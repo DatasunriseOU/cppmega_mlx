@@ -51,6 +51,7 @@ markers = [
     "bench: benchmark scripts, benchmark receipts, and comparison-policy coverage",
     "distributed: distributed-training boundary checks and fail-closed parity guards",
     "slow: tests that spawn subprocesses or run extended training loops; opt-in via -m slow",
+    "cuda_required: tests that need CUDA hardware and toolchain",
 ]
 filterwarnings = [
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",

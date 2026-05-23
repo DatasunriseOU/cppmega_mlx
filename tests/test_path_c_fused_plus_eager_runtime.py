@@ -34,6 +34,7 @@ from cppmega_mlx.training.compiled import (
     PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT,
     PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
     PathCFusedPlusEagerTrainingRuntime,
+    _path_c_training_runtime_value_and_grad_contract,
 )
 
 
@@ -228,11 +229,22 @@ def test_value_and_grad_returns_closure_outputs() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_value_and_grad_contract_reports_closed_full_coverage() -> None:
+def test_value_and_grad_contract_reports_closed_full_coverage_with_suffix_bypass() -> None:
     art = _FakeFusedArtifact()
+
+    def _suffix_loss(model: Any, batch: Mapping[str, Any]) -> tuple[mx.array, mx.array]:
+        return mx.array(0.0), mx.array(0, dtype=mx.uint32)
+
     runtime = PathCFusedPlusEagerTrainingRuntime(
-        artifact=art, bank_owner={}, owner_name="x",
-        in_region_parameter_names=("a", "b", "c"),
+        artifact=art,
+        bank_owner={},
+        owner_name="x",
+        in_region_parameter_bank_aliases={
+            "a": {"logical_name": "a", "logical_grad_name": "a_grad", "bank": "f32", "dtype": "float32", "offset": 0, "size": 1, "logical_shape": (1,)},
+            "b": {"logical_name": "b", "logical_grad_name": "b_grad", "bank": "f32", "dtype": "float32", "offset": 1, "size": 1, "logical_shape": (1,)},
+            "c": {"logical_name": "c", "logical_grad_name": "c_grad", "bank": "f32", "dtype": "float32", "offset": 2, "size": 1, "logical_shape": (1,)},
+        },
+        fused_suffix_loss_fn=_suffix_loss,
     )
     contract = runtime.value_and_grad_contract()
     assert contract["contract"] == PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT
@@ -242,7 +254,7 @@ def test_value_and_grad_contract_reports_closed_full_coverage() -> None:
     assert contract["uses_backward_or_vjp_hook"] is True
     assert contract["returns_model_grads"] is True
     assert contract["returns_full_model_grads"] is True
-    assert contract["gradient_scope"] == "full_model_via_mixed_mode"
+    assert contract["gradient_scope"] == "full_model_via_fused_suffix_bypass"
     assert contract["full_model_gradient_tree_ready"] is True
     assert contract["loss_cotangent_bridge_ready"] is True
     assert contract["model_gradient_tree_ready"] is True
@@ -252,7 +264,7 @@ def test_value_and_grad_contract_reports_closed_full_coverage() -> None:
     assert contract["runtime_class"] == "PathCFusedPlusEagerTrainingRuntime"
     coverage = contract["full_model_gradient_coverage"]
     assert coverage["full_model_gradient_tree_ready"] is True
-    assert coverage["gradient_scope"] == "full_model_via_mixed_mode"
+    assert coverage["gradient_scope"] == "full_model_via_fused_suffix_bypass"
     assert coverage["missing_parameter_names"] == []
     assert coverage["missing_parameter_count"] == 0
     assert coverage["fused_in_region_parameter_count"] == 3
@@ -262,6 +274,24 @@ def test_value_and_grad_contract_reports_closed_full_coverage() -> None:
         "layers.10.block.B_bias",
         "layers.10.block.D",
     ]
+
+
+def test_warmup_contract_does_not_pass_training_critical_gate() -> None:
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=_FakeFusedArtifact(),
+        bank_owner={},
+        owner_name="warmup",
+        in_region_parameter_names=("a", "b"),
+    )
+    contract = runtime.value_and_grad_contract()
+    assert contract["suffix_bypass_available"] is False
+    assert contract["returns_full_model_grads"] is False
+    assert contract["loss_cotangent_bridge_ready"] is False
+    assert contract["model_gradient_tree_ready"] is False
+    assert contract["delegates_to_eager_loss_and_grad"] is True
+
+    gate_payload = _path_c_training_runtime_value_and_grad_contract(runtime)
+    assert gate_payload["status"] == "incomplete"
 
 
 def test_bind_unbind_training_graph_round_trip() -> None:
@@ -322,7 +352,7 @@ def test_live_install_flips_route_to_fused_train_block() -> None:
     assert type(runtime).__name__ == "PathCFusedPlusEagerTrainingRuntime"
     inner_contract = runtime.value_and_grad_contract()
     assert inner_contract["returns_full_model_grads"] is True
-    assert inner_contract["gradient_scope"] == "full_model_via_mixed_mode"
+    assert inner_contract["gradient_scope"] == "full_model_via_fused_suffix_bypass"
     assert inner_contract["delegates_to_eager_loss_and_grad"] is False
 
 

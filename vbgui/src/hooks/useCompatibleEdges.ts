@@ -44,10 +44,15 @@ export function makeIsValidConnection(
   brickKindOf: (nodeId: string) => string | null,
 ): (conn: { source: string | null; target: string | null }) => boolean {
   return (conn) => {
-    if (pairs.size === 0) return true;        // server fallback
     const src = conn.source ? brickKindOf(conn.source) : null;
     const dst = conn.target ? brickKindOf(conn.target) : null;
     if (!src || !dst) return false;
+
+    // Tokenizer / De-Tokenizer connection bypass: allow connecting tokenizer at input and detokenizer at output.
+    if (src === "tokenizer") return true;
+    if (dst === "detokenizer") return true;
+
+    if (pairs.size === 0) return true;        // server fallback
     return pairs.has(`${src}→${dst}`);
   };
 }

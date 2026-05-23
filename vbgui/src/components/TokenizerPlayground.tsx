@@ -268,7 +268,7 @@ function TokenizerPanel({
 }: TokenizerPanelProps): JSX.Element {
   return (
     <section data-testid={`tokenizer-panel-${index}`}
-             style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+             style={{ border: "1px solid var(--vb-border)", borderRadius: 4,
                       padding: 8, display: "flex", flexDirection: "column",
                       gap: 6, minHeight: 0 }}>
       <div style={{ display: "flex", gap: 4 }}>
@@ -324,7 +324,7 @@ function TokenizerPanel({
       {state.result && (
         <>
           <div data-testid={`tokenizer-metrics-${index}`}
-               style={{ fontSize: 11, color: "#374151",
+               style={{ fontSize: 11, color: "var(--vb-text-secondary)",
                         display: "flex", alignItems: "center", gap: 6,
                         flexWrap: "wrap" }}>
             <span>{state.result.token_count} tokens</span>
@@ -367,7 +367,7 @@ function TokenizerPanel({
                style={{ display: "flex", flexWrap: "wrap", gap: 2,
                         overflowY: "auto", fontFamily: "monospace",
                         fontSize: 11, padding: 4,
-                        background: "#f9fafb", borderRadius: 3 }}>
+                        background: "var(--vb-surface-2)", borderRadius: 3 }}>
             {state.result.tokens.map((t, ti) => {
               const overlap = hoverSpan && t.start < hoverSpan.end &&
                               t.end > hoverSpan.start;

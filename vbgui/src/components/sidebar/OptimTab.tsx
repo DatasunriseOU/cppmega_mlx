@@ -1,25 +1,21 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import type { OptimKind, OptimState, ParamGroupState,
               ScheduleSpecState } from "@/state/spec";
 import { ScheduleEditor } from "@/components/ScheduleEditor";
 import { Tooltip } from "@/components/Tooltip";
 import { ExplainModal } from "@/components/ExplainModal";
 import { AutoGroupButton } from "@/components/AutoGroupButton";
+import { HelpIcon } from "@/components/HelpIcon";
 import type { RpcClient } from "@/lib/rpc";
 import type { Node, Edge } from "@xyflow/react";
+import { T } from "@/theme";
 
 export interface OptimTabProps {
   optim: OptimState;
   onApply: (next: OptimState) => void;
-  /** Optional RPC client for tooltip + Apply-recommended integration.
-   *  When omitted the tooltip surface is rendered but inert. */
   rpc?: RpcClient | null;
-  /** Canvas state for the Auto-group button. When omitted the button
-   *  is rendered but disabled. */
   graphNodes?: Node[];
   graphEdges?: Edge[];
-  /** V7-H45: schedule_kind echoed by extras of the most-recent train
-   *  run; threaded through to every ScheduleEditor instance. */
   lastRunScheduleKind?: string | null;
 }
 
@@ -29,8 +25,6 @@ const KINDS: OptimKind[] = [
   "sgd",
 ];
 
-// Recommended lr per kind — surfaces in tooltip + can auto-populate
-// the first group's lr when the kind changes (E7-10 will wire this).
 export const RECOMMENDED_LR: Record<OptimKind, number> = {
   adamw:             3e-4,
   muon:              1e-2,
@@ -55,9 +49,11 @@ export function OptimTab({
   const [explainKind, setExplainKind] = useState<OptimKind | null>(null);
   const [autoGroupBanner, setAutoGroupBanner] = useState<string | null>(null);
 
+  useEffect(() => {
+    setDraft(optim);
+  }, [optim]);
+
   function applyRecommendedToKind(params: Record<string, unknown>) {
-    // The first group governs lr; we copy lr/weight_decay/betas from
-    // the recommended map when present.
     const lr = typeof params.lr === "number" ? params.lr : draft.groups[0].lr;
     const wd = typeof params.weight_decay === "number"
       ? params.weight_decay : draft.groups[0].weight_decay;
@@ -96,17 +92,23 @@ export function OptimTab({
 
   return (
     <div data-testid="optim-tab" style={panel}>
-      <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-        <Tooltip rpc={rpc ?? null} category="optimizer" name={draft.kind}
-                 onInfoClick={() => setExplainKind(draft.kind)}
-                 testId="optim-kind-tooltip">
-          <span>Kind</span>
-        </Tooltip>
+      <label style={labelStyle}>
+        <span style={labelTitle}>
+          <Tooltip rpc={rpc ?? null} category="optimizer" name={draft.kind}
+                   onInfoClick={() => setExplainKind(draft.kind)}
+                   testId="optim-kind-tooltip">
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              Kind
+              <HelpIcon topic="optim_kind" />
+            </span>
+          </Tooltip>
+        </span>
         <select
           data-testid="optim-kind"
           value={draft.kind}
           onChange={(e) =>
             setDraft({ ...draft, kind: e.target.value as OptimKind })}
+          style={inputStyle}
         >
           {KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
@@ -120,40 +122,61 @@ export function OptimTab({
       )}
 
       <table data-testid="optim-groups"
-             style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+             style={{ width: "100%", fontSize: 11, borderCollapse: "collapse", marginTop: 8 }}>
         <thead>
-          <tr>
-            <th>matcher</th><th>lr</th><th>wd</th><th></th>
+          <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+            <th style={{ ...th, display: "inline-flex", alignItems: "center", gap: 4 }}>
+              matcher
+              <HelpIcon topic="optim_group_matcher" />
+            </th>
+            <th style={th}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                lr
+                <HelpIcon topic="optim_group_lr" />
+              </span>
+            </th>
+            <th style={th}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                wd
+                <HelpIcon topic="optim_group_wd" />
+              </span>
+            </th>
+            <th style={th}></th>
           </tr>
         </thead>
         <tbody>
           {draft.groups.map((g, i) => (
-            <tr key={i} data-testid={`optim-group-${i}`}>
-              <td>
+            <tr key={i} data-testid={`optim-group-${i}`} style={{ borderBottom: `1px solid ${T.borderSoft}` }}>
+              <td style={td}>
                 <input data-testid={`optim-group-${i}-matcher`}
                        value={g.matcher}
-                       onChange={(e) => updateGroup(i, { matcher: e.target.value })} />
+                       onChange={(e) => updateGroup(i, { matcher: e.target.value })}
+                       style={tableInputStyle} />
               </td>
-              <td>
+              <td style={td}>
                 <input data-testid={`optim-group-${i}-lr`} type="number"
                        step={1e-5} value={g.lr}
-                       onChange={(e) => updateGroup(i, { lr: Number(e.target.value) })} />
+                       onChange={(e) => updateGroup(i, { lr: Number(e.target.value) })}
+                       style={tableInputStyle} />
               </td>
-              <td>
+              <td style={td}>
                 <input data-testid={`optim-group-${i}-wd`} type="number"
                        step={0.01} value={g.weight_decay}
                        onChange={(e) => updateGroup(i, {
                          weight_decay: Number(e.target.value),
-                       })} />
+                       })}
+                       style={tableInputStyle} />
               </td>
-              <td>
+              <td style={{ ...td, display: "flex", gap: 4, justifyContent: "flex-end", alignItems: "center" }}>
                 <button data-testid={`optim-group-${i}-schedule-toggle`}
                         onClick={() => toggleSchedule(i)}
-                        title="Edit LR schedule">
+                        title="Edit LR schedule"
+                        style={miniButtonStyle}>
                   {expandedSchedules.has(i) || g.schedule ? "⏲▾" : "⏲"}
                 </button>
                 <button data-testid={`optim-group-${i}-remove`}
-                        onClick={() => removeGroup(i)}>×</button>
+                        onClick={() => removeGroup(i)}
+                        style={miniRemoveStyle}>×</button>
               </td>
             </tr>
           ))}
@@ -171,8 +194,8 @@ export function OptimTab({
         )
       ))}
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <button data-testid="optim-add-group" onClick={addGroup}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
+        <button data-testid="optim-add-group" onClick={addGroup} style={secButtonStyle}>
           + Add group
         </button>
         <AutoGroupButton
@@ -189,30 +212,40 @@ export function OptimTab({
       </div>
       {autoGroupBanner && (
         <pre data-testid="optim-auto-group-banner"
-             style={{ background: "#eff6ff", color: "#1e40af",
-                      padding: 6, borderRadius: 4, fontSize: 11,
-                      whiteSpace: "pre-wrap", marginTop: 4 }}>
+             style={{ background: T.surface3, color: T.accent,
+                      border: `1px solid ${T.border}`,
+                      padding: 8, borderRadius: 6, fontSize: 11,
+                      whiteSpace: "pre-wrap", marginTop: 8 }}>
           {autoGroupBanner}
         </pre>
       )}
 
-      <label>grad_clip_norm
+      <label style={labelStyle}>
+        <span style={labelTitle}>
+          grad_clip_norm
+          <HelpIcon topic="optim_grad_clip" />
+        </span>
         <input data-testid="optim-clip" type="number" step={0.1}
                value={draft.grad_clip_norm}
                onChange={(e) =>
                  setDraft({ ...draft,
-                            grad_clip_norm: Number(e.target.value) })} />
+                            grad_clip_norm: Number(e.target.value) })}
+               style={inputStyle} />
       </label>
 
-      <label>
+      <label style={{ ...labelStyle, flexDirection: "row", alignItems: "center", gap: 8, cursor: "pointer" }}>
         <input data-testid="optim-mp" type="checkbox"
                checked={draft.mixed_precision}
                onChange={(e) =>
-                 setDraft({ ...draft, mixed_precision: e.target.checked })} />
-        mixed_precision
+                 setDraft({ ...draft, mixed_precision: e.target.checked })}
+               style={{ cursor: "pointer", width: 14, height: 14 }} />
+        <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", display: "inline-flex", alignItems: "center", gap: 4 }}>
+          mixed_precision
+          <HelpIcon topic="optim_mixed_precision" />
+        </span>
       </label>
 
-      <button data-testid="optim-apply" onClick={() => onApply(draft)}>
+      <button data-testid="optim-apply" onClick={() => onApply(draft)} style={buttonStyle}>
         Apply
       </button>
     </div>
@@ -220,6 +253,97 @@ export function OptimTab({
 }
 
 const panel: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 8, padding: 12,
-  fontFamily: "system-ui, sans-serif", fontSize: 12,
+  display: "flex", flexDirection: "column", gap: 12, padding: 16,
+  fontFamily: T.font, fontSize: 12,
+  background: T.surface, color: T.text,
+};
+
+const labelStyle: React.CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 6,
+  color: T.textSecondary,
+};
+
+const labelTitle: React.CSSProperties = {
+  display: "inline-flex", alignItems: "center", gap: 4,
+  fontWeight: 600, textTransform: "uppercase", fontSize: 10, letterSpacing: "0.05em",
+};
+
+const inputStyle: React.CSSProperties = {
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: "var(--vb-radius-sm)",
+  color: T.text,
+  padding: "8px 10px",
+  fontSize: 12,
+  fontFamily: T.font,
+  outline: "none",
+};
+
+const tableInputStyle: React.CSSProperties = {
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: "var(--vb-radius-sm)",
+  color: T.text,
+  padding: "4px 6px",
+  fontSize: 11,
+  fontFamily: T.font,
+  width: "100%",
+  outline: "none",
+};
+
+const buttonStyle: React.CSSProperties = {
+  background: T.accent,
+  color: T.accentContrast,
+  border: "none",
+  borderRadius: "var(--vb-radius-sm)",
+  padding: "10px 14px",
+  fontSize: 12,
+  fontWeight: "bold",
+  cursor: "pointer",
+  marginTop: 10,
+};
+
+const secButtonStyle: React.CSSProperties = {
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: "var(--vb-radius-sm)",
+  color: T.text,
+  padding: "8px 12px",
+  fontSize: 12,
+  fontWeight: "bold",
+  cursor: "pointer",
+};
+
+const miniButtonStyle: React.CSSProperties = {
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: "var(--vb-radius-sm)",
+  color: T.text,
+  padding: "2px 6px",
+  fontSize: 11,
+  cursor: "pointer",
+};
+
+const miniRemoveStyle: React.CSSProperties = {
+  background: "transparent",
+  border: "none",
+  color: T.danger,
+  fontSize: 16,
+  cursor: "pointer",
+  padding: "0 4px",
+};
+
+const th: React.CSSProperties = {
+  textAlign: "left",
+  padding: "4px 6px",
+  color: T.textSecondary,
+  fontWeight: 600,
+  fontSize: 10,
+  textTransform: "uppercase",
+  letterSpacing: "0.05em",
+};
+
+const td: React.CSSProperties = {
+  padding: "4px 6px",
+  verticalAlign: "middle",
 };

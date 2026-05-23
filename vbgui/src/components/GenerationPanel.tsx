@@ -72,7 +72,7 @@ export function GenerationPanel({ rpc }: GenerationPanelProps): JSX.Element {
       </header>
 
       <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-        <span style={{ color: "#6b7280" }}>prompt tokens (comma sep)</span>
+        <span style={{ color: "var(--vb-text-muted)" }}>prompt tokens (comma sep)</span>
         <textarea data-testid="gen-prompt-tokens"
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
@@ -157,10 +157,10 @@ export function GenerationPanel({ rpc }: GenerationPanelProps): JSX.Element {
 
       {result && (
         <div data-testid="gen-result"
-             style={{ background: "#f9fafb", padding: 8,
-                      borderRadius: 4, border: "1px solid #e5e7eb" }}>
+             style={{ background: "var(--vb-surface-2)", padding: 8,
+                      borderRadius: 4, border: "1px solid var(--vb-border)" }}>
           <div style={{ display: "flex", gap: 8, fontSize: 11,
-                        color: "#374151", marginBottom: 4 }}>
+                        color: "var(--vb-text-secondary)", marginBottom: 4 }}>
             <span data-testid="gen-finish-reason">
               finish: <code>{result.finish_reason}</code>
             </span>

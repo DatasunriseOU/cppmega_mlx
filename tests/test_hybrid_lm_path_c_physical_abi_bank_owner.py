@@ -38,7 +38,7 @@ def test_make_path_c_physical_abi_bank_owner_returns_validated_owner(model) -> N
     # allocated as an mx.array with the spec's shape and dtype.
     assert owner.bank_specs, "expected at least one physical ABI bank"
     required = set(owner.required_bank_buffers)
-    assert set(owner.buffers) == required
+    assert required.issubset(owner.buffers)
     for spec in owner.bank_specs:
         buf = owner.buffers[spec.name]
         assert isinstance(buf, mx.array)
@@ -137,8 +137,10 @@ def test_artifact_forward_runs_end_to_end_on_real_metal(model) -> None:
     assert bank_owner is not None
     # The factory's banks must align with the artifact's expected shapes.
     assert artifact.physical_abi_shapes == {
-        name: tuple(buf.shape) for name, buf in bank_owner.buffers.items()
+        name: tuple(bank_owner.buffers[name].shape)
+        for name in artifact.physical_abi_shapes
     }
+    assert set(artifact.kernel_buffer_order).issubset(bank_owner.buffers)
     # And the artifact's forward must complete and materialise lazy work.
     artifact.forward(bank_owner=bank_owner)
     mx.eval(*bank_owner.buffers.values())
@@ -149,11 +151,13 @@ def test_path_c_fused_in_region_parameter_bank_aliases_covers_brick_params(
 ) -> None:
     aliases = model.path_c_fused_in_region_parameter_bank_aliases()
     # The local_gb10_quarter tiny smoke profile generates the brick_10_M /
-    # brick_11_R / brick_12_A region. The fused suffix also covers
-    # final_norm + lm_head + per-layer residual norms. Exact count check
-    # locks the discovery surface so future region drift surfaces in tests.
-    assert len(aliases) == 27
+    # brick_11_R / brick_12_A region. The fused suffix also covers the
+    # entry RMSNorm, final_norm + lm_head + per-layer residual norms.
+    # Exact count check locks the discovery surface so future region drift
+    # surfaces in tests.
+    assert len(aliases) == 28
     expected_subset = {
+        "layers.10.norm.weight",
         "layers.10.block.D",
         "layers.11.block.D",
         "layers.12.block.q_proj.weight",
@@ -179,7 +183,7 @@ def test_bind_path_c_in_region_parameter_views_into_bank_replaces_attributes(
     bank_owner = model.make_path_c_physical_abi_bank_owner()
     report = model.bind_path_c_in_region_parameter_views_into_bank(bank_owner)
     assert report["status"] == "ok"
-    assert report["in_region_parameter_count"] == 27
+    assert report["in_region_parameter_count"] == 28
     assert report["skipped"] == []
     # After binding, each in-region parameter must be backed by storage in
     # the same bank slot. Pick a small parameter and a large one to verify

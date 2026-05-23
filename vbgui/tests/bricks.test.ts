@@ -9,8 +9,8 @@ describe("brick registry", () => {
     expect(BRICKS.length).toBeGreaterThanOrEqual(22);
   });
 
-  it("matches the current backend count of 25", () => {
-    expect(BRICKS.length).toBe(25);
+  it("matches the current count of 27", () => {
+    expect(BRICKS.length).toBe(27);
   });
 
   it("has 6 adapters per ticket spec", () => {

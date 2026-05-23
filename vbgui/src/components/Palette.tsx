@@ -20,6 +20,7 @@ function groupBy<T, K extends string>(
 }
 
 function humanize(cat: string): string {
+  if (cat === "io") return "I/O (Tokenizer / De-Tokenizer)";
   return cat.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 

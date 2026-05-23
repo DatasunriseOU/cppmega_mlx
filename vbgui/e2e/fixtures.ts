@@ -11,6 +11,16 @@ export async function gotoApp(page: Page): Promise<void> {
 
 export async function selectPreset(page: Page, name: string): Promise<void> {
   await page.getByTestId("preset-launcher").selectOption(name);
+  
+  // If the LLM gallery wizard modal shows up, submit it
+  const generateBtn = page.getByTestId("llm-wizard-generate");
+  try {
+    await generateBtn.waitFor({ state: "visible", timeout: 2000 });
+    await generateBtn.click();
+  } catch {
+    // Soft ignore if the modal doesn't appear
+  }
+
   // canvas populates async (RPC → setNodes). Wait for at least one node.
   await expect.poll(async () =>
     await page.locator("[data-testid^='brick-node-']").count(),

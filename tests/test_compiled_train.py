@@ -777,6 +777,64 @@ def test_fused_train_block_callable_artifact_uses_caller_owned_banks() -> None:
     assert coverage["missing_parameter_names"] == []
 
 
+def test_fused_train_block_callable_artifact_uses_full_kernel_buffer_order() -> None:
+    calls: list[tuple[Any, ...]] = []
+    float_bank = mx.zeros((3,), dtype=mx.float32)
+    int_bank = mx.zeros((1,), dtype=mx.int32)
+    top_level_scratch = mx.zeros((5,), dtype=mx.float32)
+
+    class _BankOwner:
+        owner_name = "unit.path_c_physical_abi_banks"
+        buffers = {
+            "path_c_float32_abi_bank": float_bank,
+            "path_c_int32_abi_bank": int_bank,
+            "mamba3_entry_rmsnorm_hidden": top_level_scratch,
+        }
+
+    artifact = PathCFusedTrainBlockCallableArtifact(
+        kernel=lambda *kernel_args: calls.append(kernel_args),
+        physical_abi_map={
+            "loss": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+            "ntokens": {
+                "bank": "path_c_int32_abi_bank",
+                "dtype": "int32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+        },
+        physical_abi_shapes={
+            "path_c_float32_abi_bank": (3,),
+            "path_c_int32_abi_bank": (1,),
+        },
+        training_abi_contract={},
+        kernel_buffer_order=(
+            "path_c_float32_abi_bank",
+            "mamba3_entry_rmsnorm_hidden",
+            "path_c_int32_abi_bank",
+        ),
+    )
+
+    artifact.forward(bank_owner=_BankOwner())
+    assert calls == [(float_bank, top_level_scratch, int_bank)]
+
+    with pytest.raises(ValueError, match="mamba3_entry_rmsnorm_hidden"):
+        artifact.forward(
+            bank_owner={
+                "path_c_float32_abi_bank": float_bank,
+                "path_c_int32_abi_bank": int_bank,
+            }
+        )
+
+
 def test_fused_train_block_callable_artifact_reports_missing_full_model_grads() -> None:
     artifact = PathCFusedTrainBlockCallableArtifact(
         kernel=lambda *kernel_args: None,

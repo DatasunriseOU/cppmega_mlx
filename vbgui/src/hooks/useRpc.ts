@@ -84,12 +84,25 @@ export function useRpc(opts: UseRpcOptions = {}): RpcClient {
       socket.onerror = () => fire("disconnected");
     };
 
-    open();
+    reconnectTimer = setTimeout(open, 100);
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      wsRef.current?.close();
-      wsRef.current = null;
+      if (wsRef.current) {
+        const socket = wsRef.current;
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        if (socket.readyState === WebSocket.CONNECTING) {
+          socket.onopen = () => {
+            try { socket.close(); } catch {}
+          };
+        } else {
+          try { socket.close(); } catch {}
+        }
+        wsRef.current = null;
+      }
     };
   }, [baseUrl, enableWs]);
 

@@ -4,6 +4,7 @@
 // behaviour (use lastTrainRunId).
 
 import { HelpIcon } from "@/components/HelpIcon";
+import { T } from "@/theme";
 
 export interface RunHistoryPickerProps {
   history: readonly string[];
@@ -18,23 +19,29 @@ export function RunHistoryPicker({
     <div data-testid="run-history-picker"
          style={{ display: "flex", alignItems: "center", gap: 6,
                   fontSize: 12, padding: "4px 8px",
-                  background: "#eef2ff",
-                  borderTop: "1px solid #c7d2fe",
-                  fontFamily: "system-ui, sans-serif" }}>
-      <strong>warm-start from</strong>
+                  background: T.surface,
+                  borderTop: `1px solid ${T.border}`,
+                  color: T.text,
+                  fontFamily: T.font }}>
+      <strong style={{ color: T.accent }}>warm-start from</strong>
       <HelpIcon topic="warm_start_history" />
       <select data-testid="run-history-select"
               value={selected ?? ""}
               onChange={(e) => onSelect(
                 e.target.value === "" ? null : e.target.value)}
-              style={{ minWidth: 240 }}>
+              style={{
+                minWidth: 240,
+                color: T.text,
+                background: T.surface3,
+                border: `1px solid ${T.border}`,
+              }}>
         <option value="">(latest)</option>
         {history.map((id) => (
           <option key={id} value={id}>{id}</option>
         ))}
       </select>
       <span data-testid="run-history-count"
-            style={{ color: "#6b7280", fontSize: 11 }}>
+            style={{ color: T.textSecondary, fontSize: 11, fontWeight: "bold" }}>
         {history.length} run{history.length === 1 ? "" : "s"} in history
       </span>
     </div>

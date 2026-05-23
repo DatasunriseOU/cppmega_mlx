@@ -45,13 +45,13 @@ describe("HelpIcon + HelpModal", () => {
   // fixed inset:0 overlay. Chrome recomposed the GPU layer on every
   // mousemove that crossed the overlay → visible flicker over the
   // React Flow canvas underneath. Fix drops the blur and promotes
-  // the backdrop to its own compositing layer via translateZ(0).
+  // the backdrop to its own compositing layer via willChange: opacity.
   it("backdrop has no backdropFilter:blur (anti-flicker fix)", () => {
     render(<HelpIcon topic="dim_env_H" />);
     fireEvent.click(screen.getByTestId("help-icon-dim_env_H"));
     const backdrop = screen.getByTestId("help-modal-backdrop") as
       HTMLElement;
     expect(backdrop.style.backdropFilter || "").toBe("");
-    expect(backdrop.style.transform).toContain("translateZ");
+    expect(backdrop.style.willChange).toBe("opacity");
   });
 });

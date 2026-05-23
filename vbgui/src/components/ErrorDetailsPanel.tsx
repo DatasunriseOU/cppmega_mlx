@@ -107,7 +107,7 @@ export function ErrorDetailsPanel({
                 </span>
                 {fe.type && (
                   <span data-testid={`error-details-field-${i}-type`}
-                        style={{ color: "#9ca3af", fontSize: 10,
+                        style={{ color: "var(--vb-text-muted)", fontSize: 10,
                                  marginLeft: 6 }}>
                     [{fe.type}]
                   </span>

@@ -72,6 +72,10 @@ _REGION_RUN_EAGER_REASONS: dict[str, str] = {
     "no_template": "AutoCompiledRegion has no schedule template",
     "no_artifact": "no compiled TileLang artifact attached to this region",
     "no_module": "brick instance missing module reference (instantiate=True required)",
+    "artifact_nonfinite_fallback": (
+        "compiled artifact produced non-finite output on validation; "
+        "fell back to eager execution"
+    ),
 }
 
 
@@ -127,6 +131,11 @@ class ExecutableGraph:
     artifacts: dict[int, Callable[[mx.array], mx.array]] = field(
         default_factory=dict
     )
+    # Set to True after the first successful forward pass.  While False
+    # the executor validates artifact outputs for non-finite values and
+    # falls back to eager if any NaN/Inf is detected.  After validation
+    # passes, subsequent calls skip the check entirely.
+    _validated: bool = field(default=False, repr=False)
     # Mutable: rolling per-region execution log (last forward call).
     execution_log: list[RegionExecution] = field(default_factory=list)
 
@@ -197,16 +206,34 @@ class ExecutableGraph:
         the trailing brick's output becomes the next region's input.
         Per-region timing and backend choice are recorded in
         :attr:`execution_log` (replaced on every call).
+
+        On the **first** call (while ``_validated`` is ``False``) the
+        executor lazily checks each artifact's output for non-finite
+        values.  If any NaN/Inf is detected, that region falls back to
+        eager execution for this call and the event is recorded in the
+        execution log.  Once a full forward completes with all artifacts
+        producing finite output, ``_validated`` is set to ``True`` and
+        subsequent calls skip the check entirely.
         """
         self.execution_log.clear()
         running = hidden
+        validate = not self._validated
+        all_finite = True
         for index, region in enumerate(self.regions):
             t0 = time.perf_counter_ns()
             artifact = self.artifacts.get(index)
             if artifact is not None:
-                running = artifact(running)
-                backend = "path_c_artifact"
-                eager_reason = ""
+                artifact_out = artifact(running)
+                if validate and not mx.isfinite(artifact_out).all().item():
+                    # Artifact produced NaN/Inf — fall back to eager.
+                    artifact_out = self._run_region_eager(region, running)
+                    backend = "eager_bricks"
+                    eager_reason = "artifact_nonfinite_fallback"
+                    all_finite = False
+                else:
+                    backend = "path_c_artifact"
+                    eager_reason = ""
+                running = artifact_out
             else:
                 running = self._run_region_eager(region, running)
                 backend = "eager_bricks"
@@ -222,6 +249,8 @@ class ExecutableGraph:
                     duration_ns=int(duration),
                 )
             )
+        if validate and all_finite:
+            self._validated = True
         return running
 
     __call__ = forward

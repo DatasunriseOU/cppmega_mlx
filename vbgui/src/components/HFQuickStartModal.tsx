@@ -80,7 +80,7 @@ export function HFQuickStartModal({
          onClick={onClose}>
       <div data-testid="hf-quickstart-modal-content"
            onClick={(e) => e.stopPropagation()}
-           style={{ background: "#fff", borderRadius: 8, padding: 24,
+           style={{ background: "var(--vb-surface-2)", borderRadius: 8, padding: 24,
                     width: 480, fontFamily: "system-ui, sans-serif",
                     fontSize: 13, display: "flex", flexDirection: "column",
                     gap: 8 }}>

@@ -117,4 +117,30 @@ describe("BrickContextPanel", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(onApply).not.toHaveBeenCalled();
   });
+
+  it("shows disabled 'No trainable weights' button for residual brick when histogram requested", () => {
+    const onInspect = vi.fn();
+    render(<BrickContextPanel rpc={RPC} brickId="res_0" brickKind="residual"
+                                params={{}}
+                                onApply={() => {}} onClose={() => {}}
+                                onInspectHistogram={onInspect} />);
+    const btn = screen.getByTestId("brick-context-res_0-histogram-disabled") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(true);
+    expect(btn.textContent).toBe("No trainable weights");
+    expect(screen.queryByTestId("brick-context-res_0-histogram-fetch")).toBeNull();
+  });
+
+  it("shows enabled 'Inspect weight histogram' button for linear_bridge brick when histogram requested", () => {
+    const onInspect = vi.fn();
+    render(<BrickContextPanel rpc={RPC} brickId="lb_0" brickKind="linear_bridge"
+                                params={{}}
+                                onApply={() => {}} onClose={() => {}}
+                                onInspectHistogram={onInspect} />);
+    const btn = screen.getByTestId("brick-context-lb_0-histogram-fetch") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+    expect(btn.textContent).toBe("Inspect weight histogram");
+    expect(screen.queryByTestId("brick-context-lb_0-histogram-disabled")).toBeNull();
+  });
 });

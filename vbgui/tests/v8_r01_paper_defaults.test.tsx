@@ -79,6 +79,11 @@ describe("V8-R01: build_preset_specs defaults auto-fill", () => {
         .toBe(true);
     });
 
+    // Wait until the preset bricks are actually loaded on the canvas
+    await waitFor(() => {
+      expect(screen.queryByTestId("brick-node-a0")).not.toBeNull();
+    });
+
     // Switch to the Optim tab so its inputs are mounted in the DOM.
     fireEvent.click(screen.getByTestId("sidebar-tab-optim"));
     await waitFor(() => {

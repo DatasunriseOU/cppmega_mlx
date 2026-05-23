@@ -33,8 +33,8 @@ export function GradAttnPanel({
 
   return (
     <div data-testid="grad-attn-panel"
-         style={{ border: "1px solid #e5e7eb", borderRadius: 4,
-                  padding: 8, background: "#f9fafb", fontSize: 11,
+         style={{ border: "1px solid var(--vb-border)", borderRadius: 4,
+                  padding: 8, background: "var(--vb-surface-2)", fontSize: 11,
                   fontFamily: "monospace" }}>
       <div style={{ fontWeight: 600, marginBottom: 4 }}>
         per-brick grad + attention map (V7-H07)
@@ -43,7 +43,7 @@ export function GradAttnPanel({
       {hasGrads && (
         <div data-testid="grad-attn-panel-grads"
              style={{ marginBottom: 8 }}>
-          <div style={{ color: "#6b7280", marginBottom: 2 }}>
+          <div style={{ color: "var(--vb-text-muted)", marginBottom: 2 }}>
             grad-norm by brick
           </div>
           <GradBars norms={gradNorms!} />
@@ -52,7 +52,7 @@ export function GradAttnPanel({
 
       {hasAttn && (
         <div data-testid="grad-attn-panel-attn">
-          <div style={{ color: "#6b7280", marginBottom: 2 }}>
+          <div style={{ color: "var(--vb-text-muted)", marginBottom: 2 }}>
             attention-head mean weight
           </div>
           <AttnHeatmap means={attnHeadMeans!} />
@@ -90,7 +90,7 @@ function GradBars({ norms }: { norms: Record<string, number> }):
               <title>{`${k}: ${v.toExponential(3)}`}</title>
             </rect>
             <text x={labelW + w + 4} y={rowH - 3}
-                  style={{ fontSize: 9, fill: "#374151" }}>
+                  style={{ fontSize: 9, fill: "var(--vb-text-secondary)" }}>
               {v.toExponential(2)}
             </text>
           </g>

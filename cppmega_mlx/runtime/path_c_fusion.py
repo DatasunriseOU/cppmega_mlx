@@ -2055,6 +2055,7 @@ def _build_legacy_mamba3_fp8_train_diagnostic_region() -> PathCFusionRegion:
 def build_mamba3_fp8_train_acceptance_fixture_region(
     *,
     include_backward: bool = False,
+    model_config: Any | None = None,
 ) -> PathCFusionRegion:
     """Return the explicit named acceptance fixture for MRA train-block tests.
 
@@ -2064,14 +2065,15 @@ def build_mamba3_fp8_train_acceptance_fixture_region(
     model's actual brick graph.
     """
 
-    from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
+    if model_config is None:
+        from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
 
-    acceptance_profile = local_gb10_quarter_profile()
+        model_config = local_gb10_quarter_profile().hybrid_config()
     return _build_path_c_acceptance_fixture_region_from_route_symbols(
         region_name="mamba3_m2rnn_attention_fp8_train_block",
         route_symbols=("M", "R", "A"),
         include_backward=include_backward,
-        model_config=acceptance_profile.hybrid_config(),
+        model_config=model_config,
         acceptance_tags=("mamba3_fp8_train_acceptance",),
     )
 

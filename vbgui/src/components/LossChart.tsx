@@ -1,7 +1,4 @@
-// Inline SVG loss / lr line chart used by RunResultModal (and any future
-// live-training surface). No external charting deps so e2e can assert on
-// visible coordinates and the rendered <path> element itself, not on the
-// flat text list of extras.losses-N items.
+import { T } from "@/theme";
 
 export interface LossSeries {
   label: string;
@@ -23,8 +20,8 @@ export interface LossChartProps {
   overflowSteps?: readonly number[];
 }
 
-const DEFAULT_COLOR = "#2563eb";
-const PALETTE = ["#2563eb", "#10b981", "#f59e0b", "#ec4899", "#a855f7"];
+const DEFAULT_COLOR = "#22d3ee";
+const PALETTE = ["#22d3ee", "#34d399", "#fbbf24", "#ec4899", "#a855f7"];
 
 function pathFor(values: number[], w: number, h: number,
                  yMin: number, yMax: number, pad: number): string {
@@ -68,7 +65,7 @@ export function LossChart({
   const xMaxStep = Math.max(0, ...allSeries.map((s) => s.values.length - 1));
 
   return (
-    <div data-testid={testidPrefix} style={{ fontFamily: "system-ui, sans-serif" }}>
+    <div data-testid={testidPrefix} style={{ fontFamily: T.font }}>
       <svg
         data-testid={`${testidPrefix}-svg`}
         width={width}
@@ -76,32 +73,32 @@ export function LossChart({
         viewBox={`0 0 ${width} ${height}`}
         role="img"
         aria-label="training loss chart"
-        style={{ background: "#ffffff", border: "1px solid #e5e7eb",
+        style={{ background: T.surface2, border: `1px solid ${T.border}`,
                  borderRadius: 4 }}
       >
         {/* axes */}
         <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad}
-              stroke="#9ca3af" strokeWidth={1} />
+              stroke={T.borderStrong} strokeWidth={1} />
         <line x1={pad} y1={pad} x2={pad} y2={height - pad}
-              stroke="#9ca3af" strokeWidth={1} />
+              stroke={T.borderStrong} strokeWidth={1} />
 
         {/* y-axis labels */}
         <text data-testid={`${testidPrefix}-axis-y-label-max`}
-              x={4} y={pad + 4} fontSize={10} fill="#6b7280">
+              x={4} y={pad + 4} fontSize={10} fill={T.textSecondary}>
           {yMax.toFixed(3)}
         </text>
         <text data-testid={`${testidPrefix}-axis-y-label-min`}
-              x={4} y={height - pad} fontSize={10} fill="#6b7280">
+              x={4} y={height - pad} fontSize={10} fill={T.textSecondary}>
           {yMin.toFixed(3)}
         </text>
 
         {/* x-axis labels */}
         <text data-testid={`${testidPrefix}-axis-x-label-0`}
-              x={pad} y={height - 4} fontSize={10} fill="#6b7280">
+              x={pad} y={height - 4} fontSize={10} fill={T.textSecondary}>
           0
         </text>
         <text data-testid={`${testidPrefix}-axis-x-label-last`}
-              x={width - pad - 8} y={height - 4} fontSize={10} fill="#6b7280">
+              x={width - pad - 8} y={height - 4} fontSize={10} fill={T.textSecondary}>
           {xMaxStep}
         </text>
 

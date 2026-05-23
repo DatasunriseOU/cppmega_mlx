@@ -6,6 +6,7 @@
 
 import { useCallback, useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
+import { T } from "@/theme";
 
 export interface CkptHistoryEntry {
   path: string;
@@ -93,8 +94,9 @@ export function CheckpointHistoryDropdown({
         }}
         style={{
           fontSize: 10, padding: "2px 6px",
-          background: "#f3f4f6", border: "1px solid #d1d5db",
+          background: T.surface3, border: `1px solid ${T.border}`,
           borderRadius: 3, cursor: rpc ? "pointer" : "not-allowed",
+          color: T.text,
         }}
       >
         history ▾
@@ -104,27 +106,28 @@ export function CheckpointHistoryDropdown({
           data-testid="ckpt-history-list"
           style={{
             position: "absolute", top: 22, left: 0, zIndex: 100,
-            background: "white", border: "1px solid #d1d5db",
-            borderRadius: 4, boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
+            background: T.surface2, border: `1px solid ${T.border}`,
+            borderRadius: 4, boxShadow: T.shadowPop,
             minWidth: 360, maxWidth: 480, maxHeight: 320, overflowY: "auto",
             fontSize: 10, fontFamily: "monospace",
+            color: T.text,
           }}
         >
           {loading && (
             <div data-testid="ckpt-history-loading"
-                 style={{ padding: 8, color: "#9ca3af" }}>
+                 style={{ padding: 8, color: T.textSecondary }}>
               scanning {directory || "."}…
             </div>
           )}
           {error && !loading && (
             <div data-testid="ckpt-history-error"
-                 style={{ padding: 8, color: "#dc2626" }}>
+                 style={{ padding: 8, color: T.danger }}>
               {error}
             </div>
           )}
           {!loading && !error && entries.length === 0 && (
             <div data-testid="ckpt-history-empty"
-                 style={{ padding: 8, color: "#9ca3af" }}>
+                 style={{ padding: 8, color: T.textSecondary }}>
               no .safetensors files in {directory || "."}
             </div>
           )}
@@ -141,22 +144,22 @@ export function CheckpointHistoryDropdown({
                   }}
                   style={{
                     padding: "4px 8px", cursor: "pointer",
-                    borderBottom: "1px solid #f3f4f6",
+                    borderBottom: `1px solid ${T.border}`,
                   }}
                   onMouseEnter={(ev) =>
-                    (ev.currentTarget.style.background = "#eff6ff")}
+                    (ev.currentTarget.style.background = T.surface3)}
                   onMouseLeave={(ev) =>
                     (ev.currentTarget.style.background = "transparent")}
                 >
-                  <div style={{ fontWeight: 600, color: "#1f2937" }}>
+                  <div style={{ fontWeight: 600, color: T.text }}>
                     {basename(e.path)}
                     {e.has_opt_sidecar && (
-                      <span style={{ marginLeft: 6, color: "#059669" }}>
+                      <span style={{ marginLeft: 6, color: T.success }}>
                         +opt
                       </span>
                     )}
                   </div>
-                  <div style={{ color: "#6b7280" }}>
+                  <div style={{ color: T.textSecondary }}>
                     {e.arch_hash ? e.arch_hash.slice(0, 8) : "?"}
                     {" · "}
                     {e.opt_kind || "?"}

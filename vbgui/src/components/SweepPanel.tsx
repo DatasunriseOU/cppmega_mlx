@@ -66,7 +66,7 @@ export function SweepPanel({
                 disabled={running !== null}
                 style={{ padding: "4px 10px",
                          background: running !== null ? "#e5e7eb" : "#2563eb",
-                         color: running !== null ? "#6b7280" : "white",
+                         color: running !== null ? "var(--vb-text-muted)" : "white",
                          border: "none", borderRadius: 4,
                          cursor: running !== null ? "wait" : "pointer" }}>
           {running !== null
@@ -75,7 +75,7 @@ export function SweepPanel({
         </button>
         {running !== null && (
           <span data-testid="sweep-progress"
-                style={{ color: "#6b7280" }}>
+                style={{ color: "var(--vb-text-muted)" }}>
             {results.size}/{hSizes.length} complete
           </span>
         )}

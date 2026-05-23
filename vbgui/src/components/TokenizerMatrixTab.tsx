@@ -32,10 +32,14 @@ function cellKey(preset: string, tokenizer: string): string {
 }
 
 const PILL: Record<Status, { bg: string; fg: string; label: string }> = {
-  idle:     { bg: "#f3f4f6", fg: "#6b7280", label: "—" },
-  ok:       { bg: "#dcfce7", fg: "#166534", label: "ok" },
-  incompat: { bg: "#fef3c7", fg: "#92400e", label: "incompat" },
-  error:    { bg: "#fee2e2", fg: "#991b1b", label: "error" },
+  idle:     { bg: "var(--vb-surface-3)",
+              fg: "var(--vb-text-muted)",  label: "—" },
+  ok:       { bg: "rgba(52, 211, 153, 0.16)",
+              fg: "var(--vb-success)",     label: "ok" },
+  incompat: { bg: "rgba(251, 191, 36, 0.16)",
+              fg: "var(--vb-warning)",     label: "incompat" },
+  error:    { bg: "rgba(248, 113, 113, 0.16)",
+              fg: "var(--vb-danger)",      label: "error" },
 };
 
 export function TokenizerMatrixTab({

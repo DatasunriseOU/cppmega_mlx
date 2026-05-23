@@ -76,4 +76,46 @@ describe("V7-K9/K10 TrainLiveControls", () => {
     });
     expect(callSpy).not.toHaveBeenCalled();
   });
+
+  it("In-Browser Virtual FS toggle saves state and checkbox works", () => {
+    localStorage.clear();
+    render(<TrainLiveControls rpc={null} trainInFlight={false} activeRunId={null} onScheduleCheckpoint={() => {}} />);
+    const cb = screen.getByLabelText(/In-Browser Virtual FS/i) as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+
+    fireEvent.click(cb);
+    expect(cb.checked).toBe(true);
+    expect(localStorage.getItem("vbgui_is_virtual_fs")).toBe("true");
+  });
+
+  it("Trigger checkpoint in Virtual FS mode saves active layout state", () => {
+    localStorage.clear();
+    localStorage.setItem("vbgui_is_virtual_fs", "true");
+    const activeLayout = { projectName: "TestProject", nodes: [], edges: [], spec: {}, dimEnv: {}, trainOptions: { optimizer: "muon", num_steps: 10 } };
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
+
+    render(
+      <TrainLiveControls
+        rpc={null}
+        trainInFlight={false}
+        activeRunId={null}
+        onScheduleCheckpoint={() => {}}
+        activeLayoutState={activeLayout}
+      />
+    );
+
+    fireEvent.change(screen.getByTestId("train-live-ckpt-path"), { target: { value: "/virtual/my_draft.safetensors" } });
+    fireEvent.click(screen.getByTestId("train-live-trigger-ckpt"));
+
+    const stored = JSON.parse(localStorage.getItem("vbgui_virtual_checkpoints_v1") || "[]");
+    expect(stored.length).toBe(1);
+    expect(stored[0].path).toBe("/virtual/my_draft.safetensors");
+    expect(stored[0].arch_hash).toBe("TestProject");
+    expect(stored[0].opt_kind).toBe("muon");
+    expect(stored[0].global_step).toBe(10);
+    expect(stored[0].layoutState.projectName).toBe("TestProject");
+    expect(alertSpy).toHaveBeenCalled();
+    alertSpy.mockRestore();
+  });
 });
+

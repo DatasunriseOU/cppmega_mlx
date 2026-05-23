@@ -20,6 +20,7 @@ import "@xyflow/react/dist/style.css";
 import { BrickNode } from "./BrickNode";
 import { AdapterNode } from "./AdapterNode";
 import { LossGhostNode } from "./LossGhostNode";
+import { TokenizerVirtualNode, DetokenizerVirtualNode } from "./VirtualNodes";
 
 export interface FlowCanvasProps {
   nodes: Node[];
@@ -48,6 +49,8 @@ const NODE_TYPES: NodeTypes = {
   brick: BrickNode as unknown as NodeTypes[string],
   adapter: AdapterNode as unknown as NodeTypes[string],
   loss_ghost: LossGhostNode as unknown as NodeTypes[string],
+  tokenizer_virtual: TokenizerVirtualNode as unknown as NodeTypes[string],
+  detokenizer_virtual: DetokenizerVirtualNode as unknown as NodeTypes[string],
 };
 
 // 1. High-fidelity custom MidpointEdge component matching the visual builder mockup.
@@ -75,27 +78,57 @@ export function MidpointEdge({
   const sev = (data as { severity?: string } | undefined)?.severity;
   const adapter = (data as { adapter?: boolean } | undefined)?.adapter;
   
+  const debuggerMode = (data as { debuggerMode?: boolean } | undefined)?.debuggerMode;
+  const direction = (data as { direction?: "forward" | "backward" } | undefined)?.direction;
+  const isActiveFlow = (data as { isActiveFlow?: boolean } | undefined)?.isActiveFlow;
+
   let stroke = "#10b981"; // default emerald green
-  let strokeDasharray = undefined;
-  
-  if (adapter) {
-    stroke = "#9ca3af";
-    strokeDasharray = "4 2";
-  } else if (sev === "error") {
-    stroke = "#dc2626";
-  } else if (sev === "warning") {
-    stroke = "#d97706";
+  let strokeDasharray: string | undefined = undefined;
+  let animation: string | undefined = undefined;
+  let opacity: number | undefined = undefined;
+
+  if (debuggerMode) {
+    if (isActiveFlow) {
+      stroke = direction === "forward" ? "var(--vb-accent)" : "var(--vb-cat-moe)";
+      strokeDasharray = "4 4";
+      animation = `${direction === "forward" ? "vbFlowFwd" : "vbFlowBwd"} 0.8s linear infinite`;
+      opacity = 1.0;
+    } else {
+      stroke = "var(--vb-border-strong)";
+      opacity = 0.25;
+    }
+  } else {
+    if (adapter) {
+      stroke = "#9ca3af";
+      strokeDasharray = "4 2";
+    } else if (sev === "error") {
+      stroke = "#dc2626";
+    } else if (sev === "warning") {
+      stroke = "#d97706";
+    }
   }
 
   const finalStyle = {
     ...style,
     stroke,
-    strokeWidth: 2.5,
+    strokeWidth: debuggerMode && isActiveFlow ? 3.5 : 2.5,
     strokeDasharray,
+    animation,
+    opacity,
   };
 
   return (
     <>
+      <style>{`
+        @keyframes vbFlowFwd {
+          from { stroke-dashoffset: 16; }
+          to { stroke-dashoffset: 0; }
+        }
+        @keyframes vbFlowBwd {
+          from { stroke-dashoffset: 0; }
+          to { stroke-dashoffset: 16; }
+        }
+      `}</style>
       <BaseEdge path={edgePath} markerEnd={markerEnd} style={finalStyle} />
       <EdgeLabelRenderer>
         <div

@@ -350,7 +350,7 @@ families=${enabledFamilies.join(",") || "none"}`}
           {applyResult.families.map((f) => (
             <div key={f.family}
                  data-testid={`side-channels-apply-family-${f.family}`}
-                 style={{ color: f.active ? "#374151" : "#9ca3af" }}>
+                 style={{ color: f.active ? "var(--vb-text-secondary)" : "var(--vb-text-muted)" }}>
               · {f.family} [{f.mode}]: {f.active ? "active" : "inactive"} — {f.reason}
             </div>
           ))}
@@ -540,19 +540,19 @@ const panel: CSSProperties = {
 };
 const section: CSSProperties = {
   display: "flex", flexDirection: "column", gap: 6,
-  borderBottom: "1px solid #e5e7eb", paddingBottom: 8,
+  borderBottom: "1px solid var(--vb-border)", paddingBottom: 8,
 };
 const familyRow: CSSProperties = {
   display: "flex", flexDirection: "column", gap: 4,
-  padding: 6, border: "1px solid #e5e7eb", borderRadius: 4,
+  padding: 6, border: "1px solid var(--vb-border)", borderRadius: 4,
 };
 const label: CSSProperties = {
   display: "flex", flexDirection: "column", gap: 2,
-  color: "#374151", fontSize: 11,
+  color: "var(--vb-text-secondary)", fontSize: 11,
 };
 const heading: CSSProperties = { margin: 0, fontSize: 13 };
-const muted: CSSProperties = { color: "#6b7280", fontSize: 11 };
+const muted: CSSProperties = { color: "var(--vb-text-muted)", fontSize: 11 };
 const preview: CSSProperties = {
-  margin: 0, padding: 6, border: "1px solid #e5e7eb", borderRadius: 3,
-  background: "#f9fafb", whiteSpace: "pre-wrap", fontSize: 11,
+  margin: 0, padding: 6, border: "1px solid var(--vb-border)", borderRadius: 3,
+  background: "var(--vb-surface-2)", whiteSpace: "pre-wrap", fontSize: 11,
 };

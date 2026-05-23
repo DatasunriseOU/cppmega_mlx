@@ -5,10 +5,12 @@
 
 import { useState } from "react";
 import { HelpIcon } from "@/components/HelpIcon";
+import { T } from "@/theme";
 
 export interface DimEnvEditorProps {
   value: Record<string, number>;
   onApply: (next: Record<string, number>) => void;
+  sidebar?: boolean;
 }
 
 const EDITABLE_KEYS = ["H", "nh", "head_dim", "B", "S"] as const;
@@ -28,12 +30,16 @@ export const DIM_ENV_PRESETS: Record<string, Record<string, number>> = {
   llama3_70b:{ B: 1, S: 4096, H: 8192, nh: 64, nkv: 8,  head_dim: 128 },
 };
 
-export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element {
+export function DimEnvEditor({ value, onApply, sidebar = false }: DimEnvEditorProps): JSX.Element {
   const [draft, setDraft] = useState<Record<string, string>>(() => {
     const out: Record<string, string> = {};
     for (const k of EDITABLE_KEYS) out[k] = String(value[k] ?? "");
     return out;
   });
+
+  const activePreset = Object.entries(DIM_ENV_PRESETS).find(([_, p]) => {
+    return EDITABLE_KEYS.every((k) => value[k] === p[k]);
+  })?.[0] ?? "";
 
   const parsed = (() => {
     const H = Number(draft.H);
@@ -53,7 +59,7 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
   const fixSetH = mismatch && parsed
     ? { H: parsed.nh * parsed.hd } : null;
   const fixSetHeadDim = mismatch && parsed && parsed.nh > 0
-                      && parsed.H % parsed.nh === 0
+                        && parsed.H % parsed.nh === 0
     ? { head_dim: parsed.H / parsed.nh } : null;
 
   function applyDraft(overrides: Record<string, number> = {}) {
@@ -75,18 +81,139 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
     onApply(next);
   }
 
+  if (sidebar) {
+    return (
+      <div data-testid="dim-env-editor"
+           style={{ display: "flex", flexDirection: "column", gap: 10,
+                    padding: "12px", background: T.surface,
+                    borderBottom: `1px solid ${T.border}`,
+                    color: T.text,
+                    fontFamily: T.font, fontSize: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <strong data-testid="dim-env-editor-label" style={{ color: T.accent, fontSize: 13 }}>Environment Dimensions</strong>
+          <label style={{ display: "inline-flex", alignItems: "center",
+                           gap: 4, color: T.textSecondary }}>
+            preset
+            <select data-testid="dim-env-preset"
+                    value={activePreset}
+                    onChange={(e) => {
+                      const k = e.target.value;
+                      if (!k) return;
+                      const preset = DIM_ENV_PRESETS[k];
+                      if (preset) {
+                        setDraft(Object.fromEntries(
+                          Object.entries(preset).map(
+                            ([kk, vv]) => [kk, String(vv)])) as never);
+                        applyDraft(preset);
+                      }
+                    }}
+                    style={{
+                      color: T.text,
+                      background: T.surface3,
+                      border: `1px solid ${T.border}`,
+                      borderRadius: 4,
+                      padding: "2px 4px",
+                    }}>
+              <option value="">choose…</option>
+              {Object.keys(DIM_ENV_PRESETS).map((p) => (
+                <option key={p} value={p}
+                        data-testid={`dim-env-preset-opt-${p}`}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {EDITABLE_KEYS.map((k: EditableKey) => (
+            <label key={k} style={{ display: "flex", flexDirection: "column", gap: 4, color: T.textSecondary }}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+                {k}
+                <HelpIcon topic={`dim_env_${k}`} />
+              </span>
+              <input
+                data-testid={`dim-env-${k}`}
+                type="number"
+                value={draft[k]}
+                onChange={(e) => setDraft({ ...draft, [k]: e.target.value })}
+                style={{
+                  width: "100%",
+                  color: T.text,
+                  background: T.surface3,
+                  border: `1px solid ${T.border}`,
+                  borderRadius: 4,
+                  padding: "3px 6px",
+                  boxSizing: "border-box",
+                }}
+              />
+            </label>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <button
+            data-testid="dim-env-apply"
+            onClick={() => applyDraft()}
+            style={{ padding: "6px 12px",
+                     borderRadius: 4,
+                     border: `1px solid ${mismatch ? T.warning : T.border}`,
+                     background: mismatch ? T.warning : T.surface3,
+                     color: mismatch ? "#0f172a" : T.text,
+                     fontWeight: mismatch ? "bold" : "normal",
+                     cursor: "pointer",
+                     width: "100%" }}
+            title={mismatch
+              ? "dim_env is inconsistent — see the suggestions on the right"
+              : "Push dim_env to verify"}
+          >
+            Apply
+          </button>
+          {mismatch && (
+            <div data-testid="dim-env-inline-mismatch"
+                  style={{ color: T.warning, display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}>
+              ⚠ {mismatch}
+              <HelpIcon topic="symbolic_dim_mismatch" />
+            </div>
+          )}
+          {fixSetH && (
+            <button data-testid="dim-env-fix-set-H"
+                    onClick={() => applyDraft(fixSetH)}
+                    title={`Snap H to ${fixSetH.H} (= nh*head_dim)`}
+                    style={{ padding: "4px 8px", background: T.accentSoft,
+                             border: `1px solid ${T.accent}`,
+                             color: T.accent, borderRadius: 4, cursor: "pointer", fontSize: 11 }}>
+              Snap H → {fixSetH.H}
+            </button>
+          )}
+          {fixSetHeadDim && (
+            <button data-testid="dim-env-fix-set-head_dim"
+                    onClick={() => applyDraft(fixSetHeadDim)}
+                    title={`Snap head_dim to ${fixSetHeadDim.head_dim} (= H/nh)`}
+                    style={{ padding: "4px 8px", background: T.accentSoft,
+                             border: `1px solid ${T.accent}`,
+                             color: T.accent, borderRadius: 4, cursor: "pointer", fontSize: 11 }}>
+              Snap head_dim → {fixSetHeadDim.head_dim}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div data-testid="dim-env-editor"
          style={{ display: "flex", alignItems: "center", gap: 8,
-                  padding: "4px 8px", background: "#f9fafb",
-                  borderBottom: "1px solid #e5e7eb",
-                  fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
-      <strong data-testid="dim-env-editor-label">dim_env:</strong>
+                  padding: "4px 8px", background: T.surface,
+                  borderBottom: `1px solid ${T.border}`,
+                  color: T.text,
+                  fontFamily: T.font, fontSize: 12 }}>
+      <strong data-testid="dim-env-editor-label" style={{ color: T.accent }}>dim_env:</strong>
       <label style={{ display: "inline-flex", alignItems: "center",
-                       gap: 4 }}>
+                       gap: 4, color: T.textSecondary }}>
         scale
         <select data-testid="dim-env-preset"
-                defaultValue=""
+                value={activePreset}
                 onChange={(e) => {
                   const k = e.target.value;
                   if (!k) return;
@@ -97,7 +224,11 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
                         ([kk, vv]) => [kk, String(vv)])) as never);
                     applyDraft(preset);
                   }
-                  e.target.value = "";  // reset to placeholder
+                }}
+                style={{
+                  color: T.text,
+                  background: T.surface3,
+                  border: `1px solid ${T.border}`,
                 }}>
           <option value="">choose…</option>
           {Object.keys(DIM_ENV_PRESETS).map((p) => (
@@ -110,7 +241,7 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
       </label>
       {EDITABLE_KEYS.map((k: EditableKey) => (
         <label key={k} style={{ display: "inline-flex", alignItems: "center",
-                                 gap: 4 }}>
+                                 gap: 4, color: T.textSecondary }}>
           {k}
           <HelpIcon topic={`dim_env_${k}`} />
           <input
@@ -118,7 +249,12 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
             type="number"
             value={draft[k]}
             onChange={(e) => setDraft({ ...draft, [k]: e.target.value })}
-            style={{ width: 64 }}
+            style={{
+              width: 64,
+              color: T.text,
+              background: T.surface3,
+              border: `1px solid ${T.border}`,
+            }}
           />
         </label>
       ))}
@@ -126,8 +262,9 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
         data-testid="dim-env-apply"
         onClick={() => applyDraft()}
         style={{ padding: "2px 8px",
-                 background: mismatch ? "#fef3c7" : undefined,
-                 borderColor: mismatch ? "#d97706" : undefined }}
+                 background: mismatch ? T.warning : T.surface3,
+                 color: mismatch ? "#0f172a" : T.text,
+                 borderColor: mismatch ? T.warning : T.border }}
         title={mismatch
           ? "dim_env is inconsistent — see the suggestions on the right"
           : "Push dim_env to verify"}
@@ -136,7 +273,7 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
       </button>
       {mismatch && (
         <span data-testid="dim-env-inline-mismatch"
-              style={{ color: "#92400e", marginLeft: 8,
+              style={{ color: T.warning, marginLeft: 8,
                        display: "inline-flex", alignItems: "center" }}>
           ⚠ {mismatch}
           <HelpIcon topic="symbolic_dim_mismatch" />
@@ -146,9 +283,9 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
         <button data-testid="dim-env-fix-set-H"
                 onClick={() => applyDraft(fixSetH)}
                 title={`Snap H to ${fixSetH.H} (= nh*head_dim)`}
-                style={{ padding: "2px 8px", background: "#dbeafe",
-                         border: "1px solid #2563eb",
-                         color: "#1e40af" }}>
+                style={{ padding: "2px 8px", background: T.accentSoft,
+                         border: `1px solid ${T.accent}`,
+                         color: T.accent }}>
           Snap H → {fixSetH.H}
         </button>
       )}
@@ -156,9 +293,9 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
         <button data-testid="dim-env-fix-set-head_dim"
                 onClick={() => applyDraft(fixSetHeadDim)}
                 title={`Snap head_dim to ${fixSetHeadDim.head_dim} (= H/nh)`}
-                style={{ padding: "2px 8px", background: "#dbeafe",
-                         border: "1px solid #2563eb",
-                         color: "#1e40af" }}>
+                style={{ padding: "2px 8px", background: T.accentSoft,
+                         border: `1px solid ${T.accent}`,
+                         color: T.accent }}>
           Snap head_dim → {fixSetHeadDim.head_dim}
         </button>
       )}

@@ -33,6 +33,7 @@ export interface DtypeCostRow {
 export interface TopBarProps {
   state: SpecState;
   projectName: string;
+  activePreset?: string;
   presets: readonly string[];
   topologies: readonly TopologyFactory[];
   onProjectNameChange: (name: string) => void;
@@ -103,6 +104,8 @@ export interface TopBarProps {
   filterByPlatform?: boolean;
   onFilterByPlatformChange?: (filter: boolean) => void;
   activeDevice?: string;
+  debuggerMode?: boolean;
+  onToggleDebugger?: () => void;
 }
 
 /** V7-K2: shape returned by probe.run RPC. */
@@ -225,9 +228,8 @@ export function TopBar(p: TopBarProps): JSX.Element {
              onChange={(e) => p.onProjectNameChange(e.target.value)}
              style={{ width: 160, fontWeight: 600 }} />
 
-      <select data-testid="preset-launcher" defaultValue=""
-              onChange={(e) => { p.onPresetDrop(e.target.value);
-                                 e.currentTarget.value = ""; }}>
+      <select data-testid="preset-launcher" value={p.activePreset ?? ""}
+              onChange={(e) => { p.onPresetDrop(e.target.value); }}>
         <option value="" disabled>Preset…</option>
         {p.presets.map((n) => <option key={n} value={n}>{n}</option>)}
       </select>
@@ -385,7 +387,23 @@ export function TopBar(p: TopBarProps): JSX.Element {
           : p.trainPaused ? "paused"
           : p.trainInFlight ? "training" : "idle"}
       </span>
-      <div style={{ position: "relative" }}>
+      <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+        {p.onToggleDebugger && (
+          <button
+            data-testid="toggle-debugger-mode"
+            onClick={p.onToggleDebugger}
+            style={{
+              marginRight: 8,
+              background: p.debuggerMode ? "rgba(34, 211, 238, 0.16)" : "var(--vb-surface-3)",
+              color: p.debuggerMode ? "var(--vb-accent)" : "var(--vb-text)",
+              border: `1px solid ${p.debuggerMode ? "var(--vb-accent)" : "var(--vb-border)"}`,
+              fontWeight: 600,
+              boxShadow: p.debuggerMode ? "0 0 10px var(--vb-accent-soft)" : "none",
+            }}
+          >
+            🐛 Debugger
+          </button>
+        )}
         <button data-testid="run-pipeline"
                 onClick={() => p.onRunPipeline("smoke")}
                 style={{ background: "var(--vb-accent)",

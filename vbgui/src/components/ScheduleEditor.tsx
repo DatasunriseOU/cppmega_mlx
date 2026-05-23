@@ -98,7 +98,7 @@ function Sparkline({ values }: { values: number[] }): JSX.Element {
   return (
     <svg width={width} height={height}
          data-testid="schedule-sparkline"
-         style={{ background: "#f9fafb", border: "1px solid #e5e7eb",
+         style={{ background: "var(--vb-surface-2)", border: "1px solid var(--vb-border)",
                   borderRadius: 3 }}>
       <polyline fill="none" stroke="#2563eb" strokeWidth="1.5"
                 points={pts} />
@@ -129,7 +129,7 @@ export function ScheduleEditor({
          style={{ marginTop: 4, padding: 6,
                   border: "1px dashed #d1d5db", borderRadius: 4 }}>
       <label style={FIELD}>
-        <span style={{ color: "#6b7280" }}>Schedule</span>
+        <span style={{ color: "var(--vb-text-muted)" }}>Schedule</span>
         <select data-testid={`schedule-kind-${index}`}
                 value={kind}
                 onChange={(e) => setKind(e.target.value as ScheduleKind)}>
@@ -154,7 +154,7 @@ export function ScheduleEditor({
       )}
       {kind !== "constant" && (
         <label style={FIELD}>
-          <span style={{ color: "#6b7280" }}>warmup_steps</span>
+          <span style={{ color: "var(--vb-text-muted)" }}>warmup_steps</span>
           <input data-testid={`schedule-warmup-${index}`}
                  type="number" min={0} step={1} style={{ width: 70 }}
                  value={value?.warmup_steps ?? 0}
@@ -164,7 +164,7 @@ export function ScheduleEditor({
       )}
       {(kind === "cosine" || kind === "wsd" || kind === "polynomial") && (
         <label style={FIELD}>
-          <span style={{ color: "#6b7280" }}>total_steps</span>
+          <span style={{ color: "var(--vb-text-muted)" }}>total_steps</span>
           <input data-testid={`schedule-total-${index}`}
                  type="number" min={1} step={1} style={{ width: 80 }}
                  value={value?.total_steps ?? 100}
@@ -174,7 +174,7 @@ export function ScheduleEditor({
       )}
       {(kind === "cosine" || kind === "wsd" || kind === "polynomial") && (
         <label style={FIELD}>
-          <span style={{ color: "#6b7280" }}>min_lr_ratio</span>
+          <span style={{ color: "var(--vb-text-muted)" }}>min_lr_ratio</span>
           <input data-testid={`schedule-min-ratio-${index}`}
                  type="number" min={0} max={1} step={0.01}
                  style={{ width: 65 }}
@@ -185,7 +185,7 @@ export function ScheduleEditor({
       )}
       {kind === "wsd" && (
         <label style={FIELD}>
-          <span style={{ color: "#6b7280" }}>decay_steps</span>
+          <span style={{ color: "var(--vb-text-muted)" }}>decay_steps</span>
           <input data-testid={`schedule-decay-${index}`}
                  type="number" min={1} step={1} style={{ width: 70 }}
                  value={value?.decay_steps ?? 100}
@@ -195,7 +195,7 @@ export function ScheduleEditor({
       )}
       {kind === "polynomial" && (
         <label style={FIELD}>
-          <span style={{ color: "#6b7280" }}>power</span>
+          <span style={{ color: "var(--vb-text-muted)" }}>power</span>
           <input data-testid={`schedule-power-${index}`}
                  type="number" min={0.1} step={0.1} style={{ width: 60 }}
                  value={value?.power ?? 2.0}

@@ -59,7 +59,7 @@ export function MemoryBar({
            title={tooltip}
            style={{ display: "inline-flex", gap: 1, alignItems: "flex-end",
                     height: 18, padding: "0 4px",
-                    background: "#f3f4f6", borderRadius: 4 }}>
+                    background: "var(--vb-surface-3)", borderRadius: 4 }}>
         {ranks.map((b, i) => {
           const r = state.device_hbm_bytes > 0
             ? Math.min(1, b / state.device_hbm_bytes) : 0;
@@ -76,7 +76,7 @@ export function MemoryBar({
         <span data-testid="memory-bar-cluster-label"
               style={{ marginLeft: 6, fontSize: 10,
                        fontFamily: "monospace",
-                       color: "#374151" }}>
+                       color: "var(--vb-text-secondary)" }}>
           {ranks.length}× max {formatGB(Math.max(...ranks))}
         </span>
       </div>
@@ -90,7 +90,7 @@ export function MemoryBar({
            data-mode="compact"
            title={tooltip}
            style={{ display: "inline-flex", alignItems: "center",
-                    width: 100, height: 18, background: "#e5e7eb",
+                    width: 100, height: 18, background: "var(--vb-surface-3)",
                     borderRadius: 4, overflow: "hidden",
                     position: "relative" }}>
         <div data-testid="memory-bar-fill"
@@ -101,7 +101,7 @@ export function MemoryBar({
               data-bytes={estimate}
               style={{ position: "relative", margin: "0 auto",
                        fontSize: 10, fontFamily: "monospace",
-                       color: ratio > 0.5 ? "white" : "#111827" }}>
+                       color: "var(--vb-text)" }}>
           {formatGB(estimate)}
         </span>
         {actual != null && (
@@ -118,7 +118,7 @@ export function MemoryBar({
   // non-TopBar consumers still work.
   return (
     <div data-testid="memory-bar" title={tooltip}
-         style={{ flex: 1, height: 24, background: "#e5e7eb",
+         style={{ flex: 1, height: 24, background: "var(--vb-surface-3)",
                   borderRadius: 4, overflow: "hidden",
                   position: "relative" }}>
       <div data-testid="memory-bar-fill"
@@ -128,7 +128,7 @@ export function MemoryBar({
                     display: "flex", alignItems: "center",
                     justifyContent: "center", gap: 6,
                     fontSize: 11, fontFamily: "system-ui, sans-serif",
-                    color: ratio > 0.5 ? "white" : "#111827" }}>
+                    color: "var(--vb-text)" }}>
         <span data-testid="memory-bar-estimate"
               data-bytes={estimate}>
           est {formatGB(estimate)}

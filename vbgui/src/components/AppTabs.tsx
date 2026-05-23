@@ -23,9 +23,9 @@ export function AppTabs({ active, onChange }: AppTabsProps): JSX.Element {
   return (
     <nav role="tablist" data-testid="app-tabs"
          style={{ display: "flex", gap: 4, padding: "4px 8px",
-                  background: "#f9fafb",
-                  borderBottom: "1px solid #e5e7eb",
-                  fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
+                  background: "var(--vb-surface)",
+                  borderBottom: "1px solid var(--vb-border)",
+                  fontFamily: "var(--vb-font)", fontSize: 12 }}>
       {TABS.map((t) => (
         <button key={t.key}
                 role="tab"
@@ -33,11 +33,18 @@ export function AppTabs({ active, onChange }: AppTabsProps): JSX.Element {
                 data-testid={`app-tab-${t.key}`}
                 onClick={() => onChange(t.key)}
                 style={{
-                  padding: "4px 10px", border: "none",
-                  background: active === t.key ? "#fff" : "transparent",
+                  padding: "4px 10px",
+                  border: "none",
+                  background: active === t.key
+                    ? "var(--vb-surface-3)"
+                    : "transparent",
+                  color: active === t.key
+                    ? "var(--vb-text)"
+                    : "var(--vb-text-secondary)",
                   borderRadius: 3,
                   borderBottom: active === t.key
-                    ? "2px solid #2563eb" : "2px solid transparent",
+                    ? "2px solid var(--vb-accent)"
+                    : "2px solid transparent",
                   cursor: "pointer", fontSize: 12,
                   fontWeight: active === t.key ? 600 : 400,
                 }}>

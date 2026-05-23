@@ -5,6 +5,7 @@
 
 import { useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
+import { T } from "@/theme";
 import { HelpIcon } from "@/components/HelpIcon";
 
 export interface LossSurfaceCell {
@@ -40,7 +41,7 @@ const DEFAULT_WD_DELTAS = [0.5, 1.0, 2.0];
 function cellColor(loss: number | null | undefined,
                     min: number | null, max: number | null): string {
   if (loss == null || min == null || max == null || max <= min) {
-    return "#f3f4f6";
+    return T.surface3;
   }
   const t = (loss - min) / (max - min);
   const r = Math.round(40 + 215 * t);
@@ -92,11 +93,15 @@ export function LossSurfaceModal({
     <div data-testid="loss-surface-modal"
          role="dialog" aria-modal="true"
          style={{ position: "fixed", inset: 0, zIndex: 1000,
-                  background: "rgba(0,0,0,0.45)", display: "flex",
+                  background: "rgba(0, 0, 0, 0.7)", display: "flex",
                   alignItems: "center", justifyContent: "center",
-                  padding: 24, fontFamily: "system-ui, sans-serif" }}>
-      <div style={{ background: "white", borderRadius: 8, padding: 18,
+                  padding: 24, fontFamily: T.font }}>
+      <div style={{ background: T.surface,
+                    border: `1px solid ${T.border}`,
+                    color: T.text,
+                    borderRadius: 8, padding: 18,
                     minWidth: 460, maxWidth: 720, maxHeight: "85vh",
+                    boxShadow: T.shadowPop,
                     overflow: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between",
                       alignItems: "center", marginBottom: 8 }}>
@@ -106,28 +111,49 @@ export function LossSurfaceModal({
             <HelpIcon topic="loss_surface_explorer" />
           </h3>
           <button data-testid="loss-surface-close"
-                  onClick={onClose}>×</button>
+                  onClick={onClose}
+                  style={{
+                    background: "transparent", border: "none",
+                    color: T.textSecondary, fontSize: 20, cursor: "pointer",
+                    padding: 0, lineHeight: 1,
+                  }}>×</button>
         </div>
 
-        <div style={{ fontSize: 12, marginBottom: 8 }}>
+        <div style={{ fontSize: 12, marginBottom: 8, color: T.textSecondary }}>
           <label style={{ marginRight: 8 }}>k_steps:</label>
           <input data-testid="loss-surface-k-steps"
                  type="number" min={1} max={64} value={kSteps}
                  onChange={(e) =>
                    setKSteps(Math.max(1, Math.min(64,
                      Number(e.target.value) || 2)))}
-                 style={{ width: 60 }} />
+                 style={{
+                   width: 60,
+                   background: T.surface3,
+                   border: `1px solid ${T.border}`,
+                   color: T.text,
+                   borderRadius: 4,
+                   padding: "2px 6px",
+                 }} />
           <button data-testid="loss-surface-run"
                   onClick={() => void run()}
                   disabled={running}
-                  style={{ marginLeft: 10 }}>
+                  style={{
+                    marginLeft: 10,
+                    background: T.accent,
+                    color: "#0f172a",
+                    border: "none",
+                    borderRadius: 4,
+                    padding: "4px 10px",
+                    fontWeight: "bold",
+                    cursor: "pointer",
+                  }}>
             {running ? "Running…" : "Run sweep"}
           </button>
         </div>
 
         {error && (
           <div data-testid="loss-surface-error"
-               style={{ color: "#b91c1c", fontSize: 12 }}>
+               style={{ color: T.danger, fontSize: 12 }}>
             {error}
           </div>
         )}
@@ -169,7 +195,7 @@ export function LossSurfaceModal({
                                                    minLoss, maxLoss),
                               color: "white", fontSize: 11,
                               border: isBest
-                                ? "3px solid #facc15" : "1px solid #e5e7eb",
+                                ? "3px solid #facc15" : `1px solid ${T.border}`,
                               textAlign: "center",
                               minWidth: 56,
                             }}>
@@ -185,11 +211,11 @@ export function LossSurfaceModal({
             </table>
 
             <div data-testid="loss-surface-best"
-                 style={{ fontSize: 12, marginTop: 4 }}>
+                 style={{ fontSize: 12, marginTop: 4, color: T.textSecondary }}>
               {result.best_loss != null ? (
                 <>
                   best: lr×{result.best_lr_mult}, wd×{result.best_wd_mult}
-                  {" → loss "}{result.best_loss.toFixed(4)}
+                  {" → loss "}<strong style={{ color: T.success }}>{result.best_loss.toFixed(4)}</strong>
                 </>
               ) : (
                 "no successful cells"
@@ -203,8 +229,11 @@ export function LossSurfaceModal({
                                     result.best_wd_mult!);
                         onClose();
                       }}
-                      style={{ marginTop: 8 }}>
-                Apply best to optim
+                      style={{ marginTop: 10, background: T.accent,
+                               color: "#0f172a", border: "none",
+                               padding: "6px 12px", borderRadius: 4,
+                               cursor: "pointer", fontWeight: "bold" }}>
+                Apply recommended multiplier overrides
               </button>
             )}
           </div>

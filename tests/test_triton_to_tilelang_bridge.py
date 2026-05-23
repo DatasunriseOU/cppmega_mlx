@@ -27,6 +27,7 @@ Test policy
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 import subprocess
@@ -35,6 +36,15 @@ import textwrap
 import types
 
 import pytest
+
+_HAS_TORCH = importlib.util.find_spec("torch") is not None
+_CUDA_AVAILABLE = False
+if _HAS_TORCH:
+    try:
+        import torch
+        _CUDA_AVAILABLE = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
+    except Exception:
+        _CUDA_AVAILABLE = False
 
 
 # Triton import-skip is the very first gate so this module is collectable
@@ -237,6 +247,8 @@ def test_bridge_lowering_smoke():
     )
 
 
+@pytest.mark.cuda_required
+@pytest.mark.skipif(not _CUDA_AVAILABLE, reason="CUDA hardware not available")
 def test_bridge_dispatch_lower_smoke():
     """Bridge -> dispatch_lower(prim, target='cuda') end-to-end smoke.
 
@@ -270,16 +282,16 @@ def test_bridge_dispatch_lower_smoke():
     try:
         prim = triton_to_tilelang_prim(kernel, constexprs=constexprs, target="cuda")
     except TritonBridgeError as exc:
-        pytest.xfail(f"POC frontend coverage gap (pre dispatch_lower): {exc}")
+        pytest.skip(f"POC frontend coverage gap (pre dispatch_lower): {exc}")
 
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     try:
         artifact = dispatch_lower(prim, target="cuda")
     except (ImportError, ModuleNotFoundError) as exc:
-        pytest.xfail(f"tilelang/cuda backend unavailable on this host: {exc}")
+        pytest.skip(f"tilelang/cuda backend unavailable: {exc}")
     except RuntimeError as exc:
-        pytest.xfail(f"dispatch_lower raised RuntimeError on cuda target: {exc}")
+        pytest.skip(f"dispatch_lower raised RuntimeError on cuda target: {exc}")
 
     assert artifact is not None, (
         "dispatch_lower returned None — engine path must produce an artifact "

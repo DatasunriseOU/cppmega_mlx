@@ -1,0 +1,30 @@
+name: CUDA Lane
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  cuda-tests:
+    name: Run CUDA-only tests
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run CUDA tests
+        run: |
+          python -m pytest -m "cuda_hardware or cuda_required" -v --tb=short

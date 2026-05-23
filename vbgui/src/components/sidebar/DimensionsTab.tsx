@@ -86,7 +86,7 @@ export function DimensionsTab({
       <table data-testid="dimensions-table"
              style={{ width: "100%", borderCollapse: "collapse" }}>
         <thead>
-          <tr style={{ background: "#f9fafb" }}>
+          <tr style={{ background: "var(--vb-surface-2)" }}>
             <th style={th}>Brick</th>
             <th style={th}>Param</th>
             <th style={th}>Value</th>
@@ -101,7 +101,7 @@ export function DimensionsTab({
                 data-testid={`dim-row-${e.brick}-${e.param}`}
                 onClick={() => onHighlight?.(e.brick)}
                 style={{ cursor: onHighlight ? "pointer" : "default",
-                          borderBottom: "1px solid #f3f4f6" }}>
+                          borderBottom: `1px solid ${T.border}` }}>
               <td style={td}><code>{e.brick}</code></td>
               <td style={td}>{e.param}</td>
               <td style={td}><code>{String(e.value)}</code></td>
@@ -109,9 +109,9 @@ export function DimensionsTab({
                 <span data-testid={`dim-source-${e.brick}-${e.param}`}
                       style={{
                         background: e.source === "auto"
-                          ? "#dbeafe" : "#f3f4f6",
+                          ? "var(--vb-accent-soft)" : "var(--vb-surface-3)",
                         color: e.source === "auto"
-                          ? "#1e40af" : "#374151",
+                          ? "var(--vb-accent)" : "var(--vb-text-secondary)",
                         padding: "1px 6px", borderRadius: 3,
                         fontSize: 10, textTransform: "uppercase",
                       }}>{e.source}</span>
@@ -124,7 +124,7 @@ export function DimensionsTab({
                   <button data-testid={`dim-row-${e.brick}-${e.param}-apply`}
                           onClick={(ev) => { ev.stopPropagation();
                                              onApply(e); }}
-                          style={{ fontSize: 10, padding: "1px 6px" }}>
+                          style={{ fontSize: 10, padding: "1px 6px", background: T.accent, color: T.accentContrast, border: "none", borderRadius: 4, cursor: "pointer" }}>
                     Apply
                   </button>
                 )}
@@ -132,7 +132,7 @@ export function DimensionsTab({
             </tr>
           ))}
           {visible.length === 0 && (
-            <tr><td colSpan={5} style={{ ...td, color: "#9ca3af",
+            <tr><td colSpan={5} style={{ ...td, color: "var(--vb-text-muted)",
                                           fontStyle: "italic" }}>
               No matching entries.
             </td></tr>
@@ -147,13 +147,13 @@ export function DimensionsTab({
       <details data-testid="dimensions-flow-trace"
                style={{ marginTop: 12 }}>
         <summary style={{ cursor: "pointer", fontWeight: 600,
-                          color: "#374151" }}>
+                          color: "var(--vb-text-secondary)" }}>
           Flow trace ({log.length} step{log.length === 1 ? "" : "s"})
         </summary>
         <ol data-testid="dimensions-flow-trace-list"
             style={{ margin: "6px 0 0 0", paddingLeft: 24,
                      fontFamily: "ui-monospace, monospace",
-                     fontSize: 11, color: "#111827" }}>
+                     fontSize: 11, color: "var(--vb-text)" }}>
           {log.map((e, i) => (
             <li key={`flow-${e.brick}-${e.param}-${i}`}
                 data-testid={`flow-step-${i}`}
@@ -162,7 +162,7 @@ export function DimensionsTab({
                 data-source={e.source}
                 style={{ marginBottom: 2,
                          color: e.source === "auto"
-                           ? "#1e40af" : "#111827" }}>
+                            ? "var(--vb-accent)" : "var(--vb-text)" }}>
               <strong>{e.brick}.{e.param}</strong> ={" "}
               <code>{String(e.value)}</code>{" "}
               <em style={{ color: T.textSecondary }}>
@@ -179,6 +179,6 @@ export function DimensionsTab({
 const th: React.CSSProperties = {
   textAlign: "left", padding: "4px 6px",
   color: T.textSecondary, fontSize: 11, fontWeight: 600,
-  borderBottom: "1px solid #e5e7eb",
+  borderBottom: "1px solid var(--vb-border)",
 };
 const td: React.CSSProperties = { padding: "4px 6px" };

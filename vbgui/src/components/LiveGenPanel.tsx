@@ -48,8 +48,8 @@ export function LiveGenPanel({
 
   return (
     <div data-testid="live-gen-panel"
-         style={{ padding: 8, border: "1px solid #e5e7eb",
-                  borderRadius: 4, background: "#f9fafb",
+         style={{ padding: 8, border: "1px solid var(--vb-border)",
+                  borderRadius: 4, background: "var(--vb-surface-2)",
                   fontFamily: "system-ui, sans-serif", fontSize: 11 }}>
       <div style={{ display: "flex", justifyContent: "space-between",
                     marginBottom: 4 }}>
@@ -62,7 +62,7 @@ export function LiveGenPanel({
         )}
       </div>
       {events.length === 0 ? (
-        <div data-testid="live-gen-panel-empty" style={{ color: "#9ca3af" }}>
+        <div data-testid="live-gen-panel-empty" style={{ color: "var(--vb-text-muted)" }}>
           waiting for first token…
         </div>
       ) : (
@@ -84,7 +84,7 @@ export function LiveGenPanel({
             )}
           </div>
           <div data-testid="live-gen-panel-tail"
-               style={{ fontFamily: "monospace", color: "#374151",
+               style={{ fontFamily: "monospace", color: "var(--vb-text-secondary)",
                         whiteSpace: "pre-wrap", maxHeight: 80,
                         overflowY: "auto" }}>
             {window.map((e) => e.token_id).join(" ")}

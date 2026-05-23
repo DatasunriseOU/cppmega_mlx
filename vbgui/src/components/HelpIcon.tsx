@@ -9,6 +9,7 @@ import {
   TOPIC_FOUNDATIONS, MATH_FOUNDATIONS,
   WorkedExampleDiagram, MathLink,
   BACKWARD_TOPICS,
+  BackwardEntry,
 } from "./diagrams";
 import { T } from "@/theme";
 
@@ -29,14 +30,178 @@ export interface HelpTopic {
    *  Jacobian / VJP, and how the upstream cotangent ḡ = dL/dy is
    *  pulled back to dL/dx + dL/d{params}. Pulled in from
    *  BACKWARD_TOPICS so authoring stays declarative. */
-  backward?: {
-    differentiates: string;
-    chain_rule: string;
-    key_identity: string;
-  };
+  backward?: BackwardEntry;
 }
 
 export const HELP_TOPICS: Record<string, HelpTopic> = {
+  brick_tokenizer: {
+    title: "Tokenizer",
+    what: "Processes raw input text into a sequence of integer token IDs using the model's vocabulary.",
+    why: "Required at the model input boundary to convert readable natural language queries into numeric vectors.",
+    inputs: "Natural language query strings.",
+    outputs: "Integer token IDs matching model vocabulary bounds.",
+    normalization: "No normalization applied."
+  },
+  brick_detokenizer: {
+    title: "De-Tokenizer",
+    what: "Converts output token probability logits back into readable natural language text.",
+    why: "Required at the model output boundary to map predicted numbers back to human-comprehensible output tokens.",
+    inputs: "Token logits tensor of shape [B, S, V] or predicted index.",
+    outputs: "Decoded output natural language words/characters.",
+    normalization: "Logits must be unnormalized or softmax-normalized."
+  },
+  // ----- loss -----
+  loss_kind: {
+    title: "Loss Function Kind",
+    what: "Specifies the objective function optimized during training. Choices include classic Cross-Entropy, multi-token forecasting, or information-theory guided shapes.",
+    why: "Different objectives anchor representations differently. Cross-entropy focuses purely on the next token, whereas MTP Weighted guides models to predict multiple future tokens simultaneously."
+  },
+  loss_mtp_k: {
+    title: "Multi-Token Prediction Factor (K)",
+    what: "How many future steps/tokens the model forecasts in parallel at every step.",
+    why: "Higher K trains richer representations by forcing the model to anticipate long-term structure directly from hidden states."
+  },
+  loss_mtp_beta: {
+    title: "Weighted Loss Discount (beta)",
+    what: "Geometric discount factor for sequential token projections: L = \\sum_{i=1}^K \\beta^{i-1} L_i.",
+    why: "Maintains primary focus on the immediate next token while gracefully incorporating future forecasts with lesser magnitude to prevent optimization instability."
+  },
+  loss_ifim_lambda: {
+    title: "IFIM Shaped Lambda",
+    what: "Scalar weight scaling the Information-theoretic Fisher Information Matrix shaping loss.",
+    why: "Guides local curvature during step updates, stabilizing numerical bounds for high learning-rate runs."
+  },
+  loss_mhc_lambda: {
+    title: "MHC Attn-Bias Lambda",
+    what: "Weight of the causal multi-head consistency regularization term.",
+    why: "Enforces alignment across query/key mappings, preventing collapsed attention states."
+  },
+  loss_custom_fn: {
+    title: "Custom Function Name",
+    what: "C++ or Python hook specifying a custom loss implementation from cppmega.mlx.",
+    why: "Allows experimental custom fusions without modifying the graphical engine."
+  },
+  // ----- optim -----
+  optim_kind: {
+    title: "Optimizer Variant",
+    what: "Algorithm utilized to compute parameter steps from gradient estimates. Variants include standard AdamW, Lion, SGD, or Muon.",
+    why: "Different algorithms scale coordinates differently. Muon updates weights via orthogonalized matrices for faster block convergence."
+  },
+  optim_grad_clip: {
+    title: "Gradient Clip Cap",
+    what: "Maximum allowed global L2 norm for standard gradient updates.",
+    why: "Clips gradients exceeding this cap to prevent numerical explosion."
+  },
+  optim_mixed_precision: {
+    title: "Mixed Precision",
+    what: "Enables multi-precision execution combining FP16, BF16, and FP8 scaling regimes.",
+    why: "Reduces memory footprints and increases tensor-core compute bandwidth."
+  },
+  optim_group_matcher: {
+    title: "Group Matcher Regex",
+    what: "Regex defining which parameter names fall into this specific optimizer parameter group.",
+    why: "Allows fine-grained parameter groupings (e.g. separate weight decay for biases vs weights)."
+  },
+  optim_group_lr: {
+    title: "Learning Rate",
+    what: "Base step-size factor applied to updates in this group.",
+    why: "Different parameter types (e.g. embeddings vs projections) scale better at different magnitudes."
+  },
+  optim_group_wd: {
+    title: "Weight Decay",
+    what: "L2 regularization multiplier applied directly to weight coordinates.",
+    why: "Prevents overparameterization and forces weights to decay gracefully toward zero."
+  },
+  optim_group_betas: {
+    title: "Betas Coefficient",
+    what: "Exponential decay rates for moving average gradient estimates.",
+    why: "Balances momentum and history to negotiate saddle points safely."
+  },
+  optim_group_schedule: {
+    title: "Schedule Kind",
+    what: "Mathematical schedule scaling learning rates over training steps (e.g. Cosine, Linear Warmup).",
+    why: "Improves generalization by slowly increasing learning rate at startup, and annealing to zero at shutdown."
+  },
+  optim_group_warmup: {
+    title: "Warmup Steps",
+    what: "Number of steps taken to linearly ramp learning rate from zero up to the base rate.",
+    why: "Prevents initial gradient shocks from disrupting pre-trained weight clusters."
+  },
+  // ----- train -----
+  train_num_steps: {
+    title: "Training Steps",
+    what: "Total number of batch steps executed in the training sequence.",
+    why: "Determines overall training duration and dataset exposure."
+  },
+  train_warm_start: {
+    title: "Warm Start",
+    what: "Initializes model parameters and optimizer buffers from the last checkpoint in active run history.",
+    why: "Saves compute by starting from a pre-stabilized point instead of cold initialization."
+  },
+  train_save_path: {
+    title: "Save Checkpoint Path",
+    what: "Relative or absolute target path where model weights will be written periodically.",
+    why: "Ensures durability of model training against interruptions or crashes."
+  },
+  train_load_path: {
+    title: "Load Weight Path",
+    what: "Checkpoint file path consumed to initialize weights for warm start.",
+    why: "Specifies exactly which past configuration to resume training on."
+  },
+  train_fim: {
+    title: "FIM Enabled",
+    what: "Enables Fill-In-the-Middle causal template formatting for training data.",
+    why: "Empowers autoregressive models to infill code/text bidirectionally."
+  },
+  train_compress: {
+    title: "Dtype Compression",
+    what: "Specifies quantization settings (e.g. weights-int8) applied during checkpoint writes.",
+    why: "Shrinks disk footprint and accelerates loading times by saving parameters in quantized low-bit formats."
+  },
+  train_dtype: {
+    title: "Master Precision Mode",
+    what: "Specifies precision for optimizer variables (FP32, BF16, FP16, or Auto).",
+    why: "Trades mathematical precision for compute throughput and memory savings."
+  },
+  // ----- sharding -----
+  sharding_topology: {
+    title: "Sharding Topology",
+    what: "Distributed device topology scheme (e.g. single-process or multi-GPU pipeline).",
+    why: "Establishes layout parameters matching available machine clusters."
+  },
+  sharding_degree: {
+    title: "Degree of Parallelism",
+    what: "Number of parallel ranks sharded along model, tensor, or data dimensions.",
+    why: "Directly determines how parameter clusters are split across hardware devices."
+  },
+  // ----- rewriter -----
+  rewriter_k: {
+    title: "Multi-Token Predictions (K)",
+    what: "Number of forecasting heads injected by MTPRewriter.",
+    why: "Configures head width for parallel multi-prediction."
+  },
+  rewriter_weight: {
+    title: "Loss Weight Factor",
+    what: "Gradient scale weight for multi-token forecasts relative to main CE loss.",
+    why: "Balances regular generation loss against foresight training losses."
+  },
+  rewriter_lambda: {
+    title: "IFIM Shaping Factor",
+    what: "Lambda parameter injected dynamically for gradient bounds.",
+    why: "Directs curvature constraint coefficients."
+  },
+  rewriter_window: {
+    title: "Attention Window Bias",
+    what: "Context window scope biased by MHCRewriter.",
+    why: "Focuses query bounds inside local spans."
+  },
+  // ----- side channels -----
+  side_channels_list: {
+    title: "Side Channels",
+    what: "Special non-gradient auxiliary pathways (like token_ids, doc_ids, attention_masks).",
+    why: "Allows passing contextual indexing down the block pipeline without inflating standard tensor dimensions."
+  },
+
   // ----- dim_env -----
   dim_env_H: {
     title: "dim_env.H — residual stream width",

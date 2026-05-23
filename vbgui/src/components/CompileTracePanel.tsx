@@ -78,7 +78,7 @@ export function CompileTracePanel({
   }
   if (!trace) {
     return <div data-testid="compile-trace-loading"
-                style={{ padding: 12, color: "#6b7280" }}>loading…</div>;
+                style={{ padding: 12, color: "var(--vb-text-muted)" }}>loading…</div>;
   }
 
   return (
@@ -118,11 +118,11 @@ export function CompileTracePanel({
                       display: "flex", alignItems: "center",
                       justifyContent: "center" }}>
           <div onClick={(e) => e.stopPropagation()}
-               style={{ background: "#fff", padding: 16, borderRadius: 8,
+               style={{ background: "var(--vb-surface-2)", padding: 16, borderRadius: 8,
                         minWidth: 400, maxHeight: "60vh",
                         overflowY: "auto" }}>
             <h4 style={{ margin: "0 0 8px" }}>Sync-necessity advice</h4>
-            <p style={{ margin: "0 0 8px", color: "#6b7280" }}>
+            <p style={{ margin: "0 0 8px", color: "var(--vb-text-muted)" }}>
               z3 status: {sync.z3_solver_status} ·
               {sync.z3_elapsed_ms.toFixed(1)} ms
             </p>
@@ -155,7 +155,7 @@ export function CompileTracePanel({
       <table style={{ marginTop: 8, borderCollapse: "collapse",
                       width: "100%" }}>
         <thead>
-          <tr style={{ borderBottom: "1px solid #e5e7eb" }}>
+          <tr style={{ borderBottom: "1px solid var(--vb-border)" }}>
             <th style={th}>op</th>
             <th style={th}>backend</th>
             <th style={th}>group</th>
@@ -197,13 +197,13 @@ export function CompileTracePanel({
 }
 
 const th: React.CSSProperties = {
-  textAlign: "left", padding: "4px 6px", color: "#374151",
+  textAlign: "left", padding: "4px 6px", color: "var(--vb-text-secondary)",
   fontWeight: 600,
 };
 
 const td: React.CSSProperties = {
-  padding: "4px 6px", color: "#1f2937",
-  borderBottom: "1px solid #f3f4f6",
+  padding: "4px 6px", color: "var(--vb-text)",
+  borderBottom: "1px solid var(--vb-border-soft)",
 };
 
 function chip(bg: string, fg: string): React.CSSProperties {

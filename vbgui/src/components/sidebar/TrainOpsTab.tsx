@@ -57,7 +57,7 @@ export function TrainOpsTab({
         
         {onParallelCompose && (
           <div style={{ background: T.surface3, border: `1px solid ${T.border}`, borderRadius: 6, padding: 10 }}>
-            <ParallelComposeBar onCompose={onParallelCompose} />
+            <ParallelComposeBar onCompose={onParallelCompose} rpc={rpc} presets={PRESET_LIST} />
           </div>
         )}
         

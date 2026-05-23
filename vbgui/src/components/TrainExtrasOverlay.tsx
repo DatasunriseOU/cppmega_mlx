@@ -279,9 +279,9 @@ function _PanelShell({
   return (
     <div data-testid={testid}
          style={{ marginTop: 4, padding: "4px 8px",
-                  border: "1px solid #e5e7eb", borderRadius: 4,
-                  background: "#fafaf9", fontSize: 11 }}>
-      <div style={{ fontWeight: 600, color: "#374151",
+                  border: "1px solid var(--vb-border)", borderRadius: 4,
+                  background: "var(--vb-surface-2)", fontSize: 11 }}>
+      <div style={{ fontWeight: 600, color: "var(--vb-text-secondary)",
                     marginBottom: 4 }}>{title}</div>
       {children}
     </div>
@@ -293,8 +293,8 @@ function _MetricRow({
 }: { testid: string; label: string; value: string }) {
   return (
     <div style={{ display: "flex", gap: 6 }}>
-      <span style={{ color: "#6b7280", minWidth: 110 }}>{label}:</span>
-      <span data-testid={testid} style={{ color: "#111827",
+      <span style={{ color: "var(--vb-text-muted)", minWidth: 110 }}>{label}:</span>
+      <span data-testid={testid} style={{ color: "var(--vb-text)",
                                            fontFamily: "monospace" }}>
         {value}
       </span>
@@ -405,7 +405,7 @@ function Badge({
      tone?: "neutral" | "ok" | "info" | "warn";
      help?: string }): JSX.Element {
   const palette = {
-    neutral: { bg: "#f3f4f6", fg: "#374151", border: "#d1d5db" },
+    neutral: { bg: "var(--vb-surface-3)", fg: "var(--vb-text-secondary)", border: "#d1d5db" },
     ok:      { bg: "#dcfce7", fg: "#166534", border: "#86efac" },
     info:    { bg: "#dbeafe", fg: "#1e40af", border: "#93c5fd" },
     warn:    { bg: "#fef3c7", fg: "#92400e", border: "#fcd34d" },
@@ -434,7 +434,7 @@ function BrickKindsRow({
     <div data-testid="extras-brick-kinds-row"
          style={{ display: "flex", gap: 4, flexWrap: "wrap",
                   alignItems: "center" }}>
-      <span style={{ color: "#6b7280", fontSize: 11 }}>brick kinds:</span>
+      <span style={{ color: "var(--vb-text-muted)", fontSize: 11 }}>brick kinds:</span>
       {arr.map((k) => (
         <span key={k}
               data-testid={`extras-brick-kind-${k}`}
@@ -488,7 +488,7 @@ function ShardingAppliedPanel({
       <HelpIcon topic="metric_sharding" />
       <span data-testid="extras-sharding-applied"
             style={{ marginLeft: 6,
-                     color: sharding_applied ? "#0e7490" : "#6b7280" }}>
+                     color: sharding_applied ? "#0e7490" : "var(--vb-text-muted)" }}>
         applied: <code>{sharding_applied ? "yes" : "no"}</code>
       </span>
       {typeof per_rank_param_bytes === "number" && (

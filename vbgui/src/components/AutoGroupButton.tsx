@@ -35,12 +35,20 @@ export interface AutoGroupButtonProps {
 }
 
 function nodesToGraph(nodes: Node[], edges: Edge[]) {
+  const modelNodes = nodes.filter(
+    (n) => n.type !== "tokenizer_virtual" && n.type !== "detokenizer_virtual"
+  );
+  const modelNodeIds = new Set(modelNodes.map((n) => n.id));
+  const modelEdges = edges.filter(
+    (e) => modelNodeIds.has(e.source) && modelNodeIds.has(e.target)
+  );
+
   return {
-    nodes: nodes.map((n) => {
+    nodes: modelNodes.map((n) => {
       const data = n.data as { kind?: string; params?: Record<string, unknown> };
       return { id: n.id, kind: data.kind ?? "mlp", params: data.params ?? {} };
     }),
-    edges: edges.map((e) => ({ src: e.source, dst: e.target })),
+    edges: modelEdges.map((e) => ({ src: e.source, dst: e.target })),
   };
 }
 

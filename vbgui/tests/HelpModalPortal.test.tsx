@@ -19,6 +19,9 @@ describe("V7-Q12 HelpModal renders via createPortal(document.body)", () => {
 
     // It must be somewhere under document.body though.
     expect(document.body.contains(modal)).toBe(true);
+
+    const backdrop = screen.getByTestId("help-modal-backdrop");
+    expect(backdrop.parentElement).toBe(document.body);
   });
 
   it("opening an adapter ? also portals out", () => {
@@ -27,5 +30,8 @@ describe("V7-Q12 HelpModal renders via createPortal(document.body)", () => {
     const modal = screen.getByTestId("help-modal-adapter_rmsnorm");
     expect(container.contains(modal)).toBe(false);
     expect(document.body.contains(modal)).toBe(true);
+
+    const backdrop = screen.getByTestId("help-modal-backdrop");
+    expect(backdrop.parentElement).toBe(document.body);
   });
 });

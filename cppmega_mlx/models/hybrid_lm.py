@@ -48,6 +48,7 @@ from cppmega_mlx.runtime.path_c_physical_abi import (
     PathCPhysicalAbiBankOwner,
     logical_bank_view,
     make_physical_abi_bank_owner,
+    path_c_top_level_kernel_buffer_specs,
     write_into_bank_slot,
 )
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
@@ -1130,10 +1131,17 @@ class HybridTinyLM(nn.Module):
 
         This drives the same schedule planner the production runtime uses and
         returns the generated PrimFunc (carrying the physical-ABI attrs), or
-        ``None`` when no Path C route region exists. The model never caches the
-        artifact — callers that need to reuse it across calls should hold the
-        returned reference themselves.
+        ``None`` when no Path C route region exists. Results are cached per
+        ``sequence_length`` so repeated calls return the same object.
         """
+        cache: dict[int | None, Any] = getattr(
+            self, "_prim_func_cache", None,
+        ) or {}
+        if not hasattr(self, "_prim_func_cache"):
+            self._prim_func_cache = cache
+        if sequence_length in cache:
+            return cache[sequence_length]
+
         from cppmega_mlx.runtime.path_c_fusion_schedules import (
             plan_path_c_fusion_schedule_for_region,
         )
@@ -1163,21 +1171,22 @@ class HybridTinyLM(nn.Module):
         schedule_target = getattr(planned, "schedule_target", None)
         if schedule_target is None:
             return None
-        return schedule_target.schedule_template(planned.region)
+        result = schedule_target.schedule_template(planned.region)
+        cache[sequence_length] = result
+        return result
 
     def make_path_c_physical_abi_bank_owner(
         self,
         *,
         sequence_length: int | None = None,
     ) -> PathCPhysicalAbiBankOwner | None:
-        """Allocate the physical ABI banks the generated fused PrimFunc needs.
+        """Allocate the caller-owned buffers the generated fused PrimFunc needs.
 
         Returns a validated :class:`PathCPhysicalAbiBankOwner` whose ``buffers``
         are freshly zero-initialised MLX arrays sized exactly to the generated
-        ``_cppmega_path_c_physical_buffer_abi_shapes`` map (dtype is taken from
-        the corresponding logical-buffer placement so every bank reflects the
-        generated kernel ABI). The owner never repacks or copies model tensors;
-        it only owns the bank arrays so the runtime can bind kernel arguments
+        dtype banks plus any top-level spilled scratch parameters declared by
+        the generated PrimFunc. The owner never repacks or copies model
+        tensors; it only owns kernel buffers so the runtime can bind arguments
         in declared order.
 
         Returns ``None`` when no Path C route region exists for the model.
@@ -1218,6 +1227,17 @@ class HybridTinyLM(nn.Module):
             bank_buffers[str(bank)] = mx.zeros(
                 tuple(int(dim) for dim in tuple(shape)),
                 dtype=mx_dtype,
+            )
+        for name, spec in path_c_top_level_kernel_buffer_specs(
+            prim_func,
+            physical_abi_map=abi_map,
+            physical_abi_shapes=abi_shapes,
+        ).items():
+            if name in bank_buffers:
+                continue
+            bank_buffers[name] = mx.zeros(
+                tuple(int(dim) for dim in tuple(spec["shape"])),
+                dtype=_path_c_bank_dtype(str(spec["dtype"])),
             )
         profile_name = str(
             getattr(self, "path_c_profile_name", "HybridTinyLM")

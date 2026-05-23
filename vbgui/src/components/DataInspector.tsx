@@ -250,7 +250,9 @@ export function DataInspector({
         </button>
         <button data-testid="hf-quickstart-modal-open"
                 onClick={() => setHfModalOpen(true)}
-                style={{ background: "#eef2ff", color: "#3730a3" }}>
+                style={{ background: "var(--vb-accent-soft)",
+                         color: "var(--vb-accent)",
+                         border: "1px solid var(--vb-border)" }}>
           HF quickstart
         </button>
       </header>
@@ -261,7 +263,7 @@ export function DataInspector({
         onResult={(parquetPath) => setPath(parquetPath)}
       />
       <header style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <span style={{ fontSize: 11, color: "#6b7280" }}>Tokenizer:</span>
+        <span style={{ fontSize: 11, color: "var(--vb-text-muted)" }}>Tokenizer:</span>
         <input data-testid="data-tokenizer-path"
                type="text" placeholder="/path/to/tokenizer.json (optional)"
                value={tokenizerSource}
@@ -294,7 +296,7 @@ export function DataInspector({
       {result && (
         <>
           <div data-testid="data-metrics"
-               style={{ fontSize: 11, color: "#374151" }}>
+               style={{ fontSize: 11, color: "var(--vb-text-secondary)" }}>
             {result.total_rows} rows · token col = {result.token_column} ·
             bytes/tok avg {result.bytes_per_token_avg.toFixed(2)}
             {" "}p95 {result.bytes_per_token_p95.toFixed(2)}
@@ -305,7 +307,7 @@ export function DataInspector({
             <div data-testid="data-corpus-stats"
                  style={{ border: "1px solid #d1d5db", borderRadius: 4,
                           padding: 8, fontSize: 11,
-                          background: "#f9fafb",
+                          background: "var(--vb-surface-2)",
                           fontFamily: "monospace" }}>
               <div style={{ fontWeight: 600, marginBottom: 4 }}>
                 corpus stats (V7-G04)
@@ -337,18 +339,18 @@ export function DataInspector({
               {result.shards.map((shard) => (
                 <div key={`${shard.index}-${shard.path}`}
                      data-testid={`data-shard-${shard.index}`}
-                     style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+                     style={{ border: "1px solid var(--vb-border)", borderRadius: 4,
                               padding: 6, fontSize: 11 }}>
                   <div style={{ display: "flex", justifyContent: "space-between",
                                 gap: 6 }}>
                     <strong>shard {shard.index + 1}/{result.shards?.length ?? 1}</strong>
                     <span>{shard.row_count} rows</span>
                   </div>
-                  <div style={{ color: "#6b7280", fontFamily: "monospace",
+                  <div style={{ color: "var(--vb-text-muted)", fontFamily: "monospace",
                                 overflowWrap: "anywhere" }}>
                     {shard.path}
                   </div>
-                  <div style={{ color: "#6b7280" }}>
+                  <div style={{ color: "var(--vb-text-muted)" }}>
                     {shard.byte_size} bytes
                   </div>
                 </div>
@@ -383,7 +385,7 @@ export function DataInspector({
                           gap: 6 }}>
               {Object.entries(result.side_channel_families).map(([name, fam]) => (
                 <div key={name} data-testid={`data-family-${name}`}
-                     style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+                     style={{ border: "1px solid var(--vb-border)", borderRadius: 4,
                               padding: 6, fontSize: 11 }}>
                   <div style={{ display: "flex", justifyContent: "space-between",
                                 gap: 6 }}>
@@ -394,11 +396,11 @@ export function DataInspector({
                     </span>
                   </div>
                   <div data-testid={`data-family-${name}-alignment`}
-                       style={{ color: "#6b7280" }}>
+                       style={{ color: "var(--vb-text-muted)" }}>
                     align={fam.token_alignment} · graph={fam.graph_remapping}
                   </div>
                   <div data-testid={`data-family-${name}-provenance`}
-                       style={{ color: "#6b7280" }}>
+                       style={{ color: "var(--vb-text-muted)" }}>
                     provenance={fam.provenance} · non-null {fam.non_null_ratio.toFixed(2)}
                   </div>
                   {fam.missing_columns.length > 0 && (
@@ -420,7 +422,7 @@ export function DataInspector({
                           gap: 6 }}>
               {Object.entries(result.edge_distributions).map(([name, dist]) => (
                 <div key={name} data-testid={`data-edge-distribution-${name}`}
-                     style={{ border: "1px solid #e5e7eb", borderRadius: 4,
+                     style={{ border: "1px solid var(--vb-border)", borderRadius: 4,
                               padding: 6, fontSize: 11 }}>
                   <div style={{ display: "flex", justifyContent: "space-between",
                                 gap: 6 }}>
@@ -430,14 +432,14 @@ export function DataInspector({
                       {dist.synthetic_0_to_7_only ? "synthetic 0..7" : "real"}
                     </span>
                   </div>
-                  <div style={{ color: "#374151" }}>
+                  <div style={{ color: "var(--vb-text-secondary)" }}>
                     edges {dist.edge_count} · rows {dist.non_empty_rows}/{dist.row_count}
                   </div>
-                  <div style={{ color: "#6b7280" }}>
+                  <div style={{ color: "var(--vb-text-muted)" }}>
                     ids {dist.min_node_id ?? "n/a"}..max {dist.max_node_id ?? "n/a"} ·
                     distinct {dist.distinct_node_count}
                   </div>
-                  <div style={{ color: "#6b7280" }}>
+                  <div style={{ color: "var(--vb-text-muted)" }}>
                     per-row {dist.per_row_min}/{dist.per_row_avg.toFixed(2)}/{dist.per_row_max}
                   </div>
                 </div>
@@ -447,14 +449,14 @@ export function DataInspector({
 
           <div data-testid="data-rows"
                style={{ flex: 1, overflowY: "auto",
-                        border: "1px solid #e5e7eb",
+                        border: "1px solid var(--vb-border)",
                         borderRadius: 4 }}>
             {result.rows.map((row) => (
               <div key={row.row_index}
                    data-testid={`data-row-${row.row_index}`}
-                   style={{ padding: 6, borderBottom: "1px solid #f3f4f6",
+                   style={{ padding: 6, borderBottom: "1px solid var(--vb-border-soft)",
                             fontFamily: "monospace", fontSize: 11 }}>
-                <div style={{ color: "#6b7280",
+                <div style={{ color: "var(--vb-text-muted)",
                               display: "flex", gap: 6, alignItems: "center" }}>
                   <span>row #{row.row_index}</span>
                   {roundtrip.has(row.row_index) && (() => {
@@ -530,8 +532,8 @@ function Ribbon({ channel, colorIdx, value, tokenCount, rowIndex }: RibbonProps)
     return (
       <div data-testid={`data-ribbon-${rowIndex}-${channel}`}
            style={{ display: "flex", gap: 2, padding: "2px 0",
-                    fontSize: 10, color: "#374151" }}>
-        <span style={{ width: 96, color: "#6b7280" }}>{channel}:</span>
+                    fontSize: 10, color: "var(--vb-text-secondary)" }}>
+        <span style={{ width: 96, color: "var(--vb-text-muted)" }}>{channel}:</span>
         {value.slice(0, tokenCount).map((v, i) => (
           <span key={i}
                 style={{ background: color, padding: "0 3px",
@@ -545,8 +547,8 @@ function Ribbon({ channel, colorIdx, value, tokenCount, rowIndex }: RibbonProps)
   if (isScalarRibbon(value)) {
     return (
       <div data-testid={`data-ribbon-${rowIndex}-${channel}`}
-           style={{ fontSize: 10, color: "#374151" }}>
-        <span style={{ color: "#6b7280" }}>{channel}: </span>
+           style={{ fontSize: 10, color: "var(--vb-text-secondary)" }}>
+        <span style={{ color: "var(--vb-text-muted)" }}>{channel}: </span>
         <span style={{ background: color, padding: "0 4px",
                        borderRadius: 2 }}>{value}</span>
       </div>
@@ -554,7 +556,7 @@ function Ribbon({ channel, colorIdx, value, tokenCount, rowIndex }: RibbonProps)
   }
   return (
     <div data-testid={`data-ribbon-${rowIndex}-${channel}`}
-         style={{ fontSize: 10, color: "#6b7280" }}>
+         style={{ fontSize: 10, color: "var(--vb-text-muted)" }}>
       {channel}: <em>{JSON.stringify(value)}</em>
     </div>
   );

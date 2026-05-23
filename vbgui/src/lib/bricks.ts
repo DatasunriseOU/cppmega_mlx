@@ -9,7 +9,8 @@ export type BrickCategory =
   | "sparse_attn"
   | "cross_attn"
   | "norm_or_proj"
-  | "nonlinear_rnn";
+  | "nonlinear_rnn"
+  | "io";
 
 export interface BrickMeta {
   kind: string;
@@ -26,6 +27,7 @@ export const CATEGORY_COLORS: Record<BrickCategory, string> = {
   cross_attn:     "#ec4899",   // pink
   norm_or_proj:   "#6b7280",   // gray
   nonlinear_rnn:  "#ef4444",   // red
+  io:             "#6366f1",   // indigo
 };
 
 // 25 bricks (matches BLOCK_BUILDERS post GalCov Stage B).
@@ -63,6 +65,9 @@ export const BRICKS: readonly BrickMeta[] = [
   { kind: "per_layer_embed", label: "Per-Layer Embed",     category: "norm_or_proj" },
   // nonlinear_rnn
   { kind: "mlstm",           label: "mLSTM",               category: "nonlinear_rnn" },
+  // io
+  { kind: "tokenizer",       label: "Tokenizer",           category: "io" },
+  { kind: "detokenizer",     label: "De-Tokenizer",         category: "io" },
 ];
 
 export interface AdapterMeta {

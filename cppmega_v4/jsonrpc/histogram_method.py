@@ -95,24 +95,29 @@ def inspect_histogram(params: HistogramParams,
     hidden = int(dim_env.get("H", 128)) if isinstance(dim_env, dict) \
         else int(getattr(dim_env, "H", 128))
     brick_params = dict(getattr(brick_node, "params", {}) or {})
-    if kind in BLOCK_BUILDERS:
-        module = BLOCK_BUILDERS[kind](hidden, brick_params)
-    elif kind in {"rmsnorm", "layernorm"}:
+    clean_kind = kind.replace("adapter_", "")
+    if clean_kind in {"residual", "merge_heads", "split_heads", "transpose_bnsd"}:
+        # Pure plumbing node — no parameters to histogram.
+        raise ValueError(
+            f"brick_id={params.brick_id!r} kind={kind!r} has no "
+            f"trainable weights ({clean_kind} is a plumbing node with no parameters)")
+    elif clean_kind in BLOCK_BUILDERS:
+        module = BLOCK_BUILDERS[clean_kind](hidden, brick_params)
+    elif clean_kind in {"rmsnorm", "layernorm"}:
         # Norm primitives aren't in BLOCK_BUILDERS — instantiate
         # directly so 'Inspect weight histogram' works on canvas norm
         # nodes (e.g. tiny_aya rmsnorm tail). eps defaults to 1e-5.
         from cppmega_v4.models.unified_superblock_v4 import _make_norm
         eps = float(brick_params.get("eps", 1e-5))
-        module = _make_norm(kind, hidden, eps)
+        module = _make_norm(clean_kind, hidden, eps)
         if module is None:
             raise ValueError(
                 f"brick_id={params.brick_id!r} norm kind={kind!r} "
                 f"resolved to a no-op (no weights to inspect)")
-    elif kind == "residual":
-        # Pure plumbing node — no parameters to histogram.
-        raise ValueError(
-            f"brick_id={params.brick_id!r} kind='residual' has no "
-            f"trainable weights (residual is a join, not a module)")
+    elif clean_kind == "linear_bridge":
+        H_in = int(brick_params.get("H_in", hidden))
+        H_out = int(brick_params.get("H_out", hidden))
+        module = nn.Linear(H_in, H_out, bias=False)
     else:
         raise ValueError(
             f"brick_id={params.brick_id!r} has unknown kind={kind!r}"

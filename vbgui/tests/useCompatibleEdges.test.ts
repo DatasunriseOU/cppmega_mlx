@@ -37,4 +37,20 @@ describe("makeIsValidConnection", () => {
     expect(isValid({ source: "x", target: "y" })).toBe(false);
     expect(isValid({ source: null, target: "y" })).toBe(false);
   });
+
+  it("always allows connection if source is tokenizer", () => {
+    const isValid = makeIsValidConnection(
+      new Set(["attention→mlp"]),
+      (id) => (id === "src" ? "tokenizer" : "attention"),
+    );
+    expect(isValid({ source: "src", target: "dst" })).toBe(true);
+  });
+
+  it("always allows connection if target is detokenizer", () => {
+    const isValid = makeIsValidConnection(
+      new Set(["attention→mlp"]),
+      (id) => (id === "src" ? "mlp" : "detokenizer"),
+    );
+    expect(isValid({ source: "src", target: "dst" })).toBe(true);
+  });
 });

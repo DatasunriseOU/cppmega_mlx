@@ -230,12 +230,11 @@ def test_gemma4_preset_groups_5_sliding_then_breaks_to_global_and_moe():
     specs = build_preset_specs("gemma4", 64)
     g = from_block_specs(specs, hidden_size=64, instantiate=False)
     plans = plan_fusion_regions(g)
-    # 5 sliding attention bricks — each gqa_sliding is sdpa_attention
-    # category, and sdpa-sdpa does NOT fuse → 5 singletons
-    assert [p.size for p in plans[:5]] == [1, 1, 1, 1, 1]
-    # Then gated_attention (sdpa) -> moe (boundary) -> closes itself
-    # Total bricks: 5 sliding + 1 global + 1 moe = 7
-    assert sum(p.size for p in plans) == 7
+    # first block is per_layer_embed (norm_or_proj) followed by 5 sliding attention (sdpa_attention)
+    # norm_or_proj + sdpa_attention fuses → first region size is 2, followed by 4 singletons (size 1)
+    assert [p.size for p in plans[:5]] == [2, 1, 1, 1, 1]
+    # Total bricks: 1 ple + 5 sliding + 1 global + 1 moe = 8
+    assert sum(p.size for p in plans) == 8
 
 
 def test_zaya1_preset_packs_cca_then_4_gqa_then_moe():

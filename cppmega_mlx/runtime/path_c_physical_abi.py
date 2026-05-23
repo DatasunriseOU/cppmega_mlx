@@ -413,6 +413,52 @@ def _dtype_of(value: Any) -> str | None:
     return str(dtype).rsplit(".", 1)[-1]
 
 
+def path_c_kernel_buffer_order(prim_func: Any) -> tuple[str, ...]:
+    """Return generated kernel buffer names in positional parameter order."""
+
+    params = getattr(prim_func, "params", None)
+    if params is None:
+        return ()
+    order: list[str] = []
+    for param in params:
+        name = str(getattr(param, "name", param))
+        if name.endswith("_handle"):
+            name = name[: -len("_handle")]
+        order.append(name)
+    return tuple(order)
+
+
+def path_c_top_level_kernel_buffer_specs(
+    prim_func: Any,
+    *,
+    physical_abi_map: Mapping[str, Any],
+    physical_abi_shapes: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return non-banked top-level kernel buffers declared by ``prim_func``.
+
+    Dtype-banked Path C schedules can still expose large spilled scratch as
+    top-level PrimFunc parameters.  Those buffers are not logical ABI slots and
+    must be owned by the caller/model alongside the dtype banks.
+    """
+
+    buffer_map = getattr(prim_func, "buffer_map", None)
+    if not isinstance(buffer_map, Mapping):
+        return {}
+    bank_names = {str(name) for name in physical_abi_shapes}
+    logical_names = {str(name) for name in physical_abi_map}
+    specs: dict[str, dict[str, Any]] = {}
+    for var, buffer in buffer_map.items():
+        name = str(getattr(buffer, "name", None) or getattr(var, "name", var))
+        if name in bank_names or name in logical_names:
+            continue
+        specs[name] = {
+            "name": name,
+            "shape": tuple(int(dim) for dim in tuple(getattr(buffer, "shape", ()))),
+            "dtype": str(getattr(buffer, "dtype", "")),
+        }
+    return specs
+
+
 def validate_physical_abi_runtime_bindings(
     mapping: Mapping[str, Any],
     bank_shapes: Mapping[str, Any],
@@ -665,6 +711,8 @@ __all__ = [
     "compose_path_c_logical_buffer_owner",
     "make_physical_abi_bank_owner",
     "normalize_physical_abi_map",
+    "path_c_kernel_buffer_order",
+    "path_c_top_level_kernel_buffer_specs",
     "physical_abi_bank_specs",
     "physical_abi_full_runtime_kernel_args",
     "logical_bank_view",

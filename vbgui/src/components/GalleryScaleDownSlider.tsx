@@ -120,9 +120,10 @@ export function GalleryScaleDownSlider({
 
   return (
     <div data-testid="gallery-scaledown" style={{ padding: 8,
-         border: "1px solid #e5e7eb", borderRadius: 6, marginTop: 8,
-         display: "flex", flexDirection: "column", gap: 6 }}>
-      <label style={{ fontSize: 12, color: "#374151",
+         border: "1px solid var(--vb-border)", borderRadius: 6, marginTop: 8,
+         display: "flex", flexDirection: "column", gap: 6,
+         background: "var(--vb-surface-2)" }}>
+      <label style={{ fontSize: 12, color: "var(--vb-text-secondary)",
                        display: "flex", alignItems: "center", gap: 6 }}>
         <span>Scale-down preset</span>
         <select
@@ -140,14 +141,14 @@ export function GalleryScaleDownSlider({
         step={MIN_BYTES} value={bytes}
         onChange={(e) => setBytes(Number(e.target.value))}
       />
-      <div style={{ fontSize: 11, color: "#6b7280" }}>
+      <div style={{ fontSize: 11, color: "var(--vb-text-muted)" }}>
         target: <span data-testid="gallery-scaledown-target">
           {fmtBytes(bytes)}
         </span>
       </div>
       {loading && <span data-testid="gallery-scaledown-loading">…</span>}
       {err && <span data-testid="gallery-scaledown-error"
-                    style={{ color: "#b91c1c" }}>{err}</span>}
+                    style={{ color: "var(--vb-danger)" }}>{err}</span>}
       <button
         data-testid="gallery-auto-fit"
         onClick={() => { void runAutoFit(); }}
@@ -157,14 +158,15 @@ export function GalleryScaleDownSlider({
       </button>
       {autoFitResult && (
         <div data-testid="gallery-auto-fit-result"
-             style={{ fontSize: 11, color: "#374151",
-                      background: "#eff6ff", padding: 6,
-                      borderRadius: 4 }}>
+             style={{ fontSize: 11, color: "var(--vb-text)",
+                      background: "var(--vb-accent-soft)",
+                      border: "1px solid var(--vb-border)",
+                      padding: 6, borderRadius: 4 }}>
           <strong>{autoFitResult.topology}</strong> · {autoFitResult.reason}
         </div>
       )}
       {preview && (
-        <div style={{ fontSize: 11, color: "#374151",
+        <div style={{ fontSize: 11, color: "var(--vb-text-secondary)",
                       display: "flex", flexDirection: "column", gap: 2 }}>
           <span data-testid="gallery-scaledown-est-bytes">
             est: {fmtBytes(preview.estimated_bytes)}
@@ -179,7 +181,9 @@ export function GalleryScaleDownSlider({
           </span>
           <span data-testid="gallery-scaledown-fits"
                 data-fits={preview.fits}
-                style={{ color: preview.fits ? "#15803d" : "#b91c1c" }}>
+                style={{ color: preview.fits
+                  ? "var(--vb-success)"
+                  : "var(--vb-danger)" }}>
             {preview.fits ? "fits budget" : "exceeds budget"}
           </span>
           <button

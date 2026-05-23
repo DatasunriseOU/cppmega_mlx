@@ -87,7 +87,18 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   let x = 60, y = 60;
-  let lastName: string | null = null;
+
+  // Prepend Tokenizer Node
+  const tokenizerName = `tokenizer_${nodes.length + 1}`;
+  nodes.push({
+    id: tokenizerName,
+    type: "tokenizer_virtual",
+    position: { x, y: y + 25 },
+    data: { kind: "tokenizer", params: {} } as any,
+  });
+  let lastName: string | null = tokenizerName;
+  x += 320;
+
   for (const s of specs) {
     const name = s.name ?? `${s.kind}_${nodes.length}`;
     nodes.push({
@@ -108,6 +119,25 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
     x += 220;
     if (x > 980) { x = 60; y += 140; }
   }
+
+  // Append De-Tokenizer Node
+  const detokenizerName = `detokenizer_${nodes.length + 1}`;
+  nodes.push({
+    id: detokenizerName,
+    type: "detokenizer_virtual",
+    position: { x: x + 100, y: y + 25 },
+    data: { kind: "detokenizer", params: {} } as any,
+  });
+
+  if (lastName) {
+    edges.push({
+      id: `${lastName}->${detokenizerName}`,
+      source: lastName,
+      target: detokenizerName,
+      data: { severity: "info" },
+    });
+  }
+
   return { nodes, edges };
 }
 
@@ -162,6 +192,7 @@ export function App(): JSX.Element {
   const [tabs, setTabs] = useState<WorkspaceTab[]>(getSavedTabs);
   const [activeTabId, setActiveTabId] = useState<string>(getSavedActiveTabId);
   const isSwitchingRef = useRef<boolean>(false);
+  const debugState = useNeuralDebugger();
 
   const [nodes, setNodes] = useState<Node[]>(() => {
     const savedTabs = getSavedTabs();
@@ -181,6 +212,7 @@ export function App(): JSX.Element {
     const active = savedTabs.find((t) => t.id === savedActiveId) || savedTabs[0];
     return active.projectName;
   });
+  const [activePreset, setActivePreset] = useState<string>("");
   const [proposals, setProposals] = useState<ShardingProposalView[]>([]);
   const [spec, dispatch] = useReducer(
     specReducer,
@@ -731,10 +763,13 @@ export function App(): JSX.Element {
   const handleDropBrick = useCallback(
     (kind: string, position: { x: number; y: number }, params?: Record<string, unknown>) => {
       const isAdapter = !!adapterFor(kind);
+      let type = isAdapter ? "adapter" : "brick";
+      if (kind === "tokenizer") type = "tokenizer_virtual";
+      if (kind === "detokenizer") type = "detokenizer_virtual";
       setNodes((prev) => [
         ...prev,
         { id: `${kind}_${prev.length + 1}`,
-          type: isAdapter ? "adapter" : "brick",
+          type,
           position,
           data: { kind, params: params ?? {} } },
       ]);
@@ -925,6 +960,7 @@ export function App(): JSX.Element {
       
       setNodes(ns);
       setEdges(es);
+      setActivePreset(name);
       
       setDimEnv((prev) => ({ ...prev, H: calculatedH }));
       
@@ -1013,6 +1049,7 @@ export function App(): JSX.Element {
       console.log(`[Preset Drop: ${name}] Generated ${es.length} edges:`, es.map(e => `${e.source} -> ${e.target}`));
       setNodes(ns);
       setEdges(es);
+      setActivePreset(name);
       await handleAutoAlign(ns, es);
       // Rebind loss.head_outputs to the last brick so verify_build_spec
       // accepts the freshly-loaded preset (which doesn't define a node
@@ -1501,6 +1538,235 @@ export function App(): JSX.Element {
     setTimeout(() => setRunError(null), 2000);
   }, [proposals, scheduleVerify, spec.sharding]);
 
+  const modelNodesCount = useMemo(() => {
+    return nodes.filter(n => n.type === "brick" || n.type === "adapter").length;
+  }, [nodes]);
+
+  const maxStep = modelNodesCount + 1;
+
+  const mappedNodes = useMemo(() => {
+    const head = spec.loss.head_outputs?.[0];
+    const hasRealTokenizer = nodes.some(n => n.type === "tokenizer_virtual");
+    const hasRealDetokenizer = nodes.some(n => n.type === "detokenizer_virtual");
+
+    const modelNodes = [...nodes]
+      .filter((n) => n.type === "brick" || n.type === "adapter")
+      .sort((a, b) => a.position.x - b.position.x);
+
+    const K = modelNodes.length;
+
+    let enriched = nodes.map((n) => {
+      const isModel = n.type === "brick" || n.type === "adapter";
+      const idx = isModel ? modelNodes.findIndex((m) => m.id === n.id) : -1;
+      
+      let isActiveNode = false;
+      if (debugState.debuggerMode) {
+        isActiveNode =
+          (isModel && debugState.activeStep === idx) ||
+          (n.id === "__loss_ghost__" && debugState.activeStep === K);
+      }
+
+      let additionalData: any = {};
+      if (n.type === "tokenizer_virtual") {
+        isActiveNode = debugState.debuggerMode && debugState.activeStep === -1;
+        additionalData = {
+          prompt: debugState.prompt,
+          tokens: debugState.tokens,
+          onPromptChange: (val: string) => debugState.setPrompt(val),
+          isActiveNode,
+        };
+      } else if (n.type === "detokenizer_virtual") {
+        isActiveNode = debugState.debuggerMode && debugState.activeStep === K + 1;
+        additionalData = {
+          direction: debugState.direction,
+          isActiveNode,
+        };
+      }
+
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          debuggerMode: debugState.debuggerMode,
+          isActiveNode,
+          isWeightUpdated: debugState.debuggerMode ? debugState.isWeightUpdated : false,
+          ...additionalData,
+        },
+      };
+    });
+
+    if (!debugState.debuggerMode) return enriched;
+
+    const minX = modelNodes.length > 0 ? Math.min(...modelNodes.map((n) => n.position.x)) : 100;
+    const firstNode = modelNodes[0];
+    const tokenizerY = firstNode ? firstNode.position.y + 65 - 110 : 200;
+
+    const tokenizerNode = {
+      id: "__tokenizer__",
+      type: "tokenizer_virtual",
+      position: { x: minX - 320, y: tokenizerY },
+      data: {
+        isActiveNode: debugState.activeStep === -1,
+        prompt: debugState.prompt,
+        tokens: debugState.tokens,
+        onPromptChange: (val: string) => debugState.setPrompt(val),
+      } as any,
+      draggable: false,
+      selectable: false,
+    };
+
+    const hasGhost = !!head && nodes.some((n) => n.id === head);
+    const anchor = nodes.find((n) => n.id === head);
+    const lastNode = hasGhost && anchor ? anchor : (modelNodes[modelNodes.length - 1] || firstNode);
+    const detokY = lastNode ? lastNode.position.y + 65 - 90 : 200;
+
+    const maxX = modelNodes.length > 0 ? Math.max(...modelNodes.map((n) => n.position.x)) : 600;
+    const detokenizerNode = {
+      id: "__detokenizer__",
+      type: "detokenizer_virtual",
+      position: { x: maxX + (head ? 580 : 320), y: detokY },
+      data: {
+        isActiveNode: debugState.activeStep === K + 1,
+        direction: debugState.direction,
+      } as any,
+      draggable: false,
+      selectable: false,
+    };
+
+    const hasLossGhostInEnriched = enriched.some((n) => n.id === "__loss_ghost__");
+
+    if (hasGhost && anchor && !hasLossGhostInEnriched) {
+      enriched.push({
+        id: "__loss_ghost__",
+        type: "loss_ghost",
+        position: { x: anchor.position.x + 260, y: anchor.position.y },
+        data: {
+          kind: spec.loss.kind,
+          params: spec.loss.params,
+          debuggerMode: true,
+          isActiveNode: debugState.activeStep === K,
+        } as any,
+        draggable: false,
+        selectable: false,
+      });
+    }
+
+    const result = [...enriched];
+    if (!hasRealTokenizer) {
+      result.unshift(tokenizerNode);
+    }
+    if (!hasRealDetokenizer) {
+      result.push(detokenizerNode);
+    }
+    return result;
+  }, [nodes, debugState.debuggerMode, debugState.activeStep, debugState.direction, debugState.prompt, debugState.tokens, debugState.isWeightUpdated, spec.loss.head_outputs, spec.loss.kind, spec.loss.params]);
+
+  const mappedEdges = useMemo(() => {
+    const head = spec.loss.head_outputs?.[0];
+    const hasRealTokenizer = nodes.some(n => n.type === "tokenizer_virtual");
+    const hasRealDetokenizer = nodes.some(n => n.type === "detokenizer_virtual");
+
+    const modelNodes = [...nodes]
+      .filter((n) => n.type === "brick" || n.type === "adapter")
+      .sort((a, b) => a.position.x - b.position.x);
+
+    const K = modelNodes.length;
+
+    const getStepIndex = (nodeId: string) => {
+      const node = nodes.find(n => n.id === nodeId);
+      if (nodeId === "__tokenizer__" || (node && node.type === "tokenizer_virtual")) return -1;
+      if (nodeId === "__loss_ghost__") return K;
+      if (nodeId === "__detokenizer__" || (node && node.type === "detokenizer_virtual")) return K + 1;
+      const idx = modelNodes.findIndex((m) => m.id === nodeId);
+      return idx;
+    };
+
+    let enriched = edges.map((e) => {
+      if (!debugState.debuggerMode) return e;
+
+      const srcIdx = getStepIndex(e.source);
+      const dstIdx = getStepIndex(e.target);
+      const isActiveFlow =
+        debugState.direction === "forward"
+          ? debugState.activeStep === dstIdx
+          : debugState.activeStep === srcIdx;
+
+      return {
+        ...e,
+        data: {
+          ...e.data,
+          debuggerMode: true,
+          direction: debugState.direction,
+          isActiveFlow,
+        },
+      };
+    });
+
+    if (!debugState.debuggerMode) return enriched;
+
+    const firstModelId = modelNodes[0]?.id;
+    if (firstModelId && !hasRealTokenizer) {
+      const isEdgeActive = debugState.direction === "forward"
+        ? debugState.activeStep === 0
+        : debugState.activeStep === -1;
+
+      enriched.push({
+        id: "__tokenizer_to_first__",
+        source: "__tokenizer__",
+        target: firstModelId,
+        type: "midpoint",
+        data: {
+          debuggerMode: true,
+          direction: debugState.direction,
+          isActiveFlow: isEdgeActive,
+        } as any,
+      });
+    }
+
+    const hasGhost = !!head && nodes.some((n) => n.id === head);
+    const ghostEdgeId = "__loss_ghost_edge__";
+    const hasGhostEdge = enriched.some((e) => e.id === ghostEdgeId);
+
+    if (hasGhost && !hasGhostEdge) {
+      const isEdgeActive = debugState.direction === "forward"
+        ? debugState.activeStep === K
+        : debugState.activeStep === K - 1;
+
+      enriched.push({
+        id: ghostEdgeId,
+        source: head,
+        target: "__loss_ghost__",
+        type: "midpoint",
+        data: {
+          debuggerMode: true,
+          direction: debugState.direction,
+          isActiveFlow: isEdgeActive,
+        } as any,
+      });
+    }
+
+    const lossSourceId = hasGhost ? "__loss_ghost__" : (modelNodes[modelNodes.length - 1]?.id || "");
+    if (lossSourceId && !hasRealDetokenizer) {
+      const isEdgeActive = debugState.direction === "forward"
+        ? debugState.activeStep === K + 1
+        : debugState.activeStep === K;
+
+      enriched.push({
+        id: "__loss_to_detokenizer__",
+        source: lossSourceId,
+        target: "__detokenizer__",
+        type: "midpoint",
+        data: {
+          debuggerMode: true,
+          direction: debugState.direction,
+          isActiveFlow: isEdgeActive,
+        } as any,
+      });
+    }
+
+    return enriched;
+  }, [nodes, edges, debugState.debuggerMode, debugState.activeStep, debugState.direction, spec.loss.head_outputs]);
+
   return (
     <ReactFlowProvider>
       <div style={{ display: "flex", flexDirection: "column",
@@ -1526,6 +1792,7 @@ export function App(): JSX.Element {
         <TopBar
           state={spec}
           projectName={projectName}
+          activePreset={activePreset}
           presets={PRESETS}
           topologies={activeTopologies}
           rpc={rpc}
@@ -1792,39 +2059,8 @@ export function App(): JSX.Element {
                   </div>
                 )}
                 <FlowCanvas
-                  nodes={(() => {
-                    const head = spec.loss.head_outputs?.[0];
-                    if (!head) return nodes;
-                    const anchor = nodes.find((n) => n.id === head);
-                    if (!anchor) return nodes;
-                    const ghostId = "__loss_ghost__";
-                    if (nodes.some((n) => n.id === ghostId)) return nodes;
-                    return [...nodes, {
-                      id: ghostId,
-                      type: "loss_ghost",
-                      position: { x: anchor.position.x + 260,
-                                  y: anchor.position.y },
-                      data: { kind: spec.loss.kind,
-                              params: spec.loss.params } as never,
-                      draggable: false,
-                      selectable: false,
-                    }];
-                  })()}
-                  edges={(() => {
-                    const head = spec.loss.head_outputs?.[0];
-                    if (!head) return edges;
-                    if (!nodes.some((n) => n.id === head)) return edges;
-                    const ghostEdgeId = "__loss_ghost_edge__";
-                    if (edges.some((e) => e.id === ghostEdgeId)) return edges;
-                    return [...edges, {
-                      id: ghostEdgeId,
-                      source: head,
-                      target: "__loss_ghost__",
-                      data: { severity: "info" } as never,
-                      animated: true,
-                      style: { strokeDasharray: "4 4", stroke: "#facc15" },
-                    }];
-                  })()}
+                  nodes={mappedNodes}
+                  edges={mappedEdges}
                   onConnect={handleConnect}
                   onDropBrick={handleDropBrick}
                   onNodeClick={setSelectedBrickId}
@@ -1860,6 +2096,34 @@ export function App(): JSX.Element {
                     ]);
                   }}
                 />
+                {debugState.debuggerMode && (
+                  <DebuggerDashboard
+                    activeStep={debugState.activeStep}
+                    maxStep={maxStep}
+                    direction={debugState.direction}
+                    prompt={debugState.prompt}
+                    tokens={debugState.tokens}
+                    isPlaying={debugState.isPlaying}
+                    setIsPlaying={debugState.setIsPlaying}
+                    lr={debugState.lr}
+                    setLr={debugState.setLr}
+                    lossVal={debugState.lossVal}
+                    isWeightUpdated={debugState.isWeightUpdated}
+                    onStepForward={() => debugState.stepForward(maxStep)}
+                    onStepBackward={() => debugState.stepBackward(maxStep)}
+                    onReset={debugState.resetDebugger}
+                    onFullTrainStep={() => debugState.animateFullTrainStep(maxStep)}
+                    activeNodeLabel={(() => {
+                      const modelNodes = [...nodes]
+                        .filter(n => n.type === "brick" || n.type === "adapter")
+                        .sort((a, b) => a.position.x - b.position.x);
+                      if (debugState.activeStep >= 0 && debugState.activeStep < modelNodes.length) {
+                        return modelNodes[debugState.activeStep]?.id;
+                      }
+                      return undefined;
+                    })()}
+                  />
+                )}
                 {showLivePanel && (
                   <div
                     data-testid="live-train-controls-floating"
@@ -2387,9 +2651,11 @@ export function App(): JSX.Element {
                 onClick={() => setLossSurfaceOpen(true)}
                 style={{ position: "fixed", bottom: 56, right: 18,
                          padding: "6px 10px", fontSize: 12,
-                         background: "#eef2ff",
-                         border: "1px solid #c7d2fe", borderRadius: 6,
-                         fontFamily: "system-ui, sans-serif" }}>
+                         background: "var(--vb-surface-2)",
+                         color: "var(--vb-text)",
+                         border: "1px solid var(--vb-border)",
+                         borderRadius: 6,
+                         fontFamily: "var(--vb-font)" }}>
           Loss surface…
         </button>
         <LossSurfaceModal
@@ -2430,12 +2696,20 @@ export function App(): JSX.Element {
 // ---------------------------------------------------------------------------
 
 function nodesToGraph(nodes: Node[], edges: Edge[]) {
+  const modelNodes = nodes.filter(
+    (n) => n.type !== "tokenizer_virtual" && n.type !== "detokenizer_virtual"
+  );
+  const modelNodeIds = new Set(modelNodes.map((n) => n.id));
+  const modelEdges = edges.filter(
+    (e) => modelNodeIds.has(e.source) && modelNodeIds.has(e.target)
+  );
+
   return {
-    nodes: nodes.map((n) => {
+    nodes: modelNodes.map((n) => {
       const data = n.data as { kind?: string; params?: Record<string, unknown> };
       return { id: n.id, kind: data.kind ?? "mlp", params: data.params ?? {} };
     }),
-    edges: edges.map((e) => ({ src: e.source, dst: e.target })),
+    edges: modelEdges.map((e) => ({ src: e.source, dst: e.target })),
   };
 }
 

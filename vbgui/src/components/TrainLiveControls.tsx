@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { HelpIcon } from "@/components/HelpIcon";
 import type { RpcClient } from "@/lib/rpc";
+import { T } from "@/theme";
 
 export interface TrainLiveControlsProps {
   rpc: RpcClient | null;
@@ -508,21 +509,21 @@ export function TrainLiveControls({
         flexDirection: "column",
         gap: 6,
         padding: "8px 12px",
-        background: "rgba(254, 249, 195, 0.95)",
-        borderTop: "1px solid #facc15",
+        background: T.surface,
+        borderTop: `1px solid ${T.border}`,
         fontSize: 12,
-        fontFamily: "system-ui, sans-serif",
-        boxShadow: "0 -4px 15px rgba(0, 0, 0, 0.05)",
+        fontFamily: T.font,
+        boxShadow: T.shadowPanel,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <strong style={{ color: "#0f172a" }}>Live</strong>
+        <strong style={{ color: T.accent }}>Live</strong>
         <HelpIcon topic="train_live_controls" />
 
         <span
           data-testid="train-live-status"
           style={{
-            color: trainInFlight ? "#92400e" : "#6b7280",
+            color: trainInFlight ? T.warning : T.textSecondary,
             fontWeight: "bold",
             display: "flex",
             alignItems: "center",
@@ -540,7 +541,7 @@ export function TrainLiveControls({
             gap: 4,
             cursor: "pointer",
             fontWeight: "bold",
-            color: "#0f172a",
+            color: T.textSecondary,
           }}
         >
           <input
@@ -552,7 +553,7 @@ export function TrainLiveControls({
           💾 In-Browser Virtual FS
         </label>
 
-        <label style={{ display: "flex", alignItems: "center", gap: 4, color: "#0f172a" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 4, color: T.textSecondary }}>
           ckpt path
           <input
             data-testid="train-live-ckpt-path"
@@ -561,13 +562,13 @@ export function TrainLiveControls({
             onChange={(e) => updateCkptPath(e.target.value)}
             style={{
               padding: "3px 6px",
-              border: "1px solid #cbd5e1",
+              border: `1px solid ${T.border}`,
               borderRadius: 4,
               width: 240,
               fontSize: 11,
               fontFamily: "monospace",
-              color: "#0f172a",
-              background: "#ffffff",
+              color: T.text,
+              background: T.surface3,
             }}
           />
         </label>
@@ -578,9 +579,9 @@ export function TrainLiveControls({
           title="Browse directories and checkpoints"
           style={{
             padding: "3px 8px",
-            background: showTree ? "#0891b2" : "#f1f5f9",
-            color: showTree ? "white" : "#475569",
-            border: "1px solid #cbd5e1",
+            background: showTree ? T.accent : T.surface3,
+            color: showTree ? "#0f172a" : T.text,
+            border: `1px solid ${T.border}`,
             borderRadius: 4,
             cursor: "pointer",
             fontWeight: "bold",
@@ -630,21 +631,20 @@ export function TrainLiveControls({
           disabled={!ckptPath}
           style={{
             padding: "3px 10px",
-            background: ckptPath ? "#d97706" : "#e5e7eb",
-            color: ckptPath ? "white" : "#9ca3af",
-            border: "none",
+            background: ckptPath ? T.warning : T.surface3,
+            color: ckptPath ? "#0f172a" : T.textMuted,
+            border: `1px solid ${T.border}`,
             borderRadius: 4,
             cursor: ckptPath ? "pointer" : "default",
             fontWeight: "bold",
-            boxShadow: ckptPath ? "0 2px 4px rgba(217, 119, 6, 0.2)" : "none",
           }}
         >
           Trigger checkpoint
         </button>
 
-        <span style={{ color: "#cbd5e1" }}>|</span>
+        <span style={{ color: T.border }}>|</span>
 
-        <label style={{ display: "flex", alignItems: "center", gap: 4, color: "#0f172a" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 4, color: T.textSecondary }}>
           live lr
           <input
             data-testid="train-live-new-lr"
@@ -656,12 +656,12 @@ export function TrainLiveControls({
             onChange={(e) => setNewLr(e.target.value)}
             style={{
               padding: "3px 6px",
-              border: "1px solid #cbd5e1",
+              border: `1px solid ${T.border}`,
               borderRadius: 4,
               width: 80,
               fontSize: 11,
-              color: "#0f172a",
-              background: "#ffffff",
+              color: T.text,
+              background: T.surface3,
             }}
           />
         </label>
@@ -671,9 +671,9 @@ export function TrainLiveControls({
           disabled={!newLr || !activeRunId}
           style={{
             padding: "3px 10px",
-            background: (newLr && activeRunId) ? "#16a34a" : "#e5e7eb",
-            color: (newLr && activeRunId) ? "white" : "#9ca3af",
-            border: "none",
+            background: (newLr && activeRunId) ? T.success : T.surface3,
+            color: (newLr && activeRunId) ? "#0f172a" : T.textMuted,
+            border: `1px solid ${T.border}`,
             borderRadius: 4,
             cursor: (newLr && activeRunId) ? "pointer" : "default",
             fontWeight: "bold",
@@ -685,7 +685,7 @@ export function TrainLiveControls({
           <span
             data-testid="train-live-lr-status"
             style={{
-              color: "#1e293b",
+              color: T.textSecondary,
               fontWeight: 600,
               fontSize: 11,
             }}

@@ -1,13 +1,12 @@
 import type { ShardingState, ShardingAxis } from "@/state/spec";
+import { HelpIcon } from "@/components/HelpIcon";
+import { T } from "@/theme";
 
 export interface ShardingProposalView {
   strategy_name: string;
   fits: boolean;
   estimated_per_rank_bytes: number;
   reason: string;
-  /** H01: backend proposals carry the full axis_assignments + topology +
-   *  compile_mode. Accept must mutate spec.sharding to use them, not
-   *  just re-verify with the old spec. */
   axis_assignments?: ShardingAxis[];
 }
 
@@ -33,60 +32,77 @@ export function ShardingTab({
 }: ShardingTabProps): JSX.Element {
   return (
     <div data-testid="sharding-tab" style={panel}>
-      <section data-testid="sharding-proposals">
+      <section data-testid="sharding-proposals" style={secStyle}>
         <h4 style={hd}>Proposals</h4>
-        {proposals.length === 0 && <p style={{ color: "#9ca3af" }}>
+        {proposals.length === 0 && <p style={{ color: T.textMuted, fontStyle: "italic" }}>
           Run verify to populate proposals.
         </p>}
         {proposals.map((p, i) => (
           <div key={i} data-testid={`sharding-proposal-${i}`}
-               style={{ background: "#f9fafb", border: "1px solid #e5e7eb",
-                        padding: 8, marginBottom: 6, borderRadius: 4 }}>
+               style={{ background: T.surface2, border: `1px solid ${T.border}`,
+                        padding: "8px 10px", marginBottom: 6, borderRadius: 6 }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <strong>{p.strategy_name}</strong>
-              <span style={{ color: p.fits ? "#10b981" : "#dc2626" }}>
+              <strong style={{ color: T.text }}>{p.strategy_name}</strong>
+              <span style={{ color: p.fits ? T.success : T.danger, fontWeight: "bold" }}>
                 {p.fits ? "fits" : "OOM"} · {formatBytes(p.estimated_per_rank_bytes)}
               </span>
             </div>
-            <div style={{ color: "#6b7280", fontSize: 11 }}>{p.reason}</div>
+            <div style={{ color: T.textSecondary, fontSize: 11, marginTop: 4 }}>{p.reason}</div>
             <button data-testid={`sharding-accept-${i}`}
-                    onClick={() => onAccept(i)}>Accept</button>
+                    onClick={() => onAccept(i)}
+                    style={acceptBtnStyle}>Accept</button>
           </div>
         ))}
       </section>
 
-      <section>
+      <section style={secStyle}>
         <h4 style={hd}>Custom axes</h4>
         <table data-testid="sharding-axes"
-               style={{ width: "100%", fontSize: 11 }}>
-          <thead><tr><th>axis</th><th>kind</th><th>degree</th><th></th></tr></thead>
+               style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+              <th style={th}>axis</th>
+              <th style={th}>kind</th>
+              <th style={th}>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  degree
+                  <HelpIcon topic="sharding_degree" />
+                </span>
+              </th>
+              <th style={th}></th>
+            </tr>
+          </thead>
           <tbody>
             {sharding.axis_assignments.map((a, i) => (
-              <tr key={i} data-testid={`sharding-axis-${i}`}>
-                <td><input data-testid={`sharding-axis-${i}-name`}
+              <tr key={i} data-testid={`sharding-axis-${i}`} style={{ borderBottom: `1px solid ${T.borderSoft}` }}>
+                <td style={td}><input data-testid={`sharding-axis-${i}-name`}
                            value={a.axis_name}
                            onChange={(e) => onChange(updateAxis(
-                             sharding, i, { axis_name: e.target.value }))} /></td>
-                <td>
+                             sharding, i, { axis_name: e.target.value }))}
+                           style={tableInputStyle} /></td>
+                <td style={td}>
                   <select data-testid={`sharding-axis-${i}-kind`} value={a.kind}
                           onChange={(e) => onChange(updateAxis(
-                            sharding, i, { kind: e.target.value }))}>
+                            sharding, i, { kind: e.target.value }))}
+                          style={tableInputStyle}>
                     {PARALLEL_KINDS.map((k) => <option key={k}>{k}</option>)}
                   </select>
                 </td>
-                <td>
+                <td style={td}>
                   <input data-testid={`sharding-axis-${i}-degree`} type="number"
                          min={1} value={a.degree}
                          onChange={(e) => onChange(updateAxis(
-                           sharding, i, { degree: Number(e.target.value) }))} />
+                           sharding, i, { degree: Number(e.target.value) }))}
+                         style={tableInputStyle} />
                 </td>
-                <td>
+                <td style={{ ...td, textAlign: "right" }}>
                   <button data-testid={`sharding-axis-${i}-remove`}
                           onClick={() => onChange({
                             ...sharding,
                             axis_assignments: sharding.axis_assignments
                               .filter((_, idx) => idx !== i),
-                          })}>×</button>
+                          })}
+                          style={removeBtnStyle}>×</button>
                 </td>
               </tr>
             ))}
@@ -97,24 +113,28 @@ export function ShardingTab({
                   ...sharding,
                   axis_assignments: [...sharding.axis_assignments,
                                      { ...NEW_AXIS }],
-                })}>+ Add axis</button>
+                })}
+                style={addBtnStyle}>+ Add axis</button>
       </section>
 
-      <section>
+      <section style={secStyle}>
         <h4 style={hd}>Toggles</h4>
-        {[
-          ["master_weights_fp32", sharding.master_weights_fp32],
-          ["fp8_enabled",         sharding.fp8_enabled],
-          ["activation_checkpointing", sharding.activation_checkpointing],
-        ].map(([k, v]) => (
-          <label key={k as string} style={{ display: "block" }}>
-            <input type="checkbox" data-testid={`sharding-toggle-${k}`}
-                   checked={v as boolean}
-                   onChange={(e) => onChange({ ...sharding,
-                                               [k as string]: e.target.checked })} />
-            {k}
-          </label>
-        ))}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {[
+            ["master_weights_fp32", sharding.master_weights_fp32],
+            ["fp8_enabled",         sharding.fp8_enabled],
+            ["activation_checkpointing", sharding.activation_checkpointing],
+          ].map(([k, v]) => (
+            <label key={k as string} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input type="checkbox" data-testid={`sharding-toggle-${k}`}
+                     checked={v as boolean}
+                     onChange={(e) => onChange({ ...sharding,
+                                                 [k as string]: e.target.checked })}
+                     style={{ cursor: "pointer", width: 14, height: 14 }} />
+              <span style={{ fontSize: 11, color: T.text, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>{k}</span>
+            </label>
+          ))}
+        </div>
       </section>
     </div>
   );
@@ -130,7 +150,83 @@ function updateAxis(s: ShardingState, i: number,
 }
 
 const panel: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 12, padding: 12,
-  fontFamily: "system-ui, sans-serif", fontSize: 12,
+  display: "flex", flexDirection: "column", gap: 16, padding: 16,
+  fontFamily: T.font, fontSize: 12,
+  background: T.surface, color: T.text,
 };
-const hd: React.CSSProperties = { margin: "0 0 6px", fontSize: 12 };
+
+const hd: React.CSSProperties = {
+  margin: "0 0 8px 0",
+  fontSize: 12,
+  fontWeight: "bold",
+  color: T.accent,
+  textTransform: "uppercase",
+  letterSpacing: "0.05em",
+};
+
+const secStyle: React.CSSProperties = {
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: 6,
+  padding: 12,
+};
+
+const acceptBtnStyle: React.CSSProperties = {
+  background: T.accent,
+  color: T.accentContrast,
+  border: "none",
+  borderRadius: "var(--vb-radius-sm)",
+  padding: "4px 8px",
+  fontSize: 11,
+  fontWeight: "bold",
+  cursor: "pointer",
+  marginTop: 6,
+};
+
+const tableInputStyle: React.CSSProperties = {
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: "var(--vb-radius-sm)",
+  color: T.text,
+  padding: "4px 6px",
+  fontSize: 11,
+  fontFamily: T.font,
+  width: "100%",
+  outline: "none",
+};
+
+const addBtnStyle: React.CSSProperties = {
+  background: T.surface,
+  border: `1px solid ${T.border}`,
+  borderRadius: "var(--vb-radius-sm)",
+  color: T.text,
+  padding: "6px 10px",
+  fontSize: 11,
+  fontWeight: "bold",
+  cursor: "pointer",
+  marginTop: 8,
+};
+
+const removeBtnStyle: React.CSSProperties = {
+  background: "transparent",
+  border: "none",
+  color: T.danger,
+  fontSize: 16,
+  cursor: "pointer",
+  padding: "0 4px",
+};
+
+const th: React.CSSProperties = {
+  textAlign: "left",
+  padding: "4px 6px",
+  color: T.textSecondary,
+  fontWeight: 600,
+  fontSize: 10,
+  textTransform: "uppercase",
+  letterSpacing: "0.05em",
+};
+
+const td: React.CSSProperties = {
+  padding: "4px 6px",
+  verticalAlign: "middle",
+};

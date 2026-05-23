@@ -101,7 +101,7 @@ export function GotchasTab({
     <div data-testid="gotchas-tab" style={panel}>
       {onSuggestAdapters && (
         <section data-testid="gotchas-suggest-adapters-panel"
-                 style={{ background: "#f3f4f6", padding: 8, borderRadius: 4,
+                 style={{ background: "var(--vb-surface-3)", padding: 8, borderRadius: 4,
                           fontSize: 11 }}>
           <div style={{ fontWeight: 600, marginBottom: 4 }}>
             Suggest adapter chain (V7-K3)
@@ -154,7 +154,7 @@ export function GotchasTab({
                 [{adapterChain.consumer_shape.join("×")}]
               </div>
               <div data-testid="gotchas-suggest-adapters-reason"
-                   style={{ color: "#6b7280", marginTop: 2 }}>
+                   style={{ color: "var(--vb-text-muted)", marginTop: 2 }}>
                 {adapterChain.reason}
               </div>
               {adapterChain.chain.length === 0 ? (
@@ -178,7 +178,7 @@ export function GotchasTab({
         </section>
       )}
       {gotchas.length === 0 && (
-        <p style={{ color: "#9ca3af" }}>No gotchas fired.</p>
+        <p style={{ color: "var(--vb-text-muted)" }}>No gotchas fired.</p>
       )}
       {(["error", "warning", "info"] as const).map((sev) =>
         grouped[sev].length > 0 ? (
@@ -215,13 +215,13 @@ export function GotchasTab({
                     {sev}
                   </span>
                 </div>
-                <div style={{ color: "#374151" }}>{g.message}</div>
+                <div style={{ color: "var(--vb-text-secondary)" }}>{g.message}</div>
                 {sourceFile && (
                   <span data-testid={`gotcha-${g.id}-source`}
                         title={g.reference}
                         style={{ display: "inline-block", marginRight: 6,
                                  fontFamily: "monospace", fontSize: 10,
-                                 color: "#374151",
+                                 color: "var(--vb-text-secondary)",
                                  background: "rgba(255,255,255,0.6)",
                                  border: "1px solid #d1d5db",
                                  borderRadius: 3, padding: "0 4px" }}>
@@ -251,7 +251,7 @@ export function GotchasTab({
                   // would happen.
                   <span data-testid={`gotcha-${g.id}-fix-hint`}
                         style={{ display: "block", marginTop: 4,
-                                 color: "#6b7280", fontSize: 11,
+                                 color: "var(--vb-text-muted)", fontSize: 11,
                                  fontStyle: "italic" }}>
                     suggested fix: {g.suggested_fix}
                   </span>

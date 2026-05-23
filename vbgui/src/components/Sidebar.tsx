@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { T } from "@/theme";
 import { LossTab } from "./sidebar/LossTab";
 import { OptimTab } from "./sidebar/OptimTab";
 import { RewritersTab } from "./sidebar/RewritersTab";
@@ -104,13 +105,14 @@ export function Sidebar(p: SidebarProps): JSX.Element {
 
   return (
     <aside data-testid="sidebar"
-           style={{ width: 320, background: "#fff",
-                    borderLeft: "1px solid #e5e7eb",
+           style={{ width: 320, background: T.surface,
+                    borderLeft: `1px solid ${T.border}`,
+                    color: T.text,
                     display: "flex", flexDirection: "column",
                     fontFamily: "system-ui, sans-serif" }}>
       <nav role="tablist" data-testid="sidebar-tabs"
            style={{ display: "flex", flexWrap: "wrap",
-                    borderBottom: "1px solid #e5e7eb" }}>
+                    borderBottom: `1px solid ${T.border}` }}>
         {TAB_LABELS.map((t) => (
           <button key={t.key}
                   role="tab"
@@ -119,10 +121,11 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                   onClick={() => setActive(t.key)}
                   style={{
                     flex: "1 0 33%", padding: "8px 4px", border: "none",
-                    background: active === t.key ? "#f3f4f6" : "transparent",
+                    background: active === t.key ? T.surface2 : "transparent",
+                    color: active === t.key ? T.text : T.textSecondary,
                     cursor: "pointer", fontSize: 12,
                     borderBottom: active === t.key
-                      ? "2px solid #2563eb" : "2px solid transparent",
+                      ? `2px solid ${T.accent}` : "2px solid transparent",
                   }}>
             {t.label}
           </button>

@@ -61,3 +61,390 @@
 8:29:59 PM [vite] hmr update /src/components/TrainLiveControls.tsx
 8:29:59 PM [vite] hmr invalidate /src/components/TrainLiveControls.tsx Could not Fast Refresh (new export)
 8:29:59 PM [vite] hmr update /src/App.tsx
+8:59:38 PM [vite] hmr update /src/components/RunHistoryPicker.tsx
+9:00:34 PM [vite] hmr update /src/components/DimEnvEditor.tsx
+9:00:34 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:00:34 PM [vite] hmr update /src/App.tsx
+9:01:07 PM [vite] hmr update /src/components/BrickContextPanel.tsx
+9:01:29 PM [vite] hmr update /src/components/FlowCanvas.tsx
+9:05:44 PM [vite] hmr update /src/App.tsx
+9:05:58 PM [vite] hmr update /src/App.tsx
+9:06:24 PM [vite] hmr update /src/App.tsx
+9:06:48 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:07:00 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:07:12 PM [vite] hmr update /src/components/DimEnvEditor.tsx
+9:07:12 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:07:12 PM [vite] hmr update /src/App.tsx
+9:07:27 PM [vite] hmr update /src/components/DimEnvEditor.tsx
+9:07:27 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:07:27 PM [vite] hmr update /src/App.tsx
+9:07:39 PM [vite] hmr update /src/components/TrainOptionsPanel.tsx
+9:08:00 PM [vite] hmr update /src/components/TrainOptionsPanel.tsx
+9:08:13 PM [vite] hmr update /src/components/RunHistoryPicker.tsx
+9:08:26 PM [vite] hmr update /src/components/RunHistoryPicker.tsx
+9:08:38 PM [vite] hmr update /src/components/TrainLiveControls.tsx
+9:09:17 PM [vite] hmr update /src/components/TrainLiveControls.tsx
+9:09:36 PM [vite] hmr update /src/components/TransplantBar.tsx
+9:09:51 PM [vite] hmr update /src/components/TransplantBar.tsx
+9:10:10 PM [vite] hmr update /src/components/InsertIntoEdgeBar.tsx
+9:10:23 PM [vite] hmr update /src/components/InsertIntoEdgeBar.tsx
+9:10:36 PM [vite] hmr update /src/components/ParallelComposeBar.tsx
+9:10:50 PM [vite] hmr update /src/components/ParallelComposeBar.tsx
+9:14:03 PM [vite] hmr update /src/components/BrickNode.tsx
+9:14:17 PM [vite] hmr update /src/components/BrickNode.tsx
+9:16:55 PM [vite] hmr update /src/components/FlowCanvas.tsx
+9:17:09 PM [vite] hmr update /src/App.tsx
+9:17:42 PM [vite] hmr update /src/components/sidebar/OptimTab.tsx
+9:17:42 PM [vite] hmr invalidate /src/components/sidebar/OptimTab.tsx Could not Fast Refresh ("RECOMMENDED_LR" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:17:42 PM [vite] hmr update /src/components/Sidebar.tsx
+9:17:56 PM [vite] hmr update /src/components/sidebar/OptimTab.tsx
+9:17:56 PM [vite] hmr invalidate /src/components/sidebar/OptimTab.tsx Could not Fast Refresh ("RECOMMENDED_LR" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:17:56 PM [vite] hmr update /src/components/Sidebar.tsx
+9:26:57 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:26:57 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:26:57 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:26:58 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:26:58 PM [vite] hmr update /src/App.tsx
+9:27:07 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:27:08 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:27:08 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:27:08 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:27:08 PM [vite] hmr update /src/App.tsx
+9:27:40 PM [vite] hmr update /src/components/ExplainModal.tsx
+9:27:50 PM [vite] hmr update /src/components/ExplainModal.tsx
+9:27:59 PM [vite] hmr update /src/components/ExplainModal.tsx
+9:28:07 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:28:07 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:28:07 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:28:08 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:28:08 PM [vite] hmr update /src/App.tsx
+9:30:27 PM [vite] hmr update /src/components/ExplainModal.tsx
+9:30:43 PM [vite] hmr update /src/components/LossSurfaceModal.tsx
+9:30:59 PM [vite] hmr update /src/components/LossSurfaceModal.tsx
+9:31:50 PM [vite] hmr update /src/components/LossChart.tsx
+9:31:59 PM [vite] hmr update /src/components/LiveTrainPanel.tsx
+9:32:21 PM [vite] hmr update /src/components/CheckpointHistoryDropdown.tsx
+9:32:37 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:32:37 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:32:37 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:32:37 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:32:37 PM [vite] hmr update /src/App.tsx
+9:32:48 PM [vite] hmr update /src/App.tsx
+9:33:21 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:33:21 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:33:21 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:33:22 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:33:22 PM [vite] hmr update /src/App.tsx
+9:33:38 PM [vite] hmr update /src/components/LossSurfaceModal.tsx
+9:35:53 PM [vite] hmr update /src/components/diagrams/TensorDiagram.tsx
+9:35:53 PM [vite] hmr invalidate /src/components/diagrams/TensorDiagram.tsx Could not Fast Refresh (new export)
+9:35:53 PM [vite] hmr update /src/components/HelpIcon.tsx, /src/components/ExplainModal.tsx, /src/components/diagrams/bricks/attention.tsx, /src/components/diagrams/bricks/mlp.tsx, /src/components/diagrams/bricks/gated_attention.tsx, /src/components/diagrams/bricks/mlstm.tsx, /src/components/diagrams/bricks/rmsnorm.tsx, /src/components/diagrams/bricks/abs_pos_embed.tsx, /src/components/diagrams/bricks/mamba3.tsx, /src/components/diagrams/bricks/moe.tsx, /src/components/diagrams/bricks/gdn.tsx, /src/components/diagrams/bricks/mla.tsx
+9:35:53 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:35:53 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:35:54 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:35:54 PM [vite] hmr update /src/App.tsx
+9:36:26 PM [vite] hmr update /src/components/diagrams/TensorDiagram.tsx
+9:36:26 PM [vite] hmr invalidate /src/components/diagrams/TensorDiagram.tsx Could not Fast Refresh (new export)
+9:36:26 PM [vite] hmr update /src/components/HelpIcon.tsx, /src/components/ExplainModal.tsx, /src/components/diagrams/bricks/attention.tsx, /src/components/diagrams/bricks/mlp.tsx, /src/components/diagrams/bricks/gated_attention.tsx, /src/components/diagrams/bricks/mlstm.tsx, /src/components/diagrams/bricks/rmsnorm.tsx, /src/components/diagrams/bricks/abs_pos_embed.tsx, /src/components/diagrams/bricks/mamba3.tsx, /src/components/diagrams/bricks/moe.tsx, /src/components/diagrams/bricks/gdn.tsx, /src/components/diagrams/bricks/mla.tsx
+9:36:26 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:36:26 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:36:26 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:36:26 PM [vite] hmr update /src/App.tsx
+9:37:43 PM [vite] hmr update /src/App.tsx
+9:39:13 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:39:13 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:39:13 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:39:14 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:39:14 PM [vite] hmr update /src/App.tsx
+9:39:18 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:39:19 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:39:19 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:39:19 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:39:19 PM [vite] hmr update /src/App.tsx
+9:39:22 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:39:22 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:39:22 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:39:23 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:39:23 PM [vite] hmr update /src/App.tsx
+9:40:39 PM [vite] hmr update /src/components/HelpIcon.tsx, /src/components/ExplainModal.tsx
+9:40:39 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:40:39 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:40:39 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:40:39 PM [vite] hmr update /src/App.tsx
+9:41:08 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:41:08 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:41:08 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:41:09 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:41:09 PM [vite] hmr update /src/App.tsx
+9:41:33 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:41:33 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:41:33 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:41:33 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:41:33 PM [vite] hmr update /src/App.tsx
+9:44:49 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:44:59 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:45:12 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:45:31 PM [vite] hmr update /src/App.tsx
+9:45:41 PM [vite] hmr update /src/App.tsx
+9:46:41 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:48:13 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:48:13 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:48:13 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:48:13 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:48:13 PM [vite] hmr update /src/App.tsx
+9:49:28 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:49:41 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:50:22 PM [vite] hmr update /src/components/Sidebar.tsx
+9:50:34 PM [vite] hmr update /src/components/Sidebar.tsx
+9:50:44 PM [vite] hmr update /src/components/Sidebar.tsx
+9:50:54 PM [vite] hmr update /src/components/Sidebar.tsx
+9:51:30 PM [vite] hmr update /src/App.tsx
+9:51:51 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:52:07 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:52:20 PM [vite] hmr update /src/components/FeatureInjectionBar.tsx
+9:52:33 PM [vite] hmr update /src/components/sidebar/RewritersTab.tsx
+9:52:49 PM [vite] hmr update /src/components/sidebar/RewritersTab.tsx
+9:53:25 PM [vite] hmr update /src/components/DimEnvEditor.tsx
+9:53:25 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:53:25 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:53:33 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:54:13 PM [vite] hmr update /src/components/ParallelComposeBar.tsx
+9:54:29 PM [vite] hmr update /src/components/ParallelComposeBar.tsx
+9:54:34 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:54:34 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:54:34 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:54:34 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:54:34 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:54:42 PM [vite] hmr update /src/components/InsertIntoEdgeBar.tsx
+9:54:51 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:54:51 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:54:51 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:54:51 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:54:51 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:54:57 PM [vite] hmr update /src/components/InsertIntoEdgeBar.tsx
+9:55:09 PM [vite] hmr update /src/components/TransplantBar.tsx
+9:55:27 PM [vite] hmr update /src/components/TransplantBar.tsx
+9:55:44 PM [vite] hmr update /src/components/sidebar/TrainOpsTab.tsx
+9:56:16 PM [vite] hmr update /src/components/Sidebar.tsx
+9:56:32 PM [vite] hmr update /src/components/Sidebar.tsx
+9:57:09 PM [vite] hmr update /src/App.tsx
+9:57:26 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:57:26 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:57:26 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:57:26 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:57:26 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:57:36 PM [vite] hmr update /src/components/HelpIcon.tsx, /src/components/ExplainModal.tsx
+9:57:36 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:57:36 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:57:37 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:57:37 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:57:56 PM [vite] hmr update /src/components/HelpIcon.tsx
+9:57:56 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:57:56 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:57:57 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:57:57 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:58:25 PM [vite] hmr update /src/components/HelpIcon.tsx, /src/components/ExplainModal.tsx
+9:58:25 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:58:25 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:58:26 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:58:26 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:58:40 PM [vite] hmr update /src/components/HelpIcon.tsx, /src/components/ExplainModal.tsx
+9:58:40 PM [vite] hmr invalidate /src/components/HelpIcon.tsx Could not Fast Refresh ("HELP_TOPICS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:58:40 PM [vite] hmr update /src/components/ParallelComposeBar.tsx, /src/components/LossSurfaceModal.tsx, /src/components/TransplantBar.tsx, /src/components/TokenizerMatrixTab.tsx, /src/components/RunHistoryPicker.tsx, /src/components/TrainOptionsPanel.tsx, /src/components/SweepPanel.tsx, /src/components/InsertIntoEdgeBar.tsx, /src/components/GenerationPanel.tsx, /src/components/DimEnvEditor.tsx, /src/components/TrainLiveControls.tsx, /src/components/TrainExtrasOverlay.tsx, /src/components/ErrorDetailsPanel.tsx, /src/components/Palette.tsx, /src/components/BrickNode.tsx
+9:58:40 PM [vite] hmr invalidate /src/components/DimEnvEditor.tsx Could not Fast Refresh ("DIM_ENV_PRESETS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+9:58:40 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+9:58:42 PM [vite] hmr update /src/App.tsx
+9:58:58 PM [vite] hmr update /src/App.tsx
+9:58:58 PM [vite] Internal server error: /Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx: Unexpected token (1742:33)
+
+  1740 |                             alignItems: "center",
+  1741 |                           }}
+> 1742 |                                  }}
+       |                                  ^
+  1743 |                 />
+  1744 |                 {showLivePanel && (
+  1745 |                   <div
+  Plugin: vite:react-babel
+  File: /Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx:1742:33
+  1740|                              alignItems: "center",
+  1741|                            }}
+  1742|                                   }}
+     |                                   ^
+  1743|                  />
+  1744|                  {showLivePanel && (
+      at constructor (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:365:19)
+      at TypeScriptParserMixin.raise (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:6616:19)
+      at TypeScriptParserMixin.unexpected (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:6636:16)
+      at TypeScriptParserMixin.jsxParseIdentifier (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4581:12)
+      at TypeScriptParserMixin.jsxParseNamespacedName (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4588:23)
+      at TypeScriptParserMixin.jsxParseAttribute (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4664:22)
+      at TypeScriptParserMixin.jsxParseOpeningElementAfterName (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4679:28)
+      at TypeScriptParserMixin.jsxParseOpeningElementAfterName (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10060:18)
+      at TypeScriptParserMixin.jsxParseOpeningElementAt (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4674:17)
+      at TypeScriptParserMixin.jsxParseElementAt (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4698:33)
+      at TypeScriptParserMixin.jsxParseElement (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4761:17)
+      at TypeScriptParserMixin.parseExprAtom (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4771:19)
+      at TypeScriptParserMixin.parseExprSubscripts (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11098:23)
+      at TypeScriptParserMixin.parseUpdate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11083:21)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11063:23)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9854:18)
+      at TypeScriptParserMixin.parseMaybeUnaryOrPrivate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10916:61)
+      at TypeScriptParserMixin.parseExprOps (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10921:23)
+      at TypeScriptParserMixin.parseMaybeConditional (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10898:23)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10848:21)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9792:39
+      at TypeScriptParserMixin.tryParse (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:6924:20)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9792:18)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10817:39
+      at TypeScriptParserMixin.allowInAnd (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:12443:12)
+      at TypeScriptParserMixin.parseMaybeAssignAllowIn (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10817:17)
+      at TypeScriptParserMixin.parseMaybeAssignAllowInOrVoidPattern (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:12510:17)
+      at TypeScriptParserMixin.parseParenAndDistinguishExpression (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11692:28)
+      at TypeScriptParserMixin.parseExprAtom (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11348:23)
+      at TypeScriptParserMixin.parseExprAtom (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4776:20)
+      at TypeScriptParserMixin.parseExprSubscripts (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11098:23)
+      at TypeScriptParserMixin.parseUpdate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11083:21)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11063:23)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9854:18)
+      at TypeScriptParserMixin.parseMaybeUnaryOrPrivate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10916:61)
+      at TypeScriptParserMixin.parseExprOpBaseRightExpr (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11003:34)
+      at TypeScriptParserMixin.parseExprOpRightExpr (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10998:21)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10964:27)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9323:18)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10970:21)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9323:18)
+      at TypeScriptParserMixin.parseExprOps (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10925:17)
+      at TypeScriptParserMixin.parseMaybeConditional (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10898:23)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10848:21)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9803:20)
+      at TypeScriptParserMixin.parseExpressionBase (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10801:23)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10797:39
+      at TypeScriptParserMixin.allowInAnd (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:12443:12)
+      at TypeScriptParserMixin.parseExpression (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10797:17)
+      at TypeScriptParserMixin.jsxParseExpressionContainer (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4644:31)
+9:58:58 PM [vite] Internal server error: /Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx: Unexpected token (1742:33)
+
+  1740 |                             alignItems: "center",
+  1741 |                           }}
+> 1742 |                                  }}
+       |                                  ^
+  1743 |                 />
+  1744 |                 {showLivePanel && (
+  1745 |                   <div
+  Plugin: vite:react-babel
+  File: /Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx:1742:33
+  1740|                              alignItems: "center",
+  1741|                            }}
+  1742|                                   }}
+     |                                   ^
+  1743|                  />
+  1744|                  {showLivePanel && (
+      at constructor (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:365:19)
+      at TypeScriptParserMixin.raise (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:6616:19)
+      at TypeScriptParserMixin.unexpected (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:6636:16)
+      at TypeScriptParserMixin.jsxParseIdentifier (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4581:12)
+      at TypeScriptParserMixin.jsxParseNamespacedName (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4588:23)
+      at TypeScriptParserMixin.jsxParseAttribute (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4664:22)
+      at TypeScriptParserMixin.jsxParseOpeningElementAfterName (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4679:28)
+      at TypeScriptParserMixin.jsxParseOpeningElementAfterName (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10060:18)
+      at TypeScriptParserMixin.jsxParseOpeningElementAt (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4674:17)
+      at TypeScriptParserMixin.jsxParseElementAt (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4698:33)
+      at TypeScriptParserMixin.jsxParseElement (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4761:17)
+      at TypeScriptParserMixin.parseExprAtom (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4771:19)
+      at TypeScriptParserMixin.parseExprSubscripts (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11098:23)
+      at TypeScriptParserMixin.parseUpdate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11083:21)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11063:23)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9854:18)
+      at TypeScriptParserMixin.parseMaybeUnaryOrPrivate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10916:61)
+      at TypeScriptParserMixin.parseExprOps (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10921:23)
+      at TypeScriptParserMixin.parseMaybeConditional (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10898:23)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10848:21)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9792:39
+      at TypeScriptParserMixin.tryParse (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:6924:20)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9792:18)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10817:39
+      at TypeScriptParserMixin.allowInAnd (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:12443:12)
+      at TypeScriptParserMixin.parseMaybeAssignAllowIn (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10817:17)
+      at TypeScriptParserMixin.parseMaybeAssignAllowInOrVoidPattern (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:12510:17)
+      at TypeScriptParserMixin.parseParenAndDistinguishExpression (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11692:28)
+      at TypeScriptParserMixin.parseExprAtom (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11348:23)
+      at TypeScriptParserMixin.parseExprAtom (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4776:20)
+      at TypeScriptParserMixin.parseExprSubscripts (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11098:23)
+      at TypeScriptParserMixin.parseUpdate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11083:21)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11063:23)
+      at TypeScriptParserMixin.parseMaybeUnary (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9854:18)
+      at TypeScriptParserMixin.parseMaybeUnaryOrPrivate (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10916:61)
+      at TypeScriptParserMixin.parseExprOpBaseRightExpr (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:11003:34)
+      at TypeScriptParserMixin.parseExprOpRightExpr (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10998:21)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10964:27)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9323:18)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10970:21)
+      at TypeScriptParserMixin.parseExprOp (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9323:18)
+      at TypeScriptParserMixin.parseExprOps (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10925:17)
+      at TypeScriptParserMixin.parseMaybeConditional (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10898:23)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10848:21)
+      at TypeScriptParserMixin.parseMaybeAssign (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:9803:20)
+      at TypeScriptParserMixin.parseExpressionBase (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10801:23)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10797:39
+      at TypeScriptParserMixin.allowInAnd (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:12443:12)
+      at TypeScriptParserMixin.parseExpression (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:10797:17)
+      at TypeScriptParserMixin.jsxParseExpressionContainer (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/@babel/parser/lib/index.js:4644:31)
+9:59:22 PM [vite] hmr update /src/App.tsx
+9:59:39 PM [vite] hmr update /src/App.tsx
+9:59:54 PM [vite] hmr update /src/App.tsx
+10:00:20 PM [vite] hmr update /src/App.tsx
+10:00:53 PM [vite] hmr update /src/App.tsx
+10:00:53 PM [vite] Internal server error: Transform failed with 1 error:
+/Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx:2207:15: ERROR: The character ">" is not valid inside a JSX element
+  Plugin: vite:esbuild
+  File: /Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx:2188:0
+  
+  The character ">" is not valid inside a JSX element
+  2205|                }} />
+  2206|              
+  2207|                />
+     |                 ^
+  2208|              </>
+  2209|            }
+  
+      at failureErrorWithLog (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:1472:15)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:755:50
+      at responseCallbacks.<computed> (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:622:9)
+      at handleIncomingPacket (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:677:12)
+      at Socket.readFromStdout (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:600:7)
+      at Socket.emit (node:events:509:20)
+      at addChunk (node:internal/streams/readable:564:12)
+      at readableAddChunkPushByteMode (node:internal/streams/readable:515:3)
+      at Readable.push (node:internal/streams/readable:395:5)
+      at Pipe.onStreamRead (node:internal/stream_base_commons:189:23)
+10:00:54 PM [vite] Internal server error: Transform failed with 1 error:
+/Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx:2207:15: ERROR: The character ">" is not valid inside a JSX element
+  Plugin: vite:esbuild
+  File: /Volumes/external/sources/cppmega.mlx/vbgui/src/App.tsx:2188:0
+  
+  The character ">" is not valid inside a JSX element
+  2205|                }} />
+  2206|              
+  2207|                />
+     |                 ^
+  2208|              </>
+  2209|            }
+  
+      at failureErrorWithLog (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:1472:15)
+      at /Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:755:50
+      at responseCallbacks.<computed> (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:622:9)
+      at handleIncomingPacket (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:677:12)
+      at Socket.readFromStdout (/Volumes/external/sources/cppmega.mlx/vbgui/node_modules/esbuild/lib/main.js:600:7)
+      at Socket.emit (node:events:509:20)
+      at addChunk (node:internal/streams/readable:564:12)
+      at readableAddChunkPushByteMode (node:internal/streams/readable:515:3)
+      at Readable.push (node:internal/streams/readable:395:5)
+      at Pipe.onStreamRead (node:internal/stream_base_commons:189:23)
+10:01:09 PM [vite] hmr update /src/App.tsx
+10:01:56 PM [vite] hmr update /src/App.tsx
+10:02:12 PM [vite] hmr update /src/components/sidebar/TrainOpsTab.tsx
+10:02:29 PM [vite] hmr update /src/components/Sidebar.tsx
+10:02:58 PM [vite] hmr update /src/components/sidebar/TrainOpsTab.tsx
+10:03:06 PM [vite] hmr update /src/components/Sidebar.tsx
+10:04:40 PM [vite] hmr update /src/components/sidebar/DimensionsTab.tsx
+10:05:03 PM [vite] hmr update /src/components/sidebar/TrainOpsTab.tsx

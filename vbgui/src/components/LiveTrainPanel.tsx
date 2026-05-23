@@ -11,6 +11,7 @@
 
 import { useEffect, useState } from "react";
 import { LossChart } from "./LossChart";
+import { T } from "@/theme";
 
 export interface LiveTrainEvent {
   step: number;
@@ -61,28 +62,29 @@ export function LiveTrainPanel({
   return (
     <div data-testid="live-train-panel"
          style={{ position: "fixed", bottom: 36, right: 12,
-                  background: "white", border: "1px solid #e5e7eb",
-                  borderRadius: 6, padding: 8, fontSize: 11,
-                  fontFamily: "monospace",
-                  boxShadow: "0 2px 6px rgba(0,0,0,0.10)",
+                  background: T.surface, border: `1px solid ${T.border}`,
+                  borderRadius: 8, padding: 12, fontSize: 11,
+                  fontFamily: T.fontMono,
+                  color: T.text,
+                  boxShadow: T.shadowPanel,
                   zIndex: 30, minWidth: 360 }}>
       <div data-testid="live-train-panel-header"
            style={{ display: "flex", alignItems: "center",
                     justifyContent: "space-between",
                     marginBottom: 4 }}>
-        <div style={{ fontWeight: 600 }}>
+        <div style={{ fontWeight: 600, color: T.text }}>
           live train · step {events.length}
         </div>
         <div style={{ display: "flex", gap: 4 }}>
           {reconnectAttempts > 0 && (
             <span data-testid="live-train-panel-reconnect"
-                  style={{ color: "#d97706" }}>
+                  style={{ color: T.warning }}>
               ↻ reconnect #{reconnectAttempts}
             </span>
           )}
           {isStalled && (
             <span data-testid="live-train-panel-stalled"
-                  style={{ color: "#dc2626" }}>
+                  style={{ color: T.danger }}>
               ⚠ stalled {stalledFor.toFixed(1)}s
             </span>
           )}
@@ -99,16 +101,16 @@ export function LiveTrainPanel({
         </div>
       ) : (
         <div data-testid="live-train-panel-empty"
-             style={{ color: "#9ca3af", padding: 8 }}>
+             style={{ color: T.textSecondary, padding: 8 }}>
           waiting for first event…
         </div>
       )}
 
       {last && (
         <div data-testid="live-train-panel-pill"
-             style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+             style={{ display: "flex", gap: 8, flexWrap: "wrap", color: T.textSecondary }}>
           <span data-testid="live-train-panel-last-loss">
-            loss {last.loss.toFixed(4)}
+            loss <strong style={{ color: T.accent }}>{last.loss.toFixed(4)}</strong>
           </span>
           <span data-testid="live-train-panel-last-lr">
             lr {last.lr != null ? last.lr.toExponential(2) : "?"}
@@ -139,15 +141,15 @@ export function LiveTrainPanel({
                                width: 8,
                                height: Math.max(2, Math.min(14,
                                  load * 20)),
-                               background: load > 0.5 ? "#dc2626"
-                                          : load > 0.2 ? "#f59e0b"
-                                                       : "#10b981" }} />
+                               background: load > 0.5 ? T.danger
+                                          : load > 0.2 ? T.warning
+                                                       : T.success }} />
               ))}
             </span>
           )}
           {last.overflow && (
             <span data-testid="live-train-panel-last-overflow"
-                  style={{ color: "#dc2626" }}>
+                  style={{ color: T.danger }}>
               ⚠ scaler overflow
             </span>
           )}
@@ -156,8 +158,9 @@ export function LiveTrainPanel({
 
       {finishToast && (
         <div data-testid="live-train-panel-toast"
-             style={{ marginTop: 6, padding: 6,
-                      background: "#dcfce7", color: "#166534",
+             style={{ marginTop: 6, padding: "6px 10px",
+                      background: "rgba(52, 211, 153, 0.12)", color: T.success,
+                      border: `1px solid rgba(52, 211, 153, 0.25)`,
                       borderRadius: 4, display: "flex",
                       justifyContent: "space-between",
                       alignItems: "center" }}>
@@ -166,7 +169,7 @@ export function LiveTrainPanel({
             <button data-testid="live-train-panel-toast-dismiss"
                     onClick={onDismissToast}
                     style={{ background: "transparent", border: "none",
-                             color: "#166534", cursor: "pointer" }}>
+                             color: T.success, cursor: "pointer", fontSize: 14 }}>
               ×
             </button>
           )}

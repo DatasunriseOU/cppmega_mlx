@@ -20,7 +20,10 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
-from cppmega_mlx.runtime.path_c_physical_abi import physical_abi_runtime_kernel_args
+from cppmega_mlx.runtime.path_c_physical_abi import (
+    physical_abi_full_runtime_kernel_args,
+    physical_abi_runtime_kernel_args,
+)
 from cppmega_mlx.training.loss import next_token_cross_entropy
 
 
@@ -133,6 +136,7 @@ class PathCFusedTrainBlockCallableArtifact:
         parameter_gradient_aliases: Mapping[str, str | Sequence[str]] | None = None,
         trainable_parameter_names: Sequence[str] | None = None,
         selected_region_metadata: Mapping[str, Any] | None = None,
+        kernel_buffer_order: Sequence[str] | None = None,
     ) -> None:
         if not callable(kernel):
             raise TypeError("fused train-block kernel must be callable")
@@ -155,6 +159,11 @@ class PathCFusedTrainBlockCallableArtifact:
         )
         self.selected_region_metadata = _normalize_contract_metadata(
             selected_region_metadata or {}
+        )
+        self.kernel_buffer_order = (
+            tuple(str(name) for name in kernel_buffer_order)
+            if kernel_buffer_order is not None
+            else None
         )
         self._logical_gradient_names = frozenset(
             name for name in self.physical_abi_map if name.endswith("_grad")
@@ -203,6 +212,13 @@ class PathCFusedTrainBlockCallableArtifact:
         return buffers
 
     def _kernel_args_from_bank_owner(self, bank_owner: Any) -> tuple[Any, ...]:
+        if self.kernel_buffer_order is not None:
+            return physical_abi_full_runtime_kernel_args(
+                self.physical_abi_map,
+                self.physical_abi_shapes,
+                self.kernel_buffer_order,
+                self._bank_buffers(bank_owner),
+            )
         return physical_abi_runtime_kernel_args(
             self.physical_abi_map,
             self.physical_abi_shapes,
@@ -825,19 +841,7 @@ class PathCFusedPlusEagerTrainingRuntime:
         return dict(self._binding or {})
 
     def value_and_grad_contract(self) -> Mapping[str, Any]:
-        """Report a closed full-model gradient contract.
-
-        The wrapped artifact's own contract reports partial coverage; this
-        runtime explicitly takes ownership of every trainable parameter via
-        the eager bridge it executes internally, so the contract it surfaces
-        to the m04 install path reports full coverage. The in-region
-        parameter set is preserved as ``fused_in_region_parameter_count``
-        for telemetry, but the gate-bearing fields
-        (returns_full_model_grads / model_gradient_tree_ready /
-        delegates_to_eager_loss_and_grad) reflect the runtime's actual
-        behaviour: it returns full grads, the model tree is closed, and
-        nothing delegates *out* of the runtime to the trainer's fallback.
-        """
+        """Report whether the fused train block owns the training gradient path."""
         inner = dict(self.artifact.value_and_grad_contract())
         inner_coverage = inner.get("full_model_gradient_coverage")
         coverage = dict(inner_coverage) if isinstance(inner_coverage, Mapping) else {}
@@ -845,6 +849,12 @@ class PathCFusedPlusEagerTrainingRuntime:
         suffix_bypass_available = bool(
             self.fused_suffix_loss_fn is not None
             and self.in_region_parameter_bank_aliases
+        )
+        returns_full_model_grads = suffix_bypass_available
+        gradient_scope = (
+            "full_model_via_fused_suffix_bypass"
+            if suffix_bypass_available
+            else "selected_train_block_warmup_only"
         )
         reason = (
             "mixed-mode training runtime returns full-model grads via "
@@ -865,6 +875,13 @@ class PathCFusedPlusEagerTrainingRuntime:
                 )
             )
         )
+        if not suffix_bypass_available:
+            reason = (
+                "fused train-block gradient overlay is disabled; the runtime "
+                "can run as warmup only, while the actual full-model gradients "
+                "still come from the trainer's eager value_and_grad closure, "
+                "so this is not a Path C training critical path"
+            )
         overlay_parameter_count = (
             len(self.in_region_parameter_bank_aliases)
             if suffix_bypass_available
@@ -877,14 +894,22 @@ class PathCFusedPlusEagerTrainingRuntime:
         )
         coverage.update(
             {
-                "full_model_gradient_tree_ready": True,
-                "gradient_scope": "full_model_via_mixed_mode",
+                "full_model_gradient_tree_ready": returns_full_model_grads,
+                "gradient_scope": gradient_scope,
                 "reason": reason,
                 "covered_parameter_names": coverage.get(
                     "covered_parameter_names", []
                 ),
-                "missing_parameter_names": [],
-                "missing_parameter_count": 0,
+                "missing_parameter_names": (
+                    []
+                    if suffix_bypass_available
+                    else coverage.get("missing_parameter_names", [])
+                ),
+                "missing_parameter_count": (
+                    0
+                    if suffix_bypass_available
+                    else coverage.get("missing_parameter_count", 0)
+                ),
                 "fused_in_region_parameter_count": len(
                     self.in_region_parameter_names
                 ),
@@ -902,12 +927,12 @@ class PathCFusedPlusEagerTrainingRuntime:
             "uses_forward_hook": True,
             "uses_backward_or_vjp_hook": True,
             "returns_model_grads": True,
-            "returns_full_model_grads": True,
-            "gradient_scope": "full_model_via_mixed_mode",
-            "full_model_gradient_tree_ready": True,
-            "loss_cotangent_bridge_ready": True,
-            "model_gradient_tree_ready": True,
-            "delegates_to_eager_loss_and_grad": False,
+            "returns_full_model_grads": returns_full_model_grads,
+            "gradient_scope": gradient_scope,
+            "full_model_gradient_tree_ready": returns_full_model_grads,
+            "loss_cotangent_bridge_ready": suffix_bypass_available,
+            "model_gradient_tree_ready": returns_full_model_grads,
+            "delegates_to_eager_loss_and_grad": not suffix_bypass_available,
             "hidden_packing_performed": False,
             "full_model_gradient_coverage": coverage,
             "fused_in_region_parameter_count": len(

@@ -144,3 +144,84 @@ def test_histogram_residual_kind_rejected_cleanly():
     with pytest.raises(ValueError, match="no trainable weights"):
         inspect_histogram(HistogramParams(
             spec=spec, brick_id="r", kind="weight", buckets=8))
+
+
+def test_histogram_handles_linear_bridge_node():
+    from cppmega_v4.jsonrpc.histogram_method import (
+        HistogramParams, inspect_histogram,
+    )
+    from cppmega_v4.jsonrpc.schema import VerifyParams
+    spec = VerifyParams.model_validate({
+        "graph": {
+            "nodes": [
+                {"id": "a", "kind": "attention", "params": {}},
+                {"id": "b", "kind": "linear_bridge", "params": {"H_in": 64, "H_out": 128}},
+            ],
+            "edges": [{"src": "a", "dst": "b"}],
+        },
+        "dim_env": {"H": 64},
+        "loss": {"kind": "cross_entropy", "head_outputs": ["b"]},
+        "optim": {"kind": "adamw", "groups": [
+            {"matcher": "all", "lr": 1e-3, "weight_decay": 0.01,
+             "betas": [0.9, 0.95]}]},
+        "sharding": None,
+        "training": True,
+    })
+    r = inspect_histogram(HistogramParams(
+        spec=spec, brick_id="b", kind="weight", buckets=16))
+    assert r.n_values == 64 * 128
+
+
+def test_histogram_handles_adapter_linear_bridge_node():
+    from cppmega_v4.jsonrpc.histogram_method import (
+        HistogramParams, inspect_histogram,
+    )
+    from cppmega_v4.jsonrpc.schema import VerifyParams
+    spec = VerifyParams.model_validate({
+        "graph": {
+            "nodes": [
+                {"id": "a", "kind": "attention", "params": {}},
+                {"id": "b", "kind": "adapter_linear_bridge", "params": {}},
+            ],
+            "edges": [{"src": "a", "dst": "b"}],
+        },
+        "dim_env": {"H": 64},
+        "loss": {"kind": "cross_entropy", "head_outputs": ["b"]},
+        "optim": {"kind": "adamw", "groups": [
+            {"matcher": "all", "lr": 1e-3, "weight_decay": 0.01,
+             "betas": [0.9, 0.95]}]},
+        "sharding": None,
+        "training": True,
+    })
+    r = inspect_histogram(HistogramParams(
+        spec=spec, brick_id="b", kind="weight", buckets=16))
+    # Defaults to H x H = 64 * 64 = 4096
+    assert r.n_values == 64 * 64
+
+
+def test_histogram_plumbing_kinds_rejected_cleanly():
+    import pytest
+    from cppmega_v4.jsonrpc.histogram_method import (
+        HistogramParams, inspect_histogram,
+    )
+    from cppmega_v4.jsonrpc.schema import VerifyParams
+    for pk in ["merge_heads", "adapter_split_heads", "transpose_bnsd"]:
+        spec = VerifyParams.model_validate({
+            "graph": {
+                "nodes": [
+                    {"id": "a", "kind": "attention", "params": {}},
+                    {"id": "p", "kind": pk, "params": {}},
+                ],
+                "edges": [{"src": "a", "dst": "p"}],
+            },
+            "dim_env": {"H": 64},
+            "loss": {"kind": "cross_entropy", "head_outputs": ["p"]},
+            "optim": {"kind": "adamw", "groups": [
+                {"matcher": "all", "lr": 1e-3, "weight_decay": 0.01,
+                 "betas": [0.9, 0.95]}]},
+            "sharding": None,
+            "training": True,
+        })
+        with pytest.raises(ValueError, match="no trainable weights"):
+            inspect_histogram(HistogramParams(
+                spec=spec, brick_id="p", kind="weight", buckets=8))

@@ -6,6 +6,7 @@
 
 import { useState } from "react";
 import { HelpIcon } from "@/components/HelpIcon";
+import { T } from "@/theme";
 
 export interface TrainOptions {
   // K3 — V7-A04 validation cadence.
@@ -42,15 +43,15 @@ export function TrainOptionsPanel({
 
   return (
     <div data-testid="train-options-panel"
-         style={{ borderTop: "1px solid #e5e7eb",
+         style={{ borderTop: `1px solid ${T.border}`,
                   padding: "4px 8px", fontSize: 12,
-                  fontFamily: "system-ui, sans-serif",
-                  background: "#fafaf9" }}>
+                  fontFamily: T.font,
+                  background: T.surface, color: T.text }}>
       <button data-testid="train-options-toggle"
               onClick={() => setOpen(!open)}
               style={{ border: "none", background: "transparent",
                        cursor: "pointer", fontWeight: 600,
-                       padding: 0, color: "#374151" }}>
+                       padding: 0, color: T.text }}>
         {open ? "▼" : "▶"} Train options (K3–K8){" "}
       </button>
       {open && (
@@ -114,7 +115,7 @@ export function TrainOptionsPanel({
                      "fake_ranks", parseInt(e.target.value, 10))}
                    style={{ width: 120 }} />
             <span data-testid="train-opt-fake_ranks-value"
-                  style={{ marginLeft: 6, color: "#374151" }}>
+                  style={{ marginLeft: 6, color: T.text }}>
               {v.fake_ranks ?? 1}
             </span>
           </Row>
@@ -164,7 +165,7 @@ function Row({
      children: React.ReactNode }): JSX.Element {
   return (
     <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-      <span style={{ width: 230, color: "#6b7280", fontSize: 11 }}>
+      <span style={{ width: 230, color: T.textSecondary, fontSize: 11 }}>
         {label}
       </span>
       <HelpIcon topic={help} />
@@ -173,4 +174,11 @@ function Row({
   );
 }
 
-const INPUT: React.CSSProperties = { width: 90, fontSize: 12 };
+const INPUT: React.CSSProperties = {
+  width: 90,
+  fontSize: 12,
+  color: T.text,
+  background: T.surface3,
+  border: `1px solid ${T.border}`,
+  borderRadius: T.radiusSm,
+};

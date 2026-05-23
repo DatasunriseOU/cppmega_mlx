@@ -40,6 +40,7 @@ __all__ = [
     "load_path_c_abi_manifest",
     "launch_mamba3_fp8_train_block",
     "Mamba3Fp8TrainBlockLauncher",
+    "extract_mamba3_fp8_train_real_abi_inputs",
 ]
 
 
@@ -208,8 +209,13 @@ def _flat_into_bank(
             f"logical buffer size mismatch at offset {placement.offset}: "
             f"expected {placement.size}, got {int(value.size)}"
         )
-    typed = value.astype(_to_mx_dtype(placement.dtype))
-    flat = typed.reshape((placement.size,))
+    expected_dtype = _to_mx_dtype(placement.dtype)
+    if str(value.dtype) != str(expected_dtype):
+        raise ValueError(
+            f"logical buffer dtype mismatch at offset {placement.offset}: "
+            f"expected {placement.dtype}, got {value.dtype}"
+        )
+    flat = value.reshape((placement.size,))
     indices = mx.arange(placement.offset, placement.offset + placement.size, dtype=mx.int32)
     return bank.at[indices].add(flat - bank[indices])
 
@@ -449,6 +455,68 @@ class Mamba3Fp8TrainBlockLauncher:
             state_after=state_after,
         )
 
+    # --- ExecutableGraph adapter ------------------------------------------
+
+    def as_artifact_callable(
+        self,
+        model: Any,
+    ) -> "Callable[[mx.array], mx.array]":
+        """Return a ``Callable[[mx.array], mx.array]`` for ``ExecutableGraph.attach_artifact``.
+
+        The returned closure captures the model's current parameters
+        (extracted once via :func:`extract_mamba3_fp8_train_real_abi_inputs`)
+        and zero-initialised cotangent seeds.  Each call replaces only the
+        ``hidden`` slot in the pre-extracted ABI dict, launches the fused
+        kernel, and returns the ``attention_out`` tensor — the trailing
+        hidden state the ``ExecutableGraph`` expects from the region.
+
+        No large tensors are copied at call time; the parameter snapshot is
+        taken once at adapter-creation time.
+        """
+
+        runtime_input_names = {
+            name
+            for name in self.real_abi_inputs
+            if name
+            in {"hidden", "mamba_state", "scan_state", "m2rnn_conv_state", "mamba3_h0", "m2rnn_h0"}
+        }
+        base_inputs = extract_mamba3_fp8_train_real_abi_inputs(
+            model,
+            launcher=self,
+            real_abi_input_names=tuple(
+                name for name in self.real_abi_inputs if name not in runtime_input_names
+            ),
+        )
+        zero_seeds: dict[str, mx.array] = {
+            name: mx.zeros(
+                self.manifest.logical_to_physical[name].logical_shape,
+                dtype=_to_mx_dtype(
+                    self.manifest.logical_to_physical[name].dtype
+                ),
+            )
+            for name in self.cotangent_seed_buffers
+        }
+        hidden_placement = self.manifest.logical_to_physical["hidden"]
+        launcher = self
+
+        def _artifact_forward(hidden: mx.array) -> mx.array:
+            inputs = dict(base_inputs)
+            inputs["hidden"] = _coerce_to_placement_shape(
+                hidden, hidden_placement,
+            )
+            for name in sorted(runtime_input_names - {"hidden"}):
+                placement = self.manifest.logical_to_physical[name]
+                inputs[name] = mx.zeros(
+                    placement.logical_shape, dtype=_to_mx_dtype(placement.dtype)
+                )
+            result = launcher(
+                real_abi_inputs=inputs,
+                cotangent_seeds=zero_seeds,
+            )
+            return result.forward["attention_out"]
+
+        return _artifact_forward
+
 
 def launch_mamba3_fp8_train_block(
     compiled: Any,
@@ -463,3 +531,178 @@ def launch_mamba3_fp8_train_block(
         real_abi_inputs=real_abi_inputs,
         cotangent_seeds=cotangent_seeds,
     )
+
+
+# --- model parameter extractor -------------------------------------------
+
+
+def _coerce_to_placement_shape(
+    value: mx.array, placement: PathCBankPlacement
+) -> mx.array:
+    """Return ``value`` reshaped to the ABI slot without casts or staging."""
+
+    dtype = _to_mx_dtype(placement.dtype)
+    if str(value.dtype) != str(dtype):
+        raise ValueError(
+            f"real ABI input dtype mismatch for {placement.bank}: "
+            f"expected {placement.dtype}, got {value.dtype}"
+        )
+    if int(value.size) != placement.size:
+        raise ValueError(
+            f"real ABI input size mismatch for {placement.bank}: "
+            f"expected {placement.size}, got {int(value.size)}"
+        )
+    return value.reshape(placement.logical_shape)
+
+
+def extract_mamba3_fp8_train_real_abi_inputs(
+    model: Any,
+    *,
+    launcher: "Mamba3Fp8TrainBlockLauncher | None" = None,
+    manifest: PathCAbiManifest | None = None,
+    real_abi_input_names: tuple[str, ...] | None = None,
+    runtime_inputs: Mapping[str, mx.array] | None = None,
+    batch_size: int = 1,
+) -> dict[str, mx.array]:
+    """Collect ``mx.array`` parameters for the Path C train-block ABI.
+
+    Walks the last three entries of ``model.layers`` — which the
+    ``local_gb10_quarter_profile`` produces as ``(..., M, R, A)`` — and
+    binds each trainable parameter to the logical name the Path C
+    schedule expects. Runtime activation/state inputs (for example
+    ``hidden``, ``mamba_state``, ``scan_state``, ``m2rnn_conv_state``,
+    ``mamba3_h0``) must be supplied explicitly through ``runtime_inputs``.
+    This keeps the extractor fail-closed: it never fabricates a large tensor to
+    mask shape or ABI drift. Small schedule constants
+    (``sparse_mla_sm_scale``, ``sparse_mla_sinks``,
+    ``sparse_mla_has_sinks``) are seeded from the model config.
+
+    Every name returned by ``launcher.real_abi_inputs`` (or
+    ``real_abi_input_names`` if supplied) must resolve to an existing model
+    parameter, an explicit runtime input, or one of the small config constants.
+    Dtype and element-count mismatches raise instead of padding/truncating.
+    """
+
+    import math
+
+    if launcher is not None:
+        if manifest is None:
+            manifest = launcher.manifest
+        if real_abi_input_names is None:
+            real_abi_input_names = launcher.real_abi_inputs
+    if manifest is None:
+        raise ValueError(
+            "extract_mamba3_fp8_train_real_abi_inputs: must pass either "
+            "launcher= or manifest=; the extractor needs the Path C ABI "
+            "shape map to coerce model parameters to bank slots"
+        )
+    if real_abi_input_names is None:
+        raise ValueError(
+            "extract_mamba3_fp8_train_real_abi_inputs: must pass either "
+            "launcher= or real_abi_input_names=; the extractor needs the "
+            "explicit set of names the schedule expects"
+        )
+
+    layers = getattr(model, "layers", None)
+    if layers is None or len(layers) < 3:
+        raise ValueError(
+            "extract_mamba3_fp8_train_real_abi_inputs: model must expose "
+            "at least three .layers entries ending in (M, R, A); got "
+            f"{type(model).__name__} with "
+            f"{0 if layers is None else len(layers)} layer(s)"
+        )
+    m_block, r_block, a_block = layers[-3], layers[-2], layers[-1]
+    for name, block, expected in (
+        ("mamba3", m_block, "M"),
+        ("m2rnn", r_block, "R"),
+        ("attention", a_block, "A"),
+    ):
+        symbol = getattr(getattr(block, "layer", None), "symbol", None)
+        if symbol != expected:
+            raise ValueError(
+                f"extract_mamba3_fp8_train_real_abi_inputs: expected the "
+                f"last three layers to be (M, R, A) for the Path C "
+                f"train-block, but layer for {name} has symbol "
+                f"{symbol!r} (block type {type(block).__name__})"
+            )
+
+    mam = m_block.block
+    rnn = r_block.block
+    att = a_block.block
+
+    raw_inputs: dict[str, mx.array] = {}
+
+    raw_inputs["mamba3_entry_rmsnorm_weight"] = m_block.norm.weight
+
+    raw_inputs["mamba3_in_proj_weight"] = mam.in_proj.weight
+    raw_inputs["mamba3_out_proj_weight"] = mam.out_proj.weight
+    raw_inputs["mamba3_conv_weight"] = mam.conv_weight
+    raw_inputs["mamba3_conv_bias"] = mam.conv_bias
+    raw_inputs["mamba3_dt_bias"] = mam.dt_bias
+    raw_inputs["mamba3_B_norm_weight"] = mam.B_norm_weight
+    raw_inputs["mamba3_B_bias"] = mam.B_bias
+    raw_inputs["mamba3_C_norm_weight"] = mam.C_norm_weight
+    raw_inputs["mamba3_C_bias"] = mam.C_bias
+    raw_inputs["mamba3_D"] = mam.D
+
+    raw_inputs["mamba3_residual_to_m2rnn_norm_weight"] = r_block.norm.weight
+    raw_inputs["m2rnn_residual_to_attention_norm_weight"] = a_block.norm.weight
+
+    raw_inputs["m2rnn_in_proj_weight"] = rnn.in_proj.weight
+    raw_inputs["m2rnn_conv_weight"] = rnn.conv_weight
+    raw_inputs["m2rnn_conv_bias"] = rnn.conv_bias
+    raw_inputs["m2rnn_state_weight"] = rnn.state_weight
+    raw_inputs["m2rnn_A_log"] = rnn.A_log
+    raw_inputs["m2rnn_dt_bias"] = rnn.dt_bias
+    if rnn.D is not None:
+        raw_inputs["m2rnn_D"] = rnn.D
+    raw_inputs["m2rnn_g_norm_weight"] = rnn.g_norm.weight
+    raw_inputs["m2rnn_out_proj_weight"] = rnn.out_proj.weight
+
+    raw_inputs["attention_q_proj_weight"] = att.q_proj.weight
+    if getattr(att.q_proj, "bias", None) is not None:
+        raw_inputs["attention_q_proj_bias"] = att.q_proj.bias
+    if att.sparse_kv_proj is not None:
+        raw_inputs["attention_sparse_kv_proj_weight"] = att.sparse_kv_proj.weight
+        if getattr(att.sparse_kv_proj, "bias", None) is not None:
+            raw_inputs["attention_sparse_kv_proj_bias"] = att.sparse_kv_proj.bias
+    if att.rope_inv_freq is not None:
+        raw_inputs["attention_rope_inv_freq"] = att.rope_inv_freq
+    raw_inputs["attention_out_proj_weight"] = att.out_proj.weight
+    if getattr(att.out_proj, "bias", None) is not None:
+        raw_inputs["attention_out_proj_bias"] = att.out_proj.bias
+
+    head_dim = getattr(att.config, "q_head_dim", None) or getattr(
+        att.config, "head_dim", 1
+    )
+    q_heads = getattr(att.config, "num_attention_heads", None) or getattr(
+        att.config, "num_q_heads", None
+    )
+    if q_heads is None:
+        sinks_placement = manifest.logical_to_physical.get("sparse_mla_sinks")
+        if sinks_placement is not None:
+            q_heads = sinks_placement.size
+    q_heads = max(1, int(q_heads or 1))
+    raw_inputs["sparse_mla_sm_scale"] = mx.array(
+        [1.0 / math.sqrt(max(int(head_dim), 1))], dtype=mx.float32
+    )
+    raw_inputs["sparse_mla_sinks"] = mx.zeros((q_heads,), dtype=mx.float32)
+    raw_inputs["sparse_mla_has_sinks"] = mx.array([0], dtype=mx.int32)
+
+    runtime_inputs = {
+        str(name): value for name, value in (runtime_inputs or {}).items()
+    }
+    result: dict[str, mx.array] = {}
+    for name in real_abi_input_names:
+        placement = manifest.logical_to_physical[name]
+        if name in raw_inputs:
+            result[name] = _coerce_to_placement_shape(raw_inputs[name], placement)
+        elif name in runtime_inputs:
+            result[name] = _coerce_to_placement_shape(runtime_inputs[name], placement)
+        else:
+            raise ValueError(
+                "extract_mamba3_fp8_train_real_abi_inputs: missing required "
+                f"real ABI input {name!r}; pass it in runtime_inputs or bind "
+                "it from the model parameters/config"
+            )
+    return result

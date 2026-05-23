@@ -122,8 +122,8 @@ export function MemoryMatrixTab({
                     </td>
                   );
                 }
-                const bg = cell.fits ? "#dcfce7" : "#fee2e2";
-                const color = cell.fits ? "#15803d" : "#b91c1c";
+                const bg = cell.fits ? "rgba(52, 211, 153, 0.16)" : "rgba(248, 113, 113, 0.16)";
+                const color = cell.fits ? "var(--vb-success)" : "var(--vb-danger)";
                 const title = (
                   `${fmtBytes(cell.bytes)} of ${fmtBytes(cell.device_hbm_bytes)}` +
                   ` (headroom ${(cell.headroom * 100).toFixed(0)}%)\n` +
@@ -135,7 +135,7 @@ export function MemoryMatrixTab({
                   <td key={p}
                       data-testid={`memory-matrix-cell-${t}-${p}`}
                       title={title}
-                      style={{ ...td, background: bg, color }}>
+                      style={{ ...td, background: bg, color, borderColor: cell.fits ? "var(--vb-success)" : "var(--vb-danger)" }}>
                     <span data-testid={`memory-matrix-cell-bytes-${t}-${p}`}>
                       {fmtBytes(cell.bytes)}
                     </span>
@@ -154,7 +154,7 @@ export function MemoryMatrixTab({
       </table>
       {loading && (
         <p data-testid="memory-matrix-refreshing" style={{ fontSize: 10,
-           color: "#6b7280", margin: "4px 0 0" }}>
+           color: "var(--vb-text-muted)", margin: "4px 0 0" }}>
           refreshing…
         </p>
       )}
@@ -168,15 +168,15 @@ const panel: React.CSSProperties = {
 };
 
 const th: React.CSSProperties = {
-  padding: "4px 6px", fontWeight: 600, color: "#374151",
-  borderBottom: "1px solid #e5e7eb", textAlign: "center",
+  padding: "4px 6px", fontWeight: 600, color: "var(--vb-text-secondary)",
+  borderBottom: "1px solid var(--vb-border)", textAlign: "center",
 };
 
 const td: React.CSSProperties = {
   padding: "6px 8px", textAlign: "center", borderRadius: 4,
-  border: "1px solid #f3f4f6",
+  border: "1px solid var(--vb-border)",
 };
 
 const tdMissing: React.CSSProperties = {
-  ...td, background: "#f9fafb", color: "#9ca3af",
+  ...td, background: "var(--vb-surface-2)", color: "var(--vb-text-muted)",
 };

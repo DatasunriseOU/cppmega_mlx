@@ -98,7 +98,7 @@ export function GalleryTab({
       <h3 style={{ margin: "0 0 8px", fontSize: 14 }}>
         Per-preset gallery
       </h3>
-      <p style={{ color: "#6b7280", marginTop: 0 }}>
+      <p style={{ color: "var(--vb-text-muted)", marginTop: 0 }}>
         Click a column header to sort ascending/descending. "Refresh"
         runs a verify roundtrip and caches stats. Cache persists across
         reloads (localStorage <code>vbgui_gallery_runs_v1</code>).
@@ -106,7 +106,7 @@ export function GalleryTab({
       <table data-testid="gallery-table"
              style={{ width: "100%", borderCollapse: "collapse" }}>
         <thead>
-          <tr style={{ borderBottom: "1px solid #e5e7eb" }}>
+          <tr style={{ borderBottom: "1px solid var(--vb-border)" }}>
             {COLUMNS.map((c) => {
               const ariaSort = sortCol === c.key
                 ? (sortDir === "asc" ? "ascending" : "descending")
@@ -118,7 +118,8 @@ export function GalleryTab({
                     onClick={() => toggleSort(c.key)}
                     style={{ textAlign: c.numeric ? "right" : "left",
                              padding: "4px 6px", cursor: "pointer",
-                             color: "#374151", fontWeight: 600,
+                             color: "var(--vb-text-secondary)",
+                             fontWeight: 600,
                              userSelect: "none" }}>
                   {c.label}{" "}
                   {sortCol === c.key
@@ -134,13 +135,13 @@ export function GalleryTab({
           {rows.map((r) => (
             <tr key={r.preset}
                 data-testid={`gallery-row-${r.preset}`}
-                style={{ borderBottom: "1px solid #f3f4f6" }}>
+                style={{ borderBottom: "1px solid var(--vb-border-soft)" }}>
               {COLUMNS.map((c) => (
                 <td key={c.key}
                     data-testid={`gallery-cell-${r.preset}-${c.key}`}
                     style={{ padding: "4px 6px",
                              textAlign: c.numeric ? "right" : "left",
-                             color: "#374151" }}>
+                             color: "var(--vb-text)" }}>
                   {c.key === "preset" ? r.preset
                     : fmt((r as Record<GalleryColumn, unknown>)[c.key],
                           c.key)}

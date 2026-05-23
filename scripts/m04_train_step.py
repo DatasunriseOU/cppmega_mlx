@@ -67,6 +67,7 @@ from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
     PathCLogicalBufferOwner,
     compose_path_c_logical_buffer_owner,
     make_physical_abi_bank_owner,
+    path_c_kernel_buffer_order,
     physical_abi_bank_specs,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_runtime_bindings,
@@ -3114,11 +3115,6 @@ def _build_path_c_fused_suffix_loss_fn_for_model(
         "_cppmega_path_c_train_step_suffix_loss_input_abi",
         {},
     )
-    suffix_input_reason = ""
-    if isinstance(suffix_input_abi, Mapping):
-        suffix_input_reason = str(suffix_input_abi.get("reason", ""))
-    if "pending" in suffix_input_reason.lower():
-        return None
     output_abi = getattr(
         prim_func,
         "_cppmega_path_c_train_step_output_abi",
@@ -4080,6 +4076,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
             selected_region_metadata=(
                 _path_c_fused_train_block_selected_region_metadata(scheduled.region)
             ),
+            kernel_buffer_order=path_c_kernel_buffer_order(training_abi_prim_func),
         )
 
     return {
@@ -7514,78 +7511,152 @@ def path_c_fusion_payload(
     fused_train_block_training_critical_path = bool(
         fused_train_block_training_contract.get("critical_path_ready")
     )
-    if model is not None:
-        direct_chain_region_prefix = _path_c_direct_chain_region_prefix(
-            model,
-            profile_name,
-        )
-        runtime_chain = getattr(resolved_direct_chain_training_runtime, "chain", None)
-        direct_chains = ()
-        direct_chain = runtime_chain
-        if direct_chain is None:
-            direct_chains = plan_path_c_direct_fusion_chains_for_model(
+    try:
+        if model is not None:
+            direct_chain_region_prefix = _path_c_direct_chain_region_prefix(
                 model,
-                region_prefix=direct_chain_region_prefix,
+                profile_name,
+            )
+            runtime_chain = getattr(resolved_direct_chain_training_runtime, "chain", None)
+            direct_chains = ()
+            direct_chain = runtime_chain
+            if direct_chain is None:
+                direct_chains = plan_path_c_direct_fusion_chains_for_model(
+                    model,
+                    region_prefix=direct_chain_region_prefix,
+                    include_backward=True,
+                    sequence_length=sequence_length,
+                )
+                direct_chain = _select_path_c_direct_chain_for_region(
+                    direct_chains,
+                    selected_region,
+                )
+            if direct_chain is None:
+                raise RuntimeError(
+                    f"{profile_name} did not produce any direct Path C chain"
+                )
+            direct_chain_construction = {
+                "planner": (
+                    "training_runtime.chain"
+                    if runtime_chain is not None
+                    else "plan_path_c_direct_fusion_chains_for_model"
+                ),
+                "region_prefix": direct_chain_region_prefix,
+                "candidate_chain_count": len(direct_chains)
+                if direct_chains
+                else 1,
+                "selected_source_region": getattr(
+                    getattr(direct_chain, "source_region", None),
+                    "name",
+                    None,
+                ),
+            }
+        else:
+            direct_chain = plan_path_c_direct_fusion_chain_for_region(
+                region,
                 include_backward=True,
-                sequence_length=sequence_length,
             )
-            direct_chain = _select_path_c_direct_chain_for_region(
-                direct_chains,
-                selected_region,
+            direct_chain_construction = {
+                "planner": "plan_path_c_direct_fusion_chain_for_region",
+                "region_prefix": None,
+                "candidate_chain_count": 1,
+                "selected_source_region": getattr(
+                    getattr(direct_chain, "source_region", None),
+                    "name",
+                    None,
+                ),
+            }
+        direct_chain_runtime_binding = (
+            path_c_direct_fusion_chain_runtime_binding_payload(
+                chain=direct_chain,
+                logical_buffers=resolved_direct_chain_logical_buffers,
+                logical_buffer_owner=resolved_direct_chain_logical_buffer_owner,
+                logical_owner=resolved_direct_chain_logical_owner,
+                artifacts=resolved_direct_chain_artifacts,
             )
-        if direct_chain is None:
-            raise RuntimeError(
-                f"{profile_name} did not produce any direct Path C chain"
+        )
+        direct_chain_training_contract = (
+            path_c_direct_fusion_chain_training_runtime_contract_payload(
+                training_runtime=resolved_direct_chain_training_runtime,
+                runtime_binding=direct_chain_runtime_binding,
             )
-        direct_chain_construction = {
-            "planner": (
-                "training_runtime.chain"
-                if runtime_chain is not None
-                else "plan_path_c_direct_fusion_chains_for_model"
-            ),
-            "region_prefix": direct_chain_region_prefix,
-            "candidate_chain_count": len(direct_chains)
-            if direct_chains
-            else 1,
-            "selected_source_region": getattr(
-                getattr(direct_chain, "source_region", None),
-                "name",
-                None,
-            ),
-        }
-    else:
-        direct_chain = plan_path_c_direct_fusion_chain_for_region(
-            region,
-            include_backward=True,
+        )
+    except Exception as exc:
+        direct_chain = SimpleNamespace(
+            status="blocked",
+            reason=f"direct-chain planner unavailable: {type(exc).__name__}: {exc}",
+            max_kernel_buffers=0,
+            segments=(),
+            source_region=selected_region,
         )
         direct_chain_construction = {
-            "planner": "plan_path_c_direct_fusion_chain_for_region",
-            "region_prefix": None,
-            "candidate_chain_count": 1,
-            "selected_source_region": getattr(
-                getattr(direct_chain, "source_region", None),
-                "name",
-                None,
+            "planner": "direct_chain_planner_unavailable",
+            "region_prefix": (
+                _path_c_direct_chain_region_prefix(model, profile_name)
+                if model is not None
+                else None
             ),
+            "candidate_chain_count": 0,
+            "selected_source_region": getattr(selected_region, "name", None),
+            "error_type": type(exc).__name__,
+            "reason": str(exc),
         }
-    direct_chain_runtime_binding = (
-        path_c_direct_fusion_chain_runtime_binding_payload(
-            chain=direct_chain,
-            logical_buffers=resolved_direct_chain_logical_buffers,
-            logical_buffer_owner=resolved_direct_chain_logical_buffer_owner,
-            logical_owner=resolved_direct_chain_logical_owner,
-            artifacts=resolved_direct_chain_artifacts,
+        direct_chain_runtime_binding = {
+            "status": "direct_chain_planner_unavailable",
+            "reason": str(exc),
+            "runtime_uses_direct_fusion_chain": False,
+            "hidden_packing_performed": False,
+            "no_hidden_allocation_policy": True,
+        }
+        direct_chain_training_contract = (
+            path_c_direct_fusion_chain_training_runtime_contract_payload(
+                training_runtime=None,
+                runtime_binding=direct_chain_runtime_binding,
+            )
         )
-    )
-    direct_chain_training_contract = (
-        path_c_direct_fusion_chain_training_runtime_contract_payload(
-            training_runtime=resolved_direct_chain_training_runtime,
-            runtime_binding=direct_chain_runtime_binding,
-        )
-    )
     direct_chain_training_critical_path = bool(
         direct_chain_training_contract.get("critical_path_ready")
     )
+    try:
+        direct_chain_model_binding_audit = (
+            path_c_direct_fusion_chain_model_binding_audit(
+                chain=direct_chain,
+                model=model,
+            )
+        )
+    except Exception as exc:
+        direct_chain_model_binding_audit = {
+            "status": "direct_chain_audit_unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    try:
+        direct_chain_pre_step_owner_plan_payload = (
+            path_c_direct_chain_pre_step_owner_plan(
+                chain=direct_chain,
+                model=model,
+                logical_buffers=direct_chain_logical_buffers,
+                logical_owner=direct_chain_logical_owner,
+            )
+        )
+    except Exception as exc:
+        direct_chain_pre_step_owner_plan_payload = {
+            "status": "direct_chain_pre_step_owner_plan_unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    try:
+        direct_chain_value_and_grad_bridge_plan_payload = (
+            path_c_direct_fusion_chain_value_and_grad_bridge_plan(
+                chain=direct_chain,
+                model=model,
+                logical_buffers=direct_chain_logical_buffers,
+                logical_owner=direct_chain_logical_owner,
+            )
+        )
+    except Exception as exc:
+        direct_chain_value_and_grad_bridge_plan_payload = {
+            "status": "direct_chain_value_and_grad_bridge_plan_unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
     runtime_fused_route_bound = bool(
         fused_train_block_training_contract.get("training_runtime_available")
         or direct_chain_training_contract.get("training_runtime_available")
@@ -7788,28 +7859,9 @@ def path_c_fusion_payload(
                 direct_chain_training_contract.get("training_runtime_available")
             ),
             "training_runtime_contract": direct_chain_training_contract,
-            "model_binding_audit": (
-                path_c_direct_fusion_chain_model_binding_audit(
-                    chain=direct_chain,
-                    model=model,
-                )
-            ),
-            "pre_step_owner_plan": (
-                path_c_direct_chain_pre_step_owner_plan(
-                    chain=direct_chain,
-                    model=model,
-                    logical_buffers=direct_chain_logical_buffers,
-                    logical_owner=direct_chain_logical_owner,
-                )
-            ),
-            "value_and_grad_bridge_plan": (
-                path_c_direct_fusion_chain_value_and_grad_bridge_plan(
-                    chain=direct_chain,
-                    model=model,
-                    logical_buffers=direct_chain_logical_buffers,
-                    logical_owner=direct_chain_logical_owner,
-                )
-            ),
+            "model_binding_audit": direct_chain_model_binding_audit,
+            "pre_step_owner_plan": direct_chain_pre_step_owner_plan_payload,
+            "value_and_grad_bridge_plan": direct_chain_value_and_grad_bridge_plan_payload,
             "runtime_binding": direct_chain_runtime_binding,
         },
         "schedule_blockers": [

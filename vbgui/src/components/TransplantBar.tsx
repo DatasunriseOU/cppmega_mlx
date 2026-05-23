@@ -7,6 +7,7 @@
 import { useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
 import { HelpIcon } from "@/components/HelpIcon";
+import { T } from "@/theme";
 
 interface BrickSpec {
   kind: string;
@@ -18,10 +19,11 @@ export interface TransplantBarProps {
   rpc: RpcClient | null;
   presets: readonly string[];
   onTransplant: (kind: string, params: Record<string, unknown>) => void;
+  sidebar?: boolean;
 }
 
 export function TransplantBar({
-  rpc, presets, onTransplant,
+  rpc, presets, onTransplant, sidebar = false,
 }: TransplantBarProps): JSX.Element {
   const [sourcePreset, setSourcePreset] = useState<string>(
     presets[0] ?? "");
@@ -54,15 +56,112 @@ export function TransplantBar({
   const candidate = bricks.find(
     (b) => (b.name ?? b.kind) === selectedBrick);
 
+  if (sidebar) {
+    return (
+      <div data-testid="transplant-bar"
+           style={{ display: "flex", flexDirection: "column", gap: 8,
+                    fontFamily: T.font, fontSize: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={{ fontWeight: 600, color: T.textSecondary }}>Transplant Brick</span>
+          <HelpIcon topic="brick_transplant" />
+        </div>
+        <div style={{ display: "flex", gap: 6, width: "100%" }}>
+          <label style={{ color: T.textSecondary, display: "flex", flexDirection: "column", gap: 4, flex: 1 }}>
+            source preset
+            <select data-testid="transplant-source-preset"
+                    value={sourcePreset}
+                    onChange={(e) => {
+                      setSourcePreset(e.target.value);
+                      setBricks([]);
+                      setSelectedBrick("");
+                    }}
+                    style={{
+                      width: "100%",
+                      color: T.text,
+                      background: T.surface3,
+                      border: `1px solid ${T.border}`,
+                      borderRadius: 4,
+                      padding: "3px 6px",
+                    }}>
+              {presets.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </label>
+          <button data-testid="transplant-load-source"
+                  onClick={() => loadPreset(sourcePreset)}
+                  disabled={loading || !sourcePreset}
+                  style={{
+                    padding: "2px 10px",
+                    color: T.text,
+                    background: T.surface3,
+                    border: `1px solid ${T.border}`,
+                    borderRadius: 4,
+                    alignSelf: "flex-end",
+                    height: 26,
+                    cursor: "pointer"
+                  }}>
+            {loading ? "…" : "Load"}
+          </button>
+        </div>
+        {bricks.length > 0 && (
+          <label style={{ color: T.textSecondary, display: "flex", flexDirection: "column", gap: 4 }}>
+            source brick
+            <select data-testid="transplant-source-brick"
+                    value={selectedBrick}
+                    onChange={(e) => setSelectedBrick(e.target.value)}
+                    style={{
+                      width: "100%",
+                      color: T.text,
+                      background: T.surface3,
+                      border: `1px solid ${T.border}`,
+                      borderRadius: 4,
+                      padding: "3px 6px",
+                    }}>
+              {bricks.map((b) => {
+                const key = b.name ?? b.kind;
+                return (
+                  <option key={key} value={key}>
+                    {key} [{b.kind}]
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+        )}
+        <button data-testid="transplant-import"
+                onClick={() => {
+                  if (candidate) {
+                    onTransplant(candidate.kind, candidate.params ?? {});
+                  }
+                }}
+                disabled={!candidate}
+                style={{ padding: "6px 12px",
+                         background: candidate ? T.accent : T.surface3,
+                         color: candidate ? "#fff" : T.textMuted,
+                         border: "none", borderRadius: 4,
+                         width: "100%",
+                         fontWeight: "bold",
+                         cursor: candidate ? "pointer" : "default" }}>
+          Import
+        </button>
+        {error && (
+          <span data-testid="transplant-error"
+                style={{ color: T.danger }}>
+            {error}
+          </span>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div data-testid="transplant-bar"
          style={{ display: "flex", alignItems: "center", gap: 8,
-                  padding: "4px 8px", background: "#eef2ff",
-                  borderBottom: "1px solid #c7d2fe",
-                  fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
-      <strong style={{ color: "#0f172a" }}>Transplant</strong>
+                  padding: "4px 8px", background: T.surface,
+                  borderBottom: `1px solid ${T.border}`,
+                  fontFamily: T.font, fontSize: 12 }}>
+      <strong style={{ color: T.accent }}>Transplant</strong>
       <HelpIcon topic="brick_transplant" />
-      <label style={{ color: "#0f172a", display: "flex", alignItems: "center", gap: 4 }}>
+      <label style={{ color: T.textSecondary, display: "flex", alignItems: "center", gap: 4 }}>
         from
         <select data-testid="transplant-source-preset"
                 value={sourcePreset}
@@ -71,24 +170,41 @@ export function TransplantBar({
                   setBricks([]);
                   setSelectedBrick("");
                 }}
-                style={{ marginLeft: 4, width: 180 }}>
+                style={{
+                  marginLeft: 4,
+                  width: 180,
+                  color: T.text,
+                  background: T.surface3,
+                  border: `1px solid ${T.border}`,
+                }}>
           {presets.map((p) => <option key={p} value={p}>{p}</option>)}
         </select>
       </label>
       <button data-testid="transplant-load-source"
               onClick={() => loadPreset(sourcePreset)}
               disabled={loading || !sourcePreset}
-              style={{ padding: "2px 8px" }}>
+              style={{
+                padding: "2px 8px",
+                color: T.text,
+                background: T.surface3,
+                border: `1px solid ${T.border}`,
+              }}>
         {loading ? "Loading…" : "Load"}
       </button>
       {bricks.length > 0 && (
         <>
-          <label style={{ color: "#0f172a", display: "flex", alignItems: "center", gap: 4 }}>
+          <label style={{ color: T.textSecondary, display: "flex", alignItems: "center", gap: 4 }}>
             brick
             <select data-testid="transplant-source-brick"
                     value={selectedBrick}
                     onChange={(e) => setSelectedBrick(e.target.value)}
-                    style={{ marginLeft: 4, width: 200 }}>
+                    style={{
+                      marginLeft: 4,
+                      width: 200,
+                      color: T.text,
+                      background: T.surface3,
+                      border: `1px solid ${T.border}`,
+                    }}>
               {bricks.map((b) => {
                 const key = b.name ?? b.kind;
                 return (
@@ -101,7 +217,7 @@ export function TransplantBar({
           </label>
           <div data-testid="transplant-draggable-list"
                style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: 12 }}>
-            <span style={{ color: "#0f172a", fontWeight: 700 }}>Drag:</span>
+            <span style={{ color: T.text, fontWeight: 700 }}>Drag:</span>
             {bricks.map((b) => {
               const key = b.name ?? b.kind;
               return (
@@ -116,14 +232,14 @@ export function TransplantBar({
                   data-testid={`transplant-drag-brick-${key}`}
                   style={{
                     padding: "3px 8px",
-                    background: "#1e293b",
-                    border: "1px solid #06b6d4",
-                    color: "#22d3ee",
+                    background: T.surface3,
+                    border: `1px solid ${T.accent}`,
+                    color: T.accent,
                     borderRadius: 4,
                     cursor: "grab",
                     fontSize: 10,
                     fontWeight: 700,
-                    boxShadow: "0 2px 4px rgba(0,0,0,0.15)",
+                    boxShadow: T.shadowPanel,
                   }}
                 >
                   {key}
@@ -141,15 +257,15 @@ export function TransplantBar({
               }}
               disabled={!candidate}
               style={{ padding: "2px 10px",
-                       background: candidate ? "#4f46e5" : "#e5e7eb",
-                       color: candidate ? "white" : "#9ca3af",
-                       border: "none", borderRadius: 4,
+                       background: candidate ? T.accent : T.surface3,
+                       color: candidate ? "#0f172a" : T.textMuted,
+                       border: `1px solid ${T.border}`, borderRadius: 4,
                        cursor: candidate ? "pointer" : "default" }}>
         Import →
       </button>
       {error && (
         <span data-testid="transplant-error"
-              style={{ color: "#991b1b" }}>
+              style={{ color: T.danger }}>
           {error}
         </span>
       )}

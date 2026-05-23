@@ -49,17 +49,25 @@ export interface AblationsTabProps {
 }
 
 function nodesToGraph(nodes: Node[], edges: Edge[]) {
+  const modelNodes = nodes.filter(
+    (n) => n.type !== "tokenizer_virtual" && n.type !== "detokenizer_virtual"
+  );
+  const modelNodeIds = new Set(modelNodes.map((n) => n.id));
+  const modelEdges = edges.filter(
+    (e) => modelNodeIds.has(e.source) && modelNodeIds.has(e.target)
+  );
+
   return {
-    nodes: nodes.map((n) => {
+    nodes: modelNodes.map((n) => {
       const d = n.data as { kind?: string; params?: Record<string, unknown> };
       return { id: n.id, kind: d.kind ?? "mlp", params: d.params ?? {} };
     }),
-    edges: edges.map((e) => ({ src: e.source, dst: e.target })),
+    edges: modelEdges.map((e) => ({ src: e.source, dst: e.target })),
   };
 }
 
 function MiniChart({ values }: { values: number[] }): JSX.Element {
-  if (values.length === 0) return <span style={{ color: "#9ca3af" }}>—</span>;
+  if (values.length === 0) return <span style={{ color: "var(--vb-text-muted)" }}>—</span>;
   const max = Math.max(...values);
   const min = Math.min(...values);
   const span = max - min || 1;
@@ -70,7 +78,7 @@ function MiniChart({ values }: { values: number[] }): JSX.Element {
   }).join(" ");
   return (
     <svg width={80} height={30}
-         style={{ background: "#f9fafb", borderRadius: 2 }}>
+         style={{ background: "var(--vb-surface-2)", borderRadius: 2 }}>
       <polyline fill="none" stroke="#2563eb" strokeWidth="1.2" points={pts} />
     </svg>
   );
@@ -164,13 +172,14 @@ export function AblationsTab({
         </select>
       </label>
 
-      <div data-testid="ablation-variants"
-           style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+       <div data-testid="ablation-variants"
+            style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
         {VARIANTS_PER_AXIS[axis].map((v) => (
           <label key={v} data-testid={`ablation-variant-${v}`}
                  style={{ display: "inline-flex", gap: 3, fontSize: 11,
                           padding: "2px 6px",
-                          background: variants.has(v) ? "#dbeafe" : "#f3f4f6",
+                          background: variants.has(v) ? "var(--vb-accent-soft)" : "var(--vb-surface-3)",
+                          color: variants.has(v) ? "var(--vb-accent)" : "var(--vb-text)",
                           borderRadius: 3, cursor: "pointer" }}>
             <input type="checkbox" checked={variants.has(v)}
                    onChange={() => toggleVariant(v)} />
@@ -187,8 +196,8 @@ export function AblationsTab({
       </label>
 
       <button data-testid="ablation-run" onClick={run} disabled={running}
-              style={{ background: "#2563eb", color: "white",
-                       border: "none", padding: "5px 12px",
+              style={{ background: "var(--vb-accent)", color: "var(--vb-accent-contrast)",
+                       border: "none", padding: "5px 12px", fontWeight: "bold",
                        borderRadius: 4, cursor: "pointer", fontSize: 12 }}>
         {running ? "Running…" : "Run ablation"}
       </button>
@@ -205,7 +214,7 @@ export function AblationsTab({
                style={{ width: "100%", fontSize: 11, marginTop: 6,
                         borderCollapse: "collapse" }}>
           <thead>
-            <tr style={{ background: "#f9fafb" }}>
+            <tr style={{ background: "var(--vb-surface-2)" }}>
               <th style={th}></th>
               <th style={th}>Variant</th>
               <th style={th}>Final</th>
@@ -245,7 +254,7 @@ export function AblationsTab({
                     <td data-testid={`ablation-final-${r.variant}`}
                         style={td}>{final?.toFixed(4) ?? "—"}</td>
                     <td style={{ ...td,
-                                  color: delta == null ? "#9ca3af"
+                                  color: delta == null ? "var(--vb-text-muted)"
                                          : delta > 0 ? "#dc2626"
                                                      : "#16a34a" }}>
                       {delta == null ? "—"
@@ -262,7 +271,7 @@ export function AblationsTab({
                   {open && (
                     <tr data-testid={`ablation-row-${r.variant}-extras`}>
                       <td colSpan={6}
-                          style={{ ...td, background: "#fafafa",
+                          style={{ ...td, background: "var(--vb-surface-2)",
                                    padding: 8 }}>
                         <VariantExtras variant={r.variant}
                                        losses={r.losses}
@@ -293,14 +302,14 @@ function VariantExtras({
                  display: "grid",
                  gridTemplateColumns: "120px 1fr",
                  columnGap: 8, rowGap: 2 }}>
-      <dt style={{ color: "#6b7280" }}>losses</dt>
+      <dt style={{ color: "var(--vb-text-muted)" }}>losses</dt>
       <dd data-testid={`ablation-row-${variant}-losses`}
           style={{ margin: 0 }}>
         [{losses.map((l) => l.toFixed(4)).join(", ")}]
       </dd>
       {Object.entries(extras).map(([k, v]) => (
         <Fragment key={k}>
-          <dt style={{ color: "#6b7280" }}>{k}</dt>
+          <dt style={{ color: "var(--vb-text-muted)" }}>{k}</dt>
           <dd data-testid={`ablation-row-${variant}-extras-${k}`}
               style={{ margin: 0, wordBreak: "break-all" }}>
             {v === null || v === undefined
@@ -320,7 +329,7 @@ const panel: React.CSSProperties = {
   fontFamily: "system-ui, sans-serif", fontSize: 12,
 };
 const th: React.CSSProperties = {
-  textAlign: "left", padding: "3px 4px", color: "#6b7280",
+  textAlign: "left", padding: "3px 4px", color: "var(--vb-text-muted)",
   fontSize: 10, fontWeight: 600,
 };
 const td: React.CSSProperties = { padding: "3px 4px" };

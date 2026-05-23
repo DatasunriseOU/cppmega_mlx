@@ -18,6 +18,9 @@ function renderNode(data: Record<string, unknown>) {
         selected={false}
         dragging={false}
         isConnectable={false}
+        selectable={false}
+        deletable={false}
+        draggable={false}
         positionAbsoluteX={0}
         positionAbsoluteY={0}
         zIndex={0} />

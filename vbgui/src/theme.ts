@@ -66,6 +66,7 @@ export const CATEGORY_ACCENT: Record<BrickCategory, string> = {
   cross_attn:     "var(--vb-cat-cross)",
   norm_or_proj:   "var(--vb-cat-norm)",
   nonlinear_rnn:  "var(--vb-cat-rnn)",
+  io:             "var(--vb-accent)",
 };
 
 export function accentForCategory(cat: BrickCategory | undefined): string {
@@ -90,4 +91,5 @@ export const CATEGORY_ICON: Record<BrickCategory, string> = {
   cross_attn:     "✕",
   norm_or_proj:   "∥",
   nonlinear_rnn:  "↺",
+  io:             "🔠",
 };
