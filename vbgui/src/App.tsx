@@ -4,6 +4,7 @@ import {
 } from "@xyflow/react";
 
 import { FlowCanvas } from "@/components/FlowCanvas";
+import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
 import { TopBar, type RunMode } from "@/components/TopBar";
@@ -147,11 +148,19 @@ export function App(): JSX.Element {
   // list that was missing 5 architectures.
   const PRESETS = usePresets(rpc);
 
+  // V7-F56b / V7-F53: editable dim_env (was a constant MINI_DIM_ENV).
+  // Threaded into the verify trigger so changes to H/nh/head_dim
+  // re-run verify and surface the F56b mismatch warning.
+  const [dimEnv, setDimEnv] = useState<Record<string, number>>(
+    { ...MINI_DIM_ENV });
+
   // Keep one stable spec snapshot for the verify debouncer to read.
-  const wireSpecRef = useRef({ nodes, edges, spec, availableSideChannels });
+  const wireSpecRef = useRef({ nodes, edges, spec, availableSideChannels,
+                               dimEnv });
   useEffect(() => {
-    wireSpecRef.current = { nodes, edges, spec, availableSideChannels };
-  }, [nodes, edges, spec, availableSideChannels]);
+    wireSpecRef.current = { nodes, edges, spec, availableSideChannels,
+                            dimEnv };
+  }, [nodes, edges, spec, availableSideChannels, dimEnv]);
 
   useEffect(() => {
     const available = new Set(availableSideChannels);
@@ -163,6 +172,7 @@ export function App(): JSX.Element {
     if (snap.nodes.length === 0) return;
     const params = buildVerifyParams(
       snap.nodes, snap.edges, snap.spec, snap.availableSideChannels,
+      snap.dimEnv,
     );
     try {
       const r = await rpc.call<{
@@ -227,10 +237,14 @@ export function App(): JSX.Element {
   const rewriterKey = spec.rewriters.map((r) => r.name).join(",");
   const sideChannelKey = JSON.stringify(spec.side_channels);
   const availableSideChannelKey = availableSideChannels.join(",");
+  // V7-F56b/F53: re-verify when the dim_env editor mutates H, nh, or
+  // head_dim — otherwise the F56b badge wouldn't appear after a user
+  // types a mismatch.
+  const dimEnvKey = JSON.stringify(dimEnv);
   useEffect(() => { scheduleVerify(); },
            [nodesKey, edgesKey, lossKey, optimKey, shardingKey,
             rewriterKey, sideChannelKey, availableSideChannelKey,
-            scheduleVerify]);
+            dimEnvKey, scheduleVerify]);
 
   // V7-H03: snapshot the (nodes, edges, spec) triple every time a
   // structural key changes — that's the same set of user-meaningful
@@ -343,7 +357,7 @@ export function App(): JSX.Element {
                      }[] } }[];
       }>("suggest_sharding", {
         graph: nodesToGraph(snap.nodes, snap.edges),
-        dim_env: MINI_DIM_ENV,
+        dim_env: snap.dimEnv,
         loss: { kind: snap.spec.loss.kind,
                 head_outputs: snap.spec.loss.head_outputs },
         optim: { kind: snap.spec.optim.kind,
@@ -626,8 +640,10 @@ export function App(): JSX.Element {
           {activeTab === "canvas" && (
             <>
               <Palette />
-              <div style={{ flex: 1, position: "relative", display: "flex",
+              <div style={{ flex: 1, position: "relative",
+                            display: "flex", flexDirection: "column",
                             minHeight: 0 }}>
+                <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
                 {spec.gotchas.some(
                   (g) => g.id === "v7_f56b_dim_env_mismatch") && (
                   <div
@@ -821,10 +837,11 @@ function buildVerifyParams(
   edges: Edge[],
   spec: SpecState,
   availableSideChannels: string[] = ["doc_ids", "token_ids"],
+  dimEnv: Record<string, number> = MINI_DIM_ENV,
 ) {
   return {
     graph: nodesToGraph(nodes, edges),
-    dim_env: MINI_DIM_ENV,
+    dim_env: dimEnv,
     loss: { kind: spec.loss.kind, head_outputs: spec.loss.head_outputs,
             params: spec.loss.params },
     optim: { kind: spec.optim.kind,
