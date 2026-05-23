@@ -36,9 +36,32 @@ describe("V7-H03 useHistory", () => {
     act(() => { result.current.push(2); });
     act(() => { result.current.push(3); });
     act(() => { result.current.undo(); });    // pop 3, prev=2
-    let nxt: number | null = null;
+    let nxt: { snapshot: number; rejected: boolean } | null = null;
     act(() => { nxt = result.current.redo(); });
-    expect(nxt).toBe(3);
+    expect(nxt?.snapshot).toBe(3);
+    expect(nxt?.rejected).toBe(false);
+  });
+
+  it("V7-H43: markRejected tags the current top; redo surfaces the flag", () => {
+    const { result } = renderHook(() => useHistory<number>());
+    act(() => { result.current.push(1); });
+    act(() => { result.current.push(2); });
+    act(() => { result.current.markRejected(); });  // 2 is rejected
+    act(() => { result.current.undo(); });          // pop 2, back to 1
+    let nxt: { snapshot: number; rejected: boolean } | null = null;
+    act(() => { nxt = result.current.redo(); });
+    expect(nxt?.snapshot).toBe(2);
+    expect(nxt?.rejected).toBe(true);
+  });
+
+  it("V7-H43: clean snapshots stay rejected=false through redo", () => {
+    const { result } = renderHook(() => useHistory<number>());
+    act(() => { result.current.push(10); });
+    act(() => { result.current.push(20); });
+    act(() => { result.current.undo(); });
+    let nxt: { snapshot: number; rejected: boolean } | null = null;
+    act(() => { nxt = result.current.redo(); });
+    expect(nxt?.rejected).toBe(false);
   });
 
   it("new push after undo clears redo stack (linear semantics)", () => {

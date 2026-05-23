@@ -346,6 +346,13 @@ export function App(): JSX.Element {
                  brick_count: snap.nodes.length });
       if (r.gotchas) {
         dispatch({ type: "gotchas.set", gotchas: r.gotchas });
+        // V7-H43: when verify lands ANY error-severity gotcha on the
+        // current snapshot, tag it as rejected in the history. A
+        // later undo+redo onto this snapshot surfaces a toast so the
+        // user doesn't silently re-arm a broken spec.
+        if (r.gotchas.some((g) => g.severity === "error")) {
+          history.markRejected();
+        }
       }
       if (r.resolved?.edges) {
         setEdges((prev) => recolorEdges(prev, r.resolved!.edges!));
@@ -421,14 +428,24 @@ export function App(): JSX.Element {
     }
   }, [history]);
   const handleRedo = useCallback(() => {
-    const nxt = history.redo();
-    if (nxt) {
-      suppressNextHistoryPushRef.current = true;
-      setNodes(nxt.nodes);
-      setEdges(nxt.edges);
-      dispatch({ type: "spec.replace", spec: nxt.spec });
+    const r = history.redo();
+    if (!r) return;
+    const nxt = r.snapshot;
+    suppressNextHistoryPushRef.current = true;
+    setNodes(nxt.nodes);
+    setEdges(nxt.edges);
+    dispatch({ type: "spec.replace", spec: nxt.spec });
+    // V7-H43: when the redo lands on a snapshot the backend
+    // previously rejected, surface a transient toast so the user
+    // knows the verify gate will fail again — they can keep
+    // editing or undo back out without confusion.
+    if (r.rejected) {
+      setRunError(
+        "Redo landed on a snapshot the backend previously " +
+        "rejected — verify will refire. Undo to step out.");
+      setTimeout(() => setRunError(null), 4000);
     }
-  }, [history]);
+  }, [history, setRunError]);
 
   // V7-H03: Cmd/Ctrl+Z = undo, Shift+Cmd/Ctrl+Z = redo.
   useEffect(() => {
@@ -731,6 +748,65 @@ export function App(): JSX.Element {
   // cleared once the registry reports running=false.
   const [trainPaused, setTrainPaused] = useState<boolean>(false);
   const [trainAborting, setTrainAborting] = useState<boolean>(false);
+
+  // V7-H41 + V7-H42: persist activeTrainRunId per project so a UI
+  // reload mid-train can rehydrate pause-state from pipeline.status.
+  // We store the bare id in localStorage under a separate key from
+  // the project payload (which is generic T inside useProjects). On
+  // mount, if a stored run-id exists, hit pipeline.status; if the
+  // backend reports running, restore trainRunId + trainPaused.
+  useEffect(() => {
+    let cancelled = false;
+    function lsKey(): string | null {
+      try {
+        const projId = localStorage.getItem("vbgui_active_project_v1");
+        return projId
+          ? `vbgui_active_train_run_id_${JSON.parse(projId)}`
+          : "vbgui_active_train_run_id";
+      } catch { return "vbgui_active_train_run_id"; }
+    }
+    (async () => {
+      try {
+        const key = lsKey();
+        if (!key) return;
+        const stored = localStorage.getItem(key);
+        if (!stored) return;
+        const runId = JSON.parse(stored) as string;
+        const s = await rpc.call<{ known: boolean; running: boolean;
+                                    paused: boolean; aborted: boolean }>(
+          "pipeline.status", { run_id: runId });
+        if (cancelled) return;
+        if (s.known && s.running && !s.aborted) {
+          setTrainRunId(runId);
+          setLastTrainRunId(runId);
+          setTrainInFlight(true);
+          setTrainPaused(!!s.paused);
+        } else {
+          // Stale id; clear so we don't keep polling on every reload.
+          localStorage.removeItem(key);
+        }
+      } catch { /* offline / no project / no run — silent */ }
+    })();
+    return () => { cancelled = true; };
+    // Run once on mount; rpc is stable across renders via useRpc.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // V7-H42: write the active run-id to localStorage whenever it
+  // changes, so a reload sees it. null clears the key.
+  useEffect(() => {
+    try {
+      const projRaw = localStorage.getItem("vbgui_active_project_v1");
+      const key = projRaw
+        ? `vbgui_active_train_run_id_${JSON.parse(projRaw)}`
+        : "vbgui_active_train_run_id";
+      if (trainRunId) {
+        localStorage.setItem(key, JSON.stringify(trainRunId));
+      } else {
+        localStorage.removeItem(key);
+      }
+    } catch { /* storage offline */ }
+  }, [trainRunId]);
 
   const pollStatus = useCallback(async (
     runId: string,

@@ -107,6 +107,51 @@ describe("TokenizerPlayground", () => {
       .not.toContain("✓ Train");
   });
 
+  it("V7-H46: roundtrip pill renders ok when byte_roundtrip=true", async () => {
+    const withRoundtripOk = {
+      ...SAMPLE_RESULT,
+      capabilities: { ...SAMPLE_RESULT.capabilities,
+                       byte_roundtrip: true },
+    };
+    render(<TokenizerPlayground rpc={mockClient(withRoundtripOk)}
+                                initialSources={["/ok.json"]} />);
+    fireEvent.click(screen.getByTestId("tokenizer-encode-0"));
+    await waitFor(() => {
+      expect(screen.getByTestId("tokenizer-roundtrip-0")).toBeTruthy();
+    });
+    const pill = screen.getByTestId("tokenizer-roundtrip-0");
+    expect(pill.getAttribute("data-roundtrip")).toBe("ok");
+    expect(pill.textContent).toContain("✓");
+  });
+
+  it("V7-H46: roundtrip pill renders fail when byte_roundtrip=false", async () => {
+    const withRoundtripFail = {
+      ...SAMPLE_RESULT,
+      capabilities: { ...SAMPLE_RESULT.capabilities,
+                       byte_roundtrip: false },
+    };
+    render(<TokenizerPlayground rpc={mockClient(withRoundtripFail)}
+                                initialSources={["/bad.json"]} />);
+    fireEvent.click(screen.getByTestId("tokenizer-encode-0"));
+    await waitFor(() => {
+      const pill = screen.getByTestId("tokenizer-roundtrip-0");
+      expect(pill.getAttribute("data-roundtrip")).toBe("fail");
+      expect(pill.textContent).toContain("✗");
+    });
+  });
+
+  it("V7-H46: roundtrip pill hidden when backend omits byte_roundtrip",
+  async () => {
+    // SAMPLE_RESULT.capabilities has no byte_roundtrip → no pill.
+    render(<TokenizerPlayground rpc={mockClient(SAMPLE_RESULT)}
+                                initialSources={["/missing.json"]} />);
+    fireEvent.click(screen.getByTestId("tokenizer-encode-0"));
+    await waitFor(() => {
+      expect(screen.getByTestId("tokenizer-metrics-0")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("tokenizer-roundtrip-0")).toBeNull();
+  });
+
   it("Renders error envelope when backend fails", async () => {
     const failing = new RpcClient({
       baseUrl: "http://x",
