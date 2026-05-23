@@ -120,6 +120,39 @@ describe("V8-R02 GalleryScaleDownSlider", () => {
     expect(apply.disabled).toBe(true);
   });
 
+  it("Auto-fit button calls architectures.auto_fit and renders result",
+    async () => {
+      const AUTO_FIT = {
+        scaled: FIT_PREVIEW,
+        fits: true,
+        topology: "gb10_quarter",
+        headroom: 0.9,
+        reason: "hidden=512, layers=32, axis=dp×1, peak=0.82 GB / 137 GB",
+      };
+      const { rpc, calls } = makeFakeRpc({
+        "architectures.scale_down": FIT_PREVIEW,
+        "architectures.auto_fit": AUTO_FIT,
+      });
+      render(
+        <GalleryScaleDownSlider
+          presets={["llama3_8b"]} rpc={rpc}
+          onApply={() => {}}
+        />,
+      );
+      const btn = await waitFor(() =>
+        screen.getByTestId("gallery-auto-fit"));
+      fireEvent.click(btn);
+      await waitFor(() => {
+        expect(calls.some((c) => c.method === "architectures.auto_fit"))
+          .toBe(true);
+      });
+      await waitFor(() => {
+        const banner = screen.getByTestId("gallery-auto-fit-result");
+        expect(banner.textContent ?? "").toContain("gb10_quarter");
+        expect(banner.textContent ?? "").toContain("hidden=512");
+      });
+    });
+
   it("renders an error banner if the RPC throws", async () => {
     const { rpc } = makeFakeRpc({
       "architectures.scale_down": new Error("boom"),

@@ -809,6 +809,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "platform.get_info",
     "architectures.scale_down",
     "memory.matrix",
+    "architectures.auto_fit",
 })
 
 

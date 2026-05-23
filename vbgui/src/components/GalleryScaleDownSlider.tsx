@@ -52,6 +52,14 @@ function fmtBytes(n: number): string {
   return `${n} B`;
 }
 
+interface AutoFitResult {
+  scaled: ScaleDownPreview;
+  fits: boolean;
+  reason: string;
+  topology: string;
+  headroom: number;
+}
+
 export function GalleryScaleDownSlider({
   presets, rpc, onApply, initialBytes = ONE_GB, initialPreset,
 }: GalleryScaleDownSliderProps): JSX.Element {
@@ -61,6 +69,9 @@ export function GalleryScaleDownSlider({
   const [preview, setPreview] = useState<ScaleDownPreview | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [autoFitResult, setAutoFitResult] =
+    useState<AutoFitResult | null>(null);
+  const [autoFitBusy, setAutoFitBusy] = useState(false);
   // Per-request token so stale responses are dropped.
   const reqIdRef = useRef(0);
 
@@ -89,6 +100,23 @@ export function GalleryScaleDownSlider({
     const t = setTimeout(() => { void fetchPreview(preset, bytes); }, 250);
     return () => clearTimeout(t);
   }, [preset, bytes, fetchPreview]);
+
+  const runAutoFit = useCallback(async () => {
+    if (!preset) return;
+    setAutoFitBusy(true);
+    setErr(null);
+    try {
+      const r = await rpc.call<AutoFitResult>(
+        "architectures.auto_fit", { preset });
+      setAutoFitResult(r);
+      // Mirror as the preview block so the user sees identical state.
+      setPreview(r.scaled);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAutoFitBusy(false);
+    }
+  }, [rpc, preset]);
 
   return (
     <div data-testid="gallery-scaledown" style={{ padding: 8,
@@ -120,6 +148,21 @@ export function GalleryScaleDownSlider({
       {loading && <span data-testid="gallery-scaledown-loading">…</span>}
       {err && <span data-testid="gallery-scaledown-error"
                     style={{ color: "#b91c1c" }}>{err}</span>}
+      <button
+        data-testid="gallery-auto-fit"
+        onClick={() => { void runAutoFit(); }}
+        disabled={autoFitBusy || !preset}
+        style={{ alignSelf: "flex-start", padding: "2px 8px" }}>
+        {autoFitBusy ? "auto-fitting…" : "Auto-fit to my devbox"}
+      </button>
+      {autoFitResult && (
+        <div data-testid="gallery-auto-fit-result"
+             style={{ fontSize: 11, color: "#374151",
+                      background: "#eff6ff", padding: 6,
+                      borderRadius: 4 }}>
+          <strong>{autoFitResult.topology}</strong> · {autoFitResult.reason}
+        </div>
+      )}
       {preview && (
         <div style={{ fontSize: 11, color: "#374151",
                       display: "flex", flexDirection: "column", gap: 2 }}>

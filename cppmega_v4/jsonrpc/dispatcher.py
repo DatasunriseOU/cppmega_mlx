@@ -79,6 +79,10 @@ from cppmega_v4.jsonrpc.memory_matrix_method import (
     MemoryMatrixParams,
     memory_matrix,
 )
+from cppmega_v4.jsonrpc.auto_fit_method import (
+    AutoFitParams,
+    auto_fit,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -136,6 +140,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "memory.matrix": (
         MemoryMatrixParams,
         lambda p, c: memory_matrix(p, cache=c),
+    ),
+    "architectures.auto_fit": (
+        AutoFitParams,
+        lambda p, c: auto_fit(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,
