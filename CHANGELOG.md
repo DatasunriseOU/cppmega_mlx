@@ -2,6 +2,34 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## V7-P-block: full-scale UI + convergence e2e + M0 baseline (2026-05-23)
+
+- **P5**: DimEnvEditor scale-preset dropdown — mini / dev_128 /
+  small_512 / medium_1k / large_2k / llama3_8b / llama3_70b. Each
+  preset self-consistent (nh*head_dim == H). Unblocks full-scale
+  H=4096 through UI. testid `dim-env-preset` + per-option ids.
+- **P6/P7**: `p6_real_convergence_curve.spec.ts` asserts visible
+  LossChart shows monotonic decline across 16 steps via
+  median-quartile comparison. Replaces tautological "num_steps == N"
+  checks.
+- **P10**: `p10_hybrid_muon_adamw.spec.ts` covers muon_adamw_hybrid
+  optim end-to-end at H=512 via the P5 preset selector.
+- **M0.6**: `bench/m06_memory_bench.py` + generated
+  `bench/baselines/m06_memory.json` — the missing artefact from bd
+  t8f.6. Walks verify_and_estimate to produce per-brick
+  params/activations bytes breakdown. CLI knobs --H --S --B
+  --preset --depth --out so dev-128 grad-checkpoint+AdamW can
+  re-run.
+- **M0.7**: `tests/v4/test_m07_resumable_roundtrip.py` xfail-strict
+  pins the honest finding — resumed leg2 loss 3.29 vs baseline
+  4.04 at step N+0 (Δ=0.75) → opt-state m/v moments and/or
+  data-iterator seed don't roundtrip through checkpoint save/load.
+  bd t8f.7 stays OPEN with notes updated.
+- **Deferred (need GB10/hardware/multi-hour)**: P8 multi-epoch UI
+  e2e, P9 1k+ step Playwright run, M0.3 GB10 CUDA logits artifact,
+  M0.5 GB10 FastMTP parity. bd t8f / hjfn / uwhj / A05 carry the
+  remaining work.
+
 ## V7-N-block: deferred-work bd tickets + gen.run UI (2026-05-23)
 
 - **gen.run UI**: new Inference tab with `GenerationPanel` —
