@@ -29,16 +29,16 @@ from __future__ import annotations
 import contextlib
 import io
 
-from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
 from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
 
 
 def _rendered_train_block_source() -> str:
-    profile = local_gb10_quarter_profile()
-    tiny = profile.tiny_smoke_config()
+    # _mamba3_fp8_train_acceptance_region was simplified to take only
+    # include_backward; the per-config knobs now flow through the
+    # bundled acceptance fixture region builder.
     with contextlib.redirect_stderr(io.StringIO()):
         region = schedules._mamba3_fp8_train_acceptance_region(
-            include_backward=True, model_config=tiny,
+            include_backward=True,
         )
         prim_func = schedules.mamba3_fp8_train_fusion_schedule_template(region)
     return str(prim_func)
