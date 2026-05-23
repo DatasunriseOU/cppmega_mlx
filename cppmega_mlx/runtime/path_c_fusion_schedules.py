@@ -5099,8 +5099,8 @@ def _append_row_phased_sparse_mla_fp8_apply_body(
             kv_head_expr=kv_head,
             use_cached_sparse_index=True,
         )
-        body.append(f"{indent * 6}if {score_accum}[0] > {score_max}[0]:")
-        body.append(f"{indent * 7}{score_max}[0] = {score_accum}[0]")
+        body.append(f"{indent * 5}if {score_accum}[0] > {score_max}[0]:")
+        body.append(f"{indent * 6}{score_max}[0] = {score_accum}[0]")
         body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
         body.append(f"{indent * 5}if {sinks} > {score_max}[0]:")
         body.append(f"{indent * 6}{score_max}[0] = {sinks}")
@@ -5113,13 +5113,13 @@ def _append_row_phased_sparse_mla_fp8_apply_body(
             use_cached_sparse_index=True,
         )
         body.append(
-            f"{indent * 6}{score_weight}[0] = "
+            f"{indent * 5}{score_weight}[0] = "
             f"T.exp({score_accum}[0] - {score_max}[0])"
         )
         body.append(
-            f"{indent * 6}{score_weights}[{k_top}] = {score_weight}[0]"
+            f"{indent * 5}{score_weights}[{k_top}] = {score_weight}[0]"
         )
-        body.append(f"{indent * 6}{sumexp}[0] = {sumexp}[0] + {score_weight}[0]")
+        body.append(f"{indent * 5}{sumexp}[0] = {sumexp}[0] + {score_weight}[0]")
         body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
         body.append(
             f"{indent * 5}{sumexp}[0] = {sumexp}[0] + "
@@ -5239,8 +5239,8 @@ def _append_row_phased_sparse_mla_fp8_apply_body(
             head_expr=q_head,
             kv_head_expr=kv_head,
         )
-        body.append(f"{indent * 6}if {score_accum}[0] > {score_max}[0]:")
-        body.append(f"{indent * 7}{score_max}[0] = {score_accum}[0]")
+        body.append(f"{indent * 5}if {score_accum}[0] > {score_max}[0]:")
+        body.append(f"{indent * 6}{score_max}[0] = {score_accum}[0]")
         body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
         body.append(f"{indent * 5}if {sinks} > {score_max}[0]:")
         body.append(f"{indent * 6}{score_max}[0] = {sinks}")
@@ -5252,7 +5252,7 @@ def _append_row_phased_sparse_mla_fp8_apply_body(
             kv_head_expr=kv_head,
         )
         body.append(
-            f"{indent * 6}{sumexp}[0] = {sumexp}[0] + "
+            f"{indent * 5}{sumexp}[0] = {sumexp}[0] + "
             f"T.exp({score_accum}[0] - {score_max}[0])"
         )
         body.append(f"{indent * 4}if {sink_enabled}[0] != 0.0:")
