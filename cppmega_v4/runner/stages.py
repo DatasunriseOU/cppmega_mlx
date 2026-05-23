@@ -1822,11 +1822,19 @@ def stage_train(ctx: StageContext) -> StageResult:
             ctx=ctx, optimizer_kind=optimizer_kind,
             n_steps=n_steps, lr=lr,
         )
+        # V7-C06: opt-in compression for weights + opt-state, default
+        # "none" preserves prior behaviour (AC#5).
+        compress = str(opts.get("compress", "none"))
         if ckpt_save:
             try:
-                import safetensors.mlx as _stmlx
+                from cppmega_v4.runtime.checkpoint_quantize import (
+                    save_state_compressed as _save_compressed,
+                )
                 flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
-                _stmlx.save_file(flat, ckpt_save, metadata=ckpt_metadata)
+                _save_compressed(flat, ckpt_save,
+                                  compress=compress,
+                                  metadata=ckpt_metadata,
+                                  role="weights")
                 checkpoint_saved = str(ckpt_save)
             except Exception:
                 pass
@@ -1838,6 +1846,11 @@ def stage_train(ctx: StageContext) -> StageResult:
         opt_state_save = opts.get("opt_state_save_path")
         if opt_state_save:
             try:
+                # V7-C06 opt-state branch: same compress switch routes
+                # opt-fp16 / both → halve Adam moment table footprint.
+                from cppmega_v4.runtime.checkpoint_quantize import (
+                    save_state_compressed as _save_compressed,
+                )
                 import safetensors.mlx as _stmlx
                 opt_flat = dict(nn.utils.tree_flatten(opt.state))
                 opt_arrays = {
@@ -1846,7 +1859,19 @@ def stage_train(ctx: StageContext) -> StageResult:
                 }
                 if hasattr(rng_key, "shape"):
                     opt_arrays["_rng_key"] = rng_key
-                _stmlx.save_file(opt_arrays, opt_state_save,
+                if compress in ("opt-fp16", "both"):
+                    _save_compressed(opt_arrays, opt_state_save,
+                                      compress=compress,
+                                      metadata=None,
+                                      role="opt")
+                    opt_state_saved_path = str(opt_state_save)
+                    # Early-return: legacy save_file branch below would
+                    # double-write the file with fp32 if we let it run.
+                    continue_legacy_save = False
+                else:
+                    continue_legacy_save = True
+                if continue_legacy_save:
+                    _stmlx.save_file(opt_arrays, opt_state_save,
                                   metadata=ckpt_metadata)
                 opt_state_saved_path = str(opt_state_save)
             except Exception:
@@ -1962,7 +1987,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                 error={"type": "WeightsUnchanged",
                        "detail": f"delta {delta:.2e} <= 1e-6"},
             )
-        if len(losses) >= 2 and losses[0] > 0 and losses[-1] / losses[0] > 5:
+        _skip_loss_guard = bool(opts.get("skip_loss_blowup_guard", False))
+        if (not _skip_loss_guard
+                and len(losses) >= 2 and losses[0] > 0
+                and losses[-1] / losses[0] > 5):
             _run_registry.unregister(_registry_key)
             return StageResult(
                 name="train", status="fail",
