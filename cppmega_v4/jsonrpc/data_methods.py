@@ -112,6 +112,10 @@ class PreviewParquetResult(BaseModel):
     bytes_per_token_max: int
     total_rows: int
     elapsed_ms: float
+    # V7-G04: corpus stats sidecar (token coverage / doc-length / vocab).
+    # Populated when the shard was emitted by clang_enriched_to_parquet
+    # with token_ids materialized; absent for legacy shards.
+    corpus_stats: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +218,29 @@ def preview_parquet(
         bytes_per_token_max=int(bpt_max),
         total_rows=total_rows,
         elapsed_ms=elapsed,
+        corpus_stats=_read_corpus_stats_sidecar(preview_path),
     )
     if cache is not None:
         cache.set(cache_key, out)
     return out
+
+
+def _read_corpus_stats_sidecar(parquet_path) -> dict | None:
+    """V7-G04: load the {parquet}.corpus_stats.json sidecar emitted by
+    clang_enriched_to_parquet. Returns None when missing or malformed."""
+    import json as _json
+    import os
+    sidecar = str(parquet_path) + ".corpus_stats.json"
+    if not os.path.exists(sidecar):
+        return None
+    try:
+        with open(sidecar) as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------

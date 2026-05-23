@@ -933,7 +933,19 @@ def convert_local_jsonl_to_parquet(
                     max_tokens,
                     overflow_policy=overflow_policy,
                 )
-                source_doc_id = record.get("source_doc_id", f"{source.name}:{docs_in}")
+                # V7-G02: prefer the helper's stable signature so the
+                # same logical document gets the same id even if
+                # shards are reordered later. Fall back to the legacy
+                # name:index when the helper rejects the row.
+                source_doc_id = record.get("source_doc_id")
+                if not source_doc_id:
+                    try:
+                        from cppmega_v4.data.doc_id_assignment import (
+                            stable_doc_signature)
+                        sig = stable_doc_signature(record)
+                        source_doc_id = sig or f"{source.name}:{docs_in}"
+                    except Exception:
+                        source_doc_id = f"{source.name}:{docs_in}"
                 for sub_doc in sub_docs:
                     sub_doc.setdefault("source_doc_id", source_doc_id)
                     sub_doc.setdefault(
@@ -1023,7 +1035,17 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                     max_tokens,
                     overflow_policy=overflow_policy,
                 )
-            source_doc_id = record.get("source_doc_id", f"{fname}:{docs_in}")
+            # V7-G02: same fallback as the bucket path above — use the
+            # stable doc signature so cross-shard duplicates collapse.
+            source_doc_id = record.get("source_doc_id")
+            if not source_doc_id:
+                try:
+                    from cppmega_v4.data.doc_id_assignment import (
+                        stable_doc_signature)
+                    sig = stable_doc_signature(record)
+                    source_doc_id = sig or f"{fname}:{docs_in}"
+                except Exception:
+                    source_doc_id = f"{fname}:{docs_in}"
             for sub_doc in sub_docs:
                 sub_doc.setdefault("source_doc_id", source_doc_id)
                 sub_doc.setdefault(
@@ -1081,6 +1103,39 @@ def _flush_shard(
     check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
     pq.write_table(table, local_path, compression="snappy")
     check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
+    # V7-G04: emit a sidecar corpus-stats JSON next to the parquet shard
+    # so the UI DataInspector can render token coverage / doc-length
+    # percentiles / vocab usage without rescanning the shard. The helper
+    # is no-op safe when token_ids are absent (token_id_lists empty).
+    try:
+        from cppmega_v4.data.corpus_stats import compute_corpus_stats
+        import json as _json
+        token_lists: list[list[int]] = []
+        try:
+            for col_token_ids in table.column(TOKEN_IDS_COLUMN).to_pylist():
+                if col_token_ids:
+                    token_lists.append(list(col_token_ids))
+        except (KeyError, Exception):
+            token_lists = []
+        if token_lists and _TOKENIZED_ENRICHED_TOKENIZER is not None:
+            stats = compute_corpus_stats(
+                token_lists,
+                vocab_size=int(
+                    _TOKENIZED_ENRICHED_TOKENIZER.get_vocab_size()),
+            )
+            stats_path = local_path + ".corpus_stats.json"
+            with open(stats_path, "w") as _f:
+                _json.dump(stats, _f)
+            try:
+                gcs_upload(stats_path, gcs_uri + ".corpus_stats.json")
+            except Exception:
+                pass
+            try:
+                os.unlink(stats_path)
+            except Exception:
+                pass
+    except Exception as _exc:
+        log.warning("corpus_stats emit failed: %s", _exc)
     gcs_upload(local_path, gcs_uri)
     os.unlink(local_path)
     log.info("Uploaded shard %d (%d rows, %.1f MB)",

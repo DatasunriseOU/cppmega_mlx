@@ -19,6 +19,20 @@ export interface PreviewParquetResult {
   bytes_per_token_max: number;
   total_rows: number;
   elapsed_ms: number;
+  /** V7-G04: corpus_stats sidecar emitted by clang_enriched_to_parquet
+   *  (compute_corpus_stats output). Null for legacy shards. */
+  corpus_stats?: CorpusStats | null;
+}
+
+export interface CorpusStats {
+  token_coverage_pct?: number;
+  doc_length_p50?: number;
+  doc_length_p90?: number;
+  doc_length_p99?: number;
+  doc_length_histogram?: Array<[number, number]>;
+  vocab_usage_topk?: Array<[number, number]>;
+  long_tail_count?: number;
+  n_docs?: number;
 }
 
 export interface SideChannelFamilyCoverage {
@@ -241,6 +255,34 @@ export function DataInspector({
             {" "}max {result.bytes_per_token_max}
           </div>
 
+          {result.corpus_stats && (
+            <div data-testid="data-corpus-stats"
+                 style={{ border: "1px solid #d1d5db", borderRadius: 4,
+                          padding: 8, fontSize: 11,
+                          background: "#f9fafb",
+                          fontFamily: "monospace" }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                corpus stats (V7-G04)
+              </div>
+              <div data-testid="data-corpus-stats-token-coverage">
+                token coverage:{" "}
+                {result.corpus_stats.token_coverage_pct?.toFixed(2)}%
+              </div>
+              <div data-testid="data-corpus-stats-doc-length">
+                doc length p50/p90/p99:{" "}
+                {result.corpus_stats.doc_length_p50 ?? "?"}/
+                {result.corpus_stats.doc_length_p90 ?? "?"}/
+                {result.corpus_stats.doc_length_p99 ?? "?"}
+              </div>
+              <div data-testid="data-corpus-stats-n-docs">
+                docs: {result.corpus_stats.n_docs ?? 0}
+              </div>
+              <div data-testid="data-corpus-stats-long-tail">
+                long-tail tokens (≤1 use):{" "}
+                {result.corpus_stats.long_tail_count ?? 0}
+              </div>
+            </div>
+          )}
           {result.shards && result.shards.length > 0 && (
             <div data-testid="data-shards"
                  style={{ display: "grid",
