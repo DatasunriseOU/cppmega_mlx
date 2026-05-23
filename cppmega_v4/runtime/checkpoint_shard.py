@@ -63,48 +63,103 @@ def save_sharded(state: dict[str, mx.array],
     return index
 
 
-def load_sharded(index_path: str | pathlib.Path) -> dict[str, mx.array]:
+def _shard_index_from_name(shard_name: str) -> int | None:
+    """Parse shard index from '<prefix>.shard-NNNNN-of-MMMMM.safetensors'."""
+    try:
+        return int(shard_name.split("-")[-3]) - 1
+    except (ValueError, IndexError):
+        return None
+
+
+def load_sharded(
+    index_path: str | pathlib.Path,
+    *, _opened: list[str] | None = None,
+) -> dict[str, mx.array]:
+    """Read every shard listed in the index manifest into a single dict.
+
+    ``_opened`` is a test-only sink — when supplied, each shard's absolute
+    path is appended exactly once. Lets tests assert which files were
+    actually opened on disk (V7-C02 AC#2)."""
     index_path = pathlib.Path(index_path)
     index = json.loads(index_path.read_text())
     base = index_path.parent
     out: dict[str, mx.array] = {}
     seen_shards: set[str] = set()
-    for k, shard_name in index["weight_map"].items():
+    for shard_name in index["weight_map"].values():
         if shard_name in seen_shards:
             continue
         seen_shards.add(shard_name)
-        out.update(st.load_file(str(base / shard_name)))
+        path = str(base / shard_name)
+        if _opened is not None:
+            _opened.append(path)
+        out.update(st.load_file(path))
     return out
 
 
-def load_sharded_for_rank(index_path: str | pathlib.Path,
-                           *, rank: int, world_size: int
-                           ) -> dict[str, mx.array]:
+def load_sharded_for_rank(
+    index_path: str | pathlib.Path,
+    *, rank: int, world_size: int,
+    _opened: list[str] | None = None,
+) -> dict[str, mx.array]:
     """Round-robin shard ownership: rank r reads shards i where
-    i % world_size == r."""
+    i % world_size == r. Each owned shard is opened **exactly once**.
+
+    ``_opened`` is the same test-only sink as ``load_sharded``."""
     if world_size <= 0 or not (0 <= rank < world_size):
-        raise ValueError("invalid rank/world_size")
+        raise ValueError(
+            f"invalid rank/world_size: rank={rank}, world_size={world_size}")
     index_path = pathlib.Path(index_path)
     index = json.loads(index_path.read_text())
     base = index_path.parent
     num_shards = int(index["metadata"]["num_shards"])
     owned = {i for i in range(num_shards) if i % world_size == rank}
     out: dict[str, mx.array] = {}
-    for k, shard_name in index["weight_map"].items():
-        # Reverse-derive shard index from filename "*-NNNNN-of-MMMMM"
-        try:
-            idx = int(shard_name.split("-")[-3]) - 1
-        except (ValueError, IndexError):
+    # Deduplicate shard filenames before opening — the previous impl
+    # iterated weight_map keys and re-opened the same file once per
+    # tensor, which scaled O(num_params) instead of O(num_owned_shards).
+    seen_shards: set[str] = set()
+    for shard_name in index["weight_map"].values():
+        if shard_name in seen_shards:
             continue
-        if idx in owned:
-            if shard_name not in {n for n in
-                                  (index["weight_map"][kk]
-                                   for kk in index["weight_map"])}:
-                continue
-            # Load each shard once.
-            if shard_name not in out.get("__loaded__", set()):
-                out.update(st.load_file(str(base / shard_name)))
+        idx = _shard_index_from_name(shard_name)
+        if idx is None or idx not in owned:
+            continue
+        seen_shards.add(shard_name)
+        path = str(base / shard_name)
+        if _opened is not None:
+            _opened.append(path)
+        out.update(st.load_file(path))
     return out
 
 
-__all__ = ["save_sharded", "load_sharded", "load_sharded_for_rank"]
+def load_with_backward_compat(
+    path: str | pathlib.Path,
+    *, _opened: list[str] | None = None,
+) -> dict[str, mx.array]:
+    """V7-C02 AC#3: accept either a sharded index.json OR a legacy
+    single-file safetensors checkpoint.
+
+    If ``path`` ends in ``.index.json`` (or names an index.json file
+    that exists), delegate to :func:`load_sharded`. Otherwise treat the
+    path as a flat safetensors file and read it directly.
+    """
+    p = pathlib.Path(path)
+    if p.is_dir():
+        # Convenience: caller passed a checkpoint directory — pick the
+        # canonical model.index.json.
+        cand = p / "model.index.json"
+        if cand.is_file():
+            return load_sharded(cand, _opened=_opened)
+        raise FileNotFoundError(f"no model.index.json under {p}")
+    if p.name.endswith(".index.json"):
+        return load_sharded(p, _opened=_opened)
+    # Legacy single-file path.
+    if _opened is not None:
+        _opened.append(str(p))
+    return st.load_file(str(p))
+
+
+__all__ = [
+    "save_sharded", "load_sharded", "load_sharded_for_rank",
+    "load_with_backward_compat",
+]
