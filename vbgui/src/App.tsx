@@ -495,7 +495,7 @@ export function App(): JSX.Element {
       // would truncate to zero for those. Stick with the canonical unit.
       const r = await rpc.call<{ specs: BrickSpec[]; preset_name: string }>(
         "build_preset_specs",
-        { preset_name: name, hidden_size: MINI_HIDDEN },
+        { preset_name: name, hidden_size: dimEnv.H ?? MINI_HIDDEN },
       );
       const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
       setNodes(ns);
@@ -513,7 +513,7 @@ export function App(): JSX.Element {
     } catch (e) {
       setRunError(e);
     }
-  }, [rpc, spec.loss]);
+  }, [rpc, spec.loss, dimEnv]);
 
   const requestSuggestSharding = useCallback(async () => {
     const snap = wireSpecRef.current;

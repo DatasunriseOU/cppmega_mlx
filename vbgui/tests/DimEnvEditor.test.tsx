@@ -86,6 +86,35 @@ describe("V7-F56b/F53 DimEnvEditor", () => {
     expect(snap.textContent).toContain("16");
   });
 
+  it("V7-P5: scale-preset dropdown applies a full preset (llama3_8b)", () => {
+    const onApply = vi.fn();
+    render(<DimEnvEditor
+      value={{ H: 128, nh: 2, head_dim: 64, B: 1, S: 8 }}
+      onApply={onApply}
+    />);
+    const sel = screen.getByTestId("dim-env-preset") as HTMLSelectElement;
+    expect(sel).toBeDefined();
+    fireEvent.change(sel, { target: { value: "llama3_8b" } });
+    expect(onApply).toHaveBeenCalled();
+    const next = onApply.mock.calls[onApply.mock.calls.length - 1]?.[0];
+    expect(next.H).toBe(4096);
+    expect(next.nh).toBe(32);
+    expect(next.head_dim).toBe(128);
+  });
+
+  it("V7-P5: preset is self-consistent (nh*head_dim == H)", () => {
+    const onApply = vi.fn();
+    render(<DimEnvEditor
+      value={{ H: 128, nh: 2, head_dim: 64, B: 1, S: 8 }}
+      onApply={onApply}
+    />);
+    fireEvent.change(screen.getByTestId("dim-env-preset"),
+                     { target: { value: "medium_1k" } });
+    const next = onApply.mock.calls[onApply.mock.calls.length - 1]?.[0];
+    // 16 * 64 == 1024 ✓
+    expect(next.nh * next.head_dim).toBe(next.H);
+  });
+
   it("hides Snap head_dim when H is not divisible by nh", () => {
     // H=128 / nh=3 = 42.66 → head_dim snap NOT available; only H snap.
     render(<DimEnvEditor

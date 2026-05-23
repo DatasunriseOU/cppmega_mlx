@@ -34,5 +34,26 @@ test("H20: accept sharding → extras.fake_ranks > 1 + reduce_ms > 0",
       .trim());
     expect(reduceMs).toBeGreaterThan(0);
 
+    // Verify actual backend cross-device collective execution simulation (math-effect 🟢)
+    const isSimulated = await page.getByTestId(
+      "run-result-extras-train-is_simulated").textContent();
+    expect(isSimulated?.trim()).toBe("true");
+
+    const shardDim = parseInt(
+      (await page.getByTestId(
+        "run-result-extras-train-sharding_applied-shard_dim")
+        .textContent()) ?? "0", 10);
+    expect(shardDim).toBeGreaterThan(1);
+
+    const perRankParam = parseInt(
+      (await page.getByTestId(
+        "run-result-extras-train-sharding_applied-per_rank_param_bytes")
+        .textContent()) ?? "0", 10);
+    const totalParam = parseInt(
+      (await page.getByTestId(
+        "run-result-extras-train-sharding_applied-total_param_bytes")
+        .textContent()) ?? "0", 10);
+    expect(perRankParam).toBe(Math.floor(totalParam / shardDim));
+
     await closeModal(page);
   });

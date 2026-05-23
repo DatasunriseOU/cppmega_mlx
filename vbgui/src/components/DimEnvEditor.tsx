@@ -14,6 +14,20 @@ export interface DimEnvEditorProps {
 const EDITABLE_KEYS = ["H", "nh", "head_dim", "B", "S"] as const;
 type EditableKey = typeof EDITABLE_KEYS[number];
 
+// V7-P5: full-scale presets so the architect doesn't have to type
+// llama3_8b H=4096 by hand. Each preset snaps every editable key
+// to a self-consistent combination (nh*head_dim == H) so it lands
+// without the F56b warning.
+export const DIM_ENV_PRESETS: Record<string, Record<string, number>> = {
+  mini:      { B: 1, S: 64,   H: 128,  nh: 2,  nkv: 1,  head_dim: 64 },
+  dev_128:   { B: 1, S: 512,  H: 128,  nh: 2,  nkv: 1,  head_dim: 64 },
+  small_512: { B: 1, S: 1024, H: 512,  nh: 8,  nkv: 2,  head_dim: 64 },
+  medium_1k: { B: 1, S: 2048, H: 1024, nh: 16, nkv: 4,  head_dim: 64 },
+  large_2k:  { B: 1, S: 2048, H: 2048, nh: 32, nkv: 8,  head_dim: 64 },
+  llama3_8b: { B: 1, S: 4096, H: 4096, nh: 32, nkv: 8,  head_dim: 128 },
+  llama3_70b:{ B: 1, S: 4096, H: 8192, nh: 64, nkv: 8,  head_dim: 128 },
+};
+
 export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element {
   const [draft, setDraft] = useState<Record<string, string>>(() => {
     const out: Record<string, string> = {};
@@ -68,6 +82,32 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
                   borderBottom: "1px solid #e5e7eb",
                   fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
       <strong data-testid="dim-env-editor-label">dim_env:</strong>
+      <label style={{ display: "inline-flex", alignItems: "center",
+                       gap: 4 }}>
+        scale
+        <select data-testid="dim-env-preset"
+                defaultValue=""
+                onChange={(e) => {
+                  const k = e.target.value;
+                  if (!k) return;
+                  const preset = DIM_ENV_PRESETS[k];
+                  if (preset) {
+                    setDraft(Object.fromEntries(
+                      Object.entries(preset).map(
+                        ([kk, vv]) => [kk, String(vv)])) as never);
+                    applyDraft(preset);
+                  }
+                  e.target.value = "";  // reset to placeholder
+                }}>
+          <option value="">choose…</option>
+          {Object.keys(DIM_ENV_PRESETS).map((p) => (
+            <option key={p} value={p}
+                    data-testid={`dim-env-preset-opt-${p}`}>
+              {p}
+            </option>
+          ))}
+        </select>
+      </label>
       {EDITABLE_KEYS.map((k: EditableKey) => (
         <label key={k} style={{ display: "inline-flex", alignItems: "center",
                                  gap: 4 }}>

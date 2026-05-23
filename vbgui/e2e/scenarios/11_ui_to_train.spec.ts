@@ -31,13 +31,19 @@ test("UI activation change (swiglu) lands in extras.model_summary", async ({
   await page.locator("[data-testid='brick-context-llama3_8b_mlp-apply']")
     .click();
 
-  await clickRunPipeline(page, "train");
+  // Run N=4 steps for real convergence check
+  await page.getByTestId("run-pipeline-toggle").click();
+  await page.getByTestId("train-num-steps").fill("4");
+  await page.getByTestId("run-pipeline-train").click();
+  const modal = page.getByTestId("run-result-modal");
+  await modal.waitFor({ timeout: 60_000 });
   const extras = await readTrainExtras(page);
 
   // Content assertions — not status theatre:
   expect(extras.model_summary.mlp_activation).toBe("swiglu");
-  expect(extras.losses.length).toBeGreaterThanOrEqual(2);
+  expect(extras.losses.length).toBe(4);
   expect(extras.losses.every(l => Number.isFinite(l))).toBe(true);
+  expect(extras.losses[3]).toBeLessThan(extras.losses[0]);
   expect(extras.weight_delta_norm).toBeGreaterThan(0);
 
   await closeModal(page);
@@ -94,12 +100,19 @@ test("UI pre_norm switch attention rmsnorm→layernorm propagates", async ({
   await page.locator(
     "[data-testid='brick-context-llama3_8b_attn-apply']").click();
 
-  await clickRunPipeline(page, "train");
+  // Run N=4 steps for real convergence check
+  await page.getByTestId("run-pipeline-toggle").click();
+  await page.getByTestId("train-num-steps").fill("4");
+  await page.getByTestId("run-pipeline-train").click();
+  const modal = page.getByTestId("run-result-modal");
+  await modal.waitFor({ timeout: 60_000 });
   const extras = await readTrainExtras(page);
 
   expect(extras.model_summary.attention_pre_norm).toBe("layernorm");
   expect(extras.weight_delta_norm).toBeGreaterThan(0);
+  expect(extras.losses.length).toBe(4);
   expect(extras.losses.every(l => Number.isFinite(l))).toBe(true);
+  expect(extras.losses[3]).toBeLessThan(extras.losses[0]);
 
   await closeModal(page);
 });
@@ -119,12 +132,19 @@ test("UI optimizer change to Lion propagates to extras.optimizer_kind", async ({
   await page.getByTestId("optim-kind").selectOption("lion");
   await page.getByTestId("optim-apply").click();
 
-  await clickRunPipeline(page, "train");
+  // Run N=4 steps for real convergence check
+  await page.getByTestId("run-pipeline-toggle").click();
+  await page.getByTestId("train-num-steps").fill("4");
+  await page.getByTestId("run-pipeline-train").click();
+  const modal = page.getByTestId("run-result-modal");
+  await modal.waitFor({ timeout: 60_000 });
   const extras = await readTrainExtras(page);
 
   // The big V3-1 / B1 assertion:
   expect(extras.optimizer_kind).toBe("lion");
   expect(extras.model_summary.optimizer_kind).toBe("lion");
+  expect(extras.losses.length).toBe(4);
+  expect(extras.losses[3]).toBeLessThan(extras.losses[0]);
   expect(extras.weight_delta_norm).toBeGreaterThan(0);
 
   await closeModal(page);
@@ -143,13 +163,20 @@ test("UI optimizer change to Muon propagates and produces weight delta",
     await page.getByTestId("optim-kind").selectOption("muon");
     await page.getByTestId("optim-apply").click();
 
-    await clickRunPipeline(page, "train");
+    // Run N=4 steps for real convergence check
+    await page.getByTestId("run-pipeline-toggle").click();
+    await page.getByTestId("train-num-steps").fill("4");
+    await page.getByTestId("run-pipeline-train").click();
+    const modal = page.getByTestId("run-result-modal");
+    await modal.waitFor({ timeout: 60_000 });
     const extras = await readTrainExtras(page);
 
     expect(extras.optimizer_kind).toBe("muon");
     expect(extras.model_summary.optimizer_kind).toBe("muon");
-    expect(extras.weight_delta_norm).toBeGreaterThan(0);
+    expect(extras.losses.length).toBe(4);
     expect(extras.losses.every(l => Number.isFinite(l))).toBe(true);
+    expect(extras.losses[3]).toBeLessThan(extras.losses[0]);
+    expect(extras.weight_delta_norm).toBeGreaterThan(0);
 
     await closeModal(page);
   });

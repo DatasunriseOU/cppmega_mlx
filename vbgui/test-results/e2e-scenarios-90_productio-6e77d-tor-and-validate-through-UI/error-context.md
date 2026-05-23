@@ -6,8 +6,8 @@
 
 # Test info
 
-- Name: e2e/scenarios/86_corpus_stats_inspector.spec.ts >> V7-G04: corpus_stats sidecar renders in DataInspector
-- Location: e2e/scenarios/86_corpus_stats_inspector.spec.ts:18:1
+- Name: e2e/scenarios/90_production_preset.spec.ts >> V7-P5: Snap to llama3_8b production scale in DimEnvEditor and validate through UI
+- Location: e2e/scenarios/90_production_preset.spec.ts:7:1
 
 # Error details
 

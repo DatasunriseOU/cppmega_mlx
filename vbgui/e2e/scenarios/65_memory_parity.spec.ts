@@ -28,6 +28,10 @@ test("H11: actual memory peak within 50% of estimate after Train",
     await gotoApp(page);
     await selectPreset(page, "llama3_8b");
 
+    // Select a matched single-device topology so estimate and actual run are aligned (math-effect 🟢)
+    await page.getByTestId("topology-selector").selectOption("m3_ultra_solo");
+    await page.waitForTimeout(500);
+
     // Pre-Train: estimate is rendered, actual is absent. Wait for
     // verify to populate the estimate (debounced 200ms after the
     // preset drops bricks).
@@ -52,8 +56,7 @@ test("H11: actual memory peak within 50% of estimate after Train",
     const actual = await bytesOf(page.getByTestId("memory-bar-actual"));
     expect(estimate).toBeGreaterThan(0);
     expect(actual).toBeGreaterThan(0);
-    // Same order of magnitude (ratio < 500x). Strict 30% parity is
-    // enforced by tests/v4/test_memory_parity.py.
+    // Tight parity bound: ratio is strictly less than 4.0x
     const ratio = Math.max(actual, estimate) / Math.min(actual, estimate);
-    expect(ratio).toBeLessThan(500);
+    expect(ratio).toBeLessThan(4.0);
   });

@@ -18,21 +18,37 @@ import mlx.core as mx
 
 
 def all_gather(shard: mx.array, world_size: int) -> mx.array:
-    """Simulate all-gather by replicating shard W times along axis 0."""
+    """All-gather along axis 0.
+
+    When the active mx.distributed world matches world_size > 1 we
+    delegate to the real collective; otherwise we fall back to the
+    legacy single-process replication contract so old tests pass.
+    """
     if world_size < 1:
         raise ValueError("world_size must be >= 1")
+    from cppmega_v4.runtime import distributed as _d
+    w = _d.world()
+    if w.real and w.world_size == world_size:
+        return _d.all_gather(shard, axis=0)
     return mx.concatenate([shard for _ in range(world_size)], axis=0)
 
 
 def reduce_scatter(full: mx.array, world_size: int) -> mx.array:
-    """Simulate reduce-scatter: split full into W chunks along axis 0,
-    mean-reduce them into a single chunk."""
+    """Reduce-scatter along axis 0 with mean reduction.
+
+    Real path: mx.distributed.sum_scatter / world_size. Single-process
+    path: split into W chunks, mean-reduce — same contract as before.
+    """
     if world_size < 1:
         raise ValueError("world_size must be >= 1")
     if full.shape[0] % world_size != 0:
         raise ValueError(
             f"full[0]={full.shape[0]} not divisible by "
             f"world_size={world_size}")
+    from cppmega_v4.runtime import distributed as _d
+    w = _d.world()
+    if w.real and w.world_size == world_size:
+        return _d.reduce_scatter(full, axis=0, op="mean")
     chunk = full.shape[0] // world_size
     pieces = [full[i * chunk:(i + 1) * chunk]
               for i in range(world_size)]

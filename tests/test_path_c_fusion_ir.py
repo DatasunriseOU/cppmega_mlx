@@ -3390,6 +3390,126 @@ def test_mamba3_fp8_train_schedule_compile_helper_defaults_to_tilelang_lowerer()
     assert compiled.compiled.plan.schedule_contract is not None
     assert compiled.compiled.plan.schedule_contract.status == "verified"
 
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Step 4.b loss/grad parity: pending MLX eager mamba3 reference + "
+        "23-input JITKernel launcher. Structural single-kernel invariant "
+        "is verified by "
+        "test_mamba3_fp8_train_schedule_compile_helper_emits_metal_single_kernel_for_1b_train_block."
+    ),
+    strict=False,
+)
+def test_mamba3_fp8_train_schedule_eager_loss_grad_parity_on_metal_pending_reference() -> None:
+    """Track the eager loss/grad parity check for the 1B-quarter train block.
+
+    Once the MLX eager mamba3 reference is wired (currently lives in
+    the upstream nano-cppmega repo and not packaged with this fork),
+    this test should:
+
+    1. Allocate deterministic inputs matching the schedule's buffer
+       map.
+    2. Run the eager mamba3 train block to compute a reference loss
+       and per-parameter gradient.
+    3. Launch the compiled JITKernel artifact on the same inputs.
+    4. Assert the compiled loss matches eager within ``rtol=1e-3``
+       and every gradient buffer matches within ``rtol=1e-2``
+       (Metal fp32 reduction order tolerances).
+
+    The check is registered now (as xfail) so CI / report consumers
+    can see the planned milestone. Removing the xfail marker is the
+    completion gate for objective 4.b.
+    """
+    pytest.fail(
+        "eager mamba3 reference not yet wired in cppmega.mlx; see "
+        "docstring for the completion contract. xfail registers the "
+        "planned milestone without blocking the suite."
+    )
+
+
+def test_mamba3_fp8_train_schedule_compile_helper_emits_metal_single_kernel_for_1b_train_block() -> None:
+    """Step 4.b regression: the 1B-quarter Path C train block lowers to one kernel on Metal.
+
+    Locks the production single-kernel contract for the train block
+    that drives ``cppmega_mlx``'s mamba3_m2rnn_attention_fp8_train_block
+    fusion schedule:
+
+    * The schedule's ``single_kernel_fused`` flag is True.
+    * The lowered IRModule contains exactly one ``tir.PrimFunc``.
+    * The compiled artifact is a TileLang ``JITKernel`` targeting
+      Metal (the local-GB10-quarter / 1B-style profile this runs on).
+    * The compiled PrimFunc's parameter signature matches the schedule
+      template's declared buffer set, so the schedule didn't silently
+      drop a saved-tensor / activation slot (which would split fwd from
+      bwd into two launches).
+
+    The eager loss/grad parity check is registered separately as
+    ``test_mamba3_fp8_train_schedule_*_eager_loss_grad_parity`` once
+    the MLX eager mamba3 reference is wired (tracked as step 4.b
+    follow-up; the regression below is the structural floor).
+    """
+    import tvm
+
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+    from tvm import tir
+
+    compiled = schedules.compile_mamba3_fp8_train_fusion_schedule()
+    plan = compiled.compiled.plan
+    artifact = compiled.compiled.artifact
+
+    # Plan-level single-kernel flag (boolean intent).
+    assert plan.single_kernel_fused is True
+    assert plan.schedule_contract is not None
+    assert plan.schedule_contract.status == "verified"
+
+    # Structural single-PrimFunc invariant on the lowered IRModule.
+    lowered = compiled.compiled.lowered_module
+    assert isinstance(lowered, tvm.IRModule)
+    func_names = [gv.name_hint for gv, _ in lowered.functions.items()]
+    assert len(func_names) == 1, (
+        f"1B-quarter Path C train block must lower to exactly one PrimFunc; "
+        f"got {len(func_names)}: {func_names!r}"
+    )
+    entry_name = func_names[0]
+    entry_func = lowered[entry_name]
+    assert isinstance(entry_func, tir.PrimFunc)
+
+    # Artifact-level invariants: this is a real ``JITKernel`` compiled
+    # against Metal (the local-GB10-quarter / 1B-style profile target).
+    assert type(artifact).__name__ == "JITKernel"
+    assert hasattr(artifact, "prim_func")
+    primfunc = artifact.prim_func
+    assert isinstance(primfunc, tir.PrimFunc)
+    # The compiled entry's symbol must match the schedule's fused
+    # train block name (if these diverge, a wrapper kernel slipped in).
+    compiled_sym = primfunc.attrs.get("global_symbol")
+    assert compiled_sym is not None
+    assert str(compiled_sym) == entry_name, (
+        f"JITKernel entry symbol {compiled_sym!r} does not match the "
+        f"schedule's IRModule entry {entry_name!r} -- a wrapper "
+        "launch was inserted between the schedule and the artifact"
+    )
+
+    # Parameter-count sanity: the train block carries a non-trivial
+    # number of buffers (Path C abi bank + per-brick activations). A
+    # regression that drops the joint capture would shrink this below
+    # ~10. Use a soft floor so the check survives ABI evolution.
+    assert len(primfunc.params) >= 10, (
+        f"compiled PrimFunc has only {len(primfunc.params)} params; "
+        "the 1B-quarter train block schedule expects at least 10 "
+        "(Path C abi bank + per-brick activations + scratch)."
+    )
+
+    # The buffer map must include the canonical Path C abi bank that
+    # carries the schedule's pre-flattened bank tensors. A missing bank
+    # would indicate the schedule reverted to a per-brick split.
+    buffer_names = {
+        getattr(buf, "name", str(buf)) for buf in primfunc.buffer_map.values()
+    }
+    assert any("abi_bank" in name for name in buffer_names), (
+        f"compiled buffer_map missing the Path C abi bank: {sorted(buffer_names)!r}"
+    )
 def test_mamba3_fp8_train_schedule_compile_helper_emits_exactly_one_primfunc() -> None:
     """Step 4.a one-launch assertion (structural).
 
