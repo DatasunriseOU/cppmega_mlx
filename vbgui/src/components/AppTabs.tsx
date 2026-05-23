@@ -2,7 +2,7 @@
 // Data vs Gallery (V7-F58 per-preset sortable report).
 
 export type AppTab = "canvas" | "tokenizer" | "data"
-  | "gallery" | "sweep" | "tokmatrix";
+  | "gallery" | "sweep" | "tokmatrix" | "inference";
 
 export interface AppTabsProps {
   active: AppTab;
@@ -16,6 +16,7 @@ const TABS: { key: AppTab; label: string }[] = [
   { key: "data",       label: "Data Inspector" },
   { key: "gallery",    label: "Gallery" },
   { key: "sweep",      label: "Scaling Sweep" },
+  { key: "inference",  label: "Inference" },
 ];
 
 export function AppTabs({ active, onChange }: AppTabsProps): JSX.Element {

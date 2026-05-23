@@ -224,6 +224,23 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
     why: "When num_heads comes out as something the architect didn't " +
          "expect, this trace shows exactly which rule landed it.",
   },
+  gen_run: {
+    title: "gen.run — autoregressive token generation",
+    what:
+      "Fires the gen.run RPC with prompt_tokens + a sampler " +
+      "strategy (greedy / temperature / top_k / top_p), returns the " +
+      "generated tokens + finish_reason (eos / length / aborted) + " +
+      "wall-clock ms.",
+    why:
+      "Validates the inference path end-to-end before committing to " +
+      "a long generation. 'smoke' mode uses synthetic logits so the " +
+      "request doesn't need a real model — useful for sanity-checking " +
+      "the sampler config.",
+    example:
+      "prompt_tokens=[1,2,3], strategy=top_p, top_p=0.9, " +
+      "max_new_tokens=16 → reproducible token sequence under fixed " +
+      "seed.",
+  },
   rpc_error_data: {
     title: "RPC error.data — backend field-level details",
     what:

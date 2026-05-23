@@ -12,6 +12,7 @@ import { TransplantBar } from "@/components/TransplantBar";
 import { InsertIntoEdgeBar } from "@/components/InsertIntoEdgeBar";
 import { ParallelComposeBar } from "@/components/ParallelComposeBar";
 import { TrainOptionsPanel, type TrainOptions } from "@/components/TrainOptionsPanel";
+import { GenerationPanel } from "@/components/GenerationPanel";
 import { RunHistoryPicker } from "@/components/RunHistoryPicker";
 import { TrainLiveControls } from "@/components/TrainLiveControls";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
@@ -1468,6 +1469,9 @@ export function App(): JSX.Element {
                 "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T4_fim_only.json",
               ]}
             />
+          )}
+          {activeTab === "inference" && (
+            <GenerationPanel rpc={rpc} />
           )}
           {activeTab === "sweep" && (
             <SweepPanel
