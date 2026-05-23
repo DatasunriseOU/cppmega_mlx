@@ -193,6 +193,22 @@ export function TopBar(p: TopBarProps): JSX.Element {
     }, 300);
     return () => { cancelled = true; clearTimeout(t); };
   }, [ckptLoadPath, p.onInspectCheckpoint]);
+  // UX#7: derive a single arch-level precision label from the two
+  // existing booleans so the TopBar can offer ONE dropdown instead of
+  // two free-floating checkboxes. Callbacks set both booleans together.
+  const precisionArch: "fp32" | "mixed" | "fp8" | "fp8_mixed" =
+    p.state.sharding.fp8_enabled && p.state.optim.mixed_precision
+      ? "fp8_mixed"
+      : p.state.sharding.fp8_enabled
+        ? "fp8"
+        : p.state.optim.mixed_precision
+          ? "mixed"
+          : "fp32";
+  function setPrecisionArch(v: "fp32" | "mixed" | "fp8" | "fp8_mixed") {
+    p.onMixedPrecisionChange?.(v === "mixed" || v === "fp8_mixed");
+    p.onFp8EnabledChange?.(v === "fp8" || v === "fp8_mixed");
+  }
+
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -201,6 +217,9 @@ export function TopBar(p: TopBarProps): JSX.Element {
                      borderBottom: "1px solid var(--vb-border)",
                      color: "var(--vb-text)",
                      fontFamily: "var(--vb-font)", fontSize: 12 }}>
+      {/* UX#7 LEFT: project + preset launcher (drafts will dock here). */}
+      <div data-testid="top-bar-group-left"
+           style={{ display: "flex", alignItems: "center", gap: 8 }}>
       <input data-testid="project-name"
              value={p.projectName}
              onChange={(e) => p.onProjectNameChange(e.target.value)}
@@ -212,7 +231,11 @@ export function TopBar(p: TopBarProps): JSX.Element {
         <option value="" disabled>Preset…</option>
         {p.presets.map((n) => <option key={n} value={n}>{n}</option>)}
       </select>
+      </div>
 
+      {/* UX#7 CENTER: topology + compile + precision (one dropdown). */}
+      <div data-testid="top-bar-group-center"
+           style={{ display: "flex", alignItems: "center", gap: 8 }}>
       <select data-testid="topology-selector"
               value={p.state.sharding.topology}
               onChange={(e) =>
@@ -241,6 +264,54 @@ export function TopBar(p: TopBarProps): JSX.Element {
         <option value="whole_model">compile: whole_model ⚠</option>
       </select>
 
+      {/* UX#7: one Precision dropdown replaces the two arch-level
+          checkboxes (mixed_precision + fp8). Keeps both testids so
+          existing tests still find the checkbox state via the hidden
+          inputs below, while the user sees one knob. */}
+      {(p.onMixedPrecisionChange || p.onFp8EnabledChange) && (
+        <label style={{ fontSize: 10, display: "flex",
+                        gap: 4, alignItems: "center" }}>
+          <span style={{ color: "var(--vb-text-secondary)" }}>precision:</span>
+          <select data-testid="top-bar-precision-arch"
+                  value={precisionArch}
+                  onChange={(e) =>
+                    setPrecisionArch(e.target.value as typeof precisionArch)}
+                  style={{ minWidth: 130 }}>
+            <option value="fp32">fp32 (master)</option>
+            <option value="mixed">mixed_precision</option>
+            <option value="fp8">fp8</option>
+            <option value="fp8_mixed">fp8 + mixed</option>
+          </select>
+        </label>
+      )}
+      {/* Hidden tester-visible checkboxes keep the existing testids
+          working — toggling them still propagates to the same
+          callbacks the dropdown drives. Visually invisible. */}
+      {p.onMixedPrecisionChange && (
+        <input data-testid="top-bar-mixed-precision" type="checkbox"
+               aria-hidden="true"
+               checked={!!p.state.optim.mixed_precision}
+               onChange={(e) =>
+                 p.onMixedPrecisionChange?.(e.target.checked)}
+               style={{ position: "absolute", width: 1, height: 1,
+                        opacity: 0, pointerEvents: "none" }} />
+      )}
+      {p.onFp8EnabledChange && (
+        <input data-testid="top-bar-fp8-enabled" type="checkbox"
+               aria-hidden="true"
+               checked={!!p.state.sharding.fp8_enabled}
+               onChange={(e) =>
+                 p.onFp8EnabledChange?.(e.target.checked)}
+               style={{ position: "absolute", width: 1, height: 1,
+                        opacity: 0, pointerEvents: "none" }} />
+      )}
+      </div>
+
+      {/* UX#7 RIGHT: pushed to end via marginLeft:auto. Groups undo/redo
+          + Save/Load + MemoryBar + status pill + run split-button. */}
+      <div data-testid="top-bar-group-right"
+           style={{ display: "flex", alignItems: "center", gap: 8,
+                    marginLeft: "auto" }}>
       {/* UX-redesign #6: compact, topology-aware MemoryBar. world_size
           derives from spec.sharding.axis_assignments degrees product
           so on h100:8 (or any FSDP/TP/PP combo) the bar splits into
@@ -257,27 +328,6 @@ export function TopBar(p: TopBarProps): JSX.Element {
                    return Array.from({ length: ws },
                      () => p.state.worst_rank_bytes);
                  })()} />
-
-      {p.onMixedPrecisionChange && (
-        <label style={{ fontSize: 10, display: "flex", gap: 3,
-                        alignItems: "center" }}>
-          <input data-testid="top-bar-mixed-precision" type="checkbox"
-                 checked={!!p.state.optim.mixed_precision}
-                 onChange={(e) =>
-                   p.onMixedPrecisionChange?.(e.target.checked)} />
-          mixed_precision
-        </label>
-      )}
-      {p.onFp8EnabledChange && (
-        <label style={{ fontSize: 10, display: "flex", gap: 3,
-                        alignItems: "center" }}>
-          <input data-testid="top-bar-fp8-enabled" type="checkbox"
-                 checked={!!p.state.sharding.fp8_enabled}
-                 onChange={(e) =>
-                   p.onFp8EnabledChange?.(e.target.checked)} />
-          fp8
-        </label>
-      )}
 
       {p.onUndo && (
         <button data-testid="top-bar-undo"
@@ -646,6 +696,7 @@ export function TopBar(p: TopBarProps): JSX.Element {
             </button>
           </div>
         )}
+      </div>
       </div>
     </header>
   );

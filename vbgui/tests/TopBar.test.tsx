@@ -34,6 +34,42 @@ describe("TopBar", () => {
     expect(screen.getByTestId("run-pipeline")).toBeTruthy();
   });
 
+  // UX#7: three flex groups + single Precision dropdown.
+  it("UX#7: TopBar lays content into left / center / right groups", () => {
+    render(<TopBar {...defaultTopProps()} />);
+    expect(screen.getByTestId("top-bar-group-left")).toBeDefined();
+    expect(screen.getByTestId("top-bar-group-center")).toBeDefined();
+    expect(screen.getByTestId("top-bar-group-right")).toBeDefined();
+    // Right group is pushed to the end via marginLeft:auto.
+    const right = screen.getByTestId("top-bar-group-right") as HTMLElement;
+    expect(right.style.marginLeft).toBe("auto");
+  });
+
+  it("UX#7: Precision dropdown replaces the two arch checkboxes and " +
+     "syncs both mixed_precision + fp8 callbacks", () => {
+    const onMixedPrecisionChange = vi.fn();
+    const onFp8EnabledChange = vi.fn();
+    render(<TopBar {...defaultTopProps({
+      onMixedPrecisionChange, onFp8EnabledChange,
+    })} />);
+    const dropdown = screen.getByTestId("top-bar-precision-arch") as
+      HTMLSelectElement;
+    // INITIAL_SPEC has mixed_precision=true, fp8=false → "mixed".
+    expect(dropdown.value).toBe("mixed");
+
+    fireEvent.change(dropdown, { target: { value: "fp32" } });
+    expect(onMixedPrecisionChange).toHaveBeenLastCalledWith(false);
+    expect(onFp8EnabledChange).toHaveBeenLastCalledWith(false);
+
+    fireEvent.change(dropdown, { target: { value: "fp8" } });
+    expect(onMixedPrecisionChange).toHaveBeenLastCalledWith(false);
+    expect(onFp8EnabledChange).toHaveBeenLastCalledWith(true);
+
+    fireEvent.change(dropdown, { target: { value: "fp8_mixed" } });
+    expect(onMixedPrecisionChange).toHaveBeenLastCalledWith(true);
+    expect(onFp8EnabledChange).toHaveBeenLastCalledWith(true);
+  });
+
   // V4-1: train-data-source indicator
   it("train-data-source reads 'synthetic' when no parquet selected", () => {
     render(<TopBar {...defaultTopProps()} />);
