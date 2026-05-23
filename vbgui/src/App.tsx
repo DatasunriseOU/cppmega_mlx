@@ -27,6 +27,7 @@ import { DataInspector } from "@/components/DataInspector";
 import { BrickContextPanel } from "@/components/BrickContextPanel";
 import { LiveTrainPanel } from "@/components/LiveTrainPanel";
 import { useLiveTrainStream } from "@/hooks/useLiveTrainStream";
+import { useVerifyStream, computeSpecHash } from "@/hooks/useVerifyStream";
 
 import { useRpc } from "@/hooks/useRpc";
 import { useVerifyAfter } from "@/hooks/useVerifyAfter";
@@ -220,6 +221,17 @@ export function App(): JSX.Element {
     setTrainSideChannels((prev) => prev.filter((name) => available.has(name)));
   }, [availableSideChannels]);
 
+  // V7-H37: verify-progress subscriber. computeSpecHash matches the
+  // backend's verify_event_bus.spec_hash so the UI WS path lines up
+  // with the publisher inside the verify handler.
+  const [verifyInFlight, setVerifyInFlight] = useState<boolean>(false);
+  const [verifySpecHash, setVerifySpecHash] = useState<string | null>(null);
+  const verifyStream = useVerifyStream(
+    (import.meta.env.VITE_BACKEND_URL as string | undefined)
+      ?? "http://127.0.0.1:8765",
+    verifySpecHash, verifyInFlight,
+  );
+
   const runVerify = useCallback(async () => {
     const snap = wireSpecRef.current;
     if (snap.nodes.length === 0) return;
@@ -227,6 +239,16 @@ export function App(): JSX.Element {
       snap.nodes, snap.edges, snap.spec, snap.availableSideChannels,
       snap.dimEnv,
     );
+    // V7-H37: open the verify-progress WS *before* the RPC, then close
+    // it on completion. The hook owns the lifecycle once verifyInFlight
+    // flips.
+    try {
+      const hash = await computeSpecHash(params);
+      setVerifySpecHash(hash);
+      setVerifyInFlight(true);
+    } catch {
+      // WebCrypto unavailable (jsdom non-secure); skip progress feed.
+    }
     try {
       const r = await rpc.call<{
         memory_distributed?: { worst_rank?: { total_bytes?: number };
@@ -262,6 +284,9 @@ export function App(): JSX.Element {
       }
     } catch {
       // Backend down or invalid spec; leave state and let user retry.
+    } finally {
+      // V7-H37: tear down the progress WS regardless of verify outcome.
+      setVerifyInFlight(false);
     }
   }, [rpc]);
 
@@ -736,6 +761,24 @@ export function App(): JSX.Element {
     <ReactFlowProvider>
       <div style={{ display: "flex", flexDirection: "column",
                     height: "100vh", margin: 0 }}>
+        {/* V7-H37: verify-progress badge — visible while verify is in
+            flight, shows the most recent phase emitted by the backend
+            so the user knows a long graph verify is making progress
+            (not hung). */}
+        {verifyInFlight && verifyStream.events.length > 0 && (
+          <div data-testid="verify-progress-badge"
+               style={{ position: "fixed", top: 50, right: 14,
+                        background: "#fef3c7", color: "#92400e",
+                        padding: "4px 10px", borderRadius: 4,
+                        fontFamily: "monospace", fontSize: 11,
+                        border: "1px solid #fcd34d", zIndex: 900 }}>
+            verify · {verifyStream.events[verifyStream.events.length - 1]
+                                          ?.phase}
+            <span style={{ marginLeft: 6, opacity: 0.7 }}>
+              ({verifyStream.events.length} phases)
+            </span>
+          </div>
+        )}
         <TopBar
           state={spec}
           projectName={projectName}
