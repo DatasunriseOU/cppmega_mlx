@@ -2,6 +2,33 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## V7-D-block: TileLang→Metal kernel epic closure (2026-05-23 14:30 GMT+2)
+
+D-block (TileLang→Metal kernels, 8 subtickets + Path B adapter + epic
++ breakdown task = 13 tickets) closed as **stale bd vs reality**.
+
+- **All 10 kernels shipped** in `cppmega_mlx/nn/_tilelang/`:
+  `topk_selector` (Path B + Path C, 923 LOC), `sparse_mla` /
+  `sparse_mla_path_c` (BF16 fwd+bwd), `sparse_mla_fp8` /
+  `sparse_mla_fp8_path_c` (FP8 fwd+bwd), `sparse_mla_blockscaled` /
+  `sparse_mla_blockscaled_path_c` (e8m0 fwd+bwd),
+  `mamba3` / `mamba3_path_c` (fwd+bwd via Path C),
+  `_mamba3_helpers_tilelang.compute_dacs_segsum` (Triton-free).
+- **Path B adapter** (`0ce`): `TileLangMetalAdapter` +
+  `wrap_tilelang_metal_kernel` in
+  `cppmega_mlx/nn/_tilelang/_mlx_runtime.py:628-876`. Takes TileLang
+  artifact → extracts MSL → `mx.fast.metal_kernel`.
+- **Test fix**: `tests/test_path_c_sparse_mla_apply_emit_indent.py`
+  was calling `_mamba3_fp8_train_acceptance_region(model_config=…)`
+  but the signature was simplified to `include_backward` only.
+  Dropped the stale kwarg; 3 tests now PASS.
+- **Regression evidence**: 407/407 kernel tests PASS across 12
+  test files at commit `77a1404`. bd open count: 57 → 44.
+
+Closed tickets: `cppmega-mlx-za1`, `za1.1`, `za1.2`, `za1.3`, `za1.4`,
+`za1.5`, `za1.6`, `za1.7`, `za1.8`, `za1.9`, `za1.10`, `za1.11`,
+`0ce`.
+
 ## V7-M0.7 + M0.3 closure (2026-05-23 06:00 GMT+2)
 
 - **M0.7 (resumable training) ✅ green** — `stage_train` now
