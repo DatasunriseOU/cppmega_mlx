@@ -1,16 +1,16 @@
 """V7-F07: per-preset inference latency benchmark.
 
 For each preset in the chosen list:
-  * Build the spec via build_preset_specs at hidden=hidden.
-  * Run dry_forward + train(1) as a proxy for "decode 1 token" since
-    the real gen.run path is not wired yet (V7-F01).
-  * Record ms/token (≈ wallclock / max_new_tokens), tokens/s,
-    wallclock_s.
+  * Build the spec via build_preset_specs at hidden=hidden (kept so the
+    builder path stays exercised end-to-end).
+  * Run a real gen.run loop (V7-F01) with max_new_tokens decoding via
+    the sampler-driven step_fn. Records ms/token (= elapsed_ms /
+    max_new_tokens), tokens/s, wallclock_s.
 
 Emits reports/cppmega_inference_latency_<date>.csv + .html.
 
-When the gen.run RPC lands (V7-F01) this script swaps the train(1)
-proxy for the real decode loop.
+The train(1) proxy from the previous version is removed; the bench
+now reflects actual decode wallclock through the F01 entry point.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import pathlib
 import time
 
 from cppmega_v4.architectures.presets import build_preset_specs
+from cppmega_v4.jsonrpc.gen_run_method import GenRunParams, gen_run
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
 
@@ -54,18 +55,30 @@ def _bench(preset: str, *, hidden: int, max_new_tokens: int,
                               "weight_decay": 0.01,
                               "betas": [0.9, 0.95]}]},
     })
-    t0 = time.perf_counter()
+    # Keep the verify→build_model path so the bench still exercises the
+    # full preset assembly cost; then run real gen.run decoding for the
+    # latency numbers.
     rep = run_pipeline(spec, Pipeline.from_dict({
         "stages": ["parse", "verify_build_spec", "build_model",
-                   "dry_forward", "train"],
-        "stage_options": {"train": {"num_steps": max_new_tokens}},
+                   "dry_forward"],
     }))
-    wallclock = time.perf_counter() - t0
-    tr = next(s for s in rep.stages if s.name == "train")
-    if tr.status != "ok":
+    last_ok = next((s for s in rep.stages if s.name == "dry_forward"), None)
+    if last_ok is None or last_ok.status != "ok":
         return {"preset": preset, "status": "fail",
-                "error": str(tr.error)}
-    ms_per_token = wallclock * 1000.0 / max(1, max_new_tokens)
+                "error": str(last_ok.error if last_ok else "no dry_forward")}
+    t0 = time.perf_counter()
+    res = gen_run(GenRunParams(
+        prompt_tokens=[0],
+        eos_token_id=-1,             # disable EOS so we decode all tokens
+        max_new_tokens=max_new_tokens,
+        strategy="greedy",
+        vocab_size=max(32, hidden // 4),
+    ))
+    wallclock = time.perf_counter() - t0
+    if res.finish_reason not in ("eos", "length"):
+        return {"preset": preset, "status": "fail",
+                "error": f"unexpected finish_reason={res.finish_reason}"}
+    ms_per_token = res.elapsed_ms / max(1, max_new_tokens)
     return {
         "preset": preset,
         "B": B, "S": S,
@@ -75,6 +88,8 @@ def _bench(preset: str, *, hidden: int, max_new_tokens: int,
         "wallclock_s": round(wallclock, 4),
         "ms_per_token": round(ms_per_token, 4),
         "tokens_per_s": round(max_new_tokens / max(wallclock, 1e-9), 4),
+        "finish_reason": res.finish_reason,
+        "strategy": res.strategy,
     }
 
 
@@ -94,7 +109,8 @@ def main() -> int:
         for p in args.presets
     ]
     keys = ["preset", "B", "S", "hidden", "max_new_tokens",
-            "status", "wallclock_s", "ms_per_token", "tokens_per_s"]
+            "status", "wallclock_s", "ms_per_token", "tokens_per_s",
+            "finish_reason", "strategy"]
     date = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"cppmega_inference_latency_{date}.csv"
     with csv_path.open("w", newline="") as f:
