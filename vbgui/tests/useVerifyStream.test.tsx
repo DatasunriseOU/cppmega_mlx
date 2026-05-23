@@ -1,7 +1,7 @@
 // V7-H37: canonicalJson matches Python json.dumps(sort_keys=True);
 // useVerifyStream collects WS events + closes on finish frame.
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { canonicalJson, useVerifyStream }
   from "@/hooks/useVerifyStream";

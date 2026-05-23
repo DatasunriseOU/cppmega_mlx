@@ -1,7 +1,7 @@
 // V7-H34/H35/H36: LiveTrainPanel last-pill renders per-step
 // grad_norms summary, expert_load mini-bar, and mem_mb.
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { LiveTrainPanel, type LiveTrainEvent } from "@/components/LiveTrainPanel";
 

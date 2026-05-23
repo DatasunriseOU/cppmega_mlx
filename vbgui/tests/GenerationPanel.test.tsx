@@ -21,7 +21,7 @@ describe("V7 GenerationPanel (gen.run UI)", () => {
   });
 
   it("Run fires gen.run RPC with parsed prompt + sampler params", async () => {
-    const callSpy = vi.fn(async () => ({
+    const callSpy = vi.fn(async (_method: string, _params: unknown) => ({
       tokens: [9, 8, 7], finish_reason: "length",
       elapsed_ms: 1.2, strategy: "top_k", smoke: true,
     }));
@@ -38,7 +38,7 @@ describe("V7 GenerationPanel (gen.run UI)", () => {
       expect(screen.getByTestId("gen-result")).toBeDefined();
     });
     expect(callSpy).toHaveBeenCalledTimes(1);
-    const args = callSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+    const args = callSpy.mock.calls[0]![1] as Record<string, unknown>;
     expect(args.prompt_tokens).toEqual([5, 4, 3]);
     expect(args.strategy).toBe("top_k");
     expect(args.max_new_tokens).toBe(8);

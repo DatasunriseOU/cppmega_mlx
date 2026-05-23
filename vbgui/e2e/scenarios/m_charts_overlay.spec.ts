@@ -8,6 +8,13 @@ import {
   gotoApp, selectPreset, clickRunPipeline, closeModal,
 } from "../fixtures";
 
+// This spec types num_steps in the run-pipeline dropdown and then
+// clicks run-pipeline-train directly; the clickRunPipeline helper
+// re-opens the toggle and would wipe the just-typed value. Keep the
+// import to mirror the rest of the K/M-block surface and to satisfy
+// tsc's noUnusedLocals.
+void clickRunPipeline;
+
 test("M21/M22/M23: charts overlay smoothed/val/lr after real train", async ({
   page,
 }) => {

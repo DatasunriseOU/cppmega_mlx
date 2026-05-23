@@ -3,7 +3,7 @@
 // a typed structure so spec files can assert against real training math
 // instead of vacuous status checks.
 
-import type { Page } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 
 export type TrainExtras = {
   losses: number[];
