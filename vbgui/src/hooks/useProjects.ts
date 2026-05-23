@@ -29,6 +29,32 @@ export interface UseProjectsAPI<T> {
 
 const LS_PROJECTS = "vbgui_projects_v1";
 const LS_ACTIVE = "vbgui_active_project_v1";
+// V7-H41/H42: standalone keys for the in-flight train run lifecycle
+// so a reload can rehydrate run_id + paused flag without depending
+// on the project payload (which is opaque to this hook).
+const LS_ACTIVE_RUN_ID = "vbgui_active_train_run_id_v1";
+const LS_TRAIN_PAUSED = "vbgui_train_paused_v1";
+
+/**
+ * V7-H41/H42: read/write the in-flight train run id + paused flag
+ * across UI reloads. App.tsx rehydrates on mount and calls
+ * pipeline.status to confirm the run is still alive.
+ */
+export function loadActiveTrainRunId(): string | null {
+  return _readLS<string | null>(LS_ACTIVE_RUN_ID, null);
+}
+
+export function saveActiveTrainRunId(runId: string | null): void {
+  _writeLS(LS_ACTIVE_RUN_ID, runId);
+}
+
+export function loadTrainPaused(): boolean {
+  return _readLS<boolean>(LS_TRAIN_PAUSED, false);
+}
+
+export function saveTrainPaused(paused: boolean): void {
+  _writeLS(LS_TRAIN_PAUSED, paused);
+}
 
 function _rid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
