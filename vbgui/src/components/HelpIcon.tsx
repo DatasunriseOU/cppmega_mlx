@@ -72,6 +72,23 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "Attention memory scales O(B*S^2) for vanilla SDPA. The " +
       "GUI default S=64 keeps mini runs interactive.",
   },
+  // ----- insert into edge -----
+  insert_into_edge: {
+    title: "Insert brick into an edge",
+    what:
+      "Splits an existing edge A→B by inserting a new brick X " +
+      "between them: A→B becomes A→X and X→B. Node ids and the rest " +
+      "of the graph topology stay untouched.",
+    why:
+      "Lets the architect try interleaving new computation (e.g. an " +
+      "mLSTM-style nonlinear-rnn brick between an attention and an " +
+      "MLP) without re-laying-out the whole canvas. Verify re-runs " +
+      "automatically, surfacing any shape mismatch immediately.",
+    example:
+      "llama3_8b_attn → llama3_8b_mlp is the default llama edge. " +
+      "Insert an mLSTM block to get attn → mlstm → mlp; train 2 " +
+      "steps to validate it's loss-finite before scaling up.",
+  },
   // ----- brick transplant -----
   brick_transplant: {
     title: "Cross-preset brick transplant",

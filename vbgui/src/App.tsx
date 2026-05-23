@@ -9,6 +9,7 @@ import { GalleryTab } from "@/components/GalleryTab";
 import { SweepPanel } from "@/components/SweepPanel";
 import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
 import { TransplantBar } from "@/components/TransplantBar";
+import { InsertIntoEdgeBar } from "@/components/InsertIntoEdgeBar";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
@@ -699,6 +700,40 @@ export function App(): JSX.Element {
                             display: "flex", flexDirection: "column",
                             minHeight: 0 }}>
                 <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
+                <InsertIntoEdgeBar
+                  edges={edges.map((e) => ({
+                    source: e.source, target: e.target,
+                  }))}
+                  onInsert={(kind, edge) => {
+                    const baseName =
+                      `${kind}_insert_${nodes.length}`;
+                    // Layout: midpoint between src & dst nodes.
+                    const src = nodes.find((n) => n.id === edge.source);
+                    const dst = nodes.find((n) => n.id === edge.target);
+                    const mid = src && dst
+                      ? { x: (src.position.x + dst.position.x) / 2,
+                          y: (src.position.y + dst.position.y) / 2 + 50 }
+                      : { x: 200, y: 280 };
+                    setNodes((prev) => [
+                      ...prev,
+                      { id: baseName,
+                        type: "brick",
+                        position: mid,
+                        data: { kind } as never },
+                    ]);
+                    setEdges((prev) => [
+                      ...prev.filter((e) =>
+                        !(e.source === edge.source
+                          && e.target === edge.target)),
+                      { id: `${edge.source}->${baseName}`,
+                        source: edge.source, target: baseName,
+                        data: { severity: "info" } },
+                      { id: `${baseName}->${edge.target}`,
+                        source: baseName, target: edge.target,
+                        data: { severity: "info" } },
+                    ]);
+                  }}
+                />
                 <TransplantBar
                   rpc={rpc}
                   presets={PRESETS}
