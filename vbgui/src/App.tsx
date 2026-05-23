@@ -8,6 +8,7 @@ import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { GalleryTab } from "@/components/GalleryTab";
 import { SweepPanel } from "@/components/SweepPanel";
 import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
+import { TransplantBar } from "@/components/TransplantBar";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
@@ -698,6 +699,23 @@ export function App(): JSX.Element {
                             display: "flex", flexDirection: "column",
                             minHeight: 0 }}>
                 <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
+                <TransplantBar
+                  rpc={rpc}
+                  presets={PRESETS}
+                  onTransplant={(kind, params) => {
+                    const baseName = `${kind}_xplant_${nodes.length}`;
+                    setNodes((prev) => [
+                      ...prev,
+                      {
+                        id: baseName,
+                        type: "brick",
+                        position: { x: 60 + (prev.length * 40) % 600,
+                                    y: 280 },
+                        data: { kind, params } as never,
+                      },
+                    ]);
+                  }}
+                />
                 {spec.gotchas.some(
                   (g) => g.id === "v7_f56b_dim_env_mismatch") && (
                   <div

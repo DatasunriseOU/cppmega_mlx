@@ -72,6 +72,26 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "Attention memory scales O(B*S^2) for vanilla SDPA. The " +
       "GUI default S=64 keeps mini runs interactive.",
   },
+  // ----- brick transplant -----
+  brick_transplant: {
+    title: "Cross-preset brick transplant",
+    what:
+      "Picks a brick (kind + params) out of one preset and drops " +
+      "it onto the current canvas. The new node lands unconnected; " +
+      "the architect wires its edges manually.",
+    why:
+      "Mixing-and-matching architecture choices — e.g. taking the " +
+      "Mixtral-style MoE brick and trying it in a Llama scaffold — " +
+      "is the fastest way to validate an ablation hypothesis without " +
+      "writing a new preset factory. The transplanted brick keeps " +
+      "the source preset's parameter choices, so the architect sees " +
+      "exactly what the upstream author shipped.",
+    example:
+      "Source preset llama4_maverick → moe brick (num_experts=8, " +
+      "top_k=2). Drop into a llama3_8b canvas, connect after the " +
+      "attention block, train 2 steps to compare against the dense " +
+      "MLP variant.",
+  },
   // ----- tokenizer matrix -----
   tokenizer_matrix: {
     title: "Tokenizer × preset compatibility matrix",
