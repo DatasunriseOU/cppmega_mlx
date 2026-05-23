@@ -190,6 +190,53 @@ def test_fused_suffix_value_and_grad_returns_bank_view_cotangents() -> None:
     assert grads[2].tolist() == [5.0, 6.0, 7.0, 8.0]
 
 
+def test_fused_suffix_vjp_scales_bank_view_cotangents_by_loss_cotangent() -> None:
+    artifact = _RecordingArtifact(sentinel_loss=3.0, sentinel_ntokens=11.0)
+    bank_owner = _FakeBankOwner()
+    abi_map = _make_abi_map()
+    in_region_aliases = {
+        "p_a": {
+            "logical_name": "param_a", "logical_grad_name": "param_a_grad",
+            "bank": "f32", "dtype": "float32",
+            "offset": 60, "size": 4, "logical_shape": (4,),
+        },
+        "p_b": {
+            "logical_name": "param_b", "logical_grad_name": "param_b_grad",
+            "bank": "f32", "dtype": "float32",
+            "offset": 64, "size": 4, "logical_shape": (4,),
+        },
+    }
+    f = build_fused_suffix_custom_function(
+        artifact=artifact, bank_owner=bank_owner, abi_map=abi_map,
+        hidden_entry_logical_name="hidden_entry",
+        target_ids_logical_name="target_ids",
+        target_mask_logical_name="target_mask",
+        loss_logical_name="loss",
+        ntokens_logical_name="ntokens",
+        in_region_parameter_bank_aliases=in_region_aliases,
+        parameter_order=("p_a", "p_b"),
+    )
+
+    hidden_entry = mx.full((1, 3, 4), 1.0, dtype=mx.float32)
+    target_ids = mx.zeros((3,), dtype=mx.float32)
+    target_mask = mx.ones((3,), dtype=mx.float32)
+    param_a = mx.zeros((4,), dtype=mx.float32)
+    param_b = mx.zeros((4,), dtype=mx.float32)
+
+    def scaled_loss_fn(hidden_entry, param_a, param_b):
+        loss, _ntokens = f(hidden_entry, target_ids, target_mask, param_a, param_b)
+        return loss * mx.array(3.0, dtype=mx.float32)
+
+    grad_fn = mx.value_and_grad(scaled_loss_fn, argnums=(0, 1, 2))
+    val, grads = grad_fn(hidden_entry, param_a, param_b)
+    mx.eval(val, *grads)
+
+    assert float(val) == 9.0
+    assert grads[0].tolist() == [[[21.0]*4]*3]
+    assert grads[1].tolist() == [3.0, 6.0, 9.0, 12.0]
+    assert grads[2].tolist() == [15.0, 18.0, 21.0, 24.0]
+
+
 def test_fused_suffix_rejects_wrong_primal_count() -> None:
     artifact = _RecordingArtifact(0.0, 0.0)
     bank_owner = _FakeBankOwner()

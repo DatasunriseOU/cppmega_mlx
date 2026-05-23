@@ -175,12 +175,6 @@ def build_fused_suffix_custom_function(
             loss_cotan = cotangents[0]
         else:
             loss_cotan = cotangents
-        del loss_cotan  # The fused backward already ran inside forward with
-        # ``d_loss/d_loss = 1``; trainer-side loss scaling is handled by the
-        # caller (``CompiledPretrainingStep`` keeps loss unscaled). If a
-        # future caller scales the loss, the bank cotangents would need to
-        # scale accordingly; we surface the assumption explicitly via the
-        # runtime contract.
         hidden_entry_primal = primals[0]
         target_ids_primal = primals[1]
         target_mask_primal = primals[2]
@@ -206,6 +200,7 @@ def build_fused_suffix_custom_function(
             hidden_entry_cotan = mx.reshape(
                 hidden_entry_cotan, hidden_entry_primal.shape
             )
+        hidden_entry_cotan = hidden_entry_cotan * loss_cotan
 
         target_ids_cotan = _zeros_like_with_cotangent_dtype(
             target_ids_primal
@@ -223,6 +218,7 @@ def build_fused_suffix_custom_function(
                 != tuple(int(dim) for dim in tuple(primal.shape))
             ):
                 cotan = mx.reshape(cotan, primal.shape)
+            cotan = cotan * loss_cotan
             param_cotans.append(cotan)
 
         return (
