@@ -626,12 +626,40 @@ export function App(): JSX.Element {
           {activeTab === "canvas" && (
             <>
               <Palette />
-              <FlowCanvas
-                nodes={nodes} edges={edges}
-                onConnect={handleConnect}
-                onDropBrick={handleDropBrick}
-                onNodeClick={setSelectedBrickId}
-              />
+              <div style={{ flex: 1, position: "relative", display: "flex",
+                            minHeight: 0 }}>
+                {spec.gotchas.some(
+                  (g) => g.id === "v7_f56b_dim_env_mismatch") && (
+                  <div
+                    data-testid="symbolic-dim-warn-badge"
+                    role="alert"
+                    style={{
+                      position: "absolute", top: 8, right: 8, zIndex: 5,
+                      background: "#fef3c7", color: "#92400e",
+                      borderLeft: "4px solid #d97706",
+                      borderRadius: 4, padding: "6px 10px",
+                      fontSize: 12, fontFamily: "system-ui, sans-serif",
+                      boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
+                      maxWidth: 320,
+                    }}
+                  >
+                    <strong data-testid="symbolic-dim-warn-title">
+                      ⚠ Symbolic-dim mismatch
+                    </strong>
+                    <div data-testid="symbolic-dim-warn-message"
+                         style={{ marginTop: 2 }}>
+                      {spec.gotchas.find(
+                        (g) => g.id === "v7_f56b_dim_env_mismatch")?.message}
+                    </div>
+                  </div>
+                )}
+                <FlowCanvas
+                  nodes={nodes} edges={edges}
+                  onConnect={handleConnect}
+                  onDropBrick={handleDropBrick}
+                  onNodeClick={setSelectedBrickId}
+                />
+              </div>
               {selectedBrickId && (() => {
                 const selected = nodes.find((n) => n.id === selectedBrickId);
                 if (!selected) return null;

@@ -375,6 +375,30 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
     gotcha_payloads.extend(
         _side_channel_policy_gotchas(params.side_channels, available)
     )
+    # V7-F56b: surface the symbolic-dim mismatch as a gotcha so the
+    # vbgui GotchasTab + per-brick badge render it without needing
+    # a separate WS channel.
+    de = params.dim_env if isinstance(params.dim_env, dict) else (
+        params.dim_env.model_dump()
+        if hasattr(params.dim_env, "model_dump") else {}
+    )
+    f56b_H = de.get("H")
+    f56b_nh = de.get("nh")
+    f56b_hd = de.get("head_dim")
+    if (f56b_H is not None and f56b_nh is not None and f56b_hd is not None
+            and f56b_nh * f56b_hd != f56b_H):
+        gotcha_payloads.append(GotchaPayload(
+            id="v7_f56b_dim_env_mismatch",
+            severity="warning",
+            message=(
+                f"dim_env.H={f56b_H} but nh*head_dim = "
+                f"{f56b_nh}*{f56b_hd} = {f56b_nh * f56b_hd}. "
+                "Attention still runs via internal Q projection, but "
+                "this almost always means the architect mis-pinned a "
+                "dim_env value."
+            ),
+            reference=None,
+        ))
 
     edge_payloads: list[EdgeResolution] = []
     for re in resolved.edges:
