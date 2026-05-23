@@ -90,6 +90,9 @@ export interface TopBarProps {
    *  check + alt-config suggester). When set, the run-pipeline menu
    *  exposes a 'Run Probe' button. */
   onRunProbe?: () => Promise<ProbeRunInfo>;
+  filterByPlatform?: boolean;
+  onFilterByPlatformChange?: (filter: boolean) => void;
+  activeDevice?: string;
 }
 
 /** V7-K2: shape returned by probe.run RPC. */
@@ -198,6 +201,17 @@ export function TopBar(p: TopBarProps): JSX.Element {
                 p.onTopologyChange(e.target.value as TopologyFactory)}>
         {p.topologies.map((t) => <option key={t} value={t}>{t}</option>)}
       </select>
+
+      {p.onFilterByPlatformChange !== undefined && (
+        <label style={{ fontSize: 10, display: "flex", gap: 3,
+                        alignItems: "center", whiteSpace: "nowrap" }}>
+          <input data-testid="top-bar-filter-by-platform" type="checkbox"
+                 checked={!!p.filterByPlatform}
+                 onChange={(e) =>
+                   p.onFilterByPlatformChange?.(e.target.checked)} />
+          filter_platform ({p.activeDevice ?? "..."})
+        </label>
+      )}
 
       <select data-testid="compile-mode"
               value={p.state.sharding.compile_mode}

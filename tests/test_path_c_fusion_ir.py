@@ -3390,6 +3390,48 @@ def test_mamba3_fp8_train_schedule_compile_helper_defaults_to_tilelang_lowerer()
     assert compiled.compiled.plan.schedule_contract is not None
     assert compiled.compiled.plan.schedule_contract.status == "verified"
 
+def test_mamba3_fp8_train_schedule_compile_helper_emits_exactly_one_primfunc() -> None:
+    """Step 4.a one-launch assertion (structural).
+
+    The plan flag ``single_kernel_fused`` only summarises the *intent*
+    to fuse forward+backward into a single launch. This test inspects
+    the lowered IRModule that ``compile_mamba3_fp8_train_fusion_schedule``
+    hands to ``tilelang.compile`` and confirms it contains exactly one
+    PrimFunc -- no second function emitted for the backward half, no
+    synthetic copy seam between fwd and bwd. This locks the invariant
+    that the production train block lowers to one launch.
+    """
+    import tvm
+
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+
+    compiled = schedules.compile_mamba3_fp8_train_fusion_schedule()
+    lowered = compiled.compiled.lowered_module
+    assert isinstance(lowered, tvm.IRModule), (
+        f"expected tvm.IRModule, got {type(lowered).__name__}"
+    )
+    funcs = list(lowered.functions.items())
+    assert len(funcs) == 1, (
+        f"single-kernel Path C train block must lower to exactly one "
+        f"PrimFunc; got {len(funcs)}: "
+        f"{[gv.name_hint for gv, _ in funcs]!r}"
+    )
+    entry_gv, entry_func = funcs[0]
+    from tvm import tir
+
+    assert isinstance(entry_func, tir.PrimFunc), (
+        f"single Path C entry must be a tir.PrimFunc; got "
+        f"{type(entry_func).__name__}"
+    )
+    # The entry's global symbol should match the schedule's entry
+    # symbol -- if either ``aot_backward`` or the fwd half had split
+    # into its own function we'd see two names here.
+    assert entry_gv.name_hint == "mamba3_m2rnn_attention_fp8_train_block", (
+        f"unexpected entry symbol {entry_gv.name_hint!r}; the train block "
+        "schedule expects a single fused entry called "
+        "'mamba3_m2rnn_attention_fp8_train_block'"
+    )
+
 
 def test_path_c_schedule_registry_selects_dynamic_descriptor_chain_by_default() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)

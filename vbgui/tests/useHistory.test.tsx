@@ -36,8 +36,8 @@ describe("V7-H03 useHistory", () => {
     act(() => { result.current.push(2); });
     act(() => { result.current.push(3); });
     act(() => { result.current.undo(); });    // pop 3, prev=2
-    let nxt: { snapshot: number; rejected: boolean } | null = null;
-    act(() => { nxt = result.current.redo(); });
+    let nxt: { snapshot: number; rejected: boolean } | null | undefined;
+    act(() => { nxt = result.current.redo() ?? null; });
     expect(nxt?.snapshot).toBe(3);
     expect(nxt?.rejected).toBe(false);
   });
@@ -48,8 +48,8 @@ describe("V7-H03 useHistory", () => {
     act(() => { result.current.push(2); });
     act(() => { result.current.markRejected(); });  // 2 is rejected
     act(() => { result.current.undo(); });          // pop 2, back to 1
-    let nxt: { snapshot: number; rejected: boolean } | null = null;
-    act(() => { nxt = result.current.redo(); });
+    let nxt: { snapshot: number; rejected: boolean } | null | undefined;
+    act(() => { nxt = result.current.redo() ?? null; });
     expect(nxt?.snapshot).toBe(2);
     expect(nxt?.rejected).toBe(true);
   });
@@ -59,8 +59,8 @@ describe("V7-H03 useHistory", () => {
     act(() => { result.current.push(10); });
     act(() => { result.current.push(20); });
     act(() => { result.current.undo(); });
-    let nxt: { snapshot: number; rejected: boolean } | null = null;
-    act(() => { nxt = result.current.redo(); });
+    let nxt: { snapshot: number; rejected: boolean } | null | undefined;
+    act(() => { nxt = result.current.redo() ?? null; });
     expect(nxt?.rejected).toBe(false);
   });
 

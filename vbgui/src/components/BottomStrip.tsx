@@ -6,6 +6,7 @@ export interface BottomStripProps {
   onHelpToggle?: () => void;
   /** V7-H48: backend git sha + boot timestamp from the heartbeat. */
   backendBuildId?: string | null;
+  activeDevice?: string;
 }
 
 const STATUS_COLOR: Record<SpecState["backend_status"], string> = {
@@ -21,7 +22,7 @@ const STATUS_LABEL: Record<SpecState["backend_status"], string> = {
 };
 
 export function BottomStrip({
-  state, fusedRegionCount = 0, onHelpToggle, backendBuildId = null,
+  state, fusedRegionCount = 0, onHelpToggle, backendBuildId = null, activeDevice,
 }: BottomStripProps): JSX.Element {
   return (
     <footer data-testid="bottom-strip"
@@ -49,6 +50,13 @@ export function BottomStrip({
       <span data-testid="brick-count">
         {state.brick_count} bricks, {fusedRegionCount} fused regions
       </span>
+      {activeDevice && (
+        <span data-testid="platform-indicator"
+              style={{ display: "inline-flex", alignItems: "center", gap: 4,
+                       color: "#4f46e5", fontWeight: 600, textTransform: "uppercase" }}>
+          Platform: {activeDevice}
+        </span>
+      )}
       {backendBuildId && (
         <span data-testid="backend-build-id"
               title={`Backend build id: ${backendBuildId}`}

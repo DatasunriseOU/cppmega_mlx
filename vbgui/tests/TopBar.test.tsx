@@ -316,4 +316,22 @@ describe("MemoryBar", () => {
     expect(screen.getByTestId("memory-bar-actual").textContent)
       .toContain("12.00 GB");
   });
+
+  it("renders platform filter checkbox and responds to toggle callback", () => {
+    const onFilterByPlatformChange = vi.fn();
+    render(
+      <TopBar
+        {...defaultTopProps()}
+        filterByPlatform={true}
+        onFilterByPlatformChange={onFilterByPlatformChange}
+        activeDevice="mlx"
+      />
+    );
+    const checkbox = screen.getByTestId("top-bar-filter-by-platform") as HTMLInputElement;
+    expect(checkbox).toBeTruthy();
+    expect(checkbox.checked).toBe(true);
+
+    fireEvent.click(checkbox);
+    expect(onFilterByPlatformChange).toHaveBeenCalledWith(false);
+  });
 });

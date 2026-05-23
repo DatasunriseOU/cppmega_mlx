@@ -14,7 +14,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
-from cppmega_v4.runner import Pipeline, run_pipeline
+# NOTE: lazy import inside the handler — importing Pipeline/run_pipeline
+# at module load makes cppmega_v4.runner -> cppmega_v4.jsonrpc.schema ->
+# cppmega_v4.jsonrpc.__init__ -> dispatcher -> loss_surface_method a
+# circular path that breaks any caller (e.g.
+# `python -m cppmega_v4.tools.ckpt_inspect`) that imports
+# cppmega_v4.runner before cppmega_v4.jsonrpc finished initialising.
 
 
 class LossSurfaceParams(BaseModel):
@@ -74,6 +79,7 @@ def loss_surface_run(params: LossSurfaceParams,
             try:
                 mutated = VerifyParams.model_validate(
                     _mutate(spec_dict, lr_mult=lr_m, wd_mult=wd_m))
+                from cppmega_v4.runner import Pipeline, run_pipeline
                 rep = run_pipeline(mutated, Pipeline.from_dict({
                     "stages": ["parse", "verify_build_spec",
                                "build_model", "train"],

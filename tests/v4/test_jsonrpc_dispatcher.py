@@ -153,3 +153,21 @@ def test_dispatch_pipeline_abort_requests_stage_abort():
         assert train["status"] in {"cancelled", "skipped"}
     finally:
         clear_abort(run_id)
+
+
+def test_dispatch_platform_get_info():
+    envelope = {
+        "jsonrpc": "2.0",
+        "id": "plt",
+        "method": "platform.get_info",
+        "params": {},
+    }
+    resp = dispatch(envelope)
+    assert resp.error is None
+    assert resp.result is not None
+    assert "active_device" in resp.result
+    assert "available_topologies" in resp.result
+    assert "available_comm_backends" in resp.result
+    assert isinstance(resp.result["available_topologies"], list)
+    assert isinstance(resp.result["available_comm_backends"], list)
+
