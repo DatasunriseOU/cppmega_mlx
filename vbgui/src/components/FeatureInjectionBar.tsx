@@ -14,6 +14,7 @@
 
 import { useEffect, useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
+import { T } from "@/theme";
 
 interface CatalogOption {
   name: string;
@@ -32,10 +33,14 @@ export interface FeatureInjectionBarProps {
   /** Optional list of already-applied injections; the bar uses this
    *  to populate the applied-list display when the parent persists. */
   applied?: AppliedInjection[];
+  /** Optional remove callback. Called with the last-applied injection
+   *  matching the chip the user clicked × on. Parent is responsible
+   *  for popping the matching rewriter / brick. */
+  onRemove?: (injection: AppliedInjection) => void;
 }
 
 export function FeatureInjectionBar({
-  rpc, onApply, applied = [],
+  rpc, onApply, applied = [], onRemove,
 }: FeatureInjectionBarProps): JSX.Element {
   const [options, setOptions] = useState<CatalogOption[]>([]);
   const [selected, setSelected] = useState<string>("");
@@ -74,19 +79,50 @@ export function FeatureInjectionBar({
     onApply(injection);
   }
 
+  function removeOne(name: string) {
+    let popped: AppliedInjection | null = null;
+    for (let i = local.length - 1; i >= 0; i--) {
+      if (local[i].name === name) { popped = local[i]; break; }
+    }
+    if (!popped) return;
+    setLocal((prev) => {
+      const next = [...prev];
+      for (let i = next.length - 1; i >= 0; i--) {
+        if (next[i].name === name) { next.splice(i, 1); break; }
+      }
+      return next;
+    });
+    if (onRemove) onRemove(popped);
+  }
+
+  const counts = new Map<string, { count: number; paper_ref: string }>();
+  for (const a of local) {
+    const prev = counts.get(a.name);
+    counts.set(a.name, {
+      count: (prev?.count ?? 0) + 1,
+      paper_ref: a.paper_ref,
+    });
+  }
+  const chipEntries = Array.from(counts.entries());
+
   return (
     <div data-testid="feature-injection-bar"
          style={{ display: "flex", alignItems: "center", gap: 6,
-                  padding: 6, background: "#fefce8",
-                  border: "1px solid #fde047", borderRadius: 4,
-                  fontSize: 12 }}>
-      <strong style={{ color: "#0f172a", marginRight: 2 }}>Inject</strong>
-      <label style={{ display: "flex", alignItems: "center", gap: 4, color: "#0f172a" }}>
+                  padding: "4px 8px", background: T.surface,
+                  borderBottom: `1px solid ${T.border}`,
+                  fontSize: 12, fontFamily: T.font, color: T.text }}>
+      <strong style={{ color: T.accent, marginRight: 2 }}>Inject</strong>
+      <label style={{ display: "flex", alignItems: "center", gap: 4, color: T.textSecondary }}>
         <select
           data-testid="feature-injection-dropdown"
           value={selected}
           onChange={(e) => setSelected(e.target.value)}
           disabled={options.length === 0}
+          style={{
+            color: T.text,
+            background: T.surface3,
+            border: `1px solid ${T.border}`,
+          }}
         >
           {options.length === 0 && <option value="">…</option>}
           {options.map((o) => (
@@ -96,7 +132,7 @@ export function FeatureInjectionBar({
       </label>
       {selected && (
         <span data-testid="feature-injection-summary"
-              style={{ color: "#334155", fontWeight: 500 }}>
+              style={{ color: T.textSecondary, fontWeight: 500 }}>
           {options.find((o) => o.name === selected)?.summary ?? ""}
         </span>
       )}
@@ -104,15 +140,46 @@ export function FeatureInjectionBar({
         data-testid="feature-injection-apply"
         onClick={apply}
         disabled={!selected}
-        style={{ padding: "2px 8px" }}>
+        style={{
+          padding: "2px 8px",
+          background: T.surface3,
+          color: T.text,
+          border: `1px solid ${T.border}`,
+        }}>
         Apply
       </button>
       {err && <span data-testid="feature-injection-error"
-                    style={{ color: "#b91c1c" }}>{err}</span>}
+                    style={{ color: T.danger }}>{err}</span>}
       <span data-testid="feature-injection-applied-list"
-            style={{ color: "#374151", marginLeft: "auto" }}>
-        {local.length === 0 ? "—" :
-          local.map((a) => a.name).join(", ")}
+            style={{ display: "inline-flex", flexWrap: "wrap", gap: 4,
+                     marginLeft: "auto", alignItems: "center" }}>
+        {chipEntries.length === 0 ? (
+          <span style={{ color: T.textMuted }}>—</span>
+        ) : chipEntries.map(([name, { count }]) => (
+          <span key={name}
+                data-testid={`feature-injection-chip-${name}`}
+                style={{ display: "inline-flex", alignItems: "center",
+                         gap: 4, padding: "1px 4px 1px 6px",
+                         background: T.surface3,
+                         border: `1px solid ${T.border}`,
+                         borderRadius: 10, fontSize: 11, color: T.text }}>
+            <span>{name}</span>
+            {count > 1 && (
+              <span data-testid={`feature-injection-chip-${name}-count`}
+                    style={{ color: T.textSecondary, fontWeight: 600 }}>
+                ×{count}
+              </span>
+            )}
+            <button data-testid={`feature-injection-chip-${name}-remove`}
+                    onClick={() => removeOne(name)}
+                    title={count > 1 ? `remove one ${name}` : `remove ${name}`}
+                    style={{ background: "transparent", border: "none",
+                             color: T.textSecondary, cursor: "pointer",
+                             fontSize: 12, lineHeight: 1, padding: "0 2px" }}>
+              ×
+            </button>
+          </span>
+        ))}
       </span>
     </div>
   );

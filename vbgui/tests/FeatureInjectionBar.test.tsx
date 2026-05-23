@@ -107,6 +107,72 @@ describe("V8-R08 FeatureInjectionBar", () => {
     });
   });
 
+  it("applying the same option N times renders ONE chip with ×N count " +
+     "(UX#1: no more comma-joined mtp_weighted,mtp_weighted,...)", async () => {
+    const { rpc } = makeFakeRpc({ "catalog.list_options": CATALOG_OK });
+    render(<FeatureInjectionBar rpc={rpc} onApply={() => {}} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("feature-injection-dropdown")).toBeDefined();
+    });
+    const applyBtn = screen.getByTestId("feature-injection-apply");
+    fireEvent.click(applyBtn);
+    fireEvent.click(applyBtn);
+    fireEvent.click(applyBtn);
+    fireEvent.click(applyBtn);
+
+    // ONE chip, not four.
+    expect(screen.getAllByTestId("feature-injection-chip-mtp_weighted"))
+      .toHaveLength(1);
+    // With ×4 count badge.
+    expect(screen.getByTestId("feature-injection-chip-mtp_weighted-count")
+      .textContent).toBe("×4");
+    // Applied list should NOT contain the literal comma-joined string
+    // "mtp_weighted, mtp_weighted, mtp_weighted, mtp_weighted".
+    const list = screen.getByTestId("feature-injection-applied-list");
+    expect(list.textContent ?? "").not.toContain(
+      "mtp_weighted, mtp_weighted");
+  });
+
+  it("chip × button calls onRemove and pops one instance", async () => {
+    const { rpc } = makeFakeRpc({ "catalog.list_options": CATALOG_OK });
+    const onRemove = vi.fn();
+    render(<FeatureInjectionBar rpc={rpc} onApply={() => {}}
+                                 onRemove={onRemove} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("feature-injection-dropdown")).toBeDefined();
+    });
+    const applyBtn = screen.getByTestId("feature-injection-apply");
+    fireEvent.click(applyBtn);
+    fireEvent.click(applyBtn);
+    fireEvent.click(applyBtn);
+    expect(screen.getByTestId("feature-injection-chip-mtp_weighted-count")
+      .textContent).toBe("×3");
+
+    fireEvent.click(screen.getByTestId(
+      "feature-injection-chip-mtp_weighted-remove"));
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(onRemove.mock.calls[0][0]).toEqual({
+      name: "mtp_weighted",
+      paper_ref: "rewriter:MTPRewriter",
+    });
+    // Count drops to ×2.
+    expect(screen.getByTestId("feature-injection-chip-mtp_weighted-count")
+      .textContent).toBe("×2");
+  });
+
+  it("single-instance chip renders without a count badge", async () => {
+    const { rpc } = makeFakeRpc({ "catalog.list_options": CATALOG_OK });
+    render(<FeatureInjectionBar rpc={rpc} onApply={() => {}} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("feature-injection-dropdown")).toBeDefined();
+    });
+    fireEvent.click(screen.getByTestId("feature-injection-apply"));
+    expect(screen.getByTestId("feature-injection-chip-mtp_weighted"))
+      .toBeDefined();
+    expect(screen.queryByTestId(
+      "feature-injection-chip-mtp_weighted-count")).toBeNull();
+  });
+
   it("renders error banner on RPC failure", async () => {
     const { rpc } = makeFakeRpc({
       "catalog.list_options": new Error("catalog down"),

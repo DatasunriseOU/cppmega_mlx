@@ -779,6 +779,31 @@ export function App(): JSX.Element {
     }
   }, [nodes, featureInjections.length]);
 
+  const handleFeatureInjectionRemove = useCallback((
+    injection: AppliedInjection,
+  ) => {
+    setFeatureInjections((prev) => {
+      const next = [...prev];
+      for (let i = next.length - 1; i >= 0; i--) {
+        if (next[i].name === injection.name) {
+          next.splice(i, 1);
+          break;
+        }
+      }
+      return next;
+    });
+    if (injection.paper_ref.startsWith("rewriter:")) {
+      const name = injection.paper_ref.slice("rewriter:".length);
+      let lastIdx = -1;
+      for (let i = spec.rewriters.length - 1; i >= 0; i--) {
+        if (spec.rewriters[i].name === name) { lastIdx = i; break; }
+      }
+      if (lastIdx >= 0) {
+        dispatch({ type: "rewriters.remove", index: lastIdx });
+      }
+    }
+  }, [spec.rewriters]);
+
   // V8-R02: apply a scaled-down preset from the GalleryScaleDownSlider.
   // The slider already ran architectures.scale_down and hands us back
   // the wire-form specs + chosen (hidden_size, num_layers). We swap the
@@ -1614,6 +1639,7 @@ export function App(): JSX.Element {
                   rpc={rpc}
                   applied={featureInjections}
                   onApply={handleFeatureInjectionApply}
+                  onRemove={handleFeatureInjectionRemove}
                 />
                 <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
                 <TrainOptionsPanel
