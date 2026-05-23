@@ -1,8 +1,29 @@
+import { useState } from "react";
 import type { GotchaState } from "@/state/spec";
+
+export interface AdapterStep {
+  rule: string;
+  description: string;
+  params?: Record<string, unknown>;
+}
+
+export interface AdapterChain {
+  producer: string;
+  consumer: string;
+  producer_shape: number[];
+  consumer_shape: number[];
+  chain: AdapterStep[];
+  reason: string;
+}
 
 export interface GotchasTabProps {
   gotchas: GotchaState[];
   onAutoFix?: (id: string) => void;
+  /** V7-K3: suggest_adapters callback — UI sends producer/consumer
+   *  brick names, backend returns the adapter chain that would bridge
+   *  them. Rendered inline so users can see how to fix an edge gap. */
+  onSuggestAdapters?: (producer: string,
+                        consumer: string) => Promise<AdapterChain>;
 }
 
 const COLOR: Record<GotchaState["severity"], string> = {
@@ -42,10 +63,95 @@ function groupBySeverity(gs: GotchaState[]): Record<string, GotchaState[]> {
   return out;
 }
 
-export function GotchasTab({ gotchas, onAutoFix }: GotchasTabProps): JSX.Element {
+export function GotchasTab({
+  gotchas, onAutoFix, onSuggestAdapters,
+}: GotchasTabProps): JSX.Element {
   const grouped = groupBySeverity(gotchas);
+  const [adapterProducer, setAdapterProducer] = useState<string>("");
+  const [adapterConsumer, setAdapterConsumer] = useState<string>("");
+  const [adapterChain, setAdapterChain] = useState<AdapterChain | null>(null);
+  const [adapterError, setAdapterError] = useState<string | null>(null);
+  const [adapterLoading, setAdapterLoading] = useState<boolean>(false);
   return (
     <div data-testid="gotchas-tab" style={panel}>
+      {onSuggestAdapters && (
+        <section data-testid="gotchas-suggest-adapters-panel"
+                 style={{ background: "#f3f4f6", padding: 8, borderRadius: 4,
+                          fontSize: 11 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>
+            Suggest adapter chain (V7-K3)
+          </div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+            <input data-testid="gotchas-suggest-adapters-producer"
+                   placeholder="producer brick id"
+                   value={adapterProducer}
+                   onChange={(e) => setAdapterProducer(e.target.value)}
+                   style={{ flex: 1, fontFamily: "monospace",
+                             fontSize: 11 }} />
+            <span>→</span>
+            <input data-testid="gotchas-suggest-adapters-consumer"
+                   placeholder="consumer brick id"
+                   value={adapterConsumer}
+                   onChange={(e) => setAdapterConsumer(e.target.value)}
+                   style={{ flex: 1, fontFamily: "monospace",
+                             fontSize: 11 }} />
+            <button data-testid="gotchas-suggest-adapters-run"
+                    disabled={adapterLoading || !adapterProducer
+                              || !adapterConsumer}
+                    onClick={async () => {
+                      setAdapterLoading(true);
+                      setAdapterError(null);
+                      try {
+                        const r = await onSuggestAdapters(
+                          adapterProducer, adapterConsumer);
+                        setAdapterChain(r);
+                      } catch (e) {
+                        setAdapterError(
+                          e instanceof Error ? e.message : String(e));
+                      } finally {
+                        setAdapterLoading(false);
+                      }
+                    }}>
+              {adapterLoading ? "…" : "Suggest"}
+            </button>
+          </div>
+          {adapterError && (
+            <div data-testid="gotchas-suggest-adapters-error"
+                 style={{ color: "#dc2626" }}>{adapterError}</div>
+          )}
+          {adapterChain && (
+            <div data-testid="gotchas-suggest-adapters-result"
+                 style={{ fontFamily: "monospace" }}>
+              <div data-testid="gotchas-suggest-adapters-shapes">
+                {adapterChain.producer}{" "}
+                [{adapterChain.producer_shape.join("×")}] →{" "}
+                {adapterChain.consumer}{" "}
+                [{adapterChain.consumer_shape.join("×")}]
+              </div>
+              <div data-testid="gotchas-suggest-adapters-reason"
+                   style={{ color: "#6b7280", marginTop: 2 }}>
+                {adapterChain.reason}
+              </div>
+              {adapterChain.chain.length === 0 ? (
+                <div data-testid="gotchas-suggest-adapters-chain-empty"
+                     style={{ color: "#16a34a", marginTop: 2 }}>
+                  ✓ no adapter needed
+                </div>
+              ) : (
+                <ol data-testid="gotchas-suggest-adapters-chain"
+                    style={{ margin: "4px 0 0 18px", padding: 0 }}>
+                  {adapterChain.chain.map((step, i) => (
+                    <li key={i}
+                        data-testid={`gotchas-suggest-adapters-step-${i}`}>
+                      <strong>{step.rule}</strong>: {step.description}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          )}
+        </section>
+      )}
       {gotchas.length === 0 && (
         <p style={{ color: "#9ca3af" }}>No gotchas fired.</p>
       )}

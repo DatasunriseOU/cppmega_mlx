@@ -38,6 +38,9 @@ export interface SidebarProps {
   onShardingChange: (s: ShardingState) => void;
   onShardingAccept: (idx: number) => void;
   onGotchaAutoFix?: (id: string) => void;
+  /** V7-K3: GotchasTab forwards suggest_adapters calls up to App. */
+  onSuggestAdapters?: (producer: string, consumer: string) =>
+    Promise<import("./sidebar/GotchasTab").AdapterChain>;
   /** Optional rpc client — enables tooltip/explain integration in
    *  OptimTab and downstream tabs. App passes useRpc() here. */
   rpc?: import("@/lib/rpc").RpcClient | null;
@@ -50,6 +53,7 @@ export interface SidebarProps {
   /** H07: parent dispatches the per-brick params mutation when the
    *  user clicks Apply on an auto-inferred row in DimensionsTab. */
   onDimensionsApply?: (entry: InferenceEntryClient) => void;
+  tokenizerSource?: string | null;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -110,6 +114,8 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                            availableChannels={p.availableSideChannels}
                            selectedTrainChannels={p.selectedTrainSideChannels}
                            gotchas={p.gotchas}
+                           rpc={p.rpc ?? null}
+                           tokenizerSource={p.tokenizerSource ?? null}
                            onApply={p.onSideChannelsApply}
                            onTrainChannelsChange={
                              p.onTrainSideChannelsChange} />
@@ -120,7 +126,9 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                        onChange={p.onShardingChange} />
         )}
         {active === "gotchas"   && (
-          <GotchasTab gotchas={p.gotchas} onAutoFix={p.onGotchaAutoFix} />
+          <GotchasTab gotchas={p.gotchas}
+                       onAutoFix={p.onGotchaAutoFix}
+                       onSuggestAdapters={p.onSuggestAdapters} />
         )}
         {active === "dimensions" && (
           <DimensionsTab log={p.inferenceLog ?? []}

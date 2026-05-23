@@ -1084,6 +1084,27 @@ export function App(): JSX.Element {
                     } as never };
                   }));
                 }}
+                onSuggestAdapters={async (producer, consumer) => {
+                  // V7-K3: suggest_adapters RPC — UI sends current
+                  // graph + dim_env + producer/consumer pair, backend
+                  // returns the adapter chain that would bridge them.
+                  const snap = wireSpecRef.current;
+                  const verify = buildVerifyParams(
+                    snap.nodes, snap.edges, snap.spec,
+                    snap.availableSideChannels);
+                  return rpc.call<{
+                    producer: string; consumer: string;
+                    producer_shape: number[]; consumer_shape: number[];
+                    chain: Array<{ rule: string; description: string;
+                                    params?: Record<string, unknown> }>;
+                    reason: string;
+                  }>("suggest_adapters", {
+                    graph: verify.graph,
+                    dim_env: verify.dim_env,
+                    producer, consumer,
+                    max_steps: 4,
+                  });
+                }}
               />
             </>
           )}
