@@ -198,3 +198,109 @@ removes the unsafe overlay and replaces it with the fail-closed
 warmup+eager path. The work above is what is left to actually beat
 path_b, and it lives at the TileLang descriptor + Metal codegen
 layer, exactly where the user asked the work to happen.
+
+## Update 2026-05-23: B2 partial advance + structural Block A discovered
+
+### Fix B-1 (committed, `26575cd`): block bwd no longer clobbers residual chain
+
+The row-phased block backward emitters (`_append_row_phased_mamba3_bwd_body`,
+`_append_row_phased_m2rnn_bwd_body`,
+`_append_row_phased_attention_qkv_projection_bwd_body`) used to
+zero-init the input's `hidden_grad` slot at the start of every row
+iteration, then accumulate the block's in-projection contribution
+into the same slot with `+=`. When the input's `hidden_grad`
+output mapped to a **full-sequence bank slot** that the upstream
+`residual_rmsnorm_bwd` had already written with `=` in the same
+row iteration (specifically for the FIRST brick of an in-region
+chain), the zero-init clobbered the residual chain-rule contribution,
+so the only term that reached the input residual stream was the
+block's in-projection grad. The downstream eager prefix then saw a
+hidden_entry cotangent that was missing the chain through the
+fused region's residual bridges.
+
+New helper `_is_full_sequence_bank_slot(buffer_name, access_by_buffer)`
+detects this case via the access string pattern
+`path_c_..._abi_bank[OFFSET + i]` (no `% H` modulo). The three
+block bwd emitters now skip the zero-init when this helper returns
+True, so the existing `hidden_grad_ref += block_contribution`
+accumulator adds onto whatever the residual_rmsnorm_bwd wrote with
+`=`. Per-row scratch `*_hidden_grad` slots (used by the LATER
+bricks in the same chain, e.g. R and A consuming bridge-normalized
+hidden) keep their per-row zero-init because no earlier bwd writes
+to them in the same row iteration.
+
+This change is mathematically correct and bit-stable (no extra
+shared-memory sync, no FP order changes for `attention_out`); all
+tested suites stay green (94 + 111 + 93 + 66 + 401).
+
+### Block A (NEW): first brick of the fused region is missing its pre-block norm
+
+`_path_c_model_surfaces_from_bricks` initialises
+`context.route_hidden = initial_hidden` for the first brick. Brick
+N+1 in the chain reads `context.route_hidden = norm_{N+1}(hidden +
+delta_N)` from the inter-brick `residual_rmsnorm` bridge (which uses
+`layers.{N+1}.norm.weight` per the alias map). For brick **0** of
+the region, the M-block consumes raw `hidden` (the entry residual
+stream from the eager prefix) directly, **without** applying its
+own `layers.{first_in_region}.norm`.
+
+The eager `HybridTinyBlock.route_delta` always does
+`x = self.norm(hidden); delta = block(x); return delta`. The fused
+region therefore feeds `mamba3(hidden)` instead of
+`mamba3(norm_first(hidden))` into its first brick, so:
+
+* `local_gb10_quarter_brick_10_M_delta` is computed against a
+  ~16x-larger-magnitude input (`||hidden||` vs
+  `||norm(hidden)||`).
+* `layers.10.block.D` and `layers.10.block.in_proj.weight`
+  gradients pick up the inflated input as a multiplicative factor
+  in the bwd chain rule, yielding relative-error
+  ~10^3 — 10^4 against eager (see
+  `/tmp/path_c_blocker2_probe.py` receipts).
+* `layers.10.norm.weight` is never bound to any logical name in the
+  fused region's ABI map; the alias loop in
+  `path_c_parameter_logical_aliases` binds
+  `layers.{i+1}.norm.weight` to brick `i`'s bridge weight for
+  `i in [0, N-2]`, so `layers.{first_in_region}.norm.weight` lands
+  on the bridge BEFORE the first brick — which is in the eager
+  prefix, not in the fused region.
+
+Confirming probe (`/tmp/probe_entry_norm.py`): with deterministic
+weights and a synthetic `hidden_entry`, the eager M-block produces
+`delta_M` with `sumabs=8.18`, while the fused-equivalent
+`mamba3(hidden_entry)` (no entry norm) produces `delta_M` with
+`sumabs=0.021`. The ratio matches `1 / inv_rms ~= 19` (and propagates
+multiplicatively through subsequent layers).
+
+#### Fix layer (Block A)
+
+The right place is the TileLang surface layer (lower than the
+cppmega_mlx app code, per the constraints in this file). Two
+ladder approaches:
+
+1. **(Minimal-invasive) Add an inline entry-norm path inside the
+   first brick's fwd codegen and a matching bwd accumulator into the
+   bank `hidden_grad` slot.** Add a new real-ABI input
+   `f"{first_brick.name}_entry_rmsnorm_weight"` and have
+   `_emit_mamba3_model_brick_surfaces` consume it. The bwd accumulates
+   `inv_rms * (entry_normed_hidden_grad * weight - hidden * dot *
+   inv_rms^2 / D)` into `hidden_grad` (the bank slot we now fixed in
+   Fix B-1 to accumulate). Pros: no new op signature, no
+   `_MAMBA3_FP8_TRAIN_FWD_BWD_OP_SIGNATURE` churn, no acceptance
+   profile invalidation. Cons: ad-hoc M-block fwd/bwd changes.
+
+2. **(Structurally cleanest) Add a new `entry_rmsnorm` op-node** that
+   the surface builder prepends to the brick chain, with its own
+   fwd/bwd codegen and descriptor, and update the canonical op
+   signature `_MAMBA3_FP8_TRAIN_FWD_BWD_OP_SIGNATURE` to
+   `("entry_rmsnorm", "mamba3_mimo", "residual_rmsnorm", ...,
+   "entry_rmsnorm_bwd")`. Wire `layers.{first_in_region}.norm.weight`
+   into the alias loop as an additional candidate alias mapping to
+   `f"{first_brick.path_c_brick_name}_entry_rmsnorm_weight"`. Pros:
+   self-contained op, reuses the bridge codegen patterns. Cons:
+   requires a new descriptor, an acceptance-profile bump, and the
+   aliases mapping update.
+
+Either fix is the next-step after `26575cd`. The B6 bench gate stays
+blocked until Block A lands plus the rest of Block 2 numeric parity
+passes on `local_gb10_quarter` tiny smoke.
