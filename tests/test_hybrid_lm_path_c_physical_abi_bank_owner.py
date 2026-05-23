@@ -140,3 +140,89 @@ def test_artifact_forward_runs_end_to_end_on_real_metal(model) -> None:
     # And the artifact's forward must complete and materialise lazy work.
     artifact.forward(bank_owner=bank_owner)
     mx.eval(*bank_owner.buffers.values())
+
+
+def test_path_c_fused_in_region_parameter_bank_aliases_covers_brick_params(
+    model,
+) -> None:
+    aliases = model.path_c_fused_in_region_parameter_bank_aliases()
+    # The local_gb10_quarter tiny smoke profile generates the brick_10_M /
+    # brick_11_R / brick_12_A region. The fused suffix also covers
+    # final_norm + lm_head + per-layer residual norms. Exact count check
+    # locks the discovery surface so future region drift surfaces in tests.
+    assert len(aliases) == 27
+    expected_subset = {
+        "layers.10.block.D",
+        "layers.11.block.D",
+        "layers.12.block.q_proj.weight",
+        "norm.weight",
+        "lm_head.weight",
+    }
+    assert expected_subset.issubset(aliases.keys())
+    for name, info in aliases.items():
+        assert "logical_name" in info
+        assert "logical_grad_name" in info
+        assert info["logical_grad_name"].endswith("_grad")
+        assert info["bank"]
+        assert info["dtype"] == "float32"
+        assert isinstance(info["offset"], int)
+        assert isinstance(info["size"], int)
+        assert info["size"] > 0
+        assert isinstance(info["logical_shape"], tuple)
+
+
+def test_bind_path_c_in_region_parameter_views_into_bank_replaces_attributes(
+    model,
+) -> None:
+    bank_owner = model.make_path_c_physical_abi_bank_owner()
+    report = model.bind_path_c_in_region_parameter_views_into_bank(bank_owner)
+    assert report["status"] == "ok"
+    assert report["in_region_parameter_count"] == 27
+    assert report["skipped"] == []
+    # After binding, each in-region parameter must be backed by storage in
+    # the same bank slot. Pick a small parameter and a large one to verify
+    # the writes happened.
+    aliases = report["in_region_parameter_bank_aliases"]
+    sample_small = "layers.10.block.D"
+    sample_info = aliases[sample_small]
+    bank = bank_owner.buffers[sample_info["bank"]]
+    slot = bank[sample_info["offset"] : sample_info["offset"] + sample_info["size"]]
+    parts = sample_small.split(".")
+    holder: object = model
+    for part in parts[:-1]:
+        holder = holder[int(part)] if part.isdigit() else getattr(holder, part)
+    param_value = getattr(holder, parts[-1])
+    # Bank-resident slot equals current parameter value.
+    assert mx.allclose(slot, param_value.flatten()).item() is True
+    # And the parameter shape was preserved (logical_shape).
+    assert param_value.shape == sample_info["logical_shape"]
+
+
+def test_sync_path_c_in_region_parameters_into_bank_updates_bank_slots(
+    model,
+) -> None:
+    bank_owner = model.make_path_c_physical_abi_bank_owner()
+    aliases = model.path_c_fused_in_region_parameter_bank_aliases()
+    bank_name = "path_c_float32_abi_bank"
+    bank = bank_owner.buffers[bank_name]
+    # Pick layers.10.block.D — known to be size 4.
+    name = "layers.10.block.D"
+    info = aliases[name]
+    # Replace the model's parameter with a sentinel tensor and verify the
+    # sync writes it into the bank slot in-place (no new bank allocation).
+    sentinel = mx.array([7.0, 8.0, 9.0, 10.0], dtype=mx.float32)
+    model.layers[10].block.D = sentinel
+    bank_id_before = id(bank_owner.buffers[bank_name])
+    report = model.sync_path_c_in_region_parameters_into_bank(
+        bank_owner,
+        in_region_aliases=aliases,
+    )
+    assert report["status"] == "ok"
+    assert name in report["synced"]
+    assert report["skipped"] == []
+    # The bank object is the same Python-level object after slice assignment.
+    assert id(bank_owner.buffers[bank_name]) == bank_id_before
+    # And the slot now carries the sentinel values.
+    bank = bank_owner.buffers[bank_name]
+    slot = bank[info["offset"] : info["offset"] + info["size"]]
+    assert mx.allclose(slot, sentinel).item() is True

@@ -442,11 +442,30 @@ def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
     )
     mx.eval(loss, ntokens)
 
-    telemetry = runtime.last_fused_warmup_payload
-    assert telemetry["attempted"] is True
-    assert telemetry["completed"] is True, telemetry
-    assert telemetry["elapsed_ns"] > 0
-    assert telemetry["error"] is None
+    # The runtime exposes two complementary telemetry payloads:
+    #   * last_fused_warmup_payload is populated only in warmup mode (no bank
+    #     residency aliases were supplied);
+    #   * last_fused_value_and_grad_payload is populated in merged mode (bank
+    #     residency aliases are supplied, so the fused kernel ran via
+    #     artifact.value_and_grad and produced bank-resident gradients).
+    # When the live install path binds in-region parameter views into the
+    # bank, the runtime switches to merged mode; otherwise it stays in
+    # warmup mode. Either way the kernel must have launched and any error
+    # field must be None.
+    warmup_telemetry = runtime.last_fused_warmup_payload
+    merge_telemetry = runtime.last_fused_value_and_grad_payload
+    assert (
+        warmup_telemetry["attempted"] is True
+        or merge_telemetry["attempted"] is True
+    ), {"warmup": warmup_telemetry, "merged": merge_telemetry}
+    if warmup_telemetry["attempted"]:
+        assert warmup_telemetry["completed"] is True, warmup_telemetry
+        assert warmup_telemetry["elapsed_ns"] > 0
+        assert warmup_telemetry["error"] is None
+    if merge_telemetry["attempted"]:
+        assert merge_telemetry["completed"] is True, merge_telemetry
+        assert merge_telemetry["elapsed_ns"] > 0
+        assert merge_telemetry["error"] is None
 
     # Loss/ntokens come from the eager closure; gradient tree must contain
     # parameters that the artifact does NOT cover (proving the eager bridge
@@ -454,3 +473,269 @@ def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
     flat = dict(tree_flatten(grads))
     assert "layers.0.block.q_proj.weight" in flat  # outside fused region
 
+
+
+# ---------------------------------------------------------------------------
+# Merged-grad mode: bank-residency-aware artifact + sync callable
+# ---------------------------------------------------------------------------
+
+
+class _FakeFusedArtifactWithBankResidentGrads:
+    """Bank-aware fake that returns mx.array views as grads for in-region params."""
+
+    def __init__(self) -> None:
+        self.value_and_grad_calls: list[Mapping[str, Any]] = []
+        self.forward_calls: list[Mapping[str, Any]] = []
+        self.bank_grads: dict[str, mx.array] = {}
+        self.inner_contract: dict[str, Any] = {
+            "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
+            "owner": "CompiledPretrainingStep",
+            "uses_fused_train_block_runtime": True,
+            "uses_forward_hook": True,
+            "uses_backward_or_vjp_hook": True,
+            "returns_model_grads": True,
+            "returns_full_model_grads": False,
+            "gradient_scope": "selected_train_block",
+            "covered_parameter_count": 2,
+            "trainable_parameter_count": 4,
+            "missing_parameter_count": 2,
+            "sample_missing_parameter_names": [
+                "layers.0.block.q_proj.weight",
+                "lm_head.weight",
+            ],
+            "full_model_gradient_tree_ready": False,
+            "full_model_gradient_coverage": {
+                "full_model_gradient_tree_ready": False,
+                "reason": "stub",
+                "gradient_scope": "selected_train_block",
+                "selected_region": {"name": "fake"},
+                "covered_parameter_names": [
+                    "layers.10.block.D",
+                    "layers.11.block.D",
+                ],
+                "missing_parameter_names": [],
+                "covered_parameter_count": 2,
+                "trainable_parameter_count": 4,
+                "missing_parameter_count": 0,
+            },
+            "loss_cotangent_bridge_ready": True,
+            "model_gradient_tree_ready": True,
+            "delegates_to_eager_loss_and_grad": False,
+            "hidden_packing_performed": False,
+        }
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.forward(*args, **kwargs)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        self.forward_calls.append({"args": args, "kwargs": dict(kwargs)})
+
+    def backward(self, *args: Any, **kwargs: Any) -> Any:
+        return "backward"
+
+    def vjp(self, *args: Any, **kwargs: Any) -> Any:
+        return "vjp"
+
+    def value_and_grad(self, *args: Any, **kwargs: Any) -> Any:
+        self.value_and_grad_calls.append(
+            {"args": args, "kwargs": dict(kwargs)}
+        )
+        # Return synthesised bank-resident grads (the runtime should overlay
+        # these onto the eager grad tree for the in-region parameters).
+        return (
+            (mx.array(0.5, dtype=mx.float32), mx.array(8, dtype=mx.uint32)),
+            dict(self.bank_grads),
+        )
+
+    def value_and_grad_contract(self) -> Mapping[str, Any]:
+        return self.inner_contract
+
+
+class _FakeBankOwner:
+    def __init__(self) -> None:
+        self.buffers: dict[str, mx.array] = {
+            "f32": mx.zeros((32,), dtype=mx.float32),
+        }
+
+
+def test_merged_mode_overlays_bank_resident_grads_onto_eager_tree() -> None:
+    art = _FakeFusedArtifactWithBankResidentGrads()
+    # Two in-region params, each with a unique sentinel grad value the runtime
+    # must surface to the trainer (replacing whatever the eager closure
+    # produced for the same key).
+    fused_grad_10 = mx.array([1.0, 2.0, 3.0, 4.0], dtype=mx.float32)
+    fused_grad_11 = mx.array([5.0, 6.0, 7.0, 8.0], dtype=mx.float32)
+    art.bank_grads = {
+        "layers.10.block.D": fused_grad_10,
+        "layers.11.block.D": fused_grad_11,
+    }
+    bank_owner = _FakeBankOwner()
+    sync_calls: list[None] = []
+
+    def sync_callable() -> Mapping[str, Any]:
+        sync_calls.append(None)
+        return {"status": "ok", "synced": ["x"], "skipped": []}
+
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=bank_owner,
+        owner_name="merged",
+        in_region_parameter_bank_aliases={
+            "layers.10.block.D": {
+                "logical_name": "brick_10_M_D",
+                "logical_grad_name": "brick_10_M_D_grad",
+                "bank": "f32",
+                "dtype": "float32",
+                "offset": 0,
+                "size": 4,
+                "logical_shape": (4,),
+            },
+            "layers.11.block.D": {
+                "logical_name": "brick_11_R_D",
+                "logical_grad_name": "brick_11_R_D_grad",
+                "bank": "f32",
+                "dtype": "float32",
+                "offset": 4,
+                "size": 4,
+                "logical_shape": (4,),
+            },
+        },
+        model_bank_sync_callable=sync_callable,
+    )
+
+    eager_grad_10 = mx.array([99.0, 99.0, 99.0, 99.0], dtype=mx.float32)
+    eager_grad_11 = mx.array([99.0, 99.0, 99.0, 99.0], dtype=mx.float32)
+    eager_q_proj = mx.zeros((16, 16), dtype=mx.float32)
+    eager_lm_head = mx.zeros((256, 16), dtype=mx.float32)
+
+    def closure(model: Any, batch: Mapping[str, Any]) -> Any:
+        return (
+            (mx.array(0.0), mx.array(1, dtype=mx.uint32)),
+            {
+                "layers.10.block.D": eager_grad_10,
+                "layers.11.block.D": eager_grad_11,
+                "layers.0.block.q_proj.weight": eager_q_proj,
+                "lm_head.weight": eager_lm_head,
+            },
+        )
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model="m",  # type: ignore[arg-type]
+        batch={},
+        loss_and_grad=closure,
+    )
+    # Sync callable was invoked exactly once.
+    assert len(sync_calls) == 1
+    # The fused artifact value_and_grad was invoked with bank_owner threaded in.
+    assert len(art.value_and_grad_calls) == 1
+    assert (
+        art.value_and_grad_calls[-1]["kwargs"].get("bank_owner") is bank_owner
+    )
+    # In-region grads now come from the fused tree (sentinel values), not the
+    # eager closure (which produced 99s).
+    flat_grads = dict(tree_flatten(grads))
+    assert flat_grads["layers.10.block.D"].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert flat_grads["layers.11.block.D"].tolist() == [5.0, 6.0, 7.0, 8.0]
+    # Out-of-region grads are unchanged (eager wins).
+    assert flat_grads["layers.0.block.q_proj.weight"].shape == (16, 16)
+    assert flat_grads["lm_head.weight"].shape == (256, 16)
+    # Telemetry reflects merged-mode behaviour.
+    assert runtime.last_fused_warmup_payload["attempted"] is False
+    vg = runtime.last_fused_value_and_grad_payload
+    assert vg["attempted"] is True
+    assert vg["completed"] is True
+    assert vg["elapsed_ns"] >= 0
+    assert vg["merged_parameter_count"] == 2
+    assert vg["merged_parameter_names"] == (
+        "layers.10.block.D",
+        "layers.11.block.D",
+    )
+    assert vg["missing_parameter_names"] == ()
+    assert vg["bank_sync_status"] == {"status": "ok", "synced": ["x"], "skipped": []}
+
+
+def test_merged_mode_records_missing_bank_grads_without_dropping_coverage() -> None:
+    """If the fused tree is missing a bank-bound parameter, the merger keeps
+    the eager grad in place and records the missing parameter for telemetry."""
+
+    art = _FakeFusedArtifactWithBankResidentGrads()
+    # Only one of the two in-region params has a bank-resident grad.
+    art.bank_grads = {
+        "layers.10.block.D": mx.array([1.0, 2.0, 3.0, 4.0], dtype=mx.float32),
+    }
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=_FakeBankOwner(),
+        owner_name="merged",
+        in_region_parameter_bank_aliases={
+            "layers.10.block.D": {"logical_name": "x", "logical_grad_name": "x_grad", "bank": "f32", "dtype": "float32", "offset": 0, "size": 4, "logical_shape": (4,)},
+            "layers.11.block.D": {"logical_name": "y", "logical_grad_name": "y_grad", "bank": "f32", "dtype": "float32", "offset": 4, "size": 4, "logical_shape": (4,)},
+        },
+    )
+    eager_grad_11 = mx.array([42.0, 42.0, 42.0, 42.0], dtype=mx.float32)
+
+    def closure(model: Any, batch: Mapping[str, Any]) -> Any:
+        return (
+            (mx.array(0.0), mx.array(1, dtype=mx.uint32)),
+            {
+                "layers.10.block.D": mx.zeros((4,)),
+                "layers.11.block.D": eager_grad_11,
+            },
+        )
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model="m",  # type: ignore[arg-type]
+        batch={},
+        loss_and_grad=closure,
+    )
+    flat_grads = dict(tree_flatten(grads))
+    # Bank-resident grad replaced the eager one.
+    assert flat_grads["layers.10.block.D"].tolist() == [1.0, 2.0, 3.0, 4.0]
+    # Missing-from-fused grad kept the eager value.
+    assert flat_grads["layers.11.block.D"].tolist() == [42.0, 42.0, 42.0, 42.0]
+    vg = runtime.last_fused_value_and_grad_payload
+    assert vg["merged_parameter_count"] == 1
+    assert vg["merged_parameter_names"] == ("layers.10.block.D",)
+    assert vg["missing_parameter_names"] == ("layers.11.block.D",)
+
+
+def test_merged_mode_contract_exposes_bank_residency_signals() -> None:
+    art = _FakeFusedArtifactWithBankResidentGrads()
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=_FakeBankOwner(),
+        owner_name="merged",
+        in_region_parameter_bank_aliases={
+            "layers.10.block.D": {"logical_name": "x", "logical_grad_name": "x_grad", "bank": "f32", "dtype": "float32", "offset": 0, "size": 4, "logical_shape": (4,)},
+            "layers.11.block.D": {"logical_name": "y", "logical_grad_name": "y_grad", "bank": "f32", "dtype": "float32", "offset": 4, "size": 4, "logical_shape": (4,)},
+        },
+    )
+    contract = runtime.value_and_grad_contract()
+    assert contract["parameter_bank_residency_active"] is True
+    assert contract["merged_bank_resident_parameter_count"] == 2
+    coverage = contract["full_model_gradient_coverage"]
+    assert coverage["parameter_bank_residency_active"] is True
+    assert coverage["merged_bank_resident_parameter_count"] == 2
+    assert coverage["merged_bank_resident_parameter_names"] == (
+        "layers.10.block.D",
+        "layers.11.block.D",
+    )
+    # Reason includes the merged-mode phrasing.
+    assert "bank-resident" in coverage["reason"]
+
+
+def test_warmup_mode_contract_clears_bank_residency_signals() -> None:
+    art = _FakeFusedArtifact()
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=_FakeBankOwner(),
+        owner_name="warmup",
+        in_region_parameter_names=("a", "b"),
+    )
+    contract = runtime.value_and_grad_contract()
+    assert contract["parameter_bank_residency_active"] is False
+    assert contract["merged_bank_resident_parameter_count"] == 0
+    coverage = contract["full_model_gradient_coverage"]
+    assert coverage["parameter_bank_residency_active"] is False
+    assert coverage["merged_bank_resident_parameter_count"] == 0
+    assert coverage["merged_bank_resident_parameter_names"] == ()

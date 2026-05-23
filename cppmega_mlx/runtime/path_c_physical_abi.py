@@ -558,6 +558,98 @@ def physical_abi_full_runtime_kernel_args(
     return tuple(provided[name] for name in kernel_buffer_order)
 
 
+
+def logical_bank_view(
+    abi_map: Mapping[str, Any],
+    bank_buffers: Mapping[str, Any],
+    logical_name: str,
+) -> Any:
+    """Return a bank-resident view of ``logical_name`` as an ``mx.array``.
+
+    The view is a single slice of the appropriate bank, reshaped to the
+    logical_shape attribute of the ABI map entry. The function performs no
+    allocation, no cast, and no copy; if the logical name is not in the ABI
+    map or the bank buffer is missing, a ``ValueError`` is raised.
+    """
+
+    info = abi_map.get(logical_name)
+    if not isinstance(info, Mapping):
+        raise ValueError(
+            f"logical buffer is not in physical ABI: {logical_name!r}"
+        )
+    bank_name = str(info.get("bank", ""))
+    if bank_name not in bank_buffers:
+        raise ValueError(f"bank buffer is not bound: {bank_name!r}")
+    bank = bank_buffers[bank_name]
+    if not hasattr(bank, "__getitem__"):
+        raise TypeError(f"bank buffer {bank_name!r} is not subscriptable")
+    offset = int(info.get("offset", 0) or 0)
+    size = int(info.get("size", 1) or 1)
+    view = bank[offset : offset + size]
+    logical_shape = tuple(
+        int(dim)
+        for dim in tuple(info.get("logical_shape", info.get("shape", (size,))))
+    )
+    if logical_shape and tuple(int(dim) for dim in tuple(view.shape)) != logical_shape:
+        reshape = getattr(view.__class__, "reshape", None)
+        if reshape is None:
+            try:
+                import mlx.core as mx  # local import to keep optional
+
+                view = mx.reshape(view, logical_shape)
+            except Exception as exc:
+                raise TypeError(
+                    f"bank view for {logical_name!r} cannot be reshaped to "
+                    f"{logical_shape}"
+                ) from exc
+        else:
+            view = view.reshape(logical_shape)
+    return view
+
+
+def write_into_bank_slot(
+    abi_map: Mapping[str, Any],
+    bank_buffers: Mapping[str, Any],
+    logical_name: str,
+    value: Any,
+) -> None:
+    """Write ``value`` into the bank slot for ``logical_name`` in place.
+
+    Both ``value.shape`` and the logical_shape of the ABI entry are honored:
+    the value is flattened to the 1-D slice slot. This is the explicit,
+    caller-visible bridge from a parameter tensor to its bank slot; the
+    function performs one slice-assignment into a pre-allocated bank buffer
+    and never allocates a new bank.
+    """
+
+    info = abi_map.get(logical_name)
+    if not isinstance(info, Mapping):
+        raise ValueError(
+            f"logical buffer is not in physical ABI: {logical_name!r}"
+        )
+    bank_name = str(info.get("bank", ""))
+    if bank_name not in bank_buffers:
+        raise ValueError(f"bank buffer is not bound: {bank_name!r}")
+    bank = bank_buffers[bank_name]
+    offset = int(info.get("offset", 0) or 0)
+    size = int(info.get("size", 1) or 1)
+    # Flatten the value into a 1-D array of length ``size``.
+    expected_size = int(prod(tuple(int(dim) for dim in tuple(getattr(value, "shape", ())))))
+    if expected_size != size:
+        raise ValueError(
+            f"value for {logical_name!r} has size {expected_size}, "
+            f"expected {size}"
+        )
+    try:
+        import mlx.core as mx  # local import to keep optional
+    except ImportError as exc:
+        raise TypeError(
+            "write_into_bank_slot requires mlx.core for slice assignment"
+        ) from exc
+    flat = mx.reshape(value, (size,))
+    bank[offset : offset + size] = flat
+
+
 __all__ = [
     "PathCPhysicalAbiBinding",
     "PathCPhysicalAbiBankOwner",
@@ -568,7 +660,9 @@ __all__ = [
     "normalize_physical_abi_map",
     "physical_abi_bank_specs",
     "physical_abi_full_runtime_kernel_args",
+    "logical_bank_view",
     "physical_abi_runtime_kernel_args",
+    "write_into_bank_slot",
     "plan_physical_abi_runtime_bridge",
     "validate_physical_abi_map",
     "validate_physical_abi_runtime_bindings",

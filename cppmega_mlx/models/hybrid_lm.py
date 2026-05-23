@@ -46,7 +46,9 @@ from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
 from cppmega_mlx.runtime.path_c_physical_abi import (
     PathCLogicalBufferOwner,
     PathCPhysicalAbiBankOwner,
+    logical_bank_view,
     make_physical_abi_bank_owner,
+    write_into_bank_slot,
 )
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
 from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
@@ -1199,6 +1201,330 @@ class HybridTinyLM(nn.Module):
             abi_shapes,
             bank_buffers,
         )
+
+    def path_c_fused_in_region_parameter_bank_aliases(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return a parameter-name → bank-binding map for in-region trainables.
+
+        For every MLX trainable parameter that maps onto a logical buffer in
+        the generated fused-train-block PrimFunc AND has a matching ``*_grad``
+        slot in the same physical ABI map, this method returns a dict whose
+        values describe the bank residency for the parameter::
+
+            {
+                "logical_name": <logical name actually placed in the bank>,
+                "logical_grad_name": <matching *_grad logical name>,
+                "bank": <bank buffer name>,
+                "dtype": <bank dtype>,
+                "offset": <int>,
+                "size": <int>,
+                "logical_shape": tuple[int, ...],
+            }
+
+        Only parameters that are *both* bank-resident and gradient-producing
+        are returned; parameters whose logical name lives in the bank but has
+        no ``*_grad`` slot (for example pure inputs) are skipped.
+        """
+
+        prim_func = self.path_c_fused_train_block_prim_func(
+            sequence_length=sequence_length,
+        )
+        if prim_func is None:
+            return {}
+        abi_map = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        if not abi_map:
+            return {}
+        grad_logical_names = frozenset(
+            name for name in abi_map if name.endswith("_grad")
+        )
+        aliases = self.path_c_parameter_logical_aliases()
+        out: dict[str, dict[str, Any]] = {}
+        for parameter_name, logical_candidates in aliases.items():
+            for logical_name in logical_candidates:
+                grad_name = f"{logical_name}_grad"
+                if logical_name not in abi_map:
+                    continue
+                if grad_name not in grad_logical_names:
+                    continue
+                info = abi_map[logical_name]
+                if not isinstance(info, Mapping):
+                    continue
+                out[parameter_name] = {
+                    "logical_name": str(logical_name),
+                    "logical_grad_name": str(grad_name),
+                    "bank": str(info.get("bank", "")),
+                    "dtype": str(info.get("dtype", "")),
+                    "offset": int(info.get("offset", 0) or 0),
+                    "size": int(info.get("size", 1) or 1),
+                    "logical_shape": tuple(
+                        int(dim)
+                        for dim in tuple(
+                            info.get("logical_shape", info.get("shape", ()))
+                        )
+                    ),
+                }
+                break
+        return out
+
+    def _path_c_lookup_parameter_holder(
+        self,
+        parameter_name: str,
+    ) -> tuple[Any, str]:
+        """Walk dotted attribute path; return (holder, leaf_attr_name)."""
+
+        parts = parameter_name.split(".")
+        if not parts:
+            raise ValueError("parameter_name must be non-empty")
+        holder: Any = self
+        for part in parts[:-1]:
+            if part.isdigit() and isinstance(holder, (list, tuple)):
+                holder = holder[int(part)]
+                continue
+            inner = getattr(holder, part, None)
+            if inner is None and isinstance(holder, Mapping):
+                inner = holder[part]
+            if inner is None:
+                raise AttributeError(
+                    f"path_c_bank residency cannot resolve {parameter_name!r} "
+                    f"at {part!r}"
+                )
+            holder = inner
+        return holder, parts[-1]
+
+    def _path_c_get_parameter_tensor(
+        self,
+        parameter_name: str,
+    ) -> mx.array | None:
+        try:
+            holder, leaf = self._path_c_lookup_parameter_holder(parameter_name)
+        except AttributeError:
+            return None
+        value = getattr(holder, leaf, None)
+        if not isinstance(value, mx.array):
+            return None
+        return value
+
+    def _path_c_set_parameter_tensor(
+        self,
+        parameter_name: str,
+        value: mx.array,
+    ) -> None:
+        holder, leaf = self._path_c_lookup_parameter_holder(parameter_name)
+        setattr(holder, leaf, value)
+
+    def sync_path_c_in_region_parameters_into_bank(
+        self,
+        bank_owner: Any,
+        *,
+        in_region_aliases: Mapping[str, Mapping[str, Any]] | None = None,
+        sequence_length: int | None = None,
+    ) -> dict[str, Any]:
+        """Copy current model param values into pre-allocated bank slots.
+
+        This is the explicit caller-visible bridge from the MLX parameter tree
+        to the model-owned physical-ABI bank slots. It is invoked once per
+        training step (typically immediately before launching the fused
+        kernel) so optimizer-replaced parameter tensors propagate into the
+        bank without any hidden allocation. The bank itself is mutated in
+        place via slice assignment; no new bank is created.
+
+        Returns a report describing how many parameters were synced and how
+        many were skipped (and why).
+        """
+
+        if bank_owner is None:
+            return {
+                "status": "skipped",
+                "reason": "bank_owner is None",
+                "synced": [],
+                "skipped": [],
+            }
+        buffers = bank_owner if isinstance(bank_owner, Mapping) else None
+        if buffers is None:
+            buffers = getattr(bank_owner, "buffers", None)
+        if not isinstance(buffers, Mapping):
+            return {
+                "status": "blocked",
+                "reason": "bank_owner has no buffers mapping",
+                "synced": [],
+                "skipped": [],
+            }
+        aliases = (
+            in_region_aliases
+            if in_region_aliases is not None
+            else self.path_c_fused_in_region_parameter_bank_aliases(
+                sequence_length=sequence_length,
+            )
+        )
+        if not aliases:
+            return {
+                "status": "noop",
+                "reason": "no in-region parameter bank aliases",
+                "synced": [],
+                "skipped": [],
+            }
+        prim_func = self.path_c_fused_train_block_prim_func(
+            sequence_length=sequence_length,
+        )
+        abi_map = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        synced: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        for parameter_name, info in sorted(aliases.items()):
+            tensor = self._path_c_get_parameter_tensor(parameter_name)
+            if tensor is None:
+                skipped.append((parameter_name, "parameter_not_in_model_tree"))
+                continue
+            logical_name = str(info.get("logical_name", ""))
+            try:
+                write_into_bank_slot(
+                    abi_map,
+                    buffers,
+                    logical_name,
+                    tensor,
+                )
+                synced.append(parameter_name)
+            except Exception as exc:
+                skipped.append(
+                    (parameter_name, f"{type(exc).__name__}: {exc}")
+                )
+        return {
+            "status": "ok" if synced and not skipped else (
+                "partial" if synced else "blocked"
+            ),
+            "reason": (
+                "in-region parameters synced into bank slots"
+                if synced and not skipped
+                else (
+                    "some in-region parameters could not be synced"
+                    if synced
+                    else "no in-region parameter was synced"
+                )
+            ),
+            "synced": synced,
+            "skipped": [
+                {"parameter_name": name, "reason": reason}
+                for name, reason in skipped
+            ],
+        }
+
+    def bind_path_c_in_region_parameter_views_into_bank(
+        self,
+        bank_owner: Any,
+        *,
+        sequence_length: int | None = None,
+    ) -> dict[str, Any]:
+        """Bind in-region trainable parameters as zero-copy views into the bank.
+
+        For every parameter discovered by
+        :py:meth:`path_c_fused_in_region_parameter_bank_aliases`, this method:
+
+        1. Writes the current parameter value into its bank slot (initial sync).
+        2. Replaces the parameter attribute on the model's submodule with a
+           bank-resident view (a slice of the bank reshaped to the logical
+           shape). The view is the same MLX array that the fused kernel
+           reads / writes, so subsequent ``model.trainable_parameters()``
+           reports the view and downstream eager autograd sees the same
+           storage backing.
+
+        After ``optimizer.update(model, grads)`` replaces the parameter
+        attribute with a fresh tensor, call
+        :py:meth:`sync_path_c_in_region_parameters_into_bank` before the next
+        forward pass so the new value lands in the bank again. The bank
+        itself is mutated in place via slice assignment; no copy of the
+        full bank ever happens.
+
+        Returns a report mirroring
+        :py:meth:`sync_path_c_in_region_parameters_into_bank` plus a
+        ``bound`` list of parameters now backed by bank views.
+        """
+
+        if bank_owner is None:
+            return {
+                "status": "skipped",
+                "reason": "bank_owner is None",
+                "bound": [],
+                "skipped": [],
+                "in_region_parameter_count": 0,
+            }
+        buffers = bank_owner if isinstance(bank_owner, Mapping) else None
+        if buffers is None:
+            buffers = getattr(bank_owner, "buffers", None)
+        if not isinstance(buffers, Mapping):
+            return {
+                "status": "blocked",
+                "reason": "bank_owner has no buffers mapping",
+                "bound": [],
+                "skipped": [],
+                "in_region_parameter_count": 0,
+            }
+        aliases = self.path_c_fused_in_region_parameter_bank_aliases(
+            sequence_length=sequence_length,
+        )
+        if not aliases:
+            return {
+                "status": "noop",
+                "reason": "no in-region parameter bank aliases",
+                "bound": [],
+                "skipped": [],
+                "in_region_parameter_count": 0,
+            }
+        prim_func = self.path_c_fused_train_block_prim_func(
+            sequence_length=sequence_length,
+        )
+        abi_map = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        bound: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        for parameter_name, info in sorted(aliases.items()):
+            tensor = self._path_c_get_parameter_tensor(parameter_name)
+            if tensor is None:
+                skipped.append((parameter_name, "parameter_not_in_model_tree"))
+                continue
+            logical_name = str(info.get("logical_name", ""))
+            try:
+                write_into_bank_slot(abi_map, buffers, logical_name, tensor)
+                view = logical_bank_view(abi_map, buffers, logical_name)
+                self._path_c_set_parameter_tensor(parameter_name, view)
+                bound.append(parameter_name)
+            except Exception as exc:
+                skipped.append(
+                    (parameter_name, f"{type(exc).__name__}: {exc}")
+                )
+        self._path_c_in_region_parameter_bank_aliases = dict(aliases)
+        self._path_c_in_region_parameter_bound_names = tuple(sorted(bound))
+        return {
+            "status": "ok" if bound and not skipped else (
+                "partial" if bound else "blocked"
+            ),
+            "reason": (
+                "in-region parameters bound as bank views"
+                if bound and not skipped
+                else (
+                    "some in-region parameters could not be bank-bound"
+                    if bound
+                    else "no in-region parameter was bank-bound"
+                )
+            ),
+            "bound": bound,
+            "skipped": [
+                {"parameter_name": name, "reason": reason}
+                for name, reason in skipped
+            ],
+            "in_region_parameter_count": len(bound),
+            "in_region_parameter_names": tuple(sorted(bound)),
+            "in_region_parameter_bank_aliases": dict(aliases),
+        }
 
     def __call__(
         self,

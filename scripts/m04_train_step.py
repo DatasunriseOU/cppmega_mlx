@@ -25,7 +25,7 @@ import tempfile
 import time
 import traceback
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import numpy as np
 
@@ -3061,6 +3061,8 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
     artifact: Any,
     bank_owner: Any,
     runtime_owner: str,
+    model: Any | None = None,
+    sequence_length: int | None = None,
 ) -> Any | None:
     """Build the training runtime that owns m04's fused Path C train step.
 
@@ -3074,10 +3076,24 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
     artifact and bank owner, and routes value_and_grad through the
     trainer-supplied eager closure for residual parameters. It surfaces a
     closed full-model gradient contract so the gate flips to 'ok' without
-    monkeypatching or hidden allocation. When the artifact already returns
-    full-coverage grads (no in-region gaps), the strict runtime is used
-    instead so the artifact retains exclusive ownership of training
-    execution.
+    monkeypatching or hidden allocation.
+
+    When ``model`` is provided and exposes the parameter-bank residency
+    surface (``bind_path_c_in_region_parameter_views_into_bank`` plus
+    ``sync_path_c_in_region_parameters_into_bank``), this function also
+    binds the in-region trainable parameters as zero-copy views into the
+    model-owned bank and passes the alias map plus a per-step sync
+    callable into the runtime. That activates merged-gradient mode: the
+    fused artifact populates bank-resident gradient slots, the eager
+    closure runs for the residual parameters, and the runtime returns one
+    merged gradient tree backed by the same bank storage the kernel reads
+    and writes. When the model lacks the bank-residency surface, the
+    runtime falls back to warmup-only mode and the eager closure remains
+    the source of every gradient.
+
+    When the artifact already returns full-coverage grads (no in-region
+    gaps), the strict runtime is used instead so the artifact retains
+    exclusive ownership of training execution.
     """
     if not _path_c_fused_train_block_artifact_has_training_runtime_contract(
         artifact
@@ -3101,6 +3117,117 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
             )
         )
     )
+    in_region_aliases: dict[str, dict[str, Any]] | None = None
+    sync_callable: Callable[[], Mapping[str, Any]] | None = None
+    bind_report: dict[str, Any] | None = None
+    if model is not None and bank_owner is not None:
+        binder = getattr(
+            model,
+            "bind_path_c_in_region_parameter_views_into_bank",
+            None,
+        )
+        sync_fn = getattr(
+            model,
+            "sync_path_c_in_region_parameters_into_bank",
+            None,
+        )
+        alias_fn = getattr(
+            model,
+            "path_c_fused_in_region_parameter_bank_aliases",
+            None,
+        )
+        if (
+            callable(binder)
+            and callable(sync_fn)
+            and callable(alias_fn)
+        ):
+            try:
+                raw_bind_report = binder(
+                    bank_owner, sequence_length=sequence_length
+                )
+            except Exception as exc:
+                raw_bind_report = {
+                    "status": "error",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "bound": [],
+                    "skipped": [],
+                    "in_region_parameter_count": 0,
+                }
+            if isinstance(raw_bind_report, Mapping):
+                bind_report = {
+                    str(key): value for key, value in raw_bind_report.items()
+                }
+            else:
+                bind_report = None
+            if (
+                bind_report is not None
+                and bind_report.get("status") in {"ok", "partial"}
+            ):
+                raw_aliases = bind_report.get(
+                    "in_region_parameter_bank_aliases", {}
+                ) or {}
+                if isinstance(raw_aliases, Mapping):
+                    in_region_aliases = {
+                        str(name): (
+                            {str(k): v for k, v in dict(info).items()}
+                            if isinstance(info, Mapping)
+                            else {}
+                        )
+                        for name, info in raw_aliases.items()
+                    }
+                else:
+                    in_region_aliases = {}
+                if not in_region_aliases:
+                    # Refresh from the model if the bind report did not carry it.
+                    try:
+                        raw_aliases = alias_fn(
+                            sequence_length=sequence_length
+                        )
+                    except Exception:
+                        raw_aliases = None
+                    if isinstance(raw_aliases, Mapping):
+                        in_region_aliases = {
+                            str(name): (
+                                {str(k): v for k, v in dict(info).items()}
+                                if isinstance(info, Mapping)
+                                else {}
+                            )
+                            for name, info in raw_aliases.items()
+                        }
+                if in_region_aliases:
+                    raw_bound = bind_report.get("bound", ()) or ()
+                    bound_names = tuple(
+                        sorted(
+                            str(name) for name in cast(
+                                Sequence[Any], raw_bound
+                            )
+                        )
+                    )
+                    if bound_names:
+                        in_region_names = bound_names
+
+                    aliases_for_sync = in_region_aliases
+
+                    def _sync() -> Mapping[str, Any]:
+                        report = sync_fn(
+                            bank_owner,
+                            in_region_aliases=aliases_for_sync,
+                            sequence_length=sequence_length,
+                        )
+                        if isinstance(report, Mapping):
+                            return cast(Mapping[str, Any], report)
+                        return {
+                            "status": "ok",
+                            "reason": (
+                                "sync callable returned non-mapping value"
+                            ),
+                            "synced": [],
+                            "skipped": [],
+                        }
+
+                    sync_callable = _sync
+                else:
+                    in_region_aliases = None
     try:
         if returns_full:
             return PathCFusedTrainBlockTrainingRuntime(
@@ -3108,12 +3235,17 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
                 bank_owner=bank_owner,
                 owner_name=runtime_owner,
             )
-        return PathCFusedPlusEagerTrainingRuntime(
+        runtime = PathCFusedPlusEagerTrainingRuntime(
             artifact=artifact,
             bank_owner=bank_owner,
             owner_name=runtime_owner,
             in_region_parameter_names=in_region_names,
+            in_region_parameter_bank_aliases=in_region_aliases,
+            model_bank_sync_callable=sync_callable,
         )
+        if bind_report is not None:
+            runtime.last_parameter_bank_bind_report = dict(bind_report)
+        return runtime
     except TypeError:
         return None
 
@@ -4038,6 +4170,8 @@ def install_path_c_fused_train_block_runtime_for_model(
                 artifact=resolved_artifact,
                 bank_owner=resolved_bank_owner,
                 runtime_owner=runtime_owner,
+                model=model,
+                sequence_length=sequence_length,
             )
         )
 

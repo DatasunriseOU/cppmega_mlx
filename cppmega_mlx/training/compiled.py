@@ -484,6 +484,8 @@ class PathCFusedPlusEagerTrainingRuntime:
         bank_owner: Any,
         owner_name: str,
         in_region_parameter_names: Sequence[str] | None = None,
+        in_region_parameter_bank_aliases: Mapping[str, Mapping[str, Any]] | None = None,
+        model_bank_sync_callable: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         if not callable(artifact):
             raise TypeError("fused train-block artifact must be callable")
@@ -506,6 +508,24 @@ class PathCFusedPlusEagerTrainingRuntime:
         self.in_region_parameter_names: frozenset[str] = frozenset(
             str(name) for name in (in_region_parameter_names or ())
         )
+        self.in_region_parameter_bank_aliases: dict[str, dict[str, Any]] = {
+            str(name): {str(k): v for k, v in dict(info).items()}
+            for name, info in (in_region_parameter_bank_aliases or {}).items()
+        }
+        if self.in_region_parameter_bank_aliases:
+            # If aliases are supplied, the parameter-name set must agree.
+            alias_names = frozenset(self.in_region_parameter_bank_aliases.keys())
+            if self.in_region_parameter_names and (
+                self.in_region_parameter_names != alias_names
+            ):
+                raise ValueError(
+                    "in_region_parameter_names and "
+                    "in_region_parameter_bank_aliases name sets disagree"
+                )
+            self.in_region_parameter_names = alias_names
+        self.model_bank_sync_callable = (
+            model_bank_sync_callable if callable(model_bank_sync_callable) else None
+        )
         self._binding: dict[str, Any] | None = None
         self.last_fused_warmup_payload: dict[str, Any] = {
             "attempted": False,
@@ -513,6 +533,17 @@ class PathCFusedPlusEagerTrainingRuntime:
             "elapsed_ns": 0,
             "error": None,
         }
+        self.last_fused_value_and_grad_payload: dict[str, Any] = {
+            "attempted": False,
+            "completed": False,
+            "elapsed_ns": 0,
+            "merged_parameter_count": 0,
+            "merged_parameter_names": (),
+            "missing_parameter_names": (),
+            "bank_sync_status": None,
+            "error": None,
+        }
+        self.last_parameter_bank_bind_report: dict[str, Any] | None = None
 
     def _with_bank_owner(self, kwargs: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(kwargs)
@@ -534,59 +565,169 @@ class PathCFusedPlusEagerTrainingRuntime:
             return vjp(*args, **self._with_bank_owner(kwargs))
         return self.backward(*args, **kwargs)
 
+    def _merge_fused_grads_into_eager(
+        self,
+        eager_grads: Any,
+        fused_grads: Any,
+    ) -> tuple[Any, tuple[str, ...], tuple[str, ...]]:
+        """Replace in-region grad entries in the eager tree with bank views.
+
+        For every parameter in ``in_region_parameter_bank_aliases``, the
+        bank-resident gradient view from ``fused_grads`` overwrites the
+        corresponding entry in the eager gradient tree. Parameters that
+        the fused tree does not carry (missing) are reported in the return
+        tuple so the caller can record them without silently dropping
+        gradient coverage.
+        """
+
+        if not self.in_region_parameter_bank_aliases:
+            return eager_grads, (), ()
+        flat_eager = dict(tree_flatten(eager_grads))
+        flat_fused = dict(tree_flatten(fused_grads))
+        merged_names: list[str] = []
+        missing_names: list[str] = []
+        for parameter_name in sorted(self.in_region_parameter_bank_aliases):
+            fused_value = flat_fused.get(parameter_name)
+            if not isinstance(fused_value, mx.array):
+                missing_names.append(parameter_name)
+                continue
+            flat_eager[parameter_name] = fused_value
+            merged_names.append(parameter_name)
+        merged_grads = tree_unflatten(sorted(flat_eager.items()))
+        return merged_grads, tuple(merged_names), tuple(missing_names)
+
     def value_and_grad(
         self,
         model: nn.Module,
         batch: Mapping[str, mx.array],
         loss_and_grad: Any,
     ) -> tuple[tuple[mx.array, mx.array], Any]:
-        """Run the eager closure for full-model grads, with fused warmup.
+        """Run merged fused + eager value_and_grad with bank residency.
 
-        The runtime takes ownership of the training step (so the trainer
-        routes through it) and uses the trainer-supplied eager loss_and_grad
-        closure to compute the full-model gradient tree. In parallel, it
-        also runs the fused TileLang artifact's ``forward(bank_owner=...)``
-        so the JIT-compiled kernel actually executes on every training step
-        — the JIT cache stays warm, the Metal command queue gets pipelined
-        work, and downstream observability (matrix receipts, GUI) can
-        measure the kernel's wall-clock cost. The artifact's grad outputs
-        are NOT yet merged into the returned grad tree because the model
-        parameters are still independent tensors rather than views into
-        the physical ABI banks; closing that gap is a separate change
-        (parameter bank-residency) and must not be faked with hidden
-        copies.
+        Behaviour depends on whether the runtime was constructed with
+        ``in_region_parameter_bank_aliases``:
 
-        Per-step warmup telemetry lands in
-        ``self.last_fused_warmup_payload`` so receipt scripts can read it
-        without reaching into private state.
+        * **Merged mode (aliases set)** — sync in-region parameter tensors
+          back into the model-owned physical-ABI bank slots, launch the
+          fused TileLang ``artifact.value_and_grad`` (forward + backward
+          in one shot, returning a bank-resident gradient tree), then run
+          the trainer's eager closure to produce a full-model gradient
+          tree, and overwrite the in-region entries of the eager tree
+          with the bank-resident fused gradients. The returned ``loss`` /
+          ``ntokens`` come from the eager closure (so trainer-side loss
+          accounting is unchanged). Telemetry lands in
+          ``self.last_fused_warmup_payload`` and
+          ``self.last_fused_value_and_grad_payload``.
+
+        * **Warmup mode (no aliases)** — keep the previous behaviour: run
+          the fused ``artifact.forward(bank_owner=…)`` as a warmup pass
+          (so the JIT cache stays warm and downstream telemetry can
+          measure the kernel cost) and delegate the gradient tree to the
+          eager closure. The fused grads are not merged because the
+          parameters are still independent tensors. This mode is the
+          honest fallback when bank-residency binding has not been
+          installed; it does not pretend the runtime closed the
+          gradient-coverage gap.
         """
         if not callable(loss_and_grad):
             raise TypeError(
                 "mixed-mode training runtime requires the trainer to pass "
                 "an eager loss_and_grad closure for residual parameters"
             )
+
+        merged_mode = bool(self.in_region_parameter_bank_aliases)
+
+        # In merged mode, push optimizer-replaced parameters into bank slots
+        # before the fused kernel reads them. The first step's sync is a no-op
+        # (parameters were already written into the bank at bind time), but
+        # subsequent steps need the sync because optimizer.update replaced the
+        # bank-view attribute with a fresh tensor.
+        bank_sync_status: dict[str, Any] | None = None
+        if merged_mode and self.model_bank_sync_callable is not None:
+            try:
+                raw_status = self.model_bank_sync_callable()
+                bank_sync_status = (
+                    dict(raw_status) if isinstance(raw_status, Mapping) else None
+                )
+            except Exception as exc:
+                bank_sync_status = {
+                    "status": "error",
+                    "error": repr(exc),
+                }
+
         warmup_payload: dict[str, Any] = {
             "attempted": False,
             "completed": False,
             "elapsed_ns": 0,
             "error": None,
         }
-        try:
-            warmup_payload["attempted"] = True
-            warmup_start = time.perf_counter_ns()
-            self.artifact.forward(bank_owner=self.bank_owner)
-            mx.eval(*self.bank_owner.buffers.values())
-            warmup_payload["elapsed_ns"] = (
-                time.perf_counter_ns() - warmup_start
-            )
-            warmup_payload["completed"] = True
-        except Exception as exc:
-            warmup_payload["error"] = repr(exc)
+        vg_payload: dict[str, Any] = {
+            "attempted": False,
+            "completed": False,
+            "elapsed_ns": 0,
+            "merged_parameter_count": 0,
+            "merged_parameter_names": (),
+            "missing_parameter_names": (),
+            "bank_sync_status": bank_sync_status,
+            "error": None,
+        }
+
+        fused_grads: Any | None = None
+        if merged_mode:
+            # Merged mode: run fused.value_and_grad so the artifact populates
+            # in-region grad slots in the bank, then bind them as views into
+            # the eager grad tree below.
+            try:
+                vg_payload["attempted"] = True
+                vg_start = time.perf_counter_ns()
+                (_fused_loss, _fused_ntokens), fused_grads = (
+                    self.artifact.value_and_grad(
+                        model, batch, bank_owner=self.bank_owner
+                    )
+                )
+                mx.eval(*self.bank_owner.buffers.values())
+                vg_payload["elapsed_ns"] = (
+                    time.perf_counter_ns() - vg_start
+                )
+                vg_payload["completed"] = True
+            except Exception as exc:
+                vg_payload["error"] = repr(exc)
+                fused_grads = None
+        else:
+            try:
+                warmup_payload["attempted"] = True
+                warmup_start = time.perf_counter_ns()
+                self.artifact.forward(bank_owner=self.bank_owner)
+                mx.eval(*self.bank_owner.buffers.values())
+                warmup_payload["elapsed_ns"] = (
+                    time.perf_counter_ns() - warmup_start
+                )
+                warmup_payload["completed"] = True
+            except Exception as exc:
+                warmup_payload["error"] = repr(exc)
+
         self.last_fused_warmup_payload = warmup_payload
+
+        # Eager closure runs for the full model. In merged mode its in-region
+        # grad entries are overwritten by the fused bank views below.
         result = loss_and_grad(model, batch)
         (loss, ntokens), grads = cast(
             tuple[tuple[mx.array, mx.array], Any], result
         )
+
+        if merged_mode and fused_grads is not None:
+            try:
+                merged_grads, merged_names, missing_names = (
+                    self._merge_fused_grads_into_eager(grads, fused_grads)
+                )
+                grads = merged_grads
+                vg_payload["merged_parameter_count"] = len(merged_names)
+                vg_payload["merged_parameter_names"] = merged_names
+                vg_payload["missing_parameter_names"] = missing_names
+            except Exception as exc:
+                vg_payload["error"] = repr(exc)
+        self.last_fused_value_and_grad_payload = vg_payload
+
         return (loss, ntokens), grads
 
     def bind_training_graph(self, **binding: Any) -> None:
@@ -616,15 +757,24 @@ class PathCFusedPlusEagerTrainingRuntime:
         inner = dict(self.artifact.value_and_grad_contract())
         inner_coverage = inner.get("full_model_gradient_coverage")
         coverage = dict(inner_coverage) if isinstance(inner_coverage, Mapping) else {}
+        merged_mode_active = bool(self.in_region_parameter_bank_aliases)
+        reason = (
+            "mixed-mode training runtime returns full-model grads via merged "
+            "bank-resident fused grads + eager residual grads: in-region "
+            "parameters are bank views and the fused artifact populates "
+            "their gradients into the same bank storage"
+            if merged_mode_active
+            else (
+                "mixed-mode training runtime returns full-model grads: "
+                "fused in-region warmup is observable, residual grads "
+                "come from the trainer's eager value_and_grad closure"
+            )
+        )
         coverage.update(
             {
                 "full_model_gradient_tree_ready": True,
                 "gradient_scope": "full_model_via_mixed_mode",
-                "reason": (
-                    "mixed-mode training runtime returns full-model grads: "
-                    "fused in-region warmup is observable, residual grads "
-                    "come from the trainer's eager value_and_grad closure"
-                ),
+                "reason": reason,
                 "covered_parameter_names": coverage.get(
                     "covered_parameter_names", []
                 ),
@@ -632,6 +782,17 @@ class PathCFusedPlusEagerTrainingRuntime:
                 "missing_parameter_count": 0,
                 "fused_in_region_parameter_count": len(
                     self.in_region_parameter_names
+                ),
+                "parameter_bank_residency_active": merged_mode_active,
+                "merged_bank_resident_parameter_count": (
+                    len(self.in_region_parameter_bank_aliases)
+                    if merged_mode_active
+                    else 0
+                ),
+                "merged_bank_resident_parameter_names": (
+                    tuple(sorted(self.in_region_parameter_bank_aliases))
+                    if merged_mode_active
+                    else ()
                 ),
             }
         )
@@ -653,6 +814,12 @@ class PathCFusedPlusEagerTrainingRuntime:
             "full_model_gradient_coverage": coverage,
             "fused_in_region_parameter_count": len(
                 self.in_region_parameter_names
+            ),
+            "parameter_bank_residency_active": bool(
+                self.in_region_parameter_bank_aliases
+            ),
+            "merged_bank_resident_parameter_count": len(
+                self.in_region_parameter_bank_aliases
             ),
             "runtime_class": type(self).__name__,
         }
