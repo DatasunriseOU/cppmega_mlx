@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
 
 export interface TokenSpan {
@@ -61,6 +61,21 @@ export function TokenizerPlayground({
   const [panels, setPanels] = useState<TokenizerPanelState[]>(
     () => initialSources.slice(0, maxPanels).map((source) => ({ source })),
   );
+  // V7-K1: backend-driven tokenizer preset list via tokenizer.list_presets.
+  // Replaces the previously hardcoded suggestion set so the UI picks up
+  // PRESET_LIBRARY changes from the backend without a frontend rebuild.
+  const [presets, setPresets] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await rpc.call<{ presets: string[] }>(
+          "tokenizer.list_presets", {});
+        if (!cancelled) setPresets(res.presets ?? []);
+      } catch { /* leave empty — datalist degrades gracefully */ }
+    })();
+    return () => { cancelled = true; };
+  }, [rpc]);
 
   const runEncode = useCallback(async (idx: number) => {
     const panel = panels[idx];
@@ -112,11 +127,17 @@ export function TokenizerPlayground({
                  padding: 6, border: "1px solid #d1d5db", borderRadius: 4 }}
       />
 
+      <datalist id="tokenizer-preset-suggestions"
+                data-testid="tokenizer-preset-suggestions">
+        {presets.map((p) => <option key={p} value={p} />)}
+      </datalist>
+
       <div style={{ display: "grid",
                     gridTemplateColumns: `repeat(${Math.max(1, panels.length)}, 1fr)`,
                     gap: 8, flex: 1, minHeight: 0 }}>
         {panels.map((p, i) => (
           <TokenizerPanel key={i} index={i} state={p}
+                          presets={presets}
                           hoverSpan={hoverSpan}
                           onSourceChange={(s) => setSource(i, s)}
                           onEncode={() => runEncode(i)}
@@ -134,6 +155,7 @@ export function TokenizerPlayground({
 interface TokenizerPanelProps {
   index: number;
   state: TokenizerPanelState;
+  presets?: string[];
   hoverSpan: { start: number; end: number } | null;
   onSourceChange: (s: string) => void;
   onEncode: () => void;
@@ -144,8 +166,8 @@ interface TokenizerPanelProps {
 }
 
 function TokenizerPanel({
-  index, state, hoverSpan, onSourceChange, onEncode, onRemove, onHover,
-  onUseForTrain, trainTokenizerPath,
+  index, state, presets, hoverSpan, onSourceChange, onEncode, onRemove,
+  onHover, onUseForTrain, trainTokenizerPath,
 }: TokenizerPanelProps): JSX.Element {
   return (
     <section data-testid={`tokenizer-panel-${index}`}
@@ -156,8 +178,23 @@ function TokenizerPanel({
         <input data-testid={`tokenizer-source-${index}`}
                type="text" placeholder="tokenizer.json path or hub id"
                value={state.source}
+               list="tokenizer-preset-suggestions"
                onChange={(e) => onSourceChange(e.target.value)}
                style={{ flex: 1, fontFamily: "monospace", fontSize: 11 }} />
+        {presets && presets.length > 0 && (
+          <select data-testid={`tokenizer-preset-picker-${index}`}
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) onSourceChange(e.target.value);
+                    e.currentTarget.value = "";
+                  }}
+                  title="Pick a backend tokenizer preset"
+                  style={{ fontSize: 11, maxWidth: 110 }}>
+            <option value="">presets…</option>
+            {presets.map((p) =>
+              <option key={p} value={p}>{p}</option>)}
+          </select>
+        )}
         <button data-testid={`tokenizer-encode-${index}`} onClick={onEncode}>
           Encode
         </button>
