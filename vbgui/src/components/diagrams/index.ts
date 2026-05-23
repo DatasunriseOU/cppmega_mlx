@@ -53,6 +53,8 @@ export { DIAG_THEME, MatrixGrid, MathLink } from "./TensorDiagram";
 export { WORKED_EXAMPLES, type WorkedExample } from "./worked_examples";
 export { MATH_FOUNDATIONS, TOPIC_FOUNDATIONS,
          type MathConcept } from "./math_foundations";
+export { BACKWARD_TOPICS,
+         type BackwardEntry } from "./backward_passes";
 export { WorkedExampleDiagram } from "./WorkedExampleDiagram";
 
 
@@ -61,14 +63,23 @@ export { WorkedExampleDiagram } from "./WorkedExampleDiagram";
 // (schematic flow diagram first, then concrete numerical example).
 export const TOPIC_WORKED_EXAMPLES: Record<string, string> = {
   brick_attention:        "attention",
-  brick_gated_attention:  "attention",
+  brick_gated_attention:  "gated_attention",
   brick_mla:              "attention",
+  brick_mla_absorb:       "attention",
+  brick_mistral4_mla:     "attention",
   brick_gqa_sliding:      "attention",
   brick_cca_attention:    "attention",
   brick_mlp:              "mlp",
   brick_moe:              "moe",
   brick_bailing_moe:      "moe",
+  brick_mamba3:           "mlp",     // share matmul-flavour example
+  brick_mlstm:            "mlp",
+  brick_gdn:              "attention",
+  brick_kda:              "attention",
+  brick_abs_pos_embed:    "residual",
   adapter_rmsnorm:        "rmsnorm",
+  adapter_residual:       "residual",
+  adapter_linear_bridge:  "matmul",
   // Math foundations also expose their own worked examples.
   metric_perplexity:      "softmax",
 };

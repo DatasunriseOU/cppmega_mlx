@@ -165,6 +165,114 @@ export const WORKED_EXAMPLES: Record<string, WorkedExample> = {
     ],
     output: "y",
   },
+  gated_attention: {
+    caption: "Gated attention: σ(G) ⊙ ctx then W_o (seq=4, d_v=4)",
+    tensors: [
+      { name: "Q", role: "q", shape: [4, 4], values: [
+        [0.31, -0.22, 0.48, 0.11],
+        [-0.14, 0.39, -0.27, 0.52],
+        [0.45, 0.18, -0.33, -0.09],
+        [-0.28, 0.07, 0.41, -0.36],
+      ] },
+      { name: "K", role: "k", shape: [4, 4], values: [
+        [0.22, 0.41, -0.18, 0.33],
+        [-0.37, 0.12, 0.46, -0.19],
+        [0.15, -0.29, 0.31, 0.44],
+        [0.39, 0.08, -0.24, -0.31],
+      ] },
+      { name: "V", role: "v", shape: [4, 4], values: [
+        [0.18, -0.42, 0.29, 0.10],
+        [0.51, 0.16, -0.21, 0.36],
+        [-0.13, 0.31, 0.41, -0.25],
+        [0.28, -0.16, 0.04, 0.45],
+      ] },
+      { name: "ctx", role: "attn", shape: [4, 4], values: [
+        [0.20, -0.02, 0.14, 0.16],
+        [0.22, 0.00, 0.10, 0.18],
+        [0.18, -0.07, 0.17, 0.15],
+        [0.28, 0.02, 0.02, 0.25],
+      ] },
+      { name: "σ(G)", role: "gate", shape: [4, 4], values: [
+        [0.70, 0.23, 0.60, 0.82],
+        [0.35, 0.79, 0.46, 0.68],
+        [0.81, 0.40, 0.71, 0.25],
+        [0.43, 0.66, 0.20, 0.77],
+      ] },
+      { name: "y", role: "out", shape: [4, 4], values: [
+        [0.14, 0.00, 0.08, 0.13],
+        [0.08, 0.00, 0.05, 0.12],
+        [0.15, -0.03, 0.12, 0.04],
+        [0.12, 0.01, 0.00, 0.19],
+      ] },
+    ],
+    steps: [
+      { label: "softmax(QKᵀ/√d_k)·V", from: ["Q", "K", "V"], to: "ctx" },
+      { label: "σ(G) ⊙ ctx", from: ["ctx", "σ(G)"], to: "y" },
+    ],
+    output: "y",
+  },
+  rope: {
+    caption: "RoPE: rotate (q_x, q_y) pair by θ — preserves length, " +
+              "encodes position relatively",
+    tensors: [
+      { name: "q_pre", role: "q", shape: [4, 2], values: [
+        [0.50, 0.87],   // unit vector at 60°
+        [-0.71, 0.71],
+        [0.95, 0.31],
+        [-0.50, -0.87],
+      ] },
+      { name: "θ", role: "raw", shape: [4],
+        values: [0.00, 0.79, 1.57, 2.36] },
+      { name: "q_post", role: "q", shape: [4, 2], values: [
+        [0.50, 0.87],
+        [-1.00, 0.00],
+        [-0.31, 0.95],
+        [0.16, 0.99],
+      ] },
+    ],
+    steps: [
+      { label: "R(θ) · q", from: ["q_pre", "θ"], to: "q_post" },
+    ],
+    output: "q_post",
+  },
+  residual: {
+    caption: "Residual add: y = x + F(x). Gradient splits both ways " +
+              "in backward",
+    tensors: [
+      { name: "x", role: "q", shape: [8],
+        values: [0.42, -0.31, 0.18, 0.55, -0.27, 0.09, 0.36, -0.48] },
+      { name: "F(x)", role: "hidden", shape: [8],
+        values: [0.11, 0.05, -0.13, -0.08, 0.22, -0.06, 0.04, 0.17] },
+      { name: "y", role: "out", shape: [8],
+        values: [0.53, -0.26, 0.05, 0.47, -0.05, 0.03, 0.40, -0.31] },
+    ],
+    steps: [
+      { label: "y = x + F(x)", from: ["x", "F(x)"], to: "y" },
+    ],
+    output: "y",
+  },
+  matmul: {
+    caption: "Matrix multiplication: C = A · B (2×3) · (3×2) = (2×2)",
+    tensors: [
+      { name: "A", role: "q", shape: [2, 3], values: [
+        [1.00, 2.00, 3.00],
+        [-1.00, 0.50, 4.00],
+      ] },
+      { name: "B", role: "k", shape: [3, 2], values: [
+        [2.00, -1.00],
+        [0.50, 3.00],
+        [-1.00, 1.00],
+      ] },
+      { name: "C", role: "out", shape: [2, 2], values: [
+        [0.00, 8.00],
+        [-5.75, 6.50],
+      ] },
+    ],
+    steps: [
+      { label: "row · col", from: ["A", "B"], to: "C" },
+    ],
+    output: "C",
+  },
   moe: {
     caption: "MoE router: 4 experts, top-k=2",
     tensors: [
