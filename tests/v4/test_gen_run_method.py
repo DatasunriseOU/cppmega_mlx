@@ -61,6 +61,36 @@ def test_gen_run_in_registry(client):
     assert "gen.run" in methods
 
 
+def test_gen_run_kv_cache_grows_per_step(client):
+    """V7-F02 honest closure: when kv_cache_layers>0, gen.run wires a
+    KVCache and reports its growth in the result."""
+    res = _call(client, {
+        "prompt_tokens": [0],
+        "eos_token_id": -1,            # force max_new_tokens path
+        "max_new_tokens": 5,
+        "strategy": "greedy",
+        "kv_cache_layers": 4,
+        "kv_cache_head_dim": 16,
+    })
+    kv = res["kv_cache"]
+    assert kv is not None
+    assert kv["num_layers"] == 4
+    assert kv["head_dim"] == 16
+    assert kv["growth_events"] == 5
+    assert kv["total_bytes"] > 0
+    # Each layer absorbed one append per step.
+    assert kv["lengths_per_layer"] == [5, 5, 5, 5]
+
+
+def test_gen_run_kv_cache_disabled_by_default(client):
+    res = _call(client, {
+        "prompt_tokens": [0],
+        "max_new_tokens": 2,
+        "strategy": "greedy",
+    })
+    assert res["kv_cache"] is None
+
+
 def test_gen_run_rejects_oversized_max_new_tokens(client):
     payload = {"jsonrpc": "2.0", "id": "g2", "method": "gen.run",
                "params": {"prompt_tokens": [1], "max_new_tokens": 1_000_000}}

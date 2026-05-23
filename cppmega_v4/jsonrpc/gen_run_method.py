@@ -47,6 +47,12 @@ class GenRunParams(BaseModel):
     # so the smoke path does not require a model. F02 follow-up swaps
     # this for real hybrid_lm.step_fn with KVCache.
     smoke: bool = True
+    # V7-F02: when > 0, gen.run instantiates a KVCache with this many
+    # layers, appends one synthetic (B=1, S=1, H=head_dim) row per
+    # decode step, and reports total_bytes + per-layer length in
+    # GenRunResult.kv_cache. 0 disables KV-cache reporting.
+    kv_cache_layers: int = Field(0, ge=0, le=128)
+    kv_cache_head_dim: int = Field(16, ge=1, le=4096)
 
 
 class GenRunEvent(BaseModel):
@@ -65,6 +71,8 @@ class GenRunResult(BaseModel):
     elapsed_ms: float
     strategy: SamplerStrategy
     smoke: bool
+    # V7-F02: KVCache observability. None when kv_cache_layers=0.
+    kv_cache: dict | None = None
 
 
 def _build_step_fn(params: GenRunParams):
@@ -103,13 +111,47 @@ def gen_run(
 ) -> GenRunResult:
     import time as _time
     t0 = _time.perf_counter()
-    step_fn = _build_step_fn(params)
+    # V7-F02: optional KVCache wiring. When kv_cache_layers > 0 we
+    # instantiate a KVCache and append one synthetic (B=1, S=1, H_kv)
+    # row per token per layer so the user can see the cache grow.
+    kv_cache_state: dict | None = None
+    kv_obj = None
+    if params.kv_cache_layers > 0:
+        import mlx.core as mx
+        from cppmega_v4.runtime.kv_cache import KVCache
+        kv_obj = KVCache(num_layers=params.kv_cache_layers)
+        kv_cache_state = {"num_layers": params.kv_cache_layers,
+                          "head_dim": params.kv_cache_head_dim,
+                          "growth_events": 0,
+                          "total_bytes": 0,
+                          "lengths_per_layer": []}
+
+    inner_step = _build_step_fn(params)
+
+    def _step(last: int) -> int:
+        tok = inner_step(last)
+        if kv_obj is not None:
+            import mlx.core as mx
+            new_k = mx.zeros(
+                (1, 1, params.kv_cache_head_dim), dtype=mx.float32)
+            new_v = mx.zeros(
+                (1, 1, params.kv_cache_head_dim), dtype=mx.float32)
+            for layer in range(params.kv_cache_layers):
+                kv_obj.append(layer, new_k, new_v)
+            kv_cache_state["growth_events"] += 1
+        return tok
+
     tokens, reason, raw_events = collect_stream(
         initial_tokens=list(params.prompt_tokens),
-        step_fn=step_fn,
+        step_fn=_step,
         eos_token_id=params.eos_token_id,
         max_new_tokens=params.max_new_tokens,
     )
+    if kv_obj is not None:
+        kv_cache_state["total_bytes"] = int(kv_obj.total_bytes())
+        kv_cache_state["lengths_per_layer"] = [
+            kv_obj.length(i) for i in range(params.kv_cache_layers)
+        ]
     # stream_generate emits {step, token_id, finish_reason}; the wire
     # field is `token` so the UI doesn't have to know the inner name.
     events = [GenRunEvent(step=int(e.get("step", i)),
@@ -122,6 +164,7 @@ def gen_run(
         elapsed_ms=round((_time.perf_counter() - t0) * 1000.0, 4),
         strategy=params.strategy,
         smoke=params.smoke,
+        kv_cache=kv_cache_state,
     )
 
 
