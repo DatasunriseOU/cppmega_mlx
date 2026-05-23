@@ -2,6 +2,64 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## V7-N-block: deferred-work bd tickets + gen.run UI (2026-05-23)
+
+- **gen.run UI**: new Inference tab with `GenerationPanel` —
+  prompt_tokens parser, sampler strategy selector (greedy /
+  temperature / top_k / top_p), per-strategy hyperparams, smoke
+  toggle, token chips + finish_reason + elapsed_ms surface. testid
+  contract: gen-prompt-tokens / gen-strategy / gen-max-new-tokens /
+  gen-temperature / gen-top-k / gen-top-p / gen-seed / gen-vocab-size /
+  gen-smoke / gen-run / gen-result / gen-token-{i} / gen-finish-reason /
+  gen-elapsed-ms / gen-error.
+- **N01..N07 bd tickets created** for xfail markers + TODO comments
+  + TileLang-Metal kernel breakdown: gemm_softmax emitter wiring,
+  sparse_mla path-C custom-op, triton OP_TABLE coverage (RFC §5.5),
+  mamba3 wave-6 DSL port, dsa_splitk_indexer KL term,
+  training._quantize_8bit dDequantizeBlockwise, za1 epic per-kernel
+  breakdown.
+
+## V7-C-block: checkpoint robustness (closed via dedup, 2026-05-23)
+
+C01..C06 had two parallel ticket trees — the closed cousins
+(q3jq/z6dj/91h1/9t1m/fazl/ylyh) already shipped the backend +
+TopBar ckpt-inspect-block + train_checkpoint_save/load paths +
+K7 RunHistoryPicker warm-start UX. The 6 open dupes (1q0, 9vv,
+4whl, 8t3b, bjiy, 7n4u) closed with DEDUP notes pointing to the
+shipped twin.
+
+## V7-H-block tail: pause rehydrate + project run-id + redo defense + tokenizer roundtrip (2026-05-23)
+
+- **H46**: TokenizerPlayground byte-roundtrip pill from existing
+  EncodeVisualizeResult.capabilities.byte_roundtrip bool. Green/red
+  data-roundtrip=ok|fail testids.
+- **H41**: App.tsx useEffect on mount reads localStorage
+  activeTrainRunId, hits pipeline.status, restores trainRunId +
+  trainInFlight + trainPaused when running && !aborted. Stale ids
+  scrubbed.
+- **H42**: trainRunId persisted to
+  `vbgui_active_train_run_id_<project-uuid>` so concurrent project
+  trains don't clobber.
+- **H43**: useHistory.redo() now returns `{snapshot, rejected}`;
+  new `markRejected()` API tags current top. App.tsx runVerify
+  flags any error-severity-gotcha snapshot; handleRedo surfaces a
+  4s toast when redo lands on a rejected one.
+
+## V7-L-block tail: GotchaPayload extensions (2026-05-23)
+
+- **L48**: GotchaPayload + GotchaState gain `suggested_fix`.
+  verify RPC post-processes via backend
+  `_SUGGESTED_FIX_BY_ID` lookup so new gotcha ids ship with their
+  one-click fix label without a UI release. GotchasTab accepts
+  EITHER backend suggested_fix OR legacy AUTO_FIXABLE id; when
+  onAutoFix isn't passed it renders an italic hint.
+- **L49**: `parseSourceFile()` extracts the last path segment from
+  GotchaState.reference; renders as a small monospace `src:`
+  chip with the full path on hover.
+- **L50**: per-severity BG_TINT (red/amber/blue pastel) + a
+  colored pill (`data-severity` attr) so warnings stop blending
+  into info gotchas.
+
 ## V7-M-block: train-extras UI surfacing (2026-05-23)
 
 Backend was emitting 16 train-stage extras the UI silently buried in
