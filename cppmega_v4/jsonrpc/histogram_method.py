@@ -89,13 +89,34 @@ def inspect_histogram(params: HistogramParams,
             f"brick_id={params.brick_id!r} not in spec.graph.nodes"
         )
     kind = getattr(brick_node, "kind", "")
-    if kind not in BLOCK_BUILDERS:
+    # dim_env is a dict in the wire schema — use mapping access, not
+    # getattr (which would always return the default for a dict).
+    dim_env = params.spec.dim_env or {}
+    hidden = int(dim_env.get("H", 128)) if isinstance(dim_env, dict) \
+        else int(getattr(dim_env, "H", 128))
+    brick_params = dict(getattr(brick_node, "params", {}) or {})
+    if kind in BLOCK_BUILDERS:
+        module = BLOCK_BUILDERS[kind](hidden, brick_params)
+    elif kind in {"rmsnorm", "layernorm"}:
+        # Norm primitives aren't in BLOCK_BUILDERS — instantiate
+        # directly so 'Inspect weight histogram' works on canvas norm
+        # nodes (e.g. tiny_aya rmsnorm tail). eps defaults to 1e-5.
+        from cppmega_v4.models.unified_superblock_v4 import _make_norm
+        eps = float(brick_params.get("eps", 1e-5))
+        module = _make_norm(kind, hidden, eps)
+        if module is None:
+            raise ValueError(
+                f"brick_id={params.brick_id!r} norm kind={kind!r} "
+                f"resolved to a no-op (no weights to inspect)")
+    elif kind == "residual":
+        # Pure plumbing node — no parameters to histogram.
+        raise ValueError(
+            f"brick_id={params.brick_id!r} kind='residual' has no "
+            f"trainable weights (residual is a join, not a module)")
+    else:
         raise ValueError(
             f"brick_id={params.brick_id!r} has unknown kind={kind!r}"
         )
-    hidden = int(getattr(params.spec.dim_env, "H", 128))
-    brick_params = dict(getattr(brick_node, "params", {}) or {})
-    module = BLOCK_BUILDERS[kind](hidden, brick_params)
     flat_parts: list[mx.array] = []
     for _k, v in nn.utils.tree_flatten(module.parameters()):
         if hasattr(v, "shape"):

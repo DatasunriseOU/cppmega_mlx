@@ -56,3 +56,91 @@ def test_v7_h08_bucket_clip_64():
     # Bins are monotonic.
     for a, b in zip(r.bins, r.bins[1:]):
         assert a < b
+
+
+def test_histogram_handles_rmsnorm_node():
+    """fhxg: Inspect weight histogram on a `rmsnorm` canvas node must
+    succeed — the kind is a norm primitive (not in BLOCK_BUILDERS) and
+    used to surface 'Invalid params' before the fallback was added.
+
+    RMSNorm has `dim` channels initialised to 1.0 (gamma), so the
+    histogram is a single peak at 1.0.
+    """
+    from cppmega_v4.jsonrpc.histogram_method import (
+        HistogramParams, inspect_histogram,
+    )
+    from cppmega_v4.jsonrpc.schema import VerifyParams
+    spec = VerifyParams.model_validate({
+        "graph": {
+            "nodes": [
+                {"id": "a", "kind": "attention", "params": {}},
+                {"id": "n", "kind": "rmsnorm", "params": {}},
+            ],
+            "edges": [{"src": "a", "dst": "n"}],
+        },
+        "dim_env": {"H": 128},
+        "loss": {"kind": "cross_entropy", "head_outputs": ["n"]},
+        "optim": {"kind": "adamw", "groups": [
+            {"matcher": "all", "lr": 1e-3, "weight_decay": 0.01,
+             "betas": [0.9, 0.95]}]},
+        "sharding": None,
+        "training": True,
+    })
+    r = inspect_histogram(HistogramParams(
+        spec=spec, brick_id="n", kind="weight", buckets=32))
+    assert r.n_values == 128
+    assert abs(r.mean - 1.0) < 1e-6
+
+
+def test_histogram_handles_layernorm_node():
+    from cppmega_v4.jsonrpc.histogram_method import (
+        HistogramParams, inspect_histogram,
+    )
+    from cppmega_v4.jsonrpc.schema import VerifyParams
+    spec = VerifyParams.model_validate({
+        "graph": {
+            "nodes": [
+                {"id": "a", "kind": "attention", "params": {}},
+                {"id": "n", "kind": "layernorm", "params": {}},
+            ],
+            "edges": [{"src": "a", "dst": "n"}],
+        },
+        "dim_env": {"H": 64},
+        "loss": {"kind": "cross_entropy", "head_outputs": ["n"]},
+        "optim": {"kind": "adamw", "groups": [
+            {"matcher": "all", "lr": 1e-3, "weight_decay": 0.01,
+             "betas": [0.9, 0.95]}]},
+        "sharding": None,
+        "training": True,
+    })
+    r = inspect_histogram(HistogramParams(
+        spec=spec, brick_id="n", kind="weight", buckets=16))
+    # LayerNorm has gamma + beta = 2 * H channels.
+    assert r.n_values == 2 * 64
+
+
+def test_histogram_residual_kind_rejected_cleanly():
+    import pytest
+    from cppmega_v4.jsonrpc.histogram_method import (
+        HistogramParams, inspect_histogram,
+    )
+    from cppmega_v4.jsonrpc.schema import VerifyParams
+    spec = VerifyParams.model_validate({
+        "graph": {
+            "nodes": [
+                {"id": "a", "kind": "attention", "params": {}},
+                {"id": "r", "kind": "residual", "params": {}},
+            ],
+            "edges": [{"src": "a", "dst": "r"}],
+        },
+        "dim_env": {"H": 64},
+        "loss": {"kind": "cross_entropy", "head_outputs": ["r"]},
+        "optim": {"kind": "adamw", "groups": [
+            {"matcher": "all", "lr": 1e-3, "weight_decay": 0.01,
+             "betas": [0.9, 0.95]}]},
+        "sharding": None,
+        "training": True,
+    })
+    with pytest.raises(ValueError, match="no trainable weights"):
+        inspect_histogram(HistogramParams(
+            spec=spec, brick_id="r", kind="weight", buckets=8))
