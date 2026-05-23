@@ -95,6 +95,10 @@ from cppmega_v4.jsonrpc.sync_check_method import (
     SyncCheckParams,
     sync_check_method,
 )
+from cppmega_v4.jsonrpc.github_corpus_method import (
+    GithubCorpusParams,
+    github_corpus_method,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -168,6 +172,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "sync.check": (
         SyncCheckParams,
         lambda p, c: sync_check_method(p, cache=c),
+    ),
+    "data.github_corpus": (
+        GithubCorpusParams,
+        lambda p, c: github_corpus_method(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,

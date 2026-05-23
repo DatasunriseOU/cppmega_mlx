@@ -813,6 +813,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "data.hf_quickstart",
     "compile.trace",
     "sync.check",
+    "data.github_corpus",
 })
 
 

@@ -72,6 +72,40 @@ describe("V8-R09 HFQuickStartModal", () => {
       expect(onResult).toHaveBeenCalledWith("/tmp/vbgui/hf-1.parquet", 8200);
     });
 
+  it("GitHub tab fires data.github_corpus instead of data.hf_quickstart",
+    async () => {
+      const { rpc, calls } = makeFakeRpc({
+        "data.github_corpus": {
+          ...RPC_OK,
+          parquet_path: "/tmp/vbgui/gh-1.parquet",
+        },
+      });
+      const onResult = vi.fn();
+      render(
+        <HFQuickStartModal rpc={rpc} open={true} onClose={() => {}}
+                            onResult={onResult} />);
+      fireEvent.click(screen.getByTestId("github-corpus-tab"));
+      fireEvent.change(screen.getByTestId("github-corpus-repo-url"),
+        { target: { value: "https://github.com/karpathy/nanochat" } });
+      fireEvent.change(screen.getByTestId("github-corpus-max-commits"),
+        { target: { value: "10" } });
+      fireEvent.click(screen.getByTestId("github-corpus-run"));
+      await waitFor(() => {
+        expect(calls.some((c) => c.method === "data.github_corpus"))
+          .toBe(true);
+      });
+      const c = calls.find((x) => x.method === "data.github_corpus")!;
+      expect(c.params).toMatchObject({
+        repo_url: "https://github.com/karpathy/nanochat",
+        max_commits: 10,
+        use_treesitter: true,
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId("hf-quickstart-result-path").textContent)
+          .toContain("gh-1.parquet");
+      });
+    });
+
   it("error banner appears when the RPC throws", async () => {
     const { rpc } = makeFakeRpc({
       "data.hf_quickstart": new Error("dataset not found") });

@@ -27,8 +27,12 @@ interface QuickStartResult {
 export function HFQuickStartModal({
   rpc, open, onClose, onResult,
 }: HFQuickStartModalProps): JSX.Element | null {
+  const [tab, setTab] = useState<"hf" | "github">("hf");
   const [dataset, setDataset] = useState("HuggingFaceFW/fineweb-edu");
   const [nTokens, setNTokens] = useState(8192);
+  const [repoUrl, setRepoUrl] = useState(
+    "https://github.com/karpathy/nanochat");
+  const [maxCommits, setMaxCommits] = useState(50);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<QuickStartResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -49,11 +53,16 @@ export function HFQuickStartModal({
     setErr(null);
     setResult(null);
     try {
-      const jobId = `hf-${Date.now()}`;
-      const r = await rpc.call<QuickStartResult>(
-        "data.hf_quickstart",
-        { dataset_id: dataset, n_tokens: nTokens, job_id: jobId },
-      );
+      const jobId = `${tab}-${Date.now()}`;
+      const r = tab === "hf"
+        ? await rpc.call<QuickStartResult>(
+            "data.hf_quickstart",
+            { dataset_id: dataset, n_tokens: nTokens, job_id: jobId })
+        : await rpc.call<QuickStartResult>(
+            "data.github_corpus",
+            { repo_url: repoUrl, max_tokens: nTokens,
+              max_commits: maxCommits, job_id: jobId,
+              use_treesitter: true, use_clang: false });
       setResult(r);
       onResult?.(r.parquet_path, r.n_tokens_written);
     } catch (e) {
@@ -75,14 +84,51 @@ export function HFQuickStartModal({
                     width: 480, fontFamily: "system-ui, sans-serif",
                     fontSize: 13, display: "flex", flexDirection: "column",
                     gap: 8 }}>
-        <h3 style={{ margin: 0 }}>HF Hub quickstart</h3>
-        <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          Dataset ID
-          <input data-testid="hf-quickstart-dataset-id"
-                 value={dataset}
-                 onChange={(e) => setDataset(e.target.value)}
-                 disabled={busy} />
-        </label>
+        <h3 style={{ margin: 0 }}>Data quickstart</h3>
+        <nav style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+          <button data-testid="hf-quickstart-tab"
+                  onClick={() => setTab("hf")} disabled={busy}
+                  style={{ background: tab === "hf" ? "#dbeafe"
+                                                    : "transparent" }}>
+            HF Hub
+          </button>
+          <button data-testid="github-corpus-tab"
+                  onClick={() => setTab("github")} disabled={busy}
+                  style={{ background: tab === "github" ? "#dbeafe"
+                                                        : "transparent" }}>
+            GitHub repo (tree-sitter / clang)
+          </button>
+        </nav>
+        {tab === "hf" && (
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            Dataset ID
+            <input data-testid="hf-quickstart-dataset-id"
+                   value={dataset}
+                   onChange={(e) => setDataset(e.target.value)}
+                   disabled={busy} />
+          </label>
+        )}
+        {tab === "github" && (
+          <>
+            <label style={{ display: "flex", flexDirection: "column",
+                            gap: 2 }}>
+              Repo URL
+              <input data-testid="github-corpus-repo-url"
+                     value={repoUrl}
+                     onChange={(e) => setRepoUrl(e.target.value)}
+                     disabled={busy} />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column",
+                            gap: 2 }}>
+              max_commits
+              <input data-testid="github-corpus-max-commits"
+                     type="number" min={1} step={1}
+                     value={maxCommits}
+                     onChange={(e) => setMaxCommits(Number(e.target.value))}
+                     disabled={busy} />
+            </label>
+          </>
+        )}
         <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           n_tokens (target)
           <input data-testid="hf-quickstart-n-tokens"
@@ -92,9 +138,13 @@ export function HFQuickStartModal({
                  disabled={busy} />
         </label>
         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-          <button data-testid="hf-quickstart-run"
+          <button data-testid={tab === "hf"
+                                ? "hf-quickstart-run"
+                                : "github-corpus-run"}
                   onClick={() => { void run(); }}
-                  disabled={busy || !dataset}>
+                  disabled={busy
+                    || (tab === "hf" && !dataset)
+                    || (tab === "github" && !repoUrl)}>
             {busy ? "running…" : "Run"}
           </button>
           <button onClick={onClose} disabled={busy}>Close</button>
