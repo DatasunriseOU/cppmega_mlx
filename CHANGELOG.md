@@ -2,6 +2,32 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## V7-M0.7 + M0.3 closure (2026-05-23 06:00 GMT+2)
+
+- **M0.7 (resumable training) ✅ green** — `stage_train` now
+  auto-derives a sidecar opt-state file `<ckpt>.opt` when
+  `checkpoint_save_path` is given without an explicit
+  `opt_state_save_path`; symmetric auto-resolve on load. The
+  sidecar bundles AdamW m/v moments + `rng_key` so a single
+  "checkpoint" path yields full resumable semantics. Flipped
+  `tests/v4/test_m07_resumable_roundtrip.py` from xfail-strict to
+  PASS — resumed loss continues the baseline within <0.1 per step
+  (was Δ≈0.75).
+- **M0.3 (capture_logits wiring) ✅ MLX-side green** —
+  `dry_forward(graph, ..., capture_logits=True, seed=N)` surfaces
+  `output_logits` (shape) + `output_values` (flat list) in
+  `extras`. `bench/m03_cuda_logits_parity_harness.py` now writes
+  `bench/baselines/m03_mlx_logits.npy` (shape `[1, S, H]`).
+  Status: `awaiting_cuda_ref` — GB10 reference is the remaining
+  external blocker (bd `cppmega-mlx-uwhj`).
+- **M0.5 (FastMTP parity)**: refreshed
+  `bench/baselines/m05_mlx_fastmtp.json` (`mlx_loss=5.7456`,
+  `weight_delta_norm=0.4046`); still awaiting GB10 CUDA reference
+  (bd `cppmega-mlx-hjfn`).
+- **New regression**: `tests/v4/test_m03_capture_logits.py` (4
+  tests) pins shape, finite-values, and same-seed determinism
+  for the capture path.
+
 ## V7-P-block: full-scale UI + convergence e2e + M0 baseline (2026-05-23)
 
 - **P5**: DimEnvEditor scale-preset dropdown — mini / dev_128 /
@@ -20,15 +46,13 @@ All notable UI-surface changes since the V7 honest-closure pass.
   params/activations bytes breakdown. CLI knobs --H --S --B
   --preset --depth --out so dev-128 grad-checkpoint+AdamW can
   re-run.
-- **M0.7**: `tests/v4/test_m07_resumable_roundtrip.py` xfail-strict
-  pins the honest finding — resumed leg2 loss 3.29 vs baseline
-  4.04 at step N+0 (Δ=0.75) → opt-state m/v moments and/or
-  data-iterator seed don't roundtrip through checkpoint save/load.
-  bd t8f.7 stays OPEN with notes updated.
+- **M0.7**: initial honest finding (xfail-strict, Δ=0.75 loss
+  divergence on resume). Superseded by the M0.7 closure entry
+  above (sidecar opt-state landed 2026-05-23 06:00 GMT+2).
 - **Deferred (need GB10/hardware/multi-hour)**: P8 multi-epoch UI
-  e2e, P9 1k+ step Playwright run, M0.3 GB10 CUDA logits artifact,
-  M0.5 GB10 FastMTP parity. bd t8f / hjfn / uwhj / A05 carry the
-  remaining work.
+  e2e, P9 1k+ step Playwright run, M0.3 GB10 CUDA-side reference,
+  M0.5 GB10 FastMTP CUDA reference. bd hjfn / uwhj / A05 carry the
+  remaining external work; MLX side captured for both M0.3 + M0.5.
 
 ## V7-N-block: deferred-work bd tickets + gen.run UI (2026-05-23)
 
