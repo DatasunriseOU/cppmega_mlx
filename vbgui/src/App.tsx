@@ -31,6 +31,7 @@ import { useLiveTrainStream } from "@/hooks/useLiveTrainStream";
 import { useVerifyStream, computeSpecHash } from "@/hooks/useVerifyStream";
 
 import { useRpc } from "@/hooks/useRpc";
+import { useCacheStats } from "@/hooks/useCacheStats";
 import { useVerifyAfter } from "@/hooks/useVerifyAfter";
 import { usePresets } from "@/hooks/usePresets";
 
@@ -181,6 +182,13 @@ export function App(): JSX.Element {
     enableWs: true,
     onBackendStatus: (s) => dispatch({ type: "backend.status", status: s }),
     onBackendBuildId: (bid) => setBackendBuildId(bid),
+  });
+
+  // V7-I07: poll the JsonRPC LRU cache hit-rate so the BottomStrip
+  // chip surfaces hit_rate / size / evictions live.
+  const cacheStats = useCacheStats({
+    baseUrl: (import.meta.env.VITE_BACKEND_URL as string | undefined)
+              ?? "http://127.0.0.1:8765",
   });
 
   // Live preset list (62 entries from backend; falls back to bundled
@@ -1538,7 +1546,8 @@ export function App(): JSX.Element {
         </div>
         <BottomStrip state={spec} fusedRegionCount={0}
                      backendBuildId={backendBuildId}
-                     activeDevice={platformInfo.active_device} />
+                     activeDevice={platformInfo.active_device}
+                     cacheStats={cacheStats} />
         <LiveTrainPanel events={liveTrain.events}
                          trainInFlight={!!trainInFlight}
                          finishToast={liveTrain.finishToast}

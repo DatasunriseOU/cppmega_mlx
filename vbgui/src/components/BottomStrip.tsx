@@ -1,4 +1,6 @@
 import type { SpecState } from "@/state/spec";
+import type { CacheStats } from "@/hooks/useCacheStats";
+import { formatHitRate } from "@/hooks/useCacheStats";
 
 export interface BottomStripProps {
   state: SpecState;
@@ -7,6 +9,8 @@ export interface BottomStripProps {
   /** V7-H48: backend git sha + boot timestamp from the heartbeat. */
   backendBuildId?: string | null;
   activeDevice?: string;
+  /** V7-I07: JsonRPC LRU cache snapshot from /cache/stats. */
+  cacheStats?: CacheStats | null;
 }
 
 const STATUS_COLOR: Record<SpecState["backend_status"], string> = {
@@ -21,8 +25,17 @@ const STATUS_LABEL: Record<SpecState["backend_status"], string> = {
   disconnected: "Disconnected",
 };
 
+function cacheHitRateColor(rate: number): string {
+  if (!Number.isFinite(rate)) return "#9ca3af";
+  if (rate >= 0.75) return "#10b981"; // green
+  if (rate >= 0.40) return "#d97706"; // amber
+  return "#dc2626"; // red
+}
+
 export function BottomStrip({
-  state, fusedRegionCount = 0, onHelpToggle, backendBuildId = null, activeDevice,
+  state, fusedRegionCount = 0, onHelpToggle,
+  backendBuildId = null, activeDevice,
+  cacheStats = null,
 }: BottomStripProps): JSX.Element {
   return (
     <footer data-testid="bottom-strip"
@@ -49,6 +62,36 @@ export function BottomStrip({
       </span>
       <span data-testid="brick-count">
         {state.brick_count} bricks, {fusedRegionCount} fused regions
+      </span>
+      {/* V7-I07: JsonRPC LRU cache hit-rate dashboard chip. */}
+      <span data-testid="cache-stats"
+            title={cacheStats
+              ? `LRU cache: hits=${cacheStats.hits} misses=${cacheStats.misses} `
+                + `evictions=${cacheStats.evictions} `
+                + `size=${cacheStats.size}/${cacheStats.capacity}`
+              : "LRU cache stats unavailable"}
+            style={{ display: "inline-flex", alignItems: "center",
+                     gap: 4, fontFamily: "monospace" }}>
+        <span style={{
+          width: 6, height: 6, borderRadius: "50%",
+          background: cacheHitRateColor(
+            cacheStats?.hit_rate ?? Number.NaN),
+        }} />
+        cache{" "}
+        <span data-testid="cache-stats-hit-rate"
+              data-hit-rate={cacheStats?.hit_rate ?? ""}
+              data-hits={cacheStats?.hits ?? ""}
+              data-misses={cacheStats?.misses ?? ""}
+              data-evictions={cacheStats?.evictions ?? ""}
+              data-size={cacheStats?.size ?? ""}
+              data-capacity={cacheStats?.capacity ?? ""}>
+          {cacheStats ? formatHitRate(cacheStats.hit_rate) : "—"}
+        </span>
+        <span data-testid="cache-stats-size" style={{ opacity: 0.7 }}>
+          {cacheStats
+            ? ` ${cacheStats.size}/${cacheStats.capacity}`
+            : ""}
+        </span>
       </span>
       {activeDevice && (
         <span data-testid="platform-indicator"
