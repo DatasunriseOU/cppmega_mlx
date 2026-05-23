@@ -100,7 +100,7 @@ function ExtrasEntry({
   if (Array.isArray(v)) {
     return (
       <div style={{ display: "flex", gap: 8 }}>
-        <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
+        <dt style={{ color: "#94a3b8", minWidth: 140 }}>{k}</dt>
         <dd style={{ margin: 0 }}>
           <ol data-testid={base}
               style={{ margin: 0, padding: "0 0 0 16px",
@@ -125,7 +125,7 @@ function ExtrasEntry({
     // prefix the test framework already expects.
     return (
       <div style={{ display: "flex", gap: 8 }}>
-        <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
+        <dt style={{ color: "#94a3b8", minWidth: 140 }}>{k}</dt>
         <dd style={{ margin: 0 }}>
           <dl data-testid={base}
               style={{ margin: 0, paddingLeft: 8 }}>
@@ -139,7 +139,7 @@ function ExtrasEntry({
   }
   return (
     <div style={{ display: "flex", gap: 8 }}>
-      <dt style={{ color: "#6b7280", minWidth: 140 }}>{k}</dt>
+      <dt style={{ color: "#94a3b8", minWidth: 140 }}>{k}</dt>
       <dd data-testid={base} style={{ margin: 0 }}>
         {v === null || v === undefined ? "null" : String(v)}
       </dd>
@@ -178,31 +178,57 @@ export function RunResultModal({
          role="dialog" aria-modal="true"
          onClick={onClose}
          style={{
-           position: "fixed", inset: 0, background: "rgba(15,23,42,0.45)",
+           position: "fixed", inset: 0,
+           // V7-Q10: match HelpModal — dark+blur backdrop.
+           background: "rgba(15, 23, 42, 0.75)",
+           backdropFilter: "blur(8px)",
            display: "flex", alignItems: "center", justifyContent: "center",
            zIndex: 50, fontFamily: "system-ui, sans-serif",
          }}>
       <div data-testid="run-result-modal"
            onClick={(e) => e.stopPropagation()}
            style={{
-             background: "white", borderRadius: 6, padding: 16,
-             minWidth: 540, maxWidth: 720, maxHeight: "80vh",
+             // V7-Q10: dark theme matching HelpModal — operator reads
+             // the pipeline result on the same surface they read help
+             // on. Light text on dark for contrast.
+             background: "rgba(30, 41, 59, 0.97)",
+             backdropFilter: "blur(16px)",
+             border: "1px solid rgba(255, 255, 255, 0.1)",
+             borderRadius: 12,
+             padding: 20,
+             minWidth: 540, maxWidth: 720, maxHeight: "85vh",
              overflowY: "auto",
+             color: "#e2e8f0",
+             boxShadow: "0 20px 40px rgba(0, 0, 0, 0.5), "
+                        + "0 0 0 1px rgba(255, 255, 255, 0.05)",
            }}>
-        <header style={{ display: "flex", justifyContent: "space-between",
-                         alignItems: "center", marginBottom: 12 }}>
-          <h3 data-testid="run-result-title" style={{ margin: 0, fontSize: 14 }}>
+        <header style={{ display: "flex",
+                         justifyContent: "space-between",
+                         alignItems: "center",
+                         marginBottom: 14, paddingBottom: 10,
+                         borderBottom: "1px solid rgba(255,255,255,0.1)" }}>
+          <h3 data-testid="run-result-title"
+              style={{ margin: 0, fontSize: 15, fontWeight: 700,
+                       color: "#22d3ee", letterSpacing: "0.2px" }}>
             Pipeline result{" "}
             <span data-testid="run-result-overall"
                   style={{ color: report
                     ? COLORS[report.overall_status]
-                    : COLORS.fail }}>
+                    : COLORS.fail,
+                           fontWeight: 600 }}>
               {report ? `· ${report.overall_status} · ` +
-                        `${report.total_elapsed_ms.toFixed(1)} ms`
+                        `${(report.total_elapsed_ms ?? 0).toFixed(1)} ms`
                       : "· error"}
             </span>
           </h3>
-          <button data-testid="run-result-close" onClick={onClose}>×</button>
+          <button data-testid="run-result-close" onClick={onClose}
+                  style={{
+                    background: "rgba(255,255,255,0.05)",
+                    border: "1px solid rgba(255,255,255,0.1)",
+                    borderRadius: "50%",
+                    width: 30, height: 30, color: "#e2e8f0",
+                    cursor: "pointer", fontSize: 16, lineHeight: 1,
+                  }}>×</button>
         </header>
 
         {normalizedError && (
@@ -211,12 +237,13 @@ export function RunResultModal({
           </div>
         )}
 
-        {report && (
+        {report && report.stages && (
           <table data-testid="run-result-stages"
                  style={{ width: "100%", fontSize: 12,
                           borderCollapse: "collapse" }}>
             <thead>
-              <tr style={{ borderBottom: "1px solid #e5e7eb" }}>
+              <tr style={{ borderBottom:
+                  "1px solid rgba(255,255,255,0.15)" }}>
                 <th style={th}></th>
                 <th style={th}>Stage</th>
                 <th style={th}>Status</th>
@@ -237,14 +264,15 @@ export function RunResultModal({
                         data-first-failed={isFirstFailed
                                              ? "true" : undefined}
                         style={{
-                          borderBottom: "1px solid #f3f4f6",
+                          borderBottom:
+                            "1px solid rgba(255,255,255,0.08)",
                           // V7-L47: visual highlight on the first
-                          // failing row so the user sees it without
-                          // scrolling.
+                          // failing row — dark-mode compatible red tint.
                           background: isFirstFailed
-                            ? "#fef2f2" : undefined,
+                            ? "rgba(220,38,38,0.18)" : undefined,
                           outline: isFirstFailed
-                            ? "2px solid #fca5a5" : undefined,
+                            ? "2px solid rgba(248,113,113,0.7)"
+                            : undefined,
                           outlineOffset: isFirstFailed ? -2 : undefined,
                         }}>
                       <td style={td}>
@@ -293,7 +321,7 @@ export function RunResultModal({
                     </tr>
                     {open && s.error && (
                       <tr data-testid={`run-result-detail-${s.name}`}>
-                        <td colSpan={5} style={{ ...td, background: "#f9fafb",
+                        <td colSpan={5} style={{ ...td, background: "rgba(15,23,42,0.6)",
                                                  fontFamily: "monospace",
                                                  fontSize: 11 }}>
                           <strong>{s.error.type ?? "Error"}</strong>:{" "}
@@ -303,7 +331,7 @@ export function RunResultModal({
                     )}
                     {open && hasExtras && (
                       <tr data-testid={`run-result-extras-row-${s.name}`}>
-                        <td colSpan={5} style={{ ...td, background: "#f9fafb",
+                        <td colSpan={5} style={{ ...td, background: "rgba(15,23,42,0.6)",
                                                  padding: "6px 12px" }}>
                           {s.name === "train" && Array.isArray(extras.losses)
                             && extras.losses.length > 0 && (
@@ -356,6 +384,13 @@ function toggle(set: Set<string>, setter: (s: Set<string>) => void,
   setter(next);
 }
 
-const th: React.CSSProperties = { textAlign: "left", padding: "4px 6px",
-                                  color: "#6b7280", fontWeight: 600 };
-const td: React.CSSProperties = { padding: "4px 6px" };
+// V7-Q10: dark-modal palette. Light muted for table headings,
+// bright light for cell text so contrast is readable on
+// rgba(30,41,59,0.97) modal background.
+const th: React.CSSProperties = {
+  textAlign: "left", padding: "4px 6px",
+  color: "#94a3b8", fontWeight: 600,
+};
+const td: React.CSSProperties = {
+  padding: "4px 6px", color: "#e2e8f0",
+};
