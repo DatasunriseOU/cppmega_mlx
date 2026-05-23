@@ -357,6 +357,12 @@ export function App(): JSX.Element {
     return () => { cancelled = true; };
   }, [rpc, backendBuildId]);
 
+  // Build augmented nodes/edges that include a synthetic LossGhost
+  // anchored to spec.loss.head_outputs[0]. The ghost is read-only —
+  // dragging / clicking it has no effect; it just makes the Sidebar
+  // → Loss Apply visible on the canvas.
+  // Defined as `useMemoLossView` so the variable name stays unique;
+  // the actual useMemo below.
   const activeTopologies = useMemo(() => {
     if (!filterByPlatform || !platformInfo || !Array.isArray(platformInfo.available_topologies)) {
       return TOPOLOGIES;
@@ -574,6 +580,24 @@ export function App(): JSX.Element {
     return () => window.removeEventListener("keydown", onKey);
   }, [handleUndo, handleRedo]);
 
+  // Global Delete / Backspace key deletion for selected brick
+  useEffect(() => {
+    function onKey(ev: KeyboardEvent) {
+      if (ev.key !== "Backspace" && ev.key !== "Delete") return;
+      // Don't intercept inside text inputs or select elements
+      const tag = (ev.target as HTMLElement | null)?.tagName ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (!selectedBrickId) return;
+      
+      ev.preventDefault();
+      setNodes((prev) => prev.filter((n) => n.id !== selectedBrickId));
+      setEdges((prev) => prev.filter((e) => e.source !== selectedBrickId && e.target !== selectedBrickId));
+      setSelectedBrickId(null);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedBrickId]);
+
   // ----- Drag and Drop Movement & Workspace Draft Tabs Handlers ------------
 
   const onNodesChange: OnNodesChange = useCallback(
@@ -704,6 +728,15 @@ export function App(): JSX.Element {
           data: { severity: "info" } },
       ]);
     }, []);
+
+  // UX (cppmega-mlx-fhxg): transient toast when user applies a Loss
+  // change in the sidebar so the click registers visibly.
+  const [lossToast, setLossToast] = useState<string | null>(null);
+  useEffect(() => {
+    if (!lossToast) return;
+    const t = setTimeout(() => setLossToast(null), 2500);
+    return () => clearTimeout(t);
+  }, [lossToast]);
 
   // V8-R08: track feature injections applied via FeatureInjectionBar.
   // Each click adds either a rewriter (via dispatch) or a brick node
@@ -1795,8 +1828,52 @@ export function App(): JSX.Element {
                   </button>
                 </div>
 
+                {lossToast && (
+                  <div data-testid="loss-apply-toast"
+                       role="status"
+                       style={{ position: "absolute", top: 12, left: "50%",
+                                transform: "translateX(-50%)", zIndex: 9000,
+                                background: "#fefce8", color: "#854d0e",
+                                border: "1px solid #facc15",
+                                borderRadius: 6, padding: "6px 12px",
+                                fontSize: 12, fontFamily: "system-ui" }}>
+                    {lossToast}
+                  </div>
+                )}
                 <FlowCanvas
-                  nodes={nodes} edges={edges}
+                  nodes={(() => {
+                    const head = spec.loss.head_outputs?.[0];
+                    if (!head) return nodes;
+                    const anchor = nodes.find((n) => n.id === head);
+                    if (!anchor) return nodes;
+                    const ghostId = "__loss_ghost__";
+                    if (nodes.some((n) => n.id === ghostId)) return nodes;
+                    return [...nodes, {
+                      id: ghostId,
+                      type: "loss_ghost",
+                      position: { x: anchor.position.x + 260,
+                                  y: anchor.position.y },
+                      data: { kind: spec.loss.kind,
+                              params: spec.loss.params } as never,
+                      draggable: false,
+                      selectable: false,
+                    }];
+                  })()}
+                  edges={(() => {
+                    const head = spec.loss.head_outputs?.[0];
+                    if (!head) return edges;
+                    if (!nodes.some((n) => n.id === head)) return edges;
+                    const ghostEdgeId = "__loss_ghost_edge__";
+                    if (edges.some((e) => e.id === ghostEdgeId)) return edges;
+                    return [...edges, {
+                      id: ghostEdgeId,
+                      source: head,
+                      target: "__loss_ghost__",
+                      data: { severity: "info" } as never,
+                      animated: true,
+                      style: { strokeDasharray: "4 4", stroke: "#facc15" },
+                    }];
+                  })()}
                   onConnect={handleConnect}
                   onDropBrick={handleDropBrick}
                   onNodeClick={setSelectedBrickId}
@@ -1878,6 +1955,11 @@ export function App(): JSX.Element {
                       });
                     }}
                     onClose={() => setSelectedBrickId(null)}
+                    onDelete={() => {
+                      setNodes((prev) => prev.filter((n) => n.id !== selectedBrickId));
+                      setEdges((prev) => prev.filter((e) => e.source !== selectedBrickId && e.target !== selectedBrickId));
+                      setSelectedBrickId(null);
+                    }}
                   />
                 );
               })()}
@@ -1901,7 +1983,11 @@ export function App(): JSX.Element {
                   trainTokenizerPath ?? "cppmega_mlx/tokenizer/tokenizer.json"
                 }
                 onHighlightBrick={setSelectedBrickId}
-                onLossApply={(l) => dispatch({ type: "loss.set", loss: l })}
+                onLossApply={(l) => {
+                  dispatch({ type: "loss.set", loss: l });
+                  const target = l.head_outputs?.[0] ?? "<no head>";
+                  setLossToast(`Loss applied: ${l.kind} → ${target}`);
+                }}
                 onOptimApply={(o) => dispatch({ type: "optim.set", optim: o })}
                 lastRunScheduleKind={
                   (() => {
