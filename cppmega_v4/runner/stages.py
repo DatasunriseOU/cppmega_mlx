@@ -1747,6 +1747,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "top1_token_drift": top1_token_drift,
                 },
                 "side_channels_observed": side_channels_observed,
+                "per_brick_grad_norms": _safe_per_brick_grads(
+                    all_modules, grads if 'grads' in dir() else None),
                 "side_channels_forward_effect": {
                     "doc_ids_mask_density": sc_doc_ids_mask_density,
                     "doc_mask_applied": sc_doc_mask_applied,
@@ -2172,6 +2174,17 @@ def read_ckpt_metadata(path: str) -> dict | None:
         except Exception:
             out[k] = v
     return out or None
+
+
+def _safe_per_brick_grads(model: Any, grads: Any) -> dict[str, float]:
+    """V7-H07: extras.per_brick_grad_norms — best-effort wrapper."""
+    if grads is None:
+        return {}
+    try:
+        from cppmega_v4.runtime.per_brick_probes import per_brick_grad_norms
+        return per_brick_grad_norms(model, grads)
+    except Exception:
+        return {}
 
 
 def _ema_smooth(values: list[float], window: int = 10) -> list[float]:
