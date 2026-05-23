@@ -45,6 +45,9 @@ from cppmega_v4.jsonrpc.ablation_method import (
 from cppmega_v4.jsonrpc.ckpt_inspect_method import (
     CkptInspectParams, ckpt_inspect,
 )
+from cppmega_v4.jsonrpc.dtype_cost_method import (
+    DtypeCostParams, dtype_cost_estimate,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -99,6 +102,14 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
         PipelineAbortParams,
         lambda p, c: _pipeline_abort(p),
     ),
+    "pipeline.pause": (
+        PipelineAbortParams,
+        lambda p, c: _pipeline_pause(p),
+    ),
+    "pipeline.resume": (
+        PipelineAbortParams,
+        lambda p, c: _pipeline_resume(p),
+    ),
     "tokenizer.encode_visualize": (
         EncodeVisualizeParams,
         lambda p, c: encode_visualize(p, cache=c),
@@ -131,6 +142,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
         CkptInspectParams,
         lambda p, c: ckpt_inspect(p, cache=c),
     ),
+    "dtype.cost_estimate": (
+        DtypeCostParams,
+        lambda p, c: dtype_cost_estimate(p, cache=c),
+    ),
 }
 
 
@@ -150,6 +165,20 @@ def _pipeline_run(params: PipelineRunParams) -> PipelineRunResult:
 def _pipeline_abort(params: PipelineAbortParams) -> PipelineAbortResult:
     from cppmega_v4.runner.stages import request_abort
     request_abort(params.run_id)
+    return PipelineAbortResult(run_id=params.run_id)
+
+
+def _pipeline_pause(params: PipelineAbortParams) -> PipelineAbortResult:
+    """V7-H06: mark a train run as paused; the loop waits between steps."""
+    from cppmega_v4.runtime.job_control import pause
+    pause(params.run_id)
+    return PipelineAbortResult(run_id=params.run_id)
+
+
+def _pipeline_resume(params: PipelineAbortParams) -> PipelineAbortResult:
+    """V7-H06: clear the paused flag so the train loop proceeds."""
+    from cppmega_v4.runtime.job_control import resume
+    resume(params.run_id)
     return PipelineAbortResult(run_id=params.run_id)
 
 

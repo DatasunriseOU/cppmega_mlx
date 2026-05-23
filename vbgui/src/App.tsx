@@ -6,6 +6,7 @@ import {
 import { FlowCanvas } from "@/components/FlowCanvas";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { GalleryTab } from "@/components/GalleryTab";
+import { SweepPanel } from "@/components/SweepPanel";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
@@ -534,6 +535,33 @@ export function App(): JSX.Element {
     }
   }, [rpc, trainRunId]);
 
+  // V7-H06: pause / resume the in-flight train run. Backend job_control
+  // module blocks the train loop until resume() is called.
+  const [trainPaused, setTrainPaused] = useState<boolean>(false);
+  const handlePauseTrain = useCallback(async () => {
+    const runId = trainRunId;
+    if (!runId) return;
+    try {
+      await rpc.call("pipeline.pause", { run_id: runId });
+      setTrainPaused(true);
+    } catch (e) {
+      setRunError(String(e));
+    }
+  }, [rpc, trainRunId]);
+  const handleResumeTrain = useCallback(async () => {
+    const runId = trainRunId;
+    if (!runId) return;
+    try {
+      await rpc.call("pipeline.resume", { run_id: runId });
+      setTrainPaused(false);
+    } catch (e) {
+      setRunError(String(e));
+    }
+  }, [rpc, trainRunId]);
+  // Clear paused flag whenever a new run starts or one ends.
+  useEffect(() => { if (!trainInFlight) setTrainPaused(false); },
+           [trainInFlight]);
+
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
     if (!chosen) return;
@@ -571,6 +599,9 @@ export function App(): JSX.Element {
           trainInFlight={trainInFlight}
           trainRunId={trainRunId}
           onCancelTrain={handleCancelTrain}
+          trainPaused={trainPaused}
+          onPauseTrain={handlePauseTrain}
+          onResumeTrain={handleResumeTrain}
           onUndo={handleUndo}
           onRedo={handleRedo}
           canUndo={history.canUndo}

@@ -16,6 +16,18 @@ export interface CkptInspectInfo {
   error?: string | null;
 }
 
+/** V7-D06: per-dtype cost row from dtype.cost_estimate RPC. */
+export interface DtypeCostRow {
+  dtype: "fp32" | "bf16" | "fp16";
+  supported: boolean;
+  fwd_ms: number | null;
+  fwdbwd_ms: number | null;
+  fwd_ms_per_token: number | null;
+  fwdbwd_ms_per_token: number | null;
+  cast_overhead_ms: number | null;
+  error: string | null;
+}
+
 export interface TopBarProps {
   state: SpecState;
   projectName: string;
@@ -46,6 +58,10 @@ export interface TopBarProps {
   trainInFlight?: boolean;
   trainRunId?: string | null;
   onCancelTrain?: () => void;
+  /** V7-H06: pause / resume the currently in-flight Train run. */
+  trainPaused?: boolean;
+  onPauseTrain?: () => void;
+  onResumeTrain?: () => void;
   /** V3-8/V3-9: when present, Train button is rendered disabled with
    *  reason exposed via data-testid='top-bar-train-disabled-reason'. */
   trainDisabled?: { reason: string } | null;
@@ -62,6 +78,10 @@ export interface TopBarProps {
    *  warm-start. UI fires this on debounced change of ckpt-load-path
    *  and renders arch_hash / opt_kind / version inline. */
   onInspectCheckpoint?: (path: string) => Promise<CkptInspectInfo>;
+  /** V7-D06: callback to fetch per-dtype cost estimate. UI fires once
+   *  when the Train menu first opens and caches the table to render
+   *  ms/token next to each option in the master_dtype dropdown. */
+  onDtypeCostEstimate?: () => Promise<{ rows: DtypeCostRow[] }>;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
@@ -84,6 +104,35 @@ export function TopBar(p: TopBarProps): JSX.Element {
   // opt_kind / version before clicking Train with warm-start.
   const [ckptInfo, setCkptInfo] = useState<CkptInspectInfo | null>(null);
   const [ckptInfoLoading, setCkptInfoLoading] = useState<boolean>(false);
+  // V7-D06: cached dtype cost table. Fetched once when the menu opens
+  // so the dtype dropdown can render ms/token alongside each option.
+  const [dtypeCosts, setDtypeCosts] = useState<DtypeCostRow[] | null>(null);
+  const [dtypeCostsLoading, setDtypeCostsLoading] =
+    useState<boolean>(false);
+  useEffect(() => {
+    if (!open || !p.onDtypeCostEstimate || dtypeCosts !== null
+        || dtypeCostsLoading) return;
+    let cancelled = false;
+    setDtypeCostsLoading(true);
+    (async () => {
+      try {
+        const res = await p.onDtypeCostEstimate!();
+        if (!cancelled) setDtypeCosts(res.rows);
+      } catch {
+        if (!cancelled) setDtypeCosts([]);
+      } finally {
+        if (!cancelled) setDtypeCostsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, p.onDtypeCostEstimate, dtypeCosts, dtypeCostsLoading]);
+
+  const dtypeCostLabel = (dt: "fp32" | "bf16" | "fp16"): string => {
+    if (!dtypeCosts) return "";
+    const row = dtypeCosts.find((r) => r.dtype === dt);
+    if (!row || !row.supported || row.fwdbwd_ms_per_token == null) return "";
+    return ` · ${row.fwdbwd_ms_per_token.toFixed(4)} ms/tok`;
+  };
   useEffect(() => {
     if (!p.onInspectCheckpoint) return;
     const path = ckptLoadPath.trim();
@@ -225,6 +274,17 @@ export function TopBar(p: TopBarProps): JSX.Element {
                 style={{ marginLeft: 4 }}>
           Cancel
         </button>
+        {p.onPauseTrain && p.onResumeTrain && (
+          <button data-testid="run-pipeline-pause"
+                  onClick={() => p.trainPaused
+                    ? p.onResumeTrain?.()
+                    : p.onPauseTrain?.()}
+                  disabled={!p.trainInFlight || !p.trainRunId}
+                  title={p.trainPaused ? "Resume Train" : "Pause Train"}
+                  style={{ marginLeft: 4 }}>
+            {p.trainPaused ? "Resume" : "Pause"}
+          </button>
+        )}
         <button data-testid="run-pipeline-toggle"
                 onClick={() => setOpen((x) => !x)}>▾</button>
         {open && (
@@ -339,10 +399,23 @@ export function TopBar(p: TopBarProps): JSX.Element {
                         setMasterDtype(e.target.value as
                           "fp32" | "bf16" | "fp16" | "auto")}>
                 <option value="auto">auto (mixed_precision)</option>
-                <option value="fp32">fp32</option>
-                <option value="bf16">bf16</option>
-                <option value="fp16">fp16</option>
+                <option value="fp32">fp32{dtypeCostLabel("fp32")}</option>
+                <option value="bf16">bf16{dtypeCostLabel("bf16")}</option>
+                <option value="fp16">fp16{dtypeCostLabel("fp16")}</option>
               </select>
+              {dtypeCostsLoading && (
+                <span data-testid="dtype-cost-loading"
+                      style={{ fontSize: 10, color: "#9ca3af" }}>
+                  measuring…
+                </span>
+              )}
+              {!dtypeCostsLoading && dtypeCosts && dtypeCosts.length > 0 && (
+                <span data-testid="dtype-cost-summary"
+                      style={{ fontSize: 10, color: "#6b7280",
+                               fontFamily: "monospace" }}>
+                  measured
+                </span>
+              )}
             </label>
             <label style={{ padding: "6px 12px", display: "flex",
                             alignItems: "center", gap: 6, fontSize: 11,

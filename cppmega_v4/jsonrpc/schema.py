@@ -750,6 +750,9 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "data.roundtrip_check",
     "ablation.run",
     "ckpt.inspect",
+    "dtype.cost_estimate",
+    "pipeline.pause",
+    "pipeline.resume",
 })
 
 

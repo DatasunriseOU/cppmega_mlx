@@ -1421,7 +1421,10 @@ def stage_train(ctx: StageContext) -> StageResult:
         val_losses: list[float] = []
         # G09: check abort flag set via opts.abort or _ABORT_TOKENS set
         abort_token = opts.get("abort_token")
+        # V7-H06: block while job is paused via job_control.pause(token).
+        from cppmega_v4.runtime.job_control import wait_while_paused
         for step in range(n_steps):
+            wait_while_paused(abort_token, poll_s=0.05, max_wait_s=600.0)
             if abort_token is not None and abort_token in _ABORT_TOKENS:
                 # Stop early; return partial extras with cancellation flag.
                 return _cancelled_train_result(
