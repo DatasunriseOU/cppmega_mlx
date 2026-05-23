@@ -1,0 +1,2 @@
+preset,hidden,n_layers,num_steps,S,compile_mode,status,first_step_ms,ms_per_step_warm,ms_per_step_warm_min,peak_memory_mb,total_elapsed_s,compile_engaged,compile_status
+llama3_8b,4096,2,5,8,whole_model,ok,482.7471,13.4859,12.327,11812.5238,5.0504,True,engaged
