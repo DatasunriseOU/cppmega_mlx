@@ -58,6 +58,13 @@ class V4MoEConfig:
     aux_loss_free: bool = False
     bias_update_rate: float = 1e-3
     node_limited_routing: int | None = None
+    # V7-E01: capacity factor C ∈ (0, ∞). When < 1, expert capacity is
+    # ceil(C * total_slots / num_experts), and any overflow slots are
+    # rerouted (if reroute_overflow) or dropped. extras.moe surfaces
+    # dropped_token_ratio + rerouted_token_ratio per V7-E02. When None
+    # (default), routing is unbounded — backwards compatible.
+    capacity_factor: float | None = None
+    reroute_overflow: bool = True
 
     def __post_init__(self) -> None:
         if self.d_model <= 0:
@@ -87,6 +94,10 @@ class V4MoEConfig:
                 self.num_experts // self.node_limited_routing
             ):
                 raise ValueError("top_k exceeds capacity of node_limited_routing groups")
+        if self.capacity_factor is not None:
+            if self.capacity_factor <= 0 or self.capacity_factor > 8:
+                raise ValueError(
+                    "capacity_factor must be in (0, 8] when set")
 
     def as_moe_config(self) -> MoEConfig:
         """Project to the legacy MoEConfig (for parity tests against ReferenceMoE)."""
@@ -154,6 +165,10 @@ class V4MoE(nn.Module):
         if config.aux_loss_free:
             self.expert_bias = mx.zeros((config.num_experts,), dtype=mx.float32)
             self.freeze(keys=["expert_bias"])
+        # V7-E01/E02: stash from last __call__ when capacity_factor is set.
+        # Read by stage_train to populate extras.moe.{dropped_token_ratio,
+        # rerouted_token_ratio, capacity_per_expert}.
+        self.last_drop_stats: dict | None = None
 
     def _router_scores(self, flat_x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """Return (logits, raw_scores, biased_scores) — gate computed once."""
@@ -212,6 +227,25 @@ class V4MoE(nn.Module):
         logits, raw_scores, biased_scores = self._router_scores(flat_x)
 
         top_indices = self._select_top_k(biased_scores)
+        # V7-E01/E02: with capacity_factor set, compute drop/reroute
+        # accounting on the cpu-side top_indices and stash for stage_train.
+        if cfg.capacity_factor is not None:
+            from cppmega_v4.nn.moe_capacity import compute_drop_reroute_stats
+            try:
+                idx_py = top_indices.tolist()
+                if not isinstance(idx_py[0], list):
+                    # n_tokens dim collapsed (rare); wrap each.
+                    idx_py = [[i] for i in idx_py]
+                self.last_drop_stats = compute_drop_reroute_stats(
+                    idx_py,
+                    num_experts=cfg.num_experts,
+                    capacity_factor=float(cfg.capacity_factor),
+                    reroute=bool(cfg.reroute_overflow),
+                )
+            except Exception:
+                self.last_drop_stats = None
+        else:
+            self.last_drop_stats = None
         # Weights use the **raw** (pre-bias) scores — the bias only affects
         # which experts are selected, per V3 paper.
         top_scores = mx.take_along_axis(raw_scores, top_indices, axis=-1)

@@ -1054,11 +1054,31 @@ def stage_train(ctx: StageContext) -> StageResult:
                             moe_extras["routing_entropy"] = round(
                                 routing_entropy, 6)
                             moe_extras["load_balance_loss"] = round(lb, 8)
-                            moe_extras["dropped_token_ratio"] = 0.0
                             moe_extras["per_expert_load"] = [
                                 round(float(v), 6)
                                 for v in load_arr.tolist()
                             ]
+                            # V7-E01/E02: real drop/reroute accounting
+                            # when V4MoE was built with capacity_factor.
+                            drop_stats = getattr(
+                                moe_module, "last_drop_stats", None)
+                            if drop_stats is not None:
+                                moe_extras["dropped_token_ratio"] = round(
+                                    float(drop_stats["dropped_token_ratio"]),
+                                    6)
+                                moe_extras["rerouted_token_ratio"] = round(
+                                    float(drop_stats["rerouted_token_ratio"]),
+                                    6)
+                                moe_extras["overflow_ratio"] = round(
+                                    float(drop_stats["overflow_ratio"]), 6)
+                                moe_extras["capacity_per_expert"] = int(
+                                    drop_stats["capacity_per_expert"])
+                                moe_extras["capacity_factor"] = float(
+                                    getattr(moe_module.config,
+                                            "capacity_factor", 0.0) or 0.0)
+                            else:
+                                moe_extras["dropped_token_ratio"] = 0.0
+                                moe_extras["rerouted_token_ratio"] = 0.0
                 except Exception:
                     # Keep static extras; UI still sees num_experts/top_k.
                     pass
