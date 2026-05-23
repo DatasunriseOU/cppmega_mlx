@@ -60,6 +60,40 @@ def streaming_load_sharded(paths: Iterable[str | pathlib.Path]
         yield from streaming_load(p)
 
 
+DEFAULT_STREAMING_THRESHOLD_BYTES: int = 1 * 1024 * 1024 * 1024  # 1 GB
+
+
+def load_auto(
+    path: str | pathlib.Path,
+    *,
+    threshold_bytes: int = DEFAULT_STREAMING_THRESHOLD_BYTES,
+    _route: list[str] | None = None,
+) -> dict[str, mx.array]:
+    """V7-C04 AC#3: pick streaming vs bulk based on file size.
+
+    Files > ``threshold_bytes`` (default 1 GiB) load via the streaming
+    iterator so peak host RSS is bounded by one tensor at a time rather
+    than the full safetensors dict.  Smaller files keep the legacy bulk
+    fast path (one ``safetensors.mlx.load_file`` call).
+
+    ``_route`` is a test-only sink that records which path was taken
+    (``\"streaming\"`` or ``\"bulk\"``)."""
+    import safetensors.mlx as st_mlx
+    p = pathlib.Path(path)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    if size > threshold_bytes:
+        if _route is not None:
+            _route.append("streaming")
+        return streaming_load_all(p)
+    if _route is not None:
+        _route.append("bulk")
+    return st_mlx.load_file(str(p))
+
+
 __all__ = [
     "streaming_load", "streaming_load_all", "streaming_load_sharded",
+    "load_auto", "DEFAULT_STREAMING_THRESHOLD_BYTES",
 ]

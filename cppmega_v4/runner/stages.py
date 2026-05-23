@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from functools import partial
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping
@@ -1303,8 +1304,13 @@ def stage_train(ctx: StageContext) -> StageResult:
         ckpt_load = opts.get("checkpoint_load_path")
         if ckpt_load:
             try:
-                import safetensors.mlx as _stmlx
-                loaded = _stmlx.load_file(ckpt_load)
+                # V7-C04: route through load_auto so files > 1 GiB take
+                # the streaming path (peak RSS bounded by one tensor at
+                # a time instead of the full bulk dict).
+                from cppmega_v4.runtime.checkpoint_streaming import (
+                    load_auto as _load_auto,
+                )
+                loaded = _load_auto(ckpt_load)
                 all_modules.update(
                     nn.utils.tree_unflatten(list(loaded.items())))
                 checkpoint_loaded = str(ckpt_load)
@@ -1358,8 +1364,12 @@ def stage_train(ctx: StageContext) -> StageResult:
         opt_state_arch_diff: dict[str, Any] | None = None
         if opt_state_load:
             try:
-                import safetensors.mlx as _stmlx
-                loaded_st = _stmlx.load_file(opt_state_load)
+                # V7-C04: opt-state tables for big AdamW models are also
+                # multi-GB — share the streaming threshold with weights.
+                from cppmega_v4.runtime.checkpoint_streaming import (
+                    load_auto as _load_auto,
+                )
+                loaded_st = _load_auto(opt_state_load)
                 # V01: pull rng_key out of the opt-state bundle before
                 # tree_unflatten so it doesn't pollute opt.state.
                 rng_buf = loaded_st.pop("_rng_key", None)
@@ -1506,6 +1516,52 @@ def stage_train(ctx: StageContext) -> StageResult:
         from cppmega_v4.runtime import run_registry as _run_registry
         _registry_key = opts.get("run_id") or abort_token
         _run_registry.register(_registry_key)
+        # V7-I01 / item 52: when sharding.compile_mode == "whole_model"
+        # we actually wrap the value-and-grad closure with mx.compile
+        # instead of merely echoing the mode as metadata. The compiled
+        # closure captures model.state + optimizer.state + mx.random.state
+        # so MLX can fuse the forward+backward graph once on the first
+        # invocation; subsequent fixed-shape invocations re-use the
+        # compiled artifact. We record whether compile actually engaged
+        # (status), and per-step wall-clock so a downstream bench/test
+        # can prove the warm step << first step (i.e. compilation
+        # produced a measurable speed-up, not a no-op).
+        _compile_mode_train = "off"
+        if ws_sharding is not None:
+            _compile_mode_train = str(getattr(
+                ws_sharding, "compile_mode", "off"))
+        _compile_engaged = False
+        _compile_status = "off"
+        _compile_error: str | None = None
+        _compiled_step_value_and_grad = None
+        if _compile_mode_train == "whole_model":
+            try:
+                _captured_state = [
+                    all_modules.state, opt.state, mx.random.state,
+                ]
+
+                @partial(mx.compile, inputs=_captured_state,
+                         outputs=_captured_state)
+                def _compiled_step_value_and_grad(_emb, _targets):
+                    _loss, _grads = loss_and_grad(
+                        all_modules, _emb, _targets)
+                    return _loss, _grads
+
+                _compile_engaged = True
+                _compile_status = "engaged"
+            except Exception as _ce:  # pragma: no cover
+                _compile_error = (
+                    f"{type(_ce).__name__}: {_ce}")
+                _compile_status = "failed"
+                _compiled_step_value_and_grad = None
+        elif _compile_mode_train == "regional":
+            # Regional compile is delegated to per-brick
+            # maybe_compile_region inside the brick layer (see
+            # cppmega_mlx.training.compiled.REGIONAL_COMPILE_TARGETS).
+            _compile_status = "regional"
+        # Per-step wall-clock so first-step (compile + run) vs warm
+        # steps (compiled fast-path) can be compared.
+        _per_step_ms: list[float] = []
         for step in range(n_steps):
             wait_while_paused(abort_token, poll_s=0.05, max_wait_s=600.0)
             if abort_token is not None and abort_token in _ABORT_TOKENS:
@@ -1534,8 +1590,14 @@ def stage_train(ctx: StageContext) -> StageResult:
                 rng_key, _ = mx.random.split(rng_key)
             else:
                 emb = train_token_embedding(targets)
-            loss, grads = loss_and_grad(all_modules, emb, targets)
+            _step_t0 = time.perf_counter()
+            if _compiled_step_value_and_grad is not None:
+                loss, grads = _compiled_step_value_and_grad(emb, targets)
+            else:
+                loss, grads = loss_and_grad(all_modules, emb, targets)
             mx.eval(loss, grads)
+            _per_step_ms.append(
+                (time.perf_counter() - _step_t0) * 1000.0)
             # V7-D03: unscale the grad tree if we scaled the loss; detect
             # inf/nan overflow. On overflow the optimizer step is skipped
             # and the scaler backs off (dynamic mode). The loss value
@@ -1910,6 +1972,27 @@ def stage_train(ctx: StageContext) -> StageResult:
                        "detail": f"losses={losses}, ratio="
                                  f"{losses[-1] / losses[0]:.2f}"},
             )
+        # V7-I01: enrich sharding_applied with the actual compile
+        # outcome + per-step wall-clock so downstream tests/benches
+        # can prove mx.compile engaged and produced a measurable
+        # first-vs-warm speed-up.
+        if sharding_applied is None:
+            sharding_applied = {}
+        sharding_applied["compile_engaged"] = bool(_compile_engaged)
+        sharding_applied["compile_status"] = str(_compile_status)
+        sharding_applied["compile_error"] = _compile_error
+        # Per-step timing block (always populated even when compile=off)
+        if _per_step_ms:
+            _first_ms = float(_per_step_ms[0])
+            _warm_ms = list(_per_step_ms[1:]) or [_first_ms]
+            sharding_applied["first_step_ms"] = round(_first_ms, 4)
+            sharding_applied["warm_step_ms_mean"] = round(
+                sum(_warm_ms) / len(_warm_ms), 4)
+            sharding_applied["warm_step_ms_min"] = round(
+                min(_warm_ms), 4)
+            sharding_applied["per_step_ms"] = [
+                round(x, 4) for x in _per_step_ms
+            ]
         # V7-H05: signal completion to any WS subscribers.
         try:
             from cppmega_v4.runtime import train_event_bus
