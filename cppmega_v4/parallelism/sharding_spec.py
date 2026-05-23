@@ -128,6 +128,11 @@ class ShardingSpec:
     grad_reduce_dtype: str = "bf16"
     compile_mode: str = "regional"
     fp8_enabled: bool = False
+    mxfp4_enabled: bool = False
+    """V8-R05: forward weights stored as e2m1 block-scaled (4 bits +
+    fp8 e4m3 scale per 16-element block). Saves ~75 % of weight bytes
+    versus bf16; activations / grads stay bf16. Mutually exclusive
+    with ``fp8_enabled``."""
     activation_checkpointing: str = "full"
     comm_backend: CommBackend | str = CommBackend.RING
 
@@ -171,6 +176,10 @@ class ShardingSpec:
                 f"ShardingSpec.grad_reduce_dtype={self.grad_reduce_dtype!r} "
                 f"not in {sorted(_VALID_GRAD_DTYPES)}"
             )
+        if self.fp8_enabled and self.mxfp4_enabled:
+            raise ValueError(
+                "ShardingSpec: fp8_enabled and mxfp4_enabled are "
+                "mutually exclusive (V8-R05); choose one weight format")
         if self.compile_mode not in _VALID_COMPILE_MODES:
             raise ValueError(
                 f"ShardingSpec.compile_mode={self.compile_mode!r} not in "

@@ -51,8 +51,12 @@ QUANT_SCHEME_SYMMETRIC = "symmetric_int8_v1"
 QUANT_SCHEME_DYNAMIC = "dynamic_int8_v1"
 """Identifier for the bitsandbytes-style dynamic 8-bit LUT codec."""
 
-QUANT_SCHEMES = (QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC)
-"""All accepted scheme strings for the 8-bit codecs."""
+QUANT_SCHEME_MXFP4 = "mxfp4_e2m1_v1"
+"""V8-R05 identifier for the OCP MX 4-bit e2m1 codec (Apple Metal)."""
+
+QUANT_SCHEMES = (
+    QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC, QUANT_SCHEME_MXFP4)
+"""All accepted scheme strings for the blockwise codecs."""
 
 
 def num_blocks(numel: int, block_size: int = DEFAULT_BLOCK_SIZE) -> int:
@@ -489,6 +493,16 @@ def quantize_blockwise(
         return quantize_dynamic_blockwise(fp_tensor, block_size)
     if scheme == QUANT_SCHEME_DYNAMIC:
         return quantize_dynamic_lut_blockwise(fp_tensor, block_size)
+    if scheme == QUANT_SCHEME_MXFP4:
+        from cppmega_mlx.quant.mxfp4_metal import (
+            quantize_mxfp4_blockwise, MXFP4_BLOCK_SIZE,
+        )
+        # OCP MX is 16-element-block-only; ignore the caller-provided
+        # block_size when it equals the int8 default (256), which is
+        # the convention 8-bit callers pass blindly.
+        bs = block_size if block_size != DEFAULT_BLOCK_SIZE else \
+            MXFP4_BLOCK_SIZE
+        return quantize_mxfp4_blockwise(fp_tensor, block_size=bs)
     raise ValueError(
         f"unknown quant scheme {scheme!r}; expected one of {QUANT_SCHEMES}"
     )
@@ -500,6 +514,7 @@ def dequantize_blockwise(
     *,
     scheme: str = QUANT_SCHEME_SYMMETRIC,
     out_dtype: mx.Dtype = mx.float32,
+    numel: int | None = None,
 ) -> mx.array:
     """Dispatch the 8-bit dequantize codec by ``scheme`` string."""
 
@@ -507,6 +522,14 @@ def dequantize_blockwise(
         return dequantize_dynamic_blockwise(qdata, absmax, out_dtype=out_dtype)
     if scheme == QUANT_SCHEME_DYNAMIC:
         return dequantize_dynamic_lut_blockwise(qdata, absmax, out_dtype=out_dtype)
+    if scheme == QUANT_SCHEME_MXFP4:
+        from cppmega_mlx.quant.mxfp4_metal import dequantize_mxfp4_blockwise
+        if numel is None:
+            # mxfp4 packs 2 mantissas per byte; without a numel hint we
+            # assume the tail block is full.
+            numel = int(qdata.size) * 2
+        out = dequantize_mxfp4_blockwise(qdata, absmax, numel=numel)
+        return out.astype(out_dtype)
     raise ValueError(
         f"unknown quant scheme {scheme!r}; expected one of {QUANT_SCHEMES}"
     )
@@ -517,6 +540,7 @@ __all__ = [
     "QUANT_BIAS",
     "QUANT_RANGE",
     "QUANT_SCHEME_DYNAMIC",
+    "QUANT_SCHEME_MXFP4",
     "QUANT_SCHEME_SYMMETRIC",
     "QUANT_SCHEMES",
     "create_dynamic_map",
