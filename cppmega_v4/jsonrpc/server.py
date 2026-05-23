@@ -16,7 +16,9 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 
 from cppmega_v4.jsonrpc.cache import LRUCache
@@ -73,6 +75,23 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
     def cache_clear() -> dict[str, str]:
         cache.clear()
         return {"status": "cleared"}
+
+    @app.post("/upload/parquet")
+    async def upload_parquet(file: UploadFile = File(...)) -> dict[str, str | int]:
+        """E-AUDIT-01: persist an uploaded parquet to /tmp/vbgui_uploads
+        and return its absolute path so DataInspector can populate the
+        path field. 24 h TTL + 100-file cap applied on every upload."""
+        from cppmega_v4.jsonrpc.uploads import save_upload
+        if not file.filename or not file.filename.endswith(".parquet"):
+            raise HTTPException(
+                status_code=400, detail="only .parquet uploads accepted")
+        body = await file.read()
+        if not body:
+            raise HTTPException(
+                status_code=400, detail="empty upload body")
+        path = save_upload(body)
+        return {"path": path, "bytes": len(body),
+                "filename": file.filename}
 
     @app.post("/rpc")
     async def rpc(payload: dict) -> dict:

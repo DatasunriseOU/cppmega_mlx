@@ -196,6 +196,39 @@ export function DataInspector({
                value={path}
                onChange={(e) => setPath(e.target.value)}
                style={{ flex: 1, fontFamily: "monospace", fontSize: 11 }} />
+        {/* E-AUDIT-01: file upload picker. POSTs to /upload/parquet,
+            auto-populates the path field with the returned absolute
+            path under /tmp/vbgui_uploads/<uuid>.parquet. */}
+        <input data-testid="data-inspector-file-upload"
+               type="file" accept=".parquet"
+               onChange={async (ev) => {
+                 const f = ev.target.files?.[0];
+                 if (!f) return;
+                 const fd = new FormData();
+                 fd.append("file", f);
+                 const baseUrl = (
+                   (import.meta.env.VITE_BACKEND_URL as string | undefined)
+                   ?? "http://127.0.0.1:8765");
+                 try {
+                   const res = await fetch(
+                     `${baseUrl}/upload/parquet`,
+                     { method: "POST", body: fd });
+                   if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                   const body = await res.json() as { path: string };
+                   setPath(body.path);
+                 } catch (err) {
+                   // Surface to the parent error pill — kept inline so
+                   // the upload picker has its own testable error testid.
+                   const msg = err instanceof Error
+                     ? err.message : String(err);
+                   const errEl = document.querySelector(
+                     "[data-testid='data-inspector-file-upload-error']");
+                   if (errEl) errEl.textContent = msg;
+                 }
+               }}
+               style={{ fontSize: 11 }} />
+        <span data-testid="data-inspector-file-upload-error"
+              style={{ color: "#b91c1c", fontSize: 10 }} />
         <button data-testid="data-load" onClick={() => load(0)}>
           Load
         </button>
