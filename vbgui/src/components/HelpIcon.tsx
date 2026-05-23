@@ -4,7 +4,11 @@
 
 import { useState } from "react";
 import { createPortal } from "react-dom";
-import { TENSOR_DIAGRAMS } from "./diagrams";
+import {
+  TENSOR_DIAGRAMS, TOPIC_WORKED_EXAMPLES, WORKED_EXAMPLES,
+  TOPIC_FOUNDATIONS, MATH_FOUNDATIONS,
+  WorkedExampleDiagram, MathLink,
+} from "./diagrams";
 import { T } from "@/theme";
 
 export interface HelpTopic {
@@ -1050,6 +1054,41 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
                     <Diag />
                   </Section>
                 ) : null;
+              })()}
+              {(() => {
+                const exKey = TOPIC_WORKED_EXAMPLES[topic];
+                const ex = exKey ? WORKED_EXAMPLES[exKey] : null;
+                return ex ? (
+                  <Section label="Worked example"
+                            testid="help-modal-worked-example">
+                    <WorkedExampleDiagram example={ex} />
+                  </Section>
+                ) : null;
+              })()}
+              {(() => {
+                const keys = TOPIC_FOUNDATIONS[topic] ?? [];
+                if (keys.length === 0) return null;
+                return (
+                  <Section label="Math foundations"
+                            testid="help-modal-math-foundations">
+                    {keys.map((k) => {
+                      const m = MATH_FOUNDATIONS[k];
+                      if (!m) return null;
+                      return (
+                        <div key={k} style={{ marginBottom: 4 }}>
+                          <MathLink topic={k}
+                                     gloss={m.gloss}
+                                     url={m.urls[0]?.url ?? "#"} />
+                          <div style={{ color: "#94a3b8",
+                                         fontSize: 11,
+                                         padding: "2px 12px 6px" }}>
+                            <em>{m.key_insight}</em>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </Section>
+                );
               })()}
               <Section label="Why" testid="help-modal-why">
                 {entry.why}

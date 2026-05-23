@@ -49,4 +49,26 @@ export const TENSOR_DIAGRAMS: Record<string, () => JSX.Element> = {
 };
 
 
-export { DIAG_THEME } from "./TensorDiagram";
+export { DIAG_THEME, MatrixGrid, MathLink } from "./TensorDiagram";
+export { WORKED_EXAMPLES, type WorkedExample } from "./worked_examples";
+export { MATH_FOUNDATIONS, TOPIC_FOUNDATIONS,
+         type MathConcept } from "./math_foundations";
+export { WorkedExampleDiagram } from "./WorkedExampleDiagram";
+
+
+// Topic → worked-example key. Same fall-back semantics as the
+// diagram registry: when both are present in HelpModal, both render
+// (schematic flow diagram first, then concrete numerical example).
+export const TOPIC_WORKED_EXAMPLES: Record<string, string> = {
+  brick_attention:        "attention",
+  brick_gated_attention:  "attention",
+  brick_mla:              "attention",
+  brick_gqa_sliding:      "attention",
+  brick_cca_attention:    "attention",
+  brick_mlp:              "mlp",
+  brick_moe:              "moe",
+  brick_bailing_moe:      "moe",
+  adapter_rmsnorm:        "rmsnorm",
+  // Math foundations also expose their own worked examples.
+  metric_perplexity:      "softmax",
+};

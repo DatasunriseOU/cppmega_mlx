@@ -1953,7 +1953,7 @@ export function App(): JSX.Element {
                       const params = (node.data as {
                         params?: Record<string, unknown> })
                         ?.params ?? {};
-                      const dim_env = snap.spec.dim_env;
+                      const dim_env = snap.dimEnv;
                       const minimal_spec = {
                         graph: {
                           nodes: [

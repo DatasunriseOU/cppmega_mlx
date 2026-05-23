@@ -43,7 +43,9 @@ describe("w2t6: HelpModal slot for the diagram", () => {
     render(<HelpIcon topic="brick_attention" />);
     fireEvent.click(screen.getByTestId("help-icon-brick_attention"));
     expect(screen.getByTestId("help-modal-diagram")).toBeDefined();
-    expect(screen.getByTestId("tensor-diagram")).toBeDefined();
+    // Two tensor-diagrams now: schematic + worked-example.
+    expect(screen.getAllByTestId("tensor-diagram").length)
+      .toBeGreaterThanOrEqual(1);
   });
 
   it("omits the diagram section for topics without a diagram", () => {
