@@ -22,6 +22,28 @@ export type TrainExtras = {
     schedule_kind: string;
     num_brick_kinds: number;
   };
+  // V7-Q07.1: extended badge / panel fields read via TrainExtrasOverlay
+  // testids. All optional — scenarios that don't activate these
+  // features still see undefined and skip the assertion.
+  losses_smoothed?: number[];
+  val_losses?: number[];
+  perplexity?: number;
+  bits_per_byte?: number;
+  master_dtype?: string;
+  dtype_actual?: string;
+  fp8_active?: boolean;
+  fim_active?: boolean;
+  fim_ratio?: number;
+  sharding_applied?: boolean;
+  side_channels_observed?: string[];
+  per_brick_grad_norms?: Record<string, number>;
+  routing_entropy?: number;
+  load_balance_loss?: number;
+  per_expert_load?: number[];
+  capacity_factor?: number;
+  num_experts?: number;
+  gradient_reduce_ms?: number;
+  loss_scaler_overflows?: number[];
 };
 
 async function textOf(page: Page, testid: string): Promise<string> {
@@ -80,8 +102,68 @@ export async function readTrainExtras(page: Page): Promise<TrainExtras> {
       await textOf(page, `${ms_base}-num_brick_kinds`), 10),
   };
 
+  // V7-Q07.1: read optional badge values + chart series + arrays via
+  // the TrainExtrasOverlay testid contract. Each lookup is wrapped in
+  // a try so scenarios that don't activate the feature stay green
+  // (extras key absent on backend -> testid not in DOM -> undefined).
+  async function optText(testid: string): Promise<string | undefined> {
+    try {
+      const txt = await page.getByTestId(testid).textContent({
+        timeout: 500,
+      });
+      return txt?.trim();
+    } catch {
+      return undefined;
+    }
+  }
+  async function optNum(testid: string): Promise<number | undefined> {
+    const t = await optText(testid);
+    if (t == null || t === "") return undefined;
+    const n = parseFloat(t);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  async function optBool(testid: string): Promise<boolean | undefined> {
+    const t = await optText(testid);
+    if (t == null) return undefined;
+    return /on|true|1/i.test(t);
+  }
+  async function optArray(base: string): Promise<number[] | undefined> {
+    try {
+      const count = await page.locator(`[data-testid^='${base}-']`).count();
+      if (count === 0) return undefined;
+      const out: number[] = [];
+      for (let i = 0; i < count; i++) {
+        const t = await optText(`${base}-${i}`);
+        if (t == null) continue;
+        const n = parseFloat(t);
+        if (Number.isFinite(n)) out.push(n);
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const losses_smoothed = await optArray(
+    "run-result-extras-train-losses_smoothed");
+  const val_losses = await optArray("run-result-extras-train-val_losses");
+  const perplexity = await optNum("extras-badge-perplexity");
+  const bits_per_byte = await optNum("extras-badge-bpb");
+  const master_dtype = await optText("extras-badge-master_dtype");
+  const dtype_actual = await optText("extras-badge-dtype_actual");
+  const fp8_active = await optBool("extras-badge-fp8_active");
+  const fim_active = await optBool("extras-badge-fim_active");
+  const fim_ratio = await optNum("extras-badge-fim_ratio");
+  const sharding_applied = await optBool("extras-sharding-panel");
+  const gradient_reduce_ms = await optNum("extras-badge-gradient_reduce_ms");
+  const loss_scaler_overflows = await optArray(
+    "run-result-extras-train-loss_scaler_overflows");
+
   return {
     losses, lr_trajectory, weight_delta_norm, num_steps,
     schedule_kind, optimizer_kind, model_summary,
+    losses_smoothed, val_losses, perplexity, bits_per_byte,
+    master_dtype, dtype_actual, fp8_active, fim_active, fim_ratio,
+    sharding_applied, gradient_reduce_ms, loss_scaler_overflows,
   };
 }
