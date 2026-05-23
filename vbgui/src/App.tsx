@@ -5,6 +5,8 @@ import {
 
 import { FlowCanvas } from "@/components/FlowCanvas";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
+import { GalleryTab } from "@/components/GalleryTab";
+import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
 import { TopBar, type RunMode } from "@/components/TopBar";
@@ -153,6 +155,11 @@ export function App(): JSX.Element {
   // re-run verify and surface the F56b mismatch warning.
   const [dimEnv, setDimEnv] = useState<Record<string, number>>(
     { ...MINI_DIM_ENV });
+
+  // V7-F58: per-preset gallery cache + refresh tracking.
+  const gallery = useGalleryCache();
+  const [galleryRefreshing, setGalleryRefreshing] = useState<Set<string>>(
+    new Set());
 
   // Keep one stable spec snapshot for the verify debouncer to read.
   const wireSpecRef = useRef({ nodes, edges, spec, availableSideChannels,
@@ -606,6 +613,21 @@ export function App(): JSX.Element {
             };
             reader.readAsText(file);
           }}
+          onDtypeCostEstimate={async () => {
+            // V7-D06: small inline probe; UI renders ms/token per option.
+            return rpc.call<{
+              rows: Array<{
+                dtype: "fp32" | "bf16" | "fp16";
+                supported: boolean;
+                fwd_ms: number | null;
+                fwdbwd_ms: number | null;
+                fwd_ms_per_token: number | null;
+                fwdbwd_ms_per_token: number | null;
+                cast_overhead_ms: number | null;
+                error: string | null;
+              }>
+            }>("dtype.cost_estimate", {});
+          }}
           onInspectCheckpoint={async (path: string) => {
             // V7-C03: thin pass-through to ckpt.inspect RPC. Errors
             // surface as the TopBar's "no cppmega metadata" / error
@@ -803,6 +825,71 @@ export function App(): JSX.Element {
               }}
               onAvailableChannelsChange={setAvailableSideChannels}
               trainParquetPath={trainParquetPath} />
+          )}
+          {activeTab === "gallery" && (
+            <GalleryTab
+              presets={PRESETS}
+              cache={gallery.cache}
+              refreshing={galleryRefreshing}
+              onRefresh={async (preset) => {
+                setGalleryRefreshing((s) => new Set(s).add(preset));
+                try {
+                  const t0 = Date.now();
+                  const r = await rpc.call<{ specs: BrickSpec[];
+                                             preset_name: string }>(
+                    "build_preset_specs",
+                    { preset_name: preset, hidden_size: dimEnv.H ?? 128 },
+                  );
+                  const { nodes: ns, edges: es } = presetSpecsToNodes(
+                    r.specs);
+                  const verifyParams = {
+                    graph: { nodes: ns.map((n) => ({
+                                 id: n.id,
+                                 kind: (n.data as { kind: string }).kind,
+                                 params: (n.data as { params?: Record<string, unknown> })
+                                          .params ?? {} })),
+                             edges: es.map((e) => ({
+                                 src: e.source, dst: e.target })) },
+                    dim_env: dimEnv,
+                    loss: { kind: "cross_entropy",
+                            head_outputs: ns.length > 0
+                              ? [ns[ns.length - 1].id]
+                              : [] },
+                    optim: { kind: "adamw",
+                             groups: [{ matcher: "all", lr: 1e-3,
+                               weight_decay: 0.01, betas: [0.9, 0.95] }] },
+                    sharding: null,
+                  };
+                  const v = await rpc.call<{
+                    memory_per_brick?: Record<string, { params_bytes: number;
+                                                       activations_bytes: number }>;
+                    elapsed_ms: number;
+                  }>("verify", verifyParams);
+                  let totalParams = 0;
+                  let totalMem = 0;
+                  for (const rec of Object.values(v.memory_per_brick ?? {})) {
+                    totalParams += rec.params_bytes;
+                    totalMem += rec.params_bytes + rec.activations_bytes;
+                  }
+                  gallery.upsert({
+                    preset,
+                    bricks: ns.length,
+                    params_M: totalParams / 4 / 1_000_000,
+                    mem_MB: totalMem / 1_000_000,
+                    last_step_ms: Date.now() - t0,
+                    run_at: Date.now(),
+                  });
+                } catch {
+                  gallery.upsert({
+                    preset, bricks: 0, run_at: Date.now(),
+                  });
+                } finally {
+                  setGalleryRefreshing((s) => {
+                    const n = new Set(s); n.delete(preset); return n;
+                  });
+                }
+              }}
+            />
           )}
         </div>
         <BottomStrip state={spec} fusedRegionCount={0} />
