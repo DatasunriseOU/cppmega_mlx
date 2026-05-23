@@ -64,6 +64,12 @@ class GenRunParams(BaseModel):
     # is reproducible across reruns.
     moe_num_experts: int = Field(0, ge=0, le=512)
     moe_top_k: int = Field(2, ge=1, le=16)
+    # V7-H39: speculative-decode smoke. When speculative_k > 0, gen.run
+    # runs the cppmega_mlx.inference.speculative_decode acceptance
+    # helper against synthetic draft+target logits. Identical draft +
+    # target (default smoke) must yield accept_rate > 0.5 — sanity gate
+    # that the helper wiring is sound.
+    speculative_k: int = Field(0, ge=0, le=32)
 
 
 class GenRunEvent(BaseModel):
@@ -91,6 +97,9 @@ class GenRunResult(BaseModel):
     #    "dropped_token_ratio": 0.0  # always 0 at inference per AC#3
     #   }.
     moe: dict | None = None
+    # V7-H39: speculative-decode smoke result. None unless speculative_k
+    # was set. Shape: {k, draft_tokens, accepted, accept_rate}.
+    speculative: dict | None = None
 
 
 def _build_step_fn(params: GenRunParams):
@@ -214,6 +223,44 @@ def gen_run(
     events = [GenRunEvent(step=int(e.get("step", i)),
                            token=int(e.get("token_id", 0)))
               for i, e in enumerate(raw_events)]
+    # V7-H39: speculative-decode smoke — only runs when explicitly
+    # requested via speculative_k > 0, so the default gen.run path is
+    # unchanged. Uses synthetic identical draft+target logits keyed on
+    # the same seed; cppmega_mlx.inference.speculative_decode.
+    # speculative_acceptance is the unit under test.
+    speculative_state: dict | None = None
+    if params.speculative_k > 0:
+        import mlx.core as mx
+        from cppmega_mlx.inference.speculative_decode import (
+            speculative_acceptance,
+        )
+        K = int(params.speculative_k)
+        vocab = max(2, params.vocab_size)
+        rng_key = mx.random.key(params.seed + 1)
+        draft_logits = mx.random.normal((K, vocab), key=rng_key)
+        target_logits = draft_logits.reshape(K, vocab)
+        # Pad target_logits to (K+1, vocab) to match the helper's
+        # contract — final row is the position-after-last token.
+        bonus = mx.random.normal((1, vocab),
+                                   key=mx.random.key(params.seed + 2))
+        target_logits = mx.concatenate([target_logits, bonus], axis=0)
+        draft_tokens = mx.argmax(draft_logits, axis=-1)
+        _accepted_seq, num_accepted, _bonus = speculative_acceptance(
+            draft_logits=draft_logits,
+            target_logits=target_logits,
+            draft_tokens=draft_tokens,
+            temperature=1.0,
+            rng_key=mx.random.key(params.seed + 3),
+        )
+        accept_rate = (
+            float(num_accepted) / float(K) if K > 0 else 0.0)
+        speculative_state = {
+            "k": K,
+            "draft_tokens": [int(x) for x in draft_tokens.tolist()],
+            "accepted": int(num_accepted),
+            "accept_rate": round(accept_rate, 6),
+        }
+
     return GenRunResult(
         tokens=tokens,
         finish_reason=reason,
@@ -223,6 +270,7 @@ def gen_run(
         smoke=params.smoke,
         kv_cache=kv_cache_state,
         moe=moe_state,
+        speculative=speculative_state,
     )
 
 
