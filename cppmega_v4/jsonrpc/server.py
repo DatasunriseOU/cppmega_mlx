@@ -79,6 +79,41 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
         response = await _dispatch(payload, cache)
         return response.model_dump(mode="json", exclude_none=True)
 
+    @app.websocket("/ws/gen/{job_id}")
+    async def ws_gen(socket: WebSocket, job_id: str) -> None:
+        """V7-F06: live token stream from gen.run.
+
+        Client opens this WS *before* calling gen.run with the same
+        job_id, then receives {job_id, event:{step, token_id,
+        finish_reason}} frames until {finish:'ok'} fires."""
+        from cppmega_v4.runtime import gen_event_bus
+        import queue as _queue
+        await socket.accept()
+        q = gen_event_bus.subscribe(job_id)
+
+        def _try_get(timeout: float = 0.2):
+            try:
+                return q.get(timeout=timeout)
+            except _queue.Empty:
+                return _SENTINEL_EMPTY
+
+        try:
+            while True:
+                ev = await asyncio.to_thread(_try_get, 0.2)
+                if ev is _SENTINEL_EMPTY:
+                    await asyncio.sleep(0)
+                    continue
+                if ev is None:
+                    await socket.send_json({"finish": "ok",
+                                             "job_id": job_id})
+                    return
+                await socket.send_json({"job_id": job_id,
+                                         "event": ev})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            gen_event_bus.unsubscribe(job_id, q)
+
     @app.websocket("/ws/train/{run_id}")
     async def ws_train(socket: WebSocket, run_id: str) -> None:
         """V7-H05: live per-step training metric stream.

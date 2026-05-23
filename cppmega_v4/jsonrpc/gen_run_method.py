@@ -22,7 +22,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from cppmega_v4.jsonrpc.cache import LRUCache
-from cppmega_v4.runtime.generate_stream import collect_stream
+from cppmega_v4.runtime import gen_event_bus
+from cppmega_v4.runtime.generate_stream import stream_generate
 from cppmega_v4.runtime.samplers import (
     greedy, temperature_sample, top_k_sample, top_p_sample,
 )
@@ -53,6 +54,9 @@ class GenRunParams(BaseModel):
     # GenRunResult.kv_cache. 0 disables KV-cache reporting.
     kv_cache_layers: int = Field(0, ge=0, le=128)
     kv_cache_head_dim: int = Field(16, ge=1, le=4096)
+    # V7-F06: optional job_id; when set, gen_run publishes each token
+    # onto gen_event_bus so /ws/gen/{job_id} subscribers see streaming.
+    job_id: str | None = None
 
 
 class GenRunEvent(BaseModel):
@@ -141,12 +145,25 @@ def gen_run(
             kv_cache_state["growth_events"] += 1
         return tok
 
-    tokens, reason, raw_events = collect_stream(
+    # V7-F06: when a job_id was supplied, route through stream_generate
+    # with an on_token callback that publishes onto the bus, then mirror
+    # the same collected events for the synchronous return path.
+    raw_events: list[dict] = []
+
+    def _on_token(ev: dict) -> None:
+        raw_events.append(ev)
+        if params.job_id:
+            gen_event_bus.publish(params.job_id, ev)
+
+    tokens, reason = stream_generate(
         initial_tokens=list(params.prompt_tokens),
         step_fn=_step,
         eos_token_id=params.eos_token_id,
         max_new_tokens=params.max_new_tokens,
+        on_token=_on_token,
     )
+    if params.job_id:
+        gen_event_bus.publish(params.job_id, None)
     if kv_obj is not None:
         kv_cache_state["total_bytes"] = int(kv_obj.total_bytes())
         kv_cache_state["lengths_per_layer"] = [
