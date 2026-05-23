@@ -27,7 +27,7 @@ test("F54: transplant moe from llama4_maverick into llama3_8b", async ({
   // Select the moe brick — name from _mixtral_like factory is
   // <prefix>_moe = "llama4_maverick_moe". The select option value
   // is the brick's name (we passed `name` from build_preset_specs).
-  await brickSel.selectOption({ label: /llama4_maverick_moe/ });
+  await brickSel.selectOption("llama4_maverick_moe");
   await page.getByTestId("transplant-import").click();
 
   // The transplanted node appears with an id derived from the kind +
