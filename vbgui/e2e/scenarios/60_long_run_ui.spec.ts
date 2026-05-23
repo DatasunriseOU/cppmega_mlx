@@ -81,7 +81,10 @@ test("H06 @long-running: N=100 real-corpus walk through UI", async ({ page }) =>
   // Real-data path activated (not synthetic).
   const dataSource = await page.getByTestId(
     "run-result-extras-train-data_source").textContent();
-  expect(dataSource?.trim()).toBe("parquet_tokenized");
+  // V7-G01 added a multi-shard `parquet_tokenized_stream` label
+  // alongside the single-shard `parquet_tokenized`; H06 accepts both.
+  expect(["parquet_tokenized", "parquet_tokenized_stream"])
+    .toContain(dataSource?.trim() ?? "");
 
   await closeModal(page);
 });
