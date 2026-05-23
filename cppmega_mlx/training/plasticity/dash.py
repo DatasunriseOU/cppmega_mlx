@@ -92,24 +92,36 @@ def _lookup_in_pytree(root: Any, path: list[str]) -> mx.array | None:
 
 def _set_nested(root: dict[str, Any], path: list[str], value: mx.array) -> None:
     cursor: Any = root
-    for piece in path[:-1]:
+    for i, piece in enumerate(path[:-1]):
         next_cursor: Any
+        next_is_digit = (i + 1 < len(path)
+                         and path[i + 1].isdigit())
         if piece.isdigit():
             idx = int(piece)
             if not isinstance(cursor, list):
                 raise TypeError("array path expects list cursor")
             while len(cursor) <= idx:
-                cursor.append({})
+                cursor.append([] if next_is_digit else {})
             next_cursor = cursor[idx]
-            if next_cursor is None or not isinstance(next_cursor, (dict, list)):
-                next_cursor = {}
+            want_list = next_is_digit
+            if next_cursor is None or not isinstance(next_cursor,
+                                                      (dict, list)):
+                next_cursor = [] if want_list else {}
+                cursor[idx] = next_cursor
+            elif want_list and isinstance(next_cursor, dict):
+                next_cursor = []
                 cursor[idx] = next_cursor
         else:
             if not isinstance(cursor, dict):
                 raise TypeError("dict path expects dict cursor")
             next_cursor = cursor.get(piece)
-            if next_cursor is None or not isinstance(next_cursor, (dict, list)):
-                next_cursor = {}
+            want_list = next_is_digit
+            if next_cursor is None or not isinstance(next_cursor,
+                                                      (dict, list)):
+                next_cursor = [] if want_list else {}
+                cursor[piece] = next_cursor
+            elif want_list and isinstance(next_cursor, dict):
+                next_cursor = []
                 cursor[piece] = next_cursor
         cursor = next_cursor
     last = path[-1]

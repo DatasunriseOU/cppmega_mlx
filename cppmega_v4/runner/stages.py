@@ -1005,6 +1005,11 @@ def stage_train(ctx: StageContext) -> StageResult:
         # scaled wrapper happens at that init site.
         loss_scaler = None
         loss_scaler_overflow_steps: list[int] = []
+        # V7-E33..E35: plasticity-step trace (FIRE/DASH/ReDo). Populated
+        # in the train loop when the respective opts knob is set; ends
+        # up in extras.plasticity so the UI can render which steps
+        # fired which interventions.
+        plasticity_extras: dict[str, Any] = {}
 
         # V4-11: inference probe — forward over a fixed-seed input both
         # before training and after; report l2 and cosine drift.
@@ -1733,6 +1738,76 @@ def stage_train(ctx: StageContext) -> StageResult:
                 
                 if loss_scaler is not None:
                     loss_scaler.update(False)
+            # V7-E33..E35: Plasticity Toolkit (FIRE / DASH / ReDo).
+            # Modules existed in cppmega_mlx.training.plasticity but had
+            # no caller in stage_train. opts knobs (all default-off so
+            # existing tests/extras stay byte-identical):
+            #   fire_at_step:    int|None — fire once when step==value.
+            #   dash_every:      int>0    — apply DASH every N steps.
+            #   dash_alpha:      float    — DASH cos-sim threshold.
+            #   dash_shrink:     float    — DASH shrinkage rate.
+            #   redo_every:      int>0    — recycle ReDo dormant every N.
+            #   redo_dormant_threshold: float — ReDo activation EMA ratio.
+            try:
+                from cppmega_mlx.training import plasticity as _plast
+                fire_at = opts.get("fire_at_step")
+                if (fire_at is not None
+                        and int(fire_at) == step
+                        and step >= 0):
+                    fired_keys = _plast.apply_fire(all_modules)
+                    plasticity_extras["fire_fired_at_step"] = step
+                    plasticity_extras["fire_keys_modified"] = sorted(
+                        fired_keys)
+                    if fired_keys:
+                        try:
+                            _plast.reset_optimizer_states_for_fired_keys(
+                                opt, fired_keys)
+                        except Exception:
+                            pass
+                dash_every = int(opts.get("dash_every", 0) or 0)
+                if dash_every > 0 and (step + 1) % dash_every == 0:
+                    touched = _plast.dash_step_tree(
+                        all_modules, grads,
+                        alpha=float(opts.get("dash_alpha", 0.95)),
+                        shrink_rate=float(opts.get("dash_shrink", 0.99)),
+                    )
+                    plasticity_extras.setdefault(
+                        "dash_steps_applied", []).append(step)
+                    plasticity_extras["dash_last_keys_count"] = len(touched)
+                # ReDo runs against a dormancy proxy built from
+                # per-brick grad-norms — a zero-grad brick is dormant.
+                # The full activation-EMA path requires forward hooks
+                # and is gated by opts.redo_layer_map (a caller-supplied
+                # dict mapping name → (in_modules, out_module)).
+                redo_every = int(opts.get("redo_every", 0) or 0)
+                if (redo_every > 0
+                        and (step + 1) % redo_every == 0
+                        and opts.get("redo_layer_map")):
+                    try:
+                        gnorms = _safe_per_brick_grads(
+                            all_modules, grads)
+                        stats = {k: mx.array(
+                            [float(v)], dtype=mx.float32)
+                                  for k, v in gnorms.items()}
+                        n_recycled = _plast.recycle_dormant_neurons(
+                            opts["redo_layer_map"], stats,
+                            tau=float(opts.get(
+                                "redo_dormant_threshold", 0.025)),
+                        )
+                        plasticity_extras.setdefault(
+                            "redo_steps_applied", []).append(step)
+                        plasticity_extras["redo_last_recycled"] = (
+                            int(n_recycled))
+                    except Exception as _exc:
+                        plasticity_extras.setdefault(
+                            "redo_errors", []).append(str(_exc))
+            except Exception as _plast_exc:
+                # Plasticity is opt-in and best-effort — never blocks
+                # the training step. Surface the failure so the UI
+                # honest-closure shows which intervention silently fell
+                # through (instead of pretending it ran).
+                plasticity_extras.setdefault("errors", []).append(
+                    f"{type(_plast_exc).__name__}: {_plast_exc}")
             losses.append(float(loss.item()))
             # V7-H06b: keep run_registry's last_step/last_loss live so
             # pipeline.status reflects the most recent committed step.
@@ -2120,6 +2195,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "comm_backend": str(proxy.comm_backend.value) if proxy is not None else None,
                 "is_simulated": bool(proxy.is_simulated) if proxy is not None else None,
                 "fake_ranks": fake_ranks,
+                # V7-E33..E35: plasticity trace (FIRE/DASH/ReDo) —
+                # empty dict when none of the knobs fired.
+                "plasticity": plasticity_extras,
                 # V7-B-real: surface whether distributed actually
                 # engaged so the UI honest-closure can distinguish
                 # the real DP path from the fake_ranks replay.
