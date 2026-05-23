@@ -810,6 +810,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "architectures.scale_down",
     "memory.matrix",
     "architectures.auto_fit",
+    "data.hf_quickstart",
 })
 
 

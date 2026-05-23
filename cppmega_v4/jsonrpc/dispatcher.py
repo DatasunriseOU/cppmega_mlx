@@ -83,6 +83,10 @@ from cppmega_v4.jsonrpc.auto_fit_method import (
     AutoFitParams,
     auto_fit,
 )
+from cppmega_v4.jsonrpc.hf_quickstart_method import (
+    HfQuickstartParams,
+    hf_quickstart_method,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -144,6 +148,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "architectures.auto_fit": (
         AutoFitParams,
         lambda p, c: auto_fit(p, cache=c),
+    ),
+    "data.hf_quickstart": (
+        HfQuickstartParams,
+        lambda p, c: hf_quickstart_method(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,

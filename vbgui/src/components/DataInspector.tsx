@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
+import { HFQuickStartModal } from "@/components/HFQuickStartModal";
 
 export interface PreviewRow {
   row_index: number;
@@ -126,6 +127,7 @@ export function DataInspector({
   onUseForTrain, trainParquetPath, onAvailableChannelsChange,
 }: DataInspectorProps): JSX.Element {
   const [path, setPath] = useState(initialPath);
+  const [hfModalOpen, setHfModalOpen] = useState(false);
   const [offset, setOffset] = useState(0);
   const [result, setResult] = useState<PreviewParquetResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -246,7 +248,18 @@ export function DataInspector({
                 }}>
           {trainParquetPath === path ? "✓ Training" : "Use for training"}
         </button>
+        <button data-testid="hf-quickstart-modal-open"
+                onClick={() => setHfModalOpen(true)}
+                style={{ background: "#eef2ff", color: "#3730a3" }}>
+          HF quickstart
+        </button>
       </header>
+      <HFQuickStartModal
+        rpc={rpc}
+        open={hfModalOpen}
+        onClose={() => setHfModalOpen(false)}
+        onResult={(parquetPath) => setPath(parquetPath)}
+      />
       <header style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <span style={{ fontSize: 11, color: "#6b7280" }}>Tokenizer:</span>
         <input data-testid="data-tokenizer-path"

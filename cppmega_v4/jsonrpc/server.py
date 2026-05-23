@@ -171,6 +171,43 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
         finally:
             train_event_bus.unsubscribe(run_id, q)
 
+    @app.websocket("/ws/data/{job_id}")
+    async def ws_data(socket: WebSocket, job_id: str) -> None:
+        """V8-R09: live data-job progress stream.
+
+        The UI opens this WS *before* invoking data.hf_quickstart or
+        data.github_corpus with the same ``job_id``. Producer publishes
+        {phase: "start"|"progress"|"done", ...} dicts onto
+        ``data_event_bus``; the None sentinel ends the stream with a
+        final {finish:"ok"} frame."""
+        from cppmega_v4.runtime import data_event_bus
+        import queue as _queue
+        await socket.accept()
+        q = data_event_bus.subscribe(job_id)
+
+        def _try_get(timeout: float = 0.2):
+            try:
+                return q.get(timeout=timeout)
+            except _queue.Empty:
+                return _SENTINEL_EMPTY
+
+        try:
+            while True:
+                ev = await asyncio.to_thread(_try_get, 0.2)
+                if ev is _SENTINEL_EMPTY:
+                    await asyncio.sleep(0)
+                    continue
+                if ev is None:
+                    await socket.send_json({"finish": "ok",
+                                             "job_id": job_id})
+                    return
+                await socket.send_json({"job_id": job_id,
+                                         "event": ev})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            data_event_bus.unsubscribe(job_id, q)
+
     @app.websocket("/ws/verify/{spec_hash}")
     async def ws_verify(socket: WebSocket, spec_hash: str) -> None:
         """V7-L45: live verify progress stream.
