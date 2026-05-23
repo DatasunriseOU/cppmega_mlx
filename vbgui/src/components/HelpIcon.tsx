@@ -1238,6 +1238,7 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
                       <strong>Key identity: </strong>
                       {bw.key_identity}
                     </div>
+                    {bw.api && <BackwardApiTabs api={bw.api} />}
                   </Section>
                 );
               })()}
@@ -1418,5 +1419,69 @@ function Section({
         {children}
       </div>
     </section>
+  );
+}
+
+
+type Framework = "mlx" | "pytorch" | "jax";
+const FRAMEWORK_LABELS: Record<Framework, string> = {
+  mlx:     "MLX (Apple Silicon)",
+  pytorch: "PyTorch (CUDA / CPU)",
+  jax:     "JAX (TPU / GPU / CPU)",
+};
+
+function BackwardApiTabs({
+  api,
+}: { api: { mlx?: string; pytorch?: string; jax?: string } }): JSX.Element {
+  const frameworks = (
+    Object.keys(api) as Framework[]
+  ).filter((k) => api[k]);
+  const [active, setActive] = useState<Framework>(
+    frameworks[0] ?? "mlx",
+  );
+  const snippet = api[active] ?? "";
+  return (
+    <div data-testid="help-modal-backward-api"
+         style={{ marginTop: 8 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+        {frameworks.map((f) => (
+          <button
+            key={f}
+            type="button"
+            data-testid={`help-modal-backward-api-tab-${f}`}
+            onClick={() => setActive(f)}
+            style={{
+              padding: "4px 10px",
+              fontSize: 11,
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 4,
+              cursor: "pointer",
+              background: active === f
+                ? "rgba(34, 211, 238, 0.18)"
+                : "rgba(255,255,255,0.04)",
+              color: active === f ? "#22d3ee" : "#94a3b8",
+              fontWeight: active === f ? 700 : 400,
+            }}
+          >
+            {FRAMEWORK_LABELS[f]}
+          </button>
+        ))}
+      </div>
+      <pre data-testid={`help-modal-backward-api-snippet-${active}`}
+           style={{
+             margin: 0,
+             padding: "8px 10px",
+             background: "rgba(15, 23, 42, 0.6)",
+             border: "1px solid rgba(34, 211, 238, 0.2)",
+             borderRadius: 4,
+             fontFamily: "ui-monospace, monospace",
+             fontSize: 11,
+             color: "#e2e8f0",
+             whiteSpace: "pre-wrap",
+             overflowX: "auto",
+           }}>
+        {snippet}
+      </pre>
+    </div>
   );
 }

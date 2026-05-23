@@ -32,7 +32,8 @@ describe("backward-pass coverage", () => {
   it("attention backward references the softmax Jacobian", () => {
     const e = BACKWARD_TOPICS.brick_attention;
     expect(e.chain_rule).toMatch(/softmax/i);
-    expect(e.chain_rule).toMatch(/mx\.grad/);
+    // chain_rule is framework-agnostic now; mx.grad lives in api.mlx.
+    expect(e.api?.mlx ?? "").toMatch(/mx\.grad/);
     expect(e.key_identity).toMatch(/softmax|row-Jacobian/i);
   });
 

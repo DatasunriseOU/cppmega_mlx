@@ -1,16 +1,16 @@
 /**
- * Backward-pass walkthroughs per brick. Each entry describes:
- *   - differentiates: what scalar function and w.r.t. which params/inputs
- *   - chain_rule:     how the upstream cotangent ḡ = dL/dy propagates
- *                     through the brick's local Jacobian (named tensors,
- *                     explicit reverse steps, MLX `mx.grad` invocation)
- *   - key_identity:   one-line equation capturing the central VJP
+ * Backward-pass walkthroughs per brick. Framework-agnostic — the
+ * `chain_rule` text never assumes MLX/PyTorch/JAX; concrete
+ * reverse-mode AD invocations live in the `api` map and HelpModal
+ * renders the row matching the active platform (MLX on Apple Silicon,
+ * PyTorch on CUDA/CPU, JAX on TPU).
  *
- * Sourced from a research agent (Exa-verified canonical forms) +
- * cross-checked against textbook derivations. Reverse-mode AD in MLX
- * = `mx.grad(fn, argnums=[...])` returns a function that maps the
- * primal arguments to dL/d{arg_i}. The cotangent ḡ shown below is
- * the gradient signal arriving from layers downstream of this brick.
+ * Fields:
+ *   - differentiates: scalar function + w.r.t. which params/inputs
+ *   - chain_rule:     how ḡ = dL/dy propagates through the local Jacobian
+ *   - key_identity:   one-line equation capturing the central VJP
+ *   - api:            {mlx, pytorch, jax} — minimal reverse-mode AD call
+ *                     producing dL/d{args} for this brick's signature
  */
 
 
@@ -18,6 +18,25 @@ export interface BackwardEntry {
   differentiates: string;
   chain_rule: string;
   key_identity: string;
+  api?: {
+    mlx?: string;
+    pytorch?: string;
+    jax?: string;
+  };
+}
+
+
+/** Wrap an attention-shaped argnums list as the three canonical calls. */
+function attentionLike(): NonNullable<BackwardEntry["api"]> {
+  return {
+    mlx:
+      "mx.grad(fn, argnums=[0,1,2,3,4])(X, W_q, W_k, W_v, W_o)",
+    pytorch:
+      "loss.backward()  # X, W_q, W_k, W_v, W_o each get .grad set\n"
+      + "# or: torch.autograd.grad(loss, [X, W_q, W_k, W_v, W_o])",
+    jax:
+      "jax.grad(fn, argnums=(0,1,2,3,4))(X, W_q, W_k, W_v, W_o)",
+  };
 }
 
 
@@ -32,11 +51,11 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "Then dL/dP = dL/dC · Vᵀ and dL/dV = Pᵀ · dL/dC. The softmax step " +
       "uses its Jacobian per row: dL/dS_ij = P_ij · (dL/dP_ij − Σ_k " +
       "P_ik · dL/dP_ik). Finally dL/dQ = (dL/dS · K)/√d_k and dL/dK = " +
-      "(dL/dSᵀ · Q)/√d_k, then propagate through W_{q,k,v}. In MLX: " +
-      "`mx.grad(fn, argnums=[0,1,2,3])(X, W_q, W_k, W_v, ...)`.",
+      "(dL/dSᵀ · Q)/√d_k, then propagate through W_{q,k,v}.",
     key_identity:
       "dL/dS = P ⊙ (dL/dP − rowsum(P ⊙ dL/dP)·1ᵀ)  " +
       "(softmax row-Jacobian)",
+    api: attentionLike(),
   },
 
   brick_gated_attention: {
@@ -51,6 +70,14 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "and dL/dW_g = Xᵀ·dL/dG; the dL/dCtx branch enters the standard " +
       "SDPA backward (softmax-Jacobian, dL/dQ, dL/dK, dL/dV).",
     key_identity: "∂σ(G)/∂G = σ(G) ⊙ (1 − σ(G))",
+    api: {
+      mlx:
+        "mx.grad(fn, argnums=[0,1,2,3,4,5])(X, W_q, W_k, W_v, W_g, W_o)",
+      pytorch:
+        "loss.backward()  # X, W_q, W_k, W_v, W_g, W_o each get .grad",
+      jax:
+        "jax.grad(fn, argnums=(0,1,2,3,4,5))(X, W_q, W_k, W_v, W_g, W_o)",
+    },
   },
 
   brick_mla: {
@@ -65,12 +92,20 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "dL/dQ_rot — just rotate by the negative angle. Up-projection " +
       "VJPs: dL/dW_uq = C_qᵀ·dL/dQ and dL/dC_q = dL/dQ·W_uqᵀ, sym " +
       "for K,V (sum both into dL/dC_kv). Then dL/dW_dq = Xᵀ·dL/dC_q, " +
-      "dL/dW_dkv = Xᵀ·dL/dC_kv; dL/dX accumulates from both. MLX: " +
-      "`mx.grad(mla_fn, argnums=[1,2,3,4,5])(X, W_dq, W_uq, W_dkv, " +
-      "W_uk, W_uv)`.",
+      "dL/dW_dkv = Xᵀ·dL/dC_kv; dL/dX accumulates from both.",
     key_identity:
       "RoPE backward: dL/dQ = R(−θ) · dL/dQ_rot  " +
       "(rotation transpose = inverse rotation)",
+    api: {
+      mlx:
+        "mx.grad(mla_fn, argnums=[1,2,3,4,5])(X, W_dq, W_uq, W_dkv, " +
+        "W_uk, W_uv)",
+      pytorch:
+        "loss.backward()  # X, W_dq, W_uq, W_dkv, W_uk, W_uv each .grad",
+      jax:
+        "jax.grad(mla_fn, argnums=(1,2,3,4,5))(X, W_dq, W_uq, W_dkv, " +
+        "W_uk, W_uv)",
+    },
   },
 
   brick_mlp: {
@@ -83,9 +118,16 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "dL/d(silu(a)) = dL/dh ⊙ b. Then dL/da = dL/d(silu(a)) ⊙ " +
       "silu'(a) with silu'(a) = σ(a) + a·σ(a)(1−σ(a)). Finally " +
       "dL/dW_gate = Xᵀ·dL/da, dL/dW_up = Xᵀ·dL/db, and dL/dX = " +
-      "dL/da·W_gateᵀ + dL/db·W_upᵀ. MLX: `mx.grad(swiglu_fn, " +
-      "argnums=[1,2,3])(X, W_gate, W_up, W_down)`.",
+      "dL/da·W_gateᵀ + dL/db·W_upᵀ.",
     key_identity: "silu'(a) = σ(a) · (1 + a·(1 − σ(a)))",
+    api: {
+      mlx:
+        "mx.grad(swiglu_fn, argnums=[0,1,2,3])(X, W_gate, W_up, W_down)",
+      pytorch:
+        "loss.backward()  # X, W_gate, W_up, W_down each get .grad set",
+      jax:
+        "jax.grad(swiglu_fn, argnums=(0,1,2,3))(X, W_gate, W_up, W_down)",
+    },
   },
 
   brick_moe: {
@@ -107,6 +149,14 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
     key_identity:
       "STE for top-k: ∂Y/∂g_e ≈ Expert_e(X) on selected experts, " +
       "0 elsewhere (mask = stop-grad)",
+    api: {
+      mlx:
+        "mx.grad(moe_fn, argnums=[0,1,2])(X, W_router, [W_E1,...,W_EN])",
+      pytorch:
+        "loss.backward()  # plus loss_aux.backward() with retain_graph",
+      jax:
+        "jax.grad(moe_fn, argnums=(0,1,2))(X, W_router, experts)",
+    },
   },
 
   brick_mamba3: {
@@ -122,12 +172,18 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "ḡ_t = dL/dy_t: run a reverse scan for adjoint states " +
       "s_t = C_tᵀ·ḡ_t + Ā_{t+1}ᵀ·s_{t+1}; then dL/dB_t = s_t · " +
       "x_tᵀ · Δ_t, dL/dC_t = ḡ_t · h_tᵀ, dL/dx_t = B̄_tᵀ·s_t, and " +
-      "dL/dΔ_t, dL/dA accumulate through exp(Δ·A). MLX: " +
-      "`mx.grad(ssm_fn, argnums=[1,2,3,4])(x, A, B, C, Δ)` — dual " +
-      "form makes this O(T log T) instead of sequential.",
+      "dL/dΔ_t, dL/dA accumulate through exp(Δ·A). Dual form makes " +
+      "this O(T log T) instead of sequential.",
     key_identity:
       "Adjoint scan: s_t = Ā_{t+1}ᵀ · s_{t+1} + C_tᵀ · ḡ_t  " +
       "(reverse-time linear recurrence)",
+    api: {
+      mlx: "mx.grad(ssm_fn, argnums=[0,1,2,3,4])(x, A, B, C, Δ)",
+      pytorch:
+        "loss.backward()  # x, A, B, C, Δ each get .grad set\n"
+        + "# nvidia/mamba uses a custom CUDA backward kernel",
+      jax: "jax.grad(ssm_fn, argnums=(0,1,2,3,4))(x, A, B, C, Δ)",
+    },
   },
 
   brick_mlstm: {
@@ -149,6 +205,13 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
     key_identity:
       "Matrix-state adjoint: Ĉ_t = f_{t+1}·Ĉ_{t+1} + q_t · " +
       "∂L/∂(C_t·q_t)ᵀ",
+    api: {
+      mlx:
+        "mx.grad(mlstm_fn, argnums=[0,1,2,3,4,5,6])(x, W_i, W_f, " +
+        "W_o, W_q, W_k, W_v)",
+      pytorch: "loss.backward()  # BPTT over the matrix state",
+      jax: "jax.grad(mlstm_fn, argnums=tuple(range(7)))(x, *Ws)",
+    },
   },
 
   brick_gdn: {
@@ -163,13 +226,19 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "β_{t+1}·k_{t+1}·k_{t+1}ᵀ)ᵀ · Ŝ_{t+1} (reverse-time, " +
       "mirroring the gated identity update). Then dL/dv_t = " +
       "Ŝ_t·k_t·β_t, dL/dk_t combines both rank-1 update terms, " +
-      "dL/dβ_t = ⟨Ŝ_t, (v_t − S_{t-1}·k_t)·k_tᵀ⟩. Route q,k,v,β,g " +
-      "through their projections to dL/dW_*. MLX: " +
-      "`mx.grad(gdn_fn, argnums=[1,2,3,4,5])(x, W_q, W_k, W_v, " +
-      "W_β, W_g)`.",
+      "dL/dβ_t = ⟨Ŝ_t, (v_t − S_{t-1}·k_t)·k_tᵀ⟩.",
     key_identity:
       "Ŝ_t = (I − β_{t+1}·k_{t+1}·k_{t+1}ᵀ)ᵀ · Ŝ_{t+1} + " +
       "q_t · ∂L/∂(S_t·q_t)ᵀ",
+    api: {
+      mlx:
+        "mx.grad(gdn_fn, argnums=[0,1,2,3,4,5])(x, W_q, W_k, W_v, " +
+        "W_β, W_g)",
+      pytorch: "loss.backward()  # reverse-time scan over delta updates",
+      jax:
+        "jax.grad(gdn_fn, argnums=(0,1,2,3,4,5))(x, W_q, W_k, W_v, " +
+        "W_β, W_g)",
+    },
   },
 
   adapter_rmsnorm: {
@@ -182,13 +251,19 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "batch/seq. For dL/dx_i we need the Jacobian of x_i/rms — " +
       "both the direct term and the dependence of rms on every x_j. " +
       "Working it out: dL/dx_i = (γ_i·ḡ_i)/rms − x_i · (Σ_j " +
-      "γ_j·ḡ_j·x_j) / (d · rms³). Vectorized with u = γ ⊙ ḡ: " +
-      "dL/dx = u/rms − x · ⟨u, x⟩ / (d · rms³). The famous " +
-      "'norm cancels out' part is that after substituting y = " +
-      "γ·x/rms back, the second term becomes a clean per-feature " +
-      "subtraction — what makes ‖y‖_RMS = 1 stable under SGD.",
+      "γ_j·ḡ_j·x_j) / (d · rms³). The famous 'norm cancels out' part " +
+      "is that after substituting y = γ·x/rms back, the second term " +
+      "becomes a clean per-feature subtraction — what makes " +
+      "‖y‖_RMS = 1 stable under SGD.",
     key_identity:
       "dL/dx = (γ ⊙ ḡ)/rms − x · ⟨γ ⊙ ḡ, x⟩ / (d · rms³)",
+    api: {
+      mlx: "mx.grad(rmsnorm_fn, argnums=[0,1])(x, γ)",
+      pytorch:
+        "loss.backward()  # x, γ each get .grad set\n"
+        + "# torch.nn.RMSNorm fused-kernel backward (PyTorch 2.4+)",
+      jax: "jax.grad(rmsnorm_fn, argnums=(0,1))(x, γ)",
+    },
   },
 
   brick_abs_pos_embed: {
@@ -205,11 +280,16 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
     key_identity:
       "dL/dx = ḡ;  dL/dW_pos[t] = Σ_b ḡ[b, t, :]  " +
       "(scatter-add by position)",
+    api: {
+      mlx: "mx.grad(embed_fn, argnums=[0,1])(x, W_pos)",
+      pytorch:
+        "loss.backward()  # nn.Embedding backward = scatter_add by index",
+      jax: "jax.grad(embed_fn, argnums=(0,1))(x, W_pos)",
+    },
   },
 
   adapter_residual: {
-    differentiates:
-      "L w.r.t. dL/dx; residual adds no parameters.",
+    differentiates: "L w.r.t. dL/dx; residual adds no parameters.",
     chain_rule:
       "Forward: y = x + F(x). Jacobian = I + ∂F/∂x. Given ḡ = " +
       "dL/dy, the VJP splits and sums: dL/dx_skip = ḡ (identity " +
@@ -221,6 +301,12 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
     key_identity:
       "dL/dx = ḡ + ∂F(x)/∂xᵀ · ḡ  " +
       "(gradient flows through both branches additively)",
+    api: {
+      mlx:
+        "# residual is plumbing — ḡ flows through both branches in any AD",
+      pytorch: "# loss.backward() — autograd handles the additive split",
+      jax: "# jax.grad — additive split is fully implicit",
+    },
   },
 
   metric_perplexity: {
@@ -233,5 +319,11 @@ export const BACKWARD_TOPICS: Record<string, BackwardEntry> = {
       "J_ij = p_i·(δ_ij − p_j) combined with d/dp(−log p_y) = " +
       "−1/p_y telescopes into a clean (p − y).",
     key_identity: "softmax+CE-VJP:  dL/dz = (p − y) / B",
+    api: {
+      mlx: "mx.grad(ce_loss, argnums=[0])(z, y_onehot)",
+      pytorch:
+        "loss = F.cross_entropy(z, y); loss.backward()  # z.grad = (p-y)/B",
+      jax: "jax.grad(ce_loss)(z, y_onehot)",
+    },
   },
 };
