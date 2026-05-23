@@ -3,6 +3,7 @@
 // not gated on touching the component being explained.
 
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { TENSOR_DIAGRAMS } from "./diagrams";
 import { T } from "@/theme";
 
@@ -930,8 +931,13 @@ export interface HelpModalProps {
 
 export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
   const entry = HELP_TOPICS[topic];
-  
-  return (
+
+  // V7-Q12: render via createPortal(document.body) so the modal escapes
+  // any transformed ancestor (React Flow canvas, palette, anything
+  // with a CSS transform). Without this, position:fixed is positioned
+  // relative to the nearest transformed ancestor (per CSS spec), which
+  // pinned the modal inside the palette tile instead of the viewport.
+  const modal = (
     <div
       data-testid="help-modal-backdrop"
       role="dialog"
@@ -1158,6 +1164,10 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
       </div>
     </div>
   );
+
+  // SSR / test envs without a document fall back to inline rendering.
+  if (typeof document === "undefined") return modal;
+  return createPortal(modal, document.body);
 }
 
 function Section({
