@@ -275,6 +275,7 @@ export function FlowCanvas({
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         fitView
+        proOptions={{ hideAttribution: true }}
       >
         <Background />
         <Controls />

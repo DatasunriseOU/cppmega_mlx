@@ -9,6 +9,7 @@ import type { RpcClient } from "@/lib/rpc";
 import { Tooltip } from "@/components/Tooltip";
 import { ExplainModal } from "@/components/ExplainModal";
 import { BRICKS, brickFor } from "@/lib/bricks";
+import { computeBrickDims, fmtParamCount } from "@/lib/brickDims";
 
 const ACTIVATION_OPTIONS = [
   "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
@@ -48,9 +49,25 @@ const SUPPORTS_NORM = new Set([
   "mlp", "gated_mlp", "moe",
 ]);
 
+const KINDS_WITHOUT_WEIGHTS = new Set([
+  "residual",
+  "adapter_residual",
+  "merge_heads",
+  "adapter_merge_heads",
+  "split_heads",
+  "adapter_split_heads",
+  "transpose_bnsd",
+  "adapter_transpose_bnsd",
+]);
+
 export interface BrickContextPanelProps {
   rpc: RpcClient | null;
   brickId: string;
+  /** Current dim_env.H — used to compute approximate input/output
+   *  shapes and parameter count for this brick. */
+  hidden_size?: number;
+  /** Tokenizer vocab size — used for the embedding_table brick. */
+  vocab_size?: number;
   brickKind: string;
   params: Record<string, unknown>;
   onApply: (newParams: Record<string, unknown>) => void;
@@ -82,7 +99,8 @@ const FIELD: React.CSSProperties = {
 };
 
 export function BrickContextPanel({
-  rpc, brickId, brickKind, params, onApply, onSwapKind, onClose,
+  rpc, brickId, brickKind, params, hidden_size = 128,
+  vocab_size = 65536, onApply, onSwapKind, onClose,
   onInspectHistogram, onDelete,
 }: BrickContextPanelProps): JSX.Element {
   const [draft, setDraft] = useState<Record<string, unknown>>(params);
@@ -246,6 +264,128 @@ export function BrickContextPanel({
           </>
         )}
 
+        {/* Computed dimensions & parameter count */}
+        {(() => {
+          const dims = computeBrickDims(
+            brickKind, hidden_size, draft, vocab_size);
+          return (
+            <div data-testid={`brick-context-${brickId}-dims`}
+                 style={{ marginTop: 8, padding: "8px 10px",
+                          background: "rgba(34, 211, 238, 0.06)",
+                          border: "1px solid rgba(34, 211, 238, 0.2)",
+                          borderRadius: 6, fontSize: 11 }}>
+              <div style={{ color: "#22d3ee", fontWeight: 700,
+                            marginBottom: 4 }}>
+                📐 Dimensions & params (approx)
+              </div>
+              <div style={{ fontFamily: "ui-monospace, monospace",
+                            color: "#e8e8e8", lineHeight: 1.7 }}>
+                <div>
+                  <span style={{ color: "#94a3b8" }}>input: </span>
+                  <span data-testid={
+                    `brick-context-${brickId}-dim-input`}>
+                    {dims.input}
+                  </span>
+                </div>
+                <div>
+                  <span style={{ color: "#94a3b8" }}>output: </span>
+                  <span data-testid={
+                    `brick-context-${brickId}-dim-output`}>
+                    {dims.output}
+                  </span>
+                </div>
+                <div>
+                  <span style={{ color: "#94a3b8" }}>H (hidden): </span>
+                  <span style={{ color: "#f5b841" }}>{hidden_size}</span>
+                </div>
+                <div>
+                  <span style={{ color: "#94a3b8" }}>params: </span>
+                  <span data-testid={
+                    `brick-context-${brickId}-dim-params`}
+                        style={{ color: "#7bc47f", fontWeight: 700 }}>
+                    {fmtParamCount(dims.n_params)}
+                  </span>
+                </div>
+              </div>
+              <div style={{ color: "#94a3b8", fontSize: 10,
+                            marginTop: 4, fontStyle: "italic" }}>
+                {dims.formula}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Dynamic block parameters editor */}
+        {(() => {
+          const keys = Object.keys(draft).filter(k => !["activation", "pre_norm", "post_norm"].includes(k));
+          if (keys.length === 0) return null;
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: 8 }}>
+              <h5 style={{ margin: "10px 0 5px", fontSize: 11, fontWeight: "bold", color: "#22d3ee", borderBottom: "1px solid rgba(255, 255, 255, 0.1)", paddingBottom: 4 }}>
+                🧱 Block Parameters
+              </h5>
+              {keys.map((key) => {
+                const value = draft[key];
+                const type = typeof value;
+                return (
+                  <label key={key} style={FIELD}>
+                    <span style={{ color: "#94a3b8", fontWeight: 500, fontFamily: "monospace", fontSize: 11 }}>{key}</span>
+                    {type === "number" ? (
+                      <input
+                        type="number"
+                        value={value as number}
+                        onChange={(e) => setField(key, parseFloat(e.target.value) || 0)}
+                        style={{
+                          background: "rgba(15, 23, 42, 0.6)",
+                          color: "#f1f5f9",
+                          border: "1px solid rgba(255, 255, 255, 0.15)",
+                          borderRadius: "6px",
+                          padding: "6px 10px",
+                          outline: "none",
+                          fontSize: "13px",
+                          width: "100%",
+                        }}
+                      />
+                    ) : type === "boolean" ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                        <input
+                          type="checkbox"
+                          checked={value as boolean}
+                          onChange={(e) => setField(key, e.target.checked)}
+                          style={{ cursor: "pointer" }}
+                        />
+                        <span style={{ color: "#cbd5e1", fontSize: 12 }}>Enabled</span>
+                      </div>
+                    ) : (
+                      <input
+                        type="text"
+                        value={type === "object" ? JSON.stringify(value) : String(value)}
+                        onChange={(e) => {
+                          let parsed: any = e.target.value;
+                          if (type === "object") {
+                            try { parsed = JSON.parse(e.target.value); } catch {}
+                          }
+                          setField(key, parsed);
+                        }}
+                        style={{
+                          background: "rgba(15, 23, 42, 0.6)",
+                          color: "#f1f5f9",
+                          border: "1px solid rgba(255, 255, 255, 0.15)",
+                          borderRadius: "6px",
+                          padding: "6px 10px",
+                          outline: "none",
+                          fontSize: "13px",
+                          width: "100%",
+                        }}
+                      />
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          );
+        })()}
+
         {onSwapKind && (() => {
           const currentMeta = brickFor(brickKind);
           const sameCategory = currentMeta
@@ -329,35 +469,56 @@ export function BrickContextPanel({
         {onInspectHistogram && (
           <div data-testid={`brick-context-${brickId}-histogram-block`}
                style={{ fontSize: 11 }}>
-            <button
-              data-testid={`brick-context-${brickId}-histogram-fetch`}
-              disabled={histLoading}
-              onClick={async () => {
-                setHistLoading(true); setHistError(null);
-                try {
-                  const r = await onInspectHistogram(brickId);
-                  setHist(r);
-                } catch (e) {
-                  setHistError(e instanceof Error ? e.message : String(e));
-                } finally {
-                  setHistLoading(false);
-                }
-              }}
-              style={{
-                background: "#7c3aed",
-                color: "white",
-                border: "none",
-                padding: "8px 14px",
-                borderRadius: 6,
-                cursor: "pointer",
-                fontSize: 11,
-                fontWeight: "bold",
-                transition: "all 0.15s ease",
-                width: "100%",
-              }}
-            >
-              {histLoading ? "Loading…" : "Inspect weight histogram"}
-            </button>
+            {KINDS_WITHOUT_WEIGHTS.has(brickKind) ? (
+              <button
+                data-testid={`brick-context-${brickId}-histogram-disabled`}
+                disabled={true}
+                style={{
+                  background: "rgba(255, 255, 255, 0.05)",
+                  color: "#64748b",
+                  border: "1px solid rgba(255, 255, 255, 0.08)",
+                  padding: "8px 14px",
+                  borderRadius: 6,
+                  fontSize: 11,
+                  fontWeight: "bold",
+                  width: "100%",
+                  cursor: "not-allowed",
+                  transition: "all 0.15s ease",
+                }}
+              >
+                No trainable weights
+              </button>
+            ) : (
+              <button
+                data-testid={`brick-context-${brickId}-histogram-fetch`}
+                disabled={histLoading}
+                onClick={async () => {
+                  setHistLoading(true); setHistError(null);
+                  try {
+                    const r = await onInspectHistogram(brickId);
+                    setHist(r);
+                  } catch (e) {
+                    setHistError(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setHistLoading(false);
+                  }
+                }}
+                style={{
+                  background: "#7c3aed",
+                  color: "white",
+                  border: "none",
+                  padding: "8px 14px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: "bold",
+                  transition: "all 0.15s ease",
+                  width: "100%",
+                }}
+              >
+                {histLoading ? "Loading…" : "Inspect weight histogram"}
+              </button>
+            )}
             {histError && (
               <div data-testid={`brick-context-${brickId}-histogram-error`}
                    style={{ color: "#ef4444", marginTop: 4 }}>

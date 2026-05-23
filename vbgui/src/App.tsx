@@ -909,7 +909,14 @@ export function App(): JSX.Element {
         { preset_name: name, hidden_size: calculatedH, num_layers: options.numLayers },
       );
       
+      console.log(`[Preset Load: ${name}] Loading preset specs from backend...`);
+      console.log(`[Preset Load: ${name}] Specs:`, r.specs);
       const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
+      console.log(`[Preset Load: ${name}] Generated ${ns.length} nodes:`, ns.map(n => n.id));
+      console.log(`[Preset Load: ${name}] Generated ${es.length} edges:`, es.map(e => `${e.source} -> ${e.target}`));
+      
+      setNodes(ns);
+      setEdges(es);
       
       setDimEnv((prev) => ({ ...prev, H: calculatedH }));
       
@@ -991,7 +998,11 @@ export function App(): JSX.Element {
         "build_preset_specs",
         { preset_name: name, hidden_size: dimEnv.H ?? MINI_HIDDEN },
       );
+      console.log(`[Preset Drop: ${name}] Loading preset specs from backend...`);
+      console.log(`[Preset Drop: ${name}] Specs:`, r.specs);
       const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
+      console.log(`[Preset Drop: ${name}] Generated ${ns.length} nodes:`, ns.map(n => n.id));
+      console.log(`[Preset Drop: ${name}] Generated ${es.length} edges:`, es.map(e => `${e.source} -> ${e.target}`));
       setNodes(ns);
       setEdges(es);
       await handleAutoAlign(ns, es);
@@ -1050,7 +1061,7 @@ export function App(): JSX.Element {
     } catch (e) {
       setRunError(e);
     }
-  }, [rpc, spec.loss, dimEnv, handleAutoAlign]);
+  }, [rpc, spec.loss, spec.optim, dimEnv, handleAutoAlign]);
 
   const handlePresetSelect = useCallback(async (name: string) => {
     const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
@@ -1896,6 +1907,8 @@ export function App(): JSX.Element {
                     brickId={selectedBrickId}
                     brickKind={data.kind ?? "mlp"}
                     params={data.params ?? {}}
+                    hidden_size={dimEnv.H ?? 128}
+                    vocab_size={65536}
                     onApply={(newParams) => {
                       setNodes((prev) => prev.map((n) =>
                         n.id === selectedBrickId
