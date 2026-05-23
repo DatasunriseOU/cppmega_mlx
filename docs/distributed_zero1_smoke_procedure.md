@@ -167,9 +167,12 @@ group (which `mlx.launch -n 2` guarantees), the wrapper auto-detects
 `world_size = 2` and `rank in {0, 1}` from the global group and only the
 local-shard optimizer state is allocated.
 
-Note: `cppmega_mlx.cli.smoke_zero1` is **not yet implemented**. It will be
-added alongside the first real receipt; for now, the procedure is documented
-ahead of the launcher script so we have a target signature.
+Status: `cppmega_mlx.cli.smoke_zero1` is **implemented** (V7-Q05, commit
+landed 2026-05-23). It is a thin wrapper around
+`scripts/bench_zero1_loopback.py` that constructs the `mlx.launch -n W
+--hosts H1,H2,...` command line. Loopback receipts on a single Mac
+work today; multi-Mac receipts require peer-48 hand-off (still
+external blocker per § "Step 3").
 
 ---
 
