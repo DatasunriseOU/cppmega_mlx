@@ -87,6 +87,10 @@ from cppmega_v4.jsonrpc.hf_quickstart_method import (
     HfQuickstartParams,
     hf_quickstart_method,
 )
+from cppmega_v4.jsonrpc.compile_trace_method import (
+    CompileTraceParams,
+    compile_trace,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -152,6 +156,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "data.hf_quickstart": (
         HfQuickstartParams,
         lambda p, c: hf_quickstart_method(p, cache=c),
+    ),
+    "compile.trace": (
+        CompileTraceParams,
+        lambda p, c: compile_trace(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,
