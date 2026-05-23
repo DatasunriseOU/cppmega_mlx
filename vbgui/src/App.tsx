@@ -1933,20 +1933,56 @@ export function App(): JSX.Element {
                           : n));
                     }}
                     onInspectHistogram={async (brickId) => {
-                      // V7-H08: build current spec on the fly and call
-                      // inspect.histogram so the panel renders the
-                      // brick's fresh-init weight distribution.
+                      // V7-H08 + V7-Q11: send a MINIMAL spec containing
+                      // just the target brick + dim_env so the call
+                      // doesn't trip schema validation on canvas
+                      // states that lack head_outputs / loss head / etc.
+                      // Backend reads spec.graph.nodes[i].{id,kind,
+                      // params} + spec.dim_env.H to instantiate the
+                      // brick — everything else is filler that has to
+                      // pass extra='forbid'.
                       const snap = wireSpecRef.current;
-                      const spec_payload = buildVerifyParams(
-                        snap.nodes, snap.edges, snap.spec,
-                        snap.availableSideChannels);
+                      const node = snap.nodes.find(
+                        (n) => n.id === brickId);
+                      if (!node) {
+                        throw new Error(
+                          `brick ${brickId} not in canvas`);
+                      }
+                      const kind = (node.data as { kind?: string })
+                        ?.kind ?? brickId;
+                      const params = (node.data as {
+                        params?: Record<string, unknown> })
+                        ?.params ?? {};
+                      const dim_env = snap.spec.dim_env;
+                      const minimal_spec = {
+                        graph: {
+                          nodes: [
+                            { id: brickId, kind, params },
+                          ],
+                          edges: [],
+                        },
+                        dim_env: dim_env,
+                        loss: {
+                          kind: "cross_entropy",
+                          head_outputs: [brickId],
+                        },
+                        optim: {
+                          kind: "adamw",
+                          groups: [{
+                            matcher: "all",
+                            lr: 1e-3,
+                            weight_decay: 0.01,
+                            betas: [0.9, 0.95],
+                          }],
+                        },
+                      };
                       return rpc.call<{
                         brick_id: string; buckets: number;
                         bins: number[]; counts: number[];
                         min: number; max: number; mean: number;
                         n_values: number;
                       }>("inspect.histogram", {
-                        spec: spec_payload, brick_id: brickId,
+                        spec: minimal_spec, brick_id: brickId,
                         kind: "weight", buckets: 32,
                       });
                     }}

@@ -4,6 +4,7 @@
 
 import { useState } from "react";
 import { TENSOR_DIAGRAMS } from "./diagrams";
+import { T } from "@/theme";
 
 export interface HelpTopic {
   title: string;
@@ -874,6 +875,22 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
   },
 };
 
+// V7-Q11: adapter kinds also appear as nodes on the canvas; the
+// BrickContextPanel looks them up under brick_<kind>. Mirror the
+// adapter_* entries to brick_* so the panel doesn't show "No
+// explanation" for rmsnorm / residual / merge_heads / split_heads /
+// transpose_bnsd / linear_bridge nodes.
+for (const adapterKind of [
+  "merge_heads", "split_heads", "transpose_bnsd",
+  "linear_bridge", "rmsnorm", "residual",
+]) {
+  const aKey = `adapter_${adapterKind}`;
+  const bKey = `brick_${adapterKind}`;
+  if (HELP_TOPICS[aKey] && !HELP_TOPICS[bKey]) {
+    HELP_TOPICS[bKey] = HELP_TOPICS[aKey]!;
+  }
+}
+
 export interface HelpIconProps {
   topic: keyof typeof HELP_TOPICS | string;
   size?: number;
@@ -892,10 +909,11 @@ export function HelpIcon({ topic, size = 14 }: HelpIconProps): JSX.Element {
         onClick={() => setOpen(true)}
         style={{
           width: size, height: size, padding: 0,
-          borderRadius: "50%", background: "#e5e7eb",
-          color: "#374151", border: "none",
-          fontSize: Math.max(9, size - 4), lineHeight: 1,
+          borderRadius: "50%", background: "rgba(255, 255, 255, 0.08)",
+          color: T.accent, border: `1px solid ${T.border}`,
+          fontSize: Math.max(9, size - 4), lineHeight: `${size - 2}px`,
           cursor: "pointer", fontWeight: 700, marginLeft: 4,
+          display: "inline-flex", alignItems: "center", justifyContent: "center",
         }}
       >
         ?
