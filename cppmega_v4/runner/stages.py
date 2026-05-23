@@ -925,6 +925,12 @@ def stage_train(ctx: StageContext) -> StageResult:
             except Exception:
                 pass
         loss_and_grad = nn.value_and_grad(all_modules, loss_fn)
+        # V7-D03: LossScaler is initialized later (after master_dtype is
+        # resolved). The variable is declared up here so the train loop
+        # can reference it unconditionally; rebinding loss_and_grad to a
+        # scaled wrapper happens at that init site.
+        loss_scaler = None
+        loss_scaler_overflow_steps: list[int] = []
 
         # V4-11: inference probe — forward over a fixed-seed input both
         # before training and after; report l2 and cosine drift.
@@ -1077,6 +1083,23 @@ def stage_train(ctx: StageContext) -> StageResult:
             master_dtype = str(_opt_master)
             if master_dtype == "fp16":
                 train_dtype = "fp16"
+        # V7-D03: engage LossScaler when training in fp16. The wrapper
+        # multiplies loss by scaler.scale so grads come out scaled; we
+        # unscale + check inf/nan before opt.update inside the train loop.
+        if master_dtype == "fp16":
+            from cppmega_v4.runtime.loss_scaler import LossScaler
+            loss_scaler = LossScaler(
+                mode=str(opts.get("loss_scaler_mode", "dynamic")),
+                init_scale=float(opts.get("loss_scaler_init", 2.0 ** 16)),
+                growth_interval=int(
+                    opts.get("loss_scaler_growth_interval", 200)),
+            )
+            _unscaled_loss_fn = loss_fn
+
+            def _scaled_loss_fn(model, *args, _ls=loss_scaler,
+                                _lf=_unscaled_loss_fn, **kwargs):
+                return _lf(model, *args, **kwargs) * _ls.scale
+            loss_and_grad = nn.value_and_grad(all_modules, _scaled_loss_fn)
         fp8_active = False
         # Wire fp8_enabled from spec.sharding (payload pydantic model)
         ws_sharding = getattr(ctx.spec, "sharding", None)
@@ -1407,6 +1430,17 @@ def stage_train(ctx: StageContext) -> StageResult:
                 emb = train_token_embedding(targets)
             loss, grads = loss_and_grad(all_modules, emb, targets)
             mx.eval(loss, grads)
+            # V7-D03: unscale the grad tree if we scaled the loss; detect
+            # inf/nan overflow. On overflow the optimizer step is skipped
+            # and the scaler backs off (dynamic mode). The loss value
+            # reported is the unscaled real loss so the loss-curve UI
+            # stays meaningful.
+            _scaler_overflow_this_step = False
+            if loss_scaler is not None:
+                grads, _scaler_overflow_this_step = (
+                    loss_scaler.unscale_and_check(grads))
+                # Report the real (unscaled) loss to the user.
+                loss = loss / loss_scaler.scale
             # H20: simulate fake_ranks-way all-reduce by replaying the
             # backward N-1 more times on identical input and mean-
             # reducing all gradients across the synthetic ranks.
@@ -1456,8 +1490,14 @@ def stage_train(ctx: StageContext) -> StageResult:
                         lambda g: g * scale if hasattr(g, "shape") else g,
                         grads)
                     clip_extras["num_clips"] += 1
-            opt.update(all_modules, grads)
-            mx.eval(all_modules.parameters(), opt.state)
+            if loss_scaler is not None and _scaler_overflow_this_step:
+                loss_scaler_overflow_steps.append(step)
+                loss_scaler.update(True)
+            else:
+                opt.update(all_modules, grads)
+                mx.eval(all_modules.parameters(), opt.state)
+                if loss_scaler is not None:
+                    loss_scaler.update(False)
             losses.append(float(loss.item()))
             # V7-A04: validation pass at val_every cadence on a fresh
             # random batch (held-out from the train stream). No grad,
@@ -1625,7 +1665,13 @@ def stage_train(ctx: StageContext) -> StageResult:
                 error={"type": "NonFiniteLoss",
                        "detail": f"losses={losses}"},
             )
-        if delta <= 1e-6:
+        # V7-D03: when LossScaler skipped every step due to fp16 overflow,
+        # weights don't move — that is expected, not a bug. Surface the
+        # overflow_count in the same error envelope so the user sees why.
+        _all_skipped = (loss_scaler is not None
+                        and len(loss_scaler_overflow_steps) == len(losses)
+                        and len(losses) > 0)
+        if delta <= 1e-6 and not _all_skipped:
             return StageResult(
                 name="train", status="fail",
                 elapsed_ms=(time.perf_counter() - t0) * 1000.0,
@@ -1711,6 +1757,12 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "master_dtype": master_dtype,
                 "fp8_active": fp8_active,
                 "dtype_actual": dtype_actual,
+                "loss_scaler": (loss_scaler.snapshot()
+                                | {"overflow_steps":
+                                   loss_scaler_overflow_steps,
+                                   "overflow_count":
+                                   loss_scaler.overflow_count}
+                                 if loss_scaler is not None else None),
                 "moe": moe_extras,
                 "opt_state_carried": opt_state_carried,
                 "run_id": run_id,
