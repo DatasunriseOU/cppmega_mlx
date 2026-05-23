@@ -3871,9 +3871,15 @@ def test_fp8_path_c_training_route_reports_model_owned_physical_bank_plan(
     )
 
     binding = route["path_c_fusion"]["runtime_training_binding"]
-    assert binding["status"] == (
-        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS
-    )
+    # HybridTinyLM now provides ``make_path_c_physical_abi_bank_owner`` so
+    # the production auto-install path resolves the banks before the route
+    # payload is computed; the runtime training binding reports ``ok``.
+    assert binding["status"] == "ok", binding
+    assert binding["runtime_uses_fused_train_block"] is True
+    assert binding["physical_abi_binding_ready"] is True
+    assert binding["fused_artifact_bound"] is True
+    assert binding["missing_bank_buffers"] == []
+    assert binding["provided_bank_buffers"] == binding["required_bank_buffers"]
     bank_plan = binding["model_owned_physical_abi_bank_plan"]
     assert bank_plan["status"] == "model_owned_physical_abi_banks_required"
     assert bank_plan["owner_attribute"] == "path_c_physical_abi_bank_owner"

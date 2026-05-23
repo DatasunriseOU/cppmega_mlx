@@ -43,7 +43,11 @@ from cppmega_mlx.nn.platform_embedding import CppMegaPlatformEmbedding
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 from cppmega_mlx.recipes.pattern import ExpandedNamPattern, NamLayer, expand_nam_pattern
 from cppmega_mlx.runtime.kernel_policy import KernelPath, selected_path
-from cppmega_mlx.runtime.path_c_physical_abi import PathCLogicalBufferOwner
+from cppmega_mlx.runtime.path_c_physical_abi import (
+    PathCLogicalBufferOwner,
+    PathCPhysicalAbiBankOwner,
+    make_physical_abi_bank_owner,
+)
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
 from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
 
@@ -73,6 +77,33 @@ _ROUTE_SYMBOL_BACKENDS: dict[str, HybridBackend] = {
 }
 
 HybridAttentionMode = Literal["mla", "dsa", "full", "gqa"]
+
+_PATH_C_BANK_DTYPES: dict[str, mx.Dtype] = {
+    "bool": mx.bool_,
+    "uint8": mx.uint8,
+    "int8": mx.int8,
+    "uint16": mx.uint16,
+    "int16": mx.int16,
+    "uint32": mx.uint32,
+    "int32": mx.int32,
+    "uint64": mx.uint64,
+    "int64": mx.int64,
+    "float16": mx.float16,
+    "bfloat16": mx.bfloat16,
+    "float32": mx.float32,
+}
+
+
+def _path_c_bank_dtype(name: str) -> mx.Dtype:
+    """Translate a Path C physical-ABI dtype string into an ``mx.Dtype``."""
+    try:
+        return _PATH_C_BANK_DTYPES[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported Path C physical ABI bank dtype {name!r}"
+        ) from exc
+
+
 
 
 class StructureEmbeddingConfigKwargs(TypedDict):
@@ -1059,6 +1090,110 @@ class HybridTinyLM(nn.Module):
             include_backward=include_backward,
             min_route_bricks=min_route_bricks,
             sequence_length=sequence_length,
+        )
+
+    def path_c_fused_train_block_prim_func(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> Any | None:
+        """Materialise the fused-train-block PrimFunc for this model.
+
+        This drives the same schedule planner the production runtime uses and
+        returns the generated PrimFunc (carrying the physical-ABI attrs), or
+        ``None`` when no Path C route region exists. The model never caches the
+        artifact — callers that need to reuse it across calls should hold the
+        returned reference themselves.
+        """
+        from cppmega_mlx.runtime.path_c_fusion_schedules import (
+            plan_path_c_fusion_schedule_for_region,
+        )
+
+        regions = self.path_c_fusion_regions(
+            include_backward=True,
+            sequence_length=sequence_length,
+        )
+        if not regions:
+            return None
+        selected = max(
+            regions,
+            key=lambda region: (
+                len(region.nodes),
+                len(region.edges),
+                region.name,
+            ),
+        )
+        planned = plan_path_c_fusion_schedule_for_region(
+            selected,
+            include_backward=True,
+        )
+        schedule_target = getattr(planned, "schedule_target", None)
+        if schedule_target is None:
+            return None
+        return schedule_target.schedule_template(planned.region)
+
+    def make_path_c_physical_abi_bank_owner(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> PathCPhysicalAbiBankOwner | None:
+        """Allocate the physical ABI banks the generated fused PrimFunc needs.
+
+        Returns a validated :class:`PathCPhysicalAbiBankOwner` whose ``buffers``
+        are freshly zero-initialised MLX arrays sized exactly to the generated
+        ``_cppmega_path_c_physical_buffer_abi_shapes`` map (dtype is taken from
+        the corresponding logical-buffer placement so every bank reflects the
+        generated kernel ABI). The owner never repacks or copies model tensors;
+        it only owns the bank arrays so the runtime can bind kernel arguments
+        in declared order.
+
+        Returns ``None`` when no Path C route region exists for the model.
+        """
+        prim_func = self.path_c_fused_train_block_prim_func(
+            sequence_length=sequence_length,
+        )
+        if prim_func is None:
+            return None
+        abi_map = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+            or {}
+        )
+        abi_shapes = dict(
+            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes", {})
+            or {}
+        )
+        if not abi_map or not abi_shapes:
+            return None
+        bank_dtypes: dict[str, str] = {}
+        for placement in abi_map.values():
+            bank = str(placement["bank"])
+            dtype = str(placement["dtype"])
+            existing = bank_dtypes.setdefault(bank, dtype)
+            if existing != dtype:
+                raise ValueError(
+                    f"conflicting bank dtype for {bank!r}: "
+                    f"{existing!r} vs {dtype!r}"
+                )
+        bank_buffers: dict[str, mx.array] = {}
+        for bank, shape in abi_shapes.items():
+            dtype_name = bank_dtypes.get(str(bank))
+            if dtype_name is None:
+                raise ValueError(
+                    f"no logical buffer is placed inside physical bank {bank!r}"
+                )
+            mx_dtype = _path_c_bank_dtype(dtype_name)
+            bank_buffers[str(bank)] = mx.zeros(
+                tuple(int(dim) for dim in tuple(shape)),
+                dtype=mx_dtype,
+            )
+        profile_name = str(
+            getattr(self, "path_c_profile_name", "HybridTinyLM")
+        )
+        return make_physical_abi_bank_owner(
+            f"{profile_name}.path_c_physical_abi_banks",
+            abi_map,
+            abi_shapes,
+            bank_buffers,
         )
 
     def __call__(
