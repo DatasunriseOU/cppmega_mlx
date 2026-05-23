@@ -51,6 +51,9 @@ from cppmega_v4.jsonrpc.dtype_cost_method import (
 from cppmega_v4.jsonrpc.gen_run_method import (
     GenRunParams, gen_run,
 )
+from cppmega_v4.jsonrpc.histogram_method import (
+    HistogramParams, inspect_histogram,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -63,6 +66,8 @@ from cppmega_v4.jsonrpc.schema import (
     PipelineAbortResult,
     PipelineRunParams,
     PipelineRunResult,
+    PipelineStatusParams,
+    PipelineStatusResult,
     ProbeRunParams,
     SuggestAdaptersParams,
     SuggestOptimGroupsParams,
@@ -113,6 +118,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
         PipelineAbortParams,
         lambda p, c: _pipeline_resume(p),
     ),
+    "pipeline.status": (
+        PipelineStatusParams,
+        lambda p, c: _pipeline_status(p),
+    ),
     "tokenizer.encode_visualize": (
         EncodeVisualizeParams,
         lambda p, c: encode_visualize(p, cache=c),
@@ -153,6 +162,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
         GenRunParams,
         lambda p, c: gen_run(p, cache=c),
     ),
+    "inspect.histogram": (
+        HistogramParams,
+        lambda p, c: inspect_histogram(p, cache=c),
+    ),
 }
 
 
@@ -171,7 +184,9 @@ def _pipeline_run(params: PipelineRunParams) -> PipelineRunResult:
 
 def _pipeline_abort(params: PipelineAbortParams) -> PipelineAbortResult:
     from cppmega_v4.runner.stages import request_abort
+    from cppmega_v4.runtime import run_registry
     request_abort(params.run_id)
+    run_registry.mark_aborted(params.run_id)
     return PipelineAbortResult(run_id=params.run_id)
 
 
@@ -187,6 +202,27 @@ def _pipeline_resume(params: PipelineAbortParams) -> PipelineAbortResult:
     from cppmega_v4.runtime.job_control import resume
     resume(params.run_id)
     return PipelineAbortResult(run_id=params.run_id)
+
+
+def _pipeline_status(params: PipelineStatusParams) -> PipelineStatusResult:
+    """V7-H06b: report current lifecycle state of run_id.
+
+    Combines run_registry (running/aborted/last_step/last_loss),
+    job_control (paused). UI polls this after pause/resume/abort to
+    confirm backend actually applied the transition before flipping
+    its own indicators."""
+    from cppmega_v4.runtime import job_control, run_registry
+    snap = run_registry.snapshot(params.run_id)
+    if snap is None:
+        return PipelineStatusResult(run_id=params.run_id, known=False)
+    return PipelineStatusResult(
+        run_id=params.run_id, known=True,
+        running=bool(snap["running"]),
+        paused=job_control.is_paused(params.run_id),
+        aborted=bool(snap["aborted"]),
+        last_step=int(snap["last_step"]),
+        last_loss=snap["last_loss"],
+    )
 
 
 def dispatch(

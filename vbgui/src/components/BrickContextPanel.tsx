@@ -16,6 +16,29 @@ const ACTIVATION_OPTIONS = [
 ];
 const NORM_OPTIONS = ["rmsnorm", "layernorm", "none"];
 
+function HistogramSvg({ counts }: { counts: number[] }): JSX.Element {
+  const W = 220, H = 60;
+  const maxC = Math.max(...counts, 1);
+  const barW = W / Math.max(1, counts.length);
+  return (
+    <svg data-testid="brick-histogram-svg" width={W} height={H}
+         style={{ marginTop: 4 }}>
+      {counts.map((c, i) => {
+        const h = (c / maxC) * (H - 2);
+        return (
+          <rect key={i}
+                data-testid={`brick-histogram-bar-${i}`}
+                x={i * barW} y={H - h}
+                width={Math.max(1, barW - 1)} height={h}
+                fill="#7c3aed">
+            <title>{`bin ${i}: ${c}`}</title>
+          </rect>
+        );
+      })}
+    </svg>
+  );
+}
+
 const SUPPORTS_ACTIVATION = new Set([
   "mlp", "gated_mlp", "moe", "bailing_moe",
 ]);
@@ -36,6 +59,20 @@ export interface BrickContextPanelProps {
   // (App.tsx) preserves the node id + edges and just mutates kind.
   onSwapKind?: (newKind: string) => void;
   onClose: () => void;
+  /** V7-H08: callback to fetch the weight histogram for this brick.
+   *  Host (App.tsx) builds the full spec and calls inspect.histogram. */
+  onInspectHistogram?: (brickId: string) => Promise<HistogramResult>;
+}
+
+export interface HistogramResult {
+  brick_id: string;
+  buckets: number;
+  bins: number[];
+  counts: number[];
+  min: number;
+  max: number;
+  mean: number;
+  n_values: number;
 }
 
 const FIELD: React.CSSProperties = {
@@ -45,11 +82,15 @@ const FIELD: React.CSSProperties = {
 
 export function BrickContextPanel({
   rpc, brickId, brickKind, params, onApply, onSwapKind, onClose,
+  onInspectHistogram,
 }: BrickContextPanelProps): JSX.Element {
   const [draft, setDraft] = useState<Record<string, unknown>>(params);
   const [swapTarget, setSwapTarget] = useState<string>(brickKind);
   const [explain, setExplain] = useState<{ cat: string; name: string }
                                           | null>(null);
+  const [hist, setHist] = useState<HistogramResult | null>(null);
+  const [histLoading, setHistLoading] = useState<boolean>(false);
+  const [histError, setHistError] = useState<string | null>(null);
 
   useEffect(() => { setDraft(params); setSwapTarget(brickKind); },
             [params, brickId, brickKind]);
@@ -178,6 +219,50 @@ export function BrickContextPanel({
                         marginTop: 8 }}>
         Apply
       </button>
+
+      {onInspectHistogram && (
+        <div data-testid={`brick-context-${brickId}-histogram-block`}
+             style={{ marginTop: 10, fontSize: 11 }}>
+          <button
+            data-testid={`brick-context-${brickId}-histogram-fetch`}
+            disabled={histLoading}
+            onClick={async () => {
+              setHistLoading(true); setHistError(null);
+              try {
+                const r = await onInspectHistogram(brickId);
+                setHist(r);
+              } catch (e) {
+                setHistError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setHistLoading(false);
+              }
+            }}
+            style={{ background: "#7c3aed", color: "white",
+                     border: "none", padding: "4px 10px",
+                     borderRadius: 4, cursor: "pointer", fontSize: 11 }}>
+            {histLoading ? "Loading…" : "Inspect weight histogram"}
+          </button>
+          {histError && (
+            <div data-testid={`brick-context-${brickId}-histogram-error`}
+                 style={{ color: "#dc2626", marginTop: 4 }}>
+              {histError}
+            </div>
+          )}
+          {hist && (
+            <div data-testid={`brick-context-${brickId}-histogram-result`}
+                 style={{ marginTop: 6, fontFamily: "monospace",
+                          background: "#f9fafb", padding: 6,
+                          borderRadius: 4 }}>
+              <div data-testid={`brick-context-${brickId}-histogram-stats`}>
+                n={hist.n_values} · min={hist.min.toExponential(2)} ·
+                max={hist.max.toExponential(2)} ·
+                mean={hist.mean.toExponential(2)}
+              </div>
+              <HistogramSvg counts={hist.counts} />
+            </div>
+          )}
+        </div>
+      )}
 
       {explain && (
         <ExplainModal rpc={rpc} category={explain.cat} name={explain.name}

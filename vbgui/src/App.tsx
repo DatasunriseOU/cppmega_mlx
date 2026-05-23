@@ -11,6 +11,9 @@ import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
 import { TransplantBar } from "@/components/TransplantBar";
 import { InsertIntoEdgeBar } from "@/components/InsertIntoEdgeBar";
 import { ParallelComposeBar } from "@/components/ParallelComposeBar";
+import { TrainOptionsPanel, type TrainOptions } from "@/components/TrainOptionsPanel";
+import { RunHistoryPicker } from "@/components/RunHistoryPicker";
+import { TrainLiveControls } from "@/components/TrainLiveControls";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
@@ -165,6 +168,21 @@ export function App(): JSX.Element {
   const gallery = useGalleryCache();
   const [galleryRefreshing, setGalleryRefreshing] = useState<Set<string>>(
     new Set());
+
+  // V7-K3..K8: train-time options that were previously hardcoded.
+  const [trainOptions, setTrainOptions] = useState<TrainOptions>({
+    fake_ranks: 1,
+  });
+  // V7-K7: history of recent train run_ids (most recent first).
+  const [trainRunHistory, setTrainRunHistory] = useState<string[]>([]);
+  // V7-K7: which run_id the next warm-start run should continue from.
+  // null = use lastTrainRunId (default behaviour).
+  const [selectedWarmStartRunId, setSelectedWarmStartRunId] =
+    useState<string | null>(null);
+  // V7-K9: trigger-checkpoint-now flag — handleRunPipeline reads it
+  // once at train time, then clears it.
+  const [pendingCheckpointTrigger, setPendingCheckpointTrigger] =
+    useState<string | null>(null);
 
   // Keep one stable spec snapshot for the verify debouncer to read.
   const wireSpecRef = useRef({ nodes, edges, spec, availableSideChannels,
@@ -433,14 +451,35 @@ export function App(): JSX.Element {
       const trainOpts: Record<string, unknown> = {};
       activeTrainRunId = makeTrainRunId();
       trainOpts.run_id = activeTrainRunId;
-      trainOpts.abort_token = activeTrainRunId;
+      // V7-K8: explicit abort_token override; falls back to run_id
+      // (the prior default) when the panel input is empty.
+      trainOpts.abort_token = trainOptions.abort_token
+                              ?? activeTrainRunId;
       if (typeof opts?.num_steps === "number") {
         trainOpts.num_steps = opts.num_steps;
       }
-      // H04: warm-start uses lastTrainRunId as continue_from_run_id so
-      // the backend G10 LRU cache restores opt.state from prior run.
-      if (opts?.warm_start && lastTrainRunId) {
-        trainOpts.continue_from_run_id = lastTrainRunId;
+      // V7-K3 / V7-K4 / V7-K5 / V7-K6 — forward TrainOptionsPanel state.
+      if (typeof trainOptions.val_every === "number") {
+        trainOpts.val_every = trainOptions.val_every;
+      }
+      if (typeof trainOptions.grad_clip_max_norm === "number") {
+        trainOpts.grad_clip_max_norm = trainOptions.grad_clip_max_norm;
+      }
+      if (typeof trainOptions.loss_scaler_init_scale === "number") {
+        trainOpts.loss_scaler_init_scale =
+          trainOptions.loss_scaler_init_scale;
+      }
+      if (typeof trainOptions.loss_scaler_growth_interval === "number") {
+        trainOpts.loss_scaler_growth_interval =
+          trainOptions.loss_scaler_growth_interval;
+      }
+      // (K6 fake_ranks slider is applied AFTER the sharding-derived
+      //  block below so the explicit slider always wins.)
+      // H04 + V7-K7: warm-start uses the picker's selected run id if
+      // set, else falls back to lastTrainRunId (default behaviour).
+      if (opts?.warm_start) {
+        const warmId = selectedWarmStartRunId ?? lastTrainRunId;
+        if (warmId) trainOpts.continue_from_run_id = warmId;
       }
       // H05: forward checkpoint save/load paths to stage_train G12.
       if (opts?.checkpoint_save_path) {
@@ -476,6 +515,18 @@ export function App(): JSX.Element {
             ?? 1), 1);
         if (totalDegree > 1) trainOpts.fake_ranks = totalDegree;
       }
+      // V7-K6: explicit slider override comes last.
+      if (typeof trainOptions.fake_ranks === "number"
+          && trainOptions.fake_ranks > 1) {
+        trainOpts.fake_ranks = trainOptions.fake_ranks;
+      }
+      // V7-K9: one-shot trigger-checkpoint-now flag — the host
+      // sets pendingCheckpointTrigger to a path; we forward and
+      // clear so the next train run doesn't re-trigger.
+      if (pendingCheckpointTrigger) {
+        trainOpts.trigger_checkpoint_path = pendingCheckpointTrigger;
+        setPendingCheckpointTrigger(null);
+      }
       if (trainParquetPath) trainOpts.parquet_path = trainParquetPath;
       if (trainParquetShards.length > 1) {
         trainOpts.parquet_shards = trainParquetShards;
@@ -496,8 +547,12 @@ export function App(): JSX.Element {
     }
     try {
       const r = await rpc.call<RunReport>("pipeline.run", {
+        // V7-K2: train RPC now also picks up the DimEnvEditor's
+        // values (B, S, H, nh, head_dim). Without this, train fell
+        // back to MINI_DIM_ENV regardless of what the architect typed.
         spec: buildVerifyParams(
           snap.nodes, snap.edges, snap.spec, snap.availableSideChannels,
+          snap.dimEnv,
         ),
         pipeline: { stages, stage_options },
       });
@@ -508,6 +563,11 @@ export function App(): JSX.Element {
         const trainStage = r.stages?.find((s) => s.name === "train");
         if (trainStage?.status === "ok") {
           setLastTrainRunId(activeTrainRunId);
+          // V7-K7: keep a bounded history (10 most recent) so the
+          // RunHistoryPicker has something to offer.
+          setTrainRunHistory((prev) =>
+            [activeTrainRunId!, ...prev.filter(
+              (id) => id !== activeTrainRunId)].slice(0, 10));
           // H11: surface the Metal peak alongside the verify estimate.
           const peak = (trainStage as unknown as
             { memory_peak_bytes?: number }).memory_peak_bytes;
@@ -732,6 +792,22 @@ export function App(): JSX.Element {
                             display: "flex", flexDirection: "column",
                             minHeight: 0 }}>
                 <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
+                <TrainOptionsPanel
+                  value={trainOptions}
+                  onChange={setTrainOptions}
+                />
+                <RunHistoryPicker
+                  history={trainRunHistory}
+                  selected={selectedWarmStartRunId}
+                  onSelect={setSelectedWarmStartRunId}
+                />
+                <TrainLiveControls
+                  rpc={rpc}
+                  trainInFlight={trainInFlight}
+                  activeRunId={trainRunId}
+                  onScheduleCheckpoint={(path) =>
+                    setPendingCheckpointTrigger(path)}
+                />
                 <ParallelComposeBar
                   onCompose={(composeNodes, composeEdges) => {
                     setNodes(composeNodes.map((cn) => ({
@@ -869,6 +945,24 @@ export function App(): JSX.Element {
                           ? { ...n, data: { ...(n.data as object),
                                             kind: newKind } as never }
                           : n));
+                    }}
+                    onInspectHistogram={async (brickId) => {
+                      // V7-H08: build current spec on the fly and call
+                      // inspect.histogram so the panel renders the
+                      // brick's fresh-init weight distribution.
+                      const snap = wireSpecRef.current;
+                      const spec_payload = buildVerifyParams(
+                        snap.nodes, snap.edges, snap.spec,
+                        snap.availableSideChannels);
+                      return rpc.call<{
+                        brick_id: string; buckets: number;
+                        bins: number[]; counts: number[];
+                        min: number; max: number; mean: number;
+                        n_values: number;
+                      }>("inspect.histogram", {
+                        spec: spec_payload, brick_id: brickId,
+                        kind: "weight", buckets: 32,
+                      });
                     }}
                     onClose={() => setSelectedBrickId(null)}
                   />

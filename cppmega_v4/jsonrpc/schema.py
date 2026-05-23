@@ -683,6 +683,31 @@ class PipelineAbortResult(BaseModel):
     run_id: str
 
 
+class PipelineStatusParams(BaseModel):
+    """V7-H06b: query the lifecycle state of a run_id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+
+
+class PipelineStatusResult(BaseModel):
+    """V7-H06b: snapshot of a run from the in-process registry.
+
+    ``known`` is False when no run with that id has ever been
+    registered — distinguishes 'never seen' from 'finished'."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    known: bool
+    running: bool = False
+    paused: bool = False
+    aborted: bool = False
+    last_step: int = -1
+    last_loss: float | None = None
+
+
 class StageResult(BaseModel):
     """One stage execution result."""
 
@@ -754,6 +779,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "pipeline.pause",
     "pipeline.resume",
     "gen.run",
+    "inspect.histogram",
 })
 
 
