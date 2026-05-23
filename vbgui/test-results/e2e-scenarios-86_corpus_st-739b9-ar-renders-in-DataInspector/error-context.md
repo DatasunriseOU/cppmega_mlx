@@ -6,8 +6,8 @@
 
 # Test info
 
-- Name: e2e/scenarios/11_ui_to_train.spec.ts >> UI linear_warmup w=4 reaches train as scheduled lr_trajectory
-- Location: e2e/scenarios/11_ui_to_train.spec.ts:50:1
+- Name: e2e/scenarios/86_corpus_stats_inspector.spec.ts >> V7-G04: corpus_stats sidecar renders in DataInspector
+- Location: e2e/scenarios/86_corpus_stats_inspector.spec.ts:18:1
 
 # Error details
 
@@ -125,4 +125,9 @@ Call log:
   101 |   ).toBeGreaterThan(before);
   102 | }
   103 | 
+  104 | /** Drop an adapter onto the canvas via synthetic dragstart/drop events. */
+  105 | export async function dropAdapterViaPalette(
+  106 |   page: Page, kind: string,
+  107 | ): Promise<void> {
+  108 |   const tile = page.getByTestId(`palette-adapter-${kind}`);
 ```

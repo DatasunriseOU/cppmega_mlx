@@ -228,6 +228,7 @@ def _make_sharding(payload: ShardingSpecPayload) -> ShardingSpec:
         axis_assignments=axes,
         compile_mode=payload.compile_mode,
         fp8_enabled=payload.fp8_enabled,
+        comm_backend=payload.comm_backend,
     )
 
 
@@ -390,6 +391,30 @@ def verify(params: VerifyParams, *, cache: LRUCache | None = None) -> VerifyResu
     gotcha_payloads.extend(
         _side_channel_policy_gotchas(params.side_channels, available)
     )
+    # V7-L48: backend-owned recovery hints. The UI used to hardcode
+    # an AUTO_FIXABLE set of gotcha ids; here we let the backend say
+    # which ids have a one-click fix and what the button should say.
+    # Keeping the mapping backend-side means new gotchas ship with
+    # their recovery action without a UI release.
+    _SUGGESTED_FIX_BY_ID: dict[str, str] = {
+        "fsdp2_whole_compile":      "Switch compile_mode → regional",
+        "megatron_tp_whole_compile": "Switch compile_mode → regional",
+        "missing_edge":             "Insert missing edge",
+        "dim_mismatch":             "Adjust hidden_size to nearest valid",
+        "unknown_brick":            "Remove unknown brick",
+        "bad_dtype_combo":          "Reset dtype to bf16 master",
+        "schedule_out_of_range":    "Clamp schedule to valid range",
+        "tokenizer_mismatch":       "Pick MATRIX-compatible tokenizer",
+        "v7_f56b_dim_env_mismatch": "Snap H = nh*head_dim",
+    }
+    gotcha_payloads = [
+        g if g.suggested_fix is not None else GotchaPayload(
+            id=g.id, severity=g.severity, message=g.message,
+            reference=g.reference,
+            suggested_fix=_SUGGESTED_FIX_BY_ID.get(g.id),
+        )
+        for g in gotcha_payloads
+    ]
     # V7-F56b: surface the symbolic-dim mismatch as a gotcha so the
     # vbgui GotchasTab + per-brick badge render it without needing
     # a separate WS channel.

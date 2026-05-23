@@ -100,3 +100,59 @@ export async function dropBrickViaPalette(
     { timeout: 4_000 },
   ).toBeGreaterThan(before);
 }
+
+/** Drop an adapter onto the canvas via synthetic dragstart/drop events. */
+export async function dropAdapterViaPalette(
+  page: Page, kind: string,
+): Promise<void> {
+  const tile = page.getByTestId(`palette-adapter-${kind}`);
+  const canvas = page.getByTestId("flow-canvas");
+  const before = await page.locator("[data-testid^='adapter-node-']").count();
+  await tile.hover();
+  await page.mouse.down();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("canvas has no bounding box");
+  await page.mouse.move(box.x + 200, box.y + 200, { steps: 6 });
+  await page.mouse.up();
+  // Synthetic drop event for adapter
+  await canvas.evaluate((el, k) => {
+    const dt = new DataTransfer();
+    dt.setData("application/x-cppmega-adapter", k);
+    const ev = new DragEvent("drop", { bubbles: true, dataTransfer: dt,
+                                       clientX: 200, clientY: 200 });
+    el.dispatchEvent(ev);
+  }, kind);
+  await expect.poll(async () =>
+    await page.locator("[data-testid^='adapter-node-']").count(),
+    { timeout: 4_000 },
+  ).toBeGreaterThan(before);
+}
+
+/** Drop a transplant brick onto the canvas via synthetic dragstart/drop events. */
+export async function dropTransplantViaBar(
+  page: Page, name: string, kind: string, params: Record<string, unknown>,
+): Promise<void> {
+  const tile = page.getByTestId(`transplant-drag-brick-${name}`);
+  const canvas = page.getByTestId("flow-canvas");
+  const before = await page.locator("[data-testid^='brick-node-']").count();
+  await tile.hover();
+  await page.mouse.down();
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("canvas has no bounding box");
+  await page.mouse.move(box.x + 300, box.y + 300, { steps: 6 });
+  await page.mouse.up();
+  // Synthetic drop event for transplant
+  await canvas.evaluate((el, { k, p }) => {
+    const dt = new DataTransfer();
+    dt.setData("application/x-cppmega-transplant-kind", k);
+    dt.setData("application/x-cppmega-transplant-params", JSON.stringify(p));
+    const ev = new DragEvent("drop", { bubbles: true, dataTransfer: dt,
+                                       clientX: 300, clientY: 300 });
+    el.dispatchEvent(ev);
+  }, { k: kind, p: params });
+  await expect.poll(async () =>
+    await page.locator("[data-testid^='brick-node-']").count(),
+    { timeout: 4_000 },
+  ).toBeGreaterThan(before);
+}
+

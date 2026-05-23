@@ -14,7 +14,16 @@ import mlx.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
-from cppmega_v4.runner import Pipeline, run_pipeline
+# NOTE: cppmega_v4.runner.Pipeline/run_pipeline were imported at
+# module load in feat(v7-h08) but are not used by this handler.
+# The import created a circular path through
+# cppmega_v4.runner.__init__ -> cppmega_v4.jsonrpc.schema ->
+# cppmega_v4.jsonrpc.__init__ -> dispatcher -> histogram_method,
+# which broke any caller (e.g. `python -m cppmega_v4.tools.ckpt_inspect`)
+# that imported cppmega_v4.runner before cppmega_v4.jsonrpc finished
+# initialising. The handler instantiates bricks directly via
+# BLOCK_BUILDERS instead of going through the pipeline, so dropping
+# the unused import is the minimal honest fix.
 
 
 class HistogramParams(BaseModel):

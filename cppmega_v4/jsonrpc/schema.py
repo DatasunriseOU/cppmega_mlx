@@ -458,7 +458,15 @@ class GotchaPayload(BaseModel):
     id: str
     severity: Literal["info", "warning", "error"]
     message: str
+    # V7-L49: 'file:line' / doc anchor — UI parses out a short
+    # `source_file` chip from the suffix while keeping the full
+    # value for the link target.
     reference: str | None = None
+    # V7-L48: when set, the UI renders an inline 'Apply' button that
+    # dispatches a spec mutation keyed off `id`. Pure-string hint so
+    # existing AUTO_FIXABLE hardcoded table is no longer the only
+    # opt-in for the recovery flow.
+    suggested_fix: str | None = None
 
 
 class FusionRegionPayload(BaseModel):

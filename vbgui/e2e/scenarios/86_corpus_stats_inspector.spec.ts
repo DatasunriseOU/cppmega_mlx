@@ -20,8 +20,7 @@ test("V7-G04: corpus_stats sidecar renders in DataInspector",
     test.setTimeout(60_000);
     const dir = tmpDir();
     const parquet = path.join(dir, "shard.parquet");
-    // Use the same Python venv to build a one-row parquet + sidecar.
-    const repoRoot = path.resolve(__dirname, "../../..");
+    const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
     execSync(
       `${repoRoot}/.venv/bin/python -c "import pyarrow as pa, pyarrow.parquet as pq, json; ` +
         `pq.write_table(pa.table({'token_ids':[[1,2,3]]}), '${parquet}'); ` +
@@ -34,7 +33,7 @@ test("V7-G04: corpus_stats sidecar renders in DataInspector",
 
     await gotoApp(page);
     await clickTab(page, "data");
-    await page.getByTestId("data-source-path").fill(parquet);
+    await page.getByTestId("data-path").fill(parquet);
     await page.getByTestId("data-load").click();
 
     const block = page.getByTestId("data-corpus-stats");

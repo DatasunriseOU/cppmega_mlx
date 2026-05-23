@@ -139,8 +139,17 @@ def test_dispatch_pipeline_abort_requests_stage_abort():
         run_resp = dispatch(envelope)
         assert run_resp.error is None
         assert run_resp.result["overall_status"] == "cancelled"
-        train = run_resp.result["stages"][-1]
-        assert train["status"] == "cancelled"
-        assert train["aborted"] is True
+        stages = run_resp.result["stages"]
+        # V7-H10: any stage that observes the abort_token at entry
+        # may short-circuit with status="cancelled" + aborted=True;
+        # later stages are then reported as "skipped". The overall
+        # contract is unchanged (overall_status="cancelled") and at
+        # least one stage must record the cancellation.
+        cancelled = [s for s in stages if s["status"] == "cancelled"]
+        assert cancelled, stages
+        assert any(s.get("aborted") is True for s in cancelled), cancelled
+        train = next((s for s in stages if s["name"] == "train"), None)
+        assert train is not None
+        assert train["status"] in {"cancelled", "skipped"}
     finally:
         clear_abort(run_id)

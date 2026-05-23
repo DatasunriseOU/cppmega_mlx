@@ -18,7 +18,11 @@ export interface FlowCanvasProps {
   edges: Edge[];
   onConnect?: (params: { source: string; target: string }) => void;
   isValidConnection?: IsValidConnection;
-  onDropBrick?: (kind: string, position: { x: number; y: number }) => void;
+  onDropBrick?: (
+    kind: string,
+    position: { x: number; y: number },
+    params?: Record<string, unknown>,
+  ) => void;
   /** Fires when the user clicks a brick node — opens BrickContextPanel
    *  (E7-5/E7-6). */
   onNodeClick?: (nodeId: string) => void;
@@ -41,12 +45,23 @@ export function FlowCanvas({
     (e: React.DragEvent<HTMLDivElement>) => {
       e.preventDefault();
       const brick = e.dataTransfer.getData("application/x-cppmega-brick");
-      if (brick && onDropBrick) {
-        // currentTarget is the canvas wrapper; e.target is whatever the
-        // user dropped onto (often a child node) and would give wrong
-        // coordinates.
-        const rect = e.currentTarget.getBoundingClientRect();
-        onDropBrick(brick, { x: e.clientX - rect.left, y: e.clientY - rect.top });
+      const adapter = e.dataTransfer.getData("application/x-cppmega-adapter");
+      const transplantKind = e.dataTransfer.getData("application/x-cppmega-transplant-kind");
+      const transplantParamsRaw = e.dataTransfer.getData("application/x-cppmega-transplant-params");
+
+      const rect = e.currentTarget.getBoundingClientRect();
+      const position = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+
+      if (transplantKind && onDropBrick) {
+        let params: Record<string, unknown> = {};
+        try {
+          if (transplantParamsRaw) {
+            params = JSON.parse(transplantParamsRaw);
+          }
+        } catch { /* ignore */ }
+        onDropBrick(transplantKind, position, params);
+      } else if ((brick || adapter) && onDropBrick) {
+        onDropBrick(brick || adapter, position);
       }
     },
     [onDropBrick],

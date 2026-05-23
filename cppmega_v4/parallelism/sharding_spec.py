@@ -37,12 +37,25 @@ class ParallelismKind(str, Enum):
     PP_VPP    = "pp_vpp"       # virtual pipeline parallel
 
 
+class CommBackend(str, Enum):
+    """Recognised communication primitive backends (JAX, NCCL, and MLX variants)."""
+
+    RING  = "ring"   # MLX Ring TCP
+    JACCL = "jaccl"  # MLX Thunderbolt RDMA
+    MPI   = "mpi"    # MLX MPI
+    NCCL  = "nccl"   # PyTorch CUDA NCCL
+    PJRT  = "pjrt"   # JAX TPU PJRT
+
+
 _VALID_GRAD_DTYPES: Final[frozenset[str]] = frozenset({"bf16", "fp32"})
 _VALID_COMPILE_MODES: Final[frozenset[str]] = frozenset({
     "off", "regional", "whole_model",
 })
 _VALID_ACTIVATION_CHECKPOINT: Final[frozenset[str]] = frozenset({
     "off", "full", "selective",
+})
+_VALID_COMM_BACKENDS: Final[frozenset[str]] = frozenset({
+    "ring", "jaccl", "mpi", "nccl", "pjrt",
 })
 
 
@@ -101,9 +114,11 @@ class ShardingSpec:
         the spec accepts it so we can flag it loudly).
       fp8_enabled: forward in FP8 via Transformer Engine / torchao; this
         does NOT make grads or optimiser FP8 — known duplication pain.
-      activation_checkpointing: ``"off"`` (peak activations) | ``"full"``
+      activation_checkpointing: ``"off" sku (peak activations) | ``"full"``
         (only block boundaries kept) | ``"selective"`` (per-layer
         cherry-pick).
+      comm_backend: chosen distributed communication primitive/framework.
+        Defaults to `"ring"` for MLX/Apple Silicon single-host/multi-host.
     """
 
     topology: DeviceTopology
@@ -114,6 +129,7 @@ class ShardingSpec:
     compile_mode: str = "regional"
     fp8_enabled: bool = False
     activation_checkpointing: str = "full"
+    comm_backend: CommBackend | str = CommBackend.RING
 
     def __post_init__(self) -> None:
         if not isinstance(self.topology, DeviceTopology):
@@ -165,6 +181,11 @@ class ShardingSpec:
                 f"ShardingSpec.activation_checkpointing="
                 f"{self.activation_checkpointing!r} not in "
                 f"{sorted(_VALID_ACTIVATION_CHECKPOINT)}"
+            )
+        if self.comm_backend not in _VALID_COMM_BACKENDS:
+            raise ValueError(
+                f"ShardingSpec.comm_backend={self.comm_backend!r} not in "
+                f"{sorted(_VALID_COMM_BACKENDS)}"
             )
 
     def axis_kinds(self) -> frozenset[ParallelismKind]:

@@ -168,6 +168,7 @@ The current collected test files are:
 - tests/test_attention.py
 - tests/test_audit_v3_v4_v5.py
 - tests/test_bench_1b_training_matrix.py
+- tests/test_bench_allreduce_singleproc.py
 - tests/test_bench_baselines.py
 - tests/test_bench_dtype_cast_cost.py
 - tests/test_bench_dtype_long_horizon.py
@@ -193,6 +194,7 @@ The current collected test files are:
 - tests/test_data_pipeline_doc.py
 - tests/test_data_smoke_script.py
 - tests/test_dataloader_bridge.py
+- tests/test_distributed_runtime_proxy.py
 - tests/test_distributed_zero1.py
 - tests/test_distributed_zero1_loopback.py
 - tests/test_engram.py

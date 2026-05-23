@@ -41,6 +41,7 @@ from cppmega_v4.parallelism.sharding_spec import (
     megatron_ep_only,
     single_device,
 )
+from cppmega_v4.parallelism.runtime_simulation import DistributedRuntimeProxy
 from cppmega_v4.parallelism.topology import (
     TOPOLOGY_BUILTINS,
     DeviceKind,
@@ -62,6 +63,7 @@ __all__ = [
     "DeviceSpec",
     "DeviceTopology",
     "DistributedMemoryReport",
+    "DistributedRuntimeProxy",
     "DistributedVerificationResult",
     "GOTCHAS",
     "Gotcha",

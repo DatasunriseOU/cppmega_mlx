@@ -1446,13 +1446,6 @@ def test_descriptor_schedule_uses_descriptor_owned_fragment_emitter() -> None:
     assert "+ 0.0" not in generated_source
 
 
-@pytest.mark.skipif(
-    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
-    reason=(
-        "native tilelang.compile smoke is opt-in because it loads the native "
-        "Triton frontend and should run only when explicitly requested"
-    ),
-)
 def test_flat_descriptor_template_compiles_with_tilelang_lowerer() -> None:
     region = build_path_c_fusion_region(
         region_name="flat_native_descriptor_region",
@@ -2919,13 +2912,6 @@ def test_mamba3_fp8_train_prototype_template_lowers_as_attested_non_production()
     assert compiled.plan.schedule_contract.declared_implementation_kind == "prototype"
 
 
-@pytest.mark.skipif(
-    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
-    reason=(
-        "native tilelang.compile smoke is opt-in because it loads the native "
-        "Triton frontend and should run only when explicitly requested"
-    ),
-)
 def test_mamba3_fp8_train_prototype_template_compiles_with_tilelang_lowerer() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     schedule_template = mark_path_c_schedule_template_for_region(
@@ -2949,13 +2935,6 @@ def test_mamba3_fp8_train_prototype_template_compiles_with_tilelang_lowerer() ->
     assert compiled.plan.schedule_contract.status == "attested_non_production_schedule"
 
 
-@pytest.mark.skipif(
-    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
-    reason=(
-        "native tilelang.compile smoke is opt-in because it loads the native "
-        "Triton frontend and should run only when explicitly requested"
-    ),
-)
 def test_model_derived_descriptor_template_compiles_with_tilelang_lowerer() -> None:
     profile = local_gb10_quarter_profile()
     model = SimpleNamespace(
@@ -3256,13 +3235,6 @@ def test_row_phased_acceptance_fwd_bwd_template_generates_valid_source() -> None
     assert "attention_qkv_projection_bwd_attention_q_grad" in generated_source
 
 
-@pytest.mark.skipif(
-    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
-    reason=(
-        "native tilelang.compile smoke is opt-in because it loads the native "
-        "Triton frontend and should run only when explicitly requested"
-    ),
-)
 def test_row_phased_descriptor_template_compiles_with_tilelang_lowerer() -> None:
     cfg = local_gb10_quarter_profile().tiny_smoke_config(
         pattern="MR",
@@ -3316,13 +3288,6 @@ def test_row_phased_descriptor_template_compiles_with_tilelang_lowerer() -> None
     assert compiled.plan.schedule_contract.status == "attested_non_production_schedule"
 
 
-@pytest.mark.skipif(
-    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
-    reason=(
-        "native tilelang.compile smoke is opt-in because it loads the native "
-        "Triton frontend and should run only when explicitly requested"
-    ),
-)
 def test_row_phased_acceptance_fwd_bwd_template_compiles_with_tilelang_lowerer() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     descriptors = (
@@ -3414,13 +3379,6 @@ def test_mamba3_fp8_train_schedule_compile_helper_verifies_named_target() -> Non
     )
 
 
-@pytest.mark.skipif(
-    os.environ.get("CPPMEGA_RUN_NATIVE_TILELANG_COMPILE_SMOKE") != "1",
-    reason=(
-        "native tilelang.compile smoke is opt-in because it loads the native "
-        "Triton frontend and should run only when explicitly requested"
-    ),
-)
 def test_mamba3_fp8_train_schedule_compile_helper_defaults_to_tilelang_lowerer() -> None:
     from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
 

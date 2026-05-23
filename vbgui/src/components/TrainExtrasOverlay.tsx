@@ -350,7 +350,8 @@ function PerBrickGradNormsBar({
   per_brick_grad_norms,
 }: { per_brick_grad_norms: Record<string, number> }): JSX.Element {
   const entries = Object.entries(per_brick_grad_norms);
-  const max = Math.max(1e-9, ...entries.map(([, v]) => Math.abs(v)));
+  const validValues = entries.map(([, v]) => typeof v === "number" && !isNaN(v) ? Math.abs(v) : 0);
+  const max = Math.max(1e-9, ...validValues);
   return (
     <div data-testid="extras-per-brick-grad-norms"
          style={{ padding: 6, background: "#f1f5f9",
@@ -359,7 +360,8 @@ function PerBrickGradNormsBar({
       <HelpIcon topic="metric_per_brick_grad" />
       <div style={{ display: "flex", flexDirection: "column",
                     gap: 2, marginTop: 4 }}>
-        {entries.map(([brick, norm]) => {
+        {entries.map(([brick, rawNorm]) => {
+          const norm = typeof rawNorm === "number" && !isNaN(rawNorm) ? rawNorm : 0;
           const width = (Math.abs(norm) / max) * 100;
           return (
             <div key={brick}

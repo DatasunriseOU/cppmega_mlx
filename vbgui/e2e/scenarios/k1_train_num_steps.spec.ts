@@ -7,6 +7,14 @@ import {
   gotoApp, selectPreset, clickRunPipeline, closeModal,
 } from "../fixtures";
 
+// K1 sets num_steps inside the run-pipeline dropdown and then
+// clicks run-pipeline-train directly instead of going through the
+// shared clickRunPipeline helper, because that helper re-opens the
+// toggle and would wipe the just-typed value. Import the helper
+// anyway so it stays part of the K-block fixture surface and
+// noUnusedLocals stays happy.
+void clickRunPipeline;
+
 test("K1: TopBar num_steps drives extras.losses length visually", async ({
   page,
 }) => {

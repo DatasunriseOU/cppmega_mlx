@@ -79,6 +79,23 @@ def _num_experts(b: ModelBuildSpec) -> int:
     return int(b.dim_env.get("num_experts", 0))
 
 
+def _is_apple_silicon(s: ShardingSpec) -> bool:
+    kind = s.topology.devices[0].kind.value
+    return kind in {"m3_ultra", "gb10"}
+
+
+def _is_gpu(s: ShardingSpec) -> bool:
+    kind = s.topology.devices[0].kind.value
+    return kind in {"h100_80gb", "h200_141gb", "a100_40gb", "a100_80gb", "b100_80gb"}
+
+
+def _is_nvlink_gpu_topology(s: ShardingSpec) -> bool:
+    if not _is_gpu(s):
+        return False
+    return any("nvlink" in d.interconnect for d in s.topology.devices)
+
+
+
 # ---------------------------------------------------------------------------
 # The gotcha table — every entry has a real upstream provenance.
 # ---------------------------------------------------------------------------
@@ -293,6 +310,34 @@ GOTCHAS: tuple[Gotcha, ...] = (
         ),
         reference="cppmega/docs/memory_dtype_audit_2026_04_25.md "
                   "(precision-aware storage ladder)",
+    ),
+    Gotcha(
+        gotcha_id="incompatible_comm_backend",
+        severity=GotchaSeverity.ERROR,
+        condition=lambda s, b: (
+            (s.comm_backend == "nccl" and (_is_apple_silicon(s) or _is_tpu(s)))
+            or (s.comm_backend == "pjrt" and (_is_apple_silicon(s) or _is_gpu(s)))
+            or (s.comm_backend == "jaccl" and not _is_apple_silicon(s))
+        ),
+        message=(
+            "Incompatible communication backend: 'nccl' requires Nvidia GPUs, "
+            "'pjrt' requires TPUs, and 'jaccl' requires Apple Silicon hardware. "
+            "Select a communication backend matching the hardware topology."
+        ),
+        reference="cppmega_v4/parallelism/sharding_spec.py; AGENTS.md",
+    ),
+    Gotcha(
+        gotcha_id="slow_loopback_ring",
+        severity=GotchaSeverity.WARNING,
+        condition=lambda s, b: (
+            s.comm_backend == "ring" and _is_nvlink_gpu_topology(s)
+        ),
+        message=(
+            "Using MLX Ring over TCP ('ring') on an NVLink-interconnected GPU topology. "
+            "This will incur significant communication latency bottlenecks. Use 'nccl' "
+            "for NVLink inter-GPU collective acceleration."
+        ),
+        reference="cppmega_v4/parallelism/sharding_spec.py; gotcha_checker.py",
     ),
 )
 

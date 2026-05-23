@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
-from cppmega_v4.runner.stages import request_abort, clear_abort
+from cppmega_v4.runner.stages import (
+    STAGE_REGISTRY, StageContext, clear_abort, request_abort,
+)
 
 
 def _spec() -> VerifyParams:
@@ -28,11 +30,33 @@ def _run(opts: dict) -> dict:
 
 
 def _run_stage(opts: dict):
+    # Drive stage_train directly through STAGE_REGISTRY so this test
+    # keeps proving G09's contract (stage_train itself observes
+    # _ABORT_TOKENS and returns status="cancelled" with extras), even
+    # after V7-H10 added a pipeline-level cancel gate that would
+    # otherwise short-circuit stages earlier in the chain. The full
+    # pipeline overall-status behaviour is covered separately by
+    # tests/v4/test_jsonrpc_dispatcher.py and
+    # tests/v4/test_pipeline_abort_verify_dry.py.
+    spec = _spec()
+    ctx = StageContext(spec=spec, options={"train": opts})
+    STAGE_REGISTRY["parse"](ctx)
+    # Skip verify_build_spec here: V7-H10 added a cancel gate inside
+    # that stage which would consume the abort_token (via clear_abort)
+    # before stage_train ever sees it. This test specifically proves
+    # G09 — that stage_train itself observes the abort_token — so we
+    # exercise the build_model + train path in isolation. End-to-end
+    # behaviour through run_pipeline is covered separately.
+    STAGE_REGISTRY["build_model"](ctx)
+    return STAGE_REGISTRY["train"](ctx)
+
+
+def _run_full_pipeline_overall_status(opts: dict) -> str:
     report = run_pipeline(_spec(), Pipeline.from_dict({
         "stages": ["parse", "verify_build_spec", "build_model", "train"],
         "stage_options": {"train": opts},
     }))
-    return next(s for s in report.stages if s.name == "train")
+    return report.overall_status
 
 
 def test_abort_token_set_before_run_cancels_immediately():

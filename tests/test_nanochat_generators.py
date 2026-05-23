@@ -254,10 +254,20 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     assert summary == {"docs_in": 2, "docs_out": 2}
     assert parquet_file.metadata.num_rows == 2
     assert parquet_file.metadata.num_row_groups == 2
-    assert parquet_file.read(columns=["source_doc_id"]).column("source_doc_id").to_pylist() == [
-        "input.jsonl:1",
-        "input.jsonl:2",
-    ]
+    # V7-G02: when the input row doesn't carry an explicit
+    # source_doc_id, convert_local_jsonl_to_parquet now prefers the
+    # stable doc signature (text_sha256:...) over the legacy
+    # "<name>:<index>" form. Two distinct documents must still produce
+    # two distinct, deterministic ids of the new shape.
+    source_doc_ids = parquet_file.read(
+        columns=["source_doc_id"]
+    ).column("source_doc_id").to_pylist()
+    assert len(source_doc_ids) == 2
+    assert all(
+        isinstance(v, str) and v.startswith("text_sha256:") and len(v) > len("text_sha256:")
+        for v in source_doc_ids
+    ), source_doc_ids
+    assert len(set(source_doc_ids)) == 2
     fingerprints = parquet_file.read(
         columns=["tokenizer_fingerprint"]
     ).column("tokenizer_fingerprint").to_pylist()

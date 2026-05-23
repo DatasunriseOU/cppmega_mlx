@@ -9,6 +9,15 @@ import { gotoApp, selectPreset, closeModal } from "../fixtures";
 
 test("V7-D03: fp16 master_dtype engages LossScaler and reports snapshot",
   async ({ page }) => {
+    page.on("pageerror", (err) => {
+      console.error("BROWSER PAGE ERROR:", err.message, err.stack);
+    });
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        console.error("BROWSER CONSOLE ERROR:", msg.text());
+      }
+    });
+
     test.setTimeout(60_000);
     await gotoApp(page);
     await selectPreset(page, "llama3_8b");
@@ -16,14 +25,25 @@ test("V7-D03: fp16 master_dtype engages LossScaler and reports snapshot",
     await page.getByTestId("run-pipeline-toggle").click();
     await page.getByTestId("train-num-steps").fill("2");
     await page.getByTestId("top-bar-precision-mode").selectOption("fp16");
+    await expect(page.getByTestId("top-bar-precision-mode")).toHaveValue("fp16");
     await page.getByTestId("run-pipeline-train").click();
 
     const modal = page.getByTestId("run-result-modal");
     await modal.waitFor({ timeout: 60_000 });
+
+    // Wait for the train stage status to be "ok" (generous 45s timeout for compilation/run under load).
+    await page.getByTestId("run-result-status-train").waitFor({ state: "visible", timeout: 45_000 });
+    await expect(page.getByTestId("run-result-status-train")).toHaveText("ok", { timeout: 45_000 });
+
     await page.getByTestId("run-result-expand-train").click();
 
-    // extras.train.loss_scaler is a nested object; the StageExtras
-    // recursive renderer produces -loss_scaler-<field> testids.
+    const errorBlock = page.getByTestId("run-result-detail-train");
+    if (await errorBlock.isVisible()) {
+        console.error("TRAIN STAGE FAILED WITH ERROR:", await errorBlock.textContent());
+    }
+
+    const extrasBlock = page.getByTestId("run-result-extras-train");
+    console.error("ALL RENDERED TRAIN EXTRAS:", await extrasBlock.textContent());
     const scalerBlock = page.getByTestId("run-result-extras-train-loss_scaler");
     await expect(scalerBlock).toBeVisible();
 
@@ -45,6 +65,15 @@ test("V7-D03: fp16 master_dtype engages LossScaler and reports snapshot",
 
 test("V7-D03: bf16 master_dtype leaves loss_scaler=null",
   async ({ page }) => {
+    page.on("pageerror", (err) => {
+      console.error("BROWSER PAGE ERROR:", err.message, err.stack);
+    });
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        console.error("BROWSER CONSOLE ERROR:", msg.text());
+      }
+    });
+
     test.setTimeout(60_000);
     await gotoApp(page);
     await selectPreset(page, "llama3_8b");
@@ -56,6 +85,11 @@ test("V7-D03: bf16 master_dtype leaves loss_scaler=null",
 
     const modal = page.getByTestId("run-result-modal");
     await modal.waitFor({ timeout: 60_000 });
+
+    // Wait for the train stage status to be "ok" (generous 45s timeout for compilation/run under load).
+    await page.getByTestId("run-result-status-train").waitFor({ state: "visible", timeout: 45_000 });
+    await expect(page.getByTestId("run-result-status-train")).toHaveText("ok", { timeout: 45_000 });
+
     await page.getByTestId("run-result-expand-train").click();
 
     // The non-object null renders as text "null" via ExtrasEntry.

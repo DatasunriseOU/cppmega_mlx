@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { LossTab } from "@/components/sidebar/LossTab";
 import { OptimTab } from "@/components/sidebar/OptimTab";
 import { RewritersTab } from "@/components/sidebar/RewritersTab";
@@ -287,6 +287,62 @@ describe("SideChannelsTab", () => {
     expect(tensors.textContent).toContain("platform_ids shape=(1,5)");
     expect(tensors.textContent).toContain("structure_ids shape=(1,6)");
     expect(tensors.textContent).toContain("ast_depth_ids shape=(1,6)");
+  });
+
+  it("uses backend side-channel preview when rpc is available", async () => {
+    const rpc = {
+      call: vi.fn(async () => ({
+        token_count: 5,
+        prompt_ids: { shape: [1, 5], dtype: "int32", sample: [1, 2, 3] },
+        model_kwargs: {
+          platform_ids: { shape: [1, 20], dtype: "int32", sample: [2, 64] },
+          structure_ids: { shape: [1, 5], dtype: "int32", sample: [0, 1] },
+        },
+        side_channels: {
+          syntax: {
+            ast_depth_ids: {
+              shape: [1, 5],
+              dtype: "int32",
+              sample: [0, 1],
+            },
+          },
+        },
+        provenance: { adapter: "python:python-ast-v1" },
+        rendered_platform_context: "os=linux",
+        cache_key: "abc",
+        elapsed_ms: 1.0,
+      })),
+    };
+    render(<SideChannelsTab sideChannels={INITIAL_SPEC.side_channels}
+                            availableChannels={["platform_ids"]}
+                            selectedTrainChannels={[]}
+                            gotchas={[]}
+                            rpc={rpc as never}
+                            tokenizerSource="/tmp/tokenizer.json"
+                            onApply={() => {}}
+                            onTrainChannelsChange={() => {}} />);
+    fireEvent.change(screen.getByTestId("side-channel-inference-source"),
+      { target: { value: "parse_if_possible" } });
+    fireEvent.change(screen.getByTestId("side-channel-adapter"),
+      { target: { value: "python" } });
+    fireEvent.change(screen.getByTestId("side-channel-preview-prompt"),
+      { target: { value: "x = 1\n" } });
+    fireEvent.click(screen.getByTestId("side-channel-preview-run"));
+
+    await waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      "side_channels.preview",
+      expect.objectContaining({
+        tokenizer_source: "/tmp/tokenizer.json",
+        text: "x = 1\n",
+        adapter: "python",
+        language: "python",
+      }),
+    ));
+    const tensors = screen.getByTestId("side-channel-preview-tensors");
+    expect(tensors.textContent).toContain("prompt_ids shape=(1,5)");
+    expect(tensors.textContent).toContain("platform_ids shape=(1,20)");
+    expect(tensors.textContent).toContain("ast_depth_ids shape=(1,5)");
+    expect(tensors.textContent).toContain("adapter=python:python-ast-v1");
   });
 
   it("surfaces required-family contract probe errors", () => {

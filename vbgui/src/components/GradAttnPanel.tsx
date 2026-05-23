@@ -65,14 +65,16 @@ export function GradAttnPanel({
 function GradBars({ norms }: { norms: Record<string, number> }):
   JSX.Element {
   const entries = Object.entries(norms);
-  const max = Math.max(...entries.map(([, v]) => v), 1e-9);
+  const validValues = entries.map(([, v]) => typeof v === "number" && !isNaN(v) ? v : 0);
+  const max = Math.max(...validValues, 1e-9);
   const W = 220;
   const rowH = 14;
   const labelW = 90;
   return (
     <svg data-testid="grad-attn-panel-grads-svg"
          width={W + labelW} height={entries.length * rowH}>
-      {entries.map(([k, v], i) => {
+      {entries.map(([k, rawVal], i) => {
+        const v = typeof rawVal === "number" && !isNaN(rawVal) ? rawVal : 0;
         const t = max > 0 ? v / max : 0;
         const w = Math.max(2, t * W);
         return (

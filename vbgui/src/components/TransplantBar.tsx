@@ -82,22 +82,55 @@ export function TransplantBar({
         {loading ? "Loading…" : "Load"}
       </button>
       {bricks.length > 0 && (
-        <label>
-          brick
-          <select data-testid="transplant-source-brick"
-                  value={selectedBrick}
-                  onChange={(e) => setSelectedBrick(e.target.value)}
-                  style={{ marginLeft: 4, width: 200 }}>
+        <>
+          <label>
+            brick
+            <select data-testid="transplant-source-brick"
+                    value={selectedBrick}
+                    onChange={(e) => setSelectedBrick(e.target.value)}
+                    style={{ marginLeft: 4, width: 200 }}>
+              {bricks.map((b) => {
+                const key = b.name ?? b.kind;
+                return (
+                  <option key={key} value={key}>
+                    {key} [{b.kind}]
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+          <div data-testid="transplant-draggable-list"
+               style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: 12 }}>
+            <span style={{ color: "#4b5563", fontWeight: 600 }}>Drag:</span>
             {bricks.map((b) => {
               const key = b.name ?? b.kind;
               return (
-                <option key={key} value={key}>
-                  {key} [{b.kind}]
-                </option>
+                <div
+                  key={key}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData("application/x-cppmega-transplant-kind", b.kind);
+                    e.dataTransfer.setData("application/x-cppmega-transplant-params", JSON.stringify(b.params ?? {}));
+                    e.dataTransfer.effectAllowed = "copy";
+                  }}
+                  data-testid={`transplant-drag-brick-${key}`}
+                  style={{
+                    padding: "3px 8px",
+                    background: "#fff",
+                    border: "1px solid #a5b4fc",
+                    borderRadius: 4,
+                    cursor: "grab",
+                    fontSize: 10,
+                    fontWeight: 600,
+                    boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
+                  }}
+                >
+                  {key}
+                </div>
               );
             })}
-          </select>
-        </label>
+          </div>
+        </>
       )}
       <button data-testid="transplant-import"
               onClick={() => {
