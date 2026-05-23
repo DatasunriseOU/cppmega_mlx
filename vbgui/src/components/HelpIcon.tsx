@@ -119,6 +119,35 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "doesn't blow numerical convergence — without spinning up " +
       "real GPUs.",
   },
+  rpc_error_data: {
+    title: "RPC error.data — backend field-level details",
+    what:
+      "JSON-RPC errors carry an optional .data blob the UI used to " +
+      "discard. The ErrorDetailsPanel now walks Pydantic-style " +
+      "errors[] arrays, runtime traceback strings, and stage names " +
+      "to surface them next to the headline message.",
+    why:
+      "Without the field detail, an INVALID_PARAMS error reads as " +
+      "'1 validation error for VerifyParams' — useless. With the " +
+      "expanded view, the architect sees that, e.g., " +
+      "graph.nodes.2.kind was 'rmsnorm' (an adapter, not a brick).",
+    example:
+      "errors: [{loc: ['graph','nodes',2,'kind'], msg: 'unknown " +
+      "brick', type: 'value_error'}] now renders as a clickable " +
+      "list item.",
+  },
+  spec_validation_recovery: {
+    title: "Spec validation recovery — backend-suggested fixes",
+    what:
+      "When verify_build_spec rejects a spec with a known-fixable " +
+      "pattern (missing edge, dim mismatch, bad dtype combo, etc.), " +
+      "the gotcha payload carries a `suggested_fix` hint and a known " +
+      "id from a fixable-set. The UI surfaces an Apply button.",
+    why:
+      "The architect shouldn't need to read the message and guess " +
+      "which dropdown to change. One-click fixes turn 'broken spec' " +
+      "into 'one keystroke away from valid'.",
+  },
   warm_start_history: {
     title: "warm_start_history — which prior run to continue from",
     what:

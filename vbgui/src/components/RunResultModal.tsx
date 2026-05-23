@@ -1,8 +1,10 @@
 // Modal that displays per-stage results from a pipeline.run response.
 
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { LossChart } from "@/components/LossChart";
 import { GradAttnPanel } from "@/components/GradAttnPanel";
+import { ErrorDetailsPanel,
+         type ErrorDetails } from "@/components/ErrorDetailsPanel";
 
 export interface StageResult {
   name: string;
@@ -22,8 +24,17 @@ export interface RunReport {
 
 export interface RunResultModalProps {
   report: RunReport | null;
-  error?: string | null;
+  // V7-L46: error can be a legacy string or a rich ErrorDetails
+  // shape carrying field-level Pydantic errors / traceback.
+  error?: string | ErrorDetails | null;
   onClose: () => void;
+}
+
+function normalizeError(
+  e: string | ErrorDetails | null | undefined,
+): ErrorDetails | null {
+  if (e == null) return null;
+  return typeof e === "string" ? { message: e } : e;
 }
 
 const ICONS = { ok: "✓", fail: "✗", skipped: "·", cancelled: "!" } as const;
@@ -119,8 +130,28 @@ function ExtrasEntry({
 export function RunResultModal({
   report, error, onClose,
 }: RunResultModalProps): JSX.Element | null {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  if (!report && !error) return null;
+  const normalizedError = normalizeError(error);
+  // V7-L47: pre-expand the first failing stage so the user doesn't
+  // have to scroll the modal AND click to discover the failure.
+  const firstFailed = report?.stages?.find((s) => s.status === "fail");
+  const [expanded, setExpanded] = useState<Set<string>>(
+    () => firstFailed ? new Set([firstFailed.name]) : new Set());
+  const failedRowRef = useRef<HTMLTableRowElement | null>(null);
+  // When `report` swaps to a different failing run, re-expand the
+  // new failed stage too.
+  useEffect(() => {
+    if (firstFailed) {
+      setExpanded((prev) => prev.has(firstFailed.name)
+        ? prev : new Set([...prev, firstFailed.name]));
+      if (failedRowRef.current
+          && typeof failedRowRef.current.scrollIntoView === "function") {
+        failedRowRef.current.scrollIntoView({
+          block: "center", behavior: "auto",
+        });
+      }
+    }
+  }, [firstFailed]);
+  if (!report && !normalizedError) return null;
 
   return (
     <div data-testid="run-result-modal-backdrop"
@@ -154,11 +185,9 @@ export function RunResultModal({
           <button data-testid="run-result-close" onClick={onClose}>×</button>
         </header>
 
-        {error && (
-          <div data-testid="run-result-error"
-               style={{ background: "#fee2e2", padding: 8, borderRadius: 4,
-                        color: "#991b1b", fontSize: 12 }}>
-            {error}
+        {normalizedError && (
+          <div data-testid="run-result-error">
+            <ErrorDetailsPanel error={normalizedError} />
           </div>
         )}
 
@@ -180,10 +209,24 @@ export function RunResultModal({
                 const open = expanded.has(s.name);
                 const extras = extrasOf(s);
                 const hasExtras = Object.keys(extras).length > 0;
+                const isFirstFailed = firstFailed?.name === s.name;
                 return (
                   <Fragment key={s.name}>
                     <tr data-testid={`run-result-stage-${s.name}`}
-                        style={{ borderBottom: "1px solid #f3f4f6" }}>
+                        ref={isFirstFailed ? failedRowRef : undefined}
+                        data-first-failed={isFirstFailed
+                                             ? "true" : undefined}
+                        style={{
+                          borderBottom: "1px solid #f3f4f6",
+                          // V7-L47: visual highlight on the first
+                          // failing row so the user sees it without
+                          // scrolling.
+                          background: isFirstFailed
+                            ? "#fef2f2" : undefined,
+                          outline: isFirstFailed
+                            ? "2px solid #fca5a5" : undefined,
+                          outlineOffset: isFirstFailed ? -2 : undefined,
+                        }}>
                       <td style={td}>
                         <span style={{ color: COLORS[s.status],
                                        fontWeight: 700 }}>

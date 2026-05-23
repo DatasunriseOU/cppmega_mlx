@@ -117,7 +117,24 @@ export function App(): JSX.Element {
   const suppressNextHistoryPushRef = useRef<boolean>(false);
   const [activeTab, setActiveTab] = useState<AppTab>("canvas");
   const [runReport, setRunReport] = useState<RunReport | null>(null);
-  const [runError, setRunError] = useState<string | null>(null);
+  // V7-L46: rich error state. setRunError accepts string or RpcError;
+  // RunResultModal renders field-level details via ErrorDetailsPanel.
+  const [runError, setRunErrorRaw] =
+    useState<import("@/components/ErrorDetailsPanel").ErrorDetails | null>(null);
+  const setRunError = useCallback((e: unknown) => {
+    if (e == null) { setRunErrorRaw(null); return; }
+    if (typeof e === "string") {
+      setRunErrorRaw({ message: e }); return;
+    }
+    const obj = e as { code?: unknown; message?: unknown;
+                        data?: unknown };
+    const message = typeof obj.message === "string"
+      ? obj.message : String(e);
+    const code = typeof obj.code === "number" ? obj.code : undefined;
+    const data = obj.data && typeof obj.data === "object"
+      ? (obj.data as Record<string, unknown>) : undefined;
+    setRunErrorRaw({ code, message, data });
+  }, []);
   const [trainInFlight, setTrainInFlight] = useState(false);
   // V7-I03: synchronous lock. React's setTrainInFlight schedules an
   // async commit, so two button clicks within the same microtask
@@ -375,7 +392,7 @@ export function App(): JSX.Element {
         }});
       }
     } catch (e) {
-      setRunError(String(e));
+      setRunError(e);
     }
   }, [rpc, spec.loss]);
 
@@ -582,7 +599,7 @@ export function App(): JSX.Element {
         }
       }
     } catch (e) {
-      setRunError(String(e));
+      setRunError(e);
     } finally {
       if (mode === "train") {
         setTrainInFlight(false);
@@ -593,42 +610,89 @@ export function App(): JSX.Element {
   }, [rpc, trainParquetPath, trainSideChannels, trainTokenizerPath,
       lastTrainRunId]);
 
-  const handleCancelTrain = useCallback(async () => {
-    const runId = trainRunId;
-    if (!runId) return;
-    try {
-      await rpc.call("pipeline.abort", { run_id: runId });
-    } catch (e) {
-      setRunError(String(e));
-    }
-  }, [rpc, trainRunId]);
-
   // V7-H06: pause / resume the in-flight train run. Backend job_control
   // module blocks the train loop until resume() is called.
+  // V7-H06b: gate the local UI flip on a pipeline.status round-trip so
+  // the indicator reflects backend reality (not optimistic). Same
+  // primitive backs handleCancelTrain so activeTrainRunId is only
+  // cleared once the registry reports running=false.
   const [trainPaused, setTrainPaused] = useState<boolean>(false);
+  const [trainAborting, setTrainAborting] = useState<boolean>(false);
+
+  const pollStatus = useCallback(async (
+    runId: string,
+    predicate: (s: { paused: boolean; running: boolean;
+                     aborted: boolean }) => boolean,
+    {tries = 30, intervalMs = 100}: {tries?: number; intervalMs?: number}
+      = {}): Promise<{paused: boolean; running: boolean;
+                       aborted: boolean; last_step: number;
+                       last_loss: number | null} | null> => {
+    for (let i = 0; i < tries; i++) {
+      try {
+        const s = await rpc.call<{ run_id: string; known: boolean;
+                                    paused: boolean; running: boolean;
+                                    aborted: boolean; last_step: number;
+                                    last_loss: number | null }>(
+          "pipeline.status", { run_id: runId });
+        if (s.known && predicate(s)) return s;
+      } catch { /* swallow; retry */ }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return null;
+  }, [rpc]);
+
   const handlePauseTrain = useCallback(async () => {
     const runId = trainRunId;
     if (!runId) return;
     try {
       await rpc.call("pipeline.pause", { run_id: runId });
-      setTrainPaused(true);
+      // V7-H06b: wait for backend to confirm paused=true.
+      const confirmed = await pollStatus(runId, (s) => s.paused === true);
+      if (confirmed) setTrainPaused(true);
+      else setRunError("pipeline.pause: backend did not confirm paused");
+    } catch (e) {
+      setRunError(e);
+    }
+  }, [rpc, trainRunId, pollStatus]);
+
+  const handleCancelTrain = useCallback(async () => {
+    const runId = trainRunId;
+    if (!runId) return;
+    setTrainAborting(true);
+    try {
+      await rpc.call("pipeline.abort", { run_id: runId });
+      // V7-H06b: wait until the backend registry flips running=false
+      // (or aborted=true) before letting the UI clear activeTrainRunId.
+      // Up to ~6s — long enough for a forward in progress to return.
+      await pollStatus(runId,
+        (s) => s.running === false || s.aborted === true,
+        { tries: 60, intervalMs: 100 });
     } catch (e) {
       setRunError(String(e));
+    } finally {
+      setTrainAborting(false);
     }
-  }, [rpc, trainRunId]);
+  }, [rpc, trainRunId, pollStatus]);
+
   const handleResumeTrain = useCallback(async () => {
     const runId = trainRunId;
     if (!runId) return;
     try {
       await rpc.call("pipeline.resume", { run_id: runId });
-      setTrainPaused(false);
+      // V7-H06b: wait for backend to confirm paused=false.
+      const confirmed = await pollStatus(runId, (s) => s.paused === false);
+      if (confirmed) setTrainPaused(false);
+      else setRunError("pipeline.resume: backend did not confirm resumed");
     } catch (e) {
-      setRunError(String(e));
+      setRunError(e);
     }
-  }, [rpc, trainRunId]);
+  }, [rpc, trainRunId, pollStatus]);
+
   // Clear paused flag whenever a new run starts or one ends.
-  useEffect(() => { if (!trainInFlight) setTrainPaused(false); },
-           [trainInFlight]);
+  useEffect(() => { if (!trainInFlight) {
+    setTrainPaused(false);
+    setTrainAborting(false);
+  } }, [trainInFlight]);
 
   // V7-H05: live per-step training events streamed over /ws/train/{run_id}.
   // The bus pushes {step, loss, lr, overflow} after each opt.update so
@@ -701,6 +765,7 @@ export function App(): JSX.Element {
           trainPaused={trainPaused}
           onPauseTrain={handlePauseTrain}
           onResumeTrain={handleResumeTrain}
+          trainAborting={trainAborting}
           onUndo={handleUndo}
           onRedo={handleRedo}
           canUndo={history.canUndo}

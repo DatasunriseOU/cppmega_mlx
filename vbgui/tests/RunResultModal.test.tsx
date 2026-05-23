@@ -92,7 +92,7 @@ describe("RunResultModal", () => {
 
   it("expand reveals failed-stage detail", () => {
     render(<RunResultModal report={REPORT_FAIL} onClose={() => {}} />);
-    fireEvent.click(screen.getByTestId("run-result-expand-dry_forward"));
+    // Under V7-L47, the first failed stage is auto-expanded on render.
     const detail = screen.getByTestId("run-result-detail-dry_forward");
     expect(detail.textContent).toContain("ShapeMismatch");
     expect(detail.textContent).toContain("expected");
@@ -197,7 +197,7 @@ describe("RunResultModal", () => {
       }],
     };
     render(<RunResultModal report={mixed} onClose={() => {}} />);
-    fireEvent.click(screen.getByTestId("run-result-expand-train"));
+    // Under V7-L47, the failing train stage is auto-expanded, so no click is needed.
     expect(screen.getByTestId("run-result-detail-train").textContent)
       .toContain("Boom");
     expect(screen.getByTestId("run-result-extras-train-losses-0")
