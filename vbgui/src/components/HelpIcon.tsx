@@ -119,6 +119,111 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "doesn't blow numerical convergence — without spinning up " +
       "real GPUs.",
   },
+  // ----- train metrics (M-block) -----
+  metric_perplexity: {
+    title: "perplexity — exp(loss)",
+    what: "exp(mean cross-entropy loss) over the last logged step.",
+    why: "Loss values change with vocab size, so perplexity is the " +
+         "vocab-invariant readout architects compare across runs.",
+  },
+  metric_bpb: {
+    title: "bits_per_byte",
+    what: "Loss converted to bits per UTF-8 byte of input. " +
+          "loss / ln(2) for byte-level tokenizers; corrected by " +
+          "the avg bytes-per-token for BPE-style.",
+    why: "Cross-tokenizer comparable. Production language-model " +
+         "benchmarks (Pile, RedPajama) quote BPB instead of " +
+         "perplexity.",
+  },
+  metric_dtype: {
+    title: "master / actual dtype",
+    what: "master_dtype is what the spec asked for; dtype_actual is " +
+          "what the runtime ended up using after fp8/bf16 fallback " +
+          "(M3 chips lack fp8, MLX downgrades silently).",
+    why: "If the architect asked for fp16 but got fp32, the train " +
+         "wall-clock will surprise them. Showing both at the same " +
+         "time pins the contract.",
+  },
+  metric_fp8: {
+    title: "fp8_active",
+    what: "True when at least one fused region ran in fp8 (NV " +
+          "transformer-engine path or MX-fp8 emulator).",
+    why: "Distinct from the spec.sharding.fp8_enabled toggle, which " +
+         "is the *request*. fp8_active is the *fact*.",
+  },
+  metric_fim: {
+    title: "FIM — fill-in-the-middle",
+    what: "fim_active=true means the dataset pre-processor masked " +
+          "the middle third of each sample and asked the model to " +
+          "predict it. fim_ratio is the share of samples touched.",
+    why: "Codegen models (Codestral, DeepSeek-Coder) train on FIM. " +
+         "Validating the toggle landed is critical because dropping " +
+         "FIM accidentally collapses code-completion quality.",
+  },
+  metric_optimizer: {
+    title: "optimizer_kind",
+    what: "Which optimizer the train step actually ran (adamw / " +
+          "lion / muon / hybrid…). Reflects the runtime state, not " +
+          "the spec request — auto-fallback for unsupported opts.",
+    why: "Quick sanity check that the architect's spec landed.",
+  },
+  metric_gradient_reduce: {
+    title: "gradient_reduce_ms",
+    what: "Wall-clock spent in the (synthetic, fake_ranks-driven) " +
+          "all-reduce of gradients per train step. Single-process " +
+          "proxy for a real NCCL all-reduce.",
+    why: "Lets the architect estimate distributed-train scaling " +
+         "without a real cluster.",
+  },
+  metric_grad_clip: {
+    title: "grad-clip activity",
+    what: "max_grad_norm_seen is the largest ‖g‖ observed across " +
+          "the run; num_clips counts how many steps tripped the " +
+          "grad_clip_max_norm threshold.",
+    why: "When clips spike, the spec's lr/grad_clip combo is wrong. " +
+         "Surfacing both numbers means the architect can spot a " +
+         "diverging run before perplexity confirms it.",
+  },
+  metric_sharding: {
+    title: "sharding applied",
+    what: "sharding_applied=true when at least one parallel axis " +
+          "engaged. per_rank_param_bytes is the per-device share of " +
+          "the weights post-shard.",
+    why: "Confirms the FSDP / TP / EP plan actually executed.",
+  },
+  metric_side_channels: {
+    title: "side-channels observed",
+    what: "Which side-channel feature families the model actually " +
+          "consumed during training (doc_ids, token_ids, …).",
+    why: "If the architect wired doc_ids in but training ran with " +
+         "the placeholder zero channel, this list catches the leak.",
+  },
+  metric_per_brick_grad: {
+    title: "per-brick grad-norm",
+    what: "‖g‖ on each brick's parameters after the last train step. " +
+         "Surfaces vanishing/exploding-grad patterns localised to a " +
+         "subgraph.",
+    why: "A flat 0 next to a 1e3 spike on adjacent bricks signals a " +
+         "specific module mis-initialised.",
+  },
+  metric_moe: {
+    title: "MoE routing dashboard",
+    what: "9 routing keys: routing_entropy (token diversity), " +
+          "load_balance_loss, per_expert_load (bars), " +
+          "dropped_token_ratio, rerouted_token_ratio, overflow_ratio, " +
+          "capacity_per_expert, capacity_factor, num_experts.",
+    why: "MoE collapses silently when one expert wins all routes; " +
+         "the bar chart catches it visually within a few steps.",
+  },
+  metric_inference_steps: {
+    title: "verify_build_spec inference_steps flow trace",
+    what: "Step-by-step walk of how the dimension auto-inferer " +
+          "resolved each brick parameter — which dim_env value got " +
+          "picked, which fallback rule fired, which user override " +
+          "won.",
+    why: "When num_heads comes out as something the architect didn't " +
+         "expect, this trace shows exactly which rule landed it.",
+  },
   rpc_error_data: {
     title: "RPC error.data — backend field-level details",
     what:

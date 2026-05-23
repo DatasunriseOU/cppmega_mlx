@@ -5,6 +5,8 @@ import { LossChart } from "@/components/LossChart";
 import { GradAttnPanel } from "@/components/GradAttnPanel";
 import { ErrorDetailsPanel,
          type ErrorDetails } from "@/components/ErrorDetailsPanel";
+import { TrainExtrasOverlay,
+         type TrainExtras } from "@/components/TrainExtrasOverlay";
 
 export interface StageResult {
   name: string;
@@ -274,6 +276,11 @@ export function RunResultModal({
                                   .filter((n) => Number.isFinite(n))}
                               />
                             </div>
+                          )}
+                          {s.name === "train" && (
+                            <TrainExtrasOverlay
+                              extras={extras as TrainExtras}
+                            />
                           )}
                           {s.name === "train" && (
                             <div data-testid="run-result-grad-attn-wrap"
