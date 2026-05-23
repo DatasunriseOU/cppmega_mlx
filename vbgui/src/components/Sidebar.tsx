@@ -9,6 +9,8 @@ import { DimensionsTab,
 import { AblationsTab } from "./sidebar/AblationsTab";
 import { SideChannelsTab } from "./sidebar/SideChannelsTab";
 import { MemoryMatrixTab } from "./sidebar/MemoryMatrixTab";
+import { TrainOpsTab } from "./sidebar/TrainOpsTab";
+import type { TrainOptions } from "@/components/TrainOptionsPanel";
 import type {
   GotchaState, LossState, OptimState, RewriterState, ShardingState,
   SideChannelState,
@@ -16,7 +18,7 @@ import type {
 
 export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding"
                        | "gotchas" | "dimensions" | "ablations"
-                       | "side_channels" | "memory";
+                       | "side_channels" | "memory" | "trainops";
 
 export interface SidebarProps {
   loss: LossState;
@@ -61,6 +63,22 @@ export interface SidebarProps {
   /** V8-R03: the current VerifyParams payload used as input to the
    *  memory.matrix RPC. The Memory tab refetches whenever this changes. */
   verifySpec?: unknown;
+  /** UX#2: dim_env editor lives inside Dimensions tab. */
+  dimEnv?: Record<string, number>;
+  onDimEnvApply?: (next: Record<string, number>) => void;
+  /** UX#3: train ops + warm-start picker live in a dedicated tab. */
+  trainOptions?: TrainOptions;
+  onTrainOptionsChange?: (next: TrainOptions) => void;
+  trainRunHistory?: readonly string[];
+  selectedWarmStartRunId?: string | null;
+  onWarmStartSelect?: (runId: string | null) => void;
+  // Tab state lifting
+  activeTab?: SidebarTab;
+  onTabChange?: (tab: SidebarTab) => void;
+  // Splicing
+  onParallelCompose?: (nodes: any[], edges: any[]) => void;
+  onInsertIntoEdge?: (kind: string, edge: any) => void;
+  onTransplant?: (kind: string, params: Record<string, unknown>) => void;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -71,12 +89,19 @@ const TAB_LABELS: { key: SidebarTab; label: string }[] = [
   { key: "sharding",   label: "Sharding" },
   { key: "gotchas",    label: "Gotchas" },
   { key: "dimensions", label: "Dimensions" },
+  { key: "trainops",   label: "Train Ops" },
   { key: "ablations",  label: "Ablations" },
   { key: "memory",     label: "Memory" },
 ];
 
 export function Sidebar(p: SidebarProps): JSX.Element {
-  const [active, setActive] = useState<SidebarTab>("loss");
+  const [localActive, setLocalActive] = useState<SidebarTab>("loss");
+  const active = p.activeTab ?? localActive;
+  const setActive = (tab: SidebarTab) => {
+    setLocalActive(tab);
+    p.onTabChange?.(tab);
+  };
+
   return (
     <aside data-testid="sidebar"
            style={{ width: 320, background: "#fff",
@@ -143,7 +168,23 @@ export function Sidebar(p: SidebarProps): JSX.Element {
         {active === "dimensions" && (
           <DimensionsTab log={p.inferenceLog ?? []}
                           onHighlight={p.onHighlightBrick}
-                          onApply={p.onDimensionsApply} />
+                          onApply={p.onDimensionsApply}
+                          dimEnv={p.dimEnv}
+                          onDimEnvApply={p.onDimEnvApply} />
+        )}
+        {active === "trainops" && p.trainOptions
+                              && p.onTrainOptionsChange && (
+          <TrainOpsTab
+            trainOptions={p.trainOptions}
+            onTrainOptionsChange={p.onTrainOptionsChange}
+            history={p.trainRunHistory ?? []}
+            selectedWarmStart={p.selectedWarmStartRunId ?? null}
+            onWarmStartSelect={p.onWarmStartSelect ?? (() => {})}
+            graphEdges={p.graphEdges ?? []}
+            rpc={p.rpc ?? null}
+            onParallelCompose={p.onParallelCompose}
+            onInsertIntoEdge={p.onInsertIntoEdge}
+            onTransplant={p.onTransplant} />
         )}
         {active === "ablations" && (
           <AblationsTab rpc={p.rpc ?? null}

@@ -33,19 +33,28 @@ export interface FeatureInjectionBarProps {
   /** Optional list of already-applied injections; the bar uses this
    *  to populate the applied-list display when the parent persists. */
   applied?: AppliedInjection[];
+  /** Optional click callback. Invoked when user clicks the chip body,
+   *  useful to route sidebar tab changes. */
+  onChipClick?: (name: string) => void;
   /** Optional remove callback. Called with the last-applied injection
    *  matching the chip the user clicked × on. Parent is responsible
    *  for popping the matching rewriter / brick. */
   onRemove?: (injection: AppliedInjection) => void;
 }
 
+const EMPTY_APPLIED: AppliedInjection[] = [];
+
 export function FeatureInjectionBar({
-  rpc, onApply, applied = [], onRemove,
+  rpc, onApply, applied = EMPTY_APPLIED, onRemove, onChipClick,
 }: FeatureInjectionBarProps): JSX.Element {
   const [options, setOptions] = useState<CatalogOption[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [err, setErr] = useState<string | null>(null);
   const [local, setLocal] = useState<AppliedInjection[]>(applied);
+
+  useEffect(() => {
+    setLocal(applied);
+  }, [applied]);
 
   useEffect(() => {
     let cancelled = false;
@@ -158,11 +167,13 @@ export function FeatureInjectionBar({
         ) : chipEntries.map(([name, { count }]) => (
           <span key={name}
                 data-testid={`feature-injection-chip-${name}`}
+                onClick={() => onChipClick?.(name)}
                 style={{ display: "inline-flex", alignItems: "center",
                          gap: 4, padding: "1px 4px 1px 6px",
                          background: T.surface3,
                          border: `1px solid ${T.border}`,
-                         borderRadius: 10, fontSize: 11, color: T.text }}>
+                         borderRadius: 10, fontSize: 11, color: T.text,
+                         cursor: onChipClick ? "pointer" : "default" }}>
             <span>{name}</span>
             {count > 1 && (
               <span data-testid={`feature-injection-chip-${name}-count`}
@@ -171,7 +182,7 @@ export function FeatureInjectionBar({
               </span>
             )}
             <button data-testid={`feature-injection-chip-${name}-remove`}
-                    onClick={() => removeOne(name)}
+                    onClick={(e) => { e.stopPropagation(); removeOne(name); }}
                     title={count > 1 ? `remove one ${name}` : `remove ${name}`}
                     style={{ background: "transparent", border: "none",
                              color: T.textSecondary, cursor: "pointer",

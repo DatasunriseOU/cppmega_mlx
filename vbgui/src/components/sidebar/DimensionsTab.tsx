@@ -1,8 +1,13 @@
 // DimensionsTab — table of every (brick, parameter) inference row
 // from the latest verify response. Source 'auto' badges in blue; click
 // a row → emit highlight event so the canvas selects that node.
+//
+// UX#2: also hosts the DimEnvEditor (H/nh/head_dim/B/S + preset/Apply)
+// at the top, so the dim_env knobs live in the sidebar instead of
+// stealing a full-width strip over the canvas.
 
 import { useState } from "react";
+import { DimEnvEditor } from "@/components/DimEnvEditor";
 
 export interface InferenceEntryClient {
   brick: string;
@@ -19,10 +24,14 @@ export interface DimensionsTabProps {
    *  Parent dispatches the spec mutation so subsequent verify hides
    *  the suggestion (closing the loop). */
   onApply?: (entry: InferenceEntryClient) => void;
+  /** UX#2: current dim_env (H/nh/head_dim/B/S). When both this and
+   *  onDimEnvApply are provided, the tab renders DimEnvEditor on top. */
+  dimEnv?: Record<string, number>;
+  onDimEnvApply?: (next: Record<string, number>) => void;
 }
 
 export function DimensionsTab({
-  log, onHighlight, onApply,
+  log, onHighlight, onApply, dimEnv, onDimEnvApply,
 }: DimensionsTabProps): JSX.Element {
   const [filterSource, setFilterSource] =
     useState<"all" | "user" | "auto">("all");
@@ -37,6 +46,14 @@ export function DimensionsTab({
 
   return (
     <div data-testid="dimensions-tab" style={{ padding: 12, fontSize: 12 }}>
+      {dimEnv && onDimEnvApply && (
+        <section data-testid="dimensions-tab-env-editor"
+                 style={{ marginBottom: 12, marginLeft: -12,
+                          marginRight: -12 }}>
+          <DimEnvEditor value={dimEnv} onApply={onDimEnvApply} />
+        </section>
+      )}
+
       <header style={{ marginBottom: 8 }}>
         <h4 style={{ margin: 0, fontSize: 13 }}>Inferred Dimensions</h4>
         <div style={{ color: "#6b7280", marginTop: 2 }}>

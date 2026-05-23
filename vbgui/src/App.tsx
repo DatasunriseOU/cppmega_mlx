@@ -6,7 +6,6 @@ import {
 } from "@xyflow/react";
 
 import { FlowCanvas } from "@/components/FlowCanvas";
-import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { layoutFlow } from "@/lib/elk";
 import { GalleryTab } from "@/components/GalleryTab";
 import { GalleryScaleDownSlider } from "@/components/GalleryScaleDownSlider";
@@ -14,12 +13,8 @@ import { FeatureInjectionBar,
          type AppliedInjection } from "@/components/FeatureInjectionBar";
 import { SweepPanel } from "@/components/SweepPanel";
 import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
-import { TransplantBar } from "@/components/TransplantBar";
-import { InsertIntoEdgeBar } from "@/components/InsertIntoEdgeBar";
-import { ParallelComposeBar } from "@/components/ParallelComposeBar";
-import { TrainOptionsPanel, type TrainOptions } from "@/components/TrainOptionsPanel";
+import { type TrainOptions } from "@/components/TrainOptionsPanel";
 import { GenerationPanel } from "@/components/GenerationPanel";
-import { RunHistoryPicker } from "@/components/RunHistoryPicker";
 import { TrainLiveControls } from "@/components/TrainLiveControls";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
@@ -325,6 +320,22 @@ export function App(): JSX.Element {
     useState<string | null>(null);
 
   const [wizardPreset, setWizardPreset] = useState<string | null>(null);
+
+  // Tab state lifting for right Sidebar
+  const [activeSidebarTab, setActiveSidebarTab] = useState<import("@/components/Sidebar").SidebarTab>("loss");
+  // Floating live train controls slide-up visibility state
+  const [showLivePanel, setShowLivePanel] = useState(false);
+
+  useEffect(() => {
+    if (trainInFlight) {
+      setShowLivePanel(true);
+    } else {
+      const t = setTimeout(() => {
+        setShowLivePanel(false);
+      }, 3000);
+      return () => clearTimeout(t);
+    }
+  }, [trainInFlight]);
 
   // Dynamic platform detection and filtering.
   const [platformInfo, setPlatformInfo] = useState<{
@@ -1640,115 +1651,12 @@ export function App(): JSX.Element {
                   applied={featureInjections}
                   onApply={handleFeatureInjectionApply}
                   onRemove={handleFeatureInjectionRemove}
-                />
-                <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
-                <TrainOptionsPanel
-                  value={trainOptions}
-                  onChange={setTrainOptions}
-                />
-                <RunHistoryPicker
-                  history={trainRunHistory}
-                  selected={selectedWarmStartRunId}
-                  onSelect={setSelectedWarmStartRunId}
-                />
-                <TrainLiveControls
-                  rpc={rpc}
-                  trainInFlight={trainInFlight}
-                  activeRunId={trainRunId}
-                  onScheduleCheckpoint={(path) =>
-                    setPendingCheckpointTrigger(path)}
-                  activeLayoutState={{
-                    projectName,
-                    nodes,
-                    edges,
-                    spec,
-                    dimEnv,
-                    trainOptions,
-                  }}
-                  onLoadLayout={(layout: any) => {
-                    if (layout.projectName) setProjectName(layout.projectName);
-                    if (layout.nodes) setNodes(layout.nodes);
-                    if (layout.edges) setEdges(layout.edges);
-                    if (layout.spec) dispatch({ type: "spec.replace", spec: layout.spec });
-                    if (layout.dimEnv) setDimEnv(layout.dimEnv);
-                    if (layout.trainOptions) setTrainOptions(layout.trainOptions);
-                  }}
-                />
-                <ParallelComposeBar
-                  onCompose={(composeNodes, composeEdges) => {
-                    setNodes(composeNodes.map((cn) => ({
-                      id: cn.id,
-                      type: "brick",
-                      position: cn.position,
-                      data: { kind: cn.kind,
-                              params: cn.params ?? {} } as never,
-                    })));
-                    setEdges(composeEdges.map((ce) => ({
-                      id: `${ce.source}->${ce.target}`,
-                      source: ce.source,
-                      target: ce.target,
-                      data: { severity: "info" },
-                    })));
-                    // Rebind head_outputs to the join's downstream
-                    // norm so verify_build_spec finds the loss head.
-                    const last = composeNodes[composeNodes.length - 1];
-                    if (last) {
-                      dispatch({ type: "loss.set", loss: {
-                        ...spec.loss,
-                        head_outputs: [last.id],
-                      }});
+                  onChipClick={(name) => {
+                    if (name.toLowerCase().includes("mtp") || name.toLowerCase().includes("rewriter")) {
+                      setActiveSidebarTab("rewriters");
+                    } else {
+                      setActiveSidebarTab("trainops");
                     }
-                  }}
-                />
-                <InsertIntoEdgeBar
-                  edges={edges.map((e) => ({
-                    source: e.source, target: e.target,
-                  }))}
-                  onInsert={(kind, edge) => {
-                    const baseName =
-                      `${kind}_insert_${nodes.length}`;
-                    // Layout: midpoint between src & dst nodes.
-                    const src = nodes.find((n) => n.id === edge.source);
-                    const dst = nodes.find((n) => n.id === edge.target);
-                    const mid = src && dst
-                      ? { x: (src.position.x + dst.position.x) / 2,
-                          y: (src.position.y + dst.position.y) / 2 + 50 }
-                      : { x: 200, y: 280 };
-                    setNodes((prev) => [
-                      ...prev,
-                      { id: baseName,
-                        type: "brick",
-                        position: mid,
-                        data: { kind } as never },
-                    ]);
-                    setEdges((prev) => [
-                      ...prev.filter((e) =>
-                        !(e.source === edge.source
-                          && e.target === edge.target)),
-                      { id: `${edge.source}->${baseName}`,
-                        source: edge.source, target: baseName,
-                        data: { severity: "info" } },
-                      { id: `${baseName}->${edge.target}`,
-                        source: baseName, target: edge.target,
-                        data: { severity: "info" } },
-                    ]);
-                  }}
-                />
-                <TransplantBar
-                  rpc={rpc}
-                  presets={PRESETS}
-                  onTransplant={(kind, params) => {
-                    const baseName = `${kind}_xplant_${nodes.length}`;
-                    setNodes((prev) => [
-                      ...prev,
-                      {
-                        id: baseName,
-                        type: "brick",
-                        position: { x: 60 + (prev.length * 40) % 600,
-                                    y: 280 },
-                        data: { kind, params } as never,
-                      },
-                    ]);
                   }}
                 />
                 {spec.gotchas.some(
@@ -1931,6 +1839,50 @@ export function App(): JSX.Element {
                     ]);
                   }}
                 />
+                {showLivePanel && (
+                  <div
+                    data-testid="live-train-controls-floating"
+                    style={{
+                      position: "absolute",
+                      bottom: 24,
+                      left: "50%",
+                      transform: "translateX(-50%)",
+                      zIndex: 100,
+                      background: "rgba(15, 23, 42, 0.92)",
+                      backdropFilter: "blur(16px)",
+                      border: "1px solid rgba(255, 255, 255, 0.15)",
+                      borderRadius: 8,
+                      boxShadow: "0 10px 30px rgba(0, 0, 0, 0.6)",
+                      padding: "8px 16px",
+                      width: "fit-content",
+                      transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+                    }}
+                  >
+                    <TrainLiveControls
+                      rpc={rpc}
+                      trainInFlight={trainInFlight}
+                      activeRunId={trainRunId}
+                      onScheduleCheckpoint={(path) =>
+                        setPendingCheckpointTrigger(path)}
+                      activeLayoutState={{
+                        projectName,
+                        nodes,
+                        edges,
+                        spec,
+                        dimEnv,
+                        trainOptions,
+                      }}
+                      onLoadLayout={(layout: any) => {
+                        if (layout.projectName) setProjectName(layout.projectName);
+                        if (layout.nodes) setNodes(layout.nodes);
+                        if (layout.edges) setEdges(layout.edges);
+                        if (layout.spec) dispatch({ type: "spec.replace", spec: layout.spec });
+                        if (layout.dimEnv) setDimEnv(layout.dimEnv);
+                        if (layout.trainOptions) setTrainOptions(layout.trainOptions);
+                      }}
+                    />
+                  </div>
+                )}
               </div>
               {selectedBrickId && (() => {
                 const selected = nodes.find((n) => n.id === selectedBrickId);
@@ -2144,6 +2096,88 @@ export function App(): JSX.Element {
                     producer, consumer,
                     max_steps: 4,
                   });
+                }}
+                // Lifted active tab state
+                activeTab={activeSidebarTab}
+                onTabChange={setActiveSidebarTab}
+                // dim_env
+                dimEnv={dimEnv}
+                onDimEnvApply={setDimEnv}
+                // Train options
+                trainOptions={trainOptions}
+                onTrainOptionsChange={setTrainOptions}
+                trainRunHistory={trainRunHistory}
+                selectedWarmStartRunId={selectedWarmStartRunId}
+                onWarmStartSelect={setSelectedWarmStartRunId}
+                // Canvas splicing callbacks
+                onParallelCompose={(composeNodes, composeEdges) => {
+                  setNodes(composeNodes.map((cn) => ({
+                    id: cn.id,
+                    type: "brick",
+                    position: cn.position,
+                    data: {
+                      kind: cn.kind,
+                      params: cn.params ?? {},
+                    } as never,
+                  })));
+                  setEdges(composeEdges.map((ce) => ({
+                    id: `${ce.source}->${ce.target}`,
+                    source: ce.source,
+                    target: ce.target,
+                    data: { severity: "info" } as never,
+                  })));
+                  const last = composeNodes[composeNodes.length - 1];
+                  if (last) {
+                    dispatch({ type: "loss.set", loss: {
+                      ...spec.loss,
+                      head_outputs: [last.id],
+                    }});
+                  }
+                }}
+                onInsertIntoEdge={(kind, selectedEdge) => {
+                  const baseName = `${kind}_splice_${nodes.length}`;
+                  // Midpoint layout:
+                  const srcNode = nodes.find((n) => n.id === selectedEdge.source);
+                  const dstNode = nodes.find((n) => n.id === selectedEdge.target);
+                  const mid = srcNode && dstNode
+                    ? { x: (srcNode.position.x + dstNode.position.x) / 2,
+                        y: (srcNode.position.y + dstNode.position.y) / 2 + 50 }
+                    : { x: 500, y: 250 };
+                  setNodes((prev) => [
+                    ...prev,
+                    {
+                      id: baseName,
+                      type: "brick",
+                      position: mid,
+                      data: { kind } as never,
+                    },
+                  ]);
+                  setEdges((prev) => [
+                    ...prev.filter((e) => e.id !== `${selectedEdge.source}->${selectedEdge.target}`),
+                    {
+                      id: `${selectedEdge.source}->${baseName}`,
+                      source: selectedEdge.source, target: baseName,
+                      data: { severity: "info" } as never,
+                    },
+                    {
+                      id: `${baseName}->${selectedEdge.target}`,
+                      source: baseName, target: selectedEdge.target,
+                      data: { severity: "info" } as never,
+                    },
+                  ]);
+                }}
+                onTransplant={(kind, params) => {
+                  const baseName = `${kind}_xplant_${nodes.length}`;
+                  setNodes((prev) => [
+                    ...prev,
+                    {
+                      id: baseName,
+                      type: "brick",
+                      position: { x: 60 + (prev.length * 40) % 600,
+                                  y: 280 },
+                      data: { kind, params } as never,
+                    },
+                  ]);
                 }}
               />
             </>
