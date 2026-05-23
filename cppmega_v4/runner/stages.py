@@ -1547,11 +1547,25 @@ def stage_train(ctx: StageContext) -> StageResult:
                     loss_scaler.unscale_and_check(grads))
                 # Report the real (unscaled) loss to the user.
                 loss = loss / loss_scaler.scale
-            # H20: simulate fake_ranks-way all-reduce by replaying the
-            # backward N-1 more times on identical input and mean-
-            # reducing all gradients across the synthetic ranks.
-            if fake_ranks > 1:
-                _t_reduce = time.perf_counter()
+            # V7-B-real: when a real distributed runtime is engaged
+            # (mx.distributed.init() returned world_size > 1) we
+            # all-reduce the grad tree once per step — this is the
+            # honest DP path. fake_ranks > 1 keeps the legacy single-
+            # process replay so existing tests still measure something
+            # other than a no-op.
+            from cppmega_v4.runtime import distributed as _dist
+            _t_reduce = time.perf_counter()
+            if _dist.is_distributed():
+                grads = nn.utils.tree_map(
+                    lambda g: _dist.all_reduce(g, op="mean")
+                        if hasattr(g, "shape") else g,
+                    grads)
+                mx.eval(grads)
+                gradient_reduce_ms_total += (
+                    time.perf_counter() - _t_reduce) * 1000.0
+            elif fake_ranks > 1:
+                # H20 legacy: simulate fake_ranks-way all-reduce by
+                # replaying the backward N-1 more times and averaging.
                 accum_grads = grads
                 for _r in range(1, fake_ranks):
                     _, g_r = loss_and_grad(all_modules, emb, targets)
@@ -1959,6 +1973,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "comm_backend": str(proxy.comm_backend.value) if proxy is not None else None,
                 "is_simulated": bool(proxy.is_simulated) if proxy is not None else None,
                 "fake_ranks": fake_ranks,
+                # V7-B-real: surface whether distributed actually
+                # engaged so the UI honest-closure can distinguish
+                # the real DP path from the fake_ranks replay.
+                "distributed": (lambda: {
+                    "world_size": int(
+                        __import__("cppmega_v4.runtime.distributed",
+                                    fromlist=["world"]).world().world_size),
+                    "rank": int(
+                        __import__("cppmega_v4.runtime.distributed",
+                                    fromlist=["world"]).world().rank),
+                    "backend": __import__(
+                        "cppmega_v4.runtime.distributed",
+                        fromlist=["world"]).world().backend,
+                    "real": bool(
+                        __import__("cppmega_v4.runtime.distributed",
+                                    fromlist=["world"]).world().real),
+                })(),
                 "gradient_reduce_ms": round(
                     gradient_reduce_ms_total, 4),
                 "fim_active": fim_enabled,

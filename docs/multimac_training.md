@@ -107,3 +107,93 @@ Only after all six pass do we promote peer-48 to training_peer for actual Stream
 - This document does not claim cppmega.mlx has reached distributed Megatron parity. Stream F is greenfield work in MLX.
 - The 48 GB training_peer smoke proves the code path runs; it does not claim production-readiness or matched throughput vs CUDA/H200.
 - JACCL throughput numbers cited elsewhere (e.g., "10× lower latency than ring") are external Apple/MLX references, not local receipts. Replace with bench/baselines/ rows once the rig is up.
+
+---
+
+## Runbook (V7-B-real)
+
+The implementation pieces that back this document:
+
+| Need                            | Code                                                              |
+| ------------------------------- | ----------------------------------------------------------------- |
+| World init + primitives         | `cppmega_v4/runtime/distributed.py`                               |
+| TP Column/Row Linear            | `cppmega_v4/runtime/tp_proxy.py`                                  |
+| PP 1F1B + GPipe schedule        | `cppmega_v4/runtime/pp_proxy.py`                                  |
+| Process groups (intra/inter)    | `cppmega_v4/runtime/multi_node_topology.py:build_process_groups`  |
+| Real all-reduce bench           | `scripts/bench_allreduce_distributed.py`                          |
+| Multi-process launcher          | `scripts/launch_multi.py`                                         |
+| Stage_train DP path             | `cppmega_v4/runner/stages.py` (uses `distributed.all_reduce` when `is_distributed()` is True) |
+
+### Two-host smoke
+
+```bash
+# On dev-128:
+python -m scripts.launch_multi --np 2 --backend mlx -- \
+    python -m scripts.bench_allreduce_distributed --buf-mb 1 4 16
+
+# Multi-host via mpirun + hostfile:
+python -m scripts.launch_multi --np 2 --backend mpi \
+    --hostfile peers.hostfile -- \
+    python -m scripts.bench_allreduce_distributed --buf-mb 4 16 64
+```
+
+Expected: `world_size=2`, `backend in {mpi, ring, jaccl}`, `real=true`
+in the emitted JSON. `reports/bench_allreduce_distributed_<ts>.csv`
+carries per-buffer ms-per-iter for all-reduce, all-gather, and
+reduce-scatter.
+
+### Real DP training run
+
+`stage_train` switches to real all-reduce automatically when the
+launcher has produced `world_size > 1`. The same `pipeline.run` call
+that worked single-process now mean-reduces grads across ranks every
+step. Surface in `extras.distributed`:
+
+```json
+{
+  "world_size": 2,
+  "rank": 0,
+  "backend": "mpi",
+  "real": true
+}
+```
+
+Single-process runs keep the legacy `fake_ranks` replay path
+untouched, so existing CI passes.
+
+### Megatron-style TP
+
+```python
+from cppmega_v4.runtime.tp_proxy import (
+    ColumnParallelLinear, RowParallelLinear,
+)
+
+# When world_size==2, each rank stores half of the output dim.
+qkv = ColumnParallelLinear(in_features=H, out_features=3 * H,
+                            gather_output=False)
+out = RowParallelLinear(in_features=H, out_features=H,
+                         input_is_parallel=True)
+```
+
+`gather_output=False` paired with `input_is_parallel=True` is the
+canonical Megatron pattern — the column output stays sharded, the row
+input consumes the matching shard, and the only collectives needed
+are the implicit `all_reduce` inside `RowParallelLinear` after its
+local matmul.
+
+### Pipeline parallelism
+
+```python
+from cppmega_v4.runtime.pp_proxy import (
+    pipeline_forward_real, one_f_one_b_schedule,
+)
+
+out = pipeline_forward_real(
+    x, stages=[stage0, stage1, stage2, stage3],
+    num_microbatches=8, schedule="1f1b",
+)
+```
+
+When `world_size == len(stages)` the call routes activations between
+ranks via `distributed.send / recv_like`; otherwise it runs the same
+schedule sequentially on one process for verification.
