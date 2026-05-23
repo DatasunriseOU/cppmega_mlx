@@ -478,3 +478,74 @@ def test_next_token_cut_cross_entropy_works_under_value_and_grad() -> None:
     assert _scalar(ntokens) > 0
     assert isinstance(grads, dict)
     assert grads
+
+
+
+@pytest.mark.slow
+def test_chunked_eager_grad_hits_acceptance_4x_reduction_at_large_vocab(
+    tmp_path: Path,
+) -> None:
+    """cppmega-mlx-c08.2 acceptance smoke.
+
+    On the canonical large-vocab shape from the design contract
+    (B=4, T=512, V=65536, hidden=256, fp32) the chunked_eager_grad
+    path must keep both forward-only and forward+backward peak memory
+    at least 4x below the materialized ``nn.losses.cross_entropy``
+    reference at the production DEFAULT_CHUNK_ROWS.
+
+    The bench is driven through ``scripts/bench_cce.py`` in a fresh
+    subprocess so the MLX allocator starts clean — running the same
+    sequence inline would carry whatever the prior tests in this file
+    allocated and float the ratio downward.
+
+    Skipped on hosts whose MLX backend does not expose
+    ``mx.get_peak_memory`` (peak-memory readings then collapse to 0
+    and the ratio is undefined).
+    """
+
+    if not hasattr(mx, "get_peak_memory") or not hasattr(mx, "reset_peak_memory"):
+        pytest.skip("MLX backend does not expose get_peak_memory")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "bench_acceptance.json"
+    cmd = [
+        sys.executable,
+        str(repo_root / "scripts" / "bench_cce.py"),
+        "--batch-size", "4",
+        "--seq-len", "512",
+        "--vocab-size", "65536",
+        "--hidden", "256",
+        "--dtype", "float32",
+        "--warmup", "1",
+        "--iters", "1",
+        "--chunk-rows", str(DEFAULT_CHUNK_ROWS),
+        "--output", str(output),
+    ]
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+    import json
+
+    payload = json.loads(output.read_text())
+    results = payload["results"]
+    base_fw = results["materialized"]["forward_only"]["peak_memory_bytes"]
+    base_bw = results["materialized"]["forward_backward"]["peak_memory_bytes"]
+    ce_fw = results["chunked_eager_grad"]["forward_only"]["peak_memory_bytes"]
+    ce_bw = results["chunked_eager_grad"]["forward_backward"]["peak_memory_bytes"]
+
+    if base_fw == 0 or ce_fw == 0:
+        pytest.skip("peak memory readings unavailable on this backend")
+
+    fwd_ratio = base_fw / ce_fw
+    bwd_ratio = base_bw / ce_bw
+
+    assert fwd_ratio >= 4.0, (
+        f"forward-only peak-memory reduction {fwd_ratio:.2f}x is below the "
+        f"4x contract floor. materialized={base_fw} bytes, "
+        f"chunked_eager_grad={ce_fw} bytes, chunk_rows={DEFAULT_CHUNK_ROWS}."
+    )
+    assert bwd_ratio >= 4.0, (
+        f"forward+backward peak-memory reduction {bwd_ratio:.2f}x is below "
+        f"the 4x contract floor. materialized={base_bw} bytes, "
+        f"chunked_eager_grad={ce_bw} bytes, chunk_rows={DEFAULT_CHUNK_ROWS}."
+    )
