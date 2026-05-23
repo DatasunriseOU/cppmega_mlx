@@ -955,12 +955,16 @@ def stage_train(ctx: StageContext) -> StageResult:
         opt_state_carried = False
         run_id = str(opts.get("run_id") or id(opt))
         continue_from = opts.get("continue_from_run_id")
-        if continue_from and continue_from in _RUN_CACHE:
-            try:
-                opt.state = _RUN_CACHE[continue_from]
-                opt_state_carried = True
-            except Exception:
-                pass
+        if continue_from:
+            # V7-I03: single locked read, then assign outside the lock so
+            # the train step never serialises on the cache.
+            cached_state = _run_cache_get(continue_from)
+            if cached_state is not None:
+                try:
+                    opt.state = cached_state
+                    opt_state_carried = True
+                except Exception:
+                    pass
         # V4-9: when hybrid, count params routed to each bucket so e2e can
         # prove the split predicate actually saw 2D vs 1D/3D parameters.
         muon_group_size: int | None = None
@@ -2000,11 +2004,11 @@ def stage_train(ctx: StageContext) -> StageResult:
             )
             opt.state = nn.utils.tree_unflatten(sorted_state_pairs)
 
-        # G10: cache opt.state for future warm-start lookups (capped LRU)
+        # G10 / V7-I03: cache opt.state for future warm-start lookups
+        # via the locked helper so a concurrent reader can't observe a
+        # partial dict mid-eviction.
         try:
-            _RUN_CACHE[run_id] = opt.state
-            if len(_RUN_CACHE) > 8:
-                _RUN_CACHE.pop(next(iter(_RUN_CACHE)))
+            _run_cache_set(run_id, opt.state, cap=8)
         except Exception:
             pass
 
@@ -2465,7 +2469,37 @@ def _validate_parquet_stream_tokenizer_fingerprints(
 
 # G10: in-process LRU cache of opt.state by run_id. Used for warm-start
 # across sequential Train clicks in the same backend session.
+# V7-I03: _RUN_CACHE is read+written from the train loop AND from
+# concurrent UI clicks (two pipeline.run calls landing simultaneously
+# in different worker threads). dict mutation is not atomic across
+# the get/set pair in stage_train, so race readers could observe a
+# partially-populated opt.state. The lock is held only during the
+# get/set/eviction operations — never across the train step itself
+# (which would serialise actual training).
+import threading as _threading
 _RUN_CACHE: dict[str, Any] = {}
+_RUN_CACHE_LOCK = _threading.Lock()
+
+
+def _run_cache_get(key: str) -> Any | None:
+    """V7-I03: thread-safe read of _RUN_CACHE."""
+    with _RUN_CACHE_LOCK:
+        return _RUN_CACHE.get(key)
+
+
+def _run_cache_set(key: str, value: Any, *, cap: int = 32) -> None:
+    """V7-I03: thread-safe write with LRU-style eviction."""
+    with _RUN_CACHE_LOCK:
+        _RUN_CACHE[key] = value
+        # Drop oldest entries past cap (insertion order in py3.7+).
+        while len(_RUN_CACHE) > cap:
+            oldest = next(iter(_RUN_CACHE))
+            _RUN_CACHE.pop(oldest, None)
+
+
+def _run_cache_contains(key: str) -> bool:
+    with _RUN_CACHE_LOCK:
+        return key in _RUN_CACHE
 
 # G09: in-process set of abort tokens. Caller sets opts.abort_token to
 # some unique string; another caller (e.g. WS handler) inserts the same
