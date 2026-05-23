@@ -137,6 +137,10 @@ def _cancelled_train_result(
     weight_delta_norm: float = 0.0,
 ) -> StageResult:
     clear_abort(abort_token)
+    # V7-H06b: release the registry slot so pipeline.status flips
+    # running=False after a confirmed cancel.
+    from cppmega_v4.runtime import run_registry as _rr
+    _rr.unregister(abort_token)
     return StageResult(
         name="train", status="cancelled",
         elapsed_ms=(time.perf_counter() - t0) * 1000.0,
@@ -1423,6 +1427,12 @@ def stage_train(ctx: StageContext) -> StageResult:
         abort_token = opts.get("abort_token")
         # V7-H06: block while job is paused via job_control.pause(token).
         from cppmega_v4.runtime.job_control import wait_while_paused
+        # V7-H06b: register run with the lifecycle registry so
+        # pipeline.status RPC can answer running/paused/aborted before
+        # train returns. Tracked by run_id (falls back to abort_token).
+        from cppmega_v4.runtime import run_registry as _run_registry
+        _registry_key = opts.get("run_id") or abort_token
+        _run_registry.register(_registry_key)
         for step in range(n_steps):
             wait_while_paused(abort_token, poll_s=0.05, max_wait_s=600.0)
             if abort_token is not None and abort_token in _ABORT_TOKENS:
@@ -1522,6 +1532,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 if loss_scaler is not None:
                     loss_scaler.update(False)
             losses.append(float(loss.item()))
+            # V7-H06b: keep run_registry's last_step/last_loss live so
+            # pipeline.status reflects the most recent committed step.
+            _run_registry.mark_step(_registry_key, step, float(losses[-1]))
             # V7-H05: publish per-step event to the train_event_bus so
             # WS subscribers (UI) see loss/lr update live, not only on
             # pipeline completion.
@@ -1720,6 +1733,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                        "detail": f"delta {delta:.2e} <= 1e-6"},
             )
         if len(losses) >= 2 and losses[0] > 0 and losses[-1] / losses[0] > 5:
+            _run_registry.unregister(_registry_key)
             return StageResult(
                 name="train", status="fail",
                 elapsed_ms=(time.perf_counter() - t0) * 1000.0,
@@ -1735,6 +1749,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                 opts.get("run_id") or opts.get("abort_token"), None)
         except Exception:
             pass
+        # V7-H06b: mark run as no longer running so pipeline.status
+        # flips running=False once the train loop returns.
+        _run_registry.unregister(_registry_key)
         return StageResult(
             name="train", status="ok",
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,

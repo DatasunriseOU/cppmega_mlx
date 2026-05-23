@@ -54,6 +54,10 @@ from cppmega_v4.jsonrpc.gen_run_method import (
 from cppmega_v4.jsonrpc.histogram_method import (
     HistogramParams, inspect_histogram,
 )
+from cppmega_v4.jsonrpc.side_channel_methods import (
+    SideChannelPreviewParams,
+    preview_side_channels,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -165,6 +169,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "inspect.histogram": (
         HistogramParams,
         lambda p, c: inspect_histogram(p, cache=c),
+    ),
+    "side_channels.preview": (
+        SideChannelPreviewParams,
+        lambda p, c: preview_side_channels(p, cache=c),
     ),
 }
 

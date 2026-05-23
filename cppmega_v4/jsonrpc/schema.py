@@ -780,6 +780,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "pipeline.resume",
     "gen.run",
     "inspect.histogram",
+    "side_channels.preview",
 })
 
 
