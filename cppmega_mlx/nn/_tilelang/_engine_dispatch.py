@@ -365,6 +365,125 @@ def _engine_with_msl_extraction(
     return lowering
 
 
+# ---------------------------------------------------------------------------
+# V7-N01 / V7-N02: fusion-emitter registry.
+#
+# FX patterns like `gemm_softmax` and `qk_reduce_sm_scale` need a path from
+# pattern-match → dedicated kernel factory. `dispatch_lower` is the right
+# integration point because it already chooses between shim and engine.
+# Callers register concrete emitters via :func:`register_fusion_emitter`;
+# the FX backend in cppmega_mlx.runtime.torch_compile_backend looks them up
+# before falling through to the generic lowering path.
+# ---------------------------------------------------------------------------
+
+
+_FUSION_EMITTERS: dict[str, Callable[..., Any]] = {}
+
+
+def register_fusion_emitter(pattern_name: str,
+                              emitter: Callable[..., Any]) -> None:
+    """Register a kernel factory for a named fusion pattern.
+
+    `emitter` is invoked with arbitrary keyword shape/dtype kwargs and
+    must return a TileLang ``@T.prim_func``. The actual emit happens
+    inside :func:`emit_fusion_kernel`.
+    """
+    _FUSION_EMITTERS[pattern_name] = emitter
+
+
+def fusion_emitters_available() -> tuple[str, ...]:
+    """Return the names of every registered fusion emitter."""
+    return tuple(sorted(_FUSION_EMITTERS))
+
+
+def emit_fusion_kernel(pattern_name: str, **kwargs: Any) -> Any:
+    """Call the registered emitter for ``pattern_name`` and lower it.
+
+    Returns whatever :func:`dispatch_lower` returns for the emitted
+    PrimFunc (shim path: ``TileLangMSLLowering``; engine path:
+    compile artifact). Raises ``KeyError`` if the pattern has no
+    registered emitter — callers should fall through to the generic
+    lowering in that case.
+    """
+    if pattern_name not in _FUSION_EMITTERS:
+        raise KeyError(
+            f"no fusion emitter registered for {pattern_name!r}; "
+            f"available: {fusion_emitters_available()}")
+    prim = _FUSION_EMITTERS[pattern_name](**kwargs)
+    target = kwargs.pop("_target", "cuda")
+    return dispatch_lower(prim, target)
+
+
+def _register_default_fusion_emitters() -> None:
+    """Wire the kernel factories that ship in-tree (N01 gemm_softmax,
+    N02 sparse-MLA qk_reduce). Called eagerly on import so callers can
+    rely on ``fusion_emitters_available()`` reflecting reality."""
+    # N02: the path-C qk_reduce factory exists in-tree as
+    # make_fp8_sparse_mla_indexed_qk_reduce_kernel. Wrap it so the
+    # registry's call contract matches (kwargs → prim_func).
+    try:
+        from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+            make_fp8_sparse_mla_indexed_qk_reduce_kernel,
+        )
+        _FUSION_EMITTERS.setdefault(
+            "qk_reduce_sm_scale",
+            lambda **kw: make_fp8_sparse_mla_indexed_qk_reduce_kernel(**kw),
+        )
+    except Exception:
+        # Importing the path-C module pulls heavy TileLang DSL; missing
+        # it just means the emitter is unregistered. Callers fall back
+        # to the generic lowering path.
+        pass
+
+    # N01: gemm_softmax — a minimal TileLang PrimFunc that fuses
+    # `softmax(q @ k.T)` into one kernel. The matcher upstream already
+    # detected the pattern; this entry exposes it as a callable factory.
+    # We register a thin closure that builds the PrimFunc on demand so
+    # importing this module stays cheap even when tilelang is absent.
+    def _gemm_softmax_factory(*, M: int, N: int, K: int,
+                                in_dtype: str = "float16",
+                                out_dtype: str = "float16", **_):
+        try:
+            import tilelang.language as T
+        except Exception as exc:
+            raise NotImplementedError(
+                f"gemm_softmax emitter requires tilelang; got "
+                f"{exc.__class__.__name__}: {exc}") from exc
+
+        @T.prim_func
+        def gemm_softmax(Q: T.Buffer((M, K), in_dtype),
+                          K_buf: T.Buffer((N, K), in_dtype),
+                          Out: T.Buffer((M, N), out_dtype)):
+            # Fused: Out = softmax(Q @ K^T) along axis=-1.
+            with T.Kernel(M) as i:
+                row = T.alloc_fragment((N,), "float32")
+                for j in T.Parallel(N):
+                    acc = T.cast(0.0, "float32")
+                    for k in T.serial(K):
+                        acc += T.cast(Q[i, k], "float32") * T.cast(
+                            K_buf[j, k], "float32")
+                    row[j] = acc
+                # online softmax (max-stable).
+                m = T.alloc_fragment((1,), "float32")
+                m[0] = T.cast(-1e30, "float32")
+                for j in T.serial(N):
+                    m[0] = T.max(m[0], row[j])
+                s = T.alloc_fragment((1,), "float32")
+                s[0] = T.cast(0.0, "float32")
+                for j in T.serial(N):
+                    row[j] = T.exp(row[j] - m[0])
+                    s[0] += row[j]
+                for j in T.Parallel(N):
+                    Out[i, j] = T.cast(row[j] / s[0], out_dtype)
+
+        return gemm_softmax
+
+    _FUSION_EMITTERS.setdefault("gemm_softmax", _gemm_softmax_factory)
+
+
+_register_default_fusion_emitters()
+
+
 def dispatch_lower_supports_msl_extraction() -> bool:
     """Return True iff the engine_with_msl_extraction path is reachable.
 

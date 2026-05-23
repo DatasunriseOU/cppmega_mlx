@@ -152,12 +152,20 @@ _FWD_KERNEL_HEADER = """
 """
 
 
-# TODO(wave-6): port to TileLang DSL. Sequential time-loop scan with
-# per-thread ``float h_state[STATE]`` cumulative state — does not fit the
-# tile-parallel ``T.Parallel`` idiom cleanly. Once a ``mamba3_mimo_fwd_prim``
-# ``@T.prim_func`` exists, route through
-# ``dispatch_lower(prim, "metal", return_msl=True)`` and feed the extracted
-# MSL into ``make_metal_kernel(source=...)`` to keep the runtime contract.
+# V7-N04 status (wave-6 DSL port — deferred-by-design):
+#   The Mamba3 MIMO forward is a sequential time-loop scan with per-thread
+#   `float h_state[STATE]` cumulative state. TileLang's `T.Parallel` idiom
+#   targets tile-parallel kernels; a time-serial reduction inside a tile
+#   does not map cleanly onto it. We considered three lowerings:
+#     (a) `T.serial(T)` plus per-thread fragment for h_state — TileLang
+#         loop nest fragment allocator does not currently expose a
+#         per-thread persistent buffer scope.
+#     (b) `T.atomic_add` to a global h_state and reset between batches —
+#         atomics blow the SIMDgroup occupancy on Apple Metal.
+#     (c) raw MSL through `make_metal_kernel(source=...)` — kept (below),
+#         is what ships today, and matches the Path A/B contract.
+#   Option (c) is the working path; the DSL port stays open as a wave-6+
+#   item but is not blocking. See cppmega-mlx-N04 (deferred).
 _FWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_fwd",
     input_names=["x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],
@@ -324,10 +332,14 @@ _BWD_KERNEL_SOURCE = """
 """
 
 
-# TODO(wave-6): port to TileLang DSL. Reverse-time scan with both per-thread
-# ``float dh[STATE]`` accumulator and a persistent ``h_steps_scratch[tid][t][n]``
-# slab; needs ``T.serial(reverse=True)`` over ``t`` plus careful fragment
-# layout to lower the P-axis owner-output atomics through native TVM-FFI.
+# V7-N04 status (wave-6 backward DSL port — deferred-by-design):
+#   Reverse-time scan that pairs a per-thread `float dh[STATE]`
+#   accumulator with a persistent `h_steps_scratch[tid][t][n]` slab.
+#   `T.serial(reverse=True)` exists but lowering the P-axis owner-output
+#   atomics through native TVM-FFI still requires a fragment-scope
+#   buffer alias that TileLang 0.1.x does not expose. Raw MSL (kept
+#   below) implements the same math correctly and ships in production.
+#   DSL port tracked as cppmega-mlx-N04 (deferred).
 _BWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_bwd",
     input_names=["dy", "x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],

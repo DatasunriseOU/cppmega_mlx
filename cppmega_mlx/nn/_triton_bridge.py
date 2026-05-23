@@ -63,8 +63,79 @@ __all__ = [
     "triton_to_tilelang_prim",
     "triton_to_tilelang_compile",
     "frontend_available",
+    "rewrite_dot_trans_b_to_transpose",
     "TRITON_FRONTEND_PATH_ENV",
 ]
+
+
+def rewrite_dot_trans_b_to_transpose(fn: Any) -> Any:
+    """V7-N03 honest closure: rewrite ``tl.dot(a, b, trans_b=True)``
+    source-level into ``tl.dot(a, tl.trans(b))`` so the POC frontend's
+    OP_TABLE — which covers ``tl.trans`` but not the ``trans_b`` kwarg
+    of ``tl.dot`` under MVP scalar lowering — can lower the kernel.
+
+    Returns a wrapped triton.jit object with the same name / signature
+    whose source has the AST substitution applied. The original is
+    untouched (so the same kernel can be lowered through both paths).
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    try:
+        src = textwrap.dedent(inspect.getsource(fn))
+    except (TypeError, OSError) as exc:
+        raise TritonBridgeError(
+            f"rewrite_dot_trans_b_to_transpose: cannot read source "
+            f"of {getattr(fn, '__name__', '?')!r}: {exc}") from exc
+
+    tree = ast.parse(src)
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            self.generic_visit(node)
+            # Match `tl.dot(a, b, trans_b=True, ...)`
+            is_tl_dot = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "dot"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "tl"
+            )
+            if not is_tl_dot:
+                return node
+            kept_kw: list[ast.keyword] = []
+            trans_b = False
+            for kw in node.keywords:
+                if (kw.arg == "trans_b"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True):
+                    trans_b = True
+                    continue
+                kept_kw.append(kw)
+            if not trans_b or len(node.args) < 2:
+                return node
+            # Replace second positional arg b with tl.trans(b).
+            new_b = ast.Call(
+                func=ast.Attribute(value=ast.Name(id="tl",
+                                                    ctx=ast.Load()),
+                                    attr="trans", ctx=ast.Load()),
+                args=[node.args[1]],
+                keywords=[],
+            )
+            new_args = list(node.args)
+            new_args[1] = new_b
+            return ast.Call(func=node.func, args=new_args,
+                             keywords=kept_kw)
+
+    new_tree = ast.fix_missing_locations(_Rewriter().visit(tree))
+    new_src = ast.unparse(new_tree)
+
+    # Re-exec in the original function's globals so triton.jit resolves.
+    g = dict(getattr(fn, "__globals__", {}))
+    loc: dict[str, Any] = {}
+    exec(compile(new_src, f"<rewritten {fn.__name__}>", "exec"), g, loc)
+    rewritten = loc.get(fn.__name__, fn)
+    return rewritten
 
 
 #: Env var override: point at a different ``tl_poc_review`` checkout.
@@ -222,9 +293,25 @@ def triton_to_tilelang_prim(
         # ``pytest.importorskip("triton")`` works at the call site.
         raise
     except NotImplementedError as exc:
-        # TODO: Once OP_TABLE coverage is complete (RFC section 5.5
-        # Tier-1+) this branch should be removed and the original
-        # exception propagated. Today it indicates a coverage gap.
+        # V7-N03 honest closure: when the POC frontend's OP_TABLE hits a
+        # known coverage gap (today: tl.dot(trans_b=True) under the
+        # MVP scalar lowering), surface the gap with an actionable
+        # diagnostic that names the gap and points callers at the
+        # AST rewrite helper :func:`rewrite_dot_trans_b_to_transpose`.
+        # Other NotImplementedError paths still propagate as a generic
+        # bridge error so we don't silently lose coverage signals.
+        detail = str(exc)
+        if "trans_b" in detail or "dot" in detail.lower():
+            raise TritonBridgeError(
+                f"Triton frontend OP_TABLE missing tl.dot trans_b "
+                f"variant while lowering {inferred_name!r}: {exc}. "
+                f"Workaround: wrap the kernel with "
+                f"cppmega_mlx.nn._triton_bridge."
+                f"rewrite_dot_trans_b_to_transpose(kernel) which "
+                f"rewrites tl.dot(a, b, trans_b=True) → "
+                f"tl.dot(a, tl.trans(b)) — covered by the existing "
+                f"OP_TABLE entry for tl.trans."
+            ) from exc
         raise TritonBridgeError(
             f"Triton frontend coverage gap while lowering {inferred_name!r}: {exc}"
         ) from exc

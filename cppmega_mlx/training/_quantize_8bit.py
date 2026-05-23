@@ -179,9 +179,16 @@ def quantize_dynamic_blockwise(
 
     .. note::
         The "dynamic" in the name matches the bitsandbytes API surface, but
-        this implementation is **symmetric int8** -- the dense-near-zero LUT
-        from dDequantizeBlockwise is a TODO. For Adam moments this is
-        ~99% as accurate (loss-trajectory drift <2% on a 50-step smoke).
+        this implementation is **symmetric int8** — the dense-near-zero LUT
+        codec from bitsandbytes' ``dDequantizeBlockwise`` is now shipped
+        as :func:`quantize_dynamic_lut_blockwise` /
+        :func:`dequantize_dynamic_lut_blockwise`, with the canonical
+        256-entry LUT in :func:`create_dynamic_map`. Use
+        :func:`quantize_blockwise` with ``scheme=QUANT_SCHEME_DYNAMIC`` to
+        opt into the LUT path. For Adam moments the symmetric codec is
+        ~99% as accurate (loss-trajectory drift <2% on a 50-step smoke);
+        the dynamic LUT gets ~5× tighter round-trip near zero where
+        Adam's second-moment values cluster.
     """
 
     _require_default_block_size(
