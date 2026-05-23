@@ -159,6 +159,22 @@ def _cancelled_train_result(
     )
 
 
+def _stage_abort_token(ctx: StageContext, stage_name: str) -> str | None:
+    """V7-H10: resolve the pipeline-wide abort token for a stage entry.
+
+    Prefer the per-stage opts override, fall back to any abort_token
+    declared by any other stage in the pipeline (typically train) so a
+    single UI cancel propagates to verify / dry_forward / etc."""
+    own = ctx.opts(stage_name).get("abort_token")
+    if own:
+        return str(own)
+    for _opts in (ctx.options or {}).values():
+        tok = (_opts or {}).get("abort_token")
+        if tok:
+            return str(tok)
+    return None
+
+
 def stage_parse(ctx: StageContext) -> StageResult:
     """Materialise loss/optim/graph from the wire-form spec."""
     t0 = time.perf_counter()
@@ -184,6 +200,17 @@ def stage_parse(ctx: StageContext) -> StageResult:
 
 def stage_verify_build_spec(ctx: StageContext) -> StageResult:
     t0 = time.perf_counter()
+    # V7-H10: respect pipeline-level abort_token at stage entry so a
+    # cancel issued during a long graph verify still produces a
+    # cancelled result instead of forcing the user to wait it out.
+    _tok = _stage_abort_token(ctx, "verify_build_spec")
+    if _tok and _tok in _ABORT_TOKENS:
+        clear_abort(_tok)
+        return StageResult(
+            name="verify_build_spec", status="cancelled",
+            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+            error={"type": "Aborted", "abort_token": _tok},
+        )
     try:
         if ctx.build_spec is None:
             return _fail("verify_build_spec", t0,
@@ -331,6 +358,15 @@ def stage_build_model(ctx: StageContext) -> StageResult:
 
 def stage_dry_forward(ctx: StageContext) -> StageResult:
     t0 = time.perf_counter()
+    # V7-H10: same cancel gate as stage_verify_build_spec.
+    _tok = _stage_abort_token(ctx, "dry_forward")
+    if _tok and _tok in _ABORT_TOKENS:
+        clear_abort(_tok)
+        return StageResult(
+            name="dry_forward", status="cancelled",
+            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+            error={"type": "Aborted", "abort_token": _tok},
+        )
     try:
         opts = ctx.opts("dry_forward")
         seq = int(opts.get("S", 8))

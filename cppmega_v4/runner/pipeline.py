@@ -82,11 +82,41 @@ def run_pipeline(spec: VerifyParams, pipeline: Pipeline) -> PipelineReport:
     """Run ``pipeline`` over ``spec`` and return the report.
 
     Stops on the first failed stage unless ``continue_on_failure`` is set.
+
+    V7-H10: between stages, check if the pipeline-wide abort_token (any
+    stage that declares one in its stage_options) has been signalled via
+    pipeline.abort RPC. If so, mark all remaining stages as cancelled —
+    this makes verify_build_spec / dry_forward etc. cooperatively
+    cancellable at stage boundaries even though they can't be
+    interrupted mid-call.
     """
+    from cppmega_v4.runner.stages import _ABORT_TOKENS, clear_abort
+
+    def _pipeline_abort_token() -> str | None:
+        """Pick the first abort_token declared in any stage's options."""
+        for _name, _opts in (pipeline.stage_options or {}).items():
+            tok = (_opts or {}).get("abort_token")
+            if tok:
+                return str(tok)
+        return None
+
     t0 = time.perf_counter()
     ctx = StageContext(spec=spec, options=pipeline.stage_options)
     results: list[StageResult] = []
+    abort_token = _pipeline_abort_token()
     for name in pipeline.stages:
+        # V7-H10: cancellation gate before each stage.
+        if abort_token is not None and abort_token in _ABORT_TOKENS:
+            results.append(StageResult(
+                name=name, status="cancelled", elapsed_ms=0.0,
+                error={"type": "Aborted", "abort_token": abort_token},
+            ))
+            for remaining in pipeline.stages[len(results):]:
+                results.append(StageResult(
+                    name=remaining, status="skipped", elapsed_ms=0.0,
+                ))
+            clear_abort(abort_token)
+            break
         stage = STAGE_REGISTRY[name]
         result = stage(ctx)
         results.append(result)
