@@ -18,6 +18,7 @@ from cppmega_v4.jsonrpc.cache import LRUCache
 from cppmega_v4.jsonrpc.methods import (
     build_preset_specs,
     probe_run,
+    scale_down_method,
     suggest_adapters,
     suggest_sharding,
     verify,
@@ -98,6 +99,7 @@ from cppmega_v4.jsonrpc.schema import (
     SuggestShardingParams,
     VerifyParams,
     PlatformGetInfoParams,
+    ScaleDownParams,
 )
 
 _log = logging.getLogger(__name__)
@@ -122,6 +124,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "build_preset_specs": (
         BuildPresetSpecsParams,
         lambda p, c: build_preset_specs(p, cache=c),
+    ),
+    "architectures.scale_down": (
+        ScaleDownParams,
+        lambda p, c: scale_down_method(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,

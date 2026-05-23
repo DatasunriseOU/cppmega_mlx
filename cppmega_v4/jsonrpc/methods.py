@@ -642,6 +642,46 @@ def build_preset_specs(
 
 
 # ---------------------------------------------------------------------------
+# architectures.scale_down (V8-R02)
+# ---------------------------------------------------------------------------
+
+
+def scale_down_method(
+    params: "ScaleDownParams", *, cache: LRUCache | None = None,
+) -> "ScaleDownResultModel":
+    """Binary-search the smallest (H, L) of ``preset`` that fits the
+    target byte budget. Returns the wire-form payload directly."""
+    key, hit = _cache_lookup(cache, "architectures.scale_down", params)
+    if hit is not None:
+        return hit
+
+    from cppmega_v4.architectures.scale_down import scale_down as _scale_down
+    from cppmega_v4.jsonrpc.schema import (
+        ScaleDownResultModel, ScaleDownFromCanonical,
+    )
+
+    res = _scale_down(
+        params.preset, params.target_bytes,
+        min_hidden=params.min_hidden,
+        min_layers=params.min_layers,
+    )
+    out = ScaleDownResultModel(
+        hidden_size=res.hidden_size,
+        num_layers=res.num_layers,
+        estimated_bytes=res.estimated_bytes,
+        target_bytes=res.target_bytes,
+        fits=res.fits,
+        scaled_down_from=ScaleDownFromCanonical(
+            hidden_size=res.scaled_down_from[0],
+            num_layers=res.scaled_down_from[1],
+        ),
+        specs=res.specs,
+    )
+    _cache_store(cache, key, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # probe.run
 # ---------------------------------------------------------------------------
 

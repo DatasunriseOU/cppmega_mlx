@@ -807,7 +807,47 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "inspect.histogram",
     "side_channels.preview",
     "platform.get_info",
+    "architectures.scale_down",
 })
+
+
+# ---------------------------------------------------------------------------
+# `architectures.scale_down` — V8-R02 binary-search shrinker.
+# ---------------------------------------------------------------------------
+
+
+class ScaleDownParams(BaseModel):
+    """Input — preset name + byte budget + grid floor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    preset: str
+    target_bytes: int
+    min_hidden: int = 64
+    min_layers: int = 1
+
+
+class ScaleDownFromCanonical(BaseModel):
+    """The canonical full-size shape we scaled down from."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hidden_size: int
+    num_layers: int
+
+
+class ScaleDownResultModel(BaseModel):
+    """Output — chosen (H, L) + bytes estimate + scaled specs ready to drop."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hidden_size: int
+    num_layers: int
+    estimated_bytes: int
+    target_bytes: int
+    fits: bool
+    scaled_down_from: ScaleDownFromCanonical
+    specs: list[dict[str, Any]]
 
 
 class PlatformGetInfoParams(BaseModel):

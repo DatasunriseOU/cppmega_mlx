@@ -6,6 +6,7 @@ import {
 import { FlowCanvas } from "@/components/FlowCanvas";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { GalleryTab } from "@/components/GalleryTab";
+import { GalleryScaleDownSlider } from "@/components/GalleryScaleDownSlider";
 import { SweepPanel } from "@/components/SweepPanel";
 import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
 import { TransplantBar } from "@/components/TransplantBar";
@@ -26,6 +27,7 @@ import { LossSurfaceModal } from "@/components/LossSurfaceModal";
 import { TokenizerPlayground } from "@/components/TokenizerPlayground";
 import { DataInspector } from "@/components/DataInspector";
 import { BrickContextPanel } from "@/components/BrickContextPanel";
+import { LLMGalleryWizardModal, type WizardOptions } from "@/components/LLMGalleryWizardModal";
 import { LiveTrainPanel } from "@/components/LiveTrainPanel";
 import { useLiveTrainStream } from "@/hooks/useLiveTrainStream";
 import { useCompatibleEdges, makeIsValidConnection }
@@ -513,6 +515,30 @@ export function App(): JSX.Element {
           data: { severity: "info" } },
       ]);
     }, []);
+
+  // V8-R02: apply a scaled-down preset from the GalleryScaleDownSlider.
+  // The slider already ran architectures.scale_down and hands us back
+  // the wire-form specs + chosen (hidden_size, num_layers). We swap the
+  // canvas with these specs and update dim_env.H so verify_and_estimate
+  // sees the new scale.
+  const handleScaleDownApply = useCallback((
+    _preset: string,
+    scaledSpecs: Array<Record<string, unknown>>,
+    hidden_size: number,
+    _num_layers: number,
+  ) => {
+    const { nodes: ns, edges: es } = presetSpecsToNodes(
+      scaledSpecs as unknown as BrickSpec[]);
+    setNodes(ns);
+    setEdges(es);
+    setDimEnv((prev) => ({ ...prev, H: hidden_size }));
+    if (ns.length > 0) {
+      dispatch({ type: "loss.set", loss: {
+        ...spec.loss,
+        head_outputs: [ns[ns.length - 1].id],
+      }});
+    }
+  }, [spec.loss]);
 
   const handlePresetDrop = useCallback(async (name: string) => {
     try {
@@ -1519,7 +1545,13 @@ export function App(): JSX.Element {
               trainParquetPath={trainParquetPath} />
           )}
           {activeTab === "gallery" && (
-            <GalleryTab
+            <>
+              <GalleryScaleDownSlider
+                presets={PRESETS}
+                rpc={rpc}
+                onApply={handleScaleDownApply}
+              />
+              <GalleryTab
               presets={PRESETS}
               cache={gallery.cache}
               refreshing={galleryRefreshing}
@@ -1582,6 +1614,7 @@ export function App(): JSX.Element {
                 }
               }}
             />
+            </>
           )}
           {activeTab === "tokmatrix" && (
             <TokenizerMatrixTab
