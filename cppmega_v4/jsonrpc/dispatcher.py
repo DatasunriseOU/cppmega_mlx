@@ -91,6 +91,10 @@ from cppmega_v4.jsonrpc.compile_trace_method import (
     CompileTraceParams,
     compile_trace,
 )
+from cppmega_v4.jsonrpc.sync_check_method import (
+    SyncCheckParams,
+    sync_check_method,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -160,6 +164,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "compile.trace": (
         CompileTraceParams,
         lambda p, c: compile_trace(p, cache=c),
+    ),
+    "sync.check": (
+        SyncCheckParams,
+        lambda p, c: sync_check_method(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,

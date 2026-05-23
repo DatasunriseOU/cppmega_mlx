@@ -25,6 +25,16 @@ interface CompileTraceResult {
   backend: string;
 }
 
+interface SyncCheckEntry { after_op: string; reason: string }
+interface SyncCheckAdvice { op: string; fix: string; confidence: string }
+interface SyncCheckResult {
+  necessary_syncs: SyncCheckEntry[];
+  redundant_syncs: SyncCheckEntry[];
+  advice: SyncCheckAdvice[];
+  z3_solver_status: string;
+  z3_elapsed_ms: number;
+}
+
 export interface CompileTracePanelProps {
   rpc: RpcClient;
   specPayload: unknown;
@@ -35,6 +45,8 @@ export function CompileTracePanel({
   rpc, specPayload, backend = "mlx",
 }: CompileTracePanelProps): JSX.Element {
   const [trace, setTrace] = useState<CompileTraceResult | null>(null);
+  const [sync, setSync] = useState<SyncCheckResult | null>(null);
+  const [showAdvice, setShowAdvice] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,11 +54,15 @@ export function CompileTracePanel({
     (async () => {
       setErr(null);
       try {
-        const r = await rpc.call<CompileTraceResult>(
-          "compile.trace",
-          { spec: specPayload, backend },
-        );
-        if (!cancelled) setTrace(r);
+        const [r, s] = await Promise.all([
+          rpc.call<CompileTraceResult>(
+            "compile.trace",
+            { spec: specPayload, backend }),
+          rpc.call<SyncCheckResult>(
+            "sync.check",
+            { spec: specPayload }).catch(() => null),
+        ]);
+        if (!cancelled) { setTrace(r); if (s) setSync(s); }
       } catch (e) {
         if (!cancelled) {
           setErr(e instanceof Error ? e.message : String(e));
@@ -79,7 +95,54 @@ export function CompileTracePanel({
         <span data-testid="compile-trace-materialised-count">
           materialised: {trace.materialised_ops.length}
         </span>
+        {sync && (
+          <span data-testid="sync-check-badge"
+                onClick={() => setShowAdvice(true)}
+                style={{ marginLeft: "auto", cursor: "pointer",
+                         background: sync.redundant_syncs.length > 0
+                          ? "#fee2e2" : "#dcfce7",
+                         color: sync.redundant_syncs.length > 0
+                          ? "#991b1b" : "#166534",
+                         padding: "2px 6px", borderRadius: 4 }}>
+            sync: <span data-testid="sync-check-redundant-count">
+              {sync.redundant_syncs.length}
+            </span> redundant
+          </span>
+        )}
       </header>
+      {showAdvice && sync && (
+        <div data-testid="sync-check-advice-modal"
+             onClick={() => setShowAdvice(false)}
+             style={{ position: "fixed", inset: 0,
+                      background: "rgba(0,0,0,0.4)", zIndex: 9000,
+                      display: "flex", alignItems: "center",
+                      justifyContent: "center" }}>
+          <div onClick={(e) => e.stopPropagation()}
+               style={{ background: "#fff", padding: 16, borderRadius: 8,
+                        minWidth: 400, maxHeight: "60vh",
+                        overflowY: "auto" }}>
+            <h4 style={{ margin: "0 0 8px" }}>Sync-necessity advice</h4>
+            <p style={{ margin: "0 0 8px", color: "#6b7280" }}>
+              z3 status: {sync.z3_solver_status} ·
+              {sync.z3_elapsed_ms.toFixed(1)} ms
+            </p>
+            {sync.advice.length === 0 ? (
+              <p>No redundant syncs detected.</p>
+            ) : (
+              <ul>
+                {sync.advice.map((a, i) => (
+                  <li key={i}>
+                    <strong>{a.op}</strong>: {a.fix}
+                    {" "}({a.confidence})
+                  </li>
+                ))}
+              </ul>
+            )}
+            <button onClick={() => setShowAdvice(false)}
+                    style={{ marginTop: 8 }}>Close</button>
+          </div>
+        </div>
+      )}
       {trace.fused_groups.map((g) => (
         <span key={g}
               data-testid={`compile-trace-fused-group-${g}`}

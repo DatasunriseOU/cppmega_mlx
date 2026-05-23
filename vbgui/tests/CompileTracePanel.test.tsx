@@ -17,6 +17,20 @@ function makeFakeRpc(responses: Record<string, unknown>) {
   };
 }
 
+const SYNC = {
+  necessary_syncs: [{ after_op: "c", reason: "output" }],
+  redundant_syncs: [
+    { after_op: "a", reason: "same backend" },
+    { after_op: "b", reason: "same backend" },
+  ],
+  advice: [
+    { op: "a", fix: "remove mx.eval", confidence: "high" },
+    { op: "b", fix: "remove mx.eval", confidence: "high" },
+  ],
+  z3_solver_status: "sat",
+  z3_elapsed_ms: 12.3,
+};
+
 const TRACE = {
   ops: [
     { name: "a", fused: true,  group: "region_00_path_c",
@@ -35,11 +49,19 @@ const TRACE = {
 
 describe("V8-R06 CompileTracePanel", () => {
   it("renders ops + chips + aggregate counters", async () => {
-    const { rpc } = makeFakeRpc({ "compile.trace": TRACE });
+    const { rpc } = makeFakeRpc({
+      "compile.trace": TRACE,
+      "sync.check": SYNC,
+    });
     render(<CompileTracePanel rpc={rpc} specPayload={{}} backend="mlx" />);
     await waitFor(() => {
       expect(screen.getByTestId("compile-trace")).toBeDefined();
     });
+    await waitFor(() => {
+      expect(screen.getByTestId("sync-check-badge")).toBeDefined();
+    });
+    expect(screen.getByTestId("sync-check-redundant-count").textContent)
+      .toBe("2");
     expect(screen.getByTestId("compile-trace-fused-count").textContent)
       .toContain("1");
     expect(screen.getByTestId("compile-trace-dlpack-crossings").textContent)

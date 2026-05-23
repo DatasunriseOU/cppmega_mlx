@@ -812,6 +812,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "architectures.auto_fit",
     "data.hf_quickstart",
     "compile.trace",
+    "sync.check",
 })
 
 
