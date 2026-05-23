@@ -38,6 +38,7 @@ import { useRpc } from "@/hooks/useRpc";
 import { useCacheStats } from "@/hooks/useCacheStats";
 import { useVerifyAfter } from "@/hooks/useVerifyAfter";
 import { usePresets } from "@/hooks/usePresets";
+import { useTokenizerVocab } from "@/hooks/useTokenizerVocab";
 
 import {
   INITIAL_SPEC, specReducer, type SpecState, type TopologyFactory,
@@ -47,6 +48,8 @@ import { migrate } from "@/state/migrations";
 import { adapterFor } from "@/lib/bricks";
 import { useHistory } from "@/hooks/useHistory";
 import type { ShardingProposalView } from "@/components/sidebar/ShardingTab";
+import { useNeuralDebugger } from "@/hooks/useNeuralDebugger";
+import { DebuggerDashboard } from "@/components/DebuggerDashboard";
 
 // PRESETS list is now fetched dynamically from the backend via
 // architectures.list_presets — see usePresets() hook below. A fallback
@@ -263,6 +266,11 @@ export function App(): JSX.Element {
     onBackendStatus: (s) => dispatch({ type: "backend.status", status: s }),
     onBackendBuildId: (bid) => setBackendBuildId(bid),
   });
+
+  // UX#3: read actual vocab_size from the active tokenizer instead of
+  // hardcoding 65536 — so dropping a GPT-2 / SmolLM / cppmega tokenizer
+  // gives the BrickContextPanel the right embedding_table param count.
+  const tokenizerVocabSize = useTokenizerVocab(rpc, trainTokenizerPath);
 
   // V7-I07: poll the JsonRPC LRU cache hit-rate so the BottomStrip
   // chip surfaces hit_rate / size / evictions live.
@@ -1542,6 +1550,8 @@ export function App(): JSX.Element {
           onRedo={handleRedo}
           canUndo={history.canUndo}
           canRedo={history.canRedo}
+          debuggerMode={debugState.debuggerMode}
+          onToggleDebugger={() => debugState.setDebuggerMode(!debugState.debuggerMode)}
           onMixedPrecisionChange={(enabled) => dispatch({ type: "optim.set",
             optim: { ...spec.optim, mixed_precision: enabled } })}
           onFp8EnabledChange={(enabled) => dispatch({ type: "sharding.set",
@@ -1908,7 +1918,7 @@ export function App(): JSX.Element {
                     brickKind={data.kind ?? "mlp"}
                     params={data.params ?? {}}
                     hidden_size={dimEnv.H ?? 128}
-                    vocab_size={65536}
+                    vocab_size={tokenizerVocabSize ?? 65536}
                     onApply={(newParams) => {
                       setNodes((prev) => prev.map((n) =>
                         n.id === selectedBrickId
