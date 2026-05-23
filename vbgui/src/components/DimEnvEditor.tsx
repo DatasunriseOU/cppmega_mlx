@@ -4,6 +4,7 @@
 // calling onApply per H).
 
 import { useState } from "react";
+import { HelpIcon } from "@/components/HelpIcon";
 
 export interface DimEnvEditorProps {
   value: Record<string, number>;
@@ -68,8 +69,10 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
                   fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
       <strong data-testid="dim-env-editor-label">dim_env:</strong>
       {EDITABLE_KEYS.map((k: EditableKey) => (
-        <label key={k} style={{ display: "inline-flex", gap: 4 }}>
+        <label key={k} style={{ display: "inline-flex", alignItems: "center",
+                                 gap: 4 }}>
           {k}
+          <HelpIcon topic={`dim_env_${k}`} />
           <input
             data-testid={`dim-env-${k}`}
             type="number"
@@ -93,8 +96,10 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
       </button>
       {mismatch && (
         <span data-testid="dim-env-inline-mismatch"
-              style={{ color: "#92400e", marginLeft: 8 }}>
+              style={{ color: "#92400e", marginLeft: 8,
+                       display: "inline-flex", alignItems: "center" }}>
           ⚠ {mismatch}
+          <HelpIcon topic="symbolic_dim_mismatch" />
         </span>
       )}
       {fixSetH && (
