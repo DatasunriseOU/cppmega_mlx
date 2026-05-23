@@ -8,6 +8,7 @@
 
 import { useState } from "react";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
+import { T } from "@/theme";
 
 export interface InferenceEntryClient {
   brick: string;
@@ -56,14 +57,14 @@ export function DimensionsTab({
 
       <header style={{ marginBottom: 8 }}>
         <h4 style={{ margin: 0, fontSize: 13 }}>Inferred Dimensions</h4>
-        <div style={{ color: "#6b7280", marginTop: 2 }}>
+        <div style={{ color: T.textSecondary, marginTop: 2 }}>
           {visible.length} of {log.length} entries
         </div>
       </header>
 
       <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
         <label style={{ display: "flex", flexDirection: "column" }}>
-          <span style={{ color: "#6b7280", fontSize: 11 }}>Source</span>
+          <span style={{ color: T.textSecondary, fontSize: 11 }}>Source</span>
           <select data-testid="dimensions-filter-source"
                   value={filterSource}
                   onChange={(e) =>
@@ -74,7 +75,7 @@ export function DimensionsTab({
           </select>
         </label>
         <label style={{ display: "flex", flexDirection: "column", flex: 1 }}>
-          <span style={{ color: "#6b7280", fontSize: 11 }}>Brick</span>
+          <span style={{ color: T.textSecondary, fontSize: 11 }}>Brick</span>
           <input data-testid="dimensions-filter-brick"
                  placeholder="filter…"
                  value={filterBrick}
@@ -115,7 +116,7 @@ export function DimensionsTab({
                         fontSize: 10, textTransform: "uppercase",
                       }}>{e.source}</span>
               </td>
-              <td style={{ ...td, color: "#6b7280", fontSize: 11 }}>
+              <td style={{ ...td, color: T.textSecondary, fontSize: 11 }}>
                 {e.reason}
               </td>
               <td style={td}>
@@ -164,7 +165,7 @@ export function DimensionsTab({
                            ? "#1e40af" : "#111827" }}>
               <strong>{e.brick}.{e.param}</strong> ={" "}
               <code>{String(e.value)}</code>{" "}
-              <em style={{ color: "#6b7280" }}>
+              <em style={{ color: T.textSecondary }}>
                 ({e.source}; {e.reason})
               </em>
             </li>
@@ -177,7 +178,7 @@ export function DimensionsTab({
 
 const th: React.CSSProperties = {
   textAlign: "left", padding: "4px 6px",
-  color: "#6b7280", fontSize: 11, fontWeight: 600,
+  color: T.textSecondary, fontSize: 11, fontWeight: 600,
   borderBottom: "1px solid #e5e7eb",
 };
 const td: React.CSSProperties = { padding: "4px 6px" };
