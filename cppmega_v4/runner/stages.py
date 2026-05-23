@@ -1522,6 +1522,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                 if loss_scaler is not None:
                     loss_scaler.update(False)
             losses.append(float(loss.item()))
+            # V7-H05: publish per-step event to the train_event_bus so
+            # WS subscribers (UI) see loss/lr update live, not only on
+            # pipeline completion.
+            try:
+                from cppmega_v4.runtime import train_event_bus
+                train_event_bus.publish(
+                    opts.get("run_id") or opts.get("abort_token"),
+                    {"step": int(step),
+                     "loss": float(losses[-1]),
+                     "lr": float(lr_trajectory[-1])
+                             if lr_trajectory else None,
+                     "overflow":
+                       bool(_scaler_overflow_this_step
+                            if loss_scaler is not None else False)},
+                )
+            except Exception:
+                pass
             # V7-A04: validation pass at val_every cadence on a fresh
             # random batch (held-out from the train stream). No grad,
             # same loss kernel.
@@ -1711,6 +1728,13 @@ def stage_train(ctx: StageContext) -> StageResult:
                        "detail": f"losses={losses}, ratio="
                                  f"{losses[-1] / losses[0]:.2f}"},
             )
+        # V7-H05: signal completion to any WS subscribers.
+        try:
+            from cppmega_v4.runtime import train_event_bus
+            train_event_bus.publish(
+                opts.get("run_id") or opts.get("abort_token"), None)
+        except Exception:
+            pass
         return StageResult(
             name="train", status="ok",
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,

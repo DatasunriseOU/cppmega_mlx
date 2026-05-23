@@ -29,6 +29,9 @@ from cppmega_v4.jsonrpc.schema import (
 
 _HEARTBEAT_INTERVAL_S: float = 1.0
 
+# V7-H05 sentinel — distinct from None which marks train completion.
+_SENTINEL_EMPTY = object()
+
 
 def create_app(*, cache_capacity: int = 50) -> FastAPI:
     """Build a fresh FastAPI app — used by tests and the prod launcher."""
@@ -75,6 +78,44 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
     async def rpc(payload: dict) -> dict:
         response = await _dispatch(payload, cache)
         return response.model_dump(mode="json", exclude_none=True)
+
+    @app.websocket("/ws/train/{run_id}")
+    async def ws_train(socket: WebSocket, run_id: str) -> None:
+        """V7-H05: live per-step training metric stream.
+
+        The client subscribes by run_id; stage_train publishes
+        {step, loss, lr, overflow} after each opt.update. A None
+        sentinel marks completion; the server then sends a final
+        {finish: 'ok'} frame and closes."""
+        from cppmega_v4.runtime import train_event_bus
+        import queue as _queue
+        await socket.accept()
+        q = train_event_bus.subscribe(run_id)
+
+        def _try_get(timeout: float = 0.2):
+            try:
+                return q.get(timeout=timeout)
+            except _queue.Empty:
+                return _SENTINEL_EMPTY
+
+        try:
+            while True:
+                ev = await asyncio.to_thread(_try_get, 0.2)
+                if ev is _SENTINEL_EMPTY:
+                    # Yield to event loop so disconnect cancellation
+                    # can land between polls.
+                    await asyncio.sleep(0)
+                    continue
+                if ev is None:
+                    await socket.send_json({"finish": "ok",
+                                             "run_id": run_id})
+                    return
+                await socket.send_json({"run_id": run_id,
+                                         "event": ev})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            train_event_bus.unsubscribe(run_id, q)
 
     @app.websocket("/ws")
     async def ws(socket: WebSocket) -> None:
