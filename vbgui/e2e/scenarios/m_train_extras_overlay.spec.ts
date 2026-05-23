@@ -23,12 +23,23 @@ test("M-block: TrainExtrasOverlay surfaces real train extras", async ({
   await page.getByTestId("train-opt-grad_clip_max_norm").fill("0.5");
 
   await clickRunPipeline(page, "train");
-
+  // Capture the run state before expanding for debug.
+  const overall = await page.getByTestId("run-result-overall")
+                              .textContent();
   // L47 may have auto-expanded the train row if it failed; only
   // click expand-train when the extras row isn't already showing.
   const extrasRow = page.getByTestId("run-result-extras-row-train");
-  if (!(await extrasRow.isVisible().catch(() => false))) {
-    await page.getByTestId("run-result-expand-train").click();
+  const isOpen = await extrasRow.isVisible().catch(() => false);
+  if (!isOpen) {
+    const expandBtn = page.getByTestId("run-result-expand-train");
+    if (await expandBtn.isVisible().catch(() => false)) {
+      await expandBtn.click();
+    } else {
+      await page.screenshot({
+        path: "e2e/test-results/m-debug-no-expand-train.png" });
+      throw new Error(`no expand-train button (overall=${overall}); ` +
+        "see m-debug-no-expand-train.png");
+    }
   }
 
   // Overlay container always renders for train.
