@@ -7,6 +7,12 @@
     "seed": 7
   },
   "stage_status": "ok",
-  "status": "mlx_unavailable",
-  "detail": "dry_forward did not surface output_logits; capture_logits wiring is the M0.3 follow-up."
+  "mlx_logits_path": "bench/baselines/m03_mlx_logits.npy",
+  "mlx_shape": [
+    1,
+    32,
+    128
+  ],
+  "status": "awaiting_cuda_ref",
+  "detail": "CUDA reference bench/baselines/m03_cuda_logits_ref.npy missing; regenerate on GB10 (bd cppmega-mlx-uwhj)."
 }

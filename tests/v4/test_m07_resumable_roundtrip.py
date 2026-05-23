@@ -38,15 +38,6 @@ def _spec_2x_mlp(H: int = 128, S: int = 32) -> VerifyParams:
     })
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "V7-M0.7 honest finding: resumed run loss diverges from the "
-    "uninterrupted baseline by ~0.7 at step N+0 even with identical "
-    "seed + saved checkpoint. Either opt-state (m/v moments) isn't "
-    "round-tripping fully, the synthetic data iterator isn't seeded "
-    "from the checkpoint, or mlx layer initialisation has non-determ "
-    "across reload. xfail-strict pins the gap; flips to passing when "
-    "M0.7 wiring lands. See bd cppmega-mlx-t8f.7."
-))
 def test_v7_m07_resume_continues_identical_curve():
     """Train 4 steps → save → reload → train 2 more steps.
     Compare losses[4:6] of the resumed run to losses[4:6] of an

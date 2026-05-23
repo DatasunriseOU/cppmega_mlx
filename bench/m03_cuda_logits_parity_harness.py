@@ -64,8 +64,10 @@ def main() -> None:
     rep = run_pipeline(spec, Pipeline.from_dict({
         "stages": ["parse", "verify_build_spec", "build_model",
                    "dry_forward"],
-        "stage_options": {"dry_forward": {"seed": args.seed,
-                                          "capture_logits": True}},
+        "stage_options": {"dry_forward": {
+            "seed": args.seed, "capture_logits": True,
+            "B": 1, "S": args.S,
+        }},
     }))
     dry = next(s for s in rep.stages if s.name == "dry_forward")
 
@@ -78,19 +80,20 @@ def main() -> None:
         "stage_status": dry.status,
     }
 
-    # Capture whatever logits-shaped tensor the dry_forward stage
-    # surfaced. Backend may not have wired capture_logits yet — in
-    # that case status flags 'mlx_unavailable' so the GB10 reference
-    # generation can stay pending.
+    # V7-M0.3 wiring complete: dry_forward stage emits output_logits
+    # (shape tuple) + output_values (flat list of floats) when
+    # capture_logits=True. We reconstruct the array from values+shape
+    # and persist as bench/baselines/m03_mlx_logits.npy.
     extras = getattr(dry, "extras", {}) or {}
-    logits = extras.get("output_logits") or extras.get("logits")
-    if logits is None:
+    shape = extras.get("output_logits")
+    values = extras.get("output_values")
+    if shape is None or values is None:
         status["status"] = "mlx_unavailable"
         status["detail"] = (
-            "dry_forward did not surface output_logits; capture_logits "
-            "wiring is the M0.3 follow-up.")
+            "dry_forward did not surface output_logits/output_values; "
+            "capture_logits wiring is the M0.3 follow-up.")
     else:
-        arr = np.asarray(logits, dtype=np.float32)
+        arr = np.asarray(values, dtype=np.float32).reshape(tuple(shape))
         np.save(Path(args.mlx_out), arr)
         status["mlx_logits_path"] = args.mlx_out
         status["mlx_shape"] = list(arr.shape)

@@ -13,6 +13,7 @@ or continue.
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from functools import partial
 import traceback
@@ -389,10 +390,19 @@ def stage_dry_forward(ctx: StageContext) -> StageResult:
         seq = int(opts.get("S", 8))
         batch = int(opts.get("B", 1))
         hidden = ctx.spec.dim_env.get("H", 64)
+        # V7-M0.3: capture_logits + seed plumb deterministic input
+        # through the probe so the MLX-vs-CUDA parity harness gets the
+        # final-block activations back for bit-for-bit diffing.
+        capture_logits = bool(opts.get("capture_logits", False))
+        seed_opt = opts.get("seed")
+        seed_val = int(seed_opt) if seed_opt is not None else None
         # Re-instantiate just for forward (avoids forcing build_model dep).
         specs = _graph_to_specs(ctx.spec.graph)
         graph = from_block_specs(specs, hidden_size=hidden, instantiate=False)
-        result = dry_forward(graph, hidden_size=hidden, seq_len=seq, batch=batch)
+        result = dry_forward(
+            graph, hidden_size=hidden, seq_len=seq, batch=batch,
+            capture_logits=capture_logits, seed=seed_val,
+        )
         ctx.dry_forward_verdict = result.verdict
         # G21: rich extras — observable B/S/H + verdict for modal display
         rich: dict[str, Any] = {
@@ -400,6 +410,13 @@ def stage_dry_forward(ctx: StageContext) -> StageResult:
             "verdict": result.verdict,
             "num_nodes": len(graph.nodes),
         }
+        # V7-M0.3: surface output_logits (shape + flat values) when
+        # capture was requested; downstream m03 harness consumes this
+        # to write bench/baselines/m03_mlx_logits.npy.
+        if capture_logits and result.output_logits is not None:
+            rich["output_logits"] = list(result.output_logits)
+            if result.output_values is not None:
+                rich["output_values"] = result.output_values
         return StageResult(
             name="dry_forward",
             status="ok" if result.verdict == "ok" else "fail",
@@ -1359,7 +1376,15 @@ def stage_train(ctx: StageContext) -> StageResult:
         # H19: optional opt.state load alongside the checkpoint so a
         # resumed run picks up Adam moments → strict losses[0] parity
         # with the saved run's losses[-1].
+        # V7-M0.7: when checkpoint_load_path is given but no explicit
+        # opt_state_load_path, auto-resolve the sidecar "<ckpt>.opt" so
+        # callers that pass a single "checkpoint" path get full
+        # resumable semantics (weights + opt moments + rng_key).
         opt_state_load = opts.get("opt_state_load_path")
+        if (not opt_state_load) and ckpt_load:
+            _sidecar_load = str(ckpt_load) + ".opt"
+            if os.path.isfile(_sidecar_load):
+                opt_state_load = _sidecar_load
         opt_state_strict = bool(opts.get("opt_state_strict", False))
         opt_state_arch_diff: dict[str, Any] | None = None
         if opt_state_load:
@@ -1598,6 +1623,7 @@ def stage_train(ctx: StageContext) -> StageResult:
             mx.eval(loss, grads)
             _per_step_ms.append(
                 (time.perf_counter() - _step_t0) * 1000.0)
+            
             # V7-D03: unscale the grad tree if we scaled the loss; detect
             # inf/nan overflow. On overflow the optimizer step is skipped
             # and the scaler backs off (dynamic mode). The loss value
@@ -1690,6 +1716,10 @@ def stage_train(ctx: StageContext) -> StageResult:
                             opt.state = virtual_states[r]
                             if not opt.state:
                                 opt.init(params_r)
+                            # Restore the correct learning rate for this step, as
+                            # opt.state setter might have overwritten it with the
+                            # sharded state's stale learning_rate value.
+                            opt.learning_rate = step_lr if lr_callable is not None else lr
                             updates_r = opt.apply_gradients(grads_r, params_r)
                             virtual_states[r] = opt.state
                             rank_updates.append(updates_r)
@@ -1843,7 +1873,13 @@ def stage_train(ctx: StageContext) -> StageResult:
         # V01: also persist rng_key under the "_rng_key" entry so the
         # resumed run consumes the same synthetic data stream → enables
         # strict 1e-5 loss continuation in the matched-fragment test.
+        # V7-M0.7: when checkpoint_save_path is given but no explicit
+        # opt_state_save_path, auto-derive a sidecar "<ckpt>.opt" so
+        # callers that pass a single "checkpoint" path get a fully
+        # resumable bundle (weights + Adam moments + rng_key).
         opt_state_save = opts.get("opt_state_save_path")
+        if (not opt_state_save) and ckpt_save:
+            opt_state_save = str(ckpt_save) + ".opt"
         if opt_state_save:
             try:
                 # V7-C06 opt-state branch: same compress switch routes
