@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import type { RpcClient } from "@/lib/rpc";
 import { Tooltip } from "@/components/Tooltip";
 import { ExplainModal } from "@/components/ExplainModal";
+import { BRICKS, brickFor } from "@/lib/bricks";
 
 const ACTIVATION_OPTIONS = [
   "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
@@ -30,6 +31,10 @@ export interface BrickContextPanelProps {
   brickKind: string;
   params: Record<string, unknown>;
   onApply: (newParams: Record<string, unknown>) => void;
+  // V7-F52 — live block swap. Fires when the user picks a different
+  // same-category brick kind for this node and clicks Swap. The host
+  // (App.tsx) preserves the node id + edges and just mutates kind.
+  onSwapKind?: (newKind: string) => void;
   onClose: () => void;
 }
 
@@ -39,13 +44,15 @@ const FIELD: React.CSSProperties = {
 };
 
 export function BrickContextPanel({
-  rpc, brickId, brickKind, params, onApply, onClose,
+  rpc, brickId, brickKind, params, onApply, onSwapKind, onClose,
 }: BrickContextPanelProps): JSX.Element {
   const [draft, setDraft] = useState<Record<string, unknown>>(params);
+  const [swapTarget, setSwapTarget] = useState<string>(brickKind);
   const [explain, setExplain] = useState<{ cat: string; name: string }
                                           | null>(null);
 
-  useEffect(() => { setDraft(params); }, [params, brickId]);
+  useEffect(() => { setDraft(params); setSwapTarget(brickKind); },
+            [params, brickId, brickKind]);
 
   function setField(field: string, value: unknown) {
     setDraft({ ...draft, [field]: value });
@@ -125,6 +132,43 @@ export function BrickContextPanel({
           </label>
         </>
       )}
+
+      {onSwapKind && (() => {
+        const currentMeta = brickFor(brickKind);
+        const sameCategory = currentMeta
+          ? BRICKS.filter((b) => b.category === currentMeta.category)
+          : [];
+        if (sameCategory.length <= 1) return null;
+        return (
+          <label style={FIELD}>
+            <span style={{ color: "#6b7280" }}>
+              Swap to (same category)
+            </span>
+            <select
+              data-testid={`brick-context-${brickId}-swap-target`}
+              value={swapTarget}
+              onChange={(e) => setSwapTarget(e.target.value)}>
+              {sameCategory.map((b) => (
+                <option key={b.kind} value={b.kind}>{b.label}</option>
+              ))}
+            </select>
+            <button
+              data-testid={`brick-context-${brickId}-swap-apply`}
+              disabled={swapTarget === brickKind}
+              onClick={() => { onSwapKind(swapTarget); onClose(); }}
+              style={{ background: swapTarget === brickKind
+                          ? "#e5e7eb" : "#0ea5e9",
+                        color: swapTarget === brickKind
+                          ? "#9ca3af" : "white",
+                        border: "none", padding: "4px 10px",
+                        borderRadius: 4, fontSize: 12, marginTop: 4,
+                        cursor: swapTarget === brickKind
+                          ? "default" : "pointer" }}>
+              Swap kind
+            </button>
+          </label>
+        );
+      })()}
 
       <button data-testid={`brick-context-${brickId}-apply`}
               onClick={() => { onApply(draft); onClose(); }}

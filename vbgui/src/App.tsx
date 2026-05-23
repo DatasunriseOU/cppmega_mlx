@@ -752,6 +752,13 @@ export function App(): JSX.Element {
                                             params: newParams } as never }
                           : n));
                     }}
+                    onSwapKind={(newKind) => {
+                      setNodes((prev) => prev.map((n) =>
+                        n.id === selectedBrickId
+                          ? { ...n, data: { ...(n.data as object),
+                                            kind: newKind } as never }
+                          : n));
+                    }}
                     onClose={() => setSelectedBrickId(null)}
                   />
                 );
