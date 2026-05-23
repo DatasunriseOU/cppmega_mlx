@@ -7,6 +7,7 @@ import {
 
 import { FlowCanvas } from "@/components/FlowCanvas";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
+import { layoutFlow } from "@/lib/elk";
 import { GalleryTab } from "@/components/GalleryTab";
 import { GalleryScaleDownSlider } from "@/components/GalleryScaleDownSlider";
 import { FeatureInjectionBar,
@@ -808,54 +809,23 @@ export function App(): JSX.Element {
       const activeEdges = customEdges ?? edges;
       if (activeNodes.length === 0) return;
       
-      const ELKClass = (await import("elkjs/lib/elk.bundled.js")).default;
-      const elk = new ELKClass();
-      
-      const elkChildren = activeNodes.map((node) => {
+      const preparedNodes = activeNodes.map((node) => {
         const isAdapter = node.type === "adapter";
         return {
-          id: node.id,
-          width: isAdapter ? 140 : 180,
-          height: isAdapter ? 45 : 75,
+          ...node,
+          width: node.width ?? (isAdapter ? 140 : 180),
+          height: node.height ?? (isAdapter ? 45 : 75),
         };
       });
-      
-      const elkEdges = activeEdges.map((edge) => ({
-        id: edge.id,
-        sources: [edge.source],
-        targets: [edge.target],
-      }));
-      
-      const graph = {
-        id: "root",
-        layoutOptions: {
-          "elk.algorithm": "layered",
-          "elk.direction": "RIGHT",
-          "elk.layered.spacing.nodeNodeBetweenLayers": "100",
-          "elk.spacing.nodeNode": "80",
-        },
-        children: elkChildren,
-        edges: elkEdges,
-      };
-      
-      const layout = await elk.layout(graph);
-      
-      if (layout.children) {
-        const layoutedNodes = activeNodes.map((node) => {
-          const elkNode = layout.children?.find((c) => c.id === node.id);
-          if (elkNode && elkNode.x !== undefined && elkNode.y !== undefined) {
-            return {
-              ...node,
-              position: {
-                x: elkNode.x,
-                y: elkNode.y,
-              },
-            };
-          }
-          return node;
-        });
-        setNodes(layoutedNodes);
-      }
+
+      const { nodes: layouted } = await layoutFlow(preparedNodes as Node[], activeEdges, {
+        "elk.layered.spacing.nodeNodeBetweenLayers": "100",
+        "elk.spacing.nodeNode": "80",
+        "elk.layered.considerModelOrder.strategy": "PREFER_EDGES",
+        "elk.separateConnectedComponents": "true",
+        "elk.componentLayoutSpacing": "80",
+      });
+      setNodes(layouted);
     } catch (err) {
       console.error("Auto align layout failed:", err);
     }
@@ -988,6 +958,7 @@ export function App(): JSX.Element {
       const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
       setNodes(ns);
       setEdges(es);
+      await handleAutoAlign(ns, es);
       // Rebind loss.head_outputs to the last brick so verify_build_spec
       // accepts the freshly-loaded preset (which doesn't define a node
       // literally named "logits"). User can change this later via the
@@ -1043,7 +1014,7 @@ export function App(): JSX.Element {
     } catch (e) {
       setRunError(e);
     }
-  }, [rpc, spec.loss, dimEnv]);
+  }, [rpc, spec.loss, dimEnv, handleAutoAlign]);
 
   const handlePresetSelect = useCallback(async (name: string) => {
     const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";

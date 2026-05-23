@@ -282,7 +282,7 @@ export function FlowCanvas({
 
       {onAutoAlign && (
         <button
-          onClick={onAutoAlign}
+          onClick={() => { onAutoAlign(); }}
           data-testid="auto-align-button"
           style={{
             position: "absolute",
@@ -485,10 +485,55 @@ export function FlowCanvas({
           >
             RN
           </button>
+
+          {/* Edge Insert Radial Menu Legend (V4-R03) */}
+          <div
+            style={{
+              position: "absolute",
+              top: 150,
+              left: "50%",
+              transform: "translateX(-50%)",
+              background: "rgba(15, 23, 42, 0.95)",
+              backdropFilter: "blur(12px)",
+              border: "1px solid rgba(255, 255, 255, 0.15)",
+              borderRadius: "8px",
+              padding: "10px 12px",
+              width: 220,
+              boxShadow: "0 10px 25px rgba(0, 0, 0, 0.5)",
+              fontFamily: "system-ui, sans-serif",
+              color: "#e2e8f0",
+              fontSize: 10,
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.1)", paddingBottom: 4, marginBottom: 2 }}>
+              <span style={{ fontWeight: "bold", color: "#22d3ee" }}>⚡ Dynamic Adapter Splice</span>
+              <span
+                title="Dynamic Adapter Splicing: Right-click on any edge to splice in compatible sharding, transpose, and normalization adapters on the fly."
+                style={{
+                  background: "rgba(255,255,255,0.1)",
+                  borderRadius: "50%",
+                  width: 14,
+                  height: 14,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: "help",
+                  color: "#22d3ee",
+                  fontWeight: "bold",
+                }}
+              >
+                ?
+              </span>
+            </div>
+            <div><strong style={{ color: "#38bdf8" }}>LB</strong>: Linear Bridge (sharding adapter)</div>
+            <div><strong style={{ color: "#818cf8" }}>TR</strong>: Transpose BNSD (layout adapter)</div>
+            <div><strong style={{ color: "#34d399" }}>RN</strong>: RMSNorm (normalization adapter)</div>
+          </div>
         </div>
       )}
     </div>
   );
 }
-
-
