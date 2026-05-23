@@ -355,3 +355,59 @@ def test_embedding_and_mamba_constants_are_immutable() -> None:
     # A few canonical leaf names that cppmega CUDA's predicate also pins down.
     for leaf in ("A_log", "D", "dt_bias", "B_bias", "C_bias", "mimo_x"):
         assert leaf in MAMBA_SCALAR_LEAVES
+
+
+
+def test_make_muon_smoke_decreases_loss_on_tiny_multilayer_model() -> None:
+    """G09-style 100-step smoke: ``make_muon`` defaults must produce a
+    loss curve that genuinely decreases on a tiny synthetic LM-style
+    head. This is the cppmega-mlx-c08.1 acceptance gate that pins the
+    Keller defaults end-to-end through the splitter, the Muon NS update,
+    and the AdamW scalar group together."""
+
+    mx.random.seed(0x_c08_1)
+
+    class TinyMLP(nn.Module):
+        def __init__(self, hidden: int = 16, vocab: int = 8) -> None:
+            super().__init__()
+            self.embed = nn.Embedding(vocab, hidden)
+            self.proj1 = nn.Linear(hidden, hidden, bias=True)
+            self.proj2 = nn.Linear(hidden, hidden, bias=True)
+            self.head = nn.Linear(hidden, vocab, bias=False)
+
+        def __call__(self, tokens: mx.array) -> mx.array:
+            x = self.embed(tokens)
+            x = nn.gelu(self.proj1(x))
+            x = nn.gelu(self.proj2(x))
+            return self.head(x)
+
+    model = TinyMLP()
+    optimizer = make_muon()
+    # Sanity: defaults match the cppmega CUDA recipe documented above.
+    assert math.isclose(float(optimizer.muon.learning_rate), 2e-3, rel_tol=1e-6)
+    assert math.isclose(float(optimizer.adamw.learning_rate), 1e-4, rel_tol=1e-6)
+
+    inputs = mx.random.randint(0, 8, shape=(4, 6))
+    targets = mx.random.randint(0, 8, shape=(4, 6))
+
+    def loss_fn(params, x, y):
+        model.update(params)
+        logits = model(x)
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_targets = y.reshape(-1)
+        return mx.mean(nn.losses.cross_entropy(flat_logits, flat_targets))
+
+    losses: list[float] = []
+    for _ in range(100):
+        loss, grads = mx.value_and_grad(loss_fn)(model.parameters(), inputs, targets)
+        optimizer.update(model, grads)
+        mx.eval(model.parameters(), loss)
+        losses.append(float(loss.item()))
+
+    # End must be lower than the start; we don't require monotone descent
+    # because Muon's orthogonalization can spike a single step.
+    assert losses[-1] < losses[0], losses
+    # And the run must actually move: not a numerical no-op.
+    assert (losses[0] - losses[-1]) > 1e-3, losses
+    # All loss values must stay finite.
+    assert all(math.isfinite(loss) for loss in losses), losses
