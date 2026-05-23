@@ -21,7 +21,10 @@ export interface TrainExtras {
   lr_trajectory?: number[];
   perplexity?: number;
   bits_per_byte?: number;
-  master_dtype?: string;
+  // V7-M25: master_dtype landed in two shapes across backend revs —
+  // a flat string ("fp16") and a structured object with requested/
+  // actual/fallback flags (V7-D01). dtypeBadges normalises both.
+  master_dtype?: string | Record<string, unknown>;
   dtype_actual?: string;
   fp8_active?: boolean;
   sharding_applied?: boolean;
@@ -54,6 +57,34 @@ export interface TrainExtras {
 
 export interface TrainExtrasOverlayProps {
   extras: TrainExtras;
+}
+
+// V7-M25: backend's master_dtype can be either a string (legacy
+// shape) or an object describing requested/actual/fallback flags
+// (new dtype_state shape from V7-D01). Coerce defensively so React
+// never receives an object as a Badge child.
+function dtypeBadges(e: TrainExtras): {
+  testid: string; label: string; value: string;
+}[] {
+  const out: { testid: string; label: string; value: string }[] = [];
+  function add(testid: string, label: string, raw: unknown) {
+    if (typeof raw === "string" && raw.length > 0) {
+      out.push({ testid, label, value: raw });
+    }
+  }
+  // Direct string form.
+  add("extras-badge-master_dtype", "master", e.master_dtype);
+  add("extras-badge-dtype_actual", "actual", e.dtype_actual);
+  // Object form — unpack the standard keys.
+  const m = e.master_dtype;
+  if (m !== null && typeof m === "object") {
+    const o = m as Record<string, unknown>;
+    add("extras-badge-master_dtype", "master",
+        o.master_dtype_requested ?? o.master_dtype_actual);
+    add("extras-badge-dtype_actual", "actual",
+        o.master_dtype_actual ?? o.train_dtype_actual);
+  }
+  return out;
 }
 
 export function TrainExtrasOverlay({
@@ -112,16 +143,10 @@ export function TrainExtrasOverlay({
                  value={extras.bits_per_byte.toFixed(3)}
                  help="metric_bpb" />
         )}
-        {extras.master_dtype && (
-          <Badge testid="extras-badge-master_dtype" label="master"
-                 value={extras.master_dtype}
-                 help="metric_dtype" />
-        )}
-        {extras.dtype_actual && (
-          <Badge testid="extras-badge-dtype_actual" label="actual"
-                 value={extras.dtype_actual}
-                 help="metric_dtype" />
-        )}
+        {dtypeBadges(extras).map((b) => (
+          <Badge key={b.testid} testid={b.testid} label={b.label}
+                 value={b.value} help="metric_dtype" />
+        ))}
         {extras.fp8_active && (
           <Badge testid="extras-badge-fp8_active" label="fp8" value="ON"
                  tone="ok" help="metric_fp8" />
