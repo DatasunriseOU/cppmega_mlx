@@ -21,6 +21,7 @@ from cppmega_v4.jsonrpc.methods import (
     suggest_adapters,
     suggest_sharding,
     verify,
+    platform_get_info,
 )
 from cppmega_v4.jsonrpc.tokenizer_methods import (
     EncodeVisualizeParams,
@@ -66,6 +67,10 @@ from cppmega_v4.jsonrpc.loss_surface_method import (
     LossSurfaceParams,
     loss_surface_run,
 )
+from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
+    TokenizerRoundtripTextParams,
+    roundtrip_text,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -85,6 +90,7 @@ from cppmega_v4.jsonrpc.schema import (
     SuggestOptimGroupsParams,
     SuggestShardingParams,
     VerifyParams,
+    PlatformGetInfoParams,
 )
 
 _log = logging.getLogger(__name__)
@@ -189,6 +195,14 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "loss_surface.run": (
         LossSurfaceParams,
         lambda p, c: loss_surface_run(p, cache=c),
+    ),
+    "tokenizer.roundtrip_text": (
+        TokenizerRoundtripTextParams,
+        lambda p, c: roundtrip_text(p, cache=c),
+    ),
+    "platform.get_info": (
+        PlatformGetInfoParams,
+        lambda p, c: platform_get_info(p, cache=c),
     ),
 }
 
