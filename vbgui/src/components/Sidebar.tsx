@@ -54,6 +54,9 @@ export interface SidebarProps {
    *  user clicks Apply on an auto-inferred row in DimensionsTab. */
   onDimensionsApply?: (entry: InferenceEntryClient) => void;
   tokenizerSource?: string | null;
+  /** V7-H45: extras.schedule_kind from the most-recent train; threaded
+   *  through to OptimTab → ScheduleEditor. */
+  lastRunScheduleKind?: string | null;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -101,7 +104,9 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                                               onApply={p.onOptimApply}
                                               rpc={p.rpc ?? null}
                                               graphNodes={p.graphNodes}
-                                              graphEdges={p.graphEdges} />}
+                                              graphEdges={p.graphEdges}
+                                              lastRunScheduleKind={
+                                                p.lastRunScheduleKind} />}
         {active === "rewriters" && (
           <RewritersTab rewriters={p.rewriters}
                         onAdd={p.onRewriterAdd}

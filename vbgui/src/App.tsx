@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   ReactFlowProvider, type Edge, type Node,
 } from "@xyflow/react";
@@ -214,6 +214,45 @@ export function App(): JSX.Element {
   const [pendingCheckpointTrigger, setPendingCheckpointTrigger] =
     useState<string | null>(null);
 
+  // Dynamic platform detection and filtering.
+  const [platformInfo, setPlatformInfo] = useState<{
+    active_device: string;
+    available_topologies: string[];
+    available_comm_backends: string[];
+  }>({
+    active_device: "mlx",
+    available_topologies: ["m3_ultra_solo", "gb10_quarter"],
+    available_comm_backends: ["ring", "jaccl"],
+  });
+  const [filterByPlatform, setFilterByPlatform] = useState<boolean>(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchPlatformInfo() {
+      try {
+        const info = await rpc.call<{
+          active_device: string;
+          available_topologies: string[];
+          available_comm_backends: string[];
+        }>("platform.get_info");
+        if (!cancelled && info && Array.isArray(info.available_topologies)) {
+          setPlatformInfo(info);
+        }
+      } catch (err) {
+        console.warn("Failed to fetch platform info:", err);
+      }
+    }
+    fetchPlatformInfo();
+    return () => { cancelled = true; };
+  }, [rpc, backendBuildId]);
+
+  const activeTopologies = useMemo(() => {
+    if (!filterByPlatform || !platformInfo || !Array.isArray(platformInfo.available_topologies)) {
+      return TOPOLOGIES;
+    }
+    return TOPOLOGIES.filter(t => platformInfo.available_topologies.includes(t));
+  }, [filterByPlatform, platformInfo]);
+
   // Keep one stable spec snapshot for the verify debouncer to read.
   const wireSpecRef = useRef({ nodes, edges, spec, availableSideChannels,
                                dimEnv });
@@ -269,7 +308,8 @@ export function App(): JSX.Element {
                                             activations_bytes: number;
                                             kv_cache_bytes: number }>;
         gotchas?: { id: string; severity: "info" | "warning" | "error";
-                    message: string; reference?: string }[];
+                    message: string; reference?: string;
+                    suggested_fix?: string }[];
         elapsed_ms: number;
         resolved?: { edges?: { src: string; dst: string;
                                matched: boolean;
@@ -826,7 +866,10 @@ export function App(): JSX.Element {
           state={spec}
           projectName={projectName}
           presets={PRESETS}
-          topologies={TOPOLOGIES}
+          topologies={activeTopologies}
+          filterByPlatform={filterByPlatform}
+          onFilterByPlatformChange={setFilterByPlatform}
+          activeDevice={platformInfo.active_device}
           onProjectNameChange={setProjectName}
           onPresetDrop={handlePresetDrop}
           onTopologyChange={(t) => dispatch({ type: "sharding.set",
@@ -1157,6 +1200,16 @@ export function App(): JSX.Element {
                 onHighlightBrick={setSelectedBrickId}
                 onLossApply={(l) => dispatch({ type: "loss.set", loss: l })}
                 onOptimApply={(o) => dispatch({ type: "optim.set", optim: o })}
+                lastRunScheduleKind={
+                  (() => {
+                    const tr = runReport?.stages?.find(
+                      (s) => s.name === "train");
+                    const ex = tr?.extras as
+                      undefined | { schedule_kind?: unknown };
+                    return typeof ex?.schedule_kind === "string"
+                      ? ex.schedule_kind : null;
+                  })()
+                }
                 onRewriterAdd={(r) =>
                   dispatch({ type: "rewriters.add", rewriter: r })}
                 onRewriterRemove={(i) =>
@@ -1404,7 +1457,8 @@ export function App(): JSX.Element {
           )}
         </div>
         <BottomStrip state={spec} fusedRegionCount={0}
-                     backendBuildId={backendBuildId} />
+                     backendBuildId={backendBuildId}
+                     activeDevice={platformInfo.active_device} />
         <LiveTrainPanel events={liveTrain.events}
                          trainInFlight={!!trainInFlight}
                          finishToast={liveTrain.finishToast}

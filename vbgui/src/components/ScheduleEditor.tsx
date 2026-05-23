@@ -12,6 +12,12 @@ export interface ScheduleEditorProps {
   baseLr: number;
   value?: ScheduleSpecState;
   onChange: (next: ScheduleSpecState | undefined) => void;
+  /** V7-H45: schedule_kind actually executed by the most-recent train
+   *  run (from extras.schedule_kind). When set + differs from the
+   *  currently-selected kind, surface a hint so the user can tell
+   *  what the backend really used (e.g. fallback to 'constant' when
+   *  total_steps was missing). */
+  lastRunScheduleKind?: string | null;
 }
 
 const FIELD: React.CSSProperties = {
@@ -101,7 +107,7 @@ function Sparkline({ values }: { values: number[] }): JSX.Element {
 }
 
 export function ScheduleEditor({
-  index, baseLr, value, onChange,
+  index, baseLr, value, onChange, lastRunScheduleKind = null,
 }: ScheduleEditorProps): JSX.Element {
   const kind = value?.kind ?? "constant";
 
@@ -130,6 +136,22 @@ export function ScheduleEditor({
           {SCHEDULE_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
       </label>
+      {/* V7-H45: echo backend's actual schedule_kind from the most-
+          recent train run. Surfaces silent fallbacks (e.g. the user
+          picked 'cosine' but missed total_steps so backend ran
+          'constant'). */}
+      {lastRunScheduleKind && (
+        <span data-testid={`schedule-last-run-${index}`}
+              style={{ marginLeft: 4, fontSize: 10,
+                       padding: "1px 4px", borderRadius: 3,
+                       background: lastRunScheduleKind === kind
+                                  ? "#d1fae5" : "#fef3c7",
+                       color: lastRunScheduleKind === kind
+                                  ? "#065f46" : "#92400e" }}>
+          last run: {lastRunScheduleKind}
+          {lastRunScheduleKind !== kind && " (≠ selected)"}
+        </span>
+      )}
       {kind !== "constant" && (
         <label style={FIELD}>
           <span style={{ color: "#6b7280" }}>warmup_steps</span>

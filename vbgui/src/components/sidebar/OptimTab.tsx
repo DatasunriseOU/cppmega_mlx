@@ -18,6 +18,9 @@ export interface OptimTabProps {
    *  is rendered but disabled. */
   graphNodes?: Node[];
   graphEdges?: Edge[];
+  /** V7-H45: schedule_kind echoed by extras of the most-recent train
+   *  run; threaded through to every ScheduleEditor instance. */
+  lastRunScheduleKind?: string | null;
 }
 
 const KINDS: OptimKind[] = [
@@ -44,6 +47,7 @@ const DEFAULT_NEW_GROUP: ParamGroupState = {
 
 export function OptimTab({
   optim, onApply, rpc, graphNodes, graphEdges,
+  lastRunScheduleKind = null,
 }: OptimTabProps): JSX.Element {
   const [draft, setDraft] = useState<OptimState>(optim);
   const [expandedSchedules, setExpandedSchedules] =
@@ -162,7 +166,8 @@ export function OptimTab({
                           index={i}
                           baseLr={g.lr}
                           value={g.schedule}
-                          onChange={(s) => setSchedule(i, s)} />
+                          onChange={(s) => setSchedule(i, s)}
+                          lastRunScheduleKind={lastRunScheduleKind} />
         )
       ))}
 
