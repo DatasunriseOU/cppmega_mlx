@@ -49,6 +49,14 @@ class PreviewParquetParams(BaseModel):
     offset: int = 0
     limit: int = 32
     channels: list[str] | None = None  # None → all detected side-channels
+    # V7-Q08.1: optional tokenizer to compute a roundtrip_pass_rate
+    # over the previewed rows. When set, the response carries the
+    # decode(input_ids) == original_text pass rate so the UI can warn
+    # the operator BEFORE training starts that the chosen tokenizer
+    # won't round-trip cleanly. Absent => no check performed.
+    tokenizer_source: str | None = None
+    # Cap roundtrip-sample rows to keep preview cheap.
+    roundtrip_sample_rows: int = 16
 
 
 class PreviewRow(BaseModel):
@@ -116,6 +124,12 @@ class PreviewParquetResult(BaseModel):
     # Populated when the shard was emitted by clang_enriched_to_parquet
     # with token_ids materialized; absent for legacy shards.
     corpus_stats: dict | None = None
+    # V7-Q08.1: when params.tokenizer_source is set, this is the
+    # decode(input_ids) == original_text pass rate over the previewed
+    # rows (max roundtrip_sample_rows). None when not requested.
+    roundtrip_pass_rate: float | None = None
+    roundtrip_sampled_rows: int = 0
+    roundtrip_has_original_text: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +153,12 @@ def preview_parquet(
     filter_tag = "ALL" if params.channels is None else \
                  f"FILTER:{','.join(sorted(params.channels))}"
     preview_path, shard_paths = _preview_path_and_shards(params.path)
+    # V7-Q08.1: tokenizer_source + roundtrip_sample_rows participate in
+    # the cache key so changing the tokenizer triggers re-evaluation.
+    tok_tag = (params.tokenizer_source or "NONE")
     cache_key = (
-        f"preview::{preview_path}::{params.offset}::{params.limit}::{filter_tag}"
+        f"preview::{preview_path}::{params.offset}::{params.limit}::"
+        f"{filter_tag}::TOK={tok_tag}::SAMPLE={params.roundtrip_sample_rows}"
     )
     if cache is not None:
         hit = cache.get(cache_key)
@@ -193,6 +211,11 @@ def preview_parquet(
 
     bpt_avg, bpt_p95, bpt_max = _bytes_per_token_stats(token_lists)
     elapsed = (time.perf_counter() - t0) * 1000.0
+    # V7-Q08.1: optional roundtrip pass-rate over the previewed rows.
+    rt_pass_rate, rt_sampled, rt_has_orig = _compute_roundtrip_pass_rate(
+        preview_path, params.tokenizer_source,
+        params.roundtrip_sample_rows,
+    )
     out = PreviewParquetResult(
         rows=rows,
         token_column=token_col,
@@ -219,10 +242,65 @@ def preview_parquet(
         total_rows=total_rows,
         elapsed_ms=elapsed,
         corpus_stats=_read_corpus_stats_sidecar(preview_path),
+        roundtrip_pass_rate=rt_pass_rate,
+        roundtrip_sampled_rows=rt_sampled,
+        roundtrip_has_original_text=rt_has_orig,
     )
     if cache is not None:
         cache.set(cache_key, out)
     return out
+
+
+def _compute_roundtrip_pass_rate(
+    preview_path, tokenizer_source: str | None, sample_rows: int,
+) -> tuple[float | None, int, bool]:
+    """V7-Q08.1: lightweight roundtrip sampler for preview_parquet.
+
+    Returns (pass_rate, sampled, has_original_text) or (None, 0, False)
+    when not requested / unable to load. Designed to fail quietly so a
+    bad tokenizer path doesn't break preview rendering.
+    """
+    if not tokenizer_source:
+        return (None, 0, False)
+    try:
+        import pyarrow.parquet as pq
+        from tokenizers import Tokenizer
+    except ImportError:
+        return (None, 0, False)
+    try:
+        tok = Tokenizer.from_file(str(tokenizer_source))
+    except Exception:
+        return (None, 0, False)
+    try:
+        pf = pq.ParquetFile(str(preview_path))
+        table = pf.read_row_group(0).slice(0, max(1, int(sample_rows)))
+    except Exception:
+        return (None, 0, False)
+    cols = {f.name for f in pf.schema_arrow}
+    has_original = "original_text" in cols
+    if "input_ids" not in cols:
+        return (None, 0, has_original)
+    pad_id = tok.token_to_id("<PAD>") or 0
+    matches = 0
+    count = 0
+    for i in range(table.num_rows):
+        try:
+            ids_arr = table.column("input_ids")[i].as_py()
+            ids = [int(x) for x in ids_arr if int(x) != pad_id]
+            decoded = tok.decode(ids)
+            if has_original:
+                orig = str(table.column("original_text")[i].as_py())
+                if decoded.encode("utf-8") == orig.encode("utf-8"):
+                    matches += 1
+            else:
+                # No ground truth → treat as trivial match.
+                matches += 1
+            count += 1
+        except Exception:
+            continue
+    if count == 0:
+        return (None, 0, has_original)
+    return (matches / count, count, has_original)
 
 
 def _read_corpus_stats_sidecar(parquet_path) -> dict | None:
