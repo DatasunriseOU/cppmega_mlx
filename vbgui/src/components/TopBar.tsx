@@ -82,6 +82,19 @@ export interface TopBarProps {
    *  when the Train menu first opens and caches the table to render
    *  ms/token next to each option in the master_dtype dropdown. */
   onDtypeCostEstimate?: () => Promise<{ rows: DtypeCostRow[] }>;
+  /** V7-K2: callback to fire probe.run — Contract Probe (capability
+   *  check + alt-config suggester). When set, the run-pipeline menu
+   *  exposes a 'Run Probe' button. */
+  onRunProbe?: () => Promise<ProbeRunInfo>;
+}
+
+/** V7-K2: shape returned by probe.run RPC. */
+export interface ProbeRunInfo {
+  schema_version: string;
+  is_clean: boolean;
+  elapsed_ms: number;
+  // ProbeRunResult is extra='allow' — additional fields land here.
+  [key: string]: unknown;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
@@ -109,6 +122,10 @@ export function TopBar(p: TopBarProps): JSX.Element {
   const [dtypeCosts, setDtypeCosts] = useState<DtypeCostRow[] | null>(null);
   const [dtypeCostsLoading, setDtypeCostsLoading] =
     useState<boolean>(false);
+  // V7-K2: cached probe.run result rendered inside the menu.
+  const [probeInfo, setProbeInfo] = useState<ProbeRunInfo | null>(null);
+  const [probeLoading, setProbeLoading] = useState<boolean>(false);
+  const [probeError, setProbeError] = useState<string | null>(null);
   useEffect(() => {
     if (!open || !p.onDtypeCostEstimate || dtypeCosts !== null
         || dtypeCostsLoading) return;
@@ -296,6 +313,49 @@ export function TopBar(p: TopBarProps): JSX.Element {
             <button data-testid="run-pipeline-full"
                     onClick={() => { setOpen(false); p.onRunPipeline("full"); }}
                     style={menuItem}>Full validate</button>
+            {p.onRunProbe && (
+              <div style={{ padding: "6px 12px", display: "flex",
+                            flexDirection: "column", gap: 4 }}>
+                <button data-testid="run-probe"
+                        disabled={probeLoading}
+                        onClick={async () => {
+                          setProbeLoading(true);
+                          setProbeError(null);
+                          try {
+                            const r = await p.onRunProbe!();
+                            setProbeInfo(r);
+                          } catch (e) {
+                            setProbeError(
+                              e instanceof Error ? e.message : String(e));
+                          } finally {
+                            setProbeLoading(false);
+                          }
+                        }}
+                        style={{ ...menuItem, fontSize: 11 }}>
+                  {probeLoading ? "probing…" : "Run Probe (capability)"}
+                </button>
+                {probeError && (
+                  <div data-testid="run-probe-error"
+                       style={{ color: "#dc2626", fontSize: 10 }}>
+                    {probeError}
+                  </div>
+                )}
+                {probeInfo && (
+                  <div data-testid="run-probe-result"
+                       style={{ fontSize: 10, fontFamily: "monospace",
+                                background: "#f9fafb", padding: 4,
+                                borderRadius: 3 }}>
+                    <div data-testid="run-probe-result-clean">
+                      {probeInfo.is_clean ? "✓ clean" : "⚠ issues"}
+                      {" · "}
+                      v{probeInfo.schema_version}
+                      {" · "}
+                      {probeInfo.elapsed_ms.toFixed(1)}ms
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             <div style={{ padding: "6px 12px", display: "flex",
                           alignItems: "center", gap: 6 }}>
               <span style={{ fontSize: 11, color: "#6b7280" }}>

@@ -33,6 +33,7 @@ import {
   INITIAL_SPEC, specReducer, type SpecState, type TopologyFactory,
 } from "@/state/spec";
 import { migrate } from "@/state/migrations";
+import { adapterFor } from "@/lib/bricks";
 import { useHistory } from "@/hooks/useHistory";
 import type { ShardingProposalView } from "@/components/sidebar/ShardingTab";
 
@@ -330,11 +331,14 @@ export function App(): JSX.Element {
   // ----- Handlers ----------------------------------------------------------
 
   const handleDropBrick = useCallback(
-    (kind: string, position: { x: number; y: number }) => {
+    (kind: string, position: { x: number; y: number }, params?: Record<string, unknown>) => {
+      const isAdapter = !!adapterFor(kind);
       setNodes((prev) => [
         ...prev,
         { id: `${kind}_${prev.length + 1}`,
-          type: "brick", position, data: { kind } },
+          type: isAdapter ? "adapter" : "brick",
+          position,
+          data: { kind, params: params ?? {} } },
       ]);
     }, []);
 
@@ -738,6 +742,31 @@ export function App(): JSX.Element {
               }
             };
             reader.readAsText(file);
+          }}
+          onRunProbe={async () => {
+            // V7-K2: probe.run — build ProbeRunParams from the current
+            // spec + parquet/tokenizer paths picked in DataInspector /
+            // TokenizerPlayground. Falls back to "" when missing so
+            // backend can still report capability info.
+            const snap = wireSpecRef.current;
+            const verify = buildVerifyParams(
+              snap.nodes, snap.edges, snap.spec,
+              snap.availableSideChannels);
+            return rpc.call<{
+              schema_version: string;
+              is_clean: boolean;
+              elapsed_ms: number;
+              [key: string]: unknown;
+            }>("probe.run", {
+              graph: verify.graph,
+              dim_env: verify.dim_env,
+              loss: verify.loss,
+              optim: verify.optim,
+              tokenizer_source: trainTokenizerPath ?? "",
+              parquet_path: trainParquetPath ?? "",
+              probe_hidden_size: 64,
+              run_dry_forward: true,
+            });
           }}
           onDtypeCostEstimate={async () => {
             // V7-D06: small inline probe; UI renders ms/token per option.
