@@ -52,6 +52,11 @@ from cppmega_v4.fusion.dlpack_bridge import (
     mlx_to_tilelang,
     tilelang_to_mlx,
 )
+from cppmega_v4.fusion.execute import (
+    ExecutableGraph,
+    RegionExecution,
+    build_executable_graph,
+)
 
 __all__ = [
     "DEFAULT_MAX_REGION_SIZE",
@@ -68,6 +73,9 @@ __all__ = [
     "auto_fuse_model",
     "build_v4_extended_registry",
     "can_fuse_pair",
+    "ExecutableGraph",
+    "RegionExecution",
+    "build_executable_graph",
     "detect_region_pattern",
     "dlpack_available",
     "from_block_specs",
