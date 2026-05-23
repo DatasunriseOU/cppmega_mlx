@@ -21,6 +21,7 @@ import { TopBar, type RunMode } from "@/components/TopBar";
 import { BottomStrip } from "@/components/BottomStrip";
 import { AppTabs, type AppTab } from "@/components/AppTabs";
 import { RunResultModal, type RunReport } from "@/components/RunResultModal";
+import { LossSurfaceModal } from "@/components/LossSurfaceModal";
 import { TokenizerPlayground } from "@/components/TokenizerPlayground";
 import { DataInspector } from "@/components/DataInspector";
 import { BrickContextPanel } from "@/components/BrickContextPanel";
@@ -138,6 +139,8 @@ export function App(): JSX.Element {
     setRunErrorRaw({ code, message, data });
   }, []);
   const [trainInFlight, setTrainInFlight] = useState(false);
+  // V7-H33: loss-surface explorer modal open flag.
+  const [lossSurfaceOpen, setLossSurfaceOpen] = useState<boolean>(false);
   // V7-I03: synchronous lock. React's setTrainInFlight schedules an
   // async commit, so two button clicks within the same microtask
   // both read trainInFlight=false and both call rpc.call. The ref
@@ -1323,6 +1326,34 @@ export function App(): JSX.Element {
         <RunResultModal report={runReport} error={runError}
                         onClose={() => { setRunReport(null);
                                          setRunError(null); }} />
+        {/* V7-H33: loss-surface explorer launcher + modal. */}
+        <button data-testid="loss-surface-open"
+                onClick={() => setLossSurfaceOpen(true)}
+                style={{ position: "fixed", bottom: 56, right: 18,
+                         padding: "6px 10px", fontSize: 12,
+                         background: "#eef2ff",
+                         border: "1px solid #c7d2fe", borderRadius: 6,
+                         fontFamily: "system-ui, sans-serif" }}>
+          Loss surface…
+        </button>
+        <LossSurfaceModal
+          rpc={rpc}
+          spec={buildVerifyParams(
+            nodes, edges, spec, availableSideChannels)}
+          open={lossSurfaceOpen}
+          onClose={() => setLossSurfaceOpen(false)}
+          onApplyBest={(lrMult, wdMult) => {
+            // V7-H33: scale every optim group's lr+wd by the chosen
+            // multipliers and commit through dispatch so verify+history
+            // see the change.
+            const nextGroups = spec.optim.groups.map((g) => ({
+              ...g,
+              lr: g.lr * lrMult,
+              weight_decay: (g.weight_decay ?? 0) * wdMult,
+            }));
+            dispatch({ type: "optim.set",
+                       optim: { ...spec.optim, groups: nextGroups } });
+          }} />
       </div>
     </ReactFlowProvider>
   );

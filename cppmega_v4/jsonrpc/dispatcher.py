@@ -62,6 +62,10 @@ from cppmega_v4.jsonrpc.side_channel_apply_method import (
     SideChannelApplyParams,
     apply_side_channels,
 )
+from cppmega_v4.jsonrpc.loss_surface_method import (
+    LossSurfaceParams,
+    loss_surface_run,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -181,6 +185,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "side_channels.apply": (
         SideChannelApplyParams,
         lambda p, c: apply_side_channels(p, cache=c),
+    ),
+    "loss_surface.run": (
+        LossSurfaceParams,
+        lambda p, c: loss_surface_run(p, cache=c),
     ),
 }
 
