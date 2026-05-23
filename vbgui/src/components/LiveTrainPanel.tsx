@@ -118,6 +118,33 @@ export function LiveTrainPanel({
               mem {last.mem_mb.toFixed(1)}MB
             </span>
           )}
+          {/* V7-H34: per-step per-brick grad-norm summary. */}
+          {last.grad_norms && Object.keys(last.grad_norms).length > 0 && (
+            <span data-testid="live-train-panel-last-grad-norms">
+              ‖g‖ {Object.keys(last.grad_norms).length}b ·
+              max {Math.max(...Object.values(last.grad_norms)).toFixed(3)}
+            </span>
+          )}
+          {/* V7-H36: per-step expert-load mini-bar. */}
+          {last.expert_load && last.expert_load.length > 0 && (
+            <span data-testid="live-train-panel-last-expert-load"
+                  style={{ display: "inline-flex", gap: 2,
+                           alignItems: "center" }}>
+              experts:
+              {last.expert_load.map((load, i) => (
+                <span key={i}
+                      data-testid={`live-train-panel-expert-${i}`}
+                      title={`expert ${i}: ${load.toFixed(3)}`}
+                      style={{ display: "inline-block",
+                               width: 8,
+                               height: Math.max(2, Math.min(14,
+                                 load * 20)),
+                               background: load > 0.5 ? "#dc2626"
+                                          : load > 0.2 ? "#f59e0b"
+                                                       : "#10b981" }} />
+              ))}
+            </span>
+          )}
           {last.overflow && (
             <span data-testid="live-train-panel-last-overflow"
                   style={{ color: "#dc2626" }}>

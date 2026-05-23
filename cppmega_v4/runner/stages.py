@@ -1237,6 +1237,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                     "per_rank_activation_bytes":
                         int(per_rank_activation_bytes),
                     "total_param_bytes": int(total_param_bytes),
+                    "comm_backend": str(getattr(ws_sharding, "comm_backend", "ring")),
+                    "is_simulated": True,
                 }
 
         # H16: real dtype switching. Cast params to master_dtype and
@@ -1453,6 +1455,25 @@ def stage_train(ctx: StageContext) -> StageResult:
                     f"opt_state_load failed: "
                     f"{type(exc).__name__}: {exc}; cold restart")
 
+        # Instantiate DistributedRuntimeProxy if sharding is configured
+        proxy = None
+        virtual_states = []
+        ws_sharding = getattr(ctx.spec, "sharding", None)
+        if ws_sharding is not None:
+            from cppmega_v4.parallelism.runtime_simulation import DistributedRuntimeProxy
+            comm_backend = getattr(ws_sharding, "comm_backend", "ring")
+            world_size = 1
+            axes = getattr(ws_sharding, "axis_assignments", None) or []
+            for a in axes:
+                world_size *= int(getattr(a, "degree", 1))
+            proxy = DistributedRuntimeProxy(
+                comm_backend=comm_backend,
+                world_size=world_size,
+                rank=0,
+            )
+            if proxy.world_size > 1:
+                virtual_states = [None for _ in range(proxy.world_size)]
+
         # H20: fake multi-rank distributed train smoke. When
         # opts.fake_ranks > 1, the forward+backward is replayed N times
         # on the same micro-batch and gradients are mean-reduced (an
@@ -1579,8 +1600,31 @@ def stage_train(ctx: StageContext) -> StageResult:
                 loss_scaler_overflow_steps.append(step)
                 loss_scaler.update(True)
             else:
-                opt.update(all_modules, grads)
-                mx.eval(all_modules.parameters(), opt.state)
+                if proxy is not None and proxy.world_size > 1:
+                    # In-process simulated distributed optimizer step
+                    if step == 0 and opt.state:
+                        for r in range(proxy.world_size):
+                            virtual_states[r] = proxy.select_owned(opt.state, rank=r)
+                    
+                    rank_updates = []
+                    for r in range(proxy.world_size):
+                        grads_r = proxy.select_owned(grads, rank=r)
+                        params_r = proxy.select_owned(all_modules.parameters(), rank=r)
+                        if grads_r:
+                            opt.state = virtual_states[r]
+                            if not opt.state:
+                                opt.init(params_r)
+                            updates_r = opt.apply_gradients(grads_r, params_r)
+                            virtual_states[r] = opt.state
+                            rank_updates.append(updates_r)
+                    
+                    full_updates = proxy.all_gather_simulated(rank_updates)
+                    all_modules.update(full_updates)
+                    mx.eval(all_modules.parameters())
+                else:
+                    opt.update(all_modules, grads)
+                    mx.eval(all_modules.parameters(), opt.state)
+                
                 if loss_scaler is not None:
                     loss_scaler.update(False)
             losses.append(float(loss.item()))
@@ -1731,6 +1775,18 @@ def stage_train(ctx: StageContext) -> StageResult:
                 opt_state_saved_path = str(opt_state_save)
             except Exception:
                 pass
+
+        # Reconstitute the full optimizer state from the sharded virtual states
+        if proxy is not None and proxy.world_size > 1:
+            merged_state = {}
+            for state in virtual_states:
+                if state:
+                    merged_state.update(dict(nn.utils.tree_flatten(state)))
+            sorted_state_pairs = sorted(
+                ((k, v) for k, v in merged_state.items() if isinstance(v, mx.array)),
+                key=lambda x: x[0],
+            )
+            opt.state = nn.utils.tree_unflatten(sorted_state_pairs)
 
         # G10: cache opt.state for future warm-start lookups (capped LRU)
         try:
@@ -1900,6 +1956,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "gradient_clip": clip_extras,
                 "memory_peak_bytes": memory_peak_bytes,
                 "sharding_applied": sharding_applied,
+                "comm_backend": str(proxy.comm_backend.value) if proxy is not None else None,
+                "is_simulated": bool(proxy.is_simulated) if proxy is not None else None,
                 "fake_ranks": fake_ranks,
                 "gradient_reduce_ms": round(
                     gradient_reduce_ms_total, 4),
