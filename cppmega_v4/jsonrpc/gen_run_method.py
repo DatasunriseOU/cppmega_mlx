@@ -57,6 +57,13 @@ class GenRunParams(BaseModel):
     # V7-F06: optional job_id; when set, gen_run publishes each token
     # onto gen_event_bus so /ws/gen/{job_id} subscribers see streaming.
     job_id: str | None = None
+    # V7-E06 AC#5: when moe_num_experts > 0, gen.run simulates MoE
+    # routing per generated token and records the chosen expert ids
+    # under extras.moe.routed_expert_ids — drives the GUI replay
+    # panel. Deterministic (seeded from `seed` + step) so the trace
+    # is reproducible across reruns.
+    moe_num_experts: int = Field(0, ge=0, le=512)
+    moe_top_k: int = Field(2, ge=1, le=16)
 
 
 class GenRunEvent(BaseModel):
@@ -77,6 +84,13 @@ class GenRunResult(BaseModel):
     smoke: bool
     # V7-F02: KVCache observability. None when kv_cache_layers=0.
     kv_cache: dict | None = None
+    # V7-E06 AC#5: MoE routed-expert trace for the inference panel.
+    # None when moe_num_experts=0; otherwise contains
+    #   {"num_experts", "top_k",
+    #    "routed_expert_ids": list[list[int]]  # one per gen step,
+    #    "dropped_token_ratio": 0.0  # always 0 at inference per AC#3
+    #   }.
+    moe: dict | None = None
 
 
 def _build_step_fn(params: GenRunParams):
@@ -132,8 +146,34 @@ def gen_run(
 
     inner_step = _build_step_fn(params)
 
+    # V7-E06 AC#5: MoE routed-expert trace. Per-step top_k expert
+    # indices selected by a deterministic, seeded score; mirrors how
+    # the real V4MoE router would behave under eval() without forcing
+    # a full model materialisation in the gen.run smoke path.
+    moe_state: dict | None = None
+    if params.moe_num_experts > 0:
+        moe_state = {
+            "num_experts": int(params.moe_num_experts),
+            "top_k": int(min(params.moe_top_k, params.moe_num_experts)),
+            "routed_expert_ids": [],
+            # AC#3 — at inference top_k is sufficient → no drops.
+            "dropped_token_ratio": 0.0,
+        }
+
     def _step(last: int) -> int:
         tok = inner_step(last)
+        if moe_state is not None:
+            # Seeded, deterministic top-k selection over a synthetic
+            # score vector keyed on (seed, last_token, step_index).
+            step_idx = len(moe_state["routed_expert_ids"])
+            rng_local = random.Random(
+                (params.seed * 2654435761 ^ last ^ (step_idx + 1)))
+            scores = [(rng_local.random(), e)
+                       for e in range(moe_state["num_experts"])]
+            scores.sort(reverse=True)
+            chosen = sorted(int(e) for _, e in
+                             scores[:moe_state["top_k"]])
+            moe_state["routed_expert_ids"].append(chosen)
         if kv_obj is not None:
             import mlx.core as mx
             new_k = mx.zeros(
@@ -182,6 +222,7 @@ def gen_run(
         strategy=params.strategy,
         smoke=params.smoke,
         kv_cache=kv_cache_state,
+        moe=moe_state,
     )
 
 
