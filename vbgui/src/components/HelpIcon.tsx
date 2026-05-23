@@ -921,8 +921,16 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(15, 23, 42, 0.75)",
-        backdropFilter: "blur(8px)",
+        // UX-fix: backdropFilter: blur(8px) forced Chrome to recompose
+        // the GPU layer on every mousemove (cursor crossing the
+        // overlay → repaint loop with React Flow canvas underneath
+        // → visible flicker). Plain rgba(0,0,0,0.5) keeps focus on
+        // the modal without forcing per-frame backdrop recomposite.
+        background: "rgba(15, 23, 42, 0.55)",
+        // Promote to its own compositing layer so mousemove over the
+        // backdrop doesn't invalidate the canvas paint underneath.
+        transform: "translateZ(0)",
+        willChange: "opacity",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
