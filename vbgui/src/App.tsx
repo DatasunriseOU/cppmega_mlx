@@ -7,6 +7,7 @@ import { FlowCanvas } from "@/components/FlowCanvas";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { GalleryTab } from "@/components/GalleryTab";
 import { SweepPanel } from "@/components/SweepPanel";
+import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
@@ -920,6 +921,18 @@ export function App(): JSX.Element {
                   });
                 }
               }}
+            />
+          )}
+          {activeTab === "tokmatrix" && (
+            <TokenizerMatrixTab
+              rpc={rpc}
+              presets={["llama3_8b", "mistral_small_3_1"]}
+              tokenizers={[
+                "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T1_cppmega_v3.json",
+                "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T2_gpt2_small.json",
+                "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T3_minimal_no_fim.json",
+                "/Volumes/external/sources/cppmega.mlx/tests/fixtures/tokenizers/T4_fim_only.json",
+              ]}
             />
           )}
           {activeTab === "sweep" && (

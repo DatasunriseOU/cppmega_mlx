@@ -72,6 +72,27 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "Attention memory scales O(B*S^2) for vanilla SDPA. The " +
       "GUI default S=64 keeps mini runs interactive.",
   },
+  // ----- tokenizer matrix -----
+  tokenizer_matrix: {
+    title: "Tokenizer × preset compatibility matrix",
+    what:
+      "A grid showing each preset paired with each available " +
+      "tokenizer. Cells are 'ok' (encodes cleanly), 'incompat' " +
+      "(empty token stream — the tokenizer has no vocabulary for " +
+      "the probe text), or 'error' (file missing / corrupt).",
+    why:
+      "Mixing a preset (which expects a particular vocab_size + " +
+      "special-token contract) with the wrong tokenizer is the " +
+      "single most common training failure mode in practice. " +
+      "Validating the pair *before* train tells the architect " +
+      "instantly whether their fixture is even self-consistent. " +
+      "Click any cell to inspect the first 10 token ids it " +
+      "produced for the canonical probe text.",
+    example:
+      "T1_cppmega_v3.json + llama3_8b → ok (vocab=32000 fits). " +
+      "T4_fim_only.json + mistral_small_3_1 → incompat (no " +
+      "non-FIM tokens emitted).",
+  },
   // ----- F56b convention -----
   symbolic_dim_mismatch: {
     title: "Why nh*head_dim != H is allowed (but warned)",
