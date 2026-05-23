@@ -1526,6 +1526,195 @@ class HybridTinyLM(nn.Module):
             "in_region_parameter_bank_aliases": dict(aliases),
         }
 
+    def path_c_fused_first_in_region_layer_index(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> int | None:
+        """Return the layer index where the fused Path C region starts.
+
+        Returned value is the smallest ``layers.<index>`` index that owns a
+        bank-bound trainable parameter. ``None`` indicates the model has no
+        fused-region parameters; callers fall back to the standard
+        eager forward in that case.
+        """
+
+        aliases = self.path_c_fused_in_region_parameter_bank_aliases(
+            sequence_length=sequence_length,
+        )
+        if not aliases:
+            return None
+        indices = [
+            int(name.split(".", 2)[1])
+            for name in aliases
+            if name.startswith("layers.") and name.split(".", 2)[1].isdigit()
+        ]
+        if not indices:
+            return None
+        return min(indices)
+
+    def attach_path_c_fused_suffix_custom_function(
+        self,
+        fused_suffix: Any,
+        *,
+        parameter_order: Sequence[str],
+        first_in_region_layer_index: int,
+    ) -> None:
+        """Attach a fused-suffix custom function for the loss helper to use.
+
+        The runtime composes the function (binding artifact + bank owner)
+        once per install and registers it here so the loss helper can dispatch
+        without re-discovering the wiring on every step.
+        """
+
+        if not callable(fused_suffix):
+            raise TypeError("fused_suffix must be callable")
+        if first_in_region_layer_index < 0:
+            raise ValueError("first_in_region_layer_index must be non-negative")
+        self._path_c_fused_suffix_custom_function = fused_suffix
+        self._path_c_fused_suffix_parameter_order = tuple(parameter_order)
+        self._path_c_fused_suffix_first_in_region_layer_index = int(
+            first_in_region_layer_index
+        )
+
+    def detach_path_c_fused_suffix_custom_function(self) -> None:
+        for attr in (
+            "_path_c_fused_suffix_custom_function",
+            "_path_c_fused_suffix_parameter_order",
+            "_path_c_fused_suffix_first_in_region_layer_index",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def path_c_fused_suffix_custom_function_available(self) -> bool:
+        return callable(
+            getattr(self, "_path_c_fused_suffix_custom_function", None)
+        )
+
+    def path_c_fused_suffix_loss(
+        self,
+        batch: Mapping[str, mx.array],
+    ) -> tuple[mx.array, mx.array]:
+        """Compute (loss, ntokens) via the fused-suffix custom function.
+
+        The prefix (embedding + side-channel embeddings + layers before
+        the fused region) runs eagerly in MLX; layers inside the fused
+        region, the final norm, the ``lm_head`` projection and the loss
+        reduction are handed off to the fused TileLang artifact via the
+        attached :py:meth:`attach_path_c_fused_suffix_custom_function`
+        callable. MLX autograd therefore never traces through the
+        in-region layers: the fused custom function's VJP returns
+        bank-resident cotangents for every in-region trainable
+        parameter, and the prefix continues backward from
+        ``hidden_entry_grad`` to the embedding and prefix layers.
+
+        Returns ``(loss, ntokens)`` as MLX scalars; the trainer uses
+        these the same way it would the output of
+        :func:`cppmega_mlx.training.loss.next_token_cross_entropy`.
+        """
+
+        fused_suffix = getattr(
+            self, "_path_c_fused_suffix_custom_function", None
+        )
+        parameter_order: tuple[str, ...] = tuple(
+            cast("Sequence[str]",
+                getattr(self, "_path_c_fused_suffix_parameter_order", ()))
+        )
+        first_in_region_layer_index = getattr(
+            self,
+            "_path_c_fused_suffix_first_in_region_layer_index",
+            None,
+        )
+        if (
+            not callable(fused_suffix)
+            or not parameter_order
+            or first_in_region_layer_index is None
+        ):
+            raise ValueError(
+                "path_c_fused_suffix_loss requires "
+                "attach_path_c_fused_suffix_custom_function to be installed"
+            )
+
+        from cppmega_mlx.data.batch import ensure_lm_batch
+
+        lm_batch = ensure_lm_batch(batch)
+        input_ids = lm_batch.inputs
+        targets = lm_batch.targets
+        target_mask = lm_batch.target_mask
+        # decoder_hidden_states accepts the side-channel tensors and the
+        # document_ids stream; the prefix needs both because the masking
+        # and structure / platform embeddings are inputs to the prefix
+        # layers. The fused suffix bridge does not need a kv_cache and
+        # does not consume the side-channel kwargs directly.
+        side_channel_kwargs = dict(lm_batch.model_kwargs())
+        document_ids = lm_batch.input_document_ids
+
+        # Targets are (B, S); the fused kernel consumes a flat 1-D
+        # target_ids buffer of length S. The custom function writes them
+        # into the bank slot; we forward the per-step batch tensor.
+        if targets.ndim != 2:
+            raise ValueError(
+                f"path_c_fused_suffix_loss expects targets shaped (B, S); "
+                f"got {targets.shape}"
+            )
+        if targets.shape[0] != 1:
+            raise NotImplementedError(
+                "path_c_fused_suffix_loss currently expects batch_size=1 "
+                "(matching the tiny smoke profile); broader shapes need "
+                "the fused kernel ABI to expand its target_ids buffer."
+            )
+        if target_mask.shape != targets.shape:
+            raise ValueError(
+                "target_mask shape must match targets; got "
+                f"{target_mask.shape} vs {targets.shape}"
+            )
+        flat_target_ids = mx.reshape(
+            targets.astype(mx.int32), (targets.shape[1],)
+        )
+        flat_target_mask = mx.reshape(
+            target_mask.astype(mx.float32), (target_mask.shape[1],)
+        )
+
+        hidden_entry = self.decoder_hidden_states(
+            input_ids,
+            structure_ids=side_channel_kwargs.get("structure_ids"),
+            dep_levels=side_channel_kwargs.get("dep_levels"),
+            ast_depth_ids=side_channel_kwargs.get("ast_depth_ids"),
+            sibling_index_ids=side_channel_kwargs.get("sibling_index_ids"),
+            node_type_ids=side_channel_kwargs.get("node_type_ids"),
+            platform_ids=side_channel_kwargs.get("platform_ids"),
+            document_ids=document_ids,
+            kv_cache=None,
+            stop_layer_index=int(first_in_region_layer_index),
+            apply_final_norm=False,
+        )
+
+        params = tuple(
+            self._path_c_get_parameter_tensor(name)
+            for name in parameter_order
+        )
+        if any(p is None for p in params):
+            missing = [
+                name
+                for name, p in zip(parameter_order, params, strict=True)
+                if p is None
+            ]
+            raise ValueError(
+                "path_c_fused_suffix_loss could not resolve in-region "
+                f"parameters: {missing}"
+            )
+        result: Any = fused_suffix(
+            hidden_entry,
+            flat_target_ids,
+            flat_target_mask,
+            *params,
+        )
+        loss, ntokens = cast(tuple[mx.array, mx.array], result)
+        # ntokens lives in the bank as float32; convert back to the standard
+        # uint32 reporting form used by other loss helpers.
+        ntokens = ntokens.astype(mx.uint32)
+        return loss, ntokens
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -1565,6 +1754,8 @@ class HybridTinyLM(nn.Module):
         platform_ids: mx.array | None = None,
         document_ids: mx.array | None = None,
         kv_cache: ContiguousKVCache | None = None,
+        stop_layer_index: int | None = None,
+        apply_final_norm: bool = True,
     ) -> mx.array:
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
@@ -1682,7 +1873,9 @@ class HybridTinyLM(nn.Module):
                     expand_heads=True,
                 )
         if self.config.grad_checkpoint:
-            for layer in self.layers:
+            for layer_index, layer in enumerate(self.layers):
+                if stop_layer_index is not None and layer_index >= stop_layer_index:
+                    break
                 if layer.backend == "engram" and document_ids is not None:
                     hidden_states = mx.checkpoint(layer)(
                         hidden_states, mask, doc_ids=document_ids
@@ -1691,7 +1884,9 @@ class HybridTinyLM(nn.Module):
                     hidden_states = mx.checkpoint(layer)(hidden_states, mask)
         else:
             attention_layer_idx = 0
-            for layer in self.layers:
+            for layer_index, layer in enumerate(self.layers):
+                if stop_layer_index is not None and layer_index >= stop_layer_index:
+                    break
                 if layer.backend == "attention":
                     hidden_states = layer(
                         hidden_states,
@@ -1706,7 +1901,9 @@ class HybridTinyLM(nn.Module):
                     )
                 else:
                     hidden_states = layer(hidden_states, mask)
-        return self.norm(hidden_states)
+        if apply_final_norm:
+            return self.norm(hidden_states)
+        return hidden_states
 
 
 def _validate_side_channel_shape(

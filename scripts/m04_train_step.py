@@ -3056,6 +3056,101 @@ def _path_c_fused_train_block_artifact_has_training_runtime_contract(
     )
 
 
+def _build_path_c_fused_suffix_loss_fn_for_model(
+    *,
+    model: Any,
+    artifact: Any,
+    bank_owner: Any,
+    in_region_parameter_bank_aliases: Mapping[str, Mapping[str, Any]],
+    sequence_length: int | None,
+) -> Callable[[Any, Mapping[str, Any]], tuple[mx.array, mx.array]] | None:
+    """Compose the fused-suffix custom function and attach it to the model.
+
+    Returns the model's ``path_c_fused_suffix_loss`` method bound to its
+    own ``self`` so the training runtime can call it as ``loss_fn(model,
+    batch)``. Returns ``None`` when the model does not expose the
+    suffix-bridge surface or the ABI map does not declare the required
+    fused-suffix inputs / outputs.
+    """
+
+    from cppmega_mlx.training.path_c_fused_suffix import (
+        build_fused_suffix_custom_function,
+    )
+
+    if not callable(getattr(model, "path_c_fused_suffix_loss", None)):
+        return None
+    if not callable(getattr(model, "attach_path_c_fused_suffix_custom_function", None)):
+        return None
+
+    prim_func = model.path_c_fused_train_block_prim_func(
+        sequence_length=sequence_length,
+    )
+    if prim_func is None:
+        return None
+    abi_map = dict(
+        getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+        or {}
+    )
+    if not abi_map:
+        return None
+    # Discover the canonical hidden entry name.
+    hidden_entry_logical_name: str | None = None
+    for name in abi_map:
+        if (
+            "_hidden" in name
+            and not name.endswith("_grad")
+            and not name.endswith("_after")
+            and not name.endswith("_after_grad")
+        ):
+            hidden_entry_logical_name = name
+            break
+    if hidden_entry_logical_name is None:
+        return None
+    required_inputs = ("target_ids", "target_mask", "loss", "ntokens")
+    if not all(name in abi_map for name in required_inputs):
+        return None
+
+    first_in_region_layer_index_fn = getattr(
+        model, "path_c_fused_first_in_region_layer_index", None
+    )
+    if not callable(first_in_region_layer_index_fn):
+        return None
+    first_in_region_layer_index = first_in_region_layer_index_fn(
+        sequence_length=sequence_length
+    )
+    if first_in_region_layer_index is None:
+        return None
+
+    parameter_order = tuple(sorted(in_region_parameter_bank_aliases.keys()))
+    try:
+        fused_suffix = build_fused_suffix_custom_function(
+            artifact=artifact,
+            bank_owner=bank_owner,
+            abi_map=abi_map,
+            hidden_entry_logical_name=hidden_entry_logical_name,
+            target_ids_logical_name="target_ids",
+            target_mask_logical_name="target_mask",
+            loss_logical_name="loss",
+            ntokens_logical_name="ntokens",
+            in_region_parameter_bank_aliases=in_region_parameter_bank_aliases,
+            parameter_order=parameter_order,
+        )
+    except Exception:
+        return None
+    model.attach_path_c_fused_suffix_custom_function(
+        fused_suffix,
+        parameter_order=parameter_order,
+        first_in_region_layer_index=int(first_in_region_layer_index),
+    )
+
+    def _loss_fn(loss_model: Any, batch: Mapping[str, Any]) -> tuple[mx.array, mx.array]:
+        # MLX nn.value_and_grad always calls loss_fn(model, batch). Forward
+        # the call to the model's bound suffix-loss helper.
+        return loss_model.path_c_fused_suffix_loss(batch)
+
+    return _loss_fn
+
+
 def _path_c_fused_train_block_training_runtime_from_artifact(
     *,
     artifact: Any,
@@ -3120,6 +3215,9 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
     in_region_aliases: dict[str, dict[str, Any]] | None = None
     sync_callable: Callable[[], Mapping[str, Any]] | None = None
     bind_report: dict[str, Any] | None = None
+    fused_suffix_loss_fn: Callable[
+        [Any, Mapping[str, Any]], tuple[mx.array, mx.array]
+    ] | None = None
     if model is not None and bank_owner is not None:
         binder = getattr(
             model,
@@ -3226,6 +3324,15 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
                         }
 
                     sync_callable = _sync
+                    fused_suffix_loss_fn = (
+                        _build_path_c_fused_suffix_loss_fn_for_model(
+                            model=model,
+                            artifact=artifact,
+                            bank_owner=bank_owner,
+                            in_region_parameter_bank_aliases=in_region_aliases,
+                            sequence_length=sequence_length,
+                        )
+                    )
                 else:
                     in_region_aliases = None
     try:
@@ -3242,6 +3349,7 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
             in_region_parameter_names=in_region_names,
             in_region_parameter_bank_aliases=in_region_aliases,
             model_bank_sync_callable=sync_callable,
+            fused_suffix_loss_fn=fused_suffix_loss_fn,
         )
         if bind_report is not None:
             runtime.last_parameter_bank_bind_report = dict(bind_report)

@@ -424,7 +424,9 @@ def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
 
     # Trivial loss closure — sum of zero embedding lookup. We don't care
     # about the numbers; we care that the runtime calls artifact.forward.
-    seq_len = 16
+    # Match the path_c_training_sequence_length(args)=127 the install path uses
+    # so the fused suffix bank slots line up with the prefix output.
+    seq_len = 127
 
     def loss_fn(model: nn.Module, batch: Mapping[str, mx.array]) -> tuple[mx.array, mx.array]:
         logits = model(batch["tokens"])
@@ -433,11 +435,16 @@ def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
         return loss, ntokens
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
+    # Provide both tokens and target_tokens with the same length so the
+    # batch's effective input length equals seq_len rather than seq_len-1.
+    # This keeps the prefix output shape aligned with the fused suffix
+    # bank slot when suffix-bypass mode is active.
     tokens = mx.zeros((1, seq_len), dtype=mx.int32)
+    target_tokens = mx.zeros((1, seq_len), dtype=mx.int32)
 
     (loss, ntokens), grads = runtime.value_and_grad(
         model,
-        {"tokens": tokens},
+        {"tokens": tokens, "target_tokens": target_tokens},
         loss_and_grad,
     )
     mx.eval(loss, ntokens)
@@ -739,3 +746,85 @@ def test_warmup_mode_contract_clears_bank_residency_signals() -> None:
     assert coverage["parameter_bank_residency_active"] is False
     assert coverage["merged_bank_resident_parameter_count"] == 0
     assert coverage["merged_bank_resident_parameter_names"] == ()
+
+
+def test_suffix_bypass_contract_field_reflects_attachment() -> None:
+    art = _FakeFusedArtifactWithBankResidentGrads()
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=_FakeBankOwner(),
+        owner_name="merged_no_bypass",
+        in_region_parameter_bank_aliases={
+            "a": {"logical_name": "x", "logical_grad_name": "x_grad", "bank": "f32", "dtype": "float32", "offset": 0, "size": 4, "logical_shape": (4,)},
+        },
+    )
+    assert runtime.value_and_grad_contract()["suffix_bypass_available"] is False
+
+    # Attaching a fused_suffix_loss_fn flips the contract signal.
+    def _stub_loss(model: Any, batch: Mapping[str, Any]) -> tuple[mx.array, mx.array]:
+        return mx.array(0.0), mx.array(0, dtype=mx.uint32)
+
+    runtime_with_bypass = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=_FakeBankOwner(),
+        owner_name="merged_with_bypass",
+        in_region_parameter_bank_aliases={
+            "a": {"logical_name": "x", "logical_grad_name": "x_grad", "bank": "f32", "dtype": "float32", "offset": 0, "size": 4, "logical_shape": (4,)},
+        },
+        fused_suffix_loss_fn=_stub_loss,
+    )
+    assert (
+        runtime_with_bypass.value_and_grad_contract()["suffix_bypass_available"]
+        is True
+    )
+
+
+def test_suffix_bypass_uses_fused_suffix_loss_fn_and_skips_eager_closure() -> None:
+    art = _FakeFusedArtifactWithBankResidentGrads()
+    captured: dict[str, Any] = {}
+
+    def fused_suffix_loss(model: Any, batch: Mapping[str, Any]) -> tuple[mx.array, mx.array]:
+        captured["fused_called"] = True
+        # Touch the model parameters so MLX has something to differentiate.
+        param = getattr(model, "shared_param")
+        return param.sum(), mx.array(7, dtype=mx.uint32)
+
+    import mlx.nn as nn
+
+    class _MiniModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shared_param = mx.array([1.0, 2.0, 3.0], dtype=mx.float32)
+
+    model = _MiniModel()
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art,
+        bank_owner=_FakeBankOwner(),
+        owner_name="bypass_mini",
+        in_region_parameter_bank_aliases={
+            "shared_param": {"logical_name": "x", "logical_grad_name": "x_grad", "bank": "f32", "dtype": "float32", "offset": 0, "size": 3, "logical_shape": (3,)},
+        },
+        fused_suffix_loss_fn=fused_suffix_loss,
+    )
+
+    def eager_closure(model: Any, batch: Mapping[str, Any]) -> Any:
+        captured["eager_called"] = True
+        return (mx.array(99.0), mx.array(0, dtype=mx.uint32)), {"shared_param": mx.zeros((3,))}
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model, {}, eager_closure
+    )
+    mx.eval(loss, ntokens, *(g for _, g in tree_flatten(grads)))
+    # Bypass ran the fused closure but never the trainer's eager closure.
+    assert captured.get("fused_called") is True
+    assert "eager_called" not in captured
+    # Loss/ntokens come from the fused closure (loss=1+2+3=6, ntokens=7).
+    assert float(loss) == 6.0
+    assert int(ntokens) == 7
+    flat = dict(tree_flatten(grads))
+    assert "shared_param" in flat
+    # Telemetry confirms suffix-bypass active.
+    vg = runtime.last_fused_value_and_grad_payload
+    assert vg["suffix_bypass_active"] is True
+    assert vg["completed"] is True
+    assert vg["error"] is None

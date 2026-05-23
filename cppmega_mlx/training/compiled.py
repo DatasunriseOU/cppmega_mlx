@@ -486,6 +486,9 @@ class PathCFusedPlusEagerTrainingRuntime:
         in_region_parameter_names: Sequence[str] | None = None,
         in_region_parameter_bank_aliases: Mapping[str, Mapping[str, Any]] | None = None,
         model_bank_sync_callable: Callable[[], Mapping[str, Any]] | None = None,
+        fused_suffix_loss_fn: Callable[
+            [nn.Module, Mapping[str, Any]], tuple[mx.array, mx.array]
+        ] | None = None,
     ) -> None:
         if not callable(artifact):
             raise TypeError("fused train-block artifact must be callable")
@@ -526,6 +529,9 @@ class PathCFusedPlusEagerTrainingRuntime:
         self.model_bank_sync_callable = (
             model_bank_sync_callable if callable(model_bank_sync_callable) else None
         )
+        self.fused_suffix_loss_fn = (
+            fused_suffix_loss_fn if callable(fused_suffix_loss_fn) else None
+        )
         self._binding: dict[str, Any] | None = None
         self.last_fused_warmup_payload: dict[str, Any] = {
             "attempted": False,
@@ -542,6 +548,7 @@ class PathCFusedPlusEagerTrainingRuntime:
             "missing_parameter_names": (),
             "bank_sync_status": None,
             "error": None,
+            "suffix_bypass_active": False,
         }
         self.last_parameter_bank_bind_report: dict[str, Any] | None = None
 
@@ -602,30 +609,44 @@ class PathCFusedPlusEagerTrainingRuntime:
         batch: Mapping[str, mx.array],
         loss_and_grad: Any,
     ) -> tuple[tuple[mx.array, mx.array], Any]:
-        """Run merged fused + eager value_and_grad with bank residency.
+        """Run fused + eager value_and_grad with the strongest available bridge.
 
-        Behaviour depends on whether the runtime was constructed with
-        ``in_region_parameter_bank_aliases``:
+        Behaviour depends on the runtime's installed state:
 
-        * **Merged mode (aliases set)** — sync in-region parameter tensors
-          back into the model-owned physical-ABI bank slots, launch the
-          fused TileLang ``artifact.value_and_grad`` (forward + backward
-          in one shot, returning a bank-resident gradient tree), then run
-          the trainer's eager closure to produce a full-model gradient
+        * **Suffix-bypass mode (fused_suffix_loss_fn + aliases set)** —
+          short-circuit eager autograd for the entire in-region suffix.
+          The runtime builds ``nn.value_and_grad(model, fused_suffix_loss_fn)``
+          and runs it once: the prefix (embedding + layers before the
+          fused region) runs eagerly, then the fused custom-function
+          executes the TileLang artifact and exposes bank-resident
+          cotangents to MLX autograd. Because the suffix never enters
+          the autograd graph, the eager forward / backward cost drops to
+          the prefix only — this is the structural Path C compute /
+          memory win. The trainer-supplied ``loss_and_grad`` closure is
+          intentionally ignored in this mode: every gradient (prefix
+          plus in-region) comes from one autograd pass that consumes the
+          fused suffix as a custom function.
+
+        * **Merged mode (aliases set, no suffix bypass)** — sync
+          in-region parameter tensors back into the model-owned
+          physical-ABI bank slots, launch the fused TileLang
+          ``artifact.value_and_grad`` (forward + backward in one shot,
+          returning a bank-resident gradient tree), then run the
+          trainer's eager closure to produce a full-model gradient
           tree, and overwrite the in-region entries of the eager tree
-          with the bank-resident fused gradients. The returned ``loss`` /
-          ``ntokens`` come from the eager closure (so trainer-side loss
-          accounting is unchanged). Telemetry lands in
+          with the bank-resident fused gradients. The returned ``loss``
+          / ``ntokens`` come from the eager closure (so trainer-side
+          loss accounting is unchanged). Telemetry lands in
           ``self.last_fused_warmup_payload`` and
           ``self.last_fused_value_and_grad_payload``.
 
-        * **Warmup mode (no aliases)** — keep the previous behaviour: run
-          the fused ``artifact.forward(bank_owner=…)`` as a warmup pass
-          (so the JIT cache stays warm and downstream telemetry can
-          measure the kernel cost) and delegate the gradient tree to the
-          eager closure. The fused grads are not merged because the
-          parameters are still independent tensors. This mode is the
-          honest fallback when bank-residency binding has not been
+        * **Warmup mode (no aliases)** — keep the previous behaviour:
+          run the fused ``artifact.forward(bank_owner=…)`` as a warmup
+          pass (so the JIT cache stays warm and downstream telemetry
+          can measure the kernel cost) and delegate the gradient tree
+          to the eager closure. The fused grads are not merged because
+          the parameters are still independent tensors. This mode is
+          the honest fallback when bank-residency binding has not been
           installed; it does not pretend the runtime closed the
           gradient-coverage gap.
         """
@@ -634,6 +655,60 @@ class PathCFusedPlusEagerTrainingRuntime:
                 "mixed-mode training runtime requires the trainer to pass "
                 "an eager loss_and_grad closure for residual parameters"
             )
+
+        suffix_bypass = bool(
+            self.in_region_parameter_bank_aliases
+            and self.fused_suffix_loss_fn is not None
+        )
+        if suffix_bypass:
+            bank_sync_status: dict[str, Any] | None = None
+            if self.model_bank_sync_callable is not None:
+                try:
+                    raw_status = self.model_bank_sync_callable()
+                    bank_sync_status = (
+                        dict(raw_status) if isinstance(raw_status, Mapping) else None
+                    )
+                except Exception as exc:
+                    bank_sync_status = {
+                        "status": "error",
+                        "error": repr(exc),
+                    }
+
+            vg_payload: dict[str, Any] = {
+                "attempted": True,
+                "completed": False,
+                "elapsed_ns": 0,
+                "merged_parameter_count": len(
+                    self.in_region_parameter_bank_aliases
+                ),
+                "merged_parameter_names": tuple(
+                    sorted(self.in_region_parameter_bank_aliases)
+                ),
+                "missing_parameter_names": (),
+                "bank_sync_status": bank_sync_status,
+                "error": None,
+                "suffix_bypass_active": True,
+            }
+            try:
+                vg_start = time.perf_counter_ns()
+                fused_loss_fn = self.fused_suffix_loss_fn
+                if fused_loss_fn is None:  # pragma: no cover - guarded by suffix_bypass
+                    raise RuntimeError("suffix_bypass without fused_suffix_loss_fn")
+                fused_value_and_grad = nn.value_and_grad(model, fused_loss_fn)
+                (loss, ntokens), grads = fused_value_and_grad(model, batch)
+                vg_payload["elapsed_ns"] = (
+                    time.perf_counter_ns() - vg_start
+                )
+                vg_payload["completed"] = True
+                self.last_fused_value_and_grad_payload = vg_payload
+                # Warmup payload is meaningless in bypass mode (no separate
+                # warmup launch happens); keep the default sentinel so
+                # receipts can distinguish the modes.
+                return (loss, ntokens), grads
+            except Exception as exc:
+                vg_payload["error"] = repr(exc)
+                self.last_fused_value_and_grad_payload = vg_payload
+                raise
 
         merged_mode = bool(self.in_region_parameter_bank_aliases)
 
@@ -820,6 +895,10 @@ class PathCFusedPlusEagerTrainingRuntime:
             ),
             "merged_bank_resident_parameter_count": len(
                 self.in_region_parameter_bank_aliases
+            ),
+            "suffix_bypass_available": bool(
+                self.fused_suffix_loss_fn is not None
+                and self.in_region_parameter_bank_aliases
             ),
             "runtime_class": type(self).__name__,
         }
