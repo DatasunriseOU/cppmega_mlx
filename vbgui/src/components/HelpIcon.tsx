@@ -10,6 +10,13 @@ export interface HelpTopic {
   why: string;
   example?: string;
   reference?: string;
+  // V7-Q09: brick-tile help additions. Inputs / outputs / normalization
+  // describe upstream-compatibility, downstream-compatibility, and
+  // pre/post-norm requirements for a brick so the operator knows what
+  // to connect and where to drop a norm.
+  inputs?: string;
+  outputs?: string;
+  normalization?: string;
 }
 
 export const HELP_TOPICS: Record<string, HelpTopic> = {
@@ -405,6 +412,465 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "(decoupled Q via W_Q projection).",
     reference: "https://arxiv.org/abs/2412.19437",
   },
+
+  // V7-Q09: per-brick palette help. Each brick entry covers what it
+  // does, why you'd reach for it, expected input/output shapes, and
+  // where normalization lives.
+
+  // ----- SDPA / GQA attention family -----
+  brick_attention: {
+    title: "attention — Vanilla SDPA",
+    what:
+      "Standard scaled-dot-product attention with N query heads, KV "
+      + "projections, and a residual-shaped output. Backed by "
+      + "mx.fast.scaled_dot_product_attention on MPS.",
+    why:
+      "Default attention block. Use when the architecture is plain "
+      + "Llama / GPT / Mistral and you don't need linear / sliding / "
+      + "sparse variants.",
+    inputs:
+      "x: (B, S, H). Optional KV cache + attention mask (causal or "
+      + "doc-aware). num_heads, head_dim, num_kv_heads from params.",
+    outputs:
+      "y: (B, S, H). Shape-preserving — drops into a residual stream.",
+    normalization:
+      "Apply RMSNorm BEFORE the block (pre_norm='rmsnorm'). Post-norm "
+      + "is optional — Llama-style architectures use pre-norm only.",
+  },
+  brick_gated_attention: {
+    title: "gated_attention — Qwen3-Next style",
+    what:
+      "Attention block with an output gate + partial RoPE + Q/K "
+      + "RMSNorm + asymmetric GQA. Re-export of "
+      + "mlx_lm.models.qwen3_next.Qwen3NextAttention.",
+    why:
+      "Better at long-context routing — the output gate suppresses "
+      + "attention contribution per-token when the residual already "
+      + "carries enough info.",
+    inputs:
+      "x: (B, S, H). num_attention_heads, num_key_value_heads, "
+      + "head_dim params. Internally splits GQA: nh queries, nkv kv.",
+    outputs: "y: (B, S, H). Shape-preserving.",
+    normalization:
+      "Q/K RMSNorm is built-in; you still need a residual pre-norm "
+      + "outside the brick.",
+    reference: "Qwen3 paper §3.4",
+  },
+  brick_mla: {
+    title: "mla — Multi-Latent Attention (DeepSeek V2/V3)",
+    what:
+      "Attention with LoRA-compressed Q + LoRA-compressed KV + RoPE "
+      + "on the pe-only split. Decouples key/value memory from "
+      + "head_dim — KV cache shrinks dramatically.",
+    why:
+      "Long-context inference: a 64k context costs roughly half the "
+      + "KV memory of vanilla GQA at the same head_dim because of "
+      + "the LoRA-compressed latent.",
+    inputs:
+      "x: (B, S, H). q_lora_rank + kv_lora_rank + head_dim params. "
+      + "Position rotates only the pe-split (rope_dim) channel.",
+    outputs: "y: (B, S, H). Same shape as vanilla attention.",
+    normalization:
+      "Pre-norm required. Built-in Q/K RMSNorm scales the LoRA "
+      + "products before the attention dot-product.",
+    reference: "https://arxiv.org/abs/2412.19437",
+  },
+  brick_mla_absorb: {
+    title: "mla_absorb — MLA with absorbed fast-path",
+    what:
+      "Same as mla but prefers the absorbed-LoRA fast-path at decode "
+      + "step (merges W_Q*W_K_up and W_O*W_V_up into a single matmul).",
+    why:
+      "Inference speedup at the cost of bigger weight tensors. Use "
+      + "for serving; use plain mla for training.",
+    inputs: "Same as mla. Switching is a deploy-time decision.",
+    outputs: "Same as mla.",
+    normalization: "Same as mla.",
+  },
+  brick_mistral4_mla: {
+    title: "mistral4_mla — Mistral Small 4 absorbed MLA",
+    what:
+      "Mistral-Small-4 variant of MLA: absorbed Q/KV LoRA + INT4 "
+      + "latent cache. Vendored from mlx-lm PR #1037.",
+    why:
+      "Production Mistral Small 4 architecture; INT4 cache further "
+      + "halves long-context memory vs DeepSeek V3.",
+    inputs: "x: (B, S, H). Same LoRA-rank knobs as mla.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required; built-in Q/K RMSNorm.",
+  },
+  brick_dsv4_attention: {
+    title: "dsv4_attention — DeepSeek V4 hash-indexed sparse",
+    what:
+      "Hash-indexed sparse attention from DeepSeek V4 Flash (mlx-lm "
+      + "PR #1201). Routes each query to a small set of keys via a "
+      + "learned hash + top-k selector.",
+    why:
+      "Sub-quadratic attention for very long context (32k+). "
+      + "Inherits MLA's KV compression on top.",
+    inputs:
+      "x: (B, S, H). num_hash_buckets, top_k params + per-head hash "
+      + "projection weights.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_bailing_mla: {
+    title: "bailing_mla — Ling-2.6 multi-latent attention",
+    what:
+      "Multi-latent attention block from the Ling-2.6 family "
+      + "(mlx-lm PR #1227). MLA variant tuned for Ling's sparse MoE.",
+    why:
+      "Pair with bailing_moe to assemble Ling-style architectures.",
+    inputs: "x: (B, S, H). LoRA-rank params similar to mla.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_gqa_sliding: {
+    title: "gqa_sliding — sliding-window GQA",
+    what:
+      "Grouped-query attention with a fixed-size sliding window "
+      + "instead of full causal attention. Window_size param caps "
+      + "attended history per token.",
+    why:
+      "5:1 sliding:global ratio is the Gemma 3 + Arcee Trinity "
+      + "convention — caps long-range cost while keeping every 6th "
+      + "layer global.",
+    inputs:
+      "x: (B, S, H). num_heads, num_kv_heads, window_size, head_dim "
+      + "params.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required (Gemma uses RMSNorm).",
+  },
+  brick_cca_attention: {
+    title: "cca_attention — ZAYA1 Coarse-Causal Attention",
+    what:
+      "Compressed-context attention: pools key/value tokens into "
+      + "coarse blocks before the dot-product. ZAYA1 architecture.",
+    why:
+      "Memory-bounded long-context with explicit compression — "
+      + "trades fine-grained recall for predictable cost.",
+    inputs:
+      "x: (B, S, H). pool_size + num_heads params. Causal masking "
+      + "respects block boundaries.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_gemma4_drafter: {
+    title: "gemma4_drafter — Gemma 4 MTP drafter",
+    what:
+      "Multi-token-prediction drafter layer with cross-attention "
+      + "to the main backbone (mlx-lm PR #1276).",
+    why:
+      "Speculative decoding head — drafts the next 2-3 tokens "
+      + "from the same hidden state.",
+    inputs:
+      "x: (B, S, H) + cross_kv from main stream. drafter_k param "
+      + "controls how many lookahead tokens.",
+    outputs: "y: (B, S, H) tied to the drafter head loss.",
+    normalization: "Pre-norm on both self + cross paths.",
+  },
+  brick_nemotron_h_mtp: {
+    title: "nemotron_h_mtp — Nemotron-H MTP",
+    what:
+      "Multi-token-prediction block from NVIDIA Nemotron-H "
+      + "(mlx-lm PR #1161).",
+    why:
+      "Drafter variant tuned for Nemotron's MoE+SSM backbone.",
+    inputs: "x: (B, S, H). drafter_k param.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+
+  // ----- Linear / nonlinear attention -----
+  brick_bailing_linear: {
+    title: "bailing_linear — Ling-2.6 linear attention",
+    what:
+      "Linear attention block from Ling-2.6-flash (mlx-lm "
+      + "PR #1227). Replaces softmax with a kernel that runs in "
+      + "O(S) instead of O(S²).",
+    why:
+      "Cheap long-context inference; pair with bailing_mla on "
+      + "global layers for hybrid sparsity.",
+    inputs: "x: (B, S, H). num_heads + head_dim params.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_gdn: {
+    title: "gdn — Gated Delta Net",
+    what:
+      "Linear attention with a delta-rule update + per-token gate. "
+      + "Maintains a recurrent state across timesteps.",
+    why:
+      "Cheap recurrent block for hybrid architectures (e.g. "
+      + "Nemotron H, Qwen3-Next). Strong long-range vs vanilla "
+      + "linear attention.",
+    inputs: "x: (B, S, H). num_heads, head_dim, conv_size params.",
+    outputs: "y: (B, S, H) + state carry forward.",
+    normalization: "Pre-norm required; built-in gate.",
+  },
+  brick_kda: {
+    title: "kda — Kernel-Delta Attention",
+    what:
+      "Kimi Linear's delta-style linear attention. Sliding-window "
+      + "convolution + kernelised softmax surrogate.",
+    why:
+      "Used in Kimi Linear architecture for cheap recurrence at "
+      + "training time.",
+    inputs: "x: (B, S, H). num_heads + conv_size params.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_mamba3: {
+    title: "mamba3 — Selective SSM (Mamba-3)",
+    what:
+      "Selective state-space model with per-token gating + delta "
+      + "discretization. Re-export from cppmega_mlx.nn.mamba3.",
+    why:
+      "Non-attention sequence model — long context at O(S) cost. "
+      + "Used in Nemotron 3 Super, Phi-4-mini, hybrid backbones.",
+    inputs:
+      "x: (B, S, H). num_heads, head_dim, d_state, conv_size, "
+      + "expand params.",
+    outputs: "y: (B, S, H). Stateful — can carry h_state forward.",
+    normalization:
+      "Pre-norm required; internal silu gate + RMSNorm on output "
+      + "projection.",
+  },
+  brick_mlstm: {
+    title: "mlstm — Matrix-memory xLSTM",
+    what:
+      "Matrix-memory variant of LSTM (xLSTM 7B). Stores a per-head "
+      + "matrix state rather than a vector hidden state.",
+    why:
+      "Non-attention long-context sequence model. Tradeoff: more "
+      + "expressive state than mamba3, more compute.",
+    inputs:
+      "x: (B, S, H). num_heads, head_dim, rms_norm_eps params.",
+    outputs: "y: (B, S, H). Carries matrix state.",
+    normalization: "Pre-norm + internal RMSNorm on output.",
+  },
+
+  // ----- MoE -----
+  brick_moe: {
+    title: "moe — Mixture-of-Experts MLP",
+    what:
+      "MLP replaced by N expert sub-MLPs + top-K router. Each "
+      + "token activates only K experts (typically K=2 of 8).",
+    why:
+      "Scales MLP capacity sub-linearly with compute. Standard "
+      + "above ~10B params in modern architectures.",
+    inputs:
+      "x: (B, S, H). num_experts, top_k, capacity_factor params. "
+      + "Aux load-balance loss surfaces in extras.moe.",
+    outputs:
+      "y: (B, S, H). Plus auxiliary metrics: routing_entropy, "
+      + "load_balance_loss, dropped_token_ratio.",
+    normalization:
+      "Pre-norm required (same as plain MLP). Watch capacity_factor "
+      + "< 1 — dropped tokens degrade quality.",
+  },
+  brick_bailing_moe: {
+    title: "bailing_moe — Ling-2.6 sparse MoE",
+    what:
+      "MoE variant from Ling-2.6 (mlx-lm PR #1227) with a shared "
+      + "expert + N routed experts.",
+    why:
+      "Stronger small-expert specialization than vanilla MoE; "
+      + "shared expert covers the always-on path.",
+    inputs:
+      "x: (B, S, H). num_experts + num_shared_experts + top_k.",
+    outputs: "y: (B, S, H) + load-balance metrics in extras.",
+    normalization: "Pre-norm required.",
+  },
+
+  // ----- Sparse / specialized attention -----
+  brick_nsa: {
+    title: "nsa — Natively Sparse Attention",
+    what:
+      "Multi-branch sparse attention: combines local window + "
+      + "compressed coarse + top-k selected branches per query.",
+    why:
+      "Sub-quadratic full-context attention at training time, not "
+      + "just inference. DeepSeek V3.2-style.",
+    inputs:
+      "x: (B, S, H). num_heads, window_size, top_k, compression_ratio.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_lightning_indexer: {
+    title: "lightning_indexer — sparse-MLA indexer",
+    what:
+      "Lightning Indexer from sparse MLA: picks top-k key positions "
+      + "to attend per query. Pair with CSA/HCA.",
+    why:
+      "Selector head that feeds sparse-MLA. Reduces the per-query "
+      + "key set to a small top-k.",
+    inputs: "x: (B, S, H). top_k + index_dim params.",
+    outputs:
+      "sparse_idx: (B, S, top_k) integer indices into the key sequence.",
+    normalization: "Pre-norm before; internal projection is bias-free.",
+  },
+
+  // ----- Cross-attention / engram bridges -----
+  brick_csa_hca: {
+    title: "csa_hca — Compressed Self+History Cross Attention",
+    what:
+      "Hybrid: a compressed-self-attention path + a history-cross "
+      + "attention path inside one block. Output is the sparse-attn "
+      + "result combined with the lightning_indexer top-k.",
+    why:
+      "Building block for sparse-MLA gallery models. Reuses the "
+      + "indexer to bound key set then attends.",
+    inputs:
+      "x: (B, S, H) + sparse_idx from lightning_indexer + qr "
+      + "(rotation token).",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm required.",
+  },
+  brick_engram: {
+    title: "engram — Long-term memory cross-attention",
+    what:
+      "Cross-attention against a learned long-term memory bank. "
+      + "Tokens read from N persistent memory slots.",
+    why:
+      "Memory-augmented backbone — slots persist across batches "
+      + "for stronger long-context retention.",
+    inputs:
+      "x: (B, S, H). memory_size + num_heads params; memory bank "
+      + "is module-internal state.",
+    outputs: "y: (B, S, H).",
+    normalization: "Pre-norm on the input; memory bank is unnorm'd.",
+  },
+
+  // ----- Norm / projection / embed -----
+  brick_mlp: {
+    title: "mlp — Gated MLP (SwiGLU / GeGLU / etc.)",
+    what:
+      "Two-projection MLP with a configurable activation. Default "
+      + "is gated (swiglu/sigmoid×up), can switch to gelu/relu/silu "
+      + "via params.activation.",
+    why:
+      "Standard FFN. Most architectures alternate attention block "
+      + "+ mlp block in each layer.",
+    inputs:
+      "x: (B, S, H). intermediate_size (defaults 4*H), activation "
+      + "(glu/swiglu/geglu/reglu/gelu/silu/relu/relu2/sqrelu/xielu/"
+      + "mish), pre_norm, post_norm params.",
+    outputs: "y: (B, S, H). Shape-preserving.",
+    normalization:
+      "Pre-norm strongly recommended (RMSNorm). post_norm rare — "
+      + "only some non-Llama architectures (e.g. OLMo).",
+  },
+  brick_abs_pos_embed: {
+    title: "abs_pos_embed — Learned absolute positions",
+    what:
+      "Adds a learned (S, H) positional residual to the input "
+      + "before any attention block.",
+    why:
+      "Used by GPT-2 family and pre-RoPE architectures. Caps S at "
+      + "max_position_embeddings.",
+    inputs:
+      "x: (B, S, H). max_position_embeddings param (e.g. 1024 for "
+      + "GPT-2, 2048 for GPT-2 XL).",
+    outputs:
+      "y: (B, S, H) — x + learned_positions[:S].",
+    normalization:
+      "No norm needed inside; following attention block applies "
+      + "its own pre-norm.",
+  },
+  brick_per_layer_embed: {
+    title: "per_layer_embed — Gemma-4 per-layer scale",
+    what:
+      "Per-layer scaled embedding residual: adds a learned "
+      + "embedding scaled by a per-layer factor (1/sqrt(layer_idx)).",
+    why:
+      "Gemma 4 E2B/E4B convention. Stabilises gradient flow in "
+      + "very deep stacks.",
+    inputs:
+      "x: (B, S, H). layer_index + num_layers params. Scale factor "
+      + "computed at init.",
+    outputs: "y: (B, S, H).",
+    normalization: "No norm; this is a pure residual add.",
+  },
+
+  // ----- Adapters -----
+  adapter_merge_heads: {
+    title: "merge_heads — concatenate head dimension",
+    what:
+      "Reshape (B, S, nh, hd) → (B, S, nh*hd). Used between "
+      + "attention output and projection.",
+    why:
+      "Plumbing between split-head and dense projection spaces. "
+      + "Necessary when an attention brick emits per-head output "
+      + "but the next brick expects (B, S, H).",
+    inputs: "(B, S, nh, hd).",
+    outputs: "(B, S, nh*hd).",
+    normalization: "No norm. Pure reshape.",
+  },
+  adapter_split_heads: {
+    title: "split_heads — split into head dimension",
+    what:
+      "Reshape (B, S, nh*hd) → (B, S, nh, hd). Inverse of "
+      + "merge_heads.",
+    why:
+      "Use before a per-head op (e.g. RoPE applied per-head) when "
+      + "the upstream brick produces a flat residual.",
+    inputs: "(B, S, nh*hd).",
+    outputs: "(B, S, nh, hd).",
+    normalization: "No norm. Pure reshape.",
+  },
+  adapter_transpose_bnsd: {
+    title: "transpose_bnsd — BNSD ↔ BSND layout swap",
+    what:
+      "Swaps the seq and head axes: (B, S, nh, hd) ↔ (B, nh, S, hd).",
+    why:
+      "Some attention kernels expect (B, nh, S, hd); others "
+      + "(B, S, nh, hd). Drop this adapter when layouts disagree.",
+    inputs: "(B, S, nh, hd) or (B, nh, S, hd).",
+    outputs: "Other ordering of the same dims.",
+    normalization: "No norm.",
+  },
+  adapter_linear_bridge: {
+    title: "linear_bridge — H_in → H_out projection",
+    what:
+      "Plain nn.Linear used to bridge mismatched residual widths.",
+    why:
+      "Insert between two bricks when their residual H differs "
+      + "(e.g. an upstream MLA emits 2*H_residual due to "
+      + "decoupled-Q convention).",
+    inputs: "(B, S, H_in).",
+    outputs: "(B, S, H_out).",
+    normalization:
+      "Optional. Insert RMSNorm after if the projection changes "
+      + "scale significantly.",
+  },
+  adapter_rmsnorm: {
+    title: "rmsnorm — Root Mean Square Norm",
+    what:
+      "Standard RMSNorm: divides by sqrt(mean(x²) + eps) then "
+      + "scales by a learned gamma. No bias term, unlike LayerNorm.",
+    why:
+      "Pre-norm or post-norm gate. Most modern LLMs (Llama, Mistral, "
+      + "DeepSeek, Gemma) use RMSNorm pre-attention + pre-MLP.",
+    inputs: "(B, S, H).",
+    outputs: "(B, S, H). Shape-preserving.",
+    normalization:
+      "Insert BEFORE attention/MLP (pre-norm). post-norm is rare. "
+      + "eps default 1e-6.",
+  },
+  adapter_residual: {
+    title: "residual — explicit Add",
+    what:
+      "Adds the brick output back to the upstream residual stream. "
+      + "Implicit in most blocks; this adapter makes it explicit "
+      + "for advanced topologies.",
+    why:
+      "Use only when you've turned off a brick's implicit residual "
+      + "or you're stitching together parallel branches manually.",
+    inputs: "Two tensors of the same shape.",
+    outputs: "Sum of inputs.",
+    normalization: "None.",
+  },
 };
 
 export interface HelpIconProps {
@@ -445,85 +911,248 @@ export interface HelpModalProps {
 
 export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
   const entry = HELP_TOPICS[topic];
+  
   return (
-    <div data-testid="help-modal-backdrop"
-         role="dialog" aria-modal="true"
-         onClick={onClose}
-         style={{
-           position: "fixed", inset: 0,
-           background: "rgba(15,23,42,0.45)",
-           display: "flex", alignItems: "center", justifyContent: "center",
-           zIndex: 150, fontFamily: "system-ui, sans-serif",
-         }}>
-      <div data-testid={`help-modal-${topic}`}
-           onClick={(e) => e.stopPropagation()}
-           style={{
-             background: "white", borderRadius: 6, padding: 20,
-             width: 520, maxHeight: "80vh", overflowY: "auto",
-             boxShadow: "0 10px 30px rgba(15,23,42,0.2)",
-           }}>
-        <header style={{ display: "flex", justifyContent: "space-between",
-                          alignItems: "center", marginBottom: 12 }}>
-          <h3 data-testid="help-modal-title"
-              style={{ margin: 0, fontSize: 15 }}>
+    <div
+      data-testid="help-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15, 23, 42, 0.75)",
+        backdropFilter: "blur(8px)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 150,
+        fontFamily: "system-ui, sans-serif",
+      }}
+    >
+      <div
+        data-testid={`help-modal-${topic}`}
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "rgba(30, 41, 59, 0.95)",
+          backdropFilter: "blur(16px)",
+          border: "1px solid rgba(255, 255, 255, 0.1)",
+          borderRadius: "12px",
+          padding: "24px",
+          width: "520px",
+          maxHeight: "85vh",
+          overflowY: "auto",
+          boxShadow: "0 20px 40px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "16px",
+        }}
+      >
+        <header
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            borderBottom: "1px solid rgba(255, 255, 255, 0.1)",
+            paddingBottom: "12px",
+          }}
+        >
+          <h3
+            data-testid="help-modal-title"
+            style={{
+              margin: 0,
+              fontSize: "16px",
+              fontWeight: "bold",
+              color: "#22d3ee", // Vibrant cyan
+              letterSpacing: "0.2px",
+            }}
+          >
             {entry?.title ?? topic}
           </h3>
-          <button data-testid="help-modal-close" onClick={onClose}
-                  style={{ background: "none", border: "none",
-                           cursor: "pointer", fontSize: 18 }}>
+          <button
+            data-testid="help-modal-close"
+            onClick={onClose}
+            style={{
+              background: "rgba(255, 255, 255, 0.05)",
+              border: "1px solid rgba(255, 255, 255, 0.1)",
+              borderRadius: "50%",
+              width: "32px",
+              height: "32px",
+              cursor: "pointer",
+              fontSize: "20px",
+              color: "#94a3b8",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              lineHeight: 1,
+              transition: "all 0.15s ease",
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = "rgba(239, 68, 68, 0.2)";
+              e.currentTarget.style.color = "#f87171";
+              e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.3)";
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = "rgba(255, 255, 255, 0.05)";
+              e.currentTarget.style.color = "#94a3b8";
+              e.currentTarget.style.borderColor = "rgba(255, 255, 255, 0.1)";
+            }}
+          >
             ×
           </button>
         </header>
-        {entry ? (
-          <>
-            <Section label="What" testid="help-modal-what">
-              {entry.what}
-            </Section>
-            <Section label="Why" testid="help-modal-why">
-              {entry.why}
-            </Section>
-            {entry.example && (
-              <Section label="Example" testid="help-modal-example">
-                <code style={{ fontFamily: "ui-monospace, monospace",
-                               fontSize: 12,
-                               background: "#f3f4f6", padding: "2px 4px",
-                               borderRadius: 2 }}>
-                  {entry.example}
-                </code>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+          {entry ? (
+            <>
+              <Section label="What" testid="help-modal-what">
+                {entry.what}
               </Section>
-            )}
-            {entry.reference && (
-              <Section label="Reference" testid="help-modal-reference">
-                <a href={entry.reference} target="_blank"
-                   rel="noopener noreferrer"
-                   style={{ color: "#2563eb" }}>
-                  {entry.reference}
-                </a>
+              <Section label="Why" testid="help-modal-why">
+                {entry.why}
               </Section>
-            )}
-          </>
-        ) : (
-          <p data-testid="help-modal-missing"
-             style={{ color: "#6b7280", margin: 0 }}>
-            (No explanation for <code>{topic}</code> yet.)
-          </p>
-        )}
+              {entry.inputs && (
+                <Section label="Inputs" testid="help-modal-inputs">
+                  {entry.inputs}
+                </Section>
+              )}
+              {entry.outputs && (
+                <Section label="Outputs" testid="help-modal-outputs">
+                  {entry.outputs}
+                </Section>
+              )}
+              {entry.normalization && (
+                <Section label="Normalization"
+                         testid="help-modal-normalization">
+                  {entry.normalization}
+                </Section>
+              )}
+              {entry.example && (
+                <Section label="Example" testid="help-modal-example">
+                  <code
+                    style={{
+                      fontFamily: "ui-monospace, monospace",
+                      fontSize: "12px",
+                      background: "rgba(15, 23, 42, 0.6)",
+                      color: "#a7f3d0", // Vibrant light green/mint
+                      padding: "4px 8px",
+                      borderRadius: "6px",
+                      border: "1px solid rgba(255, 255, 255, 0.05)",
+                      display: "block",
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    {entry.example}
+                  </code>
+                </Section>
+              )}
+              {entry.reference && (
+                <Section label="Reference" testid="help-modal-reference">
+                  <a
+                    href={entry.reference}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{
+                      color: "#38bdf8",
+                      textDecoration: "underline",
+                      fontSize: "13px",
+                      transition: "color 0.15s ease",
+                    }}
+                    onMouseOver={(e) => {
+                      e.currentTarget.style.color = "#7dd3fc";
+                    }}
+                    onMouseOut={(e) => {
+                      e.currentTarget.style.color = "#38bdf8";
+                    }}
+                  >
+                    {entry.reference}
+                  </a>
+                </Section>
+              )}
+            </>
+          ) : (
+            <p
+              data-testid="help-modal-missing"
+              style={{ color: "#94a3b8", margin: 0, fontSize: "13px" }}
+            >
+              (No explanation for <code>{topic}</code> yet.)
+            </p>
+          )}
+        </div>
+
+        <footer
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            borderTop: "1px solid rgba(255, 255, 255, 0.1)",
+            paddingTop: "16px",
+            marginTop: "8px",
+          }}
+        >
+          <button
+            data-testid="help-modal-got-it"
+            onClick={onClose}
+            style={{
+              background: "#0891b2", // Cyan base
+              color: "white",
+              border: "none",
+              borderRadius: "8px",
+              padding: "10px 24px",
+              fontSize: "14px",
+              fontWeight: "bold",
+              cursor: "pointer",
+              transition: "all 0.15s cubic-bezier(0.4, 0, 0.2, 1)",
+              boxShadow: "0 4px 12px rgba(8, 145, 178, 0.2)",
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = "#06b6d4";
+              e.currentTarget.style.transform = "translateY(-1px)";
+              e.currentTarget.style.boxShadow = "0 6px 16px rgba(34, 211, 238, 0.4)";
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = "#0891b2";
+              e.currentTarget.style.transform = "translateY(0)";
+              e.currentTarget.style.boxShadow = "0 4px 12px rgba(8, 145, 178, 0.2)";
+            }}
+          >
+            Got It
+          </button>
+        </footer>
       </div>
     </div>
   );
 }
 
 function Section({
-  label, testid, children,
-}: { label: string; testid: string; children: React.ReactNode }): JSX.Element {
+  label,
+  testid,
+  children,
+}: {
+  label: string;
+  testid: string;
+  children: React.ReactNode;
+}): JSX.Element {
   return (
-    <section style={{ marginBottom: 10 }}>
-      <div style={{ color: "#6b7280", fontSize: 11,
-                    textTransform: "uppercase", letterSpacing: 0.5,
-                    marginBottom: 2 }}>
+    <section style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+      <div
+        style={{
+          color: "#38bdf8", // Premium light blue for section tags
+          fontSize: "10px",
+          fontWeight: "bold",
+          textTransform: "uppercase",
+          letterSpacing: "0.8px",
+        }}
+      >
         {label}
       </div>
-      <div data-testid={testid} style={{ color: "#111827", fontSize: 13 }}>
+      <div
+        data-testid={testid}
+        style={{
+          color: "#f1f5f9", // Bright white for premium readability
+          fontSize: "13px",
+          lineHeight: "1.6",
+        }}
+      >
         {children}
       </div>
     </section>
