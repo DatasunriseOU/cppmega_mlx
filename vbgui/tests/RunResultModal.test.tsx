@@ -24,6 +24,20 @@ const REPORT_FAIL: RunReport = {
   ],
 };
 
+// V7-H38: stage with status=ok but warnings>0 — must render in amber
+// (severity=warning) with a ⚠N badge so the user notices even though
+// the stage technically succeeded.
+const REPORT_WARN: RunReport = {
+  overall_status: "ok",
+  total_elapsed_ms: 5.5,
+  stages: [
+    { name: "parse",             status: "ok", elapsed_ms: 0.4 },
+    { name: "verify_build_spec", status: "ok", elapsed_ms: 1.0,
+      warnings: 3 },
+    { name: "build_model",       status: "ok", elapsed_ms: 4.0 },
+  ],
+};
+
 const REPORT_CANCELLED: RunReport = {
   overall_status: "cancelled",
   total_elapsed_ms: 20.0,
@@ -32,6 +46,29 @@ const REPORT_CANCELLED: RunReport = {
       aborted: true, num_steps: 3, losses: [5.5, 5.2, 5.1] },
   ],
 };
+
+describe("V7-H38 RunResultModal severity colours", () => {
+  it("status cell carries data-severity='warning' when stage has warnings>0",
+     () => {
+    render(<RunResultModal report={REPORT_WARN} onClose={() => {}} />);
+    const cell = screen.getByTestId(
+      "run-result-status-verify_build_spec");
+    expect(cell.getAttribute("data-severity")).toBe("warning");
+    expect(screen.getByTestId(
+      "run-result-warnings-verify_build_spec").textContent).toBe("⚠3");
+  });
+  it("status cell carries data-severity='ok' for clean stages", () => {
+    render(<RunResultModal report={REPORT_WARN} onClose={() => {}} />);
+    expect(screen.getByTestId(
+      "run-result-status-parse").getAttribute("data-severity")).toBe("ok");
+  });
+  it("status cell carries data-severity='fail' for failed stages", () => {
+    render(<RunResultModal report={REPORT_FAIL} onClose={() => {}} />);
+    expect(screen.getByTestId(
+      "run-result-status-dry_forward").getAttribute("data-severity"))
+      .toBe("fail");
+  });
+});
 
 describe("RunResultModal", () => {
   it("returns null when there's nothing to show", () => {

@@ -44,6 +44,22 @@ const COLORS = {
   ok: "#10b981", fail: "#dc2626", skipped: "#9ca3af", cancelled: "#f59e0b",
 } as const;
 
+// V7-H38: severity-coloured palette used when a stage has warnings>0
+// and when rendering verify-style diagnostic lines (error/warn/info).
+const SEVERITY_COLORS = {
+  error: "#dc2626", warning: "#d97706", info: "#2563eb",
+} as const;
+
+/** V7-H38: status-cell colour reflects warnings — an "ok" stage with
+ *  warnings rendered in amber so the user notices verify-found issues
+ *  even though the stage technically succeeded. */
+function statusCellColor(
+  status: keyof typeof COLORS, warnings: number,
+): string {
+  if (status === "ok" && warnings > 0) return SEVERITY_COLORS.warning;
+  return COLORS[status];
+}
+
 // V3-4: keys excluded from the visible extras dl because they're
 // redundant with the row's status / error rendering.
 const EXTRAS_RESERVED = new Set<string>([
@@ -230,14 +246,35 @@ export function RunResultModal({
                           outlineOffset: isFirstFailed ? -2 : undefined,
                         }}>
                       <td style={td}>
-                        <span style={{ color: COLORS[s.status],
+                        <span data-testid={`run-result-status-icon-${s.name}`}
+                              style={{ color:
+                                statusCellColor(s.status,
+                                                s.warnings ?? 0),
                                        fontWeight: 700 }}>
                           {ICONS[s.status]}
                         </span>
                       </td>
                       <td style={td}>{s.name}</td>
-                      <td style={{ ...td, color: COLORS[s.status] }}>
+                      <td data-testid={`run-result-status-${s.name}`}
+                          data-severity={
+                            s.status === "ok" && (s.warnings ?? 0) > 0
+                              ? "warning" : s.status}
+                          style={{ ...td,
+                                   color: statusCellColor(
+                                     s.status, s.warnings ?? 0) }}>
                         {s.status}
+                        {s.status === "ok" && (s.warnings ?? 0) > 0 && (
+                          <span data-testid={
+                                  `run-result-warnings-${s.name}`}
+                                style={{ marginLeft: 4, fontSize: 10,
+                                         padding: "1px 4px",
+                                         background:
+                                           SEVERITY_COLORS.warning,
+                                         color: "white",
+                                         borderRadius: 3 }}>
+                            ⚠{s.warnings}
+                          </span>
+                        )}
                       </td>
                       <td style={{ ...td, textAlign: "right" }}>
                         {s.elapsed_ms.toFixed(1)}
