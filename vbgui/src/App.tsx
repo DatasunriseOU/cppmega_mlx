@@ -10,6 +10,7 @@ import { SweepPanel } from "@/components/SweepPanel";
 import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
 import { TransplantBar } from "@/components/TransplantBar";
 import { InsertIntoEdgeBar } from "@/components/InsertIntoEdgeBar";
+import { ParallelComposeBar } from "@/components/ParallelComposeBar";
 import { useGalleryCache } from "@/hooks/useGalleryCache";
 import { Palette } from "@/components/Palette";
 import { Sidebar } from "@/components/Sidebar";
@@ -565,6 +566,37 @@ export function App(): JSX.Element {
   useEffect(() => { if (!trainInFlight) setTrainPaused(false); },
            [trainInFlight]);
 
+  // V7-H05: live per-step training events streamed over /ws/train/{run_id}.
+  // The bus pushes {step, loss, lr, overflow} after each opt.update so
+  // the UI can render the loss curve as it grows, not only on
+  // pipeline.run completion.
+  const [liveTrainEvents, setLiveTrainEvents] = useState<
+    Array<{ step: number; loss: number; lr?: number;
+            overflow?: boolean }>>([]);
+  useEffect(() => {
+    if (!trainRunId || !trainInFlight) return;
+    const base = ((import.meta.env.VITE_BACKEND_URL as string | undefined)
+                  ?? "http://127.0.0.1:8765").replace(/^http/, "ws");
+    let socket: WebSocket;
+    setLiveTrainEvents([]);
+    try {
+      socket = new WebSocket(`${base}/ws/train/${trainRunId}`);
+    } catch {
+      return;
+    }
+    socket.onmessage = (msg) => {
+      try {
+        const frame = JSON.parse(msg.data);
+        if (frame.event) {
+          setLiveTrainEvents((prev) => [...prev, frame.event]);
+        } else if (frame.finish) {
+          socket.close();
+        }
+      } catch { /* ignore malformed */ }
+    };
+    return () => { try { socket.close(); } catch { /* noop */ } };
+  }, [trainRunId, trainInFlight]);
+
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
     if (!chosen) return;
@@ -700,6 +732,32 @@ export function App(): JSX.Element {
                             display: "flex", flexDirection: "column",
                             minHeight: 0 }}>
                 <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
+                <ParallelComposeBar
+                  onCompose={(composeNodes, composeEdges) => {
+                    setNodes(composeNodes.map((cn) => ({
+                      id: cn.id,
+                      type: "brick",
+                      position: cn.position,
+                      data: { kind: cn.kind,
+                              params: cn.params ?? {} } as never,
+                    })));
+                    setEdges(composeEdges.map((ce) => ({
+                      id: `${ce.source}->${ce.target}`,
+                      source: ce.source,
+                      target: ce.target,
+                      data: { severity: "info" },
+                    })));
+                    // Rebind head_outputs to the join's downstream
+                    // norm so verify_build_spec finds the loss head.
+                    const last = composeNodes[composeNodes.length - 1];
+                    if (last) {
+                      dispatch({ type: "loss.set", loss: {
+                        ...spec.loss,
+                        head_outputs: [last.id],
+                      }});
+                    }
+                  }}
+                />
                 <InsertIntoEdgeBar
                   edges={edges.map((e) => ({
                     source: e.source, target: e.target,
@@ -1059,6 +1117,34 @@ export function App(): JSX.Element {
           )}
         </div>
         <BottomStrip state={spec} fusedRegionCount={0} />
+        {trainInFlight && liveTrainEvents.length > 0 && (
+          <div data-testid="live-train-strip"
+               style={{ position: "fixed", bottom: 36, right: 12,
+                        background: "white", border: "1px solid #e5e7eb",
+                        borderRadius: 4, padding: 8, fontSize: 10,
+                        fontFamily: "monospace",
+                        boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
+                        zIndex: 30, minWidth: 180 }}>
+            <div data-testid="live-train-strip-header"
+                 style={{ fontWeight: 600, marginBottom: 4 }}>
+              live train · step {liveTrainEvents.length}
+            </div>
+            <div data-testid="live-train-strip-last-loss">
+              loss: {liveTrainEvents[liveTrainEvents.length - 1].loss
+                .toFixed(4)}
+            </div>
+            <div data-testid="live-train-strip-last-lr">
+              lr: {liveTrainEvents[liveTrainEvents.length - 1].lr
+                ?.toFixed(6) ?? "?"}
+            </div>
+            {liveTrainEvents[liveTrainEvents.length - 1].overflow && (
+              <div data-testid="live-train-strip-overflow"
+                   style={{ color: "#dc2626" }}>
+                ⚠ scaler overflow
+              </div>
+            )}
+          </div>
+        )}
         <RunResultModal report={runReport} error={runError}
                         onClose={() => { setRunReport(null);
                                          setRunError(null); }} />

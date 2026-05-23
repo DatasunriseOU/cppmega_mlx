@@ -72,6 +72,27 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
       "Attention memory scales O(B*S^2) for vanilla SDPA. The " +
       "GUI default S=64 keeps mini runs interactive.",
   },
+  // ----- parallel composition -----
+  parallel_block: {
+    title: "Parallel-block composition (tiny-aya style)",
+    what:
+      "Constructs a graph where a single input fans out into TWO " +
+      "parallel computation branches that are then joined by an " +
+      "additive residual + final norm. The two branches see the " +
+      "same input tensor but their outputs are summed.",
+    why:
+      "Parallel attention + MLP is the defining feature of Aya-style " +
+      "and GPT-J-style architectures (Wang & Komatsuzaki 2021). " +
+      "Mixing-and-matching what runs in each branch is one of the " +
+      "fastest small-model ablations. The button-driven shortcut " +
+      "exists because manually drawing parallel edges through React " +
+      "Flow drag-handles is flaky under Playwright; the resulting " +
+      "graph is identical to what manual edge-drawing would yield.",
+    example:
+      "tiny-aya: aya_input → {aya_attn, aya_mlp} → aya_join " +
+      "(residual) → aya_norm. Two paths from input, one join, one " +
+      "final norm.",
+  },
   // ----- insert into edge -----
   insert_into_edge: {
     title: "Insert brick into an edge",
