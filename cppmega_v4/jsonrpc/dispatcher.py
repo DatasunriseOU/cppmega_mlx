@@ -67,6 +67,10 @@ from cppmega_v4.jsonrpc.loss_surface_method import (
     LossSurfaceParams,
     loss_surface_run,
 )
+from cppmega_v4.jsonrpc.cache_metrics_method import (
+    CacheMetricsParams,
+    cache_metrics,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -195,6 +199,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "loss_surface.run": (
         LossSurfaceParams,
         lambda p, c: loss_surface_run(p, cache=c),
+    ),
+    "cache.metrics": (
+        CacheMetricsParams,
+        lambda p, c: cache_metrics(p, cache=c),
     ),
     "tokenizer.roundtrip_text": (
         TokenizerRoundtripTextParams,
