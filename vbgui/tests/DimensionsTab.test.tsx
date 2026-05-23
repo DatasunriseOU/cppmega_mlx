@@ -89,4 +89,35 @@ describe("DimensionsTab", () => {
     expect(screen.queryByTestId(
       "dim-row-attn-head_dim-apply")).toBeNull();
   });
+
+  it("V7-M36: flow trace renders an ordered list of every inference step", () => {
+    render(<DimensionsTab log={[
+      { brick: "attn", param: "num_heads", value: 4,
+        source: "auto", reason: "H/head_dim" },
+      { brick: "attn", param: "head_dim", value: 64,
+        source: "user", reason: "spec override" },
+      { brick: "mlp", param: "hidden_size", value: 128,
+        source: "auto", reason: "from dim_env.H" },
+    ]} />);
+    const list = screen.getByTestId("dimensions-flow-trace-list");
+    expect(list).toBeDefined();
+    expect(screen.getByTestId("flow-step-0").getAttribute("data-brick"))
+      .toBe("attn");
+    expect(screen.getByTestId("flow-step-0").getAttribute("data-source"))
+      .toBe("auto");
+    expect(screen.getByTestId("flow-step-0").textContent)
+      .toContain("attn.num_heads");
+    expect(screen.getByTestId("flow-step-2").getAttribute("data-brick"))
+      .toBe("mlp");
+  });
+
+  it("V7-M36: flow trace summary shows the step count", () => {
+    render(<DimensionsTab log={[
+      { brick: "a", param: "p", value: 1, source: "auto", reason: "r" },
+      { brick: "b", param: "p", value: 2, source: "user", reason: "r" },
+    ]} />);
+    const trace = screen.getByTestId("dimensions-flow-trace");
+    expect(trace.querySelector("summary")!.textContent)
+      .toContain("2 steps");
+  });
 });

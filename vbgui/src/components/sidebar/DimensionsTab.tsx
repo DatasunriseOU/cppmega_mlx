@@ -121,6 +121,39 @@ export function DimensionsTab({
           )}
         </tbody>
       </table>
+
+      {/* V7-M36 — inference_steps flow trace: same entries, but rendered
+          as an ordered sequence the architect can walk step by step.
+          Numbered prefix + colorised source so it reads like a small
+          stack trace of how each parameter was resolved. */}
+      <details data-testid="dimensions-flow-trace"
+               style={{ marginTop: 12 }}>
+        <summary style={{ cursor: "pointer", fontWeight: 600,
+                          color: "#374151" }}>
+          Flow trace ({log.length} step{log.length === 1 ? "" : "s"})
+        </summary>
+        <ol data-testid="dimensions-flow-trace-list"
+            style={{ margin: "6px 0 0 0", paddingLeft: 24,
+                     fontFamily: "ui-monospace, monospace",
+                     fontSize: 11, color: "#111827" }}>
+          {log.map((e, i) => (
+            <li key={`flow-${e.brick}-${e.param}-${i}`}
+                data-testid={`flow-step-${i}`}
+                data-brick={e.brick}
+                data-param={e.param}
+                data-source={e.source}
+                style={{ marginBottom: 2,
+                         color: e.source === "auto"
+                           ? "#1e40af" : "#111827" }}>
+              <strong>{e.brick}.{e.param}</strong> ={" "}
+              <code>{String(e.value)}</code>{" "}
+              <em style={{ color: "#6b7280" }}>
+                ({e.source}; {e.reason})
+              </em>
+            </li>
+          ))}
+        </ol>
+      </details>
     </div>
   );
 }
