@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import mlx.core as mx
 
 from cppmega_mlx.runtime.path_c_physical_abi import (
     PathCLogicalBufferOwner,
@@ -13,6 +14,7 @@ from cppmega_mlx.runtime.path_c_physical_abi import (
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_map,
     validate_physical_abi_runtime_bindings,
+    write_into_bank_slot,
 )
 
 
@@ -436,3 +438,25 @@ def test_runtime_binding_rejects_logical_tensor_substitutes_for_banked_abi() -> 
     assert payload["missing_bank_buffers"] == ["path_c_float32_abi_bank"]
     assert payload["unexpected_buffers"] == ["hidden", "out"]
     assert any("missing caller-owned bank buffer" in error for error in payload["errors"])
+
+
+def test_write_into_bank_slot_rejects_dtype_mismatch() -> None:
+    mapping = {
+        "target_ids": {
+            "bank": "path_c_int32_abi_bank",
+            "dtype": "int32",
+            "offset": 0,
+            "shape": (4,),
+            "logical_shape": (4,),
+            "size": 4,
+        },
+    }
+    buffers = {"path_c_int32_abi_bank": mx.zeros((4,), dtype=mx.int32)}
+
+    with pytest.raises(ValueError, match="dtype 'float32'.*expected 'int32'"):
+        write_into_bank_slot(
+            mapping,
+            buffers,
+            "target_ids",
+            mx.array([1.5, 2.5, 3.5, 4.5], dtype=mx.float32),
+        )

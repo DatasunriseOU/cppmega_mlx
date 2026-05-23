@@ -633,6 +633,13 @@ def write_into_bank_slot(
     bank = bank_buffers[bank_name]
     offset = int(info.get("offset", 0) or 0)
     size = int(info.get("size", 1) or 1)
+    expected_dtype = str(info.get("dtype", ""))
+    actual_dtype = _dtype_of(value)
+    if expected_dtype and actual_dtype != expected_dtype:
+        raise ValueError(
+            f"value for {logical_name!r} has dtype {actual_dtype!r}, "
+            f"expected {expected_dtype!r}"
+        )
     # Flatten the value into a 1-D array of length ``size``.
     expected_size = int(prod(tuple(int(dim) for dim in tuple(getattr(value, "shape", ())))))
     if expected_size != size:

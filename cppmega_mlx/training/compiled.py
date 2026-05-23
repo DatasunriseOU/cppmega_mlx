@@ -710,7 +710,15 @@ class PathCFusedPlusEagerTrainingRuntime:
                 self.last_fused_value_and_grad_payload = vg_payload
                 raise
 
-        merged_mode = bool(self.in_region_parameter_bank_aliases)
+        # Bank residency alone is not enough to consume fused gradients:
+        # the fused train-block also needs per-batch runtime inputs
+        # (hidden_entry, target_ids, target_mask) written into the ABI banks.
+        # Without the suffix-bypass custom-function surface, the artifact's
+        # value_and_grad would run against stale/zero runtime inputs and would
+        # silently overwrite correct eager grads with bogus bank values. Fail
+        # closed to the original warmup+eager behavior unless suffix-bypass
+        # handled the step above.
+        merged_mode = False
 
         # In merged mode, push optimizer-replaced parameters into bank slots
         # before the fused kernel reads them. The first step's sync is a no-op
@@ -745,6 +753,7 @@ class PathCFusedPlusEagerTrainingRuntime:
             "missing_parameter_names": (),
             "bank_sync_status": bank_sync_status,
             "error": None,
+            "suffix_bypass_active": False,
         }
 
         fused_grads: Any | None = None
@@ -832,18 +841,39 @@ class PathCFusedPlusEagerTrainingRuntime:
         inner = dict(self.artifact.value_and_grad_contract())
         inner_coverage = inner.get("full_model_gradient_coverage")
         coverage = dict(inner_coverage) if isinstance(inner_coverage, Mapping) else {}
-        merged_mode_active = bool(self.in_region_parameter_bank_aliases)
+        bank_residency_ready = bool(self.in_region_parameter_bank_aliases)
+        suffix_bypass_available = bool(
+            self.fused_suffix_loss_fn is not None
+            and self.in_region_parameter_bank_aliases
+        )
         reason = (
-            "mixed-mode training runtime returns full-model grads via merged "
-            "bank-resident fused grads + eager residual grads: in-region "
-            "parameters are bank views and the fused artifact populates "
-            "their gradients into the same bank storage"
-            if merged_mode_active
+            "mixed-mode training runtime returns full-model grads via "
+            "suffix-bypass: in-region parameters and hidden-entry cotangents "
+            "come from the fused custom-function VJP, residual/prefix grads "
+            "come from MLX eager autograd"
+            if suffix_bypass_available
             else (
-                "mixed-mode training runtime returns full-model grads: "
-                "fused in-region warmup is observable, residual grads "
-                "come from the trainer's eager value_and_grad closure"
+                "mixed-mode training runtime returns full-model grads from "
+                "the trainer's eager value_and_grad closure; bank-resident "
+                "fused gradients are disabled because no verified runtime "
+                "input writer / suffix-bypass bridge is active"
+                if bank_residency_ready
+                else (
+                    "mixed-mode training runtime returns full-model grads: "
+                    "fused in-region warmup is observable, residual grads "
+                    "come from the trainer's eager value_and_grad closure"
+                )
             )
+        )
+        overlay_parameter_count = (
+            len(self.in_region_parameter_bank_aliases)
+            if suffix_bypass_available
+            else 0
+        )
+        overlay_parameter_names = (
+            tuple(sorted(self.in_region_parameter_bank_aliases))
+            if suffix_bypass_available
+            else ()
         )
         coverage.update(
             {
@@ -858,17 +888,10 @@ class PathCFusedPlusEagerTrainingRuntime:
                 "fused_in_region_parameter_count": len(
                     self.in_region_parameter_names
                 ),
-                "parameter_bank_residency_active": merged_mode_active,
-                "merged_bank_resident_parameter_count": (
-                    len(self.in_region_parameter_bank_aliases)
-                    if merged_mode_active
-                    else 0
-                ),
-                "merged_bank_resident_parameter_names": (
-                    tuple(sorted(self.in_region_parameter_bank_aliases))
-                    if merged_mode_active
-                    else ()
-                ),
+                "parameter_bank_residency_active": bank_residency_ready,
+                "bank_grad_overlay_active": suffix_bypass_available,
+                "merged_bank_resident_parameter_count": overlay_parameter_count,
+                "merged_bank_resident_parameter_names": overlay_parameter_names,
             }
         )
         merged = {
@@ -893,13 +916,9 @@ class PathCFusedPlusEagerTrainingRuntime:
             "parameter_bank_residency_active": bool(
                 self.in_region_parameter_bank_aliases
             ),
-            "merged_bank_resident_parameter_count": len(
-                self.in_region_parameter_bank_aliases
-            ),
-            "suffix_bypass_available": bool(
-                self.fused_suffix_loss_fn is not None
-                and self.in_region_parameter_bank_aliases
-            ),
+            "bank_grad_overlay_active": suffix_bypass_available,
+            "merged_bank_resident_parameter_count": overlay_parameter_count,
+            "suffix_bypass_available": suffix_bypass_available,
             "runtime_class": type(self).__name__,
         }
         return merged

@@ -4809,6 +4809,10 @@ def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_hone
     assert coverage["full_model_gradient_tree_ready"] is True
     assert coverage["gradient_scope"] == "full_model_via_mixed_mode"
     assert coverage["missing_parameter_count"] == 0
+    assert value_and_grad_contract["suffix_bypass_available"] is False
+    assert value_and_grad_contract["bank_grad_overlay_active"] is False
+    assert value_and_grad_contract["merged_bank_resident_parameter_count"] == 0
+    assert coverage["bank_grad_overlay_active"] is False
     assert value_and_grad_contract["delegates_to_eager_loss_and_grad"] is False
     assert value_and_grad_contract["hidden_packing_performed"] is False
     inner = model.path_c_fused_train_block_artifact.value_and_grad_contract()

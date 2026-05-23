@@ -565,7 +565,7 @@ class _FakeBankOwner:
         }
 
 
-def test_merged_mode_overlays_bank_resident_grads_onto_eager_tree() -> None:
+def test_bank_residency_without_suffix_bypass_fails_closed_to_eager_grads() -> None:
     art = _FakeFusedArtifactWithBankResidentGrads()
     # Two in-region params, each with a unique sentinel grad value the runtime
     # must surface to the trainer (replacing whatever the eager closure
@@ -631,39 +631,34 @@ def test_merged_mode_overlays_bank_resident_grads_onto_eager_tree() -> None:
         batch={},
         loss_and_grad=closure,
     )
-    # Sync callable was invoked exactly once.
-    assert len(sync_calls) == 1
-    # The fused artifact value_and_grad was invoked with bank_owner threaded in.
-    assert len(art.value_and_grad_calls) == 1
-    assert (
-        art.value_and_grad_calls[-1]["kwargs"].get("bank_owner") is bank_owner
-    )
-    # In-region grads now come from the fused tree (sentinel values), not the
-    # eager closure (which produced 99s).
+    # Without suffix-bypass / runtime-input writing, the runtime must not sync
+    # params into banks, must not call artifact.value_and_grad, and must not
+    # overlay fused grad slots. That path would run against stale hidden/target
+    # bank inputs and corrupt the eager gradients.
+    assert len(sync_calls) == 0
+    assert len(art.value_and_grad_calls) == 0
+    assert len(art.forward_calls) == 1
     flat_grads = dict(tree_flatten(grads))
-    assert flat_grads["layers.10.block.D"].tolist() == [1.0, 2.0, 3.0, 4.0]
-    assert flat_grads["layers.11.block.D"].tolist() == [5.0, 6.0, 7.0, 8.0]
+    assert flat_grads["layers.10.block.D"].tolist() == [99.0, 99.0, 99.0, 99.0]
+    assert flat_grads["layers.11.block.D"].tolist() == [99.0, 99.0, 99.0, 99.0]
     # Out-of-region grads are unchanged (eager wins).
     assert flat_grads["layers.0.block.q_proj.weight"].shape == (16, 16)
     assert flat_grads["lm_head.weight"].shape == (256, 16)
-    # Telemetry reflects merged-mode behaviour.
-    assert runtime.last_fused_warmup_payload["attempted"] is False
+    # Telemetry reflects fail-closed warmup+eager behaviour.
+    assert runtime.last_fused_warmup_payload["attempted"] is True
     vg = runtime.last_fused_value_and_grad_payload
-    assert vg["attempted"] is True
-    assert vg["completed"] is True
-    assert vg["elapsed_ns"] >= 0
-    assert vg["merged_parameter_count"] == 2
-    assert vg["merged_parameter_names"] == (
-        "layers.10.block.D",
-        "layers.11.block.D",
-    )
+    assert vg["attempted"] is False
+    assert vg["completed"] is False
+    assert vg["merged_parameter_count"] == 0
+    assert vg["merged_parameter_names"] == ()
     assert vg["missing_parameter_names"] == ()
-    assert vg["bank_sync_status"] == {"status": "ok", "synced": ["x"], "skipped": []}
+    assert vg["bank_sync_status"] is None
+    assert vg["suffix_bypass_active"] is False
 
 
-def test_merged_mode_records_missing_bank_grads_without_dropping_coverage() -> None:
-    """If the fused tree is missing a bank-bound parameter, the merger keeps
-    the eager grad in place and records the missing parameter for telemetry."""
+def test_bank_residency_without_suffix_bypass_never_reads_partial_bank_grads() -> None:
+    """Partial fused grad trees are ignored until suffix-bypass supplies
+    verified runtime inputs for the kernel."""
 
     art = _FakeFusedArtifactWithBankResidentGrads()
     # Only one of the two in-region params has a bank-resident grad.
@@ -696,14 +691,15 @@ def test_merged_mode_records_missing_bank_grads_without_dropping_coverage() -> N
         loss_and_grad=closure,
     )
     flat_grads = dict(tree_flatten(grads))
-    # Bank-resident grad replaced the eager one.
-    assert flat_grads["layers.10.block.D"].tolist() == [1.0, 2.0, 3.0, 4.0]
-    # Missing-from-fused grad kept the eager value.
+    # Even the available bank-resident grad is ignored in fail-closed mode;
+    # eager remains the source of truth for all parameters.
+    assert flat_grads["layers.10.block.D"].tolist() == [0.0, 0.0, 0.0, 0.0]
     assert flat_grads["layers.11.block.D"].tolist() == [42.0, 42.0, 42.0, 42.0]
     vg = runtime.last_fused_value_and_grad_payload
-    assert vg["merged_parameter_count"] == 1
-    assert vg["merged_parameter_names"] == ("layers.10.block.D",)
-    assert vg["missing_parameter_names"] == ("layers.11.block.D",)
+    assert vg["merged_parameter_count"] == 0
+    assert vg["merged_parameter_names"] == ()
+    assert vg["missing_parameter_names"] == ()
+    assert vg["suffix_bypass_active"] is False
 
 
 def test_merged_mode_contract_exposes_bank_residency_signals() -> None:
@@ -719,16 +715,14 @@ def test_merged_mode_contract_exposes_bank_residency_signals() -> None:
     )
     contract = runtime.value_and_grad_contract()
     assert contract["parameter_bank_residency_active"] is True
-    assert contract["merged_bank_resident_parameter_count"] == 2
+    assert contract["bank_grad_overlay_active"] is False
+    assert contract["merged_bank_resident_parameter_count"] == 0
     coverage = contract["full_model_gradient_coverage"]
     assert coverage["parameter_bank_residency_active"] is True
-    assert coverage["merged_bank_resident_parameter_count"] == 2
-    assert coverage["merged_bank_resident_parameter_names"] == (
-        "layers.10.block.D",
-        "layers.11.block.D",
-    )
-    # Reason includes the merged-mode phrasing.
-    assert "bank-resident" in coverage["reason"]
+    assert coverage["bank_grad_overlay_active"] is False
+    assert coverage["merged_bank_resident_parameter_count"] == 0
+    assert coverage["merged_bank_resident_parameter_names"] == ()
+    assert "disabled" in coverage["reason"]
 
 
 def test_warmup_mode_contract_clears_bank_residency_signals() -> None:
@@ -741,9 +735,11 @@ def test_warmup_mode_contract_clears_bank_residency_signals() -> None:
     )
     contract = runtime.value_and_grad_contract()
     assert contract["parameter_bank_residency_active"] is False
+    assert contract["bank_grad_overlay_active"] is False
     assert contract["merged_bank_resident_parameter_count"] == 0
     coverage = contract["full_model_gradient_coverage"]
     assert coverage["parameter_bank_residency_active"] is False
+    assert coverage["bank_grad_overlay_active"] is False
     assert coverage["merged_bank_resident_parameter_count"] == 0
     assert coverage["merged_bank_resident_parameter_names"] == ()
 
@@ -777,6 +773,7 @@ def test_suffix_bypass_contract_field_reflects_attachment() -> None:
         runtime_with_bypass.value_and_grad_contract()["suffix_bypass_available"]
         is True
     )
+    assert runtime_with_bypass.value_and_grad_contract()["bank_grad_overlay_active"] is True
 
 
 def test_suffix_bypass_uses_fused_suffix_loss_fn_and_skips_eager_closure() -> None:

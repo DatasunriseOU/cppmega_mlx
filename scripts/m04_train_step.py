@@ -3109,6 +3109,25 @@ def _build_path_c_fused_suffix_loss_fn_for_model(
     required_inputs = ("target_ids", "target_mask", "loss", "ntokens")
     if not all(name in abi_map for name in required_inputs):
         return None
+    suffix_input_abi = getattr(
+        prim_func,
+        "_cppmega_path_c_train_step_suffix_loss_input_abi",
+        {},
+    )
+    suffix_input_reason = ""
+    if isinstance(suffix_input_abi, Mapping):
+        suffix_input_reason = str(suffix_input_abi.get("reason", ""))
+    if "pending" in suffix_input_reason.lower():
+        return None
+    output_abi = getattr(
+        prim_func,
+        "_cppmega_path_c_train_step_output_abi",
+        {},
+    )
+    if isinstance(output_abi, Mapping) and not bool(
+        output_abi.get("outputs_computed", False)
+    ):
+        return None
 
     first_in_region_layer_index_fn = getattr(
         model, "path_c_fused_first_in_region_layer_index", None
@@ -3120,6 +3139,7 @@ def _build_path_c_fused_suffix_loss_fn_for_model(
     )
     if first_in_region_layer_index is None:
         return None
+    first_in_region_layer_index_int = int(cast(int, first_in_region_layer_index))
 
     parameter_order = tuple(sorted(in_region_parameter_bank_aliases.keys()))
     try:
@@ -3140,7 +3160,7 @@ def _build_path_c_fused_suffix_loss_fn_for_model(
     model.attach_path_c_fused_suffix_custom_function(
         fused_suffix,
         parameter_order=parameter_order,
-        first_in_region_layer_index=int(first_in_region_layer_index),
+        first_in_region_layer_index=first_in_region_layer_index_int,
     )
 
     def _loss_fn(loss_model: Any, batch: Mapping[str, Any]) -> tuple[mx.array, mx.array]:
