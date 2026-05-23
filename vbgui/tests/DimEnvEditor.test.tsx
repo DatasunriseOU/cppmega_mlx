@@ -62,4 +62,37 @@ describe("V7-F56b/F53 DimEnvEditor", () => {
     const warn = screen.getByTestId("dim-env-inline-mismatch");
     expect(warn.textContent).toContain("192");
   });
+
+  it("offers Snap H → fix that applies the consistent value", () => {
+    const onApply = vi.fn();
+    render(<DimEnvEditor
+      value={{ H: 128, nh: 3, head_dim: 50, B: 1, S: 8 }}
+      onApply={onApply}
+    />);
+    const snap = screen.getByTestId("dim-env-fix-set-H");
+    expect(snap.textContent).toContain("150");
+    fireEvent.click(snap);
+    expect(onApply).toHaveBeenCalledTimes(1);
+    expect(onApply.mock.calls[0]?.[0]).toMatchObject({ H: 150 });
+  });
+
+  it("offers Snap head_dim → fix only when H is divisible by nh", () => {
+    // H=128 / nh=8 = 16 → head_dim snap available.
+    render(<DimEnvEditor
+      value={{ H: 128, nh: 8, head_dim: 32, B: 1, S: 8 }}
+      onApply={() => {}}
+    />);
+    const snap = screen.getByTestId("dim-env-fix-set-head_dim");
+    expect(snap.textContent).toContain("16");
+  });
+
+  it("hides Snap head_dim when H is not divisible by nh", () => {
+    // H=128 / nh=3 = 42.66 → head_dim snap NOT available; only H snap.
+    render(<DimEnvEditor
+      value={{ H: 128, nh: 3, head_dim: 50, B: 1, S: 8 }}
+      onApply={() => {}}
+    />);
+    expect(screen.queryByTestId("dim-env-fix-set-head_dim")).toBeNull();
+    expect(screen.getByTestId("dim-env-fix-set-H")).toBeDefined();
+  });
 });

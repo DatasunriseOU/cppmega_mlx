@@ -20,15 +20,45 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
     return out;
   });
 
-  const mismatch = (() => {
+  const parsed = (() => {
     const H = Number(draft.H);
     const nh = Number(draft.nh);
     const hd = Number(draft.head_dim);
     if (!Number.isFinite(H) || !Number.isFinite(nh) ||
         !Number.isFinite(hd)) return null;
-    if (nh * hd === H) return null;
-    return `nh*head_dim = ${nh * hd} ≠ H = ${H}`;
+    return { H, nh, hd };
   })();
+  const mismatch = parsed && parsed.nh * parsed.hd !== parsed.H
+    ? `nh*head_dim = ${parsed.nh * parsed.hd} ≠ H = ${parsed.H}`
+    : null;
+  // Two single-knob fixes that snap to consistency: change H to
+  // nh*head_dim, or change head_dim to H/nh when H is cleanly
+  // divisible by nh. The architect can also accept the mismatch
+  // consciously (the codebase supports decoupled Q via projection).
+  const fixSetH = mismatch && parsed
+    ? { H: parsed.nh * parsed.hd } : null;
+  const fixSetHeadDim = mismatch && parsed && parsed.nh > 0
+                      && parsed.H % parsed.nh === 0
+    ? { head_dim: parsed.H / parsed.nh } : null;
+
+  function applyDraft(overrides: Record<string, number> = {}) {
+    const next: Record<string, number> = { ...value };
+    for (const k of EDITABLE_KEYS) {
+      const n = Number(draft[k]);
+      if (Number.isFinite(n)) next[k] = n;
+    }
+    Object.assign(next, overrides);
+    // Reflect the override back into the visible draft so the user
+    // sees the suggestion they accepted.
+    if (Object.keys(overrides).length > 0) {
+      setDraft({
+        ...draft,
+        ...Object.fromEntries(
+          Object.entries(overrides).map(([k, v]) => [k, String(v)])),
+      });
+    }
+    onApply(next);
+  }
 
   return (
     <div data-testid="dim-env-editor"
@@ -51,15 +81,13 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
       ))}
       <button
         data-testid="dim-env-apply"
-        onClick={() => {
-          const next: Record<string, number> = { ...value };
-          for (const k of EDITABLE_KEYS) {
-            const n = Number(draft[k]);
-            if (Number.isFinite(n)) next[k] = n;
-          }
-          onApply(next);
-        }}
-        style={{ padding: "2px 8px" }}
+        onClick={() => applyDraft()}
+        style={{ padding: "2px 8px",
+                 background: mismatch ? "#fef3c7" : undefined,
+                 borderColor: mismatch ? "#d97706" : undefined }}
+        title={mismatch
+          ? "dim_env is inconsistent — see the suggestions on the right"
+          : "Push dim_env to verify"}
       >
         Apply
       </button>
@@ -68,6 +96,26 @@ export function DimEnvEditor({ value, onApply }: DimEnvEditorProps): JSX.Element
               style={{ color: "#92400e", marginLeft: 8 }}>
           ⚠ {mismatch}
         </span>
+      )}
+      {fixSetH && (
+        <button data-testid="dim-env-fix-set-H"
+                onClick={() => applyDraft(fixSetH)}
+                title={`Snap H to ${fixSetH.H} (= nh*head_dim)`}
+                style={{ padding: "2px 8px", background: "#dbeafe",
+                         border: "1px solid #2563eb",
+                         color: "#1e40af" }}>
+          Snap H → {fixSetH.H}
+        </button>
+      )}
+      {fixSetHeadDim && (
+        <button data-testid="dim-env-fix-set-head_dim"
+                onClick={() => applyDraft(fixSetHeadDim)}
+                title={`Snap head_dim to ${fixSetHeadDim.head_dim} (= H/nh)`}
+                style={{ padding: "2px 8px", background: "#dbeafe",
+                         border: "1px solid #2563eb",
+                         color: "#1e40af" }}>
+          Snap head_dim → {fixSetHeadDim.head_dim}
+        </button>
       )}
     </div>
   );
