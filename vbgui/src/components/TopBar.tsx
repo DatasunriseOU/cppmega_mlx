@@ -196,9 +196,11 @@ export function TopBar(p: TopBarProps): JSX.Element {
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
-                     gap: 12, padding: "0 12px",
-                     borderBottom: "1px solid #e5e7eb",
-                     fontFamily: "system-ui, sans-serif", fontSize: 12 }}>
+                     gap: 10, padding: "0 14px",
+                     background: "var(--vb-surface)",
+                     borderBottom: "1px solid var(--vb-border)",
+                     color: "var(--vb-text)",
+                     fontFamily: "var(--vb-font)", fontSize: 12 }}>
       <input data-testid="project-name"
              value={p.projectName}
              onChange={(e) => p.onProjectNameChange(e.target.value)}
@@ -239,7 +241,22 @@ export function TopBar(p: TopBarProps): JSX.Element {
         <option value="whole_model">compile: whole_model ⚠</option>
       </select>
 
-      <MemoryBar state={p.state} />
+      {/* UX-redesign #6: compact, topology-aware MemoryBar. world_size
+          derives from spec.sharding.axis_assignments degrees product
+          so on h100:8 (or any FSDP/TP/PP combo) the bar splits into
+          N per-rank mini-strips instead of one misleading total. */}
+      <MemoryBar state={p.state} compact={true}
+                 perRankBytes={(() => {
+                   const axes = p.state.sharding?.axis_assignments ?? [];
+                   const ws = axes.reduce(
+                     (acc, a) => acc * Math.max(1, a.degree | 0), 1);
+                   if (ws <= 1) return undefined;
+                   // Backend reports only worst_rank_bytes today; replicate
+                   // across ranks so the visual cluster cardinality is
+                   // honest even when per-rank breakdown isn't ready yet.
+                   return Array.from({ length: ws },
+                     () => p.state.worst_rank_bytes);
+                 })()} />
 
       {p.onMixedPrecisionChange && (
         <label style={{ fontSize: 10, display: "flex", gap: 3,
@@ -320,8 +337,13 @@ export function TopBar(p: TopBarProps): JSX.Element {
       </span>
       <div style={{ position: "relative" }}>
         <button data-testid="run-pipeline"
-                onClick={() => p.onRunPipeline("smoke")}>
-          Smoke
+                onClick={() => p.onRunPipeline("smoke")}
+                style={{ background: "var(--vb-accent)",
+                         color: "var(--vb-accent-contrast)",
+                         border: "1px solid var(--vb-accent-strong)",
+                         fontWeight: 600,
+                         boxShadow: "0 0 14px var(--vb-accent-soft)" }}>
+          ▶ Smoke
         </button>
         <button data-testid="run-pipeline-cancel"
                 onClick={() => p.onCancelTrain?.()}
@@ -349,8 +371,12 @@ export function TopBar(p: TopBarProps): JSX.Element {
         {open && (
           <div data-testid="run-pipeline-menu"
                style={{ position: "absolute", top: "100%", right: 0,
-                        background: "white", border: "1px solid #e5e7eb",
-                        boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
+                        marginTop: 6,
+                        background: "var(--vb-surface-2)",
+                        border: "1px solid var(--vb-border)",
+                        borderRadius: "var(--vb-radius-lg)",
+                        boxShadow: "var(--vb-shadow-pop)",
+                        overflow: "hidden",
                         zIndex: 10 }}>
             <button data-testid="run-pipeline-full"
                     onClick={() => { setOpen(false); p.onRunPipeline("full"); }}
@@ -384,9 +410,9 @@ export function TopBar(p: TopBarProps): JSX.Element {
                 )}
                 {probeInfo && (
                   <div data-testid="run-probe-result"
-                       style={{ fontSize: 10, fontFamily: "monospace",
-                                background: "#f9fafb", padding: 4,
-                                borderRadius: 3 }}>
+                       style={{ fontSize: 10, fontFamily: "var(--vb-font-mono)",
+                                background: "var(--vb-surface-3)", padding: 4,
+                                borderRadius: 4 }}>
                     <div data-testid="run-probe-result-clean">
                       {probeInfo.is_clean ? "✓ clean" : "⚠ issues"}
                       {" · "}
@@ -631,6 +657,7 @@ function basename(p: string): string {
 }
 
 const menuItem: React.CSSProperties = {
-  display: "block", padding: "6px 12px", border: "none",
-  background: "white", cursor: "pointer", textAlign: "left", width: "100%",
+  display: "block", padding: "7px 14px", border: "none", borderRadius: 0,
+  background: "transparent", color: "var(--vb-text)",
+  cursor: "pointer", textAlign: "left", width: "100%",
 };
