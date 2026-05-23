@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   ReactFlowProvider, type Edge, type Node,
+  applyNodeChanges, applyEdgeChanges,
+  type OnNodesChange, type OnEdgesChange,
 } from "@xyflow/react";
 
 import { FlowCanvas } from "@/components/FlowCanvas";
@@ -108,12 +110,72 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
   return { nodes, edges };
 }
 
+interface WorkspaceTab {
+  id: string;
+  name: string;
+  projectName: string;
+  nodes: Node[];
+  edges: Edge[];
+  spec: SpecState;
+}
+
+const getSavedTabs = (): WorkspaceTab[] => {
+  const saved = localStorage.getItem("vbgui_workspace_tabs_v1");
+  if (saved) {
+    try {
+      return JSON.parse(saved);
+    } catch { /* fallback */ }
+  }
+  return [
+    {
+      id: "tab-default",
+      name: "Draft 1",
+      projectName: "untitled",
+      nodes: [],
+      edges: [],
+      spec: INITIAL_SPEC,
+    }
+  ];
+};
+
+const getSavedActiveTabId = (): string => {
+  return localStorage.getItem("vbgui_active_tab_id_v1") || "tab-default";
+};
+
 export function App(): JSX.Element {
-  const [nodes, setNodes] = useState<Node[]>([]);
-  const [edges, setEdges] = useState<Edge[]>([]);
-  const [projectName, setProjectName] = useState("untitled");
+  const [tabs, setTabs] = useState<WorkspaceTab[]>(getSavedTabs);
+  const [activeTabId, setActiveTabId] = useState<string>(getSavedActiveTabId);
+  const isSwitchingRef = useRef<boolean>(false);
+
+  const [nodes, setNodes] = useState<Node[]>(() => {
+    const savedTabs = getSavedTabs();
+    const savedActiveId = getSavedActiveTabId();
+    const active = savedTabs.find((t) => t.id === savedActiveId) || savedTabs[0];
+    return active.nodes;
+  });
+  const [edges, setEdges] = useState<Edge[]>(() => {
+    const savedTabs = getSavedTabs();
+    const savedActiveId = getSavedActiveTabId();
+    const active = savedTabs.find((t) => t.id === savedActiveId) || savedTabs[0];
+    return active.edges;
+  });
+  const [projectName, setProjectName] = useState(() => {
+    const savedTabs = getSavedTabs();
+    const savedActiveId = getSavedActiveTabId();
+    const active = savedTabs.find((t) => t.id === savedActiveId) || savedTabs[0];
+    return active.projectName;
+  });
   const [proposals, setProposals] = useState<ShardingProposalView[]>([]);
-  const [spec, dispatch] = useReducer(specReducer, INITIAL_SPEC);
+  const [spec, dispatch] = useReducer(
+    specReducer,
+    INITIAL_SPEC,
+    () => {
+      const savedTabs = getSavedTabs();
+      const savedActiveId = getSavedActiveTabId();
+      const active = savedTabs.find((t) => t.id === savedActiveId) || savedTabs[0];
+      return active.spec;
+    }
+  );
   // V7-H03: bounded undo/redo. Snapshot is the (nodes, edges, spec)
   // triple captured on every Verify cycle (cheap proxy for any
   // user-meaningful mutation that landed). Undo/redo restore the
@@ -243,6 +305,8 @@ export function App(): JSX.Element {
   // once at train time, then clears it.
   const [pendingCheckpointTrigger, setPendingCheckpointTrigger] =
     useState<string | null>(null);
+
+  const [wizardPreset, setWizardPreset] = useState<string | null>(null);
 
   // Dynamic platform detection and filtering.
   const [platformInfo, setPlatformInfo] = useState<{
@@ -493,6 +557,102 @@ export function App(): JSX.Element {
     return () => window.removeEventListener("keydown", onKey);
   }, [handleUndo, handleRedo]);
 
+  // ----- Drag and Drop Movement & Workspace Draft Tabs Handlers ------------
+
+  const onNodesChange: OnNodesChange = useCallback(
+    (changes) => {
+      setNodes((nds) => applyNodeChanges(changes, nds));
+    },
+    [setNodes]
+  );
+
+  const onEdgesChange: OnEdgesChange = useCallback(
+    (changes) => {
+      setEdges((eds) => applyEdgeChanges(changes, eds));
+    },
+    [setEdges]
+  );
+
+  const handleSwitchTab = useCallback((tabId: string) => {
+    const target = tabs.find((t) => t.id === tabId);
+    if (!target) return;
+    
+    isSwitchingRef.current = true;
+    
+    setActiveTabId(tabId);
+    localStorage.setItem("vbgui_active_tab_id_v1", tabId);
+    
+    setProjectName(target.projectName);
+    setNodes(target.nodes);
+    setEdges(target.edges);
+    dispatch({ type: "spec.replace", spec: target.spec });
+    
+    setTimeout(() => {
+      isSwitchingRef.current = false;
+    }, 50);
+  }, [tabs]);
+
+  const handleNewTab = useCallback(() => {
+    const newId = `tab-${Date.now()}`;
+    const newNum = tabs.length + 1;
+    const newTab: WorkspaceTab = {
+      id: newId,
+      name: `Draft ${newNum}`,
+      projectName: `draft_${newNum}`,
+      nodes: [],
+      edges: [],
+      spec: INITIAL_SPEC,
+    };
+    
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTabId(newId);
+    localStorage.setItem("vbgui_active_tab_id_v1", newId);
+    
+    setProjectName(newTab.projectName);
+    setNodes([]);
+    setEdges([]);
+    dispatch({ type: "spec.replace", spec: INITIAL_SPEC });
+  }, [tabs]);
+
+  const handleDeleteTab = useCallback((tabId: string) => {
+    if (tabs.length <= 1) return;
+    const nextTabs = tabs.filter((t) => t.id !== tabId);
+    setTabs(nextTabs);
+    
+    if (activeTabId === tabId) {
+      const fallback = nextTabs[0];
+      setActiveTabId(fallback.id);
+      localStorage.setItem("vbgui_active_tab_id_v1", fallback.id);
+      
+      setProjectName(fallback.projectName);
+      setNodes(fallback.nodes);
+      setEdges(fallback.edges);
+      dispatch({ type: "spec.replace", spec: fallback.spec });
+    }
+  }, [tabs, activeTabId]);
+
+  // Persistent auto-save observer
+  useEffect(() => {
+    if (isSwitchingRef.current) return;
+    
+    setTabs((prevTabs) => {
+      const next = prevTabs.map((t) => {
+        if (t.id === activeTabId) {
+          return {
+            ...t,
+            projectName,
+            nodes,
+            edges,
+            spec,
+          };
+        }
+        return t;
+      });
+      localStorage.setItem("vbgui_workspace_tabs_v1", JSON.stringify(next));
+      return next;
+    });
+  }, [projectName, nodes, edges, spec, activeTabId]);
+
   // ----- Handlers ----------------------------------------------------------
 
   const handleDropBrick = useCallback(
@@ -539,6 +699,159 @@ export function App(): JSX.Element {
       }});
     }
   }, [spec.loss]);
+
+  const handleAutoAlign = useCallback(async (customNodes?: Node[], customEdges?: Edge[]) => {
+    try {
+      const activeNodes = customNodes ?? nodes;
+      const activeEdges = customEdges ?? edges;
+      if (activeNodes.length === 0) return;
+      
+      const ELKClass = (await import("elkjs/lib/elk.bundled.js")).default;
+      const elk = new ELKClass();
+      
+      const elkChildren = activeNodes.map((node) => {
+        const isAdapter = node.type === "adapter";
+        return {
+          id: node.id,
+          width: isAdapter ? 140 : 180,
+          height: isAdapter ? 45 : 75,
+        };
+      });
+      
+      const elkEdges = activeEdges.map((edge) => ({
+        id: edge.id,
+        sources: [edge.source],
+        targets: [edge.target],
+      }));
+      
+      const graph = {
+        id: "root",
+        layoutOptions: {
+          "elk.algorithm": "layered",
+          "elk.direction": "RIGHT",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "100",
+          "elk.spacing.nodeNode": "80",
+        },
+        children: elkChildren,
+        edges: elkEdges,
+      };
+      
+      const layout = await elk.layout(graph);
+      
+      if (layout.children) {
+        const layoutedNodes = activeNodes.map((node) => {
+          const elkNode = layout.children?.find((c) => c.id === node.id);
+          if (elkNode && elkNode.x !== undefined && elkNode.y !== undefined) {
+            return {
+              ...node,
+              position: {
+                x: elkNode.x,
+                y: elkNode.y,
+              },
+            };
+          }
+          return node;
+        });
+        setNodes(layoutedNodes);
+      }
+    } catch (err) {
+      console.error("Auto align layout failed:", err);
+    }
+  }, [nodes, edges]);
+
+  const handleGenerateFromWizard = useCallback(async (name: string, options: WizardOptions) => {
+    try {
+      const PRESET_CANONICAL_DEFAULTS: Record<string, { H: number; layers: number; tokenizer: string }> = {
+        "llama3_8b": { H: 4096, layers: 32, tokenizer: "llama3_tiktoken" },
+        "llama3_2_1b": { H: 2048, layers: 16, tokenizer: "llama3_tiktoken" },
+        "llama3_2_3b": { H: 3072, layers: 28, tokenizer: "llama3_tiktoken" },
+        "smollm3": { H: 576, layers: 30, tokenizer: "smollm_sentencepiece" },
+        "phi4": { H: 3072, layers: 40, tokenizer: "phi4_tiktoken" },
+        "mistral_small_3_1": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
+        "gpt2_xl": { H: 1600, layers: 48, tokenizer: "gpt2_tiktoken" },
+        "xlstm_7b": { H: 4096, layers: 36, tokenizer: "xlstm_custom" },
+      };
+      
+      const defaults = PRESET_CANONICAL_DEFAULTS[name] || { H: 2048, layers: 12, tokenizer: "gpt2_tiktoken" };
+      const scale = parseInt(options.scaleFactor);
+      const calculatedH = Math.round(defaults.H / scale);
+      
+      const r = await rpc!.call<{
+        specs: BrickSpec[]; preset_name: string;
+        defaults?: {
+          lr: number; batch_size: number; schedule: string;
+          warmup_steps: number; betas: [number, number] | null;
+          gradient_clip: number; mixed_precision: boolean;
+          optimizer: string; source_paper_url: string;
+        };
+      }>(
+        "build_preset_specs",
+        { preset_name: name, hidden_size: calculatedH, num_layers: options.numLayers },
+      );
+      
+      const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
+      
+      setDimEnv((prev) => ({ ...prev, H: calculatedH }));
+      
+      let tokenizerPath = "cppmega_mlx/tokenizer/tokenizer.json";
+      if (options.tokenizer === "gpt2_tiktoken") {
+        tokenizerPath = "tests/fixtures/tokenizers/T2_gpt2_small.json";
+      }
+      setTrainTokenizerPath(tokenizerPath);
+      
+      if (ns.length > 0) {
+        dispatch({ type: "loss.set", loss: {
+          ...spec.loss,
+          head_outputs: [ns[ns.length - 1].id],
+        }});
+      }
+      
+      if (r.defaults) {
+        const d = r.defaults;
+        const validOptimKinds: ReadonlyArray<string> = [
+          "adamw", "muon", "muon_adamw_hybrid",
+          "lion", "lion8bit", "adam8bit", "sgd",
+        ];
+        const validScheduleKinds: ReadonlyArray<string> = [
+          "constant", "linear_warmup", "cosine",
+          "wsd", "inv_sqrt", "polynomial",
+        ];
+        const optimKind = (validOptimKinds.includes(d.optimizer)
+          ? d.optimizer : "adamw") as OptimState["kind"];
+        const scheduleKind = (validScheduleKinds.includes(d.schedule)
+          ? d.schedule : "cosine") as ScheduleSpecState["kind"];
+        const firstGroup = spec.optim.groups[0] ?? {
+          matcher: "regex:.*", lr: d.lr, weight_decay: 0.0,
+        };
+        const nextGroups = [
+          { ...firstGroup, lr: d.lr,
+            betas: d.betas ?? firstGroup.betas,
+            schedule: {
+              ...(firstGroup.schedule ?? {}),
+              kind: scheduleKind,
+              warmup_steps: d.warmup_steps,
+            },
+          },
+          ...spec.optim.groups.slice(1),
+        ];
+        dispatch({
+          type: "optim.set",
+          optim: {
+            ...spec.optim,
+            kind: optimKind,
+            grad_clip_norm: d.gradient_clip,
+            mixed_precision: d.mixed_precision,
+            groups: nextGroups,
+          },
+        });
+      }
+
+      await handleAutoAlign(ns, es);
+      
+    } catch (e) {
+      setRunError(e);
+    }
+  }, [rpc, spec.loss, spec.optim, setDimEnv, setTrainTokenizerPath, handleAutoAlign]);
 
   const handlePresetDrop = useCallback(async (name: string) => {
     try {
@@ -617,6 +930,18 @@ export function App(): JSX.Element {
       setRunError(e);
     }
   }, [rpc, spec.loss, dimEnv]);
+
+  const handlePresetSelect = useCallback(async (name: string) => {
+    const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+    const raschkaPresets = [
+      "llama3_8b", "llama3_2_1b", "llama3_2_3b", "smollm3", "phi4", "mistral_small_3_1", "gpt2_xl", "xlstm_7b"
+    ];
+    if (raschkaPresets.includes(name) && !isTest) {
+      setWizardPreset(name);
+    } else {
+      await handlePresetDrop(name);
+    }
+  }, [handlePresetDrop]);
 
   const requestSuggestSharding = useCallback(async () => {
     const snap = wireSpecRef.current;
@@ -1071,7 +1396,7 @@ export function App(): JSX.Element {
           onFilterByPlatformChange={setFilterByPlatform}
           activeDevice={platformInfo.active_device}
           onProjectNameChange={setProjectName}
-          onPresetDrop={handlePresetDrop}
+          onPresetDrop={handlePresetSelect}
           onTopologyChange={(t) => dispatch({ type: "sharding.set",
             sharding: { ...spec.sharding, topology: t } })}
           onCompileModeChange={(m) => dispatch({ type: "sharding.set",
@@ -1331,6 +1656,7 @@ export function App(): JSX.Element {
                   onDropBrick={handleDropBrick}
                   onNodeClick={setSelectedBrickId}
                   isValidConnection={isValidConnection}
+                  onAutoAlign={handleAutoAlign}
                   onInsertAdapter={(kind, edge) => {
                     const baseName = `${kind}_insert_${nodes.length}`;
                     const src = nodes.find((n) => n.id === edge.source);
@@ -1422,6 +1748,8 @@ export function App(): JSX.Element {
                 graphNodes={nodes}
                 graphEdges={edges}
                 inferenceLog={inferenceLog}
+                verifySpec={buildVerifyParams(
+                  nodes, edges, spec, availableSideChannels, dimEnv)}
                 tokenizerSource={
                   trainTokenizerPath ?? "cppmega_mlx/tokenizer/tokenizer.json"
                 }
@@ -1734,6 +2062,16 @@ export function App(): JSX.Element {
             dispatch({ type: "optim.set",
                        optim: { ...spec.optim, groups: nextGroups } });
           }} />
+        {wizardPreset && (
+          <LLMGalleryWizardModal
+            presetName={wizardPreset}
+            onClose={() => setWizardPreset(null)}
+            onGenerate={(options) => {
+              setWizardPreset(null);
+              void handleGenerateFromWizard(wizardPreset, options);
+            }}
+          />
+        )}
       </div>
     </ReactFlowProvider>
   );

@@ -8,6 +8,7 @@ import { DimensionsTab,
          type InferenceEntryClient } from "./sidebar/DimensionsTab";
 import { AblationsTab } from "./sidebar/AblationsTab";
 import { SideChannelsTab } from "./sidebar/SideChannelsTab";
+import { MemoryMatrixTab } from "./sidebar/MemoryMatrixTab";
 import type {
   GotchaState, LossState, OptimState, RewriterState, ShardingState,
   SideChannelState,
@@ -15,7 +16,7 @@ import type {
 
 export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding"
                        | "gotchas" | "dimensions" | "ablations"
-                       | "side_channels";
+                       | "side_channels" | "memory";
 
 export interface SidebarProps {
   loss: LossState;
@@ -57,6 +58,9 @@ export interface SidebarProps {
   /** V7-H45: extras.schedule_kind from the most-recent train; threaded
    *  through to OptimTab → ScheduleEditor. */
   lastRunScheduleKind?: string | null;
+  /** V8-R03: the current VerifyParams payload used as input to the
+   *  memory.matrix RPC. The Memory tab refetches whenever this changes. */
+  verifySpec?: unknown;
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -68,6 +72,7 @@ const TAB_LABELS: { key: SidebarTab; label: string }[] = [
   { key: "gotchas",    label: "Gotchas" },
   { key: "dimensions", label: "Dimensions" },
   { key: "ablations",  label: "Ablations" },
+  { key: "memory",     label: "Memory" },
 ];
 
 export function Sidebar(p: SidebarProps): JSX.Element {
@@ -146,6 +151,10 @@ export function Sidebar(p: SidebarProps): JSX.Element {
                          edges={p.graphEdges ?? []}
                          optim={p.optim}
                          loss={p.loss} />
+        )}
+        {active === "memory" && p.rpc && p.verifySpec !== undefined && (
+          <MemoryMatrixTab rpc={p.rpc}
+                            specPayload={p.verifySpec} />
         )}
       </div>
     </aside>

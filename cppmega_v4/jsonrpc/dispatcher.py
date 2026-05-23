@@ -75,6 +75,10 @@ from cppmega_v4.jsonrpc.cache_metrics_method import (
     CacheMetricsParams,
     cache_metrics,
 )
+from cppmega_v4.jsonrpc.memory_matrix_method import (
+    MemoryMatrixParams,
+    memory_matrix,
+)
 from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
@@ -128,6 +132,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "architectures.scale_down": (
         ScaleDownParams,
         lambda p, c: scale_down_method(p, cache=c),
+    ),
+    "memory.matrix": (
+        MemoryMatrixParams,
+        lambda p, c: memory_matrix(p, cache=c),
     ),
     "probe.run": (
         ProbeRunParams,

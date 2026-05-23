@@ -808,6 +808,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "side_channels.preview",
     "platform.get_info",
     "architectures.scale_down",
+    "memory.matrix",
 })
 
 
