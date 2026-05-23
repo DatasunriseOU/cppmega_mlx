@@ -1272,6 +1272,58 @@ class HybridTinyLM(nn.Module):
                 break
         return out
 
+    def _path_c_static_real_abi_input_values(
+        self,
+        abi_map: Mapping[str, Any],
+    ) -> dict[str, mx.array]:
+        """Return small non-trainable real-ABI inputs required by Path C.
+
+        The fused train-block ABI contains a few real inputs that are neither
+        trainable parameters nor per-batch runtime tensors. For Sparse-MLA
+        these are the softmax scale and optional attention sinks. They must be
+        written into model-owned banks along with parameter values; leaving the
+        zero-initialized bank slots in place makes the forward/backward kernel
+        run with ``sm_scale=0`` and kills q/kv gradients.
+        """
+
+        attention = self.config.attention_config("dsa")
+        sm_scale = float(attention.q_head_dim) ** -0.5
+        values: dict[str, mx.array] = {}
+        for logical_name, info in abi_map.items():
+            if not isinstance(info, Mapping):
+                continue
+            shape = tuple(
+                int(dim)
+                for dim in tuple(info.get("logical_shape", info.get("shape", ())))
+            )
+            if str(logical_name).endswith("sparse_mla_sm_scale"):
+                values[str(logical_name)] = mx.array(
+                    [sm_scale], dtype=mx.float32
+                ).reshape(shape or (1,))
+            elif str(logical_name).endswith("sparse_mla_sinks"):
+                values[str(logical_name)] = mx.zeros(shape, dtype=mx.float32)
+            elif str(logical_name).endswith("sparse_mla_has_sinks"):
+                values[str(logical_name)] = mx.zeros(shape, dtype=mx.int32)
+        return values
+
+    def _sync_path_c_static_real_abi_inputs_into_bank(
+        self,
+        *,
+        abi_map: Mapping[str, Any],
+        buffers: Mapping[str, Any],
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        synced: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        for logical_name, value in sorted(
+            self._path_c_static_real_abi_input_values(abi_map).items()
+        ):
+            try:
+                write_into_bank_slot(abi_map, buffers, logical_name, value)
+                synced.append(logical_name)
+            except Exception as exc:
+                skipped.append((logical_name, f"{type(exc).__name__}: {exc}"))
+        return synced, skipped
+
     def _path_c_lookup_parameter_holder(
         self,
         parameter_name: str,
@@ -1378,6 +1430,13 @@ class HybridTinyLM(nn.Module):
         )
         synced: list[str] = []
         skipped: list[tuple[str, str]] = []
+        static_synced, static_skipped = (
+            self._sync_path_c_static_real_abi_inputs_into_bank(
+                abi_map=abi_map,
+                buffers=buffers,
+            )
+        )
+        skipped.extend(static_skipped)
         for parameter_name, info in sorted(aliases.items()):
             tensor = self._path_c_get_parameter_tensor(parameter_name)
             if tensor is None:
@@ -1413,6 +1472,11 @@ class HybridTinyLM(nn.Module):
             "skipped": [
                 {"parameter_name": name, "reason": reason}
                 for name, reason in skipped
+            ],
+            "static_real_abi_inputs_synced": static_synced,
+            "static_real_abi_inputs_skipped": [
+                {"logical_name": name, "reason": reason}
+                for name, reason in static_skipped
             ],
         }
 
@@ -1486,6 +1550,13 @@ class HybridTinyLM(nn.Module):
         )
         bound: list[str] = []
         skipped: list[tuple[str, str]] = []
+        static_synced, static_skipped = (
+            self._sync_path_c_static_real_abi_inputs_into_bank(
+                abi_map=abi_map,
+                buffers=buffers,
+            )
+        )
+        skipped.extend(static_skipped)
         for parameter_name, info in sorted(aliases.items()):
             tensor = self._path_c_get_parameter_tensor(parameter_name)
             if tensor is None:
@@ -1524,6 +1595,11 @@ class HybridTinyLM(nn.Module):
             "in_region_parameter_count": len(bound),
             "in_region_parameter_names": tuple(sorted(bound)),
             "in_region_parameter_bank_aliases": dict(aliases),
+            "static_real_abi_inputs_synced": static_synced,
+            "static_real_abi_inputs_skipped": [
+                {"logical_name": name, "reason": reason}
+                for name, reason in static_skipped
+            ],
         }
 
     def path_c_fused_first_in_region_layer_index(

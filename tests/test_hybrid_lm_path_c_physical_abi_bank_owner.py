@@ -9,6 +9,8 @@ owner satisfies the structural contract enforced by
 
 from __future__ import annotations
 
+from typing import Any
+
 import mlx.core as mx
 import pytest
 
@@ -188,7 +190,7 @@ def test_bind_path_c_in_region_parameter_views_into_bank_replaces_attributes(
     bank = bank_owner.buffers[sample_info["bank"]]
     slot = bank[sample_info["offset"] : sample_info["offset"] + sample_info["size"]]
     parts = sample_small.split(".")
-    holder: object = model
+    holder: Any = model
     for part in parts[:-1]:
         holder = holder[int(part)] if part.isdigit() else getattr(holder, part)
     param_value = getattr(holder, parts[-1])
@@ -226,3 +228,54 @@ def test_sync_path_c_in_region_parameters_into_bank_updates_bank_slots(
     bank = bank_owner.buffers[bank_name]
     slot = bank[info["offset"] : info["offset"] + info["size"]]
     assert mx.allclose(slot, sentinel).item() is True
+
+
+def test_bind_path_c_syncs_sparse_mla_static_real_abi_inputs() -> None:
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = 127
+    bank_owner = model.make_path_c_physical_abi_bank_owner(
+        sequence_length=sequence_length,
+    )
+    assert bank_owner is not None
+    report = model.bind_path_c_in_region_parameter_views_into_bank(
+        bank_owner,
+        sequence_length=sequence_length,
+    )
+    prim_func = model.path_c_fused_train_block_prim_func(
+        sequence_length=sequence_length,
+    )
+    assert prim_func is not None
+    abi_map = dict(
+        getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+        or {}
+    )
+
+    def bank_slot(logical_name: str) -> mx.array:
+        info = abi_map[logical_name]
+        bank = bank_owner.buffers[str(info["bank"])]
+        offset = int(info["offset"])
+        size = int(info["size"])
+        return bank[offset : offset + size]
+
+    sm_scale_name = next(
+        name for name in abi_map if name.endswith("sparse_mla_sm_scale")
+    )
+    sinks_name = next(
+        name for name in abi_map if name.endswith("sparse_mla_sinks")
+    )
+    has_sinks_name = next(
+        name for name in abi_map if name.endswith("sparse_mla_has_sinks")
+    )
+    sm_scale = bank_slot(sm_scale_name)
+    sinks = bank_slot(sinks_name)
+    has_sinks = bank_slot(has_sinks_name)
+    mx.eval(sm_scale, sinks, has_sinks)
+
+    assert report["static_real_abi_inputs_synced"] == [
+        has_sinks_name,
+        sinks_name,
+        sm_scale_name,
+    ]
+    assert sm_scale.tolist() == [0.5]
+    assert sinks.tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert has_sinks.tolist() == [0]
