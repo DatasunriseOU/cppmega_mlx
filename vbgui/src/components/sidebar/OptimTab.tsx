@@ -175,6 +175,7 @@ export function OptimTab({
           optimKind={draft.kind}
           nodes={graphNodes ?? []}
           edges={graphEdges ?? []}
+          currentGroups={draft.groups}
           onApply={(groups, banner) => {
             setDraft({ ...draft, groups });
             setAutoGroupBanner(banner);
