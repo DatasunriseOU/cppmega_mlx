@@ -19,6 +19,10 @@ export interface TrainOptions {
   fake_ranks?: number;
   // K8 — explicit abort token (defaults to run_id when empty).
   abort_token?: string;
+  // V7-Q06.1 — B/S overrides applied before pipeline.run dispatch.
+  // Default unset => spec.dim_env.B/S wins (preserves prior behaviour).
+  train_B?: number;
+  train_S?: number;
 }
 
 export interface TrainOptionsPanelProps {
@@ -124,6 +128,29 @@ export function TrainOptionsPanel({
                      "abort_token",
                      e.target.value === "" ? undefined : e.target.value)}
                    style={{ ...INPUT, width: 200 }} />
+          </Row>
+          {/* V7-Q06.1: B + S overrides for train dim_env. */}
+          <Row label="B (train batch size)" help="dim_env_B">
+            <input data-testid="train-opt-B"
+                   type="number" min={1} max={32}
+                   value={v.train_B ?? ""}
+                   placeholder="spec.dim_env.B"
+                   onChange={(e) => set(
+                     "train_B",
+                     e.target.value === ""
+                       ? undefined : parseInt(e.target.value, 10))}
+                   style={INPUT} />
+          </Row>
+          <Row label="S (train seq len)" help="dim_env_S">
+            <input data-testid="train-opt-S"
+                   type="number" min={1} max={8192}
+                   value={v.train_S ?? ""}
+                   placeholder="spec.dim_env.S"
+                   onChange={(e) => set(
+                     "train_S",
+                     e.target.value === ""
+                       ? undefined : parseInt(e.target.value, 10))}
+                   style={INPUT} />
           </Row>
         </div>
       )}

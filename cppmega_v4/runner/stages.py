@@ -2287,6 +2287,12 @@ def stage_train(ctx: StageContext) -> StageResult:
                                    "overflow_count":
                                    loss_scaler.overflow_count}
                                  if loss_scaler is not None else None),
+                # V7-Q06.2: flatten overflow steps so LossChart can
+                # render overflow markers without diving into the
+                # nested dict. Keeps nested key for back-compat.
+                "loss_scaler_overflows": (
+                    list(loss_scaler_overflow_steps)
+                    if loss_scaler is not None else []),
                 "moe": moe_extras,
                 "opt_state_carried": opt_state_carried,
                 "run_id": run_id,

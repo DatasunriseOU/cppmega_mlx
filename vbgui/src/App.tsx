@@ -588,6 +588,9 @@ export function App(): JSX.Element {
       inference_probe_text?: string;
       master_dtype?: "fp32" | "bf16" | "fp16" | "auto";
       fim_enabled?: boolean;
+      compress?: string;
+      ckpt_strict?: boolean;
+      opt_state_strict?: boolean;
     },
   ) => {
     // V7-I03: synchronous lock check at the very top — before any
@@ -627,6 +630,16 @@ export function App(): JSX.Element {
       // V7-K3 / V7-K4 / V7-K5 / V7-K6 — forward TrainOptionsPanel state.
       if (typeof trainOptions.val_every === "number") {
         trainOpts.val_every = trainOptions.val_every;
+      }
+      // V7-Q06.1: B/S override threaded into stage_train opts. Backend
+      // reads opts.B / opts.S for the per-step synthetic/parquet batch.
+      if (typeof trainOptions.train_B === "number"
+          && trainOptions.train_B > 0) {
+        trainOpts.B = trainOptions.train_B;
+      }
+      if (typeof trainOptions.train_S === "number"
+          && trainOptions.train_S > 0) {
+        trainOpts.S = trainOptions.train_S;
       }
       if (typeof trainOptions.grad_clip_max_norm === "number") {
         trainOpts.grad_clip_max_norm = trainOptions.grad_clip_max_norm;
@@ -1241,6 +1254,33 @@ export function App(): JSX.Element {
                   onDropBrick={handleDropBrick}
                   onNodeClick={setSelectedBrickId}
                   isValidConnection={isValidConnection}
+                  onInsertAdapter={(kind, edge) => {
+                    const baseName = `${kind}_insert_${nodes.length}`;
+                    const src = nodes.find((n) => n.id === edge.source);
+                    const dst = nodes.find((n) => n.id === edge.target);
+                    const mid = src && dst
+                      ? { x: (src.position.x + dst.position.x) / 2,
+                          y: (src.position.y + dst.position.y) / 2 + 50 }
+                      : { x: 200, y: 280 };
+                    setNodes((prev) => [
+                      ...prev,
+                      { id: baseName,
+                        type: "brick",
+                        position: mid,
+                        data: { kind } as never },
+                    ]);
+                    setEdges((prev) => [
+                      ...prev.filter((e) =>
+                        !(e.source === edge.source
+                          && e.target === edge.target)),
+                      { id: `${edge.source}->${baseName}`,
+                        source: edge.source, target: baseName,
+                        data: { severity: "info" } },
+                      { id: `${baseName}->${edge.target}`,
+                        source: baseName, target: edge.target,
+                        data: { severity: "info" } },
+                    ]);
+                  }}
                 />
               </div>
               {selectedBrickId && (() => {

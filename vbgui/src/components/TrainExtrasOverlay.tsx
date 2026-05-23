@@ -52,6 +52,32 @@ export interface TrainExtras {
     brick_kinds?: string[] | string;
     num_brick_kinds?: number;
   };
+  // V7-Q06.3: styled panels for previously-untyped extras keys.
+  plasticity?: {
+    fire_fired_at_step?: number;
+    fire_keys_modified?: string[];
+    dash_last_keys_count?: number;
+    redo_last_recycled?: number | string | null;
+    [k: string]: unknown;
+  };
+  mtp?: {
+    k?: number;
+    beta?: number | number[];
+    head_losses?: number[];
+    [k: string]: unknown;
+  } | null;
+  ifim?: {
+    instr_loss?: number;
+    instr_token_count?: number;
+    lambda?: number;
+    [k: string]: unknown;
+  } | null;
+  mhc?: {
+    consistency_loss?: number;
+    heads_correlated?: number;
+    lambda?: number;
+    [k: string]: unknown;
+  } | null;
   [k: string]: unknown;
 }
 
@@ -216,7 +242,160 @@ export function TrainExtrasOverlay({
         || Array.isArray(extras.per_expert_load)) && (
         <MoEDashboard extras={extras} />
       )}
+
+      {/* V7-Q06.3: plasticity panel — FIRE/DASH/ReDo capture from train. */}
+      {extras.plasticity
+        && Object.keys(extras.plasticity).some(
+          (k) => extras.plasticity![k] !== undefined
+                 && extras.plasticity![k] !== null) && (
+        <PlasticityPanel data={extras.plasticity} />
+      )}
+
+      {/* V7-Q06.3: MTP-weighted head loss panel. */}
+      {extras.mtp && (
+        <MTPPanel data={extras.mtp} />
+      )}
+
+      {/* V7-Q06.3: IFIM instr-token loss panel. */}
+      {extras.ifim && (
+        <IFIMPanel data={extras.ifim} />
+      )}
+
+      {/* V7-Q06.3: MHC attention-bias consistency panel. */}
+      {extras.mhc && (
+        <MHCPanel data={extras.mhc} />
+      )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// V7-Q06.3 styled sub-panels for plasticity / mtp / ifim / mhc extras.
+// ---------------------------------------------------------------------------
+
+function _PanelShell({
+  testid, title, children,
+}: { testid: string; title: string; children: React.ReactNode }) {
+  return (
+    <div data-testid={testid}
+         style={{ marginTop: 4, padding: "4px 8px",
+                  border: "1px solid #e5e7eb", borderRadius: 4,
+                  background: "#fafaf9", fontSize: 11 }}>
+      <div style={{ fontWeight: 600, color: "#374151",
+                    marginBottom: 4 }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function _MetricRow({
+  testid, label, value,
+}: { testid: string; label: string; value: string }) {
+  return (
+    <div style={{ display: "flex", gap: 6 }}>
+      <span style={{ color: "#6b7280", minWidth: 110 }}>{label}:</span>
+      <span data-testid={testid} style={{ color: "#111827",
+                                           fontFamily: "monospace" }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function PlasticityPanel({ data }: { data: NonNullable<TrainExtras["plasticity"]> }) {
+  return (
+    <_PanelShell testid="extras-panel-plasticity"
+                 title="Plasticity (FIRE / DASH / ReDo)">
+      {typeof data.fire_fired_at_step === "number" && (
+        <_MetricRow testid="extras-plasticity-fire-step"
+                    label="fire_fired_at_step"
+                    value={String(data.fire_fired_at_step)} />
+      )}
+      {Array.isArray(data.fire_keys_modified) && (
+        <_MetricRow testid="extras-plasticity-fire-keys"
+                    label="fire_keys_modified"
+                    value={`${data.fire_keys_modified.length} keys`} />
+      )}
+      {typeof data.dash_last_keys_count === "number" && (
+        <_MetricRow testid="extras-plasticity-dash-keys-count"
+                    label="dash_last_keys_count"
+                    value={String(data.dash_last_keys_count)} />
+      )}
+      {data.redo_last_recycled !== undefined
+        && data.redo_last_recycled !== null && (
+        <_MetricRow testid="extras-plasticity-redo-recycled"
+                    label="redo_last_recycled"
+                    value={String(data.redo_last_recycled)} />
+      )}
+    </_PanelShell>
+  );
+}
+
+function MTPPanel({ data }: { data: NonNullable<TrainExtras["mtp"]> }) {
+  return (
+    <_PanelShell testid="extras-panel-mtp"
+                 title="MTP (multi-token-prediction)">
+      {typeof data.k === "number" && (
+        <_MetricRow testid="extras-mtp-k"
+                    label="k" value={String(data.k)} />
+      )}
+      {data.beta !== undefined && (
+        <_MetricRow testid="extras-mtp-beta"
+                    label="beta" value={JSON.stringify(data.beta)} />
+      )}
+      {Array.isArray(data.head_losses) && (
+        <_MetricRow testid="extras-mtp-head-losses"
+                    label="head_losses"
+                    value={data.head_losses.map(
+                      (l) => Number(l).toFixed(4)).join(" / ")} />
+      )}
+    </_PanelShell>
+  );
+}
+
+function IFIMPanel({ data }: { data: NonNullable<TrainExtras["ifim"]> }) {
+  return (
+    <_PanelShell testid="extras-panel-ifim"
+                 title="IFIM (instruction-aware FIM)">
+      {typeof data.instr_loss === "number" && (
+        <_MetricRow testid="extras-ifim-instr-loss"
+                    label="instr_loss"
+                    value={Number(data.instr_loss).toFixed(4)} />
+      )}
+      {typeof data.instr_token_count === "number" && (
+        <_MetricRow testid="extras-ifim-token-count"
+                    label="instr_token_count"
+                    value={String(data.instr_token_count)} />
+      )}
+      {typeof data.lambda === "number" && (
+        <_MetricRow testid="extras-ifim-lambda"
+                    label="lambda"
+                    value={Number(data.lambda).toFixed(4)} />
+      )}
+    </_PanelShell>
+  );
+}
+
+function MHCPanel({ data }: { data: NonNullable<TrainExtras["mhc"]> }) {
+  return (
+    <_PanelShell testid="extras-panel-mhc"
+                 title="MHC (multi-head consistency)">
+      {typeof data.consistency_loss === "number" && (
+        <_MetricRow testid="extras-mhc-consistency-loss"
+                    label="consistency_loss"
+                    value={Number(data.consistency_loss).toFixed(4)} />
+      )}
+      {typeof data.heads_correlated === "number" && (
+        <_MetricRow testid="extras-mhc-heads-correlated"
+                    label="heads_correlated"
+                    value={Number(data.heads_correlated).toFixed(4)} />
+      )}
+      {typeof data.lambda === "number" && (
+        <_MetricRow testid="extras-mhc-lambda"
+                    label="lambda"
+                    value={Number(data.lambda).toFixed(4)} />
+      )}
+    </_PanelShell>
   );
 }
 
