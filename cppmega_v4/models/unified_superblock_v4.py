@@ -386,6 +386,29 @@ def _make_norm(kind: str, dim: int, eps: float):
                      "use 'rmsnorm' / 'layernorm' / 'none'")
 
 
+# V7-Q13: rmsnorm / layernorm / residual are canvas-level bricks that
+# also need to appear as standalone nodes inside presets. Wrap them as
+# nn.Module-compatible builders so BLOCK_BUILDERS resolves the kind and
+# from_block_specs instantiates the right primitive.
+
+def _build_rmsnorm(hidden_size: int, params: dict) -> nn.Module:
+    return nn.RMSNorm(hidden_size, eps=float(params.get("eps", 1e-6)))
+
+
+def _build_layernorm(hidden_size: int, params: dict) -> nn.Module:
+    return nn.LayerNorm(hidden_size, eps=float(params.get("eps", 1e-5)))
+
+
+def _build_residual_passthrough(hidden_size: int, params: dict) -> nn.Module:
+    """Identity passthrough — residual ADD is implicit in the brick
+    graph join. This wrapper just lets the canvas render an explicit
+    residual node without breaking the BLOCK_BUILDERS instantiation."""
+    class _Identity(nn.Module):
+        def __call__(self, x):
+            return x
+    return _Identity()
+
+
 def _build_attention(hidden_size: int, params: dict) -> nn.Module:
     """Standard multi-head self-attention (causal). Used for `attention`.
 
@@ -600,6 +623,12 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "mlstm": _build_mlstm,
     "abs_pos_embed": _build_abs_pos_embed,
     "per_layer_embed": _build_per_layer_embed,
+    # V7-Q13: standalone norm + residual primitives. Canvas treats
+    # them as bricks; backend instantiation goes through these thin
+    # wrappers so the kind resolves and parameter histograms work.
+    "rmsnorm": _build_rmsnorm,
+    "layernorm": _build_layernorm,
+    "residual": _build_residual_passthrough,
 }
 
 

@@ -8,6 +8,7 @@ import {
   TENSOR_DIAGRAMS, TOPIC_WORKED_EXAMPLES, WORKED_EXAMPLES,
   TOPIC_FOUNDATIONS, MATH_FOUNDATIONS,
   WorkedExampleDiagram, MathLink,
+  BACKWARD_TOPICS,
 } from "./diagrams";
 import { T } from "@/theme";
 
@@ -24,6 +25,15 @@ export interface HelpTopic {
   inputs?: string;
   outputs?: string;
   normalization?: string;
+  /** Backward-pass walkthrough: what we differentiate, the local
+   *  Jacobian / VJP, and how the upstream cotangent ḡ = dL/dy is
+   *  pulled back to dL/dx + dL/d{params}. Pulled in from
+   *  BACKWARD_TOPICS so authoring stays declarative. */
+  backward?: {
+    differentiates: string;
+    chain_rule: string;
+    key_identity: string;
+  };
 }
 
 export const HELP_TOPICS: Record<string, HelpTopic> = {
@@ -804,79 +814,209 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
   adapter_merge_heads: {
     title: "merge_heads — concatenate head dimension",
     what:
-      "Reshape (B, S, nh, hd) → (B, S, nh*hd). Used between "
-      + "attention output and projection.",
+      "Pure reshape: (B, S, nh, hd) → (B, S, nh*hd). Zero "
+      + "parameters, zero compute — just a view-change. Inverse "
+      + "of split_heads.",
     why:
-      "Plumbing between split-head and dense projection spaces. "
-      + "Necessary when an attention brick emits per-head output "
-      + "but the next brick expects (B, S, H).",
-    inputs: "(B, S, nh, hd).",
-    outputs: "(B, S, nh*hd).",
-    normalization: "No norm. Pure reshape.",
+      "Plumbing between per-head computation and dense residual "
+      + "space. Most attention bricks internally hold the per-head "
+      + "shape (B, S, nh, hd) but the residual stream is "
+      + "(B, S, H=nh*hd). When an attention brick's output projection "
+      + "is OFF (advanced topology) or when chaining a raw per-head "
+      + "op (RoPE, key-norm) into a dense projection, merge_heads "
+      + "is the explicit transition.",
+    inputs: "(B, S, nh, hd) — per-head tensor.",
+    outputs:
+      "(B, S, nh*hd) — flat residual-shaped tensor.",
+    normalization:
+      "No norm. This is a view-only op — no parameters, no scale "
+      + "change, so RMSNorm before/after is unnecessary.",
+    example:
+      "Q/K-norm pattern:\n"
+      + "  split_heads → q_norm[per_head] → merge_heads → linear_bridge",
   },
   adapter_split_heads: {
     title: "split_heads — split into head dimension",
     what:
-      "Reshape (B, S, nh*hd) → (B, S, nh, hd). Inverse of "
-      + "merge_heads.",
+      "Inverse of merge_heads. Reshape (B, S, nh*hd) → (B, S, nh, hd). "
+      + "Zero parameters, pure view.",
     why:
-      "Use before a per-head op (e.g. RoPE applied per-head) when "
-      + "the upstream brick produces a flat residual.",
-    inputs: "(B, S, nh*hd).",
-    outputs: "(B, S, nh, hd).",
-    normalization: "No norm. Pure reshape.",
+      "Use BEFORE a per-head operation when the upstream produces a "
+      + "flat residual. Common cases:\n\n"
+      + "1. Per-head RoPE — RoPE rotates each head's Q/K separately; "
+      + "needs the head dim explicit.\n"
+      + "2. Per-head LayerNorm/RMSNorm (Q/K norm in MLA, Mistral) — "
+      + "the norm is per-head, scale-shared.\n"
+      + "3. Per-head custom kernels — sliding-window attention, "
+      + "compressed attention, anything that operates on (nh, S, hd) "
+      + "rather than (S, H).",
+    inputs: "(B, S, nh*hd) — flat residual-shaped tensor.",
+    outputs: "(B, S, nh, hd) — per-head tensor.",
+    normalization:
+      "No norm needed for the reshape itself. If you're splitting to "
+      + "apply per-head Q/K norm, the norm comes IMMEDIATELY after "
+      + "this adapter.",
+    example:
+      "RoPE pattern:\n"
+      + "  linear_q → split_heads → rope[per_head] → "
+      + "merge_heads → attention_kernel",
   },
   adapter_transpose_bnsd: {
-    title: "transpose_bnsd — BNSD ↔ BSND layout swap",
+    title: "transpose_bnsd — BNSD ↔ BSND axis swap",
     what:
-      "Swaps the seq and head axes: (B, S, nh, hd) ↔ (B, nh, S, hd).",
+      "Permutes the seq and head axes: "
+      + "(B, S, nh, hd) ↔ (B, nh, S, hd). Pure layout change, no "
+      + "memory copy on Metal (lazy strided view).",
     why:
-      "Some attention kernels expect (B, nh, S, hd); others "
-      + "(B, S, nh, hd). Drop this adapter when layouts disagree.",
-    inputs: "(B, S, nh, hd) or (B, nh, S, hd).",
-    outputs: "Other ordering of the same dims.",
-    normalization: "No norm.",
+      "Attention kernel libraries disagree on the canonical layout:\n\n"
+      + "• `mx.fast.scaled_dot_product_attention` (MPS SDPA) → "
+      + "(B, nh, S, hd) — BNSD\n"
+      + "• Most custom Metal kernels (TileLang sparse_mla, "
+      + "lightning_indexer) → (B, S, nh, hd) — BSND\n"
+      + "• Older Triton kernels often used BNHD\n\n"
+      + "When you stitch together bricks from different lineages the "
+      + "layouts may not line up. transpose_bnsd flips between BNSD "
+      + "and BSND without changing the underlying data.",
+    inputs:
+      "Either (B, S, nh, hd) or (B, nh, S, hd) — depending on the "
+      + "upstream brick.",
+    outputs:
+      "The other ordering of the same 4 axes. B and hd stay in their "
+      + "original positions.",
+    normalization:
+      "No norm. Layout swaps have no scale effect.",
+    example:
+      "Crossover between an MLX-native attention and a custom "
+      + "TileLang sparse-MLA kernel:\n"
+      + "  mlx_sdpa[BNSD] → transpose_bnsd → tilelang_sparse_mla[BSND]",
   },
   adapter_linear_bridge: {
-    title: "linear_bridge — H_in → H_out projection",
+    title: "linear_bridge — H_in → H_out trainable projection",
     what:
-      "Plain nn.Linear used to bridge mismatched residual widths.",
+      "A plain `nn.Linear(H_in, H_out)` matrix. The only adapter "
+      + "with real parameters (~H_in*H_out weights) — every other "
+      + "adapter is a reshape / norm / explicit add. Bridges two "
+      + "bricks whose residual widths don't match.",
     why:
-      "Insert between two bricks when their residual H differs "
-      + "(e.g. an upstream MLA emits 2*H_residual due to "
-      + "decoupled-Q convention).",
+      "Main use case: bridging incompatible residual widths between "
+      + "bricks. On the canvas the residual stream has one fixed "
+      + "width H (e.g. 128) and every brick passes (B,S,H)→(B,S,H). "
+      + "linear_bridge is the explicit escape hatch for the 5% of "
+      + "topologies that break that contract.\n\n"
+      + "FOUR concrete scenarios:\n\n"
+      + "1. Decoupled-Q convention — most MLA / attention bricks take "
+      + "(B,S,H) and return (B,S,H) via an internal W_O. But if an "
+      + "architect wants the attention block to expose its raw "
+      + "nh*head_dim Q-space outward (skipping W_O), and the next "
+      + "brick expects a different H, drop a linear_bridge between.\n\n"
+      + "2. Mid-stack width change — funnel-style architectures "
+      + "(Funnel Transformer, MobileLLM with tied projections) shrink "
+      + "H mid-stack for efficiency: mlp[H=512] → linear_bridge[512→256] "
+      + "→ attention[H=256] → ...\n\n"
+      + "3. Cross-model transplant — pulling an attention brick from "
+      + "Llama-3 8B (H=4096) and dropping it into Tiny Aya (H=128) "
+      + "needs a bridge or shape contracts blow up. Think of it as a "
+      + "doorway between rooms with different ceiling heights.\n\n"
+      + "4. A/B experiments — shunting attention → linear_bridge → mlp "
+      + "(instead of attention → mlp) adds one trainable transform to "
+      + "see whether a two-stage output projection improves the "
+      + "downstream loss. Cost: ~H_in*H_out new params.",
     inputs: "(B, S, H_in).",
-    outputs: "(B, S, H_out).",
+    outputs:
+      "(B, S, H_out). H_in and H_out are independent constructor "
+      + "knobs — that's the entire point.",
     normalization:
-      "Optional. Insert RMSNorm after if the projection changes "
-      + "scale significantly.",
+      "Optional. Insert RMSNorm AFTER if H_out is much different from "
+      + "H_in (large scale change can destabilise the downstream "
+      + "block). In practice, follow with the downstream brick's "
+      + "own pre_norm and skip the explicit norm here.",
+    example:
+      "Funnel pattern:\n"
+      + "  mlp[H=512] → linear_bridge[H_in=512, H_out=256] → \n"
+      + "  attention[H=256, num_heads=4, head_dim=64]\n"
+      + "Adds 512*256 = 131k params. Compare to MLP's 4*H*H = "
+      + "~1M params — bridge is cheap.",
+    reference:
+      "Funnel Transformer (Dai et al. 2020) for the H-shrink "
+      + "pattern; MobileLLM (Liu et al. 2024) for tied-projection "
+      + "transplant; DeepSeek-V3 §3.2 for decoupled-Q internals.",
   },
   adapter_rmsnorm: {
-    title: "rmsnorm — Root Mean Square Norm",
+    title: "rmsnorm — Root Mean Square Layer Norm",
     what:
-      "Standard RMSNorm: divides by sqrt(mean(x²) + eps) then "
-      + "scales by a learned gamma. No bias term, unlike LayerNorm.",
+      "Normalises along the H dim by sqrt(mean(x²) + eps) then "
+      + "scales by a learned gamma vector of length H. Crucially:\n"
+      + "  • NO mean-subtraction (unlike LayerNorm — saves one pass)\n"
+      + "  • NO bias term (gamma only — half the parameters)\n"
+      + "  • eps adds numerical stability (1e-6 / 1e-5 typical)\n"
+      + "Implementation: `x * gamma / sqrt(mean(x*x) + eps)`.",
     why:
-      "Pre-norm or post-norm gate. Most modern LLMs (Llama, Mistral, "
-      + "DeepSeek, Gemma) use RMSNorm pre-attention + pre-MLP.",
-    inputs: "(B, S, H).",
-    outputs: "(B, S, H). Shape-preserving.",
+      "The de-facto pre-norm gate for every modern open LLM (Llama 1-4, "
+      + "Mistral, DeepSeek V2/V3/V4, Gemma 2-4, Qwen 2-3, MoE GPT-OSS, "
+      + "Phi, OLMo). Two reasons:\n\n"
+      + "1. Cheaper than LayerNorm — skips mean subtraction (one pass + "
+      + "    one storage) and has no bias term.\n"
+      + "2. Empirically more stable at fp16/bf16 — mean-subtract can "
+      + "    introduce small numerical drift; RMSNorm avoids it.\n\n"
+      + "Use pre-norm (BEFORE attention/MLP, inside the residual "
+      + "branch) for stable deep stacks. Post-norm placement is rare "
+      + "and tends to need careful init.",
+    inputs: "(B, S, H). H must match the gamma vector's length.",
+    outputs:
+      "(B, S, H). Output magnitude is bounded — even if input has "
+      + "huge variance, output is ~ O(sqrt(H)).",
     normalization:
-      "Insert BEFORE attention/MLP (pre-norm). post-norm is rare. "
-      + "eps default 1e-6.",
+      "This IS the norm. Typical placement: pre-norm wrapping the "
+      + "attention block, then ANOTHER pre-norm wrapping the MLP "
+      + "block — `x + attn(norm1(x)); x + mlp(norm2(x))`.\n\n"
+      + "Default eps = 1e-6 for fp32/bf16; bump to 1e-5 if you see "
+      + "NaN at fp16 training.",
+    example:
+      "Llama pattern (per layer, 2 rmsnorms):\n"
+      + "  h = x + attention(rmsnorm(x))\n"
+      + "  out = h + mlp(rmsnorm(h))",
+    reference: "Zhang & Sennrich 2019 (RMSNorm paper).",
   },
   adapter_residual: {
-    title: "residual — explicit Add",
+    title: "residual — explicit Add (y = a + b)",
     what:
-      "Adds the brick output back to the upstream residual stream. "
-      + "Implicit in most blocks; this adapter makes it explicit "
-      + "for advanced topologies.",
+      "Adds two same-shape tensors element-wise. No parameters, no "
+      + "norms, just `y = a + b`. The 'residual connection' in a "
+      + "Transformer.\n\n"
+      + "In standard blocks (attention, MLP, MoE) the residual ADD is "
+      + "IMPLICIT — the block accepts x and returns `x + block(x)` "
+      + "internally. The explicit residual brick is for topologies "
+      + "that need to control the join point.",
     why:
-      "Use only when you've turned off a brick's implicit residual "
-      + "or you're stitching together parallel branches manually.",
-    inputs: "Two tensors of the same shape.",
-    outputs: "Sum of inputs.",
-    normalization: "None.",
+      "Reach for the explicit residual brick in 3 cases:\n\n"
+      + "1. Parallel-block join — when GQA and MLP branches run in "
+      + "parallel (Tiny Aya, PaLM-style) the architect explicitly "
+      + "ADDs both branch outputs back into the residual stream.\n\n"
+      + "2. Disabled implicit residual — some experimental brick "
+      + "variants ship with `residual_connection=False` to let you "
+      + "control the topology externally. Drop a residual node to "
+      + "restore the skip.\n\n"
+      + "3. Skip-connection topologies — U-Net-style "
+      + "encoder/decoder, deep transformer with cross-layer skips, "
+      + "or any case where the residual source is NOT the immediate "
+      + "upstream brick.",
+    inputs:
+      "Two tensors of identical shape (typically both (B, S, H)). "
+      + "The canvas FlowCanvas wires both edges into the same target "
+      + "node; the residual brick mean-reduces or sums per topology.",
+    outputs:
+      "a + b — same shape as either input. NaN-safe if both inputs "
+      + "are finite; no overflow handling (downstream norm catches "
+      + "scale drift).",
+    normalization:
+      "None — the residual itself doesn't normalise. The standard "
+      + "pattern is rmsnorm BEFORE the block that feeds the residual, "
+      + "not after the join. If a + b grows unbounded across layers, "
+      + "the post-stack final norm + LR scheduling are the right "
+      + "fix, not a per-join norm.",
+    example:
+      "Tiny Aya parallel-block:\n"
+      + "  pre → [attn branch, mlp branch] → residual(attn, mlp) → moe",
   },
 };
 
@@ -958,7 +1098,6 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
         background: "rgba(15, 23, 42, 0.55)",
         // Promote to its own compositing layer so mousemove over the
         // backdrop doesn't invalidate the canvas paint underneath.
-        transform: "translateZ(0)",
         willChange: "opacity",
         display: "flex",
         alignItems: "center",
@@ -1064,6 +1203,43 @@ export function HelpModal({ topic, onClose }: HelpModalProps): JSX.Element {
                     <WorkedExampleDiagram example={ex} />
                   </Section>
                 ) : null;
+              })()}
+              {(() => {
+                const bw = entry.backward ?? BACKWARD_TOPICS[topic];
+                if (!bw) return null;
+                return (
+                  <Section label="Backward pass (∂L / VJP)"
+                            testid="help-modal-backward">
+                    <div style={{ marginBottom: 6, color: "#e8e8e8",
+                                   fontSize: 12, lineHeight: 1.5 }}>
+                      <strong style={{ color: "#f5b841" }}>
+                        What we differentiate:
+                      </strong>{" "}
+                      <span data-testid="help-modal-backward-diff">
+                        {bw.differentiates}
+                      </span>
+                    </div>
+                    <div style={{ marginBottom: 6, color: "#e8e8e8",
+                                   fontSize: 12, lineHeight: 1.5 }}>
+                      <strong style={{ color: "#4ec9b0" }}>
+                        Chain-rule walkthrough:
+                      </strong>{" "}
+                      <span data-testid="help-modal-backward-chain">
+                        {bw.chain_rule}
+                      </span>
+                    </div>
+                    <div style={{ marginBottom: 4,
+                                   fontFamily: "ui-monospace, monospace",
+                                   fontSize: 12, color: "#7bc47f",
+                                   background: "rgba(123, 196, 127, 0.08)",
+                                   border: "1px solid rgba(123,196,127,0.25)",
+                                   padding: "6px 10px", borderRadius: 4 }}
+                         data-testid="help-modal-backward-identity">
+                      <strong>Key identity: </strong>
+                      {bw.key_identity}
+                    </div>
+                  </Section>
+                );
               })()}
               {(() => {
                 const keys = TOPIC_FOUNDATIONS[topic] ?? [];

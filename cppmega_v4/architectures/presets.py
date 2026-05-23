@@ -81,11 +81,28 @@ def _deepseek_v3(hidden_size: int) -> list[dict[str, Any]]:
 
 
 def _deepseek_v4_flash(hidden_size: int) -> list[dict[str, Any]]:
-    # DeepSeek V4 Flash uses compressed attention and memory blocks:
-    # 1. CSA/HCA Hybrid (csa_hca) cross-head compressed attention
-    # 2. Standalone local engram (n-gram) branch for causal sequence memory
-    # 3. DSv4 MLA sparse attention block
-    # 4. Mixture of Experts (moe)
+    """DeepSeek V4 Flash — full mini-model mirroring Raschka's diagram.
+
+    Architecture (per https://sebastianraschka.com/llm-architecture-gallery
+    + DeepSeek V4 Flash paper):
+      input → abs_pos_embed (positional residual)
+            → 3 × backbone layer:
+                 lightning_indexer (DSA top-k key selector, ratio 1/128)
+                 csa_hca (compressed self+history cross-attn, ratio 1/4)
+                 engram (long-term memory residual)
+                 dsv4_attention (hash-indexed sparse MLA)
+                 rmsnorm (post-norm)
+                 moe (sparse MoE FFN)
+            → rmsnorm (final norm)
+            → nemotron_h_mtp (multi-token prediction drafter head)
+
+    Compression contract — DSA uses:
+      • top_k = S/128 (lightning_indexer cuts key set 128× per query)
+      • kv_lora_rank = H/4 (MLA LoRA compresses KV)
+      • engram memory slots = 256 (long-term retention)
+
+    Pair with mtp_weighted loss for the drafter head (k=2, beta=0.5).
+    """
     hd = 64
     if hidden_size % hd != 0:
         if hidden_size % 32 == 0:
@@ -95,14 +112,47 @@ def _deepseek_v4_flash(hidden_size: int) -> list[dict[str, Any]]:
         else:
             hd = hidden_size // 2
     nh = hidden_size // hd
-    return [
-        {"kind": "csa_hca", "name": "dsv4_csa_hca",
-         "params": {"num_heads": nh, "head_dim": hd}},
-        {"kind": "engram", "name": "dsv4_engram"},
-        {"kind": "dsv4_attention", "name": "dsv4_attn"},
-        {"kind": "moe", "name": "dsv4_moe",
-         "params": {"num_experts": 6, "top_k": 2}},
-    ]
+    # DSA compression knobs — 1/128 sparse keys, 1/4 KV LoRA.
+    top_k = max(4, hidden_size // 128)
+    kv_lora_rank = max(16, hidden_size // 4)
+
+    def _layer(i: int) -> list[dict[str, Any]]:
+        return [
+            {"kind": "lightning_indexer", "name": f"dsv4_idx_{i}",
+             "params": {"top_k": top_k, "index_dim": 32}},
+            {"kind": "csa_hca", "name": f"dsv4_csa_hca_{i}",
+             "params": {"num_heads": nh, "head_dim": hd}},
+            {"kind": "engram", "name": f"dsv4_engram_{i}",
+             # V4 Engram block uses ngram-memory semantics (n=4 default,
+             # 256-entry embed table). Use defaults — block is doc_id
+             # aware; capacity tuning is a separate ticket.
+             "params": {}},
+            {"kind": "dsv4_attention", "name": f"dsv4_attn_{i}",
+             "params": {"num_heads": nh, "head_dim": hd,
+                        "kv_lora_rank": kv_lora_rank,
+                        "top_k": top_k}},
+            {"kind": "rmsnorm", "name": f"dsv4_post_norm_{i}"},
+            {"kind": "moe", "name": f"dsv4_moe_{i}",
+             "params": {"num_experts": 6, "top_k": 2,
+                        "capacity_factor": 1.25}},
+        ]
+
+    layers: list[dict[str, Any]] = []
+    for i in range(3):
+        layers.extend(_layer(i))
+
+    return (
+        # Input: learned absolute positional residual.
+        [{"kind": "abs_pos_embed", "name": "dsv4_pos",
+          "params": {"max_position_embeddings": 4096}}]
+        + layers
+        + [
+            {"kind": "rmsnorm", "name": "dsv4_final_norm"},
+            # MTP drafter head — produces k=2 lookahead tokens.
+            {"kind": "nemotron_h_mtp", "name": "dsv4_mtp",
+             "params": {"drafter_k": 2}},
+        ]
+    )
 
 
 def _gemma4(hidden_size: int) -> list[dict[str, Any]]:
@@ -113,6 +163,9 @@ def _gemma4(hidden_size: int) -> list[dict[str, Any]]:
     global_params = {"num_attention_heads": nh, "num_key_value_heads": nkv,
                      "head_dim": 64}
     return [
+        {"kind": "per_layer_embed", "name": "gemma4_ple",
+         "params": {"layer_index": 0, "num_layers": 26}},
+    ] + [
         {"kind": "gqa_sliding", "name": f"gemma_sw_{i}",
          "params": dict(sliding_params)} for i in range(5)
     ] + [

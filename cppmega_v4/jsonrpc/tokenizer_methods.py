@@ -31,10 +31,16 @@ from cppmega_v4.probe import TokenizerCapabilities, introspect_tokenizer
 # tokenizer.json files when shipped via the widget bundle. Resolving
 # real paths is the GUI's job; the backend just declares the names.
 PRESET_LIBRARY: tuple[str, ...] = (
+    # V7-Q13: native cppmega tokenizer surfaces first so operator's
+    # default choice is the one that ships with the local repo.
+    "cppmega_native_65k",
     "cppmega_v3", "nanochat_v3",
     "gpt-4-o200k", "gpt-3.5-cl100k", "gpt-2-p50k",
     "llama-3", "mistral", "gemma", "qwen",
     "deepseek-v3", "phi-3", "claude",
+    # Sentinel — UI shows a file-picker when this is selected so the
+    # operator can point at any tokenizer.json on disk.
+    "<custom>",
 )
 
 
