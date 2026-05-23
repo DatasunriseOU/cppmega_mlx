@@ -592,6 +592,21 @@ export function App(): JSX.Element {
             };
             reader.readAsText(file);
           }}
+          onInspectCheckpoint={async (path: string) => {
+            // V7-C03: thin pass-through to ckpt.inspect RPC. Errors
+            // surface as the TopBar's "no cppmega metadata" / error
+            // branch — they should not blow up the surrounding menu.
+            return rpc.call<{
+              exists: boolean;
+              has_metadata?: boolean;
+              cppmega_version?: string | null;
+              arch_hash?: string | null;
+              opt_kind?: string | null;
+              opt_lr?: number | null;
+              global_step?: number | null;
+              error?: string | null;
+            }>("ckpt.inspect", { path });
+          }}
           trainDisabled={
             (() => {
               // V3-8/V3-9: gate Train on gotcha severity. The verify RPC

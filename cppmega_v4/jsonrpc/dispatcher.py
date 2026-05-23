@@ -42,6 +42,9 @@ from cppmega_v4.jsonrpc.roundtrip_method import (
 from cppmega_v4.jsonrpc.ablation_method import (
     AblationRunParams, ablation_run,
 )
+from cppmega_v4.jsonrpc.ckpt_inspect_method import (
+    CkptInspectParams, ckpt_inspect,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -123,6 +126,10 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "ablation.run": (
         AblationRunParams,
         lambda p, c: ablation_run(p, cache=c),
+    ),
+    "ckpt.inspect": (
+        CkptInspectParams,
+        lambda p, c: ckpt_inspect(p, cache=c),
     ),
 }
 

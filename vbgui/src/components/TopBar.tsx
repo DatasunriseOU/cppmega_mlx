@@ -1,8 +1,20 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MemoryBar } from "./MemoryBar";
 import type { SpecState, TopologyFactory } from "@/state/spec";
 
 export type RunMode = "smoke" | "full" | "train";
+
+/** V7-C03: shape returned by ckpt.inspect RPC. */
+export interface CkptInspectInfo {
+  exists: boolean;
+  has_metadata?: boolean;
+  cppmega_version?: string | null;
+  arch_hash?: string | null;
+  opt_kind?: string | null;
+  opt_lr?: number | null;
+  global_step?: number | null;
+  error?: string | null;
+}
 
 export interface TopBarProps {
   state: SpecState;
@@ -46,6 +58,10 @@ export interface TopBarProps {
   /** G11: save/load callbacks. */
   onSaveSpec?: () => void;
   onLoadSpec?: (file: File) => void;
+  /** V7-C03: callback to inspect a checkpoint path's metadata before
+   *  warm-start. UI fires this on debounced change of ckpt-load-path
+   *  and renders arch_hash / opt_kind / version inline. */
+  onInspectCheckpoint?: (path: string) => Promise<CkptInspectInfo>;
 }
 
 export function TopBar(p: TopBarProps): JSX.Element {
@@ -63,6 +79,31 @@ export function TopBar(p: TopBarProps): JSX.Element {
   // surfaces extras.train.fim_active + fim_ratio so the UI honest-closure
   // shows the FIM math actually fired.
   const [fimEnabled, setFimEnabled] = useState<boolean>(false);
+  // V7-C03: cached metadata for the current ckpt-load-path. Populated
+  // by a 300ms-debounced ckpt.inspect call so the user sees arch_hash /
+  // opt_kind / version before clicking Train with warm-start.
+  const [ckptInfo, setCkptInfo] = useState<CkptInspectInfo | null>(null);
+  const [ckptInfoLoading, setCkptInfoLoading] = useState<boolean>(false);
+  useEffect(() => {
+    if (!p.onInspectCheckpoint) return;
+    const path = ckptLoadPath.trim();
+    if (!path) { setCkptInfo(null); return; }
+    let cancelled = false;
+    setCkptInfoLoading(true);
+    const t = setTimeout(async () => {
+      try {
+        const info = await p.onInspectCheckpoint!(path);
+        if (!cancelled) { setCkptInfo(info); setCkptInfoLoading(false); }
+      } catch (err) {
+        if (!cancelled) {
+          setCkptInfo({ exists: false,
+                        error: err instanceof Error ? err.message : String(err) });
+          setCkptInfoLoading(false);
+        }
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [ckptLoadPath, p.onInspectCheckpoint]);
   return (
     <header data-testid="top-bar"
             style={{ height: 56, display: "flex", alignItems: "center",
@@ -236,6 +277,57 @@ export function TopBar(p: TopBarProps): JSX.Element {
                        onChange={(e) => setCkptLoadPath(e.target.value)}
                        style={{ width: 200 }} />
               </label>
+              {ckptLoadPath && (
+                <div data-testid="ckpt-inspect-block"
+                     style={{ padding: "2px 0 0 84px", fontSize: 10,
+                              color: "#374151", fontFamily: "monospace",
+                              lineHeight: 1.4 }}>
+                  {ckptInfoLoading && (
+                    <span data-testid="ckpt-inspect-loading"
+                          style={{ color: "#9ca3af" }}>
+                      inspecting…
+                    </span>
+                  )}
+                  {!ckptInfoLoading && ckptInfo && !ckptInfo.exists && (
+                    <span data-testid="ckpt-inspect-missing"
+                          style={{ color: "#dc2626" }}>
+                      file not found
+                    </span>
+                  )}
+                  {!ckptInfoLoading && ckptInfo?.exists
+                    && !ckptInfo.has_metadata && (
+                    <span data-testid="ckpt-inspect-no-metadata"
+                          style={{ color: "#d97706" }}>
+                      no cppmega metadata
+                      {ckptInfo.error ? ` (${ckptInfo.error})` : ""}
+                    </span>
+                  )}
+                  {!ckptInfoLoading && ckptInfo?.has_metadata && (
+                    <div data-testid="ckpt-inspect-info"
+                         style={{ display: "flex", flexDirection: "column",
+                                  gap: 1 }}>
+                      <span data-testid="ckpt-inspect-version">
+                        v: {ckptInfo.cppmega_version ?? "?"}
+                      </span>
+                      <span data-testid="ckpt-inspect-arch-hash"
+                            title={ckptInfo.arch_hash ?? ""}>
+                        arch: {ckptInfo.arch_hash
+                          ? ckptInfo.arch_hash.slice(0, 12) + "…"
+                          : "?"}
+                      </span>
+                      <span data-testid="ckpt-inspect-opt-kind">
+                        opt: {ckptInfo.opt_kind ?? "?"}
+                        {ckptInfo.opt_lr !== null
+                          && ckptInfo.opt_lr !== undefined
+                          ? ` · lr=${ckptInfo.opt_lr}` : ""}
+                      </span>
+                      <span data-testid="ckpt-inspect-step">
+                        step: {ckptInfo.global_step ?? "?"}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             <label style={{ padding: "6px 12px", display: "flex",
                             alignItems: "center", gap: 6, fontSize: 11,

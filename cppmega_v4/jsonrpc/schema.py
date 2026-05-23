@@ -749,6 +749,7 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "suggest_optim_groups",
     "data.roundtrip_check",
     "ablation.run",
+    "ckpt.inspect",
 })
 
 
