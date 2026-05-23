@@ -140,6 +140,33 @@ describe("TopBar", () => {
     expect(onCancelTrain).toHaveBeenCalledTimes(1);
   });
 
+  it("V7-H06b: status shows 'aborting…' while trainAborting=true", () => {
+    render(<TopBar {...defaultTopProps({
+      trainInFlight: true,
+      trainRunId: "train-1",
+      trainAborting: true,
+      onCancelTrain: vi.fn(),
+    })} />);
+    expect(screen.getByTestId("top-bar-train-status").textContent)
+      .toBe("aborting…");
+    expect(screen.getByTestId("run-pipeline-cancel"))
+      .toHaveProperty("disabled", true);
+    expect((screen.getByTestId("run-pipeline-cancel") as HTMLElement)
+      .textContent).toBe("Aborting…");
+  });
+
+  it("V7-H06b: status shows 'paused' while trainPaused=true", () => {
+    render(<TopBar {...defaultTopProps({
+      trainInFlight: true,
+      trainRunId: "train-1",
+      trainPaused: true,
+      onPauseTrain: vi.fn(),
+      onResumeTrain: vi.fn(),
+    })} />);
+    expect(screen.getByTestId("top-bar-train-status").textContent)
+      .toBe("paused");
+  });
+
   it("toggle reveals Full + Train menu", () => {
     const onRunPipeline = vi.fn();
     render(<TopBar {...defaultTopProps({ onRunPipeline })} />);

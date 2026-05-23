@@ -107,9 +107,20 @@ def run_pipeline(spec: VerifyParams, pipeline: Pipeline) -> PipelineReport:
     for name in pipeline.stages:
         # V7-H10: cancellation gate before each stage.
         if abort_token is not None and abort_token in _ABORT_TOKENS:
+            # V7-H06b/H10: mirror the train-side StageResult shape so
+            # the UI sees extras.aborted=True on the cancelled stage,
+            # and mark the run as aborted in the registry so
+            # pipeline.status reflects the cancel even when train
+            # itself never ran.
+            try:
+                from cppmega_v4.runtime import run_registry as _rr
+                _rr.mark_aborted(abort_token)
+            except Exception:
+                pass
             results.append(StageResult(
                 name=name, status="cancelled", elapsed_ms=0.0,
                 error={"type": "Aborted", "abort_token": abort_token},
+                extras={"aborted": True, "abort_token": abort_token},
             ))
             for remaining in pipeline.stages[len(results):]:
                 results.append(StageResult(

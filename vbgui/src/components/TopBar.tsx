@@ -62,6 +62,10 @@ export interface TopBarProps {
   trainPaused?: boolean;
   onPauseTrain?: () => void;
   onResumeTrain?: () => void;
+  /** V7-H06b: surfaces UI-side "abort RPC fired, waiting for backend
+   * to confirm running=false" so the user sees the cancel is in
+   * progress instead of an instant disabled-button flip. */
+  trainAborting?: boolean;
   /** V3-8/V3-9: when present, Train button is rendered disabled with
    *  reason exposed via data-testid='top-bar-train-disabled-reason'. */
   trainDisabled?: { reason: string } | null;
@@ -274,10 +278,15 @@ export function TopBar(p: TopBarProps): JSX.Element {
       </span>
 
       <span data-testid="top-bar-train-status"
-            style={{ fontSize: 10, color: p.trainInFlight ? "#d97706"
-                                                          : "#9ca3af",
+            style={{ fontSize: 10,
+                     color: p.trainAborting ? "#b91c1c"
+                          : p.trainPaused   ? "#7c3aed"
+                          : p.trainInFlight ? "#d97706"
+                                            : "#9ca3af",
                      fontFamily: "monospace" }}>
-        {p.trainInFlight ? "training" : "idle"}
+        {p.trainAborting ? "aborting…"
+          : p.trainPaused ? "paused"
+          : p.trainInFlight ? "training" : "idle"}
       </span>
       <div style={{ position: "relative" }}>
         <button data-testid="run-pipeline"
@@ -286,10 +295,13 @@ export function TopBar(p: TopBarProps): JSX.Element {
         </button>
         <button data-testid="run-pipeline-cancel"
                 onClick={() => p.onCancelTrain?.()}
-                disabled={!p.trainInFlight || !p.trainRunId}
-                title={p.trainInFlight ? "Cancel Train" : "No Train run active"}
+                disabled={!p.trainInFlight || !p.trainRunId
+                          || p.trainAborting}
+                title={p.trainAborting ? "Abort pending — waiting for backend"
+                      : p.trainInFlight ? "Cancel Train"
+                      : "No Train run active"}
                 style={{ marginLeft: 4 }}>
-          Cancel
+          {p.trainAborting ? "Aborting…" : "Cancel"}
         </button>
         {p.onPauseTrain && p.onResumeTrain && (
           <button data-testid="run-pipeline-pause"

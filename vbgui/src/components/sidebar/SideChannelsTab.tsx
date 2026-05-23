@@ -7,14 +7,53 @@ import type {
   SideChannelMode,
   SideChannelState,
 } from "@/state/spec";
+import type { RpcClient } from "@/lib/rpc";
 
 export interface SideChannelsTabProps {
   sideChannels: SideChannelState;
   availableChannels: string[];
   selectedTrainChannels: string[];
   gotchas: GotchaState[];
+  rpc?: RpcClient | null;
+  tokenizerSource?: string | null;
   onApply: (next: SideChannelState) => void;
   onTrainChannelsChange: (next: string[]) => void;
+}
+
+interface TensorPreviewPayload {
+  shape: number[];
+  dtype: string;
+  sample: (number | boolean)[];
+}
+
+interface SideChannelPreviewPayload {
+  token_count: number;
+  prompt_ids: TensorPreviewPayload;
+  model_kwargs: Record<string, TensorPreviewPayload>;
+  side_channels: Record<string, Record<string, TensorPreviewPayload>>;
+  provenance: Record<string, string>;
+  rendered_platform_context: string;
+  cache_key: string;
+  elapsed_ms: number;
+}
+
+/** V7-H11: side_channels.apply backend verdict. */
+interface SideChannelApplyPayload {
+  ok: boolean;
+  active_count: number;
+  inactive_count: number;
+  families: Array<{
+    family: string;
+    mode: string;
+    active: boolean;
+    reason: string;
+    columns_requested: string[];
+    columns_present: string[];
+    columns_missing: string[];
+  }>;
+  gotchas: Array<{ id: string; severity: string; message: string;
+                    reference?: string }>;
+  elapsed_ms: number;
 }
 
 const MODES: SideChannelMode[] = ["off", "auto", "require", "if_available"];
@@ -32,7 +71,7 @@ type AdapterName = typeof ADAPTERS[number];
 
 export function SideChannelsTab({
   sideChannels, availableChannels, selectedTrainChannels, gotchas, onApply,
-  onTrainChannelsChange,
+  onTrainChannelsChange, rpc = null, tokenizerSource = null,
 }: SideChannelsTabProps): JSX.Element {
   const [draft, setDraft] = useState<SideChannelState>(sideChannels);
   const [platform, setPlatform] = useState({
@@ -45,6 +84,13 @@ export function SideChannelsTab({
   const [prompt, setPrompt] = useState("int add(int a, int b) { return a + b; }");
   const [adapter, setAdapter] = useState<AdapterName>("cpp");
   const [tensorPreview, setTensorPreview] = useState<string[]>([]);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  // V7-H11: backend-confirmed Apply verdict (per-family resolution +
+  // gotchas + ok/inactive counts). null = not yet applied this draft.
+  const [applyResult, setApplyResult] =
+    useState<SideChannelApplyPayload | null>(null);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const [applying, setApplying] = useState<boolean>(false);
 
   useEffect(() => setDraft(sideChannels), [sideChannels]);
 
@@ -248,12 +294,7 @@ export function SideChannelsTab({
                   style={{ width: "100%", minHeight: 54,
                            fontFamily: "monospace", fontSize: 11 }} />
         <button data-testid="side-channel-preview-run"
-                onClick={() => setTensorPreview(buildTensorPreview({
-                  sideChannels: draft,
-                  prompt,
-                  platformPreview,
-                  adapter,
-                }))}>
+                onClick={() => { void runPreview(); }}>
           Build preview
         </button>
         <pre data-testid="side-channel-preview" style={preview}>
@@ -265,7 +306,9 @@ platform=${platformPreview || "unspecified"}
 families=${enabledFamilies.join(",") || "none"}`}
         </pre>
         <pre data-testid="side-channel-preview-tensors" style={preview}>
-          {tensorPreview.length === 0 ? "not built" : tensorPreview.join("\n")}
+          {previewError ?? (
+            tensorPreview.length === 0 ? "not built" : tensorPreview.join("\n")
+          )}
         </pre>
       </section>
 
@@ -284,11 +327,77 @@ families=${enabledFamilies.join(",") || "none"}`}
       </section>
 
       <button data-testid="side-channels-apply"
-              onClick={() => onApply(draft)}>
-        Apply
+              disabled={applying}
+              onClick={() => void handleApply()}>
+        {applying ? "Applying…" : "Apply"}
       </button>
+      {applyError && (
+        <div data-testid="side-channels-apply-error"
+             style={{ color: "#b91c1c", fontSize: 11, marginTop: 4 }}>
+          {applyError}
+        </div>
+      )}
+      {applyResult && (
+        <div data-testid="side-channels-apply-result"
+             style={{ marginTop: 6, fontSize: 11,
+                      fontFamily: "monospace" }}>
+          <div data-testid="side-channels-apply-summary"
+               style={{ color: applyResult.ok ? "#047857" : "#b91c1c" }}>
+            applied: {applyResult.active_count} active /
+            {" "}{applyResult.inactive_count} inactive
+            {applyResult.ok ? " · ok" : " · errors"}
+          </div>
+          {applyResult.families.map((f) => (
+            <div key={f.family}
+                 data-testid={`side-channels-apply-family-${f.family}`}
+                 style={{ color: f.active ? "#374151" : "#9ca3af" }}>
+              · {f.family} [{f.mode}]: {f.active ? "active" : "inactive"} — {f.reason}
+            </div>
+          ))}
+          {applyResult.gotchas.map((g) => (
+            <div key={g.id}
+                 data-testid={`side-channels-apply-gotcha-${g.id}`}
+                 style={{ color: g.severity === "error"
+                                ? "#b91c1c" : "#b45309" }}>
+              ! {g.message}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
+
+  async function handleApply() {
+    // V7-H11: ship the local draft through side_channels.apply BEFORE
+    // committing to spec so the user sees backend's per-family
+    // resolution + gotchas inline. Local commit happens regardless so
+    // the rest of the UI (verify wiring, gotchas tab) still sees the
+    // new config even if the backend flags warnings.
+    setApplyError(null);
+    setApplyResult(null);
+    onApply(draft);
+    if (!rpc) {
+      setApplyError("no backend connection — local apply only");
+      return;
+    }
+    setApplying(true);
+    try {
+      const r = await rpc.call<SideChannelApplyPayload>(
+        "side_channels.apply",
+        {
+          side_channels: draft,
+          available_side_channels: availableChannels,
+        },
+      );
+      setApplyResult(r);
+    } catch (err) {
+      setApplyError(
+        err instanceof Error ? `error: ${err.message}` : "error: apply failed",
+      );
+    } finally {
+      setApplying(false);
+    }
+  }
 
   function setFamily(
     name: string,
@@ -317,6 +426,63 @@ families=${enabledFamilies.join(",") || "none"}`}
     ];
     onTrainChannelsChange(ordered);
   }
+
+  async function runPreview() {
+    setPreviewError(null);
+    if (!rpc || !tokenizerSource) {
+      setTensorPreview(buildTensorPreview({
+        sideChannels: draft,
+        prompt,
+        platformPreview,
+        adapter,
+      }));
+      return;
+    }
+    try {
+      const result = await rpc.call<SideChannelPreviewPayload>(
+        "side_channels.preview",
+        {
+          tokenizer_source: tokenizerSource,
+          text: prompt,
+          side_channels: draft,
+          platform_context: platform,
+          language: adapter === "none" ? undefined : adapter,
+          adapter,
+        },
+      );
+      setTensorPreview(formatBackendPreview(result));
+    } catch (err) {
+      setTensorPreview([]);
+      setPreviewError(
+        err instanceof Error ? `error: ${err.message}` : "error: preview failed",
+      );
+    }
+  }
+}
+
+function formatBackendPreview(result: SideChannelPreviewPayload): string[] {
+  const lines = [
+    `prompt_ids shape=${shapeText(result.prompt_ids.shape)} dtype=${result.prompt_ids.dtype}`,
+  ];
+  for (const [name, tensor] of Object.entries(result.model_kwargs)) {
+    lines.push(`${name} shape=${shapeText(tensor.shape)} dtype=${tensor.dtype}`);
+  }
+  for (const [family, columns] of Object.entries(result.side_channels)) {
+    for (const [name, tensor] of Object.entries(columns)) {
+      lines.push(
+        `${name} shape=${shapeText(tensor.shape)} family=${family} dtype=${tensor.dtype}`,
+      );
+    }
+  }
+  for (const [key, value] of Object.entries(result.provenance)) {
+    lines.push(`${key}=${value}`);
+  }
+  lines.push(`cache_key=${result.cache_key.slice(0, 12)}`);
+  return lines;
+}
+
+function shapeText(shape: number[]): string {
+  return `(${shape.join(",")})`;
 }
 
 function buildTensorPreview({

@@ -694,36 +694,20 @@ export function App(): JSX.Element {
     setTrainAborting(false);
   } }, [trainInFlight]);
 
-  // V7-H05: live per-step training events streamed over /ws/train/{run_id}.
-  // The bus pushes {step, loss, lr, overflow} after each opt.update so
-  // the UI can render the loss curve as it grows, not only on
-  // pipeline.run completion.
-  const [liveTrainEvents, setLiveTrainEvents] = useState<
-    Array<{ step: number; loss: number; lr?: number;
-            overflow?: boolean }>>([]);
+  // V7-L37..L41: live per-step training event stream — sparkline,
+  // overflow markers, dead-man-switch, finish toast, WS reconnect.
+  // The hook owns the WebSocket lifecycle; LiveTrainPanel renders.
+  const liveTrainBase = (import.meta.env.VITE_BACKEND_URL as string | undefined)
+                        ?? "http://127.0.0.1:8765";
+  const liveTrain = useLiveTrainStream(
+    liveTrainBase, trainRunId, !!trainInFlight);
+  // Reset buffer when a new run starts.
+  const liveTrainResetRef = useRef(liveTrain.reset);
+  useEffect(() => { liveTrainResetRef.current = liveTrain.reset; },
+           [liveTrain.reset]);
   useEffect(() => {
-    if (!trainRunId || !trainInFlight) return;
-    const base = ((import.meta.env.VITE_BACKEND_URL as string | undefined)
-                  ?? "http://127.0.0.1:8765").replace(/^http/, "ws");
-    let socket: WebSocket;
-    setLiveTrainEvents([]);
-    try {
-      socket = new WebSocket(`${base}/ws/train/${trainRunId}`);
-    } catch {
-      return;
-    }
-    socket.onmessage = (msg) => {
-      try {
-        const frame = JSON.parse(msg.data);
-        if (frame.event) {
-          setLiveTrainEvents((prev) => [...prev, frame.event]);
-        } else if (frame.finish) {
-          socket.close();
-        }
-      } catch { /* ignore malformed */ }
-    };
-    return () => { try { socket.close(); } catch { /* noop */ } };
-  }, [trainRunId, trainInFlight]);
+    if (trainInFlight && trainRunId) liveTrainResetRef.current();
+  }, [trainInFlight, trainRunId]);
 
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
