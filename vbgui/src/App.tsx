@@ -242,8 +242,14 @@ export function App(): JSX.Element {
     // V7-H37: open the verify-progress WS *before* the RPC, then close
     // it on completion. The hook owns the lifecycle once verifyInFlight
     // flips.
+    // V7-H39: capture the spec_hash at request-time; if the user mutates
+    // the canvas while verify is in flight, the recomputed hash on
+    // response will differ → we drop the stale response instead of
+    // overwriting now-current state.
+    let requestHash: string | null = null;
     try {
       const hash = await computeSpecHash(params);
+      requestHash = hash;
       setVerifySpecHash(hash);
       setVerifyInFlight(true);
     } catch {
@@ -265,6 +271,25 @@ export function App(): JSX.Element {
         inference_log?: { brick: string; param: string; value: unknown;
                           source: "user" | "auto"; reason: string }[];
       }>("verify", params);
+
+      // V7-H39: stale-response guard — if the canvas mutated while
+      // verify was in flight, the live snapshot's hash now differs
+      // from what we sent, and applying r would clobber current state.
+      if (requestHash) {
+        try {
+          const liveSnap = wireSpecRef.current;
+          const liveParams = buildVerifyParams(
+            liveSnap.nodes, liveSnap.edges, liveSnap.spec,
+            liveSnap.availableSideChannels, liveSnap.dimEnv,
+          );
+          const liveHash = await computeSpecHash(liveParams);
+          if (liveHash !== requestHash) {
+            // Drop r — user has moved on; the in-flight effect will
+            // schedule a fresh verify against the new snapshot.
+            return;
+          }
+        } catch { /* fallback: apply r as before */ }
+      }
 
       // Aggregate per-brick to a worst-rank-bytes proxy when no sharding.
       const total = sumPerBrick(r.memory_per_brick);
@@ -596,6 +621,12 @@ export function App(): JSX.Element {
       setTrainRunId(activeTrainRunId);
       setTrainInFlight(true);
     }
+    // V7-H40: UI-side correlation token. For train runs we use the
+    // already-generated activeTrainRunId; for verify/smoke/full we
+    // synthesize one so the backend echoes it back and the UI can
+    // match the response to the request across retries / reconnects.
+    const clientRunId = activeTrainRunId
+      ?? `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
       const r = await rpc.call<RunReport>("pipeline.run", {
         // V7-K2: train RPC now also picks up the DimEnvEditor's
@@ -606,7 +637,13 @@ export function App(): JSX.Element {
           snap.dimEnv,
         ),
         pipeline: { stages, stage_options },
+        client_run_id: clientRunId,
       });
+      // V7-H40: drop response if backend echo doesn't match our token.
+      // (Defends against stale retries that land after the UI moved on.)
+      if (r.client_run_id && r.client_run_id !== clientRunId) {
+        return;
+      }
       setRunReport(r);
       // H04: remember run_id of a successful Train so a follow-up
       // warm-start run can reference it.

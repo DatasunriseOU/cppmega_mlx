@@ -22,6 +22,8 @@ export interface RunReport {
   stages: StageResult[];
   overall_status: "ok" | "fail" | "cancelled";
   total_elapsed_ms: number;
+  // V7-H40: backend echoes the UI-supplied correlation token.
+  client_run_id?: string | null;
 }
 
 export interface RunResultModalProps {

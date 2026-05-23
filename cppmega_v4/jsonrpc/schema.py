@@ -207,6 +207,7 @@ class ShardingSpecPayload(BaseModel):
     # megatron_tp_whole_compile error gotchas. 'global' kept as back-compat.
     compile_mode: Literal["regional", "global", "off", "whole_model"] = "regional"
     fp8_enabled: bool = False
+    comm_backend: str = "ring"
 
 
 class RewriterPayload(BaseModel):
@@ -664,6 +665,11 @@ class PipelineRunParams(BaseModel):
 
     spec: VerifyParams
     pipeline: PipelinePayload
+    # V7-H40: UI-generated correlation token. Echoed verbatim in
+    # PipelineRunResult.client_run_id so the UI can match a long-tail
+    # WS event or a pipeline.status poll back to the originating
+    # request even across WS reconnects / retries.
+    client_run_id: str | None = None
 
 
 class PipelineAbortParams(BaseModel):
@@ -729,6 +735,8 @@ class PipelineRunResult(BaseModel):
     stages: list[StageResult]
     overall_status: Literal["ok", "fail", "cancelled"]
     total_elapsed_ms: float
+    # V7-H40: echoed verbatim from PipelineRunParams.client_run_id.
+    client_run_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

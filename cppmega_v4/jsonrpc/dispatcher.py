@@ -203,7 +203,11 @@ def _pipeline_run(params: PipelineRunParams) -> PipelineRunResult:
         "continue_on_failure": params.pipeline.continue_on_failure,
     })
     report = run_pipeline(params.spec, pipeline)
-    return PipelineRunResult.model_validate(report.to_dict())
+    # V7-H40: echo client_run_id verbatim so UI can correlate the
+    # response with its originating request.
+    payload = report.to_dict()
+    payload["client_run_id"] = params.client_run_id
+    return PipelineRunResult.model_validate(payload)
 
 
 def _pipeline_abort(params: PipelineAbortParams) -> PipelineAbortResult:
