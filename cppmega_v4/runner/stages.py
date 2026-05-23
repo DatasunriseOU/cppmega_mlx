@@ -1773,6 +1773,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                 "side_channels_observed": side_channels_observed,
                 "per_brick_grad_norms": _safe_per_brick_grads(
                     all_modules, grads if 'grads' in dir() else None),
+                "attn_head_means": _safe_attn_head_means(
+                    all_modules, emb if 'emb' in dir() else None),
                 "side_channels_forward_effect": {
                     "doc_ids_mask_density": sc_doc_ids_mask_density,
                     "doc_mask_applied": sc_doc_mask_applied,
@@ -2207,6 +2209,19 @@ def _safe_per_brick_grads(model: Any, grads: Any) -> dict[str, float]:
     try:
         from cppmega_v4.runtime.per_brick_probes import per_brick_grad_norms
         return per_brick_grad_norms(model, grads)
+    except Exception:
+        return {}
+
+
+def _safe_attn_head_means(model: Any, x: Any) -> dict[str, list[float]]:
+    """V7-H07: extras.attn_head_means — best-effort wrapper. Returns
+    {attn_brick: per-head mean attention weight}. Empty on any failure
+    so callers always see a dict."""
+    if x is None:
+        return {}
+    try:
+        from cppmega_v4.runtime.per_brick_probes import attn_head_means
+        return attn_head_means(model, x)
     except Exception:
         return {}
 

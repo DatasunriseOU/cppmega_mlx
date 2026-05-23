@@ -2,6 +2,7 @@
 
 import { Fragment, useState } from "react";
 import { LossChart } from "@/components/LossChart";
+import { GradAttnPanel } from "@/components/GradAttnPanel";
 
 export interface StageResult {
   name: string;
@@ -228,6 +229,19 @@ export function RunResultModal({
                                 losses={(extras.losses as unknown[])
                                   .map(Number)
                                   .filter((n) => Number.isFinite(n))}
+                              />
+                            </div>
+                          )}
+                          {s.name === "train" && (
+                            <div data-testid="run-result-grad-attn-wrap"
+                                 style={{ marginBottom: 8 }}>
+                              <GradAttnPanel
+                                gradNorms={
+                                  extras.per_brick_grad_norms as
+                                    Record<string, number> | undefined}
+                                attnHeadMeans={
+                                  extras.attn_head_means as
+                                    Record<string, number[]> | undefined}
                               />
                             </div>
                           )}
