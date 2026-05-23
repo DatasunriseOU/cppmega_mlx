@@ -164,8 +164,14 @@ def stage_parse(ctx: StageContext) -> StageResult:
         ctx.graph = from_block_specs(specs, hidden_size=hidden, instantiate=False)
         ctx.loss = _make_loss(ctx.spec.loss)
         ctx.optim = _make_optim(ctx.spec.optim)
+        # V7-F56b: pass dim_env into ModelBuildSpec so verify_build_spec
+        # can run the symbolic-dim coherence check (nh*head_dim == H).
+        dim_env = (ctx.spec.dim_env.model_dump()
+                   if hasattr(ctx.spec.dim_env, "model_dump")
+                   else dict(ctx.spec.dim_env or {}))
         ctx.build_spec = ModelBuildSpec(
             graph=ctx.graph, loss=ctx.loss, optim=ctx.optim,
+            dim_env=dim_env,
         )
         return _ok("parse", t0, num_nodes=len(ctx.graph.nodes))
     except Exception as exc:

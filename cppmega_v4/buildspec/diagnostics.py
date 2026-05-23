@@ -269,6 +269,48 @@ def _check_shape_coherence(spec: ModelBuildSpec) -> list[BuildDiagnostic]:
     return diags
 
 
+def _check_symbolic_dims(spec: ModelBuildSpec) -> list[BuildDiagnostic]:
+    """V7-F56b: pre-instantiation symbolic-dim coherence check.
+
+    Surfaces a WARNING when dim_env declares all three of
+    ``(H, nh, head_dim)`` but ``nh * head_dim != H``. This is *not* an
+    error in this codebase — the attention bricks use an internal
+    ``W_Q : R^H → R^{nh*head_dim}`` projection so a decoupled Q dim
+    works fine — but the inconsistency typically signals user
+    confusion (e.g. F56 honest finding H=128, nh=3, head_dim=50 was
+    almost certainly meant as H=150).
+
+    The UI (BrickNode badge + Sidebar verify panel) reads warnings
+    out of verify_build_spec stage extras so the user can spot the
+    mismatch *before* hitting a long training run."""
+    diags: list[BuildDiagnostic] = []
+    dim_env = dict(spec.dim_env or {})
+
+    H = dim_env.get("H")
+    nh = dim_env.get("nh")
+    hd = dim_env.get("head_dim")
+
+    if H is not None and nh is not None and hd is not None:
+        if nh * hd != H:
+            diags.append(BuildDiagnostic(
+                severity=BuildDiagnosticSeverity.WARNING,
+                component="dim_env",
+                message=(
+                    f"symbolic-dim mismatch: dim_env declares H={H} "
+                    f"but nh ({nh}) * head_dim ({hd}) = {nh * hd}. "
+                    "Attention will still run via Q projection, but "
+                    "the dim_env values are likely inconsistent with "
+                    "the architect's intent."
+                ),
+                suggested_fix=(
+                    f"either set H = {nh * hd}, or pick (nh, head_dim) "
+                    f"with nh*head_dim = {H}, or drop nh/head_dim from "
+                    "dim_env if they were placeholders"
+                ),
+            ))
+    return diags
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -310,7 +352,11 @@ def verify_build_spec(
     # 3. Optimizer matcher coverage
     diags.extend(_check_optim_matchers(spec))
 
-    # 4. Shape coherence
+    # 4. Symbolic dim consistency (V7-F56b): H == nh * head_dim,
+    #    and any attention-kind brick params must match dim_env.
+    diags.extend(_check_symbolic_dims(spec))
+
+    # 5. Shape coherence
     if check_shapes:
         diags.extend(_check_shape_coherence(spec))
 

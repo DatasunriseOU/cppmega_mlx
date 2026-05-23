@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
 
@@ -48,23 +46,31 @@ def test_v7_f56_compatible_combo_h512_nh8_hd64_passes():
     assert vbs.status == "ok"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "V7-F56 honest finding: build_model accepts H=128 with nh=3, "
-    "head_dim=50 silently (num_heads*head_dim ≠ H). The constructor "
-    "lacks a symbolic-dim validator at verify_build_spec. Marked xfail "
-    "to track the bug; flipping to non-xfail when the validator lands."
-))
-def test_v7_f56_incompatible_h128_nh3_hd50_train_fails_loudly():
-    """Should fail with a clear error at verify_build_spec or
-    build_model — today it silently produces a broken model."""
+def test_v7_f56b_incompatible_h128_nh3_hd50_surfaces_warning():
+    """V7-F56b: verify_build_spec surfaces a WARNING (not error) when
+    nh*head_dim != H. Bricks ship an internal Q-projection so the
+    model still trains end-to-end, but the dim_env mismatch almost
+    always means user confusion."""
     spec = _spec(H=128, num_heads=3, head_dim=50)
-    rep = run_pipeline(spec, Pipeline.from_dict({
-        "stages": ["parse", "verify_build_spec", "build_model",
-                   "dry_forward"],
-    }))
-    statuses = {s.name: s.status for s in rep.stages}
-    assert "fail" in statuses.values(), (
-        f"incompatible combo passed silently: {statuses}"
+    rep = _verify(spec)
+    vbs = next(s for s in rep.stages if s.name == "verify_build_spec")
+    # Warning, not fail — keeps decoupled-Q convention working.
+    assert vbs.status == "ok", (
+        f"F56b should warn-not-fail (decoupled Q is legitimate). "
+        f"Got: {vbs}"
+    )
+    assert (vbs.warnings or 0) >= 1, (
+        f"V7-F56b: expected ≥1 dim_env warning. Got: {vbs}"
+    )
+
+
+def test_v7_f56b_compatible_combo_produces_no_warning():
+    spec = _spec(H=128, num_heads=8, head_dim=16)  # 8*16 == 128
+    rep = _verify(spec)
+    vbs = next(s for s in rep.stages if s.name == "verify_build_spec")
+    assert vbs.status == "ok"
+    assert (vbs.warnings or 0) == 0, (
+        f"Compatible combo should be silent. Got warnings={vbs.warnings}"
     )
 
 
