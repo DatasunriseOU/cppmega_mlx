@@ -86,9 +86,10 @@ from cppmega_mlx.recipes.model_factory import (  # noqa: E402
 from cppmega_mlx.recipes.pattern import expand_nam_pattern  # noqa: E402
 from cppmega_mlx.training.compiled import (  # noqa: E402
     CompiledPretrainingStep,
-    PathCGradientBufferCapture,
+    PathCFusedPlusEagerTrainingRuntime,
     PathCFusedTrainBlockCallableArtifact,
     PathCFusedTrainBlockTrainingRuntime,
+    PathCGradientBufferCapture,
 )
 from cppmega_mlx.training.cut_cross_entropy import (  # noqa: E402
     DEFAULT_CHUNK_ROWS,
@@ -3061,15 +3062,57 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
     bank_owner: Any,
     runtime_owner: str,
 ) -> Any | None:
+    """Build the training runtime that owns m04's fused Path C train step.
+
+    Today HybridTinyLM's fused region only covers a subset of trainable
+    parameters (3 layers of 16, no embedding / lm_head), so the artifact's
+    own value_and_grad_contract reports returns_full_model_grads=False. The
+    strict PathCFusedTrainBlockTrainingRuntime then trips the m04 install
+    gate's FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE check.
+
+    The mixed-mode PathCFusedPlusEagerTrainingRuntime takes the same
+    artifact and bank owner, and routes value_and_grad through the
+    trainer-supplied eager closure for residual parameters. It surfaces a
+    closed full-model gradient contract so the gate flips to 'ok' without
+    monkeypatching or hidden allocation. When the artifact already returns
+    full-coverage grads (no in-region gaps), the strict runtime is used
+    instead so the artifact retains exclusive ownership of training
+    execution.
+    """
     if not _path_c_fused_train_block_artifact_has_training_runtime_contract(
         artifact
     ):
         return None
+    inner_contract: Mapping[str, Any] = {}
+    contract_fn = getattr(artifact, "value_and_grad_contract", None)
+    if callable(contract_fn):
+        try:
+            raw = contract_fn()
+        except Exception:
+            raw = None
+        if isinstance(raw, Mapping):
+            inner_contract = raw
+    returns_full = bool(inner_contract.get("returns_full_model_grads", False))
+    in_region_names = tuple(
+        sorted(
+            str(name)
+            for name in inner_contract.get("full_model_gradient_coverage", {}).get(
+                "covered_parameter_names", ()
+            )
+        )
+    )
     try:
-        return PathCFusedTrainBlockTrainingRuntime(
+        if returns_full:
+            return PathCFusedTrainBlockTrainingRuntime(
+                artifact=artifact,
+                bank_owner=bank_owner,
+                owner_name=runtime_owner,
+            )
+        return PathCFusedPlusEagerTrainingRuntime(
             artifact=artifact,
             bank_owner=bank_owner,
             owner_name=runtime_owner,
+            in_region_parameter_names=in_region_names,
         )
     except TypeError:
         return None

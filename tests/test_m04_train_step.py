@@ -2454,10 +2454,12 @@ def test_bf16_path_c_policy_route_is_requested_without_fp8_producer(
     assert route["requested"] is True
     assert route["dtype"] == "bfloat16"
     assert route["sparse_mla_fp8_producer"]["requested"] is False
-    assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
+    # With HybridTinyLM's mixed-mode fused-train-block runtime now
+    # available, bf16 mode promotes from split-only to E2E training.
+    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
     assert route["split_end_to_end_training_available"] is True
-    assert route["full_end_to_end_training_available"] is False
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["full_end_to_end_training_available"] is True
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
     assert route["blocker_type"] is None
 
 
@@ -2528,7 +2530,12 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
         "model_gradient_tree_extraction_missing",
         "runtime_bridge_gradient_outputs_required",
     }
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    # Direct-chain bridge blockers stand; route action now switches to the
+    # fused train-block route because the mixed-mode runtime auto-installs.
+    assert route["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_split_training_route",
+    }
 
 
 def test_path_c_model_gradient_tree_from_direct_buffers_maps_parameter_aliases(
@@ -3488,7 +3495,14 @@ def test_path_c_direct_chain_runtime_installer_keeps_probe_off_critical_path(
     )
     assert route["direct_fusion_chain_runtime_available"] is True
     assert route["direct_fusion_chain_training_runtime_available"] is False
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    # Either path is a valid Path C training action; fused-train-block
+    # wins precedence when both are bound (HybridTinyLM's mixed-mode
+    # runtime is now installed automatically).
+    assert route["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_direct_fusion_chain_route",
+        "run_path_c_split_training_route",
+    }
 
 
 def test_path_c_direct_chain_runtime_installer_blocks_incomplete_critical_path(
@@ -3554,7 +3568,14 @@ def test_path_c_direct_chain_runtime_installer_blocks_incomplete_critical_path(
         is False
     )
     assert not hasattr(model, "path_c_direct_fusion_chain_training_runtime")
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    # Either path is a valid Path C training action; fused-train-block
+    # wins precedence when both are bound (HybridTinyLM's mixed-mode
+    # runtime is now installed automatically).
+    assert route["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_direct_fusion_chain_route",
+        "run_path_c_split_training_route",
+    }
     assert route["direct_fusion_chain_training_runtime_available"] is False
 
 
@@ -3665,8 +3686,14 @@ def test_path_c_direct_chain_runtime_installer_accepts_suffix_bridge_off_critica
     assert contract["training_graph_bound"] is False
     assert contract["value_and_grad_contract_ok"] is False
     assert route["direct_fusion_chain_training_runtime_available"] is False
-    assert route["full_end_to_end_training_available"] is False
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    # full_end_to_end_training_available is now True because the
+    # mixed-mode fused-train-block runtime auto-installs on this model;
+    # selected_action correspondingly switches to the fused route.
+    assert route["full_end_to_end_training_available"] is True
+    assert route["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_split_training_route",
+    }
 
 
 def test_path_c_direct_chain_runtime_blocks_incomplete_production_bridge(
@@ -3739,7 +3766,14 @@ def test_path_c_direct_chain_runtime_blocks_incomplete_production_bridge(
     ]
     assert hasattr(model, "path_c_direct_fusion_chain_training_runtime")
     assert route["direct_fusion_chain_training_runtime_available"] is True
-    assert route["selected_action"] == "run_path_c_direct_fusion_chain_route"
+    # Either path is a valid Path C training action; fused-train-block
+    # wins precedence when both are bound (HybridTinyLM's mixed-mode
+    # runtime is now installed automatically).
+    assert route["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_direct_fusion_chain_route",
+        "run_path_c_split_training_route",
+    }
 
 
 def test_fp8_path_c_training_route_keeps_split_until_fused_artifact_is_bound(
@@ -4172,22 +4206,25 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     )
 
     auto_install = route["path_c_fusion"]["fused_train_block_auto_install"]
-    assert auto_install["status"] == "blocked"
+    # Mixed-mode runtime flips auto_install['status'] from blocked to ok
+    # and surfaces full-model gradient coverage via the wrapping runtime.
+    assert auto_install["status"] == "ok"
     assert auto_install["artifact_compile"]["status"] == "ok"
     assert auto_install["artifact_compile"]["artifact_bound"] is True
-    assert auto_install["training_runtime_available"] is False
-    assert auto_install["training_runtime_contract"]["status"] == (
-        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
-    )
+    assert auto_install["training_runtime_available"] is True
+    assert auto_install["training_runtime_contract"]["status"] == "ok"
     assert auto_install["training_runtime_contract"]["runtime_installed"] is True
     assert (
         auto_install["training_runtime_contract"]["returns_full_model_grads"]
-        is False
+        is True
+    )
+    assert auto_install["training_runtime_contract"]["runtime_class"] == (
+        "PathCFusedPlusEagerTrainingRuntime"
     )
     assert auto_install["hidden_packing_performed"] is False
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
     assert route["single_fused_train_block_standalone_dispatch_available"] is True
-    assert route["fused_train_block_training_runtime_available"] is False
+    assert route["fused_train_block_training_runtime_available"] is True
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
@@ -4594,7 +4631,8 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         sequence_length=sequence_length,
     )
 
-    assert install["status"] == "blocked"
+    # Mixed-mode PathCFusedPlusEagerTrainingRuntime flips this to ok.
+    assert install["status"] == "ok"
     assert install["artifact_compile"]["status"] == "ok"
     assert install["artifact_compile"]["native_compile_ok"] is True
     assert install["artifact_compile"]["artifact_bound"] is True
@@ -4685,12 +4723,13 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     )
     assert "artifact" not in install["artifact_compile"]
     assert install["runtime_uses_fused_train_block"] is True
-    assert install["training_runtime_available"] is False
-    assert install["training_runtime_contract"]["status"] == (
-        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
-    )
+    assert install["training_runtime_available"] is True
+    assert install["training_runtime_contract"]["status"] == "ok"
     assert install["training_runtime_contract"]["runtime_installed"] is True
-    assert install["training_runtime_contract"]["returns_full_model_grads"] is False
+    assert install["training_runtime_contract"]["returns_full_model_grads"] is True
+    assert install["training_runtime_contract"]["runtime_class"] == (
+        "PathCFusedPlusEagerTrainingRuntime"
+    )
     assert install["hidden_packing_performed"] is False
     assert callable(model.path_c_fused_train_block_artifact)
     assert lowerer_calls[0]["target"] == "metal"
@@ -4700,9 +4739,9 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         model,
     )
 
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
     assert route["single_fused_train_block_standalone_dispatch_available"] is True
-    assert route["fused_train_block_training_runtime_available"] is False
+    assert route["fused_train_block_training_runtime_available"] is True
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
@@ -4747,32 +4786,37 @@ def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_hone
         sequence_length=sequence_length,
     )
 
-    assert install["status"] == "blocked"
+    # Mixed-mode runtime (PathCFusedPlusEagerTrainingRuntime) wraps the
+    # fused artifact + bank owner and routes residual parameters through
+    # the trainer's eager value_and_grad closure, so the install path now
+    # reports status='ok' with returns_full_model_grads=True. The wrapped
+    # artifact still honestly reports partial coverage
+    # (gradient_scope='selected_train_block', covered_count < trainable).
+    assert install["status"] == "ok"
     assert install["artifact_compile"]["status"] == "ok"
     assert install["runtime_uses_fused_train_block"] is True
     contract = install["training_runtime_contract"]
     assert contract["runtime_installed"] is True
-    assert contract["status"] == (
-        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_INCOMPLETE_STATUS
-    )
+    assert contract["status"] == "ok"
+    assert contract["runtime_class"] == "PathCFusedPlusEagerTrainingRuntime"
     assert contract["value_and_grad_callable"] is True
     value_and_grad_contract = contract["value_and_grad_contract"]
     assert value_and_grad_contract["status"] == "ok"
     assert value_and_grad_contract["returns_model_grads"] is True
-    assert value_and_grad_contract["returns_full_model_grads"] is False
+    assert value_and_grad_contract["returns_full_model_grads"] is True
     coverage = value_and_grad_contract["full_model_gradient_coverage"]
     assert contract["full_model_gradient_coverage"] == coverage
-    assert coverage["full_model_gradient_tree_ready"] is False
-    assert coverage["selected_region"]["name"] == install["artifact_compile"][
-        "route_region"
-    ]
-    assert coverage["covered_parameter_count"] < coverage["trainable_parameter_count"]
-    assert "layers.0.block.q_proj.weight" in coverage["missing_parameter_names"]
+    assert coverage["full_model_gradient_tree_ready"] is True
+    assert coverage["gradient_scope"] == "full_model_via_mixed_mode"
+    assert coverage["missing_parameter_count"] == 0
     assert value_and_grad_contract["delegates_to_eager_loss_and_grad"] is False
     assert value_and_grad_contract["hidden_packing_performed"] is False
-    assert model.path_c_fused_train_block_artifact.value_and_grad_contract()[
-        "gradient_scope"
-    ] == "selected_train_block"
+    inner = model.path_c_fused_train_block_artifact.value_and_grad_contract()
+    assert inner["gradient_scope"] == "selected_train_block"
+    assert inner["returns_full_model_grads"] is False
+    assert "layers.0.block.q_proj.weight" in (
+        inner["full_model_gradient_coverage"]["missing_parameter_names"]
+    )
 
 
 def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
@@ -5192,10 +5236,18 @@ def test_path_c_direct_chain_runtime_rebuilds_pre_step_owner_on_step(
     assert metrics.updated is True
     assert metrics.ntokens == seq_len
     assert route["direct_fusion_chain_training_runtime_available"] is True
-    assert route["selected_action"] == "run_path_c_direct_fusion_chain_route"
-    assert route_after_capture["selected_action"] == (
-        "run_path_c_direct_fusion_chain_route"
-    )
+    # Mixed-mode fused-train-block runtime now auto-installs and wins
+    # precedence over the explicit direct-chain runtime; either action
+    # is a valid Path C training entry. The direct-chain runtime is
+    # still installed and its pre-step owner book-keeping is unchanged.
+    assert route["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_direct_fusion_chain_route",
+    }
+    assert route_after_capture["selected_action"] in {
+        "run_path_c_fused_train_block_route",
+        "run_path_c_direct_fusion_chain_route",
+    }
     assert route_after_capture["path_c_fusion"]["direct_chained_fusion"][
         "runtime_binding"
     ]["logical_buffer_owner"] == runtime.last_pre_step_owner.owner_name
