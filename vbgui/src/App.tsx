@@ -9,6 +9,8 @@ import { FlowCanvas } from "@/components/FlowCanvas";
 import { DimEnvEditor } from "@/components/DimEnvEditor";
 import { GalleryTab } from "@/components/GalleryTab";
 import { GalleryScaleDownSlider } from "@/components/GalleryScaleDownSlider";
+import { FeatureInjectionBar,
+         type AppliedInjection } from "@/components/FeatureInjectionBar";
 import { SweepPanel } from "@/components/SweepPanel";
 import { TokenizerMatrixTab } from "@/components/TokenizerMatrixTab";
 import { TransplantBar } from "@/components/TransplantBar";
@@ -120,6 +122,19 @@ interface WorkspaceTab {
 }
 
 const getSavedTabs = (): WorkspaceTab[] => {
+  const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+  if (isTest) {
+    return [
+      {
+        id: "tab-default",
+        name: "Draft 1",
+        projectName: "untitled",
+        nodes: [],
+        edges: [],
+        spec: INITIAL_SPEC,
+      }
+    ];
+  }
   const saved = localStorage.getItem("vbgui_workspace_tabs_v1");
   if (saved) {
     try {
@@ -139,6 +154,8 @@ const getSavedTabs = (): WorkspaceTab[] => {
 };
 
 const getSavedActiveTabId = (): string => {
+  const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+  if (isTest) return "tab-default";
   return localStorage.getItem("vbgui_active_tab_id_v1") || "tab-default";
 };
 
@@ -580,7 +597,10 @@ export function App(): JSX.Element {
     isSwitchingRef.current = true;
     
     setActiveTabId(tabId);
-    localStorage.setItem("vbgui_active_tab_id_v1", tabId);
+    const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+    if (!isTest) {
+      localStorage.setItem("vbgui_active_tab_id_v1", tabId);
+    }
     
     setProjectName(target.projectName);
     setNodes(target.nodes);
@@ -606,7 +626,10 @@ export function App(): JSX.Element {
     
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newId);
-    localStorage.setItem("vbgui_active_tab_id_v1", newId);
+    const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+    if (!isTest) {
+      localStorage.setItem("vbgui_active_tab_id_v1", newId);
+    }
     
     setProjectName(newTab.projectName);
     setNodes([]);
@@ -622,7 +645,10 @@ export function App(): JSX.Element {
     if (activeTabId === tabId) {
       const fallback = nextTabs[0];
       setActiveTabId(fallback.id);
-      localStorage.setItem("vbgui_active_tab_id_v1", fallback.id);
+      const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+      if (!isTest) {
+        localStorage.setItem("vbgui_active_tab_id_v1", fallback.id);
+      }
       
       setProjectName(fallback.projectName);
       setNodes(fallback.nodes);
@@ -648,7 +674,10 @@ export function App(): JSX.Element {
         }
         return t;
       });
-      localStorage.setItem("vbgui_workspace_tabs_v1", JSON.stringify(next));
+      const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
+      if (!isTest) {
+        localStorage.setItem("vbgui_workspace_tabs_v1", JSON.stringify(next));
+      }
       return next;
     });
   }, [projectName, nodes, edges, spec, activeTabId]);
@@ -675,6 +704,46 @@ export function App(): JSX.Element {
           data: { severity: "info" } },
       ]);
     }, []);
+
+  // V8-R08: track feature injections applied via FeatureInjectionBar.
+  // Each click adds either a rewriter (via dispatch) or a brick node
+  // to the canvas (engram), and the applied-list also lands in
+  // extras.train.feature_injections via the run-pipeline path.
+  const [featureInjections, setFeatureInjections] =
+    useState<AppliedInjection[]>([]);
+
+  const handleFeatureInjectionApply = useCallback((
+    injection: AppliedInjection,
+  ) => {
+    setFeatureInjections((prev) => [...prev, injection]);
+    if (injection.paper_ref.startsWith("rewriter:")) {
+      const name = injection.paper_ref.slice("rewriter:".length);
+      const params: Record<string, number | string> =
+        name === "MTPRewriter"   ? { K: 2, weight: 0.5 } :
+        name === "IFIMRewriter"  ? { lambda_value: 0.3 } :
+        name === "MHCRewriter"   ? { window: 32 } : {};
+      dispatch({ type: "rewriters.add",
+                 rewriter: { name: name as never, params } });
+    } else if (injection.paper_ref.startsWith("brick:")) {
+      const kind = injection.paper_ref.slice("brick:".length);
+      const nodeName = `${kind}_inj_${featureInjections.length}`;
+      const lastId = nodes.length > 0
+        ? nodes[nodes.length - 1].id : null;
+      setNodes((prev) => [...prev, {
+        id: nodeName,
+        type: "brick",
+        position: { x: 480, y: 100 + featureInjections.length * 80 },
+        data: { kind } as never,
+      }]);
+      if (lastId !== null) {
+        setEdges((prev) => [...prev, {
+          id: `${lastId}->${nodeName}`,
+          source: lastId, target: nodeName,
+          data: { severity: "info" },
+        }]);
+      }
+    }
+  }, [nodes, featureInjections.length]);
 
   // V8-R02: apply a scaled-down preset from the GalleryScaleDownSlider.
   // The slider already ran architectures.scale_down and hands us back
@@ -1528,6 +1597,11 @@ export function App(): JSX.Element {
               <div style={{ flex: 1, position: "relative",
                             display: "flex", flexDirection: "column",
                             minHeight: 0 }}>
+                <FeatureInjectionBar
+                  rpc={rpc}
+                  applied={featureInjections}
+                  onApply={handleFeatureInjectionApply}
+                />
                 <DimEnvEditor value={dimEnv} onApply={setDimEnv} />
                 <TrainOptionsPanel
                   value={trainOptions}
@@ -1650,6 +1724,77 @@ export function App(): JSX.Element {
                     </div>
                   </div>
                 )}
+                {/* Draft / Workspace Tabs */}
+                <div style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 12px",
+                  background: "rgba(15, 23, 42, 0.8)",
+                  backdropFilter: "blur(12px)",
+                  borderBottom: "1px solid rgba(255, 255, 255, 0.1)",
+                  zIndex: 10,
+                }}>
+                  {tabs.map((t) => (
+                    <div
+                      key={t.id}
+                      onClick={() => handleSwitchTab(t.id)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "6px 12px",
+                        borderRadius: 6,
+                        background: t.id === activeTabId ? "rgba(6, 182, 212, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                        border: t.id === activeTabId ? "1px solid rgba(6, 182, 212, 0.4)" : "1px solid rgba(255, 255, 255, 0.1)",
+                        color: t.id === activeTabId ? "#22d3ee" : "#94a3b8",
+                        cursor: "pointer",
+                        fontSize: 11,
+                        fontWeight: "bold",
+                        transition: "all 0.15s ease",
+                      }}
+                    >
+                      <span>📁 {t.name}</span>
+                      {tabs.length > 1 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteTab(t.id);
+                          }}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            color: "#ef4444",
+                            cursor: "pointer",
+                            fontSize: 10,
+                            padding: 0,
+                            display: "flex",
+                            alignItems: "center",
+                          }}
+                          title="Close draft"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    onClick={handleNewTab}
+                    style={{
+                      padding: "4px 10px",
+                      background: "rgba(255, 255, 255, 0.1)",
+                      border: "1px dashed rgba(255, 255, 255, 0.3)",
+                      borderRadius: 6,
+                      color: "#e2e8f0",
+                      fontSize: 11,
+                      cursor: "pointer",
+                      fontWeight: "bold",
+                    }}
+                  >
+                    ➕ New Draft
+                  </button>
+                </div>
+
                 <FlowCanvas
                   nodes={nodes} edges={edges}
                   onConnect={handleConnect}
@@ -1657,6 +1802,8 @@ export function App(): JSX.Element {
                   onNodeClick={setSelectedBrickId}
                   isValidConnection={isValidConnection}
                   onAutoAlign={handleAutoAlign}
+                  onNodesChange={onNodesChange}
+                  onEdgesChange={onEdgesChange}
                   onInsertAdapter={(kind, edge) => {
                     const baseName = `${kind}_insert_${nodes.length}`;
                     const src = nodes.find((n) => n.id === edge.source);

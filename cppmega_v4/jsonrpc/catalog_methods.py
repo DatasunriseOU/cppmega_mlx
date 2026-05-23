@@ -91,6 +91,37 @@ def catalog_list_options(
             cache.set(cache_key, result)
         return result
 
+    if params.category == "feature_injectors":
+        # V8-R08: enumerate the mid-canvas feature-injection options.
+        # Three are rewriters (MTP / IFIM / MHC) — they mutate the
+        # build spec. Two are brick kinds (engram / mlp_ngram) — they
+        # land as new nodes inserted into the canvas.
+        result = CatalogListOptionsResult(options=[
+            CatalogOptionSummary(
+                name="mtp_weighted",
+                summary="Multi-token prediction K=2 head + weighted loss",
+                paper_ref="rewriter:MTPRewriter"),
+            CatalogOptionSummary(
+                name="ifim_shaped",
+                summary="Span-aware IFIM loss reshaping",
+                paper_ref="rewriter:IFIMRewriter"),
+            CatalogOptionSummary(
+                name="mhc_attn_bias",
+                summary="Multi-head co-occurrence attention bias",
+                paper_ref="rewriter:MHCRewriter"),
+            CatalogOptionSummary(
+                name="engram",
+                summary="Standalone local engram (n-gram) branch",
+                paper_ref="brick:engram"),
+            CatalogOptionSummary(
+                name="ngram_2_3_4",
+                summary="Engram with default 2,3,4-gram orders",
+                paper_ref="brick:engram"),
+        ])
+        if cache is not None:
+            cache.set(cache_key, result)
+        return result
+
     entries = list_options(params.category)
     result = CatalogListOptionsResult(options=[
         CatalogOptionSummary(
