@@ -98,3 +98,45 @@ def test_owner_unblocks_m04_fp8_path_c_runtime_binding(model) -> None:
     assert binding.get("bank_buffer_owner") == (
         "local_gb10_quarter.path_c_physical_abi_banks"
     )
+
+
+def test_artifact_forward_runs_end_to_end_on_real_metal(model) -> None:
+    """End-to-end live check: the fused TileLang kernel actually runs on Metal.
+
+    Drives the production route to compile the artifact, then invokes
+    ``artifact.forward(bank_owner=...)`` with the model-owned banks the
+    factory produced, and confirms the call returns without raising and
+    that lazy MLX work materialises.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    import mlx.core as mx
+
+    spec = importlib.util.spec_from_file_location(
+        "m04_train_step", str(Path("scripts/m04_train_step.py").resolve())
+    )
+    assert spec is not None and spec.loader is not None
+    m04 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m04)
+
+    args = m04.build_parser().parse_args([
+        "--synthetic", "--dtype", "fp8_path_c",
+        "--model-profile", "local_gb10_quarter",
+        "--dry-run-json", "--output", "/tmp/test_artifact_real_metal.json",
+        "--data-path", "/dev/null", "--data-format", "npz",
+    ])
+    route = m04.fp8_path_c_training_route_payload_for_model(args, model)
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+
+    artifact = model.path_c_fused_train_block_artifact
+    bank_owner = model.path_c_physical_abi_bank_owner
+    assert artifact is not None
+    assert bank_owner is not None
+    # The factory's banks must align with the artifact's expected shapes.
+    assert artifact.physical_abi_shapes == {
+        name: tuple(buf.shape) for name, buf in bank_owner.buffers.items()
+    }
+    # And the artifact's forward must complete and materialise lazy work.
+    artifact.forward(bank_owner=bank_owner)
+    mx.eval(*bank_owner.buffers.values())

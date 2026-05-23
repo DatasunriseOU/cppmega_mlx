@@ -507,6 +507,12 @@ class PathCFusedPlusEagerTrainingRuntime:
             str(name) for name in (in_region_parameter_names or ())
         )
         self._binding: dict[str, Any] | None = None
+        self.last_fused_warmup_payload: dict[str, Any] = {
+            "attempted": False,
+            "completed": False,
+            "elapsed_ns": 0,
+            "error": None,
+        }
 
     def _with_bank_owner(self, kwargs: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(kwargs)
@@ -534,22 +540,49 @@ class PathCFusedPlusEagerTrainingRuntime:
         batch: Mapping[str, mx.array],
         loss_and_grad: Any,
     ) -> tuple[tuple[mx.array, mx.array], Any]:
-        """Run the eager closure for full-model grads; record fused warmup.
+        """Run the eager closure for full-model grads, with fused warmup.
 
-        This is the honest minimum: the runtime takes ownership of the
-        training step (so the trainer routes through it) and uses the
-        trainer-supplied eager loss_and_grad closure to compute the merged
-        full-model gradient tree. The fused artifact does not yet share its
-        in-region bank-resident gradients here because the model parameters
-        are still independent tensors rather than views into the physical
-        ABI banks; closing that gap is a separate change (parameter
-        bank-residency) and must not be faked with hidden copies.
+        The runtime takes ownership of the training step (so the trainer
+        routes through it) and uses the trainer-supplied eager loss_and_grad
+        closure to compute the full-model gradient tree. In parallel, it
+        also runs the fused TileLang artifact's ``forward(bank_owner=...)``
+        so the JIT-compiled kernel actually executes on every training step
+        — the JIT cache stays warm, the Metal command queue gets pipelined
+        work, and downstream observability (matrix receipts, GUI) can
+        measure the kernel's wall-clock cost. The artifact's grad outputs
+        are NOT yet merged into the returned grad tree because the model
+        parameters are still independent tensors rather than views into
+        the physical ABI banks; closing that gap is a separate change
+        (parameter bank-residency) and must not be faked with hidden
+        copies.
+
+        Per-step warmup telemetry lands in
+        ``self.last_fused_warmup_payload`` so receipt scripts can read it
+        without reaching into private state.
         """
         if not callable(loss_and_grad):
             raise TypeError(
                 "mixed-mode training runtime requires the trainer to pass "
                 "an eager loss_and_grad closure for residual parameters"
             )
+        warmup_payload: dict[str, Any] = {
+            "attempted": False,
+            "completed": False,
+            "elapsed_ns": 0,
+            "error": None,
+        }
+        try:
+            warmup_payload["attempted"] = True
+            warmup_start = time.perf_counter_ns()
+            self.artifact.forward(bank_owner=self.bank_owner)
+            mx.eval(*self.bank_owner.buffers.values())
+            warmup_payload["elapsed_ns"] = (
+                time.perf_counter_ns() - warmup_start
+            )
+            warmup_payload["completed"] = True
+        except Exception as exc:
+            warmup_payload["error"] = repr(exc)
+        self.last_fused_warmup_payload = warmup_payload
         result = loss_and_grad(model, batch)
         (loss, ntokens), grads = cast(
             tuple[tuple[mx.array, mx.array], Any], result

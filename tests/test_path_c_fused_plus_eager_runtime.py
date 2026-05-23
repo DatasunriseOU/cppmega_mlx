@@ -28,6 +28,7 @@ from typing import Any, Mapping
 
 import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 
 from cppmega_mlx.training.compiled import (
     PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT,
@@ -323,3 +324,133 @@ def test_live_install_flips_route_to_fused_train_block() -> None:
     assert inner_contract["returns_full_model_grads"] is True
     assert inner_contract["gradient_scope"] == "full_model_via_mixed_mode"
     assert inner_contract["delegates_to_eager_loss_and_grad"] is False
+
+
+def test_value_and_grad_runs_artifact_warmup_with_telemetry() -> None:
+    """value_and_grad must trigger artifact.forward(bank_owner=...) as a
+    real warmup pass and record telemetry on last_fused_warmup_payload."""
+
+    class _Owner:
+        def __init__(self) -> None:
+            self.buffers: dict[str, Any] = {}
+
+    art = _FakeFusedArtifact()
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art, bank_owner=_Owner(), owner_name="x",
+    )
+
+    def closure(model: Any, batch: Mapping[str, Any]) -> Any:
+        return (mx.array(0.0), mx.array(1, dtype=mx.uint32)), {}
+
+    runtime.value_and_grad(
+        model="m",  # type: ignore[arg-type]
+        batch={},
+        loss_and_grad=closure,
+    )
+    # The fake artifact recorded a forward call with bank_owner threaded in.
+    assert len(art.forward_calls) == 1
+    assert art.forward_calls[-1]["kwargs"].get("bank_owner") is runtime.bank_owner
+    # And telemetry was recorded.
+    telemetry = runtime.last_fused_warmup_payload
+    assert telemetry["attempted"] is True
+    assert telemetry["completed"] is True
+    assert telemetry["elapsed_ns"] >= 0
+    assert telemetry["error"] is None
+
+
+def test_value_and_grad_records_artifact_warmup_failure_without_breaking_step() -> None:
+    """If the artifact's forward raises, the runtime still returns eager grads
+    and records the failure so receipts can surface it."""
+
+    class _BadOwner:
+        @property
+        def buffers(self) -> dict[str, Any]:
+            raise RuntimeError("bank owner explodes")
+
+    art = _FakeFusedArtifact()
+    runtime = PathCFusedPlusEagerTrainingRuntime(
+        artifact=art, bank_owner=_BadOwner(), owner_name="x",
+    )
+
+    def closure(model: Any, batch: Mapping[str, Any]) -> Any:
+        return (mx.array(0.0), mx.array(1, dtype=mx.uint32)), {"x": mx.zeros((1,))}
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model="m",  # type: ignore[arg-type]
+        batch={},
+        loss_and_grad=closure,
+    )
+    telemetry = runtime.last_fused_warmup_payload
+    # Either the forward raised (BadOwner._kernel_args path) or our mx.eval
+    # tripped — either way the runtime continues and returns eager grads.
+    assert telemetry["attempted"] is True
+    assert telemetry["error"] is not None
+    assert isinstance(loss, mx.array)
+    assert "x" in grads
+
+
+def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
+    """End-to-end: a real HybridTinyLM's mixed-mode runtime, when value_and_grad
+    is called with a real eager closure, must actually launch the compiled
+    TileLang artifact (telemetry.completed=True, elapsed_ns > 0)."""
+
+    import importlib.util
+    from pathlib import Path
+
+    import mlx.nn as nn
+
+    from cppmega_mlx.recipes.model_factory import (
+        build_local_gb10_quarter_tiny_smoke_model,
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        "m04_train_step", str(Path("scripts/m04_train_step.py").resolve())
+    )
+    assert spec is not None and spec.loader is not None
+    m04 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m04)
+
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    args = m04.build_parser().parse_args([
+        "--synthetic", "--dtype", "fp8_path_c",
+        "--model-profile", "local_gb10_quarter",
+        "--dry-run-json", "--output", "/tmp/test_live_warmup.json",
+        "--data-path", "/dev/null", "--data-format", "npz",
+    ])
+    m04.fp8_path_c_training_route_payload_for_model(args, model)
+    runtime = model.path_c_fused_train_block_training_runtime
+    assert runtime is not None
+    assert type(runtime).__name__ == "PathCFusedPlusEagerTrainingRuntime"
+
+    # Trivial loss closure — sum of zero embedding lookup. We don't care
+    # about the numbers; we care that the runtime calls artifact.forward.
+    seq_len = 16
+
+    def loss_fn(model: nn.Module, batch: Mapping[str, mx.array]) -> tuple[mx.array, mx.array]:
+        logits = model(batch["tokens"])
+        loss = logits.sum() * mx.array(0.0)
+        ntokens = mx.array(int(batch["tokens"].size), dtype=mx.uint32)
+        return loss, ntokens
+
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
+    tokens = mx.zeros((1, seq_len), dtype=mx.int32)
+
+    (loss, ntokens), grads = runtime.value_and_grad(
+        model,
+        {"tokens": tokens},
+        loss_and_grad,
+    )
+    mx.eval(loss, ntokens)
+
+    telemetry = runtime.last_fused_warmup_payload
+    assert telemetry["attempted"] is True
+    assert telemetry["completed"] is True, telemetry
+    assert telemetry["elapsed_ns"] > 0
+    assert telemetry["error"] is None
+
+    # Loss/ntokens come from the eager closure; gradient tree must contain
+    # parameters that the artifact does NOT cover (proving the eager bridge
+    # provided residual grads).
+    flat = dict(tree_flatten(grads))
+    assert "layers.0.block.q_proj.weight" in flat  # outside fused region
+

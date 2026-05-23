@@ -1109,8 +1109,12 @@ class HybridTinyLM(nn.Module):
             plan_path_c_fusion_schedule_for_region,
         )
 
+        # Discover forward-only regions and let plan_path_c_fusion_schedule_for_region
+        # extend them with the autograd backward graph (matching the recipe
+        # m04 uses in compile_path_c_fused_train_block_artifact_for_model);
+        # this gives the same banked physical-ABI shapes the artifact wants.
         regions = self.path_c_fusion_regions(
-            include_backward=True,
+            include_backward=False,
             sequence_length=sequence_length,
         )
         if not regions:
