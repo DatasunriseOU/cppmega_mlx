@@ -17,6 +17,7 @@ export interface BrickNodeData {
   debuggerMode?: boolean;
   isActiveNode?: boolean;
   isWeightUpdated?: boolean;
+  gradNorm?: number;
 }
 
 export function BrickNode({ data, id, selected }: NodeProps): JSX.Element {
@@ -80,7 +81,7 @@ export function BrickNode({ data, id, selected }: NodeProps): JSX.Element {
         </div>
       </div>
 
-      {(d.shape || typeof d.memory_mb === "number") && (
+      {(d.shape || typeof d.memory_mb === "number" || typeof d.gradNorm === "number") && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6,
                       marginTop: 10 }}>
           {d.shape && (
@@ -91,6 +92,20 @@ export function BrickNode({ data, id, selected }: NodeProps): JSX.Element {
           {typeof d.memory_mb === "number" && (
             <span data-testid="brick-memory-bar" style={statPill}>
               {d.memory_mb.toFixed(1)} MB
+            </span>
+          )}
+          {typeof d.gradNorm === "number" && (
+            <span
+              data-testid="brick-grad-norm"
+              style={{
+                ...statPill,
+                color: "var(--vb-success)",
+                borderColor: "rgba(52, 211, 153, 0.4)",
+                boxShadow: "0 0 8px rgba(52, 211, 153, 0.2)",
+                fontWeight: 600,
+              }}
+            >
+              ‖g‖: {d.gradNorm.toFixed(4)}
             </span>
           )}
         </div>

@@ -62,6 +62,11 @@ describe("BrickNode", () => {
     expect(screen.getByTestId("brick-side-channel-warn")).toBeTruthy();
   });
 
+  it("shows gradNorm when provided", () => {
+    renderBrick({ kind: "mlp", gradNorm: 0.123456 });
+    expect(screen.getByTestId("brick-grad-norm").textContent).toContain("‖g‖: 0.1235");
+  });
+
   it("falls back to kind when meta is unknown", () => {
     renderBrick({ kind: "totally_made_up" });
     expect(screen.getAllByText("totally_made_up").length).toBeGreaterThan(0);

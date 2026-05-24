@@ -5,7 +5,7 @@ export interface Token {
   text: string;
 }
 
-export function useNeuralDebugger() {
+export function useNeuralDebugger(rpc?: any, tokenizerPath?: string | null) {
   const [debuggerMode, setDebuggerMode] = useState(false);
   const [activeStep, setActiveStep] = useState(-1); // -1 = tokenizer, 0..N-1 = layer nodes, N = loss, N+1 = de-tokenizer
   const [direction, setDirection] = useState<"forward" | "backward">("forward");
@@ -22,6 +22,27 @@ export function useNeuralDebugger() {
   const [lr, setLr] = useState(0.001);
   const [lossVal, setLossVal] = useState(2.34);
   const [isWeightUpdated, setIsWeightUpdated] = useState(false);
+
+  // V7-F01-REAL: fetch real segmented tokens from the active tokenizer via RPC
+  useEffect(() => {
+    if (!rpc || !tokenizerPath || !prompt) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await rpc.call(
+          "tokenizer.encode_visualize",
+          { text: prompt, tokenizer_source: tokenizerPath }
+        );
+        if (cancelled) return;
+        if (r && r.tokens) {
+          setTokens(r.tokens.map((t: any) => ({ id: t.id, text: t.text })));
+        }
+      } catch (e) {
+        console.error("Debugger tokenizer encode failed:", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [rpc, tokenizerPath, prompt]);
 
   // Use refs for intervals to prevent state staleness
   const stepTimerRef = useRef<NodeJS.Timeout | null>(null);

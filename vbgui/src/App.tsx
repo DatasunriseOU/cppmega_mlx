@@ -192,7 +192,6 @@ export function App(): JSX.Element {
   const [tabs, setTabs] = useState<WorkspaceTab[]>(getSavedTabs);
   const [activeTabId, setActiveTabId] = useState<string>(getSavedActiveTabId);
   const isSwitchingRef = useRef<boolean>(false);
-  const debugState = useNeuralDebugger();
 
   const [nodes, setNodes] = useState<Node[]>(() => {
     const savedTabs = getSavedTabs();
@@ -200,6 +199,12 @@ export function App(): JSX.Element {
     const active = savedTabs.find((t) => t.id === savedActiveId) || savedTabs[0];
     return active.nodes;
   });
+
+  const modelNodesCount = useMemo(() => {
+    return nodes.filter(n => n.type === "brick" || n.type === "adapter").length;
+  }, [nodes]);
+
+  const maxStep = modelNodesCount + 1;
   const [edges, setEdges] = useState<Edge[]>(() => {
     const savedTabs = getSavedTabs();
     const savedActiveId = getSavedActiveTabId();
@@ -303,6 +308,7 @@ export function App(): JSX.Element {
   // hardcoding 65536 — so dropping a GPT-2 / SmolLM / cppmega tokenizer
   // gives the BrickContextPanel the right embedding_table param count.
   const tokenizerVocabSize = useTokenizerVocab(rpc, trainTokenizerPath);
+  const debugState = useNeuralDebugger(rpc, trainTokenizerPath);
 
   // V7-I07: poll the JsonRPC LRU cache hit-rate so the BottomStrip
   // chip surfaces hit_rate / size / evictions live.
@@ -1001,6 +1007,7 @@ export function App(): JSX.Element {
               ...(firstGroup.schedule ?? {}),
               kind: scheduleKind,
               warmup_steps: d.warmup_steps,
+              total_steps: firstGroup.schedule?.total_steps ?? 100000,
             },
           },
           ...spec.optim.groups.slice(1),
@@ -1088,6 +1095,7 @@ export function App(): JSX.Element {
               ...(firstGroup.schedule ?? {}),
               kind: scheduleKind,
               warmup_steps: d.warmup_steps,
+              total_steps: firstGroup.schedule?.total_steps ?? 100000,
             },
           },
           ...spec.optim.groups.slice(1),
@@ -1520,6 +1528,46 @@ export function App(): JSX.Element {
     if (trainInFlight && trainRunId) liveTrainResetRef.current();
   }, [trainInFlight, trainRunId]);
 
+  // V7-F03-ANIMATE: Trigger forward-backward canvas stepping animation on actual WebSocket step updates
+  const lastAnimatedStepRef = useRef<number>(-1);
+  const animateStepRef = useRef(debugState.animateFullTrainStep);
+  useEffect(() => {
+    animateStepRef.current = debugState.animateFullTrainStep;
+  }, [debugState.animateFullTrainStep]);
+
+  useEffect(() => {
+    if (!trainInFlight) {
+      lastAnimatedStepRef.current = -1;
+      return;
+    }
+    const lastEvent = liveTrain.events.length > 0 ? liveTrain.events[liveTrain.events.length - 1] : null;
+    if (lastEvent && lastEvent.step !== lastAnimatedStepRef.current) {
+      lastAnimatedStepRef.current = lastEvent.step;
+      // Trigger full forward-backward canvas pass
+      animateStepRef.current(maxStep);
+    }
+  }, [liveTrain.events, trainInFlight, maxStep]);
+
+  // V7-F04-SYNC: Sync real Loss and LR values from active WebSocket stream to the debugger
+  const setLrRef = useRef(debugState.setLr);
+  const setLossValRef = useRef(debugState.setLossVal);
+  useEffect(() => {
+    setLrRef.current = debugState.setLr;
+    setLossValRef.current = debugState.setLossVal;
+  }, [debugState.setLr, debugState.setLossVal]);
+
+  useEffect(() => {
+    const lastEvent = liveTrain.events.length > 0 ? liveTrain.events[liveTrain.events.length - 1] : null;
+    if (lastEvent) {
+      if (typeof lastEvent.lr === "number") {
+        setLrRef.current(lastEvent.lr);
+      }
+      if (typeof lastEvent.loss === "number") {
+        setLossValRef.current(lastEvent.loss);
+      }
+    }
+  }, [liveTrain.events]);
+
   const handleShardingAccept = useCallback((idx: number) => {
     const chosen = proposals[idx];
     if (!chosen) return;
@@ -1538,11 +1586,6 @@ export function App(): JSX.Element {
     setTimeout(() => setRunError(null), 2000);
   }, [proposals, scheduleVerify, spec.sharding]);
 
-  const modelNodesCount = useMemo(() => {
-    return nodes.filter(n => n.type === "brick" || n.type === "adapter").length;
-  }, [nodes]);
-
-  const maxStep = modelNodesCount + 1;
 
   const mappedNodes = useMemo(() => {
     const head = spec.loss.head_outputs?.[0];
@@ -1555,6 +1598,8 @@ export function App(): JSX.Element {
 
     const K = modelNodes.length;
 
+    const lastEvent = liveTrain.events.length > 0 ? liveTrain.events[liveTrain.events.length - 1] : null;
+
     let enriched = nodes.map((n) => {
       const isModel = n.type === "brick" || n.type === "adapter";
       const idx = isModel ? modelNodes.findIndex((m) => m.id === n.id) : -1;
@@ -1564,6 +1609,31 @@ export function App(): JSX.Element {
         isActiveNode =
           (isModel && debugState.activeStep === idx) ||
           (n.id === "__loss_ghost__" && debugState.activeStep === K);
+      }
+
+      let gradNorm: number | undefined;
+      if (lastEvent?.grad_norms && isModel) {
+        const normKeys = Object.keys(lastEvent.grad_norms);
+        const nameVal = typeof (n.data as any)?.name === "string" ? (n.data as any).name.toLowerCase() : "";
+        const idVal = n.id.toLowerCase();
+        
+        // Find best key match in grad_norms map
+        const matchedKey = normKeys.find((k) => {
+          const lk = k.toLowerCase();
+          if (nameVal && (lk.includes(nameVal) || nameVal.includes(lk))) return true;
+          if (lk.includes(idVal) || idVal.includes(lk)) return true;
+          // check if index matches e.g. key contains "layers.3." or "layer_3" etc.
+          const idxPattern1 = `layers.${idx}.`;
+          const idxPattern2 = `layers.${idx}`;
+          const idxPattern3 = `layer_${idx}`;
+          const idxPattern4 = `.${idx}.`;
+          const idxPattern5 = `.${idx}`;
+          if (lk.includes(idxPattern1) || lk.includes(idxPattern2) || lk.includes(idxPattern3) || lk.includes(idxPattern4) || lk.endsWith(idxPattern5)) return true;
+          return false;
+        });
+        if (matchedKey !== undefined) {
+          gradNorm = lastEvent.grad_norms[matchedKey];
+        }
       }
 
       let additionalData: any = {};
@@ -1580,6 +1650,10 @@ export function App(): JSX.Element {
         additionalData = {
           direction: debugState.direction,
           isActiveNode,
+        };
+      } else if (isModel && gradNorm !== undefined) {
+        additionalData = {
+          gradNorm,
         };
       }
 
@@ -1659,7 +1733,7 @@ export function App(): JSX.Element {
       result.push(detokenizerNode);
     }
     return result;
-  }, [nodes, debugState.debuggerMode, debugState.activeStep, debugState.direction, debugState.prompt, debugState.tokens, debugState.isWeightUpdated, spec.loss.head_outputs, spec.loss.kind, spec.loss.params]);
+  }, [nodes, debugState.debuggerMode, debugState.activeStep, debugState.direction, debugState.prompt, debugState.tokens, debugState.isWeightUpdated, spec.loss.head_outputs, spec.loss.kind, spec.loss.params, liveTrain.events]);
 
   const mappedEdges = useMemo(() => {
     const head = spec.loss.head_outputs?.[0];

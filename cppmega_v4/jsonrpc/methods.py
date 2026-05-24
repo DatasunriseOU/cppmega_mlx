@@ -173,13 +173,32 @@ def _make_optim(payload: OptimSpecPayload) -> OptimSpec:
         schedule = g.schedule
         if schedule is None:
             return None
+        kind = schedule.kind
+        warmup_steps = schedule.warmup_steps if schedule.warmup_steps is not None else 0
+        total_steps = schedule.total_steps
+        min_lr_ratio = schedule.min_lr_ratio if schedule.min_lr_ratio is not None else 0.0
+        decay_steps = schedule.decay_steps
+        power = schedule.power if schedule.power is not None else 2.0
+
+        if kind in ("cosine", "wsd", "polynomial"):
+            if total_steps is None or total_steps <= 0:
+                total_steps = 100_000
+            if total_steps < warmup_steps:
+                warmup_steps = total_steps
+
+        if kind == "wsd":
+            if decay_steps is None or decay_steps < 1:
+                decay_steps = 10_000
+            if warmup_steps + decay_steps > total_steps:
+                decay_steps = max(1, total_steps - warmup_steps)
+
         return ScheduleSpec(
-            kind=schedule.kind,
-            warmup_steps=schedule.warmup_steps,
-            total_steps=schedule.total_steps,
-            min_lr_ratio=schedule.min_lr_ratio,
-            decay_steps=schedule.decay_steps,
-            power=schedule.power,
+            kind=kind,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            min_lr_ratio=min_lr_ratio,
+            decay_steps=decay_steps,
+            power=power,
         )
 
     groups = tuple(
