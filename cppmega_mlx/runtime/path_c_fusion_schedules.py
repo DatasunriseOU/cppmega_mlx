@@ -113,6 +113,15 @@ DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE = "banked_by_dtype"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
 DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
+DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH = 64
+DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS = "grid_chunks"
+DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS = "launcher_chunks"
+DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE = DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS
+DESCRIPTOR_ROW_CHUNK_INDEX_BUFFER = "path_c_row_chunk_index"
+DESCRIPTOR_ROW_CHUNK_INDEX_PARAM = "path_c_row_chunk_index"
+DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM = "path_c_row_subchunk_index"
+DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH = 8
+DESCRIPTOR_BACKWARD_GATE_PARAM = "path_c_run_backward"
 _GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = (
     "residual_norm_weight",
     # Block A: the per-brick entry RMSNorm weight emitted by the model-
@@ -293,6 +302,8 @@ class PathCFusionScheduleTarget:
     internal_buffer_policy: str = DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT
     physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT
+    max_rows_per_launch: int | None = None
+    row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE
 
 
 @dataclass(frozen=True)
@@ -945,6 +956,8 @@ def make_path_c_descriptor_schedule_template(
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
     physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
     train_step_output_abi: bool = False,
+    max_rows_per_launch: int | None = None,
+    row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE,
 ) -> Callable[[Any], Any]:
     """Return a schedule template generated from brick descriptors."""
 
@@ -959,6 +972,10 @@ def make_path_c_descriptor_schedule_template(
     validated_physical_abi_policy = _validated_physical_abi_policy(
         physical_abi_policy
     )
+    validated_max_rows_per_launch = _validated_max_rows_per_launch(
+        max_rows_per_launch
+    )
+    validated_row_dispatch_mode = _validated_row_dispatch_mode(row_dispatch_mode)
 
     def descriptor_schedule_template(template_region: Any) -> Any:
         return build_path_c_descriptor_prim_func(
@@ -971,6 +988,8 @@ def make_path_c_descriptor_schedule_template(
             loop_policy=validated_loop_policy,
             physical_abi_policy=validated_physical_abi_policy,
             train_step_output_abi=bool(train_step_output_abi),
+            max_rows_per_launch=validated_max_rows_per_launch,
+            row_dispatch_mode=validated_row_dispatch_mode,
         )
 
     descriptor_schedule_metadata = cast(Any, descriptor_schedule_template)
@@ -988,6 +1007,12 @@ def make_path_c_descriptor_schedule_template(
     descriptor_schedule_metadata._cppmega_path_c_loop_policy = validated_loop_policy
     descriptor_schedule_metadata._cppmega_path_c_physical_abi_policy = (
         validated_physical_abi_policy
+    )
+    descriptor_schedule_metadata._cppmega_path_c_max_rows_per_launch = (
+        validated_max_rows_per_launch
+    )
+    descriptor_schedule_metadata._cppmega_path_c_row_dispatch_mode = (
+        validated_row_dispatch_mode
     )
     descriptor_schedule_metadata._cppmega_path_c_workspace_edge_buffers = (
         ("kv_fp8", "kv_scale")
@@ -1055,6 +1080,8 @@ def build_path_c_descriptor_prim_func(
     loop_policy: str = DESCRIPTOR_LOOP_POLICY_FLAT,
     physical_abi_policy: str = DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
     train_step_output_abi: bool = False,
+    max_rows_per_launch: int | None = None,
+    row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE,
 ) -> Any:
     """Generate a single-entry TileLang PrimFunc from a descriptor chain."""
 
@@ -1073,6 +1100,22 @@ def build_path_c_descriptor_prim_func(
     validated_loop_policy = _validated_loop_policy(loop_policy)
     validated_physical_abi_policy = _validated_physical_abi_policy(
         physical_abi_policy
+    )
+    validated_max_rows_per_launch = _validated_max_rows_per_launch(
+        max_rows_per_launch
+    )
+    validated_row_dispatch_mode = _validated_row_dispatch_mode(row_dispatch_mode)
+    row_chunk_count = _row_phased_chunk_count(
+        loop_policy=validated_loop_policy,
+        shape_env=resolved_shape_env,
+        max_rows_per_launch=validated_max_rows_per_launch,
+    )
+    row_phased_launcher_carry_buffers = _row_phased_launcher_carry_buffers_for_nodes(
+        nodes,
+        shape_env=resolved_shape_env,
+        loop_policy=validated_loop_policy,
+        max_rows_per_launch=validated_max_rows_per_launch,
+        row_dispatch_mode=validated_row_dispatch_mode,
     )
     internal_buffers = _internal_buffers_for_nodes(
         nodes,
@@ -1121,6 +1164,7 @@ def build_path_c_descriptor_prim_func(
     external_buffers_for_abi = _append_unique_names(
         external_buffers,
         (
+            *row_phased_launcher_carry_buffers,
             *train_step_suffix_loss_input_buffers,
             *train_step_output_buffers,
             *train_step_suffix_loss_parameter_grad_buffers,
@@ -1141,6 +1185,9 @@ def build_path_c_descriptor_prim_func(
         for name in external_buffers
     }
     dtype_by_buffer = dict(dtype_by_buffer)
+    for name in row_phased_launcher_carry_buffers:
+        dtype_by_buffer[name] = _buffer_dtype(name, shape_env=resolved_shape_env)
+        shape_by_buffer[name] = _buffer_shape(name, extent, resolved_shape_env)
     for name in train_step_suffix_loss_input_buffers:
         dtype_by_buffer[name] = _buffer_dtype(name, shape_env=resolved_shape_env)
         shape_by_buffer[name] = _buffer_shape(name, extent, resolved_shape_env)
@@ -1195,6 +1242,8 @@ def build_path_c_descriptor_prim_func(
         physical_abi_plan=physical_abi_plan,
         internal_buffer_policy=validated_internal_buffer_policy,
         loop_policy=validated_loop_policy,
+        max_rows_per_launch=validated_max_rows_per_launch,
+        row_dispatch_mode=validated_row_dispatch_mode,
         external_buffers=external_buffers_for_abi,
         shape_by_buffer=shape_by_buffer,
         dtype_by_buffer=dtype_by_buffer,
@@ -1266,6 +1315,49 @@ def build_path_c_descriptor_prim_func(
             sort_keys=True,
         ),
     )
+    if validated_max_rows_per_launch is not None:
+        prim_func = prim_func.with_attr(
+            "tl.fusion.max_rows_per_launch",
+            validated_max_rows_per_launch,
+        ).with_attr(
+            "tl.fusion.row_dispatch_mode",
+            validated_row_dispatch_mode,
+        )
+    if row_chunk_count is not None:
+        prim_func = prim_func.with_attr(
+            "tl.fusion.row_chunk_count",
+            row_chunk_count,
+        )
+        if (
+            validated_row_dispatch_mode
+            == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+        ):
+            prim_func = prim_func.with_attr(
+                "tl.fusion.row_chunk_index_param",
+                DESCRIPTOR_ROW_CHUNK_INDEX_PARAM,
+            ).with_attr(
+                "tl.fusion.row_subchunk_index_param",
+                DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM,
+            ).with_attr(
+                "tl.fusion.rows_per_kernel_launch",
+                DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+            ).with_attr(
+                "tl.fusion.row_subchunk_count",
+                max(
+                    1,
+                    (
+                        int(validated_max_rows_per_launch)
+                        + DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+                        - 1
+                    )
+                    // DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+                ),
+            )
+    if any(node.op_name.endswith("_bwd") for node in nodes):
+        prim_func = prim_func.with_attr(
+            "tl.fusion.backward_gate_param",
+            DESCRIPTOR_BACKWARD_GATE_PARAM,
+        )
     compile_pass_configs = _descriptor_tilelang_compile_pass_configs(
         descriptors,
         loop_policy=validated_loop_policy,
@@ -1295,6 +1387,9 @@ def build_path_c_descriptor_prim_func(
     )
     prim_func._cppmega_path_c_loop_policy = validated_loop_policy
     prim_func._cppmega_path_c_physical_abi_policy = validated_physical_abi_policy
+    prim_func._cppmega_path_c_max_rows_per_launch = validated_max_rows_per_launch
+    prim_func._cppmega_path_c_row_dispatch_mode = validated_row_dispatch_mode
+    prim_func._cppmega_path_c_row_chunk_count = row_chunk_count
     prim_func._cppmega_path_c_internal_buffer_shapes = internal_buffer_shapes
     prim_func._cppmega_path_c_buffer_abi_shapes = {
         name: shape_by_buffer[name]
@@ -1359,6 +1454,32 @@ def _append_unique_names(
         values.append(name)
         seen.add(name)
     return tuple(values)
+
+
+def _row_phased_launcher_carry_buffers_for_nodes(
+    nodes: Sequence[_ScheduleNodeView],
+    *,
+    shape_env: PathCModelShapeEnv | None,
+    loop_policy: str,
+    max_rows_per_launch: int | None,
+    row_dispatch_mode: str,
+) -> tuple[str, ...]:
+    if (
+        shape_env is None
+        or loop_policy != DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
+        or max_rows_per_launch is None
+        or row_dispatch_mode != DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+    ):
+        return ()
+    carries: list[str] = []
+    if any(node.op_name == "mamba3_mimo" for node in nodes):
+        if int(shape_env.mamba_num_heads) * int(shape_env.mamba_num_rope_angles) > 0:
+            carries.append("mamba3_angle_state")
+        if max(0, int(shape_env.mamba_conv_kernel) - 1) > 0:
+            carries.append("mamba3_conv_state")
+    if any(node.op_name == "m2rnn" for node in nodes):
+        carries.append("m2rnn_h_state")
+    return tuple(carries)
 
 
 def _train_step_output_abi_payload(
@@ -1540,6 +1661,8 @@ def _descriptor_prim_func_source(
     physical_abi_plan: _PhysicalAbiPlan,
     internal_buffer_policy: str,
     loop_policy: str,
+    max_rows_per_launch: int | None,
+    row_dispatch_mode: str,
     external_buffers: Sequence[str],
     shape_by_buffer: Mapping[str, tuple[int, ...]],
     dtype_by_buffer: dict[str, str],
@@ -1557,6 +1680,27 @@ def _descriptor_prim_func_source(
         param_lines = [
             f"{indent}_dummy: T.Tensor(({buffer_extent},), \"float32\"),"
         ]
+    chunked_row_count = _row_phased_chunk_count(
+        loop_policy=loop_policy,
+        shape_env=shape_env,
+        max_rows_per_launch=max_rows_per_launch,
+    )
+    chunked_by_launcher = (
+        chunked_row_count is not None
+        and row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+    )
+    if chunked_by_launcher:
+        param_lines.append(
+            f"{indent}{DESCRIPTOR_ROW_CHUNK_INDEX_PARAM}: T.int32,"
+        )
+        param_lines.append(
+            f"{indent}{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM}: T.int32,"
+        )
+    has_backward = any(node.op_name.endswith("_bwd") for node in nodes)
+    if has_backward:
+        param_lines.append(
+            f"{indent}{DESCRIPTOR_BACKWARD_GATE_PARAM}: T.int32,"
+        )
     access_by_buffer = {
         buffer_name: _internal_buffer_ref(
             buffer_name,
@@ -1581,20 +1725,29 @@ def _descriptor_prim_func_source(
     )
     thread_count = min(DESCRIPTOR_DEFAULT_THREADS, max(1, loop_extent))
     block_count = (loop_extent + thread_count - 1) // thread_count
+    if loop_policy == DESCRIPTOR_LOOP_POLICY_FLAT:
+        kernel_line = f"{indent}with T.Kernel({block_count}, threads={thread_count}) as bx:"
+    elif chunked_by_launcher:
+        kernel_line = f"{indent}with T.Kernel(1, threads={thread_count}) as chunk:"
+    elif chunked_row_count is not None:
+        kernel_line = (
+            f"{indent}with T.Kernel({chunked_row_count}, threads={thread_count}) as chunk:"
+        )
+    else:
+        kernel_line = f"{indent}with T.Kernel(1, threads={thread_count}):"
 
     body: list[str] = [
         "@T.prim_func",
         f"def {entry_name}(",
         *param_lines,
         "):",
-        (
-            f"{indent}with T.Kernel({block_count}, threads={thread_count}) as bx:"
-            if loop_policy == DESCRIPTOR_LOOP_POLICY_FLAT
-            else f"{indent}with T.Kernel(1, threads={thread_count}):"
-        ),
+        kernel_line,
         f"{indent * 2}# internal_buffer_policy: {internal_buffer_policy}",
         f"{indent * 2}# loop_policy: {loop_policy}",
     ]
+    if max_rows_per_launch is not None:
+        body.append(f"{indent * 2}# max_rows_per_launch: {max_rows_per_launch}")
+        body.append(f"{indent * 2}# row_dispatch_mode: {row_dispatch_mode}")
     if loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
         body.append(f"{indent * 2}lane = T.get_thread_binding(0)")
     internal_allocator = (
@@ -1641,6 +1794,8 @@ def _descriptor_prim_func_source(
             train_step_loss_parameter_grad_buffers=(
                 train_step_loss_parameter_grad_buffers
             ),
+            max_rows_per_launch=max_rows_per_launch,
+            row_dispatch_mode=row_dispatch_mode,
             indent=indent,
         )
     else:
@@ -3211,6 +3366,8 @@ def _append_row_phased_hidden_body(
     physical_abi_plan: _PhysicalAbiPlan,
     train_step_loss_cotangent_buffers: Sequence[str],
     train_step_loss_parameter_grad_buffers: Sequence[str],
+    max_rows_per_launch: int | None,
+    row_dispatch_mode: str,
     indent: str,
 ) -> None:
     if shape_env is None:
@@ -3218,6 +3375,49 @@ def _append_row_phased_hidden_body(
     hidden_size = int(shape_env.hidden_size)
     sequence_length = int(shape_env.sequence_length)
     thread_count = min(DESCRIPTOR_DEFAULT_THREADS, max(1, sequence_length * hidden_size))
+    chunked_rows = max_rows_per_launch is not None
+    row_loop = (
+        "for row in T.serial(row_chunk_start, row_chunk_stop):"
+        if chunked_rows
+        else f"for row in T.serial(0, {sequence_length}):"
+    )
+    entry_row_loop = (
+        "for row in T.serial(row_chunk_start, entry_row_chunk_stop):"
+        if chunked_rows
+        else row_loop
+    )
+    row_chunk_expr = (
+        DESCRIPTOR_ROW_CHUNK_INDEX_PARAM
+        if row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+        else "chunk"
+    )
+    launcher_subchunked_rows = (
+        chunked_rows
+        and row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+    )
+    row_chunk_assumptions: tuple[str, ...] = ()
+    if launcher_subchunked_rows:
+        chunk_count = max(
+            1,
+            (sequence_length + int(max_rows_per_launch) - 1)
+            // int(max_rows_per_launch),
+        )
+        subchunk_count = max(
+            1,
+            (int(max_rows_per_launch) + DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH - 1)
+            // DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+        )
+        row_chunk_assumptions = (
+            f"{indent * 2}T.assume({row_chunk_expr} >= 0)",
+            f"{indent * 2}T.assume({row_chunk_expr} < {chunk_count})",
+            f"{indent * 2}T.assume({DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} >= 0)",
+            f"{indent * 2}T.assume({DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} < {subchunk_count})",
+        )
+        body.append(
+            f"{indent * 2}path_c_first_row_launch = T.if_then_else("
+            f"{row_chunk_expr} == 0, T.if_then_else("
+            f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} == 0, 1, 0), 0)"
+        )
     fwd_items = tuple(
         (node, descriptor, fragment)
         for node, descriptor, fragment in zip(
@@ -3276,6 +3476,7 @@ def _append_row_phased_hidden_body(
                 shape_env=shape_env,
                 thread_count=thread_count,
                 indent=indent,
+                launcher_chunked_rows=launcher_subchunked_rows,
             )
     for node, descriptor, _fragment in fwd_items:
         if _is_row_phased_m2rnn(node, descriptor, shape_env):
@@ -3287,6 +3488,7 @@ def _append_row_phased_hidden_body(
                 shape_env=shape_env,
                 thread_count=thread_count,
                 indent=indent,
+                launcher_chunked_rows=launcher_subchunked_rows,
             )
     for node, _descriptor, _fragment in fwd_items:
         if _is_row_phased_sparse_mla_fp8_apply(node, shape_env):
@@ -3384,8 +3586,57 @@ def _append_row_phased_hidden_body(
         body.append(
             f"{indent * 2}# entry_rmsnorm_policy: full_sequence_prepass"
         )
+        if chunked_rows:
+            body.append(f"{indent * 2}# row_dispatch_policy: chunked_rows")
+            body.extend(row_chunk_assumptions)
+            if launcher_subchunked_rows:
+                body.append(
+                    f"{indent * 2}logical_row_chunk_start = "
+                    f"{row_chunk_expr} * {max_rows_per_launch}"
+                )
+                body.append(
+                    f"{indent * 2}logical_row_chunk_stop = "
+                    f"T.min(logical_row_chunk_start + "
+                    f"{max_rows_per_launch}, {sequence_length})"
+                )
+                body.append(
+                    f"{indent * 2}subchunk_row_chunk_start = "
+                    f"T.min(logical_row_chunk_start + "
+                    f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} * "
+                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    "logical_row_chunk_stop)"
+                )
+                body.append(
+                    f"{indent * 2}subchunk_row_chunk_stop = "
+                    f"T.min(subchunk_row_chunk_start + "
+                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    "logical_row_chunk_stop)"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_start = T.if_then_else("
+                    f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                    "logical_row_chunk_start, subchunk_row_chunk_start)"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_stop = T.if_then_else("
+                    f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                    "logical_row_chunk_stop, subchunk_row_chunk_stop)"
+                )
+            else:
+                body.append(
+                    f"{indent * 2}row_chunk_start = "
+                    f"{row_chunk_expr} * {max_rows_per_launch}"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_stop = T.min(row_chunk_start + "
+                    f"{max_rows_per_launch}, {sequence_length})"
+                )
+            body.append(
+                f"{indent * 2}entry_row_chunk_stop = "
+                f"T.min(row_chunk_stop + 1, {sequence_length})"
+            )
         body.append(
-            f"{indent * 2}for row in T.serial(0, {sequence_length}):"
+            f"{indent * 2}{entry_row_loop}"
         )
         for node, descriptor, _fragment in entry_rmsnorm_fwd_items:
             _append_row_phased_entry_rmsnorm_body(
@@ -3399,7 +3650,52 @@ def _append_row_phased_hidden_body(
                 indent=indent,
             )
     if other_fwd_items:
-        body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
+        if chunked_rows and not entry_rmsnorm_fwd_items:
+            body.append(f"{indent * 2}# row_dispatch_policy: chunked_rows")
+            body.extend(row_chunk_assumptions)
+            if launcher_subchunked_rows:
+                body.append(
+                    f"{indent * 2}logical_row_chunk_start = "
+                    f"{row_chunk_expr} * {max_rows_per_launch}"
+                )
+                body.append(
+                    f"{indent * 2}logical_row_chunk_stop = "
+                    f"T.min(logical_row_chunk_start + "
+                    f"{max_rows_per_launch}, {sequence_length})"
+                )
+                body.append(
+                    f"{indent * 2}subchunk_row_chunk_start = "
+                    f"T.min(logical_row_chunk_start + "
+                    f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} * "
+                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    "logical_row_chunk_stop)"
+                )
+                body.append(
+                    f"{indent * 2}subchunk_row_chunk_stop = "
+                    f"T.min(subchunk_row_chunk_start + "
+                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    "logical_row_chunk_stop)"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_start = T.if_then_else("
+                    f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                    "logical_row_chunk_start, subchunk_row_chunk_start)"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_stop = T.if_then_else("
+                    f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                    "logical_row_chunk_stop, subchunk_row_chunk_stop)"
+                )
+            else:
+                body.append(
+                    f"{indent * 2}row_chunk_start = "
+                    f"{row_chunk_expr} * {max_rows_per_launch}"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_stop = T.min(row_chunk_start + "
+                    f"{max_rows_per_launch}, {sequence_length})"
+                )
+        body.append(f"{indent * 2}{row_loop}")
         for node, descriptor, fragment in other_fwd_items:
             if _is_row_phased_mamba3(node, descriptor, shape_env):
                 _append_row_phased_mamba3_body(
@@ -3411,6 +3707,7 @@ def _append_row_phased_hidden_body(
                     shape_env=shape_env,
                     thread_count=thread_count,
                     indent=indent,
+                    launcher_chunked_rows=launcher_subchunked_rows,
                 )
                 continue
             if node.op_name == "residual_rmsnorm":
@@ -3447,6 +3744,7 @@ def _append_row_phased_hidden_body(
                     shape_env=shape_env,
                     thread_count=thread_count,
                     indent=indent,
+                    launcher_chunked_rows=launcher_subchunked_rows,
                 )
                 continue
             if _is_row_phased_sparse_mla_fp8_apply(node, shape_env):
@@ -3474,8 +3772,25 @@ def _append_row_phased_hidden_body(
             for statement in fragment.statements:
                 body.append(f"{indent * 4}{statement}")
             body.append(f"{indent * 3}T.sync_threads()")
+    if not bwd_items:
+        _append_train_step_suffix_scalar_outputs(
+            body,
+            computed_outputs=train_step_computed_output_buffers,
+            loss_source_buffers=train_step_loss_source_buffers,
+            train_step_loss_cotangent_buffers=train_step_loss_cotangent_buffers,
+            train_step_loss_parameter_grad_buffers=(
+                train_step_loss_parameter_grad_buffers
+            ),
+            physical_abi_plan=physical_abi_plan,
+            loop_policy=DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+            shape_env=shape_env,
+            indent=indent,
+        )
+        return
+    bwd_body: list[str] = []
+    bwd_once_body: list[str] = []
     _append_train_step_suffix_scalar_outputs(
-        body,
+        bwd_once_body,
         computed_outputs=train_step_computed_output_buffers,
         loss_source_buffers=train_step_loss_source_buffers,
         train_step_loss_cotangent_buffers=train_step_loss_cotangent_buffers,
@@ -3487,36 +3802,42 @@ def _append_row_phased_hidden_body(
         shape_env=shape_env,
         indent=indent,
     )
-    if not bwd_items:
-        return
     row_phased_bwd_items = tuple(
         (node, descriptor)
         for node, descriptor, _fragment in bwd_items
         if _is_row_phased_bwd_descriptor(node, descriptor, shape_env)
     )
     if not row_phased_bwd_items:
-        body.append(
+        if bwd_once_body:
+            if launcher_subchunked_rows:
+                bwd_body.append(f"{indent * 2}if path_c_first_row_launch != 0:")
+                bwd_body.extend(f"{indent}{line}" for line in bwd_once_body)
+            else:
+                bwd_body.extend(bwd_once_body)
+        bwd_body.append(
             f"{indent * 2}# backward_policy: flat_after_row_phased_forward"
         )
-        body.append(
+        bwd_body.append(
             f"{indent * 2}for i in T.serial(lane, "
             f"{sequence_length * hidden_size}, step={thread_count}):"
         )
         for node, descriptor, fragment in bwd_items:
             _append_descriptor_node_comments(
-                body,
+                bwd_body,
                 node=node,
                 descriptor=descriptor,
                 indent=indent * 3,
             )
             for statement in fragment.statements:
-                body.append(f"{indent * 3}{statement}")
-            body.append(f"{indent * 3}T.sync_threads()")
+                bwd_body.append(f"{indent * 3}{statement}")
+            bwd_body.append(f"{indent * 3}T.sync_threads()")
+        body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} != 0:")
+        body.extend(f"{indent}{line}" for line in bwd_body)
         return
     for node, _descriptor, _fragment in bwd_items:
         if _is_row_phased_residual_rmsnorm_bwd(node, _descriptor):
             _append_row_phased_residual_rmsnorm_bwd_init(
-                body,
+                bwd_once_body,
                 node=node,
                 access_by_buffer=access_by_buffer,
                 hidden_size=hidden_size,
@@ -3526,7 +3847,7 @@ def _append_row_phased_hidden_body(
     for node, _descriptor, _fragment in bwd_items:
         if _is_row_phased_entry_rmsnorm_bwd(node, _descriptor):
             _append_row_phased_entry_rmsnorm_bwd_init(
-                body,
+                bwd_once_body,
                 node=node,
                 access_by_buffer=access_by_buffer,
                 hidden_size=hidden_size,
@@ -3534,12 +3855,18 @@ def _append_row_phased_hidden_body(
                 thread_count=thread_count,
                 indent=indent,
             )
-    body.append(f"{indent * 2}# backward_policy: row_phased_hidden_recompute")
-    body.append(f"{indent * 2}for row in T.serial(0, {sequence_length}):")
+    if bwd_once_body:
+        if launcher_subchunked_rows:
+            bwd_body.append(f"{indent * 2}if path_c_first_row_launch != 0:")
+            bwd_body.extend(f"{indent}{line}" for line in bwd_once_body)
+        else:
+            bwd_body.extend(bwd_once_body)
+    bwd_body.append(f"{indent * 2}# backward_policy: row_phased_hidden_recompute")
+    bwd_body.append(f"{indent * 2}{row_loop}")
     for node, descriptor, fragment in bwd_items:
         if _is_row_phased_residual_rmsnorm_bwd(node, descriptor):
             _append_row_phased_residual_rmsnorm_bwd_body(
-                body,
+                bwd_body,
                 node=node,
                 descriptor=descriptor,
                 dtype_by_buffer=dtype_by_buffer,
@@ -3551,7 +3878,7 @@ def _append_row_phased_hidden_body(
             continue
         if _is_row_phased_attention_qkv_projection_bwd(node, descriptor, shape_env):
             _append_row_phased_attention_qkv_projection_bwd_body(
-                body,
+                bwd_body,
                 node=node,
                 descriptor=descriptor,
                 dtype_by_buffer=dtype_by_buffer,
@@ -3563,7 +3890,7 @@ def _append_row_phased_hidden_body(
             continue
         if _is_row_phased_m2rnn_bwd(node, descriptor, shape_env):
             _append_row_phased_m2rnn_bwd_body(
-                body,
+                bwd_body,
                 node=node,
                 descriptor=descriptor,
                 dtype_by_buffer=dtype_by_buffer,
@@ -3575,7 +3902,7 @@ def _append_row_phased_hidden_body(
             continue
         if _is_row_phased_mamba3_bwd(node, descriptor, shape_env):
             _append_row_phased_mamba3_bwd_body(
-                body,
+                bwd_body,
                 node=node,
                 descriptor=descriptor,
                 dtype_by_buffer=dtype_by_buffer,
@@ -3587,7 +3914,7 @@ def _append_row_phased_hidden_body(
             continue
         if _is_row_phased_entry_rmsnorm_bwd(node, descriptor):
             _append_row_phased_entry_rmsnorm_bwd_body(
-                body,
+                bwd_body,
                 node=node,
                 descriptor=descriptor,
                 dtype_by_buffer=dtype_by_buffer,
@@ -3597,19 +3924,21 @@ def _append_row_phased_hidden_body(
                 indent=indent,
             )
             continue
-        body.append(
+        bwd_body.append(
             f"{indent * 3}for i in T.serial(row * {hidden_size} + lane, "
             f"(row + 1) * {hidden_size}, step={thread_count}):"
         )
         _append_descriptor_node_comments(
-            body,
+            bwd_body,
             node=node,
             descriptor=descriptor,
             indent=indent * 4,
         )
         for statement in fragment.statements:
-            body.append(f"{indent * 4}{statement}")
-        body.append(f"{indent * 3}T.sync_threads()")
+            bwd_body.append(f"{indent * 4}{statement}")
+        bwd_body.append(f"{indent * 3}T.sync_threads()")
+    body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} != 0:")
+    body.extend(f"{indent}{line}" for line in bwd_body)
 
 
 def _append_lane0_row_phase(
@@ -3843,6 +4172,7 @@ def _append_row_phased_mamba3_init(
     shape_env: PathCModelShapeEnv,
     thread_count: int,
     indent: str,
+    launcher_chunked_rows: bool = False,
 ) -> None:
     projected = _scratch_name(node, "mamba3_projected_vec")
     conv_history = _scratch_name(node, "mamba3_conv_history")
@@ -3924,21 +4254,53 @@ def _append_row_phased_mamba3_init(
     angle_flat = _scratch_name(node, "angle_flat_init")
     history_flat = _scratch_name(node, "history_flat_init")
     body.append(f"{indent * 2}# {node.name}: mamba3_state_policy: external_scan_state")
-    body.append(
-        f"{indent * 2}for {angle_flat} in T.serial(lane, {heads * rope_angles}, "
-        f"step={thread_count}):"
-    )
-    body.append(f"{indent * 3}{head} = {angle_flat} // {rope_angles}")
-    body.append(f"{indent * 3}{angle} = {angle_flat} % {rope_angles}")
-    body.append(f"{indent * 3}{angle_cumsum}[{head}, {angle}] = 0.0")
-    if state_output is not None:
+    if launcher_chunked_rows:
+        body.append(f"{indent * 2}if path_c_first_row_launch != 0:")
         body.append(
-            f"{indent * 2}for {state_flat} in T.serial(lane, {heads * head_dim * state_dim}, "
+            f"{indent * 3}for {angle_flat} in T.serial(lane, {heads * rope_angles}, "
             f"step={thread_count}):"
         )
-        body.append(f"{indent * 3}{head} = {state_flat} // {head_dim * state_dim}")
-        body.append(f"{indent * 3}{dim} = ({state_flat} // {state_dim}) % {head_dim}")
-        body.append(f"{indent * 3}{state} = {state_flat} % {state_dim}")
+        body.append(f"{indent * 4}{head} = {angle_flat} // {rope_angles}")
+        body.append(f"{indent * 4}{angle} = {angle_flat} % {rope_angles}")
+        body.append(f"{indent * 4}{angle_cumsum}[{head}, {angle}] = 0.0")
+        body.append(f"{indent * 2}else:")
+        body.append(
+            f"{indent * 3}for {angle_flat} in T.serial(lane, {heads * rope_angles}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{head} = {angle_flat} // {rope_angles}")
+        body.append(f"{indent * 4}{angle} = {angle_flat} % {rope_angles}")
+        angle_state_ref = _buffer_ref(
+            "mamba3_angle_state",
+            access_by_buffer,
+            f"{head} * {rope_angles} + {angle}",
+        )
+        body.append(
+            f"{indent * 4}{angle_cumsum}[{head}, {angle}] = {angle_state_ref}"
+        )
+    else:
+        body.append(
+            f"{indent * 2}for {angle_flat} in T.serial(lane, {heads * rope_angles}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 3}{head} = {angle_flat} // {rope_angles}")
+        body.append(f"{indent * 3}{angle} = {angle_flat} % {rope_angles}")
+        body.append(f"{indent * 3}{angle_cumsum}[{head}, {angle}] = 0.0")
+    if state_output is not None:
+        if launcher_chunked_rows:
+            body.append(f"{indent * 2}if path_c_first_row_launch != 0:")
+            state_loop_indent = indent * 3
+            state_body_indent = indent * 4
+        else:
+            state_loop_indent = indent * 2
+            state_body_indent = indent * 3
+        body.append(
+            f"{state_loop_indent}for {state_flat} in T.serial(lane, {heads * head_dim * state_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{state_body_indent}{head} = {state_flat} // {head_dim * state_dim}")
+        body.append(f"{state_body_indent}{dim} = ({state_flat} // {state_dim}) % {head_dim}")
+        body.append(f"{state_body_indent}{state} = {state_flat} % {state_dim}")
         state_idx = f"{head} * {head_dim * state_dim} + {dim} * {state_dim} + {state}"
         h0_expr = _node_indexed_canonical_input_expr(
             node,
@@ -3955,20 +4317,45 @@ def _append_row_phased_mamba3_init(
             ),
         )
         body.append(
-            f"{indent * 3}{_buffer_ref(state_output, access_by_buffer, state_idx)} = "
+            f"{state_body_indent}{_buffer_ref(state_output, access_by_buffer, state_idx)} = "
             f"{h0_expr}"
         )
     body.append(f"{indent * 2}T.sync_threads()")
     if history_len <= 0:
         return
     body.append(f"{indent * 2}# {node.name}: mamba3_conv_policy: zero_padded_ring_history")
-    body.append(
-        f"{indent * 2}for {history_flat} in T.serial(lane, "
-        f"{history_len * conv_channels}, step={thread_count}):"
-    )
-    body.append(f"{indent * 3}{hist} = {history_flat} // {conv_channels}")
-    body.append(f"{indent * 3}{ch} = {history_flat} % {conv_channels}")
-    body.append(f"{indent * 3}{conv_history}[{hist}, {ch}] = 0.0")
+    if launcher_chunked_rows:
+        body.append(f"{indent * 2}if path_c_first_row_launch != 0:")
+        body.append(
+            f"{indent * 3}for {history_flat} in T.serial(lane, "
+            f"{history_len * conv_channels}, step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{hist} = {history_flat} // {conv_channels}")
+        body.append(f"{indent * 4}{ch} = {history_flat} % {conv_channels}")
+        body.append(f"{indent * 4}{conv_history}[{hist}, {ch}] = 0.0")
+        body.append(f"{indent * 2}else:")
+        body.append(
+            f"{indent * 3}for {history_flat} in T.serial(lane, "
+            f"{history_len * conv_channels}, step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{hist} = {history_flat} // {conv_channels}")
+        body.append(f"{indent * 4}{ch} = {history_flat} % {conv_channels}")
+        conv_state_ref = _buffer_ref(
+            "mamba3_conv_state",
+            access_by_buffer,
+            f"{hist} * {conv_channels} + {ch}",
+        )
+        body.append(
+            f"{indent * 4}{conv_history}[{hist}, {ch}] = {conv_state_ref}"
+        )
+    else:
+        body.append(
+            f"{indent * 2}for {history_flat} in T.serial(lane, "
+            f"{history_len * conv_channels}, step={thread_count}):"
+        )
+        body.append(f"{indent * 3}{hist} = {history_flat} // {conv_channels}")
+        body.append(f"{indent * 3}{ch} = {history_flat} % {conv_channels}")
+        body.append(f"{indent * 3}{conv_history}[{hist}, {ch}] = 0.0")
     body.append(f"{indent * 2}T.sync_threads()")
 
 
@@ -3982,6 +4369,7 @@ def _append_row_phased_mamba3_body(
     shape_env: PathCModelShapeEnv,
     thread_count: int,
     indent: str,
+    launcher_chunked_rows: bool = False,
 ) -> None:
     projected = _scratch_name(node, "mamba3_projected_vec")
     conv_history = _scratch_name(node, "mamba3_conv_history")
@@ -4014,6 +4402,9 @@ def _append_row_phased_mamba3_body(
     rank_group_flat = _scratch_name(node, "rank_group_flat")
     group_state_flat = _scratch_name(node, "group_state_flat")
     history_flat = _scratch_name(node, "history_flat")
+    angle_carry_flat = _scratch_name(node, "angle_carry_flat")
+    angle_carry_head = _scratch_name(node, "angle_carry_head")
+    angle_carry_idx = _scratch_name(node, "angle_carry_idx")
     trap_group_loop = _scratch_name(node, "trap_group_loop")
     hidden_size = int(shape_env.hidden_size)
     inner_dim = int(shape_env.mamba_inner_dim)
@@ -4141,6 +4532,22 @@ def _append_row_phased_mamba3_body(
         f"{angle_cumsum}[{head}, {angle}] + "
         f"({projected}[{angle_offset} + {angle}] * {dt_vec}[{head}])"
     )
+    if launcher_chunked_rows:
+        body.append(
+            f"{indent * 3}for {angle_carry_flat} in T.serial(lane, {heads * rope_angles}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{angle_carry_head} = {angle_carry_flat} // {rope_angles}")
+        body.append(f"{indent * 4}{angle_carry_idx} = {angle_carry_flat} % {rope_angles}")
+        angle_state_ref = _buffer_ref(
+            "mamba3_angle_state",
+            access_by_buffer,
+            f"{angle_carry_head} * {rope_angles} + {angle_carry_idx}",
+        )
+        body.append(
+            f"{indent * 4}{angle_state_ref} = "
+            f"{angle_cumsum}[{angle_carry_head}, {angle_carry_idx}]"
+        )
     body.append(f"{indent * 3}T.sync_threads()")
     body.append(
         f"{indent * 3}for {trap_group_loop} in T.serial(lane, {groups}, "
@@ -4441,6 +4848,22 @@ def _append_row_phased_mamba3_body(
         f"{indent * 4}{conv_history}[{history_len - 1}, {conv_ch}] = "
         f"{projected}[{x_offset} + {conv_ch}]"
     )
+    if launcher_chunked_rows:
+        body.append(f"{indent * 3}T.sync_threads()")
+        body.append(
+            f"{indent * 3}for {history_flat} in T.serial(lane, "
+            f"{history_len * conv_channels}, step={thread_count}):"
+        )
+        hist_expr = f"({history_flat} // {conv_channels})"
+        conv_ch_expr = f"({history_flat} % {conv_channels})"
+        conv_state_ref = _buffer_ref(
+            "mamba3_conv_state",
+            access_by_buffer,
+            f"{hist_expr} * {conv_channels} + {conv_ch_expr}",
+        )
+        body.append(
+            f"{indent * 4}{conv_state_ref} = {conv_history}[{hist_expr}, {conv_ch_expr}]"
+        )
     body.append(f"{indent * 3}T.sync_threads()")
 
 
@@ -4453,6 +4876,7 @@ def _append_row_phased_m2rnn_init(
     shape_env: PathCModelShapeEnv,
     thread_count: int,
     indent: str,
+    launcher_chunked_rows: bool = False,
 ) -> None:
     conv_history = _scratch_name(node, "m2rnn_conv_history")
     h_state = _scratch_name(node, "m2rnn_h_state")
@@ -4505,13 +4929,20 @@ def _append_row_phased_m2rnn_init(
     ch = _scratch_name(node, "conv_ch_init")
     history_idx = _scratch_name(node, "history_idx_init")
     body.append(f"{indent * 2}# {node.name}: m2rnn_state_policy: row_carried")
+    if launcher_chunked_rows:
+        body.append(f"{indent * 2}if path_c_first_row_launch != 0:")
+        state_loop_indent = indent * 3
+        state_body_indent = indent * 4
+    else:
+        state_loop_indent = indent * 2
+        state_body_indent = indent * 3
     body.append(
-        f"{indent * 2}for {state_idx} in T.serial(lane, {total_heads * k_dim * v_dim}, "
+        f"{state_loop_indent}for {state_idx} in T.serial(lane, {total_heads * k_dim * v_dim}, "
         f"step={thread_count}):"
     )
-    body.append(f"{indent * 3}{head} = {state_idx} // {k_dim * v_dim}")
-    body.append(f"{indent * 3}{kk} = ({state_idx} // {v_dim}) % {k_dim}")
-    body.append(f"{indent * 3}{vv} = {state_idx} % {v_dim}")
+    body.append(f"{state_body_indent}{head} = {state_idx} // {k_dim * v_dim}")
+    body.append(f"{state_body_indent}{kk} = ({state_idx} // {v_dim}) % {k_dim}")
+    body.append(f"{state_body_indent}{vv} = {state_idx} % {v_dim}")
     h0_expr = _node_indexed_canonical_input_expr(
         node,
         "m2rnn_h0",
@@ -4519,8 +4950,24 @@ def _append_row_phased_m2rnn_init(
         access_by_buffer,
         f"{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}",
     )
-    body.append(f"{indent * 3}{h_state}[{head}, {kk}, {vv}] = {h0_expr}")
-    body.append(f"{indent * 3}{h_next}[{head}, {kk}, {vv}] = {h0_expr}")
+    body.append(f"{state_body_indent}{h_state}[{head}, {kk}, {vv}] = {h0_expr}")
+    body.append(f"{state_body_indent}{h_next}[{head}, {kk}, {vv}] = {h0_expr}")
+    if launcher_chunked_rows:
+        body.append(f"{indent * 2}else:")
+        body.append(
+            f"{indent * 3}for {state_idx} in T.serial(lane, {total_heads * k_dim * v_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{head} = {state_idx} // {k_dim * v_dim}")
+        body.append(f"{indent * 4}{kk} = ({state_idx} // {v_dim}) % {k_dim}")
+        body.append(f"{indent * 4}{vv} = {state_idx} % {v_dim}")
+        h_state_ref = _buffer_ref(
+            "m2rnn_h_state",
+            access_by_buffer,
+            f"{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}",
+        )
+        body.append(f"{indent * 4}{h_state}[{head}, {kk}, {vv}] = {h_state_ref}")
+        body.append(f"{indent * 4}{h_next}[{head}, {kk}, {vv}] = {h_state_ref}")
     body.append(f"{indent * 2}T.sync_threads()")
     if history_len <= 0:
         return
@@ -4552,6 +4999,7 @@ def _append_row_phased_m2rnn_body(
     shape_env: PathCModelShapeEnv,
     thread_count: int,
     indent: str,
+    launcher_chunked_rows: bool = False,
 ) -> None:
     conv_history = _scratch_name(node, "m2rnn_conv_history")
     h_state = _scratch_name(node, "m2rnn_h_state")
@@ -4770,6 +5218,15 @@ def _append_row_phased_m2rnn_body(
         f"{indent * 4}{h_state}[{head}, {kk}, {vv}] = "
         f"{h_next}[{head}, {kk}, {vv}]"
     )
+    if launcher_chunked_rows:
+        h_state_ref = _buffer_ref(
+            "m2rnn_h_state",
+            access_by_buffer,
+            f"{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}",
+        )
+        body.append(
+            f"{indent * 4}{h_state_ref} = {h_state}[{head}, {kk}, {vv}]"
+        )
     body.append(f"{indent * 3}{sum_sq_partial}[lane] = 0.0")
     body.append(
         f"{indent * 3}for {feature} in T.serial(lane, {features}, step={thread_count}):"
@@ -4845,6 +5302,22 @@ def _append_row_phased_m2rnn_body(
         f"{indent * 4}{conv_history}[{history_len - 1}, {conv_ch}] = "
         f"{projected}[{conv_ch}]"
     )
+    if launcher_chunked_rows:
+        body.append(f"{indent * 3}T.sync_threads()")
+        body.append(
+            f"{indent * 3}for {state_idx} in T.serial(lane, {history_len * conv_dim}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{hist} = {state_idx} // {conv_dim}")
+        body.append(f"{indent * 4}{conv_ch} = {state_idx} % {conv_dim}")
+        conv_state_ref = _buffer_ref(
+            "m2rnn_conv_state",
+            access_by_buffer,
+            f"{hist} * {conv_dim} + {conv_ch}",
+        )
+        body.append(
+            f"{indent * 4}{conv_state_ref} = {conv_history}[{hist}, {conv_ch}]"
+        )
     body.append(f"{indent * 3}T.sync_threads()")
 
 
@@ -7143,6 +7616,47 @@ def _validated_buffer_extent(buffer_extent: int) -> int:
     return extent
 
 
+def _validated_max_rows_per_launch(max_rows_per_launch: int | None) -> int | None:
+    if max_rows_per_launch is None:
+        return None
+    rows = int(max_rows_per_launch)
+    if rows <= 0:
+        raise ValueError("max_rows_per_launch must be positive when provided")
+    return rows
+
+
+def _validated_row_dispatch_mode(row_dispatch_mode: str) -> str:
+    mode = str(row_dispatch_mode)
+    if mode not in {
+        DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS,
+        DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    }:
+        raise ValueError(
+            "row_dispatch_mode must be one of "
+            f"{DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS!r}, "
+            f"{DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS!r}"
+        )
+    return mode
+
+
+def _row_phased_chunk_count(
+    *,
+    loop_policy: str,
+    shape_env: PathCModelShapeEnv | None,
+    max_rows_per_launch: int | None,
+) -> int | None:
+    if (
+        loop_policy != DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
+        or shape_env is None
+        or max_rows_per_launch is None
+    ):
+        return None
+    sequence_length = int(shape_env.sequence_length)
+    rows_per_launch = _validated_max_rows_per_launch(max_rows_per_launch)
+    assert rows_per_launch is not None
+    return max(1, (sequence_length + rows_per_launch - 1) // rows_per_launch)
+
+
 def _descriptor_loop_extent(
     external_buffers: Sequence[str],
     buffer_extent: int,
@@ -8701,7 +9215,14 @@ def _buffer_dtype(
         return "int32"
     if buffer_name.endswith("_has_sinks"):
         return "int32"
-    if canonical in {"q_scale", "kv_scale", "lse"} or buffer_name.endswith(
+    if canonical in {
+        "mamba3_angle_state",
+        "mamba3_conv_state",
+        "m2rnn_h_state",
+        "q_scale",
+        "kv_scale",
+        "lse",
+    } or buffer_name.endswith(
         ("_scale", "_sm_scale", "_lse")
     ):
         return "float32"
@@ -8729,9 +9250,12 @@ _KNOWN_BUFFER_SUFFIXES = tuple(
             "hidden",
             "mamba_state",
             "scan_state",
+            "mamba3_angle_state",
+            "mamba3_conv_state",
             "mamba3_delta",
             "m2rnn_hidden",
             "m2rnn_delta",
+            "m2rnn_h_state",
             "attention_hidden",
             "hidden_after_mamba3",
             "hidden_after_m2rnn",
@@ -8762,7 +9286,12 @@ def _canonical_buffer_name(buffer_name: str) -> str:
 def _is_mamba3_state_like_buffer(buffer_name: str, canonical_name: str) -> bool:
     if canonical_name in {"mamba_state", "scan_state", "mamba3_h0"}:
         return True
-    if canonical_name == "m2rnn_conv_state":
+    if canonical_name in {
+        "mamba3_angle_state",
+        "mamba3_conv_state",
+        "m2rnn_conv_state",
+        "m2rnn_h_state",
+    }:
         return False
     name = str(buffer_name)
     if name.endswith("_grad"):
@@ -8805,6 +9334,17 @@ def _buffer_shape(
             shape_env.mamba_num_heads
             * shape_env.mamba_head_dim
             * shape_env.mamba_state_dim,
+        )
+    if name == "mamba3_angle_state":
+        return (
+            max(1, shape_env.mamba_num_heads * shape_env.mamba_num_rope_angles),
+        )
+    if name == "mamba3_conv_state":
+        return (
+            max(
+                1,
+                (shape_env.mamba_conv_kernel - 1) * shape_env.mamba_conv_channels,
+            ),
         )
     if name == "mamba3_in_proj_weight":
         return (shape_env.mamba_in_proj_dim * hidden,)
@@ -8862,7 +9402,7 @@ def _buffer_shape(
         return (shape_env.m2rnn_num_heads * shape_env.m2rnn_v_head_dim,)
     if name == "m2rnn_out_proj_weight":
         return (hidden * shape_env.m2rnn_num_heads * shape_env.m2rnn_v_head_dim,)
-    if name == "m2rnn_h0":
+    if name in {"m2rnn_h0", "m2rnn_h_state"}:
         return (
             shape_env.m2rnn_num_heads
             * shape_env.m2rnn_k_head_dim
@@ -10033,8 +10573,43 @@ def _target_with_physical_abi_policy(
             internal_buffer_policy=target.internal_buffer_policy,
             loop_policy=target.loop_policy,
             physical_abi_policy=validated_policy,
+            max_rows_per_launch=target.max_rows_per_launch,
+            row_dispatch_mode=target.row_dispatch_mode,
         ),
         physical_abi_policy=validated_policy,
+    )
+
+
+def _target_with_max_rows_per_launch(
+    target: PathCFusionScheduleTarget,
+    region: PathCFusionRegion,
+    max_rows_per_launch: int | None,
+    row_dispatch_mode: str,
+) -> PathCFusionScheduleTarget:
+    validated_rows = _validated_max_rows_per_launch(max_rows_per_launch)
+    validated_mode = _validated_row_dispatch_mode(row_dispatch_mode)
+    if (
+        target.max_rows_per_launch == validated_rows
+        and target.row_dispatch_mode == validated_mode
+    ):
+        return target
+    shape_env = _shape_env_for_region(region)
+    return replace(
+        target,
+        schedule_template=make_path_c_descriptor_schedule_template(
+            target.brick_descriptors,
+            entry_symbol=getattr(region, "entry_symbol", None)
+            or getattr(region, "name", None),
+            buffer_extent=target.buffer_extent,
+            shape_env=shape_env,
+            internal_buffer_policy=target.internal_buffer_policy,
+            loop_policy=target.loop_policy,
+            physical_abi_policy=target.physical_abi_policy,
+            max_rows_per_launch=validated_rows,
+            row_dispatch_mode=validated_mode,
+        ),
+        max_rows_per_launch=validated_rows,
+        row_dispatch_mode=validated_mode,
     )
 
 
@@ -10205,6 +10780,8 @@ def plan_mamba3_fp8_train_fusion_schedule(
     *,
     include_backward: bool = True,
     model_config: Any | None = None,
+    max_rows_per_launch: int | None = DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+    row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE,
 ) -> Mamba3Fp8TrainFusionSchedulePlan:
     """Build and plan the named Mamba3 FP8 train-block acceptance schedule."""
 
@@ -10226,6 +10803,12 @@ def plan_mamba3_fp8_train_fusion_schedule(
             f"no Path C fusion schedule target registered for op signature "
             f"{tuple(node.op_name for node in optimized.region.nodes)!r}"
         )
+    target = _target_with_max_rows_per_launch(
+        target,
+        optimized.region,
+        max_rows_per_launch,
+        row_dispatch_mode,
+    )
     return Mamba3Fp8TrainFusionSchedulePlan(
         region=optimized.region,
         plan=optimized.plan,
@@ -10243,6 +10826,8 @@ def compile_mamba3_fp8_train_fusion_schedule(
     target_name: str = "metal",
     include_backward: bool = True,
     model_config: Any | None = None,
+    max_rows_per_launch: int | None = DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+    row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE,
 ) -> CompiledMamba3Fp8TrainFusionSchedule:
     """Lower the named Mamba3 FP8 train-block acceptance schedule.
 
@@ -10274,6 +10859,12 @@ def compile_mamba3_fp8_train_fusion_schedule(
             f"no Path C fusion schedule target registered for op signature "
             f"{tuple(node.op_name for node in region.nodes)!r}"
         )
+    target = _target_with_max_rows_per_launch(
+        target,
+        region,
+        max_rows_per_launch,
+        row_dispatch_mode,
+    )
     lowerer = tilelang_lowerer or tilelang_single_entry_lowerer
     schedule_template = _attested_schedule_template_for_target(target, region)
     compiled = compile_path_c_region(

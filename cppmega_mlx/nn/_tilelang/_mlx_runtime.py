@@ -810,6 +810,12 @@ def wrap_tilelang_metal_kernel(
                 "output_buffer_names contains buffers missing from the Metal "
                 f"signature: {missing_outputs!r}; parsed={buffer_names!r}"
             )
+        aliased_names = set(input_sources) & set(output_sources)
+        if aliased_names:
+            raise MLXRuntimeError(
+                f"Input and output buffer names must be mutually disjoint (aliasing is not supported): "
+                f"aliased={sorted(list(aliased_names))}"
+            )
         explicit_sources = input_sources + output_sources
         if len(set(explicit_sources)) != len(explicit_sources):
             raise MLXRuntimeError(
@@ -831,6 +837,14 @@ def wrap_tilelang_metal_kernel(
         raise MLXRuntimeError(
             f"unsupported TileLang Metal pattern: duplicate buffer names "
             f"{buffer_names!r}"
+        )
+
+    # Ensure no input/output aliasing overlap
+    aliased_names = set(input_sources) & set(output_sources)
+    if aliased_names:
+        raise MLXRuntimeError(
+            f"Input and output buffer names must be mutually disjoint (aliasing is not supported): "
+            f"aliased={sorted(list(aliased_names))}"
         )
 
     input_names = tuple(f"inp{i}" for i in range(len(input_sources)))

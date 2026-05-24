@@ -27,7 +27,7 @@ production adapter.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +52,7 @@ _REQUIRED_PRIMFUNC_ATTRS = (
     "tl.fusion.physical_abi.logical_to_physical",
     "tl.fusion.physical_abi.physical_buffer_shapes",
 )
+_ROW_DISPATCH_GRID_CHUNKS = "grid_chunks"
 
 
 def _decode_attr(prim_func: Any, key: str) -> Any:
@@ -100,6 +101,32 @@ class PathCAbiManifest:
     cotangent_seed_buffers: tuple[str, ...]
     top_level_scratch_shapes: Mapping[str, tuple[int, ...]]
     top_level_scratch_dtypes: Mapping[str, str]
+    max_rows_per_launch: int | None
+    row_chunk_count: int | None
+    row_subchunk_count: int | None
+    rows_per_kernel_launch: int | None
+    row_dispatch_mode: str | None
+    row_chunk_index_param: str | None
+    row_subchunk_index_param: str | None
+    row_chunk_index_buffer: str | None
+    backward_gate_param: str | None
+
+
+def _optional_positive_int_attr(prim_func: Any, key: str) -> int | None:
+    raw = prim_func.attrs.get(key)
+    if raw is None:
+        return None
+    value = int(str(raw))
+    if value <= 0:
+        raise ValueError(f"compiled PrimFunc attr {key!r} must be positive")
+    return value
+
+
+def _optional_string_attr(prim_func: Any, key: str) -> str | None:
+    raw = prim_func.attrs.get(key)
+    if raw is None:
+        return None
+    return str(raw).strip('"')
 
 
 def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
@@ -138,6 +165,12 @@ def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
         name: PathCBankPlacement.from_attr(info)
         for name, info in logical_to_physical_raw.items()
     }
+    row_chunk_index_buffer = _optional_string_attr(
+        prim_func, "tl.fusion.row_chunk_index_buffer"
+    )
+    row_chunk_index_param = _optional_string_attr(
+        prim_func, "tl.fusion.row_chunk_index_param"
+    )
 
     bank_shapes = {
         name: tuple(int(x) for x in shape) for name, shape in bank_shapes_raw.items()
@@ -157,6 +190,8 @@ def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
     # ``mamba3_delta``) end up in here too.
     for var, buffer in prim_func.buffer_map.items():
         logical = getattr(buffer, "name", None) or str(var)
+        if logical == row_chunk_index_buffer:
+            continue
         if logical in bank_shapes:
             continue
         if logical in logical_to_physical:
@@ -174,6 +209,29 @@ def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
         cotangent_seed_buffers=cotangent_buffers,
         top_level_scratch_shapes=top_level_shapes,
         top_level_scratch_dtypes=top_level_dtypes,
+        max_rows_per_launch=_optional_positive_int_attr(
+            prim_func, "tl.fusion.max_rows_per_launch"
+        ),
+        row_chunk_count=_optional_positive_int_attr(
+            prim_func, "tl.fusion.row_chunk_count"
+        ),
+        row_subchunk_count=_optional_positive_int_attr(
+            prim_func, "tl.fusion.row_subchunk_count"
+        ),
+        rows_per_kernel_launch=_optional_positive_int_attr(
+            prim_func, "tl.fusion.rows_per_kernel_launch"
+        ),
+        row_dispatch_mode=_optional_string_attr(
+            prim_func, "tl.fusion.row_dispatch_mode"
+        ),
+        row_chunk_index_param=row_chunk_index_param,
+        row_subchunk_index_param=_optional_string_attr(
+            prim_func, "tl.fusion.row_subchunk_index_param"
+        ),
+        row_chunk_index_buffer=row_chunk_index_buffer,
+        backward_gate_param=_optional_string_attr(
+            prim_func, "tl.fusion.backward_gate_param"
+        ),
     )
 
 
@@ -251,6 +309,9 @@ _FORWARD_OUTPUT_LOGICAL_BUFFERS: tuple[str, ...] = (
 _STATE_AFTER_LOGICAL_BUFFERS: tuple[str, ...] = (
     "mamba_state",
     "scan_state",
+    "mamba3_angle_state",
+    "mamba3_conv_state",
+    "m2rnn_h_state",
     "m2rnn_conv_state",
 )
 
@@ -325,6 +386,30 @@ class Mamba3Fp8TrainBlockLauncher:
     def forward_outputs(self) -> tuple[str, ...]:
         return _FORWARD_OUTPUT_LOGICAL_BUFFERS
 
+    @property
+    def max_rows_per_launch(self) -> int | None:
+        return self.manifest.max_rows_per_launch
+
+    @property
+    def row_chunk_count(self) -> int | None:
+        return self.manifest.row_chunk_count
+
+    @property
+    def row_subchunk_count(self) -> int | None:
+        return self.manifest.row_subchunk_count
+
+    @property
+    def chunked_dispatch_enabled(self) -> bool:
+        return (self.row_chunk_count or 0) > 1
+
+    @property
+    def row_chunk_index_buffer(self) -> str | None:
+        return self.manifest.row_chunk_index_buffer
+
+    @property
+    def row_chunk_index_param(self) -> str | None:
+        return self.manifest.row_chunk_index_param
+
     # --- launch ----------------------------------------------------------
 
     def __call__(
@@ -354,13 +439,34 @@ class Mamba3Fp8TrainBlockLauncher:
                 f"unknown logical buffer name(s) in real_abi_inputs: {unexpected_inputs!r}"
             )
 
+        run_backward = bool(cotangent_seeds)
+        unexpected_seeds = tuple(
+            name for name in cotangent_seeds if name not in self.cotangent_seed_buffers
+        )
+        if unexpected_seeds:
+            raise ValueError(
+                f"unknown logical buffer name(s) in cotangent_seeds: {unexpected_seeds!r}"
+            )
         missing_seeds = tuple(
             name for name in self.cotangent_seed_buffers if name not in cotangent_seeds
         )
-        if missing_seeds:
+        if run_backward and missing_seeds:
             raise ValueError(
                 f"missing cotangent seed buffers {missing_seeds!r}; "
                 "Path C train block needs them to compute parameter gradients"
+            )
+        if (
+            run_backward
+            and manifest.row_dispatch_mode == _ROW_DISPATCH_GRID_CHUNKS
+            and (manifest.row_chunk_count or 0) > 1
+            and self.parameter_grad_buffers
+        ):
+            raise RuntimeError(
+                "grid_chunks row dispatch is compile-only for fused backward "
+                "schedules: parameter-gradient zeroing and accumulation need "
+                "ordered chunk launches. Recompile with row_dispatch_mode="
+                "'launcher_chunks' until the schedule emits a real cross-block "
+                "reduction strategy."
             )
 
         # Allocate the three physical ABI banks.
@@ -409,7 +515,11 @@ class Mamba3Fp8TrainBlockLauncher:
         }
 
         # Build the full positional argument tuple in ``prim_func.params`` order.
-        positional: list[mx.array] = []
+        positional: list[Any] = []
+        row_chunk_param_index: int | None = None
+        row_chunk_param_is_scalar = False
+        row_subchunk_param_index: int | None = None
+        backward_gate_param_index: int | None = None
         for param_name in manifest.param_order:
             logical_name = param_name[: -len("_handle")] if param_name.endswith("_handle") else param_name
             if logical_name in banks:
@@ -418,50 +528,115 @@ class Mamba3Fp8TrainBlockLauncher:
                 positional.append(scratch_buffers[logical_name])
             elif logical_name in top_level_buffers:
                 positional.append(top_level_buffers[logical_name])
+            elif logical_name == manifest.row_chunk_index_param:
+                row_chunk_param_index = len(positional)
+                row_chunk_param_is_scalar = True
+                positional.append(0)
+            elif logical_name == manifest.row_chunk_index_buffer:
+                row_chunk_param_index = len(positional)
+                positional.append(mx.array([0], dtype=mx.int32))
+            elif logical_name == manifest.row_subchunk_index_param:
+                row_subchunk_param_index = len(positional)
+                positional.append(0)
+            elif logical_name == manifest.backward_gate_param:
+                backward_gate_param_index = len(positional)
+                positional.append(1 if run_backward else 0)
             else:
                 raise ValueError(
                     f"compiled PrimFunc has an unexpected parameter {param_name!r} "
                     f"not present in banks, dtype scratch, or top-level scratch"
                 )
+        if manifest.backward_gate_param is not None and backward_gate_param_index is None:
+            raise ValueError(
+                "compiled PrimFunc declares a backward gate attr but has no "
+                "matching scalar gate parameter"
+            )
 
-        # Launch. Descriptor schedules mark every ABI parameter as a native
-        # owner-output/inout buffer; keep the returned aliases in the manifest
-        # maps so extraction reads the MLX graph value produced by TileLang.
-        returned = self._kernel(*positional)
-        if returned is not None:
+        def apply_returned_outputs(returned: Any) -> None:
+            if returned is None:
+                return
             returned_outputs = (
                 [returned]
                 if isinstance(returned, mx.array)
                 else list(returned)
             )
-            if returned_outputs:
-                result_indices = self._result_param_indices
-                if len(returned_outputs) != len(result_indices):
-                    raise ValueError(
-                        "Path C TileLang kernel returned "
-                        f"{len(returned_outputs)} owner outputs for "
-                        f"{len(result_indices)} result ABI parameters"
+            if not returned_outputs:
+                return
+            result_indices = self._result_param_indices
+            if len(returned_outputs) != len(result_indices):
+                raise ValueError(
+                    "Path C TileLang kernel returned "
+                    f"{len(returned_outputs)} owner outputs for "
+                    f"{len(result_indices)} result ABI parameters"
+                )
+            for param_index, value in zip(
+                result_indices,
+                returned_outputs,
+                strict=True,
+            ):
+                param_name = manifest.param_order[param_index]
+                logical_name = (
+                    param_name[: -len("_handle")]
+                    if param_name.endswith("_handle")
+                    else param_name
+                )
+                if logical_name in banks:
+                    banks[logical_name] = value
+                elif logical_name in scratch_buffers:
+                    scratch_buffers[logical_name] = value
+                elif logical_name in top_level_buffers:
+                    top_level_buffers[logical_name] = value
+                elif logical_name == manifest.row_chunk_index_param:
+                    continue
+                elif logical_name == manifest.row_chunk_index_buffer:
+                    continue
+                elif logical_name == manifest.row_subchunk_index_param:
+                    continue
+                elif logical_name == manifest.backward_gate_param:
+                    continue
+                positional[param_index] = value
+
+        def eval_positionals() -> None:
+            mx_args = [arg for arg in positional if isinstance(arg, mx.array)]
+            if mx_args:
+                mx.eval(*mx_args)
+
+        # Launch. Descriptor schedules mark ABI parameters as native
+        # owner-output/inout buffers; keep returned aliases in the manifest maps
+        # so extraction reads the MLX graph value produced by TileLang.
+        if (
+            manifest.row_chunk_index_param is not None
+            or manifest.row_chunk_index_buffer is not None
+        ):
+            if row_chunk_param_index is None:
+                raise ValueError(
+                    "compiled PrimFunc declares chunked dispatch metadata but "
+                    "has no row chunk index parameter"
+                )
+            chunk_count = int(manifest.row_chunk_count or 1)
+            subchunk_count = (
+                1 if run_backward else int(manifest.row_subchunk_count or 1)
+            )
+            if manifest.row_subchunk_index_param is not None and row_subchunk_param_index is None:
+                raise ValueError(
+                    "compiled PrimFunc declares row subchunk dispatch metadata "
+                    "but has no row subchunk index parameter"
+                )
+            for chunk_index in range(chunk_count):
+                for subchunk_index in range(subchunk_count):
+                    positional[row_chunk_param_index] = (
+                        int(chunk_index)
+                        if row_chunk_param_is_scalar
+                        else mx.array([chunk_index], dtype=mx.int32)
                     )
-                for param_index, value in zip(
-                    result_indices,
-                    returned_outputs,
-                    strict=True,
-                ):
-                    param_name = manifest.param_order[param_index]
-                    logical_name = (
-                        param_name[: -len("_handle")]
-                        if param_name.endswith("_handle")
-                        else param_name
-                    )
-                    if logical_name in banks:
-                        banks[logical_name] = value
-                    elif logical_name in scratch_buffers:
-                        scratch_buffers[logical_name] = value
-                    elif logical_name in top_level_buffers:
-                        top_level_buffers[logical_name] = value
-                    positional[param_index] = value
-        # Force the lazy MLX graph to materialise so subsequent reads see the writes.
-        mx.eval(*positional)
+                    if row_subchunk_param_index is not None:
+                        positional[row_subchunk_param_index] = int(subchunk_index)
+                    apply_returned_outputs(self._kernel(*positional))
+                    eval_positionals()
+        else:
+            apply_returned_outputs(self._kernel(*positional))
+            # Force the lazy MLX graph to materialise so subsequent reads see the writes.
+            eval_positionals()
 
         # Extract logical outputs from the banks.
         forward = {
@@ -480,13 +655,17 @@ class Mamba3Fp8TrainBlockLauncher:
             for name in _STATE_AFTER_LOGICAL_BUFFERS
             if name in manifest.logical_to_physical
         }
-        parameter_grads = {
-            name: _bank_slot_view(
-                banks[manifest.logical_to_physical[name].bank],
-                manifest.logical_to_physical[name],
-            )
-            for name in self.parameter_grad_buffers
-        }
+        parameter_grads = (
+            {
+                name: _bank_slot_view(
+                    banks[manifest.logical_to_physical[name].bank],
+                    manifest.logical_to_physical[name],
+                )
+                for name in self.parameter_grad_buffers
+            }
+            if run_backward
+            else {}
+        )
         return PathCLaunchResult(
             forward=forward,
             parameter_grads=parameter_grads,
@@ -525,15 +704,6 @@ class Mamba3Fp8TrainBlockLauncher:
                 name for name in self.real_abi_inputs if name not in runtime_input_names
             ),
         )
-        zero_seeds: dict[str, mx.array] = {
-            name: mx.zeros(
-                self.manifest.logical_to_physical[name].logical_shape,
-                dtype=_to_mx_dtype(
-                    self.manifest.logical_to_physical[name].dtype
-                ),
-            )
-            for name in self.cotangent_seed_buffers
-        }
         hidden_placement = self.manifest.logical_to_physical["hidden"]
         launcher = self
 
@@ -549,7 +719,7 @@ class Mamba3Fp8TrainBlockLauncher:
                 )
             result = launcher(
                 real_abi_inputs=inputs,
-                cotangent_seeds=zero_seeds,
+                cotangent_seeds={},
             )
             return result.forward["attention_out"]
 

@@ -562,3 +562,31 @@ kernel void k(
             sys.modules.pop("mlx", None)
         else:
             sys.modules["mlx"] = saved_mlx
+
+
+def test_wrap_rejects_aliased_buffer_names() -> None:
+    """wrap_tilelang_metal_kernel should raise MLXRuntimeError if input/output buffer names overlap."""
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        MLXRuntimeError,
+        wrap_tilelang_metal_kernel,
+    )
+
+    src = """
+kernel void dummy(
+    device const float* A [[buffer(0)]],
+    device float* B [[buffer(1)]]
+) {
+    B[0] = A[0];
+}
+"""
+
+    with pytest.raises(MLXRuntimeError, match="mutually disjoint|aliasing is not supported"):
+        wrap_tilelang_metal_kernel(
+            src,
+            input_count=1,
+            output_count=1,
+            input_buffer_names=["A"],
+            output_buffer_names=["A"],
+            allow_mx_fast_metal_kernel=True,
+        )
+

@@ -114,7 +114,13 @@ export function ScheduleEditor({
   function setField<K extends keyof ScheduleSpecState>(
     field: K, val: ScheduleSpecState[K],
   ) {
-    onChange({ ...(value ?? { kind: "constant" }), [field]: val });
+    const nextValue = { ...(value ?? { kind: "constant" }), [field]: val };
+    if (nextValue.total_steps !== undefined && nextValue.warmup_steps !== undefined) {
+      if (nextValue.warmup_steps > nextValue.total_steps) {
+        nextValue.warmup_steps = nextValue.total_steps;
+      }
+    }
+    onChange(nextValue);
   }
   function setKind(k: ScheduleKind) {
     if (k === "constant") onChange(undefined);
@@ -156,7 +162,7 @@ export function ScheduleEditor({
         <label style={FIELD}>
           <span style={{ color: "var(--vb-text-muted)" }}>warmup_steps</span>
           <input data-testid={`schedule-warmup-${index}`}
-                 type="number" min={0} step={1} style={{ width: 70 }}
+                 type="number" min={0} max={value?.total_steps} step={1} style={{ width: 70 }}
                  value={value?.warmup_steps ?? 0}
                  onChange={(e) =>
                    setField("warmup_steps", Number(e.target.value))} />
@@ -166,7 +172,7 @@ export function ScheduleEditor({
         <label style={FIELD}>
           <span style={{ color: "var(--vb-text-muted)" }}>total_steps</span>
           <input data-testid={`schedule-total-${index}`}
-                 type="number" min={1} step={1} style={{ width: 80 }}
+                 type="number" min={Math.max(1, value?.warmup_steps ?? 0)} step={1} style={{ width: 80 }}
                  value={value?.total_steps ?? 100}
                  onChange={(e) =>
                    setField("total_steps", Number(e.target.value))} />

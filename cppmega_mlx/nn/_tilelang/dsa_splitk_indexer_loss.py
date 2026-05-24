@@ -307,6 +307,13 @@ def tilelang_supports(device: torch.device | str | None) -> bool:
 
 def _resolve_target(device: torch.device) -> str:
     if device.type == "cuda":
+        try:
+            if torch.cuda.is_available():
+                shmem = torch.cuda.get_device_properties(device).shared_memory_per_block
+                if shmem <= 49152:
+                    return "cuda -max_shmem=49152"
+        except Exception:
+            pass
         return "cuda"
     if device.type == "mps":
         # Explicit warp size keeps codegen aligned with Apple SIMDgroup width
@@ -340,6 +347,7 @@ def make_dsa_splitk_stage1_kernel(
     threads: int = _DSA_STAGE1_THREADS,
     num_stages: int = _DSA_STAGE1_NUM_STAGES,
     compute_index_path: bool = True,
+    target: str = "cuda",
 ) -> Any:
     """Build a shape-specialized stage-1 online-softmax statistics kernel.
 
@@ -400,6 +408,26 @@ def make_dsa_splitk_stage1_kernel(
     # separate, smaller stage-1-idx kernel that runs only for h=0.
     COMPUTE_INDEX = bool(compute_index_path)
 
+    is_cuda = isinstance(target, str) and "cuda" in target
+    bytes_per_elem = 2 if in_dtype in ("float16", "bfloat16") else 4
+    shmem_bytes = (
+        (BLOCK_SQ * BLOCK_D * bytes_per_elem) +
+        (BLOCK_D * BLOCK_SK * bytes_per_elem) +
+        (BLOCK_SQ * AD * bytes_per_elem)
+    )
+    # Plus m_i, d_i, m_i_prev, row_max_local, row_sum_local (each BLOCK_SQ * 4 bytes)
+    shmem_bytes += (BLOCK_SQ * 4 * 5)
+    if COMPUTE_INDEX:
+        # Plus m1_i, d1_i, m1_i_prev (each BLOCK_SQ * 4 bytes)
+        shmem_bytes += (BLOCK_SQ * 4 * 3)
+    else:
+        # Plus m1_i, d1_i, m1_i_prev (each 1 * 4 bytes)
+        shmem_bytes += (1 * 4 * 3)
+
+    pad_bytes = 49152 - shmem_bytes
+    use_padding = False  # System-wide TVM C++ runtime fix in cuda_module.cc handles cuFuncSetAttribute unconditionally
+    dummy_pad_len = max((pad_bytes + 1) // 2, 1) if use_padding else 1
+
     @T.prim_func
     def dsa_stage1(
         Q: T.Tensor((ASq, AB, AH, AD), in_dtype),
@@ -423,28 +451,32 @@ def make_dsa_splitk_stage1_kernel(
             # it once per Q-block per head saves SK_TILES-1 redundant HBM reloads
             # of the same BLOCK_SQ*AD*sizeof(in_dtype) bytes per pass.
             Q_full = T.alloc_shared((BLOCK_SQ, AD), in_dtype)
+            if use_padding:
+                dummy_pad = T.alloc_shared((dummy_pad_len,), "float16")
+
+
 
             # Online-softmax fragments live in registers.
             scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
-            row_max_local = T.alloc_fragment((BLOCK_SQ,), "float32")
-            row_sum_local = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            d_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
+            row_max_local = T.alloc_shared((BLOCK_SQ,), "float32")
+            row_sum_local = T.alloc_shared((BLOCK_SQ,), "float32")
+            m_i = T.alloc_shared((BLOCK_SQ,), "float32")
+            d_i = T.alloc_shared((BLOCK_SQ,), "float32")
+            m_i_prev = T.alloc_shared((BLOCK_SQ,), "float32")
             # Wave-4 perf #3: shrink the index-softmax fragments to size-1
             # stubs when compute_index_path=False so the AH-1 attn-only
             # head blocks no longer pay register pressure for buffers they
             # never touch. The if-guards below make the stub allocations
             # safe (no read or write reaches them when COMPUTE_INDEX is False).
             if COMPUTE_INDEX:
-                m1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-                d1_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-                m1_i_prev = T.alloc_fragment((BLOCK_SQ,), "float32")
+                m1_i = T.alloc_shared((BLOCK_SQ,), "float32")
+                d1_i = T.alloc_shared((BLOCK_SQ,), "float32")
+                m1_i_prev = T.alloc_shared((BLOCK_SQ,), "float32")
                 idx_scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             else:
-                m1_i = T.alloc_fragment((1,), "float32")
-                d1_i = T.alloc_fragment((1,), "float32")
-                m1_i_prev = T.alloc_fragment((1,), "float32")
+                m1_i = T.alloc_shared((1,), "float32")
+                d1_i = T.alloc_shared((1,), "float32")
+                m1_i_prev = T.alloc_shared((1,), "float32")
                 idx_scores_f = T.alloc_fragment((1, 1), "float32")
 
             # Initialise the index-softmax accumulators. Wave-4 perf #3:
@@ -460,14 +492,18 @@ def make_dsa_splitk_stage1_kernel(
                 m_i[i] = T.cast(-3.4028234663852886e38, "float32")
                 d_i[i] = T.cast(0, "float32")
 
+            if use_padding:
+                for i in T.Parallel(1):
+                    dummy_pad[i] = T.cast(0, "float16")
+
             # Wave-2 perf #5: load Q for this (sq_block, h) once, reuse across
             # all sk_tiles + d_tiles below. AD is the head dim (typically 64)
             # so BLOCK_SQ*AD fp16 fits comfortably in shared (worst case CUDA
             # 128*128*2 = 32 KB; Metal 32*64*2 = 4 KB).
             for i, dd in T.Parallel(BLOCK_SQ, AD):
-                sq_idx = sq_block_id * BLOCK_SQ + i
-                if sq_idx < ASq:
-                    Q_full[i, dd] = Q[sq_idx, b, h, dd]
+                safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                if sq_block_id * BLOCK_SQ + i < ASq:
+                    Q_full[i, dd] = Q[safe_sq_idx, b, h, dd]
                 else:
                     Q_full[i, dd] = T.cast(0, in_dtype)
 
@@ -487,10 +523,13 @@ def make_dsa_splitk_stage1_kernel(
             # (the tile is then entirely OOB so the per-position guards already
             # produce no writes; the clamp just guarantees the loop body runs
             # once so accumulator-init paths execute deterministically).
-            _active_sk_tiles = T.max(
-                T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1), 1
-            )
-            for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
+            if compute_index_path:
+                _active_sk_tiles = SK_TILES
+            else:
+                _active_sk_tiles = T.max(
+                    T.min(SK_TILES, _max_useful_sk // BLOCK_SK + 1), 1
+                )
+            for sk_tile in T.serial(_active_sk_tiles):
                 # Initialise the score accumulator for this tile.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                     scores_f[i, j] = T.cast(0, "float32")
@@ -511,8 +550,10 @@ def make_dsa_splitk_stage1_kernel(
                     for dd, j in T.Parallel(BLOCK_D, BLOCK_SK):
                         sk_idx = sk_tile * BLOCK_SK + j
                         d_idx = d_tile * BLOCK_D + dd
+                        safe_sk_idx = T.min(sk_idx, Sk - 1)
+                        safe_d_idx = T.min(d_idx, AD - 1)
                         if (sk_idx < Sk) and (d_idx < AD):
-                            K_s[dd, j] = K[sk_idx, b, h, d_idx]
+                            K_s[dd, j] = K[safe_sk_idx, b, h, safe_d_idx]
                         else:
                             K_s[dd, j] = T.cast(0, in_dtype)
 
@@ -521,52 +562,38 @@ def make_dsa_splitk_stage1_kernel(
 
                 # Apply softmax scale + causal mask.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    sq_idx = sq_block_id * BLOCK_SQ + i
-                    sk_idx = sk_tile * BLOCK_SK + j
-                    in_bounds = (sq_idx < ASq) and (sk_idx < Sk)
-                    valid = in_bounds and (sq_idx >= sk_idx)
-                    s = scores_f[i, j] * T.cast(SCALE, "float32")
-                    # Guard the IndexMask load against OOB on boundary tiles
-                    # (last sq_block / last sk_tile when ASq % BLOCK_SQ != 0
-                    # or Sk % BLOCK_SK != 0). Triton uses tl.load(..., mask=...)
-                    # for the equivalent guard; here we predicate the read.
-                    #
-                    # Wave-7 fix: rebinding ``s`` inside ``if SPARSE and
-                    # in_bounds:`` opens an IR IfFrame on the runtime
-                    # ``in_bounds`` vector predicate. The new ``s`` is scoped
-                    # to that IfFrame, so reading it on line 495 below trips
-                    # ``Immutable variable 's' is used outside its defining
-                    # region``. ``SPARSE`` is a Python-level constexpr (set
-                    # from ``sparse_loss`` at trace time) so we can keep the
-                    # constexpr branch and inline the runtime predicate via
-                    # ``T.if_then_else`` so no IfFrame opens around ``s``.
+                    safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                    safe_sk_idx = T.min(sk_tile * BLOCK_SK + j, Sk - 1)
                     if SPARSE:
-                        s = s + T.if_then_else(
-                            in_bounds,
-                            IndexMask[b, sq_idx, sk_idx],
-                            T.cast(0, "float32"),
+                        scores_f[i, j] = T.if_then_else(
+                            (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk) and (sq_block_id * BLOCK_SQ + i >= sk_tile * BLOCK_SK + j),
+                            scores_f[i, j] * T.cast(SCALE, "float32") + IndexMask[b, safe_sq_idx, safe_sk_idx],
+                            T.cast(-3.4028234663852886e38, "float32")
                         )
-                    if valid:
-                        scores_f[i, j] = s
                     else:
-                        scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
+                        scores_f[i, j] = T.if_then_else(
+                            (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk) and (sq_block_id * BLOCK_SQ + i >= sk_tile * BLOCK_SK + j),
+                            scores_f[i, j] * T.cast(SCALE, "float32"),
+                            T.cast(-3.4028234663852886e38, "float32")
+                        )
 
                 # Online softmax recurrence on (m_i, d_i).
                 T.reduce_max(scores_f, row_max_local, dim=1, clear=True)
+                T.sync_threads()
                 for i in T.Parallel(BLOCK_SQ):
                     m_i_prev[i] = m_i[i]
-                    new_m = T.max(m_i[i], row_max_local[i])
-                    # Drop the all-(-inf) sentinel back to 0 so the exp delta
-                    # below stays finite, matching Triton's ``tl.where``.
-                    if new_m <= T.cast(-3.4028234663852886e38, "float32"):
-                        new_m = T.cast(0, "float32")
-                    m_i[i] = new_m
+                    m_i[i] = T.if_then_else(
+                        T.max(m_i[i], row_max_local[i]) <= T.cast(-3.4028234663852886e38, "float32"),
+                        T.cast(0, "float32"),
+                        T.max(m_i[i], row_max_local[i]),
+                    )
 
                 # Renormalise scores so we can sum exp safely.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                     scores_f[i, j] = T.exp(scores_f[i, j] - m_i[i])
 
                 T.reduce_sum(scores_f, row_sum_local, dim=1, clear=True)
+                T.sync_threads()
                 for i in T.Parallel(BLOCK_SQ):
                     d_i[i] = d_i[i] * T.exp(m_i_prev[i] - m_i[i]) + row_sum_local[i]
 
@@ -591,43 +618,51 @@ def make_dsa_splitk_stage1_kernel(
                         idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
 
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
-                        sk_idx = sk_tile * BLOCK_SK + j
-                        valid = (sq_idx < ASq) and (sk_idx < Sk)
-                        # Predicate IndexScores / IndexMask reads on bounds to
-                        # avoid OOB on boundary tiles (matches the Triton
-                        # `tl.load(..., mask=...)` semantics).
-                        if valid:
-                            v = IndexScores[b, sq_idx, sk_idx]
-                            if SPARSE:
-                                v = v + IndexMask[b, sq_idx, sk_idx]
-                            idx_scores_f[i, j] = v
+                        safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                        safe_sk_idx = T.min(sk_tile * BLOCK_SK + j, Sk - 1)
+                        if SPARSE:
+                            idx_scores_f[i, j] = T.if_then_else(
+                                (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk),
+                                IndexScores[b, safe_sq_idx, safe_sk_idx] + IndexMask[b, safe_sq_idx, safe_sk_idx],
+                                T.cast(-3.4028234663852886e38, "float32")
+                            )
                         else:
-                            idx_scores_f[i, j] = T.cast(-3.4028234663852886e38, "float32")
+                            idx_scores_f[i, j] = T.if_then_else(
+                                (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk),
+                                IndexScores[b, safe_sq_idx, safe_sk_idx],
+                                T.cast(-3.4028234663852886e38, "float32")
+                            )
 
                     T.reduce_max(idx_scores_f, row_max_local, dim=1, clear=True)
+                    T.sync_threads()
                     for i in T.Parallel(BLOCK_SQ):
                         m1_i_prev[i] = m1_i[i]
-                        new_m = T.max(m1_i[i], row_max_local[i])
-                        if new_m <= T.cast(-3.4028234663852886e38, "float32"):
-                            new_m = T.cast(0, "float32")
-                        m1_i[i] = new_m
+                        m1_i[i] = T.if_then_else(
+                            T.max(m1_i[i], row_max_local[i]) <= T.cast(-3.4028234663852886e38, "float32"),
+                            T.cast(0, "float32"),
+                            T.max(m1_i[i], row_max_local[i]),
+                        )
 
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                         idx_scores_f[i, j] = T.exp(idx_scores_f[i, j] - m1_i[i])
                     T.reduce_sum(idx_scores_f, row_sum_local, dim=1, clear=True)
+                    T.sync_threads()
                     for i in T.Parallel(BLOCK_SQ):
                         d1_i[i] = d1_i[i] * T.exp(m1_i_prev[i] - m1_i[i]) + row_sum_local[i]
 
             # Persist the (m_i, d_i) statistics back to global memory.
-            for i in T.Parallel(BLOCK_SQ):
-                sq_idx = sq_block_id * BLOCK_SQ + i
-                if sq_idx < ASq:
-                    M[b, h, sq_idx] = m_i[i]
-                    D[b, h, sq_idx] = d_i[i]
-                    if h == 0:
-                        M1[b, sq_idx] = m1_i[i]
-                        D1[b, sq_idx] = d1_i[i]
+            if T.get_thread_binding(0) == 0:
+                for i in T.serial(BLOCK_SQ):
+                    sq_idx = sq_block_id * BLOCK_SQ + i
+                    if sq_idx < ASq:
+                        M[b, h, sq_idx] = m_i[i]
+                        D[b, h, sq_idx] = d_i[i]
+                        if COMPUTE_INDEX and h == 0:
+                            M1[b, sq_idx] = m1_i[i]
+                            D1[b, sq_idx] = d1_i[i]
+                        if sq_idx == 0:
+                            if use_padding:
+                                dummy_pad[0] = dummy_pad[0] + T.cast(1e-20, "float16")
 
     return dsa_stage1
 
@@ -721,6 +756,11 @@ def _q_cache_budget_bytes(target: str) -> int:
         return _Q_CACHE_BUDGET_METAL_BYTES
     if target.startswith("hip"):
         return _Q_CACHE_BUDGET_HIP_BYTES
+    if "-max_shmem=49152" in target:
+        # Blackwell GB10 has a physical limit of 49152 bytes (48 KB) of shared memory.
+        # Since larger CUDA block sizes are required for numerical correctness but do not fit
+        # with Q-cache, we return 0 to disable Q-cache unconditionally on this device.
+        return 0
     return _Q_CACHE_BUDGET_CUDA_BYTES
 
 
@@ -794,6 +834,7 @@ def make_dsa_splitk_stage2_kernel(
     threads: int = _DSA_STAGE2_THREADS,
     num_stages: int = _DSA_STAGE2_NUM_STAGES,
     use_q_cache_v5: bool = False,
+    target: str = "cuda",
 ) -> Any:
     """Build a shape-specialized stage-2 KL-divergence reduction kernel.
 
@@ -851,6 +892,24 @@ def make_dsa_splitk_stage2_kernel(
     _MD_PRE_BYTES = 8 * AH * BLOCK_SQ
     USE_MD_PRE = _MD_PRE_BYTES <= _MD_PRE_BUDGET_BYTES
 
+    is_cuda = isinstance(target, str) and "cuda" in target
+    bytes_per_elem = 2 if in_dtype in ("float16", "bfloat16") else 4
+    shmem_bytes = (
+        (BLOCK_SQ * BLOCK_D * bytes_per_elem) +
+        (BLOCK_D * BLOCK_SK * bytes_per_elem) +
+        (BLOCK_SQ * AD * bytes_per_elem)
+    )
+    if use_q_cache_v5:
+        shmem_bytes += (AH * BLOCK_SQ * AD * bytes_per_elem)
+    else:
+        shmem_bytes += (1 * 1 * 1 * bytes_per_elem)
+    # Plus row_sum_local, m1_local, d1_local, loss_i, m_h, d_h (each BLOCK_SQ * 4 bytes)
+    shmem_bytes += (BLOCK_SQ * 4 * 6)
+
+    pad_bytes = 49152 - shmem_bytes
+    use_padding = False  # System-wide TVM C++ runtime fix in cuda_module.cc handles cuFuncSetAttribute unconditionally
+    dummy_pad_len = max((pad_bytes + 1) // 2, 1) if use_padding else 1
+
     @T.prim_func
     def dsa_stage2(
         Q: T.Tensor((ASq, AB, AH, AD), in_dtype),
@@ -866,6 +925,7 @@ def make_dsa_splitk_stage2_kernel(
         with T.Kernel(AB, NUM_SQ_BLOCKS, threads=threads) as (b, sq_block_id):
             Q_s = T.alloc_shared((BLOCK_SQ, BLOCK_D), in_dtype)
             K_s = T.alloc_shared((BLOCK_D, BLOCK_SK), in_dtype)
+
             # Wave-3 P1 (grok perf finding #1): partial Q hoist for stage 2.
             # The sk_tile -> h -> d_tile loop nest re-reads Q from HBM on every
             # d_tile iteration even though Q[sq_block, b, h, :] is independent
@@ -885,6 +945,8 @@ def make_dsa_splitk_stage2_kernel(
             # hoist below trades a small extra shared (BLOCK_SQ * AD * 2 bytes
             # = 4 KB at Metal 32x64) for d_tile-level redundancy elimination.
             Q_full = T.alloc_shared((BLOCK_SQ, AD), in_dtype)
+            if use_padding:
+                dummy_pad = T.alloc_shared((dummy_pad_len,), "float16")
 
             # Wave-5: budget-gated full Q hoist. When use_q_cache_v5 is
             # True the full (AH, BLOCK_SQ, AD) Q tile is hoisted out of
@@ -902,13 +964,13 @@ def make_dsa_splitk_stage2_kernel(
             softmax_attn = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             softmax_idx = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             kl_term = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
-            row_sum_local = T.alloc_fragment((BLOCK_SQ,), "float32")
+            row_sum_local = T.alloc_shared((BLOCK_SQ,), "float32")
 
-            m1_local = T.alloc_fragment((BLOCK_SQ,), "float32")
-            d1_local = T.alloc_fragment((BLOCK_SQ,), "float32")
-            loss_i = T.alloc_fragment((BLOCK_SQ,), "float32")
-            m_h = T.alloc_fragment((BLOCK_SQ,), "float32")
-            d_h = T.alloc_fragment((BLOCK_SQ,), "float32")
+            m1_local = T.alloc_shared((BLOCK_SQ,), "float32")
+            d1_local = T.alloc_shared((BLOCK_SQ,), "float32")
+            loss_i = T.alloc_shared((BLOCK_SQ,), "float32")
+            m_h = T.alloc_shared((BLOCK_SQ,), "float32")
+            d_h = T.alloc_shared((BLOCK_SQ,), "float32")
             # Wave-2 perf #5: pre-load all heads' (m_h, d_h) for this sq block
             # so the inner sk_tile->h double loop reads them from registers
             # instead of HBM on every pass. Cost: AH*BLOCK_SQ fp32 fragments
@@ -930,14 +992,18 @@ def make_dsa_splitk_stage2_kernel(
 
             # Load stage-1 index-softmax statistics for this sq block.
             for i in T.Parallel(BLOCK_SQ):
-                sq_idx = sq_block_id * BLOCK_SQ + i
-                if sq_idx < ASq:
-                    m1_local[i] = M1[b, sq_idx]
-                    d1_local[i] = D1[b, sq_idx]
+                safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                if sq_block_id * BLOCK_SQ + i < ASq:
+                    m1_local[i] = M1[b, safe_sq_idx]
+                    d1_local[i] = D1[b, safe_sq_idx]
                 else:
                     m1_local[i] = T.cast(0, "float32")
                     d1_local[i] = T.cast(1, "float32")
                 loss_i[i] = T.cast(0, "float32")
+
+            if use_padding:
+                for i in T.Parallel(1):
+                    dummy_pad[i] = T.cast(0, "float16")
 
             # Wave-2 perf #5: pre-load M[b, h, sq], D[b, h, sq] for all h once
             # per sq_block, before the sk_tile loop. The inner per-sk_tile
@@ -948,10 +1014,10 @@ def make_dsa_splitk_stage2_kernel(
             if USE_MD_PRE:
                 for hh in T.serial(AH):
                     for i in T.Parallel(BLOCK_SQ):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
-                        if sq_idx < ASq:
-                            M_pre[hh, i] = M[b, hh, sq_idx]
-                            D_pre[hh, i] = D[b, hh, sq_idx]
+                        safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                        if sq_block_id * BLOCK_SQ + i < ASq:
+                            M_pre[hh, i] = M[b, hh, safe_sq_idx]
+                            D_pre[hh, i] = D[b, hh, safe_sq_idx]
                         else:
                             M_pre[hh, i] = T.cast(0, "float32")
                             D_pre[hh, i] = T.cast(1, "float32")
@@ -965,9 +1031,9 @@ def make_dsa_splitk_stage2_kernel(
             if use_q_cache_v5:
                 for hh in T.serial(AH):
                     for i, dd in T.Parallel(BLOCK_SQ, AD):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
-                        if sq_idx < ASq:
-                            Q_all_heads[hh, i, dd] = Q[sq_idx, b, hh, dd]
+                        safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                        if sq_block_id * BLOCK_SQ + i < ASq:
+                            Q_all_heads[hh, i, dd] = Q[safe_sq_idx, b, hh, dd]
                         else:
                             Q_all_heads[hh, i, dd] = T.cast(0, in_dtype)
 
@@ -1004,7 +1070,7 @@ def make_dsa_splitk_stage2_kernel(
             # local optimum without that restructure. Q reload ratio relative
             # to optimal is AH*SK_TILES / AH = SK_TILES (~128 on Metal, larger
             # on CUDA): noticeable but bounded.
-            for sk_tile in T.Pipelined(_active_sk_tiles, num_stages=num_stages):
+            for sk_tile in T.serial(_active_sk_tiles):
                 # Zero softmax_attn for this tile (we accumulate over heads).
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                     softmax_attn[i, j] = T.cast(0, "float32")
@@ -1027,26 +1093,25 @@ def make_dsa_splitk_stage2_kernel(
                             Q_full[i, dd] = Q_all_heads[h, i, dd]
                     else:
                         for i, dd in T.Parallel(BLOCK_SQ, AD):
-                            sq_idx = sq_block_id * BLOCK_SQ + i
-                            if sq_idx < ASq:
-                                Q_full[i, dd] = Q[sq_idx, b, h, dd]
+                            safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                            if sq_block_id * BLOCK_SQ + i < ASq:
+                                Q_full[i, dd] = Q[safe_sq_idx, b, h, dd]
                             else:
                                 Q_full[i, dd] = T.cast(0, in_dtype)
 
                     # Inner D-loop matmul.
                     for d_tile in T.serial((AD + BLOCK_D - 1) // BLOCK_D):
                         for i, dd in T.Parallel(BLOCK_SQ, BLOCK_D):
-                            d_idx = d_tile * BLOCK_D + dd
-                            if d_idx < AD:
-                                Q_s[i, dd] = Q_full[i, d_idx]
+                            if d_tile * BLOCK_D + dd < AD:
+                                Q_s[i, dd] = Q_full[i, d_tile * BLOCK_D + dd]
                             else:
                                 Q_s[i, dd] = T.cast(0, in_dtype)
 
                         for dd, j in T.Parallel(BLOCK_D, BLOCK_SK):
-                            sk_idx = sk_tile * BLOCK_SK + j
-                            d_idx = d_tile * BLOCK_D + dd
-                            if (sk_idx < Sk) and (d_idx < AD):
-                                K_s[dd, j] = K[sk_idx, b, h, d_idx]
+                            safe_sk_idx = T.min(sk_tile * BLOCK_SK + j, Sk - 1)
+                            safe_d_idx = T.min(d_tile * BLOCK_D + dd, AD - 1)
+                            if (sk_tile * BLOCK_SK + j < Sk) and (d_tile * BLOCK_D + dd < AD):
+                                K_s[dd, j] = K[safe_sk_idx, b, h, safe_d_idx]
                             else:
                                 K_s[dd, j] = T.cast(0, in_dtype)
 
@@ -1064,10 +1129,10 @@ def make_dsa_splitk_stage2_kernel(
                             d_h[i] = D_pre[h, i]
                     else:
                         for i in T.Parallel(BLOCK_SQ):
-                            sq_idx = sq_block_id * BLOCK_SQ + i
-                            if sq_idx < ASq:
-                                m_h[i] = M[b, h, sq_idx]
-                                d_h[i] = D[b, h, sq_idx]
+                            safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                            if sq_block_id * BLOCK_SQ + i < ASq:
+                                m_h[i] = M[b, h, safe_sq_idx]
+                                d_h[i] = D[b, h, safe_sq_idx]
                             else:
                                 m_h[i] = T.cast(0, "float32")
                                 d_h[i] = T.cast(1, "float32")
@@ -1076,41 +1141,36 @@ def make_dsa_splitk_stage2_kernel(
                     # accumulated softmax_attn (averaged over heads at the
                     # end via *= INV_AH).
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                        sq_idx = sq_block_id * BLOCK_SQ + i
-                        sk_idx = sk_tile * BLOCK_SK + j
-                        in_bounds = (sq_idx < ASq) and (sk_idx < Sk)
-                        valid = in_bounds and (sq_idx >= sk_idx)
-                        s = h_scores[i, j] * T.cast(SCALE, "float32")
-                        # Predicate the IndexMask read on bounds to avoid OOB
-                        # on boundary tiles (Triton uses `tl.load(..., mask=...)`).
-                        #
-                        # Wave-7 fix: ``if SPARSE and in_bounds: s = s + ...``
-                        # rebinds ``s`` inside a runtime-vector IfFrame; the
-                        # subsequent ``T.exp(s - m_h[i])`` outside the frame
-                        # then trips ``Immutable variable 's' is used outside
-                        # its defining region`` and (co-trips) ``Only the last
-                        # index of a buffer access may be a vector type`` on
-                        # the same path. ``SPARSE`` is a Python constexpr,
-                        # so the branch can stay; the runtime ``in_bounds``
-                        # predicate moves into ``T.if_then_else`` so ``s`` is
-                        # single-assigned at the trace level.
+                        safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                        safe_sk_idx = T.min(sk_tile * BLOCK_SK + j, Sk - 1)
                         if SPARSE:
-                            s = s + T.if_then_else(
-                                in_bounds,
-                                IndexMask[b, sq_idx, sk_idx],
-                                T.cast(0, "float32"),
+                            softmax_attn[i, j] = T.if_then_else(
+                                (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk) and (sq_block_id * BLOCK_SQ + i >= sk_tile * BLOCK_SK + j),
+                                softmax_attn[i, j] + T.exp(
+                                    (h_scores[i, j] * T.cast(SCALE, "float32") + T.if_then_else(
+                                        (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk),
+                                        IndexMask[b, safe_sq_idx, safe_sk_idx],
+                                        T.cast(0, "float32"),
+                                    )) - m_h[i]
+                                ) / T.if_then_else(
+                                    d_h[i] <= T.cast(0, "float32"),
+                                    T.cast(1, "float32"),
+                                    d_h[i],
+                                ),
+                                softmax_attn[i, j]
                             )
-                        if valid:
-                            # Single-assignment denom: avoid IfFrame rebind that
-                            # leaks the immutable IR var outside its defining
-                            # region (same pattern as the wave-7 ``s`` fix in
-                            # commit cac10a0).
-                            denom = T.if_then_else(
-                                d_h[i] <= T.cast(0, "float32"),
-                                T.cast(1, "float32"),
-                                d_h[i],
+                        else:
+                            softmax_attn[i, j] = T.if_then_else(
+                                (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk) and (sq_block_id * BLOCK_SQ + i >= sk_tile * BLOCK_SK + j),
+                                softmax_attn[i, j] + T.exp(
+                                    (h_scores[i, j] * T.cast(SCALE, "float32")) - m_h[i]
+                                ) / T.if_then_else(
+                                    d_h[i] <= T.cast(0, "float32"),
+                                    T.cast(1, "float32"),
+                                    d_h[i],
+                                ),
+                                softmax_attn[i, j]
                             )
-                            softmax_attn[i, j] = softmax_attn[i, j] + T.exp(s - m_h[i]) / denom
 
                 # Average over heads.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
@@ -1118,49 +1178,60 @@ def make_dsa_splitk_stage2_kernel(
 
                 # Compute index softmax q = exp(idx - m1) / d1.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    sq_idx = sq_block_id * BLOCK_SQ + i
-                    sk_idx = sk_tile * BLOCK_SK + j
-                    valid = (sq_idx < ASq) and (sk_idx < Sk)
-                    # Single-assignment denom1 (cf. wave-7 ``s`` fix cac10a0).
-                    denom1 = T.if_then_else(
-                        d1_local[i] <= T.cast(0, "float32"),
-                        T.cast(1, "float32"),
-                        d1_local[i],
-                    )
-                    # Predicate IndexScores / IndexMask reads on bounds to
-                    # avoid OOB on boundary tiles.
-                    if valid:
-                        v = IndexScores[b, sq_idx, sk_idx]
-                        if SPARSE:
-                            v = v + IndexMask[b, sq_idx, sk_idx]
-                        softmax_idx[i, j] = T.exp(v - m1_local[i]) / denom1
+                    safe_sq_idx = T.min(sq_block_id * BLOCK_SQ + i, ASq - 1)
+                    safe_sk_idx = T.min(sk_tile * BLOCK_SK + j, Sk - 1)
+                    if SPARSE:
+                        softmax_idx[i, j] = T.if_then_else(
+                            (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk),
+                            T.exp(
+                                (IndexScores[b, safe_sq_idx, safe_sk_idx] + IndexMask[b, safe_sq_idx, safe_sk_idx])
+                                - m1_local[i]
+                            ) / T.if_then_else(
+                                d1_local[i] <= T.cast(0, "float32"),
+                                T.cast(1, "float32"),
+                                d1_local[i],
+                            ),
+                            T.cast(0, "float32")
+                        )
                     else:
-                        softmax_idx[i, j] = T.cast(0, "float32")
+                        softmax_idx[i, j] = T.if_then_else(
+                            (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk),
+                            T.exp(
+                                IndexScores[b, safe_sq_idx, safe_sk_idx]
+                                - m1_local[i]
+                            ) / T.if_then_else(
+                                d1_local[i] <= T.cast(0, "float32"),
+                                T.cast(1, "float32"),
+                                d1_local[i],
+                            ),
+                            T.cast(0, "float32")
+                        )
 
                 # KL term: p * (log(p+eps) - log(q+eps)).
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    p = softmax_attn[i, j]
-                    q_ = softmax_idx[i, j]
-                    sq_idx = sq_block_id * BLOCK_SQ + i
-                    sk_idx = sk_tile * BLOCK_SK + j
-                    valid = (sq_idx < ASq) and (sk_idx < Sk) and (sq_idx >= sk_idx)
-                    if valid:
-                        kl_term[i, j] = p * (
-                            T.log(p + T.cast(EPS, "float32"))
-                            - T.log(q_ + T.cast(EPS, "float32"))
-                        )
-                    else:
-                        kl_term[i, j] = T.cast(0, "float32")
+                    kl_term[i, j] = T.if_then_else(
+                        (sq_block_id * BLOCK_SQ + i < ASq) and (sk_tile * BLOCK_SK + j < Sk) and (sq_block_id * BLOCK_SQ + i >= sk_tile * BLOCK_SK + j),
+                        softmax_attn[i, j] * (
+                            T.log(softmax_attn[i, j] + T.cast(EPS, "float32"))
+                            - T.log(softmax_idx[i, j] + T.cast(EPS, "float32"))
+                        ),
+                        T.cast(0, "float32")
+                    )
 
                 T.reduce_sum(kl_term, row_sum_local, dim=1, clear=True)
+                T.sync_threads()
                 for i in T.Parallel(BLOCK_SQ):
                     loss_i[i] = loss_i[i] + row_sum_local[i]
 
             # Persist the per-position loss.
-            for i in T.Parallel(BLOCK_SQ):
-                sq_idx = sq_block_id * BLOCK_SQ + i
-                if sq_idx < ASq:
-                    Loss[b, sq_idx] = loss_i[i]
+            if T.get_thread_binding(0) == 0:
+                for i in T.serial(BLOCK_SQ):
+                    sq_idx = sq_block_id * BLOCK_SQ + i
+                    if sq_idx < ASq:
+                        Loss[b, sq_idx] = loss_i[i]
+                        if sq_idx == 0:
+                            if use_padding:
+                                dummy_pad[0] = dummy_pad[0] + T.cast(1e-20, "float16")
 
     return dsa_stage2
 
@@ -1212,8 +1283,10 @@ def _stage1_kernel_for(
         BLOCK_D=BLOCK_D,
         threads=threads,
         num_stages=num_stages,
+        target=target,
     )
-    return dispatch_lower(prim, target)
+    tvm_target = target.split(" -max_shmem")[0]
+    return dispatch_lower(prim, tvm_target)
 
 
 @lru_cache(maxsize=64)
@@ -1265,8 +1338,10 @@ def _stage2_kernel_for(
         threads=threads,
         num_stages=num_stages,
         use_q_cache_v5=use_q_cache_v5,
+        target=target,
     )
-    return dispatch_lower(prim, target)
+    tvm_target = target.split(" -max_shmem")[0]
+    return dispatch_lower(prim, tvm_target)
 
 
 _TORCH_DTYPE_TO_TL: dict[torch.dtype, str] = {
@@ -1306,6 +1381,25 @@ def _block_constants_for_target(
 
     if _is_metal(target):
         return _metal_block_overrides(1, AH=AH), _metal_block_overrides(2, AH=AH)
+
+    if "-max_shmem=49152" in target:
+        return (
+            dict(
+                BLOCK_SQ=128,
+                BLOCK_SK=64,
+                BLOCK_D=64,
+                threads=256,
+                num_stages=1,
+            ),
+            dict(
+                BLOCK_SQ=128,
+                BLOCK_SK=64,
+                BLOCK_D=64,
+                threads=256,
+                num_stages=1,
+            ),
+        )
+
     return (
         dict(
             BLOCK_SQ=_DSA_STAGE1_BLOCK_SQ,
@@ -1371,6 +1465,35 @@ def dsa_splitk_indexer_loss_tilelang(
             f"upstream PR #4039 (got AH={AH})."
         )
 
+    if sparse_loss:
+        # Wave-11 #3 (grok wave-10 review HIGH): TOPK == 0 is silently
+        # destructive — ``scatter_(-1, idx, 0.0)`` becomes a no-op so
+        # ``index_mask`` stays ``-inf`` everywhere; index-softmax produces
+        # NaN; KL loss becomes NaN. Catch at boundary instead of corrupting
+        # training. Pre-wave-10 ASq == 0 / Sk == 0 early-out already covers
+        # the dimension-zero case but TOPK == 0 escapes that check.
+        if topk_indices.shape[2] == 0:
+            raise ValueError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices.shape[2] (TOPK) "
+                "must be >= 1 when sparse_loss=True; got 0 — would produce "
+                "all-(-inf) index_mask -> NaN softmax -> NaN loss."
+            )
+        if topk_indices.device != query.device:
+            raise ValueError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices.device "
+                f"({topk_indices.device}) != query.device ({query.device})"
+            )
+        if topk_indices.dim() != 3 or topk_indices.shape[:2] != (AB, ASq):
+            raise ValueError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices must have shape "
+                f"(AB={AB}, ASq={ASq}, TOPK); got {tuple(topk_indices.shape)}"
+            )
+        if topk_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "dsa_splitk_indexer_loss_tilelang: topk_indices.dtype must be "
+                f"int32 or int64; got {topk_indices.dtype}"
+            )
+
     in_dtype = _resolve_in_dtype(query)
     if _resolve_in_dtype(key) != in_dtype:
         raise TypeError("dsa_splitk_indexer_loss_tilelang: query/key dtypes must match")
@@ -1386,33 +1509,6 @@ def dsa_splitk_indexer_loss_tilelang(
         # callers can pass either int32 (Triton convention) or int64 (PyTorch
         # convention). Also enforce shape, contiguity, and device parity to
         # surface mismatches at the wrapper boundary instead of mid-kernel.
-        if topk_indices.device != query.device:
-            raise ValueError(
-                "dsa_splitk_indexer_loss_tilelang: topk_indices.device "
-                f"({topk_indices.device}) != query.device ({query.device})"
-            )
-        if topk_indices.dim() != 3 or topk_indices.shape[:2] != (AB, ASq):
-            raise ValueError(
-                "dsa_splitk_indexer_loss_tilelang: topk_indices must have shape "
-                f"(AB={AB}, ASq={ASq}, TOPK); got {tuple(topk_indices.shape)}"
-            )
-        # Wave-11 #3 (grok wave-10 review HIGH): TOPK == 0 is silently
-        # destructive — ``scatter_(-1, idx, 0.0)`` becomes a no-op so
-        # ``index_mask`` stays ``-inf`` everywhere; index-softmax produces
-        # NaN; KL loss becomes NaN. Catch at boundary instead of corrupting
-        # training. Pre-wave-10 ASq == 0 / Sk == 0 early-out already covers
-        # the dimension-zero case but TOPK == 0 escapes that check.
-        if topk_indices.shape[2] == 0:
-            raise ValueError(
-                "dsa_splitk_indexer_loss_tilelang: topk_indices.shape[2] (TOPK) "
-                "must be >= 1 when sparse_loss=True; got 0 — would produce "
-                "all-(-inf) index_mask -> NaN softmax -> NaN loss."
-            )
-        if topk_indices.dtype not in (torch.int32, torch.int64):
-            raise TypeError(
-                "dsa_splitk_indexer_loss_tilelang: topk_indices.dtype must be "
-                f"int32 or int64; got {topk_indices.dtype}"
-            )
         topk_idx64 = topk_indices.to(dtype=torch.int64, copy=False)
         if not topk_idx64.is_contiguous():
             topk_idx64 = topk_idx64.contiguous()

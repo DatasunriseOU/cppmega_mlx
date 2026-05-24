@@ -32,4 +32,26 @@ describe("V7-H45 ScheduleEditor last-run echo", () => {
     expect(pill.textContent).toContain("last run: constant");
     expect(pill.textContent).toContain("≠ selected");
   });
+
+  it("auto-clamps warmup_steps when total_steps is changed to be smaller", () => {
+    const onChangeMock = vi.fn();
+    render(
+      <ScheduleEditor
+        index={0}
+        baseLr={1e-3}
+        value={{ kind: "cosine", warmup_steps: 100, total_steps: 1000 }}
+        onChange={onChangeMock}
+      />
+    );
+    const totalInput = screen.getByTestId("schedule-total-0");
+    const fireEvent = require("@testing-library/react").fireEvent;
+    fireEvent.change(totalInput, { target: { value: "50" } });
+    expect(onChangeMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "cosine",
+        warmup_steps: 50,
+        total_steps: 50,
+      })
+    );
+  });
 });
