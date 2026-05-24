@@ -5298,6 +5298,76 @@ def path_c_direct_chain_value_and_grad_probe_payload(
     }
 
 
+def _path_c_shape_tuple(shape: Any) -> tuple[int, ...]:
+    if shape is None:
+        return ()
+    if isinstance(shape, int):
+        return (int(shape),)
+    return tuple(int(dim) for dim in tuple(shape))
+
+
+def _path_c_shape_extent(shape: Any) -> int:
+    extent = 1
+    for dim in _path_c_shape_tuple(shape):
+        extent *= int(dim)
+    return extent
+
+
+def _path_c_preferred_direct_chain_shape(
+    current: tuple[int, ...],
+    candidate: tuple[int, ...],
+) -> tuple[int, ...]:
+    if current == candidate:
+        return current
+    if len(candidate) > len(current):
+        return candidate
+    return current
+
+
+def _path_c_merge_direct_chain_buffer_spec(
+    specs: dict[str, dict[str, Any]],
+    *,
+    name: str,
+    shape: Any,
+    dtype: str,
+    category: str,
+    segment_index: int,
+    source: str,
+) -> None:
+    shape_tuple = _path_c_shape_tuple(shape)
+    dtype_name = str(dtype)
+    existing = specs.setdefault(
+        name,
+        {
+            "name": name,
+            "shape": shape_tuple,
+            "dtype": dtype_name,
+            "category": str(category),
+            "segments": [],
+        },
+    )
+    if str(existing["dtype"]) != dtype_name:
+        raise ValueError(
+            f"conflicting direct-chain {source} buffer dtype {name!r}: "
+            f"{existing['dtype']!r} vs {dtype_name!r}"
+        )
+    existing_shape = _path_c_shape_tuple(existing["shape"])
+    if existing_shape != shape_tuple:
+        if _path_c_shape_extent(existing_shape) != _path_c_shape_extent(shape_tuple):
+            raise ValueError(
+                f"conflicting direct-chain {source} buffer shape {name!r}: "
+                f"{existing_shape!r} vs {shape_tuple!r}"
+            )
+        existing["shape"] = _path_c_preferred_direct_chain_shape(
+            existing_shape,
+            shape_tuple,
+        )
+    existing_category = str(existing.get("category", ""))
+    if existing_category == "runtime_scratch" and str(category) != "runtime_scratch":
+        existing["category"] = str(category)
+    existing["segments"].append(int(segment_index))
+
+
 def _path_c_direct_chain_required_logical_buffer_specs(
     chain: Any,
 ) -> dict[str, dict[str, Any]]:
@@ -5333,38 +5403,27 @@ def _path_c_direct_chain_required_logical_buffer_specs(
             name = str(raw_name)
             shape = tuple(int(dim) for dim in tuple(physical_abi_shapes[name]))
             dtype = str(bank_dtypes[name])
-            existing = specs.setdefault(
-                name,
-                {
-                    "name": name,
-                    "shape": shape,
-                    "dtype": dtype,
-                    "category": _path_c_direct_chain_buffer_category(name),
-                    "segments": [],
-                },
+            _path_c_merge_direct_chain_buffer_spec(
+                specs,
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                category=_path_c_direct_chain_buffer_category(name),
+                segment_index=int(segment.index),
+                source="logical",
             )
-            if tuple(existing["shape"]) != shape or str(existing["dtype"]) != dtype:
-                raise ValueError(f"conflicting direct-chain logical buffer spec {name!r}")
-            existing["segments"].append(int(segment.index))
         for name, scratch_spec in _path_c_internal_scratch_abi_specs(
             prim_func
         ).items():
-            existing = specs.setdefault(
-                name,
-                {
-                    "name": name,
-                    "shape": tuple(scratch_spec["shape"]),
-                    "dtype": str(scratch_spec["dtype"]),
-                    "category": "runtime_scratch",
-                    "segments": [],
-                },
+            _path_c_merge_direct_chain_buffer_spec(
+                specs,
+                name=str(name),
+                shape=scratch_spec["shape"],
+                dtype=str(scratch_spec["dtype"]),
+                category=_path_c_direct_chain_buffer_category(str(name)),
+                segment_index=int(segment.index),
+                source="scratch",
             )
-            if (
-                tuple(existing["shape"]) != tuple(scratch_spec["shape"])
-                or str(existing["dtype"]) != str(scratch_spec["dtype"])
-            ):
-                raise ValueError(f"conflicting direct-chain scratch buffer spec {name!r}")
-            existing["segments"].append(int(segment.index))
     if (
         suffix_shape_env is not None
         and _path_c_direct_chain_loss_cotangent_seed_buffers(chain)
@@ -5377,21 +5436,15 @@ def _path_c_direct_chain_required_logical_buffer_specs(
                 "lm_head_weight_grad": (max(1, vocab) * hidden,),
             }
             for name, shape in suffix_specs.items():
-                existing = specs.setdefault(
-                    name,
-                    {
-                        "name": name,
-                        "shape": shape,
-                        "dtype": "float32",
-                        "category": "runtime_activation_or_grad",
-                        "segments": [],
-                    },
+                _path_c_merge_direct_chain_buffer_spec(
+                    specs,
+                    name=name,
+                    shape=shape,
+                    dtype="float32",
+                    category="runtime_activation_or_grad",
+                    segment_index=suffix_segment_index,
+                    source="suffix grad",
                 )
-                if tuple(existing["shape"]) != shape or str(existing["dtype"]) != "float32":
-                    raise ValueError(
-                        f"conflicting direct-chain suffix grad spec {name!r}"
-                    )
-                existing["segments"].append(suffix_segment_index)
     return specs
 
 
@@ -5433,13 +5486,19 @@ def _path_c_validate_internal_scratch_abi_buffers(
             missing.append(name)
             errors.append(f"{name}: missing caller-owned internal scratch buffer")
             continue
-        expected_shape = tuple(int(dim) for dim in tuple(spec.get("shape", ())))
-        actual_shape = getattr(provided[name], "shape", None)
-        actual_shape = None if actual_shape is None else tuple(int(dim) for dim in actual_shape)
-        if actual_shape != expected_shape:
+        expected_shape = _path_c_shape_tuple(spec.get("shape", ()))
+        actual_shape_raw = getattr(provided[name], "shape", None)
+        actual_shape = (
+            None if actual_shape_raw is None else _path_c_shape_tuple(actual_shape_raw)
+        )
+        if actual_shape is None or (
+            actual_shape != expected_shape
+            and _path_c_shape_extent(actual_shape) != _path_c_shape_extent(expected_shape)
+        ):
             shape_mismatches.append(name)
             errors.append(
-                f"{name}: shape {actual_shape} does not match expected {expected_shape}"
+                f"{name}: shape {actual_shape} is not compatible with expected "
+                f"{expected_shape}"
             )
         expected_dtype = str(spec.get("dtype", "float32"))
         actual_dtype = _path_c_tensor_dtype_name(provided[name])
@@ -5941,54 +6000,7 @@ def path_c_direct_fusion_chain_model_binding_audit(
 ) -> dict[str, Any]:
     """Classify direct-chain buffers by the owner needed at live runtime."""
 
-    required_buffers: dict[str, dict[str, Any]] = {}
-    for segment in getattr(chain, "segments", ()):
-        target = getattr(segment, "schedule_target", None)
-        if target is None or str(segment.status) != "ok":
-            continue
-        prim_func = target.schedule_template(segment.region)
-        physical_abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
-            or {}
-        )
-        physical_abi_shapes = dict(
-            getattr(
-                prim_func,
-                "_cppmega_path_c_physical_buffer_abi_shapes",
-                {},
-            )
-            or {}
-        )
-        bridge = plan_physical_abi_runtime_bridge(
-            physical_abi_map,
-            physical_abi_shapes,
-        )
-        bank_dtypes = dict(bridge.get("bank_dtypes", {}))
-        for name in bridge.get("required_bank_buffers", ()):
-            name = str(name)
-            required_buffers.setdefault(
-                name,
-                {
-                    "name": name,
-                    "shape": tuple(physical_abi_shapes.get(name, ())),
-                    "dtype": bank_dtypes.get(name),
-                    "category": _path_c_direct_chain_buffer_category(name),
-                    "segments": [],
-                },
-            )["segments"].append(int(segment.index))
-        for name, scratch_spec in _path_c_internal_scratch_abi_specs(
-            prim_func
-        ).items():
-            required_buffers.setdefault(
-                name,
-                {
-                    "name": name,
-                    "shape": tuple(scratch_spec["shape"]),
-                    "dtype": str(scratch_spec["dtype"]),
-                    "category": "runtime_scratch",
-                    "segments": [],
-                },
-            )["segments"].append(int(segment.index))
+    required_buffers = _path_c_direct_chain_required_logical_buffer_specs(chain)
     by_category = _path_c_direct_chain_names_by_category(required_buffers)
     runtime_activation_or_grad = by_category.get("runtime_activation_or_grad", [])
     backward_grad_names = sorted(

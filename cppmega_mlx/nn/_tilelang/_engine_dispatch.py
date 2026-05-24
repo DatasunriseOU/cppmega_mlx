@@ -451,9 +451,9 @@ def _register_default_fusion_emitters() -> None:
                 f"{exc.__class__.__name__}: {exc}") from exc
 
         @T.prim_func
-        def gemm_softmax(Q: T.Buffer((M, K), in_dtype),
-                          K_buf: T.Buffer((N, K), in_dtype),
-                          Out: T.Buffer((M, N), out_dtype)):
+        def gemm_softmax(Q: T.Tensor((M, K), in_dtype),
+                          K_buf: T.Tensor((N, K), in_dtype),
+                          Out: T.Tensor((M, N), out_dtype)):
             # Fused: Out = softmax(Q @ K^T) along axis=-1.
             with T.Kernel(M) as i:
                 row = T.alloc_fragment((N,), "float32")

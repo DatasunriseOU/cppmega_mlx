@@ -122,12 +122,12 @@ def _shared_alloc_bytes(source: str) -> int:
 
 @T.prim_func
 def _toy_path_c_train_block(
-    hidden: T.Buffer((4,), "float32"),
-    mamba_state: T.Buffer((4,), "float32"),
-    indices: T.Buffer((4,), "int32"),
-    scan_state: T.Buffer((4,), "float32"),
-    attention_out: T.Buffer((4,), "float32"),
-    lse: T.Buffer((4,), "float32"),
+    hidden: T.Tensor((4,), "float32"),
+    mamba_state: T.Tensor((4,), "float32"),
+    indices: T.Tensor((4,), "int32"),
+    scan_state: T.Tensor((4,), "float32"),
+    attention_out: T.Tensor((4,), "float32"),
+    lse: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         scan_y = T.alloc_local((4,), "float32")
@@ -155,49 +155,49 @@ def _toy_path_c_train_block(
 
 @T.prim_func
 def _toy_path_c_model_train_block(
-    hidden: T.Buffer((4,), "float32"),
-    mamba3_entry_rmsnorm_weight: T.Buffer((4,), "float32"),
-    mamba_state: T.Buffer((4,), "float32"),
-    mamba3_in_proj_weight: T.Buffer((4,), "float32"),
-    mamba3_out_proj_weight: T.Buffer((4,), "float32"),
-    mamba3_conv_weight: T.Buffer((4,), "float32"),
-    mamba3_conv_bias: T.Buffer((4,), "float32"),
-    mamba3_dt_bias: T.Buffer((4,), "float32"),
-    mamba3_B_norm_weight: T.Buffer((4,), "float32"),
-    mamba3_B_bias: T.Buffer((4,), "float32"),
-    mamba3_C_norm_weight: T.Buffer((4,), "float32"),
-    mamba3_C_bias: T.Buffer((4,), "float32"),
-    mamba3_D: T.Buffer((4,), "float32"),
-    mamba3_h0: T.Buffer((4,), "float32"),
-    scan_state: T.Buffer((4,), "float32"),
-    mamba3_residual_to_m2rnn_norm_weight: T.Buffer((4,), "float32"),
-    m2rnn_in_proj_weight: T.Buffer((4,), "float32"),
-    m2rnn_conv_weight: T.Buffer((4,), "float32"),
-    m2rnn_conv_bias: T.Buffer((4,), "float32"),
-    m2rnn_state_weight: T.Buffer((4,), "float32"),
-    m2rnn_A_log: T.Buffer((4,), "float32"),
-    m2rnn_dt_bias: T.Buffer((4,), "float32"),
-    m2rnn_D: T.Buffer((4,), "float32"),
-    m2rnn_g_norm_weight: T.Buffer((4,), "float32"),
-    m2rnn_out_proj_weight: T.Buffer((4,), "float32"),
-    m2rnn_h0: T.Buffer((4,), "float32"),
-    m2rnn_conv_state: T.Buffer((4,), "float32"),
-    hidden_after_m2rnn: T.Buffer((4,), "float32"),
-    m2rnn_residual_to_attention_norm_weight: T.Buffer((4,), "float32"),
-    attention_q_proj_weight: T.Buffer((4,), "float32"),
-    attention_q_proj_bias: T.Buffer((4,), "float32"),
-    attention_sparse_kv_proj_weight: T.Buffer((4,), "float32"),
-    attention_sparse_kv_proj_bias: T.Buffer((4,), "float32"),
-    attention_rope_inv_freq: T.Buffer((4,), "float32"),
-    attention_out_proj_weight: T.Buffer((4,), "float32"),
-    attention_out_proj_bias: T.Buffer((4,), "float32"),
-    sparse_mla_sm_scale: T.Buffer((4,), "float32"),
-    sparse_mla_sinks: T.Buffer((4,), "float32"),
-    sparse_mla_has_sinks: T.Buffer((4,), "int32"),
-    kv_fp8: T.Buffer((4,), "uint8"),
-    kv_scale: T.Buffer((4,), "float32"),
-    attention_out: T.Buffer((4,), "float32"),
-    lse: T.Buffer((4,), "float32"),
+    hidden: T.Tensor((4,), "float32"),
+    mamba3_entry_rmsnorm_weight: T.Tensor((4,), "float32"),
+    mamba_state: T.Tensor((4,), "float32"),
+    mamba3_in_proj_weight: T.Tensor((4,), "float32"),
+    mamba3_out_proj_weight: T.Tensor((4,), "float32"),
+    mamba3_conv_weight: T.Tensor((4,), "float32"),
+    mamba3_conv_bias: T.Tensor((4,), "float32"),
+    mamba3_dt_bias: T.Tensor((4,), "float32"),
+    mamba3_B_norm_weight: T.Tensor((4,), "float32"),
+    mamba3_B_bias: T.Tensor((4,), "float32"),
+    mamba3_C_norm_weight: T.Tensor((4,), "float32"),
+    mamba3_C_bias: T.Tensor((4,), "float32"),
+    mamba3_D: T.Tensor((4,), "float32"),
+    mamba3_h0: T.Tensor((4,), "float32"),
+    scan_state: T.Tensor((4,), "float32"),
+    mamba3_residual_to_m2rnn_norm_weight: T.Tensor((4,), "float32"),
+    m2rnn_in_proj_weight: T.Tensor((4,), "float32"),
+    m2rnn_conv_weight: T.Tensor((4,), "float32"),
+    m2rnn_conv_bias: T.Tensor((4,), "float32"),
+    m2rnn_state_weight: T.Tensor((4,), "float32"),
+    m2rnn_A_log: T.Tensor((4,), "float32"),
+    m2rnn_dt_bias: T.Tensor((4,), "float32"),
+    m2rnn_D: T.Tensor((4,), "float32"),
+    m2rnn_g_norm_weight: T.Tensor((4,), "float32"),
+    m2rnn_out_proj_weight: T.Tensor((4,), "float32"),
+    m2rnn_h0: T.Tensor((4,), "float32"),
+    m2rnn_conv_state: T.Tensor((4,), "float32"),
+    hidden_after_m2rnn: T.Tensor((4,), "float32"),
+    m2rnn_residual_to_attention_norm_weight: T.Tensor((4,), "float32"),
+    attention_q_proj_weight: T.Tensor((4,), "float32"),
+    attention_q_proj_bias: T.Tensor((4,), "float32"),
+    attention_sparse_kv_proj_weight: T.Tensor((4,), "float32"),
+    attention_sparse_kv_proj_bias: T.Tensor((4,), "float32"),
+    attention_rope_inv_freq: T.Tensor((4,), "float32"),
+    attention_out_proj_weight: T.Tensor((4,), "float32"),
+    attention_out_proj_bias: T.Tensor((4,), "float32"),
+    sparse_mla_sm_scale: T.Tensor((4,), "float32"),
+    sparse_mla_sinks: T.Tensor((4,), "float32"),
+    sparse_mla_has_sinks: T.Tensor((4,), "int32"),
+    kv_fp8: T.Tensor((4,), "uint8"),
+    kv_scale: T.Tensor((4,), "float32"),
+    attention_out: T.Tensor((4,), "float32"),
+    lse: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         # Block A: the fused model region now starts with an entry RMSNorm op
@@ -1825,7 +1825,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
     # row loops total: entry_rmsnorm pre-pass, main fwd, bwd.
     assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 3
     assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
-    assert 'mamba3_scan_mamba3_projected_vec: T.Buffer((18784,), "float32"),' in (
+    assert 'mamba3_scan_mamba3_projected_vec: T.Tensor((18784,), "float32"),' in (
         generated_source
     )
     assert "mamba3_scan_mamba3_projected_vec[mamba3_scan_proj_dim]" in (
@@ -1854,7 +1854,7 @@ def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> Non
     spilled = prim_func._cppmega_path_c_spilled_shared_scratch_shapes
 
     assert (
-        'mamba3_scan_mamba3_projected_vec: T.Buffer((18784,), "float32"),'
+        'mamba3_scan_mamba3_projected_vec: T.Tensor((18784,), "float32"),'
         in generated_source
     )
     assert (
@@ -1874,7 +1874,7 @@ def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> Non
     assert spilled["mamba3_scan_mamba3_conv_vec"]["bytes"] == 45056
     assert spilled["mamba3_scan_mamba3_out_inner"]["bytes"] == 28672
     assert spilled["mamba3_delta"]["internal_scratch_abi"] is True
-    assert 'mamba3_delta: T.Buffer((3584,), "float32"),' in generated_source
+    assert 'mamba3_delta: T.Tensor((3584,), "float32"),' in generated_source
     assert 'mamba3_delta = T.alloc_shared((3584,), "float32")' not in generated_source
     assert "mamba3_delta" in prim_func._cppmega_path_c_internal_scratch_abi_buffers
     assert _shared_alloc_bytes(generated_source) <= 32 * 1024
@@ -1911,7 +1911,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
         not in generated_source
     )
     assert (
-        f'mamba3_delta: T.Buffer(({cfg.hidden_size},), "float32"),'
+        f'mamba3_delta: T.Tensor(({cfg.hidden_size},), "float32"),'
         in generated_source
     )
     assert (
@@ -1930,7 +1930,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
     assert "kv_scale = T.alloc_local" not in generated_source
     assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
     assert (
-        f'path_c_uint8_abi_bank: T.Buffer(({kv_history_extent},), "uint8"),'
+        f'path_c_uint8_abi_bank: T.Tensor(({kv_history_extent},), "uint8"),'
         in generated_source
     )
     assert (
@@ -2238,7 +2238,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_model_derived_shape_env() -> 
     sinks_extent = cfg.num_attention_heads
 
     assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
-    assert 'path_c_float32_abi_bank: T.Buffer(' in generated_source
+    assert 'path_c_float32_abi_bank: T.Tensor(' in generated_source
     assert prim_func._cppmega_path_c_buffer_extent == sequence_extent
     assert prim_func._cppmega_path_c_loop_extent == hidden_extent
     assert f"for i in T.serial(0, {hidden_extent}):" not in generated_source
@@ -4423,7 +4423,7 @@ def test_model_region_shape_env_controls_dynamic_descriptor_extent() -> None:
     generated_source = prim_func._cppmega_path_c_generated_source
     abi_shapes = prim_func._cppmega_path_c_physical_buffer_abi_shapes
     assert abi_shapes["route_0_M_hidden"] == (1, 128, 32)
-    assert "route_0_M_hidden: T.Buffer((1, 128, 32), \"float32\")" in generated_source
+    assert "route_0_M_hidden: T.Tensor((1, 128, 32), \"float32\")" in generated_source
     assert "route_0_M_hidden[0, i // 32, i % 32]" in generated_source
     assert "route_0_M_hidden[0, (i % 4096) // 32, (i % 4096) % 32]" not in generated_source
     assert prim_func._cppmega_path_c_buffer_extent == 128

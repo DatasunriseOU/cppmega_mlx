@@ -2499,10 +2499,10 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
     assert bridge["loss_cotangent_bridge_ready"] is False
     assert bridge["model_gradient_tree_ready"] is False
     assert bridge["delegates_to_eager_loss_and_grad"] is False
-    assert bridge["required_gradient_buffer_count"] == 36
-    assert bridge["covered_parameter_gradient_buffer_count"] == 27
-    assert bridge["parameter_gradient_tree_name_count"] == 27
-    assert bridge["bridge_only_gradient_buffer_count"] == 9
+    assert bridge["required_gradient_buffer_count"] == 38
+    assert bridge["covered_parameter_gradient_buffer_count"] == 28
+    assert bridge["parameter_gradient_tree_name_count"] == 28
+    assert bridge["bridge_only_gradient_buffer_count"] == 10
     assert bridge["required_loss_cotangent_buffers"] == [
         "local_gb10_quarter_brick_11_R_hidden_after_grad",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad",
@@ -2517,6 +2517,12 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
     assert "local_gb10_quarter_brick_10_M_mamba3_h0_grad" in bridge[
         "required_runtime_bridge_gradients"
     ]
+    assert "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden_grad" in (
+        bridge["bridge_only_gradient_buffers"]
+    )
+    assert "local_gb10_quarter_brick_10_M_entry_rmsnorm_weight_grad" in (
+        bridge["covered_parameter_gradient_buffers"]
+    )
     assert "local_gb10_quarter_brick_12_A_qkv_projection_attention_q_proj_weight_grad" in (
         bridge["covered_parameter_gradient_buffers"]
     )
@@ -2536,6 +2542,44 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
         "run_path_c_fused_train_block_route",
         "run_path_c_split_training_route",
     }
+
+
+def test_path_c_direct_chain_diagnostics_do_not_report_unavailable_for_entry_rmsnorm(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--model-profile",
+            "local_gb10_quarter",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    route = m04_train_step.fp8_path_c_training_route_payload_for_model(
+        config,
+        model,
+    )
+
+    direct_chain = route["path_c_fusion"]["direct_chained_fusion"]
+    for key in (
+        "model_binding_audit",
+        "pre_step_owner_plan",
+        "value_and_grad_bridge_plan",
+    ):
+        status = direct_chain[key]["status"]
+        assert not status.endswith("_unavailable"), (key, direct_chain[key])
+    assert direct_chain["pre_step_owner_plan"]["status"] == (
+        "pre_step_runtime_owner_missing"
+    )
+    assert direct_chain["value_and_grad_bridge_plan"]["status"] == "blocked"
 
 
 def test_path_c_model_gradient_tree_from_direct_buffers_maps_parameter_aliases(
@@ -4971,7 +5015,7 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     )
 
     assert owner.owner_name == "local_gb10_quarter.path_c_pre_step_runtime_buffers"
-    assert len(owner.buffers) == 83
+    assert len(owner.buffers) == 87
     assert owner.hidden_packing_performed is False
     assert owner.no_hidden_allocation_policy is True
     assert owner.buffers[
@@ -4983,15 +5027,15 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     ] is parameters["layers.10.block.conv_weight"]
     assert binding["status"] == "ok"
     assert binding["runtime_uses_direct_fusion_chain"] is True
-    assert binding["provided_logical_buffer_count"] == 81
+    assert binding["provided_logical_buffer_count"] == 85
     assert binding["missing_logical_buffer_count"] == 0
     assert binding["unexpected_logical_buffer_count"] == 0
     assert pre_step_plan["status"] == "pre_step_runtime_owner_ready"
     assert pre_step_plan["training_critical_path_ready"] is True
-    assert pre_step_plan["model_parameter_or_constant_available_count"] == 25
-    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 17
+    assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
+    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 18
     assert pre_step_plan["runtime_state_available_count"] == 5
-    assert pre_step_plan["backward_workspace_gradient_available_count"] == 36
+    assert pre_step_plan["backward_workspace_gradient_available_count"] == 38
 
 
 def test_path_c_direct_chain_pre_step_owner_preserves_bf16_model_dtype(

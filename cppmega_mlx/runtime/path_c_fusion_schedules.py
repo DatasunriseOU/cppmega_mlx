@@ -1275,6 +1275,15 @@ def build_path_c_descriptor_prim_func(
             "tilelang_pass_configs",
             compile_pass_configs,
         )
+    owner_output_param_indices = tuple(range(len(physical_abi_plan.param_lines)))
+    if owner_output_param_indices:
+        prim_func = prim_func.with_attr(
+            "tilelang_out_idx",
+            list(owner_output_param_indices),
+        ).with_attr(
+            "tilelang_metal_zero_init_output_positions",
+            [],
+        )
     prim_func._cppmega_path_c_schedule_generator = PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
     prim_func._cppmega_path_c_brick_ops = tuple(
         descriptor.op_name for descriptor in descriptors
@@ -1546,7 +1555,7 @@ def _descriptor_prim_func_source(
     param_lines = list(physical_abi_plan.param_lines)
     if not param_lines:
         param_lines = [
-            f"{indent}_dummy: T.Buffer(({buffer_extent},), \"float32\"),"
+            f"{indent}_dummy: T.Tensor(({buffer_extent},), \"float32\"),"
         ]
     access_by_buffer = {
         buffer_name: _internal_buffer_ref(
@@ -2745,7 +2754,7 @@ def _spill_large_shared_scratch_to_abi(
         raise ValueError("descriptor source did not contain a function signature close")
     param_indent = " " * 4
     spill_param_lines = [
-        f'{param_indent}{info["param_name"]}: T.Buffer({_shape_literal(info["shape"])}, '
+        f'{param_indent}{info["param_name"]}: T.Tensor({_shape_literal(info["shape"])}, '
         f'"{info["dtype"]}"),'
         for name, info in spilled.items()
     ]
@@ -2866,7 +2875,7 @@ def _physical_abi_plan(
     }
     param_lines = tuple(
         f"{indent}{_physical_abi_bank_name(dtype)}: "
-        f"T.Buffer({_shape_literal(physical_shapes[_physical_abi_bank_name(dtype)])}, "
+        f"T.Tensor({_shape_literal(physical_shapes[_physical_abi_bank_name(dtype)])}, "
         f"\"{dtype}\"),"
         for dtype in bank_order
     )
@@ -2920,7 +2929,7 @@ def _direct_physical_abi_plan(
         for buffer_name in external_buffers
     }
     param_lines = tuple(
-        f"{indent}{name}: T.Buffer({_shape_literal(direct_shape_by_buffer[name])}, "
+        f"{indent}{name}: T.Tensor({_shape_literal(direct_shape_by_buffer[name])}, "
         f"\"{dtype_by_buffer[name]}\"),"
         for name in external_buffers
     )

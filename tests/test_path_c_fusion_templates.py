@@ -25,11 +25,11 @@ def _assert_raw_prim_func(candidate: object) -> PrimFunc:
 
 @T.prim_func
 def _toy_fused_train_block(
-    hidden: T.Buffer((4,), "float32"),
-    mamba_state: T.Buffer((4,), "float32"),
-    scan_state: T.Buffer((4,), "float32"),
-    attention_out: T.Buffer((4,), "float32"),
-    lse: T.Buffer((4,), "float32"),
+    hidden: T.Tensor((4,), "float32"),
+    mamba_state: T.Tensor((4,), "float32"),
+    scan_state: T.Tensor((4,), "float32"),
+    attention_out: T.Tensor((4,), "float32"),
+    lse: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         scan_y = T.alloc_local((4,), "float32")
@@ -51,11 +51,11 @@ def _toy_fused_train_block(
 
 @T.prim_func
 def _toy_fp8_prepare(
-    post_y: T.Buffer((4,), "float32"),
-    q_fp8: T.Buffer((4,), "float32"),
-    q_scale: T.Buffer((4,), "float32"),
-    kv_fp8: T.Buffer((4,), "float32"),
-    kv_scale: T.Buffer((4,), "float32"),
+    post_y: T.Tensor((4,), "float32"),
+    q_fp8: T.Tensor((4,), "float32"),
+    q_scale: T.Tensor((4,), "float32"),
+    kv_fp8: T.Tensor((4,), "float32"),
+    kv_scale: T.Tensor((4,), "float32"),
 ):
     with T.Kernel(1, threads=1):
         q_fp8[0] = post_y[0]

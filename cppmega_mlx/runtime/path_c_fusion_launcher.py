@@ -263,6 +263,10 @@ class Mamba3Fp8TrainBlockLauncher:
         self._kernel = compiled.compiled.artifact
         self._prim_func = self._kernel.prim_func
         self.manifest = load_path_c_abi_manifest(self._prim_func)
+        self._result_param_indices = tuple(
+            int(idx)
+            for idx in self._prim_func.attrs.get("tilelang_out_idx", ())
+        )
 
     # --- inspection ------------------------------------------------------
 
@@ -420,8 +424,42 @@ class Mamba3Fp8TrainBlockLauncher:
                     f"not present in banks, dtype scratch, or top-level scratch"
                 )
 
-        # Launch.
-        self._kernel(*positional)
+        # Launch. Descriptor schedules mark every ABI parameter as a native
+        # owner-output/inout buffer; keep the returned aliases in the manifest
+        # maps so extraction reads the MLX graph value produced by TileLang.
+        returned = self._kernel(*positional)
+        if returned is not None:
+            returned_outputs = (
+                [returned]
+                if isinstance(returned, mx.array)
+                else list(returned)
+            )
+            if returned_outputs:
+                result_indices = self._result_param_indices
+                if len(returned_outputs) != len(result_indices):
+                    raise ValueError(
+                        "Path C TileLang kernel returned "
+                        f"{len(returned_outputs)} owner outputs for "
+                        f"{len(result_indices)} result ABI parameters"
+                    )
+                for param_index, value in zip(
+                    result_indices,
+                    returned_outputs,
+                    strict=True,
+                ):
+                    param_name = manifest.param_order[param_index]
+                    logical_name = (
+                        param_name[: -len("_handle")]
+                        if param_name.endswith("_handle")
+                        else param_name
+                    )
+                    if logical_name in banks:
+                        banks[logical_name] = value
+                    elif logical_name in scratch_buffers:
+                        scratch_buffers[logical_name] = value
+                    elif logical_name in top_level_buffers:
+                        top_level_buffers[logical_name] = value
+                    positional[param_index] = value
         # Force the lazy MLX graph to materialise so subsequent reads see the writes.
         mx.eval(*positional)
 
