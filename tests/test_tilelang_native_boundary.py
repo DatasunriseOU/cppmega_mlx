@@ -23,6 +23,12 @@ class _RecordingArtifact:
         return args[-1]
 
 
+class _ArrayHandle:
+    def __init__(self, shape: tuple[int, ...], dtype: str) -> None:
+        self.shape = shape
+        self.dtype = dtype
+
+
 def test_native_kernel_requires_owner_outputs_by_default() -> None:
     from cppmega_mlx.nn._tilelang._mlx_runtime import (
         NativeTileLangKernel,
@@ -78,6 +84,24 @@ def test_native_kernel_rejects_wrong_owner_output_identity() -> None:
 
     with pytest.raises(NativeTileLangRuntimeError, match="caller-owned output"):
         kernel(object(), out=object())
+
+
+def test_native_kernel_returns_owner_output_when_tvm_ffi_returns_fresh_handle() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import NativeTileLangKernel
+
+    out = _ArrayHandle((2, 3), "float32")
+    fresh_handle = _ArrayHandle((2, 3), "float32")
+    artifact = _RecordingArtifact(result=fresh_handle)
+    kernel = NativeTileLangKernel(
+        artifact=artifact,
+        result_indices=(1,),
+        num_params=2,
+        target="metal",
+    )
+
+    returned = kernel(object(), out=out)
+
+    assert returned is out
 
 
 def test_native_kernel_accepts_explicit_full_abi_owner_output() -> None:

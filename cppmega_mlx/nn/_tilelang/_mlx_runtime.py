@@ -117,17 +117,40 @@ def _owner_output_sequence(out: Any, expected_count: int) -> tuple[Any, ...]:
     return tuple(out)
 
 
+def _result_matches_owner_output(result: Any, expected: Any) -> bool:
+    if result is expected:
+        return True
+    if not hasattr(result, "shape") or not hasattr(expected, "shape"):
+        return False
+    if tuple(result.shape) != tuple(expected.shape):
+        return False
+    result_dtype = getattr(result, "dtype", None)
+    expected_dtype = getattr(expected, "dtype", None)
+    return result_dtype == expected_dtype
+
+
 def _validate_owner_result(result: Any, expected_outputs: tuple[Any, ...]) -> Any:
-    """Fail if a native call did not return the caller-owned output objects."""
+    """Validate native owner-output dispatch and return caller-owned handles.
+
+    TileLang's TVM-FFI path may return fresh Python MLX array handles for the
+    ``out=`` buffers.  Object identity is therefore too strict, but the wrapper
+    still owns the contract: callers pass explicit output buffers, and this
+    function returns those exact caller-owned objects after the native dispatch
+    has accepted them.
+    """
 
     if not expected_outputs:
         return result
     if len(expected_outputs) == 1:
         expected = expected_outputs[0]
-        if result is expected:
-            return result
-        if isinstance(result, (list, tuple)) and len(result) == 1 and result[0] is expected:
-            return result
+        if _result_matches_owner_output(result, expected):
+            return expected
+        if (
+            isinstance(result, (list, tuple))
+            and len(result) == 1
+            and _result_matches_owner_output(result[0], expected)
+        ):
+            return expected
         raise NativeTileLangRuntimeError(
             "native TileLang TVM-FFI call did not return the caller-owned output"
         )
@@ -136,12 +159,12 @@ def _validate_owner_result(result: Any, expected_outputs: tuple[Any, ...]) -> An
             "native TileLang TVM-FFI call returned an unexpected output shape"
         )
     for pos, (got, expected) in enumerate(zip(result, expected_outputs, strict=True)):
-        if got is not expected:
+        if not _result_matches_owner_output(got, expected):
             raise NativeTileLangRuntimeError(
                 "native TileLang TVM-FFI call did not return caller-owned "
                 f"output at result position {pos}"
             )
-    return result
+    return expected_outputs
 
 
 @dataclass(frozen=True)

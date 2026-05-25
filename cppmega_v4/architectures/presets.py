@@ -215,8 +215,10 @@ def _nemotron3(hidden_size: int) -> list[dict[str, Any]]:
     nh = max(8, hidden_size // 64)
     return [
         {"kind": "mamba3", "name": "nemo_mamba"},
+        {"kind": "rmsnorm", "name": "nemo_norm1"},
         {"kind": "attention", "name": "nemo_attn",
          "params": {"num_heads": nh, "head_dim": 64}},
+        {"kind": "rmsnorm", "name": "nemo_norm2"},
         {"kind": "moe", "name": "nemo_moe",
          "params": {"num_experts": 4, "top_k": 2}},
     ]
@@ -588,7 +590,9 @@ def build_preset_specs(
         return [dict(s) for s in unit]
     if num_layers < 0:
         raise ValueError("num_layers must be ≥ 0")
-    n_reps = num_layers // len(unit)
+    if num_layers == 0:
+        return []
+    n_reps = max(1, num_layers // len(unit))
     out: list[dict[str, Any]] = []
     for r in range(n_reps):
         for s in unit:

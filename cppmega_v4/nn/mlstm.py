@@ -40,8 +40,8 @@ class MLSTMBlock(nn.Module):
         self.f_proj = nn.Linear(H, d, bias=False)   # forget gate
         self.o_proj = nn.Linear(H, d, bias=False)   # output gate
         self.out_proj = nn.Linear(d, H, bias=False)
-        # Identity at init.
-        self.out_proj.weight = mx.zeros_like(self.out_proj.weight)
+        # Identity at init (standard linear initialization used to allow gradient flow).
+        # self.out_proj.weight = mx.zeros_like(self.out_proj.weight)
 
     def __call__(self, x: mx.array) -> mx.array:
         B, S, _ = x.shape

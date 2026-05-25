@@ -74,6 +74,10 @@ BRICK_REQUIREMENTS: Mapping[str, tuple[DataRequirement, ...]] = {
     "mlstm":             (),
     "abs_pos_embed":     (),
     "per_layer_embed":   (),
+    "embedding_table":   (),
+    "rmsnorm":           (),
+    "layernorm":         (),
+    "residual":          (),
     # bricks that need real side-channels from parquet
     "engram":            (_ENGRAM_NEEDS_CALL_EDGES,),
     "csa_hca":           (_CSAHCA_NEEDS_TYPE_EDGES,),

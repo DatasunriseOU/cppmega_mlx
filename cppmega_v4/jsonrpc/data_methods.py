@@ -132,6 +132,60 @@ class PreviewParquetResult(BaseModel):
     roundtrip_has_original_text: bool = False
 
 
+class ListCacheParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class CacheItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_name: str
+    parquet_path: str
+    dataset_id: str
+    tokenizer: str
+    n_tokens: int
+    split: str
+    text_field: str
+    byte_size: int
+    n_docs: int
+    elapsed_ms: float
+    category: str
+
+
+class ListCacheResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[CacheItem]
+
+
+class ClearCacheParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_name: str | None = None  # if None, clear all cache
+
+
+class ClearCacheResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cleared_count: int
+    success: bool
+
+
+class ListDatasetCatalogParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DatasetCatalogItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    name: str
+    category: str
+    description: str
+    default_text_field: str
+    default_split: str
+
+
+class ListDatasetCatalogResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    catalog: list[DatasetCatalogItem]
+
+
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
@@ -477,3 +531,121 @@ def _edge_pairs(value: Any) -> list[tuple[int, int]]:
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             pairs.append((int(item[0]), int(item[1])))
     return pairs
+
+
+def list_cache(params: ListCacheParams, *, cache: LRUCache | None = None) -> ListCacheResult:
+    import json
+    import os
+    from pathlib import Path
+
+    cache_base = Path("/Users/dave/sources/cppmega.mlx/data/cache/datasets")
+    items: list[CacheItem] = []
+
+    if cache_base.exists():
+        for parquet_path in cache_base.glob("*.parquet"):
+            meta_path = parquet_path.with_suffix(".meta.json")
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+
+                    dataset_id = meta.get("dataset_id", "")
+                    cat = "Pre-training"
+                    ds_lower = dataset_id.lower()
+                    if "smoltalk" in ds_lower:
+                        cat = "SFT (Instruction)"
+                    elif "openmath" in ds_lower:
+                        cat = "Math & Reasoning"
+                    elif "ultrachat" in ds_lower:
+                        cat = "SFT Alignment"
+                    elif "github-code" in ds_lower or "codeparrot" in ds_lower:
+                        cat = "GitHub Code"
+                    elif "fineweb" in ds_lower:
+                        cat = "Pre-training"
+
+                    items.append(CacheItem(
+                        file_name=parquet_path.name,
+                        parquet_path=str(parquet_path),
+                        dataset_id=dataset_id,
+                        tokenizer=meta.get("tokenizer", ""),
+                        n_tokens=meta.get("n_tokens", 0),
+                        split=meta.get("split", ""),
+                        text_field=meta.get("text_field", ""),
+                        byte_size=parquet_path.stat().st_size,
+                        n_docs=meta.get("n_docs", 0),
+                        elapsed_ms=meta.get("elapsed_ms", 0.0),
+                        category=cat
+                    ))
+                except Exception:
+                    pass
+    return ListCacheResult(items=items)
+
+
+def clear_cache(params: ClearCacheParams, *, cache: LRUCache | None = None) -> ClearCacheResult:
+    from pathlib import Path
+
+    cache_base = Path("/Users/dave/sources/cppmega.mlx/data/cache/datasets")
+    cleared = 0
+    if cache_base.exists():
+        if params.file_name:
+            p_file = cache_base / params.file_name
+            m_file = p_file.with_suffix(".meta.json")
+            if p_file.exists():
+                p_file.unlink()
+                cleared += 1
+            if m_file.exists():
+                m_file.unlink()
+        else:
+            for p_file in cache_base.glob("*.parquet"):
+                p_file.unlink()
+                cleared += 1
+            for m_file in cache_base.glob("*.meta.json"):
+                m_file.unlink()
+
+    return ClearCacheResult(cleared_count=cleared, success=True)
+
+
+def list_dataset_catalog(params: ListDatasetCatalogParams, *, cache: LRUCache | None = None) -> ListDatasetCatalogResult:
+    catalog = [
+        DatasetCatalogItem(
+            id="HuggingFaceFW/fineweb-edu",
+            name="FineWeb-Edu (1.3B tokens)",
+            category="Pre-training",
+            description="High-quality educational web dataset filtered from FineWeb, ideal for pre-training mini LLMs.",
+            default_text_field="text",
+            default_split="train"
+        ),
+        DatasetCatalogItem(
+            id="HuggingFaceTB/smoltalk",
+            name="SmolTalk (Instruction Mix)",
+            category="SFT (Instruction)",
+            description="Diverse SFT instruction datasets including conversations, logic, code, and math.",
+            default_text_field="messages",
+            default_split="train"
+        ),
+        DatasetCatalogItem(
+            id="nvidia/OpenMathInstruct-1",
+            name="OpenMathInstruct-1",
+            category="Math & Reasoning",
+            description="NVIDIA's high-quality math reasoning instruction dataset generated using LLMs.",
+            default_text_field="question",
+            default_split="train"
+        ),
+        DatasetCatalogItem(
+            id="HuggingFaceH4/ultrachat_200k",
+            name="UltraChat 200k",
+            category="SFT Alignment",
+            description="A large-scale multi-turn conversational dataset for SFT alignment.",
+            default_text_field="messages",
+            default_split="train_sft"
+        ),
+        DatasetCatalogItem(
+            id="codeparrot/github-code-clean",
+            name="GitHub Code (Cleaned)",
+            category="GitHub Code",
+            description="Cleaned code snippets from GitHub covering multiple popular programming languages.",
+            default_text_field="code",
+            default_split="train"
+        )
+    ]
+    return ListDatasetCatalogResult(catalog=catalog)

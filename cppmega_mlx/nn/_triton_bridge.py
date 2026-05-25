@@ -224,6 +224,46 @@ def _require_frontend() -> Any:
     return tf
 
 
+def _triton_to_tilelang_prim_via_subprocess_ttir(
+    tf: Any,
+    fn: Callable[..., Any],
+    *,
+    grid: Optional[Tuple[int, ...]],
+    constexprs: Optional[Dict[str, Any]],
+    target: Optional[str],
+    name: Optional[str],
+) -> Any:
+    """Fallback for frontend paths that cannot co-load Triton and PtrAnalysis."""
+
+    import inspect
+    import textwrap
+
+    from poc.triton_frontend._test_harness.jit_to_ttir import (  # type: ignore[import-not-found]
+        triton_jit_to_ttir_subprocess_from_source,
+    )
+
+    underlying_fn = getattr(fn, "fn", fn)
+    source = textwrap.dedent(inspect.getsource(underlying_fn))
+    kernel_name = (
+        getattr(underlying_fn, "__name__", None)
+        or getattr(fn, "__name__", None)
+        or "triton_kernel"
+    )
+    ttir_text = triton_jit_to_ttir_subprocess_from_source(
+        source=source,
+        kernel_name=kernel_name,
+        constexprs=constexprs,
+        target=target,
+        extra_sys_path=[str(_frontend_root())],
+    )
+    return tf.from_ttir(
+        ttir_text,
+        target=target,
+        name=name or kernel_name,
+        grid=grid,
+    )
+
+
 def triton_to_tilelang_prim(
     fn: Callable[..., Any],
     *,
@@ -316,6 +356,28 @@ def triton_to_tilelang_prim(
             f"Triton frontend coverage gap while lowering {inferred_name!r}: {exc}"
         ) from exc
     except Exception as exc:  # pragma: no cover - defensive
+        if (
+            isinstance(exc, RuntimeWarning)
+            and "PtrAnalysis C++ shim disabled" in str(exc)
+        ):
+            try:
+                prim = _triton_to_tilelang_prim_via_subprocess_ttir(
+                    tf,
+                    fn,
+                    grid=grid,
+                    constexprs=constexprs,
+                    target=target,
+                    name=name,
+                )
+            except Exception as fallback_exc:
+                raise TritonBridgeError(
+                    f"Triton frontend failed for {inferred_name!r}: {exc!r}; "
+                    f"fresh-process TTIR fallback also failed: {fallback_exc!r}"
+                ) from fallback_exc
+            else:
+                if name and prim is not None and hasattr(prim, "with_attr"):
+                    prim = prim.with_attr("global_symbol", name)
+                return prim
         raise TritonBridgeError(
             f"Triton frontend failed for {inferred_name!r}: {exc!r}"
         ) from exc

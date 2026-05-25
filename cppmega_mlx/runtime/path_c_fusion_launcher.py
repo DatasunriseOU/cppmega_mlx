@@ -316,6 +316,9 @@ _STATE_AFTER_LOGICAL_BUFFERS: tuple[str, ...] = (
 )
 
 
+_BACKWARD_INITIAL_STATE_LOGICAL_BUFFERS: tuple[str, ...] = _STATE_AFTER_LOGICAL_BUFFERS
+
+
 class Mamba3Fp8TrainBlockLauncher:
     """One-shot, fail-closed launcher for the fused Path C train block."""
 
@@ -516,6 +519,7 @@ class Mamba3Fp8TrainBlockLauncher:
 
         # Build the full positional argument tuple in ``prim_func.params`` order.
         positional: list[Any] = []
+        bank_param_indices: dict[str, int] = {}
         row_chunk_param_index: int | None = None
         row_chunk_param_is_scalar = False
         row_subchunk_param_index: int | None = None
@@ -523,6 +527,7 @@ class Mamba3Fp8TrainBlockLauncher:
         for param_name in manifest.param_order:
             logical_name = param_name[: -len("_handle")] if param_name.endswith("_handle") else param_name
             if logical_name in banks:
+                bank_param_indices[logical_name] = len(positional)
                 positional.append(banks[logical_name])
             elif logical_name in scratch_buffers:
                 positional.append(scratch_buffers[logical_name])
@@ -601,6 +606,46 @@ class Mamba3Fp8TrainBlockLauncher:
             if mx_args:
                 mx.eval(*mx_args)
 
+        def snapshot_logical_buffers(names: tuple[str, ...]) -> dict[str, mx.array]:
+            snapshots = {
+                name: (
+                    _bank_slot_view(
+                        banks[manifest.logical_to_physical[name].bank],
+                        manifest.logical_to_physical[name],
+                    )
+                    + mx.zeros(
+                        manifest.logical_to_physical[name].logical_shape,
+                        dtype=_to_mx_dtype(manifest.logical_to_physical[name].dtype),
+                    )
+                )
+                for name in names
+                if name in manifest.logical_to_physical
+            }
+            if snapshots:
+                mx.eval(*snapshots.values())
+            return snapshots
+
+        def restore_logical_buffers(snapshots: Mapping[str, mx.array]) -> None:
+            for name, value in snapshots.items():
+                placement = manifest.logical_to_physical[name]
+                banks[placement.bank] = _flat_into_bank(
+                    banks[placement.bank],
+                    placement,
+                    value,
+                )
+                param_index = bank_param_indices.get(placement.bank)
+                if param_index is not None:
+                    positional[param_index] = banks[placement.bank]
+            if snapshots:
+                eval_positionals()
+
+        initial_backward_states = (
+            snapshot_logical_buffers(_BACKWARD_INITIAL_STATE_LOGICAL_BUFFERS)
+            if run_backward
+            else {}
+        )
+        final_forward_states: dict[str, mx.array] = {}
+
         # Launch. Descriptor schedules mark ABI parameters as native
         # owner-output/inout buffers; keep returned aliases in the manifest maps
         # so extraction reads the MLX graph value produced by TileLang.
@@ -622,17 +667,34 @@ class Mamba3Fp8TrainBlockLauncher:
                     "compiled PrimFunc declares row subchunk dispatch metadata "
                     "but has no row subchunk index parameter"
                 )
-            for chunk_index in range(chunk_count):
-                for subchunk_index in range(subchunk_count):
-                    positional[row_chunk_param_index] = (
-                        int(chunk_index)
-                        if row_chunk_param_is_scalar
-                        else mx.array([chunk_index], dtype=mx.int32)
-                    )
-                    if row_subchunk_param_index is not None:
-                        positional[row_subchunk_param_index] = int(subchunk_index)
-                    apply_returned_outputs(self._kernel(*positional))
-                    eval_positionals()
+            def launch_chunk(chunk_index: int, subchunk_index: int) -> None:
+                positional[row_chunk_param_index] = (
+                    int(chunk_index)
+                    if row_chunk_param_is_scalar
+                    else mx.array([chunk_index], dtype=mx.int32)
+                )
+                if row_subchunk_param_index is not None:
+                    positional[row_subchunk_param_index] = int(subchunk_index)
+                apply_returned_outputs(self._kernel(*positional))
+                eval_positionals()
+
+            if run_backward and backward_gate_param_index is not None:
+                positional[backward_gate_param_index] = 0
+                forward_subchunk_count = int(manifest.row_subchunk_count or 1)
+                for chunk_index in range(chunk_count):
+                    for subchunk_index in range(forward_subchunk_count):
+                        launch_chunk(chunk_index, subchunk_index)
+                final_forward_states = snapshot_logical_buffers(
+                    _STATE_AFTER_LOGICAL_BUFFERS
+                )
+                restore_logical_buffers(initial_backward_states)
+                positional[backward_gate_param_index] = 1
+                launch_chunk(0, 0)
+                restore_logical_buffers(final_forward_states)
+            else:
+                for chunk_index in range(chunk_count):
+                    for subchunk_index in range(subchunk_count):
+                        launch_chunk(chunk_index, subchunk_index)
         else:
             apply_returned_outputs(self._kernel(*positional))
             # Force the lazy MLX graph to materialise so subsequent reads see the writes.

@@ -48,9 +48,14 @@ export function makeIsValidConnection(
     const dst = conn.target ? brickKindOf(conn.target) : null;
     if (!src || !dst) return false;
 
-    // Tokenizer / De-Tokenizer connection bypass: allow connecting tokenizer at input and detokenizer at output.
-    if (src === "tokenizer") return true;
-    if (dst === "detokenizer") return true;
+    // Tokenizer strictly connects only to embedding_table
+    if (src === "tokenizer") {
+      return dst === "embedding_table";
+    }
+    // De-Tokenizer strictly accepts connections only from embedding_table, linear_bridge, mlp or other norm_or_proj bricks
+    if (dst === "detokenizer") {
+      return src === "embedding_table" || src === "linear_bridge" || src === "mlp" || src === "rmsnorm" || src === "layernorm" || src === "per_layer_embed" || src === "abs_pos_embed";
+    }
 
     if (pairs.size === 0) return true;        // server fallback
     return pairs.has(`${src}→${dst}`);

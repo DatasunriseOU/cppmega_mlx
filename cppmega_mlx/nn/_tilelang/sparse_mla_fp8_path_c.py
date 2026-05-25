@@ -2261,25 +2261,13 @@ def _make_fp8_bwd_clear_dkv_kernel(
     total = int(batch) * int(seq_len_kv) * int(kv_group) * int(K)
     g = globals()
     g.update(
-        _SMFP8_BWD_CLEAR_BATCH=int(batch),
-        _SMFP8_BWD_CLEAR_SEQ_LEN_KV=int(seq_len_kv),
-        _SMFP8_BWD_CLEAR_KV_GROUP=int(kv_group),
-        _SMFP8_BWD_CLEAR_K=int(K),
         _SMFP8_BWD_CLEAR_TOTAL=total,
         _SMFP8_BWD_CLEAR_THREADS=int(threads),
     )
 
     @T.prim_func
     def fp8_sparse_mla_bwd_clear_dkv_kernel(
-        dkv_dequant: T.Tensor(
-            (
-                _SMFP8_BWD_CLEAR_BATCH,
-                _SMFP8_BWD_CLEAR_SEQ_LEN_KV,
-                _SMFP8_BWD_CLEAR_KV_GROUP,
-                _SMFP8_BWD_CLEAR_K,
-            ),
-            "float32",
-        ),
+        dkv_dequant: T.Tensor((_SMFP8_BWD_CLEAR_TOTAL,), "float32"),
     ):
         with T.Kernel(
             T.ceildiv(_SMFP8_BWD_CLEAR_TOTAL, _SMFP8_BWD_CLEAR_THREADS),
@@ -2288,13 +2276,7 @@ def _make_fp8_bwd_clear_dkv_kernel(
             lane = T.get_thread_binding()
             elem = bx * _SMFP8_BWD_CLEAR_THREADS + lane
             if elem < _SMFP8_BWD_CLEAR_TOTAL:
-                k_idx = elem % _SMFP8_BWD_CLEAR_K
-                tmp = elem // _SMFP8_BWD_CLEAR_K
-                g_idx = tmp % _SMFP8_BWD_CLEAR_KV_GROUP
-                tmp = tmp // _SMFP8_BWD_CLEAR_KV_GROUP
-                s_idx = tmp % _SMFP8_BWD_CLEAR_SEQ_LEN_KV
-                b_idx = tmp // _SMFP8_BWD_CLEAR_SEQ_LEN_KV
-                dkv_dequant[b_idx, s_idx, g_idx, k_idx] = 0.0
+                dkv_dequant[elem] = 0.0
 
     try:
         from tilelang.transform.simplify import apply_simplify
@@ -2499,6 +2481,34 @@ def _owner_output_tuple(
     )
 
 
+def _owner_output_graph_tuple(
+    value: object,
+    *,
+    expected: tuple[mx.array, ...],
+    op_name: str,
+) -> tuple[mx.array, ...]:
+    if len(expected) == 1 and isinstance(value, mx.array):
+        out = (value,)
+    elif isinstance(value, (list, tuple)) and len(value) == len(expected):
+        out = tuple(cast(mx.array, item) for item in value)
+    else:
+        raise SparseMLAFp8PathCDirectError(
+            f"{op_name} did not return {len(expected)} graph outputs"
+        )
+    for got, want in zip(out, expected, strict=True):
+        if not isinstance(got, mx.array):
+            raise SparseMLAFp8PathCDirectError(
+                f"{op_name} returned non-array graph output"
+            )
+        if tuple(got.shape) != tuple(want.shape) or got.dtype != want.dtype:
+            raise SparseMLAFp8PathCDirectError(
+                f"{op_name} returned graph output with shape/dtype "
+                f"{tuple(got.shape)}/{got.dtype}, expected "
+                f"{tuple(want.shape)}/{want.dtype}"
+            )
+    return out
+
+
 def _flat_1d_view(array: mx.array) -> mx.array:
     return array.reshape((int(array.size),))
 
@@ -2520,14 +2530,20 @@ def _clear_fp8_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
         shape[3],
         min(_SMFP8_BWD_CLEAR_THREADS, max(1, total)),
     )
-    returned = kernel(out=dkv_buffer)
-    _owner_output_tuple(
+    flat = _flat_1d_view(dkv_buffer)
+    returned = kernel(out=flat)
+    # The clear kernel is an internal in-place side effect.  The public
+    # backward kernel below still validates strict caller-owned outputs, but
+    # MLX may hand back a fresh array wrapper for this single-output clear even
+    # when it writes the supplied owner buffer.
+    (cleared_flat,) = _owner_output_graph_tuple(
         returned,
-        expected=(dkv_buffer,),
+        expected=(flat,),
         op_name="direct tvm-ffi FP8 Sparse-MLA backward dKV clear",
     )
+    mx.eval(cleared_flat)
     mx.synchronize()
-    return dkv_buffer
+    return cleared_flat.reshape(shape)
 
 
 def _empty_fp8_bwd_output(shape: tuple[int, ...]) -> mx.array:
@@ -2621,7 +2637,7 @@ def _dispatch_fp8_bwd_owner_output_path_c(
             d_out_dtype,
             index_dtype,
         )
-        _clear_fp8_bwd_dkv_buffer(dkv_owner)
+        dkv_owner = _clear_fp8_bwd_dkv_buffer(dkv_owner)
         dq_flat = _flat_1d_view(dq_owner)
         dkv_flat = _flat_1d_view(dkv_owner)
         returned = kernel(
@@ -2641,13 +2657,14 @@ def _dispatch_fp8_bwd_owner_output_path_c(
                 f"dispatch failed: {type(exc).__name__}: {exc}"
             ) from exc
         return None
-    _owner_output_tuple(
+    dq_flat, dkv_flat = _owner_output_graph_tuple(
         returned,
         expected=(dq_flat, dkv_flat),
         op_name="direct tvm-ffi FP8 Sparse-MLA backward",
     )
+    mx.eval(dq_flat, dkv_flat)
     mx.synchronize()
-    return dq_owner, dkv_owner
+    return dq_flat.reshape(dq_shape), dkv_flat.reshape(dkv_shape)
 
 
 def _tilelang_float_dtype(dtype: mx.Dtype, *, name: str = "dtype") -> str:
@@ -2704,6 +2721,7 @@ def _make_fp8_per_token_quant_kernel(
     in_dtype: str,
 ) -> Any:
     import tilelang.language as T
+    from tilelang.tileop.metal_quant import float_to_fp8_e4m3fn_bits
 
     T = cast(Any, T)
     g = globals()
@@ -2716,7 +2734,7 @@ def _make_fp8_per_token_quant_kernel(
     @T.prim_func
     def fp8_per_token_quant(
         x: T.Tensor((_SMFP8_PTQ_ROWS * _SMFP8_PTQ_K,), _SMFP8_PTQ_INPUT_DTYPE),
-        fp8: T.Tensor((_SMFP8_PTQ_ROWS * _SMFP8_PTQ_K,), "float8_e4m3"),
+        fp8: T.Tensor((_SMFP8_PTQ_ROWS * _SMFP8_PTQ_K,), "uint8"),
         scale: T.Tensor((_SMFP8_PTQ_ROWS,), "float32"),
     ):
         with T.Kernel(_SMFP8_PTQ_ROWS, threads=_SMFP8_PER_TOKEN_QUANT_THREADS) as row:
@@ -2737,7 +2755,7 @@ def _make_fp8_per_token_quant_kernel(
                 normalized = T.cast(x[base + k], "float32") / row_scale
                 normalized = T.max(normalized, T.cast(-448.0, "float32"))
                 normalized = T.min(normalized, T.cast(448.0, "float32"))
-                fp8[base + k] = T.cast(normalized, "float8_e4m3")
+                fp8[base + k] = float_to_fp8_e4m3fn_bits(normalized)
 
     return fp8_per_token_quant
 
@@ -3265,6 +3283,7 @@ def _prepared_fp8_bwd_ste(
 ) -> tuple[mx.array, mx.array] | None:
     """Run the Path C FP8 sparse-MLA backward over per-token prepared buffers."""
 
+    mx.eval(q_fp8, q_scale, kv_fp8, kv_scale, d_out, indices)
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
         q_scale,

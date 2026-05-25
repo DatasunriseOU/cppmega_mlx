@@ -37,6 +37,14 @@ import types
 
 import pytest
 
+from cppmega_mlx.nn._triton_bridge import (  # noqa: E402
+    TRITON_FRONTEND_PATH_ENV,
+    TritonBridgeError,
+    frontend_available,
+    triton_to_tilelang_prim,
+)
+
+_FRONTEND_AVAILABLE = frontend_available()
 _HAS_TORCH = importlib.util.find_spec("torch") is not None
 _CUDA_AVAILABLE = False
 if _HAS_TORCH:
@@ -54,16 +62,9 @@ if _HAS_TORCH:
 triton = pytest.importorskip("triton")
 import triton.language as tl  # noqa: E402  - depends on importorskip above
 
-from cppmega_mlx.nn._triton_bridge import (  # noqa: E402
-    TRITON_FRONTEND_PATH_ENV,
-    TritonBridgeError,
-    frontend_available,
-    triton_to_tilelang_prim,
-)
-
 
 pytestmark = pytest.mark.skipif(
-    not frontend_available(),
+    not _FRONTEND_AVAILABLE,
     reason=(
         "POC triton_frontend not importable from /private/tmp/tl_poc_review. "
         "Set CPPMEGA_MLX_TRITON_FRONTEND_PATH or clone tl_poc_review there."

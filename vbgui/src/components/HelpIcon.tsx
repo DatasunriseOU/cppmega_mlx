@@ -974,6 +974,14 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
     outputs: "y: (B, S, H).",
     normalization: "No norm; this is a pure residual add.",
   },
+  brick_embedding_table: {
+    title: "embedding_table — Standard token embedding and de-embedding projection table",
+    what: "Dual-role learned vocabulary lookup and output linear projection table. Maps token IDs (B, S) to vectors (B, S, H) at the input, and projects hidden states (B, S, H) back to vocabulary logits (B, S, V) at the output.",
+    why: "Every language model requires mapping discrete tokens to continuous representations at the input, and projecting them back to vocabulary probabilities at the output (frequently sharing/tying weights).",
+    inputs: "x: (B, S) token IDs at input, or (B, S, H) hidden states at output.",
+    outputs: "y: (B, S, H) embeddings at input, or (B, S, V) vocabulary logits at output.",
+    normalization: "Typically followed by Positional Embedding / RMSNorm.",
+  },
 
   // ----- Adapters -----
   adapter_merge_heads: {

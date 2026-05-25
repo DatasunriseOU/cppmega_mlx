@@ -32,6 +32,12 @@ from cppmega_v4.jsonrpc.tokenizer_methods import (
 from cppmega_v4.jsonrpc.data_methods import (
     PreviewParquetParams,
     preview_parquet,
+    ListCacheParams,
+    list_cache,
+    ClearCacheParams,
+    clear_cache,
+    ListDatasetCatalogParams,
+    list_dataset_catalog,
 )
 from cppmega_v4.jsonrpc.catalog_methods import (
     catalog_explain,
@@ -104,6 +110,10 @@ from cppmega_v4.jsonrpc.tokenizer_roundtrip_text_method import (
     TokenizerRoundtripTextParams,
     roundtrip_text,
 )
+from cppmega_v4.jsonrpc.path_explorer_methods import (
+    ListDirectoryParams, list_directory, ListDirectoryResult,
+    AnalyzeSourceParams, analyze_source,
+)
 from cppmega_v4.jsonrpc.schema import (
     BuildPresetSpecsParams,
     CatalogExplainParams,
@@ -166,6 +176,14 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
         HfQuickstartParams,
         lambda p, c: hf_quickstart_method(p, cache=c),
     ),
+    "data.list_directory": (
+        ListDirectoryParams,
+        lambda p, c: list_directory(p),
+    ),
+    "data.analyze_source": (
+        AnalyzeSourceParams,
+        lambda p, c: analyze_source(p),
+    ),
     "compile.trace": (
         CompileTraceParams,
         lambda p, c: compile_trace(p, cache=c),
@@ -209,6 +227,18 @@ _ROUTES: Mapping[str, tuple[type[BaseModel], _Handler]] = {
     "data.preview_parquet": (
         PreviewParquetParams,
         lambda p, c: preview_parquet(p, cache=c),
+    ),
+    "data.list_cache": (
+        ListCacheParams,
+        lambda p, c: list_cache(p, cache=c),
+    ),
+    "data.clear_cache": (
+        ClearCacheParams,
+        lambda p, c: clear_cache(p, cache=c),
+    ),
+    "data.list_dataset_catalog": (
+        ListDatasetCatalogParams,
+        lambda p, c: list_dataset_catalog(p, cache=c),
     ),
     "catalog.explain": (
         CatalogExplainParams,

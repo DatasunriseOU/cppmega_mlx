@@ -88,6 +88,7 @@ def _build_mlp(hidden_size: int, params: dict) -> nn.Module:
             self.post_norm = _make_norm(post_norm_kind, hidden_size, norm_eps)
 
         def __call__(self, x):
+            x_in = x
             if self.pre_norm is not None:
                 x = self.pre_norm(x)
             up = self.up(x)
@@ -103,7 +104,7 @@ def _build_mlp(hidden_size: int, params: dict) -> nn.Module:
                 y = self.down(mx.sigmoid(self.gate(x)) * up)
             if self.post_norm is not None:
                 y = self.post_norm(y)
-            return y
+            return x_in + y
     return _MLP()
 
 
@@ -336,6 +337,32 @@ def _build_mlstm(hidden_size: int, params: dict) -> nn.Module:
     return MLSTMBlock(cfg)
 
 
+class EmbeddingTableBlock(nn.Module):
+    """Dual-role input embedding lookup & output projection (de-embedder) table."""
+    def __init__(self, vocab_size: int, hidden_size: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # 1. Output de-embedding / Language Model head projection:
+        # If input has shape (B, S, H), project hidden states back to vocab logits (B, S, V).
+        if x.ndim == 3 and x.shape[-1] == self.hidden_size:
+            return mx.matmul(x, self.embedding.weight.T)
+        
+        # 2. Input embedding lookup:
+        # If input has shape (B, S) token IDs, run standard embedding.
+        if x.dtype not in (mx.int32, mx.int64):
+            x = x.astype(mx.int32)
+        return self.embedding(x)
+
+
+def _build_embedding_table(hidden_size: int, params: dict) -> nn.Module:
+    vocab_size = params.get("vocab_size", 65536)
+    return EmbeddingTableBlock(vocab_size=vocab_size, hidden_size=hidden_size)
+
+
 def _build_abs_pos_embed(hidden_size: int, params: dict) -> nn.Module:
     """Learned absolute positional embedding (GalCov-B). Gallery #1 GPT-2 XL."""
     from cppmega_v4.nn.abs_pos_embed import AbsPosEmbedBlock, AbsPosEmbedConfig
@@ -422,12 +449,31 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
     pre_norm_kind = params.get("pre_norm", "none")
     post_norm_kind = params.get("post_norm", "rmsnorm")
 
+    # KV sharing parameters
+    kv_sharing = params.get("kv_sharing", "none")
+    cache_compression = params.get("cache_compression", "none")
+    kv_lora_rank = params.get("kv_lora_rank", 128)
+    kv_producer_layer = params.get("kv_producer_layer", None)
+
+    if kv_sharing == "grouped":
+        num_key_value_heads = max(1, num_heads // 4)
+    else:
+        num_key_value_heads = num_heads
+
     class _SelfAttn(nn.Module):
         def __init__(self):
             super().__init__()
+            self.kv_sharing = kv_sharing
+            self.cache_compression = cache_compression
+            self.kv_lora_rank = kv_lora_rank
+            self.kv_producer_layer = kv_producer_layer
+            self.num_heads = num_heads
+            self.num_key_value_heads = num_key_value_heads
+            self.head_dim = head_dim
+
             self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
-            self.k_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
-            self.v_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
+            self.k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False)
+            self.v_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False)
             self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
             self.pre_norm = _make_norm(pre_norm_kind, hidden_size, norm_eps)
             # 'norm' alias preserves state-dict keys from earlier
@@ -436,13 +482,20 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             # Zero-init out so the block is identity at init.
             self.o_proj.weight = mx.zeros_like(self.o_proj.weight)
 
+            # Keep references for zero-copy sharing
+            self.last_k = None
+            self.last_v = None
+
         def __call__(
             self,
             x,
             mask=None,
             attention_mask=None,
             doc_attention_mask=None,
+            shared_k=None,
+            shared_v=None,
         ):
+            x_in = x
             mask = (
                 doc_attention_mask
                 if doc_attention_mask is not None
@@ -453,14 +506,40 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
             if self.pre_norm is not None:
                 x = self.pre_norm(x)
             B, S, _ = x.shape
-            q = self.q_proj(x).reshape(B, S, num_heads, head_dim)
-            k = self.k_proj(x).reshape(B, S, num_heads, head_dim)
-            v = self.v_proj(x).reshape(B, S, num_heads, head_dim)
+            q = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
             q = mx.transpose(q, (0, 2, 1, 3))
-            k = mx.transpose(k, (0, 2, 1, 3))
-            v = mx.transpose(v, (0, 2, 1, 3))
-            scale = head_dim ** -0.5
-            scores = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2))) * scale
+
+            if shared_k is None:
+                shared_k = getattr(self, "_shared_k", None)
+            if shared_v is None:
+                shared_v = getattr(self, "_shared_v", None)
+
+            if shared_k is not None and shared_v is not None:
+                k = shared_k
+                v = shared_v
+            else:
+                k = self.k_proj(x).reshape(B, S, self.num_key_value_heads, self.head_dim)
+                v = self.v_proj(x).reshape(B, S, self.num_key_value_heads, self.head_dim)
+                k = mx.transpose(k, (0, 2, 1, 3))
+                v = mx.transpose(v, (0, 2, 1, 3))
+
+            # Store references to projected tensors (zero-copy references)
+            self.last_k = k
+            self.last_v = v
+
+            # GQA head broadcasting
+            if self.num_key_value_heads != self.num_heads:
+                r = self.num_heads // self.num_key_value_heads
+                k_exp = mx.broadcast_to(k[:, :, None, :, :], (B, self.num_key_value_heads, r, S, self.head_dim))
+                v_exp = mx.broadcast_to(v[:, :, None, :, :], (B, self.num_key_value_heads, r, S, self.head_dim))
+                k_run = k_exp.reshape(B, self.num_heads, S, self.head_dim)
+                v_run = v_exp.reshape(B, self.num_heads, S, self.head_dim)
+            else:
+                k_run = k
+                v_run = v
+
+            scale = self.head_dim ** -0.5
+            scores = mx.matmul(q, mx.transpose(k_run, (0, 1, 3, 2))) * scale
             causal_mask = mx.tril(mx.ones((S, S), dtype=mx.bool_))
             if mask is None:
                 scores = mx.where(
@@ -492,12 +571,12 @@ def _build_attention(hidden_size: int, params: dict) -> nn.Module:
                     mask = mask[:, None, :, :]
                 scores = scores + mask.astype(scores.dtype)
             w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-            o = mx.matmul(w, v)
-            o = mx.transpose(o, (0, 2, 1, 3)).reshape(B, S, num_heads * head_dim)
+            o = mx.matmul(w, v_run)
+            o = mx.transpose(o, (0, 2, 1, 3)).reshape(B, S, self.num_heads * self.head_dim)
             o = self.o_proj(o)
             if self.norm is not None:
                 o = self.norm(o)
-            return o
+            return x_in + o
 
     return _SelfAttn()
 
@@ -623,6 +702,7 @@ BLOCK_BUILDERS: dict[str, Callable[[int, dict], nn.Module]] = {
     "mlstm": _build_mlstm,
     "abs_pos_embed": _build_abs_pos_embed,
     "per_layer_embed": _build_per_layer_embed,
+    "embedding_table": _build_embedding_table,
     # V7-Q13: standalone norm + residual primitives. Canvas treats
     # them as bricks; backend instantiation goes through these thin
     # wrappers so the kind resolves and parameter histograms work.

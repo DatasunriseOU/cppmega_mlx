@@ -13,26 +13,28 @@ export interface LLMGalleryWizardModalProps {
 }
 
 const PRESET_CANONICAL_DEFAULTS: Record<string, { H: number; layers: number; tokenizer: string }> = {
-  "llama3_8b": { H: 4096, layers: 32, tokenizer: "llama3_tiktoken" },
-  "llama3_2_1b": { H: 2048, layers: 16, tokenizer: "llama3_tiktoken" },
-  "llama3_2_3b": { H: 3072, layers: 28, tokenizer: "llama3_tiktoken" },
-  "smollm3": { H: 576, layers: 30, tokenizer: "smollm_sentencepiece" },
-  "phi4": { H: 3072, layers: 40, tokenizer: "phi4_tiktoken" },
-  "mistral_small_3_1": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
+  "llama3_8b": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
+  "llama3_2_1b": { H: 2048, layers: 16, tokenizer: "cppmega_native_65k" },
+  "llama3_2_3b": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+  "smollm3": { H: 576, layers: 30, tokenizer: "cppmega_native_65k" },
+  "phi4": { H: 3072, layers: 40, tokenizer: "cppmega_native_65k" },
+  "mistral_small_3_1": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
   "gpt2_xl": { H: 1600, layers: 48, tokenizer: "gpt2_tiktoken" },
-  "xlstm_7b": { H: 4096, layers: 36, tokenizer: "xlstm_custom" },
-  "deepseek_v4_flash": { H: 2048, layers: 16, tokenizer: "llama3_tiktoken" },
-  "deepseek_v3": { H: 4096, layers: 32, tokenizer: "llama3_tiktoken" },
-  "gemma4": { H: 2048, layers: 24, tokenizer: "llama3_tiktoken" },
-  "mistral4": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
-  "ling26": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-  "kimi_linear": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
-  "kimi_k2": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
-  "longcat": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-  "nemotron3": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
-  "zaya1": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-  "arcee_trinity": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-  "qwen3_next": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
+  "xlstm_7b": { H: 4096, layers: 36, tokenizer: "cppmega_native_65k" },
+  "deepseek_v4_flash": { H: 2048, layers: 16, tokenizer: "cppmega_native_65k" },
+  "deepseek_v3": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
+  "gemma4": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+  "mistral4": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
+  "ling26": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+  "kimi_linear": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+  "kimi_k2": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+  "longcat": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+  "nemotron3": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+  "zaya1": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+  "arcee_trinity": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+  "qwen3_next": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+  "gemma3_27b": { H: 5376, layers: 64, tokenizer: "cppmega_native_65k" },
+  "gemma3_270m": { H: 640, layers: 18, tokenizer: "cppmega_native_65k" },
 };
 
 export function LLMGalleryWizardModal({
@@ -40,7 +42,7 @@ export function LLMGalleryWizardModal({
 }: LLMGalleryWizardModalProps): JSX.Element | null {
   const [scale, setScale] = useState<"1" | "4" | "8" | "32">("32"); // default to 1/32 for fast local testing
   const [layers, setLayers] = useState<number>(4); // default lightweight layers
-  const [tokenizer, setTokenizer] = useState<string>("gpt2_tiktoken");
+  const [tokenizer, setTokenizer] = useState<string>("cppmega_native_65k");
 
   useEffect(() => {
     if (!presetName) return;
@@ -195,10 +197,11 @@ export function LLMGalleryWizardModal({
               outline: "none",
             }}
           >
-            <option value="gpt2_tiktoken">GPT-2 (Tiktoken BPE - 50k vocab)</option>
-            <option value="llama3_tiktoken">LLaMA 3 (Tiktoken BPE - 128k vocab)</option>
-            <option value="smollm_sentencepiece">SmolLM3 (Llama Tokenizer SP - 49k vocab)</option>
-            <option value="phi4_tiktoken">Phi-4 (Tiktoken - 100k vocab)</option>
+            <option value="cppmega_native_65k">cppmega Native (65k BPE vocab - Local repo)</option>
+            <option value="cppmega_v3">cppmega V3 (100k BPE vocab)</option>
+            <option value="gpt2_tiktoken">GPT-2 (50k BPE vocab)</option>
+            <option value="minimal_no_fim">Minimal (No FIM)</option>
+            <option value="fim_only">FIM Only</option>
           </select>
         </div>
 

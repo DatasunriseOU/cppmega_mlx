@@ -58,13 +58,40 @@ def dry_forward(
                 )
             modules[node.name] = builder(hidden_size, dict(node.params))
 
+        # V7-M0.3: deterministic synthetic input when a seed is given so
+        # MLX-vs-CUDA parity harness can compare logits bit-for-bit.
+        if seed is not None:
+            _key = mx.random.key(int(seed))
+            x0 = mx.random.normal(
+                shape=(batch, seq_len, hidden_size), key=_key)
+            token_ids = mx.random.randint(0, 1000, (batch, seq_len), key=_key)
+            doc_ids = mx.random.randint(0, 5, (batch, seq_len), key=_key)
+        else:
+            _key = None
+            x0 = mx.random.normal((batch, seq_len, hidden_size))
+            token_ids = mx.random.randint(0, 1000, (batch, seq_len))
+            doc_ids = mx.random.randint(0, 5, (batch, seq_len))
+
         def _call(mod: object, x: mx.array) -> mx.array:
             """Call a brick and coerce tuple/dict returns to a single array.
 
             Some bricks (mamba3, certain ssm wrappers) emit
             ``(activations, state)`` — take the first array-shaped element.
             """
-            out = mod(x)  # type: ignore[operator]
+            import inspect
+            kwargs = {}
+            if hasattr(mod, "__call__"):
+                try:
+                    sig_params = inspect.signature(mod.__call__).parameters
+                    if "token_ids" in sig_params:
+                        kwargs["token_ids"] = token_ids
+                    if "doc_ids" in sig_params:
+                        kwargs["doc_ids"] = doc_ids
+                    elif "document_ids" in sig_params:
+                        kwargs["document_ids"] = doc_ids
+                except Exception:
+                    pass
+            out = mod(x, **kwargs)  # type: ignore[operator]
             if isinstance(out, tuple) or isinstance(out, list):
                 for item in out:
                     if hasattr(item, "shape"):
@@ -85,21 +112,20 @@ def dry_forward(
                     f"with no .shape attribute",
                 )
             return out
-
-        # V7-M0.3: deterministic synthetic input when a seed is given so
-        # MLX-vs-CUDA parity harness can compare logits bit-for-bit.
-        if seed is not None:
-            _key = mx.random.key(int(seed))
-            x0 = mx.random.normal(
-                shape=(batch, seq_len, hidden_size), key=_key)
-        else:
-            x0 = mx.random.normal((batch, seq_len, hidden_size))
         # Topo: pre-compute predecessors map; if a node has multiple
         # predecessors, mean-reduce their outputs before forwarding.
         outputs: dict[str, mx.array] = {}
         roots = [n.name for n in graph.nodes if not graph.predecessors(n.name)]
         for name in roots:
-            outputs[name] = _call(modules[name], x0)
+            node = graph.by_name(name)
+            if node.kind == "embedding_table":
+                if seed is not None:
+                    x_root = mx.random.randint(0, 1000, (batch, seq_len), key=_key)
+                else:
+                    x_root = mx.random.randint(0, 1000, (batch, seq_len))
+            else:
+                x_root = x0
+            outputs[name] = _call(modules[name], x_root)
         # Iterate remaining nodes in declared order (graph is already a
         # topological declaration thanks to from_block_specs).
         for node in graph.nodes:
@@ -107,7 +133,14 @@ def dry_forward(
                 continue
             preds = graph.predecessors(node.name)
             if not preds:
-                outputs[node.name] = _call(modules[node.name], x0)
+                if node.kind == "embedding_table":
+                    if seed is not None:
+                        x_root = mx.random.randint(0, 1000, (batch, seq_len), key=_key)
+                    else:
+                        x_root = mx.random.randint(0, 1000, (batch, seq_len))
+                else:
+                    x_root = x0
+                outputs[node.name] = _call(modules[node.name], x_root)
                 continue
             if len(preds) == 1:
                 inp = outputs[preds[0]]
@@ -116,13 +149,18 @@ def dry_forward(
                 inp = mx.mean(stacked, axis=0)
             outputs[node.name] = _call(modules[node.name], inp)
 
-        last = graph.nodes[-1].name
-        y = outputs[last]
-        if y.shape != (batch, seq_len, hidden_size):
+        last_node = graph.nodes[-1]
+        y = outputs[last_node.name]
+        
+        expected_shape = (batch, seq_len, hidden_size)
+        if last_node.kind == "embedding_table":
+            vocab_size = last_node.params.get("vocab_size", 65536)
+            expected_shape = (batch, seq_len, vocab_size)
+            
+        if y.shape != expected_shape:
             return DryForwardResult(
                 verdict="shape_mismatch",
-                detail=f"final shape {y.shape} != "
-                       f"(batch={batch}, seq={seq_len}, H={hidden_size})",
+                detail=f"final shape {y.shape} != expected {expected_shape}",
             )
         # V7-M0.3: optionally surface the final-block activations as
         # the "logits proxy" for parity diffing. The graph passed here

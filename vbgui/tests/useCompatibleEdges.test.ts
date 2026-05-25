@@ -38,19 +38,26 @@ describe("makeIsValidConnection", () => {
     expect(isValid({ source: null, target: "y" })).toBe(false);
   });
 
-  it("always allows connection if source is tokenizer", () => {
+  it("only allows connection if source is tokenizer and target is embedding_table", () => {
     const isValid = makeIsValidConnection(
       new Set(["attention→mlp"]),
-      (id) => (id === "src" ? "tokenizer" : "attention"),
+      (id) => (id === "src" ? "tokenizer" : (id === "dst" ? "embedding_table" : "attention")),
     );
     expect(isValid({ source: "src", target: "dst" })).toBe(true);
+    expect(isValid({ source: "src", target: "other" })).toBe(false);
   });
 
-  it("always allows connection if target is detokenizer", () => {
+  it("only allows connection if target is detokenizer and source is embedding_table, mlp, linear_bridge, norm/proj", () => {
     const isValid = makeIsValidConnection(
       new Set(["attention→mlp"]),
       (id) => (id === "src" ? "mlp" : "detokenizer"),
     );
     expect(isValid({ source: "src", target: "dst" })).toBe(true);
+
+    const isValidInvalid = makeIsValidConnection(
+      new Set(["attention→mlp"]),
+      (id) => (id === "src" ? "attention" : "detokenizer"),
+    );
+    expect(isValidInvalid({ source: "src", target: "dst" })).toBe(false);
   });
 });

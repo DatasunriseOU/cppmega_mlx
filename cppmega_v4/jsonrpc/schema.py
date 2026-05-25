@@ -53,7 +53,7 @@ class JsonRpcResponse(BaseModel):
 
     jsonrpc: JsonRpcVersion = "2.0"
     id: str | int | None
-    result: dict[str, Any] | None = None
+    result: Any = None
     error: JsonRpcError | None = None
 
 
@@ -811,6 +811,8 @@ METHOD_REGISTRY: frozenset[str] = frozenset({
     "memory.matrix",
     "architectures.auto_fit",
     "data.hf_quickstart",
+    "data.list_directory",
+    "data.analyze_source",
     "compile.trace",
     "sync.check",
     "data.github_corpus",

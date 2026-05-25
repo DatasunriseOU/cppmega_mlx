@@ -224,6 +224,7 @@ def _brick_kind_of(module: nn.Module) -> str | None:
         "MLSTMBlock": "mlstm",
         "AbsPosEmbedBlock": "abs_pos_embed",
         "PerLayerEmbedBlock": "per_layer_embed",
+        "EmbeddingTableBlock": "embedding_table",
         # gdn / kda / nsa / csa_hca / moe / mlp / engram / attention /
         # lightning_indexer are local closures in unified_superblock_v4.py
         # so their _SelfAttn / _MLP class names aren't unique. Callers

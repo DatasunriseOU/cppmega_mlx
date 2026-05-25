@@ -2552,11 +2552,35 @@ def tilelang_single_entry_lowerer(
 
     prim_func = _single_entry_prim_func(func_or_mod)
     compiler = compile_prim_func or _compile_tilelang_prim_func
+    pass_configs = _tilelang_compile_pass_configs_for_prim_func(prim_func)
+    compile_kwargs: dict[str, Any] = {
+        "target": target,
+        "execution_backend": execution_backend,
+    }
+    if pass_configs:
+        compile_kwargs["pass_configs"] = pass_configs
     return compiler(
         prim_func,
-        target=target,
-        execution_backend=execution_backend,
+        **compile_kwargs,
     )
+
+
+def _tilelang_compile_pass_configs_for_prim_func(prim_func: Any) -> dict[str, Any]:
+    attr_value: Any | None = None
+    attrs = getattr(prim_func, "attrs", None)
+    if attrs is not None:
+        try:
+            attr_value = attrs.get("tilelang_pass_configs")
+        except AttributeError:
+            try:
+                attr_value = attrs["tilelang_pass_configs"]
+            except Exception:
+                attr_value = None
+    if attr_value is None:
+        attr_value = getattr(prim_func, "_cppmega_path_c_compile_pass_configs", None)
+    if not attr_value:
+        return {}
+    return dict(attr_value)
 
 
 def _single_entry_prim_func(func_or_mod: Any) -> Any:
@@ -2590,14 +2614,25 @@ def _compile_tilelang_prim_func(
     *,
     target: str,
     execution_backend: str,
+    pass_configs: Mapping[str, Any] | None = None,
 ) -> Any:
     import tilelang
 
-    return tilelang.compile(
-        prim_func,
-        target=target,
-        execution_backend=execution_backend,
-    )
+    if not pass_configs:
+        return tilelang.compile(
+            prim_func,
+            target=target,
+            execution_backend=execution_backend,
+        )
+
+    from tilelang import tvm
+
+    with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+        return tilelang.compile(
+            prim_func,
+            target=target,
+            execution_backend=execution_backend,
+        )
 
 
 def _tilelang_compile_plan_for(

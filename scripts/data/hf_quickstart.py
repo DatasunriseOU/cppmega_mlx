@@ -61,26 +61,76 @@ def hf_quickstart(
     Returns:
       HFQuickstartResult with parquet_path and counters.
     """
-    out_dir_p = Path(out_dir or "/tmp/vbgui")
-    out_dir_p.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir_p / f"{job_id or 'hf-quickstart'}.parquet"
+    import os
+    import json
+    
+    # 1. Resolve cache directory and construct a unique persistent filename
+    cache_base = Path(out_dir or os.environ.get("VBGUI_CACHE_DIR") or "/Users/dave/sources/cppmega.mlx/data/cache/datasets")
+    cache_base.mkdir(parents=True, exist_ok=True)
+    
+    dataset_clean = dataset_id.replace("/", "--").replace(" ", "_")
+    tokenizer_clean = tokenizer.replace("/", "--").replace(" ", "_").replace(".json", "")
+    
+    cache_filename = f"{dataset_clean}_{tokenizer_clean}_{n_tokens}_{split}_{text_field}.parquet"
+    cache_meta_filename = f"{dataset_clean}_{tokenizer_clean}_{n_tokens}_{split}_{text_field}.meta.json"
+    
+    out_path = cache_base / cache_filename
+    cache_meta_path = cache_base / cache_meta_filename
+    
+    # 2. Check if persistent Cache HIT is available
+    if out_path.exists() and cache_meta_path.exists():
+        try:
+            with open(cache_meta_path, "r") as f:
+                meta = json.load(f)
+            print(f"[hf_quickstart] Cache HIT! Loading persistent cached dataset: {out_path}", flush=True)
+            from cppmega_v4.runtime import data_event_bus as _db
+            if job_id is not None:
+                _db.publish(job_id, {"phase": "start", "dataset_id": dataset_id, "n_tokens_target": n_tokens})
+                _db.publish(job_id, {"phase": "progress", "n_docs": meta["n_docs"], "n_tokens": meta["n_tokens"]})
+                _db.publish(job_id, {
+                    "phase": "done",
+                    "parquet_path": str(out_path),
+                    "n_tokens": meta["n_tokens"],
+                    "n_docs": meta["n_docs"],
+                    "elapsed_ms": meta["elapsed_ms"]
+                })
+                _db.publish(job_id, None)
+            return HFQuickstartResult(
+                parquet_path=str(out_path),
+                n_tokens_written=meta["n_tokens"],
+                n_docs_seen=meta["n_docs"],
+                elapsed_ms=meta["elapsed_ms"]
+            )
+        except Exception as e:
+            print(f"[hf_quickstart] Failed to read cache metadata sidecar: {e}. Falling back to download.", flush=True)
 
-    # Resolve the tokenizer (presets first, then path).
+    # 3. Resolve the tokenizer (bundled presets first, then local files, then HF Hub)
+    from tokenizers import Tokenizer
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
-    if tokenizer == "cppmega_v3":
-        # Default bundled tokenizer
+    
+    if tokenizer in ("cppmega_v3", "cppmega_native_65k"):
         tok_path = (
             Path(__file__).parent.parent.parent
             / "cppmega_mlx" / "tokenizer" / "tokenizer.json")
+        tok = load_cppmega_tokenizer(tok_path)
     else:
         tok_path = Path(tokenizer)
-    if not tok_path.exists():
-        raise FileNotFoundError(f"tokenizer not found: {tok_path}")
-    tok = load_cppmega_tokenizer(tok_path)
+        if tok_path.exists():
+            tok = load_cppmega_tokenizer(tok_path)
+        else:
+            try:
+                # Try loading directly from HuggingFace Hub (supports gated tokenizers via HF_TOKEN)
+                token = os.environ.get("HF_TOKEN")
+                tok = Tokenizer.from_pretrained(tokenizer, token=token)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load tokenizer '{tokenizer}' from path or HuggingFace Hub: {e}"
+                )
 
-    # Stream the HF dataset.
+    # 4. Stream the HF dataset (authenticated with HF_TOKEN for SFT/math collections)
     from datasets import load_dataset
-    ds = load_dataset(dataset_id, split=split, streaming=True)
+    token = os.environ.get("HF_TOKEN")
+    ds = load_dataset(dataset_id, split=split, streaming=True, token=token)
 
     from cppmega_v4.runtime import data_event_bus as _db
     if job_id is not None:
@@ -129,6 +179,22 @@ def hf_quickstart(
     pq.write_table(table, out_path)
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Write cache metadata sidecar
+    try:
+        with open(cache_meta_path, "w") as f:
+            json.dump({
+                "dataset_id": dataset_id,
+                "tokenizer": tokenizer,
+                "n_tokens": total_tokens,
+                "n_docs": doc_idx,
+                "split": split,
+                "text_field": text_field,
+                "elapsed_ms": elapsed_ms
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[hf_quickstart] Failed to write cache metadata sidecar: {e}", flush=True)
+
     if job_id is not None:
         _db.publish(job_id, {"phase": "done",
                               "parquet_path": str(out_path),

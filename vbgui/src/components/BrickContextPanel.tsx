@@ -10,6 +10,7 @@ import { Tooltip } from "@/components/Tooltip";
 import { ExplainModal } from "@/components/ExplainModal";
 import { BRICKS, brickFor } from "@/lib/bricks";
 import { computeBrickDims, fmtParamCount } from "@/lib/brickDims";
+import { PathExplorer } from "./PathExplorer";
 
 const ACTIVATION_OPTIONS = [
   "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
@@ -184,6 +185,18 @@ export function BrickContextPanel({
       </header>
 
       <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+        {brickKind === "tokenizer" && (
+          <div style={{ marginBottom: 10 }}>
+            <PathExplorer
+              rpc={rpc}
+              initialPath={((draft.selected_path as string) || ".")}
+              onSelect={(path, type) => {
+                setDraft((d) => ({ ...d, selected_path: path, content_type: type }));
+              }}
+            />
+          </div>
+        )}
+
         {supportsAct && (
           <label style={FIELD}>
             <Tooltip rpc={rpc} category="activation" name={activation}
@@ -262,6 +275,115 @@ export function BrickContextPanel({
               </select>
             </label>
           </>
+        )}
+
+        {brickKind === "attention" && (
+          <fieldset style={{
+            border: "1px solid rgba(34, 211, 238, 0.15)",
+            borderRadius: 8,
+            padding: 12,
+            margin: "4px 0",
+            background: "rgba(0,0,0,0.15)"
+          }}>
+            <legend style={{ fontSize: 10, fontWeight: "bold", color: "#22d3ee", padding: "0 6px" }}>
+              ⚡ KV Cache & Compression Settings
+            </legend>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 4 }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 11 }}>
+                <span style={{ color: "#cbd5e1" }}>KV Cache Sharing</span>
+                <select
+                  data-testid="kv-cache-sharing-select"
+                  value={(draft.kv_sharing as string) || "none"}
+                  onChange={(e) => setField("kv_sharing", e.target.value)}
+                  style={{
+                    background: "rgba(15, 23, 42, 0.6)",
+                    color: "#f1f5f9",
+                    border: "1px solid rgba(255, 255, 255, 0.15)",
+                    borderRadius: 6,
+                    padding: "4px 8px",
+                    outline: "none",
+                    cursor: "pointer",
+                    fontSize: 12
+                  }}
+                >
+                  <option value="none">None (Standard)</option>
+                  <option value="grouped">Grouped-Query (GQA)</option>
+                  <option value="cross_layer">Cross-Layer (CLA)</option>
+                </select>
+              </label>
+
+              <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 11 }}>
+                <span style={{ color: "#cbd5e1" }}>Cache Compression</span>
+                <select
+                  data-testid="cache-compression-select"
+                  value={(draft.cache_compression as string) || "none"}
+                  onChange={(e) => setField("cache_compression", e.target.value)}
+                  style={{
+                    background: "rgba(15, 23, 42, 0.6)",
+                    color: "#f1f5f9",
+                    border: "1px solid rgba(255, 255, 255, 0.15)",
+                    borderRadius: 6,
+                    padding: "4px 8px",
+                    outline: "none",
+                    cursor: "pointer",
+                    fontSize: 12
+                  }}
+                >
+                  <option value="none">None</option>
+                  <option value="int4">INT4</option>
+                  <option value="int8">INT8</option>
+                  <option value="fp8">FP8</option>
+                  <option value="turbo_3bit">TurboQuant 3-bit</option>
+                  <option value="turbo_4bit">TurboQuant 4-bit</option>
+                </select>
+              </label>
+
+              {draft.kv_sharing === "cross_layer" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 11 }}>
+                    <span style={{ color: "#cbd5e1" }}>KV Producer Layer Index</span>
+                    <input
+                      data-testid="kv-producer-layer-input"
+                      type="number"
+                      min={0}
+                      value={(draft.kv_producer_layer as number) ?? 0}
+                      onChange={(e) => setField("kv_producer_layer", parseInt(e.target.value) || 0)}
+                      style={{
+                        background: "rgba(15, 23, 42, 0.6)",
+                        color: "#f1f5f9",
+                        border: "1px solid rgba(255, 255, 255, 0.15)",
+                        borderRadius: 6,
+                        padding: "4px 8px",
+                        outline: "none",
+                        fontSize: 12
+                      }}
+                    />
+                  </label>
+
+                  <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 11 }}>
+                    <span style={{ color: "#cbd5e1" }}>KV LoRA Compression Rank</span>
+                    <input
+                      data-testid="kv-lora-rank-input"
+                      type="number"
+                      min={8}
+                      max={512}
+                      value={(draft.kv_lora_rank as number) || 128}
+                      onChange={(e) => setField("kv_lora_rank", parseInt(e.target.value) || 128)}
+                      style={{
+                        background: "rgba(15, 23, 42, 0.6)",
+                        color: "#f1f5f9",
+                        border: "1px solid rgba(255, 255, 255, 0.15)",
+                        borderRadius: 6,
+                        padding: "4px 8px",
+                        outline: "none",
+                        fontSize: 12
+                      }}
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+          </fieldset>
         )}
 
         {/* Computed dimensions & parameter count */}

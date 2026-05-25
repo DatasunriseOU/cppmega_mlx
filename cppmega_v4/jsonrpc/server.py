@@ -273,6 +273,18 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
             except (asyncio.CancelledError, Exception):
                 pass
 
+    # V8-R10: Mount static visual builder build directory if present to serve GUI dynamically on a single port
+    import os
+    from pathlib import Path
+    from fastapi.staticfiles import StaticFiles
+
+    dist_dir = Path("/Users/dave/sources/cppmega.mlx/vbgui/dist")
+    if not dist_dir.exists():
+        dist_dir = Path(__file__).parent.parent.parent / "vbgui" / "dist"
+
+    if dist_dir.exists():
+        app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="static")
+
     return app
 
 

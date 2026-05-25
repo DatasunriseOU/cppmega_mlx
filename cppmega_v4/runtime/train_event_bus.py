@@ -23,6 +23,7 @@ from typing import Any
 
 _LOCK = threading.Lock()
 _QUEUES: dict[str, list[queue.Queue]] = {}
+_HISTORY: dict[str, list[Any]] = {}
 
 
 def publish(run_id: str | None, event: dict[str, Any] | None) -> None:
@@ -33,6 +34,8 @@ def publish(run_id: str | None, event: dict[str, Any] | None) -> None:
     if not run_id:
         return
     with _LOCK:
+        if event is not None:
+            _HISTORY.setdefault(run_id, []).append(event)
         subs = list(_QUEUES.get(run_id, []))
     for q in subs:
         try:
@@ -47,6 +50,13 @@ def subscribe(run_id: str) -> queue.Queue:
     q: queue.Queue = queue.Queue(maxsize=1024)
     with _LOCK:
         _QUEUES.setdefault(run_id, []).append(q)
+        # Replay all historical events to the new subscriber
+        hist = _HISTORY.get(run_id, [])
+        for event in hist:
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
     return q
 
 
@@ -57,12 +67,14 @@ def unsubscribe(run_id: str, q: queue.Queue) -> None:
             subs.remove(q)
         if not subs:
             _QUEUES.pop(run_id, None)
+            _HISTORY.pop(run_id, None)
 
 
 def reset() -> None:
     """Test helper — drop all subscribers."""
     with _LOCK:
         _QUEUES.clear()
+        _HISTORY.clear()
 
 
 def subscriber_count(run_id: str) -> int:

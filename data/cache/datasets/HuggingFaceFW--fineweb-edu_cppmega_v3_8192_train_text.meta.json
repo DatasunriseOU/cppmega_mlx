@@ -1,0 +1,9 @@
+{
+  "dataset_id": "HuggingFaceFW/fineweb-edu",
+  "tokenizer": "cppmega_v3",
+  "n_tokens": 9002,
+  "n_docs": 6,
+  "split": "train",
+  "text_field": "text",
+  "elapsed_ms": 2638.8267500151414
+}

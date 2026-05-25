@@ -515,6 +515,38 @@ _CONTRACTS: dict[str, BrickShapeContract] = {
         kv_cache_elems=_zero(),
         description="Per-layer scaled embedding (Gemma 4 E2B/E4B)",
     ),
+    "embedding_table": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=ShapeExpr(("65536 * H",)),
+        activations_elems=ShapeExpr(("B * S * H",)),
+        kv_cache_elems=_zero(),
+        description="Standard learned embedding / output de-embedding projection table",
+    ),
+    "rmsnorm": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=ShapeExpr(("H",)),
+        activations_elems=ShapeExpr(("B * S * H",)),
+        kv_cache_elems=_zero(),
+        description="Root-Mean-Square Normalization layer",
+    ),
+    "layernorm": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=ShapeExpr(("2 * H",)),
+        activations_elems=ShapeExpr(("B * S * H",)),
+        kv_cache_elems=_zero(),
+        description="Layer Normalization layer (scale + bias)",
+    ),
+    "residual": BrickShapeContract(
+        inputs={"x": _bsh()},
+        outputs={"y": _bsh()},
+        params_elems=_zero(),
+        activations_elems=_zero(),
+        kv_cache_elems=_zero(),
+        description="Residual skip-connection addition / identity passthrough",
+    ),
 }
 
 

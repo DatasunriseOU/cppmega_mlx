@@ -15,7 +15,9 @@ export interface UseRpcOptions {
   timeoutMs?: number;
 }
 
-const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
+const DEFAULT_BASE_URL = typeof window !== "undefined" && window.location && (window.location.protocol === "http:" || window.location.protocol === "https:")
+  ? window.location.origin
+  : "http://127.0.0.1:8765";
 
 /** Returns a stable RpcClient; manages a WS connection if requested. */
 export function useRpc(opts: UseRpcOptions = {}): RpcClient {

@@ -63,6 +63,7 @@ export const BRICKS: readonly BrickMeta[] = [
   { kind: "mlp",             label: "MLP",                 category: "norm_or_proj" },
   { kind: "abs_pos_embed",   label: "Abs Pos Embed",       category: "norm_or_proj" },
   { kind: "per_layer_embed", label: "Per-Layer Embed",     category: "norm_or_proj" },
+  { kind: "embedding_table", label: "Embedding Table",     category: "norm_or_proj" },
   // nonlinear_rnn
   { kind: "mlstm",           label: "mLSTM",               category: "nonlinear_rnn" },
   // io

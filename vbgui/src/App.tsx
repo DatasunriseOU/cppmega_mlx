@@ -88,8 +88,8 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
   const edges: Edge[] = [];
   let x = 60, y = 60;
 
-  // Prepend Tokenizer Node
-  const tokenizerName = `tokenizer_${nodes.length + 1}`;
+  // 1. Prepend Tokenizer Node
+  const tokenizerName = `tokenizer_1`;
   nodes.push({
     id: tokenizerName,
     type: "tokenizer_virtual",
@@ -99,6 +99,24 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
   let lastName: string | null = tokenizerName;
   x += 320;
 
+  // 2. Prepend Input Embedder (Embedding Table)
+  const embedderName = `input_embedder`;
+  nodes.push({
+    id: embedderName,
+    type: "brick",
+    position: { x, y },
+    data: { kind: "embedding_table", name: "input_embedder", params: { vocab_size: 65536 } } as any,
+  });
+  edges.push({
+    id: `${lastName}->${embedderName}`,
+    source: lastName,
+    target: embedderName,
+    data: { severity: "info" },
+  });
+  lastName = embedderName;
+  x += 220;
+
+  // 3. Main bricks from specs
   for (const s of specs) {
     const name = s.name ?? `${s.kind}_${nodes.length}`;
     nodes.push({
@@ -117,26 +135,42 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
     }
     lastName = name;
     x += 220;
-    if (x > 980) { x = 60; y += 140; }
+    if (x > 1100) { x = 60; y += 140; }
   }
 
-  // Append De-Tokenizer Node
-  const detokenizerName = `detokenizer_${nodes.length + 1}`;
+  // 4. Append Output De-embedder (Embedding Table)
+  const deembedderName = `output_deembedder`;
+  nodes.push({
+    id: deembedderName,
+    type: "brick",
+    position: { x, y },
+    data: { kind: "embedding_table", name: "output_deembedder", params: { vocab_size: 65536 } } as any,
+  });
+  if (lastName) {
+    edges.push({
+      id: `${lastName}->${deembedderName}`,
+      source: lastName,
+      target: deembedderName,
+      data: { severity: "info" },
+    });
+  }
+  lastName = deembedderName;
+  x += 220;
+
+  // 5. Append De-Tokenizer Node
+  const detokenizerName = `detokenizer_1`;
   nodes.push({
     id: detokenizerName,
     type: "detokenizer_virtual",
     position: { x: x + 100, y: y + 25 },
     data: { kind: "detokenizer", params: {} } as any,
   });
-
-  if (lastName) {
-    edges.push({
-      id: `${lastName}->${detokenizerName}`,
-      source: lastName,
-      target: detokenizerName,
-      data: { severity: "info" },
-    });
-  }
+  edges.push({
+    id: `${lastName}->${detokenizerName}`,
+    source: lastName,
+    target: detokenizerName,
+    data: { severity: "info" },
+  });
 
   return { nodes, edges };
 }
@@ -880,10 +914,10 @@ export function App(): JSX.Element {
     setNodes(ns);
     setEdges(es);
     setDimEnv((prev) => ({ ...prev, H: hidden_size }));
-    if (ns.length > 0) {
+    if (ns.length > 1) {
       dispatch({ type: "loss.set", loss: {
         ...spec.loss,
-        head_outputs: [ns[ns.length - 1].id],
+        head_outputs: [ns[ns.length - 2].id],
       }});
     }
   }, [spec.loss]);
@@ -919,26 +953,28 @@ export function App(): JSX.Element {
   const handleGenerateFromWizard = useCallback(async (name: string, options: WizardOptions) => {
     try {
       const PRESET_CANONICAL_DEFAULTS: Record<string, { H: number; layers: number; tokenizer: string }> = {
-        "llama3_8b": { H: 4096, layers: 32, tokenizer: "llama3_tiktoken" },
-        "llama3_2_1b": { H: 2048, layers: 16, tokenizer: "llama3_tiktoken" },
-        "llama3_2_3b": { H: 3072, layers: 28, tokenizer: "llama3_tiktoken" },
-        "smollm3": { H: 576, layers: 30, tokenizer: "smollm_sentencepiece" },
-        "phi4": { H: 3072, layers: 40, tokenizer: "phi4_tiktoken" },
-        "mistral_small_3_1": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
+        "llama3_8b": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
+        "llama3_2_1b": { H: 2048, layers: 16, tokenizer: "cppmega_native_65k" },
+        "llama3_2_3b": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+        "smollm3": { H: 576, layers: 30, tokenizer: "cppmega_native_65k" },
+        "phi4": { H: 3072, layers: 40, tokenizer: "cppmega_native_65k" },
+        "mistral_small_3_1": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
         "gpt2_xl": { H: 1600, layers: 48, tokenizer: "gpt2_tiktoken" },
-        "xlstm_7b": { H: 4096, layers: 36, tokenizer: "xlstm_custom" },
-        "deepseek_v4_flash": { H: 2048, layers: 16, tokenizer: "llama3_tiktoken" },
-        "deepseek_v3": { H: 4096, layers: 32, tokenizer: "llama3_tiktoken" },
-        "gemma4": { H: 2048, layers: 24, tokenizer: "llama3_tiktoken" },
-        "mistral4": { H: 4096, layers: 32, tokenizer: "mistral_tiktoken" },
-        "ling26": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-        "kimi_linear": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
-        "kimi_k2": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
-        "longcat": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-        "nemotron3": { H: 3072, layers: 28, tokenizer: "gpt2_tiktoken" },
-        "zaya1": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-        "arcee_trinity": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
-        "qwen3_next": { H: 2048, layers: 24, tokenizer: "gpt2_tiktoken" },
+        "xlstm_7b": { H: 4096, layers: 36, tokenizer: "cppmega_native_65k" },
+        "deepseek_v4_flash": { H: 2048, layers: 16, tokenizer: "cppmega_native_65k" },
+        "deepseek_v3": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
+        "gemma4": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+        "mistral4": { H: 4096, layers: 32, tokenizer: "cppmega_native_65k" },
+        "ling26": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+        "kimi_linear": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+        "kimi_k2": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+        "longcat": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+        "nemotron3": { H: 3072, layers: 28, tokenizer: "cppmega_native_65k" },
+        "zaya1": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+        "arcee_trinity": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+        "qwen3_next": { H: 2048, layers: 24, tokenizer: "cppmega_native_65k" },
+        "gemma3_27b": { H: 5376, layers: 64, tokenizer: "cppmega_native_65k" },
+        "gemma3_270m": { H: 640, layers: 18, tokenizer: "cppmega_native_65k" },
       };
       
       const defaults = PRESET_CANONICAL_DEFAULTS[name] || { H: 2048, layers: 12, tokenizer: "gpt2_tiktoken" };
@@ -971,15 +1007,21 @@ export function App(): JSX.Element {
       setDimEnv((prev) => ({ ...prev, H: calculatedH }));
       
       let tokenizerPath = "cppmega_mlx/tokenizer/tokenizer.json";
-      if (options.tokenizer === "gpt2_tiktoken") {
+      if (options.tokenizer === "cppmega_v3") {
+        tokenizerPath = "tests/fixtures/tokenizers/T1_cppmega_v3.json";
+      } else if (options.tokenizer === "gpt2_tiktoken") {
         tokenizerPath = "tests/fixtures/tokenizers/T2_gpt2_small.json";
+      } else if (options.tokenizer === "minimal_no_fim") {
+        tokenizerPath = "tests/fixtures/tokenizers/T3_minimal_no_fim.json";
+      } else if (options.tokenizer === "fim_only") {
+        tokenizerPath = "tests/fixtures/tokenizers/T4_fim_only.json";
       }
       setTrainTokenizerPath(tokenizerPath);
       
-      if (ns.length > 0) {
+      if (ns.length > 1) {
         dispatch({ type: "loss.set", loss: {
           ...spec.loss,
-          head_outputs: [ns[ns.length - 1].id],
+          head_outputs: [ns[ns.length - 2].id],
         }});
       }
       
@@ -1062,10 +1104,10 @@ export function App(): JSX.Element {
       // accepts the freshly-loaded preset (which doesn't define a node
       // literally named "logits"). User can change this later via the
       // Loss tab.
-      if (ns.length > 0) {
+      if (ns.length > 1) {
         dispatch({ type: "loss.set", loss: {
           ...spec.loss,
-          head_outputs: [ns[ns.length - 1].id],
+          head_outputs: [ns[ns.length - 2].id],
         }});
       }
       // V8-R01: auto-fill the Optim/Schedule tabs from paper-anchored
@@ -1644,12 +1686,20 @@ export function App(): JSX.Element {
           tokens: debugState.tokens,
           onPromptChange: (val: string) => debugState.setPrompt(val),
           isActiveNode,
+          selectedPath: (n.data?.params?.selected_path as string) || null,
+          contentType: (n.data?.params?.content_type as string) || null,
+          progressPercent: lastEvent?.dataset_progress?.progress_percent || 0,
+          tokenOffset: lastEvent?.dataset_progress?.token_offset || 0,
+          downloadSpeed: lastEvent?.dataset_progress?.download_speed || null,
         };
       } else if (n.type === "detokenizer_virtual") {
         isActiveNode = debugState.debuggerMode && debugState.activeStep === K + 1;
         additionalData = {
           direction: debugState.direction,
           isActiveNode,
+          generatedText: lastEvent?.generated_text || null,
+          outputToken: lastEvent?.output_token || null,
+          mtp_logits: lastEvent?.mtp_logits || null,
         };
       } else if (isModel && gradNorm !== undefined) {
         additionalData = {
@@ -1671,6 +1721,10 @@ export function App(): JSX.Element {
 
     if (!debugState.debuggerMode) return enriched;
 
+    const realTokenizer = nodes.find((n) => n.type === "tokenizer_virtual");
+    const selectedPath = realTokenizer?.data?.params?.selected_path || null;
+    const contentType = realTokenizer?.data?.params?.content_type || null;
+
     const minX = modelNodes.length > 0 ? Math.min(...modelNodes.map((n) => n.position.x)) : 100;
     const firstNode = modelNodes[0];
     const tokenizerY = firstNode ? firstNode.position.y + 65 - 110 : 200;
@@ -1684,6 +1738,11 @@ export function App(): JSX.Element {
         prompt: debugState.prompt,
         tokens: debugState.tokens,
         onPromptChange: (val: string) => debugState.setPrompt(val),
+        selectedPath,
+        contentType,
+        progressPercent: lastEvent?.dataset_progress?.progress_percent || 0,
+        tokenOffset: lastEvent?.dataset_progress?.token_offset || 0,
+        downloadSpeed: lastEvent?.dataset_progress?.download_speed || null,
       } as any,
       draggable: false,
       selectable: false,
@@ -1702,6 +1761,9 @@ export function App(): JSX.Element {
       data: {
         isActiveNode: debugState.activeStep === K + 1,
         direction: debugState.direction,
+        generatedText: lastEvent?.generated_text || null,
+        outputToken: lastEvent?.output_token || null,
+        mtp_logits: lastEvent?.mtp_logits || null,
       } as any,
       draggable: false,
       selectable: false,

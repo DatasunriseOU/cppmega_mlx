@@ -61,6 +61,7 @@ _CATEGORY_BY_KIND: dict[str, str] = {
     "mlstm": "nonlinear_rnn",
     "abs_pos_embed": "norm_or_proj",
     "per_layer_embed": "norm_or_proj",
+    "embedding_table": "norm_or_proj",
     # cross attention drafter
     "gemma4_drafter": "cross_attn",
     # MTP block — opaque, treat like attention for fusion purposes
