@@ -286,6 +286,23 @@ def _build_optimizer(spec: OptimSpec) -> object:
     if spec.kind is OptimKind.SGD:
         g = spec.groups[0]
         return optim.SGD(learning_rate=g.lr, weight_decay=g.weight_decay)
+    if spec.kind is OptimKind.ADAM:
+        g = spec.groups[0]
+        return optim.Adam(
+            learning_rate=g.lr,
+            betas=list(g.betas) if g.betas is not None else [0.9, 0.999],
+        )
+    if spec.kind is OptimKind.ADAFACTOR:
+        g = spec.groups[0]
+        return optim.Adafactor(
+            learning_rate=g.lr,
+            weight_decay=g.weight_decay,
+        )
+    if spec.kind is OptimKind.RMSPROP:
+        g = spec.groups[0]
+        return optim.RMSprop(
+            learning_rate=g.lr,
+        )
     if spec.kind is OptimKind.MUON_ADAMW_HYBRID:
         # MultiOptimizer in mlx.optimizers takes a list of (predicate, opt).
         # We don't have per-param predicates here without inspecting the

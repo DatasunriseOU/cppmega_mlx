@@ -22,7 +22,7 @@ export interface OptimTabProps {
 const KINDS: OptimKind[] = [
   "adamw", "muon", "muon_adamw_hybrid",
   "lion", "lion8bit", "adam8bit",
-  "sgd",
+  "sgd", "adam", "adafactor", "rmsprop",
 ];
 
 export const RECOMMENDED_LR: Record<OptimKind, number> = {
@@ -33,6 +33,9 @@ export const RECOMMENDED_LR: Record<OptimKind, number> = {
   lion8bit:          1e-4,
   adam8bit:          3e-4,
   sgd:               1e-2,
+  adam:              3e-4,
+  adafactor:         1e-2,
+  rmsprop:           1e-3,
 };
 
 const DEFAULT_NEW_GROUP: ParamGroupState = {

@@ -12,16 +12,24 @@ from cppmega_mlx.nn.activations import (
 from cppmega_v4.explain import get_entry
 
 
-def test_activation_names_have_ten_entries():
+def test_activation_names_have_eleven_entries():
     assert set(ACTIVATION_NAMES) == {
-        "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+        "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
         "swiglu", "geglu", "reglu", "xielu",
     }
 
 
-def test_gated_set_has_four_entries():
+def test_gated_set_has_five_entries():
     gated = {n for n, g in IS_GATED.items() if g}
-    assert gated == {"swiglu", "geglu", "reglu", "xielu"}
+    assert gated == {"glu", "swiglu", "geglu", "reglu", "xielu"}
+
+
+def test_glu_forward_matches_reference():
+    x = mx.random.normal((2, 4), key=mx.random.key(0))
+    g = mx.random.normal((2, 4), key=mx.random.key(1))
+    got = apply_activation("glu", x, gate=g)
+    expected = mx.sigmoid(g) * x
+    assert mx.allclose(got, expected).item()
 
 
 def test_mish_is_dense():

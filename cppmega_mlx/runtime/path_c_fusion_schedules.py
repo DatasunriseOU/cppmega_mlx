@@ -1395,6 +1395,8 @@ def build_path_c_descriptor_prim_func(
             "tilelang_pass_configs",
             compile_pass_configs,
         )
+    if validated_loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
+        prim_func = prim_func.with_attr("tl.fusion.disable_tir_simplify", True)
     owner_output_param_indices = tuple(range(len(physical_abi_plan.param_lines)))
     if owner_output_param_indices:
         prim_func = prim_func.with_attr(
@@ -1465,11 +1467,11 @@ def _descriptor_tilelang_compile_pass_configs(
     if loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
         configs["tl.disable_thread_storage_sync"] = True
         configs["tirx.merge_static_smem"] = False
+        configs["tirx.disable_cse_tir"] = True
     if (
         loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
         and any(descriptor.op_name.endswith("_bwd") for descriptor in descriptors)
     ):
-        configs["tirx.disable_cse_tir"] = True
         configs["tirx.disable_storage_rewrite"] = True
     return configs
 

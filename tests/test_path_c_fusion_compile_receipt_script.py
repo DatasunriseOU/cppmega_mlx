@@ -240,6 +240,9 @@ def test_compile_receipt_records_native_lowerer_artifact(tmp_path: Path) -> None
     assert payload["cache_key_recompile_audit"]["second"]["native_compile_ok"] is True
     assert payload["generated_source"]["compile_pass_configs"] == {
         "tirx.disable_cse_tir": True,
+        "tirx.disable_storage_rewrite": True,
+        "tirx.merge_static_smem": False,
+        "tl.disable_thread_storage_sync": True,
     }
     chain_compile = payload["direct_logical_abi_alternative"][
         "direct_chained_fusion_native_compile"
@@ -379,20 +382,24 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         "path_c_uint8_abi_bank",
         "path_c_int32_abi_bank",
     ]
-    assert smoke["kernel_parameter_count"] == 3
+    assert smoke["kernel_parameter_count"] == 6
     assert smoke["logical_parameter_count"] > smoke["kernel_parameter_count"]
     assert smoke["total_buffer_bytes"] < smoke["max_buffer_bytes"]
-    assert [entry["name"] for entry in smoke["buffer_abi"]] == [
+    assert [entry["name"] for entry in smoke["buffer_abi"][:3]] == [
         "path_c_float32_abi_bank",
         "path_c_uint8_abi_bank",
         "path_c_int32_abi_bank",
     ]
-    assert [entry["dtype"] for entry in smoke["buffer_abi"]] == [
+    assert {entry["name"] for entry in smoke["buffer_abi"][3:]} == {
+        "route_0_M_bwd_mamba3_h_steps",
+        "route_2_A_qkv_projection_indices",
+    }
+    assert [entry["dtype"] for entry in smoke["buffer_abi"][:3]] == [
         "float32",
         "uint8",
         "int32",
     ]
-    assert captured["arg_count"] == 3
+    assert captured["arg_count"] == len(smoke["buffer_abi"])
     assert captured["arg_shapes"] == [
         tuple(entry["shape"]) for entry in smoke["buffer_abi"]
     ]

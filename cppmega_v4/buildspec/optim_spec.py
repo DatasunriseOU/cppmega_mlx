@@ -31,6 +31,9 @@ class OptimKind(str, Enum):
     LION_8BIT          = "lion8bit"
     ADAM_8BIT          = "adam8bit"
     SGD                = "sgd"
+    ADAM               = "adam"
+    ADAFACTOR          = "adafactor"
+    RMSPROP            = "rmsprop"
 
 
 # Sign-based Lion updates scale ONLY by the sign of momentum, so a large
@@ -350,6 +353,56 @@ def adam8bit(
 
 
 # ---------------------------------------------------------------------------
+# Spec Factories for new MLX Optimizers
+# ---------------------------------------------------------------------------
+
+
+def adam(
+    lr: float = 3e-4,
+    weight_decay: float = 0.0,
+    betas: tuple[float, float] = (0.9, 0.999),
+    *,
+    gradient_clip_norm: float | None = 1.0,
+) -> OptimSpec:
+    """Single-group standard Adam (no weight decay by default)."""
+    return OptimSpec(
+        kind=OptimKind.ADAM,
+        groups=(
+            ParamGroup(matcher="all", lr=lr, weight_decay=weight_decay,
+                       betas=betas),
+        ),
+        gradient_clip_norm=gradient_clip_norm,
+    )
+
+
+def adafactor(
+    lr: float = 1e-2,
+    weight_decay: float = 0.0,
+    *,
+    gradient_clip_norm: float | None = 1.0,
+) -> OptimSpec:
+    """Single-group Adafactor spec."""
+    return OptimSpec(
+        kind=OptimKind.ADAFACTOR,
+        groups=(ParamGroup(matcher="all", lr=lr, weight_decay=weight_decay),),
+        gradient_clip_norm=gradient_clip_norm,
+    )
+
+
+def rmsprop(
+    lr: float = 1e-3,
+    *,
+    gradient_clip_norm: float | None = 1.0,
+) -> OptimSpec:
+    """Single-group RMSprop spec."""
+    return OptimSpec(
+        kind=OptimKind.RMSPROP,
+        groups=(ParamGroup(matcher="all", lr=lr, weight_decay=0.0),),
+        gradient_clip_norm=gradient_clip_norm,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry — used by Stage E / GUI dropdown
 # ---------------------------------------------------------------------------
 
@@ -362,6 +415,9 @@ OPTIM_BUILTINS: dict[str, str] = {
     "lion8bit":           "cppmega_v4.buildspec.optim_spec:lion8bit",
     "adam8bit":           "cppmega_v4.buildspec.optim_spec:adam8bit",
     "sgd":                "cppmega_v4.buildspec.optim_spec:sgd",
+    "adam":               "cppmega_v4.buildspec.optim_spec:adam",
+    "adafactor":          "cppmega_v4.buildspec.optim_spec:adafactor",
+    "rmsprop":            "cppmega_v4.buildspec.optim_spec:rmsprop",
 }
 
 
@@ -379,4 +435,7 @@ __all__ = [
     "muon",
     "muon_adamw_hybrid",
     "sgd",
+    "adam",
+    "adafactor",
+    "rmsprop",
 ]

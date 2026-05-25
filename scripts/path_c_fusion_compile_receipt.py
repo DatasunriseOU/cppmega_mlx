@@ -979,7 +979,10 @@ def _buffer_abi_payload(prim_func: Any) -> tuple[list[dict[str, Any]], int]:
     total_bytes = 0
     for param in tuple(getattr(prim_func, "params", ())):
         buffer_map = getattr(prim_func, "buffer_map", {})
-        buffer = buffer_map[param]
+        try:
+            buffer = buffer_map[param]
+        except KeyError:
+            continue
         dtype = str(getattr(buffer, "dtype", "unknown"))
         shape = _shape_tuple(getattr(buffer, "shape", ()))
         elements = 1

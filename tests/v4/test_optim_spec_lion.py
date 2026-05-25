@@ -36,15 +36,17 @@ from cppmega_mlx.nn.activations import (
 # ---------------------------------------------------------------------------
 
 
-def test_optim_kind_has_seven_entries():
+def test_optim_kind_has_ten_entries():
     expected = {"adamw", "muon", "muon_adamw_hybrid",
-                "lion", "lion8bit", "adam8bit", "sgd"}
+                "lion", "lion8bit", "adam8bit", "sgd",
+                "adam", "adafactor", "rmsprop"}
     assert {k.value for k in OptimKind} == expected
 
 
-def test_optim_builtins_registers_all_seven():
+def test_optim_builtins_registers_all_ten():
     for kind in ("adamw", "muon", "muon_adamw_hybrid",
-                 "lion", "lion8bit", "adam8bit", "sgd"):
+                 "lion", "lion8bit", "adam8bit", "sgd",
+                 "adam", "adafactor", "rmsprop"):
         assert kind in OPTIM_BUILTINS
         assert OPTIM_BUILTINS[kind].endswith(f":{kind}")
 
@@ -160,16 +162,16 @@ def test_existing_factories_unchanged(factory):
 # ---------------------------------------------------------------------------
 
 
-def test_activation_names_contains_ten_entries():
-    # E7-13 extended the set from 6 → 10 (added mish + geglu/reglu/xielu).
+def test_activation_names_contains_eleven_entries():
+    # E7-13 extended the set from 6 → 10 (added mish + geglu/reglu/xielu), and we now added glu (11 total).
     assert set(ACTIVATION_NAMES) == {
-        "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+        "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
         "swiglu", "geglu", "reglu", "xielu",
     }
 
 
-def test_is_gated_four_gated_six_dense():
-    for name in ("swiglu", "geglu", "reglu", "xielu"):
+def test_is_gated_five_gated_six_dense():
+    for name in ("glu", "swiglu", "geglu", "reglu", "xielu"):
         assert is_gated(name) is True
     for name in ("gelu", "relu", "relu2", "sqrelu", "silu", "mish"):
         assert is_gated(name) is False

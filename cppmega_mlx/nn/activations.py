@@ -23,19 +23,20 @@ import mlx.nn as nn
 
 
 ActivationName = Literal[
-    "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+    "glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
     "swiglu", "geglu", "reglu", "xielu",
 ]
-"""Recognised activation names — E7-12 + E7-13 set (10 entries).
+"""Recognised activation names — E7-12 + E7-13 set + glu (11 entries).
 
 Gated entries (require a ``gate`` companion projection):
-  swiglu, geglu, reglu, xielu.
+  glu, swiglu, geglu, reglu, xielu.
 Dense entries (single projection input):
   gelu, relu, relu2, sqrelu, silu, mish.
 """
 
 
 IS_GATED: Final[dict[str, bool]] = {
+    "glu":    True,
     "gelu":   False,
     "relu":   False,
     "relu2":  False,
@@ -87,6 +88,9 @@ def apply_activation(
             f"{name!r} is dense and rejects a `gate` argument"
         )
 
+    if name == "glu":
+        assert gate is not None
+        return mx.sigmoid(gate) * x
     if name == "gelu":
         return nn.gelu_approx(x)
     if name == "relu":

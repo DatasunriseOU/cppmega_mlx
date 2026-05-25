@@ -10,10 +10,10 @@ import type { OptimState, LossState } from "@/state/spec";
 type AblationAxis = "activation" | "optimizer" | "norm" | "schedule";
 
 const VARIANTS_PER_AXIS: Record<AblationAxis, string[]> = {
-  activation: ["glu", "swiglu", "gelu", "relu", "relu2", "silu",
-               "mish", "geglu", "reglu"],
+  activation: ["glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+               "swiglu", "geglu", "reglu", "xielu"],
   optimizer:  ["adamw", "muon", "muon_adamw_hybrid", "lion",
-               "lion8bit", "adam8bit", "sgd"],
+               "lion8bit", "adam8bit", "sgd", "adam", "adafactor", "rmsprop"],
   norm:       ["rmsnorm", "layernorm", "none"],
   schedule:   ["constant", "cosine", "linear_warmup", "wsd",
                "inv_sqrt", "polynomial"],

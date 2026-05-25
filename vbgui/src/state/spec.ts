@@ -14,7 +14,8 @@ export interface LossState {
 }
 
 export type OptimKind = "adamw" | "muon" | "muon_adamw_hybrid"
-                       | "lion" | "lion8bit" | "adam8bit" | "sgd";
+                       | "lion" | "lion8bit" | "adam8bit" | "sgd"
+                       | "adam" | "adafactor" | "rmsprop";
 
 export type ScheduleKind = "constant" | "linear_warmup" | "cosine"
                           | "wsd" | "inv_sqrt" | "polynomial";

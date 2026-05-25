@@ -6,6 +6,8 @@ import {
   BaseEdge,
   EdgeLabelRenderer,
   getBezierPath,
+  Handle,
+  Position,
   type Edge,
   type Node,
   type NodeTypes,
@@ -45,12 +47,53 @@ export interface FlowCanvasProps {
   onEdgesChange?: OnEdgesChange;
 }
 
+// Beautiful custom glowing residual addition (+) node component
+export function ResidualAddNode({ id }: { id: string }): JSX.Element {
+  return (
+    <div
+      role="region"
+      aria-label="residual addition convergence node"
+      data-testid={`brick-node-${id}`}
+      style={{
+        width: 38,
+        height: 38,
+        borderRadius: "50%",
+        background: "rgba(16, 185, 129, 0.12)", // emerald tint
+        backdropFilter: "blur(8px)",
+        border: "2px solid rgba(16, 185, 129, 0.6)", // emerald border
+        boxShadow: "0 0 10px rgba(16, 185, 129, 0.4)", // emerald glow
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "#10b981", // emerald text
+        fontSize: 20,
+        fontWeight: 800,
+        fontFamily: "var(--vb-font-mono, monospace)",
+        position: "relative",
+      }}
+    >
+      <Handle
+        type="target"
+        position={Position.Left}
+        style={{ background: "#10b981", width: 6, height: 6, border: "none" }}
+      />
+      <span>+</span>
+      <Handle
+        type="source"
+        position={Position.Right}
+        style={{ background: "#10b981", width: 6, height: 6, border: "none" }}
+      />
+    </div>
+  );
+}
+
 const NODE_TYPES: NodeTypes = {
   brick: BrickNode as unknown as NodeTypes[string],
   adapter: AdapterNode as unknown as NodeTypes[string],
   loss_ghost: LossGhostNode as unknown as NodeTypes[string],
   tokenizer_virtual: TokenizerVirtualNode as unknown as NodeTypes[string],
   detokenizer_virtual: DetokenizerVirtualNode as unknown as NodeTypes[string],
+  residual_add: ResidualAddNode as unknown as NodeTypes[string],
 };
 
 // 1. High-fidelity custom MidpointEdge component matching the visual builder mockup.

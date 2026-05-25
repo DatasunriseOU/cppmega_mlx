@@ -177,10 +177,50 @@ _OPTIMIZER_ENTRIES = [
         gotchas=("No fp32 master weights → bf16 underflow during update",
                  "Sensitive to lr scaling; pair with linear_warmup"),
     ),
+    ExplainEntry(
+        category="optimizer", name="adam",
+        summary="Standard Adam (adaptive moment estimation without weight decay).",
+        when_to_use="Classic default when weight decay is not desired or handled separately.",
+        when_to_avoid="When weight decay is preferred for regularization (use AdamW instead).",
+        recommended_params={"lr": 3e-4, "betas": (0.9, 0.999)},
+        paper_ref="Kingma & Ba, 2014",
+        paper_url="https://arxiv.org/abs/1412.6980",
+        gotchas=("Can lead to model overfitting without proper regularization",),
+    ),
+    ExplainEntry(
+        category="optimizer", name="adafactor",
+        summary="Adafactor optimizer with sublinear memory footprint.",
+        when_to_use="Large transformer training where Adam state memory dominates.",
+        when_to_avoid="Small models where standard AdamW converges more stably.",
+        recommended_params={"lr": 1e-2, "weight_decay": 0.0},
+        paper_ref="Shazeer & Stern, 2018",
+        paper_url="https://arxiv.org/abs/1804.04235",
+        gotchas=("Requires different learning rate scaling than AdamW",),
+    ),
+    ExplainEntry(
+        category="optimizer", name="rmsprop",
+        summary="RMSprop (Root Mean Square Propagation).",
+        when_to_use="Recurrent neural networks, LSTMs, or specific reinforcement learning tasks.",
+        when_to_avoid="Transformer pretraining where AdamW/Muon converge much faster.",
+        recommended_params={"lr": 1e-3},
+        paper_ref="Tieleman & Hinton, 2012",
+        paper_url=None,
+        gotchas=("Lacks momentum by default, might get stuck in local minima",),
+    ),
 ]
 
 
 _ACTIVATION_ENTRIES = [
+    ExplainEntry(
+        category="activation", name="glu",
+        summary="Gated Linear Unit (Dauphin et al. 2016).",
+        when_to_use="High-performance gated structure where linear output is modulated by a sigmoid-gated channel.",
+        when_to_avoid="Hardware constraints where dual projection gating is too memory/flops-heavy.",
+        recommended_params={},
+        paper_ref="Dauphin et al., 2016",
+        paper_url="https://arxiv.org/abs/1612.08083",
+        gotchas=("Requires gate companion projection (doubles projection parameter count)",),
+    ),
     ExplainEntry(
         category="activation", name="gelu",
         summary="Gaussian Error Linear Unit (Hendrycks & Gimpel 2016).",

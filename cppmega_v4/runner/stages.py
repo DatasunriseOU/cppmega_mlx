@@ -3119,6 +3119,12 @@ def _build_optimizer(
         )
     if kind is OptimKind.SGD:
         return optim.SGD(learning_rate=base_lr), "sgd"
+    if kind is OptimKind.ADAM:
+        return optim.Adam(learning_rate=base_lr), "adam"
+    if kind is OptimKind.ADAFACTOR:
+        return optim.Adafactor(learning_rate=base_lr), "adafactor"
+    if kind is OptimKind.RMSPROP:
+        return optim.RMSprop(learning_rate=base_lr), "rmsprop"
     raise ValueError(f"unknown OptimKind {kind!r}")
 
 

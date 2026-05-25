@@ -81,6 +81,7 @@ interface BrickSpec {
   kind: string;
   name?: string;
   params?: Record<string, unknown>;
+  parallel?: BrickSpec[];
 }
 
 function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] } {
@@ -118,24 +119,75 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
 
   // 3. Main bricks from specs
   for (const s of specs) {
-    const name = s.name ?? `${s.kind}_${nodes.length}`;
-    nodes.push({
-      id: name,
-      type: "brick",
-      position: { x, y },
-      data: { kind: s.kind, params: s.params ?? {} } as never,
-    });
-    if (lastName) {
-      edges.push({
-        id: `${lastName}->${name}`,
-        source: lastName,
-        target: name,
-        data: { severity: "info" },
+    if (s.parallel && Array.isArray(s.parallel)) {
+      const branches = s.parallel;
+      const branchNames: string[] = [];
+      
+      branches.forEach((b, idx) => {
+        const name = b.name ?? `${b.kind}_${nodes.length}`;
+        branchNames.push(name);
+        
+        const offsetMultiplier = idx - (branches.length - 1) / 2;
+        const branchY = y + offsetMultiplier * 140;
+        
+        nodes.push({
+          id: name,
+          type: "brick",
+          position: { x, y: branchY },
+          data: { kind: b.kind, params: b.params ?? {} } as never,
+        });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${name}`,
+            source: lastName,
+            target: name,
+            data: { severity: "info" },
+          });
+        }
       });
+      
+      x += 220;
+      const addNodeName = `residual_add_${nodes.length}`;
+      nodes.push({
+        id: addNodeName,
+        type: "residual_add",
+        position: { x, y },
+        data: { kind: "residual_add", params: {} } as any,
+      });
+      
+      branchNames.forEach((name) => {
+        edges.push({
+          id: `${name}->${addNodeName}`,
+          source: name,
+          target: addNodeName,
+          data: { severity: "info" },
+        });
+      });
+      
+      lastName = addNodeName;
+      x += 220;
+    } else {
+      const name = s.name ?? `${s.kind}_${nodes.length}`;
+      nodes.push({
+        id: name,
+        type: "brick",
+        position: { x, y },
+        data: { kind: s.kind, params: s.params ?? {} } as never,
+      });
+      if (lastName) {
+        edges.push({
+          id: `${lastName}->${name}`,
+          source: lastName,
+          target: name,
+          data: { severity: "info" },
+        });
+      }
+      lastName = name;
+      x += 220;
     }
-    lastName = name;
-    x += 220;
-    if (x > 1100) { x = 60; y += 140; }
+    
+    if (x > 1100) { x = 60; y += 180; }
   }
 
   // 4. Append Output De-embedder (Embedding Table)
@@ -913,7 +965,20 @@ export function App(): JSX.Element {
       scaledSpecs as unknown as BrickSpec[]);
     setNodes(ns);
     setEdges(es);
-    setDimEnv((prev) => ({ ...prev, H: hidden_size }));
+    
+    let snappedDimEnv = { ...MINI_DIM_ENV, H: hidden_size };
+    for (const s of scaledSpecs) {
+      if (s.params) {
+        const p = s.params as Record<string, any>;
+        if (typeof p.num_heads === "number") snappedDimEnv.nh = p.num_heads;
+        else if (typeof p.num_attention_heads === "number") snappedDimEnv.nh = p.num_attention_heads;
+        if (typeof p.head_dim === "number") snappedDimEnv.head_dim = p.head_dim;
+        if (typeof p.num_key_value_heads === "number") snappedDimEnv.nkv = p.num_key_value_heads;
+        if (typeof p.num_experts === "number") snappedDimEnv.num_experts = p.num_experts;
+        if (typeof p.top_k === "number") snappedDimEnv.top_k = p.top_k;
+      }
+    }
+    setDimEnv(snappedDimEnv);
     if (ns.length > 1) {
       dispatch({ type: "loss.set", loss: {
         ...spec.loss,
@@ -1004,7 +1069,19 @@ export function App(): JSX.Element {
       setEdges(es);
       setActivePreset(name);
       
-      setDimEnv((prev) => ({ ...prev, H: calculatedH }));
+      let snappedDimEnv = { ...MINI_DIM_ENV, H: calculatedH };
+      for (const s of r.specs) {
+        if (s.params) {
+          const p = s.params as Record<string, any>;
+          if (typeof p.num_heads === "number") snappedDimEnv.nh = p.num_heads;
+          else if (typeof p.num_attention_heads === "number") snappedDimEnv.nh = p.num_attention_heads;
+          if (typeof p.head_dim === "number") snappedDimEnv.head_dim = p.head_dim;
+          if (typeof p.num_key_value_heads === "number") snappedDimEnv.nkv = p.num_key_value_heads;
+          if (typeof p.num_experts === "number") snappedDimEnv.num_experts = p.num_experts;
+          if (typeof p.top_k === "number") snappedDimEnv.top_k = p.top_k;
+        }
+      }
+      setDimEnv(snappedDimEnv);
       
       let tokenizerPath = "cppmega_mlx/tokenizer/tokenizer.json";
       if (options.tokenizer === "cppmega_v3") {
@@ -1030,6 +1107,7 @@ export function App(): JSX.Element {
         const validOptimKinds: ReadonlyArray<string> = [
           "adamw", "muon", "muon_adamw_hybrid",
           "lion", "lion8bit", "adam8bit", "sgd",
+          "adam", "adafactor", "rmsprop",
         ];
         const validScheduleKinds: ReadonlyArray<string> = [
           "constant", "linear_warmup", "cosine",
@@ -1118,6 +1196,7 @@ export function App(): JSX.Element {
         const validOptimKinds: ReadonlyArray<string> = [
           "adamw", "muon", "muon_adamw_hybrid",
           "lion", "lion8bit", "adam8bit", "sgd",
+          "adam", "adafactor", "rmsprop",
         ];
         const validScheduleKinds: ReadonlyArray<string> = [
           "constant", "linear_warmup", "cosine",
