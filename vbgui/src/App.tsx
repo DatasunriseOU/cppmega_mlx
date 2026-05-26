@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
-  ReactFlowProvider, type Edge, type Node,
+  ReactFlowProvider, Position, type Edge, type Node,
   applyNodeChanges, applyEdgeChanges,
   type OnNodesChange, type OnEdgesChange,
 } from "@xyflow/react";
 
 import { FlowCanvas } from "@/components/FlowCanvas";
 import { type ResearchHook } from "./components/sidebar/ResearchHooksTab";
-import { layoutFlow } from "@/lib/elk";
 import { GalleryTab } from "@/components/GalleryTab";
 import { GalleryScaleDownSlider } from "@/components/GalleryScaleDownSlider";
 import { FeatureInjectionBar,
@@ -88,28 +87,186 @@ interface BrickSpec {
   block_specs?: BrickSpec[];
 }
 
-function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] } {
+function sortNodesSequentially(nodes: Node[], edges: Edge[]): Node[] {
+  const adj = new Map<string, string[]>();
+  const inDegree = new Map<string, number>();
+  
+  nodes.forEach(n => {
+    adj.set(n.id, []);
+    inDegree.set(n.id, 0);
+  });
+  
+  edges.forEach(e => {
+    if (adj.has(e.source) && adj.has(e.target)) {
+      adj.get(e.source)!.push(e.target);
+      inDegree.set(e.target, inDegree.get(e.target)! + 1);
+    }
+  });
+  
+  let startNode = nodes.find(n => n.type === "tokenizer_virtual" || n.id === "tokenizer_1");
+  if (!startNode) {
+    startNode = nodes.find(n => inDegree.get(n.id) === 0);
+  }
+  if (!startNode && nodes.length > 0) {
+    startNode = nodes[0];
+  }
+  
+  if (!startNode) return nodes;
+  
+  const sorted: Node[] = [];
+  const visited = new Set<string>();
+  const queue: string[] = [startNode.id];
+  visited.add(startNode.id);
+  
+  while (queue.length > 0) {
+    const currId = queue.shift()!;
+    const node = nodes.find(n => n.id === currId);
+    if (node) sorted.push(node);
+    
+    const neighbors = adj.get(currId) || [];
+    // Sort neighbors: brick blocks first, residual_add last
+    neighbors.sort((a, b) => {
+      const na = nodes.find(n => n.id === a);
+      const nb = nodes.find(n => n.id === b);
+      if (na?.type === "residual_add" && nb?.type !== "residual_add") return 1;
+      if (nb?.type === "residual_add" && na?.type !== "residual_add") return -1;
+      return 0;
+    });
+    
+    neighbors.forEach(neigh => {
+      if (!visited.has(neigh)) {
+        visited.add(neigh);
+        queue.push(neigh);
+      }
+    });
+  }
+  
+  // Append any nodes that might be disconnected to avoid dropping them
+  nodes.forEach(n => {
+    if (!visited.has(n.id)) {
+      sorted.push(n);
+    }
+  });
+  
+  return sorted;
+}
+
+function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
+  let x = 80;
+  let y = 140; // give some space at the top
+  const dy = 280; // Plenty of vertical spacing to prevent herringbone overlap between rows
+  const x_start = 80;
+  
+  let row_width = 1180; // Beautiful wide row width fitting standard screens
+  if (canvasWidth && canvasWidth > 600) {
+    row_width = Math.max(1180, canvasWidth - 160);
+  } else if (typeof document !== "undefined") {
+    const container = document.querySelector('[data-testid="flow-canvas"]');
+    if (container) {
+      const w = container.getBoundingClientRect().width;
+      if (w > 600) {
+        row_width = Math.max(1180, w - 160);
+      }
+    }
+  }
+
+  let direction = 1; // 1 = left-to-right, -1 = right-to-left
+  
+  const RESIDUAL_KINDS = new Set([
+    'attention', 'mlp', 'moe', 'mlstm', 'engram', 'gdn', 'kda', 'gated_attention', 
+    'mla', 'mla_absorb', 'rmsnorm', 'csa_hca', 'lightning_indexer', 'dsv4_attention'
+  ]);
+
+  const getNodeWidth = (n: Node): number => {
+    if (n.type === "tokenizer_virtual" || n.type === "detokenizer_virtual") return 320;
+    if (n.type === "block_group") return 270;
+    if (n.type === "residual_add") return 100;
+    if (n.type === "adapter") return 180;
+    if (n.type === "loss_ghost") return 220;
+    return 220; // default brick
+  };
+  
+  return nodes.map((node, index) => {
+    const nextNode = nodes[index + 1];
+    const isResidualActiveBranch = RESIDUAL_KINDS.has((node.data as any)?.kind || "") && nextNode?.type === "residual_add";
+    
+    // Spacing for current node
+    const curDx = getNodeWidth(node);
+    
+    // Preemptive wrap check for 2-column wide herringbone structures
+    if (isResidualActiveBranch) {
+      const nextDx = getNodeWidth(nextNode);
+      const totalBranchDx = curDx + nextDx;
+      if (direction === 1 && x + totalBranchDx > row_width) {
+        direction = -1;
+        y += dy;
+      } else if (direction === -1 && x - totalBranchDx < x_start) {
+        direction = 1;
+        y += dy;
+      }
+    }
+    
+    let nodeX = x;
+    let nodeY = y;
+    
+    if (isResidualActiveBranch) {
+      // Shift active branch vertically (up by 85px)
+      nodeY = y - 85;
+    }
+    
+    // Determine dynamic handle positions based on Boustrophedon direction
+    const targetPosition = direction === 1 ? Position.Left : Position.Right;
+    const sourcePosition = direction === 1 ? Position.Right : Position.Left;
+    
+    // Advance x/y for the next node
+    if (direction === 1) {
+      if (x + curDx > row_width) {
+        direction = -1;
+        y += dy;
+      } else {
+        x += curDx;
+      }
+    } else {
+      if (x - curDx < x_start) {
+        direction = 1;
+        y += dy;
+      } else {
+        x -= curDx;
+      }
+    }
+    
+    return {
+      ...node,
+      position: { x: nodeX, y: nodeY },
+      data: {
+        ...node.data as any,
+        targetPosition,
+        sourcePosition,
+      }
+    };
+  });
+}
+
+function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
-  let x = 60, y = 60;
 
   // 1. Prepend Tokenizer Node
   const tokenizerName = `tokenizer_1`;
   nodes.push({
     id: tokenizerName,
     type: "tokenizer_virtual",
-    position: { x, y: y + 25 },
+    position: { x: 0, y: 0 },
     data: { kind: "tokenizer", params: {} } as any,
   });
   let lastName: string | null = tokenizerName;
-  x += 320;
 
   // 2. Prepend Input Embedder (Embedding Table)
   const embedderName = `input_embedder`;
   nodes.push({
     id: embedderName,
     type: "brick",
-    position: { x, y },
+    position: { x: 0, y: 0 },
     data: { kind: "embedding_table", name: "input_embedder", params: { vocab_size: 65536 } } as any,
   });
   edges.push({
@@ -119,146 +276,73 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
     data: { severity: "info" },
   });
   lastName = embedderName;
-  x += 220;
 
-  // 3. Main bricks from specs
   const RESIDUAL_KINDS = new Set([
     'attention', 'mlp', 'moe', 'mlstm', 'engram', 'gdn', 'kda', 'gated_attention', 
     'mla', 'mla_absorb', 'rmsnorm', 'csa_hca', 'lightning_indexer', 'dsv4_attention'
   ]);
 
-  for (const s of specs) {
-    const repeats = s.repeats ?? 1;
-    if (repeats > 1 || s.kind === "block_group") {
-      const name = s.name ?? `${s.kind}_group_${nodes.length}`;
-      const block_specs = s.block_specs ?? [{ kind: s.kind, params: s.params ?? {} }];
-      const label = s.label ?? (s.block_specs ? `[${s.block_specs.map(b => b.kind).join(" + ")}]` : `[${s.kind}]`);
+  // Identify repeating unit U for automatic visual stack folding
+  let unitSize = specs.length;
+  for (let i = 0; i < specs.length; i++) {
+    const name = specs[i].name || "";
+    if (name.includes("_rep")) {
+      unitSize = i;
+      break;
+    }
+  }
 
-      nodes.push({
-        id: name,
-        type: "block_group",
-        position: { x, y },
-        data: {
-          label,
-          repeats,
-          block_specs,
-        } as any,
-      });
+  const hasRepetitions = unitSize < specs.length && (specs.length % unitSize === 0);
+  const repeatsCount = hasRepetitions ? (specs.length / unitSize) : 1;
 
-      if (lastName) {
-        edges.push({
-          id: `${lastName}->${name}`,
-          source: lastName,
-          target: name,
-          data: { severity: "info" },
-        });
-      }
-      lastName = name;
-      x += 220;
-    } else if (s.parallel && Array.isArray(s.parallel)) {
-      const branches = s.parallel;
-      const branchNames: string[] = [];
-      
-      branches.forEach((b, idx) => {
-        const name = b.name ?? `${b.kind}_${nodes.length}`;
-        branchNames.push(name);
-        
-        const offsetMultiplier = idx - (branches.length - 1) / 2;
-        const branchY = y + offsetMultiplier * 140;
-        
+  // 3. Main bricks from specs (folded by default if repeating layer stack is detected)
+  if (hasRepetitions && repeatsCount > 1) {
+    const groupName = `block_group_${nodes.length}`;
+    const unitSpecs = specs.slice(0, unitSize);
+    
+    const kinds = unitSpecs.map(s => s.kind);
+    const uniqueKinds = Array.from(new Set(kinds));
+    const label = `[${uniqueKinds.map(k => k.toUpperCase()).join(" + ")}]`;
+
+    nodes.push({
+      id: groupName,
+      type: "block_group",
+      position: { x: 0, y: 0 },
+      data: {
+        label,
+        repeats: repeatsCount,
+        block_specs: unitSpecs,
+      } as any,
+    });
+
+    if (lastName) {
+      edges.push({
+        id: `${lastName}->${groupName}`,
+        source: lastName,
+        target: groupName,
+        data: { severity: "info" },
+      });
+    }
+    lastName = groupName;
+  } else {
+    for (const s of specs) {
+      const repeats = s.repeats ?? 1;
+      if (repeats > 1 || s.kind === "block_group") {
+        const name = s.name ?? `${s.kind}_group_${nodes.length}`;
+        const block_specs = s.block_specs ?? [{ kind: s.kind, params: s.params ?? {} }];
+        const label = s.label ?? (s.block_specs ? `[${s.block_specs.map(b => b.kind).join(" + ")}]` : `[${s.kind}]`);
+
         nodes.push({
           id: name,
-          type: "brick",
-          position: { x, y: branchY },
-          data: { kind: b.kind, params: b.params ?? {} } as never,
+          type: "block_group",
+          position: { x: 0, y: 0 },
+          data: {
+            label,
+            repeats,
+            block_specs,
+          } as any,
         });
-        
-        if (lastName) {
-          edges.push({
-            id: `${lastName}->${name}`,
-            source: lastName,
-            target: name,
-            data: { severity: "info" },
-          });
-        }
-      });
-      
-      x += 220;
-      const addNodeName = `residual_add_${nodes.length}`;
-      nodes.push({
-        id: addNodeName,
-        type: "residual_add",
-        position: { x, y },
-        data: { kind: "residual_add", params: {} } as any,
-      });
-      
-      branchNames.forEach((name) => {
-        edges.push({
-          id: `${name}->${addNodeName}`,
-          source: name,
-          target: addNodeName,
-          data: { severity: "info" },
-        });
-      });
-      
-      lastName = addNodeName;
-      x += 220;
-    } else {
-      const isResidual = RESIDUAL_KINDS.has(s.kind);
-      if (isResidual) {
-        const name = s.name ?? `${s.kind}_${nodes.length}`;
-        nodes.push({
-          id: name,
-          type: "brick",
-          position: { x, y: y - 100 },
-          data: { kind: s.kind, params: s.params ?? {} } as never,
-        });
-        
-        if (lastName) {
-          edges.push({
-            id: `${lastName}->${name}`,
-            source: lastName,
-            target: name,
-            data: { severity: "info" },
-          });
-        }
-        
-        x += 220;
-        
-        const addNodeName = `residual_add_${nodes.length}`;
-        nodes.push({
-          id: addNodeName,
-          type: "residual_add",
-          position: { x, y },
-          data: { kind: "residual_add", params: {} } as any,
-        });
-        
-        edges.push({
-          id: `${name}->${addNodeName}`,
-          source: name,
-          target: addNodeName,
-          data: { severity: "info" },
-        });
-        
-        if (lastName) {
-          edges.push({
-            id: `${lastName}->${addNodeName}`,
-            source: lastName,
-            target: addNodeName,
-            data: { severity: "info" },
-          });
-        }
-        
-        lastName = addNodeName;
-        x += 220;
-      } else {
-        const name = s.name ?? `${s.kind}_${nodes.length}`;
-        nodes.push({
-          id: name,
-          type: "brick",
-          position: { x, y },
-          data: { kind: s.kind, params: s.params ?? {} } as never,
-        });
+
         if (lastName) {
           edges.push({
             id: `${lastName}->${name}`,
@@ -268,11 +352,114 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
           });
         }
         lastName = name;
-        x += 220;
+      } else if (s.parallel && Array.isArray(s.parallel)) {
+        const branches = s.parallel;
+        const branchNames: string[] = [];
+        
+        branches.forEach((b) => {
+          const name = b.name ?? `${b.kind}_${nodes.length}`;
+          branchNames.push(name);
+          
+          nodes.push({
+            id: name,
+            type: "brick",
+            position: { x: 0, y: 0 },
+            data: { kind: b.kind, params: b.params ?? {} } as never,
+          });
+          
+          if (lastName) {
+            edges.push({
+              id: `${lastName}->${name}`,
+              source: lastName,
+              target: name,
+              data: { severity: "info" },
+            });
+          }
+        });
+        
+        const addNodeName = `residual_add_${nodes.length}`;
+        nodes.push({
+          id: addNodeName,
+          type: "residual_add",
+          position: { x: 0, y: 0 },
+          data: { kind: "residual_add", params: {} } as any,
+        });
+        
+        branchNames.forEach((name) => {
+          edges.push({
+            id: `${name}->${addNodeName}`,
+            source: name,
+            target: addNodeName,
+            data: { severity: "info" },
+          });
+        });
+        
+        lastName = addNodeName;
+      } else {
+        const isResidual = RESIDUAL_KINDS.has(s.kind);
+        if (isResidual) {
+          const name = s.name ?? `${s.kind}_${nodes.length}`;
+          nodes.push({
+            id: name,
+            type: "brick",
+            position: { x: 0, y: 0 },
+            data: { kind: s.kind, params: s.params ?? {} } as never,
+          });
+          
+          if (lastName) {
+            edges.push({
+              id: `${lastName}->${name}`,
+              source: lastName,
+              target: name,
+              data: { severity: "info" },
+            });
+          }
+          
+          const addNodeName = `residual_add_${nodes.length}`;
+          nodes.push({
+            id: addNodeName,
+            type: "residual_add",
+            position: { x: 0, y: 0 },
+            data: { kind: "residual_add", params: {} } as any,
+          });
+          
+          edges.push({
+            id: `${name}->${addNodeName}`,
+            source: name,
+            target: addNodeName,
+            data: { severity: "info" },
+          });
+          
+          if (lastName) {
+            edges.push({
+              id: `${lastName}->${addNodeName}`,
+              source: lastName,
+              target: addNodeName,
+              data: { severity: "info" },
+            });
+          }
+          
+          lastName = addNodeName;
+        } else {
+          const name = s.name ?? `${s.kind}_${nodes.length}`;
+          nodes.push({
+            id: name,
+            type: "brick",
+            position: { x: 0, y: 0 },
+            data: { kind: s.kind, params: s.params ?? {} } as never,
+          });
+          if (lastName) {
+            edges.push({
+              id: `${lastName}->${name}`,
+              source: lastName,
+              target: name,
+              data: { severity: "info" },
+            });
+          }
+          lastName = name;
+        }
       }
     }
-    
-    if (x > 1100) { x = 60; y += 180; }
   }
 
   // 4. Append Output De-embedder (Embedding Table)
@@ -280,7 +467,7 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
   nodes.push({
     id: deembedderName,
     type: "brick",
-    position: { x, y },
+    position: { x: 0, y: 0 },
     data: { kind: "embedding_table", name: "output_deembedder", params: { vocab_size: 65536 } } as any,
   });
   if (lastName) {
@@ -292,14 +479,13 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
     });
   }
   lastName = deembedderName;
-  x += 220;
 
   // 5. Append De-Tokenizer Node
   const detokenizerName = `detokenizer_1`;
   nodes.push({
     id: detokenizerName,
     type: "detokenizer_virtual",
-    position: { x: x + 100, y: y + 25 },
+    position: { x: 0, y: 0 },
     data: { kind: "detokenizer", params: {} } as any,
   });
   edges.push({
@@ -309,7 +495,11 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
     data: { severity: "info" },
   });
 
-  return { nodes, edges };
+  // Run the premium Snake Layout over the topologically sorted nodes!
+  const sorted = sortNodesSequentially(nodes, edges);
+  const layouted = applySnakeLayout(sorted, canvasWidth);
+
+  return { nodes: layouted, edges };
 }
 
 interface WorkspaceTab {
@@ -360,6 +550,24 @@ const getSavedActiveTabId = (): string => {
 };
 
 export function App(): JSX.Element {
+  const [canvasWidth, setCanvasWidth] = useState<number>(1180);
+
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const container = document.querySelector('[data-testid="flow-canvas"]');
+    if (!container) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect.width;
+        if (w > 600) {
+          setCanvasWidth(w);
+        }
+      }
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
   const [tabs, setTabs] = useState<WorkspaceTab[]>(getSavedTabs);
   const [activeTabId, setActiveTabId] = useState<string>(getSavedActiveTabId);
   const isSwitchingRef = useRef<boolean>(false);
@@ -1049,7 +1257,7 @@ export function App(): JSX.Element {
     _num_layers: number,
   ) => {
     const { nodes: ns, edges: es } = presetSpecsToNodes(
-      scaledSpecs as unknown as BrickSpec[]);
+      scaledSpecs as unknown as BrickSpec[], canvasWidth);
     setNodes(ns);
     setEdges(es);
     
@@ -1072,7 +1280,7 @@ export function App(): JSX.Element {
         head_outputs: [ns[ns.length - 2].id],
       }});
     }
-  }, [spec.loss]);
+  }, [spec.loss, canvasWidth]);
 
   const handleAutoAlign = useCallback(async (customNodes?: Node[], customEdges?: Edge[]) => {
     try {
@@ -1080,27 +1288,13 @@ export function App(): JSX.Element {
       const activeEdges = customEdges ?? edges;
       if (activeNodes.length === 0) return;
       
-      const preparedNodes = activeNodes.map((node) => {
-        const isAdapter = node.type === "adapter";
-        return {
-          ...node,
-          width: node.width ?? (isAdapter ? 140 : 180),
-          height: node.height ?? (isAdapter ? 45 : 75),
-        };
-      });
-
-      const { nodes: layouted } = await layoutFlow(preparedNodes as Node[], activeEdges, {
-        "elk.layered.spacing.nodeNodeBetweenLayers": "100",
-        "elk.spacing.nodeNode": "80",
-        "elk.layered.considerModelOrder.strategy": "PREFER_EDGES",
-        "elk.separateConnectedComponents": "true",
-        "elk.componentLayoutSpacing": "80",
-      });
+      const sorted = sortNodesSequentially(activeNodes, activeEdges);
+      const layouted = applySnakeLayout(sorted, canvasWidth);
       setNodes(layouted);
     } catch (err) {
       console.error("Auto align layout failed:", err);
     }
-  }, [nodes, edges]);
+  }, [nodes, edges, canvasWidth]);
 
   const handleUnpackBlockGroup = useCallback(async (groupId: string, countToUnpack: number) => {
     const groupNode = nodes.find(n => n.id === groupId);
@@ -1317,7 +1511,7 @@ export function App(): JSX.Element {
       
       console.log(`[Preset Load: ${name}] Loading preset specs from backend...`);
       console.log(`[Preset Load: ${name}] Specs:`, r.specs);
-      const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
+      const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs, canvasWidth);
       console.log(`[Preset Load: ${name}] Generated ${ns.length} nodes:`, ns.map(n => n.id));
       console.log(`[Preset Load: ${name}] Generated ${es.length} edges:`, es.map(e => `${e.source} -> ${e.target}`));
       
@@ -1405,7 +1599,7 @@ export function App(): JSX.Element {
     } catch (e) {
       setRunError(e);
     }
-  }, [rpc, spec.loss, spec.optim, setDimEnv, setTrainTokenizerPath, handleAutoAlign]);
+  }, [rpc, spec.loss, spec.optim, setDimEnv, setTrainTokenizerPath, handleAutoAlign, canvasWidth]);
 
   const handlePresetDrop = useCallback(async (name: string) => {
     try {
@@ -1427,7 +1621,7 @@ export function App(): JSX.Element {
       );
       console.log(`[Preset Drop: ${name}] Loading preset specs from backend...`);
       console.log(`[Preset Drop: ${name}] Specs:`, r.specs);
-      const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs);
+      const { nodes: ns, edges: es } = presetSpecsToNodes(r.specs, canvasWidth);
       console.log(`[Preset Drop: ${name}] Generated ${ns.length} nodes:`, ns.map(n => n.id));
       console.log(`[Preset Drop: ${name}] Generated ${es.length} edges:`, es.map(e => `${e.source} -> ${e.target}`));
       setNodes(ns);
@@ -1491,7 +1685,7 @@ export function App(): JSX.Element {
     } catch (e) {
       setRunError(e);
     }
-  }, [rpc, spec.loss, spec.optim, dimEnv, handleAutoAlign]);
+  }, [rpc, spec.loss, spec.optim, dimEnv, handleAutoAlign, canvasWidth]);
 
   const handlePresetSelect = useCallback(async (name: string) => {
     const isTest = typeof process !== "undefined" && process.env.NODE_ENV === "test";
@@ -3019,7 +3213,7 @@ export function App(): JSX.Element {
                     { preset_name: preset, hidden_size: dimEnv.H ?? 128 },
                   );
                   const { nodes: ns, edges: es } = presetSpecsToNodes(
-                    r.specs);
+                    r.specs, canvasWidth);
                   const verifyParams = {
                     graph: { nodes: ns.map((n) => ({
                                  id: n.id,
@@ -3098,7 +3292,7 @@ export function App(): JSX.Element {
                   "build_preset_specs",
                   { preset_name: presetName, hidden_size: H });
                 const { nodes: ns, edges: es } = presetSpecsToNodes(
-                  r.specs);
+                  r.specs, canvasWidth);
                 // Honest dim_env: scale nh with H so nh*head_dim = H
                 // (avoids the F56b warning during the sweep itself).
                 const sweepDimEnv: Record<string, number> = {

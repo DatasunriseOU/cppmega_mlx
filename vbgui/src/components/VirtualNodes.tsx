@@ -211,7 +211,7 @@ export function TokenizerVirtualNode({ data }: NodeProps): JSX.Element {
         </div>
       </div>
 
-      <Handle type="source" position={Position.Right} />
+      <Handle type="source" position={(data?.sourcePosition as Position) ?? Position.Right} />
     </div>
   );
 }
@@ -260,7 +260,7 @@ export function DetokenizerVirtualNode({ data }: NodeProps): JSX.Element {
         transition: "min-width 200ms ease",
       }}
     >
-      <Handle type="target" position={Position.Left} />
+      <Handle type="target" position={(data?.targetPosition as Position) ?? Position.Left} />
 
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <span style={{ fontSize: 16 }}>🔡</span>

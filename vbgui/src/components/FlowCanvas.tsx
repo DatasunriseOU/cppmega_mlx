@@ -9,6 +9,7 @@ import {
   Handle,
   Position,
   useReactFlow,
+  MarkerType,
   type Edge,
   type Node,
   type NodeTypes,
@@ -52,7 +53,9 @@ export interface FlowCanvasProps {
 }
 
 // Beautiful custom glowing residual addition (+) node component
-export function ResidualAddNode({ id }: { id: string }): JSX.Element {
+export function ResidualAddNode({ id, data }: { id: string; data?: any }): JSX.Element {
+  const targetPosition = data?.targetPosition ?? Position.Left;
+  const sourcePosition = data?.sourcePosition ?? Position.Right;
   return (
     <div
       role="region"
@@ -78,13 +81,13 @@ export function ResidualAddNode({ id }: { id: string }): JSX.Element {
     >
       <Handle
         type="target"
-        position={Position.Left}
+        position={targetPosition}
         style={{ background: "#10b981", width: 6, height: 6, border: "none" }}
       />
       <span>+</span>
       <Handle
         type="source"
-        position={Position.Right}
+        position={sourcePosition}
         style={{ background: "#10b981", width: 6, height: 6, border: "none" }}
       />
     </div>
@@ -348,16 +351,48 @@ export function FlowCanvas({
 
   // Map every edge to use the custom 'midpoint' type with a click callback registered in data
   const styledEdges = useMemo(
-    () => edges.map((e) => ({
-      ...e,
-      type: "midpoint",
-      data: {
-        ...e.data,
-        onClickMidpoint: (event: React.MouseEvent) => {
-          handleMidpointClick(event, e);
+    () => edges.map((e) => {
+      const isTapped = e.data?.isTapped || e.data?.hasHook;
+      const debuggerMode = e.data?.debuggerMode;
+      const isActiveFlow = e.data?.isActiveFlow;
+      const direction = e.data?.direction;
+      const adapter = e.data?.adapter;
+      const sev = e.data?.severity;
+
+      let arrowColor = "#10b981"; // default emerald green
+      if (isTapped) {
+        arrowColor = "#a855f7"; // Neon purple accent
+      } else if (debuggerMode) {
+        if (isActiveFlow) {
+          arrowColor = direction === "forward" ? "#22d3ee" : "#ec4899";
+        } else {
+          arrowColor = "rgba(100, 116, 139, 0.4)";
         }
+      } else if (adapter) {
+        arrowColor = "#9ca3af";
+      } else if (sev === "error") {
+        arrowColor = "#dc2626";
+      } else if (sev === "warning") {
+        arrowColor = "#d97706";
       }
-    })),
+
+      return {
+        ...e,
+        type: "midpoint",
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          width: 14,
+          height: 14,
+          color: arrowColor,
+        },
+        data: {
+          ...e.data,
+          onClickMidpoint: (event: React.MouseEvent) => {
+            handleMidpointClick(event, e);
+          }
+        }
+      };
+    }),
     [edges, handleMidpointClick],
   );
 

@@ -9,6 +9,8 @@ export interface AdapterNodeData {
 
 export function AdapterNode({ data, id, selected }: NodeProps): JSX.Element {
   const d = data as unknown as AdapterNodeData;
+  const targetPosition = (data as any)?.targetPosition ?? Position.Left;
+  const sourcePosition = (data as any)?.sourcePosition ?? Position.Right;
   const meta = adapterFor(d.kind);
   const accent = T.accent; // adapters share the cyan "operation" accent
 
@@ -29,7 +31,7 @@ export function AdapterNode({ data, id, selected }: NodeProps): JSX.Element {
         borderStyle: "dashed",
       }}
     >
-      <Handle type="target" position={Position.Left} />
+      <Handle type="target" position={targetPosition} />
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span aria-hidden="true"
               style={{ color: accent, fontSize: 13 }}>⇄</span>
@@ -41,7 +43,7 @@ export function AdapterNode({ data, id, selected }: NodeProps): JSX.Element {
           </div>
         </div>
       </div>
-      <Handle type="source" position={Position.Right} />
+      <Handle type="source" position={sourcePosition} />
     </div>
   );
 }

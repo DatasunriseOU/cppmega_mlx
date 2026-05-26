@@ -80,7 +80,7 @@ test.beforeEach(async ({ page }) => {
           }
         }, 30);
       }
-      send(data: any) {}
+      send(_data: any) {}
       close() {
         this.readyState = 3; // CLOSED
         const closeEv = new Event("close");

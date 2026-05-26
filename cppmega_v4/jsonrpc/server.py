@@ -289,9 +289,19 @@ def create_app(*, cache_capacity: int = 50) -> FastAPI:
 
 
 async def _dispatch(payload: dict, cache: LRUCache):
-    if payload.get("method") == "pipeline.run":
-        return await asyncio.to_thread(dispatch, payload, cache=cache)
-    return dispatch(payload, cache=cache)
+    try:
+        if payload.get("method") == "pipeline.run":
+            return await asyncio.to_thread(dispatch, payload, cache=cache)
+        return dispatch(payload, cache=cache)
+    finally:
+        try:
+            import mlx.core as mx
+            if mx.metal.is_available():
+                mx.metal.clear_cache()
+        except ImportError:
+            pass
+        except Exception:
+            pass
 
 
 _BUILD_ID: str | None = None

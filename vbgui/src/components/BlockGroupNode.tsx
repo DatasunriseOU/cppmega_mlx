@@ -11,6 +11,8 @@ export interface BlockGroupNodeData {
 
 export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
   const d = data as unknown as BlockGroupNodeData;
+  const targetPosition = (data as any)?.targetPosition ?? Position.Left;
+  const sourcePosition = (data as any)?.sourcePosition ?? Position.Right;
   const [showUnpackModal, setShowUnpackModal] = useState(false);
   const [unpackCount, setUnpackCount] = useState(Math.min(4, d.repeats));
 
@@ -56,7 +58,7 @@ export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
     >
       <Handle
         type="target"
-        position={Position.Left}
+        position={targetPosition}
         style={{ background: "var(--vb-cat-ssm)", width: 7, height: 7, border: "none" }}
       />
 
@@ -224,7 +226,7 @@ export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
 
       <Handle
         type="source"
-        position={Position.Right}
+        position={sourcePosition}
         style={{ background: "var(--vb-cat-ssm)", width: 7, height: 7, border: "none" }}
       />
     </div>

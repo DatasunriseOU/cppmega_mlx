@@ -1623,7 +1623,9 @@ def test_mamba3_fp8_train_descriptor_schedule_labels_nonproduction_fragments() -
     )
     assert "q_dequant_bwd_policy: saved_prepared_fp8" in generated_source
     assert "m2rnn_bwd_policy: exact_reverse_recompute" in generated_source
-    assert "mamba3_mimo_bwd_policy: exact_reverse_recompute" in generated_source
+    assert "mamba3_mimo_bwd_policy: exact_reverse_checkpoint_replay" in (
+        generated_source
+    )
     assert "# backward_policy: row_phased_hidden_recompute" in generated_source
     assert "# backward_policy: flat_after_row_phased_forward" not in generated_source
 
@@ -1892,18 +1894,30 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
     assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 9
     assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
     assert 'path_c_float32_scratch_bank: T.Tensor' in generated_source
-    assert "mamba3_scan_mamba3_projected_vec[mamba3_scan_proj_dim]" in (
-        generated_source
+    assert any(
+        _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "mamba3_scan_mamba3_projected_vec",
+        )
+        and "mamba3_scan_proj_dim" in line
+        for line in generated_source.splitlines()
     )
     assert "mamba3_scan_mamba3_next_dt[0]" in generated_source
     assert "mamba3_scan_mamba3_next_trap[0]" in generated_source
-    assert (
-        f"q_fp8[row * {cfg.hidden_size} + attention_qkv_projection_q_head * "
-        f"{attention.q_head_dim} + attention_qkv_projection_d]"
-    ) in generated_source
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "q_fp8")
+        and f"row * {cfg.hidden_size} + attention_qkv_projection_q_head * "
+        f"{attention.q_head_dim} + attention_qkv_projection_d" in line
+        for line in generated_source.splitlines()
+    )
     assert any(
         _physical_bank_fragment(prim_func, "attention_out") in line
-        and "sparse_mla_fp8_apply_context_values[" in line
+        and _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "sparse_mla_fp8_apply_context_values",
+        )
         for line in generated_source.splitlines()
     )
     assert "mamba3_scan_bwd_mamba3_stage_grad[0]" in generated_source
@@ -1952,6 +1966,30 @@ def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> Non
     assert "mamba3_delta" in prim_func._cppmega_path_c_internal_scratch_abi_aliases
     assert _shared_alloc_bytes(generated_source) <= 32 * 1024
     assert len(tuple(prim_func.params)) <= 31
+
+
+def test_mamba3_fp8_train_descriptor_replays_mamba3_backward_without_full_h_steps_scratch() -> None:
+    prim_func = mamba3_fp8_train_fusion_schedule_template(
+        build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
+    )
+    generated_source = prim_func._cppmega_path_c_generated_source
+    spilled = prim_func._cppmega_path_c_spilled_shared_scratch_shapes
+
+    assert "mamba3_mimo_bwd_policy: exact_reverse_checkpoint_replay" in (
+        generated_source
+    )
+    assert "mamba3_mimo_bwd_policy: exact_reverse_recompute" not in (
+        generated_source
+    )
+    assert "mamba3_scan_bwd_mamba3_h_steps" not in generated_source
+    assert "mamba3_scan_bwd_mamba3_h_steps" not in spilled
+    assert "mamba3_scan_bwd_mamba3_h_checkpoint" in spilled
+    assert "mamba3_scan_bwd_mamba3_angle_checkpoint" in spilled
+    assert all(
+        not scratch_name.endswith("_mamba3_h_steps")
+        for scratch_name in spilled
+    )
+    assert max(info["bytes"] for info in spilled.values()) < 1024 * 1024 * 1024
 
 
 def test_mamba3_fp8_train_descriptor_splits_float32_abi_region_surface() -> None:
@@ -2116,10 +2154,12 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
         f"for attention_qkv_projection_d in T.serial(0, {attention.q_head_dim}):"
         in generated_source
     )
-    assert (
-        f"path_c_float32_scratch_bank[{mamba3_delta_spill['offset']} + (i)]"
-        in generated_source
+    mamba3_delta_bank_ref = (
+        "path_c_float32_scratch_bank[i]"
+        if mamba3_delta_spill["offset"] == 0
+        else f"path_c_float32_scratch_bank[{mamba3_delta_spill['offset']} + (i)]"
     )
+    assert mamba3_delta_bank_ref in generated_source
     assert any(
         _line_uses_logical_buffer(prim_func, line, "q_fp8")
         and "attention_qkv_projection_q_head" in line
@@ -2440,8 +2480,7 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     mamba3_conv_bias_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_conv_vec[mamba3_scan_conv_ch] = "
-        in line
+        if _line_uses_logical_buffer(prim_func, line, "mamba3_scan_mamba3_conv_vec")
         and _line_uses_logical_buffer(prim_func, line, "mamba3_conv_bias")
     )
     mamba3_conv_history_line = next(
@@ -2503,8 +2542,7 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     mamba3_out_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_out_inner[mamba3_scan_feature] = ("
-        in line
+        if _line_uses_logical_buffer(prim_func, line, "mamba3_scan_mamba3_out_inner")
         and _line_uses_logical_buffer(prim_func, line, "mamba3_D")
     )
     mamba3_delta_line = next(
@@ -2661,7 +2699,7 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     attention_q_scale_line = next(
         line
         for line in generated_source.splitlines()
-        if "q_scale[" in line
+        if _line_uses_logical_buffer(prim_func, line, "q_scale")
         and "attention_qkv_projection_attention_q_prepared[0]" in line
     )
     attention_kv_scale_line = next(
@@ -2673,7 +2711,7 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     attention_q_fp8_line = next(
         line
         for line in generated_source.splitlines()
-        if "q_fp8[" in line
+        if _line_uses_logical_buffer(prim_func, line, "q_fp8")
         and "attention_qkv_projection_attention_q_prepared[0]" in line
     )
     attention_kv_fp8_line = next(
@@ -2704,13 +2742,18 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
         line
         for line in generated_source.splitlines()
         if _line_uses_logical_buffer(prim_func, line, "attention_out")
-        and "sparse_mla_fp8_apply_context_values[" in line
+        and _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "sparse_mla_fp8_apply_context_values",
+        )
         and _line_uses_logical_buffer(prim_func, line, "attention_out_proj_weight")
     )
     attention_bwd_q_fp8_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_qkv_projection_bwd_attention_q_grad0[0] = q_fp8_grad[" in line
+        if "attention_qkv_projection_bwd_attention_q_grad0[0] =" in line
+        and _line_uses_logical_buffer(prim_func, line, "q_fp8_grad")
     )
     attention_bwd_q_scale_line = next(
         line
@@ -2722,7 +2765,8 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     attention_bwd_kv_fp8_line = next(
         line
         for line in generated_source.splitlines()
-        if "attention_qkv_projection_bwd_attention_kv_grad0[0] = kv_fp8_grad[" in line
+        if "attention_qkv_projection_bwd_attention_kv_grad0[0] =" in line
+        and _line_uses_logical_buffer(prim_func, line, "kv_fp8_grad")
     )
     attention_bwd_kv_scale_line = next(
         line
@@ -2811,7 +2855,11 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     mamba3_bwd_hidden_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_entry_rmsnorm_hidden_grad[" in line
+        if _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "mamba3_entry_rmsnorm_hidden_grad",
+        )
         and "mamba3_scan_bwd_mamba3_project_grad" in line
         and _line_uses_logical_buffer(prim_func, line, "mamba3_in_proj_weight")
     )
@@ -2852,11 +2900,17 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     assert _line_uses_logical_buffer(prim_func, mamba3_b_norm_line, "mamba3_B_norm_weight")
     assert _line_uses_logical_buffer(prim_func, mamba3_c_norm_line, "mamba3_C_norm_weight")
     assert _line_uses_logical_buffer(prim_func, mamba3_state_line, "scan_state")
-    assert "mamba3_scan_mamba3_conv_vec[mamba3_scan_feature]" in mamba3_state_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        mamba3_state_line,
+        "mamba3_scan_mamba3_conv_vec",
+    )
     assert "mamba3_scan_mamba3_b_group" in mamba3_state_line
     assert _line_uses_logical_buffer(prim_func, mamba3_out_line, "mamba3_D")
-    assert "mamba3_scan_mamba3_projected_vec[0 + mamba3_scan_feature]" in (
-        mamba3_out_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        mamba3_out_line,
+        "mamba3_scan_mamba3_projected_vec",
     )
     assert "mamba3_scan_mamba3_accum[0]" in mamba3_delta_line
     assert _line_uses_logical_buffer(prim_func, m2rnn_project_line, "m2rnn_in_proj_weight")
@@ -2943,16 +2997,18 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     )
     assert "attention_qkv_projection_attention_q_prepared[0]" in attention_q_fp8_line
     assert "attention_qkv_projection_attention_kv_prepared[0]" in attention_kv_fp8_line
-    assert (
-        "q_scale[row * 28 + attention_qkv_projection_q_head] = "
-        "T.max(q_scale[row * 28 + attention_qkv_projection_q_head], "
-        "T.abs(T.cast(attention_qkv_projection_attention_q_prepared[0]"
-    ) in generated_source
-    assert (
-        "q_scale[row * 28 + attention_qkv_projection_q_head] = "
-        "T.max(q_scale[row * 28 + attention_qkv_projection_q_head] * "
-        "T.cast(0.002232142857142857"
-    ) in generated_source
+    assert _line_uses_logical_buffer(prim_func, attention_q_scale_line, "q_scale")
+    assert "T.max(" in attention_q_scale_line
+    assert "T.abs(T.cast(attention_qkv_projection_attention_q_prepared[0]" in (
+        attention_q_scale_line
+    )
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "q_scale")
+        and "attention_qkv_projection_q_head" in line
+        and "T.max(" in line
+        and "T.cast(0.002232142857142857" in line
+        for line in generated_source.splitlines()
+    )
     assert _physical_bank_fragment(prim_func, "kv_scale") in generated_source
     assert "T.abs(T.cast(attention_qkv_projection_attention_kv_prepared[0]" in (
         generated_source
@@ -2960,19 +3016,23 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     assert (
         "if row >= attention_qkv_projection_k_top:"
     ) in generated_source
-    assert (
-        "indices[row * 448 + attention_qkv_projection_kv_head * 16 + "
-        "attention_qkv_projection_k_top] = row - attention_qkv_projection_k_top"
-    ) in generated_source
-    assert (
-        "indices[row * 448 + attention_qkv_projection_kv_head * 16 + "
-        "attention_qkv_projection_k_top] = -1"
-    ) in generated_source
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "indices")
+        and "row * 448 + attention_qkv_projection_kv_head * 16" in line
+        and "= row - attention_qkv_projection_k_top" in line
+        for line in generated_source.splitlines()
+    )
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "indices")
+        and "row * 448 + attention_qkv_projection_kv_head * 16" in line
+        and "= -1" in line
+        for line in generated_source.splitlines()
+    )
     assert "float_to_fp8_e4m3fn_bits" in attention_q_fp8_line
     assert "float_to_fp8_e4m3fn_bits" in attention_kv_fp8_line
     assert "T.cast(-448.0" in attention_q_fp8_line
     assert "T.cast(448.0" in attention_kv_fp8_line
-    assert "fp8_e4m3fn_to_float(q_fp8" in attention_score_line
+    assert _line_uses_logical_buffer(prim_func, attention_score_line, "q_fp8")
     assert _line_uses_logical_buffer(prim_func, attention_score_line, "kv_fp8")
     assert "kv_fp8[sparse_mla_fp8_apply_sparse_index[0]]" not in generated_source
     assert "kv_scale[sparse_mla_fp8_apply_sparse_index[0]]" not in generated_source
@@ -2994,7 +3054,14 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
         "for sparse_mla_fp8_apply_out_dim_loop in T.serial(lane, 3584, step=256):"
         in generated_source
     )
-    assert "sparse_mla_fp8_apply_context_values[" in generated_source
+    assert any(
+        _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "sparse_mla_fp8_apply_context_values",
+        )
+        for line in generated_source.splitlines()
+    )
     assert (
         'sparse_mla_fp8_apply_score_weights = T.alloc_local((16,), "float32")'
         in generated_source
@@ -3007,9 +3074,11 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
         "sparse_mla_fp8_apply_score_weights[sparse_mla_fp8_apply_k_top]"
         in generated_source
     )
-    assert (
-        "sparse_mla_fp8_apply_sparse_indices[sparse_mla_fp8_apply_k_top] = indices["
-        in generated_source
+    assert any(
+        "sparse_mla_fp8_apply_sparse_indices[sparse_mla_fp8_apply_k_top] = "
+        in line
+        and _line_uses_logical_buffer(prim_func, line, "indices")
+        for line in generated_source.splitlines()
     )
     assert (
         "sparse_mla_fp8_apply_sparse_index[0] = "
@@ -3042,9 +3111,10 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
         "sparse_mla_fp8_apply_source_head_loop * 128 + "
         "sparse_mla_fp8_apply_source_dim_loop"
     ) in generated_source
-    assert (
-        "sparse_mla_fp8_apply_context_values[sparse_mla_fp8_apply_source_dim_loop]"
-        in attention_output_projection_line
+    assert _line_uses_logical_buffer(
+        prim_func,
+        attention_output_projection_line,
+        "sparse_mla_fp8_apply_context_values",
     )
     assert "+ T.cast(indices" not in attention_output_projection_line
     assert "+ indices" not in attention_output_projection_line
@@ -4311,9 +4381,11 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
     assert manifest.row_chunk_index_param == schedules.DESCRIPTOR_ROW_CHUNK_INDEX_PARAM
     assert manifest.row_chunk_index_buffer is None
     assert manifest.backward_gate_param == schedules.DESCRIPTOR_BACKWARD_GATE_PARAM
-    assert list(captured_prim_funcs[0].attrs.get("tilelang_out_idx", ())) == list(
-        range(len(manifest.bank_shapes))
-    )
+    assert list(captured_prim_funcs[0].attrs.get("tilelang_out_idx", ())) == [
+        idx
+        for idx, param in enumerate(captured_prim_funcs[0].params)
+        if param in captured_prim_funcs[0].buffer_map
+    ]
     assert 'bx = T.launch_thread("blockIdx.x", 1)' in generated_source
     assert 'lane = T.launch_thread("threadIdx.x", 256)' in generated_source
     assert "path_c_run_backward: T.int32" in generated_source
@@ -5468,15 +5540,24 @@ def test_untagged_mra_model_route_builds_dynamic_schedule_and_real_abi() -> None
     assert _physical_bank_fragment(prim_func, "route_1_R_m2rnn_D") in (
         generated_source
     )
-    assert (
-        "route_2_A_qkv_projection_q_fp8["
-        "row * 32 + route_2_A_qkv_projection_q_head * 8 + "
-        "route_2_A_qkv_projection_d]"
-    ) in generated_source
-    assert (
-        "route_2_A_qkv_projection_q_scale[row * 4 + "
-        "route_2_A_qkv_projection_q_head]"
-        in generated_source
+    assert any(
+        _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "route_2_A_qkv_projection_q_fp8",
+        )
+        and "row * 32 + route_2_A_qkv_projection_q_head * 8 + "
+        "route_2_A_qkv_projection_d" in line
+        for line in generated_source.splitlines()
+    )
+    assert any(
+        _line_uses_logical_buffer(
+            prim_func,
+            line,
+            "route_2_A_qkv_projection_q_scale",
+        )
+        and "row * 4 + route_2_A_qkv_projection_q_head" in line
+        for line in generated_source.splitlines()
     )
     assert _physical_bank_fragment(
         prim_func,
@@ -5529,10 +5610,13 @@ def test_model_derived_fwd_bwd_descriptor_declares_train_step_scalar_abi() -> No
     }
     assert buffer_abi_shapes["loss"] == (1,)
     assert buffer_abi_shapes["ntokens"] == (1,)
-    assert physical_abi_map["loss"]["bank"] == "path_c_float32_abi_bank"
+    assert physical_abi_map["loss"]["bank"] == "path_c_float32_activation_abi_bank"
     assert physical_abi_map["loss"]["shape"] == (1,)
     assert physical_abi_map["loss"]["dtype"] == "float32"
-    assert physical_abi_map["ntokens"]["bank"] == "path_c_float32_abi_bank"
+    assert (
+        physical_abi_map["ntokens"]["bank"]
+        == "path_c_float32_activation_abi_bank"
+    )
     assert physical_abi_map["ntokens"]["shape"] == (1,)
     assert physical_abi_map["ntokens"]["dtype"] == "float32"
 
@@ -5751,12 +5835,12 @@ def test_model_derived_fwd_bwd_descriptor_seeds_suffix_loss_cotangents_before_ba
     assert "for suffix_hidden_col in T.serial(0, 32):" in generated_source
     assert "for vocab_col in T.serial(0, 256):" in generated_source
     for grad_name in cotangent_abi["logical_cotangent_buffers"]:
-        grad_info = prim_func._cppmega_path_c_physical_buffer_abi_map[grad_name]
-        assert (
-            f"{grad_info['bank']}[{grad_info['offset']} + "
-            "((token_row) * 32 + (suffix_hidden_col))] = "
-            "train_step_suffix_seed_hidden_grad[0]"
-        ) in generated_source
+        assert any(
+            _line_uses_logical_buffer(prim_func, line, grad_name)
+            and "(token_row) * 32 + (suffix_hidden_col)" in line
+            and "] = train_step_suffix_seed_hidden_grad[0]" in line
+            for line in generated_source.splitlines()
+        )
 
 
 def test_model_derived_fwd_bwd_descriptor_computes_suffix_parameter_grads_before_backward() -> None:

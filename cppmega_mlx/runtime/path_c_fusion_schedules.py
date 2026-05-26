@@ -114,6 +114,7 @@ DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE = "banked_by_role"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
 DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
+MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL = 64
 _DESCRIPTOR_ROOT_READS_MARKER = "cppmega_path_c_root_reads"
 _DESCRIPTOR_ROOT_WRITES_MARKER = "cppmega_path_c_root_writes"
 _EXACT_ROW_PHASED_BACKWARD_OPS = frozenset(
@@ -1420,7 +1421,11 @@ def build_path_c_descriptor_prim_func(
         )
     if validated_loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
         prim_func = prim_func.with_attr("tl.fusion.disable_tir_simplify", True)
-    owner_output_param_indices = tuple(range(len(physical_abi_plan.param_lines)))
+    owner_output_param_indices = tuple(
+        idx
+        for idx, param in enumerate(prim_func.params)
+        if param in prim_func.buffer_map
+    )
     if owner_output_param_indices:
         prim_func = prim_func.with_attr(
             "tilelang_out_idx",
@@ -3028,10 +3033,7 @@ def _spill_large_shared_scratch_to_abi(
         byte_count = _flattened_extent(shape) * _DTYPE_NBYTES[dtype]
         total_shared_bytes += byte_count
         scratch_name = match.group("name")
-        force_scratch_abi = (
-            scratch_name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS
-            or scratch_name.endswith("_mamba3_h_steps")
-        )
+        force_scratch_abi = scratch_name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS
         if (
             byte_count > DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES
             or force_scratch_abi
@@ -9139,7 +9141,8 @@ def _append_row_phased_mamba3_bwd_body(
     out_inner = _scratch_name(node, "mamba3_out_inner")
     y_skip = _scratch_name(node, "mamba3_y_skip")
     out_inner_grad = _scratch_name(node, "mamba3_out_inner_grad")
-    h_steps = _scratch_name(node, "mamba3_h_steps")
+    h_checkpoint = _scratch_name(node, "mamba3_h_checkpoint")
+    angle_checkpoint = _scratch_name(node, "mamba3_angle_checkpoint")
     h_prev = _scratch_name(node, "mamba3_h_prev")
     h_next = _scratch_name(node, "mamba3_h_next")
     dh = _scratch_name(node, "mamba3_dh")
@@ -9177,6 +9180,9 @@ def _append_row_phased_mamba3_bwd_body(
     time_rev = _scratch_name(node, "time_rev")
     time_idx = _scratch_name(node, "time_idx")
     replay_time = _scratch_name(node, "replay_time")
+    replay_offset = _scratch_name(node, "replay_offset")
+    checkpoint_idx = _scratch_name(node, "checkpoint_idx")
+    checkpoint_start = _scratch_name(node, "checkpoint_start")
     src_row = _scratch_name(node, "src_row")
     src_hist = _scratch_name(node, "src_hist")
     hidden_loop = _scratch_name(node, "hidden_loop")
@@ -9209,6 +9215,9 @@ def _append_row_phased_mamba3_bwd_body(
     conv_b_offset = inner_dim
     conv_c_offset = inner_dim + bc_dim
     rot_dim = min(state_dim, 2 * rope_angles)
+    checkpoint_interval = MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL
+    checkpoint_count = (sequence_length + checkpoint_interval - 1) // checkpoint_interval
+    angle_extent = heads * rope_angles
 
     def _mamba3_hidden_expr(time_expr: str, hidden_expr: str) -> str:
         return _node_indexed_canonical_or_positional_input_expr(
@@ -9246,7 +9255,6 @@ def _append_row_phased_mamba3_bwd_body(
         level: int,
         update_angle: bool,
         update_state: bool,
-        compute_h_prev: bool,
     ) -> None:
         body.append(f"{indent * level}for {proj_dim} in T.serial(0, {in_proj_dim}):")
         body.append(f"{indent * (level + 1)}{sum_scratch}[0] = 0.0")
@@ -9555,11 +9563,6 @@ def _append_row_phased_mamba3_bwd_body(
             f"{indent * (level + 2)}{state_idx} = "
             f"{head} * {head_dim * state_dim} + {hidden_dim} * {state_dim} + {state_loop}"
         )
-        if compute_h_prev:
-            body.append(
-                f"{indent * (level + 2)}{h_prev}[{state_idx}] = "
-                f"{h_steps}[{time_expr} * {state_extent} + {state_idx}]"
-            )
         if update_state:
             body.append(
                 f"{indent * (level + 2)}{h_next}[{state_idx}] = "
@@ -9591,7 +9594,7 @@ def _append_row_phased_mamba3_bwd_body(
             f"{y_skip}[{feature}] * {projected}[{z_offset} + {feature}] * {scalar0}[0]"
         )
 
-    body.append(f"{indent * 3}# mamba3_mimo_bwd_policy: exact_reverse_recompute")
+    body.append(f"{indent * 3}# mamba3_mimo_bwd_policy: exact_reverse_checkpoint_replay")
     for name, extent in (
         (projected, in_proj_dim),
         (project_grad, in_proj_dim),
@@ -9601,7 +9604,8 @@ def _append_row_phased_mamba3_bwd_body(
         (out_inner, inner_dim),
         (y_skip, inner_dim),
         (out_inner_grad, inner_dim),
-        (h_steps, (sequence_length + 1) * state_extent),
+        (h_checkpoint, (checkpoint_count + 1) * state_extent),
+        (angle_checkpoint, (checkpoint_count + 1) * angle_extent),
         (h_prev, state_extent),
         (h_next, state_extent),
         (dh, state_extent),
@@ -9630,7 +9634,11 @@ def _append_row_phased_mamba3_bwd_body(
         (angle_cumsum, heads * rope_angles),
         (angle_grad, heads * rope_angles),
     ):
-        alloc = "T.alloc_shared" if name == h_steps else "T.alloc_local"
+        alloc = (
+            "T.alloc_shared"
+            if name in {h_checkpoint, angle_checkpoint}
+            else "T.alloc_local"
+        )
         body.append(f"{indent * 3}{name} = {alloc}(({extent},), \"float32\")")
     for scalar in (
         stage_grad,
@@ -9687,10 +9695,11 @@ def _append_row_phased_mamba3_bwd_body(
         default="0.0",
     )
     body.append(f"{indent * 6}{h_next}[{state_idx}] = {h0_expr}")
-    body.append(f"{indent * 6}{h_steps}[{state_idx}] = {h0_expr}")
+    body.append(f"{indent * 6}{h_checkpoint}[{state_idx}] = {h0_expr}")
     body.append(f"{indent * 6}{dh}[{state_idx}] = 0.0")
     body.append(f"{indent * 5}for {grad_flat} in T.serial(0, {heads * rope_angles}):")
     body.append(f"{indent * 6}{angle_cumsum}[{grad_flat}] = 0.0")
+    body.append(f"{indent * 6}{angle_checkpoint}[{grad_flat}] = 0.0")
     body.append(f"{indent * 6}{angle_grad}[{grad_flat}] = 0.0")
     body.append(f"{indent * 5}for {replay_time} in T.serial(0, {sequence_length}):")
     _mamba3_emit_recompute_row(
@@ -9698,21 +9707,55 @@ def _append_row_phased_mamba3_bwd_body(
         level=6,
         update_angle=True,
         update_state=True,
-        compute_h_prev=False,
     )
-    body.append(f"{indent * 6}for {state_idx} in T.serial(0, {state_extent}):")
+    body.append(f"{indent * 6}if (({replay_time} + 1) % {checkpoint_interval}) == 0:")
     body.append(
-        f"{indent * 7}{h_steps}[({replay_time} + 1) * {state_extent} + {state_idx}] = "
+        f"{indent * 7}{checkpoint_idx} = ({replay_time} + 1) // {checkpoint_interval}"
+    )
+    body.append(f"{indent * 7}for {state_idx} in T.serial(0, {state_extent}):")
+    body.append(
+        f"{indent * 8}{h_checkpoint}[{checkpoint_idx} * {state_extent} + {state_idx}] = "
         f"{h_next}[{state_idx}]"
+    )
+    body.append(f"{indent * 7}for {grad_flat} in T.serial(0, {angle_extent}):")
+    body.append(
+        f"{indent * 8}{angle_checkpoint}[{checkpoint_idx} * {angle_extent} + {grad_flat}] = "
+        f"{angle_cumsum}[{grad_flat}]"
     )
     body.append(f"{indent * 5}for {time_rev} in T.serial(0, {sequence_length}):")
     body.append(f"{indent * 6}{time_idx} = {sequence_length - 1} - {time_rev}")
+    body.append(f"{indent * 6}{checkpoint_idx} = {time_idx} // {checkpoint_interval}")
+    body.append(
+        f"{indent * 6}{checkpoint_start} = {checkpoint_idx} * {checkpoint_interval}"
+    )
+    body.append(f"{indent * 6}for {state_idx} in T.serial(0, {state_extent}):")
+    body.append(
+        f"{indent * 7}{h_next}[{state_idx}] = "
+        f"{h_checkpoint}[{checkpoint_idx} * {state_extent} + {state_idx}]"
+    )
+    body.append(f"{indent * 6}for {grad_flat} in T.serial(0, {angle_extent}):")
+    body.append(
+        f"{indent * 7}{angle_cumsum}[{grad_flat}] = "
+        f"{angle_checkpoint}[{checkpoint_idx} * {angle_extent} + {grad_flat}]"
+    )
+    body.append(f"{indent * 6}for {replay_offset} in T.serial(0, {checkpoint_interval}):")
+    body.append(
+        f"{indent * 7}{replay_time} = {checkpoint_start} + {replay_offset}"
+    )
+    body.append(f"{indent * 7}if {replay_time} < {time_idx}:")
+    _mamba3_emit_recompute_row(
+        replay_time,
+        level=8,
+        update_angle=True,
+        update_state=True,
+    )
+    body.append(f"{indent * 6}for {state_idx} in T.serial(0, {state_extent}):")
+    body.append(f"{indent * 7}{h_prev}[{state_idx}] = {h_next}[{state_idx}]")
     _mamba3_emit_recompute_row(
         time_idx,
         level=6,
-        update_angle=False,
-        update_state=False,
-        compute_h_prev=True,
+        update_angle=True,
+        update_state=True,
     )
     body.append(f"{indent * 6}for {proj_dim} in T.serial(0, {in_proj_dim}):")
     body.append(f"{indent * 7}{project_grad}[{proj_dim}] = 0.0")

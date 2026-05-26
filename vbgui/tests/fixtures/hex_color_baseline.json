@@ -4,12 +4,13 @@
   "components/BottomStrip.tsx": 7,
   "components/BrickContextPanel.tsx": 41,
   "components/BrickNode.tsx": 1,
+  "components/BlockGroupNode.tsx": 3,
   "components/CompileTracePanel.tsx": 20,
   "components/DataInspector.tsx": 47,
   "components/DimEnvEditor.tsx": 2,
   "components/ErrorDetailsPanel.tsx": 10,
   "components/ExplainModal.tsx": 1,
-  "components/FlowCanvas.tsx": 24,
+  "components/FlowCanvas.tsx": 45,
   "components/GalleryScaleDownSlider.tsx": 9,
   "components/GalleryTab.tsx": 5,
   "components/GenerationPanel.tsx": 10,
@@ -43,5 +44,6 @@
   "components/sidebar/OptimTab.tsx": 2,
   "components/sidebar/RewritersTab.tsx": 1,
   "components/sidebar/ShardingTab.tsx": 6,
-  "components/sidebar/SideChannelsTab.tsx": 16
+  "components/sidebar/SideChannelsTab.tsx": 16,
+  "components/sidebar/ResearchHooksTab.tsx": 4
 }
