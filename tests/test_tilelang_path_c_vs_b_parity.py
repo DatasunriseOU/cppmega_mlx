@@ -208,10 +208,9 @@ def _drive_fp8_vecmat(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]
 
 
 def _drive_sparse_mla_fp8(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]:
-    from cppmega_mlx.nn.sparse_mla import _resolve_shapes
     from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
         _to_fp8_with_per_tensor_scale,
-        sparse_mla_fp8_fwd_metal_impl,
+        sparse_mla_fp8_reference,
     )
     from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
         sparse_mla_fp8_path_c_apply,
@@ -229,20 +228,13 @@ def _drive_sparse_mla_fp8(shape: str) -> tuple[np.ndarray, np.ndarray, float, fl
     sm_scale = D ** -0.5
     q_fp8, q_scale = _to_fp8_with_per_tensor_scale(q)
     kv_fp8, kv_scale = _to_fp8_with_per_tensor_scale(kv)
-    shapes = _resolve_shapes(q, kv, indices, d_v=D)
-    path_b = sparse_mla_fp8_fwd_metal_impl(
-        q_fp8,
-        q_scale,
-        kv_fp8,
-        kv_scale,
+    out_b = sparse_mla_fp8_reference(
+        q,
+        kv,
         indices,
         sm_scale=sm_scale,
         d_v=D,
-        shapes=shapes,
     )
-    if path_b is None:
-        raise NotImplementedError("sparse_mla_fp8 Path B prepared-buffer kernel unavailable")
-    out_b, _lse_b = path_b
     out_c = sparse_mla_fp8_path_c_apply(
         q_fp8,
         q_scale,
@@ -256,7 +248,7 @@ def _drive_sparse_mla_fp8(shape: str) -> tuple[np.ndarray, np.ndarray, float, fl
     if out_c is None:
         raise NotImplementedError("sparse_mla_fp8_path_c_apply returned None")
     atol, rtol = _TOLERANCE_BY_DTYPE["fp8"]
-    return _np(out_b.astype(mx.float32)), _np(cast(mx.array, out_c).astype(mx.float32)), atol, rtol
+    return _np(cast(mx.array, out_b).astype(mx.float32)), _np(cast(mx.array, out_c).astype(mx.float32)), atol, rtol
 
 
 def _drive_sparse_mla_blockscaled(shape: str) -> tuple[np.ndarray, np.ndarray, float, float]:
@@ -309,12 +301,7 @@ PARITY_CASES: list[tuple[str, str, Callable[[str], Any], str | None]] = [
     ("mamba3", "carryover", _drive_mamba3, None),
     ("fp8_vecmat", "small", _drive_fp8_vecmat, None),
     ("sparse_mla_blockscaled", "prepared-small", _drive_sparse_mla_blockscaled, None),
-    (
-        "sparse_mla_fp8",
-        "prepared-small",
-        _drive_sparse_mla_fp8,
-        "sparse_mla_fp8 direct-MSL Path B is retired; Path C is covered by prepared-buffer tests",
-    ),
+    ("sparse_mla_fp8", "prepared-small", _drive_sparse_mla_fp8, None),
 ]
 
 

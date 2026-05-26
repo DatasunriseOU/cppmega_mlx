@@ -53,6 +53,9 @@ _REQUIRED_PRIMFUNC_ATTRS = (
     "tl.fusion.physical_abi.physical_buffer_shapes",
 )
 _ROW_DISPATCH_GRID_CHUNKS = "grid_chunks"
+_FORWARD_ONLY_GATE = 0
+_BACKWARD_GATE = 1
+_BACKWARD_FORWARD_PREPASS_GATE = 2
 
 
 def _decode_attr(prim_func: Any, key: str) -> Any:
@@ -98,6 +101,7 @@ class PathCAbiManifest:
     bank_shapes: Mapping[str, tuple[int, ...]]
     bank_dtypes: Mapping[str, str]
     internal_scratch_buffers: tuple[str, ...]
+    internal_scratch_aliases: Mapping[str, Mapping[str, Any]]
     cotangent_seed_buffers: tuple[str, ...]
     top_level_scratch_shapes: Mapping[str, tuple[int, ...]]
     top_level_scratch_dtypes: Mapping[str, str]
@@ -151,6 +155,10 @@ def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
     scratch_attr = prim_func.attrs.get("tl.fusion.internal_scratch_abi_buffers")
     scratch_raw = (
         json.loads(str(scratch_attr)) if scratch_attr is not None else []
+    )
+    scratch_alias_attr = prim_func.attrs.get("tl.fusion.internal_scratch_abi_aliases")
+    scratch_aliases = (
+        json.loads(str(scratch_alias_attr)) if scratch_alias_attr is not None else {}
     )
 
     cotangent_raw = prim_func.attrs.get("tl.fusion.train_step_loss_cotangent_abi")
@@ -206,6 +214,7 @@ def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
         bank_shapes=bank_shapes,
         bank_dtypes=bank_dtypes,
         internal_scratch_buffers=tuple(scratch_raw),
+        internal_scratch_aliases=scratch_aliases,
         cotangent_seed_buffers=cotangent_buffers,
         top_level_scratch_shapes=top_level_shapes,
         top_level_scratch_dtypes=top_level_dtypes,
@@ -274,8 +283,8 @@ def _flat_into_bank(
             f"expected {placement.dtype}, got {value.dtype}"
         )
     flat = value.reshape((placement.size,))
-    indices = mx.arange(placement.offset, placement.offset + placement.size, dtype=mx.int32)
-    return bank.at[indices].add(flat - bank[indices])
+    slot = slice(placement.offset, placement.offset + placement.size)
+    return bank.at[slot].add(flat - bank[slot])
 
 
 def _bank_slot_view(
@@ -489,6 +498,8 @@ class Mamba3Fp8TrainBlockLauncher:
         # (uses top_level_scratch_shapes).
         scratch_buffers: dict[str, mx.array] = {}
         for name in manifest.internal_scratch_buffers:
+            if name in manifest.internal_scratch_aliases:
+                continue
             if name in manifest.logical_to_physical:
                 placement = manifest.logical_to_physical[name]
                 scratch_buffers[name] = mx.zeros(
@@ -545,7 +556,7 @@ class Mamba3Fp8TrainBlockLauncher:
                 positional.append(0)
             elif logical_name == manifest.backward_gate_param:
                 backward_gate_param_index = len(positional)
-                positional.append(1 if run_backward else 0)
+                positional.append(_BACKWARD_GATE if run_backward else _FORWARD_ONLY_GATE)
             else:
                 raise ValueError(
                     f"compiled PrimFunc has an unexpected parameter {param_name!r} "
@@ -676,19 +687,16 @@ class Mamba3Fp8TrainBlockLauncher:
                 if row_subchunk_param_index is not None:
                     positional[row_subchunk_param_index] = int(subchunk_index)
                 apply_returned_outputs(self._kernel(*positional))
-                eval_positionals()
 
             if run_backward and backward_gate_param_index is not None:
-                positional[backward_gate_param_index] = 0
-                forward_subchunk_count = int(manifest.row_subchunk_count or 1)
+                positional[backward_gate_param_index] = _BACKWARD_FORWARD_PREPASS_GATE
                 for chunk_index in range(chunk_count):
-                    for subchunk_index in range(forward_subchunk_count):
-                        launch_chunk(chunk_index, subchunk_index)
+                    launch_chunk(chunk_index, 0)
                 final_forward_states = snapshot_logical_buffers(
                     _STATE_AFTER_LOGICAL_BUFFERS
                 )
                 restore_logical_buffers(initial_backward_states)
-                positional[backward_gate_param_index] = 1
+                positional[backward_gate_param_index] = _BACKWARD_GATE
                 launch_chunk(0, 0)
                 restore_logical_buffers(final_forward_states)
             else:

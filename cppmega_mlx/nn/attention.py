@@ -10,7 +10,6 @@ from typing import Any, Callable, Literal, Mapping, cast
 import mlx.core as mx
 import mlx.nn as nn
 
-from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
 from cppmega_mlx.inference.engine import ContiguousKVCache
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
@@ -1056,6 +1055,8 @@ class CausalSelfAttention(nn.Module):
                 key_length=key_length,
             )
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
+        from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
+
         out = scaled_dot_product_attention(
             q,
             k,

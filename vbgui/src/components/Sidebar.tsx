@@ -11,6 +11,7 @@ import { AblationsTab } from "./sidebar/AblationsTab";
 import { SideChannelsTab } from "./sidebar/SideChannelsTab";
 import { MemoryMatrixTab } from "./sidebar/MemoryMatrixTab";
 import { TrainOpsTab } from "./sidebar/TrainOpsTab";
+import { ResearchHooksTab, type ResearchHook } from "./sidebar/ResearchHooksTab";
 import type { TrainOptions } from "@/components/TrainOptionsPanel";
 import type {
   GotchaState, LossState, OptimState, RewriterState, ShardingState,
@@ -19,7 +20,7 @@ import type {
 
 export type SidebarTab = "loss" | "optim" | "rewriters" | "sharding"
                        | "gotchas" | "dimensions" | "ablations"
-                       | "side_channels" | "memory" | "trainops";
+                       | "side_channels" | "memory" | "trainops" | "research_hooks";
 
 export interface SidebarProps {
   loss: LossState;
@@ -80,6 +81,12 @@ export interface SidebarProps {
   onParallelCompose?: (nodes: any[], edges: any[]) => void;
   onInsertIntoEdge?: (kind: string, edge: any) => void;
   onTransplant?: (kind: string, params: Record<string, unknown>) => void;
+  // Research hooks integration
+  tappedEdgeId?: string | null;
+  hooks?: Record<string, ResearchHook>;
+  onUpdateHook?: (edgeId: string, hook: ResearchHook) => void;
+  onRemoveHook?: (edgeId: string) => void;
+  liveTrainEvents?: import("./LiveTrainPanel").LiveTrainEvent[];
 }
 
 const TAB_LABELS: { key: SidebarTab; label: string }[] = [
@@ -93,6 +100,7 @@ const TAB_LABELS: { key: SidebarTab; label: string }[] = [
   { key: "trainops",   label: "Train Ops" },
   { key: "ablations",  label: "Ablations" },
   { key: "memory",     label: "Memory" },
+  { key: "research_hooks", label: "Hooks" },
 ];
 
 export function Sidebar(p: SidebarProps): JSX.Element {
@@ -199,6 +207,15 @@ export function Sidebar(p: SidebarProps): JSX.Element {
         {active === "memory" && p.rpc && p.verifySpec !== undefined && (
           <MemoryMatrixTab rpc={p.rpc}
                             specPayload={p.verifySpec} />
+        )}
+        {active === "research_hooks" && (
+          <ResearchHooksTab
+            tappedEdgeId={p.tappedEdgeId ?? null}
+            hooks={p.hooks ?? {}}
+            onUpdateHook={p.onUpdateHook ?? (() => {})}
+            onRemoveHook={p.onRemoveHook ?? (() => {})}
+            liveTrainEvents={p.liveTrainEvents ?? []}
+          />
         )}
       </div>
     </aside>

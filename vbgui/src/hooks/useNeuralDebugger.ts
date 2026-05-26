@@ -58,6 +58,13 @@ export function useNeuralDebugger(rpc?: any, tokenizerPath?: string | null) {
     setIsWeightUpdated(false);
   };
 
+  // Reset state and clear timers automatically when debugger mode is disabled
+  useEffect(() => {
+    if (!debuggerMode) {
+      resetDebugger();
+    }
+  }, [debuggerMode]);
+
   const stepForward = (maxStep: number) => {
     setIsWeightUpdated(false);
     if (direction === "forward") {
@@ -140,7 +147,7 @@ export function useNeuralDebugger(rpc?: any, tokenizerPath?: string | null) {
     setActiveStep(currentStep);
     setDirection(currentDir);
 
-    const intervalMs = 250; // Fast and snappy animation sequence
+    const intervalMs = 80; // Snappy, ultra-fast visual training simulation sequence
     stepTimerRef.current = setInterval(() => {
       if (currentDir === "forward") {
         if (currentStep >= maxStep) {

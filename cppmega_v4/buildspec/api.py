@@ -87,43 +87,69 @@ class BuiltSequentialModel(nn.Module):
             setattr(self, attr, module)
             self._node_attrs[node.name] = attr
 
+    def attach_activation_probe(self, name: str, probe: Callable[[str, mx.array], mx.array | None]) -> None:
+        """Install zero-copy activation tap / causal intervention patching hook."""
+        if not hasattr(self, "_activation_probes"):
+            self._activation_probes = {}
+        self._activation_probes[name] = probe
+
+    def detach_activation_probes(self) -> None:
+        """Remove all active probes."""
+        if hasattr(self, "_activation_probes"):
+            self._activation_probes.clear()
+
     def __call__(self, x: mx.array) -> dict[str, mx.array]:
-        # Run nodes in declaration order; for each node, find its
-        # producer (any) and use that producer's output as input. If a
-        # node has no producer, feed x.
+        # Run nodes in declaration order; for each node, collect all
+        # incoming producers (any) to support multi-branch residual sums.
         outputs: dict[str, mx.array] = {}
-        producer_of: dict[str, str | None] = {}
+        producers_of: dict[str, list[str]] = {}
         for p, c in self._graph.edges:
-            producer_of.setdefault(c, p)
+            producers_of.setdefault(c, []).append(p)
 
         for node in self._graph.nodes:
-            inp_name = producer_of.get(node.name)
-            inp = outputs[inp_name] if inp_name else x
+            inps = producers_of.get(node.name, [])
+            if not inps:
+                inp = x
+            elif len(inps) == 1:
+                inp = outputs[inps[0]]
+            else:
+                # Sum the outputs of all producers (residual addition convergence)
+                # Keep calculations autograd-safe and zero-copy
+                inp = outputs[inps[0]]
+                for p_name in inps[1:]:
+                    inp = inp + outputs[p_name]
+
             if node.kind in _SKIP_KINDS_FORWARD:
-                outputs[node.name] = inp
-                continue
+                out = inp
             # Aux + MHC copy nodes: forward identity for now (loss-side
             # handles their actual contribution).
-            if node.params.get("is_ifim_aux") or node.params.get("is_mhc_copy"):
-                outputs[node.name] = inp
-                continue
-            attr = self._node_attrs.get(node.name)
-            if attr is None:
-                # No module wired (e.g. raw BrickNode with module=None,
-                # kind not in BLOCK_BUILDERS) — passthrough.
-                outputs[node.name] = inp
-                continue
-            module = getattr(self, attr)
-            try:
-                out = module(inp)
-            except TypeError:
-                # Brick wants extra kwargs (kv cache, doc_ids); skip-and-
-                # passthrough — final-mile arg routing is Stage F work.
+            elif node.params.get("is_ifim_aux") or node.params.get("is_mhc_copy"):
                 out = inp
-            if not isinstance(out, mx.array) or out.shape != inp.shape:
-                # Brick returned a non-array or reshaped — passthrough
-                # to keep downstream shape contracts honest.
-                out = inp
+            else:
+                attr = self._node_attrs.get(node.name)
+                if attr is None:
+                    # No module wired (e.g. raw BrickNode with module=None,
+                    # kind not in BLOCK_BUILDERS) — passthrough.
+                    out = inp
+                else:
+                    module = getattr(self, attr)
+                    try:
+                        out = module(inp)
+                    except TypeError:
+                        # Brick wants extra kwargs (kv cache, doc_ids); skip-and-
+                        # passthrough — final-mile arg routing is Stage F work.
+                        out = inp
+                    if not isinstance(out, mx.array) or out.shape != inp.shape:
+                        # Brick returned a non-array or reshaped — passthrough
+                        # to keep downstream shape contracts honest.
+                        out = inp
+
+            # Autograd-safe research hook invocation
+            if hasattr(self, "_activation_probes") and node.name in self._activation_probes:
+                patched = self._activation_probes[node.name](node.name, out)
+                if patched is not None:
+                    out = patched
+
             outputs[node.name] = out
         return outputs
 

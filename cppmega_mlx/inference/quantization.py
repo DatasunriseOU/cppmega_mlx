@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import mlx.nn as nn
 
-from cppmega_mlx._mlx_lm_imports import KVCache, QuantizedKVCache
+if TYPE_CHECKING:
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
 _SUPPORTED_BITS = frozenset({4, 8})
 _SUPPORTED_GROUP_SIZES = frozenset({32, 64, 128})
 _SUPPORTED_MODES = frozenset({"affine"})
@@ -127,6 +130,8 @@ def make_quantized_kv_cache(
     """Create an mlx-lm ``QuantizedKVCache`` with q4 defaults."""
 
     _validate_quant_args(bits=bits, group_size=group_size, mode="affine")
+    from cppmega_mlx._mlx_lm_imports import QuantizedKVCache
+
     return QuantizedKVCache(group_size=group_size, bits=bits)
 
 
@@ -139,6 +144,8 @@ def quantize_kv_cache(
     """Convert an existing mlx-lm ``KVCache`` to ``QuantizedKVCache``."""
 
     _validate_quant_args(bits=bits, group_size=group_size, mode="affine")
+    from cppmega_mlx._mlx_lm_imports import KVCache, QuantizedKVCache
+
     if isinstance(cache, QuantizedKVCache):
         if cache.bits != bits or cache.group_size != group_size:
             raise ValueError(

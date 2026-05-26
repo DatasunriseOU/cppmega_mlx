@@ -8,6 +8,7 @@ import {
   getBezierPath,
   Handle,
   Position,
+  useReactFlow,
   type Edge,
   type Node,
   type NodeTypes,
@@ -23,6 +24,7 @@ import { BrickNode } from "./BrickNode";
 import { AdapterNode } from "./AdapterNode";
 import { LossGhostNode } from "./LossGhostNode";
 import { TokenizerVirtualNode, DetokenizerVirtualNode } from "./VirtualNodes";
+import { BlockGroupNode } from "./BlockGroupNode";
 
 export interface FlowCanvasProps {
   nodes: Node[];
@@ -45,6 +47,8 @@ export interface FlowCanvasProps {
   onNodesChange?: OnNodesChange;
   /** React Flow edge change callback. */
   onEdgesChange?: OnEdgesChange;
+  /** Callback when an edge is context-clicked (right-click) or double-clicked to tap it. */
+  onEdgeTap?: (edgeId: string) => void;
 }
 
 // Beautiful custom glowing residual addition (+) node component
@@ -94,6 +98,7 @@ const NODE_TYPES: NodeTypes = {
   tokenizer_virtual: TokenizerVirtualNode as unknown as NodeTypes[string],
   detokenizer_virtual: DetokenizerVirtualNode as unknown as NodeTypes[string],
   residual_add: ResidualAddNode as unknown as NodeTypes[string],
+  block_group: BlockGroupNode as unknown as NodeTypes[string],
 };
 
 // 1. High-fidelity custom MidpointEdge component matching the visual builder mockup.
@@ -125,12 +130,20 @@ export function MidpointEdge({
   const direction = (data as { direction?: "forward" | "backward" } | undefined)?.direction;
   const isActiveFlow = (data as { isActiveFlow?: boolean } | undefined)?.isActiveFlow;
 
+  const isTapped = (data as { isTapped?: boolean } | undefined)?.isTapped;
+  const hasHook = (data as { hasHook?: boolean } | undefined)?.hasHook;
+
   let stroke = "#10b981"; // default emerald green
   let strokeDasharray: string | undefined = undefined;
   let animation: string | undefined = undefined;
   let opacity: number | undefined = undefined;
 
-  if (debuggerMode) {
+  if (isTapped || hasHook) {
+    stroke = "#a855f7"; // Neon purple accent
+    strokeDasharray = "6 3";
+    animation = "vbEdgePulse 1.2s linear infinite";
+    opacity = 1.0;
+  } else if (debuggerMode) {
     if (isActiveFlow) {
       stroke = direction === "forward" ? "var(--vb-accent)" : "var(--vb-cat-moe)";
       strokeDasharray = "4 4";
@@ -170,6 +183,11 @@ export function MidpointEdge({
         @keyframes vbFlowBwd {
           from { stroke-dashoffset: 0; }
           to { stroke-dashoffset: 16; }
+        }
+        @keyframes vbEdgePulse {
+          0% { stroke: #a855f7; filter: drop-shadow(0 0 2px #a855f7); stroke-dashoffset: 0; }
+          50% { stroke: #22d3ee; filter: drop-shadow(0 0 8px #22d3ee); }
+          100% { stroke: #a855f7; filter: drop-shadow(0 0 2px #a855f7); stroke-dashoffset: 18; }
         }
       `}</style>
       <BaseEdge path={edgePath} markerEnd={markerEnd} style={finalStyle} />
@@ -231,9 +249,20 @@ const EDGE_TYPES: EdgeTypes = {
 };
 
 export function FlowCanvas({
-  nodes, edges, onConnect, isValidConnection, onDropBrick, onNodeClick, onInsertAdapter, onAutoAlign, onNodesChange, onEdgesChange,
+  nodes, edges, onConnect, isValidConnection, onDropBrick, onNodeClick, onInsertAdapter, onAutoAlign, onNodesChange, onEdgesChange, onEdgeTap,
 }: FlowCanvasProps): JSX.Element {
   const [edgeMenu, setEdgeMenu] = useState<{ edge: Edge; x: number; y: number } | null>(null);
+  const { fitView } = useReactFlow();
+
+  // Robust automatic centering & zoom fitting when nodes list changes (preset load or auto-layout alignment)
+  useEffect(() => {
+    if (nodes.length > 0) {
+      const timer = setTimeout(() => {
+        void fitView({ padding: 0.15, duration: 250 });
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [nodes.length, fitView]);
 
   // Auto-close on escape key or clicking outside
   useEffect(() => {
@@ -347,6 +376,13 @@ export function FlowCanvas({
         onConnect={handleConnect as never}
         onNodeClick={(_e, node) => onNodeClick?.(node.id)}
         onEdgeClick={handleMidpointClick}
+        onEdgeContextMenu={(e, edge) => {
+          e.preventDefault();
+          onEdgeTap?.(edge.id);
+        }}
+        onEdgeDoubleClick={(_e, edge) => {
+          onEdgeTap?.(edge.id);
+        }}
         isValidConnection={isValidConnection}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}

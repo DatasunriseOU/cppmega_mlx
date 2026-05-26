@@ -110,9 +110,12 @@ DESCRIPTOR_LOOP_POLICY_FLAT = "flat"
 DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN = "row_phased_hidden"
 DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT = "direct_buffers"
 DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE = "banked_by_dtype"
+DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE = "banked_by_role"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
 DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
+_DESCRIPTOR_ROOT_READS_MARKER = "cppmega_path_c_root_reads"
+_DESCRIPTOR_ROOT_WRITES_MARKER = "cppmega_path_c_root_writes"
 _EXACT_ROW_PHASED_BACKWARD_OPS = frozenset(
     {
         "attention_qkv_projection_bwd",
@@ -1037,7 +1040,7 @@ def make_path_c_descriptor_schedule_template(
         validated_row_dispatch_mode
     )
     descriptor_schedule_metadata._cppmega_path_c_workspace_edge_buffers = (
-        ("kv_fp8", "kv_scale")
+        ("q_fp8", "q_scale", "kv_fp8", "kv_scale")
         if _descriptor_chain_uses_kv_history_workspace(descriptors)
         else ()
     )
@@ -1079,6 +1082,8 @@ cast(
     Any,
     mamba3_fp8_train_fusion_schedule_template,
 )._cppmega_path_c_workspace_edge_buffers = (
+    "q_fp8",
+    "q_scale",
     "kv_fp8",
     "kv_scale",
 )
@@ -1086,6 +1091,8 @@ cast(
     Any,
     mamba3_fp8_train_prototype_schedule_template,
 )._cppmega_path_c_workspace_edge_buffers = (
+    "q_fp8",
+    "q_scale",
     "kv_fp8",
     "kv_scale",
 )
@@ -1313,10 +1320,26 @@ def build_path_c_descriptor_prim_func(
         for name, info in spilled_shared_scratch.items()
         if bool(info.get("internal_scratch_abi"))
     )
+    internal_scratch_abi_aliases = {
+        name: {
+            "bank": str(info["bank"]),
+            "offset": int(info["offset"]),
+            "shape": tuple(info["shape"]),
+            "dtype": str(info["dtype"]),
+        }
+        for name, info in spilled_shared_scratch.items()
+        if bool(info.get("internal_scratch_abi"))
+        and bool(info.get("coalesced_scratch_bank"))
+    }
     if internal_scratch_abi_buffers:
         prim_func = prim_func.with_attr(
             "tl.fusion.internal_scratch_abi_buffers",
             json.dumps(internal_scratch_abi_buffers),
+        )
+    if internal_scratch_abi_aliases:
+        prim_func = prim_func.with_attr(
+            "tl.fusion.internal_scratch_abi_aliases",
+            json.dumps(internal_scratch_abi_aliases, sort_keys=True),
         )
     prim_func = prim_func.with_attr(
         "tl.fusion.physical_abi.policy",
@@ -1436,6 +1459,9 @@ def build_path_c_descriptor_prim_func(
     )
     prim_func._cppmega_path_c_internal_scratch_abi_buffers = (
         internal_scratch_abi_buffers
+    )
+    prim_func._cppmega_path_c_internal_scratch_abi_aliases = dict(
+        internal_scratch_abi_aliases
     )
     prim_func._cppmega_path_c_loop_extent = loop_extent
     prim_func._cppmega_path_c_generated_source = source
@@ -1780,6 +1806,18 @@ def _descriptor_prim_func_source(
         f"{indent * 2}# internal_buffer_policy: {internal_buffer_policy}",
         f"{indent * 2}# loop_policy: {loop_policy}",
     ]
+    if loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
+        root_regions = _root_kernel_buffer_regions(
+            physical_abi_plan.physical_buffer_shapes
+        )
+        body.append(
+            f"{indent * 2}T.reads({', '.join(root_regions)})  "
+            f"# {_DESCRIPTOR_ROOT_READS_MARKER}"
+        )
+        body.append(
+            f"{indent * 2}T.writes({', '.join(root_regions)})  "
+            f"# {_DESCRIPTOR_ROOT_WRITES_MARKER}"
+        )
     if max_rows_per_launch is not None:
         body.append(f"{indent * 2}# max_rows_per_launch: {max_rows_per_launch}")
         body.append(f"{indent * 2}# row_dispatch_mode: {row_dispatch_mode}")
@@ -2867,6 +2905,107 @@ _ALLOC_SHARED_LINE_RE = re.compile(
 )
 
 
+def _coalesced_scratch_bank_name(dtype: str) -> str:
+    return _safe_identifier(f"path_c_{dtype}_scratch_bank")
+
+
+def _root_kernel_buffer_region(buffer_name: str, shape: Sequence[int]) -> str:
+    extents = ", ".join(f"0:{int(dim)}" for dim in shape)
+    return f"{_safe_identifier(buffer_name)}[{extents}]"
+
+
+def _root_kernel_buffer_regions(
+    shapes_by_buffer: Mapping[str, Sequence[int]],
+) -> list[str]:
+    return [
+        _root_kernel_buffer_region(buffer_name, shape)
+        for buffer_name, shape in shapes_by_buffer.items()
+    ]
+
+
+def _append_regions_to_root_annotation(
+    line: str,
+    *,
+    marker: str,
+    extra_regions: Sequence[str],
+) -> str:
+    if marker not in line or not extra_regions:
+        return line
+    match = re.match(r"(\s*T\.(?:reads|writes)\()(.+?)(\)\s*# .*)", line)
+    if match is None:
+        return line
+    existing = match.group(2).strip()
+    regions = [existing] if existing else []
+    regions.extend(extra_regions)
+    return f"{match.group(1)}{', '.join(regions)}{match.group(3)}"
+
+
+def _can_coalesce_spilled_scratch(candidate: Mapping[str, Any]) -> bool:
+    return len(tuple(candidate["shape"])) == 1 and str(candidate["dtype"]) in {
+        "float32",
+        "int32",
+    }
+
+
+def _coalesced_scratch_parameter_count(
+    candidates: Sequence[Mapping[str, Any]],
+) -> int:
+    coalesced_banks = {
+        _coalesced_scratch_bank_name(str(candidate["dtype"]))
+        for candidate in candidates
+        if _can_coalesce_spilled_scratch(candidate)
+    }
+    standalone = sum(
+        1 for candidate in candidates if not _can_coalesce_spilled_scratch(candidate)
+    )
+    return len(coalesced_banks) + standalone
+
+
+def _replace_one_dimensional_buffer_refs(
+    line: str,
+    *,
+    source_name: str,
+    target_name: str,
+    target_offset: int,
+) -> str:
+    if f"{source_name}[" not in line:
+        return line
+    pieces: list[str] = []
+    cursor = 0
+    needle = f"{source_name}["
+    while True:
+        start = line.find(needle, cursor)
+        if start < 0:
+            pieces.append(line[cursor:])
+            break
+        if start > 0 and (line[start - 1].isalnum() or line[start - 1] == "_"):
+            pieces.append(line[cursor : start + len(needle)])
+            cursor = start + len(needle)
+            continue
+        depth = 1
+        index_start = start + len(needle)
+        end = index_start
+        while end < len(line) and depth:
+            char = line[end]
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+            end += 1
+        if depth:
+            pieces.append(line[cursor:])
+            break
+        index_expr = line[index_start : end - 1]
+        if target_offset == 0:
+            replacement = f"{target_name}[{index_expr}]"
+        else:
+            replacement = f"{target_name}[{target_offset} + ({index_expr})]"
+        pieces.append(line[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    return "".join(pieces)
+
+
 def _spill_large_shared_scratch_to_abi(
     source_lines: Sequence[str],
     *,
@@ -2922,7 +3061,10 @@ def _spill_large_shared_scratch_to_abi(
             -int(item["bytes"]),
         ),
     ):
-        if len(selected) >= available_parameters:
+        if (
+            _coalesced_scratch_parameter_count((*selected, candidate))
+            > available_parameters
+        ):
             break
         if (
             not bool(candidate.get("force_scratch_abi"))
@@ -2940,18 +3082,53 @@ def _spill_large_shared_scratch_to_abi(
         ):
             break
 
+    coalesced_offsets: dict[str, tuple[str, int]] = {}
+    coalesced_shapes: dict[str, int] = {}
+    for candidate in selected:
+        if not _can_coalesce_spilled_scratch(candidate):
+            continue
+        bank_name = _coalesced_scratch_bank_name(str(candidate["dtype"]))
+        offset = coalesced_shapes.get(bank_name, 0)
+        coalesced_offsets[str(candidate["name"])] = (bank_name, offset)
+        coalesced_shapes[bank_name] = offset + _flattened_extent(candidate["shape"])
+
     spilled = {
         str(candidate["name"]): {
             "dtype": str(candidate["dtype"]),
-            "param_name": str(candidate["param_name"]),
+            "param_name": coalesced_offsets.get(str(candidate["name"]), ("", 0))[0]
+            or str(candidate["param_name"]),
             "shape": tuple(candidate["shape"]),
             "bytes": int(candidate["bytes"]),
             "internal_scratch_abi": bool(candidate["internal_scratch_abi"]),
+            "coalesced_scratch_bank": str(candidate["name"]) in coalesced_offsets,
+            "bank": coalesced_offsets.get(str(candidate["name"]), ("", 0))[0],
+            "offset": coalesced_offsets.get(str(candidate["name"]), ("", 0))[1],
         }
         for candidate in selected
     }
     if not spilled:
         return "\n".join(source_lines) + "\n", {}
+
+    extra_root_regions = [
+        _root_kernel_buffer_region(bank_name, (extent,))
+        for bank_name, extent in coalesced_shapes.items()
+    ]
+    extra_root_regions.extend(
+        _root_kernel_buffer_region(str(info["param_name"]), info["shape"])
+        for info in spilled.values()
+        if not bool(info.get("coalesced_scratch_bank"))
+    )
+
+    def rewrite_scratch_refs(line: str) -> str:
+        rewritten_line = line
+        for scratch_name, (bank_name, offset) in coalesced_offsets.items():
+            rewritten_line = _replace_one_dimensional_buffer_refs(
+                rewritten_line,
+                source_name=scratch_name,
+                target_name=bank_name,
+                target_offset=offset,
+            )
+        return rewritten_line
 
     rewritten: list[str] = []
     signature_close_index: int | None = None
@@ -2961,17 +3138,41 @@ def _spill_large_shared_scratch_to_abi(
             continue
         if signature_close_index is None and line == "):":
             signature_close_index = len(rewritten)
-        rewritten.append(line)
+        rewritten_line = rewrite_scratch_refs(line)
+        rewritten_line = _append_regions_to_root_annotation(
+            rewritten_line,
+            marker=_DESCRIPTOR_ROOT_READS_MARKER,
+            extra_regions=extra_root_regions,
+        )
+        rewritten_line = _append_regions_to_root_annotation(
+            rewritten_line,
+            marker=_DESCRIPTOR_ROOT_WRITES_MARKER,
+            extra_regions=extra_root_regions,
+        )
+        rewritten.append(rewritten_line)
 
     if signature_close_index is None:
         raise ValueError("descriptor source did not contain a function signature close")
     param_indent = " " * 4
+    coalesced_bank_dtypes = {
+        bank_name: bank_name.removeprefix("path_c_").removesuffix("_scratch_bank")
+        for bank_name in coalesced_shapes
+    }
+    coalesced_param_lines = [
+        f'{param_indent}{bank_name}: T.Tensor(({extent},), '
+        f'"{coalesced_bank_dtypes[bank_name]}"),'
+        for bank_name, extent in coalesced_shapes.items()
+    ]
     spill_param_lines = [
         f'{param_indent}{info["param_name"]}: T.Tensor({_shape_literal(info["shape"])}, '
         f'"{info["dtype"]}"),'
         for name, info in spilled.items()
+        if not bool(info.get("coalesced_scratch_bank"))
     ]
-    rewritten[signature_close_index:signature_close_index] = spill_param_lines
+    rewritten[signature_close_index:signature_close_index] = [
+        *coalesced_param_lines,
+        *spill_param_lines,
+    ]
     return "\n".join(rewritten) + "\n", spilled
 
 
@@ -3010,11 +3211,13 @@ def _validated_physical_abi_policy(policy: str) -> str:
     if normalized not in {
         DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
         DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE,
+        DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE,
     }:
         raise ValueError(
             "physical_abi_policy must be one of "
             f"{DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT!r}, "
-            f"{DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE!r}; "
+            f"{DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE!r}, "
+            f"{DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE!r}; "
             f"got {policy!r}"
         )
     return normalized
@@ -3045,18 +3248,24 @@ def _physical_abi_plan(
 
     bank_order: list[str] = []
     bank_totals: dict[str, int] = {}
+    bank_dtypes: dict[str, str] = {}
     access_by_buffer: dict[str, str] = {}
     logical_to_physical: dict[str, Mapping[str, Any]] = {}
     for buffer_name in external_buffers:
         dtype = dtype_by_buffer[buffer_name]
-        if dtype not in bank_totals:
-            bank_order.append(dtype)
-            bank_totals[dtype] = 0
-        bank_name = _physical_abi_bank_name(dtype)
-        offset = bank_totals[dtype]
+        bank_name = _physical_abi_bank_name_for_buffer(
+            dtype,
+            buffer_name,
+            physical_abi_policy=physical_abi_policy,
+        )
+        if bank_name not in bank_totals:
+            bank_order.append(bank_name)
+            bank_totals[bank_name] = 0
+            bank_dtypes[bank_name] = dtype
+        offset = bank_totals[bank_name]
         shape = shape_by_buffer[buffer_name]
         size = max(1, _flattened_extent(shape))
-        bank_totals[dtype] += size
+        bank_totals[bank_name] += size
         logical_ref = _loop_indexed_buffer_ref(
             buffer_name,
             shape,
@@ -3082,15 +3291,12 @@ def _physical_abi_plan(
             "size": size,
         }
 
-    physical_shapes = {
-        _physical_abi_bank_name(dtype): (bank_totals[dtype],)
-        for dtype in bank_order
-    }
+    physical_shapes = {bank_name: (bank_totals[bank_name],) for bank_name in bank_order}
     param_lines = tuple(
-        f"{indent}{_physical_abi_bank_name(dtype)}: "
-        f"T.Tensor({_shape_literal(physical_shapes[_physical_abi_bank_name(dtype)])}, "
-        f"\"{dtype}\"),"
-        for dtype in bank_order
+        f"{indent}{bank_name}: "
+        f"T.Tensor({_shape_literal(physical_shapes[bank_name])}, "
+        f"\"{bank_dtypes[bank_name]}\"),"
+        for bank_name in bank_order
     )
     return _PhysicalAbiPlan(
         param_lines=param_lines,
@@ -3269,6 +3475,78 @@ def _row_major_buffer_ref(name: str, shape: Sequence[int]) -> str:
 
 def _physical_abi_bank_name(dtype: str) -> str:
     return _safe_identifier(f"path_c_{dtype}_abi_bank")
+
+
+def _physical_abi_bank_name_for_buffer(
+    dtype: str,
+    buffer_name: str,
+    *,
+    physical_abi_policy: str,
+) -> str:
+    if (
+        physical_abi_policy != DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE
+        or dtype != "float32"
+    ):
+        return _physical_abi_bank_name(dtype)
+    return _safe_identifier(f"path_c_{dtype}_{_physical_abi_role(buffer_name)}_abi_bank")
+
+
+def _physical_abi_role(buffer_name: str) -> str:
+    name = str(buffer_name)
+    if name.endswith("_grad"):
+        base = name[: -len("_grad")]
+        canonical_base = _canonical_buffer_name(base)
+        if _physical_abi_activation_like(base, canonical_base):
+            return "activation_gradient"
+        return "parameter_gradient"
+    canonical = _canonical_buffer_name(buffer_name)
+    if (
+        canonical.endswith("_weight")
+        or canonical.endswith("_bias")
+        or canonical in {
+            "mamba3_D",
+            "mamba3_h0",
+            "m2rnn_A_log",
+            "m2rnn_D",
+            "m2rnn_h0",
+            "sparse_mla_sinks",
+            "sparse_mla_sm_scale",
+        }
+    ):
+        return "parameter"
+    if canonical in {
+        "mamba_state",
+        "scan_state",
+        "mamba3_angle_state",
+        "mamba3_conv_state",
+        "m2rnn_conv_state",
+        "m2rnn_h_state",
+    }:
+        return "state"
+    if canonical in {
+        "q_scale",
+        "kv_scale",
+        "lse",
+    }:
+        return "attention"
+    return "activation"
+
+
+def _physical_abi_activation_like(buffer_name: str, canonical_name: str) -> bool:
+    name = str(buffer_name)
+    return (
+        canonical_name
+        in {
+            "hidden",
+            "hidden_after_m2rnn",
+            "attention_out",
+            "mamba3_delta",
+            "m2rnn_delta",
+        }
+        or name.endswith("_hidden")
+        or name.endswith("_delta")
+        or name.endswith("_out")
+    )
 
 
 def _banked_buffer_ref(
@@ -3722,7 +4000,7 @@ def _append_row_phased_hidden_body(
         if not lines:
             return
         if bwd_items:
-            body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} == 0:")
+            body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} != 1:")
             body.extend(f"{indent}{line}" for line in lines)
             return
         body.extend(lines)
@@ -3760,13 +4038,16 @@ def _append_row_phased_hidden_body(
                 if bwd_items:
                     body.append(
                         f"{indent * 2}row_chunk_start = T.if_then_else("
-                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
-                        "logical_row_chunk_start, subchunk_row_chunk_start)"
+                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} == 1, 0, "
+                        f"T.if_then_else({DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                        "logical_row_chunk_start, subchunk_row_chunk_start))"
                     )
                     body.append(
                         f"{indent * 2}row_chunk_stop = T.if_then_else("
-                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
-                        "logical_row_chunk_stop, subchunk_row_chunk_stop)"
+                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} == 1, "
+                        f"{sequence_length}, "
+                        f"T.if_then_else({DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                        "logical_row_chunk_stop, subchunk_row_chunk_stop))"
                     )
                 else:
                     body.append(f"{indent * 2}row_chunk_start = subchunk_row_chunk_start")
@@ -3830,13 +4111,16 @@ def _append_row_phased_hidden_body(
                 if bwd_items:
                     body.append(
                         f"{indent * 2}row_chunk_start = T.if_then_else("
-                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
-                        "logical_row_chunk_start, subchunk_row_chunk_start)"
+                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} == 1, 0, "
+                        f"T.if_then_else({DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                        "logical_row_chunk_start, subchunk_row_chunk_start))"
                     )
                     body.append(
                         f"{indent * 2}row_chunk_stop = T.if_then_else("
-                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
-                        "logical_row_chunk_stop, subchunk_row_chunk_stop)"
+                        f"{DESCRIPTOR_BACKWARD_GATE_PARAM} == 1, "
+                        f"{sequence_length}, "
+                        f"T.if_then_else({DESCRIPTOR_BACKWARD_GATE_PARAM} != 0, "
+                        "logical_row_chunk_stop, subchunk_row_chunk_stop))"
                     )
                 else:
                     body.append(f"{indent * 2}row_chunk_start = subchunk_row_chunk_start")
@@ -3989,7 +4273,7 @@ def _append_row_phased_hidden_body(
             for statement in fragment.statements:
                 bwd_body.append(f"{indent * 3}{statement}")
             bwd_body.append(f"{indent * 3}T.sync_threads()")
-        body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} != 0:")
+        body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} == 1:")
         body.extend(f"{indent}{line}" for line in bwd_body)
         return
     for node, _descriptor, _fragment in bwd_items:
@@ -4130,7 +4414,7 @@ def _append_row_phased_hidden_body(
             continue
         bwd_body.append(f"{indent * 2}{bwd_row_loop}")
         append_row_phased_bwd_item(node, descriptor, fragment)
-    body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} != 0:")
+    body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} == 1:")
     body.extend(f"{indent}{line}" for line in bwd_body)
 
 
@@ -6552,6 +6836,9 @@ def _row_phased_direct_flat_ref(
         match = re.match(r"([A-Za-z_]\w*)\[(\d+) \+ ", ref)
         if match is not None:
             return f"{match.group(1)}[{match.group(2)} + {flat_index_expr}]"
+        bank_match = re.fullmatch(r"([A-Za-z_]\w*)\[(.+)\]", ref)
+        if bank_match is not None and "_abi_bank" in bank_match.group(1):
+            return f"{bank_match.group(1)}[{flat_index_expr}]"
         match = re.fullmatch(r"([A-Za-z_]\w*)\[i\]", ref)
         if match is not None:
             return f"{match.group(1)}[{flat_index_expr}]"
@@ -6590,6 +6877,9 @@ def _row_phased_attention_indices_ref(
             bank_name = match.group(1)
             bank_offset = match.group(2)
             return f"{bank_name}[{bank_offset} + row * {row_width} + {offset}]"
+        bank_match = re.fullmatch(r"([A-Za-z_]\w*)\[(.+)\]", ref)
+        if bank_match is not None and "_abi_bank" in bank_match.group(1):
+            return f"{bank_match.group(1)}[row * {row_width} + {offset}]"
         return f"{name}[row * {row_width} + {offset}]"
     return _indexed_buffer_ref(
         buffer_name,
@@ -6647,6 +6937,9 @@ def _row_phased_attention_bwd_indices_ref(
                 f"{match.group(1)}[{match.group(2)} + "
                 f"{row_expr} * {row_width} + {offset}]"
             )
+        bank_match = re.fullmatch(r"([A-Za-z_]\w*)\[(.+)\]", ref)
+        if bank_match is not None and "_abi_bank" in bank_match.group(1):
+            return f"{bank_match.group(1)}[{row_expr} * {row_width} + {offset}]"
     return f"{name}[{row_expr} * {row_width} + {offset}]"
 
 
@@ -6682,6 +6975,9 @@ def _row_phased_lse_ref(
             bank_name = match.group(1)
             offset = match.group(2)
             return f"{bank_name}[{offset} + {row_expr} * {q_heads} + {head_expr}]"
+        bank_match = re.fullmatch(r"([A-Za-z_]\w*)\[(.+)\]", ref)
+        if bank_match is not None and "_abi_bank" in bank_match.group(1):
+            return f"{bank_match.group(1)}[{row_expr} * {q_heads} + {head_expr}]"
     # Unbanked fallback — direct flat index.
     return f"{name}[{row_expr} * {q_heads} + {head_expr}]"
 
@@ -11124,7 +11420,12 @@ def _is_attention_kv_history_workspace_output(
         return False
     if str(output_name).endswith("_grad"):
         return False
-    if _canonical_buffer_name(output_name) not in {"kv_fp8", "kv_scale"}:
+    if _canonical_buffer_name(output_name) not in {
+        "q_fp8",
+        "q_scale",
+        "kv_fp8",
+        "kv_scale",
+    }:
         return False
     return any(
         consumer.op_name in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
@@ -11148,7 +11449,12 @@ def _uses_external_kv_history_workspace(
         return False
     if loop_policy != DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
         return False
-    return _canonical_buffer_name(buffer_name) in {"kv_fp8", "kv_scale"}
+    return _canonical_buffer_name(buffer_name) in {
+        "q_fp8",
+        "q_scale",
+        "kv_fp8",
+        "kv_scale",
+    }
 
 
 def _external_buffers_for_nodes(
@@ -12072,7 +12378,7 @@ def _physical_abi_policy_for_region(
     )
     external_buffer_count = len(_external_buffers_for_nodes(nodes, internal_buffers))
     if external_buffer_count > DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT:
-        return DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE
+        return DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE
     return DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT
 
 

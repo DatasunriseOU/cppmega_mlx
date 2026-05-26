@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import mlx.core as mx
 
-from cppmega_mlx._mlx_lm_imports import KVCache, QuantizedKVCache
 from cppmega_mlx.inference.quantization import make_quantized_kv_cache
 
-_LayerCache: TypeAlias = KVCache | QuantizedKVCache
+if TYPE_CHECKING:
+    from mlx_lm.models.cache import KVCache
+
+_LayerCache: TypeAlias = Any
 _StateTree: TypeAlias = mx.array | tuple["_StateTree", ...]
 
 
@@ -53,6 +55,8 @@ class ContiguousKVCache:
     """A thin validated wrapper around one MLX-LM KV cache per layer."""
 
     def __init__(self, config: ContiguousKVCacheConfig) -> None:
+        from cppmega_mlx._mlx_lm_imports import KVCache
+
         self.config = config
         self.layers: list[_LayerCache] = [
             _make_layer_cache(config) for _ in range(config.num_layers)
@@ -311,6 +315,8 @@ def prefill_contiguous_kv_cache(
             destination.config.batch_size,
         )
         dst_layer.state = copied_state
+        from cppmega_mlx._mlx_lm_imports import QuantizedKVCache
+
         if isinstance(dst_layer, QuantizedKVCache):
             dst_layer.meta_state = src_layer.meta_state
 
@@ -340,6 +346,8 @@ def _make_layer_cache(config: ContiguousKVCacheConfig) -> _LayerCache:
         return make_quantized_kv_cache(
             bits=config.kv_bits, group_size=config.kv_group_size
         )
+    from cppmega_mlx._mlx_lm_imports import KVCache
+
     return KVCache()
 
 

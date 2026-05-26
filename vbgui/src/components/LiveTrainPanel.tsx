@@ -22,6 +22,14 @@ export interface LiveTrainEvent {
   ts?: number | null;
   grad_norms?: Record<string, number>;
   expert_load?: number[] | null;
+  dataset_progress?: {
+    progress_percent?: number;
+    token_offset?: number;
+    download_speed?: string | null;
+  } | null;
+  generated_text?: string | null;
+  output_token?: string | null;
+  mtp_logits?: any;
 }
 
 export interface LiveTrainPanelProps {

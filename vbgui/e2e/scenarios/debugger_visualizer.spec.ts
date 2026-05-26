@@ -89,8 +89,12 @@ test.describe("Interactive Neural Debugger & Sweep Validator", () => {
     for (const activation of ACTIVATIONS) {
       console.log(`Testing activation: ${activation}`);
       
-      // Open MLP/gated_mlp brick context panel (excluding sidebar palette using class filter)
-      const mlpNode = page.locator(".react-flow__node[data-testid*='gated_mlp'], .react-flow__node[data-testid*='mlp']").first();
+      // Target only true custom canvas nodes (starts with brick-node-, contains gated_mlp/mlp, and excludes palette)
+      const mlpNode = page.locator(
+        "[data-testid^='brick-node-'][data-testid*='gated_mlp']:not([data-testid*='palette']), " +
+        "[data-testid^='brick-node-'][data-testid*='mlp']:not([data-testid*='palette'])"
+      ).first();
+      
       const mlpId = await mlpNode.getAttribute("data-testid").then(id => id?.replace("brick-node-", ""));
       await mlpNode.click();
       

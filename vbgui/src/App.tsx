@@ -6,6 +6,7 @@ import {
 } from "@xyflow/react";
 
 import { FlowCanvas } from "@/components/FlowCanvas";
+import { type ResearchHook } from "./components/sidebar/ResearchHooksTab";
 import { layoutFlow } from "@/lib/elk";
 import { GalleryTab } from "@/components/GalleryTab";
 import { GalleryScaleDownSlider } from "@/components/GalleryScaleDownSlider";
@@ -82,6 +83,9 @@ interface BrickSpec {
   name?: string;
   params?: Record<string, unknown>;
   parallel?: BrickSpec[];
+  repeats?: number;
+  label?: string;
+  block_specs?: BrickSpec[];
 }
 
 function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] } {
@@ -118,8 +122,40 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
   x += 220;
 
   // 3. Main bricks from specs
+  const RESIDUAL_KINDS = new Set([
+    'attention', 'mlp', 'moe', 'mlstm', 'engram', 'gdn', 'kda', 'gated_attention', 
+    'mla', 'mla_absorb', 'rmsnorm', 'csa_hca', 'lightning_indexer', 'dsv4_attention'
+  ]);
+
   for (const s of specs) {
-    if (s.parallel && Array.isArray(s.parallel)) {
+    const repeats = s.repeats ?? 1;
+    if (repeats > 1 || s.kind === "block_group") {
+      const name = s.name ?? `${s.kind}_group_${nodes.length}`;
+      const block_specs = s.block_specs ?? [{ kind: s.kind, params: s.params ?? {} }];
+      const label = s.label ?? (s.block_specs ? `[${s.block_specs.map(b => b.kind).join(" + ")}]` : `[${s.kind}]`);
+
+      nodes.push({
+        id: name,
+        type: "block_group",
+        position: { x, y },
+        data: {
+          label,
+          repeats,
+          block_specs,
+        } as any,
+      });
+
+      if (lastName) {
+        edges.push({
+          id: `${lastName}->${name}`,
+          source: lastName,
+          target: name,
+          data: { severity: "info" },
+        });
+      }
+      lastName = name;
+      x += 220;
+    } else if (s.parallel && Array.isArray(s.parallel)) {
       const branches = s.parallel;
       const branchNames: string[] = [];
       
@@ -168,23 +204,72 @@ function presetSpecsToNodes(specs: BrickSpec[]): { nodes: Node[]; edges: Edge[] 
       lastName = addNodeName;
       x += 220;
     } else {
-      const name = s.name ?? `${s.kind}_${nodes.length}`;
-      nodes.push({
-        id: name,
-        type: "brick",
-        position: { x, y },
-        data: { kind: s.kind, params: s.params ?? {} } as never,
-      });
-      if (lastName) {
+      const isResidual = RESIDUAL_KINDS.has(s.kind);
+      if (isResidual) {
+        const name = s.name ?? `${s.kind}_${nodes.length}`;
+        nodes.push({
+          id: name,
+          type: "brick",
+          position: { x, y: y - 100 },
+          data: { kind: s.kind, params: s.params ?? {} } as never,
+        });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${name}`,
+            source: lastName,
+            target: name,
+            data: { severity: "info" },
+          });
+        }
+        
+        x += 220;
+        
+        const addNodeName = `residual_add_${nodes.length}`;
+        nodes.push({
+          id: addNodeName,
+          type: "residual_add",
+          position: { x, y },
+          data: { kind: "residual_add", params: {} } as any,
+        });
+        
         edges.push({
-          id: `${lastName}->${name}`,
-          source: lastName,
-          target: name,
+          id: `${name}->${addNodeName}`,
+          source: name,
+          target: addNodeName,
           data: { severity: "info" },
         });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${addNodeName}`,
+            source: lastName,
+            target: addNodeName,
+            data: { severity: "info" },
+          });
+        }
+        
+        lastName = addNodeName;
+        x += 220;
+      } else {
+        const name = s.name ?? `${s.kind}_${nodes.length}`;
+        nodes.push({
+          id: name,
+          type: "brick",
+          position: { x, y },
+          data: { kind: s.kind, params: s.params ?? {} } as never,
+        });
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${name}`,
+            source: lastName,
+            target: name,
+            data: { severity: "info" },
+          });
+        }
+        lastName = name;
+        x += 220;
       }
-      lastName = name;
-      x += 220;
     }
     
     if (x > 1100) { x = 60; y += 180; }
@@ -362,6 +447,8 @@ export function App(): JSX.Element {
   // when an error/cancel terminates the next run.
   const [lastTrainRunId, setLastTrainRunId] = useState<string | null>(null);
   const [selectedBrickId, setSelectedBrickId] = useState<string | null>(null);
+  const [tappedEdgeId, setTappedEdgeId] = useState<string | null>(null);
+  const [hooks, setHooks] = useState<Record<string, ResearchHook>>({});
   const [inferenceLog, setInferenceLog] = useState<
     { brick: string; param: string; value: unknown;
       source: "user" | "auto"; reason: string }[]
@@ -1014,6 +1101,175 @@ export function App(): JSX.Element {
       console.error("Auto align layout failed:", err);
     }
   }, [nodes, edges]);
+
+  const handleUnpackBlockGroup = useCallback(async (groupId: string, countToUnpack: number) => {
+    const groupNode = nodes.find(n => n.id === groupId);
+    if (!groupNode || groupNode.type !== "block_group") return;
+
+    const data = groupNode.data as any;
+    const repeats = data.repeats;
+    const blockSpecs = data.block_specs || [];
+    const remainingRepeats = repeats - countToUnpack;
+
+    const incoming = edges.filter(e => e.target === groupId);
+    const outgoing = edges.filter(e => e.source === groupId);
+
+    const RESIDUAL_KINDS = new Set([
+      'attention', 'mlp', 'moe', 'mlstm', 'engram', 'gdn', 'kda', 'gated_attention', 
+      'mla', 'mla_absorb', 'rmsnorm', 'csa_hca', 'lightning_indexer', 'dsv4_attention'
+    ]);
+
+    function unpackSpecsToNodes(specs: any[], startX: number, startY: number, initialLastName: string | null) {
+      const newNodes: Node[] = [];
+      const newEdges: Edge[] = [];
+      let x = startX, y = startY;
+      let lastName = initialLastName;
+      
+      for (const s of specs) {
+        const isResidual = RESIDUAL_KINDS.has(s.kind);
+        if (isResidual) {
+          const name = s.name ?? `${s.kind}_unpacked_${Date.now()}_${newNodes.length}`;
+          newNodes.push({
+            id: name,
+            type: "brick",
+            position: { x, y: y - 100 },
+            data: { kind: s.kind, params: s.params ?? {} } as never,
+          });
+          
+          if (lastName) {
+            newEdges.push({
+              id: `${lastName}->${name}`,
+              source: lastName,
+              target: name,
+              data: { severity: "info" },
+            });
+          }
+          
+          x += 220;
+          
+          const addNodeName = `residual_add_unpacked_${Date.now()}_${newNodes.length}`;
+          newNodes.push({
+            id: addNodeName,
+            type: "residual_add",
+            position: { x, y },
+            data: { kind: "residual_add", params: {} } as any,
+          });
+          
+          newEdges.push({
+            id: `${name}->${addNodeName}`,
+            source: name,
+            target: addNodeName,
+            data: { severity: "info" },
+          });
+          
+          if (lastName) {
+            newEdges.push({
+              id: `${lastName}->${addNodeName}`,
+              source: lastName,
+              target: addNodeName,
+              data: { severity: "info" },
+            });
+          }
+          
+          lastName = addNodeName;
+          x += 220;
+        } else {
+          const name = s.name ?? `${s.kind}_unpacked_${Date.now()}_${newNodes.length}`;
+          newNodes.push({
+            id: name,
+            type: "brick",
+            position: { x, y },
+            data: { kind: s.kind, params: s.params ?? {} } as never,
+          });
+          if (lastName) {
+            newEdges.push({
+              id: `${lastName}->${name}`,
+              source: lastName,
+              target: name,
+              data: { severity: "info" },
+            });
+          }
+          lastName = name;
+          x += 220;
+        }
+      }
+      return { newNodes, newEdges, lastLastName: lastName, finalX: x, finalY: y };
+    }
+
+    let currentLastName = incoming.length > 0 ? incoming[0].source : null;
+    let currentX = groupNode.position.x;
+    let currentY = groupNode.position.y;
+
+    const accumulatedNodes: Node[] = [];
+    const accumulatedEdges: Edge[] = [];
+
+    for (let r = 0; r < countToUnpack; r++) {
+      const suffix = `_r${r}_${Date.now()}`;
+      const specializedSpecs = blockSpecs.map((s: any, sIdx: number) => ({
+        ...s,
+        name: `${s.kind}_unpacked${suffix}_${sIdx}`,
+      }));
+      
+      const res = unpackSpecsToNodes(specializedSpecs, currentX, currentY, currentLastName);
+      accumulatedNodes.push(...res.newNodes);
+      accumulatedEdges.push(...res.newEdges);
+      currentLastName = res.lastLastName;
+      currentX = res.finalX;
+      currentY = res.finalY;
+    }
+
+    const filteredNodes = nodes.filter(n => n.id !== groupId);
+    const filteredEdges = edges.filter(e => e.target !== groupId && e.source !== groupId);
+
+    const nextNodes = [...filteredNodes, ...accumulatedNodes];
+    const nextEdges = [...filteredEdges, ...accumulatedEdges];
+
+    if (remainingRepeats > 0) {
+      // Keep folded block group node with remaining count
+      const updatedGroupNode: Node = {
+        ...groupNode,
+        position: { x: currentX, y: currentY },
+        data: {
+          ...groupNode.data,
+          repeats: remainingRepeats,
+        } as any
+      };
+      
+      nextNodes.push(updatedGroupNode);
+
+      if (currentLastName) {
+        nextEdges.push({
+          id: `${currentLastName}->${groupId}`,
+          source: currentLastName,
+          target: groupId,
+          data: { severity: "info" },
+        });
+      }
+
+      // Restore outgoing edges from groupNode
+      outgoing.forEach(e => {
+        nextEdges.push({
+          ...e,
+          source: groupId,
+        });
+      });
+    } else {
+      // Connect last unpacked node to all outgoing targets
+      outgoing.forEach(e => {
+        if (currentLastName) {
+          nextEdges.push({
+            ...e,
+            id: `${currentLastName}->${e.target}`,
+            source: currentLastName,
+          });
+        }
+      });
+    }
+
+    setNodes(nextNodes);
+    setEdges(nextEdges);
+    await handleAutoAlign(nextNodes, nextEdges);
+  }, [nodes, edges, handleAutoAlign]);
 
   const handleGenerateFromWizard = useCallback(async (name: string, options: WizardOptions) => {
     try {
@@ -1765,8 +2021,8 @@ export function App(): JSX.Element {
           tokens: debugState.tokens,
           onPromptChange: (val: string) => debugState.setPrompt(val),
           isActiveNode,
-          selectedPath: (n.data?.params?.selected_path as string) || null,
-          contentType: (n.data?.params?.content_type as string) || null,
+          selectedPath: ((n.data as any)?.params?.selected_path as string) || null,
+          contentType: ((n.data as any)?.params?.content_type as string) || null,
           progressPercent: lastEvent?.dataset_progress?.progress_percent || 0,
           tokenOffset: lastEvent?.dataset_progress?.token_offset || 0,
           downloadSpeed: lastEvent?.dataset_progress?.download_speed || null,
@@ -1786,6 +2042,15 @@ export function App(): JSX.Element {
         };
       }
 
+      if (n.type === "block_group") {
+        additionalData = {
+          ...additionalData,
+          onUnpack: (groupId: string, count: number) => {
+            void handleUnpackBlockGroup(groupId, count);
+          }
+        };
+      }
+
       return {
         ...n,
         data: {
@@ -1801,8 +2066,8 @@ export function App(): JSX.Element {
     if (!debugState.debuggerMode) return enriched;
 
     const realTokenizer = nodes.find((n) => n.type === "tokenizer_virtual");
-    const selectedPath = realTokenizer?.data?.params?.selected_path || null;
-    const contentType = realTokenizer?.data?.params?.content_type || null;
+    const selectedPath = (realTokenizer?.data as any)?.params?.selected_path || null;
+    const contentType = (realTokenizer?.data as any)?.params?.content_type || null;
 
     const minX = modelNodes.length > 0 ? Math.min(...modelNodes.map((n) => n.position.x)) : 100;
     const firstNode = modelNodes[0];
@@ -1897,7 +2162,19 @@ export function App(): JSX.Element {
     };
 
     let enriched = edges.map((e) => {
-      if (!debugState.debuggerMode) return e;
+      const isTapped = e.id === tappedEdgeId;
+      const hasHook = !!hooks[e.id];
+
+      if (!debugState.debuggerMode) {
+        return {
+          ...e,
+          data: {
+            ...e.data,
+            isTapped,
+            hasHook,
+          }
+        };
+      }
 
       const srcIdx = getStepIndex(e.source);
       const dstIdx = getStepIndex(e.target);
@@ -1913,6 +2190,8 @@ export function App(): JSX.Element {
           debuggerMode: true,
           direction: debugState.direction,
           isActiveFlow,
+          isTapped,
+          hasHook,
         },
       };
     });
@@ -2283,6 +2562,10 @@ export function App(): JSX.Element {
                   onAutoAlign={handleAutoAlign}
                   onNodesChange={onNodesChange}
                   onEdgesChange={onEdgesChange}
+                  onEdgeTap={(edgeId) => {
+                    setTappedEdgeId(edgeId);
+                    setActiveSidebarTab("research_hooks");
+                  }}
                   onInsertAdapter={(kind, edge) => {
                     const baseName = `${kind}_insert_${nodes.length}`;
                     const src = nodes.find((n) => n.id === edge.source);
@@ -2488,6 +2771,22 @@ export function App(): JSX.Element {
                 rpc={rpc}
                 graphNodes={nodes}
                 graphEdges={edges}
+                tappedEdgeId={tappedEdgeId}
+                hooks={hooks}
+                onUpdateHook={(edgeId, hook) => {
+                  setHooks((prev) => ({ ...prev, [edgeId]: hook }));
+                }}
+                onRemoveHook={(edgeId) => {
+                  setHooks((prev) => {
+                    const next = { ...prev };
+                    delete next[edgeId];
+                    return next;
+                  });
+                  if (tappedEdgeId === edgeId) {
+                    setTappedEdgeId(null);
+                  }
+                }}
+                liveTrainEvents={liveTrain.events}
                 inferenceLog={inferenceLog}
                 verifySpec={buildVerifyParams(
                   nodes, edges, spec, availableSideChannels, dimEnv)}

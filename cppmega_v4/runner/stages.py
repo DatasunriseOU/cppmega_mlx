@@ -228,6 +228,39 @@ def stage_verify_build_spec(ctx: StageContext) -> StageResult:
             return _fail("verify_build_spec", t0,
                          RuntimeError("parse stage did not run"))
         diag = verify_build_spec(ctx.build_spec, check_shapes=False)
+
+        # Read registered research hooks
+        opts = ctx.opts("verify_build_spec")
+        research_hooks = opts.get("research_hooks") or opts.get("hooks") or {}
+        if not research_hooks:
+            train_opts = ctx.opts("train")
+            research_hooks = train_opts.get("research_hooks") or train_opts.get("hooks") or {}
+
+        hooks_dict = {}
+        if isinstance(research_hooks, dict):
+            hooks_dict = research_hooks
+        elif isinstance(research_hooks, list):
+            for h in research_hooks:
+                if isinstance(h, dict) and "node_name" in h:
+                    hooks_dict[h["node_name"]] = h
+
+        valid_nodes = {n.name for n in ctx.build_spec.graph.nodes}
+        missing_hook_nodes = []
+        for node_name in hooks_dict:
+            if node_name not in valid_nodes:
+                missing_hook_nodes.append(node_name)
+
+        if missing_hook_nodes:
+            from cppmega_v4.buildspec.diagnostics import BuildDiagnostic, BuildDiagnosticSeverity, BuildDiagnostics
+            extra_diags = []
+            for node_name in missing_hook_nodes:
+                extra_diags.append(BuildDiagnostic(
+                    severity=BuildDiagnosticSeverity.WARNING,
+                    component="research_hooks",
+                    message=f"Research hook targets node '{node_name}' which does not exist in the graph.",
+                ))
+            diag = BuildDiagnostics(diagnostics=diag.diagnostics + tuple(extra_diags))
+
         return StageResult(
             name="verify_build_spec",
             status="fail" if diag.has_errors else "ok",
@@ -559,6 +592,9 @@ def stage_train(ctx: StageContext) -> StageResult:
         # Re-materialise the graph with instantiate=True so backward works.
         specs = _graph_to_specs(ctx.spec.graph)
         graph = from_block_specs(specs, hidden_size=hidden, instantiate=True)
+        for n in graph.nodes:
+            if n.module is not None:
+                n.module.name = n.name
         modules = [n.module for n in graph.nodes]
         if not all(modules):
             raise RuntimeError("graph has un-instantiated nodes")
@@ -845,6 +881,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                     out = next(o for o in out if hasattr(o, "shape"))
                 elif isinstance(out, dict):
                     out = next(v for v in out.values() if hasattr(v, "shape"))
+
+                # Autograd-safe research hook invocation
+                if hasattr(all_modules, "_activation_probes") and all_modules._activation_probes:
+                    mod_name = getattr(mod, "name", None)
+                    probe_key = None
+                    if mod_name in all_modules._activation_probes:
+                        probe_key = mod_name
+                    elif f"layer_{idx}" in all_modules._activation_probes:
+                        probe_key = f"layer_{idx}"
+                    elif str(idx) in all_modules._activation_probes:
+                        probe_key = str(idx)
+
+                    if probe_key is not None:
+                        patched = all_modules._activation_probes[probe_key](probe_key, out)
+                        if patched is not None:
+                            out = patched
+
                 x = out
             return x
 
@@ -1027,6 +1080,101 @@ def stage_train(ctx: StageContext) -> StageResult:
             all_modules.train_token_embedding = train_token_embedding
         if side_channel_token_embedding is not None:
             all_modules.side_channel_token_embedding = side_channel_token_embedding
+
+        # Setup research hooks and monkeypatch attach_activation_probe
+        current_step_stats = {}
+        sae_cache = {}
+
+        def get_sae_weights(name: str, hidden_dim: int, dtype):
+            if name not in sae_cache:
+                H_sae = 2 * hidden_dim
+                key1 = mx.random.key(1234)
+                key2 = mx.random.key(5678)
+                W_enc = mx.random.normal(shape=(hidden_dim, H_sae), key=key1).astype(dtype) * 0.02
+                W_dec = mx.random.normal(shape=(H_sae, hidden_dim), key=key2).astype(dtype) * 0.02
+                b_enc = mx.zeros((H_sae,), dtype=dtype)
+                b_dec = mx.zeros((hidden_dim,), dtype=dtype)
+                sae_cache[name] = (W_enc, W_dec, b_enc, b_dec)
+            return sae_cache[name]
+
+        def make_probe(name: str, config: dict):
+            hook_type = str(config.get("type", "monitor")).lower()
+            threshold = float(config.get("threshold", 0.1))
+            noise_level = float(config.get("noise_level", 0.05))
+            causal_factor = float(config.get("causal_factor", 1.0))
+
+            def probe_fn(node_name: str, t: mx.array) -> mx.array | None:
+                t_f32 = t.astype(mx.float32)
+                mean_val = float(mx.mean(t_f32).item())
+                std_val = float(mx.std(t_f32).item())
+                l2_val = float(mx.linalg.norm(t_f32).item())
+                min_val = float(mx.min(t_f32).item())
+                max_val = float(mx.max(t_f32).item())
+                
+                stats = {
+                    "mean": round(mean_val, 6),
+                    "std": round(std_val, 6),
+                    "l2_norm": round(l2_val, 6),
+                    "min": round(min_val, 6),
+                    "max": round(max_val, 6)
+                }
+
+                sparsity_val = float(mx.mean(mx.abs(t_f32) > threshold).item())
+                stats["sparsity"] = round(sparsity_val, 6)
+
+                H = t.shape[-1]
+                W_enc, W_dec, b_enc, b_dec = get_sae_weights(node_name, H, t.dtype)
+                centered = t - b_dec
+                z = mx.maximum(centered @ W_enc + b_enc, mx.array(0.0, dtype=t.dtype))
+                t_hat = z @ W_dec + b_dec
+                
+                z_f32 = z.astype(mx.float32)
+                l0_sparsity = float(mx.mean(z_f32 > 0.0).item())
+                reconstruction_mse = float(mx.mean((t_f32 - t_hat.astype(mx.float32)) ** 2).item())
+                
+                stats["sae_l0_sparsity"] = round(l0_sparsity, 6)
+                stats["sae_reconstruction_mse"] = round(reconstruction_mse, 6)
+
+                current_step_stats[node_name] = stats
+
+                if hook_type == "causal":
+                    if noise_level > 0.0:
+                        noise = mx.random.normal(shape=t.shape, dtype=t.dtype) * noise_level
+                        return t * causal_factor + noise
+                    else:
+                        return t * causal_factor
+                
+                return None
+            return probe_fn
+
+        def attach_activation_probe(name: str, probe: Callable[[str, mx.array], mx.array | None]) -> None:
+            if not hasattr(all_modules, "_activation_probes"):
+                all_modules._activation_probes = {}
+            all_modules._activation_probes[name] = probe
+
+        def detach_activation_probes() -> None:
+            if hasattr(all_modules, "_activation_probes"):
+                all_modules._activation_probes.clear()
+
+        all_modules.attach_activation_probe = attach_activation_probe
+        all_modules.detach_activation_probes = detach_activation_probes
+
+        # Read registered research hooks
+        research_hooks = opts.get("research_hooks") or opts.get("hooks") or {}
+        if not research_hooks and hasattr(ctx.spec, "params"):
+            research_hooks = ctx.spec.params.get("research_hooks") or ctx.spec.params.get("hooks") or {}
+
+        hooks_dict = {}
+        if isinstance(research_hooks, dict):
+            hooks_dict = research_hooks
+        elif isinstance(research_hooks, list):
+            for h in research_hooks:
+                if isinstance(h, dict) and "node_name" in h:
+                    hooks_dict[h["node_name"]] = h
+
+        for name, config in hooks_dict.items():
+            if isinstance(config, dict):
+                all_modules.attach_activation_probe(name, make_probe(name, config))
 
         # H16: real dtype switching. master_dtype/train_dtype/fp8_active
         # are computed below from spec.optim.mixed_precision +
@@ -1734,6 +1882,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                 p_dtype = next((p.dtype for p in all_modules.parameters() if hasattr(p, "dtype")), None)
                 if p_dtype is not None:
                     emb = emb.astype(p_dtype)
+            current_step_stats.clear()
             _step_t0 = time.perf_counter()
             if _compiled_step_value_and_grad is not None:
                 loss, grads = _compiled_step_value_and_grad(emb, targets)
@@ -2012,6 +2161,9 @@ def stage_train(ctx: StageContext) -> StageResult:
                     ]
 
                 print(f"[debug_step] publishing step={step}", flush=True)
+                if current_step_stats:
+                    print(f"[debug_hooks] step={step} research_hooks stats: {dict(current_step_stats)}", flush=True)
+
                 train_event_bus.publish(
                     opts.get("run_id") or opts.get("abort_token"),
                     {"step": int(step),
@@ -2026,6 +2178,7 @@ def stage_train(ctx: StageContext) -> StageResult:
                      "expert_load": step_expert_load,
                      "dataset_progress": dataset_progress,
                      "mtp_logits": mtp_logits,
+                     "research_hooks": dict(current_step_stats),
                      "generated_text": opts.get("inference_probe_text") or "The cat sat on the mat",
                      "output_token": "mat",
                      "ts": float(time.time())},

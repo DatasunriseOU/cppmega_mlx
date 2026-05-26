@@ -97,6 +97,12 @@ def _line_uses_logical_buffer(
     mapping = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
     info = mapping.get(logical_name)
     if info is None:
+        aliases = getattr(prim_func, "_cppmega_path_c_internal_scratch_abi_aliases", {})
+        info = aliases.get(logical_name)
+    if info is None:
+        spilled = getattr(prim_func, "_cppmega_path_c_spilled_shared_scratch_shapes", {})
+        info = spilled.get(logical_name)
+    if info is None:
         return False
     if info["offset"] == 0:
         return f"{info['bank']}[" in line
@@ -118,6 +124,17 @@ def _shared_alloc_bytes(source: str) -> int:
             elements *= int(dim_text)
         total += elements * dtype_bytes[dtype]
     return total
+
+
+def _max_tir_region_line_length(source: str) -> int:
+    return max(
+        (
+            len(line)
+            for line in source.splitlines()
+            if "T.reads" in line or "T.writes" in line
+        ),
+        default=0,
+    )
 
 
 @T.prim_func
@@ -194,6 +211,8 @@ def _toy_path_c_model_train_block(
     sparse_mla_sm_scale: T.Tensor((4,), "float32"),
     sparse_mla_sinks: T.Tensor((4,), "float32"),
     sparse_mla_has_sinks: T.Tensor((4,), "int32"),
+    q_fp8: T.Tensor((4,), "uint8"),
+    q_scale: T.Tensor((4,), "float32"),
     kv_fp8: T.Tensor((4,), "uint8"),
     kv_scale: T.Tensor((4,), "float32"),
     attention_out: T.Tensor((4,), "float32"),
@@ -210,8 +229,6 @@ def _toy_path_c_model_train_block(
         m2rnn_hidden = T.alloc_local((4,), "float32")
         m2rnn_delta = T.alloc_local((4,), "float32")
         attention_hidden = T.alloc_local((4,), "float32")
-        q_fp8 = T.alloc_local((4,), "float32")
-        q_scale = T.alloc_local((4,), "float32")
         indices = T.alloc_local((4,), "int32")
         mamba3_entry_rmsnorm_hidden[0] = (
             hidden[0] + mamba3_entry_rmsnorm_weight[0] * 0.0
@@ -239,13 +256,13 @@ def _toy_path_c_model_train_block(
             + m2rnn_residual_to_attention_norm_weight[0] * 0.0
             + attention_q_proj_weight[0] * 0.0
         )
-        q_fp8[0] = attention_hidden[0]
+        q_fp8[0] = T.cast(attention_hidden[0], "uint8")
         q_scale[0] = 1.0
         kv_fp8[0] = T.cast(attention_hidden[0], "uint8")
         kv_scale[0] = 1.0
         indices[0] = 0
         attention_out[0] = (
-            q_fp8[0]
+            T.cast(q_fp8[0], "float32")
             + T.cast(kv_fp8[0], "float32")
             + q_scale[0]
             + kv_scale[0]
@@ -908,9 +925,9 @@ def test_mamba3_fp8_template_has_expected_train_block_pattern() -> None:
             "route_1_R_residual_norm->route_2_A_qkv_projection:"
             "route_1_R_residual_norm_hidden:internal,"
             "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
-            "route_2_A_qkv_projection_q_fp8:internal,"
+            "route_2_A_qkv_projection_q_fp8:workspace,"
             "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
-            "route_2_A_qkv_projection_q_scale:internal,"
+            "route_2_A_qkv_projection_q_scale:workspace,"
             "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
             "route_2_A_qkv_projection_kv_fp8:workspace,"
             "route_2_A_qkv_projection->route_2_A_sparse_mla_fp8_apply:"
@@ -1003,8 +1020,8 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         for edge in region.edges
         if edge.producer == "attention_qkv_projection"
     } == {
-        "q_fp8": "internal",
-        "q_scale": "internal",
+        "q_fp8": "workspace",
+        "q_scale": "workspace",
         "kv_fp8": "workspace",
         "kv_scale": "workspace",
         "indices": "internal",
@@ -1020,8 +1037,6 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
         "hidden_after_mamba3",
         "m2rnn_delta",
         "attention_hidden",
-        "q_fp8",
-        "q_scale",
         "indices",
     )
     external_buffers = plan.schedule_contract.required_external_buffers
@@ -1030,6 +1045,8 @@ def test_mamba3_fp8_acceptance_fixture_region_includes_residual_norm_and_attenti
     assert "hidden_after_m2rnn" in external_buffers
     assert "attention_out" in external_buffers
     assert "lse" in external_buffers
+    assert "q_fp8" in external_buffers
+    assert "q_scale" in external_buffers
     assert "kv_fp8" in external_buffers
     assert "kv_scale" in external_buffers
     assert set(MAMBA3_FP8_TRAIN_REQUIRED_REAL_ABI_INPUTS).issubset(
@@ -1416,7 +1433,8 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_per_brick_emitters() -> None:
     )
     generated_source = prim_func._cppmega_path_c_generated_source
 
-    assert "mamba3_scan_mamba3_proj" in generated_source
+    assert "mamba3_scan_proj_dim" in generated_source
+    assert "mamba3_scan_mamba3_accum" in generated_source
     assert "m2rnn_packed_post_m2rnn_projected" in generated_source
     assert "attention_qkv_projection_attention_q_projected" in generated_source
     assert "attention_qkv_projection_attention_kv_projected" in generated_source
@@ -1873,9 +1891,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
     # exact generated backward fragment.
     assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 9
     assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
-    assert 'mamba3_scan_mamba3_projected_vec: T.Tensor((18784,), "float32"),' in (
-        generated_source
-    )
+    assert 'path_c_float32_scratch_bank: T.Tensor' in generated_source
     assert "mamba3_scan_mamba3_projected_vec[mamba3_scan_proj_dim]" in (
         generated_source
     )
@@ -1906,10 +1922,7 @@ def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> Non
     cfg = local_gb10_quarter_profile().hybrid_config()
     activation_extent = cfg.max_seq_length * cfg.hidden_size
 
-    assert (
-        'mamba3_scan_mamba3_projected_vec: T.Tensor((18784,), "float32"),'
-        in generated_source
-    )
+    assert 'path_c_float32_scratch_bank: T.Tensor' in generated_source
     assert (
         'mamba3_scan_mamba3_projected_vec = T.alloc_shared((18784,), "float32")'
         not in generated_source
@@ -1919,25 +1932,51 @@ def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> Non
     assert spilled["mamba3_scan_mamba3_projected_vec"]["bytes"] == 75136
     assert (
         spilled["mamba3_scan_mamba3_projected_vec"]["param_name"]
-        == "mamba3_scan_mamba3_projected_vec"
+        == "path_c_float32_scratch_bank"
     )
+    assert spilled["mamba3_scan_mamba3_projected_vec"]["coalesced_scratch_bank"] is True
     assert spilled["mamba3_scan_mamba3_conv_history"]["dtype"] == "float32"
     assert spilled["mamba3_scan_mamba3_conv_history"]["shape"] == (2, 11264)
     assert spilled["mamba3_scan_mamba3_conv_history"]["bytes"] == 90112
     assert spilled["mamba3_scan_mamba3_conv_vec"]["bytes"] == 45056
     assert spilled["mamba3_scan_mamba3_out_inner"]["bytes"] == 28672
     assert spilled["mamba3_delta"]["internal_scratch_abi"] is True
-    assert (
-        f'mamba3_delta: T.Tensor(({activation_extent},), "float32"),'
-        in generated_source
-    )
+    assert spilled["mamba3_delta"]["param_name"] == "path_c_float32_scratch_bank"
+    assert spilled["mamba3_delta"]["shape"] == (activation_extent,)
+    assert spilled["mamba3_delta"]["coalesced_scratch_bank"] is True
     assert (
         f'mamba3_delta = T.alloc_shared(({activation_extent},), "float32")'
         not in generated_source
     )
     assert "mamba3_delta" in prim_func._cppmega_path_c_internal_scratch_abi_buffers
+    assert "mamba3_delta" in prim_func._cppmega_path_c_internal_scratch_abi_aliases
     assert _shared_alloc_bytes(generated_source) <= 32 * 1024
     assert len(tuple(prim_func.params)) <= 31
+
+
+def test_mamba3_fp8_train_descriptor_splits_float32_abi_region_surface() -> None:
+    import tvm
+
+    prim_func = mamba3_fp8_train_fusion_schedule_template(
+        build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
+    )
+    physical_shapes = prim_func._cppmega_path_c_physical_buffer_abi_shapes
+    generated_source = prim_func._cppmega_path_c_generated_source
+
+    assert "path_c_float32_abi_bank" not in physical_shapes
+    assert {
+        "path_c_float32_activation_abi_bank",
+        "path_c_float32_attention_abi_bank",
+        "path_c_float32_parameter_abi_bank",
+        "path_c_float32_parameter_gradient_abi_bank",
+        "path_c_float32_state_abi_bank",
+    }.issubset(physical_shapes)
+    assert "path_c_float32_scratch_bank" in generated_source
+    assert "path_c_int32_scratch_bank" in generated_source
+    assert len(tuple(prim_func.params)) <= 31
+
+    tir_source = str(tvm.IRModule.from_expr(prim_func).script())
+    assert _max_tir_region_line_length(tir_source) < 12_000
 
 
 def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_without_full_staging() -> None:
@@ -1948,8 +1987,11 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
     cfg = local_gb10_quarter_profile().hybrid_config()
     activation_extent = cfg.max_seq_length * cfg.hidden_size
     attention = cfg.attention_config("dsa")
+    q_history_extent = cfg.max_seq_length * attention.num_q_heads * attention.q_head_dim
+    q_scale_extent = cfg.max_seq_length * attention.num_q_heads
     kv_history_extent = cfg.max_seq_length * attention.kv_heads * attention.q_head_dim
     kv_scale_extent = cfg.max_seq_length * attention.kv_heads
+    uint8_history_extent = q_history_extent + kv_history_extent
 
     # The exact train backward keeps each generated bwd fragment in its own
     # row loop so saved full-sequence buffers are populated before VJP use.
@@ -1968,17 +2010,18 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
         f'q_fp8 = T.alloc_local(({activation_extent},), "float32")'
         not in generated_source
     )
-    assert (
-        f'mamba3_delta: T.Tensor(({activation_extent},), "float32"),'
-        in generated_source
-    )
+    mamba3_delta_spill = prim_func._cppmega_path_c_spilled_shared_scratch_shapes[
+        "mamba3_delta"
+    ]
+    assert mamba3_delta_spill["param_name"] == "path_c_float32_scratch_bank"
+    assert mamba3_delta_spill["shape"] == (activation_extent,)
     assert (
         f'mamba3_delta = T.alloc_shared(({activation_extent},), "float32")'
         not in generated_source
     )
     assert (
         f'q_fp8: T.Tensor(({activation_extent},), "uint8"),'
-        in generated_source
+        not in generated_source
     )
     assert (
         f'kv_fp8 = T.alloc_local(({attention.kv_heads * attention.q_head_dim},), "uint8")'
@@ -1986,10 +2029,18 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
     )
     assert "kv_fp8 = T.alloc_local" not in generated_source
     assert "kv_scale = T.alloc_local" not in generated_source
-    assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
+    assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_role"
     assert (
-        f'path_c_uint8_abi_bank: T.Tensor(({kv_history_extent},), "uint8"),'
+        f'path_c_uint8_abi_bank: T.Tensor(({uint8_history_extent},), "uint8"),'
         in generated_source
+    )
+    assert (
+        prim_func._cppmega_path_c_buffer_abi_shapes["q_fp8"]
+        == (q_history_extent,)
+    )
+    assert (
+        prim_func._cppmega_path_c_buffer_abi_shapes["q_scale"]
+        == (q_scale_extent,)
     )
     assert (
         prim_func._cppmega_path_c_buffer_abi_shapes["kv_fp8"]
@@ -2000,20 +2051,27 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
         == (kv_scale_extent,)
     )
     assert (
+        prim_func._cppmega_path_c_physical_buffer_abi_map["q_fp8"]["bank"]
+        == "path_c_uint8_abi_bank"
+    )
+    assert (
         prim_func._cppmega_path_c_physical_buffer_abi_map["kv_fp8"]["bank"]
         == "path_c_uint8_abi_bank"
     )
-    assert prim_func._cppmega_path_c_internal_buffer_shapes["q_scale"] == (
-        cfg.max_seq_length * attention.num_q_heads,
+    assert (
+        prim_func._cppmega_path_c_physical_buffer_abi_map["q_scale"]["bank"]
+        == "path_c_float32_attention_abi_bank"
     )
+    assert "q_fp8" not in prim_func._cppmega_path_c_internal_buffer_shapes
+    assert "q_scale" not in prim_func._cppmega_path_c_internal_buffer_shapes
     assert "kv_fp8" not in prim_func._cppmega_path_c_internal_buffer_shapes
     assert "kv_scale" not in prim_func._cppmega_path_c_internal_buffer_shapes
     assert prim_func._cppmega_path_c_internal_buffer_shapes["indices"] == (
         cfg.max_seq_length * attention.kv_heads * attention.sparse_topk,
     )
     assert (
-        f'q_scale: T.Tensor(({cfg.max_seq_length * attention.num_q_heads},), "float32"),'
-        in generated_source
+        f'q_scale: T.Tensor(({q_scale_extent},), "float32"),'
+        not in generated_source
     )
     assert 'm2rnn_packed_post_m2rnn_projected_vec = T.alloc_shared((226,), "float32")' in (
         generated_source
@@ -2058,12 +2116,16 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_wit
         f"for attention_qkv_projection_d in T.serial(0, {attention.q_head_dim}):"
         in generated_source
     )
-    assert "mamba3_delta[i]" in generated_source
     assert (
-        "q_fp8[row * "
-        f"{cfg.hidden_size} + attention_qkv_projection_q_head * "
-        f"{attention.q_head_dim} + attention_qkv_projection_d]"
-    ) in generated_source
+        f"path_c_float32_scratch_bank[{mamba3_delta_spill['offset']} + (i)]"
+        in generated_source
+    )
+    assert any(
+        _line_uses_logical_buffer(prim_func, line, "q_fp8")
+        and "attention_qkv_projection_q_head" in line
+        and "attention_qkv_projection_d" in line
+        for line in generated_source.splitlines()
+    )
     assert any(
         _line_uses_logical_buffer(prim_func, line, "kv_fp8")
         and "attention_qkv_projection_kv_head" in line
@@ -2294,8 +2356,8 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_model_derived_shape_env() -> 
     attention_weight_extent = cfg.hidden_size * cfg.hidden_size
     sinks_extent = cfg.num_attention_heads
 
-    assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_dtype"
-    assert 'path_c_float32_abi_bank: T.Tensor(' in generated_source
+    assert prim_func._cppmega_path_c_physical_abi_policy == "banked_by_role"
+    assert 'path_c_float32_activation_abi_bank: T.Tensor(' in generated_source
     assert prim_func._cppmega_path_c_buffer_extent == sequence_extent
     assert prim_func._cppmega_path_c_loop_extent == hidden_extent
     assert f"for i in T.serial(0, {hidden_extent}):" not in generated_source
@@ -2311,7 +2373,7 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_model_derived_shape_env() -> 
     )
     assert (
         prim_func._cppmega_path_c_physical_buffer_abi_map["hidden"]["bank"]
-        == "path_c_float32_abi_bank"
+        == "path_c_float32_activation_abi_bank"
     )
 
 
@@ -2340,7 +2402,9 @@ def test_mamba3_fp8_train_descriptor_loop_covers_activation_extent_by_rows() -> 
     )
     assert any(
         _physical_bank_fragment(prim_func, "attention_out") in line
-        and "sparse_mla_fp8_apply_context_values[" in line
+        and _line_uses_logical_buffer(
+            prim_func, line, "sparse_mla_fp8_apply_context_values"
+        )
         for line in generated_source.splitlines()
     )
     assert _physical_bank_fragment(
@@ -2366,10 +2430,12 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
         line
         for line in generated_source.splitlines()
         if (
-            "mamba3_scan_mamba3_projected_vec[mamba3_scan_proj_dim] = "
-            "mamba3_scan_mamba3_accum[0]"
+            _line_uses_logical_buffer(
+                prim_func, line, "mamba3_scan_mamba3_projected_vec"
+            )
+            and "mamba3_scan_proj_dim" in line
+            and "mamba3_scan_mamba3_accum[0]" in line
         )
-        in line
     )
     mamba3_conv_bias_line = next(
         line
@@ -2387,8 +2453,10 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     mamba3_conv_current_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_scan_mamba3_projected_vec[7168 + mamba3_scan_conv_ch]"
-        in line
+        if _line_uses_logical_buffer(
+            prim_func, line, "mamba3_scan_mamba3_projected_vec"
+        )
+        and "7168 + mamba3_scan_conv_ch" in line
         and _line_uses_logical_buffer(prim_func, line, "mamba3_conv_weight")
     )
     mamba3_dt_line = next(
@@ -2442,7 +2510,7 @@ def test_mamba3_fp8_train_descriptor_projection_inputs_are_not_duplicated() -> N
     mamba3_delta_line = next(
         line
         for line in generated_source.splitlines()
-        if "mamba3_delta[" in line
+        if _line_uses_logical_buffer(prim_func, line, "mamba3_delta")
         and "mamba3_scan_mamba3_accum[0]" in line
     )
     m2rnn_project_line = next(
@@ -3166,22 +3234,30 @@ def test_model_derived_aot_backward_schedule_uses_dynamic_edge_names() -> None:
     assert any(
         "local_gb10_quarter_brick_11_R_bwd_m2rnn_stage_grad[0] = "
         in line
-        and "local_gb10_quarter_brick_11_R_delta_grad[" in line
+        and _line_uses_logical_buffer(
+            prim_func, line, "local_gb10_quarter_brick_11_R_delta_grad"
+        )
         for line in generated_lines
     )
     assert any(
         "local_gb10_quarter_brick_10_M_bwd_mamba3_stage_grad[0] = "
         in line
-        and "local_gb10_quarter_brick_10_M_delta_grad[" in line
+        and _line_uses_logical_buffer(
+            prim_func, line, "local_gb10_quarter_brick_10_M_delta_grad"
+        )
         for line in generated_lines
     )
     assert any(
-        "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad[" in line
+        _line_uses_logical_buffer(
+            prim_func, line, "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad"
+        )
         and "local_gb10_quarter_brick_11_R_bwd_m2rnn_project_grad" in line
         for line in generated_lines
     )
     assert any(
-        "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad[" in line
+        _line_uses_logical_buffer(
+            prim_func, line, "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad"
+        )
         and "qkv_projection_bwd_attention_projected_grad0[0]" in line
         for line in generated_lines
     )
@@ -3595,9 +3671,15 @@ def test_mamba3_fp8_train_compile_helper_passes_chunked_row_dispatch_to_schedule
     assert f"with T.Kernel({num_chunks}, threads=256) as chunk:" in descriptor_source
     assert f'bx = T.launch_thread("blockIdx.x", {num_chunks})' in generated_source
     assert 'lane = T.launch_thread("threadIdx.x", 256)' in generated_source
-    assert "row_chunk_start = bx * 64" in generated_source
-    assert f"row_chunk_stop = T.min(row_chunk_start + 64, {cfg.max_seq_length})" in generated_source
-    assert f"entry_row_chunk_stop = T.min(row_chunk_stop + 1, {cfg.max_seq_length})" in generated_source
+    assert "row_chunk_start: T.int32 = bx * 64" in generated_source
+    assert (
+        f"row_chunk_stop: T.int32 = T.min(row_chunk_start + 64, {cfg.max_seq_length})"
+        in generated_source
+    )
+    assert (
+        f"entry_row_chunk_stop: T.int32 = T.min(row_chunk_stop + 1, {cfg.max_seq_length})"
+        in generated_source
+    )
     assert (
         generated_source.count(
             "for row in range(row_chunk_start, row_chunk_start + (entry_row_chunk_stop - row_chunk_start)):"
@@ -3668,7 +3750,8 @@ def test_mamba3_fp8_train_launcher_chunk_dispatch_bounds_scalar_chunk_index_for_
     assert "path_c_row_chunk_index: T.int32" in generated_source
     assert "path_c_row_subchunk_index: T.int32" in generated_source
     assert "path_c_run_backward: T.int32" in generated_source
-    assert "if path_c_run_backward != 0:" in generated_source
+    assert "if path_c_run_backward != 1:" in generated_source
+    assert "if path_c_run_backward == 1:" in generated_source
     assert "path_c_row_chunk_index >= 0" in generated_source
     assert f"path_c_row_chunk_index < {num_chunks}" in generated_source
     assert "path_c_row_subchunk_index >= 0" in generated_source
@@ -3678,8 +3761,9 @@ def test_mamba3_fp8_train_launcher_chunk_dispatch_bounds_scalar_chunk_index_for_
         in generated_source
     )
     assert (
-        "row_chunk_start = T.if_then_else(path_c_run_backward != 0, "
-        "logical_row_chunk_start, subchunk_row_chunk_start)"
+        "row_chunk_start: T.int32 = T.if_then_else(path_c_run_backward == 1, "
+        "0, T.if_then_else(path_c_run_backward != 0, logical_row_chunk_start, "
+        "subchunk_row_chunk_start))"
         in generated_source
     )
 
@@ -3904,7 +3988,7 @@ def test_path_c_launcher_sets_backward_gate_from_cotangent_seeds() -> None:
             attention_index = mx.array([1], dtype=mx.int32)
             grad_index = mx.array([3], dtype=mx.int32)
             bank = bank.at[attention_index].add(mx.array([1.0], dtype=mx.float32))
-            if gate:
+            if gate == 1:
                 bank = bank.at[grad_index].add(mx.array([2.0], dtype=mx.float32))
             return bank
 
@@ -3934,12 +4018,12 @@ def test_path_c_launcher_sets_backward_gate_from_cotangent_seeds() -> None:
     )
     mx.eval(backward.forward["attention_out"], backward.parameter_grads["weight_grad"])
 
-    assert fake_kernel.calls == [(0, 0), (1, 0), (0, 0), (1, 0), (0, 1)]
+    assert fake_kernel.calls == [(0, 0), (1, 0), (0, 2), (1, 2), (0, 1)]
     assert forward_only.parameter_grads == {}
     assert backward.parameter_grads["weight_grad"].item() == pytest.approx(2.0)
 
 
-def test_path_c_launcher_backward_runs_after_full_forward_subchunk_grid_once() -> None:
+def test_path_c_launcher_backward_forward_prepass_runs_once_per_chunk() -> None:
     import json
 
     import mlx.core as mx
@@ -4037,7 +4121,7 @@ def test_path_c_launcher_backward_runs_after_full_forward_subchunk_grid_once() -
             attention_index = mx.array([1], dtype=mx.int32)
             grad_index = mx.array([3], dtype=mx.int32)
             bank = bank.at[attention_index].add(mx.array([1.0], dtype=mx.float32))
-            if gate:
+            if gate == 1:
                 bank = bank.at[grad_index].add(mx.array([2.0], dtype=mx.float32))
             return bank
 
@@ -4062,16 +4146,27 @@ def test_path_c_launcher_backward_runs_after_full_forward_subchunk_grid_once() -
     mx.eval(result.forward["attention_out"], result.parameter_grads["weight_grad"])
 
     assert fake_kernel.calls == [
-        (0, 0, 0),
-        (0, 1, 0),
-        (0, 2, 0),
-        (1, 0, 0),
-        (1, 1, 0),
-        (1, 2, 0),
+        (0, 0, 2),
+        (1, 0, 2),
         (0, 0, 1),
     ]
-    assert result.forward["attention_out"].item() == pytest.approx(7.0)
+    assert result.forward["attention_out"].item() == pytest.approx(3.0)
     assert result.parameter_grads["weight_grad"].item() == pytest.approx(2.0)
+
+
+def test_path_c_launcher_chunked_dispatch_does_not_sync_after_each_launch() -> None:
+    """Chunked dispatch must chain owner outputs instead of host-syncing each chunk."""
+
+    import inspect
+
+    from cppmega_mlx.runtime import path_c_fusion_launcher as launcher_mod
+
+    source = inspect.getsource(launcher_mod.Mamba3Fp8TrainBlockLauncher.__call__)
+    launch_chunk_body = source.split("def launch_chunk", 1)[1].split(
+        "if run_backward", 1
+    )[0]
+
+    assert "eval_positionals()" not in launch_chunk_body
 
 
 def test_path_c_launcher_rejects_grid_chunked_backward_parameter_grads() -> None:
@@ -4216,21 +4311,28 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
     assert manifest.row_chunk_index_param == schedules.DESCRIPTOR_ROW_CHUNK_INDEX_PARAM
     assert manifest.row_chunk_index_buffer is None
     assert manifest.backward_gate_param == schedules.DESCRIPTOR_BACKWARD_GATE_PARAM
-    assert list(captured_prim_funcs[0].attrs.get("tilelang_out_idx", ())) == [0, 1, 2]
+    assert list(captured_prim_funcs[0].attrs.get("tilelang_out_idx", ())) == list(
+        range(len(manifest.bank_shapes))
+    )
     assert 'bx = T.launch_thread("blockIdx.x", 1)' in generated_source
     assert 'lane = T.launch_thread("threadIdx.x", 256)' in generated_source
     assert "path_c_run_backward: T.int32" in generated_source
-    assert "if path_c_run_backward != 0:" in generated_source
+    assert "if path_c_run_backward != 1:" in generated_source
+    assert "if path_c_run_backward == 1:" in generated_source
     assert (
         "logical_row_chunk_start: T.int32 = path_c_row_chunk_index * 64"
         in generated_source
     )
     assert (
-        "row_chunk_start = T.if_then_else(path_c_run_backward != 0, "
-        "logical_row_chunk_start, subchunk_row_chunk_start)"
+        "row_chunk_start: T.int32 = T.if_then_else(path_c_run_backward == 1, "
+        "0, T.if_then_else(path_c_run_backward != 0, logical_row_chunk_start, "
+        "subchunk_row_chunk_start))"
         in generated_source
     )
-    assert "entry_row_chunk_stop = T.min(row_chunk_stop + 1, 4096)" in generated_source
+    assert (
+        "entry_row_chunk_stop: T.int32 = T.min(row_chunk_stop + 1, 4096)"
+        in generated_source
+    )
     assert (
         generated_source.count(
             "for row in range(row_chunk_start, row_chunk_start + (entry_row_chunk_stop - row_chunk_start)):"

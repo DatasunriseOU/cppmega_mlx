@@ -190,10 +190,10 @@ def test_dispatch_catalog_list_options_activation():
     })
     assert resp.error is None
     options = resp.result["options"]
-    # E7-13 extended the activation registry from 6 → 10 entries.
-    assert len(options) == 10
+    # We added glu, extending the activation registry from 10 → 11 entries.
+    assert len(options) == 11
     names = {o["name"] for o in options}
-    assert names == {"gelu", "relu", "relu2", "sqrelu", "silu", "mish",
+    assert names == {"glu", "gelu", "relu", "relu2", "sqrelu", "silu", "mish",
                      "swiglu", "geglu", "reglu", "xielu"}
 
 

@@ -2916,7 +2916,7 @@ def _workspace_edge_buffers_for_attested_template(
         return ()
     if not _region_has_attention_kv_workspace_edges(region):
         return ()
-    return ("kv_fp8", "kv_scale")
+    return ("q_fp8", "q_scale", "kv_fp8", "kv_scale")
 
 
 def _region_has_attention_kv_workspace_edges(region: PathCFusionRegion) -> bool:
@@ -2925,7 +2925,8 @@ def _region_has_attention_kv_workspace_edges(region: PathCFusionRegion) -> bool:
         node_by_name[edge.producer].op_name == "attention_qkv_projection"
         and node_by_name[edge.consumer].op_name
         in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
-        and _canonical_path_c_edge_buffer_name(edge.input) in {"kv_fp8", "kv_scale"}
+        and _canonical_path_c_edge_buffer_name(edge.input)
+        in {"q_fp8", "q_scale", "kv_fp8", "kv_scale"}
         for edge in region.edges
     )
 
@@ -3540,6 +3541,10 @@ def _infer_edges(nodes: Sequence[FusionNode]) -> tuple[FusionEdge, ...]:
 
 def _canonical_path_c_edge_buffer_name(buffer_name: str) -> str:
     name = str(buffer_name)
+    if name.endswith("_q_fp8"):
+        return "q_fp8"
+    if name.endswith("_q_scale"):
+        return "q_scale"
     if name.endswith("_kv_fp8"):
         return "kv_fp8"
     if name.endswith("_kv_scale"):
@@ -3557,7 +3562,8 @@ def _inferred_edge_lifetime(
         producer_node.op_name == "attention_qkv_projection"
         and consumer_node.op_name
         in {"sparse_mla_fp8_apply", "sparse_mla_fp8_apply_bwd"}
-        and _canonical_path_c_edge_buffer_name(buffer_name) in {"kv_fp8", "kv_scale"}
+        and _canonical_path_c_edge_buffer_name(buffer_name)
+        in {"q_fp8", "q_scale", "kv_fp8", "kv_scale"}
     ):
         return "workspace"
     return "internal"
