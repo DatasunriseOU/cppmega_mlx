@@ -48,7 +48,6 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
 )
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
     make_physical_abi_bank_owner,
-    physical_abi_full_runtime_kernel_args,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_map,
     validate_physical_abi_runtime_bindings,
@@ -1002,6 +1001,39 @@ def _buffer_abi_payload(prim_func: Any) -> tuple[list[dict[str, Any]], int]:
     return entries, total_bytes
 
 
+def _runtime_smoke_full_kernel_args(
+    prim_func: Any,
+    kernel_buffers: Mapping[str, Any],
+) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
+    """Return full kernel args in PrimFunc order, including scalar ABI params."""
+
+    args: list[Any] = []
+    scalar_args: list[dict[str, Any]] = []
+    buffer_map = getattr(prim_func, "buffer_map", {})
+    missing: list[str] = []
+    for param in tuple(getattr(prim_func, "params", ())):
+        buffer = buffer_map.get(param)
+        if buffer is None:
+            name = str(param)
+            value = 1 if name == "path_c_run_backward" else 0
+            args.append(value)
+            scalar_args.append({"name": name, "value": value})
+            continue
+        name = str(getattr(buffer, "name", param))
+        if name not in kernel_buffers:
+            missing.append(name)
+            continue
+        args.append(kernel_buffers[name])
+    if missing:
+        raise ValueError(
+            "physical ABI runtime bindings are not executable: "
+            + "; ".join(
+                f"{name}: missing caller-owned kernel buffer" for name in missing
+            )
+        )
+    return tuple(args), scalar_args
+
+
 def _tiny_runtime_smoke_region_target_model() -> tuple[Any, Any, Any]:
     profile = local_gb10_quarter_profile()
     cfg = profile.tiny_smoke_config(
@@ -1349,17 +1381,14 @@ def _runtime_smoke_payload(
             physical_bank_buffers=physical_bank_buffers,
         )
         kernel_buffer_order = tuple(str(entry["name"]) for entry in buffer_abi)
-        arrays = list(
-            physical_abi_full_runtime_kernel_args(
-                physical_buffer_abi_map,
-                physical_buffer_abi_shapes,
-                kernel_buffer_order,
-                kernel_buffers,
-            )
+        kernel_args, scalar_kernel_args = _runtime_smoke_full_kernel_args(
+            prim_func,
+            kernel_buffers,
         )
+        arrays = [arg for arg in kernel_args if isinstance(arg, mx.array)]
         mx.eval(*arrays)
         execute_started = time.perf_counter()
-        result = artifact(*arrays)
+        result = artifact(*kernel_args)
         mx.eval(*arrays)
         execute_elapsed_s = time.perf_counter() - execute_started
         return {
@@ -1380,6 +1409,8 @@ def _runtime_smoke_payload(
             "physical_abi_runtime_binding": physical_abi_runtime_binding,
             "fused_train_block_route": fused_train_block_route,
             "runtime_kernel_buffers": list(kernel_buffer_order),
+            "runtime_kernel_arg_count": len(kernel_args),
+            "runtime_scalar_args": scalar_kernel_args,
             "kernel_parameter_count": _kernel_parameter_count(prim_func),
             "logical_parameter_count": len(
                 getattr(prim_func, "_cppmega_path_c_buffer_abi_shapes", {}) or {}

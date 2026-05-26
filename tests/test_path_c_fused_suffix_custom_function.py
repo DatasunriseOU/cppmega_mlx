@@ -140,6 +140,48 @@ def test_fused_suffix_forward_writes_inputs_and_returns_loss() -> None:
     assert bank[64:68].tolist() == [20.0, 21.0, 22.0, 23.0]
 
 
+def test_fused_suffix_casts_small_target_mask_to_abi_dtype() -> None:
+    artifact = _RecordingArtifact(sentinel_loss=2.5, sentinel_ntokens=11.0)
+    bank_owner = _FakeBankOwner()
+    bank_owner.buffers["bf16"] = mx.zeros((8,), dtype=mx.bfloat16)
+    abi_map = _make_abi_map()
+    abi_map["target_mask"] = {
+        "bank": "bf16", "dtype": "bfloat16", "offset": 0, "size": 3,
+        "shape": (3,), "logical_shape": (3,),
+    }
+    in_region_aliases = {
+        "p_a": {
+            "logical_name": "param_a",
+            "logical_grad_name": "param_a_grad",
+            "bank": "f32", "dtype": "float32",
+            "offset": 60, "size": 4, "logical_shape": (4,),
+        },
+    }
+    f = build_fused_suffix_custom_function(
+        artifact=artifact,
+        bank_owner=bank_owner,
+        abi_map=abi_map,
+        hidden_entry_logical_name="hidden_entry",
+        target_ids_logical_name="target_ids",
+        target_mask_logical_name="target_mask",
+        loss_logical_name="loss",
+        ntokens_logical_name="ntokens",
+        in_region_parameter_bank_aliases=in_region_aliases,
+        parameter_order=("p_a",),
+    )
+
+    loss, ntokens = f(
+        mx.full((1, 3, 4), 9.0, dtype=mx.float32),
+        mx.array([1.0, 2.0, 3.0], dtype=mx.float32),
+        mx.array([1.0, 0.0, 1.0], dtype=mx.float32),
+        mx.array([10.0, 11.0, 12.0, 13.0], dtype=mx.float32),
+    )
+    mx.eval(loss, ntokens)
+
+    assert bank_owner.buffers["bf16"][0:3].dtype == mx.bfloat16
+    assert bank_owner.buffers["bf16"][0:3].tolist() == [1.0, 0.0, 1.0]
+
+
 def test_fused_suffix_value_and_grad_returns_bank_view_cotangents() -> None:
     artifact = _RecordingArtifact(sentinel_loss=3.0, sentinel_ntokens=11.0)
     bank_owner = _FakeBankOwner()

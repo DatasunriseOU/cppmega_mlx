@@ -3610,6 +3610,28 @@ def test_row_phased_descriptor_template_compiles_with_tilelang_lowerer() -> None
     assert compiled.plan.schedule_contract.status == "attested_non_production_schedule"
 
 
+def test_model_derived_fwd_bwd_tilelang_source_avoids_threadgroup_atomic_scratch() -> None:
+    cfg = local_gb10_quarter_profile().tiny_smoke_config(max_seq_length=64)
+    fwd_region = build_path_c_model_regions_from_model(
+        SimpleNamespace(name="small_compile_path_c", route_symbols=("M", "R", "A"), config=cfg),
+        region_prefix="small_compile_path_c",
+        sequence_length=64,
+    )[0]
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+
+    prim_func = target.schedule_template(region)
+    artifact = tilelang_single_entry_lowerer(prim_func, target="metal")
+    kernel_source = str(artifact.get_kernel_source())
+    shmem_match = re.search(r"threadgroup float buf_dyn_shmem\[(\d+)\];", kernel_source)
+
+    assert "AtomicAdd((&(buf_dyn_shmem" not in kernel_source
+    assert shmem_match is not None
+    assert int(shmem_match.group(1)) * 4 <= 32 * 1024
+
+
 def test_row_phased_acceptance_fwd_bwd_template_compiles_with_tilelang_lowerer() -> None:
     region = build_mamba3_fp8_train_acceptance_fixture_region(include_backward=True)
     descriptors = (

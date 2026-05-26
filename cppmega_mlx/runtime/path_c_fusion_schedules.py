@@ -112,8 +112,8 @@ DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT = "direct_buffers"
 DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE = "banked_by_dtype"
 DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE = "banked_by_role"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
-DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 4 * 1024
-DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 24 * 1024
+DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 1024
+DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 12 * 1024
 MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL = 64
 _DESCRIPTOR_ROOT_READS_MARKER = "cppmega_path_c_root_reads"
 _DESCRIPTOR_ROOT_WRITES_MARKER = "cppmega_path_c_root_writes"
@@ -137,6 +137,20 @@ DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS = frozenset(
         "m2rnn_delta_grad",
         "mamba3_delta",
         "mamba3_delta_grad",
+    }
+)
+DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_CANONICALS = frozenset(
+    {
+        "hidden",
+        "attention_hidden",
+        "hidden_after_mamba3",
+        "m2rnn_hidden",
+        "m2rnn_delta",
+        "mamba3_delta",
+        "q_fp8",
+        "q_scale",
+        "kv_fp8",
+        "kv_scale",
     }
 )
 DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH = 64
@@ -3033,9 +3047,9 @@ def _spill_large_shared_scratch_to_abi(
         byte_count = _flattened_extent(shape) * _DTYPE_NBYTES[dtype]
         total_shared_bytes += byte_count
         scratch_name = match.group("name")
-        force_scratch_abi = scratch_name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS
+        force_scratch_abi = _is_row_phased_bwd_scratch_abi_buffer(scratch_name)
         if (
-            byte_count > DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES
+            byte_count >= DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES
             or force_scratch_abi
         ):
             candidates.append(
@@ -3176,6 +3190,21 @@ def _spill_large_shared_scratch_to_abi(
         *spill_param_lines,
     ]
     return "\n".join(rewritten) + "\n", spilled
+
+
+def _is_row_phased_bwd_scratch_abi_buffer(buffer_name: str) -> bool:
+    """Return True for internal bwd scratch that must be a device ABI buffer."""
+
+    name = str(buffer_name)
+    if name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS:
+        return True
+    if not name.endswith("_grad"):
+        return False
+    canonical = _canonical_buffer_name(name)
+    if canonical in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_CANONICALS:
+        return True
+    base = name[: -len("_grad")]
+    return base.endswith(("_hidden", "_delta", "_out"))
 
 
 def _validated_internal_buffer_policy(policy: str) -> str:
@@ -3594,6 +3623,27 @@ def _row_local_internal_buffer_shape(
     shape_env: PathCModelShapeEnv,
 ) -> tuple[int, ...]:
     canonical_name = _canonical_buffer_name(buffer_name)
+    if str(buffer_name).endswith("_grad") and (
+        canonical_name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_CANONICALS
+        or str(buffer_name)[: -len("_grad")].endswith(("_hidden", "_delta", "_out"))
+    ):
+        if canonical_name == "q_fp8":
+            return (
+                shape_env.sequence_length
+                * shape_env.attention_num_q_heads
+                * shape_env.attention_head_dim,
+            )
+        if canonical_name == "q_scale":
+            return (shape_env.sequence_length * shape_env.attention_num_q_heads,)
+        if canonical_name == "kv_fp8":
+            return (
+                shape_env.sequence_length
+                * shape_env.attention_num_kv_heads
+                * shape_env.attention_head_dim,
+            )
+        if canonical_name == "kv_scale":
+            return (shape_env.sequence_length * shape_env.attention_num_kv_heads,)
+        return (shape_env.sequence_length * shape_env.hidden_size,)
     if canonical_name in {
         "mamba3_delta",
         "m2rnn_hidden",
@@ -3616,23 +3666,6 @@ def _row_local_internal_buffer_shape(
             * shape_env.attention_num_kv_heads
             * shape_env.attention_sparse_topk,
         )
-    if str(buffer_name).endswith("_grad"):
-        if canonical_name == "q_fp8":
-            return (
-                shape_env.sequence_length
-                * shape_env.attention_num_q_heads
-                * shape_env.attention_head_dim,
-            )
-        if canonical_name == "q_scale":
-            return (shape_env.sequence_length * shape_env.attention_num_q_heads,)
-        if canonical_name == "kv_fp8":
-            return (
-                shape_env.sequence_length
-                * shape_env.attention_num_kv_heads
-                * shape_env.attention_head_dim,
-            )
-        if canonical_name == "kv_scale":
-            return (shape_env.sequence_length * shape_env.attention_num_kv_heads,)
     if canonical_name == "kv_fp8":
         return (shape_env.attention_num_kv_heads * shape_env.attention_head_dim,)
     if canonical_name == "kv_scale":
@@ -12290,13 +12323,14 @@ def _dynamic_descriptor_target_for_region(
         acceptance_profile,
         descriptors,
     )
+    train_step_output_abi = _region_requires_train_step_output_abi(region, nodes)
     physical_abi_policy = _physical_abi_policy_for_region(
         nodes,
         shape_env=shape_env,
         internal_buffer_policy=internal_buffer_policy,
         loop_policy=loop_policy,
+        train_step_output_abi=train_step_output_abi,
     )
-    train_step_output_abi = _region_requires_train_step_output_abi(region, nodes)
     schedule_name = (
         acceptance_profile.schedule_name
         if acceptance_profile is not None
@@ -12412,6 +12446,7 @@ def _physical_abi_policy_for_region(
     shape_env: PathCModelShapeEnv | None,
     internal_buffer_policy: str,
     loop_policy: str,
+    train_step_output_abi: bool = False,
 ) -> str:
     internal_buffers = _internal_buffers_for_nodes(
         nodes,
@@ -12420,6 +12455,10 @@ def _physical_abi_policy_for_region(
         loop_policy=loop_policy,
     )
     external_buffer_count = len(_external_buffers_for_nodes(nodes, internal_buffers))
+    if train_step_output_abi:
+        external_buffer_count += len(_TRAIN_STEP_SCALAR_OUTPUT_ABI_NAMES)
+        external_buffer_count += len(_TRAIN_STEP_SUFFIX_LOSS_INPUT_ABI_NAMES)
+        external_buffer_count += len(_TRAIN_STEP_SUFFIX_LOSS_PARAMETER_GRAD_ABI_NAMES)
     if external_buffer_count > DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT:
         return DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE
     return DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT

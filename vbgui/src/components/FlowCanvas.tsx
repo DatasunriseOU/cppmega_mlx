@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, useEffect } from "react";
+import { useCallback, useMemo, useState, useEffect, useRef } from "react";
 import {
   ReactFlow,
   Background,
@@ -50,6 +50,8 @@ export interface FlowCanvasProps {
   onEdgesChange?: OnEdgesChange;
   /** Callback when an edge is context-clicked (right-click) or double-clicked to tap it. */
   onEdgeTap?: (edgeId: string) => void;
+  /** Callback when the flow canvas container is resized. */
+  onResize?: (width: number) => void;
 }
 
 // Beautiful custom glowing residual addition (+) node component
@@ -252,10 +254,25 @@ const EDGE_TYPES: EdgeTypes = {
 };
 
 export function FlowCanvas({
-  nodes, edges, onConnect, isValidConnection, onDropBrick, onNodeClick, onInsertAdapter, onAutoAlign, onNodesChange, onEdgesChange, onEdgeTap,
+  nodes, edges, onConnect, isValidConnection, onDropBrick, onNodeClick, onInsertAdapter, onAutoAlign, onNodesChange, onEdgesChange, onEdgeTap, onResize,
 }: FlowCanvasProps): JSX.Element {
   const [edgeMenu, setEdgeMenu] = useState<{ edge: Edge; x: number; y: number } | null>(null);
   const { fitView } = useReactFlow();
+
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!wrapperRef.current || typeof ResizeObserver === "undefined" || !onResize) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect.width;
+        if (w > 600) {
+          onResize(w);
+        }
+      }
+    });
+    observer.observe(wrapperRef.current);
+    return () => observer.disconnect();
+  }, [onResize]);
 
   // Robust automatic centering & zoom fitting when nodes list changes (preset load or auto-layout alignment)
   useEffect(() => {
@@ -398,6 +415,7 @@ export function FlowCanvas({
 
   return (
     <div
+      ref={wrapperRef}
       data-testid="flow-canvas"
       style={{ flex: 1, height: "100%", position: "relative" }}
       onDrop={handleDrop}

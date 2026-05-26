@@ -21,7 +21,6 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
 from cppmega_mlx.runtime.path_c_physical_abi import (
-    physical_abi_full_runtime_kernel_args,
     physical_abi_runtime_kernel_args,
 )
 from cppmega_mlx.training.loss import next_token_cross_entropy
@@ -53,6 +52,11 @@ PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT = (
 PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT = (
     "path_c_fused_train_block_value_and_grad_v1"
 )
+PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS: Mapping[str, int] = {
+    "path_c_run_backward": 1,
+    "path_c_row_chunk_index": 0,
+    "path_c_row_subchunk_index": 0,
+}
 
 REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
     "mamba3_pre": True,
@@ -213,12 +217,35 @@ class PathCFusedTrainBlockCallableArtifact:
 
     def _kernel_args_from_bank_owner(self, bank_owner: Any) -> tuple[Any, ...]:
         if self.kernel_buffer_order is not None:
-            return physical_abi_full_runtime_kernel_args(
+            buffers = self._bank_buffers(bank_owner)
+            physical_abi_runtime_kernel_args(
                 self.physical_abi_map,
                 self.physical_abi_shapes,
-                self.kernel_buffer_order,
-                self._bank_buffers(bank_owner),
+                {
+                    name: buffers[name]
+                    for name in self.physical_abi_shapes
+                    if name in buffers
+                },
             )
+            missing: list[str] = []
+            args: list[Any] = []
+            for name in self.kernel_buffer_order:
+                if name in buffers:
+                    args.append(buffers[name])
+                    continue
+                if name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS:
+                    args.append(PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS[name])
+                    continue
+                missing.append(name)
+            if missing:
+                raise ValueError(
+                    "physical ABI runtime bindings are not executable: "
+                    + "; ".join(
+                        f"{name}: missing caller-owned kernel buffer"
+                        for name in missing
+                    )
+                )
+            return tuple(args)
         return physical_abi_runtime_kernel_args(
             self.physical_abi_map,
             self.physical_abi_shapes,

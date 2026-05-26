@@ -818,13 +818,14 @@ def test_fused_train_block_callable_artifact_uses_full_kernel_buffer_order() -> 
         training_abi_contract={},
         kernel_buffer_order=(
             "path_c_float32_abi_bank",
+            "path_c_run_backward",
             "mamba3_entry_rmsnorm_hidden",
             "path_c_int32_abi_bank",
         ),
     )
 
     artifact.forward(bank_owner=_BankOwner())
-    assert calls == [(float_bank, top_level_scratch, int_bank)]
+    assert calls == [(float_bank, 1, top_level_scratch, int_bank)]
 
     with pytest.raises(ValueError, match="mamba3_entry_rmsnorm_hidden"):
         artifact.forward(

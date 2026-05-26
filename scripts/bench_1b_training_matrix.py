@@ -57,6 +57,14 @@ STATUS_NOT_APPLICABLE = "not_applicable"
 STATUS_PLANNED = "planned"
 MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
 SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
+FAILURE_REASON_KEYS = (
+    "status_reason",
+    "failure_reason",
+    "reason",
+    "error",
+    "message",
+    "title",
+)
 
 
 @dataclass(frozen=True)
@@ -177,6 +185,24 @@ def parse_csv_list(spec: str, choices: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _receipt_failure_reason(receipt: dict[str, Any]) -> str | None:
+    blockers = receipt.get("blockers")
+    if isinstance(blockers, list):
+        for blocker in blockers:
+            if isinstance(blocker, dict):
+                for key in FAILURE_REASON_KEYS:
+                    value = blocker.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+            elif isinstance(blocker, str) and blocker.strip():
+                return blocker.strip()
+    for key in FAILURE_REASON_KEYS:
+        value = receipt.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the P12 local 1B-class dtype/optimizer/path matrix.",
@@ -221,6 +247,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Forward --use-path-c-direct-chain-runtime to Path C m04 cells so "
             "the matrix measures the opt-in direct-chain critical-path route "
             "instead of the split/generated Path C fallback."
+        ),
+    )
+    parser.add_argument(
+        "--use-path-c-fused-train-block-runtime",
+        action="store_true",
+        help=(
+            "Forward --use-path-c-fused-train-block-runtime to Path C m04 cells. "
+            "This opt-in measures the monolithic generated fused train-block "
+            "critical path and is intentionally separate from the default "
+            "matrix because Metal pipeline compilation can exceed the memory cap."
         ),
     )
     parser.add_argument(
@@ -411,6 +447,10 @@ def build_cell(
     )
     if path.startswith("path_c") and bool(args.use_path_c_direct_chain_runtime):
         command += ("--use-path-c-direct-chain-runtime",)
+    if path.startswith("path_c") and bool(
+        args.use_path_c_fused_train_block_runtime
+    ):
+        command += ("--use-path-c-fused-train-block-runtime",)
     if args.m04_memory_cap_gib is not None:
         if args.m04_memory_cap_gib <= 0:
             raise SystemExit("--m04-memory-cap-gib must be positive")
@@ -1006,8 +1046,7 @@ def extract_result(
     reason = None
     if status != STATUS_OK:
         reason = (
-            receipt.get("status_reason")
-            or receipt.get("failure_reason")
+            _receipt_failure_reason(receipt)
             or process.stderr.strip()
             or process.stdout.strip()
             or f"cell exited {process.returncode}"

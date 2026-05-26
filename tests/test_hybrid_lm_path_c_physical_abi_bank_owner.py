@@ -91,7 +91,11 @@ def test_owner_unblocks_m04_fp8_path_c_runtime_binding(model) -> None:
         "--dry-run-json", "--output", "/tmp/test_owner_route.json",
         "--data-path", "/dev/null", "--data-format", "npz",
     ])
-    route = m04.fp8_path_c_training_route_payload_for_model(args, model)
+    route = m04.fp8_path_c_training_route_payload_for_model(
+        args,
+        model,
+        auto_install_fused_train_block=True,
+    )
     binding = route.get("path_c_fusion", {}).get("runtime_training_binding", {})
     assert binding.get("runtime_uses_fused_train_block") is True, route
     assert binding.get("physical_abi_binding_ready") is True, binding
@@ -102,18 +106,10 @@ def test_owner_unblocks_m04_fp8_path_c_runtime_binding(model) -> None:
     )
 
 
-def test_artifact_forward_runs_end_to_end_on_real_metal(model) -> None:
-    """End-to-end live check: the fused TileLang kernel actually runs on Metal.
-
-    Drives the production route to compile the artifact, then invokes
-    ``artifact.forward(bank_owner=...)`` with the model-owned banks the
-    factory produced, and confirms the call returns without raising and
-    that lazy MLX work materialises.
-    """
+def test_fused_train_block_runtime_is_not_auto_installed_by_default() -> None:
+    """The monolithic fused train-block runtime is an explicit opt-in path."""
     import importlib.util
     from pathlib import Path
-
-    import mlx.core as mx
 
     spec = importlib.util.spec_from_file_location(
         "m04_train_step", str(Path("scripts/m04_train_step.py").resolve())
@@ -128,22 +124,17 @@ def test_artifact_forward_runs_end_to_end_on_real_metal(model) -> None:
         "--dry-run-json", "--output", "/tmp/test_artifact_real_metal.json",
         "--data-path", "/dev/null", "--data-format", "npz",
     ])
-    route = m04.fp8_path_c_training_route_payload_for_model(args, model)
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    fresh_model = build_local_gb10_quarter_tiny_smoke_model()
+    route = m04.fp8_path_c_training_route_payload_for_model(args, fresh_model)
 
-    artifact = model.path_c_fused_train_block_artifact
-    bank_owner = model.path_c_physical_abi_bank_owner
-    assert artifact is not None
-    assert bank_owner is not None
-    # The factory's banks must align with the artifact's expected shapes.
-    assert artifact.physical_abi_shapes == {
-        name: tuple(bank_owner.buffers[name].shape)
-        for name in artifact.physical_abi_shapes
-    }
-    assert set(artifact.kernel_buffer_order).issubset(bank_owner.buffers)
-    # And the artifact's forward must complete and materialise lazy work.
-    artifact.forward(bank_owner=bank_owner)
-    mx.eval(*bank_owner.buffers.values())
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["fused_train_block_training_runtime_available"] is False
+    assert getattr(fresh_model, "path_c_fused_train_block_artifact", None) is None
+    assert getattr(
+        fresh_model,
+        "path_c_fused_train_block_training_runtime",
+        None,
+    ) is None
 
 
 def test_path_c_fused_in_region_parameter_bank_aliases_covers_brick_params(
@@ -209,11 +200,11 @@ def test_sync_path_c_in_region_parameters_into_bank_updates_bank_slots(
 ) -> None:
     bank_owner = model.make_path_c_physical_abi_bank_owner()
     aliases = model.path_c_fused_in_region_parameter_bank_aliases()
-    bank_name = "path_c_float32_abi_bank"
-    bank = bank_owner.buffers[bank_name]
     # Pick layers.10.block.D — known to be size 4.
     name = "layers.10.block.D"
     info = aliases[name]
+    bank_name = str(info["bank"])
+    bank = bank_owner.buffers[bank_name]
     # Replace the model's parameter with a sentinel tensor and verify the
     # sync writes it into the bank slot in-place (no new bank allocation).
     sentinel = mx.array([7.0, 8.0, 9.0, 10.0], dtype=mx.float32)

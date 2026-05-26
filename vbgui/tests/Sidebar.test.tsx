@@ -69,13 +69,14 @@ describe("OptimTab", () => {
     expect(onApply).toHaveBeenCalled();
   });
 
-  it("kind dropdown exposes all 7 OptimKind options (E7-12)", () => {
+  it("kind dropdown exposes all 10 OptimKind options (E7-12)", () => {
     render(<OptimTab optim={INITIAL_SPEC.optim} onApply={() => {}} />);
     const select = screen.getByTestId("optim-kind") as HTMLSelectElement;
     const options = Array.from(select.options).map((o) => o.value);
     expect(options).toEqual([
       "adamw", "muon", "muon_adamw_hybrid",
       "lion", "lion8bit", "adam8bit", "sgd",
+      "adam", "adafactor", "rmsprop",
     ]);
   });
 

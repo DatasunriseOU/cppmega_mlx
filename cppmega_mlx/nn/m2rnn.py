@@ -12,6 +12,7 @@ import mlx.nn as nn
 from cppmega_mlx.nn.mamba3 import causal_depthwise_conv1d
 
 DEFAULT_CHUNK_SIZE = 128
+PATH_B_REFERENCE_BASELINE_KERNEL = "reference_path_b_baseline"
 
 
 def _require_positive_int(name: str, value: int) -> None:
@@ -309,8 +310,9 @@ def _dispatch_m2rnn_scan(
 
     AUTO uses the retired Path B status seam only when it is available,
     otherwise it falls back to the pure-MLX :func:`chunked_m2rnn_scan`.
-    PATH_B and PATH_C are explicit and fail-closed when their native routes
-    are unavailable.
+    PATH_B keeps the benchmark baseline runnable by using the legacy
+    differentiable compatibility wrapper when direct MSL is retired. PATH_C
+    remains explicit and fail-closed when its native route is unavailable.
     """
 
     from cppmega_mlx.runtime.kernel_policy import (
@@ -369,11 +371,7 @@ def _dispatch_m2rnn_scan(
     )
 
     status = m2rnn_metal_status(q)
-    if path is KernelPath.PATH_B and not status.available:
-        raise RuntimeError(
-            f"m2rnn: Path B kernel unavailable ({status.reason})"
-        )
-    if status.available:
+    if path is KernelPath.PATH_B or status.available:
         q_b, k_b, v_b, W_b, xf_b = broadcast_m2rnn_heads(q, k, v, W, xf)
         batch, _seq, heads, k_dim = q_b.shape
         v_dim = v_b.shape[-1]
@@ -386,7 +384,15 @@ def _dispatch_m2rnn_scan(
             dtype=q_b.dtype,
         )
         out, h = m2rnn_apply_with_state(q_b, k_b, v_b, W_b, xf_b, h0_full)
-        record_dispatch("m2rnn", path, "metal_kernel_fwd_v1")
+        record_dispatch(
+            "m2rnn",
+            path,
+            (
+                "metal_kernel_fwd_v1"
+                if status.available
+                else PATH_B_REFERENCE_BASELINE_KERNEL
+            ),
+        )
         return out, h
 
     record_dispatch("m2rnn", path, "reference_pure_mlx")
@@ -782,6 +788,7 @@ __all__ = [
     "M2RNNConfig",
     "M2RNNMixer",
     "M2RNNMixerState",
+    "PATH_B_REFERENCE_BASELINE_KERNEL",
     "broadcast_m2rnn_heads",
     "chunked_m2rnn_scan",
     "m2rnn_softplus_decay_gate",

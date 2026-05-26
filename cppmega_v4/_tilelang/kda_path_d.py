@@ -23,15 +23,22 @@ from typing import Any
 from cppmega_v4._tilelang._path_d_deps import (
     ensure_fla_root,
     ensure_triton_frontend_root,
+    unsafe_fla_import_disabled_reason,
+    unsafe_triton_frontend_import_disabled_reason,
+    unsafe_triton_frontend_import_enabled,
 )
 
 
 def _triton_frontend_importable() -> tuple[bool, str]:
+    root = ensure_triton_frontend_root()
+    if not unsafe_triton_frontend_import_enabled():
+        return False, unsafe_triton_frontend_import_disabled_reason(root)
+    if root is None:
+        return False, "poc.triton_frontend not importable: no local checkout found"
     try:
         import triton  # noqa: F401
     except Exception as exc:
         return False, f"triton not importable: {exc.__class__.__name__}: {exc}"
-    ensure_triton_frontend_root()
     try:
         from poc.triton_frontend import from_triton_kernel  # noqa: F401
     except Exception as exc:
@@ -40,7 +47,11 @@ def _triton_frontend_importable() -> tuple[bool, str]:
 
 
 def _fla_kda_chunk_importable() -> tuple[bool, str]:
-    ensure_fla_root()
+    root = ensure_fla_root()
+    if not unsafe_triton_frontend_import_enabled():
+        return False, unsafe_fla_import_disabled_reason(root)
+    if root is None:
+        return False, "fla.ops.kda.chunk not importable: no local checkout found"
     try:
         from fla.ops.kda.chunk import chunk_kda  # noqa: F401
     except Exception as exc:

@@ -250,6 +250,7 @@ export function HFQuickStartModal({
             <label style={{ display: "flex", flexDirection: "column", gap: 4, color: "#cbd5e1" }}>
               Preset Dataset Catalog
               <select
+                data-testid={dataset !== "custom" ? "hf-quickstart-dataset-id" : "hf-quickstart-dataset-select"}
                 value={dataset}
                 onChange={(e) => setDataset(e.target.value)}
                 disabled={busy}

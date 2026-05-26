@@ -592,6 +592,17 @@ def build_parser() -> argparse.ArgumentParser:
             "compile=False, and remains off by default."
         ),
     )
+    parser.add_argument(
+        "--use-path-c-fused-train-block-runtime",
+        action="store_true",
+        help=(
+            "Opt in to the generated fused train-block value_and_grad runtime "
+            "for fp8_path_c local_gb10_quarter training. This compiles the "
+            "monolithic generated train-block shader on the actual critical "
+            "path and remains off by default until compile/profile receipts "
+            "prove it stays within the memory budget."
+        ),
+    )
     return parser
 
 
@@ -2952,7 +2963,7 @@ def fp8_path_c_training_route_payload_for_model(
     model: Any,
     *,
     compile_receipt_path: str | Path | None = None,
-    auto_install_fused_train_block: bool = True,
+    auto_install_fused_train_block: bool = False,
     fused_train_block_artifact_lowerer: Callable[..., Any] | None = None,
     fused_train_block_artifact_target_name: str = "metal",
     fused_train_block_artifact_execution_backend: str = "tvm_ffi",
@@ -5353,15 +5364,22 @@ def _path_c_merge_direct_chain_buffer_spec(
         )
     existing_shape = _path_c_shape_tuple(existing["shape"])
     if existing_shape != shape_tuple:
-        if _path_c_shape_extent(existing_shape) != _path_c_shape_extent(shape_tuple):
+        existing_extent = _path_c_shape_extent(existing_shape)
+        shape_extent = _path_c_shape_extent(shape_tuple)
+        if source == "scratch":
+            existing["shape"] = (
+                shape_tuple if shape_extent > existing_extent else existing_shape
+            )
+        elif existing_extent != shape_extent:
             raise ValueError(
                 f"conflicting direct-chain {source} buffer shape {name!r}: "
                 f"{existing_shape!r} vs {shape_tuple!r}"
             )
-        existing["shape"] = _path_c_preferred_direct_chain_shape(
-            existing_shape,
-            shape_tuple,
-        )
+        else:
+            existing["shape"] = _path_c_preferred_direct_chain_shape(
+                existing_shape,
+                shape_tuple,
+            )
     existing_category = str(existing.get("category", ""))
     if existing_category == "runtime_scratch" and str(category) != "runtime_scratch":
         existing["category"] = str(category)
@@ -5454,14 +5472,38 @@ def _path_c_internal_scratch_abi_specs(prim_func: Any) -> dict[str, dict[str, An
         or {}
     )
     specs: dict[str, dict[str, Any]] = {}
+    coalesced_banks: dict[str, dict[str, Any]] = {}
     for raw_name, raw in scratch_shapes.items():
         if not isinstance(raw, Mapping):
             continue
+        dtype = str(raw.get("dtype", "float32"))
+        shape = _path_c_shape_tuple(raw.get("shape", ()))
+        if bool(raw.get("coalesced_scratch_bank")):
+            name = str(raw.get("param_name") or raw.get("bank") or raw_name)
+            offset = int(raw.get("offset", 0) or 0)
+            extent = _path_c_shape_extent(shape)
+            existing = coalesced_banks.setdefault(
+                name,
+                {
+                    "shape": (0,),
+                    "dtype": dtype,
+                },
+            )
+            if str(existing["dtype"]) != dtype:
+                raise ValueError(
+                    f"conflicting internal scratch bank dtype {name!r}: "
+                    f"{existing['dtype']!r} vs {dtype!r}"
+                )
+            existing["shape"] = (
+                max(_path_c_shape_extent(existing["shape"]), offset + extent),
+            )
+            continue
         name = str(raw.get("param_name", raw_name))
         specs[name] = {
-            "shape": tuple(int(dim) for dim in tuple(raw.get("shape", ()))),
-            "dtype": str(raw.get("dtype", "float32")),
+            "shape": shape,
+            "dtype": dtype,
         }
+    specs.update(coalesced_banks)
     return specs
 
 
@@ -9265,9 +9307,13 @@ def run_local_gb10_quarter_training(
                 direct_chain_gradient_capture,
             ) = _path_c_direct_chain_runtime_capture_owners_for_model(model)
             model.attach_path_c_activation_probe(direct_chain_activation_capture)
+        use_path_c_fused_train_block_runtime = bool(
+            getattr(args, "use_path_c_fused_train_block_runtime", False)
+        )
         fp8_path_c_training_route = fp8_path_c_training_route_payload_for_model(
             config,
             model,
+            auto_install_fused_train_block=use_path_c_fused_train_block_runtime,
         )
         mx.eval(model.parameters())
         mx.synchronize()
@@ -9298,6 +9344,16 @@ def run_local_gb10_quarter_training(
         first_batch: Any | None = next(batches) if config.steps > 0 else None
         fp8_path_c_direct_chain_critical_path_install = None
         path_c_training_runtime = None
+        if (
+            path_c_training_route_requested(config)
+            and not bool(compile_plan["enabled"])
+            and use_path_c_fused_train_block_runtime
+        ):
+            path_c_training_runtime = getattr(
+                model,
+                "path_c_fused_train_block_training_runtime",
+                None,
+            )
         if bool(getattr(args, "use_path_c_direct_chain_runtime", False)):
             try:
                 if not path_c_training_route_requested(config):
@@ -9482,7 +9538,13 @@ def run_local_gb10_quarter_training(
                 direct_chain_gradient_capture,
             )
             fp8_path_c_post_step_runtime_capture = (
-                fp8_path_c_training_route_payload_for_model(config, model)
+                fp8_path_c_training_route_payload_for_model(
+                    config,
+                    model,
+                    auto_install_fused_train_block=(
+                        use_path_c_fused_train_block_runtime
+                    ),
+                )
             )
             direct_binding = (
                 fp8_path_c_post_step_runtime_capture.get("path_c_fusion", {})
@@ -9533,7 +9595,13 @@ def run_local_gb10_quarter_training(
                         workspace_owner,
                     )
                     fp8_path_c_post_step_runtime_capture = (
-                        fp8_path_c_training_route_payload_for_model(config, model)
+                        fp8_path_c_training_route_payload_for_model(
+                            config,
+                            model,
+                            auto_install_fused_train_block=(
+                                use_path_c_fused_train_block_runtime
+                            ),
+                        )
                     )
             if bool(getattr(args, "profile_path_c_direct_chain_runtime", False)):
                 try:
@@ -9565,7 +9633,13 @@ def run_local_gb10_quarter_training(
                             batch=last_batch,
                         )
                     fp8_path_c_post_step_runtime_capture = (
-                        fp8_path_c_training_route_payload_for_model(config, model)
+                        fp8_path_c_training_route_payload_for_model(
+                            config,
+                            model,
+                            auto_install_fused_train_block=(
+                                use_path_c_fused_train_block_runtime
+                            ),
+                        )
                     )
                 except Exception as exc:
                     fp8_path_c_direct_chain_runtime_probe = {
@@ -9578,6 +9652,9 @@ def run_local_gb10_quarter_training(
             fp8_path_c_training_route = fp8_path_c_training_route_payload_for_model(
                 config,
                 model,
+                auto_install_fused_train_block=(
+                    use_path_c_fused_train_block_runtime
+                ),
             )
         optimizer_evidence = optimizer_identity_for_selected_optimizer(
             args,
@@ -9616,6 +9693,7 @@ def run_local_gb10_quarter_training(
             "tokens_per_second": statistics.fmean(tps_values),
             "step_metrics": step_metrics,
             "kernel_dispatch": get_dispatch_log(),
+            "stepper_state": stepper.state_dict(),
             "compile": config.compile,
             "compile_enabled": compile_plan["enabled"],
             "compile_plan": compile_plan,
@@ -10177,6 +10255,7 @@ def receipt_from_train_payload(
             "fp8_path_c_direct_chain_critical_path_install": (
                 fp8_path_c_direct_chain_critical_path_install
             ),
+            "stepper_state": train_payload.get("stepper_state"),
             "steps_requested": config.steps,
             "batch_size": config.batch_size,
             "seq_len": config.seq_len,
@@ -10213,6 +10292,7 @@ def receipt_from_train_payload(
             "fp8_path_c_direct_chain_critical_path_install": (
                 fp8_path_c_direct_chain_critical_path_install
             ),
+            "stepper_state": train_payload.get("stepper_state"),
             "all_finite": all_finite,
             "losses": losses,
             "initial_loss": losses[0] if losses else None,

@@ -13,6 +13,7 @@ from pathlib import Path
 
 TRITON_FRONTEND_PATH_ENV = "CPPMEGA_MLX_TRITON_FRONTEND_PATH"
 FLA_SOURCE_PATH_ENV = "CPPMEGA_MLX_FLA_SOURCE_PATH"
+TRITON_FRONTEND_UNSAFE_IMPORT_ENV = "CPPMEGA_V4_ENABLE_UNSAFE_TRITON_IMPORT"
 
 _TRITON_FRONTEND_ROOTS = (
     Path("/Users/dave/sources/tilelang"),
@@ -62,9 +63,47 @@ def ensure_fla_root() -> str | None:
     return None
 
 
+def unsafe_triton_frontend_import_enabled() -> bool:
+    """Return True only when the caller explicitly accepts unsafe Triton imports.
+
+    Some local Triton checkouts abort the Python process during import instead
+    of raising a Python exception. Path D status probes run in normal test and
+    benchmark discovery, so they must fail closed unless the developer opts in.
+    """
+
+    return os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def unsafe_triton_frontend_import_disabled_reason(root: str | None) -> str:
+    root_text = f" root={root}" if root else " root=<not found>"
+    return (
+        "triton frontend not importable by default: unsafe import disabled "
+        f"({TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1 required); Path D runtime "
+        f"adapter not reached;{root_text}"
+    )
+
+
+def unsafe_fla_import_disabled_reason(root: str | None) -> str:
+    root_text = f" root={root}" if root else " root=<not found>"
+    return (
+        "FLA not importable by default: unsafe Path D import disabled "
+        f"({TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1 required); Path D runtime "
+        f"adapter not reached;{root_text}"
+    )
+
+
 __all__ = [
     "FLA_SOURCE_PATH_ENV",
     "TRITON_FRONTEND_PATH_ENV",
+    "TRITON_FRONTEND_UNSAFE_IMPORT_ENV",
     "ensure_fla_root",
     "ensure_triton_frontend_root",
+    "unsafe_fla_import_disabled_reason",
+    "unsafe_triton_frontend_import_disabled_reason",
+    "unsafe_triton_frontend_import_enabled",
 ]

@@ -178,12 +178,12 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
   ]);
 
   const getNodeWidth = (n: Node): number => {
-    if (n.type === "tokenizer_virtual" || n.type === "detokenizer_virtual") return 320;
-    if (n.type === "block_group") return 270;
-    if (n.type === "residual_add") return 100;
-    if (n.type === "adapter") return 180;
-    if (n.type === "loss_ghost") return 220;
-    return 220; // default brick
+    if (n.type === "tokenizer_virtual" || n.type === "detokenizer_virtual") return 340;
+    if (n.type === "block_group") return 300;
+    if (n.type === "residual_add") return 120;
+    if (n.type === "adapter") return 200;
+    if (n.type === "loss_ghost") return 240;
+    return 240; // default brick
   };
   
   return nodes.map((node, index) => {
@@ -200,9 +200,11 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
       if (direction === 1 && x + totalBranchDx > row_width) {
         direction = -1;
         y += dy;
+        x = row_width; // Reset x to right edge for right-to-left flow!
       } else if (direction === -1 && x - totalBranchDx < x_start) {
         direction = 1;
         y += dy;
+        x = x_start; // Reset x to left edge for left-to-right flow!
       }
     }
     
@@ -223,6 +225,7 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
       if (x + curDx > row_width) {
         direction = -1;
         y += dy;
+        x = row_width; // Reset x on wrap!
       } else {
         x += curDx;
       }
@@ -230,6 +233,7 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
       if (x - curDx < x_start) {
         direction = 1;
         y += dy;
+        x = x_start; // Reset x on wrap!
       } else {
         x -= curDx;
       }
@@ -245,6 +249,92 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
       }
     };
   });
+}
+
+function detectRepeatingLayers(specs: BrickSpec[]) {
+  // 1. Find the index of the first spec that has a repeat suffix (_rep1 or _1)
+  let firstRepIndex = -1;
+  let firstRepSuffixType: "rep" | "num" | null = null;
+  
+  for (let i = 0; i < specs.length; i++) {
+    const name = specs[i].name || "";
+    if (name.includes("_rep1")) {
+      firstRepIndex = i;
+      firstRepSuffixType = "rep";
+      break;
+    } else if (name.match(/_1$/)) {
+      firstRepIndex = i;
+      firstRepSuffixType = "num";
+      break;
+    }
+  }
+
+  if (firstRepIndex === -1) {
+    return { hasRepetitions: false, prefixSpecs: specs, unitSpecs: [] as BrickSpec[], repeatsCount: 1, suffixSpecs: [] as BrickSpec[] };
+  }
+
+  // 2. Find the index of the second spec that has a repeat suffix (_rep2 or _2)
+  let secondRepIndex = -1;
+  for (let i = firstRepIndex + 1; i < specs.length; i++) {
+    const name = specs[i].name || "";
+    if (firstRepSuffixType === "rep" && name.includes("_rep2")) {
+      secondRepIndex = i;
+      break;
+    } else if (firstRepSuffixType === "num" && name.match(/_2$/)) {
+      secondRepIndex = i;
+      break;
+    }
+  }
+
+  // 3. Determine the unit size U and start index of repeating stack
+  let U = -1;
+  if (secondRepIndex !== -1) {
+    U = secondRepIndex - firstRepIndex;
+  } else {
+    // Fall back: assume no prefix, so repeating stack starts at 0
+    U = firstRepIndex;
+  }
+
+  const startIndex = firstRepIndex - U;
+  if (startIndex < 0 || U <= 0 || startIndex + U > specs.length) {
+    return { hasRepetitions: false, prefixSpecs: specs, unitSpecs: [] as BrickSpec[], repeatsCount: 1, suffixSpecs: [] as BrickSpec[] };
+  }
+
+  // 4. Extract prefix, unit specs and count perfect repetitions
+  const prefixSpecs = specs.slice(0, startIndex);
+  const unitSpecs = specs.slice(startIndex, startIndex + U);
+  
+  let repeatsCount = 0;
+  for (let idx = startIndex; idx + U <= specs.length; idx += U) {
+    // Check if the current block of size U matches the unit specs kinds
+    let match = true;
+    for (let i = 0; i < U; i++) {
+      if (specs[idx + i].kind !== unitSpecs[i].kind) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      repeatsCount++;
+    } else {
+      break;
+    }
+  }
+
+  if (repeatsCount < 2) {
+    return { hasRepetitions: false, prefixSpecs: specs, unitSpecs: [] as BrickSpec[], repeatsCount: 1, suffixSpecs: [] as BrickSpec[] };
+  }
+
+  const endIndex = startIndex + repeatsCount * U;
+  const suffixSpecs = specs.slice(endIndex);
+
+  return {
+    hasRepetitions: true,
+    prefixSpecs,
+    unitSpecs,
+    repeatsCount,
+    suffixSpecs
+  };
 }
 
 function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: Node[]; edges: Edge[] } {
@@ -282,25 +372,154 @@ function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: 
     'mla', 'mla_absorb', 'rmsnorm', 'csa_hca', 'lightning_indexer', 'dsv4_attention'
   ]);
 
-  // Identify repeating unit U for automatic visual stack folding
-  let unitSize = specs.length;
-  for (let i = 0; i < specs.length; i++) {
-    const name = specs[i].name || "";
-    if (name.includes("_rep")) {
-      unitSize = i;
-      break;
+  // Detect repeating layer stacks
+  const rep = detectRepeatingLayers(specs);
+
+  // Helper to map single spec
+  const mapSingleSpec = (s: BrickSpec) => {
+    const repeats = s.repeats ?? 1;
+    if (repeats > 1 || s.kind === "block_group") {
+      const name = s.name ?? `${s.kind}_group_${nodes.length}`;
+      const block_specs = s.block_specs ?? [{ kind: s.kind, params: s.params ?? {} }];
+      const label = s.label ?? (s.block_specs ? `[${s.block_specs.map(b => b.kind).join(" + ")}]` : `[${s.kind}]`);
+
+      nodes.push({
+        id: name,
+        type: "block_group",
+        position: { x: 0, y: 0 },
+        data: {
+          label,
+          repeats,
+          block_specs,
+        } as any,
+      });
+
+      if (lastName) {
+        edges.push({
+          id: `${lastName}->${name}`,
+          source: lastName,
+          target: name,
+          data: { severity: "info" },
+        });
+      }
+      lastName = name;
+    } else if (s.parallel && Array.isArray(s.parallel)) {
+      const branches = s.parallel;
+      const branchNames: string[] = [];
+      
+      branches.forEach((b) => {
+        const name = b.name ?? `${b.kind}_${nodes.length}`;
+        branchNames.push(name);
+        
+        nodes.push({
+          id: name,
+          type: "brick",
+          position: { x: 0, y: 0 },
+          data: { kind: b.kind, params: b.params ?? {} } as never,
+        });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${name}`,
+            source: lastName,
+            target: name,
+            data: { severity: "info" },
+          });
+        }
+      });
+      
+      const addNodeName = `residual_add_${nodes.length}`;
+      nodes.push({
+        id: addNodeName,
+        type: "residual_add",
+        position: { x: 0, y: 0 },
+        data: { kind: "residual_add", params: {} } as any,
+      });
+      
+      branchNames.forEach((name) => {
+        edges.push({
+          id: `${name}->${addNodeName}`,
+          source: name,
+          target: addNodeName,
+          data: { severity: "info" },
+        });
+      });
+      
+      lastName = addNodeName;
+    } else {
+      const isResidual = RESIDUAL_KINDS.has(s.kind);
+      if (isResidual) {
+        const name = s.name ?? `${s.kind}_${nodes.length}`;
+        nodes.push({
+          id: name,
+          type: "brick",
+          position: { x: 0, y: 0 },
+          data: { kind: s.kind, params: s.params ?? {} } as never,
+        });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${name}`,
+            source: lastName,
+            target: name,
+            data: { severity: "info" },
+          });
+        }
+        
+        const addNodeName = `residual_add_${nodes.length}`;
+        nodes.push({
+          id: addNodeName,
+          type: "residual_add",
+          position: { x: 0, y: 0 },
+          data: { kind: "residual_add", params: {} } as any,
+        });
+        
+        edges.push({
+          id: `${name}->${addNodeName}`,
+          source: name,
+          target: addNodeName,
+          data: { severity: "info" },
+        });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${addNodeName}`,
+            source: lastName,
+            target: addNodeName,
+            data: { severity: "info" },
+          });
+        }
+        
+        lastName = addNodeName;
+      } else {
+        const name = s.name ?? `${s.kind}_${nodes.length}`;
+        nodes.push({
+          id: name,
+          type: "brick",
+          position: { x: 0, y: 0 },
+          data: { kind: s.kind, params: s.params ?? {} } as never,
+        });
+        
+        if (lastName) {
+          edges.push({
+            id: `${lastName}->${name}`,
+            source: lastName,
+            target: name,
+            data: { severity: "info" },
+          });
+        }
+        lastName = name;
+      }
     }
-  }
+  };
 
-  const hasRepetitions = unitSize < specs.length && (specs.length % unitSize === 0);
-  const repeatsCount = hasRepetitions ? (specs.length / unitSize) : 1;
+  if (rep.hasRepetitions) {
+    // Process prefix specs
+    rep.prefixSpecs.forEach(mapSingleSpec);
 
-  // 3. Main bricks from specs (folded by default if repeating layer stack is detected)
-  if (hasRepetitions && repeatsCount > 1) {
+    // Process repeating stack as a folded block group
     const groupName = `block_group_${nodes.length}`;
-    const unitSpecs = specs.slice(0, unitSize);
-    
-    const kinds = unitSpecs.map(s => s.kind);
+    const kinds = rep.unitSpecs.map(s => s.kind);
     const uniqueKinds = Array.from(new Set(kinds));
     const label = `[${uniqueKinds.map(k => k.toUpperCase()).join(" + ")}]`;
 
@@ -310,8 +529,8 @@ function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: 
       position: { x: 0, y: 0 },
       data: {
         label,
-        repeats: repeatsCount,
-        block_specs: unitSpecs,
+        repeats: rep.repeatsCount,
+        block_specs: rep.unitSpecs,
       } as any,
     });
 
@@ -324,145 +543,14 @@ function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: 
       });
     }
     lastName = groupName;
+
+    // Process suffix specs
+    rep.suffixSpecs.forEach(mapSingleSpec);
   } else {
-    for (const s of specs) {
-      const repeats = s.repeats ?? 1;
-      if (repeats > 1 || s.kind === "block_group") {
-        const name = s.name ?? `${s.kind}_group_${nodes.length}`;
-        const block_specs = s.block_specs ?? [{ kind: s.kind, params: s.params ?? {} }];
-        const label = s.label ?? (s.block_specs ? `[${s.block_specs.map(b => b.kind).join(" + ")}]` : `[${s.kind}]`);
-
-        nodes.push({
-          id: name,
-          type: "block_group",
-          position: { x: 0, y: 0 },
-          data: {
-            label,
-            repeats,
-            block_specs,
-          } as any,
-        });
-
-        if (lastName) {
-          edges.push({
-            id: `${lastName}->${name}`,
-            source: lastName,
-            target: name,
-            data: { severity: "info" },
-          });
-        }
-        lastName = name;
-      } else if (s.parallel && Array.isArray(s.parallel)) {
-        const branches = s.parallel;
-        const branchNames: string[] = [];
-        
-        branches.forEach((b) => {
-          const name = b.name ?? `${b.kind}_${nodes.length}`;
-          branchNames.push(name);
-          
-          nodes.push({
-            id: name,
-            type: "brick",
-            position: { x: 0, y: 0 },
-            data: { kind: b.kind, params: b.params ?? {} } as never,
-          });
-          
-          if (lastName) {
-            edges.push({
-              id: `${lastName}->${name}`,
-              source: lastName,
-              target: name,
-              data: { severity: "info" },
-            });
-          }
-        });
-        
-        const addNodeName = `residual_add_${nodes.length}`;
-        nodes.push({
-          id: addNodeName,
-          type: "residual_add",
-          position: { x: 0, y: 0 },
-          data: { kind: "residual_add", params: {} } as any,
-        });
-        
-        branchNames.forEach((name) => {
-          edges.push({
-            id: `${name}->${addNodeName}`,
-            source: name,
-            target: addNodeName,
-            data: { severity: "info" },
-          });
-        });
-        
-        lastName = addNodeName;
-      } else {
-        const isResidual = RESIDUAL_KINDS.has(s.kind);
-        if (isResidual) {
-          const name = s.name ?? `${s.kind}_${nodes.length}`;
-          nodes.push({
-            id: name,
-            type: "brick",
-            position: { x: 0, y: 0 },
-            data: { kind: s.kind, params: s.params ?? {} } as never,
-          });
-          
-          if (lastName) {
-            edges.push({
-              id: `${lastName}->${name}`,
-              source: lastName,
-              target: name,
-              data: { severity: "info" },
-            });
-          }
-          
-          const addNodeName = `residual_add_${nodes.length}`;
-          nodes.push({
-            id: addNodeName,
-            type: "residual_add",
-            position: { x: 0, y: 0 },
-            data: { kind: "residual_add", params: {} } as any,
-          });
-          
-          edges.push({
-            id: `${name}->${addNodeName}`,
-            source: name,
-            target: addNodeName,
-            data: { severity: "info" },
-          });
-          
-          if (lastName) {
-            edges.push({
-              id: `${lastName}->${addNodeName}`,
-              source: lastName,
-              target: addNodeName,
-              data: { severity: "info" },
-            });
-          }
-          
-          lastName = addNodeName;
-        } else {
-          const name = s.name ?? `${s.kind}_${nodes.length}`;
-          nodes.push({
-            id: name,
-            type: "brick",
-            position: { x: 0, y: 0 },
-            data: { kind: s.kind, params: s.params ?? {} } as never,
-          });
-          if (lastName) {
-            edges.push({
-              id: `${lastName}->${name}`,
-              source: lastName,
-              target: name,
-              data: { severity: "info" },
-            });
-          }
-          lastName = name;
-        }
-      }
-    }
+    specs.forEach(mapSingleSpec);
   }
 
-  // 4. Append Output De-embedder (Embedding Table)
+  // 4. Append Output Deembedder (Embedding Table)
   const deembedderName = `output_deembedder`;
   nodes.push({
     id: deembedderName,
@@ -551,22 +639,6 @@ const getSavedActiveTabId = (): string => {
 
 export function App(): JSX.Element {
   const [canvasWidth, setCanvasWidth] = useState<number>(1180);
-
-  useEffect(() => {
-    if (typeof ResizeObserver === "undefined") return;
-    const container = document.querySelector('[data-testid="flow-canvas"]');
-    if (!container) return;
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const w = entry.contentRect.width;
-        if (w > 600) {
-          setCanvasWidth(w);
-        }
-      }
-    });
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, []);
 
   const [tabs, setTabs] = useState<WorkspaceTab[]>(getSavedTabs);
   const [activeTabId, setActiveTabId] = useState<string>(getSavedActiveTabId);
@@ -2756,6 +2828,7 @@ export function App(): JSX.Element {
                   onAutoAlign={handleAutoAlign}
                   onNodesChange={onNodesChange}
                   onEdgesChange={onEdgesChange}
+                  onResize={setCanvasWidth}
                   onEdgeTap={(edgeId) => {
                     setTappedEdgeId(edgeId);
                     setActiveSidebarTab("research_hooks");

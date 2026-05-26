@@ -296,7 +296,9 @@ async def _dispatch(payload: dict, cache: LRUCache):
     finally:
         try:
             import mlx.core as mx
-            if mx.metal.is_available():
+            if hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+            elif hasattr(mx, "metal") and mx.metal.is_available():
                 mx.metal.clear_cache()
         except ImportError:
             pass

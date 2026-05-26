@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from cppmega_v4._tilelang._path_d_deps import TRITON_FRONTEND_UNSAFE_IMPORT_ENV
 from cppmega_v4._tilelang.kda_path_b import kda_forward_path_b
 from cppmega_v4._tilelang.kda_path_c import (
     _path_c_runtime_status as kda_path_c_runtime,
@@ -221,6 +224,24 @@ def test_kda_path_d_probes_return_tuples():
     ok_src, r_src = _fla_kda_chunk_importable()
     assert isinstance(ok_fe, bool) and r_fe
     assert isinstance(ok_src, bool) and r_src
+
+
+def test_kda_path_d_triton_probe_fails_closed_by_default():
+    if os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV):
+        pytest.skip(f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV} explicitly enabled")
+    ok, reason = _triton_frontend_importable()
+    assert ok is False
+    assert "unsafe import disabled" in reason
+    assert "runtime adapter not reached" in reason
+
+
+def test_kda_path_d_fla_probe_fails_closed_by_default():
+    if os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV):
+        pytest.skip(f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV} explicitly enabled")
+    ok, reason = _fla_kda_chunk_importable()
+    assert ok is False
+    assert "unsafe Path D import disabled" in reason
+    assert "runtime adapter not reached" in reason
 
 
 def test_kda_path_d_forced_falls_back_cleanly():

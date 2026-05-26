@@ -87,9 +87,14 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
         "not_bound"
     )
     assert payload["runtime_execution_contract"]["physical_abi_missing_bank_buffers"] == [
-        "path_c_float32_abi_bank",
+        "path_c_float32_activation_abi_bank",
+        "path_c_float32_parameter_abi_bank",
+        "path_c_float32_state_abi_bank",
         "path_c_uint8_abi_bank",
+        "path_c_float32_attention_abi_bank",
         "path_c_int32_abi_bank",
+        "path_c_float32_activation_gradient_abi_bank",
+        "path_c_float32_parameter_gradient_abi_bank",
     ]
     assert payload["runtime_execution_contract"]["schedule_contract_status"] == (
         "registered_not_lowered"
@@ -108,7 +113,7 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
         payload["runtime_execution_contract"]["metal_buffer_limit_exceeded"]
         is False
     )
-    assert payload["generated_source"]["physical_abi_policy"] == "banked_by_dtype"
+    assert payload["generated_source"]["physical_abi_policy"] == "banked_by_role"
     assert payload["generated_source"]["logical_parameter_count"] > (
         payload["runtime_execution_contract"]["kernel_parameter_count"]
     )
@@ -118,7 +123,7 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
     hidden_mapping = payload["generated_source"]["physical_buffer_abi_map"][
         "local_gb10_quarter_brick_10_M_hidden"
     ]
-    assert hidden_mapping["bank"] == "path_c_float32_abi_bank"
+    assert hidden_mapping["bank"] == "path_c_float32_activation_abi_bank"
     assert isinstance(hidden_mapping["offset"], int)
     assert hidden_mapping["offset"] >= 0
     assert hidden_mapping["dtype"] == "float32"
@@ -139,9 +144,14 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
     assert payload["generated_source"]["physical_abi_runtime_binding"][
         "missing_bank_buffers"
     ] == [
-        "path_c_float32_abi_bank",
+        "path_c_float32_activation_abi_bank",
+        "path_c_float32_parameter_abi_bank",
+        "path_c_float32_state_abi_bank",
         "path_c_uint8_abi_bank",
+        "path_c_float32_attention_abi_bank",
         "path_c_int32_abi_bank",
+        "path_c_float32_activation_gradient_abi_bank",
+        "path_c_float32_parameter_gradient_abi_bank",
     ]
     direct_alternative = payload["direct_logical_abi_alternative"]
     assert direct_alternative["physical_abi_policy"] == "direct_buffers"
@@ -356,6 +366,11 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
     def fake_artifact(*args: object) -> list[object]:
         captured["arg_count"] = len(args)
         captured["arg_shapes"] = [tuple(getattr(arg, "shape", ())) for arg in args]
+        captured["scalar_args"] = [
+            (index, arg)
+            for index, arg in enumerate(args)
+            if not hasattr(arg, "shape")
+        ]
         return []
 
     def fake_lowerer(func_or_mod: object, **kwargs: object) -> object:
@@ -375,34 +390,47 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
     assert smoke["status"] == "ok"
     assert smoke["mode"] == "tiny_mra"
     assert smoke["actually_executed"] is True
-    assert smoke["physical_abi_policy"] == "banked_by_dtype"
+    assert smoke["physical_abi_policy"] == "banked_by_role"
     assert smoke["physical_abi_runtime_binding"]["status"] == "ok"
     assert smoke["physical_abi_runtime_binding"]["ordered_kernel_buffers"] == [
-        "path_c_float32_abi_bank",
+        "path_c_float32_activation_abi_bank",
+        "path_c_float32_parameter_abi_bank",
+        "path_c_float32_state_abi_bank",
         "path_c_uint8_abi_bank",
+        "path_c_float32_attention_abi_bank",
         "path_c_int32_abi_bank",
+        "path_c_float32_activation_gradient_abi_bank",
+        "path_c_float32_parameter_gradient_abi_bank",
     ]
-    assert smoke["kernel_parameter_count"] == 6
+    assert smoke["kernel_parameter_count"] == 12
     assert smoke["logical_parameter_count"] > smoke["kernel_parameter_count"]
     assert smoke["total_buffer_bytes"] < smoke["max_buffer_bytes"]
-    assert [entry["name"] for entry in smoke["buffer_abi"][:3]] == [
-        "path_c_float32_abi_bank",
+    assert {entry["name"] for entry in smoke["buffer_abi"]} == {
+        "path_c_float32_activation_abi_bank",
+        "path_c_float32_parameter_abi_bank",
+        "path_c_float32_state_abi_bank",
         "path_c_uint8_abi_bank",
+        "path_c_float32_attention_abi_bank",
         "path_c_int32_abi_bank",
-    ]
-    assert {entry["name"] for entry in smoke["buffer_abi"][3:]} == {
-        "route_0_M_bwd_mamba3_h_steps",
-        "route_2_A_qkv_projection_indices",
+        "path_c_float32_activation_gradient_abi_bank",
+        "path_c_float32_parameter_gradient_abi_bank",
+        "path_c_float32_scratch_bank",
+        "path_c_int32_scratch_bank",
+        "route_1_R_m2rnn_h_state",
     }
-    assert [entry["dtype"] for entry in smoke["buffer_abi"][:3]] == [
-        "float32",
-        "uint8",
-        "int32",
+    assert smoke["runtime_kernel_arg_count"] == smoke["kernel_parameter_count"]
+    assert smoke["runtime_scalar_args"] == [
+        {"name": "path_c_run_backward", "value": 1}
     ]
-    assert captured["arg_count"] == len(smoke["buffer_abi"])
-    assert captured["arg_shapes"] == [
-        tuple(entry["shape"]) for entry in smoke["buffer_abi"]
+    assert captured["arg_count"] == smoke["kernel_parameter_count"]
+    assert captured["scalar_args"] == [(8, 1)]
+    expected_buffer_shapes = [tuple(entry["shape"]) for entry in smoke["buffer_abi"]]
+    expected_arg_shapes = [
+        *expected_buffer_shapes[:8],
+        (),
+        *expected_buffer_shapes[8:],
     ]
+    assert captured["arg_shapes"] == expected_arg_shapes
     assert captured["kwargs"]["target"] == "metal"
 
 

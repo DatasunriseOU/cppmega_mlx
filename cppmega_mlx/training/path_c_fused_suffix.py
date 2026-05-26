@@ -40,6 +40,21 @@ from cppmega_mlx.runtime.path_c_physical_abi import (
 
 
 FusedSuffixCallable = Callable[..., Any]
+_MX_DTYPE_BY_ABI_NAME = {
+    "bool": mx.bool_,
+    "uint8": mx.uint8,
+    "int8": mx.int8,
+    "float16": mx.float16,
+    "bfloat16": mx.bfloat16,
+    "uint16": mx.uint16,
+    "int16": mx.int16,
+    "float32": mx.float32,
+    "uint32": mx.uint32,
+    "int32": mx.int32,
+    "float64": mx.float64,
+    "uint64": mx.uint64,
+    "int64": mx.int64,
+}
 
 
 def _zeros_like_with_cotangent_dtype(value: mx.array) -> mx.array:
@@ -54,6 +69,22 @@ def _zeros_like_with_cotangent_dtype(value: mx.array) -> mx.array:
                         mx.uint8, mx.uint16, mx.uint32, mx.uint64):
         return mx.zeros(value.shape, dtype=mx.float32)
     return mx.zeros_like(value)
+
+
+def _target_mask_for_abi(
+    abi_map: Mapping[str, Any],
+    logical_name: str,
+    value: mx.array,
+) -> mx.array:
+    info = abi_map.get(logical_name)
+    if not isinstance(info, Mapping):
+        return value
+    expected_dtype = _MX_DTYPE_BY_ABI_NAME.get(str(info.get("dtype", "")))
+    if expected_dtype is None or value.dtype == expected_dtype:
+        return value
+    if value.dtype not in (mx.float16, mx.bfloat16, mx.float32, mx.float64):
+        return value
+    return value.astype(expected_dtype)
 
 
 def build_fused_suffix_custom_function(
@@ -114,6 +145,11 @@ def build_fused_suffix_custom_function(
         )
         write_into_bank_slot(
             abi_map, bank_buffers, target_ids_logical_name, target_ids
+        )
+        target_mask = _target_mask_for_abi(
+            abi_map,
+            target_mask_logical_name,
+            target_mask,
         )
         write_into_bank_slot(
             abi_map, bank_buffers, target_mask_logical_name, target_mask

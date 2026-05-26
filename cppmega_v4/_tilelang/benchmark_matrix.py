@@ -65,6 +65,8 @@ class MatrixCell:
     backend_available: bool
     backend_reason: str
     output_finite: bool
+    measured_path: Path_ | None = None
+    fallback_used: bool = False
 
     def to_json(self) -> dict[str, object]:
         return asdict(self)
@@ -125,27 +127,34 @@ def _shape_signature(shape: CellShape) -> str:
 def _output_is_finite(receipt: CellReceipt) -> bool:
     """Re-run a forward to check finiteness — cheap on small shapes."""
     s = receipt.cell_shape
-    if s.block == "gdn":
-        q = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
-        k = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
-        v = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_v))
-        beta = mx.random.normal((s.batch, s.seq_len, s.num_heads))
-        g = mx.random.normal((s.batch, s.seq_len, s.num_heads)) * 0.1
-        from cppmega_v4._tilelang.linear_attention_paths import (
-            gated_delta_recurrent_dispatch,
-        )
-        o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
-    else:
-        hv = s.num_v_heads or s.num_heads
-        q = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
-        k = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
-        v = mx.random.normal((s.batch, s.seq_len, hv, s.head_dim_v))
-        g = mx.random.normal((s.batch, s.seq_len, hv, s.head_dim_k)) * 0.05
-        beta = mx.random.normal((s.batch, s.seq_len, hv))
-        from cppmega_v4._tilelang.kda_paths import kda_recurrent_dispatch
-        o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
-    mx.eval(o)
-    return not bool(mx.any(mx.isnan(o)).item())
+    try:
+        if s.block == "gdn":
+            q = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
+            k = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
+            v = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_v))
+            beta = mx.random.normal((s.batch, s.seq_len, s.num_heads))
+            g = mx.random.normal((s.batch, s.seq_len, s.num_heads)) * 0.1
+            from cppmega_v4._tilelang.linear_attention_paths import (
+                gated_delta_recurrent_dispatch,
+            )
+            o, _ = gated_delta_recurrent_dispatch(
+                q, k, v, beta, g, path=s.path, allow_fallback=False,
+            )
+        else:
+            hv = s.num_v_heads or s.num_heads
+            q = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
+            k = mx.random.normal((s.batch, s.seq_len, s.num_heads, s.head_dim_k))
+            v = mx.random.normal((s.batch, s.seq_len, hv, s.head_dim_v))
+            g = mx.random.normal((s.batch, s.seq_len, hv, s.head_dim_k)) * 0.05
+            beta = mx.random.normal((s.batch, s.seq_len, hv))
+            from cppmega_v4._tilelang.kda_paths import kda_recurrent_dispatch
+            o, _ = kda_recurrent_dispatch(
+                q, k, v, g, beta, path=s.path, allow_fallback=False,
+            )
+        mx.eval(o)
+        return not bool(mx.any(mx.isnan(o)).item())
+    except Exception:
+        return False
 
 
 def _measure_path(
@@ -167,7 +176,11 @@ def _measure_path(
         for _ in range(iters):
             r = measure_cell(cell_shape)
             samples.append(r.fwd_seconds)
-        finite = _output_is_finite(r) if samples else False
+        finite = (
+            _output_is_finite(r)
+            if samples and r.backend_available and not r.fallback_used
+            else False
+        )
     finally:
         if prev is None:
             os.environ.pop(env_var, None)
@@ -182,6 +195,8 @@ def _measure_path(
         backend_available=r.backend_available,
         backend_reason=r.backend_reason,
         output_finite=finite,
+        measured_path=r.measured_path,
+        fallback_used=r.fallback_used,
     )
 
 
@@ -196,6 +211,8 @@ def _decide_promotion(
     eligible = [
         c for c in cells if c.backend_available and c.output_finite
         and c.median_seconds < float("inf")
+        and not c.fallback_used
+        and (c.measured_path is None or c.measured_path == c.path)
     ]
     if not eligible:
         # Nothing available — keep incumbent.
@@ -275,6 +292,9 @@ def write_matrix_receipt(receipt: MatrixReceipt, out_dir: Path) -> Path:
                 backend_available=cell.backend_available,
                 backend_reason=cell.backend_reason,
                 output_shape=(), output_dtype="float32",
+                requested_path=cell.path,
+                measured_path=cell.measured_path or cell.path,
+                fallback_used=cell.fallback_used,
             ),
             out_dir,
         )

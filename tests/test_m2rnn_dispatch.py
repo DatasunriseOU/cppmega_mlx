@@ -4,17 +4,25 @@ These tests verify that :class:`cppmega_mlx.nn.m2rnn.M2RNNMixer` honors the
 :class:`cppmega_mlx.runtime.kernel_policy.KernelPath` selection and records
 the actual kernel used into the dispatch log. AUTO may use the pure-MLX
 fallback when the retired direct-MSL Path B surface is unavailable, while
-explicit PATH_C exercises the TileLang route.
+explicit PATH_B records the reference-backed baseline and explicit PATH_C
+exercises the TileLang route.
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import pytest
 
 import mlx.core as mx
 
-from cppmega_mlx.nn.m2rnn import M2RNNConfig, M2RNNMixer, M2RNNMixerState
+from cppmega_mlx.nn.m2rnn import (
+    M2RNNConfig,
+    M2RNNMixer,
+    M2RNNMixerState,
+    PATH_B_REFERENCE_BASELINE_KERNEL,
+)
 from cppmega_mlx.runtime.kernel_policy import (
     KernelPath,
     clear_dispatch_log,
@@ -81,17 +89,21 @@ def test_reference_policy_forces_pure_mlx(monkeypatch: pytest.MonkeyPatch) -> No
     assert matches[-1]["kernel_used"] == "reference_pure_mlx"
 
 
-def test_path_b_policy_fails_closed_after_direct_msl_retirement(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    if not _METAL_AVAILABLE:
-        pytest.skip("Metal not available")
-    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "path_b")
-    block, hidden = _make_block()
-    with pytest.raises(RuntimeError, match="direct-MSL Path B is retired"):
-        block(hidden)
+def test_path_b_policy_uses_reference_baseline_after_direct_msl_retirement() -> None:
+    previous = os.environ.get("CPPMEGA_KERNEL_PATH")
+    try:
+        os.environ["CPPMEGA_KERNEL_PATH"] = "path_b"
+        block, hidden = _make_block()
+        out, _ = block(hidden)
+        mx.eval(out)
+    finally:
+        if previous is None:
+            os.environ.pop("CPPMEGA_KERNEL_PATH", None)
+        else:
+            os.environ["CPPMEGA_KERNEL_PATH"] = previous
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
-    assert matches == []
+    assert matches[-1]["path"] == "path_b"
+    assert matches[-1]["kernel_used"] == PATH_B_REFERENCE_BASELINE_KERNEL
 
 
 def test_path_c_dispatches_grouped_heads_without_path_b_fallback(

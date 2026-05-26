@@ -50,6 +50,10 @@ class CellReceipt:
     backend_reason: str
     output_shape: tuple[int, ...]
     output_dtype: str
+    requested_path: Path_ | None = None
+    measured_path: Path_ | None = None
+    fallback_used: bool = False
+    dispatch_error: str | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -59,7 +63,15 @@ class CellReceipt:
             "backend_reason": self.backend_reason,
             "output_shape": list(self.output_shape),
             "output_dtype": self.output_dtype,
+            "requested_path": self.requested_path or self.cell_shape.path,
+            "measured_path": self.measured_path or self.cell_shape.path,
+            "fallback_used": self.fallback_used,
+            "dispatch_error": self.dispatch_error,
         }
+
+
+def _path_e_metal_kernel_supported(shape: CellShape) -> bool:
+    return shape.head_dim_k % 32 == 0 and shape.head_dim_v % 4 == 0
 
 
 def measure_cell(shape: CellShape) -> CellReceipt:
@@ -73,30 +85,72 @@ def measure_cell(shape: CellShape) -> CellReceipt:
         linear_attention_path_statuses() if shape.block == "gdn" else kda_path_statuses()
     )
     st = statuses[shape.path]
+    backend_available = bool(st.available)
+    backend_reason = st.reason
+    if shape.path == "path_e" and not _path_e_metal_kernel_supported(shape):
+        backend_available = False
+        backend_reason = (
+            f"{st.reason}; benchmark shape uses Path E ops fallback, not the "
+            "vendored Metal kernel (requires head_dim_k%32==0 and head_dim_v%4==0)"
+        )
 
     env_var = GDN_ENV if shape.block == "gdn" else KDA_ENV
     prev = os.environ.get(env_var)
+
+    if shape.block == "gdn":
+        q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+        k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+        v = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_v))
+        beta = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads))
+        g = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads)) * 0.1
+
+        def run(path: Path_, *, allow_fallback: bool):
+            return gated_delta_recurrent_dispatch(
+                q, k, v, beta, g, path=path, allow_fallback=allow_fallback,
+            )
+
+    else:  # kda
+        hv = shape.num_v_heads if shape.num_v_heads is not None else shape.num_heads
+        q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+        k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
+        v = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_v))
+        g = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_k)) * 0.05
+        beta = mx.random.normal((shape.batch, shape.seq_len, hv))
+
+        def run(path: Path_, *, allow_fallback: bool):
+            return kda_recurrent_dispatch(
+                q, k, v, g, beta, path=path, allow_fallback=allow_fallback,
+            )
+
+    measured_path: Path_ = shape.path
+    fallback_used = False
+    dispatch_error: str | None = None
     os.environ[env_var] = shape.path
     try:
-        if shape.block == "gdn":
-            q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-            k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-            v = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_v))
-            beta = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads))
-            g = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads)) * 0.1
-            t0 = time.perf_counter()
-            o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g)
+        try:
+            if shape.path != "path_a" and not backend_available:
+                measured_path = "path_a"
+                fallback_used = True
+                t0 = time.perf_counter()
+                o, _ = run("path_a", allow_fallback=False)
+            else:
+                t0 = time.perf_counter()
+                o, _ = run(shape.path, allow_fallback=False)
             mx.eval(o)
             elapsed = time.perf_counter() - t0
-        else:  # kda
-            hv = shape.num_v_heads if shape.num_v_heads is not None else shape.num_heads
-            q = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-            k = mx.random.normal((shape.batch, shape.seq_len, shape.num_heads, shape.head_dim_k))
-            v = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_v))
-            g = mx.random.normal((shape.batch, shape.seq_len, hv, shape.head_dim_k)) * 0.05
-            beta = mx.random.normal((shape.batch, shape.seq_len, hv))
+        except Exception as exc:
+            if shape.path == "path_a":
+                raise
+            dispatch_error = f"{exc.__class__.__name__}: {exc}"
+            backend_available = False
+            backend_reason = (
+                f"{st.reason}; dispatch failed with fallback disabled: "
+                f"{dispatch_error}"
+            )
+            measured_path = "path_a"
+            fallback_used = True
             t0 = time.perf_counter()
-            o, _ = kda_recurrent_dispatch(q, k, v, g, beta)
+            o, _ = run("path_a", allow_fallback=False)
             mx.eval(o)
             elapsed = time.perf_counter() - t0
     finally:
@@ -108,10 +162,14 @@ def measure_cell(shape: CellShape) -> CellReceipt:
     return CellReceipt(
         cell_shape=shape,
         fwd_seconds=elapsed,
-        backend_available=st.available,
-        backend_reason=st.reason,
+        backend_available=backend_available,
+        backend_reason=backend_reason,
         output_shape=tuple(o.shape),
         output_dtype=str(o.dtype),
+        requested_path=shape.path,
+        measured_path=measured_path,
+        fallback_used=fallback_used,
+        dispatch_error=dispatch_error,
     )
 
 

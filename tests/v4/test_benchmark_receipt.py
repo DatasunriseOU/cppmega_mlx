@@ -60,6 +60,19 @@ def test_measure_cell_path_d_reports_coherent_receipt():
     assert receipt.output_shape == (1, 2, 2, 4)
 
 
+def test_measure_cell_path_e_small_shape_is_not_backend_measurement():
+    shape = CellShape(
+        block="gdn", path="path_e", batch=1, seq_len=2,
+        num_heads=2, head_dim_k=4, head_dim_v=4,
+    )
+    receipt = measure_cell(shape)
+    assert receipt.backend_available is False
+    assert receipt.fallback_used is True
+    assert receipt.measured_path == "path_a"
+    assert "ops fallback" in receipt.backend_reason
+    assert receipt.output_shape == (1, 2, 2, 4)
+
+
 def test_write_receipt_produces_valid_json(tmp_path: Path):
     shape = CellShape(
         block="gdn", path="path_a", batch=1, seq_len=2,

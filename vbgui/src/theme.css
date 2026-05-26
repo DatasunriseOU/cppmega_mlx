@@ -160,13 +160,17 @@ a { color: var(--vb-accent); }
   border: 1.5px solid var(--vb-border-strong);
   border-radius: var(--vb-radius-pill);
   transition: background 0.15s ease, box-shadow 0.15s ease,
-              border-color 0.15s ease;
+              border-color 0.15s ease, opacity 0.15s ease;
+  opacity: 0; /* Hide by default so high-fidelity arrowheads are fully visible */
 }
+.react-flow__node:hover .react-flow__handle,
+.react-flow__node.selected .react-flow__handle,
 .react-flow__handle:hover,
 .react-flow__handle-connecting {
   background: var(--vb-accent);
   border-color: var(--vb-accent);
   box-shadow: 0 0 0 4px var(--vb-accent-soft);
+  opacity: 1;
 }
 .react-flow__handle.connectionindicator { cursor: crosshair; }
 

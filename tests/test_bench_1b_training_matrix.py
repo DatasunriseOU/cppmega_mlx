@@ -114,6 +114,30 @@ def test_bench_1b_matrix_can_forward_direct_chain_runtime_flag(
     ].command
 
 
+def test_bench_1b_matrix_can_forward_fused_train_block_runtime_flag(
+    tmp_path: Path,
+) -> None:
+    args = _args(
+        tmp_path,
+        "--dtypes",
+        "bf16",
+        "--optimizers",
+        "adamw",
+        "--paths",
+        "path_b,path_c_warm",
+        "--use-path-c-fused-train-block-runtime",
+    )
+    cells = matrix.build_cells(args)
+    by_case = {cell.case_id: cell for cell in cells}
+
+    assert "--use-path-c-fused-train-block-runtime" not in by_case[
+        "bf16_adamw_path_b"
+    ].command
+    assert "--use-path-c-fused-train-block-runtime" in by_case[
+        "bf16_adamw_path_c_warm"
+    ].command
+
+
 def test_bench_1b_matrix_can_plan_profile_capture_wrapped_command(
     tmp_path: Path,
 ) -> None:
@@ -411,6 +435,57 @@ def test_bench_1b_matrix_extracts_profile_capture_receipt_when_m04_has_no_profil
     assert result.profiling_trace_captured is True
     assert result.profiling_capture_receipt_path == str(capture_receipt_path)
     assert result.profiling_capture_status == "ok"
+
+
+def test_bench_1b_matrix_failed_cell_preserves_raw_blocker_before_stderr(
+    tmp_path: Path,
+) -> None:
+    args = _args(
+        tmp_path,
+        "--dtypes",
+        "bf16",
+        "--optimizers",
+        "adamw",
+        "--paths",
+        "path_b",
+    )
+    cell = matrix.build_cells(args)[0]
+    cell.output_json.parent.mkdir(parents=True)
+    blocker = (
+        "m2rnn: Path B kernel unavailable "
+        "(direct-MSL Path B is retired; use m2rnn_path_c.py for native TileLang/TVM-FFI)"
+    )
+    cell.output_json.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "blockers": [{"type": "RuntimeError", "reason": blocker}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = matrix.extract_result(
+        cell=cell,
+        identity={
+            "cppmega_sha": "cpp",
+            "tilelang_sha": "tl",
+            "mlx_sha": "mlx",
+            "mlx_version": "0.0+mlx",
+        },
+        cache_state={"cache_mode": "none"},
+        process=subprocess.CompletedProcess(
+            cell.command,
+            2,
+            "",
+            "mx.metal.set_memory_limit is deprecated",
+        ),
+        duration_s=1.0,
+    )
+
+    assert result.status == "failed"
+    assert result.pass_fail_reason == blocker
 
 
 def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:

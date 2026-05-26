@@ -2454,12 +2454,10 @@ def test_bf16_path_c_policy_route_is_requested_without_fp8_producer(
     assert route["requested"] is True
     assert route["dtype"] == "bfloat16"
     assert route["sparse_mla_fp8_producer"]["requested"] is False
-    # With HybridTinyLM's mixed-mode fused-train-block runtime now
-    # available, bf16 mode promotes from split-only to E2E training.
-    assert route["status"] == m04_train_step.FP8_PATH_C_E2E_TRAINING_STATUS
+    assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
     assert route["split_end_to_end_training_available"] is True
-    assert route["full_end_to_end_training_available"] is True
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["full_end_to_end_training_available"] is False
+    assert route["selected_action"] == "run_path_c_split_training_route"
     assert route["blocker_type"] is None
 
 
@@ -2489,6 +2487,7 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
     route = m04_train_step.fp8_path_c_training_route_payload_for_model(
         config,
         model,
+        auto_install_fused_train_block=True,
     )
 
     bridge = route["path_c_fusion"]["direct_chained_fusion"][
@@ -3984,6 +3983,81 @@ def test_fp8_path_c_training_route_reports_model_owned_physical_bank_plan(
     )
 
 
+def test_path_c_internal_scratch_abi_specs_coalesces_physical_bank_shape() -> None:
+    prim_func = SimpleNamespace(
+        _cppmega_path_c_spilled_shared_scratch_shapes={
+            "q_fp8_grad": {
+                "dtype": "float32",
+                "param_name": "path_c_float32_scratch_bank",
+                "shape": (1024,),
+                "coalesced_scratch_bank": True,
+                "bank": "path_c_float32_scratch_bank",
+                "offset": 0,
+            },
+            "kv_fp8_grad": {
+                "dtype": "float32",
+                "param_name": "path_c_float32_scratch_bank",
+                "shape": (1024,),
+                "coalesced_scratch_bank": True,
+                "bank": "path_c_float32_scratch_bank",
+                "offset": 1024,
+            },
+            "q_scale_grad": {
+                "dtype": "float32",
+                "param_name": "path_c_float32_scratch_bank",
+                "shape": (256,),
+                "coalesced_scratch_bank": True,
+                "bank": "path_c_float32_scratch_bank",
+                "offset": 2048,
+            },
+            "local_tile": {
+                "dtype": "int32",
+                "param_name": "standalone_int32_scratch",
+                "shape": (4, 8),
+            },
+        }
+    )
+
+    specs = m04_train_step._path_c_internal_scratch_abi_specs(prim_func)
+
+    assert specs["path_c_float32_scratch_bank"] == {
+        "shape": (2304,),
+        "dtype": "float32",
+    }
+    assert specs["standalone_int32_scratch"] == {
+        "shape": (4, 8),
+        "dtype": "int32",
+    }
+    assert "q_fp8_grad" not in specs
+    assert "kv_fp8_grad" not in specs
+
+
+def test_path_c_direct_chain_scratch_bank_merge_uses_largest_segment_shape() -> None:
+    specs: dict[str, dict[str, Any]] = {}
+
+    m04_train_step._path_c_merge_direct_chain_buffer_spec(
+        specs,
+        name="path_c_float32_scratch_bank",
+        shape=(2032,),
+        dtype="float32",
+        category="runtime_activation_or_grad",
+        segment_index=0,
+        source="scratch",
+    )
+    m04_train_step._path_c_merge_direct_chain_buffer_spec(
+        specs,
+        name="path_c_float32_scratch_bank",
+        shape=(7112,),
+        dtype="float32",
+        category="runtime_activation_or_grad",
+        segment_index=2,
+        source="scratch",
+    )
+
+    assert specs["path_c_float32_scratch_bank"]["shape"] == (7112,)
+    assert specs["path_c_float32_scratch_bank"]["segments"] == [0, 2]
+
+
 def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
     tmp_path: Path,
     path_c_fusion_auto_env: None,
@@ -4197,10 +4271,16 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner_factory(
     )
 
     assert model.owner_factory_sequence_lengths == [sequence_length]
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
-    assert route["fused_train_block_training_runtime_available"] is True
-    assert route["single_fused_train_block_runtime_available"] is True
-    assert route["fused_train_block_training_runtime_contract"]["status"] == "ok"
+    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["fused_train_block_training_runtime_available"] is False
+    assert route["single_fused_train_block_runtime_available"] is False
+    assert route["single_fused_train_block_standalone_dispatch_available"] is True
+    assert route["fused_train_block_training_runtime_contract"]["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_MISSING_STATUS
+    )
+    # This flag reports that a standalone fused artifact is bound; the
+    # selected training action still stays split until the value-and-grad
+    # training runtime contract is available.
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
@@ -4246,29 +4326,30 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     route = m04_train_step.fp8_path_c_training_route_payload_for_model(
         config,
         model,
+        auto_install_fused_train_block=True,
         fused_train_block_artifact_lowerer=fake_lowerer,
     )
 
     auto_install = route["path_c_fusion"]["fused_train_block_auto_install"]
-    # Mixed-mode runtime flips auto_install['status'] from blocked to ok
-    # and surfaces full-model gradient coverage via the wrapping runtime.
-    assert auto_install["status"] == "ok"
+    assert auto_install["status"] == "blocked"
     assert auto_install["artifact_compile"]["status"] == "ok"
     assert auto_install["artifact_compile"]["artifact_bound"] is True
-    assert auto_install["training_runtime_available"] is True
-    assert auto_install["training_runtime_contract"]["status"] == "ok"
+    assert auto_install["training_runtime_available"] is False
+    assert auto_install["training_runtime_contract"]["status"] == (
+        "fused_train_block_training_runtime_incomplete"
+    )
     assert auto_install["training_runtime_contract"]["runtime_installed"] is True
     assert (
         auto_install["training_runtime_contract"]["returns_full_model_grads"]
-        is True
+        is False
     )
     assert auto_install["training_runtime_contract"]["runtime_class"] == (
         "PathCFusedPlusEagerTrainingRuntime"
     )
     assert auto_install["hidden_packing_performed"] is False
-    assert route["selected_action"] == "run_path_c_fused_train_block_route"
+    assert route["selected_action"] == "run_path_c_split_training_route"
     assert route["single_fused_train_block_standalone_dispatch_available"] is True
-    assert route["fused_train_block_training_runtime_available"] is True
+    assert route["fused_train_block_training_runtime_available"] is False
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
@@ -4309,6 +4390,7 @@ def test_fp8_path_c_training_route_for_model_auto_wraps_contracted_fused_artifac
     route = m04_train_step.fp8_path_c_training_route_payload_for_model(
         config,
         model,
+        auto_install_fused_train_block=True,
     )
 
     runtime = model.path_c_fused_train_block_training_runtime
@@ -4368,6 +4450,7 @@ def test_fp8_path_c_training_route_for_model_auto_binds_model_training_runtime(
     route = m04_train_step.fp8_path_c_training_route_payload_for_model(
         config,
         model,
+        auto_install_fused_train_block=True,
         fused_train_block_artifact_lowerer=fake_lowerer,
     )
 
@@ -4911,36 +4994,36 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    assert audit["required_logical_buffer_count"] == 81
-    assert audit["model_parameter_or_constant_count"] == 25
-    assert audit["runtime_activation_or_grad_count"] == 51
-    assert audit["backward_gradient_count"] == 34
+    assert audit["required_logical_buffer_count"] == 88
+    assert audit["model_parameter_or_constant_count"] == 26
+    assert audit["runtime_activation_or_grad_count"] == 57
+    assert audit["backward_gradient_count"] == 37
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
     assert audit["model_parameter_logical_owner_available"] is True
     assert audit["model_parameter_logical_owner"] == (
         "local_gb10_quarter.path_c_model_parameter_buffers"
     )
-    assert audit["model_parameter_logical_owner_buffer_count"] == 25
+    assert audit["model_parameter_logical_owner_buffer_count"] == 26
     assert audit["model_parameter_logical_owner_total_buffer_count"] > 25
-    assert audit["backward_gradient_parameter_alias_coverage_count"] == 25
+    assert audit["backward_gradient_parameter_alias_coverage_count"] == 28
     assert audit["backward_gradient_uncovered_count"] == 9
     assert audit["profile_brick_names_attached"] is True
-    assert audit["forward_activation_or_prepared_count"] == 17
+    assert audit["forward_activation_or_prepared_count"] == 20
     assert audit["runtime_state_count"] == 5
     pre_step_plan = route["path_c_fusion"]["direct_chained_fusion"][
         "pre_step_owner_plan"
     ]
     assert pre_step_plan["status"] == "pre_step_runtime_owner_missing"
     assert pre_step_plan["training_critical_path_ready"] is False
-    assert pre_step_plan["model_parameter_or_constant_available_count"] == 25
+    assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
     assert pre_step_plan["model_parameter_or_constant_missing_count"] == 0
-    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 17
-    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 17
+    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 20
+    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 20
     assert pre_step_plan["runtime_state_count"] == 5
     assert pre_step_plan["runtime_state_missing_count"] == 5
-    assert pre_step_plan["pre_step_runtime_missing_count"] == 22
-    assert pre_step_plan["backward_workspace_gradient_count"] == 36
+    assert pre_step_plan["pre_step_runtime_missing_count"] == 25
+    assert pre_step_plan["backward_workspace_gradient_count"] == 37
     assert (
         "local_gb10_quarter_brick_10_M_hidden"
         in pre_step_plan["batch_dependent_forward_or_prepared_missing_examples"]
@@ -4958,12 +5041,9 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert runtime_binding["logical_buffer_owner"] == (
         "local_gb10_quarter.path_c_model_parameter_buffers"
     )
-    assert runtime_binding["provided_logical_buffer_count"] == 25
+    assert runtime_binding["provided_logical_buffer_count"] == 26
     assert runtime_binding["shape_mismatch_buffers"] == []
-    assert runtime_binding["missing_logical_buffer_count"] == (
-        audit["required_logical_buffer_count"]
-        - runtime_binding["provided_logical_buffer_count"]
-    )
+    assert runtime_binding["missing_logical_buffer_count"] == 60
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
