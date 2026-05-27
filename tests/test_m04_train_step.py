@@ -450,7 +450,7 @@ def test_fp8_path_policies_set_explicit_runtime_routes(tmp_path: Path) -> None:
         ):
             assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_c"
             assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
-            assert os.environ["CPPMEGA_SPARSE_MLA_FP8_BWD"] == "path_b"
+            assert os.environ["CPPMEGA_SPARSE_MLA_FP8_BWD"] == "path_c"
             assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
         assert "CPPMEGA_SPARSE_MLA_FP8_ROUTE" not in os.environ
         assert "CPPMEGA_SPARSE_MLA_FP8_BWD" not in os.environ
@@ -1591,13 +1591,13 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     )
     assert (
         surfaces["sparse_mla_fp8_path_c_apply"]["backward_surface"]
-        == "prepared_fp8_path_b_reference_vjp"
+        == "native_tvm_ffi_graph_output_scatter"
     )
-    assert surfaces["sparse_mla_fp8_path_c_apply"]["path_c_backward_surface"] == (
-        "native_tvm_ffi_graph_output_scatter"
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["fallback_backward_surface"] == (
+        "prepared_fp8_path_b_reference_vjp"
     )
     assert surfaces["sparse_mla_fp8_path_c_apply"]["default_backward_route"] == (
-        "path_b"
+        "path_c"
     )
     assert (
         "FP8 parameter/weight producers that create the required dtype/layout "

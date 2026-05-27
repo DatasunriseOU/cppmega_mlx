@@ -271,7 +271,7 @@ SPARSE_MLA_FP8_BWD_ENV = "CPPMEGA_SPARSE_MLA_FP8_BWD"
 MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
 FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {
     SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
-    SPARSE_MLA_FP8_BWD_ENV: "path_b",
+    SPARSE_MLA_FP8_BWD_ENV: "path_c",
     MAMBA3_PATH_C_BWD_ENV: "path_b",
 }
 FP8_PATH_B_RUNTIME_ENV: dict[str, str] = {SPARSE_MLA_FP8_ROUTE_ENV: "path_b"}
@@ -2780,16 +2780,17 @@ def fp8_path_c_training_route_payload(
                 "training_surface": fp8_producer_configured,
                 "producer_required": True,
                 "producer_status": producer["status"],
-                "backward_surface": "prepared_fp8_path_b_reference_vjp",
-                "path_c_backward_surface": "native_tvm_ffi_graph_output_scatter",
-                "default_backward_route": "path_b",
+                "backward_surface": "native_tvm_ffi_graph_output_scatter",
+                "fallback_backward_surface": "prepared_fp8_path_b_reference_vjp",
+                "default_backward_route": "path_c",
                 "default_backward_reason": (
-                    "native Sparse-MLA Path C backward is kept opt-in until "
-                    "peak-memory non-regression beats Path B"
+                    "native Sparse-MLA Path C backward uses graph outputs for "
+                    "the no-owner VJP path; caller-owned buffers remain explicit "
+                    "for fused runtimes"
                 ),
                 "kernel_policy_env": {
                     SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
-                    SPARSE_MLA_FP8_BWD_ENV: "path_b",
+                    SPARSE_MLA_FP8_BWD_ENV: "path_c",
                 },
             },
             {

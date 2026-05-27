@@ -1018,6 +1018,21 @@ def test_fp8_path_c_backward_vjp_does_not_force_internal_eval() -> None:
         assert "mx.synchronize" not in source, name
 
 
+def test_fp8_path_c_backward_no_owner_route_uses_graph_outputs() -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    source = inspect.getsource(path_c_module._dispatch_fp8_bwd_owner_output_path_c)
+    no_owner_block = source.split(
+        "if dq_buffer is None and dkv_buffer is None:", maxsplit=1
+    )[1].split("elif (dq_buffer is None) != (dkv_buffer is None):", maxsplit=1)[0]
+
+    assert "_empty_fp8_bwd_output" not in source
+    assert "_zero_fp8_bwd_output" not in source
+    assert "graph_output_route = True" in no_owner_block
+    assert "returned = kernel(" in source
+    assert "out=(dq_flat, dkv_flat)" in source
+
+
 def test_fp8_path_c_prepared_float_can_force_memory_safe_reference_backward() -> None:
     import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
 

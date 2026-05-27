@@ -2546,58 +2546,6 @@ def _clear_fp8_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
     return cleared_flat.reshape(shape)
 
 
-def _zero_fp8_bwd_output(shape: tuple[int, int, int, int]) -> mx.array:
-    debug_alloc = os.environ.get("CPPMEGA_DEBUG_SPARSE_MLA_BWD_ALLOC") == "1"
-    if debug_alloc:
-        print(
-            "DEBUG_BWD_ZERO_BEGIN",
-            shape,
-            int(mx.get_active_memory()) if hasattr(mx, "get_active_memory") else None,
-        )
-    total = 1
-    for dim in shape:
-        total *= int(dim)
-    if total <= 0:
-        return mx.zeros(shape, dtype=mx.float32)
-    kernel = _fp8_bwd_clear_dkv_tvm_ffi_kernel_for(
-        shape[0],
-        shape[1],
-        shape[2],
-        shape[3],
-        min(_SMFP8_BWD_CLEAR_THREADS, max(1, total)),
-    )
-    returned = kernel()
-    if isinstance(returned, mx.array):
-        zero_flat = returned
-    elif isinstance(returned, (list, tuple)) and len(returned) == 1:
-        zero_flat = cast(mx.array, returned[0])
-    else:
-        raise SparseMLAFp8PathCDirectError(
-            "direct tvm-ffi FP8 Sparse-MLA backward lazy zero did not return "
-            "one graph output"
-        )
-    if tuple(zero_flat.shape) != (total,) or zero_flat.dtype != mx.float32:
-        raise SparseMLAFp8PathCDirectError(
-            "direct tvm-ffi FP8 Sparse-MLA backward lazy zero returned "
-            f"shape/dtype {tuple(zero_flat.shape)}/{zero_flat.dtype}, expected "
-            f"{(total,)}/float32"
-        )
-    if debug_alloc:
-        print(
-            "DEBUG_BWD_ZERO_END",
-            shape,
-            int(mx.get_active_memory()) if hasattr(mx, "get_active_memory") else None,
-        )
-    return zero_flat.reshape(shape)
-
-
-def _empty_fp8_bwd_output(shape: tuple[int, ...]) -> mx.array:
-    empty = getattr(mx, "empty", None)
-    if empty is None:
-        return mx.zeros(shape, dtype=mx.float32)
-    return cast(mx.array, empty(shape, dtype=mx.float32))
-
-
 def _dispatch_fp8_bwd_owner_output_path_c(
     *,
     q_fp8: mx.array,
@@ -2628,9 +2576,11 @@ def _dispatch_fp8_bwd_owner_output_path_c(
     dkv_shape = (batch, seq_len_kv, kv_group, K)
     index_dtype = _index_dtype_name(indices, op_name="FP8 Sparse-MLA Path C backward")
     dkv_needs_clear = True
+    graph_output_route = False
     if dq_buffer is None and dkv_buffer is None:
-        dq_owner = _zero_fp8_bwd_output(dq_shape)
-        dkv_owner = _zero_fp8_bwd_output(dkv_shape)
+        graph_output_route = True
+        dq_owner = None
+        dkv_owner = None
         dkv_needs_clear = False
     elif (dq_buffer is None) != (dkv_buffer is None):
         raise SparseMLAFp8PathCDirectError(
@@ -2664,20 +2614,33 @@ def _dispatch_fp8_bwd_owner_output_path_c(
             d_out_dtype,
             index_dtype,
         )
-        if dkv_needs_clear:
-            dkv_owner = _clear_fp8_bwd_dkv_buffer(dkv_owner)
-        dq_flat = _flat_1d_view(dq_owner)
-        dkv_flat = _flat_1d_view(dkv_owner)
-        returned = kernel(
-            _flat_1d_view(q_fp8),
-            _flat_1d_view(q_scale),
-            _flat_1d_view(kv_fp8),
-            _flat_1d_view(kv_scale),
-            _flat_1d_view(d_out),
-            _flat_1d_view(indices),
-            sm_scale_buf,
-            out=(dq_flat, dkv_flat),
-        )
+        if graph_output_route:
+            dq_flat = None
+            dkv_flat = None
+            returned = kernel(
+                _flat_1d_view(q_fp8),
+                _flat_1d_view(q_scale),
+                _flat_1d_view(kv_fp8),
+                _flat_1d_view(kv_scale),
+                _flat_1d_view(d_out),
+                _flat_1d_view(indices),
+                sm_scale_buf,
+            )
+        else:
+            if dkv_needs_clear:
+                dkv_owner = _clear_fp8_bwd_dkv_buffer(cast(mx.array, dkv_owner))
+            dq_flat = _flat_1d_view(cast(mx.array, dq_owner))
+            dkv_flat = _flat_1d_view(cast(mx.array, dkv_owner))
+            returned = kernel(
+                _flat_1d_view(q_fp8),
+                _flat_1d_view(q_scale),
+                _flat_1d_view(kv_fp8),
+                _flat_1d_view(kv_scale),
+                _flat_1d_view(d_out),
+                _flat_1d_view(indices),
+                sm_scale_buf,
+                out=(dq_flat, dkv_flat),
+            )
     except Exception as exc:
         if force_path_c:
             raise RuntimeError(
@@ -2685,11 +2648,20 @@ def _dispatch_fp8_bwd_owner_output_path_c(
                 f"dispatch failed: {type(exc).__name__}: {exc}"
             ) from exc
         return None
-    dq_flat, dkv_flat = _owner_output_graph_tuple(
-        returned,
-        expected=(dq_flat, dkv_flat),
-        op_name="direct tvm-ffi FP8 Sparse-MLA backward",
-    )
+    if graph_output_route:
+        if not isinstance(returned, (list, tuple)) or len(returned) != 2:
+            raise SparseMLAFp8PathCDirectError(
+                "direct tvm-ffi FP8 Sparse-MLA backward graph-output route "
+                "did not return dq/dkv"
+            )
+        dq_flat = cast(mx.array, returned[0])
+        dkv_flat = cast(mx.array, returned[1])
+    else:
+        dq_flat, dkv_flat = _owner_output_graph_tuple(
+            returned,
+            expected=(cast(mx.array, dq_flat), cast(mx.array, dkv_flat)),
+            op_name="direct tvm-ffi FP8 Sparse-MLA backward",
+        )
     return dq_flat.reshape(dq_shape), dkv_flat.reshape(dkv_shape)
 
 
@@ -3331,8 +3303,6 @@ def _prepared_fp8_bwd_ste(
         dq = dq.astype(q_dtype)
     if dkv.dtype != kv_dtype:
         dkv = dkv.astype(kv_dtype)
-    if os.environ.get("CPPMEGA_SPARSE_MLA_FP8_BWD_EVAL") == "1":
-        mx.eval(dq, dkv)
     return dq, dkv
 
 
