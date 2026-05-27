@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import os
 import sys
+import importlib
 from pathlib import Path
+from types import ModuleType
 
 TRITON_FRONTEND_PATH_ENV = "CPPMEGA_MLX_TRITON_FRONTEND_PATH"
 FLA_SOURCE_PATH_ENV = "CPPMEGA_MLX_FLA_SOURCE_PATH"
 TRITON_FRONTEND_UNSAFE_IMPORT_ENV = "CPPMEGA_V4_ENABLE_UNSAFE_TRITON_IMPORT"
 
 _TRITON_FRONTEND_ROOTS = (
-    Path("/Users/dave/sources/tilelang"),
     Path("/Volumes/external/sources/tilelang"),
+    Path("/Users/dave/sources/tilelang"),
     Path("/private/tmp/tl_poc_review"),
 )
 
@@ -79,6 +81,29 @@ def unsafe_triton_frontend_import_enabled() -> bool:
     }
 
 
+def import_triton_with_local_symbols() -> ModuleType:
+    """Import Triton without exporting its LLVM symbols process-wide.
+
+    Local Triton builds carry a static LLVM image inside ``libtriton``. On
+    Darwin, importing that extension with the interpreter's default dlopen
+    flags can make LLVM symbols visible to later TileLang/TVM loads, which
+    can abort the process during duplicate LLVM command-line option
+    registration. ``RTLD_LOCAL`` keeps the native image isolated while still
+    returning the normal Python module.
+    """
+
+    if not hasattr(sys, "getdlopenflags") or not hasattr(sys, "setdlopenflags"):
+        return importlib.import_module("triton")
+
+    old_flags = sys.getdlopenflags()
+    local_flags = getattr(os, "RTLD_NOW", old_flags) | getattr(os, "RTLD_LOCAL", 0)
+    sys.setdlopenflags(local_flags)
+    try:
+        return importlib.import_module("triton")
+    finally:
+        sys.setdlopenflags(old_flags)
+
+
 def unsafe_triton_frontend_import_disabled_reason(root: str | None) -> str:
     root_text = f" root={root}" if root else " root=<not found>"
     return (
@@ -103,6 +128,7 @@ __all__ = [
     "TRITON_FRONTEND_UNSAFE_IMPORT_ENV",
     "ensure_fla_root",
     "ensure_triton_frontend_root",
+    "import_triton_with_local_symbols",
     "unsafe_fla_import_disabled_reason",
     "unsafe_triton_frontend_import_disabled_reason",
     "unsafe_triton_frontend_import_enabled",

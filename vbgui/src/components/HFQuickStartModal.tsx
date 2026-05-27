@@ -264,6 +264,9 @@ export function HFQuickStartModal({
                     [{item.category}] {item.name}
                   </option>
                 ))}
+                {!catalog.some(item => item.id === dataset) && (
+                  <option value={dataset}>{dataset}</option>
+                )}
                 <option value="custom">-- Custom Dataset ID --</option>
               </select>
             </label>

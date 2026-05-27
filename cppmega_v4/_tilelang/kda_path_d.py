@@ -23,6 +23,7 @@ from typing import Any
 from cppmega_v4._tilelang._path_d_deps import (
     ensure_fla_root,
     ensure_triton_frontend_root,
+    import_triton_with_local_symbols,
     unsafe_fla_import_disabled_reason,
     unsafe_triton_frontend_import_disabled_reason,
     unsafe_triton_frontend_import_enabled,
@@ -36,7 +37,7 @@ def _triton_frontend_importable() -> tuple[bool, str]:
     if root is None:
         return False, "poc.triton_frontend not importable: no local checkout found"
     try:
-        import triton  # noqa: F401
+        import_triton_with_local_symbols()
     except Exception as exc:
         return False, f"triton not importable: {exc.__class__.__name__}: {exc}"
     try:

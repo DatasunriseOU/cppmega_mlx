@@ -208,7 +208,7 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
       }
     }
     
-    let nodeX = x;
+    let nodeX = direction === 1 ? x : x - curDx;
     let nodeY = y;
     
     if (isResidualActiveBranch) {

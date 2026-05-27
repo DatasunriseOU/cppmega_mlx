@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
+import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -43,6 +46,53 @@ PATH_D_FLA_PROBES = {
     Path("cppmega_v4/_tilelang/linear_attention_path_d.py"): "_fla_chunk_kernel_importable",
     Path("cppmega_v4/_tilelang/kda_path_d.py"): "_fla_kda_chunk_importable",
 }
+PATH_D_UNSAFE_IMPORT_ENV = "CPPMEGA_V4_ENABLE_UNSAFE_TRITON_IMPORT"
+PATH_D_DEFAULT_STATUS_TIMEOUT_SECONDS = 20
+PATH_D_DEFAULT_STATUS_PROBE_CODE = r"""
+import json
+import os
+import sys
+
+UNSAFE_ENV = "CPPMEGA_V4_ENABLE_UNSAFE_TRITON_IMPORT"
+os.environ.pop(UNSAFE_ENV, None)
+
+from cppmega_v4._tilelang.kda_path_d import (
+    _fla_kda_chunk_importable,
+    _path_d_runtime_status as kda_runtime_status,
+    _triton_frontend_importable as kda_triton_importable,
+)
+from cppmega_v4._tilelang.linear_attention_path_d import (
+    _fla_chunk_kernel_importable,
+    _path_d_runtime_status as gdn_runtime_status,
+    _triton_frontend_importable as gdn_triton_importable,
+)
+
+
+def call(label, fn):
+    ok, reason = fn()
+    return {"label": label, "ok": bool(ok), "reason": str(reason)}
+
+
+payload = {
+    "probes": [
+        call("gdn.runtime_status", gdn_runtime_status),
+        call("gdn.triton_frontend", gdn_triton_importable),
+        call("gdn.fla_chunk", _fla_chunk_kernel_importable),
+        call("kda.runtime_status", kda_runtime_status),
+        call("kda.triton_frontend", kda_triton_importable),
+        call("kda.fla_chunk", _fla_kda_chunk_importable),
+    ],
+    "unsafe_modules": sorted(
+        name
+        for name in sys.modules
+        if name == "triton"
+        or name.startswith("triton.")
+        or name == "fla"
+        or name.startswith("fla.")
+    ),
+}
+print(json.dumps(payload, sort_keys=True))
+"""
 PATH_E_ADAPTER_MODULES = {
     "v4.gdn.path_e": Path("cppmega_v4/nn/_external/mlx_lm_gated_delta_update.py"),
     "v4.kda.path_e": Path("cppmega_v4/nn/_external/mlx_lm_kda_update.py"),
@@ -289,6 +339,18 @@ def _first_import_line(function: ast.FunctionDef, module_name: str) -> int | Non
     return min(lines) if lines else None
 
 
+def _first_triton_import_probe_line(function: ast.FunctionDef) -> int | None:
+    lines = [
+        line
+        for line in (
+            _first_import_line(function, "triton"),
+            _first_call_line(function, "import_triton_with_local_symbols"),
+        )
+        if line is not None
+    ]
+    return min(lines) if lines else None
+
+
 def _first_import_prefix_line(function: ast.FunctionDef, module_prefix: str) -> int | None:
     lines: list[int] = []
     for node in ast.walk(function):
@@ -376,7 +438,7 @@ def _check_v4_path_d_import_guards(repo_root: Path) -> list[Finding]:
             function,
             "unsafe_triton_frontend_import_enabled",
         )
-        import_line = _first_import_line(function, "triton")
+        import_line = _first_triton_import_probe_line(function)
         if import_line is None:
             findings.append(
                 Finding(
@@ -385,7 +447,7 @@ def _check_v4_path_d_import_guards(repo_root: Path) -> list[Finding]:
                     location=location,
                     detail=(
                         "_triton_frontend_importable() must explicitly probe "
-                        "Triton after the unsafe-import guard"
+                        "Triton with local native symbols after the unsafe-import guard"
                     ),
                 )
             )
@@ -439,6 +501,161 @@ def _check_v4_path_d_import_guards(repo_root: Path) -> list[Finding]:
                         "Path D FLA probe imports FLA before checking "
                         "unsafe_triton_frontend_import_enabled(); FLA imports "
                         "can transitively import Triton and abort the interpreter"
+                    ),
+                )
+            )
+    return findings
+
+
+def _path_d_disabled_reason_is_clear(reason: str) -> bool:
+    return (
+        "unsafe" in reason.lower()
+        and "runtime adapter not reached" in reason
+        and PATH_D_UNSAFE_IMPORT_ENV in reason
+    )
+
+
+def check_path_d_default_status_no_unsafe_imports(
+    repo_root: Path = ROOT,
+) -> list[Finding]:
+    """Run default Path D status probes in a subprocess.
+
+    Local Triton/FLA imports can abort the interpreter. This guard keeps that
+    failure out of the main test process and verifies the default path stays
+    fail-closed with an actionable disabled reason.
+    """
+
+    env = os.environ.copy()
+    env.pop(PATH_D_UNSAFE_IMPORT_ENV, None)
+    pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else str(repo_root)
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", PATH_D_DEFAULT_STATUS_PROBE_CODE],
+            cwd=repo_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=PATH_D_DEFAULT_STATUS_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return [
+            Finding(
+                code="path_d_default_status_probe_timeout",
+                severity="error",
+                location="v4.path_d",
+                detail=(
+                    "default Path D status subprocess timed out before proving "
+                    "unsafe Triton/FLA imports stay disabled"
+                ),
+            )
+        ]
+
+    if proc.returncode != 0:
+        detail = _first_line(proc.stderr or proc.stdout or "no output")
+        return [
+            Finding(
+                code="path_d_default_status_probe_crashed",
+                severity="error",
+                location="v4.path_d",
+                detail=(
+                    "default Path D status subprocess exited with "
+                    f"{proc.returncode}: {detail}"
+                ),
+            )
+        ]
+
+    try:
+        last_line = next(
+            line for line in reversed(proc.stdout.splitlines()) if line.strip()
+        )
+        payload = json.loads(last_line)
+    except (StopIteration, json.JSONDecodeError) as exc:
+        return [
+            Finding(
+                code="path_d_default_status_probe_bad_output",
+                severity="error",
+                location="v4.path_d",
+                detail=f"default Path D status subprocess did not emit JSON: {exc}",
+            )
+        ]
+
+    findings: list[Finding] = []
+    unsafe_modules = payload.get("unsafe_modules")
+    if not isinstance(unsafe_modules, list):
+        findings.append(
+            Finding(
+                code="path_d_default_status_probe_bad_output",
+                severity="error",
+                location="v4.path_d",
+                detail="default Path D status subprocess omitted unsafe_modules list",
+            )
+        )
+    elif unsafe_modules:
+        findings.append(
+            Finding(
+                code="path_d_default_status_imported_unsafe_deps",
+                severity="error",
+                location="v4.path_d",
+                detail=(
+                    "default Path D status probe imported unsafe modules in "
+                    f"the subprocess: {unsafe_modules[:8]!r}"
+                ),
+            )
+        )
+
+    probes = payload.get("probes")
+    if not isinstance(probes, list):
+        findings.append(
+            Finding(
+                code="path_d_default_status_probe_bad_output",
+                severity="error",
+                location="v4.path_d",
+                detail="default Path D status subprocess omitted probes list",
+            )
+        )
+        return findings
+
+    for probe in probes:
+        if not isinstance(probe, dict):
+            findings.append(
+                Finding(
+                    code="path_d_default_status_probe_bad_output",
+                    severity="error",
+                    location="v4.path_d",
+                    detail=(
+                        "default Path D status probe payload item is invalid: "
+                        f"{probe!r}"
+                    ),
+                )
+            )
+            continue
+        label = str(probe.get("label") or "unknown")
+        reason = str(probe.get("reason") or "")
+        if bool(probe.get("ok")):
+            findings.append(
+                Finding(
+                    code="path_d_default_status_marked_available",
+                    severity="error",
+                    location=label,
+                    detail=(
+                        "Path D default status probe reported available "
+                        "without unsafe import opt-in"
+                    ),
+                )
+            )
+        if not _path_d_disabled_reason_is_clear(reason):
+            findings.append(
+                Finding(
+                    code="path_d_default_status_missing_disabled_reason",
+                    severity="error",
+                    location=label,
+                    detail=(
+                        "Path D default status probe did not return the "
+                        f"unsafe-import disabled reason: {_first_line(reason)}"
                     ),
                 )
             )
@@ -553,6 +770,7 @@ def check_path_contracts(repo_root: Path = ROOT) -> list[Finding]:
                 )
             )
     findings.extend(_check_v4_path_d_import_guards(repo_root))
+    findings.extend(check_path_d_default_status_no_unsafe_imports(repo_root))
     findings.extend(_check_v4_path_e_adapters(repo_root))
     return findings
 

@@ -315,3 +315,9 @@ def test_declared_path_contracts_cover_m04_and_v4_paths() -> None:
     assert [f for f in findings if f.code == "unsafe_path_d_fla_import_probe"] == []
     assert [f for f in findings if f.code == "missing_path_e_adapter"] == []
     assert [f for f in findings if f.code == "path_e_status_missing_adapter_import"] == []
+
+
+def test_path_d_default_status_subprocess_guard_fails_closed() -> None:
+    findings = path_sanity_guard.check_path_d_default_status_no_unsafe_imports(ROOT)
+
+    assert findings == []
