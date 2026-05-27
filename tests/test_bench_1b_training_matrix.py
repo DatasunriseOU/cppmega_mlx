@@ -65,6 +65,7 @@ def test_bench_1b_matrix_plan_covers_dtype_optimizer_path_cells(
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH"] == "path_b"
     assert by_case["fp8_adamw_path_b"].env["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
     assert by_case["fp8_adamw_path_c_warm"].env["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
+    assert by_case["fp8_adamw_path_c_warm"].env["CPPMEGA_SPARSE_MLA_FP8_BWD"] == "path_b"
     assert "--use-path-c-direct-chain-runtime" not in by_case[
         "bf16_adamw_path_c_warm"
     ].command
@@ -451,10 +452,7 @@ def test_bench_1b_matrix_failed_cell_preserves_raw_blocker_before_stderr(
     )
     cell = matrix.build_cells(args)[0]
     cell.output_json.parent.mkdir(parents=True)
-    blocker = (
-        "m2rnn: Path B kernel unavailable "
-        "(direct-MSL Path B is retired; use m2rnn_path_c.py for native TileLang/TVM-FFI)"
-    )
+    blocker = "m2rnn: Path B kernel unavailable (MSL dispatch unavailable)"
     cell.output_json.write_text(
         json.dumps(
             {

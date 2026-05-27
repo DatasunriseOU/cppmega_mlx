@@ -34,7 +34,8 @@ GDN_FIXED_K = 64
 GDN_FIXED_V = 32
 GDN_FIXED_BT = 64
 GDN_FIXED_BV = 32
-GDN_METAL_SAFE_CHUNK_O_BT = 32
+GDN_RUNTIME_BT = 32
+GDN_CHUNK_H_METAL_SAFE_BV = 16
 GDN_FIXED_CHUNK_O_BV = 16
 KDA_FIXED_T = 64
 KDA_FIXED_H = 1
@@ -44,6 +45,7 @@ KDA_FIXED_V = 32
 KDA_FIXED_BT = 32
 KDA_FIXED_BC = 16
 KDA_FIXED_BV = 16
+KDA_CHUNK_H_METAL_SAFE_BV = 8
 KDA_FIXED_CHUNK_O_BV = 16
 
 
@@ -570,6 +572,20 @@ def _thaw_topology_constants(
     return {name: tuple(values) for name, values in topology_constants_key}
 
 
+def _with_topology_arg_aliases(
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]],
+    aliases: dict[str, str],
+) -> Optional[dict[str, tuple[int, ...] | list[int]]]:
+    if not topology_constants:
+        return topology_constants
+    out: dict[str, tuple[int, ...] | list[int]] = dict(topology_constants)
+    for semantic_name, arg_name in aliases.items():
+        values = topology_constants.get(semantic_name)
+        if values is not None:
+            out[arg_name] = values
+    return out
+
+
 def _metadata_constants_for_buffer(
     buffer_name: str,
     topology_constants: dict[str, tuple[int, ...]],
@@ -651,6 +667,206 @@ def specialize_primfunc_for_topology_metadata(
     return prim_func.with_body(body)
 
 
+def canonicalize_kda_intra_token_static_launch(prim_func: Any) -> Any:
+    """Shrink KDA intra-token static-launch control expressions before compile.
+
+    Triton emits the diagonal-token loop as ``range(i_ts, min(i_t + 1, ...))``
+    and PtrAnalysis lowers block-pointer boundary checks into nested
+    ``min/max`` masks. Once cppmega has specialized the fixed KDA launch
+    grid and scalar ``T`` value, those expressions are exact but too large for
+    TileLang's interval prover. This pass rewrites the algebraic equivalent
+    into the small loop the schedule meant all along.
+    """
+
+    from tvm import tir
+    from tvm.tir import stmt_functor
+
+    thread_extents: dict[str, int] = {}
+
+    def gather_thread_extent(node: Any) -> None:
+        if type(node).__name__ != "AttrStmt":
+            return
+        if str(getattr(node, "attr_key", "")) != "thread_extent":
+            return
+        iter_var = getattr(node, "node", None)
+        var = getattr(iter_var, "var", None)
+        value = getattr(getattr(node, "value", None), "value", None)
+        if var is not None and value is not None:
+            thread_extents[str(var)] = int(value)
+
+    stmt_functor.post_order_visit(prim_func.body, gather_thread_extent)
+    if not thread_extents:
+        return prim_func
+
+    def int_value(expr: Any) -> Optional[int]:
+        if type(expr).__name__ != "IntImm":
+            return None
+        value = getattr(expr, "value", None)
+        return None if value is None else int(value)
+
+    def dtype_of(expr: Any) -> str:
+        return str(getattr(expr, "dtype", "int32"))
+
+    def is_var(expr: Any) -> bool:
+        return type(expr).__name__ == "Var"
+
+    def same_var(lhs: Any, rhs: Any) -> bool:
+        return is_var(lhs) and is_var(rhs) and str(lhs) == str(rhs)
+
+    def make_int(dtype: str, value: int) -> Any:
+        return tir.IntImm(dtype, int(value))
+
+    def mul_div_var(expr: Any) -> Optional[tuple[Any, int]]:
+        """Match ``floordiv(var, c) * c``."""
+
+        if type(expr).__name__ != "Mul":
+            return None
+        for lhs, rhs in ((expr.a, expr.b), (expr.b, expr.a)):
+            factor = int_value(rhs)
+            if factor is None or type(lhs).__name__ != "Div":
+                continue
+            if int_value(lhs.b) == factor and is_var(lhs.a):
+                return lhs.a, factor
+        return None
+
+    def mul_div_mod(expr: Any) -> Optional[tuple[Any, int, int]]:
+        """Match ``floordiv(truncmod(var, outer), inner) * inner``."""
+
+        if type(expr).__name__ != "Mul":
+            return None
+        for lhs, rhs in ((expr.a, expr.b), (expr.b, expr.a)):
+            inner = int_value(rhs)
+            if inner is None or type(lhs).__name__ != "Div":
+                continue
+            if int_value(lhs.b) != inner:
+                continue
+            mod = lhs.a
+            if (
+                type(mod).__name__ == "Mod"
+                and is_var(mod.a)
+                and int_value(mod.b) is not None
+            ):
+                return mod.a, int(int_value(mod.b)), inner
+        return None
+
+    def match_two_level_aligned_floor(expr: Any) -> Optional[tuple[Any, int]]:
+        """Match ``(x//A)*A + ((x%A)//B)*B`` where ``A`` is a multiple of ``B``."""
+
+        if type(expr).__name__ != "Add":
+            return None
+        for lhs, rhs in ((expr.a, expr.b), (expr.b, expr.a)):
+            outer = mul_div_var(lhs)
+            inner = mul_div_mod(rhs)
+            if outer is None or inner is None:
+                continue
+            outer_var, outer_block = outer
+            inner_var, modulo, inner_block = inner
+            if (
+                same_var(outer_var, inner_var)
+                and outer_block == modulo
+                and inner_block > 0
+                and outer_block % inner_block == 0
+            ):
+                return outer_var, inner_block
+        return None
+
+    def match_aligned_floor(expr: Any) -> Optional[tuple[Any, int]]:
+        return mul_div_var(expr) or match_two_level_aligned_floor(expr)
+
+    def rebuild_aligned_floor(var: Any, block: int) -> Any:
+        dtype = dtype_of(var)
+        return tir.Mul(
+            tir.Div(var, make_int(dtype, block)),
+            make_int(dtype, block),
+        )
+
+    def canonicalize_expr(node: Any) -> Any:
+        node_type = type(node).__name__
+        if node_type == "Mul":
+            lhs_zero = int_value(node.a) == 0
+            rhs_zero = int_value(node.b) == 0
+            if lhs_zero or rhs_zero:
+                return make_int(dtype_of(node), 0)
+            if int_value(node.a) == 1:
+                return node.b
+            if int_value(node.b) == 1:
+                return node.a
+        if node_type == "Add":
+            if int_value(node.a) == 0:
+                return node.b
+            if int_value(node.b) == 0:
+                return node.a
+        if node_type == "Call":
+            op_name = str(getattr(getattr(node, "op", None), "name", ""))
+            if op_name == "tirx.if_then_else":
+                args = list(getattr(node, "args", ()))
+                if (
+                    len(args) == 3
+                    and "T.min" in str(args[0])
+                    and type(args[1]).__name__ == "BufferLoad"
+                    and str(getattr(args[1].buffer, "name", "")) == "arg2"
+                ):
+                    return args[1]
+        if node_type == "Mod":
+            rhs = int_value(node.b)
+            if (
+                rhs is not None
+                and is_var(node.a)
+                and thread_extents.get(str(node.a), rhs + 1) <= rhs
+            ):
+                return node.a
+        if node_type == "Div":
+            rhs = int_value(node.b)
+            if (
+                rhs is not None
+                and is_var(node.a)
+                and thread_extents.get(str(node.a), rhs + 1) <= rhs
+            ):
+                return make_int(dtype_of(node.a), 0)
+        if node_type == "Add":
+            matched = match_two_level_aligned_floor(node)
+            if matched is not None:
+                var, block = matched
+                return rebuild_aligned_floor(var, block)
+        return node
+
+    body = stmt_functor.ir_transform(
+        prim_func.body,
+        None,
+        canonicalize_expr,
+        ["tirx.Call", "tirx.Mod", "tirx.Div", "tirx.Mul", "tirx.Add"],
+    )
+
+    def canonicalize_for(node: Any) -> Any:
+        if type(node).__name__ != "For":
+            return node
+        matched = match_aligned_floor(node.min)
+        if matched is None or "T.min" not in str(node.extent):
+            return node
+        var, block = matched
+        total_extent = thread_extents.get(str(var))
+        if total_extent is None or block <= 0 or total_extent % block != 0:
+            return node
+        dtype = dtype_of(var)
+        new_min = rebuild_aligned_floor(var, block)
+        new_extent = tir.Add(
+            tir.Mod(var, make_int(dtype, block)),
+            make_int(dtype, 1),
+        )
+        return tir.For(
+            node.loop_var,
+            new_min,
+            new_extent,
+            node.kind,
+            node.body,
+            node.thread_binding,
+            node.annotations,
+        )
+
+    body = stmt_functor.ir_transform(body, None, canonicalize_for, ["tirx.For"])
+    return prim_func.with_body(body)
+
+
 def _default_compile_fn(
     prim_func: Any,
     *,
@@ -703,6 +919,8 @@ def compile_tilelang_primfunc(
             specialized,
             topology_constants or {},
         )
+        if plan.name == KDA_INTRA_TOKEN_PLAN.name:
+            specialized = canonicalize_kda_intra_token_static_launch(specialized)
     except Exception as exc:  # noqa: BLE001
         return PathDCompileResult(
             available=False,
@@ -1057,17 +1275,16 @@ def compile_gdn_chunk_o_artifact(
     )
 
     cfg = dict(DEFAULT_CHUNK_O_CONSTEXPRS)
-    # The original FLA BT=64 chunk_o lowering needs 60 KiB of Metal
-    # threadgroup memory on Apple. Keep the standalone compile artifact on
-    # the smaller topology while the full GDN runtime remains explicitly
-    # pinned to the legacy BT=64 multi-stage contract below.
-    cfg["BT"] = GDN_METAL_SAFE_CHUNK_O_BT
+    # The original FLA BT=64 chunk_o lowering exceeds Apple's 32 KiB
+    # threadgroup-memory limit. Use the same safe runtime chunk size here
+    # as the multi-stage GDN launcher uses below.
+    cfg["BT"] = GDN_RUNTIME_BT
     cfg["BV"] = GDN_FIXED_CHUNK_O_BV
     if constexprs:
         cfg.update(constexprs)
     if grid is None:
         t = int(cfg.get("_RUNTIME_T", GDN_FIXED_T))
-        bt = int(cfg.get("BT", GDN_METAL_SAFE_CHUNK_O_BT))
+        bt = int(cfg.get("BT", GDN_RUNTIME_BT))
         grid = (
             math.ceil(
                 int(cfg.get("V", GDN_FIXED_V))
@@ -1491,10 +1708,17 @@ def _bind_returned_outputs(
             f"{len(explicit_outputs)} explicit owner-output buffers"
         )
     for idx, (actual, expected) in enumerate(zip(returned_outputs, explicit_outputs)):
-        if actual is not expected:
+        if actual is expected:
+            continue
+        actual_shape = tuple(int(x) for x in getattr(actual, "shape", ()))
+        expected_shape = tuple(int(x) for x in getattr(expected, "shape", ()))
+        actual_dtype = str(getattr(actual, "dtype", ""))
+        expected_dtype = str(getattr(expected, "dtype", ""))
+        if actual_shape != expected_shape or actual_dtype != expected_dtype:
             raise PathDRuntimeUnavailable(
-                f"{stage} did not preserve explicit output buffer ownership "
-                f"for out_idx[{idx}]"
+                f"{stage} returned incompatible owner-output alias for "
+                f"out_idx[{idx}]: got shape={actual_shape} dtype={actual_dtype}, "
+                f"expected shape={expected_shape} dtype={expected_dtype}"
             )
     return returned_outputs
 
@@ -1510,10 +1734,10 @@ def _compile_gdn_runtime_stages(
     PathDCompileResult,
     PathDCompileResult,
 ]:
-    nt = 1
+    nt = _ceil_div(GDN_FIXED_T, GDN_RUNTIME_BT)
     stage_grid = (nt, batch * GDN_FIXED_HV)
     chunk_v_grid = (
-        math.ceil(GDN_FIXED_V / GDN_FIXED_BV),
+        math.ceil(GDN_FIXED_V / GDN_CHUNK_H_METAL_SAFE_BV),
         batch * GDN_FIXED_HV,
     )
     chunk_o_grid = (
@@ -1522,19 +1746,27 @@ def _compile_gdn_runtime_stages(
         batch * GDN_FIXED_HV,
     )
     chunk_h_constexprs = {
+        "BT": GDN_RUNTIME_BT,
+        "BV": GDN_CHUNK_H_METAL_SAFE_BV,
         "USE_INITIAL_STATE": bool(use_initial_state),
         "STORE_FINAL_STATE": bool(output_final_state),
         "SAVE_NEW_VALUE": True,
     }
     return (
-        compile_gdn_kkt_artifact(grid=stage_grid),
-        compile_gdn_recompute_w_u_artifact(grid=stage_grid),
+        compile_gdn_kkt_artifact(
+            constexprs={"BT": GDN_RUNTIME_BT},
+            grid=stage_grid,
+        ),
+        compile_gdn_recompute_w_u_artifact(
+            constexprs={"BT": GDN_RUNTIME_BT},
+            grid=stage_grid,
+        ),
         compile_gdn_chunk_h_artifact(
             constexprs=chunk_h_constexprs,
             grid=chunk_v_grid,
         ),
         compile_gdn_chunk_o_artifact(
-            constexprs={"BT": GDN_FIXED_BT, "BV": GDN_FIXED_CHUNK_O_BV},
+            constexprs={"BT": GDN_RUNTIME_BT, "BV": GDN_FIXED_CHUNK_O_BV},
             grid=chunk_o_grid,
         ),
     )
@@ -1567,7 +1799,7 @@ def _compile_kda_runtime_stages(
     total_h_chunks = int(num_chunks) if is_varlen else int(batch) * chunks_per_batch
     stage_grid = (stage_chunks, batch * hv_heads)
     chunk_v_grid = (
-        _ceil_div(v_dim, KDA_FIXED_BV),
+        _ceil_div(v_dim, KDA_CHUNK_H_METAL_SAFE_BV),
         (num_sequences if is_varlen else batch) * hv_heads,
     )
     chunk_o_grid = (
@@ -1589,7 +1821,7 @@ def _compile_kda_runtime_stages(
         "K": int(k_dim),
         "V": int(v_dim),
         "BT": KDA_FIXED_BT,
-        "BV": KDA_FIXED_BV,
+        "BV": KDA_CHUNK_H_METAL_SAFE_BV,
         "USE_G": False,
         "USE_GK": True,
         "USE_INITIAL_STATE": bool(use_initial_state),
@@ -1610,7 +1842,10 @@ def _compile_kda_runtime_stages(
             is_varlen=is_varlen,
             scale=scale,
             constexprs=runtime_private,
-            topology_constants=topology_constants,
+            topology_constants=_with_topology_arg_aliases(
+                topology_constants,
+                {"cu_seqlens": "arg7"},
+            ),
         ),
         compile_kda_inter_solve_artifact(
             batch=batch,
@@ -1624,7 +1859,10 @@ def _compile_kda_runtime_stages(
             scale=scale,
             constexprs=runtime_private,
             grid=stage_grid,
-            topology_constants=topology_constants,
+            topology_constants=_with_topology_arg_aliases(
+                topology_constants,
+                {"cu_seqlens": "arg8", "chunk_indices": "arg9"},
+            ),
         ),
         compile_kda_recompute_w_u_artifact(
             batch=batch,
@@ -1637,13 +1875,19 @@ def _compile_kda_runtime_stages(
             is_varlen=is_varlen,
             constexprs=runtime_private,
             grid=stage_grid,
-            topology_constants=topology_constants,
+            topology_constants=_with_topology_arg_aliases(
+                topology_constants,
+                {"cu_seqlens": "arg10", "chunk_indices": "arg11"},
+            ),
         ),
         compile_gdn_chunk_h_artifact(
             constexprs=chunk_h_constexprs,
             grid=chunk_v_grid,
             scalar_specializations=(int(total_tokens),),
-            topology_constants=topology_constants,
+            topology_constants=_with_topology_arg_aliases(
+                topology_constants,
+                {"cu_seqlens": "arg9", "chunk_offsets": "arg10"},
+            ),
         ),
         compile_kda_chunk_o_artifact(
             batch=batch,
@@ -1658,7 +1902,10 @@ def _compile_kda_runtime_stages(
             scale=scale,
             constexprs=runtime_private,
             grid=chunk_o_grid,
-            topology_constants=topology_constants,
+            topology_constants=_with_topology_arg_aliases(
+                topology_constants,
+                {"cu_seqlens": "arg6", "chunk_indices": "arg7"},
+            ),
         ),
     )
 
@@ -1792,14 +2039,14 @@ def gdn_fwd_runtime_call(
         if not stage.available:
             raise PathDRuntimeUnavailable(stage.reason)
 
-    nt = 1
     q_flat = _flatten(q)
     k_flat = _flatten(k)
     v_flat = _flatten(v)
     beta_flat = _flatten(beta)
     g_cumsum_flat = _flatten(mx.cumsum(g, axis=1) * RCP_LN2)
 
-    a = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_BT,), dtype=mx.float16)
+    nt = _ceil_div(GDN_FIXED_T, GDN_RUNTIME_BT)
+    a = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_RUNTIME_BT,), dtype=mx.float16)
     w = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_K,), dtype=mx.float16)
     u = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_V,), dtype=mx.float16)
     v_new = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_V,), dtype=mx.float16)
@@ -2004,6 +2251,8 @@ def kda_fwd_runtime_call(
     topology_fingerprint: Optional[str] = None
     topology_constants: Optional[dict[str, tuple[int, ...]]] = None
     if is_varlen:
+        if topology_specialization_threshold is None:
+            topology_specialization_threshold = 1
         chunk_indices_values = tuple(
             _as_int_list(chunk_indices_arg, name="chunk_indices")
         )

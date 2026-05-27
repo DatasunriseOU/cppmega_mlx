@@ -772,7 +772,129 @@ def check_path_contracts(repo_root: Path = ROOT) -> list[Finding]:
     findings.extend(_check_v4_path_d_import_guards(repo_root))
     findings.extend(check_path_d_default_status_no_unsafe_imports(repo_root))
     findings.extend(_check_v4_path_e_adapters(repo_root))
+    findings.extend(_check_m04_path_b_m2rnn_direct_msl(repo_root))
+    findings.extend(_check_m04_path_b_mamba3_fast_bwd(repo_root))
     return findings
+
+
+def _check_m04_path_b_mamba3_fast_bwd(repo_root: Path) -> list[Finding]:
+    """Keep Path B Mamba3 backward on the measured fast partial-reduce route."""
+
+    module_path = repo_root / "cppmega_mlx" / "nn" / "_tilelang" / "mamba3.py"
+    location = str(module_path.relative_to(repo_root))
+    if not module_path.exists():
+        return [
+            Finding(
+                code="m04_path_b_mamba3_surface_missing",
+                severity="error",
+                location=location,
+                detail=(
+                    "Mamba3 Path B module is missing; the 1B Path B baseline "
+                    "cannot be trusted."
+                ),
+            )
+        ]
+
+    text = module_path.read_text(encoding="utf-8")
+    required = (
+        "_FWD_KERNEL_SOURCE",
+        "_BWD_KERNEL_SOURCE",
+        "@mx.custom_function",
+        "mamba3_mimo_apply.vjp",
+        "dB_partial",
+        "dC_partial",
+        "dA_partial",
+        "ddt_partial",
+        "dD_partial",
+        "mx.sum(dB_partial, axis=3)",
+        "mx.sum(dD_partial, axis=(0, 2))",
+    )
+    missing = [symbol for symbol in required if symbol not in text]
+    slow_owner_output_markers = [
+        marker
+        for marker in (
+            "cppmega_atomic_add_float",
+            "init_value=0",
+            "&dB[bc_idx + n]",
+            "&dC[bc_idx + n]",
+        )
+        if marker in text
+    ]
+    if not missing and not slow_owner_output_markers:
+        return []
+
+    detail_parts: list[str] = []
+    if missing:
+        detail_parts.append("missing fast partial-reduce symbols: " + ", ".join(missing))
+    if slow_owner_output_markers:
+        detail_parts.append(
+            "slow owner-output atomics present: " + ", ".join(slow_owner_output_markers)
+        )
+    return [
+        Finding(
+            code="m04_path_b_mamba3_atomic_owner_bwd",
+            severity="error",
+            location=location,
+            detail=(
+                "; ".join(detail_parts)
+                + "; Path B Mamba3 backward must keep per-lane partial outputs "
+                "plus MLX reduction unless a replacement proves 1B Path B "
+                "throughput parity."
+            ),
+        )
+    ]
+
+
+def _check_m04_path_b_m2rnn_direct_msl(repo_root: Path) -> list[Finding]:
+    """Keep the 1B Path B baseline from silently degrading to the MLX oracle."""
+
+    module_path = repo_root / "cppmega_mlx" / "nn" / "_tilelang" / "m2rnn.py"
+    location = str(module_path.relative_to(repo_root))
+    if not module_path.exists():
+        return [
+            Finding(
+                code="m04_path_b_m2rnn_surface_missing",
+                severity="error",
+                location=location,
+                detail=(
+                    "M2RNN Path B module is missing; the 1B Path B baseline "
+                    "cannot be trusted."
+                ),
+            )
+        ]
+
+    text = module_path.read_text(encoding="utf-8")
+    missing = [
+        symbol
+        for symbol in (
+            "_FWD_KERNEL_SOURCE",
+            "_BWD_KERNEL_SOURCE",
+            "@mx.custom_function",
+            "m2rnn_apply_with_state.vjp",
+        )
+        if symbol not in text
+    ]
+    retired = "direct-MSL Path B is retired" in text or "_RETIRED_REASON" in text
+    if not missing and not retired:
+        return []
+
+    detail_parts: list[str] = []
+    if retired:
+        detail_parts.append("module declares M2RNN direct-MSL Path B retired")
+    if missing:
+        detail_parts.append("missing direct-MSL symbols: " + ", ".join(missing))
+    return [
+        Finding(
+            code="m04_path_b_m2rnn_direct_msl_retired",
+            severity="error",
+            location=location,
+            detail=(
+                "; ".join(detail_parts)
+                + "; Path B must keep the direct-MSL forward/backward VJP or "
+                "the speed matrix baseline is invalid."
+            ),
+        )
+    ]
 
 
 def _load_json(path: Path) -> Any:

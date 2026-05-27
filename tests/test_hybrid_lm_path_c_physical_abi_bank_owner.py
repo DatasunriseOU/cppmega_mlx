@@ -135,6 +135,7 @@ def test_fused_train_block_runtime_is_not_auto_installed_by_default() -> None:
         "path_c_fused_train_block_training_runtime",
         None,
     ) is None
+    assert getattr(fresh_model, "path_c_physical_abi_bank_owner", None) is None
 
 
 def test_path_c_fused_in_region_parameter_bank_aliases_covers_brick_params(

@@ -21,6 +21,7 @@ These tests exercise:
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import math
 import re
@@ -132,6 +133,20 @@ def _feature_int(features: dict[str, int | bool | str], key: str) -> int:
 def _array_only(value: object) -> mx.array:
     assert not isinstance(value, tuple)
     return cast(mx.array, value)
+
+
+def _assert_grad_pair_matches_owner_shapes(
+    result: object,
+    dq_buffer: mx.array,
+    dkv_buffer: mx.array,
+) -> tuple[mx.array, mx.array]:
+    assert isinstance(result, tuple) and len(result) == 2
+    dq, dkv = cast(tuple[mx.array, mx.array], result)
+    assert tuple(dq.shape) == tuple(dq_buffer.shape)
+    assert tuple(dkv.shape) == tuple(dkv_buffer.shape)
+    assert dq.dtype == dq_buffer.dtype
+    assert dkv.dtype == dkv_buffer.dtype
+    return dq, dkv
 
 
 def _load_fp8_bench_module():
@@ -959,7 +974,9 @@ def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
         dq_buffer=dq_buffer,
         dkv_buffer=dkv_buffer,
     )
-    assert result == (dq_buffer, dkv_buffer)
+    dq_result, dkv_result = _assert_grad_pair_matches_owner_shapes(
+        result, dq_buffer, dkv_buffer
+    )
 
     forced_result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
@@ -974,10 +991,76 @@ def test_fp8_path_c_bwd_owner_outputs_run_through_atomic_tvm_ffi() -> None:
         dq_buffer=dq_buffer,
         dkv_buffer=dkv_buffer,
     )
-    assert forced_result == (dq_buffer, dkv_buffer)
-    mx.eval(dq_buffer, dkv_buffer)
-    assert np.all(np.isfinite(np.asarray(dq_buffer)))
-    assert np.all(np.isfinite(np.asarray(dkv_buffer)))
+    dq_forced, dkv_forced = _assert_grad_pair_matches_owner_shapes(
+        forced_result, dq_buffer, dkv_buffer
+    )
+    mx.eval(dq_result, dkv_result, dq_forced, dkv_forced)
+    assert np.all(np.isfinite(np.asarray(dq_forced)))
+    assert np.all(np.isfinite(np.asarray(dkv_forced)))
+
+
+def test_fp8_path_c_backward_vjp_does_not_force_internal_eval() -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    checked_sources = {
+        "_clear_fp8_bwd_dkv_buffer": inspect.getsource(
+            path_c_module._clear_fp8_bwd_dkv_buffer
+        ),
+        "_dispatch_fp8_bwd_owner_output_path_c": inspect.getsource(
+            path_c_module._dispatch_fp8_bwd_owner_output_path_c
+        ),
+        "_prepared_fp8_bwd_ste": inspect.getsource(
+            path_c_module._prepared_fp8_bwd_ste
+        ),
+    }
+    for name, source in checked_sources.items():
+        assert "mx.eval" not in source, name
+        assert "mx.synchronize" not in source, name
+
+
+def test_fp8_path_c_prepared_float_can_force_memory_safe_reference_backward() -> None:
+    import cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c as path_c_module
+
+    assert (
+        path_c_module._prepared_fp8_backward_uses_path_c(
+            force_path_c=True,
+            force_backward_path_c=False,
+        )
+        is False
+    )
+    assert (
+        path_c_module._prepared_fp8_backward_uses_path_c(
+            force_path_c=False,
+            force_backward_path_c=True,
+        )
+        is True
+    )
+
+    q, kv, indices, d_v = _make_inputs(scale=0.1)
+    q = q.astype(mx.bfloat16)
+    kv = kv.astype(mx.bfloat16)
+    q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
+    kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+    d_out = mx.ones(tuple(q.shape[:3]) + (d_v,), dtype=mx.bfloat16)
+    dq, dkv = path_c_module._prepared_fp8_reference_bwd_ste(
+        q,
+        kv,
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        d_out,
+        indices,
+        sm_scale=q.shape[-1] ** -0.5,
+        d_v=d_v,
+    )
+    mx.eval(dq, dkv)
+    assert tuple(dq.shape) == tuple(q.shape)
+    assert tuple(dkv.shape) == tuple(kv.shape)
+    assert dq.dtype == q.dtype
+    assert dkv.dtype == kv.dtype
+    assert np.all(np.isfinite(np.asarray(dq.astype(mx.float32))))
+    assert np.all(np.isfinite(np.asarray(dkv.astype(mx.float32))))
 
 
 def test_fp8_path_c_bwd_without_owner_outputs_clears_atomic_dkv() -> None:
@@ -1012,8 +1095,10 @@ def test_fp8_path_c_bwd_without_owner_outputs_clears_atomic_dkv() -> None:
         dq_buffer=dq_buffer,
         dkv_buffer=dkv_buffer,
     )
-    assert owner_result == (dq_buffer, dkv_buffer)
-    mx.eval(dq_buffer, dkv_buffer)
+    dq_owner, dkv_owner = _assert_grad_pair_matches_owner_shapes(
+        owner_result, dq_buffer, dkv_buffer
+    )
+    mx.eval(dq_owner, dkv_owner)
 
     poison = mx.full(tuple(kv.shape), float("nan"), dtype=mx.float32)
     mx.eval(poison)
@@ -1041,10 +1126,10 @@ def test_fp8_path_c_bwd_without_owner_outputs_clears_atomic_dkv() -> None:
     assert np.all(np.isfinite(np.asarray(dq)))
     assert np.all(np.isfinite(np.asarray(dkv)))
     np.testing.assert_allclose(
-        np.asarray(dq), np.asarray(dq_buffer), rtol=1e-5, atol=1e-5
+        np.asarray(dq), np.asarray(dq_owner), rtol=1e-5, atol=1e-5
     )
     np.testing.assert_allclose(
-        np.asarray(dkv), np.asarray(dkv_buffer), rtol=1e-5, atol=1e-5
+        np.asarray(dkv), np.asarray(dkv_owner), rtol=1e-5, atol=1e-5
     )
 
 
@@ -1124,7 +1209,9 @@ def _assert_fp8_path_c_bwd_runs_with_owner_buffers(
         dq_buffer=dq_buffer,
         dkv_buffer=dkv_buffer,
     )
-    assert forced_result == (dq_buffer, dkv_buffer)
+    dq_forced, dkv_forced = _assert_grad_pair_matches_owner_shapes(
+        forced_result, dq_buffer, dkv_buffer
+    )
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
         q_scale,
@@ -1138,10 +1225,12 @@ def _assert_fp8_path_c_bwd_runs_with_owner_buffers(
         dq_buffer=dq_buffer,
         dkv_buffer=dkv_buffer,
     )
-    assert result == (dq_buffer, dkv_buffer)
-    mx.eval(dq_buffer, dkv_buffer)
-    assert np.all(np.isfinite(np.asarray(dq_buffer)))
-    assert np.all(np.isfinite(np.asarray(dkv_buffer)))
+    dq_result, dkv_result = _assert_grad_pair_matches_owner_shapes(
+        result, dq_buffer, dkv_buffer
+    )
+    mx.eval(dq_forced, dkv_forced, dq_result, dkv_result)
+    assert np.all(np.isfinite(np.asarray(dq_result)))
+    assert np.all(np.isfinite(np.asarray(dkv_result)))
 
 
 def _fake_fp8_path_c_bwd_owner_output_route(
@@ -1533,7 +1622,7 @@ def test_fp8_path_c_backward_uses_tvm_ffi_owner_outputs(
         dkv_buffer=dkv_buffer,
     )
 
-    assert grads == (dq_buffer, dkv_buffer)
+    _assert_grad_pair_matches_owner_shapes(grads, dq_buffer, dkv_buffer)
     assert clear_calls == [dkv_buffer]
     assert len(calls) == 1
     kernel_args, owner_outputs = calls[0]

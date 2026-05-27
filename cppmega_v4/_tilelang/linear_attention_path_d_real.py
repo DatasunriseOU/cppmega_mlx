@@ -857,6 +857,8 @@ def _lower_fla_kernel_uncached(
     try:
         from poc.triton_frontend import from_ttir, _walk_text_ttir
 
+        full_error_type: Optional[str] = None
+        full_error_message: Optional[str] = None
         try:
             prim = from_ttir(
                 ttir_text,
@@ -883,8 +885,9 @@ def _lower_fla_kernel_uncached(
                 ttir_text_len=len(ttir_text),
                 missing_ops=[str(exc)],
             )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            full_error_type = type(exc).__name__
+            full_error_message = str(exc)
 
         try:
             visited = _walk_text_ttir(ttir_text)
@@ -903,8 +906,8 @@ def _lower_fla_kernel_uncached(
             missing_ops=[],
             prim_func=None,
             ttir_text_len=len(ttir_text),
-            error_type=None,
-            error_message=None,
+            error_type=full_error_type,
+            error_message=full_error_message,
             constexprs=constexprs,
         )
     except Exception as exc:

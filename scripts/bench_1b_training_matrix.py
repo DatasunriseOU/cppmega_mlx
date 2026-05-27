@@ -57,6 +57,7 @@ STATUS_NOT_APPLICABLE = "not_applicable"
 STATUS_PLANNED = "planned"
 MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
 SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
+SPARSE_MLA_FP8_BWD_ENV = "CPPMEGA_SPARSE_MLA_FP8_BWD"
 FAILURE_REASON_KEYS = (
     "status_reason",
     "failure_reason",
@@ -377,6 +378,7 @@ def path_env_and_support(
         }
         if dtype == "fp8":
             env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
+            env[SPARSE_MLA_FP8_BWD_ENV] = "path_b"
         return (env, True, None, "cold", cache_dir)
     if path == "path_c_warm":
         env = {
@@ -388,6 +390,7 @@ def path_env_and_support(
         }
         if dtype == "fp8":
             env[SPARSE_MLA_FP8_ROUTE_ENV] = "path_c"
+            env[SPARSE_MLA_FP8_BWD_ENV] = "path_b"
         return (env, True, None, "warm", cache_dir)
     return {}, False, f"unknown path {path!r}", "not_applicable", None
 
