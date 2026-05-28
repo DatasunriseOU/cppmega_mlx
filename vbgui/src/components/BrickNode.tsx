@@ -1,7 +1,8 @@
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { type NodeProps } from "@xyflow/react";
 import { brickFor } from "@/lib/bricks";
 import { T, accentForCategory, accentVar, CATEGORY_ICON } from "@/theme";
 import { HelpIcon } from "@/components/HelpIcon";
+import { FourSideHandles } from "@/components/nodeHandles";
 
 export interface BrickNodeData {
   kind: string;
@@ -22,8 +23,6 @@ export interface BrickNodeData {
 
 export function BrickNode({ data, id, selected }: NodeProps): JSX.Element {
   const d = data as unknown as BrickNodeData;
-  const targetPosition = (data as any)?.targetPosition ?? Position.Left;
-  const sourcePosition = (data as any)?.sourcePosition ?? Position.Right;
   const meta = brickFor(d.kind);
   const accent = accentForCategory(meta?.category);
   const glyph = meta ? CATEGORY_ICON[meta.category] : "◇";
@@ -64,7 +63,7 @@ export function BrickNode({ data, id, selected }: NodeProps): JSX.Element {
         ...debuggerGlowStyle,
       }}
     >
-      <Handle type="target" position={targetPosition} />
+      <FourSideHandles />
 
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <span className="vb-chip" aria-hidden="true" style={{ fontSize: 15 }}>
@@ -265,8 +264,6 @@ export function BrickNode({ data, id, selected }: NodeProps): JSX.Element {
           ⚙
         </button>
       </footer>
-
-      <Handle type="source" position={sourcePosition} />
     </div>
   );
 }

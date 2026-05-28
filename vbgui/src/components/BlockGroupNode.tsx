@@ -1,4 +1,5 @@
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { type NodeProps } from "@xyflow/react";
+import { FourSideHandles } from "@/components/nodeHandles";
 import { useState } from "react";
 import { T } from "@/theme";
 
@@ -11,8 +12,6 @@ export interface BlockGroupNodeData {
 
 export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
   const d = data as unknown as BlockGroupNodeData;
-  const targetPosition = (data as any)?.targetPosition ?? Position.Left;
-  const sourcePosition = (data as any)?.sourcePosition ?? Position.Right;
   const [showUnpackModal, setShowUnpackModal] = useState(false);
   const [unpackCount, setUnpackCount] = useState(Math.min(4, d.repeats));
 
@@ -56,11 +55,7 @@ export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
         transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
       }}
     >
-      <Handle
-        type="target"
-        position={targetPosition}
-        style={{ background: "var(--vb-cat-ssm)", width: 7, height: 7, border: "none" }}
-      />
+      <FourSideHandles style={{ background: "var(--vb-cat-ssm)", width: 7, height: 7, border: "none" }} />
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -267,11 +262,6 @@ export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
         </div>
       )}
 
-      <Handle
-        type="source"
-        position={sourcePosition}
-        style={{ background: "var(--vb-cat-ssm)", width: 7, height: 7, border: "none" }}
-      />
     </div>
   );
 }

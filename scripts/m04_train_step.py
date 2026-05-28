@@ -3532,6 +3532,46 @@ def _build_path_c_fused_replay_loss_fn_for_model(
     first_in_region_layer_index_int = int(cast(int, first_in_region_layer_index))
 
     parameter_order = tuple(sorted(in_region_parameter_bank_aliases.keys()))
+
+    def _artifact_or_prim_attr(name: str, default: Any = None) -> Any:
+        value = getattr(
+            artifact,
+            f"_cppmega_path_c_{name}",
+            getattr(artifact, name, None),
+        )
+        if value:
+            return value
+        return getattr(prim_func, f"_cppmega_path_c_{name}", default)
+
+    row_chunk_count = _artifact_or_prim_attr("row_chunk_count")
+    row_chunk_index_param = _artifact_or_prim_attr("row_chunk_index_param")
+    row_subchunk_count = _artifact_or_prim_attr("row_subchunk_count")
+    row_subchunk_index_param = _artifact_or_prim_attr("row_subchunk_index_param")
+    backward_stage_count = _artifact_or_prim_attr("backward_stage_count")
+    backward_stage_index_param = _artifact_or_prim_attr("backward_stage_index_param")
+    backward_gate_param = (
+        _artifact_or_prim_attr("backward_gate_param", "path_c_run_backward")
+        or "path_c_run_backward"
+    )
+
+    # A single-kernel fused train block (base PathCFusedTrainBlockCallableArtifact,
+    # not a multi-kernel generated-stage artifact) lowers the entire forward and the
+    # full recurrent backward into ONE TileLang/Metal kernel that only gates on
+    # ``path_c_run_backward`` and walks rows/sub-chunks/backward-stages internally.
+    # It must be dispatched grid-chunked: launched exactly once for the forward and
+    # once for the replay backward. The launcher-chunk / sub-chunk / backward-stage
+    # *index* params only select work for multi-kernel generated-stage artifacts
+    # (whose ``forward`` walks its sub-stage kernels). Forwarding those index params
+    # to the single kernel would relaunch the same whole-sequence kernel
+    # chunk*subchunk*stage times — a pure redundant recompute — so suppress them.
+    single_kernel_grid_chunked = not bool(
+        getattr(artifact, "generated_stage_artifact", False)
+    )
+    if single_kernel_grid_chunked:
+        row_chunk_index_param = None
+        row_subchunk_index_param = None
+        backward_stage_index_param = None
+
     try:
         fused_replay = build_fused_replay_boundary_custom_function(
             artifact=artifact,
@@ -3542,76 +3582,13 @@ def _build_path_c_fused_replay_loss_fn_for_model(
             boundary_cotangent_logical_names=boundary_cotangents,
             in_region_parameter_bank_aliases=in_region_parameter_bank_aliases,
             parameter_order=parameter_order,
-            row_chunk_count=getattr(
-                artifact,
-                "_cppmega_path_c_row_chunk_count",
-                getattr(artifact, "row_chunk_count", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_row_chunk_count",
-                None,
-            ),
-            row_chunk_index_param=getattr(
-                artifact,
-                "_cppmega_path_c_row_chunk_index_param",
-                getattr(artifact, "row_chunk_index_param", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_row_chunk_index_param",
-                None,
-            ),
-            row_subchunk_count=getattr(
-                artifact,
-                "_cppmega_path_c_row_subchunk_count",
-                getattr(artifact, "row_subchunk_count", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_row_subchunk_count",
-                None,
-            ),
-            row_subchunk_index_param=getattr(
-                artifact,
-                "_cppmega_path_c_row_subchunk_index_param",
-                getattr(artifact, "row_subchunk_index_param", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_row_subchunk_index_param",
-                None,
-            ),
-            backward_stage_count=getattr(
-                artifact,
-                "_cppmega_path_c_backward_stage_count",
-                getattr(artifact, "backward_stage_count", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_backward_stage_count",
-                None,
-            ),
-            backward_stage_index_param=getattr(
-                artifact,
-                "_cppmega_path_c_backward_stage_index_param",
-                getattr(artifact, "backward_stage_index_param", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_backward_stage_index_param",
-                None,
-            ),
-            backward_gate_param=getattr(
-                artifact,
-                "_cppmega_path_c_backward_gate_param",
-                getattr(artifact, "backward_gate_param", None),
-            )
-            or getattr(
-                prim_func,
-                "_cppmega_path_c_backward_gate_param",
-                "path_c_run_backward",
-            ),
+            row_chunk_count=row_chunk_count,
+            row_chunk_index_param=row_chunk_index_param,
+            row_subchunk_count=row_subchunk_count,
+            row_subchunk_index_param=row_subchunk_index_param,
+            backward_stage_count=backward_stage_count,
+            backward_stage_index_param=backward_stage_index_param,
+            backward_gate_param=backward_gate_param,
         )
     except Exception:
         return None
@@ -3960,10 +3937,17 @@ def path_c_fusion_runtime_training_binding_payload(
             physical_abi_shapes=physical_abi_shapes,
             owner_name=resolved_bank_owner,
         )
+        # The fused-artifact branch carries its own exact ABI (artifact + bank owner
+        # are consistent) -> strict equality. The schedule-template branch validates a
+        # model-owned bank owner sized from the MERGED launcher+generated-stage ABI,
+        # which is a strict SUPERSET of any single region's need (e.g. state bank
+        # 9540 >= 9388); accept larger-but-sufficient banks there (the kernel-arg
+        # builder slices a prefix view), mirroring the kernel-buffer binding check.
         binding = validate_physical_abi_runtime_bindings(
             physical_abi_map,
             physical_abi_shapes,
             resolved_bank_buffers,
+            allow_superset=physical_abi_policy != "fused_artifact_physical_abi",
         )
         required_bank_buffers = list(bridge.get("required_bank_buffers", ()))
         missing_bank_buffers = list(binding.get("missing_bank_buffers", ()))
@@ -4465,6 +4449,41 @@ def _path_c_kernel_buffer_shapes(prim_func: Any) -> dict[str, tuple[int, ...]]:
         shape = tuple(int(dim) for dim in tuple(getattr(buffer, "shape", ())))
         shapes[name] = shape
     return shapes
+
+
+def _path_c_exact_kernel_buffer(
+    value: Any,
+    expected_shape: tuple[int, ...] | None,
+    *,
+    mx_module: Any,
+) -> Any:
+    """Return a view of ``value`` matching a segment kernel's expected shape.
+
+    Coalesced scratch banks (e.g. ``path_c_float32_scratch_bank``) are allocated
+    once at the MAX extent across all direct-chain segments, but each compiled
+    segment kernel declares only the extent it needs. The tvm-ffi DLTensor binder
+    requires an exact element-count match, so slice the max-merged bank to a
+    contiguous zero-copy prefix view sized for the current segment. Mirrors
+    ``PathCFusedTrainBlockCallableArtifact._kernel_exact_buffers``. Correctly-sized
+    buffers (output/parameter banks) are returned unchanged; under-sized buffers
+    are left for the binder/validation to report.
+    """
+    if expected_shape is None:
+        return value
+    expected_shape = tuple(int(dim) for dim in expected_shape)
+    actual_shape = tuple(int(dim) for dim in tuple(getattr(value, "shape", ())))
+    if actual_shape == expected_shape:
+        return value
+    expected_size = 1
+    for dim in expected_shape:
+        expected_size *= int(dim)
+    actual_size = int(getattr(value, "size", 0) or 0)
+    if actual_size < expected_size:
+        return value
+    view = mx_module.reshape(value, (-1,))[:expected_size]
+    if expected_shape != (expected_size,):
+        view = mx_module.reshape(view, expected_shape)
+    return view
 
 
 def _path_c_merged_physical_abi_for_prim_funcs(
@@ -6157,11 +6176,52 @@ def run_path_c_direct_fusion_chain_route(
                 )
             ),
         )
-        arrays = tuple(buffers[name] for name in ordered_names)
-        mx_module.eval(*arrays)
+        # Assemble kernel args from the compiled segment's FULL positional param
+        # order (mirrors PathCFusedTrainBlockCallableArtifact._kernel_args_from_bank_owner).
+        #  * buffer params -> caller-owned bank/logical buffer, sliced to this
+        #    segment's declared shape (coalesced scratch banks are allocated at the
+        #    max extent across segments; slicing satisfies the tvm-ffi DLTensor
+        #    exact element-count binder).
+        #  * scalar params -> the segment gate value / scalar default. The backward
+        #    gate (path_c_run_backward) sits at a SEGMENT-DEPENDENT position, not
+        #    always last, so building from buffer names alone dropped it and yielded
+        #    one fewer ABI arg than the kernel declares.
+        kernel_buffer_shapes = _path_c_kernel_buffer_shapes(prim_func)
+        kernel_param_order = path_c_kernel_buffer_order(prim_func)
+        gate_param = str(
+            getattr(
+                prim_func,
+                "_cppmega_path_c_backward_gate_param",
+                "path_c_run_backward",
+            )
+            or "path_c_run_backward"
+        )
+        run_backward_value = 1 if execution_phase == "backward" else 0
+        kernel_call_args: list[Any] = []
+        for name in kernel_param_order:
+            if name in buffers:
+                kernel_call_args.append(
+                    _path_c_exact_kernel_buffer(
+                        buffers[name],
+                        kernel_buffer_shapes.get(name),
+                        mx_module=mx_module,
+                    )
+                )
+            elif name == gate_param:
+                kernel_call_args.append(run_backward_value)
+            elif name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS:
+                kernel_call_args.append(PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS[name])
+            else:
+                raise ValueError(
+                    f"direct-chain segment {segment.index} kernel param {name!r} "
+                    "has no caller-owned buffer or scalar default"
+                )
+        arrays = tuple(kernel_call_args)
+        buffer_arrays = tuple(arg for arg in arrays if hasattr(arg, "shape"))
+        mx_module.eval(*buffer_arrays)
         segment_started = time.perf_counter()
         result = artifact(*arrays)
-        mx_module.eval(*arrays)
+        mx_module.eval(*buffer_arrays)
         segment_results.append(
             {
                 "index": int(segment.index),
@@ -6170,7 +6230,7 @@ def run_path_c_direct_fusion_chain_route(
                 "execution_phase": execution_phase,
                 "schedule_id": target.schedule_id,
                 "kernel_arg_count": len(arrays),
-                "kernel_args": list(ordered_names),
+                "kernel_args": list(kernel_param_order),
                 "elapsed_s": time.perf_counter() - segment_started,
                 "result_type": type(result).__name__,
             }
@@ -7311,10 +7371,15 @@ def make_path_c_direct_fusion_chain_workspace_owner(
         spec = specs.get(name)
         if spec is None:
             raise KeyError(f"unknown direct-chain logical buffer {name!r}")
-        if not name.endswith("_grad"):
+        # Allocate caller-owned RUNTIME workspace buffers: backward bridge
+        # gradients (*_grad) plus the coalesced scratch / recurrent checkpoint /
+        # state banks introduced by the coalescing + checkpointing ABI refinement
+        # (e.g. path_c_float32_scratch_bank, mamba3_h_checkpoint). Model
+        # parameters/constants are NEVER allocated here — they come from the model.
+        if str(spec.get("category")) == "model_parameter_or_constant":
             raise ValueError(
-                "direct-chain workspace allocation is limited to explicit "
-                f"gradient output buffers; got {name!r}"
+                "direct-chain workspace allocation must not allocate model "
+                f"parameter/constant buffers; got {name!r}"
             )
         buffers[name] = mx.zeros(
             tuple(spec["shape"]),

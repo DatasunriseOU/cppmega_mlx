@@ -463,8 +463,18 @@ def validate_physical_abi_runtime_bindings(
     mapping: Mapping[str, Any],
     bank_shapes: Mapping[str, Any],
     buffers: Mapping[str, Any] | None,
+    *,
+    allow_superset: bool = False,
 ) -> dict[str, Any]:
-    """Validate caller-supplied physical bank buffers without allocating."""
+    """Validate caller-supplied physical bank buffers without allocating.
+
+    ``allow_superset`` (opt-in; default exact-equality) accepts a caller/model-owned
+    bank whose flat element count is >= the required extent and whose dtype matches.
+    This is for bindings against a single schedule-template region when the model owns
+    banks sized from the MERGED launcher+generated-stage ABI (a strict superset of any
+    one region's need); the kernel-arg builder slices a contiguous prefix view to the
+    exact per-region shape at call time. All other callers keep strict equality.
+    """
 
     bridge_plan = plan_physical_abi_runtime_bridge(mapping, bank_shapes)
     required_banks = list(bridge_plan["required_bank_buffers"])
@@ -498,10 +508,19 @@ def validate_physical_abi_runtime_bindings(
         expected_shape = tuple(int(dim) for dim in tuple(bank_shapes[bank]))
         actual_shape = _shape_of(provided[bank])
         if actual_shape != expected_shape:
-            shape_mismatches.append(bank)
-            errors.append(
-                f"{bank}: shape {actual_shape} does not match expected {expected_shape}"
+            expected_numel = int(prod(expected_shape)) if expected_shape else 1
+            actual_numel = (
+                int(prod(actual_shape)) if actual_shape else 0
             )
+            if allow_superset and actual_shape is not None and actual_numel >= expected_numel:
+                # Larger-but-sufficient caller-owned bank (merged-ABI superset); the
+                # kernel-arg builder slices a contiguous prefix view to the exact shape.
+                pass
+            else:
+                shape_mismatches.append(bank)
+                errors.append(
+                    f"{bank}: shape {actual_shape} does not match expected {expected_shape}"
+                )
         expected_dtype = bank_dtypes.get(bank)
         actual_dtype = _dtype_of(provided[bank])
         if actual_dtype != expected_dtype:

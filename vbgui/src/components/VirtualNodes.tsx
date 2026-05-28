@@ -1,4 +1,5 @@
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { type NodeProps } from "@xyflow/react";
+import { FourSideHandles } from "@/components/nodeHandles";
 import { T } from "@/theme";
 
 export interface Token {
@@ -310,7 +311,7 @@ export function TokenizerVirtualNode({ data }: NodeProps): JSX.Element {
         </div>
       </div>
 
-      <Handle type="source" position={(data?.sourcePosition as Position) ?? Position.Right} />
+      <FourSideHandles />
     </div>
   );
 }
@@ -359,7 +360,7 @@ export function DetokenizerVirtualNode({ data }: NodeProps): JSX.Element {
         transition: "min-width 200ms ease",
       }}
     >
-      <Handle type="target" position={(data?.targetPosition as Position) ?? Position.Left} />
+      <FourSideHandles />
 
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <span style={{ fontSize: 16 }}>🔡</span>

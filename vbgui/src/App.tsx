@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
-  ReactFlowProvider, Position, type Edge, type Node,
-  applyNodeChanges, applyEdgeChanges,
+  ReactFlowProvider, Position, type Edge, type Node, type Connection,
+  applyNodeChanges, applyEdgeChanges, reconnectEdge,
   type OnNodesChange, type OnEdgesChange,
 } from "@xyflow/react";
 
@@ -386,7 +386,12 @@ export function groupRepeatedNodes(nodes: Node[], edges: Edge[]): { nodes: Node[
     const id = `${src}->${tgt}`;
     if (seen.has(id)) continue;
     seen.add(id);
-    newEdges.push({ ...e, id, source: src, target: tgt });
+    // Drop stale handle ids when an endpoint is rewritten to a folded group —
+    // the router re-assigns sides (and sourceHandle/targetHandle) on the next
+    // layoutFlow pass for the new topology.
+    const { sourceHandle: _sh, targetHandle: _th, ...rest } = e as Edge;
+    void _sh; void _th;
+    newEdges.push({ ...rest, id, source: src, target: tgt });
   }
 
   const newNodes = nodes.filter((n) => !removed.has(n.id)).concat(groupNodes);
@@ -1388,6 +1393,27 @@ export function App(): JSX.Element {
       ]);
     }, []);
 
+  // Manual edge reconnection: drag an existing edge's end onto any of the 8
+  // handles. Keep the stable edge id (shouldReplaceId:false) so router state /
+  // structural signature don't churn, and drop the stale orthogonal route so
+  // the edge cleanly re-beziers to the user's chosen handle until next align.
+  const handleReconnect = useCallback(
+    (oldEdge: Edge, conn: Connection) => {
+      setEdges((prev) => {
+        const next = reconnectEdge(oldEdge, conn, prev, { shouldReplaceId: false });
+        return next.map((e) =>
+          e.id === oldEdge.id
+            ? { ...e, data: { ...(e.data as any), elkBends: undefined } }
+            : e
+        );
+      });
+    }, []);
+
+  // Drop an edge end on empty canvas → delete that edge.
+  const handleDeleteEdgeById = useCallback((id: string) => {
+    setEdges((prev) => prev.filter((e) => e.id !== id));
+  }, []);
+
   // UX (cppmega-mlx-fhxg): transient toast when user applies a Loss
   // change in the sidebar so the click registers visibly.
   const [lossToast, setLossToast] = useState<string | null>(null);
@@ -1499,6 +1525,9 @@ export function App(): JSX.Element {
     }
   }, [spec.loss, canvasWidth]);
 
+  // One layout pass: fold repeated bricks → ELK layered layout →
+  // obstacle-avoiding orthogonal edge routing. Sets nodes + edges together
+  // (always from the SAME layout, so node sides and routed bends never desync).
   const remeasureScheduled = useRef(false);
   const handleAutoAlign = useCallback(async (customNodes?: Node[], customEdges?: Edge[]) => {
     try {
@@ -1506,12 +1535,7 @@ export function App(): JSX.Element {
       const activeEdges = customEdges ?? edges;
       if (activeNodes.length === 0) return;
 
-      // Fold runs of identical adjacent bricks into block_groups first, so the
-      // layout operates on the collapsed graph (and edges stay consistent).
       const grouped = groupRepeatedNodes(activeNodes, activeEdges);
-      // ELK layered layout: real topological layering + crossing minimization
-      // (handles residual skip edges far better than the old snake layout).
-      // Returns edges annotated with orthogonal bend points for clean routing.
       const { nodes: layouted, edges: routed } = await layoutFlow(grouped.nodes, grouped.edges, {
         sizeOf: getNodeSize,
         canvasWidth,
@@ -1520,9 +1544,11 @@ export function App(): JSX.Element {
       setNodes(layouted);
       setEdges(routed);
 
-      // Freshly loaded/folded nodes have no measured size yet, so their widths
-      // were estimated. Re-run once after React Flow measures them for
-      // pixel-accurate, overlap-free placement (uses the latest state via ref).
+      // Freshly loaded/folded nodes have estimated sizes; once React Flow
+      // measures them, re-run ONCE (fire-and-forget so awaiting callers — e.g.
+      // preset load applying optim defaults — aren't blocked) for pixel-exact
+      // placement + routing. FlowCanvas calls updateNodeInternals on the side
+      // change so handle bounds stay fresh and routes don't fall back.
       const someUnmeasured = layouted.some((n) => !((n as any).measured?.width));
       if (someUnmeasured && !remeasureScheduled.current) {
         remeasureScheduled.current = true;
@@ -3043,6 +3069,8 @@ export function App(): JSX.Element {
                   nodes={mappedNodes}
                   edges={mappedEdges}
                   onConnect={handleConnect}
+                  onReconnectEdge={handleReconnect}
+                  onDeleteEdge={handleDeleteEdgeById}
                   onDropBrick={handleDropBrick}
                   onNodeClick={setSelectedBrickId}
                   isValidConnection={isValidConnection}

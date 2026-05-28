@@ -1,0 +1,170 @@
+{
+  "kind": "cppmega_path_c_single_fused_kernel_e2e_execution_receipt",
+  "goal_stage": "runtime_binding (single fused kernel actually executes end-to-end)",
+  "model_profile": "local_gb10_quarter (tiny smoke dims)",
+  "region": null,
+  "runtime_type": "PathCFusedPlusEagerTrainingRuntime",
+  "artifact_type": "PathCFusedTrainBlockCallableArtifact",
+  "physical_abi_policy": "banked_by_role",
+  "compile_seconds": 6.187,
+  "physical_abi_banks": {
+    "count": 17,
+    "total_bytes": 285624,
+    "banks": {
+      "path_c_float32_activation_abi_bank": {
+        "shape": [
+          6226
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 24904
+      },
+      "path_c_float32_parameter_abi_bank": {
+        "shape": [
+          3009
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 12036
+      },
+      "path_c_float32_state_abi_bank": {
+        "shape": [
+          9540
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 38160
+      },
+      "path_c_uint8_abi_bank": {
+        "shape": [
+          4064
+        ],
+        "dtype": "mlx.core.uint8",
+        "nbytes": 4064
+      },
+      "path_c_float32_attention_abi_bank": {
+        "shape": [
+          1524
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 6096
+      },
+      "path_c_int32_abi_bank": {
+        "shape": [
+          1
+        ],
+        "dtype": "mlx.core.int32",
+        "nbytes": 4
+      },
+      "path_c_float32_activation_gradient_abi_bank": {
+        "shape": [
+          4064
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 16256
+      },
+      "path_c_float32_parameter_gradient_abi_bank": {
+        "shape": [
+          5102
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 20408
+      },
+      "path_c_float32_scratch_bank": {
+        "shape": [
+          32774
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 131096
+      },
+      "path_c_int32_scratch_bank": {
+        "shape": [
+          8128
+        ],
+        "dtype": "mlx.core.int32",
+        "nbytes": 32512
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_b_raw": {
+        "shape": [
+          1,
+          4
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 16
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_c_raw": {
+        "shape": [
+          1,
+          4
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 16
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_b_group": {
+        "shape": [
+          1,
+          4
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 16
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_c_group": {
+        "shape": [
+          1,
+          4
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 16
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum": {
+        "shape": [
+          4,
+          1
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 16
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_b_inv_rms": {
+        "shape": [
+          1,
+          1
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 4
+      },
+      "local_gb10_quarter_brick_10_M_mamba3_c_inv_rms": {
+        "shape": [
+          1,
+          1
+        ],
+        "dtype": "mlx.core.float32",
+        "nbytes": 4
+      }
+    }
+  },
+  "execution": {
+    "actually_executed": true,
+    "real_kernel_launches_per_step": 2,
+    "forward_plus_backward_launches": 2,
+    "grid_chunked_single_launch_per_pass": true,
+    "loss_cold": 5.551532745361328,
+    "loss_warm": 5.551532745361328,
+    "loss_finite": true,
+    "ntokens": 127,
+    "grad_leaf_count": 8,
+    "grad_leaves_nonzero": 2,
+    "grad_leaves_all_finite": true,
+    "step_seconds_cold": 0.041,
+    "step_seconds_warm": 0.01
+  },
+  "replay_telemetry": {
+    "attempted": true,
+    "completed": true,
+    "elapsed_ns": 6834875,
+    "error": null,
+    "replay_cotangent_bridge_active": true,
+    "suffix_bypass_active": false
+  },
+  "software": {
+    "cppmega_sha": "9b7cadb",
+    "tilelang_sha": "87c247a5",
+    "platform": "macOS-26.5-arm64-arm-64bit-Mach-O"
+  }
+}

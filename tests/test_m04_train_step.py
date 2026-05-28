@@ -2545,11 +2545,19 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     assert direct_chain["standalone_dispatch_available"] is True
     assert direct_chain["training_critical_path"] is False
     assert direct_chain["training_runtime_available"] is False
-    assert direct_chain["runtime_binding"]["segment_count"] == 5
+    assert direct_chain["runtime_binding"]["segment_count"] == 7
     assert [
         segment["execution_phase"]
         for segment in direct_chain["runtime_binding"]["segments"]
-    ] == ["forward", "forward", "backward", "backward", "backward"]
+    ] == [
+        "forward",
+        "forward",
+        "backward",
+        "backward",
+        "backward",
+        "backward",
+        "backward",
+    ]
     assert route["status"] == m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
     assert route["end_to_end_training_status"] == (
         m04_train_step.FP8_PATH_C_SPLIT_TRAINING_STATUS
@@ -2564,7 +2572,7 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     )
     assert route["fused_train_block_runtime_available"] is False
     assert route["fused_train_block_blocker_type"] == (
-        m04_train_step.FP8_PATH_C_DIRECT_CHAIN_TRAINING_RUNTIME_MISSING_STATUS
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS
     )
     assert route["selected_action"] == "run_path_c_split_training_route"
     assert route["direct_mx_array_artifact_call_status"] == (
@@ -2650,10 +2658,10 @@ def test_path_c_direct_chain_value_and_grad_bridge_plan_reports_loss_and_tree_ga
     assert bridge["loss_cotangent_bridge_ready"] is False
     assert bridge["model_gradient_tree_ready"] is False
     assert bridge["delegates_to_eager_loss_and_grad"] is False
-    assert bridge["required_gradient_buffer_count"] == 38
+    assert bridge["required_gradient_buffer_count"] == 39
     assert bridge["covered_parameter_gradient_buffer_count"] == 28
     assert bridge["parameter_gradient_tree_name_count"] == 28
-    assert bridge["bridge_only_gradient_buffer_count"] == 10
+    assert bridge["bridge_only_gradient_buffer_count"] == 11
     assert bridge["required_loss_cotangent_buffers"] == [
         "local_gb10_quarter_brick_11_R_hidden_after_grad",
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad",
@@ -2759,8 +2767,8 @@ def test_path_c_model_gradient_tree_from_direct_buffers_maps_parameter_aliases(
 
     assert payload["status"] == "ok"
     assert payload["gradient_tree_ready"] is True
-    assert payload["mapped_parameter_gradient_count"] == 27
-    assert payload["parameter_gradient_alias_count"] == 27
+    assert payload["mapped_parameter_gradient_count"] == 28
+    assert payload["parameter_gradient_alias_count"] == 28
     assert payload["missing_parameter_gradient_names"] == []
     assert payload["missing_logical_gradient_buffers"] == []
     assert "layers.12.block.q_proj.weight_grad" in flat
@@ -2815,7 +2823,7 @@ def test_path_c_direct_chain_bridge_plan_accepts_gradient_tree_buffers(
     assert bridge["model_gradient_tree_extraction"]["status"] == "ok"
     assert bridge["model_gradient_tree_extraction"][
         "mapped_parameter_gradient_count"
-    ] == 27
+    ] == 28
     assert {blocker["kind"] for blocker in bridge["blockers"]} == {
         "loss_cotangent_bridge_missing"
     }
@@ -2982,6 +2990,8 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
         "segment:2:backward",
         "segment:3:backward",
         "segment:4:backward",
+        "segment:5:backward",
+        "segment:6:backward",
     ]
 
 
@@ -3595,10 +3605,12 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
 
     assert payload["status"] == "ok"
     assert payload["runtime_uses_direct_fusion_chain"] is True
-    assert payload["segment_count"] == 5
+    assert payload["segment_count"] == 7
     assert [segment["execution_phase"] for segment in payload["segments"]] == [
         "forward",
         "forward",
+        "backward",
+        "backward",
         "backward",
         "backward",
         "backward",
@@ -3609,12 +3621,19 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
         "ok",
         "ok",
         "ok",
+        "ok",
+        "ok",
     ]
     assert [segment["kernel_arg_count"] for segment in payload["segments"]] == [
-        len(segment["required_logical_buffers"])
-        for segment in route["path_c_fusion"]["direct_chained_fusion"][
-            "runtime_binding"
-        ]["segments"]
+        len(rb_segment["required_logical_buffers"])
+        # backward segments additionally pass the path_c_run_backward gate scalar
+        + (1 if payload_segment["execution_phase"] == "backward" else 0)
+        for payload_segment, rb_segment in zip(
+            payload["segments"],
+            route["path_c_fusion"]["direct_chained_fusion"]["runtime_binding"][
+                "segments"
+            ],
+        )
     ]
 
 
@@ -3881,10 +3900,13 @@ def test_path_c_direct_chain_runtime_installer_accepts_suffix_bridge_off_critica
     assert contract["training_graph_bound"] is False
     assert contract["value_and_grad_contract_ok"] is False
     assert route["direct_fusion_chain_training_runtime_available"] is False
-    # full_end_to_end_training_available is now True because the
-    # mixed-mode fused-train-block runtime auto-installs on this model;
-    # selected_action correspondingly switches to the fused route.
-    assert route["full_end_to_end_training_available"] is True
+    # The fused-train-block runtime is explicitly opt-in via
+    # --use-path-c-fused-train-block-runtime (verified end-to-end separately). The
+    # route does NOT auto-install it by default here, so without the flag full
+    # end-to-end fused training is not advertised and the route uses the split
+    # path (default auto-install would change fp8_path_c routing and is a separate
+    # opt-in that must not regress paths B/D/E).
+    assert route["full_end_to_end_training_available"] is False
     assert route["selected_action"] in {
         "run_path_c_fused_train_block_route",
         "run_path_c_split_training_route",
@@ -5453,10 +5475,10 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    assert audit["required_logical_buffer_count"] == 88
+    assert audit["required_logical_buffer_count"] == 94
     assert audit["model_parameter_or_constant_count"] == 26
-    assert audit["runtime_activation_or_grad_count"] == 57
-    assert audit["backward_gradient_count"] == 37
+    assert audit["runtime_activation_or_grad_count"] == 62
+    assert audit["backward_gradient_count"] == 39
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
     assert audit["model_parameter_logical_owner_available"] is True
@@ -5466,10 +5488,10 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert audit["model_parameter_logical_owner_buffer_count"] == 26
     assert audit["model_parameter_logical_owner_total_buffer_count"] > 25
     assert audit["backward_gradient_parameter_alias_coverage_count"] == 28
-    assert audit["backward_gradient_uncovered_count"] == 9
+    assert audit["backward_gradient_uncovered_count"] == 11
     assert audit["profile_brick_names_attached"] is True
-    assert audit["forward_activation_or_prepared_count"] == 20
-    assert audit["runtime_state_count"] == 5
+    assert audit["forward_activation_or_prepared_count"] == 23
+    assert audit["runtime_state_count"] == 6
     pre_step_plan = route["path_c_fusion"]["direct_chained_fusion"][
         "pre_step_owner_plan"
     ]
@@ -5477,12 +5499,12 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert pre_step_plan["training_critical_path_ready"] is False
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
     assert pre_step_plan["model_parameter_or_constant_missing_count"] == 0
-    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 20
-    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 20
-    assert pre_step_plan["runtime_state_count"] == 5
-    assert pre_step_plan["runtime_state_missing_count"] == 5
-    assert pre_step_plan["pre_step_runtime_missing_count"] == 25
-    assert pre_step_plan["backward_workspace_gradient_count"] == 37
+    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 23
+    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 23
+    assert pre_step_plan["runtime_state_count"] == 6
+    assert pre_step_plan["runtime_state_missing_count"] == 6
+    assert pre_step_plan["pre_step_runtime_missing_count"] == 29
+    assert pre_step_plan["backward_workspace_gradient_count"] == 39
     assert (
         "local_gb10_quarter_brick_10_M_hidden"
         in pre_step_plan["batch_dependent_forward_or_prepared_missing_examples"]
@@ -5493,6 +5515,7 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
         "local_gb10_quarter_brick_10_M_state_in",
         "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
         "local_gb10_quarter_brick_11_R_m2rnn_h0",
+        "mamba3_angle_grad_state",
     ]
     runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
         "runtime_binding"
@@ -5502,7 +5525,7 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     )
     assert runtime_binding["provided_logical_buffer_count"] == 26
     assert runtime_binding["shape_mismatch_buffers"] == []
-    assert runtime_binding["missing_logical_buffer_count"] == 60
+    assert runtime_binding["missing_logical_buffer_count"] == 66
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
@@ -5554,7 +5577,7 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     )
 
     assert owner.owner_name == "local_gb10_quarter.path_c_pre_step_runtime_buffers"
-    assert len(owner.buffers) == 87
+    assert len(owner.buffers) == 94
     assert owner.hidden_packing_performed is False
     assert owner.no_hidden_allocation_policy is True
     assert owner.buffers[
@@ -5566,15 +5589,15 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     ] is parameters["layers.10.block.conv_weight"]
     assert binding["status"] == "ok"
     assert binding["runtime_uses_direct_fusion_chain"] is True
-    assert binding["provided_logical_buffer_count"] == 85
+    assert binding["provided_logical_buffer_count"] == 92
     assert binding["missing_logical_buffer_count"] == 0
     assert binding["unexpected_logical_buffer_count"] == 0
     assert pre_step_plan["status"] == "pre_step_runtime_owner_ready"
     assert pre_step_plan["training_critical_path_ready"] is True
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
-    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 18
-    assert pre_step_plan["runtime_state_available_count"] == 5
-    assert pre_step_plan["backward_workspace_gradient_available_count"] == 38
+    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 23
+    assert pre_step_plan["runtime_state_available_count"] == 6
+    assert pre_step_plan["backward_workspace_gradient_available_count"] == 39
 
 
 def test_path_c_direct_chain_pre_step_owner_preserves_bf16_model_dtype(
@@ -6090,9 +6113,16 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         not in runtime_binding["missing_logical_buffers"]
     )
     assert runtime_binding["missing_logical_buffers"] == [
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden_grad",
         "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
+        "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
         "local_gb10_quarter_brick_10_M_state_in_grad",
         "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
+        "m2rnn_h_checkpoint",
+        "mamba3_angle_checkpoint",
+        "mamba3_h_checkpoint",
+        "path_c_float32_scratch_bank",
+        "path_c_int32_scratch_bank",
     ]
 
     workspace_owner = (
@@ -6134,7 +6164,7 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     assert runtime_binding["status"] == (
         m04_train_step.FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
     )
-    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3, 4]
+    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3, 4, 5, 6]
     assert runtime_binding["hidden_packing_performed"] is False
 
 
@@ -6182,11 +6212,19 @@ def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
         "local_gb10_quarter.path_c_direct_fusion_chain_buffers"
     )
     assert runtime_binding["hidden_packing_performed"] is False
-    assert runtime_binding["provided_logical_buffer_count"] == 25
-    assert runtime_binding["missing_logical_buffer_count"] == 56
+    assert runtime_binding["provided_logical_buffer_count"] == 26
+    assert runtime_binding["missing_logical_buffer_count"] == 66
     assert [
         segment["execution_phase"] for segment in runtime_binding["segments"]
-    ] == ["forward", "forward", "backward", "backward", "backward"]
+    ] == [
+        "forward",
+        "forward",
+        "backward",
+        "backward",
+        "backward",
+        "backward",
+        "backward",
+    ]
     assert "hidden" not in runtime_binding["missing_logical_buffers"]
     assert "hidden_grad" not in runtime_binding["missing_logical_buffers"]
     assert "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out" in (

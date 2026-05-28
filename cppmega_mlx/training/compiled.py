@@ -130,6 +130,11 @@ class PathCFusedTrainBlockCallableArtifact:
 
     hidden_packing_performed = False
     no_hidden_allocation_policy = True
+    # A base (non-staged) artifact wraps ONE compiled TileLang/Metal kernel that
+    # lowers the whole forward and the full recurrent backward internally and only
+    # gates on ``path_c_run_backward``; it is dispatched grid-chunked (launched once
+    # per forward / backward). Multi-kernel stage artifacts override this to True.
+    generated_stage_artifact = False
 
     def __init__(
         self,

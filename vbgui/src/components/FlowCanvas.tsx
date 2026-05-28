@@ -6,12 +6,12 @@ import {
   BaseEdge,
   EdgeLabelRenderer,
   getBezierPath,
-  Handle,
-  Position,
   useReactFlow,
+  useUpdateNodeInternals,
   MarkerType,
   type Edge,
   type Node,
+  type Connection,
   type NodeTypes,
   type EdgeTypes,
   type EdgeProps,
@@ -21,6 +21,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
+import { FourSideHandles } from "./nodeHandles";
 import { BrickNode } from "./BrickNode";
 import { AdapterNode } from "./AdapterNode";
 import { LossGhostNode } from "./LossGhostNode";
@@ -31,6 +32,8 @@ export interface FlowCanvasProps {
   nodes: Node[];
   edges: Edge[];
   onConnect?: (params: { source: string; target: string }) => void;
+  onReconnectEdge?: (oldEdge: Edge, newConnection: Connection) => void;
+  onDeleteEdge?: (id: string) => void;
   isValidConnection?: IsValidConnection;
   onDropBrick?: (
     kind: string,
@@ -55,9 +58,7 @@ export interface FlowCanvasProps {
 }
 
 // Beautiful custom glowing residual addition (+) node component
-export function ResidualAddNode({ id, data }: { id: string; data?: any }): JSX.Element {
-  const targetPosition = data?.targetPosition ?? Position.Left;
-  const sourcePosition = data?.sourcePosition ?? Position.Right;
+export function ResidualAddNode({ id }: { id: string; data?: any }): JSX.Element {
   return (
     <div
       role="region"
@@ -81,17 +82,8 @@ export function ResidualAddNode({ id, data }: { id: string; data?: any }): JSX.E
         position: "relative",
       }}
     >
-      <Handle
-        type="target"
-        position={targetPosition}
-        style={{ background: "#10b981", width: 6, height: 6, border: "none" }}
-      />
+      <FourSideHandles style={{ background: "#10b981", width: 6, height: 6, border: "none" }} />
       <span>+</span>
-      <Handle
-        type="source"
-        position={sourcePosition}
-        style={{ background: "#10b981", width: 6, height: 6, border: "none" }}
-      />
     </div>
   );
 }
@@ -297,10 +289,43 @@ const EDGE_TYPES: EdgeTypes = {
 };
 
 export function FlowCanvas({
-  nodes, edges, onConnect, isValidConnection, onDropBrick, onNodeClick, onInsertAdapter, onAutoAlign, onNodesChange, onEdgesChange, onEdgeTap, onResize,
+  nodes, edges, onConnect, onReconnectEdge, onDeleteEdge, isValidConnection, onDropBrick, onNodeClick, onInsertAdapter, onAutoAlign, onNodesChange, onEdgesChange, onEdgeTap, onResize,
 }: FlowCanvasProps): JSX.Element {
   const [edgeMenu, setEdgeMenu] = useState<{ edge: Edge; x: number; y: number } | null>(null);
   const { fitView } = useReactFlow();
+  const updateNodeInternals = useUpdateNodeInternals();
+
+  // Manual edge reconnection — drag an edge end onto any handle (or onto empty
+  // canvas to delete it). The success ref distinguishes a valid drop from a
+  // drop into the void (onReconnectEnd fires in both cases).
+  const reconnectOk = useRef(true);
+  const handleReconnectStart = useCallback(() => { reconnectOk.current = false; }, []);
+  const handleReconnect = useCallback((oldEdge: Edge, conn: Connection) => {
+    reconnectOk.current = true;
+    onReconnectEdge?.(oldEdge, conn);
+  }, [onReconnectEdge]);
+  const handleReconnectEnd = useCallback((_e: unknown, edge: Edge) => {
+    if (!reconnectOk.current) onDeleteEdge?.(edge.id);
+    reconnectOk.current = true;
+  }, [onDeleteEdge]);
+
+  // Each node now exposes 8 handles (4 sides × source/target); the router
+  // assigns which handle each edge uses via edge.sourceHandle/targetHandle and
+  // also flips data.sourcePosition/targetPosition. React Flow caches handle
+  // bounds and resolves edge endpoints from the referenced handle — both must
+  // be re-measured when the router reassigns sides, or routes attach to the
+  // stale side and bezier-cross node boxes. Re-measure on any change to node
+  // handle sides OR the set of handle ids edges reference.
+  const handleSidesSig = nodes
+    .map((n) => `${n.id}:${(n.data as any)?.sourcePosition ?? ""}:${(n.data as any)?.targetPosition ?? ""}`)
+    .join("|");
+  const edgeHandleSig = edges
+    .map((e) => `${e.id}:${e.sourceHandle ?? ""}:${e.targetHandle ?? ""}`)
+    .join("|");
+  useEffect(() => {
+    nodes.forEach((n) => updateNodeInternals(n.id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handleSidesSig, edgeHandleSig, updateNodeInternals]);
 
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -471,6 +496,10 @@ export function FlowCanvas({
         nodeTypes={NODE_TYPES}
         edgeTypes={EDGE_TYPES}
         onConnect={handleConnect as never}
+        onReconnect={handleReconnect as never}
+        onReconnectStart={handleReconnectStart}
+        onReconnectEnd={handleReconnectEnd as never}
+        reconnectRadius={12}
         onNodeClick={(_e, node) => onNodeClick?.(node.id)}
         onEdgeClick={handleMidpointClick}
         onEdgeContextMenu={(e, edge) => {

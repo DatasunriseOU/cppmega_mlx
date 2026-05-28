@@ -5,7 +5,8 @@
  * Apply in the Loss sidebar tab.
  */
 
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { type NodeProps } from "@xyflow/react";
+import { FourSideHandles } from "@/components/nodeHandles";
 import { T } from "@/theme";
 
 export interface LossGhostNodeData {
@@ -15,7 +16,6 @@ export interface LossGhostNodeData {
 
 export function LossGhostNode({ data, id }: NodeProps): JSX.Element {
   const d = data as unknown as LossGhostNodeData;
-  const targetPosition = (data as any)?.targetPosition ?? Position.Left;
   const paramSummary = d.params
     ? Object.entries(d.params)
         .map(([k, v]) => `${k}=${v}`).join(", ")
@@ -35,7 +35,7 @@ export function LossGhostNode({ data, id }: NodeProps): JSX.Element {
         color: T.text,
       }}
     >
-      <Handle type="target" position={targetPosition} />
+      <FourSideHandles />
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span aria-hidden="true"
               style={{ fontSize: 16, color: "#facc15" }}>L</span>
