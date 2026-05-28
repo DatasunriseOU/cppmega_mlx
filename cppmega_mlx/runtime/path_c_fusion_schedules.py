@@ -124,7 +124,7 @@ DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE = "banked_by_role"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 1024
 DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 12 * 1024
-MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL = 64
+MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL = 8
 M2RNN_BWD_REPLAY_CHECKPOINT_INTERVAL = 1
 _DESCRIPTOR_ROOT_READS_MARKER = "cppmega_path_c_root_reads"
 _DESCRIPTOR_ROOT_WRITES_MARKER = "cppmega_path_c_root_writes"
@@ -430,6 +430,7 @@ class PathCDescriptorScheduleStageGroup:
     active_node_names: tuple[str, ...]
     stage_suffix: str
     row_dispatch_mode: str
+    rows_per_kernel_launch: int
     reason: str
 
 
@@ -488,6 +489,13 @@ def _path_c_descriptor_stage_node_op_name(node: Any) -> str:
     return str(getattr(node, "op_name", ""))
 
 
+def _path_c_descriptor_stage_rows_per_kernel_launch_for_node(node: Any) -> int:
+    op_name = _path_c_descriptor_stage_node_op_name(node)
+    if op_name in {"attention_qkv_projection_bwd", "mamba3_mimo_bwd"}:
+        return 1
+    return DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+
+
 def _path_c_descriptor_stage_append(
     groups: list[PathCDescriptorScheduleStageGroup],
     *,
@@ -496,6 +504,7 @@ def _path_c_descriptor_stage_append(
     active_node_names: Sequence[str],
     reason: str,
     row_dispatch_mode: str = DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    rows_per_kernel_launch: int = DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
 ) -> None:
     names = tuple(str(name) for name in active_node_names if str(name))
     if not names:
@@ -510,6 +519,9 @@ def _path_c_descriptor_stage_append(
             active_node_names=names,
             stage_suffix=f"{prefix}{stage_index}",
             row_dispatch_mode=validated_mode,
+            rows_per_kernel_launch=_validated_rows_per_kernel_launch(
+                rows_per_kernel_launch
+            ),
             reason=reason,
         )
     )
@@ -592,6 +604,11 @@ def plan_path_c_descriptor_stage_groups(
                 stage_index=backward_index,
                 active_node_names=(name,),
                 reason=f"descriptor_isolates_backward_{op_name}_fragment",
+                rows_per_kernel_launch=(
+                    _path_c_descriptor_stage_rows_per_kernel_launch_for_node(
+                        node
+                    )
+                ),
             )
             backward_consumed.add(name)
             backward_index += 1
@@ -606,6 +623,9 @@ def plan_path_c_descriptor_stage_groups(
             stage_index=backward_index,
             active_node_names=(name,),
             reason="descriptor_keeps_backward_block_as_generated_stage",
+            rows_per_kernel_launch=(
+                _path_c_descriptor_stage_rows_per_kernel_launch_for_node(node)
+            ),
         )
         backward_consumed.add(name)
         backward_index += 1
@@ -666,6 +686,7 @@ def make_path_c_descriptor_stage_schedule_template(
     active_node_names: Sequence[str] | None = None,
     stage_suffix: str = "",
     row_dispatch_mode: str = DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    rows_per_kernel_launch: int = DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
 ) -> Callable[[Any], Any]:
     """Build a generated stage template with the train-block ABI contract.
 
@@ -697,6 +718,7 @@ def make_path_c_descriptor_stage_schedule_template(
             ),
             max_rows_per_launch=schedule_target.max_rows_per_launch,
             row_dispatch_mode=row_dispatch_mode,
+            rows_per_kernel_launch=rows_per_kernel_launch,
             execution_stage=execution_stage,
             active_node_names=active_node_names,
         ),
@@ -728,6 +750,7 @@ def path_c_descriptor_stage_prim_funcs(
             active_node_names=group.active_node_names,
             stage_suffix=group.stage_suffix,
             row_dispatch_mode=group.row_dispatch_mode,
+            rows_per_kernel_launch=group.rows_per_kernel_launch,
         )
         for group in stage_groups
     )
@@ -1317,6 +1340,7 @@ def make_path_c_descriptor_schedule_template(
     train_step_output_abi: bool = False,
     max_rows_per_launch: int | None = None,
     row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE,
+    rows_per_kernel_launch: int = DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
     execution_stage: str = DESCRIPTOR_EXECUTION_STAGE_ALL,
     active_node_names: Sequence[str] | None = None,
 ) -> Callable[[Any], Any]:
@@ -1337,6 +1361,9 @@ def make_path_c_descriptor_schedule_template(
         max_rows_per_launch
     )
     validated_row_dispatch_mode = _validated_row_dispatch_mode(row_dispatch_mode)
+    validated_rows_per_kernel_launch = _validated_rows_per_kernel_launch(
+        rows_per_kernel_launch
+    )
     validated_execution_stage = _validated_execution_stage(execution_stage)
     active_node_names_tuple = (
         tuple(str(name) for name in active_node_names)
@@ -1357,6 +1384,7 @@ def make_path_c_descriptor_schedule_template(
             train_step_output_abi=bool(train_step_output_abi),
             max_rows_per_launch=validated_max_rows_per_launch,
             row_dispatch_mode=validated_row_dispatch_mode,
+            rows_per_kernel_launch=validated_rows_per_kernel_launch,
             execution_stage=validated_execution_stage,
             active_node_names=active_node_names_tuple,
         )
@@ -1382,6 +1410,9 @@ def make_path_c_descriptor_schedule_template(
     )
     descriptor_schedule_metadata._cppmega_path_c_row_dispatch_mode = (
         validated_row_dispatch_mode
+    )
+    descriptor_schedule_metadata._cppmega_path_c_rows_per_kernel_launch = (
+        validated_rows_per_kernel_launch
     )
     descriptor_schedule_metadata._cppmega_path_c_execution_stage = (
         validated_execution_stage
@@ -1461,6 +1492,7 @@ def build_path_c_descriptor_prim_func(
     train_step_output_abi: bool = False,
     max_rows_per_launch: int | None = None,
     row_dispatch_mode: str = DESCRIPTOR_DEFAULT_ROW_DISPATCH_MODE,
+    rows_per_kernel_launch: int = DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
     execution_stage: str = DESCRIPTOR_EXECUTION_STAGE_ALL,
     active_node_names: Sequence[str] | None = None,
 ) -> Any:
@@ -1486,6 +1518,9 @@ def build_path_c_descriptor_prim_func(
         max_rows_per_launch
     )
     validated_row_dispatch_mode = _validated_row_dispatch_mode(row_dispatch_mode)
+    validated_rows_per_kernel_launch = _validated_rows_per_kernel_launch(
+        rows_per_kernel_launch
+    )
     validated_execution_stage = _validated_execution_stage(execution_stage)
     active_node_name_set = (
         frozenset(str(name) for name in active_node_names)
@@ -1508,10 +1543,10 @@ def build_path_c_descriptor_prim_func(
             1,
             (
                 int(validated_max_rows_per_launch)
-                + DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+                + validated_rows_per_kernel_launch
                 - 1
             )
-            // DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+            // validated_rows_per_kernel_launch,
         )
         if (
             row_chunk_count is not None
@@ -1662,6 +1697,7 @@ def build_path_c_descriptor_prim_func(
         loop_policy=validated_loop_policy,
         max_rows_per_launch=validated_max_rows_per_launch,
         row_dispatch_mode=validated_row_dispatch_mode,
+        rows_per_kernel_launch=validated_rows_per_kernel_launch,
         execution_stage=validated_execution_stage,
         active_node_names=active_node_name_set,
         external_buffers=external_buffers_for_abi,
@@ -1780,7 +1816,7 @@ def build_path_c_descriptor_prim_func(
                 DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM,
             ).with_attr(
                 "tl.fusion.rows_per_kernel_launch",
-                DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+                validated_rows_per_kernel_launch,
             ).with_attr(
                 "tl.fusion.row_subchunk_count",
                 row_subchunk_count,
@@ -1834,6 +1870,9 @@ def build_path_c_descriptor_prim_func(
     prim_func._cppmega_path_c_physical_abi_policy = validated_physical_abi_policy
     prim_func._cppmega_path_c_max_rows_per_launch = validated_max_rows_per_launch
     prim_func._cppmega_path_c_row_dispatch_mode = validated_row_dispatch_mode
+    prim_func._cppmega_path_c_rows_per_kernel_launch = (
+        validated_rows_per_kernel_launch
+    )
     prim_func._cppmega_path_c_execution_stage = validated_execution_stage
     prim_func._cppmega_path_c_active_node_names = tuple(
         sorted(active_node_name_set or ())
@@ -2180,6 +2219,7 @@ def _descriptor_prim_func_source(
     loop_policy: str,
     max_rows_per_launch: int | None,
     row_dispatch_mode: str,
+    rows_per_kernel_launch: int,
     execution_stage: str,
     active_node_names: frozenset[str] | None,
     external_buffers: Sequence[str],
@@ -2360,6 +2400,7 @@ def _descriptor_prim_func_source(
             ),
             max_rows_per_launch=max_rows_per_launch,
             row_dispatch_mode=row_dispatch_mode,
+            rows_per_kernel_launch=rows_per_kernel_launch,
             execution_stage=execution_stage,
             active_node_names=active_node_names,
             indent=indent,
@@ -4409,6 +4450,7 @@ def _append_row_phased_hidden_body(
     train_step_loss_parameter_grad_buffers: Sequence[str],
     max_rows_per_launch: int | None,
     row_dispatch_mode: str,
+    rows_per_kernel_launch: int,
     execution_stage: str,
     active_node_names: frozenset[str] | None,
     indent: str,
@@ -4450,8 +4492,8 @@ def _append_row_phased_hidden_body(
         )
         subchunk_count = max(
             1,
-            (int(max_rows_per_launch) + DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH - 1)
-            // DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+            (int(max_rows_per_launch) + int(rows_per_kernel_launch) - 1)
+            // int(rows_per_kernel_launch),
         )
         row_chunk_assumptions = (
             f"{indent * 2}T.assume({row_chunk_expr} >= 0)",
@@ -4671,13 +4713,13 @@ def _append_row_phased_hidden_body(
                     f"{indent * 2}subchunk_row_chunk_start = "
                     f"T.min(logical_row_chunk_start + "
                     f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} * "
-                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    f"{rows_per_kernel_launch}, "
                     "logical_row_chunk_stop)"
                 )
                 body.append(
                     f"{indent * 2}subchunk_row_chunk_stop = "
                     f"T.min(subchunk_row_chunk_start + "
-                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    f"{rows_per_kernel_launch}, "
                     "logical_row_chunk_stop)"
                 )
                 body.append(f"{indent * 2}row_chunk_start = subchunk_row_chunk_start")
@@ -4729,13 +4771,13 @@ def _append_row_phased_hidden_body(
                     f"{indent * 2}subchunk_row_chunk_start = "
                     f"T.min(logical_row_chunk_start + "
                     f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} * "
-                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    f"{rows_per_kernel_launch}, "
                     "logical_row_chunk_stop)"
                 )
                 body.append(
                     f"{indent * 2}subchunk_row_chunk_stop = "
                     f"T.min(subchunk_row_chunk_start + "
-                    f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+                    f"{rows_per_kernel_launch}, "
                     "logical_row_chunk_stop)"
                 )
                 body.append(f"{indent * 2}row_chunk_start = subchunk_row_chunk_start")
@@ -4864,13 +4906,13 @@ def _append_row_phased_hidden_body(
             f"{indent * 2}subchunk_row_chunk_start = "
             f"T.min(logical_row_chunk_start + "
             f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} * "
-            f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+            f"{rows_per_kernel_launch}, "
             "logical_row_chunk_stop)"
         )
         body.append(
             f"{indent * 2}subchunk_row_chunk_stop = "
             f"T.min(subchunk_row_chunk_start + "
-            f"{DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH}, "
+            f"{rows_per_kernel_launch}, "
             "logical_row_chunk_stop)"
         )
         body.append(f"{indent * 2}row_chunk_start = subchunk_row_chunk_start")
@@ -9087,7 +9129,11 @@ def _append_row_phased_m2rnn_bwd_body(
     body.append(f"{indent * 3}{scalar0} = T.alloc_local((1,), \"float32\")")
     body.append(f"{indent * 3}{scalar1} = T.alloc_local((1,), \"float32\")")
     body.append(f"{indent * 3}{scalar2} = T.alloc_local((1,), \"float32\")")
-    first_row_condition = "path_c_first_row_launch != 0" if launcher_chunked_rows else "row == 0"
+    first_row_condition = (
+        "path_c_first_row_launch != 0 and row == row_chunk_start"
+        if launcher_chunked_rows
+        else "row == 0"
+    )
     time_rev_range = "row, row + 1" if launcher_chunked_rows else f"0, {sequence_length}"
     body.append(f"{indent * 3}if {first_row_condition}:")
     body.append(f"{indent * 4}if lane == 0:")
@@ -10402,7 +10448,9 @@ def _append_row_phased_mamba3_bwd_body(
     ):
         body.append(f"{indent * 3}{scalar} = T.alloc_local((1,), \"float32\")")
     first_row_condition = (
-        "path_c_first_row_launch != 0" if launcher_chunked_rows else "row == 0"
+        "path_c_first_row_launch != 0 and row == row_chunk_start"
+        if launcher_chunked_rows
+        else "row == 0"
     )
     time_rev_range = "row, row + 1" if launcher_chunked_rows else f"0, {sequence_length}"
     body.append(f"{indent * 3}if {first_row_condition}:")
@@ -11234,6 +11282,17 @@ def _validated_max_rows_per_launch(max_rows_per_launch: int | None) -> int | Non
     rows = int(max_rows_per_launch)
     if rows <= 0:
         raise ValueError("max_rows_per_launch must be positive when provided")
+    return rows
+
+
+def _validated_rows_per_kernel_launch(rows_per_kernel_launch: int | None) -> int:
+    rows = (
+        DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+        if rows_per_kernel_launch is None
+        else int(rows_per_kernel_launch)
+    )
+    if rows <= 0:
+        raise ValueError("rows_per_kernel_launch must be positive")
     return rows
 
 

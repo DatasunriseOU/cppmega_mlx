@@ -1,0 +1,8 @@
+step 1 action: load preset deepseek_v4_flash
+step 2 action: Auto Align Graph (folded)
+  [folded] nodes=9 edges=9 handles in:L=8/R=0  out:L=0/R=8  edges ortho=9 bezier-fallback=0  overlaps=0
+step 3 action: Unpack All -> Auto Align (expanded)
+  [unpacked] nodes=32 edges=62 handles in:L=30/R=1  out:L=2/R=29  edges ortho=58 bezier-fallback=4  overlaps=0
+      flipped sides: ['residual_add_unpacked_1779959980307_1:in=R', 'lightning_indexer_unpacked_r1_1779959980307_0:out=L', 'lightning_indexer_unpacked_r2_1779959980307_0:out=L']
+RESULT no_overlap = PASS
+RESULT bezier_fallback_is_minority = PASS

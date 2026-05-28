@@ -1,0 +1,27 @@
+step 1 action: load preset deepseek_v4_flash (viewport 1440x900)
+step 2 action: Unpack All, then Auto Align Graph
+  layout: nodes=32  rows=17  overlaps=0
+    row 0: n=1 width=132px in:L=0/R=0 out:L=0/R=1
+    row 1: n=2 width=417px in:L=0/R=2 out:L=2/R=0
+    row 2: n=3 width=418px in:L=3/R=0 out:L=0/R=3
+    row 3: n=1 width=153px in:L=1/R=0 out:L=0/R=1
+    row 4: n=1 width=153px in:L=1/R=0 out:L=0/R=1
+    row 5: n=3 width=248px in:L=0/R=3 out:L=3/R=0
+    row 6: n=1 width=150px in:L=0/R=1 out:L=1/R=0
+    row 7: n=1 width=150px in:L=0/R=1 out:L=1/R=0
+    row 8: n=3 width=409px in:L=3/R=0 out:L=0/R=3
+    row 9: n=2 width=409px in:L=2/R=0 out:L=0/R=2
+    row 10: n=2 width=409px in:L=2/R=0 out:L=0/R=2
+    row 11: n=3 width=238px in:L=0/R=3 out:L=3/R=0
+    row 12: n=1 width=140px in:L=0/R=1 out:L=1/R=0
+    row 13: n=1 width=140px in:L=0/R=1 out:L=1/R=0
+    row 14: n=3 width=359px in:L=3/R=0 out:L=0/R=3
+    row 15: n=1 width=186px in:L=1/R=0 out:L=0/R=1
+    row 16: n=3 width=378px in:L=0/R=3 out:L=2/R=0
+RESULT CP1 wrapped_multirow = PASS (17 rows)
+RESULT CP2 odd_rows_R_to_L  = FAIL
+RESULT CP3 each_row_fits    = PASS
+RESULT CP4 no_overlap       = PASS
+step 3 action: drag node rmsnorm_unpacked_r0_1779961171719_4 180px down to detach from its ELK route
+  edges touching dragged node: 0
+RESULT CP5 drag_falls_back_to_bezier = FAIL

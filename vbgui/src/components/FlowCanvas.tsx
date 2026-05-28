@@ -51,7 +51,7 @@ export interface FlowCanvasProps {
   /** Callback when an edge is context-clicked (right-click) or double-clicked to tap it. */
   onEdgeTap?: (edgeId: string) => void;
   /** Callback when the flow canvas container is resized. */
-  onResize?: (width: number) => void;
+  onResize?: (width: number, height: number) => void;
 }
 
 // Beautiful custom glowing residual addition (+) node component
@@ -143,7 +143,15 @@ export function MidpointEdge({
   let edgePath: string;
   let labelX: number;
   let labelY: number;
-  if (elkBends && elkBends.length >= 2) {
+  // Bends are computed once per auto-align. If the user has since dragged
+  // either endpoint, the stored bend points no longer match the live handles
+  // and the path would crook back to the old position. Detect that and fall
+  // back to a clean bezier — the orthogonal route returns on the next align.
+  const bendsFresh =
+    !!elkBends && elkBends.length >= 2 &&
+    Math.hypot(elkBends[0].x - sourceX, elkBends[0].y - sourceY) < 24 &&
+    Math.hypot(elkBends[elkBends.length - 1].x - targetX, elkBends[elkBends.length - 1].y - targetY) < 24;
+  if (bendsFresh && elkBends) {
     // Glue endpoints to the live handle positions, route through ELK's bends.
     const pts = elkBends.map((p) => ({ ...p }));
     pts[0] = { x: sourceX, y: sourceY };
@@ -300,8 +308,9 @@ export function FlowCanvas({
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const w = entry.contentRect.width;
+        const h = entry.contentRect.height;
         if (w > 600) {
-          onResize(w);
+          onResize(w, h);
         }
       }
     });

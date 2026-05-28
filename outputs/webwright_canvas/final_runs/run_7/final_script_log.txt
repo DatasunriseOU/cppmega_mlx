@@ -1,0 +1,8 @@
+bundle: http://127.0.0.1:8765/assets/index-B0DK3qBx.js
+step 1 action: load preset deepseek_v4_flash
+step 2 action: Auto Align Graph (folded)
+  [folded] 9 edges, REAL crossings = 0
+step 3 action: Unpack All, then Auto Align Graph
+  [unpacked] 62 edges, REAL crossings = 0
+RESULT folded   no crossings: PASS
+RESULT unpacked no crossings: PASS

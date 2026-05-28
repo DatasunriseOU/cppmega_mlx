@@ -837,6 +837,33 @@ def test_fused_train_block_callable_artifact_uses_full_kernel_buffer_order() -> 
         )
 
 
+def test_fused_train_block_callable_artifact_reports_launcher_chunk_metadata() -> None:
+    artifact = PathCFusedTrainBlockCallableArtifact(
+        kernel=lambda *kernel_args: None,
+        physical_abi_map={},
+        physical_abi_shapes={},
+        training_abi_contract={},
+        backward_gate_param="path_c_run_backward",
+        row_chunk_count=2,
+        row_chunk_index_param="path_c_row_chunk_index",
+        row_subchunk_count=8,
+        row_subchunk_index_param="path_c_row_subchunk_index",
+        rows_per_kernel_launch=8,
+    )
+
+    contract = artifact.value_and_grad_contract()
+    assert contract["generated_stage_artifact"] is False
+    assert contract["row_chunk_count"] == 2
+    assert contract["row_chunk_index_param"] == "path_c_row_chunk_index"
+    assert contract["row_subchunk_count"] == 8
+    assert contract["row_subchunk_index_param"] == "path_c_row_subchunk_index"
+    assert contract["rows_per_kernel_launch"] == 8
+    assert artifact._cppmega_path_c_row_chunk_count == 2
+    assert artifact._cppmega_path_c_row_subchunk_index_param == (
+        "path_c_row_subchunk_index"
+    )
+
+
 def test_generated_stage_artifact_reports_launcher_chunk_metadata() -> None:
     float_bank = mx.zeros((1,), dtype=mx.float32)
 
@@ -880,6 +907,106 @@ def test_generated_stage_artifact_reports_launcher_chunk_metadata() -> None:
     assert contract["row_chunk_index_param"] == "path_c_row_chunk_index"
     assert contract["row_subchunk_count"] == 8
     assert contract["row_subchunk_index_param"] == "path_c_row_subchunk_index"
+
+
+def test_generated_stage_artifact_refines_heavy_stage_subchunks() -> None:
+    float_bank = mx.zeros((1,), dtype=mx.float32)
+    calls: list[tuple[str, int, int, int]] = []
+
+    class _BankOwner:
+        owner_name = "unit.path_c_physical_abi_banks"
+        buffers = {"path_c_float32_abi_bank": float_bank}
+
+    def make_kernel(name: str):
+        def _kernel(_bank: mx.array, gate: int, chunk: int, subchunk: int) -> None:
+            calls.append((name, int(gate), int(chunk), int(subchunk)))
+
+        return _kernel
+
+    artifact = PathCGeneratedStageTrainBlockCallableArtifact(
+        forward_kernel=make_kernel("f0"),
+        backward_kernel=make_kernel("b0"),
+        backward_kernels=(make_kernel("b0"), make_kernel("b1"), make_kernel("b2")),
+        physical_abi_map={
+            "loss": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+        },
+        physical_abi_shapes={"path_c_float32_abi_bank": (1,)},
+        training_abi_contract={},
+        forward_kernel_buffer_order=(
+            "path_c_float32_abi_bank",
+            "path_c_run_backward",
+            "path_c_row_chunk_index",
+            "path_c_row_subchunk_index",
+        ),
+        backward_kernel_buffer_orders=(
+            (
+                "path_c_float32_abi_bank",
+                "path_c_run_backward",
+                "path_c_row_chunk_index",
+                "path_c_row_subchunk_index",
+            ),
+            (
+                "path_c_float32_abi_bank",
+                "path_c_run_backward",
+                "path_c_row_chunk_index",
+                "path_c_row_subchunk_index",
+            ),
+            (
+                "path_c_float32_abi_bank",
+                "path_c_run_backward",
+                "path_c_row_chunk_index",
+                "path_c_row_subchunk_index",
+            ),
+        ),
+        backward_kernel_buffer_shapes_by_stage=(
+            {"path_c_float32_abi_bank": (1,)},
+            {"path_c_float32_abi_bank": (1,)},
+            {"path_c_float32_abi_bank": (1,)},
+        ),
+        row_chunk_count=2,
+        row_chunk_index_param="path_c_row_chunk_index",
+        row_subchunk_count=8,
+        row_subchunk_index_param="path_c_row_subchunk_index",
+        rows_per_kernel_launch=8,
+        backward_stage_row_launches=(
+            {"rows_per_kernel_launch": 8, "row_subchunk_count": 8},
+            {"rows_per_kernel_launch": 1, "row_subchunk_count": 64},
+            {"rows_per_kernel_launch": 8, "row_subchunk_count": 8},
+        ),
+    )
+
+    assert artifact.backward_stages[1].kernel_buffer_shapes == {
+        "path_c_float32_abi_bank": (1,)
+    }
+
+    artifact.forward(
+        bank_owner=_BankOwner(),
+        kernel_scalar_params={
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 1,
+            "path_c_row_subchunk_index": 3,
+        },
+    )
+
+    assert calls == [
+        ("b0", 1, 1, 3),
+        ("b1", 1, 1, 24),
+        ("b1", 1, 1, 25),
+        ("b1", 1, 1, 26),
+        ("b1", 1, 1, 27),
+        ("b1", 1, 1, 28),
+        ("b1", 1, 1, 29),
+        ("b1", 1, 1, 30),
+        ("b1", 1, 1, 31),
+        ("b2", 1, 1, 3),
+    ]
 
 
 def test_fused_train_block_callable_artifact_reports_missing_full_model_grads() -> None:

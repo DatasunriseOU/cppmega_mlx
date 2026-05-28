@@ -183,6 +183,7 @@ def _production_mra_staged_launcher_prim_func(stage_suffix: str) -> tuple[object
         physical_abi_policy=target.physical_abi_policy,
         max_rows_per_launch=target.max_rows_per_launch,
         row_dispatch_mode=group.row_dispatch_mode,
+        rows_per_kernel_launch=group.rows_per_kernel_launch,
         execution_stage=group.execution_stage,
         active_node_names=group.active_node_names,
     )
@@ -569,10 +570,15 @@ def test_descriptor_stage_planner_groups_train_block_from_region_graph() -> None
     ]
     assert groups[3].active_node_names == ("route_2_A_sparse_mla_fp8_apply_bwd",)
     assert groups[4].active_node_names == ("route_2_A_qkv_projection_bwd",)
+    assert groups[4].rows_per_kernel_launch == 1
+    assert groups[8].active_node_names == ("route_0_M_bwd",)
+    assert groups[8].rows_per_kernel_launch == 1
     assert all(
         group.row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
         for group in groups
     )
+    assert all(group.rows_per_kernel_launch == 8 for group in groups[:4])
+    assert groups[5].rows_per_kernel_launch == 8
 
 
 def test_descriptor_phase_planner_fuses_train_block_by_execution_phase() -> None:
@@ -622,7 +628,13 @@ def test_production_staged_launcher_m2rnn_b3_replays_one_row() -> None:
         == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
     )
     assert "path_c_first_row_launch = T.if_then_else(" in generated_source
-    assert "if path_c_first_row_launch != 0:" in generated_source
+    assert prim_func._cppmega_path_c_rows_per_kernel_launch == 8
+    assert prim_func._cppmega_path_c_row_subchunk_count == 8
+    assert (
+        "if path_c_first_row_launch != 0 and row == row_chunk_start:"
+        in generated_source
+    )
+    assert "if path_c_first_row_launch != 0:" not in policy_window
     assert "for route_1_R_bwd_time_rev in T.serial(row, row + 1):" in (
         policy_window
     )
@@ -677,7 +689,25 @@ def test_production_staged_launcher_mamba3_b5_spills_grad_vector_scratch_to_abi(
         == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
     )
     assert "path_c_first_row_launch = T.if_then_else(" in generated_source
+    assert prim_func._cppmega_path_c_rows_per_kernel_launch == 1
+    assert prim_func._cppmega_path_c_row_subchunk_count == 64
+    assert "path_c_row_subchunk_index < 64" in generated_source
+    assert (
+        "subchunk_row_chunk_start = T.min(logical_row_chunk_start + "
+        "path_c_row_subchunk_index * 1, logical_row_chunk_stop)"
+        in generated_source
+    )
+    assert (
+        "if path_c_first_row_launch != 0 and row == row_chunk_start:"
+        in generated_source
+    )
     assert "# mamba3_mimo_bwd_policy: exact_lane_parallel_checkpoint_replay" in (
+        generated_source
+    )
+    assert "for route_0_M_bwd_replay_offset in T.serial(0, 8):" in (
+        generated_source
+    )
+    assert "for route_0_M_bwd_replay_offset in T.serial(0, 64):" not in (
         generated_source
     )
     assert "if lane == 0:" not in generated_source

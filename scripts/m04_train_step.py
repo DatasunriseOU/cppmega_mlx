@@ -78,6 +78,7 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     DESCRIPTOR_EXECUTION_STAGE_FORWARD,
     DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS,
     DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
     PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
     make_path_c_descriptor_schedule_template,
     make_path_c_descriptor_stage_schedule_template,
@@ -4206,6 +4207,7 @@ def _path_c_generated_stage_schedule_template(
     active_node_names: Sequence[str] | None = None,
     stage_suffix: str = "",
     row_dispatch_mode: str = DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    rows_per_kernel_launch: int | None = None,
 ) -> Callable[[Any], Any]:
     """Build a stage PrimFunc template with the full train-block ABI map."""
     return make_path_c_descriptor_stage_schedule_template(
@@ -4216,6 +4218,11 @@ def _path_c_generated_stage_schedule_template(
         active_node_names=active_node_names,
         stage_suffix=stage_suffix,
         row_dispatch_mode=row_dispatch_mode,
+        rows_per_kernel_launch=(
+            DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+            if rows_per_kernel_launch is None
+            else int(rows_per_kernel_launch)
+        ),
     )
 
 
@@ -4282,6 +4289,18 @@ def _path_c_max_int_prim_attr(
     return max(values) if values else None
 
 
+def _path_c_min_int_prim_attr(
+    prim_funcs: Sequence[Any],
+    attr_name: str,
+) -> int | None:
+    values = tuple(
+        value
+        for prim_func in prim_funcs
+        if (value := _path_c_int_prim_attr(prim_func, attr_name)) is not None
+    )
+    return min(values) if values else None
+
+
 def _path_c_generated_stage_row_launch_attrs(
     prim_funcs: Sequence[Any],
 ) -> dict[str, Any]:
@@ -4296,7 +4315,7 @@ def _path_c_generated_stage_row_launch_attrs(
             prim_funcs,
             "_cppmega_path_c_row_chunk_index_param",
         ),
-        "row_subchunk_count": _path_c_max_int_prim_attr(
+        "row_subchunk_count": _path_c_min_int_prim_attr(
             prim_funcs,
             "_cppmega_path_c_row_subchunk_count",
         ),
@@ -4304,11 +4323,48 @@ def _path_c_generated_stage_row_launch_attrs(
             prim_funcs,
             "_cppmega_path_c_row_subchunk_index_param",
         ),
+        "rows_per_kernel_launch": _path_c_max_int_prim_attr(
+            prim_funcs,
+            "_cppmega_path_c_rows_per_kernel_launch",
+        ),
         "backward_gate_param": _path_c_first_str_prim_attr(
             prim_funcs,
             "_cppmega_path_c_backward_gate_param",
         ),
     }
+
+
+def _path_c_stage_row_launch_specs(
+    prim_funcs: Sequence[Any],
+) -> tuple[dict[str, Any], ...]:
+    specs: list[dict[str, Any]] = []
+    for index, prim_func in enumerate(prim_funcs):
+        specs.append(
+            {
+                "stage_index": index,
+                "row_chunk_count": _path_c_int_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_chunk_count",
+                ),
+                "row_chunk_index_param": _path_c_str_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_chunk_index_param",
+                ),
+                "row_subchunk_count": _path_c_int_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_subchunk_count",
+                ),
+                "row_subchunk_index_param": _path_c_str_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_subchunk_index_param",
+                ),
+                "rows_per_kernel_launch": _path_c_int_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_rows_per_kernel_launch",
+                ),
+            }
+        )
+    return tuple(specs)
 
 
 def _path_c_monolithic_recurrent_backward_runtime_blocker(
@@ -4485,6 +4541,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
                 active_node_names=group.active_node_names,
                 stage_suffix=group.stage_suffix,
                 row_dispatch_mode=group.row_dispatch_mode,
+                rows_per_kernel_launch=group.rows_per_kernel_launch,
             )
             for group in forward_stage_groups
         )
@@ -4502,6 +4559,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
                 active_node_names=group.active_node_names,
                 stage_suffix=group.stage_suffix,
                 row_dispatch_mode=group.row_dispatch_mode,
+                rows_per_kernel_launch=group.rows_per_kernel_launch,
             )
             for group in backward_stage_groups
         )
@@ -4542,6 +4600,186 @@ def compile_path_c_fused_train_block_artifact_for_model(
         trainable_parameter_names = tuple(
             sorted(_path_c_model_trainable_parameter_names(model))
         )
+        generated_stage_groups_payload = [
+            {
+                "index": group.index,
+                "execution_stage": group.execution_stage,
+                "active_node_names": list(group.active_node_names),
+                "stage_suffix": group.stage_suffix,
+                "row_dispatch_mode": group.row_dispatch_mode,
+                "rows_per_kernel_launch": group.rows_per_kernel_launch,
+                "reason": group.reason,
+            }
+            for group in (*forward_stage_groups, *backward_stage_groups)
+        ]
+        if monolithic_runtime_blocker is not None:
+            try:
+                single_launcher_template = _path_c_generated_stage_schedule_template(
+                    schedule_target=schedule_target,
+                    region=scheduled.region,
+                    abi_prim_func=training_abi_prim_func,
+                    execution_stage=DESCRIPTOR_EXECUTION_STAGE_ALL,
+                    active_node_names=None,
+                    stage_suffix="launcher",
+                    row_dispatch_mode=DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+                    rows_per_kernel_launch=DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+                )
+                single_launcher_prim_func = single_launcher_template(
+                    scheduled.region
+                )
+                attested_single_launcher_template = (
+                    mark_path_c_schedule_template_for_region(
+                        single_launcher_template,
+                        scheduled.region,
+                        implementation_kind=schedule_target.implementation_kind,
+                        production_schedule_id=schedule_target.schedule_id
+                        if schedule_target.implementation_kind == "production"
+                        else "",
+                        required_real_abi_inputs=(
+                            schedule_target.required_real_abi_inputs
+                        ),
+                    )
+                )
+                single_launcher_compiled = compile_path_c_region(
+                    scheduled.region,
+                    schedule_template=attested_single_launcher_template,
+                    schedule_name=f"{schedule_target.schedule_name}_launcher_chunks",
+                    schedule_status=schedule_target.schedule_status,
+                    tilelang_lowerer=native_lowerer,
+                    target=target_name,
+                )
+                single_launcher_artifact = (
+                    single_launcher_compiled.artifact
+                    if isinstance(single_launcher_compiled, CompiledPathCRegion)
+                    else None
+                )
+                single_launcher_plan = (
+                    single_launcher_compiled.plan
+                    if isinstance(single_launcher_compiled, CompiledPathCRegion)
+                    else single_launcher_compiled
+                )
+                single_launcher_plan_payload = (
+                    _path_c_fused_train_block_plan_payload(single_launcher_plan)
+                )
+                if callable(single_launcher_artifact) and bool(
+                    single_launcher_plan_payload.get("single_kernel_fused")
+                ):
+                    launcher_physical_abi_map, launcher_physical_abi_shapes = (
+                        _path_c_merged_physical_abi_for_prim_funcs(
+                            (single_launcher_prim_func,)
+                        )
+                    )
+                    launcher_row_launch_attrs = (
+                        _path_c_generated_stage_row_launch_attrs(
+                            (single_launcher_prim_func,)
+                        )
+                    )
+                    plan_payload = {
+                        **single_launcher_plan_payload,
+                        "monolithic_native_compile_skipped": True,
+                        "monolithic_runtime_blocked": False,
+                        "monolithic_runtime_blocker": None,
+                        "monolithic_grid_runtime_blocked": True,
+                        "monolithic_grid_runtime_blocker": (
+                            monolithic_runtime_blocker
+                        ),
+                        "selected_runtime_artifact": (
+                            "single_generated_launcher_chunks"
+                        ),
+                        "single_generated_artifact": True,
+                        "generated_stage_artifact": False,
+                        "generated_stage_count": len(forward_stage_prim_funcs)
+                        + len(backward_stage_prim_funcs),
+                        "generated_stage_groups": generated_stage_groups_payload,
+                        "single_launcher_compile_verified": True,
+                        "single_launcher_row_launch": {
+                            key: value
+                            for key, value in launcher_row_launch_attrs.items()
+                            if value is not None
+                        },
+                        "monolithic_contract_artifact_type": type(
+                            single_launcher_artifact
+                        ).__name__,
+                        "all_stages_single_kernel_fused": True,
+                        "runtime_schedule_contract_status": (
+                            "single_launcher_verified"
+                        ),
+                    }
+                    artifact = PathCFusedTrainBlockCallableArtifact(
+                        kernel=single_launcher_artifact,
+                        physical_abi_map=launcher_physical_abi_map,
+                        physical_abi_shapes=launcher_physical_abi_shapes,
+                        training_abi_contract=training_abi_contract,
+                        parameter_gradient_aliases=parameter_gradient_aliases,
+                        trainable_parameter_names=trainable_parameter_names,
+                        selected_region_metadata=selected_region_metadata,
+                        kernel_buffer_order=path_c_kernel_buffer_order(
+                            single_launcher_prim_func
+                        ),
+                        kernel_buffer_shapes=_path_c_kernel_buffer_shapes(
+                            single_launcher_prim_func
+                        ),
+                        backward_gate_param=(
+                            launcher_row_launch_attrs["backward_gate_param"]
+                            or getattr(
+                                single_launcher_prim_func,
+                                "_cppmega_path_c_backward_gate_param",
+                                "path_c_run_backward",
+                            )
+                        ),
+                        row_chunk_count=launcher_row_launch_attrs[
+                            "row_chunk_count"
+                        ],
+                        row_chunk_index_param=launcher_row_launch_attrs[
+                            "row_chunk_index_param"
+                        ],
+                        row_subchunk_count=launcher_row_launch_attrs[
+                            "row_subchunk_count"
+                        ],
+                        row_subchunk_index_param=launcher_row_launch_attrs[
+                            "row_subchunk_index_param"
+                        ],
+                        rows_per_kernel_launch=launcher_row_launch_attrs[
+                            "rows_per_kernel_launch"
+                        ],
+                    )
+                    return {
+                        "status": "ok",
+                        "reason": (
+                            "selected Path C model train block compiled to one "
+                            "callable generated TileLang/TVM launcher artifact"
+                        ),
+                        "runtime_owner": runtime_owner,
+                        "route_region": getattr(scheduled.region, "name", None),
+                        "schedule_id": getattr(schedule_target, "schedule_id", None),
+                        "schedule_name": getattr(schedule_target, "schedule_name", None),
+                        "implementation_kind": getattr(
+                            schedule_target,
+                            "implementation_kind",
+                            None,
+                        ),
+                        "native_compile_ok": True,
+                        "hidden_packing_performed": False,
+                        "plan": plan_payload,
+                        "training_abi_contract": training_abi_contract,
+                        "artifact": artifact,
+                    }
+                monolithic_plan_payload = {
+                    **monolithic_plan_payload,
+                    "single_launcher_compile_verified": False,
+                    "single_launcher_rejected_reason": (
+                        "single generated launcher did not produce a verified "
+                        "callable fused artifact"
+                    ),
+                    "single_launcher_plan": single_launcher_plan_payload,
+                }
+            except Exception as exc:
+                monolithic_plan_payload = {
+                    **monolithic_plan_payload,
+                    "single_launcher_compile_verified": False,
+                    "single_launcher_compile_error": str(exc),
+                    "single_launcher_compile_error_type": type(exc).__name__,
+                }
         if (
             monolithic_runtime_blocker is None
             and callable(monolithic_artifact)
@@ -4557,17 +4795,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
                 "generated_stage_artifact": False,
                 "generated_stage_count": len(forward_stage_prim_funcs)
                 + len(backward_stage_prim_funcs),
-                "generated_stage_groups": [
-                    {
-                        "index": group.index,
-                        "execution_stage": group.execution_stage,
-                        "active_node_names": list(group.active_node_names),
-                        "stage_suffix": group.stage_suffix,
-                        "row_dispatch_mode": group.row_dispatch_mode,
-                        "reason": group.reason,
-                    }
-                    for group in (*forward_stage_groups, *backward_stage_groups)
-                ],
+                "generated_stage_groups": generated_stage_groups_payload,
                 "monolithic_contract_artifact_type": type(
                     monolithic_artifact
                 ).__name__,
@@ -4586,6 +4814,36 @@ def compile_path_c_fused_train_block_artifact_for_model(
                 ),
                 kernel_buffer_shapes=_path_c_kernel_buffer_shapes(
                     training_abi_prim_func
+                ),
+                backward_gate_param=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_backward_gate_param",
+                    "path_c_run_backward",
+                ),
+                row_chunk_count=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_row_chunk_count",
+                    None,
+                ),
+                row_chunk_index_param=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_row_chunk_index_param",
+                    None,
+                ),
+                row_subchunk_count=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_row_subchunk_count",
+                    None,
+                ),
+                row_subchunk_index_param=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_row_subchunk_index_param",
+                    None,
+                ),
+                rows_per_kernel_launch=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_rows_per_kernel_launch",
+                    None,
                 ),
             )
             return {
@@ -4679,6 +4937,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
                 "active_node_names": list(group.active_node_names),
                 "stage_suffix": group.stage_suffix,
                 "row_dispatch_mode": group.row_dispatch_mode,
+                "rows_per_kernel_launch": group.rows_per_kernel_launch,
                 "reason": group.reason,
             }
             for group in (*forward_stage_groups, *backward_stage_groups)
@@ -4733,6 +4992,12 @@ def compile_path_c_fused_train_block_artifact_for_model(
             for key, value in stage_row_launch_attrs.items()
             if value is not None
         },
+        "generated_forward_stage_row_launches": list(
+            _path_c_stage_row_launch_specs(forward_stage_prim_funcs)
+        ),
+        "generated_backward_stage_row_launches": list(
+            _path_c_stage_row_launch_specs(backward_stage_prim_funcs)
+        ),
     }
     if (
         not forward_artifacts
@@ -4843,6 +5108,13 @@ def compile_path_c_fused_train_block_artifact_for_model(
         row_chunk_index_param=stage_row_launch_attrs["row_chunk_index_param"],
         row_subchunk_count=stage_row_launch_attrs["row_subchunk_count"],
         row_subchunk_index_param=stage_row_launch_attrs["row_subchunk_index_param"],
+        rows_per_kernel_launch=stage_row_launch_attrs["rows_per_kernel_launch"],
+        forward_stage_row_launches=_path_c_stage_row_launch_specs(
+            forward_stage_prim_funcs
+        ),
+        backward_stage_row_launches=_path_c_stage_row_launch_specs(
+            backward_stage_prim_funcs
+        ),
     )
 
     return {

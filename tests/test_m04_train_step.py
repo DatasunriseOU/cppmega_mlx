@@ -4806,32 +4806,37 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert callable(compiled["artifact"])
     assert isinstance(
         compiled["artifact"],
+        m04_train_step.PathCFusedTrainBlockCallableArtifact,
+    )
+    assert not isinstance(
+        compiled["artifact"],
         m04_train_step.PathCGeneratedStageTrainBlockCallableArtifact,
     )
     assert compiled["route_region"] == expected_route["graph_construction"][
         "selected_model_region"
     ]
     assert compiled["implementation_kind"] == "production"
-    assert compiled["plan"]["single_kernel_fused"] is False
-    assert compiled["plan"]["single_generated_artifact"] is False
-    assert compiled["plan"]["generated_stage_artifact"] is True
+    assert compiled["plan"]["single_kernel_fused"] is True
+    assert compiled["plan"]["single_generated_artifact"] is True
+    assert compiled["plan"]["generated_stage_artifact"] is False
     assert compiled["plan"]["monolithic_native_compile_skipped"] is True
-    assert compiled["plan"]["monolithic_runtime_blocked"] is True
-    assert compiled["plan"]["monolithic_runtime_blocker"]["kind"] == (
+    assert compiled["plan"]["monolithic_runtime_blocked"] is False
+    assert compiled["plan"]["monolithic_grid_runtime_blocked"] is True
+    assert compiled["plan"]["monolithic_grid_runtime_blocker"]["kind"] == (
         "monolithic_grid_chunks_recurrent_backward_scalar_replay"
     )
     assert compiled["plan"]["selected_runtime_artifact"] == (
-        "generated_stage_launcher_chunks"
+        "single_generated_launcher_chunks"
     )
     assert compiled["plan"]["all_stages_single_kernel_fused"] is True
-    assert compiled["plan"]["generated_stage_compile_verified"] is True
+    assert compiled["plan"]["single_launcher_compile_verified"] is True
     assert compiled["plan"]["runtime_schedule_contract_status"] == (
-        "generated_stages_verified"
+        "single_launcher_verified"
     )
-    assert compiled["plan"]["generated_stage_row_launch"][
+    assert compiled["plan"]["single_launcher_row_launch"][
         "row_chunk_index_param"
     ] == "path_c_row_chunk_index"
-    assert compiled["plan"]["generated_stage_row_launch"][
+    assert compiled["plan"]["single_launcher_row_launch"][
         "row_subchunk_index_param"
     ] == "path_c_row_subchunk_index"
     assert compiled["artifact"].row_chunk_count == 2
@@ -4840,6 +4845,7 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert compiled["artifact"].row_subchunk_index_param == (
         "path_c_row_subchunk_index"
     )
+    assert len(lowerer_calls) == 1
     assert compiled["plan"]["backward_graph"] == "aot_autograd"
     training_abi_contract = compiled["training_abi_contract"]
     assert training_abi_contract["status"] == "ok"
@@ -4929,16 +4935,17 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     assert install["artifact_compile"]["native_compile_ok"] is True
     assert install["artifact_compile"]["artifact_bound"] is True
     assert install["artifact_compile"]["artifact_type"] == (
-        "PathCGeneratedStageTrainBlockCallableArtifact"
+        "PathCFusedTrainBlockCallableArtifact"
     )
-    assert install["artifact_compile"]["plan"]["generated_stage_artifact"] is True
+    assert install["artifact_compile"]["plan"]["single_generated_artifact"] is True
+    assert install["artifact_compile"]["plan"]["generated_stage_artifact"] is False
     assert (
         install["artifact_compile"]["plan"]["selected_runtime_artifact"]
-        == "generated_stage_launcher_chunks"
+        == "single_generated_launcher_chunks"
     )
     assert (
         install["artifact_compile"]["plan"]["runtime_schedule_contract_status"]
-        == "generated_stages_verified"
+        == "single_launcher_verified"
     )
     assert install["artifact_compile"]["training_abi_contract"]["status"] == "ok"
     assert (

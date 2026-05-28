@@ -494,6 +494,12 @@ def test_compile_receipt_can_execute_tiny_phase_fused_runtime_smoke(
     )
     assert smoke["runtime_launch_grid"]["forward_stages_per_launch"] == 1
     assert smoke["runtime_launch_grid"]["backward_stages_per_launch"] == 1
+    assert smoke["generated_forward_stage_row_launches"][0][
+        "rows_per_kernel_launch"
+    ] == 8
+    assert smoke["generated_backward_stage_row_launches"][0][
+        "rows_per_kernel_launch"
+    ] == 8
     assert [group["reason"] for group in smoke["generated_stage_groups"]] == [
         "descriptor_fuses_forward_phase_blocks",
         "descriptor_fuses_backward_phase_blocks",

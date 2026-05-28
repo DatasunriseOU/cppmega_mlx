@@ -142,6 +142,12 @@ class PathCFusedTrainBlockCallableArtifact:
         selected_region_metadata: Mapping[str, Any] | None = None,
         kernel_buffer_order: Sequence[str] | None = None,
         kernel_buffer_shapes: Mapping[str, Sequence[int]] | None = None,
+        backward_gate_param: str | None = None,
+        row_chunk_count: int | None = None,
+        row_chunk_index_param: str | None = None,
+        row_subchunk_count: int | None = None,
+        row_subchunk_index_param: str | None = None,
+        rows_per_kernel_launch: int | None = None,
     ) -> None:
         if not callable(kernel):
             raise TypeError("fused train-block kernel must be callable")
@@ -174,6 +180,32 @@ class PathCFusedTrainBlockCallableArtifact:
             str(name): tuple(int(dim) for dim in tuple(shape))
             for name, shape in (kernel_buffer_shapes or {}).items()
         }
+        self.backward_gate_param = str(backward_gate_param or "path_c_run_backward")
+        self.row_chunk_count = (
+            max(1, int(row_chunk_count)) if row_chunk_count is not None else None
+        )
+        self.row_chunk_index_param = (
+            str(row_chunk_index_param) if row_chunk_index_param else None
+        )
+        self.row_subchunk_count = (
+            max(1, int(row_subchunk_count))
+            if row_subchunk_count is not None
+            else None
+        )
+        self.row_subchunk_index_param = (
+            str(row_subchunk_index_param) if row_subchunk_index_param else None
+        )
+        self.rows_per_kernel_launch = (
+            max(1, int(rows_per_kernel_launch))
+            if rows_per_kernel_launch is not None
+            else None
+        )
+        self._cppmega_path_c_backward_gate_param = self.backward_gate_param
+        self._cppmega_path_c_row_chunk_count = self.row_chunk_count
+        self._cppmega_path_c_row_chunk_index_param = self.row_chunk_index_param
+        self._cppmega_path_c_row_subchunk_count = self.row_subchunk_count
+        self._cppmega_path_c_row_subchunk_index_param = self.row_subchunk_index_param
+        self._cppmega_path_c_rows_per_kernel_launch = self.rows_per_kernel_launch
         self._logical_gradient_names = frozenset(
             name for name in self.physical_abi_map if name.endswith("_grad")
         )
@@ -448,6 +480,12 @@ class PathCFusedTrainBlockCallableArtifact:
             "model_gradient_tree_ready": bool(self._parameter_gradient_bindings),
             "delegates_to_eager_loss_and_grad": False,
             "hidden_packing_performed": False,
+            "generated_stage_artifact": False,
+            "row_chunk_count": self.row_chunk_count,
+            "row_chunk_index_param": self.row_chunk_index_param,
+            "row_subchunk_count": self.row_subchunk_count,
+            "row_subchunk_index_param": self.row_subchunk_index_param,
+            "rows_per_kernel_launch": self.rows_per_kernel_launch,
         }
 
 
@@ -493,6 +531,9 @@ class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallable
         row_chunk_index_param: str | None = None,
         row_subchunk_count: int | None = None,
         row_subchunk_index_param: str | None = None,
+        rows_per_kernel_launch: int | None = None,
+        forward_stage_row_launches: Sequence[Mapping[str, Any]] | None = None,
+        backward_stage_row_launches: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         forward_kernel_sequence = tuple(forward_kernels or (forward_kernel,))
         if not forward_kernel_sequence:
@@ -569,10 +610,12 @@ class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallable
                 trainable_parameter_names=trainable_parameter_names,
                 selected_region_metadata=selected_region_metadata,
                 kernel_buffer_order=order,
+                kernel_buffer_shapes=shape_map,
             )
-            for kernel, order in zip(
+            for kernel, order, shape_map in zip(
                 forward_kernel_sequence,
                 forward_order_sequence,
+                raw_forward_shape_sequence,
                 strict=True,
             )
         )
@@ -587,10 +630,12 @@ class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallable
                 trainable_parameter_names=trainable_parameter_names,
                 selected_region_metadata=selected_region_metadata,
                 kernel_buffer_order=order,
+                kernel_buffer_shapes=shape_map,
             )
-            for kernel, order in zip(
+            for kernel, order, shape_map in zip(
                 backward_kernel_sequence,
                 backward_order_sequence,
+                raw_backward_shape_sequence,
                 strict=True,
             )
         )
@@ -609,6 +654,19 @@ class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallable
         )
         self.row_subchunk_index_param = (
             str(row_subchunk_index_param) if row_subchunk_index_param else None
+        )
+        self.rows_per_kernel_launch = (
+            max(1, int(rows_per_kernel_launch))
+            if rows_per_kernel_launch is not None
+            else None
+        )
+        self.forward_stage_row_launches = self._normalise_stage_row_launches(
+            forward_stage_row_launches,
+            len(forward_kernel_sequence),
+        )
+        self.backward_stage_row_launches = self._normalise_stage_row_launches(
+            backward_stage_row_launches,
+            len(backward_kernel_sequence),
         )
         self.forward_kernel_buffer_shapes_by_stage = tuple(
             {
@@ -663,30 +721,128 @@ class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallable
             raise ValueError("generated Path C artifact has no backward stage")
         if max_stages is not None:
             stages = stages[:max_stages]
+        stage_row_launches = (
+            self.backward_stage_row_launches
+            if run_backward
+            else self.forward_stage_row_launches
+        )
+        if max_stages is not None:
+            stage_row_launches = stage_row_launches[:max_stages]
         stage_base_kwargs = {
             key: value for key, value in kwargs.items() if key != "max_stages"
         }
         result: Any = None
-        for index, stage in enumerate(stages):
+        for index, (stage, stage_row_launch) in enumerate(
+            zip(stages, stage_row_launches, strict=True)
+        ):
             stage_shapes = (
                 self.backward_kernel_buffer_shapes_by_stage[index]
                 if run_backward
                 else self.forward_kernel_buffer_shapes_by_stage[index]
             )
-            stage_kwargs = dict(stage_base_kwargs)
-            if stage_shapes:
-                stage_kwargs["bank_owner"] = self._stage_exact_bank_owner(
-                    bank_owner,
-                    stage_shapes,
-                )
-            try:
-                result = stage.forward(*args, **stage_kwargs)
-            except Exception as exc:
-                stage_kind = "backward" if run_backward else "forward"
-                raise RuntimeError(
-                    f"generated Path C {stage_kind} stage {index} failed"
-                ) from exc
+            for stage_scalar_params in self._stage_scalar_param_variants(
+                kernel_scalar_params,
+                stage_row_launch,
+            ):
+                stage_kwargs = dict(stage_base_kwargs)
+                stage_kwargs["kernel_scalar_params"] = stage_scalar_params
+                if stage_shapes:
+                    stage_kwargs["bank_owner"] = self._stage_exact_bank_owner(
+                        bank_owner,
+                        stage_shapes,
+                    )
+                try:
+                    result = stage.forward(*args, **stage_kwargs)
+                except Exception as exc:
+                    stage_kind = "backward" if run_backward else "forward"
+                    raise RuntimeError(
+                        f"generated Path C {stage_kind} stage {index} failed"
+                    ) from exc
         return result
+
+    def _normalise_stage_row_launches(
+        self,
+        raw_stage_row_launches: Sequence[Mapping[str, Any]] | None,
+        stage_count: int,
+    ) -> tuple[dict[str, Any], ...]:
+        default = {
+            "row_chunk_count": self.row_chunk_count,
+            "row_chunk_index_param": self.row_chunk_index_param,
+            "row_subchunk_count": self.row_subchunk_count,
+            "row_subchunk_index_param": self.row_subchunk_index_param,
+            "rows_per_kernel_launch": self.rows_per_kernel_launch,
+        }
+        if raw_stage_row_launches is None:
+            return tuple(dict(default) for _ in range(stage_count))
+        specs = tuple(raw_stage_row_launches)
+        if len(specs) != stage_count:
+            raise ValueError("stage row launch spec/kernel count mismatch")
+        normalised: list[dict[str, Any]] = []
+        for spec in specs:
+            merged = dict(default)
+            for key, value in dict(spec).items():
+                if value is not None:
+                    merged[str(key)] = value
+            for int_key in (
+                "row_chunk_count",
+                "row_subchunk_count",
+                "rows_per_kernel_launch",
+            ):
+                if merged.get(int_key) is not None:
+                    merged[int_key] = max(1, int(merged[int_key]))
+            for str_key in ("row_chunk_index_param", "row_subchunk_index_param"):
+                if merged.get(str_key):
+                    merged[str_key] = str(merged[str_key])
+                else:
+                    merged[str_key] = None
+            normalised.append(merged)
+        return tuple(normalised)
+
+    def _stage_scalar_param_variants(
+        self,
+        kernel_scalar_params: Mapping[str, Any] | None,
+        stage_row_launch: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        base_params = dict(kernel_scalar_params or {})
+        artifact_subchunk_param = self.row_subchunk_index_param
+        stage_subchunk_param = stage_row_launch.get("row_subchunk_index_param")
+        if not artifact_subchunk_param or not stage_subchunk_param:
+            return (base_params,)
+        artifact_rows = self.rows_per_kernel_launch
+        stage_rows = stage_row_launch.get("rows_per_kernel_launch")
+        if artifact_rows is None or stage_rows is None:
+            return (base_params,)
+        artifact_rows = max(1, int(artifact_rows))
+        stage_rows = max(1, int(stage_rows))
+        artifact_subchunk = int(base_params.get(artifact_subchunk_param, 0))
+        if stage_rows == artifact_rows:
+            if stage_subchunk_param != artifact_subchunk_param:
+                base_params[str(stage_subchunk_param)] = artifact_subchunk
+            return (base_params,)
+        if stage_rows > artifact_rows or artifact_rows % stage_rows != 0:
+            raise ValueError(
+                "stage rows_per_kernel_launch must divide the artifact "
+                "coordinator rows_per_kernel_launch"
+            )
+        refine_factor = artifact_rows // stage_rows
+        stage_subchunk_count = stage_row_launch.get("row_subchunk_count")
+        variants: list[dict[str, Any]] = []
+        for offset in range(refine_factor):
+            fine_subchunk = artifact_subchunk * refine_factor + offset
+            if (
+                stage_subchunk_count is not None
+                and fine_subchunk >= int(stage_subchunk_count)
+            ):
+                continue
+            params = dict(base_params)
+            params[str(stage_subchunk_param)] = fine_subchunk
+            stage_chunk_param = stage_row_launch.get("row_chunk_index_param")
+            if stage_chunk_param and self.row_chunk_index_param:
+                params[str(stage_chunk_param)] = int(
+                    base_params.get(self.row_chunk_index_param, 0)
+                )
+            variants.append(params)
+        return tuple(variants) or (base_params,)
 
     def _stage_exact_bank_owner(
         self,
@@ -726,6 +882,9 @@ class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallable
         payload["row_chunk_index_param"] = self.row_chunk_index_param
         payload["row_subchunk_count"] = self.row_subchunk_count
         payload["row_subchunk_index_param"] = self.row_subchunk_index_param
+        payload["rows_per_kernel_launch"] = self.rows_per_kernel_launch
+        payload["forward_stage_row_launches"] = list(self.forward_stage_row_launches)
+        payload["backward_stage_row_launches"] = list(self.backward_stage_row_launches)
         payload["delegates_to_eager_loss_and_grad"] = False
         return payload
 

@@ -46,6 +46,7 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     DESCRIPTOR_EXECUTION_STAGE_FORWARD,
     DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
     DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
     make_path_c_descriptor_schedule_template,
     make_path_c_descriptor_stage_schedule_template,
     merge_path_c_physical_abi_for_prim_funcs,
@@ -1235,6 +1236,7 @@ def _generated_stage_schedule_template(
     active_node_names: Sequence[str] | None = None,
     stage_suffix: str = "",
     row_dispatch_mode: str = DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    rows_per_kernel_launch: int | None = None,
 ) -> Callable[[Any], Any]:
     return make_path_c_descriptor_stage_schedule_template(
         schedule_target=target,
@@ -1244,6 +1246,11 @@ def _generated_stage_schedule_template(
         active_node_names=active_node_names,
         stage_suffix=stage_suffix,
         row_dispatch_mode=row_dispatch_mode,
+        rows_per_kernel_launch=(
+            DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+            if rows_per_kernel_launch is None
+            else int(rows_per_kernel_launch)
+        ),
     )
 
 
@@ -1296,6 +1303,57 @@ def _kernel_buffer_shapes_for_prim_func(prim_func: Any) -> dict[str, tuple[int, 
             int(dim) for dim in tuple(getattr(buffer, "shape", ()))
         )
     return shapes
+
+
+def _path_c_int_prim_attr(prim_func: Any, attr_name: str) -> int | None:
+    value = getattr(prim_func, attr_name, None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _path_c_str_prim_attr(prim_func: Any, attr_name: str) -> str | None:
+    value = getattr(prim_func, attr_name, None)
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _path_c_stage_row_launch_specs(
+    prim_funcs: Sequence[Any],
+) -> tuple[dict[str, Any], ...]:
+    specs: list[dict[str, Any]] = []
+    for index, prim_func in enumerate(prim_funcs):
+        specs.append(
+            {
+                "stage_index": index,
+                "row_chunk_count": _path_c_int_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_chunk_count",
+                ),
+                "row_chunk_index_param": _path_c_str_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_chunk_index_param",
+                ),
+                "row_subchunk_count": _path_c_int_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_subchunk_count",
+                ),
+                "row_subchunk_index_param": _path_c_str_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_row_subchunk_index_param",
+                ),
+                "rows_per_kernel_launch": _path_c_int_prim_attr(
+                    prim_func,
+                    "_cppmega_path_c_rows_per_kernel_launch",
+                ),
+            }
+        )
+    return tuple(specs)
 
 
 def _merged_physical_abi_for_prim_funcs(
@@ -1576,6 +1634,7 @@ def _runtime_smoke_payload(
                     active_node_names=group.active_node_names,
                     stage_suffix=group.stage_suffix,
                     row_dispatch_mode=group.row_dispatch_mode,
+                    rows_per_kernel_launch=group.rows_per_kernel_launch,
                 )
                 for group in forward_stage_groups
             )
@@ -1588,6 +1647,7 @@ def _runtime_smoke_payload(
                     active_node_names=group.active_node_names,
                     stage_suffix=group.stage_suffix,
                     row_dispatch_mode=group.row_dispatch_mode,
+                    rows_per_kernel_launch=group.rows_per_kernel_launch,
                 )
                 for group in backward_stage_groups
             )
@@ -1751,6 +1811,37 @@ def _runtime_smoke_payload(
                     "path_c_run_backward",
                 )
                 or "path_c_run_backward",
+                row_chunk_count=getattr(
+                    prim_func,
+                    "_cppmega_path_c_row_chunk_count",
+                    None,
+                ),
+                row_chunk_index_param=getattr(
+                    prim_func,
+                    "_cppmega_path_c_row_chunk_index_param",
+                    None,
+                ),
+                row_subchunk_count=getattr(
+                    prim_func,
+                    "_cppmega_path_c_row_subchunk_count",
+                    None,
+                ),
+                row_subchunk_index_param=getattr(
+                    prim_func,
+                    "_cppmega_path_c_row_subchunk_index_param",
+                    None,
+                ),
+                rows_per_kernel_launch=getattr(
+                    prim_func,
+                    "_cppmega_path_c_rows_per_kernel_launch",
+                    None,
+                ),
+                forward_stage_row_launches=_path_c_stage_row_launch_specs(
+                    forward_stage_prim_funcs
+                ),
+                backward_stage_row_launches=_path_c_stage_row_launch_specs(
+                    backward_stage_prim_funcs
+                ),
             )
         else:
             runtime_artifact = PathCFusedTrainBlockCallableArtifact(
@@ -1957,10 +2048,17 @@ def _runtime_smoke_payload(
                     "active_node_names": list(group.active_node_names),
                     "stage_suffix": group.stage_suffix,
                     "row_dispatch_mode": group.row_dispatch_mode,
+                    "rows_per_kernel_launch": group.rows_per_kernel_launch,
                     "reason": group.reason,
                 }
                 for group in (*forward_stage_groups, *backward_stage_groups)
             ],
+            "generated_forward_stage_row_launches": list(
+                _path_c_stage_row_launch_specs(forward_stage_prim_funcs)
+            ),
+            "generated_backward_stage_row_launches": list(
+                _path_c_stage_row_launch_specs(backward_stage_prim_funcs)
+            ),
             "kernel_source": (
                 {
                     **_artifact_kernel_source_stats(artifact),
@@ -2078,6 +2176,7 @@ def build_compile_receipt(
             "active_node_names": list(group.active_node_names),
             "stage_suffix": group.stage_suffix,
             "row_dispatch_mode": group.row_dispatch_mode,
+            "rows_per_kernel_launch": group.rows_per_kernel_launch,
             "reason": group.reason,
         }
         for group in descriptor_stage_groups

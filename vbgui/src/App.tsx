@@ -781,6 +781,7 @@ const getSavedActiveTabId = (): string => {
 
 export function App(): JSX.Element {
   const [canvasWidth, setCanvasWidth] = useState<number>(1180);
+  const [canvasHeight, setCanvasHeight] = useState<number>(800);
 
   const [tabs, setTabs] = useState<WorkspaceTab[]>(getSavedTabs);
   const [activeTabId, setActiveTabId] = useState<string>(getSavedActiveTabId);
@@ -1513,6 +1514,8 @@ export function App(): JSX.Element {
       // Returns edges annotated with orthogonal bend points for clean routing.
       const { nodes: layouted, edges: routed } = await layoutFlow(grouped.nodes, grouped.edges, {
         sizeOf: getNodeSize,
+        canvasWidth,
+        canvasHeight,
       });
       setNodes(layouted);
       setEdges(routed);
@@ -1531,7 +1534,7 @@ export function App(): JSX.Element {
     } catch (err) {
       console.error("Auto align layout failed:", err);
     }
-  }, [nodes, edges, canvasWidth, setEdges]);
+  }, [nodes, edges, canvasWidth, canvasHeight, setEdges]);
   // Always points at the latest handleAutoAlign so the deferred re-measure pass
   // reads current (now-measured) nodes instead of a stale closure.
   const handleAutoAlignRef = useRef(handleAutoAlign);
@@ -1620,7 +1623,11 @@ export function App(): JSX.Element {
           
           x += 220;
           
-          const addNodeName = `residual_add_unpacked_${Date.now()}_${newNodes.length}`;
+          // Derive add-node id from the brick id so it stays unique across
+          // outer unpack iterations (Date.now() collides for fast loops and
+          // newNodes.length resets per call — both produced ID collisions that
+          // collapsed all repeated brick instances onto a shared add pair).
+          const addNodeName = `${name}_add`;
           newNodes.push({
             id: addNodeName,
             type: "residual_add",
@@ -3042,7 +3049,7 @@ export function App(): JSX.Element {
                   onAutoAlign={handleAutoAlign}
                   onNodesChange={onNodesChange}
                   onEdgesChange={onEdgesChange}
-                  onResize={setCanvasWidth}
+                  onResize={(w, h) => { setCanvasWidth(w); setCanvasHeight(h); }}
                   onEdgeTap={(edgeId) => {
                     setTappedEdgeId(edgeId);
                     setActiveSidebarTab("research_hooks");

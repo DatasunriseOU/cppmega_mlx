@@ -1,0 +1,24 @@
+step 1 action: load preset deepseek_v4_flash (viewport 1440x900)
+step 2 action: Unpack All, then Auto Align Graph
+  layout: nodes=32  rows=17  overlaps=0
+    row 0: n=1  x=[0..132] width=132 in:L=0/R=0 out:L=0/R=1
+    row 1: n=2  x=[0..740] width=740 in:L=0/R=2 out:L=2/R=0
+    row 2: n=3  x=[0..683] width=683 in:L=3/R=0 out:L=0/R=3
+    row 3: n=1  x=[530..683] width=153 in:L=1/R=0 out:L=0/R=1
+    row 4: n=1  x=[530..683] width=153 in:L=1/R=0 out:L=0/R=1
+    row 5: n=3  x=[0..477] width=477 in:L=0/R=3 out:L=3/R=0
+    row 6: n=1  x=[98..248] width=150 in:L=0/R=1 out:L=1/R=0
+    row 7: n=1  x=[98..248] width=150 in:L=0/R=1 out:L=1/R=0
+    row 8: n=3  x=[0..664] width=664 in:L=3/R=0 out:L=0/R=3
+    row 9: n=2  x=[0..664] width=664 in:L=2/R=0 out:L=0/R=2
+    row 10: n=2  x=[0..664] width=664 in:L=2/R=0 out:L=0/R=2
+    row 11: n=3  x=[0..457] width=457 in:L=0/R=3 out:L=3/R=0
+    row 12: n=1  x=[98..238] width=140 in:L=0/R=1 out:L=1/R=0
+    row 13: n=1  x=[98..238] width=140 in:L=0/R=1 out:L=1/R=0
+    row 14: n=3  x=[0..699] width=699 in:L=3/R=0 out:L=0/R=3
+    row 15: n=1  x=[0..186] width=186 in:L=1/R=0 out:L=0/R=1
+    row 16: n=3  x=[0..662] width=662 in:L=0/R=3 out:L=2/R=0
+RESULT CP1 wrapped_multirow = PASS (17 rows)
+RESULT CP2 row_directions   = FAIL
+RESULT CP3 each_row_fits    = PASS
+RESULT CP4 no_overlap       = PASS

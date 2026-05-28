@@ -1,0 +1,14 @@
+step 1 action: load preset deepseek_v4_flash (viewport 1440x900)
+step 2 action: Unpack All, then Auto Align Graph
+  layout: nodes=32  rows=2  overlaps=0
+    row 0: n=1 width=132px in:L=0/R=0 out:L=0/R=1
+    row 1: n=31 width=418px in:L=16/R=15 out:L=14/R=16
+RESULT CP1 wrapped_multirow = PASS (2 rows)
+RESULT CP2 odd_rows_R_to_L  = FAIL
+RESULT CP3 each_row_fits    = PASS
+RESULT CP4 no_overlap       = PASS
+step 3 action: drag node lightning_indexer_unpacked_r0_1779961279804_0 180px down
+  edges touching dragged node: 2
+    Edge from dsv4_pos to lightning_indexer_unpacked_r0_1779961279804_0: hasC=True hasL/Q=False d='M190,803.6000061035156 C276.595678237462,803.6000061035156 -88.56525236625683,10...'
+    Edge from lightning_indexer_unpacked_r0_1779961279804_0 to residual_add_unpacked_1779961279804_1: hasC=True hasL/Q=False d='M374.3763416946397,1010.6232449166467 C422.68744834084475,1010.6232449166467 532...'
+RESULT CP5 drag_falls_back_to_bezier = PASS
