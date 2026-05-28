@@ -332,7 +332,12 @@ class PathCFusedTrainBlockCallableArtifact:
                 expected_size *= int(dim)
             actual_size = int(getattr(value, "size", 0) or 0)
             if actual_size < expected_size:
-                continue
+                raise ValueError(
+                    "physical ABI runtime bindings are not executable: "
+                    f"{name}: caller-owned kernel buffer shape {actual_shape} "
+                    f"has {actual_size} elements, expected at least "
+                    f"{expected_shape} ({expected_size} elements)"
+                )
             view = mx.reshape(value, (-1,))[:expected_size]
             if expected_shape != (expected_size,):
                 view = mx.reshape(view, expected_shape)

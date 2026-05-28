@@ -24,8 +24,8 @@ Categories (assigned per brick kind):
     only on the residual-add output side.
   - ``mtp``: nemotron_h_mtp — fusion depends on the underlying block_type;
     conservatively classified as ``sdpa_attention`` here.
-  - ``norm_or_proj``: mlp / residual / lightning_indexer — small ops that
-    fuse with neighbours easily.
+  - ``norm_or_proj``: rmsnorm / layernorm / mlp / residual /
+    lightning_indexer — small ops that fuse with neighbours easily.
   - ``sparse_attn``: nsa / csa_hca — data-dependent control flow; cannot
     fuse with anything in the current planner.
 """
@@ -79,6 +79,10 @@ _CATEGORY_BY_KIND: dict[str, str] = {
     "nsa": "sparse_attn",
     "csa_hca": "sparse_attn",
     # Light ops / projections / norms
+    "rmsnorm": "norm_or_proj",
+    "layernorm": "norm_or_proj",
+    "residual": "norm_or_proj",
+    "residual_rmsnorm": "norm_or_proj",
     "mlp": "norm_or_proj",
     "engram": "norm_or_proj",
     "lightning_indexer": "norm_or_proj",

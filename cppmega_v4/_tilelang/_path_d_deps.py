@@ -361,7 +361,7 @@ def path_d_imports_allowed(mode: str = "frontend") -> tuple[bool, str]:
 def unsafe_triton_frontend_import_disabled_reason(root: str | None) -> str:
     root_text = f" root={root}" if root else " root=<not found>"
     return (
-        "unsafe triton frontend import disabled because "
+        "unsafe triton frontend import disabled (not importable by default) because "
         f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1 is not set; native import "
         "preflight did not authorize in-process import; Path D runtime "
         f"adapter not reached;{root_text}"
@@ -371,7 +371,7 @@ def unsafe_triton_frontend_import_disabled_reason(root: str | None) -> str:
 def unsafe_fla_import_disabled_reason(root: str | None) -> str:
     root_text = f" root={root}" if root else " root=<not found>"
     return (
-        "unsafe FLA import disabled because "
+        "unsafe FLA import disabled (not importable by default) because "
         f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1 is not set; native import "
         "preflight did not authorize in-process import; Path D runtime "
         f"adapter not reached;{root_text}"

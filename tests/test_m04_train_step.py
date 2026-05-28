@@ -1705,20 +1705,22 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is False
+    expected_physical_banks = [
+        "path_c_float32_activation_abi_bank",
+        "path_c_float32_parameter_abi_bank",
+        "path_c_float32_state_abi_bank",
+        "path_c_uint8_abi_bank",
+        "path_c_float32_attention_abi_bank",
+        "path_c_int32_abi_bank",
+        "path_c_float32_activation_gradient_abi_bank",
+        "path_c_float32_parameter_gradient_abi_bank",
+    ]
     assert route["path_c_fusion"]["runtime_training_binding"][
         "required_bank_buffers"
-    ] == [
-        "path_c_float32_abi_bank",
-        "path_c_uint8_abi_bank",
-        "path_c_int32_abi_bank",
-    ]
+    ] == expected_physical_banks
     assert route["path_c_fusion"]["runtime_training_binding"][
         "missing_bank_buffers"
-    ] == [
-        "path_c_float32_abi_bank",
-        "path_c_uint8_abi_bank",
-        "path_c_int32_abi_bank",
-    ]
+    ] == expected_physical_banks
     assert route["path_c_fusion"]["runtime_training_binding"][
         "no_hidden_allocation_policy"
     ] is True
@@ -1726,6 +1728,10 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["path_c_fusion"]["compiler"] == "tilelang.engine.fusion"
     assert route["path_c_fusion"]["requires_msl_post_fusion"] is False
     assert route["path_c_fusion"]["large_tensor_staging_allowed"] is False
+    selected_schedule_id = route["path_c_fusion"]["graph_construction"][
+        "selected_model_region_schedule_id"
+    ]
+    assert selected_schedule_id.startswith("path_c_descriptor_chain_")
     assert route["path_c_fusion"]["graph_construction"] == {
         "builder": "PathCFusionScheduleOptimizer",
         "input_model": "local_gb10_quarter_profile_path_c_bricks",
@@ -1738,6 +1744,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "static_acceptance_fixture_used_for_selection": False,
         "selected_model_region": "local_gb10_quarter_path_c_10_12",
         "selected_model_region_op_signature": [
+            "entry_rmsnorm",
             "mamba3_mimo",
             "residual_rmsnorm",
             "m2rnn",
@@ -1745,7 +1752,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
             "attention_qkv_projection",
             "sparse_mla_fp8_apply",
         ],
-        "selected_model_region_schedule_id": "path_c_descriptor_chain_5785a4a0210e",
+        "selected_model_region_schedule_id": selected_schedule_id,
         "preset_only": False,
     }
     model_route_candidates = route["path_c_fusion"]["model_route_candidates"]
@@ -1771,6 +1778,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert candidate["brick_kinds"] == ["mamba3", "m2rnn", "attention"]
     assert candidate["brick_route_symbols"] == ["M", "R", "A"]
     assert candidate["node_names"] == [
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm",
         "local_gb10_quarter_brick_10_M",
         "local_gb10_quarter_brick_10_M_residual_norm",
         "local_gb10_quarter_brick_11_R",
@@ -1779,6 +1787,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply",
     ]
     assert candidate["op_signature"] == [
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",
@@ -1786,7 +1795,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "attention_qkv_projection",
         "sparse_mla_fp8_apply",
     ]
-    assert candidate["edge_count"] == 10
+    assert candidate["edge_count"] == 11
     assert candidate["z3_sync"] == {
         "enabled": True,
         "objective": "minimize_sync_async",
@@ -1818,7 +1827,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     assert route["path_c_fusion"]["schedule_registry"] == {
         "selector": "PathCFusionScheduleRegistry",
         "match_policy": "op_signature_or_descriptor_chain",
-        "selected_schedule_id": "path_c_descriptor_chain_5785a4a0210e",
+        "selected_schedule_id": selected_schedule_id,
         "selected_schedule_name": (
             "local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd"
         ),
@@ -1832,14 +1841,14 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     ] == "production"
     assert route["path_c_fusion"]["schedule_contract"][
         "declared_schedule_id"
-    ] == "path_c_descriptor_chain_5785a4a0210e"
+    ] == selected_schedule_id
     assert "local_gb10_quarter_brick_10_M_mamba3_in_proj_weight" in (
         route["path_c_fusion"]["schedule_contract"][
             "declared_required_real_abi_inputs"
         ]
     )
     assert route["path_c_fusion"]["production_schedule"]["schedule_id"] == (
-        "path_c_descriptor_chain_5785a4a0210e"
+        selected_schedule_id
     )
     assert route["path_c_fusion"]["production_schedule"]["schedule_name"] == (
         "local_gb10_quarter_path_c_10_12:descriptor_generated_fwd_bwd"
@@ -2006,25 +2015,27 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "required_internal_buffers"
     ]
     for expected_internal in [
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden",
         "local_gb10_quarter_brick_10_M_delta",
         "local_gb10_quarter_brick_10_M_residual_norm_hidden",
         "local_gb10_quarter_brick_11_R_delta",
         "local_gb10_quarter_brick_11_R_residual_norm_hidden",
-        "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8",
-        "local_gb10_quarter_brick_12_A_qkv_projection_q_scale",
+        "local_gb10_quarter_brick_12_A_qkv_projection_indices",
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_fp8_grad",
+        "local_gb10_quarter_brick_12_A_qkv_projection_q_scale_grad",
         "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
         "local_gb10_quarter_brick_10_M_delta_grad",
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden_grad",
     ]:
         assert expected_internal in required_internal_buffers
-    assert route["path_c_fusion"]["production_compile_receipt"]["status"] == (
-        "verified"
-    )
-    assert route["path_c_fusion"]["production_compile_receipt"]["verified"] is True
+    assert route["path_c_fusion"]["production_compile_receipt"]["status"] == "mismatch"
+    assert route["path_c_fusion"]["production_compile_receipt"]["verified"] is False
+    assert route["path_c_fusion"]["production_compile_receipt"]["native_compile_ok"] is True
     assert (
         route["path_c_fusion"]["production_compile_receipt"][
             "runtime_execution_status"
         ]
-        == "runtime_ready"
+        == "compile_only_not_runtime_ready"
     )
     assert (
         route["path_c_fusion"]["production_compile_receipt"]["runtime_smoke_mode"]
@@ -2032,17 +2043,35 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     )
     assert (
         route["path_c_fusion"]["production_compile_receipt"][
+            "runtime_smoke_actually_executed"
+        ]
+        is False
+    )
+    assert (
+        route["path_c_fusion"]["production_compile_receipt"][
             "production_runtime_smoke_uses_fused_train_block"
+        ]
+        is False
+    )
+    assert route["path_c_fusion"]["production_compile_receipt"]["failed_checks"] == [
+        "runtime_execution_ready",
+        "production_runtime_smoke_ok",
+        "production_smoke_uses_fused_train_block",
+    ]
+    assert (
+        route["path_c_fusion"]["production_compile_receipt"]["checks"][
+            "schedule_id_matches"
         ]
         is True
     )
     assert [blocker["kind"] for blocker in route["path_c_fusion"]["schedule_blockers"]] == [
         "selected_model_schedule_not_default",
+        "production_schedule_not_compile_verified",
         "fused_train_block_runtime_not_bound",
         "production_1b_matrix_profile_missing",
     ]
     assert route["path_c_fusion"]["schedule_blockers"][0]["schedule_id"] == (
-        "path_c_descriptor_chain_5785a4a0210e"
+        selected_schedule_id
     )
     assert route["path_c_fusion"]["schedule_blockers"][0]["schedule_generator"] == (
         PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
@@ -2058,6 +2087,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "local_gb10_quarter_brick_11_R_bwd",
         "local_gb10_quarter_brick_10_M_residual_norm_bwd",
         "local_gb10_quarter_brick_10_M_bwd",
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm_bwd",
     ]
     assert route["path_c_fusion"]["autograd_plan"]["backward_edges"] == [
         [
@@ -2105,8 +2135,14 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
             "local_gb10_quarter_brick_10_M_bwd",
             "local_gb10_quarter_brick_10_M_delta_grad",
         ],
+        [
+            "local_gb10_quarter_brick_10_M_bwd",
+            "local_gb10_quarter_brick_10_M_entry_rmsnorm_bwd",
+            "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden_grad",
+        ],
     ]
     assert route["path_c_fusion"]["node_names"] == [
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm",
         "local_gb10_quarter_brick_10_M",
         "local_gb10_quarter_brick_10_M_residual_norm",
         "local_gb10_quarter_brick_11_R",
@@ -2119,6 +2155,7 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
         "local_gb10_quarter_brick_11_R_bwd",
         "local_gb10_quarter_brick_10_M_residual_norm_bwd",
         "local_gb10_quarter_brick_10_M_bwd",
+        "local_gb10_quarter_brick_10_M_entry_rmsnorm_bwd",
     ]
     assert route["path_c_fusion"]["z3_sync"] == {
         "enabled": True,
@@ -2431,11 +2468,7 @@ def test_path_c_fusion_runtime_binding_accepts_model_owned_physical_banks(
     assert payload["fused_artifact_bound"] is True
     assert payload["runtime_uses_fused_train_block"] is True
     assert payload["missing_bank_buffers"] == []
-    assert payload["provided_bank_buffers"] == [
-        "path_c_float32_abi_bank",
-        "path_c_uint8_abi_bank",
-        "path_c_int32_abi_bank",
-    ]
+    assert payload["provided_bank_buffers"] == list(bank_buffers)
     assert payload["bank_buffer_owner"] == "local_gb10_quarter.path_c_physical_abi_banks"
     assert payload["hidden_packing_performed"] is False
 
@@ -2465,11 +2498,9 @@ def test_path_c_fusion_runtime_binding_accepts_bank_owner_object(
     assert payload["fused_artifact_bound"] is True
     assert payload["runtime_uses_fused_train_block"] is True
     assert payload["bank_buffer_owner"] == "local_gb10_quarter.path_c_physical_abi_banks"
-    assert payload["provided_bank_buffers"] == [
-        "path_c_float32_abi_bank",
-        "path_c_uint8_abi_bank",
-        "path_c_int32_abi_bank",
-    ]
+    assert payload["provided_bank_buffers"] == list(
+        _model_route_physical_bank_buffers()
+    )
 
 
 def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
@@ -4196,6 +4227,153 @@ def test_path_c_internal_scratch_validator_accepts_larger_coalesced_bank() -> No
     assert binding["shape_mismatch_internal_scratch_buffers"] == []
 
 
+def test_path_c_fused_train_block_installer_resizes_auto_owner_to_selected_artifact(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    physical_abi_map = {
+        "loss": {
+            "bank": "path_c_bfloat16_abi_bank",
+            "dtype": "bfloat16",
+            "offset": 0,
+            "shape": (2,),
+            "logical_shape": (2,),
+            "size": 2,
+        }
+    }
+    physical_abi_shapes = {"path_c_bfloat16_abi_bank": (2,)}
+
+    class _Artifact:
+        def __call__(self, *args: Any) -> None:
+            del args
+
+    _Artifact.physical_abi_map = physical_abi_map
+    _Artifact.physical_abi_shapes = physical_abi_shapes
+    _Artifact.kernel_buffer_shapes = {
+        "path_c_bfloat16_abi_bank": (2,),
+        "path_c_float32_scratch_bank": (8,),
+    }
+
+    stale_owner = make_physical_abi_bank_owner(
+        "unit.path_c_physical_abi_banks",
+        physical_abi_map,
+        physical_abi_shapes,
+        {
+            "path_c_bfloat16_abi_bank": mx.zeros((2,), dtype=mx.bfloat16),
+            "path_c_float32_scratch_bank": mx.zeros((4,), dtype=mx.float32),
+        },
+    )
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    model.path_c_physical_abi_bank_owner = stale_owner
+
+    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+        model=model,
+        fused_artifact=_Artifact(),
+        training_runtime=_ReadyFusedTrainBlockTrainingRuntime(),
+        sequence_length=m04_train_step.path_c_training_sequence_length(config),
+    )
+
+    assert install["status"] == "ok"
+    assert install["artifact_kernel_buffer_binding"]["status"] == "ok"
+    assert model.path_c_physical_abi_bank_owner is not stale_owner
+    owner_buffers = model.path_c_physical_abi_bank_owner.buffers
+    assert tuple(owner_buffers["path_c_float32_scratch_bank"].shape) == (8,)
+    assert owner_buffers["path_c_bfloat16_abi_bank"].dtype == mx.bfloat16
+
+
+def test_path_c_fused_train_block_installer_rejects_explicit_undersized_owner(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    physical_abi_map = {
+        "loss": {
+            "bank": "path_c_float32_abi_bank",
+            "dtype": "float32",
+            "offset": 0,
+            "shape": (2,),
+            "logical_shape": (2,),
+            "size": 2,
+        }
+    }
+    physical_abi_shapes = {"path_c_float32_abi_bank": (2,)}
+
+    class _Artifact:
+        def __call__(self, *args: Any) -> None:
+            del args
+
+    _Artifact.physical_abi_map = physical_abi_map
+    _Artifact.physical_abi_shapes = physical_abi_shapes
+    _Artifact.kernel_buffer_shapes = {
+        "path_c_float32_abi_bank": (2,),
+        "path_c_float32_scratch_bank": (8,),
+    }
+
+    stale_owner = make_physical_abi_bank_owner(
+        "unit.path_c_physical_abi_banks",
+        physical_abi_map,
+        physical_abi_shapes,
+        {
+            "path_c_float32_abi_bank": mx.zeros((2,), dtype=mx.float32),
+            "path_c_float32_scratch_bank": mx.zeros((4,), dtype=mx.float32),
+        },
+    )
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+
+    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+        model=model,
+        bank_owner=stale_owner,
+        fused_artifact=_Artifact(),
+        training_runtime=_ReadyFusedTrainBlockTrainingRuntime(),
+        sequence_length=m04_train_step.path_c_training_sequence_length(config),
+    )
+
+    assert install["status"] == "blocked"
+    assert install["artifact_kernel_buffer_binding"]["status"] == "failed"
+    assert install["artifact_kernel_buffer_binding"]["undersized_kernel_buffers"] == [
+        {
+            "name": "path_c_float32_scratch_bank",
+            "expected_shape": [8],
+            "expected_size": 8,
+            "actual_shape": [4],
+            "actual_size": 4,
+        }
+    ]
+
+
 def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
     tmp_path: Path,
     path_c_fusion_auto_env: None,
@@ -4484,9 +4662,22 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     assert route["selected_action"] == "run_path_c_fused_train_block_route"
     assert route["single_fused_train_block_standalone_dispatch_available"] is True
     assert route["fused_train_block_training_runtime_available"] is True
+    assert route["path_c_fusion"]["status"] == "runtime_bound_not_default"
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
+    assert route["path_c_fusion"]["graph_construction"][
+        "schedule_construction"
+    ] == "dynamic_brick_descriptors"
+    assert auto_install["artifact_compile"]["native_compile_ok"] is True
+    assert auto_install["artifact_compile"]["plan"]["single_generated_artifact"] is True
+    assert (
+        auto_install["artifact_compile"]["plan"]["runtime_schedule_contract_status"]
+        == "single_launcher_verified"
+    )
+    assert route["path_c_fusion"]["runtime_training_binding"][
+        "hidden_packing_performed"
+    ] is False
     assert callable(model.path_c_fused_train_block_artifact)
     assert lowerer_calls[0]["target"] == "metal"
 
@@ -4899,6 +5090,64 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert lowerer_calls[0]["target"] == "metal"
 
 
+def test_compile_path_c_fused_train_block_short_sequence_still_uses_launcher_stage_selector(
+    tmp_path: Path,
+    path_c_fusion_auto_env: None,
+) -> None:
+    del path_c_fusion_auto_env
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--pattern",
+            "A",
+            "--depth",
+            "1",
+            "--dsa-a-layer-ranks",
+            "0",
+            "--seq-len",
+            "16",
+            "--output",
+            str(tmp_path / "receipt.json"),
+        ]
+    )
+    config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    sequence_length = m04_train_step.path_c_training_sequence_length(config)
+    lowerer_calls: list[dict[str, Any]] = []
+
+    def fake_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
+        del func_or_mod
+        lowerer_calls.append({"target": target, "kwargs": dict(kwargs)})
+        return lambda *args: None
+
+    compiled = m04_train_step.compile_path_c_fused_train_block_artifact_for_model(
+        model=model,
+        sequence_length=sequence_length,
+        lowerer=fake_lowerer,
+    )
+
+    assert compiled["status"] == "ok"
+    assert compiled["plan"]["selected_runtime_artifact"] == (
+        "single_generated_launcher_chunks"
+    )
+    assert compiled["plan"]["monolithic_grid_runtime_blocked"] is True
+    assert compiled["plan"]["monolithic_grid_runtime_blocker"]["row_chunk_count"] == 1
+    assert compiled["plan"]["single_launcher_runtime_blocked"] is False
+    assert compiled["artifact"].row_chunk_count == 1
+    assert compiled["artifact"].row_chunk_index_param == "path_c_row_chunk_index"
+    assert compiled["artifact"].row_subchunk_count == 64
+    assert compiled["artifact"].row_subchunk_index_param == (
+        "path_c_row_subchunk_index"
+    )
+    assert compiled["artifact"].backward_stage_count == 7
+    assert compiled["artifact"].backward_stage_index_param == (
+        "path_c_backward_stage_index"
+    )
+    assert len(lowerer_calls) == 1
+
+
 def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks_exist(
     tmp_path: Path,
     path_c_fusion_auto_env: None,
@@ -4929,12 +5178,14 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         lowerer_calls.append({"target": target, "kwargs": dict(kwargs)})
         return lambda *args: None
 
-    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
-        model=model,
-        bank_owner=_model_route_generated_stage_physical_bank_owner(
+    model.path_c_physical_abi_bank_owner = (
+        _model_route_generated_stage_physical_bank_owner(
             model,
             sequence_length=sequence_length,
-        ),
+        )
+    )
+    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+        model=model,
         compile_artifact=True,
         artifact_lowerer=fake_lowerer,
         sequence_length=sequence_length,
@@ -4959,6 +5210,7 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         == "single_launcher_verified"
     )
     assert install["artifact_compile"]["training_abi_contract"]["status"] == "ok"
+    assert install["artifact_kernel_buffer_binding"]["status"] == "ok"
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "can_back_value_and_grad"
@@ -5103,12 +5355,14 @@ def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_hone
         del func_or_mod, target, kwargs
         return lambda *kernel_args: None
 
-    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
-        model=model,
-        bank_owner=_model_route_generated_stage_physical_bank_owner(
+    model.path_c_physical_abi_bank_owner = (
+        _model_route_generated_stage_physical_bank_owner(
             model,
             sequence_length=sequence_length,
-        ),
+        )
+    )
+    install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
+        model=model,
         compile_artifact=True,
         artifact_lowerer=fake_lowerer,
         sequence_length=sequence_length,
@@ -6087,7 +6341,7 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     )
 
     assert payload["mode"] == "force"
-    assert payload["status"] == "force_blocked_runtime_not_bound"
+    assert payload["status"] == "force_blocked_schedule_unverified"
     assert payload["single_kernel_fused"] is False
     assert payload["fullgraph_required"] is True
     assert payload["graph_break_policy"] == "fail_closed"
@@ -6099,10 +6353,10 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     assert payload["schedule_contract"]["status"] == "registered_not_lowered"
     assert payload["schedule_contract"]["declared_implementation_kind"] == "production"
     assert payload["schedule_contract"]["declared_schedule_id"] == (
-        "path_c_descriptor_chain_5785a4a0210e"
+        payload["production_schedule"]["schedule_id"]
     )
-    assert payload["production_schedule"]["schedule_id"] == (
-        "path_c_descriptor_chain_5785a4a0210e"
+    assert payload["production_schedule"]["schedule_id"].startswith(
+        "path_c_descriptor_chain_"
     )
     assert payload["production_schedule"]["implementation_status"] == (
         "ready"
@@ -6130,29 +6384,35 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     assert "production_1b_matrix_profile_missing" in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
     }
-    assert "production_schedule_not_compile_verified" not in {
+    assert "production_schedule_not_compile_verified" in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
     }
-    assert payload["production_compile_receipt"]["status"] == "verified"
+    assert payload["production_compile_receipt"]["status"] == "mismatch"
+    assert payload["production_compile_receipt"]["verified"] is False
     assert payload["production_compile_receipt"]["native_compile_ok"] is True
     assert payload["production_compile_receipt"]["cache_key_recompile_status"] == (
         "key_stable"
     )
     assert payload["production_compile_receipt"]["runtime_execution_status"] == (
-        "runtime_ready"
+        "compile_only_not_runtime_ready"
     )
-    assert payload["production_compile_receipt"]["runtime_route_uses_fused_region"] is True
+    assert payload["production_compile_receipt"]["runtime_route_uses_fused_region"] is False
     assert payload["production_compile_receipt"]["runtime_smoke_status"] == "ok"
     assert payload["production_compile_receipt"]["runtime_smoke_mode"] == "production_1b"
     assert (
-        payload["production_compile_receipt"]["runtime_smoke_actually_executed"] is True
+        payload["production_compile_receipt"]["runtime_smoke_actually_executed"] is False
     )
     assert (
         payload["production_compile_receipt"][
             "production_runtime_smoke_uses_fused_train_block"
         ]
-        is True
+        is False
     )
+    assert payload["production_compile_receipt"]["failed_checks"] == [
+        "runtime_execution_ready",
+        "production_runtime_smoke_ok",
+        "production_smoke_uses_fused_train_block",
+    ]
     assert "production_schedule_uses_descriptor_loop_fragments" not in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
     }
@@ -6162,8 +6422,8 @@ def test_path_c_fusion_force_mode_fails_closed_until_runtime_is_bound(
     assert payload["semantic_blockers"] == []
     assert "diagnostic_raw_abi_region" not in payload
     assert payload["default_allowed"] is False
-    assert "matching native compile receipt" in payload["reason"]
-    assert "runtime still has no bound fused artifact" in payload["reason"]
+    assert "not yet trusted" in payload["reason"]
+    assert "compile-verified" in payload["reason"]
 
 
 def test_path_c_fusion_payload_accepts_matching_matrix_profile_receipt(

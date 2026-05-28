@@ -837,6 +837,42 @@ def test_fused_train_block_callable_artifact_uses_full_kernel_buffer_order() -> 
         )
 
 
+def test_fused_train_block_callable_artifact_rejects_undersized_kernel_buffer() -> None:
+    float_bank = mx.zeros((3,), dtype=mx.float32)
+
+    artifact = PathCFusedTrainBlockCallableArtifact(
+        kernel=lambda *kernel_args: None,
+        physical_abi_map={
+            "loss": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+        },
+        physical_abi_shapes={"path_c_float32_abi_bank": (3,)},
+        training_abi_contract={},
+        kernel_buffer_order=(
+            "path_c_float32_abi_bank",
+            "path_c_float32_scratch_bank",
+        ),
+        kernel_buffer_shapes={
+            "path_c_float32_abi_bank": (3,),
+            "path_c_float32_scratch_bank": (8,),
+        },
+    )
+
+    with pytest.raises(ValueError, match="path_c_float32_scratch_bank"):
+        artifact.forward(
+            bank_owner={
+                "path_c_float32_abi_bank": float_bank,
+                "path_c_float32_scratch_bank": mx.zeros((4,), dtype=mx.float32),
+            }
+        )
+
+
 def test_fused_train_block_callable_artifact_reports_launcher_chunk_metadata() -> None:
     artifact = PathCFusedTrainBlockCallableArtifact(
         kernel=lambda *kernel_args: None,

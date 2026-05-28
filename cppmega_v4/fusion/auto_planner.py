@@ -6,8 +6,8 @@ conservative:
 
   - Eligibility check delegates entirely to
     :func:`cppmega_v4.fusion.compatibility.can_fuse_pair` (table-driven).
-  - A region is **extended** when the trailing brick can fuse with the
-    next candidate AND no hard limit is breached.
+  - A region is **extended** when every existing brick in the open region can
+    fuse with the next candidate AND no hard limit is breached.
   - A region is **closed** (and a new one started at the next brick)
     when eligibility says ``can_fuse=False``, when adding the next brick
     would exceed ``max_region_size`` bricks, or when the estimated
@@ -197,7 +197,9 @@ def plan_fusion_regions(
 
     The decision is:
 
-      1. If ``can_fuse_pair(tail, next).can_fuse`` is False → close.
+      1. If any existing brick in the open region cannot fuse with ``next``
+         → close.  This prevents light ops such as RMSNorm from bridging two
+         hard-incompatible heavy blocks into one invalid region.
       2. If extending would put the region above ``max_region_size`` → close.
       3. If extending would push estimated threadgroup memory above
          ``max_shared_mem_bytes`` → close.
@@ -234,12 +236,33 @@ def plan_fusion_regions(
         if not elig.can_fuse:
             close = True
             reason = elig.reason
-        elif len(open_region.nodes) + 1 > max_region_size:
+        else:
+            for existing in open_region.nodes[:-1]:
+                region_elig = can_fuse_pair(existing, current)
+                if not region_elig.can_fuse:
+                    close = True
+                    reason = (
+                        "region incompatibility: "
+                        f"{existing.kind}->{current.kind}: {region_elig.reason}"
+                    )
+                    break
+                if region_elig.backend != elig.backend:
+                    close = True
+                    reason = (
+                        "region backend mismatch: "
+                        f"{existing.kind}->{current.kind} uses "
+                        f"{region_elig.backend!r}, tail pair uses {elig.backend!r}"
+                    )
+                    break
+        if not close and len(open_region.nodes) + 1 > max_region_size:
             close = True
             reason = (
                 f"region would exceed max_region_size={max_region_size}"
             )
-        elif open_region.shared_mem_bytes + next_shared > max_shared_mem_bytes:
+        elif (
+            not close
+            and open_region.shared_mem_bytes + next_shared > max_shared_mem_bytes
+        ):
             close = True
             reason = (
                 "region would exceed shared-mem budget "

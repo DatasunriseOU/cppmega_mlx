@@ -67,33 +67,35 @@ function snakifyExistingRows(
       if (c.y - lastMaxY > 80) rows.push([c]); else last.push(c);
     } else rows.push([c]);
   }
-  if (rows.length < 2) return null; // single row, no snake to make
+  if (rows.length < 2) return null;
 
   const out = new Map<string, WrapAssignment>();
-  // Parity counts only multi-node rows. Singleton rows (a lone rmsnorm or
-  // residual_add between bigger rows) inherit the prior row's direction so
-  // their handle sides line up with the chain instead of flipping in place.
-  let majorIdx = 0;
-  let lastReverse = false;
-  rows.forEach((row) => {
-    if (row.length < 2) {
-      // Singleton row — keep ELK position, follow prior multi-node row's direction.
-      row.forEach((c) => out.set(c.id, { x: c.x, y: c.y, reverse: lastReverse }));
-      return;
-    }
-    const reverse = majorIdx % 2 === 1;
-    majorIdx++;
-    lastReverse = reverse;
+  // Every row contributes to parity (singletons too) so the snake stays
+  // strictly alternating. Each row is also SHIFTED in x so its chain-entry
+  // side aligns with the previous row's chain-exit side — that's what turns
+  // the inter-row link from a long bezier sweep into a short vertical hop.
+  let prevExitX: number | null = null;
+  rows.forEach((row, ri) => {
+    const origMinX = Math.min(...row.map((c) => c.x));
+    const origMaxR = Math.max(...row.map((c) => c.x + c.w));
+    const reverse = ri % 2 === 1;
+
+    // Entry side of this row (in ELK coords, before shift):
+    //   normal row → leftmost x (origMinX)
+    //   mirrored row → rightmost x after mirror (still origMaxR by construction)
+    const entryX = reverse ? origMaxR : origMinX;
+    const shift = prevExitX !== null ? prevExitX - entryX : 0;
+
     if (!reverse) {
-      row.forEach((c) => out.set(c.id, { x: c.x, y: c.y, reverse: false }));
-      return;
+      row.forEach((c) => out.set(c.id, { x: c.x + shift, y: c.y, reverse: false }));
+      prevExitX = origMaxR + shift;
+    } else {
+      row.forEach((c) => {
+        const mirroredX = origMaxR + origMinX - (c.x + c.w);
+        out.set(c.id, { x: mirroredX + shift, y: c.y, reverse: true });
+      });
+      prevExitX = origMinX + shift;
     }
-    const minX = Math.min(...row.map((c) => c.x));
-    const maxR = Math.max(...row.map((c) => c.x + c.w));
-    row.forEach((c) => {
-      const mirroredX = maxR + minX - (c.x + c.w);
-      out.set(c.id, { x: mirroredX, y: c.y, reverse: true });
-    });
   });
   return out;
 }
@@ -155,6 +157,10 @@ function computeRowWrap(
 
   const out = new Map<string, WrapAssignment>();
   let yCursor = 0;
+  // Each row gets a horizontal shift so its chain-entry side lines up with
+  // the previous row's chain-exit side — turning the snake's inter-row link
+  // into a short vertical hop instead of a long diagonal bezier.
+  let prevExitX: number | null = null;
   rows.forEach((row, ri) => {
     const reverse = ri % 2 === 1;
     let xCursor = 0;
@@ -163,16 +169,24 @@ function computeRowWrap(
       offs.push(xCursor);
       xCursor += li.width + (idx < row.layers.length - 1 ? H_GAP : 0);
     });
+    // Determine this row's entry x (in row-local coords, before global shift).
+    // Normal row: entry at left (x=0). Reverse row: entry at right (x=row.width).
+    const localEntryX = reverse ? row.width : 0;
+    const shift = prevExitX !== null ? prevExitX - localEntryX : 0;
+
     row.layers.forEach((li, idx) => {
       const rowOffX = reverse ? row.width - offs[idx] - li.width : offs[idx];
       li.nodes.forEach((c) => {
         out.set(c.id, {
-          x: rowOffX + (c.x - li.minX),
+          x: rowOffX + (c.x - li.minX) + shift,
           y: yCursor + (c.y - li.minY),
           reverse,
         });
       });
     });
+    // Exit side x (in row-local coords) + shift = next row's prevExitX.
+    const localExitX = reverse ? 0 : row.width;
+    prevExitX = localExitX + shift;
     yCursor += row.height + V_GAP;
   });
   return out;

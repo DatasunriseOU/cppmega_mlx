@@ -304,6 +304,90 @@ def test_fused_replay_launcher_chunked_artifact_launches_all_chunks() -> None:
     ) == [{"path_c_run_backward": 1}]
 
 
+def test_fused_replay_launcher_stage_selector_launches_backward_stages() -> None:
+    artifact = _RecordingReplayArtifact()
+    bank_owner = _FakeBankOwner()
+    f = build_fused_replay_boundary_custom_function(
+        artifact=artifact,
+        bank_owner=bank_owner,
+        abi_map=_make_abi_map(),
+        hidden_entry_logical_name="hidden_entry",
+        boundary_output_logical_names=("boundary_a", "boundary_b"),
+        boundary_cotangent_logical_names=("boundary_a_grad", "boundary_b_grad"),
+        in_region_parameter_bank_aliases=_parameter_aliases(),
+        parameter_order=("p_a", "p_b"),
+        row_chunk_count=1,
+        row_chunk_index_param="path_c_row_chunk_index",
+        row_subchunk_count=2,
+        row_subchunk_index_param="path_c_row_subchunk_index",
+        backward_stage_count=3,
+        backward_stage_index_param="path_c_backward_stage_index",
+    )
+
+    def loss_fn(hidden_entry, param_a, param_b):
+        boundary_a, boundary_b = f(hidden_entry, param_a, param_b)
+        return boundary_a.sum() + boundary_b.sum()
+
+    value, grads = mx.value_and_grad(loss_fn, argnums=(0, 1, 2))(
+        mx.full((1, 3, 4), 9.0, dtype=mx.float32),
+        mx.array([10.0, 11.0, 12.0, 13.0], dtype=mx.float32),
+        mx.array([20.0, 21.0, 22.0, 23.0], dtype=mx.float32),
+    )
+    mx.eval(value, *grads)
+
+    assert [
+        call["kernel_scalar_params"]
+        for call in artifact.forward_calls
+    ] == [
+        {
+            "path_c_run_backward": 0,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 0,
+        },
+        {
+            "path_c_run_backward": 0,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 1,
+        },
+        {
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 0,
+            "path_c_backward_stage_index": 0,
+        },
+        {
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 0,
+            "path_c_backward_stage_index": 1,
+        },
+        {
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 0,
+            "path_c_backward_stage_index": 2,
+        },
+        {
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 1,
+            "path_c_backward_stage_index": 0,
+        },
+        {
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 1,
+            "path_c_backward_stage_index": 1,
+        },
+        {
+            "path_c_run_backward": 1,
+            "path_c_row_chunk_index": 0,
+            "path_c_row_subchunk_index": 1,
+            "path_c_backward_stage_index": 2,
+        },
+    ]
+
+
 def test_fused_suffix_forward_writes_inputs_and_returns_loss() -> None:
     artifact = _RecordingArtifact(sentinel_loss=2.5, sentinel_ntokens=11.0)
     bank_owner = _FakeBankOwner()

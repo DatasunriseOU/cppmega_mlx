@@ -113,7 +113,7 @@ MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS = "ready"
 PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR = "dynamic_brick_descriptor_generator"
 DESCRIPTOR_DEFAULT_BUFFER_EXTENT = 4
 DESCRIPTOR_DEFAULT_THREADS = 256
-DESCRIPTOR_ROW_PHASED_THREADS = 128
+DESCRIPTOR_ROW_PHASED_THREADS = 1024
 DESCRIPTOR_INTERNAL_BUFFER_POLICY_SCALAR_LOCAL = "scalar_local"
 DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN = "row_local_hidden"
 DESCRIPTOR_LOOP_POLICY_FLAT = "flat"
@@ -123,7 +123,7 @@ DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_DTYPE = "banked_by_dtype"
 DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE = "banked_by_role"
 DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT = 31
 DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES = 1024
-DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 12 * 1024
+DESCRIPTOR_SHARED_SCRATCH_BUDGET_BYTES = 8 * 1024
 MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL = 8
 M2RNN_BWD_REPLAY_CHECKPOINT_INTERVAL = 1
 _DESCRIPTOR_ROOT_READS_MARKER = "cppmega_path_c_root_reads"
@@ -1780,6 +1780,7 @@ def build_path_c_descriptor_prim_func(
         internal_buffers=internal_buffers,
         internal_buffer_shapes=internal_buffer_shapes,
         physical_abi_plan=physical_abi_plan,
+        physical_abi_policy=validated_physical_abi_policy,
         internal_buffer_policy=validated_internal_buffer_policy,
         loop_policy=validated_loop_policy,
         max_rows_per_launch=validated_max_rows_per_launch,
@@ -2408,6 +2409,7 @@ def _descriptor_prim_func_source(
     internal_buffers: Sequence[str],
     internal_buffer_shapes: Mapping[str, tuple[int, ...]],
     physical_abi_plan: _PhysicalAbiPlan,
+    physical_abi_policy: str,
     internal_buffer_policy: str,
     loop_policy: str,
     max_rows_per_launch: int | None,
@@ -2667,6 +2669,9 @@ def _descriptor_prim_func_source(
         existing_parameter_count=len(param_lines),
         internal_buffer_names=frozenset(active_internal_buffers),
         force_spill_names=frozenset(force_spilled_internal_buffers),
+        force_builtin_spill_names=(
+            physical_abi_policy != DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT
+        ),
     )
 
 
@@ -3861,6 +3866,7 @@ def _spill_large_shared_scratch_to_abi(
     existing_parameter_count: int,
     internal_buffer_names: frozenset[str] = frozenset(),
     force_spill_names: frozenset[str] = frozenset(),
+    force_builtin_spill_names: bool = True,
 ) -> tuple[str, Mapping[str, Mapping[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     total_shared_bytes = 0
@@ -3881,7 +3887,10 @@ def _spill_large_shared_scratch_to_abi(
         force_scratch_abi = (
             scratch_name in force_spill_names
             or _is_row_phased_bwd_scratch_abi_buffer(scratch_name)
-            or _force_spill_shared_scratch_name(scratch_name)
+            or (
+                force_builtin_spill_names
+                and _force_spill_shared_scratch_name(scratch_name)
+            )
         )
         if (
             byte_count >= DESCRIPTOR_SHARED_SCRATCH_SPILL_THRESHOLD_BYTES
@@ -6363,6 +6372,7 @@ def _append_row_phased_mamba3_body(
             f"({out_inner}[{feature}] + ({d_skip} * {x_val})) * "
             f"{z_val} * (1.0 / (1.0 + T.exp(-{z_val})))"
         )
+        body.append(f"{indent * 3}T.sync_threads()")
         body.append(f"{indent * 3}if ((row + 1) % {checkpoint_interval}) == 0:")
         body.append(f"{indent * 4}{checkpoint_idx} = (row + 1) // {checkpoint_interval}")
         body.append(
@@ -9447,14 +9457,17 @@ def _append_row_phased_m2rnn_bwd_body(
         )
     body.append(f"{indent * 5}for {state_idx} in T.serial(0, {full_state_extent}):")
     body.append(f"{indent * 6}{dh}[{state_idx}] = 0.0")
+    if hidden_grad is not None:
+        body.append(
+            f"{indent * 5}for {grad_flat} in T.serial(0, "
+            f"{sequence_length * hidden_size}):"
+        )
+        body.append(
+            f"{indent * 6}{_indexed_buffer_ref(hidden_grad, access_by_buffer, grad_flat)} = 0.0"
+        )
     body.append(f"{indent * 3}if lane == 0:")
     body.append(f"{indent * 4}for {time_rev} in T.serial({time_rev_range}):")
     body.append(f"{indent * 6}{time_idx} = {sequence_length - 1} - {time_rev}")
-    if hidden_grad is not None:
-        body.append(f"{indent * 6}for {hidden_loop} in T.serial(0, {hidden_size}):")
-        body.append(
-            f"{indent * 7}{_indexed_buffer_ref(hidden_grad, access_by_buffer, f'{time_idx} * {hidden_size} + {hidden_loop}')} = 0.0"
-        )
     body.append(f"{indent * 6}{checkpoint_idx} = {time_idx} // {checkpoint_interval}")
     body.append(f"{indent * 6}{checkpoint_start} = {checkpoint_idx} * {checkpoint_interval}")
     body.append(f"{indent * 6}for {state_idx} in T.serial(0, {full_state_extent}):")
@@ -9734,10 +9747,7 @@ def _append_row_phased_m2rnn_bwd_body(
     body.append(f"{indent * 6}for {conv_ch} in T.serial(0, {conv_dim}):")
     body.append(f"{indent * 7}{conv_grad}[{conv_ch}] = 0.0")
     body.append(f"{indent * 6}T.sync_threads()")
-    body.append(
-        f"{indent * 6}for {proj_dim} in T.serial(lane, {in_proj_dim}, "
-        f"step={thread_count}):"
-    )
+    body.append(f"{indent * 6}for {proj_dim} in T.serial(0, {in_proj_dim}):")
     body.append(f"{indent * 7}{project_grad}[{proj_dim}] = 0.0")
     body.append(f"{indent * 6}for {feature} in T.serial(0, {features}):")
     body.append(f"{indent * 7}{head} = {feature} // {v_dim}")
@@ -9838,13 +9848,7 @@ def _append_row_phased_m2rnn_bwd_body(
         f"({h_prev}[{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv_inner}] * "
         f"{state_weight_expr_inner})"
     )
-    body.append(
-        f"{indent * 9}{tanh_val}[0] = "
-        f"({h_next}[{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}] - "
-        f"({decay}[0] * "
-        f"{h_prev}[{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}])) / "
-        f"(1.0 - {decay}[0])"
-    )
+    body.append(f"{indent * 9}{tanh_val}[0] = T.tanh({accum}[0] + ({k_val} * {v_val}))")
     body.append(
         f"{indent * 9}{scalar0}[0] = {scalar0}[0] + "
         f"({dh}[{head} * {k_dim * v_dim} + {kk} * {v_dim} + {vv}] * "
@@ -10048,10 +10052,7 @@ def _append_row_phased_m2rnn_bwd_body(
         f"{project_grad}[{conv_ch}] + ({scalar1}[0] * {current_conv_weight_expr})"
     )
     body.append(f"{indent * 6}T.sync_threads()")
-    body.append(
-        f"{indent * 6}for {proj_dim} in T.serial(lane, {in_proj_dim}, "
-        f"step={thread_count}):"
-    )
+    body.append(f"{indent * 6}for {proj_dim} in T.serial(0, {in_proj_dim}):")
     body.append(f"{indent * 7}for {hidden_loop} in T.serial(0, {hidden_size}):")
     hidden_expr = _node_indexed_canonical_or_positional_input_expr(
         node,
@@ -10766,7 +10767,6 @@ def _append_row_phased_mamba3_bwd_body(
         )
     if (
         hidden_grad is not None
-        and not launcher_chunked_rows
         and not _is_full_sequence_bank_slot(
         hidden_grad,
         access_by_buffer,
@@ -10819,14 +10819,6 @@ def _append_row_phased_mamba3_bwd_body(
     body.append(f"{indent * 5}T.sync_threads()")
     body.append(f"{indent * 5}for {time_rev} in T.serial({time_rev_range}):")
     body.append(f"{indent * 6}{time_idx} = {sequence_length - 1} - {time_rev}")
-    if launcher_chunked_rows and hidden_grad is not None:
-        body.append(
-            f"{indent * 6}for {hidden_loop} in T.serial(lane, {hidden_size}, "
-            f"step={thread_count}):"
-        )
-        body.append(
-            f"{indent * 7}{_indexed_buffer_ref(hidden_grad, access_by_buffer, f'{time_idx} * {hidden_size} + {hidden_loop}')} = 0.0"
-        )
     body.append(f"{indent * 6}{checkpoint_idx} = {time_idx} // {checkpoint_interval}")
     body.append(
         f"{indent * 6}{checkpoint_start} = {checkpoint_idx} * {checkpoint_interval}"
@@ -13728,6 +13720,12 @@ def _physical_abi_policy_for_region(
         external_buffer_count += len(_TRAIN_STEP_SCALAR_OUTPUT_ABI_NAMES)
         external_buffer_count += len(_TRAIN_STEP_SUFFIX_LOSS_INPUT_ABI_NAMES)
         external_buffer_count += len(_TRAIN_STEP_SUFFIX_LOSS_PARAMETER_GRAD_ABI_NAMES)
+    if (
+        shape_env is not None
+        and internal_buffer_policy == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
+        and loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
+    ):
+        return DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE
     if external_buffer_count > DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT:
         return DESCRIPTOR_PHYSICAL_ABI_POLICY_BANKED_BY_ROLE
     return DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT

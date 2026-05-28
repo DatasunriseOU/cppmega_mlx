@@ -108,6 +108,10 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
     MSLDispatchUnsupported,
     can_run_metal,
 )
+from cppmega_mlx.nn._tilelang._mlx_runtime import (
+    NativeTileLangRuntimeError,
+    _validate_owner_result,
+)
 from cppmega_mlx.nn._tilelang.mamba3 import _validate_inputs
 
 
@@ -2789,14 +2793,17 @@ def mamba3_mimo_fwd_path_c(
     if not isinstance(out_list, (list, tuple)) or len(out_list) != 2:
         raise RuntimeError("Mamba3 Path C fwd tvm-ffi returned an invalid output tuple")
     if owner_outputs is not None:
-        y, h_last = owner_outputs
-        if not all(
-            got is expected
-            for got, expected in zip(out_list, (y, h_last), strict=True)
-        ):
+        try:
+            y, h_last = cast(
+                tuple[mx.array, mx.array],
+                _validate_owner_result(out_list, owner_outputs),
+            )
+        except NativeTileLangRuntimeError as exc:
             raise RuntimeError(
                 "Mamba3 Path C fwd tvm-ffi did not return caller-owned outputs"
-            )
+            ) from exc
+        del lowering
+        return y, h_last
     y, h_last = cast(tuple[mx.array, mx.array], tuple(out_list))
     del lowering
     return y, h_last

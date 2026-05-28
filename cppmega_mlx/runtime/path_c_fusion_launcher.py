@@ -114,6 +114,8 @@ class PathCAbiManifest:
     row_subchunk_index_param: str | None
     row_chunk_index_buffer: str | None
     backward_gate_param: str | None
+    backward_stage_count: int | None
+    backward_stage_index_param: str | None
 
 
 def _optional_positive_int_attr(prim_func: Any, key: str) -> int | None:
@@ -240,6 +242,12 @@ def load_path_c_abi_manifest(prim_func: Any) -> PathCAbiManifest:
         row_chunk_index_buffer=row_chunk_index_buffer,
         backward_gate_param=_optional_string_attr(
             prim_func, "tl.fusion.backward_gate_param"
+        ),
+        backward_stage_count=_optional_positive_int_attr(
+            prim_func, "tl.fusion.backward_stage_count"
+        ),
+        backward_stage_index_param=_optional_string_attr(
+            prim_func, "tl.fusion.backward_stage_index_param"
         ),
     )
 
@@ -534,6 +542,7 @@ class Mamba3Fp8TrainBlockLauncher:
         row_chunk_param_index: int | None = None
         row_chunk_param_is_scalar = False
         row_subchunk_param_index: int | None = None
+        backward_stage_param_index: int | None = None
         backward_gate_param_index: int | None = None
         for param_name in manifest.param_order:
             logical_name = param_name[: -len("_handle")] if param_name.endswith("_handle") else param_name
@@ -553,6 +562,9 @@ class Mamba3Fp8TrainBlockLauncher:
                 positional.append(mx.array([0], dtype=mx.int32))
             elif logical_name == manifest.row_subchunk_index_param:
                 row_subchunk_param_index = len(positional)
+                positional.append(0)
+            elif logical_name == manifest.backward_stage_index_param:
+                backward_stage_param_index = len(positional)
                 positional.append(0)
             elif logical_name == manifest.backward_gate_param:
                 backward_gate_param_index = len(positional)
@@ -607,6 +619,8 @@ class Mamba3Fp8TrainBlockLauncher:
                 elif logical_name == manifest.row_chunk_index_buffer:
                     continue
                 elif logical_name == manifest.row_subchunk_index_param:
+                    continue
+                elif logical_name == manifest.backward_stage_index_param:
                     continue
                 elif logical_name == manifest.backward_gate_param:
                     continue
@@ -678,7 +692,20 @@ class Mamba3Fp8TrainBlockLauncher:
                     "compiled PrimFunc declares row subchunk dispatch metadata "
                     "but has no row subchunk index parameter"
                 )
-            def launch_chunk(chunk_index: int, subchunk_index: int) -> None:
+            if (
+                manifest.backward_stage_index_param is not None
+                and backward_stage_param_index is None
+            ):
+                raise ValueError(
+                    "compiled PrimFunc declares backward stage dispatch metadata "
+                    "but has no backward stage index parameter"
+                )
+
+            def launch_chunk(
+                chunk_index: int,
+                subchunk_index: int,
+                backward_stage_index: int = 0,
+            ) -> None:
                 positional[row_chunk_param_index] = (
                     int(chunk_index)
                     if row_chunk_param_is_scalar
@@ -686,18 +713,31 @@ class Mamba3Fp8TrainBlockLauncher:
                 )
                 if row_subchunk_param_index is not None:
                     positional[row_subchunk_param_index] = int(subchunk_index)
+                if backward_stage_param_index is not None:
+                    positional[backward_stage_param_index] = int(backward_stage_index)
                 apply_returned_outputs(self._kernel(*positional))
 
             if run_backward and backward_gate_param_index is not None:
                 positional[backward_gate_param_index] = _BACKWARD_FORWARD_PREPASS_GATE
+                prepass_subchunk_count = int(manifest.row_subchunk_count or 1)
                 for chunk_index in range(chunk_count):
-                    launch_chunk(chunk_index, 0)
+                    for subchunk_index in range(prepass_subchunk_count):
+                        launch_chunk(chunk_index, subchunk_index)
                 final_forward_states = snapshot_logical_buffers(
                     _STATE_AFTER_LOGICAL_BUFFERS
                 )
                 restore_logical_buffers(initial_backward_states)
                 positional[backward_gate_param_index] = _BACKWARD_GATE
-                launch_chunk(0, 0)
+                backward_subchunk_count = int(manifest.row_subchunk_count or 1)
+                backward_stage_count = int(manifest.backward_stage_count or 1)
+                for backward_stage_index in range(backward_stage_count):
+                    for chunk_index in range(chunk_count):
+                        for subchunk_index in range(backward_subchunk_count):
+                            launch_chunk(
+                                chunk_index,
+                                subchunk_index,
+                                backward_stage_index,
+                            )
                 restore_logical_buffers(final_forward_states)
             else:
                 for chunk_index in range(chunk_count):

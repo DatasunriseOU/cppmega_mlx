@@ -252,6 +252,11 @@ def test_nemotron3_preset_has_mamba_and_attention_singletons():
     specs = build_preset_specs("nemotron3", 64)
     g = from_block_specs(specs, hidden_size=64, instantiate=False)
     plans = plan_fusion_regions(g)
-    # mamba3 (ssm) + attention (sdpa) + moe — ssm-sdpa False, sdpa-moe False
-    assert [p.size for p in plans] == [1, 1, 1]
-    assert [p.brick_names[0] for p in plans] == ["nemo_mamba", "nemo_attn", "nemo_moe"]
+    # Norms fuse into their adjacent heavy block, but cannot bridge hard
+    # incompatible heavy blocks into one region.
+    assert [p.size for p in plans] == [2, 2, 1]
+    assert [p.brick_names for p in plans] == [
+        ("nemo_mamba", "nemo_norm1"),
+        ("nemo_attn", "nemo_norm2"),
+        ("nemo_moe",),
+    ]

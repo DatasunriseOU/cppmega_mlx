@@ -98,6 +98,7 @@ from cppmega_mlx.recipes.model_factory import (  # noqa: E402
 from cppmega_mlx.recipes.pattern import expand_nam_pattern  # noqa: E402
 from cppmega_mlx.training.compiled import (  # noqa: E402
     CompiledPretrainingStep,
+    PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS,
     PathCFusedPlusEagerTrainingRuntime,
     PathCFusedTrainBlockCallableArtifact,
     PathCFusedTrainBlockTrainingRuntime,
@@ -2146,6 +2147,14 @@ def _path_c_merge_model_gradient_trees(*trees: Any) -> Any:
     return tree_unflatten(sorted(merged, key=lambda item: item[0]))
 
 
+def _path_c_model_gradient_tree_array_names(grads: Any) -> frozenset[str]:
+    return frozenset(
+        str(name)
+        for name, value in tree_flatten(grads)
+        if isinstance(value, mx.array)
+    )
+
+
 def _path_c_inactive_sparse_dsa_dense_parameter_names(
     model: Any,
     chain: Any,
@@ -2402,10 +2411,11 @@ def _path_c_direct_chain_full_gradient_coverage_payload(
         for name in bridge_plan.get("parameter_gradient_tree_names", ())
         if str(name) not in suffix_bridge_parameter_names
     }
+    boundary_norm_name = f"layers.{start_layer_index}.norm.weight"
     prefix_names = _path_c_model_prefix_parameter_names(
         model,
         end_layer_index=start_layer_index,
-        include_boundary_norm=True,
+        include_boundary_norm=boundary_norm_name not in direct_names,
     )
     suffix_names = {
         _path_c_strip_gradient_suffix(str(name))
@@ -2973,6 +2983,196 @@ def _path_c_physical_abi_bank_owner_for_model(
     return None
 
 
+def _path_c_kernel_buffer_dtype(name: str, *, default: str = "float32") -> Any:
+    """Return the MLX dtype implied by a generated Path C kernel buffer name."""
+
+    text = str(name)
+    if "uint8" in text:
+        return mx.uint8
+    if "int32" in text:
+        return mx.int32
+    if "bfloat16" in text:
+        return mx.bfloat16
+    if "float16" in text:
+        return mx.float16
+    if "float32" in text:
+        return mx.float32
+    return getattr(mx, default)
+
+
+def _path_c_shape_numel(shape: Sequence[int]) -> int:
+    size = 1
+    for dim in shape:
+        size *= int(dim)
+    return int(size)
+
+
+def _path_c_bank_owner_buffers(bank_owner: Any | None) -> Mapping[str, Any]:
+    if bank_owner is None:
+        return {}
+    if isinstance(bank_owner, Mapping):
+        return {str(name): value for name, value in bank_owner.items()}
+    buffers = getattr(bank_owner, "buffers", None)
+    if isinstance(buffers, Mapping):
+        return {str(name): value for name, value in buffers.items()}
+    return {}
+
+
+def _path_c_artifact_kernel_buffer_shape_requirements(
+    artifact: Any,
+) -> dict[str, tuple[int, ...]]:
+    """Return largest per-buffer shape required by a selected runtime artifact."""
+
+    requirements: dict[str, tuple[int, ...]] = {}
+
+    def add_shapes(shapes: Any) -> None:
+        if not isinstance(shapes, Mapping):
+            return
+        for raw_name, raw_shape in shapes.items():
+            name = str(raw_name)
+            if name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS:
+                continue
+            shape = tuple(int(dim) for dim in tuple(raw_shape))
+            current = requirements.get(name)
+            if current is None or _path_c_shape_numel(shape) > _path_c_shape_numel(
+                current
+            ):
+                requirements[name] = shape
+
+    add_shapes(getattr(artifact, "kernel_buffer_shapes", None))
+    add_shapes(getattr(artifact, "forward_kernel_buffer_shapes", None))
+    add_shapes(getattr(artifact, "backward_kernel_buffer_shapes", None))
+    for attr_name in (
+        "forward_kernel_buffer_shapes_by_stage",
+        "backward_kernel_buffer_shapes_by_stage",
+    ):
+        for shapes in getattr(artifact, attr_name, ()) or ():
+            add_shapes(shapes)
+    return requirements
+
+
+def _path_c_artifact_bank_owner_kernel_buffer_binding(
+    *,
+    artifact: Any | None,
+    bank_owner: Any | None,
+) -> dict[str, Any]:
+    """Validate top-level kernel buffers that are outside physical ABI banks."""
+
+    if artifact is None:
+        return {
+            "status": "not_bound",
+            "reason": "no fused train-block artifact is selected",
+            "missing_kernel_buffers": [],
+            "undersized_kernel_buffers": [],
+            "required_kernel_buffers": [],
+        }
+
+    requirements = _path_c_artifact_kernel_buffer_shape_requirements(artifact)
+    required_names = sorted(requirements)
+    buffers = _path_c_bank_owner_buffers(bank_owner)
+    missing: list[str] = []
+    undersized: list[dict[str, Any]] = []
+    for name in required_names:
+        value = buffers.get(name)
+        if value is None:
+            missing.append(name)
+            continue
+        expected_shape = requirements[name]
+        expected_size = _path_c_shape_numel(expected_shape)
+        actual_shape = tuple(int(dim) for dim in tuple(getattr(value, "shape", ())))
+        actual_size = int(getattr(value, "size", 0) or _path_c_shape_numel(actual_shape))
+        if actual_size < expected_size:
+            undersized.append(
+                {
+                    "name": name,
+                    "expected_shape": list(expected_shape),
+                    "expected_size": expected_size,
+                    "actual_shape": list(actual_shape),
+                    "actual_size": actual_size,
+                }
+            )
+    ok = not missing and not undersized
+    return {
+        "status": "ok" if ok else "failed",
+        "reason": (
+            "caller/model-owned kernel buffers satisfy selected artifact"
+            if ok
+            else "caller/model-owned kernel buffers do not satisfy selected artifact"
+        ),
+        "required_kernel_buffers": required_names,
+        "missing_kernel_buffers": missing,
+        "undersized_kernel_buffers": undersized,
+        "bank_buffer_owner": getattr(bank_owner, "owner_name", None),
+    }
+
+
+def _path_c_physical_abi_bank_owner_for_artifact(
+    *,
+    artifact: Any,
+    owner_name: str,
+) -> Any | None:
+    """Allocate model-owned ABI banks sized to the selected compiled artifact."""
+
+    physical_abi_map = getattr(artifact, "physical_abi_map", None)
+    physical_abi_shapes = getattr(artifact, "physical_abi_shapes", None)
+    if not isinstance(physical_abi_map, Mapping) or not isinstance(
+        physical_abi_shapes,
+        Mapping,
+    ):
+        return None
+    if not physical_abi_map or not physical_abi_shapes:
+        return None
+
+    bank_dtypes: dict[str, str] = {}
+    for placement in physical_abi_map.values():
+        if not isinstance(placement, Mapping):
+            continue
+        bank = str(placement.get("bank", ""))
+        dtype = str(placement.get("dtype", ""))
+        if not bank or not dtype:
+            continue
+        existing = bank_dtypes.setdefault(bank, dtype)
+        if existing != dtype:
+            raise ValueError(
+                f"conflicting bank dtype for {bank!r}: {existing!r} vs {dtype!r}"
+            )
+
+    buffers: dict[str, mx.array] = {}
+    for bank, shape in physical_abi_shapes.items():
+        bank_name = str(bank)
+        dtype_name = bank_dtypes.get(bank_name)
+        if dtype_name is None:
+            raise ValueError(
+                f"no logical buffer is placed inside physical bank {bank_name!r}"
+            )
+        buffers[bank_name] = mx.zeros(
+            tuple(int(dim) for dim in tuple(shape)),
+            dtype=_path_c_kernel_buffer_dtype(bank_name, default=dtype_name),
+        )
+
+    kernel_buffer_shapes = getattr(artifact, "kernel_buffer_shapes", None)
+    if isinstance(kernel_buffer_shapes, Mapping):
+        for name, shape in kernel_buffer_shapes.items():
+            buffer_name = str(name)
+            if (
+                buffer_name in buffers
+                or buffer_name in physical_abi_shapes
+                or buffer_name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS
+            ):
+                continue
+            buffers[buffer_name] = mx.zeros(
+                tuple(int(dim) for dim in tuple(shape)),
+                dtype=_path_c_kernel_buffer_dtype(buffer_name),
+            )
+
+    return make_physical_abi_bank_owner(
+        owner_name,
+        physical_abi_map,
+        physical_abi_shapes,
+        buffers,
+    )
+
+
 def _path_c_direct_chain_runtime_capture_aliases_for_model(
     model: Any,
 ) -> dict[str, tuple[str, ...]]:
@@ -3051,14 +3251,16 @@ def fp8_path_c_training_route_payload_for_model(
         model,
         sequence_length=sequence_length,
         allocate_if_missing=(
-            auto_install_requested
+            (
+                auto_install_requested
+                and callable(model_fused_artifact)
+            )
             or artifact_can_back_training_runtime
             or model_fused_training_runtime is not None
         ),
     )
     if (
         auto_install_requested
-        and model_bank_owner is not None
         and (
             not callable(model_fused_artifact)
             or (
@@ -3067,17 +3269,23 @@ def fp8_path_c_training_route_payload_for_model(
             )
         )
     ):
+        compile_missing_artifact = not callable(model_fused_artifact)
         auto_install_report = install_path_c_fused_train_block_runtime_for_model(
             model=model,
-            bank_owner=model_bank_owner,
+            bank_owner=None if compile_missing_artifact else model_bank_owner,
             training_runtime=model_fused_training_runtime,
-            compile_artifact=not callable(model_fused_artifact),
+            compile_artifact=compile_missing_artifact,
             artifact_lowerer=fused_train_block_artifact_lowerer,
             artifact_target_name=fused_train_block_artifact_target_name,
             artifact_execution_backend=(
                 fused_train_block_artifact_execution_backend
             ),
             sequence_length=sequence_length,
+        )
+        model_bank_owner = _path_c_physical_abi_bank_owner_for_model(
+            model,
+            sequence_length=sequence_length,
+            allocate_if_missing=False,
         )
 
     direct_chain_logical_owner = _path_c_direct_chain_logical_owner_for_model(model)
@@ -4407,12 +4615,6 @@ def _path_c_monolithic_recurrent_backward_runtime_blocker(
         or execution_stage != DESCRIPTOR_EXECUTION_STAGE_ALL
     ):
         return None
-    row_chunk_count = _path_c_int_prim_attr(
-        prim_func,
-        "_cppmega_path_c_row_chunk_count",
-    )
-    if row_chunk_count is None or row_chunk_count <= 1:
-        return None
     ops = tuple(
         str(op)
         for op in (getattr(prim_func, "_cppmega_path_c_brick_ops", ()) or ())
@@ -4445,12 +4647,15 @@ def _path_c_monolithic_recurrent_backward_runtime_blocker(
         "kind": "monolithic_grid_chunks_recurrent_backward_scalar_replay",
         "reason": (
             "monolithic grid-chunk recurrent backward scalarizes exact replay "
-            "inside each generated row chunk; production runtime must use "
-            "descriptor launcher-chunk stages instead"
+            "inside one all-stage generated TileLang call; production runtime "
+            "must use descriptor launcher-chunk stages instead"
         ),
         "row_dispatch_mode": row_dispatch_mode,
         "execution_stage": execution_stage,
-        "row_chunk_count": row_chunk_count,
+        "row_chunk_count": _path_c_int_prim_attr(
+            prim_func,
+            "_cppmega_path_c_row_chunk_count",
+        ),
         "sequence_length": sequence_length,
         "recurrent_backward_ops": list(dict.fromkeys(recurrent_backward_ops)),
     }
@@ -5345,6 +5550,7 @@ def install_path_c_fused_train_block_runtime_for_model(
     """
 
     profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
+    explicit_caller_banks = bank_owner is not None or bank_buffers is not None
     if bank_owner is not None and bank_buffers is not None:
         return {
             "status": "blocked",
@@ -5394,14 +5600,19 @@ def install_path_c_fused_train_block_runtime_for_model(
         if fused_artifact is not None
         else getattr(model, "path_c_fused_train_block_artifact", None)
     )
-    resolved_bank_owner = (
-        bank_owner
-        if bank_owner is not None
-        else _path_c_physical_abi_bank_owner_for_model(
+    if bank_owner is not None:
+        resolved_bank_owner = bank_owner
+    elif bank_buffers is not None:
+        resolved_bank_owner = None
+    else:
+        # When we are about to compile/select the artifact, do not allocate
+        # model banks from the generic schedule first: single launcher chunks
+        # can require larger top-level scratch than the per-stage ABI template.
+        resolved_bank_owner = _path_c_physical_abi_bank_owner_for_model(
             model,
             sequence_length=sequence_length,
+            allocate_if_missing=not (compile_artifact and resolved_artifact is None),
         )
-    )
     resolved_bank_buffers = bank_buffers
     resolved_bank_buffer_owner = bank_buffer_owner
     if resolved_bank_owner is None and bank_buffers is not None:
@@ -5442,49 +5653,108 @@ def install_path_c_fused_train_block_runtime_for_model(
 
     artifact_compile_payload: dict[str, Any] | None = None
     if resolved_artifact is None and compile_artifact:
-        if resolved_bank_owner is None:
-            artifact_compile_payload = {
-                "status": "skipped_physical_abi_banks_missing",
-                "reason": (
-                    "fused train-block artifact compilation is deferred until "
-                    "caller/model-owned physical ABI banks are available; the "
-                    "installer will not allocate or pack banks implicitly"
+        artifact_compile_payload = (
+            compile_path_c_fused_train_block_artifact_for_model(
+                model=model,
+                sequence_length=sequence_length,
+                target_name=artifact_target_name,
+                execution_backend=artifact_execution_backend,
+                lowerer=artifact_lowerer,
+            )
+        )
+        if artifact_compile_payload.get("status") != "ok":
+            return {
+                "status": "blocked",
+                "reason": artifact_compile_payload.get("reason"),
+                "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+                "route_region": getattr(selected_region, "name", None),
+                "runtime_uses_fused_train_block": False,
+                "hidden_packing_performed": bool(
+                    artifact_compile_payload.get(
+                        "hidden_packing_performed",
+                        False,
+                    )
                 ),
-                "native_compile_ok": False,
-                "hidden_packing_performed": False,
-                "artifact": None,
+                "artifact_compile": (
+                    _path_c_fused_train_block_artifact_compile_report(
+                        artifact_compile_payload
+                    )
+                ),
+                "execution": None,
             }
-        else:
-            artifact_compile_payload = (
-                compile_path_c_fused_train_block_artifact_for_model(
-                    model=model,
-                    sequence_length=sequence_length,
-                    target_name=artifact_target_name,
-                    execution_backend=artifact_execution_backend,
-                    lowerer=artifact_lowerer,
+        resolved_artifact = artifact_compile_payload.get("artifact")
+
+    artifact_kernel_buffer_binding: dict[str, Any] | None = None
+    if resolved_artifact is not None:
+        artifact_kernel_buffer_binding = (
+            _path_c_artifact_bank_owner_kernel_buffer_binding(
+                artifact=resolved_artifact,
+                bank_owner=resolved_bank_owner,
+            )
+        )
+    if (
+        resolved_artifact is not None
+        and artifact_kernel_buffer_binding is not None
+        and artifact_kernel_buffer_binding.get("status") != "ok"
+        and not explicit_caller_banks
+    ):
+        try:
+            resolved_bank_owner = _path_c_physical_abi_bank_owner_for_artifact(
+                artifact=resolved_artifact,
+                owner_name=f"{profile_name}.path_c_physical_abi_banks",
+            )
+            artifact_kernel_buffer_binding = (
+                _path_c_artifact_bank_owner_kernel_buffer_binding(
+                    artifact=resolved_artifact,
+                    bank_owner=resolved_bank_owner,
                 )
             )
-            if artifact_compile_payload.get("status") != "ok":
-                return {
-                    "status": "blocked",
-                    "reason": artifact_compile_payload.get("reason"),
-                    "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
-                    "route_region": getattr(selected_region, "name", None),
-                    "runtime_uses_fused_train_block": False,
-                    "hidden_packing_performed": bool(
-                        artifact_compile_payload.get(
-                            "hidden_packing_performed",
-                            False,
-                        )
+            if artifact_compile_payload is not None:
+                artifact_compile_payload = {
+                    **artifact_compile_payload,
+                    "artifact_physical_abi_bank_owner_allocated": (
+                        resolved_bank_owner is not None
                     ),
-                    "artifact_compile": (
-                        _path_c_fused_train_block_artifact_compile_report(
-                            artifact_compile_payload
-                        )
+                    "artifact_physical_abi_bank_owner": getattr(
+                        resolved_bank_owner,
+                        "owner_name",
+                        None,
                     ),
-                    "execution": None,
+                    "artifact_kernel_buffer_binding": (
+                        artifact_kernel_buffer_binding
+                    ),
                 }
-            resolved_artifact = artifact_compile_payload.get("artifact")
+        except Exception as exc:
+            return {
+                "status": "blocked",
+                "reason": f"artifact physical ABI bank allocation failed: {exc}",
+                "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+                "route_region": getattr(selected_region, "name", None),
+                "runtime_uses_fused_train_block": False,
+                "hidden_packing_performed": False,
+                "artifact_compile": _path_c_fused_train_block_artifact_compile_report(
+                    artifact_compile_payload
+                ),
+                "execution": None,
+            }
+    if (
+        resolved_artifact is not None
+        and artifact_kernel_buffer_binding is not None
+        and artifact_kernel_buffer_binding.get("status") != "ok"
+    ):
+        return {
+            "status": "blocked",
+            "reason": artifact_kernel_buffer_binding.get("reason"),
+            "runtime_owner": f"{profile_name}.path_c_fused_train_block_runtime",
+            "route_region": getattr(selected_region, "name", None),
+            "runtime_uses_fused_train_block": False,
+            "hidden_packing_performed": False,
+            "artifact_compile": _path_c_fused_train_block_artifact_compile_report(
+                artifact_compile_payload
+            ),
+            "artifact_kernel_buffer_binding": artifact_kernel_buffer_binding,
+            "execution": None,
+        }
 
     runtime_binding = path_c_fusion_runtime_training_binding_payload(
         region=scheduled.region,
@@ -5504,6 +5774,7 @@ def install_path_c_fused_train_block_runtime_for_model(
             "binding_status": runtime_binding.get("status"),
             "runtime_uses_fused_train_block": False,
             "runtime_binding": runtime_binding,
+            "artifact_kernel_buffer_binding": artifact_kernel_buffer_binding,
             "hidden_packing_performed": bool(
                 runtime_binding.get("hidden_packing_performed", False)
             ),
@@ -5566,6 +5837,7 @@ def install_path_c_fused_train_block_runtime_for_model(
             "binding_status": runtime_binding.get("status"),
             "runtime_uses_fused_train_block": True,
             "runtime_binding": runtime_binding,
+            "artifact_kernel_buffer_binding": artifact_kernel_buffer_binding,
             "training_runtime_available": False,
             "training_runtime_contract": training_runtime_contract,
             "hidden_packing_performed": bool(
@@ -5594,6 +5866,7 @@ def install_path_c_fused_train_block_runtime_for_model(
         "binding_status": runtime_binding.get("status"),
         "runtime_uses_fused_train_block": True,
         "runtime_binding": runtime_binding,
+        "artifact_kernel_buffer_binding": artifact_kernel_buffer_binding,
         "training_runtime_available": bool(
             training_runtime_contract.get("training_runtime_available")
         ),
@@ -6085,11 +6358,14 @@ class PathCDirectFusionChainTrainingRuntime:
             parameter_grads = {}
         if not isinstance(parameter_grads, Mapping):
             raise TypeError("loss cotangent bridge parameter_grads must be a Mapping")
-        bridge_parameter_gradient_names = {str(name) for name in parameter_grads}
+        bridge_parameter_gradient_names = {
+            _path_c_strip_gradient_suffix(str(name)) for name in parameter_grads
+        }
         direct_parameter_gradient_names = [
             str(name)
             for name in bridge_plan["parameter_gradient_tree_names"]
-            if str(name) not in bridge_parameter_gradient_names
+            if _path_c_strip_gradient_suffix(str(name))
+            not in bridge_parameter_gradient_names
         ]
         direct_grads = path_c_model_gradient_tree_from_direct_buffers(
             model=model,
@@ -6128,18 +6404,55 @@ class PathCDirectFusionChainTrainingRuntime:
                 raise ValueError(
                     "full-model Path C gradients require direct-chain hidden_grad"
                 )
-            raw_hidden_cotangent = mx.zeros_like(hidden_cotangent)
+            direct_gradient_names = {
+                _path_c_strip_gradient_suffix(str(name))
+                for name in direct_parameter_gradient_names
+            }
+            start_layer_index = _path_c_direct_chain_start_layer_index(
+                model,
+                self.chain,
+            )
+            boundary_norm_name = (
+                f"layers.{start_layer_index}.norm.weight"
+                if start_layer_index is not None
+                else None
+            )
+            direct_chain_owns_entry_rmsnorm_bwd = (
+                boundary_norm_name is not None
+                and boundary_norm_name in direct_gradient_names
+            )
+            raw_hidden_cotangent = (
+                hidden_cotangent
+                if direct_chain_owns_entry_rmsnorm_bwd
+                else mx.zeros_like(hidden_cotangent)
+            )
+            normed_hidden_cotangent = (
+                None
+                if direct_chain_owns_entry_rmsnorm_bwd
+                else hidden_cotangent
+            )
             prefix_grads = path_c_prefix_gradient_tree_from_hidden_cotangent(
                 model=model,
                 batch=batch,
                 hidden_cotangent=raw_hidden_cotangent,
-                normed_hidden_cotangent=hidden_cotangent,
+                normed_hidden_cotangent=normed_hidden_cotangent,
                 chain=self.chain,
+            )
+            direct_model_grads = _path_c_model_gradient_tree_strip_grad_suffixes(
+                direct_grads
+            )
+            bridge_model_grads = _path_c_model_gradient_tree_from_parameter_grads(
+                parameter_grads
+            )
+            covered_gradient_names = (
+                _path_c_model_gradient_tree_array_names(prefix_grads)
+                | _path_c_model_gradient_tree_array_names(direct_model_grads)
+                | _path_c_model_gradient_tree_array_names(bridge_model_grads)
             )
             grads = _path_c_merge_model_gradient_trees(
                 prefix_grads,
-                _path_c_model_gradient_tree_strip_grad_suffixes(direct_grads),
-                _path_c_model_gradient_tree_from_parameter_grads(parameter_grads),
+                direct_model_grads,
+                bridge_model_grads,
                 _path_c_zero_gradient_tree_for_parameters(
                     model,
                     frozenset(
@@ -6148,6 +6461,7 @@ class PathCDirectFusionChainTrainingRuntime:
                             "inactive_zero_gradient_parameter_names",
                             (),
                         )
+                        if str(name) not in covered_gradient_names
                     ),
                 ),
             )
@@ -8947,14 +9261,16 @@ def path_c_fusion_payload(
     force_runtime_blocked = mode is PathCFusionMode.FORCE and not runtime_fused_route_bound
     scaffold_blocked = not schedule_spec.production_fragments_complete
     status = (
-        "off"
-        if mode is PathCFusionMode.OFF
-        else "force_blocked_schedule_unverified"
+        "force_blocked_schedule_unverified"
         if force_blocked
         else "force_blocked_runtime_not_bound"
         if force_runtime_blocked
         else "plan_scaffold_not_default"
         if scaffold_blocked
+        else "runtime_bound_not_default"
+        if runtime_fused_route_bound
+        else "off"
+        if mode is PathCFusionMode.OFF
         else "plan_ready_not_default"
     )
     if scaffold_blocked:
