@@ -87,6 +87,12 @@ class _CompileRecorder:
         return object()
 
 
+@dataclass
+class _FakeArray:
+    shape: tuple[int, ...]
+    dtype: str
+
+
 def _count_named_buffer_loads(prim_func, names: set[str]) -> int:
     from tvm.tir import stmt_functor
 
@@ -191,6 +197,159 @@ def test_runtime_adapter_specializes_scale_and_static_t():
     assert result.available is True
     assert recorder.called is True
     assert prim.specialized == {"scale": 0.125, "T": 64}
+
+
+def test_kda_intra_static_launch_canonicalizes_diagonal_loop_bounds():
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        canonicalize_kda_intra_token_static_launch,
+    )
+
+    pid0 = tir.Var("pid0_1", "int32")
+    loop_var = tir.Var("i_112", "int32")
+    start = (
+        tir.Div(pid0, tir.IntImm("int32", 32)) * tir.IntImm("int32", 32)
+        + tir.Div(
+            tir.Mod(pid0, tir.IntImm("int32", 32)),
+            tir.IntImm("int32", 16),
+        )
+        * tir.IntImm("int32", 16)
+    )
+    extent = (
+        tir.Min(
+            pid0 + tir.IntImm("int32", 1),
+            tir.Min(
+                tir.IntImm("int32", 64),
+                start + tir.IntImm("int32", 16),
+            ),
+        )
+        - start
+    )
+    loop = tir.For(
+        loop_var,
+        start,
+        extent,
+        tir.ForKind.SERIAL,
+        tir.Evaluate(loop_var),
+    )
+    iter_var = tir.IterVar(
+        (tir.IntImm("int32", 0), tir.IntImm("int32", 64)),
+        pid0,
+        tir.IterVar.ThreadIndex,
+        "blockIdx.x",
+    )
+    prim = tir.PrimFunc(
+        params=[],
+        body=tir.AttrStmt(
+            iter_var,
+            "thread_extent",
+            tir.IntImm("int32", 64),
+            loop,
+        ),
+    )
+
+    text = str(canonicalize_kda_intra_token_static_launch(prim))
+
+    assert "T.min" not in text
+    assert "T.Div(pid0_1, 16) * 16" in text
+    assert "T.truncmod(pid0_1, 16) + 1" in text
+
+
+def test_kda_intra_static_launch_canonicalizes_zero_offset_diagonal_bounds():
+    pytest.importorskip("tvm")
+    from tvm import tir
+
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        canonicalize_kda_intra_token_static_launch,
+    )
+
+    pid0 = tir.Var("pid0_1", "int32")
+    loop_var = tir.Var("i_112", "int32")
+    zero_offset = tir.IntImm("int32", 0) * tir.IntImm("int32", 32)
+    start = zero_offset + tir.Div(pid0, tir.IntImm("int32", 16)) * tir.IntImm(
+        "int32", 16
+    )
+    extent = (
+        tir.Min(
+            pid0 + tir.IntImm("int32", 1),
+            tir.Min(
+                tir.IntImm("int32", 32),
+                start + tir.IntImm("int32", 16),
+            ),
+        )
+        - start
+    )
+    loop = tir.For(
+        loop_var,
+        start,
+        extent,
+        tir.ForKind.SERIAL,
+        tir.Evaluate(loop_var),
+    )
+    iter_var = tir.IterVar(
+        (tir.IntImm("int32", 0), tir.IntImm("int32", 32)),
+        pid0,
+        tir.IterVar.ThreadIndex,
+        "blockIdx.x",
+    )
+    prim = tir.PrimFunc(
+        params=[],
+        body=tir.AttrStmt(
+            iter_var,
+            "thread_extent",
+            tir.IntImm("int32", 32),
+            loop,
+        ),
+    )
+
+    text = str(canonicalize_kda_intra_token_static_launch(prim))
+
+    assert "T.min" not in text
+    assert "T.Mul(0, 32)" not in text
+    assert "T.Div(pid0_1, 16) * 16" in text
+    assert "T.truncmod(pid0_1, 16) + 1" in text
+
+
+def test_bind_returned_outputs_accepts_owner_alias_wrappers():
+    from cppmega_v4._tilelang.path_d_runtime_adapter import _bind_returned_outputs
+
+    expected = _FakeArray((64, 32), "float16")
+    alias = _FakeArray((64, 32), "float16")
+
+    assert _bind_returned_outputs("stage", [alias], (expected,)) == (alias,)
+
+
+def test_bind_returned_outputs_rejects_incompatible_alias_wrappers():
+    from cppmega_v4._tilelang.path_d_runtime_adapter import (
+        PathDRuntimeUnavailable,
+        _bind_returned_outputs,
+    )
+
+    expected = _FakeArray((64, 32), "float16")
+    alias = _FakeArray((64, 16), "float16")
+
+    with pytest.raises(PathDRuntimeUnavailable, match="incompatible owner-output"):
+        _bind_returned_outputs("stage", [alias], (expected,))
+
+
+def test_topology_arg_aliases_preserve_semantic_constants():
+    from cppmega_v4._tilelang.path_d_runtime_adapter import _with_topology_arg_aliases
+
+    constants = {"cu_seqlens": (0, 16, 64), "chunk_offsets": (0, 1, 3)}
+
+    out = _with_topology_arg_aliases(
+        constants,
+        {"cu_seqlens": "arg9", "chunk_offsets": "arg10"},
+    )
+
+    assert out == {
+        "cu_seqlens": (0, 16, 64),
+        "chunk_offsets": (0, 1, 3),
+        "arg9": (0, 16, 64),
+        "arg10": (0, 1, 3),
+    }
 
 
 def test_kda_topology_policy_promotes_only_repeated_varlen_layout():

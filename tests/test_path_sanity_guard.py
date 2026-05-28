@@ -8,8 +8,7 @@ from scripts import path_sanity_guard
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH_B_BLOCKER = (
-    "m2rnn: Path B kernel unavailable "
-    "(direct-MSL Path B is retired; use m2rnn_path_c.py for native TileLang/TVM-FFI)"
+    "m2rnn: Path B kernel unavailable (MSL dispatch unavailable)"
 )
 DEPRECATION_WARNING = (
     "mx.metal.set_memory_limit is deprecated and will be removed in a future version. "
@@ -130,6 +129,39 @@ def test_matrix_guard_rejects_path_c_comparison_without_path_b_baseline(
     findings = path_sanity_guard.check_matrix_report(report, repo_root=tmp_path)
 
     assert any(f.code == "path_c_without_runnable_path_b_baseline" for f in findings)
+
+
+def test_contract_guard_rejects_retired_m2rnn_path_b_surface(tmp_path: Path) -> None:
+    module = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "m2rnn.py"
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        '"""Retired direct-MSL compatibility surface for M2RNN."""\n'
+        '_RETIRED_REASON = "direct-MSL Path B is retired"\n',
+        encoding="utf-8",
+    )
+
+    findings = path_sanity_guard._check_m04_path_b_m2rnn_direct_msl(tmp_path)
+
+    assert any(f.code == "m04_path_b_m2rnn_direct_msl_retired" for f in findings)
+
+
+def test_contract_guard_rejects_mamba3_atomic_owner_bwd_surface(tmp_path: Path) -> None:
+    module = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "mamba3.py"
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        "_FWD_KERNEL_SOURCE = ''\n"
+        "_BWD_KERNEL_SOURCE = '&dB[bc_idx + n] cppmega_atomic_add_float'\n"
+        "@mx.custom_function\n"
+        "def mamba3_mimo_apply():\n"
+        "    pass\n"
+        "mamba3_mimo_apply.vjp\n"
+        "init_value=0\n",
+        encoding="utf-8",
+    )
+
+    findings = path_sanity_guard._check_m04_path_b_mamba3_fast_bwd(tmp_path)
+
+    assert any(f.code == "m04_path_b_mamba3_atomic_owner_bwd" for f in findings)
 
 
 def test_matrix_guard_rejects_fused_path_c_claim_without_stepper_runtime(

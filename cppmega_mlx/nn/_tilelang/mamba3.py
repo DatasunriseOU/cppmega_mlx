@@ -2,11 +2,28 @@
 
 .. todo:: wave-6: port to TileLang DSL.
 
-   The direct-MSL source has no safe inverse transform into TileLang DSL. The
-   production native route must be regenerated from a TileLang PrimFunc and
-   launched with ``execution_backend="tvm_ffi"``; until that rewrite lands this
-   module is only a legacy direct-MSL fallback. Its backward path writes final
-   owner gradients with atomic adds instead of exposing P-axis partial buffers.
+   Both ``_FWD_KERNEL_SOURCE`` and ``_BWD_KERNEL_SOURCE`` are sequential
+   selective-scan kernels with **per-thread cumulative state** (``float
+   h_state[STATE]`` for fwd, ``float dh[STATE]`` plus a persistent
+   ``h_steps_scratch[tid][t][n]`` slab and reverse iteration for bwd). They do
+   not fit the canonical TileLang DSL idiom (tile-parallel ``T.Parallel`` /
+   ``T.Pipelined`` over a static iteration space) without a non-trivial
+   rewrite that introduces ``T.serial(reverse=True)`` over ``t`` and treats
+   the per-thread carry as a ``T.alloc_fragment`` of static shape.
+
+   The MSL-extraction adapter
+   (:func:`cppmega_mlx.nn._tilelang._msl_extraction.extract_msl_from_engine_artifact`,
+   commit ``00d6d90``) is in tree and the prerequisite ``return_msl=True``
+   kwarg on ``dispatch_lower`` works for the simpler tile-parallel kernels
+   (``topk_selector`` already flipped). Porting these scan kernels remains a
+   wave-6 line item: write ``mamba3_mimo_fwd_prim`` /
+   ``mamba3_mimo_bwd_prim`` ``@T.prim_func`` factories, route through
+   ``dispatch_lower(prim, "metal", return_msl=True)``, then feed the
+   extracted MSL string into the existing ``_msl_transform.make_metal_kernel``
+   call site so the 12 mlx + 2 cppmega call sites stay numerically identical.
+
+   Until then this module stays on its hand-written MSL source to preserve
+   numerical parity. See ``MIGRATION_PLAN.md`` and the wave-6 tracker.
 
 This module implements the Mamba3 MIMO selective-scan kernel in vendor MSL,
 without depending on TileLang's TVM-Metal lowering. The forward kernel is the
@@ -130,42 +147,15 @@ _FWD_KERNEL_SOURCE = """
 _FWD_KERNEL_HEADER = """
     #include <metal_stdlib>
     using namespace metal;
-
-    inline void cppmega_atomic_add_float(device float* ptr, float value) {
-        device atomic_uint* atomic_ptr = reinterpret_cast<device atomic_uint*>(ptr);
-        uint old_bits = atomic_load_explicit(atomic_ptr, memory_order_relaxed);
-        while (true) {
-            float old_value = as_type<float>(old_bits);
-            uint new_bits = as_type<uint>(old_value + value);
-            uint expected = old_bits;
-            if (atomic_compare_exchange_weak_explicit(
-                    atomic_ptr,
-                    &expected,
-                    new_bits,
-                    memory_order_relaxed,
-                    memory_order_relaxed)) {
-                break;
-            }
-            old_bits = expected;
-        }
-    }
 """
 
 
-# V7-N04 status (wave-6 DSL port — deferred-by-design):
-#   The Mamba3 MIMO forward is a sequential time-loop scan with per-thread
-#   `float h_state[STATE]` cumulative state. TileLang's `T.Parallel` idiom
-#   targets tile-parallel kernels; a time-serial reduction inside a tile
-#   does not map cleanly onto it. We considered three lowerings:
-#     (a) `T.serial(T)` plus per-thread fragment for h_state — TileLang
-#         loop nest fragment allocator does not currently expose a
-#         per-thread persistent buffer scope.
-#     (b) `T.atomic_add` to a global h_state and reset between batches —
-#         atomics blow the SIMDgroup occupancy on Apple Metal.
-#     (c) raw MSL through `make_metal_kernel(source=...)` — kept (below),
-#         is what ships today, and matches the Path A/B contract.
-#   Option (c) is the working path; the DSL port stays open as a wave-6+
-#   item but is not blocking. See cppmega-mlx-N04 (deferred).
+# TODO(wave-6): port to TileLang DSL. Sequential time-loop scan with
+# per-thread ``float h_state[STATE]`` cumulative state does not fit the
+# tile-parallel ``T.Parallel`` idiom cleanly. Once a ``mamba3_mimo_fwd_prim``
+# ``@T.prim_func`` exists, route through
+# ``dispatch_lower(prim, "metal", return_msl=True)`` and feed the extracted
+# MSL into ``make_metal_kernel(source=...)`` to keep the runtime contract.
 _FWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_fwd",
     input_names=["x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],
@@ -192,16 +182,16 @@ _BWD_KERNEL_SOURCE = """
     // Outputs:
     //   dx     [B, T, H, P]
     //   dz     [B, T, H, P]
-    //   dB     [B, T, H, N]
-    //   dC     [B, T, H, N]
-    //   dA     [B, T, H]
-    //   ddt    [B, T, H]
-    //   dD     [H]
+    //   dB_partial [B, T, H, P, N]  -- caller sums over P
+    //   dC_partial [B, T, H, P, N]  -- caller sums over P
+    //   dA_partial [B, T, H, P]     -- caller sums over P
+    //   ddt_partial[B, T, H, P]     -- caller sums over P
+    //   dD_partial [B, H, P]        -- caller sums over (B, P)
     //   dh0        [B, H, P, N]
     //
     // One thread per (b, h, p) lane. The (b, h, p) decomposition keeps each
-    // lane fully owning a single P slice. P-axis contributions are accumulated
-    // into final owner outputs with fp32 atomics.
+    // lane fully owning a single P slice, so per-lane partial outputs do not
+    // need atomics. The caller reduces partials into final shapes.
 
     uint tid = thread_position_in_grid.x;
     uint total_lanes = uint(BATCH) * uint(HEADS) * uint(HEADDIM);
@@ -287,9 +277,12 @@ _BWD_KERNEL_SOURCE = """
             dh[n] += d_y_skipped * float(C_proj[bc_idx + n]);
         }
 
+        // Stride for the (B, T, H, P, N) partial buffers.
+        uint partial_n_base = ((b * uint(SEQ) + t) * uint(HEADS) * uint(HEADDIM)
+                              + h * uint(HEADDIM) + p) * uint(STATE);
         for (uint n = 0; n < uint(STATE); ++n) {
-            cppmega_atomic_add_float(&dC[bc_idx + n], d_y_skipped * float(h_steps_scratch[scratch_t + n]));
-            cppmega_atomic_add_float(&dB[bc_idx + n], dh[n] * x_val);
+            dC_partial[partial_n_base + n] = T_OUT(d_y_skipped * float(h_steps_scratch[scratch_t + n]));
+            dB_partial[partial_n_base + n] = T_OUT(dh[n] * x_val);
         }
 
         // dx contribution.
@@ -314,8 +307,9 @@ _BWD_KERNEL_SOURCE = """
             }
         }
         float d_logdecay = d_decay * decay;
-        cppmega_atomic_add_float(&dA[adt_idx], d_logdecay * dt_val);
-        cppmega_atomic_add_float(&ddt[adt_idx], d_logdecay * A_val);
+        uint adt_partial_idx = ((b * uint(SEQ) + t) * uint(HEADS) + h) * uint(HEADDIM) + p;
+        dA_partial[adt_partial_idx] = T_OUT(d_logdecay * dt_val);
+        ddt_partial[adt_partial_idx] = T_OUT(d_logdecay * A_val);
 
         // Propagate dh through decay.
         for (uint n = 0; n < uint(STATE); ++n) {
@@ -328,29 +322,28 @@ _BWD_KERNEL_SOURCE = """
     for (uint n = 0; n < uint(STATE); ++n) {
         dh0[h_base + n] = T_OUT(dh[n]);
     }
-    cppmega_atomic_add_float(&dD[h], dD_acc);
+    uint dD_idx = ((b) * uint(HEADS) + h) * uint(HEADDIM) + p;
+    dD_partial[dD_idx] = T_OUT(dD_acc);
 """
 
 
-# V7-N04 status (wave-6 backward DSL port — deferred-by-design):
-#   Reverse-time scan that pairs a per-thread `float dh[STATE]`
-#   accumulator with a persistent `h_steps_scratch[tid][t][n]` slab.
-#   `T.serial(reverse=True)` exists but lowering the P-axis owner-output
-#   atomics through native TVM-FFI still requires a fragment-scope
-#   buffer alias that TileLang 0.1.x does not expose. Raw MSL (kept
-#   below) implements the same math correctly and ships in production.
-#   DSL port tracked as cppmega-mlx-N04 (deferred).
+# TODO(wave-6): port to TileLang DSL. Reverse-time scan with both per-thread
+# ``float dh[STATE]`` accumulator and a persistent ``h_steps_scratch[tid][t][n]``
+# slab; needs ``T.serial(reverse=True)`` over ``t`` plus careful fragment
+# layout to keep the per-lane partial outputs (dB_partial, dC_partial,
+# dA_partial, ddt_partial) atomics-free. Same flip pattern as the fwd above
+# once the prim_func exists.
 _BWD_KERNEL = _msl_transform.make_metal_kernel(
     name="cppmega_mamba3_mimo_bwd",
     input_names=["dy", "x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0"],
     output_names=[
         "dx",
         "dz",
-        "dB",
-        "dC",
-        "dA",
-        "ddt",
-        "dD",
+        "dB_partial",
+        "dC_partial",
+        "dA_partial",
+        "ddt_partial",
+        "dD_partial",
         "dh0",
         "h_steps_scratch",
     ],
@@ -551,25 +544,15 @@ def _mamba3_mimo_bwd_metal_kernel(
     output_shapes = [
         (batch, seq, heads, headdim),                  # dx
         (batch, seq, heads, headdim),                  # dz
-        (batch, seq, heads, state),                    # dB
-        (batch, seq, heads, state),                    # dC
-        (batch, seq, heads),                           # dA
-        (batch, seq, heads),                           # ddt
-        (heads,),                                      # dD
+        (batch, seq, heads, headdim, state),           # dB_partial
+        (batch, seq, heads, headdim, state),           # dC_partial
+        (batch, seq, heads, headdim),                  # dA_partial
+        (batch, seq, heads, headdim),                  # ddt_partial
+        (batch, heads, headdim),                       # dD_partial
         (batch, heads, headdim, state),                # dh0
         (batch * heads * headdim, seq, state),         # h_steps_scratch
     ]
-    output_dtypes = [
-        cast_dtype,
-        cast_dtype,
-        mx.float32,
-        mx.float32,
-        mx.float32,
-        mx.float32,
-        mx.float32,
-        cast_dtype,
-        cast_dtype,
-    ]
+    output_dtypes = [cast_dtype] * len(output_shapes)
     try:
         outputs = _msl_transform.dispatch(
             cast(_msl_transform.MetalKernel, _BWD_KERNEL),
@@ -579,11 +562,16 @@ def _mamba3_mimo_bwd_metal_kernel(
             grid=(total_lanes, 1, 1),
             threadgroup=(threads, 1, 1),
             template=template,
-            init_value=0,
         )
     except Exception:
         return None
-    dx_, dz_, dB, dC, dA, ddt, dD, dh0_, _h_scratch = outputs
+    dx_, dz_, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_, _h_scratch = outputs
+    # Reduce P-dimension partials.
+    dB = mx.sum(dB_partial, axis=3)         # -> (B, T, H, N)
+    dC = mx.sum(dC_partial, axis=3)         # -> (B, T, H, N)
+    dA = mx.sum(dA_partial, axis=3)         # -> (B, T, H)
+    ddt = mx.sum(ddt_partial, axis=3)       # -> (B, T, H)
+    dD = mx.sum(dD_partial, axis=(0, 2))    # -> (H,)
     return (
         dx_.astype(x.dtype),
         dB.astype(B.dtype),

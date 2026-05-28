@@ -440,6 +440,7 @@ def test_fp8_path_policies_set_explicit_runtime_routes(tmp_path: Path) -> None:
         {
             "CPPMEGA_KERNEL_PATH__SPARSE_MLA": None,
             "CPPMEGA_SPARSE_MLA_FP8_ROUTE": None,
+            "CPPMEGA_SPARSE_MLA_FP8_BWD": None,
             "CPPMEGA_MAMBA3_PATH_C_BWD": None,
         }
     ):
@@ -449,14 +450,59 @@ def test_fp8_path_policies_set_explicit_runtime_routes(tmp_path: Path) -> None:
         ):
             assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_c"
             assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_c"
+            assert os.environ["CPPMEGA_SPARSE_MLA_FP8_BWD"] == "path_c"
             assert os.environ["CPPMEGA_MAMBA3_PATH_C_BWD"] == "path_b"
         assert "CPPMEGA_SPARSE_MLA_FP8_ROUTE" not in os.environ
+        assert "CPPMEGA_SPARSE_MLA_FP8_BWD" not in os.environ
         assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
 
         with m04_train_step.fp8_path_b_kernel_policy(path_b_args):
             assert os.environ["CPPMEGA_KERNEL_PATH__SPARSE_MLA"] == "path_b"
             assert os.environ["CPPMEGA_SPARSE_MLA_FP8_ROUTE"] == "path_b"
             assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
+
+
+def test_fp8_path_c_direct_chain_capture_is_opt_in(tmp_path: Path) -> None:
+    base_args = m04_train_step.build_parser().parse_args(
+        ["--synthetic", "--dtype", "fp8_path_c", "--output", str(tmp_path / "base.json")]
+    )
+    runtime_args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--use-path-c-direct-chain-runtime",
+            "--output",
+            str(tmp_path / "runtime.json"),
+        ]
+    )
+    profile_args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--profile-path-c-direct-chain-runtime",
+            "--output",
+            str(tmp_path / "profile.json"),
+        ]
+    )
+
+    assert not m04_train_step.path_c_direct_chain_capture_requested(
+        base_args,
+        compile_enabled=False,
+    )
+    assert m04_train_step.path_c_direct_chain_capture_requested(
+        runtime_args,
+        compile_enabled=False,
+    )
+    assert m04_train_step.path_c_direct_chain_capture_requested(
+        profile_args,
+        compile_enabled=False,
+    )
+    assert not m04_train_step.path_c_direct_chain_capture_requested(
+        runtime_args,
+        compile_enabled=True,
+    )
 
 
 def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(tmp_path: Path) -> None:
@@ -1546,6 +1592,12 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     assert (
         surfaces["sparse_mla_fp8_path_c_apply"]["backward_surface"]
         == "native_tvm_ffi_graph_output_scatter"
+    )
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["fallback_backward_surface"] == (
+        "prepared_fp8_path_b_reference_vjp"
+    )
+    assert surfaces["sparse_mla_fp8_path_c_apply"]["default_backward_route"] == (
+        "path_c"
     )
     assert (
         "FP8 parameter/weight producers that create the required dtype/layout "
@@ -3948,15 +4000,15 @@ def test_fp8_path_c_training_route_reports_model_owned_physical_bank_plan(
     )
 
     binding = route["path_c_fusion"]["runtime_training_binding"]
-    # HybridTinyLM now provides ``make_path_c_physical_abi_bank_owner`` so
-    # the production auto-install path resolves the banks before the route
-    # payload is computed; the runtime training binding reports ``ok``.
-    assert binding["status"] == "ok", binding
-    assert binding["runtime_uses_fused_train_block"] is True
-    assert binding["physical_abi_binding_ready"] is True
-    assert binding["fused_artifact_bound"] is True
-    assert binding["missing_bank_buffers"] == []
-    assert binding["provided_bank_buffers"] == binding["required_bank_buffers"]
+    assert binding["status"] == (
+        m04_train_step.FP8_PATH_C_FUSED_TRAIN_BLOCK_BANKS_MISSING_STATUS
+    )
+    assert binding["runtime_uses_fused_train_block"] is False
+    assert binding["physical_abi_binding_ready"] is False
+    assert binding["fused_artifact_bound"] is False
+    assert binding["missing_bank_buffers"] == binding["required_bank_buffers"]
+    assert binding["provided_bank_buffers"] == []
+    assert not hasattr(model, "path_c_physical_abi_bank_owner")
     bank_plan = binding["model_owned_physical_abi_bank_plan"]
     assert bank_plan["status"] == "model_owned_physical_abi_banks_required"
     assert bank_plan["owner_attribute"] == "path_c_physical_abi_bank_owner"

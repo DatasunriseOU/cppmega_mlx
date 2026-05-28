@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import os
-
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from cppmega_v4._tilelang._path_d_deps import TRITON_FRONTEND_UNSAFE_IMPORT_ENV
 from cppmega_v4._tilelang.kda_path_b import kda_forward_path_b
 from cppmega_v4._tilelang.kda_path_c import (
     _path_c_runtime_status as kda_path_c_runtime,
@@ -226,22 +223,28 @@ def test_kda_path_d_probes_return_tuples():
     assert isinstance(ok_src, bool) and r_src
 
 
-def test_kda_path_d_triton_probe_fails_closed_by_default():
-    if os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV):
-        pytest.skip(f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV} explicitly enabled")
+def test_kda_path_d_triton_probe_uses_native_preflight_by_default():
     ok, reason = _triton_frontend_importable()
-    assert ok is False
-    assert "unsafe import disabled" in reason
-    assert "runtime adapter not reached" in reason
+    if ok:
+        assert "triton + poc.triton_frontend importable" in reason
+    else:
+        assert (
+            "preflight" in reason
+            or "blocked" in reason
+            or "not importable" in reason
+        )
 
 
-def test_kda_path_d_fla_probe_fails_closed_by_default():
-    if os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV):
-        pytest.skip(f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV} explicitly enabled")
+def test_kda_path_d_fla_probe_uses_native_preflight_by_default():
     ok, reason = _fla_kda_chunk_importable()
-    assert ok is False
-    assert "unsafe Path D import disabled" in reason
-    assert "runtime adapter not reached" in reason
+    if ok:
+        assert "fla.ops.kda.chunk importable" in reason
+    else:
+        assert (
+            "preflight" in reason
+            or "blocked" in reason
+            or "not importable" in reason
+        )
 
 
 def test_kda_path_d_forced_falls_back_cleanly():

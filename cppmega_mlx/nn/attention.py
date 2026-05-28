@@ -743,6 +743,10 @@ class CausalSelfAttention(nn.Module):
         )
         q_fp8, q_scale = _to_fp8_with_per_token_scale(q)
         kv_fp8, kv_scale = _to_fp8_with_per_token_scale(kv)
+        q_fp8 = mx.stop_gradient(q_fp8)
+        q_scale = mx.stop_gradient(q_scale)
+        kv_fp8 = mx.stop_gradient(kv_fp8)
+        kv_scale = mx.stop_gradient(kv_scale)
         if kv_cache is not None:
             if layer_idx is None:
                 raise ValueError("layer_idx is required when kv_cache is provided")
@@ -777,6 +781,7 @@ class CausalSelfAttention(nn.Module):
                 topk=effective_topk,
                 key_length=key_length if key_length is not None else seq,
             )
+        indices = mx.stop_gradient(indices)
         full_window_owner_buffers = (
             kv_cache is None
             and rope_offset == 0

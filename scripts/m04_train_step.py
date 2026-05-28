@@ -267,9 +267,11 @@ FP8_PATH_B_KERNEL_POLICY_ENV = {
     "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
 }
 SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
+SPARSE_MLA_FP8_BWD_ENV = "CPPMEGA_SPARSE_MLA_FP8_BWD"
 MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
 FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {
     SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
+    SPARSE_MLA_FP8_BWD_ENV: "path_c",
     MAMBA3_PATH_C_BWD_ENV: "path_b",
 }
 FP8_PATH_B_RUNTIME_ENV: dict[str, str] = {SPARSE_MLA_FP8_ROUTE_ENV: "path_b"}
@@ -487,6 +489,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable HybridTinyLM block checkpointing for the M0.4 smoke receipt.",
     )
     parser.add_argument(
+        "--cce-chunk-rows",
+        type=int,
+        default=TrainHybridTinyConfig.cce_chunk_rows,
+        help=(
+            "Rows per chunk for the MLX cut-cross-entropy loss. The value is "
+            "recorded in receipts because it is a performance/memory knob."
+        ),
+    )
+    parser.add_argument(
         "--synthetic",
         action="store_true",
         help="Use an explicit temporary NPZ with repeated tiny samples instead of --data-path.",
@@ -633,6 +644,7 @@ def config_from_args(
         mamba_groups=args.mamba_groups,
         mamba_chunk_size=args.mamba_chunk_size,
         grad_checkpoint=args.grad_checkpoint,
+        cce_chunk_rows=args.cce_chunk_rows,
         token_key=args.token_key,
         memory_limit_total_bytes=args.memory_limit_total_bytes,
         memory_limit_wired_ratio=args.memory_limit_wired_ratio,
@@ -732,6 +744,23 @@ def path_c_training_route_requested(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> bool:
     return fp8_path_c_route_requested(args) or path_c_kernel_policy_requested()
+
+
+def path_c_direct_chain_capture_requested(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+    *,
+    compile_enabled: bool,
+) -> bool:
+    """Return whether direct-chain activation/gradient evidence must be retained."""
+
+    return (
+        fp8_path_c_route_requested(args)
+        and not compile_enabled
+        and (
+            bool(getattr(args, "use_path_c_direct_chain_runtime", False))
+            or bool(getattr(args, "profile_path_c_direct_chain_runtime", False))
+        )
+    )
 
 
 def path_c_kernel_policy_requested() -> bool:
@@ -2752,6 +2781,17 @@ def fp8_path_c_training_route_payload(
                 "producer_required": True,
                 "producer_status": producer["status"],
                 "backward_surface": "native_tvm_ffi_graph_output_scatter",
+                "fallback_backward_surface": "prepared_fp8_path_b_reference_vjp",
+                "default_backward_route": "path_c",
+                "default_backward_reason": (
+                    "native Sparse-MLA Path C backward uses graph outputs for "
+                    "the no-owner VJP path; caller-owned buffers remain explicit "
+                    "for fused runtimes"
+                ),
+                "kernel_policy_env": {
+                    SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
+                    SPARSE_MLA_FP8_BWD_ENV: "path_c",
+                },
             },
             {
                 "name": "mamba3_mimo_path_c",
@@ -2902,10 +2942,14 @@ def _path_c_physical_abi_bank_owner_for_model(
     model: Any,
     *,
     sequence_length: int | None,
+    allocate_if_missing: bool = True,
 ) -> Any | None:
     bank_owner = getattr(model, "path_c_physical_abi_bank_owner", None)
     if bank_owner is not None:
         return bank_owner
+
+    if not allocate_if_missing:
+        return None
 
     make_bank_owner = getattr(model, "make_path_c_physical_abi_bank_owner", None)
     if callable(make_bank_owner):
@@ -2975,6 +3019,7 @@ def fp8_path_c_training_route_payload_for_model(
     model_bank_owner = _path_c_physical_abi_bank_owner_for_model(
         model,
         sequence_length=sequence_length,
+        allocate_if_missing=auto_install_fused_train_block,
     )
     model_fused_artifact = getattr(model, "path_c_fused_train_block_artifact", None)
     model_fused_training_runtime = getattr(
@@ -9286,6 +9331,10 @@ def run_local_gb10_quarter_training(
         device = device_info()
         compile_plan = compile_payload(config, device)
         loss_eval_chunks = not bool(compile_plan["enabled"])
+        direct_chain_capture_requested = path_c_direct_chain_capture_requested(
+            config,
+            compile_enabled=bool(compile_plan["enabled"]),
+        )
         if fp8_path_c_route_requested(config):
             # MLX 0.32 rejects explicit evals inside value_and_grad once the
             # FP8 Path C graph uses custom TileLang-backed nodes. Keep chunking
@@ -9301,7 +9350,7 @@ def run_local_gb10_quarter_training(
         direct_chain_activation_capture: PathCActivationBufferCapture | None = None
         direct_chain_gradient_capture: PathCGradientBufferCapture | None = None
         route_backend = route_backend_payload(model)
-        if fp8_path_c_route_requested(config) and not bool(compile_plan["enabled"]):
+        if direct_chain_capture_requested:
             (
                 direct_chain_activation_capture,
                 direct_chain_gradient_capture,
@@ -9471,13 +9520,16 @@ def run_local_gb10_quarter_training(
                     "training_critical_path": False,
                 }
 
+        split_grad_update_eval = bool(
+            direct_chain_capture_requested or path_c_training_runtime is not None
+        )
         stepper = CompiledPretrainingStep(
             model,
             optimizer,
             state={"step": 0, "trained_tokens": 0},
             loss_fn=loss_fn,
             compile=bool(compile_plan["enabled"]),
-            split_grad_update_eval=fp8_path_c_route_requested(config),
+            split_grad_update_eval=split_grad_update_eval,
             path_c_gradient_probe=direct_chain_gradient_capture,
             path_c_training_runtime=path_c_training_runtime,
         )
@@ -9698,10 +9750,10 @@ def run_local_gb10_quarter_training(
             "compile_enabled": compile_plan["enabled"],
             "compile_plan": compile_plan,
             "loss_eval_chunks": loss_eval_chunks,
-            "split_grad_update_eval": fp8_path_c_route_requested(config),
+            "split_grad_update_eval": split_grad_update_eval,
             "split_grad_update_eval_reason": (
                 FP8_PATH_C_SPLIT_GRAD_UPDATE_EVAL_REASON
-                if fp8_path_c_route_requested(config)
+                if split_grad_update_eval
                 else None
             ),
             "dtype": config.dtype,

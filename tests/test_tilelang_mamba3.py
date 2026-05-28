@@ -197,27 +197,27 @@ def test_status_is_available_or_explains_why() -> None:
     assert isinstance(status.reason, str) and status.reason
 
 
-def test_legacy_mamba3_blocker_points_to_native_tvm_ffi_route() -> None:
+def test_mamba3_path_b_documents_tilelang_port_boundary() -> None:
     mod = importlib.import_module("cppmega_mlx.nn._tilelang.mamba3")
     assert mod.__doc__ is not None
-    assert "no safe inverse transform" in mod.__doc__
-    assert 'execution_backend="tvm_ffi"' in mod.__doc__
-    assert "legacy direct-MSL fallback" in mod.__doc__
+    assert "sequential selective-scan kernels" in mod.__doc__
+    assert "return_msl=True" in mod.__doc__
+    assert "hand-written MSL source" in mod.__doc__
 
 
-def test_legacy_mamba3_bwd_source_uses_final_owner_outputs() -> None:
+def test_mamba3_bwd_source_keeps_fast_partial_reduce_path_b_surface() -> None:
     mod = importlib.import_module("cppmega_mlx.nn._tilelang.mamba3")
     source = inspect.getsource(mod)
 
-    assert "&dB[bc_idx + n]" in mod._BWD_KERNEL_SOURCE
-    assert '"dB_partial"' not in mod._BWD_KERNEL_SOURCE
-    assert "dB_partial" not in mod._BWD_KERNEL_SOURCE
-    assert "dC_partial" not in mod._BWD_KERNEL_SOURCE
-    assert "dA_partial" not in mod._BWD_KERNEL_SOURCE
-    assert "ddt_partial" not in mod._BWD_KERNEL_SOURCE
-    assert "dD_partial" not in mod._BWD_KERNEL_SOURCE
-    assert "cppmega_atomic_add_float" in source
-    assert "init_value=0" in source
+    assert "dB_partial" in mod._BWD_KERNEL_SOURCE
+    assert "dC_partial" in mod._BWD_KERNEL_SOURCE
+    assert "dA_partial" in mod._BWD_KERNEL_SOURCE
+    assert "ddt_partial" in mod._BWD_KERNEL_SOURCE
+    assert "dD_partial" in mod._BWD_KERNEL_SOURCE
+    assert "mx.sum(dB_partial, axis=3)" in source
+    assert "mx.sum(dD_partial, axis=(0, 2))" in source
+    assert "cppmega_atomic_add_float" not in source
+    assert "init_value=0" not in source
     assert "atomic_outputs=True" not in source
 
 

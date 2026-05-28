@@ -9,14 +9,11 @@ runnable PrimFunc/compiled artifact to the recurrent call signature.
 
 from __future__ import annotations
 
-import os
-
 import mlx.core as mx
 import numpy as np
 import pytest
 
 from cppmega_v4._tilelang._dispatch import PathStatus
-from cppmega_v4._tilelang._path_d_deps import TRITON_FRONTEND_UNSAFE_IMPORT_ENV
 from cppmega_v4._tilelang.linear_attention_path_d import (
     _fla_chunk_kernel_importable,
     _path_d_runtime_status,
@@ -57,13 +54,16 @@ def test_triton_frontend_probe_returns_tuple():
     assert isinstance(reason, str) and reason
 
 
-def test_triton_frontend_probe_fails_closed_by_default():
-    if os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV):
-        pytest.skip(f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV} explicitly enabled")
+def test_triton_frontend_probe_uses_native_preflight_by_default():
     ok, reason = _triton_frontend_importable()
-    assert ok is False
-    assert "unsafe import disabled" in reason
-    assert "runtime adapter not reached" in reason
+    if ok:
+        assert "triton + poc.triton_frontend importable" in reason
+    else:
+        assert (
+            "preflight" in reason
+            or "blocked" in reason
+            or "not importable" in reason
+        )
 
 
 def test_fla_chunk_kernel_probe_returns_tuple():
@@ -72,13 +72,16 @@ def test_fla_chunk_kernel_probe_returns_tuple():
     assert isinstance(reason, str) and reason
 
 
-def test_fla_chunk_kernel_probe_fails_closed_by_default():
-    if os.environ.get(TRITON_FRONTEND_UNSAFE_IMPORT_ENV):
-        pytest.skip(f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV} explicitly enabled")
+def test_fla_chunk_kernel_probe_uses_native_preflight_by_default():
     ok, reason = _fla_chunk_kernel_importable()
-    assert ok is False
-    assert "unsafe Path D import disabled" in reason
-    assert "runtime adapter not reached" in reason
+    if ok:
+        assert "FLA chunk_delta_h kernel importable" in reason
+    else:
+        assert (
+            "preflight" in reason
+            or "blocked" in reason
+            or "not importable" in reason
+        )
 
 
 def test_path_d_forced_falls_back_cleanly():

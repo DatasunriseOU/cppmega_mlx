@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from collections.abc import Callable, Mapping
+import os
 from typing import Any, cast
 
 import mlx.core as mx
@@ -47,6 +48,7 @@ from cppmega_mlx.nn._tilelang._msl_transform import (
 
 
 TILELANG_METAL_FP8_SPARSE_MLA_TARGET = "metal"
+SPARSE_MLA_FP8_BWD_ENV = "CPPMEGA_SPARSE_MLA_FP8_BWD"
 
 # TileLang resolves these globals while decorating nested @T.prim_func kernels.
 # Defaults keep pyright aligned with the runtime-specialized values.
@@ -2541,16 +2543,7 @@ def _clear_fp8_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
         expected=(flat,),
         op_name="direct tvm-ffi FP8 Sparse-MLA backward dKV clear",
     )
-    mx.eval(cleared_flat)
-    mx.synchronize()
     return cleared_flat.reshape(shape)
-
-
-def _empty_fp8_bwd_output(shape: tuple[int, ...]) -> mx.array:
-    empty = getattr(mx, "empty", None)
-    if empty is None:
-        return mx.zeros(shape, dtype=mx.float32)
-    return cast(mx.array, empty(shape, dtype=mx.float32))
 
 
 def _dispatch_fp8_bwd_owner_output_path_c(
@@ -2582,46 +2575,30 @@ def _dispatch_fp8_bwd_owner_output_path_c(
     dq_shape = (batch, seq_len, heads, K)
     dkv_shape = (batch, seq_len_kv, kv_group, K)
     index_dtype = _index_dtype_name(indices, op_name="FP8 Sparse-MLA Path C backward")
+    dkv_needs_clear = True
+    graph_output_route = False
     if dq_buffer is None and dkv_buffer is None:
-        return _dispatch_fp8_bwd_owner_output_path_c(
-            q_fp8=q_fp8,
-            q_scale=q_scale,
-            kv_fp8=kv_fp8,
-            kv_scale=kv_scale,
-            d_out=d_out,
-            indices=indices,
-            sm_scale_buf=sm_scale_buf,
-            batch=batch,
-            seq_len=seq_len,
-            heads=heads,
-            seq_len_kv=seq_len_kv,
-            kv_group=kv_group,
-            head_kv=head_kv,
-            topk=topk,
-            K=K,
-            d_v=d_v,
-            threads=threads,
-            d_out_dtype=d_out_dtype,
-            dq_buffer=_empty_fp8_bwd_output(dq_shape),
-            dkv_buffer=_empty_fp8_bwd_output(dkv_shape),
-            force_path_c=force_path_c,
-        )
-    if (dq_buffer is None) != (dkv_buffer is None):
+        graph_output_route = True
+        dq_owner = None
+        dkv_owner = None
+        dkv_needs_clear = False
+    elif (dq_buffer is None) != (dkv_buffer is None):
         raise SparseMLAFp8PathCDirectError(
             "sparse_mla_fp8_bwd_path_c owner-output route requires both "
             "dq_buffer and dkv_buffer"
         )
-    try:
-        dq_owner, dkv_owner = _validate_fp8_bwd_owner_outputs(
-            dq_buffer,
-            dkv_buffer,
-            dq_shape=dq_shape,
-            dkv_shape=dkv_shape,
-        )
-    except SparseMLAFp8PathCDirectError as exc:
-        if force_path_c:
-            raise RuntimeError(str(exc)) from exc
-        return None
+    else:
+        try:
+            dq_owner, dkv_owner = _validate_fp8_bwd_owner_outputs(
+                dq_buffer,
+                dkv_buffer,
+                dq_shape=dq_shape,
+                dkv_shape=dkv_shape,
+            )
+        except SparseMLAFp8PathCDirectError as exc:
+            if force_path_c:
+                raise RuntimeError(str(exc)) from exc
+            return None
     try:
         kernel = _fp8_bwd_tvm_ffi_kernel_for(
             batch,
@@ -2637,19 +2614,33 @@ def _dispatch_fp8_bwd_owner_output_path_c(
             d_out_dtype,
             index_dtype,
         )
-        dkv_owner = _clear_fp8_bwd_dkv_buffer(dkv_owner)
-        dq_flat = _flat_1d_view(dq_owner)
-        dkv_flat = _flat_1d_view(dkv_owner)
-        returned = kernel(
-            _flat_1d_view(q_fp8),
-            _flat_1d_view(q_scale),
-            _flat_1d_view(kv_fp8),
-            _flat_1d_view(kv_scale),
-            _flat_1d_view(d_out),
-            _flat_1d_view(indices),
-            sm_scale_buf,
-            out=(dq_flat, dkv_flat),
-        )
+        if graph_output_route:
+            dq_flat = None
+            dkv_flat = None
+            returned = kernel(
+                _flat_1d_view(q_fp8),
+                _flat_1d_view(q_scale),
+                _flat_1d_view(kv_fp8),
+                _flat_1d_view(kv_scale),
+                _flat_1d_view(d_out),
+                _flat_1d_view(indices),
+                sm_scale_buf,
+            )
+        else:
+            if dkv_needs_clear:
+                dkv_owner = _clear_fp8_bwd_dkv_buffer(cast(mx.array, dkv_owner))
+            dq_flat = _flat_1d_view(cast(mx.array, dq_owner))
+            dkv_flat = _flat_1d_view(cast(mx.array, dkv_owner))
+            returned = kernel(
+                _flat_1d_view(q_fp8),
+                _flat_1d_view(q_scale),
+                _flat_1d_view(kv_fp8),
+                _flat_1d_view(kv_scale),
+                _flat_1d_view(d_out),
+                _flat_1d_view(indices),
+                sm_scale_buf,
+                out=(dq_flat, dkv_flat),
+            )
     except Exception as exc:
         if force_path_c:
             raise RuntimeError(
@@ -2657,13 +2648,20 @@ def _dispatch_fp8_bwd_owner_output_path_c(
                 f"dispatch failed: {type(exc).__name__}: {exc}"
             ) from exc
         return None
-    dq_flat, dkv_flat = _owner_output_graph_tuple(
-        returned,
-        expected=(dq_flat, dkv_flat),
-        op_name="direct tvm-ffi FP8 Sparse-MLA backward",
-    )
-    mx.eval(dq_flat, dkv_flat)
-    mx.synchronize()
+    if graph_output_route:
+        if not isinstance(returned, (list, tuple)) or len(returned) != 2:
+            raise SparseMLAFp8PathCDirectError(
+                "direct tvm-ffi FP8 Sparse-MLA backward graph-output route "
+                "did not return dq/dkv"
+            )
+        dq_flat = cast(mx.array, returned[0])
+        dkv_flat = cast(mx.array, returned[1])
+    else:
+        dq_flat, dkv_flat = _owner_output_graph_tuple(
+            returned,
+            expected=(cast(mx.array, dq_flat), cast(mx.array, dkv_flat)),
+            op_name="direct tvm-ffi FP8 Sparse-MLA backward",
+        )
     return dq_flat.reshape(dq_shape), dkv_flat.reshape(dkv_shape)
 
 
@@ -3283,7 +3281,6 @@ def _prepared_fp8_bwd_ste(
 ) -> tuple[mx.array, mx.array] | None:
     """Run the Path C FP8 sparse-MLA backward over per-token prepared buffers."""
 
-    mx.eval(q_fp8, q_scale, kv_fp8, kv_scale, d_out, indices)
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
         q_scale,
@@ -3298,8 +3295,81 @@ def _prepared_fp8_bwd_ste(
     )
     if result is None:
         return None
+    q_dtype = q.dtype
+    kv_dtype = kv.dtype
     del q, kv
-    return result
+    dq, dkv = result
+    if dq.dtype != q_dtype:
+        dq = dq.astype(q_dtype)
+    if dkv.dtype != kv_dtype:
+        dkv = dkv.astype(kv_dtype)
+    return dq, dkv
+
+
+def _prepared_fp8_reference_bwd_ste(
+    q: mx.array,
+    kv: mx.array,
+    q_fp8: mx.array,
+    q_scale: mx.array,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+    d_out: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float,
+    d_v: int | None,
+) -> tuple[mx.array, mx.array]:
+    """Memory-safe Path B backward over the same prepared FP8 values."""
+
+    from cppmega_mlx.nn.sparse_mla import sparse_mla_attention_reference
+
+    q_ref = (
+        mx.from_fp8(q_fp8, dtype=mx.float32) * q_scale.astype(mx.float32)[..., None]
+    ).astype(q.dtype)
+    kv_ref = (
+        mx.from_fp8(kv_fp8, dtype=mx.float32) * kv_scale.astype(mx.float32)[..., None]
+    ).astype(kv.dtype)
+
+    def _ref_apply(q_in: mx.array, kv_in: mx.array) -> mx.array:
+        out = sparse_mla_attention_reference(
+            q_in,
+            kv_in,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            return_lse=False,
+        )
+        if isinstance(out, tuple):
+            return out[0]
+        return out
+
+    _, vjps = mx.vjp(_ref_apply, (q_ref, kv_ref), (d_out,))
+    dq = vjps[0]
+    dkv = vjps[1]
+    if dq.dtype != q.dtype:
+        dq = dq.astype(q.dtype)
+    if dkv.dtype != kv.dtype:
+        dkv = dkv.astype(kv.dtype)
+    return dq, dkv
+
+
+def _prepared_fp8_backward_uses_path_c(
+    *,
+    force_path_c: bool,
+    force_backward_path_c: bool | None,
+) -> bool:
+    if force_backward_path_c is not None:
+        return bool(force_backward_path_c)
+    route = os.environ.get(SPARSE_MLA_FP8_BWD_ENV, "").strip().lower()
+    if route in {"path_c", "c"}:
+        return True
+    if route in {"path_b", "b"}:
+        return False
+    if route:
+        raise ValueError(
+            f"{SPARSE_MLA_FP8_BWD_ENV} must be path_b or path_c; got {route!r}"
+        )
+    return force_path_c
 
 
 def sparse_mla_fp8_path_c_apply_prepared_float(
@@ -3318,6 +3388,7 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
     causal: bool = False,
     output_dtype: mx.Dtype | None = None,
     runtime_buffer_probe: Callable[[Mapping[str, Any]], None] | None = None,
+    force_backward_path_c: bool | None = None,
 ) -> mx.array:
     """Differentiable owner wrapper for prepared-buffer FP8 Path C apply.
 
@@ -3379,20 +3450,37 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
                 "sparse_mla_fp8_path_c_apply_prepared_float: sinks backward is not "
                 "implemented"
             )
-        grads = _prepared_fp8_bwd_ste(
-            q_in,
-            kv_in,
-            q_fp8,
-            q_scale,
-            kv_fp8,
-            kv_scale,
-            cotangent,
-            indices,
-            sm_scale=sm_scale,
-            d_v=d_v,
+        if _prepared_fp8_backward_uses_path_c(
             force_path_c=force_path_c,
-            causal=causal,
-        )
+            force_backward_path_c=force_backward_path_c,
+        ):
+            grads = _prepared_fp8_bwd_ste(
+                q_in,
+                kv_in,
+                q_fp8,
+                q_scale,
+                kv_fp8,
+                kv_scale,
+                cotangent,
+                indices,
+                sm_scale=sm_scale,
+                d_v=d_v,
+                force_path_c=force_path_c,
+                causal=causal,
+            )
+        else:
+            grads = _prepared_fp8_reference_bwd_ste(
+                q_in,
+                kv_in,
+                q_fp8,
+                q_scale,
+                kv_fp8,
+                kv_scale,
+                cotangent,
+                indices,
+                sm_scale=sm_scale,
+                d_v=d_v,
+            )
         if grads is None:
             if force_path_c:
                 raise RuntimeError(

@@ -1,7 +1,7 @@
-"""Tests for the retired M2RNN direct-MSL compatibility surface.
+"""Tests for the M2RNN direct-MSL Path B compatibility surface.
 
 Coverage:
-  - :func:`m2rnn_metal_status` reports the retired fail-closed reason.
+  - :func:`m2rnn_metal_status` reports the direct-MSL dispatch status.
   - Forward parity vs :func:`m2rnn_scan` reference (FP32 atol=1e-4 rtol=1e-3,
     FP16 atol=2e-3 rtol=5e-3).
   - VJP through :func:`m2rnn_apply` matches autograd through the reference.
@@ -70,17 +70,20 @@ def _make_inputs(
 def test_status_is_available_or_explains_why() -> None:
     status = m2rnn_metal_status()
     assert isinstance(status, M2RNNMetalStatus)
-    assert status.available is False
-    assert "direct-MSL Path B is retired" in status.reason
+    if mx.metal.is_available():
+        assert status.available is True
+        assert "MSL dispatch path is available" in status.reason
+    else:
+        assert status.available is False
+        assert status.reason
 
 
-def test_legacy_m2rnn_blocker_points_to_native_tvm_ffi_route() -> None:
+def test_m2rnn_path_b_keeps_direct_msl_surface() -> None:
     mod = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn")
     assert mod.__doc__ is not None
-    assert "Retired direct-MSL compatibility surface" in mod.__doc__
-    assert "m2rnn_path_c.py" in mod.__doc__
-    assert not hasattr(mod, "_FWD_KERNEL_SOURCE")
-    assert not hasattr(mod, "_BWD_KERNEL_SOURCE")
+    assert "Path B port of cppmega's M2RNN recurrent mixer" in mod.__doc__
+    assert hasattr(mod, "_FWD_KERNEL_SOURCE")
+    assert hasattr(mod, "_BWD_KERNEL_SOURCE")
 
 
 # ---------------------------------------------------------------------------
