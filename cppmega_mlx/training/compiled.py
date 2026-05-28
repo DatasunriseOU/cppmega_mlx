@@ -56,6 +56,7 @@ PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS: Mapping[str, int] = {
     "path_c_run_backward": 1,
     "path_c_row_chunk_index": 0,
     "path_c_row_subchunk_index": 0,
+    "path_c_backward_stage_index": 0,
 }
 
 REGIONAL_COMPILE_TARGETS: Mapping[CompileTarget, bool] = {
@@ -148,6 +149,8 @@ class PathCFusedTrainBlockCallableArtifact:
         row_subchunk_count: int | None = None,
         row_subchunk_index_param: str | None = None,
         rows_per_kernel_launch: int | None = None,
+        backward_stage_count: int | None = None,
+        backward_stage_index_param: str | None = None,
     ) -> None:
         if not callable(kernel):
             raise TypeError("fused train-block kernel must be callable")
@@ -200,12 +203,24 @@ class PathCFusedTrainBlockCallableArtifact:
             if rows_per_kernel_launch is not None
             else None
         )
+        self.backward_stage_count = (
+            max(1, int(backward_stage_count))
+            if backward_stage_count is not None
+            else None
+        )
+        self.backward_stage_index_param = (
+            str(backward_stage_index_param) if backward_stage_index_param else None
+        )
         self._cppmega_path_c_backward_gate_param = self.backward_gate_param
         self._cppmega_path_c_row_chunk_count = self.row_chunk_count
         self._cppmega_path_c_row_chunk_index_param = self.row_chunk_index_param
         self._cppmega_path_c_row_subchunk_count = self.row_subchunk_count
         self._cppmega_path_c_row_subchunk_index_param = self.row_subchunk_index_param
         self._cppmega_path_c_rows_per_kernel_launch = self.rows_per_kernel_launch
+        self._cppmega_path_c_backward_stage_count = self.backward_stage_count
+        self._cppmega_path_c_backward_stage_index_param = (
+            self.backward_stage_index_param
+        )
         self._logical_gradient_names = frozenset(
             name for name in self.physical_abi_map if name.endswith("_grad")
         )
@@ -486,6 +501,8 @@ class PathCFusedTrainBlockCallableArtifact:
             "row_subchunk_count": self.row_subchunk_count,
             "row_subchunk_index_param": self.row_subchunk_index_param,
             "rows_per_kernel_launch": self.rows_per_kernel_launch,
+            "backward_stage_count": self.backward_stage_count,
+            "backward_stage_index_param": self.backward_stage_index_param,
         }
 
 

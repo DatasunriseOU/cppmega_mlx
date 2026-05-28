@@ -1,14 +1,14 @@
-bundle: http://127.0.0.1:8765/assets/index-B0DK3qBx.js
+bundle: http://127.0.0.1:8765/assets/index-DoLZxAnf.js
 step 1 action: load preset deepseek_v4_flash
 step 2 action: Auto Align Graph (folded)
   [folded] 9 edges, crossings (interior) = 0
 step 3 action: Unpack All, then Auto Align Graph
   [unpacked] 62 edges, crossings (interior) = 6
-    X  engram_unpacked_r0_1779964444764_2_add -> dsv4_attentio  ×  dsv4_attention_unpacked_r0_1779964444764_3 -> dsv4_atte
-    X  engram_unpacked_r0_1779964444764_2_add -> dsv4_attentio  ×  engram_unpacked_r0_1779964444764_2_add -> dsv4_attentio
-    X  csa_hca_unpacked_r1_1779964444764_1_add -> engram_unpac  ×  engram_unpacked_r1_1779964444764_2 -> engram_unpacked_r
-    X  csa_hca_unpacked_r1_1779964444764_1_add -> engram_unpac  ×  csa_hca_unpacked_r1_1779964444764_1_add -> engram_unpac
-    X  lightning_indexer_unpacked_r2_1779964444764_0_add -> cs  ×  csa_hca_unpacked_r2_1779964444764_1 -> csa_hca_unpacked
-    X  lightning_indexer_unpacked_r2_1779964444764_0_add -> cs  ×  lightning_indexer_unpacked_r2_1779964444764_0_add -> cs
+    X  engram_unpacked_r0_1779964683031_2_add -> dsv4_attentio  ×  dsv4_attention_unpacked_r0_1779964683031_3 -> dsv4_atte
+    X  engram_unpacked_r0_1779964683031_2_add -> dsv4_attentio  ×  engram_unpacked_r0_1779964683031_2_add -> dsv4_attentio
+    X  csa_hca_unpacked_r1_1779964683031_1_add -> engram_unpac  ×  engram_unpacked_r1_1779964683031_2 -> engram_unpacked_r
+    X  csa_hca_unpacked_r1_1779964683031_1_add -> engram_unpac  ×  csa_hca_unpacked_r1_1779964683031_1_add -> engram_unpac
+    X  lightning_indexer_unpacked_r2_1779964683031_0_add -> cs  ×  csa_hca_unpacked_r2_1779964683031_1 -> csa_hca_unpacked
+    X  lightning_indexer_unpacked_r2_1779964683031_0_add -> cs  ×  lightning_indexer_unpacked_r2_1779964683031_0_add -> cs
 RESULT folded   crossings = 0
 RESULT unpacked crossings = 6

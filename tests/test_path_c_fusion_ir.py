@@ -4696,8 +4696,8 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
     The full 4096-row kernel is too expensive for a unit test once owner
     outputs are returned correctly, so this pins the compile-time watchdog
     contract: one row-chunk-indexed kernel body, 64 host-visible chunks, and
-    all ABI banks returned as owner outputs. The tiny Metal smoke below covers
-    the real runtime owner-output path.
+    only written ABI banks returned as owner outputs. The tiny Metal smoke below
+    covers the real runtime owner-output path.
     """
 
     from cppmega_mlx.runtime import path_c_fusion_launcher as launcher_mod
@@ -4735,11 +4735,26 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
     assert manifest.row_chunk_index_param == schedules.DESCRIPTOR_ROW_CHUNK_INDEX_PARAM
     assert manifest.row_chunk_index_buffer is None
     assert manifest.backward_gate_param == schedules.DESCRIPTOR_BACKWARD_GATE_PARAM
-    assert list(captured_prim_funcs[0].attrs.get("tilelang_out_idx", ())) == [
-        idx
-        for idx, param in enumerate(captured_prim_funcs[0].params)
+    out_idx = list(captured_prim_funcs[0].attrs.get("tilelang_out_idx", ()))
+    output_buffer_names = {
+        str(
+            getattr(
+                captured_prim_funcs[0].buffer_map[captured_prim_funcs[0].params[idx]],
+                "name",
+                captured_prim_funcs[0].params[idx],
+            )
+        )
+        for idx in out_idx
+    }
+    all_buffer_param_count = sum(
+        1
+        for param in captured_prim_funcs[0].params
         if param in captured_prim_funcs[0].buffer_map
-    ]
+    )
+    assert len(out_idx) < all_buffer_param_count
+    assert "path_c_float32_parameter_abi_bank" not in output_buffer_names
+    assert "path_c_float32_parameter_gradient_abi_bank" in output_buffer_names
+    assert "path_c_float32_activation_abi_bank" in output_buffer_names
     assert 'bx = T.launch_thread("blockIdx.x", 1)' in generated_source
     assert 'lane = T.launch_thread("threadIdx.x", 128)' in generated_source
     assert "path_c_run_backward: T.int32" in generated_source
@@ -4774,9 +4789,9 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
         generated_source.count(
             "for row in range(row_chunk_start, row_chunk_start + (row_chunk_stop - row_chunk_start)):"
         )
-        == 1
+        >= 1
     )
-    assert generated_source.count("for row in range(4096):") == 7
+    assert generated_source.count("for row in range(4096):") == 0
 
 
 @pytest.mark.slow

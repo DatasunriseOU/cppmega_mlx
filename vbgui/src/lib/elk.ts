@@ -70,14 +70,24 @@ function snakifyExistingRows(
   if (rows.length < 2) return null; // single row, no snake to make
 
   const out = new Map<string, WrapAssignment>();
-  rows.forEach((row, ri) => {
-    const reverse = ri % 2 === 1;
+  // Parity counts only multi-node rows. Singleton rows (a lone rmsnorm or
+  // residual_add between bigger rows) inherit the prior row's direction so
+  // their handle sides line up with the chain instead of flipping in place.
+  let majorIdx = 0;
+  let lastReverse = false;
+  rows.forEach((row) => {
+    if (row.length < 2) {
+      // Singleton row — keep ELK position, follow prior multi-node row's direction.
+      row.forEach((c) => out.set(c.id, { x: c.x, y: c.y, reverse: lastReverse }));
+      return;
+    }
+    const reverse = majorIdx % 2 === 1;
+    majorIdx++;
+    lastReverse = reverse;
     if (!reverse) {
-      // Even rows: keep ELK's positions as-is.
       row.forEach((c) => out.set(c.id, { x: c.x, y: c.y, reverse: false }));
       return;
     }
-    // Odd rows: mirror x within the row's bounding range and flip handles.
     const minX = Math.min(...row.map((c) => c.x));
     const maxR = Math.max(...row.map((c) => c.x + c.w));
     row.forEach((c) => {

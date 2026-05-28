@@ -125,6 +125,8 @@ def build_fused_replay_boundary_custom_function(
     row_chunk_index_param: str | None = None,
     row_subchunk_count: int | None = None,
     row_subchunk_index_param: str | None = None,
+    backward_stage_count: int | None = None,
+    backward_stage_index_param: str | None = None,
     backward_gate_param: str = "path_c_run_backward",
 ) -> FusedReplayBoundaryCallable:
     """Return ``f(hidden_entry, *params) -> boundary outputs``.
@@ -160,6 +162,8 @@ def build_fused_replay_boundary_custom_function(
         max(1, int(row_subchunk_count or 1)) if subchunk_param else 1
     )
     gate_param = str(backward_gate_param or "path_c_run_backward")
+    stage_param = str(backward_stage_index_param or "")
+    stage_count = max(1, int(backward_stage_count or 1)) if stage_param else 1
     backward_sync_outputs = (
         f"{hidden_entry_logical_name}_grad",
         *(
@@ -192,10 +196,21 @@ def build_fused_replay_boundary_custom_function(
             row_chunk_index_param=chunk_param,
             row_subchunk_index_param=subchunk_param,
         ):
-            artifact.forward(
-                bank_owner=bank_owner,
-                kernel_scalar_params=scalar_params,
-            )
+            stage_range = range(stage_count) if run_backward else range(1)
+            for stage_index in stage_range:
+                stage_scalar_params = dict(scalar_params)
+                if run_backward and stage_param:
+                    stage_scalar_params[stage_param] = int(stage_index)
+                try:
+                    artifact.forward(
+                        bank_owner=bank_owner,
+                        kernel_scalar_params=stage_scalar_params,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "fused replay artifact launch failed with "
+                        f"kernel_scalar_params={stage_scalar_params!r}"
+                    ) from exc
         sync_outputs = backward_sync_outputs if run_backward else boundary_outputs
         mx.eval(*_logical_views(abi_map, bank_buffers, sync_outputs))
 

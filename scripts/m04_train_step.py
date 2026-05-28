@@ -3374,6 +3374,26 @@ def _build_path_c_fused_replay_loss_fn_for_model(
                 "_cppmega_path_c_row_subchunk_index_param",
                 None,
             ),
+            backward_stage_count=getattr(
+                artifact,
+                "_cppmega_path_c_backward_stage_count",
+                getattr(artifact, "backward_stage_count", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_backward_stage_count",
+                None,
+            ),
+            backward_stage_index_param=getattr(
+                artifact,
+                "_cppmega_path_c_backward_stage_index_param",
+                getattr(artifact, "backward_stage_index_param", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_backward_stage_index_param",
+                None,
+            ),
             backward_gate_param=getattr(
                 artifact,
                 "_cppmega_path_c_backward_gate_param",
@@ -4402,6 +4422,18 @@ def _path_c_monolithic_recurrent_backward_runtime_blocker(
     )
     if not recurrent_backward_ops:
         return None
+    backward_stage_count = _path_c_int_prim_attr(
+        prim_func,
+        "_cppmega_path_c_backward_stage_count",
+    )
+    backward_stage_index_param = _path_c_str_prim_attr(
+        prim_func,
+        "_cppmega_path_c_backward_stage_index_param",
+    )
+    if backward_stage_count is not None and backward_stage_count > 1 and (
+        backward_stage_index_param
+    ):
+        return None
     shape_env = getattr(prim_func, "_cppmega_path_c_shape_env", None)
     sequence_length = getattr(shape_env, "sequence_length", None)
     try:
@@ -4419,6 +4451,81 @@ def _path_c_monolithic_recurrent_backward_runtime_blocker(
         "row_dispatch_mode": row_dispatch_mode,
         "execution_stage": execution_stage,
         "row_chunk_count": row_chunk_count,
+        "sequence_length": sequence_length,
+        "recurrent_backward_ops": list(dict.fromkeys(recurrent_backward_ops)),
+    }
+
+
+def _path_c_single_launcher_recurrent_backward_runtime_blocker(
+    prim_func: Any | None,
+) -> dict[str, Any] | None:
+    """Return a runtime blocker for all-stage launcher recurrent backward."""
+
+    if prim_func is None:
+        return None
+    row_dispatch_mode = _path_c_str_prim_attr(
+        prim_func,
+        "_cppmega_path_c_row_dispatch_mode",
+    )
+    execution_stage = _path_c_str_prim_attr(
+        prim_func,
+        "_cppmega_path_c_execution_stage",
+    )
+    if (
+        row_dispatch_mode != DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+        or execution_stage != DESCRIPTOR_EXECUTION_STAGE_ALL
+    ):
+        return None
+    ops = tuple(
+        str(op)
+        for op in (getattr(prim_func, "_cppmega_path_c_brick_ops", ()) or ())
+    )
+    recurrent_backward_ops = tuple(
+        op for op in ops if op in _PATH_C_RECURRENT_BACKWARD_OPS
+    )
+    if not recurrent_backward_ops:
+        return None
+    backward_stage_count = _path_c_int_prim_attr(
+        prim_func,
+        "_cppmega_path_c_backward_stage_count",
+    )
+    backward_stage_index_param = _path_c_str_prim_attr(
+        prim_func,
+        "_cppmega_path_c_backward_stage_index_param",
+    )
+    if backward_stage_count is not None and backward_stage_count > 1 and (
+        backward_stage_index_param
+    ):
+        return None
+    shape_env = getattr(prim_func, "_cppmega_path_c_shape_env", None)
+    sequence_length = getattr(shape_env, "sequence_length", None)
+    try:
+        sequence_length = int(sequence_length)
+    except (TypeError, ValueError):
+        sequence_length = None
+    return {
+        "status": "blocked",
+        "kind": "single_launcher_chunks_recurrent_backward_scalar_replay",
+        "reason": (
+            "single all-stage launcher still runs recurrent backward scalar "
+            "replay inside one generated TileLang call; production runtime "
+            "must use descriptor backward stage fragments until the recurrent "
+            "backward fragments are tiled"
+        ),
+        "row_dispatch_mode": row_dispatch_mode,
+        "execution_stage": execution_stage,
+        "row_chunk_count": _path_c_int_prim_attr(
+            prim_func,
+            "_cppmega_path_c_row_chunk_count",
+        ),
+        "row_subchunk_count": _path_c_int_prim_attr(
+            prim_func,
+            "_cppmega_path_c_row_subchunk_count",
+        ),
+        "rows_per_kernel_launch": _path_c_int_prim_attr(
+            prim_func,
+            "_cppmega_path_c_rows_per_kernel_launch",
+        ),
         "sequence_length": sequence_length,
         "recurrent_backward_ops": list(dict.fromkeys(recurrent_backward_ops)),
     }
@@ -4622,7 +4729,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
                     active_node_names=None,
                     stage_suffix="launcher",
                     row_dispatch_mode=DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
-                    rows_per_kernel_launch=DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
+                    rows_per_kernel_launch=1,
                 )
                 single_launcher_prim_func = single_launcher_template(
                     scheduled.region
@@ -4664,6 +4771,11 @@ def compile_path_c_fused_train_block_artifact_for_model(
                 if callable(single_launcher_artifact) and bool(
                     single_launcher_plan_payload.get("single_kernel_fused")
                 ):
+                    single_launcher_runtime_blocker = (
+                        _path_c_single_launcher_recurrent_backward_runtime_blocker(
+                            single_launcher_prim_func
+                        )
+                    )
                     launcher_physical_abi_map, launcher_physical_abi_shapes = (
                         _path_c_merged_physical_abi_for_prim_funcs(
                             (single_launcher_prim_func,)
@@ -4697,6 +4809,32 @@ def compile_path_c_fused_train_block_artifact_for_model(
                             for key, value in launcher_row_launch_attrs.items()
                             if value is not None
                         },
+                        "single_launcher_backward_stage": {
+                            "backward_stage_count": getattr(
+                                single_launcher_prim_func,
+                                "_cppmega_path_c_backward_stage_count",
+                                None,
+                            ),
+                            "backward_stage_index_param": getattr(
+                                single_launcher_prim_func,
+                                "_cppmega_path_c_backward_stage_index_param",
+                                None,
+                            ),
+                            "backward_stage_node_groups": [
+                                list(group)
+                                for group in getattr(
+                                    single_launcher_prim_func,
+                                    "_cppmega_path_c_backward_stage_node_groups",
+                                    (),
+                                )
+                            ],
+                        },
+                        "single_launcher_runtime_blocked": bool(
+                            single_launcher_runtime_blocker
+                        ),
+                        "single_launcher_runtime_blocker": (
+                            single_launcher_runtime_blocker
+                        ),
                         "monolithic_contract_artifact_type": type(
                             single_launcher_artifact
                         ).__name__,
@@ -4705,6 +4843,22 @@ def compile_path_c_fused_train_block_artifact_for_model(
                             "single_launcher_verified"
                         ),
                     }
+                    if single_launcher_runtime_blocker is not None:
+                        monolithic_plan_payload = {
+                            **monolithic_plan_payload,
+                            **plan_payload,
+                            "selected_runtime_artifact": (
+                                "generated_stage_launcher_chunks"
+                            ),
+                            "single_generated_artifact": False,
+                            "generated_stage_artifact": True,
+                            "runtime_schedule_contract_status": (
+                                "single_launcher_runtime_blocked"
+                            ),
+                        }
+                        raise RuntimeError(
+                            single_launcher_runtime_blocker["reason"]
+                        )
                     artifact = PathCFusedTrainBlockCallableArtifact(
                         kernel=single_launcher_artifact,
                         physical_abi_map=launcher_physical_abi_map,
@@ -4742,6 +4896,16 @@ def compile_path_c_fused_train_block_artifact_for_model(
                         rows_per_kernel_launch=launcher_row_launch_attrs[
                             "rows_per_kernel_launch"
                         ],
+                        backward_stage_count=getattr(
+                            single_launcher_prim_func,
+                            "_cppmega_path_c_backward_stage_count",
+                            None,
+                        ),
+                        backward_stage_index_param=getattr(
+                            single_launcher_prim_func,
+                            "_cppmega_path_c_backward_stage_index_param",
+                            None,
+                        ),
                     )
                     return {
                         "status": "ok",
@@ -4774,12 +4938,18 @@ def compile_path_c_fused_train_block_artifact_for_model(
                     "single_launcher_plan": single_launcher_plan_payload,
                 }
             except Exception as exc:
-                monolithic_plan_payload = {
-                    **monolithic_plan_payload,
-                    "single_launcher_compile_verified": False,
-                    "single_launcher_compile_error": str(exc),
-                    "single_launcher_compile_error_type": type(exc).__name__,
-                }
+                if monolithic_plan_payload.get("single_launcher_runtime_blocked"):
+                    monolithic_plan_payload = {
+                        **monolithic_plan_payload,
+                        "single_launcher_rejected_reason": str(exc),
+                    }
+                else:
+                    monolithic_plan_payload = {
+                        **monolithic_plan_payload,
+                        "single_launcher_compile_verified": False,
+                        "single_launcher_compile_error": str(exc),
+                        "single_launcher_compile_error_type": type(exc).__name__,
+                    }
         if (
             monolithic_runtime_blocker is None
             and callable(monolithic_artifact)
@@ -4845,6 +5015,16 @@ def compile_path_c_fused_train_block_artifact_for_model(
                     "_cppmega_path_c_rows_per_kernel_launch",
                     None,
                 ),
+                backward_stage_count=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_backward_stage_count",
+                    None,
+                ),
+                backward_stage_index_param=getattr(
+                    training_abi_prim_func,
+                    "_cppmega_path_c_backward_stage_index_param",
+                    None,
+                ),
             )
             return {
                 "status": "ok",
@@ -4903,14 +5083,18 @@ def compile_path_c_fused_train_block_artifact_for_model(
     monolithic_artifact = (
         compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
     )
-    plan = compiled.plan if isinstance(compiled, CompiledPathCRegion) else compiled
-    plan_payload = _path_c_fused_train_block_plan_payload(plan)
+    plan_payload = {
+        **monolithic_plan_payload,
+        "single_kernel_fused": False,
+    }
     if monolithic_runtime_blocker is not None:
         plan_payload = {
             **plan_payload,
             "monolithic_native_compile_skipped": True,
             "monolithic_runtime_blocked": True,
             "monolithic_runtime_blocker": monolithic_runtime_blocker,
+            "monolithic_grid_runtime_blocked": True,
+            "monolithic_grid_runtime_blocker": monolithic_runtime_blocker,
             "selected_runtime_artifact": "generated_stage_launcher_chunks",
         }
     else:
@@ -4919,6 +5103,8 @@ def compile_path_c_fused_train_block_artifact_for_model(
             "monolithic_native_compile_skipped": False,
             "monolithic_runtime_blocked": False,
             "monolithic_runtime_blocker": None,
+            "monolithic_grid_runtime_blocked": False,
+            "monolithic_grid_runtime_blocker": None,
             "selected_runtime_artifact": "generated_stage_launcher_chunks",
         }
     stage_row_launch_attrs = _path_c_generated_stage_row_launch_attrs(

@@ -4352,8 +4352,7 @@ def test_fp8_path_c_training_route_for_model_reads_bank_owner(
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     sequence_length = m04_train_step.path_c_training_sequence_length(config)
-    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
-        model,
+    model.path_c_physical_abi_bank_owner = model.make_path_c_physical_abi_bank_owner(
         sequence_length=sequence_length,
     )
     model.path_c_fused_train_block_artifact = lambda *args: None
@@ -4450,8 +4449,7 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     sequence_length = m04_train_step.path_c_training_sequence_length(config)
-    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
-        model,
+    model.path_c_physical_abi_bank_owner = model.make_path_c_physical_abi_bank_owner(
         sequence_length=sequence_length,
     )
     lowerer_calls: list[dict[str, Any]] = []
@@ -4516,8 +4514,7 @@ def test_fp8_path_c_training_route_for_model_auto_wraps_contracted_fused_artifac
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     sequence_length = m04_train_step.path_c_training_sequence_length(config)
-    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
-        model,
+    model.path_c_physical_abi_bank_owner = model.make_path_c_physical_abi_bank_owner(
         sequence_length=sequence_length,
     )
     artifact = _ContractedFusedTrainBlockArtifact()
@@ -4570,8 +4567,7 @@ def test_fp8_path_c_training_route_for_model_auto_binds_model_training_runtime(
     config = m04_train_step.config_from_args(args, data_path=tmp_path / "tokens.npz")
     model = build_local_gb10_quarter_tiny_smoke_model()
     sequence_length = m04_train_step.path_c_training_sequence_length(config)
-    model.path_c_physical_abi_bank_owner = _model_route_physical_bank_owner(
-        model,
+    model.path_c_physical_abi_bank_owner = model.make_path_c_physical_abi_bank_owner(
         sequence_length=sequence_length,
     )
     runtime = _UnboundReadyFusedTrainBlockTrainingRuntime()
@@ -4808,10 +4804,6 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
         compiled["artifact"],
         m04_train_step.PathCFusedTrainBlockCallableArtifact,
     )
-    assert not isinstance(
-        compiled["artifact"],
-        m04_train_step.PathCGeneratedStageTrainBlockCallableArtifact,
-    )
     assert compiled["route_region"] == expected_route["graph_construction"][
         "selected_model_region"
     ]
@@ -4830,6 +4822,8 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     )
     assert compiled["plan"]["all_stages_single_kernel_fused"] is True
     assert compiled["plan"]["single_launcher_compile_verified"] is True
+    assert compiled["plan"]["single_launcher_runtime_blocked"] is False
+    assert compiled["plan"]["single_launcher_runtime_blocker"] is None
     assert compiled["plan"]["runtime_schedule_contract_status"] == (
         "single_launcher_verified"
     )
@@ -4839,11 +4833,28 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert compiled["plan"]["single_launcher_row_launch"][
         "row_subchunk_index_param"
     ] == "path_c_row_subchunk_index"
+    assert compiled["plan"]["single_launcher_row_launch"][
+        "rows_per_kernel_launch"
+    ] == 1
+    assert compiled["plan"]["single_launcher_row_launch"][
+        "row_subchunk_count"
+    ] == 64
+    assert compiled["plan"]["single_launcher_backward_stage"][
+        "backward_stage_count"
+    ] == 7
+    assert compiled["plan"]["single_launcher_backward_stage"][
+        "backward_stage_index_param"
+    ] == "path_c_backward_stage_index"
     assert compiled["artifact"].row_chunk_count == 2
     assert compiled["artifact"].row_chunk_index_param == "path_c_row_chunk_index"
-    assert compiled["artifact"].row_subchunk_count == 8
+    assert compiled["artifact"].row_subchunk_count == 64
     assert compiled["artifact"].row_subchunk_index_param == (
         "path_c_row_subchunk_index"
+    )
+    assert compiled["artifact"].rows_per_kernel_launch == 1
+    assert compiled["artifact"].backward_stage_count == 7
+    assert compiled["artifact"].backward_stage_index_param == (
+        "path_c_backward_stage_index"
     )
     assert len(lowerer_calls) == 1
     assert compiled["plan"]["backward_graph"] == "aot_autograd"

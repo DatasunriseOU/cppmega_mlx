@@ -173,6 +173,7 @@ DESCRIPTOR_ROW_CHUNK_INDEX_PARAM = "path_c_row_chunk_index"
 DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM = "path_c_row_subchunk_index"
 DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH = 8
 DESCRIPTOR_BACKWARD_GATE_PARAM = "path_c_run_backward"
+DESCRIPTOR_BACKWARD_STAGE_INDEX_PARAM = "path_c_backward_stage_index"
 DESCRIPTOR_EXECUTION_STAGE_ALL = "all"
 DESCRIPTOR_EXECUTION_STAGE_FORWARD = "forward"
 DESCRIPTOR_EXECUTION_STAGE_BACKWARD = "backward"
@@ -630,6 +631,37 @@ def plan_path_c_descriptor_stage_groups(
         backward_consumed.add(name)
         backward_index += 1
 
+    return tuple(groups)
+
+
+def _path_c_backward_stage_name_groups_for_nodes(
+    nodes: Sequence[Any],
+) -> tuple[tuple[str, ...], ...]:
+    """Return descriptor-planned backward stage names for a node sequence."""
+
+    backward_nodes = tuple(
+        node
+        for node in nodes
+        if _path_c_schedule_node_execution_phase(node) == "backward"
+    )
+    groups: list[tuple[str, ...]] = []
+    consumed: set[str] = set()
+    for op_name in ("sparse_mla_fp8_apply_bwd", "attention_qkv_projection_bwd"):
+        for node in backward_nodes:
+            name = _path_c_descriptor_stage_node_name(node)
+            if (
+                name in consumed
+                or _path_c_descriptor_stage_node_op_name(node) != op_name
+            ):
+                continue
+            groups.append((name,))
+            consumed.add(name)
+    for node in backward_nodes:
+        name = _path_c_descriptor_stage_node_name(node)
+        if name in consumed:
+            continue
+        groups.append((name,))
+        consumed.add(name)
     return tuple(groups)
 
 
@@ -1479,6 +1511,61 @@ cast(
 )
 
 
+def _path_c_fp8_e4m3fn_to_float(T: Any, bits: Any) -> Any:
+    bits_u = T.Cast("uint32", bits)
+    abs_bits = bits_u & T.uint32(0x7F)
+    sign = (bits_u >> T.uint32(7)) & T.uint32(1)
+    exp_bits = (bits_u >> T.uint32(3)) & T.uint32(0xF)
+    mant_bits = bits_u & T.uint32(0x7)
+
+    mant = T.Cast("float32", mant_bits)
+    subnormal = mant * T.float32(1.0 / 512.0)
+    normal = (T.float32(1.0) + mant * T.float32(1.0 / 8.0)) * T.exp2(
+        T.Cast("float32", T.Cast("int32", exp_bits) - T.int32(7))
+    )
+    value = T.if_then_else(exp_bits == T.uint32(0), subnormal, normal)
+    value = T.if_then_else(abs_bits == T.uint32(0x7F), T.float32(0.0), value)
+    return T.if_then_else(sign != T.uint32(0), -value, value)
+
+
+def _path_c_float_to_fp8_e4m3fn_bits(T: Any, value: Any) -> Any:
+    x = T.Cast("float32", value)
+    finite_x = T.if_then_else(T.isfinite(x), x, T.float32(0.0))
+    sign = T.if_then_else(finite_x < T.float32(0.0), T.uint32(0x80), T.uint32(0))
+    ax = T.min(T.abs(finite_x), T.float32(448.0))
+
+    subnormal_mant = T.min(
+        T.Cast("uint32", T.round(ax * T.float32(512.0))),
+        T.uint32(7),
+    )
+
+    normal_ax = T.max(ax, T.float32(1.0 / 64.0))
+    exp_unbiased = T.Cast("int32", T.floor(T.log2(normal_ax)))
+    exp_bits_i = exp_unbiased + T.int32(7)
+    base = T.exp2(T.Cast("float32", exp_unbiased))
+    mant = T.Cast(
+        "uint32",
+        T.round((normal_ax / base - T.float32(1.0)) * T.float32(8.0)),
+    )
+
+    mant_carry = mant >= T.uint32(8)
+    exp_bits_i = exp_bits_i + T.if_then_else(mant_carry, T.int32(1), T.int32(0))
+    exp_bits_i = T.max(T.min(exp_bits_i, T.int32(15)), T.int32(1))
+    mant = T.if_then_else(mant_carry, T.uint32(0), mant)
+    mant = T.if_then_else(
+        exp_bits_i == T.int32(15),
+        T.min(mant, T.uint32(6)),
+        T.min(mant, T.uint32(7)),
+    )
+    normal_bits = (T.Cast("uint32", exp_bits_i) << T.uint32(3)) | mant
+    magnitude = T.if_then_else(
+        ax < T.float32(1.0 / 64.0),
+        subnormal_mant,
+        normal_bits,
+    )
+    return T.Cast("uint8", sign | magnitude)
+
+
 def build_path_c_descriptor_prim_func(
     region: Any,
     brick_descriptors: Sequence[PathCBrickScheduleDescriptor],
@@ -1717,10 +1804,11 @@ def build_path_c_descriptor_prim_func(
     )
 
     import tilelang.language as T
-    from tilelang.tileop.metal_quant import (
-        float_to_fp8_e4m3fn_bits,
-        fp8_e4m3fn_to_float,
+    float_to_fp8_e4m3fn_bits = lambda value: _path_c_float_to_fp8_e4m3fn_bits(
+        T,
+        value,
     )
+    fp8_e4m3fn_to_float = lambda bits: _path_c_fp8_e4m3fn_to_float(T, bits)
 
     filename = f"<path_c_descriptor_schedule:{entry_name}>"
     linecache.cache[filename] = (
@@ -1833,6 +1921,24 @@ def build_path_c_descriptor_prim_func(
             "tl.fusion.backward_gate_param",
             DESCRIPTOR_BACKWARD_GATE_PARAM,
         )
+    backward_stage_name_groups = (
+        _path_c_backward_stage_name_groups_for_nodes(nodes)
+        if (
+            validated_execution_stage == DESCRIPTOR_EXECUTION_STAGE_ALL
+            and validated_loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
+            and validated_row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+            and active_node_name_set is None
+        )
+        else ()
+    )
+    if backward_stage_name_groups:
+        prim_func = prim_func.with_attr(
+            "tl.fusion.backward_stage_index_param",
+            DESCRIPTOR_BACKWARD_STAGE_INDEX_PARAM,
+        ).with_attr(
+            "tl.fusion.backward_stage_count",
+            len(backward_stage_name_groups),
+        )
     compile_pass_configs = _descriptor_tilelang_compile_pass_configs(
         descriptors,
         loop_policy=validated_loop_policy,
@@ -1844,10 +1950,45 @@ def build_path_c_descriptor_prim_func(
         )
     if validated_loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN:
         prim_func = prim_func.with_attr("tl.fusion.disable_tir_simplify", True)
-    owner_output_param_indices = tuple(
-        idx
-        for idx, param in enumerate(prim_func.params)
-        if param in prim_func.buffer_map
+    written_logical_buffers = _append_unique_names(
+        tuple(
+            output_name
+            for node in nodes
+            if (
+                (active_node_name_set is None or node.name in active_node_name_set)
+                and (
+                    validated_execution_stage != DESCRIPTOR_EXECUTION_STAGE_FORWARD
+                    or not node.op_name.endswith("_bwd")
+                )
+                and (
+                    validated_execution_stage != DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+                    or node.op_name.endswith("_bwd")
+                )
+            )
+            for output_name in node.outputs
+        ),
+        (
+            *row_phased_launcher_carry_buffers,
+            *_row_phased_replay_buffers_for_nodes(
+                nodes,
+                shape_env=resolved_shape_env,
+                loop_policy=validated_loop_policy,
+            ),
+            *train_step_computed_output_buffers,
+            *(
+                train_step_suffix_loss_parameter_grad_buffers
+                if train_step_suffix_loss_parameter_grad_abi_payload[
+                    "gradients_computed"
+                ]
+                else ()
+            ),
+        ),
+    )
+    owner_output_param_indices = _descriptor_owner_output_param_indices(
+        prim_func,
+        physical_abi_plan=physical_abi_plan,
+        written_logical_buffers=written_logical_buffers,
+        spilled_shared_scratch=spilled_shared_scratch,
     )
     if owner_output_param_indices:
         prim_func = prim_func.with_attr(
@@ -1912,6 +2053,13 @@ def build_path_c_descriptor_prim_func(
         )
         else None
     )
+    prim_func._cppmega_path_c_backward_stage_index_param = (
+        DESCRIPTOR_BACKWARD_STAGE_INDEX_PARAM if backward_stage_name_groups else None
+    )
+    prim_func._cppmega_path_c_backward_stage_count = (
+        len(backward_stage_name_groups) if backward_stage_name_groups else None
+    )
+    prim_func._cppmega_path_c_backward_stage_node_groups = backward_stage_name_groups
     prim_func._cppmega_path_c_internal_buffer_shapes = internal_buffer_shapes
     prim_func._cppmega_path_c_buffer_abi_shapes = {
         name: shape_by_buffer[name]
@@ -1984,6 +2132,51 @@ def _append_unique_names(
         values.append(name)
         seen.add(name)
     return tuple(values)
+
+
+def _descriptor_owner_output_param_indices(
+    prim_func: Any,
+    *,
+    physical_abi_plan: "_PhysicalAbiPlan",
+    written_logical_buffers: Sequence[str],
+    spilled_shared_scratch: Mapping[str, Mapping[str, Any]],
+) -> tuple[int, ...]:
+    """Return only PrimFunc params whose caller-owned storage is written."""
+
+    output_param_names: set[str] = set()
+    for raw_name in written_logical_buffers:
+        name = str(raw_name)
+        placement = physical_abi_plan.logical_to_physical.get(name)
+        if isinstance(placement, Mapping):
+            bank_name = placement.get("bank")
+            if bank_name:
+                output_param_names.add(str(bank_name))
+            continue
+        if name in physical_abi_plan.physical_buffer_shapes:
+            output_param_names.add(name)
+
+    for info in spilled_shared_scratch.values():
+        if bool(info.get("coalesced_scratch_bank")):
+            bank_name = info.get("bank")
+            if bank_name:
+                output_param_names.add(str(bank_name))
+            continue
+        param_name = info.get("param_name")
+        if param_name:
+            output_param_names.add(str(param_name))
+
+    if not output_param_names:
+        return ()
+    buffer_map = getattr(prim_func, "buffer_map", {}) or {}
+    indices: list[int] = []
+    for idx, param in enumerate(getattr(prim_func, "params", ())):
+        buffer = buffer_map.get(param)
+        if buffer is None:
+            continue
+        name = str(getattr(buffer, "name", None) or getattr(param, "name", param))
+        if name in output_param_names:
+            indices.append(idx)
+    return tuple(indices)
 
 
 def _row_phased_launcher_carry_buffers_for_nodes(
@@ -2267,6 +2460,21 @@ def _descriptor_prim_func_source(
         param_lines.append(
             f"{indent}{DESCRIPTOR_BACKWARD_GATE_PARAM}: T.int32,"
         )
+    backward_stage_selector = bool(
+        has_backward
+        and chunked_by_launcher
+        and loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
+        and active_node_names is None
+    )
+    backward_stage_name_groups = (
+        _path_c_backward_stage_name_groups_for_nodes(nodes)
+        if backward_stage_selector
+        else ()
+    )
+    if backward_stage_selector and backward_stage_name_groups:
+        param_lines.append(
+            f"{indent}{DESCRIPTOR_BACKWARD_STAGE_INDEX_PARAM}: T.int32,"
+        )
     active_internal_buffers = _stage_active_internal_buffers(
         nodes=nodes,
         internal_buffers=internal_buffers,
@@ -2403,6 +2611,8 @@ def _descriptor_prim_func_source(
             rows_per_kernel_launch=rows_per_kernel_launch,
             execution_stage=execution_stage,
             active_node_names=active_node_names,
+            backward_stage_selector=bool(backward_stage_name_groups),
+            row_dispatch_defined=False,
             indent=indent,
         )
     else:
@@ -4453,6 +4663,8 @@ def _append_row_phased_hidden_body(
     rows_per_kernel_launch: int,
     execution_stage: str,
     active_node_names: frozenset[str] | None,
+    backward_stage_selector: bool,
+    row_dispatch_defined: bool,
     indent: str,
 ) -> None:
     if shape_env is None:
@@ -4501,11 +4713,12 @@ def _append_row_phased_hidden_body(
             f"{indent * 2}T.assume({DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} >= 0)",
             f"{indent * 2}T.assume({DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} < {subchunk_count})",
         )
-        body.append(
-            f"{indent * 2}path_c_first_row_launch = T.if_then_else("
-            f"{row_chunk_expr} == 0, T.if_then_else("
-            f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} == 0, 1, 0), 0)"
-        )
+        if not row_dispatch_defined:
+            body.append(
+                f"{indent * 2}path_c_first_row_launch = T.if_then_else("
+                f"{row_chunk_expr} == 0, T.if_then_else("
+                f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} == 0, 1, 0), 0)"
+            )
     fwd_items = tuple(
         (node, descriptor, fragment)
         for node, descriptor, fragment in zip(
@@ -4875,6 +5088,7 @@ def _append_row_phased_hidden_body(
         and not fwd_items
         and chunked_rows
         and not launcher_subchunked_rows
+        and not row_dispatch_defined
     ):
         body.append(f"{indent * 2}# row_dispatch_policy: chunked_rows")
         body.append(
@@ -4890,6 +5104,7 @@ def _append_row_phased_hidden_body(
         and not fwd_items
         and chunked_rows
         and launcher_subchunked_rows
+        and not row_dispatch_defined
     ):
         body.append(f"{indent * 2}# row_dispatch_policy: chunked_rows")
         body.extend(row_chunk_assumptions)
@@ -4932,6 +5147,79 @@ def _append_row_phased_hidden_body(
             indent=indent,
         )
         return
+    if backward_stage_selector and execution_stage == DESCRIPTOR_EXECUTION_STAGE_ALL:
+        stage_name_groups = _path_c_backward_stage_name_groups_for_nodes(
+            tuple(node for node, _descriptor, _fragment in bwd_items)
+        )
+        if stage_name_groups:
+            if chunked_rows and launcher_subchunked_rows and not fwd_items:
+                body.append(f"{indent * 2}# row_dispatch_policy: chunked_rows")
+                body.extend(row_chunk_assumptions)
+                body.append(
+                    f"{indent * 2}logical_row_chunk_start = "
+                    f"{row_chunk_expr} * {max_rows_per_launch}"
+                )
+                body.append(
+                    f"{indent * 2}logical_row_chunk_stop = "
+                    f"T.min(logical_row_chunk_start + "
+                    f"{max_rows_per_launch}, {sequence_length})"
+                )
+                body.append(
+                    f"{indent * 2}subchunk_row_chunk_start = "
+                    f"T.min(logical_row_chunk_start + "
+                    f"{DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM} * "
+                    f"{rows_per_kernel_launch}, "
+                    "logical_row_chunk_stop)"
+                )
+                body.append(
+                    f"{indent * 2}subchunk_row_chunk_stop = "
+                    f"T.min(subchunk_row_chunk_start + "
+                    f"{rows_per_kernel_launch}, "
+                    "logical_row_chunk_stop)"
+                )
+                body.append(
+                    f"{indent * 2}row_chunk_start = subchunk_row_chunk_start"
+                )
+                body.append(f"{indent * 2}row_chunk_stop = subchunk_row_chunk_stop")
+            body.append(f"{indent * 2}if {DESCRIPTOR_BACKWARD_GATE_PARAM} == 1:")
+            for stage_index, stage_names in enumerate(stage_name_groups):
+                stage_lines: list[str] = []
+                _append_row_phased_hidden_body(
+                    stage_lines,
+                    nodes=nodes,
+                    descriptors=descriptors,
+                    fragments=fragments,
+                    dtype_by_buffer=dtype_by_buffer,
+                    access_by_buffer=access_by_buffer,
+                    shape_env=shape_env,
+                    train_step_computed_output_buffers=(
+                        train_step_computed_output_buffers
+                    ),
+                    train_step_loss_source_buffers=train_step_loss_source_buffers,
+                    physical_abi_plan=physical_abi_plan,
+                    train_step_loss_cotangent_buffers=(
+                        train_step_loss_cotangent_buffers
+                    ),
+                    train_step_loss_parameter_grad_buffers=(
+                        train_step_loss_parameter_grad_buffers
+                    ),
+                    max_rows_per_launch=max_rows_per_launch,
+                    row_dispatch_mode=row_dispatch_mode,
+                    rows_per_kernel_launch=rows_per_kernel_launch,
+                    execution_stage=DESCRIPTOR_EXECUTION_STAGE_BACKWARD,
+                    active_node_names=frozenset(stage_names),
+                    backward_stage_selector=False,
+                    row_dispatch_defined=True,
+                    indent=indent,
+                )
+                if not stage_lines:
+                    continue
+                body.append(
+                    f"{indent * 3}if {DESCRIPTOR_BACKWARD_STAGE_INDEX_PARAM} "
+                    f"== {stage_index}:"
+                )
+                body.extend(f"{indent * 2}{line}" for line in stage_lines)
+            return
     bwd_body: list[str] = []
     bwd_once_body: list[str] = []
     _append_train_step_suffix_scalar_outputs(
