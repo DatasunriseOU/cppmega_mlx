@@ -42,6 +42,7 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
         "matrix_measures_current_runtime_route": True,
         "compile_receipt_measures_fused_schedule_compile": True,
         "runtime_uses_fused_train_block": False,
+        "runtime_smoke_uses_fused_train_block": False,
         "production_runtime_smoke_uses_fused_train_block": False,
         "path_c_default_allowed": False,
     }
@@ -390,6 +391,8 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
     assert smoke["status"] == "ok"
     assert smoke["mode"] == "tiny_mra"
     assert smoke["actually_executed"] is True
+    assert smoke["runtime_smoke_uses_fused_train_block"] is True
+    assert payload["reporting_contract"]["runtime_smoke_uses_fused_train_block"] is True
     assert smoke["physical_abi_policy"] == "banked_by_role"
     assert smoke["physical_abi_runtime_binding"]["status"] == "ok"
     assert smoke["physical_abi_runtime_binding"]["ordered_kernel_buffers"] == [
@@ -402,7 +405,7 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         "path_c_float32_activation_gradient_abi_bank",
         "path_c_float32_parameter_gradient_abi_bank",
     ]
-    assert smoke["kernel_parameter_count"] == 12
+    assert smoke["kernel_parameter_count"] == 21
     assert smoke["logical_parameter_count"] > smoke["kernel_parameter_count"]
     assert smoke["total_buffer_bytes"] < smoke["max_buffer_bytes"]
     assert {entry["name"] for entry in smoke["buffer_abi"]} == {
@@ -416,17 +419,31 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         "path_c_float32_parameter_gradient_abi_bank",
         "path_c_float32_scratch_bank",
         "path_c_int32_scratch_bank",
-        "route_1_R_m2rnn_h_state",
+        "runtime_smoke_brick_0_M_mamba3_b_raw",
+        "runtime_smoke_brick_0_M_mamba3_c_raw",
+        "runtime_smoke_brick_0_M_mamba3_b_group",
+        "runtime_smoke_brick_0_M_mamba3_c_group",
+        "runtime_smoke_brick_0_M_mamba3_angle_cumsum",
+        "runtime_smoke_brick_0_M_mamba3_b_inv_rms",
+        "runtime_smoke_brick_0_M_mamba3_c_inv_rms",
+        "runtime_smoke_brick_1_R_m2rnn_h_state",
     }
+    assert smoke["runtime_artifact_kind"] == "single"
+    assert smoke["single_generated_artifact"] is True
+    assert smoke["generated_stage_artifact"] is False
     assert smoke["runtime_kernel_arg_count"] == smoke["kernel_parameter_count"]
     assert smoke["runtime_scalar_args"] == [
-        {"name": "path_c_run_backward", "value": 1}
+        {"name": "path_c_row_chunk_index", "value": 0},
+        {"name": "path_c_row_subchunk_index", "value": 0},
+        {"name": "path_c_run_backward", "value": 1},
     ]
     assert captured["arg_count"] == smoke["kernel_parameter_count"]
-    assert captured["scalar_args"] == [(8, 1)]
+    assert captured["scalar_args"] == [(8, 0), (9, 7), (10, 1)]
     expected_buffer_shapes = [tuple(entry["shape"]) for entry in smoke["buffer_abi"]]
     expected_arg_shapes = [
         *expected_buffer_shapes[:8],
+        (),
+        (),
         (),
         *expected_buffer_shapes[8:],
     ]
@@ -434,7 +451,59 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
     assert captured["kwargs"]["target"] == "metal"
 
 
-def test_runtime_smoke_reports_standalone_fused_artifact_not_training_route(
+def test_compile_receipt_can_execute_tiny_phase_fused_runtime_smoke(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {"lowerer_calls": 0, "artifact_calls": 0}
+
+    def fake_artifact(*args: object) -> list[object]:
+        captured["artifact_calls"] = int(captured["artifact_calls"]) + 1
+        captured["last_arg_count"] = len(args)
+        captured["last_scalar_args"] = [
+            (index, arg)
+            for index, arg in enumerate(args)
+            if not hasattr(arg, "shape")
+        ]
+        return []
+
+    def fake_lowerer(func_or_mod: object, **kwargs: object) -> object:
+        del func_or_mod
+        captured["lowerer_calls"] = int(captured["lowerer_calls"]) + 1
+        captured["kwargs"] = kwargs
+        return fake_artifact
+
+    exit_code, payload = path_c_fusion_compile_receipt.build_compile_receipt(
+        native_compile=False,
+        source_out=tmp_path / "generated.py",
+        runtime_smoke="tiny",
+        runtime_smoke_artifact="phased",
+        runtime_smoke_lowerer=fake_lowerer,
+    )
+
+    smoke = payload["runtime_smoke"]
+    assert exit_code == 0
+    assert smoke["status"] == "ok"
+    assert smoke["runtime_artifact_kind"] == "phased"
+    assert smoke["single_generated_artifact"] is False
+    assert smoke["generated_stage_artifact"] is True
+    assert smoke["generated_phase_artifact"] is True
+    assert captured["lowerer_calls"] == 2
+    assert captured["artifact_calls"] == (
+        smoke["runtime_launch_grid"]["total_forward_launches"]
+        + smoke["runtime_launch_grid"]["total_backward_launches"]
+    )
+    assert smoke["runtime_launch_grid"]["forward_stages_per_launch"] == 1
+    assert smoke["runtime_launch_grid"]["backward_stages_per_launch"] == 1
+    assert [group["reason"] for group in smoke["generated_stage_groups"]] == [
+        "descriptor_fuses_forward_phase_blocks",
+        "descriptor_fuses_backward_phase_blocks",
+    ]
+    assert smoke["kernel_source"]["generated_phase_artifact"] is True
+    assert smoke["kernel_source"]["monolithic_native_compile_skipped"] is True
+    assert captured["kwargs"]["target"] == "metal"
+
+
+def test_runtime_smoke_binds_fused_artifact_to_training_route(
     tmp_path: Path,
 ) -> None:
     def fake_artifact(*_args: object) -> list[object]:
@@ -456,28 +525,28 @@ def test_runtime_smoke_reports_standalone_fused_artifact_not_training_route(
 
     assert exit_code == 0
     assert smoke["status"] == "ok"
-    assert fused_route["status"] == "standalone_only_not_training_route"
-    assert fused_route["install"]["status"] == "blocked"
+    assert smoke["runtime_smoke_uses_fused_train_block"] is True
+    assert fused_route["status"] == "ok"
+    assert fused_route["install"]["status"] == "ok"
     assert fused_route["install"]["runtime_uses_fused_train_block"] is True
-    assert fused_route["install"]["training_runtime_available"] is False
-    assert fused_route["install"]["training_runtime_contract"]["status"] == (
-        "fused_train_block_training_runtime_missing"
-    )
+    assert fused_route["install"]["training_runtime_available"] is True
+    assert fused_route["install"]["training_runtime_contract"]["status"] == "ok"
+    assert fused_route["install"]["training_runtime_contract"][
+        "value_and_grad_contract"
+    ]["gradient_scope"] == "full_model_via_fused_replay_cotangent_bridge"
     assert fused_route["install"]["hidden_packing_performed"] is False
     assert fused_route["route"]["selected_action"] == (
-        "run_path_c_split_training_route"
+        "run_path_c_fused_train_block_route"
     )
     assert (
         fused_route["route"]["single_fused_train_block_standalone_dispatch_available"]
         is True
     )
-    assert fused_route["route"]["single_fused_train_block_runtime_available"] is False
-    assert fused_route["route"]["fused_train_block_training_runtime_available"] is False
+    assert fused_route["route"]["single_fused_train_block_runtime_available"] is True
+    assert fused_route["route"]["fused_train_block_training_runtime_available"] is True
     assert fused_route["route"]["fused_train_block_training_runtime_contract"][
         "status"
-    ] == (
-        "fused_train_block_training_runtime_missing"
-    )
+    ] == "ok"
     assert fused_route["route"]["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True

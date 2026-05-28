@@ -345,27 +345,36 @@ def path_d_imports_allowed(mode: str = "frontend") -> tuple[bool, str]:
     block_reason = path_d_native_import_block_reason()
     if block_reason is not None:
         return False, block_reason
-    if unsafe_triton_frontend_import_enabled():
-        return True, (
-            "Path D native imports explicitly enabled by "
-            f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1"
-        )
-    return path_d_native_import_preflight(mode)
+    if not unsafe_triton_frontend_import_enabled():
+        if mode in {"gdn_fla", "kda_fla"}:
+            return False, unsafe_fla_import_disabled_reason(None)
+        return False, unsafe_triton_frontend_import_disabled_reason(None)
+    ok, reason = path_d_native_import_preflight(mode)
+    if not ok:
+        return False, reason
+    return True, (
+        "Path D native imports explicitly enabled by "
+        f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1; {reason}"
+    )
 
 
 def unsafe_triton_frontend_import_disabled_reason(root: str | None) -> str:
     root_text = f" root={root}" if root else " root=<not found>"
     return (
-        "triton frontend not importable: native import preflight did not "
-        f"authorize in-process import; Path D runtime adapter not reached;{root_text}"
+        "unsafe triton frontend import disabled because "
+        f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1 is not set; native import "
+        "preflight did not authorize in-process import; Path D runtime "
+        f"adapter not reached;{root_text}"
     )
 
 
 def unsafe_fla_import_disabled_reason(root: str | None) -> str:
     root_text = f" root={root}" if root else " root=<not found>"
     return (
-        "FLA not importable: native import preflight did not authorize "
-        f"in-process import; Path D runtime adapter not reached;{root_text}"
+        "unsafe FLA import disabled because "
+        f"{TRITON_FRONTEND_UNSAFE_IMPORT_ENV}=1 is not set; native import "
+        "preflight did not authorize in-process import; Path D runtime "
+        f"adapter not reached;{root_text}"
     )
 
 

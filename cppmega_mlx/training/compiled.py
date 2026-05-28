@@ -141,6 +141,7 @@ class PathCFusedTrainBlockCallableArtifact:
         trainable_parameter_names: Sequence[str] | None = None,
         selected_region_metadata: Mapping[str, Any] | None = None,
         kernel_buffer_order: Sequence[str] | None = None,
+        kernel_buffer_shapes: Mapping[str, Sequence[int]] | None = None,
     ) -> None:
         if not callable(kernel):
             raise TypeError("fused train-block kernel must be callable")
@@ -169,6 +170,10 @@ class PathCFusedTrainBlockCallableArtifact:
             if kernel_buffer_order is not None
             else None
         )
+        self.kernel_buffer_shapes = {
+            str(name): tuple(int(dim) for dim in tuple(shape))
+            for name, shape in (kernel_buffer_shapes or {}).items()
+        }
         self._logical_gradient_names = frozenset(
             name for name in self.physical_abi_map if name.endswith("_grad")
         )
@@ -215,23 +220,35 @@ class PathCFusedTrainBlockCallableArtifact:
             raise TypeError("fused train-block artifact requires a bank_owner")
         return buffers
 
-    def _kernel_args_from_bank_owner(self, bank_owner: Any) -> tuple[Any, ...]:
+    def _kernel_args_from_bank_owner(
+        self,
+        bank_owner: Any,
+        *,
+        kernel_scalar_params: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, ...]:
+        scalar_params = {
+            str(name): value for name, value in (kernel_scalar_params or {}).items()
+        }
         if self.kernel_buffer_order is not None:
-            buffers = self._bank_buffers(bank_owner)
+            owner_buffers = self._bank_buffers(bank_owner)
             physical_abi_runtime_kernel_args(
                 self.physical_abi_map,
                 self.physical_abi_shapes,
                 {
-                    name: buffers[name]
+                    name: owner_buffers[name]
                     for name in self.physical_abi_shapes
-                    if name in buffers
+                    if name in owner_buffers
                 },
             )
+            buffers = self._kernel_exact_buffers(owner_buffers)
             missing: list[str] = []
             args: list[Any] = []
             for name in self.kernel_buffer_order:
                 if name in buffers:
                     args.append(buffers[name])
+                    continue
+                if name in scalar_params:
+                    args.append(scalar_params[name])
                     continue
                 if name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS:
                     args.append(PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS[name])
@@ -252,11 +269,35 @@ class PathCFusedTrainBlockCallableArtifact:
             self._bank_buffers(bank_owner),
         )
 
+    def _kernel_exact_buffers(self, buffers: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not self.kernel_buffer_shapes:
+            return buffers
+        exact = dict(buffers)
+        for name, expected_shape in self.kernel_buffer_shapes.items():
+            value = exact.get(name)
+            if value is None:
+                continue
+            actual_shape = tuple(int(dim) for dim in tuple(getattr(value, "shape", ())))
+            if actual_shape == expected_shape:
+                continue
+            expected_size = 1
+            for dim in expected_shape:
+                expected_size *= int(dim)
+            actual_size = int(getattr(value, "size", 0) or 0)
+            if actual_size < expected_size:
+                continue
+            view = mx.reshape(value, (-1,))[:expected_size]
+            if expected_shape != (expected_size,):
+                view = mx.reshape(view, expected_shape)
+            exact[name] = view
+        return exact
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.forward(*args, **kwargs)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         bank_owner = kwargs.pop("bank_owner", None)
+        kernel_scalar_params = kwargs.pop("kernel_scalar_params", None)
         if bank_owner is None:
             return self.kernel(*args, **kwargs)
         if args or kwargs:
@@ -264,7 +305,12 @@ class PathCFusedTrainBlockCallableArtifact:
                 "fused train-block artifact accepts only bank_owner-bound "
                 "kernel dispatch"
             )
-        return self.kernel(*self._kernel_args_from_bank_owner(bank_owner))
+        return self.kernel(
+            *self._kernel_args_from_bank_owner(
+                bank_owner,
+                kernel_scalar_params=kernel_scalar_params,
+            )
+        )
 
     def backward(self, *args: Any, **kwargs: Any) -> Any:
         return self.forward(*args, **kwargs)
@@ -391,6 +437,10 @@ class PathCFusedTrainBlockCallableArtifact:
             "full_model_gradient_coverage": coverage,
             "loss_cotangent_bridge_ready": bool(
                 self.training_abi_contract.get(
+                    "replay_cotangent_boundary_available",
+                    False,
+                )
+                or self.training_abi_contract.get(
                     "train_step_loss_cotangents_computed",
                     False,
                 )
@@ -399,6 +449,285 @@ class PathCFusedTrainBlockCallableArtifact:
             "delegates_to_eager_loss_and_grad": False,
             "hidden_packing_performed": False,
         }
+
+
+class PathCGeneratedStageTrainBlockCallableArtifact(PathCFusedTrainBlockCallableArtifact):
+    """Contracted Path C artifact backed by generated forward/backward stages.
+
+    This keeps the runtime contract at the train-block boundary: callers bind
+    one physical ABI bank owner and select forward/backward with the same ABI
+    scalar gate.  The implementation detail is that the descriptor generator
+    emitted smaller phase kernels over the same bank map, avoiding a monolithic
+    Metal function without falling back to a Python chain of logical kernels.
+    """
+
+    generated_stage_artifact = True
+
+    def __init__(
+        self,
+        *,
+        forward_kernel: Callable[..., Any],
+        backward_kernel: Callable[..., Any] | None,
+        forward_kernels: Sequence[Callable[..., Any]] | None = None,
+        backward_kernels: Sequence[Callable[..., Any]] | None = None,
+        physical_abi_map: Mapping[str, Any],
+        physical_abi_shapes: Mapping[str, Any],
+        training_abi_contract: Mapping[str, Any],
+        parameter_gradient_aliases: Mapping[str, str | Sequence[str]] | None = None,
+        trainable_parameter_names: Sequence[str] | None = None,
+        selected_region_metadata: Mapping[str, Any] | None = None,
+        forward_kernel_buffer_order: Sequence[str] | None = None,
+        backward_kernel_buffer_order: Sequence[str] | None = None,
+        forward_kernel_buffer_orders: Sequence[Sequence[str]] | None = None,
+        backward_kernel_buffer_orders: Sequence[Sequence[str]] | None = None,
+        forward_kernel_buffer_shapes: Mapping[str, Sequence[int]] | None = None,
+        backward_kernel_buffer_shapes: Mapping[str, Sequence[int]] | None = None,
+        forward_kernel_buffer_shapes_by_stage: Sequence[
+            Mapping[str, Sequence[int]]
+        ] | None = None,
+        backward_kernel_buffer_shapes_by_stage: Sequence[
+            Mapping[str, Sequence[int]]
+        ] | None = None,
+        backward_gate_param: str = "path_c_run_backward",
+        row_chunk_count: int | None = None,
+        row_chunk_index_param: str | None = None,
+        row_subchunk_count: int | None = None,
+        row_subchunk_index_param: str | None = None,
+    ) -> None:
+        forward_kernel_sequence = tuple(forward_kernels or (forward_kernel,))
+        if not forward_kernel_sequence:
+            raise ValueError("generated Path C artifact needs a forward stage")
+        backward_kernel_sequence = tuple(
+            backward_kernels
+            if backward_kernels is not None
+            else ((backward_kernel,) if backward_kernel is not None else ())
+        )
+        raw_forward_orders = (
+            forward_kernel_buffer_orders
+            or (
+                (tuple(str(name) for name in forward_kernel_buffer_order),)
+                if forward_kernel_buffer_order is not None
+                else (None,) * len(forward_kernel_sequence)
+            )
+        )
+        forward_order_sequence = tuple(
+            None if order is None else tuple(str(name) for name in order)
+            for order in raw_forward_orders
+        )
+        if len(forward_order_sequence) != len(forward_kernel_sequence):
+            raise ValueError("forward stage kernel/order count mismatch")
+        raw_backward_orders = (
+            backward_kernel_buffer_orders
+            or (
+                (tuple(str(name) for name in backward_kernel_buffer_order),)
+                if backward_kernel_buffer_order is not None
+                else (None,) * len(backward_kernel_sequence)
+            )
+        )
+        backward_order_sequence = tuple(
+            None if order is None else tuple(str(name) for name in order)
+            for order in raw_backward_orders
+        )
+        if len(backward_order_sequence) != len(backward_kernel_sequence):
+            raise ValueError("backward stage kernel/order count mismatch")
+        raw_forward_shape_sequence = forward_kernel_buffer_shapes_by_stage
+        if raw_forward_shape_sequence is None:
+            raw_forward_shape_sequence = (
+                (forward_kernel_buffer_shapes or {}),
+            ) * len(forward_kernel_sequence)
+        raw_forward_shape_sequence = tuple(raw_forward_shape_sequence)
+        if len(raw_forward_shape_sequence) != len(forward_kernel_sequence):
+            raise ValueError("forward stage kernel/shape count mismatch")
+        raw_backward_shape_sequence = backward_kernel_buffer_shapes_by_stage
+        if raw_backward_shape_sequence is None:
+            raw_backward_shape_sequence = (
+                (backward_kernel_buffer_shapes or {}),
+            ) * len(backward_kernel_sequence)
+        raw_backward_shape_sequence = tuple(raw_backward_shape_sequence)
+        if len(raw_backward_shape_sequence) != len(backward_kernel_sequence):
+            raise ValueError("backward stage kernel/shape count mismatch")
+        super().__init__(
+            kernel=forward_kernel_sequence[0],
+            physical_abi_map=physical_abi_map,
+            physical_abi_shapes=physical_abi_shapes,
+            training_abi_contract={
+                **dict(training_abi_contract),
+                "generated_stage_artifact": True,
+            },
+            parameter_gradient_aliases=parameter_gradient_aliases,
+            trainable_parameter_names=trainable_parameter_names,
+            selected_region_metadata=selected_region_metadata,
+            kernel_buffer_order=forward_order_sequence[0],
+        )
+        self.forward_stages = tuple(
+            PathCFusedTrainBlockCallableArtifact(
+                kernel=kernel,
+                physical_abi_map=physical_abi_map,
+                physical_abi_shapes=physical_abi_shapes,
+                training_abi_contract=self.training_abi_contract,
+                parameter_gradient_aliases=parameter_gradient_aliases,
+                trainable_parameter_names=trainable_parameter_names,
+                selected_region_metadata=selected_region_metadata,
+                kernel_buffer_order=order,
+            )
+            for kernel, order in zip(
+                forward_kernel_sequence,
+                forward_order_sequence,
+                strict=True,
+            )
+        )
+        self.forward_stage = self.forward_stages[0]
+        self.backward_stages = tuple(
+            PathCFusedTrainBlockCallableArtifact(
+                kernel=kernel,
+                physical_abi_map=physical_abi_map,
+                physical_abi_shapes=physical_abi_shapes,
+                training_abi_contract=self.training_abi_contract,
+                parameter_gradient_aliases=parameter_gradient_aliases,
+                trainable_parameter_names=trainable_parameter_names,
+                selected_region_metadata=selected_region_metadata,
+                kernel_buffer_order=order,
+            )
+            for kernel, order in zip(
+                backward_kernel_sequence,
+                backward_order_sequence,
+                strict=True,
+            )
+        )
+        self.backward_stage = self.backward_stages[0] if self.backward_stages else None
+        self.backward_gate_param = str(backward_gate_param or "path_c_run_backward")
+        self.row_chunk_count = (
+            max(1, int(row_chunk_count)) if row_chunk_count is not None else None
+        )
+        self.row_chunk_index_param = (
+            str(row_chunk_index_param) if row_chunk_index_param else None
+        )
+        self.row_subchunk_count = (
+            max(1, int(row_subchunk_count))
+            if row_subchunk_count is not None
+            else None
+        )
+        self.row_subchunk_index_param = (
+            str(row_subchunk_index_param) if row_subchunk_index_param else None
+        )
+        self.forward_kernel_buffer_shapes_by_stage = tuple(
+            {
+                str(name): tuple(int(dim) for dim in tuple(shape))
+                for name, shape in raw_shapes.items()
+            }
+            for raw_shapes in raw_forward_shape_sequence
+        )
+        self.forward_kernel_buffer_shapes = self.forward_kernel_buffer_shapes_by_stage[0]
+        self.backward_kernel_buffer_shapes_by_stage = tuple(
+            {
+                str(name): tuple(int(dim) for dim in tuple(shape))
+                for name, shape in raw_shapes.items()
+            }
+            for raw_shapes in raw_backward_shape_sequence
+        )
+        self.backward_kernel_buffer_shapes = (
+            self.backward_kernel_buffer_shapes_by_stage[0]
+            if self.backward_kernel_buffer_shapes_by_stage
+            else {}
+        )
+
+    def _run_backward_from_scalars(
+        self,
+        kernel_scalar_params: Mapping[str, Any] | None,
+    ) -> bool:
+        scalar_params = kernel_scalar_params or {}
+        raw_gate = scalar_params.get(
+            self.backward_gate_param,
+            PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS.get(self.backward_gate_param, 1),
+        )
+        try:
+            return int(raw_gate) == 1
+        except Exception:
+            return bool(raw_gate)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        bank_owner = kwargs.get("bank_owner", None)
+        kernel_scalar_params = kwargs.get("kernel_scalar_params", None)
+        raw_max_stages = kwargs.get("max_stages", None)
+        max_stages: int | None = None
+        if raw_max_stages is not None:
+            max_stages = max(0, int(raw_max_stages))
+        if bank_owner is None:
+            stage_kwargs = {
+                key: value for key, value in kwargs.items() if key != "max_stages"
+            }
+            return self.forward_stage.forward(*args, **stage_kwargs)
+        run_backward = self._run_backward_from_scalars(kernel_scalar_params)
+        stages = self.backward_stages if run_backward else self.forward_stages
+        if run_backward and not self.backward_stages:
+            raise ValueError("generated Path C artifact has no backward stage")
+        if max_stages is not None:
+            stages = stages[:max_stages]
+        stage_base_kwargs = {
+            key: value for key, value in kwargs.items() if key != "max_stages"
+        }
+        result: Any = None
+        for index, stage in enumerate(stages):
+            stage_shapes = (
+                self.backward_kernel_buffer_shapes_by_stage[index]
+                if run_backward
+                else self.forward_kernel_buffer_shapes_by_stage[index]
+            )
+            stage_kwargs = dict(stage_base_kwargs)
+            if stage_shapes:
+                stage_kwargs["bank_owner"] = self._stage_exact_bank_owner(
+                    bank_owner,
+                    stage_shapes,
+                )
+            try:
+                result = stage.forward(*args, **stage_kwargs)
+            except Exception as exc:
+                stage_kind = "backward" if run_backward else "forward"
+                raise RuntimeError(
+                    f"generated Path C {stage_kind} stage {index} failed"
+                ) from exc
+        return result
+
+    def _stage_exact_bank_owner(
+        self,
+        bank_owner: Any,
+        stage_shapes: Mapping[str, tuple[int, ...]],
+    ) -> Mapping[str, Any]:
+        buffers = dict(self._bank_buffers(bank_owner))
+        physical_banks = set(self.physical_abi_shapes)
+        for name, expected_shape in stage_shapes.items():
+            if name in physical_banks:
+                continue
+            value = buffers.get(name)
+            if value is None:
+                continue
+            actual_shape = tuple(int(dim) for dim in tuple(getattr(value, "shape", ())))
+            if actual_shape == expected_shape:
+                continue
+            expected_size = 1
+            for dim in expected_shape:
+                expected_size *= int(dim)
+            actual_size = int(getattr(value, "size", 0) or 0)
+            if actual_size < expected_size:
+                continue
+            view = mx.reshape(value, (-1,))[:expected_size]
+            if expected_shape != (expected_size,):
+                view = mx.reshape(view, expected_shape)
+            buffers[name] = view
+        return buffers
+
+    def value_and_grad_contract(self) -> Mapping[str, Any]:
+        payload = dict(super().value_and_grad_contract())
+        payload["generated_stage_artifact"] = True
+        payload["generated_stage_count"] = len(self.forward_stages) + len(
+            self.backward_stages
+        )
+        payload["row_chunk_count"] = self.row_chunk_count
+        payload["row_chunk_index_param"] = self.row_chunk_index_param
+        payload["row_subchunk_count"] = self.row_subchunk_count
+        payload["row_subchunk_index_param"] = self.row_subchunk_index_param
+        payload["delegates_to_eager_loss_and_grad"] = False
+        return payload
 
 
 class PathCFusedTrainBlockTrainingRuntime:
@@ -532,6 +861,9 @@ class PathCFusedPlusEagerTrainingRuntime:
         fused_suffix_loss_fn: Callable[
             [nn.Module, Mapping[str, Any]], tuple[mx.array, mx.array]
         ] | None = None,
+        fused_replay_loss_fn: Callable[
+            [nn.Module, Mapping[str, Any]], tuple[mx.array, mx.array]
+        ] | None = None,
     ) -> None:
         if not callable(artifact):
             raise TypeError("fused train-block artifact must be callable")
@@ -575,6 +907,9 @@ class PathCFusedPlusEagerTrainingRuntime:
         self.fused_suffix_loss_fn = (
             fused_suffix_loss_fn if callable(fused_suffix_loss_fn) else None
         )
+        self.fused_replay_loss_fn = (
+            fused_replay_loss_fn if callable(fused_replay_loss_fn) else None
+        )
         self._binding: dict[str, Any] | None = None
         self.last_fused_warmup_payload: dict[str, Any] = {
             "attempted": False,
@@ -592,6 +927,7 @@ class PathCFusedPlusEagerTrainingRuntime:
             "bank_sync_status": None,
             "error": None,
             "suffix_bypass_active": False,
+            "replay_cotangent_bridge_active": False,
         }
         self.last_parameter_bank_bind_report: dict[str, Any] | None = None
 
@@ -699,11 +1035,15 @@ class PathCFusedPlusEagerTrainingRuntime:
                 "an eager loss_and_grad closure for residual parameters"
             )
 
+        replay_bridge = bool(
+            self.in_region_parameter_bank_aliases
+            and self.fused_replay_loss_fn is not None
+        )
         suffix_bypass = bool(
             self.in_region_parameter_bank_aliases
             and self.fused_suffix_loss_fn is not None
         )
-        if suffix_bypass:
+        if replay_bridge or suffix_bypass:
             bank_sync_status: dict[str, Any] | None = None
             if self.model_bank_sync_callable is not None:
                 try:
@@ -730,13 +1070,18 @@ class PathCFusedPlusEagerTrainingRuntime:
                 "missing_parameter_names": (),
                 "bank_sync_status": bank_sync_status,
                 "error": None,
-                "suffix_bypass_active": True,
+                "suffix_bypass_active": bool(suffix_bypass and not replay_bridge),
+                "replay_cotangent_bridge_active": bool(replay_bridge),
             }
             try:
                 vg_start = time.perf_counter_ns()
-                fused_loss_fn = self.fused_suffix_loss_fn
-                if fused_loss_fn is None:  # pragma: no cover - guarded by suffix_bypass
-                    raise RuntimeError("suffix_bypass without fused_suffix_loss_fn")
+                fused_loss_fn = (
+                    self.fused_replay_loss_fn
+                    if replay_bridge
+                    else self.fused_suffix_loss_fn
+                )
+                if fused_loss_fn is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("fused bridge missing loss function")
                 fused_value_and_grad = nn.value_and_grad(model, fused_loss_fn)
                 (loss, ntokens), grads = fused_value_and_grad(model, batch)
                 vg_payload["elapsed_ns"] = (
@@ -797,6 +1142,7 @@ class PathCFusedPlusEagerTrainingRuntime:
             "bank_sync_status": bank_sync_status,
             "error": None,
             "suffix_bypass_active": False,
+            "replay_cotangent_bridge_active": False,
         }
 
         fused_grads: Any | None = None
@@ -877,13 +1223,30 @@ class PathCFusedPlusEagerTrainingRuntime:
             self.fused_suffix_loss_fn is not None
             and self.in_region_parameter_bank_aliases
         )
-        returns_full_model_grads = suffix_bypass_available
+        replay_cotangent_bridge_available = bool(
+            self.fused_replay_loss_fn is not None
+            and self.in_region_parameter_bank_aliases
+        )
+        fused_bridge_available = (
+            replay_cotangent_bridge_available or suffix_bypass_available
+        )
+        returns_full_model_grads = fused_bridge_available
         gradient_scope = (
+            "full_model_via_fused_replay_cotangent_bridge"
+            if replay_cotangent_bridge_available
+            else (
             "full_model_via_fused_suffix_bypass"
             if suffix_bypass_available
             else "selected_train_block_warmup_only"
+            )
         )
         reason = (
+            "mixed-mode training runtime returns full-model grads via "
+            "replay/cotangent bridge: the generated TileLang artifact owns "
+            "only the fused M/R/A block, while MLX eager prefix/suffix "
+            "autograd supplies boundary cotangents and residual gradients"
+            if replay_cotangent_bridge_available
+            else (
             "mixed-mode training runtime returns full-model grads via "
             "suffix-bypass: in-region parameters and hidden-entry cotangents "
             "come from the fused custom-function VJP, residual/prefix grads "
@@ -901,8 +1264,9 @@ class PathCFusedPlusEagerTrainingRuntime:
                     "come from the trainer's eager value_and_grad closure"
                 )
             )
+            )
         )
-        if not suffix_bypass_available:
+        if not fused_bridge_available:
             reason = (
                 "fused train-block gradient overlay is disabled; the runtime "
                 "can run as warmup only, while the actual full-model gradients "
@@ -911,12 +1275,12 @@ class PathCFusedPlusEagerTrainingRuntime:
             )
         overlay_parameter_count = (
             len(self.in_region_parameter_bank_aliases)
-            if suffix_bypass_available
+            if fused_bridge_available
             else 0
         )
         overlay_parameter_names = (
             tuple(sorted(self.in_region_parameter_bank_aliases))
-            if suffix_bypass_available
+            if fused_bridge_available
             else ()
         )
         coverage.update(
@@ -929,19 +1293,19 @@ class PathCFusedPlusEagerTrainingRuntime:
                 ),
                 "missing_parameter_names": (
                     []
-                    if suffix_bypass_available
+                    if fused_bridge_available
                     else coverage.get("missing_parameter_names", [])
                 ),
                 "missing_parameter_count": (
                     0
-                    if suffix_bypass_available
+                    if fused_bridge_available
                     else coverage.get("missing_parameter_count", 0)
                 ),
                 "fused_in_region_parameter_count": len(
                     self.in_region_parameter_names
                 ),
                 "parameter_bank_residency_active": bank_residency_ready,
-                "bank_grad_overlay_active": suffix_bypass_available,
+                "bank_grad_overlay_active": fused_bridge_available,
                 "merged_bank_resident_parameter_count": overlay_parameter_count,
                 "merged_bank_resident_parameter_names": overlay_parameter_names,
             }
@@ -957,9 +1321,9 @@ class PathCFusedPlusEagerTrainingRuntime:
             "returns_full_model_grads": returns_full_model_grads,
             "gradient_scope": gradient_scope,
             "full_model_gradient_tree_ready": returns_full_model_grads,
-            "loss_cotangent_bridge_ready": suffix_bypass_available,
+            "loss_cotangent_bridge_ready": fused_bridge_available,
             "model_gradient_tree_ready": returns_full_model_grads,
-            "delegates_to_eager_loss_and_grad": not suffix_bypass_available,
+            "delegates_to_eager_loss_and_grad": not fused_bridge_available,
             "hidden_packing_performed": False,
             "full_model_gradient_coverage": coverage,
             "fused_in_region_parameter_count": len(
@@ -968,9 +1332,10 @@ class PathCFusedPlusEagerTrainingRuntime:
             "parameter_bank_residency_active": bool(
                 self.in_region_parameter_bank_aliases
             ),
-            "bank_grad_overlay_active": suffix_bypass_available,
+            "bank_grad_overlay_active": fused_bridge_available,
             "merged_bank_resident_parameter_count": overlay_parameter_count,
             "suffix_bypass_available": suffix_bypass_available,
+            "replay_cotangent_bridge_available": replay_cotangent_bridge_available,
             "runtime_class": type(self).__name__,
         }
         return merged
@@ -1562,6 +1927,7 @@ __all__ = [
     "PathCGradientBufferCapture",
     "PathCGradientProbe",
     "PathCFusedTrainBlockCallableArtifact",
+    "PathCGeneratedStageTrainBlockCallableArtifact",
     "PathCFusedTrainBlockTrainingRuntime",
     "PathCFusedPlusEagerTrainingRuntime",
     "PathCTrainingRuntime",

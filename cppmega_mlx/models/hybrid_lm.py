@@ -52,6 +52,10 @@ from cppmega_mlx.runtime.path_c_physical_abi import (
     write_into_bank_slot,
 )
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
+from cppmega_mlx.training.cut_cross_entropy import (
+    DEFAULT_CHUNK_ROWS,
+    linear_cross_entropy,
+)
 from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
 
 if TYPE_CHECKING:
@@ -1175,6 +1179,92 @@ class HybridTinyLM(nn.Module):
         cache[sequence_length] = result
         return result
 
+    def path_c_fused_train_block_stage_prim_funcs(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> tuple[Any, ...]:
+        """Return descriptor-planned generated stage PrimFuncs for this block."""
+
+        cache: dict[int | None, tuple[Any, ...]] = getattr(
+            self,
+            "_stage_prim_func_cache",
+            None,
+        ) or {}
+        if not hasattr(self, "_stage_prim_func_cache"):
+            self._stage_prim_func_cache = cache
+        if sequence_length in cache:
+            return cache[sequence_length]
+
+        abi_prim_func = self.path_c_fused_train_block_prim_func(
+            sequence_length=sequence_length,
+        )
+        if abi_prim_func is None:
+            cache[sequence_length] = ()
+            return ()
+
+        from cppmega_mlx.runtime.path_c_fusion_schedules import (
+            path_c_descriptor_stage_prim_funcs,
+            plan_path_c_fusion_schedule_for_region,
+        )
+
+        regions = self.path_c_fusion_regions(
+            include_backward=False,
+            sequence_length=sequence_length,
+        )
+        if not regions:
+            cache[sequence_length] = ()
+            return ()
+        selected = max(
+            regions,
+            key=lambda region: (
+                len(region.nodes),
+                len(region.edges),
+                region.name,
+            ),
+        )
+        planned = plan_path_c_fusion_schedule_for_region(
+            selected,
+            include_backward=True,
+        )
+        schedule_target = getattr(planned, "schedule_target", None)
+        if schedule_target is None:
+            cache[sequence_length] = ()
+            return ()
+        stage_prim_funcs = path_c_descriptor_stage_prim_funcs(
+            region=planned.region,
+            schedule_target=schedule_target,
+            abi_prim_func=abi_prim_func,
+        )
+        cache[sequence_length] = stage_prim_funcs
+        return stage_prim_funcs
+
+    def path_c_fused_train_block_physical_abi(
+        self,
+        *,
+        sequence_length: int | None = None,
+    ) -> tuple[dict[str, Any], dict[str, tuple[int, ...]], tuple[Any, ...]]:
+        """Return the merged physical ABI used by all generated train stages."""
+
+        prim_func = self.path_c_fused_train_block_prim_func(
+            sequence_length=sequence_length,
+        )
+        if prim_func is None:
+            return {}, {}, ()
+
+        from cppmega_mlx.runtime.path_c_fusion_schedules import (
+            merge_path_c_physical_abi_for_prim_funcs,
+        )
+
+        prim_funcs = (
+            prim_func,
+            *self.path_c_fused_train_block_stage_prim_funcs(
+                sequence_length=sequence_length,
+            ),
+        )
+        abi_map, abi_shapes = merge_path_c_physical_abi_for_prim_funcs(prim_funcs)
+        return abi_map, abi_shapes, prim_funcs
+
     def make_path_c_physical_abi_bank_owner(
         self,
         *,
@@ -1191,18 +1281,8 @@ class HybridTinyLM(nn.Module):
 
         Returns ``None`` when no Path C route region exists for the model.
         """
-        prim_func = self.path_c_fused_train_block_prim_func(
+        abi_map, abi_shapes, prim_funcs = self.path_c_fused_train_block_physical_abi(
             sequence_length=sequence_length,
-        )
-        if prim_func is None:
-            return None
-        abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
-            or {}
-        )
-        abi_shapes = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes", {})
-            or {}
         )
         if not abi_map or not abi_shapes:
             return None
@@ -1228,11 +1308,20 @@ class HybridTinyLM(nn.Module):
                 tuple(int(dim) for dim in tuple(shape)),
                 dtype=mx_dtype,
             )
-        for name, spec in path_c_top_level_kernel_buffer_specs(
-            prim_func,
-            physical_abi_map=abi_map,
-            physical_abi_shapes=abi_shapes,
-        ).items():
+        top_level_specs: dict[str, dict[str, Any]] = {}
+        for prim_func in prim_funcs:
+            for name, spec in path_c_top_level_kernel_buffer_specs(
+                prim_func,
+                physical_abi_map=abi_map,
+                physical_abi_shapes=abi_shapes,
+            ).items():
+                existing = top_level_specs.get(name)
+                shape = tuple(int(dim) for dim in tuple(spec["shape"]))
+                if existing is None or math.prod(shape) > math.prod(
+                    tuple(existing["shape"])
+                ):
+                    top_level_specs[name] = dict(spec)
+        for name, spec in top_level_specs.items():
             if name in bank_buffers:
                 continue
             bank_buffers[name] = mx.zeros(
@@ -1276,14 +1365,8 @@ class HybridTinyLM(nn.Module):
         no ``*_grad`` slot (for example pure inputs) are skipped.
         """
 
-        prim_func = self.path_c_fused_train_block_prim_func(
+        abi_map, _abi_shapes, _prim_funcs = self.path_c_fused_train_block_physical_abi(
             sequence_length=sequence_length,
-        )
-        if prim_func is None:
-            return {}
-        abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
-            or {}
         )
         if not abi_map:
             return {}
@@ -1468,12 +1551,8 @@ class HybridTinyLM(nn.Module):
                 "synced": [],
                 "skipped": [],
             }
-        prim_func = self.path_c_fused_train_block_prim_func(
+        abi_map, _abi_shapes, _prim_funcs = self.path_c_fused_train_block_physical_abi(
             sequence_length=sequence_length,
-        )
-        abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
-            or {}
         )
         synced: list[str] = []
         skipped: list[tuple[str, str]] = []
@@ -1588,12 +1667,8 @@ class HybridTinyLM(nn.Module):
                 "skipped": [],
                 "in_region_parameter_count": 0,
             }
-        prim_func = self.path_c_fused_train_block_prim_func(
+        abi_map, _abi_shapes, _prim_funcs = self.path_c_fused_train_block_physical_abi(
             sequence_length=sequence_length,
-        )
-        abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
-            or {}
         )
         bound: list[str] = []
         skipped: list[tuple[str, str]] = []
@@ -1713,6 +1788,190 @@ class HybridTinyLM(nn.Module):
         return callable(
             getattr(self, "_path_c_fused_suffix_custom_function", None)
         )
+
+    def attach_path_c_fused_replay_custom_function(
+        self,
+        fused_replay: Any,
+        *,
+        parameter_order: Sequence[str],
+        first_in_region_layer_index: int,
+        boundary_output_logical_names: Sequence[str],
+        chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    ) -> None:
+        """Attach a fused-block replay custom function for loss replay.
+
+        The attached callable owns only the generated Path C block. The suffix
+        loss remains eager MLX code so ``lm_head`` and softmax loops never enter
+        the TileLang train-block PrimFunc.
+        """
+
+        if not callable(fused_replay):
+            raise TypeError("fused_replay must be callable")
+        if first_in_region_layer_index < 0:
+            raise ValueError("first_in_region_layer_index must be non-negative")
+        self._path_c_fused_replay_custom_function = fused_replay
+        self._path_c_fused_replay_parameter_order = tuple(parameter_order)
+        self._path_c_fused_replay_first_in_region_layer_index = int(
+            first_in_region_layer_index
+        )
+        self._path_c_fused_replay_boundary_output_logical_names = tuple(
+            str(name) for name in boundary_output_logical_names
+        )
+        self._path_c_fused_replay_chunk_rows = max(1, int(chunk_rows))
+
+    def detach_path_c_fused_replay_custom_function(self) -> None:
+        for attr in (
+            "_path_c_fused_replay_custom_function",
+            "_path_c_fused_replay_parameter_order",
+            "_path_c_fused_replay_first_in_region_layer_index",
+            "_path_c_fused_replay_boundary_output_logical_names",
+            "_path_c_fused_replay_chunk_rows",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def path_c_fused_replay_custom_function_available(self) -> bool:
+        return callable(
+            getattr(self, "_path_c_fused_replay_custom_function", None)
+        )
+
+    def path_c_fused_replay_loss(
+        self,
+        batch: Mapping[str, mx.array],
+    ) -> tuple[mx.array, mx.array]:
+        """Compute loss with eager suffix and fused-block replay VJP."""
+
+        fused_replay = getattr(
+            self, "_path_c_fused_replay_custom_function", None
+        )
+        parameter_order: tuple[str, ...] = tuple(
+            cast("Sequence[str]",
+                getattr(self, "_path_c_fused_replay_parameter_order", ()))
+        )
+        first_in_region_layer_index = getattr(
+            self,
+            "_path_c_fused_replay_first_in_region_layer_index",
+            None,
+        )
+        boundary_output_names: tuple[str, ...] = tuple(
+            cast(
+                "Sequence[str]",
+                getattr(
+                    self,
+                    "_path_c_fused_replay_boundary_output_logical_names",
+                    (),
+                ),
+            )
+        )
+        if (
+            not callable(fused_replay)
+            or not parameter_order
+            or first_in_region_layer_index is None
+            or not boundary_output_names
+        ):
+            raise ValueError(
+                "path_c_fused_replay_loss requires "
+                "attach_path_c_fused_replay_custom_function to be installed"
+            )
+
+        from cppmega_mlx.data.batch import ensure_lm_batch
+
+        lm_batch = ensure_lm_batch(batch)
+        input_ids = lm_batch.inputs
+        targets = lm_batch.targets
+        target_mask = lm_batch.target_mask
+        side_channel_kwargs = dict(lm_batch.model_kwargs())
+        document_ids = lm_batch.input_document_ids
+
+        if target_mask.shape != targets.shape:
+            raise ValueError(
+                "target_mask shape must match targets; got "
+                f"{target_mask.shape} vs {targets.shape}"
+            )
+
+        hidden_entry = self.decoder_hidden_states(
+            input_ids,
+            structure_ids=side_channel_kwargs.get("structure_ids"),
+            dep_levels=side_channel_kwargs.get("dep_levels"),
+            ast_depth_ids=side_channel_kwargs.get("ast_depth_ids"),
+            sibling_index_ids=side_channel_kwargs.get("sibling_index_ids"),
+            node_type_ids=side_channel_kwargs.get("node_type_ids"),
+            platform_ids=side_channel_kwargs.get("platform_ids"),
+            document_ids=document_ids,
+            kv_cache=None,
+            stop_layer_index=int(first_in_region_layer_index),
+            apply_final_norm=False,
+        )
+
+        params = tuple(
+            self._path_c_get_parameter_tensor(name)
+            for name in parameter_order
+        )
+        if any(p is None for p in params):
+            missing = [
+                name
+                for name, p in zip(parameter_order, params, strict=True)
+                if p is None
+            ]
+            raise ValueError(
+                "path_c_fused_replay_loss could not resolve in-region "
+                f"parameters: {missing}"
+            )
+        boundary_result: Any = fused_replay(
+            hidden_entry,
+            *cast(tuple[mx.array, ...], params),
+        )
+        boundary_outputs = (
+            boundary_result
+            if isinstance(boundary_result, tuple)
+            else (boundary_result,)
+        )
+        if len(boundary_outputs) != len(boundary_output_names):
+            raise ValueError(
+                "fused replay returned "
+                f"{len(boundary_outputs)} boundary outputs, expected "
+                f"{len(boundary_output_names)}"
+            )
+        hidden = boundary_outputs[0]
+        for boundary in boundary_outputs[1:]:
+            hidden = hidden + boundary
+
+        norm = getattr(self, "norm", None)
+        lm_head = getattr(self, "lm_head", None)
+        norm_weight = getattr(norm, "weight", None)
+        head_weight = getattr(lm_head, "weight", None)
+        if not isinstance(norm_weight, mx.array):
+            raise TypeError(
+                "path_c_fused_replay_loss requires model.norm.weight as an mx.array"
+            )
+        if not isinstance(head_weight, mx.array):
+            raise TypeError(
+                "path_c_fused_replay_loss requires model.lm_head.weight as an mx.array"
+            )
+        norm_eps = float(getattr(norm, "eps", 1e-5))
+        inv_rms = mx.rsqrt(
+            mx.mean(hidden * hidden, axis=-1, keepdims=True)
+            + mx.array(norm_eps, dtype=hidden.dtype)
+        )
+        normed = hidden * inv_rms * norm_weight
+        token_losses = linear_cross_entropy(
+            normed,
+            head_weight,
+            targets,
+            reduction="none",
+            chunk_rows=int(
+                getattr(
+                    self,
+                    "_path_c_fused_replay_chunk_rows",
+                    DEFAULT_CHUNK_ROWS,
+                )
+            ),
+            eval_chunks=False,
+        )
+        ntokens = target_mask.sum()
+        denom = mx.maximum(ntokens, mx.array(1.0, dtype=mx.float32))
+        loss = (token_losses * target_mask).astype(mx.float32).sum() / denom
+        return loss, ntokens.astype(mx.uint32)
 
     def path_c_fused_suffix_loss(
         self,

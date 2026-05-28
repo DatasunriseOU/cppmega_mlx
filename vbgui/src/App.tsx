@@ -27,6 +27,9 @@ import { LossSurfaceModal } from "@/components/LossSurfaceModal";
 import { TokenizerPlayground } from "@/components/TokenizerPlayground";
 import { DataInspector } from "@/components/DataInspector";
 import { BrickContextPanel } from "@/components/BrickContextPanel";
+import { PathExplorer } from "@/components/PathExplorer";
+import type { TokenizerInputSource } from "@/components/VirtualNodes";
+import { layoutFlow } from "@/lib/elk";
 import { LLMGalleryWizardModal, type WizardOptions } from "@/components/LLMGalleryWizardModal";
 import { LiveTrainPanel } from "@/components/LiveTrainPanel";
 import { useLiveTrainStream } from "@/hooks/useLiveTrainStream";
@@ -151,12 +154,48 @@ function sortNodesSequentially(nodes: Node[], edges: Edge[]): Node[] {
   return sorted;
 }
 
+// Real rendered dimensions when React Flow has measured them; otherwise a
+// per-type estimate. Using true sizes is what prevents nodes from overlapping
+// and edges from cutting through node bodies after auto-align.
+function getNodeSize(n: Node): { w: number; h: number } {
+  const m = (n as any).measured as { width?: number; height?: number } | undefined;
+  if (m && typeof m.width === "number" && typeof m.height === "number" && m.width > 0 && m.height > 0) {
+    return { w: m.width, h: m.height };
+  }
+  if (n.type === "tokenizer_virtual") {
+    const tk = ((n.data as any)?.tokens as unknown[])?.length ?? 8;
+    const rows = Math.max(1, Math.ceil(tk / 3));
+    return { w: 264, h: 230 + rows * 30 };
+  }
+  if (n.type === "detokenizer_virtual") {
+    const heads = ((n.data as any)?.mtp_logits as unknown[])?.length ?? 1;
+    return { w: heads > 1 ? 380 : 260, h: 300 };
+  }
+  if (n.type === "block_group") {
+    // Width is driven by the (single-line, nowrap) label — multi-kind folded
+    // groups like "[LIGHTNING_INDEXER + CSA_HCA + ... + MOE]" render far wider
+    // than a short "[GQA_SLIDING]". Estimating from label length keeps the
+    // next node from being placed on top of a wide group at load time, before
+    // React Flow has measured it.
+    const label = ((n.data as any)?.label as string) || "";
+    const w = Math.min(760, Math.max(260, 96 + label.length * 7));
+    return { w, h: 148 };
+  }
+  if (n.type === "residual_add") return { w: 120, h: 60 };
+  if (n.type === "adapter") return { w: 200, h: 96 };
+  if (n.type === "loss_ghost") return { w: 240, h: 120 };
+  return { w: 240, h: 130 }; // default brick
+}
+
 function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
-  let x = 80;
-  let y = 140; // give some space at the top
-  const dy = 280; // Plenty of vertical spacing to prevent herringbone overlap between rows
   const x_start = 80;
-  
+  const H_GAP = 72;   // horizontal breathing room so edges don't graze bodies
+  const V_GAP = 96;   // gap between rows, added on top of the tallest node in a row
+  const UP_SHIFT = 85; // active residual branch lifts above its add node
+  let x = x_start;
+  let y = 140; // give some space at the top
+  let rowMaxH = 0; // tallest node placed in the current row
+
   let row_width = 1180; // Beautiful wide row width fitting standard screens
   if (canvasWidth && canvasWidth > 600) {
     row_width = Math.max(1180, canvasWidth - 160);
@@ -171,74 +210,66 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
   }
 
   let direction = 1; // 1 = left-to-right, -1 = right-to-left
-  
+
   const RESIDUAL_KINDS = new Set([
-    'attention', 'mlp', 'moe', 'mlstm', 'engram', 'gdn', 'kda', 'gated_attention', 
+    'attention', 'mlp', 'moe', 'mlstm', 'engram', 'gdn', 'kda', 'gated_attention',
     'mla', 'mla_absorb', 'rmsnorm', 'csa_hca', 'lightning_indexer', 'dsv4_attention'
   ]);
 
-  const getNodeWidth = (n: Node): number => {
-    if (n.type === "tokenizer_virtual" || n.type === "detokenizer_virtual") return 340;
-    if (n.type === "block_group") return 300;
-    if (n.type === "residual_add") return 120;
-    if (n.type === "adapter") return 200;
-    if (n.type === "loss_ghost") return 240;
-    return 240; // default brick
-  };
-  
   return nodes.map((node, index) => {
     const nextNode = nodes[index + 1];
     const isResidualActiveBranch = RESIDUAL_KINDS.has((node.data as any)?.kind || "") && nextNode?.type === "residual_add";
-    
-    // Spacing for current node
-    const curDx = getNodeWidth(node);
-    
+
+    const { w: curDx, h: curH } = getNodeSize(node);
+
     // Preemptive wrap check for 2-column wide herringbone structures
     if (isResidualActiveBranch) {
-      const nextDx = getNodeWidth(nextNode);
-      const totalBranchDx = curDx + nextDx;
+      const totalBranchDx = curDx + H_GAP + getNodeSize(nextNode).w;
       if (direction === 1 && x + totalBranchDx > row_width) {
         direction = -1;
-        y += dy;
+        y += rowMaxH + V_GAP;
+        rowMaxH = 0;
         x = row_width; // Reset x to right edge for right-to-left flow!
       } else if (direction === -1 && x - totalBranchDx < x_start) {
         direction = 1;
-        y += dy;
+        y += rowMaxH + V_GAP;
+        rowMaxH = 0;
         x = x_start; // Reset x to left edge for left-to-right flow!
       }
     }
-    
-    let nodeX = direction === 1 ? x : x - curDx;
-    let nodeY = y;
-    
-    if (isResidualActiveBranch) {
-      // Shift active branch vertically (up by 85px)
-      nodeY = y - 85;
-    }
-    
+
+    const nodeX = direction === 1 ? x : x - curDx;
+    // Active branch is lifted above the row baseline so its add node sits inline.
+    const nodeY = isResidualActiveBranch ? y - UP_SHIFT : y;
+
+    // Track the vertical extent this node contributes to the current row.
+    rowMaxH = Math.max(rowMaxH, curH + (isResidualActiveBranch ? UP_SHIFT : 0));
+
     // Determine dynamic handle positions based on Boustrophedon direction
     const targetPosition = direction === 1 ? Position.Left : Position.Right;
     const sourcePosition = direction === 1 ? Position.Right : Position.Left;
-    
+
     // Advance x/y for the next node
     if (direction === 1) {
-      if (x + curDx > row_width) {
+      if (x + curDx + H_GAP > row_width) {
         direction = -1;
-        y += dy;
+        y += rowMaxH + V_GAP;
+        rowMaxH = 0;
         x = row_width; // Reset x on wrap!
       } else {
-        x += curDx;
+        x += curDx + H_GAP;
       }
     } else {
-      if (x - curDx < x_start) {
+      if (x - curDx - H_GAP < x_start) {
         direction = 1;
-        y += dy;
+        y += rowMaxH + V_GAP;
+        rowMaxH = 0;
         x = x_start; // Reset x on wrap!
       } else {
-        x -= curDx;
+        x -= curDx + H_GAP;
       }
     }
-    
+
     return {
       ...node,
       position: { x: nodeX, y: nodeY },
@@ -249,6 +280,117 @@ function applySnakeLayout(nodes: Node[], canvasWidth?: number): Node[] {
       }
     };
   });
+}
+
+// Collapse runs of >=2 identical, cleanly-linear brick nodes into a folded
+// block_group. Works on any live graph (not just freshly-loaded presets) and
+// keys off kind + param signature rather than node-name conventions — this is
+// what the old name-based detectRepeatingLayers missed (e.g. a non-numbered
+// per_layer_embed prefix sitting in front of N identical gqa_sliding layers).
+export function groupRepeatedNodes(nodes: Node[], edges: Edge[]): { nodes: Node[]; edges: Edge[] } {
+  if (nodes.length < 2) return { nodes, edges };
+
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const outAdj = new Map<string, string[]>();
+  const inDeg = new Map<string, number>();
+  const outDeg = new Map<string, number>();
+  nodes.forEach((n) => { outAdj.set(n.id, []); inDeg.set(n.id, 0); outDeg.set(n.id, 0); });
+  edges.forEach((e) => {
+    if (byId.has(e.source) && byId.has(e.target)) {
+      outAdj.get(e.source)!.push(e.target);
+      outDeg.set(e.source, outDeg.get(e.source)! + 1);
+      inDeg.set(e.target, inDeg.get(e.target)! + 1);
+    }
+  });
+
+  const sig = (n: Node | undefined): string | null => {
+    if (!n || n.type !== "brick") return null;
+    if ((n.data as any)?._unpacked) return null; // user explicitly expanded these
+    const kind = ((n.data as any)?.kind as string) || "";
+    if (!kind || kind === "embedding_table") return null; // never fold I/O embedders
+    const params = ((n.data as any)?.params as Record<string, unknown>) || {};
+    const keys = Object.keys(params).sort();
+    return kind + "|" + keys.map((k) => `${k}=${JSON.stringify(params[k])}`).join(",");
+  };
+
+  const consumed = new Set<string>();
+  const runs: string[][] = [];
+  for (const n of nodes) {
+    if (consumed.has(n.id)) continue;
+    const s = sig(n);
+    if (s === null || outDeg.get(n.id) !== 1) continue;
+    const run = [n.id];
+    let cur = n.id;
+    // Extend while the unique successor is the same signature and fed only by us.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const succs = outAdj.get(cur)!;
+      if (succs.length !== 1) break;
+      const nxt = succs[0];
+      const nn = byId.get(nxt);
+      if (!nn || consumed.has(nxt) || sig(nn) !== s || inDeg.get(nxt) !== 1) break;
+      run.push(nxt);
+      cur = nxt;
+      if (outDeg.get(nxt) !== 1) break; // last node of the run; stop extending
+    }
+    if (run.length >= 2) {
+      run.forEach((id) => consumed.add(id));
+      runs.push(run);
+    }
+  }
+
+  if (runs.length === 0) return { nodes, edges };
+
+  const idToGroup = new Map<string, string>();
+  const firstOf = new Map<string, string>();
+  const lastOf = new Map<string, string>();
+  const removed = new Set<string>();
+  const groupNodes: Node[] = [];
+
+  runs.forEach((run) => {
+    const first = byId.get(run[0])!;
+    const kind = ((first.data as any)?.kind as string) || "block";
+    const params = ((first.data as any)?.params as Record<string, unknown>) || {};
+    const groupId = `block_group_${run[0]}`;
+    run.forEach((id) => { idToGroup.set(id, groupId); removed.add(id); });
+    firstOf.set(groupId, run[0]);
+    lastOf.set(groupId, run[run.length - 1]);
+    groupNodes.push({
+      id: groupId,
+      type: "block_group",
+      position: first.position ?? { x: 0, y: 0 },
+      data: {
+        label: `[${kind.toUpperCase()}]`,
+        repeats: run.length,
+        block_specs: [{ kind, params }],
+      } as any,
+    });
+  });
+
+  const newEdges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const e of edges) {
+    const sg = idToGroup.get(e.source);
+    const tg = idToGroup.get(e.target);
+    if (sg && tg && sg === tg) continue; // edge internal to a run
+    let src = e.source;
+    let tgt = e.target;
+    if (sg) {
+      if (e.source !== lastOf.get(sg)) continue; // internal non-tail source
+      src = sg;
+    }
+    if (tg) {
+      if (e.target !== firstOf.get(tg)) continue; // internal non-head target
+      tgt = tg;
+    }
+    const id = `${src}->${tgt}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    newEdges.push({ ...e, id, source: src, target: tgt });
+  }
+
+  const newNodes = nodes.filter((n) => !removed.has(n.id)).concat(groupNodes);
+  return { nodes: newNodes, edges: newEdges };
 }
 
 function detectRepeatingLayers(specs: BrickSpec[]) {
@@ -715,6 +857,8 @@ export function App(): JSX.Element {
   const [trainInFlight, setTrainInFlight] = useState(false);
   // V7-H33: loss-surface explorer modal open flag.
   const [lossSurfaceOpen, setLossSurfaceOpen] = useState<boolean>(false);
+  // Tokenizer input-source picker (example prompt / file / directory explorer).
+  const [tokenizerSourceOpen, setTokenizerSourceOpen] = useState<boolean>(false);
   // V7-I03: synchronous lock. React's setTrainInFlight schedules an
   // async commit, so two button clicks within the same microtask
   // both read trainInFlight=false and both call rpc.call. The ref
@@ -1354,19 +1498,82 @@ export function App(): JSX.Element {
     }
   }, [spec.loss, canvasWidth]);
 
+  const remeasureScheduled = useRef(false);
   const handleAutoAlign = useCallback(async (customNodes?: Node[], customEdges?: Edge[]) => {
     try {
       const activeNodes = customNodes ?? nodes;
       const activeEdges = customEdges ?? edges;
       if (activeNodes.length === 0) return;
-      
-      const sorted = sortNodesSequentially(activeNodes, activeEdges);
-      const layouted = applySnakeLayout(sorted, canvasWidth);
+
+      // Fold runs of identical adjacent bricks into block_groups first, so the
+      // layout operates on the collapsed graph (and edges stay consistent).
+      const grouped = groupRepeatedNodes(activeNodes, activeEdges);
+      // ELK layered layout: real topological layering + crossing minimization
+      // (handles residual skip edges far better than the old snake layout).
+      // Returns edges annotated with orthogonal bend points for clean routing.
+      const { nodes: layouted, edges: routed } = await layoutFlow(grouped.nodes, grouped.edges, {
+        sizeOf: getNodeSize,
+      });
       setNodes(layouted);
+      setEdges(routed);
+
+      // Freshly loaded/folded nodes have no measured size yet, so their widths
+      // were estimated. Re-run once after React Flow measures them for
+      // pixel-accurate, overlap-free placement (uses the latest state via ref).
+      const someUnmeasured = layouted.some((n) => !((n as any).measured?.width));
+      if (someUnmeasured && !remeasureScheduled.current) {
+        remeasureScheduled.current = true;
+        setTimeout(() => {
+          remeasureScheduled.current = false;
+          void handleAutoAlignRef.current?.();
+        }, 220);
+      }
     } catch (err) {
       console.error("Auto align layout failed:", err);
     }
-  }, [nodes, edges, canvasWidth]);
+  }, [nodes, edges, canvasWidth, setEdges]);
+  // Always points at the latest handleAutoAlign so the deferred re-measure pass
+  // reads current (now-measured) nodes instead of a stale closure.
+  const handleAutoAlignRef = useRef(handleAutoAlign);
+  handleAutoAlignRef.current = handleAutoAlign;
+
+  // Re-run topological layout after structural changes (node/edge add or
+  // remove) so blocks never end up overlapping. Debounced, and explicitly NOT
+  // triggered by drag/select/measure changes to avoid fighting the user.
+  const structuralSig = `${nodes.length}:${edges.map((e) => e.id).sort().join("|")}`;
+  const prevStructuralSig = useRef(structuralSig);
+  const relayoutTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (prevStructuralSig.current === structuralSig) return;
+    prevStructuralSig.current = structuralSig;
+    if (relayoutTimer.current) clearTimeout(relayoutTimer.current);
+    relayoutTimer.current = setTimeout(() => { void handleAutoAlign(); }, 250);
+    return () => { if (relayoutTimer.current) clearTimeout(relayoutTimer.current); };
+  }, [structuralSig, handleAutoAlign]);
+
+  // Persist the tokenizer input-source mode (example/file/directory) onto the
+  // real tokenizer node's params so it survives save/load and debugger remap.
+  const handleTokenizerSourceMode = useCallback((src: TokenizerInputSource) => {
+    setNodes((prev) => prev.map((n) =>
+      n.type === "tokenizer_virtual"
+        ? { ...n, data: { ...(n.data as any), params: { ...((n.data as any)?.params ?? {}), input_source: src } } }
+        : n
+    ));
+    if (src !== "example") setTokenizerSourceOpen(true);
+  }, [setNodes]);
+
+  // Commit a chosen file/directory path from the explorer modal.
+  const handleTokenizerPathSelect = useCallback(
+    (path: string, ctype: "text" | "code" | "parquet") => {
+      setNodes((prev) => prev.map((n) =>
+        n.type === "tokenizer_virtual"
+          ? { ...n, data: { ...(n.data as any), params: { ...((n.data as any)?.params ?? {}), selected_path: path, content_type: ctype } } }
+          : n
+      ));
+      setTokenizerSourceOpen(false);
+    },
+    [setNodes]
+  );
 
   const handleUnpackBlockGroup = useCallback(async (groupId: string, countToUnpack: number) => {
     const groupNode = nodes.find(n => n.id === groupId);
@@ -1399,9 +1606,9 @@ export function App(): JSX.Element {
             id: name,
             type: "brick",
             position: { x, y: y - 100 },
-            data: { kind: s.kind, params: s.params ?? {} } as never,
+            data: { kind: s.kind, params: s.params ?? {}, _unpacked: true } as never,
           });
-          
+
           if (lastName) {
             newEdges.push({
               id: `${lastName}->${name}`,
@@ -1445,7 +1652,7 @@ export function App(): JSX.Element {
             id: name,
             type: "brick",
             position: { x, y },
-            data: { kind: s.kind, params: s.params ?? {} } as never,
+            data: { kind: s.kind, params: s.params ?? {}, _unpacked: true } as never,
           });
           if (lastName) {
             newEdges.push({
@@ -2287,6 +2494,9 @@ export function App(): JSX.Element {
           tokens: debugState.tokens,
           onPromptChange: (val: string) => debugState.setPrompt(val),
           isActiveNode,
+          inputSource: ((n.data as any)?.params?.input_source as string) || "example",
+          onSourceModeChange: handleTokenizerSourceMode,
+          onBrowseSource: () => setTokenizerSourceOpen(true),
           selectedPath: ((n.data as any)?.params?.selected_path as string) || null,
           contentType: ((n.data as any)?.params?.content_type as string) || null,
           progressPercent: lastEvent?.dataset_progress?.progress_percent || 0,
@@ -2334,6 +2544,7 @@ export function App(): JSX.Element {
     const realTokenizer = nodes.find((n) => n.type === "tokenizer_virtual");
     const selectedPath = (realTokenizer?.data as any)?.params?.selected_path || null;
     const contentType = (realTokenizer?.data as any)?.params?.content_type || null;
+    const inputSource = (realTokenizer?.data as any)?.params?.input_source || "example";
 
     const minX = modelNodes.length > 0 ? Math.min(...modelNodes.map((n) => n.position.x)) : 100;
     const firstNode = modelNodes[0];
@@ -2348,6 +2559,9 @@ export function App(): JSX.Element {
         prompt: debugState.prompt,
         tokens: debugState.tokens,
         onPromptChange: (val: string) => debugState.setPrompt(val),
+        inputSource,
+        onSourceModeChange: handleTokenizerSourceMode,
+        onBrowseSource: () => setTokenizerSourceOpen(true),
         selectedPath,
         contentType,
         progressPercent: lastEvent?.dataset_progress?.progress_percent || 0,
@@ -3466,6 +3680,39 @@ export function App(): JSX.Element {
               void handleGenerateFromWizard(wizardPreset, options);
             }}
           />
+        )}
+        {tokenizerSourceOpen && (
+          <div
+            data-testid="tokenizer-source-modal"
+            onClick={() => setTokenizerSourceOpen(false)}
+            style={{
+              position: "fixed",
+              inset: 0,
+              background: "rgba(0, 0, 0, 0.55)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              zIndex: 1000,
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{ width: 460, maxWidth: "92vw" }}
+            >
+              <PathExplorer
+                rpc={rpc}
+                initialPath={
+                  (() => {
+                    const tk = nodes.find((n) => n.type === "tokenizer_virtual");
+                    const p = (tk?.data as any)?.params?.selected_path as string | undefined;
+                    if (!p) return ".";
+                    return p.includes("/") ? p.slice(0, p.lastIndexOf("/")) || "." : ".";
+                  })()
+                }
+                onSelect={handleTokenizerPathSelect}
+              />
+            </div>
+          </div>
         )}
       </div>
     </ReactFlowProvider>

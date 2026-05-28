@@ -17,6 +17,8 @@ export interface MtpHeadData {
   logits: MtpLogit[];
 }
 
+export type TokenizerInputSource = "example" | "file" | "directory";
+
 export function TokenizerVirtualNode({ data }: NodeProps): JSX.Element {
   const isActive = data.isActiveNode as boolean;
   const prompt = (data.prompt as string) || "The cat sat on the mat";
@@ -30,6 +32,19 @@ export function TokenizerVirtualNode({ data }: NodeProps): JSX.Element {
   const tokenOffset = (data.tokenOffset as number) || 0;
   const downloadSpeed = (data.downloadSpeed as string) || null;
 
+  // Input source switcher (example prompt vs file vs directory explorer)
+  const inputSource = (data.inputSource as TokenizerInputSource) || "example";
+  const onSourceModeChange = data.onSourceModeChange as
+    | ((src: TokenizerInputSource) => void)
+    | undefined;
+  const onBrowseSource = data.onBrowseSource as (() => void) | undefined;
+
+  const SOURCES: { id: TokenizerInputSource; label: string; icon: string }[] = [
+    { id: "example", label: "Example", icon: "✎" },
+    { id: "file", label: "File", icon: "📄" },
+    { id: "directory", label: "Folder", icon: "📁" },
+  ];
+
   return (
     <div
       role="group"
@@ -37,7 +52,8 @@ export function TokenizerVirtualNode({ data }: NodeProps): JSX.Element {
       data-testid="tokenizer-virtual-node"
       className={`vb-node ${isActive ? "vb-node-selected" : ""}`}
       style={{
-        minWidth: 280,
+        width: 264,
+        maxWidth: 264,
         padding: "14px",
         background: "var(--vb-surface-2)",
         border: isActive
@@ -129,41 +145,124 @@ export function TokenizerVirtualNode({ data }: NodeProps): JSX.Element {
         </div>
       )}
 
-      <div>
-        <label
-          htmlFor="debugger-prompt-input"
-          style={{
-            display: "block",
-            fontSize: 10,
-            color: T.textSecondary,
-            marginBottom: 4,
-            fontWeight: 600,
-            textTransform: "uppercase",
-            letterSpacing: "0.05em",
-          }}
-        >
-          Prompt Input
-        </label>
-        <input
-          id="debugger-prompt-input"
-          type="text"
-          className="nodrag nopan"
-          value={prompt}
-          onChange={(e) => onPromptChange?.(e.target.value)}
-          placeholder="Type prompt here..."
-          style={{
-            width: "100%",
-            background: "var(--vb-surface-3)",
-            border: "1px solid var(--vb-border)",
-            borderRadius: "var(--vb-radius-sm)",
-            color: T.text,
-            padding: "6px 8px",
-            fontSize: 12,
-            fontFamily: T.font,
-            outline: "none",
-          }}
-        />
+      {/* Input source switcher: example prompt / file / directory */}
+      <div className="nodrag nopan" style={{ display: "flex", gap: 4 }}>
+        {SOURCES.map((s) => {
+          const active = inputSource === s.id;
+          return (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => onSourceModeChange?.(s.id)}
+              data-testid={`tokenizer-source-${s.id}`}
+              style={{
+                flex: 1,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 4,
+                padding: "4px 0",
+                fontSize: 10,
+                fontWeight: 600,
+                cursor: "pointer",
+                color: active ? "var(--vb-accent)" : T.textSecondary,
+                background: active ? "var(--vb-accent-soft)" : "var(--vb-surface-3)",
+                border: `1px solid ${active ? "var(--vb-accent)" : "var(--vb-border)"}`,
+                borderRadius: "var(--vb-radius-sm)",
+              }}
+            >
+              <span style={{ fontSize: 11 }}>{s.icon}</span>
+              {s.label}
+            </button>
+          );
+        })}
       </div>
+
+      {inputSource === "example" ? (
+        <div>
+          <label
+            htmlFor="debugger-prompt-input"
+            style={{
+              display: "block",
+              fontSize: 10,
+              color: T.textSecondary,
+              marginBottom: 4,
+              fontWeight: 600,
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+            }}
+          >
+            Prompt Input
+          </label>
+          <input
+            id="debugger-prompt-input"
+            type="text"
+            className="nodrag nopan"
+            value={prompt}
+            onChange={(e) => onPromptChange?.(e.target.value)}
+            placeholder="Type prompt here..."
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              background: "var(--vb-surface-3)",
+              border: "1px solid var(--vb-border)",
+              borderRadius: "var(--vb-radius-sm)",
+              color: T.text,
+              padding: "6px 8px",
+              fontSize: 12,
+              fontFamily: T.font,
+              outline: "none",
+            }}
+          />
+        </div>
+      ) : (
+        <div>
+          <div
+            style={{
+              display: "block",
+              fontSize: 10,
+              color: T.textSecondary,
+              marginBottom: 4,
+              fontWeight: 600,
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+            }}
+          >
+            {inputSource === "file" ? "Source File" : "Source Directory"}
+          </div>
+          <button
+            type="button"
+            className="nodrag nopan"
+            onClick={() => onBrowseSource?.()}
+            data-testid="tokenizer-browse-source"
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              background: "var(--vb-surface-3)",
+              border: "1px dashed var(--vb-border)",
+              borderRadius: "var(--vb-radius-sm)",
+              color: selectedPath ? T.text : T.textMuted,
+              padding: "6px 8px",
+              fontSize: 11.5,
+              fontFamily: T.fontMono,
+              cursor: "pointer",
+              textAlign: "left",
+            }}
+          >
+            <span>{inputSource === "file" ? "📄" : "📁"}</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {selectedPath
+                ? selectedPath.length > 26
+                  ? `…${selectedPath.slice(-24)}`
+                  : selectedPath
+                : "Browse…"}
+            </span>
+          </button>
+        </div>
+      )}
 
       <div>
         <div

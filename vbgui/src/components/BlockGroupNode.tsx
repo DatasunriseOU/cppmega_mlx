@@ -151,7 +151,50 @@ export function BlockGroupNode({ data, id, selected }: NodeProps): JSX.Element {
               <span style={{ color: T.textSecondary }}>Count to unpack:</span>
               <span style={{ fontWeight: "bold", color: "var(--vb-accent)", fontFamily: T.fontMono }}>{unpackCount} / {d.repeats}</span>
             </div>
-            
+
+            {/* Precise stepper + numeric input — usable even for 60+ layers */}
+            {(() => {
+              const clamp = (v: number) => Math.max(1, Math.min(d.repeats, isNaN(v) ? 1 : v));
+              const stepBtn = (label: string, fn: () => void, testid: string) => (
+                <button
+                  type="button"
+                  data-testid={testid}
+                  onClick={(e) => { e.stopPropagation(); fn(); }}
+                  style={{
+                    width: 26, height: 26, flex: "0 0 auto",
+                    fontSize: 14, fontWeight: "bold", lineHeight: 1,
+                    background: "rgba(168, 85, 247, 0.15)",
+                    border: "1px solid var(--vb-cat-ssm)",
+                    color: "var(--vb-text)", borderRadius: 4, cursor: "pointer",
+                  }}
+                >{label}</button>
+              );
+              return (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
+                  {stepBtn("−", () => setUnpackCount((c) => clamp(c - 1)), `unpack-dec-${id}`)}
+                  <input
+                    type="number"
+                    className="nodrag nopan"
+                    min={1}
+                    max={d.repeats}
+                    value={unpackCount}
+                    data-testid={`unpack-count-input-${id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setUnpackCount(clamp(parseInt(e.target.value, 10)))}
+                    style={{
+                      flex: 1, minWidth: 0, textAlign: "center",
+                      background: "var(--vb-surface-3, rgba(255,255,255,0.06))",
+                      border: "1px solid var(--vb-cat-ssm)",
+                      color: "var(--vb-text)", borderRadius: 4,
+                      padding: "3px 4px", fontSize: 12, fontFamily: T.fontMono,
+                      outline: "none",
+                    }}
+                  />
+                  {stepBtn("+", () => setUnpackCount((c) => clamp(c + 1)), `unpack-inc-${id}`)}
+                </div>
+              );
+            })()}
+
             <input
               type="range"
               min={1}

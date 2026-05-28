@@ -11,6 +11,10 @@ import pytest
 from cppmega_mlx.training.path_c_fused_suffix import (
     build_fused_suffix_custom_function,
 )
+from cppmega_mlx.training.path_c_fused_replay import (
+    build_fused_replay_boundary_custom_function,
+    replay_launch_scalar_params,
+)
 
 
 class _RecordingArtifact:
@@ -41,6 +45,42 @@ class _RecordingArtifact:
 class _FakeBankOwner:
     def __init__(self) -> None:
         self.buffers = {"f32": mx.zeros((300,), dtype=mx.float32)}
+
+
+class _RecordingReplayArtifact:
+    """Artifact stand-in for fused block forward/replay-backward gates."""
+
+    def __init__(self) -> None:
+        self.forward_calls: list[Mapping[str, Any]] = []
+        self.backward_cotangent_snapshots: list[dict[str, list[float]]] = []
+
+    def forward(
+        self,
+        *,
+        bank_owner: Any,
+        kernel_scalar_params: Mapping[str, Any] | None = None,
+    ) -> None:
+        scalar_params = dict(kernel_scalar_params or {})
+        self.forward_calls.append(
+            {"bank_owner": bank_owner, "kernel_scalar_params": scalar_params}
+        )
+        bank = bank_owner.buffers["f32"]
+        run_backward = int(scalar_params.get("path_c_run_backward", -1))
+        if run_backward == 0:
+            bank[80:92] = mx.full((12,), 2.0, dtype=mx.float32)
+            bank[92:104] = mx.full((12,), 5.0, dtype=mx.float32)
+        elif run_backward == 1:
+            self.backward_cotangent_snapshots.append(
+                {
+                    "boundary_a_grad": bank[220:232].tolist(),
+                    "boundary_b_grad": bank[232:244].tolist(),
+                }
+            )
+            bank[200:212] = mx.full((12,), 7.0, dtype=mx.float32)
+            bank[212:216] = mx.array([1.0, 2.0, 3.0, 4.0], dtype=mx.float32)
+            bank[216:220] = mx.array([5.0, 6.0, 7.0, 8.0], dtype=mx.float32)
+        else:
+            raise AssertionError(f"unexpected path_c_run_backward={run_backward}")
 
 
 def _make_abi_map() -> dict[str, dict[str, Any]]:
@@ -85,7 +125,183 @@ def _make_abi_map() -> dict[str, dict[str, Any]]:
             "bank": "f32", "dtype": "float32", "offset": 216, "size": 4,
             "shape": (4,), "logical_shape": (4,),
         },
+        "boundary_a": {
+            "bank": "f32", "dtype": "float32", "offset": 80, "size": 12,
+            "shape": (12,), "logical_shape": (1, 3, 4),
+        },
+        "boundary_b": {
+            "bank": "f32", "dtype": "float32", "offset": 92, "size": 12,
+            "shape": (12,), "logical_shape": (1, 3, 4),
+        },
+        "boundary_a_grad": {
+            "bank": "f32", "dtype": "float32", "offset": 220, "size": 12,
+            "shape": (12,), "logical_shape": (1, 3, 4),
+        },
+        "boundary_b_grad": {
+            "bank": "f32", "dtype": "float32", "offset": 232, "size": 12,
+            "shape": (12,), "logical_shape": (1, 3, 4),
+        },
     }
+
+
+def _parameter_aliases() -> dict[str, dict[str, Any]]:
+    return {
+        "p_a": {
+            "logical_name": "param_a",
+            "logical_grad_name": "param_a_grad",
+            "bank": "f32", "dtype": "float32",
+            "offset": 60, "size": 4, "logical_shape": (4,),
+        },
+        "p_b": {
+            "logical_name": "param_b",
+            "logical_grad_name": "param_b_grad",
+            "bank": "f32", "dtype": "float32",
+            "offset": 64, "size": 4, "logical_shape": (4,),
+        },
+    }
+
+
+def test_fused_replay_boundary_value_and_grad_seeds_cotangents() -> None:
+    artifact = _RecordingReplayArtifact()
+    bank_owner = _FakeBankOwner()
+    abi_map = _make_abi_map()
+    f = build_fused_replay_boundary_custom_function(
+        artifact=artifact,
+        bank_owner=bank_owner,
+        abi_map=abi_map,
+        hidden_entry_logical_name="hidden_entry",
+        boundary_output_logical_names=("boundary_a", "boundary_b"),
+        boundary_cotangent_logical_names=("boundary_a_grad", "boundary_b_grad"),
+        in_region_parameter_bank_aliases=_parameter_aliases(),
+        parameter_order=("p_a", "p_b"),
+    )
+
+    hidden_entry = mx.full((1, 3, 4), 9.0, dtype=mx.float32)
+    param_a = mx.array([10.0, 11.0, 12.0, 13.0], dtype=mx.float32)
+    param_b = mx.array([20.0, 21.0, 22.0, 23.0], dtype=mx.float32)
+
+    def loss_fn(hidden_entry, param_a, param_b):
+        boundary_a, boundary_b = f(hidden_entry, param_a, param_b)
+        return boundary_a.sum() + boundary_b.sum() * mx.array(3.0, dtype=mx.float32)
+
+    value, grads = mx.value_and_grad(loss_fn, argnums=(0, 1, 2))(
+        hidden_entry,
+        param_a,
+        param_b,
+    )
+    mx.eval(value, *grads)
+
+    assert float(value) == (12 * 2.0) + (12 * 5.0 * 3.0)
+    assert [
+        call["kernel_scalar_params"]["path_c_run_backward"]
+        for call in artifact.forward_calls
+    ] == [0, 1]
+    assert artifact.backward_cotangent_snapshots == [
+        {
+            "boundary_a_grad": [1.0] * 12,
+            "boundary_b_grad": [3.0] * 12,
+        }
+    ]
+    assert grads[0].shape == hidden_entry.shape
+    assert grads[0].tolist() == [[[7.0] * 4] * 3]
+    assert grads[1].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert grads[2].tolist() == [5.0, 6.0, 7.0, 8.0]
+
+
+def test_fused_replay_boundary_casts_suffix_cotangent_to_grad_bank_dtype() -> None:
+    artifact = _RecordingReplayArtifact()
+    bank_owner = _FakeBankOwner()
+    f = build_fused_replay_boundary_custom_function(
+        artifact=artifact,
+        bank_owner=bank_owner,
+        abi_map=_make_abi_map(),
+        hidden_entry_logical_name="hidden_entry",
+        boundary_output_logical_names=("boundary_a", "boundary_b"),
+        boundary_cotangent_logical_names=("boundary_a_grad", "boundary_b_grad"),
+        in_region_parameter_bank_aliases=_parameter_aliases(),
+        parameter_order=("p_a", "p_b"),
+    )
+
+    def loss_fn(hidden_entry, param_a, param_b):
+        boundary_a, boundary_b = f(hidden_entry, param_a, param_b)
+        return (
+            boundary_a.astype(mx.bfloat16).sum()
+            + boundary_b.astype(mx.bfloat16).sum() * mx.array(2.0, dtype=mx.bfloat16)
+        )
+
+    value, grads = mx.value_and_grad(loss_fn, argnums=(0, 1, 2))(
+        mx.full((1, 3, 4), 9.0, dtype=mx.float32),
+        mx.array([10.0, 11.0, 12.0, 13.0], dtype=mx.float32),
+        mx.array([20.0, 21.0, 22.0, 23.0], dtype=mx.float32),
+    )
+    mx.eval(value, *grads)
+
+    assert artifact.backward_cotangent_snapshots == [
+        {
+            "boundary_a_grad": [1.0] * 12,
+            "boundary_b_grad": [2.0] * 12,
+        }
+    ]
+    assert bank_owner.buffers["f32"].dtype == mx.float32
+
+
+def test_fused_replay_grid_chunked_artifact_launches_once_without_chunk_param() -> None:
+    artifact = _RecordingReplayArtifact()
+    bank_owner = _FakeBankOwner()
+    f = build_fused_replay_boundary_custom_function(
+        artifact=artifact,
+        bank_owner=bank_owner,
+        abi_map=_make_abi_map(),
+        hidden_entry_logical_name="hidden_entry",
+        boundary_output_logical_names=("boundary_a", "boundary_b"),
+        boundary_cotangent_logical_names=("boundary_a_grad", "boundary_b_grad"),
+        in_region_parameter_bank_aliases=_parameter_aliases(),
+        parameter_order=("p_a", "p_b"),
+        row_chunk_count=64,
+        row_chunk_index_param=None,
+    )
+
+    outputs = f(
+        mx.full((1, 3, 4), 9.0, dtype=mx.float32),
+        mx.array([10.0, 11.0, 12.0, 13.0], dtype=mx.float32),
+        mx.array([20.0, 21.0, 22.0, 23.0], dtype=mx.float32),
+    )
+    mx.eval(*outputs)
+
+    assert len(artifact.forward_calls) == 1
+    assert artifact.forward_calls[0]["kernel_scalar_params"] == {
+        "path_c_run_backward": 0,
+    }
+
+
+def test_fused_replay_launcher_chunked_artifact_launches_all_chunks() -> None:
+    launch_params = replay_launch_scalar_params(
+        run_backward=False,
+        launch_count=2,
+        subchunk_count=3,
+        gate_param="path_c_run_backward",
+        row_chunk_index_param="path_c_row_chunk_index",
+        row_subchunk_index_param="path_c_row_subchunk_index",
+    )
+
+    expected_forward = [
+        {
+            "path_c_run_backward": 0,
+            "path_c_row_chunk_index": chunk,
+            "path_c_row_subchunk_index": subchunk,
+        }
+        for chunk in range(2)
+        for subchunk in range(3)
+    ]
+    assert list(launch_params) == expected_forward
+    assert list(
+        replay_launch_scalar_params(
+            run_backward=True,
+            launch_count=1,
+            subchunk_count=1,
+            gate_param="path_c_run_backward",
+        )
+    ) == [{"path_c_run_backward": 1}]
 
 
 def test_fused_suffix_forward_writes_inputs_and_returns_loss() -> None:

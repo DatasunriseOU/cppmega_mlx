@@ -332,13 +332,33 @@ def test_live_install_flips_route_to_fused_train_block() -> None:
     )
 
     model = build_local_gb10_quarter_tiny_smoke_model()
+    lowerer_calls: list[dict[str, Any]] = []
+
+    class _NoopKernel:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def __call__(self, *kernel_args: Any) -> None:
+            self.calls.append(tuple(kernel_args))
+
+    def fake_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
+        del func_or_mod
+        kernel = _NoopKernel()
+        lowerer_calls.append({"target": target, "kwargs": dict(kwargs), "kernel": kernel})
+        return kernel
+
     args = m04.build_parser().parse_args([
         "--synthetic", "--dtype", "fp8_path_c",
         "--model-profile", "local_gb10_quarter",
         "--dry-run-json", "--output", "/tmp/test_mixed_mode_route.json",
         "--data-path", "/dev/null", "--data-format", "npz",
+        "--use-path-c-fused-train-block-runtime",
     ])
-    route = m04.fp8_path_c_training_route_payload_for_model(args, model)
+    route = m04.fp8_path_c_training_route_payload_for_model(
+        args,
+        model,
+        fused_train_block_artifact_lowerer=fake_lowerer,
+    )
 
     assert route["status"] == "m04_path_c_training_route_available"
     assert route["selected_action"] == "run_path_c_fused_train_block_route"
@@ -352,8 +372,17 @@ def test_live_install_flips_route_to_fused_train_block() -> None:
     assert type(runtime).__name__ == "PathCFusedPlusEagerTrainingRuntime"
     inner_contract = runtime.value_and_grad_contract()
     assert inner_contract["returns_full_model_grads"] is True
-    assert inner_contract["gradient_scope"] == "full_model_via_fused_suffix_bypass"
+    assert (
+        inner_contract["gradient_scope"]
+        == "full_model_via_fused_replay_cotangent_bridge"
+    )
+    assert inner_contract["suffix_bypass_available"] is False
+    assert inner_contract["replay_cotangent_bridge_available"] is True
     assert inner_contract["delegates_to_eager_loss_and_grad"] is False
+    auto_install = route["path_c_fusion"]["fused_train_block_auto_install"]
+    assert auto_install["training_runtime_available"] is True
+    assert auto_install["training_runtime_contract"]["status"] == "ok"
+    assert lowerer_calls[0]["target"] == "metal"
 
 
 def test_value_and_grad_runs_artifact_warmup_with_telemetry() -> None:
@@ -419,10 +448,9 @@ def test_value_and_grad_records_artifact_warmup_failure_without_breaking_step() 
     assert "x" in grads
 
 
-def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
-    """End-to-end: a real HybridTinyLM's mixed-mode runtime, when value_and_grad
-    is called with a real eager closure, must actually launch the compiled
-    TileLang artifact (telemetry.completed=True, elapsed_ns > 0)."""
+def test_live_value_and_grad_replay_bridge_dispatches_artifact() -> None:
+    """End-to-end: a real HybridTinyLM mixed runtime must dispatch the compiled
+    artifact through forward and replay-backward gates."""
 
     import importlib.util
     from pathlib import Path
@@ -441,19 +469,41 @@ def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
     spec.loader.exec_module(m04)
 
     model = build_local_gb10_quarter_tiny_smoke_model()
+    kernels: list[Any] = []
+
+    class _NoopKernel:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def __call__(self, *kernel_args: Any) -> None:
+            self.calls.append(tuple(kernel_args))
+
+    def fake_lowerer(func_or_mod: Any, *, target: str, **kwargs: Any) -> Any:
+        del func_or_mod, target, kwargs
+        kernel = _NoopKernel()
+        kernels.append(kernel)
+        return kernel
+
     args = m04.build_parser().parse_args([
         "--synthetic", "--dtype", "fp8_path_c",
         "--model-profile", "local_gb10_quarter",
         "--dry-run-json", "--output", "/tmp/test_live_warmup.json",
         "--data-path", "/dev/null", "--data-format", "npz",
+        "--use-path-c-fused-train-block-runtime",
     ])
-    m04.fp8_path_c_training_route_payload_for_model(args, model)
+    route = m04.fp8_path_c_training_route_payload_for_model(
+        args,
+        model,
+        fused_train_block_artifact_lowerer=fake_lowerer,
+    )
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
     runtime = model.path_c_fused_train_block_training_runtime
     assert runtime is not None
     assert type(runtime).__name__ == "PathCFusedPlusEagerTrainingRuntime"
 
-    # Trivial loss closure — sum of zero embedding lookup. We don't care
-    # about the numbers; we care that the runtime calls artifact.forward.
+    # Trivial loss closure. Replay bridge ignores this closure in favour of
+    # the model-attached fused replay loss; it is still passed to keep the
+    # public value_and_grad signature exercised.
     # Match the path_c_training_sequence_length(args)=127 the install path uses
     # so the fused suffix bank slots line up with the prefix output.
     seq_len = 127
@@ -479,34 +529,25 @@ def test_live_value_and_grad_warmup_runs_real_tilelang_kernel() -> None:
     )
     mx.eval(loss, ntokens)
 
-    # The runtime exposes two complementary telemetry payloads:
-    #   * last_fused_warmup_payload is populated only in warmup mode (no bank
-    #     residency aliases were supplied);
-    #   * last_fused_value_and_grad_payload is populated in merged mode (bank
-    #     residency aliases are supplied, so the fused kernel ran via
-    #     artifact.value_and_grad and produced bank-resident gradients).
-    # When the live install path binds in-region parameter views into the
-    # bank, the runtime switches to merged mode; otherwise it stays in
-    # warmup mode. Either way the kernel must have launched and any error
-    # field must be None.
+    # Replay bridge is now the training critical path: no separate warmup
+    # launch, and artifact.forward must be called once with run_backward=0
+    # and once with run_backward=1 through the custom VJP.
     warmup_telemetry = runtime.last_fused_warmup_payload
-    merge_telemetry = runtime.last_fused_value_and_grad_payload
-    assert (
-        warmup_telemetry["attempted"] is True
-        or merge_telemetry["attempted"] is True
-    ), {"warmup": warmup_telemetry, "merged": merge_telemetry}
-    if warmup_telemetry["attempted"]:
-        assert warmup_telemetry["completed"] is True, warmup_telemetry
-        assert warmup_telemetry["elapsed_ns"] > 0
-        assert warmup_telemetry["error"] is None
-    if merge_telemetry["attempted"]:
-        assert merge_telemetry["completed"] is True, merge_telemetry
-        assert merge_telemetry["elapsed_ns"] > 0
-        assert merge_telemetry["error"] is None
+    replay_telemetry = runtime.last_fused_value_and_grad_payload
+    assert warmup_telemetry["attempted"] is False
+    assert replay_telemetry["attempted"] is True
+    assert replay_telemetry["completed"] is True, replay_telemetry
+    assert replay_telemetry["elapsed_ns"] > 0
+    assert replay_telemetry["error"] is None
+    assert replay_telemetry["replay_cotangent_bridge_active"] is True
+    assert replay_telemetry["suffix_bypass_active"] is False
+    assert len(kernels) == 1
+    assert len(kernels[0].calls) == 2
 
     # Loss/ntokens come from the eager closure; gradient tree must contain
-    # parameters that the artifact does NOT cover (proving the eager bridge
-    # provided residual grads).
+    # parameters that the artifact does NOT cover, proving the eager prefix /
+    # suffix graph still provides residual grads while the M/R/A block is
+    # crossed through the fused replay custom VJP.
     flat = dict(tree_flatten(grads))
     assert "layers.0.block.q_proj.weight" in flat  # outside fused region
 

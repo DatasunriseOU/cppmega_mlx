@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import json
+import math
 import os
 import platform
 import re
@@ -39,18 +41,31 @@ from cppmega_mlx.runtime.path_c_fusion import (  # noqa: E402
     tilelang_single_entry_lowerer,
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
+    DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+    DESCRIPTOR_EXECUTION_STAGE_BACKWARD,
+    DESCRIPTOR_EXECUTION_STAGE_FORWARD,
     DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
+    DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
     make_path_c_descriptor_schedule_template,
+    make_path_c_descriptor_stage_schedule_template,
+    merge_path_c_physical_abi_for_prim_funcs,
     path_c_fusion_schedule_spec,
+    plan_path_c_descriptor_phase_groups,
+    plan_path_c_descriptor_stage_groups,
     plan_path_c_direct_fusion_chain_for_region,
     plan_path_c_direct_fusion_chains_for_model,
     select_path_c_fusion_schedule_target,
 )
 from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
     make_physical_abi_bank_owner,
+    path_c_kernel_buffer_order,
     plan_physical_abi_runtime_bridge,
     validate_physical_abi_map,
     validate_physical_abi_runtime_bindings,
+)
+from cppmega_mlx.training.compiled import (  # noqa: E402
+    PathCFusedTrainBlockCallableArtifact,
+    PathCGeneratedStageTrainBlockCallableArtifact,
 )
 
 
@@ -88,6 +103,34 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=256 * 1024 * 1024,
         help="Skip runtime smoke execution if the smoke ABI exceeds this byte budget.",
+    )
+    parser.add_argument(
+        "--runtime-smoke-max-launches",
+        type=int,
+        default=None,
+        help=(
+            "Optionally cap generated-stage forward and backward launches. "
+            "This validates binding without claiming a full production execution."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-smoke-max-stages",
+        type=int,
+        default=None,
+        help=(
+            "Optionally cap generated stages per launch. This is a diagnostic "
+            "binding smoke budget and always prevents a full-execution claim."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-smoke-artifact",
+        choices=("single", "staged", "phased"),
+        default="single",
+        help=(
+            "Choose whether runtime smoke dispatches the single generated "
+            "train-block artifact, the diagnostic generated-stage artifact, "
+            "or the descriptor-fused forward/backward phase artifact."
+        ),
     )
     return parser
 
@@ -575,9 +618,21 @@ def _production_runtime_smoke_binding(
 
     if runtime_smoke_payload.get("status") != "ok":
         return None
+    if runtime_smoke_payload.get("full_execution") is False:
+        return None
     if runtime_smoke_payload.get("mode") != "production_1b":
         return None
     if runtime_smoke_payload.get("region_name") != region_name:
+        return None
+    fused_route = runtime_smoke_payload.get("fused_train_block_route")
+    if not isinstance(fused_route, Mapping) or fused_route.get("status") != "ok":
+        return None
+    route = fused_route.get("route")
+    if not isinstance(route, Mapping):
+        return None
+    if route.get("selected_action") != "run_path_c_fused_train_block_route":
+        return None
+    if route.get("single_fused_train_block_runtime_available") is not True:
         return None
     binding = runtime_smoke_payload.get("physical_abi_runtime_binding")
     if not isinstance(binding, Mapping):
@@ -1035,8 +1090,13 @@ def _runtime_smoke_full_kernel_args(
 
 
 def _tiny_runtime_smoke_region_target_model() -> tuple[Any, Any, Any]:
-    profile = local_gb10_quarter_profile()
-    cfg = profile.tiny_smoke_config(
+    profile = local_gb10_quarter_profile(
+        name="runtime_smoke",
+        pattern="MRA",
+        depth=3,
+        dsa_a_layer_ranks=(0,),
+    )
+    model = profile.build_tiny_smoke_model(
         pattern="MRA",
         depth=3,
         dsa_a_layer_ranks=(0,),
@@ -1049,16 +1109,9 @@ def _tiny_runtime_smoke_region_target_model() -> tuple[Any, Any, Any]:
         m2rnn_k_head_dim=8,
         m2rnn_v_head_dim=8,
     )
-    model = SimpleNamespace(
-        name="runtime_smoke",
-        path_c_profile_name="runtime_smoke",
-        path_c_input_model_name="runtime_smoke.path_c_bricks",
-        route_symbols=("M", "R", "A"),
-        config=cfg,
-    )
     regions = build_path_c_model_regions_from_model(
         model,
-        region_prefix="runtime_smoke",
+        region_prefix=model.path_c_region_prefix,
         include_backward=False,
     )
     if not regions:
@@ -1122,10 +1175,133 @@ def _artifact_kernel_source_stats(artifact: Any) -> dict[str, Any]:
         "if_count": kernel_source.count("if ("),
         "threadgroup_dynamic_shared_bytes": None,
     }
-    match = re.search(r"threadgroup\s+uchar\s+buf_dyn_shmem\[(\d+)\]", kernel_source)
+    match = re.search(
+        r"threadgroup\s+(?P<dtype>uchar|float|int)\s+buf_dyn_shmem\[(?P<count>\d+)\]",
+        kernel_source,
+    )
     if match is not None:
-        stats["threadgroup_dynamic_shared_bytes"] = int(match.group(1))
+        scale = {"uchar": 1, "float": 4, "int": 4}[match.group("dtype")]
+        stats["threadgroup_dynamic_shared_bytes"] = int(match.group("count")) * scale
     return stats
+
+
+def _stage_kernel_source_payload(
+    *,
+    monolithic_artifact: Any | None,
+    forward_artifacts: Sequence[Any],
+    backward_artifacts: Sequence[Any],
+    artifact_kind: str = "staged",
+) -> dict[str, Any]:
+    monolithic = _artifact_kernel_source_stats(monolithic_artifact)
+    stages = {
+        **{
+            f"forward_{index}": _artifact_kernel_source_stats(artifact)
+            for index, artifact in enumerate(forward_artifacts)
+        },
+        **{
+            f"backward_{index}": _artifact_kernel_source_stats(artifact)
+            for index, artifact in enumerate(backward_artifacts)
+        },
+    }
+    max_stage = max(
+        stages.values(),
+        key=lambda item: int(item.get("kernel_source_bytes", 0) or 0),
+    )
+    return {
+        **max_stage,
+        "generated_stage_artifact": True,
+        "generated_phase_artifact": artifact_kind == "phased",
+        "stage_count": len(stages),
+        "max_stage_kernel_source_bytes": max(
+            int(item.get("kernel_source_bytes", 0) or 0)
+            for item in stages.values()
+        ),
+        "total_stage_kernel_source_bytes": sum(
+            int(item.get("kernel_source_bytes", 0) or 0)
+            for item in stages.values()
+        ),
+        "monolithic_contract": monolithic,
+        "monolithic_native_compile_skipped": monolithic_artifact is None,
+        "stages": stages,
+    }
+
+
+def _generated_stage_schedule_template(
+    *,
+    target: Any,
+    region: Any,
+    abi_prim_func: Any,
+    execution_stage: str,
+    active_node_names: Sequence[str] | None = None,
+    stage_suffix: str = "",
+    row_dispatch_mode: str = DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+) -> Callable[[Any], Any]:
+    return make_path_c_descriptor_stage_schedule_template(
+        schedule_target=target,
+        region=region,
+        abi_prim_func=abi_prim_func,
+        execution_stage=execution_stage,
+        active_node_names=active_node_names,
+        stage_suffix=stage_suffix,
+        row_dispatch_mode=row_dispatch_mode,
+    )
+
+
+def _runtime_smoke_launcher_chunked_target(target: Any, region: Any) -> Any:
+    shape_env = getattr(
+        getattr(target, "schedule_template", None),
+        "_cppmega_path_c_shape_env",
+        None,
+    )
+    max_rows_per_launch = (
+        target.max_rows_per_launch
+        if getattr(target, "max_rows_per_launch", None) is not None
+        else DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH
+    )
+    schedule_template = make_path_c_descriptor_schedule_template(
+        target.brick_descriptors,
+        entry_symbol=getattr(region, "entry_symbol", None)
+        or getattr(region, "name", None),
+        buffer_extent=target.buffer_extent,
+        shape_env=shape_env,
+        internal_buffer_policy=target.internal_buffer_policy,
+        loop_policy=target.loop_policy,
+        physical_abi_policy=target.physical_abi_policy,
+        train_step_output_abi=bool(
+            getattr(
+                target.schedule_template,
+                "_cppmega_path_c_train_step_output_abi_enabled",
+                False,
+            )
+        ),
+        max_rows_per_launch=max_rows_per_launch,
+        row_dispatch_mode=DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    )
+    return replace(
+        target,
+        schedule_template=schedule_template,
+        max_rows_per_launch=max_rows_per_launch,
+        row_dispatch_mode=DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+    )
+
+
+def _kernel_buffer_shapes_for_prim_func(prim_func: Any) -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    buffer_map = getattr(prim_func, "buffer_map", {}) or {}
+    for param in tuple(getattr(prim_func, "params", ())):
+        buffer = buffer_map.get(param)
+        if buffer is None:
+            continue
+        shapes[str(getattr(buffer, "name", param))] = tuple(
+            int(dim) for dim in tuple(getattr(buffer, "shape", ()))
+        )
+    return shapes
+
+
+def _merged_physical_abi_for_prim_funcs(
+    prim_funcs: Sequence[Any],
+) -> tuple[dict[str, Any], dict[str, tuple[int, ...]]]:
+    return merge_path_c_physical_abi_for_prim_funcs(prim_funcs)
 
 
 def _runtime_smoke_route_args(mode: str) -> SimpleNamespace:
@@ -1249,6 +1425,9 @@ def _runtime_smoke_payload(
     target_name: str,
     execution_backend: str,
     max_bytes: int,
+    max_launches: int | None = None,
+    max_stages: int | None = None,
+    artifact_kind: str = "single",
     lowerer: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     if mode == "none":
@@ -1264,6 +1443,13 @@ def _runtime_smoke_payload(
             "actually_executed": False,
             "reason": f"unsupported runtime smoke mode: {mode}",
         }
+    if artifact_kind not in {"single", "staged", "phased"}:
+        return {
+            "status": "unsupported_artifact_kind",
+            "mode": mode,
+            "actually_executed": False,
+            "reason": f"unsupported runtime smoke artifact: {artifact_kind}",
+        }
 
     started = time.perf_counter()
     region: Any | None = None
@@ -1271,9 +1457,17 @@ def _runtime_smoke_payload(
     prim_func: Any | None = None
     buffer_abi: list[dict[str, Any]] = []
     total_bytes: int | None = None
+    launch_limit = None if max_launches is None else max(0, int(max_launches))
+    stage_limit = None if max_stages is None else max(0, int(max_stages))
+    forward_stage_artifacts: tuple[Any, ...] = ()
+    backward_stage_artifacts: tuple[Any, ...] = ()
+    forward_stage_prim_funcs: tuple[Any, ...] = ()
+    backward_stage_prim_funcs: tuple[Any, ...] = ()
     smoke_mode = "production_1b" if mode == "production" else "tiny_mra"
     try:
+        generated_stage_artifact = artifact_kind in {"staged", "phased"}
         region, target, model = _runtime_smoke_region_target_model(mode)
+        target = _runtime_smoke_launcher_chunked_target(target, region)
         prim_func = target.schedule_template(region)
         buffer_abi, total_bytes = _buffer_abi_payload(prim_func)
         if total_bytes > max_bytes:
@@ -1313,20 +1507,33 @@ def _runtime_smoke_payload(
                     **kwargs,
                 )
 
-        compiled, stdout, stderr, compile_error, compile_elapsed_s = (
-            _compile_path_c_region_with_native_capture(
+        if artifact_kind == "single":
+            compiled, stdout, stderr, compile_error, compile_elapsed_s = (
+                _compile_path_c_region_with_native_capture(
+                    region=region,
+                    schedule_template=schedule_template,
+                    schedule_name=target.schedule_name,
+                    schedule_status=target.schedule_status,
+                    native_lowerer=native_lowerer,
+                    target_name=target_name,
+                )
+            )
+        else:
+            plan_started = time.perf_counter()
+            compiled = compile_path_c_region(
                 region=region,
                 schedule_template=schedule_template,
                 schedule_name=target.schedule_name,
                 schedule_status=target.schedule_status,
-                native_lowerer=native_lowerer,
-                target_name=target_name,
             )
-        )
+            stdout = ""
+            stderr = ""
+            compile_error = None
+            compile_elapsed_s = time.perf_counter() - plan_started
         artifact = (
             compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
         )
-        if compile_error is not None or artifact is None:
+        if compile_error is not None or (artifact_kind == "single" and artifact is None):
             return {
                 "status": "failed_compile",
                 "mode": smoke_mode,
@@ -1342,6 +1549,72 @@ def _runtime_smoke_payload(
                 "stdout_tail": stdout[-2000:],
                 "stderr_tail": stderr[-2000:],
             }
+        descriptor_stage_groups = (
+            plan_path_c_descriptor_phase_groups(region)
+            if artifact_kind == "phased"
+            else plan_path_c_descriptor_stage_groups(region)
+        )
+        forward_stage_groups = tuple(
+            group
+            for group in descriptor_stage_groups
+            if group.execution_stage == DESCRIPTOR_EXECUTION_STAGE_FORWARD
+        )
+        backward_stage_groups = tuple(
+            group
+            for group in descriptor_stage_groups
+            if group.execution_stage == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+        )
+        stage_output = SimpleNamespace(stdout="", stderr="")
+        stage_compile_elapsed_s = 0.0
+        if generated_stage_artifact:
+            forward_stage_templates = tuple(
+                _generated_stage_schedule_template(
+                    target=target,
+                    region=region,
+                    abi_prim_func=prim_func,
+                    execution_stage=group.execution_stage,
+                    active_node_names=group.active_node_names,
+                    stage_suffix=group.stage_suffix,
+                    row_dispatch_mode=group.row_dispatch_mode,
+                )
+                for group in forward_stage_groups
+            )
+            backward_stage_templates = tuple(
+                _generated_stage_schedule_template(
+                    target=target,
+                    region=region,
+                    abi_prim_func=prim_func,
+                    execution_stage=group.execution_stage,
+                    active_node_names=group.active_node_names,
+                    stage_suffix=group.stage_suffix,
+                    row_dispatch_mode=group.row_dispatch_mode,
+                )
+                for group in backward_stage_groups
+            )
+            forward_stage_prim_funcs = tuple(
+                template(region) for template in forward_stage_templates
+            )
+            backward_stage_prim_funcs = tuple(
+                template(region) for template in backward_stage_templates
+            )
+            stage_started = time.perf_counter()
+            with _capture_native_output() as captured_stage_output:
+                forward_stage_artifacts = tuple(
+                    native_lowerer(
+                        stage_prim_func,
+                        target=target_name,
+                    )
+                    for stage_prim_func in forward_stage_prim_funcs
+                )
+                backward_stage_artifacts = tuple(
+                    native_lowerer(
+                        stage_prim_func,
+                        target=target_name,
+                    )
+                    for stage_prim_func in backward_stage_prim_funcs
+                )
+            stage_output = captured_stage_output
+            stage_compile_elapsed_s = time.perf_counter() - stage_started
 
         import mlx.core as mx  # noqa: PLC0415
 
@@ -1352,17 +1625,49 @@ def _runtime_smoke_payload(
             )
             for entry in buffer_abi
         }
-        physical_buffer_abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {}) or {}
-        )
-        physical_buffer_abi_shapes = dict(
-            getattr(
-                prim_func,
-                "_cppmega_path_c_physical_buffer_abi_shapes",
-                {},
+        stage_buffer_abi: list[dict[str, Any]] = []
+        if generated_stage_artifact:
+            for stage_prim_func in (
+                *forward_stage_prim_funcs,
+                *backward_stage_prim_funcs,
+            ):
+                stage_entries, _stage_total_bytes = _buffer_abi_payload(stage_prim_func)
+                stage_buffer_abi.extend(stage_entries)
+                for entry in stage_entries:
+                    name = str(entry["name"])
+                    shape = tuple(entry["shape"])
+                    existing = kernel_buffers.get(name)
+                    if existing is not None and int(existing.size) >= math.prod(shape):
+                        continue
+                    kernel_buffers[name] = mx.zeros(
+                        shape,
+                        dtype=_mlx_dtype(str(entry["dtype"])),
+                    )
+            physical_buffer_abi_map, physical_buffer_abi_shapes = (
+                _merged_physical_abi_for_prim_funcs(
+                    (
+                        prim_func,
+                        *forward_stage_prim_funcs,
+                        *backward_stage_prim_funcs,
+                    )
+                )
             )
-            or {}
-        )
+        else:
+            physical_buffer_abi_map = dict(
+                getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+                or {}
+            )
+            physical_buffer_abi_shapes = {
+                str(name): tuple(int(dim) for dim in tuple(shape))
+                for name, shape in dict(
+                    getattr(
+                        prim_func,
+                        "_cppmega_path_c_physical_buffer_abi_shapes",
+                        {},
+                    )
+                    or {}
+                ).items()
+            }
         physical_bank_buffers = {
             name: kernel_buffers[name]
             for name in physical_buffer_abi_shapes
@@ -1372,10 +1677,109 @@ def _runtime_smoke_payload(
             physical_buffer_abi_shapes,
             physical_bank_buffers,
         )
+        try:
+            from scripts import m04_train_step  # noqa: PLC0415
+
+            training_abi_contract = (
+                m04_train_step._path_c_fused_train_block_training_abi_contract_payload(
+                    prim_func
+                )
+            )
+            parameter_gradient_aliases = (
+                model.path_c_parameter_gradient_aliases()
+                if callable(getattr(model, "path_c_parameter_gradient_aliases", None))
+                else {}
+            )
+            trainable_parameter_names = tuple(
+                sorted(m04_train_step._path_c_model_trainable_parameter_names(model))
+            )
+            selected_region_metadata = (
+                m04_train_step._path_c_fused_train_block_selected_region_metadata(
+                    region
+                )
+            )
+        except Exception:
+            training_abi_contract = {"generated_stage_artifact": True}
+            parameter_gradient_aliases = {}
+            trainable_parameter_names = ()
+            selected_region_metadata = {}
+        if generated_stage_artifact:
+            runtime_artifact = PathCGeneratedStageTrainBlockCallableArtifact(
+                forward_kernel=forward_stage_artifacts[0],
+                forward_kernels=forward_stage_artifacts,
+                backward_kernel=backward_stage_artifacts[0]
+                if backward_stage_artifacts
+                else None,
+                backward_kernels=backward_stage_artifacts,
+                physical_abi_map=physical_buffer_abi_map,
+                physical_abi_shapes=physical_buffer_abi_shapes,
+                training_abi_contract=training_abi_contract,
+                parameter_gradient_aliases=parameter_gradient_aliases,
+                trainable_parameter_names=trainable_parameter_names,
+                selected_region_metadata=selected_region_metadata,
+                forward_kernel_buffer_order=path_c_kernel_buffer_order(
+                    forward_stage_prim_funcs[0]
+                ),
+                forward_kernel_buffer_orders=tuple(
+                    path_c_kernel_buffer_order(stage_prim_func)
+                    for stage_prim_func in forward_stage_prim_funcs
+                ),
+                backward_kernel_buffer_order=path_c_kernel_buffer_order(
+                    backward_stage_prim_funcs[0]
+                ),
+                backward_kernel_buffer_orders=tuple(
+                    path_c_kernel_buffer_order(stage_prim_func)
+                    for stage_prim_func in backward_stage_prim_funcs
+                ),
+                forward_kernel_buffer_shapes=_kernel_buffer_shapes_for_prim_func(
+                    forward_stage_prim_funcs[0]
+                ),
+                forward_kernel_buffer_shapes_by_stage=tuple(
+                    _kernel_buffer_shapes_for_prim_func(stage_prim_func)
+                    for stage_prim_func in forward_stage_prim_funcs
+                ),
+                backward_kernel_buffer_shapes=_kernel_buffer_shapes_for_prim_func(
+                    backward_stage_prim_funcs[0]
+                ),
+                backward_kernel_buffer_shapes_by_stage=tuple(
+                    _kernel_buffer_shapes_for_prim_func(stage_prim_func)
+                    for stage_prim_func in backward_stage_prim_funcs
+                ),
+                backward_gate_param=getattr(
+                    prim_func,
+                    "_cppmega_path_c_backward_gate_param",
+                    "path_c_run_backward",
+                )
+                or "path_c_run_backward",
+            )
+        else:
+            runtime_artifact = PathCFusedTrainBlockCallableArtifact(
+                kernel=artifact,
+                physical_abi_map=physical_buffer_abi_map,
+                physical_abi_shapes=physical_buffer_abi_shapes,
+                training_abi_contract=training_abi_contract,
+                parameter_gradient_aliases=parameter_gradient_aliases,
+                trainable_parameter_names=trainable_parameter_names,
+                selected_region_metadata=selected_region_metadata,
+                kernel_buffer_order=path_c_kernel_buffer_order(prim_func),
+            )
+        smoke_bank_owner = make_physical_abi_bank_owner(
+            "runtime_smoke.path_c_physical_abi_banks",
+            physical_buffer_abi_map,
+            physical_buffer_abi_shapes,
+            {
+                **physical_bank_buffers,
+                **{
+                    name: value
+                    for name, value in kernel_buffers.items()
+                    if name not in physical_bank_buffers
+                },
+            },
+        )
         fused_train_block_route = _runtime_smoke_fused_train_block_route_payload(
             mode=mode,
             model=model,
-            artifact=artifact,
+            artifact=runtime_artifact,
             physical_buffer_abi_map=physical_buffer_abi_map,
             physical_buffer_abi_shapes=physical_buffer_abi_shapes,
             physical_bank_buffers=physical_bank_buffers,
@@ -1387,14 +1791,89 @@ def _runtime_smoke_payload(
         )
         arrays = [arg for arg in kernel_args if isinstance(arg, mx.array)]
         mx.eval(*arrays)
+
+        row_chunk_param = str(
+            getattr(prim_func, "_cppmega_path_c_row_chunk_index_param", "") or ""
+        )
+        row_subchunk_param = str(
+            getattr(prim_func, "_cppmega_path_c_row_subchunk_index_param", "") or ""
+        )
+        row_chunk_count = (
+            max(1, int(getattr(prim_func, "_cppmega_path_c_row_chunk_count", 1) or 1))
+            if row_chunk_param
+            else 1
+        )
+        row_subchunk_count = (
+            max(
+                1,
+                int(getattr(prim_func, "_cppmega_path_c_row_subchunk_count", 1) or 1),
+            )
+            if row_subchunk_param
+            else 1
+        )
+        backward_gate_param = str(
+            getattr(
+                prim_func,
+                "_cppmega_path_c_backward_gate_param",
+                "path_c_run_backward",
+            )
+            or "path_c_run_backward"
+        )
+
+        def launch_generated_artifact(*, run_backward: bool) -> tuple[Any, int, bool]:
+            result: Any = None
+            executed = 0
+            for chunk_index in range(row_chunk_count):
+                for subchunk_index in range(row_subchunk_count):
+                    if launch_limit is not None and executed >= launch_limit:
+                        return result, executed, True
+                    scalar_params = {backward_gate_param: 1 if run_backward else 0}
+                    if row_chunk_param:
+                        scalar_params[row_chunk_param] = int(chunk_index)
+                    if row_subchunk_param:
+                        scalar_params[row_subchunk_param] = int(subchunk_index)
+                    dispatch_kwargs: dict[str, Any] = {
+                        "bank_owner": smoke_bank_owner,
+                        "kernel_scalar_params": scalar_params,
+                    }
+                    if generated_stage_artifact:
+                        dispatch_kwargs["max_stages"] = stage_limit
+                    result = runtime_artifact.forward(**dispatch_kwargs)
+                    executed += 1
+            return result, executed, False
+
         execute_started = time.perf_counter()
-        result = artifact(*kernel_args)
+        forward_result, executed_forward_launches, forward_launch_limited = (
+            launch_generated_artifact(run_backward=False)
+        )
+        mx.eval(*physical_bank_buffers.values())
+        backward_result, executed_backward_launches, backward_launch_limited = (
+            launch_generated_artifact(run_backward=True)
+        )
         mx.eval(*arrays)
         execute_elapsed_s = time.perf_counter() - execute_started
+        total_forward_launches = row_chunk_count * row_subchunk_count
+        total_backward_launches = row_chunk_count * row_subchunk_count
+        launch_limited = bool(forward_launch_limited or backward_launch_limited)
+        stage_limited = bool(
+            generated_stage_artifact
+            and
+            stage_limit is not None
+            and (
+                stage_limit < len(forward_stage_artifacts)
+                or stage_limit < len(backward_stage_artifacts)
+            )
+        )
+        executed_launches = executed_forward_launches + executed_backward_launches
         return {
             "status": "ok",
             "mode": smoke_mode,
-            "actually_executed": True,
+            "actually_executed": executed_launches > 0,
+            "full_execution": not launch_limited and not stage_limited,
+            "launch_limited": launch_limited,
+            "stage_limited": stage_limited,
+            "max_launches": launch_limit,
+            "max_stages": stage_limit,
             "target": target_name,
             "execution_backend": execution_backend,
             "region_name": region.name,
@@ -1408,9 +1887,53 @@ def _runtime_smoke_payload(
             ),
             "physical_abi_runtime_binding": physical_abi_runtime_binding,
             "fused_train_block_route": fused_train_block_route,
+            "runtime_smoke_uses_fused_train_block": (
+                fused_train_block_route.get("status") == "ok"
+            ),
             "runtime_kernel_buffers": list(kernel_buffer_order),
+            "runtime_stage_kernel_buffers": [
+                str(entry["name"]) for entry in stage_buffer_abi
+            ],
             "runtime_kernel_arg_count": len(kernel_args),
             "runtime_scalar_args": scalar_kernel_args,
+            "runtime_launch_grid": {
+                "row_chunk_param": row_chunk_param or None,
+                "row_chunk_count": row_chunk_count,
+                "row_subchunk_param": row_subchunk_param or None,
+                "row_subchunk_count": row_subchunk_count,
+                "total_forward_launches": total_forward_launches,
+                "total_backward_launches": total_backward_launches,
+                "executed_forward_launches": executed_forward_launches,
+                "executed_backward_launches": executed_backward_launches,
+                "skipped_forward_launches": (
+                    total_forward_launches - executed_forward_launches
+                ),
+                "skipped_backward_launches": (
+                    total_backward_launches - executed_backward_launches
+                ),
+                "forward_stages_per_launch": len(forward_stage_artifacts)
+                if generated_stage_artifact
+                else 1,
+                "backward_stages_per_launch": len(backward_stage_artifacts)
+                if generated_stage_artifact
+                else 1,
+                "executed_forward_stages_per_launch": min(
+                    len(forward_stage_artifacts),
+                    stage_limit
+                    if stage_limit is not None
+                    else len(forward_stage_artifacts),
+                )
+                if generated_stage_artifact
+                else 1,
+                "executed_backward_stages_per_launch": min(
+                    len(backward_stage_artifacts),
+                    stage_limit
+                    if stage_limit is not None
+                    else len(backward_stage_artifacts),
+                )
+                if generated_stage_artifact
+                else 1,
+            },
             "kernel_parameter_count": _kernel_parameter_count(prim_func),
             "logical_parameter_count": len(
                 getattr(prim_func, "_cppmega_path_c_buffer_abi_shapes", {}) or {}
@@ -1419,25 +1942,99 @@ def _runtime_smoke_payload(
             "total_buffer_bytes": total_bytes,
             "max_buffer_bytes": max_bytes,
             "compile_elapsed_s": compile_elapsed_s,
+            "stage_compile_elapsed_s": stage_compile_elapsed_s,
             "execute_elapsed_s": execute_elapsed_s,
             "elapsed_s": time.perf_counter() - started,
-            "artifact_type": type(artifact).__name__,
-            "kernel_source": _artifact_kernel_source_stats(artifact),
-            "result_type": type(result).__name__,
-            "result_repr": repr(result)[:500],
+            "artifact_type": type(runtime_artifact).__name__,
+            "runtime_artifact_kind": artifact_kind,
+            "single_generated_artifact": artifact_kind == "single",
+            "generated_stage_artifact": generated_stage_artifact,
+            "generated_phase_artifact": artifact_kind == "phased",
+            "generated_stage_groups": [
+                {
+                    "index": group.index,
+                    "execution_stage": group.execution_stage,
+                    "active_node_names": list(group.active_node_names),
+                    "stage_suffix": group.stage_suffix,
+                    "row_dispatch_mode": group.row_dispatch_mode,
+                    "reason": group.reason,
+                }
+                for group in (*forward_stage_groups, *backward_stage_groups)
+            ],
+            "kernel_source": (
+                {
+                    **_artifact_kernel_source_stats(artifact),
+                    "single_generated_artifact": True,
+                    "generated_stage_artifact": False,
+                }
+                if artifact_kind == "single"
+                else _stage_kernel_source_payload(
+                    monolithic_artifact=artifact,
+                    forward_artifacts=forward_stage_artifacts,
+                    backward_artifacts=backward_stage_artifacts,
+                    artifact_kind=artifact_kind,
+                )
+            ),
+            "stage_source_bytes": {
+                **{
+                    f"forward_{index}": len(
+                        (
+                            getattr(
+                                stage_prim_func,
+                                "_cppmega_path_c_generated_source",
+                                "",
+                            )
+                            or ""
+                        ).encode("utf-8")
+                    )
+                    for index, stage_prim_func in enumerate(forward_stage_prim_funcs)
+                },
+                **{
+                    f"backward_{index}": len(
+                        (
+                            getattr(
+                                stage_prim_func,
+                                "_cppmega_path_c_generated_source",
+                                "",
+                            )
+                            or ""
+                        ).encode("utf-8")
+                    )
+                    for index, stage_prim_func in enumerate(backward_stage_prim_funcs)
+                },
+            },
+            "result_type": type((forward_result, backward_result)).__name__,
+            "result_repr": repr((forward_result, backward_result))[:500],
             "stdout_tail": stdout[-2000:],
-            "stderr_tail": stderr[-2000:],
+            "stderr_tail": (stderr + stage_output.stderr)[-2000:],
         }
     except Exception as exc:  # pragma: no cover - defensive receipt path
-        kernel_source = (
-            _artifact_kernel_source_stats(artifact)
-            if "artifact" in locals() and artifact is not None
-            else None
-        )
+        if (
+            "forward_stage_artifacts" in locals()
+            and (forward_stage_artifacts or backward_stage_artifacts)
+        ):
+            kernel_source = _stage_kernel_source_payload(
+                monolithic_artifact=artifact if "artifact" in locals() else None,
+                forward_artifacts=forward_stage_artifacts,
+                backward_artifacts=backward_stage_artifacts,
+                artifact_kind=artifact_kind,
+            )
+        else:
+            kernel_source = (
+                _artifact_kernel_source_stats(artifact)
+                if "artifact" in locals() and artifact is not None
+                else None
+            )
         return {
             "status": "failed_execute",
             "mode": smoke_mode,
             "actually_executed": False,
+            "full_execution": False,
+            "launch_limited": False,
+            "max_launches": launch_limit,
+            "stage_limited": False,
+            "max_stages": stage_limit,
+            "runtime_artifact_kind": artifact_kind,
             "target": target_name,
             "execution_backend": execution_backend,
             "region_name": getattr(region, "name", None),
@@ -1465,11 +2062,26 @@ def build_compile_receipt(
     tilelang_entry_lowerer: Callable[..., Any] | None = None,
     runtime_smoke: str = "none",
     runtime_smoke_max_bytes: int = 256 * 1024 * 1024,
+    runtime_smoke_max_launches: int | None = None,
+    runtime_smoke_max_stages: int | None = None,
+    runtime_smoke_artifact: str = "single",
     runtime_smoke_lowerer: Callable[..., Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     started = time.perf_counter()
     profile, model, fwd_region, region, target = _selected_region_and_target()
     prim_func = target.schedule_template(region)
+    descriptor_stage_groups = plan_path_c_descriptor_stage_groups(region)
+    descriptor_stage_plan = [
+        {
+            "index": group.index,
+            "execution_stage": group.execution_stage,
+            "active_node_names": list(group.active_node_names),
+            "stage_suffix": group.stage_suffix,
+            "row_dispatch_mode": group.row_dispatch_mode,
+            "reason": group.reason,
+        }
+        for group in descriptor_stage_groups
+    ]
     generated_source = str(
         getattr(prim_func, "_cppmega_path_c_generated_source", "")
         or prim_func.script()
@@ -1592,6 +2204,9 @@ def build_compile_receipt(
         target_name=target_name,
         execution_backend=execution_backend,
         max_bytes=runtime_smoke_max_bytes,
+        max_launches=runtime_smoke_max_launches,
+        max_stages=runtime_smoke_max_stages,
+        artifact_kind=runtime_smoke_artifact,
         lowerer=runtime_smoke_lowerer,
     )
     production_runtime_smoke_binding = _production_runtime_smoke_binding(
@@ -1605,6 +2220,11 @@ def build_compile_receipt(
     )
     production_runtime_smoke_uses_fused_train_block = (
         production_runtime_smoke_binding is not None
+    )
+    runtime_smoke_fused_route = runtime_smoke_payload.get("fused_train_block_route")
+    runtime_smoke_uses_fused_train_block = bool(
+        isinstance(runtime_smoke_fused_route, Mapping)
+        and runtime_smoke_fused_route.get("status") == "ok"
     )
     payload = {
         "kind": "cppmega_path_c_fusion_compile_receipt",
@@ -1639,6 +2259,7 @@ def build_compile_receipt(
                 descriptor.op_name for descriptor in target.brick_descriptors
             ],
         },
+        "descriptor_stage_plan": descriptor_stage_plan,
         "schedule_spec": {
             "schedule_id": schedule_spec.schedule_id,
             "implementation_kind": schedule_spec.implementation_kind,
@@ -1741,6 +2362,9 @@ def build_compile_receipt(
             "matrix_measures_current_runtime_route": True,
             "compile_receipt_measures_fused_schedule_compile": True,
             "runtime_uses_fused_train_block": False,
+            "runtime_smoke_uses_fused_train_block": (
+                runtime_smoke_uses_fused_train_block
+            ),
             "production_runtime_smoke_uses_fused_train_block": (
                 production_runtime_smoke_uses_fused_train_block
             ),
@@ -1759,6 +2383,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_backend=args.execution_backend,
         runtime_smoke=args.runtime_smoke,
         runtime_smoke_max_bytes=args.runtime_smoke_max_bytes,
+        runtime_smoke_max_launches=args.runtime_smoke_max_launches,
+        runtime_smoke_max_stages=args.runtime_smoke_max_stages,
+        runtime_smoke_artifact=args.runtime_smoke_artifact,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

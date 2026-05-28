@@ -889,21 +889,10 @@ def path_c_fusion_summary_from_receipt(receipt: dict[str, Any]) -> dict[str, Any
     direct_chain_training_contract = direct_chained.get("training_runtime_contract")
     if not isinstance(direct_chain_training_contract, dict):
         direct_chain_training_contract = {}
-    direct_chain_training_ready = bool(
-        direct_chain_training_contract.get("training_runtime_available")
-        or direct_chain_training_contract.get("critical_path_ready")
-    )
     runtime_uses_fused_train_block = bool(
         runtime_binding.get("runtime_uses_fused_train_block")
-        or direct_chain_training_ready
     )
-    runtime_binding_status = (
-        "ok"
-        if direct_chain_training_ready
-        else direct_chain_training_contract.get("status")
-        if direct_chain_binding.get("runtime_uses_direct_fusion_chain")
-        else runtime_binding.get("status")
-    )
+    runtime_binding_status = runtime_binding.get("status")
     return {
         "mode": fusion.get("mode"),
         "status": fusion.get("status"),

@@ -73,8 +73,18 @@ from cppmega_mlx.runtime.path_c_physical_abi import (  # noqa: E402
     validate_physical_abi_runtime_bindings,
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
+    DESCRIPTOR_EXECUTION_STAGE_ALL,
+    DESCRIPTOR_EXECUTION_STAGE_BACKWARD,
+    DESCRIPTOR_EXECUTION_STAGE_FORWARD,
+    DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS,
+    DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
     PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
+    make_path_c_descriptor_schedule_template,
+    make_path_c_descriptor_stage_schedule_template,
+    merge_path_c_physical_abi_for_prim_funcs,
+    path_c_descriptor_stage_prim_funcs,
     path_c_fusion_schedule_spec,
+    plan_path_c_descriptor_stage_groups,
     plan_path_c_direct_fusion_chain_for_region,
     plan_path_c_direct_fusion_chains_for_model,
     plan_path_c_fusion_schedule_for_region,
@@ -90,6 +100,7 @@ from cppmega_mlx.training.compiled import (  # noqa: E402
     PathCFusedPlusEagerTrainingRuntime,
     PathCFusedTrainBlockCallableArtifact,
     PathCFusedTrainBlockTrainingRuntime,
+    PathCGeneratedStageTrainBlockCallableArtifact,
     PathCGradientBufferCapture,
 )
 from cppmega_mlx.training.cut_cross_entropy import (  # noqa: E402
@@ -609,9 +620,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Opt in to the generated fused train-block value_and_grad runtime "
             "for fp8_path_c local_gb10_quarter training. This compiles the "
-            "monolithic generated train-block shader on the actual critical "
-            "path and remains off by default until compile/profile receipts "
-            "prove it stays within the memory budget."
+            "descriptor-generated train-block artifact on the actual critical "
+            "path; recurrent backward routes use launcher-chunk generated "
+            "stages instead of the unsafe monolithic grid-chunk shader."
         ),
     )
     return parser
@@ -2620,11 +2631,14 @@ def fp8_path_c_training_route_payload(
     )
     fused_train_block_runtime_available = bool(
         single_fused_train_block_runtime_available
+    )
+    path_c_training_runtime_available = bool(
+        fused_train_block_runtime_available
         or direct_fusion_chain_training_runtime_available
     )
     split_training_available = bool(requested and producer_configured)
     full_training_available = bool(
-        split_training_available and fused_train_block_runtime_available
+        split_training_available and path_c_training_runtime_available
     )
     route_status = (
         FP8_PATH_C_E2E_TRAINING_STATUS
@@ -2644,8 +2658,6 @@ def fp8_path_c_training_route_payload(
         if full_training_available
         else str(fused_train_block_training_contract.get("status"))
         if single_fused_train_block_standalone_dispatch_available
-        else str(direct_chain_training_contract.get("status"))
-        if direct_fusion_chain_runtime_available
         else str(runtime_training_binding.get("status"))
         if producer_configured
         else str(producer["status"])
@@ -2710,6 +2722,9 @@ def fp8_path_c_training_route_payload(
         "full_end_to_end_training_available": full_training_available,
         "fused_train_block_runtime_available": (
             fused_train_block_runtime_available
+        ),
+        "path_c_training_runtime_available": (
+            path_c_training_runtime_available
         ),
         "single_fused_train_block_runtime_available": (
             single_fused_train_block_runtime_available
@@ -3015,12 +3030,11 @@ def fp8_path_c_training_route_payload_for_model(
     """Return Path C training route metadata using model-owned ABI banks."""
 
     sequence_length = path_c_training_sequence_length(args)
-    auto_install_report: dict[str, Any] | None = None
-    model_bank_owner = _path_c_physical_abi_bank_owner_for_model(
-        model,
-        sequence_length=sequence_length,
-        allocate_if_missing=auto_install_fused_train_block,
+    auto_install_requested = bool(
+        auto_install_fused_train_block
+        or getattr(args, "use_path_c_fused_train_block_runtime", False)
     )
+    auto_install_report: dict[str, Any] | None = None
     model_fused_artifact = getattr(model, "path_c_fused_train_block_artifact", None)
     model_fused_training_runtime = getattr(
         model,
@@ -3032,8 +3046,17 @@ def fp8_path_c_training_route_payload_for_model(
             model_fused_artifact
         )
     )
+    model_bank_owner = _path_c_physical_abi_bank_owner_for_model(
+        model,
+        sequence_length=sequence_length,
+        allocate_if_missing=(
+            auto_install_requested
+            or artifact_can_back_training_runtime
+            or model_fused_training_runtime is not None
+        ),
+    )
     if (
-        auto_install_fused_train_block
+        auto_install_requested
         and model_bank_owner is not None
         and (
             not callable(model_fused_artifact)
@@ -3223,6 +3246,159 @@ def _build_path_c_fused_suffix_loss_fn_for_model(
     return _loss_fn
 
 
+def _build_path_c_fused_replay_loss_fn_for_model(
+    *,
+    model: Any,
+    artifact: Any,
+    bank_owner: Any,
+    in_region_parameter_bank_aliases: Mapping[str, Mapping[str, Any]],
+    sequence_length: int | None,
+) -> Callable[[Any, Mapping[str, Any]], tuple[mx.array, mx.array]] | None:
+    """Attach replay/cotangent custom function for the fused block boundary."""
+
+    from cppmega_mlx.training.path_c_fused_replay import (
+        build_fused_replay_boundary_custom_function,
+    )
+
+    if not callable(getattr(model, "path_c_fused_replay_loss", None)):
+        return None
+    if not callable(getattr(model, "attach_path_c_fused_replay_custom_function", None)):
+        return None
+
+    prim_func = model.path_c_fused_train_block_prim_func(
+        sequence_length=sequence_length,
+    )
+    if prim_func is None:
+        return None
+    abi_map = dict(
+        getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+        or {}
+    )
+    if not abi_map:
+        return None
+    hidden_entry_logical_name: str | None = None
+    for name in abi_map:
+        if (
+            "_hidden" in name
+            and not name.endswith("_grad")
+            and not name.endswith("_after")
+            and not name.endswith("_after_grad")
+        ):
+            hidden_entry_logical_name = name
+            break
+    if hidden_entry_logical_name is None:
+        return None
+    boundary_abi = dict(
+        getattr(
+            prim_func,
+            "_cppmega_path_c_train_step_loss_cotangent_abi",
+            {},
+        )
+        or {}
+    )
+    boundary_outputs = tuple(
+        str(name) for name in boundary_abi.get("source_logical_buffers", ())
+    )
+    boundary_cotangents = tuple(
+        str(name) for name in boundary_abi.get("logical_cotangent_buffers", ())
+    )
+    if (
+        not boundary_outputs
+        or len(boundary_outputs) != len(boundary_cotangents)
+        or any(name not in abi_map for name in boundary_outputs)
+        or any(name not in abi_map for name in boundary_cotangents)
+    ):
+        return None
+
+    first_in_region_layer_index_fn = getattr(
+        model, "path_c_fused_first_in_region_layer_index", None
+    )
+    if not callable(first_in_region_layer_index_fn):
+        return None
+    first_in_region_layer_index = first_in_region_layer_index_fn(
+        sequence_length=sequence_length
+    )
+    if first_in_region_layer_index is None:
+        return None
+    first_in_region_layer_index_int = int(cast(int, first_in_region_layer_index))
+
+    parameter_order = tuple(sorted(in_region_parameter_bank_aliases.keys()))
+    try:
+        fused_replay = build_fused_replay_boundary_custom_function(
+            artifact=artifact,
+            bank_owner=bank_owner,
+            abi_map=abi_map,
+            hidden_entry_logical_name=hidden_entry_logical_name,
+            boundary_output_logical_names=boundary_outputs,
+            boundary_cotangent_logical_names=boundary_cotangents,
+            in_region_parameter_bank_aliases=in_region_parameter_bank_aliases,
+            parameter_order=parameter_order,
+            row_chunk_count=getattr(
+                artifact,
+                "_cppmega_path_c_row_chunk_count",
+                getattr(artifact, "row_chunk_count", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_row_chunk_count",
+                None,
+            ),
+            row_chunk_index_param=getattr(
+                artifact,
+                "_cppmega_path_c_row_chunk_index_param",
+                getattr(artifact, "row_chunk_index_param", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_row_chunk_index_param",
+                None,
+            ),
+            row_subchunk_count=getattr(
+                artifact,
+                "_cppmega_path_c_row_subchunk_count",
+                getattr(artifact, "row_subchunk_count", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_row_subchunk_count",
+                None,
+            ),
+            row_subchunk_index_param=getattr(
+                artifact,
+                "_cppmega_path_c_row_subchunk_index_param",
+                getattr(artifact, "row_subchunk_index_param", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_row_subchunk_index_param",
+                None,
+            ),
+            backward_gate_param=getattr(
+                artifact,
+                "_cppmega_path_c_backward_gate_param",
+                getattr(artifact, "backward_gate_param", None),
+            )
+            or getattr(
+                prim_func,
+                "_cppmega_path_c_backward_gate_param",
+                "path_c_run_backward",
+            ),
+        )
+    except Exception:
+        return None
+    model.attach_path_c_fused_replay_custom_function(
+        fused_replay,
+        parameter_order=parameter_order,
+        first_in_region_layer_index=first_in_region_layer_index_int,
+        boundary_output_logical_names=boundary_outputs,
+    )
+
+    def _loss_fn(loss_model: Any, batch: Mapping[str, Any]) -> tuple[mx.array, mx.array]:
+        return loss_model.path_c_fused_replay_loss(batch)
+
+    return _loss_fn
+
+
 def _path_c_fused_train_block_training_runtime_from_artifact(
     *,
     artifact: Any,
@@ -3288,6 +3464,9 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
     sync_callable: Callable[[], Mapping[str, Any]] | None = None
     bind_report: dict[str, Any] | None = None
     fused_suffix_loss_fn: Callable[
+        [Any, Mapping[str, Any]], tuple[mx.array, mx.array]
+    ] | None = None
+    fused_replay_loss_fn: Callable[
         [Any, Mapping[str, Any]], tuple[mx.array, mx.array]
     ] | None = None
     if model is not None and bank_owner is not None:
@@ -3396,8 +3575,8 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
                         }
 
                     sync_callable = _sync
-                    fused_suffix_loss_fn = (
-                        _build_path_c_fused_suffix_loss_fn_for_model(
+                    fused_replay_loss_fn = (
+                        _build_path_c_fused_replay_loss_fn_for_model(
                             model=model,
                             artifact=artifact,
                             bank_owner=bank_owner,
@@ -3422,6 +3601,7 @@ def _path_c_fused_train_block_training_runtime_from_artifact(
             in_region_parameter_bank_aliases=in_region_aliases,
             model_bank_sync_callable=sync_callable,
             fused_suffix_loss_fn=fused_suffix_loss_fn,
+            fused_replay_loss_fn=fused_replay_loss_fn,
         )
         if bind_report is not None:
             runtime.last_parameter_bank_bind_report = dict(bind_report)
@@ -3519,22 +3699,29 @@ def path_c_fusion_runtime_training_binding_payload(
             resolved_bank_owner = str(
                 getattr(bank_owner, "owner_name", resolved_bank_owner)
             )
-        prim_func = schedule_target.schedule_template(region)
-        physical_abi_map = dict(
-            getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
-            or {}
-        )
-        physical_abi_shapes = dict(
-            getattr(
-                prim_func,
-                "_cppmega_path_c_physical_buffer_abi_shapes",
-                {},
+        artifact_abi_map = getattr(fused_artifact, "physical_abi_map", None)
+        artifact_abi_shapes = getattr(fused_artifact, "physical_abi_shapes", None)
+        if artifact_abi_map is not None and artifact_abi_shapes is not None:
+            physical_abi_map = dict(artifact_abi_map)
+            physical_abi_shapes = dict(artifact_abi_shapes)
+            physical_abi_policy = "fused_artifact_physical_abi"
+        else:
+            prim_func = schedule_target.schedule_template(region)
+            physical_abi_map = dict(
+                getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
+                or {}
             )
-            or {}
-        )
-        physical_abi_policy = str(
-            getattr(prim_func, "_cppmega_path_c_physical_abi_policy", "unknown")
-        )
+            physical_abi_shapes = dict(
+                getattr(
+                    prim_func,
+                    "_cppmega_path_c_physical_buffer_abi_shapes",
+                    {},
+                )
+                or {}
+            )
+            physical_abi_policy = str(
+                getattr(prim_func, "_cppmega_path_c_physical_abi_policy", "unknown")
+            )
         bridge = plan_physical_abi_runtime_bridge(
             physical_abi_map,
             physical_abi_shapes,
@@ -3580,6 +3767,13 @@ def path_c_fusion_runtime_training_binding_payload(
             "physical_abi_policy": physical_abi_policy,
             "required_bank_buffers": required_bank_buffers,
             "missing_bank_buffers": missing_bank_buffers,
+            "shape_mismatch_buffers": list(
+                binding.get("shape_mismatch_buffers", ())
+            ),
+            "dtype_mismatch_buffers": list(
+                binding.get("dtype_mismatch_buffers", ())
+            ),
+            "unexpected_buffers": list(binding.get("unexpected_buffers", ())),
             "provided_bank_buffers": provided_bank_buffers,
             "bank_buffer_owner": resolved_bank_owner,
             "model_owned_physical_abi_bank_plan": bank_plan,
@@ -3658,6 +3852,9 @@ def _path_c_fused_train_block_training_abi_contract_payload(
             "train_step_loss_source_buffers": [],
             "train_step_loss_cotangents_computed": False,
             "train_step_loss_cotangent_abi": {},
+            "replay_cotangent_boundary_available": False,
+            "replay_boundary_source_buffers": [],
+            "replay_boundary_cotangent_buffers": [],
             "train_step_suffix_loss_parameter_grads_computed": False,
             "train_step_suffix_loss_parameter_grad_abi": {},
             "train_step_suffix_loss_parameter_gradient_buffers": [],
@@ -3731,6 +3928,27 @@ def _path_c_fused_train_block_training_abi_contract_payload(
     train_step_loss_cotangents_computed = bool(
         train_step_loss_cotangent_abi.get("cotangents_computed")
     )
+    replay_boundary_source_buffers = [
+        str(name)
+        for name in train_step_loss_cotangent_abi.get(
+            "source_logical_buffers",
+            (),
+        )
+    ]
+    replay_boundary_cotangent_buffers = [
+        str(name)
+        for name in train_step_loss_cotangent_abi.get(
+            "logical_cotangent_buffers",
+            (),
+        )
+    ]
+    replay_cotangent_boundary_available = bool(
+        replay_boundary_source_buffers
+        and len(replay_boundary_source_buffers)
+        == len(replay_boundary_cotangent_buffers)
+        and all(name in physical_abi_map for name in replay_boundary_source_buffers)
+        and all(name in physical_abi_map for name in replay_boundary_cotangent_buffers)
+    )
     train_step_suffix_loss_parameter_grad_abi = dict(
         getattr(
             prim_func,
@@ -3785,13 +4003,16 @@ def _path_c_fused_train_block_training_abi_contract_payload(
     loss_outputs = value_output_candidates("loss")
     ntokens_outputs = value_output_candidates("ntokens")
     missing_outputs: list[str] = []
-    if not loss_outputs:
+    if not loss_outputs and not replay_cotangent_boundary_available:
         missing_outputs.append("loss")
-    if not ntokens_outputs:
+    if not ntokens_outputs and not replay_cotangent_boundary_available:
         missing_outputs.append("ntokens")
     if not gradient_outputs:
         missing_outputs.append("model_grads")
-    if not train_step_suffix_loss_parameter_grads_computed:
+    if (
+        not replay_cotangent_boundary_available
+        and not train_step_suffix_loss_parameter_grads_computed
+    ):
         missing_outputs.append("suffix_parameter_grads")
     missing_suffix_loss_inputs = [
         name for name in suffix_loss_inputs if name not in physical_abi_map
@@ -3801,12 +4022,19 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         and bool(suffix_loss_inputs)
         and not missing_suffix_loss_inputs
     )
-    can_back_value_and_grad = (
+    legacy_suffix_value_and_grad = (
         not missing_outputs
         and suffix_loss_inputs_available
         and train_step_outputs_computed
         and train_step_loss_cotangents_computed
         and train_step_suffix_loss_parameter_grads_computed
+    )
+    can_back_value_and_grad = bool(
+        legacy_suffix_value_and_grad
+        or (
+            replay_cotangent_boundary_available
+            and bool(gradient_outputs)
+        )
     )
     return {
         "contract": PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
@@ -3826,6 +4054,9 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         "train_step_loss_source_buffers": train_step_loss_source_buffers,
         "train_step_loss_cotangents_computed": train_step_loss_cotangents_computed,
         "train_step_loss_cotangent_abi": train_step_loss_cotangent_abi,
+        "replay_cotangent_boundary_available": replay_cotangent_boundary_available,
+        "replay_boundary_source_buffers": replay_boundary_source_buffers,
+        "replay_boundary_cotangent_buffers": replay_boundary_cotangent_buffers,
         "train_step_suffix_loss_parameter_grads_computed": (
             train_step_suffix_loss_parameter_grads_computed
         ),
@@ -3848,8 +4079,21 @@ def _path_c_fused_train_block_training_abi_contract_payload(
         "missing_suffix_loss_inputs": missing_suffix_loss_inputs,
         "loss_output_candidates": loss_outputs,
         "ntokens_output_candidates": ntokens_outputs,
+        "loss_outputs_source": (
+            "fused_train_step_output_abi"
+            if loss_outputs and ntokens_outputs
+            else "eager_suffix_replay_cotangent_bridge"
+            if replay_cotangent_boundary_available
+            else "unavailable"
+        ),
         "sample_gradient_outputs": gradient_outputs[:8],
         "reason": (
+            "generated fused train-block ABI exposes replay boundary outputs, "
+            "cotangent seed buffers, and model-gradient buffers; loss and "
+            "ntokens are computed by the eager suffix outside the TileLang "
+            "artifact"
+            if replay_cotangent_boundary_available and gradient_outputs
+            else
             "generated fused train-block ABI exposes loss, ntokens, and gradient "
             "buffers for value_and_grad"
             if can_back_value_and_grad
@@ -3953,6 +4197,177 @@ def _path_c_fused_train_block_artifact_compile_report(
     return report
 
 
+def _path_c_generated_stage_schedule_template(
+    *,
+    schedule_target: Any,
+    region: Any,
+    abi_prim_func: Any,
+    execution_stage: str,
+    active_node_names: Sequence[str] | None = None,
+    stage_suffix: str = "",
+    row_dispatch_mode: str = DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+) -> Callable[[Any], Any]:
+    """Build a stage PrimFunc template with the full train-block ABI map."""
+    return make_path_c_descriptor_stage_schedule_template(
+        schedule_target=schedule_target,
+        region=region,
+        abi_prim_func=abi_prim_func,
+        execution_stage=execution_stage,
+        active_node_names=active_node_names,
+        stage_suffix=stage_suffix,
+        row_dispatch_mode=row_dispatch_mode,
+    )
+
+
+def _path_c_kernel_buffer_shapes(prim_func: Any) -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    buffer_map = getattr(prim_func, "buffer_map", {}) or {}
+    for param in tuple(getattr(prim_func, "params", ())):
+        buffer = buffer_map.get(param)
+        if buffer is None:
+            continue
+        name = str(getattr(buffer, "name", param))
+        shape = tuple(int(dim) for dim in tuple(getattr(buffer, "shape", ())))
+        shapes[name] = shape
+    return shapes
+
+
+def _path_c_merged_physical_abi_for_prim_funcs(
+    prim_funcs: Sequence[Any],
+) -> tuple[dict[str, Any], dict[str, tuple[int, ...]]]:
+    return merge_path_c_physical_abi_for_prim_funcs(prim_funcs)
+
+
+_PATH_C_RECURRENT_BACKWARD_OPS = frozenset({"m2rnn_bwd", "mamba3_mimo_bwd"})
+
+
+def _path_c_int_prim_attr(prim_func: Any, attr_name: str) -> int | None:
+    raw_value = getattr(prim_func, attr_name, None)
+    if raw_value is None:
+        return None
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _path_c_str_prim_attr(prim_func: Any, attr_name: str) -> str | None:
+    raw_value = getattr(prim_func, attr_name, None)
+    if raw_value is None:
+        return None
+    text = str(raw_value)
+    return text or None
+
+
+def _path_c_first_str_prim_attr(
+    prim_funcs: Sequence[Any],
+    attr_name: str,
+) -> str | None:
+    for prim_func in prim_funcs:
+        value = _path_c_str_prim_attr(prim_func, attr_name)
+        if value:
+            return value
+    return None
+
+
+def _path_c_max_int_prim_attr(
+    prim_funcs: Sequence[Any],
+    attr_name: str,
+) -> int | None:
+    values = tuple(
+        value
+        for prim_func in prim_funcs
+        if (value := _path_c_int_prim_attr(prim_func, attr_name)) is not None
+    )
+    return max(values) if values else None
+
+
+def _path_c_generated_stage_row_launch_attrs(
+    prim_funcs: Sequence[Any],
+) -> dict[str, Any]:
+    """Extract launcher-chunk scalar ABI metadata from generated stage PrimFuncs."""
+
+    return {
+        "row_chunk_count": _path_c_max_int_prim_attr(
+            prim_funcs,
+            "_cppmega_path_c_row_chunk_count",
+        ),
+        "row_chunk_index_param": _path_c_first_str_prim_attr(
+            prim_funcs,
+            "_cppmega_path_c_row_chunk_index_param",
+        ),
+        "row_subchunk_count": _path_c_max_int_prim_attr(
+            prim_funcs,
+            "_cppmega_path_c_row_subchunk_count",
+        ),
+        "row_subchunk_index_param": _path_c_first_str_prim_attr(
+            prim_funcs,
+            "_cppmega_path_c_row_subchunk_index_param",
+        ),
+        "backward_gate_param": _path_c_first_str_prim_attr(
+            prim_funcs,
+            "_cppmega_path_c_backward_gate_param",
+        ),
+    }
+
+
+def _path_c_monolithic_recurrent_backward_runtime_blocker(
+    prim_func: Any | None,
+) -> dict[str, Any] | None:
+    """Return a runtime blocker for the scalarized monolithic recurrent bwd form."""
+
+    if prim_func is None:
+        return None
+    row_dispatch_mode = _path_c_str_prim_attr(
+        prim_func,
+        "_cppmega_path_c_row_dispatch_mode",
+    )
+    execution_stage = _path_c_str_prim_attr(
+        prim_func,
+        "_cppmega_path_c_execution_stage",
+    )
+    if (
+        row_dispatch_mode != DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS
+        or execution_stage != DESCRIPTOR_EXECUTION_STAGE_ALL
+    ):
+        return None
+    row_chunk_count = _path_c_int_prim_attr(
+        prim_func,
+        "_cppmega_path_c_row_chunk_count",
+    )
+    if row_chunk_count is None or row_chunk_count <= 1:
+        return None
+    ops = tuple(
+        str(op)
+        for op in (getattr(prim_func, "_cppmega_path_c_brick_ops", ()) or ())
+    )
+    recurrent_backward_ops = tuple(
+        op for op in ops if op in _PATH_C_RECURRENT_BACKWARD_OPS
+    )
+    if not recurrent_backward_ops:
+        return None
+    shape_env = getattr(prim_func, "_cppmega_path_c_shape_env", None)
+    sequence_length = getattr(shape_env, "sequence_length", None)
+    try:
+        sequence_length = int(sequence_length)
+    except (TypeError, ValueError):
+        sequence_length = None
+    return {
+        "status": "blocked",
+        "kind": "monolithic_grid_chunks_recurrent_backward_scalar_replay",
+        "reason": (
+            "monolithic grid-chunk recurrent backward scalarizes exact replay "
+            "inside each generated row chunk; production runtime must use "
+            "descriptor launcher-chunk stages instead"
+        ),
+        "row_dispatch_mode": row_dispatch_mode,
+        "execution_stage": execution_stage,
+        "row_chunk_count": row_chunk_count,
+        "sequence_length": sequence_length,
+        "recurrent_backward_ops": list(dict.fromkeys(recurrent_backward_ops)),
+    }
+
+
 def compile_path_c_fused_train_block_artifact_for_model(
     *,
     model: Any,
@@ -4034,13 +4449,179 @@ def compile_path_c_fused_train_block_artifact_for_model(
             "reason": str(exc),
         }
     try:
+        if training_abi_prim_func is None:
+            raise RuntimeError(str(training_abi_contract.get("reason", "")))
+        monolithic_runtime_blocker = (
+            _path_c_monolithic_recurrent_backward_runtime_blocker(
+                training_abi_prim_func
+            )
+        )
+        monolithic_compile_kwargs: dict[str, Any] = {
+            "schedule_template": schedule_template,
+            "schedule_name": schedule_target.schedule_name,
+            "schedule_status": schedule_target.schedule_status,
+            "target": target_name,
+        }
+        if monolithic_runtime_blocker is None:
+            monolithic_compile_kwargs["tilelang_lowerer"] = native_lowerer
         compiled = compile_path_c_region(
             scheduled.region,
-            schedule_template=schedule_template,
-            schedule_name=schedule_target.schedule_name,
-            schedule_status=schedule_target.schedule_status,
-            tilelang_lowerer=native_lowerer,
-            target=target_name,
+            **monolithic_compile_kwargs,
+        )
+        descriptor_stage_groups = plan_path_c_descriptor_stage_groups(
+            scheduled.region
+        )
+        forward_stage_groups = tuple(
+            group
+            for group in descriptor_stage_groups
+            if group.execution_stage == DESCRIPTOR_EXECUTION_STAGE_FORWARD
+        )
+        forward_stage_templates = tuple(
+            _path_c_generated_stage_schedule_template(
+                schedule_target=schedule_target,
+                region=scheduled.region,
+                abi_prim_func=training_abi_prim_func,
+                execution_stage=group.execution_stage,
+                active_node_names=group.active_node_names,
+                stage_suffix=group.stage_suffix,
+                row_dispatch_mode=group.row_dispatch_mode,
+            )
+            for group in forward_stage_groups
+        )
+        backward_stage_groups = tuple(
+            group
+            for group in descriptor_stage_groups
+            if group.execution_stage == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+        )
+        backward_stage_templates = tuple(
+            _path_c_generated_stage_schedule_template(
+                schedule_target=schedule_target,
+                region=scheduled.region,
+                abi_prim_func=training_abi_prim_func,
+                execution_stage=group.execution_stage,
+                active_node_names=group.active_node_names,
+                stage_suffix=group.stage_suffix,
+                row_dispatch_mode=group.row_dispatch_mode,
+            )
+            for group in backward_stage_groups
+        )
+        forward_stage_prim_funcs = tuple(
+            template(scheduled.region) for template in forward_stage_templates
+        )
+        backward_stage_prim_funcs = tuple(
+            template(scheduled.region) for template in backward_stage_templates
+        )
+        monolithic_artifact = (
+            compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
+        )
+        plan = compiled.plan if isinstance(compiled, CompiledPathCRegion) else compiled
+        monolithic_plan_payload = _path_c_fused_train_block_plan_payload(plan)
+        if monolithic_runtime_blocker is not None:
+            monolithic_plan_payload = {
+                **monolithic_plan_payload,
+                "monolithic_native_compile_skipped": True,
+                "monolithic_runtime_blocked": True,
+                "monolithic_runtime_blocker": monolithic_runtime_blocker,
+                "selected_runtime_artifact": "generated_stage_launcher_chunks",
+            }
+        physical_abi_map, physical_abi_shapes = (
+            _path_c_merged_physical_abi_for_prim_funcs(
+                (
+                    training_abi_prim_func,
+                    *forward_stage_prim_funcs,
+                    *backward_stage_prim_funcs,
+                )
+            )
+        )
+        parameter_gradient_aliases: Mapping[str, Any] = {}
+        if callable(getattr(model, "path_c_parameter_gradient_aliases", None)):
+            parameter_gradient_aliases = model.path_c_parameter_gradient_aliases()
+        selected_region_metadata = (
+            _path_c_fused_train_block_selected_region_metadata(scheduled.region)
+        )
+        trainable_parameter_names = tuple(
+            sorted(_path_c_model_trainable_parameter_names(model))
+        )
+        if (
+            monolithic_runtime_blocker is None
+            and callable(monolithic_artifact)
+            and bool(monolithic_plan_payload.get("single_kernel_fused"))
+        ):
+            plan_payload = {
+                **monolithic_plan_payload,
+                "monolithic_native_compile_skipped": False,
+                "monolithic_runtime_blocked": False,
+                "monolithic_runtime_blocker": None,
+                "selected_runtime_artifact": "single_monolithic_grid_chunks",
+                "single_generated_artifact": True,
+                "generated_stage_artifact": False,
+                "generated_stage_count": len(forward_stage_prim_funcs)
+                + len(backward_stage_prim_funcs),
+                "generated_stage_groups": [
+                    {
+                        "index": group.index,
+                        "execution_stage": group.execution_stage,
+                        "active_node_names": list(group.active_node_names),
+                        "stage_suffix": group.stage_suffix,
+                        "row_dispatch_mode": group.row_dispatch_mode,
+                        "reason": group.reason,
+                    }
+                    for group in (*forward_stage_groups, *backward_stage_groups)
+                ],
+                "monolithic_contract_artifact_type": type(
+                    monolithic_artifact
+                ).__name__,
+                "all_stages_single_kernel_fused": True,
+            }
+            artifact = PathCFusedTrainBlockCallableArtifact(
+                kernel=monolithic_artifact,
+                physical_abi_map=physical_abi_map,
+                physical_abi_shapes=physical_abi_shapes,
+                training_abi_contract=training_abi_contract,
+                parameter_gradient_aliases=parameter_gradient_aliases,
+                trainable_parameter_names=trainable_parameter_names,
+                selected_region_metadata=selected_region_metadata,
+                kernel_buffer_order=path_c_kernel_buffer_order(
+                    training_abi_prim_func
+                ),
+                kernel_buffer_shapes=_path_c_kernel_buffer_shapes(
+                    training_abi_prim_func
+                ),
+            )
+            return {
+                "status": "ok",
+                "reason": (
+                    "selected Path C model train block compiled to one callable "
+                    "generated TileLang/TVM artifact"
+                ),
+                "runtime_owner": runtime_owner,
+                "route_region": getattr(scheduled.region, "name", None),
+                "schedule_id": getattr(schedule_target, "schedule_id", None),
+                "schedule_name": getattr(schedule_target, "schedule_name", None),
+                "implementation_kind": getattr(
+                    schedule_target,
+                    "implementation_kind",
+                    None,
+                ),
+                "native_compile_ok": True,
+                "hidden_packing_performed": False,
+                "plan": plan_payload,
+                "training_abi_contract": training_abi_contract,
+                "artifact": artifact,
+            }
+        forward_artifacts = tuple(
+            native_lowerer(
+                prim_func,
+                target=target_name,
+            )
+            for prim_func in forward_stage_prim_funcs
+        )
+        backward_artifacts = tuple(
+            native_lowerer(
+                prim_func,
+                target=target_name,
+            )
+            for prim_func in backward_stage_prim_funcs
         )
     except Exception as exc:
         return {
@@ -4061,79 +4642,208 @@ def compile_path_c_fused_train_block_artifact_for_model(
             "artifact": None,
         }
 
-    artifact = compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
+    monolithic_artifact = (
+        compiled.artifact if isinstance(compiled, CompiledPathCRegion) else None
+    )
     plan = compiled.plan if isinstance(compiled, CompiledPathCRegion) else compiled
     plan_payload = _path_c_fused_train_block_plan_payload(plan)
-    if artifact is None or not callable(artifact):
-        return {
-            "status": "blocked",
-            "reason": "fused train-block native compile did not produce a callable artifact",
-            "runtime_owner": runtime_owner,
-            "route_region": getattr(scheduled.region, "name", None),
-            "schedule_id": getattr(schedule_target, "schedule_id", None),
-            "schedule_name": getattr(schedule_target, "schedule_name", None),
-            "implementation_kind": getattr(
-                schedule_target,
-                "implementation_kind",
-                None,
-            ),
-            "native_compile_ok": False,
-            "hidden_packing_performed": False,
-            "plan": plan_payload,
-            "training_abi_contract": training_abi_contract,
-            "artifact": None,
+    if monolithic_runtime_blocker is not None:
+        plan_payload = {
+            **plan_payload,
+            "monolithic_native_compile_skipped": True,
+            "monolithic_runtime_blocked": True,
+            "monolithic_runtime_blocker": monolithic_runtime_blocker,
+            "selected_runtime_artifact": "generated_stage_launcher_chunks",
         }
-    if not bool(plan_payload["single_kernel_fused"]):
-        return {
-            "status": "blocked",
-            "reason": "compiled train-block plan is not a verified single fused kernel",
-            "runtime_owner": runtime_owner,
-            "route_region": getattr(scheduled.region, "name", None),
-            "schedule_id": getattr(schedule_target, "schedule_id", None),
-            "schedule_name": getattr(schedule_target, "schedule_name", None),
-            "implementation_kind": getattr(
-                schedule_target,
-                "implementation_kind",
-                None,
-            ),
-            "native_compile_ok": False,
-            "hidden_packing_performed": False,
-            "plan": plan_payload,
-            "training_abi_contract": training_abi_contract,
-            "artifact": None,
+    else:
+        plan_payload = {
+            **plan_payload,
+            "monolithic_native_compile_skipped": False,
+            "monolithic_runtime_blocked": False,
+            "monolithic_runtime_blocker": None,
+            "selected_runtime_artifact": "generated_stage_launcher_chunks",
         }
+    stage_row_launch_attrs = _path_c_generated_stage_row_launch_attrs(
+        (*forward_stage_prim_funcs, *backward_stage_prim_funcs)
+    )
+    plan_payload = {
+        **plan_payload,
+        "single_generated_artifact": False,
+        "generated_stage_artifact": True,
+        "generated_stage_count": len(forward_stage_prim_funcs)
+        + len(backward_stage_prim_funcs),
+        "generated_stage_groups": [
+            {
+                "index": group.index,
+                "execution_stage": group.execution_stage,
+                "active_node_names": list(group.active_node_names),
+                "stage_suffix": group.stage_suffix,
+                "row_dispatch_mode": group.row_dispatch_mode,
+                "reason": group.reason,
+            }
+            for group in (*forward_stage_groups, *backward_stage_groups)
+        ],
+        "stage_source_bytes": {
+            **{
+                f"forward_{index}": len(
+                    (
+                        getattr(
+                            prim_func,
+                            "_cppmega_path_c_generated_source",
+                            "",
+                        )
+                        or ""
+                    ).encode("utf-8")
+                )
+                for index, prim_func in enumerate(forward_stage_prim_funcs)
+            },
+            **{
+                f"backward_{index}": len(
+                    (
+                        getattr(
+                            prim_func,
+                            "_cppmega_path_c_generated_source",
+                            "",
+                        )
+                        or ""
+                    ).encode("utf-8")
+                )
+                for index, prim_func in enumerate(backward_stage_prim_funcs)
+            },
+        },
+        "monolithic_contract_artifact_type": type(monolithic_artifact).__name__
+        if monolithic_artifact is not None
+        else None,
+        "all_stages_single_kernel_fused": bool(
+            all(callable(artifact) for artifact in forward_artifacts)
+            and all(callable(artifact) for artifact in backward_artifacts)
+        ),
+        "generated_stage_compile_verified": bool(
+            all(callable(artifact) for artifact in forward_artifacts)
+            and all(callable(artifact) for artifact in backward_artifacts)
+        ),
+        "runtime_schedule_contract_status": "generated_stages_verified"
+        if (
+            all(callable(artifact) for artifact in forward_artifacts)
+            and all(callable(artifact) for artifact in backward_artifacts)
+        )
+        else "generated_stages_unverified",
+        "generated_stage_row_launch": {
+            key: value
+            for key, value in stage_row_launch_attrs.items()
+            if value is not None
+        },
+    }
     if (
-        artifact is not None
-        and not _path_c_fused_train_block_artifact_has_training_runtime_contract(
-            artifact
-        )
-        and training_abi_prim_func is not None
+        not forward_artifacts
+        or not all(callable(artifact) for artifact in forward_artifacts)
+        or not backward_artifacts
+        or not all(callable(artifact) for artifact in backward_artifacts)
     ):
-        parameter_gradient_aliases: Mapping[str, Any] = {}
-        if callable(getattr(model, "path_c_parameter_gradient_aliases", None)):
-            parameter_gradient_aliases = model.path_c_parameter_gradient_aliases()
-        artifact = PathCFusedTrainBlockCallableArtifact(
-            kernel=artifact,
-            physical_abi_map=getattr(
-                training_abi_prim_func,
-                "_cppmega_path_c_physical_buffer_abi_map",
-                {},
+        return {
+            "status": "blocked",
+            "reason": (
+                "generated Path C stage compile did not produce callable "
+                "forward/backward artifacts"
             ),
-            physical_abi_shapes=getattr(
-                training_abi_prim_func,
-                "_cppmega_path_c_physical_buffer_abi_shapes",
-                {},
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(scheduled.region, "name", None),
+            "schedule_id": getattr(schedule_target, "schedule_id", None),
+            "schedule_name": getattr(schedule_target, "schedule_name", None),
+            "implementation_kind": getattr(
+                schedule_target,
+                "implementation_kind",
+                None,
             ),
-            training_abi_contract=training_abi_contract,
-            parameter_gradient_aliases=parameter_gradient_aliases,
-            trainable_parameter_names=tuple(
-                sorted(_path_c_model_trainable_parameter_names(model))
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "plan": plan_payload,
+            "training_abi_contract": training_abi_contract,
+            "artifact": None,
+        }
+    if not bool(plan_payload["all_stages_single_kernel_fused"]):
+        return {
+            "status": "blocked",
+            "reason": "compiled train-block stages are not verified fused kernels",
+            "runtime_owner": runtime_owner,
+            "route_region": getattr(scheduled.region, "name", None),
+            "schedule_id": getattr(schedule_target, "schedule_id", None),
+            "schedule_name": getattr(schedule_target, "schedule_name", None),
+            "implementation_kind": getattr(
+                schedule_target,
+                "implementation_kind",
+                None,
             ),
-            selected_region_metadata=(
-                _path_c_fused_train_block_selected_region_metadata(scheduled.region)
-            ),
-            kernel_buffer_order=path_c_kernel_buffer_order(training_abi_prim_func),
+            "native_compile_ok": False,
+            "hidden_packing_performed": False,
+            "plan": plan_payload,
+            "training_abi_contract": training_abi_contract,
+            "artifact": None,
+        }
+    parameter_gradient_aliases: Mapping[str, Any] = {}
+    if callable(getattr(model, "path_c_parameter_gradient_aliases", None)):
+        parameter_gradient_aliases = model.path_c_parameter_gradient_aliases()
+    physical_abi_map, physical_abi_shapes = _path_c_merged_physical_abi_for_prim_funcs(
+        (
+            training_abi_prim_func,
+            *forward_stage_prim_funcs,
+            *backward_stage_prim_funcs,
         )
+    )
+    artifact = PathCGeneratedStageTrainBlockCallableArtifact(
+        forward_kernel=forward_artifacts[0],
+        forward_kernels=forward_artifacts,
+        backward_kernel=backward_artifacts[0],
+        backward_kernels=backward_artifacts,
+        physical_abi_map=physical_abi_map,
+        physical_abi_shapes=physical_abi_shapes,
+        training_abi_contract=training_abi_contract,
+        parameter_gradient_aliases=parameter_gradient_aliases,
+        trainable_parameter_names=tuple(
+            sorted(_path_c_model_trainable_parameter_names(model))
+        ),
+        selected_region_metadata=(
+            _path_c_fused_train_block_selected_region_metadata(scheduled.region)
+        ),
+        forward_kernel_buffer_order=path_c_kernel_buffer_order(
+            forward_stage_prim_funcs[0]
+        ),
+        forward_kernel_buffer_orders=tuple(
+            path_c_kernel_buffer_order(prim_func)
+            for prim_func in forward_stage_prim_funcs
+        ),
+        backward_kernel_buffer_order=path_c_kernel_buffer_order(
+            backward_stage_prim_funcs[0]
+        ),
+        backward_kernel_buffer_orders=tuple(
+            path_c_kernel_buffer_order(prim_func)
+            for prim_func in backward_stage_prim_funcs
+        ),
+        forward_kernel_buffer_shapes=_path_c_kernel_buffer_shapes(
+            forward_stage_prim_funcs[0]
+        ),
+        forward_kernel_buffer_shapes_by_stage=tuple(
+            _path_c_kernel_buffer_shapes(prim_func)
+            for prim_func in forward_stage_prim_funcs
+        ),
+        backward_kernel_buffer_shapes=_path_c_kernel_buffer_shapes(
+            backward_stage_prim_funcs[0]
+        ),
+        backward_kernel_buffer_shapes_by_stage=tuple(
+            _path_c_kernel_buffer_shapes(prim_func)
+            for prim_func in backward_stage_prim_funcs
+        ),
+        backward_gate_param=getattr(
+            training_abi_prim_func,
+            "_cppmega_path_c_backward_gate_param",
+            "path_c_run_backward",
+        )
+        or "path_c_run_backward",
+        row_chunk_count=stage_row_launch_attrs["row_chunk_count"],
+        row_chunk_index_param=stage_row_launch_attrs["row_chunk_index_param"],
+        row_subchunk_count=stage_row_launch_attrs["row_subchunk_count"],
+        row_subchunk_index_param=stage_row_launch_attrs["row_subchunk_index_param"],
+    )
 
     return {
         "status": "ok",
@@ -5578,10 +6288,23 @@ def _path_c_validate_internal_scratch_abi_buffers(
         actual_shape = (
             None if actual_shape_raw is None else _path_c_shape_tuple(actual_shape_raw)
         )
-        if actual_shape is None or (
-            actual_shape != expected_shape
-            and _path_c_shape_extent(actual_shape) != _path_c_shape_extent(expected_shape)
-        ):
+        expected_extent = _path_c_shape_extent(expected_shape)
+        actual_extent = (
+            None if actual_shape is None else _path_c_shape_extent(actual_shape)
+        )
+        coalesced_scratch_bank = (
+            name.startswith("path_c_") and name.endswith("_scratch_bank")
+        )
+        shape_compatible = bool(
+            actual_shape == expected_shape
+            or actual_extent == expected_extent
+            or (
+                coalesced_scratch_bank
+                and actual_extent is not None
+                and actual_extent >= expected_extent
+            )
+        )
+        if not shape_compatible:
             shape_mismatches.append(name)
             errors.append(
                 f"{name}: shape {actual_shape} is not compatible with expected "
@@ -7758,7 +8481,6 @@ def path_c_fusion_payload(
         }
     runtime_fused_route_bound = bool(
         fused_train_block_training_contract.get("training_runtime_available")
-        or direct_chain_training_contract.get("training_runtime_available")
     )
     real_schedule_unverified = (
         not production_compile_verified and not plan.single_kernel_fused
@@ -7792,7 +8514,8 @@ def path_c_fusion_payload(
         reason = (
             "real fused train-block schedule has a matching native compile "
             "receipt and stable cache-key audit, but the training runtime still "
-            "has no bound fused artifact/banks or direct-chain logical buffers"
+            "has no bound generated fused artifact, physical ABI banks, and "
+            "single fused train-block value_and_grad runtime"
         )
     else:
         reason = (

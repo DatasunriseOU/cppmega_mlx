@@ -18,6 +18,7 @@ from cppmega_mlx.training.compiled import (
     PATH_C_FUSED_TRAIN_BLOCK_TRAINING_RUNTIME_CONTRACT,
     PATH_C_FUSED_TRAIN_BLOCK_VALUE_AND_GRAD_CONTRACT,
     PathCGradientBufferCapture,
+    PathCGeneratedStageTrainBlockCallableArtifact,
     PathCFusedTrainBlockCallableArtifact,
     PretrainingMetrics,
     PretrainingState,
@@ -834,6 +835,51 @@ def test_fused_train_block_callable_artifact_uses_full_kernel_buffer_order() -> 
                 "path_c_int32_abi_bank": int_bank,
             }
         )
+
+
+def test_generated_stage_artifact_reports_launcher_chunk_metadata() -> None:
+    float_bank = mx.zeros((1,), dtype=mx.float32)
+
+    class _BankOwner:
+        owner_name = "unit.path_c_physical_abi_banks"
+        buffers = {"path_c_float32_abi_bank": float_bank}
+
+    artifact = PathCGeneratedStageTrainBlockCallableArtifact(
+        forward_kernel=lambda *kernel_args: None,
+        backward_kernel=lambda *kernel_args: None,
+        physical_abi_map={
+            "loss": {
+                "bank": "path_c_float32_abi_bank",
+                "dtype": "float32",
+                "offset": 0,
+                "shape": (1,),
+                "logical_shape": (1,),
+                "size": 1,
+            },
+        },
+        physical_abi_shapes={"path_c_float32_abi_bank": (1,)},
+        training_abi_contract={},
+        row_chunk_count=2,
+        row_chunk_index_param="path_c_row_chunk_index",
+        row_subchunk_count=8,
+        row_subchunk_index_param="path_c_row_subchunk_index",
+    )
+
+    artifact.forward(
+        bank_owner=_BankOwner(),
+        kernel_scalar_params={
+            "path_c_run_backward": 0,
+            "path_c_row_chunk_index": 1,
+            "path_c_row_subchunk_index": 7,
+        },
+    )
+
+    contract = artifact.value_and_grad_contract()
+    assert contract["generated_stage_artifact"] is True
+    assert contract["row_chunk_count"] == 2
+    assert contract["row_chunk_index_param"] == "path_c_row_chunk_index"
+    assert contract["row_subchunk_count"] == 8
+    assert contract["row_subchunk_index_param"] == "path_c_row_subchunk_index"
 
 
 def test_fused_train_block_callable_artifact_reports_missing_full_model_grads() -> None:

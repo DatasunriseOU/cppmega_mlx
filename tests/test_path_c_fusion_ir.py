@@ -42,8 +42,13 @@ from cppmega_mlx.runtime.path_c_fusion import (
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import (
     DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN,
+    DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+    DESCRIPTOR_EXECUTION_STAGE_BACKWARD,
+    DESCRIPTOR_EXECUTION_STAGE_FORWARD,
     DESCRIPTOR_LOOP_POLICY_FLAT,
     DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN,
+    DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS,
+    DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
     MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID,
     MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_NAME,
     MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS,
@@ -63,8 +68,11 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (
     mamba3_fp8_train_fusion_schedule_template,
     mamba3_fp8_train_fusion_schedule_target,
     mamba3_fp8_train_prototype_schedule_template,
+    path_c_descriptor_stage_prim_funcs,
     path_c_fusion_schedule_spec,
     path_c_fusion_schedule_template,
+    plan_path_c_descriptor_phase_groups,
+    plan_path_c_descriptor_stage_groups,
     plan_path_c_direct_fusion_chain_for_region,
     plan_path_c_direct_fusion_chains_for_model,
     plan_path_c_fusion_schedule_for_region,
@@ -135,6 +143,50 @@ def _max_tir_region_line_length(source: str) -> int:
         ),
         default=0,
     )
+
+
+def _generated_source_window(source: str, marker: str, line_count: int = 80) -> str:
+    lines = source.splitlines()
+    marker_index = next(index for index, line in enumerate(lines) if marker in line)
+    return "\n".join(lines[marker_index : marker_index + line_count])
+
+
+def _production_mra_staged_launcher_prim_func(stage_suffix: str) -> tuple[object, object]:
+    from cppmega_mlx.runtime import path_c_fusion_schedules as schedules
+
+    cfg = local_gb10_quarter_profile().hybrid_config()
+    fwd_region = build_path_c_model_region_from_route_symbols(
+        region_name="generic_mra_path_c",
+        route_symbols=("M", "R", "A"),
+        model_config=cfg,
+    )
+    region = build_path_c_aot_autograd_region(fwd_region)
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+    assert target.implementation_kind == "production"
+
+    group = next(
+        group
+        for group in plan_path_c_descriptor_stage_groups(region)
+        if group.stage_suffix == stage_suffix
+    )
+    shape_env = target.schedule_template._cppmega_path_c_shape_env
+    entry_base = getattr(region, "entry_symbol", None) or region.name
+    schedule_template = schedules.make_path_c_descriptor_schedule_template(
+        target.brick_descriptors,
+        entry_symbol=f"{entry_base}_{group.stage_suffix}",
+        buffer_extent=target.buffer_extent,
+        shape_env=shape_env,
+        internal_buffer_policy=target.internal_buffer_policy,
+        loop_policy=target.loop_policy,
+        physical_abi_policy=target.physical_abi_policy,
+        max_rows_per_launch=target.max_rows_per_launch,
+        row_dispatch_mode=group.row_dispatch_mode,
+        execution_stage=group.execution_stage,
+        active_node_names=group.active_node_names,
+    )
+    return group, schedule_template(region)
 
 
 @T.prim_func
@@ -461,8 +513,17 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
         "generic_mra_path_c:descriptor_generated_fwd_bwd"
     )
     assert target.implementation_kind == "production"
+    assert target.max_rows_per_launch == DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH
+    assert target.row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_GRID_CHUNKS
     prim_func = path_c_fusion_schedule_template(build_path_c_aot_autograd_region(region))
     assert "def generic_mra_path_c(" in prim_func._cppmega_path_c_generated_source
+    assert prim_func._cppmega_path_c_row_chunk_count == (
+        LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH + DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH - 1
+    ) // DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH
+    assert prim_func._cppmega_path_c_max_rows_per_launch == (
+        DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH
+    )
+    assert "vocab_col" not in prim_func._cppmega_path_c_generated_source
     assert plan.schedule_contract is not None
     spec = path_c_fusion_schedule_spec(
         build_path_c_aot_autograd_region(region),
@@ -471,6 +532,184 @@ def test_build_path_c_model_region_from_route_symbols_uses_dynamic_default_targe
     )
     assert spec.real_abi_contract_complete is True
     assert spec.missing_real_abi_inputs == ()
+
+
+def test_descriptor_stage_planner_groups_train_block_from_region_graph() -> None:
+    fwd_region = build_path_c_model_region_from_route_symbols(
+        region_name="generic_mra_path_c",
+        route_symbols=("M", "R", "A"),
+        model_config=local_gb10_quarter_profile().hybrid_config(),
+    )
+    region = build_path_c_aot_autograd_region(fwd_region)
+
+    groups = plan_path_c_descriptor_stage_groups(region)
+
+    assert [(group.execution_stage, group.stage_suffix) for group in groups] == [
+        (DESCRIPTOR_EXECUTION_STAGE_FORWARD, "g0"),
+        (DESCRIPTOR_EXECUTION_STAGE_FORWARD, "g1"),
+        (DESCRIPTOR_EXECUTION_STAGE_FORWARD, "g2"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b0"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b1"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b2"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b3"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b4"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b5"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b6"),
+    ]
+    assert [group.active_node_names for group in groups[:3]] == [
+        ("route_0_M_entry_rmsnorm",),
+        ("route_0_M",),
+        (
+            "route_0_M_residual_norm",
+            "route_1_R",
+            "route_1_R_residual_norm",
+            "route_2_A_qkv_projection",
+            "route_2_A_sparse_mla_fp8_apply",
+        ),
+    ]
+    assert groups[3].active_node_names == ("route_2_A_sparse_mla_fp8_apply_bwd",)
+    assert groups[4].active_node_names == ("route_2_A_qkv_projection_bwd",)
+    assert all(
+        group.row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+        for group in groups
+    )
+
+
+def test_descriptor_phase_planner_fuses_train_block_by_execution_phase() -> None:
+    fwd_region = build_path_c_model_region_from_route_symbols(
+        region_name="generic_mra_path_c",
+        route_symbols=("M", "R", "A"),
+        model_config=local_gb10_quarter_profile().hybrid_config(),
+    )
+    region = build_path_c_aot_autograd_region(fwd_region)
+
+    groups = plan_path_c_descriptor_phase_groups(region)
+
+    assert [(group.execution_stage, group.stage_suffix) for group in groups] == [
+        (DESCRIPTOR_EXECUTION_STAGE_FORWARD, "g0"),
+        (DESCRIPTOR_EXECUTION_STAGE_BACKWARD, "b0"),
+    ]
+    assert groups[0].active_node_names == tuple(
+        name for name in region.node_names if not name.endswith("_bwd")
+    )
+    assert groups[1].active_node_names == tuple(
+        name for name in region.node_names if name.endswith("_bwd")
+    )
+    assert groups[0].reason == "descriptor_fuses_forward_phase_blocks"
+    assert groups[1].reason == "descriptor_fuses_backward_phase_blocks"
+    assert all(
+        group.row_dispatch_mode == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+        for group in groups
+    )
+
+
+def test_production_staged_launcher_m2rnn_b3_replays_one_row() -> None:
+    import tvm
+
+    group, prim_func = _production_mra_staged_launcher_prim_func("b3")
+    generated_source = prim_func._cppmega_path_c_generated_source
+    policy_window = _generated_source_window(
+        generated_source,
+        "# m2rnn_bwd_policy: exact_reverse_checkpoint_replay",
+    )
+    tir_source = str(tvm.IRModule.from_expr(prim_func).script())
+
+    assert group.execution_stage == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+    assert group.active_node_names == ("route_1_R_bwd",)
+    assert prim_func._cppmega_path_c_execution_stage == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+    assert (
+        prim_func._cppmega_path_c_row_dispatch_mode
+        == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+    )
+    assert "path_c_first_row_launch = T.if_then_else(" in generated_source
+    assert "if path_c_first_row_launch != 0:" in generated_source
+    assert "for route_1_R_bwd_time_rev in T.serial(row, row + 1):" in (
+        policy_window
+    )
+    assert "for route_1_R_bwd_replay_offset in T.serial(0, 1):" in (
+        policy_window
+    )
+    assert "for route_1_R_bwd_replay_offset in T.serial(0, 64):" not in (
+        policy_window
+    )
+    assert "for route_1_R_bwd_replay_offset in range(1):" in tir_source
+    assert "for route_1_R_bwd_replay_offset in range(64):" not in tir_source
+
+
+def test_production_staged_launcher_mamba3_b5_spills_grad_vector_scratch_to_abi() -> None:
+    import tvm
+
+    group, prim_func = _production_mra_staged_launcher_prim_func("b5")
+    generated_source = prim_func._cppmega_path_c_generated_source
+    tir_source = str(tvm.IRModule.from_expr(prim_func).script())
+    spilled = prim_func._cppmega_path_c_spilled_shared_scratch_shapes
+    forced_spill_names = (
+        "route_0_M_bwd_mamba3_h_prev",
+        "route_0_M_bwd_mamba3_h_next",
+        "route_0_M_bwd_mamba3_dh",
+        "route_0_M_bwd_mamba3_dh_prev",
+        "route_0_M_bwd_mamba3_angle_grad",
+        "route_0_M_bwd_mamba3_b_raw_grad",
+        "route_0_M_bwd_mamba3_c_raw_grad",
+        "route_0_M_bwd_mamba3_b_group_grad",
+        "route_0_M_bwd_mamba3_c_group_grad",
+        "route_0_M_bwd_mamba3_dt_vec",
+        "route_0_M_bwd_mamba3_a_vec",
+        "route_0_M_bwd_mamba3_dt_grad",
+        "route_0_M_bwd_mamba3_a_grad",
+        "route_0_M_bwd_mamba3_next_dt_pre_vec",
+        "route_0_M_bwd_mamba3_next_dt_vec",
+        "route_0_M_bwd_mamba3_next_trap_vec",
+        "route_0_M_bwd_mamba3_trap_grad",
+        "route_0_M_bwd_mamba3_projected_vec",
+        "route_0_M_bwd_mamba3_project_grad",
+        "route_0_M_bwd_mamba3_conv_vec",
+        "route_0_M_bwd_mamba3_conv_grad",
+        "route_0_M_bwd_mamba3_out_inner",
+        "route_0_M_bwd_mamba3_out_inner_grad",
+    )
+
+    assert group.execution_stage == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+    assert group.active_node_names == ("route_0_M_bwd",)
+    assert prim_func._cppmega_path_c_execution_stage == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+    assert (
+        prim_func._cppmega_path_c_row_dispatch_mode
+        == DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS
+    )
+    assert "path_c_first_row_launch = T.if_then_else(" in generated_source
+    assert "# mamba3_mimo_bwd_policy: exact_lane_parallel_checkpoint_replay" in (
+        generated_source
+    )
+    assert "if lane == 0:" not in generated_source
+    assert "T.serial(0, 11264)" not in generated_source
+    assert "T.serial(0, 18784)" not in generated_source
+    assert "T.serial(0, 458752)" not in generated_source
+    assert "path_c_float32_scratch_bank: T.Tensor" in generated_source
+    assert "T.alloc_shared" not in generated_source
+    assert 'scope="shared"' not in tir_source
+    assert "threadgroup" not in tir_source
+    assert "buf_dyn_shmem" not in tir_source
+
+    for scratch_name in forced_spill_names:
+        info = spilled[scratch_name]
+        assert info["dtype"] == "float32"
+        assert info["param_name"] == "path_c_float32_scratch_bank"
+        assert info["coalesced_scratch_bank"] is True
+        assert f"{scratch_name} = T.alloc_local" not in generated_source
+        assert f"{scratch_name} = T.alloc_shared" not in generated_source
+        assert f"{scratch_name} = T.alloc_buffer" not in tir_source
+
+    for scratch_name in (
+        "route_0_M_bwd_mamba3_h_prev",
+        "route_0_M_bwd_mamba3_dh",
+        "route_0_M_bwd_mamba3_project_grad",
+        "route_0_M_bwd_mamba3_conv_grad",
+        "route_0_M_bwd_mamba3_out_inner_grad",
+    ):
+        assert any(
+            _line_uses_logical_buffer(prim_func, line, scratch_name)
+            for line in generated_source.splitlines()
+        )
 
 
 def test_named_mamba3_acceptance_target_is_explicit_fixture_only() -> None:
@@ -1622,8 +1861,8 @@ def test_mamba3_fp8_train_descriptor_schedule_labels_nonproduction_fragments() -
         in generated_source
     )
     assert "q_dequant_bwd_policy: saved_prepared_fp8" in generated_source
-    assert "m2rnn_bwd_policy: exact_reverse_recompute" in generated_source
-    assert "mamba3_mimo_bwd_policy: exact_reverse_checkpoint_replay" in (
+    assert "m2rnn_bwd_policy: exact_reverse_checkpoint_replay" in generated_source
+    assert "mamba3_mimo_bwd_policy: exact_lane_parallel_checkpoint_replay" in (
         generated_source
     )
     assert "# backward_policy: row_phased_hidden_recompute" in generated_source
@@ -1879,19 +2118,23 @@ def test_mamba3_fp8_train_descriptor_schedule_uses_loop_fragments() -> None:
 
     assert "# loop_policy: row_phased_hidden" in generated_source
     assert "# internal_buffer_policy: row_local_hidden" in generated_source
-    assert "with T.Kernel(1, threads=256):" in generated_source
+    assert "with T.Kernel(64, threads=128) as chunk:" in generated_source
     assert "lane = T.get_thread_binding(0)" in generated_source
     assert "if lane == 0:" in generated_source
     assert "T.sync_threads()" in generated_source
-    assert f"for row in T.serial(0, {cfg.max_seq_length}):" in generated_source
+    assert "for row in T.serial(row_chunk_start, row_chunk_stop):" in (
+        generated_source
+    )
     assert (
         f"for i in T.serial(row * {cfg.hidden_size} + lane, "
-        f"(row + 1) * {cfg.hidden_size}, step=256):"
+        f"(row + 1) * {cfg.hidden_size}, step=128):"
     ) in generated_source
     assert "# backward_policy: row_phased_hidden_recompute" in generated_source
     # The train block has two forward row loops and one row loop per
     # exact generated backward fragment.
-    assert generated_source.count(f"for row in T.serial(0, {cfg.max_seq_length}):") == 9
+    assert generated_source.count(
+        "for row in T.serial(row_chunk_start, row_chunk_stop):"
+    ) == 8
     assert f"for i in T.serial(0, {activation_extent}):" not in generated_source
     assert 'path_c_float32_scratch_bank: T.Tensor' in generated_source
     assert any(
@@ -1974,8 +2217,9 @@ def test_mamba3_fp8_train_descriptor_replays_mamba3_backward_without_full_h_step
     )
     generated_source = prim_func._cppmega_path_c_generated_source
     spilled = prim_func._cppmega_path_c_spilled_shared_scratch_shapes
+    physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
 
-    assert "mamba3_mimo_bwd_policy: exact_reverse_checkpoint_replay" in (
+    assert "mamba3_mimo_bwd_policy: exact_lane_parallel_checkpoint_replay" in (
         generated_source
     )
     assert "mamba3_mimo_bwd_policy: exact_reverse_recompute" not in (
@@ -1983,8 +2227,14 @@ def test_mamba3_fp8_train_descriptor_replays_mamba3_backward_without_full_h_step
     )
     assert "mamba3_scan_bwd_mamba3_h_steps" not in generated_source
     assert "mamba3_scan_bwd_mamba3_h_steps" not in spilled
-    assert "mamba3_scan_bwd_mamba3_h_checkpoint" in spilled
-    assert "mamba3_scan_bwd_mamba3_angle_checkpoint" in spilled
+    assert "mamba3_h_checkpoint" in physical_abi_map
+    assert "mamba3_angle_checkpoint" in physical_abi_map
+    assert physical_abi_map["mamba3_h_checkpoint"]["bank"] == (
+        "path_c_float32_state_abi_bank"
+    )
+    assert physical_abi_map["mamba3_angle_checkpoint"]["bank"] == (
+        "path_c_float32_state_abi_bank"
+    )
     assert all(
         not scratch_name.endswith("_mamba3_h_steps")
         for scratch_name in spilled
@@ -2015,6 +2265,53 @@ def test_mamba3_fp8_train_descriptor_splits_float32_abi_region_surface() -> None
 
     tir_source = str(tvm.IRModule.from_expr(prim_func).script())
     assert _max_tir_region_line_length(tir_source) < 12_000
+
+
+def test_bf16_descriptor_stages_do_not_emit_threadgroup_bfloat16_scratch() -> None:
+    cfg = local_gb10_quarter_profile().hybrid_config()
+    fwd_region = build_path_c_model_region_from_route_symbols(
+        region_name="generic_mra_path_c",
+        route_symbols=("M", "R", "A"),
+        model_config=cfg,
+    )
+    region = build_path_c_aot_autograd_region(fwd_region)
+    shape_env = region.metadata["path_c_model_shape_env"]
+    region = replace(
+        region,
+        metadata={
+            **region.metadata,
+            "path_c_model_shape_env": replace(
+                shape_env,
+                sequence_length=128,
+                model_value_dtype="bfloat16",
+            ),
+        },
+    )
+    target = select_path_c_fusion_schedule_target(region)
+
+    assert target is not None
+    abi_prim_func = target.schedule_template(region)
+    groups = plan_path_c_descriptor_stage_groups(region)
+    stage_prim_funcs = path_c_descriptor_stage_prim_funcs(
+        region=region,
+        schedule_target=target,
+        abi_prim_func=abi_prim_func,
+        groups=groups,
+    )
+    source_by_suffix = {
+        group.stage_suffix: prim_func._cppmega_path_c_generated_source
+        for group, prim_func in zip(groups, stage_prim_funcs, strict=True)
+    }
+
+    for source in source_by_suffix.values():
+        assert re.search(r'T\.alloc_shared\([^\n]+, "bfloat16"\)', source) is None
+    assert "route_1_R_residual_norm_hidden" not in source_by_suffix["g1"]
+    g2_spilled = stage_prim_funcs[2]._cppmega_path_c_spilled_shared_scratch_shapes
+    assert g2_spilled["route_1_R_residual_norm_hidden"]["dtype"] == "float32"
+    assert (
+        g2_spilled["route_1_R_residual_norm_hidden"]["param_name"]
+        == "path_c_float32_scratch_bank"
+    )
 
 
 def test_mamba3_fp8_train_descriptor_schedule_uses_row_local_internal_arrays_without_full_staging() -> None:
@@ -3853,11 +4150,16 @@ def test_mamba3_fp8_train_launcher_chunk_dispatch_bounds_scalar_chunk_index_for_
         in generated_source
     )
     assert (
-        "row_chunk_start: T.int32 = T.if_then_else(path_c_run_backward == 1, "
-        "0, T.if_then_else(path_c_run_backward != 0, logical_row_chunk_start, "
-        "subchunk_row_chunk_start))"
+        "row_chunk_start: T.int32 = T.min(logical_row_chunk_start + "
+        "path_c_row_subchunk_index * 8, logical_row_chunk_stop)"
         in generated_source
     )
+    assert (
+        "row_chunk_stop: T.int32 = T.min(row_chunk_start + 8, "
+        "logical_row_chunk_stop)"
+        in generated_source
+    )
+    assert "row_chunk_start: T.int32 = T.if_then_else(path_c_run_backward == 1, 0" not in generated_source
 
 
 def test_path_c_launcher_manifest_decodes_launcher_chunk_index_param() -> None:
@@ -4409,7 +4711,7 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
         if param in captured_prim_funcs[0].buffer_map
     ]
     assert 'bx = T.launch_thread("blockIdx.x", 1)' in generated_source
-    assert 'lane = T.launch_thread("threadIdx.x", 256)' in generated_source
+    assert 'lane = T.launch_thread("threadIdx.x", 128)' in generated_source
     assert "path_c_run_backward: T.int32" in generated_source
     assert "if path_c_run_backward != 1:" in generated_source
     assert "if path_c_run_backward == 1:" in generated_source
@@ -4418,11 +4720,16 @@ def test_full_1b_quarter_launcher_chunk_contract() -> None:
         in generated_source
     )
     assert (
-        "row_chunk_start: T.int32 = T.if_then_else(path_c_run_backward == 1, "
-        "0, T.if_then_else(path_c_run_backward != 0, logical_row_chunk_start, "
-        "subchunk_row_chunk_start))"
+        "row_chunk_start: T.int32 = T.min(logical_row_chunk_start + "
+        "path_c_row_subchunk_index * 8, logical_row_chunk_stop)"
         in generated_source
     )
+    assert (
+        "row_chunk_stop: T.int32 = T.min(row_chunk_start + 8, "
+        "logical_row_chunk_stop)"
+        in generated_source
+    )
+    assert "row_chunk_start: T.int32 = T.if_then_else(path_c_run_backward == 1, 0" not in generated_source
     assert (
         "entry_row_chunk_stop: T.int32 = T.min(row_chunk_stop + 1, 4096)"
         in generated_source
@@ -5139,13 +5446,37 @@ def test_compiled_vs_eager_mra_grad_parity_rtol1e2() -> None:
             hidden_after_m2rnn = hidden_after_mamba3 + m2rnn_delta
             a_normed = self.a.norm(hidden_after_m2rnn)
             prepared = self.a.block.prepare_sparse_mla_fp8(a_normed, mask="causal")
-            attention_out = self.a.block._apply_sparse_mla_fp8_path_c_prepared(
-                prepared,
-                output_shape=(
-                    int(a_normed.shape[0]),
-                    int(a_normed.shape[1]),
-                    self.a.block.config.q_proj_dim,
-                ),
+            # This is the eager oracle: keep the prepared Path C forward
+            # semantics, but use the reference VJP instead of the standalone
+            # Path C Sparse-MLA backward kernel.
+            from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+                sparse_mla_fp8_path_c_apply_prepared_float,
+            )
+
+            attention_values = sparse_mla_fp8_path_c_apply_prepared_float(
+                prepared.q,
+                prepared.kv,
+                prepared.q_fp8,
+                prepared.q_scale,
+                prepared.kv_fp8,
+                prepared.kv_scale,
+                prepared.indices,
+                sm_scale=prepared.sm_scale,
+                d_v=prepared.d_v,
+                sinks=None,
+                force_path_c=True,
+                causal=prepared.causal,
+                output_dtype=prepared.q.dtype,
+                force_backward_path_c=False,
+            )
+            attention_out = self.a.block.out_proj(
+                attention_values.reshape(
+                    (
+                        int(a_normed.shape[0]),
+                        int(a_normed.shape[1]),
+                        self.a.block.config.q_proj_dim,
+                    )
+                )
             )
             return attention_out.sum() + hidden_after_m2rnn.sum()
 
@@ -5452,7 +5783,10 @@ def test_model_region_shape_env_controls_dynamic_descriptor_extent() -> None:
     assert target.internal_buffer_policy == DESCRIPTOR_INTERNAL_BUFFER_POLICY_ROW_LOCAL_HIDDEN
     assert target.loop_policy == DESCRIPTOR_LOOP_POLICY_ROW_PHASED_HIDDEN
     assert "# loop_policy: row_phased_hidden" in generated_source
-    assert "for row in T.serial(0, 128):" in generated_source
+    assert "row_chunk_start = chunk * 64" in generated_source
+    assert "row_chunk_stop = T.min(row_chunk_start + 64, 128)" in generated_source
+    assert "entry_row_chunk_stop = T.min(row_chunk_stop + 1, 128)" in generated_source
+    assert "for row in T.serial(row_chunk_start, row_chunk_stop):" in generated_source
     assert (
         "for i in T.serial(row * 32 + lane, "
         "(row + 1) * 32, step=256):"
@@ -5617,30 +5951,19 @@ def test_model_derived_fwd_bwd_descriptor_declares_train_step_scalar_abi() -> No
     prim_func = target.schedule_template(region)
     output_abi = prim_func._cppmega_path_c_train_step_output_abi
     physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
-    buffer_abi_shapes = prim_func._cppmega_path_c_buffer_abi_shapes
 
     assert output_abi == {
-        "declared": True,
-        "outputs_computed": True,
-        "computed_logical_outputs": ("loss", "ntokens"),
+        "declared": False,
+        "outputs_computed": False,
+        "computed_logical_outputs": (),
         "pending_logical_outputs": (),
-        "logical_outputs": ("loss", "ntokens"),
-        "reason": (
-            "train-step scalar ABI slots are generated and populated by fused "
-            "suffix loss codegen"
-        ),
+        "logical_outputs": (),
+        "reason": "train-step scalar ABI slots are not required for this descriptor",
     }
-    assert buffer_abi_shapes["loss"] == (1,)
-    assert buffer_abi_shapes["ntokens"] == (1,)
-    assert physical_abi_map["loss"]["bank"] == "path_c_float32_activation_abi_bank"
-    assert physical_abi_map["loss"]["shape"] == (1,)
-    assert physical_abi_map["loss"]["dtype"] == "float32"
-    assert (
-        physical_abi_map["ntokens"]["bank"]
-        == "path_c_float32_activation_abi_bank"
-    )
-    assert physical_abi_map["ntokens"]["shape"] == (1,)
-    assert physical_abi_map["ntokens"]["dtype"] == "float32"
+    assert "loss" not in physical_abi_map
+    assert "ntokens" not in physical_abi_map
+    assert "target_ids" not in physical_abi_map
+    assert "lm_head_weight" not in physical_abi_map
 
 
 def test_model_derived_fwd_bwd_descriptor_declares_suffix_loss_input_abi() -> None:
@@ -5666,39 +5989,21 @@ def test_model_derived_fwd_bwd_descriptor_declares_suffix_loss_input_abi() -> No
     target = select_path_c_fusion_schedule_target(region)
 
     assert target is not None
-    assert "train_step_suffix_loss_input_abi" in target.required_codegen_steps
+    assert "train_step_suffix_loss_input_abi" not in target.required_codegen_steps
 
     prim_func = target.schedule_template(region)
     suffix_abi = prim_func._cppmega_path_c_train_step_suffix_loss_input_abi
     physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
-    buffer_abi_shapes = prim_func._cppmega_path_c_buffer_abi_shapes
 
     assert suffix_abi == {
-        "declared": True,
-        "logical_inputs": (
-            "target_ids",
-            "target_mask",
-            "final_norm_weight",
-            "lm_head_weight",
-        ),
-        "reason": (
-            "train-step suffix loss inputs are declared for fused loss codegen; "
-            "target_mask is consumed for ntokens, while full loss codegen is pending"
-        ),
+        "declared": False,
+        "logical_inputs": (),
+        "reason": "train-step suffix loss inputs are not required for this descriptor",
     }
-    assert buffer_abi_shapes["target_ids"] == (128,)
-    assert buffer_abi_shapes["target_mask"] == (128,)
-    assert buffer_abi_shapes["final_norm_weight"] == (32,)
-    assert buffer_abi_shapes["lm_head_weight"] == (cfg.vocab_size * 32,)
-    assert physical_abi_map["target_ids"]["dtype"] == "int32"
-    assert physical_abi_map["target_mask"]["dtype"] == "float32"
-    assert physical_abi_map["final_norm_weight"]["dtype"] == "float32"
-    assert physical_abi_map["lm_head_weight"]["dtype"] == "float32"
-    assert physical_abi_map["lm_head_weight"]["shape"] == (cfg.vocab_size * 32,)
-    assert physical_abi_map["lm_head_weight"]["logical_shape"] == (
-        cfg.vocab_size,
-        32,
-    )
+    assert "target_ids" not in physical_abi_map
+    assert "target_mask" not in physical_abi_map
+    assert "final_norm_weight" not in physical_abi_map
+    assert "lm_head_weight" not in physical_abi_map
 
 
 def test_model_derived_fwd_bwd_descriptor_computes_ntokens_from_target_mask() -> None:
@@ -5729,14 +6034,13 @@ def test_model_derived_fwd_bwd_descriptor_computes_ntokens_from_target_mask() ->
     output_abi = prim_func._cppmega_path_c_train_step_output_abi
     generated_source = prim_func._cppmega_path_c_generated_source
 
-    assert output_abi["outputs_computed"] is True
-    assert output_abi["computed_logical_outputs"] == ("loss", "ntokens")
+    assert output_abi["outputs_computed"] is False
+    assert output_abi["computed_logical_outputs"] == ()
     assert output_abi["pending_logical_outputs"] == ()
-    assert "# train_step_suffix_loss_ntokens" in generated_source
-    assert "for token_row in T.serial(0, 128):" in generated_source
-    assert _physical_bank_fragment(prim_func, "ntokens") in generated_source
-    assert _physical_bank_fragment(prim_func, "target_mask") in generated_source
-    assert "loss" in output_abi["computed_logical_outputs"]
+    assert "# train_step_suffix_loss_ntokens" not in generated_source
+    assert "target_mask" not in prim_func._cppmega_path_c_physical_buffer_abi_map
+    assert "ntokens" not in prim_func._cppmega_path_c_physical_buffer_abi_map
+    assert "loss" not in output_abi["computed_logical_outputs"]
 
 
 def test_model_derived_fwd_bwd_descriptor_computes_suffix_loss_before_backward() -> None:
@@ -5767,38 +6071,21 @@ def test_model_derived_fwd_bwd_descriptor_computes_suffix_loss_before_backward()
     output_abi = prim_func._cppmega_path_c_train_step_output_abi
     generated_source = prim_func._cppmega_path_c_generated_source
 
-    assert output_abi["outputs_computed"] is True
-    assert output_abi["computed_logical_outputs"] == ("loss", "ntokens")
+    assert output_abi["outputs_computed"] is False
+    assert output_abi["computed_logical_outputs"] == ()
     assert output_abi["pending_logical_outputs"] == ()
-    suffix_index = generated_source.index("# train_step_suffix_loss_scalar")
     backward_index = generated_source.index("# backward_policy: row_phased_hidden_recompute")
-    assert suffix_index < backward_index
-    assert "for vocab_col in T.serial(0, 256):" in generated_source
-    assert "for suffix_hidden_col in T.serial(0, 32):" in generated_source
-    assert "T.exp(train_step_suffix_logit[0] - train_step_suffix_max_logit[0])" in (
-        generated_source
-    )
-    assert "T.log(train_step_suffix_sum_exp[0])" in generated_source
-    assert _physical_bank_fragment(prim_func, "loss") in generated_source
-    assert _physical_bank_fragment(prim_func, "target_ids") in generated_source
-    assert _physical_bank_fragment(prim_func, "target_mask") in generated_source
-    assert _physical_bank_fragment(prim_func, "final_norm_weight") in generated_source
-    assert _physical_bank_fragment(prim_func, "lm_head_weight") in generated_source
-    lm_head_info = prim_func._cppmega_path_c_physical_buffer_abi_map["lm_head_weight"]
-    assert (
-        f"{lm_head_info['bank']}[{lm_head_info['offset']} + "
-        "((vocab_col) * 32 + (suffix_hidden_col))]"
-    ) in generated_source
+    assert backward_index > 0
+    assert "# train_step_suffix_loss_scalar" not in generated_source
+    assert "for vocab_col in T.serial(0, 256):" not in generated_source
+    assert "train_step_suffix_logit" not in generated_source
+    assert "train_step_suffix_sum_exp" not in generated_source
     for source_name in (
         "route_1_R_hidden_after",
         "route_2_A_sparse_mla_fp8_apply_out",
     ):
         source_info = prim_func._cppmega_path_c_physical_buffer_abi_map[source_name]
         assert source_info["logical_shape"] == (1, 128, 32)
-        assert (
-            f"{source_info['bank']}[{source_info['offset']} + "
-            "((token_row) * 32 + (suffix_hidden_col))]"
-        ) in generated_source
     assert _physical_bank_fragment(prim_func, "route_1_R_hidden_after") in (
         generated_source
     )
@@ -5836,7 +6123,7 @@ def test_model_derived_fwd_bwd_descriptor_seeds_suffix_loss_cotangents_before_ba
     generated_source = prim_func._cppmega_path_c_generated_source
     cotangent_abi = prim_func._cppmega_path_c_train_step_loss_cotangent_abi
 
-    assert cotangent_abi["cotangents_computed"] is True
+    assert cotangent_abi["cotangents_computed"] is False
     assert cotangent_abi["source_logical_buffers"] == (
         "route_1_R_hidden_after",
         "route_2_A_sparse_mla_fp8_apply_out",
@@ -5845,24 +6132,15 @@ def test_model_derived_fwd_bwd_descriptor_seeds_suffix_loss_cotangents_before_ba
         "route_1_R_hidden_after_grad",
         "route_2_A_sparse_mla_fp8_apply_out_grad",
     )
-    suffix_index = generated_source.index("# train_step_suffix_loss_scalar")
-    seed_index = generated_source.index("# train_step_suffix_loss_cotangent_seeds")
     backward_index = generated_source.index("# backward_policy: row_phased_hidden_recompute")
-    assert suffix_index < seed_index < backward_index
-    assert "train_step_suffix_seed_softmax[0]" in generated_source
-    assert "train_step_suffix_seed_class_grad[0]" in generated_source
-    assert "train_step_suffix_seed_dot[0]" in generated_source
-    assert "train_step_suffix_seed_hidden_grad[0]" in generated_source
-    assert "for seed_hidden_dot_col in T.serial(0, 32):" in generated_source
-    assert "for suffix_hidden_col in T.serial(0, 32):" in generated_source
-    assert "for vocab_col in T.serial(0, 256):" in generated_source
+    assert backward_index > 0
+    assert "# train_step_suffix_loss_cotangent_seeds" not in generated_source
+    assert "train_step_suffix_seed_softmax[0]" not in generated_source
+    assert "train_step_suffix_seed_class_grad[0]" not in generated_source
+    assert "for vocab_col in T.serial(0, 256):" not in generated_source
     for grad_name in cotangent_abi["logical_cotangent_buffers"]:
-        assert any(
-            _line_uses_logical_buffer(prim_func, line, grad_name)
-            and "(token_row) * 32 + (suffix_hidden_col)" in line
-            and "] = train_step_suffix_seed_hidden_grad[0]" in line
-            for line in generated_source.splitlines()
-        )
+        assert grad_name in prim_func._cppmega_path_c_physical_buffer_abi_map
+        assert _physical_bank_fragment(prim_func, grad_name) in generated_source
 
 
 def test_model_derived_fwd_bwd_descriptor_computes_suffix_parameter_grads_before_backward() -> None:
@@ -5897,48 +6175,22 @@ def test_model_derived_fwd_bwd_descriptor_computes_suffix_parameter_grads_before
     physical_abi_map = prim_func._cppmega_path_c_physical_buffer_abi_map
 
     assert parameter_grad_abi == {
-        "declared": True,
-        "parameter_logical_buffers": ("final_norm_weight", "lm_head_weight"),
-        "logical_gradient_buffers": (
+        "declared": False,
+        "parameter_logical_buffers": (),
+        "logical_gradient_buffers": (),
+        "gradients_computed": False,
+        "missing_logical_gradient_buffers": (
             "final_norm_weight_grad",
             "lm_head_weight_grad",
         ),
-        "gradients_computed": True,
-        "missing_logical_gradient_buffers": (),
-        "reason": (
-            "train-step suffix loss parameter gradients are generated for "
-            "final_norm_weight and lm_head_weight"
-        ),
+        "reason": "train-step suffix loss parameter gradients are not required for this descriptor",
     }
-    assert physical_abi_map["final_norm_weight_grad"]["shape"] == (32,)
-    assert physical_abi_map["final_norm_weight_grad"]["logical_shape"] == (32,)
-    assert physical_abi_map["lm_head_weight_grad"]["shape"] == (
-        cfg.vocab_size * 32,
-    )
-    assert physical_abi_map["lm_head_weight_grad"]["logical_shape"] == (
-        cfg.vocab_size,
-        32,
-    )
-    suffix_index = generated_source.index("# train_step_suffix_loss_scalar")
-    param_grad_index = generated_source.index("# train_step_suffix_loss_parameter_grads")
     backward_index = generated_source.index("# backward_policy: row_phased_hidden_recompute")
-    assert suffix_index < param_grad_index < backward_index
-    assert "train_step_suffix_param_class_grad[0]" in generated_source
-    assert "train_step_suffix_param_grad_norm[0]" in generated_source
-    final_norm_grad_info = physical_abi_map["final_norm_weight_grad"]
-    lm_head_grad_info = physical_abi_map["lm_head_weight_grad"]
-    assert (
-        f"{final_norm_grad_info['bank']}[{final_norm_grad_info['offset']} + "
-        "(suffix_hidden_col)] = "
-        f"{final_norm_grad_info['bank']}[{final_norm_grad_info['offset']} + "
-        "(suffix_hidden_col)] + "
-    ) in generated_source
-    assert (
-        f"{lm_head_grad_info['bank']}[{lm_head_grad_info['offset']} + "
-        "((vocab_col) * 32 + (suffix_hidden_col))] = "
-        f"{lm_head_grad_info['bank']}[{lm_head_grad_info['offset']} + "
-        "((vocab_col) * 32 + (suffix_hidden_col))] + "
-    ) in generated_source
+    assert backward_index > 0
+    assert "final_norm_weight_grad" not in physical_abi_map
+    assert "lm_head_weight_grad" not in physical_abi_map
+    assert "# train_step_suffix_loss_parameter_grads" not in generated_source
+    assert "train_step_suffix_param_class_grad[0]" not in generated_source
 
 
 def test_model_region_shape_env_specializes_contract_and_cache_key() -> None:

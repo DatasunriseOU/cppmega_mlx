@@ -33,6 +33,9 @@ from cppmega_v4._tilelang._path_d_deps import (
     ensure_triton_frontend_root,
     import_triton_with_local_symbols,
     path_d_imports_allowed,
+    unsafe_fla_import_disabled_reason,
+    unsafe_triton_frontend_import_disabled_reason,
+    unsafe_triton_frontend_import_enabled,
 )
 
 
@@ -41,6 +44,8 @@ def _triton_frontend_importable() -> tuple[bool, str]:
     root = ensure_triton_frontend_root()
     if root is None:
         return False, "poc.triton_frontend not importable: no local checkout found"
+    if not unsafe_triton_frontend_import_enabled():
+        return False, unsafe_triton_frontend_import_disabled_reason(root)
     ok, reason = path_d_imports_allowed("frontend")
     if not ok:
         return False, f"{reason}; root={root}"
@@ -60,6 +65,8 @@ def _fla_chunk_kernel_importable() -> tuple[bool, str]:
     root = ensure_fla_root()
     if root is None:
         return False, "FLA chunk_delta_h kernel not importable: no local checkout found"
+    if not unsafe_triton_frontend_import_enabled():
+        return False, unsafe_fla_import_disabled_reason(root)
     ok, reason = path_d_imports_allowed("gdn_fla")
     if not ok:
         return False, f"{reason}; root={root}"

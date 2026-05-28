@@ -106,6 +106,26 @@ const NODE_TYPES: NodeTypes = {
   block_group: BlockGroupNode as unknown as NodeTypes[string],
 };
 
+// Build a rounded-corner orthogonal path through ELK bend points.
+function roundedOrthPath(points: { x: number; y: number }[], r = 9): string {
+  if (points.length < 2) return "";
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const p0 = points[i - 1], p1 = points[i], p2 = points[i + 1];
+    const v1x = p1.x - p0.x, v1y = p1.y - p0.y;
+    const v2x = p2.x - p1.x, v2y = p2.y - p1.y;
+    const l1 = Math.hypot(v1x, v1y) || 1;
+    const l2 = Math.hypot(v2x, v2y) || 1;
+    const rr = Math.min(r, l1 / 2, l2 / 2);
+    const ax = p1.x - (v1x / l1) * rr, ay = p1.y - (v1y / l1) * rr;
+    const bx = p1.x + (v2x / l2) * rr, by = p1.y + (v2y / l2) * rr;
+    d += ` L ${ax} ${ay} Q ${p1.x} ${p1.y} ${bx} ${by}`;
+  }
+  const last = points[points.length - 1];
+  d += ` L ${last.x} ${last.y}`;
+  return d;
+}
+
 // 1. High-fidelity custom MidpointEdge component matching the visual builder mockup.
 export function MidpointEdge({
   id,
@@ -119,14 +139,29 @@ export function MidpointEdge({
   markerEnd,
   data,
 }: EdgeProps): JSX.Element {
-  const [edgePath, labelX, labelY] = getBezierPath({
-    sourceX,
-    sourceY,
-    sourcePosition,
-    targetX,
-    targetY,
-    targetPosition,
-  });
+  const elkBends = (data as { elkBends?: { x: number; y: number }[] } | undefined)?.elkBends;
+  let edgePath: string;
+  let labelX: number;
+  let labelY: number;
+  if (elkBends && elkBends.length >= 2) {
+    // Glue endpoints to the live handle positions, route through ELK's bends.
+    const pts = elkBends.map((p) => ({ ...p }));
+    pts[0] = { x: sourceX, y: sourceY };
+    pts[pts.length - 1] = { x: targetX, y: targetY };
+    edgePath = roundedOrthPath(pts);
+    const mid = pts[Math.floor(pts.length / 2)];
+    labelX = mid.x;
+    labelY = mid.y;
+  } else {
+    [edgePath, labelX, labelY] = getBezierPath({
+      sourceX,
+      sourceY,
+      sourcePosition,
+      targetX,
+      targetY,
+      targetPosition,
+    });
+  }
 
   const sev = (data as { severity?: string } | undefined)?.severity;
   const adapter = (data as { adapter?: boolean } | undefined)?.adapter;

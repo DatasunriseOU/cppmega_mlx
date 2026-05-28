@@ -9,6 +9,7 @@ owner satisfies the structural contract enforced by
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import mlx.core as mx
@@ -70,6 +71,29 @@ def test_path_c_fused_train_block_prim_func_exposes_physical_abi_attrs(model) ->
     # Bank names referenced by the placements must all appear in the shape map.
     placement_banks = {str(info["bank"]) for info in abi_map.values()}
     assert placement_banks <= set(abi_shapes)
+
+
+def test_bank_owner_uses_generated_stage_union_abi(model) -> None:
+    """Stage-generated kernels can require larger physical banks than monolithic ABI."""
+
+    prim_func = model.path_c_fused_train_block_prim_func(sequence_length=64)
+    assert prim_func is not None
+    monolithic_shapes = dict(
+        getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes", {}) or {}
+    )
+    _abi_map, merged_shapes, prim_funcs = model.path_c_fused_train_block_physical_abi(
+        sequence_length=64,
+    )
+    owner = model.make_path_c_physical_abi_bank_owner(sequence_length=64)
+    assert owner is not None
+
+    assert len(prim_funcs) > 1
+    state_bank = "path_c_float32_state_abi_bank"
+    assert tuple(merged_shapes[state_bank]) == tuple(owner.buffers[state_bank].shape)
+    assert math.prod(tuple(merged_shapes[state_bank])) >= math.prod(
+        tuple(monolithic_shapes[state_bank])
+    )
+    assert tuple(merged_shapes[state_bank]) != tuple(monolithic_shapes[state_bank])
 
 
 def test_owner_unblocks_m04_fp8_path_c_runtime_binding(model) -> None:
@@ -143,20 +167,21 @@ def test_path_c_fused_in_region_parameter_bank_aliases_covers_brick_params(
 ) -> None:
     aliases = model.path_c_fused_in_region_parameter_bank_aliases()
     # The local_gb10_quarter tiny smoke profile generates the brick_10_M /
-    # brick_11_R / brick_12_A region. The fused suffix also covers the
-    # entry RMSNorm, final_norm + lm_head + per-layer residual norms.
+    # brick_11_R / brick_12_A region. The replay/cotangent fused block covers
+    # only parameters owned by that region; final_norm and lm_head stay in the
+    # eager suffix and must not be hidden inside the physical ABI bank aliases.
     # Exact count check locks the discovery surface so future region drift
     # surfaces in tests.
-    assert len(aliases) == 28
+    assert len(aliases) == 26
     expected_subset = {
         "layers.10.norm.weight",
         "layers.10.block.D",
         "layers.11.block.D",
         "layers.12.block.q_proj.weight",
-        "norm.weight",
-        "lm_head.weight",
     }
     assert expected_subset.issubset(aliases.keys())
+    assert "norm.weight" not in aliases
+    assert "lm_head.weight" not in aliases
     for name, info in aliases.items():
         assert "logical_name" in info
         assert "logical_grad_name" in info
@@ -175,7 +200,7 @@ def test_bind_path_c_in_region_parameter_views_into_bank_replaces_attributes(
     bank_owner = model.make_path_c_physical_abi_bank_owner()
     report = model.bind_path_c_in_region_parameter_views_into_bank(bank_owner)
     assert report["status"] == "ok"
-    assert report["in_region_parameter_count"] == 28
+    assert report["in_region_parameter_count"] == 26
     assert report["skipped"] == []
     # After binding, each in-region parameter must be backed by storage in
     # the same bank slot. Pick a small parameter and a large one to verify

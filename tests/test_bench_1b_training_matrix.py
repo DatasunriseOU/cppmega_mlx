@@ -486,11 +486,11 @@ def test_bench_1b_matrix_failed_cell_preserves_raw_blocker_before_stderr(
     assert result.pass_fail_reason == blocker
 
 
-def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:
+def test_path_c_fusion_summary_keeps_direct_chain_separate_from_fused_route() -> None:
     receipt = {
         "training": {
             "fp8_path_c_training_route": {
-                "fused_train_block_runtime_available": True,
+                "fused_train_block_runtime_available": False,
                 "path_c_fusion": {
                     "mode": "auto",
                     "status": "plan_ready_not_default",
@@ -528,13 +528,13 @@ def test_path_c_fusion_summary_preserves_direct_chain_runtime_route() -> None:
     summary = matrix.path_c_fusion_summary_from_receipt(receipt)
     proof = matrix.proof_result_from_receipt(receipt, path="path_c_warm")
 
-    assert summary["runtime_uses_fused_train_block"] is True
+    assert summary["runtime_uses_fused_train_block"] is False
     assert summary["runtime_uses_direct_fusion_chain"] is True
-    assert summary["runtime_binding_status"] == "ok"
+    assert summary["runtime_binding_status"] == "model_owned_physical_abi_banks_missing"
     assert summary["direct_chain_runtime_binding_status"] == "ok"
     assert summary["direct_chain_training_runtime_status"] == "ok"
     assert summary["direct_chain_training_runtime_available"] is True
-    assert proof["runtime_uses_fused_train_block"] is True
+    assert proof["runtime_uses_fused_train_block"] is False
 
 
 def test_path_c_fusion_summary_does_not_promote_standalone_direct_chain() -> None:
@@ -578,9 +578,7 @@ def test_path_c_fusion_summary_does_not_promote_standalone_direct_chain() -> Non
 
     assert summary["runtime_uses_direct_fusion_chain"] is True
     assert summary["runtime_uses_fused_train_block"] is False
-    assert summary["runtime_binding_status"] == (
-        "direct_fusion_chain_training_runtime_incomplete"
-    )
+    assert summary["runtime_binding_status"] == "model_owned_physical_abi_banks_missing"
     assert summary["direct_chain_training_runtime_available"] is False
     assert proof["runtime_uses_fused_train_block"] is False
 

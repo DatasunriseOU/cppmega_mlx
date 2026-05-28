@@ -2178,7 +2178,7 @@ def _model_route_physical_bank_buffers(
     model: Any | None = None,
     *,
     sequence_length: int | None = None,
-) -> dict[str, _PathCBankLike]:
+) -> dict[str, mx.array]:
     regions = _model_route_regions(model, sequence_length=sequence_length)
     selected_region = m04_train_step._select_path_c_model_route_region(regions)
     assert selected_region is not None
@@ -2194,7 +2194,10 @@ def _model_route_physical_bank_buffers(
     )
     bank_shapes = getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_shapes")
     return {
-        bank: _PathCBankLike(tuple(bank_shapes[bank]), bridge["bank_dtypes"][bank])
+        bank: mx.zeros(
+            tuple(int(dim) for dim in tuple(bank_shapes[bank])),
+            dtype=getattr(mx, str(bridge["bank_dtypes"][bank])),
+        )
         for bank in bridge["required_bank_buffers"]
     }
 
@@ -2226,6 +2229,72 @@ def _model_route_physical_bank_owner(
             model,
             sequence_length=sequence_length,
         ),
+    )
+
+
+def _model_route_generated_stage_physical_abi(
+    model: Any | None = None,
+    *,
+    sequence_length: int | None = None,
+) -> tuple[dict[str, Any], dict[str, tuple[int, ...]]]:
+    regions = _model_route_regions(model, sequence_length=sequence_length)
+    selected_region = m04_train_step._select_path_c_model_route_region(regions)
+    assert selected_region is not None
+    scheduled = m04_train_step.plan_path_c_fusion_schedule_for_region(
+        selected_region,
+        include_backward=True,
+    )
+    assert scheduled.schedule_target is not None
+    abi_prim_func = scheduled.schedule_target.schedule_template(scheduled.region)
+    stage_groups = m04_train_step.plan_path_c_descriptor_stage_groups(
+        scheduled.region
+    )
+    stage_prim_funcs = tuple(
+        m04_train_step._path_c_generated_stage_schedule_template(
+            schedule_target=scheduled.schedule_target,
+            region=scheduled.region,
+            abi_prim_func=abi_prim_func,
+            execution_stage=group.execution_stage,
+            active_node_names=group.active_node_names,
+            stage_suffix=group.stage_suffix,
+            row_dispatch_mode=group.row_dispatch_mode,
+        )(scheduled.region)
+        for group in stage_groups
+    )
+    return m04_train_step._path_c_merged_physical_abi_for_prim_funcs(
+        (abi_prim_func, *stage_prim_funcs)
+    )
+
+
+def _model_route_generated_stage_physical_bank_owner(
+    model: Any | None = None,
+    *,
+    sequence_length: int | None = None,
+):
+    physical_abi_map, physical_abi_shapes = _model_route_generated_stage_physical_abi(
+        model,
+        sequence_length=sequence_length,
+    )
+    bridge = m04_train_step.plan_physical_abi_runtime_bridge(
+        physical_abi_map,
+        physical_abi_shapes,
+    )
+    owner_prefix = (
+        str(getattr(model, "path_c_profile_name"))
+        if model is not None and getattr(model, "path_c_profile_name", None)
+        else "local_gb10_quarter"
+    )
+    return make_physical_abi_bank_owner(
+        f"{owner_prefix}.path_c_physical_abi_banks",
+        physical_abi_map,
+        physical_abi_shapes,
+        {
+            bank: mx.zeros(
+                tuple(int(dim) for dim in tuple(physical_abi_shapes[bank])),
+                dtype=getattr(mx, str(bridge["bank_dtypes"][bank])),
+            )
+            for bank in bridge["required_bank_buffers"]
+        },
     )
 
 
@@ -4110,6 +4179,23 @@ def test_path_c_direct_chain_scratch_bank_merge_uses_largest_segment_shape() -> 
     assert specs["path_c_float32_scratch_bank"]["segments"] == [0, 2]
 
 
+def test_path_c_internal_scratch_validator_accepts_larger_coalesced_bank() -> None:
+    binding = m04_train_step._path_c_validate_internal_scratch_abi_buffers(
+        {
+            "path_c_float32_scratch_bank": {
+                "shape": (8192,),
+                "dtype": "float32",
+            },
+        },
+        {
+            "path_c_float32_scratch_bank": mx.zeros((28672,), dtype=mx.float32),
+        },
+    )
+
+    assert binding["status"] == "ok"
+    assert binding["shape_mismatch_internal_scratch_buffers"] == []
+
+
 def test_path_c_fusion_payload_keeps_compile_blocker_without_matching_receipt(
     tmp_path: Path,
     path_c_fusion_auto_env: None,
@@ -4383,25 +4469,23 @@ def test_fp8_path_c_training_route_for_model_auto_compiles_fused_artifact_when_b
     )
 
     auto_install = route["path_c_fusion"]["fused_train_block_auto_install"]
-    assert auto_install["status"] == "blocked"
+    assert auto_install["status"] == "ok"
     assert auto_install["artifact_compile"]["status"] == "ok"
     assert auto_install["artifact_compile"]["artifact_bound"] is True
-    assert auto_install["training_runtime_available"] is False
-    assert auto_install["training_runtime_contract"]["status"] == (
-        "fused_train_block_training_runtime_incomplete"
-    )
+    assert auto_install["training_runtime_available"] is True
+    assert auto_install["training_runtime_contract"]["status"] == "ok"
     assert auto_install["training_runtime_contract"]["runtime_installed"] is True
     assert (
         auto_install["training_runtime_contract"]["returns_full_model_grads"]
-        is False
+        is True
     )
     assert auto_install["training_runtime_contract"]["runtime_class"] == (
         "PathCFusedPlusEagerTrainingRuntime"
     )
     assert auto_install["hidden_packing_performed"] is False
-    assert route["selected_action"] == "run_path_c_split_training_route"
+    assert route["selected_action"] == "run_path_c_fused_train_block_route"
     assert route["single_fused_train_block_standalone_dispatch_available"] is True
-    assert route["fused_train_block_training_runtime_available"] is False
+    assert route["fused_train_block_training_runtime_available"] is True
     assert route["path_c_fusion"]["runtime_training_binding"][
         "runtime_uses_fused_train_block"
     ] is True
@@ -4720,47 +4804,76 @@ def test_compile_path_c_fused_train_block_artifact_for_model_lowers_selected_aot
     assert compiled["native_compile_ok"] is True
     assert compiled["hidden_packing_performed"] is False
     assert callable(compiled["artifact"])
+    assert isinstance(
+        compiled["artifact"],
+        m04_train_step.PathCGeneratedStageTrainBlockCallableArtifact,
+    )
     assert compiled["route_region"] == expected_route["graph_construction"][
         "selected_model_region"
     ]
     assert compiled["implementation_kind"] == "production"
-    assert compiled["plan"]["single_kernel_fused"] is True
+    assert compiled["plan"]["single_kernel_fused"] is False
+    assert compiled["plan"]["single_generated_artifact"] is False
+    assert compiled["plan"]["generated_stage_artifact"] is True
+    assert compiled["plan"]["monolithic_native_compile_skipped"] is True
+    assert compiled["plan"]["monolithic_runtime_blocked"] is True
+    assert compiled["plan"]["monolithic_runtime_blocker"]["kind"] == (
+        "monolithic_grid_chunks_recurrent_backward_scalar_replay"
+    )
+    assert compiled["plan"]["selected_runtime_artifact"] == (
+        "generated_stage_launcher_chunks"
+    )
+    assert compiled["plan"]["all_stages_single_kernel_fused"] is True
+    assert compiled["plan"]["generated_stage_compile_verified"] is True
+    assert compiled["plan"]["runtime_schedule_contract_status"] == (
+        "generated_stages_verified"
+    )
+    assert compiled["plan"]["generated_stage_row_launch"][
+        "row_chunk_index_param"
+    ] == "path_c_row_chunk_index"
+    assert compiled["plan"]["generated_stage_row_launch"][
+        "row_subchunk_index_param"
+    ] == "path_c_row_subchunk_index"
+    assert compiled["artifact"].row_chunk_count == 2
+    assert compiled["artifact"].row_chunk_index_param == "path_c_row_chunk_index"
+    assert compiled["artifact"].row_subchunk_count == 8
+    assert compiled["artifact"].row_subchunk_index_param == (
+        "path_c_row_subchunk_index"
+    )
     assert compiled["plan"]["backward_graph"] == "aot_autograd"
     training_abi_contract = compiled["training_abi_contract"]
     assert training_abi_contract["status"] == "ok"
     assert training_abi_contract["can_back_value_and_grad"] is True
-    assert training_abi_contract["loss_output_available"] is True
-    assert training_abi_contract["ntokens_output_available"] is True
-    assert training_abi_contract["train_step_output_abi_declared"] is True
-    assert training_abi_contract["train_step_suffix_loss_input_abi_declared"] is True
-    assert training_abi_contract["suffix_loss_inputs_available"] is True
+    assert training_abi_contract["loss_output_available"] is False
+    assert training_abi_contract["ntokens_output_available"] is False
+    assert training_abi_contract["loss_outputs_source"] == (
+        "eager_suffix_replay_cotangent_bridge"
+    )
+    assert training_abi_contract["train_step_output_abi_declared"] is False
+    assert training_abi_contract["train_step_suffix_loss_input_abi_declared"] is False
+    assert training_abi_contract["suffix_loss_inputs_available"] is False
     assert training_abi_contract["missing_suffix_loss_inputs"] == []
-    assert training_abi_contract["train_step_outputs_computed"] is True
-    assert training_abi_contract["train_step_computed_outputs"] == [
-        "loss",
-        "ntokens",
-    ]
+    assert training_abi_contract["train_step_outputs_computed"] is False
+    assert training_abi_contract["train_step_computed_outputs"] == []
     assert training_abi_contract["train_step_pending_outputs"] == []
     loss_source_buffers = training_abi_contract["train_step_loss_source_buffers"]
     assert len(loss_source_buffers) == 2
     assert loss_source_buffers[0].endswith("_R_hidden_after")
     assert loss_source_buffers[1].endswith("_A_sparse_mla_fp8_apply_out")
-    assert training_abi_contract["train_step_loss_cotangents_computed"] is True
+    assert training_abi_contract["train_step_loss_cotangents_computed"] is False
+    assert training_abi_contract["replay_cotangent_boundary_available"] is True
     assert (
         training_abi_contract[
             "train_step_suffix_loss_parameter_grads_computed"
         ]
-        is True
+        is False
     )
     assert training_abi_contract[
         "train_step_suffix_loss_parameter_gradient_buffers"
-    ] == [
-        "final_norm_weight_grad",
-        "lm_head_weight_grad",
-    ]
+    ] == []
     assert training_abi_contract[
         "train_step_suffix_loss_parameter_grad_abi"
-    ]["gradients_computed"] is True
+    ]["gradients_computed"] is False
     assert training_abi_contract["gradient_output_count"] > 0
     assert training_abi_contract["logical_buffer_count"] > (
         training_abi_contract["kernel_parameter_count"]
@@ -4801,7 +4914,7 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
 
     install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
         model=model,
-        bank_owner=_model_route_physical_bank_owner(
+        bank_owner=_model_route_generated_stage_physical_bank_owner(
             model,
             sequence_length=sequence_length,
         ),
@@ -4815,6 +4928,18 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
     assert install["artifact_compile"]["status"] == "ok"
     assert install["artifact_compile"]["native_compile_ok"] is True
     assert install["artifact_compile"]["artifact_bound"] is True
+    assert install["artifact_compile"]["artifact_type"] == (
+        "PathCGeneratedStageTrainBlockCallableArtifact"
+    )
+    assert install["artifact_compile"]["plan"]["generated_stage_artifact"] is True
+    assert (
+        install["artifact_compile"]["plan"]["selected_runtime_artifact"]
+        == "generated_stage_launcher_chunks"
+    )
+    assert (
+        install["artifact_compile"]["plan"]["runtime_schedule_contract_status"]
+        == "generated_stages_verified"
+    )
     assert install["artifact_compile"]["training_abi_contract"]["status"] == "ok"
     assert (
         install["artifact_compile"]["training_abi_contract"][
@@ -4826,25 +4951,25 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         install["artifact_compile"]["training_abi_contract"][
             "loss_output_available"
         ]
-        is True
+        is False
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "ntokens_output_available"
         ]
-        is True
+        is False
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "train_step_suffix_loss_input_abi_declared"
         ]
-        is True
+        is False
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "suffix_loss_inputs_available"
         ]
-        is True
+        is False
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
@@ -4856,13 +4981,13 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         install["artifact_compile"]["training_abi_contract"][
             "train_step_outputs_computed"
         ]
-        is True
+        is False
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "train_step_computed_outputs"
         ]
-        == ["loss", "ntokens"]
+        == []
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
@@ -4880,13 +5005,19 @@ def test_path_c_fused_train_block_runtime_installer_compiles_artifact_when_banks
         install["artifact_compile"]["training_abi_contract"][
             "train_step_loss_cotangents_computed"
         ]
+        is False
+    )
+    assert (
+        install["artifact_compile"]["training_abi_contract"][
+            "replay_cotangent_boundary_available"
+        ]
         is True
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
             "train_step_suffix_loss_parameter_grads_computed"
         ]
-        is True
+        is False
     )
     assert (
         install["artifact_compile"]["training_abi_contract"][
@@ -4956,7 +5087,7 @@ def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_hone
 
     install = m04_train_step.install_path_c_fused_train_block_runtime_for_model(
         model=model,
-        bank_owner=_model_route_physical_bank_owner(
+        bank_owner=_model_route_generated_stage_physical_bank_owner(
             model,
             sequence_length=sequence_length,
         ),
@@ -4965,11 +5096,11 @@ def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_hone
         sequence_length=sequence_length,
     )
 
-    # Mixed-mode runtime (PathCFusedPlusEagerTrainingRuntime) wraps the
-    # fused artifact + bank owner and routes residual parameters through
-    # the trainer's eager value_and_grad closure, so the install path now
-    # reports status='ok' with returns_full_model_grads=True. The wrapped
-    # artifact still honestly reports partial coverage
+    # PathCFusedPlusEagerTrainingRuntime wraps the fused artifact + bank
+    # owner and installs the replay/cotangent custom function. The install
+    # path reports status='ok' only when the generated artifact owns the
+    # in-region block gradients and MLX eager suffix owns loss/lm_head.
+    # The wrapped artifact still honestly reports partial coverage
     # (gradient_scope='selected_train_block', covered_count < trainable).
     assert install["status"] == "ok"
     assert install["artifact_compile"]["status"] == "ok"
@@ -4986,12 +5117,16 @@ def test_path_c_fused_train_block_runtime_installer_wraps_compiled_artifact_hone
     coverage = value_and_grad_contract["full_model_gradient_coverage"]
     assert contract["full_model_gradient_coverage"] == coverage
     assert coverage["full_model_gradient_tree_ready"] is True
-    assert coverage["gradient_scope"] == "full_model_via_mixed_mode"
+    assert (
+        coverage["gradient_scope"]
+        == "full_model_via_fused_replay_cotangent_bridge"
+    )
     assert coverage["missing_parameter_count"] == 0
     assert value_and_grad_contract["suffix_bypass_available"] is False
-    assert value_and_grad_contract["bank_grad_overlay_active"] is False
-    assert value_and_grad_contract["merged_bank_resident_parameter_count"] == 0
-    assert coverage["bank_grad_overlay_active"] is False
+    assert value_and_grad_contract["replay_cotangent_bridge_available"] is True
+    assert value_and_grad_contract["bank_grad_overlay_active"] is True
+    assert value_and_grad_contract["merged_bank_resident_parameter_count"] > 0
+    assert coverage["bank_grad_overlay_active"] is True
     assert value_and_grad_contract["delegates_to_eager_loss_and_grad"] is False
     assert value_and_grad_contract["hidden_packing_performed"] is False
     inner = model.path_c_fused_train_block_artifact.value_and_grad_contract()
@@ -5477,7 +5612,10 @@ def test_path_c_fusion_payload_reads_model_bound_direct_chain_runtime(
     direct_chain = payload["direct_chained_fusion"]
     assert direct_chain["runtime_binding"]["runtime_uses_direct_fusion_chain"] is True
     assert direct_chain["training_runtime_contract"]["status"] == "ok"
-    assert "fused_train_block_runtime_not_bound" not in {
+    assert payload["fused_train_block_training_critical_path"] is False
+    assert payload["fused_train_block_training_runtime_available"] is False
+    assert direct_chain["training_critical_path"] is True
+    assert "fused_train_block_runtime_not_bound" in {
         blocker["kind"] for blocker in payload["schedule_blockers"]
     }
 

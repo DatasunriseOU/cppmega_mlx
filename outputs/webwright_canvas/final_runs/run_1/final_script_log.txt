@@ -1,0 +1,13 @@
+step 1 action: select preset 'deepseek_v4_flash' from the toolbar <select>
+step 2 action: click 'Generate Architecture' in the LLM gallery wizard
+step 3 action: click 'Auto Align Graph'
+step 4 action: click react-flow Fit View control
+step 5 action: measured 9 canvas nodes; 0 overlapping pairs (area>64px & >3% of smaller node)
+step 6 action: folded block_group nodes found = 1: ['⧉ FOLDED BLOCK GROUP [LIGHTNING_INDEXER + CSA_HCA + ENGRAM + DSV4_ATTENTION + RM']
+step 7 action: tokenizer width=132px; switcher example=True file=True folder=True
+RESULT CP1 graph_loaded   = PASS
+RESULT CP2 tokenizer_narrow = PASS
+RESULT CP3 source_switcher = PASS
+RESULT CP4 no_overlap      = PASS
+RESULT CP5 folded_group    = PASS
+FINAL: preset=deepseek_v4_flash nodes=9 overlaps=0 groups=1 tokenizer_w=132
