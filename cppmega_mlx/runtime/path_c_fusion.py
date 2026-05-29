@@ -86,6 +86,21 @@ __all__ = [
 
 
 FUSION_MODE_ENV = "CPPMEGA_PATH_C_FUSION"
+# Opt-in lever (target-agnostic, identical on Metal and CUDA): when enabled,
+# the auto-discovery region splitter does NOT close the current fused segment
+# at a route brick that lacks a surface lowerer (e.g. ``E``/moe). Instead, when
+# such a brick is *bracketed* by surface-eligible bricks (an eligible run has
+# already started and at least one more eligible brick follows), the brick is
+# absorbed into the region as an in-chain EAGER EDGE: it is recorded in the
+# region span / metadata but emits NO fused kernel surface. The fused chain
+# therefore still contains only M/R/A surfaces (so backward math is unchanged),
+# while the region span grows across the eager-edge brick. Growing the span
+# moves the region's first brick earlier, which is what shrinks the eager
+# prefix that the direct-chain training runtime runs before the fused region.
+# Off by default so the fused-chain ABI, paths B/D/E, and every existing
+# acceptance/region test stay byte-identical until an eager-edge-capable
+# runtime opts in.
+SPAN_EAGER_EDGE_ENV = "CPPMEGA_PATH_C_SPAN_EAGER_EDGE"
 DEFAULT_MAX_PATH_B_CACHE_GIB = 55.0
 DEFAULT_MAX_PATH_B_MEDIAN_STEP_S = 10.0
 DEFAULT_MIN_C_OVER_B = 1.0
@@ -190,6 +205,13 @@ class _ResolvedPathCModelBrick:
     route_symbol: str
     attention_qkv_has_bias: bool = True
     attention_out_proj_has_bias: bool = True
+    # When True this brick is carried as an in-chain EAGER EDGE: it counts
+    # toward the region span (so the region's first brick / start layer can
+    # move earlier) but it emits NO fused kernel surface and its delta is
+    # produced eagerly by the runtime. Only set for bricks whose route symbol
+    # has no surface lowerer (e.g. ``E``/moe) and only when the span-eager-edge
+    # lever is enabled.
+    is_eager_edge: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,6 +257,23 @@ def selected_path_c_fusion_mode(
 
     raw = (env or os.environ).get(FUSION_MODE_ENV, "")
     return _FUSION_MODE_ALIASES.get(raw.strip().lower(), PathCFusionMode.OFF)
+
+
+_TRUTHY_FLAG_VALUES = frozenset({"1", "true", "yes", "on", "force"})
+
+
+def path_c_span_eager_edges_enabled(
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether the region splitter may span non-fusible eager edges.
+
+    Controlled by ``CPPMEGA_PATH_C_SPAN_EAGER_EDGE`` (see ``SPAN_EAGER_EDGE_ENV``).
+    Target-agnostic: there is no Metal/CUDA branch; the same flag governs both.
+    Off by default.
+    """
+
+    raw = (env or os.environ).get(SPAN_EAGER_EDGE_ENV, "")
+    return raw.strip().lower() in _TRUTHY_FLAG_VALUES
 
 
 @dataclass(frozen=True)
@@ -953,6 +992,31 @@ def build_path_c_model_regions_from_route_symbols(
     return tuple(regions)
 
 
+def _can_absorb_eager_edge(
+    resolved_bricks: Sequence[_ResolvedPathCModelBrick],
+    *,
+    index: int,
+    segment: Sequence[_ResolvedPathCModelBrick],
+) -> bool:
+    """Return whether a non-fusible brick may be carried as an eager edge.
+
+    An eager edge is only valid when it is *bracketed* by surface-eligible
+    bricks: the current fused segment must already contain at least one
+    surface-eligible brick (so there is a producer hidden state to carry the
+    residual forward), and at least one later brick must also be
+    surface-eligible (so the segment does not terminate on a non-fused edge).
+    This keeps every fused chain bounded by real kernel surfaces while letting
+    the region span grow across the eager edge.
+    """
+
+    if not any(not b.is_eager_edge for b in segment):
+        return False
+    for later in resolved_bricks[index + 1 :]:
+        if _path_c_model_brick_surface_lowerer_for(later.route_symbol) is not None:
+            return True
+    return False
+
+
 def build_path_c_model_regions_from_bricks(
     bricks: Sequence[Any],
     *,
@@ -973,6 +1037,7 @@ def build_path_c_model_regions_from_bricks(
         _resolved_path_c_model_brick(brick, index=index)
         for index, brick in enumerate(bricks)
     )
+    span_eager_edges = path_c_span_eager_edges_enabled()
     regions: list[PathCFusionRegion] = []
     segment: list[_ResolvedPathCModelBrick] = []
     segment_start = 0
@@ -981,6 +1046,15 @@ def build_path_c_model_regions_from_bricks(
             if not segment:
                 segment_start = index
             segment.append(brick)
+            continue
+        if span_eager_edges and _can_absorb_eager_edge(
+            resolved_bricks, index=index, segment=segment
+        ):
+            # Carry the non-fusible brick (e.g. moe) as an in-chain eager edge:
+            # it extends the region span but emits no fused surface, so the
+            # fused chain stays surface-eligible-only and gradients are
+            # unchanged. The runtime computes its delta eagerly.
+            segment.append(replace(brick, is_eager_edge=True))
             continue
         _append_path_c_model_brick_segment(
             regions,
@@ -1027,11 +1101,15 @@ def build_path_c_model_region_from_bricks(
     if not resolved_bricks:
         raise ValueError("bricks must contain at least one model brick")
     supported_symbols = _path_c_supported_route_symbols()
+    # Eager-edge bricks intentionally carry an unsupported route symbol (no
+    # surface lowerer); they extend the region span but are never lowered to a
+    # fused surface, so they are exempt from the supported-symbol check.
     unsupported = sorted(
         {
             brick.route_symbol
             for brick in resolved_bricks
             if brick.route_symbol not in supported_symbols
+            and not brick.is_eager_edge
         }
     )
     if unsupported:
@@ -1041,9 +1119,13 @@ def build_path_c_model_region_from_bricks(
             f"{unsupported!r}"
         )
     resolved_shape_env = shape_env or _path_c_model_shape_env_from_config(model_config)
+    eager_edge_names = tuple(
+        brick.name for brick in resolved_bricks if brick.is_eager_edge
+    )
     metadata: dict[str, Any] = {
         "path_c_route_symbols": tuple(brick.route_symbol for brick in resolved_bricks),
         "path_c_bricks": tuple(_path_c_brick_metadata(brick) for brick in resolved_bricks),
+        "path_c_eager_edge_bricks": eager_edge_names,
         "path_c_acceptance_tags": tuple(str(tag) for tag in acceptance_tags),
         "path_c_acceptance_fixture_abi": False,
     }
@@ -1134,6 +1216,10 @@ def _resolved_path_c_model_brick(
     *,
     index: int,
 ) -> _ResolvedPathCModelBrick:
+    # An already-resolved brick is returned unchanged so the eager-edge flag
+    # (and any other resolved attributes) survive a re-resolution pass.
+    if isinstance(brick, _ResolvedPathCModelBrick):
+        return brick
     kind = _brick_attr(brick, "kind")
     route_symbol = _path_c_route_symbol_from_brick(brick)
     raw_name = _brick_attr(brick, "name")
@@ -1169,6 +1255,8 @@ def _path_c_brick_metadata(
         "kind": brick.kind,
         "route_symbol": brick.route_symbol,
     }
+    if brick.is_eager_edge:
+        metadata["eager_edge"] = "true"
     if brick.route_symbol == "A" and not brick.attention_qkv_has_bias:
         metadata["attention_qkv_has_bias"] = "false"
     if brick.route_symbol == "A" and not brick.attention_out_proj_has_bias:
@@ -1392,7 +1480,16 @@ def _append_path_c_model_brick_segment(
     shape_env: PathCModelShapeEnv | None,
     acceptance_tags: Sequence[str],
 ) -> None:
-    if len(segment) < min_route_bricks:
+    # A fused chain must be bounded by real kernel surfaces, so drop any
+    # trailing eager-edge bricks (no surface) before emitting the region.
+    trimmed = list(segment)
+    while trimmed and trimmed[-1].is_eager_edge:
+        trimmed.pop()
+    segment = trimmed
+    # ``min_route_bricks`` counts surface-eligible (fused) bricks only; eager
+    # edges extend the span but do not themselves form a fusible region.
+    fused_count = sum(1 for brick in segment if not brick.is_eager_edge)
+    if fused_count < min_route_bricks:
         return
     end = segment_start + len(segment) - 1
     regions.append(
@@ -1676,6 +1773,31 @@ def _path_c_model_surfaces_from_bricks(
     if not bricks:
         raise ValueError("bricks must contain at least one route")
 
+    # Eager-edge bricks (e.g. moe) extend the region span but are NOT lowered
+    # to fused surfaces -- the direct-chain runtime computes their delta
+    # eagerly and stitches the hidden state across the gap. Each fused
+    # sub-segment between two eager edges keeps a byte-identical M/R/A ABI; at
+    # an eager-edge boundary the surface chain DOES NOT connect the previous
+    # fused brick's output directly to the next fused brick (that would silently
+    # drop the eager delta). Instead the next fused sub-segment re-seeds its
+    # residual/route hidden from a runtime-provided eager-edge output buffer,
+    # so the ABI explicitly records the dependency and a compile-and-run cannot
+    # bypass the eager moe.
+    #
+    # ``eager_edge_before[i]`` is True when an eager-edge brick sits in the
+    # original span immediately before the i-th *fused* brick.
+    eager_edge_before: list[bool] = []
+    pending_eager_edge = False
+    for brick in bricks:
+        if brick.is_eager_edge:
+            pending_eager_edge = True
+            continue
+        eager_edge_before.append(pending_eager_edge)
+        pending_eager_edge = False
+    bricks = tuple(brick for brick in bricks if not brick.is_eager_edge)
+    if not bricks:
+        raise ValueError("region must contain at least one fusible route brick")
+
     context = _PathCBrickSurfaceLoweringContext(
         residual_hidden=initial_hidden,
         route_hidden=initial_hidden,
@@ -1711,12 +1833,27 @@ def _path_c_model_surfaces_from_bricks(
             )
         result = lowerer.emit(brick, context)
         if index + 1 < len(bricks):
-            _append_path_c_inter_brick_residual_norm(
-                context,
-                producer_brick=brick,
-                norm_brick=bricks[index + 1],
-                delta=result.delta_output,
-            )
+            if eager_edge_before[index + 1]:
+                # An eager edge sits between this fused brick and the next one.
+                # Finalize this brick's residual (producer side) into a
+                # caller-visible ``hidden_after`` buffer, then start a fresh
+                # fused sub-segment whose residual/route hidden is the
+                # runtime-provided eager-edge output. The runtime is contracted
+                # to write the eager moe delta into this buffer; the surface
+                # chain never connects the two sub-segments directly.
+                _append_path_c_eager_edge_boundary(
+                    context,
+                    producer_brick=brick,
+                    norm_brick=bricks[index + 1],
+                    delta=result.delta_output,
+                )
+            else:
+                _append_path_c_inter_brick_residual_norm(
+                    context,
+                    producer_brick=brick,
+                    norm_brick=bricks[index + 1],
+                    delta=result.delta_output,
+                )
     return tuple(context.surfaces)
 
 
@@ -1899,6 +2036,57 @@ def _append_path_c_inter_brick_residual_norm(
     )
     context.residual_hidden = hidden_after
     context.route_hidden = next_hidden
+
+
+def _append_path_c_eager_edge_boundary(
+    context: _PathCBrickSurfaceLoweringContext,
+    *,
+    producer_brick: _ResolvedPathCModelBrick,
+    norm_brick: _ResolvedPathCModelBrick,
+    delta: str,
+) -> None:
+    """Close a fused sub-segment at an eager-edge (e.g. moe) boundary.
+
+    Emits the producer's residual fold into ``{producer}_hidden_after`` -- the
+    hidden state the runtime feeds into the eager moe brick(s) -- then re-seeds
+    the surface walk so the next fused sub-segment reads its residual/route
+    hidden from a runtime-provided ``{norm_brick}_eager_edge_in`` buffer. The
+    surface chain therefore never connects the two sub-segments directly; the
+    eager-edge output buffer is an explicit ABI dependency the runtime must
+    populate (with the eager moe delta already folded in) before the next
+    sub-segment runs. This keeps each fused sub-segment's M/R/A math identical
+    while making the dropped-delta failure mode impossible to reach silently.
+    """
+
+    norm_name = f"{producer_brick.name}_residual_norm"
+    hidden_after = f"{producer_brick.name}_hidden_after"
+    eager_normed = f"{norm_name}_hidden"
+    context.surfaces.append(
+        _residual_norm_surface(
+            name=norm_name,
+            hidden=context.residual_hidden,
+            delta=delta,
+            norm_weight=f"{norm_name}_weight",
+            hidden_after=hidden_after,
+            next_hidden=eager_normed,
+        )
+    )
+    # Runtime-provided seed for the next fused sub-segment: the residual
+    # baseline carrying the eager moe delta, plus the entry RMSNorm the next
+    # fused brick consumes.
+    eager_edge_in = f"{norm_brick.name}_eager_edge_in"
+    entry_norm_name = f"{norm_brick.name}_entry_rmsnorm"
+    entry_normed_hidden = f"{entry_norm_name}_hidden"
+    context.surfaces.append(
+        _entry_rmsnorm_surface(
+            name=entry_norm_name,
+            hidden=eager_edge_in,
+            norm_weight=f"{entry_norm_name}_weight",
+            normed_hidden=entry_normed_hidden,
+        )
+    )
+    context.residual_hidden = eager_edge_in
+    context.route_hidden = entry_normed_hidden
 
 
 def _residual_norm_surface(
