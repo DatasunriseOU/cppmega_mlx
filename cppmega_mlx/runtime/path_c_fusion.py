@@ -1241,6 +1241,19 @@ def _path_c_model_value_dtype(model: Any) -> str | None:
     parameters = getattr(model, "parameters", None)
     if not callable(parameters):
         return None
+    # Value banks (parameters/activations) must carry the model's low-precision
+    # CARRIER dtype, not whatever parameter happens to be first in tree order. A
+    # mixed-precision (fp8/bf16) model keeps weights+activations in 16-bit and only
+    # uses fp32 for accumulation/optimizer state; a leading fp32 norm/scale wrongly
+    # widened every Path C value bank to float32 (2x memory + bandwidth — the fp8
+    # Path C regression vs Path B). Prefer the 16-bit carrier when present.
+    try:
+        names = _collect_tensor_dtype_names(parameters())
+    except Exception:
+        names = set()
+    for carrier in ("bfloat16", "float16"):
+        if carrier in names:
+            return carrier
     try:
         return _first_tensor_dtype_name(parameters())
     except Exception:
@@ -1264,6 +1277,25 @@ def _first_tensor_dtype_name(value: Any) -> str | None:
             if found is not None:
                 return found
     return None
+
+
+def _collect_tensor_dtype_names(value: Any, out: set[str] | None = None) -> set[str]:
+    if out is None:
+        out = set()
+    dtype = getattr(value, "dtype", None)
+    shape = getattr(value, "shape", None)
+    if dtype is not None and shape is not None:
+        name = str(dtype).rsplit(".", 1)[-1]
+        if name:
+            out.add(name)
+        return out
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _collect_tensor_dtype_names(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_tensor_dtype_names(item, out)
+    return out
 
 
 def _path_c_model_shape_env_from_config(config: Any | None) -> PathCModelShapeEnv | None:
