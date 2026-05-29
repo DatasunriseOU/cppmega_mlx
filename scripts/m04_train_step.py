@@ -1058,11 +1058,36 @@ def fp8_path_c_producer_gate_payload(
     }
 
 
+def _path_c_default_target() -> str:
+    """Resolve the default lowering target for Path C fused/direct-chain kernels.
+
+    On Apple silicon we lower to Metal; everywhere else (e.g. CUDA gb10) Metal is
+    unavailable, so fall back to CUDA.  Detection mirrors mlx: ``mx.metal`` may be
+    present as a module yet report ``is_available() == False`` on non-Metal hosts.
+    """
+    metal = getattr(mx, "metal", None)
+    if metal is None or not metal.is_available():
+        return "cuda"
+    return "metal"
+
+
 def _tilelang_dev_roots() -> tuple[Path, ...]:
     roots: list[Path] = []
-    env_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
-    if env_root:
-        roots.append(Path(env_root).expanduser())
+    for env_name in ("TILELANG_DEV_BUILD_ROOT", "TILELANG_ROOT"):
+        env_root = os.environ.get(env_name)
+        if env_root:
+            roots.append(Path(env_root).expanduser())
+    # Derive the build dir of the installed `tilelang` package (real build with
+    # libtilelang.so), e.g. /home/dave/source/tilelang/build, as a candidate.
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("tilelang")
+        if spec is not None and spec.origin:
+            pkg_build = Path(spec.origin).parent.parent / "build"
+            roots.append(pkg_build)
+    except Exception:
+        pass
     roots.extend(
         [
             ROOT.parent / "tl_apache_tvm_swap",
@@ -1109,6 +1134,10 @@ def ensure_tilelang_dev_env_for_path_c() -> None:
         lib_dir = build_root / "lib"
         tvm_dir = build_root / "tvm"
         if not lib_dir.exists() or not tvm_dir.exists():
+            continue
+        # Skip stub-only build dirs (e.g. tl_apache_tvm_swap/build holds only
+        # libcudart_stub.so etc.). A usable dev build must ship libtilelang.so.
+        if not (lib_dir / "libtilelang.so").exists():
             continue
         os.environ["TILELANG_DEV_BUILD_ROOT"] = str(build_root)
         os.environ.setdefault("TVM_LIBRARY_PATH", str(lib_dir))
@@ -3225,7 +3254,7 @@ def fp8_path_c_training_route_payload_for_model(
     compile_receipt_path: str | Path | None = None,
     auto_install_fused_train_block: bool = False,
     fused_train_block_artifact_lowerer: Callable[..., Any] | None = None,
-    fused_train_block_artifact_target_name: str = "metal",
+    fused_train_block_artifact_target_name: str = _path_c_default_target(),
     fused_train_block_artifact_execution_backend: str = "tvm_ffi",
 ) -> dict[str, Any]:
     """Return Path C training route metadata using model-owned ABI banks."""
@@ -4759,7 +4788,7 @@ def compile_path_c_fused_train_block_artifact_for_model(
     *,
     model: Any,
     sequence_length: int | None = None,
-    target_name: str = "metal",
+    target_name: str = _path_c_default_target(),
     execution_backend: str = "tvm_ffi",
     lowerer: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -5556,7 +5585,7 @@ def install_path_c_fused_train_block_runtime_for_model(
     training_runtime: Any | None = None,
     compile_artifact: bool = False,
     artifact_lowerer: Callable[..., Any] | None = None,
-    artifact_target_name: str = "metal",
+    artifact_target_name: str = _path_c_default_target(),
     artifact_execution_backend: str = "tvm_ffi",
     sequence_length: int | None = None,
 ) -> dict[str, Any]:
@@ -6020,7 +6049,7 @@ def _path_c_direct_chain_artifact_for_segment(
 def compile_path_c_direct_fusion_chain_artifacts(
     chain: Any,
     *,
-    target_name: str = "metal",
+    target_name: str = _path_c_default_target(),
     execution_backend: str = "tvm_ffi",
     lowerer: Callable[..., Any] | None = None,
 ) -> tuple[Any, ...]:
@@ -6661,7 +6690,8 @@ def install_path_c_direct_chain_training_runtime_for_model(
     chain: Any | None = None,
     artifacts: Any | None = None,
     logical_owner: Any | None = None,
-    artifact_compiler: Callable[[Any], Any] = compile_path_c_direct_fusion_chain_artifacts,
+    target_name: str | None = None,
+    artifact_compiler: Callable[..., Any] | None = None,
     owner_name: str | None = None,
     sequence_length: int | None = None,
     training_critical_path: bool = False,
@@ -6733,6 +6763,13 @@ def install_path_c_direct_chain_training_runtime_for_model(
             "training_critical_path": False,
         }
 
+    resolved_target_name = target_name or _path_c_default_target()
+    if artifact_compiler is None:
+        def artifact_compiler(_chain: Any) -> Any:
+            return compile_path_c_direct_fusion_chain_artifacts(
+                _chain,
+                target_name=resolved_target_name,
+            )
     compiled_artifacts = artifacts if artifacts is not None else artifact_compiler(selected_chain)
     resolved_owner_name = owner_name or (
         f"{profile_name}.path_c_direct_fusion_chain_training_runtime"

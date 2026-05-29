@@ -22,6 +22,7 @@ from typing import Any, cast
 
 from cppmega_mlx.runtime.path_c_fusion import (
     CompiledPathCRegion,
+    _path_c_default_target,
     FusionCompilePlan,
     FusionKernelSurface,
     FusionScheduleContractStatus,
@@ -13499,7 +13500,7 @@ class PathCFusionScheduleOptimizer:
         self,
         *,
         tilelang_lowerer: Callable[..., Any],
-        target_name: str = "metal",
+        target_name: str = _path_c_default_target(),
     ) -> CompiledPathCRegion:
         """Compile the selected target through its descriptor schedule template."""
 
@@ -14467,7 +14468,7 @@ def plan_mamba3_fp8_train_fusion_schedule(
 def compile_mamba3_fp8_train_fusion_schedule(
     *,
     tilelang_lowerer: Callable[..., Any] | None = None,
-    target_name: str = "metal",
+    target_name: str = _path_c_default_target(),
     include_backward: bool = True,
     model_config: Any | None = None,
     max_rows_per_launch: int | None = DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,

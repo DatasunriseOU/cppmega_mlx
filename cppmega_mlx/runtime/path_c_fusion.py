@@ -19,6 +19,19 @@ from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 import mlx.core as mx
 
+
+def _path_c_default_target() -> str:
+    """Default TileLang lowering target for Path C kernels.
+
+    Metal on Apple silicon; CUDA elsewhere (e.g. gb10).  ``mx.metal`` may exist
+    as a module yet report ``is_available() == False`` on non-Metal hosts.
+    """
+    metal = getattr(mx, "metal", None)
+    if metal is None or not metal.is_available():
+        return "cuda"
+    return "metal"
+
+
 __all__ = [
     "BenchmarkAcceptanceRow",
     "CompiledPathCRegion",
@@ -2199,7 +2212,7 @@ def compile_mamba3_fp8_train_tilelang_region_from_prim_funcs(
     fp8_prepare_spec: SparseMLAFp8PrepareSpec | None = None,
     sparse_mla_fp8_prepared: Any,
     schedule_template: Callable[[Any], Any] | None = None,
-    target: str = "metal",
+    target: str = _path_c_default_target(),
     lowerer: Callable[..., Any] | None = None,
     require_single_kernel: bool = True,
 ) -> Any:
@@ -2467,7 +2480,7 @@ def compile_path_c_region(
     schedule_status: str = "ready",
     tilelang_lowerer: Callable[..., Any] | None = None,
     tilelang_plan_factory: Callable[..., Any] | None = None,
-    target: str = "metal",
+    target: str = _path_c_default_target(),
     compiler: Callable[[FusionCompilePlan], object] | None = None,
 ) -> FusionCompilePlan | CompiledPathCRegion:
     """Create a TileLang/TVM region compile plan, optionally invoking compiler."""
@@ -2575,7 +2588,7 @@ def compile_path_c_region(
 def tilelang_single_entry_lowerer(
     func_or_mod: Any,
     *,
-    target: str = "metal",
+    target: str = _path_c_default_target(),
     execution_backend: str = "tvm_ffi",
     compile_prim_func: Callable[..., Any] | None = None,
     **_kwargs: Any,
