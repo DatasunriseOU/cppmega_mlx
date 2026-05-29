@@ -12753,32 +12753,53 @@ def _buffer_dtype(
     *,
     shape_env: PathCModelShapeEnv | None = None,
 ) -> str:
-    if str(buffer_name).endswith("_grad"):
-        return "float32"
     canonical = _canonical_buffer_name(buffer_name)
-    if canonical in {"q_fp8", "kv_fp8"}:
-        return "uint8"
-    if canonical == "target_ids":
-        return "int32"
-    if buffer_name == "indices" or buffer_name.endswith("_indices"):
-        return "int32"
-    if buffer_name.endswith("_has_sinks"):
-        return "int32"
+    is_grad = str(buffer_name).endswith("_grad")
+    # fp8/int classification applies to forward VALUE buffers only; the gradient of
+    # an fp8/int buffer is a real-valued gradient (carrier dtype), never uint8/int32.
+    if not is_grad:
+        if canonical in {"q_fp8", "kv_fp8"}:
+            return "uint8"
+        if canonical == "target_ids":
+            return "int32"
+        if buffer_name == "indices" or buffer_name.endswith("_indices"):
+            return "int32"
+        if buffer_name.endswith("_has_sinks"):
+            return "int32"
+    # FP32-mandatory: fp8 dequant scales, LSE reductions, and recurrent scan/state
+    # accumulation INCLUDING their initial-state/state-input gradients (h0/state_in)
+    # — downcasting corrupts the fp8 matmul, softmax normalization, or recurrent
+    # backward stability. (In-kernel reverse-scan accumulators live in threadgroup
+    # scratch and are already float32 via accum_dtype, independent of this map.)
     if canonical in {
         "mamba3_angle_state",
         "mamba3_angle_checkpoint",
         "mamba3_angle_grad_state",
         "mamba3_conv_state",
         "mamba3_h_checkpoint",
+        "mamba3_h0_grad",
         "m2rnn_h_state",
         "m2rnn_h_checkpoint",
+        "m2rnn_h0_grad",
+        "state_in_grad",
         "q_scale",
         "kv_scale",
         "lse",
     } or buffer_name.endswith(
-        ("_scale", "_sm_scale", "_lse")
+        (
+            "_scale",
+            "_sm_scale",
+            "_lse",
+            "_h0_grad",
+            "_state_in_grad",
+        )
     ):
         return "float32"
+    # Parameter/activation VALUE buffers AND their gradients carry the model's
+    # bf16/fp16 carrier dtype. Path B keeps gradients in the bf16 parameter dtype,
+    # so bf16 grad banks are parity-consistent (the previous unconditional float32
+    # for every *_grad doubled the gradient arenas). For a float32 model the carrier
+    # resolves to float32, so behaviour is unchanged (no regression).
     return (
         str(shape_env.model_value_dtype)
         if shape_env is not None and str(shape_env.model_value_dtype)
