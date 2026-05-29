@@ -440,6 +440,304 @@ def mamba3_mimo_fwd_cuda_eager(
 
 
 # ---------------------------------------------------------------------------
+# mamba3 (bwd) — vendored CUDA-safe copy of the production reverse scan
+# ---------------------------------------------------------------------------
+#
+# Ports the Metal single-kernel scratch backward
+# (``mamba3_path_c._bwd_scratch_partial_kernel_for``) to CUDA. Per (b, h, p)
+# lane the kernel (1) recomputes the forward state scan into a global scratch
+# slab ``h_steps_scratch[b, t, h, p, n]`` (decayed recurrence
+# ``h = exp(A*dt)*h + x*B``), then (2) runs the reverse-time VJP scan to emit
+# *per-lane partial* gradients. The P-axis reductions that turn those partials
+# into dB/dC/dA/ddt/dD are done in MLX outside the kernel (identical axes to
+# ``mamba3_path_c._mamba3_mimo_bwd_path_c_bf16_snapshot_kernel``):
+#
+#   dB  = sum_p dB_lane_grad   (B,S,H,STATE,HEADDIM) -> (B,S,H,STATE)
+#   dC  = sum_p dC_lane_grad   (B,S,H,STATE,HEADDIM) -> (B,S,H,STATE)
+#   dA  = sum_p dA_lane_grad   (B,S,H,HEADDIM)       -> (B,S,H)
+#   ddt = sum_p ddt_lane_grad  (B,S,H,HEADDIM)       -> (B,S,H)
+#   dD  = sum_{b,p} dD_lane_grad (B,H,HEADDIM)       -> (H,)
+#
+# dx/dz/dh0 are per-lane (no reduction). The recurrence/VJP math is byte-for-byte
+# the Metal scratch kernel; only the codegen primitives change for nvcc:
+#   * lane index from ``T.get_thread_binding()`` + block id, not the Metal
+#     ``tir.metal.thread_position_in_grid_x`` intrinsic;
+#   * ``T.alloc_local`` one-slot accumulators instead of ``T.alloc_var(init=)``
+#     (the latter emits a non-lvalue ``float v = 0`` that nvcc rejects here).
+# All carriers fp32 (the production fp32 EAGER carrier path). Defined at module
+# scope (no ``from __future__ import annotations``) so the ``@T.prim_func``
+# ``get_type_hints`` re-evaluation resolves the shape names.
+
+
+def _make_mamba3_bwd_cuda_prim(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+) -> Any:
+    """Build a CUDA-safe Mamba3 MIMO backward (lane-grad partials) prim_func."""
+
+    import tilelang.language as T
+
+    LANES = BATCH * HEADS * HEADDIM
+    THREADS = min(256, max(1, LANES))
+    ad = "float32"
+
+    @T.prim_func
+    def bwd(
+        dy: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        x: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        B: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
+        C: T.Tensor((BATCH, SEQ, HEADS, STATE), "float32"),
+        z: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        A: T.Tensor((BATCH, SEQ, HEADS), "float32"),
+        dt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
+        D: T.Tensor((HEADS,), "float32"),
+        h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
+        dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        dB_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), "float32"),
+        dC_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), "float32"),
+        dA_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        ddt_lane_grad: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
+        dD_lane_grad: T.Tensor((BATCH, HEADS, HEADDIM), "float32"),
+        dh0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
+    ):
+        h_steps_scratch = T.alloc_global(
+            (BATCH, SEQ + 1, HEADS, HEADDIM, STATE), ad
+        )
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
+            lane = T.get_thread_binding()
+            gl = bx * THREADS + lane
+            h_state = T.alloc_local((STATE,), ad)
+            dh = T.alloc_local((STATE,), ad)
+            decay = T.alloc_local((1,), ad)
+            dD_acc = T.alloc_local((1,), ad)
+            y_state = T.alloc_local((1,), ad)
+            dx_inp = T.alloc_local((1,), ad)
+            d_decay = T.alloc_local((1,), ad)
+            if gl < LANES:
+                p = gl % HEADDIM
+                h = (gl // HEADDIM) % HEADS
+                b = gl // (HEADDIM * HEADS)
+                D_h = D[h]
+
+                # Forward recompute into the global scratch slab.
+                for n in T.serial(STATE):
+                    h_state[n] = h0[b, h, p, n]
+                    h_steps_scratch[b, 0, h, p, n] = h_state[n]
+                for t in T.serial(SEQ):
+                    decay[0] = T.exp(A[b, t, h] * dt[b, t, h])
+                    x_val = x[b, t, h, p]
+                    for n in T.serial(STATE):
+                        h_state[n] = decay[0] * h_state[n] + x_val * B[b, t, h, n]
+                        h_steps_scratch[b, t + 1, h, p, n] = h_state[n]
+
+                # Reverse-time VJP scan.
+                for n in T.serial(STATE):
+                    h_state[n] = h_steps_scratch[b, SEQ, h, p, n]
+                    dh[n] = 0.0
+                dD_acc[0] = 0.0
+
+                for rt in T.serial(SEQ):
+                    t = SEQ - 1 - rt
+                    A_val = A[b, t, h]
+                    dt_val = dt[b, t, h]
+                    decay[0] = T.exp(A_val * dt_val)
+                    x_val = x[b, t, h, p]
+                    z_val = z[b, t, h, p]
+                    dY = dy[b, t, h, p]
+
+                    y_state[0] = 0.0
+                    for n in T.serial(STATE):
+                        y_state[0] = y_state[0] + h_state[n] * C[b, t, h, n]
+                    y_skipped = y_state[0] + D_h * x_val
+                    sig_z = 1.0 / (1.0 + T.exp(-z_val))
+                    silu_z = z_val * sig_z
+                    silu_dz = sig_z * (1.0 + z_val * (1.0 - sig_z))
+                    d_silu = dY * y_skipped
+                    d_y_skipped = dY * silu_z
+
+                    dz[b, t, h, p] = d_silu * silu_dz
+                    dD_acc[0] = dD_acc[0] + d_y_skipped * x_val
+
+                    dx_inp[0] = 0.0
+                    d_decay[0] = 0.0
+                    for n in T.serial(STATE):
+                        C_val = C[b, t, h, n]
+                        B_val = B[b, t, h, n]
+                        h_prev = h_steps_scratch[b, t, h, p, n]
+                        dh_n = dh[n] + d_y_skipped * C_val
+                        dC_lane_grad[b, t, h, n, p] = d_y_skipped * h_state[n]
+                        dB_lane_grad[b, t, h, n, p] = dh_n * x_val
+                        dx_inp[0] = dx_inp[0] + dh_n * B_val
+                        d_decay[0] = d_decay[0] + dh_n * h_prev
+                        dh[n] = dh_n * decay[0]
+                        h_state[n] = h_prev
+
+                    dx_skip = d_y_skipped * D_h
+                    dx[b, t, h, p] = dx_skip + dx_inp[0]
+
+                    d_logdecay = d_decay[0] * decay[0]
+                    dA_lane_grad[b, t, h, p] = d_logdecay * dt_val
+                    ddt_lane_grad[b, t, h, p] = d_logdecay * A_val
+
+                for n in T.serial(STATE):
+                    dh0[b, h, p, n] = dh[n]
+                dD_lane_grad[b, h, p] = dD_acc[0]
+
+    return bwd
+
+
+@functools.lru_cache(maxsize=128)
+def _mamba3_bwd_cuda_kernel(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM: int,
+    STATE: int,
+) -> Any:
+    """Compile the CUDA-safe Mamba3 MIMO backward kernel (caller-owned outs)."""
+
+    import tilelang
+
+    prim = _make_mamba3_bwd_cuda_prim(BATCH, SEQ, HEADS, HEADDIM, STATE)
+    return tilelang.compile(prim, target="cuda", out_idx=None)
+
+
+def mamba3_mimo_bwd_cuda_eager(
+    dy: mx.array,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+) -> tuple[
+    mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array
+] | None:
+    """TileLang-CUDA EAGER Mamba3 MIMO backward.
+
+    Returns grads ``(dx, dB, dC, dz, dA, ddt, dD, dh0)`` (matching the VJP order
+    of the primals ``x, B, C, z, A, dt, D, h0``) cast back to the corresponding
+    input dtypes, or ``None`` on any failure so the caller can fall back to the
+    pure-MLX reference VJP. fp32 carriers only (matches the production fp32
+    EAGER path). The kernel emits per-(b,h,p) lane partials for the gradients
+    that are reduced over the HEADDIM/P axis; the reductions happen here in MLX.
+    """
+
+    ok, _reason = cuda_eager_available()
+    if not ok:
+        return None
+
+    from cppmega_mlx.nn._tilelang.mamba3 import _validate_inputs
+
+    try:
+        import torch
+    except Exception:
+        return None
+
+    batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+    if seq == 0:
+        return (
+            mx.zeros_like(x),
+            mx.zeros_like(B),
+            mx.zeros_like(C),
+            mx.zeros_like(z),
+            mx.zeros_like(A),
+            mx.zeros_like(dt),
+            mx.zeros_like(D),
+            mx.zeros_like(h0),
+        )
+
+    dyf = dy.astype(mx.float32)
+    xf = x.astype(mx.float32)
+    Bf = B.astype(mx.float32)
+    Cf = C.astype(mx.float32)
+    zf = z.astype(mx.float32)
+    Af = A.astype(mx.float32)
+    dtf = dt.astype(mx.float32)
+    Df = D.astype(mx.float32)
+    h0f = h0.astype(mx.float32)
+
+    try:
+        kernel = _mamba3_bwd_cuda_kernel(batch, seq, heads, headdim, state)
+        dy_t = _mlx_to_torch_cuda(dyf)
+        x_t = _mlx_to_torch_cuda(xf)
+        B_t = _mlx_to_torch_cuda(Bf)
+        C_t = _mlx_to_torch_cuda(Cf)
+        z_t = _mlx_to_torch_cuda(zf)
+        A_t = _mlx_to_torch_cuda(Af)
+        dt_t = _mlx_to_torch_cuda(dtf)
+        D_t = _mlx_to_torch_cuda(Df)
+        h0_t = _mlx_to_torch_cuda(h0f)
+
+        dx_t = torch.zeros(
+            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
+        )
+        dz_t = torch.zeros(
+            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
+        )
+        dB_lg_t = torch.zeros(
+            batch, seq, heads, state, headdim, dtype=torch.float32, device="cuda"
+        )
+        dC_lg_t = torch.zeros(
+            batch, seq, heads, state, headdim, dtype=torch.float32, device="cuda"
+        )
+        dA_lg_t = torch.zeros(
+            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
+        )
+        ddt_lg_t = torch.zeros(
+            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
+        )
+        dD_lg_t = torch.zeros(
+            batch, heads, headdim, dtype=torch.float32, device="cuda"
+        )
+        dh0_t = torch.zeros(
+            batch, heads, headdim, state, dtype=torch.float32, device="cuda"
+        )
+        kernel(
+            dy_t,
+            x_t,
+            B_t,
+            C_t,
+            z_t,
+            A_t,
+            dt_t,
+            D_t,
+            h0_t,
+            dx_t,
+            dz_t,
+            dB_lg_t,
+            dC_lg_t,
+            dA_lg_t,
+            ddt_lg_t,
+            dD_lg_t,
+            dh0_t,
+        )
+        torch.cuda.synchronize()
+    except Exception:
+        return None
+
+    # Reduce the per-(b,h,p) lane partials over the P axis (matches the Metal
+    # bf16-snapshot reduction axes exactly).
+    dx = _torch_cuda_to_mlx(dx_t, x.dtype)
+    dz = _torch_cuda_to_mlx(dz_t, z.dtype)
+    dh0_g = _torch_cuda_to_mlx(dh0_t, h0.dtype)
+    dB = _torch_cuda_to_mlx(dB_lg_t.sum(dim=4), B.dtype)
+    dC = _torch_cuda_to_mlx(dC_lg_t.sum(dim=4), C.dtype)
+    dA = _torch_cuda_to_mlx(dA_lg_t.sum(dim=3), A.dtype)
+    ddt = _torch_cuda_to_mlx(ddt_lg_t.sum(dim=3), dt.dtype)
+    dD = _torch_cuda_to_mlx(dD_lg_t.sum(dim=(0, 2)), D.dtype)
+    return dx, dB, dC, dz, dA, ddt, dD, dh0_g
+
+
+
+
+# ---------------------------------------------------------------------------
 # FP8 Sparse-MLA — per-token FP8 producer (CUDA-safe) + prepared-buffer apply
 # ---------------------------------------------------------------------------
 #
@@ -1025,6 +1323,7 @@ __all__ = [
     "cuda_eager_available",
     "sparse_mla_fwd_cuda_eager",
     "mamba3_mimo_fwd_cuda_eager",
+    "mamba3_mimo_bwd_cuda_eager",
     "fp8_per_token_quant_cuda_eager",
     "fp8_sparse_mla_apply_cuda_eager",
     "m2rnn_mapped_packed_post_fwd_cuda_eager",

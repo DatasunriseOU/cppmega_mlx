@@ -3826,17 +3826,30 @@ def mamba3_mimo_bwd_path_c(
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Backward pass via the lowered TileLang DSL kernel."""
 
-    # CUDA EAGER branch: the Metal SIMD lane-grad backward kernel is not
-    # ported to CUDA yet (TODO). On a non-Metal host, compute gradients
-    # via MLX autograd over the pure-MLX reference scan so the CUDA EAGER
-    # forward remains end-to-end differentiable. Returns grads for all 8
-    # inputs (x, B, C, z, A, dt, D, h0), matching the kernel ABI.
+    # CUDA EAGER branch: on a non-Metal host the Metal SIMD lane-grad
+    # backward kernel cannot lower. Use the vendored TileLang-CUDA backward
+    # kernel (mamba3_mimo_bwd_cuda_eager) which ports the production single-
+    # kernel scratch reverse scan. If that kernel is unavailable or raises,
+    # fall back to MLX autograd over the pure-MLX reference scan so
+    # correctness never regresses. Returns grads for all 8 inputs
+    # (x, B, C, z, A, dt, D, h0), matching the kernel/VJP ABI.
     if not can_run_metal():
         if out is not None:
             raise RuntimeError(
                 "mamba3_mimo_bwd_path_c owner-output route is Metal/tvm-ffi "
                 "only; the CUDA EAGER backward returns fresh arrays"
             )
+        from cppmega_mlx.nn._tilelang._cuda_eager import (
+            cuda_eager_available,
+            mamba3_mimo_bwd_cuda_eager,
+        )
+
+        cuda_ok, _cuda_reason = cuda_eager_available()
+        if cuda_ok:
+            grads = mamba3_mimo_bwd_cuda_eager(dy, x, B, C, z, A, dt, D, h0)
+            if grads is not None:
+                return grads
+
         from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_reference
 
         def _ref(x_, B_, C_, z_, A_, dt_, D_, h0_):
