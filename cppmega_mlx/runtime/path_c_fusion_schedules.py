@@ -2665,7 +2665,7 @@ def _descriptor_prim_func_source(
             shape_env=shape_env,
             indent=indent,
         )
-    return _spill_large_shared_scratch_to_abi(
+    spilled_source, spilled_scratch = _spill_large_shared_scratch_to_abi(
         body,
         existing_parameter_count=len(param_lines),
         internal_buffer_names=frozenset(active_internal_buffers),
@@ -2674,6 +2674,13 @@ def _descriptor_prim_func_source(
             physical_abi_policy != DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT
         ),
     )
+    # CUDA-only, target/capacity-gated: any oversized T.alloc_shared scratch that
+    # could NOT be spilled to ABI device-scratch params above (the portable
+    # 31-buffer kernel ABI budget is exhausted on the backward direct-chain) is
+    # rewritten to a global device workspace so ptxas accepts the kernel. Off
+    # CUDA (e.g. Metal) this is a no-op and the source is unchanged.
+    spilled_source = _demote_residual_shared_scratch_to_global(spilled_source)
+    return spilled_source, spilled_scratch
 
 
 def _stage_active_internal_buffers(
@@ -10104,6 +10111,104 @@ def _append_row_phased_m2rnn_bwd_body(
         body.append(f"{indent * 7}{h0_grad_ref} = {dh}[{state_idx}]")
     body.append(f"{indent * 3}T.sync_threads()")
     return
+
+
+# Budget below the queried CUDA opt-in shared-memory cap that a single generated
+# kernel's residual ``T.alloc_shared`` scratch may occupy.  Anything above this
+# (after the existing ABI-scratch spill pass has run) is rewritten to a global
+# (device) workspace so ptxas accepts the kernel.  We target the conservative
+# static per-block budget (48 KiB) so the residual shared footprint stays well
+# inside the opt-in cap with headroom for compiler bookkeeping.
+_CUDA_SHARED_SCRATCH_BUDGET_BYTES = 0xC000  # 49152 bytes (static per-block).
+
+
+def _cuda_shared_memory_optin_cap_bytes() -> int | None:
+    """Return the CUDA opt-in max shared-memory-per-block, or ``None`` off CUDA.
+
+    The demotion of residual oversized shared scratch to a global device
+    workspace is *only* applied when the active Path C lowering target is CUDA
+    (``_path_c_default_target() == "cuda"``).  On Metal hosts this returns
+    ``None`` and callers MUST treat that as "no capacity limit" so the generated
+    schedule is byte-for-byte identical to the pre-change behaviour (every
+    surviving ``T.alloc_shared`` buffer keeps its shared scope).  Metal's
+    threadgroup model spills oversized scratch to device memory in its own
+    backend, so this CUDA-only demotion mirrors what Metal already does without
+    touching the Metal codegen path.
+    """
+
+    if _path_c_default_target() != "cuda":
+        return None
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("libcudart.so")
+        value = ctypes.c_int(0)
+        device = ctypes.c_int(0)
+        # cudaDevAttrMaxSharedMemoryPerBlockOptin == 97.
+        rc = lib.cudaDeviceGetAttribute(ctypes.byref(value), 97, device)
+        if rc == 0 and value.value > 0:
+            return int(value.value)
+    except Exception:
+        pass
+    # CUDA target but the attribute query failed (no runtime / no device): fall
+    # back to the conservative sm_80+ opt-in floor so we still demote rather than
+    # emit a kernel that ptxas will reject for shared-memory overflow.
+    return 0x18C00  # 101376 bytes (99 KiB), matches sm_121a opt-in cap.
+
+
+def _demote_residual_shared_scratch_to_global(source: str) -> str:
+    """CUDA-only: rewrite residual oversized ``T.alloc_shared`` to ``T.alloc_global``.
+
+    Runs AFTER ``_spill_large_shared_scratch_to_abi`` so it only ever touches
+    ``T.alloc_shared`` lines that survived the ABI-scratch spill (e.g. the full
+    reverse-scan Mamba3 backward state ``h_prev``/``h_next``/``dh``/``dh_prev``,
+    which cannot be spilled to ABI device-scratch params in the direct-chain path
+    because the portable 31-buffer kernel ABI budget is exhausted).  For
+    ``local_gb10_quarter`` those buffers sum to ~7.4 MB of ``shared.dyn`` per
+    block, which ptxas rejects (max ~99 KiB even with the opt-in attribute on
+    Blackwell sm_121a).  ``T.alloc_global`` is a kernel-internal device workspace
+    (no ABI param, no 31-buffer-limit interaction) and is launched with a single
+    block, so it preserves the cross-lane visibility the shared buffers provided.
+
+    Off CUDA (``_cuda_shared_memory_optin_cap_bytes() is None``, e.g. Metal) this
+    returns ``source`` unchanged, so the Metal schedule is byte-for-byte
+    identical to the pre-change behaviour.  The largest residual shared buffers
+    are demoted first until the residual shared total fits the CUDA budget.
+    """
+
+    cap_bytes = _cuda_shared_memory_optin_cap_bytes()
+    if cap_bytes is None:
+        return source
+    budget_bytes = min(_CUDA_SHARED_SCRATCH_BUDGET_BYTES, cap_bytes)
+    lines = source.splitlines()
+    shared: list[tuple[int, str, int]] = []  # (line_index, name, byte_count)
+    shared_total = 0
+    for index, line in enumerate(lines):
+        match = _ALLOC_SHARED_LINE_RE.match(line)
+        if match is None:
+            continue
+        shape_value = ast.literal_eval(match.group("shape"))
+        shape = (
+            (int(shape_value),)
+            if isinstance(shape_value, int)
+            else tuple(int(dim) for dim in shape_value)
+        )
+        byte_count = _flattened_extent(shape) * _DTYPE_NBYTES[match.group("dtype")]
+        shared.append((index, match.group("name"), byte_count))
+        shared_total += byte_count
+    if shared_total <= budget_bytes:
+        return source
+    # Demote the largest residual shared buffers first until the rest fit.
+    for index, _name, byte_count in sorted(
+        shared, key=lambda item: item[2], reverse=True
+    ):
+        if shared_total <= budget_bytes:
+            break
+        lines[index] = lines[index].replace(
+            "T.alloc_shared(", "T.alloc_global(", 1
+        )
+        shared_total -= byte_count
+    return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
 
 
 def _append_row_phased_mamba3_bwd_body(

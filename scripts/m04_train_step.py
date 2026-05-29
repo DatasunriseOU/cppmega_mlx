@@ -33,6 +33,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# MLX CUDA graph-cache sizing: the HybridTinyLM Path C step compiles many
+# distinct kernels; MLX's default cache (400) thrashes on CUDA hosts and aborts
+# at mx.eval ("Cache thrashing... set MLX_CUDA_GRAPH_CACHE_SIZE"). Set a roomy
+# default before MLX initializes. No-op on Metal (CUDA-only knob); setdefault so
+# an explicit user/env value always wins.
+os.environ.setdefault("MLX_CUDA_GRAPH_CACHE_SIZE", "8192")
+
 import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten, tree_unflatten  # noqa: E402
