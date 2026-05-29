@@ -2386,9 +2386,24 @@ def sparse_mla_path_c_status() -> SparseMLAPathCStatus:
     """Return whether the Path C TileLang DSL kernel can dispatch on this host."""
 
     if not can_run_metal():
+        # CUDA EAGER branch: on a non-Metal host (e.g. gb10 / sm_121)
+        # the Metal MSL path is unavailable, but a TileLang-CUDA per-op
+        # kernel can still run. Report available so the forward routes
+        # through ``sparse_mla_fwd_path_c``'s CUDA branch.
+        from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+
+        cuda_ok, cuda_reason = cuda_eager_available()
+        if cuda_ok:
+            return SparseMLAPathCStatus(
+                available=True,
+                reason=f"Sparse-MLA TileLang-CUDA EAGER path ready ({cuda_reason})",
+            )
         return SparseMLAPathCStatus(
             available=False,
-            reason="MLX Metal backend is not available on the default GPU device",
+            reason=(
+                "MLX Metal backend is not available on the default GPU "
+                f"device and CUDA EAGER path unavailable: {cuda_reason}"
+            ),
         )
     ok, reason = _tilelang_available()
     if not ok:
@@ -3746,6 +3761,22 @@ def sparse_mla_fwd_path_c(
 
     status = sparse_mla_path_c_status()
     if not status.available:
+        return None
+
+    # CUDA EAGER branch: when Metal is unavailable, run the reused
+    # static-shape TileLang Sparse-MLA fwd prim_func with target="cuda"
+    # instead of the Metal tvm-ffi owner-output route below.
+    if not can_run_metal():
+        from cppmega_mlx.nn._tilelang._cuda_eager import (
+            cuda_eager_available,
+            sparse_mla_fwd_cuda_eager,
+        )
+
+        cuda_ok, _cuda_reason = cuda_eager_available()
+        if cuda_ok:
+            return sparse_mla_fwd_cuda_eager(
+                q, kv, indices, sm_scale=sm_scale, d_v=d_v
+            )
         return None
 
     shapes = _resolve_shapes(q, kv, indices, d_v=d_v)
