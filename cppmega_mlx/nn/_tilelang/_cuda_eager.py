@@ -102,6 +102,7 @@ def _init_dtype_maps() -> None:
             mx.bfloat16: torch.bfloat16,
             mx.int32: torch.int32,
             mx.int64: torch.int64,
+            mx.uint8: torch.uint8,
         }
     )
     _NP_DTYPE_FOR_MLX.update(
@@ -111,6 +112,7 @@ def _init_dtype_maps() -> None:
             mx.bfloat16: "float32",  # numpy has no bf16; carry through fp32
             mx.int32: "int32",
             mx.int64: "int64",
+            mx.uint8: "uint8",
         }
     )
     del np
@@ -438,26 +440,593 @@ def mamba3_mimo_fwd_cuda_eager(
 
 
 # ---------------------------------------------------------------------------
-# m2rnn — TODO
+# FP8 Sparse-MLA — per-token FP8 producer (CUDA-safe) + prepared-buffer apply
 # ---------------------------------------------------------------------------
+#
+# Path C's FP8 Sparse-MLA refuses a full-size scaled-tensor fallback: it must
+# consume prepared ``q_fp8 / q_scale / kv_fp8 / kv_scale`` (per-token amax ->
+# scale -> e4m3 cast) buffers. On Metal those are produced by a single-pass
+# tvm-ffi quant kernel; here we run the equivalent TileLang kernels with
+# ``target="cuda"``.
+#
+# The in-tree producer prim (``_make_fp8_per_token_quant_kernel``) uses
+# ``T.alloc_var("float32")`` for the per-element ``normalized`` temporary, which
+# nvcc rejects (it emits ``float* normalized`` and then assigns a float to the
+# pointer). We therefore vendor a CUDA-safe copy that uses a one-element
+# ``T.alloc_local`` accumulator instead — identical amax/scale/e4m3 math, same
+# uint8 + fp32 output layout that the apply consumer expects. The prepared-buffer
+# *apply* kernel (``_make_fp8_sparse_mla_apply_kernel``) is already CUDA-safe
+# (``T.alloc_local`` / ``T.alloc_shared`` / portable e4m3 codec), so we compile
+# it verbatim with ``target="cuda"``.
+
+
+def _make_fp8_per_token_quant_cuda_prim(rows: int, K: int, in_dtype: str) -> Any:
+    """CUDA-safe per-token FP8 (e4m3 -> uint8) quant + per-row fp32 scale.
+
+    Mirrors ``sparse_mla_fp8_path_c._make_fp8_per_token_quant_kernel`` exactly
+    (per-row amax, ``scale = max(amax/448, 1e-12)``, clamp to +/-448, e4m3
+    encode), but replaces the ``T.alloc_var("float32")`` per-element temporary
+    with a one-slot ``T.alloc_local`` so CUDA codegen accepts it.
+
+    Defined at module scope (no ``from __future__ import annotations`` here) so
+    TileLang's ``get_type_hints`` re-evaluation resolves the shape names.
+    """
+
+    import tilelang.language as T
+    from tilelang.tileop.metal_quant import float_to_fp8_e4m3fn_bits
+
+    g = globals()
+    g.update(
+        _CUDA_FP8_PTQ_ROWS=int(rows),
+        _CUDA_FP8_PTQ_K=int(K),
+        _CUDA_FP8_PTQ_IN=str(in_dtype),
+    )
+
+    @T.prim_func
+    def fp8_per_token_quant_cuda(
+        x: T.Tensor((_CUDA_FP8_PTQ_ROWS * _CUDA_FP8_PTQ_K,), _CUDA_FP8_PTQ_IN),
+        fp8: T.Tensor((_CUDA_FP8_PTQ_ROWS * _CUDA_FP8_PTQ_K,), "uint8"),
+        scale: T.Tensor((_CUDA_FP8_PTQ_ROWS,), "float32"),
+    ):
+        with T.Kernel(_CUDA_FP8_PTQ_ROWS, threads=256) as row:
+            x_abs = T.alloc_fragment((_CUDA_FP8_PTQ_K,), "float32")
+            row_amax = T.alloc_fragment((1,), "float32")
+            nrm = T.alloc_local((1,), "float32")
+            base = row * _CUDA_FP8_PTQ_K
+            for k in T.Parallel(_CUDA_FP8_PTQ_K):
+                x_abs[k] = T.abs(T.cast(x[base + k], "float32"))
+            T.reduce_max(x_abs, row_amax, dim=0, clear=True)
+            row_scale = T.max(
+                row_amax[0] * T.cast(1.0 / 448.0, "float32"),
+                T.cast(1.0e-12, "float32"),
+            )
+            if T.get_thread_binding(0) == 0:
+                scale[row] = row_scale
+            for k in T.Parallel(_CUDA_FP8_PTQ_K):
+                nrm[0] = T.cast(x[base + k], "float32") / row_scale
+                nrm[0] = T.max(nrm[0], T.cast(-448.0, "float32"))
+                nrm[0] = T.min(nrm[0], T.cast(448.0, "float32"))
+                fp8[base + k] = float_to_fp8_e4m3fn_bits(nrm[0])
+
+    return fp8_per_token_quant_cuda
+
+
+@functools.lru_cache(maxsize=128)
+def _fp8_per_token_quant_cuda_kernel(rows: int, K: int, in_dtype: str) -> Any:
+    import tilelang
+
+    prim = _make_fp8_per_token_quant_cuda_prim(rows, K, in_dtype)
+    return tilelang.compile(prim, target="cuda", out_idx=None)
+
+
+def fp8_per_token_quant_cuda_eager(x: mx.array) -> tuple[mx.array, mx.array] | None:
+    """Quantize ``x`` to e4m3 (uint8) + per-final-dim-row fp32 scale on CUDA.
+
+    Returns ``(fp8, scale)`` where ``fp8`` has the same shape as ``x`` (uint8
+    storage) and ``scale`` has shape ``x.shape[:-1]`` (float32), matching
+    :func:`sparse_mla_fp8_path_c._to_fp8_with_per_token_scale_metal`. Returns
+    ``None`` on any failure so the caller can re-raise the documented guard.
+    """
+
+    ok, _reason = cuda_eager_available()
+    if not ok:
+        return None
+    if x.ndim < 2 or x.size == 0:
+        return None
+    if x.dtype not in {mx.float32, mx.float16, mx.bfloat16}:
+        return None
+
+    try:
+        import torch
+    except Exception:
+        return None
+
+    K = int(x.shape[-1])
+    rows = 1
+    for dim in x.shape[:-1]:
+        rows *= int(dim)
+    in_dtype = {
+        mx.float32: "float32",
+        mx.float16: "float16",
+        mx.bfloat16: "bfloat16",
+    }[x.dtype]
+    # bf16 has no numpy carrier in the bridge; quantize from a fp32 carrier so
+    # the producer math is bit-identical to the Metal path (which also widens
+    # to fp32 before amax/encode).
+    if x.dtype == mx.bfloat16:
+        x_in = x.astype(mx.float32)
+        in_dtype = "float32"
+    else:
+        x_in = x
+
+    try:
+        kernel = _fp8_per_token_quant_cuda_kernel(rows, K, in_dtype)
+        x_t = _mlx_to_torch_cuda(x_in).reshape(-1)
+        fp8_t = torch.zeros(rows * K, dtype=torch.uint8, device="cuda")
+        scale_t = torch.zeros(rows, dtype=torch.float32, device="cuda")
+        kernel(x_t, fp8_t, scale_t)
+        torch.cuda.synchronize()
+    except Exception:
+        return None
+
+    fp8 = _torch_cuda_to_mlx(fp8_t.reshape(x.shape), mx.uint8)
+    scale = _torch_cuda_to_mlx(scale_t.reshape(x.shape[:-1]), mx.float32)
+    return fp8, scale
+
+
+@functools.lru_cache(maxsize=128)
+def _fp8_sparse_mla_apply_cuda_kernel(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    seq_len_kv: int,
+    kv_group: int,
+    head_kv: int,
+    topk: int,
+    K: int,
+    d_v: int,
+    threads: int,
+    out_dtype: str,
+    index_dtype: str,
+) -> Any:
+    """Compile the in-tree prepared-buffer FP8 Sparse-MLA apply prim for CUDA."""
+
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c import (
+        _make_fp8_sparse_mla_apply_kernel,
+    )
+
+    prim = _make_fp8_sparse_mla_apply_kernel(
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        seq_len_kv=seq_len_kv,
+        kv_group=kv_group,
+        head_kv=head_kv,
+        topk=topk,
+        K=K,
+        d_v=d_v,
+        threads=threads,
+        out_dtype=out_dtype,
+        index_dtype=index_dtype,
+    )
+    return tilelang.compile(prim, target="cuda", out_idx=None)
+
+
+_TORCH_DTYPE_FOR_OUT: dict[str, Any] = {}
+
+
+def _torch_out_dtype(name: str) -> Any:
+    import torch
+
+    if not _TORCH_DTYPE_FOR_OUT:
+        _TORCH_DTYPE_FOR_OUT.update(
+            {
+                "float32": torch.float32,
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }
+        )
+    return _TORCH_DTYPE_FOR_OUT[name]
+
+
+def fp8_sparse_mla_apply_cuda_eager(
+    q_fp8: mx.array,
+    q_scale: mx.array,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float,
+    sinks: mx.array | None,
+    batch: int,
+    seq_len: int,
+    heads: int,
+    seq_len_kv: int,
+    kv_group: int,
+    head_kv: int,
+    topk: int,
+    K: int,
+    d_v: int,
+    threads: int,
+    out_dtype: str,
+    index_dtype: str,
+) -> tuple[mx.array, mx.array] | None:
+    """TileLang-CUDA EAGER prepared-buffer FP8 Sparse-MLA apply -> ``(out, lse)``.
+
+    Consumes the prepared ``q_fp8/q_scale/kv_fp8/kv_scale`` buffers exactly like
+    the Metal apply kernel; returns flat ``out`` reshaped to
+    ``(B,S,H,d_v)`` and ``lse`` reshaped to ``(B,S,H)``. ``None`` on failure.
+    """
+
+    ok, _reason = cuda_eager_available()
+    if not ok:
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+
+    lanes = batch * seq_len * heads
+    mx_out_dtype = {
+        "float32": mx.float32,
+        "float16": mx.float16,
+        "bfloat16": mx.bfloat16,
+    }[out_dtype]
+
+    try:
+        kernel = _fp8_sparse_mla_apply_cuda_kernel(
+            batch,
+            seq_len,
+            heads,
+            seq_len_kv,
+            kv_group,
+            head_kv,
+            topk,
+            K,
+            d_v,
+            threads,
+            out_dtype,
+            index_dtype,
+        )
+        q_fp8_t = _mlx_to_torch_cuda(q_fp8.astype(mx.uint8)).reshape(-1)
+        q_scale_t = _mlx_to_torch_cuda(q_scale.astype(mx.float32)).reshape(-1)
+        kv_fp8_t = _mlx_to_torch_cuda(kv_fp8.astype(mx.uint8)).reshape(-1)
+        kv_scale_t = _mlx_to_torch_cuda(kv_scale.astype(mx.float32)).reshape(-1)
+        idx_t = _mlx_to_torch_cuda(indices).reshape(-1)
+        sm_t = torch.tensor([float(sm_scale)], dtype=torch.float32, device="cuda")
+        if sinks is None:
+            sinks_t = torch.zeros(heads, dtype=torch.float32, device="cuda")
+            has_sinks_t = torch.zeros(1, dtype=torch.int32, device="cuda")
+        else:
+            sinks_t = _mlx_to_torch_cuda(sinks.astype(mx.float32)).reshape(-1)
+            has_sinks_t = torch.ones(1, dtype=torch.int32, device="cuda")
+        out_t = torch.zeros(
+            lanes * d_v, dtype=_torch_out_dtype(out_dtype), device="cuda"
+        )
+        lse_t = torch.zeros(lanes, dtype=torch.float32, device="cuda")
+        kernel(
+            q_fp8_t,
+            q_scale_t,
+            kv_fp8_t,
+            kv_scale_t,
+            idx_t,
+            sm_t,
+            sinks_t,
+            has_sinks_t,
+            out_t,
+            lse_t,
+        )
+        torch.cuda.synchronize()
+    except Exception:
+        return None
+
+    out = _torch_cuda_to_mlx(
+        out_t.reshape(batch, seq_len, heads, d_v), mx_out_dtype
+    )
+    lse = _torch_cuda_to_mlx(
+        lse_t.reshape(batch, seq_len, heads), mx.float32
+    )
+    return out, lse
+
+
+# ---------------------------------------------------------------------------
+# m2rnn (fwd) — vendored CUDA-safe mapped-packed-post affine scan
+# ---------------------------------------------------------------------------
+#
+# The production m2rnn Path C forward (``m2rnn_path_c._make_mapped_packed_post_
+# fwd_prim_func``) is a per-(b, head, v) lane sequential affine scan
+# (``h = f*h + (1-f)*tanh(h@W + k*v)``; ``post = (q.h + v*D) * g * sigmoid(g)``).
+# It is already CUDA-shaped (block-id + ``T.get_thread_binding`` lane,
+# ``T.alloc_local`` state), with ONE CUDA blocker: the gate temporary
+# ``sig_g = T.alloc_var(T.float32, init=0.0)`` (the same non-lvalue
+# ``float sig_g = 0`` nvcc reject as mamba3's accumulators). We vendor a
+# CUDA-safe copy that uses a one-slot ``T.alloc_local`` for the gate instead.
+# Math, buffer order, and output layout are byte-for-byte the same as the Metal
+# prim, so the consumer (``m2rnn`` nn module) sees identical ``(post, h_last)``.
+#
+# Defined at module scope (no ``from __future__ import annotations``) so
+# TileLang's ``get_type_hints`` re-evaluation resolves the shape names.
+
+
+def _make_m2rnn_mapped_packed_post_fwd_cuda_prim(
+    batch: int,
+    seq: int,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    w_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+) -> Any:
+    """CUDA-safe mapped-packed-post m2rnn forward (post, h_last, tanh_cache)."""
+
+    import tilelang.language as T
+
+    conv_dim = q_heads * k_dim + k_heads * k_dim + v_heads * v_dim
+    k_offset = q_heads * k_dim
+    v_offset = k_offset + k_heads * k_dim
+    q_group = total_heads // q_heads
+    k_group = total_heads // k_heads
+    v_group = total_heads // v_heads
+    g_repeat = total_heads // g_heads
+    w_group = total_heads // w_heads
+    f_group = total_heads // f_heads
+    g_dim = g_heads * v_dim
+    g_offset = projected_dim - g_dim
+    features = total_heads * v_dim
+    lanes = batch * features
+    threads = min(256, max(1, lanes))
+    accum_dtype = "float32"
+
+    @T.prim_func
+    def fwd(
+        conv_input: T.Tensor((batch, seq, conv_dim), carrier_dtype),
+        W: T.Tensor((w_heads, v_dim, v_dim), carrier_dtype),
+        xf: T.Tensor((batch, seq, f_heads), carrier_dtype),
+        h0: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
+        D: T.Tensor((total_heads, v_dim), carrier_dtype),
+        projected: T.Tensor((batch, seq, projected_dim), carrier_dtype),
+        h_last: T.Tensor((batch, total_heads, k_dim, v_dim), carrier_dtype),
+        tanh_cache: T.Tensor((batch, seq, total_heads, k_dim, v_dim), carrier_dtype),
+        post: T.Tensor((batch, seq, features), carrier_dtype),
+    ):
+        with T.Kernel(T.ceildiv(lanes, threads), threads=threads) as bx:
+            tid = T.get_thread_binding(0)
+            lane = bx * threads + tid
+            h_state = T.alloc_local((k_dim, v_dim), accum_dtype)
+            h_next = T.alloc_local((k_dim, v_dim), accum_dtype)
+            y_acc = T.alloc_local((1,), accum_dtype)
+            acc = T.alloc_local((1,), accum_dtype)
+            sig_g = T.alloc_local((1,), accum_dtype)
+            if lane < lanes:
+                feature = lane % features
+                vv_out = feature % v_dim
+                h = feature // v_dim
+                b = lane // features
+                q_src = h // q_group
+                k_src = h // k_group
+                v_src = h // v_group
+                w_src = h // w_group
+                f_src = h // f_group
+                g_flat = feature // g_repeat
+                q_head_offset = q_src * k_dim
+                k_head_offset = k_offset + k_src * k_dim
+                v_head_offset = v_offset + v_src * v_dim
+                v_index = v_head_offset + vv_out
+                g_index = g_offset + g_flat
+                d_val = T.cast(D[h, vv_out], accum_dtype)
+
+                for kk in T.serial(k_dim):
+                    for vv in T.serial(v_dim):
+                        h_state[kk, vv] = T.cast(h0[b, h, kk, vv], accum_dtype)
+
+                for t in T.serial(seq):
+                    f_val = T.cast(xf[b, t, f_src], accum_dtype)
+                    one_minus_f = 1.0 - f_val
+                    y_acc[0] = 0.0
+
+                    for kk in T.serial(k_dim):
+                        k_val = T.cast(
+                            conv_input[b, t, k_head_offset + kk],
+                            accum_dtype,
+                        )
+                        q_val = T.cast(
+                            conv_input[b, t, q_head_offset + kk],
+                            accum_dtype,
+                        )
+                        for vv in T.serial(v_dim):
+                            acc[0] = 0.0
+                            for v0 in T.serial(v_dim):
+                                acc[0] = acc[0] + h_state[kk, v0] * T.cast(
+                                    W[w_src, v0, vv],
+                                    accum_dtype,
+                                )
+                            z = acc[0] + k_val * T.cast(
+                                conv_input[b, t, v_head_offset + vv],
+                                accum_dtype,
+                            )
+                            tz = T.tanh(z)
+                            if vv_out == 0:
+                                tanh_cache[b, t, h, kk, vv] = T.cast(
+                                    tz,
+                                    carrier_dtype,
+                                )
+                            h_next[kk, vv] = f_val * h_state[kk, vv] + one_minus_f * tz
+                        y_acc[0] = y_acc[0] + q_val * h_next[kk, vv_out]
+
+                    g_val = T.cast(projected[b, t, g_index], accum_dtype)
+                    if g_val >= 0.0:
+                        sig_g[0] = 1.0 / (1.0 + T.exp(-g_val))
+                    else:
+                        sig_g[0] = T.exp(g_val)
+                        sig_g[0] = sig_g[0] / (1.0 + sig_g[0])
+                    v_val = T.cast(conv_input[b, t, v_index], accum_dtype)
+                    post[b, t, feature] = T.cast(
+                        (y_acc[0] + v_val * d_val) * g_val * sig_g[0],
+                        carrier_dtype,
+                    )
+
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_state[kk, vv] = h_next[kk, vv]
+                if vv_out == 0:
+                    for kk in T.serial(k_dim):
+                        for vv in T.serial(v_dim):
+                            h_last[b, h, kk, vv] = T.cast(
+                                h_state[kk, vv],
+                                carrier_dtype,
+                            )
+
+    return fwd
+
+
+@functools.lru_cache(maxsize=128)
+def _m2rnn_mapped_packed_post_fwd_cuda_kernel(
+    batch: int,
+    seq: int,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    w_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+) -> Any:
+    import tilelang
+
+    prim = _make_m2rnn_mapped_packed_post_fwd_cuda_prim(
+        batch,
+        seq,
+        total_heads,
+        q_heads,
+        k_heads,
+        v_heads,
+        g_heads,
+        w_heads,
+        f_heads,
+        k_dim,
+        v_dim,
+        projected_dim,
+        carrier_dtype,
+    )
+    return tilelang.compile(prim, target="cuda", out_idx=None)
+
+
+def m2rnn_mapped_packed_post_fwd_cuda_eager(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    total_heads: int,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+    w_heads: int,
+    f_heads: int,
+    k_dim: int,
+    v_dim: int,
+    projected_dim: int,
+    carrier_dtype: str,
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    """TileLang-CUDA EAGER mapped-packed-post m2rnn fwd -> (post, h_last, tanh_cache).
+
+    Returns ``None`` on any failure so the caller can fall back to the pure-MLX
+    reference scan. ``post`` has shape ``(B, S, total_heads*v_dim)``, ``h_last``
+    ``(B, total_heads, k_dim, v_dim)``, ``tanh_cache``
+    ``(B, S, total_heads, k_dim, v_dim)`` (all in ``conv_input.dtype``).
+    """
+
+    ok, _reason = cuda_eager_available()
+    if not ok:
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+
+    batch, seq, _ = (int(x) for x in conv_input.shape)
+    features = total_heads * v_dim
+    out_dtype = conv_input.dtype
+
+    # The vendored prim takes fp32/fp16 carriers; widen bf16 to fp32 (the bridge
+    # has no native bf16 numpy carrier) — matches the Metal carrier widening.
+    if out_dtype == mx.bfloat16:
+        carrier_mx = mx.float32
+        carrier_name = "float32"
+    else:
+        carrier_mx = out_dtype
+        carrier_name = carrier_dtype
+
+    try:
+        kernel = _m2rnn_mapped_packed_post_fwd_cuda_kernel(
+            batch,
+            seq,
+            total_heads,
+            q_heads,
+            k_heads,
+            v_heads,
+            g_heads,
+            w_heads,
+            f_heads,
+            k_dim,
+            v_dim,
+            projected_dim,
+            carrier_name,
+        )
+        ci_t = _mlx_to_torch_cuda(conv_input.astype(carrier_mx))
+        W_t = _mlx_to_torch_cuda(W.astype(carrier_mx))
+        xf_t = _mlx_to_torch_cuda(xf.astype(carrier_mx))
+        h0_t = _mlx_to_torch_cuda(h0.astype(carrier_mx))
+        D_t = _mlx_to_torch_cuda(D.astype(carrier_mx))
+        proj_t = _mlx_to_torch_cuda(projected.astype(carrier_mx))
+        torch_carrier = _MLX_TO_TORCH_DTYPE[carrier_mx]
+        h_last_t = torch.zeros(
+            batch, total_heads, k_dim, v_dim, dtype=torch_carrier, device="cuda"
+        )
+        tanh_t = torch.zeros(
+            batch, seq, total_heads, k_dim, v_dim, dtype=torch_carrier, device="cuda"
+        )
+        post_t = torch.zeros(
+            batch, seq, features, dtype=torch_carrier, device="cuda"
+        )
+        kernel(ci_t, W_t, xf_t, h0_t, D_t, proj_t, h_last_t, tanh_t, post_t)
+        torch.cuda.synchronize()
+    except Exception:
+        return None
+
+    post = _torch_cuda_to_mlx(post_t, out_dtype)
+    h_last = _torch_cuda_to_mlx(h_last_t, out_dtype)
+    tanh_cache = _torch_cuda_to_mlx(tanh_t, out_dtype)
+    return post, h_last, tanh_cache
 
 
 def m2rnn_supported_cuda_eager() -> tuple[bool, str]:
-    """m2rnn CUDA EAGER kernel is not yet ported.
+    """Report whether the m2rnn TileLang-CUDA EAGER forward can dispatch."""
 
-    TODO: the m2rnn Path C kernels in ``m2rnn_path_c.py`` are Metal-MSL
-    lowered (and several use the Metal ``tir.metal.*`` thread intrinsics like
-    mamba3); porting requires a CUDA-safe affine-scan prim_func analogous to
-    :func:`_mamba3_fwd_cuda_kernel`. Until then m2rnn stays on the pure-MLX
-    reference on CUDA.
-    """
-
-    return False, "m2rnn CUDA EAGER kernel not yet ported (uses Metal MSL path)"
+    return cuda_eager_available()
 
 
 __all__ = [
     "cuda_eager_available",
     "sparse_mla_fwd_cuda_eager",
     "mamba3_mimo_fwd_cuda_eager",
+    "fp8_per_token_quant_cuda_eager",
+    "fp8_sparse_mla_apply_cuda_eager",
+    "m2rnn_mapped_packed_post_fwd_cuda_eager",
     "m2rnn_supported_cuda_eager",
 ]

@@ -3012,6 +3012,80 @@ def sparse_mla_fp8_path_c_apply_direct(
     return out_buf, lse_buf
 
 
+def _sparse_mla_fp8_apply_cuda_eager(
+    q_fp8: mx.array,
+    q_scale: mx.array,
+    kv_fp8: mx.array,
+    kv_scale: mx.array,
+    indices: mx.array,
+    *,
+    sm_scale: float,
+    d_v: int | None,
+    sinks: mx.array | None,
+    output_dtype: mx.Dtype | None,
+) -> tuple[mx.array, mx.array] | None:
+    """Run the prepared-buffer FP8 Sparse-MLA apply on CUDA -> ``(out, lse)``."""
+
+    from cppmega_mlx.nn._tilelang._cuda_eager import (
+        cuda_eager_available,
+        fp8_sparse_mla_apply_cuda_eager,
+    )
+
+    cuda_ok, _reason = cuda_eager_available()
+    if not cuda_ok:
+        return None
+    (
+        batch,
+        seq_len,
+        heads,
+        seq_len_kv,
+        kv_group,
+        head_kv,
+        topk,
+        K,
+        d_v_resolved,
+        threads,
+    ) = _validate_fp8_apply_inputs(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        d_v=d_v,
+    )
+    output_dtype_resolved = _mx_float_dtype(output_dtype, default=mx.float16)
+    out_dtype = _tilelang_float_dtype(output_dtype_resolved, name="output_dtype")
+    if sinks is not None:
+        if not isinstance(sinks, mx.array):
+            raise TypeError("sinks must be an mlx.core.array")
+        if sinks.shape != (heads,):
+            raise ValueError(f"sinks must have shape ({heads},), got {sinks.shape}")
+        if sinks.dtype != mx.float32:
+            raise ValueError("sinks must be float32")
+    index_dtype = _index_dtype_name(indices, op_name="FP8 Sparse-MLA Path C apply")
+    return fp8_sparse_mla_apply_cuda_eager(
+        q_fp8,
+        q_scale,
+        kv_fp8,
+        kv_scale,
+        indices,
+        sm_scale=sm_scale,
+        sinks=sinks,
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        seq_len_kv=seq_len_kv,
+        kv_group=kv_group,
+        head_kv=head_kv,
+        topk=topk,
+        K=K,
+        d_v=d_v_resolved,
+        threads=threads,
+        out_dtype=out_dtype,
+        index_dtype=index_dtype,
+    )
+
+
 def sparse_mla_fp8_path_c_apply(
     q_fp8: mx.array,
     q_scale: mx.array,
@@ -3060,6 +3134,29 @@ def sparse_mla_fp8_path_c_apply(
         return direct_out
 
     if not can_run_metal():
+        # CUDA EAGER branch: run the prepared-buffer FP8 Sparse-MLA apply
+        # prim_func with target="cuda" over the same uint8/fp32 buffers.
+        cuda_result = _sparse_mla_fp8_apply_cuda_eager(
+            q_fp8,
+            q_scale,
+            kv_fp8,
+            kv_scale,
+            indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            sinks=sinks,
+            output_dtype=output_dtype,
+        )
+        if cuda_result is not None:
+            cuda_out, cuda_lse = cuda_result
+            _emit_fp8_apply_runtime_buffer(
+                runtime_buffer_probe,
+                name="lse",
+                tensor=cuda_lse,
+            )
+            if return_lse:
+                return cuda_out, cuda_lse
+            return cuda_out
         if force_path_c:
             raise RuntimeError(
                 "sparse_mla_fp8_path_c_apply: MLX Metal backend is unavailable"
@@ -3256,12 +3353,37 @@ def _to_fp8_with_per_token_scale(x: mx.array) -> tuple[mx.array, mx.array]:
     metal_result = _to_fp8_with_per_token_scale_metal(x)
     if metal_result is not None:
         return metal_result
+    # CUDA EAGER branch: Metal is unavailable (e.g. gb10 / sm_121). Run the
+    # equivalent per-token FP8 producer as a TileLang-CUDA kernel that yields
+    # the SAME prepared (uint8 e4m3 fp8, fp32 per-row scale) buffers the FP8
+    # Sparse-MLA apply consumer expects — no full-size scaled-tensor
+    # materialization, so the producer-owned contract is preserved.
+    if not can_run_metal():
+        cuda_result = _to_fp8_with_per_token_scale_cuda(x)
+        if cuda_result is not None:
+            return cuda_result
     raise RuntimeError(
         "_to_fp8_with_per_token_scale requires the native TileLang tvm-ffi "
         "per-token FP8 producer graph path; "
         "Path C must consume prepared q_fp8/q_scale/kv_fp8/kv_scale buffers "
         "and must not materialize a full-size scaled tensor fallback"
     )
+
+
+def _to_fp8_with_per_token_scale_cuda(x: mx.array) -> tuple[mx.array, mx.array] | None:
+    """TileLang-CUDA EAGER per-token FP8 producer (uint8 e4m3 + fp32 scale)."""
+
+    from cppmega_mlx.nn._tilelang._cuda_eager import (
+        cuda_eager_available,
+        fp8_per_token_quant_cuda_eager,
+    )
+
+    cuda_ok, _reason = cuda_eager_available()
+    if not cuda_ok:
+        return None
+    if x.dtype not in {mx.float32, mx.float16, mx.bfloat16}:
+        raise TypeError(f"FP8 producer input must be floating, got {x.dtype}")
+    return fp8_per_token_quant_cuda_eager(x)
 
 
 def _prepared_fp8_bwd_ste(
@@ -3280,6 +3402,33 @@ def _prepared_fp8_bwd_ste(
     causal: bool,
 ) -> tuple[mx.array, mx.array] | None:
     """Run the Path C FP8 sparse-MLA backward over per-token prepared buffers."""
+
+    # CUDA EAGER branch: the Path C FP8 backward is a Metal/tvm-ffi owner-output
+    # kernel that cannot dispatch on a non-Metal host (e.g. gb10 / sm_121).
+    # Route to the memory-safe reference backward over the SAME prepared FP8
+    # values so training gradients stay finite (mirrors c9f1a97's non-FP8
+    # Sparse-MLA "fwd CUDA-eager, bwd reference VJP" design). Guarded so Metal
+    # hosts keep the native Path C backward byte-for-byte.
+    if not can_run_metal():
+        try:
+            from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+
+            cuda_ok, _reason = cuda_eager_available()
+        except Exception:
+            cuda_ok = False
+        if cuda_ok:
+            return _prepared_fp8_reference_bwd_ste(
+                q,
+                kv,
+                q_fp8,
+                q_scale,
+                kv_fp8,
+                kv_scale,
+                d_out,
+                indices,
+                sm_scale=sm_scale,
+                d_v=d_v,
+            )
 
     result = sparse_mla_fp8_bwd_path_c(
         q_fp8,
@@ -3358,9 +3507,35 @@ def _prepared_fp8_backward_uses_path_c(
     force_path_c: bool,
     force_backward_path_c: bool | None,
 ) -> bool:
+    route = os.environ.get(SPARSE_MLA_FP8_BWD_ENV, "").strip().lower()
+    # CUDA EAGER branch: the FP8 Sparse-MLA Path C backward is a Metal/tvm-ffi
+    # owner-output kernel. On a non-Metal host (e.g. gb10 / sm_121) it cannot
+    # dispatch, so unless the caller *explicitly* forces the Path C backward we
+    # take the memory-safe reference backward over the same prepared FP8 values
+    # (mirrors c9f1a97's non-FP8 Sparse-MLA "fwd CUDA-eager, bwd reference VJP"
+    # design). An explicit ``force_backward_path_c=True`` / env still wins so the
+    # failure surfaces rather than being silently downgraded.
+    if not can_run_metal():
+        try:
+            from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+
+            cuda_ok, _reason = cuda_eager_available()
+        except Exception:
+            cuda_ok = False
+        if cuda_ok:
+            if force_backward_path_c is True:
+                return True
+            if route in {"path_c", "c"}:
+                return True
+            if route in {"path_b", "b"}:
+                return False
+            if route:
+                raise ValueError(
+                    f"{SPARSE_MLA_FP8_BWD_ENV} must be path_b or path_c; got {route!r}"
+                )
+            return False
     if force_backward_path_c is not None:
         return bool(force_backward_path_c)
-    route = os.environ.get(SPARSE_MLA_FP8_BWD_ENV, "").strip().lower()
     if route in {"path_c", "c"}:
         return True
     if route in {"path_b", "b"}:

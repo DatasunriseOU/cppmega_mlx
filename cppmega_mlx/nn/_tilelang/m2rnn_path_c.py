@@ -5408,6 +5408,177 @@ def m2rnn_apply_mapped_packed_post_with_state_path_c(
     return apply(conv_input, W, xf, h0, D, projected)
 
 
+def m2rnn_mapped_packed_post_cuda_eager_supported() -> bool:
+    """Whether the m2rnn combined post forward can run TileLang-CUDA EAGER."""
+
+    if _msl_transform.can_run_metal():
+        return False
+    try:
+        from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+
+        ok, _reason = cuda_eager_available()
+    except Exception:
+        return False
+    return bool(ok)
+
+
+def m2rnn_apply_mapped_packed_post_with_state_cuda_eager(
+    conv_input: mx.array,
+    W: mx.array,
+    xf: mx.array,
+    h0: mx.array,
+    D: mx.array,
+    projected: mx.array,
+    *,
+    q_heads: int,
+    k_heads: int,
+    v_heads: int,
+    g_heads: int,
+) -> tuple[mx.array, mx.array] | None:
+    """TileLang-CUDA EAGER mapped-packed-post m2rnn apply -> ``(post, h_last)``.
+
+    Forward runs the vendored CUDA-safe combined scan+post prim_func; backward
+    uses the pure-MLX reference VJP over the same primals (mirrors c9f1a97's
+    "fwd CUDA-eager, bwd reference" design for the non-FP8 Sparse-MLA path).
+    Returns ``None`` if the geometry/dtype is unsupported so the caller can
+    fall back to the pure-MLX reference scan.
+    """
+
+    from cppmega_mlx.nn._tilelang._cuda_eager import (
+        m2rnn_mapped_packed_post_fwd_cuda_eager,
+    )
+
+    if h0 is None:
+        return None
+    # NB: do NOT use ``_mapped_packed_post_inputs_well_formed`` /
+    # ``_mapped_packed_post_shape`` here — both bottom out in
+    # ``_mapped_packed_path_c_inputs_well_formed`` which is gated on
+    # ``can_run_metal()`` and always rejects on a CUDA host. Derive the shape
+    # directly from the buffers and validate the mapped layout ourselves.
+    if not _validate_same_dtype(conv_input, W, xf, h0, D, projected):
+        return None
+    carrier_dtype = _tl_dtype_for(conv_input.dtype)
+    if carrier_dtype is None:
+        return None
+    try:
+        if conv_input.ndim != 3 or W.ndim != 3 or xf.ndim != 3:
+            return None
+        if h0.ndim != 4 or D.ndim != 2 or projected.ndim != 3:
+            return None
+        if not _require_positive_heads(
+            int(q_heads), int(k_heads), int(v_heads), int(g_heads)
+        ):
+            return None
+        batch = int(conv_input.shape[0])
+        seq = int(conv_input.shape[1])
+        conv_dim = int(conv_input.shape[2])
+        total_heads = int(h0.shape[1])
+        k_dim = int(h0.shape[2])
+        v_dim = int(h0.shape[3])
+        w_heads = int(W.shape[0])
+        f_heads = int(xf.shape[-1])
+        projected_dim = int(projected.shape[-1])
+        if (
+            int(h0.shape[0]) != batch
+            or int(xf.shape[0]) != batch
+            or int(xf.shape[1]) != seq
+            or int(projected.shape[0]) != batch
+            or int(projected.shape[1]) != seq
+        ):
+            return None
+        if int(W.shape[1]) != v_dim or int(W.shape[2]) != v_dim:
+            return None
+        if tuple(int(x) for x in D.shape) != (total_heads, v_dim):
+            return None
+        if total_heads % int(q_heads) != 0 or total_heads % int(k_heads) != 0:
+            return None
+        if total_heads % int(v_heads) != 0 or total_heads % int(g_heads) != 0:
+            return None
+        if total_heads % w_heads != 0 or total_heads % f_heads != 0:
+            return None
+        if conv_dim != _mapped_conv_dim(
+            int(q_heads), int(k_heads), int(v_heads), k_dim, v_dim
+        ):
+            return None
+        if projected_dim < int(g_heads) * v_dim:
+            return None
+    except (TypeError, ValueError, IndexError):
+        return None
+    if seq == 0:
+        return (
+            mx.zeros((batch, 0, total_heads * v_dim), dtype=conv_input.dtype),
+            h0,
+        )
+
+    @mx.custom_function
+    def _apply(
+        conv_input_: mx.array,
+        W_: mx.array,
+        xf_: mx.array,
+        h0_: mx.array,
+        D_: mx.array,
+        projected_: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        full = m2rnn_mapped_packed_post_fwd_cuda_eager(
+            conv_input_,
+            W_,
+            xf_,
+            h0_,
+            D_,
+            projected_,
+            total_heads=int(total_heads),
+            q_heads=int(q_heads),
+            k_heads=int(k_heads),
+            v_heads=int(v_heads),
+            g_heads=int(g_heads),
+            w_heads=int(w_heads),
+            f_heads=int(f_heads),
+            k_dim=int(k_dim),
+            v_dim=int(v_dim),
+            projected_dim=int(projected_dim),
+            carrier_dtype=carrier_dtype,
+        )
+        if full is None:
+            raise RuntimeError(
+                "m2rnn_apply_mapped_packed_post_with_state_cuda_eager: "
+                "CUDA EAGER forward dispatch failed"
+            )
+        post, h_last, _tanh_cache = full
+        return post, h_last
+
+    apply_any = cast(Any, _apply)
+
+    @apply_any.vjp
+    def _apply_vjp(
+        primals: tuple[mx.array, ...],
+        cotangent: tuple[mx.array, mx.array],
+        output: tuple[mx.array, mx.array],
+    ) -> tuple[mx.array, ...]:
+        del output
+        conv_input_, W_, xf_, h0_, D_, projected_ = primals
+        dpost = cotangent[0]
+        grads = _m2rnn_mapped_packed_post_reference_bwd(
+            dpost,
+            conv_input_,
+            W_,
+            xf_,
+            h0_,
+            D_,
+            projected_,
+            q_heads=int(q_heads),
+            k_heads=int(k_heads),
+            v_heads=int(v_heads),
+            g_heads=int(g_heads),
+        )
+        return _match_primal_gradient_dtypes(grads, primals)
+
+    result = _apply(conv_input, W, xf, h0, D, projected)
+    # custom_function failures (RuntimeError above) surface eagerly only when the
+    # output is materialized; the nn-module caller evals soon after. Returning a
+    # graph here is fine — the kernel is JIT-built before any eval.
+    return result
+
+
 def _post_residual_gate_apply_for_layout(
     q_heads: int,
     k_heads: int,

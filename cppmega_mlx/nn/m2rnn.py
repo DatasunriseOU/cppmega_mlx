@@ -653,9 +653,11 @@ class M2RNNMixer(nn.Module):
         used_path_c = False
         if path is KernelPath.PATH_C:
             from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
+                m2rnn_apply_mapped_packed_post_with_state_cuda_eager,
                 m2rnn_apply_mapped_packed_with_state_path_c,
                 m2rnn_apply_post_residual_gate_path_c,
                 m2rnn_mapped_packed_path_c_status,
+                m2rnn_mapped_packed_post_cuda_eager_supported,
                 m2rnn_post_residual_gate_path_c_status,
             )
 
@@ -695,22 +697,54 @@ class M2RNNMixer(nn.Module):
                     if self.D.dtype == conv_input.dtype
                     else self.D.astype(conv_input.dtype)
                 )
-                status = m2rnn_mapped_packed_path_c_status(
-                    conv_input,
-                    state_weight,
-                    xf,
-                    h0_full,
-                    q_heads=cfg.num_q_heads,
-                    k_heads=cfg.num_k_heads,
-                    v_heads=cfg.num_v_heads,
-                )
-                if not status.available:
+                # CUDA EAGER branch: on a non-Metal host (e.g. gb10 / sm_121)
+                # the Metal mapped-packed + post-gate kernels cannot dispatch.
+                # Run the vendored CUDA-safe combined scan+post prim_func that
+                # produces the SAME (post, h_last) the Metal split path would,
+                # with a pure-MLX reference VJP for the backward.
+                cuda_post = None
+                if (
+                    path is KernelPath.PATH_C
+                    and m2rnn_mapped_packed_post_cuda_eager_supported()
+                ):
+                    cuda_post = m2rnn_apply_mapped_packed_post_with_state_cuda_eager(
+                        conv_input,
+                        state_weight,
+                        xf,
+                        h0_full,
+                        D,
+                        projected,
+                        q_heads=cfg.num_q_heads,
+                        k_heads=cfg.num_k_heads,
+                        v_heads=cfg.num_v_heads,
+                        g_heads=cfg.num_g_heads,
+                    )
+                if cuda_post is not None:
+                    out, h = cuda_post
+                    record_dispatch(
+                        "m2rnn",
+                        path,
+                        "path_c_tilelang_cuda_eager_packed_post",
+                    )
+                    used_path_c = True
+                    status = None
+                else:
+                    status = m2rnn_mapped_packed_path_c_status(
+                        conv_input,
+                        state_weight,
+                        xf,
+                        h0_full,
+                        q_heads=cfg.num_q_heads,
+                        k_heads=cfg.num_k_heads,
+                        v_heads=cfg.num_v_heads,
+                    )
+                if status is not None and not status.available:
                     if path is KernelPath.PATH_C:
                         raise RuntimeError(
                             f"m2rnn: Path C packed kernel unavailable "
                             f"({status.reason})"
                         )
-                else:
+                elif status is not None:
                     out, h = m2rnn_apply_mapped_packed_with_state_path_c(
                         conv_input,
                         state_weight,
