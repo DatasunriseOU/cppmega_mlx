@@ -2617,6 +2617,7 @@ def _descriptor_prim_func_source(
             backward_stage_selector=bool(backward_stage_name_groups),
             row_dispatch_defined=False,
             indent=indent,
+            cuda_target=(_path_c_default_target() == "cuda"),
         )
     else:
         active_items = tuple(
@@ -4683,6 +4684,7 @@ def _append_row_phased_hidden_body(
     backward_stage_selector: bool,
     row_dispatch_defined: bool,
     indent: str,
+    cuda_target: bool = False,
 ) -> None:
     if shape_env is None:
         raise ValueError("row_phased_hidden loop policy requires a model shape_env")
@@ -4807,6 +4809,7 @@ def _append_row_phased_hidden_body(
                 thread_count=thread_count,
                 indent=indent,
                 launcher_chunked_rows=launcher_subchunked_rows,
+                cuda_target=cuda_target,
             )
     for node, descriptor, _fragment in fwd_items:
         if _is_row_phased_m2rnn(node, descriptor, shape_env):
@@ -5035,6 +5038,7 @@ def _append_row_phased_hidden_body(
                     thread_count=thread_count,
                     indent=indent,
                     launcher_chunked_rows=launcher_subchunked_rows,
+                    cuda_target=cuda_target,
                 )
                 continue
             if node.op_name == "residual_rmsnorm":
@@ -5700,6 +5704,7 @@ def _append_row_phased_mamba3_init(
     thread_count: int,
     indent: str,
     launcher_chunked_rows: bool = False,
+    cuda_target: bool = False,
 ) -> None:
     projected = _scratch_name(node, "mamba3_projected_vec")
     conv_history = _scratch_name(node, "mamba3_conv_history")
@@ -5715,6 +5720,10 @@ def _append_row_phased_mamba3_init(
     trap_group = _scratch_name(node, "mamba3_trap_group")
     next_dt = _scratch_name(node, "mamba3_next_dt")
     next_trap = _scratch_name(node, "mamba3_next_trap")
+    # CUDA-only thread-parallel trapezoid scratch (declared only when
+    # cuda_target so the Metal kernel source is byte-for-byte unchanged).
+    next_dt_vec = _scratch_name(node, "mamba3_next_dt_vec")
+    next_trap_vec = _scratch_name(node, "mamba3_next_trap_vec")
     angle_cumsum = _scratch_name(node, "mamba3_angle_cumsum")
     out_inner = _scratch_name(node, "mamba3_out_inner")
     accum = _scratch_name(node, "mamba3_accum")
@@ -5760,6 +5769,16 @@ def _append_row_phased_mamba3_init(
     body.append(f"{indent * 2}{trap_group} = T.alloc_shared(({groups},), \"float32\")")
     body.append(f"{indent * 2}{next_dt} = T.alloc_local((1,), \"float32\")")
     body.append(f"{indent * 2}{next_trap} = T.alloc_local((1,), \"float32\")")
+    if cuda_target:
+        # CUDA-only: per-head next-row dt/trap projection scratch. These are in
+        # the force-spill list, so they alias into the ABI float32 scratch bank
+        # and do not consume the per-block shared-memory budget.
+        body.append(
+            f"{indent * 2}{next_dt_vec} = T.alloc_shared(({heads},), \"float32\")"
+        )
+        body.append(
+            f"{indent * 2}{next_trap_vec} = T.alloc_shared(({heads},), \"float32\")"
+        )
     body.append(
         f"{indent * 2}{angle_cumsum} = "
         f"T.alloc_shared(({heads}, {rope_angles}), \"float32\")"
@@ -5925,6 +5944,7 @@ def _append_row_phased_mamba3_body(
     thread_count: int,
     indent: str,
     launcher_chunked_rows: bool = False,
+    cuda_target: bool = False,
 ) -> None:
     projected = _scratch_name(node, "mamba3_projected_vec")
     conv_history = _scratch_name(node, "mamba3_conv_history")
@@ -5940,6 +5960,12 @@ def _append_row_phased_mamba3_body(
     trap_group = _scratch_name(node, "mamba3_trap_group")
     next_dt = _scratch_name(node, "mamba3_next_dt")
     next_trap = _scratch_name(node, "mamba3_next_trap")
+    # CUDA-only: per-head precomputed next-row dt/trap projections so the
+    # trapezoid term is computed thread-parallel over `heads` (mirrors the
+    # backward body), instead of serially over `groups` lanes. See the
+    # cuda_target branch below for why this avoids the forward runaway.
+    next_dt_vec = _scratch_name(node, "mamba3_next_dt_vec")
+    next_trap_vec = _scratch_name(node, "mamba3_next_trap_vec")
     angle_cumsum = _scratch_name(node, "mamba3_angle_cumsum")
     out_inner = _scratch_name(node, "mamba3_out_inner")
     accum = _scratch_name(node, "mamba3_accum")
@@ -6095,6 +6121,63 @@ def _append_row_phased_mamba3_body(
         f"{angle_cumsum}[{head}, {angle}] + "
         f"({projected}[{angle_offset} + {angle}] * {dt_vec}[{head}])"
     )
+    if cuda_target:
+        # CUDA-only: compute the next-row dt/trap raw projections for EVERY head
+        # in this same thread-parallel `head` loop (one head per active lane,
+        # `heads` lanes busy). The original (Metal) path recomputes these inside
+        # a `groups`-serial loop with an inner `heads_per_group` loop, so only
+        # `groups` lanes do the expensive `hidden`-deep reduction while the rest
+        # idle behind a block sync -> the forward compute-spin runaway on CUDA.
+        # The arithmetic is identical (same FMA order, same softplus); only the
+        # work distribution changes. Mirrors `_append_row_phased_mamba3_bwd_body`.
+        next_dt_hidden_expr = _node_indexed_positional_input_expr(
+            node,
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"(row + 1) * {hidden_size} + {hidden_dim_loop}",
+        )
+        next_dt_vec_weight_expr = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_in_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"({dt_offset} + {head}) * {hidden_size} + {hidden_dim_loop}",
+        )
+        next_trap_vec_weight_expr = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_in_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"({trap_offset} + {head}) * {hidden_size} + {hidden_dim_loop}",
+        )
+        next_dt_vec_bias = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_dt_bias",
+            dtype_by_buffer,
+            access_by_buffer,
+            head,
+        )
+        body.append(f"{indent * 4}{next_dt_vec}[{head}] = 0.0")
+        body.append(f"{indent * 4}{next_trap_vec}[{head}] = 0.0")
+        body.append(
+            f"{indent * 4}if row + 1 < {int(shape_env.sequence_length)}:"
+        )
+        body.append(
+            f"{indent * 5}for {hidden_dim_loop} in T.serial(0, {hidden_size}):"
+        )
+        body.append(
+            f"{indent * 6}{next_dt_vec}[{head}] = {next_dt_vec}[{head}] + "
+            f"({next_dt_hidden_expr} * {next_dt_vec_weight_expr})"
+        )
+        body.append(
+            f"{indent * 6}{next_trap_vec}[{head}] = {next_trap_vec}[{head}] + "
+            f"({next_dt_hidden_expr} * {next_trap_vec_weight_expr})"
+        )
+        body.append(
+            f"{indent * 5}{next_dt_vec}[{head}] = T.log(1.0 + "
+            f"T.exp({next_dt_vec}[{head}] + {next_dt_vec_bias}))"
+        )
     if launcher_chunked_rows:
         body.append(
             f"{indent * 3}for {angle_carry_flat} in T.serial(lane, {heads * rope_angles}, "
@@ -6129,75 +6212,108 @@ def _append_row_phased_mamba3_body(
         f"{angle_cumsum}[{angle_carry_head}, {angle_carry_idx}]"
     )
     body.append(f"{indent * 3}T.sync_threads()")
-    body.append(
-        f"{indent * 3}for {trap_group_loop} in T.serial(lane, {groups}, "
-        f"step={thread_count}):"
-    )
-    body.append(f"{indent * 4}{trap_group}[{trap_group_loop}] = 0.0")
-    body.append(f"{indent * 4}for {head} in T.serial(0, {heads_per_group}):")
-    body.append(
-        f"{indent * 5}{accum}[0] = "
-        f"{trap_group_loop} * {heads_per_group} + {head}"
-    )
-    body.append(f"{indent * 5}{next_dt}[0] = 0.0")
-    body.append(f"{indent * 5}{next_trap}[0] = 0.0")
-    body.append(f"{indent * 5}if row + 1 < {int(shape_env.sequence_length)}:")
-    body.append(f"{indent * 6}for {hidden_dim_loop} in T.serial(0, {hidden_size}):")
-    next_hidden_expr = _node_indexed_positional_input_expr(
-        node,
-        0,
-        dtype_by_buffer,
-        access_by_buffer,
-        f"(row + 1) * {hidden_size} + {hidden_dim_loop}",
-    )
-    next_dt_weight_expr = _node_indexed_canonical_input_expr(
-        node,
-        "mamba3_in_proj_weight",
-        dtype_by_buffer,
-        access_by_buffer,
-        f"({dt_offset} + T.cast({accum}[0], \"int32\")) * {hidden_size} + "
-        f"{hidden_dim_loop}",
-    )
-    next_trap_weight_expr = _node_indexed_canonical_input_expr(
-        node,
-        "mamba3_in_proj_weight",
-        dtype_by_buffer,
-        access_by_buffer,
-        f"({trap_offset} + T.cast({accum}[0], \"int32\")) * {hidden_size} + "
-        f"{hidden_dim_loop}",
-    )
-    body.append(
-        f"{indent * 7}{next_dt}[0] = {next_dt}[0] + "
-        f"({next_hidden_expr} * {next_dt_weight_expr})"
-    )
-    body.append(
-        f"{indent * 7}{next_trap}[0] = {next_trap}[0] + "
-        f"({next_hidden_expr} * {next_trap_weight_expr})"
-    )
-    next_dt_bias = _node_indexed_canonical_input_expr(
-        node,
-        "mamba3_dt_bias",
-        dtype_by_buffer,
-        access_by_buffer,
-        f'T.cast({accum}[0], "int32")',
-    )
-    body.append(
-        f"{indent * 6}{next_dt}[0] = T.log(1.0 + "
-        f"T.exp({next_dt}[0] + {next_dt_bias}))"
-    )
-    body.append(
-        f"{indent * 5}{trap_group}[{trap_group_loop}] = "
-        f"{trap_group}[{trap_group_loop}] + "
-        f"(({next_dt}[0] * (1.0 - (1.0 / (1.0 + T.exp(-{next_trap}[0]))))) + "
-        f"({dt_vec}[T.cast({accum}[0], \"int32\")] * "
-        f"(1.0 / (1.0 + T.exp(-{projected}[{trap_offset} + "
-        f"T.cast({accum}[0], \"int32\")])))))"
-    )
-    body.append(
-        f"{indent * 4}{trap_group}[{trap_group_loop}] = "
-        f"{trap_group}[{trap_group_loop}] / "
-        f"{float(heads_per_group):.1f}"
-    )
+    if cuda_target:
+        # CUDA-only: the next-row dt/trap reductions were already done
+        # thread-parallel over `heads` above. This per-group reduction now just
+        # sums the precomputed `next_dt_vec`/`next_trap_vec` (no `hidden`-deep
+        # inner loop), so the whole trapezoid phase is cheap and no longer
+        # serializes the block on `groups` lanes. Same arithmetic as the Metal
+        # path below.
+        body.append(
+            f"{indent * 3}for {trap_group_loop} in T.serial(lane, {groups}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{trap_group}[{trap_group_loop}] = 0.0")
+        body.append(f"{indent * 4}for {head} in T.serial(0, {heads_per_group}):")
+        body.append(
+            f"{indent * 5}{accum}[0] = "
+            f"{trap_group_loop} * {heads_per_group} + {head}"
+        )
+        body.append(
+            f"{indent * 5}{trap_group}[{trap_group_loop}] = "
+            f"{trap_group}[{trap_group_loop}] + "
+            f"(({next_dt_vec}[T.cast({accum}[0], \"int32\")] * "
+            f"(1.0 - (1.0 / (1.0 + T.exp(-{next_trap_vec}["
+            f"T.cast({accum}[0], \"int32\")]))))) + "
+            f"({dt_vec}[T.cast({accum}[0], \"int32\")] * "
+            f"(1.0 / (1.0 + T.exp(-{projected}[{trap_offset} + "
+            f"T.cast({accum}[0], \"int32\")])))))"
+        )
+        body.append(
+            f"{indent * 4}{trap_group}[{trap_group_loop}] = "
+            f"{trap_group}[{trap_group_loop}] / "
+            f"{float(heads_per_group):.1f}"
+        )
+    else:
+        body.append(
+            f"{indent * 3}for {trap_group_loop} in T.serial(lane, {groups}, "
+            f"step={thread_count}):"
+        )
+        body.append(f"{indent * 4}{trap_group}[{trap_group_loop}] = 0.0")
+        body.append(f"{indent * 4}for {head} in T.serial(0, {heads_per_group}):")
+        body.append(
+            f"{indent * 5}{accum}[0] = "
+            f"{trap_group_loop} * {heads_per_group} + {head}"
+        )
+        body.append(f"{indent * 5}{next_dt}[0] = 0.0")
+        body.append(f"{indent * 5}{next_trap}[0] = 0.0")
+        body.append(f"{indent * 5}if row + 1 < {int(shape_env.sequence_length)}:")
+        body.append(f"{indent * 6}for {hidden_dim_loop} in T.serial(0, {hidden_size}):")
+        next_hidden_expr = _node_indexed_positional_input_expr(
+            node,
+            0,
+            dtype_by_buffer,
+            access_by_buffer,
+            f"(row + 1) * {hidden_size} + {hidden_dim_loop}",
+        )
+        next_dt_weight_expr = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_in_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"({dt_offset} + T.cast({accum}[0], \"int32\")) * {hidden_size} + "
+            f"{hidden_dim_loop}",
+        )
+        next_trap_weight_expr = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_in_proj_weight",
+            dtype_by_buffer,
+            access_by_buffer,
+            f"({trap_offset} + T.cast({accum}[0], \"int32\")) * {hidden_size} + "
+            f"{hidden_dim_loop}",
+        )
+        body.append(
+            f"{indent * 7}{next_dt}[0] = {next_dt}[0] + "
+            f"({next_hidden_expr} * {next_dt_weight_expr})"
+        )
+        body.append(
+            f"{indent * 7}{next_trap}[0] = {next_trap}[0] + "
+            f"({next_hidden_expr} * {next_trap_weight_expr})"
+        )
+        next_dt_bias = _node_indexed_canonical_input_expr(
+            node,
+            "mamba3_dt_bias",
+            dtype_by_buffer,
+            access_by_buffer,
+            f'T.cast({accum}[0], "int32")',
+        )
+        body.append(
+            f"{indent * 6}{next_dt}[0] = T.log(1.0 + "
+            f"T.exp({next_dt}[0] + {next_dt_bias}))"
+        )
+        body.append(
+            f"{indent * 5}{trap_group}[{trap_group_loop}] = "
+            f"{trap_group}[{trap_group_loop}] + "
+            f"(({next_dt}[0] * (1.0 - (1.0 / (1.0 + T.exp(-{next_trap}[0]))))) + "
+            f"({dt_vec}[T.cast({accum}[0], \"int32\")] * "
+            f"(1.0 / (1.0 + T.exp(-{projected}[{trap_offset} + "
+            f"T.cast({accum}[0], \"int32\")])))))"
+        )
+        body.append(
+            f"{indent * 4}{trap_group}[{trap_group_loop}] = "
+            f"{trap_group}[{trap_group_loop}] / "
+            f"{float(heads_per_group):.1f}"
+        )
     body.append(f"{indent * 3}T.sync_threads()")
     body.append(f"{indent * 3}# mamba3_bc_policy: rank_group_rmsnorm_rope")
     body.append(
