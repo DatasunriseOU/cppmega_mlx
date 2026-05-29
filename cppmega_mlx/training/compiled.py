@@ -1716,6 +1716,13 @@ class CompiledPretrainingStep:
         if path_c_gradient_probe is not None:
             self.attach_path_c_gradient_probe(path_c_gradient_probe)
         self._path_c_training_runtime: PathCTrainingRuntime | None = None
+        # Records whether the fused Path C runtime fell back to the eager
+        # loss_and_grad path (CUDA safety net; see ``_eager_step``).
+        self._path_c_runtime_fallback_count: int = 0
+        self._path_c_runtime_fallback_error: str | None = None
+        # Latched True once the fused runtime times out, so the remaining steps
+        # skip it entirely and use the eager baseline.
+        self._path_c_runtime_disabled: bool = False
         if path_c_training_runtime is not None:
             self.attach_path_c_training_runtime(path_c_training_runtime)
 
@@ -1958,6 +1965,117 @@ class CompiledPretrainingStep:
                 }
             )
 
+    def _run_fused_value_and_grad_guarded(
+        self,
+        runtime: PathCTrainingRuntime,
+        loss_batch: Mapping[str, mx.array],
+    ) -> tuple[tuple[mx.array, mx.array], Any] | None:
+        """Run the fused runtime value_and_grad under an exception (+ time) guard.
+
+        Returns the ``((loss, ntokens), grads)`` tuple on success, or ``None`` to
+        signal the caller should fall back to the eager loss_and_grad path.
+
+        The always-on guard is exception-based: if the fused runtime raises (e.g.
+        the MLX<->CUDA buffer handoff, incomplete fused gradient extraction, or a
+        CUDA launch/exec error surfaced by the bridge's explicit
+        ``torch.cuda.synchronize()``), we catch it and degrade to the eager
+        baseline so the run never regresses to steps_completed=0.
+
+        An OPTIONAL wall-clock watchdog is enabled only when
+        ``MLX_PATH_C_FUSED_STEP_TIMEOUT_S`` is set to a positive number. It runs
+        the fused call on a daemon worker thread and, on timeout, permanently
+        disables the fused runtime and falls back to eager. It is opt-in because
+        a CUDA kernel that is launched but does not return cannot be cancelled
+        in-process: the abandoned worker keeps the runaway kernel resident on the
+        GPU, starving the eager fallback. The clean default therefore runs the
+        fused call inline (no leaked kernel) and relies on the exception guard.
+        The first failure / timeout is recorded for reporting.
+        """
+
+        import os
+        import warnings
+
+        timeout_env = os.environ.get("MLX_PATH_C_FUSED_STEP_TIMEOUT_S")
+        timeout_s = 0.0
+        if timeout_env:
+            try:
+                timeout_s = float(timeout_env)
+            except (TypeError, ValueError):
+                timeout_s = 0.0
+
+        error: BaseException | None = None
+        if timeout_s > 0:
+            import threading
+
+            result_box: dict[str, Any] = {}
+
+            def _worker() -> None:
+                try:
+                    result_box["value"] = runtime.value_and_grad(
+                        self.model,
+                        loss_batch,
+                        self._loss_and_grad,
+                    )
+                except BaseException as exc:  # noqa: BLE001 - to main thread
+                    result_box["error"] = exc
+
+            worker = threading.Thread(
+                target=_worker, name="path-c-fused-value-and-grad", daemon=True
+            )
+            worker.start()
+            worker.join(timeout=timeout_s)
+
+            if worker.is_alive():
+                # Timed out — a runaway / impractically slow fused kernel. Abandon
+                # the worker (daemon) and permanently disable the fused runtime so
+                # every subsequent step uses the eager baseline.
+                self._path_c_runtime_disabled = True
+                if self._path_c_runtime_fallback_error is None:
+                    self._path_c_runtime_fallback_error = (
+                        f"fused value_and_grad exceeded {timeout_s:g}s budget"
+                    )
+                self._path_c_runtime_fallback_count += 1
+                warnings.warn(
+                    "Path C fused direct-chain runtime.value_and_grad exceeded the "
+                    f"{timeout_s:g}s budget; disabling the fused runtime and falling "
+                    "back to the eager loss_and_grad path for the rest of the run.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return None
+
+            error = result_box.get("error")
+            if error is None:
+                return result_box.get("value")
+        else:
+            try:
+                return runtime.value_and_grad(
+                    self.model,
+                    loss_batch,
+                    self._loss_and_grad,
+                )
+            except Exception as exc:  # pragma: no cover - hardware-specific path
+                error = exc
+
+        if error is not None:
+            if self._path_c_runtime_fallback_error is None:
+                self._path_c_runtime_fallback_error = (
+                    f"{type(error).__name__}: {error}"
+                )
+            self._path_c_runtime_fallback_count += 1
+            warnings.warn(
+                "Path C fused direct-chain runtime.value_and_grad failed; "
+                "falling back to the eager loss_and_grad path: "
+                f"{type(error).__name__}: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+
+        # Unreachable in practice: both the timeout and inline branches return on
+        # success above. Fall back to eager defensively if we ever get here.
+        return None
+
     def _eager_step(
         self,
         batch: CompiledBatch,
@@ -1966,14 +2084,24 @@ class CompiledPretrainingStep:
     ) -> tuple[mx.array, mx.array, Any]:
         loss_batch = cast(Mapping[str, mx.array], batch)
         runtime = self._path_c_training_runtime
-        if runtime is None:
+        if runtime is None or self._path_c_runtime_disabled:
             (loss, ntokens), grads = self._loss_and_grad(self.model, loss_batch)
         else:
-            (loss, ntokens), grads = runtime.value_and_grad(
-                self.model,
-                loss_batch,
-                self._loss_and_grad,
-            )
+            outcome = self._run_fused_value_and_grad_guarded(runtime, loss_batch)
+            if outcome is not None:
+                (loss, ntokens), grads = outcome
+            else:
+                # SAFETY FALLBACK: the fused Path C direct-chain runtime either
+                # raised or exceeded its wall-clock budget (e.g. the MLX<->CUDA
+                # buffer handoff, incomplete fused gradient extraction, or a
+                # pathologically slow / runaway fused kernel). Rather than
+                # aborting the whole run with steps_completed=0 we degrade to the
+                # working eager value_and_grad path (the same ops dispatched
+                # through the TileLang-CUDA EAGER kernels / pure-MLX reference),
+                # guaranteeing we never end up below the eager baseline.
+                (loss, ntokens), grads = self._loss_and_grad(
+                    self.model, loss_batch
+                )
         self._emit_path_c_gradients(grads)
         if self.split_grad_update_eval:
             mx.eval(loss, ntokens, grads)

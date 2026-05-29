@@ -6110,6 +6110,128 @@ def compile_path_c_direct_fusion_chain_artifacts(
     return tuple(artifacts)
 
 
+def _path_c_artifact_target_is_cuda(artifact: Any) -> bool:
+    """Return True iff a compiled direct-chain artifact targets CUDA.
+
+    The fused direct-chain runtime is identical on Metal and CUDA except for the
+    MLX<->kernel buffer handoff: Metal exports zero-copy Metal DLPack that the
+    Metal kernel consumes directly, whereas MLX on a CUDA host has no CUDA DLPack
+    export so the tvm-ffi adapter raises ``DLPackDeviceError`` (it sees Metal/host
+    DLPack but the kernel targets 'cuda'). This probe drives the CUDA-only
+    numpy-host-roundtrip bridge; if the target cannot be determined we return
+    ``False`` and leave the original (Metal) zero-copy call path untouched.
+    """
+
+    target = getattr(artifact, "target", None)
+    kind = getattr(target, "kind", None)
+    name = getattr(kind, "name", None)
+    if isinstance(name, str):
+        return name == "cuda"
+    text = str(target) if target is not None else ""
+    return "cuda" in text.lower()
+
+
+def _path_c_call_cuda_artifact_with_mlx_bridge(
+    *,
+    artifact: Any,
+    arrays: tuple[Any, ...],
+    kernel_arg_buffer_names: Mapping[int, tuple[str, tuple[int, ...] | None]],
+    buffers: dict[str, Any],
+    mx_module: Any,
+) -> Any:
+    """Call a CUDA direct-chain artifact across the MLX<->torch-CUDA bridge.
+
+    MLX on a CUDA host (e.g. gb10) is a CUDA build whose arrays only expose a
+    Metal/host DLPack buffer, so passing them to the compiled tvm-ffi CUDA kernel
+    raises ``DLPackDeviceError``. We reuse the EAGER per-op bridge
+    (``cppmega_mlx.nn._tilelang._cuda_eager``) to copy each caller-owned MLX
+    buffer arg to a contiguous torch CUDA tensor (numpy host roundtrip), invoke
+    the kernel with those torch tensors (no MLX array reaches the adapter, so the
+    Metal-DLPack guard is not triggered), and then reflect the kernel's in-place
+    writes back into the owning bank buffers in ``buffers`` — preserving the
+    direct-chain caller-owned in/out buffer ABI. Scalar args (gate / scalar
+    defaults) are passed through unchanged.
+
+    This is reachable only when :func:`_path_c_artifact_target_is_cuda` is True,
+    so the Apple/Metal zero-copy path never enters here.
+    """
+
+    from cppmega_mlx.nn._tilelang._cuda_eager import (
+        _mlx_to_torch_cuda,
+        _torch_cuda_to_mlx,
+    )
+
+    # Build the positional argument list with MLX buffers replaced by torch CUDA
+    # tensors. Remember which positions own a torch buffer so we can copy the
+    # kernel's results back afterwards.
+    torch_args: list[Any] = []
+    torch_buffer_slots: dict[int, tuple[str, Any]] = {}
+    for position, arg in enumerate(arrays):
+        if position in kernel_arg_buffer_names:
+            name, _expected_shape = kernel_arg_buffer_names[position]
+            torch_t = _mlx_to_torch_cuda(arg)
+            torch_args.append(torch_t)
+            torch_buffer_slots[position] = (name, torch_t)
+        else:
+            torch_args.append(arg)
+
+    result = artifact(*torch_args)
+
+    # Force the launched CUDA kernel(s) to complete (and surface any launch /
+    # execution error) before we copy the results back to the host. Without an
+    # explicit sync a kernel fault would otherwise only manifest later, inside an
+    # unrelated D2H copy, where it is much harder to attribute and to recover
+    # from via the eager fallback.
+    try:
+        import torch as _torch
+
+        _torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    # Reflect the kernel's in-place writes back into the caller-owned banks. The
+    # arg may have been a max-extent bank sliced down to this segment's declared
+    # shape (see ``_path_c_exact_kernel_buffer``); write the torch result into the
+    # matching contiguous prefix of the full bank so other segments that share the
+    # coalesced bank see consistent state.
+    for position, (name, torch_t) in torch_buffer_slots.items():
+        original = buffers.get(name)
+        if original is None:
+            continue
+        out_dtype = getattr(original, "dtype", None)
+        if out_dtype is None:
+            continue
+        updated = _torch_cuda_to_mlx(torch_t, out_dtype)
+        full_shape = tuple(int(d) for d in getattr(original, "shape", ()))
+        updated_size = int(getattr(updated, "size", 0) or 0)
+        full_size = 1
+        for dim in full_shape:
+            full_size *= int(dim)
+        if updated_size == full_size:
+            buffers[name] = mx_module.reshape(updated, full_shape)
+            continue
+        if updated_size < full_size:
+            # The kernel wrote a contiguous prefix view of a larger coalesced
+            # bank; stitch the updated prefix in front of the untouched tail.
+            flat_original = mx_module.reshape(original, (-1,))
+            flat_updated = mx_module.reshape(updated, (-1,))
+            tail = flat_original[updated_size:]
+            stitched = mx_module.concatenate([flat_updated, tail], axis=0)
+            buffers[name] = mx_module.reshape(stitched, full_shape)
+            continue
+        # Unexpected larger result: store as-is so a downstream validator reports.
+        buffers[name] = updated
+
+    buffer_outputs = tuple(
+        buffers[name]
+        for name, _ in torch_buffer_slots.values()
+        if name in buffers and hasattr(buffers[name], "shape")
+    )
+    if buffer_outputs:
+        mx_module.eval(*buffer_outputs)
+    return result
+
+
 def run_path_c_direct_fusion_chain_route(
     *,
     chain: Any,
@@ -6234,8 +6356,17 @@ def run_path_c_direct_fusion_chain_route(
         )
         run_backward_value = 1 if execution_phase == "backward" else 0
         kernel_call_args: list[Any] = []
+        # position -> (logical buffer name, expected kernel shape) for every
+        # caller-owned buffer arg. Used by the CUDA MLX<->torch bridge to write
+        # the kernel's in-place results back into the owning bank buffers
+        # (Metal is zero-copy so it does not need this).
+        kernel_arg_buffer_names: dict[int, tuple[str, tuple[int, ...] | None]] = {}
         for name in kernel_param_order:
             if name in buffers:
+                kernel_arg_buffer_names[len(kernel_call_args)] = (
+                    str(name),
+                    kernel_buffer_shapes.get(name),
+                )
                 kernel_call_args.append(
                     _path_c_exact_kernel_buffer(
                         buffers[name],
@@ -6256,8 +6387,25 @@ def run_path_c_direct_fusion_chain_route(
         buffer_arrays = tuple(arg for arg in arrays if hasattr(arg, "shape"))
         mx_module.eval(*buffer_arrays)
         segment_started = time.perf_counter()
-        result = artifact(*arrays)
-        mx_module.eval(*buffer_arrays)
+        # On a CUDA host MLX is a CUDA build with NO CUDA DLPack export, so the
+        # tvm-ffi adapter rejects MLX arrays for a non-Metal kernel
+        # (DLPackDeviceError). Bridge the MLX buffer args to torch CUDA tensors
+        # (numpy host roundtrip, reusing the EAGER _cuda_eager helpers), call
+        # the artifact, then reflect the kernel's in-place writes back into the
+        # caller-owned bank buffers. Strictly gated on target=="cuda" so the
+        # Metal zero-copy arg-assembly + call path below is byte-for-byte
+        # unchanged.
+        if _path_c_artifact_target_is_cuda(artifact):
+            result = _path_c_call_cuda_artifact_with_mlx_bridge(
+                artifact=artifact,
+                arrays=arrays,
+                kernel_arg_buffer_names=kernel_arg_buffer_names,
+                buffers=buffers,
+                mx_module=mx_module,
+            )
+        else:
+            result = artifact(*arrays)
+            mx_module.eval(*buffer_arrays)
         segment_results.append(
             {
                 "index": int(segment.index),
@@ -11352,6 +11500,27 @@ def run_local_gb10_quarter_training(
             "step_metrics": step_metrics,
             "kernel_dispatch": get_dispatch_log(),
             "stepper_state": stepper.state_dict(),
+            "path_c_fused_runtime_evidence": {
+                "fused_runtime_installed": (
+                    getattr(stepper, "_path_c_training_runtime", None) is not None
+                ),
+                "fused_runtime_fallback_count": int(
+                    getattr(stepper, "_path_c_runtime_fallback_count", 0)
+                ),
+                "fused_runtime_fallback_error": getattr(
+                    stepper, "_path_c_runtime_fallback_error", None
+                ),
+                "fused_runtime_disabled": bool(
+                    getattr(stepper, "_path_c_runtime_disabled", False)
+                ),
+                "fused_runtime_executed": (
+                    getattr(stepper, "_path_c_training_runtime", None) is not None
+                    and int(
+                        getattr(stepper, "_path_c_runtime_fallback_count", 0)
+                    )
+                    == 0
+                ),
+            },
             "compile": config.compile,
             "compile_enabled": compile_plan["enabled"],
             "compile_plan": compile_plan,
