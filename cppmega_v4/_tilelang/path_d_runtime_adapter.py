@@ -2416,7 +2416,18 @@ def gdn_fwd_runtime_call(
         )
     )
 
-    a = mx.empty((b * total_tokens * hv_heads * GDN_RUNTIME_BT,), dtype=mx.float16)
+    # kkt_solve writes only the lower-triangular (T_chunk x T_chunk) region of
+    # its per-chunk output; the strictly-upper lanes are structurally unused by
+    # recompute_w_u but MUST be finite, because downstream chunk GEMMs multiply
+    # the full matrix (0 * NaN == NaN). mx.empty leaves those lanes as whatever
+    # freed allocation MLX recycles -- and right after a heavy fp32 reference
+    # (the FLA-naive parity ref) that recycled memory contains NaN, which then
+    # poisons the whole pipeline (observed: kkt output a == NaN -> y == NaN, only
+    # when mx.eval(ref) runs first and reshuffles allocations). Zero-initialize a
+    # so the unwritten lanes are a hard 0, never recycled NaN. The fully-written
+    # buffers below stay mx.empty. RULE: never feed a partially-written buffer's
+    # uninitialized lanes into a kernel that reads the whole tensor.
+    a = mx.zeros((b * total_tokens * hv_heads * GDN_RUNTIME_BT,), dtype=mx.float16)
     w = mx.empty((b * total_tokens * hv_heads * k_dim,), dtype=mx.float16)
     u = mx.empty((b * total_tokens * hv_heads * v_dim,), dtype=mx.float16)
     v_new = mx.empty((b * total_tokens * hv_heads * v_dim,), dtype=mx.float16)
