@@ -1975,25 +1975,44 @@ class CompiledPretrainingStep:
         Returns the ``((loss, ntokens), grads)`` tuple on success, or ``None`` to
         signal the caller should fall back to the eager loss_and_grad path.
 
-        The always-on guard is exception-based: if the fused runtime raises (e.g.
-        the MLX<->CUDA buffer handoff, incomplete fused gradient extraction, or a
-        CUDA launch/exec error surfaced by the bridge's explicit
-        ``torch.cuda.synchronize()``), we catch it and degrade to the eager
-        baseline so the run never regresses to steps_completed=0.
+        RULE #1 (fail fast, fail loud): a fused-runtime crash is a *real bug* in
+        the selected Path C kernel / bridge. By DEFAULT this method therefore
+        RAISES with where+what instead of silently substituting an eager result
+        that looks fine but hides the broken fused path. Surfacing the bug is the
+        priority.
+
+        The eager degrade is retained ONLY as an explicit, opt-in bisection
+        escape, enabled by setting ``MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE`` to a
+        truthy value (``1``/``true``/``yes``/``on``). When opted in, a fused
+        crash is *loudly* degraded to eager — a ``RuntimeWarning`` is emitted and
+        the receipt fields (``_path_c_runtime_fallback_count`` /
+        ``_path_c_runtime_fallback_error``, surfaced as
+        ``path_c_fused_runtime_evidence`` in the train-step report) record that
+        the run used a degraded path. This is for deliberate bisection only; it
+        is never the silent default.
 
         An OPTIONAL wall-clock watchdog is enabled only when
         ``MLX_PATH_C_FUSED_STEP_TIMEOUT_S`` is set to a positive number. It runs
-        the fused call on a daemon worker thread and, on timeout, permanently
-        disables the fused runtime and falls back to eager. It is opt-in because
-        a CUDA kernel that is launched but does not return cannot be cancelled
-        in-process: the abandoned worker keeps the runaway kernel resident on the
-        GPU, starving the eager fallback. The clean default therefore runs the
-        fused call inline (no leaked kernel) and relies on the exception guard.
-        The first failure / timeout is recorded for reporting.
+        the fused call on a daemon worker thread and, on timeout, treats the
+        runaway fused kernel exactly like a crash: RAISE by default, or (with the
+        opt-in degrade env) permanently disable the fused runtime and fall back
+        to eager. The watchdog is opt-in because a CUDA kernel that is launched
+        but does not return cannot be cancelled in-process: the abandoned worker
+        keeps the runaway kernel resident on the GPU. The clean default therefore
+        runs the fused call inline (no leaked kernel) and relies on the exception
+        guard. The first failure / timeout is recorded for reporting.
         """
 
         import os
         import warnings
+
+        degrade_env = os.environ.get("MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE", "")
+        allow_eager_degrade = degrade_env.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
         timeout_env = os.environ.get("MLX_PATH_C_FUSED_STEP_TIMEOUT_S")
         timeout_s = 0.0
@@ -2026,19 +2045,37 @@ class CompiledPretrainingStep:
             worker.join(timeout=timeout_s)
 
             if worker.is_alive():
-                # Timed out — a runaway / impractically slow fused kernel. Abandon
-                # the worker (daemon) and permanently disable the fused runtime so
-                # every subsequent step uses the eager baseline.
-                self._path_c_runtime_disabled = True
+                # Timed out — a runaway / impractically slow fused kernel. This is
+                # a real bug in the fused Path C kernel/bridge.
+                timeout_detail = (
+                    f"fused value_and_grad exceeded {timeout_s:g}s budget"
+                )
                 if self._path_c_runtime_fallback_error is None:
-                    self._path_c_runtime_fallback_error = (
-                        f"fused value_and_grad exceeded {timeout_s:g}s budget"
-                    )
+                    self._path_c_runtime_fallback_error = timeout_detail
                 self._path_c_runtime_fallback_count += 1
+                if not allow_eager_degrade:
+                    # RULE #1: surface the runaway fused kernel instead of
+                    # silently degrading to eager.
+                    raise RuntimeError(
+                        "Path C fused direct-chain runtime.value_and_grad timed out "
+                        f"in CompiledPretrainingStep._run_fused_value_and_grad_guarded "
+                        f"({timeout_detail}). Refusing to silently fall back to the "
+                        "eager loss_and_grad path (RULE #1) — this points at a runaway "
+                        "or pathologically slow fused Path C kernel/bridge. Set "
+                        "MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE=1 to opt into a loud "
+                        "eager degrade for bisection only."
+                    )
+                # Opt-in bisection escape: abandon the worker (daemon) and
+                # permanently disable the fused runtime so every subsequent step
+                # uses the eager baseline. LOUD (warning + receipt fields).
+                self._path_c_runtime_disabled = True
                 warnings.warn(
                     "Path C fused direct-chain runtime.value_and_grad exceeded the "
-                    f"{timeout_s:g}s budget; disabling the fused runtime and falling "
-                    "back to the eager loss_and_grad path for the rest of the run.",
+                    f"{timeout_s:g}s budget; MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE is "
+                    "set, so disabling the fused runtime and degrading to the eager "
+                    "loss_and_grad path for the rest of the run (bisection mode). The "
+                    "underlying fused-kernel bug is NOT fixed; the receipt field "
+                    "path_c_fused_runtime_evidence records this degraded run.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -2063,18 +2100,40 @@ class CompiledPretrainingStep:
                     f"{type(error).__name__}: {error}"
                 )
             self._path_c_runtime_fallback_count += 1
+            if not allow_eager_degrade:
+                # RULE #1: a fused-runtime crash is a real bug in the selected
+                # Path C kernel/bridge. Surface it instead of silently producing
+                # an eager result that masks the broken fused path.
+                raise RuntimeError(
+                    "Path C fused direct-chain runtime.value_and_grad crashed in "
+                    "CompiledPretrainingStep._run_fused_value_and_grad_guarded "
+                    f"({type(error).__name__}: {error}). Refusing to silently fall "
+                    "back to the eager loss_and_grad path (RULE #1) — this points at "
+                    "a real bug in the fused Path C kernel/bridge (e.g. the MLX<->CUDA "
+                    "buffer handoff, incomplete fused gradient extraction, or a CUDA "
+                    "launch/exec error). Set MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE=1 to "
+                    "opt into a loud eager degrade for bisection only."
+                ) from error
+            # Opt-in bisection escape: LOUD degrade (warning + receipt fields).
             warnings.warn(
                 "Path C fused direct-chain runtime.value_and_grad failed; "
-                "falling back to the eager loss_and_grad path: "
-                f"{type(error).__name__}: {error}",
+                "MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE is set, so degrading to the "
+                "eager loss_and_grad path (bisection mode). The underlying fused "
+                "bug is NOT fixed; path_c_fused_runtime_evidence records this "
+                f"degraded run: {type(error).__name__}: {error}",
                 RuntimeWarning,
                 stacklevel=2,
             )
             return None
 
         # Unreachable in practice: both the timeout and inline branches return on
-        # success above. Fall back to eager defensively if we ever get here.
-        return None
+        # success above. If we somehow reach here, fail loud rather than silently
+        # degrade to eager (RULE #1).
+        raise RuntimeError(
+            "CompiledPretrainingStep._run_fused_value_and_grad_guarded reached an "
+            "unreachable state: the fused runtime neither returned a result nor "
+            "recorded an error. This is an internal control-flow bug."
+        )
 
     def _eager_step(
         self,
@@ -2091,14 +2150,15 @@ class CompiledPretrainingStep:
             if outcome is not None:
                 (loss, ntokens), grads = outcome
             else:
-                # SAFETY FALLBACK: the fused Path C direct-chain runtime either
-                # raised or exceeded its wall-clock budget (e.g. the MLX<->CUDA
-                # buffer handoff, incomplete fused gradient extraction, or a
-                # pathologically slow / runaway fused kernel). Rather than
-                # aborting the whole run with steps_completed=0 we degrade to the
-                # working eager value_and_grad path (the same ops dispatched
-                # through the TileLang-CUDA EAGER kernels / pure-MLX reference),
-                # guaranteeing we never end up below the eager baseline.
+                # OPT-IN BISECTION DEGRADE ONLY: this branch is reachable solely
+                # when MLX_PATH_C_FUSED_ALLOW_EAGER_DEGRADE is set. By default
+                # _run_fused_value_and_grad_guarded RAISES on a fused crash/timeout
+                # (RULE #1 — surface the bug) instead of returning None. When the
+                # operator has explicitly opted into the loud bisection degrade,
+                # the fused Path C direct-chain runtime raised or exceeded its
+                # wall-clock budget; we degrade to the eager value_and_grad path
+                # (already warned + recorded in path_c_fused_runtime_evidence) so a
+                # deliberate bisection run completes rather than aborting.
                 (loss, ntokens), grads = self._loss_and_grad(
                     self.model, loss_batch
                 )
