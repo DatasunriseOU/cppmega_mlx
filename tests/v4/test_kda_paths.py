@@ -9,6 +9,7 @@ import pytest
 from cppmega_v4._tilelang.kda_path_b import kda_forward_path_b
 from cppmega_v4._tilelang.kda_path_c import (
     _path_c_runtime_status as kda_path_c_runtime,
+    _tilelang_importable as kda_tilelang_importable,
 )
 from cppmega_v4._tilelang.kda_path_d import (
     _fla_kda_chunk_importable,
@@ -194,6 +195,37 @@ def test_kda_path_c_fallback_matches_path_a():
     )
     o_ref, _ = naive_recurrent_kda(q, k, v, g, beta)
     np.testing.assert_array_equal(np.array(o_disp), np.array(o_ref))
+
+
+@pytest.mark.skipif(
+    not kda_tilelang_importable()[0],
+    reason="tilelang not importable in this env",
+)
+def test_kda_path_c_real_kernel_parity_with_path_a():
+    """Real @T.prim_func KDA Path C parity vs the FLA-naive reference.
+
+    Uses L2-normalised q/k (the production conditioning for KDA — q and k are
+    always normalised in the real architecture) so the delta-rule recurrence
+    stays bounded and fp32 reassociation between the Metal kernel and the MLX
+    reference is at the 1e-6 level rather than tripping on an exploded state.
+    """
+    from cppmega_v4._tilelang.kda_path_c import _kda_fwd_path_c_call
+
+    B, T, H, HV, K, V = 1, 16, 2, 4, 64, 64
+    rng = np.random.default_rng(73)
+
+    def _l2n(x):
+        return x / (mx.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
+
+    q = _l2n(mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32)))
+    k = _l2n(mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32)))
+    v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
+    g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
+    beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
+    o_c, _ = _kda_fwd_path_c_call(q, k, v, g, beta)
+    o_a, _ = naive_recurrent_kda(q, k, v, g, beta)
+    mx.eval(o_c, o_a)
+    np.testing.assert_allclose(np.array(o_c), np.array(o_a), atol=1e-4, rtol=1e-3)
 
 
 # ----- Path D (Triton frontend) -----

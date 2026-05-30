@@ -136,12 +136,18 @@ def test_gdn_dispatch_returns_same_as_path_a():
 
 @pytest.mark.parametrize("path", ["path_a", "path_b", "path_c", "path_d", "path_e"])
 def test_gdn_dispatch_each_path_runs(path):
-    """Each forced path must return finite, correctly-shaped output."""
+    """Each forced path must return finite, correctly-shaped output.
+
+    The GDN gate is parameterised as decay = exp(g) <= 1, so g must be <= 0
+    (a g>0 amplifying gate has no real pre-image under softplus_inverse(-g),
+    and Path E correctly RAISES per RULE #1 rather than silently clamping).
+    Use a physically-valid non-positive gate so every forced path runs.
+    """
     q = mx.random.normal((1, 4, 2, 4))
     k = mx.random.normal((1, 4, 2, 4))
     v = mx.random.normal((1, 4, 2, 4))
-    beta = mx.random.normal((1, 4, 2))
-    g = mx.random.normal((1, 4, 2)) * 0.1
+    beta = mx.sigmoid(mx.random.normal((1, 4, 2)))
+    g = -mx.abs(mx.random.normal((1, 4, 2)) * 0.1)
     o, _ = gated_delta_recurrent_dispatch(q, k, v, beta, g, path=path)
     assert o.shape == (1, 4, 2, 4)
     assert not bool(mx.any(mx.isnan(o)).item())
