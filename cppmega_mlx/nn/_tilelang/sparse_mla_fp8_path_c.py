@@ -2558,7 +2558,12 @@ def _owner_output_graph_tuple(
 
 
 def _flat_1d_view(array: mx.array) -> mx.array:
-    return array.reshape((int(array.size),))
+    # reshape preserves the non-contiguity of prepared FP8 inputs
+    # (q_fp8/kv_fp8 produced by per-token/tensor scaling), and tvm-ffi DLPack
+    # rejects non-contiguous tensors.  mx.contiguous is a no-op when the array
+    # is already contiguous and preserves dtype, so the 1-D view is always a
+    # contiguous DLPack-exportable buffer.
+    return mx.contiguous(array.reshape((int(array.size),)))
 
 
 def _clear_fp8_bwd_dkv_buffer(dkv_buffer: mx.array) -> mx.array:
@@ -2624,9 +2629,16 @@ def _dispatch_fp8_bwd_owner_output_path_c(
     dkv_needs_clear = True
     graph_output_route = False
     if dq_buffer is None and dkv_buffer is None:
+        # GRAPH-OUTPUT route: no caller-owned buffers were supplied.  Allocating
+        # the dkv output via tvm-ffi out_idx hands back uninitialized (NaN-poison)
+        # memory, and the bwd kernel's T.atomic_add scatters *accumulating* into
+        # dkv -- so the buffer MUST be pre-zeroed.  Allocate the gradient buffers
+        # here (mx.zeros, native graph outputs) and route through the same
+        # owner-output dispatch with a zeroed dkv, making the graph route
+        # self-clearing regardless of allocator state.
         graph_output_route = True
-        dq_owner = None
-        dkv_owner = None
+        dq_owner = mx.zeros(dq_shape, dtype=mx.float32)
+        dkv_owner = mx.zeros(dkv_shape, dtype=mx.float32)
         dkv_needs_clear = False
     elif (dq_buffer is None) != (dkv_buffer is None):
         raise SparseMLAFp8PathCDirectError(
@@ -2660,54 +2672,42 @@ def _dispatch_fp8_bwd_owner_output_path_c(
             d_out_dtype,
             index_dtype,
         )
-        if graph_output_route:
-            dq_flat = None
-            dkv_flat = None
-            returned = kernel(
-                _flat_1d_view(q_fp8),
-                _flat_1d_view(q_scale),
-                _flat_1d_view(kv_fp8),
-                _flat_1d_view(kv_scale),
-                _flat_1d_view(d_out),
-                _flat_1d_view(indices),
-                sm_scale_buf,
-            )
-        else:
-            if dkv_needs_clear:
-                dkv_owner = _clear_fp8_bwd_dkv_buffer(cast(mx.array, dkv_owner))
-            dq_flat = _flat_1d_view(cast(mx.array, dq_owner))
-            dkv_flat = _flat_1d_view(cast(mx.array, dkv_owner))
-            returned = kernel(
-                _flat_1d_view(q_fp8),
-                _flat_1d_view(q_scale),
-                _flat_1d_view(kv_fp8),
-                _flat_1d_view(kv_scale),
-                _flat_1d_view(d_out),
-                _flat_1d_view(indices),
-                sm_scale_buf,
-                out=(dq_flat, dkv_flat),
-            )
+        # Both routes now dispatch into pre-zeroed owner buffers via out=:
+        # the graph route zeroed dq/dkv at allocation above; the owner route
+        # zero-clears the caller's dkv via the dedicated clear kernel.  This
+        # guarantees the bwd kernel's accumulating atomic_add into dkv always
+        # starts from zero instead of NaN-poison freed memory.
+        if dkv_needs_clear:
+            dkv_owner = _clear_fp8_bwd_dkv_buffer(cast(mx.array, dkv_owner))
+        dq_flat = _flat_1d_view(cast(mx.array, dq_owner))
+        dkv_flat = _flat_1d_view(cast(mx.array, dkv_owner))
+        returned = kernel(
+            _flat_1d_view(q_fp8),
+            _flat_1d_view(q_scale),
+            _flat_1d_view(kv_fp8),
+            _flat_1d_view(kv_scale),
+            _flat_1d_view(d_out),
+            _flat_1d_view(indices),
+            sm_scale_buf,
+            out=(dq_flat, dkv_flat),
+        )
     except Exception as exc:
         if force_path_c:
+            route_label = (
+                "graph-output (self-allocated zeroed buffers)"
+                if graph_output_route
+                else "caller-owned"
+            )
             raise RuntimeError(
-                "sparse_mla_fp8_bwd_path_c: direct tvm-ffi owner-output "
+                f"sparse_mla_fp8_bwd_path_c: direct tvm-ffi {route_label} "
                 f"dispatch failed: {type(exc).__name__}: {exc}"
             ) from exc
         return None
-    if graph_output_route:
-        if not isinstance(returned, (list, tuple)) or len(returned) != 2:
-            raise SparseMLAFp8PathCDirectError(
-                "direct tvm-ffi FP8 Sparse-MLA backward graph-output route "
-                "did not return dq/dkv"
-            )
-        dq_flat = cast(mx.array, returned[0])
-        dkv_flat = cast(mx.array, returned[1])
-    else:
-        dq_flat, dkv_flat = _owner_output_graph_tuple(
-            returned,
-            expected=(cast(mx.array, dq_flat), cast(mx.array, dkv_flat)),
-            op_name="direct tvm-ffi FP8 Sparse-MLA backward",
-        )
+    dq_flat, dkv_flat = _owner_output_graph_tuple(
+        returned,
+        expected=(cast(mx.array, dq_flat), cast(mx.array, dkv_flat)),
+        op_name="direct tvm-ffi FP8 Sparse-MLA backward",
+    )
     return dq_flat.reshape(dq_shape), dkv_flat.reshape(dkv_shape)
 
 
