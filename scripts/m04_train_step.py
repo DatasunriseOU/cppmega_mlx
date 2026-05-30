@@ -6419,6 +6419,30 @@ def run_path_c_direct_fusion_chain_route(
                 "result_type": type(result).__name__,
             }
         )
+    # CUDA-only write-back fix: the MLX<->torch bridge replaces caller-owned bank
+    # arrays with NEW mlx arrays holding the kernel results, living only in the
+    # route-local ``buffers`` dict. Metal mutates the owner's arrays in-place
+    # (zero-copy) and needs none of this. The caller
+    # (PathCDirectFusionChainTrainingRuntime.value_and_grad) re-reads
+    # ``logical_owner.buffers`` after the forward route to seed the loss bridge
+    # and backward, so without reflecting the writes back the fused forward
+    # outputs are silently dropped -> degenerate loss -> near-zero fused grads.
+    # CUDA-gated so Metal is byte-for-byte unchanged.
+    # (env CPPMEGA_PATH_C_DISABLE_CUDA_WRITEBACK=1 disables it to reproduce the
+    #  pre-fix broken state for verification calibration.)
+    if (
+        _path_c_default_target() == "cuda"
+        and os.environ.get("CPPMEGA_PATH_C_DISABLE_CUDA_WRITEBACK", "") != "1"
+    ):
+        for _target_map in (getattr(logical_owner, "buffers", None), logical_buffers):
+            if _target_map is None:
+                continue
+            try:
+                for _name, _value in buffers.items():
+                    _target_map[_name] = _value
+            except (TypeError, AttributeError):
+                # immutable mapping (e.g. MappingProxyType): cannot write back.
+                pass
     return {
         "status": "ok",
         "runtime_uses_direct_fusion_chain": True,
