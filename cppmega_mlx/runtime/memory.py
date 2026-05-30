@@ -273,11 +273,14 @@ def memory_limit_api_status(mx_module: Any | None = None) -> MemoryLimitApiStatu
     root_memory_limit_available = callable(getattr(mx, "set_memory_limit", None))
     metal = getattr(mx, "metal", None)
     metal_memory_limit_available = callable(getattr(metal, "set_memory_limit", None))
+    # List the non-deprecated root setter first so ``preferred_*`` reflects what
+    # ``apply_memory_limit_plan`` actually calls. ``mx.metal.set_memory_limit`` is
+    # only retained as a fallback for older MLX without ``mx.set_memory_limit``.
     supported_paths: list[str] = []
-    if metal_memory_limit_available:
-        supported_paths.append("mx.metal.set_memory_limit")
     if root_memory_limit_available:
         supported_paths.append("mx.set_memory_limit")
+    if metal_memory_limit_available:
+        supported_paths.append("mx.metal.set_memory_limit")
     return MemoryLimitApiStatus(
         wired_limit_available=callable(getattr(mx, "set_wired_limit", None)),
         root_memory_limit_available=root_memory_limit_available,
@@ -362,12 +365,16 @@ def apply_memory_limit_plan(
     metal_set_memory_limit = getattr(metal, "set_memory_limit", None)
     if not callable(set_wired_limit):
         raise RuntimeError("mlx.core.set_wired_limit is unavailable")
-    if callable(metal_set_memory_limit):
-        set_memory_limit = metal_set_memory_limit
-        memory_limit_api_path = "mx.metal.set_memory_limit"
-    elif callable(root_set_memory_limit):
+    # Prefer the non-deprecated root setter. ``mx.metal.set_memory_limit`` is
+    # deprecated in current MLX releases and emits a DeprecationWarning that, under
+    # ``-W error``, fails every cell that applies a memory limit. Fall back to the
+    # metal namespace only on older MLX that lacks ``mx.set_memory_limit``.
+    if callable(root_set_memory_limit):
         set_memory_limit = root_set_memory_limit
         memory_limit_api_path = "mx.set_memory_limit"
+    elif callable(metal_set_memory_limit):
+        set_memory_limit = metal_set_memory_limit
+        memory_limit_api_path = "mx.metal.set_memory_limit"
     else:
         raise RuntimeError("no supported MLX memory limit setter is available")
 

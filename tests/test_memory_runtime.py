@@ -191,18 +191,20 @@ def test_apply_memory_limit_plan_sets_both_limits_when_explicit() -> None:
     assert fake.metal.calls == [850]
 
 
-def test_apply_memory_limit_plan_prefers_metal_memory_limit_api() -> None:
+def test_apply_memory_limit_plan_prefers_root_memory_limit_api() -> None:
+    # When both setters exist, the non-deprecated ``mx.set_memory_limit`` wins so
+    # the deprecated ``mx.metal.set_memory_limit`` warning never fires under -W error.
     fake = _FakeMLXWithRootMemoryLimit()
     plan = memory_limit_plan(1000)
 
     result = apply_memory_limit_plan(plan, mx_module=fake, apply=True)
 
     assert result.previous_wired_limit_bytes == 123
-    assert result.previous_metal_limit_bytes == 456
-    assert result.metal_limit_api_path == "mx.metal.set_memory_limit"
+    assert result.previous_metal_limit_bytes == 789
+    assert result.metal_limit_api_path == "mx.set_memory_limit"
     assert fake.calls == [700]
-    assert fake.root_memory_calls == []
-    assert fake.metal.calls == [850]
+    assert fake.root_memory_calls == [850]
+    assert fake.metal.calls == []
 
 
 def test_apply_memory_limit_plan_rejects_missing_apis() -> None:
@@ -246,15 +248,15 @@ def test_memory_limit_api_status_reports_root_and_compat_paths() -> None:
         wired_limit_available=True,
         root_memory_limit_available=True,
         metal_memory_limit_available=True,
-        preferred_memory_limit_api_path="mx.metal.set_memory_limit",
+        preferred_memory_limit_api_path="mx.set_memory_limit",
         supported_memory_limit_api_paths=(
-            "mx.metal.set_memory_limit",
             "mx.set_memory_limit",
+            "mx.metal.set_memory_limit",
         ),
     )
     assert status.to_dict()["supported_memory_limit_api_paths"] == [
-        "mx.metal.set_memory_limit",
         "mx.set_memory_limit",
+        "mx.metal.set_memory_limit",
     ]
 
 

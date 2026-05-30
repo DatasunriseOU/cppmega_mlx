@@ -289,6 +289,23 @@ FP8_PATH_B_KERNEL_POLICY_ENV = {
 SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
 SPARSE_MLA_FP8_BWD_ENV = "CPPMEGA_SPARSE_MLA_FP8_BWD"
 MAMBA3_PATH_C_BWD_ENV = "CPPMEGA_MAMBA3_PATH_C_BWD"
+# Long-sequence safety gate for the FP8 Path C AUTO route. At seq>=2048 the
+# row-phased replay/recompute arenas plus the fp32-mandatory q_scale/kv_scale/
+# lse/state banks make FP8 Path C peak memory explode to ~159-171 GB (~5x the
+# bf16 Path C peak) and run slower than FP8 Path B. The AUTO route therefore
+# fails closed to the FP8 Path B reference baseline at long sequence lengths.
+# Override the threshold with CPPMEGA_FP8_PATH_C_MAX_SEQ_LEN (set 0 to disable
+# the gate entirely). The gate is AUTO-only: an explicit Path C runtime opt-in
+# (--use-path-c-direct-chain-runtime / --use-path-c-fused-train-block-runtime)
+# always bypasses it.
+FP8_PATH_C_MAX_SEQ_LEN_ENV = "CPPMEGA_FP8_PATH_C_MAX_SEQ_LEN"
+# Set by run_receipt() from the --use-path-c-*-runtime args so that downstream
+# gate evaluations driven by the (flag-less) TrainHybridTinyConfig still observe
+# the explicit operator override and bypass the AUTO long-seq gate.
+FP8_PATH_C_EXPLICIT_OVERRIDE_ENV = "CPPMEGA_FP8_PATH_C_EXPLICIT_RUNTIME_OVERRIDE"
+FP8_PATH_C_LONG_SEQ_GATE_DEFAULT = 2048
+FP8_PATH_C_LONG_SEQ_GATE_FALLBACK_DTYPE = FP8_PATH_B_DTYPE
+FP8_PATH_C_LONG_SEQ_GATE_STATUS = "fp8_path_c_auto_long_seq_gated_to_path_b"
 FP8_PATH_C_RUNTIME_ENV: dict[str, str] = {
     SPARSE_MLA_FP8_ROUTE_ENV: "path_c",
     SPARSE_MLA_FP8_BWD_ENV: "path_c",
@@ -742,16 +759,147 @@ def optimizer_variant_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def fp8_path_c_dtype_requested(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
+    """Return whether the CLI/config dtype names the FP8 Path C route.
+
+    This is the raw dtype check before the long-sequence AUTO safety gate. Use
+    :func:`fp8_path_c_route_requested` for the effective decision that honors the
+    gate.
+    """
+
+    return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_C_DTYPE
+
+
+def fp8_path_c_explicit_runtime_override(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
+    """Return whether an explicit Path C runtime opt-in is present.
+
+    The two ``--use-path-c-*-runtime`` flags install the Path C value_and_grad
+    runtime on the actual training critical path. They are explicit operator
+    overrides, so they bypass the AUTO long-sequence safety gate.
+
+    The flags live only on the argparse namespace; ``run_receipt`` mirrors them
+    into :data:`FP8_PATH_C_EXPLICIT_OVERRIDE_ENV` so the same decision holds when
+    the gate is evaluated against the flag-less ``TrainHybridTinyConfig``.
+    """
+
+    if (
+        getattr(args, "use_path_c_direct_chain_runtime", False)
+        or getattr(args, "use_path_c_fused_train_block_runtime", False)
+    ):
+        return True
+    return os.environ.get(FP8_PATH_C_EXPLICIT_OVERRIDE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def fp8_path_c_max_seq_len() -> int:
+    """Return the FP8 Path C AUTO long-sequence gate threshold.
+
+    Defaults to :data:`FP8_PATH_C_LONG_SEQ_GATE_DEFAULT` (2048). Override with the
+    ``CPPMEGA_FP8_PATH_C_MAX_SEQ_LEN`` env var. A value of ``0`` (or any
+    non-positive integer) disables the gate.
+    """
+
+    raw = os.environ.get(FP8_PATH_C_MAX_SEQ_LEN_ENV)
+    if raw is None or raw.strip() == "":
+        return FP8_PATH_C_LONG_SEQ_GATE_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{FP8_PATH_C_MAX_SEQ_LEN_ENV} must be an integer sequence length"
+        ) from exc
+    return value
+
+
+def fp8_path_c_long_seq_gate(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> dict[str, Any]:
+    """Evaluate the FP8 Path C AUTO long-sequence safety gate.
+
+    The gate only applies to the AUTO FP8 Path C dtype route. It fails closed to
+    the FP8 Path B reference baseline when the configured sequence length reaches
+    the threshold, because FP8 Path C peak memory explodes (~5x bf16 Path C) and
+    runs slower than Path B at long sequence lengths. An explicit Path C runtime
+    opt-in bypasses the gate, and a non-positive threshold disables it.
+
+    Returns a receipt-shaped payload. ``gated`` is True only when the route is
+    actively being refused.
+    """
+
+    dtype_requested = fp8_path_c_dtype_requested(args)
+    explicit_override = fp8_path_c_explicit_runtime_override(args)
+    threshold = fp8_path_c_max_seq_len()
+    seq_len = int(getattr(args, "seq_len", 0) or 0)
+    gate_enabled = threshold > 0
+    gated = (
+        dtype_requested
+        and gate_enabled
+        and not explicit_override
+        and seq_len >= threshold
+    )
+    reason: str | None = None
+    if gated:
+        reason = (
+            f"FP8 Path C AUTO route refused: seq_len={seq_len} >= "
+            f"{FP8_PATH_C_MAX_SEQ_LEN_ENV}={threshold}. FP8 Path C peak memory "
+            f"explodes (~5x bf16 Path C, 159-171 GB observed at seq=2048) and is "
+            f"slower than FP8 Path B at long sequence lengths; falling back to the "
+            f"FP8 Path B reference baseline. Pass an explicit Path C runtime "
+            f"opt-in (--use-path-c-direct-chain-runtime / "
+            f"--use-path-c-fused-train-block-runtime) or set "
+            f"{FP8_PATH_C_MAX_SEQ_LEN_ENV}=0 to override."
+        )
+    return {
+        "gated": gated,
+        "dtype_requested": dtype_requested,
+        "explicit_override": explicit_override,
+        "gate_enabled": gate_enabled,
+        "threshold": threshold,
+        "seq_len": seq_len,
+        "fallback_dtype": FP8_PATH_C_LONG_SEQ_GATE_FALLBACK_DTYPE if gated else None,
+        "status": FP8_PATH_C_LONG_SEQ_GATE_STATUS if gated else "not_gated",
+        "env": FP8_PATH_C_MAX_SEQ_LEN_ENV,
+        "reason": reason,
+    }
+
+
 def fp8_path_c_route_requested(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> bool:
-    return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_C_DTYPE
+    """Return the effective FP8 Path C route decision (AUTO gate applied).
+
+    Equals the raw dtype request unless the AUTO long-sequence safety gate fires,
+    in which case the route fails closed to the FP8 Path B baseline.
+    """
+
+    if not fp8_path_c_dtype_requested(args):
+        return False
+    return not fp8_path_c_long_seq_gate(args)["gated"]
+
+
+def fp8_path_c_route_gated_to_path_b(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+) -> bool:
+    """Return whether an FP8 Path C request was demoted to Path B by the gate."""
+
+    return fp8_path_c_dtype_requested(args) and fp8_path_c_long_seq_gate(args)["gated"]
 
 
 def fp8_path_b_route_requested(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> bool:
-    return str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_B_DTYPE
+    if str(getattr(args, "dtype", "")).strip().lower() == FP8_PATH_B_DTYPE:
+        return True
+    # A long-seq-gated FP8 Path C request fails closed onto the Path B baseline.
+    return fp8_path_c_route_gated_to_path_b(args)
 
 
 def fp8_training_route_requested(
@@ -1232,7 +1380,8 @@ def precision_route_payload(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ) -> dict[str, Any]:
     if fp8_path_b_route_requested(args):
-        return {
+        long_seq_gate = fp8_path_c_long_seq_gate(args)
+        payload = {
             "requested": FP8_PATH_B_DTYPE,
             "kind": "fp8_path_b_reference_baseline",
             "status": FP8_PATH_B_E2E_TRAINING_STATUS,
@@ -1246,6 +1395,14 @@ def precision_route_payload(
             "hidden_wrapper_quantization_allowed": False,
             "kernel_boundary_quantization_allowed": False,
         }
+        if long_seq_gate["gated"]:
+            # The user asked for FP8 Path C but the AUTO long-seq gate demoted the
+            # route to the Path B reference baseline; record why for the receipt.
+            payload["requested"] = FP8_PATH_C_DTYPE
+            payload["kind"] = "fp8_path_c_auto_long_seq_gated_to_path_b"
+            payload["status"] = long_seq_gate["status"]
+            payload["fp8_path_c_long_seq_gate"] = long_seq_gate
+        return payload
     if fp8_path_c_route_requested(args):
         producer = sparse_mla_fp8_producer_payload(args)
         producer_configured = bool(producer["configured"])
@@ -10861,6 +11018,13 @@ def run_receipt(
     local_gb10_route_fn: Callable[..., tuple[dict[str, Any], int]] | None = None,
     allocation_probe_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], int]:
+    # Mirror the explicit Path C runtime opt-in onto the environment so the AUTO
+    # long-seq gate makes the same decision whether it is evaluated against the
+    # argparse namespace or the flag-less TrainHybridTinyConfig.
+    if fp8_path_c_explicit_runtime_override(args):
+        os.environ[FP8_PATH_C_EXPLICIT_OVERRIDE_ENV] = "1"
+    else:
+        os.environ.pop(FP8_PATH_C_EXPLICIT_OVERRIDE_ENV, None)
     if args.steps < 1:
         return (
             blocked_receipt(
@@ -10989,9 +11153,9 @@ def _run_existing_training(
             )
             return enforce_loss_decrease_requirement(args, receipt)
         with (
-            fp8_path_b_kernel_policy(config),
-            fp8_path_c_kernel_policy(config),
-            fp8_path_c_stdio_suppressed(config),
+            fp8_path_b_kernel_policy(args),
+            fp8_path_c_kernel_policy(args),
+            fp8_path_c_stdio_suppressed(args),
         ):
             return local_gb10_route_fn(
                 args,
@@ -11013,9 +11177,9 @@ def _run_existing_training(
     memory_before = metal_memory_payload()
     try:
         with (
-            fp8_path_b_kernel_policy(config),
-            fp8_path_c_kernel_policy(config),
-            fp8_path_c_stdio_suppressed(config),
+            fp8_path_b_kernel_policy(args),
+            fp8_path_c_kernel_policy(args),
+            fp8_path_c_stdio_suppressed(args),
         ):
             if args.dry_run_json:
                 train_payload = dry_run_payload_fn(

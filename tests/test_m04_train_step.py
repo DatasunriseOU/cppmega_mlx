@@ -7911,3 +7911,166 @@ def test_acceptance_gate_requires_canonical_allocation_probe(
         "local_gb10_quarter_preflight_ok"
         in (gate["full_local_gb10_quarter_gate_blockers"])
     )
+
+
+def _fp8_path_c_gate_args(
+    *,
+    dtype: str = "fp8_path_c",
+    seq_len: int = 512,
+    use_direct_chain: bool = False,
+    use_fused_train_block: bool = False,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        dtype=dtype,
+        seq_len=seq_len,
+        use_path_c_direct_chain_runtime=use_direct_chain,
+        use_path_c_fused_train_block_runtime=use_fused_train_block,
+    )
+
+
+def test_fp8_path_c_gate_default_threshold_is_2048() -> None:
+    with temporary_env({m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None}):
+        assert (
+            m04_train_step.fp8_path_c_max_seq_len()
+            == m04_train_step.FP8_PATH_C_LONG_SEQ_GATE_DEFAULT
+            == 2048
+        )
+
+
+def test_fp8_path_c_auto_route_selectable_below_threshold() -> None:
+    args = _fp8_path_c_gate_args(seq_len=512)
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            m04_train_step.FP8_PATH_C_EXPLICIT_OVERRIDE_ENV: None,
+        }
+    ):
+        gate = m04_train_step.fp8_path_c_long_seq_gate(args)
+        assert gate["gated"] is False
+        assert m04_train_step.fp8_path_c_route_requested(args) is True
+        assert m04_train_step.fp8_path_b_route_requested(args) is False
+
+
+def test_fp8_path_c_auto_route_gated_at_and_above_threshold() -> None:
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            m04_train_step.FP8_PATH_C_EXPLICIT_OVERRIDE_ENV: None,
+        }
+    ):
+        for seq_len in (2048, 4096):
+            args = _fp8_path_c_gate_args(seq_len=seq_len)
+            gate = m04_train_step.fp8_path_c_long_seq_gate(args)
+            assert gate["gated"] is True
+            assert (
+                gate["status"]
+                == m04_train_step.FP8_PATH_C_LONG_SEQ_GATE_STATUS
+            )
+            assert gate["fallback_dtype"] == m04_train_step.FP8_PATH_B_DTYPE
+            assert gate["reason"] and "Path C" in gate["reason"]
+            # Effective route fails closed onto the Path B baseline.
+            assert m04_train_step.fp8_path_c_route_requested(args) is False
+            assert m04_train_step.fp8_path_b_route_requested(args) is True
+
+
+def test_fp8_path_c_explicit_runtime_override_bypasses_gate() -> None:
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            m04_train_step.FP8_PATH_C_EXPLICIT_OVERRIDE_ENV: None,
+        }
+    ):
+        direct = _fp8_path_c_gate_args(seq_len=4096, use_direct_chain=True)
+        assert m04_train_step.fp8_path_c_long_seq_gate(direct)["gated"] is False
+        assert m04_train_step.fp8_path_c_route_requested(direct) is True
+
+        fused = _fp8_path_c_gate_args(seq_len=4096, use_fused_train_block=True)
+        assert m04_train_step.fp8_path_c_long_seq_gate(fused)["gated"] is False
+        assert m04_train_step.fp8_path_c_route_requested(fused) is True
+
+
+def test_fp8_path_c_override_env_bypasses_gate_for_flagless_config() -> None:
+    # A flag-less config (TrainHybridTinyConfig-style) still honors the override
+    # that run_receipt mirrors into the environment.
+    args = _fp8_path_c_gate_args(seq_len=4096)
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            m04_train_step.FP8_PATH_C_EXPLICIT_OVERRIDE_ENV: "1",
+        }
+    ):
+        assert m04_train_step.fp8_path_c_long_seq_gate(args)["gated"] is False
+        assert m04_train_step.fp8_path_c_route_requested(args) is True
+
+
+def test_fp8_path_c_gate_does_not_touch_bf16_path_c() -> None:
+    # bf16 Path C (CPPMEGA_KERNEL_PATH=path_c, dtype != fp8_path_c) is untouched.
+    args = _fp8_path_c_gate_args(dtype="bfloat16", seq_len=4096)
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            "CPPMEGA_KERNEL_PATH": "path_c",
+            "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+        }
+    ):
+        assert m04_train_step.fp8_path_c_long_seq_gate(args)["gated"] is False
+        # bf16 Path C is still requested via the kernel policy env.
+        assert m04_train_step.path_c_kernel_policy_requested() is True
+        assert m04_train_step.path_c_training_route_requested(args) is True
+
+
+def test_fp8_path_c_gate_does_not_touch_fp8_path_b() -> None:
+    args = _fp8_path_c_gate_args(dtype="fp8_path_b", seq_len=4096)
+    with temporary_env({m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None}):
+        assert m04_train_step.fp8_path_c_long_seq_gate(args)["gated"] is False
+        assert m04_train_step.fp8_path_b_route_requested(args) is True
+
+
+def test_fp8_path_c_gate_threshold_is_configurable() -> None:
+    # Custom threshold via env.
+    with temporary_env({m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: "1024"}):
+        assert m04_train_step.fp8_path_c_max_seq_len() == 1024
+        gated = _fp8_path_c_gate_args(seq_len=1024)
+        assert m04_train_step.fp8_path_c_route_requested(gated) is False
+        ok = _fp8_path_c_gate_args(seq_len=1023)
+        assert m04_train_step.fp8_path_c_route_requested(ok) is True
+    # Disabled via threshold 0.
+    with temporary_env({m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: "0"}):
+        assert m04_train_step.fp8_path_c_max_seq_len() == 0
+        args = _fp8_path_c_gate_args(seq_len=4096)
+        assert m04_train_step.fp8_path_c_long_seq_gate(args)["gated"] is False
+        assert m04_train_step.fp8_path_c_route_requested(args) is True
+
+
+def test_fp8_path_c_gate_records_receipt_note_on_precision_route() -> None:
+    args = _fp8_path_c_gate_args(seq_len=2048)
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            m04_train_step.FP8_PATH_C_EXPLICIT_OVERRIDE_ENV: None,
+        }
+    ):
+        payload = m04_train_step.precision_route_payload(args)
+    assert payload["kind"] == "fp8_path_c_auto_long_seq_gated_to_path_b"
+    assert payload["status"] == m04_train_step.FP8_PATH_C_LONG_SEQ_GATE_STATUS
+    assert payload["path_c_used"] is False
+    assert payload["fp8_path_c_long_seq_gate"]["gated"] is True
+
+
+def test_fp8_path_c_gate_kernel_policy_env_falls_back_to_path_b() -> None:
+    args = _fp8_path_c_gate_args(seq_len=2048)
+    route_env = m04_train_step.SPARSE_MLA_FP8_ROUTE_ENV
+    with temporary_env(
+        {
+            m04_train_step.FP8_PATH_C_MAX_SEQ_LEN_ENV: None,
+            m04_train_step.FP8_PATH_C_EXPLICIT_OVERRIDE_ENV: None,
+            route_env: "path_c",
+        }
+    ):
+        with m04_train_step.fp8_path_b_kernel_policy(
+            args
+        ), m04_train_step.fp8_path_c_kernel_policy(args):
+            # Gated AUTO Path C demotes the live Sparse-MLA route to Path B.
+            assert os.environ[route_env] == "path_b"
+        # Restored on exit.
+        assert os.environ[route_env] == "path_c"
