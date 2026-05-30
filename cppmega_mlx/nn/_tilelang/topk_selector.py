@@ -60,12 +60,15 @@ off-by-one fills.
 Performance vs MLX's built-in ``argpartition``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-MLX's ``mx.argpartition`` is itself an optimised Metal kernel. Unmasked AUTO
-routes now use the TileLang/tvm-ffi owner-output path when it is available;
-masked intervals fall back to the pure-MLX reference until the owner-output
-Path C route grows masked-row parity. Explicit ``backend="metal"`` is retained
-only as a fail-closed compatibility spelling for callers that still probe the
-retired Path B surface.
+MLX's ``mx.argpartition`` is itself an optimised Metal kernel. Both unmasked
+and masked AUTO routes now use the TileLang/tvm-ffi owner-output path when it is
+available: the Path C prim reads ``starts``/``ends`` and masks columns outside
+``[start, end)`` to ``-inf`` before the per-lane top-K insertion, so masked rows
+reach set-equality parity with the pure-MLX reference (including the ``-1``
+sentinel for intervals shorter than ``k``). The pure-MLX reference is used only
+as a fallback when Path C cannot dispatch. Explicit ``backend="metal"`` is
+retained only as a fail-closed compatibility spelling for callers that still
+probe the retired Path B surface.
 
 Algorithm sketch::
 
@@ -725,12 +728,12 @@ def topk_selector_tilelang_direct(
         raise ValueError(
             f"topk_selector expects a (B, T) array; got shape {scores.shape}"
         )
-    if starts is not None or ends is not None:
-        raise TopKPathCDirectError(
-            "topk_selector_tilelang direct tvm-ffi route is currently "
-            "limited to unmasked rows; masked start/end intervals remain on "
-            "Path B until the TileLang owner-output lowering is parity-clean"
-        )
+    # Masked start/end intervals are handled directly by the Path C prim:
+    # the kernel reads ``starts[bx]``/``ends[bx]`` and masks columns outside
+    # ``[start, end)`` to ``-inf`` before the per-lane top-K insertion, so the
+    # owner-output route is parity-clean for masked rows (set-equality with the
+    # pure-MLX reference, including the ``-1`` sentinel when an interval yields
+    # fewer than ``k`` valid columns). No separate masked prim is required.
     batch = int(scores.shape[0])
     seq_len = int(scores.shape[1])
     if k < 1 or k > seq_len:
@@ -779,14 +782,29 @@ def topk_selector_tilelang_direct(
         raise TopKPathCDirectError(
             f"direct tvm-ffi topk dispatch failed: {type(exc).__name__}: {exc}"
         ) from exc
-    if returned is not indices:
-        raise TopKPathCDirectError(
-            "direct tvm-ffi topk did not return the caller-owned output"
-        )
     # TVM encodes into MLX's current Metal command buffer outside the MLX graph.
     # The returned owner array has no lazy MLX dependency edge, so force the
     # command buffer to complete before Python or downstream consumers observe it.
     mx.synchronize()
+    if returned is indices:
+        # tvm-ffi handed back the exact caller-owned object.
+        return indices
+    # Some installed TileLang/tvm-ffi builds return a fresh MLX wrapper around
+    # the caller's ``out_idx`` buffer instead of the literal Python object. The
+    # kernel still wrote into the caller's storage (out_idx=1 == ``indices``),
+    # so the ownership contract holds. Validate the wrapper is a compatible
+    # int32 (batch, k) array and mirror its values into the caller-owned buffer
+    # so downstream consumers see the result on the exact object they passed.
+    if (
+        not isinstance(returned, mx.array)
+        or tuple(returned.shape) != tuple(indices.shape)
+        or returned.dtype != indices.dtype
+    ):
+        raise TopKPathCDirectError(
+            "direct tvm-ffi topk did not return the caller-owned output"
+        )
+    indices[:, :] = returned
+    mx.eval(indices)
     return indices
 
 
@@ -843,10 +861,9 @@ class PathBStatus:
 
 
 _PATH_B_RETIRED_REASON = (
-    "topk_selector direct-MSL Path B is retired. Unmasked AUTO calls should use "
-    "the TileLang/tvm-ffi owner-output route; masked or unsupported no-output "
-    "calls fall back to the pure-MLX reference until masked owner-output Path C "
-    "parity lands."
+    "topk_selector direct-MSL Path B is retired. Both unmasked and masked AUTO "
+    "calls use the TileLang/tvm-ffi owner-output route; only calls where Path C "
+    "cannot dispatch fall back to the pure-MLX reference."
 )
 
 
@@ -881,11 +898,11 @@ def topk_selector(
         starts: optional (B,) int32 starts for per-row mask.
         ends: optional (B,) int32 ends for per-row mask.
         backend: ``"auto"`` (default) tries TileLang Path C with an owner-output
-            buffer for unmasked calls, then falls back to the pure-MLX reference;
-            ``"metal"`` fails closed because Path B is retired;
-            ``"tilelang"`` / ``"path_c"`` require the owner-output Path C
-            helper and allocate the public result buffer for unmasked calls;
-            ``"mlx"`` always uses the reference.
+            buffer for both unmasked and masked (start/end interval) calls, then
+            falls back to the pure-MLX reference; ``"metal"`` fails closed because
+            Path B is retired; ``"tilelang"`` / ``"path_c"`` require the
+            owner-output Path C helper and allocate the public result buffer for
+            unmasked and masked calls; ``"mlx"`` always uses the reference.
     """
 
     if backend not in {"auto", "mlx", "metal", "tilelang", "path_c"}:
@@ -897,15 +914,21 @@ def topk_selector(
     if backend in {"tilelang", "path_c"}:
         try:
             owner_out = mx.zeros((int(scores.shape[0]), int(k)), dtype=mx.int32)
-            return topk_selector_tilelang_direct(scores, k, out=owner_out)
+            return topk_selector_tilelang_direct(
+                scores, k, starts=starts, ends=ends, out=owner_out
+            )
         except TopKPathCDirectError as exc:
             raise RuntimeError("topk_selector: TileLang Path C path unavailable") from exc
-    if starts is None and ends is None:
-        try:
-            owner_out = mx.zeros((int(scores.shape[0]), int(k)), dtype=mx.int32)
-            return topk_selector_tilelang_direct(scores, k, out=owner_out)
-        except TopKPathCDirectError:
-            pass
+    # AUTO routes both unmasked and masked intervals through the owner-output
+    # Path C prim (the kernel applies the [start, end) mask itself); any
+    # dispatch/compile failure falls back to the pure-MLX reference.
+    try:
+        owner_out = mx.zeros((int(scores.shape[0]), int(k)), dtype=mx.int32)
+        return topk_selector_tilelang_direct(
+            scores, k, starts=starts, ends=ends, out=owner_out
+        )
+    except TopKPathCDirectError:
+        pass
     return topk_selector_reference(scores, k, starts=starts, ends=ends)
 
 

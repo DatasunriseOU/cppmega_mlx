@@ -537,9 +537,10 @@ def test_path_c_direct_tvm_ffi_reuses_owner_output_and_mutates_buffer() -> None:
     assert _to_index_sets(out) == _to_index_sets(out_ref)
 
 
-def test_path_c_direct_rejects_starts_ends_mask(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_path_c_direct_masked_interval_parity_set_equality() -> None:
+    """Masked start/end intervals now go through the owner-output Path C prim
+    (no fallback to the pure-MLX reference) and match it for set membership."""
+
     rng = np.random.default_rng(20260504)
     batch, seq_len, k = 3, 64, 4
     scores_np = rng.standard_normal((batch, seq_len)).astype(np.float32)
@@ -552,20 +553,20 @@ def test_path_c_direct_rejects_starts_ends_mask(
     scores = mx.array(scores_np)
     starts = mx.array(starts_np)
     ends = mx.array(ends_np)
-    out = mx.full((batch, k), -123, dtype=mx.int32)
 
-    monkeypatch.setattr(
-        topk_selector_mod,
-        "_path_c_tvm_ffi_kernel_for",
-        lambda *_, **__: (_ for _ in ()).throw(
-            AssertionError("masked direct Path C must fail before compile")
-        ),
-    )
+    out_c = _topk_tilelang_direct_output(scores, k, starts=starts, ends=ends)
+    out_ref = topk_selector_reference(scores, k, starts=starts, ends=ends)
+    mx.eval(out_c, out_ref)
 
-    with pytest.raises(TopKPathCDirectError, match="limited to unmasked rows"):
-        topk_selector_tilelang_direct(scores, k, starts=starts, ends=ends, out=out)
-    mx.eval(out)
-    assert np.asarray(out).tolist() == [[-123] * k] * batch
+    assert _to_index_sets(out_c) == _to_index_sets(out_ref)
+    assert out_c.dtype == mx.int32
+    assert tuple(out_c.shape) == (batch, k)
+    # Every selected index lies inside its row's [start, end) interval.
+    arr = np.asarray(out_c)
+    for b in range(batch):
+        for idx in arr[b]:
+            if idx >= 0:
+                assert starts_np[b] <= idx < ends_np[b]
 
 
 @pytest.mark.parametrize(
@@ -573,24 +574,29 @@ def test_path_c_direct_rejects_starts_ends_mask(
     [
         (np.array([0, 3], dtype=np.int32), None),
         (None, np.array([-1, 99], dtype=np.int32)),
+        (np.array([1, 2], dtype=np.int32), np.array([3, 2], dtype=np.int32)),
     ],
 )
-def test_path_c_direct_rejects_partial_interval_mask(
+def test_path_c_direct_partial_interval_mask_parity(
     starts_np: np.ndarray | None,
     ends_np: np.ndarray | None,
 ) -> None:
+    """Partial (starts-only / ends-only), out-of-range, and short/empty
+    intervals all reach set-equality parity with the reference through the
+    owner-output Path C prim, including the ``-1`` sentinel for short rows."""
+
     scores = mx.array(np.array([
         [5.0, 4.0, 3.0, 2.0],
         [0.0, 1.0, 2.0, 3.0],
     ], dtype=np.float32))
     starts = None if starts_np is None else mx.array(starts_np)
     ends = None if ends_np is None else mx.array(ends_np)
-    out = mx.full((2, 2), -123, dtype=mx.int32)
 
-    with pytest.raises(TopKPathCDirectError, match="limited to unmasked rows"):
-        topk_selector_tilelang_direct(scores, k=2, starts=starts, ends=ends, out=out)
-    mx.eval(out)
-    assert np.asarray(out).tolist() == [[-123, -123], [-123, -123]]
+    out_c = _topk_tilelang_direct_output(scores, k=2, starts=starts, ends=ends)
+    out_ref = topk_selector_reference(scores, k=2, starts=starts, ends=ends)
+    mx.eval(out_c, out_ref)
+
+    assert _to_index_sets(out_c) == _to_index_sets(out_ref)
 
 
 def test_path_c_keeps_expected_exact_order_for_ties() -> None:
@@ -610,7 +616,12 @@ def test_path_c_keeps_expected_exact_order_for_ties() -> None:
     assert np.asarray(out_c).tolist() == expected
 
 
-def test_path_c_direct_rejects_masked_ties_and_sentinels() -> None:
+def test_path_c_direct_masked_ties_and_sentinels_parity() -> None:
+    """Masked rows with ties and short intervals (``-1`` sentinels) reach
+    set-equality parity with the reference through the owner-output Path C
+    prim. Tie-exact sequence ordering is not asserted (set membership is the
+    contract), but the short-interval sentinel set must contain ``-1``."""
+
     scores = mx.array(np.array([
         [9.0, 7.0, 7.0, 6.0, 7.0, 5.0, 7.0, 4.0],
         [1.0, 8.0, 8.0, 8.0, 3.0, 8.0, 2.0, 8.0],
@@ -618,20 +629,15 @@ def test_path_c_direct_rejects_masked_ties_and_sentinels() -> None:
     ], dtype=np.float32))
     starts = mx.array(np.array([1, 2, 6], dtype=np.int32))
     ends = mx.array(np.array([7, 6, 8], dtype=np.int32))
-    out = mx.full((3, 4), -123, dtype=mx.int32)
 
-    with pytest.raises(TopKPathCDirectError, match="limited to unmasked rows"):
-        topk_selector_tilelang_direct(scores, k=4, starts=starts, ends=ends, out=out)
+    out_c = _topk_tilelang_direct_output(scores, k=4, starts=starts, ends=ends)
     out_ref = topk_selector_reference(scores, k=4, starts=starts, ends=ends)
-    mx.eval(out, out_ref)
+    mx.eval(out_c, out_ref)
 
-    expected = [
-        [1, 2, 4, 6],
-        [2, 3, 5, 4],
-        [6, 7, -1, -1],
-    ]
-    assert np.asarray(out_ref).tolist() == expected
-    assert np.asarray(out).tolist() == [[-123] * 4] * 3
+    assert _to_index_sets(out_c) == _to_index_sets(out_ref)
+    # Row 2's interval [6, 8) has only 2 valid columns for k=4, so the
+    # reference pads with the -1 sentinel; Path C must do the same.
+    assert -1 in _to_index_sets(out_c)[2]
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
@@ -728,26 +734,56 @@ def test_public_entry_point_auto_falls_back_to_reference_when_path_c_direct_fail
     assert _to_index_sets(out) == _to_index_sets(out_ref)
 
 
-def test_public_entry_point_auto_uses_reference_for_masked_calls(
+def test_public_entry_point_auto_uses_path_c_for_masked_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Masked AUTO calls now route through the owner-output Path C prim
+    (passing starts/ends through), not the pure-MLX reference."""
+
     scores = mx.array(np.arange(64, dtype=np.float32).reshape(1, 64))
     starts = mx.array(np.array([8], dtype=np.int32))
     ends = mx.array(np.array([48], dtype=np.int32))
+    sentinel = mx.array(np.array([[47, 46, 45, 44, 43, 42, 41, 40]], dtype=np.int32))
+    seen: dict[str, object] = {}
 
-    def fail_path_c(*args: object, **kwargs: object) -> None:
-        raise AssertionError("masked backend='auto' must not call unmasked Path C direct")
+    def path_c_direct(scores_arg, k, *, starts=None, ends=None, out=None):
+        seen["starts"] = starts
+        seen["ends"] = ends
+        return sentinel
 
     def fail_path_b(*args: object, **kwargs: object) -> None:
         raise AssertionError("backend='auto' must not call retired Path B")
 
     monkeypatch.setattr(
         "cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang_direct",
-        fail_path_c,
+        path_c_direct,
     )
     monkeypatch.setattr(
         "cppmega_mlx.nn._tilelang.topk_selector.topk_selector_metal",
         fail_path_b,
+    )
+    out = topk_selector(scores, k=8, starts=starts, ends=ends, backend="auto")
+    assert seen["starts"] is starts
+    assert seen["ends"] is ends
+    assert np.asarray(out).tolist() == [[47, 46, 45, 44, 43, 42, 41, 40]]
+
+
+def test_public_entry_point_auto_masked_falls_back_to_reference_when_path_c_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the masked Path C prim cannot dispatch, AUTO still falls back to the
+    pure-MLX reference rather than raising."""
+
+    scores = mx.array(np.arange(64, dtype=np.float32).reshape(1, 64))
+    starts = mx.array(np.array([8], dtype=np.int32))
+    ends = mx.array(np.array([48], dtype=np.int32))
+
+    def fail_path_c(*args: object, **kwargs: object) -> None:
+        raise TopKPathCDirectError("masked compile failed")
+
+    monkeypatch.setattr(
+        "cppmega_mlx.nn._tilelang.topk_selector.topk_selector_tilelang_direct",
+        fail_path_c,
     )
     out = topk_selector(scores, k=8, starts=starts, ends=ends, backend="auto")
     out_ref = topk_selector_reference(scores, k=8, starts=starts, ends=ends)
