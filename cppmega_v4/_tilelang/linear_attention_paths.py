@@ -112,9 +112,19 @@ def _dispatch_failure_or_fallback(
     *args,
     **kwargs,
 ):
-    if allow_fallback:
-        return _path_a_call(*args, **kwargs)
-    raise RuntimeError(f"GDN {path} dispatch failed and fallback disabled: {exc}") from exc
+    # RULE #1 (no automated/silent fallbacks): a RUNTIME crash inside the
+    # selected GDN kernel is a bug in that clear path. Silently switching to
+    # Path A here would return a *different* (degraded) result and hide the
+    # bug. Always RAISE so the failure surfaces and we fix the root cause.
+    # (Explicit *unavailability* routing — when a path advertises it cannot
+    # run — still goes through ``_fallback_or_raise``; that is selection, not
+    # an on-failure fallback.)
+    del allow_fallback, args, kwargs
+    raise RuntimeError(
+        f"GDN dispatch: selected {path} crashed at runtime "
+        f"({type(exc).__name__}: {exc}). Refusing to silently fall back to "
+        f"Path A (RULE #1) — this points at a real bug in {path}."
+    ) from exc
 
 
 def _path_b_call(*args, allow_fallback: bool = True, **kwargs):

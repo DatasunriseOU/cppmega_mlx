@@ -61,12 +61,20 @@ def _with_pass_context(pass_configs: dict[str, Any] | None):
 
 
 def _ensure_path_c_metal_intrinsics_registered() -> None:
+    # RULE #1 (no automated/silent fallbacks): if the Metal FP8 intrinsics are
+    # not registered, a Path C FP8 kernel would compile/run against MISSING
+    # intrinsics and silently produce a wrong result. The only acceptable
+    # silent skip is the genuine "feature not present in this tilelang build"
+    # case (the assert helper itself does not exist) — that is a
+    # pre-existing-feature-not-available check, not an on-failure fallback.
     try:
         from tilelang.language.fp8_op import assert_metal_fp8_intrinsics_registered
-
-        assert_metal_fp8_intrinsics_registered()
-    except Exception:
-        pass
+    except (ImportError, ModuleNotFoundError):
+        # Older tilelang without the FP8 intrinsics module — nothing to assert.
+        return
+    # A failure of the assert itself means the intrinsics are genuinely NOT
+    # registered: surface it instead of swallowing and running a broken kernel.
+    assert_metal_fp8_intrinsics_registered()
 
 
 def _engine_compile(

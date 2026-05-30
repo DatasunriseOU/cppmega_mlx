@@ -499,10 +499,21 @@ def _dispatch_mamba3_scan(
                     y, h_last = mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(
                         x, B, C, z, A, dt, D, h0
                     )
-            except RuntimeError:
-                # AUTO is fail-closed: graph/DLPack boundary failures keep the
-                # production Path B route rather than allocating staging buffers.
-                pass
+            except RuntimeError as exc:
+                # RULE #1 (no automated/silent fallbacks): a RUNTIME crash in
+                # the selected Mamba3 Path C kernel is a bug in that clear
+                # path. Silently dropping to Path B / the pure-MLX reference
+                # would return a degraded result and hide the bug. RAISE so
+                # the graph/DLPack boundary failure surfaces and we fix the
+                # root cause. (An UNAVAILABLE Path C is handled before this
+                # try-block by the status check, not here.)
+                raise RuntimeError(
+                    "mamba3_mimo dispatch: selected Path C "
+                    f"({auto_mode!r}) crashed at runtime "
+                    f"({type(exc).__name__}: {exc}). Refusing to silently fall "
+                    "back to Path B / pure-MLX reference (RULE #1) — this "
+                    "points at a real bug in the Path C graph/DLPack boundary."
+                ) from exc
             else:
                 record_dispatch(
                     "mamba3_mimo",
