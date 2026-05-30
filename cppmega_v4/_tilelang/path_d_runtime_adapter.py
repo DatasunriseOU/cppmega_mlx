@@ -35,7 +35,17 @@ GDN_FIXED_V = 32
 GDN_FIXED_BT = 64
 GDN_FIXED_BV = 32
 GDN_RUNTIME_BT = 32
-GDN_CHUNK_H_METAL_SAFE_BV = 16
+# chunk_delta_h (h_blockdim64) holds [64, BV] fp32 state accumulators (b_h1..)
+# thread-private. With an initial state loaded (USE_INITIAL_STATE, the
+# ``with_state`` shape) the extra h0 load + the BV-wide store path pushes the
+# per-thread footprint past Apple's compute-function stack budget at BV=16,
+# so newComputePipelineStateWithFunction fails ("Compute function exceeds
+# available stack space"). Tiling the V reduction to BV=8 (the smallest tile
+# Metal's GEMM allows -- N must be a multiple of 8) shrinks the state tile so
+# the pipeline-state creation fits, mirroring the recompute_w_u BK/BV tiling
+# below. BV=8 still launches and stays in parity for the no-initial-state
+# shapes, so it is used uniformly.
+GDN_CHUNK_H_METAL_SAFE_BV = 8
 GDN_FIXED_CHUNK_O_BV = 16
 # recompute_w_u (shared by GDN and KDA) materializes several BT*BK + BT*BV
 # THREAD-PRIVATE accumulators (b_w, b_u, b_kb, b_vb, b_A, ...). With the FLA
@@ -1926,7 +1936,27 @@ def _compile_gdn_runtime_stages(
         "BT": GDN_RUNTIME_BT,
         "IS_VARLEN": bool(is_varlen),
     }
-    kkt_constexprs = {**runtime_private, **shared_dims}
+    # The FLA kkt_solve kernel hard-codes a 4-sub-block (BC x 4) decomposition
+    # of each BT-token chunk: it reads/inverts/stores blocks at column offsets
+    # 0, BC, 2*BC, 3*BC, so it is only correct when BT == 4 * BC. The default
+    # FLA pairing is BT=64 / BC=16. When this multi-stage launcher runs the
+    # whole GDN pipeline at the Metal-safe GDN_RUNTIME_BT (=32, because the
+    # chunk_o / chunk_h inter-chunk kernels overflow Apple's 32 KiB threadgroup
+    # memory at BT=64), the kkt stage MUST shrink BC to BT/4 so its 4 sub-blocks
+    # still tile exactly one BT chunk -- otherwise sub-blocks 2/3 read the next
+    # chunk's tokens and the (I+A)^{-1} merge writes past the [T, BT] A buffer,
+    # producing a wrong inverse that drifts across chunks (and NaNs past 2
+    # chunks). A [BC, BC] = [8, 8] GEMM cannot be split across the lowering's
+    # default 4 warps (m_warp * n_warp must equal num_warps), so the kkt stage
+    # also pins num_warps=1 for the small-BC tile. Both are launch-config
+    # corrections on the cppmega side; the lowered kernel itself is unchanged.
+    kkt_bc = max(1, GDN_RUNTIME_BT // 4)
+    kkt_constexprs = {
+        **runtime_private,
+        **shared_dims,
+        "BC": kkt_bc,
+        "_NUM_WARPS": 1 if kkt_bc < 16 else 4,
+    }
     recompute_constexprs = {
         **runtime_private,
         **shared_dims,

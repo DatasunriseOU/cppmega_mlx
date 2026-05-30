@@ -876,6 +876,18 @@ def _lower_fla_kernel_uncached(
 
     # Prefer ``from_ttir`` directly so we control the text-vs-mlir routing;
     # ``from_triton_kernel`` would re-capture and double the work.
+    #
+    # A stage may pin the cooperative-tensor warp count via a private
+    # ``_NUM_WARPS`` constexpr (filtered from the TTIR signature above because
+    # it is ``_``-prefixed). This is required for small-tile GEMMs such as the
+    # GDN kkt_solve at BC=8: a [8, 8] block cannot be partitioned across the
+    # lowering's default 4 warps (``m_warp * n_warp must equal num_warps``), so
+    # the stage requests ``num_warps=1``. It is a launch-config override, not a
+    # change to the lowered kernel body.
+    num_warps_override = constexprs.get("_NUM_WARPS")
+    num_warps_override = (
+        int(num_warps_override) if num_warps_override is not None else None
+    )
     try:
         from poc.triton_frontend import from_ttir, _walk_text_ttir
 
@@ -887,6 +899,7 @@ def _lower_fla_kernel_uncached(
                 name=primfunc_name,
                 grid=grid,
                 arg_buffer_shapes=arg_buffer_shapes,
+                num_warps=num_warps_override,
             )
             return LowerResult(
                 status="LOWERED_FULL",
