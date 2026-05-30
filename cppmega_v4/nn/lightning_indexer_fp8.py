@@ -95,9 +95,26 @@ class LightningIndexerFP8(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, config.n_heads, bias=False)
 
     def _wq_b_apply(self, qr: mx.array) -> mx.array:
-        """Apply wq_b: qr @ wq_b.T with dequant-on-the-fly."""
+        """Apply wq_b: qr @ wq_b.T with dequant-on-the-fly.
+
+        For the fp8-blocks path this reuses the fused cooperative-tensor
+        ``fused_fp8_gemm`` (block-FP8 weight × activation -> ``qr @ W.T``)
+        when available, falling back to a pure-MLX ``dequant_block_fp8`` +
+        matmul otherwise.  ``fused_fp8_gemm`` is itself fail-safe (it drops to
+        its own scalar kernel if TileLang is unavailable), so the indexer keeps
+        working on every host.
+        """
         if self.config.fp8_blocks:
-            w = dequant_block_fp8(self._wq_b_fp8, self._wq_b_scale_inv)
+            try:
+                from cppmega_v4._tilelang.fused_fp8_gemm import fused_fp8_gemm
+
+                # W = wq_b [out_dim, q_lora_rank]; fused_fp8_gemm computes
+                # qr @ W.T = [B, T, out_dim].
+                return fused_fp8_gemm(
+                    self._wq_b_fp8, self._wq_b_scale_inv, qr
+                ).astype(mx.bfloat16)
+            except Exception:  # noqa: BLE001 -- never break the indexer forward
+                w = dequant_block_fp8(self._wq_b_fp8, self._wq_b_scale_inv)
         else:
             w = self._wq_b_bf16
         # qr [B, T, q_lora_rank] @ w.T [q_lora_rank, out_dim]
