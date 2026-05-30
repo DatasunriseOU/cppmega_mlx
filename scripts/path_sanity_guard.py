@@ -176,9 +176,17 @@ PATH_CONTRACTS: tuple[PathContract, ...] = (
     PathContract(
         "v4.gdn",
         "path_d",
-        "test_only",
-        "blocked_candidate",
-        "GDN Triton-frontend Path D remains fallback/test-only until the runtime adapter is wired.",
+        "runnable_if_available",
+        "candidate",
+        "GDN Triton-frontend Path D is eligible only when its runtime adapter "
+        "reports backend_available. The adapter is now generalized beyond the "
+        "fixed prefill slice (arbitrary H/HV/K/V/T, custom scale, "
+        "initial/final recurrent state, packed varlen) with a fused Path B "
+        "backward, mirroring the KDA Path D row. See "
+        "reports/raw/v4_gdn_path_d_parity.json; numeric-launch parity vs the "
+        "Path A FLA-naive reference is captured on Apple M5 hardware (the "
+        "TileLang mpp::tensor_ops::matmul2d cooperative-tensor GEMM the FLA "
+        "kernels lower to requires Metal 4 / M5), identical to KDA Path D.",
     ),
     PathContract(
         "v4.gdn",

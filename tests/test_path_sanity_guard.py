@@ -211,7 +211,23 @@ def test_matrix_guard_rejects_fused_path_c_claim_without_stepper_runtime(
     )
 
 
-def test_v4_matrix_guard_rejects_test_only_path_d_promotion(tmp_path: Path) -> None:
+def test_v4_matrix_guard_rejects_test_only_path_d_promotion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # GDN Path D is now a runnable_if_available candidate (mirrors KDA Path D),
+    # so exercise the blocked-promotion rejection logic by temporarily pinning
+    # the gdn/path_d contract back to test_only/blocked_candidate.
+    blocked = path_sanity_guard.PathContract(
+        "v4.gdn",
+        "path_d",
+        "test_only",
+        "blocked_candidate",
+        "synthetic blocked contract for guard rejection test",
+    )
+    monkeypatch.setitem(
+        path_sanity_guard.CONTRACT_BY_KEY, ("v4.gdn", "path_d"), blocked
+    )
+
     report = _write_json(
         tmp_path / "v4_gdn_matrix.json",
         {

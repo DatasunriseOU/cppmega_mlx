@@ -533,6 +533,26 @@ def _full_arg(extent: int) -> Tuple[int]:
     return (max(int(extent), 1),)
 
 
+def _gdn_varlen_meta_lengths(
+    constexprs: Dict[str, Any],
+    b: int,
+) -> Tuple[int, int]:
+    """Return ``(cu_seqlens_len, chunk_indices_len)`` honoring IS_VARLEN.
+
+    When packed varlen is active the kkt/recompute/chunk_o kernels receive the
+    real cu_seqlens (length N+1) and chunk_indices (2 ints per chunk); under
+    fixed-length they are unused single-element placeholders.
+    """
+
+    t = _runtime_t(constexprs)
+    bt = int(constexprs["BT"])
+    if bool(constexprs.get("IS_VARLEN", False)):
+        n = _runtime_n(constexprs, b)
+        nt = _runtime_num_chunks(constexprs, _num_chunks(t, bt))
+        return _runtime_cu_len(constexprs, n + 1), nt * 2
+    return 1, 1
+
+
 def _gdn_kkt_arg_buffer_shapes(
     constexprs: Dict[str, Any],
     grid: Optional[Tuple[int, ...]],
@@ -543,13 +563,14 @@ def _gdn_kkt_arg_buffer_shapes(
     k = int(constexprs["K"])
     bt = int(constexprs["BT"])
     b = _batch_from_grid(grid, hv)
+    cu_len, chunk_indices_len = _gdn_varlen_meta_lengths(constexprs, b)
     return {
         0: _full_arg(b * t * h * k),      # k
         1: _full_arg(b * t * hv),         # g
         2: _full_arg(b * t * hv),         # beta
         3: _full_arg(b * t * hv * bt),    # A
-        4: _full_arg(1),                  # cu_seqlens, unused when IS_VARLEN=False
-        5: _full_arg(1),                  # chunk_indices, unused when IS_VARLEN=False
+        4: _full_arg(cu_len),             # cu_seqlens
+        5: _full_arg(chunk_indices_len),  # chunk_indices
     }
 
 
@@ -564,6 +585,7 @@ def _gdn_recompute_arg_buffer_shapes(
     v = int(constexprs["V"])
     bt = int(constexprs["BT"])
     b = _batch_from_grid(grid, hv)
+    cu_len, chunk_indices_len = _gdn_varlen_meta_lengths(constexprs, b)
     return {
         0: _full_arg(b * t * h * k),      # k
         1: _full_arg(b * t * hv * v),     # v
@@ -572,8 +594,8 @@ def _gdn_recompute_arg_buffer_shapes(
         4: _full_arg(b * t * hv * v),     # u
         5: _full_arg(b * t * hv * bt),    # A
         6: _full_arg(b * t * hv),         # g
-        7: _full_arg(1),                  # cu_seqlens
-        8: _full_arg(1),                  # chunk_indices
+        7: _full_arg(cu_len),             # cu_seqlens
+        8: _full_arg(chunk_indices_len),  # chunk_indices
     }
 
 

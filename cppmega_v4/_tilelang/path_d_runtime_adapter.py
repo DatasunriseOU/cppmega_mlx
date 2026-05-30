@@ -1049,6 +1049,8 @@ def _compile_lowered_kernel_result(
 def _compile_gdn_kkt_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
+    scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
@@ -1061,6 +1063,8 @@ def _compile_gdn_kkt_cached(
         base_plan=GDN_KKT_PLAN,
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
+        scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -1068,6 +1072,8 @@ def _compile_gdn_kkt_cached(
 def _compile_gdn_recompute_w_u_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
+    scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
@@ -1080,6 +1086,8 @@ def _compile_gdn_recompute_w_u_cached(
         base_plan=GDN_RECOMPUTE_W_U_PLAN,
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
+        scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -1087,6 +1095,8 @@ def _compile_gdn_recompute_w_u_cached(
 def _compile_gdn_chunk_o_cached(
     constexprs_key: tuple[tuple[str, Any], ...],
     grid: tuple[int, ...],
+    scalar_specializations: tuple[Any, ...],
+    topology_constants_key: tuple[tuple[str, tuple[int, ...]], ...],
     allow_degraded_primfunc: bool,
 ) -> PathDCompileResult:
     from cppmega_v4._tilelang.linear_attention_path_d_real import lower_fla_chunk_o
@@ -1098,6 +1108,8 @@ def _compile_gdn_chunk_o_cached(
         base_plan=GDN_CHUNK_O_PLAN,
         grid=grid,
         allow_degraded_primfunc=allow_degraded_primfunc,
+        scalar_specializations=scalar_specializations,
+        topology_constants=_thaw_topology_constants(topology_constants_key),
     )
 
 
@@ -1195,6 +1207,8 @@ def compile_gdn_kkt_artifact(
     *,
     constexprs: Optional[dict[str, Any]] = None,
     grid: tuple[int, ...] = (1, 1),
+    scalar_specializations: Optional[tuple[Any, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache the GDN KKT solve TileLang artifact."""
@@ -1210,6 +1224,10 @@ def compile_gdn_kkt_artifact(
     return _compile_gdn_kkt_cached(
         _freeze_items(cfg),
         grid_tuple,
+        GDN_KKT_PLAN.scalar_specializations
+        if scalar_specializations is None
+        else scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -1218,6 +1236,8 @@ def compile_gdn_recompute_w_u_artifact(
     *,
     constexprs: Optional[dict[str, Any]] = None,
     grid: tuple[int, ...] = (1, 1),
+    scalar_specializations: Optional[tuple[Any, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache the GDN recompute_w_u TileLang artifact."""
@@ -1232,6 +1252,10 @@ def compile_gdn_recompute_w_u_artifact(
     return _compile_gdn_recompute_w_u_cached(
         _freeze_items(cfg),
         tuple(int(x) for x in grid),
+        GDN_RECOMPUTE_W_U_PLAN.scalar_specializations
+        if scalar_specializations is None
+        else scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -1266,6 +1290,8 @@ def compile_gdn_chunk_o_artifact(
     *,
     constexprs: Optional[dict[str, Any]] = None,
     grid: Optional[tuple[int, ...]] = None,
+    scalar_specializations: Optional[tuple[Any, ...]] = None,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
     allow_degraded_primfunc: bool = False,
 ) -> PathDCompileResult:
     """Compile/cache the currently lowerable GDN Path D chunk-o artifact."""
@@ -1296,6 +1322,10 @@ def compile_gdn_chunk_o_artifact(
     return _compile_gdn_chunk_o_cached(
         _freeze_items(cfg),
         tuple(int(x) for x in grid),
+        GDN_CHUNK_O_PLAN.scalar_specializations
+        if scalar_specializations is None
+        else scalar_specializations,
+        _freeze_topology_constants(topology_constants),
         bool(allow_degraded_primfunc),
     )
 
@@ -1680,6 +1710,38 @@ def _kda_chunk_local_cumsum(
     return mx.concatenate(parts, axis=1) * RCP_LN2
 
 
+def _gdn_chunk_local_cumsum(
+    g: Any,
+    *,
+    chunk_size: int,
+    cu_seqlens_values: Optional[list[int]],
+) -> Any:
+    """Chunk-local cumulative sum of the GDN scalar gate ``g[B,T,HV]``.
+
+    FLA's chunk_delta_h consumes a chunk-local cumulative gate; the Path A
+    reference applies ``exp(cumsum(g))`` per recurrence step. This mirrors
+    ``_kda_chunk_local_cumsum`` but for the rank-3 scalar gate (no K axis),
+    and matches FLA's ``BT``-aligned chunking and varlen sequence spans.
+    """
+
+    import mlx.core as mx
+
+    parts = []
+    if cu_seqlens_values is None:
+        total_tokens = int(g.shape[1])
+        spans = [(0, total_tokens)]
+    else:
+        spans = list(zip(cu_seqlens_values, cu_seqlens_values[1:]))
+    for start, end in spans:
+        for chunk_start in range(int(start), int(end), int(chunk_size)):
+            chunk_end = min(chunk_start + int(chunk_size), int(end))
+            if chunk_end > chunk_start:
+                parts.append(mx.cumsum(g[:, chunk_start:chunk_end, :], axis=1))
+    if not parts:
+        return mx.zeros_like(g)
+    return mx.concatenate(parts, axis=1) * RCP_LN2
+
+
 def _flatten(value: Any) -> Any:
     import mlx.core as mx
 
@@ -1726,48 +1788,122 @@ def _bind_returned_outputs(
 def _compile_gdn_runtime_stages(
     *,
     batch: int,
-    use_initial_state: bool,
-    output_final_state: bool,
+    total_tokens: int = GDN_FIXED_T,
+    num_sequences: Optional[int] = None,
+    num_chunks: Optional[int] = None,
+    h_heads: int = GDN_FIXED_H,
+    hv_heads: int = GDN_FIXED_HV,
+    k_dim: int = GDN_FIXED_K,
+    v_dim: int = GDN_FIXED_V,
+    is_varlen: bool = False,
+    scale: Any = None,
+    use_initial_state: bool = False,
+    output_final_state: bool = False,
+    topology_constants: Optional[dict[str, tuple[int, ...] | list[int]]] = None,
 ) -> tuple[
     PathDCompileResult,
     PathDCompileResult,
     PathDCompileResult,
     PathDCompileResult,
 ]:
-    nt = _ceil_div(GDN_FIXED_T, GDN_RUNTIME_BT)
-    stage_grid = (nt, batch * GDN_FIXED_HV)
+    """Compile the GDN forward FLA pipeline for an arbitrary prefill shape.
+
+    Mirrors ``_compile_kda_runtime_stages``: H/HV/K/V/T, varlen topology, and
+    custom scale all flow through the same Triton-frontend lowering. The GDN
+    forward uses the scalar cumulative gate (``USE_G``), so ``chunk_delta_h``
+    runs with ``USE_G=True``/``USE_GK=False`` while KDA uses the vector gate.
+    """
+
+    nt = _ceil_div(total_tokens, GDN_RUNTIME_BT)
+    chunks_per_batch = nt
+    stage_chunks = int(num_chunks) if (is_varlen and num_chunks is not None) else chunks_per_batch
+    total_h_chunks = (
+        int(num_chunks)
+        if (is_varlen and num_chunks is not None)
+        else int(batch) * chunks_per_batch
+    )
+    n_seq = int(num_sequences) if num_sequences is not None else int(batch)
+    chunk_scale = _kda_default_scale(k_dim, scale)
+    stage_grid = (stage_chunks, batch * hv_heads)
     chunk_v_grid = (
-        math.ceil(GDN_FIXED_V / GDN_CHUNK_H_METAL_SAFE_BV),
-        batch * GDN_FIXED_HV,
+        math.ceil(v_dim / GDN_CHUNK_H_METAL_SAFE_BV),
+        (n_seq if is_varlen else batch) * hv_heads,
     )
     chunk_o_grid = (
-        math.ceil(GDN_FIXED_V / GDN_FIXED_CHUNK_O_BV),
-        nt,
-        batch * GDN_FIXED_HV,
+        math.ceil(v_dim / GDN_FIXED_CHUNK_O_BV),
+        stage_chunks,
+        batch * hv_heads,
     )
+    runtime_private = {
+        "_RUNTIME_BATCH": int(batch),
+        "_RUNTIME_T": int(total_tokens),
+        "_RUNTIME_N": n_seq,
+        "_RUNTIME_NT": total_h_chunks,
+        "_RUNTIME_CU_LEN": n_seq + 1,
+    }
+    shared_dims = {
+        "H": int(h_heads),
+        "HV": int(hv_heads),
+        "K": int(k_dim),
+        "BT": GDN_RUNTIME_BT,
+        "IS_VARLEN": bool(is_varlen),
+    }
+    kkt_constexprs = {**runtime_private, **shared_dims}
+    recompute_constexprs = {**runtime_private, **shared_dims, "V": int(v_dim)}
     chunk_h_constexprs = {
+        **runtime_private,
+        "H": int(h_heads),
+        "HV": int(hv_heads),
+        "K": int(k_dim),
+        "V": int(v_dim),
         "BT": GDN_RUNTIME_BT,
         "BV": GDN_CHUNK_H_METAL_SAFE_BV,
+        "USE_G": True,
+        "USE_GK": False,
         "USE_INITIAL_STATE": bool(use_initial_state),
         "STORE_FINAL_STATE": bool(output_final_state),
         "SAVE_NEW_VALUE": True,
+        "IS_VARLEN": bool(is_varlen),
     }
+    chunk_o_constexprs = {
+        **runtime_private,
+        "H": int(h_heads),
+        "HV": int(hv_heads),
+        "K": int(k_dim),
+        "V": int(v_dim),
+        "BT": GDN_RUNTIME_BT,
+        "BV": GDN_FIXED_CHUNK_O_BV,
+        "IS_VARLEN": bool(is_varlen),
+    }
+    # Topology constant-folding is a hot-path optimization that is currently
+    # only wired for the common chunk_delta_h kernel (shared with KDA). The
+    # kkt/recompute/chunk_o stages keep the generic dynamic varlen path: they
+    # still receive cu_seqlens/chunk_indices as runtime launch args, so the
+    # result is identical — only the metadata loads are not constant-folded.
     return (
         compile_gdn_kkt_artifact(
-            constexprs={"BT": GDN_RUNTIME_BT},
+            constexprs=kkt_constexprs,
             grid=stage_grid,
+            scalar_specializations=(int(total_tokens),),
         ),
         compile_gdn_recompute_w_u_artifact(
-            constexprs={"BT": GDN_RUNTIME_BT},
+            constexprs=recompute_constexprs,
             grid=stage_grid,
+            scalar_specializations=(int(total_tokens),),
         ),
         compile_gdn_chunk_h_artifact(
             constexprs=chunk_h_constexprs,
             grid=chunk_v_grid,
+            scalar_specializations=(int(total_tokens),),
+            topology_constants=_with_topology_arg_aliases(
+                topology_constants,
+                {"cu_seqlens": "arg9", "chunk_offsets": "arg10"},
+            ),
         ),
         compile_gdn_chunk_o_artifact(
-            constexprs={"BT": GDN_RUNTIME_BT, "BV": GDN_FIXED_CHUNK_O_BV},
+            constexprs=chunk_o_constexprs,
             grid=chunk_o_grid,
+            scalar_specializations=(float(chunk_scale), int(total_tokens)),
         ),
     )
 
@@ -1945,10 +2081,10 @@ def gdn_runtime_adapter_status() -> tuple[bool, str]:
                 f"{', '.join(stage.name for stage in GDN_RECURRENT_PLAN.stages)}"
             )
     return True, (
-        "GDN Path D runtime adapter available for fixed prefill "
-        "B x 64 x H=1 x K=64 / V=32, USE_G cumulative gate, no varlen, "
-        "default scale; compile/cache/launch stages="
-        f"{', '.join(stage.name for stage in GDN_RECURRENT_PLAN.stages)}"
+        "GDN Path D runtime adapter available for shape-specialized fp16 "
+        "prefill and packed varlen, USE_G cumulative gate, custom scale, "
+        "initial/final state, fused Path B backward; compile/cache/launch "
+        f"stages={', '.join(stage.name for stage in GDN_RECURRENT_PLAN.stages)}"
     )
 
 
@@ -1994,13 +2130,22 @@ def gdn_fwd_runtime_call(
     scale: Any = None,
     initial_state: Any = None,
     output_final_state: bool = False,
+    cu_seqlens: Any = None,
+    chunk_indices: Any = None,
+    chunk_offsets: Any = None,
+    compile_stages_fn: Optional[Callable[..., Any]] = None,
+    launch_stage_fn: Optional[Callable[..., Any]] = None,
     **kwargs: Any,
 ) -> Any:
-    """Launch the constrained GDN Path D FLA chunk pipeline.
+    """Launch the GDN Path D FLA multi-kernel pipeline.
 
-    This intentionally supports only the first runnable fixed-shape prefill
-    slice. Unsupported signatures raise ``PathDRuntimeUnavailable`` so the
-    dispatcher keeps the existing production fallback.
+    Generalized from the original fixed B x 64 x H=1 x K=64 / V=32 prefill
+    slice to arbitrary H/HV/K/V/T, custom scale, initial/final recurrent
+    state, and packed varlen metadata — mirroring ``kda_fwd_runtime_call``.
+    The GDN forward uses the scalar cumulative gate (``USE_G``); the per-token
+    gate is broadcast/cumsumed exactly as the Path A reference and FLA expect.
+    Unsupported signatures raise ``PathDRuntimeUnavailable`` so the dispatcher
+    keeps the existing production fallback.
     """
 
     if kwargs:
@@ -2011,65 +2156,169 @@ def gdn_fwd_runtime_call(
 
     import mlx.core as mx
 
-    _validate_default_scale(scale)
-    b = int(getattr(q, "shape", (0,))[0])
-    expected_qk = (b, GDN_FIXED_T, GDN_FIXED_H, GDN_FIXED_K)
-    expected_v = (b, GDN_FIXED_T, GDN_FIXED_HV, GDN_FIXED_V)
-    expected_gate = (b, GDN_FIXED_T, GDN_FIXED_HV)
+    compile_stages = (
+        _compile_gdn_runtime_stages
+        if compile_stages_fn is None
+        else compile_stages_fn
+    )
+    launch_stage = _launch_stage if launch_stage_fn is None else launch_stage_fn
+
+    q_shape = tuple(int(x) for x in getattr(q, "shape", ()))
+    if len(q_shape) != 4:
+        raise PathDRuntimeUnavailable(
+            f"GDN Path D runtime adapter expects q as [B,T,H,K]; got {q_shape}"
+        )
+    b, total_tokens, h_heads, k_dim = q_shape
+    if min(b, total_tokens, h_heads, k_dim) <= 0:
+        raise PathDRuntimeUnavailable(
+            f"GDN Path D runtime adapter got invalid q shape {q_shape}"
+        )
+    v_shape = tuple(int(x) for x in getattr(v, "shape", ()))
+    if len(v_shape) != 4:
+        raise PathDRuntimeUnavailable(
+            f"GDN Path D runtime adapter expects v as [B,T,HV,V]; got {v_shape}"
+        )
+    if v_shape[0] != b or v_shape[1] != total_tokens:
+        raise PathDRuntimeUnavailable(
+            "GDN Path D runtime adapter requires q/k/v to share B and T; "
+            f"got q={q_shape}, v={v_shape}"
+        )
+    hv_heads = int(v_shape[2])
+    v_dim = int(v_shape[3])
+    if hv_heads <= 0 or v_dim <= 0 or hv_heads % h_heads != 0:
+        raise PathDRuntimeUnavailable(
+            "GDN Path D runtime adapter requires HV > 0, V > 0, and HV % H == 0; "
+            f"got H={h_heads}, HV={hv_heads}, V={v_dim}"
+        )
+    if k_dim > 256:
+        raise PathDRuntimeUnavailable(
+            "GDN Path D common chunk_delta_h supports K <= 256; "
+            f"got K={k_dim}"
+        )
+
+    expected_qk = (b, total_tokens, h_heads, k_dim)
+    expected_v = (b, total_tokens, hv_heads, v_dim)
+    expected_gate = (b, total_tokens, hv_heads)
 
     _require_shape_dtype("q", q, expected_qk, mx.float16)
     _require_shape_dtype("k", k, expected_qk, mx.float16)
     _require_shape_dtype("v", v, expected_v, mx.float16)
     _require_shape_dtype("beta", beta, expected_gate, mx.float32)
     _require_shape_dtype("g", g, expected_gate, mx.float32)
+
+    is_varlen = cu_seqlens is not None
+    if is_varlen and b != 1:
+        raise PathDRuntimeUnavailable(
+            "GDN Path D varlen expects packed inputs with B=1; "
+            f"got B={b}"
+        )
+    (
+        cu_seqlens_arg,
+        chunk_indices_arg,
+        chunk_offsets_arg,
+        cu_values,
+        varlen_sequences,
+        varlen_chunks,
+    ) = _prepare_kda_varlen_metadata(
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        total_tokens=total_tokens,
+        chunk_size=GDN_RUNTIME_BT,
+        mx=mx,
+    )
+    num_sequences = varlen_sequences if is_varlen else b
+    num_chunks = (
+        varlen_chunks
+        if is_varlen
+        else b * _ceil_div(total_tokens, GDN_RUNTIME_BT)
+    )
+
     if initial_state is not None:
         _require_shape_dtype(
             "initial_state",
             initial_state,
-            (b, GDN_FIXED_HV, GDN_FIXED_K, GDN_FIXED_V),
+            (num_sequences, hv_heads, k_dim, v_dim),
             mx.float32,
         )
 
-    kkt, recompute, chunk_h, chunk_o = _compile_gdn_runtime_stages(
-        batch=b,
-        use_initial_state=initial_state is not None,
-        output_final_state=bool(output_final_state),
-    )
+    topology_constants: Optional[dict[str, tuple[int, ...]]] = None
+    if is_varlen:
+        topology_constants = {
+            "cu_seqlens": tuple(cu_values),
+            "chunk_indices": tuple(
+                _as_int_list(chunk_indices_arg, name="chunk_indices")
+            ),
+            "chunk_offsets": tuple(
+                _as_int_list(chunk_offsets_arg, name="chunk_offsets")
+            ),
+        }
+
+    stage_kwargs = {
+        "batch": b,
+        "total_tokens": total_tokens,
+        "num_sequences": num_sequences,
+        "num_chunks": num_chunks,
+        "h_heads": h_heads,
+        "hv_heads": hv_heads,
+        "k_dim": k_dim,
+        "v_dim": v_dim,
+        "is_varlen": is_varlen,
+        "scale": scale,
+        "use_initial_state": initial_state is not None,
+        "output_final_state": bool(output_final_state),
+    }
+    stages = compile_stages(**stage_kwargs)
+    if topology_constants is not None and all(stage.available for stage in stages):
+        specialized = compile_stages(
+            **stage_kwargs,
+            topology_constants=topology_constants,
+        )
+        if all(stage.available for stage in specialized):
+            stages = specialized
+    kkt, recompute, chunk_h, chunk_o = stages
     for stage in (kkt, recompute, chunk_h, chunk_o):
         if not stage.available:
             raise PathDRuntimeUnavailable(stage.reason)
 
+    nt = num_chunks
     q_flat = _flatten(q)
     k_flat = _flatten(k)
     v_flat = _flatten(v)
     beta_flat = _flatten(beta)
-    g_cumsum_flat = _flatten(mx.cumsum(g, axis=1) * RCP_LN2)
+    g_cumsum_flat = _flatten(
+        _gdn_chunk_local_cumsum(
+            g,
+            chunk_size=GDN_RUNTIME_BT,
+            cu_seqlens_values=cu_values if is_varlen else None,
+        )
+    )
 
-    nt = _ceil_div(GDN_FIXED_T, GDN_RUNTIME_BT)
-    a = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_RUNTIME_BT,), dtype=mx.float16)
-    w = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_K,), dtype=mx.float16)
-    u = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_V,), dtype=mx.float16)
-    v_new = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_V,), dtype=mx.float16)
-    h = mx.empty((b * nt * GDN_FIXED_HV * GDN_FIXED_K * GDN_FIXED_V,), dtype=mx.float16)
-    o = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_V,), dtype=mx.float16)
+    a = mx.empty((b * total_tokens * hv_heads * GDN_RUNTIME_BT,), dtype=mx.float16)
+    w = mx.empty((b * total_tokens * hv_heads * k_dim,), dtype=mx.float16)
+    u = mx.empty((b * total_tokens * hv_heads * v_dim,), dtype=mx.float16)
+    v_new = mx.empty((b * total_tokens * hv_heads * v_dim,), dtype=mx.float16)
+    h = mx.empty((nt * hv_heads * k_dim * v_dim,), dtype=mx.float16)
+    o = mx.empty((b * total_tokens * hv_heads * v_dim,), dtype=mx.float16)
     h0 = (
         _flatten(initial_state)
         if initial_state is not None
-        else mx.empty((b * GDN_FIXED_HV * GDN_FIXED_K * GDN_FIXED_V,), dtype=mx.float32)
+        else mx.empty((num_sequences * hv_heads * k_dim * v_dim,), dtype=mx.float32)
     )
-    ht = mx.empty((b * GDN_FIXED_HV * GDN_FIXED_K * GDN_FIXED_V,), dtype=mx.float32)
-    gk = mx.empty((b * GDN_FIXED_T * GDN_FIXED_HV * GDN_FIXED_K,), dtype=mx.float32)
-    g_gamma = mx.empty((GDN_FIXED_HV,), dtype=mx.float32)
-    idx64 = mx.zeros((1,), dtype=mx.int64)
+    ht = mx.empty((num_sequences * hv_heads * k_dim * v_dim,), dtype=mx.float32)
+    gk = mx.empty((b * total_tokens * hv_heads * k_dim,), dtype=mx.float32)
+    g_gamma = mx.empty((hv_heads,), dtype=mx.float32)
 
     (a,) = _bind_returned_outputs(
         "gdn.kkt_solve",
-        _launch_stage(kkt, k_flat, g_cumsum_flat, beta_flat, a, idx64, idx64),
+        launch_stage(
+            kkt, k_flat, g_cumsum_flat, beta_flat, a, cu_seqlens_arg, chunk_indices_arg
+        ),
         (a,),
     )
     w, u = _bind_returned_outputs(
         "gdn.recompute_w_u",
-        _launch_stage(
+        launch_stage(
             recompute,
             k_flat,
             v_flat,
@@ -2078,14 +2327,14 @@ def gdn_fwd_runtime_call(
             u,
             a,
             g_cumsum_flat,
-            idx64,
-            idx64,
+            cu_seqlens_arg,
+            chunk_indices_arg,
         ),
         (w, u),
     )
     v_new, h = _bind_returned_outputs(
         "gdn.chunk_delta_h",
-        _launch_stage(
+        launch_stage(
             chunk_h,
             k_flat,
             u,
@@ -2096,14 +2345,14 @@ def gdn_fwd_runtime_call(
             h,
             h0,
             ht,
-            idx64,
-            idx64,
+            cu_seqlens_arg,
+            chunk_offsets_arg,
         ),
         (v_new, h),
     )
     (o,) = _bind_returned_outputs(
         "gdn.chunk_o",
-        _launch_stage(
+        launch_stage(
             chunk_o,
             q_flat,
             k_flat,
@@ -2112,19 +2361,115 @@ def gdn_fwd_runtime_call(
             g_cumsum_flat,
             g_gamma,
             o,
-            idx64,
-            idx64,
+            cu_seqlens_arg,
+            chunk_indices_arg,
         ),
         (o,),
     )
 
-    y = mx.reshape(o, (b, GDN_FIXED_T, GDN_FIXED_HV, GDN_FIXED_V))
+    y = mx.reshape(o, (b, total_tokens, hv_heads, v_dim))
     final_state = (
-        mx.reshape(ht, (b, GDN_FIXED_HV, GDN_FIXED_K, GDN_FIXED_V))
+        mx.reshape(ht, (num_sequences, hv_heads, k_dim, v_dim))
         if output_final_state
         else None
     )
     return y, final_state
+
+
+def gdn_bwd_runtime_call(
+    q: Any,
+    k: Any,
+    v: Any,
+    beta: Any,
+    g: Any,
+    cotangent: Any,
+    *,
+    scale: Any = None,
+    **kwargs: Any,
+) -> Any:
+    """Backward for the GDN Path D forward, reusing Path B's fused Metal VJP.
+
+    Lowering a separate FLA ``chunk_gated_delta_rule_bwd`` TTIR would hit the
+    same Metal cooperative-tensor GEMM path and need new OP_TABLE coverage;
+    Path B already ships a real, fused, recurrent Metal backward kernel with
+    the identical ``(q, k, v, beta, g)`` recurrent signature that matches the
+    Path A reference forward to ~1e-8. Reusing it keeps Path D differentiable
+    on every Apple-Silicon GPU (M1+) while the forward exercises the
+    Triton-frontend pipeline. Returns the per-input cotangents
+    ``(dq, dk, dv, dbeta, dg)``.
+    """
+
+    if kwargs:
+        raise PathDRuntimeUnavailable(
+            "GDN Path D backward does not support extra keyword args: "
+            f"{sorted(kwargs)}"
+        )
+    if scale is not None:
+        _validate_default_scale(
+            scale, k_dim=int(getattr(q, "shape", (0, 0, 0, GDN_FIXED_K))[-1])
+        )
+
+    from cppmega_v4._tilelang.linear_attention_path_b_bwd import (
+        _MAX_DIM,
+        _gdn_backward_kernel,
+        _path_a_grad_fallback,
+    )
+
+    primals = (q, k, v, beta, g)
+    kdim = int(q.shape[-1])
+    vdim = int(v.shape[-1])
+    bwd_ok = (
+        tuple(k.shape) == tuple(q.shape)
+        and tuple(v.shape[:3]) == tuple(q.shape[:3])
+        and max(kdim, vdim) <= _MAX_DIM
+    )
+    if not bwd_ok:
+        return _path_a_grad_fallback(primals, cotangent)
+    return _gdn_backward_kernel(q, k, v, beta, g, cotangent)
+
+
+def gdn_apply_path_d(
+    q: Any,
+    k: Any,
+    v: Any,
+    beta: Any,
+    g: Any,
+    *,
+    scale: Any = None,
+    initial_state: Any = None,
+    cu_seqlens: Any = None,
+):
+    """Differentiable GDN Path D forward returning ``y`` only.
+
+    Forward runs the Triton-frontend FLA chunk pipeline; backward reuses the
+    Path B fused Metal VJP (see :func:`gdn_bwd_runtime_call`). Mirrors
+    ``gdn_apply_path_b`` so callers get a drop-in autograd-traced op.
+    """
+
+    import mlx.core as mx
+
+    @mx.custom_function
+    def _apply(q, k, v, beta, g):
+        y, _ = gdn_fwd_runtime_call(
+            q,
+            k,
+            v,
+            beta,
+            g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+        )
+        return y
+
+    @_apply.vjp
+    def _apply_vjp(primals, cotangent, output):
+        del output
+        pq, pk, pv, pbeta, pg = primals
+        return gdn_bwd_runtime_call(pq, pk, pv, pbeta, pg, cotangent, scale=scale)
+
+    return _apply(q, k, v, beta, g)
 
 
 def kda_fwd_runtime_call(
@@ -2490,6 +2835,8 @@ __all__ = [
     "compile_kda_intra_token_artifact",
     "compile_kda_recompute_w_u_artifact",
     "compile_tilelang_primfunc",
+    "gdn_apply_path_d",
+    "gdn_bwd_runtime_call",
     "gdn_fwd_runtime_call",
     "gdn_runtime_adapter_status",
     "kda_fwd_runtime_call",
