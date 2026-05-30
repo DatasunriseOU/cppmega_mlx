@@ -184,9 +184,13 @@ PATH_CONTRACTS: tuple[PathContract, ...] = (
         "initial/final recurrent state, packed varlen) with a fused Path B "
         "backward, mirroring the KDA Path D row. See "
         "reports/raw/v4_gdn_path_d_parity.json; numeric-launch parity vs the "
-        "Path A FLA-naive reference is captured on Apple M5 hardware (the "
-        "TileLang mpp::tensor_ops::matmul2d cooperative-tensor GEMM the FLA "
-        "kernels lower to requires Metal 4 / M5), identical to KDA Path D.",
+        "Path A FLA-naive reference. The TileLang mpp::tensor_ops::matmul2d "
+        "cooperative-tensor GEMM the FLA kernels lower to runs on Metal 4 "
+        "(macOS 26+) and is verified on Apple M4 (NOT M5-gated): the gate is "
+        "the OS/SDK Metal-4 capability, not the silicon generation. "
+        "recompute_w_u is tiled through Metal-safe BK/BV blocks so its "
+        "per-thread accumulators fit the pipeline-state stack budget, "
+        "identical to KDA Path D.",
     ),
     PathContract(
         "v4.gdn",

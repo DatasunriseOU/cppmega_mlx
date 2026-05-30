@@ -37,6 +37,16 @@ GDN_FIXED_BV = 32
 GDN_RUNTIME_BT = 32
 GDN_CHUNK_H_METAL_SAFE_BV = 16
 GDN_FIXED_CHUNK_O_BV = 16
+# recompute_w_u (shared by GDN and KDA) materializes several BT*BK + BT*BV
+# THREAD-PRIVATE accumulators (b_w, b_u, b_kb, b_vb, b_A, ...). With the FLA
+# default BK=BV=64 these are ~4096 elements/thread (~27K total), which makes
+# newComputePipelineStateWithFunction fail with "Compute function exceeds
+# available stack space" on Apple Metal. Tiling the K/V reduction through
+# smaller blocks shrinks each thread-private tile so the pipeline-state
+# creation fits Metal's per-thread stack budget. This is an occupancy/tiling
+# limit (it would fail on M5 too), independent of the Metal-4 language gate.
+GDN_RECOMPUTE_W_U_METAL_SAFE_BK = 32
+GDN_RECOMPUTE_W_U_METAL_SAFE_BV = 16
 KDA_FIXED_T = 64
 KDA_FIXED_H = 1
 KDA_FIXED_HV = 1
@@ -1472,6 +1482,11 @@ def compile_kda_recompute_w_u_artifact(
             "K": int(k_dim),
             "V": int(v_dim),
             "BT": int(bt),
+            # Tile K/V through Metal-safe blocks so the per-thread WY-recompute
+            # accumulators fit the pipeline-state stack budget (shared root
+            # cause with GDN recompute_w_u -> "exceeds available stack space").
+            "BK": min(int(k_dim), GDN_RECOMPUTE_W_U_METAL_SAFE_BK),
+            "BV": min(int(v_dim), GDN_RECOMPUTE_W_U_METAL_SAFE_BV),
             "IS_VARLEN": bool(is_varlen),
         }
     )
@@ -1849,7 +1864,15 @@ def _compile_gdn_runtime_stages(
         "IS_VARLEN": bool(is_varlen),
     }
     kkt_constexprs = {**runtime_private, **shared_dims}
-    recompute_constexprs = {**runtime_private, **shared_dims, "V": int(v_dim)}
+    recompute_constexprs = {
+        **runtime_private,
+        **shared_dims,
+        "V": int(v_dim),
+        # Tile the K/V reduction through Metal-safe blocks so the per-thread
+        # recompute_w_u accumulators fit the pipeline-state stack budget.
+        "BK": min(int(k_dim), GDN_RECOMPUTE_W_U_METAL_SAFE_BK),
+        "BV": min(int(v_dim), GDN_RECOMPUTE_W_U_METAL_SAFE_BV),
+    }
     chunk_h_constexprs = {
         **runtime_private,
         "H": int(h_heads),
