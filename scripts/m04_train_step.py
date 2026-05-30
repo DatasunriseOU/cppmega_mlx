@@ -7626,10 +7626,13 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
         batch,
         end_layer_index=start_layer_index,
     )
-    layers = tuple(getattr(model, "layers", ()))
+    # The fused chain's first brick reads ``{first_brick}_hidden`` as the RAW
+    # residual baseline and applies its own entry-RMSNorm (a fused
+    # ``entry_rmsnorm`` surface bound to ``layers.{start}.norm.weight``) to
+    # derive the route input. Seeding the raw residual stream therefore matches
+    # the eager ``updated = hidden + route_delta(norm(hidden))`` contract;
+    # seeding the pre-normed hidden would double-apply the entry norm.
     boundary_hidden = prefix_hidden
-    if start_layer_index < len(layers):
-        boundary_hidden = layers[start_layer_index].norm(prefix_hidden)
     hidden_seed_names = {
         "hidden",
         f"{first_brick_name}_hidden",
