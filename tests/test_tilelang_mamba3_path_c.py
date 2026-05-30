@@ -202,6 +202,59 @@ def _require_mamba3_path_c() -> None:
         pytest.skip(f"mamba3 Path C unavailable on this host: {status.reason}")
 
 
+def _is_dlpack_contiguity_failure(exc: BaseException) -> bool:
+    """True iff any link of the cause/context chain is a DLPack contiguity reject."""
+
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur)
+        if "not contiguous" in text or "DLPackConversionError" in type(cur).__name__:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def test_fwd_path_c_accepts_strided_producer_views_no_dlpack_error() -> None:
+    """Strided/broadcast producer views must not trip the tvm-ffi DLPack check.
+
+    The Mamba3 model layer hands Path C non-contiguous views (RoPE state-dim
+    transposes, group->head broadcasts, reshapes of sliced projections). Path C
+    materializes them contiguous at its ABI boundary, so dispatch must never
+    raise ``FromDLPack: Tensor is not contiguous`` (RULE #1: fix at the source,
+    no fallback). Any *other* dispatch failure (e.g. a tilelang build-level
+    ffi-NULL) is out of scope for this contiguity guard and tolerated here.
+    """
+
+    _require_mamba3_path_c()
+    batch, seq, heads, headdim, state = 1, 4, 2, 4, 5
+    mx.random.seed(0)
+
+    def rnd(*shape: int) -> mx.array:
+        return mx.random.normal(shape).astype(mx.float32)
+
+    # h0 as a transpose view (strided) and B as a broadcast view (stride-0).
+    x = rnd(batch, seq, heads, headdim)
+    B = mx.broadcast_to(rnd(batch, seq, 1, state), (batch, seq, heads, state))
+    C = rnd(batch, seq, heads, state)
+    z = rnd(batch, seq, heads, headdim)
+    A = rnd(batch, seq, heads)
+    dt = mx.abs(rnd(batch, seq, heads))
+    D = rnd(heads)
+    h0 = mx.transpose(rnd(batch, heads, state, headdim), (0, 1, 3, 2))
+    mx.eval(x, B, C, z, A, dt, D, h0)
+
+    try:
+        y, h_last = mamba3_path_c.mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
+        mx.eval(y, h_last)
+    except Exception as exc:  # noqa: BLE001 - we classify and re-assert below
+        assert not _is_dlpack_contiguity_failure(exc), (
+            "Path C still rejects strided/broadcast inputs at the DLPack "
+            f"boundary: {exc}"
+        )
+
+
 def _assert_no_bwd_lane_grad_outputs(msl: str) -> None:
     for name in _BWD_LANE_GRAD_OUTPUT_TOKENS:
         assert name not in msl

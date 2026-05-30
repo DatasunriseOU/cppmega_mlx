@@ -2356,6 +2356,34 @@ def _require_supported_no_hidden_casts(
     return dtypes
 
 
+def _materialize_contiguous_inputs(
+    op_name: str,
+    *named_arrays: tuple[str, mx.array],
+) -> tuple[mx.array, ...]:
+    """Materialize each tvm-ffi input as a contiguous, DLPack-exportable buffer.
+
+    Path C dispatches caller-owned MLX arrays straight across the tvm-ffi
+    boundary, where ``dlpack_to_tvm_tensor`` rejects any non-contiguous layout
+    with ``FromDLPack: Tensor is not contiguous``. The Mamba3 producer (the
+    model layer feeding ``_dispatch_mamba3_scan``) can legitimately hand Path C
+    strided/broadcast views — e.g. RoPE state-dim transposes/reshapes or
+    group->head broadcasts upstream of the scan. Those are *layout* views of an
+    otherwise supported buffer, so the correct fix is to materialize the
+    contiguous buffer the ABI requires at this choke point, not to fall back to
+    another path (RULE #1).
+
+    This is layout-only: ``mx.contiguous`` is a no-op on already-contiguous
+    arrays and never changes dtype, so the no-hidden-cast contract is preserved
+    (unsupported dtypes are still rejected by
+    :func:`_require_supported_no_hidden_casts`). Anything ``mx.contiguous``
+    genuinely cannot make DLPack-exportable still surfaces loudly at the
+    dispatch boundary via :func:`_raise_if_dlpack_boundary_failure`.
+    """
+
+    del op_name
+    return tuple(mx.contiguous(array) for _name, array in named_arrays)
+
+
 def _require_owner_array(
     op_name: str,
     name: str,
@@ -2770,6 +2798,21 @@ def mamba3_mimo_fwd_path_c(
         ("D", D),
         ("h0", h0),
     )
+    # The producer may hand Path C strided/broadcast views (RoPE state-dim
+    # transposes, group->head broadcasts, slices). The tvm-ffi DLPack import
+    # rejects non-contiguous buffers, so materialize the contiguous layout the
+    # ABI requires here (layout-only, dtype-preserving; RULE #1: no fallback).
+    x, B, C, z, A, dt, D, h0 = _materialize_contiguous_inputs(
+        "mamba3_mimo_fwd_path_c",
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
+    )
     if seq == 0:
         if out is not None:
             raise RuntimeError(
@@ -2868,6 +2911,20 @@ def _mamba3_mimo_fwd_path_c_with_snapshots(
 
     batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
     dtypes = _require_supported_no_hidden_casts(
+        "mamba3_mimo_fwd_path_c",
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
+    )
+    # See mamba3_mimo_fwd_path_c: materialize contiguous tvm-ffi inputs so a
+    # strided/broadcast producer view does not trip the DLPack contiguity check
+    # (layout-only, dtype-preserving; RULE #1: no fallback).
+    x, B, C, z, A, dt, D, h0 = _materialize_contiguous_inputs(
         "mamba3_mimo_fwd_path_c",
         ("x", x),
         ("B", B),
@@ -3860,6 +3917,23 @@ def mamba3_mimo_bwd_path_c(
         _y, vjps = mx.vjp(_ref, primals, [dy])
         return tuple(vjps)
 
+    # Materialize contiguous tvm-ffi inputs once at the Metal backward entry so
+    # every downstream Path C bwd kernel (snapshot, lane-grad, reducer) receives
+    # DLPack-exportable buffers even when the VJP cotangent or a producer view
+    # is strided/broadcast (layout-only, dtype-preserving; RULE #1: no
+    # fallback). Unsupported dtypes are still rejected downstream.
+    dy, x, B, C, z, A, dt, D, h0 = _materialize_contiguous_inputs(
+        "mamba3_mimo_bwd_path_c",
+        ("dy", dy),
+        ("x", x),
+        ("B", B),
+        ("C", C),
+        ("z", z),
+        ("A", A),
+        ("dt", dt),
+        ("D", D),
+        ("h0", h0),
+    )
     return _mamba3_mimo_bwd_path_c_kernel(dy, x, B, C, z, A, dt, D, h0, out=out)
 
 
