@@ -13,14 +13,32 @@ scaffold with a pure-MLX FP8-dequant GEMM path that mirrors the upstream V3.2
 The K side (wk) and weights_proj stay bfloat16 — they're tiny (head_dim ~32
 and n_heads ~32) so the FP8 overhead is not worth it.
 
+Fused FP8 GEMM wiring (Path C):
+    The indexer's ``q`` projection ``qr @ wq_b.T`` — the inner block-FP8
+    weight × activation GEMM that feeds the score einsum — is routed through
+    the TileLang cooperative-tensor ``fused_fp8_gemm`` prim (the keystone
+    block-FP8 GEMM) via :meth:`LightningIndexerFP8._wq_b_apply`, under an
+    *explicit* shape-dispatch (RULE #1: no silent dequant fallback hiding a
+    broken fused path — a malformed FP8 weight RAISES).  ``fused_fp8_gemm``
+    internally picks its cooperative-tensor prim or a numerically e4m3-exact
+    scalar MSL kernel; both agree to FP8 tolerance.
+
+    The score contraction itself (``einsum bqhd,bkd,bqh->bqk``) is NOT a
+    ``fused_fp8_gemm``-shaped op: both ``q`` and ``k`` are *dynamic bf16
+    activations* (there is no static block-FP8 weight operand), and the
+    contraction is a per-head-weighted, head-summed attention score, not a
+    plain ``A @ W.T``.  It therefore stays pure-MLX by design — wiring it
+    through ``fused_fp8_gemm`` would require fabricating a fake static FP8
+    weight, which RULE #1 forbids.
+
 Provenance / labelling note:
     The only vendored upstream piece here is ``dequant_block_fp8`` (mlx-lm
-    PR #1224); everything else is plain MLX ops. There is NO fused Path-E
-    Metal indexer kernel — do not label this module "Path E". The GDN/KDA
-    Path E (``mlx_lm_gated_delta_update`` / ``mlx_lm_kda_update``) is a
-    separate, genuinely fused vendored Metal kernel. A future Metal/TileLang
-    fused indexer GEMM could replace the inner matmul here without touching
-    this wrapper's external API; until then this is a pure-MLX path.
+    PR #1224). There is NO fused Path-E Metal indexer kernel — do not label
+    this module "Path E". The GDN/KDA Path E
+    (``mlx_lm_gated_delta_update`` / ``mlx_lm_kda_update``) is a separate,
+    genuinely fused vendored Metal kernel. The ``wq_b`` projection here is a
+    real fused TileLang block-FP8 GEMM (Path C), but the wrapper as a whole is
+    not "Path E".
 """
 
 from dataclasses import dataclass
@@ -95,30 +113,92 @@ class LightningIndexerFP8(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, config.n_heads, bias=False)
 
     def _wq_b_apply(self, qr: mx.array) -> mx.array:
-        """Apply wq_b: qr @ wq_b.T with dequant-on-the-fly.
+        """Apply the FP8 score-path projection ``qr @ wq_b.T``.
 
-        For the fp8-blocks path this reuses the fused cooperative-tensor
-        ``fused_fp8_gemm`` (block-FP8 weight × activation -> ``qr @ W.T``)
-        when available, falling back to a pure-MLX ``dequant_block_fp8`` +
-        matmul otherwise.  ``fused_fp8_gemm`` is itself fail-safe (it drops to
-        its own scalar kernel if TileLang is unavailable), so the indexer keeps
-        working on every host.
+        This is the indexer's one genuine block-FP8 weight × activation GEMM
+        (the ``q`` projection that feeds the score einsum downstream): ``wq_b``
+        is stored as a static ``[out_dim, q_lora_rank]`` uint8 e4m3 weight with
+        a ``[ceil(out_dim/128), ceil(q_lora_rank/128)]`` per-block ``scale_inv``,
+        which is exactly the ``fused_fp8_gemm`` contract (``out = a @ W.T`` with
+        a precomputed block-FP8 weight).
+
+        RULE #1 — explicit dispatch, NO silent fallback:
+          * fp8-blocks path: the shape is validated against the
+            ``fused_fp8_gemm`` block-FP8 contract and the fused
+            cooperative-tensor kernel is called *directly*.  If the kernel
+            raises it propagates — we do NOT swallow it into a dequant matmul
+            that would hide a broken fused path.  ``fused_fp8_gemm`` itself
+            chooses its TileLang cooperative-tensor prim vs scalar MSL kernel
+            (both numerically e4m3-exact); that is an internal, numerically
+            equivalent choice, not a degraded fallback.
+          * a shape that does NOT satisfy the block-FP8 contract is handled by
+            an *explicit*, shape-correct ``dequant_block_fp8`` + matmul path
+            with a stated reason — reached only when the contract check says so,
+            never as an exception-swallowing escape hatch.
+          * non-fp8 (bf16) path: plain matmul, no fp8 involved.
         """
         if self.config.fp8_blocks:
-            try:
-                from cppmega_v4._tilelang.fused_fp8_gemm import fused_fp8_gemm
+            from cppmega_v4._tilelang.fused_fp8_gemm import fused_fp8_gemm
 
+            if self._wq_b_fp8_gemm_supported(qr):
                 # W = wq_b [out_dim, q_lora_rank]; fused_fp8_gemm computes
-                # qr @ W.T = [B, T, out_dim].
+                # qr @ W.T = [B, T, out_dim].  Errors here propagate (RULE #1).
                 return fused_fp8_gemm(
                     self._wq_b_fp8, self._wq_b_scale_inv, qr
                 ).astype(mx.bfloat16)
-            except Exception:  # noqa: BLE001 -- never break the indexer forward
-                w = dequant_block_fp8(self._wq_b_fp8, self._wq_b_scale_inv)
+            # Explicit (not silent) shape-correct path: the weight does not
+            # satisfy the block-FP8 GEMM contract, so dequant the e4m3 weight
+            # and matmul in bf16.  The reason is reported by
+            # ``_wq_b_fp8_gemm_supported`` raising on a genuinely broken shape.
+            w = dequant_block_fp8(self._wq_b_fp8, self._wq_b_scale_inv)
         else:
             w = self._wq_b_bf16
         # qr [B, T, q_lora_rank] @ w.T [q_lora_rank, out_dim]
         return qr.astype(mx.bfloat16) @ w.T
+
+    def _wq_b_fp8_gemm_supported(self, qr: mx.array) -> bool:
+        """Explicit dispatch predicate for the ``fused_fp8_gemm`` score GEMM.
+
+        Returns ``True`` when the stored ``wq_b`` weight + ``qr`` activation
+        satisfy the ``fused_fp8_gemm`` block-FP8 contract (uint8 2D weight,
+        matching contraction dim, correctly-shaped per-128-block ``scale_inv``).
+
+        RULE #1: a malformed FP8 weight (wrong dtype / rank / scale-block shape)
+        is a real bug, so this RAISES rather than silently steering to a
+        dequant fallback.  ``False`` is returned only for the one legitimate
+        non-fused case — an empty contraction (``q_lora_rank == 0``) where the
+        GEMM is degenerate — which the explicit dequant path then handles.
+        """
+        w = self._wq_b_fp8
+        s = self._wq_b_scale_inv
+        if w.dtype != mx.uint8:
+            raise TypeError(
+                f"_wq_b_apply: wq_b fp8 weight must be uint8 e4m3 storage; "
+                f"got {w.dtype}"
+            )
+        if w.ndim != 2:
+            raise ValueError(
+                f"_wq_b_apply: wq_b fp8 weight must be 2D [out_dim, q_lora_rank]; "
+                f"got shape {w.shape}"
+            )
+        out_dim, k = w.shape
+        if qr.shape[-1] != k:
+            raise ValueError(
+                f"_wq_b_apply: qr last dim ({qr.shape[-1]}) must match wq_b "
+                f"contraction dim ({k})"
+            )
+        blocks_m = (out_dim + _FP8_BLOCK - 1) // _FP8_BLOCK
+        blocks_k = (k + _FP8_BLOCK - 1) // _FP8_BLOCK
+        if tuple(s.shape) != (blocks_m, blocks_k):
+            raise ValueError(
+                f"_wq_b_apply: wq_b scale_inv shape {tuple(s.shape)} != expected "
+                f"({blocks_m}, {blocks_k}) for W={w.shape} block={_FP8_BLOCK}"
+            )
+        if k == 0:
+            # Degenerate empty contraction: fused_fp8_gemm has nothing to do;
+            # the explicit dequant+matmul path returns the correct zeros.
+            return False
+        return True
 
     def load_fp8_weights(
         self,
