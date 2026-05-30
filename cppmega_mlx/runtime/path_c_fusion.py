@@ -8,7 +8,7 @@ lowered Metal kernels.
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
@@ -2842,6 +2842,83 @@ def _single_entry_prim_func(func_or_mod: Any) -> Any:
     return prim_func
 
 
+def _path_c_prim_func_disables_tir_simplify(prim_func: Any) -> bool:
+    """True iff ``prim_func`` carries ``tl.fusion.disable_tir_simplify``.
+
+    The descriptor scheduler sets this attr on every row-phased kernel (forward
+    and backward) to opt out of the heavy TVM arithmetic simplifier — its
+    deeply-nested per-lane strided guards make ``RewriteSimplifier::TryCompare``
+    blow up.  TileLang's ``engine/phase.py`` already honours the attr in its
+    gated ``_maybe_simplify`` sites, but the CUDA backend pipeline prologue
+    (``tilelang/backend/cuda/pipeline.py``) calls a RAW, UNGATED
+    ``tilelang.transform.Simplify()`` that ignores the attr.  That ungated
+    Simplify is the entire ~18-23 min cold-compile blow-up of the fused mamba3
+    backward ``b0`` kernel (profiled: it is the single hot frame; bypassing it
+    lowers the kernel in ~10-13 s).  See
+    ``_path_c_cuda_prologue_simplify_gate``.
+    """
+
+    for attrs in (
+        getattr(prim_func, "attrs", None),
+        None,
+    ):
+        if attrs is None:
+            continue
+        try:
+            if bool(attrs.get("tl.fusion.disable_tir_simplify", False)):
+                return True
+        except Exception:  # noqa: BLE001
+            try:
+                if bool(attrs["tl.fusion.disable_tir_simplify"]):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+    return False
+
+
+@contextmanager
+def _path_c_cuda_prologue_simplify_gate(prim_func: Any, *, target: str) -> Any:
+    """Honour ``tl.fusion.disable_tir_simplify`` for the UNGATED CUDA-prologue
+    ``Simplify`` pass by temporarily replacing it with an identity pass.
+
+    TileLang's ``engine/phase.py`` skips ``Simplify`` for these kernels, but the
+    CUDA backend prologue (``backend/cuda/pipeline.py``) re-runs a raw
+    ``tilelang.transform.Simplify()`` that does NOT consult the attr — and that
+    one pass is the whole multi-minute compile blow-up for the fused row-phased
+    mamba3 backward.  When the kernel opts out of simplification AND we target
+    CUDA, we swap ``tilelang.transform.Simplify`` for an identity-returning pass
+    for the lifetime of this compile only, then restore it.  This is exactly the
+    behaviour the ``disable_tir_simplify`` attr already requests everywhere else,
+    so it preserves the established (correctness-safe) lowering of this kernel
+    class — the kernel still lowers and runs identically, just without the
+    redundant, pathologically-slow simplifier sweep.  A strict no-op on Metal /
+    any kernel that does not set the attr.
+    """
+
+    if "cuda" not in str(target) or not _path_c_prim_func_disables_tir_simplify(
+        prim_func
+    ):
+        yield
+        return
+
+    import tilelang.transform as _tl_transform
+
+    original_simplify = _tl_transform.Simplify
+
+    class _IdentityPass:
+        def __call__(self, mod: Any) -> Any:
+            return mod
+
+    def _identity_simplify(*_args: Any, **_kwargs: Any) -> Any:
+        return _IdentityPass()
+
+    _tl_transform.Simplify = _identity_simplify  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        _tl_transform.Simplify = original_simplify  # type: ignore[assignment]
+
+
 def _compile_tilelang_prim_func(
     prim_func: Any,
     *,
@@ -2851,22 +2928,22 @@ def _compile_tilelang_prim_func(
 ) -> Any:
     import tilelang
 
-    if not pass_configs:
-        return tilelang.compile(
-            prim_func,
-            target=target,
-            execution_backend=execution_backend,
-        )
+    with _path_c_cuda_prologue_simplify_gate(prim_func, target=target):
+        if not pass_configs:
+            return tilelang.compile(
+                prim_func,
+                target=target,
+                execution_backend=execution_backend,
+            )
 
-    from tilelang import tvm
+        from tilelang import tvm
 
-    with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
-        return tilelang.compile(
-            prim_func,
-            target=target,
-            execution_backend=execution_backend,
-        )
-
+        with tvm.transform.PassContext(opt_level=3, config=dict(pass_configs)):
+            return tilelang.compile(
+                prim_func,
+                target=target,
+                execution_backend=execution_backend,
+            )
 
 def _tilelang_compile_plan_for(
     region: PathCFusionRegion,
