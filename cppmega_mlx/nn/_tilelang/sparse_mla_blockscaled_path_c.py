@@ -138,6 +138,19 @@ class SparseMLABlockScaledPathCDirectError(RuntimeError):
     """Raised when the prepared-buffer tvm-ffi owner-output path cannot run."""
 
 
+def _flat_1d_view(a: mx.array) -> mx.array:
+    """Return a contiguous flat 1-D view matching the kernel's flat ABI.
+
+    The ``blockscaled_sparse_mla_apply_kernel`` declares flat 1-D ``T.Tensor``
+    signatures for every buffer, but callers hand in raw 4-D arrays. Passing a
+    4-D array against a 1-D signature makes tvm-ffi return NULL. ``mx.contiguous``
+    guards against non-contiguous inputs (e.g. transposed/sliced views) so the
+    reshape produces a faithful row-major flat buffer rather than a wrong one.
+    """
+
+    return mx.contiguous(a.reshape((int(a.size),)))
+
+
 def _owner_output_tuple(
     returned: Any,
     *,
@@ -1365,15 +1378,21 @@ def sparse_mla_blockscaled_path_c_apply_direct(
         ) from exc
 
     sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
+    # The kernel declares flat 1-D ABI for every buffer (inputs AND the out/lse
+    # owner outputs). Flatten the inputs and hand the kernel flat views of the
+    # caller-owned outputs; those flat views share storage with the 4-D/3-D
+    # owner buffers, so the in-place write is visible after we reshape back.
+    out_flat = _flat_1d_view(out_buf)
+    lse_flat = _flat_1d_view(lse_buf)
     try:
         returned = kernel(
-            q_fp8,
-            q_scale,
-            kv_fp8,
-            kv_scale,
-            indices,
+            _flat_1d_view(q_fp8),
+            _flat_1d_view(q_scale),
+            _flat_1d_view(kv_fp8),
+            _flat_1d_view(kv_scale),
+            _flat_1d_view(indices),
             sm_scale_buf,
-            out=(out_buf, lse_buf),
+            out=(out_flat, lse_flat),
         )
     except Exception as exc:
         try:
@@ -1386,12 +1405,15 @@ def sparse_mla_blockscaled_path_c_apply_direct(
             "direct tvm-ffi E8M0 Sparse-MLA forward dispatch failed: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    _owner_output_tuple(
+    out_written, lse_written = _owner_output_tuple(
         returned,
-        expected=(out_buf, lse_buf),
+        expected=(out_flat, lse_flat),
         op_name="direct tvm-ffi E8M0 Sparse-MLA forward",
     )
-    return out_buf, lse_buf
+    return (
+        out_written.reshape(tuple(int(d) for d in out_buf.shape)),
+        lse_written.reshape(tuple(int(d) for d in lse_buf.shape)),
+    )
 
 
 def sparse_mla_blockscaled_path_c_apply(
@@ -1476,11 +1498,11 @@ def sparse_mla_blockscaled_path_c_apply(
         )
         sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
         returned = kernel(
-            q_fp8,
-            q_scale,
-            kv_fp8,
-            kv_scale,
-            indices,
+            _flat_1d_view(q_fp8),
+            _flat_1d_view(q_scale),
+            _flat_1d_view(kv_fp8),
+            _flat_1d_view(kv_scale),
+            _flat_1d_view(indices),
             sm_scale_buf,
         )
     except Exception as exc:

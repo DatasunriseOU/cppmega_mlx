@@ -246,6 +246,9 @@ def test_blockscaled_path_c_forward_uses_tvm_ffi_owner_outputs(
 
         def fake_kernel(*kernel_args: object, out: tuple[mx.array, mx.array]):
             calls.append((kernel_args, out))
+            # The kernel writes its flat 1-D owner buffers in place. Emulate
+            # that here so the test can prove the reshape view the wrapper
+            # returns shares storage with the caller-owned out/lse buffers.
             return out
 
         return fake_kernel
@@ -277,18 +280,25 @@ def test_blockscaled_path_c_forward_uses_tvm_ffi_owner_outputs(
         lse=lse,
     )
 
+    # The kernel declares a flat 1-D ABI for every buffer; the wrapper must
+    # flatten the raw 4-D inputs (and the out/lse owner buffers) before
+    # dispatch, then reshape the written owner buffers back to caller shape.
     assert isinstance(result, tuple)
-    assert result[0] is out
-    assert result[1] is lse
+    assert tuple(result[0].shape) == (batch, seq, heads, dim)
+    assert tuple(result[1].shape) == (batch, seq, heads)
     assert len(calls) == 1
     kernel_args, owner_outputs = calls[0]
-    assert kernel_args[0] is q_fp8
-    assert kernel_args[1] is q_scale
-    assert kernel_args[2] is kv_fp8
-    assert kernel_args[3] is kv_scale
-    assert kernel_args[4] is indices
-    assert owner_outputs[0] is out
-    assert owner_outputs[1] is lse
+    # Every positional kernel arg (except the scalar sm_scale buffer) must be a
+    # contiguous flat 1-D view of the corresponding raw 4-D caller array.
+    assert tuple(kernel_args[0].shape) == (q_fp8.size,)
+    assert tuple(kernel_args[1].shape) == (q_scale.size,)
+    assert tuple(kernel_args[2].shape) == (kv_fp8.size,)
+    assert tuple(kernel_args[3].shape) == (kv_scale.size,)
+    assert tuple(kernel_args[4].shape) == (indices.size,)
+    # The owner outputs handed to the kernel are flat 1-D views that share
+    # storage with the caller-owned out/lse buffers.
+    assert tuple(owner_outputs[0].shape) == (out.size,)
+    assert tuple(owner_outputs[1].shape) == (lse.size,)
 
 
 def test_blockscaled_path_c_forward_owner_output_abi_is_fail_closed(
@@ -379,6 +389,69 @@ def test_blockscaled_path_c_apply_matches_reference() -> None:
     assert out_c is not None
     out_ref = sparse_mla_blockscaled_reference(q, kv, indices, sm_scale=sm_scale, d_v=dim)
     mx.eval(out_c, out_ref)
+    np.testing.assert_allclose(
+        np.asarray(out_c.astype(mx.float32)),
+        np.asarray(cast(mx.array, out_ref).astype(mx.float32)),
+        atol=2e-2,
+        rtol=5e-2,
+    )
+
+
+def test_blockscaled_path_c_apply_owner_output_direct_matches_reference() -> None:
+    """Exercise the _direct owner-output route on the real Metal kernel.
+
+    The kernel declares a flat 1-D ABI for the out/lse owner buffers too. This
+    test passes raw 4-D out / 3-D lse caller-owned buffers through the public
+    owner-output route (out=/lse=), which dispatches into
+    ``sparse_mla_blockscaled_path_c_apply_direct``. It proves the flatten +
+    reshape-back path writes correct values in place rather than producing the
+    ffi-NULL the flat-vs-4D ABI mismatch used to raise.
+    """
+
+    if not _metal_available():
+        pytest.skip("Metal backend not available on this host")
+
+    rng = np.random.RandomState(12)
+    batch, seq, heads, kv_group, seq_kv, topk, dim = 1, 2, 2, 1, 8, 4, 64
+    q = mx.array((rng.standard_normal((batch, seq, heads, dim)) * 0.1).astype(np.float16))
+    kv = mx.array((rng.standard_normal((batch, seq_kv, kv_group, dim)) * 0.1).astype(np.float16))
+    indices_np = rng.randint(0, seq_kv, size=(batch, seq, kv_group, topk)).astype(np.int32)
+    indices = mx.array(indices_np)
+    sm_scale = dim ** -0.5
+
+    q_packed, q_scales = _quantize_mxfp8(q)
+    kv_packed, kv_scales = _quantize_mxfp8(kv)
+    q_fp8 = _unpack_mxfp8_to_uint8(q_packed, dim)
+    kv_fp8 = _unpack_mxfp8_to_uint8(kv_packed, dim)
+
+    out_buf = mx.zeros((batch, seq, heads, dim), dtype=mx.float16)
+    lse_buf = mx.zeros((batch, seq, heads), dtype=mx.float32)
+
+    out_c, lse_c = sparse_mla_blockscaled_path_c_apply(
+        q_fp8,
+        q_scales,
+        kv_fp8,
+        kv_scales,
+        indices,
+        sm_scale=sm_scale,
+        d_v=dim,
+        return_lse=True,
+        force_path_c=True,
+        out=out_buf,
+        lse=lse_buf,
+    )
+
+    assert tuple(out_c.shape) == (batch, seq, heads, dim)
+    assert tuple(lse_c.shape) == (batch, seq, heads)
+
+    out_ref = sparse_mla_blockscaled_reference(q, kv, indices, sm_scale=sm_scale, d_v=dim)
+    mx.eval(out_c, out_ref, out_buf)
+    # The reshape-back view and the caller-owned 4-D buffer must hold the same
+    # in-place written values.
+    np.testing.assert_array_equal(
+        np.asarray(out_c.astype(mx.float32)),
+        np.asarray(out_buf.astype(mx.float32)),
+    )
     np.testing.assert_allclose(
         np.asarray(out_c.astype(mx.float32)),
         np.asarray(cast(mx.array, out_ref).astype(mx.float32)),
