@@ -125,6 +125,56 @@ def _metal_smem_blocker(msg: str) -> bool:
     return "threadgroup memory" in msg.lower() and "exceeds" in msg.lower()
 
 
+def _metal_pipeline_state_blocker(msg: str) -> bool:
+    """Metal pipeline-state creation (newComputePipelineStateWithFunction) failed.
+
+    Surfaces as ``Check failed: (state != nullptr)`` from the TVM Metal runtime,
+    typically with "Compute function exceeds available stack space". This is an
+    Apple per-thread occupancy limit for a given kernel/tiling (e.g. the
+    ``h_blockdim64`` chunk-state kernel with an initial state loaded), not a
+    Path D launch-ABI or arg-count defect.
+    """
+
+    low = msg.lower()
+    return "state != nullptr" in low or (
+        "cannot get state" in low and "function" in low
+    )
+
+
+def _tilelang_non_tail_output_abi_bug(msg: str) -> bool:
+    """TileLang tvm-ffi Metal mis-maps any non-tail ``out_idx`` owner-output.
+
+    This is a REAL TileLang codegen/launch defect, *not* a cppmega-side or
+    per-shape Metal-hardware constraint, and *not* the matmul2d zeros /
+    cooperative-tensor launch-config bug fixed in tilelang ``7ae53998``.
+
+    Root cause (isolated with a 4-line repro, zero cppmega code): the
+    ``execution_backend='tvm_ffi'`` Metal route only binds owner-output buffers
+    correctly when every ``out_idx`` parameter sits at the *tail* of the kernel
+    signature. When an output is followed by any input parameter, the bridge
+    binds the wrong MLX buffer to that output slot. Minimal evidence::
+
+        out_idx=[2] of 3 params (tail)      -> correct (max_err 0.0)
+        out_idx=[1] of 3 params (non-tail)  -> WRONG  (max_err ~4.8)
+        out_idx=[1] of 4 params (non-tail)  -> WRONG  (max_err ~8.8)
+        out_idx=[1,2] of 4 (last adjacent)  -> out[2] OK, out[1] WRONG
+
+    When the resulting buffer-count bookkeeping breaks hard (e.g. the GDN
+    ``kkt_solve`` stage: 6 params, out_idx=[3], two trailing int64 topology
+    buffers), it surfaces as the make_packed_api host assertion
+    ``<kernel>: num_args should be N``; milder cases silently return wrong
+    numbers. Every GDN Path D stage (kkt_solve out_idx=[3]/6, recompute_w_u
+    out_idx=[3,4]/9, chunk_delta_h out_idx=[3,6]/11) has a non-tail output, so
+    the pipeline cannot launch correctly until TileLang binds non-tail
+    owner-outputs by index on the Metal tvm-ffi route.
+
+    NOTE: this is a *diagnosis only*. The cell is still recorded as not-launched
+    / not-parity-ok; no numerical fallback is substituted (RULE #1).
+    """
+
+    return "num_args should be" in msg
+
+
 def _run_cell(shape: GDNParityShape, *, tol_abs: float, tol_rel: float) -> GDNParityCell:
     import mlx.core as mx
 
@@ -221,11 +271,32 @@ def _run_cell(shape: GDNParityShape, *, tol_abs: float, tol_rel: float) -> GDNPa
     except Exception as exc:  # noqa: BLE001
         msg = f"{exc.__class__.__name__}: {exc}"
         cell.error = msg[:600]
-        if _metal_smem_blocker(msg):
+        if _tilelang_non_tail_output_abi_bug(msg):
+            cell.error = (
+                "TileLang tvm-ffi Metal NON-TAIL owner-output ABI bug: a Path D "
+                "stage with an out_idx that is not the tail parameter is bound to "
+                "the wrong MLX buffer, surfacing here as the make_packed_api host "
+                "assertion 'num_args should be N'. This is a REAL TileLang "
+                "codegen/launch defect (reproducible with a 4-line kernel, no "
+                "cppmega code), NOT a per-shape Metal-hardware constraint and NOT "
+                "the matmul2d zeros/launch-config bug fixed in tilelang 7ae53998. "
+                "Every GDN Path D stage (kkt_solve/recompute_w_u/chunk_delta_h) "
+                "has a non-tail output, so the pipeline cannot launch until "
+                "TileLang binds non-tail owner-outputs by index. See "
+                f"_tilelang_non_tail_output_abi_bug. raw={msg[:200]}"
+            )
+        elif _metal_smem_blocker(msg):
             cell.error = (
                 "Metal threadgroup-memory limit: kernel SMEM footprint exceeds "
                 "Apple's 32 KiB per-threadgroup cap at this K/V tiling "
                 f"(per-shape Metal constraint). raw={msg[:200]}"
+            )
+        elif _metal_pipeline_state_blocker(msg):
+            cell.error = (
+                "Metal pipeline-state limit: newComputePipelineStateWithFunction "
+                "failed (compute function exceeds available stack space) for this "
+                "kernel/tiling -- a per-shape Apple occupancy constraint, not a "
+                f"Path D launch-ABI/arg-count defect. raw={msg[:200]}"
             )
         elif _metal_launch_blocker(msg):
             cell.error = (

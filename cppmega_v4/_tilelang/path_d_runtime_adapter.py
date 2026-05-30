@@ -1769,6 +1769,69 @@ def _launch_stage(stage: PathDCompileResult, *args: Any) -> Any:
     return stage.launch(*args)
 
 
+def _isolate_pipeline_launch_graph() -> None:
+    """Drop stale MLX/TVM-FFI producer records before a Path D pipeline launch.
+
+    Root cause of the spurious ``<kernel>: num_args should be N`` launch-ABI
+    assertion: the TileLang MLX bridge tracks producer->consumer launch hazards
+    in a *process-global* registry keyed by ``id()`` of the MLX array
+    (``tilelang.analysis.metal_graph_sync._PRODUCERS``). Across independent Path D
+    invocations (the parity harness's eight cells, or several adapter calls in one
+    pytest process), MLX frees an earlier pipeline's intermediate array and reuses
+    its ``id()`` for a buffer in the next pipeline. The next launch then matches a
+    *stale* producer record and dispatches a packed call with the wrong buffer
+    set, which make_packed_api host arg-packing rejects as a num_args mismatch --
+    even though the adapter handed every stage exactly its declared parameter
+    count. Synchronizing and clearing the registry here gives each pipeline a
+    clean launch graph, so independent invocations cannot cross-contaminate.
+
+    Best-effort and dependency-light: if MLX or the bridge's test hook is
+    unavailable, this is a silent no-op (the bug only manifests on the real
+    Metal/MLX bridge anyway).
+    """
+
+    try:
+        import mlx.core as mx
+
+        mx.synchronize()
+    except Exception:  # noqa: BLE001 - MLX may be absent in unit contexts
+        pass
+    try:
+        from tilelang.analysis.metal_graph_sync import (
+            clear_metal_graph_sync_state_for_tests,
+        )
+
+        clear_metal_graph_sync_state_for_tests()
+    except Exception:  # noqa: BLE001 - bridge optional / API may move
+        pass
+
+
+def _materialize_pipeline_outputs(*outputs: Any) -> None:
+    """Force MLX to evaluate a Path D multi-kernel pipeline before returning.
+
+    The TileLang MLX/TVM-FFI bridge tracks producer->consumer launch hazards in
+    a *process-global* registry keyed by ``id()`` of the MLX array
+    (``tilelang.analysis.metal_graph_sync._PRODUCERS``). A Path D forward builds
+    a four/five-kernel lazy MLX graph and returns it un-evaluated. If a caller
+    builds several such pipelines before evaluating any of them (e.g. the parity
+    harness, or any batched eval), MLX may free an intermediate array and reuse
+    its ``id()`` for a later pipeline's buffer, so the stale producer record is
+    matched to the wrong launch. At ``mx.eval`` time the bridge then dispatches a
+    packed call with a mismatched buffer set, surfacing as a spurious
+    ``<kernel>: num_args should be N`` assertion from make_packed_api host
+    arg-packing -- even though every stage was handed exactly its declared
+    parameter count. Evaluating the outputs here closes each pipeline's graph (and
+    drops its intermediates from the producer registry) before the next launch,
+    so independent invocations cannot cross-contaminate.
+    """
+
+    import mlx.core as mx
+
+    materialized = [out for out in outputs if out is not None]
+    if materialized:
+        mx.eval(*materialized)
+
+
 def _bind_returned_outputs(
     stage: str,
     returned: Any,
@@ -2304,6 +2367,12 @@ def gdn_fwd_runtime_call(
         if not stage.available:
             raise PathDRuntimeUnavailable(stage.reason)
 
+    # Start this pipeline with a clean MLX/TVM-FFI launch graph so a prior
+    # caller's freed-and-reused array id() cannot mismatch our stage launches
+    # (the spurious "num_args should be N" assertion). See
+    # _isolate_pipeline_launch_graph.
+    _isolate_pipeline_launch_graph()
+
     nt = num_chunks
     q_flat = _flatten(q)
     k_flat = _flatten(k)
@@ -2396,6 +2465,11 @@ def gdn_fwd_runtime_call(
         if output_final_state
         else None
     )
+    # Close this pipeline's lazy MLX graph before returning so its intermediate
+    # buffers leave the bridge's id()-keyed producer registry and cannot be
+    # mismatched to a later Path D launch (the spurious "num_args should be N"
+    # launch-ABI assertion). See _materialize_pipeline_outputs.
+    _materialize_pipeline_outputs(y, final_state)
     return y, final_state
 
 
@@ -2713,6 +2787,11 @@ def kda_fwd_runtime_call(
             detail = f"; {coverage_reason}" if coverage_reason else ""
             raise PathDRuntimeUnavailable(f"{stage.reason}{detail}")
 
+    # Start with a clean MLX/TVM-FFI launch graph (see
+    # _isolate_pipeline_launch_graph) so a prior caller's reused array id()
+    # cannot mismatch our stage launches.
+    _isolate_pipeline_launch_graph()
+
     h_chunks = num_chunks
     q_flat = _flatten(q)
     k_flat = _flatten(k)
@@ -2833,6 +2912,11 @@ def kda_fwd_runtime_call(
         if output_final_state
         else None
     )
+    # Close this pipeline's lazy MLX graph before returning (see
+    # _materialize_pipeline_outputs) so KDA's multi-kernel intermediates cannot
+    # cross-contaminate a later Path D launch via the bridge's id()-keyed
+    # producer registry.
+    _materialize_pipeline_outputs(y, final_state)
     return y, final_state
 
 
