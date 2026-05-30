@@ -255,8 +255,17 @@ def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
             "path_e", _path_e_status().reason, allow_fallback, *args, **kwargs,
         )
     try:
+        from cppmega_v4.nn._external._path_e_eligibility import PathEUnavailable
         from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
         return kda_update(*args, **kwargs)
+    except PathEUnavailable as exc:
+        # AVAILABILITY/SELECTION signal (e.g. an ineligible shape), NOT a
+        # runtime crash. Route it like static unavailability above so the
+        # dispatcher falls back to Path B/A (or RAISES when allow_fallback is
+        # False). A genuine kernel crash still hits the always-raise handler.
+        return _fallback_or_raise(
+            "path_e", str(exc), allow_fallback, *args, **kwargs,
+        )
     except Exception as exc:
         return _dispatch_failure_or_fallback(
             "path_e", exc, allow_fallback, *args, **kwargs,

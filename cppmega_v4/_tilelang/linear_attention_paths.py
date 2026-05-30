@@ -280,6 +280,8 @@ def _path_e_status_for_inputs(*args, **kwargs) -> PathStatus:
 
 
 def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
+    from cppmega_v4.nn._external._path_e_eligibility import PathEUnavailable
+
     status = _path_e_status()
     if not status.available:
         return _fallback_or_raise(
@@ -290,6 +292,17 @@ def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
             "cppmega_v4.nn._external.mlx_lm_gated_delta_update"
         )
         return op.gated_delta_update(*args, **kwargs)
+    except PathEUnavailable as exc:
+        # AVAILABILITY/SELECTION signal, NOT a runtime crash. Path E raises
+        # PathEUnavailable (mlx_lm_gated_delta_update.py) when the gate is
+        # amplifying (g>0) or the shape is ineligible — it explicitly cannot
+        # represent this input. That is semantically identical to the static
+        # unavailability routed above, so route it the same way (fall back to
+        # Path B/A, or RAISE when allow_fallback=False). RULE #1 stays intact:
+        # a genuine kernel crash falls through to the always-raise handler.
+        return _fallback_or_raise(
+            "path_e", str(exc), allow_fallback, *args, **kwargs,
+        )
     except Exception as exc:
         return _dispatch_failure_or_fallback(
             "path_e", exc, allow_fallback, *args, **kwargs,
