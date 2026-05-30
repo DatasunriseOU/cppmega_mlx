@@ -118,17 +118,20 @@ def test_path_e_status_unavailable_for_amplifying_gate():
     assert "amplifying" in st.reason
 
 
-def test_path_e_status_unavailable_for_ineligible_shape():
-    """Auto-mode status must mark Path E unavailable for Dk%32!=0."""
-    B, T, H, K, V = 1, 4, 2, 8, 8  # ineligible: K=8
+def test_path_e_status_available_for_odd_dk_shape():
+    """After the in-MSL remainder-mask, Dk%32!=0 forward shapes are AVAILABLE.
+
+    (Previously this asserted unavailability; the fast forward kernel now
+    handles any Dk correctly, so an odd Dk no longer fails closed.)
+    """
+    B, T, H, K, V = 1, 4, 2, 40, 17  # Dk%32!=0 and Dv%4!=0
     q = mx.random.normal((B, T, H, K))
     k = mx.random.normal((B, T, H, K))
     v = mx.random.normal((B, T, H, V))
     beta = mx.sigmoid(mx.random.normal((B, T, H)))
     g = -mx.abs(mx.random.normal((B, T, H)) * 0.1)
     st = _path_e_status_for_inputs(q, k, v, beta, g)
-    assert not st.available
-    assert "ineligible" in st.reason
+    assert st.available
 
 
 def test_path_e_status_available_for_eligible_inputs():

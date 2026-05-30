@@ -20,12 +20,16 @@ has two HARD limits that, if ignored, silently trade correctness or speed:
    ``exp``) would be ill-defined. KDA's amplifying gates (``g > 0``) are
    therefore representable; only the GDN parameterisation is bounded.
 
-2. SHAPE (silent slow path).
-   The fast Metal kernel only runs when ``Dk % 32 == 0`` and ``Dv % 4 == 0``.
-   For other dims the upstream falls back to a pure-MLX ops reference, which is
-   correct but SLOW. ``auto_pick`` must not select Path E for such shapes —
-   otherwise it picks a "kernel" that is really the slow reference. We record
-   the eligibility in the Path E status so ``auto_pick`` skips it.
+2. SHAPE (forward: unconstrained; backward: Dv%4).
+   The fast Metal *forward* kernel now carries an in-MSL Dk remainder-mask
+   (``_mlx_lm_gated_delta_vendored.py``), so it runs CORRECTLY for ANY ``Dk``
+   — the old ``Dk % 32 == 0`` limit is gone — and ``Dv`` is also unconstrained
+   for the forward (non-uniform dispatch + scalar ``v_[dv_idx]``). The
+   training/VJP *backward* kernel also lifts ``Dk`` but STILL needs
+   ``Dv % 4 == 0`` (four SIMD groups cooperate over a fixed ``[4*Dk]`` tile);
+   for ``Dv % 4 != 0`` training fails closed to the Python-ops VJP reference.
+   ``shape_uses_fast_kernel`` (forward) / ``shape_uses_fast_kernel_backward``
+   (VJP) encode these so dispatch picks the right path.
 
 These helpers are imported by the GDN/KDA adapters (to fail-close at call
 time) and by the dispatch ``_path_e_status`` functions (to skip E in
@@ -58,12 +62,45 @@ class PathEEligibility:
 
 
 def shape_uses_fast_kernel(dk: int, dv: int) -> bool:
-    """True iff (Dk, Dv) hit the fast vendored Metal kernel (not slow ops)."""
-    return (dk % KERNEL_DK_MULTIPLE == 0) and (dv % KERNEL_DV_MULTIPLE == 0)
+    """True iff (Dk, Dv) hit the fast vendored Metal *forward* kernel.
+
+    The forward inference kernel now carries an in-MSL Dk remainder-mask
+    (``_mlx_lm_gated_delta_vendored.py``), so ANY ``Dk`` runs correctly on the
+    fast kernel — the old ``Dk % 32 == 0`` requirement is gone. ``Dv`` is also
+    unconstrained for the forward: MLX's non-uniform dispatch handles a ragged
+    final threadgroup and the forward reads a scalar ``v_[dv_idx]`` per row.
+    Forward is therefore fast for all shapes.
+    """
+    del dk, dv  # forward kernel is shape-agnostic after the remainder-mask
+    return True
+
+
+def shape_uses_fast_kernel_backward(dk: int, dv: int) -> bool:
+    """True iff (Dk, Dv) hit the fast Metal *VJP/training backward* kernel.
+
+    The backward (``_mlx_lm_gated_delta_vjp_metal_vendored.py``) also carries
+    the Dk remainder-mask, so ``Dk`` is unconstrained. It STILL requires
+    ``Dv % 4 == 0`` because four SIMD groups (one per ``dv`` offset 0..3)
+    cooperatively reduce ``dq``/``dk``/``dg``/``dbeta`` via a fixed ``[4 * Dk]``
+    shared-memory tile; a ragged final ``Dv`` group is not yet handled. When
+    this is False, training fails closed to the Python-ops VJP reference.
+    """
+    del dk  # Dk handled by the remainder-mask
+    return dv % KERNEL_DV_MULTIPLE == 0
 
 
 def _gate_has_amplifying(g: mx.array) -> bool:
-    """True iff any element of the log-decay ``g`` is > 0 (decay > 1)."""
+    """True iff any element of the log-decay ``g`` is > 0 (decay > 1).
+
+    Behaviour is unchanged from before the Dk remainder-mask work: the GDN
+    adapter relies on this to FAIL-CLOSE on an amplifying gate (the GDN
+    parameterisation's ``a=softplus_inverse(-g)`` is real only for ``g <= 0``).
+    NOTE: ``mx.any(...).item()`` forces a device sync on the hot path; an
+    earlier proposal to gate this behind a ``debug`` flag was dropped because
+    skipping the probe would silently let an amplifying GDN gate fall through
+    to the clamp instead of fail-closing — i.e. it would change gate-sign
+    behaviour, which must stay intact.
+    """
     # tolerance: treat tiny positive jitter as non-amplifying so that
     # round-trip noise on a g==0 gate does not spuriously fail-close.
     return bool(mx.any(g.astype(mx.float32) > 1e-6).item())
@@ -81,18 +118,23 @@ def gdn_eligibility(g: mx.array, dk: int, dv: int) -> PathEEligibility:
     gate_ok = not amplifying
     if amplifying:
         reason = (
-            "GDN Path E cannot represent an amplifying gate: g>0 (decay>1) is "
-            "outside upstream g_decay=exp(-exp(A_log)*softplus(...)) which is "
-            "bounded by 1; falling back so correctness is not silently clamped"
+            "GDN Path E cannot represent an amplifying gate under the GDN "
+            "parameterisation: GDN recovers the kernel decay via "
+            "a=softplus_inverse(-g), which is real only for g<=0 (decay<=1); a "
+            "g>0 (decay>1) has no real pre-image, so falling back rather than "
+            "silently clamping. (The Metal kernel itself has NO clamp and "
+            "multiplies state by any positive decay — KDA feeds exp(g)>1 into "
+            "the SAME kernel and amplifies correctly; only the GDN gate "
+            "parameterisation is bounded by 1.)"
         )
     elif not fast:
         reason = (
-            f"GDN Path E shape ineligible: Dk={dk} (need %{KERNEL_DK_MULTIPLE}==0) "
-            f"or Dv={dv} (need %{KERNEL_DV_MULTIPLE}==0) would force the slow "
-            "upstream ops fallback, not the fast Metal kernel"
+            f"GDN Path E shape ineligible for Dv={dv} (need %{KERNEL_DV_MULTIPLE}"
+            "==0 for the training/VJP backward); forward Dk is unconstrained "
+            "after the in-MSL remainder-mask"
         )
     else:
-        reason = "GDN Path E eligible: gate g<=0 and fast Metal kernel shape"
+        reason = "GDN Path E eligible: gate g<=0 and supported shape"
     return PathEEligibility(
         eligible=gate_ok and fast,
         reason=reason,
@@ -109,14 +151,10 @@ def kda_eligibility(dk: int, dv: int) -> PathEEligibility:
     fast-kernel shape; ineligible shapes force the slow ops fallback.
     """
     fast = shape_uses_fast_kernel(dk, dv)
-    if not fast:
-        reason = (
-            f"KDA Path E shape ineligible: Dk={dk} (need %{KERNEL_DK_MULTIPLE}==0) "
-            f"or Dv={dv} (need %{KERNEL_DV_MULTIPLE}==0) would force the slow "
-            "upstream ops fallback, not the fast Metal kernel"
-        )
-    else:
-        reason = "KDA Path E eligible: fast Metal kernel shape (gate always representable)"
+    reason = (
+        "KDA Path E eligible: forward fast Metal kernel runs for any Dk "
+        "(in-MSL remainder-mask) and any Dv; gate always representable"
+    )
     return PathEEligibility(
         eligible=fast,
         reason=reason,
@@ -142,4 +180,5 @@ __all__ = [
     "gdn_eligibility",
     "kda_eligibility",
     "shape_uses_fast_kernel",
+    "shape_uses_fast_kernel_backward",
 ]

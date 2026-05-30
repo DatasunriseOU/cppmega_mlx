@@ -219,9 +219,10 @@ def _path_e_status() -> PathStatus:
         return PathStatus(
             path="path_e", available=True,
             reason=(
-                "vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel "
-                "for Dk%32==0 & Dv%4==0 and gate g<=0; fails closed otherwise "
-                "so the dispatcher falls back to Path B/A)"
+                "vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; "
+                "forward runs for ANY Dk via the in-MSL remainder-mask and any "
+                "Dv; gate must be g<=0 for GDN, otherwise fails closed so the "
+                "dispatcher falls back to Path B/A)"
             ),
         )
     except Exception:

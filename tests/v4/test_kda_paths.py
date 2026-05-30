@@ -369,37 +369,36 @@ def test_kda_path_e_parity_with_path_a_kernel_path():
     np.testing.assert_allclose(np.array(sf_e), np.array(sf_a), atol=1e-4, rtol=1e-4)
 
 
-def test_kda_path_e_fails_closed_on_ineligible_shape():
-    """Small dims (Dk%32!=0) FAIL CLOSED — no silent slow ops fallback.
+def test_kda_path_e_runs_for_odd_dk_shape():
+    """Dk%32!=0 (vectorized KDA gate) now runs the fast kernel CORRECTLY.
 
-    The hardened adapter raises PathEUnavailable for ineligible shapes so the
-    dispatcher can fall back to Path B/A instead of running the slow upstream
-    ops reference under a "kernel" label.
+    Previously the adapter fail-closed for these shapes (the floor-tiled kernel
+    silently truncated the trailing Dk%32 keys). After the in-MSL remainder-mask
+    the fast forward kernel is correct for any Dk, so the adapter is eligible and
+    its output matches the FLA naive KDA reference.
     """
-    import pytest
-
-    from cppmega_v4.nn._external._path_e_eligibility import PathEUnavailable
     from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
-    B, T, H, HV, K, V = 1, 3, 2, 4, 8, 8
+    B, T, H, HV, K, V = 1, 3, 2, 4, 40, 17  # Dk%32!=0 and Dv%4!=0
     rng = np.random.default_rng(131)
     q = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
     k = mx.array(rng.standard_normal((B, T, H, K)).astype(np.float32))
     v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
     g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
     beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
-    with pytest.raises(PathEUnavailable, match="shape ineligible"):
-        kda_update(q, k, v, g, beta)
 
-    # Auto-mode must SKIP Path E for the ineligible shape (status unavailable).
+    # Adapter runs (no PathEUnavailable) and matches the FLA naive reference.
+    o_e, _ = kda_update(q, k, v, g, beta)
+    o_a, _ = naive_recurrent_kda(q, k, v, g, beta)
+    np.testing.assert_allclose(np.array(o_e), np.array(o_a), atol=1e-3, rtol=1e-3)
+
+    # Auto-mode now marks Path E AVAILABLE for the odd shape.
     from cppmega_v4._tilelang.kda_paths import _path_e_status_for_inputs
     st = _path_e_status_for_inputs(q, k, v, g, beta)
-    assert not st.available
-    assert "shape ineligible" in st.reason
+    assert st.available
 
-    # And dispatch with fallback must still produce a correct result via Path A.
+    # Dispatch still produces a correct result.
     o_disp, _ = kda_recurrent_dispatch(q, k, v, g, beta)
-    o_a, _ = naive_recurrent_kda(q, k, v, g, beta)
-    np.testing.assert_allclose(np.array(o_disp), np.array(o_a), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(np.array(o_disp), np.array(o_a), atol=1e-3, rtol=1e-3)
 
 
 def test_kda_path_e_forced():

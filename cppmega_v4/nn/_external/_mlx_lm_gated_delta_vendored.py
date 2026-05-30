@@ -1,5 +1,4 @@
-# Vendored verbatim from ml-explore/mlx-lm PR #1217
-#   (mlx_lm/models/gated_delta.py)
+# Derived from ml-explore/mlx-lm PR #1217 (mlx_lm/models/gated_delta.py).
 # Upstream license: MIT, Copyright © 2023 Apple Inc.
 #
 # Public surface used by cppmega_v4 Path E:
@@ -7,8 +6,21 @@
 #   - gated_delta_kernel(...) — low-level Metal kernel entry
 #   - gated_delta_ops(...) — pure-MLX reference for prefill
 #   - compute_g(A_log, a, dt_bias) — gate transform
-# No edits — pure copy. cppmega_v4/nn/path_e_adapter.py wraps our (g, beta)
-# API to this module's (a, b, A_log, dt_bias) API.
+# cppmega_v4/nn/path_e_adapter.py wraps our (g, beta) API to this module's
+# (a, b, A_log, dt_bias) API.
+#
+# CPPMEGA DELTA over the PR #1217 snapshot (see VENDORED_MANIFEST.json):
+#   In-MSL Dk remainder-mask so the fast Metal kernel is CORRECT for ANY Dk,
+#   not just Dk % 32 == 0. Upstream uses `n_per_t = Dk / 32` (integer floor),
+#   so the trailing Dk % 32 keys owned past lane 31's slice were NEVER loaded
+#   -> silent truncation / wrong answer for non-multiple-of-32 Dk. We switch
+#   to a ceil tiling `n_per_t = (Dk + 31) / 32` and guard every per-`i` load
+#   with `s_idx < Dk`, substituting additive/multiplicative identities for the
+#   out-of-range tail (0 for k/q/state contributions; the VECTORIZED gate uses
+#   decay = exp(0) = 1, i.e. g_access expands to 0.0 on the tail so that the
+#   pre-reduction simd_sum is never poisoned). The scalar GDN gate is per-(b,t,
+#   hv) broadcast and so unaffected. Everything else is the verbatim PR #1217
+#   snapshot (incl. the PR #1066 Kahan-compensated kv_mem + 4-way unroll).
 
 from functools import partial
 from typing import Optional, Tuple
@@ -27,11 +39,17 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         return None
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
 
-    # Configure g indexing based on whether gating is vectorized
+    # Configure g indexing based on whether gating is vectorized.
+    # Vectorized g is [B,T,Hv,Dk] and is read per-key (s_idx). On the Dk
+    # remainder tail (s_idx >= Dk) the load would be OOB, so we mask it and
+    # substitute decay = 1.0 (== exp(0)) for that lane's tail entry. Using 1.0
+    # leaves state[i] unchanged; since the tail state[i] is itself 0 (masked
+    # load) and the tail k_/q_ contributions are 0, the tail never poisons the
+    # pre-reduction simd_sum(kv_mem)/simd_sum(out).
     if vectorized:
         g_comment = "// g: [B, T, Hv, Dk]"
         g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
-        g_access = "g_[s_idx]"
+        g_access = "(s_idx < Dk ? static_cast<float>(g_[s_idx]) : 1.0f)"
         g_advance = "g_ += Hv * Dk;"
     else:
         g_comment = "// g: [B, T, Hv]"
@@ -44,7 +62,9 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
         auto hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
+        // cppmega delta: ceil tiling so the trailing Dk % 32 keys are owned by
+        // a lane and loaded (upstream used floor `Dk / 32`, dropping the tail).
+        constexpr int n_per_t = (Dk + 31) / 32;
 
         // q, k: [B, T, Hk, Dk]
         auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
@@ -64,7 +84,9 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         float state[n_per_t];
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          state[i] = static_cast<float>(i_state[s_idx]);
+          // Dk remainder-mask: tail lanes hold 0 (additive identity) so they
+          // contribute nothing to any simd_sum reduction.
+          state[i] = (s_idx < Dk) ? static_cast<float>(i_state[s_idx]) : 0.0f;
         }}
 
         {g_comment}
@@ -78,6 +100,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
             float kv_mem = 0.0f, kv_c = 0.0f; \
             for (int i = 0; i < n_per_t; ++i) {{ \
               auto s_idx = n_per_t * dk_idx + i; \
+              if (s_idx >= Dk) continue; \
               state[i] *= {g_access}; \
               auto p = state[i] * k_[s_idx]; \
               auto a = p - kv_c; \
@@ -90,6 +113,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
             float out = 0.0f; \
             for (int i = 0; i < n_per_t; ++i) {{ \
               auto s_idx = n_per_t * dk_idx + i; \
+              if (s_idx >= Dk) continue; \
               state[i] += k_[s_idx] * delta; \
               out += state[i] * q_[s_idx]; \
             }} \
@@ -114,7 +138,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         #undef ADV
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<StT>(state[i]);
+          if (s_idx < Dk) o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
     inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
@@ -295,15 +319,15 @@ def gated_delta_update(
     if training:
         # Chunked VJP path with O(T/chunk) autodiff graph — fits T≥2048
         # on 36 GB Apple Silicon where the Python-ops path OOMs.
-        # Metal backward kernel is 8–11× faster than the Python reference,
-        # but only handles the unmasked GPU path with Dk%32==0 and Dv%4==0.
-        Dk = q.shape[-1]
+        # Metal backward kernel is 8–11× faster than the Python reference. It
+        # now handles ANY Dk (in-MSL remainder-mask), but still needs Dv%4==0
+        # for the four-SIMD-group cooperative reduction (ragged Dv backward
+        # deferred). The unmasked GPU path is also required.
         Dv = v.shape[-1]
         can_use_metal = (
             mx.metal.is_available()
             and mx.default_device() == mx.gpu
             and mask is None
-            and Dk % 32 == 0
             and Dv % 4 == 0
         )
         if can_use_metal:

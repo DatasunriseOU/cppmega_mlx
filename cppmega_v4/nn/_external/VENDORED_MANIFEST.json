@@ -19,10 +19,11 @@
       "pr": 1217,
       "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1217",
       "upstream_path": "mlx_lm/models/gated_delta.py",
-      "kind": "verbatim",
+      "kind": "derived",
       "used_by": "GDN/KDA Path E (gated_delta_update, gated_delta_kernel, gated_delta_ops, compute_g)",
-      "sha256": "18b3a77250b246d46e63d8fa9e8208936ea09bd46b97b036c2ec34edfc0a176b",
-      "notes": "Snapshot includes the PR #1066 Kahan-compensated kv_mem accumulation + 4-way time-loop unroll; this is NOT identical to an older mlx-lm checkout that predates PR #1066."
+      "upstream_base_sha256": "18b3a77250b246d46e63d8fa9e8208936ea09bd46b97b036c2ec34edfc0a176b",
+      "sha256": "d2f3c76ca2870c98dfe95390287f01a4ee75d048227f0784076826938514ea08",
+      "notes": "Was 'verbatim' (PR #1217 snapshot, incl. PR #1066 Kahan kv_mem + 4-way unroll). Reclassified 'derived': cppmega added an in-MSL Dk remainder-mask (ceil tiling n_per_t=(Dk+31)/32 + per-i s_idx<Dk guards; vectorized gate uses decay=1.0 on the masked tail) so the fast Metal forward kernel is correct for ANY Dk, not just Dk%32==0 — upstream silently truncated the trailing Dk%32 keys. upstream_base_sha256 records the pre-delta PR #1217 snapshot; the only delta is this remainder-mask."
     },
     {
       "file": "_mlx_lm_fp8_dequant_vendored.py",
@@ -41,8 +42,9 @@
       "upstream_path": "mlx_lm/models/gated_delta.py (kernel reused; VJP is cppmega-authored)",
       "kind": "derived",
       "used_by": "GDN Path E training backward (fused Metal VJP)",
-      "sha256": "dfe959d0ed50d60d75d93532a80b0b6f769aad74ce39bc00a0770128c9903f4e",
-      "notes": "cppmega-authored fused Metal VJP built on the vendored PR #1217 gated_delta_kernel; upstream has no registered VJP."
+      "upstream_base_sha256": "dfe959d0ed50d60d75d93532a80b0b6f769aad74ce39bc00a0770128c9903f4e",
+      "sha256": "e4448b96fef0830c02c88bae918cd02e7c053892bde7f9021230d18384ea9386",
+      "notes": "cppmega-authored fused Metal VJP built on the vendored PR #1217 gated_delta_kernel; upstream has no registered VJP. DELTA over upstream_base_sha256: same in-MSL Dk remainder-mask as the forward (ceil tiling + per-i s_idx<Dk guards in fwd-save and both bwd kernels; vectorized gate tail decay=1.0) so the VJP handles any Dk. Still requires Dv%4==0 (four-SIMD-group cooperative reduction over a fixed [4*Dk] tile) — ragged-Dv backward deferred."
     },
     {
       "file": "_mlx_lm_gated_delta_vjp_vendored.py",

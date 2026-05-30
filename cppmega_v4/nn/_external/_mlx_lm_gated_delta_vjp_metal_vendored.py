@@ -56,7 +56,13 @@ def _make_fwd_save_kernel(vectorized: bool = False):
     if vectorized:
         g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
         g_advance = "g_ += Hv * Dk;"
-        g_decay = "state[i] = state[i] * static_cast<float>(g_[n_per_t * dk_idx + i]);"
+        # Dk remainder-mask: tail key (s_idx >= Dk) uses decay = 1.0 so the
+        # masked tail state (0) is left untouched and never poisons simd_sum.
+        g_decay = (
+            "{ auto _gi = n_per_t * dk_idx + i; "
+            "float _d = (_gi < Dk) ? static_cast<float>(g_[_gi]) : 1.0f; "
+            "state[i] = state[i] * _d; }"
+        )
     else:
         g_setup = "auto g_ = g + b_idx * T * Hv;"
         g_advance = "g_ += Hv;"
@@ -67,7 +73,9 @@ def _make_fwd_save_kernel(vectorized: bool = False):
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
         auto hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
+        // cppmega delta: ceil tiling + per-i Dk remainder-mask (upstream floor
+        // `Dk / 32` dropped the trailing Dk % 32 keys).
+        constexpr int n_per_t = (Dk + 31) / 32;
 
         auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
         auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
@@ -85,7 +93,8 @@ def _make_fwd_save_kernel(vectorized: bool = False):
 
         float state[n_per_t];
         for (int i = 0; i < n_per_t; ++i) {{
-          state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = (s_idx < Dk) ? static_cast<float>(i_state[s_idx]) : 0.0f;
         }}
 
         {g_setup}
@@ -95,6 +104,7 @@ def _make_fwd_save_kernel(vectorized: bool = False):
           float kv_mem = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx >= Dk) continue;
             {g_decay}
             kv_mem += state[i] * static_cast<float>(k_[s_idx]);
           }}
@@ -106,6 +116,7 @@ def _make_fwd_save_kernel(vectorized: bool = False):
           float out_val = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx >= Dk) continue;
             state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
             out_val += state[i] * static_cast<float>(q_[s_idx]);
           }}
@@ -115,7 +126,8 @@ def _make_fwd_save_kernel(vectorized: bool = False):
           }}
 
           for (int i = 0; i < n_per_t; ++i) {{
-            h_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx < Dk) h_state[s_idx] = static_cast<StT>(state[i]);
           }}
 
           q_ += Hk * Dk;
@@ -129,7 +141,7 @@ def _make_fwd_save_kernel(vectorized: bool = False):
 
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<StT>(state[i]);
+          if (s_idx < Dk) o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
     return mx.fast.metal_kernel(
@@ -157,7 +169,10 @@ def _make_bwd_kernel():
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
         auto hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
+        // cppmega delta: ceil tiling + per-i Dk remainder-mask. Loads of tail
+        // keys (s_idx >= Dk) are skipped (registers zeroed) so they contribute
+        // nothing to any simd_sum and never write OOB into the shared tiles.
+        constexpr int n_per_t = (Dk + 31) / 32;
 
         auto q_base = q + b_idx * T * Hk * Dk + hk_idx * Dk;
         auto k_base = k + b_idx * T * Hk * Dk + hk_idx * Dk;
@@ -198,7 +213,8 @@ def _make_bwd_kernel():
         {
           auto ds_row = ds_final_ptr + dv_idx * Dk;
           for (int i = 0; i < n_per_t; ++i) {
-            dS[i] = static_cast<float>(ds_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            dS[i] = (s_idx < Dk) ? static_cast<float>(ds_row[s_idx]) : 0.0f;
           }
         }
 
@@ -215,7 +231,8 @@ def _make_bwd_kernel():
           auto S_new_row = hist_base + t * Dv * Dk + dv_idx * Dk;
           float S_new[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            S_new[i] = static_cast<float>(S_new_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            S_new[i] = (s_idx < Dk) ? static_cast<float>(S_new_row[s_idx]) : 0.0f;
           }
 
           const device StT* S_prev_row;
@@ -226,7 +243,8 @@ def _make_bwd_kernel():
           }
           float S_prev[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            S_prev[i] = static_cast<float>(S_prev_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            S_prev[i] = (s_idx < Dk) ? static_cast<float>(S_prev_row[s_idx]) : 0.0f;
           }
 
           // Recover S_tmp = g_t * S_prev (pre-update state used for kv_mem).
@@ -238,7 +256,9 @@ def _make_bwd_kernel():
           // kv_mem = sum_dk(S_tmp * k_t)
           float kv_mem = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {
-            kv_mem += S_tmp[i] * static_cast<float>(k_t[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx >= Dk) continue;
+            kv_mem += S_tmp[i] * static_cast<float>(k_t[s_idx]);
           }
           kv_mem = simd_sum(kv_mem);
 
@@ -249,7 +269,8 @@ def _make_bwd_kernel():
           // (1) y = S_new @ q  =>  dS_t += outer(dy_t, q_t); dq_t = S_new.T @ dy_t.
           float dq_contrib[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            float q_val = static_cast<float>(q_t[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            float q_val = (s_idx < Dk) ? static_cast<float>(q_t[s_idx]) : 0.0f;
             dS[i] += dy_val * q_val;
             dq_contrib[i] = S_new[i] * dy_val;
           }
@@ -257,7 +278,8 @@ def _make_bwd_kernel():
           // (2) S_new = S_tmp + outer(delta, k_t)
           float k_regs[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            k_regs[i] = static_cast<float>(k_t[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            k_regs[i] = (s_idx < Dk) ? static_cast<float>(k_t[s_idx]) : 0.0f;
           }
           float ddelta = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {
@@ -300,6 +322,7 @@ def _make_bwd_kernel():
           // threadgroup (one slot in the Dv_groups axis).
           for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx >= Dk) continue;
             dq_tile[simd_y * Dk + s_idx] = dq_contrib[i];
             dk_tile[simd_y * Dk + s_idx] = dk_a[i] + dk_b[i];
           }
@@ -314,6 +337,7 @@ def _make_bwd_kernel():
             auto dk_slot = dk_base + t * Hv * Dv_groups * Dk + tg_y * Dk;
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
+              if (s_idx >= Dk) continue;
               float sum_q = dq_tile[0 * Dk + s_idx] + dq_tile[1 * Dk + s_idx]
                           + dq_tile[2 * Dk + s_idx] + dq_tile[3 * Dk + s_idx];
               float sum_k = dk_tile[0 * Dk + s_idx] + dk_tile[1 * Dk + s_idx]
@@ -339,7 +363,8 @@ def _make_bwd_kernel():
         // Write dS_initial for the chunk (same (b,hv,dv) slice).
         auto ds_init_row = ds_init_ptr + dv_idx * Dk;
         for (int i = 0; i < n_per_t; ++i) {
-          ds_init_row[n_per_t * dk_idx + i] = static_cast<StT>(dS[i]);
+          auto s_idx = n_per_t * dk_idx + i;
+          if (s_idx < Dk) ds_init_row[s_idx] = static_cast<StT>(dS[i]);
         }
     """
     return mx.fast.metal_kernel(
@@ -387,7 +412,8 @@ def _make_bwd_kernel_vec():
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
         auto hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
+        // cppmega delta: ceil tiling + per-i Dk remainder-mask (vectorized g).
+        constexpr int n_per_t = (Dk + 31) / 32;
 
         auto q_base = q + b_idx * T * Hk * Dk + hk_idx * Dk;
         auto k_base = k + b_idx * T * Hk * Dk + hk_idx * Dk;
@@ -424,7 +450,8 @@ def _make_bwd_kernel_vec():
         {
           auto ds_row = ds_final_ptr + dv_idx * Dk;
           for (int i = 0; i < n_per_t; ++i) {
-            dS[i] = static_cast<float>(ds_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            dS[i] = (s_idx < Dk) ? static_cast<float>(ds_row[s_idx]) : 0.0f;
           }
         }
 
@@ -436,16 +463,19 @@ def _make_bwd_kernel_vec():
           auto g_t_row = g_base + t * Hv * Dk;
           float beta_t = static_cast<float>(*(beta_base + t * Hv));
 
-          // Load per-Dk g_t into registers.
+          // Load per-Dk g_t into registers. Tail key uses decay = 1.0 so the
+          // (zeroed) tail S_prev stays 0 and never poisons any simd_sum.
           float g_t_vec[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            g_t_vec[i] = static_cast<float>(g_t_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            g_t_vec[i] = (s_idx < Dk) ? static_cast<float>(g_t_row[s_idx]) : 1.0f;
           }
 
           auto S_new_row = hist_base + t * Dv * Dk + dv_idx * Dk;
           float S_new[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            S_new[i] = static_cast<float>(S_new_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            S_new[i] = (s_idx < Dk) ? static_cast<float>(S_new_row[s_idx]) : 0.0f;
           }
 
           const device StT* S_prev_row;
@@ -456,7 +486,8 @@ def _make_bwd_kernel_vec():
           }
           float S_prev[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            S_prev[i] = static_cast<float>(S_prev_row[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            S_prev[i] = (s_idx < Dk) ? static_cast<float>(S_prev_row[s_idx]) : 0.0f;
           }
 
           // S_tmp = g_t_vec (per-Dk) * S_prev
@@ -468,7 +499,9 @@ def _make_bwd_kernel_vec():
           // kv_mem = sum_dk(S_tmp * k_t)
           float kv_mem = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {
-            kv_mem += S_tmp[i] * static_cast<float>(k_t[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx >= Dk) continue;
+            kv_mem += S_tmp[i] * static_cast<float>(k_t[s_idx]);
           }
           kv_mem = simd_sum(kv_mem);
 
@@ -479,7 +512,8 @@ def _make_bwd_kernel_vec():
           // (1) y = S_new @ q
           float dq_contrib[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            float q_val = static_cast<float>(q_t[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            float q_val = (s_idx < Dk) ? static_cast<float>(q_t[s_idx]) : 0.0f;
             dS[i] += dy_val * q_val;
             dq_contrib[i] = S_new[i] * dy_val;
           }
@@ -487,7 +521,8 @@ def _make_bwd_kernel_vec():
           // (2) S_new = S_tmp + outer(delta, k_t)
           float k_regs[n_per_t];
           for (int i = 0; i < n_per_t; ++i) {
-            k_regs[i] = static_cast<float>(k_t[n_per_t * dk_idx + i]);
+            auto s_idx = n_per_t * dk_idx + i;
+            k_regs[i] = (s_idx < Dk) ? static_cast<float>(k_t[s_idx]) : 0.0f;
           }
           float ddelta = 0.0f;
           for (int i = 0; i < n_per_t; ++i) {
@@ -524,6 +559,7 @@ def _make_bwd_kernel_vec():
           // Stash contributions into shared memory for intra-threadgroup sum.
           for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
+            if (s_idx >= Dk) continue;
             dq_tile[simd_y * Dk + s_idx] = dq_contrib[i];
             dk_tile[simd_y * Dk + s_idx] = dk_a[i] + dk_b[i];
             dg_tile[simd_y * Dk + s_idx] = dg_local_vec[i];
@@ -539,6 +575,7 @@ def _make_bwd_kernel_vec():
             auto dg_slot = dg_base + t * Hv * Dv_groups * Dk + tg_y * Dk;
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
+              if (s_idx >= Dk) continue;
               float sum_q = dq_tile[0 * Dk + s_idx] + dq_tile[1 * Dk + s_idx]
                           + dq_tile[2 * Dk + s_idx] + dq_tile[3 * Dk + s_idx];
               float sum_k = dk_tile[0 * Dk + s_idx] + dk_tile[1 * Dk + s_idx]
@@ -563,7 +600,8 @@ def _make_bwd_kernel_vec():
 
         auto ds_init_row = ds_init_ptr + dv_idx * Dk;
         for (int i = 0; i < n_per_t; ++i) {
-          ds_init_row[n_per_t * dk_idx + i] = static_cast<StT>(dS[i]);
+          auto s_idx = n_per_t * dk_idx + i;
+          if (s_idx < Dk) ds_init_row[s_idx] = static_cast<StT>(dS[i]);
         }
     """
     return mx.fast.metal_kernel(
