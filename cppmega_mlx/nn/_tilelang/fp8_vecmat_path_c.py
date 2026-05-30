@@ -1036,14 +1036,27 @@ def fp8_scaled_vecmat_path_c_direct(
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
             try:
-                return kernel(
+                # Owner-output reuse contract: write in place into ``out`` and
+                # return that exact object (see the note at the primary dispatch
+                # site below). Dropping ``_tilelang_mlx_async_owner_outputs`` is
+                # behavior-preserving against the non-native (slow) tvm-ffi route
+                # -- which always ran synchronously and returned the caller object
+                # -- and restores ``returned is out`` under the now-live native
+                # bridge, whose async path returned a fresh aliasing wrapper.
+                returned = kernel(
                     x_fp8,
                     scale_x,
                     W_fp8,
                     scale_w,
                     out,
-                    _tilelang_mlx_async_owner_outputs=True,
                 )
+                if returned is not out:
+                    raise FP8VecmatPathCDirectError(
+                        "direct tvm-ffi FP8 vecmat did not return the caller-owned output"
+                    )
+                return out
+            except FP8VecmatPathCDirectError:
+                raise
             except Exception as exc:
                 try:
                     from tilelang.contrib.mlx_interop import DLPackInteropError
@@ -1079,13 +1092,22 @@ def fp8_scaled_vecmat_path_c_direct(
         ) from exc
 
     try:
+        # Owner-output reuse contract: the kernel writes in place into the
+        # caller-owned ``C`` (== ``out``) and the route returns that exact
+        # object, matching the sibling matmul direct route and the non-native
+        # (slow) tvm-ffi route, which always returns the caller object. The
+        # earlier ``_tilelang_mlx_async_owner_outputs=True`` request made the
+        # now-live native bridge return a fresh MLX wrapper that merely *aliases*
+        # ``out`` (correct data, but ``returned is out`` was False). The slow
+        # route ignored the async flag and ran synchronously, so dropping it is
+        # behavior-preserving against the committed baseline while restoring the
+        # documented ``returned is out`` contract under the native route.
         returned = kernel(
             A,
             A_scale,
             B,
             B_scale,
             C,
-            _tilelang_mlx_async_owner_outputs=True,
         )
     except Exception as exc:
         try:
@@ -1097,7 +1119,11 @@ def fp8_scaled_vecmat_path_c_direct(
         raise FP8VecmatPathCDirectError(
             f"direct tvm-ffi FP8 vecmat dispatch failed: {type(exc).__name__}: {exc}"
         ) from exc
-    return returned
+    if returned is not C:
+        raise FP8VecmatPathCDirectError(
+            "direct tvm-ffi FP8 vecmat did not return the caller-owned output"
+        )
+    return C
 
 
 def fp8_scaled_vecmat_path_c(
@@ -1116,10 +1142,10 @@ def fp8_scaled_vecmat_path_c(
     ``x_fp8`` is ``(K,)`` uint8 e4m3 storage and ``W_fp8`` is transposed
     ``(N, K)`` storage, matching Path B. ``scale_x`` is scalar; ``scale_w`` may
     be scalar or per-output ``(N,)``. When ``out`` is provided, dispatches via
-    tvm-ffi into that caller-owned output and returns the MLX graph output that
-    aliases ``out``. Evaluating the returned value schedules the write; reading
-    ``out`` after that observes the same storage. Without ``out``, this function
-    fails explicitly: there is no non-owner-output Path C dispatch surface.
+    tvm-ffi into that caller-owned output and returns that same ``out`` object
+    (owner-output reuse contract, matching the sibling matmul direct route and
+    the non-native tvm-ffi route). Without ``out``, this function fails
+    explicitly: there is no non-owner-output Path C dispatch surface.
     """
 
     if out is not None:
