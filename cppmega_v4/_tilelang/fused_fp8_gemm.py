@@ -36,10 +36,21 @@ Two implementations share the public ``fused_fp8_gemm`` entry point:
     storage byte (not the signed e4m3 decode), which silently corrupts the
     result.  The compiled MSL is driven through MLX's native
     ``mx.fast.metal_kernel`` stream via the host ``wrap_tilelang_metal_kernel``
-    adapter, so it shares MLX command buffers (the tvm-ffi / DLPack
-    owner-output route is not used because this MLX build does not expose
-    ``mx.metal._current_command_buffer``, so its kernels read uncommitted
-    buffers — even the shipped ``fp8_matmul_path_c`` returns zeros here).
+    adapter, so it shares MLX command buffers.
+
+    The tvm-ffi / DLPack owner-output route (as used by the shipped dense
+    ``fp8_scaled_matmul_path_c``) is intentionally **not** used here.  That route
+    now works for the dense matmul's production kernel signature (5-param:
+    fp8 A/B + two fp32 per-tensor scales + fp32 C) after the live tvm-ffi Metal
+    fixes — verified numerically exact end-to-end on M4.  But this fused GEMM's
+    kernel signature (two float16 tile inputs + fp32 C, no scale buffers) still
+    fails to launch through the live tvm-ffi Metal runtime: its compiled host
+    image dispatches to ``ffi.Function returned NULL`` (the launch-config /
+    device_mod recovery that makes the dense 5-param signature work does not yet
+    cover this signature shape).  Until that runtime gap is closed, the
+    cooperative-tensor fused GEMM stays on the MSL ``mx.fast.metal_kernel``
+    adapter, which is numerically correct.  See the verification note in the PR
+    that enabled dense matmul2d.
 
   * **Scalar hand-MSL fallback** (legacy).  One thread per output column ×
     batch row, used when TileLang is unimportable, the Metal compile callback

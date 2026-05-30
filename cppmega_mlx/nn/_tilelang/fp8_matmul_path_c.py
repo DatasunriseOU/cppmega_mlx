@@ -38,7 +38,7 @@ _FP8_MM_NUM_STAGES = 0
 _FP8_MM_C_DTYPE = "float32"
 
 
-def _coop_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int]:
+def _coop_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int] | None:
     """Pick a Metal-4 cooperative-tensor (matmul2d) tile (BM, BN, BK, threads).
 
     The cooperative ``mpp::tensor_ops::matmul2d`` micro-tile is 16x32x16: the
@@ -48,6 +48,14 @@ def _coop_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int]:
     warp tiles. These tiles were measured on M4 Max to beat both the legacy
     LUT-dot4 Path C accumulation and the pure-MLX FP8 reference across the
     production matmul shapes (128^3..1024^3); see the bench receipt.
+
+    Returns ``None`` when no legal cooperative tile cleanly divides ``M/N/K``
+    (e.g. tiny or non-aligned shapes like 16x16x32 or 8x12x16). The cooperative
+    matmul2d kernel does not bounds-guard a partial output tile, so launching it
+    on an undividable shape returns numerically WRONG (column-shuffled) output.
+    Callers must route a ``None`` result to the legacy dot4 kernel, which is
+    correct for any shape -- this is shape-correct dispatch, NOT a silent
+    gate-off (RULE #1): the production matmul shapes always yield a real tile.
     """
     # Ordered best-first per shape (measured on M4 Max). Each entry keeps the
     # cooperative-tensor threadgroup memory under the 32 KiB Metal budget that
@@ -79,8 +87,9 @@ def _coop_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int]:
         if shmem > shmem_budget:
             continue
         return bm, bn, bk, threads
-    # Fallback: smallest legal cooperative tile (single warp, 16x32x16).
-    return 16, 32, 16, 32
+    # No legal cooperative tile divides this shape: signal the caller to use the
+    # shape-agnostic dot4 kernel instead of emitting a wrong partial-tile GEMM.
+    return None
 
 
 @dataclass(frozen=True)
@@ -247,12 +256,19 @@ def _make_scaled_matmul2d_kernel(
     (``BM % 16``, ``BN % 32``, ``BK % 16``, warp partition); the legacy dot4
     ``BM/BN/BK`` arguments are not necessarily legal cooperative tiles, so a
     measured-best cooperative tile is derived from the GEMM extents.
+
+    Returns ``None`` when ``_coop_tile_for`` reports that no legal cooperative
+    tile divides ``M/N/K`` -- the caller must then use the shape-agnostic dot4
+    kernel (the cooperative kernel would emit a wrong partial-tile result).
     """
     import tilelang
     from tilelang import language as T
     from tvm.target import Target
 
-    bm, bn, bk, threads = _coop_tile_for(int(M), int(N), int(K))
+    tile = _coop_tile_for(int(M), int(N), int(K))
+    if tile is None:
+        return None
+    bm, bn, bk, threads = tile
 
     globals().update(
         T=T,
@@ -276,27 +292,34 @@ FP8_PATH_C_MATMUL2D_ENV = "CPPMEGA_FP8_PATH_C_MATMUL2D"
 def _matmul2d_owner_output_enabled() -> bool:
     """Whether to route the owner-output GEMM through Metal-4 ``matmul2d``.
 
-    The cooperative-tensor ``matmul2d`` kernel is numerically exact (maxdiff 0
-    vs the FP8 reference) and 1.5x-10x faster than both the legacy LUT-dot4
-    accumulation and the pure-MLX FP8 reference on M4+ when launched via a
-    Metal runtime that supports cooperative-tensor kernels (verified through
-    TileLang's torch / ``torch.mps`` execution backend).
+    matmul2d is the **default and only** owner-output GEMM path (RULE #1: the
+    clear path; no silent gate-off to dot4). The cooperative-tensor ``matmul2d``
+    kernel is numerically exact (maxdiff 0 vs the FP8 reference) and is launched
+    correctly by the production **tvm-ffi** owner-output route on Apple M4+:
+    verified end-to-end through ``fp8_scaled_matmul_path_c_direct`` /
+    ``NativeTileLangKernel`` at 128^3..1024^3 (maxdiff 0.00000, up to ~4.4x
+    faster than the legacy LUT-dot4 accumulation at 1024^3).
 
-    It is OFF by default because the owner-output contract here dispatches via
-    the **tvm-ffi** execution backend, and the tvm-ffi Metal runtime in the
-    pinned TileLang build cannot launch cooperative-tensor kernels: such
-    kernels lower to a host module the adapter cannot introspect
-    (``device_mod is None``), so the recovered launch config collapses to a
-    degenerate ``(1,1,1) x (1,1,1)`` grid and the kernel returns numerically
-    wrong output. Until that runtime path lands, the safe owner-output route
-    stays on the dot4 kernel. Set ``CPPMEGA_FP8_PATH_C_MATMUL2D=1`` to opt in
-    once the active TileLang build can launch cooperative kernels through
-    tvm-ffi.
+    This requires a TileLang build whose tvm-ffi Metal runtime launches the
+    cooperative-tensor kernel with the recovered launch config (the
+    ``_restore_metal_device_mod`` / ``_metal_launch_config`` recovery in
+    ``tilelang/jit/adapter/tvm_ffi.py``) and commits + syncs the owner output
+    buffer. Earlier the route was gated OFF because that runtime path collapsed
+    the launch config to a degenerate ``(1,1,1) x (1,1,1)`` grid and the owner
+    output came back zeroed; both are fixed in the live build, so the gate is
+    removed and matmul2d is unconditional.
+
+    ``CPPMEGA_FP8_PATH_C_MATMUL2D`` is retained only as an explicit emergency
+    opt-OUT (set it to ``0``/``false``/``off`` to force the legacy dot4 kernel
+    on a host whose tvm-ffi runtime regresses). It is **not** consulted to
+    silently fall back; matmul2d failures RAISE.
     """
     import os
 
     val = os.environ.get(FP8_PATH_C_MATMUL2D_ENV, "").strip().lower()
-    return val in {"1", "true", "yes", "on"}
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 _FP8_MATMUL_TVM_FFI_KERNEL_CACHE: dict[
@@ -336,34 +359,40 @@ def _fp8_matmul_tvm_ffi_kernel_for(
 
     target = _msl_transform._as_metal_target(TILELANG_METAL_MATMUL_TARGET)
 
-    # Prefer the Metal-4 cooperative-tensor matmul2d emission when explicitly
-    # enabled (and the active TileLang build can launch cooperative kernels
-    # through tvm-ffi): on M4+ it is numerically exact (maxdiff 0 vs the FP8
-    # reference) and 1.5x-10x faster than both the legacy LUT-dot4
-    # accumulation and the pure-MLX FP8 reference across 128^3..1024^3.
-    # Otherwise dispatch the dot4 owner-output kernel, which the pinned
-    # tvm-ffi Metal runtime launches correctly, so the owner-output contract
-    # never returns numerically wrong output. See _matmul2d_owner_output_enabled.
-    kernel = None
+    # RULE #1: the Metal-4 cooperative-tensor matmul2d emission is the clear,
+    # default owner-output GEMM path. It is launched correctly by the production
+    # tvm-ffi owner-output route on Apple M4+ (verified end-to-end via
+    # fp8_scaled_matmul_path_c_direct / NativeTileLangKernel): numerically exact
+    # (maxdiff 0.00000 vs the FP8 reference) and up to ~4.4x faster than the
+    # legacy LUT-dot4 accumulation at 1024^3. A matmul2d *compile* failure RAISES
+    # here (caught and re-raised as FP8MatmulPathCDirectError by the caller) --
+    # it does NOT silently fall back to dot4.
+    #
+    # The one shape-correct exception: when M/N/K admit no legal cooperative
+    # tile (`_make_scaled_matmul2d_kernel` -> None, e.g. tiny/non-aligned shapes
+    # like 16x16x32), the cooperative kernel cannot tile the output without
+    # emitting a wrong partial-tile result, so the shape-agnostic dot4 kernel is
+    # used. That is shape-correct dispatch, not a silent gate-off: every
+    # production matmul shape (128^3..1024^3) yields a real cooperative tile and
+    # runs matmul2d. dot4 is also used when the caller explicitly opts out via
+    # CPPMEGA_FP8_PATH_C_MATMUL2D=0.
+    coop_prim = None
     if _matmul2d_owner_output_enabled():
-        try:
-            coop_prim = _make_scaled_matmul2d_kernel(
-                M=M,
-                N=N,
-                K=K,
-                num_stages=num_stages,
-                c_dtype=c_dtype,
-            )
-            kernel = tilelang.compile(
-                coop_prim,
-                target=target,
-                execution_backend="tvm_ffi",
-                out_idx=-1,
-            )
-        except Exception:
-            kernel = None
-
-    if kernel is None:
+        coop_prim = _make_scaled_matmul2d_kernel(
+            M=M,
+            N=N,
+            K=K,
+            num_stages=num_stages,
+            c_dtype=c_dtype,
+        )
+    if coop_prim is not None:
+        kernel = tilelang.compile(
+            coop_prim,
+            target=target,
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+        )
+    else:
         prim = _make_scaled_matmul_kernel(
             M=M,
             N=N,
