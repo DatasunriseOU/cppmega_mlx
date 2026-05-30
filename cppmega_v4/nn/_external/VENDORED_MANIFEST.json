@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "Provenance pin for the mlx-lm upstream code vendored into cppmega_v4 Path E",
+    "and the V4 mHC / MTP stack. Each entry records the upstream PR, the path it",
+    "was copied from, whether it is a verbatim snapshot or a cppmega-authored",
+    "derivative, and a sha256 of the vendored file as committed. The drift check",
+    "(_vendored_provenance.py, exercised by tests/v4/test_vendored_provenance.py)",
+    "recomputes these hashes and fails if a vendored file diverges from its",
+    "recorded snapshot, so silent edits to a 'verbatim' copy cannot slip in.",
+    "Hashes are over the file bytes exactly as stored in the repo."
+  ],
+  "schema_version": 1,
+  "upstream_repo": "https://github.com/ml-explore/mlx-lm",
+  "upstream_license": "MIT (Copyright Apple Inc.)",
+  "recorded_at": "2026-05-30",
+  "entries": [
+    {
+      "file": "_mlx_lm_gated_delta_vendored.py",
+      "pr": 1217,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1217",
+      "upstream_path": "mlx_lm/models/gated_delta.py",
+      "kind": "verbatim",
+      "used_by": "GDN/KDA Path E (gated_delta_update, gated_delta_kernel, gated_delta_ops, compute_g)",
+      "sha256": "18b3a77250b246d46e63d8fa9e8208936ea09bd46b97b036c2ec34edfc0a176b",
+      "notes": "Snapshot includes the PR #1066 Kahan-compensated kv_mem accumulation + 4-way time-loop unroll; this is NOT identical to an older mlx-lm checkout that predates PR #1066."
+    },
+    {
+      "file": "_mlx_lm_fp8_dequant_vendored.py",
+      "pr": 1224,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1224",
+      "upstream_path": "mlx_lm/models/qwen3_5_moe.py (Model.sanitize FP8 dequant block, generalized)",
+      "kind": "derived",
+      "used_by": "Lightning Indexer FP8 (pure-MLX, NOT Path E) + MoE FP8 loaders",
+      "sha256": "3a48eec1797aee1a9c6d16e819064a045624a3eb62faf69a5670faf1b978f2a8",
+      "notes": "Inline upstream snippet pulled into a standalone dequant_block_fp8 utility; functionally faithful but reorganised, hence 'derived'."
+    },
+    {
+      "file": "_mlx_lm_gated_delta_vjp_metal_vendored.py",
+      "pr": 1217,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1217",
+      "upstream_path": "mlx_lm/models/gated_delta.py (kernel reused; VJP is cppmega-authored)",
+      "kind": "derived",
+      "used_by": "GDN Path E training backward (fused Metal VJP)",
+      "sha256": "dfe959d0ed50d60d75d93532a80b0b6f769aad74ce39bc00a0770128c9903f4e",
+      "notes": "cppmega-authored fused Metal VJP built on the vendored PR #1217 gated_delta_kernel; upstream has no registered VJP."
+    },
+    {
+      "file": "_mlx_lm_gated_delta_vjp_vendored.py",
+      "pr": 1217,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1217",
+      "upstream_path": "mlx_lm/models/gated_delta.py (Python-ops reference; VJP is cppmega-authored)",
+      "kind": "derived",
+      "used_by": "GDN Path E training backward (gradient-checkpointed Python reference)",
+      "sha256": "1a5040eb617070f6fbc0712af88cd35104d83a6917a0c5fdfb518dc3a1436b10",
+      "notes": "cppmega-authored chunked Python VJP wrapping the vendored PR #1217 ops; bounds T>=2048 memory."
+    },
+    {
+      "file": "_mlx_lm_hyper_connection_vendored.py",
+      "pr": 1189,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1189",
+      "upstream_path": "mlx_lm/models/hyper_connection.py",
+      "kind": "verbatim",
+      "used_by": "V4 mHC residual (HyperConnection, HyperHead)",
+      "sha256": "6febc66a50e6504fad2f60b2af51e3eb01a9fb83713b4189d39cf9c499b7b9c7",
+      "notes": "Recorded for completeness; not part of Path E."
+    },
+    {
+      "file": "_mlx_lm_sinkhorn_vendored.py",
+      "pr": 1189,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/1189",
+      "upstream_path": "mlx_lm/models/sinkhorn.py",
+      "kind": "verbatim",
+      "used_by": "V4 mHC Sinkhorn projection (hc_split_sinkhorn)",
+      "sha256": "af2dee5ef7db71c9bc254bae8000ade7e92fd8e5a8367f3bd3bf4b713b1a587f",
+      "notes": "Recorded for completeness; not part of Path E."
+    },
+    {
+      "file": "_mlx_lm_mtp_module_vendored.py",
+      "pr": 990,
+      "pr_url": "https://github.com/ml-explore/mlx-lm/pull/990",
+      "upstream_path": "mlx_lm/models/qwen3_5.py (MTPModule excerpt)",
+      "kind": "derived",
+      "used_by": "V4 MTP speculative-decode module",
+      "sha256": "3131e547b15a43b2538ccfb1c14a275f91f51739008dca4770a28c7fb414444c",
+      "notes": "Excerpt only (MTPModule + decoder layer); the PR's generate/server drivers are out of scope."
+    }
+  ]
+}

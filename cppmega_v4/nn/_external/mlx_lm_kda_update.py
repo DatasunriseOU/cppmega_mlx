@@ -35,8 +35,16 @@ Upstream gated_delta_kernel signature:
     so we pass ``g_decay = exp(our_g)`` directly here.
 
 Constraints:
-    - Upstream Metal kernel requires Dk % 32 == 0 and Dv % 4 == 0; smaller
-      dims fall back to the pure-ops reference path.
+    - Upstream Metal kernel requires Dk % 32 == 0 and Dv % 4 == 0. Smaller
+      dims would silently drop to the pure-ops reference path (correct but
+      slow). This adapter FAILS CLOSED for ineligible shapes (raises
+      ``PathEUnavailable``) so the dispatcher falls back to Path B/A instead of
+      running a "kernel" path that is really the slow reference. The
+      eligibility is surfaced through the Path E status (``kda_eligibility``)
+      so ``auto_pick`` skips E for ineligible shapes.
+    - KDA passes ``g_decay = exp(g)`` straight to the kernel, so any finite
+      gate (including amplifying, g>0) is representable — unlike GDN, there is
+      no gate-sign constraint.
 """
 
 from __future__ import annotations
@@ -47,7 +55,10 @@ import mlx.core as mx
 
 from cppmega_v4.nn._external._mlx_lm_gated_delta_vendored import (
     gated_delta_kernel as _upstream_kernel,
-    gated_delta_ops as _upstream_ops,
+)
+from cppmega_v4.nn._external._path_e_eligibility import (
+    PathEUnavailable,
+    kda_eligibility,
 )
 
 
@@ -94,6 +105,13 @@ def kda_update(
     if hv_size % h_size != 0:
         raise ValueError(f"HV ({hv_size}) must be divisible by H ({h_size})")
 
+    # FAIL-CLOSE: an ineligible shape would force the slow upstream ops
+    # fallback. Raise so the dispatcher falls back to Path B/A rather than
+    # running a "kernel" path that is really the slow pure-ops reference.
+    elig = kda_eligibility(kdim, vdim)
+    if not elig.eligible:
+        raise PathEUnavailable(elig.reason)
+
     # FLA pre-scales q by 1/sqrt(K); upstream does not.
     fla_scale = scale if scale is not None else 1.0 / math.sqrt(kdim)
     q_scaled = (q.astype(mx.float32) * fla_scale).astype(q.dtype)
@@ -111,18 +129,17 @@ def kda_update(
 
     beta_f = beta.astype(mx.float32)
 
-    # Upstream Metal kernel needs Dk % 32 == 0 and Dv % 4 == 0; otherwise
-    # fall through to the pure-ops reference (which also handles vector-gate).
-    use_kernel = (kdim % 32 == 0) and (vdim % 4 == 0) and mx.metal.is_available()
-
-    if use_kernel:
-        y, new_state = _upstream_kernel(
-            q_scaled, k, v, g_decay, beta_f, state, mask=None,
+    # Eligibility above guarantees the fast Metal kernel shape. If Metal is
+    # unavailable at runtime, fail closed too (the kernel cannot run) rather
+    # than silently using the slow ops reference.
+    if not mx.metal.is_available():
+        raise PathEUnavailable(
+            "KDA Path E requires Metal for the vendored gated_delta kernel; "
+            "Metal is unavailable on this host"
         )
-    else:
-        y, new_state = _upstream_ops(
-            q_scaled, k, v, g_decay, beta_f, state, mask=None,
-        )
+    y, new_state = _upstream_kernel(
+        q_scaled, k, v, g_decay, beta_f, state, mask=None,
+    )
 
     final = None
     if output_final_state:

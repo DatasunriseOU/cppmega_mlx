@@ -219,8 +219,9 @@ def _path_e_status() -> PathStatus:
         return PathStatus(
             path="path_e", available=True,
             reason=(
-                "vendored mlx-lm PR #1217 gated_delta_update (Metal kernel "
-                "for Dk%32==0 & Dv%4==0; ops fallback otherwise)"
+                "vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel "
+                "for Dk%32==0 & Dv%4==0 and gate g<=0; fails closed otherwise "
+                "so the dispatcher falls back to Path B/A)"
             ),
         )
     except Exception:
@@ -233,6 +234,38 @@ def _path_e_status() -> PathStatus:
                 "cppmega_v4/nn/_external/mlx_lm_gated_delta_update.py"
             ),
         )
+
+
+def _path_e_status_for_inputs(*args, **kwargs) -> PathStatus:
+    """Input-aware Path E status: combine importability with eligibility.
+
+    Path E is only *truly* available for a concrete call when (a) the adapter
+    imports AND (b) the gate is representable (g<=0; no amplifying gate) AND
+    (c) the shape hits the fast Metal kernel. ``auto_pick`` consumes this so it
+    SKIPS Path E (falls through to D/A) rather than selecting a path that would
+    silently clamp the gate or drop to the slow upstream ops fallback.
+
+    Best-effort: if inputs cannot be parsed (e.g. unusual call shape) we fall
+    back to the static status so behaviour is never worse than before.
+    """
+    base = _path_e_status()
+    if not base.available:
+        return base
+    # Expected signature: (q, k, v, beta, g, ...). Probe g + dims defensively.
+    try:
+        from cppmega_v4.nn._external._path_e_eligibility import gdn_eligibility
+
+        q = kwargs.get("q", args[0] if len(args) > 0 else None)
+        v = kwargs.get("v", args[2] if len(args) > 2 else None)
+        g = kwargs.get("g", args[4] if len(args) > 4 else None)
+        if q is None or v is None or g is None:
+            return base
+        elig = gdn_eligibility(g, int(q.shape[-1]), int(v.shape[-1]))
+    except Exception:
+        return base
+    if elig.eligible:
+        return base
+    return PathStatus(path="path_e", available=False, reason=elig.reason)
 
 
 def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
@@ -299,7 +332,16 @@ def gated_delta_recurrent_dispatch(
     """Call the auto-selected GDN backend, falling back to Path A.
 
     Same callable signature as ``naive_recurrent_gated_delta_rule``.
+
+    In auto-mode (``path is None``) Path E availability is recomputed from the
+    *actual* inputs (gate sign + shape) so ``auto_pick`` SKIPS Path E for
+    amplifying gates or ineligible shapes — it never selects a path that would
+    silently clamp the gate or drop to the slow upstream ops fallback.
     """
+    effective_overrides = dict(status_overrides) if status_overrides else {}
+    if path is None and "path_e" not in effective_overrides:
+        effective_overrides["path_e"] = _path_e_status_for_inputs(*args, **kwargs)
+    status_overrides = effective_overrides or None
     statuses = linear_attention_path_statuses(status_overrides=status_overrides)
     if path is None:
         path = linear_attention_auto_mode_for_inputs(status_overrides=status_overrides)

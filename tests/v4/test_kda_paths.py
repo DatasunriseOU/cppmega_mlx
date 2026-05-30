@@ -369,8 +369,16 @@ def test_kda_path_e_parity_with_path_a_kernel_path():
     np.testing.assert_allclose(np.array(sf_e), np.array(sf_a), atol=1e-4, rtol=1e-4)
 
 
-def test_kda_path_e_parity_ops_fallback():
-    """Small dims (Dk%32!=0) fall through to the pure-ops reference."""
+def test_kda_path_e_fails_closed_on_ineligible_shape():
+    """Small dims (Dk%32!=0) FAIL CLOSED — no silent slow ops fallback.
+
+    The hardened adapter raises PathEUnavailable for ineligible shapes so the
+    dispatcher can fall back to Path B/A instead of running the slow upstream
+    ops reference under a "kernel" label.
+    """
+    import pytest
+
+    from cppmega_v4.nn._external._path_e_eligibility import PathEUnavailable
     from cppmega_v4.nn._external.mlx_lm_kda_update import kda_update
     B, T, H, HV, K, V = 1, 3, 2, 4, 8, 8
     rng = np.random.default_rng(131)
@@ -379,9 +387,19 @@ def test_kda_path_e_parity_ops_fallback():
     v = mx.array(rng.standard_normal((B, T, HV, V)).astype(np.float32))
     g = mx.array(-rng.uniform(0.01, 0.2, (B, T, HV, K)).astype(np.float32))
     beta = mx.array(rng.uniform(0.1, 0.9, (B, T, HV)).astype(np.float32))
-    o_e, _ = kda_update(q, k, v, g, beta)
+    with pytest.raises(PathEUnavailable, match="shape ineligible"):
+        kda_update(q, k, v, g, beta)
+
+    # Auto-mode must SKIP Path E for the ineligible shape (status unavailable).
+    from cppmega_v4._tilelang.kda_paths import _path_e_status_for_inputs
+    st = _path_e_status_for_inputs(q, k, v, g, beta)
+    assert not st.available
+    assert "shape ineligible" in st.reason
+
+    # And dispatch with fallback must still produce a correct result via Path A.
+    o_disp, _ = kda_recurrent_dispatch(q, k, v, g, beta)
     o_a, _ = naive_recurrent_kda(q, k, v, g, beta)
-    np.testing.assert_allclose(np.array(o_e), np.array(o_a), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(np.array(o_disp), np.array(o_a), atol=1e-4, rtol=1e-4)
 
 
 def test_kda_path_e_forced():

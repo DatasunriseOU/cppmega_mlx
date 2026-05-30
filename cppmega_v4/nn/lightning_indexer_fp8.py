@@ -1,11 +1,11 @@
-"""ROI 7 — DSA Lightning Indexer FP8 path.
+"""ROI 7 — DSA Lightning Indexer FP8 path (pure-MLX + vendored FP8 dequant).
 
-Wraps the fp32 ``LightningIndexer`` scaffold with an FP8-quantized GEMM
-path that mirrors the upstream V3.2 ``act_quant`` / ``fp8_index`` pattern
-without requiring a custom CUDA / Metal kernel:
+NOT a Path-E fused Metal kernel. This wraps the fp32 ``LightningIndexer``
+scaffold with a pure-MLX FP8-dequant GEMM path that mirrors the upstream V3.2
+``act_quant`` / ``fp8_index`` pattern WITHOUT a custom CUDA / Metal kernel:
 
   1. wq_b weight is stored fp8 (e4m3) with block-128 scale_inv, dequantised
-     on the fly via ``dequant_block_fp8`` (PR #1224 utility, vendored).
+     on the fly via ``dequant_block_fp8`` (vendored mlx-lm PR #1224 utility).
   2. Activations are token-wise dynamically quantized to fp8 (per-row scale
      in fp32), the matmul runs in bfloat16 (the closest MLX accuracy that
      preserves fp8 precision), and the output is rescaled.
@@ -13,10 +13,14 @@ without requiring a custom CUDA / Metal kernel:
 The K side (wk) and weights_proj stay bfloat16 — they're tiny (head_dim ~32
 and n_heads ~32) so the FP8 overhead is not worth it.
 
-This path matches the upstream contract closely enough that ROI 7 is
-"real" (not a fallback): the same indexer module can drive sparse MLA in
-production. A future Metal/TileLang fused kernel replaces the inner GEMM
-without touching this wrapper's external API.
+Provenance / labelling note:
+    The only vendored upstream piece here is ``dequant_block_fp8`` (mlx-lm
+    PR #1224); everything else is plain MLX ops. There is NO fused Path-E
+    Metal indexer kernel — do not label this module "Path E". The GDN/KDA
+    Path E (``mlx_lm_gated_delta_update`` / ``mlx_lm_kda_update``) is a
+    separate, genuinely fused vendored Metal kernel. A future Metal/TileLang
+    fused indexer GEMM could replace the inner matmul here without touching
+    this wrapper's external API; until then this is a pure-MLX path.
 """
 
 from dataclasses import dataclass
@@ -58,11 +62,13 @@ class LightningIndexerFP8Config(LightningIndexerConfig):
 
 
 class LightningIndexerFP8(nn.Module):
-    """V3.2-faithful FP8 lightning indexer (path E for ROI 7).
+    """V3.2-faithful FP8 lightning indexer (pure-MLX + vendored FP8 dequant).
 
-    Drop-in for ``LightningIndexer`` with identical forward signature.
-    The wq_b projection runs through a dequant-on-the-fly fp8→bf16 path;
-    everything else stays bf16 (small dims don't benefit from fp8).
+    This is NOT a Path-E fused Metal kernel — it is plain MLX ops plus the
+    vendored ``dequant_block_fp8`` (mlx-lm PR #1224). Drop-in for
+    ``LightningIndexer`` with identical forward signature. The wq_b projection
+    runs through a dequant-on-the-fly fp8->bf16 path; everything else stays
+    bf16 (small dims don't benefit from fp8).
     """
 
     def __init__(self, config: LightningIndexerFP8Config):

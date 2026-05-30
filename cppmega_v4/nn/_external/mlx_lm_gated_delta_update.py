@@ -17,12 +17,20 @@ Our naive_recurrent_gated_delta_rule signature (FLA convention):
 Adapter mapping:
 1. Decay: upstream needs decay in (0,1]; FLA uses exp(g). Set A_log=0, dt_bias=0,
    then compute_g(a) = exp(-softplus(a)). We need exp(-softplus(a)) = exp(g),
-   i.e. ``a = softplus_inverse(-g)``. Requires ``g <= 0`` (decay <= 1) — values
-   above 0 are clamped (Path E cannot represent amplifying gates because the
-   upstream parameterization is monotonically bounded by 1).
+   i.e. ``a = softplus_inverse(-g)``. Requires ``g <= 0`` (decay <= 1). Values
+   ``g > 0`` (an *amplifying* gate, decay > 1) are OUTSIDE the upstream
+   parameterization (``g_decay`` is bounded by 1). Rather than silently clamp
+   them — and silently lose information — this adapter FAILS CLOSED: it raises
+   ``PathEUnavailable`` so the dispatcher falls back to Path B/A, which can
+   represent amplifying gates exactly. The eligibility is also surfaced through
+   the Path E status (``gdn_eligibility``) so ``auto_pick`` never picks E for
+   an amplifying gate in the first place.
 2. Beta: upstream beta = sigmoid(b). Pass ``b = logit(our_beta)``.
 3. Scale: pre-multiply ``q`` by the FLA scale ``1/sqrt(K)`` before calling
    upstream (it doesn't scale internally).
+4. Shape: the fast Metal kernel only runs for ``Dk%32==0 & Dv%4==0``; smaller
+   dims would silently drop to the slow upstream ops fallback, so this adapter
+   fails closed for ineligible shapes too (recorded in the status as well).
 """
 
 from __future__ import annotations
@@ -32,6 +40,10 @@ import math
 import mlx.core as mx
 
 from cppmega_v4.nn._external._mlx_lm_gated_delta_vendored import gated_delta_update as _upstream
+from cppmega_v4.nn._external._path_e_eligibility import (
+    PathEUnavailable,
+    gdn_eligibility,
+)
 
 
 def _softplus_inverse(y: mx.array) -> mx.array:
@@ -68,10 +80,18 @@ def gated_delta_update(
     b_size, t_size, h_size = beta.shape
     dk = q.shape[-1]
     dv = v.shape[-1]
+    # FAIL-CLOSE: an amplifying gate (g>0, decay>1) is outside the upstream
+    # parameterization (bounded by 1) and an ineligible shape would force the
+    # slow ops fallback. Raise instead of silently clamping/slowing so the
+    # dispatcher falls back to Path B/A.
+    elig = gdn_eligibility(g, dk, dv)
+    if not elig.eligible:
+        raise PathEUnavailable(elig.reason)
     # FLA convention: q is scaled by 1/sqrt(K) internally; upstream is not.
     fla_scale = scale if scale is not None else 1.0 / math.sqrt(dk)
     q_scaled = (q.astype(mx.float32) * fla_scale).astype(q.dtype)
-    # Decay: g is log-decay; upstream representable range is decay <= 1, so g <= 0.
+    # Decay: g is log-decay, guaranteed <= 0 here (eligibility checked above).
+    # Clamp strictly below 0 only to keep softplus_inverse finite at g==0.
     g_clamped = mx.minimum(g.astype(mx.float32), -1e-6)
     a_synth = _softplus_inverse(-g_clamped)  # [B, T, H]
     # Beta: upstream applies sigmoid(b); pre-invert with logit.
@@ -84,9 +104,8 @@ def gated_delta_update(
         state = mx.zeros((b_size, h_size, dv, dk), dtype=mx.float32)
     else:
         state = mx.transpose(initial_state.astype(mx.float32), (0, 1, 3, 2))
-    # Upstream Metal kernel needs Dk % 32 == 0 and Dv % 4 == 0. Fall back to
-    # the ops path for smaller dims so the test suite can exercise Path E.
-    use_kernel = (dk % 32 == 0) and (dv % 4 == 0)
+    # Eligibility above guarantees the fast Metal kernel shape.
+    use_kernel = True
     y, new_state = _upstream(
         q_scaled, k, v, a_synth, b_synth, A_log, dt_bias,
         state=state, mask=None, use_kernel=use_kernel, training=training,

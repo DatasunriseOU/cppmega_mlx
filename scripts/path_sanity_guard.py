@@ -699,6 +699,85 @@ def _check_v4_path_e_adapters(repo_root: Path) -> list[Finding]:
     return findings
 
 
+def _check_v4_vendored_provenance(repo_root: Path) -> list[Finding]:
+    """Flag drift between vendored mlx-lm snapshots and their pinned hashes.
+
+    Path E (and the mHC/MTP stack) rely on verbatim/derived copies of upstream
+    mlx-lm code pinned in
+    ``cppmega_v4/nn/_external/VENDORED_MANIFEST.json``. If a snapshot is edited
+    without updating the manifest, this fails closed so the drift is caught.
+    """
+    manifest_path = (
+        repo_root / "cppmega_v4" / "nn" / "_external" / "VENDORED_MANIFEST.json"
+    )
+    location = "v4._external.vendored_provenance"
+    if not manifest_path.exists():
+        return [
+            Finding(
+                code="missing_vendored_manifest",
+                severity="error",
+                location=location,
+                detail=f"expected vendored provenance manifest at {manifest_path}",
+            )
+        ]
+    try:
+        import hashlib
+        import json as _json
+
+        manifest = _json.loads(manifest_path.read_text())
+    except Exception as exc:  # pragma: no cover - defensive
+        return [
+            Finding(
+                code="invalid_vendored_manifest",
+                severity="error",
+                location=location,
+                detail=f"could not parse VENDORED_MANIFEST.json: {exc}",
+            )
+        ]
+    findings: list[Finding] = []
+    base = manifest_path.parent
+    for entry in manifest.get("entries", []):
+        name = entry.get("file")
+        recorded = entry.get("sha256")
+        target = base / name if name else None
+        if not recorded:
+            findings.append(
+                Finding(
+                    code="vendored_missing_hash",
+                    severity="error",
+                    location=f"{location}.{name}",
+                    detail="manifest entry has no sha256 pin",
+                )
+            )
+            continue
+        if target is None or not target.exists():
+            findings.append(
+                Finding(
+                    code="vendored_missing_file",
+                    severity="error",
+                    location=f"{location}.{name}",
+                    detail=f"vendored file {name} recorded in manifest is missing",
+                )
+            )
+            continue
+        actual = hashlib.sha256(target.read_bytes()).hexdigest()
+        if actual != recorded:
+            findings.append(
+                Finding(
+                    code="vendored_snapshot_drift",
+                    severity="error",
+                    location=f"{location}.{name}",
+                    detail=(
+                        f"vendored snapshot diverged from pinned PR "
+                        f"#{entry.get('pr')} (recorded {recorded[:12]}, got "
+                        f"{actual[:12]}); update VENDORED_MANIFEST.json if the "
+                        f"re-vendor is intentional"
+                    ),
+                )
+            )
+    return findings
+
+
 def check_path_contracts(repo_root: Path = ROOT) -> list[Finding]:
     declared = discover_declared_paths(repo_root)
     findings: list[Finding] = []
@@ -772,6 +851,7 @@ def check_path_contracts(repo_root: Path = ROOT) -> list[Finding]:
     findings.extend(_check_v4_path_d_import_guards(repo_root))
     findings.extend(check_path_d_default_status_no_unsafe_imports(repo_root))
     findings.extend(_check_v4_path_e_adapters(repo_root))
+    findings.extend(_check_v4_vendored_provenance(repo_root))
     findings.extend(_check_m04_path_b_m2rnn_direct_msl(repo_root))
     findings.extend(_check_m04_path_b_mamba3_fast_bwd(repo_root))
     return findings

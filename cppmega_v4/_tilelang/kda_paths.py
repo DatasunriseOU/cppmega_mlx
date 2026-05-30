@@ -204,11 +204,40 @@ def _path_e_status() -> PathStatus:
         path="path_e", available=True,
         reason=(
             "vendored mlx-lm gated_delta vectorised-gate Metal kernel "
-            "(Dk%32==0 & Dv%4==0; smaller dims fall back to the pure-ops "
-            "reference). The same kernel as GDN Path E — KDA hits the "
-            "g.ndim==4 branch in gated_delta_kernel."
+            "(fast kernel for Dk%32==0 & Dv%4==0; fails closed for smaller "
+            "dims so the dispatcher falls back to Path B/A instead of the slow "
+            "pure-ops reference). The same kernel as GDN Path E — KDA hits the "
+            "g.ndim==4 branch in gated_delta_kernel. No gate-sign constraint "
+            "(KDA passes g_decay=exp(g) directly)."
         ),
     )
+
+
+def _path_e_status_for_inputs(*args, **kwargs) -> PathStatus:
+    """Input-aware KDA Path E status: importability + shape eligibility.
+
+    KDA has no gate-sign constraint, only the fast-kernel shape (Dk%32==0 &
+    Dv%4==0). ``auto_pick`` consumes this so it SKIPS Path E for ineligible
+    shapes rather than selecting the slow upstream ops fallback. Best-effort:
+    unparseable inputs fall back to the static status.
+    """
+    base = _path_e_status()
+    if not base.available:
+        return base
+    # KDA signature: (q, k, v, g, beta, ...). q.shape[-1]=Dk, v.shape[-1]=Dv.
+    try:
+        from cppmega_v4.nn._external._path_e_eligibility import kda_eligibility
+
+        q = kwargs.get("q", args[0] if len(args) > 0 else None)
+        v = kwargs.get("v", args[2] if len(args) > 2 else None)
+        if q is None or v is None:
+            return base
+        elig = kda_eligibility(int(q.shape[-1]), int(v.shape[-1]))
+    except Exception:
+        return base
+    if elig.eligible:
+        return base
+    return PathStatus(path="path_e", available=False, reason=elig.reason)
 
 
 def _path_e_call(*args, allow_fallback: bool = True, **kwargs):
@@ -272,7 +301,16 @@ def kda_recurrent_dispatch(
     status_overrides: Mapping[PathName, PathStatus] | None = None,
     **kwargs,
 ):
-    """Call the auto-selected KDA backend, falling back to Path A."""
+    """Call the auto-selected KDA backend, falling back to Path A.
+
+    In auto-mode Path E availability is recomputed from the actual shape so
+    ``auto_pick`` SKIPS Path E for ineligible shapes (which would otherwise
+    drop to the slow upstream ops fallback).
+    """
+    effective_overrides = dict(status_overrides) if status_overrides else {}
+    if path is None and "path_e" not in effective_overrides:
+        effective_overrides["path_e"] = _path_e_status_for_inputs(*args, **kwargs)
+    status_overrides = effective_overrides or None
     statuses = kda_path_statuses(status_overrides=status_overrides)
     if path is None:
         path = kda_auto_mode_for_inputs(status_overrides=status_overrides)
