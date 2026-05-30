@@ -4130,14 +4130,304 @@ def dump_lowered_bwd_msl(
     return cast(str, lowering.msl_text)
 
 
+# --- Metal-4 cooperative-tensor (matmul2d) grouped QK / PV GEMM reducers ------
+#
+# The fused per-lane forward above runs each (b,s,h) query as M=1 scalar dot
+# products / tree reductions for both the QK (q.kT) and PV (attn.v) phases. When
+# the ``head_kv`` query heads of one KV group are tiled together (they share the
+# same gathered KV via ``indices[b,s,group,:]``), QK becomes a real
+# ``[head_kv, qk_dim] @ [topk, qk_dim]^T`` GEMM and PV a ``[head_kv, topk] @
+# [topk, d_v]`` GEMM. For group shapes that admit a legal Metal-4 cooperative
+# tile (``_coop_tile_for``: M%16, N%32, K%16), these run on the cooperative-
+# tensor ``mpp::tensor_ops::matmul2d`` GEMM (the keystone #6 emission: half
+# inputs in shared, accumulator C in shared -> triggers the cooperative path),
+# which beats the per-lane scalar reductions. Group shapes no cooperative tile
+# divides (head_kv<16 / topk<32 / d_v<32) stay on the scalar-reduction path via
+# explicit shape-correct dispatch (RULE #1: not a silent gate; unsupported
+# shapes RAISE in the dispatcher).
+
+_SMBF16_GEMM_M = 16
+_SMBF16_GEMM_N = 32
+_SMBF16_GEMM_K = 32
+_SMBF16_GEMM_BM = 16
+_SMBF16_GEMM_BN = 32
+_SMBF16_GEMM_BK = 32
+_SMBF16_GEMM_THREADS = 32
+_SMBF16_GEMM_TRANSPOSE_B = True
+
+
+def make_sparse_mla_grouped_gemm_matmul2d_kernel(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    BK: int,
+    threads: int,
+    transpose_B: bool,
+) -> Any:
+    """Build a grouped half-precision GEMM as a Metal-4 cooperative-tensor tile.
+
+    Used for both Sparse-MLA GEMMs in half:
+
+    * QK (``q.kT``): ``A=[head_kv, qk_dim]``, ``B=[topk, qk_dim]``,
+      ``transpose_B=True`` -> ``C=[head_kv, topk]``.
+    * PV (``attn.v``): ``A=[head_kv, topk]``, ``B=[topk, d_v]``,
+      ``transpose_B=False`` -> ``C=[head_kv, d_v]``.
+
+    ``A``/``B`` are ``float16`` inputs copied into ``shared`` cooperative-input
+    buffers; the accumulator ``C_shared`` lives in ``shared`` scope, which is
+    what triggers the cooperative-tensor ``matmul2d`` lowering. The output is
+    ``float32`` for QK-score / PV-accum precision.
+
+    ``BM/BN/BK/threads`` MUST be a legal cooperative tile dividing ``M/N/K``; a
+    violated precondition RAISES (RULE #1: no silent gate).
+    """
+
+    if M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(
+            f"grouped Sparse-MLA matmul2d requires positive M/N/K; got M={M} N={N} K={K}"
+        )
+    if M % BM or N % BN or K % BK:
+        raise ValueError(
+            "grouped Sparse-MLA matmul2d tile does not divide the GEMM extents: "
+            f"M={M} N={N} K={K} BM={BM} BN={BN} BK={BK}"
+        )
+    if BM % 16 or BN % 32 or BK % 16:
+        raise ValueError(
+            "grouped Sparse-MLA matmul2d tile violates the Metal-4 cooperative "
+            f"constraint (BM%16, BN%32, BK%16): BM={BM} BN={BN} BK={BK}"
+        )
+
+    import tilelang.language as T
+    from tvm.target import Target
+
+    T = cast(Any, T)
+
+    g = globals()
+    g.update(
+        T=T,
+        Target=Target,
+        _SMBF16_GEMM_M=int(M),
+        _SMBF16_GEMM_N=int(N),
+        _SMBF16_GEMM_K=int(K),
+        _SMBF16_GEMM_BM=int(BM),
+        _SMBF16_GEMM_BN=int(BN),
+        _SMBF16_GEMM_BK=int(BK),
+        _SMBF16_GEMM_THREADS=int(threads),
+        _SMBF16_GEMM_TRANSPOSE_B=bool(transpose_B),
+    )
+
+    if transpose_B:
+
+        @T.prim_func
+        def sparse_mla_grouped_gemm_matmul2d(
+            A: T.Tensor((_SMBF16_GEMM_M, _SMBF16_GEMM_K), "float16"),
+            B: T.Tensor((_SMBF16_GEMM_N, _SMBF16_GEMM_K), "float16"),
+            C: T.Tensor((_SMBF16_GEMM_M, _SMBF16_GEMM_N), "float32"),
+        ):
+            with T.Kernel(
+                T.ceildiv(_SMBF16_GEMM_N, _SMBF16_GEMM_BN),
+                T.ceildiv(_SMBF16_GEMM_M, _SMBF16_GEMM_BM),
+                threads=_SMBF16_GEMM_THREADS,
+            ) as (bx, by):
+                A_shared = T.alloc_shared((_SMBF16_GEMM_BM, _SMBF16_GEMM_BK), "float16", scope="shared")
+                B_shared = T.alloc_shared((_SMBF16_GEMM_BN, _SMBF16_GEMM_BK), "float16", scope="shared")
+                C_shared = T.alloc_shared((_SMBF16_GEMM_BM, _SMBF16_GEMM_BN), "float32", scope="shared")
+                T.clear(C_shared)
+                for ko in T.serial(T.ceildiv(_SMBF16_GEMM_K, _SMBF16_GEMM_BK)):
+                    T.copy(A[by * _SMBF16_GEMM_BM, ko * _SMBF16_GEMM_BK], A_shared)
+                    T.copy(B[bx * _SMBF16_GEMM_BN, ko * _SMBF16_GEMM_BK], B_shared)
+                    T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
+                T.copy(C_shared, C[by * _SMBF16_GEMM_BM, bx * _SMBF16_GEMM_BN])
+
+        return sparse_mla_grouped_gemm_matmul2d
+
+    @T.prim_func
+    def sparse_mla_grouped_gemm_matmul2d_nt(
+        A: T.Tensor((_SMBF16_GEMM_M, _SMBF16_GEMM_K), "float16"),
+        B: T.Tensor((_SMBF16_GEMM_K, _SMBF16_GEMM_N), "float16"),
+        C: T.Tensor((_SMBF16_GEMM_M, _SMBF16_GEMM_N), "float32"),
+    ):
+        with T.Kernel(
+            T.ceildiv(_SMBF16_GEMM_N, _SMBF16_GEMM_BN),
+            T.ceildiv(_SMBF16_GEMM_M, _SMBF16_GEMM_BM),
+            threads=_SMBF16_GEMM_THREADS,
+        ) as (bx, by):
+            A_shared = T.alloc_shared((_SMBF16_GEMM_BM, _SMBF16_GEMM_BK), "float16", scope="shared")
+            B_shared = T.alloc_shared((_SMBF16_GEMM_BK, _SMBF16_GEMM_BN), "float16", scope="shared")
+            C_shared = T.alloc_shared((_SMBF16_GEMM_BM, _SMBF16_GEMM_BN), "float32", scope="shared")
+            T.clear(C_shared)
+            for ko in T.serial(T.ceildiv(_SMBF16_GEMM_K, _SMBF16_GEMM_BK)):
+                T.copy(A[by * _SMBF16_GEMM_BM, ko * _SMBF16_GEMM_BK], A_shared)
+                T.copy(B[ko * _SMBF16_GEMM_BK, bx * _SMBF16_GEMM_BN], B_shared)
+                T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
+            T.copy(C_shared, C[by * _SMBF16_GEMM_BM, bx * _SMBF16_GEMM_BN])
+
+    return sparse_mla_grouped_gemm_matmul2d_nt
+
+
+@lru_cache(maxsize=128)
+def _grouped_gemm_matmul2d_kernel_for(
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    BK: int,
+    threads: int,
+    transpose_B: bool,
+) -> Any:
+    """Build and cache the tvm-ffi cooperative-tensor grouped half GEMM."""
+
+    import tilelang
+
+    prim = make_sparse_mla_grouped_gemm_matmul2d_kernel(
+        M=M,
+        N=N,
+        K=K,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        threads=threads,
+        transpose_B=transpose_B,
+    )
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target("metal"),
+        execution_backend="tvm_ffi",
+        out_idx=2,
+    )
+
+
+def _aligned_contiguous_smbf16(array: mx.array) -> mx.array:
+    """Fresh, 64-byte-aligned, row-major copy (tvm-ffi DLPack requires align=64)."""
+
+    if array.dtype == mx.uint8:
+        fresh = mx.bitwise_or(array, mx.array(0, dtype=mx.uint8))
+    else:
+        fresh = array + mx.array(0, dtype=array.dtype)
+    return mx.contiguous(fresh)
+
+
+def sparse_mla_grouped_qk_path_c(
+    q_half: mx.array,
+    k_half: mx.array,
+    out: mx.array,
+) -> mx.array:
+    """Grouped Sparse-MLA QK (``q.kT``) GEMM with explicit matmul2d/scalar dispatch.
+
+    ``q_half`` is ``(M=head_kv, qk_dim)`` half query rows, ``k_half`` is the
+    gathered ``(N=topk, qk_dim)`` KV rows, ``out`` the caller-owned ``(M, N)``
+    fp32 score tile. Routes to the Metal-4 cooperative-tensor matmul2d GEMM when
+    ``_coop_tile_for(M, N, K)`` is legal; otherwise RAISES (the scalar per-lane
+    reduction in the fused forward is the shape-correct path for those shapes --
+    callers that hit a sub-tile group must use the fused kernel, not this
+    standalone GEMM). RULE #1: explicit shape dispatch, no silent fallback here.
+    """
+
+    return _sparse_mla_grouped_gemm_dispatch(
+        q_half, k_half, out, transpose_B=True, op_name="sparse_mla_grouped_qk_path_c"
+    )
+
+
+def sparse_mla_grouped_pv_path_c(
+    probs_half: mx.array,
+    v_half: mx.array,
+    out: mx.array,
+) -> mx.array:
+    """Grouped Sparse-MLA PV (``attn.v``) GEMM with explicit matmul2d dispatch.
+
+    ``probs_half`` is ``(M=head_kv, topk)`` half softmax weights, ``v_half`` is
+    the gathered ``(topk, d_v)`` value rows, ``out`` the caller-owned
+    ``(M, d_v)`` fp32 output. Routes to cooperative-tensor matmul2d when the
+    shape admits a legal tile; otherwise RAISES. RULE #1: explicit dispatch.
+    """
+
+    return _sparse_mla_grouped_gemm_dispatch(
+        probs_half, v_half, out, transpose_B=False, op_name="sparse_mla_grouped_pv_path_c"
+    )
+
+
+def _sparse_mla_grouped_gemm_dispatch(
+    A: mx.array,
+    B: mx.array,
+    out: mx.array,
+    *,
+    transpose_B: bool,
+    op_name: str,
+) -> mx.array:
+    if not _msl_transform.can_run_metal():
+        raise RuntimeError(f"{op_name}: MLX Metal backend unavailable.")
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(
+            f"{op_name}: A/B must be 2D; got A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    if A.dtype != mx.float16 or B.dtype != mx.float16:
+        raise ValueError(
+            f"{op_name}: A/B must be float16; got {A.dtype}, {B.dtype}"
+        )
+    M = int(A.shape[0])
+    K = int(A.shape[1])
+    if transpose_B:
+        N = int(B.shape[0])
+        if int(B.shape[1]) != K:
+            raise ValueError(
+                f"{op_name}: QK shape mismatch A={tuple(A.shape)} B={tuple(B.shape)}"
+            )
+    else:
+        N = int(B.shape[1])
+        if int(B.shape[0]) != K:
+            raise ValueError(
+                f"{op_name}: PV shape mismatch A={tuple(A.shape)} B={tuple(B.shape)} "
+                f"(expected B rows == A cols == {K})"
+            )
+    if tuple(out.shape) != (M, N) or out.dtype != mx.float32:
+        raise ValueError(
+            f"{op_name}: out must be fp32 shape ({M}, {N}); got {tuple(out.shape)} {out.dtype}"
+        )
+
+    from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import _coop_tile_for
+
+    coop = _coop_tile_for(M, N, K)
+    if coop is None:
+        raise ValueError(
+            f"{op_name}: grouped GEMM shape M={M} N={N} K={K} admits no legal "
+            "Metal-4 cooperative tile (needs M%16==0, N%32==0, K%16==0). This "
+            "standalone matmul2d GEMM only serves cooperative-tileable group "
+            "shapes; sub-tile groups are served by the fused per-lane "
+            "scalar-reduction forward."
+        )
+    bm, bn, bk, threads = coop
+    A_a = _aligned_contiguous_smbf16(A)
+    B_a = _aligned_contiguous_smbf16(B)
+    mx.eval(A_a, B_a)
+    try:
+        kernel = _grouped_gemm_matmul2d_kernel_for(
+            M, N, K, bm, bn, bk, threads, transpose_B
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"{op_name}: cooperative-tensor matmul2d compile failed for "
+            f"M={M} N={N} K={K} tile={coop} ({type(exc).__name__}: {exc})."
+        ) from exc
+    returned = kernel(A_a, B_a, out)
+    result = returned[0] if isinstance(returned, (list, tuple)) else returned
+    return cast(mx.array, result)
+
+
 __all__ = [
     "SparseMLAPathCDirectError",
     "SparseMLAPathCStatus",
     "dump_lowered_bwd_msl",
     "dump_lowered_fwd_msl",
+    "make_sparse_mla_grouped_gemm_matmul2d_kernel",
     "sparse_mla_bwd_path_c",
     "sparse_mla_fwd_path_c_direct",
     "sparse_mla_fwd_path_c",
+    "sparse_mla_grouped_qk_path_c",
+    "sparse_mla_grouped_pv_path_c",
     "sparse_mla_path_c_apply",
     "sparse_mla_path_c_metal_apply",
     "sparse_mla_path_c_status",

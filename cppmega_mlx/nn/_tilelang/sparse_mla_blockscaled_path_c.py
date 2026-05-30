@@ -1916,6 +1916,293 @@ def blockscaled_sparse_mla_qk_path_c_status(
     )
 
 
+# --- Metal-4 cooperative-tensor (matmul2d) grouped E8M0 QK reducer ------------
+#
+# The M=1 ``make_blockscaled_sparse_mla_qk_reduce_kernel`` runs one query row
+# against the gathered top-k KV rows, folding the per-K-block E8M0 scale into
+# each scalar dot4 term. When ``head_kv`` query heads of a KV group are tiled
+# together, the QK tile is a ``[head_kv, qk_dim] @ [topk, qk_dim]^T`` GEMM. The
+# cooperative-tensor ``matmul2d`` accumulates raw products, so the E8M0
+# per-K-block scales are folded into the half cooperative-input tiles BEFORE the
+# GEMM: ``A_shared[i,kk] = e4m3_to_half(A_fp8[i,kk]) * e8m0_to_float(A_scale[kb])``
+# (likewise B). For group shapes that admit a legal cooperative tile this beats
+# the per-row scalar reduction; sub-tile group shapes RAISE in the dispatcher
+# (RULE #1: explicit shape-correct dispatch, no silent gate).
+
+_BSFP8_QKMM_M = 16
+_BSFP8_QKMM_N = 32
+_BSFP8_QKMM_K = 64
+_BSFP8_QKMM_BM = 16
+_BSFP8_QKMM_BN = 32
+_BSFP8_QKMM_BK = 32
+_BSFP8_QKMM_THREADS = 32
+_BSFP8_QKMM_BS = 1
+_BSFP8_QKMM_SCALE_BLOCKS = 2
+
+
+def make_blockscaled_sparse_mla_qk_reduce_matmul2d_kernel(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    BK: int,
+    threads: int,
+    B_SCALE_ROWS: int | None = None,
+) -> Any:
+    """Build the grouped E8M0 QK tile as a Metal-4 cooperative-tensor GEMM.
+
+    Computes ``C[M, N] = (dequant(A_fp8, A_scale) @ dequant(B_fp8, B_scale)^T)``
+    where ``M = head_kv`` query rows share the gathered top-k KV matrix and the
+    E8M0 per-K-block (size 32) scales are folded into the half cooperative-input
+    tiles before the GEMM.
+
+    ``BM/BN/BK/threads`` MUST be a legal cooperative tile dividing ``M/N/K`` and
+    ``BK`` must be a multiple of ``E8M0_BLOCK_SIZE`` so each shared K-tile maps
+    to whole E8M0 scale blocks. A violated precondition RAISES (RULE #1).
+    """
+
+    if M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(
+            f"grouped E8M0 QK matmul2d requires positive M/N/K; got M={M} N={N} K={K}"
+        )
+    if K % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"grouped E8M0 QK matmul2d requires K divisible by {E8M0_BLOCK_SIZE}; got K={K}"
+        )
+    if M % BM or N % BN or K % BK:
+        raise ValueError(
+            "grouped E8M0 QK matmul2d tile does not divide the GEMM extents: "
+            f"M={M} N={N} K={K} BM={BM} BN={BN} BK={BK}"
+        )
+    if BM % 16 or BN % 32 or BK % 16:
+        raise ValueError(
+            "grouped E8M0 QK matmul2d tile violates the Metal-4 cooperative "
+            f"constraint (BM%16, BN%32, BK%16): BM={BM} BN={BN} BK={BK}"
+        )
+    if BK % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"grouped E8M0 QK matmul2d requires BK divisible by {E8M0_BLOCK_SIZE}; got BK={BK}"
+        )
+    b_scale_rows = N if B_SCALE_ROWS is None else int(B_SCALE_ROWS)
+    if b_scale_rows not in (1, N):
+        raise ValueError(f"B_SCALE_ROWS must be 1 or N={N}; got {b_scale_rows}")
+
+    from tilelang import language as T
+    from tilelang.tileop.metal_quant import e8m0_to_float
+    from tvm.target import Target
+
+    T = cast(Any, T)
+
+    scale_blocks = K // E8M0_BLOCK_SIZE
+    g = globals()
+    g.update(
+        T=T,
+        Target=Target,
+        e8m0_to_float=e8m0_to_float,
+        _BSFP8_QKMM_M=int(M),
+        _BSFP8_QKMM_N=int(N),
+        _BSFP8_QKMM_K=int(K),
+        _BSFP8_QKMM_BM=int(BM),
+        _BSFP8_QKMM_BN=int(BN),
+        _BSFP8_QKMM_BK=int(BK),
+        _BSFP8_QKMM_THREADS=int(threads),
+        _BSFP8_QKMM_BS=int(b_scale_rows),
+        _BSFP8_QKMM_SCALE_BLOCKS=int(scale_blocks),
+    )
+
+    @T.prim_func
+    def blockscaled_sparse_mla_qk_reduce_matmul2d(
+        A_fp8: T.Tensor((_BSFP8_QKMM_M, _BSFP8_QKMM_K), "float8_e4m3"),
+        A_scale: T.Tensor((_BSFP8_QKMM_M, _BSFP8_QKMM_SCALE_BLOCKS), "uint8"),
+        B_fp8: T.Tensor((_BSFP8_QKMM_N, _BSFP8_QKMM_K), "float8_e4m3"),
+        B_scale: T.Tensor((_BSFP8_QKMM_BS, _BSFP8_QKMM_SCALE_BLOCKS), "uint8"),
+        C: T.Tensor((_BSFP8_QKMM_M, _BSFP8_QKMM_N), "float32"),
+    ):
+        with T.Kernel(
+            T.ceildiv(_BSFP8_QKMM_N, _BSFP8_QKMM_BN),
+            T.ceildiv(_BSFP8_QKMM_M, _BSFP8_QKMM_BM),
+            threads=_BSFP8_QKMM_THREADS,
+        ) as (bx, by):
+            A_shared = T.alloc_shared((_BSFP8_QKMM_BM, _BSFP8_QKMM_BK), "float16", scope="shared")
+            B_shared = T.alloc_shared((_BSFP8_QKMM_BN, _BSFP8_QKMM_BK), "float16", scope="shared")
+            C_shared = T.alloc_shared((_BSFP8_QKMM_BM, _BSFP8_QKMM_BN), "float32", scope="shared")
+            T.clear(C_shared)
+            for ko in T.serial(T.ceildiv(_BSFP8_QKMM_K, _BSFP8_QKMM_BK)):
+                for i, kk in T.Parallel(_BSFP8_QKMM_BM, _BSFP8_QKMM_BK):
+                    a_val = T.alloc_var("float32")
+                    a_kb = (ko * _BSFP8_QKMM_BK + kk) // E8M0_BLOCK_SIZE
+                    a_val = T.cast(A_fp8[by * _BSFP8_QKMM_BM + i, ko * _BSFP8_QKMM_BK + kk], "float32")
+                    A_shared[i, kk] = T.cast(
+                        a_val * e8m0_to_float(A_scale[by * _BSFP8_QKMM_BM + i, a_kb]), "float16"
+                    )
+                for j, kk in T.Parallel(_BSFP8_QKMM_BN, _BSFP8_QKMM_BK):
+                    b_val = T.alloc_var("float32")
+                    b_kb = (ko * _BSFP8_QKMM_BK + kk) // E8M0_BLOCK_SIZE
+                    b_row = 0 if _BSFP8_QKMM_BS == 1 else (bx * _BSFP8_QKMM_BN + j)
+                    b_val = T.cast(B_fp8[bx * _BSFP8_QKMM_BN + j, ko * _BSFP8_QKMM_BK + kk], "float32")
+                    B_shared[j, kk] = T.cast(
+                        b_val * e8m0_to_float(B_scale[b_row, b_kb]), "float16"
+                    )
+                T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
+            T.copy(C_shared, C[by * _BSFP8_QKMM_BM, bx * _BSFP8_QKMM_BN])
+
+    return blockscaled_sparse_mla_qk_reduce_matmul2d
+
+
+@lru_cache(maxsize=128)
+def _qk_reduce_matmul2d_kernel_for_blockscaled(
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    BK: int,
+    threads: int,
+    b_scale_rows: int,
+) -> Any:
+    """Build and cache the tvm-ffi cooperative-tensor grouped E8M0 QK reducer."""
+
+    import tilelang
+
+    prim = make_blockscaled_sparse_mla_qk_reduce_matmul2d_kernel(
+        M=M,
+        N=N,
+        K=K,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        threads=threads,
+        B_SCALE_ROWS=b_scale_rows,
+    )
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target(TILELANG_METAL_E8M0_SPARSE_MLA_TARGET),
+        execution_backend="tvm_ffi",
+        out_idx=4,
+    )
+
+
+def _aligned_contiguous_bsfp8(array: mx.array) -> mx.array:
+    """Fresh, 64-byte-aligned, row-major copy (tvm-ffi DLPack requires align=64)."""
+
+    if array.dtype == mx.uint8:
+        fresh = mx.bitwise_or(array, mx.array(0, dtype=mx.uint8))
+    else:
+        fresh = array + mx.array(0, dtype=array.dtype)
+    return mx.contiguous(fresh)
+
+
+def blockscaled_sparse_mla_qk_reduce_grouped_path_c(
+    A_fp8: mx.array,
+    A_scale: mx.array,
+    B_fp8: mx.array,
+    B_scale: mx.array,
+    out: mx.array,
+) -> mx.array:
+    """Run the grouped E8M0 QK tile with explicit matmul2d/scalar dispatch.
+
+    ``A_fp8`` is ``(M=head_kv, K)`` e4m3 uint8 storage, ``A_scale`` its
+    ``(M, K/32)`` E8M0 uint8 block scales; ``B_fp8`` the gathered ``(N=topk, K)``
+    KV rows with ``(N or 1, K/32)`` E8M0 scales; ``out`` the caller-owned
+    ``(M, N)`` fp32 score tile.
+
+    Routes to the Metal-4 cooperative-tensor matmul2d GEMM (E8M0 scales folded
+    into the half cooperative inputs) when ``_coop_tile_for(M, N, K)`` is legal;
+    otherwise RAISES -- the M=1 scalar reducer remains the shape-correct path for
+    sub-tile groups (callers route those through ``blockscaled_sparse_mla_qk_
+    reduce_path_c``). RULE #1: explicit shape dispatch, no silent fallback here.
+    """
+
+    if not can_run_metal():
+        raise RuntimeError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: MLX Metal backend "
+            "unavailable."
+        )
+    if A_fp8.ndim != 2 or B_fp8.ndim != 2:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: A_fp8/B_fp8 must be "
+            f"2D; got A={tuple(A_fp8.shape)} B={tuple(B_fp8.shape)}"
+        )
+    if A_fp8.dtype != mx.uint8 or B_fp8.dtype != mx.uint8:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: A_fp8/B_fp8 must be "
+            f"uint8 e4m3 storage; got {A_fp8.dtype}, {B_fp8.dtype}"
+        )
+    if A_scale.dtype != mx.uint8 or B_scale.dtype != mx.uint8:
+        raise TypeError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: A_scale/B_scale must "
+            f"be uint8 E8M0 block scales; got {A_scale.dtype}, {B_scale.dtype}"
+        )
+    M = int(A_fp8.shape[0])
+    K = int(A_fp8.shape[1])
+    N = int(B_fp8.shape[0])
+    if M <= 0 or N <= 0 or K <= 0 or int(B_fp8.shape[1]) != K:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: A/B shape mismatch: "
+            f"A={tuple(A_fp8.shape)} B={tuple(B_fp8.shape)}"
+        )
+    if K % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: K must be divisible "
+            f"by {E8M0_BLOCK_SIZE}; got K={K}"
+        )
+    scale_blocks = K // E8M0_BLOCK_SIZE
+    if tuple(A_scale.shape) != (M, scale_blocks):
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: A_scale must have "
+            f"shape ({M}, {scale_blocks}); got {tuple(A_scale.shape)}"
+        )
+    if tuple(B_scale.shape) not in ((1, scale_blocks), (N, scale_blocks)):
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: B_scale must have "
+            f"shape (1, {scale_blocks}) or ({N}, {scale_blocks}); got {tuple(B_scale.shape)}"
+        )
+    if tuple(out.shape) != (M, N) or out.dtype != mx.float32:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: out must be fp32 "
+            f"shape ({M}, {N}); got {tuple(out.shape)} {out.dtype}"
+        )
+
+    from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import _coop_tile_for
+
+    coop = _coop_tile_for(M, N, K)
+    if coop is None:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: grouped shape "
+            f"M={M} N={N} K={K} admits no legal Metal-4 cooperative tile "
+            "(needs M%16==0, N%32==0, K%16==0). Sub-tile group shapes are served "
+            "by the M=1 scalar reducer (blockscaled_sparse_mla_qk_reduce_path_c)."
+        )
+    bm, bn, bk, threads = coop
+    if bk % E8M0_BLOCK_SIZE != 0:
+        raise ValueError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: cooperative tile "
+            f"BK={bk} is not a multiple of E8M0 block size {E8M0_BLOCK_SIZE}; the "
+            f"per-K-block scale fold is undefined for M={M} N={N} K={K}."
+        )
+    b_scale_rows = 1 if int(B_scale.shape[0]) == 1 else N
+    A_fp8_a = _aligned_contiguous_bsfp8(A_fp8)
+    A_scale_a = _aligned_contiguous_bsfp8(A_scale)
+    B_fp8_a = _aligned_contiguous_bsfp8(B_fp8)
+    B_scale_a = _aligned_contiguous_bsfp8(B_scale)
+    mx.eval(A_fp8_a, A_scale_a, B_fp8_a, B_scale_a)
+    try:
+        kernel = _qk_reduce_matmul2d_kernel_for_blockscaled(
+            M, N, K, bm, bn, bk, threads, b_scale_rows
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "blockscaled_sparse_mla_qk_reduce_grouped_path_c: cooperative-tensor "
+            f"matmul2d compile failed for M={M} N={N} K={K} tile={coop} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
+    returned = kernel(A_fp8_a, A_scale_a, B_fp8_a, B_scale_a, out)
+    result = returned[0] if isinstance(returned, (list, tuple)) else returned
+    return cast(mx.array, result)
+
+
 __all__ = [
     "E8M0_BLOCK_SIZE",
     "E8M0_LAYOUT",
@@ -1928,7 +2215,9 @@ __all__ = [
     "blockscaled_sparse_mla_qk_path_c_status",
     "blockscaled_sparse_mla_qk_reduce_msl_features",
     "blockscaled_sparse_mla_qk_reduce_path_c",
+    "blockscaled_sparse_mla_qk_reduce_grouped_path_c",
     "blockscaled_sparse_mla_qk_reduce_path_c_status",
+    "make_blockscaled_sparse_mla_qk_reduce_matmul2d_kernel",
     "blockscaled_sparse_mla_qk_scaled_matmul_probe_status",
     "lower_blockscaled_sparse_mla_qk_msl",
     "lower_blockscaled_sparse_mla_qk_reduce_msl",

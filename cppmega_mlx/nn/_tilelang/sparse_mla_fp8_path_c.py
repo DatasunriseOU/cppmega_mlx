@@ -1010,6 +1010,325 @@ def make_fp8_sparse_mla_qk_reduce_kernel(
         return fp8_sparse_mla_qk_reduce
 
 
+# --- Metal-4 cooperative-tensor (matmul2d) grouped QK reducer -----------------
+#
+# The M=1 ``make_fp8_sparse_mla_qk_reduce_kernel`` above is a single query row
+# against the gathered top-k KV rows (scalar dot4 / allreduce). When several
+# query heads in the same KV group (``head_kv`` rows) share one gathered KV
+# matrix, the QK tile becomes a real ``[head_kv, K] @ [topk, K]^T`` GEMM whose
+# M=head_kv, N=topk, K=qk_dim. For shapes that admit a legal Metal-4
+# cooperative tile (M%16, N%32, K%16; see ``_coop_tile_for``), routing this
+# grouped tile through the cooperative-tensor ``mpp::tensor_ops::matmul2d``
+# GEMM (the same keystone emission #6 fp8_matmul uses) beats the per-row dot4
+# reductions. The dot4 M=1 reducer remains the explicit shape-correct path for
+# group shapes no cooperative tile divides (head_kv<16 / topk<32). This is NOT
+# a silent fallback: the dispatcher in ``fp8_sparse_mla_qk_reduce_grouped_path_c``
+# selects by ``_coop_tile_for`` and RAISES on genuinely unsupported shapes.
+
+# TileLang resolves these module globals while decorating the nested grouped
+# matmul2d @T.prim_func. Defaults keep pyright aligned with runtime values.
+_SMFP8_QKMM_M = 16
+_SMFP8_QKMM_N = 32
+_SMFP8_QKMM_K = 64
+_SMFP8_QKMM_BM = 16
+_SMFP8_QKMM_BN = 32
+_SMFP8_QKMM_BK = 32
+_SMFP8_QKMM_THREADS = 32
+_SMFP8_QKMM_BS = 1
+
+
+def _aligned_contiguous(array: mx.array) -> mx.array:
+    """Return a freshly-allocated, row-major, 64-byte-aligned copy of ``array``.
+
+    The tvm-ffi DLPack import enforces ``require_alignment=64``. A 1-row slice
+    (e.g. ``A_fp8[row:row+1, :]``) inherits a non-aligned byte offset from its
+    base buffer; ``mx.contiguous`` alone may preserve that offset. Materializing
+    through a fresh elementwise op forces MLX to allocate a new aligned buffer.
+    """
+
+    # A view/slice can carry a non-64-aligned byte offset from its parent
+    # buffer. Force a genuine elementwise materialization (uint8 bit-or with 0 /
+    # numeric add with 0) so MLX allocates a NEW buffer at offset 0, then make it
+    # contiguous. ``mx.contiguous`` alone is a no-op on an already-contiguous
+    # sub-offset slice and would preserve the bad offset.
+    if array.dtype == mx.uint8:
+        fresh = mx.bitwise_or(array, mx.array(0, dtype=mx.uint8))
+    else:
+        fresh = array + mx.array(0, dtype=array.dtype)
+    return mx.contiguous(fresh)
+
+
+def make_fp8_sparse_mla_qk_reduce_matmul2d_kernel(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    BK: int,
+    threads: int,
+    b_scale_size: int | None = None,
+) -> Any:
+    """Build the grouped FP8 QK tile as a Metal-4 cooperative-tensor GEMM.
+
+    Computes ``C[M, N] = (A_fp8[M, K] @ B_fp8[N, K]^T) * A_scale * B_scale``
+    where ``M = head_kv`` query rows share the gathered top-k KV matrix.
+
+    The FP8 ``e4m3`` tiles are dequantized to ``half`` into ``shared``
+    cooperative-input buffers (each byte routed through an explicit ``float32``
+    scratch so the Metal backend emits the per-element ``__tvm_fp8_e4m3_to_half``
+    LUT decode rather than a mis-lowered ``(half4)(uchar4)`` integer cast). The
+    accumulator ``C_shared`` lives in ``shared`` scope, which is what triggers
+    the cooperative-tensor ``matmul2d`` lowering in ``gemm_metal.py``. Scalar A
+    scale and scalar/per-row B scale are applied to the shared accumulator once
+    after the K reduction.
+
+    ``BM/BN/BK/threads`` MUST be a legal cooperative tile (per ``_coop_tile_for``)
+    and must evenly divide ``M/N/K`` — the cooperative kernel does not bounds-
+    guard a partial output tile. The caller guarantees this via shape-correct
+    dispatch; here a violated precondition RAISES (RULE #1: no silent gate).
+    """
+
+    if M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(
+            f"grouped FP8 QK matmul2d requires positive M/N/K; got M={M} N={N} K={K}"
+        )
+    if M % BM or N % BN or K % BK:
+        raise ValueError(
+            "grouped FP8 QK matmul2d tile does not divide the GEMM extents: "
+            f"M={M} N={N} K={K} BM={BM} BN={BN} BK={BK}"
+        )
+    if BM % 16 or BN % 32 or BK % 16:
+        raise ValueError(
+            "grouped FP8 QK matmul2d tile violates the Metal-4 cooperative "
+            f"constraint (BM%16, BN%32, BK%16): BM={BM} BN={BN} BK={BK}"
+        )
+    b_scale_extent = N if b_scale_size is None else int(b_scale_size)
+    if b_scale_extent not in (1, N):
+        raise ValueError(
+            f"B_scale must be scalar or per-row for grouped FP8 QK matmul2d; "
+            f"got {b_scale_extent=} {N=}"
+        )
+
+    from tilelang import language as T
+    from tvm.target import Target
+
+    T = cast(Any, T)
+
+    g = globals()
+    g.update(
+        T=T,
+        Target=Target,
+        _SMFP8_QKMM_M=int(M),
+        _SMFP8_QKMM_N=int(N),
+        _SMFP8_QKMM_K=int(K),
+        _SMFP8_QKMM_BM=int(BM),
+        _SMFP8_QKMM_BN=int(BN),
+        _SMFP8_QKMM_BK=int(BK),
+        _SMFP8_QKMM_THREADS=int(threads),
+        _SMFP8_QKMM_BS=int(b_scale_extent),
+    )
+
+    @T.prim_func
+    def fp8_sparse_mla_qk_reduce_matmul2d(
+        A_fp8: T.Tensor((_SMFP8_QKMM_M, _SMFP8_QKMM_K), "float8_e4m3"),
+        A_scale: T.Tensor((1,), "float32"),
+        B_fp8: T.Tensor((_SMFP8_QKMM_N, _SMFP8_QKMM_K), "float8_e4m3"),
+        B_scale: T.Tensor((_SMFP8_QKMM_BS,), "float32"),
+        C: T.Tensor((_SMFP8_QKMM_M, _SMFP8_QKMM_N), "float32"),
+    ):
+        with T.Kernel(
+            T.ceildiv(_SMFP8_QKMM_N, _SMFP8_QKMM_BN),
+            T.ceildiv(_SMFP8_QKMM_M, _SMFP8_QKMM_BM),
+            threads=_SMFP8_QKMM_THREADS,
+        ) as (bx, by):
+            A_shared = T.alloc_shared((_SMFP8_QKMM_BM, _SMFP8_QKMM_BK), "float16", scope="shared")
+            B_shared = T.alloc_shared((_SMFP8_QKMM_BN, _SMFP8_QKMM_BK), "float16", scope="shared")
+            C_shared = T.alloc_shared((_SMFP8_QKMM_BM, _SMFP8_QKMM_BN), "float32", scope="shared")
+            T.clear(C_shared)
+            for ko in T.serial(T.ceildiv(_SMFP8_QKMM_K, _SMFP8_QKMM_BK)):
+                for i, kk in T.Parallel(_SMFP8_QKMM_BM, _SMFP8_QKMM_BK):
+                    a_val = T.alloc_var("float32")
+                    a_val = T.cast(A_fp8[by * _SMFP8_QKMM_BM + i, ko * _SMFP8_QKMM_BK + kk], "float32")
+                    A_shared[i, kk] = T.cast(a_val, "float16")
+                for j, kk in T.Parallel(_SMFP8_QKMM_BN, _SMFP8_QKMM_BK):
+                    b_val = T.alloc_var("float32")
+                    b_val = T.cast(B_fp8[bx * _SMFP8_QKMM_BN + j, ko * _SMFP8_QKMM_BK + kk], "float32")
+                    B_shared[j, kk] = T.cast(b_val, "float16")
+                T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
+            sa = A_scale[0]
+            for i, j in T.Parallel(_SMFP8_QKMM_BM, _SMFP8_QKMM_BN):
+                col = bx * _SMFP8_QKMM_BN + j
+                if _SMFP8_QKMM_BS == 1:
+                    C_shared[i, j] = C_shared[i, j] * sa * B_scale[0]
+                else:
+                    C_shared[i, j] = C_shared[i, j] * sa * B_scale[col]
+            T.copy(C_shared, C[by * _SMFP8_QKMM_BM, bx * _SMFP8_QKMM_BN])
+
+    return fp8_sparse_mla_qk_reduce_matmul2d
+
+
+@lru_cache(maxsize=128)
+def _qk_reduce_matmul2d_kernel_for(
+    M: int,
+    N: int,
+    K: int,
+    BM: int,
+    BN: int,
+    BK: int,
+    threads: int,
+    b_scale_size: int,
+) -> Any:
+    """Build and cache the tvm-ffi cooperative-tensor grouped QK reducer."""
+
+    import tilelang
+
+    prim = make_fp8_sparse_mla_qk_reduce_matmul2d_kernel(
+        M=M,
+        N=N,
+        K=K,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        threads=threads,
+        b_scale_size=b_scale_size,
+    )
+    return tilelang.compile(
+        prim,
+        target=_msl_transform._as_metal_target(TILELANG_METAL_FP8_SPARSE_MLA_TARGET),
+        execution_backend="tvm_ffi",
+        out_idx=4,
+    )
+
+
+def fp8_sparse_mla_qk_reduce_grouped_path_c(
+    A_fp8: mx.array,
+    A_scale: mx.array,
+    B_fp8: mx.array,
+    B_scale: mx.array,
+    out: mx.array,
+) -> mx.array:
+    """Run the grouped FP8 Sparse-MLA QK tile with explicit matmul2d/dot4 dispatch.
+
+    ``A_fp8`` is ``(M=head_kv, K)`` e4m3 uint8 storage (the query rows of one KV
+    group), ``B_fp8`` is the gathered ``(N=topk, K)`` KV rows, ``out`` is the
+    caller-owned ``(M, N)`` fp32 score tile.
+
+    Shape-correct dispatch (RULE #1 -- no silent fallback):
+
+    * When ``_coop_tile_for(M, N, K)`` returns a legal cooperative tile, the
+      grouped tile runs the Metal-4 cooperative-tensor ``matmul2d`` GEMM.
+    * Otherwise (e.g. head_kv<16 or topk<32, no tile divides the shape), each of
+      the ``M`` query rows is routed through the proven M=1 dot4 reducer
+      (``fp8_sparse_mla_qk_reduce_path_c``). This is the explicit shape-correct
+      path, not a hidden gate.
+
+    A genuinely unsupported shape (non-positive extents, K not divisible by 4 so
+    even the dot4 reducer cannot lower) RAISES with where+what.
+    """
+
+    if not can_run_metal():
+        raise RuntimeError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: MLX Metal backend "
+            "unavailable; the FP8 Sparse-MLA QK tile cannot dispatch."
+        )
+    if A_fp8.ndim != 2 or B_fp8.ndim != 2:
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: A_fp8/B_fp8 must be 2D; "
+            f"got A={tuple(A_fp8.shape)} B={tuple(B_fp8.shape)}"
+        )
+    if A_fp8.dtype != mx.uint8 or B_fp8.dtype != mx.uint8:
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: A_fp8/B_fp8 must be uint8 "
+            f"e4m3 storage; got {A_fp8.dtype}, {B_fp8.dtype}"
+        )
+    M = int(A_fp8.shape[0])
+    K = int(A_fp8.shape[1])
+    N = int(B_fp8.shape[0])
+    if M <= 0 or N <= 0 or K <= 0 or int(B_fp8.shape[1]) != K:
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: A/B shape mismatch: "
+            f"A={tuple(A_fp8.shape)} B={tuple(B_fp8.shape)}"
+        )
+    if A_scale.dtype != mx.float32 or B_scale.dtype != mx.float32:
+        raise TypeError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: A_scale/B_scale must be "
+            f"float32; got {A_scale.dtype}, {B_scale.dtype}"
+        )
+    if A_scale.size != 1:
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: A_scale must be a single "
+            f"FP32 scale; got shape {tuple(A_scale.shape)}"
+        )
+    if B_scale.size not in (1, N):
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: B_scale must be scalar or "
+            f"N={N} row scales; got shape {tuple(B_scale.shape)}"
+        )
+    if tuple(out.shape) != (M, N) or out.dtype != mx.float32:
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: out must be fp32 shape "
+            f"({M}, {N}); got shape {tuple(out.shape)} dtype {out.dtype}"
+        )
+
+    from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import _coop_tile_for
+
+    coop = _coop_tile_for(M, N, K)
+    b_scale_extent = 1 if int(B_scale.size) == 1 else N
+    if coop is not None:
+        bm, bn, bk, threads = coop
+        A_scale_1d = mx.contiguous(A_scale.reshape((1,)))
+        B_scale_1d = mx.contiguous(B_scale.reshape((B_scale.size,)))
+        try:
+            kernel = _qk_reduce_matmul2d_kernel_for(
+                M, N, K, bm, bn, bk, threads, b_scale_extent
+            )
+        except Exception as exc:
+            # RULE #1: a cooperative-tensor compile failure on a shape the tile
+            # divides is a real bug, not a "not applicable" signal -- raise it,
+            # do NOT silently drop to dot4.
+            raise RuntimeError(
+                "fp8_sparse_mla_qk_reduce_grouped_path_c: cooperative-tensor "
+                f"matmul2d compile failed for M={M} N={N} K={K} tile={coop} "
+                f"({type(exc).__name__}: {exc})."
+            ) from exc
+        returned = kernel(A_fp8, A_scale_1d, B_fp8, B_scale_1d, out)
+        result = returned[0] if isinstance(returned, (list, tuple)) else returned
+        return cast(mx.array, result)
+
+    # No legal cooperative tile divides this grouped shape: route each query row
+    # through the M=1 dot4 reducer. Explicit shape-correct dispatch, not a gate.
+    if K % 4 != 0:
+        raise ValueError(
+            "fp8_sparse_mla_qk_reduce_grouped_path_c: shape M={} N={} K={} admits "
+            "no cooperative tile and K is not a multiple of 4, so the dot4 reducer "
+            "cannot lower either -- unsupported.".format(M, N, K)
+        )
+    # The M=1 dot4 reducer dispatches through tvm-ffi which requires 64-byte
+    # aligned, contiguous buffers; re-materialize fresh aligned copies so a
+    # non-aligned slice/view does not crash the DLPack import.
+    B_fp8_a = _aligned_contiguous(B_fp8)
+    B_scale_a = _aligned_contiguous(B_scale.reshape((B_scale.size,)))
+    A_scale_a = _aligned_contiguous(A_scale.reshape((1,)))
+    mx.eval(B_fp8_a, B_scale_a, A_scale_a)
+    for row in range(M):
+        a_row = _aligned_contiguous(A_fp8[row : row + 1, :])
+        mx.eval(a_row)
+        row_scores = fp8_sparse_mla_qk_reduce_path_c(
+            a_row,
+            A_scale_a,
+            B_fp8_a,
+            B_scale_a,
+        )
+        if row_scores is None:
+            raise RuntimeError(
+                "fp8_sparse_mla_qk_reduce_grouped_path_c: dot4 reducer returned "
+                f"None for grouped fallback row {row} (M={M} N={N} K={K})."
+            )
+        out[row : row + 1, :] = row_scores.reshape((1, N)).astype(mx.float32)
+    return out
+
+
 def lower_fp8_sparse_mla_qk_reduce_msl(
     *,
     N: int = 16,
@@ -4103,6 +4422,8 @@ __all__ = [
     "fp8_sparse_mla_indexed_qk_reduce_path_c_status",
     "fp8_sparse_mla_qk_reduce_msl_features",
     "fp8_sparse_mla_qk_reduce_path_c",
+    "fp8_sparse_mla_qk_reduce_grouped_path_c",
+    "make_fp8_sparse_mla_qk_reduce_matmul2d_kernel",
     "fp8_sparse_mla_qk_reduce_path_c_status",
     "fp8_sparse_mla_qk_msl_features",
     "fp8_sparse_mla_qk_path_c_status",
