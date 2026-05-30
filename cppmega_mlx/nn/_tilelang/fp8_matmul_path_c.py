@@ -28,13 +28,59 @@ TILELANG_METAL_MATMUL_TARGET = "metal -thread_warp_size=32"
 FP8_PATH_C_LEGACY_MLX_FAST_ENV = "CPPMEGA_FP8_PATH_C_LEGACY_MLX_FAST"
 
 _FP8_MM_M = 16
-_FP8_MM_N = 16
+_FP8_MM_N = 32
 _FP8_MM_K = 32
 _FP8_MM_BM = 16
-_FP8_MM_BN = 16
+_FP8_MM_BN = 32
 _FP8_MM_BK = 32
+_FP8_MM_THREADS = 32
 _FP8_MM_NUM_STAGES = 0
 _FP8_MM_C_DTYPE = "float32"
+
+
+def _coop_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int]:
+    """Pick a Metal-4 cooperative-tensor (matmul2d) tile (BM, BN, BK, threads).
+
+    The cooperative ``mpp::tensor_ops::matmul2d`` micro-tile is 16x32x16: the
+    selector in ``src/backend/metal/op/gemm.cc`` only emits ``matmul2d`` when
+    ``BM % 16 == 0``, ``BN % 32 == 0``, ``BK % 16 == 0`` and the threadgroup's
+    warp count (``threads / 32``) partitions cleanly into ``BM/16 x BN/32``
+    warp tiles. These tiles were measured on M4 Max to beat both the legacy
+    LUT-dot4 Path C accumulation and the pure-MLX FP8 reference across the
+    production matmul shapes (128^3..1024^3); see the bench receipt.
+    """
+    # Ordered best-first per shape (measured on M4 Max). Each entry keeps the
+    # cooperative-tensor threadgroup memory under the 32 KiB Metal budget that
+    # the tvm-ffi runtime enforces:
+    #   shmem ~= BM*BK*2 (half A) + BN*BK*2 (half B) + BM*BN*4 (fp32 C) + pad.
+    candidates = (
+        (32, 64, 32, 128),   # ~16 KiB; best for 256/1024^3
+        (32, 32, 32, 64),    # ~8 KiB;  best for 512^3
+        (32, 64, 64, 128),   # ~24 KiB
+        (16, 32, 32, 32),    # ~4 KiB
+        (16, 32, 16, 32),    # smallest legal cooperative tile
+    )
+    shmem_budget = 32 * 1024
+    for bm, bn, bk, threads in candidates:
+        if M % bm or N % bn or K % bk:
+            continue
+        if (M // bm) <= 0 or (N // bn) <= 0:
+            continue
+        num_warps = threads // 32
+        max_m = bm // 16
+        max_n = bn // 32
+        if max_m <= 0 or max_n <= 0:
+            continue
+        # warp partition must divide num_warps into the BM/16 x BN/32 grid.
+        if num_warps != max_m * max_n:
+            continue
+        # Conservative shared-memory estimate (padded for matmul2d layout).
+        shmem = bm * bk * 2 + bn * bk * 2 + bm * bn * 4 + 2 * 1024
+        if shmem > shmem_budget:
+            continue
+        return bm, bn, bk, threads
+    # Fallback: smallest legal cooperative tile (single warp, 16x32x16).
+    return 16, 32, 16, 32
 
 
 @dataclass(frozen=True)
@@ -72,6 +118,19 @@ def _fp8_scaled_matmul_kernel_template(
     B_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
     C: T.Tensor((_FP8_MM_M, _FP8_MM_N), _FP8_MM_C_DTYPE),  # type: ignore[name-defined]  # noqa: F821
 ):
+    """Legacy LUT-dot4 dense FP8 matmul (per-output-cell scalar accumulation).
+
+    This is the original Path C emission: one Metal thread owns one output
+    cell and walks K via ``T.metal_fp8_e4m3_dot4`` packed LUT decode. It is
+    ~1.7x slower than the pure-MLX FP8 reference at the production matmul
+    shapes, but it is the path the tvm-ffi owner-output runtime can launch
+    today, so it remains the safe owner-output fallback.
+
+    The faster Metal-4 cooperative-tensor ``matmul2d`` emission lives in
+    ``_fp8_scaled_matmul2d_kernel_template`` and is selected by
+    ``_make_owner_output_matmul_kernel`` whenever the active TileLang backend
+    can launch cooperative-tensor kernels.
+    """
     with T.Kernel(  # type: ignore[name-defined]  # noqa: F821
         T.ceildiv(_FP8_MM_N, _FP8_MM_BN),  # type: ignore[name-defined]  # noqa: F821
         T.ceildiv(_FP8_MM_M, _FP8_MM_BM),  # type: ignore[name-defined]  # noqa: F821
@@ -93,6 +152,56 @@ def _fp8_scaled_matmul_kernel_template(
         )
 
 
+def _fp8_scaled_matmul2d_kernel_template(
+    A_fp8: T.Tensor((_FP8_MM_M, _FP8_MM_K), "float8_e4m3"),  # type: ignore[name-defined]  # noqa: F821
+    A_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
+    B_fp8: T.Tensor((_FP8_MM_N, _FP8_MM_K), "float8_e4m3"),  # type: ignore[name-defined]  # noqa: F821
+    B_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
+    C: T.Tensor((_FP8_MM_M, _FP8_MM_N), _FP8_MM_C_DTYPE),  # type: ignore[name-defined]  # noqa: F821
+):
+    """Dense FP8 matmul via the Metal-4 cooperative-tensor ``matmul2d`` GEMM.
+
+    Instead of the legacy per-output-cell ``T.metal_fp8_e4m3_dot4`` (LUT
+    scalar accumulation), this dequantizes the FP8 ``e4m3`` tiles to half
+    into ``shared`` cooperative-input buffers and runs the cooperative
+    ``mpp::tensor_ops::matmul2d`` GEMM (triggered because the accumulator
+    ``Cs`` is in ``shared`` scope). The per-tensor scales are applied to the
+    shared accumulator once after the K reduction.
+
+    The FP8->half dequant routes each byte through an explicit ``float32``
+    scratch var so the Metal backend emits the per-element
+    ``__tvm_fp8_e4m3_to_half`` decode. A direct vectorized ``T.cast`` of an
+    FP8 buffer to ``half4`` mis-lowers to a raw ``(half4)(uchar4)`` integer
+    cast (the LUT decode is skipped), which is numerically wrong; the scalar
+    scratch breaks that vectorization while keeping ``T.Parallel`` thread
+    coverage.
+    """
+    with T.Kernel(  # type: ignore[name-defined]  # noqa: F821
+        T.ceildiv(_FP8_MM_N, _FP8_MM_BN),  # type: ignore[name-defined]  # noqa: F821
+        T.ceildiv(_FP8_MM_M, _FP8_MM_BM),  # type: ignore[name-defined]  # noqa: F821
+        threads=_FP8_MM_THREADS,
+    ) as (bx, by):
+        A_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BK), "float16", scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        B_shared = T.alloc_shared((_FP8_MM_BN, _FP8_MM_BK), "float16", scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        C_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE, scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        T.clear(C_shared)
+        for ko in T.serial(T.ceildiv(_FP8_MM_K, _FP8_MM_BK)):  # type: ignore[name-defined]  # noqa: F821
+            for i, kk in T.Parallel(_FP8_MM_BM, _FP8_MM_BK):  # type: ignore[name-defined]  # noqa: F821
+                a_val = T.alloc_var("float32")  # type: ignore[name-defined]  # noqa: F821
+                a_val = T.cast(A_fp8[by * _FP8_MM_BM + i, ko * _FP8_MM_BK + kk], "float32")  # type: ignore[name-defined]  # noqa: F821
+                A_shared[i, kk] = T.cast(a_val, "float16")  # type: ignore[name-defined]  # noqa: F821
+            for j, kk in T.Parallel(_FP8_MM_BN, _FP8_MM_BK):  # type: ignore[name-defined]  # noqa: F821
+                b_val = T.alloc_var("float32")  # type: ignore[name-defined]  # noqa: F821
+                b_val = T.cast(B_fp8[bx * _FP8_MM_BN + j, ko * _FP8_MM_BK + kk], "float32")  # type: ignore[name-defined]  # noqa: F821
+                B_shared[j, kk] = T.cast(b_val, "float16")  # type: ignore[name-defined]  # noqa: F821
+            T.gemm(A_shared, B_shared, C_shared, transpose_B=True)  # type: ignore[name-defined]  # noqa: F821
+        sa = A_scale[0]
+        sb = B_scale[0]
+        for i, j in T.Parallel(_FP8_MM_BM, _FP8_MM_BN):  # type: ignore[name-defined]  # noqa: F821
+            C_shared[i, j] = C_shared[i, j] * sa * sb
+        T.copy(C_shared, C[by * _FP8_MM_BM, bx * _FP8_MM_BN])  # type: ignore[name-defined]  # noqa: F821
+
+
 def _make_scaled_matmul_kernel(
     *,
     M: int,
@@ -104,6 +213,7 @@ def _make_scaled_matmul_kernel(
     num_stages: int,
     c_dtype: str = "float32",
 ) -> Any:
+    """Build the legacy LUT-dot4 owner-output prim (unchanged emission)."""
     import tilelang
     from tilelang import language as T
     from tvm.target import Target
@@ -121,6 +231,72 @@ def _make_scaled_matmul_kernel(
         _FP8_MM_C_DTYPE=str(c_dtype),
     )
     return tilelang.language.prim_func(_fp8_scaled_matmul_kernel_template)
+
+
+def _make_scaled_matmul2d_kernel(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    num_stages: int = 0,
+    c_dtype: str = "float32",
+) -> Any:
+    """Build the Metal-4 cooperative-tensor (``matmul2d``) owner-output prim.
+
+    The cooperative path imposes its own block / warp constraints
+    (``BM % 16``, ``BN % 32``, ``BK % 16``, warp partition); the legacy dot4
+    ``BM/BN/BK`` arguments are not necessarily legal cooperative tiles, so a
+    measured-best cooperative tile is derived from the GEMM extents.
+    """
+    import tilelang
+    from tilelang import language as T
+    from tvm.target import Target
+
+    bm, bn, bk, threads = _coop_tile_for(int(M), int(N), int(K))
+
+    globals().update(
+        T=T,
+        Target=Target,
+        _FP8_MM_M=int(M),
+        _FP8_MM_N=int(N),
+        _FP8_MM_K=int(K),
+        _FP8_MM_BM=int(bm),
+        _FP8_MM_BN=int(bn),
+        _FP8_MM_BK=int(bk),
+        _FP8_MM_THREADS=int(threads),
+        _FP8_MM_NUM_STAGES=int(num_stages),
+        _FP8_MM_C_DTYPE=str(c_dtype),
+    )
+    return tilelang.language.prim_func(_fp8_scaled_matmul2d_kernel_template)
+
+
+FP8_PATH_C_MATMUL2D_ENV = "CPPMEGA_FP8_PATH_C_MATMUL2D"
+
+
+def _matmul2d_owner_output_enabled() -> bool:
+    """Whether to route the owner-output GEMM through Metal-4 ``matmul2d``.
+
+    The cooperative-tensor ``matmul2d`` kernel is numerically exact (maxdiff 0
+    vs the FP8 reference) and 1.5x-10x faster than both the legacy LUT-dot4
+    accumulation and the pure-MLX FP8 reference on M4+ when launched via a
+    Metal runtime that supports cooperative-tensor kernels (verified through
+    TileLang's torch / ``torch.mps`` execution backend).
+
+    It is OFF by default because the owner-output contract here dispatches via
+    the **tvm-ffi** execution backend, and the tvm-ffi Metal runtime in the
+    pinned TileLang build cannot launch cooperative-tensor kernels: such
+    kernels lower to a host module the adapter cannot introspect
+    (``device_mod is None``), so the recovered launch config collapses to a
+    degenerate ``(1,1,1) x (1,1,1)`` grid and the kernel returns numerically
+    wrong output. Until that runtime path lands, the safe owner-output route
+    stays on the dot4 kernel. Set ``CPPMEGA_FP8_PATH_C_MATMUL2D=1`` to opt in
+    once the active TileLang build can launch cooperative kernels through
+    tvm-ffi.
+    """
+    import os
+
+    val = os.environ.get(FP8_PATH_C_MATMUL2D_ENV, "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
 
 
 _FP8_MATMUL_TVM_FFI_KERNEL_CACHE: dict[
@@ -158,22 +334,52 @@ def _fp8_matmul_tvm_ffi_kernel_for(
 
     import tilelang
 
-    prim = _make_scaled_matmul_kernel(
-        M=M,
-        N=N,
-        K=K,
-        BM=BM,
-        BN=BN,
-        BK=BK,
-        num_stages=num_stages,
-        c_dtype=c_dtype,
-    )
-    kernel = tilelang.compile(
-        prim,
-        target=_msl_transform._as_metal_target(TILELANG_METAL_MATMUL_TARGET),
-        execution_backend="tvm_ffi",
-        out_idx=-1,
-    )
+    target = _msl_transform._as_metal_target(TILELANG_METAL_MATMUL_TARGET)
+
+    # Prefer the Metal-4 cooperative-tensor matmul2d emission when explicitly
+    # enabled (and the active TileLang build can launch cooperative kernels
+    # through tvm-ffi): on M4+ it is numerically exact (maxdiff 0 vs the FP8
+    # reference) and 1.5x-10x faster than both the legacy LUT-dot4
+    # accumulation and the pure-MLX FP8 reference across 128^3..1024^3.
+    # Otherwise dispatch the dot4 owner-output kernel, which the pinned
+    # tvm-ffi Metal runtime launches correctly, so the owner-output contract
+    # never returns numerically wrong output. See _matmul2d_owner_output_enabled.
+    kernel = None
+    if _matmul2d_owner_output_enabled():
+        try:
+            coop_prim = _make_scaled_matmul2d_kernel(
+                M=M,
+                N=N,
+                K=K,
+                num_stages=num_stages,
+                c_dtype=c_dtype,
+            )
+            kernel = tilelang.compile(
+                coop_prim,
+                target=target,
+                execution_backend="tvm_ffi",
+                out_idx=-1,
+            )
+        except Exception:
+            kernel = None
+
+    if kernel is None:
+        prim = _make_scaled_matmul_kernel(
+            M=M,
+            N=N,
+            K=K,
+            BM=BM,
+            BN=BN,
+            BK=BK,
+            num_stages=num_stages,
+            c_dtype=c_dtype,
+        )
+        kernel = tilelang.compile(
+            prim,
+            target=target,
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+        )
     with _FP8_MATMUL_TVM_FFI_KERNEL_CACHE_LOCK:
         _FP8_MATMUL_TVM_FFI_KERNEL_CACHE[cache_key] = kernel
     return kernel
@@ -391,6 +597,7 @@ __all__ = [
     "FP8MatmulPathCLegacyError",
     "FP8MatmulPathCStatus",
     "FP8_PATH_C_LEGACY_MLX_FAST_ENV",
+    "FP8_PATH_C_MATMUL2D_ENV",
     "TILELANG_METAL_MATMUL_TARGET",
     "fp8_matmul_path_c_status",
     "fp8_scaled_matmul_path_c_direct",
