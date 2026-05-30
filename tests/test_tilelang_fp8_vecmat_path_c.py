@@ -649,7 +649,11 @@ def test_fp8_vecmat_direct_tvm_ffi_reuses_owner_output_and_matches_reference() -
         expected = reference.astype(dtype).astype(mx.float32)
         mx.eval(returned, expected)
 
-        assert returned is not out
+        # Owner-output reuse contract: the tvm-ffi route writes in place and
+        # returns the caller-owned ``out`` (matches the sibling owner-output
+        # tests at 361/510 and the function name "reuses_owner_output"). The
+        # prior ``is not out`` assertion was inverted vs the documented contract.
+        assert returned is out
         np.testing.assert_allclose(
             np.asarray(out.astype(mx.float32)),
             np.asarray(expected),
