@@ -264,8 +264,15 @@ def sparse_mla_fwd_cuda_eager(
         )
         kernel(q_t, kv_t, idx_t, sc_t, out_t, lse_t)
         torch.cuda.synchronize()
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a CUDA kernel launch/writeback failure here is a real bug in
+        # the selected Sparse-MLA fwd kernel, not a "feature absent" signal. Do
+        # NOT return None to a silent fallback — raise with where+what.
+        raise RuntimeError(
+            f"_cuda_eager.sparse_mla_fwd_cuda_eager: TileLang-CUDA Sparse-MLA "
+            f"fwd kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     out = _torch_cuda_to_mlx(
         out_t.reshape(shapes.batch, shapes.seq_len, shapes.heads, shapes.d_v),
@@ -431,8 +438,15 @@ def mamba3_mimo_fwd_cuda_eager(
         )
         kernel(x_t, B_t, C_t, z_t, A_t, dt_t, D_t, h0_t, y_t, hl_t)
         torch.cuda.synchronize()
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the
+        # vendored Mamba3 MIMO fwd kernel, not "feature absent". Raise loud
+        # instead of returning None into a silent pure-MLX-scan fallback.
+        raise RuntimeError(
+            f"_cuda_eager.mamba3_mimo_fwd_cuda_eager: TileLang-CUDA Mamba3 MIMO "
+            f"fwd kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     y = _torch_cuda_to_mlx(y_t, x.dtype)
     h_last = _torch_cuda_to_mlx(hl_t, h0.dtype)
@@ -719,8 +733,16 @@ def mamba3_mimo_bwd_cuda_eager(
             dh0_t,
         )
         torch.cuda.synchronize()
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the
+        # vendored Mamba3 MIMO bwd kernel, not "feature absent". Raise loud
+        # instead of returning None into a silent MLX-autograd reference VJP
+        # fallback (which would mask a broken gradient kernel).
+        raise RuntimeError(
+            f"_cuda_eager.mamba3_mimo_bwd_cuda_eager: TileLang-CUDA Mamba3 MIMO "
+            f"bwd kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     # Reduce the per-(b,h,p) lane partials over the P axis (matches the Metal
     # bf16-snapshot reduction axes exactly).
@@ -864,8 +886,16 @@ def fp8_per_token_quant_cuda_eager(x: mx.array) -> tuple[mx.array, mx.array] | N
         scale_t = torch.zeros(rows, dtype=torch.float32, device="cuda")
         kernel(x_t, fp8_t, scale_t)
         torch.cuda.synchronize()
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the FP8
+        # per-token quant producer kernel, not "feature absent". Raise loud
+        # instead of returning None (the caller would otherwise re-raise a
+        # generic guard that hides the real producer-kernel error).
+        raise RuntimeError(
+            f"_cuda_eager.fp8_per_token_quant_cuda_eager: TileLang-CUDA per-token "
+            f"FP8 quant kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     fp8 = _torch_cuda_to_mlx(fp8_t.reshape(x.shape), mx.uint8)
     scale = _torch_cuda_to_mlx(scale_t.reshape(x.shape[:-1]), mx.float32)
@@ -1017,8 +1047,16 @@ def fp8_sparse_mla_apply_cuda_eager(
             lse_t,
         )
         torch.cuda.synchronize()
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the
+        # prepared-buffer FP8 Sparse-MLA apply kernel, not "feature absent".
+        # Raise loud instead of returning None into the caller's
+        # non-force_path_c silent `return None` degraded path.
+        raise RuntimeError(
+            f"_cuda_eager.fp8_sparse_mla_apply_cuda_eager: TileLang-CUDA "
+            f"prepared-buffer FP8 Sparse-MLA apply kernel launch/writeback "
+            f"failed ({type(exc).__name__}: {exc})."
+        ) from exc
 
     out = _torch_cuda_to_mlx(
         out_t.reshape(batch, seq_len, heads, d_v), mx_out_dtype
@@ -1304,8 +1342,17 @@ def m2rnn_mapped_packed_post_fwd_cuda_eager(
         )
         kernel(ci_t, W_t, xf_t, h0_t, D_t, proj_t, h_last_t, tanh_t, post_t)
         torch.cuda.synchronize()
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the
+        # vendored m2rnn mapped-packed-post fwd kernel, not "feature absent".
+        # Raise loud instead of returning None (the caller would otherwise
+        # re-raise a generic "dispatch failed" that hides the real error, or
+        # fall back to the pure-MLX reference scan).
+        raise RuntimeError(
+            f"_cuda_eager.m2rnn_mapped_packed_post_fwd_cuda_eager: TileLang-CUDA "
+            f"m2rnn mapped-packed-post fwd kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     post = _torch_cuda_to_mlx(post_t, out_dtype)
     h_last = _torch_cuda_to_mlx(h_last_t, out_dtype)

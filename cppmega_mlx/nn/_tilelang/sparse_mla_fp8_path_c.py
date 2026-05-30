@@ -577,11 +577,12 @@ def _kernel_body_for_feature_counts(msl: str) -> str:
 
 
 def _kernel_signature_and_body_for_feature_counts(msl: str) -> tuple[str, str]:
-    try:
-        _prelude, sig_text, body_text = _msl_transform._split_kernel_msl(msl)
-    except Exception:
-        fallback = msl.split("kernel void", 1)[-1] if "kernel void" in msl else msl
-        return fallback.split("{", 1)[0], fallback
+    # RULE #1: `_split_kernel_msl` already raises a clear RuntimeError with
+    # where+what ("missing 'kernel void'", "unbalanced parens/braces") when the
+    # MSL is malformed. Do NOT swallow that into a crude string-split fallback —
+    # the degraded parse would yield WRONG feature counts and silently mask a
+    # genuinely-malformed kernel in the downstream Path C feature guards.
+    _prelude, sig_text, body_text = _msl_transform._split_kernel_msl(msl)
     return sig_text, body_text
 
 
@@ -1001,7 +1002,11 @@ def make_fp8_sparse_mla_qk_reduce_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_sparse_mla_qk_reduce)
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
+        # ACCEPTABLE: the simplify pass is a correctness-preserving optimization;
+        # if it is absent from this TileLang build, the unsimplified kernel is
+        # functionally identical. RULE #1: do NOT swallow a real crash *inside*
+        # the pass (only the import is feature-absent) — that now propagates.
         return fp8_sparse_mla_qk_reduce
 
 
@@ -1258,7 +1263,10 @@ def make_fp8_sparse_mla_indexed_qk_reduce_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_sparse_mla_indexed_qk_reduce)
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
+        # ACCEPTABLE: simplify is a correctness-preserving optimization; if the
+        # pass is absent the unsimplified kernel is functionally identical.
+        # RULE #1: a real crash inside the pass now propagates (not swallowed).
         return fp8_sparse_mla_indexed_qk_reduce
 
 
@@ -1629,14 +1637,28 @@ def fp8_sparse_mla_qk_reduce_path_c(
             b_scale_size,
         )
     except (MSLDispatchUnsupported, SparseMLAFp8PathCDirectError):
+        # ACCEPTABLE: explicit "this specific kernel can't take this case"
+        # signal (documented feature-absent) -> None feeds documented routing.
         return None
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: any OTHER compile/lowering crash of the FP8 QK reducer is a
+        # real bug, not a "not applicable" signal. Availability is probed by
+        # fp8_sparse_mla_qk_reduce_path_c_status; here raise with where+what.
+        raise RuntimeError(
+            f"fp8_sparse_mla_qk_reduce_path_c: FP8 QK reducer kernel "
+            f"compile/lowering failed for n={n} k={k} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     try:
         returned = kernel(A_fp8_u8, A_scale_f32, B_fp8_u8, B_scale_f32)
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback crash is a real bug, not "not
+        # applicable". Raise with where+what instead of silently None.
+        raise RuntimeError(
+            f"fp8_sparse_mla_qk_reduce_path_c: FP8 QK reducer kernel "
+            f"launch/writeback failed ({type(exc).__name__}: {exc})."
+        ) from exc
     if isinstance(returned, (list, tuple)):
         if len(returned) != 1:
             return None
@@ -1705,9 +1727,19 @@ def fp8_sparse_mla_indexed_qk_reduce_path_c(
             ),
         )
     except (MSLDispatchUnsupported, SparseMLAFp8PathCDirectError):
+        # ACCEPTABLE: explicit "this specific kernel can't take this case"
+        # signal (documented feature-absent) -> None feeds documented routing.
         return None
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: any OTHER compile/lowering crash of the indexed FP8 QK
+        # reducer is a real bug, not a "not applicable" signal. Availability is
+        # probed by fp8_sparse_mla_indexed_qk_reduce_path_c_status; raise here.
+        raise RuntimeError(
+            f"fp8_sparse_mla_indexed_qk_reduce_path_c: indexed FP8 QK reducer "
+            f"kernel compile/lowering failed for batch={batch} seq_len={seq_len} "
+            f"heads={heads} topk={topk} k={k} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     sm_scale_buf = mx.array([float(sm_scale)], dtype=mx.float32)
     try:
@@ -1719,8 +1751,13 @@ def fp8_sparse_mla_indexed_qk_reduce_path_c(
             indices_i32,
             sm_scale_buf,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback crash is a real bug, not "not
+        # applicable". Raise with where+what instead of silently None.
+        raise RuntimeError(
+            f"fp8_sparse_mla_indexed_qk_reduce_path_c: indexed FP8 QK reducer "
+            f"kernel launch/writeback failed ({type(exc).__name__}: {exc})."
+        ) from exc
     if isinstance(returned, (list, tuple)):
         if len(returned) != 1:
             return None
@@ -1994,7 +2031,10 @@ def _make_fp8_sparse_mla_apply_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_sparse_mla_apply_kernel)
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
+        # ACCEPTABLE: simplify is a correctness-preserving optimization; if the
+        # pass is absent the unsimplified kernel is functionally identical.
+        # RULE #1: a real crash inside the pass now propagates (not swallowed).
         return fp8_sparse_mla_apply_kernel
 
 
@@ -2245,7 +2285,10 @@ def _make_fp8_sparse_mla_bwd_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_sparse_mla_bwd_kernel)
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
+        # ACCEPTABLE: simplify is a correctness-preserving optimization; if the
+        # pass is absent the unsimplified kernel is functionally identical.
+        # RULE #1: a real crash inside the pass now propagates (not swallowed).
         return fp8_sparse_mla_bwd_kernel
 
 
@@ -2284,7 +2327,10 @@ def _make_fp8_bwd_clear_dkv_kernel(
         from tilelang.transform.simplify import apply_simplify
 
         return apply_simplify(fp8_sparse_mla_bwd_clear_dkv_kernel)
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
+        # ACCEPTABLE: simplify is a correctness-preserving optimization; if the
+        # pass is absent the unsimplified kernel is functionally identical.
+        # RULE #1: a real crash inside the pass now propagates (not swallowed).
         return fp8_sparse_mla_bwd_clear_dkv_kernel
 
 
@@ -2887,8 +2933,17 @@ def _to_fp8_with_per_token_scale_metal(x: mx.array) -> tuple[mx.array, mx.array]
     try:
         kernel = _fp8_per_token_quant_tvm_ffi_kernel_for(rows, K, in_dtype)
         returned = kernel(x_flat)
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: this is the Metal FP8 per-token producer on a Metal host
+        # (can_run_metal() True was asserted above). A compile/launch failure
+        # here is a real bug; returning None makes the caller re-raise a generic
+        # "requires native tvm-ffi producer" guard that hides the real cause.
+        # Raise with where+what instead.
+        raise RuntimeError(
+            f"_to_fp8_with_per_token_scale_metal: Metal FP8 per-token quant "
+            f"producer kernel compile/launch failed for rows={rows} K={K} "
+            f"in_dtype={in_dtype} ({type(exc).__name__}: {exc})."
+        ) from exc
     if not isinstance(returned, (list, tuple)) or len(returned) != 2:
         return None
     fp8_flat = cast(mx.array, returned[0])

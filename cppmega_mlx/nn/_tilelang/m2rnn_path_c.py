@@ -3430,8 +3430,17 @@ def _m2rnn_fwd_path_c_full(
         )
     try:
         kernel, lowering = _fwd_kernel_for(batch, seq, heads, k_dim, v_dim, carrier_dtype)
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a compile failure of the selected M2RNN Path C fwd kernel is a
+        # real bug, not a "Path C not applicable" signal (those are the explicit
+        # None returns above for dtype/can_run_metal/h0). Availability is probed
+        # separately by `_kernel_lowering_status`; here, raise with where+what.
+        raise RuntimeError(
+            f"_m2rnn_fwd_path_c_full: M2RNN Path C fwd kernel compile/lowering "
+            f"failed for batch={batch} seq={seq} heads={heads} k_dim={k_dim} "
+            f"v_dim={v_dim} carrier={carrier_dtype} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     if out is None:
@@ -3537,8 +3546,15 @@ def _m2rnn_bwd_path_c_kernel(
         )
     try:
         kernel, lowering = _bwd_kernel_for(batch, seq, heads, k_dim, v_dim, carrier_dtype)
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: a compile failure of the selected M2RNN Path C bwd kernel is a
+        # real bug, not a "Path C not applicable" signal. Raise with where+what.
+        raise RuntimeError(
+            f"_m2rnn_bwd_path_c_kernel: M2RNN Path C bwd kernel compile/lowering "
+            f"failed for batch={batch} seq={seq} heads={heads} k_dim={k_dim} "
+            f"v_dim={v_dim} carrier={carrier_dtype} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     dW, dh0, dk, dq, dv, dxf, _scratch = kernel(
@@ -4145,8 +4161,15 @@ def _m2rnn_packed_fwd_path_c_full(
             v_dim,
             carrier_dtype,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the selected packed M2RNN Path C fwd
+        # kernel is a real bug, not a "not applicable" signal. Raise where+what.
+        raise RuntimeError(
+            f"_m2rnn_packed_fwd_path_c_full: packed M2RNN Path C fwd kernel "
+            f"compile/lowering failed for batch={batch} seq={seq} heads={heads} "
+            f"k_dim={k_dim} v_dim={v_dim} carrier={carrier_dtype} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     if out is None:
@@ -4218,8 +4241,15 @@ def _m2rnn_packed_bwd_path_c_kernel(
             v_dim,
             carrier_dtype,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the selected packed M2RNN Path C bwd
+        # kernel is a real bug, not a "not applicable" signal. Raise where+what.
+        raise RuntimeError(
+            f"_m2rnn_packed_bwd_path_c_kernel: packed M2RNN Path C bwd kernel "
+            f"compile/lowering failed for batch={batch} seq={seq} heads={heads} "
+            f"k_dim={k_dim} v_dim={v_dim} carrier={carrier_dtype} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     dconv_input, dW, dxf, dh0, _scratch = kernel(
@@ -4332,8 +4362,15 @@ def _m2rnn_mapped_packed_fwd_path_c_full(
             v_dim,
             carrier_dtype,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the selected mapped-packed M2RNN Path C
+        # fwd kernel is a real bug, not a "not applicable" signal. Raise.
+        raise RuntimeError(
+            f"mapped-packed M2RNN Path C fwd kernel compile/lowering failed for "
+            f"batch={batch} seq={seq} total_heads={total_heads} k_dim={k_dim} "
+            f"v_dim={v_dim} carrier={carrier_dtype} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     if out is None:
@@ -4447,8 +4484,16 @@ def _m2rnn_mapped_packed_bwd_path_c_kernel(
             dy_dtype,
             "float32",
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: this try wraps shape validation (which raises ValueError on
+        # malformed dy/tanh_cache) and the mapped-packed M2RNN Path C bwd kernel
+        # compile. Both are real bugs — not "not applicable" signals (those are
+        # the explicit `return None` shape checks, which return normally and
+        # never reach this except). Raise with where+what instead of swallowing.
+        raise RuntimeError(
+            f"mapped-packed M2RNN Path C bwd kernel compile/validation failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     outputs: M2RNNPackedBwdOwnerOutputs = (
@@ -4592,8 +4637,15 @@ def _m2rnn_mapped_packed_post_fwd_path_c_full(
             projected_dim,
             carrier_dtype,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the selected mapped-packed-post M2RNN
+        # Path C fwd kernel is a real bug, not a "not applicable" signal. Raise.
+        raise RuntimeError(
+            f"mapped-packed-post M2RNN Path C fwd kernel compile/lowering failed "
+            f"for batch={batch} seq={seq} total_heads={total_heads} k_dim={k_dim} "
+            f"v_dim={v_dim} projected_dim={projected_dim} carrier={carrier_dtype} "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     h_last, tanh_cache, post = kernel(conv_input, W, xf, h0, D, projected)
@@ -4698,8 +4750,14 @@ def _m2rnn_inline_post_bwd_path_c_kernel(
             carrier_dtype,
             "float32",
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the M2RNN post-residual/gate bwd-from-
+        # recurrence kernel is a real bug, not a "not applicable" signal. Raise.
+        raise RuntimeError(
+            f"M2RNN Path C post-residual/gate bwd-from-recurrence kernel "
+            f"compile/lowering failed for batch={batch} seq={seq} "
+            f"total_heads={total_heads} ({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     dy_recurrent, dconv_input, dD, dprojected = _m2rnn_post_bwd_owner_outputs(
@@ -4794,8 +4852,14 @@ def _m2rnn_post_residual_gate_fwd_path_c(
             projected_dim,
             carrier_dtype,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the M2RNN post-residual/gate fwd kernel is
+        # a real bug, not a "not applicable" signal. Raise with where+what.
+        raise RuntimeError(
+            f"M2RNN Path C post-residual/gate fwd kernel compile/lowering failed "
+            f"for batch={batch} seq={seq} total_heads={total_heads} "
+            f"carrier={carrier_dtype} ({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     return kernel(y, conv_input, D, projected)
@@ -4874,8 +4938,14 @@ def _m2rnn_post_residual_gate_bwd_path_c_kernel(
             carrier_dtype,
             "float32",
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        # RULE #1: compile failure of the M2RNN post-residual/gate bwd kernel is
+        # a real bug, not a "not applicable" signal. Raise with where+what.
+        raise RuntimeError(
+            f"M2RNN Path C post-residual/gate bwd kernel compile/lowering failed "
+            f"for batch={batch} seq={seq} total_heads={total_heads} "
+            f"carrier={carrier_dtype} ({type(exc).__name__}: {exc})."
+        ) from exc
 
     del lowering
     dy_recurrent, dconv_input, dD, dprojected = _m2rnn_post_bwd_owner_outputs(

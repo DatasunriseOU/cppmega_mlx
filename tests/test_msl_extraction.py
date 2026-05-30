@@ -214,13 +214,20 @@ def test_dispatch_lower_engine_with_msl_mode_falls_back_on_import_error(
     assert fallback_warnings, "expected one-shot fallback warning"
 
 
-def test_dispatch_lower_return_msl_kwarg_falls_back_on_extraction_failure(
+def test_dispatch_lower_return_msl_kwarg_raises_on_extraction_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``return_msl=True`` falls back to shim if extraction returns None."""
+    """RULE #1: ``return_msl=True`` RAISES (no silent shim fallback) when the
+    engine lowering succeeds but MSL extraction returns None.
+
+    Previously this silently fell back to the legacy MSL-string shim — the
+    forbidden "MSL-instead-of-tvm-ffi" automated fallback. Extraction returning
+    None after a successful engine lowering points at a real extraction bug for
+    that artifact, so the dispatcher must surface it loudly. (The shim is still
+    reachable via an explicit ``CPPMEGA_MLX_TILELANG_ENGINE=shim`` route.)
+    """
 
     from cppmega_mlx.nn._tilelang import _engine_dispatch
-    from cppmega_mlx.nn._tilelang._msl_transform import TileLangMSLLowering
 
     monkeypatch.setenv("CPPMEGA_MLX_TILELANG_ENGINE", "auto")
     _engine_dispatch._reset_fallback_warning_for_tests()
@@ -234,31 +241,20 @@ def test_dispatch_lower_return_msl_kwarg_falls_back_on_extraction_failure(
         lambda *_a, **_kw: _NoSourceArtifact(),
     )
 
-    fake_lowering = TileLangMSLLowering(
-        header="// shim-fallback",
-        body="{}",
-        grid=(1, 1, 1),
-        threadgroup=(1, 1, 1),
-        msl_text=_STUB_MSL,
-        buffer_param_names=[],
-        kernel_name="shim_fallback",
-    )
+    # Sentinel: the shim must NOT be reached — a real extraction failure must
+    # raise, not silently degrade to the legacy lowering.
     monkeypatch.setattr(
-        _engine_dispatch, "_shim_lower", lambda *_a, **_kw: fake_lowering
+        _engine_dispatch,
+        "_shim_lower",
+        lambda *_a, **_kw: pytest.fail(
+            "RULE #1: shim must not be invoked on extraction failure"
+        ),
     )
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        result = _engine_dispatch.dispatch_lower(
+    with pytest.raises(RuntimeError, match="returned None"):
+        _engine_dispatch.dispatch_lower(
             object(), target="metal", return_msl=True
         )
-
-    assert result is fake_lowering
-    assert any(
-        "engine_with_msl_extraction" in str(w.message)
-        and issubclass(w.category, UserWarning)
-        for w in caught
-    )
 
 
 def test_dispatch_lower_return_msl_kwarg_returns_extracted_lowering(

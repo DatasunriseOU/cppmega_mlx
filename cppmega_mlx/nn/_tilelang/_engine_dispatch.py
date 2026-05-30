@@ -360,16 +360,23 @@ def _engine_with_msl_extraction(
 
     lowering = extract_msl_from_engine_artifact(artifact, target=target)
     if lowering is None:
-        if not _MSL_EXTRACTION_FALLBACK_WARNED:
-            warnings.warn(
-                "cppmega_mlx._tilelang: engine_with_msl_extraction returned "
-                "None (non-metal target or artifact had no kernel_source); "
-                "falling back to MSL shim.",
-                UserWarning,
-                stacklevel=2,
-            )
-            _MSL_EXTRACTION_FALLBACK_WARNED = True
-        return _shim_lower(prim_func, target, pass_configs=pass_configs)
+        # RULE #1: the engine lowering SUCCEEDED (we are past the ImportError
+        # guard) but MSL extraction returned None. That is NOT "engine absent" —
+        # it is extraction silently failing (non-metal target, or a metal
+        # artifact with no kernel_source). Falling back to the legacy MSL-string
+        # shim here is exactly the forbidden "MSL-instead-of-tvm-ffi" silent
+        # fallback: it papers over a real extraction bug with a different
+        # (legacy) lowering. Raise with where+what; if the caller genuinely
+        # wants the shim they must route explicitly via CPPMEGA_MLX_TILELANG_ENGINE=shim.
+        raise RuntimeError(
+            f"_engine_with_msl_extraction: TileLang engine lowering for "
+            f"target={target!r} succeeded but "
+            f"extract_msl_from_engine_artifact returned None (non-metal target, "
+            f"or the engine artifact exposed no kernel_source). Refusing to "
+            f"silently fall back to the legacy MSL shim (RULE #1) — this points "
+            f"at a real MSL-extraction bug for this artifact. Set "
+            f"{_FLAG_ENV}=shim to explicitly use the legacy MSL lowering."
+        )
     return lowering
 
 
