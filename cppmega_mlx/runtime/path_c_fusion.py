@@ -2475,12 +2475,101 @@ def _aot_backward_surface_for_node(node: FusionNode) -> FusionKernelSurface:
     )
 
 
-def _aot_backward_surfaces_for(region: PathCFusionRegion) -> tuple[FusionKernelSurface, ...]:
-    return tuple(
-        _aot_backward_surface_for_node(node)
-        for node in reversed(region.nodes)
-        if node.backward == "aot_autograd"
+# The chunked mamba3 SSD-core ops emit their OWN backward surfaces (owner_output)
+# rather than relying on the synthesized AOT ``_bwd`` derivation. The forward F0/F1/
+# F2 ops are forward-phase owner_output nodes; their explicit B2/B1/B0 ``_bwd`` ops
+# (in forward-list order B2,B1,B0 -- already the correct reverse-of-forward order)
+# are appended into the brick's surface list by
+# ``_emit_mamba3_chunked_bwd_model_brick_surfaces``.
+_MAMBA3_CHUNKED_FORWARD_OP_NAMES = (
+    "mamba3_chunk_precompute",
+    "mamba3_inter_chunk_recur",
+    "mamba3_chunk_scan_combine",
+)
+
+
+def _is_mamba3_chunked_forward_node(node: FusionNode) -> bool:
+    return (
+        str(node.op_name) in _MAMBA3_CHUNKED_FORWARD_OP_NAMES
+        and str(node.backward) == "owner_output"
     )
+
+
+def _is_owner_output_backward_node(node: FusionNode) -> bool:
+    """True for an EXPLICIT backward surface already present in a forward region.
+
+    These are the chunked mamba3 B2/B1/B0 ``_bwd`` ops emitted alongside the
+    forward F0/F1/F2 surfaces (op_name ends ``_bwd`` and backward=owner_output).
+    They are removed from the forward-node list and re-emitted, in correct
+    reverse-of-forward position, by ``_aot_backward_surfaces_for``.
+    """
+
+    return (
+        str(node.op_name).endswith("_bwd")
+        and str(node.backward) == "owner_output"
+    )
+
+
+def _explicit_backward_nodes_for_forward(
+    forward_node: FusionNode,
+    region: PathCFusionRegion,
+) -> tuple[FusionNode, ...]:
+    """Return the explicit ``_bwd`` nodes belonging to a chunked-mamba brick.
+
+    The chunked mamba3 brick named ``{brick}`` lowers F0/F1/F2 with names
+    ``{brick}_chunk_precompute`` / ``_inter_chunk_recur`` / ``_chunk_scan_combine``
+    and the matching B2/B1/B0 with the SAME stems + ``_bwd``. The three backward
+    surfaces are attached to the F0 (first) forward node so the reverse derivation
+    emits them once per brick, in their forward-list (B2,B1,B0 = reverse) order,
+    at the reverse position of the brick's forward span.
+    """
+
+    name = str(forward_node.name)
+    if not name.endswith("_chunk_precompute"):
+        return ()
+    brick = name[: -len("_chunk_precompute")]
+    bwd_stems = (
+        f"{brick}_chunk_scan_combine_bwd",
+        f"{brick}_inter_chunk_recur_bwd",
+        f"{brick}_chunk_precompute_bwd",
+    )
+    by_name = {str(node.name): node for node in region.nodes}
+    selected = []
+    for stem in bwd_stems:
+        node = by_name.get(stem)
+        if node is None:
+            raise ValueError(
+                "chunked mamba3 backward surface missing for forward brick "
+                f"{brick!r}: expected {stem!r} in region {region.name!r}"
+            )
+        selected.append(node)
+    return tuple(selected)
+
+
+def _aot_backward_surfaces_for(region: PathCFusionRegion) -> tuple[FusionKernelSurface, ...]:
+    """Return backward surfaces in reverse-of-forward execution order.
+
+    For each FORWARD node (reversed): an ``aot_autograd`` node derives a
+    synthesized ``_bwd`` surface; a chunked-mamba forward (owner_output) node
+    emits its pre-built explicit B2/B1/B0 ``_bwd`` surfaces at that reverse
+    position (so the model graph's later-in-reverse residual_rmsnorm_bwd, which
+    produces the brick ``delta_grad`` cotangent, runs BEFORE the mamba backward).
+    Explicit ``_bwd`` nodes already in the region are NOT re-derived as forward.
+    """
+
+    surfaces: list[FusionKernelSurface] = []
+    for node in reversed(region.nodes):
+        if _is_owner_output_backward_node(node):
+            # Explicit backward surfaces are emitted via their forward node below.
+            continue
+        if node.backward == "aot_autograd":
+            surfaces.append(_aot_backward_surface_for_node(node))
+        elif _is_mamba3_chunked_forward_node(node):
+            surfaces.extend(
+                _surface_from_node(bwd_node)
+                for bwd_node in _explicit_backward_nodes_for_forward(node, region)
+            )
+    return tuple(surfaces)
 
 
 def build_path_c_aot_autograd_region(
@@ -2488,14 +2577,25 @@ def build_path_c_aot_autograd_region(
     *,
     region_name: str | None = None,
 ) -> PathCFusionRegion:
-    """Return ``region`` plus symbolic AOT backward graph surfaces."""
+    """Return ``region`` plus symbolic AOT backward graph surfaces.
+
+    The forward node list keeps every FORWARD-phase surface (including the chunked
+    mamba3 F0/F1/F2 owner_output forward ops) but drops the explicit ``_bwd``
+    surfaces that the chunked brick appended alongside its forward; those are
+    re-emitted, in correct reverse position, by ``_aot_backward_surfaces_for``.
+    """
 
     if not isinstance(region, PathCFusionRegion):
         raise TypeError("region must be PathCFusionRegion")
+    forward_surfaces = tuple(
+        _surface_from_node(node)
+        for node in region.nodes
+        if not _is_owner_output_backward_node(node)
+    )
     return build_path_c_fusion_region(
         region_name=region_name or region.name,
         surfaces=(
-            *(_surface_from_node(node) for node in region.nodes),
+            *forward_surfaces,
             *_aot_backward_surfaces_for(region),
         ),
         z3_sync=region.z3_sync,

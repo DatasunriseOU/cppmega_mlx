@@ -189,3 +189,94 @@ the model gradient tree. Both are chain/grad-tree assembly — NOT a dtype/ABI b
     SAME 3 pre-existing failures (verified identical via `git stash` on clean base:
     test_fp8_..._blocks_missing_sparse_mla_producer + the 2 direct-chain
     value_and_grad bridge tests; unrelated to this change).
+
+================================================================================
+## UPDATE (commit on `mamba3-grad-tree`) — NON-MAMBA BACKWARD SEGMENTS NOW EMIT
+## under flag ON; the mamba delta cotangent IS seeded. The PRIOR "NEXT GAP"
+## (missing non-mamba bwd segs) is RESOLVED. A DEEPER gap blocks 163-grad parity.
+================================================================================
+
+### Root cause of the missing non-mamba backward segments (CORRECTS the premise above)
+The flag-ON `build_path_c_model_regions_from_model(include_backward=True)` region
+ALREADY emits ALL 9 backward nodes in correct reverse order (verified). The drop
+was in the DIRECT-CHAIN PLANNER: `plan_path_c_direct_fusion_chain_for_region`
+(path_c_fusion_schedules.py ~:16044) guarded the AOT-backward build with
+`not any(node.op_name.endswith("_bwd") for node in region.nodes)`. When the flag is
+ON the chunked brick appends its 3 explicit B2/B1/B0 `_bwd` surfaces INTO the
+forward node list, so that guard saw a `_bwd` node and SKIPPED
+`build_path_c_aot_autograd_region` ENTIRELY — so the OTHER bricks' backward
+(sparse_mla/attention/residual x2/m2rnn/entry) were never derived. The chain had
+only the 3 chunked mamba bwd, interleaved mid-forward.
+
+### FIX (gated nowhere — both flag states share the same correct code path)
+1. `build_path_c_aot_autograd_region` (path_c_fusion.py) now: (a) drops explicit
+   owner_output `_bwd` nodes from the forward list, (b) `_aot_backward_surfaces_for`
+   walks `reversed(forward_nodes)` and, for each chunked-mamba FORWARD node, emits
+   that brick's pre-built B2/B1/B0 `_bwd` surfaces AT THAT REVERSE POSITION (so the
+   residual_rmsnorm_bwd that produces `{brick}_delta_grad` runs BEFORE the mamba
+   backward). aot_autograd nodes derive their `_bwd` as before.
+2. The planner guard now only short-circuits on a SYNTHESIZED (non-owner_output)
+   `_bwd` node, so the chunked explicit `_bwd` no longer suppresses the build.
+
+### VERIFIED (probe + live route)
+- Flag-OFF chain UNCHANGED: 14 segments (7 fwd + 7 bwd), byte-identical order.
+- Flag-ON chain NOW: 18 segments (9 fwd + 9 bwd). Backward order:
+  sparse_mla_bwd, attention_qkv_bwd, residual_rmsnorm_bwd(R), m2rnn_bwd,
+  residual_rmsnorm_bwd(M -> emits brick_10_M_delta_grad), B2, B1, B0,
+  entry_rmsnorm_bwd. seg13 residual_rmsnorm_bwd OUT=brick_10_M_delta_grad;
+  seg14 B2 IN=brick_10_M_delta_grad (cotangent SEEDED).
+- Live flag-ON route end-to-end: loss FINITE (5.65–5.78), grads jumped 2 -> 18
+  (m2rnn layer-11 + attention layer-12 + suffix param grads now ALL flow because
+  the non-mamba backward runs). `brick_10_M_delta_grad` absmax=5.64e-3 (NONZERO).
+- New tests (test_mamba3_chunked_backward_b0b1b2.py): full-backward-chain OFF +
+  ON ordering + delta_grad seam — 13 passed (11 prior + 2 new).
+
+### THE DEEPER REMAINING GAP — chunked path has NO eager projection fwd/bwd bridge
+163-grad PARITY is STILL NOT achieved, but the cause is NOT the backward chain.
+The chunked region only covers the SSD CORE. Its projected inputs
+(`{brick}_x/B/C/A/dt/z/h0`) are caller-owned and the pre-step owner ALLOCATES THEM
+AS ZEROS (m04 `make_path_c_direct_chain_pre_step_runtime_owner` ~:8699) — there is
+NO eager `in_proj/conv/norm` forward that computes them from the residual hidden,
+and NO eager projection backward that folds the SSD-core input-grads back into the
+model params. Consequences, both verified at flag-ON:
+  (a) The chunked FORWARD runs on ZERO x/B/C/A/dt, so the cached boundary states
+      (cb/dA_cumsum/prev_states) are degenerate. The B2/B1/B0 backward multiplies
+      the (now NONZERO) `delta_grad` by zero forward activations -> EVERY chunked
+      grad output is ZERO: brick_10_M {x,B,C,A,dt,z,D,h0}_grad all absmax=0.
+  (b) Even if nonzero, those are grads w.r.t. the PROJECTED SSD tensors, NOT the
+      model params. The serial `mamba3_mimo_bwd` emits `{brick}_mamba3_in_proj_
+      weight_grad`/`_conv_weight_grad`/... directly (it backprops proj+conv+norm
+      internally). The grad-tree alias (`path_c_parameter_gradient_aliases`,
+      hybrid_lm.py:991) maps the mamba PARAMS to those `mamba3_*_weight_grad`
+      buffers — which the chunked chain never produces — so the coverage gate
+      (`_path_c_direct_chain_full_gradient_coverage_payload`) is INCOMPLETE for
+      layer-10 and the full-grad install path is bypassed (18 grads, not 163).
+  Only `{brick}_D_grad` would map 1:1 to a model param (mamba3_D); the projection/
+  conv/norm params have no chunked producer at all.
+
+RULE #1: I did NOT fake parity by aliasing the mismatched SSD-input grads onto the
+projection-param grad names (that would be a silent wrong-gradient fallback). The
+honest remaining work to reach 163-grad parity is a SEPARATE feature:
+  1. Eager (MLX-differentiable) mamba in_proj/conv/B-C-norm forward that POPULATES
+     `{brick}_x/B/C/A/dt/z/h0` from the residual hidden + the real block weights
+     (replacing the zero-seed), staged ahead of the chunked region.
+  2. Eager projection BACKWARD: take the chunked B0/B1/B2 SSD-input grads
+     (`x_grad/B_grad/.../z_grad/h0_grad`) and VJP them through that eager
+     projection to produce `{brick}_mamba3_*_weight_grad` model-param grads, then
+     register those under the existing grad-tree aliases so coverage completes.
+  This is analogous to the existing `path_c_prefix_gradient_tree_from_hidden_
+  cotangent` bridge but for the mamba projection sub-graph. It is NOT a chain-
+  assembly or grad-name-mapping change; it is a missing differentiable sub-step.
+
+### wall-time (Metal, local_gb10_quarter smoke, seq=128, batch=1)
+  flag OFF (serial): 163 grads, loss 5.7134, fwd+bwd 6.106 s.
+  flag ON (chunked): 18 grads (partial), loss ~5.65–5.78 finite, fwd+bwd ~26 s
+    (the verify harness builds+compiles 18 segments incl. the now-present 9 bwd;
+    the chunked GPU kernels themselves remain ~3x faster — the wall-time here is
+    dominated by first-call compile of the 4 extra backward segments).
+
+### Merge-safety re-confirmed with THIS change (flag default OFF)
+  - test_path_c_fusion_ir.py + test_path_c_autosplit_metal_parity.py: 124 passed.
+  - test_mamba3_chunked_backward_b0b1b2.py: 13 passed (incl. 2 new chain tests).
+  - test_m04_train_step.py -k direct_chain|path_c|chain: 82 passed, SAME 3
+    pre-existing failures (re-verified identical via `git stash` on clean base).

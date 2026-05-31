@@ -16041,10 +16041,21 @@ def plan_path_c_direct_fusion_chain_for_region(
         _path_c_default_target() == "metal"
         and forward_max_segment_nodes is not None
     )
+    # Build the symbolic backward graph when requested. A region whose nodes
+    # ALREADY include a synthesized (aot-derived) backward op is treated as
+    # already-built and left as-is. The chunked mamba3 brick appends its OWN
+    # explicit B2/B1/B0 ``_bwd`` surfaces (backward="owner_output") into the
+    # FORWARD node list; those must NOT short-circuit the backward build --
+    # ``build_path_c_aot_autograd_region`` relocates them to their correct
+    # reverse position AND derives the remaining non-mamba brick backward ops.
+    already_has_synthesized_backward = any(
+        node.op_name.endswith("_bwd")
+        and str(getattr(node, "backward", "")) != "owner_output"
+        for node in region.nodes
+    )
     working_region = (
         build_path_c_aot_autograd_region(region)
-        if include_backward
-        and not any(node.op_name.endswith("_bwd") for node in region.nodes)
+        if include_backward and not already_has_synthesized_backward
         else region
     )
     nodes = tuple(working_region.nodes)

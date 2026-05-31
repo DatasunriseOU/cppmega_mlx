@@ -243,6 +243,87 @@ def test_region_flip_on_emits_three_chunked_backward_surfaces(monkeypatch):
     assert "mamba3_scan_cb" in b2.inputs
 
 
+def _build_mra_full_backward_region(env, *, include_backward):
+    """Build a 3-brick (M mamba3 / R m2rnn / A attention) region.
+
+    This mirrors the real model route span the direct-chain planner discovers so
+    the FULL reverse backward chain (non-mamba ``_bwd`` + chunked mamba B2/B1/B0)
+    can be asserted.
+    """
+    from cppmega_mlx.runtime.path_c_fusion import (
+        PathCModelBrick,
+        build_path_c_model_region_from_bricks,
+    )
+
+    bricks = (
+        PathCModelBrick(name="brick_M", kind="mamba3", route_symbol="M"),
+        PathCModelBrick(name="brick_R", kind="m2rnn", route_symbol="R"),
+        PathCModelBrick(name="brick_A", kind="attention", route_symbol="A"),
+    )
+    return build_path_c_model_region_from_bricks(
+        region_name="mra_chain",
+        bricks=bricks,
+        shape_env=env,
+        include_backward=include_backward,
+    )
+
+
+def test_full_backward_chain_off_emits_serial_mamba_bwd(monkeypatch):
+    """Flag OFF: the full (fwd+bwd) region emits the 7 serial backward ops in
+    reverse order, ending with mamba3_mimo_bwd then entry_rmsnorm_bwd. Merge-safe
+    baseline for the flag-ON assertion below."""
+    monkeypatch.delenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", raising=False)
+    region = _build_mra_full_backward_region(_env(), include_backward=True)
+    bwd = [n.op_name for n in region.nodes if n.op_name.endswith("_bwd")]
+    assert bwd == [
+        "sparse_mla_fp8_apply_bwd",
+        "attention_qkv_projection_bwd",
+        "residual_rmsnorm_bwd",
+        "m2rnn_bwd",
+        "residual_rmsnorm_bwd",
+        "mamba3_mimo_bwd",
+        "entry_rmsnorm_bwd",
+    ], bwd
+
+
+def test_full_backward_chain_on_emits_all_segments_in_reverse_order(monkeypatch):
+    """Flag ON (the unlock fix): the full (fwd+bwd) region emits the NON-mamba
+    backward segments (sparse_mla/attention/residual x2/m2rnn/entry) IN ADDITION
+    TO the 3 chunked mamba ``_bwd`` (B2/B1/B0), all in correct reverse-of-forward
+    order. The residual_rmsnorm_bwd producing the mamba ``brick_M_delta_grad``
+    cotangent MUST run BEFORE the chunked mamba backward so the cotangent is
+    seeded (the root cause of the prior zero-mamba-grad gap)."""
+    monkeypatch.setenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", "1")
+    region = _build_mra_full_backward_region(_env(), include_backward=True)
+    bwd = [n.op_name for n in region.nodes if n.op_name.endswith("_bwd")]
+    assert bwd == [
+        "sparse_mla_fp8_apply_bwd",
+        "attention_qkv_projection_bwd",
+        "residual_rmsnorm_bwd",
+        "m2rnn_bwd",
+        "residual_rmsnorm_bwd",
+        "mamba3_chunk_scan_combine_bwd",
+        "mamba3_inter_chunk_recur_bwd",
+        "mamba3_chunk_precompute_bwd",
+        "entry_rmsnorm_bwd",
+    ], bwd
+
+    # The mamba cotangent seam: a residual_rmsnorm_bwd must OUTPUT the brick's
+    # delta_grad and run strictly BEFORE the chunked mamba B2 reads it.
+    nodes = list(region.nodes)
+    delta_grad = "brick_M_delta_grad"
+    seed_idx = next(
+        i for i, n in enumerate(nodes)
+        if n.op_name == "residual_rmsnorm_bwd" and delta_grad in n.outputs
+    )
+    b2_idx = next(
+        i for i, n in enumerate(nodes)
+        if n.op_name == "mamba3_chunk_scan_combine_bwd"
+    )
+    assert seed_idx < b2_idx, (seed_idx, b2_idx)
+    assert delta_grad in nodes[b2_idx].inputs, nodes[b2_idx].inputs
+
+
 def test_backward_handoff_buffers_fp32_and_force_spilled():
     """The 6 backward grad-handoff buffers resolve fp32 and are in the force-spill
     ABI set (mirror of the forward handoff registration)."""
