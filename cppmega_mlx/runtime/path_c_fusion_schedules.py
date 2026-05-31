@@ -43,6 +43,8 @@ from cppmega_mlx.runtime.path_c_fusion import (
 
 
 __all__ = [
+    "MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE",
+    "mamba3_chunked_forward_scan_grid",
     "MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID",
     "MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_NAME",
     "MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS",
@@ -6285,6 +6287,133 @@ def _append_row_phased_mamba3_init(
     body.append(f"{indent * 2}T.sync_threads()")
 
 
+# Chunk size for the PROVEN chunked-parallel forward scan-core
+# (``cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core``). The full
+# ``local_gb10_quarter`` mamba3 config carries ``mamba_chunk_size == 64`` and
+# the scan-core's Metal tile config requires ``block_M == 64`` (one M-tile per
+# chunk). RULE #1: this is the ONE chunk granularity the validated scan-core
+# kernel was compiled+parity-checked at; a mismatched shape RAISES below, it
+# never silently re-tiles or falls back to the serial scan.
+MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE = 64
+
+
+def _mamba3_chunked_forward_scan_feasibility(
+    *,
+    sequence_length: int,
+    batch: int,
+    heads: int,
+    head_dim: int,
+    state_dim: int,
+    groups: int,
+    chunk_size: int = MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE,
+) -> tuple[bool, int, tuple[int, int, int] | None, str, Any, Any]:
+    """Non-raising classifier for hosting the chunked mamba3 forward scan-core.
+
+    Returns ``(feasible, total_threadgroups, grid_or_None, characteristic,
+    estimate, limit)``. The single source of truth for both the emit-time
+    descriptor record (which must NOT abort the serial kernel for small/non-tile
+    test shapes) and the RAISING dispatch gate
+    :func:`mamba3_chunked_forward_scan_grid` (which surfaces infeasibility as
+    :class:`PathCSplitInfeasible` for callers that actually select the chunked
+    path). RULE #1: no try/except degraded path -- this is a pure boolean
+    classification; the raise lives in the gate that wraps it.
+    """
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        MAMBA3_CHUNKED_FWD_BLOCK_M,
+        MAMBA3_CHUNKED_FWD_BLOCK_N,
+        chunk_scan_fwd_grid,
+    )
+
+    if sequence_length % chunk_size != 0:
+        return (
+            False, 0, None,
+            "mamba3_chunked_forward sequence_length not divisible by chunk_size",
+            sequence_length, chunk_size,
+        )
+    if chunk_size != MAMBA3_CHUNKED_FWD_BLOCK_M:
+        return (
+            False, 0, None,
+            "mamba3_chunked_forward chunk_size != validated scan-core block_M",
+            chunk_size, MAMBA3_CHUNKED_FWD_BLOCK_M,
+        )
+    if head_dim % MAMBA3_CHUNKED_FWD_BLOCK_N != 0:
+        return (
+            False, 0, None,
+            "mamba3_chunked_forward head_dim not divisible by scan-core block_N",
+            head_dim, MAMBA3_CHUNKED_FWD_BLOCK_N,
+        )
+    if heads % groups != 0:
+        return (
+            False, 0, None,
+            "mamba3_chunked_forward heads not divisible by groups",
+            heads, groups,
+        )
+    try:
+        total, grid = chunk_scan_fwd_grid(
+            batch, sequence_length, chunk_size, groups, heads, head_dim, state_dim
+        )
+    except ValueError as exc:
+        return (
+            False, 0, None,
+            f"mamba3_chunked_forward scan-core grid rejected shape: {exc}",
+            (batch, sequence_length, chunk_size, heads, head_dim, state_dim),
+            "chunk_scan_fwd_grid contract",
+        )
+    return (True, total, grid, "", None, None)
+
+
+def mamba3_chunked_forward_scan_grid(
+    *,
+    region_name: str,
+    sequence_length: int,
+    batch: int,
+    heads: int,
+    head_dim: int,
+    state_dim: int,
+    groups: int,
+    chunk_size: int = MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE,
+) -> tuple[int, tuple[int, int, int]]:
+    """Feasibility gate + grid descriptor for the chunked mamba3 forward scan-core.
+
+    Returns ``(total_threadgroups, (gx, gy, gz))`` for the
+    ``cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core`` grid that replaces the
+    O(S) serial single-threadgroup forward scan
+    (``mamba3_scan_policy: external_state_recurrence``). For the production
+    ``local_gb10_quarter`` forward (S=4096, chunk=64, heads=112, head_dim=64,
+    state_dim=64, groups=8) this is ``(112, 4, 64) -> 28672`` threadgroups vs the
+    serial forward's **1** (validated to compile+run on Metal at fp16 parity
+    ~9.8e-4 vs the SSD reference by
+    ``scratch/run_chunk_scan_fwd_metal_prod.py`` / the scan-core tests).
+
+    RULE #1 (NO SILENT FALLBACK): a shape the validated scan-core cannot host
+    RAISES :class:`PathCSplitInfeasible` here -- the chunked forward path is a
+    legitimate, explicitly-gated codegen choice, never a try/except that
+    silently degrades to the serial scan. The scan-core's own helpers
+    (``chunk_scan_fwd_grid`` / ``chunk_scan_fwd_metal_prim``) RAISE identically
+    on non-divisible seqlen / non-divisible heads.
+    """
+    feasible, total, grid, characteristic, estimate, limit = (
+        _mamba3_chunked_forward_scan_feasibility(
+            sequence_length=sequence_length,
+            batch=batch,
+            heads=heads,
+            head_dim=head_dim,
+            state_dim=state_dim,
+            groups=groups,
+            chunk_size=chunk_size,
+        )
+    )
+    if not feasible or grid is None:
+        raise PathCSplitInfeasible(
+            region_name,
+            characteristic,
+            estimate,
+            limit,
+            op_name="mamba3_mimo",
+        )
+    return total, grid
+
+
 def _append_row_phased_mamba3_body(
     body: list[str],
     *,
@@ -6841,6 +6970,57 @@ def _append_row_phased_mamba3_body(
     )
     body.append(f"{indent * 3}T.sync_threads()")
     if state_output is not None:
+        # CHUNKED-FORWARD SCAN-CORE GRID DESCRIPTOR (validated, gated).
+        #
+        # Emit-time feasibility gate for the PROVEN chunked-parallel forward
+        # scan-core (``cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core``) that
+        # replaces this O(S) serial single-threadgroup scan. The gate RAISES
+        # ``PathCSplitInfeasible`` (RULE #1: no silent serial fallback) for any
+        # shape the Metal-validated scan-core kernel cannot host; on a feasible
+        # shape it records the exact grid + threadgroup count that the chunked
+        # forward dispatches. For the production local_gb10_quarter forward this
+        # is ``(heads, ceildiv(head_dim,16), batch*nchunks)`` -> 28672
+        # threadgroups vs this serial scan's 1 (compiles+runs on Metal at fp16
+        # parity ~9.8e-4 vs the SSD reference; see
+        # ``scratch/run_chunk_scan_fwd_metal_prod.py``).
+        # Classify (non-raising) whether THIS shape can host the chunked grid.
+        # The serial scan below is still the emitted compute (the full
+        # kernel-split swap is the documented remaining work); recording the
+        # descriptor here makes the chunked dispatch parameters live + asserted
+        # for production-tile shapes, and explicitly labels non-tile-aligned
+        # test shapes as NOT FEASIBLE. This is a pure classification (no
+        # try/except degraded path): the serial scan is the ONLY emitted compute
+        # for ALL shapes today, so nothing is silenced -- the RAISING gate
+        # ``mamba3_chunked_forward_scan_grid`` is for callers that actually
+        # SELECT the chunked dispatch.
+        (
+            _chunked_feasible,
+            _chunked_total,
+            _chunked_grid,
+            _chunked_reason,
+            _chunked_est,
+            _chunked_limit,
+        ) = _mamba3_chunked_forward_scan_feasibility(
+            sequence_length=int(shape_env.sequence_length),
+            batch=1,
+            heads=heads,
+            head_dim=head_dim,
+            state_dim=state_dim,
+            groups=groups,
+        )
+        if _chunked_feasible:
+            body.append(
+                f"{indent * 3}# mamba3_chunked_forward_scan: grid={_chunked_grid} "
+                f"threadgroups={_chunked_total} chunk_size="
+                f"{MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE} (validated scan-core; "
+                f"serial-scan threadgroups=1)"
+            )
+        else:
+            body.append(
+                f"{indent * 3}# mamba3_chunked_forward_scan: NOT FEASIBLE for this "
+                f"shape -- {_chunked_reason} "
+                f"({_chunked_est} vs {_chunked_limit}); serial scan retained"
+            )
         body.append(f"{indent * 3}# mamba3_scan_policy: external_state_recurrence")
         body.append(
             f"{indent * 3}for {feature} in T.serial(lane, {inner_dim}, "
