@@ -2348,6 +2348,64 @@ def _path_c_model_gradient_tree_array_names(grads: Any) -> frozenset[str]:
     )
 
 
+def _path_c_add_model_gradient_trees(left: Any, right: Any) -> Any:
+    """Element-wise sum of two model gradient trees with identical leaves.
+
+    Used to accumulate per-batch-row direct-chain gradients. Both trees must
+    carry the same array leaf names (the full trainable-parameter gradient
+    tree); any mismatch raises (no silent drop).
+    """
+
+    left_pairs = {
+        str(name): value
+        for name, value in tree_flatten(left)
+        if isinstance(value, mx.array)
+    }
+    right_pairs = {
+        str(name): value
+        for name, value in tree_flatten(right)
+        if isinstance(value, mx.array)
+    }
+    if set(left_pairs) != set(right_pairs):
+        only_left = sorted(set(left_pairs).difference(right_pairs))[:8]
+        only_right = sorted(set(right_pairs).difference(left_pairs))[:8]
+        raise ValueError(
+            "per-row gradient trees must carry identical leaves; "
+            f"only_left={only_left}, only_right={only_right}"
+        )
+    summed = [
+        (name, left_pairs[name] + right_pairs[name])
+        for name in sorted(left_pairs)
+    ]
+    return tree_unflatten(summed)
+
+
+def _path_c_select_lm_batch_row(
+    batch: Mapping[str, mx.array] | mx.array,
+    row: int,
+) -> Mapping[str, mx.array] | mx.array:
+    """Select a single batch row, preserving the leading batch axis as size 1.
+
+    The Path C direct-chain runtime is per-sequence; each row is fed through the
+    batch-1 descriptor ABI. Slicing with ``[row:row+1]`` keeps every array's
+    rank so downstream ``ensure_lm_batch``/loss-bridge shape contracts hold.
+    """
+
+    if isinstance(batch, mx.array):
+        if batch.ndim < 1:
+            raise ValueError("cannot select a batch row from a 0-D array")
+        return batch[row : row + 1]
+    if not isinstance(batch, Mapping):
+        raise TypeError(f"unsupported batch type for row selection: {type(batch)!r}")
+    selected: dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, mx.array) and value.ndim >= 1:
+            selected[key] = value[row : row + 1]
+        else:
+            selected[key] = value
+    return selected
+
+
 def _path_c_inactive_sparse_dsa_dense_parameter_names(
     model: Any,
     chain: Any,
@@ -6267,6 +6325,32 @@ def compile_path_c_direct_fusion_chain_artifacts(
     return tuple(artifacts)
 
 
+def _path_c_per_segment_command_buffer_commit_enabled() -> bool:
+    """Return True when the direct-chain commits a Metal command buffer per segment.
+
+    The fused direct-chain encodes all 7 segments' TVM-FFI Metal kernels into
+    MLX's single borrowed in-flight command buffer; committing only once at the
+    end runs the whole chain in ONE command buffer that exceeds the macOS GPU
+    watchdog window (kIOGPUCommandBufferCallbackErrorTimeout). Committing per
+    segment (mx.eval + mx.synchronize between segments) bounds each command
+    buffer to ONE segment's GPU work, keeping it under the watchdog limit.
+
+    Enabled by default on Metal hosts (where the watchdog applies). Set
+    ``CPPMEGA_PATH_C_PER_SEGMENT_CMDBUF_COMMIT=0`` to reproduce the pre-fix
+    monolithic single-command-buffer timeout for verification calibration; set
+    ``=1`` to force it on a CUDA host. There is NO silent fallback: when the
+    boundary is enabled and the commit raises, the route raises (it never
+    degrades to the single-buffer path).
+    """
+
+    override = os.environ.get("CPPMEGA_PATH_C_PER_SEGMENT_CMDBUF_COMMIT", "")
+    if override != "":
+        return override not in ("0", "false", "False", "no", "off")
+    # Default: enable on Metal (the watchdog target); the CUDA host commits
+    # through the numpy-host bridge and never touches the Metal command buffer.
+    return _path_c_default_target() != "cuda"
+
+
 def _path_c_artifact_target_is_cuda(artifact: Any) -> bool:
     """Return True iff a compiled direct-chain artifact targets CUDA.
 
@@ -6562,7 +6646,45 @@ def run_path_c_direct_fusion_chain_route(
             )
         else:
             result = artifact(*arrays)
+            # --- Per-stage Metal command-buffer commit boundary -----------------
+            # The fused direct-chain encodes every segment's TVM-FFI kernel into
+            # MLX's borrowed in-flight Metal command buffer (see tilelang
+            # mlx_metal_external_command_buffer). If all 7 segments accumulate into
+            # ONE command buffer and only a single trailing mx.eval commits it, that
+            # command buffer's total GPU time exceeds the macOS GPU watchdog window
+            # (kIOGPUCommandBufferCallbackErrorTimeout) -> the full Path-C backward
+            # times out at tvm_ffi.py mx.eval(*owner_aliases).
+            #
+            # Commit per segment so each command buffer holds exactly ONE segment's
+            # GPU work and stays under the watchdog limit:
+            #   * mx_module.eval(*buffer_arrays) forces MLX to END the active
+            #     compute encoder, append the TVM-encoded kernel, and COMMIT the
+            #     current command buffer through MLX's own scheduler outer loop
+            #     (the commit/notify_new_task pairing in mlx backend/metal/eval.cpp).
+            #   * mx_module.synchronize() waits for that committed command buffer to
+            #     COMPLETE, so MLX opens a FRESH command buffer for the next segment.
+            #
+            # This is MLX-scheduler-SAFE: eval()/synchronize() are MLX's public
+            # scheduler entry points and perform the commit on the scheduler's outer
+            # loop. A naive mid-eval CommandEncoder::commit() from C++ (the prior
+            # Path-D attempt) corrupts MLX's scheduler task accounting (commit not
+            # paired with notify_new_task) -> escaped C++ exception / dangling Metal
+            # device event. We never do that here.
+            #
+            # RULE #1 (no silent fallback): if the commit boundary fails it RAISES
+            # with which segment failed -- it never degrades to the monolithic
+            # single-buffer path that timed out.
             mx_module.eval(*buffer_arrays)
+            if _path_c_per_segment_command_buffer_commit_enabled():
+                try:
+                    mx_module.synchronize()
+                except Exception as exc:  # pragma: no cover - surfaced loudly
+                    raise RuntimeError(
+                        "direct-chain per-stage Metal command-buffer commit failed "
+                        f"at segment {int(segment.index)} "
+                        f"(phase={execution_phase}, region={segment.region.name}): "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
         segment_results.append(
             {
                 "index": int(segment.index),
@@ -6668,7 +6790,14 @@ class PathCDirectFusionChainTrainingRuntime:
         factory = self.pre_step_owner_factory
         if factory is None:
             return self.logical_buffers, self.logical_owner
-        owner = factory(model, batch)
+        batch_row = getattr(self, "_pre_step_batch_row", None)
+        try:
+            owner = factory(model, batch, batch_row=batch_row)
+        except TypeError:
+            # Back-compat: factory that does not accept batch_row (single-row).
+            if batch_row not in (None, 0):
+                raise
+            owner = factory(model, batch)
         owner_buffers = getattr(owner, "buffers", None)
         if not isinstance(owner_buffers, Mapping):
             raise TypeError("pre-step owner factory must return a buffers owner")
@@ -6710,6 +6839,46 @@ class PathCDirectFusionChainTrainingRuntime:
         loss_and_grad: Any,
     ) -> tuple[tuple[mx.array, mx.array], Any]:
         del loss_and_grad
+        # The direct-chain descriptor kernels are per-sequence (batch-1 ABI).
+        # Process each batch row through the per-sequence pipeline and reduce the
+        # results token-weightedly so no row is dropped. A single-row batch runs
+        # the body once (the prior behaviour, batch_row=None).
+        lm_batch = ensure_lm_batch(batch)
+        batch_rows = int(lm_batch.inputs.shape[0])
+        if batch_rows <= 1:
+            return self._value_and_grad_single_row(model, batch, batch_row=None)
+        loss_sum = mx.array(0.0, dtype=mx.float32)
+        ntokens_total = mx.array(0.0, dtype=mx.float32)
+        accumulated_grads: Any = None
+        for row in range(batch_rows):
+            row_batch = _path_c_select_lm_batch_row(batch, row)
+            (row_loss, row_ntokens), row_grads = self._value_and_grad_single_row(
+                model,
+                row_batch,
+                batch_row=row,
+            )
+            row_ntokens_f = row_ntokens.astype(mx.float32)
+            loss_sum = loss_sum + row_loss.astype(mx.float32) * row_ntokens_f
+            ntokens_total = ntokens_total + row_ntokens_f
+            if accumulated_grads is None:
+                accumulated_grads = row_grads
+            else:
+                accumulated_grads = _path_c_add_model_gradient_trees(
+                    accumulated_grads,
+                    row_grads,
+                )
+        denom = mx.maximum(ntokens_total, mx.array(1.0, dtype=mx.float32))
+        loss = loss_sum / denom
+        return (loss, ntokens_total), accumulated_grads
+
+    def _value_and_grad_single_row(
+        self,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+        *,
+        batch_row: int | None,
+    ) -> tuple[tuple[mx.array, mx.array], Any]:
+        self._pre_step_batch_row = batch_row
         bridge_contract = _path_c_loss_cotangent_bridge_contract_payload(
             self.loss_cotangent_bridge
         )
@@ -7772,11 +7941,21 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
     model: nn.Module,
     batch: Mapping[str, mx.array] | mx.array,
     owner_name: str | None = None,
+    batch_row: int | None = None,
 ) -> PathCLogicalBufferOwner:
     """Build per-step direct-chain buffers from model params and the batch.
 
     This owner is derived from the dynamic chain ABI.  It does not depend on
     post-step captures and does not use named acceptance fixtures.
+
+    The Path C direct-chain descriptor kernels are strictly per-sequence: the
+    declared logical ABI for the residual/hidden buffers is ``(1, S, H)`` and
+    the kernel loop extent for ``hidden`` is exactly ``S * H`` (one sequence).
+    A multi-row batch is therefore processed one row at a time; ``batch_row``
+    selects which row's prefix hidden seeds the batch-1 ``(1, S, H)`` buffer.
+    When ``batch_row`` is ``None`` the batch must contain exactly one row, and
+    seeding the full ``(1, S, H)`` prefix hidden matches the chain ABI; any
+    other batch size with ``batch_row=None`` raises (no silent row-drop).
     """
 
     start_layer_index = _path_c_direct_chain_start_layer_index(model, chain)
@@ -7807,6 +7986,26 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
         batch,
         end_layer_index=start_layer_index,
     )
+    # The descriptor chain ABI is batch-1 ``(1, S, H)``. Fold the model batch
+    # into the per-sequence ABI by selecting the requested row; never flatten
+    # B*S into one sequence (that would leak across rows) and never slice a
+    # batch>1 buffer down to row 0 (that would silently drop the other rows).
+    if prefix_hidden.ndim == 3:
+        prefix_batch = int(prefix_hidden.shape[0])
+        if batch_row is None:
+            if prefix_batch != 1:
+                raise ValueError(
+                    "Path C direct-chain pre-step owner requires batch_row for a "
+                    f"multi-row batch (prefix hidden batch={prefix_batch}); the "
+                    "descriptor chain is per-sequence (batch-1)"
+                )
+        else:
+            if not (0 <= int(batch_row) < prefix_batch):
+                raise ValueError(
+                    f"batch_row {batch_row} out of range for prefix hidden batch "
+                    f"{prefix_batch}"
+                )
+            prefix_hidden = prefix_hidden[int(batch_row) : int(batch_row) + 1]
     # The fused chain's first brick reads ``{first_brick}_hidden`` as the RAW
     # residual baseline and applies its own entry-RMSNorm (a fused
     # ``entry_rmsnorm`` surface bound to ``layers.{start}.norm.weight``) to
@@ -11412,11 +11611,15 @@ def run_local_gb10_quarter_training(
                             "training_critical_path": False,
                         }
                     else:
+                        # The descriptor chain is per-sequence (batch-1 ABI), so
+                        # the install-time binding owner is seeded from row 0 of
+                        # the batch; value_and_grad iterates all rows at runtime.
                         initial_owner = (
                             make_path_c_direct_chain_pre_step_runtime_owner(
                                 chain=selected_chain,
                                 model=model,
                                 batch=first_batch,
+                                batch_row=0,
                             )
                         )
 
@@ -11424,12 +11627,14 @@ def run_local_gb10_quarter_training(
                             model_arg: nn.Module,
                             batch_arg: Mapping[str, mx.array],
                             *,
+                            batch_row: int | None = None,
                             chain: Any = selected_chain,
                         ) -> PathCLogicalBufferOwner:
                             return make_path_c_direct_chain_pre_step_runtime_owner(
                                 chain=chain,
                                 model=model_arg,
                                 batch=batch_arg,
+                                batch_row=batch_row,
                             )
 
                         fp8_path_c_direct_chain_critical_path_install = (
