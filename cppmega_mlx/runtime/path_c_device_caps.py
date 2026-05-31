@@ -90,12 +90,25 @@ class DeviceCaps:
 
     @property
     def shared_scratch_trigger_bytes(self) -> int:
-        """Logical alloc_shared total above which Metal pooling/CUDA demote fires.
+        """Logical alloc_shared DEMOTE TARGET for the Metal pool / CUDA demote pass.
 
         Derived from the queried threadgroup cap and the preset/calibrated
-        logical->physical packing margin: a logical total above
-        ``threadgroup_mem_bytes / margin`` would inflate past the physical cap.
-        Replaces the hardcoded ``_METAL_SHARED_SCRATCH_TRIGGER_BYTES`` (28672).
+        logical->physical packing margin (``threadgroup_mem_bytes / margin``):
+        once a kernel has been found to overflow, the pass demotes its largest
+        residual ``alloc_shared`` buffers until the survivors fit this logical
+        budget (so the coalesced physical ``buf_dyn_shmem`` = budget * margin
+        lands at the threadgroup cap). This reproduces the hand-tuned 8 KiB
+        DEMOTE TARGET (``_METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES`` == 8192;
+        32768 / 3.7 ~= 8856).
+
+        NOTE: this is the demote *target*, NOT the pool *trigger*. The trigger --
+        the logical total above which a kernel is judged to overflow threadgroup
+        memory at all -- is the threadgroup cap itself (hand-tuned literal 28672 ==
+        32768 - one threadgroup page), applied directly in the Metal pool pass
+        (``_pool_oversized_shared_scratch_to_metal_workspace``). Conflating the two
+        (using ``cap / margin`` as the trigger) over-pools small fullgraph kernels
+        and strips internal fusion-edge buffers out of the single-launcher entry
+        PrimFunc -- see the regression fixed in that pass.
         """
 
         margin = self.logical_to_physical_shared_margin

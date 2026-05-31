@@ -114,6 +114,85 @@ def test_metal_caps_drive_the_split_decisions():
     assert c.buffer_arg_limit == 31
 
 
+def test_metal_single_launcher_fullgraph_not_pooled_at_short_sequence():
+    """§7.1 golden gate: the single-launcher fullgraph train block must stay a
+    single fused kernel (NOT pooled) at a short sequence on Metal.
+
+    Regression guard: the caps-derived shared-scratch pool trigger must remain the
+    threadgroup cap (physical-overflow point), NOT ``cap / margin``. When step 5
+    used ``cap / margin`` (8856 on M4 Max) as the trigger, the ~20 KiB logical
+    single-launcher fullgraph kernel was over-pooled: its internal fusion-edge
+    buffer ``entry_rmsnorm_hidden`` was demoted from ``alloc_shared`` to the
+    ``alloc_global`` pool, stripping its load/store out of the entry PrimFunc, so
+    tilelang's fullgraph validator rejected the missing edge and the auto-split
+    SILENTLY fell back to the staged launcher (a RULE #1 violation). main 82b6ab0
+    single-fuses this shape; this gate keeps that behaviour byte-for-byte.
+    """
+    if _path_c_default_target() != "metal":
+        pytest.skip("Metal single-launcher parity (run on M4 Max)")
+
+    import m04_train_step as m
+    from cppmega_mlx.recipes.model_factory import (
+        build_local_gb10_quarter_tiny_smoke_model,
+    )
+
+    model = build_local_gb10_quarter_tiny_smoke_model()
+    # Short sequence (the train-step path subtracts the shift, giving 15 here) is
+    # exactly where the over-pool regression bit: the fullgraph kernel's logical
+    # shared total (~20 KiB) sits in the 8856..32768 band where cap/margin pools
+    # but the cap-itself trigger does not.
+    compiled = m.compile_path_c_fused_train_block_artifact_for_model(
+        model=model,
+        sequence_length=15,
+        lowerer=lambda func, *, target, **kwargs: (lambda *args: None),
+    )
+
+    assert compiled["status"] == "ok", compiled.get("reason")
+    plan = compiled["plan"]
+    # The single-launcher fullgraph must fuse to ONE kernel and be SELECTED.
+    assert plan["single_kernel_fused"] is True, plan.get(
+        "single_launcher_compile_error"
+    )
+    assert plan["selected_runtime_artifact"] == "single_generated_launcher_chunks", (
+        f"auto-split fell back to {plan['selected_runtime_artifact']!r} instead of "
+        "the single fused launcher; the shared-scratch pool likely over-pooled an "
+        "internal fusion-edge buffer (RULE #1: no silent fused->staged fallback). "
+        f"compile error: {plan.get('single_launcher_compile_error')!r}"
+    )
+    assert plan["single_launcher_runtime_blocked"] is False
+    # On the success path no compile error is recorded (the key is only set in the
+    # except branch when the single-launcher compile raises).
+    assert plan.get("single_launcher_compile_error") is None
+    assert plan["single_launcher_compile_verified"] is True
+
+
+def test_metal_shared_scratch_pool_trigger_is_cap_not_cap_over_margin():
+    """The pool TRIGGER is the threadgroup cap; the DEMOTE TARGET is cap/margin.
+
+    Pins the two distinct thresholds so a future edit cannot silently collapse them
+    back into ``cap / margin`` (which over-pools small fullgraph kernels). A kernel
+    whose logical shared scratch fits the cap must be returned UNCHANGED; a kernel
+    that overflows must be pooled down to the cap/margin demote target.
+    """
+    if _path_c_default_target() != "metal":
+        pytest.skip("metal-only")
+    c = device_caps()
+    cap = int(c.threadgroup_mem_bytes)
+    # demote target (cap/margin) is strictly below the trigger (cap): the two are
+    # NOT the same number, so the regression (trigger == target) cannot recur.
+    assert c.shared_scratch_trigger_bytes < cap
+    assert c.shared_scratch_trigger_bytes == int(cap / c.logical_to_physical_shared_margin)
+
+    # A name-gated reverse-scan kernel whose residual shared scratch FITS the cap
+    # is left byte-for-byte unchanged (no pool emitted).
+    fits = (
+        "        _bwd_mamba3_h_next = T.alloc_shared((8,), \"float32\")\n"
+        "        _bwd_mamba3_h_prev = T.alloc_shared((8,), \"float32\")\n"
+        "        _bwd_mamba3_h_next[0] = _bwd_mamba3_h_prev[0]\n"
+    )
+    assert sched._pool_oversized_shared_scratch_to_metal_workspace(fits) == fits
+
+
 def test_cuda_caps_resolve_to_monolithic():
     """§7.2: CUDA caps -> no segment-node split, no row/time chunking, only the
     queried shared-mem demote. Asserted at the caps-resolution level so it runs

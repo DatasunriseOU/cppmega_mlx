@@ -10601,15 +10601,25 @@ _CUDA_SHARED_SCRATCH_BUDGET_BYTES = 0xC000  # 49152 bytes (static per-block).
 #
 # REPLACED (design step 5 / §5): the former hardcoded
 # ``_METAL_SHARED_SCRATCH_TRIGGER_BYTES = 28672`` and
-# ``_METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES = 8192`` are GONE.  The pool pass
-# (``_pool_oversized_shared_scratch_to_metal_workspace``) now derives both from
-# the device-capability probe: it pools when the PHYSICAL residual
-# (logical * caps.logical_to_physical_shared_margin, ~3.7x from the preset)
-# exceeds the QUERIED ``caps.threadgroup_mem_bytes``, and demotes the largest
-# buffers until the residual fits.  On M4 Max this reproduces the previous
-# behaviour (trigger 32768/3.7 ~= 8856 logical; the pass is name-gated to the
-# multi-MB mamba3/m2rnn reverse-scan kernels, which trip any trigger in the
-# 8856-28672 band identically).
+# ``_METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES = 8192`` are now DERIVED from the
+# device-capability probe by ``_pool_oversized_shared_scratch_to_metal_workspace``:
+#   * TRIGGER  -- a kernel overflows threadgroup memory when its residual LOGICAL
+#     ``alloc_shared`` total exceeds the QUERIED ``caps.threadgroup_mem_bytes``
+#     (32768 on M4 Max; the hand-tuned literal was 28672 == cap - one threadgroup
+#     page). This is the PHYSICAL-OVERFLOW point: small fullgraph kernels whose
+#     logical scratch fits the cap are left untouched.
+#   * DEMOTE TARGET -- once a kernel is found to overflow, demote its largest
+#     residual buffers until the survivors fit ``cap / margin`` logical, so the
+#     coalesced physical ``buf_dyn_shmem`` (= logical * margin, ~3.7x from the
+#     preset) lands at the cap (8856 logical ~= the hand-tuned 8192).
+# REGRESSION NOTE: step 5 originally used ``cap / margin`` (8856) as BOTH the
+# trigger AND the target. That lowered the trigger from 28672 to 8856 and pooled
+# the ~20 KiB single-launcher fullgraph train block, stripping the internal
+# fusion-edge buffer ``entry_rmsnorm_hidden`` (alloc_shared -> alloc_global pool)
+# out of the entry PrimFunc -- tilelang's fullgraph validator then rejected the
+# missing load/store and the auto-split silently fell back to the staged launcher
+# (a RULE #1 violation). The trigger is now the cap itself; the margin governs
+# only the demote target, matching main 82b6ab0 byte-for-byte.
 
 
 def _cuda_shared_memory_optin_cap_bytes() -> int | None:
@@ -10783,10 +10793,24 @@ def _pool_oversized_shared_scratch_to_metal_workspace(source: str) -> str:
             "path_c shared-scratch pool: logical_to_physical_shared_margin must "
             f"be >0 (got {margin!r} on {caps.device_name})"
         )
-    # Demote until the residual LOGICAL total fits the cap once inflated by the
-    # margin (physical = logical * margin <= threadgroup_cap).
+    # TRIGGER vs DEMOTE-TARGET are two DISTINCT thresholds (the hand-tuned pair
+    # was 28K trigger / 8K target). The ``margin`` (logical->physical coalescing
+    # ratio, ~3.7x) is calibrated on the multi-MB reverse-scan kernels' giant
+    # ``buf_dyn_shmem`` and governs only the DEMOTE TARGET (how far to pool once
+    # we have decided a kernel overflows), NOT the trigger. A kernel physically
+    # overflows Metal threadgroup memory when its residual LOGICAL ``alloc_shared``
+    # total exceeds the queried threadgroup cap -- small fullgraph kernels (e.g.
+    # the single-launcher train block, ~20 KiB logical here) sit BELOW the cap and
+    # MUST NOT be pooled: their tiny static ``alloc_shared`` buffers are real
+    # threadgroup memory with no giant dynamic-shared coalescing, so demoting an
+    # internal fusion edge buffer (entry_rmsnorm_hidden) off threadgroup memory
+    # would strip its load/store from the entry PrimFunc and break the fullgraph
+    # single-kernel fusion the launcher path requires. Conflating the trigger with
+    # ``cap / margin`` (==8856 here) regressed exactly that path; the trigger is
+    # the physical cap itself (28672-equivalent at the M4 Max 32 KiB cap, minus
+    # the per-kernel overhead Metal already reserves above the residual scratch).
     demote_target_logical = threadgroup_cap / margin
-    if shared_total * margin <= threadgroup_cap:
+    if shared_total <= threadgroup_cap:
         return source
     # Select the largest residual shared buffers to pool until the rest fit,
     # guaranteeing the physical buf_dyn_shmem fits the queried threadgroup cap.
