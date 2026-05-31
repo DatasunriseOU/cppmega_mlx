@@ -4714,6 +4714,20 @@ def _path_c_generated_stage_schedule_template(
 
 
 def _path_c_kernel_buffer_shapes(prim_func: Any) -> dict[str, tuple[int, ...]]:
+    # Mamba3 chunked-scan delegated grid prims are compiled JITKernels with no TIR
+    # ``buffer_map``; the delegation interpose attaches the authoritative per-name
+    # ABI shapes (from the compiled KernelParam slots). Use them directly so the
+    # route arg-assembly can slice/validate the handoff + region buffers by name.
+    delegated_shapes = getattr(
+        prim_func,
+        "_cppmega_path_c_delegated_kernel_buffer_shapes",
+        None,
+    )
+    if delegated_shapes is not None:
+        return {
+            str(name): tuple(int(dim) for dim in tuple(shape))
+            for name, shape in delegated_shapes.items()
+        }
     shapes: dict[str, tuple[int, ...]] = {}
     buffer_map = getattr(prim_func, "buffer_map", {}) or {}
     for param in tuple(getattr(prim_func, "params", ())):
@@ -6320,6 +6334,28 @@ def compile_path_c_direct_fusion_chain_artifacts(
                 f"direct-chain segment {getattr(segment, 'index', '?')} is not compilable: "
                 f"{getattr(segment, 'reason', '')}"
             )
+        # Mamba3 chunked-scan delegated grid segments: schedule_template returns an
+        # ALREADY-COMPILED tilelang JITKernel (the proven build_*_metal grid prim),
+        # not a PrimFunc the template->source->lower pipeline can re-compile
+        # (compile_path_c_region/_module_from_template RAISE on a non-PrimFunc).
+        # The JITKernel IS the callable Metal artifact, so use it directly. RULE #1:
+        # this is the one delegation path; flag OFF never reaches it.
+        delegated_prim = target.schedule_template(segment.region)
+        if (
+            getattr(
+                delegated_prim,
+                "_cppmega_path_c_mamba3_chunked_grid_delegation",
+                None,
+            )
+            is not None
+        ):
+            if not callable(delegated_prim):
+                raise RuntimeError(
+                    f"direct-chain segment {segment.index} delegated chunked grid "
+                    "prim is not callable"
+                )
+            artifacts.append(delegated_prim)
+            continue
         schedule_template = mark_path_c_schedule_template_for_region(
             target.schedule_template,
             segment.region,
@@ -7749,6 +7785,58 @@ def _path_c_direct_chain_required_logical_buffer_specs(
                 segment_index=int(segment.index),
                 source="scratch",
             )
+        # Mamba3 chunked-scan delegated grid segments expose their caller-owned
+        # buffers (projected SSD inputs, inter-chunk handoff buffers, fwd/bwd
+        # grad-handoff buffers, model params, grad outputs) through the attached
+        # delegated named-buffer ABI rather than the bridge/spilled-scratch maps.
+        # Register every one so the pre-step owner allocates the non-parameter
+        # buffers (model params resolve through the model owner by category) and
+        # the route binds them by name. dtype/shape come from the compiled
+        # KernelParam slots (authoritative).
+        delegated_order = getattr(
+            prim_func,
+            "_cppmega_path_c_delegated_kernel_buffer_order",
+            None,
+        )
+        if delegated_order is not None:
+            delegated_shapes = dict(
+                getattr(
+                    prim_func,
+                    "_cppmega_path_c_delegated_kernel_buffer_shapes",
+                    {},
+                )
+                or {}
+            )
+            delegated_dtypes = dict(
+                getattr(
+                    prim_func,
+                    "_cppmega_path_c_delegated_kernel_buffer_dtypes",
+                    {},
+                )
+                or {}
+            )
+            for name in delegated_order:
+                name = str(name)
+                # The owner allocation dtype MUST equal the kernel's bind dtype
+                # (the authoritative compiled KernelParam dtype), so the tvm-ffi
+                # DLTensor binder accepts the caller-owned buffer and the
+                # producer->consumer handoff stays byte-consistent across the 6
+                # delegated segments (F0 writes cb/dA_cumsum fp16, F2 reads them
+                # fp16; summary_states/prev_states/final_state fp32 throughout).
+                # A param/grad name that is ALSO produced by a non-delegated
+                # segment keeps its existing spec via the conflict check in
+                # _path_c_merge_direct_chain_buffer_spec (RULE #1: dtype conflicts
+                # RAISE, never silently downcast).
+                abi_dtype = str(delegated_dtypes.get(name, "float32"))
+                _path_c_merge_direct_chain_buffer_spec(
+                    specs,
+                    name=name,
+                    shape=delegated_shapes.get(name, ()),
+                    dtype=abi_dtype,
+                    category=_path_c_direct_chain_buffer_category(name),
+                    segment_index=int(segment.index),
+                    source="scratch",
+                )
     if (
         suffix_shape_env is not None
         and _path_c_direct_chain_loss_cotangent_seed_buffers(chain)

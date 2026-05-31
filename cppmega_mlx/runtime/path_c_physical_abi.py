@@ -416,6 +416,18 @@ def _dtype_of(value: Any) -> str | None:
 def path_c_kernel_buffer_order(prim_func: Any) -> tuple[str, ...]:
     """Return generated kernel buffer names in positional parameter order."""
 
+    # Mamba3 chunked-scan delegated grid prims are COMPILED tilelang JITKernels
+    # whose ``.params`` are unnamed ``KernelParam`` (dtype+shape). The delegation
+    # interpose attaches an explicit ordered named-buffer ABI (region surface
+    # node.inputs + node.outputs, 1:1 with the kernel's device-buffer param slots);
+    # use it so the direct-chain runtime binds the handoff/region buffers by name.
+    delegated_order = getattr(
+        prim_func,
+        "_cppmega_path_c_delegated_kernel_buffer_order",
+        None,
+    )
+    if delegated_order is not None:
+        return tuple(str(name) for name in delegated_order)
     params = getattr(prim_func, "params", None)
     if params is None:
         return ()
