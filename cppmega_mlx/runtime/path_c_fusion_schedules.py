@@ -1368,6 +1368,36 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 fragment_emitter=_emit_mamba3_mimo_source,
             ),
             PathCBrickScheduleDescriptor(
+                op_name="mamba3_chunk_scan_combine",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "mamba3_chunk_scan_combine_descriptor",
+                    "mamba3_chunk_scan_combine_grid_kernel",
+                ),
+                description=(
+                    "Mamba3 chunked SSD scan+combine (F2) brick descriptor; "
+                    "GRID-launched scan-core, delegates to "
+                    "chunk_scan_fwd_metal_prim (shadow-registered, Stage 1)"
+                ),
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core:"
+                    "build_chunk_scan_combine_metal/chunk_scan_fwd_metal_prim"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "F2 scan+combine is a grid-launched kernel (own T.Kernel grid) "
+                    "delegating to the proven chunk_scan_fwd_metal_prim core; it is "
+                    "shadow-registered so its op-name signature resolves via select "
+                    "without blocking, while the live mamba3 forward still emits the "
+                    "serial scan. Chain-template wiring of the F0/F1 handoff is Stage 2"
+                ),
+                # F2 is a grid kernel, NOT row-phased single-thread; keep the
+                # default flat loop policy so the row-phased mamba template gating
+                # (_is_row_phased_mamba3) does not swallow it (design §3.2).
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
+                fragment_emitter=_emit_mamba3_chunk_scan_combine_source,
+            ),
+            PathCBrickScheduleDescriptor(
                 op_name="mamba3_mimo_bwd",
                 implementation_status="descriptor_codegen_ready",
                 required_codegen_steps=(
@@ -12828,6 +12858,47 @@ def _emit_mamba3_mimo_source(
             f"{out} = T.alloc_local((1,), \"float32\")",
         ),
         statements=tuple(inner),
+    )
+
+
+def _emit_mamba3_chunk_scan_combine_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Fragment emitter for the Path-C F2 ``mamba3_chunk_scan_combine`` segment.
+
+    Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2 (F2 row) / §3.2.
+
+    F2 is NOT a row-phased single-thread fragment inlined into the shared region
+    PrimFunc: its kernel is the GRID-launched, Metal-validated SSD scan+combine
+    core ``chunk_scan_fwd_metal_prim`` (own ``T.Kernel(nheads, ...)`` grid). Its
+    real codegen is the single delegation
+    ``mamba3_chunked_scan_core.build_chunk_scan_combine_metal`` — exercised + parity
+    gated in isolation by the Stage-1 harness
+    ``tests/test_mamba3_chunk_scan_combine_f2.py`` against the serial forward.
+
+    Stage 1 is a SHADOW registration: the live mamba3 forward still emits the
+    serial scan (``mamba3_mimo`` descriptor); this descriptor only needs to RESOLVE
+    via ``select`` so its op-name signature is not blocked with
+    ``no descriptor target``. We therefore return a marker fragment that records the
+    delegation source. Wiring this fragment into the fused chain template is Stage 2
+    (region-build flag + F0/F1 handoff), out of Stage-1 scope; until then this
+    descriptor is never selected for the live region (its op-name is not emitted by
+    region build), so the marker is never inlined. RULE #1: there is no silent
+    fallback — the kernel path is the one delegation above, and a future Stage-2
+    template hookup MUST route through it, not re-emit a serial scan here.
+    """
+    marker = _scratch_name(node, "mamba3_chunk_scan_combine_shadow")
+    return _ScheduleNodeFragment(
+        allocations=(f"{marker} = T.alloc_local((1,), \"float32\")",),
+        statements=(
+            "# F2 mamba3_chunk_scan_combine: delegates to "
+            "cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core."
+            "build_chunk_scan_combine_metal (grid scan+combine core); "
+            "shadow-registered (Stage 1), serial scan still emitted live",
+            f"{marker}[0] = 0.0",
+        ),
     )
 
 

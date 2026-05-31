@@ -51,12 +51,23 @@ __all__ = [
     "chunk_scan_fwd_metal_prim",
     "chunk_scan_fwd_grid",
     "compile_chunk_scan_fwd_metal",
+    "build_chunk_scan_combine_metal",
     "MAMBA3_CHUNKED_FWD_BLOCK_M",
     "MAMBA3_CHUNKED_FWD_BLOCK_N",
     "MAMBA3_CHUNKED_FWD_BLOCK_K",
     "MAMBA3_CHUNKED_FWD_BLOCK_DSTATE",
     "MAMBA3_CHUNKED_FWD_THREADS",
 ]
+
+# Stable op-node name for the Path-C F2 scan+combine segment (design doc
+# ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2/§3.2). The Path-C brick-schedule
+# descriptor registered under this name DELEGATES its kernel build to
+# ``chunk_scan_fwd_metal_prim`` below (the proven, Metal-validated SSD chunked
+# forward scan+combine core). This single binding is the one clear path from the
+# descriptor/emitter and the isolation harness to the scan core (RULE #1: no
+# second/fallback codegen path).
+MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME = "mamba3_chunk_scan_combine"
+__all__.append("MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME")
 
 # Metal-validated tile config. block_N=16 keeps the GEMM N below the 32-column
 # threshold so the legacy 8x8 simdgroup path (M1-M4) is selected instead of the
@@ -352,3 +363,32 @@ def compile_chunk_scan_fwd_metal(
         target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
     )
     return kernel
+
+
+def build_chunk_scan_combine_metal(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    **kwargs: Any,
+) -> Any:
+    """Build the Path-C F2 ``mamba3_chunk_scan_combine`` Metal kernel.
+
+    This is the SINGLE named delegation that the Path-C brick-schedule
+    descriptor registered under :data:`MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME` and the
+    Stage-1 isolation parity harness both call. It compiles the proven
+    :func:`chunk_scan_fwd_metal_prim` scan+combine core (inputs
+    ``cb, x, dt, dA_cumsum, C, prev_states, D`` -> ``Output``) — there is exactly
+    ONE codegen path; on any compile/shape failure the underlying builder RAISES
+    with where+what and there is NO serial fallback (RULE #1).
+
+    Returns a callable Metal ``JITKernel``; pass a PRE-ZEROED contiguous fp16
+    output buffer positionally as the 8th argument and ``torch.mps.synchronize()``
+    after dispatch.
+    """
+    return compile_chunk_scan_fwd_metal(
+        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+    )
