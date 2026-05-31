@@ -384,6 +384,11 @@ class _ResolveFromTarget:
 
 _RESOLVE_FORWARD_CAP_FROM_TARGET = _ResolveFromTarget()
 _RESOLVE_BACKWARD_CAP_FROM_TARGET = _ResolveFromTarget()
+# Resolve the kernel buffer-argument limit from the device-capability probe
+# (caps.buffer_arg_limit): Metal -> 31 (family ABI const), CUDA -> unbounded
+# sentinel. Distinct sentinel so an explicit caller-supplied limit is honored
+# unchanged while the default tracks the queried/preset device cap.
+_RESOLVE_BUFFER_LIMIT_FROM_CAPS = _ResolveFromTarget()
 _GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = (
     "residual_norm_weight",
     # Block A: the per-brick entry RMSNorm weight emitted by the model-
@@ -14619,7 +14624,7 @@ def plan_path_c_direct_fusion_chain_for_region(
     region: PathCFusionRegion,
     *,
     include_backward: bool = True,
-    max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
+    max_kernel_buffers: int | _ResolveFromTarget = _RESOLVE_BUFFER_LIMIT_FROM_CAPS,
     max_segment_nodes: int | None = None,
     forward_max_segment_nodes: int | None | _ResolveFromTarget = (
         _RESOLVE_FORWARD_CAP_FROM_TARGET
@@ -14666,6 +14671,16 @@ def plan_path_c_direct_fusion_chain_for_region(
 
     if not isinstance(region, PathCFusionRegion):
         raise TypeError("region must be PathCFusionRegion")
+    if isinstance(max_kernel_buffers, _ResolveFromTarget):
+        # Resolve the kernel buffer-argument limit from the device-capability
+        # probe: Metal -> caps.buffer_arg_limit == 31 (Apple family ABI const,
+        # the portable floor), CUDA -> the unbounded sentinel (no 31-arg wall).
+        # The live count (_kernel_parameter_count_for_target) and the
+        # parameter_count > limit break already exist and fail loud; only the
+        # LIMIT now comes from the queried/preset device cap, not a literal.
+        from cppmega_mlx.runtime.path_c_device_caps import device_caps
+
+        max_kernel_buffers = int(device_caps().buffer_arg_limit)
     if max_kernel_buffers <= 0:
         raise ValueError("max_kernel_buffers must be positive")
     if max_segment_nodes is not None and max_segment_nodes <= 0:
@@ -15039,7 +15054,7 @@ def plan_path_c_direct_fusion_chains_for_model(
     region_prefix: str | None = None,
     include_backward: bool = True,
     min_route_bricks: int = 2,
-    max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
+    max_kernel_buffers: int | _ResolveFromTarget = _RESOLVE_BUFFER_LIMIT_FROM_CAPS,
     max_segment_nodes: int | None = None,
     forward_max_segment_nodes: int | None | _ResolveFromTarget = (
         _RESOLVE_FORWARD_CAP_FROM_TARGET

@@ -176,3 +176,27 @@ def test_cuda_optin_cap_uses_queried_caps_not_silent_floor():
         assert value is None
     else:
         assert value == device_caps().threadgroup_mem_bytes
+
+
+def test_planner_buffer_limit_default_resolves_from_caps():
+    """Step 3: max_kernel_buffers default is the caps sentinel, resolving to 31."""
+    import inspect
+
+    from cppmega_mlx.runtime import path_c_fusion_schedules as sched
+
+    sig = inspect.signature(sched.plan_path_c_direct_fusion_chain_for_region)
+    default = sig.parameters["max_kernel_buffers"].default
+    assert default is sched._RESOLVE_BUFFER_LIMIT_FROM_CAPS
+    assert isinstance(default, sched._ResolveFromTarget)
+    # model-level planner forwards the same sentinel
+    sig_model = inspect.signature(sched.plan_path_c_direct_fusion_chains_for_model)
+    assert (
+        sig_model.parameters["max_kernel_buffers"].default
+        is sched._RESOLVE_BUFFER_LIMIT_FROM_CAPS
+    )
+    # resolution yields the queried/preset device buffer-arg limit
+    c = device_caps()
+    if c.backend == "metal":
+        assert c.buffer_arg_limit == 31
+    else:
+        assert c.buffer_arg_limit == (1 << 30)
