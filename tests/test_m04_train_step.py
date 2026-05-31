@@ -2546,18 +2546,23 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     assert direct_chain["training_critical_path"] is False
     assert direct_chain["training_runtime_available"] is False
     # Metal forward fusion cap (METAL_FORWARD_MAX_SEGMENT_NODES = 2) splits the
-    # 4-op forward mega-kernel into 4 forward segments (the ~176-199 KB MSL of
-    # the fused m2rnn+residual_rmsnorm+attention_qkv_projection+
-    # sparse_mla_fp8_apply kernel crashes Metal's MTLCompilerService at
-    # newComputePipelineState). Metal backward fusion cap
-    # (METAL_BACKWARD_MAX_SEGMENT_NODES = 1) splits the 3-op backward
-    # mega-kernel (..._chain_7_10, ~115 KB / ~10-25s -> macOS GPU watchdog)
-    # into one segment per backward op -> 7 backward segments. Total = 11.
-    assert direct_chain["runtime_binding"]["segment_count"] == 11
+    # 4-op forward mega-kernel (the ~176-199 KB MSL of the fused
+    # m2rnn+residual_rmsnorm+attention_qkv_projection+sparse_mla_fp8_apply kernel
+    # crashes Metal's MTLCompilerService at newComputePipelineState); the cap is
+    # further lowered to 1 for the row-chunked-independent forward ops
+    # (attention_qkv_projection, sparse_mla_fp8_apply; see
+    # _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS) so each is isolated and launcher_chunks
+    # row-windowed to stay under the macOS GPU watchdog -> 5 forward segments.
+    # Metal backward fusion cap (METAL_BACKWARD_MAX_SEGMENT_NODES = 1) splits the
+    # 3-op backward mega-kernel (..._chain_7_10, ~115 KB / ~10-25s -> macOS GPU
+    # watchdog) into one segment per backward op -> 7 backward segments.
+    # Total = 12.
+    assert direct_chain["runtime_binding"]["segment_count"] == 12
     assert [
         segment["execution_phase"]
         for segment in direct_chain["runtime_binding"]["segments"]
     ] == [
+        "forward",
         "forward",
         "forward",
         "forward",
@@ -3637,7 +3642,14 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
     # sparse_mla_fp8_apply`` (region ..._chain_3_7) generates ~176-199 KB MSL
     # that crashes Metal's MTLCompilerService at newComputePipelineState
     # (XPC_ERROR_CONNECTION_INTERRUPTED), so forward fuses at most 2 ops per
-    # segment -> 4 forward segments.
+    # segment. The cap is FURTHER lowered to 1 for any forward segment
+    # containing a row-chunked-independent forward op (attention_qkv_projection,
+    # sparse_mla_fp8_apply; see _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS) so each is
+    # ISOLATED in its own segment and can be launcher_chunks row-windowed to stay
+    # under the macOS GPU watchdog (the monolithic 3-op forward segment
+    # ..._chain_4_6 was killed at ~9.6s at full scale). Net forward grouping:
+    # [entry,mamba3][residual,m2rnn][residual][attention_qkv][sparse_mla] ->
+    # 5 forward segments.
     #
     # On Metal the BACKWARD phase is split by the backward fusion cap
     # (METAL_BACKWARD_MAX_SEGMENT_NODES = 1): the greedy 3-op backward
@@ -3645,10 +3657,11 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
     # residual_rmsnorm_bwd`` (region ..._chain_7_10) runs as ONE grid_chunks
     # command buffer whose GPU time exceeds the macOS GPU watchdog
     # (kIOGPUCommandBufferCallbackErrorTimeout at full scale), so each backward
-    # op lands in its own segment -> 7 backward segments. Total = 11 segments.
+    # op lands in its own segment -> 7 backward segments. Total = 12 segments.
     # CUDA keeps the greedy 2-forward / 7-segment grouping (no caps).
-    assert payload["segment_count"] == 11
+    assert payload["segment_count"] == 12
     assert [segment["execution_phase"] for segment in payload["segments"]] == [
+        "forward",
         "forward",
         "forward",
         "forward",
@@ -3661,26 +3674,32 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
         "backward",
         "backward",
     ]
-    assert [segment["status"] for segment in payload["segments"]] == ["ok"] * 11
-    # The watchdog-heavy BACKWARD segments are row/time-CHUNKED (launcher_chunks)
-    # so the runtime splits each into watchdog-safe per-launch command buffers.
-    # Two kinds qualify (see _TIME_CHUNKED_RECURRENT_BACKWARD_OPS |
-    # _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS):
-    #   * recurrent reverse-time scans  -> m2rnn_bwd (idx 7), mamba3_mimo_bwd (idx 9)
-    #   * per-row-independent heavy ops -> sparse_mla_fp8_apply_bwd (idx 4),
-    #                                      attention_qkv_projection_bwd (idx 5)
+    assert [segment["status"] for segment in payload["segments"]] == ["ok"] * 12
+    # The watchdog-heavy FORWARD and BACKWARD segments are row/time-CHUNKED
+    # (launcher_chunks) so the runtime splits each into watchdog-safe per-launch
+    # command buffers. Qualifying ops (see _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS,
+    # _TIME_CHUNKED_RECURRENT_BACKWARD_OPS | _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS):
+    #   * per-row-independent heavy FORWARD -> attention_qkv_projection (idx 3),
+    #                                          sparse_mla_fp8_apply (idx 4)
+    #   * per-row-independent heavy BACKWARD -> sparse_mla_fp8_apply_bwd (idx 5),
+    #                                           attention_qkv_projection_bwd (idx 6)
+    #   * recurrent reverse-time scans  -> m2rnn_bwd (idx 8), mamba3_mimo_bwd (idx 10)
     # Each declares the path_c_row_chunk_index / path_c_row_subchunk_index /
-    # path_c_backward_stage_index scalar params (3 extra scalar args beyond the
-    # backward gate). The light backward ops (residual_rmsnorm_bwd idx 6/8,
-    # entry_rmsnorm_bwd idx 10) keep grid_chunks (they run well under the
-    # watchdog). The independent ops carry NO cross-launch state; only the
-    # recurrent ops carry reverse-scan adjoint state across launches.
+    # path_c_backward_stage_index scalar params (3 extra scalar args; the forward
+    # launcher segments bind the same launcher index scalars but NOT the backward
+    # gate). The light ops (residual_rmsnorm idx 2 forward, residual_rmsnorm_bwd
+    # idx 7/9, entry_rmsnorm_bwd idx 11) keep grid_chunks (they run well under the
+    # watchdog). The forward + independent backward ops carry NO cross-launch
+    # state; only the recurrent backward ops carry reverse-scan adjoint state
+    # across launches.
     time_chunked_segment_indices = {
         segment["index"]
         for segment in payload["segments"]
         if segment.get("time_chunk_launch_count")
     }
-    assert time_chunked_segment_indices == {4, 5, 7, 9}, time_chunked_segment_indices
+    assert time_chunked_segment_indices == {3, 4, 5, 6, 8, 10}, (
+        time_chunked_segment_indices
+    )
     for time_chunked_index in sorted(time_chunked_segment_indices):
         recurrent_bwd_launch_count = next(
             segment["time_chunk_launch_count"]
@@ -3692,10 +3711,18 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
         len(rb_segment["required_logical_buffers"])
         # backward segments additionally pass the path_c_run_backward gate scalar
         + (1 if payload_segment["execution_phase"] == "backward" else 0)
-        # the time-chunked recurrent backward segments also bind the launcher-chunk
-        # index scalars (path_c_row_chunk_index + path_c_row_subchunk_index +
-        # path_c_backward_stage_index) so the runtime can select each launch.
-        + (3 if payload_segment["index"] in time_chunked_segment_indices else 0)
+        # The row/time-chunked launcher segments bind the launcher-chunk index
+        # scalars so the runtime can select each launch. FORWARD launcher segments
+        # (attention_qkv_projection / sparse_mla_fp8_apply) bind 2 scalars
+        # (path_c_row_chunk_index + path_c_row_subchunk_index). BACKWARD launcher
+        # segments (recurrent + independent heavy bwd ops) bind those 2 PLUS the
+        # path_c_backward_stage_index reverse-stage selector (3 total; the
+        # path_c_run_backward gate is already counted above).
+        + (
+            0
+            if payload_segment["index"] not in time_chunked_segment_indices
+            else (3 if payload_segment["execution_phase"] == "backward" else 2)
+        )
         for payload_segment, rb_segment in zip(
             payload["segments"],
             route["path_c_fusion"]["direct_chained_fusion"]["runtime_binding"][
@@ -6278,10 +6305,11 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     assert runtime_binding["status"] == (
         m04_train_step.FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
     )
-    # 11 segments on Metal: forward fusion cap -> 4 forward segments; backward
-    # fusion cap -> 7 backward segments (see the segment_count tests).
+    # 12 segments on Metal: forward fusion cap + row-chunked forward op isolation
+    # -> 5 forward segments; backward fusion cap -> 7 backward segments (see the
+    # segment_count tests).
     assert runtime_binding["missing_artifact_segments"] == [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     ]
     assert runtime_binding["hidden_packing_performed"] is False
 
@@ -6335,11 +6363,13 @@ def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
     # Metal forward split, and the Metal backward cap exposes +5 cross-segment
     # backward grads (see the capture-owners test).
     assert runtime_binding["missing_logical_buffer_count"] == 70
-    # Metal forward fusion cap -> 4 forward segments; backward fusion cap -> 7
-    # backward segments (see the segment_count tests). Total = 11.
+    # Metal forward fusion cap + row-chunked forward op isolation -> 5 forward
+    # segments; backward fusion cap -> 7 backward segments (see the segment_count
+    # tests). Total = 12.
     assert [
         segment["execution_phase"] for segment in runtime_binding["segments"]
     ] == [
+        "forward",
         "forward",
         "forward",
         "forward",

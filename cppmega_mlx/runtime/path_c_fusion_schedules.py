@@ -194,6 +194,54 @@ _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS = frozenset(
         "attention_qkv_projection_bwd",
     }
 )
+# Per-row-INDEPENDENT heavy FORWARD ops that exceed the macOS GPU watchdog
+# (~5-6s per command buffer) when run as ONE monolithic grid_chunks command
+# buffer at full local_gb10_quarter scale (depth=13 hidden=3584 max_seq=4096).
+# These are the FORWARD analog of _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS.
+#
+# Measured at full scale, seg[2] FORWARD region ..._chain_4_6 (the fused
+# residual_rmsnorm + attention_qkv_projection + sparse_mla_fp8_apply forward
+# segment) runs as a monolithic grid_chunks command buffer over S=4096 and is
+# killed at ~9.6s by the watchdog (kIOGPUCommandBufferCallbackErrorTimeout).
+# The two heavy ops are attention_qkv_projection and sparse_mla_fp8_apply.
+#
+# Both are per-row-INDEPENDENT in the FORWARD direction:
+#   * attention_qkv_projection is a per-token (per-row) Q/KV linear projection +
+#     split-half RoPE + per-head FP8 prepare. Output row R reads input hidden
+#     row R plus the shared projection weights only -- there is NO cross-row /
+#     cross-time carried state. Its outputs (q_fp8/q_scale/kv_fp8/kv_scale) are
+#     caller-owned full-sequence KV-history workspace buffers (see
+#     _is_attention_kv_history_workspace_output): across the K row-launches every
+#     row [0, S) is written into those persistent buffers.
+#   * sparse_mla_fp8_apply writes a per-query-row attention output (and per-row
+#     LSE). Query row R reads the SHARED full-sequence KV-history workspace
+#     (kv_fp8/kv_scale, indexed by the row's top-k sparse indices, all <= R for
+#     causal) plus its own q row -- again NO carried cross-row state; the KV it
+#     reads is produced by attention_qkv_projection in an EARLIER segment and is
+#     fully materialized before this op runs.
+# So launcher_chunks row-windowing splits each into K command buffers over the
+# independent ROW axis with zero cross-launch state. As with the independent
+# backward ops, _row_phased_launcher_carry_buffers_for_nodes adds carry buffers
+# ONLY for mamba3/m2rnn, never for these -- no carry buffers are added here.
+#
+# CORRECTNESS / PARITY REQUIREMENT: because sparse_mla_fp8_apply row R reads KV
+# at positions written by attention_qkv_projection for OTHER rows, these two ops
+# must NOT be row-windowed while fused in one segment (a row window would read
+# KV positions not yet written in that window). The forward fusion cap is
+# therefore lowered to 1 op for any forward segment containing a row-chunked
+# forward op (see _effective_forward_max_segment_nodes_for_window), isolating
+# attention_qkv_projection and sparse_mla_fp8_apply each into their OWN segment.
+# attention_qkv_projection then writes the FULL KV workspace across its K
+# committed launches BEFORE sparse_mla_fp8_apply's segment row-windows over the
+# now-complete KV -> forward activations are bitwise unchanged by chunking.
+# Metal-only (CUDA has no per-command-buffer watchdog, so CUDA keeps the
+# monolithic grid_chunks forward path and greedy forward fusion).
+_ROW_CHUNKED_INDEPENDENT_FORWARD_OPS = frozenset(
+    {
+        "attention_qkv_projection",
+        "sparse_mla_fp8_apply",
+    }
+)
 DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS = frozenset(
     {
         "attention_hidden",
@@ -609,6 +657,47 @@ def _path_c_descriptor_stage_node_name(node: Any) -> str:
 
 def _path_c_descriptor_stage_node_op_name(node: Any) -> str:
     return str(getattr(node, "op_name", ""))
+
+
+def _nodes_contain_row_chunked_forward_op(nodes: Iterable[Any]) -> bool:
+    """True if any node is a row-chunked-independent FORWARD op.
+
+    These ops (:data:`_ROW_CHUNKED_INDEPENDENT_FORWARD_OPS`) must be ISOLATED in
+    their own forward segment so each can be launcher_chunks row-windowed without
+    a fused sibling reading partially-written cross-row workspace (see that
+    frozenset's docstring for the KV-history parity requirement).
+    """
+
+    return any(
+        _path_c_descriptor_stage_node_op_name(node)
+        in _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS
+        for node in nodes
+    )
+
+
+def _effective_forward_max_segment_nodes_for_window(
+    candidate_nodes: Iterable[Any],
+    forward_max_segment_nodes: int | None,
+) -> int | None:
+    """Forward op cap for a candidate segment window.
+
+    Lowers the configured ``forward_max_segment_nodes`` to 1 whenever the window
+    contains a row-chunked-independent forward op so that
+    ``attention_qkv_projection`` / ``sparse_mla_fp8_apply`` each land alone in
+    their own segment (the watchdog isolation that lets them be row-windowed and
+    that keeps sparse-MLA's KV reads bitwise-correct -- see
+    :data:`_ROW_CHUNKED_INDEPENDENT_FORWARD_OPS`). Returns the unchanged cap
+    otherwise; ``None`` stays ``None`` only when there is no row-chunked forward
+    op (a row-chunked forward op always forces a cap of 1, even on an otherwise
+    uncapped target -- but this is reached only on Metal, where the cap is set).
+    """
+
+    nodes = tuple(candidate_nodes)
+    if not _nodes_contain_row_chunked_forward_op(nodes):
+        return forward_max_segment_nodes
+    if forward_max_segment_nodes is None:
+        return 1
+    return min(int(forward_max_segment_nodes), 1)
 
 
 def _path_c_descriptor_stage_rows_per_kernel_launch_for_node(node: Any) -> int:
@@ -14548,6 +14637,21 @@ def plan_path_c_direct_fusion_chain_for_region(
         raise ValueError(
             "backward_max_segment_nodes must be positive when provided"
         )
+    # Metal-only watchdog mitigation for the heavy per-row-INDEPENDENT FORWARD
+    # ops (attention_qkv_projection / sparse_mla_fp8_apply): isolate each in its
+    # own 1-op segment and switch that segment to launcher_chunks row-windowing.
+    # Gated explicitly on the lowering target AND on the forward cap being active
+    # (RULE #1: explicit by target, no silent fallback): CUDA -- which has no
+    # per-command-buffer GPU watchdog -- resolves the forward cap to ``None`` and
+    # so keeps the monolithic grid_chunks forward path + greedy forward fusion
+    # byte-for-byte unchanged. A caller that explicitly passes
+    # ``forward_max_segment_nodes=None`` disables ALL Metal forward mitigations
+    # (the pipeline-state split AND this watchdog row-chunk isolation) together,
+    # so the row-chunk isolation is bound to the SAME switch as the forward cap.
+    forward_row_chunk_isolation = (
+        _path_c_default_target() == "metal"
+        and forward_max_segment_nodes is not None
+    )
     working_region = (
         build_path_c_aot_autograd_region(region)
         if include_backward
@@ -14593,15 +14697,41 @@ def plan_path_c_direct_fusion_chain_for_region(
             # extending the forward segment here so it splits into smaller
             # pipeline-safe kernels. Backward segments are exempt (they keep
             # greedy fusion up to the buffer limit).
+            #
+            # The cap is FURTHER lowered to 1 for any forward window containing a
+            # row-chunked-independent forward op (attention_qkv_projection /
+            # sparse_mla_fp8_apply; see _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS).
+            # That isolates each heavy forward op in its OWN segment so (a) it can
+            # be launcher_chunks row-windowed below to stay under the macOS GPU
+            # watchdog (the monolithic 3-op forward segment ..._chain_4_6 was
+            # killed at ~9.6s at full scale), and (b) sparse_mla_fp8_apply's KV
+            # reads of the full-sequence workspace written by the SEPARATE
+            # attention_qkv_projection segment stay bitwise-correct (a fused row
+            # window would read KV positions not yet written). Mirrors the
+            # backward cap=1 isolation of the per-row-independent heavy bwd ops.
+            effective_forward_cap = (
+                _effective_forward_max_segment_nodes_for_window(
+                    candidate_region.nodes,
+                    forward_max_segment_nodes,
+                )
+                if forward_row_chunk_isolation
+                else forward_max_segment_nodes
+            )
             if (
                 execution_phase == DESCRIPTOR_EXECUTION_STAGE_FORWARD
-                and forward_max_segment_nodes is not None
-                and end - start > forward_max_segment_nodes
+                and effective_forward_cap is not None
+                and end - start > effective_forward_cap
             ):
                 first_failure = (
                     f"forward direct-buffer segment reached "
-                    f"forward_max_segment_nodes={forward_max_segment_nodes} "
-                    f"(Metal newComputePipelineState size cap)"
+                    f"forward_max_segment_nodes={effective_forward_cap} "
+                    f"(Metal newComputePipelineState size cap"
+                    + (
+                        " / row-chunked forward op isolation"
+                        if effective_forward_cap != forward_max_segment_nodes
+                        else ""
+                    )
+                    + ")"
                 )
                 break
             # BACKWARD-only Metal watchdog cap. Backward fused segments larger
@@ -14684,6 +14814,44 @@ def plan_path_c_direct_fusion_chain_for_region(
                         _TIME_CHUNKED_RECURRENT_BACKWARD_OPS
                         | _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS
                     )
+                    for node in candidate_region.nodes
+                )
+            ):
+                direct_target = _target_with_max_rows_per_launch(
+                    direct_target,
+                    candidate_region,
+                    DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+                    DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+                )
+            # ROW-WINDOWING for the per-row-INDEPENDENT heavy FORWARD ops
+            # (attention_qkv_projection / sparse_mla_fp8_apply; see
+            # _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS). The FORWARD analog of the
+            # backward block above. At full scale the fused 3-op forward segment
+            # ..._chain_4_6 (residual_rmsnorm + attention_qkv_projection +
+            # sparse_mla_fp8_apply) runs as ONE monolithic grid_chunks command
+            # buffer over S=4096 and is killed at ~9.6s by the macOS GPU watchdog
+            # (kIOGPUCommandBufferCallbackErrorTimeout). The effective forward cap
+            # above isolates each heavy op in its OWN 1-op segment; here that
+            # isolated segment is switched to launcher_chunks so its per-row body
+            # (`for row in T.serial(row_chunk_start, row_chunk_stop)`) is driven as
+            # K command buffers over the independent ROW axis -- each command
+            # buffer holds only a row window of work, well under the watchdog.
+            # These ops have NO carried cross-row state
+            # (_row_phased_launcher_carry_buffers_for_nodes adds carries ONLY for
+            # mamba3/m2rnn, never for these), so no carry buffers are added.
+            # Across the K launches every row [0, S) is written into the
+            # caller-owned full-sequence buffers, so the forward activations are
+            # bitwise unchanged by chunking; sparse_mla_fp8_apply reads the
+            # full KV-history workspace already written by the SEPARATE isolated
+            # attention_qkv_projection segment. (Metal-only watchdog split; CUDA
+            # keeps the monolithic grid_chunks forward path.)
+            if (
+                forward_row_chunk_isolation
+                and execution_phase == DESCRIPTOR_EXECUTION_STAGE_FORWARD
+                and direct_target.max_rows_per_launch is not None
+                and any(
+                    _path_c_descriptor_stage_node_op_name(node)
+                    in _ROW_CHUNKED_INDEPENDENT_FORWARD_OPS
                     for node in candidate_region.nodes
                 )
             ):
