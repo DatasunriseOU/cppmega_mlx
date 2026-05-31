@@ -10548,22 +10548,15 @@ def _cuda_shared_memory_optin_cap_bytes() -> int | None:
 
     if _path_c_default_target() != "cuda":
         return None
-    try:
-        import ctypes
+    # RULE #1: the opt-in cap is the LIVE-QUERIED shared_memory_per_block_optin
+    # from the device-caps probe -- NEVER a hardcoded floor. If the query fails
+    # on a CUDA target the probe RAISES (path_c_device_caps._probe_cuda_live),
+    # which propagates here; we do NOT substitute a guessed 0x18C00 floor that
+    # could silently mis-size the demote and emit a kernel ptxas rejects.
+    from cppmega_mlx.runtime.path_c_device_caps import device_caps
 
-        lib = ctypes.CDLL("libcudart.so")
-        value = ctypes.c_int(0)
-        device = ctypes.c_int(0)
-        # cudaDevAttrMaxSharedMemoryPerBlockOptin == 97.
-        rc = lib.cudaDeviceGetAttribute(ctypes.byref(value), 97, device)
-        if rc == 0 and value.value > 0:
-            return int(value.value)
-    except Exception:
-        pass
-    # CUDA target but the attribute query failed (no runtime / no device): fall
-    # back to the conservative sm_80+ opt-in floor so we still demote rather than
-    # emit a kernel that ptxas will reject for shared-memory overflow.
-    return 0x18C00  # 101376 bytes (99 KiB), matches sm_121a opt-in cap.
+    caps = device_caps()
+    return int(caps.threadgroup_mem_bytes)
 
 
 def _demote_residual_shared_scratch_to_global(source: str) -> str:
@@ -10589,7 +10582,14 @@ def _demote_residual_shared_scratch_to_global(source: str) -> str:
     cap_bytes = _cuda_shared_memory_optin_cap_bytes()
     if cap_bytes is None:
         return source
-    budget_bytes = min(_CUDA_SHARED_SCRATCH_BUDGET_BYTES, cap_bytes)
+    # Budget = min(queried static per-block shared, queried opt-in cap) -- both
+    # now come from the device-caps probe (design §5), not the literal
+    # _CUDA_SHARED_SCRATCH_BUDGET_BYTES (kept only as a conservative ceiling so a
+    # future device with a larger static cap still leaves compiler headroom).
+    from cppmega_mlx.runtime.path_c_device_caps import device_caps
+
+    static_shared = int(device_caps().static_shared_mem_bytes)
+    budget_bytes = min(_CUDA_SHARED_SCRATCH_BUDGET_BYTES, static_shared, cap_bytes)
     lines = source.splitlines()
     shared: list[tuple[int, str, int]] = []  # (line_index, name, byte_count)
     shared_total = 0

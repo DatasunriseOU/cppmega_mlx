@@ -155,3 +155,24 @@ def test_cache_schema_version_mismatch_invalidates(tmp_path, monkeypatch):
     payload["schema_version"] = 999
     path.write_text(json.dumps(payload))
     assert load_calibration_cache(backend, arch, dev) is None
+
+
+def test_cuda_optin_cap_uses_queried_caps_not_silent_floor():
+    """RULE #1: the CUDA opt-in cap is queried; no silent 0x18C00 floor remains."""
+    from cppmega_mlx.runtime import path_c_fusion_schedules as sched
+    import inspect
+
+    src = inspect.getsource(sched._cuda_shared_memory_optin_cap_bytes)
+    # The silent except:pass + hardcoded "return 0x18C00" floor must be gone
+    # (the constant may still appear in an explanatory comment, but never as a
+    # returned fallback value).
+    assert "return 0x18C00" not in src
+    assert "except Exception:\n        pass" not in src
+    assert "device_caps" in src
+    # On a Metal host it returns None (no CUDA demote); on CUDA it returns the
+    # queried opt-in cap (or RAISES if the probe fails -- never a guessed floor).
+    value = sched._cuda_shared_memory_optin_cap_bytes()
+    if _path_c_default_target() == "metal":
+        assert value is None
+    else:
+        assert value == device_caps().threadgroup_mem_bytes
