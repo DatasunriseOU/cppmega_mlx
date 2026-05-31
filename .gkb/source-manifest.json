@@ -1,0 +1,272 @@
+{
+  "authority_hierarchy": [
+    "live_api",
+    "code",
+    "doc",
+    "policy"
+  ],
+  "detector_versions": {
+    "bd": "bd version 1.0.3 (Homebrew)",
+    "git": "git version 2.50.1 (Apple Git-155)",
+    "http": "requests/2.34.2",
+    "node": "v25.9.0",
+    "python": "3.11.13"
+  },
+  "drift_annotations_vocabulary": [
+    "CODE_ABSENT",
+    "API_INACCESSIBLE",
+    "API_ABSENT",
+    "UNDOCUMENTED",
+    "API_NARROWER_THAN_CODE",
+    "VERSION_SKEW",
+    "UNVERIFIABLE"
+  ],
+  "generated_at": "2026-05-31T20:43:46Z",
+  "manifest_version": 3,
+  "repo": "/Volumes/external/sources/cppmega.mlx",
+  "schema": "gkb.source_capability_manifest/v1",
+  "sources": {
+    "bd": {
+      "capability": {
+        "cli": true,
+        "cli_version": "1.0.3",
+        "closed": 518,
+        "data": true,
+        "files": [
+          ".beads/interactions.jsonl",
+          ".beads/issues.jsonl"
+        ],
+        "in_progress": 1,
+        "jsonl_rows": 1191,
+        "open": 81,
+        "total_issues": 601
+      },
+      "detected_at": "2026-05-31T20:43:47Z",
+      "evidence": {
+        "command": "ls .beads/*.jsonl; bd --version; bd stats",
+        "observation": "2 jsonl; total=601 (jsonl_rows=1191); bd 1.0.3"
+      },
+      "present": true
+    },
+    "codebase": {
+      "capability": {
+        "all_source": 1949,
+        "ast_reachability": false,
+        "axiom_extraction": {
+          "note": "primary lang 'py' has NO as-built axiom/reachability extractor; only TS/JS are wired (@babel -> compile_axioms). Adapter-A needed: Python axiom compiler (stdlib ast) + C++/CUDA/Metal AST extractor (clang/tree-sitter). Code tier NOT used for grounding until then (no false code-grounded verdict).",
+          "primary_wired": false,
+          "unparsable_langs": [
+            "c",
+            "cpp",
+            "cuda",
+            "metal",
+            "objcpp",
+            "py"
+          ],
+          "wired_langs": [
+            "js",
+            "ts"
+          ]
+        },
+        "degraded_langs": [],
+        "file_counts": {
+          "all_source": 1949,
+          "js_jsx": 37,
+          "py": 904,
+          "ts_tsx": 304
+        },
+        "langs": {
+          "c": 2,
+          "cpp": 3,
+          "cuda": 653,
+          "js": 37,
+          "metal": 44,
+          "objcpp": 2,
+          "py": 904,
+          "ts": 304
+        },
+        "missing_configured_roots": [],
+        "native_provenance": {
+          "clang_langs_present": [
+            "c",
+            "cpp",
+            "cuda",
+            "metal",
+            "objcpp"
+          ],
+          "compile_commands": null,
+          "engine": "libclang(version-call-failed:AttributeError)",
+          "libclang_available": true
+        },
+        "notes": [
+          "NATIVE C-family present but NO compile_commands.json — cross-file AST is heuristic; generate it (cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON / bear -- make) for accurate flags."
+        ],
+        "parsable": false,
+        "parse_status": {
+          "c": "native:libclang",
+          "cpp": "native:libclang",
+          "cuda": "native:libclang",
+          "js": "native:@babel(axioms+reachability)",
+          "metal": "native:libclang(as-c++)",
+          "objcpp": "native:libclang",
+          "py": "native:stdlib-ast(provenance)",
+          "ts": "native:tsc/@babel(axioms+reachability)"
+        },
+        "primary_lang": "py",
+        "roots": [
+          "."
+        ],
+        "symbol_provenance_langs": [
+          "c",
+          "cpp",
+          "cuda",
+          "js",
+          "metal",
+          "objcpp",
+          "py",
+          "ts"
+        ]
+      },
+      "detected_at": "2026-05-31T20:43:46Z",
+      "evidence": {
+        "command": "scan ['.'] (repo root (no src/ — full scan)) by extension",
+        "observation": "langs[py:904 cuda:653 ts:304 metal:44 js:37 cpp:3 c:2 objcpp:2] all=1949 primary=py parsable(axiom)=False native_provenance=libclang (wired=['js', 'ts']; provenance=['c', 'cpp', 'cuda', 'js', 'metal', 'objcpp', 'py', 'ts']; degraded=none)"
+      },
+      "present": true
+    },
+    "docs": {
+      "capability": {
+        "breakdown": {
+          "docs": 66,
+          "other": 0,
+          "planning": 0,
+          "root": 28
+        },
+        "corpus_files": 94,
+        "globs": [
+          "docs/**/*.md",
+          "*.md",
+          "cppmega_mlx/**/*.md",
+          "cppmega_v4/**/*.md"
+        ]
+      },
+      "detected_at": "2026-05-31T20:43:47Z",
+      "evidence": {
+        "command": "corpus globs ['docs/**/*.md', '*.md', 'cppmega_mlx/**/*.md', 'cppmega_v4/**/*.md'] | wc -l",
+        "observation": "94 files (docs=66 root=28 planning=0 other=0)"
+      },
+      "present": true
+    },
+    "git": {
+      "capability": {
+        "depth": 784,
+        "head_sha": "00021c5d5df16cc5e694195d2bce6f1873805564",
+        "provenance": "full",
+        "shallow": false
+      },
+      "detected_at": "2026-05-31T20:43:47Z",
+      "evidence": {
+        "command": "git rev-parse --is-inside-work-tree; git rev-list --count HEAD",
+        "observation": "true; 784 (head 00021c5d5df1)"
+      },
+      "present": true
+    },
+    "live_api": {
+      "capability": {
+        "base_urls": [],
+        "configured": false,
+        "defined_in_code": {
+          "framework": "FastAPI",
+          "health_path": "/health",
+          "note": "API DEFINED IN CODE but not configured/running; set api.base_url to its launched address (+ api.health_path) to use it as a live oracle. reachable stays false until then (no false api-grounded verdict).",
+          "primary_source": "cppmega_v4/jsonrpc/server.py",
+          "routes": [
+            {
+              "path": "/health",
+              "verb": "GET"
+            },
+            {
+              "path": "/schema/methods",
+              "verb": "GET"
+            },
+            {
+              "path": "/cache/stats",
+              "verb": "GET"
+            },
+            {
+              "path": "/cache/clear",
+              "verb": "POST"
+            },
+            {
+              "path": "/upload/parquet",
+              "verb": "POST"
+            },
+            {
+              "path": "/rpc",
+              "verb": "POST"
+            },
+            {
+              "path": "/ws/gen/{job_id}",
+              "verb": "WS"
+            },
+            {
+              "path": "/ws/train/{run_id}",
+              "verb": "WS"
+            },
+            {
+              "path": "/ws/data/{job_id}",
+              "verb": "WS"
+            },
+            {
+              "path": "/ws/verify/{spec_hash}",
+              "verb": "WS"
+            },
+            {
+              "path": "/ws",
+              "verb": "WS"
+            }
+          ],
+          "servers": [
+            {
+              "framework": "FastAPI",
+              "health_path": "/health",
+              "route_count": 11,
+              "source": "cppmega_v4/jsonrpc/server.py",
+              "transports": [
+                "http",
+                "ws"
+              ]
+            },
+            {
+              "framework": "FastAPI",
+              "health_path": "/health",
+              "route_count": 2,
+              "source": "cppmega_mlx/inference/serve.py",
+              "transports": [
+                "http"
+              ]
+            }
+          ],
+          "transports": [
+            "http",
+            "ws"
+          ]
+        },
+        "health_status": null,
+        "reachable": false,
+        "version_anchor": {
+          "comparable": false,
+          "kind": "none",
+          "value": null
+        }
+      },
+      "detected_at": "2026-05-31T20:43:46Z",
+      "evidence": {
+        "command": "scan code roots for a served-API definition; no base_url configured in gkb config nor playwright",
+        "observation": "no base_url configured, but API DEFINED IN CODE: FastAPI 11 routes @ cppmega_v4/jsonrpc/server.py (health=/health) — present, reachable:false (not running)"
+      },
+      "present": true
+    }
+  },
+  "warnings": []
+}

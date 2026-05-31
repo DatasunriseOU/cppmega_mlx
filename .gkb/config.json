@@ -1,0 +1,10 @@
+{
+  "corpus": {
+    "include": ["docs/**/*.md", "*.md", "cppmega_mlx/**/*.md", "cppmega_v4/**/*.md"],
+    "exclude": ["**/node_modules/**", "**/dist/**", "**/.gkb/**", "**/reports/**", "**/scratch/**", "**/.egg-info/**", "**/vendor/**"],
+    "max_files": 0
+  },
+  "embedder": {"provider": "google", "dim": 768},
+  "extractor": {"provider": "gemini", "model": "gemini-flash-latest"},
+  "store": ".gkb/store"
+}
