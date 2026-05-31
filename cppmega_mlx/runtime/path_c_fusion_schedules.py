@@ -11192,26 +11192,48 @@ def _append_row_phased_mamba3_bwd_body(
         f"{angle_checkpoint_ref}"
     )
     body.append(f"{indent * 6}T.sync_threads()")
+    # Reverse-time checkpoint replay. The forward recompute body emitted by
+    # ``_mamba3_emit_recompute_row`` replays ``[checkpoint_start, time_idx]``: each
+    # ``replay_time < time_idx`` advances the recurrent state (``h_next`` /
+    # ``angle_cumsum``) and rebuilds the per-step scratch, and the FINAL step
+    # ``replay_time == time_idx`` leaves the current-step scratch (projected /
+    # conv / dt_vec / b_group / ...) that the backward block below consumes.
+    #
+    # Previously this recompute was INLINED TWICE — once in the replay loop for
+    # ``replay_time < time_idx`` and once again for ``time_idx`` itself (the
+    # ``time_idx`` copy lived OUTSIDE the loop). Those two copies are byte-for-byte
+    # identical (~26-28 KB MSL each). Merging them into ONE emission that replays
+    # ``[checkpoint_start, time_idx]`` inclusive cuts ~26 KB of MSL (130.0 -> 104.3
+    # KB) with EXACTLY the same arithmetic — the ``h_prev`` snapshot is taken at
+    # the START of the ``replay_time == time_idx`` iteration, i.e. the
+    # post-(time_idx-1) state, exactly as the prior structure. Verified
+    # bit-identical gradients (max-abs-diff 0.0). No gradient change; CUDA lowers
+    # the smaller body too.
+    #
+    # NOTE: this merge alone does NOT clear the Metal newComputePipelineState
+    # crash. Root cause (isolated by bisection, see commit body): the recompute
+    # emits ``T.sync_threads()`` barriers INSIDE this data-dependent replay loop,
+    # and a threadgroup_barrier inside the nested checkpoint-replay loop crashes
+    # MTLCompilerService (XPC_ERROR_CONNECTION_INTERRUPTED) regardless of size
+    # (a barrier-free 25 KB replay scaffold compiles; the 53 KB recompute-in-loop
+    # crashes; m2rnn_bwd compiles ONLY because its replay loop is barrier-free).
+    # The durable fix is to make the replay recompute barrier-free (each lane
+    # replays its own slice independently, m2rnn-style) — tracked as the follow-up.
     body.append(f"{indent * 6}for {replay_offset} in T.serial(0, {checkpoint_interval}):")
     body.append(
         f"{indent * 7}{replay_time} = {checkpoint_start} + {replay_offset}"
     )
-    body.append(f"{indent * 7}if {replay_time} < {time_idx}:")
+    body.append(f"{indent * 7}if {replay_time} <= {time_idx}:")
+    body.append(f"{indent * 8}if {replay_time} == {time_idx}:")
+    body.append(
+        f"{indent * 9}for {state_idx} in T.serial(lane, {state_extent}, "
+        f"step={thread_count}):"
+    )
+    body.append(f"{indent * 10}{h_prev}[{state_idx}] = {h_next}[{state_idx}]")
+    body.append(f"{indent * 8}T.sync_threads()")
     _mamba3_emit_recompute_row(
         replay_time,
         level=8,
-        update_angle=True,
-        update_state=True,
-    )
-    body.append(
-        f"{indent * 6}for {state_idx} in T.serial(lane, {state_extent}, "
-        f"step={thread_count}):"
-    )
-    body.append(f"{indent * 7}{h_prev}[{state_idx}] = {h_next}[{state_idx}]")
-    body.append(f"{indent * 6}T.sync_threads()")
-    _mamba3_emit_recompute_row(
-        time_idx,
-        level=6,
         update_angle=True,
         update_state=True,
     )
