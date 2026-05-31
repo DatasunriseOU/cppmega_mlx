@@ -278,6 +278,37 @@ DESCRIPTOR_ROW_CHUNK_INDEX_BUFFER = "path_c_row_chunk_index"
 DESCRIPTOR_ROW_CHUNK_INDEX_PARAM = "path_c_row_chunk_index"
 DESCRIPTOR_ROW_SUBCHUNK_INDEX_PARAM = "path_c_row_subchunk_index"
 DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH = 8
+# Per-op time-chunk window override for the mamba3 reverse-time-scan backward.
+#
+# Every launcher-chunked backward segment processes ``rows_per_kernel_launch``
+# reverse time-steps per Metal command buffer (one ``(chunk, subchunk)`` launch;
+# see _path_c_segment_time_chunk_launches). The shared default of 8 steps/launch
+# is watchdog-safe for the per-row-INDEPENDENT heavy ops
+# (attention_qkv_projection_bwd / sparse_mla_fp8_apply_bwd, ~0.42s/launch) but
+# NOT for mamba3_mimo_bwd: its reverse-scan state (1.75MB/step x 4) was pooled to
+# GLOBAL device memory (commit b330bdb, forced by Metal's 32KiB threadgroup cap),
+# so each reverse step is far slower and an 8-step command buffer trips the macOS
+# GPU watchdog (kIOGPUCommandBufferCallbackErrorTimeout) on its FIRST launch at
+# full local_gb10_quarter scale (depth=13 hidden=3584 max_seq=4096). mamba3 gets
+# its OWN smaller window here.
+#
+# Measured isolation sweep (scripts/_bwdgate_mamba3_window_sweep.py, M4 Max, full
+# local_gb10_quarter, first 4 launches; first launch carries the checkpoint-replay
+# setup, ~5s GPU watchdog window):
+#   window  total launches   first launch   steady/launch   first-launch fits?
+#   ------  --------------   ------------   -------------   ------------------
+#     8         512            (timeout)         --           NO  (kIOGPU timeout)
+#     4        1024             3.63s           2.42s         yes (tight, ~1.4s margin)
+#     2        2048             2.52s           1.19s         yes (~2.5s margin)
+#     1        4096             1.65s           0.68s         yes (~3.3s margin)
+# Per-step cost is ~linear (~0.6s/time-step) so the TOTAL mamba3 backward wall is
+# roughly window-independent (~40-46 min); reducing the window only trades a fixed
+# total cost for more launches with more watchdog margin. 4 is the LARGEST
+# watchdog-safe window; 2 is chosen as the committed default for a comfortable
+# ~50% margin during the ~61-min end-to-end run (a window-4 launch at 3.63s leaves
+# little headroom if a transient GPU stall lands on it). Metal-only: CUDA has no
+# per-command-buffer watchdog and keeps the shared default.
+MAMBA3_BWD_ROWS_PER_KERNEL_LAUNCH = 2
 DESCRIPTOR_BACKWARD_GATE_PARAM = "path_c_run_backward"
 DESCRIPTOR_BACKWARD_STAGE_INDEX_PARAM = "path_c_backward_stage_index"
 DESCRIPTOR_EXECUTION_STAGE_ALL = "all"
@@ -704,6 +735,27 @@ def _path_c_descriptor_stage_rows_per_kernel_launch_for_node(node: Any) -> int:
     op_name = _path_c_descriptor_stage_node_op_name(node)
     if op_name in {"attention_qkv_projection_bwd", "mamba3_mimo_bwd"}:
         return 1
+    return DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
+
+
+def _mamba3_bwd_rows_per_kernel_launch_for_nodes(nodes: Iterable[Any]) -> int:
+    """Per-launch time-chunk window for a launcher-chunked backward segment.
+
+    Returns :data:`MAMBA3_BWD_ROWS_PER_KERNEL_LAUNCH` (the smaller, watchdog-safe
+    mamba3 window) when the segment contains ``mamba3_mimo_bwd`` -- whose pooled
+    global reverse-scan state makes each reverse step expensive enough that the
+    shared 8-step window trips the macOS GPU watchdog. Every other
+    launcher-chunked backward op (the per-row-INDEPENDENT heavy ops and m2rnn_bwd)
+    keeps the shared :data:`DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH` window, which is
+    already watchdog-safe for them. With the backward op cap = 1 each backward op
+    is in its OWN segment, so a segment never mixes mamba3 with another op.
+    """
+
+    if any(
+        _path_c_descriptor_stage_node_op_name(node) == "mamba3_mimo_bwd"
+        for node in nodes
+    ):
+        return MAMBA3_BWD_ROWS_PER_KERNEL_LAUNCH
     return DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
 
 
@@ -14817,11 +14869,23 @@ def plan_path_c_direct_fusion_chain_for_region(
                     for node in candidate_region.nodes
                 )
             ):
+                # Per-op time-chunk window. mamba3_mimo_bwd carries multi-MB
+                # global reverse-scan state per step (b330bdb), so an 8-step
+                # command buffer trips the watchdog on its first launch -- it
+                # needs a SMALLER window than the per-row-independent heavy ops.
+                # _mamba3_bwd_rows_per_kernel_launch_for_nodes returns the mamba3
+                # override only when the segment contains mamba3_mimo_bwd; every
+                # other launcher-chunked backward op keeps the shared default.
                 direct_target = _target_with_max_rows_per_launch(
                     direct_target,
                     candidate_region,
                     DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
                     DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+                    rows_per_kernel_launch=(
+                        _mamba3_bwd_rows_per_kernel_launch_for_nodes(
+                            candidate_region.nodes
+                        )
+                    ),
                 )
             # ROW-WINDOWING for the per-row-INDEPENDENT heavy FORWARD ops
             # (attention_qkv_projection / sparse_mla_fp8_apply; see
@@ -15092,12 +15156,25 @@ def _target_with_max_rows_per_launch(
     region: PathCFusionRegion,
     max_rows_per_launch: int | None,
     row_dispatch_mode: str,
+    rows_per_kernel_launch: int = DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
 ) -> PathCFusionScheduleTarget:
     validated_rows = _validated_max_rows_per_launch(max_rows_per_launch)
     validated_mode = _validated_row_dispatch_mode(row_dispatch_mode)
+    validated_rows_per_kernel_launch = _validated_rows_per_kernel_launch(
+        rows_per_kernel_launch
+    )
+    # The dispatch mode + max_rows_per_launch are carried on the target struct,
+    # but the per-launch time-chunk window (rows_per_kernel_launch) lives ONLY in
+    # the generated schedule_template / compiled PrimFunc attrs, so it is never
+    # recorded on the PathCFusionScheduleTarget. A non-default window must
+    # therefore re-generate the template even when mode + max_rows already match;
+    # the early-out is valid only for the default window (where re-generation
+    # would be a no-op). RULE #1: an explicit non-default window always lowers --
+    # never silently keeps the default 8-step kernel.
     if (
         target.max_rows_per_launch == validated_rows
         and target.row_dispatch_mode == validated_mode
+        and validated_rows_per_kernel_launch == DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH
     ):
         return target
     shape_env = _shape_env_for_region(region)
@@ -15114,6 +15191,7 @@ def _target_with_max_rows_per_launch(
             physical_abi_policy=target.physical_abi_policy,
             max_rows_per_launch=validated_rows,
             row_dispatch_mode=validated_mode,
+            rows_per_kernel_launch=validated_rows_per_kernel_launch,
         ),
         max_rows_per_launch=validated_rows,
         row_dispatch_mode=validated_mode,
