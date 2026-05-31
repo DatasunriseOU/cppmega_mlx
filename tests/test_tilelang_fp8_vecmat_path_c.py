@@ -510,8 +510,13 @@ def test_fp8_vecmat_direct_path_uses_owner_output_without_mlx_fast_fallback(
         assert returned is out
 
     assert len(calls) == len(_owner_output_dtypes())
+    # Owner-output reuse runs the synchronous tvm-ffi route and returns the exact
+    # caller object (``returned is out`` above). The async owner-output request
+    # was dropped: under the now-live native bridge it returned a fresh wrapper
+    # that only aliases ``out`` (breaking the ``returned is out`` contract), and
+    # the non-native route ignored the flag and ran synchronously anyway.
     assert all(
-        call.get("_tilelang_mlx_async_owner_outputs") is True for call in call_kwargs
+        "_tilelang_mlx_async_owner_outputs" not in call for call in call_kwargs
     )
     for call in calls:
         assert call[0] is x
