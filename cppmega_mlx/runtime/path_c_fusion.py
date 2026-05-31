@@ -1936,6 +1936,25 @@ _MAMBA3_CHUNKED_HANDOFF_SUFFIXES = (
     "prev_states",
     "final_state",
 )
+# Caller-owned BACKWARD grad-handoff buffer suffixes that wire B2 -> B1 -> B0
+# (Stage 3; the analytic transpose of the forward F2 -> F1 -> F0 handoff). They
+# are NEW logical region buffers (registered in _buffer_shape / _buffer_dtype and
+# the schedules force-spill set DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS):
+#   dchunk_states : B2 -> B1   grad of prev_states (per-chunk entry state)
+#   dstates       : B1 -> B0   grad of summary_states
+#   dinp_diag     : B2 -> B0   diag input-outer grad
+#   dA_cumsum_y   : B2 -> B0   Y-path dA_cumsum grad
+#   dA_cumsum_tail: B1 -> B0   chunk-tail dA_cumsum grad
+#   dh_last       : (region input) cotangent of final_state (zero by default)
+# All fp32 (recurrent-state precision; resolved in _buffer_dtype). The final input
+# grads (dx/dB/dlog_decay/ddt/dh0/dC/dz/dD) are this brick's grad outputs.
+_MAMBA3_CHUNKED_BWD_HANDOFF_SUFFIXES = (
+    "dchunk_states",
+    "dstates",
+    "dinp_diag",
+    "dA_cumsum_y",
+    "dA_cumsum_tail",
+)
 
 
 def _emit_mamba3_model_brick_surfaces(
@@ -2042,7 +2061,110 @@ def _emit_mamba3_chunked_model_brick_surfaces(
             backward="owner_output",
         )
     )
+    # When the flag is ON the forward surfaces use ``owner_output`` (no AOT
+    # autograd derivation), so the 3 backward segments are emitted EXPLICITLY here
+    # with the cross-segment grad-handoff wiring (B2 -> B1 -> B0), the analytic
+    # transpose of the forward F2 -> F1 -> F0. This replaces the serial
+    # ``mamba3_mimo_bwd`` (which is not emitted when the flag is ON).
+    _emit_mamba3_chunked_bwd_model_brick_surfaces(brick, context)
     return _PathCBrickSurfaceLoweringResult(delta_output=delta)
+
+
+def _emit_mamba3_chunked_bwd_model_brick_surfaces(
+    brick: _ResolvedPathCModelBrick,
+    context: _PathCBrickSurfaceLoweringContext,
+) -> None:
+    """Emit the chunked B2/B1/B0 SSD-core BACKWARD as 3 region surfaces.
+
+    The analytic transpose of the forward F2/F1/F0 (design §2/§7 Stage 3), wired by
+    the per-brick caller-owned grad-handoff buffers (``dchunk_states`` B2->B1,
+    ``dstates`` B1->B0, ``dinp_diag``/``dA_cumsum_y`` B2->B0, ``dA_cumsum_tail``
+    B1->B0). REUSES the forward-materialized boundary states
+    (``cb / dA_cumsum / prev_states / summary_states``) instead of the 8x
+    checkpoint-replay (design §3/§6).
+
+    Inputs are the brick's delta cotangent (``{name}_delta_grad``), the forward
+    cache (the same projected SSD tensors + handoff buffers the forward staged),
+    and ``{name}_dh_last`` (final-state cotangent, zero by default). Outputs are the
+    brick's grad outputs for the SSD inputs (``{name}_x_grad`` / ``B`` / ``C`` /
+    ``dt`` / ``A`` via dlog_decay+ddt / ``z`` / ``D`` / ``h0``).
+
+    Each ``_bwd`` op-node compiles to its proven ``build_*_bwd_metal`` grid kernel
+    via the compile-site delegation interpose. RULE #1: on compile/parity failure
+    the builder RAISES (no silent serial fallback).
+    """
+    name = brick.name
+    proj = {
+        suffix: f"{name}_{suffix}"
+        for suffix in _MAMBA3_CHUNKED_PROJECTED_SSD_INPUT_SUFFIXES
+    }
+    hand = {
+        suffix: f"{name}_{suffix}"
+        for suffix in _MAMBA3_CHUNKED_HANDOFF_SUFFIXES
+    }
+    bwd = {
+        suffix: f"{name}_{suffix}"
+        for suffix in _MAMBA3_CHUNKED_BWD_HANDOFF_SUFFIXES
+    }
+    h0 = f"{name}_h0"
+    skip_d = f"{name}_D"
+    delta_grad = f"{name}_delta_grad"
+    dh_last = f"{name}_dh_last"
+    y = f"{name}_y"
+    z = f"{name}_z"
+
+    # B2 — output/Y transpose. Reads delta cotangent + forward cache; writes the
+    # output-side grads (dC/dz/dD final; dchunk_states/dinp_diag/dA_cumsum_y handoff;
+    # dx D-skip partial accumulated by B0).
+    context.surfaces.append(
+        FusionKernelSurface.path_c(
+            name=f"{name}_chunk_scan_combine_bwd",
+            op_name="mamba3_chunk_scan_combine_bwd",
+            inputs=(
+                delta_grad, hand["cb"], proj["x"], z, proj["dt"],
+                hand["dA_cumsum"], proj["C"], proj["B"], hand["prev_states"],
+                skip_d, y,
+            ),
+            outputs=(
+                f"{name}_C_grad", f"{name}_x_grad", f"{name}_z_grad",
+                bwd["dchunk_states"], bwd["dinp_diag"], bwd["dA_cumsum_y"],
+                f"{name}_D_grad",
+            ),
+            backward="owner_output",
+        )
+    )
+    # B1 — REVERSE inter-chunk combiner. Reads dchunk_states + prev_states + the
+    # final-state cotangent; writes dstates/dA_cumsum_tail handoff + dh0 (final).
+    context.surfaces.append(
+        FusionKernelSurface.path_c(
+            name=f"{name}_inter_chunk_recur_bwd",
+            op_name="mamba3_inter_chunk_recur_bwd",
+            inputs=(
+                bwd["dchunk_states"], hand["dA_cumsum"], dh_last,
+                hand["prev_states"],
+            ),
+            outputs=(bwd["dstates"], f"{name}_h0_grad", bwd["dA_cumsum_tail"]),
+            backward="owner_output",
+        )
+    )
+    # B0 — precompute transpose. Folds dstates + dinp_diag + the dA_cumsum grads
+    # into the final input grads dx (accumulated)/dB/dlog_decay/ddt.
+    context.surfaces.append(
+        FusionKernelSurface.path_c(
+            name=f"{name}_chunk_precompute_bwd",
+            op_name="mamba3_chunk_precompute_bwd",
+            inputs=(
+                bwd["dstates"], bwd["dinp_diag"], bwd["dA_cumsum_y"],
+                bwd["dA_cumsum_tail"], hand["dA_cumsum"], proj["x"], proj["B"],
+                proj["dt"], proj["A"],
+            ),
+            outputs=(
+                f"{name}_x_grad", f"{name}_B_grad", f"{name}_dt_grad",
+                f"{name}_A_grad",
+            ),
+            backward="owner_output",
+        )
+    )
 
 
 def _emit_m2rnn_model_brick_surfaces(

@@ -170,6 +170,93 @@ def test_backward_interpose_on_emits_real_grid_kernel(op_name, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Verification 1b: the LIVE REGION-BUILD backward 1->3 surface flip.            #
+# --------------------------------------------------------------------------- #
+
+
+def _build_mamba_direct_chain_region(env):
+    from cppmega_mlx.runtime.path_c_fusion import (
+        PathCModelBrick,
+        build_path_c_model_region_from_bricks,
+    )
+
+    bricks = (PathCModelBrick(name="mamba3_scan", kind="mamba3", route_symbol="M"),)
+    return build_path_c_model_region_from_bricks(
+        region_name="mamba3_direct_chain", bricks=bricks, shape_env=env
+    )
+
+
+def test_region_flip_off_no_chunked_backward_surfaces(monkeypatch):
+    """Flag OFF (default): the direct-chain region has NO chunked _bwd surfaces —
+    the serial mamba3_mimo (with aot_autograd) is unchanged (merge-safe)."""
+    monkeypatch.delenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", raising=False)
+    region = _build_mamba_direct_chain_region(_env())
+    ops = [n.op_name for n in region.nodes]
+    assert "mamba3_mimo" in ops
+    assert not any(o in _BWD_OPS for o in ops), ops
+
+
+def test_region_flip_on_emits_three_chunked_backward_surfaces(monkeypatch):
+    """Flag ON: the region emits the 3 chunked _bwd segments (B2->B1->B0), each
+    classified as a BACKWARD-phase node isolated into its own backward stage, wired
+    by the per-brick grad-handoff buffers."""
+    monkeypatch.setenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", "1")
+    from cppmega_mlx.runtime.path_c_fusion_schedules import (
+        _path_c_schedule_node_execution_phase,
+        plan_path_c_descriptor_stage_groups,
+    )
+
+    region = _build_mamba_direct_chain_region(_env())
+    bwd_nodes = {n.op_name: n for n in region.nodes if n.op_name in _BWD_OPS}
+    assert set(bwd_nodes) == set(_BWD_OPS), list(bwd_nodes)
+    # all 3 classify as backward phase
+    for n in region.nodes:
+        if n.op_name in _BWD_OPS:
+            assert _path_c_schedule_node_execution_phase(n) == "backward", n.op_name
+
+    # each _bwd op is isolated into its own backward stage group
+    op_by_node = {n.name: n.op_name for n in region.nodes}
+    bwd_stage_ops = []
+    for g in plan_path_c_descriptor_stage_groups(region):
+        ops = [op_by_node.get(x) for x in g.active_node_names]
+        for op in ops:
+            if op in _BWD_OPS:
+                assert g.execution_stage == "backward", g.execution_stage
+                assert len(g.active_node_names) == 1, list(g.active_node_names)
+                bwd_stage_ops.append(op)
+    assert bwd_stage_ops == list(_BWD_OPS), bwd_stage_ops
+
+    # grad-handoff wiring: B2 -> B1 -> B0 (the transpose of F2 -> F1 -> F0)
+    b2 = bwd_nodes["mamba3_chunk_scan_combine_bwd"]
+    b1 = bwd_nodes["mamba3_inter_chunk_recur_bwd"]
+    b0 = bwd_nodes["mamba3_chunk_precompute_bwd"]
+    assert "mamba3_scan_dchunk_states" in b2.outputs
+    assert "mamba3_scan_dchunk_states" in b1.inputs
+    assert "mamba3_scan_dstates" in b1.outputs
+    assert "mamba3_scan_dstates" in b0.inputs
+    assert "mamba3_scan_dinp_diag" in b2.outputs and "mamba3_scan_dinp_diag" in b0.inputs
+    assert "mamba3_scan_dA_cumsum_tail" in b1.outputs and "mamba3_scan_dA_cumsum_tail" in b0.inputs
+    # B2/B1/B0 REUSE the forward-materialized boundary states (no replay)
+    assert "mamba3_scan_prev_states" in b2.inputs
+    assert "mamba3_scan_prev_states" in b1.inputs
+    assert "mamba3_scan_cb" in b2.inputs
+
+
+def test_backward_handoff_buffers_fp32_and_force_spilled():
+    """The 6 backward grad-handoff buffers resolve fp32 and are in the force-spill
+    ABI set (mirror of the forward handoff registration)."""
+    from cppmega_mlx.runtime.path_c_fusion_schedules import (
+        DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS,
+        _buffer_dtype,
+    )
+
+    for nm in DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS:
+        assert _buffer_dtype(nm) == "float32", nm
+    assert "mamba3_dchunk_states" in DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS
+    assert "mamba3_dstates" in DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS
+
+
 @pytest.mark.skipif(
     not _torch_mps_available(), reason="requires torch + Metal (mps) backend"
 )

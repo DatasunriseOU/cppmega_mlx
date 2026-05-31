@@ -599,8 +599,13 @@ def test_region_flip_on_full_scale_region_parity(monkeypatch, capsys):
     assert env.mamba_num_heads == H
 
     region = _build_mamba_direct_chain_region(env)
+    # Forward-only chunked nodes (Stage 3 also emits 3 chunked _bwd nodes when the
+    # flag is ON; this forward-parity check exercises just F0/F1/F2).
     chunked_nodes = [
-        n for n in region.nodes if n.op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS
+        n
+        for n in region.nodes
+        if n.op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS
+        and not n.op_name.endswith("_bwd")
     ]
     assert len(chunked_nodes) == 3
 

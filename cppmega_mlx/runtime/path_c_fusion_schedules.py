@@ -265,6 +265,20 @@ DESCRIPTOR_MAMBA3_CHUNKED_FWD_HANDOFF_ABI_BUFFERS = frozenset(
         "mamba3_final_state",
     }
 )
+# Backward grad-handoff buffers (B2 -> B1 -> B0; Stage 3). Force-spilled to named
+# ABI scratch (mirror of the forward set) so they land as stable named params
+# across the producer/consumer backward segments. All fp32 (resolved in
+# _buffer_dtype). Flag-gated (default OFF) — never appear in the serial backward.
+DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS = frozenset(
+    {
+        "mamba3_dh_last",
+        "mamba3_dchunk_states",
+        "mamba3_dstates",
+        "mamba3_dinp_diag",
+        "mamba3_dA_cumsum_y",
+        "mamba3_dA_cumsum_tail",
+    }
+)
 DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_CANONICALS = frozenset(
     {
         "hidden",
@@ -725,13 +739,18 @@ class _ScheduleNodeView:
 def _path_c_schedule_node_execution_phase(node: Any) -> str:
     backward = str(getattr(node, "backward", ""))
     op_name = str(getattr(node, "op_name", ""))
-    # The chunked F0/F1/F2 SSD-core ops are FORWARD producers that carry NO
-    # synthesized AOT backward (they own their output gradient: backward=
-    # "owner_output"), but they must run in the FORWARD execution stage so the
-    # compile-site delegation interpose substitutes their grid kernel during the
-    # forward pass (RULE #1: the chunked forward is never grouped as a backward
-    # fragment). Backward stays serial/unchanged.
-    if op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS:
+    # The chunked F0/F1/F2 SSD-core FORWARD ops carry NO synthesized AOT backward
+    # (they own their output gradient: backward="owner_output"), but they must run
+    # in the FORWARD execution stage so the compile-site delegation interpose
+    # substitutes their grid kernel during the forward pass (RULE #1: the chunked
+    # forward is never grouped as a backward fragment). The chunked B0/B1/B2
+    # BACKWARD ops (``*_bwd``) are explicitly EXCLUDED here so they classify as
+    # backward below (they too are in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS for the
+    # shared interpose, but they belong to the backward execution stage).
+    if (
+        op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS
+        and not op_name.endswith("_bwd")
+    ):
         return "forward"
     if backward == "owner_output" or op_name.endswith("_bwd"):
         return "backward"
@@ -4662,6 +4681,8 @@ def _is_row_phased_bwd_scratch_abi_buffer(buffer_name: str) -> bool:
     if name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS:
         return True
     if name in DESCRIPTOR_MAMBA3_CHUNKED_FWD_HANDOFF_ABI_BUFFERS:
+        return True
+    if name in DESCRIPTOR_MAMBA3_CHUNKED_BWD_HANDOFF_ABI_BUFFERS:
         return True
     if not name.endswith("_grad"):
         return False
@@ -14375,6 +14396,14 @@ def _buffer_dtype(
         "mamba3_summary_states",
         "mamba3_prev_states",
         "mamba3_final_state",
+        # Mamba3 chunked-scan B2->B1->B0 backward grad-handoff buffers (Stage 3):
+        # fp32 for recurrent grad-state precision.
+        "mamba3_dh_last",
+        "mamba3_dchunk_states",
+        "mamba3_dstates",
+        "mamba3_dinp_diag",
+        "mamba3_dA_cumsum_y",
+        "mamba3_dA_cumsum_tail",
         "m2rnn_h_state",
         "m2rnn_h_checkpoint",
         "m2rnn_h0_grad",
@@ -14502,6 +14531,13 @@ _MAMBA3_CHUNKED_FWD_REGION_BUFFER_SUFFIXES: tuple[str, ...] = (
     "summary_states",
     "prev_states",
     "final_state",
+    # backward grad-handoff (B2 -> B1 -> B0; Stage 3)
+    "dh_last",
+    "dchunk_states",
+    "dstates",
+    "dinp_diag",
+    "dA_cumsum_y",
+    "dA_cumsum_tail",
 )
 
 
@@ -14594,6 +14630,13 @@ def _mamba3_chunked_fwd_region_buffer_shape(
         "summary_states": (batch, nchunks, nheads, headdim, dstate),
         "prev_states": (batch, nchunks, nheads, headdim, dstate),
         "final_state": (batch, nheads, headdim, dstate),
+        # BACKWARD grad-handoff buffers (B2 -> B1 -> B0; Stage 3, fp32)
+        "dh_last": (batch, nheads, headdim, dstate),
+        "dchunk_states": (batch, nchunks, nheads, headdim, dstate),
+        "dstates": (batch, nchunks, nheads, headdim, dstate),
+        "dinp_diag": (batch, seqlen, nheads, headdim, dstate),
+        "dA_cumsum_y": (batch, nheads, nchunks, chunk),
+        "dA_cumsum_tail": (batch, nheads, nchunks, chunk),
     }
     return shapes[suffix]
 
