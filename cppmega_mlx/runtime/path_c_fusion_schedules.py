@@ -14873,7 +14873,18 @@ def plan_path_c_direct_fusion_chain_for_region(
             # SAME launcher_chunks treatment; the carry-buffer plumbing distinguishes
             # them downstream. (Metal-only watchdog split; CUDA keeps grid_chunks.)
             if (
-                execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+                # Watchdog chunking is a macOS GPU-watchdog WORKAROUND and is
+                # Metal-ONLY. CUDA has no per-command-buffer watchdog, so it keeps
+                # grid_chunks (monolithic, one launch per segment): the genuine
+                # fused kernels. The comment above always claimed this but the
+                # code applied launcher_chunks unconditionally -- the gate below
+                # makes CUDA actually monolithic. (Measured: monolithic is the
+                # correct CUDA path; the heavy backward COMPUTE -- not chunking
+                # overhead -- is the long pole on CUDA, so this is correctness +
+                # fewer launches, not a speed claim.) The hardware-aware auto-split
+                # supersedes this with caps.has_command_buffer_watchdog.
+                _path_c_default_target() == "metal"
+                and execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
                 and direct_target.max_rows_per_launch is not None
                 and any(
                     _path_c_descriptor_stage_node_op_name(node)
