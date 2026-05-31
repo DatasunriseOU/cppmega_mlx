@@ -1,10 +1,15 @@
 """Metal golden-parity gate (design §7.1): the caps-derived auto-split must
 reproduce the CURRENT hand-tuned local_gb10_quarter splits byte-for-byte.
 
-The reference is main 9f74055's segment grouping + dispatch modes + chunk params.
+The reference is main 82b6ab0's segment grouping + dispatch modes + chunk params
+(the auto-split was originally calibrated against 9f74055; main has since advanced
+with the mamba3 per-op time-chunk window=2 (b18f415), the backward atomic_add ->
+non-atomic RMW (20860b7), and the CUDA monolithic gate (930748a) -- all of which
+the auto-split reproduces, the window via _mamba3_bwd_rows_per_kernel_launch_for_nodes
+and CUDA-monolithic via caps.has_command_buffer_watchdog==False).
 This test plans the real local_gb10_quarter route region on Metal with the
 auto-split enabled (default sentinels resolve from device_caps()) and asserts the
-exact 12-segment plan.
+exact 12-segment plan AND the per-segment time-chunk window.
 
 CUDA monolithic-parity (§7.2) is asserted at the resolution level (caps fields)
 so it can run without a CUDA device; the full CUDA plan is checked on gb10.
@@ -26,21 +31,27 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 
-# The hand-tuned reference (main 9f74055), in plan order.
-# (ops, execution_phase, row_dispatch_mode, max_rows_per_launch, buffer_count)
+# The hand-tuned reference (main 82b6ab0), in plan order.
+# (ops, execution_phase, row_dispatch_mode, max_rows_per_launch, buffer_count,
+#  rows_per_kernel_launch). The last field is the per-launch TIME-CHUNK WINDOW:
+# main 82b6ab0 added a smaller window (=2) for mamba3_mimo_bwd (b18f415) because
+# its pooled global reverse-scan state makes the shared 8-step command buffer trip
+# the macOS GPU watchdog; every other launcher-chunked backward op keeps the
+# shared default of 8. The auto-split reproduces this exactly via
+# _mamba3_bwd_rows_per_kernel_launch_for_nodes.
 _GOLDEN_SEGMENTS = [
-    (("entry_rmsnorm", "mamba3_mimo"), "forward", "grid_chunks", 64, 23),
-    (("residual_rmsnorm", "m2rnn"), "forward", "grid_chunks", 64, 20),
-    (("residual_rmsnorm",), "forward", "grid_chunks", 64, 6),
-    (("attention_qkv_projection",), "forward", "launcher_chunks", 64, 9),
-    (("sparse_mla_fp8_apply",), "forward", "launcher_chunks", 64, 12),
-    (("sparse_mla_fp8_apply_bwd",), "backward", "launcher_chunks", 64, 15),
-    (("attention_qkv_projection_bwd",), "backward", "launcher_chunks", 64, 12),
-    (("residual_rmsnorm_bwd",), "backward", "grid_chunks", 64, 9),
-    (("m2rnn_bwd",), "backward", "launcher_chunks", 64, 25),
-    (("residual_rmsnorm_bwd",), "backward", "grid_chunks", 64, 9),
-    (("mamba3_mimo_bwd",), "backward", "launcher_chunks", 64, 30),
-    (("entry_rmsnorm_bwd",), "backward", "grid_chunks", 64, 6),
+    (("entry_rmsnorm", "mamba3_mimo"), "forward", "grid_chunks", 64, 23, 8),
+    (("residual_rmsnorm", "m2rnn"), "forward", "grid_chunks", 64, 20, 8),
+    (("residual_rmsnorm",), "forward", "grid_chunks", 64, 6, 8),
+    (("attention_qkv_projection",), "forward", "launcher_chunks", 64, 9, 8),
+    (("sparse_mla_fp8_apply",), "forward", "launcher_chunks", 64, 12, 8),
+    (("sparse_mla_fp8_apply_bwd",), "backward", "launcher_chunks", 64, 15, 8),
+    (("attention_qkv_projection_bwd",), "backward", "launcher_chunks", 64, 12, 8),
+    (("residual_rmsnorm_bwd",), "backward", "grid_chunks", 64, 9, 8),
+    (("m2rnn_bwd",), "backward", "launcher_chunks", 64, 25, 8),
+    (("residual_rmsnorm_bwd",), "backward", "grid_chunks", 64, 9, 8),
+    (("mamba3_mimo_bwd",), "backward", "launcher_chunks", 64, 30, 2),
+    (("entry_rmsnorm_bwd",), "backward", "grid_chunks", 64, 6, 8),
 ]
 
 
@@ -66,6 +77,13 @@ def test_metal_autosplit_reproduces_hand_tuned_splits():
     actual = []
     for seg in chain.segments:
         tgt = seg.schedule_target
+        # The per-launch time-chunk window lives only on the generated PrimFunc
+        # attrs (it is not recorded on the schedule_target), so read it back from
+        # the compiled template to assert the mamba3 window=2 (b18f415).
+        prim_func = tgt.schedule_template(seg.region)
+        rows_per_kernel_launch = getattr(
+            prim_func, "_cppmega_path_c_rows_per_kernel_launch", None
+        )
         actual.append(
             (
                 tuple(n.op_name for n in seg.region.nodes),
@@ -73,6 +91,7 @@ def test_metal_autosplit_reproduces_hand_tuned_splits():
                 getattr(tgt, "row_dispatch_mode", None),
                 getattr(tgt, "max_rows_per_launch", None),
                 seg.kernel_parameter_count,
+                rows_per_kernel_launch,
             )
         )
 
