@@ -161,6 +161,39 @@ _TIME_CHUNKED_RECURRENT_BACKWARD_OPS = frozenset(
         "mamba3_mimo_bwd",
     }
 )
+# Per-row-INDEPENDENT heavy BACKWARD ops that exceed the macOS GPU watchdog
+# (~5-6s per command buffer) when run as ONE monolithic grid_chunks command
+# buffer at full local_gb10_quarter scale (depth=13 hidden=3584 max_seq=4096).
+#
+# Measured (full scale, each op ISOLATED in its own segment, grid_chunks, run in
+# a FRESH process so no prior GPU error pollutes the device):
+#   sparse_mla_fp8_apply_bwd      monolithic grid_chunks -> ~12s  -> WATCHDOG KILL
+#                                 (kIOGPUCommandBufferCallbackErrorTimeout)
+#   attention_qkv_projection_bwd  monolithic grid_chunks -> ~10s  -> WATCHDOG KILL
+#   residual_rmsnorm_bwd          monolithic grid_chunks -> ~0.08s -> safe
+# Both heavy ops time out the watchdog even ALONE (not from summing several ops
+# in one command buffer), so a fused-segment op cap alone does NOT clear them --
+# each needs its single op split across multiple command buffers over its
+# per-row axis. Unlike the recurrent reverse-time scans (m2rnn_bwd /
+# mamba3_mimo_bwd), these ops are per-row-INDEPENDENT: each output row depends
+# only on its own input row plus the shared weights, with NO carried reverse-time
+# state. So launcher_chunks row-windowing splits them into K command buffers over
+# rows with zero cross-launch state (see _row_phased_launcher_carry_buffers_for_nodes
+# which adds carry buffers ONLY for mamba3/m2rnn, never for these). The weight
+# gradients still accumulate correctly: path_c_first_row_launch zeroes the owner
+# grads exactly once on the first (chunk 0, subchunk 0) launch, then every launch
+# adds its rows' contribution.
+# Measured row-windowed (launcher_chunks, max_rows_per_launch=64 ->
+# rows_per_kernel_launch=8 -> 512 launches of 8 rows each):
+#   attention_qkv_projection_bwd  ~0.42s per launch -> watchdog-safe.
+# Metal-only (CUDA's compiler/scheduler has no such per-command-buffer watchdog,
+# so CUDA keeps the monolithic grid_chunks path).
+_ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS = frozenset(
+    {
+        "sparse_mla_fp8_apply_bwd",
+        "attention_qkv_projection_bwd",
+    }
+)
 DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS = frozenset(
     {
         "attention_hidden",
@@ -231,6 +264,31 @@ DESCRIPTOR_EXECUTION_STAGES = frozenset(
 # limit, so this cap is gated to Metal only (CUDA keeps greedy forward fusion).
 METAL_FORWARD_MAX_SEGMENT_NODES = 2
 
+# Metal-only BACKWARD fused-segment op-count cap.
+#
+# Sibling of METAL_FORWARD_MAX_SEGMENT_NODES, for the reverse-autograd backward
+# phase. The greedy direct-chain planner otherwise fuses backward ops up to the
+# portable buffer limit, producing the 3-op backward mega-kernel
+# ``sparse_mla_fp8_apply_bwd + attention_qkv_projection_bwd + residual_rmsnorm_bwd``
+# (region ``..._chain_7_10``). Measured at full local_gb10_quarter scale that
+# fused segment is ONE ~115 KB grid_chunks command buffer that runs ~10-25s of
+# GPU time and is killed by the macOS GPU watchdog
+# (kIOGPUCommandBufferCallbackErrorTimeout) -- the FIRST backward segment to die.
+# Capping backward segments at 1 op puts each backward op in its OWN segment /
+# command buffer, which (a) keeps each command buffer small and (b) lets the two
+# per-row-INDEPENDENT heavy ops (sparse_mla_fp8_apply_bwd,
+# attention_qkv_projection_bwd; see _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS) get
+# launcher_chunks row-windowing so each command buffer holds only a row window's
+# worth of work (~0.42s) -- well under the watchdog. The light backward ops
+# (residual_rmsnorm_bwd / entry_rmsnorm_bwd) run monolithically in ~0.08s.
+#
+# NOTE: an op cap alone does NOT clear sparse_mla_fp8_apply_bwd /
+# attention_qkv_projection_bwd -- each times out the watchdog even ISOLATED in a
+# 1-op segment, so isolation MUST be paired with row-windowing (the cap of 1
+# guarantees the isolation those ops need to be row-chunked). CUDA has no such
+# watchdog, so the cap is Metal-only (CUDA keeps greedy backward fusion).
+METAL_BACKWARD_MAX_SEGMENT_NODES = 1
+
 
 class _ResolveFromTarget:
     """Sentinel: resolve a planner default from the active lowering target.
@@ -246,6 +304,7 @@ class _ResolveFromTarget:
 
 
 _RESOLVE_FORWARD_CAP_FROM_TARGET = _ResolveFromTarget()
+_RESOLVE_BACKWARD_CAP_FROM_TARGET = _ResolveFromTarget()
 _GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = (
     "residual_norm_weight",
     # Block A: the per-brick entry RMSNorm weight emitted by the model-
@@ -14230,6 +14289,9 @@ def plan_path_c_direct_fusion_chain_for_region(
     forward_max_segment_nodes: int | None | _ResolveFromTarget = (
         _RESOLVE_FORWARD_CAP_FROM_TARGET
     ),
+    backward_max_segment_nodes: int | None | _ResolveFromTarget = (
+        _RESOLVE_BACKWARD_CAP_FROM_TARGET
+    ),
     registry: PathCFusionScheduleRegistry | None = None,
 ) -> PathCFusionScheduleChainPlan:
     """Greedily split a Path C region into direct-buffer fused segments.
@@ -14249,11 +14311,22 @@ def plan_path_c_direct_fusion_chain_for_region(
     ``MTLCompilerService`` at ``newComputePipelineState`` with
     ``XPC_ERROR_CONNECTION_INTERRUPTED`` — splits into two smaller
     pipeline-safe kernels); on CUDA it is ``None`` (no cap, the CUDA compiler
-    has no such pipeline-state size limit, so CUDA fusion is unchanged). The
-    cap applies ONLY to forward segments; backward segments keep greedy fusion
-    up to the buffer limit (their reverse-time watchdog split is handled
-    separately via launcher_chunks). Pass an explicit value to override; pass
-    ``None`` to disable the cap entirely.
+    has no such pipeline-state size limit, so CUDA fusion is unchanged).
+
+    ``backward_max_segment_nodes`` is the sibling Metal-only cap for the
+    reverse-autograd BACKWARD phase. The default
+    (``_RESOLVE_BACKWARD_CAP_FROM_TARGET``) resolves to
+    :data:`METAL_BACKWARD_MAX_SEGMENT_NODES` = 1 on Metal and ``None`` on CUDA.
+    Capping backward segments at 1 op splits the 3-op backward mega-kernel
+    ``sparse_mla_fp8_apply_bwd + attention_qkv_projection_bwd +
+    residual_rmsnorm_bwd`` (region ``..._chain_7_10``, ~115 KB, ~10-25s GPU time
+    -> macOS GPU watchdog kill) into one segment per op, which both shrinks each
+    command buffer AND lets the per-row-INDEPENDENT heavy ops
+    (``sparse_mla_fp8_apply_bwd`` / ``attention_qkv_projection_bwd``;
+    :data:`_ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS`) get launcher_chunks
+    row-windowing so each command buffer holds only a row window (~0.42s) -- well
+    under the watchdog. Pass an explicit value to override; pass ``None`` to
+    disable (CUDA keeps greedy backward fusion).
     """
 
     if not isinstance(region, PathCFusionRegion):
@@ -14278,6 +14351,23 @@ def plan_path_c_direct_fusion_chain_for_region(
     ):
         raise ValueError(
             "forward_max_segment_nodes must be positive when provided"
+        )
+    if isinstance(backward_max_segment_nodes, _ResolveFromTarget):
+        # Resolve the backward fusion cap from the active lowering target: Metal
+        # caps at 1 op/segment (so the watchdog-killing 3-op backward segment
+        # ..._chain_7_10 splits per op and the heavy per-row-independent ops can
+        # be row-windowed); CUDA stays uncapped (no watchdog).
+        backward_max_segment_nodes = (
+            METAL_BACKWARD_MAX_SEGMENT_NODES
+            if _path_c_default_target() == "metal"
+            else None
+        )
+    if (
+        backward_max_segment_nodes is not None
+        and backward_max_segment_nodes <= 0
+    ):
+        raise ValueError(
+            "backward_max_segment_nodes must be positive when provided"
         )
     working_region = (
         build_path_c_aot_autograd_region(region)
@@ -14335,6 +14425,25 @@ def plan_path_c_direct_fusion_chain_for_region(
                     f"(Metal newComputePipelineState size cap)"
                 )
                 break
+            # BACKWARD-only Metal watchdog cap. Backward fused segments larger
+            # than ``backward_max_segment_nodes`` ops run as ONE grid_chunks
+            # command buffer whose GPU time exceeds the macOS GPU watchdog
+            # (kIOGPUCommandBufferCallbackErrorTimeout) -- the 3-op
+            # ..._chain_7_10 mega-kernel was the FIRST backward segment to die.
+            # Stop extending the backward segment so each backward op lands in
+            # its own command buffer (and the per-row-independent heavy ops can
+            # then be row-windowed below). Forward segments are unaffected.
+            if (
+                execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+                and backward_max_segment_nodes is not None
+                and end - start > backward_max_segment_nodes
+            ):
+                first_failure = (
+                    f"backward direct-buffer segment reached "
+                    f"backward_max_segment_nodes={backward_max_segment_nodes} "
+                    f"(Metal GPU watchdog command-buffer cap)"
+                )
+                break
             target = selector.select(candidate_region)
             if target is None:
                 first_failure = (
@@ -14372,12 +14481,30 @@ def plan_path_c_direct_fusion_chain_for_region(
             # mamba3_mimo_bwd; m2rnn_bwd runs FIRST in the reverse chain and tripped
             # the watchdog before mamba3 was reached (verified timeout at region
             # ..._chain_10_11 / op=m2rnn_bwd), so both recurrent ops are included.
+            #
+            # ROW-WINDOWING for the per-row-INDEPENDENT heavy backward ops
+            # (sparse_mla_fp8_apply_bwd / attention_qkv_projection_bwd; see
+            # _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS). At full scale each of these
+            # times out the macOS GPU watchdog even ISOLATED in its own 1-op
+            # grid_chunks command buffer (~10-12s). They have NO carried
+            # reverse-time state (each output row depends only on its own input
+            # row + shared weights), so launcher_chunks splits them into K command
+            # buffers over the independent ROW axis with zero cross-launch state
+            # (_row_phased_launcher_carry_buffers_for_nodes adds carry buffers ONLY
+            # for mamba3/m2rnn, never for these). Weight grads still accumulate
+            # correctly via the path_c_first_row_launch one-time owner-grad zero.
+            # Both recurrent and independent watchdog-heavy ops therefore take the
+            # SAME launcher_chunks treatment; the carry-buffer plumbing distinguishes
+            # them downstream. (Metal-only watchdog split; CUDA keeps grid_chunks.)
             if (
                 execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
                 and direct_target.max_rows_per_launch is not None
                 and any(
                     _path_c_descriptor_stage_node_op_name(node)
-                    in _TIME_CHUNKED_RECURRENT_BACKWARD_OPS
+                    in (
+                        _TIME_CHUNKED_RECURRENT_BACKWARD_OPS
+                        | _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS
+                    )
                     for node in candidate_region.nodes
                 )
             ):
@@ -14480,6 +14607,9 @@ def plan_path_c_direct_fusion_chains_for_model(
     forward_max_segment_nodes: int | None | _ResolveFromTarget = (
         _RESOLVE_FORWARD_CAP_FROM_TARGET
     ),
+    backward_max_segment_nodes: int | None | _ResolveFromTarget = (
+        _RESOLVE_BACKWARD_CAP_FROM_TARGET
+    ),
     registry: PathCFusionScheduleRegistry | None = None,
     sequence_length: int | None = None,
 ) -> tuple[PathCFusionScheduleChainPlan, ...]:
@@ -14490,9 +14620,9 @@ def plan_path_c_direct_fusion_chains_for_model(
     model's brick graph first, then split each discovered region into generic
     direct-buffer segments.  It does not consult named acceptance fixtures.
 
-    ``forward_max_segment_nodes`` is forwarded to
-    :func:`plan_path_c_direct_fusion_chain_for_region` (Metal-only forward
-    fusion cap; see that function's docstring).
+    ``forward_max_segment_nodes`` / ``backward_max_segment_nodes`` are forwarded
+    to :func:`plan_path_c_direct_fusion_chain_for_region` (Metal-only fusion caps
+    for the forward / backward phases; see that function's docstring).
     """
 
     regions = build_path_c_model_regions_from_model(
@@ -14509,6 +14639,7 @@ def plan_path_c_direct_fusion_chains_for_model(
             max_kernel_buffers=max_kernel_buffers,
             max_segment_nodes=max_segment_nodes,
             forward_max_segment_nodes=forward_max_segment_nodes,
+            backward_max_segment_nodes=backward_max_segment_nodes,
             registry=registry,
         )
         for region in regions

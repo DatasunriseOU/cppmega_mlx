@@ -990,15 +990,19 @@ def test_plan_path_c_direct_fusion_chains_for_model_uses_dynamic_brick_chain() -
         config=local_gb10_quarter_profile().hybrid_config(),
     )
 
+    # Disable the Metal-only watchdog caps so this test pins the dynamic-brick
+    # discovery + pure greedy direct-buffer segmentation on every host.
     chains = plan_path_c_direct_fusion_chains_for_model(
         model,
         region_prefix="dynamic_model_path_c",
+        forward_max_segment_nodes=None,
+        backward_max_segment_nodes=None,
     )
 
     assert len(chains) == 1
     chain = chains[0]
-    assert chain.status == "blocked"
-    assert chain.reason == "at least one chain segment cannot be expressed as direct buffers"
+    assert chain.status == "ready"
+    assert chain.reason == "all chain segments fit direct-buffer portable Metal limits"
     assert chain.source_region.name == "dynamic_model_path_c_0_2"
     assert any(
         node.op_name.endswith("_bwd") for node in chain.source_region.nodes
@@ -1007,12 +1011,14 @@ def test_plan_path_c_direct_fusion_chains_for_model_uses_dynamic_brick_chain() -
     assert chain.segments[0].node_start == 0
     assert chain.segments[-1].node_end == len(chain.source_region.nodes)
     assert all(segment.physical_abi_policy == "direct_buffers" for segment in chain.segments)
-    blocked_segments = tuple(segment for segment in chain.segments if segment.status != "ok")
-    assert len(blocked_segments) == 1
-    assert tuple(node.op_name for node in blocked_segments[0].region.nodes) == (
-        "mamba3_mimo_bwd",
+    # The mamba3 backward op lands in its own single-op direct-buffer segment.
+    mamba3_bwd_segments = tuple(
+        segment
+        for segment in chain.segments
+        if tuple(node.op_name for node in segment.region.nodes) == ("mamba3_mimo_bwd",)
     )
-    assert "descriptor stage ABI scratch parameter budget exceeded" in blocked_segments[0].reason
+    assert len(mamba3_bwd_segments) == 1
+    assert all(segment.status == "ok" for segment in chain.segments)
     assert all(
         "mamba3_in_proj_weight" not in getattr(
             segment.schedule_target,
@@ -3788,12 +3794,17 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
     )[0]
     region = build_path_c_aot_autograd_region(fwd_region)
 
+    # Pin the PURE greedy buffer-limit splitting (caps disabled): this test
+    # asserts contiguous direct-buffer segmentation + the per-op buffer budget,
+    # independent of the Metal-only watchdog caps (covered separately).
     chain = plan_path_c_direct_fusion_chain_for_region(
         region,
         include_backward=False,
+        forward_max_segment_nodes=None,
+        backward_max_segment_nodes=None,
     )
 
-    assert chain.status == "blocked"
+    assert chain.status == "ready"
     assert len(chain.segments) >= 2
     assert tuple(
         (segment.node_start, segment.node_end)
@@ -3802,17 +3813,15 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
     assert chain.segments[-1].node_end == len(region.nodes)
     for previous, current in zip(chain.segments[:-1], chain.segments[1:], strict=True):
         assert previous.node_end == current.node_start
-    blocked_segments = tuple(segment for segment in chain.segments if segment.status != "ok")
-    assert len(blocked_segments) == 1
-    assert tuple(node.op_name for node in blocked_segments[0].region.nodes) == (
-        "mamba3_mimo_bwd",
+    # The mamba3 backward op binds enough direct buffers that the greedy splitter
+    # places it in its OWN single-op segment under the portable buffer limit.
+    mamba3_bwd_segments = tuple(
+        segment
+        for segment in chain.segments
+        if tuple(node.op_name for node in segment.region.nodes) == ("mamba3_mimo_bwd",)
     )
-    assert "descriptor stage ABI scratch parameter budget exceeded" in blocked_segments[0].reason
+    assert len(mamba3_bwd_segments) == 1
     for segment in chain.segments:
-        if segment.status != "ok":
-            assert segment.schedule_target is None
-            assert segment.plan is None
-            continue
         assert segment.status == "ok"
         assert segment.physical_abi_policy == "direct_buffers"
         assert segment.kernel_parameter_count is not None
@@ -3857,8 +3866,12 @@ def test_direct_fusion_chain_splits_model_route_under_metal_buffer_limit() -> No
     assert abi_shapes["local_gb10_quarter_brick_10_M_state_in"] == (
         mamba3_state_shape
     )
-    assert "local_gb10_quarter_brick_10_M_state_in_grad" not in abi_shapes
-    assert "local_gb10_quarter_brick_10_M_mamba3_h0_grad" not in abi_shapes
+    # The mamba3 backward segment now plans ``ok`` (it lands in its own single-op
+    # direct-buffer segment), so it contributes its reverse-scan state-grad ABI
+    # buffers, shaped like the forward ``state_in``.
+    assert abi_shapes["local_gb10_quarter_brick_10_M_state_in_grad"] == (
+        mamba3_state_shape
+    )
     assert abi_shapes[
         "local_gb10_quarter_brick_11_R_residual_norm_weight"
     ] == (shape_env.hidden_size,)
@@ -3877,12 +3890,20 @@ def test_direct_fusion_chain_keeps_loss_bridge_forward_boundary_separate() -> No
     )[0]
     region = build_path_c_aot_autograd_region(fwd_region)
 
+    # This test pins the PURE greedy planner grouping (buffer-limit splitting +
+    # loss-bridge forward/backward boundary), so disable the Metal-only watchdog
+    # caps (forward newComputePipelineState cap / backward GPU-watchdog cap) that
+    # would otherwise further split forward/backward segments on Metal hosts. The
+    # caps' own splitting is covered separately; here we assert the underlying
+    # greedy fusion + execution-phase boundary is correct on every host.
     chain = plan_path_c_direct_fusion_chain_for_region(
         region,
         include_backward=False,
+        forward_max_segment_nodes=None,
+        backward_max_segment_nodes=None,
     )
 
-    assert chain.status == "blocked"
+    assert chain.status == "ready"
     assert [
         (
             segment.node_start,
@@ -3929,7 +3950,7 @@ def test_direct_fusion_chain_keeps_loss_bridge_forward_boundary_separate() -> No
         ),
         (10, 11, "backward", "ok", ("m2rnn_bwd",)),
         (11, 12, "backward", "ok", ("residual_rmsnorm_bwd",)),
-        (12, 13, "backward", "blocked", ("mamba3_mimo_bwd",)),
+        (12, 13, "backward", "ok", ("mamba3_mimo_bwd",)),
         (13, 14, "backward", "ok", ("entry_rmsnorm_bwd",)),
     ]
     for segment in chain.segments:
