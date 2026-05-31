@@ -1494,6 +1494,100 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
                 fragment_emitter=_emit_mamba3_inter_chunk_recur_source,
             ),
+            # --- Stage 3 BACKWARD chunked descriptors (B2 / B1 / B0) --- #
+            # The analytic transpose of the forward F2/F1/F0 (design §2/§7 Stage 3).
+            # Each is a single-entry GRID kernel; the compile-site interpose
+            # substitutes the real build_*_bwd_metal grid prim when the flag is ON.
+            PathCBrickScheduleDescriptor(
+                op_name="mamba3_chunk_scan_combine_bwd",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "mamba3_chunk_scan_combine_bwd_descriptor",
+                    "mamba3_chunk_scan_combine_bwd_grid_kernel",
+                ),
+                description=(
+                    "Mamba3 chunked SSD scan+combine BACKWARD (B2) brick "
+                    "descriptor; GRID-launched output/Y transpose; delegates to "
+                    "chunk_scan_combine_bwd_metal_prim (dC/dx/dz/dchunk_states/"
+                    "dinp/dA_cumsum_y/dD)"
+                ),
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core:"
+                    "build_chunk_scan_combine_bwd_metal/"
+                    "chunk_scan_combine_bwd_metal_prim"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "B2 scan+combine backward is a grid-launched kernel (own "
+                    "T.Kernel grid) delegating to chunk_scan_combine_bwd_metal_prim "
+                    "— the analytic transpose of the forward F2. Validated vs the "
+                    "MLX backward proto (worst grad 3.68e-4) by "
+                    "scratch/test_b0b1b2_metal_vs_proto.py (Stage 3)"
+                ),
+                supports_backward=False,
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
+                fragment_emitter=_emit_mamba3_chunk_scan_combine_bwd_source,
+            ),
+            PathCBrickScheduleDescriptor(
+                op_name="mamba3_inter_chunk_recur_bwd",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "mamba3_inter_chunk_recur_bwd_descriptor",
+                    "mamba3_inter_chunk_recur_bwd_grid_kernel",
+                ),
+                description=(
+                    "Mamba3 chunked SSD inter-chunk recurrence BACKWARD (B1) brick "
+                    "descriptor; the NEW O(S/C) REVERSE upper-tri combiner; "
+                    "delegates to inter_chunk_recur_bwd_metal_prim (reuses forward "
+                    "prev_states -> dstates/dh0/dA_cumsum_tail; no 8x replay)"
+                ),
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core:"
+                    "build_inter_chunk_recur_bwd_metal/"
+                    "inter_chunk_recur_bwd_metal_prim"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "B1 inter-chunk recurrence backward is the REVERSE O(S/C) "
+                    "upper-tri combiner (own T.Kernel(batch,nheads) grid; the chunk "
+                    "axis is the only serial REVERSE carry) — the adjoint of the "
+                    "forward F1 lower-tri recurrence. REUSES the forward-"
+                    "materialized prev_states (the 8x checkpoint-replay elimination, "
+                    "design §3/§6). Validated by scratch/test_b0b1b2_metal_vs_proto.py"
+                ),
+                supports_backward=False,
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
+                fragment_emitter=_emit_mamba3_inter_chunk_recur_bwd_source,
+            ),
+            PathCBrickScheduleDescriptor(
+                op_name="mamba3_chunk_precompute_bwd",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "mamba3_chunk_precompute_bwd_descriptor",
+                    "mamba3_chunk_precompute_bwd_grid_kernel",
+                ),
+                description=(
+                    "Mamba3 chunked SSD precompute BACKWARD (B0) brick descriptor; "
+                    "GRID-launched precompute transpose; delegates to "
+                    "chunk_precompute_bwd_metal_prim (decay_states transpose + dinp "
+                    "assembly + cumsum/segsum VJP -> dx/dB/dlog_decay/ddt)"
+                ),
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core:"
+                    "build_chunk_precompute_bwd_metal/"
+                    "chunk_precompute_bwd_metal_prim"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "B0 precompute backward is a grid-launched kernel (own T.Kernel "
+                    "grid) delegating to chunk_precompute_bwd_metal_prim — the "
+                    "transpose of the forward F0 precompute, assembling the final "
+                    "input grads. Validated by scratch/test_b0b1b2_metal_vs_proto.py"
+                ),
+                supports_backward=False,
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
+                fragment_emitter=_emit_mamba3_chunk_precompute_bwd_source,
+            ),
             PathCBrickScheduleDescriptor(
                 op_name="mamba3_mimo_bwd",
                 implementation_status="descriptor_codegen_ready",
@@ -6588,9 +6682,16 @@ def mamba3_chunked_forward_scan_grid(
 # ``CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN`` flag is ON.
 _MAMBA3_CHUNKED_GRID_DELEGATION_OPS = frozenset(
     {
+        # forward F0/F1/F2 (Stage 2)
         "mamba3_chunk_precompute",
         "mamba3_inter_chunk_recur",
         "mamba3_chunk_scan_combine",
+        # backward B0/B1/B2 (Stage 3) — the analytic transpose of F0/F1/F2.
+        # Same builder ABI (build_*_metal / positional dims); the interpose
+        # resolves them identically (RULE #1: one delegation path each).
+        "mamba3_chunk_precompute_bwd",
+        "mamba3_inter_chunk_recur_bwd",
+        "mamba3_chunk_scan_combine_bwd",
     }
 )
 
@@ -13215,6 +13316,98 @@ def _emit_mamba3_inter_chunk_recur_source(
             "cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core."
             "build_inter_chunk_recur_metal (O(S/C) inter-chunk recurrence -> "
             "prev_states/final_state handoff buffers, fp32)",
+            f"{marker}[0] = 0.0",
+        ),
+    )
+
+
+def _emit_mamba3_chunk_scan_combine_bwd_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Fragment emitter for the Path-C B2 ``mamba3_chunk_scan_combine_bwd`` segment.
+
+    Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2 (B2 row) / §7 Stage 3.
+
+    B2 is the analytic TRANSPOSE of the forward F2 scan+combine (output/gate +
+    Y_diag + Y_off transpose). Its kernel is the GRID-launched core
+    ``chunk_scan_combine_bwd_metal_prim`` (own ``T.Kernel(batch*nchunks, nheads)``
+    grid). Real codegen is the single delegation
+    ``mamba3_chunked_backward_core.build_chunk_scan_combine_bwd_metal`` — validated
+    vs the MLX backward proto (worst grad 3.68e-4) by
+    ``scratch/test_b0b1b2_metal_vs_proto.py``. This marker only needs to RESOLVE
+    via ``select``; the live interpose substitutes the real grid kernel when the
+    flag is ON. RULE #1: no silent fallback — one delegation path.
+    """
+    marker = _scratch_name(node, "mamba3_chunk_scan_combine_bwd_shadow")
+    return _ScheduleNodeFragment(
+        allocations=(f"{marker} = T.alloc_local((1,), \"float32\")",),
+        statements=(
+            "# B2 mamba3_chunk_scan_combine_bwd: delegates to "
+            "cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core."
+            "build_chunk_scan_combine_bwd_metal (grid output/Y transpose -> "
+            "dC/dx/dz/dchunk_states/dinp/dA_cumsum_y/dD)",
+            f"{marker}[0] = 0.0",
+        ),
+    )
+
+
+def _emit_mamba3_chunk_precompute_bwd_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Fragment emitter for the Path-C B0 ``mamba3_chunk_precompute_bwd`` segment.
+
+    Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2 (B0 row) / §7 Stage 3.
+
+    B0 is the transpose of the forward F0 precompute (decay_states transpose +
+    dinp assembly + cumsum/segsum VJP). Real codegen delegation
+    ``mamba3_chunked_backward_core.build_chunk_precompute_bwd_metal`` -> the final
+    input grads ``dx/dB/dlog_decay/ddt``. This marker only needs to RESOLVE via
+    ``select``; the live interpose substitutes the real grid kernel when the flag
+    is ON. RULE #1: no silent fallback — one delegation path.
+    """
+    marker = _scratch_name(node, "mamba3_chunk_precompute_bwd_shadow")
+    return _ScheduleNodeFragment(
+        allocations=(f"{marker} = T.alloc_local((1,), \"float32\")",),
+        statements=(
+            "# B0 mamba3_chunk_precompute_bwd: delegates to "
+            "cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core."
+            "build_chunk_precompute_bwd_metal (grid precompute transpose -> "
+            "dx/dB/dlog_decay/ddt input grads)",
+            f"{marker}[0] = 0.0",
+        ),
+    )
+
+
+def _emit_mamba3_inter_chunk_recur_bwd_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Fragment emitter for the Path-C B1 ``mamba3_inter_chunk_recur_bwd`` segment.
+
+    Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2 (B1 row) / §7 Stage 3.
+
+    B1 is the ONE genuinely new kernel: the REVERSE O(S/C) inter-chunk combiner
+    (upper-tri ``decay_chunk`` contraction — the adjoint of the forward F1 lower-tri
+    recurrence). It REUSES the forward-materialized ``prev_states`` boundary states
+    (the 8x checkpoint-replay elimination, design §3/§6). Real codegen delegation
+    ``mamba3_chunked_backward_core.build_inter_chunk_recur_bwd_metal`` ->
+    ``dstates/dh0/dA_cumsum_tail``. This marker only needs to RESOLVE via
+    ``select``; the live interpose substitutes the real grid kernel when the flag
+    is ON. RULE #1: no silent fallback — one delegation path.
+    """
+    marker = _scratch_name(node, "mamba3_inter_chunk_recur_bwd_shadow")
+    return _ScheduleNodeFragment(
+        allocations=(f"{marker} = T.alloc_local((1,), \"float32\")",),
+        statements=(
+            "# B1 mamba3_inter_chunk_recur_bwd: delegates to "
+            "cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core."
+            "build_inter_chunk_recur_bwd_metal (REVERSE O(S/C) upper-tri combiner "
+            "-> dstates/dh0/dA_cumsum_tail; reuses forward prev_states)",
             f"{marker}[0] = 0.0",
         ),
     )
