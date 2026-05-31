@@ -6497,6 +6497,65 @@ def _path_c_call_cuda_artifact_with_mlx_bridge(
     return result
 
 
+def _path_c_segment_time_chunk_launches(prim_func: Any) -> tuple[tuple[int, int], ...]:
+    """Return ``(chunk_index, subchunk_index)`` launch pairs for a segment.
+
+    A direct-chain segment whose compiled prim_func declares
+    ``_cppmega_path_c_max_rows_per_launch`` AND
+    ``_cppmega_path_c_row_dispatch_mode == 'launcher_chunks'`` is time-chunked:
+    its reverse-time recurrent scan body emits one time step per ``row`` and
+    the runtime selects which rows a launch processes via the
+    ``path_c_row_chunk_index`` / ``path_c_row_subchunk_index`` scalar params.
+    The kernel maps ``(chunk_index, subchunk_index)`` to a row window and walks
+    only those rows, carrying the reverse scan state (dh<->h0_grad,
+    angle_grad<->mamba3_angle_grad_state) across launches through caller-owned
+    buffers; ``path_c_first_row_launch`` (1 only at chunk 0 / subchunk 0) zeroes
+    the owner grads exactly once.
+
+    Iteration order MIRRORS the eager replay driver
+    (cppmega_mlx.training.path_c_fused_replay.replay_launch_scalar_params):
+    ``for chunk in range(row_chunk_count): for subchunk in
+    range(row_subchunk_count)``. Because the reverse-scan body computes
+    ``time_idx = (S - 1) - row``, the first launch (chunk 0, subchunk 0, row 0)
+    correctly starts the reverse scan at the LAST time step (S-1), so forward
+    chunk/subchunk order walks time S-1 -> 0 exactly as the monolithic scan did.
+
+    Returns an empty tuple when the segment is NOT launcher-chunked (grid_chunks
+    or non-row-phased) -- the caller then keeps the single-launch path, which is
+    the correct clear path for those segments (NOT a fallback).
+    """
+
+    max_rows_per_launch = getattr(
+        prim_func, "_cppmega_path_c_max_rows_per_launch", None
+    )
+    row_dispatch_mode = getattr(prim_func, "_cppmega_path_c_row_dispatch_mode", None)
+    row_chunk_index_param = getattr(
+        prim_func, "_cppmega_path_c_row_chunk_index_param", None
+    )
+    if (
+        max_rows_per_launch is None
+        or str(row_dispatch_mode) != "launcher_chunks"
+        or not row_chunk_index_param
+    ):
+        return ()
+    row_chunk_count = getattr(prim_func, "_cppmega_path_c_row_chunk_count", None)
+    row_subchunk_count = getattr(
+        prim_func, "_cppmega_path_c_row_subchunk_count", None
+    )
+    if row_chunk_count is None:
+        raise ValueError(
+            "launcher-chunked direct-chain segment is missing "
+            "_cppmega_path_c_row_chunk_count"
+        )
+    chunk_count = max(1, int(row_chunk_count))
+    subchunk_count = max(1, int(row_subchunk_count or 1))
+    return tuple(
+        (chunk_index, subchunk_index)
+        for chunk_index in range(chunk_count)
+        for subchunk_index in range(subchunk_count)
+    )
+
+
 def run_path_c_direct_fusion_chain_route(
     *,
     chain: Any,
@@ -6626,6 +6685,11 @@ def run_path_c_direct_fusion_chain_route(
         # the kernel's in-place results back into the owning bank buffers
         # (Metal is zero-copy so it does not need this).
         kernel_arg_buffer_names: dict[int, tuple[str, tuple[int, ...] | None]] = {}
+        # Record the positional index of every scalar param the time-chunk
+        # driver overrides per launch. The launcher-chunk index params sit at a
+        # SEGMENT-DEPENDENT position (they are interleaved with buffer params in
+        # kernel_param_order), so recompute them per segment -- never hardcode.
+        scalar_param_arg_positions: dict[str, int] = {}
         for name in kernel_param_order:
             if name in buffers:
                 kernel_arg_buffer_names[len(kernel_call_args)] = (
@@ -6642,6 +6706,7 @@ def run_path_c_direct_fusion_chain_route(
             elif name == gate_param:
                 kernel_call_args.append(run_backward_value)
             elif name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS:
+                scalar_param_arg_positions[str(name)] = len(kernel_call_args)
                 kernel_call_args.append(PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS[name])
             else:
                 raise ValueError(
@@ -6669,6 +6734,95 @@ def run_path_c_direct_fusion_chain_route(
                 mx_module=mx_module,
             )
         else:
+            # --- Intra-segment TIME-CHUNKING for the launcher-chunked segment ----
+            # The mamba3 mimo BACKWARD segment is a reverse-time recurrent scan
+            # over the WHOLE sequence (S time steps). Encoded as ONE Metal command
+            # buffer it runs ~7s of GPU time -> macOS GPU watchdog kill
+            # (kIOGPUCommandBufferCallbackErrorTimeout). Its compiled kernel
+            # declares path_c_row_chunk_index / path_c_row_subchunk_index and
+            # emits a per-row reverse scan body, so the runtime splits the scan
+            # into K command buffers over TIME: one artifact() call per
+            # (chunk, subchunk), each processing <= rows_per_kernel_launch time
+            # steps, with eval()+synchronize() committing each as its own command
+            # buffer. The reverse adjoint scan state (dh<->h0_grad,
+            # angle_grad<->mamba3_angle_grad_state) carries across launches via the
+            # caller-owned buffers (already accumulated with relaxed atomic_add),
+            # and path_c_first_row_launch zeroes the owner grads exactly once on
+            # the very first (chunk 0, subchunk 0) launch.
+            #
+            # Segments that are NOT launcher-chunked (every forward segment plus
+            # the non-mamba3 backward segments stay grid_chunks) take the single
+            # artifact() call below -- that is the correct clear path for them, not
+            # a fallback.
+            time_chunk_launches = _path_c_segment_time_chunk_launches(prim_func)
+            chunk_param = str(
+                getattr(prim_func, "_cppmega_path_c_row_chunk_index_param", "")
+                or ""
+            )
+            subchunk_param = str(
+                getattr(prim_func, "_cppmega_path_c_row_subchunk_index_param", "")
+                or ""
+            )
+            if time_chunk_launches:
+                # The launcher index params MUST be bound as kernel args for the
+                # split to select work; if the compiled kernel declares
+                # launcher-chunk dispatch but the args list lacks those scalar
+                # slots, the split would silently run the same window K times.
+                # RULE #1: fail loud rather than emit wrong grads.
+                if (
+                    chunk_param not in scalar_param_arg_positions
+                    or subchunk_param not in scalar_param_arg_positions
+                ):
+                    raise ValueError(
+                        f"direct-chain segment {segment.index} declares "
+                        "launcher-chunk dispatch but kernel args are missing the "
+                        f"{chunk_param!r}/{subchunk_param!r} scalar slots "
+                        f"(have {sorted(scalar_param_arg_positions)})"
+                    )
+                chunk_pos = scalar_param_arg_positions[chunk_param]
+                subchunk_pos = scalar_param_arg_positions[subchunk_param]
+                result = None
+                for chunk_index, subchunk_index in time_chunk_launches:
+                    launch_args = list(arrays)
+                    launch_args[chunk_pos] = int(chunk_index)
+                    launch_args[subchunk_pos] = int(subchunk_index)
+                    result = artifact(*launch_args)
+                    # Commit THIS launch as its own Metal command buffer so it
+                    # holds only <= rows_per_kernel_launch reverse-scan time steps
+                    # and stays under the watchdog window. eval()+synchronize() are
+                    # MLX's public scheduler entry points (commit on the scheduler
+                    # outer loop), so the cross-launch state handoff through the
+                    # caller-owned buffers is fully materialized before the next
+                    # launch reads it.
+                    mx_module.eval(*buffer_arrays)
+                    if _path_c_per_segment_command_buffer_commit_enabled():
+                        try:
+                            mx_module.synchronize()
+                        except Exception as exc:  # pragma: no cover
+                            raise RuntimeError(
+                                "direct-chain time-chunk command-buffer commit "
+                                f"failed at segment {int(segment.index)} "
+                                f"launch (chunk={chunk_index}, "
+                                f"subchunk={subchunk_index}) "
+                                f"(phase={execution_phase}, "
+                                f"region={segment.region.name}): "
+                                f"{type(exc).__name__}: {exc}"
+                            ) from exc
+                segment_results.append(
+                    {
+                        "index": int(segment.index),
+                        "status": "ok",
+                        "region_name": segment.region.name,
+                        "execution_phase": execution_phase,
+                        "schedule_id": target.schedule_id,
+                        "kernel_arg_count": len(arrays),
+                        "kernel_args": list(kernel_param_order),
+                        "elapsed_s": time.perf_counter() - segment_started,
+                        "result_type": type(result).__name__,
+                        "time_chunk_launch_count": len(time_chunk_launches),
+                    }
+                )
+                continue
             result = artifact(*arrays)
             # --- Per-stage Metal command-buffer commit boundary -----------------
             # The fused direct-chain encodes every segment's TVM-FFI kernel into

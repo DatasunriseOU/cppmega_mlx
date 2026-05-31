@@ -14232,6 +14232,37 @@ def plan_path_c_direct_fusion_chain_for_region(
                 candidate_region,
                 DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
             )
+            # Intra-segment TIME-CHUNKING for the mamba3 mimo BACKWARD segment.
+            #
+            # The mamba3 reverse-time recurrent scan is a single
+            # `for time_rev in T.serial(0, S)` over the whole sequence inside ONE
+            # threadgroup. Under the default grid_chunks dispatch that is ONE Metal
+            # command buffer spanning all S time steps -> ~7s GPU time -> macOS GPU
+            # watchdog kill (kIOGPUCommandBufferCallbackErrorTimeout).
+            #
+            # Switching JUST this segment to launcher_chunks makes its compiled
+            # kernel declare path_c_row_chunk_index / path_c_row_subchunk_index and
+            # emit the per-row reverse scan body
+            # (`for time_rev in T.serial(row, row + 1)`), so the runtime can drive
+            # the reverse scan as K separate command buffers over TIME, carrying the
+            # reverse adjoint scan state (dh<->h0_grad, angle_grad<->
+            # mamba3_angle_grad_state) across launches via caller-owned buffers.
+            # Every other segment (forward + non-mamba3-bwd) keeps grid_chunks --
+            # only the long reverse scan needs the watchdog-safe launcher split.
+            if (
+                execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+                and direct_target.max_rows_per_launch is not None
+                and any(
+                    _path_c_descriptor_stage_node_op_name(node) == "mamba3_mimo_bwd"
+                    for node in candidate_region.nodes
+                )
+            ):
+                direct_target = _target_with_max_rows_per_launch(
+                    direct_target,
+                    candidate_region,
+                    DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+                    DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
+                )
             try:
                 parameter_count = _kernel_parameter_count_for_target(
                     candidate_region,
@@ -14483,7 +14514,19 @@ def _kernel_parameter_count_for_target(
     region: PathCFusionRegion,
     target: PathCFusionScheduleTarget,
 ) -> int:
-    return len(tuple(target.schedule_template(region).params))
+    # The portable limit (DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT) is Metal's
+    # buffer-argument binding cap, so count only params that actually bind a
+    # device buffer (present in the prim_func ``buffer_map``). Scalar params --
+    # the backward gate plus the launcher time-chunk index params
+    # (path_c_row_chunk_index / path_c_row_subchunk_index /
+    # path_c_backward_stage_index) -- are passed by value and consume NO buffer
+    # slot, so they must not count against the buffer limit. (Counting them
+    # spuriously blocked the launcher-chunked mamba3 backward at 34 "buffers"
+    # when it really binds only 30.)
+    prim_func = target.schedule_template(region)
+    params = tuple(getattr(prim_func, "params", ()))
+    buffer_map = getattr(prim_func, "buffer_map", {}) or {}
+    return sum(1 for param in params if buffer_map.get(param) is not None)
 
 
 def _attested_schedule_template_for_target(

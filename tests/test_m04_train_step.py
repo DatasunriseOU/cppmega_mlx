@@ -3624,10 +3624,32 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
         "ok",
         "ok",
     ]
+    # The mamba3 mimo BACKWARD segment is TIME-CHUNKED (launcher_chunks): its
+    # kernel additionally declares the path_c_row_chunk_index /
+    # path_c_row_subchunk_index / path_c_backward_stage_index scalar params so the
+    # runtime can split the reverse-time scan into watchdog-safe per-launch
+    # command buffers. That segment therefore carries 3 extra scalar args beyond
+    # the backward gate; every other segment keeps grid_chunks dispatch.
+    time_chunked_segment_indices = {
+        segment["index"]
+        for segment in payload["segments"]
+        if segment.get("time_chunk_launch_count")
+    }
+    assert time_chunked_segment_indices == {5}, time_chunked_segment_indices
+    mamba3_bwd_launch_count = next(
+        segment["time_chunk_launch_count"]
+        for segment in payload["segments"]
+        if segment["index"] == 5
+    )
+    assert mamba3_bwd_launch_count > 1
     assert [segment["kernel_arg_count"] for segment in payload["segments"]] == [
         len(rb_segment["required_logical_buffers"])
         # backward segments additionally pass the path_c_run_backward gate scalar
         + (1 if payload_segment["execution_phase"] == "backward" else 0)
+        # the time-chunked mamba3 backward also binds the launcher-chunk index
+        # scalars (path_c_row_chunk_index + path_c_row_subchunk_index +
+        # path_c_backward_stage_index) so the runtime can select each launch.
+        + (3 if payload_segment["index"] in time_chunked_segment_indices else 0)
         for payload_segment, rb_segment in zip(
             payload["segments"],
             route["path_c_fusion"]["direct_chained_fusion"]["runtime_binding"][
