@@ -209,6 +209,43 @@ DESCRIPTOR_EXECUTION_STAGES = frozenset(
         DESCRIPTOR_EXECUTION_STAGE_BACKWARD,
     }
 )
+# Metal-only FORWARD fused-segment op-count cap.
+#
+# The greedy direct-chain planner fuses each forward segment up to the portable
+# kernel-buffer limit, producing the 4-op forward mega-kernel
+# ``m2rnn + residual_rmsnorm + attention_qkv_projection + sparse_mla_fp8_apply``
+# (region ``..._chain_3_7``). Its generated MSL device kernel is ~176-199 KB /
+# ~1600-2200 lines (dominated by attention_qkv_projection + sparse_mla_fp8_apply,
+# a sparse top-k FP8 attention with RoPE + softmax). TileLang codegen + metallib
+# build SUCCEED, but at runtime Metal's MTLCompilerService crashes the final
+# AIR->GPU-ISA pipeline-state stage inside ``newComputePipelineState``:
+#   InternalError: Check failed: (state != nullptr): ...
+#   Compilation failed due to an interrupted connection:
+#   XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries.
+# Measured (full local_gb10_quarter, depth=13 hidden=3584 max_seq=4096):
+#   chain_0_3 (3 light fwd ops)  ~46 KB  -> pipeline OK
+#   chain_7_10 (3 bwd ops)       ~116 KB -> pipeline OK
+#   chain_3_7 (4 heavy fwd ops)  ~176 KB -> pipeline CRASH (newComputePipelineState)
+# Capping forward segments at 2 ops splits chain_3_7 into chain_3_5 and chain_5_7,
+# each well under the crashing size. CUDA's compiler has no such pipeline-state
+# limit, so this cap is gated to Metal only (CUDA keeps greedy forward fusion).
+METAL_FORWARD_MAX_SEGMENT_NODES = 2
+
+
+class _ResolveFromTarget:
+    """Sentinel: resolve a planner default from the active lowering target.
+
+    A distinct type (not ``None``, which is a valid "no cap" value) so callers
+    can explicitly request the target-resolved default or override it.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "<resolve-from-target>"
+
+
+_RESOLVE_FORWARD_CAP_FROM_TARGET = _ResolveFromTarget()
 _GENERIC_MODEL_REAL_ABI_INPUT_SUFFIXES = (
     "residual_norm_weight",
     # Block A: the per-brick entry RMSNorm weight emitted by the model-
@@ -14190,6 +14227,9 @@ def plan_path_c_direct_fusion_chain_for_region(
     include_backward: bool = True,
     max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
     max_segment_nodes: int | None = None,
+    forward_max_segment_nodes: int | None | _ResolveFromTarget = (
+        _RESOLVE_FORWARD_CAP_FROM_TARGET
+    ),
     registry: PathCFusionScheduleRegistry | None = None,
 ) -> PathCFusionScheduleChainPlan:
     """Greedily split a Path C region into direct-buffer fused segments.
@@ -14198,6 +14238,22 @@ def plan_path_c_direct_fusion_chain_for_region(
     would exceed Metal's portable buffer slot limit.  It never falls back to
     dtype-bank packing; segments that cannot be expressed with direct buffers
     under ``max_kernel_buffers`` are reported as blocked.
+
+    ``forward_max_segment_nodes`` is a Metal-only cap on the number of ops a
+    FORWARD-phase fused segment may contain. The default
+    (``_RESOLVE_FORWARD_CAP_FROM_TARGET``) is resolved at call time from the
+    active lowering target: on Metal it is
+    :data:`METAL_FORWARD_MAX_SEGMENT_NODES` = 2 (so the heavy 4-op forward
+    segment ``m2rnn + residual_rmsnorm + attention_qkv_projection +
+    sparse_mla_fp8_apply`` — whose ~176-199 KB MSL crashes Metal's
+    ``MTLCompilerService`` at ``newComputePipelineState`` with
+    ``XPC_ERROR_CONNECTION_INTERRUPTED`` — splits into two smaller
+    pipeline-safe kernels); on CUDA it is ``None`` (no cap, the CUDA compiler
+    has no such pipeline-state size limit, so CUDA fusion is unchanged). The
+    cap applies ONLY to forward segments; backward segments keep greedy fusion
+    up to the buffer limit (their reverse-time watchdog split is handled
+    separately via launcher_chunks). Pass an explicit value to override; pass
+    ``None`` to disable the cap entirely.
     """
 
     if not isinstance(region, PathCFusionRegion):
@@ -14206,6 +14262,23 @@ def plan_path_c_direct_fusion_chain_for_region(
         raise ValueError("max_kernel_buffers must be positive")
     if max_segment_nodes is not None and max_segment_nodes <= 0:
         raise ValueError("max_segment_nodes must be positive when provided")
+    if isinstance(forward_max_segment_nodes, _ResolveFromTarget):
+        # Resolve the forward fusion cap from the active lowering target:
+        # Metal needs the split (MTLCompilerService crashes at
+        # newComputePipelineState on the 4-op forward mega-kernel); CUDA has no
+        # such limit and stays uncapped (greedy) for max fusion.
+        forward_max_segment_nodes = (
+            METAL_FORWARD_MAX_SEGMENT_NODES
+            if _path_c_default_target() == "metal"
+            else None
+        )
+    if (
+        forward_max_segment_nodes is not None
+        and forward_max_segment_nodes <= 0
+    ):
+        raise ValueError(
+            "forward_max_segment_nodes must be positive when provided"
+        )
     working_region = (
         build_path_c_aot_autograd_region(region)
         if include_backward
@@ -14242,6 +14315,24 @@ def plan_path_c_direct_fusion_chain_for_region(
                 first_failure = (
                     "direct-chain segment would cross the forward/backward "
                     "execution boundary required by the loss cotangent bridge"
+                )
+                break
+            # FORWARD-only Metal pipeline-state cap. Forward fused segments
+            # larger than ``forward_max_segment_nodes`` ops generate MSL whose
+            # ~176-199 KB device kernel crashes Metal's MTLCompilerService at
+            # newComputePipelineState (XPC_ERROR_CONNECTION_INTERRUPTED). Stop
+            # extending the forward segment here so it splits into smaller
+            # pipeline-safe kernels. Backward segments are exempt (they keep
+            # greedy fusion up to the buffer limit).
+            if (
+                execution_phase == DESCRIPTOR_EXECUTION_STAGE_FORWARD
+                and forward_max_segment_nodes is not None
+                and end - start > forward_max_segment_nodes
+            ):
+                first_failure = (
+                    f"forward direct-buffer segment reached "
+                    f"forward_max_segment_nodes={forward_max_segment_nodes} "
+                    f"(Metal newComputePipelineState size cap)"
                 )
                 break
             target = selector.select(candidate_region)
@@ -14386,6 +14477,9 @@ def plan_path_c_direct_fusion_chains_for_model(
     min_route_bricks: int = 2,
     max_kernel_buffers: int = DESCRIPTOR_PORTABLE_KERNEL_BUFFER_LIMIT,
     max_segment_nodes: int | None = None,
+    forward_max_segment_nodes: int | None | _ResolveFromTarget = (
+        _RESOLVE_FORWARD_CAP_FROM_TARGET
+    ),
     registry: PathCFusionScheduleRegistry | None = None,
     sequence_length: int | None = None,
 ) -> tuple[PathCFusionScheduleChainPlan, ...]:
@@ -14395,6 +14489,10 @@ def plan_path_c_direct_fusion_chains_for_model(
     ``plan_path_c_fusion_schedules_for_model``: discover regions from the
     model's brick graph first, then split each discovered region into generic
     direct-buffer segments.  It does not consult named acceptance fixtures.
+
+    ``forward_max_segment_nodes`` is forwarded to
+    :func:`plan_path_c_direct_fusion_chain_for_region` (Metal-only forward
+    fusion cap; see that function's docstring).
     """
 
     regions = build_path_c_model_regions_from_model(
@@ -14410,6 +14508,7 @@ def plan_path_c_direct_fusion_chains_for_model(
             include_backward=include_backward,
             max_kernel_buffers=max_kernel_buffers,
             max_segment_nodes=max_segment_nodes,
+            forward_max_segment_nodes=forward_max_segment_nodes,
             registry=registry,
         )
         for region in regions

@@ -2545,11 +2545,18 @@ def test_fp8_path_c_training_route_keeps_split_when_direct_chain_is_standalone(
     assert direct_chain["standalone_dispatch_available"] is True
     assert direct_chain["training_critical_path"] is False
     assert direct_chain["training_runtime_available"] is False
-    assert direct_chain["runtime_binding"]["segment_count"] == 7
+    # Metal forward fusion cap (METAL_FORWARD_MAX_SEGMENT_NODES = 2) splits the
+    # 4-op forward mega-kernel into 4 forward segments (the ~176-199 KB MSL of
+    # the fused m2rnn+residual_rmsnorm+attention_qkv_projection+
+    # sparse_mla_fp8_apply kernel crashes Metal's MTLCompilerService at
+    # newComputePipelineState). Backward (5 segments) is unchanged.
+    assert direct_chain["runtime_binding"]["segment_count"] == 9
     assert [
         segment["execution_phase"]
         for segment in direct_chain["runtime_binding"]["segments"]
     ] == [
+        "forward",
+        "forward",
         "forward",
         "forward",
         "backward",
@@ -2953,7 +2960,12 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
             required_loss_cotangent_buffers: Sequence[str],
             chain: Any,
         ) -> dict[str, Any]:
-            assert events == ["segment:0:forward", "segment:1:forward"]
+            assert events == [
+                "segment:0:forward",
+                "segment:1:forward",
+                "segment:2:forward",
+                "segment:3:forward",
+            ]
             events.append("loss_cotangent_bridge")
             return super().__call__(
                 model=model,
@@ -2983,15 +2995,21 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
 
     runtime.value_and_grad(model, {}, forbidden_loss_and_grad)
 
+    # Metal forward fusion cap -> 4 forward segments (0-3) execute, then the loss
+    # cotangent bridge fires at the forward/backward boundary, then the 5 backward
+    # segments (4-8) run. The bridge boundary is unchanged; only the forward
+    # segment count grew (the 4-op forward mega-kernel is split into 4 segments).
     assert events == [
         "segment:0:forward",
         "segment:1:forward",
+        "segment:2:forward",
+        "segment:3:forward",
         "loss_cotangent_bridge",
-        "segment:2:backward",
-        "segment:3:backward",
         "segment:4:backward",
         "segment:5:backward",
         "segment:6:backward",
+        "segment:7:backward",
+        "segment:8:backward",
     ]
 
 
@@ -3605,8 +3623,19 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
 
     assert payload["status"] == "ok"
     assert payload["runtime_uses_direct_fusion_chain"] is True
-    assert payload["segment_count"] == 7
+    # On Metal the FORWARD phase is split by the forward fusion cap
+    # (METAL_FORWARD_MAX_SEGMENT_NODES = 2): the greedy 4-op forward
+    # mega-kernel ``m2rnn + residual_rmsnorm + attention_qkv_projection +
+    # sparse_mla_fp8_apply`` (region ..._chain_3_7) generates ~176-199 KB MSL
+    # that crashes Metal's MTLCompilerService at newComputePipelineState
+    # (XPC_ERROR_CONNECTION_INTERRUPTED), so forward fuses at most 2 ops per
+    # segment -> 4 forward segments. The 5 backward segments are unchanged
+    # (the cap is forward-only). CUDA keeps the greedy 2-forward / 7-segment
+    # grouping (no pipeline-state size limit).
+    assert payload["segment_count"] == 9
     assert [segment["execution_phase"] for segment in payload["segments"]] == [
+        "forward",
+        "forward",
         "forward",
         "forward",
         "backward",
@@ -3623,10 +3652,12 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
         "ok",
         "ok",
         "ok",
+        "ok",
+        "ok",
     ]
     # The recurrent reverse-time-scan BACKWARD segments are TIME-CHUNKED
-    # (launcher_chunks): both the m2rnn_bwd (segment 3) and mamba3_mimo_bwd
-    # (segment 5) reverse scans declare the path_c_row_chunk_index /
+    # (launcher_chunks): both the m2rnn_bwd (segment 5) and mamba3_mimo_bwd
+    # (segment 7) reverse scans declare the path_c_row_chunk_index /
     # path_c_row_subchunk_index / path_c_backward_stage_index scalar params so the
     # runtime can split each reverse-time scan into watchdog-safe per-launch
     # command buffers. Those segments therefore carry 3 extra scalar args beyond
@@ -3636,12 +3667,16 @@ def test_path_c_direct_chain_runtime_executor_runs_native_segments(
     # m2rnn_bwd was added to the time-chunked set because in the reverse chain it
     # runs BEFORE mamba3 and is an equally long reverse-time scan; under
     # grid_chunks it tripped the macOS GPU watchdog before mamba3 was reached.
+    #
+    # The time-chunked indices shifted from {3, 5} to {5, 7} because the Metal
+    # forward fusion cap added 2 extra forward segments ahead of the backward
+    # phase (see the segment_count assertion above).
     time_chunked_segment_indices = {
         segment["index"]
         for segment in payload["segments"]
         if segment.get("time_chunk_launch_count")
     }
-    assert time_chunked_segment_indices == {3, 5}, time_chunked_segment_indices
+    assert time_chunked_segment_indices == {5, 7}, time_chunked_segment_indices
     for time_chunked_index in sorted(time_chunked_segment_indices):
         recurrent_bwd_launch_count = next(
             segment["time_chunk_launch_count"]
@@ -5504,9 +5539,13 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    assert audit["required_logical_buffer_count"] == 94
+    # Metal forward fusion cap splits sparse_mla_fp8_apply into its own segment,
+    # so the int32 sparse-index scratch (path_c_int32_scratch_bank) is now fully
+    # internal to that kernel instead of a coalesced cross-segment scratch bank:
+    # one fewer runtime_activation_or_grad logical buffer (94 -> 93, 62 -> 61).
+    assert audit["required_logical_buffer_count"] == 93
     assert audit["model_parameter_or_constant_count"] == 26
-    assert audit["runtime_activation_or_grad_count"] == 62
+    assert audit["runtime_activation_or_grad_count"] == 61
     assert audit["backward_gradient_count"] == 39
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
@@ -5519,7 +5558,10 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert audit["backward_gradient_parameter_alias_coverage_count"] == 28
     assert audit["backward_gradient_uncovered_count"] == 11
     assert audit["profile_brick_names_attached"] is True
-    assert audit["forward_activation_or_prepared_count"] == 23
+    # 22 (was 23): the int32 sparse-index scratch bank, previously a coalesced
+    # cross-segment forward/prepared scratch buffer, is now kernel-internal to
+    # the standalone sparse_mla_fp8_apply segment after the Metal forward split.
+    assert audit["forward_activation_or_prepared_count"] == 22
     assert audit["runtime_state_count"] == 6
     pre_step_plan = route["path_c_fusion"]["direct_chained_fusion"][
         "pre_step_owner_plan"
@@ -5528,11 +5570,11 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert pre_step_plan["training_critical_path_ready"] is False
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
     assert pre_step_plan["model_parameter_or_constant_missing_count"] == 0
-    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 23
-    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 23
+    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 22
+    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 22
     assert pre_step_plan["runtime_state_count"] == 6
     assert pre_step_plan["runtime_state_missing_count"] == 6
-    assert pre_step_plan["pre_step_runtime_missing_count"] == 29
+    assert pre_step_plan["pre_step_runtime_missing_count"] == 28
     assert pre_step_plan["backward_workspace_gradient_count"] == 39
     assert (
         "local_gb10_quarter_brick_10_M_hidden"
@@ -5554,7 +5596,9 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     )
     assert runtime_binding["provided_logical_buffer_count"] == 26
     assert runtime_binding["shape_mismatch_buffers"] == []
-    assert runtime_binding["missing_logical_buffer_count"] == 66
+    # 65 (was 66): the int32 sparse-index scratch bank is no longer a
+    # cross-segment logical buffer after the Metal forward split.
+    assert runtime_binding["missing_logical_buffer_count"] == 65
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
@@ -5606,7 +5650,9 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     )
 
     assert owner.owner_name == "local_gb10_quarter.path_c_pre_step_runtime_buffers"
-    assert len(owner.buffers) == 94
+    # 93 (was 94): the Metal forward split makes the int32 sparse-index scratch
+    # bank kernel-internal, so it is no longer a cross-segment logical buffer.
+    assert len(owner.buffers) == 93
     assert owner.hidden_packing_performed is False
     assert owner.no_hidden_allocation_policy is True
     assert owner.buffers[
@@ -5618,13 +5664,15 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     ] is parameters["layers.10.block.conv_weight"]
     assert binding["status"] == "ok"
     assert binding["runtime_uses_direct_fusion_chain"] is True
-    assert binding["provided_logical_buffer_count"] == 92
+    assert binding["provided_logical_buffer_count"] == 91
     assert binding["missing_logical_buffer_count"] == 0
     assert binding["unexpected_logical_buffer_count"] == 0
     assert pre_step_plan["status"] == "pre_step_runtime_owner_ready"
     assert pre_step_plan["training_critical_path_ready"] is True
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
-    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 23
+    # 22 (was 23): int32 sparse-index scratch bank is kernel-internal after the
+    # Metal forward split (see the model_derived_regions / capture-owners tests).
+    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 22
     assert pre_step_plan["runtime_state_available_count"] == 6
     assert pre_step_plan["backward_workspace_gradient_available_count"] == 39
 
@@ -6141,6 +6189,9 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_out_grad"
         not in runtime_binding["missing_logical_buffers"]
     )
+    # path_c_int32_scratch_bank dropped from the missing set: the Metal forward
+    # split makes the sparse_mla int32 sparse-index scratch kernel-internal, so
+    # it is no longer a coalesced cross-segment logical scratch bank.
     assert runtime_binding["missing_logical_buffers"] == [
         "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden_grad",
         "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
@@ -6151,7 +6202,6 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
         "mamba3_angle_checkpoint",
         "mamba3_h_checkpoint",
         "path_c_float32_scratch_bank",
-        "path_c_int32_scratch_bank",
     ]
 
     workspace_owner = (
@@ -6193,7 +6243,9 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     assert runtime_binding["status"] == (
         m04_train_step.FP8_PATH_C_DIRECT_CHAIN_ARTIFACTS_MISSING_STATUS
     )
-    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3, 4, 5, 6]
+    # 9 segments on Metal: the forward fusion cap splits the forward phase into
+    # 4 segments (was 2) + 5 backward segments (see the segment_count tests).
+    assert runtime_binding["missing_artifact_segments"] == [0, 1, 2, 3, 4, 5, 6, 7, 8]
     assert runtime_binding["hidden_packing_performed"] is False
 
 
@@ -6242,10 +6294,16 @@ def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
     )
     assert runtime_binding["hidden_packing_performed"] is False
     assert runtime_binding["provided_logical_buffer_count"] == 26
-    assert runtime_binding["missing_logical_buffer_count"] == 66
+    # 65 (was 66): int32 sparse-index scratch bank is kernel-internal after the
+    # Metal forward split (see the capture-owners test).
+    assert runtime_binding["missing_logical_buffer_count"] == 65
+    # Metal forward fusion cap -> 4 forward segments + 5 backward (see the
+    # segment_count tests for why the 4-op forward mega-kernel is split).
     assert [
         segment["execution_phase"] for segment in runtime_binding["segments"]
     ] == [
+        "forward",
+        "forward",
         "forward",
         "forward",
         "backward",
