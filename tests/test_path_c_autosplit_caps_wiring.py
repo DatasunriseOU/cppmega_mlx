@@ -50,6 +50,34 @@ def test_metal_pool_pass_pools_oversized_and_leaves_small_untouched():
     )
 
 
+def test_is_recurrent_reproduces_old_frozenset_membership():
+    """Step 6: structural is_recurrent == old _TIME_CHUNKED_RECURRENT_BACKWARD_OPS."""
+    # The recurrent reverse-time scans the old frozenset held, verbatim.
+    old_recurrent = {"m2rnn_bwd", "mamba3_mimo_bwd"}
+    # Every other watchdog-relevant backward op the planner sees.
+    other_bwd = {
+        "attention_qkv_projection_bwd",
+        "sparse_mla_fp8_apply_bwd",
+        "residual_rmsnorm_bwd",
+        "entry_rmsnorm_bwd",
+    }
+    for op in old_recurrent:
+        assert sched._op_is_recurrent_state_scan(op) is True, op
+    for op in other_bwd:
+        assert sched._op_is_recurrent_state_scan(op) is False, op
+    # The frozenset itself is deleted.
+    assert not hasattr(sched, "_TIME_CHUNKED_RECURRENT_BACKWARD_OPS")
+
+
+def test_is_recurrent_forward_ops():
+    # forward recurrent ops (mamba3/m2rnn) carry state; attention/sparse do not
+    assert sched._op_is_recurrent_state_scan("mamba3_mimo") is True
+    assert sched._op_is_recurrent_state_scan("m2rnn") is True
+    assert sched._op_is_recurrent_state_scan("attention_qkv_projection") is False
+    assert sched._op_is_recurrent_state_scan("sparse_mla_fp8_apply") is False
+    assert sched._op_is_recurrent_state_scan("residual_rmsnorm") is False
+
+
 def test_path_c_split_infeasible_message_has_where_and_what():
     exc = sched.PathCSplitInfeasible(
         "region_chain_7_8", "watchdog", 12.0, 2.5, op_name="sparse_mla_fp8_apply_bwd"

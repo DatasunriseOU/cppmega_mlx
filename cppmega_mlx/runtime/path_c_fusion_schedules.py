@@ -138,30 +138,18 @@ _EXACT_ROW_PHASED_BACKWARD_OPS = frozenset(
         "mamba3_mimo_bwd",
     }
 )
-# Recurrent REVERSE-TIME-SCAN backward ops. Each is a single
-# ``for time_rev in T.serial(0, S)`` over the WHOLE sequence inside ONE
-# threadgroup. Encoded under the default grid_chunks dispatch as ONE Metal
-# command buffer that spans all S time steps, the scan exceeds the macOS GPU
-# watchdog window (kIOGPUCommandBufferCallbackErrorTimeout). These ops MUST be
-# switched to launcher_chunks so the reverse scan is driven as K command buffers
-# over TIME (one ``artifact()`` per row-window, reverse adjoint state carried
-# across launches through caller-owned buffers). The other row-phased backward
-# ops in _EXACT_ROW_PHASED_BACKWARD_OPS (attention_qkv_projection_bwd /
-# sparse_mla_fp8_apply_bwd) are per-row-INDEPENDENT (no carried reverse-time
-# state) so they fit one command buffer and stay grid_chunks.
+# Recurrent REVERSE-TIME-SCAN backward ops (mamba3_mimo_bwd / m2rnn_bwd). Each is
+# a single ``for time_rev in T.serial(0, S)`` over the WHOLE sequence inside ONE
+# threadgroup; under grid_chunks that is ONE Metal command buffer spanning all S
+# time steps -> exceeds the macOS GPU watchdog window -> must be switched to
+# launcher_chunks TIME-chunking.
 #
-# NOTE: the original intra-segment time-chunking (commit ac412fb) only covered
-# mamba3_mimo_bwd, but in the direct-chain reverse order the m2rnn_bwd segment
-# runs BEFORE mamba3 and is an equally long reverse-time scan -> it tripped the
-# watchdog first (verified: timeout at segment region ..._chain_10_11 /
-# op=m2rnn_bwd, before mamba3 was ever reached). Both recurrent backward ops
-# need the launcher split.
-_TIME_CHUNKED_RECURRENT_BACKWARD_OPS = frozenset(
-    {
-        "m2rnn_bwd",
-        "mamba3_mimo_bwd",
-    }
-)
+# REPLACED (design step 6 / §2.4): the former hardcoded
+# ``_TIME_CHUNKED_RECURRENT_BACKWARD_OPS = {m2rnn_bwd, mamba3_mimo_bwd}`` frozenset
+# is DELETED. Recurrence is now derived STRUCTURALLY by
+# ``_op_is_recurrent_state_scan`` (the op's FORWARD descriptor emits a
+# ``*_state_recurrence`` codegen step). This reproduces the old membership exactly
+# (verified by the membership-parity test) while removing the duplicated literal.
 # Per-row-INDEPENDENT heavy BACKWARD ops that exceed the macOS GPU watchdog
 # (~5-6s per command buffer) when run as ONE monolithic grid_chunks command
 # buffer at full local_gb10_quarter scale (depth=13 hidden=3584 max_seq=4096).
@@ -728,6 +716,49 @@ def _path_c_descriptor_stage_node_name(node: Any) -> str:
 
 def _path_c_descriptor_stage_node_op_name(node: Any) -> str:
     return str(getattr(node, "op_name", ""))
+
+
+def _op_is_recurrent_state_scan(
+    op_name: str,
+    *,
+    registry: "PathCBrickScheduleDescriptorRegistry | None" = None,
+) -> bool:
+    """Structural test: does ``op_name`` carry a reverse-time recurrent state scan?
+
+    Replaces the hardcoded ``_TIME_CHUNKED_RECURRENT_BACKWARD_OPS`` /
+    ``_ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS`` frozensets (design §2.4). A backward
+    op is a reverse-time recurrence iff its FORWARD descriptor emits a
+    ``*_state_recurrence`` codegen step -- i.e. the forward pass carries scan
+    state across time, so the backward is a single reverse-time scan over the
+    whole sequence and must be TIME-chunked (launcher_chunks). The per-row
+    INDEPENDENT heavy ops (attention_qkv_projection / sparse_mla_fp8_apply) have
+    no such step and are ROW-windowed instead.
+
+    The forward descriptor is resolved by stripping a trailing ``_bwd`` (the
+    synthesized AOT-backward descriptors do not carry the recurrence step; the
+    information lives on the forward descriptor that the backward differentiates).
+    This reproduces the old frozenset membership EXACTLY:
+    {m2rnn_bwd, mamba3_mimo_bwd} -> recurrent; everything else -> independent.
+    """
+
+    forward_op = op_name[: -len("_bwd")] if op_name.endswith("_bwd") else op_name
+    reg = registry or default_path_c_brick_schedule_descriptor_registry()
+    descriptor = reg.descriptor_for(forward_op)
+    if descriptor is None:
+        return False
+    return any(
+        "_state_recurrence" in step for step in descriptor.required_codegen_steps
+    )
+
+
+def _node_is_recurrent_state_scan(
+    node: Any,
+    *,
+    registry: "PathCBrickScheduleDescriptorRegistry | None" = None,
+) -> bool:
+    return _op_is_recurrent_state_scan(
+        _path_c_descriptor_stage_node_op_name(node), registry=registry
+    )
 
 
 def _nodes_contain_row_chunked_forward_op(nodes: Iterable[Any]) -> bool:
@@ -14938,6 +14969,13 @@ def plan_path_c_direct_fusion_chain_for_region(
             # Both recurrent and independent watchdog-heavy ops therefore take the
             # SAME launcher_chunks treatment; the carry-buffer plumbing distinguishes
             # them downstream. (Metal-only watchdog split; CUDA keeps grid_chunks.)
+            # The recurrent reverse-time scans (mamba3_mimo_bwd / m2rnn_bwd) are
+            # now identified STRUCTURALLY via _node_is_recurrent_state_scan (the
+            # op's forward descriptor emits a *_state_recurrence step), replacing
+            # the deleted _TIME_CHUNKED_RECURRENT_BACKWARD_OPS frozenset (§2.4).
+            # The per-row-INDEPENDENT heavy ops are still gated on the
+            # _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS set here; step 8 replaces that
+            # membership with the watchdog est_gpu_time_s > budget predicate.
             if (
                 # Watchdog chunking is a macOS GPU-watchdog WORKAROUND and is
                 # Metal-ONLY. CUDA has no per-command-buffer watchdog, so it keeps
@@ -14953,11 +14991,9 @@ def plan_path_c_direct_fusion_chain_for_region(
                 and execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
                 and direct_target.max_rows_per_launch is not None
                 and any(
-                    _path_c_descriptor_stage_node_op_name(node)
-                    in (
-                        _TIME_CHUNKED_RECURRENT_BACKWARD_OPS
-                        | _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS
-                    )
+                    _node_is_recurrent_state_scan(node)
+                    or _path_c_descriptor_stage_node_op_name(node)
+                    in _ROW_CHUNKED_INDEPENDENT_BACKWARD_OPS
                     for node in candidate_region.nodes
                 )
             ):
