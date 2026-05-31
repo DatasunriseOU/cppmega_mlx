@@ -101,6 +101,18 @@ FUSION_MODE_ENV = "CPPMEGA_PATH_C_FUSION"
 # acceptance/region test stay byte-identical until an eager-edge-capable
 # runtime opts in.
 SPAN_EAGER_EDGE_ENV = "CPPMEGA_PATH_C_SPAN_EAGER_EDGE"
+# Opt-in lever for the Mamba3 chunked-scan LIVE forward (F0/F1/F2). DEFAULT OFF.
+# When OFF (the live default) the Mamba3 forward emits the single serial
+# ``mamba3_mimo`` surface and the descriptor codegen path is byte-identical to
+# today's behaviour. When ON, region build replaces that single surface with the
+# 3 chunked surfaces (mamba3_chunk_precompute / mamba3_inter_chunk_recur /
+# mamba3_chunk_scan_combine) wired by caller-owned handoff buffers, and the
+# segment compile site delegates each to its proven ``build_*_metal`` grid
+# kernel (the SHADOW no-op fragment markers are NEVER emitted for a live op).
+# RULE #1: ON path is the single grid-prim delegation per segment; on a
+# compile/parity failure the builder RAISES (no silent serial fallback). OFF by
+# default so merging this change is behaviour-safe for every existing test.
+MAMBA3_CHUNKED_SCAN_ENV = "CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN"
 DEFAULT_MAX_PATH_B_CACHE_GIB = 55.0
 DEFAULT_MAX_PATH_B_MEDIAN_STEP_S = 10.0
 DEFAULT_MIN_C_OVER_B = 1.0
@@ -273,6 +285,22 @@ def path_c_span_eager_edges_enabled(
     """
 
     raw = (env or os.environ).get(SPAN_EAGER_EDGE_ENV, "")
+    return raw.strip().lower() in _TRUTHY_FLAG_VALUES
+
+
+def path_c_mamba3_chunked_scan_enabled(
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether the Mamba3 LIVE forward emits the chunked F0/F1/F2 surfaces.
+
+    Controlled by ``CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN`` (see
+    ``MAMBA3_CHUNKED_SCAN_ENV``). Off by default: the live forward emits the
+    single serial ``mamba3_mimo`` surface. When ON, region build emits the 3
+    chunked surfaces and the segment compile site delegates each to its proven
+    grid kernel. Target-agnostic; no silent fallback (RULE #1).
+    """
+
+    raw = (env or os.environ).get(MAMBA3_CHUNKED_SCAN_ENV, "")
     return raw.strip().lower() in _TRUTHY_FLAG_VALUES
 
 

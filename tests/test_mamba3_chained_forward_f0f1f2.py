@@ -346,3 +346,121 @@ def test_chained_metal_f0f1f2_matches_serial_forward(
     assert max_hlast < 5e-4, (
         f"chained-Metal-vs-serial h_last max|abs|={max_hlast:.3e} > 5e-4 at S={seqlen}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Verification 3: the LIVE compile-site DELEGATION INTERPOSE (Stage-2 live flip)#
+# - flag OFF: F0/F1/F2 segment compiles via the source/exec template (the SHADOW#
+#   marker path) -> a PrimFunc, NOT a delegated grid kernel.                    #
+# - flag ON : the interpose BYPASSES exec/source and substitutes the proven     #
+#   build_*_metal grid JITKernel (the no-op marker is NEVER the live kernel).   #
+# Design: docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md §3.1/§7.                       #
+# --------------------------------------------------------------------------- #
+
+
+def _local_gb10_quarter_env():
+    """Quarter-scale (S=4096) Path-C shape env feasible for the chunked scan-core
+    (chunk=64, headdim%block_N==0, heads%groups==0)."""
+    from cppmega_mlx.runtime.path_c_fusion import PathCModelShapeEnv
+
+    return PathCModelShapeEnv(
+        sequence_length=4096,
+        hidden_size=3584,
+        attention_num_q_heads=28,
+        attention_num_kv_heads=4,
+        attention_head_dim=128,
+        attention_sparse_topk=64,
+        mamba_expand=2,
+        mamba_head_dim=128,
+        mamba_state_dim=128,
+        mamba_groups=1,
+        mamba_mimo_rank=1,
+        mamba_is_mimo=True,
+        mamba_conv_kernel=4,
+        mamba_rope_fraction=0.5,
+        m2rnn_k_head_dim=128,
+        m2rnn_v_head_dim=128,
+        m2rnn_num_q_heads=8,
+        m2rnn_num_k_heads=8,
+        m2rnn_num_v_heads=8,
+        m2rnn_num_f_heads=8,
+        m2rnn_num_g_heads=8,
+        m2rnn_num_weight_heads=8,
+        m2rnn_conv_kernel=4,
+    )
+
+
+_INTERPOSE_SURFACES = {
+    "mamba3_chunk_precompute": (
+        ("mamba3_x", "mamba3_B", "mamba3_C", "mamba3_A", "mamba3_dt"),
+        ("mamba3_cb", "mamba3_dA_cumsum", "mamba3_summary_states"),
+    ),
+    "mamba3_inter_chunk_recur": (
+        ("mamba3_summary_states", "mamba3_dA_cumsum", "mamba3_h0"),
+        ("mamba3_prev_states", "mamba3_final_state"),
+    ),
+    "mamba3_chunk_scan_combine": (
+        ("mamba3_cb", "mamba3_x", "mamba3_dt", "mamba3_dA_cumsum",
+         "mamba3_C", "mamba3_prev_states", "mamba3_D"),
+        ("mamba3_out",),
+    ),
+}
+
+
+def _build_segment_prim(op_name, inputs, outputs, env):
+    from cppmega_mlx.runtime.path_c_fusion import (
+        FusionKernelSurface,
+        Z3SyncSpec,
+        build_path_c_fusion_region,
+    )
+    from cppmega_mlx.runtime.path_c_fusion_schedules import (
+        build_path_c_descriptor_prim_func,
+        default_path_c_brick_schedule_descriptor_registry,
+    )
+
+    reg = default_path_c_brick_schedule_descriptor_registry()
+    surf = FusionKernelSurface.path_c(
+        name=f"{op_name}_node", op_name=op_name,
+        inputs=inputs, outputs=outputs, backward="owner_output",
+    )
+    region = build_path_c_fusion_region(
+        region_name=op_name, surfaces=(surf,),
+        z3_sync=Z3SyncSpec.minimize_sync_async(),
+    )
+    desc = reg.descriptor_for(op_name)
+    return build_path_c_descriptor_prim_func(region, (desc,), shape_env=env)
+
+
+def test_chunked_scan_flag_default_off(monkeypatch):
+    """The live flip is DEFAULT OFF: a single F0 segment compiles via the
+    source/exec template (the shadow marker path), NOT the delegated grid kernel."""
+    monkeypatch.delenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", raising=False)
+    env = _local_gb10_quarter_env()
+    ins, outs = _INTERPOSE_SURFACES["mamba3_chunk_precompute"]
+    prim = _build_segment_prim("mamba3_chunk_precompute", ins, outs, env)
+    # OFF: NOT a delegated grid kernel.
+    assert getattr(prim, "_cppmega_path_c_mamba3_chunked_grid_delegation", None) is None
+    assert type(prim).__name__ != "JITKernel"
+
+
+@pytest.mark.skipif(
+    not _torch_mps_available(), reason="requires torch + Metal (mps) backend"
+)
+@pytest.mark.parametrize("op_name", list(_INTERPOSE_SURFACES))
+def test_chunked_scan_flag_on_interpose_emits_real_grid_kernel(op_name, monkeypatch):
+    """Flag ON: the compile-site interpose substitutes the REAL build_*_metal grid
+    JITKernel for the F0/F1/F2 segment — the no-op SHADOW marker is NEVER the
+    live emitted kernel (RULE #1)."""
+    monkeypatch.setenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", "1")
+    env = _local_gb10_quarter_env()
+    ins, outs = _INTERPOSE_SURFACES[op_name]
+    prim = _build_segment_prim(op_name, ins, outs, env)
+    # ON: the proven grid kernel, tagged with the delegation op-name.
+    assert type(prim).__name__ == "JITKernel", (
+        f"{op_name} flag-ON must emit a real grid JITKernel, got {type(prim).__name__}"
+    )
+    assert (
+        getattr(prim, "_cppmega_path_c_mamba3_chunked_grid_delegation", None)
+        == op_name
+    )
+    assert getattr(prim, "_cppmega_path_c_brick_ops", None) == (op_name,)

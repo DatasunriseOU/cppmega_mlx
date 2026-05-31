@@ -37,6 +37,7 @@ from cppmega_mlx.runtime.path_c_fusion import (
     build_mamba3_fp8_train_acceptance_fixture_region,
     compile_path_c_region,
     mark_path_c_schedule_template_for_region,
+    path_c_mamba3_chunked_scan_enabled as _path_c_mamba3_chunked_scan_enabled,
     tilelang_single_entry_lowerer,
     trusted_path_c_production_schedule_ids,
 )
@@ -245,6 +246,23 @@ DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS = frozenset(
         "m2rnn_delta_grad",
         "mamba3_delta",
         "mamba3_delta_grad",
+    }
+)
+# Mamba3 chunked-scan F0->F1->F2 caller-owned handoff buffers (design §3.1).
+# These flow segment->segment across the multi-segment chain and so must
+# materialise as distinct physical device ABI buffers (mirrors
+# DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS). summary_states/prev_states are
+# fp32 (resolved in _buffer_dtype). Registered into the force-spill scratch ABI
+# below so the segment boundary does not alias them. The chunked-scan LIVE flip
+# is flag-gated (CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN, default OFF) — these names
+# never appear in the serial mamba3_mimo surface, so OFF behaviour is unchanged.
+DESCRIPTOR_MAMBA3_CHUNKED_FWD_HANDOFF_ABI_BUFFERS = frozenset(
+    {
+        "mamba3_cb",
+        "mamba3_dA_cumsum",
+        "mamba3_summary_states",
+        "mamba3_prev_states",
+        "mamba3_final_state",
     }
 )
 DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_CANONICALS = frozenset(
@@ -2213,6 +2231,36 @@ def build_path_c_descriptor_prim_func(
             physical_abi_plan=physical_abi_plan,
         )
     )
+    # --- Mamba3 chunked-scan LIVE delegation interpose (design §3.1/§7) ---
+    # When the chunked-scan flag is ON and this segment is a single
+    # GRID-launched F0/F1/F2 op, its kernel is the proven build_*_metal grid
+    # prim (its own multi-grid T.Kernel cannot be a fragment in the template's
+    # single T.Kernel). BYPASS the exec/source path and substitute the real grid
+    # prim — the SHADOW fragment markers are NEVER emitted for a live op
+    # (RULE #1). Flag OFF (live default): this branch is never taken, the serial
+    # mamba3_mimo descriptor source path is byte-identical to today's behaviour.
+    if (
+        len(nodes) == 1
+        and nodes[0].op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS
+        and _path_c_mamba3_chunked_scan_enabled()
+    ):
+        delegated_prim = _mamba3_chunked_grid_delegation_prim(
+            op_name=nodes[0].op_name,
+            production_source=descriptors[0].production_source,
+            shape_env=resolved_shape_env,
+        )
+        delegated_prim._cppmega_path_c_schedule_generator = (
+            PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
+        )
+        delegated_prim._cppmega_path_c_brick_ops = (nodes[0].op_name,)
+        delegated_prim._cppmega_path_c_shape_env = resolved_shape_env
+        delegated_prim._cppmega_path_c_buffer_extent = extent
+        delegated_prim._cppmega_path_c_execution_stage = validated_execution_stage
+        delegated_prim._cppmega_path_c_mamba3_chunked_grid_delegation = (
+            nodes[0].op_name
+        )
+        return delegated_prim
+
     source, spilled_shared_scratch = _descriptor_prim_func_source(
         entry_name=entry_name,
         nodes=nodes,
@@ -4503,6 +4551,8 @@ def _is_row_phased_bwd_scratch_abi_buffer(buffer_name: str) -> bool:
     name = str(buffer_name)
     if name in DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS:
         return True
+    if name in DESCRIPTOR_MAMBA3_CHUNKED_FWD_HANDOFF_ABI_BUFFERS:
+        return True
     if not name.endswith("_grad"):
         return False
     canonical = _canonical_buffer_name(name)
@@ -6505,6 +6555,127 @@ def mamba3_chunked_forward_scan_grid(
             op_name="mamba3_mimo",
         )
     return total, grid
+
+
+# --------------------------------------------------------------------------- #
+# Mamba3 chunked-scan LIVE compile-site DELEGATION INTERPOSE (F0/F1/F2).        #
+# Design: docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md §3.1/§7 Stage-2 live flip.    #
+# --------------------------------------------------------------------------- #
+
+# Op-names whose segment is a single GRID-launched kernel that CANNOT be a
+# fragment inlined into the shared single-``T.Kernel`` template PrimFunc. Each
+# resolves (via its descriptor ``production_source``) to a ``build_*_metal``
+# builder that returns its OWN multi-grid ``@T.prim_func`` directly. The
+# fragment_emitter markers registered for these ops are SHADOW no-ops that must
+# NEVER be the live emitted kernel (RULE #1) — the interpose below bypasses the
+# exec/source path and substitutes the real grid prim when the
+# ``CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN`` flag is ON.
+_MAMBA3_CHUNKED_GRID_DELEGATION_OPS = frozenset(
+    {
+        "mamba3_chunk_precompute",
+        "mamba3_inter_chunk_recur",
+        "mamba3_chunk_scan_combine",
+    }
+)
+
+# The caller-owned handoff buffers that flow F0 -> F1 -> F2 are registered as a
+# force-spill device ABI scratch set at module scope
+# (DESCRIPTOR_MAMBA3_CHUNKED_FWD_HANDOFF_ABI_BUFFERS); summary_states/prev_states
+# resolve fp32 in _buffer_dtype (design §3.1/§3.3/§6.6).
+
+
+def _resolve_mamba3_chunked_grid_builder(production_source: str):
+    """Resolve ``module:builder/inner`` from a descriptor ``production_source``.
+
+    ``production_source`` is e.g.
+    ``"cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core:"``
+    ``"build_chunk_precompute_metal/chunk_precompute_fwd_metal_prim"`` — the
+    ``build_*_metal`` segment of the ``builder/inner`` tail is the live grid
+    kernel delegation. RULE #1: an unresolvable / malformed source RAISES with
+    where+what; there is no fallback.
+    """
+    import importlib
+
+    if ":" not in production_source:
+        raise ValueError(
+            "mamba3 chunked-scan delegation interpose: malformed "
+            f"production_source (no module:tail): {production_source!r}"
+        )
+    module_path, tail = production_source.split(":", 1)
+    builder_name = tail.split("/", 1)[0].strip()
+    if not builder_name.startswith("build_"):
+        raise ValueError(
+            "mamba3 chunked-scan delegation interpose: production_source tail "
+            f"does not name a build_*_metal builder: {production_source!r}"
+        )
+    module = importlib.import_module(module_path.strip())
+    builder = getattr(module, builder_name, None)
+    if builder is None or not callable(builder):
+        raise ValueError(
+            "mamba3 chunked-scan delegation interpose: "
+            f"{module_path}:{builder_name} is not a callable builder"
+        )
+    return builder
+
+
+def _mamba3_chunked_grid_delegation_prim(
+    *,
+    op_name: str,
+    production_source: str,
+    shape_env: PathCModelShapeEnv | None,
+    batch: int = 1,
+):
+    """Return the proven F0/F1/F2 grid ``@T.prim_func`` for a single-node segment.
+
+    Reconciles the chain's region ``shape_env`` to the builder's positional
+    ``(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)`` ABI. The builder
+    compiles+returns the Metal grid kernel whose own multi-grid ``T.Kernel``
+    cannot be hosted as a fragment in the template's single ``T.Kernel`` — this is
+    the ONE live delegation path (RULE #1). On any compile/shape failure the
+    builder RAISES with where+what; there is NO silent serial fallback.
+
+    NOTE: this returns the COMPILED JITKernel-bearing prim from ``build_*_metal``;
+    the LIVE region-build flip (#2) + ABI-handoff binder reconciliation must feed
+    the handoff buffers into the builder's positional slots. Until that flip is
+    wired, this interpose is reached only when the chunked surfaces are emitted
+    (flag ON), never for the serial ``mamba3_mimo`` surface (flag OFF default).
+    """
+    if op_name not in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS:
+        raise ValueError(
+            "mamba3 chunked-scan delegation interpose invoked for non-chunked "
+            f"op_name {op_name!r}"
+        )
+    if shape_env is None:
+        raise ValueError(
+            "mamba3 chunked-scan delegation interpose requires a resolved "
+            f"shape_env to derive the builder ABI dims for {op_name!r}"
+        )
+    seqlen = int(shape_env.sequence_length)
+    nheads = int(shape_env.mamba_num_heads)
+    headdim = int(shape_env.mamba_head_dim)
+    dstate = int(shape_env.mamba_state_dim)
+    ngroups = int(shape_env.mamba_groups)
+    chunk = int(MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE)
+    # Fail-fast feasibility (mirrors the live dispatch gate): a shape the
+    # validated scan-core cannot host RAISES rather than emitting a no-op marker.
+    feasible, _total, _grid, characteristic, estimate, limit = (
+        _mamba3_chunked_forward_scan_feasibility(
+            sequence_length=seqlen,
+            batch=batch,
+            heads=nheads,
+            head_dim=headdim,
+            state_dim=dstate,
+            groups=ngroups,
+            chunk_size=chunk,
+        )
+    )
+    if not feasible:
+        raise ValueError(
+            "mamba3 chunked-scan delegation interpose: shape infeasible for "
+            f"{op_name!r}: {characteristic} (got {estimate!r}, want {limit!r})"
+        )
+    builder = _resolve_mamba3_chunked_grid_builder(production_source)
+    return builder(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
 
 
 def _append_row_phased_mamba3_body(
@@ -13990,6 +14161,11 @@ def _buffer_dtype(
         "mamba3_conv_state",
         "mamba3_h_checkpoint",
         "mamba3_h0_grad",
+        # Mamba3 chunked-scan F0->F1->F2 inter-chunk state handoff buffers
+        # (design §3.3/§6.6): fp32 for recurrent-state precision.
+        "mamba3_summary_states",
+        "mamba3_prev_states",
+        "mamba3_final_state",
         "m2rnn_h_state",
         "m2rnn_h_checkpoint",
         "m2rnn_h0_grad",
