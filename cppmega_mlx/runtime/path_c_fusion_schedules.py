@@ -1398,6 +1398,69 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                 fragment_emitter=_emit_mamba3_chunk_scan_combine_source,
             ),
             PathCBrickScheduleDescriptor(
+                op_name="mamba3_chunk_precompute",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "mamba3_chunk_precompute_descriptor",
+                    "mamba3_chunk_precompute_grid_kernel",
+                ),
+                description=(
+                    "Mamba3 chunked SSD precompute (F0) brick descriptor; "
+                    "GRID-launched, NO scan dependency; delegates to "
+                    "chunk_precompute_fwd_metal_prim (forms cb, dA_cumsum, "
+                    "summary_states for the F1/F2 handoff)"
+                ),
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core:"
+                    "build_chunk_precompute_metal/chunk_precompute_fwd_metal_prim"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "F0 precompute is a grid-launched kernel (own T.Kernel grid) "
+                    "delegating to chunk_precompute_fwd_metal_prim; it writes the "
+                    "caller-owned cb/dA_cumsum/summary_states handoff buffers the "
+                    "F1 inter-chunk recurrence and F2 scan+combine consume. "
+                    "Validated chained vs serial forward by "
+                    "tests/test_mamba3_chained_forward_f0f1f2.py (Stage 2)"
+                ),
+                # F0 is a grid kernel, NOT row-phased single-thread; keep the
+                # default flat loop policy so the row-phased mamba template gating
+                # does not swallow it (design §3.2).
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
+                fragment_emitter=_emit_mamba3_chunk_precompute_source,
+            ),
+            PathCBrickScheduleDescriptor(
+                op_name="mamba3_inter_chunk_recur",
+                implementation_status="descriptor_codegen_ready",
+                required_codegen_steps=(
+                    "mamba3_inter_chunk_recur_descriptor",
+                    "mamba3_inter_chunk_recur_grid_kernel",
+                ),
+                description=(
+                    "Mamba3 chunked SSD inter-chunk recurrence (F1) brick "
+                    "descriptor; the ONLY O(S/C) sequential stage; delegates to "
+                    "inter_chunk_recur_fwd_metal_prim (summary_states + h0 -> "
+                    "prev_states, final_state)"
+                ),
+                production_source=(
+                    "cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core:"
+                    "build_inter_chunk_recur_metal/inter_chunk_recur_fwd_metal_prim"
+                ),
+                production_fragment_status="region_fragment_inlined_unoptimized",
+                production_fragment_reason=(
+                    "F1 inter-chunk recurrence is a grid-launched kernel (own "
+                    "T.Kernel grid, batch*nheads threadgroups; the chunk axis is "
+                    "the only serial carry) delegating to "
+                    "inter_chunk_recur_fwd_metal_prim; it reads the F0 "
+                    "summary_states/dA_cumsum handoff plus h0 and writes the "
+                    "prev_states the F2 scan+combine consumes (fp32 for precision, "
+                    "design §3.3). Validated chained vs serial forward by "
+                    "tests/test_mamba3_chained_forward_f0f1f2.py (Stage 2)"
+                ),
+                preferred_loop_policy=DESCRIPTOR_LOOP_POLICY_FLAT,
+                fragment_emitter=_emit_mamba3_inter_chunk_recur_source,
+            ),
+            PathCBrickScheduleDescriptor(
                 op_name="mamba3_mimo_bwd",
                 implementation_status="descriptor_codegen_ready",
                 required_codegen_steps=(
@@ -12897,6 +12960,74 @@ def _emit_mamba3_chunk_scan_combine_source(
             "cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core."
             "build_chunk_scan_combine_metal (grid scan+combine core); "
             "shadow-registered (Stage 1), serial scan still emitted live",
+            f"{marker}[0] = 0.0",
+        ),
+    )
+
+
+def _emit_mamba3_chunk_precompute_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Fragment emitter for the Path-C F0 ``mamba3_chunk_precompute`` segment.
+
+    Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2 (F0 row) / §3.2.
+
+    F0 is NOT a row-phased single-thread fragment inlined into the shared region
+    PrimFunc: its kernel is the GRID-launched precompute core
+    ``chunk_precompute_fwd_metal_prim`` (own ``T.Kernel(batch*nchunks, nheads)``
+    grid). Its real codegen is the single delegation
+    ``mamba3_chunked_precompute_core.build_chunk_precompute_metal`` — exercised +
+    parity gated chained (F0->F1->F2) vs the serial forward by
+    ``tests/test_mamba3_chained_forward_f0f1f2.py`` (Stage 2). It writes the
+    caller-owned ``cb / dA_cumsum / summary_states`` handoff buffers the F1/F2
+    segments consume. This marker only needs to RESOLVE via ``select`` so the
+    op-name signature is not blocked with ``no descriptor target``; the live chain
+    template hookup (region-build flag + ABI handoff) is wired separately. RULE #1:
+    no silent fallback — the kernel path is the one delegation above.
+    """
+    marker = _scratch_name(node, "mamba3_chunk_precompute_shadow")
+    return _ScheduleNodeFragment(
+        allocations=(f"{marker} = T.alloc_local((1,), \"float32\")",),
+        statements=(
+            "# F0 mamba3_chunk_precompute: delegates to "
+            "cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core."
+            "build_chunk_precompute_metal (grid precompute core -> cb/dA_cumsum/"
+            "summary_states handoff buffers)",
+            f"{marker}[0] = 0.0",
+        ),
+    )
+
+
+def _emit_mamba3_inter_chunk_recur_source(
+    node: _ScheduleNodeView,
+    dtype_by_buffer: dict[str, str],
+    access_by_buffer: dict[str, str],
+) -> _ScheduleNodeFragment:
+    """Fragment emitter for the Path-C F1 ``mamba3_inter_chunk_recur`` segment.
+
+    Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §2 (F1 row) / §3.2.
+
+    F1 is the ONLY O(S/C) sequential stage. Its kernel is the GRID-launched
+    inter-chunk recurrence core ``inter_chunk_recur_fwd_metal_prim`` (own
+    ``T.Kernel(batch, nheads)`` grid; the chunk axis is the only serial carry).
+    Its real codegen is the single delegation
+    ``mamba3_chunked_precompute_core.build_inter_chunk_recur_metal`` — exercised +
+    parity gated chained (F0->F1->F2) vs the serial forward by
+    ``tests/test_mamba3_chained_forward_f0f1f2.py`` (Stage 2). It reads the F0
+    ``summary_states / dA_cumsum`` handoff plus ``h0`` and writes the
+    ``prev_states`` (fp32) the F2 scan+combine consumes. This marker only needs to
+    RESOLVE via ``select``; RULE #1: no silent fallback — one delegation path.
+    """
+    marker = _scratch_name(node, "mamba3_inter_chunk_recur_shadow")
+    return _ScheduleNodeFragment(
+        allocations=(f"{marker} = T.alloc_local((1,), \"float32\")",),
+        statements=(
+            "# F1 mamba3_inter_chunk_recur: delegates to "
+            "cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core."
+            "build_inter_chunk_recur_metal (O(S/C) inter-chunk recurrence -> "
+            "prev_states/final_state handoff buffers, fp32)",
             f"{marker}[0] = 0.0",
         ),
     )

@@ -1,0 +1,348 @@
+"""Stage-2 chained-isolation harness: F0 -> F1 -> F2 vs the SERIAL forward.
+
+Design: ``docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md`` §7 Stage 2.
+
+Stage 1 proved the F2 grid scan+combine kernel in isolation, fed
+``cb/dA_cumsum/prev_states`` recomputed EAGERLY (a torch reference precompute
+standing in for the not-yet-built F0/F1). Stage 2 builds those two missing
+segments as real Metal kernels and chains all three through the caller-owned
+handoff buffers, exactly as the Path-C multi-segment chain will:
+
+  F0 ``mamba3_chunk_precompute``  (x,B,C,A,dt) -> cb, dA_cumsum, summary_states
+  F1 ``mamba3_inter_chunk_recur`` (summary_states, dA_cumsum, h0) -> prev_states, final_state
+  F2 ``mamba3_chunk_scan_combine`` (cb, x, dt, dA_cumsum, C, prev_states, D) -> Output
+
+PARITY GATE (Stage-2 success): the FULL chained output ``max|abs|`` and
+``final_state`` (h_last) vs the SERIAL Path-C forward must be ``< 5e-4`` fp16 at
+the validated scan-core ``chunk_size == block_M == 64`` (the live feasibility gate
+``_mamba3_chunked_forward_scan_feasibility:6363``). The serial reference is an
+explicit per-timestep diagonal recurrence (carry ``h`` advanced one step at a
+time, seeded by ``h0``) — genuinely serial, NOT a re-expression of the chunked
+einsum.
+
+The cross-``chunk_size {64,128,256}`` + non-pow2-S sweep of the design's parity
+gate is exercised at the SSD numerical-contract level by
+``test_chained_numerical_contract_sweep`` (fp32 reference algebra), since the
+Metal F2 kernel's tile config pins ``block_M == 64`` (chunk=64) — a mismatched
+chunk RAISES at the feasibility gate, it never silently re-tiles (RULE #1).
+
+RULE #1: the kernel path is the single delegation per segment
+(``build_chunk_precompute_metal`` / ``build_inter_chunk_recur_metal`` /
+``build_chunk_scan_combine_metal``); on a compile/parity failure the helpers RAISE
+with where+what and the test FAILS — it never degrades to the serial scan.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+# Reuse the proven Stage-1 reference precompute + serial forward (the numerical
+# ground truth), so this harness validates the NEW Metal F0/F1 against the SAME
+# contract the Stage-1 eager reference already matched the serial forward to.
+from tests.test_mamba3_chunk_scan_combine_f2 import (
+    _eager_precompute,
+    _serial_forward,
+    _torch_mps_available,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Verification 0: all 3 forward descriptors register + select-resolve (no Metal).#
+# --------------------------------------------------------------------------- #
+
+
+def test_all_three_forward_descriptors_register_and_resolve():
+    """F0/F1/F2 op-names each resolve to a brick descriptor (no ``no descriptor
+    target``) — the Stage-2 success criterion: select resolves all 3 signatures."""
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
+        MAMBA3_CHUNK_PRECOMPUTE_OP_NAME,
+        MAMBA3_INTER_CHUNK_RECUR_OP_NAME,
+    )
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME,
+    )
+    from cppmega_mlx.runtime.path_c_fusion import (
+        FusionKernelSurface,
+        Z3SyncSpec,
+        build_path_c_fusion_region,
+    )
+    from cppmega_mlx.runtime.path_c_fusion_schedules import (
+        default_path_c_brick_schedule_descriptor_registry,
+        default_path_c_fusion_schedule_registry,
+    )
+
+    reg = default_path_c_brick_schedule_descriptor_registry()
+    for op in (
+        MAMBA3_CHUNK_PRECOMPUTE_OP_NAME,
+        MAMBA3_INTER_CHUNK_RECUR_OP_NAME,
+        MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME,
+    ):
+        desc = reg.descriptor_for(op)
+        assert desc is not None, f"{op} descriptor must register (else select blocks)"
+        assert desc.fragment_emitter is not None, f"{op} needs a fragment_emitter"
+        assert reg.descriptors_for_signature((op,)) is not None
+
+    # each single-node region resolves via the schedule registry select
+    sched_reg = default_path_c_fusion_schedule_registry()
+    surf_inputs = {
+        MAMBA3_CHUNK_PRECOMPUTE_OP_NAME: ("mamba3_x", "mamba3_B", "mamba3_C", "mamba3_A", "mamba3_dt"),
+        MAMBA3_INTER_CHUNK_RECUR_OP_NAME: ("mamba3_summary_states", "mamba3_dA_cumsum", "mamba3_h0"),
+        MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME: (
+            "mamba3_cb", "mamba3_x", "mamba3_dt", "mamba3_dA_cumsum",
+            "mamba3_C", "mamba3_prev_states", "mamba3_D",
+        ),
+    }
+    for op, inputs in surf_inputs.items():
+        surf = FusionKernelSurface.path_c(
+            name=f"{op}_node", op_name=op, inputs=inputs,
+            outputs=("out0",), backward="owner_output",
+        )
+        region = build_path_c_fusion_region(
+            region_name=op, surfaces=(surf,),
+            z3_sync=Z3SyncSpec.minimize_sync_async(),
+        )
+        assert tuple(n.op_name for n in region.nodes) == (op,)
+        target = sched_reg.select(region)
+        assert target is not None, f"{op} signature must NOT be blocked by select"
+        assert target.op_signature == (op,)
+
+
+# --------------------------------------------------------------------------- #
+# Verification 1: numerical-contract sweep (fp32 reference algebra, no Metal).  #
+# chunk {64,128,256} + a non-power-of-2 S — the design's parity-gate shapes.    #
+# --------------------------------------------------------------------------- #
+
+
+def _ref_chunked_forward_fp32(C, Bmat, x, A, dt, h0, D, chunk_size):
+    """Fp32 SSD chunked forward (F0+F1+F2 algebra) — the numerical contract.
+
+    Builds cb/dA_cumsum/prev_states via the proven ``_eager_precompute`` (F0+F1
+    reference math), then applies the F2 scan+combine algebra (Y_diag+Y_off+D*x)
+    AND returns ``final_state`` (h_last). All fp32. This is the object the chained
+    Metal kernels must reproduce; it is compared against ``_serial_forward`` to
+    confirm the chunked decomposition is faithful at every chunk_size.
+    """
+    import torch
+    from einops import rearrange, repeat
+
+    batch, seqlen, ngroups, dstate = C.shape
+    _, _, nheads, headdim = x.shape
+    nchunks = seqlen // chunk_size
+    h = nheads // ngroups
+
+    # --- F0 reference (fp32, NO fp16 cast — this is the 1e-5 fp32 contract) ---
+    Cf, Bf, xf, Af, dtf = C.float(), Bmat.float(), x.float(), A.float(), dt.float()
+    a = Af.view(1, 1, nheads) * dtf
+    a_c = rearrange(a, "b (c l) h -> b h c l", c=nchunks)
+    dA_cumsum = torch.cumsum(a_c, dim=-1)  # (b,h,c,l)
+    Cc = rearrange(Cf, "b (c l) g n -> b c l g n", c=nchunks)
+    Bc = rearrange(Bf, "b (c s) g n -> b c s g n", c=nchunks)
+    cb = torch.einsum("bclgn,bcsgn->bcgls", Cc, Bc)  # (b,c,g,l,s)
+    Bexp = repeat(Bf, "b (c s) g n -> b c s (g h) n", c=nchunks, h=h)
+    xexp = rearrange(xf, "b (c s) hh p -> b c s hh p", c=nchunks)
+    dtc = rearrange(dtf, "b (c s) hh -> b hh c s", c=nchunks)
+    decay_states = torch.exp(dA_cumsum[:, :, :, -1:] - dA_cumsum)
+    summary = torch.einsum("bhcs,bhcs,bcshp,bcshn->bchpn", decay_states, dtc, xexp, Bexp)
+
+    # --- F1 reference (fp32 inter-chunk recurrence seeded by h0) ---
+    chunk_tail = dA_cumsum[:, :, :, -1]  # (b,nheads,c)
+    state = h0.float().clone()  # (b,H,P,N)
+    prev_states = torch.zeros(batch, nchunks, nheads, headdim, dstate)
+    for c in range(nchunks):
+        prev_states[:, c] = state
+        state = torch.exp(chunk_tail[:, :, c])[..., None, None] * state + summary[:, c]
+    final_state = state
+
+    # --- F2 reference (serial scan+combine over the chunked handoff) ---
+    dt_k = dtc.contiguous()
+    out = _serial_forward(cb, x, dt_k, dA_cumsum, Cf, prev_states, D, chunk_size)
+    return out, final_state
+
+
+@pytest.mark.parametrize(
+    "batch,seqlen,chunk,nheads,headdim,dstate,ngroups",
+    [
+        (1, 256, 64, 2, 64, 16, 1),
+        (1, 512, 128, 2, 64, 16, 1),
+        (1, 768, 256, 2, 64, 16, 1),     # chunk=256
+        (1, 320, 64, 2, 64, 16, 1),      # non-power-of-2 S (5 chunks)
+        (1, 640, 128, 2, 64, 16, 1),     # non-power-of-2 nchunks=5
+    ],
+)
+def test_chained_numerical_contract_sweep(
+    batch, seqlen, chunk, nheads, headdim, dstate, ngroups, capsys
+):
+    """F0+F1+F2 SSD algebra == serial forward < 1e-5 fp32, chunk {64,128,256}+nonpow2.
+
+    Confirms the chunked decomposition (incl. the inter-chunk RoPE-angle-style
+    cumsum carried as ``dA_cumsum`` chunk-tail decay) is numerically faithful at
+    every chunk granularity and a non-power-of-2 S — independent of the Metal
+    tile config (which pins chunk=64).
+    """
+    import torch
+
+    assert seqlen % chunk == 0
+    torch.manual_seed(0)
+    dev = "cpu"
+    C = torch.randn(batch, seqlen, ngroups, dstate, device=dev) * 0.1
+    Bmat = torch.randn(batch, seqlen, ngroups, dstate, device=dev) * 0.1
+    x = torch.randn(batch, seqlen, nheads, headdim, device=dev) * 0.1
+    A = -torch.rand(nheads, device=dev)
+    dt = torch.rand(batch, seqlen, nheads, device=dev) * 0.05
+    D = torch.randn(nheads, device=dev)
+    h0 = torch.randn(batch, nheads, headdim, dstate, device=dev) * 0.1
+
+    out, final_state = _ref_chunked_forward_fp32(C, Bmat, x, A, dt, h0, D, chunk)
+
+    # Serial ground truth (full per-timestep recurrence seeded by h0), incl
+    # h_last. This is independent of the chunked split — the contract anchor.
+    out_serial, hlast_serial = _serial_full_forward(C, Bmat, x, A, dt, h0, D)
+
+    assert not bool(torch.isnan(out).any())
+    max_abs = float((out - out_serial).abs().max())
+    max_hlast = float((final_state - hlast_serial).abs().max())
+    # confirm the inter-chunk cumulative-decay MAGNITUDE matches (design gate)
+    with capsys.disabled():
+        print(
+            f"\n[chained-contract] S={seqlen} chunk={chunk} nchunks={seqlen//chunk} "
+            f"H={nheads} -> out max|abs|={max_abs:.3e} h_last max|abs|={max_hlast:.3e}"
+        )
+    assert max_abs < 1e-5, f"chained-vs-serial out max|abs|={max_abs:.3e} > 1e-5"
+    assert max_hlast < 1e-5, f"chained-vs-serial h_last max|abs|={max_hlast:.3e} > 1e-5"
+
+
+def _serial_full_forward(C, Bmat, x, A, dt, h0, D):
+    """Reference SERIAL per-timestep diagonal forward over the FULL sequence.
+
+    The OUR recurrence (mamba3.py ``_chunked_mamba3_diagonal_scan``):
+      log_decay[t] = A[h]*dt[t]
+      h[t]  = exp(log_decay[t]) * h[t-1] + dt[t] * (x[t] outer B[t])
+      y[t]  = sum_n h[t] * C[t] + D*x[t]   (no z gate; F2 output contract)
+    Seeded by ``h0``. fp32. Returns (out (b,S,H,P), h_last (b,H,P,N)).
+    """
+    import torch
+    from einops import repeat
+
+    batch, seqlen, ngroups, dstate = C.shape
+    _, _, nheads, headdim = x.shape
+    h = nheads // ngroups
+    Cf = repeat(C.float(), "b l g n -> b l (g h) n", h=h)
+    Bf = repeat(Bmat.float(), "b l g n -> b l (g h) n", h=h)
+    xf = x.float()
+    Af = A.float()
+    dtf = dt.float()
+    state = h0.float().clone()  # (b,H,P,N)
+    out = torch.zeros(batch, seqlen, nheads, headdim)
+    for t in range(seqlen):
+        decay = torch.exp(Af.view(1, nheads) * dtf[:, t])  # (b,H)
+        inp = dtf[:, t][:, :, None, None] * (
+            xf[:, t][:, :, :, None] * Bf[:, t][:, :, None, :]
+        )  # (b,H,P,N)
+        state = decay[:, :, None, None] * state + inp
+        y = torch.einsum("bhpn,bhn->bhp", state, Cf[:, t])  # (b,H,P)
+        out[:, t] = y + D.float().view(1, nheads, 1) * xf[:, t]
+    return out, state
+
+
+# --------------------------------------------------------------------------- #
+# Verification 2: Metal F0->F1->F2 chained, vs the SERIAL forward < 5e-4 fp16.  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(
+    not _torch_mps_available(), reason="requires torch + Metal (mps) backend"
+)
+@pytest.mark.parametrize(
+    "batch,seqlen,chunk,nheads,headdim,dstate",
+    [
+        (1, 256, 64, 2, 64, 16),
+        (1, 4096, 64, 8, 64, 16),   # full-scale-style threadgroup counts
+    ],
+)
+def test_chained_metal_f0f1f2_matches_serial_forward(
+    batch, seqlen, chunk, nheads, headdim, dstate, capsys
+):
+    """FULL chained Metal forward (F0->F1->F2) vs SERIAL forward < 5e-4 fp16.
+
+    The Stage-2 end-to-end PARITY GATE. cb/dA_cumsum/summary_states/prev_states
+    flow segment->segment EXACTLY as caller-owned handoff buffers (the Path-C
+    multi-segment ABI). No eager precompute — F0/F1 are real Metal kernels.
+    """
+    import torch
+    from einops import rearrange
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
+        build_chunk_precompute_metal,
+        build_inter_chunk_recur_metal,
+        chunk_precompute_fwd_grid,
+        inter_chunk_recur_fwd_grid,
+    )
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        MAMBA3_CHUNKED_FWD_BLOCK_M,
+        build_chunk_scan_combine_metal,
+        chunk_scan_fwd_grid,
+    )
+
+    assert chunk == MAMBA3_CHUNKED_FWD_BLOCK_M
+    ngroups = 1
+    nchunks = seqlen // chunk
+    dev = "mps"
+    torch.manual_seed(0)
+    C = (torch.randn(batch, seqlen, ngroups, dstate, device=dev) * 0.1).half()
+    Bmat = (torch.randn(batch, seqlen, ngroups, dstate, device=dev) * 0.1).half()
+    x = (torch.randn(batch, seqlen, nheads, headdim, device=dev) * 0.1).half()
+    A = -torch.rand(nheads, device=dev).half()
+    dt = (torch.rand(batch, seqlen, nheads, device=dev) * 0.05).half()
+    D = torch.randn(nheads, device=dev).half()
+    h0 = (torch.randn(batch, nheads, headdim, dstate, device=dev) * 0.1).float()
+
+    tg0, g0 = chunk_precompute_fwd_grid(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+    tg1, g1 = inter_chunk_recur_fwd_grid(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+    tg2, g2 = chunk_scan_fwd_grid(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+
+    # ---- F0: precompute ---- (caller-owned handoff buffers, pre-zeroed) ----
+    k0 = build_chunk_precompute_metal(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+    cb = torch.zeros(batch, nchunks, ngroups, chunk, chunk, device=dev, dtype=torch.float16)
+    dA_cumsum = torch.zeros(batch, nheads, nchunks, chunk, device=dev, dtype=torch.float16)
+    summary_states = torch.zeros(batch, nchunks, nheads, headdim, dstate, device=dev, dtype=torch.float32)
+    k0(x.contiguous(), Bmat.contiguous(), C.contiguous(), A.contiguous(), dt.contiguous(),
+       cb, dA_cumsum, summary_states)
+    torch.mps.synchronize()
+
+    # ---- F1: inter-chunk recurrence ---- (consumes F0 handoff) ----
+    k1 = build_inter_chunk_recur_metal(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+    prev_states = torch.zeros(batch, nchunks, nheads, headdim, dstate, device=dev, dtype=torch.float32)
+    final_state = torch.zeros(batch, nheads, headdim, dstate, device=dev, dtype=torch.float32)
+    k1(summary_states.contiguous(), dA_cumsum.contiguous(), h0.contiguous(),
+       prev_states, final_state)
+    torch.mps.synchronize()
+
+    # ---- F2: scan+combine ---- (consumes F0+F1 handoff; prev_states->fp16) ----
+    k2 = build_chunk_scan_combine_metal(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+    dt_k = rearrange(dt, "b (c s) hh -> b hh c s", c=nchunks).contiguous()
+    out = torch.zeros(batch, seqlen, nheads, headdim, device=dev, dtype=torch.float16)
+    k2(cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
+       C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+    torch.mps.synchronize()
+
+    # ---- SERIAL ground truth (full per-timestep recurrence, seeded by h0) ----
+    out_serial, hlast_serial = _serial_full_forward(C.cpu(), Bmat.cpu(), x.cpu(), A.cpu(), dt.cpu(), h0.cpu(), D.cpu())
+
+    assert not bool(torch.isnan(out).any()), "chained Metal forward produced NaN"
+    assert not bool(torch.isnan(final_state).any()), "F1 final_state produced NaN"
+    max_abs = float((out.float().cpu() - out_serial).abs().max())
+    max_hlast = float((final_state.float().cpu() - hlast_serial).abs().max())
+    with capsys.disabled():
+        print(
+            f"\n[chained-metal] S={seqlen} chunk={chunk} H={nheads} P={headdim} "
+            f"N={dstate} -> tg(F0/F1/F2)={tg0}/{tg1}/{tg2} grids={g0}/{g1}/{g2} "
+            f"out max|abs|(chain vs serial)={max_abs:.3e} "
+            f"h_last max|abs|={max_hlast:.3e}"
+        )
+    assert max_abs < 5e-4, (
+        f"chained-Metal-vs-serial out max|abs|={max_abs:.3e} > Stage-2 gate 5e-4 "
+        f"at S={seqlen}"
+    )
+    assert max_hlast < 5e-4, (
+        f"chained-Metal-vs-serial h_last max|abs|={max_hlast:.3e} > 5e-4 at S={seqlen}"
+    )
