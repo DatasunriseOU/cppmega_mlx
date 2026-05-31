@@ -11581,10 +11581,12 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             f"{out_dim} * {inner_dim} + {feature}",
         )
+        # Lane-disjoint: lane==feature, address==out_dim*inner_dim+feature, so
+        # each lane owns a distinct out_proj_weight_grad column. Serial time loop
+        # => non-atomic RMW is byte-identical and avoids the global-atomic stall.
         body.append(
-            f"{indent * 8}T.atomic_add({out_grad_ref}, "
-            f"{stage_grad}[0] * {out_inner}[{feature}], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 8}{out_grad_ref} = {out_grad_ref} + "
+            f"({stage_grad}[0] * {out_inner}[{feature}])"
         )
     body.append(f"{indent * 6}T.sync_threads()")
     body.append(
@@ -11845,17 +11847,17 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             grad_flat,
         )
+        # Lane-disjoint: lane==rank_loop, grad_flat=(rank_loop*groups+.)*sd+.
+        # so each lane owns distinct addresses; serial time loop => RMW.
         body.append(
-            f"{indent * 9}T.atomic_add({b_norm_grad_ref}, "
-            f"{scalar0}[0] * {conv}[{conv_b_offset} + {grad_flat}] * "
-            f"{b_inv}[{rank_loop} * {groups} + {group_loop}], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 9}{b_norm_grad_ref} = {b_norm_grad_ref} + "
+            f"({scalar0}[0] * {conv}[{conv_b_offset} + {grad_flat}] * "
+            f"{b_inv}[{rank_loop} * {groups} + {group_loop}])"
         )
     if b_bias_grad is not None:
         b_bias_grad_ref = _indexed_buffer_ref(b_bias_grad, access_by_buffer, grad_flat)
         body.append(
-            f"{indent * 9}T.atomic_add({b_bias_grad_ref}, {scalar0}[0], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 9}{b_bias_grad_ref} = {b_bias_grad_ref} + {scalar0}[0]"
         )
     body.append(
         f"{indent * 9}{conv_grad}[{conv_b_offset} + {grad_flat}] = "
@@ -11876,17 +11878,16 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             grad_flat,
         )
+        # Lane-disjoint (lane==rank_loop); serial time loop => non-atomic RMW.
         body.append(
-            f"{indent * 9}T.atomic_add({c_norm_grad_ref}, "
-            f"{scalar1}[0] * {conv}[{conv_c_offset} + {grad_flat}] * "
-            f"{c_inv}[{rank_loop} * {groups} + {group_loop}], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 9}{c_norm_grad_ref} = {c_norm_grad_ref} + "
+            f"({scalar1}[0] * {conv}[{conv_c_offset} + {grad_flat}] * "
+            f"{c_inv}[{rank_loop} * {groups} + {group_loop}])"
         )
     if c_bias_grad is not None:
         c_bias_grad_ref = _indexed_buffer_ref(c_bias_grad, access_by_buffer, grad_flat)
         body.append(
-            f"{indent * 9}T.atomic_add({c_bias_grad_ref}, {scalar1}[0], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 9}{c_bias_grad_ref} = {c_bias_grad_ref} + {scalar1}[0]"
         )
     body.append(
         f"{indent * 9}{conv_grad}[{conv_c_offset} + {grad_flat}] = "
@@ -11935,9 +11936,9 @@ def _append_row_phased_mamba3_bwd_body(
     )
     if dt_bias_grad is not None:
         dt_bias_grad_ref = _indexed_buffer_ref(dt_bias_grad, access_by_buffer, hidden_dim)
+        # Lane-disjoint (lane==hidden_dim); serial time loop => non-atomic RMW.
         body.append(
-            f"{indent * 9}T.atomic_add({dt_bias_grad_ref}, {scalar3}[0], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 9}{dt_bias_grad_ref} = {dt_bias_grad_ref} + {scalar3}[0]"
         )
     body.append(f"{indent * 9}for {hidden_loop} in T.serial(0, {hidden_size}):")
     if in_proj_weight_grad is not None:
@@ -11951,15 +11952,16 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             f"({trap_offset} + {hidden_dim}) * {hidden_size} + {hidden_loop}",
         )
+        # Lane-disjoint (lane==hidden_dim => distinct rows dt_offset+hidden_dim /
+        # trap_offset+hidden_dim). The later main scatter touches the same rows
+        # only across a sync_threads barrier (sequential) => non-atomic RMW.
         body.append(
-            f"{indent * 10}T.atomic_add({next_dt_grad_ref}, "
-            f"{_mamba3_hidden_expr(f'({time_idx} + 1)', hidden_loop)} * {scalar3}[0], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 10}{next_dt_grad_ref} = {next_dt_grad_ref} + "
+            f"({_mamba3_hidden_expr(f'({time_idx} + 1)', hidden_loop)} * {scalar3}[0])"
         )
         body.append(
-            f"{indent * 10}T.atomic_add({next_trap_grad_ref}, "
-            f"{_mamba3_hidden_expr(f'({time_idx} + 1)', hidden_loop)} * {scalar4}[0], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 10}{next_trap_grad_ref} = {next_trap_grad_ref} + "
+            f"({_mamba3_hidden_expr(f'({time_idx} + 1)', hidden_loop)} * {scalar4}[0])"
         )
     if hidden_grad is not None:
         hidden_grad_ref = _indexed_buffer_ref(
@@ -12012,9 +12014,11 @@ def _append_row_phased_mamba3_bwd_body(
     )
     if dt_bias_grad is not None:
         dt_bias_grad_ref = _indexed_buffer_ref(dt_bias_grad, access_by_buffer, head)
+        # Lane-disjoint (lane==head); separated from the earlier dt_bias scatter
+        # by a sync_threads => non-atomic RMW accumulates correctly.
         body.append(
-            f"{indent * 7}T.atomic_add({dt_bias_grad_ref}, "
-            f"{dt_grad}[{head}] * {scalar0}[0], memory_order=\"relaxed\")"
+            f"{indent * 7}{dt_bias_grad_ref} = {dt_bias_grad_ref} + "
+            f"({dt_grad}[{head}] * {scalar0}[0])"
         )
     body.append(
         f"{indent * 7}if -T.log(1.0 + T.exp({projected}[{a_offset} + {head}])) < -0.01:"
@@ -12038,9 +12042,9 @@ def _append_row_phased_mamba3_bwd_body(
     )
     if conv_bias_grad is not None:
         conv_bias_ref = _indexed_buffer_ref(conv_bias_grad, access_by_buffer, conv_ch)
+        # Lane-disjoint (lane==conv_ch); serial time loop => non-atomic RMW.
         body.append(
-            f"{indent * 7}T.atomic_add({conv_bias_ref}, {scalar1}[0], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 7}{conv_bias_ref} = {conv_bias_ref} + {scalar1}[0]"
         )
     if history_len > 0:
         body.append(f"{indent * 7}for {kernel_pos} in T.serial(0, {history_len}):")
@@ -12072,9 +12076,11 @@ def _append_row_phased_mamba3_bwd_body(
                 access_by_buffer,
                 f"{conv_ch} * {kernel} + {kernel_pos}",
             )
+            # Lane-disjoint: lane==conv_ch owns row conv_ch*kernel+. ; serial time
+            # loop => non-atomic RMW byte-identical to the atomic.
             body.append(
-                f"{indent * 8}T.atomic_add({conv_weight_grad_ref}, "
-                f"{scalar1}[0] * {scalar2}[0], memory_order=\"relaxed\")"
+                f"{indent * 8}{conv_weight_grad_ref} = {conv_weight_grad_ref} + "
+                f"({scalar1}[0] * {scalar2}[0])"
             )
         body.append(f"{indent * 8}if {src_row} >= 0:")
         body.append(f"{indent * 9}for {hidden_loop} in T.serial(0, {hidden_size}):")
@@ -12084,11 +12090,13 @@ def _append_row_phased_mamba3_bwd_body(
                 access_by_buffer,
                 f"({x_offset} + {conv_ch}) * {hidden_size} + {hidden_loop}",
             )
+            # Lane-disjoint: lane==conv_ch => row (x_offset+conv_ch)*H+. ; the
+            # main in-proj scatter (a sync_threads later) hits the same rows only
+            # SEQUENTIALLY, so non-atomic RMW accumulates correctly.
             body.append(
-                f"{indent * 10}T.atomic_add({in_proj_grad_ref}, "
-                f"{_mamba3_hidden_expr(src_row, hidden_loop)} * {scalar1}[0] * "
-                f"{_mamba3_conv_weight_expr(conv_ch, kernel_pos)}, "
-                "memory_order=\"relaxed\")"
+                f"{indent * 10}{in_proj_grad_ref} = {in_proj_grad_ref} + "
+                f"({_mamba3_hidden_expr(src_row, hidden_loop)} * {scalar1}[0] * "
+                f"{_mamba3_conv_weight_expr(conv_ch, kernel_pos)})"
             )
         if hidden_grad is not None:
             hidden_grad_ref = _indexed_buffer_ref(
@@ -12108,10 +12116,11 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             f"{conv_ch} * {kernel} + {history_len}",
         )
+        # Lane-disjoint (lane==conv_ch); serial time loop => non-atomic RMW.
         body.append(
-            f"{indent * 7}T.atomic_add({current_conv_weight_grad_ref}, "
-            f"{scalar1}[0] * {projected}[{x_offset} + {conv_ch}], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 7}{current_conv_weight_grad_ref} = "
+            f"{current_conv_weight_grad_ref} + "
+            f"({scalar1}[0] * {projected}[{x_offset} + {conv_ch}])"
         )
     body.append(
         f"{indent * 7}{project_grad}[{x_offset} + {conv_ch}] = "
@@ -12130,12 +12139,18 @@ def _append_row_phased_mamba3_bwd_body(
             access_by_buffer,
             f"{proj_dim} * {hidden_size} + {hidden_loop}",
         )
+        # Lane-disjoint scatter: lane==proj_dim, so each lane owns a distinct
+        # in_proj_weight_grad ROW (proj_dim*H + .) and the serial time loop runs
+        # one step at a time. No two threads ever target the same address within
+        # a launch -> a non-atomic read-modify-write is byte-identical to the
+        # atomic and ~10x cheaper (relaxed global atomics serialize on Metal).
         body.append(
-            f"{indent * 8}T.atomic_add({in_proj_grad_ref}, "
-            f"{_mamba3_hidden_expr(time_idx, hidden_loop)} * {project_grad}[{proj_dim}], "
-            "memory_order=\"relaxed\")"
+            f"{indent * 8}{in_proj_grad_ref} = {in_proj_grad_ref} + "
+            f"({_mamba3_hidden_expr(time_idx, hidden_loop)} * {project_grad}[{proj_dim}])"
         )
     if hidden_grad is not None:
+        # hidden_grad[time_idx*H + hidden_loop]: ALL proj_dim lanes accumulate
+        # into the same hidden_loop column -> lanes COLLIDE; keep atomic.
         hidden_grad_ref = _indexed_buffer_ref(
             hidden_grad,
             access_by_buffer,
