@@ -41,6 +41,15 @@ class DevicePreset:
     compiler_shader_ceiling_bytes: int | None
     logical_to_physical_shared_margin: float
     buffer_arg_limit: int
+    # Empirically-characterized fused-segment op-count caps for this device's
+    # compiler/watchdog (the hand-tuned 2/1 on M4 Max). These are device facts
+    # (the MTLCompilerService pipeline-size crash band and the watchdog per-op
+    # isolation need): the planner uses them as the PRIMARY split mechanism and
+    # ADDS the MSL-byte / watchdog-time predicates as device-grounded backstops
+    # that fire on larger region shapes than the calibration scale. None -> no
+    # op-count cap (CUDA: no compiler crash / no watchdog -> monolithic fusion).
+    forward_max_segment_nodes: int | None = None
+    backward_max_segment_nodes: int | None = None
     per_op_time_per_row_s: dict[str, float] = field(default_factory=dict)
     per_op_ref_shape: dict[str, int] = field(default_factory=dict)
     effective_flop_s: float = 0.0
@@ -78,6 +87,8 @@ _PRESETS: tuple[DevicePreset, ...] = (
         compiler_shader_ceiling_bytes=140_000,  # between 116 KiB OK and 176 KiB crash
         logical_to_physical_shared_margin=3.7,  # ~29.5 KiB physical / 8 KiB logical
         buffer_arg_limit=31,
+        forward_max_segment_nodes=2,  # MTLCompilerService pipeline-size band
+        backward_max_segment_nodes=1,  # watchdog per-op isolation
         per_op_time_per_row_s={  # @ local_gb10_quarter ref shape (S=4096)
             "sparse_mla_fp8_apply_bwd": 12.0 / 4096,  # ~12 s monolithic / 4096 rows
             "attention_qkv_projection_bwd": 10.0 / 4096,  # ~10 s monolithic / 4096 rows

@@ -166,6 +166,13 @@ def calibrate_nonqueryable_limits(
         calibrated["has_command_buffer_watchdog"] = True
         calibrated["safety_margin"] = 0.5
         calibrated["buffer_arg_limit"] = 31
+        # The op-count caps are derived from the watchdog/compiler facts: a
+        # watchdog device needs per-op backward isolation (1); the forward MSL
+        # band drives the forward cap. A genuinely-new device's true forward cap
+        # comes from the _probe_msl_ceiling op-count bisection; until that probe
+        # is implemented for the new device this RAISES above, so we never guess.
+        calibrated["forward_max_segment_nodes"] = 2
+        calibrated["backward_max_segment_nodes"] = 1
     elif backend == "cuda":
         # CUDA has no watchdog / no MSL pipeline-state ceiling; the only hard
         # limit is the queried shared cap. The remaining non-queryable fields are

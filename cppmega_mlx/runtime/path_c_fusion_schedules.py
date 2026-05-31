@@ -327,9 +327,15 @@ DESCRIPTOR_EXECUTION_STAGES = frozenset(
 #   chain_0_3 (3 light fwd ops)  ~46 KB  -> pipeline OK
 #   chain_7_10 (3 bwd ops)       ~116 KB -> pipeline OK
 #   chain_3_7 (4 heavy fwd ops)  ~176 KB -> pipeline CRASH (newComputePipelineState)
-# Capping forward segments at 2 ops splits chain_3_7 into chain_3_5 and chain_5_7,
-# each well under the crashing size. CUDA's compiler has no such pipeline-state
-# limit, so this cap is gated to Metal only (CUDA keeps greedy forward fusion).
+# Capping forward segments at 2 ops splits the heavy forward chain into smaller
+# pipeline-safe kernels. CUDA's compiler has no such pipeline-state limit, so this
+# cap is Metal only (CUDA keeps greedy forward fusion).
+#
+# SUPERSEDED (design step 8 / §3.1): the planner no longer reads this literal --
+# it resolves the forward op cap from ``device_caps().forward_max_segment_nodes``
+# (the M4 Max preset carries 2; CUDA carries None -> monolithic), and ADDS the
+# MSL-byte estimate predicate as a device-grounded backstop. The constant is kept
+# only as documentation of the characterized M4 Max value.
 METAL_FORWARD_MAX_SEGMENT_NODES = 2
 
 # Metal-only BACKWARD fused-segment op-count cap.
@@ -355,6 +361,12 @@ METAL_FORWARD_MAX_SEGMENT_NODES = 2
 # 1-op segment, so isolation MUST be paired with row-windowing (the cap of 1
 # guarantees the isolation those ops need to be row-chunked). CUDA has no such
 # watchdog, so the cap is Metal-only (CUDA keeps greedy backward fusion).
+#
+# SUPERSEDED (design step 8 / §3.1): the planner now resolves the backward op cap
+# from ``device_caps().backward_max_segment_nodes`` (the M4 Max preset carries 1
+# -- the watchdog per-op isolation; CUDA carries None -> monolithic), and ADDS the
+# watchdog-time estimate predicate as a device-grounded backstop. The constant is
+# kept only as documentation of the characterized M4 Max value.
 METAL_BACKWARD_MAX_SEGMENT_NODES = 1
 
 
@@ -14702,6 +14714,159 @@ def plan_path_c_fusion_schedule_for_region(
     )
 
 
+def _derived_max_rows_per_launch_for_region(
+    candidate_region: PathCFusionRegion,
+) -> int:
+    """Device-derived watchdog-safe row window for a candidate segment.
+
+    Replaces the hardcoded ``DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH = 64`` passed
+    to the launcher_chunks switch (design §3.4 / §4.7):
+    ``min(floor(watchdog_window * safety / per_row_time), descriptor_default)``.
+    At the M4 Max / local_gb10_quarter scale the watchdog-safe bound (~1024)
+    exceeds the descriptor default, so this lands on the hand-tuned 64; on a
+    tighter-watchdog device it shrinks below 64 (and the backstop RAISES if even
+    one row cannot fit). Needs no generated source -- only the shape env + the
+    per-op coefficient -- so it is free at the switch point.
+    """
+
+    from cppmega_mlx.runtime.path_c_device_caps import device_caps
+    from cppmega_mlx.runtime import path_c_segment_estimator as _estimator
+
+    caps = device_caps()
+    env = _shape_env_for_region(candidate_region)
+    if env is None or caps.watchdog_window_s is None:
+        return DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH
+    op_names = tuple(
+        _path_c_descriptor_stage_node_op_name(node)
+        for node in candidate_region.nodes
+    )
+    # Use the SLOWEST (largest per-row) non-recurrent op in the segment to bound
+    # the row window (the recurrent ops are time-chunked, not row-timed).
+    est_gpu_time_s = sum(
+        _estimator.est_op_gpu_time_s(op_name, env, caps) for op_name in op_names
+    )
+    seq = max(1, int(env.sequence_length))
+    est = _estimator.SegmentEstimate(
+        logical_shared_bytes=0,
+        physical_shared_bytes=0,
+        buffer_arg_count=0,
+        est_gpu_time_s=est_gpu_time_s,
+        is_recurrent=False,
+        msl_source_bytes=0,
+        per_row_time_s=est_gpu_time_s / seq,
+    )
+    return _estimator.derived_max_rows_per_launch(
+        est, caps, descriptor_default=DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH
+    )
+
+
+def _path_c_segment_estimate_backstop(
+    *,
+    candidate_region: PathCFusionRegion,
+    direct_target: Any,
+    parameter_count: int,
+    execution_phase: str,
+    segment_op_count: int,
+) -> str | None:
+    """Device-grounded MSL-size / watchdog-time backstop for one candidate segment.
+
+    Returns a ``first_failure`` string (shrink the segment, try fewer ops) when an
+    estimate exceeds a device limit but the segment can still be split; RAISES
+    :class:`PathCSplitInfeasible` when a single-op (irreducible) segment exceeds a
+    hard limit (RULE #1, design §6.3). Returns ``None`` when the segment passes.
+
+    Only fires on a Metal device whose caps carry the relevant ceiling/watchdog;
+    CUDA caps have ``msl_pipeline_state_ceiling_bytes is None`` and
+    ``has_command_buffer_watchdog is False`` so this is a no-op there.
+    """
+
+    from cppmega_mlx.runtime.path_c_device_caps import device_caps
+    from cppmega_mlx.runtime import path_c_segment_estimator as _estimator
+
+    caps = device_caps()
+    # Nothing to back-stop on CUDA (no compiler pipeline crash, no watchdog).
+    if caps.msl_pipeline_state_ceiling_bytes is None and not (
+        caps.has_command_buffer_watchdog
+    ):
+        return None
+
+    prim_func = direct_target.schedule_template(candidate_region)
+    source = getattr(prim_func, "_cppmega_path_c_generated_source", "") or ""
+    op_names = tuple(
+        _path_c_descriptor_stage_node_op_name(node)
+        for node in candidate_region.nodes
+    )
+    env = _shape_env_for_region(candidate_region)
+    is_recurrent = any(_node_is_recurrent_state_scan(node) for node in candidate_region.nodes)
+    est = _estimator.estimate_segment_from_source(
+        source=source,
+        op_names=op_names,
+        buffer_arg_count=parameter_count,
+        env=env,
+        caps=caps,
+        is_recurrent=is_recurrent,
+        alloc_shared_re=_ALLOC_SHARED_LINE_RE,
+        dtype_nbytes=_DTYPE_NBYTES,
+        flattened_extent=_flattened_extent,
+    )
+
+    # (c) forward MSL pipeline-state ceiling (Metal-only).
+    if (
+        caps.msl_pipeline_state_ceiling_bytes is not None
+        and execution_phase == DESCRIPTOR_EXECUTION_STAGE_FORWARD
+        and est.msl_source_bytes > caps.msl_pipeline_state_ceiling_bytes
+    ):
+        if segment_op_count == 1:
+            raise PathCSplitInfeasible(
+                candidate_region.name,
+                "msl-pipeline-size",
+                est.msl_source_bytes,
+                caps.msl_pipeline_state_ceiling_bytes,
+                op_name=op_names[0] if op_names else "",
+            )
+        return (
+            f"forward segment MSL source {est.msl_source_bytes} B exceeds the "
+            f"compiler pipeline-state ceiling {caps.msl_pipeline_state_ceiling_bytes} B "
+            f"-- shrink segment"
+        )
+
+    # (d) backward watchdog-time budget (Metal-only). The recurrent/independent
+    # row/time chunking already switched the dispatch above; here we check the
+    # PER-LAUNCH time still fits after chunking, and RAISE if even a 1-op segment
+    # at the minimal window cannot fit.
+    if (
+        caps.has_command_buffer_watchdog
+        and execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
+        and caps.watchdog_window_s is not None
+    ):
+        budget_s = caps.watchdog_window_s * caps.safety_margin
+        if est.est_gpu_time_s > budget_s:
+            # Recurrent ops time-chunk; independent ops row-window. Estimate the
+            # per-launch time after the derived chunking.
+            if est.is_recurrent:
+                chunks = _estimator.derived_time_chunk_count(est, caps)
+                per_launch = est.est_gpu_time_s / max(1, chunks)
+            else:
+                rows = _estimator.derived_max_rows_per_launch(est, caps)
+                seq = max(1, int(env.sequence_length)) if env is not None else 1
+                per_launch = est.est_gpu_time_s * (rows / seq)
+            if per_launch > budget_s:
+                if segment_op_count == 1:
+                    raise PathCSplitInfeasible(
+                        candidate_region.name,
+                        "watchdog",
+                        per_launch,
+                        budget_s,
+                        op_name=op_names[0] if op_names else "",
+                    )
+                return (
+                    f"backward segment est per-launch {per_launch:.3f}s exceeds the "
+                    f"watchdog budget {budget_s:.3f}s even after chunking -- shrink "
+                    f"segment"
+                )
+    return None
+
+
 def plan_path_c_direct_fusion_chain_for_region(
     region: PathCFusionRegion,
     *,
@@ -14767,16 +14932,23 @@ def plan_path_c_direct_fusion_chain_for_region(
         raise ValueError("max_kernel_buffers must be positive")
     if max_segment_nodes is not None and max_segment_nodes <= 0:
         raise ValueError("max_segment_nodes must be positive when provided")
+    # Resolve the forward/backward fusion caps from the DEVICE-CAPABILITY probe
+    # (design step 8 / §3.1), no longer from the METAL_*_MAX_SEGMENT_NODES
+    # literals: caps.forward_max_segment_nodes is the compiler MSL-band op cap
+    # (Metal 2; CUDA None -> monolithic), caps.backward_max_segment_nodes is the
+    # watchdog per-op-isolation cap (Metal 1; CUDA None). The MSL-byte and
+    # watchdog-time ESTIMATE predicates below (estimate_segment) layer on top as
+    # device-grounded backstops that fire on larger region shapes. CUDA, with no
+    # compiler crash and no watchdog, resolves both to None and stays monolithic.
+    _caps_for_planner = None
+    if isinstance(forward_max_segment_nodes, _ResolveFromTarget) or isinstance(
+        backward_max_segment_nodes, _ResolveFromTarget
+    ):
+        from cppmega_mlx.runtime.path_c_device_caps import device_caps
+
+        _caps_for_planner = device_caps()
     if isinstance(forward_max_segment_nodes, _ResolveFromTarget):
-        # Resolve the forward fusion cap from the active lowering target:
-        # Metal needs the split (MTLCompilerService crashes at
-        # newComputePipelineState on the 4-op forward mega-kernel); CUDA has no
-        # such limit and stays uncapped (greedy) for max fusion.
-        forward_max_segment_nodes = (
-            METAL_FORWARD_MAX_SEGMENT_NODES
-            if _path_c_default_target() == "metal"
-            else None
-        )
+        forward_max_segment_nodes = _caps_for_planner.forward_max_segment_nodes
     if (
         forward_max_segment_nodes is not None
         and forward_max_segment_nodes <= 0
@@ -14785,15 +14957,7 @@ def plan_path_c_direct_fusion_chain_for_region(
             "forward_max_segment_nodes must be positive when provided"
         )
     if isinstance(backward_max_segment_nodes, _ResolveFromTarget):
-        # Resolve the backward fusion cap from the active lowering target: Metal
-        # caps at 1 op/segment (so the watchdog-killing 3-op backward segment
-        # ..._chain_7_10 splits per op and the heavy per-row-independent ops can
-        # be row-windowed); CUDA stays uncapped (no watchdog).
-        backward_max_segment_nodes = (
-            METAL_BACKWARD_MAX_SEGMENT_NODES
-            if _path_c_default_target() == "metal"
-            else None
-        )
+        backward_max_segment_nodes = _caps_for_planner.backward_max_segment_nodes
     if (
         backward_max_segment_nodes is not None
         and backward_max_segment_nodes <= 0
@@ -15007,7 +15171,7 @@ def plan_path_c_direct_fusion_chain_for_region(
                 direct_target = _target_with_max_rows_per_launch(
                     direct_target,
                     candidate_region,
-                    DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+                    _derived_max_rows_per_launch_for_region(candidate_region),
                     DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
                     rows_per_kernel_launch=(
                         _mamba3_bwd_rows_per_kernel_launch_for_nodes(
@@ -15050,7 +15214,7 @@ def plan_path_c_direct_fusion_chain_for_region(
                 direct_target = _target_with_max_rows_per_launch(
                     direct_target,
                     candidate_region,
-                    DESCRIPTOR_DEFAULT_MAX_ROWS_PER_LAUNCH,
+                    _derived_max_rows_per_launch_for_region(candidate_region),
                     DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
                 )
             try:
@@ -15068,6 +15232,25 @@ def plan_path_c_direct_fusion_chain_for_region(
                     f"direct-buffer segment needs {parameter_count} kernel "
                     f"buffers, above limit {max_kernel_buffers}"
                 )
+                break
+            # Device-grounded ESTIMATE backstops (design step 8 / §3.2-3.4): the
+            # op-count caps above are the primary split mechanism (they reproduce
+            # the hand-tuned splits at the calibration scale); these predicates
+            # additionally fire on LARGER region shapes whose generated MSL source
+            # exceeds the compiler pipeline-state ceiling (forward) or whose
+            # estimated GPU time exceeds the watchdog budget even after row/time
+            # chunking (backward). On a 1-op segment that still cannot fit, they
+            # RAISE PathCSplitInfeasible (RULE #1) rather than emit a kernel the
+            # device will crash on.
+            backstop_failure = _path_c_segment_estimate_backstop(
+                candidate_region=candidate_region,
+                direct_target=direct_target,
+                parameter_count=parameter_count,
+                execution_phase=execution_phase,
+                segment_op_count=end - start,
+            )
+            if backstop_failure is not None:
+                first_failure = backstop_failure
                 break
             plan = compile_path_c_region(
                 candidate_region,

@@ -80,6 +80,11 @@ class DeviceCaps:
     effective_flop_s: float
     effective_bytes_s: float
     safety_margin: float
+    # Device-characterized fused-segment op-count caps (Metal 2/1; CUDA None/None).
+    # The PRIMARY split mechanism; the MSL-byte / watchdog-time estimate predicates
+    # are device-grounded backstops layered on top (design §3.3-3.4).
+    forward_max_segment_nodes: int | None = None
+    backward_max_segment_nodes: int | None = None
     # provenance per field: "queried" | "family-const" | "preset" | "calibrated" | "cache"
     source: dict[str, str] = field(default_factory=dict)
 
@@ -439,6 +444,8 @@ class _NonQueryable:
     effective_flop_s: float
     effective_bytes_s: float
     safety_margin: float
+    forward_max_segment_nodes: int | None
+    backward_max_segment_nodes: int | None
     provenance: str  # "preset" | "cache" | "calibrated"
 
 
@@ -453,6 +460,8 @@ def _preset_to_nonqueryable(preset: DevicePreset, *, provenance: str) -> _NonQue
         effective_flop_s=preset.effective_flop_s,
         effective_bytes_s=preset.effective_bytes_s,
         safety_margin=preset.safety_margin,
+        forward_max_segment_nodes=preset.forward_max_segment_nodes,
+        backward_max_segment_nodes=preset.backward_max_segment_nodes,
         provenance=provenance,
     )
 
@@ -518,6 +527,8 @@ def _merge_cache_over_preset(
             effective_flop_s=float(cached.get("effective_flop_s", 0.0)),
             effective_bytes_s=float(cached.get("effective_bytes_s", 0.0)),
             safety_margin=float(cached.get("safety_margin", 0.5)),
+            forward_max_segment_nodes=cached.get("forward_max_segment_nodes"),
+            backward_max_segment_nodes=cached.get("backward_max_segment_nodes"),
             provenance="cache",
         )
         return base
@@ -545,6 +556,8 @@ def _merge_cache_over_preset(
             cached.get("effective_bytes_s", base.effective_bytes_s)
         ),
         safety_margin=base.safety_margin,
+        forward_max_segment_nodes=base.forward_max_segment_nodes,
+        backward_max_segment_nodes=base.backward_max_segment_nodes,
         provenance="cache",
     )
 
@@ -634,6 +647,8 @@ def _assemble(backend: str, live: dict[str, Any], nq: _NonQueryable) -> DeviceCa
         "effective_flop_s": nq.provenance,
         "effective_bytes_s": nq.provenance,
         "safety_margin": nq.provenance,
+        "forward_max_segment_nodes": nq.provenance,
+        "backward_max_segment_nodes": nq.provenance,
     }
 
     return DeviceCaps(
@@ -658,6 +673,12 @@ def _assemble(backend: str, live: dict[str, Any], nq: _NonQueryable) -> DeviceCa
         effective_flop_s=nq.effective_flop_s,
         effective_bytes_s=nq.effective_bytes_s,
         safety_margin=nq.safety_margin,
+        forward_max_segment_nodes=(
+            nq.forward_max_segment_nodes if backend == "metal" else None
+        ),
+        backward_max_segment_nodes=(
+            nq.backward_max_segment_nodes if backend == "metal" else None
+        ),
         source=source,
     )
 
