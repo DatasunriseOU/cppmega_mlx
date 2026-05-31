@@ -137,6 +137,30 @@ _EXACT_ROW_PHASED_BACKWARD_OPS = frozenset(
         "mamba3_mimo_bwd",
     }
 )
+# Recurrent REVERSE-TIME-SCAN backward ops. Each is a single
+# ``for time_rev in T.serial(0, S)`` over the WHOLE sequence inside ONE
+# threadgroup. Encoded under the default grid_chunks dispatch as ONE Metal
+# command buffer that spans all S time steps, the scan exceeds the macOS GPU
+# watchdog window (kIOGPUCommandBufferCallbackErrorTimeout). These ops MUST be
+# switched to launcher_chunks so the reverse scan is driven as K command buffers
+# over TIME (one ``artifact()`` per row-window, reverse adjoint state carried
+# across launches through caller-owned buffers). The other row-phased backward
+# ops in _EXACT_ROW_PHASED_BACKWARD_OPS (attention_qkv_projection_bwd /
+# sparse_mla_fp8_apply_bwd) are per-row-INDEPENDENT (no carried reverse-time
+# state) so they fit one command buffer and stay grid_chunks.
+#
+# NOTE: the original intra-segment time-chunking (commit ac412fb) only covered
+# mamba3_mimo_bwd, but in the direct-chain reverse order the m2rnn_bwd segment
+# runs BEFORE mamba3 and is an equally long reverse-time scan -> it tripped the
+# watchdog first (verified: timeout at segment region ..._chain_10_11 /
+# op=m2rnn_bwd, before mamba3 was ever reached). Both recurrent backward ops
+# need the launcher split.
+_TIME_CHUNKED_RECURRENT_BACKWARD_OPS = frozenset(
+    {
+        "m2rnn_bwd",
+        "mamba3_mimo_bwd",
+    }
+)
 DESCRIPTOR_ROW_PHASED_BWD_SCRATCH_ABI_BUFFERS = frozenset(
     {
         "attention_hidden",
@@ -14232,28 +14256,37 @@ def plan_path_c_direct_fusion_chain_for_region(
                 candidate_region,
                 DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
             )
-            # Intra-segment TIME-CHUNKING for the mamba3 mimo BACKWARD segment.
+            # Intra-segment TIME-CHUNKING for the recurrent reverse-time-scan
+            # BACKWARD segments (m2rnn_bwd AND mamba3_mimo_bwd; see
+            # _TIME_CHUNKED_RECURRENT_BACKWARD_OPS).
             #
-            # The mamba3 reverse-time recurrent scan is a single
+            # Each recurrent reverse scan is a single
             # `for time_rev in T.serial(0, S)` over the whole sequence inside ONE
             # threadgroup. Under the default grid_chunks dispatch that is ONE Metal
-            # command buffer spanning all S time steps -> ~7s GPU time -> macOS GPU
-            # watchdog kill (kIOGPUCommandBufferCallbackErrorTimeout).
+            # command buffer spanning all S time steps -> multi-second GPU time ->
+            # macOS GPU watchdog kill (kIOGPUCommandBufferCallbackErrorTimeout).
             #
-            # Switching JUST this segment to launcher_chunks makes its compiled
-            # kernel declare path_c_row_chunk_index / path_c_row_subchunk_index and
-            # emit the per-row reverse scan body
+            # Switching the segment to launcher_chunks makes its compiled kernel
+            # declare path_c_row_chunk_index / path_c_row_subchunk_index and emit
+            # the per-row reverse scan body
             # (`for time_rev in T.serial(row, row + 1)`), so the runtime can drive
-            # the reverse scan as K separate command buffers over TIME, carrying the
-            # reverse adjoint scan state (dh<->h0_grad, angle_grad<->
-            # mamba3_angle_grad_state) across launches via caller-owned buffers.
-            # Every other segment (forward + non-mamba3-bwd) keeps grid_chunks --
-            # only the long reverse scan needs the watchdog-safe launcher split.
+            # the reverse scan as K separate command buffers over TIME, carrying
+            # the reverse adjoint scan state across launches via caller-owned
+            # buffers. Every other segment (forward + per-row-INDEPENDENT backward
+            # ops like attention_qkv_projection_bwd / sparse_mla_fp8_apply_bwd /
+            # residual_rmsnorm_bwd) keeps grid_chunks -- only the long reverse
+            # scans need the watchdog-safe launcher split.
+            #
+            # The original time-chunking (commit ac412fb) covered ONLY
+            # mamba3_mimo_bwd; m2rnn_bwd runs FIRST in the reverse chain and tripped
+            # the watchdog before mamba3 was reached (verified timeout at region
+            # ..._chain_10_11 / op=m2rnn_bwd), so both recurrent ops are included.
             if (
                 execution_phase == DESCRIPTOR_EXECUTION_STAGE_BACKWARD
                 and direct_target.max_rows_per_launch is not None
                 and any(
-                    _path_c_descriptor_stage_node_op_name(node) == "mamba3_mimo_bwd"
+                    _path_c_descriptor_stage_node_op_name(node)
+                    in _TIME_CHUNKED_RECURRENT_BACKWARD_OPS
                     for node in candidate_region.nodes
                 )
             ):
