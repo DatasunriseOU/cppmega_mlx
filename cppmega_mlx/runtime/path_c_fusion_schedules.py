@@ -6298,6 +6298,36 @@ def _append_row_phased_mamba3_body(
     launcher_chunked_rows: bool = False,
     cuda_target: bool = False,
 ) -> None:
+    # CHUNKED-FORWARD INTEGRATION SITE (mamba3 forward scan-core).
+    #
+    # The state-recurrence block below (search "mamba3_scan_policy:
+    # external_state_recurrence") is the O(S) SERIAL forward scan that runs in a
+    # single ``T.Kernel(1, threads=...)`` threadgroup. The PROVEN chunked,
+    # many-threadgroup replacement is
+    # ``cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core`` — an SSD 4-step
+    # chunked forward that COMPILES + RUNS on Metal at 2048 threadgroups
+    # (S=4096,C=256,H=8) with fp16 parity ~4.9e-4 vs the SSD reference and fp32
+    # parity ~1e-5 vs OUR serial ``_chunked_mamba3_diagonal_scan`` (validated by
+    # ``tests/test_mamba3_chunked_scan_core.py``; ~37.6x forward speedup).
+    #
+    # The scan-core inputs (cb=C@Bᵀ per chunk, dA_cumsum=cumsum(A*dt),
+    # prev_states per-chunk entry states) are produced by THIS body's precompute
+    # stages, which are already position-local and grid-parallel: in-proj matvec,
+    # causal conv, RoPE angle cumsum, trapezoid, B/C RMSNorm+rope. Completing the
+    # swap means: (a) emit those precompute stages over the grid, (b) form cb /
+    # dA_cumsum / per-chunk prev_states (inter-chunk recurrence is the only O(S/C)
+    # sequential part, with the RoPE angle cumsum as a separate associative scalar
+    # prefix), (c) launch the chunked scan-core grid instead of the serial scan
+    # below, (d) apply the Y_off + skip + silu·z gate. The descriptor/ABI and the
+    # carry/replay boundary-state buffers
+    # (``_row_phased_launcher_carry_buffers_for_nodes`` /
+    # ``_row_phased_replay_buffers_for_nodes``) already plumb the per-chunk
+    # boundary states; conv needs only a ``kernel-1`` halo from the prior chunk.
+    #
+    # RULE #1: the per-target codegen choice (chunked grid vs serial launcher) is
+    # a legitimate gate, NOT a silent fallback. On chunking/parity failure the
+    # scan-core helpers RAISE with where+what; do not silently keep the serial
+    # path.
     projected = _scratch_name(node, "mamba3_projected_vec")
     conv_history = _scratch_name(node, "mamba3_conv_history")
     conv = _scratch_name(node, "mamba3_conv_vec")
