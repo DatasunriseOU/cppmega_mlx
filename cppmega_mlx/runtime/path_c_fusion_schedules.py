@@ -72,6 +72,7 @@ __all__ = [
     "PathCFusionScheduleRegistry",
     "PathCFusionScheduleSpec",
     "PathCFusionScheduleTarget",
+    "PathCSplitInfeasible",
     "build_path_c_descriptor_prim_func",
     "default_path_c_brick_schedule_descriptor_registry",
     "default_path_c_fusion_schedule_registry",
@@ -414,6 +415,40 @@ _TRAIN_STEP_SUFFIX_LOSS_INPUT_ABI_REASON = (
     "train-step suffix loss inputs are declared for fused loss codegen; "
     "target_mask is consumed for ntokens, while full loss codegen is pending"
 )
+class PathCSplitInfeasible(RuntimeError):
+    """A Path-C segment cannot be split to fit a hard device limit (RULE #1).
+
+    Raised when an irreducible segment -- a single op (``end - start == 1``) that,
+    after the pool/demote pass, still exceeds the threadgroup-memory cap, or
+    exceeds the buffer-argument count, or (forward) exceeds the MSL pipeline-state
+    ceiling, or (backward) exceeds the watchdog budget even at the minimal row
+    window -- has no feasible split.  We NEVER fall back to greedy fusion, NEVER
+    emit the oversized kernel, NEVER return zeros: we surface where + what failed.
+    """
+
+    def __init__(
+        self,
+        region_name: str,
+        characteristic: str,
+        estimated_value: Any,
+        limit: Any,
+        *,
+        op_name: str = "",
+    ) -> None:
+        self.region_name = region_name
+        self.characteristic = characteristic
+        self.estimated_value = estimated_value
+        self.limit = limit
+        self.op_name = op_name
+        op_suffix = f" op={op_name}" if op_name else ""
+        super().__init__(
+            f"PathCSplitInfeasible: region={region_name}{op_suffix} "
+            f"{characteristic} estimate={estimated_value} exceeds device limit "
+            f"{limit}; no feasible split (RULE #1: refusing to emit an over-budget "
+            f"kernel or fall back to greedy fusion)"
+        )
+
+
 _DTYPE_NBYTES = {
     "bool": 1,
     "uint8": 1,
@@ -10511,30 +10546,27 @@ def _append_row_phased_m2rnn_bwd_body(
 # inside the opt-in cap with headroom for compiler bookkeeping.
 _CUDA_SHARED_SCRATCH_BUDGET_BYTES = 0xC000  # 49152 bytes (static per-block).
 
-# Metal threadgroup-memory budget for a single generated kernel's residual
-# ``T.alloc_shared`` scratch.  Apple GPUs cap threadgroup memory at 32 KiB
-# (``maxTotalThreadgroupMemory`` / the metallib threadgroup allocation limit).
-# A generated mamba3/m2rnn reverse-scan backward declares MULTIPLE MB of
-# ``shared.dyn`` (the full reverse-time state h_prev/h_next/dh/dh_prev plus the
-# per-step in-proj/conv/B-C scratch), which TileLang lowers to one giant
+# Metal threadgroup-memory pooling for a generated kernel's residual
+# ``T.alloc_shared`` scratch.  Apple GPUs cap threadgroup memory at a
+# device-queried ``maxThreadgroupMemoryLength`` (32768 on M4 Max).  A generated
+# mamba3/m2rnn reverse-scan backward declares MULTIPLE MB of ``shared.dyn`` (the
+# full reverse-time state h_prev/h_next/dh/dh_prev plus the per-step
+# in-proj/conv/B-C scratch), which TileLang lowers to one giant
 # ``threadgroup float buf_dyn_shmem[...]`` array.  When that array exceeds the
 # threadgroup limit the Metal driver crashes ``MTLCompilerService`` at
-# ``newComputePipelineState`` (XPC_ERROR_CONNECTION_INTERRUPTED) — the same crash
-# previously misattributed to in-loop barriers (verified on-device: removing the
-# barriers, and even running the whole reverse scan single-lane, does NOT clear
-# the crash; demoting the oversized shared scratch off threadgroup memory DOES).
-# TRIGGER: only pool when a kernel's LOGICAL ``alloc_shared`` total exceeds this.
-# Metal's threadgroup-memory cap is 32 KiB; a kernel whose shared scratch already
-# fits keeps every buffer in threadgroup memory (unchanged), so the greedy
-# planner's buffer-count splitting is unaffected for the small per-op kernels.
-_METAL_SHARED_SCRATCH_TRIGGER_BYTES = 0x7000  # 28672 bytes (28 KiB).
-# DEMOTE-TARGET: once triggered, pool the largest buffers until the LOGICAL
-# residual is under this.  TileLang packs the residual ``alloc_shared`` into a
-# single coalesced ``buf_dyn_shmem`` array with alignment padding, so the PHYSICAL
-# threadgroup size runs a few× the logical residual; targeting 8 KiB logical keeps
-# the physical ``buf_dyn_shmem`` comfortably under Metal's 32 KiB limit (measured
-# ~29.5 KiB physical for the mamba3 backward).
-_METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES = 0x2000  # 8192 bytes (8 KiB).
+# ``newComputePipelineState`` (XPC_ERROR_CONNECTION_INTERRUPTED).
+#
+# REPLACED (design step 5 / §5): the former hardcoded
+# ``_METAL_SHARED_SCRATCH_TRIGGER_BYTES = 28672`` and
+# ``_METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES = 8192`` are GONE.  The pool pass
+# (``_pool_oversized_shared_scratch_to_metal_workspace``) now derives both from
+# the device-capability probe: it pools when the PHYSICAL residual
+# (logical * caps.logical_to_physical_shared_margin, ~3.7x from the preset)
+# exceeds the QUERIED ``caps.threadgroup_mem_bytes``, and demotes the largest
+# buffers until the residual fits.  On M4 Max this reproduces the previous
+# behaviour (trigger 32768/3.7 ~= 8856 logical; the pass is name-gated to the
+# multi-MB mamba3/m2rnn reverse-scan kernels, which trip any trigger in the
+# 8856-28672 band identically).
 
 
 def _cuda_shared_memory_optin_cap_bytes() -> int | None:
@@ -10689,17 +10721,36 @@ def _pool_oversized_shared_scratch_to_metal_workspace(source: str) -> str:
         byte_count = _flattened_extent(shape) * _DTYPE_NBYTES[dtype]
         shared.append((index, match.group("name"), shape, dtype, byte_count))
         shared_total += byte_count
-    # Only pool kernels whose shared scratch would overflow Metal's threadgroup
-    # cap; kernels that already fit are left untouched so the planner's
-    # buffer-count splitting is unchanged for them.
-    if shared_total <= _METAL_SHARED_SCRATCH_TRIGGER_BYTES:
+    # Only pool kernels whose PHYSICAL shared scratch would overflow the QUERIED
+    # Metal threadgroup cap; kernels that already fit are left untouched so the
+    # planner's buffer-count splitting is unchanged for them. The trigger and the
+    # demote target are now derived from the device-capability probe (queried
+    # threadgroup_mem_bytes) and the preset/calibrated logical->physical packing
+    # margin -- NOT the hardcoded _METAL_SHARED_SCRATCH_TRIGGER_BYTES (28672) /
+    # _DEMOTE_TARGET_BYTES (8192). TileLang coalesces the residual alloc_shared
+    # into one buf_dyn_shmem array running ``margin`` x the logical bytes, so the
+    # principled comparison is physical (= logical * margin) against the cap.
+    from cppmega_mlx.runtime.path_c_device_caps import device_caps
+
+    caps = device_caps()
+    threadgroup_cap = int(caps.threadgroup_mem_bytes)
+    margin = float(caps.logical_to_physical_shared_margin)
+    if margin <= 0:
+        raise ValueError(
+            "path_c shared-scratch pool: logical_to_physical_shared_margin must "
+            f"be >0 (got {margin!r} on {caps.device_name})"
+        )
+    # Demote until the residual LOGICAL total fits the cap once inflated by the
+    # margin (physical = logical * margin <= threadgroup_cap).
+    demote_target_logical = threadgroup_cap / margin
+    if shared_total * margin <= threadgroup_cap:
         return source
-    # Select the largest residual shared buffers to pool until the rest fit the
-    # (smaller) demote target, guaranteeing the physical buf_dyn_shmem fits 32 KiB.
+    # Select the largest residual shared buffers to pool until the rest fit,
+    # guaranteeing the physical buf_dyn_shmem fits the queried threadgroup cap.
     demote: list[tuple[int, str, tuple[int, ...], str, int]] = []
     remaining = shared_total
     for entry in sorted(shared, key=lambda item: item[4], reverse=True):
-        if remaining <= _METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES:
+        if remaining <= demote_target_logical:
             break
         demote.append(entry)
         remaining -= entry[4]
