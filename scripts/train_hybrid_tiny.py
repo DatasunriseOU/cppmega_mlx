@@ -72,6 +72,11 @@ DTYPES = {
     # until the model graph owns native FP8 producers.
     "fp8_path_b": mx.bfloat16,
     "fp8_path_c": mx.bfloat16,
+    # NVFP4 (e2m1 + per-block-16 scale) Blackwell training route. Carrier is
+    # bf16 exactly like the fp8 routes; the 4-bit e2m1 operands are materialized
+    # per-op at the GEMM boundary. m04_train_step owns the fail-loud gate that
+    # RAISES for the training ops that lack an nvfp4 kernel (no bf16 downcast).
+    "nvfp4": mx.bfloat16,
 }
 STRUCTURE_MODEL_KWARG_NAMES = (
     "structure_ids",

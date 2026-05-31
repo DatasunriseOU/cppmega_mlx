@@ -153,6 +153,16 @@ from scripts.train_hybrid_tiny import (  # noqa: E402
     validation_dataset_path,
     validate_config,
 )
+from scripts._nvfp4_route import (  # noqa: E402
+    NVFP4_CARRIER_DTYPE,
+    NVFP4_DTYPE,
+    NVFP4_E2E_TRAINING_BLOCKER_TYPE,
+    Nvfp4TrainingRouteUnavailable,
+    nvfp4_route_requested,
+    nvfp4_training_route_payload,
+    nvfp4_training_route_unavailable_reason,
+    raise_if_nvfp4_training_unsupported,
+)
 
 
 TARGET_PARQUET = (
@@ -458,12 +468,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument(
         "--dtype",
-        choices=("float32", "float16", "bfloat16", FP8_PATH_B_DTYPE, FP8_PATH_C_DTYPE),
+        choices=(
+            "float32",
+            "float16",
+            "bfloat16",
+            FP8_PATH_B_DTYPE,
+            FP8_PATH_C_DTYPE,
+            NVFP4_DTYPE,
+        ),
         default="bfloat16",
         help=(
             "Training dtype/precision route. fp8_path_b enables the explicit "
             "non-Path-C FP8 reference baseline; fp8_path_c enables existing "
-            "Path C model ops with a bf16 carrier."
+            "Path C model ops with a bf16 carrier; nvfp4 enables the Blackwell "
+            "e2m1 + block-scale 4-bit route (carrier bf16; real forward-GEMM "
+            "operands, fails loud naming the training ops that lack an nvfp4 "
+            "kernel -- no silent bf16 downcast)."
         ),
     )
     parser.add_argument(
@@ -1034,6 +1054,8 @@ def carrier_dtype_for_acceptance(
 ) -> str:
     if fp8_training_route_requested(args):
         return FP8_PATH_C_CARRIER_DTYPE
+    if nvfp4_route_requested(args):
+        return NVFP4_CARRIER_DTYPE
     return str(getattr(args, "dtype", ""))
 
 
@@ -1435,6 +1457,8 @@ def precision_route_payload(
             "hidden_wrapper_quantization_allowed": False,
             "kernel_boundary_quantization_allowed": False,
         }
+    if nvfp4_route_requested(args):
+        return nvfp4_training_route_payload(args)
     return {
         "requested": str(getattr(args, "dtype", "")),
         "kind": "native_mlx_dtype",
@@ -11326,6 +11350,24 @@ def _run_existing_training(
         return blocked_receipt(
             args, str(exc), type(exc).__name__
         ), 0 if args.dry_run_json else 2
+    # RULE #1 fail-loud NVFP4 gate. --dtype nvfp4 is an accepted training route
+    # (carrier bf16, e2m1 + block-scale forward-GEMM operands are real and
+    # M4-verified) but a full training step needs nvfp4 kernels that do not
+    # exist yet. We RAISE a precise blocked receipt naming the missing ops
+    # instead of silently downcasting them to bf16. The dry-run path still emits
+    # the route metadata so --dry-run-json reports the wired route + next
+    # blocker. The smoke gate exercises the one op that IS nvfp4 (the e2m1 GEMM)
+    # so the route does real nvfp4 work before reporting the precise blocker.
+    if nvfp4_route_requested(config):
+        return (
+            blocked_receipt(
+                args,
+                nvfp4_training_route_unavailable_reason(),
+                NVFP4_E2E_TRAINING_BLOCKER_TYPE,
+                probe_allocation=False,
+            ),
+            0 if args.dry_run_json else 2,
+        )
     fp8_producer_gate = fp8_path_c_producer_gate_payload(config)
     if fp8_producer_gate["fail_closed"]:
         reason_type = str(fp8_producer_gate["status"])
@@ -11453,6 +11495,11 @@ def run_local_gb10_quarter_training(
             ),
             2,
         )
+    # Defensive RULE #1 guard for direct callers of this route (the primary
+    # gate lives in _run_existing_training). nvfp4 must never reach the model
+    # build / forward in a silent bf16 carrier -- RAISE naming the missing
+    # nvfp4 training kernels.
+    raise_if_nvfp4_training_unsupported(config)
 
     model: Any | None = None
     optimizer: Any | None = None
