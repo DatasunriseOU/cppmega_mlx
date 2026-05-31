@@ -9,7 +9,7 @@ grad-checkpoint target-parquet gate is captured.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict
 import io
@@ -4740,6 +4740,268 @@ def _path_c_kernel_buffer_shapes(prim_func: Any) -> dict[str, tuple[int, ...]]:
     return shapes
 
 
+def _path_c_kernel_buffer_dtypes(prim_func: Any) -> dict[str, str]:
+    """Per-name kernel-slot dtypes for a delegated mamba3 chunked grid prim.
+
+    The compiled JITKernel binds each slot at the authoritative KernelParam
+    dtype (the delegation interpose records these). The direct-chain owner
+    allocates a handoff buffer at its PRODUCER dtype; when a CONSUMER slot binds
+    a narrower dtype (e.g. F2/B1 read ``prev_states`` fp16 while F1 wrote fp32),
+    the route casts the bound buffer to this slot dtype at bind (explicit, RULE
+    #1 — the fp32 owner buffer is untouched). Empty for non-delegated prims so
+    the (flag-OFF) serial path applies no casts.
+    """
+
+    delegated_dtypes = getattr(
+        prim_func,
+        "_cppmega_path_c_delegated_kernel_buffer_dtypes",
+        None,
+    )
+    if delegated_dtypes is not None:
+        return {str(name): str(dtype) for name, dtype in delegated_dtypes.items()}
+    return {}
+
+
+_PATH_C_NUMPY_TO_MX_DTYPE_CACHE: dict[str, Any] = {}
+
+
+def _path_c_cast_kernel_buffer_dtype(
+    value: Any,
+    expected_dtype: str | None,
+    *,
+    mx_module: Any,
+) -> Any:
+    """Cast ``value`` to ``expected_dtype`` when a delegated slot dtype differs.
+
+    Only narrows/widens a per-bind copy for a CONSUMER (read) slot whose kernel
+    KernelParam dtype differs from the owner buffer's allocation dtype. The owner
+    buffer is left intact (model policy). When dtypes already match, returns the
+    value unchanged (zero-copy). RULE #1: an UNKNOWN/unresolvable dtype RAISES
+    rather than binding a mismatched buffer.
+    """
+
+    if not expected_dtype:
+        return value
+    target = _PATH_C_NUMPY_TO_MX_DTYPE_CACHE.get(expected_dtype)
+    if target is None:
+        target = _path_c_mx_dtype_from_name(expected_dtype, mx_module=mx_module)
+        _PATH_C_NUMPY_TO_MX_DTYPE_CACHE[expected_dtype] = target
+    current = getattr(value, "dtype", None)
+    if current is target:
+        return value
+    return value.astype(target)
+
+
+def _path_c_mx_dtype_from_name(name: str, *, mx_module: Any) -> Any:
+    text = str(name).strip().lower()
+    aliases = {
+        "float32": "float32",
+        "f32": "float32",
+        "float": "float32",
+        "float16": "float16",
+        "f16": "float16",
+        "half": "float16",
+        "bfloat16": "bfloat16",
+        "bf16": "bfloat16",
+        "float64": "float32",  # owner policy never allocates f64; bind as f32
+    }
+    resolved = aliases.get(text)
+    if resolved is None:
+        raise ValueError(
+            f"direct-chain kernel slot dtype {name!r} is not a recognised "
+            "owner/kernel dtype (RULE #1: refuse to bind an unknown dtype)"
+        )
+    dtype = getattr(mx_module, resolved, None)
+    if dtype is None:
+        raise ValueError(
+            f"mlx module has no dtype {resolved!r} for kernel slot dtype {name!r}"
+        )
+    return dtype
+
+
+def _path_c_mlx_to_torch_mps(value: Any) -> Any:
+    """Copy an ``mx.array`` to a contiguous torch MPS tensor (host roundtrip).
+
+    The mamba3 chunked grid-delegated artifacts are tilelang torch-mps JITKernels
+    (compiled with ``target=metal``); their launcher dispatches a ``torch.mps``
+    compiled shader and rejects MLX arrays. Bridge MLX -> torch MPS so the
+    direct-chain route (MLX-native owner buffers) can drive them. Host roundtrip
+    is parity-exact (no silent precision change; bf16 widens to f32 only for the
+    numpy hop and is cast back). RULE #1: an unsupported dtype RAISES.
+    """
+
+    import numpy as np
+    import torch
+
+    dtype_name = str(getattr(value, "dtype", "")).rsplit(".", 1)[-1]
+    torch_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "int32": torch.int32,
+        "int64": torch.int64,
+        "bool_": torch.bool,
+        "uint32": torch.int32,
+    }.get(dtype_name)
+    if torch_dtype is None:
+        raise TypeError(
+            f"direct-chain torch-mps bridge: unsupported mlx dtype {value.dtype!r}"
+        )
+    if dtype_name == "bfloat16":
+        host = np.array(value.astype(mx.float32))
+    else:
+        host = np.array(value)
+    t = torch.from_numpy(np.ascontiguousarray(host)).to(device="mps")
+    if t.dtype != torch_dtype:
+        t = t.to(torch_dtype)
+    return t.contiguous()
+
+
+def _path_c_torch_mps_to_mlx(tensor: Any, *, mx_module: Any) -> Any:
+    """Copy a torch MPS tensor back into an ``mx.array`` (host roundtrip)."""
+
+    import torch
+
+    cpu = tensor.detach().to(device="cpu")
+    if cpu.dtype == torch.bfloat16:
+        cpu = cpu.to(torch.float32)
+    return mx_module.array(cpu.numpy())
+
+
+def _path_c_call_delegated_metal_artifact_with_mlx_bridge(
+    artifact: Any,
+    arrays: Sequence[Any],
+    kernel_arg_buffer_names: Mapping[int, tuple[str, Any]],
+    output_names: Sequence[str],
+    buffers: dict[str, Any],
+    *,
+    logical_owner: Any,
+    segment_index: int,
+    mx_module: Any,
+) -> Any:
+    """Drive a delegated torch-mps grid kernel from MLX-owned buffers.
+
+    The delegated F0/F1/F2 + B0/B1/B2 grid kernels are tilelang torch-mps
+    artifacts. The validated kernel test passes ALL buffer slots (inputs AND
+    pre-allocated outputs) as torch tensors and the kernel writes the outputs
+    IN-PLACE. Mirror that: bridge every MLX buffer arg to a torch MPS tensor,
+    call the artifact, then reflect the OUTPUT-role torch tensors back into the
+    caller/model-owned MLX buffers (cast/reshape to the owner's model-policy
+    dtype/shape). RULE #1: a dropped/oversized handoff write surfaces loudly via
+    the owner shape (and the binding validator catches a missing buffer earlier).
+    """
+
+    import torch
+
+    output_name_set = {str(n) for n in output_names}
+    torch_args: list[Any] = []
+    output_torch_slots: dict[str, Any] = {}
+    for position, arg in enumerate(arrays):
+        if position in kernel_arg_buffer_names and hasattr(arg, "shape"):
+            name = str(kernel_arg_buffer_names[position][0])
+            torch_t = _path_c_mlx_to_torch_mps(arg)
+            torch_args.append(torch_t)
+            if name in output_name_set:
+                output_torch_slots[name] = torch_t
+        else:
+            torch_args.append(arg)
+    result = artifact(*torch_args)
+    torch.mps.synchronize()
+    # The kernel writes the passed output buffers in place; reflect those (and any
+    # out_idx return, if the adapter returned new tensors) back into the owner.
+    returned = result if isinstance(result, (tuple, list)) else (result,)
+    returned = tuple(r for r in returned if hasattr(r, "shape"))
+    if len(returned) == len(output_names) and returned:
+        # Adapter returned fresh output tensors (out_idx allocation) — prefer them.
+        for name, tensor in zip(output_names, returned):
+            output_torch_slots[str(name)] = tensor
+    owner_buffers = getattr(logical_owner, "buffers", None)
+    for name in output_names:
+        name = str(name)
+        tensor = output_torch_slots.get(name)
+        if tensor is None:
+            continue
+        staged = _path_c_torch_mps_to_mlx(tensor, mx_module=mx_module)
+        target = buffers.get(name)
+        if target is not None:
+            target_shape = tuple(int(d) for d in tuple(getattr(target, "shape", ())))
+            target_dtype = getattr(target, "dtype", None)
+            if tuple(int(d) for d in tuple(getattr(staged, "shape", ()))) != (
+                target_shape
+            ):
+                staged = mx_module.reshape(staged, target_shape)
+            if target_dtype is not None and getattr(staged, "dtype", None) is not (
+                target_dtype
+            ):
+                staged = staged.astype(target_dtype)
+        buffers[name] = staged
+        if isinstance(owner_buffers, MutableMapping):
+            try:
+                owner_buffers[name] = buffers[name]
+            except (TypeError, KeyError):
+                pass
+    return result
+
+
+def _path_c_writeback_delegated_outputs(
+    result: Any,
+    output_names: Sequence[str],
+    buffers: dict[str, Any],
+    *,
+    logical_owner: Any,
+    segment_index: int,
+    mx_module: Any,
+) -> None:
+    """Write a delegated grid kernel's out_idx returns into owner handoff buffers.
+
+    The mamba3 chunked F0/F1/F2 + B0/B1/B2 kernels compile with ``out_idx`` so on
+    Metal the kernel ALLOCATES + RETURNS its outputs (it does NOT mutate the
+    caller-passed slot). The producer->consumer handoff (and the loss/grad chain)
+    therefore needs these returned arrays reflected into the caller/model-owned
+    buffers, cast/reshaped to the OWNER's allocation dtype + shape (the owner
+    holds the model-policy dtype; a delegated producer may emit a narrower dtype
+    — this is the explicit producer-side bridge, mirroring the consumer-side
+    cast-at-bind). RULE #1: a count mismatch between the returned arrays and the
+    declared output slots RAISES (never silently drop a handoff write).
+    """
+
+    if not output_names:
+        return
+    returned = result if isinstance(result, (tuple, list)) else (result,)
+    returned = tuple(r for r in returned if hasattr(r, "shape"))
+    if len(returned) != len(output_names):
+        raise ValueError(
+            f"direct-chain delegated segment {segment_index} returned "
+            f"{len(returned)} output array(s) but its ABI declares "
+            f"{len(output_names)} output slot(s) {tuple(output_names)!r} "
+            "(RULE #1: cannot reflect the handoff writes)"
+        )
+    owner_buffers = getattr(logical_owner, "buffers", None)
+    for name, value in zip(output_names, returned):
+        target = buffers.get(name)
+        if target is not None:
+            target_shape = tuple(int(d) for d in tuple(getattr(target, "shape", ())))
+            target_dtype = getattr(target, "dtype", None)
+            staged = value
+            if (
+                tuple(int(d) for d in tuple(getattr(staged, "shape", ())))
+                != target_shape
+            ):
+                staged = mx_module.reshape(staged, target_shape)
+            if target_dtype is not None and getattr(staged, "dtype", None) is not (
+                target_dtype
+            ):
+                staged = staged.astype(target_dtype)
+            buffers[name] = staged
+        else:
+            buffers[name] = value
+        if isinstance(owner_buffers, MutableMapping):
+            try:
+                owner_buffers[name] = buffers[name]
+            except (TypeError, KeyError):
+                pass
+
+
 def _path_c_exact_kernel_buffer(
     value: Any,
     expected_shape: tuple[int, ...] | None,
@@ -6705,7 +6967,35 @@ def run_path_c_direct_fusion_chain_route(
         #    always last, so building from buffer names alone dropped it and yielded
         #    one fewer ABI arg than the kernel declares.
         kernel_buffer_shapes = _path_c_kernel_buffer_shapes(prim_func)
+        # Per-slot kernel dtypes for delegated mamba3 chunked grid prims (empty
+        # for the serial flag-OFF path). The owner allocates each handoff buffer
+        # at its PRODUCER dtype; a CONSUMER slot binding a different dtype (e.g.
+        # F2/B1 read prev_states fp16 while F1 wrote it fp32) gets an EXPLICIT
+        # cast-at-bind here — the fp32 owner buffer is untouched (RULE #1: no
+        # silent precision loss, the cast is an explicit per-bind copy).
+        kernel_buffer_dtypes = _path_c_kernel_buffer_dtypes(prim_func)
         kernel_param_order = path_c_kernel_buffer_order(prim_func)
+        # Mamba3 chunked grid-delegated segments compile with ``out_idx`` (the
+        # tilelang torch-mps adapter ALLOCATES + RETURNS those outputs instead of
+        # writing into the caller-passed slot), so on Metal the kernel's output
+        # arrays come back as the call ``result`` and MUST be written back into
+        # the caller/model-owned handoff buffers for the producer->consumer chain
+        # to see them. The ordered output names are the ``role == "output"`` slots
+        # of the delegated buffer ABI, in positional out_idx order. Empty for the
+        # serial (flag-OFF) path, which mutates its buffers in place (no writeback).
+        delegated_roles = dict(
+            getattr(
+                prim_func,
+                "_cppmega_path_c_delegated_kernel_buffer_roles",
+                {},
+            )
+            or {}
+        )
+        delegated_output_names = tuple(
+            str(name)
+            for name in path_c_kernel_buffer_order(prim_func)
+            if str(delegated_roles.get(str(name), "")) == "output"
+        ) if delegated_roles else ()
         gate_param = str(
             getattr(
                 prim_func,
@@ -6732,13 +7022,17 @@ def run_path_c_direct_fusion_chain_route(
                     str(name),
                     kernel_buffer_shapes.get(name),
                 )
-                kernel_call_args.append(
-                    _path_c_exact_kernel_buffer(
-                        buffers[name],
-                        kernel_buffer_shapes.get(name),
-                        mx_module=mx_module,
-                    )
+                bound_buffer = _path_c_exact_kernel_buffer(
+                    buffers[name],
+                    kernel_buffer_shapes.get(name),
+                    mx_module=mx_module,
                 )
+                bound_buffer = _path_c_cast_kernel_buffer_dtype(
+                    bound_buffer,
+                    kernel_buffer_dtypes.get(name),
+                    mx_module=mx_module,
+                )
+                kernel_call_args.append(bound_buffer)
             elif name == gate_param:
                 kernel_call_args.append(run_backward_value)
             elif name in PATH_C_SCALAR_KERNEL_PARAM_DEFAULTS:
@@ -6859,7 +7153,25 @@ def run_path_c_direct_fusion_chain_route(
                     }
                 )
                 continue
-            result = artifact(*arrays)
+            if delegated_output_names:
+                # Mamba3 chunked grid-delegated segment: the artifact is a tilelang
+                # torch-mps JITKernel (it rejects MLX arrays). Bridge the MLX-owned
+                # buffers to torch MPS, run the kernel, and reflect the output-role
+                # handoff buffers back into the caller/model-owned MLX buffers
+                # (cast/reshape to the owner's model-policy dtype/shape) so the
+                # producer->consumer chain + loss/grad see them.
+                result = _path_c_call_delegated_metal_artifact_with_mlx_bridge(
+                    artifact,
+                    arrays,
+                    kernel_arg_buffer_names,
+                    delegated_output_names,
+                    buffers,
+                    logical_owner=logical_owner,
+                    segment_index=int(segment.index),
+                    mx_module=mx_module,
+                )
+            else:
+                result = artifact(*arrays)
             # --- Per-stage Metal command-buffer commit boundary -----------------
             # The fused direct-chain encodes every segment's TVM-FFI kernel into
             # MLX's borrowed in-flight Metal command buffer (see tilelang
@@ -7687,6 +7999,7 @@ def _path_c_merge_direct_chain_buffer_spec(
     category: str,
     segment_index: int,
     source: str,
+    role: str | None = None,
 ) -> None:
     shape_tuple = _path_c_shape_tuple(shape)
     dtype_name = str(dtype)
@@ -7698,18 +8011,83 @@ def _path_c_merge_direct_chain_buffer_spec(
             "dtype": dtype_name,
             "category": str(category),
             "segments": [],
+            # Track whether the OWNER dtype/shape was pinned by a producer
+            # (write/output) slot. A mamba3 chunked handoff buffer is allocated at
+            # its PRODUCER dtype (model policy, e.g. F1 writes prev_states fp32); a
+            # CONSUMER (read/input) slot binding a DIFFERENT dtype (e.g. F2 reads
+            # it fp16) is reconciled by an EXPLICIT cast-at-bind in the route, NOT
+            # by changing the owner dtype. RULE #1: a producer-vs-producer dtype
+            # conflict (two writers disagree) still RAISES — never silent.
+            "dtype_pinned_by_producer": str(role) == "output",
+            # Track whether the SERIAL model ABI (physical_abi ``source="logical"``)
+            # pinned this buffer. A delegated SSD-core OUTPUT that the rest of the
+            # serial model graph consumes (e.g. the brick ``delta``) is a model
+            # activation: the model-policy dtype/shape is authoritative and the
+            # delegated producer casts/reshapes its out_idx return on writeback.
+            "dtype_pinned_by_model_abi": source == "logical",
         },
     )
+    model_abi = source == "logical"
     if str(existing["dtype"]) != dtype_name:
-        raise ValueError(
-            f"conflicting direct-chain {source} buffer dtype {name!r}: "
-            f"{existing['dtype']!r} vs {dtype_name!r}"
-        )
+        existing_pinned = bool(existing.get("dtype_pinned_by_producer"))
+        existing_model_abi = bool(existing.get("dtype_pinned_by_model_abi"))
+        incoming_is_producer = str(role) == "output"
+        if model_abi and not existing_model_abi:
+            # Serial model ABI is the dtype authority for a boundary activation:
+            # adopt it; the delegated producer casts its out_idx return on
+            # writeback (and any delegated consumer casts at bind).
+            existing["dtype"] = dtype_name
+            existing["dtype_pinned_by_model_abi"] = True
+            existing["dtype_pinned_by_producer"] = False
+        elif existing_model_abi and not model_abi:
+            # Keep the model-policy dtype; the delegated slot casts at bind /
+            # writeback.
+            pass
+        elif incoming_is_producer and not existing_pinned:
+            # First producer wins over an earlier consumer-only registration.
+            existing["dtype"] = dtype_name
+            existing["dtype_pinned_by_producer"] = True
+        elif existing_pinned and not incoming_is_producer:
+            # Keep the producer dtype; the consumer slot casts at bind.
+            pass
+        else:
+            raise ValueError(
+                f"conflicting direct-chain {source} buffer dtype {name!r}: "
+                f"{existing['dtype']!r} vs {dtype_name!r}"
+                + (
+                    " (both producer writes — cannot reconcile)"
+                    if incoming_is_producer and existing_pinned
+                    else " (two serial model-ABI dtypes — cannot reconcile)"
+                    if model_abi and existing_model_abi
+                    else " (no producer to pin owner dtype)"
+                )
+            )
     existing_shape = _path_c_shape_tuple(existing["shape"])
     if existing_shape != shape_tuple:
         existing_extent = _path_c_shape_extent(existing_shape)
         shape_extent = _path_c_shape_extent(shape_tuple)
-        if source == "scratch":
+        if model_abi and not bool(existing.get("shape_pinned_by_model_abi")):
+            # The serial model ABI declares the boundary activation's logical
+            # shape (e.g. delta (b,s,h*p)); adopt it when the extent matches the
+            # delegated producer's view (the writeback reshapes the return). A
+            # genuine extent mismatch still RAISES below.
+            if existing_extent == shape_extent:
+                existing["shape"] = shape_tuple
+                existing["shape_pinned_by_model_abi"] = True
+            else:
+                raise ValueError(
+                    f"conflicting direct-chain {source} buffer shape {name!r}: "
+                    f"{existing_shape!r} vs {shape_tuple!r}"
+                )
+        elif bool(existing.get("shape_pinned_by_model_abi")) and not model_abi:
+            # Keep the model-policy shape; the delegated slot reshapes at bind /
+            # writeback (extent already reconciled when the model ABI pinned it).
+            if existing_extent != shape_extent:
+                raise ValueError(
+                    f"conflicting direct-chain {source} buffer shape {name!r}: "
+                    f"{existing_shape!r} vs {shape_tuple!r}"
+                )
+        elif source == "scratch":
             existing["shape"] = (
                 shape_tuple if shape_extent > existing_extent else existing_shape
             )
@@ -7815,6 +8193,14 @@ def _path_c_direct_chain_required_logical_buffer_specs(
                 )
                 or {}
             )
+            delegated_roles = dict(
+                getattr(
+                    prim_func,
+                    "_cppmega_path_c_delegated_kernel_buffer_roles",
+                    {},
+                )
+                or {}
+            )
             for name in delegated_order:
                 name = str(name)
                 # The owner allocation dtype MUST equal the kernel's bind dtype
@@ -7836,6 +8222,7 @@ def _path_c_direct_chain_required_logical_buffer_specs(
                     category=_path_c_direct_chain_buffer_category(name),
                     segment_index=int(segment.index),
                     source="scratch",
+                    role=str(delegated_roles.get(name, "input")),
                 )
     if (
         suffix_shape_env is not None
@@ -8290,6 +8677,17 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
         spec = required_specs[name]
         if name in model_parameter_names:
             value = model_buffers.get(name)
+            if not isinstance(value, mx.array):
+                # The mamba3 chunked SSD-core surfaces name the model skip param
+                # ``{brick}_D`` (de-infixed), while the model owner exposes it as
+                # ``{brick}_mamba3_D``. Resolve through the explicit delegated
+                # param-name alias (RULE #1: a single deterministic mapping, and
+                # if the alias also misses we still RAISE below — never silent).
+                for alias in _path_c_direct_chain_model_param_aliases(name):
+                    alias_value = model_buffers.get(alias)
+                    if isinstance(alias_value, mx.array):
+                        value = alias_value
+                        break
             if isinstance(value, mx.array):
                 buffers[name] = value
             else:
@@ -8315,6 +8713,28 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
         hidden_packing_performed=False,
         no_hidden_allocation_policy=True,
     )
+
+
+def _path_c_direct_chain_model_param_aliases(name: str) -> tuple[str, ...]:
+    """Candidate model-owner param keys for a delegated SSD-core param name.
+
+    The mamba3 chunked F2/B2/B0 region surfaces name the model skip param
+    ``{brick}_D`` and the A-decay param ``{brick}_A`` WITHOUT the ``mamba3_``
+    infix the model owner uses (``{brick}_mamba3_D`` / ``{brick}_mamba3_A_log``).
+    Return the deterministic alias(es) so the pre-step owner resolves them to the
+    real model parameter. RULE #1: this is a single explicit mapping; an
+    unresolved name still RAISES at the caller (never a silent zero buffer).
+    """
+
+    text = str(name)
+    aliases: list[str] = []
+    if text.endswith("_D"):
+        aliases.append(text[: -len("_D")] + "_mamba3_D")
+    if text.endswith("_A"):
+        # The chunked F0/B0 read the A-decay param named ``A``; the model owns it
+        # as ``A_log`` (the log-decay weight the kernel exponentiates internally).
+        aliases.append(text[: -len("_A")] + "_mamba3_A_log")
+    return tuple(aliases)
 
 
 def _path_c_direct_chain_buffer_category(name: str) -> str:
@@ -8831,6 +9251,95 @@ def path_c_direct_fusion_chain_runtime_binding_payload(
                 )
                 continue
             prim_func = target.schedule_template(segment.region)
+            delegated_order = getattr(
+                prim_func,
+                "_cppmega_path_c_delegated_kernel_buffer_order",
+                None,
+            )
+            if delegated_order is not None:
+                # Mamba3 chunked grid-delegated segment: the binding source is the
+                # attached named-buffer ABI (region surface node.inputs+outputs,
+                # 1:1 with the compiled JITKernel's device-buffer param slots),
+                # NOT the TIR physical_abi_map (a compiled JITKernel has no
+                # buffer_map). Binding is BY NAME against the caller/model-owned
+                # buffers — this IS direct-buffer binding. Validate every slot
+                # name is present with a matching element count; dtype is bridged
+                # by the route's explicit cast-at-bind (the owner holds the
+                # PRODUCER dtype, a consumer slot casts), so a producer/consumer
+                # dtype split is NOT a binding failure here (RULE #1: a MISSING or
+                # element-count-mismatched buffer still blocks loudly).
+                required_names = tuple(str(name) for name in delegated_order)
+                slot_shapes = _path_c_kernel_buffer_shapes(prim_func)
+                segment_missing = [
+                    name for name in required_names if name not in resolved_buffers
+                ]
+                slot_shape_mismatch: list[str] = []
+                for name in required_names:
+                    value = resolved_buffers.get(name)
+                    if value is None:
+                        continue
+                    expected = slot_shapes.get(name)
+                    if expected is None:
+                        continue
+                    expected_size = 1
+                    for dim in expected:
+                        expected_size *= int(dim)
+                    actual_size = int(getattr(value, "size", 0) or 0)
+                    if actual_size != expected_size:
+                        slot_shape_mismatch.append(name)
+                required_logical_buffer_names.update(required_names)
+                shape_mismatch_buffers.update(slot_shape_mismatch)
+                artifact = _path_c_direct_chain_artifact_for_segment(
+                    artifacts, segment
+                )
+                artifact_bound = callable(artifact)
+                logical_binding_ready = (
+                    not segment_missing and not slot_shape_mismatch
+                )
+                runtime_ready = bool(logical_binding_ready and artifact_bound)
+                if not logical_binding_ready:
+                    all_bindings_ready = False
+                    missing_logical_buffers.update(
+                        str(name) for name in segment_missing
+                    )
+                if not artifact_bound:
+                    all_artifacts_bound = False
+                    missing_artifact_segments.append(int(segment.index))
+                provided_logical_buffers = [
+                    name for name in required_names if name in provided_names
+                ]
+                segment_payloads.append(
+                    {
+                        "index": int(segment.index),
+                        "status": "ok" if runtime_ready else "not_bound",
+                        "reason": (
+                            "delegated mamba3 chunked grid segment with named-"
+                            "buffer ABI bound to caller-owned buffers"
+                            if runtime_ready
+                            else "delegated mamba3 chunked grid segment requires "
+                            "caller-owned named buffers and a callable artifact"
+                        ),
+                        "runtime_ready": runtime_ready,
+                        "artifact_bound": artifact_bound,
+                        "logical_tensor_binding_supported": True,
+                        "logical_tensor_binding_ready": logical_binding_ready,
+                        "binding_status": "ok" if logical_binding_ready else "blocked",
+                        "physical_abi_policy": "direct_buffers",
+                        "execution_phase": str(
+                            getattr(segment, "execution_phase", "unknown")
+                        ),
+                        "required_logical_buffers": list(required_names),
+                        "missing_logical_buffers": segment_missing,
+                        "shape_mismatch_buffers": slot_shape_mismatch,
+                        "dtype_mismatch_buffers": [],
+                        "binding_errors": [],
+                        "provided_logical_buffers": provided_logical_buffers,
+                        "schedule_id": target.schedule_id,
+                        "region_name": segment.region.name,
+                        "delegated_mamba3_chunked_grid": True,
+                    }
+                )
+                continue
             physical_abi_map = dict(
                 getattr(prim_func, "_cppmega_path_c_physical_buffer_abi_map", {})
                 or {}

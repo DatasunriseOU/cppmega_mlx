@@ -2406,6 +2406,21 @@ def build_path_c_descriptor_prim_func(
             *(str(name) for name in nodes[0].inputs),
             *(str(name) for name in nodes[0].outputs),
         )
+        # Per-name PRODUCER/CONSUMER role for this delegated segment: a name in
+        # ``node.outputs`` is WRITTEN here (producer slot), a name in
+        # ``node.inputs`` is READ here (consumer slot). The direct-chain owner
+        # allocates each handoff buffer at its PRODUCER dtype (model policy), and
+        # the route casts the bound buffer to a CONSUMER slot's dtype only when it
+        # narrows for a read (e.g. F1 writes ``prev_states`` fp32; F2/B1 read it
+        # fp16 — an explicit fp16 cast-copy at bind, mirroring the validated
+        # kernel test's ``prev_states.half()``; the fp32 owner buffer is intact).
+        delegated_output_names = frozenset(
+            str(name) for name in nodes[0].outputs
+        )
+        delegated_buffer_roles = {
+            str(name): ("output" if str(name) in delegated_output_names else "input")
+            for name in delegated_buffer_order
+        }
         # The compiled JITKernel's device-buffer KernelParams are the AUTHORITATIVE
         # per-slot shapes (the exact ABI the kernel binds). Pair them positionally
         # with the ordered names (scalar params, if any, are skipped — these grid
@@ -2441,6 +2456,9 @@ def build_path_c_descriptor_prim_func(
                     delegated_buffer_order, delegated_buffer_params
                 )
             }
+            delegated_prim._cppmega_path_c_delegated_kernel_buffer_roles = (
+                delegated_buffer_roles
+            )
         else:
             delegated_prim._cppmega_path_c_delegated_kernel_buffer_abi_skipped = (
                 f"region surface declares {len(delegated_buffer_order)} ordered "
