@@ -725,6 +725,14 @@ class _ScheduleNodeView:
 def _path_c_schedule_node_execution_phase(node: Any) -> str:
     backward = str(getattr(node, "backward", ""))
     op_name = str(getattr(node, "op_name", ""))
+    # The chunked F0/F1/F2 SSD-core ops are FORWARD producers that carry NO
+    # synthesized AOT backward (they own their output gradient: backward=
+    # "owner_output"), but they must run in the FORWARD execution stage so the
+    # compile-site delegation interpose substitutes their grid kernel during the
+    # forward pass (RULE #1: the chunked forward is never grouped as a backward
+    # fragment). Backward stays serial/unchanged.
+    if op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS:
+        return "forward"
     if backward == "owner_output" or op_name.endswith("_bwd"):
         return "backward"
     return "forward"
@@ -924,7 +932,15 @@ def plan_path_c_descriptor_stage_groups(
     for node in forward_nodes:
         name = _path_c_descriptor_stage_node_name(node)
         op_name = _path_c_descriptor_stage_node_op_name(node)
-        if op_name in {"entry_rmsnorm", "mamba3_mimo"}:
+        # The chunked F0/F1/F2 forward ops are GRID-launched single-node segments
+        # (own multi-grid T.Kernel) that MUST each be isolated into their own
+        # forward stage so the compile-site delegation interpose (which requires
+        # len(nodes) == 1) substitutes the proven build_*_metal grid kernel
+        # (RULE #1: never fused into a single-T.Kernel template fragment).
+        if (
+            op_name in {"entry_rmsnorm", "mamba3_mimo"}
+            or op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS
+        ):
             if forward_tail:
                 _path_c_descriptor_stage_append(
                     groups,
@@ -14272,6 +14288,123 @@ def _is_mamba3_state_like_buffer(buffer_name: str, canonical_name: str) -> bool:
     )
 
 
+# Per-brick projected-SSD region input + inter-chunk handoff buffer SUFFIXES for
+# the chunked F0/F1/F2 forward (design §2/§7). They are caller-owned region ABI
+# buffers named ``{brick}_{suffix}`` (e.g. ``mamba3_scan_x``, ``mamba3_scan_cb``).
+# Their flattened extents are derived from the mamba shape_env (batch is 1 for the
+# direct-chain region; the chunk size is the validated scan-core block).
+_MAMBA3_CHUNKED_FWD_REGION_BUFFER_SUFFIXES: tuple[str, ...] = (
+    # projected SSD inputs (F0/F2 read these)
+    "x",
+    "B",
+    "C",
+    "A",
+    "dt",
+    # initial / skip params
+    "h0",
+    "D",
+    # inter-chunk handoff (F0 -> F1 -> F2)
+    "cb",
+    "dA_cumsum",
+    "summary_states",
+    "prev_states",
+    "final_state",
+)
+
+
+# Real-ABI buffer names that COLLIDE on the chunked single-letter / ``h0``
+# suffixes but are NOT chunked region buffers — they must resolve through the
+# generic shape map. ``mamba3_h0``/``mamba3_D`` happen to share their flattened
+# extent with the chunked shape, but ``m2rnn_D``/``m2rnn_h0`` do NOT, so a silent
+# rebind would corrupt them (RULE #1).
+_MAMBA3_CHUNKED_FWD_REGION_BUFFER_NAME_EXCLUSIONS: frozenset[str] = frozenset(
+    {"mamba3_h0", "mamba3_D", "m2rnn_h0", "m2rnn_D"}
+)
+# Real-ABI suffixes that, when a brick-prefixed buffer ends with them, indicate a
+# prefixed real ABI weight (e.g. ``mamba3_scan_mamba3_D``) rather than a chunked
+# region buffer — exclude these too so the serial (flag-OFF) prefixed ABI is never
+# rebound to a chunked shape.
+_MAMBA3_CHUNKED_FWD_REGION_BUFFER_SUFFIX_EXCLUSIONS: tuple[str, ...] = (
+    "_mamba3_D",
+    "_mamba3_h0",
+    "_m2rnn_D",
+    "_m2rnn_h0",
+)
+
+
+def _mamba3_chunked_fwd_region_buffer_shape(
+    buffer_name: str,
+    shape_env: PathCModelShapeEnv,
+) -> tuple[int, ...] | None:
+    """Return the flattened shape of a chunked F0/F1/F2 region ABI buffer.
+
+    Recognises the per-brick ``{brick}_{suffix}`` projected-SSD inputs and the
+    inter-chunk handoff buffers (design §2/§7). Returns ``None`` when the name is
+    not one of those suffixes so the caller falls through to the generic map.
+    RULE #1: the shapes mirror the prim-func tensor ABI exactly (a mismatch would
+    silently mis-bind a handoff buffer); there is no padding/guess fallback.
+    """
+
+    name = str(buffer_name)
+    if name.endswith("_grad"):
+        return None
+    # The chunked region emits buffers named ``{brick}_{suffix}`` where ``brick``
+    # is the mamba brick name (e.g. ``mamba3_scan``). Exclude the bare real-ABI
+    # names (``mamba3_h0``/``mamba3_D``/``m2rnn_h0``/``m2rnn_D``) which collide on
+    # the single-letter / ``h0`` suffixes but are NOT chunked region buffers —
+    # those resolve through the generic map below (RULE #1: never silently rebind
+    # a real ABI buffer to a chunked shape).
+    if name in _MAMBA3_CHUNKED_FWD_REGION_BUFFER_NAME_EXCLUSIONS:
+        return None
+    if name.endswith(_MAMBA3_CHUNKED_FWD_REGION_BUFFER_SUFFIX_EXCLUSIONS):
+        return None
+    suffix: str | None = None
+    for candidate in _MAMBA3_CHUNKED_FWD_REGION_BUFFER_SUFFIXES:
+        # Require a non-empty brick prefix (``_{suffix}``); a bare ``x``/``D``/...
+        # is never a per-brick chunked region buffer.
+        if name.endswith(f"_{candidate}") and len(name) > len(candidate) + 1:
+            suffix = candidate
+            break
+    if suffix is None:
+        return None
+    batch = 1
+    seqlen = int(shape_env.sequence_length)
+    nheads = int(shape_env.mamba_num_heads)
+    headdim = int(shape_env.mamba_head_dim)
+    dstate = int(shape_env.mamba_state_dim)
+    ngroups = int(shape_env.mamba_groups)
+    chunk = int(MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE)
+    if seqlen % chunk != 0:
+        raise ValueError(
+            "mamba3 chunked-scan region buffer shape: seqlen "
+            f"({seqlen}) must be divisible by chunk ({chunk}); no padding "
+            f"(RULE #1) for buffer {buffer_name!r}"
+        )
+    nchunks = seqlen // chunk
+    shapes: dict[str, tuple[int, ...]] = {
+        # projected SSD per-position tensors (F0/F2 inputs)
+        "x": (batch, seqlen, nheads, headdim),
+        "B": (batch, seqlen, ngroups, dstate),
+        "C": (batch, seqlen, ngroups, dstate),
+        "A": (nheads,),
+        # F0 takes dt as (b,s,h); F2 takes dt reshaped (b,h,nchunks,chunk). The
+        # flattened extent is identical (batch*seqlen*nheads), so a single
+        # logical region buffer carries both views (the runtime stages the F2
+        # view contiguously).
+        "dt": (batch, seqlen, nheads),
+        # initial state / skip (F1 / F2 inputs)
+        "h0": (batch, nheads, headdim, dstate),
+        "D": (nheads,),
+        # inter-chunk handoff buffers
+        "cb": (batch, nchunks, ngroups, chunk, chunk),
+        "dA_cumsum": (batch, nheads, nchunks, chunk),
+        "summary_states": (batch, nchunks, nheads, headdim, dstate),
+        "prev_states": (batch, nchunks, nheads, headdim, dstate),
+        "final_state": (batch, nheads, headdim, dstate),
+    }
+    return shapes[suffix]
+
+
 def _buffer_shape(
     buffer_name: str,
     buffer_extent: int,
@@ -14279,6 +14412,9 @@ def _buffer_shape(
 ) -> tuple[int, ...]:
     if shape_env is None:
         return (buffer_extent,)
+    chunked_shape = _mamba3_chunked_fwd_region_buffer_shape(buffer_name, shape_env)
+    if chunked_shape is not None:
+        return chunked_shape
     name = _canonical_buffer_name(buffer_name)
     seq = shape_env.sequence_length
     hidden = shape_env.hidden_size

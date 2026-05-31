@@ -464,3 +464,204 @@ def test_chunked_scan_flag_on_interpose_emits_real_grid_kernel(op_name, monkeypa
         == op_name
     )
     assert getattr(prim, "_cppmega_path_c_brick_ops", None) == (op_name,)
+
+
+# --------------------------------------------------------------------------- #
+# Verification 4: the LIVE REGION-BUILD 1->3 SURFACE FLIP (Stage-2).            #
+# - flag OFF: the direct-chain model region emits ONE serial mamba3_mimo        #
+#   forward surface (byte-identical to today's behaviour).                      #
+# - flag ON : the region emits 3 chunked SSD-core forward surfaces              #
+#   (mamba3_chunk_precompute -> mamba3_inter_chunk_recur ->                      #
+#   mamba3_chunk_scan_combine) wired by the per-brick handoff buffers, each      #
+#   isolated into its own FORWARD stage so the compile-site interpose fires.     #
+# Design: docs/MAMBA3-PATHC-MULTIKERNEL-DESIGN.md §2/§7.                         #
+# --------------------------------------------------------------------------- #
+
+_MAMBA3_CHUNKED_REGION_OPS = (
+    "mamba3_chunk_precompute",
+    "mamba3_inter_chunk_recur",
+    "mamba3_chunk_scan_combine",
+)
+
+
+def _build_mamba_direct_chain_region(env):
+    from cppmega_mlx.runtime.path_c_fusion import (
+        PathCModelBrick,
+        build_path_c_model_region_from_bricks,
+    )
+
+    bricks = (PathCModelBrick(name="mamba3_scan", kind="mamba3", route_symbol="M"),)
+    return build_path_c_model_region_from_bricks(
+        region_name="mamba3_direct_chain", bricks=bricks, shape_env=env
+    )
+
+
+def test_region_flip_default_off_single_mamba3_mimo_surface(monkeypatch):
+    """Flag OFF (default): the direct-chain region emits ONE mamba3_mimo forward
+    surface — byte-identical to today's serial behaviour (RULE #1 merge-safe)."""
+    monkeypatch.delenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", raising=False)
+    env = _local_gb10_quarter_env()
+    region = _build_mamba_direct_chain_region(env)
+    forward_ops = [n.op_name for n in region.nodes if n.op_name != "entry_rmsnorm"]
+    assert forward_ops == ["mamba3_mimo"], forward_ops
+    assert not any(
+        n.op_name in _MAMBA3_CHUNKED_REGION_OPS for n in region.nodes
+    )
+
+
+def test_region_flip_on_emits_three_chunked_forward_surfaces(monkeypatch):
+    """Flag ON: the direct-chain region replaces the single mamba3_mimo surface
+    with the 3 chunked SSD-core forward segments (F0/F1/F2), wired by the
+    per-brick handoff buffers, each isolated into its own FORWARD stage group."""
+    monkeypatch.setenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", "1")
+    from cppmega_mlx.runtime.path_c_fusion_schedules import (
+        plan_path_c_descriptor_stage_groups,
+    )
+
+    env = _local_gb10_quarter_env()
+    region = _build_mamba_direct_chain_region(env)
+    chunked_ops = [n.op_name for n in region.nodes if n.op_name in _MAMBA3_CHUNKED_REGION_OPS]
+    assert chunked_ops == list(_MAMBA3_CHUNKED_REGION_OPS), chunked_ops
+    # The serial mamba3_mimo surface is NOT emitted when the flag is ON.
+    assert not any(n.op_name == "mamba3_mimo" for n in region.nodes)
+
+    # Each chunked op is isolated into its own FORWARD stage so the compile-site
+    # delegation interpose (which requires len(nodes) == 1) fires per segment.
+    op_by_node = {n.name: n.op_name for n in region.nodes}
+    chunked_stage_ops: list[str] = []
+    for group in plan_path_c_descriptor_stage_groups(region):
+        ops = [op_by_node.get(nm) for nm in group.active_node_names]
+        for op in ops:
+            if op in _MAMBA3_CHUNKED_REGION_OPS:
+                assert group.execution_stage == "forward", group.execution_stage
+                assert len(group.active_node_names) == 1, list(group.active_node_names)
+                chunked_stage_ops.append(op)
+    assert chunked_stage_ops == list(_MAMBA3_CHUNKED_REGION_OPS), chunked_stage_ops
+
+    # The 3 surfaces are wired by the per-brick handoff buffers: F0 -> F1 -> F2.
+    nodes_by_op = {n.op_name: n for n in region.nodes}
+    f0 = nodes_by_op["mamba3_chunk_precompute"]
+    f1 = nodes_by_op["mamba3_inter_chunk_recur"]
+    f2 = nodes_by_op["mamba3_chunk_scan_combine"]
+    assert "mamba3_scan_summary_states" in f0.outputs
+    assert "mamba3_scan_summary_states" in f1.inputs
+    assert "mamba3_scan_prev_states" in f1.outputs
+    assert "mamba3_scan_prev_states" in f2.inputs
+    assert "mamba3_scan_cb" in f0.outputs and "mamba3_scan_cb" in f2.inputs
+    assert f2.outputs == ("mamba3_scan_delta",)
+
+
+@pytest.mark.skipif(
+    not _torch_mps_available(), reason="requires torch + Metal (mps) backend"
+)
+def test_region_flip_on_full_scale_region_parity(monkeypatch, capsys):
+    """Flag ON, full scale (S=4096, H=8): the LIVE direct-chain region emits 3
+    chunked forward segments, each delegates to its proven grid JITKernel, and the
+    chained region forward matches the SERIAL Path-C forward < 5e-4 fp16.
+
+    The Stage-2 REGION-build parity gate (mirrors
+    ``scripts/repro_fullscale_region_flip.py``). RULE #1: a compile/parity failure
+    RAISES — no silent serial fallback."""
+    monkeypatch.setenv("CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN", "1")
+
+    import torch
+    from einops import rearrange
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        MAMBA3_CHUNKED_FWD_BLOCK_M,
+    )
+    from cppmega_mlx.runtime.path_c_fusion import (
+        FusionKernelSurface,
+        PathCModelShapeEnv,
+        Z3SyncSpec,
+        build_path_c_fusion_region,
+    )
+    from cppmega_mlx.runtime.path_c_fusion_schedules import (
+        _MAMBA3_CHUNKED_GRID_DELEGATION_OPS,
+        build_path_c_descriptor_prim_func,
+        default_path_c_brick_schedule_descriptor_registry,
+    )
+
+    b, S, H, P, N, G = 1, 4096, 8, 64, 16, 1
+    chunk = MAMBA3_CHUNKED_FWD_BLOCK_M
+    nchunks = S // chunk
+    dev = "mps"
+    env = PathCModelShapeEnv(
+        sequence_length=S, hidden_size=H * P, attention_num_q_heads=H,
+        attention_num_kv_heads=H, attention_head_dim=P, attention_sparse_topk=1,
+        mamba_expand=1, mamba_head_dim=P, mamba_state_dim=N, mamba_groups=G,
+        mamba_mimo_rank=1, mamba_is_mimo=True, mamba_conv_kernel=4,
+        mamba_rope_fraction=0.5, m2rnn_k_head_dim=P, m2rnn_v_head_dim=P,
+        m2rnn_num_q_heads=H, m2rnn_num_k_heads=H, m2rnn_num_v_heads=H,
+        m2rnn_num_f_heads=H, m2rnn_num_g_heads=H, m2rnn_num_weight_heads=H,
+        m2rnn_conv_kernel=4,
+    )
+    assert env.mamba_num_heads == H
+
+    region = _build_mamba_direct_chain_region(env)
+    chunked_nodes = [
+        n for n in region.nodes if n.op_name in _MAMBA3_CHUNKED_GRID_DELEGATION_OPS
+    ]
+    assert len(chunked_nodes) == 3
+
+    reg = default_path_c_brick_schedule_descriptor_registry()
+    kernels = {}
+    for node in chunked_nodes:
+        surf = FusionKernelSurface.path_c(
+            name=node.name, op_name=node.op_name,
+            inputs=node.inputs, outputs=node.outputs, backward="owner_output",
+        )
+        subregion = build_path_c_fusion_region(
+            region_name=node.op_name, surfaces=(surf,),
+            z3_sync=Z3SyncSpec.minimize_sync_async(),
+            metadata={"path_c_model_shape_env": env},
+        )
+        prim = build_path_c_descriptor_prim_func(
+            subregion, (reg.descriptor_for(node.op_name),), shape_env=env
+        )
+        assert type(prim).__name__ == "JITKernel", node.op_name
+        kernels[node.op_name] = prim
+
+    torch.manual_seed(0)
+    C = (torch.randn(b, S, G, N, device=dev) * 0.1).half()
+    Bmat = (torch.randn(b, S, G, N, device=dev) * 0.1).half()
+    x = (torch.randn(b, S, H, P, device=dev) * 0.1).half()
+    A = -torch.rand(H, device=dev).half()
+    dt = (torch.rand(b, S, H, device=dev) * 0.05).half()
+    D = torch.randn(H, device=dev).half()
+    h0 = (torch.randn(b, H, P, N, device=dev) * 0.1).float()
+
+    cb = torch.zeros(b, nchunks, G, chunk, chunk, device=dev, dtype=torch.float16)
+    dA_cumsum = torch.zeros(b, H, nchunks, chunk, device=dev, dtype=torch.float16)
+    summary_states = torch.zeros(b, nchunks, H, P, N, device=dev, dtype=torch.float32)
+    kernels["mamba3_chunk_precompute"](
+        x.contiguous(), Bmat.contiguous(), C.contiguous(),
+        A.contiguous(), dt.contiguous(), cb, dA_cumsum, summary_states)
+    torch.mps.synchronize()
+
+    prev_states = torch.zeros(b, nchunks, H, P, N, device=dev, dtype=torch.float32)
+    final_state = torch.zeros(b, H, P, N, device=dev, dtype=torch.float32)
+    kernels["mamba3_inter_chunk_recur"](
+        summary_states.contiguous(), dA_cumsum.contiguous(), h0.contiguous(),
+        prev_states, final_state)
+    torch.mps.synchronize()
+
+    dt_k = rearrange(dt, "b (c s) hh -> b hh c s", c=nchunks).contiguous()
+    out = torch.zeros(b, S, H, P, device=dev, dtype=torch.float16)
+    kernels["mamba3_chunk_scan_combine"](
+        cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
+        C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+    torch.mps.synchronize()
+
+    out_serial, hlast_serial = _serial_full_forward(
+        C.cpu(), Bmat.cpu(), x.cpu(), A.cpu(), dt.cpu(), h0.cpu(), D.cpu())
+    max_abs = float((out.float().cpu() - out_serial).abs().max())
+    max_hlast = float((final_state.float().cpu() - hlast_serial).abs().max())
+    with capsys.disabled():
+        print(
+            f"\n[region-flip parity] S={S} H={H} P={P} N={N} G={G} "
+            f"out max|abs|={max_abs:.3e} h_last max|abs|={max_hlast:.3e}"
+        )
+    assert not bool(torch.isnan(out).any())
+    assert max_abs < 5e-4, f"region-flip forward parity {max_abs:.3e} >= 5e-4"
+    assert max_hlast < 5e-4, f"region-flip final-state parity {max_hlast:.3e} >= 5e-4"

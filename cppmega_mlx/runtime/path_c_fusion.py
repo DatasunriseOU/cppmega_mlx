@@ -1918,6 +1918,26 @@ def _path_c_model_brick_surface_lowerer_for(
     )
 
 
+# Per-brick projected-SSD region input suffixes consumed by the chunked
+# F0/F1/F2 forward (design §2/§7). These are the PRE-projected SSD tensors the
+# precompute stage (mamba3_chunked_precompute_core.chunk_precompute_fwd_metal_prim)
+# reads — they are caller-owned region ABI inputs, NOT the raw block weights. The
+# serial ``mamba3_mimo`` surface forms them internally from ``route_hidden`` + the
+# real in-proj/conv/norm weights; when the chunked flag is ON the direct-chain
+# runtime stages them ahead of the region and feeds them as these inputs.
+_MAMBA3_CHUNKED_PROJECTED_SSD_INPUT_SUFFIXES = ("x", "B", "C", "A", "dt")
+# Caller-owned inter-chunk handoff buffer suffixes that wire F0 -> F1 -> F2
+# (DESCRIPTOR_MAMBA3_CHUNKED_FWD_HANDOFF_ABI_BUFFERS in the schedules module);
+# summary_states/prev_states/final_state resolve fp32 in ``_buffer_dtype``.
+_MAMBA3_CHUNKED_HANDOFF_SUFFIXES = (
+    "cb",
+    "dA_cumsum",
+    "summary_states",
+    "prev_states",
+    "final_state",
+)
+
+
 def _emit_mamba3_model_brick_surfaces(
     brick: _ResolvedPathCModelBrick,
     context: _PathCBrickSurfaceLoweringContext,
@@ -1925,6 +1945,8 @@ def _emit_mamba3_model_brick_surfaces(
     name = brick.name
     delta = f"{name}_delta"
     state = f"{name}_state"
+    if path_c_mamba3_chunked_scan_enabled():
+        return _emit_mamba3_chunked_model_brick_surfaces(brick, context)
     context.surfaces.append(
         FusionKernelSurface.path_c(
             name=name,
@@ -1936,6 +1958,88 @@ def _emit_mamba3_model_brick_surfaces(
             ),
             outputs=(delta, state),
             backward="aot_autograd",
+        )
+    )
+    return _PathCBrickSurfaceLoweringResult(delta_output=delta)
+
+
+def _emit_mamba3_chunked_model_brick_surfaces(
+    brick: _ResolvedPathCModelBrick,
+    context: _PathCBrickSurfaceLoweringContext,
+) -> _PathCBrickSurfaceLoweringResult:
+    """Emit the chunked F0/F1/F2 SSD-core forward as 3 region surfaces.
+
+    The ``CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN`` flag is ON. In place of the single
+    serial ``mamba3_mimo`` surface this emits the 3 grid-launched SSD-core
+    segments (design §2/§7):
+
+      F0 ``mamba3_chunk_precompute``  : (x,B,C,A,dt) -> cb, dA_cumsum, summary_states
+      F1 ``mamba3_inter_chunk_recur`` : (summary_states, dA_cumsum, h0) -> prev_states, final_state
+      F2 ``mamba3_chunk_scan_combine``: (cb, x, dt, dA_cumsum, C, prev_states, D) -> delta
+
+    wired by the per-brick caller-owned handoff buffers. The projected SSD tensors
+    (``{name}_x/B/C/A/dt``) and the initial state ``{name}_h0`` / skip param
+    ``{name}_D`` are region ABI INPUTS the direct-chain runtime stages ahead of the
+    region (the serial mamba3_mimo forms them internally from the in-proj/conv/norm
+    weights). The F2 output is this brick's ``delta``; the final inter-chunk state
+    is the brick ``state`` output (matching the serial state hand-back).
+
+    RULE #1: each segment compiles to its proven ``build_*_metal`` grid kernel via
+    the compile-site delegation interpose; on compile/parity failure the builder
+    RAISES (no silent serial fallback). Flag OFF keeps the single serial surface.
+    """
+
+    name = brick.name
+    # Projected SSD region inputs (caller-owned, per brick).
+    proj = {
+        suffix: f"{name}_{suffix}"
+        for suffix in _MAMBA3_CHUNKED_PROJECTED_SSD_INPUT_SUFFIXES
+    }
+    # Inter-chunk handoff buffers (caller-owned, per brick).
+    hand = {
+        suffix: f"{name}_{suffix}"
+        for suffix in _MAMBA3_CHUNKED_HANDOFF_SUFFIXES
+    }
+    h0 = f"{name}_h0"
+    skip_d = f"{name}_D"
+    delta = f"{name}_delta"
+
+    # F0 — grid precompute (no scan dependency).
+    context.surfaces.append(
+        FusionKernelSurface.path_c(
+            name=f"{name}_chunk_precompute",
+            op_name="mamba3_chunk_precompute",
+            inputs=(proj["x"], proj["B"], proj["C"], proj["A"], proj["dt"]),
+            outputs=(hand["cb"], hand["dA_cumsum"], hand["summary_states"]),
+            backward="owner_output",
+        )
+    )
+    # F1 — inter-chunk recurrence (the only O(S/C) serial stage).
+    context.surfaces.append(
+        FusionKernelSurface.path_c(
+            name=f"{name}_inter_chunk_recur",
+            op_name="mamba3_inter_chunk_recur",
+            inputs=(hand["summary_states"], hand["dA_cumsum"], h0),
+            outputs=(hand["prev_states"], hand["final_state"]),
+            backward="owner_output",
+        )
+    )
+    # F2 — chunked scan + combine (grid; emits the SSD scan-y delta).
+    context.surfaces.append(
+        FusionKernelSurface.path_c(
+            name=f"{name}_chunk_scan_combine",
+            op_name="mamba3_chunk_scan_combine",
+            inputs=(
+                hand["cb"],
+                proj["x"],
+                proj["dt"],
+                hand["dA_cumsum"],
+                proj["C"],
+                hand["prev_states"],
+                skip_d,
+            ),
+            outputs=(delta,),
+            backward="owner_output",
         )
     )
     return _PathCBrickSurfaceLoweringResult(delta_output=delta)
