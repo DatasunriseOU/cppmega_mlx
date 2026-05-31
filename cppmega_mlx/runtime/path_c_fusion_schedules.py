@@ -2801,6 +2801,14 @@ def _descriptor_prim_func_source(
     # rewritten to a global device workspace so ptxas accepts the kernel. Off
     # CUDA (e.g. Metal) this is a no-op and the source is unchanged.
     spilled_source = _demote_residual_shared_scratch_to_global(spilled_source)
+    # Metal-only: pool oversized residual T.alloc_shared scratch into ONE global
+    # workspace buffer.  Metal caps threadgroup memory at 32 KiB; the reverse-scan
+    # backward declares multiple MB of shared.dyn, which overflows that limit and
+    # crashes newComputePipelineState.  Per-buffer demotion is not viable (each
+    # global buffer is a kernel argument and the kernel already uses ~28 of ~31),
+    # so this pools every demoted float32 buffer into a single coalesced global
+    # workspace (one extra argument).  Off Metal this is a no-op.
+    spilled_source = _pool_oversized_shared_scratch_to_metal_workspace(spilled_source)
     return spilled_source, spilled_scratch
 
 
@@ -10357,6 +10365,31 @@ def _append_row_phased_m2rnn_bwd_body(
 # inside the opt-in cap with headroom for compiler bookkeeping.
 _CUDA_SHARED_SCRATCH_BUDGET_BYTES = 0xC000  # 49152 bytes (static per-block).
 
+# Metal threadgroup-memory budget for a single generated kernel's residual
+# ``T.alloc_shared`` scratch.  Apple GPUs cap threadgroup memory at 32 KiB
+# (``maxTotalThreadgroupMemory`` / the metallib threadgroup allocation limit).
+# A generated mamba3/m2rnn reverse-scan backward declares MULTIPLE MB of
+# ``shared.dyn`` (the full reverse-time state h_prev/h_next/dh/dh_prev plus the
+# per-step in-proj/conv/B-C scratch), which TileLang lowers to one giant
+# ``threadgroup float buf_dyn_shmem[...]`` array.  When that array exceeds the
+# threadgroup limit the Metal driver crashes ``MTLCompilerService`` at
+# ``newComputePipelineState`` (XPC_ERROR_CONNECTION_INTERRUPTED) — the same crash
+# previously misattributed to in-loop barriers (verified on-device: removing the
+# barriers, and even running the whole reverse scan single-lane, does NOT clear
+# the crash; demoting the oversized shared scratch off threadgroup memory DOES).
+# TRIGGER: only pool when a kernel's LOGICAL ``alloc_shared`` total exceeds this.
+# Metal's threadgroup-memory cap is 32 KiB; a kernel whose shared scratch already
+# fits keeps every buffer in threadgroup memory (unchanged), so the greedy
+# planner's buffer-count splitting is unaffected for the small per-op kernels.
+_METAL_SHARED_SCRATCH_TRIGGER_BYTES = 0x7000  # 28672 bytes (28 KiB).
+# DEMOTE-TARGET: once triggered, pool the largest buffers until the LOGICAL
+# residual is under this.  TileLang packs the residual ``alloc_shared`` into a
+# single coalesced ``buf_dyn_shmem`` array with alignment padding, so the PHYSICAL
+# threadgroup size runs a few× the logical residual; targeting 8 KiB logical keeps
+# the physical ``buf_dyn_shmem`` comfortably under Metal's 32 KiB limit (measured
+# ~29.5 KiB physical for the mamba3 backward).
+_METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES = 0x2000  # 8192 bytes (8 KiB).
+
 
 def _cuda_shared_memory_optin_cap_bytes() -> int | None:
     """Return the CUDA opt-in max shared-memory-per-block, or ``None`` off CUDA.
@@ -10445,6 +10478,130 @@ def _demote_residual_shared_scratch_to_global(source: str) -> str:
         )
         shared_total -= byte_count
     return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+
+def _pool_oversized_shared_scratch_to_metal_workspace(source: str) -> str:
+    """Metal: pool oversized ``T.alloc_shared`` scratch into ONE global workspace.
+
+    On Metal the residual reverse-scan backward scratch (the full reverse-time
+    state h_prev/h_next/dh/dh_prev plus per-step in-proj/conv/B-C buffers) sums to
+    several MB of ``shared.dyn``, which TileLang lowers to a single giant
+    ``threadgroup float buf_dyn_shmem[...]`` array that overflows Metal's 32 KiB
+    threadgroup-memory limit and crashes ``newComputePipelineState``
+    (XPC_ERROR_CONNECTION_INTERRUPTED).  We CANNOT demote each buffer to its own
+    ``T.alloc_global`` — every global buffer becomes a kernel-buffer argument and
+    the backward kernel already uses ~28 of Metal's ~31-buffer-argument limit, so
+    demoting even the four 1.75 MB state buffers blows the argument limit and the
+    Metal source fails to compile.
+
+    The durable fix pools EVERY demoted ``float32`` buffer into ONE coalesced
+    ``T.alloc_global`` workspace (a SINGLE extra kernel buffer) and rewrites every
+    ``name[idx]`` reference to ``pool[offset + (idx)]`` via the existing
+    1-D-buffer-ref remapper.  This moves the oversized scratch off threadgroup
+    memory (clearing the crash) while adding exactly one buffer argument.  The
+    cross-lane visibility the shared buffers provided is preserved: the kernel is
+    launched single-block, so a global workspace is visible to every lane exactly
+    like threadgroup memory was.  Only ``float32`` buffers are pooled (the only
+    dtype the oversized reverse-scan scratch uses); a non-float32 oversized buffer
+    raises rather than silently degrading.
+
+    Off Metal this is a no-op.  Behaviour-preserving: the demotion only changes
+    WHERE the scratch lives, not the arithmetic, so gradients are unchanged.
+    """
+
+    if _path_c_default_target() != "metal":
+        return source
+    # Scope: only the recurrent reverse-scan BACKWARD kernels
+    # (mamba3_mimo_bwd / m2rnn_bwd) carry the multi-MB reverse-time state
+    # (h_prev/h_next/dh/dh_prev) that overflows Metal's threadgroup cap and is NOT
+    # covered by the forward newComputePipelineState segment-node split.  Gate on
+    # those distinctive state-buffer names so this pass NEVER perturbs the forward
+    # fusion planner's buffer-count grouping (which the forward split already
+    # handles) — pooling there would only change WHERE forward scratch lives while
+    # spuriously shifting greedy fusion boundaries.
+    if not (
+        "_bwd_mamba3_h_next = T.alloc_shared(" in source
+        or "_bwd_mamba3_h_prev = T.alloc_shared(" in source
+        or "_bwd_m2rnn_h_next = T.alloc_shared(" in source
+        or "_bwd_m2rnn_h_prev = T.alloc_shared(" in source
+    ):
+        return source
+    lines = source.splitlines()
+    shared: list[tuple[int, str, tuple[int, ...], str, int]] = []
+    shared_total = 0
+    for index, line in enumerate(lines):
+        match = _ALLOC_SHARED_LINE_RE.match(line)
+        if match is None:
+            continue
+        shape_value = ast.literal_eval(match.group("shape"))
+        shape = (
+            (int(shape_value),)
+            if isinstance(shape_value, int)
+            else tuple(int(dim) for dim in shape_value)
+        )
+        dtype = match.group("dtype")
+        byte_count = _flattened_extent(shape) * _DTYPE_NBYTES[dtype]
+        shared.append((index, match.group("name"), shape, dtype, byte_count))
+        shared_total += byte_count
+    # Only pool kernels whose shared scratch would overflow Metal's threadgroup
+    # cap; kernels that already fit are left untouched so the planner's
+    # buffer-count splitting is unchanged for them.
+    if shared_total <= _METAL_SHARED_SCRATCH_TRIGGER_BYTES:
+        return source
+    # Select the largest residual shared buffers to pool until the rest fit the
+    # (smaller) demote target, guaranteeing the physical buf_dyn_shmem fits 32 KiB.
+    demote: list[tuple[int, str, tuple[int, ...], str, int]] = []
+    remaining = shared_total
+    for entry in sorted(shared, key=lambda item: item[4], reverse=True):
+        if remaining <= _METAL_SHARED_SCRATCH_DEMOTE_TARGET_BYTES:
+            break
+        demote.append(entry)
+        remaining -= entry[4]
+    if not demote:
+        return source
+    for _index, name, _shape, dtype, _byte_count in demote:
+        if dtype != "float32":
+            raise ValueError(
+                "Metal oversized-shared pooling only supports float32 scratch; "
+                f"buffer {name!r} is {dtype!r} and exceeds the threadgroup budget. "
+                "Add a typed pool or reduce its extent — refusing to silently "
+                "leave it in overflowing threadgroup memory."
+            )
+    # Assign each demoted buffer a contiguous slice of one float32 pool workspace.
+    pool_name = _safe_identifier("path_c_metal_shared_pool")
+    offsets: dict[str, int] = {}
+    pool_extent = 0
+    demote_indices = {entry[0] for entry in demote}
+    for _index, name, shape, _dtype, _byte_count in demote:
+        offsets[name] = pool_extent
+        pool_extent += _flattened_extent(shape)
+    # Find the indentation of the first demoted alloc line so the pool allocation
+    # is emitted at the same scope.
+    first_index = min(demote_indices)
+    pool_indent = _ALLOC_SHARED_LINE_RE.match(lines[first_index]).group("indent")
+    out: list[str] = []
+    pool_emitted = False
+    for index, line in enumerate(lines):
+        if index in demote_indices:
+            if not pool_emitted:
+                out.append(
+                    f'{pool_indent}{pool_name} = '
+                    f'T.alloc_global(({pool_extent},), "float32")'
+                )
+                pool_emitted = True
+            # Drop the original alloc_shared line for the pooled buffer.
+            continue
+        remapped = line
+        for _di, name, _shape, _dtype, _byte_count in demote:
+            if f"{name}[" in remapped:
+                remapped = _replace_one_dimensional_buffer_refs(
+                    remapped,
+                    source_name=name,
+                    target_name=pool_name,
+                    target_offset=offsets[name],
+                )
+        out.append(remapped)
+    return "\n".join(out) + ("\n" if source.endswith("\n") else "")
 
 
 def _append_row_phased_mamba3_bwd_body(
