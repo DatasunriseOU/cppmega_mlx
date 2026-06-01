@@ -69,6 +69,13 @@ def main() -> None:
         torch = None
         have_torch = False
 
+    # Optional MLX memory-limit cap (GB). Caps the MLX cache pool so the unified
+    # footprint tracks the live high-water instead of MLX's reservation
+    # headroom.
+    cap_gb = os.environ.get("CPPMEGA_MLX_MEMORY_LIMIT_GB", "").strip()
+    if cap_gb and hasattr(mx, "set_memory_limit"):
+        mx.set_memory_limit(int(float(cap_gb) * (1024**3)))
+
     t0 = time.time()
     model = local_gb10_quarter(dtype=mx.bfloat16, grad_checkpoint=args.grad_checkpoint)
     mx.eval(model.parameters())
