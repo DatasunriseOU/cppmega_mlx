@@ -139,6 +139,11 @@ def main() -> None:
     run_s = time.time() - t1
 
     peak_gb = _peak_gb()
+    torch_reserved_gb = (
+        round(float(torch.cuda.max_memory_reserved()) / (1024**3), 3)
+        if have_torch
+        else None
+    )
     torch_peak_gb = (
         round(float(torch.cuda.max_memory_allocated()) / (1024**3), 3)
         if have_torch
@@ -156,6 +161,7 @@ def main() -> None:
         "after_params_peak_gb": round(after_params_gb, 3),
         "mlx_peak_gb": round(peak_gb, 3),
         "torch_cuda_peak_gb": torch_peak_gb,
+        "torch_cuda_reserved_gb": torch_reserved_gb,
         "rss_gb": round(_rss_gb(), 3),
         "loss": float(loss),
     }
