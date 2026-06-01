@@ -2110,7 +2110,15 @@ def _emit_mamba3_chunked_bwd_model_brick_surfaces(
     skip_d = f"{name}_D"
     delta_grad = f"{name}_delta_grad"
     dh_last = f"{name}_dh_last"
-    y = f"{name}_y"
+    # B2 needs the forward UN-GATED SSD output ``y`` (= Y_diag+Y_off+D*x) to
+    # transpose the silu(z) gate (``dgate = dout*y``). The forward F2
+    # ``mamba3_chunk_scan_combine`` writes EXACTLY this ungated y into the brick's
+    # ``{name}_delta`` output (F2 has no z gate — verified chunk_scan_fwd_metal_prim
+    # applies no silu). Wiring B2's ``y`` input to a SEPARATE ``{name}_y`` buffer
+    # left it zero-seeded (no forward producer) -> the whole gate backward (and the
+    # grads downstream of dY) collapsed to zero. Bind it to the real F2 output.
+    # RULE #1: a single deterministic producer (F2 delta) feeds the consumer (B2 y).
+    y = f"{name}_delta"
     z = f"{name}_z"
 
     # B2 — output/Y transpose. Reads delta cotangent + forward cache; writes the

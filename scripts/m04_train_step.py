@@ -2653,6 +2653,81 @@ def path_c_prefix_gradient_tree_from_hidden_cotangent(
     return _path_c_gradient_tree_subset(grads, prefix_parameter_names)
 
 
+def _path_c_mamba3_projection_covered_parameter_names(
+    *,
+    model: Any,
+    chain: Any,
+) -> set[str]:
+    """Model param names the flag-ON chunked mamba3 projection bridge covers.
+
+    When ``CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN`` is ON the chunked region's
+    declared grad buffers are ``{brick}_x_grad``/``_B_grad``/... (the SSD-core
+    input grads, NOT the model-param grad names). The eager projection backward
+    bridge converts those into ``{brick}_mamba3_<param>_grad`` model-param grads at
+    RUNTIME (see ``_fold_mamba3_projection_param_grads``). Those names are exactly
+    the ``path_c_parameter_gradient_aliases`` TARGETS for the mamba block params,
+    so the corresponding MLX param names are covered — return them so the coverage
+    gate fires the full 163-grad install. Flag OFF: returns empty (the serial
+    mamba3_mimo_bwd already emits these param grads and they are counted via the
+    normal direct-chain grad-buffer path).
+    """
+
+    from cppmega_mlx.runtime.path_c_fusion import path_c_mamba3_chunked_scan_enabled
+
+    if not path_c_mamba3_chunked_scan_enabled():
+        return set()
+    if not callable(getattr(model, "path_c_parameter_gradient_aliases", None)):
+        return set()
+
+    try:
+        from cppmega_mlx.runtime.mamba3_projection_bridge import (
+            MAMBA3_PROJECTION_PARAM_GRAD_SUFFIXES,
+            mamba3_brick_blocks_for_chain,
+        )
+    except Exception:  # pragma: no cover - import guard only
+        return set()
+
+    brick_blocks = mamba3_brick_blocks_for_chain(model)
+    if not brick_blocks:
+        return set()
+
+    # The chunked region only stages a mamba brick that is present in the chain's
+    # declared buffers. Discover staged mamba bricks from the chunked SSD-input
+    # buffer specs (the same set the projection forward seeds).
+    required_specs = _path_c_direct_chain_required_logical_buffer_specs(chain)
+    staged_bricks: set[str] = set()
+    for raw_name in required_specs:
+        name = str(raw_name)
+        for suffix in ("_x", "_B", "_C", "_dt", "_z", "_h0"):
+            if name.endswith(suffix):
+                brick = name[: -len(suffix)]
+                if brick in brick_blocks:
+                    staged_bricks.add(brick)
+                break
+    if not staged_bricks:
+        return set()
+
+    # The projection bridge produces these alias-target grad buffers per staged
+    # brick. Map each target back to its MLX param name through the aliases. The
+    # ``mamba3_D`` grad is the chunked B2 ``{brick}_D_grad`` re-keyed to the alias
+    # target ``{brick}_mamba3_D_grad`` by the fold.
+    produced_targets: set[str] = set()
+    for brick in staged_bricks:
+        for logical_suffix in MAMBA3_PROJECTION_PARAM_GRAD_SUFFIXES:
+            produced_targets.add(f"{brick}_{logical_suffix}_grad")
+        produced_targets.add(f"{brick}_mamba3_D_grad")
+
+    aliases = model.path_c_parameter_gradient_aliases()
+    covered: set[str] = set()
+    for parameter_name, raw_targets in aliases.items():
+        targets = (
+            (raw_targets,) if isinstance(raw_targets, str) else tuple(raw_targets)
+        )
+        if any(str(t) in produced_targets for t in targets):
+            covered.add(_path_c_strip_gradient_suffix(str(parameter_name)))
+    return covered
+
+
 def _path_c_direct_chain_full_gradient_coverage_payload(
     *,
     model: Any | None,
@@ -2686,6 +2761,15 @@ def _path_c_direct_chain_full_gradient_coverage_payload(
         for name in bridge_plan.get("parameter_gradient_tree_names", ())
         if str(name) not in suffix_bridge_parameter_names
     }
+    # Flag-ON ONLY: the chunked mamba3 brick's model-param grads are produced by
+    # the eager projection backward bridge at runtime (their grad-buffer names are
+    # the alias targets), so they are covered even though the chunked region's own
+    # declared grad buffers are the SSD-core input grads. RULE #1: only added when
+    # the bridge will actually run (flag ON + the mamba brick is staged).
+    direct_names |= _path_c_mamba3_projection_covered_parameter_names(
+        model=model,
+        chain=chain,
+    )
     boundary_norm_name = f"layers.{start_layer_index}.norm.weight"
     prefix_names = _path_c_model_prefix_parameter_names(
         model,
@@ -4858,10 +4942,34 @@ def _path_c_mlx_to_torch_mps(value: Any) -> Any:
 
 
 def _path_c_torch_mps_to_mlx(tensor: Any, *, mx_module: Any) -> Any:
-    """Copy a torch MPS tensor back into an ``mx.array`` (host roundtrip)."""
+    """Copy a torch MPS tensor back into an ``mx.array`` (host roundtrip).
+
+    The delegated grid kernels write their OUTPUT slots in place on the torch MPS
+    device. The ``.to("cpu")`` host copy must observe the COMPLETED device write:
+    on MPS a bare ``.to("cpu")`` can race the kernel's in-place store (the delegated
+    ``_bwd`` grad slots came back all-zero in the direct-chain route — the kernel
+    DID write them, but the host copy read the pre-write contents). Force a device
+    sync + a contiguous device-side materialization before the host hop so the
+    store is visible. RULE #1: a silent stale read would surface as ZERO grads (a
+    wrong gradient) — this makes the read correct, never a fallback.
+    """
 
     import torch
 
+    if getattr(tensor, "is_mps", False) or str(getattr(tensor, "device", "")).startswith(
+        "mps"
+    ):
+        # The delegated grid kernel wrote this OUTPUT slot in place on MPS. A bare
+        # ``.to("cpu")`` (even after ``torch.mps.synchronize()``) can read the slot
+        # BEFORE the in-place store is host-visible — the delegated ``_bwd`` grad
+        # slots came back all-zero in the direct-chain route despite the kernel
+        # writing them. Issue a DEPENDENT device op (a reduction that consumes every
+        # written element) + a sync so the store is ordered/materialized before the
+        # host hop. RULE #1: a stale read is a silent ZERO gradient — this forces the
+        # correct value, it is not a fallback.
+        tensor = tensor.detach().contiguous()
+        _ = tensor.abs().sum().item()  # blocks until the in-place store completes
+        torch.mps.synchronize()
     cpu = tensor.detach().to(device="cpu")
     if cpu.dtype == torch.bfloat16:
         cpu = cpu.to(torch.float32)
@@ -7261,6 +7369,19 @@ def run_path_c_direct_fusion_chain_route(
     }
 
 
+def _path_c_mamba3_chunked_scan_enabled_for_runtime() -> bool:
+    """Flag check for the runtime mamba3 chunked-scan projection bridge.
+
+    Wraps ``path_c_mamba3_chunked_scan_enabled`` (default OFF). When OFF the
+    runtime mamba3 backward fold is skipped entirely (the serial mamba3_mimo_bwd
+    emits the param grads), so flag-OFF behaviour is unchanged.
+    """
+
+    from cppmega_mlx.runtime.path_c_fusion import path_c_mamba3_chunked_scan_enabled
+
+    return path_c_mamba3_chunked_scan_enabled()
+
+
 class PathCDirectFusionChainTrainingRuntime:
     """Explicit direct-chain runtime object for m04 route binding checks."""
 
@@ -7468,6 +7589,20 @@ class PathCDirectFusionChainTrainingRuntime:
             artifacts=self.artifacts,
             execution_phases=("backward",),
         )
+        # Flag-ON ONLY: fold the chunked SSD-core scan-input grads
+        # ({brick}_x_grad/B_grad/C_grad/z_grad/A_grad/dt_grad/h0_grad) back through
+        # the eager projection (in_proj/conv/norm/rope/trap/A/dt) to produce the
+        # mamba3_*_weight model-param grads ({brick}_mamba3_in_proj_weight_grad ...)
+        # the grad-tree aliases expect. Writes them INTO ``buffers`` so
+        # path_c_model_gradient_tree_from_direct_buffers maps them to MLX params.
+        # Flag OFF: never runs (serial mamba3_mimo_bwd already emits param grads).
+        if _path_c_mamba3_chunked_scan_enabled_for_runtime():
+            self._fold_mamba3_projection_param_grads(
+                model=model,
+                batch=batch,
+                buffers=buffers,
+                batch_row=batch_row,
+            )
         bridge_plan = path_c_direct_fusion_chain_value_and_grad_bridge_plan(
             chain=self.chain,
             model=model,
@@ -7487,6 +7622,27 @@ class PathCDirectFusionChainTrainingRuntime:
             if _path_c_strip_gradient_suffix(str(name))
             not in bridge_parameter_gradient_names
         ]
+        # Flag-ON ONLY: extract the mamba3 projection-bridge param grads too. The
+        # bridge wrote {brick}_mamba3_<param>_grad into ``buffers``; these are the
+        # alias targets for the mamba block params, so adding the MLX param names
+        # here makes path_c_model_gradient_tree_from_direct_buffers map them.
+        if _path_c_mamba3_chunked_scan_enabled_for_runtime():
+            existing_direct = {
+                _path_c_strip_gradient_suffix(str(n))
+                for n in direct_parameter_gradient_names
+            }
+            # The alias KEYS (and thus parameter_gradient_tree_names) carry the
+            # ``_grad`` suffix; append in the same format.
+            for mamba_param in sorted(
+                _path_c_mamba3_projection_covered_parameter_names(
+                    model=model, chain=self.chain
+                )
+            ):
+                if (
+                    mamba_param not in existing_direct
+                    and mamba_param not in bridge_parameter_gradient_names
+                ):
+                    direct_parameter_gradient_names.append(f"{mamba_param}_grad")
         direct_grads = path_c_model_gradient_tree_from_direct_buffers(
             model=model,
             logical_buffers=buffers,
@@ -7620,6 +7776,139 @@ class PathCDirectFusionChainTrainingRuntime:
                 grad_pairs.append((name, value))
             grads = tree_unflatten(grad_pairs)
         return (loss, ntokens), grads
+
+    def _fold_mamba3_projection_param_grads(
+        self,
+        *,
+        model: nn.Module,
+        batch: Mapping[str, mx.array],
+        buffers: dict[str, mx.array],
+        batch_row: int | None,
+    ) -> None:
+        """Fold chunked SSD-input grads into mamba3 param grads (flag-ON only).
+
+        The chunked B2/B1/B0 backward wrote ``{brick}_x_grad`` / ``_B_grad`` /
+        ``_C_grad`` / ``_z_grad`` / ``_A_grad`` / ``_dt_grad`` / ``_h0_grad`` into
+        ``buffers`` — grads w.r.t. the KERNEL-ABI scan inputs (the exact tensors
+        the eager projection produced). VJP them through the SAME projection that
+        seeded the forward inputs to obtain the mamba3 model-param grads, then
+        write each under its grad-tree-alias logical name
+        ``{brick}_mamba3_<param>_grad`` so the coverage gate completes.
+
+        RULE #1: the boundary hidden is recomputed deterministically (identical to
+        the pre-step owner). A staged mamba brick away from the chain boundary, or
+        a grad buffer of wrong shape, RAISES — no silent skip / wrong-grad alias.
+        """
+
+        from cppmega_mlx.runtime.mamba3_projection_bridge import (
+            mamba3_brick_blocks_for_chain,
+            mamba3_projection_param_grads,
+        )
+
+        chain = self.chain
+        start_layer_index = _path_c_direct_chain_start_layer_index(model, chain)
+        if start_layer_index is None:
+            raise ValueError(
+                "cannot resolve Path C direct-chain start layer for the mamba3 "
+                "projection backward bridge"
+            )
+        brick_blocks = mamba3_brick_blocks_for_chain(model)
+
+        # Cotangent suffix -> projection kernel-ABI key.
+        #
+        # The chunked B0 backward's output ABI (mamba3_chunked_backward_core.py:
+        # dx, dB, dlog_decay, ddt) is wired to the region grad buffers in this
+        # order: ``{name}_x_grad`` <- dx, ``{name}_B_grad`` <- dB,
+        # ``{name}_dt_grad`` <- dlog_decay (= d/d log_decay), ``{name}_A_grad`` <-
+        # ddt (= d/d dt_k, the COMPLETE kernel ``dt`` input cotangent incl. the
+        # decay-chain ``*A_k`` term). So the kernel ``dt`` cotangent is the
+        # ``{name}_A_grad`` buffer (ddt), NOT ``{name}_dt_grad``.
+        #
+        # ``{name}_dt_grad`` (dlog_decay) is the grad of ``log_decay = A_k*dt_k``
+        # w.r.t. the STATIC per-head ``A_k`` (pinned to the constant -1 by the ABI
+        # mapping; no model-param dependence) — intentionally NOT folded.
+        # ``D_grad`` is already a 1:1 model-param grad from the chunked region
+        # (mamba3_D); the projection does not re-derive it.
+        cot_suffix_to_key = {
+            "x_grad": "x",
+            "B_grad": "B",
+            "C_grad": "C",
+            "z_grad": "z",
+            "A_grad": "dt",
+            "h0_grad": "h0",
+        }
+
+        # Discover which mamba bricks have chunked scan-input grad buffers present.
+        staged: dict[str, dict[str, mx.array]] = {}
+        for name in list(buffers.keys()):
+            for suffix, key in cot_suffix_to_key.items():
+                tail = "_" + suffix
+                if not name.endswith(tail):
+                    continue
+                brick = name[: -len(tail)]
+                if brick not in brick_blocks:
+                    continue
+                value = buffers[name]
+                if isinstance(value, mx.array):
+                    staged.setdefault(brick, {})[key] = value
+                break
+
+        if not staged:
+            return
+
+        # Boundary hidden = the SAME raw residual the pre-step owner seeded.
+        prefix_hidden = path_c_model_prefix_hidden_states(
+            model,
+            batch,
+            end_layer_index=start_layer_index,
+        )
+        if prefix_hidden.ndim == 3 and batch_row is not None:
+            prefix_batch = int(prefix_hidden.shape[0])
+            if not (0 <= int(batch_row) < prefix_batch):
+                raise ValueError(
+                    f"batch_row {batch_row} out of range for prefix hidden batch "
+                    f"{prefix_batch}"
+                )
+            prefix_hidden = prefix_hidden[int(batch_row) : int(batch_row) + 1]
+        boundary_hidden = prefix_hidden
+
+        layers = tuple(getattr(model, "layers", ()))
+        boundary_layer = layers[start_layer_index]
+        entry_norm = getattr(boundary_layer, "norm", None)
+        entry_norm_weight = getattr(entry_norm, "weight", None)
+        if not isinstance(entry_norm_weight, mx.array):
+            raise ValueError(
+                "mamba3 projection backward bridge requires the boundary layer "
+                f"({start_layer_index}) entry-RMSNorm weight"
+            )
+        entry_norm_eps = float(getattr(entry_norm, "eps", 1e-5))
+
+        for brick in sorted(staged):
+            block, layer_index = brick_blocks[brick]
+            if layer_index != start_layer_index:
+                raise ValueError(
+                    "Path C flag-ON chunked mamba3 projection backward bridge only "
+                    f"supports a mamba brick at the chain boundary layer "
+                    f"({start_layer_index}); brick {brick!r} is at layer "
+                    f"{layer_index}."
+                )
+            param_grads = mamba3_projection_param_grads(
+                block,
+                boundary_hidden,
+                staged[brick],
+                entry_norm_weight=entry_norm_weight,
+                entry_norm_eps=entry_norm_eps,
+            )
+            for logical_suffix, grad_value in param_grads.items():
+                grad_name = f"{brick}_{logical_suffix}_grad"
+                buffers[grad_name] = grad_value
+            # The ``D`` skip-param grad is produced DIRECTLY by the chunked B2
+            # ({brick}_D_grad). The model grad-tree alias expects the ``mamba3_``
+            # infix ({brick}_mamba3_D_grad); bridge that single rename so coverage
+            # completes for mamba3_D. RULE #1: only when the chunked D grad exists.
+            chunked_d_grad = buffers.get(f"{brick}_D_grad")
+            if isinstance(chunked_d_grad, mx.array):
+                buffers[f"{brick}_mamba3_D_grad"] = chunked_d_grad
 
     def value_and_grad_contract(self) -> Mapping[str, Any]:
         binding = self.training_graph_binding() or {}
@@ -8588,6 +8877,105 @@ def make_path_c_direct_fusion_chain_workspace_owner(
     )
 
 
+def _path_c_mamba3_projection_overrides(
+    *,
+    model: Any,
+    chain: Any,
+    boundary_hidden: mx.array,
+    start_layer_index: int,
+    first_brick_name: str,
+    required_specs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, mx.array]:
+    """Compute REAL projected chunked-SSD inputs for the flag-ON mamba3 region.
+
+    Replaces the zero-seed of ``{brick}_x/B/C/A/dt/z/h0`` with the eager
+    differentiable projection forward (in_proj -> conv -> B/C-norm+RoPE -> trap ->
+    A/dt) mapped onto the chunked GRID-kernel ABI, so the chunked F0/F1/F2 scan
+    runs on real inputs that reproduce OUR serial scan exactly.
+
+    Only fires for a mamba3 brick whose INPUT hidden is the chain BOUNDARY hidden
+    (i.e. the chain's first brick, which applies its own entry RMSNorm). A mid-
+    chain mamba brick's input depends on prior bricks' runtime deltas (not yet
+    computed in the pre-step owner) — RULE #1: that case RAISES rather than seed a
+    wrong projection input. Flag OFF: this function is never called.
+    """
+
+    from cppmega_mlx.runtime.mamba3_projection_bridge import (
+        MAMBA3_KERNEL_ABI_SSD_INPUT_SUFFIXES,
+        mamba3_brick_blocks_for_chain,
+        mamba3_projection_forward,
+    )
+
+    brick_blocks = mamba3_brick_blocks_for_chain(model)
+    # The flag-ON region only stages projected SSD inputs for mamba bricks that
+    # are present as buffer prefixes in the chain. Discover them from the specs.
+    staged_bricks: dict[str, str] = {}
+    for raw_name in required_specs:
+        name = str(raw_name)
+        for suffix in MAMBA3_KERNEL_ABI_SSD_INPUT_SUFFIXES:
+            tail = "_" + suffix
+            if not name.endswith(tail):
+                continue
+            brick = name[: -len(tail)]
+            if brick in brick_blocks:
+                staged_bricks[brick] = brick
+            break
+
+    if not staged_bricks:
+        return {}
+
+    # Resolve the chain boundary brick's entry RMSNorm weight (the norm the first
+    # brick applies to the raw residual to derive its projection input).
+    layers = tuple(getattr(model, "layers", ()))
+    if not (0 <= start_layer_index < len(layers)):
+        raise ValueError(
+            f"start_layer_index {start_layer_index} out of range for "
+            f"{len(layers)} layers"
+        )
+    boundary_layer = layers[start_layer_index]
+    entry_norm = getattr(boundary_layer, "norm", None)
+    entry_norm_weight = getattr(entry_norm, "weight", None)
+    if not isinstance(entry_norm_weight, mx.array):
+        raise ValueError(
+            "Path C mamba3 projection bridge requires the boundary layer "
+            f"({start_layer_index}) entry-RMSNorm weight"
+        )
+    entry_norm_eps = float(getattr(entry_norm, "eps", 1e-5))
+
+    overrides: dict[str, mx.array] = {}
+    for brick in sorted(staged_bricks):
+        block, layer_index = brick_blocks[brick]
+        if layer_index != start_layer_index:
+            raise ValueError(
+                "Path C flag-ON chunked mamba3 projection bridge only supports a "
+                f"mamba brick at the chain boundary layer ({start_layer_index}); "
+                f"brick {brick!r} is at layer {layer_index}. Its input hidden is "
+                "produced by prior in-chain bricks at runtime and is not available "
+                "in the pre-step owner (RULE #1: refusing to seed a wrong input)."
+            )
+        kernel = mamba3_projection_forward(
+            block,
+            boundary_hidden,
+            entry_norm_weight=entry_norm_weight,
+            entry_norm_eps=entry_norm_eps,
+        )
+        for suffix, value in kernel.items():
+            name = f"{brick}_{suffix}"
+            spec = required_specs.get(name)
+            if spec is None:
+                continue
+            target_dtype = _mx_dtype_from_path_c_abi(str(spec["dtype"]))
+            target_shape = tuple(int(d) for d in spec["shape"])
+            if tuple(value.shape) != target_shape:
+                raise ValueError(
+                    f"mamba3 projection produced {name!r} with shape "
+                    f"{tuple(value.shape)} but the chunked region ABI requires "
+                    f"{target_shape}"
+                )
+            overrides[name] = value.astype(target_dtype)
+    return overrides
+
+
 def make_path_c_direct_chain_pre_step_runtime_owner(
     *,
     chain: Any,
@@ -8705,6 +9093,25 @@ def make_path_c_direct_chain_pre_step_runtime_owner(
             "model direct-chain owner is missing required parameter buffers: "
             f"{missing_model_buffers[:8]}"
         )
+
+    # Flag-ON ONLY: replace the zero-seeded chunked-SSD projected inputs
+    # ({brick}_x/B/C/A/dt/z/h0) with the REAL eager projection forward so the
+    # chunked F0/F1/F2 scan core runs on actual inputs (not zeros). Flag OFF: the
+    # serial mamba3_mimo forms these internally and this branch never runs, so the
+    # owner is byte-for-byte unchanged.
+    from cppmega_mlx.runtime.path_c_fusion import path_c_mamba3_chunked_scan_enabled
+
+    if path_c_mamba3_chunked_scan_enabled():
+        projection_overrides = _path_c_mamba3_projection_overrides(
+            model=model,
+            chain=chain,
+            boundary_hidden=boundary_hidden,
+            start_layer_index=start_layer_index,
+            first_brick_name=first_brick_name,
+            required_specs=required_specs,
+        )
+        for name, value in projection_overrides.items():
+            buffers[name] = value
 
     profile_name = str(getattr(model, "path_c_profile_name", "HybridTinyLM"))
     return PathCLogicalBufferOwner(

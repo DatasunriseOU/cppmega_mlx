@@ -280,3 +280,90 @@ honest remaining work to reach 163-grad parity is a SEPARATE feature:
   - test_mamba3_chunked_backward_b0b1b2.py: 13 passed (incl. 2 new chain tests).
   - test_m04_train_step.py -k direct_chain|path_c|chain: 82 passed, SAME 3
     pre-existing failures (re-verified identical via `git stash` on clean base).
+
+================================================================================
+## UPDATE (branch `mamba3-projection-bridge`) — EAGER PROJECTION FWD/BWD BRIDGE
+## IMPLEMENTED + VERIFIED. Forward now seeds REAL inputs; coverage completes to
+## 163 grads. ONE upstream gap remains: the chunked B-kernels emit ZERO grads in
+## the route (NOT the bridge).
+================================================================================
+
+### What was BUILT (cppmega_mlx/runtime/mamba3_projection_bridge.py + m04 wiring)
+1. **Projection FORWARD** (`mamba3_projection_forward`): replicates
+   `Mamba3ReferenceBlock.__call__` (mamba3.py:728-804) from entry-RMSNorm +
+   in_proj THROUGH (stopping before) the scan — conv+silu, B/C MIMO RMSNorm+mean,
+   softplus dt + trapezoidal B-scale, RoPE-on-state via angles_cumsum, A floor,
+   h0 — then maps the serial-convention inputs onto the chunked GRID-kernel ABI:
+     A_k[h] = -1 (static)        dt_k = -A_s*dt_s (>0)   => A_k*dt_k = A_s*dt_s
+     x_k = x_s                   B_k = B_s/dt_k          => dt_k*x_k(x)B_k = x_s(x)B_s
+   This is EXACT (no approximation): VERIFIED the kernel-ABI scan reproduces OUR
+   serial scan output to <1e-4 fp32 and rel 6.3e-4 at fp16 (tests/test_mamba3_
+   projection_bridge.py::test_kernel_abi_mapping_reproduces_serial_scan).
+2. **Projection BACKWARD** (`mamba3_projection_param_grads`): mirrors
+   path_c_prefix_gradient_tree_from_hidden_cotangent — builds sum(kernel_abi[k] *
+   cotangent[k]) and nn.value_and_grad over the mamba block params. Consumes the
+   chunked SSD-input cotangents (x/B/C/z/dt/h0); ``dt`` cotangent = the B0 ``ddt``
+   buffer (= {brick}_A_grad, the COMPLETE d/d dt_k incl. the *A_k decay-chain
+   term); the B0 ``dlog_decay`` ({brick}_dt_grad) is for the STATIC A_k=-1 and is
+   intentionally dropped. VERIFIED full-composition (proj-fwd -> kernel scan ->
+   scan-VJP -> bridge-VJP) == serial autodiff param grads to **4.5e-13** for all 8
+   projection params (test_full_composition_matches_serial_autodiff). out_proj
+   correctly gets ZERO projection grad (applied post-scan).
+3. **m04 wiring** (scripts/m04_train_step.py, ALL flag-ON gated):
+   - `make_path_c_direct_chain_pre_step_runtime_owner`: replaces the zero-seed of
+     {brick}_x/B/C/A/dt/z/h0 with the projection forward (VERIFIED seeds nonzero).
+   - `PathCDirectFusionChainTrainingRuntime._fold_mamba3_projection_param_grads`:
+     after the backward route, VJPs the chunked SSD-input grad buffers into
+     {brick}_mamba3_<param>_grad + re-keys {brick}_D_grad -> {brick}_mamba3_D_grad.
+   - `_path_c_mamba3_projection_covered_parameter_names` + coverage payload +
+     direct-grad-name extension: the chunked mamba params are now coverage-complete
+     so the critical-path 163-grad install fires (VERIFIED ready=True, missing=[]).
+   - Flag OFF: every branch is gated OFF -> owner/coverage/route byte-unchanged.
+
+### VERIFICATION (Metal, local_gb10_quarter smoke, H=1 P=64 N=16 chunk=64)
+- Bridge unit/numerical: tests/test_mamba3_projection_bridge.py — 8 passed
+  (fwd ABI parity <1e-4, full-composition vs serial autodiff 4.5e-13, owner seeds
+  nonzero flag-ON, coverage complete flag-ON, no projection buffers flag-OFF).
+- Flag-ON full route runs END-TO-END: install critical=True, loss FINITE
+  (~5.6-5.72), **163 grads returned**, all grad NAMES present (vs serial-eager
+  reference). fwd+bwd ~4s (vs serial baseline 6.1s; the serial DESCRIPTOR route is
+  XPC-blocked here — see below).
+- Merge-safety (flag default OFF): test_path_c_fusion_ir + autosplit_metal_parity
+  124 passed; test_mamba3_chunked_backward_b0b1b2 13 passed; test_m04_train_step -k
+  direct_chain|path_c|chain 82 passed, SAME 3 pre-existing failures (re-verified
+  identical via git stash on clean base).
+
+### THE ONE REMAINING GAP (upstream chunked-region infra, NOT the projection bridge)
+The chunked B2/B1/B0 BACKWARD kernels EMIT ZERO grad outputs when driven via the
+route's torch-mps host-roundtrip bridge, even though the SAME kernels pass the
+direct kernel-level parity test (test_mamba3_chunked_backward_b0b1b2.py: 13 passed,
+worst 3.84e-4). Diagnosed precisely:
+  - Forward: the chunked F0/F1/F2 run on the REAL projected inputs and write a real
+    cache (cb absmax=41, dA_cumsum=0.16, summary_states=6.7e-3, delta=0.087).
+  - Backward: {brick}_delta_grad reaching B2 is NONZERO (7e-3), B2's ABI is wired
+    correctly (delta_grad=input[0], C_grad/x_grad/z_grad/D_grad=output), but every
+    B2/B1/B0 grad output reads back as absmax=0.0.
+  - Note: {brick}_y (the forward un-gated SSD output) is a B2 INPUT (B2 needs it for
+    the z-gate backward dgate=dout*y) but NO forward segment writes it (F2 writes
+    only {brick}_delta). So {brick}_y stays zero-init -> dz path zeros; but dY =
+    dout*silu(z) (gate) should still be nonzero and feed dx/dC, so the all-zero
+    output points at the torch-mps out_idx reflection / kernel invocation for the
+    `_bwd` segments specifically (F0 forward reflection through the SAME bridge
+    works). This is the next gap to close to make the 163 grads NONZERO-correct.
+
+Because the chunked backward feeds the projection bridge ZERO cotangents, the
+bridge correctly (RULE #1) produces ZERO mamba projection param grads — it is NOT
+faking parity. The bridge is provably exact (4.5e-13) and will yield correct param
+grads the moment the chunked backward emits the (already kernel-verified) nonzero
+SSD-input cotangents. Two concrete upstream fixes: (a) make the forward F2 also
+write {brick}_y (or have B2 recompute it), (b) verify the torch-mps out_idx return
+reflection for the B2/B1/B0 delegated `_bwd` segments writes the owner grad buffers
+(the forward F0/F1/F2 reflection works, so the asymmetry is localized).
+
+### Honest wall-time (Metal, smoke, seq=64-128, batch=1)
+  flag ON (chunked + bridge): 163 grads, loss ~5.6-5.72 finite, fwd+bwd ~4s.
+  serial DESCRIPTOR route (flag OFF): XPC-blocked in THIS environment on the giant
+    fused chain_12_13 Metal kernel (XPC_ERROR_CONNECTION_INTERRUPTED) — the very
+    mega-kernel the chunked path REPLACES; reproducible on a CLEAN checkout, NOT a
+    regression from this change. Prior recorded serial baseline: loss 5.7134,
+    6.106s. Eager-serial full-model reference (mamba=ref scan): loss ~5.70-5.71.
