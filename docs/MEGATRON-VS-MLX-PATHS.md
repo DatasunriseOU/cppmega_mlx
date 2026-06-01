@@ -1,10 +1,10 @@
-# Megatron (C++/torch) vs MLX Paths — Definitive Throughput Comparison
+# Megatron-LM (PyTorch + TransformerEngine CUDA) vs MLX Paths — Definitive Throughput Comparison
 
 Date: 2026-06-01 · Host: gb10 (NVIDIA GB10, sm_121, 121 GB unified) · single GPU (TP=1 PP=1 DP=1 CP=1, EP local)
 
-This doc pairs the **LIVE-reproduced** C++/Megatron `local_gb10_quarter` training number against our
+This doc pairs the **LIVE-reproduced** Megatron-LM `local_gb10_quarter` training number against our
 MLX paths (path_b / path_c / path_c_chunked) from the gb10 1B speed matrix. It is the single
-apples-to-apples reference for "how fast is the C++ stack vs our MLX port, and which configs each can run."
+apples-to-apples reference for "how fast is the Megatron stack vs our MLX port, and which configs each can run."
 
 Cross-references: `docs/TOKPS-DISCREPANCY.md` (the "75 vs 3000 tok/s" verdict) and
 `reports/MATRIX-REVIEW-INDEX.md` (the full Path-A..E campaign index).
@@ -15,7 +15,7 @@ cannot run say **cannot run** with the exact reason.
 
 ---
 
-## 1. The C++/Megatron number — LIVE-REPRODUCED (not read from a receipt)
+## 1. The Megatron-LM number — LIVE-REPRODUCED (not read from a receipt)
 
 Reproduced live on gb10 this session, **not** read from `plan.md`. Launcher:
 `/home/dave/source/cppmega/scripts/local_gb10_quarter_train.sh` (gb10 copy; cppmega SHA `8a3498f`).
@@ -57,7 +57,7 @@ not a dry pass).
 - **Steady-state (iters 7-10): mean 4820 ms/step → 3399 tok/s. Best iter 3404 tok/s.**
 - Wider warm window (iters 5-10): 4854 ms → 3375 tok/s.
 - Measured-system peak memory during the run: 38 GB (includes a concurrent MLX probe campaign on the same
-  box). The **C++ run's own footprint is ~26 GB** per the receipt / `MATRIX-REVIEW-INDEX.md`.
+  box). The **Megatron run's own footprint is ~26 GB** per the receipt / `MATRIX-REVIEW-INDEX.md`.
 
 ### Live vs receipt
 
@@ -71,7 +71,7 @@ not a dry pass).
 4413 ms. The gap is **not** a config or correctness difference (same 16,384 tok/step, same fwd+bwd+Muon, same
 loss trajectory) — it is **memory-bandwidth contention**: another agent was running a concurrent MLX
 `probe_real_step_mem … --batch 1 --seq 4096` campaign that bursts to ~93 GB on the same 121 GB unified-memory
-device throughout the C++ run. The receipt was measured on a clean idle box. On an idle box this run lands on
+device throughout the Megatron run. The receipt was measured on a clean idle box. On an idle box this run lands on
 the 3712-3747 cluster. **3399 tok/s is the honest live number under contention; ~3700 tok/s is the clean-box
 number, now confirmed reproducible (not just receipt-read).**
 
@@ -134,7 +134,7 @@ Sources: `reports/cppmega_1b_speed_matrix_gb10_fastfused_20260601_b2s512.md`,
 | bs=1 × seq=1024 | 1024 | **191** ✅ | **cannot run** | 32.6 (b) | path_c blocks at seq>512 |
 | bs=1 × seq=1024 (eff. MoE) | 1024 | 166 ✅ | n/a | 32.8 | `CPPMEGA_MOE_EFFICIENT=1`, loss 11.29→5.65 |
 | bs=1 × seq=4096 | 16384 | **cannot run** | n/a | fwd-only 4.9; fwd+bwd+adamw **97+** | backward+optimizer burst > 105 GB cap |
-| bs=4 × seq=4096 (C++ config) | 16384 | **cannot run** | n/a | — | unreachable (bwd+opt burst) |
+| bs=4 × seq=4096 (Megatron config) | 16384 | **cannot run** | n/a | — | unreachable (bwd+opt burst) |
 
 (muon mirrors adamw on scale: bs1→bs2 path_b 92→159.)
 
@@ -142,8 +142,8 @@ Sources: `reports/cppmega_1b_speed_matrix_gb10_fastfused_20260601_b2s512.md`,
 
 ## 3. Apples-to-apples normalization
 
-The C++ run does **16,384 tok/step**; the MLX path_c run does **512 tok/step** — a **32×** token-count
-difference before any substrate effect. Per `TOKPS-DISCREPANCY.md`, the face-value C++/MLX-muon ratio
+The Megatron run does **16,384 tok/step**; the MLX path_c run does **512 tok/step** — a **32×** token-count
+difference before any substrate effect. Per `TOKPS-DISCREPANCY.md`, the face-value Megatron/MLX-muon ratio
 (3399…3747 vs 75.7) decomposes as roughly **32× (tokens/step) × ~5-11× (MLX-eager muon tax + eager-reference
 vs fused-FP8-CUDA substrate)**, with **0× from GPU count** (both single-GPU, per-GPU == aggregate) and
 **0× from model architecture** (identical NAM56R stack, confirmed in `TOKPS-DISCREPANCY.md` §5).
@@ -152,19 +152,19 @@ vs fused-FP8-CUDA substrate)**, with **0× from GPU count** (both single-GPU, pe
 
 | side | optimizer | tok/step | tok/s | ms per token | basis |
 |---|---|---:|---:|---:|---|
-| C++ Megatron (live) | muon | 16,384 | 3399 | **0.294** | 4820 ms ÷ 16384 |
-| C++ Megatron (receipt) | muon | 16,384 | 3712-3747 | 0.267-0.269 | clean box |
+| Megatron-LM (live) | muon | 16,384 | 3399 | **0.294** | 4820 ms ÷ 16384 |
+| Megatron-LM (receipt) | muon | 16,384 | 3712-3747 | 0.267-0.269 | clean box |
 | MLX path_b | adamw | 512 | 156 | 6.41 | best small-batch MLX |
 | MLX path_b | adamw | 1024 | 191 (seq=1024) | 5.24 | scales with seq |
 | MLX path_c | adamw | 512 | 117 | 8.55 | only shape path_c runs |
 | MLX path_b | muon | 512 | 92 | 10.87 | matched optimizer, small batch |
 
-The per-token gap C++ vs MLX-path_b-adamw at their respective runnable shapes is ~**0.294 vs 5.24-6.41 ms/token
+The per-token gap Megatron vs MLX-path_b-adamw at their respective runnable shapes is ~**0.294 vs 5.24-6.41 ms/token
 (≈18-22×)**. This is the genuine **fused-FP8-CUDA-large-batch vs MLX-eager-bf16-small-batch** substrate +
 batch-amortization delta — it is **not** closeable to a single clean factor because the two measurements needed
-(MLX at bs=4×seq=4096, and C++ at bs=1×seq=512) do not exist: MLX cannot reach the C++ shape (below).
+(MLX at bs=4×seq=4096, and Megatron at bs=1×seq=512) do not exist: MLX cannot reach the Megatron shape (below).
 
-### Why MLX cannot reach the C++ config (code-pinned, from `MATRIX-REVIEW-INDEX.md`)
+### Why MLX cannot reach the Megatron config (code-pinned, from `MATRIX-REVIEW-INDEX.md`)
 
 1. **path_c is pinned to exactly bs=1 × seq=512.** It blocks at bs>1 *or* seq>512 with
    `direct_fusion_chain_logical_buffers_missing` — the fused direct-chain runtime was built for that one shape.
@@ -176,7 +176,7 @@ batch-amortization delta — it is **not** closeable to a single clean factor be
    (gradients + m/v optimizer state + recomputed grad-checkpoint activations all materialize at once) — over the
    105 GB SIGTERM safety cap. So bs=4×seq=4096 (and even bs=1×seq=4096 fwd+bwd) is unreachable in MLX-eager.
 3. The wall is the **whole-model backward+optimizer burst, NOT the MoE** — measured: efficient sparse MoE and
-   dense MoE have the same ~32.6/32.8 GB peak at seq=1024 (MoE is only 4 of 13 layers). C++ does bs=4×seq=4096
+   dense MoE have the same ~32.6/32.8 GB peak at seq=1024 (MoE is only 4 of 13 layers). Megatron does bs=4×seq=4096
    in ~26 GB because its fused training step (activation checkpointing + a fused optimizer that never
    materializes all grads + optimizer-state simultaneously) + sparse all-to-all MoE avoid that burst.
 
@@ -185,34 +185,34 @@ batch-amortization delta — it is **not** closeable to a single clean factor be
 ## 4. Final cross-path table
 
 Rows = the four paths; columns = the configs each can run, with tok/s. **"cannot run"** cells state the exact
-reason. C++ = live this session; MLX = gb10 1B matrix (prior session, LIVE-measured). All single GB10, full
+reason. Megatron = live this session; MLX = gb10 1B matrix (prior session, LIVE-measured). All single GB10, full
 fwd+bwd+optimizer step.
 
 | path | bs1×seq512 (512 tok) | bs2×seq512 (1024 tok) | bs1×seq1024 (1024 tok) | bs4×seq4096 (16384 tok) | dtype/opt of best cell |
 |---|---|---|---|---|---|
-| **C++ Megatron** | not measured¹ | not measured¹ | not measured¹ | **3399 tok/s live** (3712-3747 receipt, clean box) | bf16+FP8 / Muon |
+| **Megatron-LM** | not measured¹ | not measured¹ | not measured¹ | **3399 tok/s live** (3712-3747 receipt, clean box) | bf16+FP8 / Muon |
 | **MLX path_b** | 156 (adamw) / 92 (muon) | **259** (adamw) / 159 (muon) | **191** (adamw, seq=1024) | **cannot run** — bwd+optimizer burst ~97 GB > cap | bf16 / adamw |
 | **MLX path_c** | **117** (adamw) / 80.5 (muon) | **cannot run** — bs>1 → `direct_fusion_chain_logical_buffers_missing` | **cannot run** — seq>512 → same | **cannot run** — bs & seq both off build shape | bf16 / adamw |
 | **MLX path_c_chunked** | 121 (adamw) / 80.5 (muon) | **cannot run** — same direct-chain limit (bs>1) | **cannot run** — same (seq>512) | **cannot run** — same | bf16 / adamw; compiles 1.15-2.0× faster than path_c |
 
-¹ C++ Megatron at small shapes (bs1×seq512 etc.) was **not run** — the launcher targets the production quarter
+¹ Megatron-LM at small shapes (bs1×seq512 etc.) was **not run** — the launcher targets the production quarter
 config (bs4×seq4096). It is technically runnable there but out of scope; the one cell that matters for the
-comparison (its native bs4×seq4096) is the live-reproduced 3399 tok/s. This asymmetry — C++ only measured at its
-big shape, MLX only runnable at small shapes — is exactly why a single clean MLX-vs-C++ ratio does not exist
+comparison (its native bs4×seq4096) is the live-reproduced 3399 tok/s. This asymmetry — Megatron only measured at its
+big shape, MLX only runnable at small shapes — is exactly why a single clean MLX-vs-Megatron ratio does not exist
 (`TOKPS-DISCREPANCY.md` §6).
 
 ### Plain-language summary
 
-- **C++/Megatron is the only path that runs the real production config (bs4×seq4096, 16,384 tok/step): live
+- **Megatron-LM is the only path that runs the real production config (bs4×seq4096, 16,384 tok/step): live
   3399 tok/s under contention, 3712-3747 tok/s on a clean box (receipt, now reproduced).**
 - **MLX path_b is the only MLX path that scales** with batch and sequence, but **tops out before seq=4096**
-  (backward+optimizer memory burst) and so **cannot meet the C++ config**. Best MLX numbers: 259 tok/s
+  (backward+optimizer memory burst) and so **cannot meet the Megatron config**. Best MLX numbers: 259 tok/s
   (bs2×seq512) / 191 tok/s (bs1×seq1024), adamw, bf16.
 - **MLX path_c / path_c_chunked are pinned to bs1×seq512** (117 / 121 tok/s adamw) — the fused direct-chain
   runtime exists only for that shape; everything larger fails loud. Their win is **faster compile**, not
   steady-state throughput.
-- The C++↔MLX gap is **batch/token-count (32×) + eager-reference-vs-fused-FP8-CUDA substrate**, not a model or
-  GPU-count difference (`TOKPS-DISCREPANCY.md`). The highest-leverage MLX item to even approach the C++ config is
+- The Megatron↔MLX gap is **batch/token-count (32×) + eager-reference-vs-fused-FP8-CUDA substrate**, not a model or
+  GPU-count difference (`TOKPS-DISCREPANCY.md`). The highest-leverage MLX item to even approach the Megatron config is
   a **fused/streamed (chunked-param) optimizer step** that never holds all grads + optimizer state at once.
 
 ---
@@ -232,20 +232,20 @@ since it is counterproductive on MLX-CUDA), with `free -g` as truth and the gb10
 **Conclusion (measured, not assumed):** at seq ≥ 2048 the chunked backward that *saves* the memory is
 compute-heavy, so MLX-eager trades the OOM for ~5 min/step — neither seq=2048 nor seq=4096 yields a practical
 completing throughput number, and seq=4096 additionally peaks 107 GB (>100 GB budget). The fixes brought
-seq=4096 from 121 GB→107 GB (close) but it stays over budget and ~100× slower per step than the fused C++
+seq=4096 from 121 GB→107 GB (close) but it stays over budget and ~100× slower per step than the fused Megatron
 kernel. So the literal bs4×seq4096 MLX path_b number is **fundamentally impractical** on this eager stack —
 now proven by direct runs, not inferred. The honest MLX throughput ceiling is **191 tok/s @ bs1×seq1024**;
-C++/Megatron does the full bs4×seq4096 step at **3399 tok/s live** in ~26 GB. The gap is the
-eager-reference-vs-fused-FP8-CUDA substrate + the streamed-optimizer/recompute design C++ has and MLX-eager lacks.
+Megatron-LM does the full bs4×seq4096 step at **3399 tok/s live** in ~26 GB. The gap is the
+eager-reference-vs-fused-FP8-CUDA substrate + the streamed-optimizer/recompute design Megatron has and MLX-eager lacks.
 
 ---
 
 ## Sources
 
-- **Live C++ run:** `repro_quarter_20260601_192748` on gb10, launcher
+- **Live Megatron run:** `repro_quarter_20260601_192748` on gb10, launcher
   `/home/dave/source/cppmega/scripts/local_gb10_quarter_train.sh` (cppmega SHA `8a3498f`); raw per-iter timings
   in §1.
-- **C++ receipt:** cppmega `plan.md:989,991,110,116` (3628-3747 cluster, 2026-04-25).
+- **Megatron receipt:** cppmega `plan.md:989,991,110,116` (3628-3747 cluster, 2026-04-25).
 - **MLX matrix:** `reports/cppmega_1b_speed_matrix_gb10_fastfused_20260601.md`,
   `…_b2s512.md`, `cppmega_1b_seqscale_gb10_b1s1024_results.json`.
 - **Analyses:** `docs/TOKPS-DISCREPANCY.md`, `reports/MATRIX-REVIEW-INDEX.md`.
