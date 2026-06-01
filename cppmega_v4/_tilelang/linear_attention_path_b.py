@@ -199,6 +199,25 @@ def _gdn_forward_kernel(
     return o, state_final
 
 
+def _device_can_run_metal() -> bool:
+    """True iff the live MLX device is an Apple GPU with a working Metal backend.
+
+    The single device->target switch for Path B (mirrors
+    ``linear_attention_path_c._device_can_run_metal``): when True the hand-MSL
+    ``mx.fast.metal_kernel`` forward runs (the existing Apple path); when False
+    (the CUDA gb10 host where ``mx.default_device()`` is the CUDA gpu but
+    ``mx.metal.is_available()`` is False) Path B must route to the host
+    ``_cuda_eager`` bridge, otherwise ``mx.fast.metal_kernel`` raises
+    ``RuntimeError: [metal_kernel] No Metal back-end.`` on the CUDA host.
+    """
+    metal = getattr(mx, "metal", None)
+    return (
+        mx.default_device() == mx.gpu
+        and metal is not None
+        and metal.is_available()
+    )
+
+
 def gdn_forward_path_b(
     q: mx.array,
     k: mx.array,
@@ -212,11 +231,52 @@ def gdn_forward_path_b(
 ):
     """Path B forward, signature matching ``naive_recurrent_gated_delta_rule``.
 
+    Device-aware target (mirrors GDN Path C): on Apple (Metal available) run
+    the hand-MSL ``mx.fast.metal_kernel`` forward unchanged. On a CUDA host
+    (Metal unavailable, ``mx.default_device()`` is the CUDA gpu) route the same
+    GDN gated-delta recurrence through the host ``_cuda_eager`` bridge — the
+    MSL kernel's ``mx.fast.metal_kernel`` would otherwise raise
+    ``RuntimeError: [metal_kernel] No Metal back-end.`` on the CUDA arrays.
+
+    Any failure of the CUDA EAGER path RAISES (RULE #1) — never a silent
+    fall-through to the Apple MSL kernel (which cannot run on CUDA anyway).
+
     Supports:
         - ``initial_state`` shape [B, H, K, V] (streaming decode).
         - Custom ``scale`` (defaults to 1/sqrt(K) per FLA convention).
         - ``head_k_dim != head_v_dim``.
     """
+    # CUDA EAGER branch: Metal is unavailable, so the hand-MSL kernel cannot
+    # accept the CUDA-resident MLX arrays. Run the same GDN gated-delta
+    # recurrence via the host _cuda_eager bridge (target='cuda'), the exact
+    # same vendored prim_func GDN Path C uses on CUDA.
+    if not _device_can_run_metal():
+        from cppmega_mlx.nn._tilelang._cuda_eager import (
+            cuda_eager_available,
+            gdn_fwd_cuda_eager,
+        )
+
+        cuda_ok, cuda_reason = cuda_eager_available()
+        if not cuda_ok:
+            raise RuntimeError(
+                "GDN Path B: Metal backend unavailable (mx.fast.metal_kernel "
+                "cannot run on the CUDA host) and the TileLang-CUDA EAGER "
+                f"forward is also unavailable: {cuda_reason}. Use path_a or "
+                "path_c on CUDA."
+            )
+        result = gdn_fwd_cuda_eager(
+            q, k, v, beta, g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+        if result is None:
+            raise RuntimeError(
+                "GDN Path B: TileLang-CUDA EAGER dispatch returned None "
+                "(cuda_eager_available() was True — this is a bug)"
+            )
+        return result
+
     o, sf = _gdn_forward_kernel(q, k, v, beta, g, scale=scale, h0=initial_state)
     return o, (sf if output_final_state else None)
 

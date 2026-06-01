@@ -198,6 +198,24 @@ def _kda_forward_kernel(
     return out.reshape(b, t, hv, vdim), sf.reshape(b, hv, kdim, vdim)
 
 
+def _device_can_run_metal() -> bool:
+    """True iff the live MLX device is an Apple GPU with a working Metal backend.
+
+    The single device->target switch for KDA Path B (mirrors
+    ``kda_path_c._device_can_run_metal``): True -> hand-MSL
+    ``mx.fast.metal_kernel`` (Apple); False -> the host ``_cuda_eager`` bridge
+    (the CUDA gb10 host where ``mx.metal.is_available()`` is False but the
+    default device is the CUDA gpu). Running ``mx.fast.metal_kernel`` on CUDA
+    arrays raises ``RuntimeError: [metal_kernel] No Metal back-end.``
+    """
+    metal = getattr(mx, "metal", None)
+    return (
+        mx.default_device() == mx.gpu
+        and metal is not None
+        and metal.is_available()
+    )
+
+
 def kda_forward_path_b(
     q: mx.array,
     k: mx.array,
@@ -211,8 +229,15 @@ def kda_forward_path_b(
 ):
     """KDA Path B forward, signature matching ``naive_recurrent_kda``.
 
+    Device-aware target (mirrors KDA Path C): on Apple run the hand-MSL
+    ``mx.fast.metal_kernel`` forward; on a CUDA host route the same KDA
+    recurrence through the host ``_cuda_eager`` bridge (the MSL kernel raises
+    ``[metal_kernel] No Metal back-end.`` on CUDA arrays). CUDA EAGER failures
+    RAISE (RULE #1).
+
     Falls back to Path A only when HV is not divisible by H (architectural
-    mismatch). Supports ``initial_state`` and custom ``scale``.
+    mismatch — a selection guard, not an on-failure fallback). Supports
+    ``initial_state`` and custom ``scale``.
     """
     if v.shape[2] % q.shape[2] != 0:
         from cppmega_v4.nn._external.fla_naive_kda import naive_recurrent_kda
@@ -221,6 +246,38 @@ def kda_forward_path_b(
             scale=scale, initial_state=initial_state,
             output_final_state=output_final_state,
         )
+
+    # CUDA EAGER branch: Metal is unavailable, so the hand-MSL kernel cannot
+    # accept the CUDA-resident MLX arrays. Run the same KDA recurrence via the
+    # host _cuda_eager bridge (target='cuda'), the exact vendored prim_func KDA
+    # Path C uses on CUDA.
+    if not _device_can_run_metal():
+        from cppmega_mlx.nn._tilelang._cuda_eager import (
+            cuda_eager_available,
+            kda_fwd_cuda_eager,
+        )
+
+        cuda_ok, cuda_reason = cuda_eager_available()
+        if not cuda_ok:
+            raise RuntimeError(
+                "KDA Path B: Metal backend unavailable (mx.fast.metal_kernel "
+                "cannot run on the CUDA host) and the TileLang-CUDA EAGER "
+                f"forward is also unavailable: {cuda_reason}. Use path_a or "
+                "path_c on CUDA."
+            )
+        result = kda_fwd_cuda_eager(
+            q, k, v, g, beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+        if result is None:
+            raise RuntimeError(
+                "KDA Path B: TileLang-CUDA EAGER dispatch returned None "
+                "(cuda_eager_available() was True — this is a bug)"
+            )
+        return result
+
     o, sf = _kda_forward_kernel(q, k, v, g, beta, scale=scale, h0=initial_state)
     return o, (sf if output_final_state else None)
 
