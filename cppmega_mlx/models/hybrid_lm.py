@@ -8,6 +8,7 @@ implementation and does not claim production kernel performance.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -60,6 +61,13 @@ from cppmega_mlx.training.mtp import MinimalMTPHead, MTPLossConfig
 
 if TYPE_CHECKING:
     from cppmega_mlx.runtime.path_c_fusion import PathCFusionRegion
+
+# PR-2 (FUSED-PIPELINE-ROADMAP §4): opt-in free-barrier after each
+# grad-checkpointed layer. Default OFF so behavior is unchanged unless
+# CPPMEGA_MLX_CHECKPOINT_EVAL_BARRIER=1 is set.
+_CHECKPOINT_EVAL_BARRIER = (
+    os.environ.get("CPPMEGA_MLX_CHECKPOINT_EVAL_BARRIER") == "1"
+)
 
 HybridBackend = Literal["attention", "mamba3", "moe", "m2rnn", "engram", "concept"]
 HybridBlockModule = (
@@ -2288,6 +2296,16 @@ class HybridTinyLM(nn.Module):
                 else:
                     fn = lambda hs, _layer=layer, _mask=mask: _layer(hs, _mask)
                 hidden_states = nn.utils.checkpoint(layer, fn)(hidden_states)
+                if _CHECKPOINT_EVAL_BARRIER:
+                    # PR-2 (FUSED-PIPELINE-ROADMAP §4): force+free each
+                    # checkpointed layer's stored input before the next layer
+                    # builds its graph, so the recompute working set never
+                    # coexists with the full set of stored inputs. Without this
+                    # barrier MLX's lazy tape keeps every layer's checkpoint
+                    # input live simultaneously and checkpoint is a no-op for
+                    # peak memory. Default OFF; opt in via
+                    # CPPMEGA_MLX_CHECKPOINT_EVAL_BARRIER=1.
+                    mx.eval(hidden_states)
         else:
             attention_layer_idx = 0
             for layer_index, layer in enumerate(self.layers):
