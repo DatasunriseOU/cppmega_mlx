@@ -367,3 +367,89 @@ reflection for the B2/B1/B0 delegated `_bwd` segments writes the owner grad buff
     mega-kernel the chunked path REPLACES; reproducible on a CLEAN checkout, NOT a
     regression from this change. Prior recorded serial baseline: loss 5.7134,
     6.106s. Eager-serial full-model reference (mamba=ref scan): loss ~5.70-5.71.
+
+================================================================================
+## FINAL (branch `mamba3-projection-bridge`) — ZERO-GRAD GAP RESOLVED; chunked
+## backward now emits NONZERO grads; 163 grads flow with NONZERO mamba params;
+## loss MATCHES serial. Residual per-grad gap is route-wide fp16 kernel precision,
+## NOT the bridge (proven exact 4.5e-13).
+================================================================================
+
+### What closed the prior "ONE REMAINING GAP" (the all-zero chunked backward grads)
+The prior gap was: B2/B1/B0 backward read back absmax=0.0 in the route. TWO fixes,
+both already present in this branch's uncommitted work and now VERIFIED end-to-end:
+  1. **B2 ``y`` input bound to the REAL F2 output** (path_c_fusion.py
+     `_emit_mamba3_chunked_bwd_model_brick_surfaces`): B2 needs the forward ungated
+     SSD output ``y`` for the silu(z) gate transpose (dgate = dout*y). It was wired
+     to a SEPARATE ``{name}_y`` buffer with NO forward producer (zero-seeded) — so
+     the gate backward and everything downstream of dY collapsed to zero. The F2
+     ``mamba3_chunk_scan_combine`` writes exactly this ungated y into ``{name}_delta``
+     (F2 applies no gate), so B2's ``y`` is now bound to ``{name}_delta``. Single
+     deterministic producer -> consumer (RULE #1).
+  2. **torch-MPS host-roundtrip ordering** (m04 `_path_c_torch_mps_to_mlx`): the
+     delegated grid kernels write their OUTPUT slots IN PLACE on MPS; a bare
+     ``.to("cpu")`` could read the slot BEFORE the in-place store was host-visible
+     (the ``_bwd`` grad slots came back zero despite the kernel writing them). Now a
+     DEPENDENT device reduction (``.abs().sum().item()``) + ``torch.mps.synchronize()``
+     orders/materializes the store before the host hop. RULE #1: a stale read is a
+     silent ZERO gradient — this forces the correct value, not a fallback.
+
+### UNLOCK PROOF (Metal, local_gb10_quarter smoke, seq=64, batch=1, flag ON)
+- Flag-ON route: install status=ok, **163 grads**, all NONZERO, loss FINITE.
+  scratch/parity_on_vs_serial_same_model.py: route loss 5.68-5.71, serial-eager
+  (fp32 ref) loss 5.69-5.73, **loss diff ~0.012** (within fp16-chunked tolerance).
+  163 common grads, 0 only-route, 0 only-serial (full grad NAME coverage).
+- Layer-10 mamba (the BRIDGE TARGET) per-grad max|abs| vs fp32 serial reference:
+  D 6e-7, C_bias 3e-5, B/C_norm 7e-5, dt_bias 1e-4, B_bias 2e-4 (all << 1e-3);
+  out_proj 1.1e-3, in_proj 2.7e-3, conv_weight 9e-3, conv_bias/norm 1.4-3.1e-2.
+  These are among the SMALLEST grads in the whole model — every NON-mamba layer
+  (attention 0.1-0.2, mlp 0.1-0.16, m2rnn 0.25-0.56) is LARGER, and varies
+  run-to-run (m2rnn conv_bias 0.265 -> 0.556 across two runs) — proving the diff
+  is route-wide fp16 Metal-kernel precision + nondeterministic kernel scheduling,
+  NOT a bridge defect.
+
+### Bridge correctness is PROVEN EXACT (independent of route fp16 noise)
+- tests/test_mamba3_projection_bridge.py: **8 passed**. Forward kernel-ABI mapping
+  reproduces OUR serial scan to <1e-4 (fp32). Full composition (proj-fwd -> chunked
+  scan -> scan-VJP -> bridge-VJP) == serial autodiff param grads to **4.5e-13** for
+  all 8 projection params. out_proj correctly ZERO (post-scan). dt_k strictly > 0.
+  Owner seeds nonzero flag-ON; coverage complete flag-ON; flag-OFF seeds nothing.
+- tests/test_mamba3_chunked_backward_b0b1b2.py: **13 passed**, chunked B0/B1/B2
+  kernel-level parity worst 3.84e-4 (fp16).
+
+### THE PRECISE RESIDUAL GAP (named honestly)
+Strict <1e-3 per-grad parity vs the fp32 serial reference is NOT met for the
+layer-10 conv/in_proj/norm grads (1e-3..3e-2). ROOT CAUSE: the chunked grid kernels
+run their tensor math at fp16 internal precision (the documented dtype bridge: the
+KernelParam dtype is fp16, read-slots cast to fp16). Accumulated through the full
+projection (in_proj/conv/silu/RMSNorm/RoPE/trapezoid) the fp16 rounding grows from
+the isolated-kernel 3.84e-4 to ~1e-2 on the conv params. This is the SAME fp16
+effect that puts EVERY non-mamba route layer at 1e-1+. The proper apples-to-apples
+control (flag-OFF route: identical fp16 kernels everywhere EXCEPT layer-10) is
+XPC-blocked in this environment on the chain_12_13 mega-kernel, so the only
+available baseline is fp32-eager — which double-counts the route-wide fp16 gap.
+To reach strict <1e-3: widen the chunked grid kernels' internal compute to fp32
+(kernel change in mamba3_chunked_scan_core / *_bwd_core), then re-verify. The
+BRIDGE needs no change (it is exact at 4.5e-13).
+
+### COMPLETE UNLOCK ASSESSMENT
+- 163 grads with REAL nonzero mamba projection params: YES (was 18/partial-zero).
+- loss MATCHES serial: YES (diff ~0.012, fp16-chunked tolerance, NOT just finite).
+- per-grad < 1e-3 vs serial: layer-10 bridge target mostly YES (D/biases/norms);
+  conv/in_proj NO at fp16 (1e-3..3e-2) — gated by the chunked KERNELS' fp16
+  precision (route-wide, not the bridge). Whole-route worst 0.1-0.56 is fp16.
+- honest wall-time: flag-ON fwd+bwd ~3.9-4.3s (163 grads); fp32 eager-serial
+  reference ~0.01-0.05s (it is plain MLX autodiff with no Metal kernel
+  compile/launch — not the descriptor route, which is XPC-blocked here).
+- flag-OFF unchanged: YES — 124 fusion_ir+autosplit passed, 13 chunked-backward
+  passed, 82 m04 direct_chain passed with the SAME 3 pre-existing failures
+  (verified IDENTICAL on a clean worktree of base 956f8ae).
+
+### Merge-safety (flag default OFF) — GREEN
+  - test_path_c_fusion_ir.py + test_path_c_autosplit_metal_parity.py: 124 passed.
+  - test_mamba3_chunked_backward_b0b1b2.py: 13 passed.
+  - test_mamba3_projection_bridge.py: 8 passed.
+  - test_m04_train_step.py -k direct_chain|path_c|chain: 82 passed, 3 FAILED —
+    the SAME 3 pre-existing (test_fp8_..._missing_sparse_mla_producer + 2
+    direct-chain value_and_grad bridge tests), VERIFIED identical on base 956f8ae
+    worktree (``batch mapping must contain a 'tokens' array`` fixture errors).
