@@ -52,6 +52,13 @@ def main() -> None:
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--vocab", type=int, default=65_536)
     ap.add_argument("--optimizer", action="store_true", help="also run AdamW update")
+    ap.add_argument("--adam8bit", action="store_true", help="use int8 AdamW state")
+    ap.add_argument(
+        "--split-eval",
+        dest="split_eval",
+        action="store_true",
+        help="eval grads + free bwd graph before the optimizer update",
+    )
     ap.add_argument(
         "--grad-checkpoint",
         dest="grad_checkpoint",
@@ -91,9 +98,19 @@ def main() -> None:
 
     optimizer = None
     if args.optimizer:
-        from cppmega_mlx.training.optimizers import make_adamw
+        if args.adam8bit:
+            from cppmega_mlx.training.optimizers import make_adam8bit
 
-        optimizer = make_adamw(learning_rate=1e-4, weight_decay=0.0)
+            optimizer = make_adam8bit(
+                learning_rate=1e-4,
+                weight_decay=0.0,
+                quant_scheme="dynamic_int8_v1",
+                min_8bit_size=4096,
+            )
+        else:
+            from cppmega_mlx.training.optimizers import make_adamw
+
+            optimizer = make_adamw(learning_rate=1e-4, weight_decay=0.0)
         optimizer.init(model.trainable_parameters())
         mx.eval(model.parameters(), optimizer.state)
 
@@ -108,6 +125,12 @@ def main() -> None:
     t1 = time.time()
     (loss, ntok), grads = nn.value_and_grad(model, loss_fn)(model, batch)
     if optimizer is not None:
+        if args.split_eval:
+            # Materialise loss+grads and free the backward graph BEFORE the
+            # optimizer update, so the bwd activations and the optimizer-update
+            # working set never coexist in a single eval. Peak becomes
+            # max(bwd, update) instead of bwd+update.
+            mx.eval(loss, ntok, grads)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state, loss, ntok)
     else:
