@@ -28,11 +28,12 @@ def _gib(n: int | None) -> float:
     return (n or 0) / (1024 ** 3)
 
 
-def build_model(hidden: int, depth: int, vocab: int, seq: int, grad_ckpt: bool) -> HybridTinyLM:
+def build_model(hidden: int, depth: int, vocab: int, seq: int, grad_ckpt: bool,
+                pattern: str = "AEMR") -> HybridTinyLM:
     cfg = HybridTinyConfig(
         vocab_size=vocab,
         hidden_size=hidden,
-        pattern="AEMR",
+        pattern=pattern,
         depth=depth,
         num_attention_heads=max(1, hidden // 64),
         max_seq_length=seq,
@@ -57,6 +58,7 @@ def main() -> None:
     ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--clear-cache", action="store_true")
     ap.add_argument("--opt", choices=["adamw", "adam8bit"], default="adamw")
+    ap.add_argument("--pattern", type=str, default="AEMR")
     ap.add_argument("--steps", type=int, default=2)
     args = ap.parse_args()
 
@@ -64,7 +66,7 @@ def main() -> None:
     if hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()
 
-    model = build_model(args.hidden, args.depth, args.vocab, args.seq, args.grad_ckpt)
+    model = build_model(args.hidden, args.depth, args.vocab, args.seq, args.grad_ckpt, args.pattern)
     nparams = sum(v.size for _, v in __import__("mlx.utils", fromlist=["tree_flatten"]).tree_flatten(model.parameters()))
     print(f"after-model-build peak={_gib(mx.get_peak_memory() if hasattr(mx,'get_peak_memory') else None):.2f}GiB")
     opt = make_adam8bit(learning_rate=1e-4) if args.opt == "adam8bit" else make_adamw(learning_rate=1e-4)
