@@ -43,6 +43,7 @@ callers add *after* the existing ``can_run_metal()`` checks.
 # the in-tree prim builders in ``sparse_mla_path_c.py`` / ``mamba3_path_c.py``.
 
 import functools
+import os
 from typing import Any
 
 import mlx.core as mx
@@ -776,6 +777,16 @@ def mamba3_mimo_bwd_cuda_eager(
 
     chunk = mamba3_bwd_seq_chunk()
     if chunk > 0 and seq > chunk:
+        if os.environ.get("CPPMEGA_MAMBA3_BWD_SEQ_CHUNK_DEBUG", "").strip():
+            import sys as _sys
+
+            print(
+                f"[mamba3-chunk] seq={seq} chunk={chunk} "
+                f"({(seq + chunk - 1) // chunk} chunks)",
+                file=_sys.stderr,
+                flush=True,
+            )
+
         def _cuda_fwd_state(x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c):
             out = mamba3_mimo_fwd_cuda_eager(
                 x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c
