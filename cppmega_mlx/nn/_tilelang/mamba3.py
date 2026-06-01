@@ -48,8 +48,9 @@ Public surface:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import cast
+from typing import Callable, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -60,6 +61,38 @@ from cppmega_mlx.nn._tilelang._mamba3_helpers import (
     bwd_dtrap_ddt,
     compute_dacs_segsum,
 )
+
+# Sequence-chunked Mamba3 backward. The monolithic Path-B bwd kernel
+# materialises fp32 partials of shape (B, SEQ, H, N, P) plus an
+# (B, SEQ+1, H, P, N) state scratch slab; at seq=4096 that is ~21 GB per
+# mamba3 layer (×3 layers ≈ 63 GB), which is the dominant term in the
+# fwd+bwd+optimizer peak. When this env flag is set to a positive integer
+# C, the orchestrator splits the time axis into C-length chunks: it carries
+# the forward scan state h across chunk boundaries (cheap, O(num_chunks)
+# boundary states) and runs the reverse VJP chunk-by-chunk, feeding each
+# chunk's dh0 as the next (earlier) chunk's incoming state cotangent. This is
+# *numerically identical* to the full-sequence backward — same kernel math,
+# just a bounded working set — and caps the bwd partials at chunk-size.
+MAMBA3_BWD_SEQ_CHUNK_ENV = "CPPMEGA_MAMBA3_BWD_SEQ_CHUNK"
+
+
+def mamba3_bwd_seq_chunk() -> int:
+    """Return the configured Mamba3 backward seq-chunk length (0 = disabled)."""
+
+    raw = os.environ.get(MAMBA3_BWD_SEQ_CHUNK_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{MAMBA3_BWD_SEQ_CHUNK_ENV} must be a non-negative integer, got {raw!r}"
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            f"{MAMBA3_BWD_SEQ_CHUNK_ENV} must be a non-negative integer, got {value}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -351,6 +384,38 @@ _BWD_KERNEL = _msl_transform.make_metal_kernel(
     header=_FWD_KERNEL_HEADER,
 )
 
+# Chunked variant: identical math, but the reverse scan seeds dh with an
+# incoming end-state cotangent ``dh_init`` (instead of 0) so the sequence-
+# chunked orchestrator can carry the boundary state-gradient across chunks.
+# Only the dh-seed differs; everything else is the shared source.
+_BWD_KERNEL_SOURCE_DHINIT = _BWD_KERNEL_SOURCE.replace(
+    "    float dh[STATE];\n    for (uint n = 0; n < uint(STATE); ++n) {\n        dh[n] = 0.0f;\n    }",
+    "    float dh[STATE];\n    for (uint n = 0; n < uint(STATE); ++n) {\n        dh[n] = float(dh_init[h_base + n]);\n    }",
+)
+if _BWD_KERNEL_SOURCE_DHINIT == _BWD_KERNEL_SOURCE:  # pragma: no cover - guard
+    raise RuntimeError(
+        "mamba3 chunked bwd: failed to splice dh_init seed into MSL source"
+    )
+_BWD_KERNEL_DHINIT = _msl_transform.make_metal_kernel(
+    name="cppmega_mamba3_mimo_bwd_dhinit",
+    input_names=[
+        "dy", "x", "B_proj", "C_proj", "z", "A", "dt", "D", "h0", "dh_init"
+    ],
+    output_names=[
+        "dx",
+        "dz",
+        "dB_partial",
+        "dC_partial",
+        "dA_partial",
+        "ddt_partial",
+        "dD_partial",
+        "dh0",
+        "h_steps_scratch",
+    ],
+    source=_BWD_KERNEL_SOURCE_DHINIT,
+    header=_FWD_KERNEL_HEADER,
+)
+
 
 def _validate_inputs(
     x: mx.array,
@@ -584,6 +649,225 @@ def _mamba3_mimo_bwd_metal_kernel(
     )
 
 
+def _mamba3_mimo_bwd_metal_kernel_dhinit(
+    dy: mx.array,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    dh_init: mx.array,
+) -> tuple[mx.array, ...] | None:
+    """Metal bwd kernel with an incoming end-state cotangent (chunk carry).
+
+    Identical to :func:`_mamba3_mimo_bwd_metal_kernel` except the reverse scan
+    seeds ``dh`` with ``dh_init`` instead of 0. Returns ``None`` if Metal is
+    not eligible.
+    """
+
+    if _BWD_KERNEL_DHINIT is None:
+        return None
+    status = mamba3_mimo_metal_status(x)
+    if not status.available:
+        return None
+
+    batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+    if seq == 0:
+        return None
+    if dh_init.shape != h0.shape:
+        raise ValueError(
+            f"dh_init must match h0 shape {h0.shape}, got {dh_init.shape}"
+        )
+
+    cast_dtype = mx.float32 if x.dtype == mx.bfloat16 else x.dtype
+    inputs = [
+        dy.astype(cast_dtype),
+        x.astype(cast_dtype),
+        B.astype(cast_dtype),
+        C.astype(cast_dtype),
+        z.astype(cast_dtype),
+        A.astype(cast_dtype),
+        dt.astype(cast_dtype),
+        D.astype(cast_dtype),
+        h0.astype(cast_dtype),
+        dh_init.astype(cast_dtype),
+    ]
+    total_lanes = batch * heads * headdim
+    threads = min(256, total_lanes if total_lanes > 0 else 1)
+    template = [
+        ("T_OUT", cast_dtype),
+        ("BATCH", batch),
+        ("SEQ", seq),
+        ("HEADS", heads),
+        ("HEADDIM", headdim),
+        ("STATE", state),
+    ]
+    output_shapes = [
+        (batch, seq, heads, headdim),
+        (batch, seq, heads, headdim),
+        (batch, seq, heads, headdim, state),
+        (batch, seq, heads, headdim, state),
+        (batch, seq, heads, headdim),
+        (batch, seq, heads, headdim),
+        (batch, heads, headdim),
+        (batch, heads, headdim, state),
+        (batch * heads * headdim, seq, state),
+    ]
+    output_dtypes = [cast_dtype] * len(output_shapes)
+    try:
+        outputs = _msl_transform.dispatch(
+            cast(_msl_transform.MetalKernel, _BWD_KERNEL_DHINIT),
+            inputs=inputs,
+            output_shapes=output_shapes,
+            output_dtypes=output_dtypes,
+            grid=(total_lanes, 1, 1),
+            threadgroup=(threads, 1, 1),
+            template=template,
+        )
+    except Exception:
+        return None
+    dx_, dz_, dB_partial, dC_partial, dA_partial, ddt_partial, dD_partial, dh0_, _h = outputs
+    dB = mx.sum(dB_partial, axis=3)
+    dC = mx.sum(dC_partial, axis=3)
+    dA = mx.sum(dA_partial, axis=3)
+    ddt = mx.sum(ddt_partial, axis=3)
+    dD = mx.sum(dD_partial, axis=(0, 2))
+    return (
+        dx_.astype(x.dtype),
+        dB.astype(B.dtype),
+        dC.astype(C.dtype),
+        dz_.astype(z.dtype),
+        dA.astype(A.dtype),
+        ddt.astype(dt.dtype),
+        dD.astype(D.dtype),
+        dh0_.astype(h0.dtype),
+    )
+
+
+def _slice_seq(arr: mx.array, start: int, stop: int) -> mx.array:
+    """Slice the time axis (axis=1) of a (B, SEQ, ...) tensor."""
+
+    return arr[:, start:stop]
+
+
+def mamba3_mimo_bwd_seq_chunked(
+    dy: mx.array,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    *,
+    chunk: int,
+    fwd_state_fn: Callable[..., mx.array],
+    bwd_chunk_fn: Callable[..., tuple[mx.array, ...]],
+    trap: mx.array | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Sequence-chunked Mamba3 backward — numerically identical, bounded memory.
+
+    Splits the time axis into ``chunk``-length segments. ``fwd_state_fn`` must
+    return the scan state ``h_last`` (shape == ``h0``) for a given input slice
+    and starting state. ``bwd_chunk_fn`` must run the per-chunk reverse VJP for
+    a slice starting at scan-state ``h0_chunk`` and incoming end-state cotangent
+    ``dh_init`` and return ``(dx, dB, dC, dz, dA, ddt, dD, dh0)`` for that slice
+    (``dD`` reduced over the chunk's time axis already).
+
+    The state carry across chunk boundaries makes this *exactly* the same math
+    as the monolithic backward (RULE #1: no correctness change), with the bwd
+    working set capped at one chunk instead of the full sequence.
+    """
+
+    batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+    if chunk <= 0:
+        raise ValueError(f"chunk must be positive, got {chunk}")
+    if dy.shape != (batch, seq, heads, headdim):
+        raise ValueError(f"dy must be {(batch, seq, heads, headdim)}, got {dy.shape}")
+
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    while start < seq:
+        bounds.append((start, min(start + chunk, seq)))
+        start += chunk
+
+    # Forward boundary-state pass: h_starts[i] is the scan state entering chunk
+    # i. Only the O(num_chunks) boundary states are retained (no per-step slab).
+    h_starts: list[mx.array] = []
+    h_cur = h0
+    for lo, hi in bounds:
+        h_starts.append(h_cur)
+        h_cur = fwd_state_fn(
+            _slice_seq(x, lo, hi),
+            _slice_seq(B, lo, hi),
+            _slice_seq(C, lo, hi),
+            _slice_seq(z, lo, hi),
+            _slice_seq(A, lo, hi),
+            _slice_seq(dt, lo, hi),
+            D,
+            h_cur,
+        )
+        mx.eval(h_cur)
+
+    # Reverse chunk loop: carry dh (state cotangent on the chunk boundary).
+    dx_parts: list[mx.array] = [None] * len(bounds)  # type: ignore[list-item]
+    dB_parts: list[mx.array] = [None] * len(bounds)  # type: ignore[list-item]
+    dC_parts: list[mx.array] = [None] * len(bounds)  # type: ignore[list-item]
+    dz_parts: list[mx.array] = [None] * len(bounds)  # type: ignore[list-item]
+    dA_parts: list[mx.array] = [None] * len(bounds)  # type: ignore[list-item]
+    ddt_parts: list[mx.array] = [None] * len(bounds)  # type: ignore[list-item]
+    dD_total = mx.zeros((heads,), dtype=mx.float32)
+    dh_carry = mx.zeros_like(h0.astype(mx.float32))
+
+    for idx in range(len(bounds) - 1, -1, -1):
+        lo, hi = bounds[idx]
+        trap_slice = _slice_seq(trap, lo, hi) if trap is not None else None
+        dx_c, dB_c, dC_c, dz_c, dA_c, ddt_c, dD_c, dh0_c = bwd_chunk_fn(
+            _slice_seq(dy, lo, hi),
+            _slice_seq(x, lo, hi),
+            _slice_seq(B, lo, hi),
+            _slice_seq(C, lo, hi),
+            _slice_seq(z, lo, hi),
+            _slice_seq(A, lo, hi),
+            _slice_seq(dt, lo, hi),
+            D,
+            h_starts[idx],
+            dh_init=dh_carry,
+            trap=trap_slice,
+        )
+        dx_parts[idx] = dx_c
+        dB_parts[idx] = dB_c
+        dC_parts[idx] = dC_c
+        dz_parts[idx] = dz_c
+        dA_parts[idx] = dA_c
+        ddt_parts[idx] = ddt_c
+        dD_total = dD_total + dD_c.astype(mx.float32)
+        dh_carry = dh0_c.astype(mx.float32)
+        # Free the chunk's working partials before the next (earlier) chunk.
+        mx.eval(dx_c, dB_c, dC_c, dz_c, dA_c, ddt_c, dh_carry, dD_total)
+
+    dx = mx.concatenate(dx_parts, axis=1)
+    dB = mx.concatenate(dB_parts, axis=1)
+    dC = mx.concatenate(dC_parts, axis=1)
+    dz = mx.concatenate(dz_parts, axis=1)
+    dA = mx.concatenate(dA_parts, axis=1)
+    ddt = mx.concatenate(ddt_parts, axis=1)
+    return (
+        dx.astype(x.dtype),
+        dB.astype(B.dtype),
+        dC.astype(C.dtype),
+        dz.astype(z.dtype),
+        dA.astype(A.dtype),
+        ddt.astype(dt.dtype),
+        dD_total.astype(D.dtype),
+        dh_carry.astype(h0.dtype),
+    )
+
+
 def mamba3_mimo_bwd_metal(
     dy: mx.array,
     x: mx.array,
@@ -614,7 +898,62 @@ def mamba3_mimo_bwd_metal(
 
     if backend not in {"auto", "mlx", "metal"}:
         raise ValueError(f"unknown backend {backend!r}; expected 'auto', 'mlx', or 'metal'")
-    if backend in {"auto", "metal"}:
+
+    chunk = mamba3_bwd_seq_chunk()
+    seq = x.shape[1]
+    use_chunk = chunk > 0 and seq > chunk
+
+    metal_chunk_ok = (
+        use_chunk
+        and backend in {"auto", "metal"}
+        and _BWD_KERNEL_DHINIT is not None
+        and mamba3_mimo_metal_status(x).available
+    )
+
+    if use_chunk and metal_chunk_ok:
+        # Seq-chunked Metal path: each chunk runs the dh_init-seeded Metal
+        # kernel, carrying the scan state and end-state cotangent across
+        # boundaries. Same kernel math, bwd working set bounded by chunk-len.
+        def _metal_fwd_state(x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c):
+            _y, h_last = mamba3_mimo_fwd_metal(
+                x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c
+            )
+            return h_last
+
+        def _metal_bwd_chunk(
+            dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c, *, dh_init, trap=None
+        ):
+            grads = _mamba3_mimo_bwd_metal_kernel_dhinit(
+                dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c, dh_init
+            )
+            if grads is None:
+                # Metal eligible at the top-level check but a per-chunk shape
+                # (e.g. a short tail chunk) was rejected — use the pure-MLX
+                # parity oracle for just that chunk.
+                return _mamba3_mimo_bwd_pure_mlx(
+                    dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c,
+                    trap=trap, dh_init=dh_init,
+                )
+            if trap is not None:
+                ddt_trap, _dtrap = bwd_dtrap_ddt(
+                    grads[5].astype(mx.float32),
+                    dt_c.astype(mx.float32),
+                    trap.astype(mx.float32),
+                )
+                grads = list(grads)
+                grads[5] = grads[5] + ddt_trap.astype(grads[5].dtype)
+                grads = tuple(grads)
+            return grads
+
+        return mamba3_mimo_bwd_seq_chunked(
+            dy, x, B, C, z, A, dt, D, h0,
+            chunk=chunk,
+            fwd_state_fn=_metal_fwd_state,
+            bwd_chunk_fn=_metal_bwd_chunk,
+            trap=trap,
+        )
+
+    if backend in {"auto", "metal"} and not use_chunk:
         metal_result = _mamba3_mimo_bwd_metal_kernel(dy, x, B, C, z, A, dt, D, h0)
         if metal_result is not None:
             metal_grads = metal_result
@@ -630,6 +969,30 @@ def mamba3_mimo_bwd_metal(
             return tuple(metal_grads)  # type: ignore[return-value]
         if backend == "metal":
             raise RuntimeError("explicit metal backend unavailable for Mamba3 bwd")
+
+    if use_chunk:
+        # Metal not eligible: pure-MLX chunked path (parity oracle).
+        def _mlx_fwd_state(x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c):
+            _y, h_last = mamba3_mimo_reference(
+                x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c
+            )
+            return h_last
+
+        def _mlx_bwd_chunk(
+            dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c, *, dh_init, trap=None
+        ):
+            return _mamba3_mimo_bwd_pure_mlx(
+                dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c,
+                trap=trap, dh_init=dh_init,
+            )
+
+        return mamba3_mimo_bwd_seq_chunked(
+            dy, x, B, C, z, A, dt, D, h0,
+            chunk=chunk,
+            fwd_state_fn=_mlx_fwd_state,
+            bwd_chunk_fn=_mlx_bwd_chunk,
+            trap=trap,
+        )
     return _mamba3_mimo_bwd_pure_mlx(dy, x, B, C, z, A, dt, D, h0, trap=trap)
 
 
@@ -645,10 +1008,18 @@ def _mamba3_mimo_bwd_pure_mlx(
     h0: mx.array,
     *,
     trap: mx.array | None = None,
+    dh_init: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Pure-MLX backward; identical math to the kernel.
 
     Used as the fallback path and as a parity oracle for the Metal kernel.
+
+    ``dh_init`` is the incoming state cotangent at the *end* of this (sub)scan
+    (``dh`` on ``h_last``). It is ``0`` for a full-sequence backward (nothing
+    downstream consumes ``h_last``), but the sequence-chunked orchestrator
+    feeds the next chunk's ``dh0`` here so a chunked backward is bitwise the
+    same math as the monolithic one. ``dh0`` (the returned 8th grad) is the
+    state cotangent at the *start* of this (sub)scan.
     """
 
     batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
@@ -705,7 +1076,14 @@ def _mamba3_mimo_bwd_pure_mlx(
 
     # y_skipped is needed for dz; recompute lazily during reverse pass.
     # Reverse recurrence on h: dh_(t-1) += decay[t] * dh_t.
-    dh_next = mx.zeros_like(h0_f)
+    if dh_init is None:
+        dh_next = mx.zeros_like(h0_f)
+    else:
+        if dh_init.shape != h0.shape:
+            raise ValueError(
+                f"dh_init must match h0 shape {h0.shape}, got {dh_init.shape}"
+            )
+        dh_next = dh_init.astype(work_dtype)
 
     # Walk backwards through time.
     for t in range(seq - 1, -1, -1):
@@ -854,9 +1232,12 @@ def _mamba3_mimo_apply_vjp(
 
 
 __all__ = [
+    "MAMBA3_BWD_SEQ_CHUNK_ENV",
     "Mamba3MetalStatus",
+    "mamba3_bwd_seq_chunk",
     "mamba3_mimo_apply",
     "mamba3_mimo_bwd_metal",
+    "mamba3_mimo_bwd_seq_chunked",
     "mamba3_mimo_fwd_metal",
     "mamba3_mimo_metal_status",
     "mamba3_mimo_reference",

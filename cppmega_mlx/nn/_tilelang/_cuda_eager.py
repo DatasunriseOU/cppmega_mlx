@@ -509,6 +509,7 @@ def _make_mamba3_bwd_cuda_prim(
         dt: T.Tensor((BATCH, SEQ, HEADS), "float32"),
         D: T.Tensor((HEADS,), "float32"),
         h0: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
+        dh_init: T.Tensor((BATCH, HEADS, HEADDIM, STATE), "float32"),
         dx: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
         dz: T.Tensor((BATCH, SEQ, HEADS, HEADDIM), "float32"),
         dB_lane_grad: T.Tensor((BATCH, SEQ, HEADS, STATE, HEADDIM), "float32"),
@@ -548,10 +549,12 @@ def _make_mamba3_bwd_cuda_prim(
                         h_state[n] = decay[0] * h_state[n] + x_val * B[b, t, h, n]
                         h_steps_scratch[b, t + 1, h, p, n] = h_state[n]
 
-                # Reverse-time VJP scan.
+                # Reverse-time VJP scan. dh is seeded with the incoming
+                # end-state cotangent (0 for a full-sequence backward; the
+                # next chunk's dh0 for the sequence-chunked orchestrator).
                 for n in T.serial(STATE):
                     h_state[n] = h_steps_scratch[b, SEQ, h, p, n]
-                    dh[n] = 0.0
+                    dh[n] = dh_init[b, h, p, n]
                 dD_acc[0] = 0.0
 
                 for rt in T.serial(SEQ):
@@ -620,6 +623,100 @@ def _mamba3_bwd_cuda_kernel(
     return tilelang.compile(prim, target="cuda", out_idx=None)
 
 
+def _mamba3_mimo_bwd_cuda_eager_once(
+    dy: mx.array,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    *,
+    dh_init: mx.array | None = None,
+) -> tuple[
+    mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array
+]:
+    """Single CUDA bwd kernel call for one (sub)sequence.
+
+    ``dh_init`` seeds the reverse scan's end-state cotangent (0 for a full
+    backward; the next chunk's ``dh0`` for the chunked orchestrator).
+    """
+
+    import torch
+
+    from cppmega_mlx.nn._tilelang.mamba3 import _validate_inputs
+
+    batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+
+    dyf = dy.astype(mx.float32)
+    xf = x.astype(mx.float32)
+    Bf = B.astype(mx.float32)
+    Cf = C.astype(mx.float32)
+    zf = z.astype(mx.float32)
+    Af = A.astype(mx.float32)
+    dtf = dt.astype(mx.float32)
+    Df = D.astype(mx.float32)
+    h0f = h0.astype(mx.float32)
+    if dh_init is None:
+        dh_init_f = mx.zeros_like(h0f)
+    else:
+        if dh_init.shape != h0.shape:
+            raise ValueError(
+                f"dh_init must match h0 shape {h0.shape}, got {dh_init.shape}"
+            )
+        dh_init_f = dh_init.astype(mx.float32)
+
+    kernel = _mamba3_bwd_cuda_kernel(batch, seq, heads, headdim, state)
+    dy_t = _mlx_to_torch_cuda(dyf)
+    x_t = _mlx_to_torch_cuda(xf)
+    B_t = _mlx_to_torch_cuda(Bf)
+    C_t = _mlx_to_torch_cuda(Cf)
+    z_t = _mlx_to_torch_cuda(zf)
+    A_t = _mlx_to_torch_cuda(Af)
+    dt_t = _mlx_to_torch_cuda(dtf)
+    D_t = _mlx_to_torch_cuda(Df)
+    h0_t = _mlx_to_torch_cuda(h0f)
+    dh_init_t = _mlx_to_torch_cuda(dh_init_f)
+
+    dx_t = torch.zeros(batch, seq, heads, headdim, dtype=torch.float32, device="cuda")
+    dz_t = torch.zeros(batch, seq, heads, headdim, dtype=torch.float32, device="cuda")
+    dB_lg_t = torch.zeros(
+        batch, seq, heads, state, headdim, dtype=torch.float32, device="cuda"
+    )
+    dC_lg_t = torch.zeros(
+        batch, seq, heads, state, headdim, dtype=torch.float32, device="cuda"
+    )
+    dA_lg_t = torch.zeros(
+        batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
+    )
+    ddt_lg_t = torch.zeros(
+        batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
+    )
+    dD_lg_t = torch.zeros(batch, heads, headdim, dtype=torch.float32, device="cuda")
+    dh0_t = torch.zeros(
+        batch, heads, headdim, state, dtype=torch.float32, device="cuda"
+    )
+    kernel(
+        dy_t, x_t, B_t, C_t, z_t, A_t, dt_t, D_t, h0_t, dh_init_t,
+        dx_t, dz_t, dB_lg_t, dC_lg_t, dA_lg_t, ddt_lg_t, dD_lg_t, dh0_t,
+    )
+    torch.cuda.synchronize()
+
+    # Reduce the per-(b,h,p) lane partials over the P axis (matches the Metal
+    # bf16-snapshot reduction axes exactly).
+    dx = _torch_cuda_to_mlx(dx_t, x.dtype)
+    dz = _torch_cuda_to_mlx(dz_t, z.dtype)
+    dh0_g = _torch_cuda_to_mlx(dh0_t, h0.dtype)
+    dB = _torch_cuda_to_mlx(dB_lg_t.sum(dim=4), B.dtype)
+    dC = _torch_cuda_to_mlx(dC_lg_t.sum(dim=4), C.dtype)
+    dA = _torch_cuda_to_mlx(dA_lg_t.sum(dim=3), A.dtype)
+    ddt = _torch_cuda_to_mlx(ddt_lg_t.sum(dim=3), dt.dtype)
+    dD = _torch_cuda_to_mlx(dD_lg_t.sum(dim=(0, 2)), D.dtype)
+    return dx, dB, dC, dz, dA, ddt, dD, dh0_g
+
+
 def mamba3_mimo_bwd_cuda_eager(
     dy: mx.array,
     x: mx.array,
@@ -641,16 +738,26 @@ def mamba3_mimo_bwd_cuda_eager(
     pure-MLX reference VJP. fp32 carriers only (matches the production fp32
     EAGER path). The kernel emits per-(b,h,p) lane partials for the gradients
     that are reduced over the HEADDIM/P axis; the reductions happen here in MLX.
+
+    When ``CPPMEGA_MAMBA3_BWD_SEQ_CHUNK`` selects a chunk length < seq, this
+    routes through the sequence-chunked orchestrator: the giant fp32 bwd
+    partials ``(B,SEQ,H,N,P)`` and the ``(B,SEQ+1,H,P,N)`` state slab are then
+    bounded by chunk-length instead of the full sequence. The math is identical
+    (the chunk's scan state and end-state cotangent are carried exactly).
     """
 
     ok, _reason = cuda_eager_available()
     if not ok:
         return None
 
-    from cppmega_mlx.nn._tilelang.mamba3 import _validate_inputs
+    from cppmega_mlx.nn._tilelang.mamba3 import (
+        _validate_inputs,
+        mamba3_bwd_seq_chunk,
+        mamba3_mimo_bwd_seq_chunked,
+    )
 
     try:
-        import torch
+        import torch  # noqa: F401
     except Exception:
         return None
 
@@ -667,72 +774,52 @@ def mamba3_mimo_bwd_cuda_eager(
             mx.zeros_like(h0),
         )
 
-    dyf = dy.astype(mx.float32)
-    xf = x.astype(mx.float32)
-    Bf = B.astype(mx.float32)
-    Cf = C.astype(mx.float32)
-    zf = z.astype(mx.float32)
-    Af = A.astype(mx.float32)
-    dtf = dt.astype(mx.float32)
-    Df = D.astype(mx.float32)
-    h0f = h0.astype(mx.float32)
+    chunk = mamba3_bwd_seq_chunk()
+    if chunk > 0 and seq > chunk:
+        def _cuda_fwd_state(x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c):
+            out = mamba3_mimo_fwd_cuda_eager(
+                x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c
+            )
+            if out is None:
+                raise RuntimeError(
+                    "mamba3 CUDA chunked bwd: forward state pass returned None"
+                )
+            return out[1]
+
+        def _cuda_bwd_chunk(
+            dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c, *, dh_init, trap=None
+        ):
+            grads = _mamba3_mimo_bwd_cuda_eager_once(
+                dy_c, x_c, B_c, C_c, z_c, A_c, dt_c, D_c, h0_c, dh_init=dh_init
+            )
+            if trap is not None:
+                from cppmega_mlx.nn._tilelang._mamba3_helpers import bwd_dtrap_ddt
+
+                ddt_trap, _dtrap = bwd_dtrap_ddt(
+                    grads[5].astype(mx.float32),
+                    dt_c.astype(mx.float32),
+                    trap.astype(mx.float32),
+                )
+                grads = list(grads)
+                grads[5] = grads[5] + ddt_trap.astype(grads[5].dtype)
+                grads = tuple(grads)
+            return grads
+
+        try:
+            return mamba3_mimo_bwd_seq_chunked(
+                dy, x, B, C, z, A, dt, D, h0,
+                chunk=chunk,
+                fwd_state_fn=_cuda_fwd_state,
+                bwd_chunk_fn=_cuda_bwd_chunk,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "_cuda_eager.mamba3_mimo_bwd_cuda_eager: chunked Mamba3 MIMO "
+                f"bwd failed ({type(exc).__name__}: {exc})."
+            ) from exc
 
     try:
-        kernel = _mamba3_bwd_cuda_kernel(batch, seq, heads, headdim, state)
-        dy_t = _mlx_to_torch_cuda(dyf)
-        x_t = _mlx_to_torch_cuda(xf)
-        B_t = _mlx_to_torch_cuda(Bf)
-        C_t = _mlx_to_torch_cuda(Cf)
-        z_t = _mlx_to_torch_cuda(zf)
-        A_t = _mlx_to_torch_cuda(Af)
-        dt_t = _mlx_to_torch_cuda(dtf)
-        D_t = _mlx_to_torch_cuda(Df)
-        h0_t = _mlx_to_torch_cuda(h0f)
-
-        dx_t = torch.zeros(
-            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
-        )
-        dz_t = torch.zeros(
-            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
-        )
-        dB_lg_t = torch.zeros(
-            batch, seq, heads, state, headdim, dtype=torch.float32, device="cuda"
-        )
-        dC_lg_t = torch.zeros(
-            batch, seq, heads, state, headdim, dtype=torch.float32, device="cuda"
-        )
-        dA_lg_t = torch.zeros(
-            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
-        )
-        ddt_lg_t = torch.zeros(
-            batch, seq, heads, headdim, dtype=torch.float32, device="cuda"
-        )
-        dD_lg_t = torch.zeros(
-            batch, heads, headdim, dtype=torch.float32, device="cuda"
-        )
-        dh0_t = torch.zeros(
-            batch, heads, headdim, state, dtype=torch.float32, device="cuda"
-        )
-        kernel(
-            dy_t,
-            x_t,
-            B_t,
-            C_t,
-            z_t,
-            A_t,
-            dt_t,
-            D_t,
-            h0_t,
-            dx_t,
-            dz_t,
-            dB_lg_t,
-            dC_lg_t,
-            dA_lg_t,
-            ddt_lg_t,
-            dD_lg_t,
-            dh0_t,
-        )
-        torch.cuda.synchronize()
+        return _mamba3_mimo_bwd_cuda_eager_once(dy, x, B, C, z, A, dt, D, h0)
     except Exception as exc:
         # RULE #1: a kernel launch/writeback failure is a real bug in the
         # vendored Mamba3 MIMO bwd kernel, not "feature absent". Raise loud
@@ -743,18 +830,6 @@ def mamba3_mimo_bwd_cuda_eager(
             f"bwd kernel launch/writeback failed "
             f"({type(exc).__name__}: {exc})."
         ) from exc
-
-    # Reduce the per-(b,h,p) lane partials over the P axis (matches the Metal
-    # bf16-snapshot reduction axes exactly).
-    dx = _torch_cuda_to_mlx(dx_t, x.dtype)
-    dz = _torch_cuda_to_mlx(dz_t, z.dtype)
-    dh0_g = _torch_cuda_to_mlx(dh0_t, h0.dtype)
-    dB = _torch_cuda_to_mlx(dB_lg_t.sum(dim=4), B.dtype)
-    dC = _torch_cuda_to_mlx(dC_lg_t.sum(dim=4), C.dtype)
-    dA = _torch_cuda_to_mlx(dA_lg_t.sum(dim=3), A.dtype)
-    ddt = _torch_cuda_to_mlx(ddt_lg_t.sum(dim=3), dt.dtype)
-    dD = _torch_cuda_to_mlx(dD_lg_t.sum(dim=(0, 2)), D.dtype)
-    return dx, dB, dC, dz, dA, ddt, dD, dh0_g
 
 
 
