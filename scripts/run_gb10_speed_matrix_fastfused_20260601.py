@@ -28,13 +28,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATESTAMP = "20260601"
+# Optional run parameterization (env-driven). Defaults reproduce the original
+# batch=1 seq=512 matrix byte-for-byte. MATRIX_TAG suffixes every output path +
+# work/cache dir so a batch=4 fair run does NOT clobber the batch=1 artifacts.
+TAG = os.environ.get("MATRIX_TAG", "").strip()
+_SUF = f"_{TAG}" if TAG else ""
+BATCH_SIZE = int(os.environ.get("MATRIX_BATCH_SIZE", "1"))
+SEQ_LEN = int(os.environ.get("MATRIX_SEQ_LEN", "512"))
+STEPS = int(os.environ.get("MATRIX_STEPS", "10"))
 TARGET_PARQUET = (
     ROOT / "data" / "parquet_samples" / "gb10" / "clang_semantic_4k_v10" / "val_00000.parquet"
 )
-WORK_DIR = Path(f"/tmp/cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}_cells")
-CACHE_ROOT = Path(f"/tmp/cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}_tilelang_cache")
-MD_OUT = ROOT / "reports" / f"cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}.md"
-HTML_OUT = ROOT / "reports" / f"cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}.html"
+WORK_DIR = Path(f"/tmp/cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}{_SUF}_cells")
+CACHE_ROOT = Path(f"/tmp/cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}{_SUF}_tilelang_cache")
+MD_OUT = ROOT / "reports" / f"cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}{_SUF}.md"
+HTML_OUT = ROOT / "reports" / f"cppmega_1b_speed_matrix_gb10_fastfused_{DATESTAMP}{_SUF}.html"
 
 PYTHON = sys.executable
 def _timeout_bin():
@@ -111,9 +119,9 @@ def build_command(dtype: str, optimizer: str, bits: int, path: str, out_json: Pa
         "--data-path", str(TARGET_PARQUET.relative_to(ROOT)),
         "--data-format", "parquet",
         "--token-key", "token_ids",
-        "--steps", "10",
-        "--batch-size", "1",
-        "--seq-len", "512",
+        "--steps", str(STEPS),
+        "--batch-size", str(BATCH_SIZE),
+        "--seq-len", str(SEQ_LEN),
         "--dtype", dtype_arg(dtype, path),
         "--optimizer", OPT_CLI[(optimizer, bits)],
         "--optimizer-quant-scheme", "dynamic_int8_v1",
@@ -300,7 +308,8 @@ def write_markdown(results, identity):
     L.append("- Host: gb10 (NVIDIA GB10, CUDA sm_121)")
     L.append("- Model profile: local_gb10_quarter")
     L.append(f"- Data: {TARGET_PARQUET.relative_to(ROOT)} (parquet, token_ids)")
-    L.append("- Settings: seq-len 512, batch 1, --steps 10 warm, --grad-checkpoint, --optimizer-quant-scheme dynamic_int8_v1")
+    L.append(f"- Settings: seq-len {SEQ_LEN}, batch {BATCH_SIZE}, --steps {STEPS} warm, --grad-checkpoint, --optimizer-quant-scheme dynamic_int8_v1"
+             + (f" (tokens/step = {BATCH_SIZE*SEQ_LEN})" if (BATCH_SIZE != 1 or SEQ_LEN != 512) else ""))
     L.append("- Paths: `path_b` (reference); `path_c` = Path-C flag-OFF (serial mamba3, prior baseline); "
              "`path_c_chunked` = Path-C **flag-ON** (CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN=1, FAST chunked fused mamba3).")
     L.append("- Path-C route: SPLIT/WARM (Path C fwd + Path B mamba3 bwd, mamba3 bwd=path_b).")
@@ -420,7 +429,7 @@ def write_html(results, identity):
 <h1>cppmega 1B Speed Matrix — gb10 (NVIDIA GB10, CUDA) — FAST FUSED Path-C</h1>
 <ul class="meta">
  <li>Date: {DATESTAMP} &middot; Host: gb10 (NVIDIA GB10, CUDA sm_121) &middot; Profile: local_gb10_quarter</li>
- <li>seq-len 512, batch 1, --steps 10 warm, --grad-checkpoint, dynamic_int8_v1</li>
+ <li>seq-len {SEQ_LEN}, batch {BATCH_SIZE}, --steps {STEPS} warm, --grad-checkpoint, dynamic_int8_v1 (tokens/step = {BATCH_SIZE*SEQ_LEN})</li>
  <li>path_b=reference &middot; path_c=flag-OFF serial mamba3 &middot; path_c_chunked=flag-ON CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN=1 (FAST chunked fused mamba3)</li>
  <li>loss check = all losses finite AND final&lt;initial (fail-loud) &middot; per-cell bound {CELL_TIMEOUT_S}s</li>
  <li>cppmega SHA: <code>{_esc(identity['cppmega_sha'])}</code> &middot; TileLang SHA: <code>{_esc(identity['tilelang_sha'])}</code></li>
