@@ -45,32 +45,35 @@ gb10 1B, flag-OFF (serial `path_c`) → flag-ON (`path_c_chunked`, `CPPMEGA_PATH
 
 The like-for-like **batch=4×seq=4096** comparison the goal asked for is **not achievable in MLX-eager on this model** — measured, memory-guarded ramp on gb10 (121 GB unified), bf16 adamw, real tok/s:
 
-| config | path_b | path_c | peak mem | note |
+| config | path_b | path_c | peak mem (MLX) | note |
 | --- | --- | --- | --- | --- |
 | bs=1 × seq=512 | 156 tok/s | **117 tok/s** ✅ | ~22 GB | the one shape path_c runs |
 | bs=2 × seq=512 | **259** ✅ | blocked | — | path_b scales w/ batch |
 | bs=1 × seq=1024 | **191** ✅ | blocked | 33 GB (path_b) | path_b scales w/ seq |
-| bs=1 × seq=4096 | **OOM (121 GB)** | OOM | — | dense MoE blows up |
-| bs=4 × seq=4096 (literal goal) | **OOM** | n/a | — | unreachable |
+| bs=1 × seq=1024 (efficient MoE) | **166** ✅ | n/a | **32.8 GB** | `CPPMEGA_MOE_EFFICIENT=1`, loss 11.29→5.65 |
+| bs=1 × seq=4096 (efficient MoE) | **no-fit** | n/a | fwd-only **4.9 GB**; fwd+bwd+adamw **97 GB+** | backward burst > 105 GB safety cap (SIGTERM, not true OOM) |
+| bs=4 × seq=4096 (literal goal) | **no-fit** | n/a | — | unreachable (bwd burst) |
 
-(muon mirrors adamw: bs1→bs2 path_b 92→159.) Two independent, code-pinpointed walls:
+(muon mirrors adamw: bs1→bs2 path_b 92→159.) Three independent, code-pinpointed facts:
 - **path_c (CUDA direct-chain) is pinned to exactly bs=1×seq=512** — it blocks at bs>1 *or* seq>512 with `direct_fusion_chain_logical_buffers_missing` (the fused direct-chain runtime was built for that one shape). So *steady-state path_c-vs-path_b at scale is unmeasurable* — path_c doesn't run off its build shape. **path_b runs everywhere and scales** with both batch (156→259) and seq (156→191).
-- **MLX-eager OOMs at seq=4096 even at bs=1** (121 GB) — root cause pinpointed in code: `cppmega_mlx/nn/moe.py:214` `ReferenceMoE` runs a **dense loop over all 16 experts on all tokens** (docstring: *"Dense ... reference suitable for smoke tests"*) + gather O(n²) reference sparse-MLA. C++/Megatron does the same bs=4×seq=4096 in **~26 GB** via sparse all-to-all MoE. **That ~5× memory ratio IS the concrete MLX-vs-C++ finding.**
+- **The seq=4096 forward FITS** (MLX peak **4.9 GB** efficient / 5.2 GB dense, fwd-only, bs=1) — the OOM wall is **entirely in the backward + AdamW optimizer step**, which bursts from ~21 GB steady to **83 GB (seq=2048)** / **97 GB+ and climbing (seq=4096)** in the few seconds the gradients + m/v optimizer states + recomputed grad-checkpoint activations all land at once.
+- **The seq-scaling wall is NOT MoE-dominated at full-model scale.** Measured on gb10: at seq=1024 the dense MoE (32.6 GB) and the efficient sparse-gather MoE (32.8 GB) have *the same* peak — the MoE is only 4 of 13 layers (`AEMEAEMEAEMR`) with a small `expert_hidden=896`, so its activation share is minor relative to the 3584-wide attention/mamba layers + 1B-param AdamW state. The efficient MoE **does** cut the routed-MoE activation ~4× (single-layer fwd+bwd, d=3584, 16 experts, top_k=4, bf16: seq=4096 **3.84 GB → 2.20 GB, 1.75× less, 2.7× faster**), but that win is a small fraction of the full-model backward burst, so it alone does not bring seq=4096 under the safe budget.
 
-**Why MLX OOMs where C++ doesn't:** C++/Megatron does bs=4×seq=4096 in **~26 GB** (3700 tok/s) using **sparse all-to-all MoE**; the MLX path uses a **dense `ReferenceMoE`** that materializes all 16 experts (O(seq×experts)) plus gather-based O(n²)-memory reference sparse-MLA. So MLX-eager's memory blows up with seq, capping reachable seq well below 4096. **This is the concrete MLX-vs-C++ finding** — not a tuning gap but a different (reference vs production) MoE/attention implementation.
+**MLX-vs-C++ finding, corrected & measured:** C++/Megatron does bs=4×seq=4096 in **~26 GB** (3700 tok/s) with sparse all-to-all MoE + a fused training step (activation checkpointing + fused optimizer that never materializes all grads/optimizer-state at once). MLX-eager's wall is the **whole-model backward + optimizer burst** (not the MoE specifically): the forward fits in 5 GB, but the eager backward + AdamW first-update peaks ~97 GB at seq=4096 bs=1 — and the MoE, attention, and optimizer all contribute. The efficient MoE removes one O(num_experts) term but the dominant terms (per-layer backward recompute + full grad/optimizer-state materialization) remain.
 
-**What this means for the two sub-questions:**
-- *steady-state path_c-vs-path_b at scale*: not measurable on gb10 (path_c is bs=1-only there; path_b scales). At bs=1, path_b ≥ path_c (CUDA-eager reference is leaner than fused for small work). The fused Path-C win remains **compile-time** (1.15–2.0×, §Headline 1), not steady-state-throughput at bs=1.
-- *MLX-vs-C++ like-for-like*: impossible at C++'s config because MLX-eager OOMs at seq=4096. The honest comparison is bounded to seq=512, where the ~40× headline decomposes as muon-tax × token-count × eager-reference-substrate (see `TOKPS-DISCREPANCY.md`).
+**Two sub-questions:**
+- *steady-state path_c-vs-path_b at scale*: not measurable on gb10 (path_c is bs=1-only there; path_b scales). At bs=1, path_b ≥ path_c (CUDA-eager reference is leaner than fused for small work). The fused Path-C win remains **compile-time** (1.15–2.0×, §Headline 1).
+- *MLX-vs-C++ like-for-like at seq=4096*: still not reachable in MLX-eager bs=1 — but the wall is now precisely located: **the backward+optimizer burst (~97 GB), not the MoE**. The honest throughput comparison stays bounded to seq≤1024 (166 tok/s efficient / 191 dense at seq=1024 bs=1), where the per-token gap vs C++ 3700 tok/s @ bs4×seq4096 decomposes as token-count (16384 vs 1024 tok/step) × eager-reference-substrate × fused-vs-eager-optimizer (see `TOKPS-DISCREPANCY.md`).
 
-**Open growth items** (not blockers, documented honestly): (a) Path-C direct-chain runtime for bs>1 on CUDA; (b) replace dense `ReferenceMoE`/reference sparse-MLA with memory-efficient kernels so MLX can reach seq=4096.
+**What it would take to reach seq=4096 fwd+bwd under 70 GB** (the remaining wall, evidence above): (a) a fused/streamed optimizer step that updates params in chunks instead of materializing all grads + AdamW m/v at once; (b) more aggressive activation checkpointing across the attention/mamba backward (the bulk of the burst); (c) the efficient MoE (now landed, env-gated) is a necessary-but-not-sufficient piece. Item (a) is the highest-leverage next step.
 
 ## Resolved since first draft
+- **Memory-efficient MoE** ✅ landed, **env-gated** `CPPMEGA_MOE_EFFICIENT=1` (default OFF → existing paths byte-identical). `ReferenceMoE._routed_combine_sparse` gathers only the tokens routed to each expert (top_k), runs the FFN on that subset, scatter-adds back — **same math** as the dense loop. Numeric parity pinned in `tests/test_moe_efficient.py`: **forward bitwise-identical (max-diff 0.0 on BOTH Metal and CUDA)**; gradients within the fp32 reduction-order envelope (7.6e-5 Metal / 3.7e-3 CUDA — pure cuBLAS non-associativity, *not* an algorithm delta — proven by a bitwise-exact gather/scatter round-trip test). Single-layer fwd+bwd: seq=4096 **3.84→2.20 GB (1.75×), 2.7× faster**. Full-model gb10 seq=1024 bs=1: **166 tok/s, 32.8 GB, loss 11.29→5.65** (matches dense 191/32.6). *Conclusion: necessary but not sufficient for seq=4096 — the wall is the whole-model backward+optimizer burst, see Fair-comparison section.* (commits `72d8827`, `6c49768`, `60477f5`, `c19d4a8`).
 - **nvfp4 forward** ✅ works on gb10 (rel_err 0.147). **nvfp4 backward** ✅ now REAL on sm_121 via the reduced RtN recipe `NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)` — dgrad 0.1465 / wgrad 0.1343 vs bf16, enabled behind a numeric gate; the DEFAULT RHT+SR recipe stays fail-loud (genuinely datacenter-only). See `NVFP4-TRAINING-KERNELS.md`, `NVFP4-NANOCHAT-RECIPE.md`, `NVFP4-GB10-MIXED-APPROACH.md` (commit `78b7b31`).
 - **v4 op-level Path-C on CUDA** ✅ wired (`target=cuda` device-aware, commit `fe32cb1`); gb10 v4 matrix shows path_c `ok`.
 - **path_b on CUDA** ✅ wired (commit `a319599`); full gb10 1B matrix shows path_b `ok` and scaling.
 
 ## Remaining growth items (honest, not blockers)
+- **seq=4096 fwd+bwd memory**: the wall is now pinpointed to the **whole-model backward + AdamW optimizer burst** (forward fits in 4.9 GB; the eager backward + full grad/m/v materialization peaks ~97 GB at seq=4096 bs=1). Highest-leverage fix = a **fused/streamed (chunked-param) optimizer step** that never holds all grads + optimizer state at once, plus deeper attention/mamba backward checkpointing. The efficient MoE (above) is one landed piece; it is not the dominant term.
 - Path-C direct-chain training runtime for **bs>1 on CUDA** (currently bs=1-only).
-- Memory-efficient **MoE/attention** kernels (replace dense `ReferenceMoE` + reference sparse-MLA) so MLX-eager can reach seq=4096 without OOM.
 - nvfp4 backward **full convergence-parity** vs bf16 over a long run (only "runs + loss-descends + grads within 0.147" is proven so far).
