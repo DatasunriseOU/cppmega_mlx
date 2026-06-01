@@ -59,19 +59,32 @@ def _path_a_call(*args, **kwargs):
 
 def _path_b_status() -> PathStatus:
     try:
-        importlib.import_module("cppmega_v4._tilelang.kda_path_b")
+        b_mod = importlib.import_module("cppmega_v4._tilelang.kda_path_b")
         import mlx.core as mx
-        if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
+        # Device-aware: Apple -> hand-MSL mx.fast.metal_kernel; CUDA host ->
+        # host _cuda_eager bridge (see kda_forward_path_b._device_can_run_metal).
+        if b_mod._device_can_run_metal():
+            if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
+                return PathStatus(
+                    path="path_b", available=False,
+                    reason="mx.fast.metal_kernel not available on this build",
+                )
             return PathStatus(
-                path="path_b", available=False,
-                reason="mx.fast.metal_kernel not available on this build",
+                path="path_b", available=True,
+                reason=(
+                    "hand-MSL KDA forward via mx.fast.metal_kernel; the "
+                    "autograd-aware wrapper kda_apply_path_b in kda_path_b_bwd.py "
+                    "also provides a real Metal backward (V <= 256)"
+                ),
             )
+        from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+        cuda_ok, cuda_reason = cuda_eager_available()
         return PathStatus(
-            path="path_b", available=True,
+            path="path_b", available=cuda_ok,
             reason=(
-                "hand-MSL KDA forward via mx.fast.metal_kernel; the "
-                "autograd-aware wrapper kda_apply_path_b in kda_path_b_bwd.py "
-                "also provides a real Metal backward (V <= 256)"
+                "KDA Path B forward via TileLang-CUDA EAGER bridge "
+                "(kda_fwd_cuda_eager; Metal unavailable on this CUDA host). "
+                f"{cuda_reason}"
             ),
         )
     except Exception as exc:

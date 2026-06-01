@@ -70,20 +70,37 @@ def _path_a_call(*args, **kwargs):
 
 def _path_b_status() -> PathStatus:
     try:
-        importlib.import_module("cppmega_v4._tilelang.linear_attention_path_b")
-        # Confirm mx.fast.metal_kernel is callable (Metal available).
-        if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
+        b_mod = importlib.import_module(
+            "cppmega_v4._tilelang.linear_attention_path_b"
+        )
+        # Device-aware: on Apple the forward runs the hand-MSL
+        # mx.fast.metal_kernel; on a CUDA host it routes the same GDN
+        # recurrence through the host _cuda_eager bridge (see
+        # gdn_forward_path_b._device_can_run_metal).
+        if b_mod._device_can_run_metal():
+            if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
+                return PathStatus(
+                    path="path_b", available=False,
+                    reason="mx.fast.metal_kernel not available on this build",
+                )
             return PathStatus(
-                path="path_b", available=False,
-                reason="mx.fast.metal_kernel not available on this build",
+                path="path_b", available=True,
+                reason=(
+                    "hand-MSL GDN forward via mx.fast.metal_kernel; the "
+                    "autograd-aware wrapper gdn_apply_path_b in "
+                    "linear_attention_path_b_bwd.py also provides a real Metal "
+                    "backward (max(K, V) <= 256)"
+                ),
             )
+        # CUDA host: route through the TileLang-CUDA EAGER bridge.
+        from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+        cuda_ok, cuda_reason = cuda_eager_available()
         return PathStatus(
-            path="path_b", available=True,
+            path="path_b", available=cuda_ok,
             reason=(
-                "hand-MSL GDN forward via mx.fast.metal_kernel; the "
-                "autograd-aware wrapper gdn_apply_path_b in "
-                "linear_attention_path_b_bwd.py also provides a real Metal "
-                "backward (max(K, V) <= 256)"
+                "GDN Path B forward via TileLang-CUDA EAGER bridge "
+                "(gdn_fwd_cuda_eager; Metal unavailable on this CUDA host). "
+                f"{cuda_reason}"
             ),
         )
     except Exception as exc:
