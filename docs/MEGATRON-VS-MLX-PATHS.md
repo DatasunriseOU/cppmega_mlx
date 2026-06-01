@@ -217,6 +217,64 @@ big shape, MLX only runnable at small shapes — is exactly why a single clean M
 
 ---
 
+## 5. Batch-scaling throughput (live)
+
+Date: 2026-06-02 · Host: gb10 · single GPU. Goal: use the ~4× memory headroom (the bs=4×seq=4096 step uses only
+~28 GB torch-allocated on a 121 GB box) to push tok/s above the 3399 baseline by scaling batch. All numbers below
+are **LIVE-measured this session** on a clean idle box (no concurrent MLX campaign), `free -g` as the OS truth and
+Megatron's own `[Rank 0] … max allocated` as the torch truth. Launcher unchanged; batch/seq overridden per-run by
+forwarding `--micro-batch-size N --global-batch-size N --seq-length S --train-iters 10` to the launcher (which
+passes them through to `cppmega.recipes.run_profiles shell`, overriding the profile defaults of 4/4/4096).
+
+**Env fix applied (same as §1, required or the run crashes in TE RMSNorm NVRTC):** prepend
+`/usr/local/cuda-13.3/targets/sbsa-linux/lib` to `LD_LIBRARY_PATH`. Validated this session with a minimal
+`te.RMSNorm(1024).cuda().bfloat16()` forward (`TE RMSNorm OK`) before the scan.
+
+**tok/s-vs-batch curve (steady-state = iters 7-10 mean; iters 1-2 are compile/warmup, excluded):**
+
+| config | tok/step | ms/step (7-10) | **tok/s** | torch max-alloc | OS `free` used (peak) | loss descends? |
+|---|---:|---:|---:|---:|---:|:--:|
+| **bs=4 × seq=4096** (baseline) | 16,384 | 4788 | **3422** | 28.2 GB | ~37 GB | yes (11.79→5.45) |
+| **bs=8 × seq=4096** | 32,768 | 8359 | **3920** | 46.4 GB | ~63 GB | yes (11.77→5.64) |
+| **bs=16 × seq=4096** | 65,536 | 15672 | **4182** | **82.9 GB** | **~103 GB** | yes (11.78→5.60) |
+| bs=4 × seq=8192 (seq lever) | 32,768 | 8590 | 3815 | 46.4 GB | ~64 GB | yes (11.74→5.81) |
+
+Raw steady-iter ms (the four iters averaged): bs4 = 4800.9 / 4785.1 / 4803.4 / 4764.7; bs8 = 8410.5 / 8369.2 /
+8371.8 / 8284.7; bs16 = 15746.0 / 15702.8 / 15659.0 / 15578.7; bs4·seq8192 = 8617.4 / 8642.6 / 8559.1 / 8539.8.
+Every run exited 0, 0 NaN, real loss descent (not a dry pass).
+
+**Findings:**
+
+- **Throughput DID scale with batch, but with strong diminishing returns:** 3422 → 3920 (+15% at bs 4→8) →
+  4182 (+7% at bs 8→16). It is **not** linear — per-step overhead is small relative to the already-large bs=4
+  step, so doubling the batch nearly doubles step time. The model is essentially **compute-bound at bs=4
+  already**; bigger batches mostly amortize a thin fixed overhead, hence the shrinking gains.
+- **Peak reached: 4182 tok/s at bs=16 × seq=4096** (65,536 tok/step), torch max-allocated 82.9 GB.
+- **Target NOT met.** 4182 tok/s is +23% over the 3399 baseline but well below the 6000-12000 user target. Batch
+  scaling alone cannot reach it on this stack because the per-token compute is the bottleneck, not per-step
+  overhead — a 2× tok/s would require ~halving per-token FLOPs/time (kernel/precision work), not more batch.
+- **Batch is the better lever than seq:** at the *same* 32,768 tok/step, bs=8×seq=4096 (3920 tok/s) beats
+  bs=4×seq=8192 (3815 tok/s) by ~3%, and uses identical memory (46.4 GB) — the longer sequence pays a small
+  O(seq²) attention tax even with flash-attn. So scale batch first.
+- **Memory ceiling ≈ bs=16 for seq=4096.** Torch max-allocated grows ~linearly with batch
+  (28.2 → 46.4 → 82.9 GB; ≈ +4.5 GB per unit batch). bs=16 already peaks OS `free` "used" at **~103 GB** during
+  the compile iter (reserved 88 GB torch + system). Extrapolating, **bs=20 → ~101 GB allocated / ~107 GB
+  reserved → OS >110 GB**, which violates the "stay ~20 GB below 121 GB" discipline on a box that OOM'd
+  repeatedly this session. **bs=16 was therefore the highest config run; bs≥20 was not attempted (would OOM).**
+
+**Bottom line:** scaling batch from 4 to 16 lifts throughput from 3422 to **4182 tok/s** (the session peak) at
+82.9 GB, but the curve plateaus and never approaches the 6000-12000 target — the quarter model is compute-bound,
+so the remaining headroom buys little. Reaching 6k+ would need a per-token-compute change (kernel/precision/recompute),
+not more batch.
+
+**Runs (logs on gb10 `/home/dave/logs/`):** `scan_bs4_seq4096_223208`, `scan_bs8_seq4096_223524`,
+`scan_bs16_seq4096_223851`, `scan_bs4_seq8192_224518` — each `.log` (Megatron), `.launcher.log`, `.nvsmi.log`
+(memory.used reports `[N/A]` on this unified-memory box, so `free -g` + Megatron `max allocated` are the memory
+truth). Box left clean after the scan: no `pretrain_mamba`/`torch.distributed.run` orphans, no
+`fuser /dev/nvidia-uvm` holders, `drop_caches` run, `free -g` back to used=4 GB / avail=116 GB.
+
+---
+
 ## Update — direct seq=2048/4096 path_b measurement (mamba3-chunk enabled, no grad-checkpoint)
 
 After the mamba3 seq-chunked backward (`CPPMEGA_MAMBA3_BWD_SEQ_CHUNK=1`, 63 GB→8 GB) + the grad-checkpoint
