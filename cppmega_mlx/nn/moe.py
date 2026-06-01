@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 ActivationName = Literal["gelu", "relu2", "swiglu"]
+
+# Env gate for the memory-efficient sparse-gather routed compute. Default OFF so
+# every existing training/inference path stays byte-identical to the dense
+# reference unless the operator explicitly opts in.
+_MOE_EFFICIENT_ENV = "CPPMEGA_MOE_EFFICIENT"
+
+
+def _moe_efficient_enabled() -> bool:
+    """Return True iff the env flag opts into the sparse-gather routed compute."""
+
+    value = os.environ.get(_MOE_EFFICIENT_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -210,12 +224,10 @@ class ReferenceMoE(nn.Module):
         flat_indices = router.top_indices.reshape(-1, self.config.top_k)
         flat_weights = router.top_weights.reshape(-1, self.config.top_k)
 
-        routed = mx.zeros_like(flat_x)
-        for expert_id, expert in enumerate(self.experts):
-            expert_out = expert(flat_x)
-            mask = mx.equal(flat_indices, mx.array(expert_id, dtype=flat_indices.dtype))
-            weight = mx.sum(mx.where(mask, flat_weights, mx.zeros_like(flat_weights)), axis=-1)
-            routed = routed + expert_out * weight[:, None]
+        if _moe_efficient_enabled():
+            routed = self._routed_combine_sparse(flat_x, flat_indices, flat_weights)
+        else:
+            routed = self._routed_combine_dense(flat_x, flat_indices, flat_weights)
 
         routed = routed.reshape(x.shape)
         shared = self.shared_expert(x) if self.shared_expert is not None else None
@@ -226,6 +238,113 @@ class ReferenceMoE(nn.Module):
             routed_output=routed,
             shared_output=shared,
         )
+
+    def _expert_weight(
+        self,
+        flat_indices: mx.array,
+        flat_weights: mx.array,
+        expert_id: int,
+    ) -> mx.array:
+        """Per-token combine weight for ``expert_id`` (0 when not selected).
+
+        Equals ``sum_k top_weights[t, k]`` over the slots ``k`` whose
+        ``top_indices[t, k] == expert_id``.  Identical in both the dense and
+        sparse routed-combine paths so the math is unchanged.
+        """
+
+        mask = mx.equal(flat_indices, mx.array(expert_id, dtype=flat_indices.dtype))
+        return mx.sum(
+            mx.where(mask, flat_weights, mx.zeros_like(flat_weights)), axis=-1
+        )
+
+    def _routed_combine_dense(
+        self,
+        flat_x: mx.array,
+        flat_indices: mx.array,
+        flat_weights: mx.array,
+    ) -> mx.array:
+        """Dense reference: run every expert on all tokens, then mask+combine.
+
+        Peak activation is ``O(num_experts x tokens x expert_hidden)`` because
+        every one of ``num_experts`` experts materializes a full-token hidden.
+        Kept as the default path for byte-identical behaviour.
+        """
+
+        routed = mx.zeros_like(flat_x)
+        for expert_id, expert in enumerate(self.experts):
+            expert_out = expert(flat_x)
+            weight = self._expert_weight(flat_indices, flat_weights, expert_id)
+            routed = routed + expert_out * weight[:, None]
+        return routed
+
+    def _routed_combine_sparse(
+        self,
+        flat_x: mx.array,
+        flat_indices: mx.array,
+        flat_weights: mx.array,
+    ) -> mx.array:
+        """Memory-efficient sparse-gather routed compute (env-gated, exact).
+
+        For each expert, gather ONLY the tokens routed to it (the rows where the
+        expert appears in ``top_indices``), run the FFN on that subset, scale by
+        the per-token combine weight, and scatter-add the contribution back.
+
+        This is mathematically identical to :meth:`_routed_combine_dense`: a
+        non-routed token contributes ``expert_out * 0`` in the dense path, which
+        is exactly the term dropped here.  The routing indices are produced under
+        ``mx.stop_gradient`` (see :class:`TopKRouter`), so deriving the per-expert
+        row lists on the host from them does not perturb autograd — gradients
+        flow only through the gathered FFN compute and the scatter-add.
+
+        Peak activation is bounded by the *largest* expert's token count, which
+        is on average ``tokens x top_k / num_experts`` instead of
+        ``num_experts x tokens`` for the dense path — a ``num_experts / top_k``
+        reduction in the routed MoE activation footprint (e.g. 16/4 = 4x), with
+        experts processed sequentially so only one expert's hidden is live.
+        """
+
+        num_tokens, d_model = flat_x.shape
+        routed = mx.zeros_like(flat_x)
+
+        # ``top_indices`` is stop_gradient'd routing metadata; materializing it on
+        # the host to build per-expert row lists is a metadata read, not a
+        # gradient-bearing op.  Gather/scatter on the device carry the gradient.
+        host_indices = np.asarray(flat_indices)
+        for expert_id, expert in enumerate(self.experts):
+            rows = np.nonzero(np.any(host_indices == expert_id, axis=1))[0]
+            if rows.size == 0:
+                # No token routed to this expert in this batch: it contributes
+                # exactly zero in the dense path. Touch its params with a zero
+                # scalar so the grad tree stays populated (grad == 0, not missing).
+                routed = routed + self._zero_touch_expert(expert).astype(flat_x.dtype)
+                continue
+            row_idx = mx.array(rows.astype(np.int32))
+            x_gathered = mx.take(flat_x, row_idx, axis=0)
+            out_gathered = expert(x_gathered)
+            weight = self._expert_weight(flat_indices, flat_weights, expert_id)
+            weight_gathered = mx.take(weight, row_idx, axis=0)
+            contrib = out_gathered * weight_gathered[:, None]
+            scattered = mx.zeros((num_tokens, d_model), dtype=flat_x.dtype)
+            scattered = scattered.at[row_idx].add(contrib)
+            routed = routed + scattered
+        return routed
+
+    def _zero_touch_expert(self, expert: "FeedForwardExpert") -> mx.array:
+        """Return a scalar that depends on every expert param but equals 0.
+
+        Used only when an expert receives no tokens in a batch so its parameters
+        still appear in the gradient tree (with a zero gradient) — never silently
+        dropped from the optimizer state.  This mirrors the dense path, where an
+        unrouted expert still runs (and gets a zero combine weight), so its
+        params always carry a (zero) gradient.
+        """
+
+        from mlx.utils import tree_flatten
+
+        acc = mx.zeros((), dtype=mx.float32)
+        for _leaf_name, leaf in tree_flatten(expert.parameters()):
+            acc = acc + leaf.astype(mx.float32).sum() * mx.zeros((), dtype=mx.float32)
+        return acc
 
 
 def _require_positive(name: str, value: int | float) -> None:
