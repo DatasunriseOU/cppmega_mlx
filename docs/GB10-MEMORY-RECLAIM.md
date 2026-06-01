@@ -30,14 +30,25 @@ box (`avail` collapses to single‑digit GB).
    # only escalate to kill -9 if TERM fails; a -9 mid-alloc is what leaks in the first place
    ```
    Memory returns to `free` within a few seconds once the true holder dies.
-3. (Optional, cache pressure only) drop the page cache — reclaims **buff/cache**,
-   NOT process/GPU memory:
+3. Drop the page cache — reclaims **buff/cache** (file-backed pages), NOT memory
+   held by a live process:
    ```sh
    ssh gb10 "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
    ```
-   In the leak case above this freed ~0.5 GB (cache was only ~1.3 GB) — it is the
-   right tool for cache pressure, but it does **not** fix a GPU‑orphan leak. Use the
-   `fuser` step for that.
+
+## Two distinct cases — pick the right tool
+
+The `free` "used" can stay high for **two different reasons**; the fix differs:
+
+| symptom | cause | fix |
+|---|---|---|
+| `fuser -v /dev/nvidia*` shows an **anomalous python/m04** PID (next to Xorg/gnome/firefox); `nvidia_uvm` refcount > 0 | a live/orphan CUDA process still **holds** GPU memory (device-mapped; `ps`/`nvidia-smi` may not show it) | `kill -TERM <pid>` the holder (step 2). Memory returns when it dies. |
+| `fuser` shows **no** compute holder (even under `sudo`); `nvidia_uvm` refcount **0**; `AnonPages` tiny; but `used` is tens of GB | **page-cache accumulation** — e.g. a fresh-process-per-cell sweep where each process re-reads weights/parquet/tilelang artifacts from disk | `sync; echo 3 > /proc/sys/vm/drop_caches` (step 3). Frees it instantly. |
+
+Observed both in one session: a `kill -9`'d batch=4 m04 left an orphan **holding** ~100 GB
+(fixed by `fuser`+kill); a 54-cell fresh-process regen left ~60 GB of **page cache** with
+no holder (fixed by `drop_caches`, which dropped 65 G → 5 G). Check `fuser` first to tell
+which case you're in.
 
 ## Verify
 
