@@ -217,6 +217,29 @@ big shape, MLX only runnable at small shapes — is exactly why a single clean M
 
 ---
 
+## Update — direct seq=2048/4096 path_b measurement (mamba3-chunk enabled, no grad-checkpoint)
+
+After the mamba3 seq-chunked backward (`CPPMEGA_MAMBA3_BWD_SEQ_CHUNK=1`, 63 GB→8 GB) + the grad-checkpoint
+correctness fix, I directly ran path_b at long seq on gb10 (bf16, adamw, efficient MoE, **grad-checkpoint OFF**
+since it is counterproductive on MLX-CUDA), with `free -g` as truth and the gb10 budget of 100 GB:
+
+| config | unified peak | completes? | verdict |
+| --- | --- | --- | --- |
+| bs1×seq1024 | 33 GB | yes | **191 tok/s** — largest *practical* point |
+| bs1×seq2048 | **76 GB** (fits 100 GB) | **no** — ~5 min/step, didn't finish 6 steps in 30 min | fits budget but impractically slow |
+| bs1×seq4096 | **93 GB steady / 107 GB peak** | **no** — peak >100 GB budget + ~5 min/step | over budget + impractically slow |
+
+**Conclusion (measured, not assumed):** at seq ≥ 2048 the chunked backward that *saves* the memory is
+compute-heavy, so MLX-eager trades the OOM for ~5 min/step — neither seq=2048 nor seq=4096 yields a practical
+completing throughput number, and seq=4096 additionally peaks 107 GB (>100 GB budget). The fixes brought
+seq=4096 from 121 GB→107 GB (close) but it stays over budget and ~100× slower per step than the fused C++
+kernel. So the literal bs4×seq4096 MLX path_b number is **fundamentally impractical** on this eager stack —
+now proven by direct runs, not inferred. The honest MLX throughput ceiling is **191 tok/s @ bs1×seq1024**;
+C++/Megatron does the full bs4×seq4096 step at **3399 tok/s live** in ~26 GB. The gap is the
+eager-reference-vs-fused-FP8-CUDA substrate + the streamed-optimizer/recompute design C++ has and MLX-eager lacks.
+
+---
+
 ## Sources
 
 - **Live C++ run:** `repro_quarter_20260601_192748` on gb10, launcher
