@@ -3947,11 +3947,31 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
     tensors.
     """
 
+    from cppmega_mlx.nn._tilelang._sparse_mla_v32_fused import (
+        v32_fused_apply,
+        v32_fused_bwd,
+        v32_fused_enabled,
+    )
+
+    use_v32_fused = v32_fused_enabled()
+
     @mx.custom_function
     def _apply(
         q_in: mx.array,
         kv_in: mx.array,
     ) -> mx.array:
+        if use_v32_fused:
+            # Env-gated real fused DeepSeek-V3.2 Sparse-MLA forward over bf16
+            # q/kv/indices (O(seq*topk), full online softmax + LSE). RULE #1:
+            # v32_fused_apply RAISES loudly on any kernel failure; we never
+            # silently keep the reference here while claiming the fused path ran.
+            return v32_fused_apply(
+                q_in,
+                kv_in,
+                indices,
+                sm_scale=sm_scale,
+                return_lse=False,
+            )
         apply_kwargs: dict[str, Any] = {
             "sm_scale": sm_scale,
             "d_v": d_v,
@@ -3999,6 +4019,31 @@ def sparse_mla_fp8_path_c_apply_prepared_float(
                 "sparse_mla_fp8_path_c_apply_prepared_float: sinks backward is not "
                 "implemented"
             )
+        if use_v32_fused:
+            # Env-gated real fused v32 Sparse-MLA backward (exercises
+            # T.atomic_addx4 dKV scatter). Recompute fwd to obtain LSE the bwd
+            # needs, then run the fused dq/dkv. RULE #1: RAISES on failure.
+            fwd_out, fwd_lse = v32_fused_apply(
+                q_in,
+                kv_in,
+                indices,
+                sm_scale=sm_scale,
+                return_lse=True,
+            )
+            dq, dkv = v32_fused_bwd(
+                q_in,
+                kv_in,
+                fwd_out,
+                cotangent,
+                indices,
+                fwd_lse,
+                sm_scale=sm_scale,
+            )
+            if dq.dtype != q_in.dtype:
+                dq = dq.astype(q_in.dtype)
+            if dkv.dtype != kv_in.dtype:
+                dkv = dkv.astype(kv_in.dtype)
+            return dq, dkv
         if _prepared_fp8_backward_uses_path_c(
             force_path_c=force_path_c,
             force_backward_path_c=force_backward_path_c,
