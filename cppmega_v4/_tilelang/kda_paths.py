@@ -141,19 +141,31 @@ def _path_b_call(*args, allow_fallback: bool = True, **kwargs):
 
 def _path_c_status() -> PathStatus:
     try:
-        from cppmega_v4._tilelang.kda_path_c import _path_c_runtime_status
+        from cppmega_v4._tilelang.kda_path_c import (
+            _path_c_runtime_status,
+            _device_can_run_metal,
+        )
     except Exception as exc:
         return PathStatus(
             path="path_c", available=False,
             reason=f"path_c module not importable: {exc}",
         )
     ok, reason = _path_c_runtime_status()
+    # Device-aware (mirrors _path_b_status): Apple compiles target='metal';
+    # CUDA host routes the same recurrence via the host _cuda_eager bridge.
+    if _device_can_run_metal():
+        detail = (
+            "KDA Path C: TileLang DSL @T.prim_func → tilelang.compile("
+            "target='metal', execution_backend='tvm_ffi')."
+        )
+    else:
+        detail = (
+            "KDA Path C via TileLang-CUDA EAGER bridge (kda_fwd_cuda_eager; "
+            "target='cuda', Metal unavailable on this CUDA host)."
+        )
     return PathStatus(
         path="path_c", available=ok,
-        reason=(
-            f"KDA Path C: TileLang DSL @T.prim_func → tilelang.compile("
-            f"target='metal', execution_backend='tvm_ffi'). {reason}"
-        ),
+        reason=f"{detail} {reason}",
     )
 
 

@@ -161,6 +161,7 @@ def _path_c_status() -> PathStatus:
     try:
         from cppmega_v4._tilelang.linear_attention_path_c import (
             _path_c_runtime_status,
+            _device_can_run_metal,
         )
     except Exception as exc:
         return PathStatus(
@@ -168,12 +169,22 @@ def _path_c_status() -> PathStatus:
             reason=f"path_c module not importable: {exc}",
         )
     ok, reason = _path_c_runtime_status()
+    # Device-aware (mirrors _path_b_status): on Apple Path C compiles the
+    # TileLang DSL for target='metal' (tvm_ffi); on a CUDA host it routes the
+    # same recurrence through the host _cuda_eager bridge (target='cuda').
+    if _device_can_run_metal():
+        detail = (
+            "GDN Path C: TileLang DSL @T.prim_func → tilelang.compile("
+            "target='metal', execution_backend='tvm_ffi')."
+        )
+    else:
+        detail = (
+            "GDN Path C via TileLang-CUDA EAGER bridge (gdn_fwd_cuda_eager; "
+            "target='cuda', Metal unavailable on this CUDA host)."
+        )
     return PathStatus(
         path="path_c", available=ok,
-        reason=(
-            f"GDN Path C: TileLang DSL @T.prim_func → tilelang.compile("
-            f"target='metal', execution_backend='tvm_ffi'). {reason}"
-        ),
+        reason=f"{detail} {reason}",
     )
 
 
