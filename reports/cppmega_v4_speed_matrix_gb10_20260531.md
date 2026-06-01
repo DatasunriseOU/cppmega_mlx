@@ -2,7 +2,7 @@
 
 - Date: 20260531
 - Host: Linux-6.17.0-1021-nvidia-aarch64-with-glibc2.39
-- cppmega SHA: `66932dc`
+- cppmega SHA: `3ef4894`
 - Python: 3.13.11
 - Op measured: v4 linear-attention FORWARD (GDN gated-delta + KDA recurrent), NOT full m04 1B training (the v4 benchmark harness is op-level).
 - Shape: B=1 T=512 H=8 Dk=64 Dv=64 (Path-E-eligible: Dk%32==0, Dv%4==0)
@@ -12,44 +12,44 @@
 
 | block | dtype | path | status | measured_path | median fwd ms | throughput Melem/s | reason |
 | ----- | ----- | ---- | ------ | ------------- | ------------: | -----------------: | ------ |
-| gdn | f32 | a | ok | a | 39.837 | 6.58 | pure-MLX reference |
-| gdn | f32 | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| gdn | f32 | c | failed | c | — | — | RuntimeError: GDN dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| gdn | f32 | a | ok | a | 32.214 | 8.14 | pure-MLX reference |
+| gdn | f32 | b | ok | b | 1.204 | 217.73 | GDN Path B forward via TileLang-CUDA EAGER bridge (gdn_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| gdn | f32 | c | ok | c | 1.204 | 217.80 | GDN Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | gdn | f32 | d | failed | d | — | — | RuntimeError: GDN path_d unavailable and fallback disabled: GDN Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
-| gdn | f32 | e | ok | e | 25.921 | 10.11 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
-| gdn | bf16 | a | ok | a | 32.323 | 8.11 | pure-MLX reference |
-| gdn | bf16 | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| gdn | bf16 | c | failed | c | — | — | RuntimeError: GDN dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| gdn | f32 | e | ok | e | 16.385 | 16.00 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
+| gdn | bf16 | a | ok | a | 29.878 | 8.77 | pure-MLX reference |
+| gdn | bf16 | b | ok | b | 1.292 | 202.93 | GDN Path B forward via TileLang-CUDA EAGER bridge (gdn_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| gdn | bf16 | c | ok | c | 1.573 | 166.69 | GDN Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | gdn | bf16 | d | failed | d | — | — | RuntimeError: GDN path_d unavailable and fallback disabled: GDN Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
-| gdn | bf16 | e | ok | e | 59.365 | 4.42 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
-| gdn | fp16 | a | ok | a | 37.773 | 6.94 | pure-MLX reference |
-| gdn | fp16 | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| gdn | fp16 | c | failed | c | — | — | RuntimeError: GDN dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| gdn | bf16 | e | ok | e | 19.809 | 13.23 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
+| gdn | fp16 | a | ok | a | 24.987 | 10.49 | pure-MLX reference |
+| gdn | fp16 | b | ok | b | 2.107 | 124.42 | GDN Path B forward via TileLang-CUDA EAGER bridge (gdn_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| gdn | fp16 | c | ok | c | 2.006 | 130.68 | GDN Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | gdn | fp16 | d | failed | d | — | — | RuntimeError: GDN path_d unavailable and fallback disabled: GDN Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
-| gdn | fp16 | e | ok | e | 60.128 | 4.36 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
-| gdn | fp16d | a | ok | a | 40.831 | 6.42 | pure-MLX reference |
-| gdn | fp16d | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| gdn | fp16d | c | failed | c | — | — | RuntimeError: GDN dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| gdn | fp16 | e | ok | e | 20.357 | 12.88 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
+| gdn | fp16d | a | ok | a | 33.197 | 7.90 | pure-MLX reference |
+| gdn | fp16d | b | ok | b | 1.431 | 183.14 | GDN Path B forward via TileLang-CUDA EAGER bridge (gdn_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| gdn | fp16d | c | ok | c | 1.435 | 182.71 | GDN Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | gdn | fp16d | d | failed | d | — | — | RuntimeError: GDN path_d unavailable and fallback disabled: GDN Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
-| gdn | fp16d | e | ok | e | 19.371 | 13.53 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
-| kda | f32 | a | ok | a | 24.244 | 10.81 | pure-MLX KDA reference |
-| kda | f32 | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| kda | f32 | c | failed | c | — | — | RuntimeError: KDA dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| gdn | fp16d | e | ok | e | 20.063 | 13.07 | vendored mlx-lm PR #1217 gated_delta_update (fast Metal kernel; forward runs for ANY Dk via the in-MSL remainder-mask and any Dv; gate must be g<=0 for GDN, oth |
+| kda | f32 | a | ok | a | 33.155 | 7.91 | pure-MLX KDA reference |
+| kda | f32 | b | ok | b | 1.563 | 167.77 | KDA Path B forward via TileLang-CUDA EAGER bridge (kda_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| kda | f32 | c | ok | c | 1.629 | 160.97 | KDA Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | kda | f32 | d | failed | d | — | — | RuntimeError: KDA path_d unavailable and fallback disabled: KDA Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
 | kda | f32 | e | failed | e | — | — | RuntimeError: KDA path_e unavailable and fallback disabled: KDA Path E requires Metal for the vendored gated_delta kernel; Metal is unavailable on this host |
-| kda | bf16 | a | ok | a | 35.946 | 7.29 | pure-MLX KDA reference |
-| kda | bf16 | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| kda | bf16 | c | failed | c | — | — | RuntimeError: KDA dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| kda | bf16 | a | ok | a | 25.621 | 10.23 | pure-MLX KDA reference |
+| kda | bf16 | b | ok | b | 2.819 | 92.99 | KDA Path B forward via TileLang-CUDA EAGER bridge (kda_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| kda | bf16 | c | ok | c | 1.827 | 143.48 | KDA Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | kda | bf16 | d | failed | d | — | — | RuntimeError: KDA path_d unavailable and fallback disabled: KDA Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
 | kda | bf16 | e | failed | e | — | — | RuntimeError: KDA path_e unavailable and fallback disabled: KDA Path E requires Metal for the vendored gated_delta kernel; Metal is unavailable on this host |
-| kda | fp16 | a | ok | a | 33.943 | 7.72 | pure-MLX KDA reference |
-| kda | fp16 | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| kda | fp16 | c | failed | c | — | — | RuntimeError: KDA dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| kda | fp16 | a | ok | a | 29.804 | 8.80 | pure-MLX KDA reference |
+| kda | fp16 | b | ok | b | 2.346 | 111.76 | KDA Path B forward via TileLang-CUDA EAGER bridge (kda_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| kda | fp16 | c | ok | c | 1.965 | 133.38 | KDA Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | kda | fp16 | d | failed | d | — | — | RuntimeError: KDA path_d unavailable and fallback disabled: KDA Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
 | kda | fp16 | e | failed | e | — | — | RuntimeError: KDA path_e unavailable and fallback disabled: KDA Path E requires Metal for the vendored gated_delta kernel; Metal is unavailable on this host |
-| kda | fp16d | a | ok | a | 33.433 | 7.84 | pure-MLX KDA reference |
-| kda | fp16d | b | failed | b | — | — | RuntimeError: [metal_kernel] No Metal back-end. |
-| kda | fp16d | c | failed | c | — | — | RuntimeError: KDA dispatch: selected path_c crashed at runtime (DLPackDeviceError: array is on DLDeviceType(13):0, but this path requires kDLMetal:0). Refusing  |
+| kda | fp16d | a | ok | a | 25.661 | 10.22 | pure-MLX KDA reference |
+| kda | fp16d | b | ok | b | 1.854 | 141.39 | KDA Path B forward via TileLang-CUDA EAGER bridge (kda_fwd_cuda_eager; Metal unavailable on this CUDA host). TileLang-CUDA EAGER path ready |
+| kda | fp16d | c | ok | c | 1.852 | 141.55 | KDA Path C: TileLang DSL @T.prim_func → tilelang.compile(target='metal', execution_backend='tvm_ffi'). tilelang + host TileLang→MSL infra reachable |
 | kda | fp16d | d | failed | d | — | — | RuntimeError: KDA path_d unavailable and fallback disabled: KDA Path D: Triton kernel -> poc.triton_frontend.from_triton_kernel → tilelang.compile. unsafe trito |
 | kda | fp16d | e | failed | e | — | — | RuntimeError: KDA path_e unavailable and fallback disabled: KDA Path E requires Metal for the vendored gated_delta kernel; Metal is unavailable on this host |
 
