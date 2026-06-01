@@ -12,9 +12,13 @@ under RULE #1 (no silent fallbacks):
 * The BACKWARD nvfp4 GEMM, optimizer state, and every non-GEMM op have NO
   working nvfp4 kernel on the available arch, so the route RAISES a precise,
   actionable error naming the missing op + enablement -- it NEVER downcasts to
-  bf16 silently. On gb10 specifically the backward fails because the installed
-  TE was built for ``sm_120`` (plain), not ``sm_120a``/``sm_121a``, so the
-  FP4-cvt / RHT PTX mis-executes.
+  bf16 silently. On gb10 specifically the backward fails because the FP4
+  stochastic-rounding cast (``cvt.rs.satfinite.e2m1x4``) and Random-Hadamard
+  fused kernels are DATACENTER-ONLY: TE source-gates the SR cvt to
+  ``sm_100a``/``sm_103a`` and the RHT kernel needs the SM100 TMEM/tcgen05
+  pipeline that sm_12x does not implement. This is NOT fixable by a TE rebuild
+  for any sm_12x target (verified 2026-06-01) -- the fail-loud is permanent on
+  consumer/Spark Blackwell until NVIDIA ships SM12x-native kernels upstream.
 
 These tests assert BOTH halves: the real forward op matches bf16 within
 tolerance, and the unsupported ops raise the expected ``Nvfp4*`` error.
@@ -89,9 +93,14 @@ def test_payload_advertises_both_forward_backends_and_no_e2e() -> None:
     assert payload["element_format"] == "e2m1"
     assert "transformer_engine" in payload["forward_gemm_kernel_cuda"].lower()
     assert "mxfp4_matmul_path_c" in payload["forward_gemm_kernel_metal"]
-    # gb10 backward gap is documented with an enablement path, not hidden.
-    assert "sm120" in payload["backward_gemm_cuda_status"]
-    assert "compute_120f" in payload["backward_gemm_cuda_enablement"]
+    # gb10 backward gap is documented as datacenter-only (NOT a rebuild gap).
+    assert "datacenter_only" in payload["backward_gemm_cuda_status"]
+    assert "not_fixable_by_te_rebuild" in payload["backward_gemm_cuda_status"]
+    enablement = payload["backward_gemm_cuda_enablement"]
+    assert "UPSTREAM ONLY" in enablement
+    assert "tcgen05" in enablement
+    # Must NOT advertise the disproven compute_120f rebuild as the fix.
+    assert "compute_120f" not in enablement
 
 
 def test_fail_loud_guard_raises_for_nvfp4_and_names_missing_ops() -> None:
@@ -99,11 +108,15 @@ def test_fail_loud_guard_raises_for_nvfp4_and_names_missing_ops() -> None:
     with pytest.raises(Nvfp4TrainingRouteUnavailable) as ei:
         raise_if_nvfp4_training_unsupported(_Args("nvfp4"))
     msg = str(ei.value)
-    # The error must name the decisive backward blocker + the enablement.
+    # The error must name the decisive backward blocker + the REAL reason.
     assert "BACKWARD" in msg or "backward" in msg
-    assert "compute_120f" in msg
+    assert "cvt.rs.satfinite.e2m1x4" in msg
+    assert "tcgen05" in msg
+    assert "UPSTREAM ONLY" in msg
+    # The disproven "rebuild with compute_120f" claim must be gone.
+    assert "compute_120f" not in msg
     # And must NOT pretend a full training step works.
-    assert "garbage gradients" in msg or "fails loud" in msg
+    assert "fails loud" in msg or "fail loud" in msg or "fp8_path_c" in msg
 
 
 def test_fail_loud_guard_is_noop_for_other_dtypes() -> None:
@@ -115,7 +128,11 @@ def test_fail_loud_guard_is_noop_for_other_dtypes() -> None:
 def test_reason_message_is_actionable() -> None:
     reason = nvfp4_training_route_unavailable_reason()
     assert "e2m1" in reason
-    assert "compute_120f" in reason
+    # The corrected, evidence-backed enablement: datacenter-only, upstream fix.
+    assert "cvt.rs.satfinite.e2m1x4" in reason
+    assert "tcgen05" in reason
+    assert "UPSTREAM ONLY" in reason
+    assert "compute_120f" not in reason  # disproven hypothesis removed
     assert "fp8_path_c" in reason  # points at a route that works today
 
 
@@ -205,15 +222,19 @@ def test_cuda_forward_nvfp4_gemm_matches_bf16() -> None:
     not _cuda_te_available(),
     reason="CUDA + TransformerEngine NVFP4 not available (run on gb10)",
 )
-@pytest.mark.skipif(
-    os.environ.get("NVFP4_BACKWARD_FIXED") == "1",
-    reason="TE rebuilt with sm_120a/sm_121a; backward is expected to work now",
-)
-def test_cuda_backward_nvfp4_gemm_fails_loud_on_miscompiled_te() -> None:
-    # RULE #1: the broken backward must RAISE (naming the arch mismatch), not
-    # silently return garbage gradients.
+def test_cuda_backward_nvfp4_gemm_fails_loud_datacenter_only() -> None:
+    # RULE #1: the nvfp4 backward on sm_12x must RAISE, not silently return
+    # garbage gradients. Verified 2026-06-01: this is NOT a build-flag gap --
+    # the SR FP4 cvt (cvt.rs.satfinite.e2m1x4) is source-gated in TE to
+    # sm_100a/sm_103a and the RHT kernel needs SM100 TMEM/tcgen05 absent on
+    # sm_12x, so NO TE rebuild for any sm_12x target can enable it. The
+    # fail-loud is therefore PERMANENT on consumer/Spark Blackwell (no
+    # NVFP4_BACKWARD_FIXED escape hatch) until NVIDIA ships SM12x-native FP4
+    # SR+RHT backward kernels upstream.
     with pytest.raises(Nvfp4CudaKernelMiscompiled) as ei:
         nvfp4_te_gemm_probe(M=256, K=512, N=256, run_backward=True)
     msg = str(ei.value)
-    assert "sm_120a" in msg  # names the wrong target users would reach for
-    assert "compute_120f" in msg
+    # Names the real, evidence-backed blocker (not the disproven 120f rebuild).
+    assert "datacenter-only" in msg.lower() or "datacenter_only" in msg.lower()
+    assert "tcgen05" in msg or "cvt.rs.satfinite.e2m1x4" in msg
+    assert "compute_120f" not in msg

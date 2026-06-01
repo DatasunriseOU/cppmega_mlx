@@ -126,29 +126,71 @@ thread):
   Try recompiling with sm_XXXa instead of sm_XXX.
 ```
 
-**Root cause (proven via cuobjdump on the TE .so):** the installed
-`libtransformer_engine.so` embeds SASS for:
+The installed `libtransformer_engine.so` (TE editable build at
+`/home/dave/TransformerEngine`, git `8d1d79bf`) embeds SASS for
+(`cuobjdump --list-elf`, 2026-06-01):
 
 ```
 sm_75, sm_80, sm_89, sm_90, sm_90a, sm_100, sm_100a, sm_103a, sm_120  (PLAIN)
 ```
 
-i.e. TE's default CUDA-13 arch list `75;80;89;90;100;120` — `sm_120` is built
-**PLAIN**, and the architecture-specific `a` variants exist only for datacenter
-Blackwell (`sm_100a`, `sm_103a`). GB10 is `sm_121`, runs the `sm_120` plain
-SASS, which lacks the arch-specific FP4 cvt / RHT instructions → the asserts
-above.
+i.e. TE's default CUDA-13 arch list — `sm_120` built **PLAIN**, no `sm_121`,
+and the `a` variants only for datacenter Blackwell (`sm_100a`, `sm_103a`). GB10
+(`sm_121`) runs the `sm_120` plain SASS.
 
-**The `a` variant is NOT the fix on desktop/consumer Blackwell.** Per
-NVIDIA/cutlass#3096 and flashinfer-ai/flashinfer#2723, forcing `compute_120a`
-gencode SEGFAULTS on desktop Blackwell ("RTX PRO 6000 reports compute capability
-12.0, not 12.0a; the `a`-specific instructions are not available on desktop
-Blackwell"). The working target is the **family-specific `compute_120f`** added
-in CUDA 13.0, which "enables the full SM120 feature set with working TMA WS
-grouped-GEMM tactics" (compute_120f took a CUTLASS NVFP4 MoE from 14.6 → 39.0
-tok/s vs compute_120a). So the enablement for gb10 backward is to rebuild TE/
-cuBLASLt-path FP4 kernels under CUDA ≥ 13 targeting `120f`, once TE's build
-emits the `f` family target.
+**ROOT CAUSE — corrected verdict (2026-06-01): the backward is GENUINELY
+DATACENTER-ONLY, NOT a build-flag gap. A TE rebuild for any sm_12x target
+CANNOT unblock it.** The earlier `compute_120f` rebuild hypothesis was
+investigated against the TE source on gb10 and **disproven**. Three independent,
+load-bearing reasons, each verified directly:
+
+1. **TE source-gates SR to datacenter `a` archs.** In
+   `transformer_engine/common/util/ptx.cuh`:
+
+   ```cpp
+   #define ARCH_HAS_STOCHASTIC_ROUNDING \
+     NVTE_CUDA_ARCH_MATCHES(ptx::ArchSpecific<100>, ptx::ArchSpecific<103>)
+   ```
+
+   `ArchSpecific<N>` is true only when `__CUDA_ARCH__ == N*10` **and** the build
+   is the arch-specific `a` variant (`__CUDA_ARCH_SPECIFIC__` defined). So SR is
+   enabled **only** for `sm_100a` / `sm_103a`. It is deliberately **excluded
+   from the Blackwell family set** (the sibling `ARCH_BLACKWELL_FAMILY` macro
+   lists `FamilySpecific<100>,<110>,<120>`, but `ARCH_HAS_STOCHASTIC_ROUNDING`
+   does **not**). Therefore **even an `sm_120f`/`sm_121f` build leaves
+   `has_rs == false`**, and every SR FP4 cast (`cvt.rs.satfinite.e2m1x4.f32`)
+   compiles to the device-error path `NVTE_DEVICE_ERROR("FP4 cvt PTX
+   instructions are architecture-specific. Try recompiling with sm_XXXa instead
+   of sm_XXX.")`. This gate is in **C++ source, not gencode** — no compiler flag
+   changes it. (Same instruction + same gate is used by the RHT kernel's
+   `StochasticNumericConverterBase`.)
+
+2. **nvcc 13.x has no `sm_12x` `a`/`f` code target.** `nvcc --list-gpu-code` on
+   CUDA 13.0 / 13.1 / 13.2 / 13.3 emits, for the 12x family, **only** plain
+   `sm_120` and `sm_121` — there is no `sm_120a`, `sm_120f`, `sm_121a`, or
+   `sm_121f` to compile for. (The `120f` family target that helped CUTLASS NVFP4
+   *MoE forward* tactics — cf. cutlass#3096 — is not exposed as an nvcc gencode
+   here, and per (1) would not flip the SR gate anyway.)
+
+3. **No hardware path: sm_12x lacks `tcgen05` / TMEM.** The RHT fused kernel
+   (`row_cast_col_hadamard_transform_cast_fusion.cu`) is built on the CUTLASS
+   **SM100 blockscaled pipeline** — `SM100::TMEM::LOAD`, `SM100_MMA_F16BF16_SS`,
+   `cutlass/detail/sm100_blockscaled_layout.hpp`, cluster launch — i.e.
+   `tcgen05`/TMEM. NVIDIA staff (johnny_nv, NVIDIA Developer Forums) state plainly:
+   *"SM12x (GB10 / DGX Spark / RTX 50) does **not** implement `tcgen05`, and
+   therefore it also doesn't support the associated FP4 Tensor Core path."* The
+   TMEM-backed blockscaled FP4 path is gated to datacenter SM100/SM110. This is
+   exactly why the RHT kernel raises `CUDA Error: invalid argument` on gb10 —
+   TMEM ops do not exist on this SM. (The sm_121 forward NVFP4 GEMM that *does*
+   work goes through a **different**, non-tcgen05 cuBLASLt/CuTe-geforce pipeline.)
+
+**Conclusion:** VERIFIED BROKEN **and** verified UNFIXABLE-BY-REBUILD on gb10.
+The enablement is **not in our hands** — it requires NVIDIA to ship
+**SM12x-native (non-tcgen05) FP4 stochastic-rounding + RHT backward kernels** in
+a future TransformerEngine / cuBLASLt release (and to widen
+`ARCH_HAS_STOCHASTIC_ROUNDING` to the 120 family once an `f`/`a` SR cvt exists
+for it). Until then the nvfp4 **backward** stays fail-loud on consumer/Spark
+Blackwell. The **forward** nvfp4 GEMM remains real and working (§3a).
 
 **Danger note (why we fail loud):** the backward FP4 error is ASYNC. Without
 `CUDA_LAUNCH_BLOCKING=1` AND a fresh `te.Linear`, TE quantizer-workspace state
@@ -204,7 +246,7 @@ each; it does NOT bf16-fallback:
 
 | Op | Why | Enablement |
 |----|-----|-----------|
-| `nvfp4_gemm_backward_vjp_te_cuda_sm121` | TE FP4-cvt/RHT PTX is arch-specific; TE built `sm_120` plain (not the `f` family) → asserts / CUDA invalid-argument on gb10 | Rebuild TE under CUDA ≥ 13 with family target `compute_120f` (NOT `sm_120a`, which SEGFAULTS on desktop Blackwell; cf. cutlass#3096) |
+| `nvfp4_gemm_backward_vjp_te_cuda_sm121` | **Datacenter-only, NOT a build gap.** SR FP4 cvt (`cvt.rs.satfinite.e2m1x4`) is TE-source-gated to `sm_100a`/`sm_103a`; RHT kernel needs SM100 TMEM/`tcgen05` which sm_12x does not implement. nvcc 13.x has no sm_12x `a`/`f` target → a TE rebuild **cannot** fix it (see §3b) | **UPSTREAM ONLY**: needs NVIDIA to ship SM12x-native (non-`tcgen05`) FP4 SR + RHT backward kernels in a future TE/cuBLASLt release |
 | `cuda_blackwell_nvfp4_gemm_metal_only` | The Metal fwd GEMM is Metal-only; it RAISES on CUDA | Use the TE/cuBLASLt CUDA forward path above |
 | `gemm_backward_vjp` | No nvfp4 grad kernel for the Metal e2m1 GEMM | Implement an nvfp4 VJP for `mxfp4_matmul_path_c` |
 | `optimizer_state_and_update` | AdamW moments are fp32-only; no nvfp4 optimizer state | Implement nvfp4 optimizer-state kernels |
@@ -242,10 +284,11 @@ assertions run when torch+TE+CUDA+NVFP4 present.
 * `test_metal_forward_nvfp4_gemm_matches_bf16` — real Metal fwd GEMM < 0.5 rel.
 * `test_cuda_forward_nvfp4_gemm_matches_bf16` — **real gb10 NVFP4 fwd GEMM
   < 0.3 rel** (measured 0.147).
-* `test_cuda_backward_nvfp4_gemm_fails_loud_on_miscompiled_te` — the broken gb10
-  backward RAISES `Nvfp4CudaKernelMiscompiled` naming the `compute_120f`
-  enablement. (Skips, expecting pass, when `NVFP4_BACKWARD_FIXED=1` once TE is
-  rebuilt with `120f`.)
+* `test_cuda_backward_nvfp4_gemm_fails_loud_datacenter_only` — the broken gb10
+  backward RAISES `Nvfp4CudaKernelMiscompiled` naming the REAL, evidence-backed
+  blocker (SR cvt source-gated to `sm_100a`/`sm_103a`; RHT needs SM100
+  TMEM/`tcgen05` absent on sm_12x). The fail-loud is **permanent** on sm_12x
+  (no `NVFP4_BACKWARD_FIXED` escape hatch — a rebuild cannot fix it; §3b).
 
 **Results:**
 
@@ -283,10 +326,28 @@ cd <dir> && /home/dave/cppmega-venv/bin/python -m pytest tests/test_nvfp4_route.
   https://github.com/NVIDIA/TransformerEngine
 * cuBLAS 12.9 block-scaled FP4 (CUDA_R_4F_E2M1 + CUDA_R_UE4M3, 16-elem blocks) —
   https://developer.nvidia.com/blog/boosting-matrix-multiplication-speed-and-flexibility-with-nvidia-cublas-12-9/
-* CUTLASS SM120 NVFP4: sm_120a SEGFAULT, compute_120f fix (CUDA 13.0) —
+* CUTLASS SM120 NVFP4: sm_120a SEGFAULT, compute_120f fix (CUDA 13.0) — note
+  this `120f` finding is for the *forward MoE* tactic path; it does NOT enable
+  the FP4 *stochastic-rounding backward* (see §3b) —
   https://github.com/NVIDIA/cutlass/issues/3096
 * FlashInfer SM120 NVFP4 grouped GEMM patching —
   https://github.com/flashinfer-ai/flashinfer/issues/2723
+* **NVIDIA staff (johnny_nv): SM12x (GB10/DGX Spark/RTX50) does NOT implement
+  `tcgen05`, hence no associated FP4 Tensor-Core/TMEM blockscaled path** (the
+  decisive datacenter-only evidence for the broken RHT backward) —
+  https://forums.developer.nvidia.com/t/dearest-cutlass-team-when-the-hell-are-you-going-to-properly-fix-tcgen05-fp4-support-for-dgx-spark-gb10-sm121/359598
+* CUTLASS issue #2800: BlockScaledMmaOp restricts FP4 to `sm_100a`, blocking
+  sm_120/sm_121 — https://github.com/NVIDIA/cutlass/issues/2800
+* PyTorch issue #172807: auto-detected arch flags drop the accelerated suffix
+  (sm_120a → sm_120), breaking Blackwell NVFP4/block-scaled MMA —
+  https://github.com/pytorch/pytorch/issues/172807
+* TE source gate (the SR FP4 cvt is source-restricted to sm_100a/sm_103a):
+  `transformer_engine/common/util/ptx.cuh` `ARCH_HAS_STOCHASTIC_ROUNDING` =
+  `NVTE_CUDA_ARCH_MATCHES(ptx::ArchSpecific<100>, ptx::ArchSpecific<103>)`;
+  RHT kernel `common/hadamard_transform/row_cast_col_hadamard_transform_cast_fusion.cu`
+  builds on the CUTLASS SM100 TMEM/tcgen05 pipeline.
+* PTX ISA `cvt.rs.satfinite.e2m1x4` (round-with-select stochastic-rounding FP4
+  cvt) — https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
 * CUTLASS NVFP4 GEMM example —
   https://github.com/NVIDIA/cutlass/blob/main/examples/72_blackwell_narrow_precision_gemm/72b_blackwell_nvfp4_nvfp4_gemm.cu
 * Community nvfp4 training (cuBLASLt + Microxcaling) —
