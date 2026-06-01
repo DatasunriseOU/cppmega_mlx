@@ -108,8 +108,20 @@ def main() -> None:
         loss_val = float(logits.astype(mx.float32).mean())
 
     peak_gb = _peak_gb()
+    torch_peak_gb = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch_peak_gb = round(
+                float(torch.cuda.max_memory_allocated()) / (1024**3), 3
+            )
+    except Exception:
+        torch_peak_gb = None
+    mamba_chunk = os.environ.get("CPPMEGA_MAMBA3_BWD_SEQ_CHUNK", "").strip() or None
     result = {
         "efficient_moe": efficient,
+        "mamba3_bwd_seq_chunk": mamba_chunk,
         "batch": args.batch,
         "seq": args.seq,
         "backward": bool(args.backward),
@@ -117,7 +129,8 @@ def main() -> None:
         "build_s": round(build_s, 2),
         "run_s": round(run_s, 2),
         "after_params_peak_gb": round(after_params_gb, 3),
-        "peak_gb": round(peak_gb, 3),
+        "mlx_peak_gb": round(peak_gb, 3),
+        "torch_cuda_peak_gb": torch_peak_gb,
         "loss_or_mean": loss_val,
     }
     print("PROBE_RESULT " + json.dumps(result), flush=True)
