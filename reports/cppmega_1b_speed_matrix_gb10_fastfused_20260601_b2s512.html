@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>cppmega 1B Speed Matrix — Metal (M4 Max) FAST FUSED Path-C 20260601</title>
+<style>
+ body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }
+ h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 1.6rem; }
+ ul.meta { font-size: 0.82rem; color: #444; line-height: 1.5; }
+ table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin-bottom: 1rem; }
+ th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
+ th { background: #2d2d2d; color: #fff; }
+ td.num { text-align: right; font-variant-numeric: tabular-nums; }
+ td.fast { color: #0a7d28; font-weight: 700; }
+ td.slow { color: #b40000; font-weight: 700; }
+ tr.ok td:nth-child(5) { color: #0a7d28; font-weight: 600; }
+ tr.bad td:nth-child(5) { color: #b40000; font-weight: 700; }
+ tr:nth-child(even) { background: #f6f6f6; }
+</style></head><body>
+<h1>cppmega 1B Speed Matrix — gb10 (NVIDIA GB10, CUDA) — FAST FUSED Path-C</h1>
+<ul class="meta">
+ <li>Date: 20260601 &middot; Host: gb10 (NVIDIA GB10, CUDA sm_121) &middot; Profile: local_gb10_quarter</li>
+ <li>seq-len 512, batch 2, --steps 10 warm, --grad-checkpoint, dynamic_int8_v1 (tokens/step = 1024)</li>
+ <li>path_b=reference &middot; path_c=flag-OFF serial mamba3 &middot; path_c_chunked=flag-ON CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN=1 (FAST chunked fused mamba3)</li>
+ <li>loss check = all losses finite AND final&lt;initial (fail-loud) &middot; per-cell bound 1800s</li>
+ <li>cppmega SHA: <code>a319599</code> &middot; TileLang SHA: <code>unknown</code></li>
+</ul>
+<table>
+<thead><tr><th>dtype</th><th>optimizer</th><th>bits</th><th>path</th><th>status</th><th>tok/s</th><th>step/s</th><th>compile s</th><th>peak GB</th><th>loss check</th><th>first/last loss</th><th>flag</th><th>reason</th></tr></thead>
+<tbody>
+<tr class="ok"><td>bf16</td><td>muon</td><td class="num">16</td><td>path_b</td><td>ok</td><td class="num">159</td><td class="num">0.165</td><td class="num">13.5</td><td class="num">27</td><td>PASS</td><td class="num">11.3 &rarr; 5.79</td><td></td><td>ok</td></tr>
+<tr class="bad"><td>bf16</td><td>muon</td><td class="num">16</td><td>path_c</td><td>blocked</td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num">17.2</td><td>FAIL</td><td class="num"></td><td>0</td><td>direct-chain training runtime not implemented (contract=direct_fusion_chain_training_runtime_missing; runtime_binding=direct_fusion_chain_logical_buffers_missing; model_binding=runtime_activation_owner_missing); split route available=m04_path_c_split_training_route_available</td></tr>
+<tr class="bad"><td>bf16</td><td>muon</td><td class="num">16</td><td>path_c_chunked</td><td>blocked</td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num">17.2</td><td>FAIL</td><td class="num"></td><td>1</td><td>direct-chain training runtime not implemented (contract=direct_fusion_chain_training_runtime_missing; runtime_binding=direct_fusion_chain_logical_buffers_missing; model_binding=runtime_activation_owner_missing); split route available=m04_path_c_split_training_route_available</td></tr>
+<tr class="ok"><td>bf16</td><td>adamw</td><td class="num">16</td><td>path_b</td><td>ok</td><td class="num">259</td><td class="num">0.27</td><td class="num">9.31</td><td class="num">32</td><td>PASS</td><td class="num">11.3 &rarr; 5.79</td><td></td><td>ok</td></tr>
+<tr class="bad"><td>bf16</td><td>adamw</td><td class="num">16</td><td>path_c</td><td>blocked</td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num">22.3</td><td>FAIL</td><td class="num"></td><td>0</td><td>direct-chain training runtime not implemented (contract=direct_fusion_chain_training_runtime_missing; runtime_binding=direct_fusion_chain_logical_buffers_missing; model_binding=runtime_activation_owner_missing); split route available=m04_path_c_split_training_route_available</td></tr>
+<tr class="bad"><td>bf16</td><td>adamw</td><td class="num">16</td><td>path_c_chunked</td><td>blocked</td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num">22.3</td><td>FAIL</td><td class="num"></td><td>1</td><td>direct-chain training runtime not implemented (contract=direct_fusion_chain_training_runtime_missing; runtime_binding=direct_fusion_chain_logical_buffers_missing; model_binding=runtime_activation_owner_missing); split route available=m04_path_c_split_training_route_available</td></tr>
+</tbody></table>
+<h2>Path-C flag-OFF &rarr; flag-ON (chunked fused mamba3) speedup</h2>
+<table>
+<thead><tr><th>dtype</th><th>optimizer</th><th>bits</th><th>serial step/s</th><th>chunked step/s</th><th>step/s speedup</th><th>serial compile s</th><th>chunked compile s</th><th>compile speedup</th></tr></thead>
+<tbody>
+<tr><td>bf16</td><td>muon</td><td class='num'>16</td><td class='num'></td><td class='num'></td><td class='num '></td><td class='num'></td><td class='num'></td><td class='num'></td></tr>
+<tr><td>bf16</td><td>adamw</td><td class='num'>16</td><td class='num'></td><td class='num'></td><td class='num '></td><td class='num'></td><td class='num'></td><td class='num'></td></tr>
+</tbody></table>
+</body></html>
