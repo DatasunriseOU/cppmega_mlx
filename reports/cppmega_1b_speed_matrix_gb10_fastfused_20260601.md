@@ -11,46 +11,46 @@
 - nvfp4: accepted route but full training step fails-LOUD (no nvfp4 training kernels yet) — honest blocked cell.
 - CUDA note: the CPPMEGA_PATH_C_MAMBA3_CHUNKED_SCAN flag is target-agnostic (same on Metal+CUDA); per-cell results report whatever CUDA measures.
 - Per-cell bound: 1800s OS timeout (fail-loud)
-- cppmega SHA: `66932dc` · TileLang SHA: `unknown`
+- cppmega SHA: `a319599` · TileLang SHA: `unknown`
 
 | dtype | optimizer | bits | path | status | tok/s | step/s | compile s | peak GB | loss check | first/last loss | flag |
 | ----- | --------- | ---: | ---- | ------ | ----: | -----: | --------: | ------: | ---------- | --------------- | ---- |
-| bf16 | muon | 16 | path_b | blocked |  |  |  | 12.1 | FAIL |  |  |
-| bf16 | muon | 16 | path_c | ok | 75.7 | 0.155 | 12.3 | 15.5 | PASS | 11.3 → 6.27 | 0 |
-| bf16 | muon | 16 | path_c_chunked | ok | 78.7 | 0.159 | 8.92 | 15.9 | PASS | 11.3 → 6.27 | 1 |
-| bf16 | muon | 8 | path_b | blocked |  |  |  | 5.62 | FAIL |  |  |
-| bf16 | muon | 8 | path_c | ok | 34 | 0.0686 | 20.8 | 21.9 | PASS | 11.3 → 6.27 | 0 |
-| bf16 | muon | 8 | path_c_chunked | ok | 34.4 | 0.0683 | 17.5 | 21.7 | PASS | 11.3 → 6.28 | 1 |
-| bf16 | adamw | 16 | path_b | blocked |  |  |  | 17.1 | FAIL |  |  |
-| bf16 | adamw | 16 | path_c | ok | 117 | 0.242 | 9.57 | 21.7 | PASS | 11.3 → 6.27 | 0 |
-| bf16 | adamw | 16 | path_c_chunked | ok | 122 | 0.246 | 6.01 | 21.7 | PASS | 11.3 → 6.27 | 1 |
-| bf16 | adamw | 8 | path_b | blocked |  |  |  | 6.9 | FAIL |  |  |
-| bf16 | adamw | 8 | path_c | ok | 27.6 | 0.0553 | 23.3 | 33.9 | PASS | 11.3 → 6.28 | 0 |
-| bf16 | adamw | 8 | path_c_chunked | ok | 28.3 | 0.056 | 20.3 | 33.9 | PASS | 11.3 → 6.27 | 1 |
-| bf16 | lion | 16 | path_b | blocked |  |  |  | 10.3 | FAIL |  |  |
-| bf16 | lion | 16 | path_c | ok | 121 | 0.25 | 9.51 | 25.1 | PASS | 11.3 → 7.48 | 0 |
-| bf16 | lion | 16 | path_c_chunked | ok | 121 | 0.245 | 5.94 | 25.1 | PASS | 11.3 → 7.48 | 1 |
-| bf16 | lion | 8 | path_b | blocked |  |  |  | 5.16 | FAIL |  |  |
-| bf16 | lion | 8 | path_c | ok | 47.4 | 0.096 | 15.9 | 29.1 | PASS | 11.3 → 7.48 | 0 |
-| bf16 | lion | 8 | path_c_chunked | ok | 48.3 | 0.0959 | 12.2 | 29.1 | PASS | 11.3 → 7.48 | 1 |
-| fp8 | muon | 16 | path_b | blocked |  |  |  | 12.1 | FAIL |  |  |
-| fp8 | muon | 16 | path_c | ok | 71.7 | 0.149 | 15.9 | 15.5 | PASS | 11.2 → 6.69 | 0 |
-| fp8 | muon | 16 | path_c_chunked | ok | 74.7 | 0.151 | 9.37 | 15.5 | PASS | 11.2 → 6.69 | 1 |
-| fp8 | muon | 8 | path_b | blocked |  |  |  | 5.62 | FAIL |  |  |
-| fp8 | muon | 8 | path_c | ok | 33.1 | 0.0673 | 24.5 | 21.7 | PASS | 11.2 → 6.69 | 0 |
-| fp8 | muon | 8 | path_c_chunked | ok | 33.7 | 0.0669 | 17.6 | 21.7 | PASS | 11.2 → 6.69 | 1 |
-| fp8 | adamw | 16 | path_b | blocked |  |  |  | 17.1 | FAIL |  |  |
-| fp8 | adamw | 16 | path_c | ok | 108 | 0.227 | 13.8 | 21.7 | PASS | 11.2 → 6.69 | 0 |
-| fp8 | adamw | 16 | path_c_chunked | ok | 114 | 0.232 | 6.93 | 21.7 | PASS | 11.2 → 6.69 | 1 |
-| fp8 | adamw | 8 | path_b | blocked |  |  |  | 6.9 | FAIL |  |  |
-| fp8 | adamw | 8 | path_c | ok | 27 | 0.0546 | 27.6 | 33.9 | PASS | 11.2 → 6.69 | 0 |
-| fp8 | adamw | 8 | path_c_chunked | ok | 27.4 | 0.0542 | 20.9 | 33.9 | PASS | 11.2 → 6.69 | 1 |
-| fp8 | lion | 16 | path_b | blocked |  |  |  | 10.3 | FAIL |  |  |
-| fp8 | lion | 16 | path_c | ok | 114 | 0.24 | 13.7 | 25.1 | PASS | 11.2 → 8.08 | 0 |
-| fp8 | lion | 16 | path_c_chunked | ok | 119 | 0.242 | 6.86 | 25.1 | PASS | 11.2 → 8.08 | 1 |
-| fp8 | lion | 8 | path_b | blocked |  |  |  | 5.16 | FAIL |  |  |
-| fp8 | lion | 8 | path_c | ok | 44.7 | 0.0917 | 20.2 | 29.1 | PASS | 11.2 → 8.07 | 0 |
-| fp8 | lion | 8 | path_c_chunked | ok | 47.1 | 0.0941 | 13.3 | 29.1 | PASS | 11.2 → 8.08 | 1 |
+| bf16 | muon | 16 | path_b | ok | 92 | 0.187 | 8.66 | 19.5 | PASS | 11.3 → 6.27 |  |
+| bf16 | muon | 16 | path_c | ok | 80.5 | 0.162 | 8.81 | 15.5 | PASS | 11.3 → 6.27 | 0 |
+| bf16 | muon | 16 | path_c_chunked | ok | 80.5 | 0.162 | 8.78 | 15.9 | PASS | 11.3 → 6.27 | 1 |
+| bf16 | muon | 8 | path_b | ok | 38.9 | 0.0776 | 16.2 | 22.6 | PASS | 11.3 → 6.27 |  |
+| bf16 | muon | 8 | path_c | ok | 34.6 | 0.0688 | 17.2 | 21.7 | PASS | 11.3 → 6.27 | 0 |
+| bf16 | muon | 8 | path_c_chunked | ok | 34.9 | 0.0694 | 17 | 21.7 | PASS | 11.3 → 6.27 | 1 |
+| bf16 | adamw | 16 | path_b | ok | 156 | 0.321 | 6.37 | 24.5 | PASS | 11.3 → 6.27 |  |
+| bf16 | adamw | 16 | path_c | ok | 122 | 0.245 | 5.94 | 21.7 | PASS | 11.3 → 6.27 | 0 |
+| bf16 | adamw | 16 | path_c_chunked | ok | 121 | 0.244 | 5.74 | 21.7 | PASS | 11.3 → 6.27 | 1 |
+| bf16 | adamw | 8 | path_b | ok | 33.5 | 0.0668 | 18.6 | 33.9 | PASS | 11.3 → 6.27 |  |
+| bf16 | adamw | 8 | path_c | ok | 28.3 | 0.0559 | 19.8 | 33.9 | PASS | 11.3 → 6.27 | 0 |
+| bf16 | adamw | 8 | path_c_chunked | ok | 28.2 | 0.0558 | 20 | 33.9 | PASS | 11.3 → 6.27 | 1 |
+| bf16 | lion | 16 | path_b | ok | 168 | 0.346 | 6.37 | 26.4 | PASS | 11.3 → 7.48 |  |
+| bf16 | lion | 16 | path_c | ok | 125 | 0.251 | 5.86 | 25.1 | PASS | 11.3 → 7.48 | 0 |
+| bf16 | lion | 16 | path_c_chunked | ok | 125 | 0.25 | 5.59 | 25.1 | PASS | 11.3 → 7.48 | 1 |
+| bf16 | lion | 8 | path_b | ok | 56.9 | 0.114 | 12.1 | 29.1 | PASS | 11.3 → 7.48 |  |
+| bf16 | lion | 8 | path_c | ok | 47.6 | 0.0944 | 12.4 | 29.1 | PASS | 11.3 → 7.48 | 0 |
+| bf16 | lion | 8 | path_c_chunked | ok | 48.4 | 0.0962 | 12.5 | 29.1 | PASS | 11.3 → 7.48 | 1 |
+| fp8 | muon | 16 | path_b | ok | 91.1 | 0.185 | 8.91 | 22.1 | PASS | 11.2 → 6.77 |  |
+| fp8 | muon | 16 | path_c | ok | 75.4 | 0.152 | 9.2 | 15.5 | PASS | 11.2 → 6.69 | 0 |
+| fp8 | muon | 16 | path_c_chunked | ok | 74.8 | 0.151 | 9.19 | 15.9 | PASS | 11.2 → 6.69 | 1 |
+| fp8 | muon | 8 | path_b | ok | 38.7 | 0.0773 | 16.3 | 22.6 | PASS | 11.2 → 6.77 |  |
+| fp8 | muon | 8 | path_c | ok | 33.5 | 0.0666 | 17.6 | 21.7 | PASS | 11.2 → 6.69 | 0 |
+| fp8 | muon | 8 | path_c_chunked | ok | 33.6 | 0.0668 | 17.6 | 21.7 | PASS | 11.2 → 6.69 | 1 |
+| fp8 | adamw | 16 | path_b | ok | 154 | 0.317 | 6.56 | 27.2 | PASS | 11.2 → 6.78 |  |
+| fp8 | adamw | 16 | path_c | ok | 110 | 0.222 | 7.09 | 21.7 | PASS | 11.2 → 6.69 | 0 |
+| fp8 | adamw | 16 | path_c_chunked | ok | 113 | 0.229 | 6.98 | 21.7 | PASS | 11.2 → 6.69 | 1 |
+| fp8 | adamw | 8 | path_b | ok | 33.5 | 0.0667 | 18.4 | 33.9 | PASS | 11.2 → 6.77 |  |
+| fp8 | adamw | 8 | path_c | ok | 27.7 | 0.0549 | 20.8 | 33.9 | PASS | 11.2 → 6.69 | 0 |
+| fp8 | adamw | 8 | path_c_chunked | ok | 27.7 | 0.0548 | 20.9 | 33.9 | PASS | 11.2 → 6.69 | 1 |
+| fp8 | lion | 16 | path_b | ok | 164 | 0.339 | 6.57 | 26.4 | PASS | 11.2 → 7.05 |  |
+| fp8 | lion | 16 | path_c | ok | 117 | 0.238 | 6.62 | 25.1 | PASS | 11.2 → 8.07 | 0 |
+| fp8 | lion | 16 | path_c_chunked | ok | 114 | 0.232 | 7.03 | 25.1 | PASS | 11.2 → 8.08 | 1 |
+| fp8 | lion | 8 | path_b | ok | 56.2 | 0.113 | 12.4 | 29.1 | PASS | 11.2 → 7.04 |  |
+| fp8 | lion | 8 | path_c | ok | 46.6 | 0.0931 | 13.4 | 29.1 | PASS | 11.2 → 8.07 | 0 |
+| fp8 | lion | 8 | path_c_chunked | ok | 45.5 | 0.0906 | 13.3 | 29.1 | PASS | 11.2 → 8.08 | 1 |
 | nvfp4 | muon | 16 | path_b | blocked |  |  |  | 0 | FAIL |  |  |
 | nvfp4 | muon | 16 | path_c | blocked |  |  |  | 0 | FAIL |  | 0 |
 | nvfp4 | muon | 16 | path_c_chunked | blocked |  |  |  | 0 | FAIL |  | 1 |
@@ -77,18 +77,18 @@
 
 | dtype | optimizer | bits | serial step/s | chunked step/s | step/s speedup | serial compile s | chunked compile s | compile speedup |
 | ----- | --------- | ---: | ------------: | -------------: | -------------: | ---------------: | ----------------: | --------------: |
-| bf16 | muon | 16 | 0.155 | 0.159 | 1.02x | 12.3 | 8.92 | 1.38x |
-| bf16 | muon | 8 | 0.0686 | 0.0683 | 0.997x | 20.8 | 17.5 | 1.19x |
-| bf16 | adamw | 16 | 0.242 | 0.246 | 1.02x | 9.57 | 6.01 | 1.59x |
-| bf16 | adamw | 8 | 0.0553 | 0.056 | 1.01x | 23.3 | 20.3 | 1.15x |
-| bf16 | lion | 16 | 0.25 | 0.245 | 0.979x | 9.51 | 5.94 | 1.6x |
-| bf16 | lion | 8 | 0.096 | 0.0959 | 0.999x | 15.9 | 12.2 | 1.31x |
-| fp8 | muon | 16 | 0.149 | 0.151 | 1.01x | 15.9 | 9.37 | 1.7x |
-| fp8 | muon | 8 | 0.0673 | 0.0669 | 0.994x | 24.5 | 17.6 | 1.39x |
-| fp8 | adamw | 16 | 0.227 | 0.232 | 1.02x | 13.8 | 6.93 | 2x |
-| fp8 | adamw | 8 | 0.0546 | 0.0542 | 0.992x | 27.6 | 20.9 | 1.32x |
-| fp8 | lion | 16 | 0.24 | 0.242 | 1.01x | 13.7 | 6.86 | 2x |
-| fp8 | lion | 8 | 0.0917 | 0.0941 | 1.03x | 20.2 | 13.3 | 1.51x |
+| bf16 | muon | 16 | 0.162 | 0.162 | 1x | 8.81 | 8.78 | 1x |
+| bf16 | muon | 8 | 0.0688 | 0.0694 | 1.01x | 17.2 | 17 | 1.01x |
+| bf16 | adamw | 16 | 0.245 | 0.244 | 0.995x | 5.94 | 5.74 | 1.03x |
+| bf16 | adamw | 8 | 0.0559 | 0.0558 | 0.998x | 19.8 | 20 | 0.993x |
+| bf16 | lion | 16 | 0.251 | 0.25 | 0.996x | 5.86 | 5.59 | 1.05x |
+| bf16 | lion | 8 | 0.0944 | 0.0962 | 1.02x | 12.4 | 12.5 | 0.99x |
+| fp8 | muon | 16 | 0.152 | 0.151 | 0.992x | 9.2 | 9.19 | 1x |
+| fp8 | muon | 8 | 0.0666 | 0.0668 | 1x | 17.6 | 17.6 | 0.999x |
+| fp8 | adamw | 16 | 0.222 | 0.229 | 1.03x | 7.09 | 6.98 | 1.02x |
+| fp8 | adamw | 8 | 0.0549 | 0.0548 | 0.998x | 20.8 | 20.9 | 0.992x |
+| fp8 | lion | 16 | 0.238 | 0.232 | 0.975x | 6.62 | 7.03 | 0.941x |
+| fp8 | lion | 8 | 0.0931 | 0.0906 | 0.973x | 13.4 | 13.3 | 1x |
 | nvfp4 | muon | 16 |  |  |  |  |  |  |
 | nvfp4 | muon | 8 |  |  |  |  |  |  |
 | nvfp4 | adamw | 16 |  |  |  |  |  |  |
