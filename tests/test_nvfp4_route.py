@@ -9,19 +9,30 @@ under RULE #1 (no silent fallbacks):
       ``quantize_mxfp4_blockwise`` e2m1 + per-block-16 codec.
     - CUDA/gb10 sm_121: TransformerEngine ``NVFP4BlockScaling`` + cuBLASLt FP4
       GEMM (VERIFIED working, rel_err vs bf16 ~0.146).
-* The BACKWARD nvfp4 GEMM, optimizer state, and every non-GEMM op have NO
-  working nvfp4 kernel on the available arch, so the route RAISES a precise,
-  actionable error naming the missing op + enablement -- it NEVER downcasts to
-  bf16 silently. On gb10 specifically the backward fails because the FP4
-  stochastic-rounding cast (``cvt.rs.satfinite.e2m1x4``) and Random-Hadamard
-  fused kernels are DATACENTER-ONLY: TE source-gates the SR cvt to
-  ``sm_100a``/``sm_103a`` and the RHT kernel needs the SM100 TMEM/tcgen05
-  pipeline that sm_12x does not implement. This is NOT fixable by a TE rebuild
-  for any sm_12x target (verified 2026-06-01) -- the fail-loud is permanent on
-  consumer/Spark Blackwell until NVIDIA ships SM12x-native kernels upstream.
+* The BACKWARD nvfp4 GEMM has TWO recipes:
+    - REDUCED round-to-nearest (``NVFP4BlockScaling(disable_rht=True,
+      disable_stochastic_rounding=True)``, ported from nanochat) RUNS on gb10
+      sm_121 -- dgrad+wgrad in FP4 RtN, rel_err ~0.147 vs bf16. It reuses the
+      same working forward cuBLASLt FP4 GEMM and avoids the datacenter-only SR
+      cvt + RHT fused kernel. It is GATED behind a runtime numeric probe
+      (``nvfp4_te_backward_rtn_probe``) and is a SUPPORTED op only when the gate
+      passes. (This REOPENS the earlier "datacenter-only / can't be done"
+      conclusion -- which was correct only for the DEFAULT recipe.)
+    - DEFAULT (RHT + stochastic rounding ON) fails on gb10 because the FP4
+      stochastic-rounding cast (``cvt.rs.satfinite.e2m1x4``) and Random-Hadamard
+      fused kernels are DATACENTER-ONLY: TE source-gates the SR cvt to
+      ``sm_100a``/``sm_103a`` and the RHT kernel needs the SM100 TMEM/tcgen05
+      pipeline that sm_12x does not implement. This is NOT fixable by a TE
+      rebuild for any sm_12x target (verified 2026-06-01) -- the DEFAULT-recipe
+      fail-loud is permanent on consumer/Spark Blackwell until NVIDIA ships
+      SM12x-native kernels upstream.
+* optimizer state and every non-GEMM op have NO working nvfp4 kernel on the
+  available arch, so the route RAISES a precise, actionable error naming the
+  missing op + enablement -- it NEVER downcasts to bf16 silently.
 
-These tests assert BOTH halves: the real forward op matches bf16 within
-tolerance, and the unsupported ops raise the expected ``Nvfp4*`` error.
+These tests assert BOTH halves: the real forward op + reduced RtN backward match
+bf16 within tolerance, and the DEFAULT-recipe backward raises the expected
+``Nvfp4*`` error.
 
 Run on Mac (Metal-only assertions skip cleanly when MLX/Metal absent) and on
 gb10 (the CUDA assertions run when torch+TE+CUDA are present).
@@ -43,17 +54,22 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts._nvfp4_route import (  # noqa: E402
     NVFP4_BLOCK_SIZE,
     NVFP4_ELEMENT_FORMAT,
+    NVFP4_RTN_BACKWARD_DGRAD_REL_ERR_TOL,
     NVFP4_SUPPORTED_OPS,
     NVFP4_UNSUPPORTED_TRAINING_OPS,
     Nvfp4CudaKernelMiscompiled,
     Nvfp4TrainingRouteUnavailable,
+    nvfp4_backward_rtn_supported,
     nvfp4_route_requested,
+    nvfp4_te_backward_rtn_probe,
     nvfp4_te_cuda_capability,
     nvfp4_te_gemm_probe,
     nvfp4_training_route_payload,
     nvfp4_training_route_unavailable_reason,
     raise_if_nvfp4_training_unsupported,
 )
+
+_RTN_BWD_OP = "backward_nvfp4_rtn_dgrad_fp4_wgrad_fp4_te_cublaslt_cuda_sm121"
 
 
 class _Args:
@@ -72,12 +88,20 @@ def test_route_constants_well_formed() -> None:
     # Both forward backends are advertised as supported.
     assert "forward_gemm_operands_e2m1_block_scale_metal_m4" in NVFP4_SUPPORTED_OPS
     assert "forward_nvfp4_gemm_te_cublaslt_cuda_sm121" in NVFP4_SUPPORTED_OPS
-    # The decisive gb10 backward blocker is enumerated as unsupported.
+    # The REDUCED round-to-nearest backward (ported from nanochat) is a SUPPORTED
+    # op, gated at runtime by the numeric probe.
+    assert _RTN_BWD_OP in NVFP4_SUPPORTED_OPS
+    # The DEFAULT-recipe gb10 backward blocker stays enumerated as unsupported.
     assert (
         "nvfp4_gemm_backward_vjp_te_cuda_sm121"
         in NVFP4_UNSUPPORTED_TRAINING_OPS
     )
     assert "optimizer_state_and_update" in NVFP4_UNSUPPORTED_TRAINING_OPS
+    # The RtN op is NOT also listed as unsupported (no contradictory state).
+    assert _RTN_BWD_OP not in NVFP4_UNSUPPORTED_TRAINING_OPS
+    # The acceptance tolerance is a sane, finite bound above the measured ~0.147
+    # and well below a garbage (~1.0) mis-execution.
+    assert 0.147 < NVFP4_RTN_BACKWARD_DGRAD_REL_ERR_TOL < 0.6
 
 
 def test_route_requested_predicate() -> None:
@@ -93,7 +117,8 @@ def test_payload_advertises_both_forward_backends_and_no_e2e() -> None:
     assert payload["element_format"] == "e2m1"
     assert "transformer_engine" in payload["forward_gemm_kernel_cuda"].lower()
     assert "mxfp4_matmul_path_c" in payload["forward_gemm_kernel_metal"]
-    # gb10 backward gap is documented as datacenter-only (NOT a rebuild gap).
+    # gb10 DEFAULT backward gap is documented as datacenter-only (NOT a rebuild
+    # gap), while the reduced RtN recipe is advertised as working.
     assert "datacenter_only" in payload["backward_gemm_cuda_status"]
     assert "not_fixable_by_te_rebuild" in payload["backward_gemm_cuda_status"]
     enablement = payload["backward_gemm_cuda_enablement"]
@@ -101,6 +126,11 @@ def test_payload_advertises_both_forward_backends_and_no_e2e() -> None:
     assert "tcgen05" in enablement
     # Must NOT advertise the disproven compute_120f rebuild as the fix.
     assert "compute_120f" not in enablement
+    # The reduced RtN backward is advertised separately as WORKING on sm_121.
+    assert "WORKS" in payload["backward_gemm_cuda_rtn_status"]
+    assert "disable_rht" in payload["backward_gemm_cuda_rtn_recipe"]
+    assert "disable_stochastic_rounding" in payload["backward_gemm_cuda_rtn_recipe"]
+    assert "nanochat" in payload["backward_gemm_cuda_rtn_ported_from"]
 
 
 def test_fail_loud_guard_raises_for_nvfp4_and_names_missing_ops() -> None:
@@ -186,7 +216,8 @@ def test_metal_forward_nvfp4_gemm_matches_bf16() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CUDA/gb10 NVFP4: forward works, backward fails loud. (Skips off-CUDA.)
+# CUDA/gb10 NVFP4: forward works; reduced RtN backward works (gated); default
+# RHT+SR backward fails loud. (Skips off-CUDA.)
 # ---------------------------------------------------------------------------
 
 
@@ -222,19 +253,79 @@ def test_cuda_forward_nvfp4_gemm_matches_bf16() -> None:
     not _cuda_te_available(),
     reason="CUDA + TransformerEngine NVFP4 not available (run on gb10)",
 )
-def test_cuda_backward_nvfp4_gemm_fails_loud_datacenter_only() -> None:
-    # RULE #1: the nvfp4 backward on sm_12x must RAISE, not silently return
-    # garbage gradients. Verified 2026-06-01: this is NOT a build-flag gap --
-    # the SR FP4 cvt (cvt.rs.satfinite.e2m1x4) is source-gated in TE to
-    # sm_100a/sm_103a and the RHT kernel needs SM100 TMEM/tcgen05 absent on
-    # sm_12x, so NO TE rebuild for any sm_12x target can enable it. The
-    # fail-loud is therefore PERMANENT on consumer/Spark Blackwell (no
-    # NVFP4_BACKWARD_FIXED escape hatch) until NVIDIA ships SM12x-native FP4
-    # SR+RHT backward kernels upstream.
-    with pytest.raises(Nvfp4CudaKernelMiscompiled) as ei:
-        nvfp4_te_gemm_probe(M=256, K=512, N=256, run_backward=True)
-    msg = str(ei.value)
+def test_cuda_default_recipe_backward_nvfp4_gemm_fails_loud_datacenter_only() -> None:
+    # RULE #1: the DEFAULT-recipe (RHT + stochastic rounding ON) nvfp4 backward on
+    # sm_12x must RAISE, not silently return garbage gradients. Verified
+    # 2026-06-01: this is NOT a build-flag gap -- the SR FP4 cvt
+    # (cvt.rs.satfinite.e2m1x4) is source-gated in TE to sm_100a/sm_103a and the
+    # RHT kernel needs SM100 TMEM/tcgen05 absent on sm_12x, so NO TE rebuild for
+    # any sm_12x target can enable the DEFAULT recipe. (The REDUCED RtN recipe is
+    # the escape -- see test_cuda_reduced_rtn_backward_* below.)
+    #
+    # CRITICAL: the RHT-kernel crash CORRUPTS the CUDA context irrecoverably
+    # (subsequent cudaMalloc/normal_ raise "invalid argument"). We therefore run
+    # the destructive probe in an ISOLATED SUBPROCESS so it cannot poison the
+    # context of the in-process RtN backward test. This is not a fallback -- the
+    # subprocess still RAISES Nvfp4CudaKernelMiscompiled; we just contain the
+    # blast radius. We assert the subprocess prints the marker and exits nonzero.
+    import subprocess  # noqa: PLC0415
+
+    code = (
+        "import sys, os; "
+        "os.environ['CUDA_LAUNCH_BLOCKING']='1'; "
+        "sys.path.insert(0, %r); "
+        "from scripts._nvfp4_route import (nvfp4_te_gemm_probe, "
+        "Nvfp4CudaKernelMiscompiled); "
+        "\ntry:\n"
+        "    nvfp4_te_gemm_probe(M=256, K=512, N=256, run_backward=True)\n"
+        "    print('NO_RAISE'); sys.exit(2)\n"
+        "except Nvfp4CudaKernelMiscompiled as e:\n"
+        "    print('RAISED_MISCOMPILED'); print(repr(str(e))); sys.exit(0)\n"
+    ) % str(_REPO_ROOT)
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "CUDA_LAUNCH_BLOCKING": "1"},
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "RAISED_MISCOMPILED" in proc.stdout, out
     # Names the real, evidence-backed blocker (not the disproven 120f rebuild).
-    assert "datacenter-only" in msg.lower() or "datacenter_only" in msg.lower()
-    assert "tcgen05" in msg or "cvt.rs.satfinite.e2m1x4" in msg
-    assert "compute_120f" not in msg
+    assert "datacenter-only" in out.lower() or "datacenter_only" in out.lower()
+    assert "tcgen05" in out or "cvt.rs.satfinite.e2m1x4" in out
+    assert "compute_120f" not in out
+
+
+@pytest.mark.skipif(
+    not _cuda_te_available(),
+    reason="CUDA + TransformerEngine NVFP4 not available (run on gb10)",
+)
+def test_cuda_reduced_rtn_backward_runs_and_matches_bf16() -> None:
+    # The REDUCED round-to-nearest backward (RHT off + SR off; ported from
+    # nanochat) RUNS on sm_121 and matches the bf16 reference within tolerance.
+    # This REOPENS the previously-declared "datacenter-only / can't be done"
+    # conclusion (commit b6a6177) for the reduced recipe specifically. Measured on
+    # gb10: dgrad rel_err ~0.147, wgrad rel_err ~0.134.
+    res = nvfp4_te_backward_rtn_probe(M=256, K=512, N=256)
+    assert res["backward_rtn_supported"] is True
+    assert res["op"] == _RTN_BWD_OP
+    assert res["dgrad_all_finite"] is True and res["wgrad_all_finite"] is True
+    # The numeric gate: dgrad must be finite and within the acceptance tolerance.
+    assert res["dgrad_rel_rmse_vs_bf16"] < NVFP4_RTN_BACKWARD_DGRAD_REL_ERR_TOL, res
+    assert res["wgrad_rel_rmse_vs_bf16"] < NVFP4_RTN_BACKWARD_DGRAD_REL_ERR_TOL, res
+    # Sanity: the recipe string names the load-bearing disables.
+    assert "disable_rht" in res["recipe"]
+    assert "disable_stochastic_rounding" in res["recipe"]
+
+
+@pytest.mark.skipif(
+    not _cuda_te_available(),
+    reason="CUDA + TransformerEngine NVFP4 not available (run on gb10)",
+)
+def test_cuda_reduced_rtn_backward_capability_gate_true_on_gb10() -> None:
+    # The runtime capability gate must report the RtN backward supported on gb10
+    # (where the numeric probe passes). This is the gate that makes the
+    # NVFP4_SUPPORTED_OPS entry actually usable.
+    assert nvfp4_backward_rtn_supported() is True

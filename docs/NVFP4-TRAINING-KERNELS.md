@@ -106,7 +106,16 @@ forward_nvfp4_gemm_te_cublaslt_cuda_sm121: rel_rmse_vs_bf16 = 0.147, finite=True
 0.147 is the expected FP4 forward error (no RHT). This is a REAL nvfp4 op on
 gb10 and we wire/test it (§5, §6).
 
-### 3b. BACKWARD NVFP4 GEMM — BROKEN on gb10 (root cause identified)
+### 3b. BACKWARD NVFP4 GEMM — DEFAULT recipe BROKEN on gb10; REDUCED RtN recipe WORKS
+
+There are **two** backward recipes with **different** status on gb10. The
+**default** recipe (RHT + SR) is genuinely datacenter-only and stays fail-loud
+(§3b-i). The **reduced round-to-nearest** recipe (RHT off + SR off, ported from
+nanochat) **runs and matches bf16 within ~0.147 rel-err** (§3b-ii). The earlier
+"backward genuinely blocked / can't be done" verdict (commit b6a6177) was correct
+**only** for the default recipe and was too broad.
+
+#### 3b-i. DEFAULT recipe (RHT + SR) — BROKEN on gb10 (root cause identified)
 
 Running the **default production recipe** (RHT on fwd-inp + bwd, SR on bwd)
 backward on gb10 raises a hard CUDA error from the Random-Hadamard fused quant
@@ -199,6 +208,60 @@ mis-execution. Our probe defeats this by (a) using a fresh module for the
 default-recipe backward and (b) treating the arch-specific assertion as a hard
 RAISE. We never accept the masked gradients.
 
+#### 3b-ii. REDUCED RtN recipe (RHT off + SR off) — WORKS on gb10 (real, measured)
+
+The **reduced round-to-nearest** recipe — ported from nanochat
+(`CHANGELOG_GB10.md:240–268`, `gpt.py:951–961`; loss 11.09→6.58 over 22 GB10
+steps) — disables both RHT and stochastic rounding:
+
+```python
+from transformer_engine.common.recipe import NVFP4BlockScaling
+recipe = NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)
+```
+
+With both off, TE's `fp4_quant_bwd_grad` degrades to plain RtN E2M1 + E4M3
+16-element block scale — the **same** cuBLASLt `CUDA_R_4F_E2M1 × UE4M3` path the
+forward (§3a) already proves works. It never touches the SR cvt
+(`cvt.rs.satfinite.e2m1x4`) or the RHT fused kernel, so neither §3b-i blocker is
+reached. **Measured on gb10 (sm_121, TE 2.16.0.dev0+a46079cb, 2026-06-01)** with
+a fresh module + `CUDA_LAUNCH_BLOCKING=1`, vs a pure-bf16 `te.Linear` reference:
+
+```
+recipe = NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)
+fwd  rel_err = 0.1472   (finite)
+dgrad rel_err = 0.1465  (finite)   # input-grad, FP4 RtN
+wgrad rel_err = 0.1343  (finite)   # weight-grad, FP4 RtN
+deterministic & reproducible across runs (SR off → no stochasticity);
+holds at M,K,N=512,1024,512 (dgrad 0.1465 / wgrad 0.1346).
+```
+
+**API delta from nanochat (load-bearing):** nanochat's TE accepted
+`override_linear_precision=(False,False,True)` (force wgrad→BF16) and a
+`disable_sr` alias. **This** TE build (2.16.0.dev0+a46079cb) has **neither**
+kwarg — it exposes `disable_rht`, `disable_stochastic_rounding`,
+`disable_2d_quantization`, and `backward_override ∈ {None,'high_precision',
+'dequantized'}`. The bare `disable_rht + disable_stochastic_rounding` recipe runs
+**both** dgrad and wgrad in FP4 RtN on this build (so we do **not** need the
+wgrad-BF16 split that nanochat used; `backward_override='high_precision'` would
+force the whole backward to BF16 — measured dgrad/wgrad = 0.0 — if a future TE
+regresses wgrad). The `build_nvfp4_rtn_recipe()` helper tries this-build kwargs
+first, then nanochat's, with graceful per-kwarg fallback.
+
+**ENABLED behind a numeric gate (RULE #1).** The reduced RtN backward is a
+SUPPORTED op (`backward_nvfp4_rtn_dgrad_fp4_wgrad_fp4_te_cublaslt_cuda_sm121`)
+**only when** `nvfp4_te_backward_rtn_probe()` runs the real FP4 backward on the
+live device and dgrad rel-err is finite and `< 0.35`
+(`NVFP4_RTN_BACKWARD_DGRAD_REL_ERR_TOL`). If the kernel raises, produces
+NaN/garbage, or exceeds the bound, the probe RAISES `Nvfp4CudaKernelMiscompiled`
+and the route stays fail-loud — no silent bf16 masquerade.
+
+**Honesty caveat (RULE #1).** This proves "runs + matches bf16 within ~0.15
+rel-err" — the same ballpark as the forward. It does **not** prove full
+convergence accuracy parity over a long training run; nanochat's loss-descent
+receipt is the integration evidence that it trains. wgrad here is real FP4 (not
+the BF16 fallback nanochat used), so the accuracy is at least as good as
+nanochat's on this build.
+
 ### 3c. MXFP8 — also unavailable on gb10 (for completeness)
 
 `check_mxfp8_support()` → `(False, 'MXFP8 (for all gemm layouts) is not supported
@@ -240,13 +303,14 @@ metadata; the real training step RAISES the precise blocker.
 |----|---------|--------|--------|
 | `forward_gemm_operands_e2m1_block_scale_metal_m4` | Metal/M4 | `cppmega_mlx.nn._tilelang.mxfp4_matmul_path_c` over `quantize_mxfp4_blockwise` | real (M4); exercised by `nvfp4_gemm_smoke` |
 | `forward_nvfp4_gemm_te_cublaslt_cuda_sm121` | CUDA/gb10 | TE `NVFP4BlockScaling` + cuBLASLt FP4 | **VERIFIED on gb10, rel_err 0.147**; exercised by `nvfp4_te_gemm_probe(run_backward=False)` |
+| `backward_nvfp4_rtn_dgrad_fp4_wgrad_fp4_te_cublaslt_cuda_sm121` | CUDA/gb10 | TE `NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)` + cuBLASLt FP4 (RtN, no SR/RHT) | **VERIFIED on gb10: dgrad rel_err 0.147, wgrad 0.134** (§3b-ii); ported from nanochat; GATED at runtime by `nvfp4_te_backward_rtn_probe()` (dgrad `< 0.35`); exercised by `test_cuda_reduced_rtn_backward_*` |
 
 **FAIL-LOUD ops (`NVFP4_UNSUPPORTED_TRAINING_OPS`)** — the route RAISES naming
 each; it does NOT bf16-fallback:
 
 | Op | Why | Enablement |
 |----|-----|-----------|
-| `nvfp4_gemm_backward_vjp_te_cuda_sm121` | **Datacenter-only, NOT a build gap.** SR FP4 cvt (`cvt.rs.satfinite.e2m1x4`) is TE-source-gated to `sm_100a`/`sm_103a`; RHT kernel needs SM100 TMEM/`tcgen05` which sm_12x does not implement. nvcc 13.x has no sm_12x `a`/`f` target → a TE rebuild **cannot** fix it (see §3b) | **UPSTREAM ONLY**: needs NVIDIA to ship SM12x-native (non-`tcgen05`) FP4 SR + RHT backward kernels in a future TE/cuBLASLt release |
+| `nvfp4_gemm_backward_vjp_te_cuda_sm121` (**DEFAULT recipe** only — RHT+SR ON) | **Datacenter-only, NOT a build gap.** SR FP4 cvt (`cvt.rs.satfinite.e2m1x4`) is TE-source-gated to `sm_100a`/`sm_103a`; RHT kernel needs SM100 TMEM/`tcgen05` which sm_12x does not implement. nvcc 13.x has no sm_12x `a`/`f` target → a TE rebuild **cannot** fix it (see §3b-i). **The REDUCED RtN recipe is the escape — see the supported-ops table above.** | **UPSTREAM ONLY**: needs NVIDIA to ship SM12x-native (non-`tcgen05`) FP4 SR + RHT backward kernels in a future TE/cuBLASLt release |
 | `cuda_blackwell_nvfp4_gemm_metal_only` | The Metal fwd GEMM is Metal-only; it RAISES on CUDA | Use the TE/cuBLASLt CUDA forward path above |
 | `gemm_backward_vjp` | No nvfp4 grad kernel for the Metal e2m1 GEMM | Implement an nvfp4 VJP for `mxfp4_matmul_path_c` |
 | `optimizer_state_and_update` | AdamW moments are fp32-only; no nvfp4 optimizer state | Implement nvfp4 optimizer-state kernels |
@@ -263,15 +327,18 @@ For a full training step TODAY use `--dtype fp8_path_c` or `--dtype bfloat16`.
 * `_run_existing_training` emits a `blocked_receipt(... NVFP4_E2E_TRAINING_
   BLOCKER_TYPE)` with the precise reason.
 * `nvfp4_te_gemm_probe(run_backward=True)` RAISES
-  `Nvfp4CudaKernelMiscompiled` on the broken gb10 backward (arch-specific PTX),
-  rather than returning the masked/garbage gradients TE would otherwise hand
-  back. No silent fallback exists anywhere in the route.
+  `Nvfp4CudaKernelMiscompiled` on the broken gb10 **default-recipe** backward
+  (arch-specific PTX), rather than returning the masked/garbage gradients TE
+  would otherwise hand back. The **reduced RtN** backward
+  (`nvfp4_te_backward_rtn_probe()`) is gated on a numeric dgrad rel-err `< 0.35`
+  and RAISES the same `Nvfp4CudaKernelMiscompiled` if it ever mis-executes —
+  it is enabled only when the gate passes. No silent fallback exists anywhere.
 
 ---
 
 ## 6. The test we added and its results
 
-Test: `tests/test_nvfp4_route.py` (10 tests). Backend-aware: always-on metadata
+Test: `tests/test_nvfp4_route.py` (12 tests). Backend-aware: always-on metadata
 + fail-loud assertions; Metal-only assertions skip when MLX/Metal absent; CUDA
 assertions run when torch+TE+CUDA+NVFP4 present.
 
@@ -279,27 +346,41 @@ assertions run when torch+TE+CUDA+NVFP4 present.
   `test_payload_advertises_both_forward_backends_and_no_e2e`,
   `test_reason_message_is_actionable`,
   `test_capability_probe_never_crashes_without_torch` — route metadata + probe.
+  Asserts the reduced RtN backward op is in `NVFP4_SUPPORTED_OPS` (and not
+  contradictorily in the unsupported list) and that the payload advertises the
+  working RtN recipe + nanochat provenance.
 * `test_fail_loud_guard_raises_for_nvfp4_and_names_missing_ops`,
   `test_fail_loud_guard_is_noop_for_other_dtypes` — RULE #1 gate.
 * `test_metal_forward_nvfp4_gemm_matches_bf16` — real Metal fwd GEMM < 0.5 rel.
 * `test_cuda_forward_nvfp4_gemm_matches_bf16` — **real gb10 NVFP4 fwd GEMM
   < 0.3 rel** (measured 0.147).
-* `test_cuda_backward_nvfp4_gemm_fails_loud_datacenter_only` — the broken gb10
-  backward RAISES `Nvfp4CudaKernelMiscompiled` naming the REAL, evidence-backed
-  blocker (SR cvt source-gated to `sm_100a`/`sm_103a`; RHT needs SM100
-  TMEM/`tcgen05` absent on sm_12x). The fail-loud is **permanent** on sm_12x
-  (no `NVFP4_BACKWARD_FIXED` escape hatch — a rebuild cannot fix it; §3b).
+* `test_cuda_reduced_rtn_backward_runs_and_matches_bf16` — **the reduced RtN
+  backward RUNS on gb10 and matches bf16** (dgrad/wgrad rel_err `< 0.35`;
+  measured 0.147 / 0.134). The numeric gate.
+* `test_cuda_reduced_rtn_backward_capability_gate_true_on_gb10` —
+  `nvfp4_backward_rtn_supported()` returns True on gb10.
+* `test_cuda_default_recipe_backward_nvfp4_gemm_fails_loud_datacenter_only` — the
+  broken gb10 **DEFAULT-recipe** backward RAISES `Nvfp4CudaKernelMiscompiled`
+  naming the REAL, evidence-backed blocker (SR cvt source-gated to
+  `sm_100a`/`sm_103a`; RHT needs SM100 TMEM/`tcgen05` absent on sm_12x). The
+  default-recipe fail-loud is **permanent** on sm_12x (a rebuild cannot fix it;
+  §3b-i) — the reduced RtN recipe is the escape (§3b-ii).
 
 **Results:**
 
-* Mac (this checkout): `7 passed, 3 skipped` — Metal skipped because the
+* Mac (this checkout): `7 passed, 5 skipped` — Metal skipped because the
   in-tree tilelang dev build (`merge/upstream-codegen-reorg`) has a tvm_ffi
   circular-import (pre-existing infra gap, unrelated to nvfp4); CUDA skipped (no
   CUDA on Mac). The Metal assertion is gated by a real tiny-GEMM smoke so it
   skips cleanly on a broken-tilelang host and runs where tilelang is healthy.
-* gb10 (`/home/dave/cppmega-venv`): **`9 passed, 1 skipped`** — Metal skipped (no
-  Apple GPU); the CUDA forward test PASSES (real nvfp4 GEMM, 0.147 rel) and the
-  CUDA backward fail-loud test PASSES (broken backward RAISES as designed).
+* gb10 (`/home/dave/cppmega-venv`, TE 2.16.0.dev0+a46079cb, sm_121,
+  2026-06-01): **`11 passed, 1 skipped`** — Metal skipped (no Apple GPU). The
+  CUDA forward test PASSES (real nvfp4 GEMM, 0.147 rel); the **reduced RtN
+  backward** test PASSES (`dgrad 0.1465 / wgrad 0.1343`, gate True); the
+  capability-gate test PASSES; and the **default-recipe** backward fail-loud test
+  PASSES (broken default backward RAISES as designed, run in an isolated
+  subprocess so its irrecoverable RHT-kernel context-corruption cannot poison the
+  in-process RtN test).
 
 Reproduce on gb10:
 
