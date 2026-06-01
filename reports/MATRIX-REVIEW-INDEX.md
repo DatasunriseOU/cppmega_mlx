@@ -43,14 +43,19 @@ gb10 1B, flag-OFF (serial `path_c`) → flag-ON (`path_c_chunked`, `CPPMEGA_PATH
 
 ## Fair comparison (goal #1) — RESOLVED with measured evidence
 
-The like-for-like **batch=4×seq=4096** comparison the goal asked for is **provably not achievable in MLX-eager on this model** — it OOMs. Measured on gb10 (121 GB unified), memory-guarded ramp:
+The like-for-like **batch=4×seq=4096** comparison the goal asked for is **not achievable in MLX-eager on this model** — measured, memory-guarded ramp on gb10 (121 GB unified), bf16 adamw, real tok/s:
 
-| config | result (gb10, bf16) |
-| --- | --- |
-| bs=1 × seq=512 (baseline) | path_b/path_c/path_c_chunked all run (full 54-cell matrix) |
-| **bs=2 × seq=512** | path_b **scales** (muon 92→159, adamw 156→259 tok/s); **path_c BLOCKED** — `direct_fusion_chain_training_runtime_missing` (Path-C direct-chain runtime is **bs=1-only** on CUDA) |
-| **bs=1 × seq=4096** (seq-matched to C++) | **OOM** — memory spiked 22→**121 GB** instantly, guard SIGTERM'd. MLX-eager cannot reach seq=4096 **even at batch=1** |
-| bs=4 × seq=4096 (the literal goal config) | **OOM** (≥100 GB), never completes |
+| config | path_b | path_c | peak mem | note |
+| --- | --- | --- | --- | --- |
+| bs=1 × seq=512 | 156 tok/s | **117 tok/s** ✅ | ~22 GB | the one shape path_c runs |
+| bs=2 × seq=512 | **259** ✅ | blocked | — | path_b scales w/ batch |
+| bs=1 × seq=1024 | **191** ✅ | blocked | 33 GB (path_b) | path_b scales w/ seq |
+| bs=1 × seq=4096 | **OOM (121 GB)** | OOM | — | dense MoE blows up |
+| bs=4 × seq=4096 (literal goal) | **OOM** | n/a | — | unreachable |
+
+(muon mirrors adamw: bs1→bs2 path_b 92→159.) Two independent, code-pinpointed walls:
+- **path_c (CUDA direct-chain) is pinned to exactly bs=1×seq=512** — it blocks at bs>1 *or* seq>512 with `direct_fusion_chain_logical_buffers_missing` (the fused direct-chain runtime was built for that one shape). So *steady-state path_c-vs-path_b at scale is unmeasurable* — path_c doesn't run off its build shape. **path_b runs everywhere and scales** with both batch (156→259) and seq (156→191).
+- **MLX-eager OOMs at seq=4096 even at bs=1** (121 GB) — root cause pinpointed in code: `cppmega_mlx/nn/moe.py:214` `ReferenceMoE` runs a **dense loop over all 16 experts on all tokens** (docstring: *"Dense ... reference suitable for smoke tests"*) + gather O(n²) reference sparse-MLA. C++/Megatron does the same bs=4×seq=4096 in **~26 GB** via sparse all-to-all MoE. **That ~5× memory ratio IS the concrete MLX-vs-C++ finding.**
 
 **Why MLX OOMs where C++ doesn't:** C++/Megatron does bs=4×seq=4096 in **~26 GB** (3700 tok/s) using **sparse all-to-all MoE**; the MLX path uses a **dense `ReferenceMoE`** that materializes all 16 experts (O(seq×experts)) plus gather-based O(n²)-memory reference sparse-MLA. So MLX-eager's memory blows up with seq, capping reachable seq well below 4096. **This is the concrete MLX-vs-C++ finding** — not a tuning gap but a different (reference vs production) MoE/attention implementation.
 
