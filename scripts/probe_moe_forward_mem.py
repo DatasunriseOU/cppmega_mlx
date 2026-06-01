@@ -48,7 +48,23 @@ def main() -> None:
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--backward", action="store_true", help="also run one backward")
     ap.add_argument("--vocab", type=int, default=65_536)
+    ap.add_argument(
+        "--grad-checkpoint",
+        dest="grad_checkpoint",
+        action="store_true",
+        default=None,
+        help="force grad-checkpoint on (default: on iff --backward)",
+    )
+    ap.add_argument(
+        "--no-grad-checkpoint",
+        dest="grad_checkpoint",
+        action="store_false",
+        help="force grad-checkpoint off",
+    )
     args = ap.parse_args()
+    # mx.checkpoint without a paired backward produces a malformed CUDA graph;
+    # only enable grad-checkpoint when a backward is actually run (or forced).
+    grad_ckpt = args.backward if args.grad_checkpoint is None else args.grad_checkpoint
 
     efficient = os.environ.get("CPPMEGA_MOE_EFFICIENT", "").strip().lower() in {
         "1",
@@ -57,7 +73,7 @@ def main() -> None:
         "yes",
     }
     t0 = time.time()
-    model = local_gb10_quarter(dtype=mx.bfloat16, grad_checkpoint=True)
+    model = local_gb10_quarter(dtype=mx.bfloat16, grad_checkpoint=grad_ckpt)
     mx.eval(model.parameters())
     mx.synchronize()
     build_s = time.time() - t0
@@ -97,6 +113,7 @@ def main() -> None:
         "batch": args.batch,
         "seq": args.seq,
         "backward": bool(args.backward),
+        "grad_checkpoint": bool(grad_ckpt),
         "build_s": round(build_s, 2),
         "run_s": round(run_s, 2),
         "after_params_peak_gb": round(after_params_gb, 3),
