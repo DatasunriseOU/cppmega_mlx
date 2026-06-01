@@ -133,10 +133,20 @@ Sources: `reports/cppmega_1b_speed_matrix_gb10_fastfused_20260601_b2s512.md`,
 | bs=2 × seq=512 | 1024 | **259** ✅ | **cannot run** | 27-32 (b)/17-22 (c attempt) | path_c blocks at bs>1 |
 | bs=1 × seq=1024 | 1024 | **191** ✅ | **cannot run** | 32.6 (b) | path_c blocks at seq>512 |
 | bs=1 × seq=1024 (eff. MoE) | 1024 | 166 ✅ | n/a | 32.8 | `CPPMEGA_MOE_EFFICIENT=1`, loss 11.29→5.65 |
-| bs=1 × seq=4096 | 16384 | **cannot run** | n/a | fwd-only 4.9; fwd+bwd+adamw **97+** | backward+optimizer burst > 105 GB cap |
-| bs=4 × seq=4096 (Megatron config) | 16384 | **cannot run** | n/a | — | unreachable (bwd+opt burst) |
+| bs=1 × seq=4096 | 16384 | **cannot run** (monolithic) | n/a | fwd-only 4.9; fwd+bwd+adamw **97+** | backward+optimizer burst > 105 GB cap |
+| bs=4 × seq=4096 (Megatron config) | 16384 | **cannot run** (monolithic) | n/a | OOM @114 | unreachable as ONE monolithic step (bwd+opt burst) |
+| **bs=4 × seq=4096 + PR-2 grad-accum=4** | **16384** | **514 tok/s** ✅ | n/a | **64.93** (active 3.05) | **NOW REACHABLE** — loop-level grad-accum (`05e53d8`, dense pattern=A, hidden=2048/depth=24/542.5M, Adam8bit) |
 
 (muon mirrors adamw on scale: bs1→bs2 path_b 92→159.)
+
+> **PR-2 update (2026-06-02, FUSED-PIPELINE-ROADMAP §4/§5, commit `05e53d8`):** the bs=4×seq=4096 step is
+> **no longer unreachable**. The 116/114 GB monolithic burst was a *loop/graph* problem (whole fwd+bwd+update
+> forced at one terminal `mx.eval`), not a kernel one. `one_step_train` now supports env-gated, numerically
+> equivalent **gradient accumulation** (split the batch into N microbatches, `mx.eval`-and-drop each micro's
+> graph before the next). At N=4 + Adam8bit the Megatron-shape step lands at **64.93 GiB peak (active 3.05 GiB),
+> ~514 tok/s, loss finite + decreasing** — measured live on gb10, well under the 100 GB box budget. The residual
+> ~65 GiB peak is the MLX-CUDA **allocator high-water mark**, not the live working set (3 GiB); driving it to the
+> 30–40 GiB target needs allocator-limit pinning / Relax whole-step liveness (roadmap §4), not more grad-accum.
 
 ---
 
@@ -171,10 +181,14 @@ batch-amortization delta — it is **not** closeable to a single clean factor be
    So a steady-state path_c-vs-path_b-at-scale comparison is **unmeasurable**; path_c simply doesn't run off its
    build shape. The Path-C win is therefore **compile-time only** (1.15-2.0× faster first-step / kernel build),
    not steady-state throughput at bs=1.
-2. **path_b runs everywhere and scales** (156→259 with batch, 156→191 with seq) but **cannot reach seq=4096**:
-   the seq=4096 **forward fits in 4.9 GB**, but the **eager backward + AdamW first-update bursts to ~97 GB**
-   (gradients + m/v optimizer state + recomputed grad-checkpoint activations all materialize at once) — over the
-   105 GB SIGTERM safety cap. So bs=4×seq=4096 (and even bs=1×seq=4096 fwd+bwd) is unreachable in MLX-eager.
+2. **path_b runs everywhere and scales** (156→259 with batch, 156→191 with seq); seq=4096 was **unreachable as a
+   single monolithic step** — the seq=4096 forward fits in 4.9 GB, but the eager backward + AdamW first-update
+   burst to ~97–114 GB (gradients + m/v optimizer state + recomputed grad-checkpoint activations all materialize
+   at once), over the safety cap. **PR-2 (commit `05e53d8`) makes it reachable:** loop-level gradient accumulation
+   (N microbatches, `mx.eval`-and-drop per micro — numerically equivalent to the full-batch step) drops the
+   activation term ~linearly with N, so **bs=4×seq=4096 now runs at 64.93 GiB peak / ~514 tok/s** (live gb10,
+   dense pattern=A, hidden=2048/depth=24/542.5M, Adam8bit). The remaining ~65 GiB is the allocator high-water mark
+   (live set 3 GiB), not the activation burst — see roadmap §4 PR-2 for the 30–40 GiB durable path.
 3. The wall is the **whole-model backward+optimizer burst, NOT the MoE** — measured: efficient sparse MoE and
    dense MoE have the same ~32.6/32.8 GB peak at seq=1024 (MoE is only 4 of 13 layers). Megatron does bs=4×seq=4096
    in ~26 GB because its fused training step (activation checkpointing + a fused optimizer that never

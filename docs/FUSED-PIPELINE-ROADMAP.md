@@ -135,8 +135,27 @@ All paths under `/Volumes/external/sources/tilelang/examples/`. Effort tags: Low
 
 ### PR-2 — The memory-loop fix (grad-accum + selective checkpoint barrier + 8-bit optimizer)
 **Highest mem ROI, smallest diff.** Independent of PR-1; can land in parallel.
+**STATUS (2026-06-02): LANDED + MEASURED ON gb10 (commit `05e53d8`). bs=4×seq=4096 went OOM→FITS.**
 - **First step:** wire `grad_accum_steps` (scaffolding at `checkpoint.py:101-104`) into `one_step_train` (`loop.py`) with `mx.eval(grads)`-and-drop per microbatch; add `mx.eval(hidden_states)` barrier after each attention-only checkpointed layer; switch optimizer to `optimizers_quantized.py`; call `maybe_clear_cache_after_step` (`runtime/memory.py:191`) each step.
 - **Unblocks:** seq=4096 step 116 GB → 30–40 GB on gb10 — makes the real production config (bs4×seq4096) *reachable* on a single box without waiting for Relax.
+
+**What landed (`05e53d8`, all env-gated, default = prior behavior — RULE #1):**
+- `one_step_train` (`loop.py`): `grad_accum_steps` kwarg / `GRAD_ACCUM_STEPS` env (default 1 = byte-identical to the prior single-`mx.eval` step). When N>1: split the batch into N microbatches, run `value_and_grad` per micro, `mx.eval` the **token-weighted** running accumulator as a free-barrier, drop each micro's fwd/bwd graph before the next. Optional `clear_cache` hook.
+- `hybrid_lm.py`: opt-in `mx.eval(hidden_states)` after each grad-checkpointed layer (`CPPMEGA_MLX_CHECKPOINT_EVAL_BARRIER=1`, default OFF) — converts the previously no-op checkpoint into a real free-barrier.
+- 8-bit optimizer (`make_adam8bit`) + `maybe_clear_cache_after_step` already wired in `train_hybrid_tiny.py`; probe `scripts/pr2_seq4096_memory_probe.py` exposes `--opt adam8bit`.
+
+**Numeric equivalence (RULE #1, verified on Mac, `scratch/pr2_grad_accum_equivalence.py`):** N=4 micro vs full-batch → loss abs-diff **0.0**, worst grad rel-diff **2.8e-7**, post-step param rel-diff **1.2e-7**; checkpoint barrier ON vs OFF → grads **bitwise identical**. Token-weighting (`weight = n_i / N_total`) makes `sum_i weight_i · grad_i` exactly the full-batch grad for a token-mean loss. 165 loop/compiled/gradient/checkpoint tests pass.
+
+**Measured peak — gb10, seq=4096, dense pattern=A, hidden=2048 / depth=24 / 542.5M params** (peak = `mx.get_peak_memory`; 100 GB box budget; `free -g` cross-check; watchdog SIGTERM @100 G):
+
+| config | grad_accum | optimizer | active GiB | peak GiB | tok/s | fits ≤100 G? |
+|---|---|---|---|---|---|---|
+| bs=4×seq4096 monolithic (BEFORE) | 1 | AdamW | — | **OOM (SIGTERM @114 G)** | — | **NO** |
+| bs=4×seq4096 (AFTER) | 4 | AdamW | 6.06 | **67.94** | 526 | **YES** |
+| bs=4×seq4096 = Megatron config | 4 | Adam8bit | **3.05** | **64.93** | 514 | **YES** |
+| bs=8×seq4096 (2× prod batch) | 8 | Adam8bit | 3.05 | 64.93 | 516 | YES |
+
+**Result:** the real `bs=4×seq=4096` step went from **OOM (>114 GB, watchdog-killed)** to **67.94 GiB — it now fits on a single gb10**, loss finite + decreasing (10.54→10.29), ~526 tok/s. Active working set drops **linearly with N** (6.06 GiB @ N=4 → 3.05 GiB @ N=8), confirming the activation lever. The ~64–68 GiB *peak* is the **allocator high-water mark, not the live set** (active is 3–6 GiB) — `clear_cache` trims but the CUDA-MLX allocator/graph-cache holds the high-water mark. **Honest floor:** loop-level levers land the seq=4096 step at **~62–68 GiB peak — well under the 100 GB box budget, above the 30–40 GiB stretch target.** Reaching 30–40 GiB *peak* needs allocator-limit pinning (`apply_memory_limit_plan` / `MLX_CUDA_GRAPH_CACHE_SIZE`) and/or the durable Relax whole-step liveness (§4); the dominant residual term is the **allocator high-water mark / static param+optimizer block**, not activations (which grad-accum already collapses).
 
 ### PR-3 — Auto-fusion / block-registry (the Megatron-spec equivalent)
 **The composability layer.** Depends on PR-1's brick descriptors existing.
