@@ -2255,28 +2255,39 @@ class HybridTinyLM(nn.Module):
                     expand_heads=True,
                 )
         if self.config.grad_checkpoint:
-            # Use nn.utils.checkpoint (NOT mx.checkpoint). mx.checkpoint(module)
-            # only checkpoints w.r.t. the call's array inputs and does NOT thread
-            # the module's trainable parameters through the recompute, so under
-            # nn.value_and_grad it silently DROPS gradients for some params (the
-            # whole final MoE layer's expert weights, conv_bias, rope_inv_freq —
-            # verified |g|>0 without checkpoint, ==0 with mx.checkpoint). It also
-            # makes the additive attention mask a differentiable checkpoint input,
-            # tripping "scaled_dot_product_attention does not support VJP w.r.t.
-            # mask" on CUDA. nn.utils.checkpoint(module) checkpoints w.r.t. the
-            # module's trainable parameters AND inputs (threads params via
-            # module.trainable_parameters()), giving bitwise-correct gradients
-            # (dloss=0, grad max_rel=0) and not differentiating the mask.
+            # Activation checkpointing. Two requirements, both load-bearing:
+            #
+            # 1. Use ``nn.utils.checkpoint`` (NOT ``mx.checkpoint``).
+            #    ``mx.checkpoint(module)`` only checkpoints w.r.t. the call's
+            #    array inputs and does NOT thread the module's trainable params
+            #    through the recompute, so under ``nn.value_and_grad`` it
+            #    silently DROPS gradients for many params (verified: the whole
+            #    final MoE layer's expert + shared_expert weights, conv_bias,
+            #    rope_inv_freq → |grad|==0 with mx.checkpoint, |grad|>0 without,
+            #    loss identical so the bug was invisible to a loss-only check).
+            #    ``nn.utils.checkpoint(module, fn)`` threads params via
+            #    ``module.trainable_parameters()`` → bitwise-correct grads.
+            #
+            # 2. Pass the attention ``mask`` (and ``doc_ids``) via a CLOSURE,
+            #    not as a checkpointed positional input. Otherwise MLX takes a
+            #    VJP w.r.t. the additive mask and CUDA's
+            #    scaled_dot_product_attention raises "does not support VJP with
+            #    respect to mask" — the real blocker for grad-checkpointed
+            #    Path-B training on gb10. The mask is a constant; closing over
+            #    it keeps it out of the differentiated input set while params +
+            #    ``hidden_states`` are still recomputed.
             for layer_index, layer in enumerate(self.layers):
                 if stop_layer_index is not None and layer_index >= stop_layer_index:
                     break
-                checkpointed = nn.utils.checkpoint(layer)
                 if layer.backend == "engram" and document_ids is not None:
-                    hidden_states = checkpointed(
-                        hidden_states, mask, doc_ids=document_ids
+                    fn = (
+                        lambda hs, _layer=layer, _mask=mask, _doc=document_ids: _layer(
+                            hs, _mask, doc_ids=_doc
+                        )
                     )
                 else:
-                    hidden_states = checkpointed(hidden_states, mask)
+                    fn = lambda hs, _layer=layer, _mask=mask: _layer(hs, _mask)
+                hidden_states = nn.utils.checkpoint(layer, fn)(hidden_states)
         else:
             attention_layer_idx = 0
             for layer_index, layer in enumerate(self.layers):
