@@ -167,6 +167,24 @@ def _path_c_runtime_status() -> tuple[bool, str]:
     return _tilelang_importable()
 
 
+def _device_can_run_metal() -> bool:
+    """True iff the live MLX device is an Apple GPU with a working Metal backend.
+
+    The single device->target switch for Path C: when this is True the kernel
+    compiles for ``target='metal'`` (tvm_ffi, the existing Apple path); when it
+    is False (e.g. the CUDA gb10 host where ``mx.default_device()`` is the CUDA
+    gpu but ``mx.metal.is_available()`` is False) Path C must compile for
+    ``target='cuda'`` via the host ``_cuda_eager`` bridge, otherwise the
+    Metal-compiled tvm_ffi kernel raises ``DLPackDeviceError`` on CUDA arrays.
+    """
+    metal = getattr(mx, "metal", None)
+    return (
+        mx.default_device() == mx.gpu
+        and metal is not None
+        and metal.is_available()
+    )
+
+
 def _gdn_fwd_path_c_call(
     q: mx.array,
     k: mx.array,
@@ -180,10 +198,45 @@ def _gdn_fwd_path_c_call(
 ):
     """Path C entry — same signature as ``naive_recurrent_gated_delta_rule``.
 
+    Device-aware target: on Apple (Metal available) compile the TileLang
+    prim_func for ``target='metal'`` (tvm_ffi). On a CUDA host (Metal
+    unavailable, ``mx.default_device()`` is the CUDA gpu) compile the same
+    recurrence for ``target='cuda'`` via the host ``_cuda_eager`` bridge —
+    feeding CUDA MLX arrays into the Metal-compiled kernel would otherwise
+    raise ``DLPackDeviceError`` (kernel requires kDLMetal).
+
     On any failure (tilelang missing, compile error, runtime error) raises
     ``RuntimeError`` so the caller can fall back to Path A.
     """
     import math
+
+    # CUDA EAGER branch: Metal is unavailable, so the Metal/tvm_ffi kernel
+    # cannot accept the CUDA-resident MLX arrays. Compile the same GDN
+    # gated-delta recurrence with target='cuda' (host _cuda_eager bridge).
+    if not _device_can_run_metal():
+        from cppmega_mlx.nn._tilelang._cuda_eager import (
+            cuda_eager_available,
+            gdn_fwd_cuda_eager,
+        )
+
+        cuda_ok, cuda_reason = cuda_eager_available()
+        if not cuda_ok:
+            raise RuntimeError(
+                "GDN Path C: Metal backend unavailable and TileLang-CUDA "
+                f"EAGER path also unavailable: {cuda_reason}"
+            )
+        result = gdn_fwd_cuda_eager(
+            q, k, v, beta, g,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+        if result is None:
+            raise RuntimeError(
+                "GDN Path C: TileLang-CUDA EAGER dispatch returned None "
+                "(cuda_eager_available() was True — this is a bug)"
+            )
+        return result
 
     B, T_, H, K_dim = q.shape
     V_dim = v.shape[-1]

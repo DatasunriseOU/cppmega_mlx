@@ -134,6 +134,23 @@ def _path_c_runtime_status() -> tuple[bool, str]:
     return _tilelang_importable()
 
 
+def _device_can_run_metal() -> bool:
+    """True iff the live MLX device is an Apple GPU with a working Metal backend.
+
+    The single device->target switch for KDA Path C: True -> ``target='metal'``
+    (tvm_ffi, Apple); False -> ``target='cuda'`` via the host ``_cuda_eager``
+    bridge (CUDA gb10 host where ``mx.metal.is_available()`` is False but the
+    default device is the CUDA gpu). Feeding CUDA MLX arrays into the
+    Metal-compiled tvm_ffi kernel would otherwise raise ``DLPackDeviceError``.
+    """
+    metal = getattr(mx, "metal", None)
+    return (
+        mx.default_device() == mx.gpu
+        and metal is not None
+        and metal.is_available()
+    )
+
+
 def _kda_fwd_path_c_call(
     q: mx.array,
     k: mx.array,
@@ -145,8 +162,41 @@ def _kda_fwd_path_c_call(
     initial_state: Optional[mx.array] = None,
     output_final_state: bool = False,
 ):
-    """KDA Path C entry — same signature as ``naive_recurrent_kda``."""
+    """KDA Path C entry — same signature as ``naive_recurrent_kda``.
+
+    Device-aware target: on Apple compile for ``target='metal'`` (tvm_ffi); on
+    a CUDA host compile the same recurrence for ``target='cuda'`` via the host
+    ``_cuda_eager`` bridge.
+    """
     import math
+
+    # CUDA EAGER branch: see GDN Path C for rationale (DLPackDeviceError on CUDA
+    # MLX arrays fed to the Metal/tvm_ffi kernel). Compile the same KDA
+    # recurrence with target='cuda'.
+    if not _device_can_run_metal():
+        from cppmega_mlx.nn._tilelang._cuda_eager import (
+            cuda_eager_available,
+            kda_fwd_cuda_eager,
+        )
+
+        cuda_ok, cuda_reason = cuda_eager_available()
+        if not cuda_ok:
+            raise RuntimeError(
+                "KDA Path C: Metal backend unavailable and TileLang-CUDA "
+                f"EAGER path also unavailable: {cuda_reason}"
+            )
+        result = kda_fwd_cuda_eager(
+            q, k, v, g, beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+        )
+        if result is None:
+            raise RuntimeError(
+                "KDA Path C: TileLang-CUDA EAGER dispatch returned None "
+                "(cuda_eager_available() was True — this is a bug)"
+            )
+        return result
 
     B, T_, H, K_dim = q.shape
     HV, V_dim = v.shape[2], v.shape[-1]

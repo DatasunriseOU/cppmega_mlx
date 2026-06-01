@@ -1366,6 +1366,367 @@ def m2rnn_supported_cuda_eager() -> tuple[bool, str]:
     return cuda_eager_available()
 
 
+# ---------------------------------------------------------------------------
+# GDN gated-delta (linear-attention Path C) — CUDA-safe per-lane recurrence
+# ---------------------------------------------------------------------------
+#
+# The v4 GDN Path C forward
+# (``cppmega_v4._tilelang.linear_attention_path_c._fwd_kernel_for``) is a
+# per-(b, head, v) lane sequential delta-rule scan compiled with
+# ``tilelang.compile(target='metal', execution_backend='tvm_ffi')``. On a CUDA
+# host MLX has no Metal backend, so feeding CUDA MLX arrays into that
+# Metal-compiled tvm-ffi kernel raises ``DLPackDeviceError`` (the kernel only
+# accepts ``kDLMetal`` arrays). This branch compiles the *same* recurrence with
+# ``target='cuda'`` and bridges MLX<->torch CUDA via the numpy host roundtrip,
+# exactly like the mamba3/sparse_mla CUDA EAGER paths above.
+#
+# The Metal prim uses ``T.alloc_var(T.float32, init=0.0)`` for the ``kth_S_j``
+# and ``out`` scalar accumulators, which nvcc rejects (non-lvalue
+# ``float v = 0``). We vendor a CUDA-safe copy that uses one-slot
+# ``T.alloc_local`` accumulators instead; the recurrence math, lane mapping and
+# (y, h_last) buffer layout are byte-for-byte identical to the Metal prim.
+#
+# Defined at module scope (no ``from __future__ import annotations``) so the
+# ``@T.prim_func`` ``get_type_hints`` re-evaluation resolves the shape names.
+
+
+def _gdn_threads_for(lanes: int) -> int:
+    for tg in (256, 192, 128, 96, 64, 32):
+        if lanes % tg == 0:
+            return tg
+    return 32
+
+
+def _make_gdn_fwd_cuda_prim(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM_K: int,
+    HEADDIM_V: int,
+) -> Any:
+    """CUDA-safe GDN gated-delta forward (y, h_last) prim_func (fp32 carriers).
+
+    Mirrors ``linear_attention_path_c._fwd_kernel_for``'s ``fwd`` recurrence
+    exactly (alpha decay -> K·S reduction -> delta correction -> rank-1 outer
+    add + q·S projection), with one-slot ``T.alloc_local`` scalar accumulators
+    so CUDA codegen accepts it.
+    """
+
+    import tilelang.language as T
+
+    LANES = BATCH * HEADS * HEADDIM_V
+    THREADS = _gdn_threads_for(LANES)
+    ad = "float32"
+
+    @T.prim_func
+    def fwd(
+        q: T.Tensor((BATCH, SEQ, HEADS, HEADDIM_K), "float32"),
+        k: T.Tensor((BATCH, SEQ, HEADS, HEADDIM_K), "float32"),
+        v: T.Tensor((BATCH, SEQ, HEADS, HEADDIM_V), "float32"),
+        beta: T.Tensor((BATCH, SEQ, HEADS), "float32"),
+        g: T.Tensor((BATCH, SEQ, HEADS), "float32"),
+        h0: T.Tensor((BATCH, HEADS, HEADDIM_K, HEADDIM_V), "float32"),
+        y: T.Tensor((BATCH, SEQ, HEADS, HEADDIM_V), "float32"),
+        h_last: T.Tensor((BATCH, HEADS, HEADDIM_K, HEADDIM_V), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
+            tid = T.get_thread_binding(0)
+            global_lane = bx * THREADS + tid
+            h_state = T.alloc_local((HEADDIM_K,), ad)
+            kth_S_j = T.alloc_local((1,), ad)
+            out = T.alloc_local((1,), ad)
+            if global_lane < LANES:
+                vj = global_lane % HEADDIM_V
+                head = (global_lane // HEADDIM_V) % HEADS
+                bb = global_lane // (HEADDIM_V * HEADS)
+                for i in T.serial(HEADDIM_K):
+                    h_state[i] = h0[bb, head, i, vj]
+                for t in T.serial(SEQ):
+                    g_val = g[bb, t, head]
+                    beta_val = beta[bb, t, head]
+                    decay = T.exp(g_val)
+                    v_j = v[bb, t, head, vj]
+                    kth_S_j[0] = 0.0
+                    for i in T.serial(HEADDIM_K):
+                        h_state[i] = h_state[i] * decay
+                        kth_S_j[0] = kth_S_j[0] + k[bb, t, head, i] * h_state[i]
+                    v_eff = beta_val * (v_j - kth_S_j[0])
+                    out[0] = 0.0
+                    for i in T.serial(HEADDIM_K):
+                        k_i = k[bb, t, head, i]
+                        q_i = q[bb, t, head, i]
+                        h_state[i] = h_state[i] + k_i * v_eff
+                        out[0] = out[0] + q_i * h_state[i]
+                    y[bb, t, head, vj] = out[0]
+                for i in T.serial(HEADDIM_K):
+                    h_last[bb, head, i, vj] = h_state[i]
+
+    return fwd
+
+
+@functools.lru_cache(maxsize=128)
+def _gdn_fwd_cuda_kernel(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HEADDIM_K: int,
+    HEADDIM_V: int,
+) -> Any:
+    """Compile the CUDA-safe GDN gated-delta forward (caller-owned y/h_last)."""
+
+    import tilelang
+
+    prim = _make_gdn_fwd_cuda_prim(BATCH, SEQ, HEADS, HEADDIM_K, HEADDIM_V)
+    return tilelang.compile(prim, target="cuda", out_idx=None)
+
+
+def gdn_fwd_cuda_eager(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    beta: mx.array,
+    g: mx.array,
+    *,
+    scale: float | None = None,
+    initial_state: mx.array | None = None,
+    output_final_state: bool = False,
+) -> tuple[mx.array, mx.array | None] | None:
+    """TileLang-CUDA EAGER GDN gated-delta forward -> ``(y, h_last|None)``.
+
+    Same contract as ``naive_recurrent_gated_delta_rule`` /
+    ``_gdn_fwd_path_c_call``: ``q/k:[B,T,H,K]``, ``v:[B,T,H,V]``,
+    ``beta/g:[B,T,H]``, optional ``initial_state:[B,H,K,V]``. FLA pre-scales
+    ``q *= scale`` (default ``1/sqrt(K)``). fp32 carriers (the production fp32
+    EAGER carrier path). Returns ``None`` only when the CUDA EAGER path is
+    *unavailable* (so the caller can route to a documented guard); any kernel
+    launch/writeback failure RAISES (RULE #1).
+    """
+
+    import math
+
+    ok, _reason = cuda_eager_available()
+    if not ok:
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+
+    B, T_, H, K_dim = (int(x) for x in q.shape)
+    V_dim = int(v.shape[-1])
+    fla_scale = scale if scale is not None else 1.0 / math.sqrt(K_dim)
+
+    qf = (q.astype(mx.float32) * fla_scale).astype(mx.float32)
+    kf = k.astype(mx.float32)
+    vf = v.astype(mx.float32)
+    betaf = beta.astype(mx.float32)
+    gf = g.astype(mx.float32)
+    if initial_state is None:
+        h0f = mx.zeros((B, H, K_dim, V_dim), dtype=mx.float32)
+    else:
+        h0f = initial_state.astype(mx.float32)
+
+    try:
+        kernel = _gdn_fwd_cuda_kernel(B, T_, H, K_dim, V_dim)
+        q_t = _mlx_to_torch_cuda(qf)
+        k_t = _mlx_to_torch_cuda(kf)
+        v_t = _mlx_to_torch_cuda(vf)
+        beta_t = _mlx_to_torch_cuda(betaf)
+        g_t = _mlx_to_torch_cuda(gf)
+        h0_t = _mlx_to_torch_cuda(h0f)
+        y_t = torch.zeros(B, T_, H, V_dim, dtype=torch.float32, device="cuda")
+        hl_t = torch.zeros(B, H, K_dim, V_dim, dtype=torch.float32, device="cuda")
+        kernel(q_t, k_t, v_t, beta_t, g_t, h0_t, y_t, hl_t)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the
+        # vendored GDN gated-delta fwd kernel, not "feature absent". Raise
+        # loud instead of returning None into a silent pure-MLX scan fallback.
+        raise RuntimeError(
+            f"_cuda_eager.gdn_fwd_cuda_eager: TileLang-CUDA GDN gated-delta "
+            f"fwd kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
+
+    y = _torch_cuda_to_mlx(y_t, q.dtype)
+    h_last = _torch_cuda_to_mlx(hl_t, mx.float32) if output_final_state else None
+    return y, h_last
+
+
+def gdn_supported_cuda_eager() -> tuple[bool, str]:
+    """Report whether the GDN TileLang-CUDA EAGER forward can dispatch."""
+
+    return cuda_eager_available()
+
+
+# ---------------------------------------------------------------------------
+# KDA recurrent (Path C) — CUDA-safe per-lane recurrence
+# ---------------------------------------------------------------------------
+#
+# Mirrors ``kda_path_c._kda_fwd_kernel_for``'s ``fwd``: per-(b, hv, v) lane
+# scan with per-K vectorized log-gate decay. Same CUDA adaptation as GDN:
+# one-slot ``T.alloc_local`` accumulators replace ``T.alloc_var(init=)``.
+
+
+def _make_kda_fwd_cuda_prim(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HV: int,
+    HEADDIM_K: int,
+    HEADDIM_V: int,
+) -> Any:
+    """CUDA-safe KDA recurrent forward (y, h_last) prim_func (fp32 carriers)."""
+
+    import tilelang.language as T
+
+    assert HV % HEADS == 0, f"HV ({HV}) must be divisible by HEADS ({HEADS})"
+    GROUP = HV // HEADS
+    LANES = BATCH * HV * HEADDIM_V
+    THREADS = _gdn_threads_for(LANES)
+    ad = "float32"
+
+    @T.prim_func
+    def fwd(
+        q: T.Tensor((BATCH, SEQ, HEADS, HEADDIM_K), "float32"),
+        k: T.Tensor((BATCH, SEQ, HEADS, HEADDIM_K), "float32"),
+        v: T.Tensor((BATCH, SEQ, HV, HEADDIM_V), "float32"),
+        g: T.Tensor((BATCH, SEQ, HV, HEADDIM_K), "float32"),
+        beta: T.Tensor((BATCH, SEQ, HV), "float32"),
+        h0: T.Tensor((BATCH, HV, HEADDIM_K, HEADDIM_V), "float32"),
+        y: T.Tensor((BATCH, SEQ, HV, HEADDIM_V), "float32"),
+        h_last: T.Tensor((BATCH, HV, HEADDIM_K, HEADDIM_V), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(LANES, THREADS), threads=THREADS) as bx:
+            tid = T.get_thread_binding(0)
+            global_lane = bx * THREADS + tid
+            h_state = T.alloc_local((HEADDIM_K,), ad)
+            kth_S_j = T.alloc_local((1,), ad)
+            out = T.alloc_local((1,), ad)
+            if global_lane < LANES:
+                vj = global_lane % HEADDIM_V
+                hv_idx = (global_lane // HEADDIM_V) % HV
+                bb = global_lane // (HEADDIM_V * HV)
+                h_idx = hv_idx // GROUP
+                for i in T.serial(HEADDIM_K):
+                    h_state[i] = h0[bb, hv_idx, i, vj]
+                for t in T.serial(SEQ):
+                    beta_val = beta[bb, t, hv_idx]
+                    v_j = v[bb, t, hv_idx, vj]
+                    kth_S_j[0] = 0.0
+                    for i in T.serial(HEADDIM_K):
+                        decay_i = T.exp(g[bb, t, hv_idx, i])
+                        h_state[i] = h_state[i] * decay_i
+                        kth_S_j[0] = kth_S_j[0] + k[bb, t, h_idx, i] * h_state[i]
+                    inner_j = v_j - kth_S_j[0]
+                    out[0] = 0.0
+                    for i in T.serial(HEADDIM_K):
+                        k_i = k[bb, t, h_idx, i]
+                        q_i = q[bb, t, h_idx, i]
+                        h_state[i] = h_state[i] + beta_val * k_i * inner_j
+                        out[0] = out[0] + q_i * h_state[i]
+                    y[bb, t, hv_idx, vj] = out[0]
+                for i in T.serial(HEADDIM_K):
+                    h_last[bb, hv_idx, i, vj] = h_state[i]
+
+    return fwd
+
+
+@functools.lru_cache(maxsize=128)
+def _kda_fwd_cuda_kernel(
+    BATCH: int,
+    SEQ: int,
+    HEADS: int,
+    HV: int,
+    HEADDIM_K: int,
+    HEADDIM_V: int,
+) -> Any:
+    """Compile the CUDA-safe KDA recurrent forward (caller-owned y/h_last)."""
+
+    import tilelang
+
+    prim = _make_kda_fwd_cuda_prim(BATCH, SEQ, HEADS, HV, HEADDIM_K, HEADDIM_V)
+    return tilelang.compile(prim, target="cuda", out_idx=None)
+
+
+def kda_fwd_cuda_eager(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    *,
+    scale: float | None = None,
+    initial_state: mx.array | None = None,
+    output_final_state: bool = False,
+) -> tuple[mx.array, mx.array | None] | None:
+    """TileLang-CUDA EAGER KDA recurrent forward -> ``(y, h_last|None)``.
+
+    Same contract as ``naive_recurrent_kda`` / ``_kda_fwd_path_c_call``:
+    ``q/k:[B,T,H,K]``, ``v:[B,T,HV,V]``, ``g:[B,T,HV,K]``, ``beta:[B,T,HV]``,
+    optional ``initial_state:[B,HV,K,V]``. FLA pre-scales ``q *= scale``
+    (default ``1/sqrt(K)``). fp32 carriers. Returns ``None`` only when the
+    CUDA EAGER path is *unavailable*; any kernel failure RAISES (RULE #1).
+    """
+
+    import math
+
+    ok, _reason = cuda_eager_available()
+    if not ok:
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+
+    B, T_, H, K_dim = (int(x) for x in q.shape)
+    HV = int(v.shape[2])
+    V_dim = int(v.shape[-1])
+    fla_scale = scale if scale is not None else 1.0 / math.sqrt(K_dim)
+
+    qf = (q.astype(mx.float32) * fla_scale).astype(mx.float32)
+    kf = k.astype(mx.float32)
+    vf = v.astype(mx.float32)
+    gf = g.astype(mx.float32)
+    betaf = beta.astype(mx.float32)
+    if initial_state is None:
+        h0f = mx.zeros((B, HV, K_dim, V_dim), dtype=mx.float32)
+    else:
+        h0f = initial_state.astype(mx.float32)
+
+    try:
+        kernel = _kda_fwd_cuda_kernel(B, T_, H, HV, K_dim, V_dim)
+        q_t = _mlx_to_torch_cuda(qf)
+        k_t = _mlx_to_torch_cuda(kf)
+        v_t = _mlx_to_torch_cuda(vf)
+        g_t = _mlx_to_torch_cuda(gf)
+        beta_t = _mlx_to_torch_cuda(betaf)
+        h0_t = _mlx_to_torch_cuda(h0f)
+        y_t = torch.zeros(B, T_, HV, V_dim, dtype=torch.float32, device="cuda")
+        hl_t = torch.zeros(B, HV, K_dim, V_dim, dtype=torch.float32, device="cuda")
+        kernel(q_t, k_t, v_t, g_t, beta_t, h0_t, y_t, hl_t)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        # RULE #1: a kernel launch/writeback failure is a real bug in the
+        # vendored KDA recurrent fwd kernel, not "feature absent". Raise loud
+        # instead of returning None into a silent pure-MLX scan fallback.
+        raise RuntimeError(
+            f"_cuda_eager.kda_fwd_cuda_eager: TileLang-CUDA KDA recurrent "
+            f"fwd kernel launch/writeback failed "
+            f"({type(exc).__name__}: {exc})."
+        ) from exc
+
+    y = _torch_cuda_to_mlx(y_t, q.dtype)
+    h_last = _torch_cuda_to_mlx(hl_t, mx.float32) if output_final_state else None
+    return y, h_last
+
+
+def kda_supported_cuda_eager() -> tuple[bool, str]:
+    """Report whether the KDA TileLang-CUDA EAGER forward can dispatch."""
+
+    return cuda_eager_available()
+
+
 __all__ = [
     "cuda_eager_available",
     "sparse_mla_fwd_cuda_eager",
@@ -1375,4 +1736,8 @@ __all__ = [
     "fp8_sparse_mla_apply_cuda_eager",
     "m2rnn_mapped_packed_post_fwd_cuda_eager",
     "m2rnn_supported_cuda_eager",
+    "gdn_fwd_cuda_eager",
+    "gdn_supported_cuda_eager",
+    "kda_fwd_cuda_eager",
+    "kda_supported_cuda_eager",
 ]
