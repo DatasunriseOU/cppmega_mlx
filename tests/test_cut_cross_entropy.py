@@ -426,15 +426,20 @@ def test_next_token_cut_cross_entropy_uses_hybrid_decoder_checkpoint(
     )
     checkpointed_layers: list[object] = []
 
-    def checkpoint_spy(fn):
-        checkpointed_layers.append(fn)
+    import mlx.nn as _nn
 
-        def wrapped(*args, **kwargs):
-            return fn(*args, **kwargs)
+    real_checkpoint = _nn.utils.checkpoint
 
-        return wrapped
+    def checkpoint_spy(module, fn=None):
+        # The decoder must checkpoint via nn.utils.checkpoint (which threads the
+        # module's trainable parameters through the recompute), NOT the bare
+        # mx.checkpoint (which silently drops parameter gradients and trips the
+        # SDPA-mask VJP). Record each checkpointed module and delegate to the
+        # real implementation so gradients stay correct.
+        checkpointed_layers.append(module)
+        return real_checkpoint(module, fn)
 
-    monkeypatch.setattr(mx, "checkpoint", checkpoint_spy)
+    monkeypatch.setattr(_nn.utils, "checkpoint", checkpoint_spy)
     loss, ntokens = next_token_cut_cross_entropy(
         model, _hybrid_tiny_batch(), chunk_rows=2
     )
@@ -479,6 +484,88 @@ def test_next_token_cut_cross_entropy_works_under_value_and_grad() -> None:
     assert isinstance(grads, dict)
     assert grads
 
+
+def test_grad_checkpoint_gradients_match_non_checkpoint() -> None:
+    """grad_checkpoint must be numerically equivalent (RULE #1).
+
+    Regression for the silent gradient-dropping bug: ``mx.checkpoint(module)``
+    does NOT thread the module's trainable parameters through the recompute, so
+    under ``nn.value_and_grad`` it returned ZERO gradients for some params
+    (verified: the final MoE layer's expert weights, conv_bias, rope_inv_freq).
+    The decoder now uses ``nn.utils.checkpoint`` which threads params correctly.
+    This test fails closed if a future change reintroduces the drop: grads with
+    grad_checkpoint=True must equal grads with grad_checkpoint=False.
+    """
+
+    import mlx.core as mx
+
+    def _flat(tree: object, prefix: str = "") -> dict[str, mx.array]:
+        out: dict[str, mx.array] = {}
+        if isinstance(tree, dict):
+            for key, val in tree.items():
+                out.update(_flat(val, f"{prefix}{key}."))
+        elif isinstance(tree, (list, tuple)):
+            for idx, val in enumerate(tree):
+                out.update(_flat(val, f"{prefix}{idx}."))
+        elif isinstance(tree, mx.array):
+            out[prefix] = tree
+        return out
+
+    base_kwargs = dict(
+        vocab_size=32,
+        hidden_size=16,
+        max_seq_length=8,
+        pattern="AEM",
+        depth=3,
+        num_attention_heads=2,
+        dsa_a_layer_ranks=(0,),
+        mamba_expand=1,
+        mamba_head_dim=8,
+        mamba_state_dim=8,
+        mamba_groups=1,
+        mamba_chunk_size=4,
+    )
+    mx.random.seed(7)
+    model_off = HybridTinyLM(
+        HybridTinyConfig(grad_checkpoint=False, **base_kwargs), dtype=mx.float32
+    )
+    mx.eval(model_off.parameters())
+    model_on = HybridTinyLM(
+        HybridTinyConfig(grad_checkpoint=True, **base_kwargs), dtype=mx.float32
+    )
+    model_on.update(model_off.parameters())
+    mx.eval(model_on.parameters())
+
+    batch = LMTokenBatch(
+        **{k: v for k, v in _hybrid_tiny_batch().items() if k != "document_ids"}
+    )
+
+    def loss_fn(model: HybridTinyLM, batch: LMTokenBatch) -> tuple[mx.array, mx.array]:
+        return next_token_cut_cross_entropy(model, batch, chunk_rows=2)
+
+    (loss_off, _), grads_off = nn.value_and_grad(model_off, loss_fn)(model_off, batch)
+    (loss_on, _), grads_on = nn.value_and_grad(model_on, loss_fn)(model_on, batch)
+    mx.eval(loss_off, grads_off, loss_on, grads_on)
+
+    assert math.isclose(_scalar(loss_off), _scalar(loss_on), rel_tol=0.0, abs_tol=1e-5)
+
+    flat_off = _flat(grads_off)
+    flat_on = _flat(grads_on)
+    assert set(flat_off) == set(flat_on)
+    worst_rel = 0.0
+    worst_key = ""
+    for key, g_off in flat_off.items():
+        a = g_off.astype(mx.float32)
+        b = flat_on[key].astype(mx.float32)
+        amax = float(mx.max(mx.abs(a)).item())
+        if amax < 1e-8:
+            continue
+        rel = float(mx.max(mx.abs(a - b)).item()) / (amax + 1e-8)
+        if rel > worst_rel:
+            worst_rel = rel
+            worst_key = key
+    # nn.utils.checkpoint recomputes exactly -> bitwise-equal grads here.
+    assert worst_rel < 1e-4, f"grad mismatch under checkpoint at {worst_key}: {worst_rel}"
 
 
 @pytest.mark.slow
