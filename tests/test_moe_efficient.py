@@ -29,28 +29,59 @@ from cppmega_mlx.nn import moe as moe_mod
 from cppmega_mlx.nn.moe import MoEConfig, ReferenceMoE
 
 
-def _is_cuda_backend() -> bool:
-    try:
-        return mx.default_device().type == mx.DeviceType.gpu and "cuda" in repr(
-            mx.default_device()
-        ).lower()
-    except Exception:
-        return False
+def _backend_reassociation_epsilon() -> float:
+    """Measure this backend's fp32 *gather-reorder* reassociation delta.
+
+    The Device repr is ``Device(gpu, 0)`` on BOTH Metal and CUDA, so backend
+    identity is not introspectable. Instead we measure the exact property that
+    drives the sparse-vs-dense parity delta: running the same expert FFN on the
+    same tokens but in a permuted (gathered) order and scattering back. Any
+    nonzero result is pure backend fp32 reduction-order rounding (the gather and
+    scatter themselves are bitwise exact — see the round-trip test). Metal is
+    (near-)associative here (~1e-7); CUDA cuBLAS is not (~1e-3). The parity
+    thresholds derive directly from this measured envelope, so the test
+    self-calibrates to whatever backend it runs on — no silent fudge.
+    """
+
+    mx.random.seed(123)
+    num_tokens, d_model, hidden = 256, 3584, 128
+    x = mx.random.normal((num_tokens, d_model)).astype(mx.float32)
+    w_in = mx.random.normal((hidden, d_model)).astype(mx.float32) * 0.02
+    w_out = mx.random.normal((d_model, hidden)).astype(mx.float32) * 0.02
+
+    def ffn(xx: mx.array) -> mx.array:
+        return nn.gelu_approx(xx @ w_in.T) @ w_out.T
+
+    direct = ffn(x)
+    perm = np.random.permutation(num_tokens).astype(np.int32)
+    idx = mx.array(perm)
+    gathered = ffn(mx.take(x, idx, axis=0))
+    reordered = mx.zeros((num_tokens, d_model), dtype=mx.float32).at[idx].add(gathered)
+    mx.eval(direct, reordered)
+    return float(mx.max(mx.abs(direct - reordered)))
 
 
-# fp32 reassociation envelope: Metal is (near-)associative; CUDA cuBLAS is not.
-# Measured: one reassociated K=3584 fp32 matmul differs ~3e-4 on CUDA; the swiglu
-# expert chain (two matmuls + gelu) compounds that into the low-e-3 range.
+# A non-associative backend (CUDA cuBLAS) yields ~1e-3 for the gathered FFN
+# reorder; Metal yields ~1e-7. Branch the parity tolerances on the measured
+# envelope; the dense-vs-sparse delta is the same kind of reordering, summed
+# across experts, so allow a small multiple over the single-chain epsilon.
+_BACKEND_REASSOC_EPS = _backend_reassociation_epsilon()
+_BACKEND_IS_NONASSOC = _BACKEND_REASSOC_EPS > 1e-5
+_FWD_TOL = 5e-3 if _BACKEND_IS_NONASSOC else 1e-5
+_INPUT_GRAD_TOL = 5e-3 if _BACKEND_IS_NONASSOC else 1e-5
+_PARAM_GRAD_TOL = 1e-2 if _BACKEND_IS_NONASSOC else 1e-4
+
+
 def _fwd_tol() -> float:
-    return 5e-3 if _is_cuda_backend() else 1e-5
+    return _FWD_TOL
 
 
 def _input_grad_tol() -> float:
-    return 5e-3 if _is_cuda_backend() else 1e-5
+    return _INPUT_GRAD_TOL
 
 
 def _param_grad_tol() -> float:
-    return 1e-2 if _is_cuda_backend() else 1e-4
+    return _PARAM_GRAD_TOL
 
 
 def _config(*, d_model: int = 3584, num_experts: int = 16, top_k: int = 4) -> MoEConfig:
