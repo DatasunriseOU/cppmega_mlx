@@ -21,6 +21,7 @@ from cppmega_mlx.data.batch import synthetic_token_batch
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.training.loop import one_step_train
 from cppmega_mlx.training.optimizers import make_adamw
+from cppmega_mlx.training.optimizers_quantized import make_adam8bit
 
 
 def _gib(n: int | None) -> float:
@@ -55,6 +56,7 @@ def main() -> None:
     ap.add_argument("--vocab", type=int, default=32000)
     ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--clear-cache", action="store_true")
+    ap.add_argument("--opt", choices=["adamw", "adam8bit"], default="adamw")
     ap.add_argument("--steps", type=int, default=2)
     args = ap.parse_args()
 
@@ -64,12 +66,13 @@ def main() -> None:
 
     model = build_model(args.hidden, args.depth, args.vocab, args.seq, args.grad_ckpt)
     nparams = sum(v.size for _, v in __import__("mlx.utils", fromlist=["tree_flatten"]).tree_flatten(model.parameters()))
-    opt = make_adamw(learning_rate=1e-4)
+    print(f"after-model-build peak={_gib(mx.get_peak_memory() if hasattr(mx,'get_peak_memory') else None):.2f}GiB")
+    opt = make_adam8bit(learning_rate=1e-4) if args.opt == "adam8bit" else make_adamw(learning_rate=1e-4)
     batch = synthetic_token_batch(batch_size=args.batch, seq_length=args.seq, vocab_size=args.vocab)
 
     print(f"config: seq={args.seq} batch={args.batch} grad_accum={args.grad_accum} "
           f"hidden={args.hidden} depth={args.depth} grad_ckpt={args.grad_ckpt} "
-          f"clear_cache={args.clear_cache} params={nparams/1e6:.1f}M")
+          f"opt={args.opt} clear_cache={args.clear_cache} params={nparams/1e6:.1f}M")
 
     for step in range(args.steps):
         t0 = time.perf_counter()
