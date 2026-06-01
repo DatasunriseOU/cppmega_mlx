@@ -52,6 +52,13 @@ def main() -> None:
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--vocab", type=int, default=65_536)
     ap.add_argument("--optimizer", action="store_true", help="also run AdamW update")
+    ap.add_argument(
+        "--grad-checkpoint",
+        dest="grad_checkpoint",
+        action="store_true",
+        default=False,
+        help="enable per-layer mx.checkpoint (default: off)",
+    )
     args = ap.parse_args()
 
     try:
@@ -63,7 +70,7 @@ def main() -> None:
         have_torch = False
 
     t0 = time.time()
-    model = local_gb10_quarter(dtype=mx.bfloat16, grad_checkpoint=True)
+    model = local_gb10_quarter(dtype=mx.bfloat16, grad_checkpoint=args.grad_checkpoint)
     mx.eval(model.parameters())
     mx.synchronize()
     build_s = time.time() - t0
@@ -112,6 +119,7 @@ def main() -> None:
         "mamba3_bwd_seq_chunk": os.environ.get("CPPMEGA_MAMBA3_BWD_SEQ_CHUNK") or None,
         "batch": args.batch,
         "seq": args.seq,
+        "grad_checkpoint": bool(args.grad_checkpoint),
         "optimizer": bool(args.optimizer),
         "build_s": round(build_s, 2),
         "run_s": round(run_s, 2),
