@@ -70,6 +70,83 @@ def _mamba3_mimo_apply_with_state_vjp(
     return mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
 
 
+@mx.custom_function
+def _mamba3_mimo_apply_with_state_cuda_eager(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Differentiable Path B Mamba3 forward on a CUDA host (no Metal).
+
+    Device-aware Path B analog of :func:`_mamba3_mimo_apply_with_state`: when
+    the live MLX device is the CUDA gpu (Metal unavailable), the hand-MSL Path
+    B Metal kernel cannot run, so the same Mamba3 MIMO recurrence is routed
+    through the host ``_cuda_eager`` bridge (``mamba3_mimo_fwd_cuda_eager`` —
+    the exact CUDA-safe prim_func Mamba3 Path C uses on CUDA). Gradients flow
+    only through ``y`` (the ``h_last`` cotangent is zero in practice), matching
+    the Metal Path B contract.
+
+    Kernel unavailability / launch failure RAISES (RULE #1) — never a silent
+    fall-through to the Metal kernel (which cannot run on CUDA) or to a
+    different path.
+    """
+
+    from cppmega_mlx.nn._tilelang._cuda_eager import (
+        cuda_eager_available,
+        mamba3_mimo_fwd_cuda_eager,
+    )
+
+    cuda_ok, cuda_reason = cuda_eager_available()
+    if not cuda_ok:
+        raise RuntimeError(
+            "mamba3_mimo: Path B Metal kernel unavailable on this CUDA host "
+            f"and the TileLang-CUDA EAGER forward is also unavailable: {cuda_reason}"
+        )
+    result = mamba3_mimo_fwd_cuda_eager(x, B, C, z, A, dt, D, h0)
+    if result is None:
+        raise RuntimeError(
+            "mamba3_mimo: Path B TileLang-CUDA EAGER forward returned None "
+            "(cuda_eager_available() was True — this is a bug)"
+        )
+    return result
+
+
+@_mamba3_mimo_apply_with_state_cuda_eager.vjp
+def _mamba3_mimo_apply_with_state_cuda_eager_vjp(
+    primals: tuple[mx.array, ...],
+    cotangent: tuple[mx.array, mx.array],
+    output: tuple[mx.array, mx.array],
+) -> tuple[mx.array, ...]:
+    """CUDA-eager Path B VJP — ignores the ``h_last`` cotangent (zero)."""
+
+    from cppmega_mlx.nn._tilelang._cuda_eager import (
+        cuda_eager_available,
+        mamba3_mimo_bwd_cuda_eager,
+    )
+
+    del output
+    x, B, C, z, A, dt, D, h0 = primals
+    dy = cotangent[0]
+    cuda_ok, cuda_reason = cuda_eager_available()
+    if not cuda_ok:
+        raise RuntimeError(
+            "mamba3_mimo: Path B Metal backward unavailable on this CUDA host "
+            f"and the TileLang-CUDA EAGER backward is also unavailable: {cuda_reason}"
+        )
+    grads = mamba3_mimo_bwd_cuda_eager(dy, x, B, C, z, A, dt, D, h0)
+    if grads is None:
+        raise RuntimeError(
+            "mamba3_mimo: Path B TileLang-CUDA EAGER backward returned None "
+            "(cuda_eager_available() was True — this is a bug)"
+        )
+    return grads
+
+
 @dataclass(frozen=True)
 class Mamba3Config:
     """Local MLX config using cppmega-facing Author Mamba3 names where possible."""
@@ -469,6 +546,29 @@ def _dispatch_mamba3_scan(
     # AUTO + PATH_B share the Metal-availability check.
     status = mamba3_mimo_metal_status(x)
     if path is KernelPath.PATH_B and not status.available:
+        # Device-aware Path B: on a CUDA host (Metal unavailable, default
+        # device is the CUDA gpu) the hand-MSL Path B Metal kernel cannot run.
+        # Route the same Mamba3 MIMO recurrence through the host _cuda_eager
+        # bridge (the exact CUDA-safe prim_func Path C uses on CUDA). Mirrors
+        # the GDN/KDA Path B device switch. Unavailability/failure RAISES
+        # (RULE #1) — never a silent fall-through.
+        from cppmega_mlx.kernels.metal_ops import can_run_metal
+
+        if not can_run_metal():
+            from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
+
+            cuda_ok, cuda_reason = cuda_eager_available()
+            if not cuda_ok:
+                raise RuntimeError(
+                    f"mamba3_mimo: Path B kernel unavailable ({status.reason}) "
+                    f"and the TileLang-CUDA EAGER path is also unavailable: "
+                    f"{cuda_reason}. Use path_c on CUDA."
+                )
+            y, h_last = _mamba3_mimo_apply_with_state_cuda_eager(
+                x, B, C, z, A, dt, D, h0
+            )
+            record_dispatch("mamba3_mimo", path, "cuda_eager_fwd_v1")
+            return y, h_last
         raise RuntimeError(
             f"mamba3_mimo: Path B kernel unavailable ({status.reason})"
         )
