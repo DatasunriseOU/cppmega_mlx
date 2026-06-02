@@ -11,7 +11,13 @@ path_c fwd+bwd region chain assembled as ONE `@R.function` of `R.call_tir` leave
 cuts the strict concurrent peak **1.67x->1.80x, growing with depth** (section 5).
 The top unknown is resolved: path_c's physical-ABI prims do NOT fit `call_tir` DPS
 (section 3, 3 verbatim reasons) -- PR 1 uses logical-buffer leaves, PR 2 writes the
-DPS adapter. Integration is a multi-quarter effort; this doc specifies the roadmap.
+DPS adapter. **PR 2 done + measured** (2026-06-02): the physical-bank ->
+logical-buffer DPS adapter makes a REAL path_c region a VALID, plannable Relax-graph
+leaf -- but via an **external-function boundary (`R.call_dps_packed`), NOT a
+`call_tir` leaf**, because the real path_c kernel can ONLY be lowered by
+`tilelang.compile` (mismatch #3 is a hard codegen wall that does NOT close even after
+currying the scalar). Section 7. Integration is a multi-quarter effort; this doc
+specifies the roadmap.
 
 PoC code: [`cppmega_mlx/runtime/relax_memory_plan_poc.py`](../cppmega_mlx/runtime/relax_memory_plan_poc.py)
 (self-checking, fail-loud; run instructions at the bottom).
@@ -287,14 +293,13 @@ PYTHONPATH=/Volumes/external/sources/cppmega.mlx \
 
 ### The concrete NEXT PR toward the full 1.8B train step
 
-**PR 2 -- physical-bank -> logical-buffer DPS adapter + real-prim leaves:** write a
-per-region adapter shim that exposes each path_c region's logical inputs/outputs as
-distinct DPS buffer params (inputs first, output buffer last, void return) and
-internally packs/unpacks them into the physical ABI banks + drives the real
-`tilelang.compile`d kernel. This makes the REAL path_c prims `R.call_tir` leaves
-(closing all three mismatches in section 3) so PR 1's planner sees the genuine
-region working sets, not stand-in logical kernels. Validate the adapter against the
-single-block `Gradient` ICHECK before promising the optimizer co-plan.
+**PR 2 -- physical-bank -> logical-buffer DPS adapter + real-prim leaves: DONE +
+MEASURED (2026-06-02), section 7.** The adapter makes a REAL path_c region a valid,
+plannable Relax-graph leaf, but the boundary is `R.call_dps_packed` (external
+function), NOT `R.call_tir` -- mismatch #3 (the TileLang guarded-sync kernel) is a
+hard codegen wall that the generic relax/s_tir pipeline cannot lower even after
+currying the scalar. See section 7 for the measured result + the precise reason the
+graph path uses an external-function boundary.
 
 Then, in order (section 4 levers), each a measured increment on top of PR 2:
 **(3a)** `relax.transform.Gradient` over the WHOLE assembled step (not per-region),
@@ -320,8 +325,12 @@ planning invocation every later PR reuses.
   in-place optimizer is multiple quarters.
 * **DPS / physical-ABI adapter** was the top unknown (section 3) -- **RESOLVED:
   path_c's physical-ABI prims do NOT fit `call_tir` DPS (3 verbatim reasons).** PR 1
-  ships logical-buffer leaves; **PR 2 writes the physical->logical DPS adapter shim**
-  to put the real prims into the graph (section 5).
+  ships logical-buffer leaves; **PR 2 (DONE, section 7) writes the physical->logical
+  DPS adapter** -- but the boundary is `R.call_dps_packed` (external function), NOT a
+  `call_tir` leaf, because mismatch #3 (the TileLang guarded-sync kernel) is a hard
+  codegen wall that does NOT close even after currying the scalar. The real kernel
+  goes through `tilelang.compile`; the adapter packs/unpacks logical I/O around it
+  and the planner still co-plans each region's logical working set.
 * **Optimizer co-planning** needs inlining into the adjoint's single dataflow
   block; the single-block ICHECK (`gradient.cc:680`) may reject it -- validate
   before promising the optimizer-state win.
@@ -350,3 +359,119 @@ or the strict peak in the fwd+bwd cases, or if a planned VM output disagrees wit
 its numpy reference. Last verified: 2026-06-02, all checks passed (numbers in
 section 1).
 ```
+
+---
+
+## 7. PR 2 -- DONE + MEASURED (2026-06-02): physical-bank -> logical-buffer DPS adapter
+
+**Shipped:**
+* [`cppmega_mlx/runtime/path_c_dps_adapter.py`](../cppmega_mlx/runtime/path_c_dps_adapter.py)
+  -- the adapter: parses a REAL path_c prim's physical-ABI metadata
+  (`tl.fusion.physical_abi.logical_to_physical`, `..._physical_buffer_shapes`),
+  exposes each region's logical I/O as a DPS boundary, and registers a packed
+  function that packs logical inputs into the physical bank sub-ranges, runs the
+  region kernel, and unpacks the logical output.
+* [`cppmega_mlx/runtime/path_c_relax_step_real.py`](../cppmega_mlx/runtime/path_c_relax_step_real.py)
+  -- assembles REAL path_c region leaves through the adapter as `R.call_dps_packed`
+  leaves in ONE `@R.function`, runs `StaticPlanBlockMemory`, builds + runs on the
+  LLVM Relax VM, checks numerics, and measures planned vs unplanned peak. Reuses
+  PR 1's exact analyzers (no new accounting).
+
+### Deliverable (1): does the adapter make a real path_c prim a valid Relax leaf?
+
+**YES -- but via `R.call_dps_packed` (external function), NOT `R.call_tir`.** The
+real prim was probed against all three section-3 mismatches and each was MEASURED:
+
+1. **PARAM ORDER (mismatch #1) -- CLOSED by currying.** The scalar
+   `path_c_run_backward` sits at param index 5 (the middle). `prim.specialize(
+   {run_backward: const})` yields a 16-param prim with ZERO scalar params (a separate
+   fwd-only leaf at `run_backward=0` and bwd-only at `=1`), so there is no mid-param
+   scalar. Verified: `scratch/pr2_test_curry.py` prints `scalars: []`.
+2. **NO TRAILING OUTPUT BUFFER (mismatch #2) -- CLOSED by the adapter ABI.** The prim
+   has `tilelang_out_idx = [0,2,3,4,6,...,16]` (nearly every param is an in-place
+   bank output). The adapter presents logical inputs as read-only Relax tensors and a
+   single logical output as the trailing Relax tensor; the physical-bank in-place
+   packing is internal to the packed function. The adapter packs/unpacks LOGICAL
+   tensors through the REAL bank sub-range offsets byte-exact (verified on the
+   44.9M-f32 activation bank, `route_0_M_hidden`->`route_0_M_hidden_after`, shape
+   `(1,4096,3584)`: `scratch/pr2_test_real_abi_roundtrip.py`).
+3. **NOT A GENERIC-TIR KERNEL (mismatch #3) -- a HARD WALL; does NOT close.** Even
+   after currying `run_backward` to a constant, the generic relax/s_tir build STILL
+   RAISES `Cannot insert syncs inside condition` (`thread_storage_sync.cc:145`) --
+   the row-chunk dispatch guards around `T.alloc_shared` syncs remain
+   (`condition_counter() == 1`, was 2 before currying). MEASURED:
+   `scratch/pr2_test_curry.py`. The SAME prim lowers cleanly through
+   `tilelang.compile` (target=metal) in ~2 s, emitting a 168 KB Metal kernel + a
+   callable `JITKernel`. MEASURED: `scratch/pr2_compile_full.py`.
+
+**Therefore the real path_c kernel can ONLY be lowered by `tilelang.compile`; it can
+never be inlined into a generic-TIR `R.call_tir` leaf. The correct Relax-graph
+boundary is an EXTERNAL FUNCTION: `R.call_dps_packed("<region>", [logical_inputs],
+out_sinfo)`**, with the tilelang-compiled kernel + bank pack/unpack behind it. A
+single such leaf is `well_formed` + legalizes to call_tir form + plans under
+`StaticPlanBlockMemory` + builds + runs on the LLVM VM with exact numerics
+(`scratch/pr2_test_dps_packed_leaf.py`: strict peak 1024->512 B, max abs diff 0.0).
+`call_dps_packed` outputs ARE Relax-level tensors that `CallTIRRewrite` materialises
+as `builtin.alloc_tensor` and the planner co-plans -- so the planner STILL sees each
+region's logical working set (the internal physical banks are not Relax-visible;
+co-planning those banks across regions is a further step -- expose banks as Relax
+tensors).
+
+### Deliverable (2): real-prim region peak, planned vs unplanned
+
+Real `mr_path_c` MR prim parsed (17 params, **60 logical tensors across 5 physical
+banks**), `run_backward` curried per fwd/bwd leaf, assembled as a fwd-then-reverse
+chain of `R.call_dps_packed` adapter leaves. Device: CPU LLVM Relax VM.
+
+| Chain (fwd+bwd, DPS-adapter leaves) | ALL-LIVE (eager) | planned WS | reduction | STRICT peak | planned peak | reduction |
+|---|---|---|---|---|---|---|
+| 4 layers, S=8, H=3584 | 0.88 MB | 0.66 MB | **1.33x** | 0.55 MB | 0.33 MB | **1.67x** |
+| 6 layers, S=8, H=3584 | 1.31 MB | 0.88 MB | **1.50x** | 0.77 MB | 0.44 MB | **1.75x** |
+| 8 layers, S=8, H=3584 | 1.75 MB | 1.09 MB | **1.60x** | 0.98 MB | 0.55 MB | **1.80x** |
+
+Both the eager all-live total AND the strict concurrent peak drop, and the
+**strict-peak win GROWS with depth (1.67x->1.75x->1.80x)** -- identical to PR 1, as
+expected: the leaf liveness structure is the same; PR 2's change is the BOUNDARY
+(real-prim DPS adapter via `call_dps_packed` over the real ABI map, instead of a
+hand-written logical `call_tir` PrimFunc). The numbers confirm the planner co-plans
+the real region leaves' logical working sets end-to-end. Run:
+
+```
+TVM_LIBRARY_PATH=/Volumes/external/sources/tilelang/build/lib \
+PYTHONPATH=/Volumes/external/sources/cppmega.mlx \
+/Volumes/external/sources/nanochat/.venv/bin/python3 -u \
+  -m cppmega_mlx.runtime.path_c_relax_step_real
+```
+
+### Deliverable (3): the concrete remaining step to the full 1.8B train step graph
+
+The adapter unblocks putting REAL path_c regions in the graph via the
+`call_dps_packed` external boundary. The remaining steps, in order:
+
+1. **On-device kernel driver.** Wire `set_region_kernel_driver` to call the real
+   `tilelang.compile`'d `JITKernel` on a live Metal/CUDA device (the kernel compiles
+   in ~2 s; the pack/unpack ABI is proven). Single-run gb10 discipline for CUDA.
+2. **Co-plan the physical banks, not just logical outputs.** Today the banks are
+   internal to each packed func, so the planner reuses only the logical-output
+   tensors. Expose the activation/state banks as Relax-level tensors (DPS params of
+   the leaf) so `StaticPlanBlockMemory` shares the heavy banks ACROSS regions -- this
+   is where the large all-live -> working-set collapse on the real ~45M/253M-f32
+   banks lands.
+3. **`Gradient` over the WHOLE assembled step**, then manual
+   `start_checkpoint`/`end_checkpoint` remat per block (no auto-selector in this TVM),
+   then an in-place Adam/SGD op (or ZeRO-1). Projected: 118 GB --(liveness, ~2.2x)-->
+   ~55-60 GB --(remat, ~5x activations)--> ~30-35 GB --(in-place optimizer)-->
+   **~26-30 GB**. Validate the adapter leaves against the single-block `Gradient`
+   ICHECK (`gradient.cc:680`) before promising the optimizer co-plan.
+
+### PR 2 evidence scripts (all pass, 2026-06-02)
+
+* `scratch/pr2_test_curry.py` -- mismatch #1 closes by currying; mismatch #3 does NOT
+  (s_tir still raises the guarded-sync error after currying).
+* `scratch/pr2_compile_full.py` -- the real prim DOES lower via `tilelang.compile`
+  (Metal, ~2 s, 168 KB MSL) -> the external-boundary decision.
+* `scratch/pr2_test_dps_packed_leaf.py` -- a `call_dps_packed` leaf is well_formed +
+  plans + builds + runs + correct.
+* `scratch/pr2_test_real_abi_roundtrip.py` -- adapter packs/unpacks through the REAL
+  bank sub-range offsets byte-exact.
+* `scratch/pr2_dump_abi.py` -- dumps the real prim's physical-ABI metadata maps.
