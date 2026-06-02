@@ -374,3 +374,99 @@ def mlx_cuda_array_to_torch_tensor(arr: "mx.array") -> Any:
         )
     del torch
     return t
+
+
+# ---------------------------------------------------------------------------
+# OUTPUT side: torch CUDA result -> mx.array, zero-copy, no host bounce
+# ---------------------------------------------------------------------------
+#
+# Symmetric counterpart to ``mlx_cuda_array_to_torch_tensor`` (the INPUT bridge).
+# A TileLang/torch-CUDA kernel writes its result into a torch CUDA tensor; this
+# imports it straight back into an ``mx.array`` via DLPack with NO ``.cpu()``
+# host roundtrip. It relies on the native MLX CUDA *import* (DatasunriseOU fork:
+# convert.cpp ``cuda_dlpack_to_mlx`` + cuda backend ``import_external_buffer``),
+# which wraps the foreign CUDA buffer zero-copy and materializes it into an
+# MLX-owned GPU allocation with a single device-side copy (no PCIe bounce).
+#
+# RULE #1: if the running MLX build lacks the CUDA import (older binary that
+# still raises "CUDA DLPack import is not supported"), we RAISE with where+what
+# instead of silently host-bouncing. The caller (``_cuda_eager``) chooses this
+# zero-copy writeback only when the build supports it.
+
+
+def mlx_cuda_import_available() -> bool:
+    """Return True iff the running MLX build can import a CUDA DLPack capsule.
+
+    Probes the native import by round-tripping a tiny torch CUDA tensor through
+    ``mx.array(t)`` (DLPack). Returns False (not raise) for the *capability*
+    probe; actual writebacks raise on failure.
+    """
+
+    try:
+        import torch
+    except Exception:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        t = torch.ones(4, dtype=torch.float32, device="cuda")
+        torch.cuda.synchronize()
+        a = mx.array(t)
+        mx.eval(a)
+        return bool(abs(float(a.sum().item()) - 4.0) < 1e-4)
+    except Exception:
+        return False
+
+
+def torch_cuda_tensor_to_mlx(t, out_dtype=None):
+    """Import a torch CUDA tensor into an ``mx.array`` zero-copy (no host bounce).
+
+    Replaces the ``t.detach().cpu().numpy()`` writeback in
+    ``_cuda_eager._torch_cuda_to_mlx``: the kernel result stays GPU-resident and
+    crosses the torch->MLX boundary via DLPack (torch ``__dlpack__`` consumed by
+    the native MLX CUDA import). A single device-side copy lands it in an
+    MLX-owned buffer; there is no ``.cpu()`` / PCIe roundtrip.
+
+    RAISES (RULE #1) if the tensor is not a CUDA tensor or the MLX build cannot
+    import the CUDA DLPack capsule -- never silently degrades to a host copy.
+    """
+
+    import torch
+
+    if not isinstance(t, torch.Tensor):
+        raise TypeError(
+            f"_cuda_zerocopy.torch_cuda_tensor_to_mlx: expected a torch.Tensor, "
+            f"got {type(t).__name__}."
+        )
+    if not t.is_cuda:
+        raise RuntimeError(
+            f"_cuda_zerocopy.torch_cuda_tensor_to_mlx: tensor is on {t.device}, "
+            f"not CUDA; the zero-copy MLX import requires a CUDA device tensor."
+        )
+
+    # DLPack producer-readiness contract: flush torch's CUDA stream so the
+    # buffer is materialized before MLX reads it. MLX import does a full device
+    # sync of its own before the device-side copy, but we sync the producer here
+    # to honor the handoff ordering explicitly.
+    src = t.detach().contiguous()
+    torch.cuda.synchronize()
+
+    try:
+        # mx.array(torch_tensor) routes through MLX create_array ->
+        # nd_array_to_mlx -> (DatasunriseOU) cuda_dlpack_to_mlx, consuming the
+        # tensor's __dlpack__ kDLCUDA capsule with no host roundtrip.
+        arr = mx.array(src)
+    except Exception as exc:  # noqa: BLE001 - surface where + what failed
+        raise RuntimeError(
+            f"_cuda_zerocopy.torch_cuda_tensor_to_mlx: mx.array() rejected the "
+            f"torch CUDA DLPack capsule (dtype={src.dtype}, "
+            f"shape={tuple(int(d) for d in src.shape)}). This MLX build likely "
+            f"lacks the native CUDA DLPack import (cuda_dlpack_to_mlx); rebuild "
+            f"MLX-CUDA with the import patch. Underlying error: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if out_dtype is not None and arr.dtype != out_dtype:
+        arr = arr.astype(out_dtype)
+    del torch
+    return arr

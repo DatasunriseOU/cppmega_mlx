@@ -41,9 +41,14 @@ This wrapper forwards ``gb10`` (auto-detect by default, overridable via
 sm_12x and the original Hopper kernel on sm_90/sm_100. MLX-CUDA q/kv/indices are
 fed to the torch-backend kernel interfaces zero-copy via DLPack when
 ``CPPMEGA_TILELANG_CUDA_ZEROCOPY=1`` (kDLCUDA ``DLManagedTensor`` over
-``mx.array.data_ptr()``, no host roundtrip); outputs come back from torch (MLX
-cannot import a CUDA DLPack, so the torch->MLX writeback is a host bounce — an
-MLX limitation, surfaced honestly, not a silent degrade of the input path).
+``mx.array.data_ptr()``, no host roundtrip). The kernel outputs are imported
+back from torch into MLX zero-copy too (DatasunriseOU MLX-CUDA DLPack *import*:
+``cuda_dlpack_to_mlx`` wraps the foreign CUDA buffer and materializes it into an
+MLX-owned GPU allocation with a single device-side copy — no ``.cpu()`` host
+bounce), so the whole fused fwd/bwd stays GPU-resident and keeps the kernel's
+latency win. With ``CPPMEGA_TILELANG_CUDA_ZEROCOPY`` unset the writeback uses the
+explicit eager numpy-host copy (a deliberately-selected mode, not a silent
+degrade).
 """
 
 from __future__ import annotations

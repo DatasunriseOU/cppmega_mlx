@@ -23,13 +23,16 @@ in-tree static-shape TileLang prim_funcs and compiles them with
   VJP (documented TODO to port the Metal SIMD lane-grad bwd).
 * **m2rnn** — not yet ported; see :func:`m2rnn_supported_cuda_eager` (TODO).
 
-MLX on this host has no CUDA-array DLPack export
-(``a.__dlpack__`` raises "CUDA DLPack export is not supported"), so the
-MLX<->kernel boundary uses a numpy host roundtrip into torch CUDA tensors.
-That is correct (if not zero-copy) for an EAGER fallback whose job is to run a
-real TileLang-CUDA kernel rather than raise. The Metal path is untouched: every
-public entry below is only invoked from a ``cuda_eager_available()`` branch the
-callers add *after* the existing ``can_run_metal()`` checks.
+The MLX<->kernel boundary is zero-copy on this fork. Inputs are exported to torch
+zero-copy via DLPack (MLX-CUDA kDLCUDA export, commit 6da6a0e4), and kernel
+outputs are imported back into MLX zero-copy via DLPack (MLX-CUDA kDLCUDA
+*import*: ``cuda_dlpack_to_mlx``) when ``CPPMEGA_TILELANG_CUDA_ZEROCOPY=1`` —
+no ``.cpu()`` host roundtrip, so the fused kernel keeps its latency win. With the
+env unset the writeback falls back to the explicit eager numpy-host copy (a
+deliberately-selected mode, not a silent degrade); see ``_torch_cuda_to_mlx``.
+The Metal path is untouched: every public entry below is only invoked from a
+``cuda_eager_available()`` branch the callers add *after* the existing
+``can_run_metal()`` checks.
 """
 
 # pyright: reportMissingImports=false, reportInvalidTypeForm=false
@@ -141,11 +144,39 @@ def _mlx_to_torch_cuda(a: mx.array) -> Any:
     return t.contiguous()
 
 
+def _zerocopy_writeback_enabled() -> bool:
+    """Whether the kernel-output writeback should use the zero-copy CUDA import.
+
+    Same env gate as the input bridge (``CPPMEGA_TILELANG_CUDA_ZEROCOPY``): when
+    set, the torch-CUDA kernel result is imported back into MLX via DLPack with
+    no ``.cpu()`` host roundtrip (DatasunriseOU native MLX CUDA import). When
+    unset (default) the explicit eager numpy-host copy below is used. These are
+    two deliberately-selected modes, NOT a silent fallback.
+    """
+
+    from cppmega_mlx.nn._tilelang._cuda_zerocopy import zerocopy_enabled
+
+    return zerocopy_enabled()
+
+
 def _torch_cuda_to_mlx(t: Any, out_dtype: Any) -> mx.array:
-    """Copy a CUDA torch tensor back into an ``mx.array`` of ``out_dtype``."""
+    """Move a CUDA torch tensor back into an ``mx.array`` of ``out_dtype``.
+
+    With ``CPPMEGA_TILELANG_CUDA_ZEROCOPY=1`` this stays GPU-resident: the result
+    crosses torch->MLX via DLPack (no ``.cpu()`` / PCIe bounce), which is what
+    preserves the fused kernel's latency win. RULE #1: when the zero-copy mode is
+    requested it RAISES if the MLX build cannot import the CUDA capsule, instead
+    of silently host-bouncing. Default (env unset) uses the eager numpy-host copy.
+    """
+
+    import torch
+
+    if _zerocopy_writeback_enabled():
+        from cppmega_mlx.nn._tilelang._cuda_zerocopy import torch_cuda_tensor_to_mlx
+
+        return torch_cuda_tensor_to_mlx(t, out_dtype)
 
     import numpy as np  # noqa: F401
-    import torch
 
     cpu = t.detach().to(device="cpu")
     if cpu.dtype == torch.bfloat16:
