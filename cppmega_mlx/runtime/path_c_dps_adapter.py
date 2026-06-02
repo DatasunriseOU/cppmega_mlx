@@ -192,8 +192,13 @@ def make_region_dps_packed(leaf: PathCRegionLeaf) -> Callable[..., Any]:
                 f"{len(leaf.logical_inputs)+1} args "
                 f"(inputs {len(leaf.logical_inputs)} + 1 output), got {len(args)}"
             )
-        in_arrays = [np.from_dlpack(a) for a in args[:-1]]
-        out_array = np.from_dlpack(args[-1])
+        # Import the call_dps_packed ABI tensors to host numpy. On a CUDA Relax VM
+        # (tvm.cuda(0)) these arrive as device tensors; ``np.from_dlpack`` RAISES
+        # "Unsupported device in DLTensor" for them, so we route device tensors
+        # through ``.numpy()`` (an explicit host copy). CPU/Metal tensors still use
+        # the zero-copy ``np.from_dlpack``. RULE #1: if neither works we RAISE.
+        in_arrays = [_dps_arg_to_host_numpy(a) for a in args[:-1]]
+        out_tensor = args[-1]
 
         # Allocate the physical banks we own.
         banks = {b: np.zeros((n,), dtype=np.float32) for b, n in bank_shapes.items()}
@@ -215,11 +220,65 @@ def make_region_dps_packed(leaf: PathCRegionLeaf) -> Callable[..., Any]:
         _drive_region_compute(leaf, banks)
 
         # Unpack the logical-output sub-range into the trailing DPS output tensor.
+        # On CUDA the DPS output is a device tensor that does NOT alias a host numpy
+        # view, so we write the result back EXPLICITLY (host->device copy) rather
+        # than via an aliasing ``out_array[...] =``.
         m = lmap[leaf.logical_output]
+        out_host_shape = tuple(int(d) for d in out_tensor.shape)
         out_flat = banks[m.bank][m.offset : m.offset + m.size]
-        out_array[...] = out_flat.reshape(out_array.shape)
+        _dps_writeback_host_to_arg(out_tensor, out_flat.reshape(out_host_shape))
 
     return _packed
+
+
+def _dps_arg_to_host_numpy(arg: Any) -> np.ndarray:
+    """Import a call_dps_packed ABI tensor to a host numpy array, device-agnostically.
+
+    CPU/Metal DLPack-capable tensors import zero-copy via ``np.from_dlpack``; CUDA
+    tensors (whose device DLPack export is rejected by numpy with "Unsupported
+    device in DLTensor") are copied to host via the tensor's ``.numpy()`` method.
+    RULE #1 (fail loud): if BOTH paths fail the original errors are surfaced."""
+
+    try:
+        return np.from_dlpack(arg)
+    except Exception as dlpack_err:  # noqa: BLE001 -- CUDA: Unsupported device in DLTensor
+        to_numpy = getattr(arg, "numpy", None)
+        if to_numpy is None:
+            raise RuntimeError(
+                "FAIL-LOUD: DPS arg is neither host-DLPack-importable nor has a "
+                f".numpy() host-copy method (type={type(arg).__name__}); "
+                f"np.from_dlpack raised: {dlpack_err}"
+            ) from dlpack_err
+        return np.ascontiguousarray(to_numpy())
+
+
+def _dps_writeback_host_to_arg(out_tensor: Any, host_result: np.ndarray) -> None:
+    """Write a host numpy result back into a call_dps_packed output tensor,
+    device-agnostically.
+
+    For a CPU/Metal tensor that aliases a host numpy view we assign through that
+    view; for a CUDA device tensor (which does NOT alias host memory) we build a
+    same-device source tensor and ``copyto`` the device output in place. RULE #1:
+    if neither path is available we RAISE."""
+
+    host_result = np.ascontiguousarray(host_result, dtype=np.float32)
+    # CPU/Metal: alias the output's host buffer and assign in place.
+    try:
+        view = np.from_dlpack(out_tensor)
+        view[...] = host_result.reshape(view.shape)
+        return
+    except Exception:  # noqa: BLE001 -- CUDA: device DLPack rejected by numpy
+        pass
+    # CUDA (and any device tensor with a .device + copyto): host->device copy.
+    dev = getattr(out_tensor, "device", None)
+    copyto = getattr(out_tensor, "copyto", None)
+    if dev is None or copyto is None:
+        raise RuntimeError(
+            "FAIL-LOUD: DPS output tensor is not host-DLPack-aliasable and lacks "
+            f"a (.device, .copyto) device-writeback path (type={type(out_tensor).__name__})"
+        )
+    src = tvm.runtime.tensor(host_result, device=dev)
+    src.copyto(out_tensor)
 
 
 # Hook the region compute. Default = a transparent reference matching the region's
