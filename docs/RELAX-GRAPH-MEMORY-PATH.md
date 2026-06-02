@@ -5,8 +5,13 @@ TVM Relax graph and running `StaticPlanBlockMemory` gives a **strictly lower pea
 memory** than eager execution, because the graph has cross-op / cross-layer
 liveness that an eager single-`mx.eval` barrier cannot exploit.
 
-**Status:** PoC done and passing (measured numbers below). Integration is a
-multi-quarter effort; this doc specifies the first PR and the full roadmap.
+**Status:** PoC done and passing (measured numbers below). **PR 1 done + measured**
+(2026-06-02): whole-region `StaticPlanBlockMemory` over a REAL-shaped (`H=3584`)
+path_c fwd+bwd region chain assembled as ONE `@R.function` of `R.call_tir` leaves
+cuts the strict concurrent peak **1.67x->1.80x, growing with depth** (section 5).
+The top unknown is resolved: path_c's physical-ABI prims do NOT fit `call_tir` DPS
+(section 3, 3 verbatim reasons) -- PR 1 uses logical-buffer leaves, PR 2 writes the
+DPS adapter. Integration is a multi-quarter effort; this doc specifies the roadmap.
 
 PoC code: [`cppmega_mlx/runtime/relax_memory_plan_poc.py`](../cppmega_mlx/runtime/relax_memory_plan_poc.py)
 (self-checking, fail-loud; run instructions at the bottom).
@@ -154,14 +159,52 @@ Reuse unchanged:
 Swap only in the toy/opt-in harness: the eager stitch at `loop.py:171-176` becomes
 a single Relax-VM call to `train_step`.
 
-### The load-bearing unknown (validate first)
+### The load-bearing unknown -- NOW VALIDATED (2026-06-02): NO, path_c physical-ABI prims do NOT fit R.call_tir DPS
 
 path_c PrimFuncs bind a **physical bank ABI** (`path_c_physical_abi.py`,
 `merge_path_c_physical_abi_for_prim_funcs` at `path_c_fusion.py:1199`). Relax
-`call_tir` expects destination-passing (DPS) output-buffer convention. **It is
-UNVERIFIED that path_c's physical-ABI PrimFuncs satisfy `call_tir` DPS without a
-thin wrapper.** First PR builds the toy with plain *logical-buffer* ABIs to defer
-this; a per-region DPS adapter shim is the second PR if needed.
+`call_tir` expects destination-passing (DPS) output-buffer convention. We wrote a
+REAL path_c PrimFunc (`mr_path_c`, the joint fwd+bwd region from
+`build_path_c_aot_autograd_region` + `path_c_fusion_schedule_template`) into a
+`relax.BlockBuilder` IRModule, emitted `R.call_tir`, and ran
+legalize->well_formed->CallTIRRewrite->`relax.build`. Verbatim captured by
+`scratch/test_call_tir_dps.py`. **It does NOT fit DPS, for three concrete reasons:**
+
+1. **PARAM ORDER (well_formed = FALSE).** DPS requires tensor args first, scalar
+   (`R.Prim`) args last (via `tir_vars`). The physical prim interleaves its scalar
+   `path_c_run_backward: T.int32` at **param index 8 -- in the middle** of the
+   tensor banks. well_formed reports:
+   `Argument 5 type mismatch: expected R.Prim("int32"), given R.Tensor((60708456,), dtype="float32")`.
+2. **NO TRAILING OUTPUT BUFFER (in-place physical banks).** DPS needs fresh,
+   distinct trailing output buffer params the callee only WRITES. The physical prim
+   packs many logical tensors into disjoint *ranges* of a few large shared dtype
+   banks (`path_c_float32_activation_abi_bank` ~45M f32, `..._parameter_abi_bank`
+   ~133M f32, `..._state_abi_bank` ~253M f32, ...) and **reads AND writes those
+   banks in place** (every `*_abi_bank` is in BOTH `T.reads` and `T.writes`).
+   There is no clean output buffer -- "outputs" are sub-ranges of input banks.
+   CallTIRRewrite only "succeeds" structurally if you *contrive* an output by
+   reusing a route buffer (e.g. the RNN `h_next` state), which is not real DPS.
+3. **NOT A GENERIC-TIR KERNEL (`relax.build` RAISES).** The TileLang
+   `T.Kernel(64, threads=1024)` body guards `T.alloc_shared` accesses inside an
+   `if (path_c_run_backward)` conditional; it is authored to be lowered by
+   `tilelang.compile`, not the generic relax/s_tir TIR pipeline, which raises
+   `Cannot insert syncs inside condition` (`thread_storage_sync.cc:145`).
+
+**Decision (matches the doc's original plan).** PR 1 therefore assembles the chain
+from DPS-CLEAN **logical-buffer** region PrimFuncs -- one TIR PrimFunc per region
+shaped `(inputs..., trailing-output-buffer, void return)` -- at REAL path_c region
+shapes (`hidden_size=3584`, the model's `AEMR` layer pattern). That leaf shape is
+proven to wrap+build+run on the LLVM Relax VM (`scratch/test_dps_clean.py`). The
+**physical-bank -> logical-buffer DPS adapter shim is the explicit next PR** (PR 2,
+below). See `cppmega_mlx/runtime/path_c_relax_step.py` for PR 1.
+
+> Environment note: the vendored TVM is mid `tir`->`tirx` migration on the tilelang
+> `merge/upstream-codegen-reorg` branch. TVMScript `T.block` is renamed `T.sblock`
+> (same FFI). A second tirx quirk: a conditional (`T.if_then_else`/`Select`)
+> reading an *argument*-backed buffer directly trips a `LowerDeviceKernelLaunch`
+> substitution ICHECK (`stmt_functor.cc:694`); copying the arg buffer to a local
+> first sidesteps it without changing semantics. Both are handled in PR 1; neither
+> affects the planning result (planning runs on Relax IR before codegen).
 
 ---
 
@@ -200,33 +243,85 @@ cited literature and are the multi-quarter remainder.
 
 ---
 
-## 5. First PR (smallest real increment)
+## 5. PR 1 -- DONE + MEASURED (2026-06-02): whole-region Relax assembly + planning
 
-**PR 1 -- "whole-step Relax assembly + planning, toy 2-region step":**
+**Shipped:** [`cppmega_mlx/runtime/path_c_relax_step.py`](../cppmega_mlx/runtime/path_c_relax_step.py).
+A `relax.BlockBuilder` assembler that registers per-region fwd+bwd PrimFuncs into
+ONE IRModule and emits `@R.function train_step` issuing `R.call_tir` leaves in
+fwd-then-reverse order, with **every forward activation saved and consumed by its
+matching backward region** (so forward activations are irreducibly live across the
+backward pass -- the cross-layer concurrency eager `mx.eval` cannot exploit). It
+runs `StaticPlanBlockMemory` + `LowerAllocTensor` + `KillAfterLastUse`,
+`relax.build`s to an LLVM VM `Executable`, runs it, and checks the planned VM
+output against an independent numpy reference (fail-loud, RULE #1). It reuses the
+PoC's exact peak analyzers (`eager_peak_bytes` / `planned_peak_bytes`) -- no new
+accounting, no fabrication.
 
-* Add `cppmega_mlx/runtime/path_c_relax_step.py`: `BlockBuilder` assembler that
-  takes 2 adjacent regions' fwd+bwd PrimFuncs and emits one `@R.function
-  train_step` issuing `call_tir`s in fwd-then-reverse order; runs
-  `StaticPlanBlockMemory` + `KillAfterLastUse`; `relax.build` to a VM `Executable`.
-* Build with plain logical-buffer ABIs (defer the physical-ABI/DPS adapter).
-* Wire the existing DLPack bridge (`_cuda_zerocopy.py`) to feed MLX inputs / read
-  outputs.
-* Gate behind a toy harness flag; do NOT change the eager `loop.py` default.
-* Acceptance: `estimate_memory_usage` + the PoC's peak analyzer report a measured
-  lower planned peak than the 2 independent `tilelang.compile` kernels, AND the
-  Relax-VM output matches the eager MLX output (fail-loud, RULE #1).
+Leaves are DPS-clean **logical-buffer** PrimFuncs at REAL path_c shapes
+(`hidden_size=3584`), because the physical-ABI prims do NOT fit DPS (section 3,
+validated). Device: **CPU LLVM Relax VM** (planning is target-independent IR-level).
 
-PoC code committed alongside this doc is the executable reference for the analyzer
-and the planning invocation PR 1 reuses.
+**MEASURED whole-region peak reduction (planned vs unplanned), real H=3584 chain:**
+
+| Chain (fwd+bwd) | ALL-LIVE (eager) | planned WS | reduction | STRICT peak | planned peak | reduction |
+|---|---|---|---|---|---|---|
+| 4 layers, S=8, H=3584 | 0.88 MB | 0.66 MB | **1.33x** | 0.55 MB | 0.33 MB | **1.67x** |
+| 6 layers, S=8, H=3584 | 1.31 MB | 0.88 MB | **1.50x** | 0.77 MB | 0.44 MB | **1.75x** |
+| 8 layers, S=8, H=3584 | 1.75 MB | 1.09 MB | **1.60x** | 0.98 MB | 0.55 MB | **1.80x** |
+
+Both the eager all-live total AND the STRICT concurrent peak drop, and the
+**strict-peak win GROWS with depth (1.67x -> 1.75x -> 1.80x)** -- the load-bearing
+cross-layer-liveness signature. (Magnitudes are small because S=8 is downscaled so
+the generic-TIR build finishes fast on CPU; the *ratios* are S-independent and are
+what extrapolate to the deep 1.8B step. They are notably STRONGER than the PoC's
+synthetic matmul chain at 1.16-1.28x, because each backward region's dependency on
+its saved forward activation manufactures more genuine concurrency than a bare
+`Gradient` over a matmul chain.) Run:
+
+```
+TVM_LIBRARY_PATH=/Volumes/external/sources/tilelang/build/lib \
+PYTHONPATH=/Volumes/external/sources/cppmega.mlx \
+/Volumes/external/sources/nanochat/.venv/bin/python3 -u \
+  -m cppmega_mlx.runtime.path_c_relax_step
+```
+
+### The concrete NEXT PR toward the full 1.8B train step
+
+**PR 2 -- physical-bank -> logical-buffer DPS adapter + real-prim leaves:** write a
+per-region adapter shim that exposes each path_c region's logical inputs/outputs as
+distinct DPS buffer params (inputs first, output buffer last, void return) and
+internally packs/unpacks them into the physical ABI banks + drives the real
+`tilelang.compile`d kernel. This makes the REAL path_c prims `R.call_tir` leaves
+(closing all three mismatches in section 3) so PR 1's planner sees the genuine
+region working sets, not stand-in logical kernels. Validate the adapter against the
+single-block `Gradient` ICHECK before promising the optimizer co-plan.
+
+Then, in order (section 4 levers), each a measured increment on top of PR 2:
+**(3a)** `relax.transform.Gradient` over the WHOLE assembled step (not per-region),
+co-planning fwd+bwd in one liveness scope; **(3b)** manual
+`relax.grad.start_checkpoint`/`end_checkpoint` remat boundaries per transformer
+block (no auto-selector in this TVM -- new pass if auto placement wanted), target
+~5x on the activation term; **(3c)** in-place Adam/SGD op so the planner aliases
+`param <- updated_param` and `m/v` in place (or ZeRO-1 sharding), attacking the
+optimizer-state term. Projected: 118 GB --(PR1/PR2 liveness, ~2.2x)--> ~55-60 GB
+--(remat, ~5x activations)--> ~30-35 GB --(in-place optimizer)--> **~26-30 GB**.
+Steps 1-3 (liveness) are now measured; remat + in-place optimizer are the
+multi-quarter remainder.
+
+PoC + `path_c_relax_step.py` are the executable reference for the analyzer and the
+planning invocation every later PR reuses.
 
 ---
 
 ## 6. Honest risks / scope
 
-* **Multi-quarter.** PoC (this doc) is week-1. PR 1 (2-region toy) is weeks. The
-  full 1.8B step with remat + in-place optimizer is multiple quarters.
-* **DPS / physical-ABI adapter** is the top unknown (section 3). If path_c
-  PrimFuncs cannot be `call_tir` leaves without a wrapper, PR 1.5 writes the shim.
+* **Multi-quarter.** PoC was week-1; PR 1 (whole-region assembly + planning, real
+  H=3584 chain) is DONE + measured (section 5). The full 1.8B step with remat +
+  in-place optimizer is multiple quarters.
+* **DPS / physical-ABI adapter** was the top unknown (section 3) -- **RESOLVED:
+  path_c's physical-ABI prims do NOT fit `call_tir` DPS (3 verbatim reasons).** PR 1
+  ships logical-buffer leaves; **PR 2 writes the physical->logical DPS adapter shim**
+  to put the real prims into the graph (section 5).
 * **Optimizer co-planning** needs inlining into the adjoint's single dataflow
   block; the single-block ICHECK (`gradient.cc:680`) may reject it -- validate
   before promising the optimizer-state win.
