@@ -16,7 +16,16 @@ logical-buffer DPS adapter makes a REAL path_c region a VALID, plannable Relax-g
 leaf -- but via an **external-function boundary (`R.call_dps_packed`), NOT a
 `call_tir` leaf**, because the real path_c kernel can ONLY be lowered by
 `tilelang.compile` (mismatch #3 is a hard codegen wall that does NOT close even after
-currying the scalar). Section 7. Integration is a multi-quarter effort; this doc
+currying the scalar). Section 7. **PR 3 done + measured** (2026-06-02): the physical
+banks (activation 171.5M, parameter 360.8M, parameter-grad 418.5M, state/checkpoint
+965.3M -- 1981 MB/region) are exposed as cross-region Relax SSA tensors, so
+`StaticPlanBlockMemory` shares the heavy banks ACROSS regions. MEASURED collapse on the
+real banks: eager all-live -> planned peak **1.32x -> 1.67x, growing with depth** (the
+planned-peak slope == the checkpoint-bank size, so every bank collapses to a constant
+working set EXCEPT the O(N)-live checkpoint -- the remat target). The real MR JITKernel
+also runs on Metal THROUGH the `call_dps_packed` boundary end-to-end. The bound is the
+key finding: cross-region liveness reuse cannot beat the checkpoint term; only
+rematerialization can. Section 8. Integration is a multi-quarter effort; this doc
 specifies the roadmap.
 
 PoC code: [`cppmega_mlx/runtime/relax_memory_plan_poc.py`](../cppmega_mlx/runtime/relax_memory_plan_poc.py)
@@ -475,3 +484,168 @@ The adapter unblocks putting REAL path_c regions in the graph via the
 * `scratch/pr2_test_real_abi_roundtrip.py` -- adapter packs/unpacks through the REAL
   bank sub-range offsets byte-exact.
 * `scratch/pr2_dump_abi.py` -- dumps the real prim's physical-ABI metadata maps.
+
+---
+
+## 8. PR 3 -- DONE + MEASURED (2026-06-02): physical banks as cross-region Relax tensors (the LARGE collapse) + real on-device kernel driver
+
+**Shipped:**
+* [`cppmega_mlx/runtime/path_c_relax_step_banks.py`](../cppmega_mlx/runtime/path_c_relax_step_banks.py)
+  -- the bank-as-Relax-tensor SSA assembly + the honest peak analyzer + the remat
+  projection.
+* `make_real_kernel_driver` in
+  [`cppmega_mlx/runtime/path_c_dps_adapter.py`](../cppmega_mlx/runtime/path_c_dps_adapter.py)
+  -- the first-class on-device driver that runs the real tilelang JITKernel through
+  the `call_dps_packed` boundary (PR-3 deliverable 3).
+
+### The two PR-3 tasks (from section 7's "remaining step" (1) and (2))
+
+**(2) Expose the physical banks as cross-region Relax tensors.** Until PR-3 each
+region's 5 physical banks were INTERNAL to its packed func, so
+`StaticPlanBlockMemory` only co-planned the tiny logical-output tensors -> 1.80x.
+PR-3 threads the REAL banks (parsed from `tl.fusion.physical_abi.physical_buffer_shapes`)
+as Relax-level SSA tensors region-to-region: each region READS bank tensors and WRITES
+updated bank tensors (`R.call_dps_packed` with multiple bank inputs and multiple bank
+outputs). The SSA thread mirrors the real dataflow:
+
+| bank | per-region | liveness in the SSA thread | collapses? |
+|---|---|---|---|
+| parameter | 360.8 MB | read-only, shared by EVERY region | YES -> 1x |
+| parameter_gradient | 418.5 MB | SSA grad accumulator (read+write per bwd) | YES -> 1x |
+| activation | 171.5 MB | forward-flowing (fwd i: act_i -> act_{i+1}) | YES -> ~2 live |
+| activation_gradient | 112.0 MB | backward-flowing (bwd i in/out) | YES -> ~2 live |
+| **state / checkpoint** | **965.3 MB** | **fwd i SAVES, bwd i READS -> live fwd-i..bwd-i** | **NO -> O(N)** |
+
+**(1) On-device kernel driver.** `make_real_kernel_driver(leaf, tvm.metal(0))` maps the
+5 banks to the kernel's leading params, the curried `run_backward` to the gate param,
+and zero scratch to the 11 auxiliary route buffers, then invokes `leaf.kernel` (the
+tilelang JITKernel) on the device. PROVEN end-to-end on Metal
+(`scratch/pr3_real_kernel_driver.py`): the real 17-param MR kernel compiles in ~0.8 s
+(168 KB MSL) and runs THROUGH the `call_dps_packed` boundary, computing
+**14,680,063 / 14,680,064 nonzero** activation outputs (the kernel genuinely executes,
+not the numpy stand-in). This is the external-function boundary executing the real
+kernel through the Relax graph -- the proof the task asked for.
+
+### Deliverable (1): MEASURED peak reduction with banks exposed, and how it scales
+
+Real bank numels (5 banks, **1981 MB/region**), assembled as a fwd-then-reverse
+`call_dps_packed` SSA chain. Eager all-live = `mx.eval` semantics (every region's bank
+outputs live at once). Planned peak = the TRUE concurrent high-water (honest liveness;
+see the limitation below). Device: CPU LLVM Relax VM (planning is target-independent).
+
+| layers | eager all-live | planned peak (banks exposed) | reduction |
+|---|---|---|---|
+| 2 | 3.26 GB | 2.46 GB | **1.32x** |
+| 4 | 6.51 GB | 4.76 GB | **1.37x** |
+| 8 | 13.03 GB | 8.53 GB | **1.53x** |
+| 16 | 26.05 GB | 16.07 GB | **1.62x** |
+| **28 (the 1.8B step's MR blocks)** | **45.59 GB** | **27.38 GB** | **1.67x** |
+
+**The reduction GROWS with depth (1.32x -> 1.67x) -- this is the cross-region
+bank-sharing collapse.** The honest signature: a linear fit gives **all-live slope =
+1.628 GB/layer, planned-peak slope = 0.951 GB/layer**, and **0.951 GB/layer == the
+state/checkpoint bank size (0.943 GB)**. So the planner collapsed EVERYTHING that can
+collapse -- the forward-flowing activation banks, the backward-flowing
+activation-gradient banks, the read-only parameter bank, and the SSA parameter-gradient
+accumulator all fold to a CONSTANT working set (0.68 GB/layer saved) -- and the ONLY
+term still growing with depth is the **O(N)-live checkpoint/state bank**.
+
+### The honest bound: bank-sharing alone does NOT close the gap -- the checkpoint bank is the remat target
+
+This is larger than PR-2's 1.80x **on the heavy banks** (PR-2's 1.80x was on the tiny
+logical outputs only; PR-3 moves the real 45M/253M-f32 banks), but it is **bounded at
+~1.67x by the O(N) checkpoint term**, NOT a runaway collapse. That is the real,
+load-bearing finding: cross-region liveness reuse collapses every bank EXCEPT the
+saved-activation/state checkpoint, because checkpoint i is irreducibly live from fwd-i
+to bwd-i. **Liveness planning cannot beat the checkpoint term; only rematerialization
+(lever 4) can.** Projected with sqrt(N) gradient checkpointing on the state bank:
+
+| layers | eager all-live | banks-planned | + sqrt(N) remat |
+|---|---|---|---|
+| 8 | 13.03 GB | 8.53 GB | **4.14 GB** |
+| 16 | 26.05 GB | 16.07 GB | **5.09 GB** |
+| 28 | 45.59 GB | 27.38 GB | **6.97 GB** |
+
+So the projection to the 1.8B step's 28 MR blocks: the **activation+state+grad working
+set** lands at ~27 GB with banks exposed, and ~7 GB with sqrt(N) remat on top. This is
+the activation/grad term ONLY (parsed from the quarter-profile region banks); the FULL
+118 GB eager figure additionally includes the Adam optimizer state (m, v = 2x params)
+at the real bs=4xseq=4096 scale. **Closing-the-gap math, re-grounded on the MEASURED
+bank slopes:** the bank-exposed planner takes the activation/grad term from O(N)-all-live
+(1.628 GB/layer) to O(N)-checkpoint (0.951 GB/layer) -> sqrt(N) remat takes the
+checkpoint term to O(sqrt N) -> an in-place Adam op (lever 5) takes the optimizer-state
+term in place. The remat step is the one that turns the O(N) checkpoint into the small
+residual; **bank-exposure + remat + in-place optimizer is what projects the eager
+118 GB toward the Megatron-class ~26-40 GB target** -- and the measured bank slopes show
+bank-exposure alone gets the activation/grad working set to ~27 GB at 28 blocks, with
+remat pushing the checkpoint residual to single-digit GB.
+
+### Deliverable (2): numeric equivalence vs the per-region-internal-bank version
+
+The bank-as-SSA-tensor assembly produces the SAME result as PR-2's per-region-internal
+version -- the pack/unpack is just relocated from inside each packed func to Relax tensor
+boundaries. VERIFIED on the LLVM VM at a ratio-preserving downscale (4 and 8 layers):
+the planned VM output (`actg`, `paramg`) matches an independent numpy reference of the
+identical SSA dataflow, **max abs diff 0.0**, at both the `/20000` and a stress `/2000`
+downscale (8 layers). RULE #1: any mismatch RAISES.
+
+### KEY PR-3 FINDING -- a Relax limitation that BOUNDS the graph path (reported, not papered over)
+
+`StaticPlanBlockMemory` **cannot see THROUGH the `call_dps_packed` external boundary**.
+Because the packed func is opaque, the planner does NOT know it WRITES its trailing
+bank-output tensors, so it emits a `kill_storage` for each such storage IMMEDIATELY
+after `alloc` (dead-on-arrival). Two consequences, both measured
+(`scratch/pr3_inspect_planned_ir.py`):
+
+1. **The plan stays CORRECT** -- each checkpoint nonetheless keeps a DISTINCT storage
+   token (the killed storage is never reused for a conflicting tensor), so numerics are
+   exact (verified above). The premature kill is benign for correctness.
+2. **But the PoC's `planned_peak_bytes` analyzer UNDER-counts** -- it honours the
+   premature kills and reports a falsely-low peak (e.g. 1.52 GB flat where the true
+   peak is 8.53 GB at 8 layers). PR-3 therefore ships a corrected `true_planned_peak`
+   analyzer: a storage is live from its alloc until the LAST textual use of any tensor
+   viewing it (call_packed args count as uses). The table above uses the honest figure.
+
+The bound this sets: the **real path_c kernel can ONLY be `call_dps_packed`** (PR-2
+mismatch #3 -- the TileLang guarded-sync body never lowers under generic s_tir), so the
+planner is ALWAYS blind to the in-place bank writes behind it. It can still co-plan the
+bank *tensors* (their alloc/last-use liveness IS visible), which is what delivers the
+1.67x collapse -- but it cannot do *in-place* bank aliasing across the external call
+(the SSA input and output bank are distinct Relax tensors, so a true in-place update is
+not planned; this matches the doc's "no in-place planning by default" risk and is the
+same reason the in-place Adam op (lever 5) must be an explicit op, not a planner freebie).
+A `call_tir` (planner-transparent DPS) variant of the same bank chain confirms the
+planner tracks the checkpoint liveness identically when the boundary is NOT opaque
+(`scratch/pr3_call_tir_banks.py`), so the limitation is specifically the
+external-function opacity, which the real kernel cannot avoid.
+
+### PR 3 evidence scripts (all pass, 2026-06-02)
+
+* `cppmega_mlx/runtime/path_c_relax_step_banks.py` -- the bank-SSA assembly, numeric
+  validation (max abs diff 0.0), full-scale peak table, and remat projection.
+* `scratch/pr3_real_kernel_driver.py` -- the REAL MR JITKernel runs on Metal through the
+  `call_dps_packed` boundary (14.68M nonzero activation outputs).
+* `scratch/pr3_dump_banks.py` -- the real 5-bank sizes + per-bank logical-tensor layout.
+* `scratch/pr3_inspect_planned_ir.py` -- shows the premature `kill_storage` of
+  externally-written bank outputs (the limitation) and that distinct storages are kept.
+* `scratch/pr3_call_tir_banks.py` -- the same bank chain with planner-transparent
+  `call_tir` leaves, isolating the opacity as the cause.
+* `scratch/pr3_true_peak.py` / `scratch/pr3_decompose_peak.py` -- the honest peak slope
+  (== state-bank/layer) and the per-bank-category decomposition.
+
+### Remaining to the full 1.8B step graph
+
+1. **Rematerialization on the checkpoint bank** (the measured O(N) term) -- manual
+   `relax.grad.start_checkpoint`/`end_checkpoint` per MR block (no auto-selector in this
+   TVM). This is now the SINGLE highest-leverage remaining step: it is the only lever
+   that beats the checkpoint term the bank-exposure measurement proved is irreducible
+   under liveness.
+2. **`Gradient` over the WHOLE assembled step** -- validate the `call_dps_packed` bank
+   leaves against the single-block `Gradient` ICHECK (`gradient.cc:680`) before promising
+   the optimizer co-plan.
+3. **In-place Adam/SGD op** (or ZeRO-1) -- because the planner does NOT do in-place across
+   the external boundary (the finding above), the optimizer in-place update must be an
+   explicit op, attacking the optimizer-state term.
+4. **CUDA on gb10** -- the Metal driver is proven; re-run `make_real_kernel_driver` with
+   `tvm.cuda(0)` under the single-run gb10 discipline (poll IDLE + free>105G, SIGTERM,
+   fuser + drop_caches) to confirm the same boundary on the production device.
