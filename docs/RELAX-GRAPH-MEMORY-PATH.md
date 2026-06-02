@@ -917,3 +917,111 @@ naive working-set (the doubling not avoided), or if the in-place optimizer raise
 full-step peak by more than 1x params over the remat peak. Last verified: 2026-06-03 --
 28-block full-step peak 8.787 GB (optimizer +0.000 GB to peak), in-place working-set
 9.844 GB vs naive 10.253 GB (0.409 GB saved), max abs diff 0.0.
+
+
+## 11. PR 6 -- DONE + MEASURED (2026-06-03): TESTABLE END-TO-END train_step RUNS on gb10 CUDA
+
+This is the "до состояния что можно тестировать" deliverable: a SINGLE entry
+(`cppmega_mlx/runtime/path_c_relax_train_step.py`) that builds the WHOLE-step Relax
+`@R.function` -- banks SSA (PR-3) + sqrt-N remat (PR-4) + in-place Adam (PR-5) + a
+scalar LOSS leaf -- sets the real CUDA kernel driver, runs `StaticPlanBlockMemory` +
+`relax.build(target=cuda)`, and EXECUTES one training step on `tvm.cuda(0)` on gb10,
+feeding real device inputs and reporting a finite loss + the measured peak.
+
+### What the whole-step graph is (one @R.function)
+
+`build_train_step(numels, n_layers)` emits, in ONE dataflow block:
+`forward (sqrt-N remat) -> pathc.bank_loss(act_final) -> backward (re-emit fwd for
+non-boundary checkpoints) -> pathc.adam_inplace`, returning `(loss, param', m', v')`.
+The loss leaf reduces the final forward activation bank to one f32 (mean-of-squares) --
+the training-step observable whose finiteness gates the profiling phase. The loss adds
+**+0.000 GB to the planned peak** (it consumes the final activation that is already
+live), so the 28-block whole-step planned peak is still **8.787 GB**, identical to PR-5.
+
+### Deliverable (1+2): RUNS yes/no + loss finite + MEASURED peak, on gb10 CUDA
+
+`scratch/pr6_cuda_e2e_train_step_gb10.py`, on `tvm.cuda(0)` (Grace-Blackwell aarch64),
+two stages, BOTH PASS (2026-06-03):
+
+| config | RUNS | loss (finite) | planned peak | measured free-delta |
+|---|---|---|---|---|
+| Stage 1 whole graph, real bank scale, **8 layers** | yes | 4.1655e-02 yes | 4.682 GB | 10.66 GB |
+| Stage 1 whole graph, real bank scale, **28 layers (1.8B)** | **yes** | **4.1656e-02 yes** | **8.787 GB** | **17.64 GB** |
+| Stage 2 **REAL path_c CUDA kernel** fwd, 2 layers | yes | 4.1655e-02 yes | -- | 0.94 GB |
+
+**The full 28-layer 1.8B config ASSEMBLES + EXECUTES end-to-end on gb10 CUDA**: every
+region kind (forward, sqrt-N recompute-forward, backward, `adam_inplace`, loss) runs
+through the Relax `call_dps_packed` graph on `tvm.cuda(0)`, the loss is finite, and the
+StaticPlanBlockMemory **planned device-peak is 8.787 GB** (the PR-5 headline, now
+EXECUTED not just planned). Stage 2 runs the REAL tilelang path_c-CUDA JITKernel (17
+params, 149024 bytes CUDA-C, proven on gb10 at 14.68M nonzero) behind the forward
+boundary of the SAME whole-step graph.
+
+**Why measured free-delta (17.64 GB) > planned device peak (8.787 GB):** the abstract
+bank drivers host-stage each bank across the `call_dps_packed` boundary -- on CUDA the
+ABI tensors are device tensors, so the driver reads them via `.numpy()` (host copy) and
+writes back via `tvm.runtime.tensor(host).copyto(out)` (host->device). Those transient
+host buffers + the input device tensors + the CUDA context inflate the `free -g` delta
+above the device-allocation high-water. The `planned peak` (8.787 GB) is the honest
+device-allocator high-water from StaticPlanBlockMemory; the free-delta is the full
+process residency including host staging. A fused on-device kernel for every region
+(not just the forward) would collapse the staging -- that is the profiling-phase target.
+
+### Deliverable (3): fail-loud on any region that can't run on CUDA -- one real bug found + fixed
+
+The FIRST 28→8-layer CUDA run RAISED at `path_c_relax_step_banks.py:packed` ->
+`RuntimeError: Unsupported device in DLTensor` from `np.from_dlpack(act_in)`. ROOT
+CAUSE: the abstract bank/optim/loss drivers were written for the CPU VM and called
+`np.from_dlpack` directly, which RAISES on CUDA device tensors (the documented PR-3
+CUDA-DLPack issue, previously fixed only in the dps adapter, not in the bank drivers).
+FIX (committed): device-agnostic `bank_arg_to_host` / `bank_writeback` helpers in
+`path_c_relax_step_banks.py`, used by EVERY driver (bank fwd/bwd, adam_inplace, loss) --
+zero-copy `np.from_dlpack` on CPU/Metal, `.numpy()` host-copy + `copyto` host->device on
+CUDA, RAISING fail-loud if neither route exists. After the fix every region runs on
+CUDA. RULE #1: no silent fallback -- the helpers RAISE on an un-handleable device.
+
+### The 28-layer compile-time gap (honest finding)
+
+The 28-layer whole-step module is ~146 `call_dps_packed` regions (28 fwd + 89
+recompute-fwd + 28 bwd + adam + loss). Its CUDA-VM build (`tvm.compile(target=cuda)`)
+is CPU-heavy and slow -- ~14 min wall at 100% CPU on gb10 (CallTIRRewrite +
+StaticPlanBlockMemory + codegen scale with region count). It COMPLETES and runs (above),
+but the compile time is the scaling cost to address before the profiling phase
+(memoize/cache the per-region lowering, or batch identical regions). At 8 layers the
+whole-step build+run is seconds.
+
+### CPU off-device testability (self-check, no GPU needed)
+
+`python -m cppmega_mlx.runtime.path_c_relax_train_step` builds + runs the SAME whole
+step on the LLVM VM at 4/8/16/28 layers, asserting the loss is finite AND matches a
+numpy reference of the same dataflow (max |dloss| 3.6e-10, param' checksum exact). So
+the e2e graph is testable on any host; gb10 CUDA is the on-device proof.
+
+### Verdict
+
+**YES -- there is a TESTABLE e2e graph train_step running on gb10 now.** It runs at the
+full **28-layer 1.8B config** (and 8/4 layers), loss finite (4.1656e-02), planned
+device-peak **8.787 GB**, with the REAL path_c-CUDA kernel proven through the forward
+boundary of the same graph. This gates (opens) the profiling phase. Remaining for
+profiling: the 28-layer CUDA-VM compile time (~14 min) and the host-staging overhead in
+the abstract drivers (free-delta 17.64 GB vs 8.787 GB device-plan) -- both addressable
+by fusing/caching the per-region on-device kernels.
+
+### PR 6 evidence (run, all pass, 2026-06-03)
+
+CPU self-check (off gb10):
+```
+TVM_LIBRARY_PATH=/Volumes/external/sources/tilelang/build/lib \
+PYTHONPATH=/Volumes/external/sources/cppmega.mlx \
+<python> -m cppmega_mlx.runtime.path_c_relax_train_step
+```
+gb10 CUDA e2e (real kernel):
+```
+PYTHONPATH=/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/cppmega_mlx \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/pr6_cuda_e2e_train_step_gb10.py
+```
+Both RAISE fail-loud (RULE #1) on a non-finite loss or any region that cannot run
+through the graph on the target. Last verified 2026-06-03: 28-layer 1.8B whole-step
+RUNS on gb10 CUDA, loss 4.165619e-02 finite, planned device-peak 8.787 GB, measured
+free-delta 17.64 GB.

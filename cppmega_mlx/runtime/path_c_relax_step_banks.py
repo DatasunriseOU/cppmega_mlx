@@ -131,6 +131,50 @@ class BankSinfo:
         return relax.TensorStructInfo((self.numel,), "float32")
 
 
+# --------------------------------------------------------------------------- #
+# Device-agnostic call_dps_packed ABI tensor import / writeback.
+#
+# The bank/optim/loss packed funcs run inside the Relax VM. On the CPU/LLVM VM the
+# ABI tensors are host-DLPack-importable (zero-copy np.from_dlpack). On a CUDA Relax
+# VM (tvm.cuda(0)) they arrive as DEVICE tensors and np.from_dlpack RAISES
+# "Unsupported device in DLTensor" -- so we route device tensors through .numpy()
+# (host copy) on read and tvm.runtime.tensor(...).copyto(out) (host->device) on write.
+# RULE #1 (fail loud): if neither route exists we RAISE; no silent fallback.
+# --------------------------------------------------------------------------- #
+def bank_arg_to_host(arg) -> np.ndarray:
+    """Import a call_dps_packed ABI tensor to host numpy, device-agnostically."""
+    try:
+        return np.from_dlpack(arg)
+    except Exception as dlpack_err:  # noqa: BLE001 -- CUDA: Unsupported device in DLTensor
+        to_numpy = getattr(arg, "numpy", None)
+        if to_numpy is None:
+            raise RuntimeError(
+                "FAIL-LOUD: bank ABI tensor is neither host-DLPack-importable nor has "
+                f"a .numpy() host-copy method (type={type(arg).__name__}); "
+                f"np.from_dlpack raised: {dlpack_err}") from dlpack_err
+        return np.ascontiguousarray(to_numpy())
+
+
+def bank_writeback(out_tensor, host_result: np.ndarray) -> None:
+    """Write a host numpy result into a call_dps_packed output tensor, device-agnostic."""
+    host_result = np.ascontiguousarray(host_result, np.float32)
+    try:
+        view = np.from_dlpack(out_tensor)
+        view[...] = host_result.reshape(view.shape)
+        return
+    except Exception:  # noqa: BLE001 -- CUDA: device DLPack rejected by numpy
+        pass
+    dev = getattr(out_tensor, "device", None)
+    copyto = getattr(out_tensor, "copyto", None)
+    if dev is None or copyto is None:
+        raise RuntimeError(
+            "FAIL-LOUD: bank output tensor is not host-DLPack-aliasable and lacks a "
+            f"(.device,.copyto) device-writeback path (type={type(out_tensor).__name__})")
+    src = tvm.runtime.tensor(
+        host_result.reshape(tuple(int(d) for d in out_tensor.shape)), device=dev)
+    src.copyto(out_tensor)
+
+
 def _region_fwd_driver(numels: dict[str, int]):
     """Packed func for a FORWARD region. Inputs (Relax tensors, read):
        act_in, param, state_in. Outputs (Relax tensors, write):
@@ -138,18 +182,18 @@ def _region_fwd_driver(numels: dict[str, int]):
        forward semantics over the bank flat ranges (downscaled, checkable)."""
 
     def packed(act_in, param, state_in, act_out, state_out):
-        a = np.from_dlpack(act_in)
-        p = np.from_dlpack(param)
-        s = np.from_dlpack(state_in)
-        ao = np.from_dlpack(act_out)
-        so = np.from_dlpack(state_out)
+        a = bank_arg_to_host(act_in)
+        p = bank_arg_to_host(param)
         # logical fwd: new activation bank = relu(act + small param-derived bias);
         # checkpoint = a snapshot of the activation (what bwd will read).
         bias = np.float32(p[: min(p.size, 1)].sum() * 1e-6) if p.size else np.float32(0.0)
-        ao[...] = np.maximum(a + bias, 0.0)
-        so[...] = 0.0
+        ao = np.maximum(a + bias, 0.0).astype(np.float32)
+        so = np.zeros(state_out.shape[0] if hasattr(state_out, "shape") else ao.size,
+                     np.float32)
         n = min(so.size, ao.size)
         so[:n] = ao[:n]  # checkpoint the activation for the backward read
+        bank_writeback(act_out, ao)
+        bank_writeback(state_out, so)
 
     return packed
 
@@ -162,22 +206,22 @@ def _region_bwd_driver(numels: dict[str, int]):
     to bwd-i -- the cross-pass concurrency."""
 
     def packed(actg_in, param, state_ckpt, paramg_in, actg_out, paramg_out):
-        g = np.from_dlpack(actg_in)
-        p = np.from_dlpack(param)
-        ck = np.from_dlpack(state_ckpt)
-        pgi = np.from_dlpack(paramg_in)
-        go = np.from_dlpack(actg_out)
-        pgo = np.from_dlpack(paramg_out)
+        g = bank_arg_to_host(actg_in)
+        ck = bank_arg_to_host(state_ckpt)
+        pgi = bank_arg_to_host(paramg_in)
+        go_n = actg_out.shape[0] if hasattr(actg_out, "shape") else g.size
         # logical bwd: gate the incoming grad by the saved checkpoint's relu mask,
         # propagate to the previous layer; accumulate a parameter grad.
-        n = min(g.size, ck.size, go.size)
+        n = min(g.size, ck.size, go_n)
         gate = (ck[:n] > 0.0).astype(np.float32)
-        go[...] = 0.0
+        go = np.zeros(go_n, np.float32)
         go[:n] = g[:n] * gate
         # grad accumulation: new paramg = old paramg + contribution (SSA in-place alias)
-        pgo[...] = pgi
+        pgo = pgi.astype(np.float32).copy()
         m = min(pgo.size, n)
         pgo[:m] = pgi[:m] + g[:m] * 1e-3
+        bank_writeback(actg_out, go)
+        bank_writeback(paramg_out, pgo)
 
     return packed
 

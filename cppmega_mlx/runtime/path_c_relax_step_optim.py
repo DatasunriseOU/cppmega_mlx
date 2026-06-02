@@ -80,6 +80,8 @@ from cppmega_mlx.runtime.path_c_relax_step_banks import (
     BANK_PARAMG,
     BANK_STATE,
     BankSinfo,
+    bank_arg_to_host,
+    bank_writeback,
     real_bank_numels,
     register_bank_drivers,
 )
@@ -114,19 +116,16 @@ ADAM_STEP = 1  # bias-correction step t (single train-step here)
 # --------------------------------------------------------------------------- #
 def _adam_inplace_driver(numels: dict[str, int]):
     def packed(param_in, m_in, v_in, grad_in, param_out, m_out, v_out):
-        p = np.from_dlpack(param_in)
-        m = np.from_dlpack(m_in)
-        v = np.from_dlpack(v_in)
-        g = np.from_dlpack(grad_in)
-        po = np.from_dlpack(param_out)
-        mo = np.from_dlpack(m_out)
-        vo = np.from_dlpack(v_out)
+        p = bank_arg_to_host(param_in)
+        m = bank_arg_to_host(m_in)
+        v = bank_arg_to_host(v_in)
+        g = bank_arg_to_host(grad_in)
         n = min(p.size, m.size, v.size, g.size)
         b1 = ADAM_B1
         b2 = ADAM_B2
         # m <- b1*m + (1-b1)*g ; v <- b2*v + (1-b2)*g^2  (standard Adam moments)
-        mo[...] = m
-        vo[...] = v
+        mo = m.astype(np.float32).copy()
+        vo = v.astype(np.float32).copy()
         mo[:n] = b1 * m[:n] + (np.float32(1.0) - b1) * g[:n]
         vo[:n] = b2 * v[:n] + (np.float32(1.0) - b2) * (g[:n] * g[:n])
         # bias correction at step t
@@ -134,8 +133,11 @@ def _adam_inplace_driver(numels: dict[str, int]):
         bc2 = np.float32(1.0) - b2 ** ADAM_STEP
         m_hat = mo[:n] / bc1
         v_hat = vo[:n] / bc2
-        po[...] = p
+        po = p.astype(np.float32).copy()
         po[:n] = p[:n] - ADAM_LR * m_hat / (np.sqrt(v_hat) + ADAM_EPS)
+        bank_writeback(param_out, po)
+        bank_writeback(m_out, mo)
+        bank_writeback(v_out, vo)
 
     return packed
 
