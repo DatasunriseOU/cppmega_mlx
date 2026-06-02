@@ -287,3 +287,90 @@ def mlx_cuda_array_to_tvm_tensor(arr: "mx.array") -> Any:
             f"dtype={arr.dtype}, shape={tuple(int(d) for d in arr.shape)}): "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+
+
+def _mlx_native_cuda_dlpack_available(arr: "mx.array") -> bool:
+    """Return True iff this MLX build natively exports a kDLCUDA DLPack capsule.
+
+    The native C++ export (MLX ``feat(dlpack)`` / commit 6da6a0e4) advertises
+    ``__dlpack_device__() == (kDLCUDA(2), id)`` and produces a real CUDA capsule
+    from ``__dlpack__()``. Older MLX builds either lack ``__dlpack__`` or raise
+    "CUDA DLPack export is not supported", in which case we fall through to the
+    ``data_ptr()`` Python escape hatch below. Both are genuine zero-copy paths.
+    """
+
+    dl_dev = getattr(arr, "__dlpack_device__", None)
+    if not callable(dl_dev) or not callable(getattr(arr, "__dlpack__", None)):
+        return False
+    try:
+        dev = dl_dev()
+    except Exception:
+        return False
+    return bool(dev) and int(dev[0]) in (kDLCUDA, kDLCUDAManaged)
+
+
+def mlx_cuda_array_to_torch_tensor(arr: "mx.array") -> Any:
+    """Import an MLX-CUDA array as a torch CUDA tensor view, zero-copy, via DLPack.
+
+    This is the device-view (no host roundtrip) counterpart to the numpy-copy
+    bridge in ``_cuda_eager._mlx_to_torch_cuda``. It feeds the TileLang
+    torch-backend kernel interfaces (``sparse_mla_fwd_interface`` /
+    ``sparse_mla_bwd``) a real device view of the MLX allocation — no copy, no
+    host bounce.
+
+    Two genuine zero-copy mechanisms, in preference order (NOT a silent
+    degrade — both are real zero-copy device views):
+
+    1. **Native MLX kDLCUDA export** (commit 6da6a0e4): hand the MLX array
+       straight to ``torch.from_dlpack``, which calls its ``__dlpack__()``.
+    2. **``data_ptr()`` Python escape hatch**: build the kDLCUDA
+       ``DLManagedTensor`` capsule from ``mx.array.data_ptr()`` (MLX #3342) and
+       import it. Used only when the native export is absent.
+
+    RAISES (no copy fallback) so a broken zero-copy path is surfaced, per RULE #1.
+    """
+
+    import torch
+    from torch.utils.dlpack import from_dlpack as _torch_from_dlpack
+
+    if _mlx_native_cuda_dlpack_available(arr):
+        # Native zero-copy: torch.from_dlpack consumes MLX's own __dlpack__()
+        # kDLCUDA capsule. MLX must flush its CUDA stream before handoff.
+        _synchronize_mlx_stream()
+        try:
+            t = torch.from_dlpack(arr)
+        except Exception as exc:  # noqa: BLE001 - surface where + what failed
+            raise RuntimeError(
+                f"_cuda_zerocopy: torch.from_dlpack rejected the MLX native "
+                f"kDLCUDA export (dtype={arr.dtype}, "
+                f"shape={tuple(int(d) for d in arr.shape)}): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    else:
+        if not hasattr(arr, "data_ptr"):
+            raise RuntimeError(
+                "_cuda_zerocopy: this MLX build neither exports a native kDLCUDA "
+                "DLPack capsule (__dlpack__) nor exposes mx.array.data_ptr(); "
+                "the zero-copy MLX->torch bridge cannot run. Build MLX at the "
+                "kDLCUDA-export commit (6da6a0e4) or a build with data_ptr() "
+                "(MLX #3342)."
+            )
+        capsule = mlx_cuda_array_to_dlpack_capsule(arr)
+        try:
+            t = _torch_from_dlpack(capsule)
+        except Exception as exc:  # noqa: BLE001 - surface where + what failed
+            raise RuntimeError(
+                f"_cuda_zerocopy: torch.utils.dlpack.from_dlpack rejected the "
+                f"MLX-CUDA data_ptr() capsule (device_type={_dlpack_device_type()}, "
+                f"device_id={_cuda_device_id()}, dtype={arr.dtype}, "
+                f"shape={tuple(int(d) for d in arr.shape)}): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    if not t.is_cuda:
+        raise RuntimeError(
+            "_cuda_zerocopy: torch imported the MLX-CUDA DLPack as a non-CUDA "
+            f"tensor (device={t.device}); the zero-copy bridge requires a CUDA "
+            "device view."
+        )
+    del torch
+    return t

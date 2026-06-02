@@ -28,13 +28,22 @@ softmax forward; preprocess-delta + atomic-scatter dKV backward).
 
 gb10 / sm_121 note
 ------------------
-The v32 fwd/bwd tiles request >48 KB dynamic shared memory. On gb10/sm_121 the
-TileLang/TVM runtime's ``cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)``
-opt-in is rejected by the driver above ~48 KB even though the device reports a
-99 KB opt-in carve-out, so the fused kernel does not yet run there (it lowers +
-compiles for sm_121a; only the runtime smem opt-in is blocked). On H100 (sm_90)
-/ B200 (sm_100) the carve-out fits and the fused path runs. This is surfaced
-loudly when forced, never silently degraded.
+RESOLVED (tilelang 823c807c): the v32 fwd/bwd tiles now FIT the gb10/sm_121
+99 KiB dynamic-smem carve-out via the re-tiled GB10 variant (``gb10=True``:
+block_I=16, num_stages=1, aggressive shared-memory merge, Hopper TMA-lower
+disabled, ``O_shared`` dropped, mask-in-shared). MEASURED on real sm_121a ptxas
+(CUDA 13.3): fwd 93.0 KiB, bwd <= 99 KiB; fwd cos 0.998, bwd dq/dkv cos 1.000 vs
+the upstream reference. The earlier >48 KB ``cuFuncSetAttribute`` rejection was a
+codegen/argbinder smem-emission bug, fixed in the merge-codegen-reorg branch.
+
+This wrapper forwards ``gb10`` (auto-detect by default, overridable via
+``CPPMEGA_SPARSE_MLA_V32_GB10``) so the kernel emits the GB10-fitting variant on
+sm_12x and the original Hopper kernel on sm_90/sm_100. MLX-CUDA q/kv/indices are
+fed to the torch-backend kernel interfaces zero-copy via DLPack when
+``CPPMEGA_TILELANG_CUDA_ZEROCOPY=1`` (kDLCUDA ``DLManagedTensor`` over
+``mx.array.data_ptr()``, no host roundtrip); outputs come back from torch (MLX
+cannot import a CUDA DLPack, so the torch->MLX writeback is a host bounce — an
+MLX limitation, surfaced honestly, not a silent degrade of the input path).
 """
 
 from __future__ import annotations
@@ -77,19 +86,69 @@ def _torch():
 
 
 def _mlx_to_torch_cuda(arr: mx.array):
-    """Materialize an MLX array as a contiguous CUDA torch tensor (no host copy
-    when a CUDA->CUDA DLPack bridge is available; otherwise via DLPack)."""
+    """Materialize an MLX array as a contiguous CUDA torch tensor.
+
+    When the zero-copy DLPack escape hatch is enabled
+    (``CPPMEGA_TILELANG_CUDA_ZEROCOPY=1``) the MLX-CUDA device buffer is handed to
+    torch via a kDLCUDA ``DLManagedTensor`` capsule with NO host roundtrip — the
+    returned tensor is a real device view of the MLX allocation. Otherwise we use
+    the numpy-host-roundtrip eager bridge (``_cuda_eager._mlx_to_torch_cuda``).
+
+    RULE #1: the zero-copy bridge RAISES with where+what on any failure; we never
+    silently fall back to the eager host-copy bridge while claiming zero-copy.
+    """
 
     torch = _torch()
-    from cppmega_mlx.nn._tilelang._cuda_eager import _mlx_to_torch_cuda as _bridge
+    if _zerocopy_enabled():
+        from cppmega_mlx.nn._tilelang._cuda_zerocopy import (
+            mlx_cuda_array_to_torch_tensor as _zc_bridge,
+        )
 
-    t = _bridge(arr)
+        t = _zc_bridge(arr)
+    else:
+        from cppmega_mlx.nn._tilelang._cuda_eager import _mlx_to_torch_cuda as _bridge
+
+        t = _bridge(arr)
     if not t.is_cuda:
         raise RuntimeError(
             "_sparse_mla_v32_fused: MLX->torch bridge did not yield a CUDA tensor; "
             "the fused v32 Sparse-MLA path requires CUDA buffers."
         )
+    # ``.contiguous()`` is a no-op (returns the same storage) for the row-major
+    # zero-copy view; it only copies if MLX handed us a strided buffer.
     return t.contiguous()
+
+
+def _zerocopy_enabled() -> bool:
+    """Return whether the zero-copy CUDA DLPack escape hatch is env-gated ON."""
+
+    from cppmega_mlx.nn._tilelang._cuda_zerocopy import zerocopy_enabled
+
+    return zerocopy_enabled()
+
+
+def _gb10_flag() -> bool | None:
+    """Resolve the ``gb10`` arch flag forwarded to the v32 fwd/bwd interfaces.
+
+    The upstream kernels accept ``gb10=None`` (auto-detect sm_12x), ``gb10=True``
+    (force the 99 KiB-fitting GB10 variant: block_I=16, num_stages=1, aggressive
+    smem merge, TMA-lower disabled), or ``gb10=False`` (the original Hopper
+    kernel). We default to auto-detect (``None``) so the kernel itself decides by
+    compute capability; ``CPPMEGA_SPARSE_MLA_V32_GB10`` forces the choice
+    (1/true/on -> True, 0/false/off -> False) for A/B testing or non-sm_12x hosts.
+    """
+
+    raw = os.environ.get("CPPMEGA_SPARSE_MLA_V32_GB10", "").strip().lower()
+    if raw == "":
+        return None
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "_sparse_mla_v32_fused: CPPMEGA_SPARSE_MLA_V32_GB10 must be one of "
+        f"1/true/on or 0/false/off (or unset for auto-detect); got {raw!r}."
+    )
 
 
 def _torch_cuda_to_mlx(tensor, dtype: mx.Dtype) -> mx.array:
@@ -204,6 +263,7 @@ def v32_fused_apply(
             kv_t.contiguous(),
             idx_t.contiguous(),
             sm_scale=float(sm_scale),
+            gb10=_gb10_flag(),
         )
         torch.cuda.synchronize()
     except Exception as exc:
@@ -256,6 +316,7 @@ def v32_fused_bwd(
             idx_t,
             lse_t,
             sm_scale=float(sm_scale),
+            gb10=_gb10_flag(),
         )
         torch.cuda.synchronize()
     except Exception as exc:
@@ -268,5 +329,7 @@ def v32_fused_bwd(
         ) from exc
 
     dq = _torch_cuda_to_mlx(dq_t, mx.bfloat16)
-    dkv = _torch_cuda_to_mlx(dkv_t.astype(torch.bfloat16), mx.bfloat16)
+    # ``sparse_mla_bwd``'s postprocess emits dkv as a torch fp32 tensor; cast to
+    # bf16 with torch's ``.to`` (NOT MLX/numpy ``.astype``) before the writeback.
+    dkv = _torch_cuda_to_mlx(dkv_t.to(torch.bfloat16), mx.bfloat16)
     return dq, dkv
