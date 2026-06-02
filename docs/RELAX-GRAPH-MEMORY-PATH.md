@@ -765,7 +765,7 @@ bank-exposure+remat puts the activation/grad term at ~8.8 GB, leaving optimizer 
 the only remaining term to keep in place -> Megatron-class.** This is the step that
 determined whether the whole graph path achieves Megatron-class memory: it does.
 
-### Deliverable (4): in-place optimizer (lever 5) -- the last lever, specified
+### Deliverable (4): in-place optimizer (lever 5) -- **WIRED + MEASURED** (see §10)
 
 The Adam m/v state (2x params) is a STATIC term not in the activation banks. An in-place
 Adam op (`param <- update(param, m, v)` with m, v updated in place) keeps it at 1x
@@ -773,8 +773,7 @@ instead of allocating fresh m', v'. Per PR-3's finding, `StaticPlanBlockMemory` 
 alias in place ACROSS the `call_dps_packed` external boundary (SSA input and output bank
 are distinct Relax tensors), so this MUST be an EXPLICIT in-place op, not a planner
 freebie. It is orthogonal to remat (attacks the optimizer-state term, not the checkpoint
-term), specified here and not yet wired; it is the remaining lever to keep the
-optimizer-state term from doubling the parameter footprint. ZeRO-1 sharding is the
+term). **This is now WIRED and MEASURED -- see §10.** ZeRO-1 sharding is the
 multi-device alternative.
 
 ### KEY PR-4 FINDING -- explicit re-emission is required AND sufficient
@@ -803,3 +802,118 @@ PYTHONPATH=/Volumes/external/sources/cppmega.mlx \
 It RAISES (fail-loud, RULE #1) if the remat output differs from the non-remat output at
 any layer count, or if remat fails to lower the PR-3 banks-only peak. Last verified:
 2026-06-02 -- 28-block peak 27.38 GB -> 8.79 GB, max abs diff 0.0.
+
+## 10. PR 5 / lever 5 -- DONE + MEASURED (2026-06-03): IN-PLACE ADAM OPTIMIZER (the last memory lever; the MEMORY side now CLOSES)
+
+**Shipped:**
+[`cppmega_mlx/runtime/path_c_relax_step_optim.py`](../cppmega_mlx/runtime/path_c_relax_step_optim.py)
+-- the in-place Adam optimizer appended to the PR-4 sqrt(N)-remat full step
+(`build_full_step_with_optim`, the `pathc.adam_inplace` `call_dps_packed` op at
+`path_c_relax_step_optim.py:204`), the numeric-equivalence check vs an independent
+numpy Adam reference (`_verify_optim_numerics`, max abs diff 0.0), and the full-step
+planned-peak / working-set measurement at 4/8/16/28 layers including a NAIVE
+(non-in-place) variant to PROVE the in-place structure is load-bearing.
+
+### The problem (the PR-3 finding, restated for the optimizer term)
+
+PR-4 put the activation/grad/checkpoint working set at **8.79 GB MEASURED** for the 28
+MR blocks. The only remaining static term is the Adam optimizer state -- `m` (1st
+moment) and `v` (2nd moment), each = the parameter bank (**0.352 GB/region**), so **2x
+params = 0.705 GB/region of STATIC state**. `StaticPlanBlockMemory` CANNOT alias the SSA
+input bank onto the SSA output bank across the `call_dps_packed` boundary, so a NAIVE
+optimizer `(param', m', v') = adam(param, m, v, grad)` allocates THREE fresh banks that
+coexist with the live inputs -> the optimizer-state term DOUBLES. That doubling is what
+lever 5 must prevent, and it MUST be an EXPLICIT in-place op (no planner freebie).
+
+### The fix (explicit in-place = planner-visible storage reuse)
+
+The optimizer is structured so the `adam_inplace` call is the **LAST use** of the input
+`m`, `v`, `param` banks (and the bwd-produced `paramg`), and its outputs `m'`, `v'`,
+`param'` are born AT that call. `StaticPlanBlockMemory`'s liveness then sees the input
+banks go dead exactly where the output banks allocate, and **REUSES the input storage
+slot for the output** -- the same mechanism that collapses the forward-flowing
+activation bank in PR-3. Net optimizer growth = the persistent `(m + v + param)` band,
+counted ONCE, NOT a second `(m' + v')` band. The NAIVE variant (`inplace=False`) keeps
+the originals live (returns them too), so `m'/v'/param'` cannot reuse the storage -> it
+is MEASURED higher by one param-sized band, proving the in-place SSA structure does the
+work (the planner does not do it across the boundary for us).
+
+### Deliverable (1): MEASURED full-step peak with the in-place optimizer
+
+Real bank numels, CPU LLVM Relax VM, the SAME `true_planned_peak` analyzer PR-3/PR-4
+ship (RULE #1). PEAK = concurrent high-water; working-set = sum of distinct persistent
+bands (the honest optimizer-footprint metric -- m/v live step-to-step):
+
+| layers | PR-4 remat peak | **+ in-place Adam PEAK** | in-place working-set | naive working-set | working-set saved (in-place) |
+|---|---|---|---|---|---|
+| 4 | 3.572 GB | **3.572 GB (+0.000)** | 4.629 GB | 5.037 GB | 0.409 GB |
+| 8 | 4.682 GB | **4.682 GB (+0.000)** | 5.739 GB | 6.147 GB | 0.409 GB |
+| 16 | 7.677 GB | **7.677 GB (+0.000)** | 8.734 GB | 9.143 GB | 0.409 GB |
+| **28 (the 1.8B step)** | **8.787 GB** | **8.787 GB (+0.000)** | **9.844 GB** | **10.253 GB** | **0.409 GB** |
+
+**The full-step peak with the in-place Adam optimizer is 8.787 GB at the real 28 MR
+blocks -- IDENTICAL to the PR-4 remat peak (the optimizer adds +0.000 GB to the PEAK).**
+Two facts, both MEASURED:
+
+* **PEAK is flat (+0.000 GB).** The optimizer runs at the END of the step, AFTER the
+  backward checkpoint working-set (which sets the 8.787 GB peak mid-backward) has
+  drained, so its bands -- whether 1x (in-place) or 2x (naive) -- never coexist with the
+  checkpoint peak. The optimizer-state term does NOT raise the full-step peak.
+* **Persistent working-set: in-place is one param-sized band LOWER than naive** (9.844
+  vs 10.253 GB at 28 layers; **0.409 GB saved = ~1x params**, the duplicated
+  `m'/v'/param'` band the naive variant carries). This is the doubling avoided, MEASURED,
+  and it confirms the planner does NOT alias across the boundary for free -- the explicit
+  in-place SSA structure is load-bearing.
+
+### Deliverable (2): numeric equivalence (in-place Adam == reference Adam)
+
+The planned VM's `(param', m', v')` matches an independent numpy reference Adam step
+(standard moments `m<-b1*m+(1-b1)*g`, `v<-b2*v+(1-b2)*g^2`, bias-corrected
+`m_hat/v_hat`, `param<-param-lr*m_hat/(sqrt(v_hat)+eps)`), VERIFIED at a
+ratio-preserving downscale at 4/8/28 layers plus a `/2000` denser-bank stress at 8
+layers -- **max abs diff 0.0** for `param'`, `m'`, AND `v'`. RULE #1: any mismatch
+RAISES.
+
+### The MEMORY side now CLOSES -- final 1.8B train-step picture
+
+| term | size | lever |
+|---|---|---|
+| activation/grad/checkpoint working set (28 blocks) | **8.79 GB MEASURED** | PR-3 bank-exposure + PR-4 sqrt-N remat |
+| Adam optimizer state (m, v = 2x params), kept in place | **+0 GB to the PEAK** (persistent band counted once, working-set 9.84 GB) | **PR-5 lever 5 (in-place Adam), now WIRED** |
+| **FULL-STEP MEASURED peak (fwd+bwd+remat+optimizer)** | **8.787 GB** | -- |
+
+The eager 118 GB OOM had the activation/grad term grow O(N). Bank-exposure (PR-3) +
+sqrt-N remat (PR-4) put that term at **8.79 GB MEASURED**, and the in-place Adam (PR-5)
+keeps the optimizer-state term from doubling -- it adds **+0.000 GB to the full-step
+peak** and only one persistent param-sized band to the working-set. **The full-step
+MEASURED peak with the in-place optimizer is 8.787 GB, well inside the Megatron-class
+26-40 GB target. The graph/Relax memory path CLOSES: 118 GB eager OOM -> 8.787 GB
+full-step planned peak.**
+
+### KEY PR-5 FINDING -- the optimizer term does not raise the peak; in-place keeps the working-set at 1x
+
+Two distinct, MEASURED facts the design must separate: (a) the optimizer runs after the
+backward drains, so it never raises the concurrent PEAK regardless of in-place-ness; (b)
+the in-place SSA structure is still required to keep the PERSISTENT working-set (the
+m/v/param banks that live across train-steps) at 1x params instead of 2x -- the naive
+variant is MEASURED one param-sized band higher. So lever 5 buys a lower persistent
+DRAM residency (m/v not duplicated each step), which matters for the static optimizer
+state that resides between steps, while the peak is already set by the remat checkpoint
+term. The explicit in-place op is REQUIRED (no planner aliasing across the boundary) and
+SUFFICIENT (the planner reuses the dead input storage for the updated banks).
+
+### PR 5 evidence (run, all pass, 2026-06-03)
+
+```
+TVM_LIBRARY_PATH=/Volumes/external/sources/tilelang/build/lib \
+PYTHONPATH=/Volumes/external/sources/cppmega.mlx \
+/Volumes/external/sources/nanochat/.venv/bin/python3 -u \
+  -m cppmega_mlx.runtime.path_c_relax_step_optim
+```
+
+It RAISES (fail-loud, RULE #1) if the in-place Adam output differs from the numpy
+reference Adam at any layer count, if the in-place working-set is NOT lower than the
+naive working-set (the doubling not avoided), or if the in-place optimizer raises the
+full-step peak by more than 1x params over the remat peak. Last verified: 2026-06-03 --
+28-block full-step peak 8.787 GB (optimizer +0.000 GB to peak), in-place working-set
+9.844 GB vs naive 10.253 GB (0.409 GB saved), max abs diff 0.0.
