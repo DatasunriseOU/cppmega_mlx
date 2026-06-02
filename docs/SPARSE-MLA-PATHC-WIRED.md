@@ -73,10 +73,17 @@ zero-copy bridge calls = **15**, eager-host bridge calls = **0**, all elements f
 **PHASE 2 — fused path_c at model scale** (no dense ref — it would need ~17 TB)
 `B=1 S=4096 SKV=8192 H=128 topk=2048`:
 
-- fwd: finite=True, latency = 3860 ms, out_abs_mean = 0.0140
-- fwd+bwd: finite=True, latency = 7765 ms, dq_abs_mean = 0.0051, dkv_abs_mean = 0.0571
-- peak_mem = **7.45 GiB**
+- fwd: finite=True, latency = **632.7 ms** (was 3860 ms host-bounce), out_abs_mean = 0.0140
+- fwd+bwd: finite=True, latency = **1419.3 ms** (was 7765 ms host-bounce), dq_abs_mean = 0.0051, dkv_abs_mean = 0.0571
+- peak_mem = **5.38 GiB** (was 7.45 GiB)
 - zero-copy = 15, eager = 0
+
+> Re-measured 2026-06-02 after the MLX-CUDA DLPack-import deadlock fix (below)
+> made the **output** torch->MLX writeback genuine deadlock-free zero-copy: fwd
+> **3860 -> 632.7 ms (6.1x)**, fwd+bwd **7765 -> 1419.3 ms (5.5x)**, also beating
+> the prior 2824 ms host-bounce fused-fwd number. The latency win now SURVIVES
+> through path_c; the residual is per-call wrapper/JIT-dispatch overhead, not a
+> host PCIe bounce.
 
 The proof that the **real fused kernel ran** (not the reference, not the eager
 host bridge): `zero-copy bridge calls = 15` and `eager = 0` for fwd+bwd inputs,
@@ -105,17 +112,61 @@ Through the **current path_c wrapper**:
 
 - **Memory win SURVIVES** — measured **12.9× less peak** at `S=4096/topk=256`
   (2.07 GiB fused vs 26.8 GiB dense torch reference).
-- **Latency win does NOT survive** — per-call wrapper overhead dominates:
-  - the **output** torch→MLX writeback is a host bounce
-    (`_cuda_eager._torch_cuda_to_mlx` does `.cpu().numpy()` — MLX cannot *import*
-    a CUDA DLPack capsule, `convert.cpp:155`), copying the ~0.5 GB output
-    GPU→host→GPU every call;
-  - `sparse_mla_fwd_interface` does a per-call JIT-cache dispatch.
-  - Net measured fused-fwd-through-path_c ≈ 2824 ms vs dense ref 698 ms at that
-    shape — **overhead-bound, NOT kernel-bound.** The **input** side is true
-    zero-copy (0 eager / DLPack).
+- **Latency win now SURVIVES** (re-measured 2026-06-02, after the DLPack-import
+  deadlock fix below). Both sides of the bridge are now true GPU-resident
+  zero-copy:
+  - **input** side: native MLX kDLCUDA `__dlpack__` -> `torch.from_dlpack` (always was zero-copy);
+  - **output** side: torch CUDA result -> `mx.array` now imports the foreign
+    CUDA buffer with a single on-device `cudaMemcpy` into an MLX-owned buffer
+    (no `.cpu().numpy()`, no GPU->host->GPU PCIe bounce).
+  - Net fused fwd-through-path_c at S=4096/topk=2048: **632.7 ms** (was 3860 ms),
+    fwd+bwd **1419.3 ms** (was 7765 ms) — now wrapper/JIT-dispatch-bound, not
+    host-bounce-bound. `sparse_mla_fwd_interface` still does a per-call
+    JIT-cache dispatch (the remaining overhead).
 
-**Correctness is CLOSED.** The remaining work is pure-perf: a CUDA-DLPack
-*import* into MLX (or an MLX-side output buffer the kernel writes in place) to
-kill the output host bounce, plus hoisting the kernel handle out of the per-call
-interface. That is a latency optimization, not a correctness gap.
+**Correctness is CLOSED and the latency win is RESTORED.** The residual overhead
+is the per-call JIT-cache dispatch in `sparse_mla_fwd_interface` (hoisting the
+kernel handle out of the per-call interface would shave it further) — a latency
+optimization, not a correctness gap.
+
+## MLX-CUDA DLPack-import deadlock (root cause + fix, 2026-06-02)
+
+The output-side zero-copy import (`mx.array(torch_cuda_tensor)` ->
+`convert.cpp:cuda_dlpack_to_mlx`) initially **DEADLOCKED on the SECOND
+consecutive import + `mx.synchronize`** — i.e. on every iteration of a training
+loop. EXIT=124 (timeout) on isolation probes.
+
+**Root cause.** The first import implementation wrapped the foreign CUDA pointer
+in an `mx::array` whose **deleter CAPTURED the nanobind `owner`** (the source
+torch tensor / DLPack capsule, a `shared_ptr<nb::ndarray>`). Releasing that
+owner decrefs a Python object, which needs the **GIL**. When MLX's **scheduler
+thread** later destroyed that array's `Data` (e.g. during a subsequent
+`mx.synchronize`, which the main thread calls *while holding the GIL*), the
+scheduler thread blocked forever waiting for the GIL -> deadlock. A
+`gil_scoped_release` around the import's own eval did NOT fix it (the deadlock is
+at the LATER user-called `mx.synchronize`, not the import's eval) — reverted.
+
+**Fix (DatasunriseOU/mlx).** A new CUDA backend primitive
+`cu::copy_external_to_mlx_buffer(src, nbytes)` (`mlx/backend/cuda/allocator.cpp`,
+declared in `cuda.h`, stubbed in `no_cuda.cpp`): (1) `allocator().malloc(nbytes)`
+-> a REAL MLX-managed buffer, (2) a single synchronous `cudaMemcpy(dst, src,
+nbytes, cudaMemcpyDefault)` on the **calling** thread, (3) return the MLX-owned
+buffer. `cuda_dlpack_to_mlx_contiguous` then builds the `mx::array` from that
+MLX-owned buffer with the **default `allocator::free` deleter** — so **NO foreign
+buffer and NO Python/DLPack owner ever enters MLX's graph or scheduler**. The
+torch capsule is only READ during the copy and is released on the calling thread
+(which holds the GIL). `allocator::free` runs GIL-free, so the scheduler thread
+can never deadlock.
+
+Tradeoff: this is a device-to-device `cudaMemcpy` (a single fast on-device copy,
+no host bounce), not pointer-aliasing zero-copy — but it is deadlock-free and
+correct, and recovers essentially all of the latency vs the prior
+`.cpu().numpy()` host round-trip.
+
+**Verified (gb10, /home/dave/cppmega-venv/bin/python):**
+- `/tmp/iso_probe.py` (single + second import + sync): EXIT=0 (was hang).
+- `/tmp/iso2_probe.py` (import/eval/sync x3): EXIT=0 (was EXIT=124 at Test 2).
+- 100x loop (torch CUDA -> `mx.array` -> MLX op -> `mx.synchronize`): EXIT=0,
+  **bit-identical every iter** (max_abs_err=0.0), 0.09s total.
+- path_c e2e (`verify_sparse_mla_v32_pathc_e2e.py`): EXIT=0, zero-copy=15,
+  eager=0, fwd cos=1.0000, latency restored as above.

@@ -384,9 +384,11 @@ def mlx_cuda_array_to_torch_tensor(arr: "mx.array") -> Any:
 # A TileLang/torch-CUDA kernel writes its result into a torch CUDA tensor; this
 # imports it straight back into an ``mx.array`` via DLPack with NO ``.cpu()``
 # host roundtrip. It relies on the native MLX CUDA *import* (DatasunriseOU fork:
-# convert.cpp ``cuda_dlpack_to_mlx`` + cuda backend ``import_external_buffer``),
-# which wraps the foreign CUDA buffer zero-copy and materializes it into an
-# MLX-owned GPU allocation with a single device-side copy (no PCIe bounce).
+# convert.cpp ``cuda_dlpack_to_mlx`` + cuda backend
+# ``copy_external_to_mlx_buffer``), which copies the foreign CUDA buffer into a
+# fresh MLX-owned GPU allocation with a single on-device ``cudaMemcpy`` (no PCIe
+# host bounce, and DEADLOCK-FREE under repeated imports: no foreign buffer / no
+# Python owner ever enters MLX's scheduler — see docs/SPARSE-MLA-PATHC-WIRED.md).
 #
 # RULE #1: if the running MLX build lacks the CUDA import (older binary that
 # still raises "CUDA DLPack import is not supported"), we RAISE with where+what
