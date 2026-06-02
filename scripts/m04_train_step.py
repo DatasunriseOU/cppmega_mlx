@@ -6827,6 +6827,23 @@ def _path_c_call_cuda_artifact_with_mlx_bridge(
     so the Apple/Metal zero-copy path never enters here.
     """
 
+    from cppmega_mlx.nn._tilelang._cuda_zerocopy import zerocopy_enabled
+
+    if zerocopy_enabled():
+        # ZERO-COPY path (CPPMEGA_TILELANG_CUDA_ZEROCOPY=1): hand the caller-owned
+        # MLX-CUDA arrays straight to the tvm-ffi CUDA artifact. The TileLang
+        # adapter is now device-aware (accepts kDLCUDA/kDLCUDAManaged DLPack for a
+        # cuda kernel), and _cuda_zerocopy builds a real DLManagedTensor from
+        # mx.array.data_ptr() so no host roundtrip happens. RULE #1: any failure
+        # RAISES here -- there is NO silent fallback to the eager copy bridge.
+        return _path_c_call_cuda_artifact_zerocopy_mlx(
+            artifact=artifact,
+            arrays=arrays,
+            kernel_arg_buffer_names=kernel_arg_buffer_names,
+            buffers=buffers,
+            mx_module=mx_module,
+        )
+
     from cppmega_mlx.nn._tilelang._cuda_eager import (
         _mlx_to_torch_cuda,
         _torch_cuda_to_mlx,
@@ -6900,6 +6917,63 @@ def _path_c_call_cuda_artifact_with_mlx_bridge(
     )
     if buffer_outputs:
         mx_module.eval(*buffer_outputs)
+    return result
+
+
+def _path_c_call_cuda_artifact_zerocopy_mlx(
+    *,
+    artifact: Any,
+    arrays: tuple[Any, ...],
+    kernel_arg_buffer_names: Mapping[int, tuple[str, tuple[int, ...] | None]],
+    buffers: dict[str, Any],
+    mx_module: Any,
+) -> Any:
+    """Call a CUDA direct-chain artifact zero-copy with MLX-CUDA arrays.
+
+    Interim escape hatch (docs/DLPACK-CUDA-FIXES.md plan B). The caller-owned MLX
+    arrays are passed straight to the tvm-ffi CUDA artifact; the TileLang adapter
+    is now device-aware and ``_cuda_zerocopy`` builds a real ``DLManagedTensor``
+    from ``mx.array.data_ptr()`` (no host roundtrip). The kernel writes in place
+    into the same CUDA buffer the MLX array views, so the owning bank buffer is
+    already updated -- we re-register the same array object (no copy/stitch).
+
+    RULE #1: this is the explicit zero-copy clear path; any failure RAISES (it is
+    selected only when ``CPPMEGA_TILELANG_CUDA_ZEROCOPY=1``). There is NO silent
+    fallback to the eager copy bridge.
+    """
+
+    from cppmega_mlx.nn._tilelang._cuda_zerocopy import _synchronize_mlx_stream
+
+    # Ensure every MLX buffer arg is materialized on the CUDA stream before the
+    # kernel reads its device pointer (DLPack producer-side stream contract).
+    buffer_args = tuple(arg for arg in arrays if hasattr(arg, "shape"))
+    if buffer_args:
+        mx_module.eval(*buffer_args)
+    _synchronize_mlx_stream()
+
+    # Pass MLX arrays directly; the adapter imports them zero-copy via DLPack.
+    result = artifact(*arrays)
+
+    # The kernel mutated the device memory the MLX arrays already alias, so the
+    # caller-owned banks are updated in place. Re-bind the same objects so the
+    # direct-chain in/out ABI (buffers[name]) reflects the kernel result, and
+    # synchronize so the writes are visible before any downstream read.
+    updated_outputs: list[Any] = []
+    for position, arg in enumerate(arrays):
+        if position in kernel_arg_buffer_names:
+            name, _expected_shape = kernel_arg_buffer_names[position]
+            if name in buffers:
+                buffers[name] = arg
+                updated_outputs.append(arg)
+
+    # Device-synchronize so the kernel's writes are visible before any downstream
+    # read of the aliased MLX buffers. A failed sync would mean we cannot prove
+    # ordering, so RAISE (RULE #1) rather than hand back possibly-stale data.
+    import torch as _torch
+
+    _torch.cuda.synchronize()
+    if updated_outputs:
+        mx_module.eval(*updated_outputs)
     return result
 
 
