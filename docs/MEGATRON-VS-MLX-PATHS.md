@@ -148,6 +148,31 @@ Sources: `reports/cppmega_1b_speed_matrix_gb10_fastfused_20260601_b2s512.md`,
 > ~65 GiB peak is the MLX-CUDA **allocator high-water mark**, not the live working set (3 GiB); driving it to the
 > 30–40 GiB target needs allocator-limit pinning / Relax whole-step liveness (roadmap §4), not more grad-accum.
 
+> **1.8B update (2026-06-02, MLX-CUDA kernel fix, MLX commit `0f54b940d` DatasunriseOU/mlx@upstream-integration):**
+> The **1.8B** `local_gb10_quarter` backward (efficient MoE, Adam8bit, bs=4×seq=4096, grad-accum=4) was blocked on
+> gb10 by a **kernel-launch** failure — `cudaLaunchKernelExC` / `cudaGraphAddKernelNode … invalid argument` at the
+> first microbatch. Root cause (found by resolving the failing kernel pointer to a symbol — `binary_g<Multiply,bf16>`
+> with `grid=(1,458640,1)`): a **CUDA `gridDim.y` overflow**. CUDA caps `gridDim.y`/`gridDim.z` at **65535**, but
+> MLX-CUDA's generic elementwise/copy kernels (`binary_g`, `copy_g*`) and the quantized matvec/gather kernels
+> (`fp_qmv`, `gemv_gather`/`gemv_batched`) map a large *rest*/batch/index count straight onto `gridDim.y`. For the
+> 1.8B model's flattened MoE tensors that count reaches **~458 640**, so the launch is rejected. (The earlier
+> hypothesis that this was a `qmm_sm90` >48 KB shared-memory opt-in bug was **wrong** — `qmm_sm90` is `sm_90`-only and
+> never runs on sm_121; the failing kernels use `smem=0`.) **Fix:** split the row-block count across `gridDim.y` and
+> `gridDim.z`, reconstructing the row as `blockIdx.y + blockIdx.z*gridDim.y` (identity when `gridDim.z==1`; numerics
+> unchanged); plus a central fail-loud `cudaFuncSetAttribute` >48 KB dynamic-smem opt-in at the launch chokepoint for
+> the CUTLASS quantized kernels that genuinely need it on sm_121.
+>
+> **Result:** the 1.8B backward now **launches successfully** on gb10 — the `invalid argument` failure is gone (a
+> 1-step diagnostic confirms every kernel grid is within CUDA limits and no launch fails). **However**, the full
+> bs=4×seq=4096 step then hits a *separate* genuine **memory-capacity OOM** — `cudaMallocAsync … out of memory` at
+> the backward `mx.eval`, even with `--grad-checkpoint`. This is the **MLX eager-AD allocator high-water mark**: the
+> 542.5M dense model already peaks at ~65 GiB for this config (row above), and the 1.8B model is ~3.4× larger, so its
+> eager backward exceeds the 118 GB unified-memory box. This is the documented memory-architecture limitation (roadmap
+> §4: allocator-limit pinning / Relax whole-step liveness) — **not** the kernel bug. **No 1.8B steady-state tok/s could
+> be measured** because the step cannot complete within the box at this config; the kernel blocker, however, is fixed.
+> The apples-to-apples Megatron baseline remains **3399 tok/s @ ~26 GB** (Megatron fits 1.8B-shape via selective
+> recompute + distributed optimizer; MLX eager AD does not, yet).
+
 ---
 
 ## 3. Apples-to-apples normalization
