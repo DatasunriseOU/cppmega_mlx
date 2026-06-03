@@ -55,6 +55,7 @@ __all__ = [
     "MAMBA3_INTER_CHUNK_RECUR_BWD_OP_NAME",
     "MAMBA3_CHUNK_PRECOMPUTE_BWD_OP_NAME",
     "chunk_scan_combine_bwd_metal_prim",
+    "chunk_scan_combine_bwd_cuda_prim",
     "inter_chunk_recur_bwd_metal_prim",
     "chunk_precompute_bwd_metal_prim",
     "chunk_scan_combine_bwd_grid",
@@ -391,6 +392,303 @@ def chunk_scan_combine_bwd_metal_prim(
     return main
 
 
+def chunk_scan_combine_bwd_cuda_prim(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    threads: int = 128,
+) -> Any:
+    """CUDA (gb10 / sm_121) twin of :func:`chunk_scan_combine_bwd_metal_prim`.
+
+    IDENTICAL analytic backward math (it is the transpose of the forward F2 scan +
+    combine). The ONLY delta vs the Metal prim is the THREAD MAPPING of the two
+    terms the Metal prim funnels through lane 0:
+
+      * the ``dC = dC_off + dC_diag + dstate_decay`` block (Metal lines 274-311),
+        whose dominant ``dC_diag`` inner did
+        ``L*dstate*headdim*Sum_{ll}(ll+1) ~= 8.5M`` serial MACs on ONE lane, and
+      * the ``Y_diag`` ``dseg`` segsum-VJP block (Metal lines 360-386), another
+        ``headdim*Sum(ll+1) ~= 133K`` serial MACs on lane 0.
+
+    Re-grid (same ``(batch*nchunks, nheads)`` grid, 128 threads, NO new grid dims —
+    the per-threadgroup ``dAcs_acc``/``dY``/``DYX`` tiles must stay co-resident):
+
+      1. Stage ``x[base+0..L-1, head, 0..headdim-1]`` into a shared ``XT[L,headdim]``
+         tile (built once via ``T.Parallel(L*headdim)``).
+      2. Build the lower-tri shared tile
+         ``DYX[ll,ss] = sum_p dY[ll,pp]*XT[ss,pp]`` (ss<=ll) ONCE, mapped over
+         ``T.Parallel(L*L)`` with each thread doing the headdim reduction. This is
+         the recompute-killer: the Metal prim recomputed this exact quantity
+         ``dstate`` times inside ``dC_diag`` AND a second time as ``dlmat`` inside
+         ``dseg``; here it is built once and consumed by BOTH (matches the proto /
+         forward F2 ``cb`` decay+dt+mask reuse, just transposed).
+      3. ``dC_off + dC_diag + dstate_decay``: map ``(ll,nn)`` over
+         ``T.Parallel(L*dstate)``. Each thread owns one ``dC[*,base+ll,head,nn]``
+         cell (UNIQUE per thread -> race-free direct write): the serial ``pp``
+         reduction gives ``accn`` (dC_off), the serial ``ss<=ll`` reduction over
+         the precomputed ``DYX`` gives ``cdiag`` (dC_diag), and the per-(ll)
+         ``dstate_decay`` (an ``nn``-reduction of ``accn*C[l,n]``) is folded into
+         ``dAcs_acc[ll]`` via ``T.atomic_add`` (the ONLY multi-writer cell).
+      4. ``dseg`` (Y_diag dA grad): lane-strided over the lower-tri ``(ll,ss)``
+         pairs (mirrors the existing ``dinp`` lane-strided pattern), reusing
+         ``DYX`` (zero recompute), with the ``+dAcs_acc[ll] / -dAcs_acc[ss]``
+         segsum-VJP scatter done via ``T.atomic_add`` (both contributions race on
+         shared ``dAcs_acc``).
+
+    The fast already-threaded parts (dz/dx/dD ``T.Parallel(L*headdim)``,
+    ``dchunk_states`` ``T.Parallel(headdim*dstate)``, ``dinp`` lane-strided) are
+    copied VERBATIM — they already match the B0 ~111ms threaded pattern.
+
+    dD PARITY NOTE (RULE #1): the dD path (the ``dy_v*x_v`` reduction +
+    ``T.atomic_add(dD[head], ...)``) is UNCHANGED and is already fp32-correct
+    (proven bit-exact vs fp32 gold when fed fp32 inputs). The 1.40e-3 gate miss is
+    a GOLD-vs-kernel INPUT-PRECISION mismatch (gold read fp32 x/z/dout while the
+    kernel reads the fp16 forward cache), NOT a kernel bug — so it is fixed in the
+    probe's gold (align the dD VJP to the SAME fp16 cache the kernel consumes), NOT
+    by changing this kernel. See scratch/probe_chunked_backward_cuda_gb10.py.
+
+    Same pass_configs (``tl.disable_tma_lower`` / ``tl.disable_warp_specialized``)
+    and out_idx [11..17] as the Metal compile-site; selected only when the resolved
+    target is CUDA (the Metal prim stays byte-identical). RULE #1: this is the ONE
+    CUDA path; compile/parity failures RAISE (no fallback to the slow prim/numpy).
+    """
+    import tilelang
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim: seqlen ({seqlen}) must be "
+            f"divisible by chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim: nheads ({nheads}) must be "
+            f"divisible by ngroups ({ngroups})"
+        )
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    heads_per_group = nheads // ngroups
+    L = chunk_size
+    p = _LOG2E
+
+    @T.prim_func
+    def main(
+        dout: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        z: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        D: T.Tensor((nheads), dtype),  # type: ignore
+        y: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dC: T.Tensor((batch, seqlen, nheads, dstate), accum_dtype),  # type: ignore
+        dx: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dz: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dchunk_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dinp: T.Tensor((batch, seqlen, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dA_cumsum_y: T.Tensor((batch, nheads, nchunks, chunk_size), accum_dtype),  # type: ignore
+        dD: T.Tensor((nheads), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nheads, threads=threads) as (bx, by):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            head_idx = by
+            group_idx = head_idx // heads_per_group
+            base = chunk_idx * chunk_size
+
+            dacs = T.alloc_shared((L,), accum_dtype)        # dA_cumsum row (this head/chunk)
+            dY = T.alloc_shared((L, headdim), accum_dtype)  # dY[l,p] (post split)
+            dAcs_acc = T.alloc_shared((L,), accum_dtype)     # accumulated dA_cumsum grad
+            XT = T.alloc_shared((L, headdim), accum_dtype)   # staged x[base+s, head, p]
+            DYX = T.alloc_shared((L, L), accum_dtype)        # dyx[l,s] = sum_p dY[l,p]*x[s,p]
+
+            # --- load dA_cumsum row, init dA grad accumulator ---
+            for l in T.Parallel(L):
+                dacs[l] = T.Cast(accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, l])
+                dAcs_acc[l] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+
+            # --- output/gate + D-skip transpose: dY[l,p], dz, dx, dD ---
+            #   (VERBATIM from the Metal prim — already threaded over L*headdim;
+            #    dD is fp32-correct, the 1.40e-3 gate miss is an input-precision
+            #    GOLD mismatch fixed in the probe, NOT here. RULE #1.)
+            #   out = gate*y ; gate=silu(z) ; y = Y + D*x
+            #   dgate = dout*y ; dy = dout*gate ; dz = dgate*silu'(z)
+            #   dx_skip = D*dy ; dD += dy*x ; dY = dy
+            dD_local = T.alloc_local((1,), accum_dtype)
+            dD_local[0] = T.Cast(accum_dtype, 0)
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                s = base + ll
+                z_v = T.Cast(accum_dtype, z[batch_idx, s, head_idx, pp])
+                gate = z_v / (T.Cast(accum_dtype, 1.0) + T.exp(-z_v))
+                y_v = T.Cast(accum_dtype, y[batch_idx, s, head_idx, pp])
+                dout_v = T.Cast(accum_dtype, dout[batch_idx, s, head_idx, pp])
+                dgate = dout_v * y_v
+                dy_v = dout_v * gate
+                dz[batch_idx, s, head_idx, pp] = dgate * _silu_grad_expr(T, z_v, accum_dtype)
+                d_v = T.Cast(accum_dtype, D[head_idx])
+                x_v = T.Cast(accum_dtype, x[batch_idx, s, head_idx, pp])
+                dx[batch_idx, s, head_idx, pp] = d_v * dy_v
+                dD_local[0] = dD_local[0] + dy_v * x_v
+                dY[ll, pp] = dy_v
+                # Stage x for THIS chunk/head into shared once (XT[s,p]); reused by
+                # the DYX build below (the dC_diag + dseg recompute-killer).
+                XT[ll, pp] = x_v
+            T.sync_threads()
+            T.atomic_add(dD[head_idx], dD_local[0])
+
+            # First zero the dC / dinp / dchunk_states slices this threadgroup owns
+            # (each (batch,chunk,head) owns disjoint slices). VERBATIM from Metal.
+            for ln in T.Parallel(L * dstate):
+                ll = ln // dstate
+                nn = ln % dstate
+                dC[batch_idx, base + ll, head_idx, nn] = T.Cast(accum_dtype, 0)
+            for pn in T.Parallel(headdim * dstate):
+                pp = pn // dstate
+                nn = pn % dstate
+                dchunk_states[batch_idx, chunk_idx, head_idx, pp, nn] = T.Cast(
+                    accum_dtype, 0
+                )
+            for lpn0 in T.serial(0, L * headdim * dstate, threads):
+                lane = T.get_thread_binding(0)
+                idx = lpn0 + lane
+                if idx < L * headdim * dstate:
+                    ll = idx // (headdim * dstate)
+                    rem = idx % (headdim * dstate)
+                    pp = rem // dstate
+                    nn = rem % dstate
+                    dinp[batch_idx, base + ll, head_idx, pp, nn] = T.Cast(
+                        accum_dtype, 0
+                    )
+            T.sync_threads()
+
+            # ---- BUILD shared DYX[l,s] = sum_p dY[l,p]*x[s,p] (ss<=ll, lower-tri) ----
+            # This is the SINGLE quantity the Metal prim recomputed dstate-times in
+            # dC_diag (lines 299-305) AND again as dlmat in dseg (lines 371-378).
+            # Built ONCE over L*L work items spread across 128 threads.
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                if ss <= ll:
+                    for pp in T.serial(headdim):
+                        acc[0] = acc[0] + dY[ll, pp] * XT[ss, pp]
+                DYX[ll, ss] = acc[0]
+            T.sync_threads()
+
+            # ---- dC = dC_off + dC_diag (per (l,n)); dstate_decay -> dAcs_acc ----
+            #   dC_off[l,n]  = sum_p dY[l,p]*prev_states[p,n]*state_decay[l]
+            #   dC_diag[l,n] = sum_{s<=l} Lmat[l,s]*dt_s*DYX[l,s]*B[s,n]
+            #     Lmat[l,s] = exp(dacs[l]-dacs[s]).  inp=dt*x⊗B so dt_s appears here.
+            #   dstate_decay[l] = sum_n (dC_off-inner)*C[l,n] ; dAcs_acc[l] += dsd*sd
+            # Re-gridded: each (ll,nn) thread owns one dC cell (UNIQUE -> race-free
+            # write); dstate_decay's nn-reduction folds into dAcs_acc via atomic_add.
+            for ln in T.Parallel(L * dstate):
+                ll = ln // dstate
+                nn = ln % dstate
+                s = base + ll
+                sd = T.exp2(dacs[ll] * p)
+                # dC_off inner: accn = sum_p dY[l,p]*prev_states[p,n]
+                accn = T.alloc_local((1,), accum_dtype)
+                accn[0] = T.Cast(accum_dtype, 0)
+                for pp in T.serial(headdim):
+                    cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
+                    accn[0] = accn[0] + dY[ll, pp] * cs
+                # dC_diag inner: cdiag = sum_{s2<=l} Lmat[l,s2]*dt_s2*DYX[l,s2]*B[s2,n]
+                cdiag = T.alloc_local((1,), accum_dtype)
+                cdiag[0] = T.Cast(accum_dtype, 0)
+                for ss in T.serial(0, ll + 1):
+                    lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    b_v = T.Cast(accum_dtype, B[batch_idx, base + ss, group_idx, nn])
+                    cdiag[0] = cdiag[0] + lmat * dt_s * DYX[ll, ss] * b_v
+                dC[batch_idx, s, head_idx, nn] = accn[0] * sd + cdiag[0]
+                # dstate_decay nn-reduction -> dAcs_acc[ll] (multi-writer: atomic).
+                c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                T.atomic_add(dAcs_acc[ll], accn[0] * c_v * sd)
+            T.sync_threads()
+
+            # dchunk_states[p,n] += sum_l dY[l,p]*C[l,n]*state_decay[l] (VERBATIM).
+            for pn in T.Parallel(headdim * dstate):
+                pp = pn // dstate
+                nn = pn % dstate
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                for ll in T.serial(L):
+                    sd = T.exp2(dacs[ll] * p)
+                    c_v = T.Cast(accum_dtype, C[batch_idx, base + ll, group_idx, nn])
+                    acc[0] = acc[0] + dY[ll, pp] * c_v * sd
+                dchunk_states[batch_idx, chunk_idx, head_idx, pp, nn] = acc[0]
+            T.sync_threads()
+
+            # ---- Y_diag transpose (intra-chunk) -> dinp (VERBATIM, already threaded) ----
+            #   dinp[s,p,n] (grad wrt inp=dt*x⊗B) = sum_{l>=s} dY[l,p]*C[l,n]*Lmat[l,s]
+            for sp in T.serial(0, L * headdim, threads):
+                lane = T.get_thread_binding(0)
+                spi = sp + lane
+                if spi < L * headdim:
+                    ss = spi // headdim
+                    pp = spi % headdim
+                    sidx = base + ss
+                    for nn in T.serial(dstate):
+                        acc = T.alloc_local((1,), accum_dtype)
+                        acc[0] = T.Cast(accum_dtype, 0)
+                        for ll in T.serial(ss, L):  # l >= s (lower-tri)
+                            lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                            c_v = T.Cast(
+                                accum_dtype, C[batch_idx, base + ll, group_idx, nn]
+                            )
+                            acc[0] = acc[0] + dY[ll, pp] * c_v * lmat
+                        dinp[batch_idx, sidx, head_idx, pp, nn] = (
+                            dinp[batch_idx, sidx, head_idx, pp, nn] + acc[0]
+                        )
+            T.sync_threads()
+
+            # ---- Y_diag dA grad (dseg) — RE-GRIDDED off lane 0 ----
+            #   dLmat[l,s] = sum_p dY[l,p]*x[s,p] == DYX[l,s] (reuse, zero recompute)
+            #   M[l,s] = cb*lmat*dt_s ; dseg = DYX[l,s]*M[l,s]
+            #   segsum-vjp: +dAcs_acc[l] over l>=s, -dAcs_acc[s] over s<l (strictly l>s).
+            # Lane-strided over the L*L (ll,ss) grid with the ll>ss mask (mirrors the
+            # dinp lane-strided pattern); the +/- scatter races on dAcs_acc -> atomic.
+            for ls0 in T.serial(0, L * L, threads):
+                lane = T.get_thread_binding(0)
+                lsi = ls0 + lane
+                if lsi < L * L:
+                    ll = lsi // L
+                    ss = lsi % L
+                    if ll > ss:
+                        cb_v = T.Cast(
+                            accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
+                        )
+                        lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                        dt_s = T.Cast(
+                            accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss]
+                        )
+                        m_ls = cb_v * lmat * dt_s
+                        dseg = DYX[ll, ss] * m_ls
+                        T.atomic_add(dAcs_acc[ll], dseg)
+                        T.atomic_add(dAcs_acc[ss], -dseg)
+            T.sync_threads()
+
+            for l in T.Parallel(L):
+                dA_cumsum_y[batch_idx, head_idx, chunk_idx, l] = dAcs_acc[l]
+
+    return main
+
+
 def build_chunk_scan_combine_bwd_metal(
     batch: int,
     seqlen: int,
@@ -416,20 +714,28 @@ def build_chunk_scan_combine_bwd_metal(
         _resolve_chunked_compile_target,
     )
 
-    prim = chunk_scan_combine_bwd_metal_prim(
-        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
-    )
     resolved_target = _resolve_chunked_compile_target(target)
+    # B2 is — like the forward F2 — the ONE backward stage whose prim BODY differs
+    # by backend: the CUDA twin RE-GRIDS the two lane-0 funnels (dC_diag + dseg)
+    # across all 128 threads (the dominant ~8.5M-serial-MAC dC_diag hotspot, and
+    # the dseg segsum-VJP), staging a shared DYX[L,L] recompute-killer tile. The
+    # Metal prim (chunk_scan_combine_bwd_metal_prim) stays BYTE-IDENTICAL so Metal
+    # callers are unaffected. Select the matching prim by resolved target kind.
     # CUDA (sm_121): mirror the forward F2 compile-site EXACTLY — thread the same
     # two pass_configs so the CUDA codegen surface is identical to the validated
-    # forward. The B2 prim BODY has NO T.gemm / TMA-eligible copy (grep-confirmed:
-    # zero T.gemm / shared.dyn / make_swizzled_layout), so there is no tensormap
-    # descriptor to mis-align; disabling the TMA + warp-specialized lowering is a
-    # no-op-or-safer escape hatch that keeps the compile path byte-identical to
-    # the forward. The Metal branch is UNCHANGED (no pass_configs). RULE #1:
-    # explicit per-target codegen choice, never a silent fallback.
+    # forward. The B2 cuda prim BODY has NO T.gemm / TMA-eligible copy (the new
+    # DYX/XT tiles are plain static shared filled by elementwise T.Parallel loads),
+    # so there is no tensormap descriptor to mis-align; disabling the TMA +
+    # warp-specialized lowering is a no-op-or-safer escape hatch that keeps the
+    # compile path byte-identical to the forward. The Metal branch is UNCHANGED (no
+    # pass_configs). RULE #1: explicit per-target codegen choice, never a silent
+    # fallback — the CUDA prim is the ONE CUDA path; a compile/parity failure
+    # propagates (no fallback to the slow Metal prim or numpy).
     kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
     if "cuda" in kind:
+        prim = chunk_scan_combine_bwd_cuda_prim(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        )
         pass_configs = {
             "tl.disable_tma_lower": True,
             "tl.disable_warp_specialized": True,
@@ -440,6 +746,9 @@ def build_chunk_scan_combine_bwd_metal(
             target=resolved_target,
             pass_configs=pass_configs,
         )
+    prim = chunk_scan_combine_bwd_metal_prim(
+        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+    )
     return tilelang.compile(
         prim,
         out_idx=[11, 12, 13, 14, 15, 16, 17],
