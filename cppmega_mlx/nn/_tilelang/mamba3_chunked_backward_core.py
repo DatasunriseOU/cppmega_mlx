@@ -419,10 +419,31 @@ def build_chunk_scan_combine_bwd_metal(
     prim = chunk_scan_combine_bwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
     )
+    resolved_target = _resolve_chunked_compile_target(target)
+    # CUDA (sm_121): mirror the forward F2 compile-site EXACTLY — thread the same
+    # two pass_configs so the CUDA codegen surface is identical to the validated
+    # forward. The B2 prim BODY has NO T.gemm / TMA-eligible copy (grep-confirmed:
+    # zero T.gemm / shared.dyn / make_swizzled_layout), so there is no tensormap
+    # descriptor to mis-align; disabling the TMA + warp-specialized lowering is a
+    # no-op-or-safer escape hatch that keeps the compile path byte-identical to
+    # the forward. The Metal branch is UNCHANGED (no pass_configs). RULE #1:
+    # explicit per-target codegen choice, never a silent fallback.
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        pass_configs = {
+            "tl.disable_tma_lower": True,
+            "tl.disable_warp_specialized": True,
+        }
+        return tilelang.compile(
+            prim,
+            out_idx=[11, 12, 13, 14, 15, 16, 17],
+            target=resolved_target,
+            pass_configs=pass_configs,
+        )
     return tilelang.compile(
         prim,
         out_idx=[11, 12, 13, 14, 15, 16, 17],
-        target=_resolve_chunked_compile_target(target),
+        target=resolved_target,
     )
 
 
@@ -596,10 +617,31 @@ def build_inter_chunk_recur_bwd_metal(
     prim = inter_chunk_recur_bwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
     )
+    resolved_target = _resolve_chunked_compile_target(target)
+    # CUDA (sm_121): mirror the forward F2 compile-site EXACTLY — thread the same
+    # two pass_configs. The B1 prim BODY has NO T.gemm / TMA-eligible copy
+    # (grep-confirmed: zero T.gemm / shared.dyn / make_swizzled_layout — it does
+    # not even alloc_shared), so there is no tensormap descriptor to mis-align;
+    # the pass_configs are a no-op-or-safer escape hatch keeping the CUDA compile
+    # path byte-identical to the forward. The Metal branch is UNCHANGED (no
+    # pass_configs). RULE #1: explicit per-target codegen choice, never a silent
+    # fallback.
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        pass_configs = {
+            "tl.disable_tma_lower": True,
+            "tl.disable_warp_specialized": True,
+        }
+        return tilelang.compile(
+            prim,
+            out_idx=[4, 5, 6],
+            target=resolved_target,
+            pass_configs=pass_configs,
+        )
     return tilelang.compile(
         prim,
         out_idx=[4, 5, 6],
-        target=_resolve_chunked_compile_target(target),
+        target=resolved_target,
     )
 
 
@@ -852,8 +894,29 @@ def build_chunk_precompute_bwd_metal(
     prim = chunk_precompute_bwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
     )
+    resolved_target = _resolve_chunked_compile_target(target)
+    # CUDA (sm_121): mirror the forward F2 compile-site EXACTLY — thread the same
+    # two pass_configs. The B0 prim BODY has NO T.gemm / TMA-eligible copy
+    # (grep-confirmed: zero T.gemm / shared.dyn / make_swizzled_layout; all
+    # alloc_shared are plain default scope), so there is no tensormap descriptor
+    # to mis-align; the pass_configs are a no-op-or-safer escape hatch keeping the
+    # CUDA compile path byte-identical to the forward. The Metal branch is
+    # UNCHANGED (no pass_configs). RULE #1: explicit per-target codegen choice,
+    # never a silent fallback.
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        pass_configs = {
+            "tl.disable_tma_lower": True,
+            "tl.disable_warp_specialized": True,
+        }
+        return tilelang.compile(
+            prim,
+            out_idx=[9, 10, 11, 12],
+            target=resolved_target,
+            pass_configs=pass_configs,
+        )
     return tilelang.compile(
         prim,
         out_idx=[9, 10, 11, 12],
-        target=_resolve_chunked_compile_target(target),
+        target=resolved_target,
     )

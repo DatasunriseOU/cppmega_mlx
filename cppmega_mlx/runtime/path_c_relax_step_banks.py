@@ -84,8 +84,10 @@ from cppmega_mlx.runtime.path_c_dps_adapter import (
     parse_physical_bank_shapes,
 )
 from cppmega_mlx.runtime.path_c_fusion import (
+    MAMBA3_CHUNKED_SCAN_ENV,
     build_path_c_aot_autograd_region,
     build_path_c_model_region_from_route_symbols,
+    path_c_mamba3_chunked_scan_enabled,
 )
 from cppmega_mlx.runtime.path_c_fusion_schedules import path_c_fusion_schedule_template
 from cppmega_mlx.recipes.model_factory import local_gb10_quarter_profile
@@ -295,12 +297,87 @@ def _region_bwd_driver(numels: dict[str, int]):
     return packed
 
 
+# Env that EXPLICITLY acknowledges the abstract numpy bank backward driver is the
+# intended path for THIS bank-SSA build (the CPU self-check / non-gridded path).
+# Default OFF. When the gridded chunked-scan backward (B0/B1/B2) is enabled but the
+# real backward driver has NOT been installed, register_bank_drivers RAISES rather
+# than silently binding the numpy host backward (RULE #1: no silent fallback). Set
+# this truthy ONLY for the deliberate numpy self-check, never in production.
+ALLOW_NUMPY_BANK_BWD_ENV = "CPPMEGA_PATH_C_ALLOW_NUMPY_BANK_BWD"
+
+# Set truthy by register_real_backward_driver once the REAL gridded bank backward is
+# installed, so a subsequent register_bank_drivers (e.g. re-entry) does NOT clobber
+# the real bwd binding with the numpy one (and the RULE #1 guard knows the real path
+# is live). This is a process-local in-memory flag, NOT an env read.
+_REAL_BANK_BWD_INSTALLED = False
+
+
+def _numpy_bank_bwd_allowed() -> bool:
+    import os as _os
+
+    raw = _os.environ.get(ALLOW_NUMPY_BANK_BWD_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def set_real_bank_bwd_installed(value: bool) -> None:
+    """Mark whether the REAL gridded bank backward driver has been installed.
+
+    Called by ``register_real_backward_driver`` so a later ``register_bank_drivers``
+    does NOT clobber the real gridded ``pathc.bank_bwd_*`` binding with the abstract
+    numpy one, and so the RULE #1 guard treats the gridded backward as live (it does
+    NOT raise — the real path is installed, not the numpy fallback).
+    """
+    global _REAL_BANK_BWD_INSTALLED
+    _REAL_BANK_BWD_INSTALLED = bool(value)
+
+
+def real_bank_bwd_installed() -> bool:
+    """Return whether the REAL gridded bank backward driver is currently installed."""
+    return _REAL_BANK_BWD_INSTALLED
+
+
 def register_bank_drivers(numels: dict[str, int], n_layers: int) -> None:
+    # RULE #1 (NO SILENT FALLBACK): when the gridded chunked-scan backward is
+    # ENABLED, the bank-SSA train_step path's per-region `pathc.bank_bwd_i` is the
+    # ABSTRACT NUMPY host backward (`_region_bwd_driver`) — a host round-trip of the
+    # ~2028 MB region banks that does NOT route through the gridded B0/B1/B2 region
+    # surfaces. Binding it while the gridded backward is enabled would be a SILENT
+    # numpy-host fallback masquerading as the gridded path. So:
+    #   * If the real gridded bank backward is already installed
+    #     (`register_real_backward_driver` set `_REAL_BANK_BWD_INSTALLED`), keep it —
+    #     bind ONLY the forward here, never clobber the real bwd with numpy.
+    #   * Else if the flag is ON and numpy-bwd was NOT explicitly acknowledged
+    #     (`ALLOW_NUMPY_BANK_BWD_ENV`), RAISE with WHERE+WHAT — direct the caller to
+    #     the direct-chain region path (build_path_c_model_region_from_route_symbols
+    #     + compile_path_c_region, flag ON) OR register_real_backward_driver, which
+    #     actually execute the gridded B0/B1/B2.
+    #   * Else (flag OFF, or numpy explicitly acknowledged for the CPU self-check):
+    #     the numpy bank backward is the legitimate path — bind it.
+    chunked_on = path_c_mamba3_chunked_scan_enabled()
+    if chunked_on and not _REAL_BANK_BWD_INSTALLED and not _numpy_bank_bwd_allowed():
+        raise RuntimeError(
+            "register_bank_drivers (path_c_relax_step_banks): the gridded chunked "
+            "backward is ENABLED ("
+            f"{MAMBA3_CHUNKED_SCAN_ENV}=1) but this bank-SSA "
+            "build_train_step path would bind `pathc.bank_bwd_*` to the ABSTRACT "
+            "NUMPY host backward (_region_bwd_driver), which does NOT execute the "
+            "gridded B0/B1/B2 region surfaces. Binding it would be a SILENT "
+            "numpy-host backward fallback (RULE #1 forbidden). Drive the gridded "
+            "backward via EITHER the direct-chain region path "
+            "(build_path_c_model_region_from_route_symbols + compile_path_c_region "
+            "with the flag ON, which routes through the chunked region surfaces and "
+            "the delegation interpose) OR call register_real_backward_driver(...) to "
+            "install the real gridded bank backward. To DELIBERATELY run the numpy "
+            "self-check with the flag on, set "
+            f"{ALLOW_NUMPY_BANK_BWD_ENV}=1 (CPU reference only, never production)."
+        )
     for i in range(n_layers):
         tvm_ffi.register_global_func(
             f"pathc.bank_fwd_{i}", _region_fwd_driver(numels), override=True)
-        tvm_ffi.register_global_func(
-            f"pathc.bank_bwd_{i}", _region_bwd_driver(numels), override=True)
+        # Do NOT overwrite a real gridded bwd binding with the numpy one.
+        if not _REAL_BANK_BWD_INSTALLED:
+            tvm_ffi.register_global_func(
+                f"pathc.bank_bwd_{i}", _region_bwd_driver(numels), override=True)
 
 
 def build_bank_chain(numels: dict[str, int], n_layers: int) -> tvm.IRModule:

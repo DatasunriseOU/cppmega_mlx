@@ -77,6 +77,7 @@ from cppmega_mlx.runtime.path_c_relax_step_banks import (
     bank_writeback,
     real_bank_numels,
     register_bank_drivers,
+    set_real_bank_bwd_installed,
 )
 from cppmega_mlx.runtime.path_c_dps_adapter import (
     alloc_device_banks,
@@ -244,6 +245,149 @@ def register_real_forward_driver(leaf, real_driver, bank_numels: dict[str, int],
     fwd = make_real_bank_forward_driver(leaf, real_driver, bank_numels, device=device)
     for i in range(n_layers):
         tvm_ffi.register_global_func(f"pathc.bank_fwd_{i}", fwd, override=True)
+
+
+# --------------------------------------------------------------------------- #
+# (b2) The REAL-kernel BACKWARD driver — symmetric to make_real_bank_forward_driver.
+#
+# This is what flips the §15-profiled `pathc.bank_bwd_i` from the ABSTRACT NUMPY host
+# backward (path_c_relax_step_banks._region_bwd_driver, the 79.6%/91.4% wall — a host
+# round-trip of the ~2028 MB region banks) to the REAL GRIDDED backward MR kernel
+# (run_backward=1), which behind the call_dps_packed boundary runs the gridded
+# B0/B1/B2 chunked SSD backward on the physical banks. The bank-SSA, remat, optimizer,
+# and loss structure are UNCHANGED — only the per-region backward compute becomes the
+# real device-resident kernel.
+#
+# The bank-backward call_dps_packed ABI (from _region_bwd_driver) is
+#   (actg_in, param, state_ckpt, paramg_in, actg_out, paramg_out):
+#     IN : actg_in   = incoming activation grad (from the next layer)
+#          param     = the model weights (read-only)
+#          state_ckpt= checkpoint i (the forward-saved activation snapshot)
+#          paramg_in = running parameter-grad accumulator
+#     OUT: actg_out  = grad propagated to the previous layer (the bwd kernel writes
+#                      BANK_ACTG in place)
+#          paramg_out= updated parameter-grad accumulator (BANK_PARAMG in place)
+#
+# `leaf` is a BACKWARD PathCRegionLeaf (run_backward=1) carrying the real kernel;
+# `real_driver` is make_real_kernel_driver(leaf, device) from the driver phase.
+# --------------------------------------------------------------------------- #
+def make_real_bank_backward_driver(leaf, real_driver, bank_numels: dict[str, int],
+                                   *, device=None):
+    """Build a `pathc.bank_bwd_*` packed func that runs the REAL gridded MR backward.
+
+    Mirrors make_real_bank_forward_driver exactly (same DEVICE-RESIDENT vs
+    NUMPY-STAGED gate, RULE #1: clear device-vs-host gate, no silent fallback), but
+    over the BACKWARD bank ABI. The real kernel is the SAME compiled artifact as the
+    forward, specialized to run_backward=1 (the gridded B0/B1/B2 transpose). It seeds
+    BANK_ACTG/BANK_PARAM/BANK_STATE/BANK_PARAMG from actg_in/param/state_ckpt/
+    paramg_in, runs the kernel (writes BANK_ACTG + BANK_PARAMG in place), then writes
+    actg_out = BANK_ACTG and paramg_out = BANK_PARAMG.
+
+    RULE #1: no numpy host backward is reachable from this driver; the only paths are
+    (a) DEVICE-RESIDENT real kernel and (b) NUMPY-STAGED real kernel (the same real
+    compiled kernel, just host-staged for the CPU self-check). Any failure RAISES.
+    """
+
+    actg_n = bank_numels[BANK_ACTG]
+    state_n = bank_numels[BANK_STATE]
+    param_n = bank_numels[BANK_PARAM]
+    paramg_n = bank_numels[BANK_PARAMG]
+
+    # Build the device-resident kernel driver + driver-owned device physical banks
+    # ONCE (lazily, first device call); persists across every backward call.
+    dev_state: dict[str, object] = {}
+
+    def _ensure_device_state(dev):
+        if "driver" not in dev_state:
+            dev_state["driver"] = make_device_resident_kernel_driver(leaf, dev)
+            dev_state["banks"] = alloc_device_banks(leaf.bank_shapes, dev)
+        return dev_state["driver"], dev_state["banks"]
+
+    def packed(actg_in, param, state_ckpt, paramg_in, actg_out, paramg_out):
+        if bank_arg_is_device(actg_in):
+            # ---- DEVICE-RESIDENT PATH (no numpy host bounce) ----
+            dev = actg_in.device
+            dev_driver, dbanks = _ensure_device_state(dev)
+            # Seed the backward kernel's physical banks from the SSA banks
+            # (device->device view copies; tail-zeroed where the SSA bank is shorter).
+            bank_copy_prefix_device(
+                dbanks[BANK_ACTG], actg_in,
+                min(actg_n, int(np.prod([int(d) for d in actg_in.shape]))))
+            bank_copy_prefix_device(
+                dbanks[BANK_PARAM], param,
+                min(param_n, int(np.prod([int(d) for d in param.shape]))))
+            bank_copy_prefix_device(
+                dbanks[BANK_STATE], state_ckpt,
+                min(state_n, int(np.prod([int(d) for d in state_ckpt.shape]))))
+            bank_copy_prefix_device(
+                dbanks[BANK_PARAMG], paramg_in,
+                min(paramg_n, int(np.prod([int(d) for d in paramg_in.shape]))))
+            # Run the REAL gridded backward kernel (run_backward=1) on the device
+            # banks (writes BANK_ACTG + BANK_PARAMG in place).
+            dev_driver(leaf, dbanks, dev)
+            # actg_out <- new activation grad (device->device).
+            bank_copy_prefix_device(
+                actg_out, dbanks[BANK_ACTG],
+                min(actg_n, int(np.prod([int(d) for d in actg_out.shape]))))
+            # paramg_out <- updated parameter-grad accumulator (device->device).
+            bank_copy_prefix_device(
+                paramg_out, dbanks[BANK_PARAMG],
+                min(paramg_n, int(np.prod([int(d) for d in paramg_out.shape]))))
+            return
+
+        # ---- NUMPY-STAGED REFERENCE PATH (CPU self-test; STILL the real kernel) ----
+        ag = bank_arg_to_host(actg_in)
+        p = bank_arg_to_host(param)
+        ck = bank_arg_to_host(state_ckpt)
+        pgi = bank_arg_to_host(paramg_in)
+        banks = {
+            BANK_ACT: np.zeros(bank_numels[BANK_ACT], np.float32),
+            BANK_ACTG: np.ascontiguousarray(ag, np.float32).reshape(-1)[:actg_n].copy(),
+            BANK_PARAM: np.ascontiguousarray(p, np.float32).reshape(-1)[:param_n].copy(),
+            BANK_PARAMG: np.ascontiguousarray(pgi, np.float32).reshape(-1)[:paramg_n].copy(),
+            BANK_STATE: np.ascontiguousarray(ck, np.float32).reshape(-1)[:state_n].copy(),
+        }
+        for bank, n in ((BANK_ACTG, actg_n), (BANK_PARAM, param_n),
+                        (BANK_PARAMG, paramg_n), (BANK_STATE, state_n)):
+            if banks[bank].size < n:
+                pad = np.zeros(n, np.float32)
+                pad[: banks[bank].size] = banks[bank]
+                banks[bank] = pad
+        real_driver(leaf, banks)
+        bank_writeback(actg_out, banks[BANK_ACTG].reshape(-1)[:actg_n])
+        bank_writeback(paramg_out, banks[BANK_PARAMG].reshape(-1)[:paramg_n])
+
+    return packed
+
+
+def register_real_backward_driver(leaf, real_driver, bank_numels: dict[str, int],
+                                  n_layers: int, *, device=None) -> None:
+    """Install the REAL gridded path_c backward kernel as EVERY `pathc.bank_bwd_i`.
+
+    This REPLACES the abstract numpy host backward (the §15 79.6%/91.4% wall) with the
+    real device-resident gridded backward MR kernel (run_backward=1 -> gridded
+    B0/B1/B2). It also flips ``set_real_bank_bwd_installed(True)`` so that:
+      * the RULE #1 guard in register_bank_drivers does NOT raise (the gridded path is
+        live, not the forbidden numpy fallback), and
+      * a subsequent register_bank_drivers re-entry does NOT clobber this real bwd
+        binding with the numpy one.
+
+    ``leaf`` MUST be a BACKWARD leaf (run_backward=1); ``device`` enables the
+    DEVICE-RESIDENT backward path (banks stay device tensors, no host bounce). Pass the
+    CUDA device on gb10. RULE #1: a forward leaf here is a wiring bug — RAISE."""
+    if int(getattr(leaf, "run_backward", 0)) != 1:
+        raise RuntimeError(
+            "register_real_backward_driver: leaf.run_backward must be 1 (a BACKWARD "
+            f"leaf), got run_backward={getattr(leaf, 'run_backward', None)!r}. "
+            "Pass the bwd-specialized PathCRegionLeaf (RULE #1: no silent forward "
+            "leaf binding as the backward region)."
+        )
+    bwd = make_real_bank_backward_driver(leaf, real_driver, bank_numels, device=device)
+    for i in range(n_layers):
+        tvm_ffi.register_global_func(f"pathc.bank_bwd_{i}", bwd, override=True)
+    # Mark the real gridded backward as installed so the RULE #1 guard knows the
+    # numpy bank backward is NOT the live path (and is never re-bound over this).
+    set_real_bank_bwd_installed(True)
 
 
 # --------------------------------------------------------------------------- #
