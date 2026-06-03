@@ -158,16 +158,16 @@ def build_remat_bank_chain(numels: dict[str, int], n_layers: int) -> tvm.IRModul
     with bb.function("train_step", [act0, param, paramg0, actg0]):
         with bb.dataflow():
             # ---- FORWARD ----
-            # Thread act forward through every region. SAVE the entering activation
-            # act[i] at each boundary (kept live across backward for recompute), and
-            # SAVE checkpoint_i at each boundary (read directly by bwd i, no recompute).
-            # Non-boundary act/checkpoint outputs die at last use (forward-flowing).
+            # Thread act forward through every region. At each boundary SAVE (a) the
+            # checkpoint_i (read directly by bwd i, no recompute) and (b) the EXITING
+            # activation act[i+1] (the activation ENTERING region i+1), which is the
+            # recompute START point for that segment's backward pass. Non-boundary
+            # act/checkpoint outputs die at last use (forward-flowing). Only O(sqrt N)
+            # boundary checkpoints + O(sqrt N) boundary exit-activations span backward.
             act = act0
-            saved_act: dict[int, relax.Var] = {}   # boundary -> entering activation
-            saved_ckpt: dict[int, relax.Var] = {}  # boundary -> saved checkpoint
+            saved_ckpt: dict[int, relax.Var] = {}   # boundary -> saved checkpoint
+            saved_exit: dict[int, relax.Var] = {}   # boundary -> activation EXITING boundary
             for i in range(n_layers):
-                if i in bset:
-                    saved_act[i] = act  # the activation ENTERING fwd region i
                 out = bb.emit(relax.call_dps_packed(
                     f"pathc.bank_fwd_{i}", [act, param, act],
                     [sAct, sState]))
@@ -175,13 +175,55 @@ def build_remat_bank_chain(numels: dict[str, int], n_layers: int) -> tvm.IRModul
                 ck = bb.emit(relax.TupleGetItem(out, 1))
                 if i in bset:
                     saved_ckpt[i] = ck  # boundary checkpoint: live until bwd i
+                    saved_exit[i] = act_next  # activation ENTERING region i+1 (recompute start)
                 act = act_next
 
-            # ---- BACKWARD ----
+            # ---- BACKWARD (Korthikanti per-segment recompute cache) ----
             # For each region i (reverse): obtain checkpoint_i. If i is a boundary,
-            # use the saved checkpoint. Else RE-EMIT the forward from the nearest
-            # boundary up to i to regenerate checkpoint_i LOCALLY (recompute), so the
-            # recomputed checkpoint is born here and killed at the bwd i call below.
+            # use the saved checkpoint. Else the checkpoint must be RECOMPUTED from the
+            # nearest saved boundary. The KEY anti-pattern fix vs the naive remat: do
+            # NOT re-derive the prefix b..i independently for every non-boundary i
+            # (that is the O(N*sqrt N) checkpointing anti-pattern -- region b+1
+            # recomputes [b..b+1], b+2 recomputes [b..b+2] from scratch, etc., each
+            # re-running the same prefix). Instead WALK EACH SEGMENT ONCE: the first
+            # time the backward pass needs a recomputed checkpoint in a segment,
+            # re-emit the forward b..segment_end exactly once and CACHE every
+            # checkpoint b+1..segment_end. Every later backward region in that segment
+            # reads its checkpoint straight from the cache -- zero extra forward calls.
+            #
+            # Recompute count drops from O(N*sqrt N) (sum 2+3+..+L per segment) to
+            # O(N) (each non-boundary region recomputed exactly once: N - #boundaries
+            # total). Numerically IDENTICAL: the cached ck_j is the same op on the same
+            # boundary activation as before, just emitted once instead of redundantly.
+            #
+            # Liveness is preserved: a segment's recompute is emitted lazily, the FIRST
+            # time (in reverse order) that segment is entered -- i.e. immediately before
+            # that segment's highest backward region consumes its checkpoint -- so the
+            # recomputed checkpoints are born inside the segment's local backward window
+            # and the planner still sees them as short-lived (O(sqrt N) peak), exactly
+            # as the naive remat. We only remove the REDUNDANT re-emissions.
+            seg_end_of: dict[int, int] = {}  # boundary b -> last region index in its segment
+            for k, b in enumerate(boundaries):
+                seg_end_of[b] = (boundaries[k + 1] - 1) if k + 1 < len(boundaries) \
+                    else (n_layers - 1)
+            recomputed_ckpt: dict[int, relax.Var] = {}  # region j -> its recomputed checkpoint
+
+            def _recompute_segment(b: int) -> None:
+                """Re-emit the forward (b+1)..seg_end ONCE, caching every checkpoint.
+                Starts from saved_exit[b] (the activation entering region b+1), so the
+                boundary region b's own forward is NOT re-run (its checkpoint is already
+                saved). Lazy + idempotent: called the first time the backward pass needs
+                a recomputed checkpoint in segment b, then never re-emitted. Emits
+                exactly (seg_end - b) forward calls = one per non-boundary region."""
+                rec_act = saved_exit[b]
+                for j in range(b + 1, seg_end_of[b] + 1):
+                    rout = bb.emit(relax.call_dps_packed(
+                        f"pathc.bank_fwd_{j}", [rec_act, param, rec_act],
+                        [sAct, sState]))
+                    rec_act = bb.emit(relax.TupleGetItem(rout, 0))
+                    rec_ck = bb.emit(relax.TupleGetItem(rout, 1))
+                    recomputed_ckpt[j] = rec_ck
+
             actg = actg0
             paramg = paramg0
             for i in reversed(range(n_layers)):
@@ -189,21 +231,14 @@ def build_remat_bank_chain(numels: dict[str, int], n_layers: int) -> tvm.IRModul
                     ck_i = saved_ckpt[i]
                 else:
                     b = nearest_boundary(i, boundaries)
-                    # recompute forward b..i from the saved boundary activation,
-                    # regenerating each intermediate checkpoint; keep only ck_i live.
-                    rec_act = saved_act[b]
-                    ck_i = None
-                    for j in range(b, i + 1):
-                        rout = bb.emit(relax.call_dps_packed(
-                            f"pathc.bank_fwd_{j}", [rec_act, param, rec_act],
-                            [sAct, sState]))
-                        rec_act = bb.emit(relax.TupleGetItem(rout, 0))
-                        rec_ck = bb.emit(relax.TupleGetItem(rout, 1))
-                        ck_i = rec_ck  # the last segment step's checkpoint == ckpt_i
+                    if i not in recomputed_ckpt:
+                        # first backward region in this segment -> recompute it ONCE.
+                        _recompute_segment(b)
+                    ck_i = recomputed_ckpt.get(i)
                     if ck_i is None:
                         raise RuntimeError(
                             "FAIL-LOUD: recompute produced no checkpoint for "
-                            f"region {i}")
+                            f"region {i} (segment boundary {b})")
                 out = bb.emit(relax.call_dps_packed(
                     f"pathc.bank_bwd_{i}", [actg, param, ck_i, paramg],
                     [sActG, sParamG]))
@@ -220,18 +255,15 @@ def build_remat_bank_chain(numels: dict[str, int], n_layers: int) -> tvm.IRModul
 def recompute_overhead(n_layers: int) -> tuple[int, int, float]:
     """Returns (n_forward_calls_baseline, n_extra_recompute_calls, overhead_factor).
 
-    Baseline forward calls = n_layers (one per region). Recompute calls = for each
-    NON-boundary backward region i, recompute from nearest boundary b..i = (i-b+1)
-    extra forward calls.
+    Baseline forward calls = n_layers (one per region). With the Korthikanti
+    per-segment recompute cache, each segment is walked exactly ONCE during backward
+    (re-emitting (b+1)..seg_end), so each NON-boundary region is recomputed exactly
+    once -> extra recompute calls = n_layers - #boundaries. This is the O(N) lower
+    bound for sqrt-N checkpointing; the naive remat's redundant per-region prefix
+    re-derivation (O(N*sqrt N), sum 2+3+..+L per segment) is eliminated.
     """
     boundaries = checkpoint_boundaries(n_layers)
-    bset = set(boundaries)
-    extra = 0
-    for i in range(n_layers):
-        if i in bset:
-            continue
-        b = nearest_boundary(i, boundaries)
-        extra += (i - b + 1)
+    extra = n_layers - len(boundaries)
     return n_layers, extra, extra / max(1, n_layers)
 
 

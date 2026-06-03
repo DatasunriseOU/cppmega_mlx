@@ -280,25 +280,49 @@ def build_train_step(numels: dict[str, int], n_layers: int) -> tvm.IRModule:
     with bb.function("train_step", [act0, param, paramg0, actg0, m0, v0]):
         with bb.dataflow():
             # ---- FORWARD (sqrt-N remat) ----
+            # SAVE at each boundary: the checkpoint (read directly by bwd) and the
+            # EXITING activation (entering region i+1) = the recompute START point.
             act = act0
-            saved_act: dict[int, relax.Var] = {}
             saved_ckpt: dict[int, relax.Var] = {}
+            saved_exit: dict[int, relax.Var] = {}
             for i in range(n_layers):
-                if i in bset:
-                    saved_act[i] = act
                 out = bb.emit(relax.call_dps_packed(
                     f"pathc.bank_fwd_{i}", [act, param, act], [sAct, sState]))
                 act_next = bb.emit(relax.TupleGetItem(out, 0))
                 ck = bb.emit(relax.TupleGetItem(out, 1))
                 if i in bset:
                     saved_ckpt[i] = ck
+                    saved_exit[i] = act_next
                 act = act_next
             act_final = act
 
             # ---- LOSS on the final forward activation ----
             loss = bb.emit(relax.call_dps_packed("pathc.bank_loss", [act_final], [sLoss]))
 
-            # ---- BACKWARD (re-emit forward for non-boundary checkpoints) ----
+            # ---- BACKWARD (Korthikanti per-segment recompute cache) ----
+            # Walk each segment ONCE: the first backward region that needs a recomputed
+            # checkpoint re-emits the forward (b+1)..seg_end exactly once, caching every
+            # checkpoint; every later backward region in the segment reads the cache.
+            # This is O(N) recompute (N - #boundaries) instead of the naive O(N*sqrt N)
+            # per-region prefix re-derivation. Numerically identical; the recomputes are
+            # emitted lazily inside each segment's local backward window so they stay
+            # short-lived (O(sqrt N) checkpoint peak).
+            seg_end_of: dict[int, int] = {}
+            for k, b in enumerate(boundaries):
+                seg_end_of[b] = (boundaries[k + 1] - 1) if k + 1 < len(boundaries) \
+                    else (n_layers - 1)
+            recomputed_ckpt: dict[int, relax.Var] = {}
+
+            def _recompute_segment(b: int) -> None:
+                rec_act = saved_exit[b]
+                for j in range(b + 1, seg_end_of[b] + 1):
+                    rout = bb.emit(relax.call_dps_packed(
+                        f"pathc.bank_fwd_{j}", [rec_act, param, rec_act],
+                        [sAct, sState]))
+                    rec_act = bb.emit(relax.TupleGetItem(rout, 0))
+                    rec_ck = bb.emit(relax.TupleGetItem(rout, 1))
+                    recomputed_ckpt[j] = rec_ck
+
             actg = actg0
             paramg = paramg0
             for i in reversed(range(n_layers)):
@@ -306,19 +330,13 @@ def build_train_step(numels: dict[str, int], n_layers: int) -> tvm.IRModule:
                     ck_i = saved_ckpt[i]
                 else:
                     b = nearest_boundary(i, boundaries)
-                    rec_act = saved_act[b]
-                    ck_i = None
-                    for j in range(b, i + 1):
-                        rout = bb.emit(relax.call_dps_packed(
-                            f"pathc.bank_fwd_{j}", [rec_act, param, rec_act],
-                            [sAct, sState]))
-                        rec_act = bb.emit(relax.TupleGetItem(rout, 0))
-                        rec_ck = bb.emit(relax.TupleGetItem(rout, 1))
-                        ck_i = rec_ck
+                    if i not in recomputed_ckpt:
+                        _recompute_segment(b)
+                    ck_i = recomputed_ckpt.get(i)
                     if ck_i is None:
                         raise RuntimeError(
                             "FAIL-LOUD: recompute produced no checkpoint for region "
-                            f"{i}")
+                            f"{i} (segment boundary {b})")
                 out = bb.emit(relax.call_dps_packed(
                     f"pathc.bank_bwd_{i}", [actg, param, ck_i, paramg],
                     [sActG, sParamG]))

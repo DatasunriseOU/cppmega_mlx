@@ -21,11 +21,11 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 |---|---|---|
 | config | 28-layer 1.8B, seq=4096, batch=1 | 1.835B, bs=4×seq=4096 |
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
-| **peak memory** | **8.787 GB planned device-peak** (8.08 GB measured free-delta, 8L device-resident §13; was 10.30 GB pre-§13) | **~26 GB** |
-| **fits Megatron-class memory** | **YES — 8.79 GB planned < 26 GB (≈3x under)** | 26 GB |
-| **tok/s** | **29.82 tok/s @ 8 layers MEASURED (device-resident fwd, §13; was 25.2 pre-§13); ~5.19 tok/s @ 28 layers EXTRAPOLATED** | **3399 tok/s** |
-| tok/s ratio vs Megatron | 0.0088x (8L measured, §13) / 0.0015x (28L extrapolated) — i.e. **114x–654x slower** (was 135x–654x) | 1.0x |
-| what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident in the forward (§13)** + abstract numpy bwd/adam/loss (lever 4) | tuned fused-FP8-CUDA kernels + selective recompute |
+| **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
+| **fits Megatron-class memory** | **YES — 13.0 GB planned 28L < 26 GB (2x under)** | 26 GB |
+| **tok/s** | **45.44 tok/s @ 8 layers MEASURED (Korthikanti launch-fusion, §14; was 29.82 @ §13, 25.2 pre-§13); ~11.76 tok/s @ 28 layers EXTRAPOLATED (was 5.19 @ §13)** | **3399 tok/s** |
+| tok/s ratio vs Megatron | 0.0134x (8L measured, §14) / 0.0035x (28L extrapolated) — i.e. **75x–289x slower** (was 114x–654x @ §13) | 1.0x |
+| what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti per-segment recompute cache (§14, 28L: 117→51 forward launches)** + abstract numpy bwd/adam/loss (lever 4) | tuned fused-FP8-CUDA kernels + selective recompute |
 
 **(a) Does the graph path FIT in Megatron-class memory? YES.** The StaticPlanBlockMemory
 planned device-peak for the whole 28-layer 1.8B step is **8.787 GB** — roughly **3x under**
@@ -34,22 +34,25 @@ Megatron's ~26 GB, and the optimizer state is kept at 1x by the explicit in-plac
 114-116 GB on the same box, `MEGATRON-VS-MLX-PATHS.md`); the graph path runs it and plans
 to 8.79 GB. **This is the win the whole memory-path was built for.**
 
-**(b) What tok/s does it achieve? Far below Megatron — and honestly so, but the
-host-staging lever has now been spent.** The §2/§4 PR-7 baseline profiled the **abstract
-numpy host-staged** forward (a cheap `np.maximum` proxy + a full 2028 MB host round-trip per
-region) and measured **25.2 tok/s @ 8L, ~5.2 @ 28L (135×–654× gap)**, ~100% host-staging-
-bound. **§13 re-profiles with the LANDED device-resident forward** (the REAL tilelang
-path_c-CUDA MR kernel, banks kept on `tvm.cuda(0)` end-to-end, no `.numpy()` in the forward
-hot path): **29.82 tok/s @ 8L MEASURED (1.18× faster), measured peak 8.08 GB (−2.22 GB host
-staging removed), 8L gap narrowed 135×→114×**; the 28L extrapolation is ~unchanged at **5.19
-tok/s (~654×)**. The decisive qualitative result: the forward's 96.9%-of-step term was
-**host-staging in the baseline and is now 95.8% real-device-kernel COMPUTE** — **the step is
-no longer host-staging-bound in the forward; the throughput floor has moved to the real
-6.5 s MR-kernel compute × the sqrt-N remat launch count** (117 forward launches at 28L). The
-gap is NOT the architecture (identical 1.835B stack); the next levers (§13) are
-forward-launch fusion + a faster/fused MR kernel + the real device backward + ×4 batch —
-device-compute work. See §4 for the baseline breakdown, **§13 for the device-resident
-re-profile + the host-staging recovery + the new attribution**, and §5 for the lever list.
+**(b) What tok/s does it achieve? Far below Megatron — but TWO levers have now been spent and
+both worked.** The §2/§4 PR-7 baseline (abstract numpy host-staged forward) measured **25.2
+tok/s @ 8L**, ~100% host-staging-bound. **§13** landed the **device-resident forward** (REAL
+tilelang MR kernel, banks on `tvm.cuda(0)`, no `.numpy()` in the hot path) → **29.82 tok/s @
+8L (1.18×)**, moving the floor off host-staging onto real-kernel compute × launch count.
+**§14 lands the launch-fusion lever — the Korthikanti per-segment recompute cache** (walk each
+sqrt-N segment ONCE during backward, caching all its checkpoints, instead of the naive
+O(N·√N) per-region prefix re-derivation): **45.44 tok/s @ 8L MEASURED (1.524× over §13), and
+28L extrapolates to 11.76 tok/s (2.267× over §13's 5.19)**. The lever cuts forward launches
+**20→13 at 8L and 117→51 at 28L** (the per-call MR-kernel cost is unchanged at 6.56 s — same
+kernel — so the win is purely fewer launches); numerics are **identical** (loss 5.525e-06
+every step, bit-for-bit with §13). The **8L gap narrows 114×→75×, the 28L gap 654×→289×**. The
+honest cost: the segment cache holds a whole segment's recomputed checkpoints concurrently, so
+the **planned device-peak rises 4.682→6.400 GB at 8L and 8.787→12.998 GB at 28L** — a real
+memory/launch tradeoff, still 2× under Megatron's 26 GB. The gap is NOT architecture; the
+remaining floor is the **6.56 s/call MR kernel itself** (now 95.0% of the step, 51 launches at
+28L). The next lever is a **faster/fused/FP8 MR kernel** (per-call compute, not launch count).
+See §4 for the baseline, **§13 for the device-resident re-profile, §14 for the launch-fusion
+result + the new attribution**, and §5 for the lever list.
 
 ---
 
@@ -465,19 +468,178 @@ device RAISES. Measured 2026-06-03 on gb10 `tvm.cuda(0)`, TVM 0.25.dev0.
 
 ---
 
+## 14. KORTHIKANTI LAUNCH-FUSION — the per-segment recompute cache, re-profiled (gb10 CUDA, 2026-06-03)
+
+§13 left the throughput floor at **real-kernel compute × the sqrt-N remat launch count**, and
+named **forward-launch fusion** as the single biggest 28L lever. §14 lands and measures it:
+the **Korthikanti per-segment recompute cache** in the remat assembly
+(`path_c_relax_step_remat.py`, `path_c_relax_train_step.py`, `path_c_relax_step_optim.py`).
+
+**What changed (the lever).** The naive sqrt-N remat re-derived the forward prefix `b..i`
+*independently for every non-boundary backward region i* — region b+1 recomputes [b..b+1],
+b+2 recomputes [b..b+2] from scratch, etc. That is the **O(N·√N) checkpointing anti-pattern**:
+the same prefix is re-run once per region in the segment. The Korthikanti cache instead **walks
+each segment exactly once**: the first backward region in a segment re-emits the forward
+`(b+1)..seg_end` a single time and **caches every checkpoint**; every later backward region in
+that segment reads its checkpoint from the cache. Recompute drops from O(N·√N) to **O(N)**
+(each non-boundary region recomputed exactly once = N − #boundaries). Numerically **identical**
+— the cached `ck_j` is the same op on the same boundary activation, just emitted once instead
+of redundantly.
+
+**Forward launch count (the measured lever):**
+
+| depth | boundaries | naive forward launches | **Korthikanti launches** | reduction |
+|---|---|---:|---:|---:|
+| **8L** | [0,3,6] | 8 + 12 = **20** | 8 + 5 = **13** | **1.538×** |
+| **28L** | [0,6,12,18,24] | 28 + 89 = **117** | 28 + 23 = **51** | **2.294×** |
+
+### MEASURED (gb10 CUDA, 8 layers, 4 steps, warm = steps 1–3)
+
+| metric | §13 (device-resident, naive remat) | **§14 (Korthikanti launch-cache)** |
+|---|---:|---:|
+| forward launches/step | 20 | **13** |
+| mean warm step | 137.36 s | **90.144 s** (median 90.28 s) |
+| **THROUGHPUT** | **29.82 tok/s** | **45.44 tok/s** |
+| **step-time speedup** | 1.0× | **1.524×** (137.36 → 90.14 s) |
+| per-call fwd (device-resident) | 6585.2 ms | **6559.7 ms** (unchanged — same kernel) |
+| per-call bwd (abstract) | 612.8 ms | 456.1 ms |
+| forward share of step | 95.8% | **95.0%** |
+| planned device-peak (8L) | 4.682 GB | **6.400 GB** (+1.718 GB: segment checkpoint cache) |
+| loss | 5.525e-06 | **5.525e-06** (identical — numeric equivalence) |
+
+```
+=== PROFILE (DEVICE-RESIDENT FWD) gb10 CUDA, 8 layers (n_layers=8, 4 steps) ===
+  mean step (warm) : 90144.0 ms  median 90280.5 ms
+  tokens/step      : 4096 (seq=4096, batch=1)
+  THROUGHPUT       : 45.44 tok/s
+  planned dev-peak : 6.400 GB
+  per-region wall over 4 steps (host-driver time):
+    fwd+remat :  341106.7 ms  (52 calls)   95.0%  [DEVICE-RESIDENT]   (13/step)
+    bwd       :   14595.1 ms  (32 calls)    4.1%  [abstract numpy]    (8/step)
+    adam      :    3041.8 ms  ( 4 calls)    0.8%  [abstract numpy]
+    loss      :     318.3 ms  ( 4 calls)    0.1%  [abstract numpy]
+  per-call fwd  :    6559.7 ms/call (device-resident)
+  fwd+remat calls/step = 13, bwd calls/step = 8
+  losses: 5.525325e-06, 5.525331e-06, 5.525332e-06, 5.525341e-06 (finite, stable)
+```
+
+### The launch-fusion win — what it bought (honest)
+
+* **Net 8L speedup: 1.524× (29.82 → 45.44 tok/s).** The lever cut forward launches 20→13;
+  with the per-call MR cost unchanged (6.585→6.560 s, same kernel), the predicted 13/20 =
+  0.65× step time matched the measured 90.14/137.36 = 0.656× almost exactly. **This is a pure
+  launch-count win** — no kernel change, no numeric change (loss bit-for-bit 5.525e-06).
+* **The honest memory cost.** The Korthikanti cache keeps a *whole segment's* recomputed
+  checkpoints live concurrently (the segment is walked once and cached), whereas the naive
+  remat kept only ~1 recomputed checkpoint live at a time. The checkpoint bank is 0.9427 GB;
+  the max segment length is 3 (8L) / 6 (28L), so the planned device-peak rises **4.682→6.400
+  GB (8L)** and **8.787→12.998 GB (28L)**. This is a real **memory-for-launches tradeoff**,
+  stated explicitly — still **2× under Megatron's 26 GB**, and the eager path still OOMs where
+  this runs. (The profiler's 22.86 GB free-delta high-water was host buff/cache noise: free
+  returned to the 117 GB baseline after `drop_caches`; the load-bearing device number is the
+  **6.400 GB planned peak**.)
+* **The forward share barely moved (95.8%→95.0%) because the bottleneck is unchanged in KIND.**
+  The step is still **real-device-kernel-compute-bound in the forward** — we just launch the
+  6.56 s MR kernel 13× instead of 20× at 8L (51× instead of 117× at 28L). Launch fusion
+  attacked the *count*; the *per-launch cost* is the next floor.
+
+### Extrapolation to 28 layers / 1.8B (explicit, labelled — measured §14 per-call costs)
+
+Using the MEASURED §14 per-call costs (fwd **6.5597 s/call**, bwd **0.4561 s/call**) and the
+Korthikanti 28L launch counts (**51 fwd** [28 fwd + 23 recompute] + 28 bwd + 1 adam + 1 loss):
+
+```
+28L step ≈ 51×6.5597 + 28×0.4561 + adam 0.760 + loss 0.080 ≈ 348.2 s/step
+        → 4096 / 348.2 ≈ 11.76 tok/s   (EXTRAPOLATED from measured 8L per-call costs)
+```
+
+vs §13's 28L extrapolation of 5.19 tok/s (which used the naive 117 launches): the launch lever
+delivers **2.267× at 28L** (it scales BETTER with depth — 117→51 is 2.29× vs 8L's 20→13 =
+1.54×, because deeper nets have larger segments where the naive O(N·√N) redundancy is worse).
+Isolating the lever: the same per-call cost with the naive 117 launches gives 781 s/step → 5.24
+tok/s, so the launch reduction ALONE is **2.24× at 28L** (matching the 2.29× launch ratio).
+
+### Re-stated gap vs Megatron 3399 tok/s @ 26 GB
+
+| side | tok/step | planned peak | tok/s | gap vs Megatron |
+|---|---:|---:|---:|---:|
+| **Megatron-LM (live)** | 16,384 | ~26 GB | **3399** | 1.0× |
+| Relax 8L, device-resident fwd, naive remat (§13) | 4,096 | 4.682 GB | 29.82 | 114× |
+| **Relax 8L, device-resident fwd, Korthikanti (§14)** | 4,096 | **6.400 GB** | **45.44** | **75×** |
+| Relax 28L, Korthikanti (§14, extrapolated) | 4,096 | 12.998 GB | 11.76 | **289×** |
+| Relax 28L, naive remat (§13, extrapolated) | 4,096 | 8.787 GB | 5.19 | 654× |
+
+**The new gap is 75× at 8L (was 114×) and 289× at 28L (was 654×).** The launch-fusion lever
+compounds with the device-resident forward and is the **biggest single throughput win at depth**
+(28L gap more than halved). It does NOT touch the per-launch MR-kernel cost — that is the next
+floor.
+
+### What attributes the REMAINING gap — the next lever (honest, post-launch-fusion)
+
+After §13 (host-staging gone) and §14 (launch count cut), the 75×–289× gap is now attributed
+to, in order:
+
+1. **The 6.56 s/call MR-kernel compute — the new sole dominant term (95.0% of the step).** This
+   is the **single biggest remaining lever and is no longer about launch count** — it is the
+   per-launch cost of the unfused MR region kernel (the whole M+R route in one giant kernel; the
+   mamba scan stage runs `T.Kernel(1, threads=1024)`, a single-block serial recurrence —
+   §13/diagnosis). Cutting *per-call* cost needs a **faster/fused/tiled/FP8 MR kernel** (e.g. a
+   CUDA SSD chunked scan to replace the single-SM serial recurrence, collapsing the 4096-deep
+   critical path). At 51×6.56 s = 334.5 s of the 348 s/step at 28L, this is where ~96% of the
+   remaining time lives.
+2. **Abstract numpy bwd/adam/loss (now 5.0% combined at 8L).** bwd = 456 ms/call abstract,
+   adam 0.8%, loss 0.1%. Wiring the **real device-resident backward** (lever 4) removes the last
+   abstract host round-trips; small at 8L, grows with depth.
+3. **4× batch gap.** Megatron runs 16,384 tok/step (bs=4) vs this path's 4,096 (batch=1) — 4×
+   less amortization per launch. Batching ×4 (§5 lever 3) is free amortization Megatron gets.
+4. **Memory headroom for further tradeoffs.** The Korthikanti cache spent some of the 26 GB
+   envelope (28L now 13.0 GB planned). Larger checkpoint segments (fewer recompute, more cache)
+   or batching would consume more — there is ~13 GB of headroom to Megatron's 26 GB to trade.
+
+**Bottom line:** the launch-fusion lever is spent and it worked — 8L 29.82→45.44 tok/s
+(1.524×), 28L 5.19→11.76 tok/s (2.267×), 8L gap 114×→75×, 28L gap 654×→289×, numerics
+identical, at a stated +1.7/+4.2 GB planned-peak cost (still 2× under Megatron). The throughput
+floor has **moved from launch count to the per-call MR-kernel compute (95.0% of the step)**; the
+next lever is a faster/fused/FP8 MR kernel — per-launch device-compute work, not launch count
+and not staging.
+
+### Reproduce (§14)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+PR7_LAYERS=8 PR7_STEPS=4 \
+TVM_LIBRARY_PATH=/home/dave/sources/tl_apache_tvm_swap_zfinal/build/lib \
+LD_LIBRARY_PATH=/home/dave/sources/tl_apache_tvm_swap_zfinal/build/lib:/home/dave/source/cppmega_mlx/.venv/lib/python3.12/site-packages/z3/lib \
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/sources/tl_apache_tvm_swap_zfinal/3rdparty/tvm/python \
+/home/dave/cppmega-venv/bin/python scratch/pr7_profile_device_resident_gb10.py
+```
+The §14 stack is `tl_apache_tvm_swap_zfinal` (tvm 0.25.dev0, has `tirx`) + native `tvm_ffi` +
+editable `source/tilelang` — the only internally-consistent tree on gb10 (the older
+`source/tilelang/build` libs in §13's reproduce now mismatch the `tirx`-migrated tilelang). The
+Korthikanti cache is in `path_c_relax_step_remat.build_remat_bank_chain` /
+`path_c_relax_train_step.build_train_step` / `path_c_relax_step_optim.build_full_step_with_optim`
+(`_recompute_segment`, `saved_exit`, `recomputed_ckpt`). FAIL-LOUD as §13. Launch counts
+verified analytically by `recompute_overhead(n)`: 8L total_fwd=13, 28L total_fwd=51.
+
+---
+
 ## 7. Verdict
 
-The Relax graph-path train_step **fits Megatron-class memory (8.787 GB planned device-peak
-vs Megatron 26 GB, optimizer in-place) and runs the full 28-layer 1.8B step the eager path
-OOMs on** — the memory-first goal is MET on device. With the **device-resident forward
-driver landed and re-profiled (§13)**, the 8L throughput is **29.82 tok/s (was 25.2),
-measured peak 8.08 GB (was 10.30 GB, −2.22 GB host staging removed)** — the 8L gap vs
-Megatron's 3399 tok/s narrows from **135× to 114×**. The host-staging lever worked where it
-was 96.9% of the wall: the forward is now device-resident and **the step is real-device-
-kernel-compute-bound in the forward, no longer host-staging-bound**. The 28L extrapolation is
-**~unchanged (5.19 tok/s, ~654×)** because at depth the floor is the real 6.5 s MR-kernel
-compute × the sqrt-N remat launch count (117 forward launches at 28L), not the staging just
-removed. **The throughput floor has moved from host-staging to kernel-compute × launch
-count**; the next levers (§13) are forward-launch fusion + a faster/fused MR kernel + the
-real device backward + ×4 batch — device-compute work, not more staging removal. The memory
-envelope is proven; the throughput path is now a kernel-fusion problem.
+The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L
+device-peak vs Megatron 26 GB, optimizer in-place) and runs the full 28-layer 1.8B step the
+eager path OOMs on** — the memory-first goal is MET on device. Two throughput levers have now
+landed and both are measured. **§13 (device-resident forward)** took 8L from 25.2 → **29.82
+tok/s** and moved the floor off host-staging onto real-kernel compute × launch count. **§14
+(Korthikanti per-segment recompute cache — launch fusion)** takes 8L to **45.44 tok/s
+MEASURED (1.524× over §13)** and 28L to **11.76 tok/s extrapolated (2.267× over §13)** by
+cutting forward launches **20→13 at 8L and 117→51 at 28L**, numerics bit-for-bit identical
+(loss 5.525e-06), at a stated memory cost (planned peak 4.682→6.400 GB at 8L, 8.787→12.998 GB
+at 28L — the segment checkpoint cache, still 2× under Megatron). The **8L gap vs Megatron's
+3399 tok/s narrows 114×→75×, the 28L gap 654×→289×** — the launch lever is the biggest single
+throughput win at depth and scales better with depth (2.29× launch reduction at 28L). With
+host-staging eliminated (§13) and launch count cut (§14), **the throughput floor has moved to
+the per-call MR-kernel compute itself — 6.56 s/call, now 95.0% of the step**; the next lever
+is a faster/fused/FP8 MR kernel (the single-block `T.Kernel(1, threads=1024)` mamba serial
+recurrence → a gridded CUDA SSD chunked scan), per-launch device-compute work, not launch
+count and not staging. The memory envelope is proven; the throughput path is now a single
+kernel's per-call compute.
