@@ -808,8 +808,11 @@ warning (`lane == 0`, also present in the §15 forward). `cuda_port_edits_needed
 
 ### Parity — FAIL: 7/8 grads pass, dD = 1.40e-3 EXCEEDS the 1e-3 gate (deterministic over 2 runs)
 
-Per-grad max|abs| over ALL elements vs the MLX-proto-backward reference (the proto is 1.30e-4 vs
-the serial autograd GOLD), gate < 1e-3:
+Per-grad max|abs| over ALL elements vs the serial-autograd GOLD oracle **directly** — the probe
+takes the torch.autograd VJP of our exact serial recurrence (`_chunked_mamba3_diagonal_scan`) as the
+gold and compares the gridded B0/B1/B2 chain against it with no MLX-proto in the loop (strictly
+stronger than vs-proto: no proto↔gold slack). Gate < 1e-3, checked over every element (no row/head
+subset; per-grad NaN/Inf RAISES — the discipline the §13 forward inf-bug lacked):
 
 | grad | max\|abs\| (run 1 / run 2) | gate | verdict |
 |---|---:|---:|:--|
