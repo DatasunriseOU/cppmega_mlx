@@ -661,27 +661,30 @@ def chunk_scan_combine_bwd_cuda_prim(
             #   dLmat[l,s] = sum_p dY[l,p]*x[s,p] == DYX[l,s] (reuse, zero recompute)
             #   M[l,s] = cb*lmat*dt_s ; dseg = DYX[l,s]*M[l,s]
             #   segsum-vjp: +dAcs_acc[l] over l>=s, -dAcs_acc[s] over s<l (strictly l>s).
-            # Map the L*L (ll,ss) grid over T.Parallel (the SAME un-fragmented
-            # thread-parallel idiom the dC apply / DYX build above use — a
-            # lane-strided T.serial here gets its masked body split across the
-            # shared-mem barriers TileLang inserts between the global cb load and the
-            # atomic scatter, hoisting the locals out of scope). The dseg compute
-            # lands in a thread-local; the +/- scatter (ll>ss mask) races on shared
-            # dAcs_acc -> T.atomic_add. dseg=0 off the strict lower-tri (no-op adds).
+            # Map the L*L (ll,ss) grid over T.Parallel with a BRANCHLESS body (NO
+            # `if ss<ll` mask): TileLang inserts a __syncthreads() between the global
+            # cb load and the shared-dAcs_acc atomic, and when that barrier lands
+            # INSIDE an if-masked region it re-emits the guard per fragment WITHOUT
+            # hoisting the locals (cb_v/dseg fall out of scope -> 'undefined'). The
+            # unmasked dC apply / DYX build above survive the same barrier precisely
+            # because they are NOT inside an if. So here cb_v/lmat/dt_s are computed
+            # unconditionally (all in-bounds for any (ll,ss) in [0,L)^2) and the
+            # strict-lower-tri (ss<ll) selection is a BRANCHLESS multiplicative mask:
+            # T.if_then_else yields a value, not control flow. (DYX[ll,ss]=0 already
+            # for ss>ll; the mask also kills the ss==ll diagonal -> dseg=0 off the
+            # strict lower-tri, so the +/- scatter is a no-op there. Math IDENTICAL.)
             for ls in T.Parallel(L * L):
                 ll = ls // L
                 ss = ls % L
-                dseg = T.alloc_local((1,), accum_dtype)
-                dseg[0] = T.Cast(accum_dtype, 0)
-                if ss < ll:
-                    cb_v = T.Cast(
-                        accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
-                    )
-                    lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
-                    dseg[0] = DYX[ll, ss] * cb_v * lmat * dt_s
-                T.atomic_add(dAcs_acc[ll], dseg[0])
-                T.atomic_add(dAcs_acc[ss], -dseg[0])
+                cb_v = T.Cast(accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss])
+                lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                tri = T.if_then_else(
+                    ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+                )
+                dseg = DYX[ll, ss] * cb_v * lmat * dt_s * tri
+                T.atomic_add(dAcs_acc[ll], dseg)
+                T.atomic_add(dAcs_acc[ss], -dseg)
             T.sync_threads()
 
             for l in T.Parallel(L):
