@@ -511,11 +511,27 @@ def chunk_scan_combine_bwd_cuda_prim(
             dAcs_acc = T.alloc_shared((L,), accum_dtype)     # accumulated dA_cumsum grad
             XT = T.alloc_shared((L, headdim), accum_dtype)   # staged x[base+s, head, p]
             DYX = T.alloc_shared((L, L), accum_dtype)        # dyx[l,s] = sum_p dY[l,p]*x[s,p]
+            LMAT = T.alloc_shared((L, L), accum_dtype)       # exp2((dacs[l]-dacs[s])*p), l>=s
 
             # --- load dA_cumsum row, init dA grad accumulator ---
             for l in T.Parallel(L):
                 dacs[l] = T.Cast(accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, l])
                 dAcs_acc[l] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+
+            # --- precompute the lower-tri intra-chunk decay LMAT[l,s] ONCE ---
+            #   lmat[l,s] = exp2((dacs[l]-dacs[s])*p) for s<=l (else 0). The Metal prim
+            #   recomputed this exp2 inside dC_diag (per (l,n,s)), dinp (per (s,p,n,l))
+            #   AND dseg (per (l,s)) — ~65K exp2/threadgroup in dinp alone. Built once
+            #   over L*L threads (4096 exp2), then read from shared everywhere below.
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                LMAT[ll, ss] = T.if_then_else(
+                    ss <= ll,
+                    T.exp2((dacs[ll] - dacs[ss]) * p),
+                    T.Cast(accum_dtype, 0),
+                )
             T.sync_threads()
 
             # --- output/gate + D-skip transpose: dY[l,p], dz, dx, dD ---
@@ -611,7 +627,7 @@ def chunk_scan_combine_bwd_cuda_prim(
                 cdiag = T.alloc_local((1,), accum_dtype)
                 cdiag[0] = T.Cast(accum_dtype, 0)
                 for ss in T.serial(0, ll + 1):
-                    lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                    lmat = LMAT[ll, ss]
                     dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
                     b_v = T.Cast(accum_dtype, B[batch_idx, base + ss, group_idx, nn])
                     cdiag[0] = cdiag[0] + lmat * dt_s * DYX[ll, ss] * b_v
@@ -647,7 +663,7 @@ def chunk_scan_combine_bwd_cuda_prim(
                         acc = T.alloc_local((1,), accum_dtype)
                         acc[0] = T.Cast(accum_dtype, 0)
                         for ll in T.serial(ss, L):  # l >= s (lower-tri)
-                            lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                            lmat = LMAT[ll, ss]  # shared, precomputed (no exp2 here)
                             c_v = T.Cast(
                                 accum_dtype, C[batch_idx, base + ll, group_idx, nn]
                             )
@@ -677,7 +693,7 @@ def chunk_scan_combine_bwd_cuda_prim(
                 ll = ls // L
                 ss = ls % L
                 cb_v = T.Cast(accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss])
-                lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                lmat = LMAT[ll, ss]  # shared, precomputed (no exp2 here)
                 dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
                 tri = T.if_then_else(
                     ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
