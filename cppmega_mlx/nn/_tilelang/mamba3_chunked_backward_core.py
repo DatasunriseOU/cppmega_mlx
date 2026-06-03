@@ -661,26 +661,27 @@ def chunk_scan_combine_bwd_cuda_prim(
             #   dLmat[l,s] = sum_p dY[l,p]*x[s,p] == DYX[l,s] (reuse, zero recompute)
             #   M[l,s] = cb*lmat*dt_s ; dseg = DYX[l,s]*M[l,s]
             #   segsum-vjp: +dAcs_acc[l] over l>=s, -dAcs_acc[s] over s<l (strictly l>s).
-            # Lane-strided over the L*L (ll,ss) grid with the ll>ss mask (mirrors the
-            # dinp lane-strided pattern); the +/- scatter races on dAcs_acc -> atomic.
-            for ls0 in T.serial(0, L * L, threads):
-                lane = T.get_thread_binding(0)
-                lsi = ls0 + lane
-                if lsi < L * L:
-                    ll = lsi // L
-                    ss = lsi % L
-                    if ll > ss:
-                        cb_v = T.Cast(
-                            accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
-                        )
-                        lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                        dt_s = T.Cast(
-                            accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss]
-                        )
-                        m_ls = cb_v * lmat * dt_s
-                        dseg = DYX[ll, ss] * m_ls
-                        T.atomic_add(dAcs_acc[ll], dseg)
-                        T.atomic_add(dAcs_acc[ss], -dseg)
+            # Map the L*L (ll,ss) grid over T.Parallel (the SAME un-fragmented
+            # thread-parallel idiom the dC apply / DYX build above use — a
+            # lane-strided T.serial here gets its masked body split across the
+            # shared-mem barriers TileLang inserts between the global cb load and the
+            # atomic scatter, hoisting the locals out of scope). The dseg compute
+            # lands in a thread-local; the +/- scatter (ll>ss mask) races on shared
+            # dAcs_acc -> T.atomic_add. dseg=0 off the strict lower-tri (no-op adds).
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                dseg = T.alloc_local((1,), accum_dtype)
+                dseg[0] = T.Cast(accum_dtype, 0)
+                if ss < ll:
+                    cb_v = T.Cast(
+                        accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
+                    )
+                    lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    dseg[0] = DYX[ll, ss] * cb_v * lmat * dt_s
+                T.atomic_add(dAcs_acc[ll], dseg[0])
+                T.atomic_add(dAcs_acc[ss], -dseg[0])
             T.sync_threads()
 
             for l in T.Parallel(L):
