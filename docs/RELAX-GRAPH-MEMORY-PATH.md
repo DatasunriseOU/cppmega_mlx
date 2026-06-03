@@ -1025,3 +1025,27 @@ Both RAISE fail-loud (RULE #1) on a non-finite loss or any region that cannot ru
 through the graph on the target. Last verified 2026-06-03: 28-layer 1.8B whole-step
 RUNS on gb10 CUDA, loss 4.165619e-02 finite, planned device-peak 8.787 GB, measured
 free-delta 17.64 GB.
+
+---
+
+## 12. PR 7 — PROFILED on gb10 CUDA vs Megatron (the comparison)
+
+`scratch/pr7_profile_train_step_gb10.py` profiles the whole-step graph over MULTIPLE
+steps with **compile-once / run-many** (the loop optimization: `tvm.compile` + VM built
+once, N steps on the same VM, optimizer state threaded step→step), and times every region
+driver. Full write-up: **docs/RELAX-GRAPH-VS-MEGATRON.md**. Headline (gb10 CUDA, 8 layers,
+10 steps, 2026-06-03):
+
+* **mean warm step 162.2 s → 25.2 tok/s** (tokens/step = seq 4096 × batch 1); compile-once
+  0.03 s (8L). Loss 4.165547e-02 finite + stable every step.
+* **measured peak 10.30 GB free-delta** (8L); the **28-layer 1.8B planned device-peak is
+  8.787 GB — ≈3× under Megatron's ~26 GB**. The graph path **FITS Megatron-class memory**
+  and runs the 1.8B step the eager path OOMs on (114-116 GB).
+* per-region breakdown: **forward+remat 96.9%**, bwd 2.5%, adam 0.5%, loss 0.0%;
+  `driver-tot` ≈ 100% of the step wall → the step is **~100% host-staging-bound** (the
+  abstract drivers round-trip every 2028 MB/region bank to host numpy across the
+  `call_dps_packed` boundary), NOT device-compute-bound.
+* vs Megatron 3399 tok/s @ 26 GB: tok/s trails **135× (8L) to ~654× (28L extrapolated)** —
+  the gap is fully attributed to the per-region host-staging (not the device kernels: PR-6
+  proved the real path_c-CUDA kernel runs through the forward boundary) + the 4× batch gap.
+  The next lever is on-device fusion of the forward+remat regions (96.9% of the time).
