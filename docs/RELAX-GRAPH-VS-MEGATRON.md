@@ -21,11 +21,11 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 |---|---|---|
 | config | 28-layer 1.8B, seq=4096, batch=1 | 1.835B, bs=4×seq=4096 |
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
-| **peak memory** | **8.787 GB planned device-peak** (17.64 GB measured free-delta) | **~26 GB** |
+| **peak memory** | **8.787 GB planned device-peak** (8.08 GB measured free-delta, 8L device-resident §13; was 10.30 GB pre-§13) | **~26 GB** |
 | **fits Megatron-class memory** | **YES — 8.79 GB planned < 26 GB (≈3x under)** | 26 GB |
-| **tok/s** | **25.2 tok/s @ 8 layers MEASURED; ~5.2 tok/s @ 28 layers EXTRAPOLATED** | **3399 tok/s** |
-| tok/s ratio vs Megatron | 0.0074x (8L measured) / 0.0015x (28L extrapolated) — i.e. **135x–654x slower** | 1.0x |
-| what runs the compute | abstract numpy host-staged region drivers (memory/executability proof) + REAL path_c-CUDA kernel proven through the fwd boundary (PR-6 stage 2) | tuned fused-FP8-CUDA kernels + selective recompute |
+| **tok/s** | **29.82 tok/s @ 8 layers MEASURED (device-resident fwd, §13; was 25.2 pre-§13); ~5.19 tok/s @ 28 layers EXTRAPOLATED** | **3399 tok/s** |
+| tok/s ratio vs Megatron | 0.0088x (8L measured, §13) / 0.0015x (28L extrapolated) — i.e. **114x–654x slower** (was 135x–654x) | 1.0x |
+| what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident in the forward (§13)** + abstract numpy bwd/adam/loss (lever 4) | tuned fused-FP8-CUDA kernels + selective recompute |
 
 **(a) Does the graph path FIT in Megatron-class memory? YES.** The StaticPlanBlockMemory
 planned device-peak for the whole 28-layer 1.8B step is **8.787 GB** — roughly **3x under**
@@ -34,17 +34,22 @@ Megatron's ~26 GB, and the optimizer state is kept at 1x by the explicit in-plac
 114-116 GB on the same box, `MEGATRON-VS-MLX-PATHS.md`); the graph path runs it and plans
 to 8.79 GB. **This is the win the whole memory-path was built for.**
 
-**(b) What tok/s does it achieve? Far below Megatron — and honestly so.** The current
-graph path is a MEMORY-FIRST design whose region compute is still the abstract numpy
-host-staged drivers (the memory/executability proof harness), NOT tuned device kernels.
-Profiled on gb10 CUDA, the per-step wall is **host-staging-bound and ~constant per
-region**, giving **~25 tok/s at 8 layers (measured)** and an extrapolated **~5 tok/s at
-28 layers** — a **135x (8L measured) to ~654x (28L extrapolated) throughput gap vs
-Megatron's 3399 tok/s**. The gap is NOT
-in the device kernels (PR-6 proved the real path_c-CUDA kernel runs 14.68M nonzero through
-the same boundary); it is entirely the per-region host↔device numpy staging across the
-`call_dps_packed` boundary. See §4 for where the time goes and §5 for the levers that
-close it.
+**(b) What tok/s does it achieve? Far below Megatron — and honestly so, but the
+host-staging lever has now been spent.** The §2/§4 PR-7 baseline profiled the **abstract
+numpy host-staged** forward (a cheap `np.maximum` proxy + a full 2028 MB host round-trip per
+region) and measured **25.2 tok/s @ 8L, ~5.2 @ 28L (135×–654× gap)**, ~100% host-staging-
+bound. **§13 re-profiles with the LANDED device-resident forward** (the REAL tilelang
+path_c-CUDA MR kernel, banks kept on `tvm.cuda(0)` end-to-end, no `.numpy()` in the forward
+hot path): **29.82 tok/s @ 8L MEASURED (1.18× faster), measured peak 8.08 GB (−2.22 GB host
+staging removed), 8L gap narrowed 135×→114×**; the 28L extrapolation is ~unchanged at **5.19
+tok/s (~654×)**. The decisive qualitative result: the forward's 96.9%-of-step term was
+**host-staging in the baseline and is now 95.8% real-device-kernel COMPUTE** — **the step is
+no longer host-staging-bound in the forward; the throughput floor has moved to the real
+6.5 s MR-kernel compute × the sqrt-N remat launch count** (117 forward launches at 28L). The
+gap is NOT the architecture (identical 1.835B stack); the next levers (§13) are
+forward-launch fusion + a faster/fused MR kernel + the real device backward + ×4 batch —
+device-compute work. See §4 for the baseline breakdown, **§13 for the device-resident
+re-profile + the host-staging recovery + the new attribution**, and §5 for the lever list.
 
 ---
 
@@ -327,13 +332,152 @@ the per-forward-call device-resident vs numpy-staged wall (measured 1.30×).
 
 ---
 
+## 13. RE-PROFILE WITH THE DEVICE-RESIDENT FORWARD DRIVER — measured tok/s + the host-staging recovery (gb10 CUDA, 2026-06-03)
+
+This re-runs the whole-step profiler with the **device-resident forward driver** of §4a
+wired into every `pathc.bank_fwd_i` region (the REAL tilelang MR JITKernel, banks kept on
+`tvm.cuda(0)` end-to-end, no `.numpy()` in the per-region forward hot path), and re-measures
+tok/s + peak + the per-region breakdown against the §2/§4 PR-7 baseline (which ran the
+**abstract numpy host-staged** forward). Profiler:
+`scratch/pr7_profile_device_resident_gb10.py` (compile-once / run-many, optimizer state
+threaded, background `/proc/meminfo` peak sampler, per-region wall timers). Loss finite and
+stable (`5.525e-06`) every step — same artifact the §4a equivalence proved
+(`max|device−numpy| = 1.025e-06`).
+
+### MEASURED (gb10 CUDA, 8 layers, 4 steps, warm = steps 1–3)
+
+| metric | PR-7 baseline (abstract numpy fwd) | **device-resident fwd (this §13)** |
+|---|---:|---:|
+| forward compute | `np.maximum` proxy + full host round-trip/region | **REAL tilelang MR kernel, banks device-resident** |
+| mean warm step | 162.23 s | **137.36 s** (median 135.65 s) |
+| **THROUGHPUT** | **25.2 tok/s** | **29.82 tok/s** |
+| step-time speedup | 1.0× | **1.18×** (162.2 → 137.4 s) |
+| planned device-peak | 4.682 GB | 4.682 GB (unchanged — same plan) |
+| **MEASURED peak (free-delta)** | **10.30 GB** | **8.08 GB** (−2.22 GB: the per-region host staging buffers are gone) |
+| loss | 4.166e-02 (abstract) | **5.525e-06** (real kernel), finite, stable |
+
+```
+=== PROFILE (DEVICE-RESIDENT FWD) gb10 CUDA, 8 layers (n_layers=8, 4 steps) ===
+  compile-once     : 0.03s (amortized to ~0 over a loop)
+  mean step (warm) : 137355.2 ms  median 135645.1 ms
+  THROUGHPUT       : 29.82 tok/s
+  planned dev-peak : 4.682 GB
+  MEASURED peak    : 8.08 GB free-delta high-water
+  per-region wall over 4 steps (host-driver time):
+    fwd+remat :  526817.0 ms  (80 calls)   95.8%  [DEVICE-RESIDENT]
+    bwd       :   19611.1 ms  (32 calls)    3.6%  [abstract numpy]
+    adam      :    3037.5 ms  (4 calls)     0.6%  [abstract numpy]
+    loss      :     328.6 ms  (4 calls)     0.1%  [abstract numpy]
+  per-call fwd  :    6585.2 ms/call (device-resident)
+  per-call bwd  :     612.8 ms/call (abstract)
+```
+
+### The host-staging recovery — what the elimination actually bought (honest)
+
+* **Net 8L speedup: 1.18× (25.2 → 29.82 tok/s), peak −2.22 GB (10.30 → 8.08 GB).** The
+  measured free-delta dropping 2.22 GB is the direct, unambiguous signature of removing the
+  per-region host staging buffers — the device-allocator plan (4.682 GB) is unchanged, so
+  the entire drop is host-side numpy that no longer exists.
+* **Apples-to-apples at the real-kernel forward: 1.28× — and this is the honest staging
+  number.** The §2 baseline 25.2 tok/s ran a *cheap numpy proxy* forward (`np.maximum`) whose
+  ~6.9 s/call was almost entirely the 2028 MB host round-trip. This §13 run pays the *real*
+  6.5 s MR-kernel **compute** per call. So the 1.18× *net* mixes two changes (removed the host
+  bounce **and** swapped in the heavier real kernel). Holding the forward fixed at the REAL
+  kernel, the device-resident path is `8472 ms → 6585 ms/call` = **1.28× per forward call**
+  (consistent with §4a's 1.30× and the scout's 1.38× ceiling): the recovered term is the
+  per-call ~1.9 s of bank `.numpy()` / `copyto` host staging, now gone.
+* **The 96.9% → 95.8% "forward share" did NOT move because the bottleneck SHIFTED, not
+  vanished.** In the §4 baseline the forward's 96.9% was **host-staging**. In §13 the forward
+  is **95.8% device-kernel COMPUTE** — the 6585 ms/call is the real MR kernel executing on
+  the GPU, with its ~1.9 s host bounce removed. **The step is no longer host-staging-bound in
+  the forward; it is now real-device-compute-bound in the forward.** That is the qualitative
+  result of this lever: host-staging is eliminated where it was 96.9% of the wall, and the
+  exposed floor is the kernel's own compute × the launch count.
+
+### Extrapolation to 28 layers / 1.8B (explicit, labelled — device-resident per-call costs)
+
+Using the MEASURED device-resident per-call costs (fwd+remat **6.585 s/call**, bwd **0.613
+s/call**) and the §5 region counts (28L = 117 fwd+remat [28 fwd + 89 sqrt-N recompute] + 28
+bwd + 1 adam + 1 loss):
+
+```
+28L step ≈ 117×6.585 + 28×0.613 + adam/loss ≈ 770.5 + 17.2 + ~0.8 ≈ 788.5 s/step
+        → 4096 / 788.5 ≈ 5.19 tok/s   (EXTRAPOLATED from measured 8L per-call costs)
+```
+
+The 28L number is **~unchanged (5.19 vs the baseline's ~5.2)** — because at 28L the step is
+dominated by **117 real-kernel forward launches** (the sqrt-N remat multiplies 28 forward
+regions into 117), and each launch is now the real 6.5 s MR kernel **compute**, which the
+device-residency does not shrink. The 8L net win (1.18×) comes mostly from the smaller remat
+multiplier at 8L; the host-staging recovery (1.28× per call) is real but is swamped at 28L by
+the kernel-compute × launch-count floor.
+
+### Re-stated gap vs Megatron 3399 tok/s @ 26 GB
+
+| side | tok/step | peak mem | tok/s | gap vs Megatron |
+|---|---:|---:|---:|---:|
+| **Megatron-LM (live)** | 16,384 | ~26 GB | **3399** | 1.0× |
+| Relax graph-path 8L, abstract-numpy fwd (PR-7 baseline) | 4,096 | 10.30 GB | 25.2 | 135× |
+| **Relax graph-path 8L, DEVICE-RESIDENT fwd (§13)** | 4,096 | **8.08 GB** | **29.82** | **114×** |
+| Relax graph-path 28L, device-resident fwd (EXTRAPOLATED) | 4,096 | 8.787 GB planned | **5.19** | **654×** |
+
+**The new gap is 114× at 8L (was 135×) and ~654× at 28L (unchanged).** The device-resident
+forward closed the 8L gap from 135× to 114× (the 1.18× net speedup) and cut measured peak by
+2.22 GB, but did not move the 28L extrapolation, because at depth the floor is the real
+kernel's compute × the remat launch count, not the host staging that was just removed.
+
+### What attributes the REMAINING gap — the next lever (honest, post-host-staging)
+
+The forward host-staging that was **96.9% of the baseline step** is eliminated; the remaining
+114×–654× gap is now attributed to, in order:
+
+1. **Real MR-kernel compute per launch (6.585 s/call) — the new dominant term.** This is a
+   single-launch, **unfused** MR region kernel (one giant kernel doing the whole M+R route).
+   6.5 s/call × 20 (8L) / 117 (28L) launches is now 95.8% of the step. The next lever is a
+   **faster / fused / tiled MR kernel** (and FP8 like Megatron) — this is device-compute
+   optimization, not staging.
+2. **sqrt-N remat launch multiplication.** The 28 forward regions become 117 forward launches
+   at 28L (89 are recompute). Each recompute is a full 6.5 s kernel launch. Fusing adjacent
+   forward+remat regions into fewer launches (§5 lever 1 remainder, deferred) directly attacks
+   this — it is the single biggest 28L lever now that staging is gone.
+3. **Abstract numpy bwd/adam/loss still host-stage (now 4.3% combined at 8L).** bwd = 612.8
+   ms/call abstract (§13), adam 0.6%, loss 0.1%. Wiring the **real device-resident backward**
+   (lever 4) removes the last abstract host round-trips; small at 8L, but it grows with depth.
+4. **4× batch gap.** Megatron runs 16,384 tok/step (bs=4) vs this path's 4,096 (batch=1) — 4×
+   less amortization per launch. Batching ×4 (§5 lever 3) is free amortization Megatron gets.
+
+**Bottom line:** the host-staging lever is spent and it worked where it applied — the forward
+is now device-resident, peak dropped 2.22 GB, 8L gap 135×→114×. The throughput floor has
+**moved from host-staging to real-kernel compute × launch count**; the next levers are kernel
+fusion/speed (1, 2) and the real device backward (3), not more staging removal.
+
+### Reproduce (§13)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+PR7_LAYERS=8 PR7_STEPS=4 \
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/pr7_profile_device_resident_gb10.py
+```
+FAIL-LOUD: non-finite loss, any region that cannot run, or a device tensor not detected as
+device RAISES. Measured 2026-06-03 on gb10 `tvm.cuda(0)`, TVM 0.25.dev0.
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (8.787 GB planned device-peak
 vs Megatron 26 GB, optimizer in-place) and runs the full 28-layer 1.8B step the eager path
-OOMs on** — the memory-first goal is MET on device. Its **throughput trails Megatron by
-135x (8L) to ~654x (28L)** (25.2 tok/s @ 8L measured, ~5.2 tok/s @ 28L extrapolated, vs 3399), and the gap
-is **fully attributed to the abstract per-region host↔device staging** (not the device
-kernels, not the architecture) plus the 4× batch gap. The path is a memory envelope that is
-now proven; closing the throughput gap is the on-device-fusion work in §5, with the real
-path_c-CUDA kernel already proven through the forward boundary.
+OOMs on** — the memory-first goal is MET on device. With the **device-resident forward
+driver landed and re-profiled (§13)**, the 8L throughput is **29.82 tok/s (was 25.2),
+measured peak 8.08 GB (was 10.30 GB, −2.22 GB host staging removed)** — the 8L gap vs
+Megatron's 3399 tok/s narrows from **135× to 114×**. The host-staging lever worked where it
+was 96.9% of the wall: the forward is now device-resident and **the step is real-device-
+kernel-compute-bound in the forward, no longer host-staging-bound**. The 28L extrapolation is
+**~unchanged (5.19 tok/s, ~654×)** because at depth the floor is the real 6.5 s MR-kernel
+compute × the sqrt-N remat launch count (117 forward launches at 28L), not the staging just
+removed. **The throughput floor has moved from host-staging to kernel-compute × launch
+count**; the next levers (§13) are forward-launch fusion + a faster/fused MR kernel + the
+real device backward + ×4 batch — device-compute work, not more staging removal. The memory
+envelope is proven; the throughput path is now a kernel-fusion problem.
