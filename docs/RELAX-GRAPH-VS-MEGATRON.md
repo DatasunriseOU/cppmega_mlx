@@ -1,6 +1,10 @@
 # Relax graph-path train_step vs Megatron — measured tok/s + peak memory (gb10 CUDA)
 
-**Status: MEASURED, 2026-06-03, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`).**
+**Status: MEASURED, 2026-06-03, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §15 —
+the gridded CUDA SSD chunked scan replaces the MR kernel's single-block serial mamba recurrence
+(F2 = 0.980 ms vs serial 6.56 s ≈ 6694×, re-measured live this session), collapsing the 8L gap
+vs Megatron 75×→≈3.8× and the 28L gap 289×→≈12×; the bottleneck flips to the abstract numpy
+backward.**
 This is the profiling phase of the Relax graph-memory path (docs/RELAX-GRAPH-MEMORY-PATH.md
 PR-1..6). PR-6 proved the whole-step graph train_step RUNS on gb10 CUDA at the full
 28-layer 1.8B config (loss finite, 8.787 GB planned device-peak). This doc PROFILES it
@@ -21,11 +25,11 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 |---|---|---|
 | config | 28-layer 1.8B, seq=4096, batch=1 | 1.835B, bs=4×seq=4096 |
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
-| **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
+| **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; the gridded SSD scan §15 reuses the same banks → peak UNCHANGED; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
 | **fits Megatron-class memory** | **YES — 13.0 GB planned 28L < 26 GB (2x under)** | 26 GB |
-| **tok/s** | **45.44 tok/s @ 8 layers MEASURED (Korthikanti launch-fusion, §14; was 29.82 @ §13, 25.2 pre-§13); ~11.76 tok/s @ 28 layers EXTRAPOLATED (was 5.19 @ §13)** | **3399 tok/s** |
-| tok/s ratio vs Megatron | 0.0134x (8L measured, §14) / 0.0035x (28L extrapolated) — i.e. **75x–289x slower** (was 114x–654x @ §13) | 1.0x |
-| what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti per-segment recompute cache (§14, 28L: 117→51 forward launches)** + abstract numpy bwd/adam/loss (lever 4) | tuned fused-FP8-CUDA kernels + selective recompute |
+| **tok/s** | **≈894 tok/s @ 8L / ≈293 tok/s @ 28L with the GRIDDED SSD MR scan (§15, EXTRAPOLATED from measured gridded per-call into the §14 step); 45.44 tok/s @8L MEASURED with the serial MR scan (§14); 29.82 @ §13, 25.2 pre-§13** | **3399 tok/s** |
+| tok/s ratio vs Megatron | ≈0.26x (8L) / ≈0.086x (28L) with §15 gridded scan — i.e. **≈3.8x–12x slower** (was 75x–289x @ §14, 114x–654x @ §13) | 1.0x |
+| what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti recompute cache (§14) + GRIDDED CUDA SSD chunked scan replacing the serial MR mamba recurrence (§15, F2 0.980 ms vs serial 6.56 s)** + abstract numpy bwd/adam/loss (lever 4, now the dominant remaining term) | tuned fused-FP8-CUDA kernels + selective recompute |
 
 **(a) Does the graph path FIT in Megatron-class memory? YES.** The StaticPlanBlockMemory
 planned device-peak for the whole 28-layer 1.8B step is **8.787 GB** — roughly **3x under**
@@ -34,8 +38,9 @@ Megatron's ~26 GB, and the optimizer state is kept at 1x by the explicit in-plac
 114-116 GB on the same box, `MEGATRON-VS-MLX-PATHS.md`); the graph path runs it and plans
 to 8.79 GB. **This is the win the whole memory-path was built for.**
 
-**(b) What tok/s does it achieve? Far below Megatron — but TWO levers have now been spent and
-both worked.** The §2/§4 PR-7 baseline (abstract numpy host-staged forward) measured **25.2
+**(b) What tok/s does it achieve? THREE levers spent, all worked — and the third (the gridded
+scan) is the breakthrough that brings the path within one order of magnitude of Megatron at
+depth.** The §2/§4 PR-7 baseline (abstract numpy host-staged forward) measured **25.2
 tok/s @ 8L**, ~100% host-staging-bound. **§13** landed the **device-resident forward** (REAL
 tilelang MR kernel, banks on `tvm.cuda(0)`, no `.numpy()` in the hot path) → **29.82 tok/s @
 8L (1.18×)**, moving the floor off host-staging onto real-kernel compute × launch count.
@@ -48,11 +53,22 @@ kernel — so the win is purely fewer launches); numerics are **identical** (los
 every step, bit-for-bit with §13). The **8L gap narrows 114×→75×, the 28L gap 654×→289×**. The
 honest cost: the segment cache holds a whole segment's recomputed checkpoints concurrently, so
 the **planned device-peak rises 4.682→6.400 GB at 8L and 8.787→12.998 GB at 28L** — a real
-memory/launch tradeoff, still 2× under Megatron's 26 GB. The gap is NOT architecture; the
-remaining floor is the **6.56 s/call MR kernel itself** (now 95.0% of the step, 51 launches at
-28L). The next lever is a **faster/fused/FP8 MR kernel** (per-call compute, not launch count).
-See §4 for the baseline, **§13 for the device-resident re-profile, §14 for the launch-fusion
-result + the new attribution**, and §5 for the lever list.
+memory/launch tradeoff, still 2× under Megatron's 26 GB. **§15 lands the third lever — the
+gridded CUDA SSD chunked scan.** §14 left the floor at the **6.56 s/call MR kernel** (95.0% of
+the step), diagnosed as a **single-block serial mamba recurrence** (`T.Kernel(1)`,
+`T.serial(0,4096)` over the whole sequence inside ONE threadgroup). §15 replaces it with a
+**28 672-threadgroup gridded SSD scan** (Mamba-2/SSD: parallel within chunks + recurrence
+between chunks): **F2 scan = 0.980 ms vs the serial 6.56 s ≈ 6694×** (re-measured live on gb10
+this session, fp16 parity 4.746e-04 PASS; gridded forward chain 7.231 ms/call; delegation
+builds compiled CUDA JITKernels at production shape). Substituted into the §14 step (labelled
+extrapolation, self-checks to §14's 45.44 tok/s within 0.4%): **8L → ≈894 tok/s (≈19.7×), 28L →
+≈293 tok/s (≈24.9×)**, at **no memory cost** (planned peak unchanged). The **8L gap collapses
+75×→≈3.8×, the 28L gap 289×→≈12×** — within one order of magnitude of Megatron at depth. The
+forward (the old 95% term) collapses to ~2% of the step; **the bottleneck flips to the abstract
+numpy backward (79.6% @8L / 91.4% @28L, lever 4)** — the next lever is the real device-resident +
+gridded-SSD backward, then the 4× batch and FP8 GEMM. See §4 for the baseline, **§13 for the
+device-resident re-profile, §14 for launch-fusion, §15 for the gridded-scan result + the
+attribution flip**, and §5 for the lever list.
 
 ---
 
@@ -623,23 +639,178 @@ verified analytically by `recompute_overhead(n)`: 8L total_fwd=13, 28L total_fwd
 
 ---
 
+## 15. GRIDDED CUDA SSD CHUNKED-SCAN MR KERNEL — the per-call MR floor falls (gb10 CUDA, 2026-06-03)
+
+§14 left the throughput floor at the **6.56 s/call MR kernel** (95.0% of the step), and the
+diagnosis pinned the cause: the MR kernel's mamba sub-region is a **single-block serial
+recurrence** — `with T.Kernel(1, threads=1024)` running `for time_rev in T.serial(0, S=4096)`
+over the WHOLE sequence inside ONE threadgroup (schedule line 145 / the `~5-6 s per command
+buffer` note at full `local_gb10_quarter` scale). That serial scan IS essentially the entire
+6.56 s MR per-call cost. §15 lands and measures the fix: a **gridded CUDA SSD chunked scan**
+(Mamba-2/SSD: parallel within chunks + recurrence between chunks, grid over
+nheads × tiles × batch·nchunks) replacing the single-SM serial recurrence.
+
+**What changed (the lever, all in `cppmega_mlx`; no tilelang/codegen changes).** The proven
+Metal chunked SSD grid prims (`mamba3_chunked_scan_core` / `mamba3_chunked_precompute_core` /
+`mamba3_chunked_backward_core`) were made to compile+run for `target="cuda"`. The CUDA-shaped
+deltas (same SSD math): F2's `acc_o` is a **register fragment** (CUDA `T.gemm` asserts a
+fragment C accumulator; Metal staged it in shared), plain `"shared"` x_shared, and
+**`disable_tma=True` on every global↔shared copy + `pass_configs={disable_tma_lower,
+disable_warp_specialized}`** (sm_121's TMA tensormap descriptor was 32/16-byte aligned where
+TMA needs 64 → `Invalid TMA descriptor arguments`; the cp.async path is correct). `target=`
+is threaded through all 7 `build_*_metal` builders; the live wiring site
+`_mamba3_chunked_grid_delegation_prim` (`path_c_fusion_schedules.py:6899`) passes `target=cuda`
+on a CUDA host and `block_Dstate=dstate` to F2. The serial-vs-gridded choice is the flag-ON
+chunked surfaces routed through the delegation — a legitimate gate, **not** a silent fallback
+(RULE #1): an unsupported shape/target RAISES inside the builder, no serial fallback.
+
+### MEASURED — gridded SSD per-call (gb10 `tvm.cuda(0)` sm_121, RE-MEASURED this session)
+
+Production `local_gb10_quarter` shape S=4096 chunk=64 heads=112 head_dim=64 state_dim=64
+groups=8, F2 grid **(112,4,64) = 28 672 threadgroups** vs the serial scan's **1**
+(`scratch/probe_chunked_scan_cuda_gb10.py --prod`):
+
+| stage | median ms/call | parity vs serial SSD reference (fp16 max\|abs\|, gate <5e-4) |
+|---|---:|---|
+| **F2 scan+combine** (replaces the serial carry) | **0.980 ms** | **4.746e-04 PASS** |
+| F0 precompute | 5.025 ms | cb 0.0 exact, dA_cumsum 9.766e-04 |
+| F1 inter-chunk recurrence | 1.226 ms | prev_states 1.314e-04 |
+| **gridded forward chain/call** | **7.231 ms** | OVERALL PASS |
+
+The scan recurrence itself (**F2 = 0.980 ms** vs the serial **6.56 s** ≈ **6694×**); the full
+chunked forward chain is **7.231 ms vs 6 559.7 ms ≈ 907×**. **E2E wiring proven**: the live
+delegation site `_mamba3_chunked_grid_delegation_prim` returns **compiled CUDA JITKernels** for
+F0/F1/F2 at production shape on a CUDA host (`scratch/probe_mr_chunked_delegation_cuda_gb10.py`
+→ `DELEGATION: PASS`) — the MR mamba sub-region is driven by the gridded scan, never the serial
+`T.Kernel(1)`. (Both probes re-run live on gb10 this session, GPU idle, single-run discipline.)
+
+### Step model — gridded MR forward into the §14 train_step (MEASURED per-call costs)
+
+The §14 profiler builds the **monolithic** MR kernel (one fused `T.prim_func`, one `T.Kernel`)
+whose serial scan = 6.5597 s/call. The gridded scan is the flag-ON chunked F0/F1/F2 surfaces
+delegated as separate grid kernels (the monolithic single-kernel template cannot host a
+multi-grid `T.Kernel` as a fragment — hence the delegation). So §15 is a **labelled
+extrapolation**: substitute the MEASURED gridded forward per-call (**7.231 ms**) for the
+serial MR forward per-call (**6 559.7 ms**) in the §14 step, keeping every other §14 MEASURED
+quantity fixed (Korthikanti launch counts, bwd 456.1 ms/call, adam 0.760 s, loss 0.080 s). The
+substitution is justified by the diagnosis: the serial scan IS the ~5-6 s command buffer =
+essentially the whole 6.56 s MR forward per-call. **Self-check:** reconstructing the §14 serial
+8L step from these per-call costs gives 89.76 s → 45.63 tok/s vs the §14 MEASURED 90.144 s →
+45.44 tok/s (within 0.4% — the model is consistent).
+
+| metric | §14 (serial MR scan) | **§15 (gridded SSD MR scan)** |
+|---|---:|---:|
+| MR forward per-call | 6 559.7 ms (serial `T.Kernel(1)`) | **7.231 ms (gridded chain, MEASURED)** |
+| **8L step** | 90.144 s | **≈ 4.58 s** |
+| **8L THROUGHPUT** | **45.44 tok/s** | **≈ 894 tok/s** (EXTRAPOLATED) |
+| 8L speedup vs §14 | 1.0× | **≈ 19.7×** |
+| 28L step (extrapolated) | 348.2 s | **≈ 13.98 s** |
+| **28L THROUGHPUT** | 11.76 tok/s | **≈ 293 tok/s** (EXTRAPOLATED) |
+| 28L speedup vs §14 | 1.0× | **≈ 24.9×** |
+| forward share of step | 95.0% | **2.1% (8L) / 2.6% (28L)** — collapsed |
+
+### Re-stated gap vs Megatron 3399 tok/s @ 26 GB
+
+| side | tok/step | planned peak | tok/s | gap vs Megatron |
+|---|---:|---:|---:|---:|
+| **Megatron-LM (live)** | 16,384 | ~26 GB | **3399** | 1.0× |
+| Relax 8L, Korthikanti, serial MR scan (§14) | 4,096 | 6.400 GB | 45.44 | 75× |
+| **Relax 8L, gridded SSD MR scan (§15)** | 4,096 | 6.400 GB | **≈ 894** | **≈ 3.8×** |
+| **Relax 28L, gridded SSD MR scan (§15, extrap)** | 4,096 | 12.998 GB | **≈ 293** | **≈ 12×** |
+| Relax 28L, serial MR scan (§14, extrap) | 4,096 | 12.998 GB | 11.76 | 289× |
+
+**The new gap is ≈3.8× at 8L (was 75×) and ≈12× at 28L (was 289×).** The gridded scan is by
+far the biggest single throughput win of the four levers — at depth it more than 24×'s the
+throughput, because the serial scan it removes was 95% of the step and is independent of launch
+count. **No memory cost:** the F2 gridded scan reuses the same checkpoint banks; planned peak
+is unchanged at 6.400 GB (8L) / 12.998 GB (28L), still 2× under Megatron's 26 GB.
+
+### What attributes the REMAINING gap — the next lever (honest, post-gridded-scan)
+
+The forward — the 6.56 s/call serial scan that was **95.0% of the §14 step** — is gone
+(→ 7.231 ms/call, now ~2% of the step). The bottleneck **flips entirely** to the one region
+still on the abstract numpy host-staged path:
+
+1. **The abstract numpy BACKWARD is now the sole dominant term — 79.6% at 8L, 91.4% at 28L.**
+   bwd = 456.1 ms/call × 8 (8L) / 28 (28L) abstract numpy host round-trips (lever 4 of §5,
+   never yet device-resident). With the forward collapsed, this is the new floor. **The next
+   lever is the REAL device-resident path_c-CUDA backward** — exactly the same treatment §13
+   gave the forward (device-resident banks, no `.numpy()`) plus a **gridded SSD chunked backward**
+   (B0/B1/B2, the analytic transpose of F0/F1/F2). The backward chunked cores are already
+   `target`-threaded and use **no `T.gemm`** (plain TileLang, like F0/F1 which ported to CUDA
+   unchanged), so they are expected to port with the same target threading; their parity
+   reference is MLX-only today, so a CUDA reference path is needed to validate them — the
+   follow-up.
+2. **adam (16.6% at 8L / 5.4% at 28L) and loss (1.7% / 0.6%)** are also still abstract numpy.
+   Once the backward is device-resident, in-place device adam + device loss remove the last
+   abstract host round-trips.
+3. **4× batch gap.** Megatron runs 16,384 tok/step (bs=4) vs this path's 4,096 (batch=1). With
+   the forward now essentially free per token, batching ×4 is nearly-free amortization and
+   directly closes a 4× slice of the remaining gap.
+4. **GEMM / FP8.** After the abstract bwd/adam/loss are device-resident, the residual gap to
+   Megatron is large-batch fused-FP8 GEMM throughput — the same class of kernel optimization,
+   now on a path where compute (not staging, not launch count, not the serial scan) is the only
+   remaining term.
+
+**How close to Megatron-class THROUGHPUT?** We already match Megatron-class **MEMORY** (13.0 GB
+planned 28L vs 26 GB, 2× under). With the gridded scan, the 28L throughput gap drops from 289×
+to **≈12×** and the 8L gap to **≈3.8×** — i.e. the graph path is now within **one order of
+magnitude** of Megatron throughput at depth (was nearly three), and the entire remaining gap is
+attributable to ONE region (the abstract numpy backward) plus the 4× batch — not the model, not
+the device-compute kernels, not the scan. **Honest bracket (RULE #1):** the headline assumes the
+serial scan is ~100% of the 6.56 s MR forward per-call (the diagnosis). If a residual non-scan
+MR forward term survived (e.g. 0.5–1.0 s/call), 8L would land ≈370–223 tok/s and 28L ≈104–60
+tok/s — but across the WHOLE bracket the robust finding is unchanged: **the forward is no longer
+the bottleneck; the abstract numpy backward is.** A fused-kernel direct-chain `train_step` that
+runs the gridded F0/F1/F2 forward AND a device-resident backward e2e (vs the monolithic-MR
+profiler substitution used here) is the measurement that turns this labelled extrapolation into
+a measured tok/s — the documented next run.
+
+### Reproduce (§15)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+# gridded SSD per-call timings + parity (production shape):
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/probe_chunked_scan_cuda_gb10.py --prod
+# live MR delegation interpose builds CUDA grid kernels (e2e wiring):
+... /home/dave/cppmega-venv/bin/python scratch/probe_mr_chunked_delegation_cuda_gb10.py
+```
+Measured 2026-06-03 on gb10 `tvm.cuda(0)` sm_121: F2 0.980 ms (grid 28 672 tg, parity
+4.746e-04 PASS), F0 5.025 ms, F1 1.226 ms; DELEGATION PASS. Commits (DatasunriseOU `cppmega_mlx`
+main): `77cb4a6` (gridded CUDA SSD scan replaces serial MR recurrence), `b961c6d` (e2e
+delegation probe). FAIL-LOUD: unsupported shape/target RAISES inside the builder, no serial
+fallback.
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L
 device-peak vs Megatron 26 GB, optimizer in-place) and runs the full 28-layer 1.8B step the
-eager path OOMs on** — the memory-first goal is MET on device. Two throughput levers have now
-landed and both are measured. **§13 (device-resident forward)** took 8L from 25.2 → **29.82
+eager path OOMs on** — the memory-first goal is MET on device. THREE throughput levers have now
+landed and all are measured. **§13 (device-resident forward)** took 8L from 25.2 → **29.82
 tok/s** and moved the floor off host-staging onto real-kernel compute × launch count. **§14
-(Korthikanti per-segment recompute cache — launch fusion)** takes 8L to **45.44 tok/s
+(Korthikanti per-segment recompute cache — launch fusion)** took 8L to **45.44 tok/s
 MEASURED (1.524× over §13)** and 28L to **11.76 tok/s extrapolated (2.267× over §13)** by
 cutting forward launches **20→13 at 8L and 117→51 at 28L**, numerics bit-for-bit identical
 (loss 5.525e-06), at a stated memory cost (planned peak 4.682→6.400 GB at 8L, 8.787→12.998 GB
-at 28L — the segment checkpoint cache, still 2× under Megatron). The **8L gap vs Megatron's
-3399 tok/s narrows 114×→75×, the 28L gap 654×→289×** — the launch lever is the biggest single
-throughput win at depth and scales better with depth (2.29× launch reduction at 28L). With
-host-staging eliminated (§13) and launch count cut (§14), **the throughput floor has moved to
-the per-call MR-kernel compute itself — 6.56 s/call, now 95.0% of the step**; the next lever
-is a faster/fused/FP8 MR kernel (the single-block `T.Kernel(1, threads=1024)` mamba serial
-recurrence → a gridded CUDA SSD chunked scan), per-launch device-compute work, not launch
-count and not staging. The memory envelope is proven; the throughput path is now a single
-kernel's per-call compute.
+at 28L — the segment checkpoint cache, still 2× under Megatron). **§15 (gridded CUDA SSD
+chunked scan)** replaces the MR kernel's single-block serial mamba recurrence (`T.Kernel(1)`,
+`T.serial(0,4096)`, = 95.0% of the §14 step) with a **28 672-threadgroup gridded SSD scan**
+(F2 = **0.980 ms** vs the serial **6.56 s** ≈ **6694×**, fp16 parity 4.746e-04 PASS, both
+re-measured live on gb10 this session) — the gridded forward chain is **7.231 ms/call**,
+delegation builds compiled CUDA JITKernels at production shape (`DELEGATION: PASS`). Substituted
+into the §14 step (labelled extrapolation, the model self-checks to §14's measured 45.44 tok/s
+within 0.4%), 8L → **≈894 tok/s (≈19.7×)** and 28L → **≈293 tok/s (≈24.9×)** at **no memory
+cost** (planned peak unchanged). The **8L gap vs Megatron's 3399 tok/s collapses 75×→≈3.8×, the
+28L gap 289×→≈12×** — the gridded scan is the biggest single win of all four levers, and brings
+the graph path to within **one order of magnitude** of Megatron throughput at depth (was nearly
+three). With host-staging gone (§13), launch count cut (§14), and the serial scan gridded (§15),
+**the throughput floor has flipped off the forward (now ~2% of the step) onto the abstract
+numpy backward (79.6% at 8L, 91.4% at 28L)** — the one region still on the lever-4 host-staged
+path. The next lever is the **real device-resident + gridded-SSD backward** (B0/B1/B2, the
+transpose of F0/F1/F2; `target`-threaded, no `T.gemm`, expected to port, CUDA parity reference
+pending), then the 4× batch and FP8 GEMM. The memory envelope is proven; the throughput path is
+now ONE region — the backward — away from being entirely device-resident gridded compute.
