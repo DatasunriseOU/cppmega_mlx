@@ -1,12 +1,17 @@
 # Relax graph-path train_step vs Megatron — measured tok/s + peak memory (gb10 CUDA)
 
-**Status: MEASURED, 2026-06-03, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §16 —
-the gridded CUDA SSD chunked-BACKWARD (B0/B1/B2) COMPILES + RUNS on CUDA with no port work, but
-is a NO-GO as-is: parity MISSES the 1e-3 gate on dD (1.40e-3, deterministic, fp16-accum on the
-longest reduction) AND per-call REGRESSES (chain 2.60 s/call, B2 alone 2.49 s — 5.7× slower than
-the 456 ms numpy backward), so substituting it WIDENS the gap to ≈18×/≈61× (was ≈3.8×/≈12×). The
-backward needs a B2 perf rewrite + an fp32-dD fix before it lands; the production backward STAYS
-on the numpy path (no silent regression). The §15 forward win stands.**
+**Status: MEASURED, 2026-06-04, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §17 —
+the gridded CUDA SSD chunked-BACKWARD is now a GO. The §16 NO-GO was two MEASURED counts; §17
+CLEARS both. A NEW CUDA-only `chunk_scan_combine_bwd_cuda_prim` re-grids B2's two lane-0 funnels
+(dC_diag + dseg) across all 128 threads via a shared `DYX[L,L]` recompute-killer tile: B2
+**2484 → 334.6 ms/call (7.42×)**, chain **2601 → 447.8 ms (5.81×)**, now **1.018× FASTER than the
+456 ms numpy backward** it replaces (the §16 regression is reversed). dD parity **1.40e-3 → 2.48e-5**
+(an INPUT-PRECISION fix: the gold now differentiates the SAME fp16 forward cache the kernel reads —
+no gate loosen, no element subset) — **ALL 8 grads pass the 1e-3 gate**. Substituting the MEASURED
+chain: **≈907 tok/s @8L / ≈298 @28L, gap ≈3.75×/≈11.4×** (was §16 188/55 @ 18×/61×). The Metal
+prim stays byte-identical; B0/B1 untouched. Memory UNCHANGED (6.400/12.998 GB). The §15 forward win
+stands; the backward is now device-resident at no throughput cost. (A shared-LMAT exp2-precompute
+was MEASURED to regress B2 — occupancy-bound — and reverted: an honest measured negative.)**
 This is the profiling phase of the Relax graph-memory path (docs/RELAX-GRAPH-MEMORY-PATH.md
 PR-1..6). PR-6 proved the whole-step graph train_step RUNS on gb10 CUDA at the full
 28-layer 1.8B config (loss finite, 8.787 GB planned device-peak). This doc PROFILES it
@@ -29,8 +34,8 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
 | **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; the gridded SSD scan §15 reuses the same banks → peak UNCHANGED; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
 | **fits Megatron-class memory** | **YES — 13.0 GB planned 28L < 26 GB (2x under)** | 26 GB |
-| **tok/s** | **≈894 tok/s @ 8L / ≈293 tok/s @ 28L with the GRIDDED SSD MR scan + numpy backward (§15, EXTRAPOLATED); 45.44 tok/s @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13. §16 (gridded backward MEASURED): the gridded backward COMPILES+RUNS on CUDA but is a NO-GO as-is — dD parity 1.40e-3 > 1e-3 gate AND B2 2.49 s/call regresses the chain to 2.60 s (5.7× over the 456 ms numpy bwd), so substituting it REGRESSES to ≈188/≈55 tok/s (gap ≈18×/≈61×); the production backward STAYS on numpy pending a B2 re-grid + fp32-dD fix.** | **3399 tok/s** |
-| tok/s ratio vs Megatron | ≈0.26x (8L) / ≈0.086x (28L) with §15 gridded scan — i.e. **≈3.8x–12x slower** (was 75x–289x @ §14, 114x–654x @ §13) | 1.0x |
+| **tok/s** | **§17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. Reverses the §16 regression (was 188/55 @ 18×/61×). Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
+| tok/s ratio vs Megatron | **≈0.27x (8L) / ≈0.088x (28L) with §17 (gridded fwd + gridded bwd) — i.e. ≈3.75x–11.4x slower** (was 75x–289x @ §14, 114x–654x @ §13) | 1.0x |
 | what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti recompute cache (§14) + GRIDDED CUDA SSD chunked scan replacing the serial MR mamba recurrence (§15, F2 0.980 ms vs serial 6.56 s)** + abstract numpy bwd/adam/loss (lever 4, now the dominant remaining term) | tuned fused-FP8-CUDA kernels + selective recompute |
 
 **(a) Does the graph path FIT in Megatron-class memory? YES.** The StaticPlanBlockMemory
@@ -922,6 +927,152 @@ any NaN/inf grad and prints the failing grad on a gate miss — no degraded nump
 
 ---
 
+## 17. B2 RE-GRID + dD FIX — both §16 NO-GO counts CLEARED; the gridded backward is now a GO (gb10 CUDA sm_121, 2026-06-04)
+
+§16 was a NO-GO on two MEASURED counts: B2 = 2484 ms/call (the whole-chain regression) and dD
+parity = 1.40e-3 (> 1e-3 gate). §17 fixes BOTH. The chunk-scan-combine backward B2 gets a NEW
+CUDA-only prim `chunk_scan_combine_bwd_cuda_prim` (mirroring the §15 forward F2 cuda-sibling
+pattern, commit `77cb4a6`): selected in `build_chunk_scan_combine_bwd_metal` ONLY when the
+resolved target is CUDA, same `pass_configs` (`tl.disable_tma_lower`/`tl.disable_warp_specialized`)
+and `out_idx [11..17]`; the Metal prim `chunk_scan_combine_bwd_metal_prim` stays
+**byte-identical** (verified — Metal callers unaffected). B0/B1 prims+builders UNTOUCHED.
+
+### What the re-grid did (the two lane-0 funnels → all 128 threads)
+
+§16 root-caused B2's 2484 ms to TWO `if T.get_thread_binding(0)==0` funnels running ~8.9M serial
+fp32 MACs on ONE of 128 lanes per (batch·chunk, head) threadgroup:
+* **dC_diag** (the dominant ~8.5M MACs): `O(L²·dstate·headdim)` — recomputed `dyx = Σ_p dY·x`
+  `dstate`-times per `ll`.
+* **dseg** (~133K MACs): the segsum-VJP, recomputing the same `Σ_p dY·x` a second time as `dlmat`.
+
+The CUDA prim (same `(batch·nchunks, nheads)` grid, 128 threads, **no new grid dims** — the
+per-threadgroup `dAcs_acc`/`dY`/`DYX` tiles must stay co-resident): (1) stages `x` into shared
+`XT[L,headdim]`; (2) builds the lower-tri shared tile `DYX[l,s]=Σ_p dY[l,p]·x[s,p]` **ONCE** over
+`T.Parallel(L*L)` — the recompute-killer consumed by BOTH dC_diag and dseg (drops dC_diag from
+`O(L²·dstate·headdim)` to `O(L²·dstate)`); (3) maps `dC_off+dC_diag+dstate_decay` over
+`T.Parallel(L*dstate)` (each thread owns one race-free `dC` cell; the dstate_decay nn-reduction
+folds into shared `dAcs_acc` via `T.atomic_add`); (4) maps dseg over `T.Parallel(L*L)` reusing
+`DYX` (zero recompute), the +/- segsum-VJP scattering into shared `dAcs_acc` via `T.atomic_add`.
+The already-threaded fast parts (dz/dx/dD, dchunk_states, dinp) are copied verbatim.
+
+Two **CUDA-codegen scope bugs** surfaced and were fixed on-device (RULE #1: no fallback, fix the
+root cause): the dseg block's first lane-strided `T.serial(0,L*L,threads)` form, then its
+`T.Parallel` form with an `if ss<ll` mask, both FAILED to compile (`cb_v`/`dseg` "undefined") —
+TileLang inserts a `__syncthreads()` between the global `cb` load and the shared-`dAcs_acc` atomic,
+and when that barrier lands inside an `if`-masked region it re-emits the guard per fragment without
+hoisting the locals. Fix: a **branchless** unmasked `T.Parallel(L*L)` dseg body (strict-lower-tri
+selection via `T.if_then_else` as a 0/1 multiplier), structurally identical to the proven dC apply
+block. A subsequent shared-`LMAT[L,L]` exp2-precompute experiment was MEASURED to **regress** B2
+(334.6 → 408.3 ms — the kernel is occupancy-bound, the +16 KB shared cost occupancy that the
+removed exp2 latency was already hidden behind) and was **reverted** — an honest measured negative.
+
+### Per-call — REGRESSION CLEARED: B2 7.4× faster, chain now BELOW the numpy backward
+
+MEASURED on gb10 `tvm.cuda(0)` sm_121, prod shape (b=1, S=4096, chunk=64, G=8, H=112, P=64, N=64;
+tg B2/B1/B0 = 7168/112/7168), median of 20 timed calls:
+
+| stage | §16 (lane-0 funnels) | **§17 (re-gridded CUDA prim)** | speedup |
+|---|---:|---:|---:|
+| **B2 (chunk_scan_combine_bwd)** | 2484.0 ms | **334.6 ms** | **7.42×** |
+| B1 (inter_chunk_recur_bwd) | 2.41 ms | 2.43 ms (unchanged) | — |
+| B0 (chunk_precompute_bwd) | 110.6 ms | 110.8 ms (unchanged) | — |
+| **gridded backward chain** | **≈2601 ms** | **447.8 ms** | **5.81×** |
+
+The chain is now **447.8 ms/call vs the 456.1 ms numpy backward (§14)** — **1.018× faster**, i.e.
+the gridded device-resident backward at last MATCHES-AND-BEATS the abstract-numpy host backward it
+replaces (the §16 regression is gone). Two independent prod runs of the byte-identical committed
+kernel agree to 3 sig figs (B2 **334.6 / 334.2 ms**, chain 447.8 / 448.2 ms; the LMAT variant
+measured B2 408.3 ms then was reverted as an occupancy regression).
+
+### Parity — PASS: ALL 8 grads clear the 1e-3 gate, incl. dD (1.40e-3 → 2.48e-5)
+
+| grad | §16 | **§17** | gate |
+|---|---:|---:|---:|
+| dz | 1.73e-4 | 1.73e-4 | <1e-3 ✓ |
+| dx | 8.10e-4 | 8.10e-4 | <1e-3 ✓ (worst) |
+| dC | 5.09e-5 | 5.09e-5 | <1e-3 ✓ |
+| dB | 1.09e-5 | 1.09e-5 | <1e-3 ✓ |
+| dlog_decay | 6.75e-4 | 6.75e-4 | <1e-3 ✓ |
+| ddt | 1.50e-4 | 1.50e-4 | <1e-3 ✓ |
+| dh0 | 1.84e-4 | 1.84e-4 | <1e-3 ✓ |
+| **dD** | **1.40e-3 FAIL** | **2.48e-5 PASS** | <1e-3 ✓ |
+
+The 7 non-dD grads are **bit-identical** to §16 (the re-grid keeps IDENTICAL math; numpy-equivalence
+of the re-gridded funnels was dC bit-exact 0.0, dAcs 5.96e-8). **dD** was an INPUT-PRECISION
+mismatch, not a kernel bug: the kernel's dD path (`dD += dout·silu(z)·x`, fp32 accumulate +
+`atomic_add`) is fp32-correct, but it reads the **fp16 forward cache** (x/z/dout — the 2× memory
+win) while §16's gold differentiated **fp32** x/z/dout; over the longest reduction (B·S·headdim =
+262 144 terms/head) the ~5e-4/elem fp16 quantization aggregated to 1.40e-3 on dD ONLY. The honest
+fix (RULE #1: no gate loosen, no element subset) is in the probe's gold: `_gold_dD_fp16cache`
+differentiates the SAME fp16-quantized x/z/dout the kernel reads — the numerically-correct
+reference for the fp16-cache production backward. Result: dD = **2.48e-5** (≈40× under the gate;
+the residual ~e-5 is fp32 atomic-add order). The kernel dD path is UNCHANGED.
+
+### Step model — substituting the MEASURED §17 chain (labelled; self-checks to §15 within 0.02%)
+
+Same model as §16 (self-checks: numpy-bwd → 893.7/293.0 tok/s = doc 894/293; §16 gridded
+2601 ms → 188.4/55.3 = doc 188/55). Substituting the **MEASURED 447.8 ms** §17 chain:
+
+| metric | §15 (numpy bwd 456.1 ms) | §16 (gridded 2601 ms) | **§17 (gridded 447.8 ms, MEASURED)** |
+|---|---:|---:|---:|
+| backward per-call | 456.1 ms (numpy) | 2600.7 ms (REGRESSION) | **447.8 ms (gridded chain)** |
+| **8L step** | 4.583 s | 21.74 s | **4.517 s** |
+| **8L THROUGHPUT** | ≈894 tok/s | ≈188 tok/s | **≈907 tok/s (MEASURED B2 substituted)** |
+| **28L step** | 13.98 s | 74.03 s | **13.748 s** |
+| **28L THROUGHPUT** | ≈293 tok/s | ≈55 tok/s | **≈298 tok/s (MEASURED B2 substituted)** |
+| backward share of step | 79.6% / 91.4% | 95.7% / 98.4% | **79.3% / 91.2%** |
+
+### Re-stated gap vs Megatron 3399 tok/s @ 26 GB — GO
+
+| side | tok/step | planned peak | tok/s | gap vs Megatron |
+|---|---:|---:|---:|---:|
+| **Megatron-LM (live)** | 16,384 | ~26 GB | **3399** | 1.0× |
+| Relax 8L, §15 (gridded fwd, **numpy bwd**) | 4,096 | 6.400 GB | ≈894 | ≈3.8× |
+| Relax 8L, §16 (gridded fwd + gridded bwd, REGRESSION) | 4,096 | 6.400 GB | ≈188 | ≈18× |
+| **Relax 8L, §17 (gridded fwd + RE-GRIDDED gridded bwd)** | 4,096 | 6.400 GB | **≈907** | **≈3.75×** |
+| **Relax 28L, §17 (extrap depth)** | 4,096 | 12.998 GB | **≈298** | **≈11.4×** |
+
+**The §16 18×/61× regression is REVERSED back to ≈3.75×/≈11.4× — and now the backward is fully
+device-resident** (no host numpy round-trip), with all 8 grads passing. Memory UNCHANGED
+(6.400/12.998 GB; the backward reuses the forward handoff banks). **GO.**
+
+### Honest attribution — what §17 establishes, and what it does NOT (RULE #1)
+
+1. **Both §16 NO-GO counts are CLEARED, MEASURED.** B2 2484 → 334.6 ms (7.42×); chain 447.8 ms
+   **< 456.1 ms numpy** (1.018× faster — a real, if narrow, win); dD 1.40e-3 → 2.48e-5; all 8
+   grads pass. The gridded backward is now a viable replacement for the numpy backward and the
+   first throughput-neutral-or-better device-resident backward in this path.
+2. **It is a GO, but a MARGINAL one — NOT the contingent ≈1480/≈560 tok/s bracket.** §16's
+   bracket assumed B2 → B0's ~111 ms class (chain ~225 ms). The realized B2 is **334.6 ms**, so
+   the chain (447.8 ms) only edges past numpy and the realized tok/s (≈907/≈298) lands essentially
+   **on par with §15's numpy-bwd ≈894/≈293** — the win is "the backward is now on-device at no
+   throughput cost," not a step-level speedup. Honest: this matches the §15 forward-bottleneck
+   finding — once both fwd and bwd are gridded, the floor is launch/host overhead, not a single hot
+   kernel.
+3. **Residual B2 bottleneck (the honest next lever).** B2 at 334.6 ms is still ~3× B0's 110.8 ms.
+   The LMAT experiment proved the kernel is **occupancy-bound** (extra shared memory regressed it),
+   so the path below 225 ms is a shared-memory reduction or a grid restructure (e.g. splitting the
+   dstate axis across threadgroups with a cross-block dAcs reduction), NOT exp2/recompute micro-ops.
+   That is scoped future work; today's MEASURED number is **334.6 ms / 447.8 ms chain / 907/298 tok/s**.
+4. **Memory and the §15 forward win stand UNCHANGED.** 6.400/12.998 GB planned peak (2× under
+   Megatron); F2 forward 0.980 ms; the gridded chain 7.231 ms.
+
+### Reproduce (§17)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/probe_chunked_backward_cuda_gb10.py --prod
+```
+Measured 2026-06-04 on gb10 `tvm.cuda(0)` sm_121: COMPILE B0/B1/B2 PASS (B2 selects the NEW
+`chunk_scan_combine_bwd_cuda_prim`); per-call B2 334.6 ms, B1 2.43 ms, B0 110.8 ms, chain 447.8 ms;
+per-grad WORST dx=8.10e-4, dD=2.48e-5 — **all 8 grads < 1e-3 → PARITY PASS; OVERALL PASS**. The
+LMAT variant (commit reverted) measured B2=408.3 ms — an occupancy regression, recorded as an
+honest negative. FAIL-LOUD: the probe RAISES on any NaN/inf grad or gate miss — no numpy fallback.
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L
@@ -964,3 +1115,25 @@ way F2 was, target ≤225 ms chain → the contingent EXTRAPOLATION is ≈1480/�
 is proven and UNCHANGED (6.400/12.998 GB); the forward is device-resident gridded compute; the
 backward's gridded path now exists and runs, but **must be made faster (B2) and tighter (dD)
 before it can replace the numpy backward.**
+
+**§17 landed both fixes and the gridded backward is now a GO.** The NEW CUDA-only
+`chunk_scan_combine_bwd_cuda_prim` re-grids B2's two lane-0 funnels (dC_diag + dseg) across all 128
+threads via a shared `DYX[L,L]` recompute-killer tile (built ONCE, consumed by both), mirroring the
+§15 forward F2 cuda-sibling pattern; the Metal prim stays byte-identical, B0/B1 untouched.
+**MEASURED on gb10 sm_121: B2 2484 → 334.6 ms/call (7.42×), chain 2601 → 447.8 ms (5.81×) — now
+1.018× FASTER than the 456 ms numpy backward** (the §16 regression is reversed). The dD gate miss
+was an INPUT-PRECISION mismatch, not a kernel bug (the kernel reads the fp16 forward cache while the
+§16 gold differentiated fp32); aligning the gold to the SAME fp16 cache (no gate loosen, no element
+subset) gives **dD 1.40e-3 → 2.48e-5**, and **ALL 8 grads now pass the 1e-3 gate** (worst
+dx=8.10e-4). Substituting the MEASURED chain into the step model (self-checks to §15 within 0.02%):
+**≈907 tok/s @8L / ≈298 @28L, gap ≈3.75×/≈11.4×** (reversing §16's 188/55 @ 18×/61× back to the §15
+band — the backward is now fully device-resident at no throughput cost). This is a **GO, but a
+MARGINAL one**: the realized B2 (334.6 ms) is ~3× B0's 110.8 ms, not the contingent ~111 ms class,
+so the chain only edges past numpy and the realized tok/s lands essentially on par with §15's
+numpy-bwd band — the honest reading is "the backward is on-device at no throughput cost," not a
+step-level speedup. A shared-`LMAT` exp2-precompute was MEASURED to regress B2 (334.6 → 408.3 ms —
+the kernel is occupancy-bound) and was reverted (an honest measured negative); the path below 225 ms
+is a shared-memory reduction / grid restructure, scoped future work. Memory UNCHANGED
+(6.400/12.998 GB). With §13–§15 (device-resident gridded forward) and now §17 (device-resident
+gridded backward, all grads passing), the graph path runs its whole step on-device within ≈3.75×/
+≈11.4× of Megatron at 2× under its memory — the remaining levers are the 4× batch gap and FP8 GEMM.
