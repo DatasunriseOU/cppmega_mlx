@@ -71,10 +71,16 @@ from cppmega_mlx.runtime.path_c_relax_step_banks import (
     BANK_PARAMG,
     BANK_STATE,
     BankSinfo,
+    bank_arg_is_device,
     bank_arg_to_host,
+    bank_copy_prefix_device,
     bank_writeback,
     real_bank_numels,
     register_bank_drivers,
+)
+from cppmega_mlx.runtime.path_c_dps_adapter import (
+    alloc_device_banks,
+    make_device_resident_kernel_driver,
 )
 from cppmega_mlx.runtime.path_c_relax_step_remat import (
     checkpoint_boundaries,
@@ -126,26 +132,78 @@ def _loss_reference(act_bank: np.ndarray) -> float:
 # `leaf` is a fwd-only PathCRegionLeaf (run_backward=0) carrying the real kernel;
 # `real_driver` is make_real_kernel_driver(leaf, device) from the driver phase.
 # --------------------------------------------------------------------------- #
-def make_real_bank_forward_driver(leaf, real_driver, bank_numels: dict[str, int]):
+def make_real_bank_forward_driver(leaf, real_driver, bank_numels: dict[str, int],
+                                  *, device=None):
     """Build a `pathc.bank_fwd_*` packed func that runs the REAL path_c CUDA kernel.
 
-    ABI: (act_in, param, state_in, act_out, state_out). It packs the act/param banks
-    into the real kernel's physical banks, runs the real kernel (real_driver writes
-    the activation bank back into ``banks``), then writes act_out = activation bank
-    and state_out = checkpoint snapshot of the activation. The real kernel is the
-    SAME compiled artifact proven on gb10 (14.68M nonzero)."""
+    ABI: (act_in, param, state_in, act_out, state_out). It seeds the real kernel's
+    activation/parameter physical banks from the incoming act/param SSA bank tensors,
+    runs the real kernel (writes the activation bank in place), then writes
+    act_out = activation bank and state_out = checkpoint snapshot of the activation.
+    The real kernel is the SAME compiled artifact proven on gb10 (14.68M nonzero).
+
+    TWO PATHS (RULE #1: clear device-vs-host gate, no silent fallback):
+      * DEVICE-RESIDENT (gb10): when the call_dps_packed bank tensors arrive on a real
+        device, the act/param banks are seeded into the driver-OWNED device physical
+        banks via DEVICE->DEVICE view copies, the DEVICE-RESIDENT kernel driver runs
+        the kernel on those device banks IN PLACE, and act_out/state_out are filled by
+        DEVICE->DEVICE copies. NO ``.numpy()`` / host staging anywhere -- this removes
+        the per-region per-step ~2028 MB host round-trip at the VM boundary.
+      * NUMPY-STAGED (CPU self-test / reference): host numpy banks + the numpy-staged
+        real_driver. Used only when the ABI tensors are host tensors.
+
+    ``device`` is required for the device-resident path; the device kernel driver +
+    device physical banks are built ONCE here and reused across calls (the kernel
+    mutates them in place)."""
 
     act_n = bank_numels[BANK_ACT]
     state_n = bank_numels[BANK_STATE]
     param_n = bank_numels[BANK_PARAM]
 
+    # Build the device-resident kernel driver + the driver-owned device physical banks
+    # ONCE (lazily, on first device call). These persist across every forward call.
+    dev_state: dict[str, object] = {}
+
+    def _ensure_device_state(dev):
+        if "driver" not in dev_state:
+            dev_state["driver"] = make_device_resident_kernel_driver(leaf, dev)
+            dev_state["banks"] = alloc_device_banks(leaf.bank_shapes, dev)
+        return dev_state["driver"], dev_state["banks"]
+
     def packed(act_in, param, state_in, act_out, state_out):
+        if bank_arg_is_device(act_in):
+            # ---- DEVICE-RESIDENT PATH (no numpy host bounce) ----
+            dev = act_in.device
+            dev_driver, dbanks = _ensure_device_state(dev)
+            # The non-input banks (ACTG, PARAMG, STATE) are zeroed ONCE at alloc (in
+            # alloc_device_banks). The scout validated (pr7_device_resident_kernel_feed:
+            # max|device-numpy|=0) that REUSING the banks across calls -- WITHOUT
+            # re-zeroing -- is bit-identical to the fresh-zeroed-numpy path for the
+            # forward kernel (the forward reads ACT+PARAM and overwrites its out banks;
+            # it does not read stale non-input bank state). So we DO NOT re-zero per
+            # call -- that would reintroduce a ~1.5 GB host->device bounce we are here
+            # to eliminate. (Numeric equivalence is asserted on gb10.)
+            # Seed the kernel's activation/parameter physical banks from the SSA banks
+            # (device->device view copies; tail-zeroed where the SSA bank is shorter).
+            bank_copy_prefix_device(dbanks[BANK_ACT], act_in,
+                                    min(act_n, int(np.prod([int(d) for d in act_in.shape]))))
+            bank_copy_prefix_device(dbanks[BANK_PARAM], param,
+                                    min(param_n, int(np.prod([int(d) for d in param.shape]))))
+            # Run the REAL kernel on the device banks (writes BANK_ACT in place).
+            dev_driver(leaf, dbanks, dev)
+            # act_out <- new activation bank (device->device).
+            bank_copy_prefix_device(act_out, dbanks[BANK_ACT],
+                                    min(act_n, int(np.prod([int(d) for d in act_out.shape]))))
+            # state_out <- checkpoint snapshot of the activation (device->device).
+            so_n = int(np.prod([int(d) for d in state_out.shape]))
+            bank_copy_prefix_device(state_out, dbanks[BANK_ACT], min(so_n, act_n))
+            return
+
+        # ---- NUMPY-STAGED REFERENCE PATH (CPU self-test) ----
         a = bank_arg_to_host(act_in)
         p = bank_arg_to_host(param)
         ao = act_out
         so = state_out
-        # Physical banks the real kernel operates on. The activation bank is seeded
-        # with the incoming activation; the parameter bank with the incoming params.
         banks = {
             BANK_ACT: np.ascontiguousarray(a, np.float32).reshape(-1)[:act_n].copy(),
             BANK_ACTG: np.zeros(bank_numels[BANK_ACTG], np.float32),
@@ -161,12 +219,9 @@ def make_real_bank_forward_driver(leaf, real_driver, bank_numels: dict[str, int]
             pad = np.zeros(param_n, np.float32)
             pad[: banks[BANK_PARAM].size] = banks[BANK_PARAM]
             banks[BANK_PARAM] = pad
-        # Run the REAL tilelang path_c CUDA kernel on the banks (writes act bank).
         real_driver(leaf, banks)
         act_new = banks[BANK_ACT].reshape(-1)
-        # act_out <- new activation bank.
         bank_writeback(ao, act_new[:act_n])
-        # state_out <- checkpoint snapshot of the activation (what backward reads).
         ck = np.zeros(state_n, np.float32)
         n = min(state_n, act_new.size)
         ck[:n] = act_new[:n]
@@ -176,15 +231,17 @@ def make_real_bank_forward_driver(leaf, real_driver, bank_numels: dict[str, int]
 
 
 def register_real_forward_driver(leaf, real_driver, bank_numels: dict[str, int],
-                                 n_layers: int) -> None:
+                                 n_layers: int, *, device=None) -> None:
     """Install the REAL path_c CUDA kernel as EVERY `pathc.bank_fwd_i` region.
 
     All forward regions share the one real MR kernel (the bank ABI is per-block
     identical; the bank STORAGE is what the planner threads). The backward + optimizer
     + loss drivers stay the abstract numpy ones (the backward kernel is the s_tir wall
     documented in the adapter; the forward proves the real-kernel-through-graph path).
-    """
-    fwd = make_real_bank_forward_driver(leaf, real_driver, bank_numels)
+
+    ``device`` enables the DEVICE-RESIDENT forward path (banks stay device tensors, no
+    host bounce). Pass the CUDA device on gb10."""
+    fwd = make_real_bank_forward_driver(leaf, real_driver, bank_numels, device=device)
     for i in range(n_layers):
         tvm_ffi.register_global_func(f"pathc.bank_fwd_{i}", fwd, override=True)
 

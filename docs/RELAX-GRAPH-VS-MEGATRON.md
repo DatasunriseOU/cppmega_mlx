@@ -188,6 +188,56 @@ loss are together <3%. This is why:
 
 ---
 
+## 4a. DEVICE-RESIDENT forward driver — LANDED (the host-bounce removal)
+
+The DPS driver has been reworked so the forward keeps the banks **device-resident on
+`tvm.cuda(0)` end-to-end** — no numpy in the per-region hot path. What changed:
+
+* **`path_c_dps_adapter.py`** — new device-resident primitives:
+  `device_bank_view` (zero-copy `Tensor._create_view(size, dtype, relative_byte_offset)`
+  flat sub-range VIEW of a bank), `device_pack` / `device_unpack` (device→device `copyto`
+  into/out of those views — NO host array), `alloc_device_banks` (`tvm.runtime.empty` on
+  device, zeroed once, reused across calls), and `make_device_resident_kernel_driver`
+  (builds the kernel's positional arg list **once** — the 5 device banks at their
+  positions, the curried `run_backward` scalar at the gate, and **device-resident**
+  zero scratch for every auxiliary route-buffer param; per call it just runs
+  `kernel(*args)` + `dev.sync()`, and the kernel **mutates the device banks in place at
+  `out_idx`** so there is nothing to read back). `make_region_dps_packed._packed` now
+  routes by the output tensor's DLPack device type (`__dlpack_device__()[0] != kDLCPU`):
+  a device VM takes `_packed_device_resident` (device views), a CPU VM takes the numpy
+  reference path (a clear device-vs-host gate, not a try/except fallback). The old
+  `make_real_kernel_driver` is kept as the **numpy-staged reference** for the CPU
+  self-test and the equivalence check.
+* **`path_c_relax_step_banks.py`** — `bank_arg_is_device` (DLPack-device gate at the VM
+  boundary), `bank_copy_prefix_device` (device→device prefix copy + device-resident
+  tail-zero), `_zero_device_tensor` (zeros from a cached **device** zero buffer — only the
+  first fill per (shape,dtype,device) touches the host).
+* **`path_c_relax_train_step.py`** — `make_real_bank_forward_driver(..., device=dev)` now
+  takes a device-resident path: when the `pathc.bank_fwd_*` `call_dps_packed` bank tensors
+  arrive on a real device, it seeds the kernel's act/param banks via device→device view
+  copies, runs the device-resident kernel driver in place, and fills `act_out`/`state_out`
+  via device→device copies. **No `.numpy()` at the VM boundary in the forward.**
+
+**MEASURED on gb10 `tvm.cuda(0)` (`scratch/pr7_device_resident_driver_validate_gb10.py`),
+REAL MR JITKernel (17 params, `out_idx=[0,2,3,4,6..16]`):**
+
+| check | result |
+|---|---|
+| (A) numeric equivalence, device-resident vs numpy-staged forward | `max\|dev−numpy\| = 1.025e-06` (act_out and state_out), 44,957,695 / 44,957,696 nonzero — **equivalent within fp tol** |
+| (C) per-forward-call wall | numpy-staged **8472.4 ms** → device-resident **6515.0 ms** = **1.30×** |
+| (B) e2e train_step on CUDA, device-resident forward, 2 layers × 3 steps | **RUNS, loss finite** (5.525e-06, stable across steps) |
+
+The **1.30×** is the per-call ceiling for THIS kernel: this MR region is one **6.5 s**
+single-launch kernel, so its own 5-bank H2D/D2H staging is small relative to compute; the
+device-resident win at the driver level is the elimination of the per-call `np.zeros` bank
+allocation + `np.ascontiguousarray` copies + dict rebuilds (the scout's 1.38× ceiling).
+The LARGER lever is at the **VM boundary**: the device-resident forward removes the
+per-region per-step `.numpy()` round-trip of the full 2028 MB banks across
+`call_dps_packed` — the 96.9% term in §4 — for every forward + remat region. bwd/adam/loss
+remain the abstract numpy drivers (lever 4); the forward is now device-resident.
+
+---
+
 ## 5. Apples-to-apples vs Megatron 3399 / 26 GB, and the honest gap
 
 | side | tok/step | peak mem | tok/s | ms/token | what runs |
@@ -223,15 +273,20 @@ over a CONFIRMED-runnable config, not a runnability claim.)
 
 ### Levers that close the throughput gap (next, measured-cost-known)
 
-1. **Fuse every region on-device (eliminate host staging).** The single biggest lever,
-   now MEASURED: the per-region `.numpy()` / `copyto` round-trips are **~100% of the step
-   wall, and the forward+remat path alone is 96.9%** (§4). PR-6 stage 2 already runs the
-   REAL path_c-CUDA kernel through the forward boundary on device; doing the same for the
-   forward+remat regions first (96.9% of the time) — then bwd/adam/loss — and keeping the
-   banks resident on `tvm.cuda(0)` across regions removes the host staging and collapses
-   the free-delta toward the 8.787 GB device plan. Expected: the step becomes
-   device-compute-bound, not copy-bound — the regime where the real kernels' throughput
-   shows. Attacking the forward+remat staging is the highest-leverage single change.
+1. **Keep the banks DEVICE-RESIDENT in the forward (eliminate the host staging) — LANDED.**
+   The single biggest lever. The per-region `.numpy()` / `copyto` round-trips were
+   **~100% of the step wall, the forward+remat path alone 96.9%** (§4). The DPS driver
+   has now been **reworked to keep the banks as `tvm.cuda(0)` device tensors end-to-end**
+   in the forward: pack/unpack of the logical I/O sub-ranges is a **zero-copy device VIEW
+   (`Tensor._create_view` with a byte offset) + a device→device `copyto`**, the physical
+   banks are allocated **once** (`tvm.runtime.empty` on device) and reused across calls,
+   and the real tilelang JITKernel is fed the device banks directly — it mutates them
+   **in place at `out_idx`**, so there is nothing to read back. **No `np.ndarray` /
+   `np.from_dlpack` / `.numpy()` / host `copyto` in the per-region forward compute path.**
+   See §4a for the landed driver + the measured numeric equivalence and per-call speedup.
+   Remaining: extend the same device-resident treatment to bwd/adam/loss (those are still
+   the abstract numpy s_tir-wall drivers, lever 4), and fuse adjacent forward+remat
+   regions into fewer launches.
 2. **Cache the compiled executable (28-layer compile is ~14 min, one-time).** Memoize the
    per-region lowering / batch identical regions so the whole-step `tvm.compile` is paid
    once per shape, not once per process. (compile-once is already applied across steps;
@@ -259,6 +314,16 @@ FAIL-LOUD (RULE #1): non-finite loss or any region that cannot run RAISES, namin
 The whole-step e2e (PR-6) and its CPU self-check are
 `scratch/pr6_cuda_e2e_train_step_gb10.py` and
 `python -m cppmega_mlx.runtime.path_c_relax_train_step`.
+
+```
+# DEVICE-RESIDENT forward driver validation (numeric equivalence + e2e + speedup), §4a:
+PR7V_LAYERS=2 PR7V_STEPS=3 PR7V_N=20 \
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/pr7_device_resident_driver_validate_gb10.py
+```
+Asserts `max|device−numpy| < 1e-3` (measured 1.025e-06), a finite e2e loss, and reports
+the per-forward-call device-resident vs numpy-staged wall (measured 1.30×).
 
 ---
 

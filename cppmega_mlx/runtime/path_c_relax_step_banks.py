@@ -141,8 +141,32 @@ class BankSinfo:
 # (host copy) on read and tvm.runtime.tensor(...).copyto(out) (host->device) on write.
 # RULE #1 (fail loud): if neither route exists we RAISE; no silent fallback.
 # --------------------------------------------------------------------------- #
+def bank_arg_is_device(arg) -> bool:
+    """True iff a call_dps_packed ABI bank tensor lives on a real (non-CPU) device and
+    supports the zero-copy device view + device->device copy ABI. On a CUDA/Metal Relax
+    VM the bank tensors arrive as ``tvm.runtime.Tensor`` (with ``_create_view`` and
+    ``copyto``) on the device -- so the DEVICE-RESIDENT path applies and NO ``.numpy()``
+    host bounce is needed. This is the gate that removes the doc's 96.9% host round-trip
+    at the VM boundary (a clear device-vs-host gate, NOT a try/except fallback)."""
+    if not (hasattr(arg, "_create_view") and hasattr(arg, "copyto")):
+        return False
+    fn = getattr(arg, "__dlpack_device__", None)  # (device_type, device_id)
+    if fn is None:
+        return False
+    try:
+        dt = int(fn()[0])
+    except Exception:  # noqa: BLE001
+        return False
+    return dt != 1  # DLDeviceType.kDLCPU == 1; CUDA=2, Metal=8 -> device-resident path
+
+
 def bank_arg_to_host(arg) -> np.ndarray:
-    """Import a call_dps_packed ABI tensor to host numpy, device-agnostically."""
+    """Import a call_dps_packed ABI tensor to host numpy, device-agnostically.
+
+    NOTE: this is the HOST path -- it forces a device->host copy on CUDA. The
+    device-resident drivers route bank tensors through the device-view helpers above
+    instead and never hit this. It remains for the abstract reference drivers + CPU VM
+    self-test (and for places where a host numpy view is genuinely required)."""
     try:
         return np.from_dlpack(arg)
     except Exception as dlpack_err:  # noqa: BLE001 -- CUDA: Unsupported device in DLTensor
@@ -153,6 +177,51 @@ def bank_arg_to_host(arg) -> np.ndarray:
                 f"a .numpy() host-copy method (type={type(arg).__name__}); "
                 f"np.from_dlpack raised: {dlpack_err}") from dlpack_err
         return np.ascontiguousarray(to_numpy())
+
+
+def bank_copy_prefix_device(dst, src, n: int) -> None:
+    """Device->device copy of the first ``n`` elements of ``src`` into ``dst`` (both
+    DEVICE tvm.runtime.Tensor of dtype float32), then ZERO the tail of ``dst`` if it is
+    longer. ZERO host traffic: a device view copy + (when needed) one device zero-fill.
+    Mirrors the numpy ``dst[:n] = src[:n]; dst[n:] = 0`` used by the abstract drivers,
+    but device-resident. RULE #1: out-of-range RAISES."""
+    src_n = int(np.prod([int(d) for d in src.shape]))
+    dst_n = int(np.prod([int(d) for d in dst.shape]))
+    if n > src_n or n > dst_n:
+        raise RuntimeError(
+            f"FAIL-LOUD: bank_copy_prefix_device n={n} exceeds src={src_n}/dst={dst_n}")
+    if dst_n > n:
+        _zero_device_tensor(dst)  # zero the tail; the prefix is overwritten next
+    src_v = src._create_view((n,), "float32", relative_byte_offset=0)
+    dst_v = dst._create_view((n,), "float32", relative_byte_offset=0)
+    src_v.copyto(dst_v)
+
+
+_BANK_ZERO_HOST_CACHE: dict[tuple, np.ndarray] = {}
+_BANK_ZERO_DEVICE_CACHE: dict[tuple, object] = {}
+
+
+def _zero_device_tensor(t) -> None:
+    """Zero a DEVICE tensor in place WITHOUT a per-call host->device transfer: copy from
+    a cached DEVICE-resident zero buffer (one per (shape,dtype,device), created once via
+    a single host->device fill). Subsequent zeroings are device->device copies, so the
+    inner loop has NO host traffic. Falls back to a host-zero copyfrom only the FIRST
+    time a given (shape,dtype,device) is seen (to materialise the device-zero buffer)."""
+    shp = tuple(int(d) for d in t.shape)
+    dtype = str(t.dtype)
+    dev = t.device
+    dkey = (shp, dtype, repr(dev))  # repr stable: device(type='cuda', index=0)
+    zdev = _BANK_ZERO_DEVICE_CACHE.get(dkey)
+    if zdev is None:
+        hkey = (shp, dtype)
+        zh = _BANK_ZERO_HOST_CACHE.get(hkey)
+        if zh is None:
+            zh = np.zeros(shp, dtype=np.dtype(dtype))
+            _BANK_ZERO_HOST_CACHE[hkey] = zh
+        zdev = tvm.runtime.empty(shp, dtype, device=dev)
+        zdev.copyfrom(zh)  # ONE host->device fill per (shape,dtype,device)
+        _BANK_ZERO_DEVICE_CACHE[dkey] = zdev
+    zdev.copyto(t)  # device->device zero (no host traffic)
 
 
 def bank_writeback(out_tensor, host_result: np.ndarray) -> None:

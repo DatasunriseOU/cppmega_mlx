@@ -83,6 +83,131 @@ from tvm import relax, tir
 
 
 # --------------------------------------------------------------------------- #
+# PR-7 DEVICE-RESIDENT primitives (the host-bounce elimination).
+#
+# The doc's RELAX-GRAPH-VS-MEGATRON lever: the per-step hot path round-tripped
+# every ~2028 MB physical bank to HOST NUMPY across the call_dps_packed boundary
+# each call (``.numpy()`` on read, host->device ``copyto`` on writeback). That host
+# bounce -- NOT the device kernels -- is 96.9% of the step time.
+#
+# These helpers keep the banks DEVICE-RESIDENT end to end: bank sub-range pack/unpack
+# is a ZERO-COPY device VIEW (``Tensor._create_view`` with a byte offset) + a
+# device->device ``copyto``; banks are allocated ONCE via ``tvm.runtime.empty`` on the
+# device; the tilelang JITKernel is fed the device banks directly (the scout's call
+# convention) and mutates them IN PLACE at ``kernel.out_idx``. No np.ndarray /
+# np.from_dlpack / .numpy() / host copyto appears in the per-region compute path.
+#
+# RULE #1 (fail loud): every helper asserts dtype/size/device; mismatches RAISE.
+# --------------------------------------------------------------------------- #
+_DTYPE_ITEMSIZE = {"float32": 4, "float16": 2, "bfloat16": 2, "int32": 4, "int64": 8}
+
+
+def _itemsize(dtype: str) -> int:
+    if dtype not in _DTYPE_ITEMSIZE:
+        raise RuntimeError(
+            f"FAIL-LOUD: device-resident path needs a known itemsize for dtype "
+            f"{dtype!r}; add it to _DTYPE_ITEMSIZE")
+    return _DTYPE_ITEMSIZE[dtype]
+
+
+def _dlpack_device_type(arg: Any) -> int | None:
+    """The DLPack device type of a tvm tensor, read from ``__dlpack_device__()`` ->
+    (device_type, device_id). DLDeviceType: kDLCPU=1, kDLCUDA=2, kDLMetal=8, ... The
+    ``Tensor.device`` object on this build does NOT expose a usable ``device_type``
+    attribute (only a ``dlpack_device_type`` method + name), so we read the DLPack pair
+    directly -- the authoritative, build-stable device signal."""
+    fn = getattr(arg, "__dlpack_device__", None)
+    if fn is None:
+        return None
+    try:
+        return int(fn()[0])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def is_device_tensor(arg: Any) -> bool:
+    """True iff ``arg`` is a tvm device tensor that supports the zero-copy device
+    view + device->device copy ABI (``_create_view`` and ``copyto``). The Relax VM
+    materialises every call_dps_packed arg as a ``tvm.runtime.Tensor`` (registered
+    globally via _set_class_tensor), which carries both -- so on a CUDA VM the bank
+    args arrive ready for the device-resident path, NO numpy needed."""
+
+    return hasattr(arg, "_create_view") and hasattr(arg, "copyto")
+
+
+def device_bank_view(bank: Any, offset: int, size: int, dtype: str) -> Any:
+    """A ZERO-COPY flat (size,) device VIEW of ``bank[offset:offset+size]`` (same
+    allocation, no copy). ``offset``/``size`` are ELEMENT counts; the view's byte
+    offset is ``offset * itemsize``. RULE #1: out-of-range RAISES."""
+
+    bank_numel = int(np.prod([int(d) for d in bank.shape]))
+    if offset < 0 or offset + size > bank_numel:
+        raise RuntimeError(
+            f"FAIL-LOUD: bank sub-range [{offset}:{offset+size}] out of bank numel "
+            f"{bank_numel}")
+    return bank._create_view((size,), dtype, relative_byte_offset=offset * _itemsize(dtype))
+
+
+def device_pack(bank: Any, src: Any, offset: int, size: int, dtype: str) -> None:
+    """Pack a device tensor ``src`` (numel==size) into ``bank[offset:offset+size]`` via
+    a device->device copy into a zero-copy view. NO host traffic. RULE #1: RAISES on
+    size/device mismatch."""
+
+    src_numel = int(np.prod([int(d) for d in src.shape]))
+    if src_numel != size:
+        raise RuntimeError(
+            f"FAIL-LOUD: device_pack src numel {src_numel} != ABI sub-range size {size}")
+    view = device_bank_view(bank, offset, size, dtype)
+    # src is (S0,S1,..); view is flat (size,). copyto compares numel, both contiguous.
+    src_flat = src._create_view((size,), dtype, relative_byte_offset=0)
+    src_flat.copyto(view)
+
+
+def device_unpack(bank: Any, dst: Any, offset: int, size: int, dtype: str) -> None:
+    """Unpack ``bank[offset:offset+size]`` into device tensor ``dst`` (numel==size) via
+    a device->device copy from a zero-copy view. NO host traffic. RULE #1: RAISES."""
+
+    dst_numel = int(np.prod([int(d) for d in dst.shape]))
+    if dst_numel != size:
+        raise RuntimeError(
+            f"FAIL-LOUD: device_unpack dst numel {dst_numel} != ABI sub-range size {size}")
+    view = device_bank_view(bank, offset, size, dtype)
+    dst_flat = dst._create_view((size,), dtype, relative_byte_offset=0)
+    view.copyto(dst_flat)
+
+
+def alloc_device_banks(bank_shapes: dict[str, int], device: Any,
+                       dtype: str = "float32") -> dict[str, Any]:
+    """Allocate the physical banks ONCE, device-resident (``tvm.runtime.empty`` on
+    ``device``), zero-initialised. Returns {bank: tvm.runtime.Tensor}. The banks are
+    reused across calls (the kernel mutates them in place), so this is hoisted OUT of
+    the per-step hot path. NO numpy host array is materialised for the bank storage."""
+
+    banks: dict[str, Any] = {}
+    for b, n in bank_shapes.items():
+        t = tvm.runtime.empty((int(n),), dtype, device=device)
+        _zero_device_tensor(t)
+        banks[b] = t
+    return banks
+
+
+_ZERO_HOST_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _zero_device_tensor(t: Any) -> None:
+    """Zero a device tensor in place WITHOUT a per-call host allocation: copy from a
+    cached host-zero buffer (allocated once per shape). This runs ONCE per bank at
+    setup (not in the hot path), so the one-time host->device zero-fill is amortised."""
+
+    key = (tuple(int(d) for d in t.shape), str(t.dtype))
+    z = _ZERO_HOST_CACHE.get(key)
+    if z is None:
+        z = np.zeros(key[0], dtype=np.dtype(key[1]))
+        _ZERO_HOST_CACHE[key] = z
+    t.copyfrom(z)
+
+
+# --------------------------------------------------------------------------- #
 # Physical-ABI introspection (reads the REAL prim's metadata -- no fabrication)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -168,18 +293,20 @@ def make_region_dps_packed(leaf: PathCRegionLeaf) -> Callable[..., Any]:
     ``leaf``. Signature (call_dps_packed ABI): (logical_in_0, ..., logical_in_k,
     logical_out) -- inputs first, single OUTPUT LAST, banks INTERNAL.
 
-    Body: allocate the physical banks, pack each logical input into its bank
-    sub-range, invoke the real tilelang kernel on the banks (in the kernel's
-    positional bank order), unpack the logical-output sub-range into ``logical_out``.
+    Body: pack each logical input into its bank sub-range, invoke the real tilelang
+    kernel on the banks (in the kernel's positional bank order), unpack the
+    logical-output sub-range into ``logical_out``.
 
-    NOTE on the kernel call: the real tilelang JITKernel takes the physical banks
-    (and any auxiliary route buffers) positionally. We supply the banks we own; any
-    auxiliary route-symbol buffers the kernel also takes are zero-filled scratch of
-    the kernel-declared shape (they are not part of THIS region's logical ABI -- the
-    adapter's contract is the logical inputs/output; auxiliary kernel args are an
-    internal kernel detail). For the self-test below we drive a numpy reference
-    through the SAME pack/unpack to validate the adapter plumbing end to end without
-    requiring a live Metal device on the measurement host.
+    TWO PATHS (RULE #1: one clear path each, no silent fallback):
+      * DEVICE-RESIDENT (the gb10 path): when the call_dps_packed ABI tensors arrive
+        as device tensors (a CUDA/Metal Relax VM materialises them as
+        ``tvm.runtime.Tensor`` with ``_create_view``/``copyto``), pack/unpack is a
+        ZERO-COPY device VIEW + device->device copy, the banks stay device-resident
+        (allocated ONCE in the driver), and the tilelang JITKernel mutates them in
+        place. NO numpy host array in the hot path -- this is the host-bounce removal.
+      * NUMPY-REFERENCE (the CPU self-test path): when the ABI tensors are host
+        tensors (a CPU/LLVM VM), pack/unpack is numpy slicing so the adapter plumbing
+        is testable off-device. This is gated by the arg DEVICE, not a try/except.
     """
 
     lmap = leaf.logical_map
@@ -192,43 +319,85 @@ def make_region_dps_packed(leaf: PathCRegionLeaf) -> Callable[..., Any]:
                 f"{len(leaf.logical_inputs)+1} args "
                 f"(inputs {len(leaf.logical_inputs)} + 1 output), got {len(args)}"
             )
-        # Import the call_dps_packed ABI tensors to host numpy. On a CUDA Relax VM
-        # (tvm.cuda(0)) these arrive as device tensors; ``np.from_dlpack`` RAISES
-        # "Unsupported device in DLTensor" for them, so we route device tensors
-        # through ``.numpy()`` (an explicit host copy). CPU/Metal tensors still use
-        # the zero-copy ``np.from_dlpack``. RULE #1: if neither works we RAISE.
-        in_arrays = [_dps_arg_to_host_numpy(a) for a in args[:-1]]
         out_tensor = args[-1]
-
-        # Allocate the physical banks we own.
-        banks = {b: np.zeros((n,), dtype=np.float32) for b, n in bank_shapes.items()}
-
-        # Pack each logical input into its bank sub-range.
-        for lname, arr in zip(leaf.logical_inputs, in_arrays):
-            m = lmap[lname]
-            flat = np.ascontiguousarray(arr, dtype=np.float32).reshape(-1)
-            if flat.size != m.size:
-                raise RuntimeError(
-                    f"FAIL-LOUD: logical input {lname} numel {flat.size} != "
-                    f"ABI sub-range size {m.size}"
-                )
-            banks[m.bank][m.offset : m.offset + m.size] = flat
-
-        # Invoke the region compute on the packed banks. The real deployment calls
-        # ``leaf.kernel`` (the tilelang JITKernel) here on a live Metal/CUDA device;
-        # the adapter's pack/unpack ABI around that call is what this module proves.
-        _drive_region_compute(leaf, banks)
-
-        # Unpack the logical-output sub-range into the trailing DPS output tensor.
-        # On CUDA the DPS output is a device tensor that does NOT alias a host numpy
-        # view, so we write the result back EXPLICITLY (host->device copy) rather
-        # than via an aliasing ``out_array[...] =``.
-        m = lmap[leaf.logical_output]
-        out_host_shape = tuple(int(d) for d in out_tensor.shape)
-        out_flat = banks[m.bank][m.offset : m.offset + m.size]
-        _dps_writeback_host_to_arg(out_tensor, out_flat.reshape(out_host_shape))
+        # Route by the OUTPUT tensor's device residency (a clear gate, not a fallback):
+        # a device tensor (CUDA/Metal VM) takes the device-resident path; otherwise the
+        # numpy reference path (CPU/LLVM VM self-test).
+        if is_device_tensor(out_tensor) and _output_is_device(out_tensor):
+            _packed_device_resident(leaf, args)
+        else:
+            _packed_numpy_reference(leaf, args, bank_shapes, lmap)
 
     return _packed
+
+
+def _output_is_device(t: Any) -> bool:
+    """True iff the tensor lives on a non-CPU device (so the device-resident path
+    applies). CPU tensors (dlpack device_type 1) take the numpy reference path."""
+
+    dt = _dlpack_device_type(t)
+    # DLDeviceType.kDLCPU == 1. Anything else (CUDA=2, Metal=8, ...) is a real device.
+    return dt is not None and dt != 1
+
+
+def _packed_device_resident(leaf: PathCRegionLeaf, args: tuple) -> None:
+    """DEVICE-RESIDENT body: pack logical inputs into the driver-owned device banks via
+    zero-copy views, run the real kernel on the device banks (in place), unpack the
+    logical output via a device view. NO numpy in the hot path."""
+
+    lmap = leaf.logical_map
+    out_tensor = args[-1]
+    dev = out_tensor.device
+    banks = _device_banks_for(leaf, dev)  # allocated ONCE, reused across calls
+
+    for lname, arr in zip(leaf.logical_inputs, args[:-1]):
+        m = lmap[lname]
+        device_pack(banks[m.bank], arr, m.offset, m.size, m.dtype)
+
+    _drive_region_compute_device(leaf, banks, dev)
+
+    m = lmap[leaf.logical_output]
+    device_unpack(banks[m.bank], out_tensor, m.offset, m.size, m.dtype)
+
+
+def _packed_numpy_reference(leaf: PathCRegionLeaf, args: tuple,
+                            bank_shapes: dict[str, int],
+                            lmap: dict[str, "LogicalBufferMap"]) -> None:
+    """NUMPY-REFERENCE body (CPU self-test ONLY): host numpy pack/unpack around the
+    abstract region driver. Kept so the adapter plumbing is testable off gb10."""
+
+    in_arrays = [_dps_arg_to_host_numpy(a) for a in args[:-1]]
+    out_tensor = args[-1]
+    banks = {b: np.zeros((n,), dtype=np.float32) for b, n in bank_shapes.items()}
+    for lname, arr in zip(leaf.logical_inputs, in_arrays):
+        m = lmap[lname]
+        flat = np.ascontiguousarray(arr, dtype=np.float32).reshape(-1)
+        if flat.size != m.size:
+            raise RuntimeError(
+                f"FAIL-LOUD: logical input {lname} numel {flat.size} != "
+                f"ABI sub-range size {m.size}")
+        banks[m.bank][m.offset : m.offset + m.size] = flat
+    _drive_region_compute(leaf, banks)
+    m = lmap[leaf.logical_output]
+    out_host_shape = tuple(int(d) for d in out_tensor.shape)
+    out_flat = banks[m.bank][m.offset : m.offset + m.size]
+    _dps_writeback_host_to_arg(out_tensor, out_flat.reshape(out_host_shape))
+
+
+# Per-leaf device bank cache -- banks allocated ONCE per (leaf, device) and reused
+# across every call (the kernel mutates them in place at out_idx, so device-resident
+# banks ARE the rolling state). This is the hoist that removes the per-call np.zeros
+# bank allocation the scout measured as the dominant non-H2D/D2H cost.
+_DEVICE_BANKS: dict[tuple, dict[str, Any]] = {}
+
+
+def _device_banks_for(leaf: PathCRegionLeaf, device: Any) -> dict[str, Any]:
+    key = (id(leaf), repr(device))  # repr is stable: device(type='cuda', index=0)
+    banks = _DEVICE_BANKS.get(key)
+    if banks is None:
+        banks = alloc_device_banks(leaf.bank_shapes, device)
+        _DEVICE_BANKS[key] = banks
+    return banks
 
 
 def _dps_arg_to_host_numpy(arg: Any) -> np.ndarray:
@@ -286,12 +455,25 @@ def _dps_writeback_host_to_arg(out_tensor: Any, host_result: np.ndarray) -> None
 # real path is set by ``set_region_kernel_driver`` to call ``leaf.kernel`` on device.
 _REGION_DRIVER: Callable[[PathCRegionLeaf, dict[str, np.ndarray]], None] | None = None
 
+# The DEVICE-RESIDENT region compute hook: takes the driver-owned DEVICE banks (dict of
+# tvm.runtime.Tensor on the device) and the device, runs the real kernel on them IN
+# PLACE. NO numpy. Set by ``set_region_device_driver`` (the gb10 path).
+_REGION_DEVICE_DRIVER: Callable[[PathCRegionLeaf, dict[str, Any], Any], None] | None = None
+
 
 def set_region_kernel_driver(
     fn: Callable[[PathCRegionLeaf, dict[str, np.ndarray]], None] | None,
 ) -> None:
     global _REGION_DRIVER
     _REGION_DRIVER = fn
+
+
+def set_region_device_driver(
+    fn: Callable[[PathCRegionLeaf, dict[str, Any], Any], None] | None,
+) -> None:
+    """Install the DEVICE-RESIDENT region-compute driver (banks stay device tensors)."""
+    global _REGION_DEVICE_DRIVER
+    _REGION_DEVICE_DRIVER = fn
 
 
 def _drive_region_compute(leaf: PathCRegionLeaf, banks: dict[str, np.ndarray]) -> None:
@@ -303,6 +485,17 @@ def _drive_region_compute(leaf: PathCRegionLeaf, banks: dict[str, np.ndarray]) -
         "with either the on-device tilelang-kernel driver or a reference driver "
         "before invoking the DPS packed function."
     )
+
+
+def _drive_region_compute_device(
+    leaf: PathCRegionLeaf, banks: dict[str, Any], device: Any) -> None:
+    if _REGION_DEVICE_DRIVER is not None:
+        _REGION_DEVICE_DRIVER(leaf, banks, device)
+        return
+    raise RuntimeError(
+        "FAIL-LOUD: no DEVICE-RESIDENT region driver set. Call "
+        "set_region_device_driver(make_device_resident_kernel_driver(leaf, device)) "
+        "before invoking the DPS packed function on a device VM.")
 
 
 def register_region_dps_packed(leaf: PathCRegionLeaf, packed_name: str) -> None:
@@ -325,10 +518,11 @@ def register_region_dps_packed(leaf: PathCRegionLeaf, packed_name: str) -> None:
 def make_real_kernel_driver(
     leaf: PathCRegionLeaf, device: Any,
 ) -> Callable[[PathCRegionLeaf, dict[str, np.ndarray]], None]:
-    """Build an on-device driver that runs ``leaf.kernel`` (the real tilelang JITKernel)
-    on ``device`` (e.g. ``tvm.metal(0)`` / ``tvm.cuda(0)``), mapping the 5 physical
-    banks to the kernel's leading 5 params, the curried ``run_backward`` scalar to the
-    gate param, and zero-filled scratch to the auxiliary route-buffer params.
+    """NUMPY-STAGED on-device driver (the REFERENCE path, kept for the CPU/numpy
+    self-test and the host-vs-device equivalence check). Runs ``leaf.kernel`` (the real
+    tilelang JITKernel) on ``device`` by staging the NUMPY bank dict H2D each call and
+    reading the out banks D2H. This is the host-bounced path the device-resident driver
+    below REPLACES.
 
     RULE #1: shape / param-count mismatches RAISE; no silent fallback."""
 
@@ -363,6 +557,64 @@ def make_real_kernel_driver(
         for name, pos in bank_pos.items():
             if pos in out_idx:
                 banks[name] = args[pos].numpy().reshape(-1)
+
+    return driver
+
+
+# --------------------------------------------------------------------------- #
+# PR-7 (the rework): the DEVICE-RESIDENT real-kernel driver.
+#
+# Banks arrive as DEVICE tensors (the driver owns them, allocated once via
+# alloc_device_banks). The kernel's positional arg list is built ONCE: the 5 physical
+# banks bound at their positions (the SAME device tensor objects the adapter packs
+# into), the curried run_backward scalar at the gate, and zero-filled DEVICE scratch
+# for every auxiliary route-buffer param (allocated ONCE, reused). Per call we just run
+# ``kernel(*args)`` -- the kernel MUTATES the device banks IN PLACE at ``out_idx``, so
+# there is NOTHING to read back: the device bank tensors ARE the output. NO numpy, NO
+# H2D, NO D2H in the hot path. This is the host-bounce elimination.
+# --------------------------------------------------------------------------- #
+def make_device_resident_kernel_driver(
+    leaf: PathCRegionLeaf, device: Any,
+) -> Callable[[PathCRegionLeaf, dict[str, Any], Any], None]:
+    """Build the DEVICE-RESIDENT driver. Signature matches the device-driver hook:
+    ``(leaf, device_banks, device) -> None``, where ``device_banks`` is the dict of the
+    driver-owned device-resident bank tensors. RULE #1: mismatches RAISE."""
+
+    if not getattr(device, "exist", False):
+        raise RuntimeError(
+            f"FAIL-LOUD: device {device} not present for the device-resident driver")
+    kparams = list(leaf.kernel.params)
+    bank_pos = {name: i for i, name in enumerate(leaf.bank_param_order[:5])}
+    gate_pos = next((i for i, p in enumerate(kparams)
+                     if len(list(p.shape)) == 0), None)
+    if gate_pos is None:
+        raise RuntimeError("FAIL-LOUD: no scalar gate param found in the kernel ABI")
+
+    # Allocate the auxiliary route-buffer scratch ONCE (device-resident, zeroed). These
+    # are not part of THIS region's logical ABI; the kernel reads them as zero scratch.
+    scratch: dict[int, Any] = {}
+    for i in range(len(kparams)):
+        if i == gate_pos or i in set(bank_pos.values()):
+            continue
+        shp = tuple(int(d) for d in kparams[i].shape)
+        t = tvm.runtime.empty(shp if shp else (1,),
+                              str(kparams[i].dtype), device=device)
+        _zero_device_tensor(t)
+        scratch[i] = t
+
+    def driver(lf: PathCRegionLeaf, device_banks: dict[str, Any], dev: Any) -> None:
+        args: list[Any] = [None] * len(kparams)
+        for name, pos in bank_pos.items():
+            if name not in device_banks:
+                raise RuntimeError(
+                    f"FAIL-LOUD: device bank {name} missing for device-resident driver")
+            args[pos] = device_banks[name]  # the SAME device tensor (in-place output)
+        args[gate_pos] = int(lf.run_backward)
+        for i, t in scratch.items():
+            args[i] = t
+        lf.kernel(*args)
+        dev.sync()
+        # kernel wrote the out banks IN PLACE at out_idx -> device_banks already updated.
 
     return driver
 
