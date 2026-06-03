@@ -221,17 +221,23 @@ def build_chunk_precompute_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Compile the F0 precompute kernel to a Metal ``JITKernel``.
+    """Compile the F0 precompute kernel to a ``JITKernel`` (Metal or CUDA).
 
-    Outputs (cb, dA_cumsum, summary_states) are the 6th/7th/8th params; pass
-    PRE-ZEROED contiguous buffers positionally (no ``out_idx`` allocation), and
-    ``torch.mps.synchronize()`` after. RULE #1: compile failures propagate.
+    ``target`` selects the codegen backend (``None`` => Metal default, ``"cuda"``
+    => CUDA / sm_121). Outputs (cb, dA_cumsum, summary_states) are the 6th/7th/8th
+    params; pass PRE-ZEROED contiguous buffers positionally (no ``out_idx``
+    allocation), and synchronize the device after. RULE #1: compile failures
+    propagate.
     """
     import tilelang
 
-    from cppmega_mlx.nn._tilelang import _msl_transform
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        _resolve_chunked_compile_target,
+    )
 
     prim = chunk_precompute_fwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
@@ -239,7 +245,7 @@ def build_chunk_precompute_metal(
     return tilelang.compile(
         prim,
         out_idx=[5, 6, 7],
-        target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
+        target=_resolve_chunked_compile_target(target),
     )
 
 
@@ -363,17 +369,22 @@ def build_inter_chunk_recur_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Compile the F1 inter-chunk recurrence kernel to a Metal ``JITKernel``.
+    """Compile the F1 inter-chunk recurrence kernel to a ``JITKernel``.
 
-    Outputs (prev_states, final_state) are the 4th/5th params; pass PRE-ZEROED
-    contiguous fp32 buffers positionally, ``torch.mps.synchronize()`` after.
-    RULE #1: compile failures propagate (no serial fallback).
+    ``target`` selects Metal (default) or CUDA (``"cuda"`` / sm_121). Outputs
+    (prev_states, final_state) are the 4th/5th params; pass PRE-ZEROED contiguous
+    fp32 buffers positionally, synchronize the device after. RULE #1: compile
+    failures propagate (no serial fallback).
     """
     import tilelang
 
-    from cppmega_mlx.nn._tilelang import _msl_transform
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        _resolve_chunked_compile_target,
+    )
 
     prim = inter_chunk_recur_fwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
@@ -381,5 +392,5 @@ def build_inter_chunk_recur_metal(
     return tilelang.compile(
         prim,
         out_idx=[3, 4],
-        target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
+        target=_resolve_chunked_compile_target(target),
     )

@@ -49,9 +49,11 @@ from typing import Any
 
 __all__ = [
     "chunk_scan_fwd_metal_prim",
+    "chunk_scan_fwd_cuda_prim",
     "chunk_scan_fwd_grid",
     "compile_chunk_scan_fwd_metal",
     "build_chunk_scan_combine_metal",
+    "_resolve_chunked_compile_target",
     "MAMBA3_CHUNKED_FWD_BLOCK_M",
     "MAMBA3_CHUNKED_FWD_BLOCK_N",
     "MAMBA3_CHUNKED_FWD_BLOCK_K",
@@ -217,6 +219,7 @@ def chunk_scan_fwd_metal_prim(
                     batch_idx, bz, chunk_idx, m_idx * block_M : (m_idx + 1) * block_M
                 ],
                 dA_cs_m_shared,
+                disable_tma=True,
             )
             T.copy(dA_cs_m_shared, dA_cs_m_local)
             T.clear(acc_o)
@@ -233,6 +236,7 @@ def chunk_scan_fwd_metal_prim(
                     0:block_Dstate,
                 ],
                 C_shared,
+                disable_tma=True,
             )
             T.copy(
                 prev_states[
@@ -243,6 +247,7 @@ def chunk_scan_fwd_metal_prim(
                     0:block_Dstate,
                 ],
                 prev_state_shared,
+                disable_tma=True,
             )
             T.gemm(C_shared, prev_state_shared, acc_o, transpose_B=True)
             for i, j in T.Parallel(block_M, block_N):
@@ -259,6 +264,7 @@ def chunk_scan_fwd_metal_prim(
                         k * block_K : (k + 1) * block_K,
                     ],
                     cb_shared,
+                    disable_tma=True,
                 )
                 T.copy(cb_shared, cb_local)
                 T.copy(
@@ -266,6 +272,7 @@ def chunk_scan_fwd_metal_prim(
                         batch_idx, bz, chunk_idx, k * block_K : (k + 1) * block_K
                     ],
                     dA_cs_k_shared,
+                    disable_tma=True,
                 )
                 T.copy(dA_cs_k_shared, dA_cs_k_local)
                 for i, j in T.Parallel(block_M, block_K):
@@ -275,6 +282,7 @@ def chunk_scan_fwd_metal_prim(
                 T.copy(
                     dt[batch_idx, bz, chunk_idx, k * block_K : (k + 1) * block_K],
                     dt_shared,
+                    disable_tma=True,
                 )
                 T.copy(dt_shared, dt_local)
                 for i, j in T.Parallel(block_M, block_K):
@@ -293,6 +301,7 @@ def chunk_scan_fwd_metal_prim(
                         n_idx * block_N : (n_idx + 1) * block_N,
                     ],
                     x_shared,
+                    disable_tma=True,
                 )
                 # A in register fragment (cb_local), B in shared (x_shared), C in
                 # shared (acc_o): RS->staged-shared Metal GEMM (gemm_metal.py fix).
@@ -309,6 +318,7 @@ def chunk_scan_fwd_metal_prim(
                     n_idx * block_N : (n_idx + 1) * block_N,
                 ],
                 x_residual_shared,
+                disable_tma=True,
             )
             T.copy(x_residual_shared, x_residual_local)
             for i, j in T.Parallel(block_M, block_N):
@@ -325,9 +335,275 @@ def chunk_scan_fwd_metal_prim(
                     bz,
                     n_idx * block_N : (n_idx + 1) * block_N,
                 ],
+                disable_tma=True,
             )
 
     return main
+
+
+def chunk_scan_fwd_cuda_prim(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    block_M: int = MAMBA3_CHUNKED_FWD_BLOCK_M,
+    block_N: int = MAMBA3_CHUNKED_FWD_BLOCK_N,
+    block_K: int = MAMBA3_CHUNKED_FWD_BLOCK_K,
+    block_Dstate: int = MAMBA3_CHUNKED_FWD_BLOCK_DSTATE,
+    threads: int = MAMBA3_CHUNKED_FWD_THREADS,
+) -> Any:
+    """CUDA twin of :func:`chunk_scan_fwd_metal_prim` (gb10 / sm_121).
+
+    IDENTICAL SSD scan+combine math; the ONLY deltas are the codegen-shape
+    choices the CUDA GEMM backend requires where the Metal RS->staged-shared path
+    differed:
+
+      * ``acc_o`` is a REGISTER FRAGMENT (``T.alloc_fragment``), not a shared
+        buffer. The CUDA ``T.gemm`` lowering asserts the C accumulator is a
+        fragment (``local_buf acc_o must be a fragment, but got shared``); the
+        Metal path deliberately staged C in shared for the 8x8 simdgroup route.
+        The elementwise scale/mask/D-add over ``acc_o`` lower identically on a
+        fragment under ``T.Parallel``.
+      * ``x_shared`` uses plain ``scope="shared"`` (the Metal ``"shared.dyn"``
+        staging hint dodged a Metal storage-sync bug; CUDA uses static shared).
+      * no ``make_swizzled_layout`` annotation (a Metal-specific bank-conflict
+        layout; CUDA's GEMM lowering picks its own ldmatrix/cp.async layout).
+
+    This is the canonical CUDA SSD chunk-scan form this core was promoted from
+    (see the module docstring). The numerical contract is unchanged — verified
+    against the SERIAL forward to fp16 ``< 5e-4`` on sm_121 by
+    ``scratch/probe_chunked_scan_cuda_gb10.py``.
+    """
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_scan_fwd_cuda_prim: seqlen ({seqlen}) must be divisible by "
+            f"chunk_size ({chunk_size}); no padding fallback (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_scan_fwd_cuda_prim: nheads ({nheads}) must be divisible by "
+            f"ngroups ({ngroups})"
+        )
+    if block_Dstate < dstate:
+        raise ValueError(
+            f"chunk_scan_fwd_cuda_prim: block_Dstate ({block_Dstate}) < dstate "
+            f"({dstate}); the C/prev_state slices would lose state columns "
+            f"(RULE #1: no silent truncation)"
+        )
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = T.ceildiv(seqlen, chunk_size)
+    p = 1.44269504  # 1/ln(2): exp2(x*p) == exp(x)
+
+    @T.prim_func
+    def main(
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), dtype),  # type: ignore
+        D: T.Tensor((nheads), dtype),  # type: ignore
+        Output: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+    ):
+        with T.Kernel(
+            nheads,
+            T.ceildiv(chunk_size, block_M) * T.ceildiv(headdim, block_N),
+            batch * nchunks,
+            threads=threads,
+        ) as (bz, bx, by):
+            acc_o = T.alloc_fragment((block_M, block_N), accum_dtype)
+            acc_o_shared = T.alloc_shared((block_M, block_N), dtype)
+            cb_shared = T.alloc_shared((block_M, block_K), dtype)
+            cb_local = T.alloc_fragment((block_M, block_K), dtype)
+            dA_cs_k_shared = T.alloc_shared((block_K), dtype)
+            dA_cs_k_local = T.alloc_fragment((block_K), accum_dtype)
+            dA_cs_m_local = T.alloc_fragment((block_M), accum_dtype)
+            dt_shared = T.alloc_shared((block_K), dtype)
+            dt_local = T.alloc_fragment((block_K), accum_dtype)
+            x_shared = T.alloc_shared((block_K, block_N), dtype)
+            dA_cs_m_shared = T.alloc_shared((block_M), dtype)
+            scale_m_local = T.alloc_fragment((block_M), accum_dtype)
+            C_shared = T.alloc_shared((block_M, block_Dstate), dtype)
+            prev_state_shared = T.alloc_shared((block_N, block_Dstate), dtype)
+            D_local = T.alloc_fragment((1), accum_dtype)
+            x_residual_shared = T.alloc_shared((block_M, block_N), dtype)
+            x_residual_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+            batch_idx = by % batch
+            chunk_idx = by // batch
+            m_idx = bx // T.ceildiv(headdim, block_N)
+            n_idx = bx % T.ceildiv(headdim, block_N)
+
+            T.copy(
+                dA_cumsum[
+                    batch_idx, bz, chunk_idx, m_idx * block_M : (m_idx + 1) * block_M
+                ],
+                dA_cs_m_shared,
+                disable_tma=True,
+            )
+            T.copy(dA_cs_m_shared, dA_cs_m_local)
+            T.clear(acc_o)
+
+            for i in T.Parallel(block_M):
+                scale_m_local[i] = T.exp2(dA_cs_m_local[i] * p)
+            T.copy(
+                C[
+                    batch_idx,
+                    chunk_idx * chunk_size
+                    + m_idx * block_M : chunk_idx * chunk_size
+                    + (m_idx + 1) * block_M,
+                    bz // (nheads // ngroups),
+                    0:block_Dstate,
+                ],
+                C_shared,
+                disable_tma=True,
+            )
+            T.copy(
+                prev_states[
+                    batch_idx,
+                    chunk_idx,
+                    bz,
+                    n_idx * block_N : (n_idx + 1) * block_N,
+                    0:block_Dstate,
+                ],
+                prev_state_shared,
+                disable_tma=True,
+            )
+            T.gemm(C_shared, prev_state_shared, acc_o, transpose_B=True)
+            for i, j in T.Parallel(block_M, block_N):
+                acc_o[i, j] *= scale_m_local[i]
+
+            loop_range = T.ceildiv((m_idx + 1) * block_M, block_K)
+            for k in T.serial(loop_range):
+                T.copy(
+                    cb[
+                        batch_idx,
+                        chunk_idx,
+                        bz // (nheads // ngroups),
+                        m_idx * block_M : (m_idx + 1) * block_M,
+                        k * block_K : (k + 1) * block_K,
+                    ],
+                    cb_shared,
+                    disable_tma=True,
+                )
+                T.copy(cb_shared, cb_local)
+                T.copy(
+                    dA_cumsum[
+                        batch_idx, bz, chunk_idx, k * block_K : (k + 1) * block_K
+                    ],
+                    dA_cs_k_shared,
+                    disable_tma=True,
+                )
+                T.copy(dA_cs_k_shared, dA_cs_k_local)
+                for i, j in T.Parallel(block_M, block_K):
+                    cb_local[i, j] = cb_local[i, j] * T.exp2(
+                        dA_cs_m_local[i] * p - dA_cs_k_local[j] * p
+                    )
+                T.copy(
+                    dt[batch_idx, bz, chunk_idx, k * block_K : (k + 1) * block_K],
+                    dt_shared,
+                    disable_tma=True,
+                )
+                T.copy(dt_shared, dt_local)
+                for i, j in T.Parallel(block_M, block_K):
+                    cb_local[i, j] *= dt_local[j]
+                for i, j in T.Parallel(block_M, block_K):
+                    cb_local[i, j] = T.if_then_else(
+                        m_idx * block_M + i >= k * block_K + j, cb_local[i, j], 0
+                    )
+                T.copy(
+                    x[
+                        batch_idx,
+                        chunk_idx * chunk_size
+                        + k * block_K : chunk_idx * chunk_size
+                        + (k + 1) * block_K,
+                        bz,
+                        n_idx * block_N : (n_idx + 1) * block_N,
+                    ],
+                    x_shared,
+                    disable_tma=True,
+                )
+                T.gemm(cb_local, x_shared, acc_o)
+
+            D_local[0] = D[bz]
+            T.copy(
+                x[
+                    batch_idx,
+                    chunk_idx * chunk_size
+                    + m_idx * block_M : chunk_idx * chunk_size
+                    + (m_idx + 1) * block_M,
+                    bz,
+                    n_idx * block_N : (n_idx + 1) * block_N,
+                ],
+                x_residual_shared,
+                disable_tma=True,
+            )
+            T.copy(x_residual_shared, x_residual_local)
+            for i, j in T.Parallel(block_M, block_N):
+                acc_o[i, j] += x_residual_local[i, j] * D_local[0]
+
+            T.copy(acc_o, acc_o_shared)
+            T.copy(
+                acc_o_shared,
+                Output[
+                    batch_idx,
+                    chunk_idx * chunk_size
+                    + m_idx * block_M : chunk_idx * chunk_size
+                    + (m_idx + 1) * block_M,
+                    bz,
+                    n_idx * block_N : (n_idx + 1) * block_N,
+                ],
+                disable_tma=True,
+            )
+
+    return main
+
+
+def _resolve_chunked_compile_target(target: Any) -> Any:
+    """Resolve the ``target`` kwarg shared by every chunked builder.
+
+    The chunked SSD grid prim BODIES are target-agnostic plain TileLang; only the
+    compile-site target object differs between Metal (Apple) and CUDA (gb10 /
+    sm_121). This is the single place that maps the caller's intent to a
+    ``tvm.target.Target``:
+
+      * ``None`` / ``"metal"`` / ``"metal -thread_warp_size=32"`` -> Metal target
+        (back-compat default; every existing Metal caller is unchanged).
+      * ``"cuda"`` (or any ``cuda...`` spec, or a CUDA ``tvm.target.Target``) ->
+        CUDA target so the SAME prim lowers through TileLang's CUDA backend.
+
+    RULE #1: an unrecognized target spec RAISES (no silent Metal default for a
+    CUDA host); the chunked-vs-serial / Metal-vs-CUDA selection is an explicit
+    gate, never a silent fallback.
+    """
+    from cppmega_mlx.nn._tilelang import _msl_transform
+
+    if target is None:
+        return _msl_transform._as_metal_target("metal -thread_warp_size=32")
+    if isinstance(target, str):
+        spec = target.strip()
+        if spec.startswith("cuda"):
+            return _msl_transform._as_cuda_target(spec)
+        if spec.startswith("metal"):
+            return _msl_transform._as_metal_target(spec)
+        raise ValueError(
+            "mamba3 chunked builder: unrecognized target spec "
+            f"{target!r}; expected 'metal...'/'cuda...' (RULE #1: no default)"
+        )
+    # Already a tvm.target.Target: coerce through whichever helper matches its
+    # kind so the determine_target allowlist still accepts it.
+    kind = str(getattr(getattr(target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        return _msl_transform._as_cuda_target(target)
+    return _msl_transform._as_metal_target(target)
 
 
 def compile_chunk_scan_fwd_metal(
@@ -338,29 +614,56 @@ def compile_chunk_scan_fwd_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Compile the chunked scan-core to a Metal ``JITKernel``.
+    """Compile the chunked scan-core to a ``JITKernel`` (Metal or CUDA).
 
-    Uses the repo's ``_as_metal_target`` builder (the bare ``"metal
-    -thread_warp_size=32"`` string is rejected by this tilelang's
+    ``target`` selects the codegen backend (``None`` => Metal default, ``"cuda"``
+    => CUDA / sm_121). Uses the repo's ``_as_metal_target`` / ``_as_cuda_target``
+    builders (the bare CLI strings are rejected by this tilelang's
     ``determine_target`` allowlist; the Target object bypasses it). Returns a
     callable ``JITKernel``; pass a PRE-ZEROED contiguous fp16 output buffer
-    positionally as the 8th argument and ``torch.mps.synchronize()`` after.
+    positionally as the 8th argument and synchronize the device after.
 
     RULE #1: compile failures propagate (no swallow / no serial fallback).
     """
     import tilelang
 
-    from cppmega_mlx.nn._tilelang import _msl_transform
-
+    resolved_target = _resolve_chunked_compile_target(target)
+    # F2 is the ONE chunked stage whose prim BODY differs by backend: the CUDA
+    # GEMM requires a register-fragment C accumulator, the Metal path stages it
+    # in shared (8x8 simdgroup route). Select the matching prim by the resolved
+    # target kind — same SSD math, backend-shaped codegen (RULE #1: explicit
+    # per-target codegen choice, not a silent fallback).
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        prim = chunk_scan_fwd_cuda_prim(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        )
+        # sm_121 (Blackwell): the GEMM operand copies otherwise lower to TMA
+        # (``__tvm_tensormap_create_tiled``), and at these tile dims the
+        # tensormap descriptor is 32-byte aligned where TMA requires 64-byte
+        # -> "Invalid TMA descriptor arguments" at RUN. Disable the TMA +
+        # warp-specialized lowering so the copies use plain cp.async/vectorized
+        # loads (the same SSD math; this is TileLang's documented escape hatch,
+        # cf. ``tilelang/utils/sparse.py``). RULE #1: explicit codegen choice,
+        # not a silent fallback.
+        pass_configs = {
+            "tl.disable_tma_lower": True,
+            "tl.disable_warp_specialized": True,
+        }
+        return tilelang.compile(
+            prim, out_idx=[7], target=resolved_target, pass_configs=pass_configs
+        )
     prim = chunk_scan_fwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
     )
     kernel = tilelang.compile(
         prim,
         out_idx=[7],
-        target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
+        target=resolved_target,
     )
     return kernel
 
@@ -373,9 +676,11 @@ def build_chunk_scan_combine_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Build the Path-C F2 ``mamba3_chunk_scan_combine`` Metal kernel.
+    """Build the Path-C F2 ``mamba3_chunk_scan_combine`` kernel (Metal or CUDA).
 
     This is the SINGLE named delegation that the Path-C brick-schedule
     descriptor registered under :data:`MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME` and the
@@ -385,10 +690,11 @@ def build_chunk_scan_combine_metal(
     ONE codegen path; on any compile/shape failure the underlying builder RAISES
     with where+what and there is NO serial fallback (RULE #1).
 
-    Returns a callable Metal ``JITKernel``; pass a PRE-ZEROED contiguous fp16
-    output buffer positionally as the 8th argument and ``torch.mps.synchronize()``
-    after dispatch.
+    ``target`` selects Metal (default) or CUDA (``"cuda"``). Returns a callable
+    ``JITKernel``; pass a PRE-ZEROED contiguous fp16 output buffer positionally
+    as the 8th argument and synchronize the device after dispatch.
     """
     return compile_chunk_scan_fwd_metal(
-        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate,
+        target=target, **kwargs,
     )

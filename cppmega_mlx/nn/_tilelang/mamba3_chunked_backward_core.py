@@ -399,17 +399,22 @@ def build_chunk_scan_combine_bwd_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Compile the B2 scan+combine backward kernel to a Metal ``JITKernel``.
+    """Compile the B2 scan+combine backward kernel to a ``JITKernel``.
 
-    Outputs (dC, dx, dz, dchunk_states, dinp, dA_cumsum_y, dD) are the trailing 7
-    params; pass PRE-ZEROED contiguous buffers positionally. RULE #1: compile
-    failures propagate (no serial fallback).
+    ``target`` selects Metal (default) or CUDA (``"cuda"`` / sm_121). Outputs
+    (dC, dx, dz, dchunk_states, dinp, dA_cumsum_y, dD) are the trailing 7 params;
+    pass PRE-ZEROED contiguous buffers positionally. RULE #1: compile failures
+    propagate (no serial fallback).
     """
     import tilelang
 
-    from cppmega_mlx.nn._tilelang import _msl_transform
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        _resolve_chunked_compile_target,
+    )
 
     prim = chunk_scan_combine_bwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
@@ -417,7 +422,7 @@ def build_chunk_scan_combine_bwd_metal(
     return tilelang.compile(
         prim,
         out_idx=[11, 12, 13, 14, 15, 16, 17],
-        target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
+        target=_resolve_chunked_compile_target(target),
     )
 
 
@@ -571,17 +576,22 @@ def build_inter_chunk_recur_bwd_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Compile the B1 reverse inter-chunk recurrence kernel to a Metal JITKernel.
+    """Compile the B1 reverse inter-chunk recurrence kernel to a ``JITKernel``.
 
-    Outputs (dstates, dh0, dA_cumsum_tail) are the trailing 3 params; pass
-    PRE-ZEROED contiguous fp32 buffers positionally. RULE #1: compile failures
-    propagate (no serial fallback).
+    ``target`` selects Metal (default) or CUDA (``"cuda"`` / sm_121). Outputs
+    (dstates, dh0, dA_cumsum_tail) are the trailing 3 params; pass PRE-ZEROED
+    contiguous fp32 buffers positionally. RULE #1: compile failures propagate
+    (no serial fallback).
     """
     import tilelang
 
-    from cppmega_mlx.nn._tilelang import _msl_transform
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        _resolve_chunked_compile_target,
+    )
 
     prim = inter_chunk_recur_bwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
@@ -589,7 +599,7 @@ def build_inter_chunk_recur_bwd_metal(
     return tilelang.compile(
         prim,
         out_idx=[4, 5, 6],
-        target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
+        target=_resolve_chunked_compile_target(target),
     )
 
 
@@ -822,17 +832,22 @@ def build_chunk_precompute_bwd_metal(
     nheads: int,
     headdim: int,
     dstate: int,
+    *,
+    target: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Compile the B0 precompute backward kernel to a Metal ``JITKernel``.
+    """Compile the B0 precompute backward kernel to a ``JITKernel``.
 
-    Outputs (dx, dB, dlog_decay, ddt) are the trailing 4 params; pass PRE-ZEROED
+    ``target`` selects Metal (default) or CUDA (``"cuda"`` / sm_121). Outputs
+    (dx, dB, dlog_decay, ddt) are the trailing 4 params; pass PRE-ZEROED
     contiguous fp32 buffers positionally (dx is accumulated into — B2 wrote the
     D-skip path first). RULE #1: compile failures propagate (no serial fallback).
     """
     import tilelang
 
-    from cppmega_mlx.nn._tilelang import _msl_transform
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        _resolve_chunked_compile_target,
+    )
 
     prim = chunk_precompute_bwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
@@ -840,5 +855,5 @@ def build_chunk_precompute_bwd_metal(
     return tilelang.compile(
         prim,
         out_idx=[9, 10, 11, 12],
-        target=_msl_transform._as_metal_target("metal -thread_warp_size=32"),
+        target=_resolve_chunked_compile_target(target),
     )

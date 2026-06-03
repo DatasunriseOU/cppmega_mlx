@@ -1469,6 +1469,42 @@ def _as_metal_target_uncached(target: Any) -> Any:
             return spec
 
 
+def _as_cuda_target(target: Any = "cuda") -> Any:
+    """Coerce a CUDA target spec into a ``tvm.target.Target`` for TileLang.
+
+    The mamba3 chunked-SSD grid kernels (F0/F1/F2 + B0/B1/B2) were authored
+    against the Metal codegen path via :func:`_as_metal_target`. On a CUDA host
+    (gb10 / sm_121) the SAME ``@T.prim_func`` bodies lower to CUDA unchanged, but
+    the builders must select a CUDA ``tvm.target.Target`` instead of a Metal one.
+    This helper is the CUDA sibling of :func:`_as_metal_target`: it returns a
+    ``tvm.target.Target`` for the bare ``"cuda"`` kind (TileLang's
+    ``determine_target`` allowlist accepts the Target object) or coerces a
+    passed-through spec/Target.
+
+    The arch (sm_121) is inferred by TVM from the live device at compile time;
+    we do NOT pin ``-arch`` here so the same call works on any CUDA device the
+    runtime actually owns. Returns the input unchanged when TVM is unavailable so
+    a non-TVM host sees a clear downstream error (RULE #1: no silent degrade).
+    """
+    try:
+        from tilelang import tvm  # type: ignore
+    except Exception:
+        try:
+            import tvm  # type: ignore
+        except Exception:
+            return target
+
+    if not isinstance(target, str):
+        try:
+            return tvm.target.Target(target)
+        except Exception:
+            return target
+    try:
+        return tvm.target.Target(target)
+    except Exception:
+        return target
+
+
 # Wave 5 grok finding #1: optional self-validation of the full-signature
 # corpus at import time. Off by default to keep import fast; enable in CI or
 # during local development by setting ``CPPMEGA_VALIDATE_PARSE_TESTS=1``.
@@ -1496,6 +1532,7 @@ __all__ = [
     "MSLDispatchUnsupported",
     "MetalKernel",
     "TileLangMSLLowering",
+    "_as_cuda_target",
     "_as_metal_target",
     "_assert_path_c_metal_fp8_intrinsics_registered",
     "can_run_metal",

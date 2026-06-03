@@ -6890,7 +6890,25 @@ def _mamba3_chunked_grid_delegation_prim(
             f"{op_name!r}: {characteristic} (got {estimate!r}, want {limit!r})"
         )
     builder = _resolve_mamba3_chunked_grid_builder(production_source)
-    return builder(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
+    # Target-aware delegation: the chunked grid prim BODIES are target-agnostic;
+    # only the compile-site target differs. On a CUDA host (gb10 / sm_121) the
+    # builder must emit a CUDA JITKernel, not the Metal default. This is the ONE
+    # place the host backend is selected for the chunked grid kernels; RULE #1 —
+    # an unsupported target RAISES inside the builder (no silent Metal fallback
+    # on a CUDA host).
+    grid_target = "cuda" if _path_c_default_target() == "cuda" else None
+    builder_kwargs: dict[str, Any] = {"target": grid_target}
+    # The scan+combine F2/B2 cores carry a GEMM ``block_Dstate`` tile that slices
+    # the state axis ``[..., 0:block_Dstate]``. The validated CUDA path tiles it
+    # to the actual ``dstate`` (production dstate=64): the builder default of 128
+    # would over-slice a dstate<128 tensor. The precompute/recur cores have no
+    # such tile and do not accept the kwarg. RULE #1: pass the exact, validated
+    # tile only where the prim consumes it (no silent over-slice).
+    if op_name == "mamba3_chunk_scan_combine":
+        builder_kwargs["block_Dstate"] = dstate
+    return builder(
+        batch, seqlen, chunk, ngroups, nheads, headdim, dstate, **builder_kwargs
+    )
 
 
 def _append_row_phased_mamba3_body(
