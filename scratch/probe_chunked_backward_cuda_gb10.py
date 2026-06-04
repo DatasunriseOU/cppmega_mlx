@@ -214,7 +214,7 @@ def _time(fn, n=20):
 
 
 def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
-                   *, use_dhlast=False):
+                   *, use_dhlast=False, b2_v2_ab=False):
     from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
         build_chunk_precompute_metal, build_inter_chunk_recur_metal,
     )
@@ -222,6 +222,7 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
         build_chunk_scan_combine_bwd_metal, build_inter_chunk_recur_bwd_metal,
         build_chunk_precompute_bwd_metal,
     )
+    import os as _os
 
     b, S, G, H, P, N = batch, seqlen, ngroups, nheads, headdim, dstate
     nchunks = S // chunk
@@ -287,6 +288,17 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
     y_t = serial_y(cb, th(x_np), dt_k, dA, th(C_np), prev, th(D_np), chunk)
 
     # ============================ B2 ============================
+    # B2 v2 (dstate-split grid-restructure) is selected by the SAME env flag the
+    # builder reads (CPPMEGA_PATH_C_B2_V2). When ON, the dA_cumsum_y output (slot 16)
+    # gains a dstate_split axis (b,H,nchunks,KN,chunk); after B2, before B1/B0, we
+    # SUM that axis to recover the v1 dA_cumsum_y the chain consumes. When OFF the
+    # buffer + chain are v1-byte-identical (no reduce). RULE #1: KN must divide N
+    # (the prim RAISES otherwise — surfaced here as a compile failure, no fallback).
+    _b2_v2_flag = str(_os.environ.get("CPPMEGA_PATH_C_B2_V2", "")).strip().lower()
+    _b2_v2_on = _b2_v2_flag in ("1", "true", "yes", "on")
+    _b2_kn = int(_os.environ.get("CPPMEGA_PATH_C_B2_DSTATE_SPLIT", "2")) if _b2_v2_on else 1
+    result["B2_v2"] = bool(_b2_v2_on)
+    result["B2_dstate_split"] = _b2_kn
     try:
         k_b2 = build_chunk_scan_combine_bwd_metal(b, S, chunk, G, H, P, N, target="cuda")
     except Exception:
@@ -294,22 +306,26 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
         traceback.print_exc()
         result["B2_compile"] = "FAIL"
         return False, result
-    print("[B2] COMPILE ok")
+    print(f"[B2] COMPILE ok  (v2={_b2_v2_on} KN={_b2_kn})")
     # PRE-ZEROED contiguous fp32 outputs (the kernels accumulate).
     dC_m = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
     dx_m = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
     dz_m = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
     dchunk = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
     dinp_diag = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
-    dA_y = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+    # dA_y carries the dstate_split partial axis when v2 is on (KN); KN==1 off.
+    if _b2_v2_on:
+        dA_y_raw = torch.zeros(b, H, nchunks, _b2_kn, chunk, device=DEV, dtype=torch.float32)
+    else:
+        dA_y_raw = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
     dD_m = torch.zeros(H, device=DEV, dtype=torch.float32)
 
     def run_b2():
         dC_m.zero_(); dx_m.zero_(); dz_m.zero_(); dchunk.zero_()
-        dinp_diag.zero_(); dA_y.zero_(); dD_m.zero_()
+        dinp_diag.zero_(); dA_y_raw.zero_(); dD_m.zero_()
         k_b2(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
              th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
-             dC_m, dx_m, dz_m, dchunk, dinp_diag, dA_y, dD_m)
+             dC_m, dx_m, dz_m, dchunk, dinp_diag, dA_y_raw, dD_m)
     try:
         run_b2(); torch.cuda.synchronize()
     except Exception:
@@ -318,7 +334,101 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
         result["B2_run"] = "FAIL"
         return False, result
     t_b2 = _time(run_b2)
-    print(f"[B2] RUN ok  TIMING median={t_b2:.3f} ms/call")
+    print(f"[B2] RUN ok  TIMING median={t_b2:.3f} ms/call  (v2={_b2_v2_on} KN={_b2_kn})")
+    # Reduce the dstate_split partial axis -> v1-equivalent dA_cumsum_y for B0.
+    # Summing over KN recovers EXACTLY the v1 dA grad (the dstate-decay term is a
+    # per-block N-partial; the N-independent dseg is counted once on the bz==0
+    # partial). OFF: no reduce, byte-identical to v1.
+    dA_y = dA_y_raw.sum(dim=3).contiguous() if _b2_v2_on else dA_y_raw
+
+    # ----- B2 v1-vs-v2 A/B (LABELLED MEASURED) — single-process medians+speedup ---
+    # Builds BOTH prims directly (bypassing the env) so both medians come from ONE
+    # gb10 run. The v2 dA_y partial is reduced and compared bit-for-near vs v1 dA_y
+    # as a math-equivalence check (KN-sum == v1). RULE #1: a v2 that is SLOWER than
+    # v1 is reported NO-GO here, never silently used; any compile/run error raises.
+    if b2_v2_ab:
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+            chunk_scan_combine_bwd_cuda_prim, chunk_scan_combine_bwd_cuda_prim_v2,
+        )
+        import tilelang as _tl
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+            _resolve_chunked_compile_target as _rct,
+        )
+        _tgt = _rct("cuda")
+        _pc = {"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True}
+        _ab = {"shape": dict(b=b, S=S, chunk=chunk, G=G, H=H, P=P, N=N)}
+
+        # v1
+        _p1 = chunk_scan_combine_bwd_cuda_prim(b, S, chunk, G, H, P, N)
+        _k1 = _tl.compile(_p1, out_idx=[11, 12, 13, 14, 15, 16, 17], target=_tgt,
+                          pass_configs=_pc)
+        _dC1 = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+        _dx1 = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dz1 = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dck1 = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+        _din1 = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+        _dAy1 = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+        _dD1 = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+        def _run_v1():
+            _dC1.zero_(); _dx1.zero_(); _dz1.zero_(); _dck1.zero_()
+            _din1.zero_(); _dAy1.zero_(); _dD1.zero_()
+            _k1(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
+                th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
+                _dC1, _dx1, _dz1, _dck1, _din1, _dAy1, _dD1)
+        _run_v1(); torch.cuda.synchronize()
+        _t1 = _time(_run_v1)
+
+        # v2 sweep over the requested KN list (default 2,4); each must divide N.
+        kn_list = [int(s) for s in
+                   _os.environ.get("CPPMEGA_PATH_C_B2_AB_KNS", "2,4").split(",")
+                   if s.strip()]
+        ab_rows = {"v1_ms": _t1, "kn": {}}
+        for kn in kn_list:
+            if N % kn != 0:
+                # RULE #1: surface WHERE+WHAT, do not silently skip a bad KN.
+                raise RuntimeError(
+                    f"[B2-AB] dstate_split={kn} does not divide dstate={N}; "
+                    f"the v2 prim REQUIRES it (no fallback).")
+            _p2 = chunk_scan_combine_bwd_cuda_prim_v2(
+                b, S, chunk, G, H, P, N, dstate_split=kn)
+            _k2 = _tl.compile(_p2, out_idx=[11, 12, 13, 14, 15, 16, 17], target=_tgt,
+                              pass_configs=_pc)
+            _dC2 = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+            _dx2 = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+            _dz2 = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+            _dck2 = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+            _din2 = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+            _dAy2 = torch.zeros(b, H, nchunks, kn, chunk, device=DEV, dtype=torch.float32)
+            _dD2 = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+            def _run_v2():
+                _dC2.zero_(); _dx2.zero_(); _dz2.zero_(); _dck2.zero_()
+                _din2.zero_(); _dAy2.zero_(); _dD2.zero_()
+                _k2(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
+                    th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
+                    _dC2, _dx2, _dz2, _dck2, _din2, _dAy2, _dD2)
+            _run_v2(); torch.cuda.synchronize()
+            _t2 = _time(_run_v2)
+            # math-equivalence: v2 outputs (with dA_y KN-summed) must match v1.
+            _dAy2s = _dAy2.sum(dim=3)
+            eq = {
+                "dC": float((_dC2 - _dC1).abs().max()),
+                "dx": float((_dx2 - _dx1).abs().max()),
+                "dz": float((_dz2 - _dz1).abs().max()),
+                "dchunk": float((_dck2 - _dck1).abs().max()),
+                "dinp": float((_din2 - _din1).abs().max()),
+                "dA_y": float((_dAy2s - _dAy1).abs().max()),
+                "dD": float((_dD2 - _dD1).abs().max()),
+            }
+            speedup = _t1 / _t2 if _t2 > 0 else float("nan")
+            verdict = "GO" if _t2 < _t1 else "NO-GO"
+            ab_rows["kn"][kn] = {"v2_ms": _t2, "speedup": speedup,
+                                 "verdict": verdict, "vs_v1_max_abs": eq}
+            print(f"[B2-AB] MEASURED v1={_t1:.3f}ms  v2(KN={kn})={_t2:.3f}ms  "
+                  f"speedup={speedup:.3f}x  {verdict}  "
+                  f"vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eq.items()} }")
+        result["B2_v2_ab"] = ab_rows
 
     # ============================ B1 ============================
     try:
@@ -537,6 +647,12 @@ def _gold_dlog_decay(x_np, B_np, C_np, A_np, dt_np, D_np, h0_np, z_np,
 def main():
     prod = "--prod" in sys.argv
     use_dhlast = "--dhlast" in sys.argv
+    # --b2-v2-ab: in ONE gb10 process build+time BOTH the §17-GO v1 B2 cuda prim and
+    # the dstate-split v2 prim (KN sweep via CPPMEGA_PATH_C_B2_AB_KNS, default 2,4),
+    # printing medians + speedup LABELLED MEASURED and the v2-vs-v1 math-equivalence
+    # max|abs|. The parity chain (B1/B0 + the 8-grad gate) is UNCHANGED and uses the
+    # env-selected B2 (v1 byte-identical unless CPPMEGA_PATH_C_B2_V2 is set).
+    b2_v2_ab = "--b2-v2-ab" in sys.argv
     print("=== CUDA chunked-BACKWARD probe (gb10 sm_121) ===")
     print("torch", torch.__version__, "cuda_avail", torch.cuda.is_available(),
           "dev", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NONE")
@@ -556,7 +672,8 @@ def main():
     results = []
     for cfg in cfgs:
         try:
-            cfg_ok, res = probe_backward(**cfg, use_dhlast=use_dhlast)
+            cfg_ok, res = probe_backward(**cfg, use_dhlast=use_dhlast,
+                                         b2_v2_ab=b2_v2_ab)
         except Exception as exc:  # RULE #1: surface WHERE+WHAT, fail loud.
             print("[BWD] PROBE RAISED (RULE #1 fail-loud):")
             traceback.print_exc()

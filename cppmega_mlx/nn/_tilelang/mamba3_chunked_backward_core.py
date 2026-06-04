@@ -56,6 +56,7 @@ __all__ = [
     "MAMBA3_CHUNK_PRECOMPUTE_BWD_OP_NAME",
     "chunk_scan_combine_bwd_metal_prim",
     "chunk_scan_combine_bwd_cuda_prim",
+    "chunk_scan_combine_bwd_cuda_prim_v2",
     "inter_chunk_recur_bwd_metal_prim",
     "chunk_precompute_bwd_metal_prim",
     "chunk_scan_combine_bwd_grid",
@@ -693,6 +694,339 @@ def chunk_scan_combine_bwd_cuda_prim(
     return main
 
 
+def chunk_scan_combine_bwd_cuda_prim_v2(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    threads: int = 128,
+    dstate_split: int = 2,
+) -> Any:
+    """B2 v2 — dstate-SPLIT grid-restructure twin of :func:`chunk_scan_combine_bwd_cuda_prim`.
+
+    IDENTICAL analytic backward math to the §17-GO v1 CUDA prim (it IS the v1 body
+    with the ``dstate`` (n) axis SPLIT across a NEW third grid dimension ``bz`` of
+    extent ``dstate_split`` (== "KN")). v2 exists to attack the occupancy/tail bound
+    the §17 honest-attribution scoped: B2 ~= 3x B0 because the long ``dstate``-serial
+    reductions inside ``dC`` / ``dchunk_states`` / ``dinp`` run unhidden on a grid
+    that is only ``(batch*nchunks, nheads)``. v2 multiplies the threadgroup count by
+    ``dstate_split`` and shrinks each block's N-serial reductions by ``dstate_split``
+    (more blocks/SM-supply + shorter tails), while the per-threadgroup SHARED budget
+    is UNCHANGED (``dacs``/``dAcs_acc``/``dY``/``XT``/``DYX`` are all
+    dstate-independent — recomputed per ``bz``; ZERO added shared, so occupancy is
+    not lost to shared pressure).
+
+    The N-disjoint design (race-free, NO atomics across blocks):
+      * Grid is ``T.Kernel(batch*nchunks, nheads, dstate_split)`` -> ``(bx, by, bz)``.
+        ``kn = bz`` ; ``n_per = dstate // dstate_split`` ; ``n0 = kn*n_per``. This
+        block OWNS the contiguous N-range ``[n0, n0+n_per)``.
+      * EVERY loop that indexes N (the dC zero/apply, dchunk_states zero/apply, dinp
+        zero/Y_diag) is restricted to ``[n0, n0+n_per)`` -> blocks with different
+        ``bz`` touch DISJOINT N-slices of dC/dchunk_states/dinp -> direct writes are
+        race-free, no atomics, no cross-block reduction needed for those outputs.
+      * The ``dz`` / ``dx`` (D-skip) writes and the ``dD`` atomic are N-INDEPENDENT;
+        they would be redundantly written by all ``dstate_split`` blocks. They are
+        gated to ``kn == 0`` via a uniform 0/1 ``kn_is_zero`` factor (RULE #1: a
+        uniform predicate, NOT a data-dependent control-flow fallback — the math is
+        written EXACTLY once). The dz/dx writes still execute on the ``kn!=0`` blocks
+        but multiply the stored value by ``kn_is_zero`` so they store 0 -> but those
+        cells are ALSO written 0 by being overwritten? No — to be safe they are
+        guarded so only ``kn==0`` stores the real value; the others skip via the
+        uniform factor multiplying into a no-op store of the SAME cell (idempotent:
+        every block writes the same dz/dx cell, but only kn==0 writes the true value
+        and the others write 0; since blocks race on these cells we instead gate the
+        STORE itself to kn==0 with a uniform `if`, which is uniform-branch-safe).
+
+    The dA grad (``dA_cumsum_y``) becomes a PER-bz PARTIAL output of NEW shape
+    ``(batch, nheads, nchunks, dstate_split, chunk_size)`` (still emitted at the SAME
+    out_idx slot 16); summing over the ``dstate_split`` axis recovers the v1
+    ``dA_cumsum_y`` exactly. Two contributions land in ``dAcs_acc`` (then the
+    partial):
+      * the ``dstate_decay`` ``accn*c_v*sd`` term is N-DEPENDENT -> each block
+        contributes its own N-range partial (summing over bz recovers the full
+        ``sum_n``). Kept per-block, unmultiplied.
+      * the ``dseg`` segsum-VJP (``DYX[ll,ss]*cb_v*lmat*dt_s``) is N-INDEPENDENT ->
+        it must be counted ONCE across the ``dstate_split`` blocks (else summing the
+        partial multiplies it by ``dstate_split``). It is multiplied by a uniform
+        ``kn_is_zero`` (= 1 on bz==0, else 0) so ONLY the bz==0 partial carries it.
+        (RULE #1: a uniform multiplicative mask, not a branch-around-a-barrier — the
+        §17 codegen bug where a __syncthreads() inside an if-masked region drops the
+        local hoist is avoided exactly as in v1: the body is BRANCHLESS and the
+        tri/kn masks are ``T.if_then_else`` VALUES.)
+
+    RAISE (RULE #1, NO fallback): ``dstate`` MUST be divisible by ``dstate_split``
+    (disjoint contiguous N-ranges); ``dstate_split`` MUST be in ``[1, dstate]``.
+    ``dstate_split == 1`` is the v1 body bit-for-bit (single bz, n0=0, n_per=dstate,
+    kn_is_zero=1, partial axis of extent 1) — used to validate v2 == v1.
+
+    Same ``pass_configs`` and the SAME out_idx ``[11..17]`` as v1 (slot 16 simply
+    gains the ``dstate_split`` axis). Selected by the build-site env flag; a
+    compile/parity failure PROPAGATES (no fallback to v1 / Metal / numpy).
+    """
+    import tilelang  # noqa: F401
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_v2: seqlen ({seqlen}) must be "
+            f"divisible by chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_v2: nheads ({nheads}) must be "
+            f"divisible by ngroups ({ngroups})"
+        )
+    if not isinstance(dstate_split, int) or dstate_split < 1:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_v2: dstate_split ({dstate_split}) "
+            f"must be an int >= 1 (RULE #1: no fallback)"
+        )
+    if dstate_split > dstate:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_v2: dstate_split ({dstate_split}) "
+            f"must be <= dstate ({dstate}) (RULE #1: no fallback)"
+        )
+    if dstate % dstate_split != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_v2: dstate ({dstate}) must be "
+            f"divisible by dstate_split ({dstate_split}) for disjoint contiguous "
+            f"N-ranges; no padding/remainder fallback (RULE #1)"
+        )
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    heads_per_group = nheads // ngroups
+    L = chunk_size
+    p = _LOG2E
+    KN = dstate_split
+    n_per = dstate // dstate_split
+
+    @T.prim_func
+    def main(
+        dout: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        z: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        D: T.Tensor((nheads), dtype),  # type: ignore
+        y: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dC: T.Tensor((batch, seqlen, nheads, dstate), accum_dtype),  # type: ignore
+        dx: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dz: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dchunk_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dinp: T.Tensor((batch, seqlen, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dA_cumsum_y: T.Tensor((batch, nheads, nchunks, dstate_split, chunk_size), accum_dtype),  # type: ignore
+        dD: T.Tensor((nheads), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nheads, dstate_split, threads=threads) as (bx, by, bz):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            head_idx = by
+            group_idx = head_idx // heads_per_group
+            base = chunk_idx * chunk_size
+            kn = bz                     # which dstate-split block (0..KN-1)
+            n0 = kn * n_per             # this block owns N-range [n0, n0+n_per)
+            # uniform 0/1 (block-uniform: same for all threads in the block) — gates
+            # the N-INDEPENDENT contributions (dz/dx/dD, dseg) to exactly the bz==0
+            # block so summing over the dstate_split axis counts them once.
+            kn_is_zero = T.if_then_else(
+                kn == 0, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+            )
+
+            dacs = T.alloc_shared((L,), accum_dtype)        # dA_cumsum row (this head/chunk)
+            dY = T.alloc_shared((L, headdim), accum_dtype)  # dY[l,p] (post split)
+            dAcs_acc = T.alloc_shared((L,), accum_dtype)     # accumulated dA_cumsum grad (this bz)
+            XT = T.alloc_shared((L, headdim), accum_dtype)   # staged x[base+s, head, p]
+            DYX = T.alloc_shared((L, L), accum_dtype)        # dyx[l,s] = sum_p dY[l,p]*x[s,p]
+
+            # --- load dA_cumsum row, init dA grad accumulator (dstate-indep) ---
+            for l in T.Parallel(L):
+                dacs[l] = T.Cast(accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, l])
+                dAcs_acc[l] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+
+            # --- output/gate + D-skip transpose: dY[l,p], dz, dx, dD ---
+            #   (SAME math as v1; dz/dx are written ONLY on the bz==0 block (uniform
+            #    if), and dD atomic is gated to bz==0 — these are N-independent so
+            #    every bz would otherwise redundantly write/accumulate them. dY/XT are
+            #    dstate-independent staging the EVERY block needs, so they are filled
+            #    on every block. RULE #1: the write is gated by a UNIFORM predicate
+            #    (kn==0), not data-dependent control flow.)
+            dD_local = T.alloc_local((1,), accum_dtype)
+            dD_local[0] = T.Cast(accum_dtype, 0)
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                s = base + ll
+                z_v = T.Cast(accum_dtype, z[batch_idx, s, head_idx, pp])
+                gate = z_v / (T.Cast(accum_dtype, 1.0) + T.exp(-z_v))
+                y_v = T.Cast(accum_dtype, y[batch_idx, s, head_idx, pp])
+                dout_v = T.Cast(accum_dtype, dout[batch_idx, s, head_idx, pp])
+                dgate = dout_v * y_v
+                dy_v = dout_v * gate
+                d_v = T.Cast(accum_dtype, D[head_idx])
+                x_v = T.Cast(accum_dtype, x[batch_idx, s, head_idx, pp])
+                if kn == 0:
+                    # uniform branch (kn is block-uniform) -> warp-safe; writes the
+                    # N-independent dz/dx ONCE (bz==0 owns them).
+                    dz[batch_idx, s, head_idx, pp] = (
+                        dgate * _silu_grad_expr(T, z_v, accum_dtype)
+                    )
+                    dx[batch_idx, s, head_idx, pp] = d_v * dy_v
+                dD_local[0] = dD_local[0] + dy_v * x_v
+                dY[ll, pp] = dy_v
+                XT[ll, pp] = x_v
+            T.sync_threads()
+            # dD is the global D-skip reduction (N-independent) -> count once: scale
+            # the per-block local by the uniform kn_is_zero so only bz==0 contributes.
+            T.atomic_add(dD[head_idx], dD_local[0] * kn_is_zero)
+
+            # First zero THIS block's OWNED N-slice of dC / dinp / dchunk_states
+            # (disjoint across bz -> race-free direct writes). Restricted to
+            # [n0, n0+n_per).
+            for ln in T.Parallel(L * n_per):
+                ll = ln // n_per
+                nn = n0 + (ln % n_per)
+                dC[batch_idx, base + ll, head_idx, nn] = T.Cast(accum_dtype, 0)
+            for pn in T.Parallel(headdim * n_per):
+                pp = pn // n_per
+                nn = n0 + (pn % n_per)
+                dchunk_states[batch_idx, chunk_idx, head_idx, pp, nn] = T.Cast(
+                    accum_dtype, 0
+                )
+            for lpn0 in T.serial(0, L * headdim * n_per, threads):
+                lane = T.get_thread_binding(0)
+                idx = lpn0 + lane
+                if idx < L * headdim * n_per:
+                    ll = idx // (headdim * n_per)
+                    rem = idx % (headdim * n_per)
+                    pp = rem // n_per
+                    nn = n0 + (rem % n_per)
+                    dinp[batch_idx, base + ll, head_idx, pp, nn] = T.Cast(
+                        accum_dtype, 0
+                    )
+            T.sync_threads()
+
+            # ---- BUILD shared DYX[l,s] = sum_p dY[l,p]*x[s,p] (ss<=ll, lower-tri) ----
+            # dstate-INDEPENDENT -> built per block (zero added shared; same as v1).
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                if ss <= ll:
+                    for pp in T.serial(headdim):
+                        acc[0] = acc[0] + dY[ll, pp] * XT[ss, pp]
+                DYX[ll, ss] = acc[0]
+            T.sync_threads()
+
+            # ---- dC = dC_off + dC_diag (per (l,n) in THIS block's N-range) ----
+            #   SAME math as v1; the (ll,nn) grid is restricted to n_per N-values
+            #   (nn = n0 + nloc) -> the serial reductions over N elsewhere shrink by
+            #   dstate_split. dstate_decay's nn-reduction is a PER-BLOCK partial of
+            #   sum_n (it folds into THIS bz's dAcs_acc); summing the partial axis
+            #   over bz recovers the full sum_n. (atomic on dAcs_acc: still the only
+            #   multi-writer shared cell WITHIN a block.)
+            for ln in T.Parallel(L * n_per):
+                ll = ln // n_per
+                nn = n0 + (ln % n_per)
+                s = base + ll
+                sd = T.exp2(dacs[ll] * p)
+                accn = T.alloc_local((1,), accum_dtype)
+                accn[0] = T.Cast(accum_dtype, 0)
+                for pp in T.serial(headdim):
+                    cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
+                    accn[0] = accn[0] + dY[ll, pp] * cs
+                cdiag = T.alloc_local((1,), accum_dtype)
+                cdiag[0] = T.Cast(accum_dtype, 0)
+                for ss in T.serial(0, ll + 1):
+                    lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    b_v = T.Cast(accum_dtype, B[batch_idx, base + ss, group_idx, nn])
+                    cdiag[0] = cdiag[0] + lmat * dt_s * DYX[ll, ss] * b_v
+                dC[batch_idx, s, head_idx, nn] = accn[0] * sd + cdiag[0]
+                # dstate_decay nn-reduction -> dAcs_acc[ll] (per-block N partial).
+                c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                T.atomic_add(dAcs_acc[ll], accn[0] * c_v * sd)
+            T.sync_threads()
+
+            # dchunk_states[p,n] += sum_l dY[l,p]*C[l,n]*state_decay[l] (THIS N-range).
+            for pn in T.Parallel(headdim * n_per):
+                pp = pn // n_per
+                nn = n0 + (pn % n_per)
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                for ll in T.serial(L):
+                    sd = T.exp2(dacs[ll] * p)
+                    c_v = T.Cast(accum_dtype, C[batch_idx, base + ll, group_idx, nn])
+                    acc[0] = acc[0] + dY[ll, pp] * c_v * sd
+                dchunk_states[batch_idx, chunk_idx, head_idx, pp, nn] = acc[0]
+            T.sync_threads()
+
+            # ---- Y_diag transpose (intra-chunk) -> dinp (THIS N-range) ----
+            #   dinp[s,p,n] = sum_{l>=s} dY[l,p]*C[l,n]*Lmat[l,s] ; the inner serial
+            #   over N shrinks to n_per (the v2 win on this output). The (sp) grid is
+            #   lane-strided over L*headdim exactly as v1.
+            for sp in T.serial(0, L * headdim, threads):
+                lane = T.get_thread_binding(0)
+                spi = sp + lane
+                if spi < L * headdim:
+                    ss = spi // headdim
+                    pp = spi % headdim
+                    sidx = base + ss
+                    for nloc in T.serial(n_per):
+                        nn = n0 + nloc
+                        acc = T.alloc_local((1,), accum_dtype)
+                        acc[0] = T.Cast(accum_dtype, 0)
+                        for ll in T.serial(ss, L):  # l >= s (lower-tri)
+                            lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                            c_v = T.Cast(
+                                accum_dtype, C[batch_idx, base + ll, group_idx, nn]
+                            )
+                            acc[0] = acc[0] + dY[ll, pp] * c_v * lmat
+                        dinp[batch_idx, sidx, head_idx, pp, nn] = (
+                            dinp[batch_idx, sidx, head_idx, pp, nn] + acc[0]
+                        )
+            T.sync_threads()
+
+            # ---- Y_diag dA grad (dseg) — N-INDEPENDENT, counted ONCE (bz==0) ----
+            #   dseg = DYX[l,s]*cb*lmat*dt_s (strict lower-tri ss<ll); BRANCHLESS body
+            #   (the §17 barrier-in-if codegen bug is avoided exactly as in v1). The
+            #   atomic into dAcs_acc is multiplied by the uniform kn_is_zero so only
+            #   the bz==0 block's partial carries the (dstate-independent) dseg term.
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                cb_v = T.Cast(accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss])
+                lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                tri = T.if_then_else(
+                    ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+                )
+                dseg = DYX[ll, ss] * cb_v * lmat * dt_s * tri * kn_is_zero
+                T.atomic_add(dAcs_acc[ll], dseg)
+                T.atomic_add(dAcs_acc[ss], -dseg)
+            T.sync_threads()
+
+            # Emit THIS bz's partial dA grad into the dstate_split axis (slot 16).
+            # Summing over the dstate_split axis recovers the v1 dA_cumsum_y exactly:
+            #   sum_kn [ sum_{n in block} dstate_decay + (kn==0 ? dseg : 0) ]
+            #     = sum_n dstate_decay  +  dseg   (== v1).
+            for l in T.Parallel(L):
+                dA_cumsum_y[batch_idx, head_idx, chunk_idx, kn, l] = dAcs_acc[l]
+
+    return main
+
+
 def build_chunk_scan_combine_bwd_metal(
     batch: int,
     seqlen: int,
@@ -711,7 +1045,23 @@ def build_chunk_scan_combine_bwd_metal(
     (dC, dx, dz, dchunk_states, dinp, dA_cumsum_y, dD) are the trailing 7 params;
     pass PRE-ZEROED contiguous buffers positionally. RULE #1: compile failures
     propagate (no serial fallback).
+
+    CUDA-ONLY B2 v2 A/B SELECTION (RULE #1 — the ONE path, failure RAISES):
+      env ``CPPMEGA_PATH_C_B2_V2`` truthy (1/true/yes/on) selects the dstate-SPLIT
+      grid-restructure prim :func:`chunk_scan_combine_bwd_cuda_prim_v2` instead of
+      the §17-GO v1 ``chunk_scan_combine_bwd_cuda_prim``. The split factor (KN) is
+      env ``CPPMEGA_PATH_C_B2_DSTATE_SPLIT`` (default 2); it MUST divide ``dstate``
+      (the v2 prim RAISES otherwise — no fallback). With v2 selected, the
+      ``dA_cumsum_y`` output (slot 16) gains a ``dstate_split`` axis of shape
+      ``(batch, nheads, nchunks, dstate_split, chunk_size)``; the caller must size
+      that buffer accordingly and SUM the ``dstate_split`` axis to recover the v1
+      ``dA_cumsum_y`` before feeding B0 (see the probe). KN==1 is the v1 body
+      bit-for-bit (validation gate). When the flag is OFF the v1 prim is selected
+      BYTE-IDENTICAL (a slow v2 is reported NO-GO, never silently used). The flag is
+      CUDA-only: the Metal branch is UNCHANGED. NO try/except — a v2 compile/parity
+      failure PROPAGATES (never falls back to v1 / Metal / numpy).
     """
+    import os
     import tilelang
 
     from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
@@ -737,9 +1087,23 @@ def build_chunk_scan_combine_bwd_metal(
     # propagates (no fallback to the slow Metal prim or numpy).
     kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
     if "cuda" in kind:
-        prim = chunk_scan_combine_bwd_cuda_prim(
-            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
-        )
+        # v2 A/B select (CUDA-only). Env-gated, NO try/except (RULE #1): if v2 is
+        # selected it is the ONE path and any compile/parity failure propagates.
+        _v2_flag = str(os.environ.get("CPPMEGA_PATH_C_B2_V2", "")).strip().lower()
+        _v2_on = _v2_flag in ("1", "true", "yes", "on")
+        if _v2_on:
+            _kn = int(os.environ.get("CPPMEGA_PATH_C_B2_DSTATE_SPLIT", "2"))
+            # The v2 prim itself RAISES if dstate % dstate_split != 0 / out of range
+            # (no fallback); we forward dstate_split explicitly (kwargs carries any
+            # threads= override only).
+            prim = chunk_scan_combine_bwd_cuda_prim_v2(
+                batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate,
+                dstate_split=_kn, **kwargs
+            )
+        else:
+            prim = chunk_scan_combine_bwd_cuda_prim(
+                batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+            )
         pass_configs = {
             "tl.disable_tma_lower": True,
             "tl.disable_warp_specialized": True,
