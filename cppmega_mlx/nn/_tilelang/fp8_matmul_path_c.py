@@ -259,15 +259,35 @@ def _fp8_scaled_matmul2d_cuda_kernel_template(
         C_frag = T.alloc_fragment((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE)  # type: ignore[name-defined]  # noqa: F821
         C_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE, scope="shared")  # type: ignore[name-defined]  # noqa: F821
         T.clear(C_frag)
+        A_fp8_local = T.alloc_fragment((_FP8_MM_BM, _FP8_MM_BK), "float8_e4m3")  # type: ignore[name-defined]  # noqa: F821
+        B_fp8_local = T.alloc_fragment((_FP8_MM_BN, _FP8_MM_BK), "float8_e4m3")  # type: ignore[name-defined]  # noqa: F821
         for ko in T.serial(T.ceildiv(_FP8_MM_K, _FP8_MM_BK)):  # type: ignore[name-defined]  # noqa: F821
+            # Stage the e4m3 bytes into register fragments first (disable_tma on
+            # the global load), then cast element-wise. On CUDA codegen the prior
+            # ``T.alloc_var("float32")`` scratch lowered to a non-assignable
+            # ``float[1]`` array (lvalue error); the per-element fragment->fragment
+            # ``T.cast(e4m3 -> float16)`` here lowers to the NATIVE
+            # ``__nv_fp8_e4m3 -> half`` decode (codegen_cuda ``GetTileLangFP8Type``
+            # -> ``fp8_e4*_t``), NOT a vectorized ``(half4)(uchar4)`` reinterpret —
+            # the per-element scalar cast keeps the decode honest (RULE #1) while
+            # producing a valid CUDA lvalue. (F2 forward CUDA twin pattern: copy
+            # global->local, then operate on the fragment under T.Parallel.)
+            T.copy(  # type: ignore[name-defined]  # noqa: F821
+                A_fp8[by * _FP8_MM_BM : by * _FP8_MM_BM + _FP8_MM_BM,
+                      ko * _FP8_MM_BK : ko * _FP8_MM_BK + _FP8_MM_BK],
+                A_fp8_local,
+                disable_tma=True,
+            )
+            T.copy(  # type: ignore[name-defined]  # noqa: F821
+                B_fp8[bx * _FP8_MM_BN : bx * _FP8_MM_BN + _FP8_MM_BN,
+                      ko * _FP8_MM_BK : ko * _FP8_MM_BK + _FP8_MM_BK],
+                B_fp8_local,
+                disable_tma=True,
+            )
             for i, kk in T.Parallel(_FP8_MM_BM, _FP8_MM_BK):  # type: ignore[name-defined]  # noqa: F821
-                a_val = T.alloc_var("float32")  # type: ignore[name-defined]  # noqa: F821
-                a_val = T.cast(A_fp8[by * _FP8_MM_BM + i, ko * _FP8_MM_BK + kk], "float32")  # type: ignore[name-defined]  # noqa: F821
-                A_shared[i, kk] = T.cast(a_val, "float16")  # type: ignore[name-defined]  # noqa: F821
+                A_shared[i, kk] = T.cast(A_fp8_local[i, kk], "float16")  # type: ignore[name-defined]  # noqa: F821
             for j, kk in T.Parallel(_FP8_MM_BN, _FP8_MM_BK):  # type: ignore[name-defined]  # noqa: F821
-                b_val = T.alloc_var("float32")  # type: ignore[name-defined]  # noqa: F821
-                b_val = T.cast(B_fp8[bx * _FP8_MM_BN + j, ko * _FP8_MM_BK + kk], "float32")  # type: ignore[name-defined]  # noqa: F821
-                B_shared[j, kk] = T.cast(b_val, "float16")  # type: ignore[name-defined]  # noqa: F821
+                B_shared[j, kk] = T.cast(B_fp8_local[j, kk], "float16")  # type: ignore[name-defined]  # noqa: F821
             T.gemm(A_shared, B_shared, C_frag, transpose_B=True)  # type: ignore[name-defined]  # noqa: F821
         sa = A_scale[0]
         sb = B_scale[0]

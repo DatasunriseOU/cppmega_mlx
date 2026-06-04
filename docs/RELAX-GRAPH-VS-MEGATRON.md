@@ -1233,6 +1233,90 @@ probes RAISE on any NaN/inf grad or gate miss.
 
 ---
 
+## §19. fp8 GEMM now RUNS on sm_121 — TE tensorwise is the REAL ~1.8× tensor-core win; our in-house CUDA e4m3 twin is correct but unoptimized (MEASURED, gb10 2026-06-04)
+
+§18 left the fp8 SPEED **unmeasured** (all three fp8 routes RAISED on sm_121). §19 closes that: the
+§18 "TE tensor-wise hits an NVRTC toolchain mismatch" blocker has CLEARED on this box, and we ported
+the in-house Metal dequant→half→`T.gemm` route to a `target="cuda"` fragment-C twin
+(`fp8_scaled_matmul_path_c_cuda_prim`, the F2-forward CUDA-sibling pattern). **Both fp8 routes now
+COMPILE and RUN on sm_121 with honest e4m3 parity** — the fp8 speed is finally MEASURED.
+
+**MEASURED per prod bs4 GEMM (M=16384, 20 iters, e4m3 vs bf16-cuBLAS over ALL elements):**
+
+| shape | M×N×K | bf16 TFLOPs | **R1 TE-tensorwise** (fp8 cuBLASLt) | **R2 in-house** (cuda dequant→`T.gemm`) | rel-err |
+|---|---|---|---|---|---|
+| mlp_up_gate | 16384×37888×3584 | 33.7 | **61.8 TFLOPs (1.83×)** | 7.1 TFLOPs (0.21×) | 0.0375 |
+| mlp_down | 16384×3584×18944 | 34.3 | **55.6 TFLOPs (1.62×)** | 6.2 TFLOPs (0.18×) | 0.0376 |
+| attn_qkv | 16384×10752×3584 | 33.5 | **59.2 TFLOPs (1.76×)** | 10.7 TFLOPs (0.32×) | 0.0375 |
+| attn_out | 16384×3584×3584 | 33.3 | **52.4 TFLOPs (1.58×)** | 14.1 TFLOPs (0.42×) | 0.0375 |
+
+bf16 re-confirms §18's 33–34 TFLOPs; operand byte-halving **2.0× MEASURED** on every shape (fp8 = 1
+byte, bf16 = 2). **e4m3 parity is HONEST and PASSES: rel-err 0.0375 on all four prod shapes** (vs the
+0.10 ceiling; squarely in the derived 0.04–0.08 e4m3 band; identical between R1 and R2 because both
+quantize the same operands to the same per-tensor e4m3, confirming neither is a secret bf16 — a bf16
+path would read ~0, garbage ~1.0).
+
+**The honest split — two distinct fp8 paths, only one is fast:**
+* **R1 TE-tensorwise** is a REAL fp8 *tensor-core* GEMM: TE `DelayedScaling(E4M3)` → cuBLASLt fp8
+  MMA on sm_121's regular FP8 Tensor Cores (NOT the FP4 tcgen05/TMEM path). **1.58–1.83× over bf16,
+  MEASURED** — this proves fp8 tensor cores exist and help on GB10. Only the MXFP8 *block-scaling*
+  recipe is upstream-blocked ("not supported on 12.0+"); per-tensor E4M3 works.
+* **R2 in-house** is the dequant→half→`T.gemm` route (route B): operands are genuinely `fp8_e4m3`
+  (native `fp8_e4_t`→`half_t` per-element decode in the emitted CUDA, verified in the kernel source),
+  giving the 2.0× byte-halving and honest 0.0375 parity — **but the MMA runs on the decoded fp16
+  values** (`tl::mma_sync<kFloat16,kFloat16,kFloat32,16,8,16>`), so it gets NO fp8-tensor-core
+  throughput, and on its **untuned 32×64×32 single-128-thread tile** (carried over from the Metal
+  32 KiB-smem cooperative selector, occupancy ≈1 warp-tile) it is **2–5× SLOWER than bf16 cuBLAS**.
+  The route is numerically correct and is the proven *memory* lever (fp8 storage); it is NOT yet a
+  speed lever — it needs a CUDA-native tile/occupancy tune (and, for compute speed, an fp8-input MMA
+  rather than dequant-to-fp16) to approach R1.
+
+**Two port edits were needed for R2 to run on CUDA (RULE #1, no fallback, fixes mirror the F2 twin):**
+(1) the Metal `T.alloc_var("float32")` decode scratch lowered to a non-assignable `float[1]` on
+codegen_cuda (`expression must be a modifiable lvalue`); replaced with a register-fragment stage
+(`T.copy` e4m3 global→fragment, then per-element `T.cast`→fp16) — keeps the native per-element decode,
+emits a valid CUDA lvalue. (2) the microbench fed the kernel a `.view(torch.uint8)` tensor but the
+prim's operand param is typed `float8_e4m3`; the tvm_ffi adapter SEGFAULTed on the dtype mismatch —
+fixed to pass the native `torch.float8_e4m3fn` (the 1-byte storage IS the halving regardless of the
+dtype tag).
+
+**GO/NO-GO (§19):** **GO** — a REAL fp8 e4m3 tensor-core GEMM RUNS on sm_121 with a MEASURED
+**~1.8× speedup** and honest 0.0375 parity (via TE tensorwise); the in-house CUDA e4m3 twin
+COMPILES + RUNS + passes parity (closing the §18 "Metal-only / UNRUNNABLE" gap) but is NOT yet fast
+(unoptimized tile + fp16-MMA, 0.18–0.42×). **Attribution is split and explicit:** the throughput win
+belongs to TE-cuBLASLt fp8, not to our in-house kernel; our kernel's contribution is the *memory*
+halving and a correct on-CUDA fp8 path that is the optimization target. The fp8 *memory* synergy
+stands (2.0× MEASURED): **bs4-fp8 ≈ 2× bs1-fp16 (= bs2-fp16) ≈ 12.8 GB @8L / ~26 GB @28L** — back to
+Megatron-class memory at 8L (vs naive bs4-fp16 ~25.6/52 GB).
+
+**EXTRAPOLATION (e2e, clearly labelled — IF the MLP/attn GEMMs run at the R1 ~1.7× mean fp8 speed):**
+the four transformer-block GEMMs at bs4 sum to bf16 ≈247 ms/step (132.1 + 64.8 + 37.6 + 12.7);
+at the measured ~1.7× they fall to ≈145 ms (a ~102 ms/step GEMM-time reduction). This is purely the
+transformer-block GEMM phase — **the SSD chunked scan is launch-bound and UNAFFECTED by fp8** (its
+cost is grid/launch, not GEMM FLOPs), so the §17 step-model tok/s headline does NOT move from the SSD
+side; fp8's e2e effect is confined to the transformer-block GEMM fraction of the step and is a
+memory-first win (fit bs4 in Megatron-class banks) more than a tok/s win on this SSD-dominated model.
+The in-house R2 route, AS-IS, would REGRESS the GEMM phase (slower than bf16) and so must NOT be wired
+into the e2e step until tile-tuned — wiring the 0.2–0.4× kernel in place of bf16 would be a forbidden
+silent regression (RULE #1).
+
+### Reproduce (§19)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+export PP=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python
+export TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib
+PYTHONPATH=$PP python scratch/fp8_gemm_microbench.py --prod --iters 20 --warmup 5
+# R1_te_tensorwise: real fp8 cuBLASLt MMA (1.58–1.83×); R2_tilelang_coop: in-house cuda e4m3
+# dequant→T.gemm (compiles+runs+parity 0.0375, but 0.18–0.42× — untuned tile, fp16-MMA).
+```
+Measured 2026-06-04 on gb10 `tvm.cuda(0)` sm_121. RULE #1: the fp8 numbers are real e4m3 (parity
+0.0375 over ALL elements proves it — not a bf16/garbage run); R2's slowness is reported as the honest
+measured negative, NOT masked, and R2 is NOT wired into the step (a 0.2–0.4× kernel replacing bf16
+would be a forbidden silent regression).
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L

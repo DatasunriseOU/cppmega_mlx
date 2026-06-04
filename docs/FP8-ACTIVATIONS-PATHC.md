@@ -1,6 +1,26 @@
 # FP8 ACTIVATIONS END-TO-END for the path_c pipeline (design + microbench spec)
 
-**Status: DESIGN (read-only round), 2026-06-04. Target: gb10 sm_121 (Grace-Blackwell, `tvm.cuda(0)`).**
+**§19 MEASURED UPDATE (gb10 sm_121, 2026-06-04) — fp8 GEMM now RUNS; the SPEED is MEASURED.**
+The §18 "fp8 UNRUNNABLE on sm_121" gap is CLOSED on two fronts. (1) **TE per-tensor E4M3
+(`DelayedScaling`, cuBLASLt fp8 MMA) is the REAL fp8 tensor-core win: 1.57–1.84× over bf16
+MEASURED** at the four prod bs4 GEMM shapes (52.1–61.8 fp8 TFLOPs vs 33.3–34.3 bf16), rel-err
+**0.0375 honest over ALL elements** (≤0.10 ceiling; only the MXFP8 *block-scaling* recipe stays
+upstream-blocked "not supported on 12.0+"; the per-tensor NVRTC-builtins loader gap is fixed by the
+committed self-healing `cppmega_mlx/_gb10_nvrtc_env.py`). (2) **Our in-house Metal dequant→half→
+`T.gemm` route is ported to a `target="cuda"` fragment-C twin** (`fp8_scaled_matmul_path_c_cuda_prim`)
+that COMPILES + RUNS + passes parity (0.0375, native `fp8_e4_t`→`half_t` decode verified in the
+emitted CUDA) — **but it is NOT yet fast (0.18–0.42×): its MMA runs on the decoded fp16 values
+(`mma_sync<kFloat16,…>`, not an fp8-input MMA) on an untuned 32×64×32 single-128-thread tile**, so it
+is the proven *memory* lever (2.0× operand-byte halving MEASURED) and the on-CUDA optimization target,
+NOT a speed lever as-is. Attribution is explicit: the throughput belongs to TE-cuBLASLt fp8; our
+kernel gives the memory halving + a correct on-CUDA fp8 path. Full numbers + reproduce: RELAX §19.
+(Two port edits were required: the Metal `T.alloc_var` decode scratch lowered to a non-assignable
+`float[1]` on codegen_cuda → replaced with a register-fragment stage; and the microbench must pass the
+native `torch.float8_e4m3fn` not a `.view(uint8)` reinterpret, which segfaults the tvm_ffi adapter.)
+
+---
+
+**Status: DESIGN (read-only round) + §19 MEASURED microbench, 2026-06-04. Target: gb10 sm_121 (Grace-Blackwell, `tvm.cuda(0)`).**
 This is Track 2 of the 3-lever Megatron-gap workflow (lever 1 = bs1→bs4; lever 2 = THIS doc, fp8
 activations end-to-end; lever 3 = B2 grid-restructure). It is the user's thesis verbatim: *"why hold
 bf16 activations at all if every kernel is fp8? that is BOTH speed (fp8 tensor cores) AND memory
@@ -22,11 +42,15 @@ any failure it RAISES with where+what — never an fp8→bf16 or bs4→bs1 silen
   (4 tokens × 1 byte = 2× of 1 token × 2 bytes). Concretely ~12.8 GB @8L / ~26 GB @28L for bs4-fp8
   vs the naive ~25.6/~52 GB bs4-fp16 — back to Megatron-class (~26 GB) at 8L. PROJECTION. (Correction
   per §18 adversarial verify: the earlier "bs4-fp8 ≈ bs1-fp16" headline was arithmetically wrong.)
-* **Speed (the de-risk target).** The dominant GEMMs at bs4 are the transformer-block MLP/attention
+* **Speed (NOW MEASURED, §19).** The dominant GEMMs at bs4 are the transformer-block MLP/attention
   GEMMs (M = bs·seq = 16384), NOT the SSD scan. On Blackwell these run on the **regular FP8 Tensor
-  Cores** (MXFP8 / per-tensor cuBLASLt e4m3), which — unlike the FP4 SR/RHT path — DO exist on
-  sm_121 (no tcgen05/TMEM dependency). The microbench measures the realized fp8-vs-bf16 TFLOPs at
-  those exact shapes before any rewrite.
+  Cores** (per-tensor cuBLASLt e4m3), which — unlike the FP4 SR/RHT path — DO exist on sm_121 (no
+  tcgen05/TMEM dependency): **MEASURED 1.57–1.84× over bf16** (TE `DelayedScaling` E4M3, 52.1–61.8
+  fp8 TFLOPs vs 33.3–34.3 bf16, rel-err 0.0375 ≤ 0.10). MXFP8 block-scaling stays upstream-blocked on
+  12.0+. Our in-house `target="cuda"` dequant→`T.gemm` twin RUNS + parity-passes (0.0375) but is
+  **0.18–0.42× as-is** (decoded-fp16 MMA on an untuned tile) — a memory lever (2.0× MEASURED) + the
+  optimization target, not yet a speed lever. (Was: "the microbench measures … before any rewrite" —
+  now measured; full table in RELAX §19.)
 * **Scaling recommendation.** Use **MXFP8 (E4M3, 32-element block / E8M0 scale) for ALL operands
   incl. activation gradients** as the primary recipe, with **per-tensor delayed-amax E4M3** (reusing
   `fp8_amax.py`) as the simpler fallback-FREE alternative for the in-house TileLang kernels that do
@@ -78,6 +102,13 @@ target for the SSD GEMMs that live inside our own grid kernels.
 | **LM-head / embedding, RMSNorm, residual adds, SwiGLU nonlinearity** | **bf16** (carrier) | small FLOPs, sensitive; not GEMMs; not worth fp8 (matches the nvfp4 route's `NVFP4_UNSUPPORTED_TRAINING_OPS` carve-out) |
 
 ### 2b. Scaling strategy — RECOMMENDATION: MXFP8 (E4M3, block-32) primary; per-tensor delayed-amax secondary
+
+> **§2b-status (MEASURED 2026-06-04, gb10 sm_121 / CC 12.1) — MXFP8 is UPSTREAM-BLOCKED here today; per-tensor delayed-amax (R1 tensorwise) is the route that RUNS.**
+> The MXFP8 "primary" recommendation below is the *target* recipe for Blackwell, but it does **not** run on gb10 (GB10, sm_121) this round, and we do **not** fake it (RULE #1). NVIDIA TransformerEngine's own Python gate `transformer_engine/pytorch/quantization.py::_compute_mxfp8_support()` (line 69) hard-raises `"MXFP8 (for all gemm layouts) is not supported on 12.0+ architectures yet."` for compute capability ≥ (12,0). Root cause (TE tech lead *ptrendx*, issue [#2668](https://github.com/NVIDIA/TransformerEngine/issues/2668), 2026-02-11): cuBLAS lacks the **non-TN GEMM layouts** MXFP8 backward needs on SM120/SM121 — a cuBLAS gap, **not** hardware/CUTLASS and **not** our code. The fix, PR [#3050](https://github.com/NVIDIA/TransformerEngine/pull/3050) (still an **OPEN DRAFT** as of 2026-05-29, complemented by PR [#2833](https://github.com/NVIDIA/TransformerEngine/pull/2833)), relaxes the gate **only** when `tex.get_cublasLt_version() >= 130600` (**cuBLASLt 13.6.0.2**) — and that cuBLASLt does **not exist anywhere yet** (PyPI max + box max are both 13.5.1.27 = `130501 < 130600`). So even a perfect cherry-pick of #3050 today would still `fail-closed` (`is_mxfp8_available()` → False), which is correct: forcing the gate lower would silently miscompute the MXFP8 backward (a RULE #1 violation). **VERDICT: MXFP8 on sm_121 is genuinely upstream-blocked on (a) an unmerged draft PR and (b) an unreleased cuBLASLt 13.6.0.2 dependency. Recorded as a measured FAIL, never silently degraded to bf16 or tensorwise.**
+>
+> **Forward plan (when NVIDIA ships cuBLASLt 13.6.0.2):** `pip install 'nvidia-cublas>=13.6.0.2'` into `cppmega-venv`, then update `/home/dave/TransformerEngine` to a SHA carrying BOTH PR #2833 and PR #3050 once merged (or cherry-pick `git fetch origin pull/2833/head:pr2833 && pull/3050/head:pr3050` onto a throwaway branch off local `main`, rebuild with `NVTE_CUDA_ARCHS=121a pip install -e . --no-build-isolation`). Expect conflicts: the installed TE is a fork-tainted build (HEAD `8d1d79bf`, v2.16.0.dev0, jewelmusicee remote + local cppmega MXFP8 transpose commits, 31 behind origin) — merge origin/main first. Re-verify forward **and** backward numerically before labeling the route fp8-pass; the drafts are unfinished ("TODO: code/git history clean up", tests box unchecked).
+>
+> **What runs on gb10 today:** **R1 tensorwise** (per-tensor Float8 delayed-amax, the "secondary" below) — TE supports it on sm_121 (NVIDIA forum: "FP8 with delayed scaling works correctly on these architectures as a workaround"); its only blocker was the NVRTC `libnvrtc-builtins.so.13.3` loader path, now fixed durably (system `ldconfig` cache + the committed `cppmega_mlx/_gb10_nvrtc_env.py` re-exec guard + the run-command `LD_LIBRARY_PATH` prefix). And **R2** (our CUDA `T.gemm` e4m3 dequant twin). §19 MEASURED: R1 tensorwise = real fp8 cuBLASLt MMA, 1.58–1.83× over bf16, rel_err 0.0375; R2 compiles+runs+parity 0.0375 but 0.18–0.42× (untuned tile + fp16-MMA).
 
 * **Primary: MXFP8 block-32 E4M3 (E8M0 power-of-2 scale).** On Blackwell this is the native recipe.
   Decisive grounding from the 2025 literature + NVIDIA docs: **E4M3 for ALL tensors including

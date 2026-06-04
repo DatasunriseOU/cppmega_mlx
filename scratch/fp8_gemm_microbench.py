@@ -26,9 +26,24 @@ polling gb10 IDLE + free>105GB. It RAISES on NaN/Inf (no degraded path).
 
 Run on gb10:
   ssh gb10; cd /home/dave/source/cppmega_mlx
+  LD_LIBRARY_PATH=/usr/local/cuda-13.3/targets/sbsa-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
   PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
   TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
   /home/dave/cppmega-venv/bin/python scratch/fp8_gemm_microbench.py --prod
+
+The LD_LIBRARY_PATH prefix puts the CUDA 13.3 libnvrtc-builtins.so.13.3 (which
+TransformerEngine's NVRTC dlopen's at JIT-compile time) on the loader path; the
+R1 tensorwise (Float8 delayed-scaling) route fails on gb10 sm_121 WITHOUT it
+("failed to open libnvrtc-builtins.so.13.3"). main() ALSO calls
+``ensure_nvrtc_builtins_path()`` (cppmega_mlx._gb10_nvrtc_env), which re-execs
+with the corrected LD_LIBRARY_PATH if the prefix above was forgotten — so the
+route works even if a future operator copies an old command without it (RULE #1:
+the loader-path fix is committed/self-healing, not a transient one-shell export).
+
+(§19 MEASURED: R1 te_tensorwise = real fp8 cuBLASLt MMA, 1.58-1.83x over bf16,
+rel_err 0.0375; R2 in-house cuda e4m3 dequant->T.gemm compiles+runs+parity 0.0375
+but 0.18-0.42x — untuned tile + fp16-MMA. R1 MXFP8 stays UPSTREAM-BLOCKED on
+sm_121: "not supported on 12.0+ architectures yet".)
 
 Flags:
   --prod        prod local_gb10_quarter shapes (hidden=3584 ffn=18944 bs=4 seq=4096)
@@ -177,6 +192,20 @@ def run_te_fp8(shape: GemmShape, ref_out, a_bf16, w_bf16, *, iters: int, warmup:
 
     try:
         if recipe_kind == "mxfp8":
+            # UPSTREAM-BLOCKED on gb10 sm_121 (CC 12.1), NOT a fixable gap this
+            # round. te.fp8_autocast(MXFP8BlockScaling) RAISES inside NVIDIA TE's
+            # own gate transformer_engine/pytorch/quantization.py
+            # _compute_mxfp8_support() (line 69): "MXFP8 (for all gemm layouts) is
+            # not supported on 12.0+ architectures yet." Root cause (TE lead
+            # ptrendx, issue #2668): cuBLAS lacks non-TN GEMM layouts for MXFP8
+            # backward on SM120/SM121. The fix (PR #3050, OPEN DRAFT) needs
+            # cuBLASLt >= 13.6.0.2 which is UNRELEASED (PyPI/box max = 13.5.1.27),
+            # so even cherry-picking it would still fail-closed. We do NOT lower
+            # the gate to force-enable (RULE #1: that would silently miscompute the
+            # backward pass). This route is EXPECTED to record ran=False with the
+            # exact TE message below — an honest measured FAIL, never degraded to
+            # bf16 or to the tensorwise recipe. See docs/FP8-ACTIVATIONS-PATHC.md
+            # §2b-status. Use R1 tensorwise (NVRTC-unblocked) or R2 cuda instead.
             fp8_recipe = te_recipe.MXFP8BlockScaling()
         elif recipe_kind == "tensorwise":
             fp8_recipe = te_recipe.DelayedScaling(
@@ -214,21 +243,34 @@ def run_te_fp8(shape: GemmShape, ref_out, a_bf16, w_bf16, *, iters: int, warmup:
 # R2 — our cppmega_mlx fp8 cooperative T.gemm (CUDA fragment-C twin on gb10)
 # -----------------------------------------------------------------------------
 def _quantize_pertensor_fp8(t):
-    """Per-tensor amax -> e4m3 (uint8 storage) + fp32 dequant scale, via fp8_amax.
+    """Per-tensor amax -> e4m3 + fp32 dequant scale, via fp8_amax.
 
     Reuses fp8_pack_tilelang (the CUDA-ready per-tensor amax + RNE e4m3 cast);
-    returns (fp8_u8, scale_f32_scalar) where ``scale = amax/448`` is the
+    returns (fp8_e4m3fn, scale_f32_scalar) where ``scale = amax/448`` is the
     post-gemm dequant multiplier. RAISES on non-finite amax (fp8_pack_tilelang).
+
+    The CUDA prim's operand param is typed ``float8_e4m3`` (KernelParam dtype),
+    and the tvm_ffi dispatch adapter validates the input dtype against that —
+    so the kernel must receive the native ``torch.float8_e4m3fn`` tensor, NOT a
+    ``.view(torch.uint8)`` reinterpret (passing uint8 segfaults the adapter on
+    the e4m3-vs-uint8 dtype mismatch). The 1-byte e4m3 storage IS the 2.0x
+    operand-byte halving regardless of the python-visible dtype tag.
     """
     import torch
 
     from cppmega_mlx.nn._tilelang.fp8_amax import fp8_pack_tilelang
 
     fp8_e4m3, scale, _orig_dtype = fp8_pack_tilelang(t)
-    # The cooperative kernel consumes the e4m3 *bytes* as uint8 storage.
-    fp8_u8 = fp8_e4m3.view(torch.uint8).contiguous()
+    if fp8_e4m3.dtype is not torch.float8_e4m3fn:
+        raise TypeError(
+            "fp8_gemm_microbench._quantize_pertensor_fp8: fp8_pack_tilelang did "
+            f"not return float8_e4m3fn (got {fp8_e4m3.dtype}); the CUDA prim's "
+            "float8_e4m3 operand param requires the native e4m3 dtype (RULE #1: "
+            "no silent dtype reinterpret)."
+        )
+    fp8_e4m3 = fp8_e4m3.contiguous()
     scale_buf = scale.reshape(1).to(dtype=torch.float32, device=t.device)
-    return fp8_u8, scale_buf
+    return fp8_e4m3, scale_buf
 
 
 def run_tilelang_fp8(shape: GemmShape, ref_out, a_bf16, w_bf16, *,
@@ -507,6 +549,16 @@ def _emit_json(results: list[ShapeResult]) -> None:
 
 
 def main() -> int:
+    # gb10 NVRTC loader-path guard FIRST, before any torch / TE import in run().
+    # On gb10 (sm_121) this ensures /usr/local/cuda-13.3/targets/sbsa-linux/lib is
+    # on the STARTUP LD_LIBRARY_PATH (re-execing once if needed) so TE's NVRTC can
+    # dlopen libnvrtc-builtins.so.13.3 — the R1 tensorwise route's only loader
+    # blocker. No-op (returns "noop-not-gb10") on a Mac/M4 dev box. RULE #1: it
+    # RAISES if it cannot persist the path, never silently relies on a shell var.
+    from cppmega_mlx._gb10_nvrtc_env import ensure_nvrtc_builtins_path
+
+    ensure_nvrtc_builtins_path()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--prod", action="store_true",
                     help="prod local_gb10_quarter shapes (the only supported mode)")
