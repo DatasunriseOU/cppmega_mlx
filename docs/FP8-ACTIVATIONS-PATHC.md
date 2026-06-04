@@ -17,9 +17,11 @@ any failure it RAISES with where+what — never an fp8→bf16 or bs4→bs1 silen
 
 * **Memory (the certain win).** Holding the path_c activation banks in fp8 (1 byte) instead of fp16
   (2 bytes) HALVES the activation-cache footprint. The §17 device-peak is 6.400 GB @8L / 12.998 GB
-  @28L; the activation-cache portion drops ~2×. Cross-track synergy: **bs4-in-fp8 ≈ bs1-in-fp16
-  memory**, so lever 1's 4× token count is repaid by lever 2's 2× halving (net ≈2× over bs1-fp16,
-  i.e. ~12.8 GB @8L / ~26 GB @28L for bs4-fp8 vs the naive ~25.6/~52 GB bs4-fp16). PROJECTION.
+  @28L; the activation-cache portion drops ~2×. Cross-track synergy: fp8 repays HALF of lever 1's
+  4× token cost — **bs4-in-fp8 ≈ 2× bs1-in-fp16 (i.e. ≈ bs2-in-fp16) memory**, NOT ≈ bs1-in-fp16
+  (4 tokens × 1 byte = 2× of 1 token × 2 bytes). Concretely ~12.8 GB @8L / ~26 GB @28L for bs4-fp8
+  vs the naive ~25.6/~52 GB bs4-fp16 — back to Megatron-class (~26 GB) at 8L. PROJECTION. (Correction
+  per §18 adversarial verify: the earlier "bs4-fp8 ≈ bs1-fp16" headline was arithmetically wrong.)
 * **Speed (the de-risk target).** The dominant GEMMs at bs4 are the transformer-block MLP/attention
   GEMMs (M = bs·seq = 16384), NOT the SSD scan. On Blackwell these run on the **regular FP8 Tensor
   Cores** (MXFP8 / per-tensor cuBLASLt e4m3), which — unlike the FP4 SR/RHT path — DO exist on
