@@ -42,7 +42,7 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
 | **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; the gridded SSD scan §15 reuses the same banks → peak UNCHANGED; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
 | **fits Megatron-class memory** | **YES — 13.0 GB planned 28L < 26 GB (2x under)** | 26 GB |
-| **tok/s** | **§17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. §18 RE-MEASURED the 3 gap levers: bs4 fwd MEASURED+PASS but tok/s batch-invariant (saturated kernels, gap unchanged ≈3.75×/≈11.4×), bs4 bwd memory-NO-GO (gold harness OOM), fp8 UNRUNNABLE on sm_121 (byte-halving 2.0× MEASURED, speed UNMEASURED), B2 v2 NO-GO (0.997×/1.001×) — §17 headline holds. Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
+| **tok/s** | **§17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. §18 RE-MEASURED the 3 gap levers: bs4 fwd MEASURED+PASS but tok/s batch-invariant (saturated kernels, gap unchanged ≈3.75×/≈11.4×), bs4 bwd memory-NO-GO (gold harness OOM), fp8 UNRUNNABLE on sm_121 (byte-halving 2.0× MEASURED, speed UNMEASURED), B2 v2 NO-GO (0.997×/1.001×) — §17 headline holds. §21 RE-MEASURED the fp8 levers on the unblocked sm_121: our OWN native fp8-input e4m3 MMA is now VERIFIED real (kFloat8_e4m3 m16n8k32, 0 fp16) and 2.2–3.5× faster than the old fp16-decode but still 0.69–0.95× bf16 (untuned tile → speed NO-GO); TE standalone fp8 GEMM stays the only ~1.7× win; wiring TE fp8 into the e2e step is a memory-NO-GO (fp8 backward OOMs at the MLX↔torch cudaMallocAsync bridge, reproduced to seq=512) — so §17's ≈907/≈298 stays the canonical step number, fp8 e2e tok/s UNMEASURED. Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
 | tok/s ratio vs Megatron | **≈0.27x (8L) / ≈0.088x (28L) with §17 (gridded fwd + gridded bwd) — i.e. ≈3.75x–11.4x slower** (was 75x–289x @ §14, 114x–654x @ §13) | 1.0x |
 | what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti recompute cache (§14) + GRIDDED CUDA SSD chunked scan replacing the serial MR mamba recurrence (§15, F2 0.980 ms vs serial 6.56 s)** + abstract numpy bwd/adam/loss (lever 4, now the dominant remaining term) | tuned fused-FP8-CUDA kernels + selective recompute |
 
@@ -1387,6 +1387,128 @@ Measured 2026-06-04 on gb10 `tvm.cuda(0)` sm_121, single exclusive run, gb10 lef
 
 ---
 
+## §21. FOUR LEVERS RE-MEASURED — cleanup done, NATIVE fp8-input MMA is now REAL (2.2–3.5× over the old fp16-decode but still <1× bf16), R1-e2e fp8 backward is a memory-NO-GO (MLX↔torch cudaMallocAsync contention) (MEASURED, gb10 sm_121, 2026-06-04)
+
+This round spent four levers as the sole exclusive gb10 owner (serial discipline, drop_caches between
+runs, box left idle). Headline: **the R2 native fp8-input MMA now compiles, runs, and is VERIFIED a real
+e4m3 tensor-core MMA** (not the fp16-decode relabel) — a 2.2–3.5× lift over the §19/§20 fp16-decode R2 —
+**but it is still below bf16** (untuned single-tile), so it is a real-fp8-MMA GO and a speed NO-GO. **The
+R1 standalone fp8 GEMM stays the only measured ~1.7× win**, and **wiring it into the e2e step is a
+memory-NO-GO**: the fp8 backward OOMs at the MLX→torch zero-copy bridge from MLX/torch `cudaMallocAsync`
+unified-memory contention (reproduced down to seq=512, no optimizer). The cleanup freed 14.88 GB.
+
+### Lever 3 — CLEANUP (done, non-GPU)
+`scratch/gb10_cleanup_and_e2e.sh` cleanup portion (re-verify-then-remove, `sudo -n` available at execute
+time, live `/usr/local/cuda` + `/usr/local/cuda-13` both → cuda-13.3 so the removals are NOT the live
+target): **REMOVED `/home/dave/venv_unsloth` (5.53 GB) + `/usr/local/cuda-13.0` (4.63 GB) +
+`/usr/local/cuda-13.1` (4.72 GB) + the two dangling `gds-13-0/13-1.conf` ldconfig confs, ldconfig
+refreshed — freed 14.88 GB total, `had_skip=0`**. **KEPT** cuda-13.2 (pip cu132 target), cuda-13.3 (NVRTC
+builtins, `libnvrtc-builtins.so.13.3 → .33` verified present after), cppmega-venv. Disk 672→657 GB used.
+`RESULT_CLEANUP freed_total_gb=14.88 kept=cuda-13.2,cuda-13.3,cppmega-venv`.
+
+### Lever 1 — R2 NATIVE fp8-input MMA (the SPEED-lever target): a REAL fp8 MMA now, but still <1× bf16
+`scratch/fp8_gemm_microbench.py --prod --iters 20 --warmup 5` runs THREE fp8 routes side-by-side. The
+new `R2_native_fp8mma` (`fp8_scaled_matmul_path_c_cuda_native_prim`, e4m3 shared operands fed straight
+into `T.gemm`) is the A/B counterpart to the §19/§20 `R2_tilelang_coop` (fp16-decode).
+
+**VERIFY gate (RULE #1 — is it REAL fp8-input, not fp16 relabeled?): PASS.** The generated CUDA for the
+native prim emits
+```
+tl::mma_sync<tl::DataType::kFloat8_e4m3, tl::DataType::kFloat8_e4m3, tl::DataType::kFloat32, 16, 8, 32, false, true>(...)
+```
+i.e. **both operands `kFloat8_e4m3`, accumulator `kFloat32`, shape `16,8,32` = the native SM120 m16n8k32
+f8f6f4 atom** — `kFloat16` count = **0**, `__nv_fp8`-decode count = **0**, `fp8_e4` ×12. This is a genuine
+fp8-input tensor-core MMA with zero fp16 decode, fp32 accumulate. Confirmed on the live sm_121 GPU.
+
+**MEASURED per prod bs4 GEMM (M=16384, 20 iters, e4m3 vs bf16-cuBLAS over ALL elements):**
+
+| shape | M×N×K | bf16 | **R2_native_fp8mma (NEW)** | R2_coop (fp16-decode, §20) | native-vs-coop | rel-err |
+|---|---|---:|---|---|---:|---:|
+| mlp_up_gate | 16384×37888×3584 | 33.7 | **23.4 TFLOPs (0.69×)** | 7.4 (0.22×) | **3.16×** | 0.0376 |
+| mlp_down | 16384×3584×18944 | 34.3 | **25.2 TFLOPs (0.73×)** | 7.2 (0.21×) | **3.50×** | 0.0376 |
+| attn_qkv | 16384×10752×3584 | 33.5 | **23.6 TFLOPs (0.70×)** | 10.6 (0.32×) | **2.23×** | 0.0376 |
+| attn_out | 16384×3584×3584 | 33.3 | **31.6 TFLOPs (0.95×)** | 14.1 (0.42×) | **2.24×** | 0.0376 |
+
+**GO/NO-GO (R2): real-fp8-MMA = GO, speed-vs-bf16 = NO-GO (still).** The native prim is now a verified
+real fp8-input MMA (the lever's primary feasibility claim — PROVEN) and lifts the memory-lever 2.2–3.5×
+over the fp16-decode twin at identical 0.0376 parity, but at **0.69–0.95× of bf16 it is still slower than
+bf16** because the tile is the untuned single 16×32×32 / 64-thread tile (one m16n8 fragment, low
+occupancy). Wiring a <1× kernel in place of bf16 would be a forbidden silent regression (RULE #1), so it
+stays out of the e2e step. The path to >1× is tile-tuning + multi-warp occupancy (scoped future work);
+the hard part — emitting a native e4m3 MMA on sm_121 from our own T.gemm — is now done.
+
+### Lever 2 / 1b — R1 MXFP8 bypass: still upstream-blocked (honest, not our defect)
+`R1_te_mxfp8` again RECORDS `ran=False` with the exact TE message *"MXFP8 (for all gemm layouts) is not
+supported on 12.0+ architectures yet"* (NVIDIA TE `_compute_mxfp8_support()` hard-gates CC≥12.0; fix
+PR #3050 needs cuBLASLt≥13.6.0.2, unreleased, box max 13.5.1.27). No gate was lowered (would silently
+miscompute the non-TN MXFP8 backward — RULE #1). A CUTLASS-Blackwell mxfp8 bypass that sidesteps cuBLAS
+remains the only untried route and is NOT integrated here; recorded as a documented upstream block.
+
+### Lever — R1 e2e WIRING (`scripts/bench_fp8_e2e_step_20260604.py`, `CPPMEGA_FP8_LINEAR`): bf16 ran, fp8 = memory-NO-GO
+The harness A/B's the SAME `local_gb10_quarter` (13-layer, pattern `AEMEAEMEAEMR`) MLX model fwd+bwd
+(+AdamW) with the TE DelayedScaling(E4M3) fp8 GEMM wired into attention q/k/v/out + MoE gate/up/down
+(`maybe_fp8_linear_call`, zero-copy MLX↔torch bridge, persistent per-site `te.Linear` amax history).
+
+* **bf16 arm — RAN (MEASURED):** seq=1024 bs1, optimizer ON, `MLX_CUDA_GRAPH_CACHE_SIZE=2000`:
+  **74.26 s/step, 13.8 tok/s, MLX peak 37.58 GB, final_loss 6.71985** (`torch_cuda_peak=0` — pure MLX, no
+  torch GEMM in the bf16 arm). NOTE: this is the **raw MLX-eager** step (every op an MLX graph node), NOT
+  the optimized pr6 graph-path runner — it is far slower than the §17 device-resident gridded step and is
+  used here ONLY as the fp8 A/B baseline, not as a tok/s claim against Megatron.
+* **fp8 arm — OOM, memory-NO-GO (RAISED per RULE #1, NOT degraded):** at seq=4096 (cache-thrash at the
+  default 400-graph cache, then OOM at the larger cache), at seq=1024 (OOM at 114 GB), and — reproduced at
+  the **absolute minimum** seq=512, NO optimizer, MLX cap 30 GB (88 GB torch headroom) — the fp8 path gets
+  through the forward and RAISES in the **fp8 BACKWARD** at the bridge:
+  `fp8_te_linear: MLX->torch zero-copy bridge failed for the fp8 backward (..., 3584, 1024):
+   _cuda_zerocopy: torch.from_dlpack rejected the MLX native kDLCUDA export (..., shape=(512,3584)):
+   cudaMallocAsync(&data, size, stream) failed: out of memory` (box at 117 GB).
+  **Root cause (fully attributed):** the shape (512,3584) is tiny, so this is NOT an activation-size OOM —
+  it is **MLX↔torch `cudaMallocAsync` unified-memory contention** on the single GB10 device. MLX's
+  stream-ordered pool reserves unified memory and does not release it for torch's competing
+  `cudaMallocAsync` during the fp8 backward; the COMBINED MLX+torch working set deadlocks the budget
+  regardless of seq/optimizer/cap. Per RULE #1 the fp8 GEMM RAISED with where+what at the bridge — it did
+  **NOT** silently fall back to bf16. This is a hard **memory-NO-GO for the fp8 e2e arm AS WIRED** on this
+  box (dual MLX+torch CUDA residency on unified memory). The realized e2e fp8-vs-bf16 step speedup is
+  therefore **UNMEASURED** (the fp8 step never completed); the standalone fp8 GEMM win (R1 ~1.7×, §19/§20)
+  is real but the e2e-step folding is blocked by the allocator coexistence, not by the GEMM.
+
+### THE REAL e2e vs MEGATRON (honest decomposition)
+The fp8 e2e step did not complete (above), so there is **no new measured fp8 e2e tok/s to put against
+Megatron's 3399** this round. The canonical step result remains **§17 (≈907 tok/s @8L / ≈298 @28L, gap
+≈3.75×/≈11.4×, 6.4/13.0 GB)** on the device-resident gridded path. Even had the fp8 arm run, the honest
+ceiling is bounded: fp8 helps ONLY the transformer-block GEMM fraction + memory — **the SSD scan is
+launch-bound (§15/§18) and fp8 does NOT touch it** — and at §17 the forward GEMMs are ~2% of the step
+while the backward dominates (79.6%@8L / 91.4%@28L). So the fp8 e2e upside is the GEMM-phase speedup
+(standalone ~1.7×, applied to a small step fraction) + the operand byte-halving (2.0× MEASURED), NOT a
+step-level catch-up to Megatron. Self-check vs §17/§19: consistent — §19's 1.57–1.83× standalone GEMM win
+stands; §21 adds that (a) our OWN native fp8 MMA is now real but sub-bf16, and (b) the TE fp8 e2e wiring
+is memory-blocked by MLX↔torch allocator coexistence, so the §17 GO is still the canonical step number.
+
+### GO/NO-GO per lever (§21)
+| lever | result | GO/NO-GO |
+|---|---|---|
+| 3 — cleanup | freed 14.88 GB (venv_unsloth + cuda-13.0/13.1 + gds confs), kept cuda-13.2/13.3 + venv | **GO** |
+| 1 — R2 native fp8-input MMA | VERIFIED real e4m3 MMA (kFloat8_e4m3 m16n8k32, 0 fp16); 0.69–0.95× bf16, 2.2–3.5× over fp16-decode, parity 0.0376 | **GO as real fp8 MMA; NO-GO as speed (still <bf16, untuned tile)** |
+| 1b — MXFP8 bypass | TE gate still hard-blocks CC≥12.0 (PR#3050 needs unreleased cuBLASLt 13.6); CUTLASS bypass not integrated | **NO-GO (upstream block, documented)** |
+| R1 e2e wiring | bf16 arm ran (74.26 s/step, 13.8 tok/s, 37.58 GB); fp8 arm OOMs in the fp8 backward (MLX↔torch cudaMallocAsync contention), RAISED not degraded | **bf16 GO; fp8 e2e NO-GO (memory, as wired)** |
+
+### Reproduce (§21)
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+# cleanup (already done; idempotent re-verify): SKIP_E2E=1 bash scratch/gb10_cleanup_and_e2e.sh
+# R2 native fp8 MMA + R1 standalone (3 routes side-by-side):
+LD_LIBRARY_PATH=/usr/local/cuda-13.3/targets/sbsa-linux/lib:$LD_LIBRARY_PATH \
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/fp8_gemm_microbench.py --prod --iters 20 --warmup 5
+#   R2_native_fp8mma: 0.69–0.95× bf16, 2.2–3.5× over R2_coop; CUDA emits tl::mma_sync<kFloat8_e4m3,...,16,8,32>.
+# R1 e2e A/B (bf16 ran; fp8 OOMs in the fp8 backward — memory-NO-GO, RAISES):
+MLX_CUDA_GRAPH_CACHE_SIZE=2000 CPPMEGA_MLX_MEMORY_LIMIT_GB=90 ... bench_fp8_e2e_step_20260604.py --batch 1 --seq 1024 --steps 4 --warmup 2 --optimizer --arm both
+```
+Measured 2026-06-04 on gb10 `tvm.cuda(0)` sm_121, single exclusive owner, serial runs with drop_caches
+between, gb10 left idle (0% util, >115 GB free).
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L
@@ -1469,3 +1591,30 @@ GO (≈907/≈298 tok/s, ≈3.75×/≈11.4×) is the canonical MEASURED result a
 integrity note: §18's box ran the backward ~3× slower than §17 uniformly across the byte-identical
 B0/B1, a box steady-state effect — §17's 334.6 ms is NOT revised; the valid §18 datum is the
 in-process v1-vs-v2 ratio.)
+
+**§21 re-measured the fp8 levers on the now-unblocked sm_121 (NVRTC fixed) and cleaned the box — one
+real-MMA breakthrough, one memory wall, no step-level catch-up.** Cleanup freed **14.88 GB**
+(`venv_unsloth` 5.53 + `cuda-13.0` 4.63 + `cuda-13.1` 4.72 + dangling gds confs), keeping
+cuda-13.2/13.3 + the venv. The **R2 native fp8-input e4m3 MMA now compiles, runs, and is VERIFIED a real
+fp8 tensor-core MMA** — the generated CUDA emits `tl::mma_sync<kFloat8_e4m3,kFloat8_e4m3,kFloat32,16,8,32>`
+(zero `kFloat16`, zero `__nv_fp8`-decode, the native SM120 m16n8k32 f8f6f4 atom), fp32 accumulate, parity
+0.0376. It is **2.2–3.5× faster than the §19/§20 fp16-decode R2** (23.4/25.2/23.6/31.6 vs 7.4/7.2/10.6/14.1
+TFLOPs) — the lever's hard part (emitting a native e4m3 MMA from our own `T.gemm` on sm_121) is **DONE** —
+**but at 0.69–0.95× of bf16 it is still slower than bf16** (untuned single 16×32×32 / 64-thread tile, low
+occupancy), so it is a **real-fp8-MMA GO and a speed NO-GO**; a <1× kernel will not replace bf16 (RULE #1).
+The **R1 standalone TE DelayedScaling(E4M3) GEMM stays the only measured ~1.7× win** (1.57–1.83×, §19/§20).
+**Wiring R1 into the e2e step is a memory-NO-GO:** the new `bench_fp8_e2e_step_20260604.py` A/B ran the
+**bf16 arm (MEASURED: 74.26 s/step, 13.8 tok/s, 37.58 GB MLX peak, seq=1024 bs1 13-layer, raw MLX-eager —
+not the §17 graph-path)**, but the **fp8 arm RAISED in the fp8 BACKWARD** at the MLX→torch zero-copy bridge
+with `cudaMallocAsync ... out of memory` — reproduced down to the absolute minimum (seq=512, NO optimizer,
+30 GB MLX cap, 88 GB torch headroom), so it is **NOT** an activation-size OOM but **MLX↔torch
+`cudaMallocAsync` unified-memory contention** on the single GB10 (MLX's pool reserves unified memory and
+won't yield it to torch's competing alloc during the fp8 backward). Per RULE #1 the fp8 GEMM RAISED with
+where+what — it did **NOT** silently degrade to bf16 — so the realized fp8 e2e step speedup is **UNMEASURED**
+(blocked by allocator coexistence, not by the GEMM). Honest e2e-vs-Megatron: with the fp8 step blocked,
+**§17's ≈907/≈298 tok/s (gap ≈3.75×/≈11.4×) remains the canonical step result**; even unblocked, fp8 helps
+only the transformer-block GEMM fraction + memory (the SSD scan is launch-bound and fp8 does NOT touch it,
+and at §17 the GEMMs are ~2% of the step vs the backward's ~80–91%), so fp8 is a memory + GEMM-phase lever,
+not a step-level catch-up to Megatron. Net: the box is cleaner, our own native fp8 MMA is real (and the
+tuning target is now occupancy, not feasibility), and the TE-fp8 e2e path needs an MLX/torch allocator
+co-residency fix (shared pool / unified allocator) before it can be measured end-to-end on this box.
