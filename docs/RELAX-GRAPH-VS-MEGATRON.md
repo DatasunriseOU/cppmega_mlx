@@ -1,17 +1,25 @@
 # Relax graph-path train_step vs Megatron — measured tok/s + peak memory (gb10 CUDA)
 
-**Status: MEASURED, 2026-06-04, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §17 —
-the gridded CUDA SSD chunked-BACKWARD is now a GO. The §16 NO-GO was two MEASURED counts; §17
-CLEARS both. A NEW CUDA-only `chunk_scan_combine_bwd_cuda_prim` re-grids B2's two lane-0 funnels
-(dC_diag + dseg) across all 128 threads via a shared `DYX[L,L]` recompute-killer tile: B2
-**2484 → 334.6 ms/call (7.42×)**, chain **2601 → 447.8 ms (5.81×)**, now **1.018× FASTER than the
-456 ms numpy backward** it replaces (the §16 regression is reversed). dD parity **1.40e-3 → 2.48e-5**
-(an INPUT-PRECISION fix: the gold now differentiates the SAME fp16 forward cache the kernel reads —
-no gate loosen, no element subset) — **ALL 8 grads pass the 1e-3 gate**. Substituting the MEASURED
-chain: **≈907 tok/s @8L / ≈298 @28L, gap ≈3.75×/≈11.4×** (was §16 188/55 @ 18×/61×). The Metal
-prim stays byte-identical; B0/B1 untouched. Memory UNCHANGED (6.400/12.998 GB). The §15 forward win
-stands; the backward is now device-resident at no throughput cost. (A shared-LMAT exp2-precompute
-was MEASURED to regress B2 — occupancy-bound — and reverted: an honest measured negative.)**
+**Status: MEASURED, 2026-06-04, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §18 —
+the THREE named Megatron-gap levers (4× batch / fp8 activations / B2 v2 dstate-split) RE-MEASURED:
+ALL THREE land as NO-GO-for-throughput, the §17 ≈907/≈298 tok/s GO stands unchanged. (1) bs4
+FORWARD is MEASURED + parity-PASS (chain 7.231→≈29.59 ms, 4.09× — exactly 4× grid, batch reaches the
+launch grid) but **tok/s is batch-invariant** (the SSD kernels were already occupancy-saturated at
+bs1, so 4× tokens cost ~4× time → NO utilization gain, gap stays ≈3.75×/≈11.4×); the bs4 BACKWARD
+probe is a **memory-NO-GO** — its torch-autograd gold reference OOMs the box (≈110 GB > 100 GB
+budget, SIGTERMed), the kernels themselves never being the limit; bs4 device-peak ≈25.6/52 GB fp16
+(28L now 2× OVER Megatron's 26 GB). (2) FP8 GEMMs are **UNRUNNABLE on sm_121** — TE MXFP8 RAISES
+"not supported on 12.0+ architectures", TE tensor-wise RAISES NVRTC failure, our coop fp8 T.gemm is
+Metal-only; bf16 baselines MEASURED (33–34 TFLOPs at prod shapes), operand byte-halving **2.0×
+MEASURED** (the memory synergy is real; the fp8 SPEED is UNMEASURED — a CUDA fp8 emission is the
+path forward). (3) B2 v2 dstate-split is a **NO-GO** — measured in-process v1-vs-v2 = **0.997×/1.001×
+(zero speedup)**, math-equivalent (dD 5.25e-6, others bit-identical); B2 stays v1, contingent
+≈1480/≈560 not achieved. (Today's box ran the backward ~3× slower than §17 uniformly across the
+byte-identical B0/B1 too — a box-state effect, NOT a code regression; §17's 334.6 ms canonical
+number is NOT revised.) Prior: §17 — the gridded CUDA SSD chunked-BACKWARD is a GO (B2
+**2484 → 334.6 ms/call (7.42×)**, chain **2601 → 447.8 ms (5.81×)**, 1.018× faster than the 456 ms
+numpy backward; dD **1.40e-3 → 2.48e-5**; ALL 8 grads pass the 1e-3 gate → **≈907 tok/s @8L /
+≈298 @28L, gap ≈3.75×/≈11.4×**), Metal prim byte-identical, memory UNCHANGED (6.400/12.998 GB).**
 This is the profiling phase of the Relax graph-memory path (docs/RELAX-GRAPH-MEMORY-PATH.md
 PR-1..6). PR-6 proved the whole-step graph train_step RUNS on gb10 CUDA at the full
 28-layer 1.8B config (loss finite, 8.787 GB planned device-peak). This doc PROFILES it
@@ -34,7 +42,7 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
 | **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; the gridded SSD scan §15 reuses the same banks → peak UNCHANGED; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
 | **fits Megatron-class memory** | **YES — 13.0 GB planned 28L < 26 GB (2x under)** | 26 GB |
-| **tok/s** | **§17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. Reverses the §16 regression (was 188/55 @ 18×/61×). Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
+| **tok/s** | **§17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. §18 RE-MEASURED the 3 gap levers: bs4 fwd MEASURED+PASS but tok/s batch-invariant (saturated kernels, gap unchanged ≈3.75×/≈11.4×), bs4 bwd memory-NO-GO (gold harness OOM), fp8 UNRUNNABLE on sm_121 (byte-halving 2.0× MEASURED, speed UNMEASURED), B2 v2 NO-GO (0.997×/1.001×) — §17 headline holds. Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
 | tok/s ratio vs Megatron | **≈0.27x (8L) / ≈0.088x (28L) with §17 (gridded fwd + gridded bwd) — i.e. ≈3.75x–11.4x slower** (was 75x–289x @ §14, 114x–654x @ §13) | 1.0x |
 | what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti recompute cache (§14) + GRIDDED CUDA SSD chunked scan replacing the serial MR mamba recurrence (§15, F2 0.980 ms vs serial 6.56 s)** + abstract numpy bwd/adam/loss (lever 4, now the dominant remaining term) | tuned fused-FP8-CUDA kernels + selective recompute |
 
@@ -1073,6 +1081,158 @@ honest negative. FAIL-LOUD: the probe RAISES on any NaN/inf grad or gate miss �
 
 ---
 
+## 18. THREE MEGATRON-GAP LEVERS RE-MEASURED (bs4 / fp8 / B2-v2) — one GO-with-caveat, two NO-GO (gb10 CUDA sm_121, 2026-06-04)
+
+§17 left three named levers to close the Megatron gap (≈3.75×/≈11.4× at 16384-vs-4096 tok/step).
+§18 ran all three on gb10 under strict single-run discipline (poll IDLE + free>105 GB before each;
+SIGTERM-only; `fuser`+`drop_caches` after each). **Honest headline: the bs4 FORWARD lands MEASURED
+and parity-passes, but (1) it buys NO tok/s (the kernels were already occupancy-saturated at bs1 —
+4× tokens cost ~4× time, throughput batch-invariant); (2) the bs4 BACKWARD probe is a memory-NO-GO
+(its torch-autograd gold reference OOMs the box, not the kernels); (3) FP8 GEMMs are UNRUNNABLE on
+sm_121 today (all 3 routes fail); (4) B2 v2 dstate-split is a NO-GO (0.997×/1.001× — zero speedup).
+The §17 GO (≈907/≈298 tok/s, all 8 grads pass) stands; none of the three levers moved the headline.**
+
+### RUN A — 4× BATCH (bs1 → bs4, 16384 tok/step)
+
+**Forward bs4 — MEASURED, PASS.** `probe_chunked_scan_cuda_gb10.py --prod --bs4` (prod shape
+b=4 S=4096 c=64 G=8 H=112 P=64 N=64). The micro-batch axis threads end-to-end (track-1 wiring):
+grid sanity asserts **F2 tg 28672→114688 = 4× exactly, F0 tg 7168→28672 = 4× exactly** (batch
+reaches the launch grid — no silent bs4→bs1). Parity F2 **4.885e-4 < 5e-4** PASS.
+
+| stage | bs1 (§15) | **bs4 (§18 MEASURED)** | bs4/bs1 |
+|---|---:|---:|---:|
+| F2 scan+combine | 0.980 ms | **3.868 ms** | 3.95× |
+| F0 precompute | 5.025 ms | **20.599 ms** | 4.10× |
+| F1 inter-chunk | 1.226 ms | **5.122 ms** | 4.18× |
+| **gridded fwd chain** | **7.231 ms** | **≈29.59 ms** | **4.09×** |
+
+The scaling is **near-linear ~4.0–4.2×** — i.e. **the kernels were already occupancy-saturated at
+bs1**, so the 4× grid buys NO per-token utilization. This is the honest negative for lever-1's
+"bigger GEMMs amortize launch/overhead" thesis on THESE SSD kernels: launch overhead was already
+amortized at bs1 (28 672 threadgroups), so 4× tokens = ~4× time and **tok/s is batch-invariant**.
+
+**Backward bs4 — MEMORY-NO-GO (probe ceiling, not kernel ceiling).**
+`probe_chunked_backward_cuda_gb10.py --prod --bs4` drove MemAvailable **117.8→11.2 GB (≈110 GB
+used > 100 GB budget)** during compile/allocation, **before any timing**, and was **SIGTERMed**
+(clean, never `-9`); after SIGTERM the box held ~15 GB until `drop_caches` reclaimed the pinned
+unified-memory pool → 117.8 GB. ROOT CAUSE (RULE #1, named): the wall is the probe's **torch.autograd
+serial-VJP gold reference**, which unrolls the recurrence over S=4096 with `requires_grad` on the
+(B=4,S=4096,H=112,P=64,N=64) fp32 `inp` tensor — that ONE tensor is ≈30 GB at bs4, and the autograd
+tape multiplies it several-fold. The **gridded backward kernels themselves were never the limit**;
+the gold harness is. So the bs4 backward **per-call ms is UNMEASURED**; the honest EXTRAPOLATION
+(from the forward's measured 4.09× and the §17 bs1 chain 447.8 ms) is **≈4× → ≈1.8 s/call at bs4**,
+i.e. throughput-neutral with bs1 (4× tokens / ~4× time). A measured bs4 backward needs a
+gold-light probe variant (the round-2 work item; **not** a silent change to the committed probe).
+
+**bs4 step-model tok/s (EXTRAPOLATION; self-checks to §17/§15).** With the forward measured at
+~4.09× and the backward extrapolated at ~4×, the per-step wall at 16384 tok scales ~4× of the
+§17 4096-tok step, so **tok/s ≈ §17 tok/s (batch-invariant): ≈890–907 @8L / ≈293–298 @28L**, gap
+vs Megatron 3399 **unchanged at ≈3.75×/≈11.4×**. Lever-1 achieves **apples-to-apples tok/step
+parity** with Megatron (16384 vs 16384) but **no throughput gain and no gap closure**.
+
+**Device-peak at bs4 (honest, NO LONGER 2× under Megatron).** The fp16 activation/state banks
+scale 4× (param/optimizer banks 1× — track-1 `assert_batch_scaling`): projected **≈25.6 GB @8L /
+≈52 GB @28L** (EXTRAPOLATION from §17's 6.400/12.998 GB × 4 on the act/state banks). The 28L bs4
+peak (~52 GB) is **2× OVER** Megatron's 26 GB — bs4 in fp16 forfeits the memory headroom. This is
+exactly where lever-2 (fp8 activations halving the banks) was meant to repay the cost — see RUN B.
+
+### RUN B — FP8 ACTIVATIONS (e4m3 vs bf16 GEMM microbench at prod bs4 shapes)
+
+`scratch/fp8_gemm_microbench.py --prod` on `NVIDIA GB10 sm_121`, M=16384 (bs4×seq4096),
+hidden=3584 ffn=18944. **bf16 baselines MEASURED; ALL THREE fp8 routes UNRUNNABLE on sm_121 today
+(no silent skip — each failure RECORDED):**
+
+| GEMM | shape (M×N×K) | GFLOP | **bf16 TFLOPs (MEASURED)** | bf16 ms | operand bf16→fp8 |
+|---|---|---:|---:|---:|---|
+| mlp_up_gate | 16384×37888×3584 | 4449.6 | **33.7** | 132.0 | 389.0→194.5 MB (**2.0×**) |
+| mlp_down | 16384×3584×18944 | 2224.8 | **34.3** | 64.85 | 756.5→378.3 MB (**2.0×**) |
+| attn_qkv | 16384×10752×3584 | 1262.7 | **33.5** | 37.65 | 194.5→97.3 MB (**2.0×**) |
+| attn_out | 16384×3584×3584 | 420.9 | **33.3** | 12.65 | 143.1→71.6 MB (**2.0×**) |
+| ssd_f2_tile | 64×64×64 | 0.0005 | 0.017 | 0.031 | (launch-bound) |
+
+**fp8 routes (all FAILED, MEASURED as the gap):**
+- **R1 TE MXFP8** → `RuntimeError: MXFP8 (for all gemm layouts) is not supported on 12.0+
+  architectures yet` — gb10's Blackwell sm_121 (CC 12.0+) is not yet covered by this
+  TransformerEngine build's MXFP8 path.
+- **R1 TE tensor-wise FP8** → `NVRTC_ERROR_BUILTIN_OPERATION_FAILURE` /
+  `failed to open libnvrtc-builtins.so.13.3` — a TE/NVRTC toolchain version mismatch on this host.
+- **R2 cppmega cooperative fp8 T.gemm** → `MLX Metal unavailable` — our
+  `_fp8_scaled_matmul2d_kernel_template` is Metal-only; the `target="cuda"` emission is the
+  round-3 work item (`docs/FP8-ACTIVATIONS-PATHC.md §6.2`).
+
+**Honest verdict — fp8 NO-GO-on-this-host (measured tooling gap, not a design refutation).** The
+fp8 tensor-core speedup at prod shapes is **UNMEASURED** (no route runs). What IS measured and
+holds: **operand byte-halving = exactly 2.0×** for every prod GEMM, i.e. fp8 activations would
+halve the activation/state banks — which is precisely the synergy that would repay RUN A's 4×
+memory cost (**bs4-fp8 ≈ bs1-fp16 banks: ~25.6/2 ≈ 12.8 GB @8L, ~52/2 ≈ 26 GB @28L** —
+EXTRAPOLATION, back under Megatron-class at 8L). The projected e2e win (fp8 tensor cores at the
+~33–34 bf16 TFLOPs MLP/attn GEMMs would, at the documented ~2× fp8 throughput, roughly halve those
+GEMM ms) is **DESIGN-ONLY until a CUDA fp8 emission exists** — the path forward is the round-3
+`target="cuda"` port of the cooperative fp8 T.gemm (sm_121 MXFP8 in TE is blocked upstream).
+
+### RUN C — B2 v2 dstate-split A/B re-measure
+
+`probe_chunked_backward_cuda_gb10.py --prod --b2-v2-ab` (KN sweep 2,4) builds and times BOTH the
+§17-GO v1 B2 and the dstate-split v2 in ONE process, plus an isolated v1 confirm run. **All 8 grads
+PASS the 1e-3 gate** (worst dx=8.10e-4, dD=2.29e-5); v2 is **math-equivalent** to v1 (dC/dx/dz/
+dchunk/dinp bit-identical 0.00e+00; dA_y 3.7e-8; dD 5.25e-6).
+
+| | B2 ms (MEASURED today) | speedup vs v1 | verdict |
+|---|---:|---:|---|
+| v1 (§17 prim) | **1033.8** | 1.000× | baseline |
+| v2 KN=2 | 1037.3 | **0.997×** | **NO-GO** |
+| v2 KN=4 | 1033.1 | **1.001×** | within-noise (no win) |
+| v1 isolated confirm | 1020.1 | — | (B0 266.3, B1 5.30) |
+
+**B2 v2 is a NO-GO — the dstate-split buys ZERO speedup** (0.997×/1.001×, both within timing
+noise). Per RULE #1 the production B2 **stays on v1**; v2 is kept env-gated (`CPPMEGA_PATH_C_B2_V2`)
+and OFF, math-equivalent but not adopted. The contingent **≈1480/≈560 tok/s bracket is NOT
+achieved** — B2 was not brought below 225 ms.
+
+**Measurement-integrity note (RULE #1 — do NOT silently revise §17).** Today's ABSOLUTE backward
+ms ran **~3× higher than §17** (B2 1020/1034 vs 334.6; B0 266 vs 110.8; B1 5.30 vs 2.43). The
+inflation is **uniform across all three kernels including the byte-identical, untouched B0/B1**, and
+the isolated single-kernel run reproduces it — so it is a **today-box steady-state effect** (clock/
+thermal/driver), NOT a code regression and NOT A/B contention. The valid A/B datum is the
+**in-process v1-vs-v2 ratio** (measured under identical conditions): it says v2 ≈ v1. The §17
+headline (334.6 ms / 447.8 ms chain / 907/298 tok/s) is the canonical MEASURED number and is **NOT
+revised down** by today's slower box; §18 reports both honestly.
+
+### §18 GO/NO-GO per track + the fp8 path forward
+
+| track | status | measured basis |
+|---|---|---|
+| **(1) 4× batch (bs4)** | **GO-fwd / NO-GO-throughput / MEM-NO-GO-bwd** | fwd bs4 MEASURED+parity (4.09×, batch-invariant tok/s); bwd probe OOM (gold harness, not kernels); peak ~25.6/52 GB (28L 2× OVER Megatron) |
+| **(2) fp8 activations** | **NO-GO-on-host (tooling)** | bf16 33–34 TFLOPs MEASURED; all 3 fp8 routes RAISE on sm_121; byte-halving 2.0× MEASURED; fp8 speedup UNMEASURED |
+| **(3) B2 v2 dstate-split** | **NO-GO (no speedup)** | v2 0.997×/1.001× vs v1, math-equivalent; stays v1; §17 GO stands |
+
+**Net:** none of the three levers closes the Megatron gap today; the §17 ≈3.75×/≈11.4× GO holds.
+The **one real path forward** the data points to is **lever-2 done RIGHT on sm_121**: a
+`target="cuda"` emission of the cooperative fp8 T.gemm (TE's MXFP8 is upstream-blocked on Blackwell
+12.0+), which alone delivers the **measured 2.0× memory halving** (making bs4-fp8 fit Megatron-class
+memory) and the path to fp8 tensor-core throughput on the MLP/attn GEMMs that dominate at bs4 —
+neither bs4-alone (saturated kernels, no tok/s) nor B2 v2 (no speedup) moves the needle.
+
+### Reproduce (§18)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+export PP=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python
+export TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib
+# RUN A — bs4 forward (PASS) / bs4 backward (memory-NO-GO, OOMs on the gold harness)
+PYTHONPATH=$PP python scratch/probe_chunked_scan_cuda_gb10.py --prod --bs4
+PYTHONPATH=$PP python scratch/probe_chunked_backward_cuda_gb10.py --prod --bs4   # OOM watch: SIGTERM-only
+# RUN B — fp8 vs bf16 GEMM microbench (bf16 MEASURED; fp8 routes RAISE on sm_121)
+PYTHONPATH=$PP python scratch/fp8_gemm_microbench.py --prod
+# RUN C — B2 v1-vs-v2 A/B (v2 NO-GO: 0.997×/1.001×)
+PYTHONPATH=$PP CPPMEGA_PATH_C_B2_AB_KNS=2,4 python scratch/probe_chunked_backward_cuda_gb10.py --prod --b2-v2-ab
+```
+Measured 2026-06-04 on gb10 `tvm.cuda(0)` sm_121. RULE #1: every fp8 route failure and the bs4-bwd
+OOM is RECORDED as the measured gap (no silent skip, no bs4→bs1 / fp8→bf16 / v2→v1 fallback); the
+probes RAISE on any NaN/inf grad or gate miss.
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L
@@ -1137,3 +1297,21 @@ is a shared-memory reduction / grid restructure, scoped future work. Memory UNCH
 (6.400/12.998 GB). With §13–§15 (device-resident gridded forward) and now §17 (device-resident
 gridded backward, all grads passing), the graph path runs its whole step on-device within ≈3.75×/
 ≈11.4× of Megatron at 2× under its memory — the remaining levers are the 4× batch gap and FP8 GEMM.
+
+**§18 RE-MEASURED those two remaining levers (plus the B2 v2 polish) — and all three are NO-GO for
+throughput today.** (1) **4× batch:** the bs4 forward is MEASURED and parity-passes (chain ≈29.59 ms
+= 4.09× bs1, grid exactly 4×) but the SSD kernels were already occupancy-saturated at bs1, so 4×
+tokens cost ~4× time → **tok/s is batch-invariant, the gap does NOT close**; the bs4 backward is a
+**memory-NO-GO** (the probe's torch-autograd gold reference, not the kernels, OOMs the box at ≈110 GB
+and was SIGTERMed); bs4 fp16 device-peak ≈25.6/52 GB forfeits the memory headroom (28L 2× OVER
+Megatron). (2) **FP8 activations:** UNRUNNABLE on sm_121 — TE MXFP8 is upstream-blocked on Blackwell
+12.0+, TE tensor-wise hits an NVRTC toolchain mismatch, our cooperative fp8 T.gemm is Metal-only; the
+fp8 SPEEDUP is therefore UNMEASURED, but the **operand byte-halving (2.0×) IS measured** — fp8
+activations would halve the banks and make bs4-fp8 fit Megatron-class memory, so the ONE path
+forward the data endorses is a `target="cuda"` emission of the cooperative fp8 T.gemm. (3) **B2 v2
+dstate-split:** measured **0.997×/1.001× vs v1 — zero speedup**, math-equivalent, **NO-GO**; B2 stays
+v1, the contingent ≈1480/≈560 bracket is not reached. None of the three moved the headline: **the §17
+GO (≈907/≈298 tok/s, ≈3.75×/≈11.4×) is the canonical MEASURED result and stands.** (A measurement-
+integrity note: §18's box ran the backward ~3× slower than §17 uniformly across the byte-identical
+B0/B1, a box steady-state effect — §17's 334.6 ms is NOT revised; the valid §18 datum is the
+in-process v1-vs-v2 ratio.)
