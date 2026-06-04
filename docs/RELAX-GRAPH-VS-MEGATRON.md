@@ -1,6 +1,33 @@
 # Relax graph-path train_step vs Megatron — measured tok/s + peak memory (gb10 CUDA)
 
-**Status: MEASURED, 2026-06-04, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §18 —
+**Status: MEASURED, 2026-06-05, gb10 (Grace-Blackwell aarch64, `tvm.cuda(0)`). Latest: §27 —
+the B2 backward tensor-core T.gemm rewrite is REAL but a THROUGHPUT NO-GO. The new prim
+`chunk_scan_combine_bwd_cuda_prim_gemm` re-expresses B2's four GEMM-able contractions
+(DYX / dC_off / dC_diag / dchunk_states) as `T.gemm` mirroring the §26 F0 14.5× template.
+It emits **REAL sm_120 tensor-core code — 128 `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
++ 66 `ldmatrix` in the compiled `.so` (the `tl::mma_sync<kFloat16,kFloat16,kFloat32,16,8,16>`
+CUTLASS path, byte-for-byte the F0 codegen form), NOT threaded-serial relabeled** — and ALL 8
+model-facing grads PASS the 1e-3 gate through the GEMM prim (dz=1.73e-4, dx=8.10e-4, dC=8.49e-5,
+dB=1.25e-5, dlog_decay=9.77e-4, ddt=1.53e-4, dh0=2.34e-4, dD=2.67e-5 via the honest fp16-cache
+gold; WORST 9.77e-4 < 1e-3; GEMM-vs-v1 deltas dC 6.2e-5 / dchunk 4.8e-5 / dA_y 3.2e-5,
+math-equivalent). **BUT the in-process A/B is 0.749× — the GEMM prim is SLOWER than the v1
+threaded-serial prim (v1=1027.5 ms, gemm=1371.5 ms, same box, same inputs) → NO-GO.** Unlike F0
+(whose serial-scalar contraction was the entire 24.57 ms hotspot), B2's dominant cost is NOT the
+four collapsed contractions — they are tiny single-64-tile m16n8k16 GEMMs (M=N=K=64, one MMA
+tile each) whose ldmatrix/smem-staging + four sync barriers cost MORE than the v1 re-gridded
+serial reductions, while the actual B2 hotspot (the 3-index s-dependent `dinp` contraction +
+the gold-side work) stays threaded in BOTH prims. So GEMM-izing B2 does NOT transfer the F0 win;
+the §26 lever was MIS-LOCALIZED for B2. **B2 stays the v1 prim** (byte-identical, env-gated off);
+the GEMM prim is committed behind `CPPMEGA_PATH_C_B2_GEMM` as a measured NO-GO (RULE #1: the
+selected path is the ONE path and RAISES on failure; it required a frag→shared spill `dCdiag_sh`
+to clear a `float32x{2,4}`-vs-`float32` Simplify Bind ICHECK — the all-fp32 `dC` consume loop
+auto-vectorized while its loop-variant `atomic_add` could not ride the vector lane; fixed by
+thread-striding that loop and spilling the dC_diag fragment to shared, +16 KB → 88.5 KB < 99 KB).
+B0 was NOT converted (B2 NO-GO predicts the same single-tile-GEMM regression). **The §17 ≈907/≈298
+tok/s GO is UNCHANGED — the backward chain stays v1 447.8 ms canonical (the GEMM chain would be
+~559.9 ms, a REGRESSION).** This box ran ~3× slower than §17 uniformly (box-state effect, the v1
+B2=1358.7 / B0=272.6 / B1=5.28 ms here vs §17's 334.6 / 110.8 / 2.41 — NOT a code regression;
+the canonical §17 numbers are NOT revised, only the box-invariant 0.749× ratio is). Prior: §18 —
 the THREE named Megatron-gap levers (4× batch / fp8 activations / B2 v2 dstate-split) RE-MEASURED:
 ALL THREE land as NO-GO-for-throughput, the §17 ≈907/≈298 tok/s GO stands unchanged. (1) bs4
 FORWARD is MEASURED + parity-PASS (chain 7.231→≈29.59 ms, 4.09× — exactly 4× grid, batch reaches the
@@ -42,7 +69,7 @@ region that cannot run RAISES (the profiler and the e2e runner both fail-closed)
 | tokens/step | 4,096 (seq×batch=4096×1) | 16,384 (bs=4×seq=4096) |
 | **peak memory** | **6.400 GB planned 8L / 12.998 GB planned 28L device-peak** (Korthikanti launch-cache §14; the gridded SSD scan §15 reuses the same banks → peak UNCHANGED; was 4.682/8.787 GB pre-§14 — the launch lever trades +1.7/+4.2 GB for the launch reduction, still 2x under Megatron) | **~26 GB** |
 | **fits Megatron-class memory** | **YES — 13.0 GB planned 28L < 26 GB (2x under)** | 26 GB |
-| **tok/s** | **§17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. §18 RE-MEASURED the 3 gap levers: bs4 fwd MEASURED+PASS but tok/s batch-invariant (saturated kernels, gap unchanged ≈3.75×/≈11.4×), bs4 bwd memory-NO-GO (gold harness OOM), fp8 UNRUNNABLE on sm_121 (byte-halving 2.0× MEASURED, speed UNMEASURED), B2 v2 NO-GO (0.997×/1.001×) — §17 headline holds. §21 RE-MEASURED the fp8 levers on the unblocked sm_121: our OWN native fp8-input e4m3 MMA is now VERIFIED real (kFloat8_e4m3 m16n8k32, 0 fp16) and 2.2–3.5× faster than the old fp16-decode but still 0.69–0.95× bf16 (untuned tile → speed NO-GO); TE standalone fp8 GEMM stays the only ~1.7× win; wiring TE fp8 into the e2e step is a memory-NO-GO (fp8 backward OOMs at the MLX↔torch cudaMallocAsync bridge, reproduced to seq=512) — so §17's ≈907/≈298 stays the canonical step number, fp8 e2e tok/s UNMEASURED. Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
+| **tok/s** | **§27 (B2 tensor-core T.gemm backward — REAL HMMA, parity PASS, but THROUGHPUT NO-GO): the new `chunk_scan_combine_bwd_cuda_prim_gemm` emits 128 real `mma.sync.m16n8k16` + 66 `ldmatrix` (F0 codegen form, SASS-verified) and ALL 8 grads pass the 1e-3 gate (WORST dlog_decay 9.77e-4; dD 2.67e-5 honest fp16-cache gold), but the in-process A/B is **0.749× — SLOWER than v1** (v1=1027.5 ms vs gemm=1371.5 ms same box) → B2 stays v1, gated off behind `CPPMEGA_PATH_C_B2_GEMM`. B2's four collapsed contractions are tiny single-64-tile GEMMs whose staging+sync cost exceeds the v1 serial reductions; the real B2 hotspot (3-index dinp) stays threaded in both. The §26 F0 lever does NOT transfer to B2. tok/s UNCHANGED from §17 (the GEMM chain ~559.9 ms would REGRESS vs v1 447.8 ms). §17 (gridded fwd + RE-GRIDDED gridded backward, MEASURED B2 substituted): ≈907 tok/s @8L / ≈298 @28L (gap ≈3.75×/≈11.4×) — B2 re-gridded 2484→334.6 ms (7.42×), chain 447.8 ms < 456 ms numpy bwd, ALL 8 grads pass incl dD 2.48e-5. §18 RE-MEASURED the 3 gap levers: bs4 fwd MEASURED+PASS but tok/s batch-invariant (saturated kernels, gap unchanged ≈3.75×/≈11.4×), bs4 bwd memory-NO-GO (gold harness OOM), fp8 UNRUNNABLE on sm_121 (byte-halving 2.0× MEASURED, speed UNMEASURED), B2 v2 NO-GO (0.997×/1.001×) — §17 headline holds. §21 RE-MEASURED the fp8 levers on the unblocked sm_121: our OWN native fp8-input e4m3 MMA is now VERIFIED real (kFloat8_e4m3 m16n8k32, 0 fp16) and 2.2–3.5× faster than the old fp16-decode but still 0.69–0.95× bf16 (untuned tile → speed NO-GO); TE standalone fp8 GEMM stays the only ~1.7× win; wiring TE fp8 into the e2e step is a memory-NO-GO (fp8 backward OOMs at the MLX↔torch cudaMallocAsync bridge, reproduced to seq=512) — so §17's ≈907/≈298 stays the canonical step number, fp8 e2e tok/s UNMEASURED. Prior: ≈894/≈293 @ §15 (gridded scan + numpy bwd, EXTRAPOLATED); 45.44 @8L MEASURED (§14); 29.82 @ §13, 25.2 pre-§13.** | **3399 tok/s** |
 | tok/s ratio vs Megatron | **≈0.27x (8L) / ≈0.088x (28L) with §17 (gridded fwd + gridded bwd) — i.e. ≈3.75x–11.4x slower** (was 75x–289x @ §14, 114x–654x @ §13) | 1.0x |
 | what runs the compute | **REAL tilelang path_c-CUDA MR kernel, device-resident fwd (§13) + Korthikanti recompute cache (§14) + GRIDDED CUDA SSD chunked scan replacing the serial MR mamba recurrence (§15, F2 0.980 ms vs serial 6.56 s)** + abstract numpy bwd/adam/loss (lever 4, now the dominant remaining term) | tuned fused-FP8-CUDA kernels + selective recompute |
 
@@ -1510,6 +1537,18 @@ between, gb10 left idle (0% util, >115 GB free).
 ---
 
 ## 7. Verdict
+
+**§27 (B2 tensor-core backward — NO-GO):** The B2 backward GEMM rewrite is a real, parity-correct
+tensor-core kernel (128 `mma.sync.m16n8k16` + 66 `ldmatrix`, SASS-verified, ALL 8 grads pass the
+1e-3 gate incl. dD 2.67e-5 honest fp16-cache) but it is **0.749× — slower than the v1 threaded-serial
+prim** (v1 1027.5 ms vs gemm 1371.5 ms, same box/inputs, in-process A/B). B2's four collapsed
+contractions are tiny single-64-tile m16n8k16 GEMMs whose ldmatrix/smem-staging + four sync barriers
+cost MORE than v1's re-gridded serial reductions, while the true B2 hotspot (the 3-index s-dependent
+`dinp` contraction) stays threaded in BOTH prims — so the §26 F0 14.5× lever does NOT transfer. **The
+backward chain stays v1 (447.8 ms canonical); the GEMM chain would REGRESS to ~559.9 ms. Step tok/s
+UNCHANGED at §17's ≈907 @8L / ≈298 @28L (gap ≈3.75×/≈11.4× vs Megatron 3399).** The GEMM prim is
+committed behind `CPPMEGA_PATH_C_B2_GEMM` (default OFF, RULE #1 the-one-path semantics, RAISES on
+failure) as a documented measured NO-GO; B0 was not converted (same single-tile regression predicted).
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L
 device-peak vs Megatron 26 GB, optimizer in-place) and runs the full 28-layer 1.8B step the

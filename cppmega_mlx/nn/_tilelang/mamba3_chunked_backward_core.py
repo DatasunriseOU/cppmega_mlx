@@ -1189,7 +1189,9 @@ def chunk_scan_combine_bwd_cuda_prim_gemm(
             group_idx = head_idx // heads_per_group
             base = chunk_idx * chunk_size
 
-            # SMEM-MINIMAL tiling (<99 KB gb10 budget at prod L=P=N=64 -> 72.5 KB).
+            # SMEM-MINIMAL tiling (<99 KB gb10 budget at prod L=P=N=64 -> 88.5 KB
+            # incl. dCdiag_sh; the fragment->shared spill that fixes the Simplify
+            # float32x{2,4}-vs-float32 Bind ICHECK).
             # The fp16 GEMM operands are REUSED across the four GEMM phases (each
             # phase is separated by T.sync_threads() and the operand tile is written
             # FRESH before its gemm, so the reuse is race-free). Sized by the MAX of
@@ -1211,6 +1213,7 @@ def chunk_scan_combine_bwd_cuda_prim_gemm(
             opA = T.alloc_shared((L, maxLP), dtype, scope="shared")        # XT16 | M16 | dY_sd16
             opB = T.alloc_shared((maxLP, dstate), dtype, scope="shared")   # ps16 | B16 | C16
             store_fp32 = T.alloc_shared((maxLP, dstate), accum_dtype, scope="shared")  # dCoff_sh | dchunk_store
+            dCdiag_sh = T.alloc_shared((L, dstate), accum_dtype, scope="shared")  # dC_diag fp32 (frag->shared so the elementwise dC consume reads SHARED, not a register fragment — a flattened T.Parallel index over a fragment auto-vectorizes to float32x2 in Simplify; F0 reads fragments only via whole-tile T.copy)
             DYX_frag = T.alloc_fragment((L, L), accum_dtype)               # (A) C accum
             dCoff_frag = T.alloc_fragment((L, dstate), accum_dtype)        # (B) C accum
             dCdiag_frag = T.alloc_fragment((L, dstate), accum_dtype)       # (C) C accum
@@ -1314,21 +1317,30 @@ def chunk_scan_combine_bwd_cuda_prim_gemm(
             T.sync_threads()
             T.clear(dCdiag_frag)
             T.gemm(opA[0:L, 0:L], opB[0:L, 0:dstate], dCdiag_frag)  # sum_s M[l,s]*B[s,n]
+            T.copy(dCdiag_frag, dCdiag_sh)   # fragment -> shared (whole-tile, F0 pattern)
             T.sync_threads()
 
             # dC[l,n] = dCoff*sd[l] + dCdiag ; dstate_decay dA grad from un-scaled
             # dC_off (store_fp32, the §A risk-3 segsum-VJP term:
             # dAcs_acc[l] += sum_n dCoff*C*sd).
-            for ln in T.Parallel(L * dstate):
-                ll = ln // dstate
-                nn = ln % dstate
-                s = base + ll
-                sd = T.exp2(dacs[ll] * p)
-                dC[batch_idx, s, head_idx, nn] = (
-                    store_fp32[ll, nn] * sd + dCdiag_frag[ll, nn]
-                )
-                c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
-                T.atomic_add(dAcs_acc[ll], store_fp32[ll, nn] * c_v * sd)
+            # THREAD-STRIDED serial (NOT T.Parallel): a flat T.Parallel(L*dstate)
+            # over the all-fp32 contiguous dC store auto-vectorizes to float32x4 in
+            # Simplify, but the loop-variant atomic_add to dAcs_acc[ll] cannot ride
+            # that vector lane -> the float32x4-vs-float32 Bind ICHECK. The same
+            # thread-strided form the dinp/dinp-zero loops use is not vectorized.
+            for ln0 in T.serial(0, L * dstate, threads):
+                lane = T.get_thread_binding(0)
+                ln = ln0 + lane
+                if ln < L * dstate:
+                    ll = ln // dstate
+                    nn = ln % dstate
+                    s = base + ll
+                    sd = T.exp2(dacs[ll] * p)
+                    dC[batch_idx, s, head_idx, nn] = (
+                        store_fp32[ll, nn] * sd + dCdiag_sh[ll, nn]
+                    )
+                    c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                    T.atomic_add(dAcs_acc[ll], store_fp32[ll, nn] * c_v * sd)
             T.sync_threads()
 
             # ---- (D) dchunk_states[p,n] = sum_l (dY[l,p]*sd[l])*C[l,n] via T.gemm ----
@@ -1500,7 +1512,8 @@ def build_chunk_scan_combine_bwd_metal(
             #   + dY16[L,P]fp16 + opA[L,max(L,P)]fp16 + opB[max(L,P),N]fp16
             #   + store_fp32[max(L,P),N]fp32.  (DYX_frag/dCoff_frag/dCdiag_frag/
             #   dchunk_frag live in REGISTERS — fragments, not smem.)  XT(fp32) is
-            #   DROPPED (XT16 written directly). At prod L=P=N=64 -> 72.5 KB.
+            #   DROPPED (XT16 written directly). dCdiag_sh[L,N]fp32 added (frag->shared
+            #   spill, the float32x{2,4} Simplify-Bind fix). At prod L=P=N=64 -> 88.5 KB.
             L = chunk_size
             P = headdim
             N = dstate
@@ -1513,6 +1526,10 @@ def build_chunk_scan_combine_bwd_metal(
                 + L * maxLP * 2           # opA (fp16; XT16|M16|dY_sd16)
                 + maxLP * N * 2           # opB (fp16; ps16|B16|C16)
                 + maxLP * N * 4           # store_fp32 (dCoff_sh|dchunk_store)
+                + L * N * 4               # dCdiag_sh (fp32; frag->shared, so the
+                                          #   elementwise dC consume reads SHARED not
+                                          #   a register fragment — avoids the
+                                          #   float32x2-vs-float32 Simplify Bind error)
             )
             _GB10_SMEM_BUDGET = 99 * 1024
             if smem_bytes >= _GB10_SMEM_BUDGET:
