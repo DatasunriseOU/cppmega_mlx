@@ -21,6 +21,7 @@ from typing import Any
 import mlx.core as mx
 
 from cppmega_mlx.nn._tilelang import _msl_transform
+from cppmega_mlx.nn._tilelang._cuda_eager import cuda_eager_available
 from cppmega_mlx.nn._tilelang._msl_transform import can_run_metal
 
 
@@ -211,6 +212,71 @@ def _fp8_scaled_matmul2d_kernel_template(
         T.copy(C_shared, C[by * _FP8_MM_BM, bx * _FP8_MM_BN])  # type: ignore[name-defined]  # noqa: F821
 
 
+def _fp8_scaled_matmul2d_cuda_kernel_template(
+    A_fp8: T.Tensor((_FP8_MM_M, _FP8_MM_K), "float8_e4m3"),  # type: ignore[name-defined]  # noqa: F821
+    A_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
+    B_fp8: T.Tensor((_FP8_MM_N, _FP8_MM_K), "float8_e4m3"),  # type: ignore[name-defined]  # noqa: F821
+    B_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
+    C: T.Tensor((_FP8_MM_M, _FP8_MM_N), _FP8_MM_C_DTYPE),  # type: ignore[name-defined]  # noqa: F821
+):
+    """CUDA twin of :func:`_fp8_scaled_matmul2d_kernel_template` (gb10 / sm_121).
+
+    IDENTICAL FP8 e4m3 dequant -> half -> ``T.gemm`` math; the ONLY deltas are
+    the codegen-shape choices the CUDA GEMM backend requires where the Metal
+    cooperative ``matmul2d`` path differed (mirrors the F2 forward CUDA port,
+    :func:`mamba3_chunked_scan_core.chunk_scan_fwd_cuda_prim`):
+
+      * the C accumulator is a REGISTER FRAGMENT (``T.alloc_fragment``), not a
+        ``shared`` buffer. The CUDA ``T.gemm`` lowering asserts the C operand is
+        a fragment (``local_buf must be a fragment, but got shared``); the Metal
+        cooperative path deliberately staged ``Cs`` in shared to TRIGGER the
+        ``mpp::tensor_ops::matmul2d`` simdgroup GEMM. A separate ``C_shared``
+        stays ONLY as the epilogue copy-out staging buffer.
+      * the post-K scale multiply runs on the fragment under ``T.Parallel``
+        (lowers identically per the F2 fragment elementwise rule).
+      * the epilogue global-store copy carries ``disable_tma=True`` (on sm_121
+        the TMA tensormap descriptor mis-aligns at these tile dims ->
+        "Invalid TMA descriptor arguments"; the cp.async path is correct).
+
+    The FP8->half dequant is byte-identical to the Metal template: each e4m3 byte
+    is routed through an explicit ``float32`` scratch var so the CUDA backend
+    emits the NATIVE ``__nv_fp8_e4m3 -> half`` decode (``codegen_cuda`` ->
+    ``__nv_fp8..._e4m3``), NOT a vectorized ``(half4)(uchar4)`` integer reinterpret
+    that would skip the float8 decode and be numerically wrong (RULE #1: the
+    scalar scratch keeps the decode honest on CUDA exactly as it does on Metal).
+
+    ``A_shared``/``B_shared`` stay plain ``scope="shared"`` (already CUDA-correct,
+    NOT ``shared.dyn``); there is no ``make_swizzled_layout`` annotation (the
+    CUDA GEMM lowering picks its own ldmatrix/cp.async layout).
+    """
+    with T.Kernel(  # type: ignore[name-defined]  # noqa: F821
+        T.ceildiv(_FP8_MM_N, _FP8_MM_BN),  # type: ignore[name-defined]  # noqa: F821
+        T.ceildiv(_FP8_MM_M, _FP8_MM_BM),  # type: ignore[name-defined]  # noqa: F821
+        threads=_FP8_MM_THREADS,
+    ) as (bx, by):
+        A_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BK), "float16", scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        B_shared = T.alloc_shared((_FP8_MM_BN, _FP8_MM_BK), "float16", scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        C_frag = T.alloc_fragment((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE)  # type: ignore[name-defined]  # noqa: F821
+        C_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE, scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        T.clear(C_frag)
+        for ko in T.serial(T.ceildiv(_FP8_MM_K, _FP8_MM_BK)):  # type: ignore[name-defined]  # noqa: F821
+            for i, kk in T.Parallel(_FP8_MM_BM, _FP8_MM_BK):  # type: ignore[name-defined]  # noqa: F821
+                a_val = T.alloc_var("float32")  # type: ignore[name-defined]  # noqa: F821
+                a_val = T.cast(A_fp8[by * _FP8_MM_BM + i, ko * _FP8_MM_BK + kk], "float32")  # type: ignore[name-defined]  # noqa: F821
+                A_shared[i, kk] = T.cast(a_val, "float16")  # type: ignore[name-defined]  # noqa: F821
+            for j, kk in T.Parallel(_FP8_MM_BN, _FP8_MM_BK):  # type: ignore[name-defined]  # noqa: F821
+                b_val = T.alloc_var("float32")  # type: ignore[name-defined]  # noqa: F821
+                b_val = T.cast(B_fp8[bx * _FP8_MM_BN + j, ko * _FP8_MM_BK + kk], "float32")  # type: ignore[name-defined]  # noqa: F821
+                B_shared[j, kk] = T.cast(b_val, "float16")  # type: ignore[name-defined]  # noqa: F821
+            T.gemm(A_shared, B_shared, C_frag, transpose_B=True)  # type: ignore[name-defined]  # noqa: F821
+        sa = A_scale[0]
+        sb = B_scale[0]
+        for i, j in T.Parallel(_FP8_MM_BM, _FP8_MM_BN):  # type: ignore[name-defined]  # noqa: F821
+            C_frag[i, j] = C_frag[i, j] * sa * sb
+        T.copy(C_frag, C_shared)  # type: ignore[name-defined]  # noqa: F821
+        T.copy(C_shared, C[by * _FP8_MM_BM, bx * _FP8_MM_BN], disable_tma=True)  # type: ignore[name-defined]  # noqa: F821
+
+
 def _make_scaled_matmul_kernel(
     *,
     M: int,
@@ -286,6 +352,85 @@ def _make_scaled_matmul2d_kernel(
     return tilelang.language.prim_func(_fp8_scaled_matmul2d_kernel_template)
 
 
+def _make_scaled_matmul2d_cuda_kernel(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    num_stages: int = 0,
+    c_dtype: str = "float32",
+) -> Any:
+    """Build the CUDA (sm_121) dequant->half->``T.gemm`` owner-output prim.
+
+    Same cooperative-tile selection (:func:`_coop_tile_for`) as the Metal
+    builder -- every production matmul shape (M=16384; mlp/attn N/K) yields a
+    legal tile -- but binds the CUDA twin template
+    (:func:`_fp8_scaled_matmul2d_cuda_kernel_template`, register-fragment C).
+
+    Returns ``None`` when ``_coop_tile_for`` reports that no legal tile divides
+    ``M/N/K`` (RULE #1: the caller RAISES on a CUDA host rather than emitting a
+    wrong partial-tile GEMM -- there is no Metal LUT/dot4 sibling to fall to on
+    CUDA; the legacy dot4 intrinsic is Metal-only).
+    """
+    import tilelang
+    from tilelang import language as T
+    from tvm.target import Target
+
+    tile = _coop_tile_for(int(M), int(N), int(K))
+    if tile is None:
+        return None
+    bm, bn, bk, threads = tile
+
+    globals().update(
+        T=T,
+        Target=Target,
+        _FP8_MM_M=int(M),
+        _FP8_MM_N=int(N),
+        _FP8_MM_K=int(K),
+        _FP8_MM_BM=int(bm),
+        _FP8_MM_BN=int(bn),
+        _FP8_MM_BK=int(bk),
+        _FP8_MM_THREADS=int(threads),
+        _FP8_MM_NUM_STAGES=int(num_stages),
+        _FP8_MM_C_DTYPE=str(c_dtype),
+    )
+    return tilelang.language.prim_func(_fp8_scaled_matmul2d_cuda_kernel_template)
+
+
+def _resolve_fp8_compile_target(target: Any) -> Any:
+    """Resolve the ``target`` kwarg threaded through the FP8 matmul builders.
+
+    The dequant->half->``T.gemm`` prim BODY is target-agnostic plain TileLang;
+    only the compile-site target object differs between Metal (Apple) and CUDA
+    (gb10 / sm_121). Verbatim port of
+    :func:`mamba3_chunked_scan_core._resolve_chunked_compile_target`:
+
+      * ``None`` / ``"metal..."`` -> Metal target (back-compat default; every
+        existing Metal caller is unchanged).
+      * ``"cuda..."`` (or a CUDA ``tvm.target.Target``) -> CUDA target so the
+        SAME prim lowers through TileLang's CUDA backend.
+
+    RULE #1: an unrecognized target spec RAISES (no silent Metal default for a
+    CUDA host); the Metal-vs-CUDA selection is an explicit gate.
+    """
+    if target is None:
+        return _msl_transform._as_metal_target(TILELANG_METAL_MATMUL_TARGET)
+    if isinstance(target, str):
+        spec = target.strip()
+        if spec.startswith("cuda"):
+            return _msl_transform._as_cuda_target(spec)
+        if spec.startswith("metal"):
+            return _msl_transform._as_metal_target(spec)
+        raise ValueError(
+            "fp8_scaled_matmul_path_c: unrecognized target spec "
+            f"{target!r}; expected 'metal...'/'cuda...' (RULE #1: no default)"
+        )
+    kind = str(getattr(getattr(target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        return _msl_transform._as_cuda_target(target)
+    return _msl_transform._as_metal_target(target)
+
+
 FP8_PATH_C_MATMUL2D_ENV = "CPPMEGA_FP8_PATH_C_MATMUL2D"
 
 
@@ -323,7 +468,7 @@ def _matmul2d_owner_output_enabled() -> bool:
 
 
 _FP8_MATMUL_TVM_FFI_KERNEL_CACHE: dict[
-    tuple[int, int, int, int, int, int, int, str],
+    tuple[int, int, int, int, int, int, int, str, str],
     Any,
 ] = {}
 _FP8_MATMUL_TVM_FFI_KERNEL_CACHE_LOCK = threading.RLock()
@@ -339,7 +484,10 @@ def _fp8_matmul_tvm_ffi_kernel_for(
     BK: int,
     num_stages: int,
     c_dtype: str,
+    target: Any = None,
 ) -> Any:
+    resolved_target = _resolve_fp8_compile_target(target)
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
     cache_key = (
         int(M),
         int(N),
@@ -349,6 +497,7 @@ def _fp8_matmul_tvm_ffi_kernel_for(
         int(BK),
         int(num_stages),
         str(c_dtype),
+        kind or "metal",
     )
     with _FP8_MATMUL_TVM_FFI_KERNEL_CACHE_LOCK:
         cached = _FP8_MATMUL_TVM_FFI_KERNEL_CACHE.get(cache_key)
@@ -357,7 +506,49 @@ def _fp8_matmul_tvm_ffi_kernel_for(
 
     import tilelang
 
-    target = _msl_transform._as_metal_target(TILELANG_METAL_MATMUL_TARGET)
+    # CUDA (gb10 / sm_121): the dequant->half->T.gemm prim is the ONE fp8 path.
+    # Select the CUDA twin (register-fragment C) and compile with the F2 sm_121
+    # escape hatch pass_configs so the GEMM operand copies use cp.async instead
+    # of TMA (the tensormap descriptor mis-aligns at these tile dims ->
+    # "Invalid TMA descriptor arguments" at RUN). RULE #1: there is NO Metal
+    # LUT/dot4 sibling on CUDA, so an undividable shape or a compile failure
+    # RAISES (caught + re-raised as FP8MatmulPathCDirectError by the caller); it
+    # does NOT silently fall back to dot4, to bf16, or to a degraded precision.
+    if "cuda" in kind:
+        cuda_prim = _make_scaled_matmul2d_cuda_kernel(
+            M=M,
+            N=N,
+            K=K,
+            num_stages=num_stages,
+            c_dtype=c_dtype,
+        )
+        if cuda_prim is None:
+            raise FP8MatmulPathCDirectError(
+                f"fp8_scaled_matmul_path_c (cuda): no legal cooperative tile "
+                f"divides M={M} N={N} K={K}; the CUDA dequant->T.gemm kernel "
+                "cannot tile this shape and there is no Metal-only dot4 sibling "
+                "on CUDA (RULE #1: no silent partial-tile / fallback)."
+            )
+        # sm_121 (Blackwell): disable the TMA + warp-specialized lowering so the
+        # GEMM operand copies use plain cp.async/vectorized loads (the same
+        # dequant->T.gemm math; TileLang's documented escape hatch). Mirrors
+        # compile_chunk_scan_fwd_metal (mamba3_chunked_scan_core.py). RULE #1:
+        # explicit per-target codegen choice, not a silent fallback.
+        kernel = tilelang.compile(
+            cuda_prim,
+            target=resolved_target,
+            execution_backend="tvm_ffi",
+            out_idx=-1,
+            pass_configs={
+                "tl.disable_tma_lower": True,
+                "tl.disable_warp_specialized": True,
+            },
+        )
+        with _FP8_MATMUL_TVM_FFI_KERNEL_CACHE_LOCK:
+            _FP8_MATMUL_TVM_FFI_KERNEL_CACHE[cache_key] = kernel
+        return kernel
+
+    target = resolved_target
 
     # RULE #1: the Metal-4 cooperative-tensor matmul2d emission is the clear,
     # default owner-output GEMM path. It is launched correctly by the production
@@ -512,6 +703,30 @@ def _validate_owner_output(out: mx.array, *, M: int, N: int) -> tuple[mx.array, 
     )
 
 
+def _require_fp8_host_for_target(target: Any) -> str:
+    """Resolve the host gate for the requested ``target`` (RULE #1: explicit).
+
+    Returns the resolved target kind (``"cuda"``/``"metal"``). On a CUDA target
+    a CUDA host (torch.cuda + tilelang, via :func:`cuda_eager_available`) is
+    REQUIRED; on a Metal target a working MLX Metal backend is REQUIRED. An
+    unmet host requirement RAISES :class:`FP8MatmulPathCDirectError` with
+    where+what -- it never silently selects the other backend.
+    """
+    resolved = _resolve_fp8_compile_target(target)
+    kind = str(getattr(getattr(resolved, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        ok, reason = cuda_eager_available()
+        if not ok:
+            raise FP8MatmulPathCDirectError(
+                f"fp8_scaled_matmul_path_c (cuda target): CUDA host unavailable: "
+                f"{reason}"
+            )
+        return "cuda"
+    if not can_run_metal():
+        raise FP8MatmulPathCDirectError("MLX Metal unavailable")
+    return "metal"
+
+
 def fp8_scaled_matmul_path_c_direct(
     A_fp8: mx.array,
     B_fp8: mx.array,
@@ -523,11 +738,19 @@ def fp8_scaled_matmul_path_c_direct(
     BN: int = 16,
     BK: int = 32,
     num_stages: int = 0,
+    target: Any = None,
 ) -> mx.array:
-    """Run dense FP8 Path C through tvm-ffi into a caller-owned MLX output."""
+    """Run dense FP8 Path C through tvm-ffi into a caller-owned MLX output.
 
-    if not can_run_metal():
-        raise FP8MatmulPathCDirectError("MLX Metal unavailable")
+    ``target`` selects the codegen backend: ``None``/``"metal..."`` keeps the
+    Metal cooperative ``matmul2d`` route (Apple, unchanged); ``"cuda..."``
+    selects the CUDA register-fragment dequant->``T.gemm`` twin (gb10 / sm_121).
+    RULE #1: on a CUDA host the cuda prim is the ONE fp8 path -- a
+    compile/dispatch failure RAISES with where+what, never a silent fall to the
+    Metal LUT route, to bf16, or to degraded precision.
+    """
+
+    _require_fp8_host_for_target(target)
     A, A_scale, B, B_scale, M, N, K = _normalize_inputs(
         A_fp8,
         B_fp8,
@@ -546,7 +769,10 @@ def fp8_scaled_matmul_path_c_direct(
             BK=int(BK),
             num_stages=int(num_stages),
             c_dtype=c_dtype,
+            target=target,
         )
+    except FP8MatmulPathCDirectError:
+        raise
     except Exception as exc:
         raise FP8MatmulPathCDirectError(
             f"direct tvm-ffi FP8 matmul compile failed: {type(exc).__name__}: {exc}"
@@ -582,13 +808,16 @@ def fp8_scaled_matmul_path_c(
     BK: int = 32,
     num_stages: int = 0,
     out: mx.array | None = None,
+    target: Any = None,
 ) -> mx.array | None:
     """Run dense FP8 Path C matmul over prepared GPU buffers.
 
     ``A_fp8`` is ``(M,K)`` uint8 e4m3 storage and ``B_fp8`` is transposed
     ``(N,K)`` storage. Scales are scalar fp32 only in this first prepared-buffer
-    surface. When ``out`` is provided, runs the direct tvm-ffi owner-output
-    route and returns that same object. Without ``out``, this function fails
+    surface. ``target`` selects the codegen backend (``None``/``"metal..."`` =>
+    Metal cooperative matmul2d; ``"cuda..."`` => CUDA fragment-C dequant->T.gemm
+    twin). When ``out`` is provided, runs the direct tvm-ffi owner-output route
+    and returns that same object. Without ``out``, this function fails
     explicitly: there is no non-owner-output Path C dispatch surface.
     """
 
@@ -603,12 +832,36 @@ def fp8_scaled_matmul_path_c(
             BN=BN,
             BK=BK,
             num_stages=num_stages,
+            target=target,
         )
 
     _raise_owner_output_required("fp8_scaled_matmul_path_c")
 
 
-def fp8_matmul_path_c_status() -> FP8MatmulPathCStatus:
+def fp8_matmul_path_c_status(target: Any = None) -> FP8MatmulPathCStatus:
+    """Report whether the dense FP8 Path C matmul is dispatchable on this host.
+
+    ``target`` selects which backend's availability is reported:
+      * ``None``/``"metal..."`` -> requires a working MLX Metal backend (Apple).
+      * ``"cuda..."`` -> requires a CUDA host (torch.cuda + tilelang) via
+        :func:`cuda_eager_available`; on gb10 / sm_121 this returns available
+        (the CUDA fragment-C dequant->T.gemm twin), NOT "MLX Metal unavailable".
+
+    RULE #1: the cuda branch never reports the Metal-unavailable reason on a
+    CUDA host, and the metal branch is unchanged on Apple.
+    """
+    resolved = _resolve_fp8_compile_target(target)
+    kind = str(getattr(getattr(resolved, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        ok, reason = cuda_eager_available()
+        if not ok:
+            return FP8MatmulPathCStatus(False, reason, target="cuda")
+        return FP8MatmulPathCStatus(
+            True,
+            "dense FP8 Path C prepared-buffer owner-output matmul is "
+            "dispatchable (cuda fragment-C dequant->T.gemm, sm_121)",
+            target="cuda",
+        )
     if not can_run_metal():
         return FP8MatmulPathCStatus(False, "MLX Metal unavailable")
     try:
@@ -632,3 +885,35 @@ __all__ = [
     "fp8_scaled_matmul_path_c_direct",
     "fp8_scaled_matmul_path_c",
 ]
+
+
+def fp8_scaled_matmul_path_c_cuda_prim(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    num_stages: int = 0,
+    c_dtype: str = "float32",
+) -> Any:
+    """Public alias: build the CUDA (sm_121) dequant->half->``T.gemm`` prim.
+
+    Thin wrapper over :func:`_make_scaled_matmul2d_cuda_kernel` exposed under
+    the name the round-3 port plan references. Returns the compiled-ready
+    ``@T.prim_func`` (register-fragment C, plain ``shared`` operands, the
+    scalar-scratch e4m3->half decode); ``None`` when no legal cooperative tile
+    divides ``M/N/K`` (the caller RAISES on a CUDA host -- RULE #1). Compile it
+    via :func:`tilelang.compile` with ``target=_as_cuda_target("cuda")`` and
+    ``pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized":
+    True}`` -- exactly what :func:`_fp8_matmul_tvm_ffi_kernel_for` does on the
+    cuda branch.
+    """
+    return _make_scaled_matmul2d_cuda_kernel(
+        M=M,
+        N=N,
+        K=K,
+        num_stages=num_stages,
+        c_dtype=c_dtype,
+    )
+
+
+__all__.append("fp8_scaled_matmul_path_c_cuda_prim")

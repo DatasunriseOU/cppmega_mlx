@@ -13,9 +13,13 @@ RECORDED as the measured gap, never silently skipped):
        wrapped in te.fp8_autocast — the proven gb10 cuBLASLt FP8 CUDA path
        (scripts/_nvfp4_route.py already drives te.Linear/te.fp8_autocast here).
   R2 = our cppmega_mlx fp8 cooperative T.gemm (fp8->fp16 dequant +
-       T.gemm, _fp8_scaled_matmul2d_kernel_template). Metal-only today, so on
-       gb10 it RAISES "MLX Metal unavailable" — recorded as the measured
-       "needs-a-CUDA-emission" gap that scopes round 3.
+       T.gemm). On gb10 this now drives the CUDA fragment-C twin
+       (fp8_scaled_matmul_path_c_cuda_prim, compiled target=cuda with the
+       sm_121 TMA + warp-spec escape-hatch pass_configs) — a REAL e4m3
+       tensor-core measurement, with the honest e4m3-vs-bf16 rel_err over all
+       elements (the >0.10 gate catches a secret bf16/garbage run). RULE #1:
+       compile/dispatch failure is RECORDED with where+what, never a silent
+       fall to the Metal LUT route, to TE, or to bf16.
 
 Single-run discipline: ONLY the Profile agent runs this, sequentially, after
 polling gb10 IDLE + free>105GB. It RAISES on NaN/Inf (no degraded path).
@@ -207,38 +211,123 @@ def run_te_fp8(shape: GemmShape, ref_out, a_bf16, w_bf16, *, iters: int, warmup:
 
 
 # -----------------------------------------------------------------------------
-# R2 — our cppmega_mlx fp8 cooperative T.gemm (Metal-only today)
+# R2 — our cppmega_mlx fp8 cooperative T.gemm (CUDA fragment-C twin on gb10)
 # -----------------------------------------------------------------------------
-def run_tilelang_fp8(shape: GemmShape, ref_out, *, iters: int, warmup: int) -> RouteResult:
-    """The in-house fp8 cooperative T.gemm path. On gb10 (CUDA) the current build
-    is Metal-only and RAISES 'MLX Metal unavailable' — that is the measured gap
-    that scopes a CUDA emission (round 3), RECORDED honestly, not pretended-ran."""
+def _quantize_pertensor_fp8(t):
+    """Per-tensor amax -> e4m3 (uint8 storage) + fp32 dequant scale, via fp8_amax.
+
+    Reuses fp8_pack_tilelang (the CUDA-ready per-tensor amax + RNE e4m3 cast);
+    returns (fp8_u8, scale_f32_scalar) where ``scale = amax/448`` is the
+    post-gemm dequant multiplier. RAISES on non-finite amax (fp8_pack_tilelang).
+    """
+    import torch
+
+    from cppmega_mlx.nn._tilelang.fp8_amax import fp8_pack_tilelang
+
+    fp8_e4m3, scale, _orig_dtype = fp8_pack_tilelang(t)
+    # The cooperative kernel consumes the e4m3 *bytes* as uint8 storage.
+    fp8_u8 = fp8_e4m3.view(torch.uint8).contiguous()
+    scale_buf = scale.reshape(1).to(dtype=torch.float32, device=t.device)
+    return fp8_u8, scale_buf
+
+
+def run_tilelang_fp8(shape: GemmShape, ref_out, a_bf16, w_bf16, *,
+                     iters: int, warmup: int) -> RouteResult:
+    """In-house fp8 e4m3 dequant->half->T.gemm, CUDA fragment-C twin (sm_121).
+
+    Quantizes the SAME a_bf16/w_bf16 the bf16 reference used (per-tensor amax via
+    fp8_amax) to e4m3, compiles the CUDA prim
+    (``fp8_scaled_matmul_path_c_cuda_prim`` -> tilelang.compile(target=cuda,
+    pass_configs disable TMA + warp-spec)), and times a REAL e4m3 tensor-core
+    GEMM. The realized value is (A/scale_a · W/scale_b)·scale_a·scale_b ≈ A·W —
+    the same logical matmul as the bf16 reference, differing ONLY in 3-bit-mantissa
+    operand precision; rel_err is reported over ALL elements (honest, no subset).
+
+    RULE #1: a compile/dispatch failure RAISES (recorded ran=False with the
+    precise where+what). It NEVER falls back to the Metal LUT route, to TE, or to
+    bf16; the >0.10 rel_err parity gate would catch a secret bf16/garbage run.
+    """
     name = "R2_tilelang_coop"
     try:
+        import tilelang
+        import torch
+
+        from cppmega_mlx.nn._tilelang._msl_transform import _as_cuda_target
         from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import (
             fp8_matmul_path_c_status,
+            fp8_scaled_matmul_path_c_cuda_prim,
         )
     except Exception as exc:
         return RouteResult(name, ran=False, reason=f"import failed: {exc!r}")
 
-    status = fp8_matmul_path_c_status()
+    status = fp8_matmul_path_c_status(target="cuda")
     if not status.available:
         return RouteResult(
             name, ran=False,
             reason=(
-                f"fp8_matmul_path_c unavailable on this host: {status.reason}. "
-                "The cooperative T.gemm fp8 kernel is Metal-only today; a "
-                "target='cuda' emission of _fp8_scaled_matmul2d_kernel_template "
-                "is the round-3 work item (docs/FP8-ACTIVATIONS-PATHC.md §6.2)."
+                f"fp8_matmul_path_c (cuda target) unavailable on this host: "
+                f"{status.reason}."
             ),
         )
-    # If a future build exposes a CUDA emission, wire the owner-output call here.
+
+    M, N, K = shape.M, shape.N, shape.K
+    try:
+        # Quantize the IDENTICAL reference operands to e4m3 (per-tensor amax).
+        a_fp8, scale_a = _quantize_pertensor_fp8(a_bf16)          # (M,K) u8, (1,) f32
+        w_fp8, scale_b = _quantize_pertensor_fp8(w_bf16)          # (N,K) u8, (1,) f32
+
+        # Build + compile the CUDA fragment-C dequant->T.gemm prim. out_idx=[4]
+        # -> the kernel owns/returns the (M,N) fp32 output C (the 5th tensor).
+        prim = fp8_scaled_matmul_path_c_cuda_prim(M=M, N=N, K=K, c_dtype="float32")
+        if prim is None:
+            return RouteResult(
+                name, ran=False,
+                reason=(
+                    f"no legal cooperative tile divides M={M} N={N} K={K}; the "
+                    "CUDA dequant->T.gemm kernel cannot tile this shape (RULE #1: "
+                    "no silent partial-tile / no Metal-dot4 sibling on CUDA)."
+                ),
+            )
+        kernel = tilelang.compile(
+            prim,
+            target=_as_cuda_target("cuda"),
+            out_idx=[4],
+            pass_configs={
+                "tl.disable_tma_lower": True,
+                "tl.disable_warp_specialized": True,
+            },
+        )
+    except Exception as exc:
+        # RULE #1: a compile failure is RECORDED with where+what, never hidden.
+        return RouteResult(
+            name, ran=False,
+            reason=(
+                f"cuda coop fp8 T.gemm compile failed: {type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc(limit=4)}"
+            ),
+        )
+
+    try:
+        def _call():
+            return kernel(a_fp8, scale_a, w_fp8, scale_b)
+
+        median_ms, out = _time_cuda(_call, iters=iters, warmup=warmup)
+    except Exception as exc:
+        # RULE #1: a dispatch failure is RECORDED with where+what, never hidden.
+        return RouteResult(
+            name, ran=False,
+            reason=(
+                f"cuda coop fp8 T.gemm dispatch failed: {type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc(limit=4)}"
+            ),
+        )
+
+    tflops = shape.flops / (median_ms * 1e-3) / 1e12
+    rel = _rel_err(out, ref_out)
     return RouteResult(
-        name, ran=False,
-        reason=(
-            "fp8_matmul_path_c reports available but this microbench has no CUDA "
-            "owner-output driver wired yet — add it when the CUDA emission lands."
-        ),
+        name, ran=True, tflops=tflops, median_ms=median_ms,
+        rel_err=rel, finite=True,
+        reason="cuda fragment-C dequant->T.gemm (fp8_matmul_path_c_cuda_prim, sm_121)",
     )
 
 
@@ -328,10 +417,16 @@ def run(shapes: list[GemmShape], *, iters: int, warmup: int,
             res.routes.append(RouteResult("R1_te", ran=False, reason="--no-te"))
 
         if do_tl:
-            r = run_tilelang_fp8(shape, ref_out, iters=iters, warmup=warmup)
+            r = run_tilelang_fp8(shape, ref_out, a_bf16, w_bf16,
+                                 iters=iters, warmup=warmup)
             res.routes.append(r)
-            print(f"   {r.route}: {'RAN' if r.ran else 'GAP'} — "
-                  f"{r.reason.splitlines()[0] if r.reason else 'ok'}", flush=True)
+            if r.ran:
+                speedup = (r.tflops or 0) / bf16_tflops
+                print(f"   {r.route}: {r.tflops:8.1f} TFLOPs  ({r.median_ms:.3f} ms)  "
+                      f"{speedup:.2f}x vs bf16  rel_err={r.rel_err:.4e}", flush=True)
+            else:
+                print(f"   {r.route}: GAP — "
+                      f"{r.reason.splitlines()[0] if r.reason else 'ok'}", flush=True)
         else:
             res.routes.append(RouteResult("R2_tilelang", ran=False, reason="--no-tl"))
 
