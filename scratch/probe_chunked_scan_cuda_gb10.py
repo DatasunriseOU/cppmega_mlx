@@ -255,7 +255,19 @@ def probe_f0_f1(batch, seqlen, chunk, ngroups, nheads, headdim, dstate):
 
 def main():
     prod = "--prod" in sys.argv
+    # TRACK 1 (4x batch): --bs4 flips the prod cfg's micro-batch axis 1 -> 4. The
+    # builders + grids already consume ``batch`` (grid total scales by batch), so
+    # this is a pure cfg change; the F0/F1/F2 kernels need NO edit. RULE #1: --bs4
+    # only takes effect under --prod (the prod tile is the only bs4 target here);
+    # combining --bs4 without --prod RAISES rather than silently ignoring it.
+    bs4 = "--bs4" in sys.argv
+    if bs4 and not prod:
+        print("FAIL-LOUD: --bs4 requires --prod (the bs4 target is the prod tile); "
+              "RULE #1: refusing to silently ignore --bs4")
+        sys.exit(2)
+    batch = 4 if bs4 else 1
     print("=== CUDA chunked-scan probe (gb10 sm_121) ===")
+    print(f"micro_batch_size={batch} (--bs4={bs4})")
     print("torch", torch.__version__, "cuda_avail", torch.cuda.is_available(),
           "dev", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NONE")
     if not torch.cuda.is_available():
@@ -264,7 +276,40 @@ def main():
 
     if prod:
         # production local_gb10_quarter: S=4096 c=64 h=112 p=64 n=64 g=8
-        cfgs = [dict(batch=1, seqlen=4096, chunk=64, ngroups=8, nheads=112, headdim=64, dstate=64)]
+        cfgs = [dict(batch=batch, seqlen=4096, chunk=64, ngroups=8, nheads=112,
+                     headdim=64, dstate=64)]
+        # bs4 grid sanity (open question #4): the batch axis is an OUTER grid axis,
+        # orthogonal to the head/group tiling, so the F0/F2 grid total must be
+        # EXACTLY ``batch``x the bs1 grid total at the same head/group shape. RULE
+        # #1: a grid total that is NOT batch-proportional means batch did not reach
+        # the launch grid -> RAISE.
+        if bs4:
+            from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+                chunk_scan_fwd_grid,
+            )
+            from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
+                chunk_precompute_fwd_grid,
+            )
+            _c = cfgs[0]
+            _bs1 = dict(_c, batch=1)
+            for _label, _grid_fn in (
+                ("F2", chunk_scan_fwd_grid),
+                ("F0", chunk_precompute_fwd_grid),
+            ):
+                _tg1, _ = _grid_fn(_bs1["batch"], _bs1["seqlen"], _bs1["chunk"],
+                                   _bs1["ngroups"], _bs1["nheads"], _bs1["headdim"],
+                                   _bs1["dstate"])
+                _tg4, _ = _grid_fn(_c["batch"], _c["seqlen"], _c["chunk"],
+                                   _c["ngroups"], _c["nheads"], _c["headdim"],
+                                   _c["dstate"])
+                if _tg4 != _tg1 * batch:
+                    raise RuntimeError(
+                        f"FAIL-LOUD: {_label} grid total at bs{batch} ({_tg4}) is not "
+                        f"{batch}x the bs1 grid total ({_tg1}); batch did not reach "
+                        "the launch grid (RULE #1: no silent bs4->bs1)"
+                    )
+                print(f"[{_label}] bs4 grid sanity OK: tg(bs1)={_tg1} -> "
+                      f"tg(bs{batch})={_tg4} == {batch}x")
     else:
         # small first (fast compile/run feedback), then a medium one.
         cfgs = [

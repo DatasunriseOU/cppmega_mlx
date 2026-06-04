@@ -2377,6 +2377,13 @@ def build_path_c_descriptor_prim_func(
             op_name=nodes[0].op_name,
             production_source=descriptors[0].production_source,
             shape_env=resolved_shape_env,
+            # Thread the micro-batch axis EXPLICITLY: the delegation prim's
+            # ``batch: int = 1`` default is the canonical silent-fallback trap —
+            # if we passed no batch= the F0..B2 grid kernels would compile bs1
+            # even when the surrounding step is bs4 (degraded/wrong, not a crash).
+            # Sourcing it from ``resolved_shape_env.batch`` keeps banks and kernels
+            # on the SAME single source of truth (RULE #1).
+            batch=int(resolved_shape_env.batch),
         )
         delegated_prim._cppmega_path_c_schedule_generator = (
             PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR
@@ -2430,6 +2437,49 @@ def build_path_c_descriptor_prim_func(
             for param in tuple(getattr(delegated_prim, "params", ()))
             if not (hasattr(param, "is_scalar") and bool(param.is_scalar()))
         )
+        # RULE #1 BATCH-CONSISTENCY GUARD (no silent bs4->bs1): the region surface
+        # sized its handoff/region banks for ``resolved_shape_env.batch`` (via
+        # ``_mamba3_chunked_fwd_region_buffer_shape``); the compiled grid kernel was
+        # compiled for the SAME batch (passed above). If a half-threaded path let
+        # them disagree, a bs4 kernel writing into a bs1-sized bank would be a
+        # silent out-of-bounds / truncation. Cross-check the compiled kernel's
+        # device-buffer param leading dim against the region-declared batch for
+        # every buffer whose region shape carries an explicit leading ``batch``
+        # axis (the per-token/per-state chunked banks; the bare ``A``/``D`` vectors
+        # and any scalar slots carry no batch axis and are skipped). RAISE with
+        # WHERE (buffer name) + WHAT (expected batch vs prim leading dim).
+        _expected_batch = int(resolved_shape_env.batch)
+        if len(delegated_buffer_order) == len(delegated_buffer_params):
+            for _bufname, _param in zip(
+                delegated_buffer_order, delegated_buffer_params
+            ):
+                _region_shape = _mamba3_chunked_fwd_region_buffer_shape(
+                    _bufname, resolved_shape_env
+                )
+                if _region_shape is None or len(_region_shape) == 0:
+                    continue
+                # The chunked region buffers that carry an outer batch axis declare
+                # it as dim 0 == batch (x/B/C/dt/h0/cb/.../final_state/d*). Vectors
+                # like A=(nheads,)/D=(nheads,) have a leading dim != batch by design
+                # — skip those (their dim 0 is a head/feature count, not batch).
+                if int(_region_shape[0]) != _expected_batch:
+                    continue
+                _prim_shape = tuple(
+                    int(dim) for dim in tuple(getattr(_param, "shape", ()))
+                )
+                if len(_prim_shape) == 0:
+                    continue
+                if int(_prim_shape[0]) != _expected_batch:
+                    raise ValueError(
+                        "mamba3 chunked-scan delegation batch mismatch for buffer "
+                        f"{_bufname!r}: region surface sized leading dim "
+                        f"{_expected_batch} (shape_env.batch) but the compiled grid "
+                        f"kernel param leading dim is {int(_prim_shape[0])} "
+                        f"(prim shape {_prim_shape}). A half-threaded bs"
+                        f"{_expected_batch} path would write OOB into a bs"
+                        f"{int(_prim_shape[0])}-sized bank (RULE #1: no silent "
+                        "bs4->bs1 fallback)."
+                    )
         # Attach the named-buffer ABI only when the region surface's ordered
         # buffers RECONCILE 1:1 with the kernel's device-buffer param slots. The
         # FULL model surface declares exactly the kernel's inputs+outputs (verified
@@ -7499,7 +7549,9 @@ def _append_row_phased_mamba3_body(
             _chunked_limit,
         ) = _mamba3_chunked_forward_scan_feasibility(
             sequence_length=int(shape_env.sequence_length),
-            batch=1,
+            # Thread the micro-batch axis for consistency (flag-OFF serial-emit
+            # classification only; does not change grid feasibility True/False).
+            batch=int(shape_env.batch),
             heads=heads,
             head_dim=head_dim,
             state_dim=state_dim,
@@ -14691,7 +14743,11 @@ def _mamba3_chunked_fwd_region_buffer_shape(
             break
     if suffix is None:
         return None
-    batch = 1
+    # Outer micro-batch axis: every chunked region/handoff bank below carries
+    # ``batch`` as leading dim, so this single source resizes ALL of them to bs4
+    # (or any bsN). RULE #1: sourced from the SAME shape_env the delegation prim
+    # compiles against, so banks and kernels cannot disagree.
+    batch = int(shape_env.batch)
     seqlen = int(shape_env.sequence_length)
     nheads = int(shape_env.mamba_num_heads)
     headdim = int(shape_env.mamba_head_dim)
@@ -14755,6 +14811,15 @@ def _buffer_shape(
     q_dim = q_heads * head_dim
     kv_dim = kv_heads * head_dim
     topk = shape_env.attention_sparse_topk
+    # Outer micro-batch axis. RULE #1: applied EXPLICITLY, per-buffer, ONLY to the
+    # per-token activation/state/checkpoint banks below — NEVER to weight banks
+    # (mamba3_in_proj_weight, *_norm_weight, lm_head_weight, dt_bias, D,
+    # conv_weight, ...), which are batch-INVARIANT. A blanket multiply would 4x the
+    # parameter banks (wrong) and break the param-1x liveness model + the bs1
+    # self-check. The chunked region buffers (x/B/C/cb/prev_states/...) already
+    # carried batch via _mamba3_chunked_fwd_region_buffer_shape above and never
+    # reach here.
+    batch = int(shape_env.batch)
     if name in {
         "hidden",
         "mamba3_delta",
@@ -14765,20 +14830,27 @@ def _buffer_shape(
         "hidden_after_m2rnn",
         "attention_out",
     }:
-        return (seq * hidden,)
+        return (batch * seq * hidden,)
     if _is_mamba3_state_like_buffer(buffer_name, name):
         return (
-            shape_env.mamba_num_heads
+            batch
+            * shape_env.mamba_num_heads
             * shape_env.mamba_head_dim
             * shape_env.mamba_state_dim,
         )
     if name == "mamba3_angle_state":
         return (
-            max(1, shape_env.mamba_num_heads * shape_env.mamba_num_rope_angles),
+            max(
+                1,
+                batch * shape_env.mamba_num_heads * shape_env.mamba_num_rope_angles,
+            ),
         )
     if name == "mamba3_angle_grad_state":
         return (
-            max(1, shape_env.mamba_num_heads * shape_env.mamba_num_rope_angles),
+            max(
+                1,
+                batch * shape_env.mamba_num_heads * shape_env.mamba_num_rope_angles,
+            ),
         )
     if name == "mamba3_angle_checkpoint":
         checkpoint_interval = MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL
@@ -14786,7 +14858,8 @@ def _buffer_shape(
             shape_env.sequence_length + checkpoint_interval - 1
         ) // checkpoint_interval
         return (
-            (checkpoint_count + 1)
+            batch
+            * (checkpoint_count + 1)
             * max(1, shape_env.mamba_num_heads * shape_env.mamba_num_rope_angles),
         )
     if name == "mamba3_h_checkpoint":
@@ -14795,7 +14868,8 @@ def _buffer_shape(
             shape_env.sequence_length + checkpoint_interval - 1
         ) // checkpoint_interval
         return (
-            (checkpoint_count + 1)
+            batch
+            * (checkpoint_count + 1)
             * shape_env.mamba_num_heads
             * shape_env.mamba_head_dim
             * shape_env.mamba_state_dim,
@@ -14804,7 +14878,9 @@ def _buffer_shape(
         return (
             max(
                 1,
-                (shape_env.mamba_conv_kernel - 1) * shape_env.mamba_conv_channels,
+                batch
+                * (shape_env.mamba_conv_kernel - 1)
+                * shape_env.mamba_conv_channels,
             ),
         )
     if name == "mamba3_in_proj_weight":
@@ -14841,7 +14917,7 @@ def _buffer_shape(
         # the eager ``layers.{first_in_region}.norm.weight`` parameter.
         return (hidden,)
     if name in {"target_ids", "target_mask"}:
-        return (seq,)
+        return (batch * seq,)
     if name == "lm_head_weight":
         vocab = max(1, int(getattr(shape_env, "vocab_size", 0) or 0))
         return (vocab * hidden,)
@@ -14865,7 +14941,8 @@ def _buffer_shape(
         return (hidden * shape_env.m2rnn_num_heads * shape_env.m2rnn_v_head_dim,)
     if name in {"m2rnn_h0", "m2rnn_h_state"}:
         return (
-            shape_env.m2rnn_num_heads
+            batch
+            * shape_env.m2rnn_num_heads
             * shape_env.m2rnn_k_head_dim
             * shape_env.m2rnn_v_head_dim,
         )
@@ -14875,13 +14952,16 @@ def _buffer_shape(
             shape_env.sequence_length + checkpoint_interval - 1
         ) // checkpoint_interval
         return (
-            (checkpoint_count + 1)
+            batch
+            * (checkpoint_count + 1)
             * shape_env.m2rnn_num_heads
             * shape_env.m2rnn_k_head_dim
             * shape_env.m2rnn_v_head_dim,
         )
     if name == "m2rnn_conv_state":
-        return ((shape_env.m2rnn_conv_kernel - 1) * shape_env.m2rnn_conv_dim,)
+        return (
+            batch * (shape_env.m2rnn_conv_kernel - 1) * shape_env.m2rnn_conv_dim,
+        )
     if name == "attention_q_proj_weight":
         return (q_dim * hidden,)
     if name == "attention_q_proj_bias":
@@ -14897,17 +14977,17 @@ def _buffer_shape(
     if name == "attention_out_proj_bias":
         return (hidden,)
     if name == "q_fp8":
-        return (seq * q_heads * head_dim,)
+        return (batch * seq * q_heads * head_dim,)
     if name == "q_scale":
-        return (seq * q_heads,)
+        return (batch * seq * q_heads,)
     if name == "kv_fp8":
-        return (seq * kv_heads * head_dim,)
+        return (batch * seq * kv_heads * head_dim,)
     if name == "kv_scale":
-        return (seq * kv_heads,)
+        return (batch * seq * kv_heads,)
     if name == "indices":
-        return (seq * kv_heads * topk,)
+        return (batch * seq * kv_heads * topk,)
     if name == "lse":
-        return (seq * q_heads,)
+        return (batch * seq * q_heads,)
     if name == "sparse_mla_sm_scale":
         return (1,)
     if name == "sparse_mla_sinks":
@@ -14920,7 +15000,7 @@ def _buffer_shape(
         or name.endswith("_delta")
         or name.endswith("_out")
     ):
-        return (seq * hidden,)
+        return (batch * seq * hidden,)
     return (buffer_extent,)
 
 

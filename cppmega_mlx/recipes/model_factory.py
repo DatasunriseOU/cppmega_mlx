@@ -132,6 +132,13 @@ class ModelFactoryProfile:
     num_attention_heads: int
     head_dim: int
     vocab_size: int
+    # Outer micro-batch axis for the path_c gridded step. Default 1 keeps every
+    # existing profile/consumer at the historical bs1 behavior byte-for-byte; set
+    # it to 4 (via ``local_gb10_quarter_profile(micro_batch_size=4)`` or a
+    # ``replace``) to select the bs4 gridded path. It is threaded onto the
+    # HybridTinyConfig the profile yields so the path_c shape-env reads it as the
+    # single source of truth. RULE #1: a non-positive value RAISES in __post_init__.
+    micro_batch_size: int = 1
     max_seq_length: int = LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH
     dsa_a_layer_ranks: tuple[int, ...] = LOCAL_GB10_QUARTER_DSA_A_LAYER_RANKS
     dsa_indexer_n_heads: int | None = 32
@@ -161,6 +168,7 @@ class ModelFactoryProfile:
         _require_positive("num_attention_heads", self.num_attention_heads)
         _require_positive("head_dim", self.head_dim)
         _require_positive("vocab_size", self.vocab_size)
+        _require_positive("micro_batch_size", self.micro_batch_size)
         _require_positive("max_seq_length", self.max_seq_length)
         _require_positive("moe_num_experts", self.moe_num_experts)
         _require_positive("moe_top_k", self.moe_top_k)
@@ -217,9 +225,43 @@ class ModelFactoryProfile:
         )
 
     def hybrid_config(self, **overrides) -> HybridTinyConfig:
-        """Return a HybridTinyConfig using existing NAM56R-to-MLX mapping."""
+        """Return a HybridTinyConfig using existing NAM56R-to-MLX mapping.
 
-        return build_hybrid_tiny_config_from_nam56r(self.nam56r_config(), **overrides)
+        The profile's ``micro_batch_size`` rides onto the returned config as the
+        single source of truth for the path_c gridded step's outer batch axis
+        (``_path_c_model_shape_env_from_config`` reads ``config.micro_batch_size``).
+        ``HybridTinyConfig`` is a frozen dataclass with no such field, so the value
+        is carried directly on the instance via ``object.__setattr__`` (the
+        documented "carry it on the config/region directly" path). RULE #1: an
+        explicit ``micro_batch_size`` override that conflicts with the profile's is
+        rejected, and the carried value is read back and asserted — a value that
+        failed to stick RAISES rather than silently reverting to bs1.
+        """
+
+        requested_batch = int(self.micro_batch_size)
+        if "micro_batch_size" in overrides:
+            override_batch = int(overrides.pop("micro_batch_size"))
+            if override_batch < 1:
+                raise ValueError(
+                    "hybrid_config(micro_batch_size=...) must be a positive int "
+                    f"(got {override_batch!r}); RULE #1 forbids a silent clamp to 1"
+                )
+            requested_batch = override_batch
+        config = build_hybrid_tiny_config_from_nam56r(
+            self.nam56r_config(), **overrides
+        )
+        # Carry the micro-batch axis onto the frozen config instance (no field in
+        # HybridTinyConfig) so the path_c shape-env reads ONE source of truth.
+        object.__setattr__(config, "micro_batch_size", requested_batch)
+        carried = int(getattr(config, "micro_batch_size", 0))
+        if carried != requested_batch:
+            raise RuntimeError(
+                "model_factory.hybrid_config: failed to carry micro_batch_size "
+                f"onto the HybridTinyConfig (requested {requested_batch}, read back "
+                f"{carried!r}); RULE #1: refusing a silent bs{requested_batch}->bs1 "
+                "revert"
+            )
+        return config
 
     def tiny_smoke_config(self, **overrides) -> HybridTinyConfig:
         """Return a small T=512-capable config preserving this route profile."""

@@ -653,7 +653,18 @@ def main():
     # max|abs|. The parity chain (B1/B0 + the 8-grad gate) is UNCHANGED and uses the
     # env-selected B2 (v1 byte-identical unless CPPMEGA_PATH_C_B2_V2 is set).
     b2_v2_ab = "--b2-v2-ab" in sys.argv
+    # TRACK 1 (4x batch): --bs4 flips the prod cfg's micro-batch axis 1 -> 4. The
+    # B0/B1/B2 builders + grids already consume ``batch`` (grid total scales by
+    # batch); this is a pure cfg change, no kernel edit. RULE #1: --bs4 requires
+    # --prod and is never silently ignored.
+    bs4 = "--bs4" in sys.argv
+    if bs4 and not prod:
+        print("FAIL-LOUD: --bs4 requires --prod (the bs4 target is the prod tile); "
+              "RULE #1: refusing to silently ignore --bs4")
+        sys.exit(2)
+    batch = 4 if bs4 else 1
     print("=== CUDA chunked-BACKWARD probe (gb10 sm_121) ===")
+    print(f"micro_batch_size={batch} (--bs4={bs4})")
     print("torch", torch.__version__, "cuda_avail", torch.cuda.is_available(),
           "dev", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NONE")
     if not torch.cuda.is_available():
@@ -661,7 +672,7 @@ def main():
         sys.exit(2)
 
     if prod:
-        cfgs = [dict(batch=1, seqlen=4096, chunk=64, ngroups=8, nheads=112,
+        cfgs = [dict(batch=batch, seqlen=4096, chunk=64, ngroups=8, nheads=112,
                      headdim=64, dstate=64)]
     else:
         cfgs = [dict(batch=1, seqlen=256, chunk=64, ngroups=1, nheads=2,

@@ -433,6 +433,19 @@ class PathCModelShapeEnv:
     m2rnn_conv_kernel: int
     model_value_dtype: str = "float32"
     vocab_size: int = 0
+    # Outer micro-batch axis threaded into every gridded F0/F1/F2/B0/B1/B2 builder
+    # and into the per-token activation/state bank shapes. Default 1 keeps the
+    # historical bs1 behavior byte-identical for every existing caller; a >1 value
+    # selects the bs4 (or any bsN) gridded path. RULE #1: an invalid batch RAISES
+    # in __post_init__ (no silent clamp to 1).
+    batch: int = 1
+
+    def __post_init__(self) -> None:
+        if int(self.batch) < 1:
+            raise ValueError(
+                "PathCModelShapeEnv.batch must be a positive micro-batch size "
+                f"(got {self.batch!r}); RULE #1 forbids a silent clamp to 1"
+            )
 
     @property
     def mamba_inner_dim(self) -> int:
@@ -1438,9 +1451,26 @@ def _path_c_model_shape_env_from_config(config: Any | None) -> PathCModelShapeEn
         hidden_size = int(getattr(config, "hidden_size"))
     except AttributeError:
         return None
+    # Micro-batch axis (bs1 default for every config that does not carry it; bs4
+    # and friends ride on ``micro_batch_size``). RULE #1: a config that DOES carry
+    # a ``micro_batch_size`` must yield a usable positive int — if it is present
+    # but non-coercible/non-positive we RAISE rather than silently defaulting to 1
+    # (a silent bs4->bs1 revert is exactly the forbidden fallback).
+    raw_batch = getattr(config, "micro_batch_size", None)
+    if raw_batch is None:
+        batch = 1
+    else:
+        batch = int(raw_batch)
+        if batch < 1:
+            raise ValueError(
+                "Path C model shape-env: config.micro_batch_size must be a "
+                f"positive int (got {raw_batch!r}); RULE #1 forbids a silent "
+                "clamp/revert to bs1"
+            )
     return PathCModelShapeEnv(
         sequence_length=sequence_length,
         hidden_size=hidden_size,
+        batch=batch,
         attention_num_q_heads=int(attention_config.num_q_heads),
         attention_num_kv_heads=int(attention_config.kv_heads),
         attention_head_dim=int(attention_config.q_head_dim),

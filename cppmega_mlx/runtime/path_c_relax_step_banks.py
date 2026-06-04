@@ -105,6 +105,82 @@ def real_bank_numels() -> dict[str, int]:
     return parse_physical_bank_shapes(prim)
 
 
+def real_bank_numels_for_batch(micro_batch_size: int) -> dict[str, int]:
+    """Parse the real per-region bank numels for a chosen micro-batch size.
+
+    Threads ``micro_batch_size`` through the SAME profile->config->region->prim
+    pipeline as ``real_bank_numels`` (which is the ``micro_batch_size=1`` case), so
+    the bs4 banks flow automatically from the resized ``_buffer_shape`` /
+    ``_mamba3_chunked_fwd_region_buffer_shape``. RULE #1: a non-positive batch
+    RAISES (no silent clamp).
+    """
+    if int(micro_batch_size) < 1:
+        raise ValueError(
+            "real_bank_numels_for_batch: micro_batch_size must be positive "
+            f"(got {micro_batch_size!r})"
+        )
+    cfg = local_gb10_quarter_profile(
+        micro_batch_size=int(micro_batch_size)
+    ).hybrid_config()
+    region = build_path_c_model_region_from_route_symbols(
+        region_name="mr_path_c", route_symbols=("M", "R"), model_config=cfg,
+    )
+    prim = path_c_fusion_schedule_template(build_path_c_aot_autograd_region(region))
+    return parse_physical_bank_shapes(prim)
+
+
+def assert_batch_scaling(micro_batch_size: int) -> dict[str, dict[str, int]]:
+    """bs4 memory self-check: assert the param/paramg banks are batch-INVARIANT
+    (stay 1x) and the activation/activation-gradient/state banks scale ~linearly
+    with the micro-batch axis.
+
+    Returns the bs1 vs bsN numels per bank for reporting. RULE #1: a param/paramg
+    bank that changed size (an accidental blanket multiply over weights) RAISES;
+    an activation/state bank that did NOT scale (a half-threaded path that left a
+    bank at bs1 while the kernels run bsN) also RAISES.
+    """
+    b = int(micro_batch_size)
+    if b < 1:
+        raise ValueError(
+            f"assert_batch_scaling: micro_batch_size must be positive (got {b!r})"
+        )
+    base = real_bank_numels()
+    scaled = real_bank_numels_for_batch(b)
+    invariant_banks = (BANK_PARAM, BANK_PARAMG)
+    scaling_banks = (BANK_ACT, BANK_ACTG, BANK_STATE)
+    for key in invariant_banks:
+        if key not in base or key not in scaled:
+            raise RuntimeError(
+                f"assert_batch_scaling: missing weight bank {key!r} in parsed "
+                f"numels (base keys={sorted(base)}, scaled keys={sorted(scaled)})"
+            )
+        if scaled[key] != base[key]:
+            raise RuntimeError(
+                "assert_batch_scaling: weight bank "
+                f"{key!r} CHANGED size with micro_batch_size={b} "
+                f"({base[key]} -> {scaled[key]}); RULE #1: weight/grad banks MUST "
+                "stay 1x — an accidental blanket batch multiply over weights"
+            )
+    if b > 1:
+        for key in scaling_banks:
+            if key not in base or key not in scaled:
+                raise RuntimeError(
+                    f"assert_batch_scaling: missing scaling bank {key!r} in parsed "
+                    f"numels (base keys={sorted(base)}, scaled keys={sorted(scaled)})"
+                )
+            if scaled[key] <= base[key]:
+                raise RuntimeError(
+                    "assert_batch_scaling: activation/state bank "
+                    f"{key!r} did NOT grow with micro_batch_size={b} "
+                    f"({base[key]} -> {scaled[key]}); RULE #1: a half-threaded "
+                    f"path left this bank at bs1 while the kernels run bs{b}"
+                )
+    return {
+        "bs1": dict(base),
+        f"bs{b}": dict(scaled),
+    }
+
+
 # Short bank keys -> the real ABI bank names.
 BANK_ACT = "path_c_float32_activation_abi_bank"
 BANK_ACTG = "path_c_float32_activation_gradient_abi_bank"
