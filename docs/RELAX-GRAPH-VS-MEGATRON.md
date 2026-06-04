@@ -1815,3 +1815,73 @@ NVIDIA Dev Forum thread. On this GB10 sm_121a part the CUTLASS block-scaled MXFP
 
 So lever 3 moves from §22 NO-GO to **partial GO**: correct, real MXFP8, crosses bf16 — but the headline
 4–4.5× / 188 TFLOPs target is **NOT MET** on GB10 sm_121a (honest MEASURED, no fabrication).
+
+## §23. FUSED smem-resident SSD FORWARD — N=64 smem fit SOLVED + parity PASS, but the naïve serial-reduction fusion is a PERF NO-GO (126.7 ms, 40.7× SLOWER than cppmega's 3.11 ms) (MEASURED, gb10 sm_121, 2026-06-04)
+
+The §22 lever-5 prescription was: fuse F0/F1/F2 into ONE smem-resident SSD kernel (mirror cppmega's
+Triton `mamba_chunk_scan_combined`, state resident in smem) AND make the N=64 scan tile fit the GB10
+~99 KB cap. This round built `cppmega_mlx/nn/_tilelang/mamba3_ssd_fused_fwd.py`
+(`ssd_fused_fwd_cuda_prim`): a persistent per-(batch,head) threadgroup that loops the 64 chunks
+serially, carrying `state[headdim,dstate]` fp32 RESIDENT in shared memory — cb/dA_cumsum/summary/
+prev_states NEVER round-trip to global (only Output + final_state are written). Env-gated
+`CPPMEGA_MAMBA3_SSD_FUSED_FWD` (default OFF); the un-fused F0/F1/F2 + Metal path stay byte-identical.
+
+**ALL numbers MEASURED at the §17 prod cfg (S=4096 c=64 g=8 H=112 P=64 N=64 bs1), gb10 sm_121,
+`scratch/probe_ssd_fused_fwd_gb10.py --prod`, warm median over 20 timed device-resident dispatches.**
+
+### What WORKED (two real wins, both MEASURED)
+- **N=64 smem fit SOLVED — the fused kernel LAUNCHES at N=64.** Per-threadgroup static smem budget =
+  **82,688 B (80.75 KiB) < the 101,376 B (~99 KB) GB10 opt-in cap**, 18,688 B headroom (fp16 operand
+  tiles + fp32 accumulation; an all-fp32 staging would be 112.75 KiB and overflow). Grid `(1,112)` =
+  112 persistent threadgroups. COMPILE ok (out_idx=[7,8]), RUN ok, NaN=False.
+- **The un-fused F2 ALSO now LAUNCHES at N=64.** The §22 "F2 SEGFAULTS at launch at N=64" was NOT a
+  block_Dstate-vs-99KB-smem problem (F2's default `block_Dstate=128 ≥ dstate=64` already passes its
+  own guard); the actual root cause was a **dtype contract break**: `chunk_scan_fwd_cuda_prim` declared
+  `prev_states` fp16 while F1 writes it fp32 (§3.3) — a 2-byte-typed read of a 4-byte buffer walked the
+  dstate stride OOB → launch crash. The Phase-0 fix (declare `prev_states` accum_dtype) makes the
+  **whole un-fused F0→F1→F2 chain run end-to-end at prod N=64** (F2 RUN ok, NaN=False). This corrects
+  the §22 attribution of the segfault.
+- **Parity PASS over ALL elements (fp16 gate 5e-4).** fused-vs-un-fused: out max|abs| **4.883e-04**,
+  final_state **3.159e-06**. fused-vs-serial: out **4.750e-04**, final_state **1.818e-06**. un-fused-vs-serial:
+  out **4.750e-04**, final_state **4.977e-06**. The fused SSD math is numerically faithful.
+
+### What FAILED — the fused kernel is 40.7× SLOWER than the target (PERF NO-GO)
+| kernel | MEASURED fwd ms (prod) |
+|---|---|
+| **fused F0+F1+F2 (this round)** | **126.69 ms** (min 123.65) |
+| un-fused F0 | 24.57 ms |
+| un-fused F1 | 1.23 ms |
+| un-fused F2 | 4.22 ms |
+| **un-fused SUM (F0+F1+F2)** | **30.02 ms** |
+| cppmega Megatron fused (ref) | 3.11 ms |
+
+- fused vs un-fused = **0.24× (≈4.2× SLOWER)**. fused vs cppmega 3.11 ms = **40.74× SLOWER**.
+- **Root cause (honest): the fusion eliminated the global round-trips but replaced the GEMMs with
+  serial scalar reductions.** The un-fused F0/F2 use `T.gemm` (tensor cores) for cb=C@B^T, the diagonal
+  scan, and the off-diagonal C@state; the fused prim does every one of those as an explicit
+  `T.serial` scalar FMA loop over shared tiles, on a grid of only 112 threadgroups × 128 threads. The
+  per-chunk work (cb: L·L·N, Y_diag: L·P·L, summary: P·N·L) is now scalar, serial, and tensor-core-idle,
+  looped 64× per threadgroup. Killing the 16–24 ms of F0 global traffic was real, but it was dwarfed by
+  the ~100 ms of lost GEMM throughput. **Residency-without-tensor-cores is a net loss here.**
+- Note F0 measured **24.57 ms** this run (vs the §22-cited 16.37 ms) — same un-fused kernel, re-measured;
+  it remains the dominant un-fused cost and the ≥5× cppmega gap stands either way.
+
+### tok/s effect if wired into the §17 step
+NOT wired (env gate default OFF — nothing regresses). Wiring this fused fwd in would make the mamba
+forward **WORSE** (126.7 ms replacing the 30.0 ms un-fused chain, +96.7 ms/mamba-block/step), so the
+step tok/s would DROP, not rise. No tok/s gain to report — reporting a drop honestly rather than a
+fabricated speedup. EXTRAPOLATION only (not benchmarked end-to-end) because it is a clear regression and
+running it in the model would only confirm a slowdown.
+
+### GO / NO-GO (honest)
+- **GO: the N=64 smem-fit + launch goal of the "minimum viable win".** The prod config now runs
+  end-to-end at N=64 — both the new fused kernel AND the un-fused F2 (via the prev_states dtype fix).
+  Parity is clean over all elements.
+- **NO-GO: the perf goal (approach cppmega's 3.11 ms).** The naïve smem-resident scalar-reduction
+  fusion is 40.7× too slow. Smem-residency alone is not the lever; the lever is **GEMM/tensor-core
+  utilization**. The next iteration must keep the chunk state resident BUT do cb / Y_diag / Y_off /
+  summary as `T.gemm` (block-tiled, tensor-core) inside the persistent threadgroup — i.e. the cppmega
+  Triton structure (smem-resident block-MMA), not a per-(batch,head) serial scan. Until then the
+  un-fused F0/F1/F2 chain (30.0 ms, now N=64-clean) remains the production path. RULE #1: the fused path
+  stays env-gated OFF and RAISES on tile/smem/compile failure — it never silently replaces the faster
+  un-fused chain.
