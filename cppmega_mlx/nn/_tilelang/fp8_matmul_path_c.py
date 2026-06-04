@@ -638,6 +638,145 @@ def _make_scaled_matmul2d_cuda_native_kernel(
     return tilelang.language.prim_func(_fp8_scaled_matmul2d_cuda_native_kernel_template)
 
 
+# Lever fp8-mma-tune: a CLOSURE-parameterized, PIPELINED native-fp8 prim builder
+# the autotune harness drives. It is a STRICT SUPERSET of
+# :func:`_make_scaled_matmul2d_cuda_native_kernel` whose params (BM,BN,BK,threads,
+# num_stages,enable_rasteration) are bound as Python closure locals (NOT
+# ``globals().update`` mutation of the module template), so the tuner can vary the
+# tile per call without racing the shared module globals. The KERNEL BODY is the
+# verified SM120 fp8-input e4m3 MMA: e4m3 shared operands feed ``T.gemm`` directly
+# (-> ``tl::mma_sync<kFloat8_e4m3,kFloat8_e4m3,kFloat32,16,8,32>``), fp32 ``C_frag``
+# accumulate, the ``sa*sb`` epilogue, and ``disable_tma=True`` on every copy
+# (sm_121 TMA tensormap mis-aligns -> "Invalid TMA descriptor arguments").
+#
+# DELTAS vs the (still-default) module template
+# (:func:`_fp8_scaled_matmul2d_cuda_native_kernel_template`) -- which stays
+# BYTE-IDENTICAL so the production default + the Metal route are untouched:
+#   * the K loop is ``T.Pipelined(..., num_stages=num_stages)`` instead of
+#     ``T.serial(...)`` -- so ``num_stages`` is now LIVE (the module template's
+#     ``T.serial`` makes num_stages a NO-OP); num_stages=0 lowers to an
+#     un-pipelined single-buffer loop (parity with the current default).
+#   * ``threads`` parameterizes ``T.Kernel`` (the module template hard-binds
+#     ``_FP8_MM_THREADS``).
+#   * an OPTIONAL ``T.use_swizzle(panel_size=10, enable=enable_rasteration)``
+#     L2 rasterization hint (off by default -> emission parity with the module
+#     template when enable_rasteration=False).
+# RULE #1: this is the ONE tunable path; an illegal tile RAISES in the builder
+# (validated below, same gates as :func:`_native_fp8_tile_for`); a pipelining/
+# swizzle codegen failure RAISES at compile -- it never silently degrades to the
+# un-pipelined template or to bf16.
+
+
+def _make_scaled_matmul2d_cuda_native_tunable(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    block_M: int,
+    block_N: int,
+    block_K: int,
+    num_stages: int,
+    threads: int,
+    c_dtype: str = "float32",
+    enable_rasteration: bool = False,
+) -> Any:
+    """Build a PIPELINED, closure-parameterized native fp8-input e4m3 ``T.gemm`` prim.
+
+    All of ``block_M/block_N/block_K``, ``num_stages``, ``threads`` and
+    ``enable_rasteration`` are required (the autotuner supplies every axis); they
+    are captured as Python closure locals and validated against the fp8 m16n8k32
+    MMA hard constraints (BK%32==0, K%BK==0, BM%16==0, BN%8==0, M%BM==0, N%BN==0)
+    -- an illegal tile RAISES here (RULE #1: no silent re-tile / partial-tile).
+
+    The emitted body is identical math to the verified native template; only the
+    K loop (``T.Pipelined``), the ``T.Kernel`` ``threads``, and the optional
+    ``T.use_swizzle`` differ (see the module comment above). Returns a
+    ``@T.prim_func`` ready for :func:`tilelang.compile` with the same
+    ``tl.disable_tma_lower`` / ``tl.disable_warp_specialized`` pass_configs.
+    """
+    import tilelang  # noqa: F401
+    from tilelang import language as T
+
+    bm, bn, bk = int(block_M), int(block_N), int(block_K)
+    thr, ns = int(threads), int(num_stages)
+    M_i, N_i, K_i = int(M), int(N), int(K)
+    c_dt = str(c_dtype)
+    rasterize = bool(enable_rasteration)
+
+    # Validate the tile against the e4m3 m16n8k32 MMA gates (RULE #1: RAISE, the
+    # autotuner is expected to filter illegal configs out BEFORE calling this, so
+    # reaching here with an illegal tile is a real bug, not a sweep miss).
+    if bk % 32 != 0 or K_i % bk:
+        raise ValueError(
+            "fp8_scaled_matmul_path_c (cuda native tunable): illegal BK "
+            f"block_K={bk} for K={K_i}; the e4m3 m16n8k32 MMA requires "
+            "block_K%32==0 and K%block_K==0 (RULE #1: K%32 is a hard floor)."
+        )
+    if bm % 16 or bn % 8 or M_i % bm or N_i % bn:
+        raise ValueError(
+            "fp8_scaled_matmul_path_c (cuda native tunable): illegal BM/BN "
+            f"block_M={bm} block_N={bn} for M={M_i} N={N_i}; require "
+            "block_M%16==0, block_N%8==0, M%block_M==0, N%block_N==0 "
+            "(RULE #1: no wrong partial-tile)."
+        )
+    if thr <= 0 or thr % 32 != 0:
+        raise ValueError(
+            "fp8_scaled_matmul_path_c (cuda native tunable): illegal threads="
+            f"{thr}; require a positive multiple of 32 (warp granularity)."
+        )
+    if ns < 0:
+        raise ValueError(
+            "fp8_scaled_matmul_path_c (cuda native tunable): illegal "
+            f"num_stages={ns}; require >= 0 (0 = un-pipelined single buffer)."
+        )
+
+    @T.prim_func
+    def _native_fp8_tunable(
+        A_fp8: T.Tensor((M_i, K_i), "float8_e4m3"),
+        A_scale: T.Tensor((1,), "float32"),
+        B_fp8: T.Tensor((N_i, K_i), "float8_e4m3"),
+        B_scale: T.Tensor((1,), "float32"),
+        C: T.Tensor((M_i, N_i), c_dt),
+    ):
+        with T.Kernel(
+            T.ceildiv(N_i, bn),
+            T.ceildiv(M_i, bm),
+            threads=thr,
+        ) as (bx, by):
+            # NATIVE-fp8: shared operands stay e4m3 (no float16 decode buffers) so
+            # T.gemm dispatches the SM120 fp8 MMA atom (verified kFloat8_e4m3).
+            A_shared = T.alloc_shared((bm, bk), "float8_e4m3", scope="shared")
+            B_shared = T.alloc_shared((bn, bk), "float8_e4m3", scope="shared")
+            C_frag = T.alloc_fragment((bm, bn), c_dt)
+            C_shared = T.alloc_shared((bm, bn), c_dt, scope="shared")
+            T.clear(C_frag)
+            # Optional L2 rasterization hint (off by default -> emission parity).
+            T.use_swizzle(panel_size=10, enable=rasterize)
+            # PIPELINED K loop: num_stages is LIVE here (the default module
+            # template uses T.serial, which makes num_stages inert).
+            for ko in T.Pipelined(T.ceildiv(K_i, bk), num_stages=ns):
+                T.copy(
+                    A_fp8[by * bm : by * bm + bm, ko * bk : ko * bk + bk],
+                    A_shared,
+                    disable_tma=True,
+                )
+                T.copy(
+                    B_fp8[bx * bn : bx * bn + bn, ko * bk : ko * bk + bk],
+                    B_shared,
+                    disable_tma=True,
+                )
+                # transpose_B=True keeps the TN layout the SM120 fp8 MMA requires.
+                T.gemm(A_shared, B_shared, C_frag, transpose_B=True)
+            sa = A_scale[0]
+            sb = B_scale[0]
+            for i, j in T.Parallel(bm, bn):
+                C_frag[i, j] = C_frag[i, j] * sa * sb
+            T.copy(C_frag, C_shared)
+            T.copy(C_shared, C[by * bm, bx * bn], disable_tma=True)
+
+    return _native_fp8_tunable
+
+
 def _resolve_fp8_compile_target(target: Any) -> Any:
     """Resolve the ``target`` kwarg threaded through the FP8 matmul builders.
 
@@ -1256,3 +1395,53 @@ def fp8_scaled_matmul_path_c_cuda_native_prim(
 
 __all__.append("fp8_scaled_matmul_path_c_cuda_native_prim")
 __all__.append("FP8_PATH_C_CUDA_NATIVE_ENV")
+
+
+def fp8_scaled_matmul_path_c_cuda_native_tunable_prim(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    block_M: int,
+    block_N: int,
+    block_K: int,
+    num_stages: int,
+    threads: int,
+    c_dtype: str = "float32",
+    enable_rasteration: bool = False,
+) -> Any:
+    """Public alias: build the PIPELINED, closure-parameterized native fp8 prim.
+
+    Thin wrapper over :func:`_make_scaled_matmul2d_cuda_native_tunable` -- the
+    lever-fp8-mma-tune kernel the autotune harness (``scratch/fp8_mma_autotune.py``)
+    sweeps. Every tile axis (``block_M/block_N/block_K``, ``num_stages``,
+    ``threads``, ``enable_rasteration``) is required and validated; an illegal tile
+    RAISES (RULE #1). The kernel body is the verified SM120 fp8-input e4m3 MMA
+    (``SM120_16x8x32_TN`` -> ``mma.sync...kind::f8f6f4.m16n8k32...e4m3.e4m3.f32``),
+    fp32 accumulate, but with a LIVE ``T.Pipelined(num_stages)`` K loop and a
+    parameterized ``threads`` (the default
+    :func:`fp8_scaled_matmul_path_c_cuda_native_prim` uses ``T.serial`` so its
+    num_stages is inert). Compile via :func:`tilelang.compile` with
+    ``target=_as_cuda_target("cuda")`` and ``pass_configs={"tl.disable_tma_lower":
+    True, "tl.disable_warp_specialized": True}``.
+
+    VERIFY-GATE (RULE #1): the GB10 phase must confirm the generated CUDA still
+    emits ``tl::mma_sync<kFloat8_e4m3,kFloat8_e4m3,kFloat32,16,8,32>`` (NOT
+    kFloat16) after pipelining -- that proves the pipelined loop did not perturb
+    the SM120 fp8 MMA dispatch back to an fp16 path.
+    """
+    return _make_scaled_matmul2d_cuda_native_tunable(
+        M=M,
+        N=N,
+        K=K,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+        num_stages=num_stages,
+        threads=threads,
+        c_dtype=c_dtype,
+        enable_rasteration=enable_rasteration,
+    )
+
+
+__all__.append("fp8_scaled_matmul_path_c_cuda_native_tunable_prim")
