@@ -1317,6 +1317,76 @@ would be a forbidden silent regression).
 
 ---
 
+## §20. THREE-ROUTE fp8 ENABLEMENT — toolchain fix CONFIRMED, all-routes re-run (MEASURED, gb10 sm_121, 2026-06-04)
+
+§19 measured fp8 speed for the two routes that ran. §20 is the **explicit 3-route enablement audit**
+after the committed toolchain fixes (the NVRTC loader-path self-heal `cppmega_mlx/_gb10_nvrtc_env.py`
++ the R2 cuda port), re-running the full microbench `--prod` under the fixed env as the SOLE gb10
+owner (box polled idle: 0% util, 116 GB free, no other worker). It answers the de-risk question
+directly — **X of 3 fp8 routes now REALLY run real fp8 on sm_121, and is each "fp8" number genuine
+e4m3 (not bf16 mislabeled)?**
+
+**ENABLEMENT TALLY — 2 of 3 routes RUN real fp8; 1 is genuinely upstream-blocked:**
+
+| route | recipe | RUNS on sm_121? | the §18 blocker now… | real fp8? (RULE #1 proof) |
+|---|---|---|---|---|
+| **R1 MXFP8** | TE `MXFP8BlockScaling` | **NO — upstream-blocked** | TE's own gate STILL raises "MXFP8 (for all gemm layouts) is not supported on 12.0+ architectures yet" | n/a — `ran=False`, recorded as the exact TE message, NEVER degraded to bf16/tensorwise |
+| **R1 tensorwise** | TE `DelayedScaling(E4M3)` | **YES** | the `libnvrtc-builtins.so.13.3` error is **GONE** | E4M3 cuBLASLt fp8 MMA; 1.57–1.83× over bf16 on identical shapes (only fp8 tensor cores deliver this), parity 0.0376 |
+| **R2 ours (cuda)** | in-house e4m3 dequant→`T.gemm` | **YES** | the "MLX Metal unavailable" error is **GONE** (cuda port pulled) | native `torch.float8_e4m3fn` operand (kernel RAISES if not e4m3), 2.0× byte-halving, parity 0.0376 |
+
+**MEASURED per prod bs4 GEMM (M=16384, 20 iters, e4m3 vs bf16-cuBLAS over ALL elements; this run):**
+
+| shape | M×N×K | bf16 TFLOPs | **R1 TE-tensorwise** | **R2 in-house cuda** | rel-err |
+|---|---|---|---|---|---|
+| mlp_up_gate | 16384×37888×3584 | 33.7 | **61.7 TFLOPs (1.83×)** | 7.5 TFLOPs (0.22×) | 0.0376 |
+| mlp_down | 16384×3584×18944 | 34.3 | **55.7 TFLOPs (1.62×)** | 7.2 TFLOPs (0.21×) | 0.0376 |
+| attn_qkv | 16384×10752×3584 | 33.5 | **59.2 TFLOPs (1.77×)** | 11.1 TFLOPs (0.33×) | 0.0376 |
+| attn_out | 16384×3584×3584 | 33.3 | **52.4 TFLOPs (1.57×)** | 14.1 TFLOPs (0.42×) | 0.0376 |
+
+(Re-confirms §19 within run-to-run jitter. `operand_halving_ratio = 2.0` MEASURED on every shape.)
+
+**The toolchain fixes that enabled R1 tensorwise + R2 (committed, self-healing — not transient exports):**
+* **NVRTC loader path (R1 tensorwise):** TE's `libnvrtc.so.13` dlopen's a companion
+  `libnvrtc-builtins.so.13.3` whose MINOR must match exactly. The file exists at
+  `/usr/local/cuda-13.3/targets/sbsa-linux/lib/libnvrtc-builtins.so.13.3` but the login-shell
+  `LD_LIBRARY_PATH` is empty. Fix = the committed `ensure_nvrtc_builtins_path()` (stdlib-only, re-execs
+  the interpreter ONCE to prepend the 13.3 dir before any torch/TE link map) + the run-command
+  `LD_LIBRARY_PATH` prefix + the system `ldconfig` cache now resolving `libnvrtc-builtins.so.13.3` (via
+  `/usr/local/cuda → cuda-13.3`, durable, verified). VERIFIED no regression: torch (cu132) still
+  imports and a tiny `x@x` cuda op still works with 13.3 on the path (each loaded `libnvrtc` finds its
+  OWN matching builtins — 13.3 ADDS availability, does not remove 13.2).
+* **CUDA port (R2):** the in-house route was Metal-only; the `target="cuda"` fragment-C twin
+  (`fp8_scaled_matmul_path_c_cuda_prim`, pulled from origin main) now COMPILES + RUNS on sm_121 (the
+  two §19 port edits: register-fragment decode lvalue + native `float8_e4m3fn` operand).
+
+**R1 MXFP8 — confirmed STILL upstream-blocked, NOT enabled by any cherry-pick (honest):** we did NOT
+lower TE's gate. NVIDIA TE's `_compute_mxfp8_support()` hard-raises for CC ≥ 12.0; the fix (PR #3050,
+OPEN DRAFT) needs cuBLASLt ≥ 13.6.0.2 which is UNRELEASED anywhere (box/PyPI max = 13.5.1.27), so even
+a perfect cherry-pick stays fail-closed. Force-unblocking would silently miscompute the MXFP8 backward
+(non-TN GEMM layout gap, TE issue #2668) = a RULE #1 violation. R1 MXFP8 is recorded as a measured
+FAIL via the exact TE-raised message, never degraded. See `docs/FP8-ACTIVATIONS-PATHC.md` §2b-status.
+
+**GO/NO-GO (§20):** **GO (toolchain de-risk complete).** 2 of 3 fp8 routes RUN real e4m3 on sm_121
+with honest 0.0376 parity; the third (MXFP8) is a documented upstream block, not our defect. The
+throughput win (~1.7× mean) belongs to **R1 TE-tensorwise (cuBLASLt fp8)**; R2 is the correct-but-untuned
+*memory* lever (2.0× byte-halving, 0.18–0.42× speed) and must NOT be wired into the e2e step until
+tile-tuned (a 0.2–0.4× kernel replacing bf16 would be a forbidden silent regression, RULE #1).
+
+### Reproduce (§20)
+
+```
+ssh gb10; cd /home/dave/source/cppmega_mlx
+LD_LIBRARY_PATH=/usr/local/cuda-13.3/targets/sbsa-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
+PYTHONPATH=/home/dave/source/cppmega_mlx:/home/dave/source/tilelang/3rdparty/tvm/python:/home/dave/source/tilelang/3rdparty/tvm/3rdparty/tvm-ffi/python \
+TVM_LIBRARY_PATH=/home/dave/source/tilelang/build/lib \
+/home/dave/cppmega-venv/bin/python scratch/fp8_gemm_microbench.py --prod
+# R1_te_mxfp8: SKIP/GAP (TE upstream-blocked, CC≥12.0); R1_te_tensorwise: real fp8 cuBLASLt (1.57–1.83×);
+# R2_tilelang_coop: in-house cuda e4m3 dequant→T.gemm (compiles+runs+parity 0.0376, 0.21–0.42× untuned).
+```
+Measured 2026-06-04 on gb10 `tvm.cuda(0)` sm_121, single exclusive run, gb10 left idle (0% util, 118 GB free).
+
+---
+
 ## 7. Verdict
 
 The Relax graph-path train_step **fits Megatron-class memory (12.998 GB planned 28L

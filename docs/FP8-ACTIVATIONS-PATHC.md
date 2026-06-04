@@ -18,6 +18,17 @@ kernel gives the memory halving + a correct on-CUDA fp8 path. Full numbers + rep
 `float[1]` on codegen_cuda → replaced with a register-fragment stage; and the microbench must pass the
 native `torch.float8_e4m3fn` not a `.view(uint8)` reinterpret, which segfaults the tvm_ffi adapter.)
 
+**§20 ENABLEMENT AUDIT (gb10 sm_121, 2026-06-04) — re-ran the full microbench `--prod` under the
+fixed env as the SOLE gb10 owner (box idle, 116 GB free).** Explicit 3-route tally: **2 of 3 fp8
+routes RUN real e4m3** — **R1 tensorwise** (the `libnvrtc-builtins.so.13.3` loader error is GONE; 1.57–
+1.83× cuBLASLt fp8) and **R2 ours cuda** (the "MLX Metal unavailable" error is GONE; compiles+runs+
+parity 0.0376, 0.21–0.42×). **R1 MXFP8 stays upstream-blocked** — TE's gate still raises "not supported
+on 12.0+", recorded as a measured FAIL (NEVER degraded to bf16/tensorwise), and we did NOT lower the
+gate (PR #3050 needs unreleased cuBLASLt ≥13.6.0.2; force-unblock = silent MXFP8-backward miscompute =
+RULE #1 violation). All fp8 numbers verified REAL e4m3: operand byte-halving 2.0× MEASURED, parity
+0.0376 over ALL elements (not ~0 bf16-mislabeled, not >0.10 garbage). Full §20 table + reproduce +
+toolchain-fix detail: RELAX §20.
+
 ---
 
 **Status: DESIGN (read-only round) + §19 MEASURED microbench, 2026-06-04. Target: gb10 sm_121 (Grace-Blackwell, `tvm.cuda(0)`).**
