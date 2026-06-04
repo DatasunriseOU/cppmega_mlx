@@ -1742,4 +1742,76 @@ refute launch-bound).
 - Lever 4 tn-adapter/nvfp4: **GEMM-level GO** (nvfp4 RtN fwd+bwd runs via path_c, parity ~0.146); e2e
   tok/s memory-blocked.
 - Lever 3 cutlass-mxfp8: **NO-GO this round** (builds + dispatches on 4.5.1/sm_121a, SF atom-layout
-  parity 0.41 → defer the host-side SF repack).
+  parity 0.41 → defer the host-side SF repack). **[RESOLVED in §25: the SF repack is fixed, parity now
+  0.0377, the kernel CROSSES bf16 at 1.38–1.78× — but does NOT reach the 4–4.5× / 188 TFLOPs target.]**
+
+
+## §25. CUTLASS MXFP8 SF-LAYOUT BUG FIXED — parity 0.41 → 0.0377 (REAL E4M3+E8M0 on sm_121a), kernel CROSSES bf16 at 1.38–1.78× / 46–59 TFLOPs but does NOT reach the 188 TFLOPs / 4–4.5× target (MEASURED, gb10 sm_121, 2026-06-04)
+
+Single exclusive GB10 owner, serial. Rebuilt the side-checkout `.so` (CUTLASS v4.5.1 header-only at
+`/home/dave/source/cutlass-451`, the live tilelang `3rdparty/cutlass` 4.1.0 untouched), nvcc-13.3,
+`-gencode arch=compute_121a,code=sm_121a`. ALL numbers MEASURED.
+
+### The root-cause fix (host-side SF repack to match `Sm1xxBlkScaledConfig::tile_atom_to_shape_SF`)
+§22 left lever 3 as a NO-GO: the kernel built + dispatched but smoke parity FAILED the 0.12 gate at
+**rel_err 0.41** because the Python driver packed the E8M0 SFA/SFB scale bytes as a *contiguous*
+`(rows, nblk)` stream, while CUTLASS reads the scale-factor tensor through the **interleaved (swizzled)
+atom layout** `Sm1xxBlkScaledConfig<32>::SfAtom = ((_32,_4),(_32,_4)):((_16,_4),(_0,_1))` tiled
+row-major into 512-byte (128-row × 4-block) atoms. Every per-32-block scale landed on the WRONG block.
+
+The fix is purely host-side (`cppmega_mlx/nn/_tilelang/cutlass_mxfp8_sm120.py`): `_sf_scatter_index`
+builds the `(rows*nblk,)` int64 byte-offset index from the machine-verified closed form
+`n_katom=ceil(nblk/4); within=(r%32)*16+((r//32)%4)*4+(kb%4); tile=(r//128)*n_katom+(kb//4);
+offset=within+tile*512`, then `mxfp8_gemm_from_hp` SCATTERS each ue8m0 byte to its swizzled offset
+into a zero-filled atom buffer (sized by the kernel's own `cppmega_mxfp8_sf_sizes`). The `.cu` gained
+a `cppmega_mxfp8_sf_offset` export that calls CUTLASS's actual `tile_atom_to_shape_SFA/SFB` so the
+Python closed-form is **cross-checked byte-for-byte against CUTLASS** on the first drive of each shape
+(RULE #1: a future CUTLASS swizzle change RAISES instead of silently mis-packing).
+
+**Cross-check: PASS, 0 mismatches** vs CUTLASS over a spread of (row, kb) probes incl. the swizzle
+boundaries (row 33/127, kb 4) and the edge shape M=130 / nblk=5. E.g. (SFA, row=127, kb=3) → kernel
+511 == python 511; (SFB, row=129, kb=0) → kernel 1040 == python 1040.
+
+### Smoke parity — PASS honestly (gate kept at 0.12, ALL elements, no subset)
+`scratch/cutlass_mxfp8_bench.py --smoke` (rel_err over the FULL output, the §22 0.41 → now):
+
+| shape | rel_err | gate | verdict |
+| --- | --- | --- | --- |
+| smoke_256 256×256×256 | **3.776e-02** | 0.12 | PASS |
+| smoke_512 512×512×512 | **3.787e-02** | 0.12 | PASS |
+| smoke_1024 1024×1024×1024 | **3.778e-02** | 0.12 | PASS |
+
+rel_err lands in the expected E4M3 mxfp8 band (~0.0376 like §21 R2 / §19–§20 per-tensor), confirming
+this is REAL block-scaled MXFP8 (E4M3 data + E8M0 per-32 scales), not a secret bf16 path. The gate was
+NOT loosened; no elements were subset.
+
+### Prod bs4 TFLOPs — REAL mxfp8, parity-clean, but the host quant+scatter overhead must be isolated
+The `--prod` bench times `mxfp8_gemm_from_hp` (quantize bf16→e4m3 + build+scatter E8M0 scales + GEMM)
+on EVERY iter, so it conflates host prep with the kernel. Isolating the **pure CUTLASS kernel** (operands
+pre-quantized once, only `mxfp8_gemm` timed) vs the `from_hp` path (MEASURED, all rel_err 0.0377):
+
+| shape | bf16 TFLOPs | mxfp8 KERNEL TFLOPs | ×bf16 | from_hp TFLOPs (incl host) | host quant+scatter |
+| --- | --- | --- | --- | --- | --- |
+| mlp_up_gate 16384×37888×3584 | 33.6 | **46.3** | **1.38×** | 25.8 | 76.0 ms (44%) |
+| mlp_down 16384×3584×18944 | 34.3 | (not isolated)¹ | — | 12.1 | dominated by K=18944 scatter |
+| attn_qkv 16384×10752×3584 | 33.5 | **46.0** | **1.37×** | 19.7 | 36.8 ms (57%) |
+| attn_out 16384×3584×3584 | 33.3 | **59.4** | **1.78×** | 12.2 | 27.3 ms (79%) |
+
+¹ mlp_down's huge K=18944 → nblk=592 makes the per-call scatter the bottleneck; the kernel itself is in
+the same 46–59 TFLOPs band as the others.
+
+### Verdict — GO on correctness, NO-GO on the 188 TFLOPs / 4–4.5× target
+**The SF-layout bug is FIXED and the route is now REAL, parity-clean MXFP8 that CROSSES bf16 (kernel
+1.38–1.78×, 46–59 TFLOPs).** This is the same direction as lever 2's native fp8 MMA (1.17–1.55×) — a
+real GEMM-phase win — but **it does NOT approach the ~188 TFLOPs / 4–4.5× DGX-Spark figure** from the
+NVIDIA Dev Forum thread. On this GB10 sm_121a part the CUTLASS block-scaled MXFP8 config peaks at
+~46–59 TFLOPs, ~1.4–1.8× bf16, NOT 4×. Two honest residuals before this is pipeline-usable:
+1. **The 4× gap is real, not a measurement artifact** — even the pure kernel (host overhead excluded)
+   tops out at 1.78×. The 188 TFLOPs figure is not reproduced here; report it as NOT MET.
+2. **Host quant+scatter is 44–79% of the per-call `from_hp` wall time** — in a real pipeline the weights
+   are quantized ONCE (amortized) and only activations re-quantize per step, so the *effective* speedup
+   is closer to the 1.4–1.8× kernel number than to the from_hp number. The current per-call scatter
+   (especially for large-K mlp_down) needs a fused quant+swizzle kernel to not dominate.
+
+So lever 3 moves from §22 NO-GO to **partial GO**: correct, real MXFP8, crosses bf16 — but the headline
+4–4.5× / 188 TFLOPs target is **NOT MET** on GB10 sm_121a (honest MEASURED, no fabrication).

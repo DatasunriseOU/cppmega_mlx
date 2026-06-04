@@ -86,6 +86,19 @@ any failure it RAISES with where+what — never an fp8→bf16 or bs4→bs1 silen
 | `sparse_mla_blockscaled*.py` | **MXFP8** (block-32, E8M0-like) | **per-block-32** | quantize to packed uint32 + uint8 scales | fwd + bwd (prepared) | Metal Path C |
 | `mxfp4_matmul_path_c.py` | e2m1 + block-16 scale | per-block-16 (fp32 scale) | codec dequant→fp16 into shared, then `T.gemm` | forward GEMM | **Metal-only** cooperative `matmul2d` |
 | `scripts/_nvfp4_route.py` | e2m1 + E4M3 block-16 | per-block-16 | TE `NVFP4BlockScaling` (RtN recipe) | **fwd + bwd VERIFIED on gb10** (dgrad 0.1465 / wgrad 0.1343 rel-err) | **CUDA/TE cuBLASLt** |
+| `cutlass_mxfp8_sm120.py` + `_cutlass_mxfp8_sm120.cu` | **MXFP8** (e4m3 + E8M0 block-32) | **per-block-32** | host `build_e8m0_block_scales` (`ceil(log2(amax/448))`) + **swizzled SFA/SFB repack** (`Sm1xxBlkScaledConfig::tile_atom_to_shape_SF`) | forward GEMM (TN) | **CUDA, standalone CUTLASS v4.5.1 sm_121a `.so`** — a REAL native CUDA MXFP8 GEMM (§25) |
+
+> **§25 update (gb10 sm_121a, 2026-06-04):** the standalone CUTLASS MXFP8 route is now **correct and
+> parity-clean**. The §22 SF-layout bug (rel_err 0.41) was the host packing the E8M0 SFA/SFB bytes
+> contiguously instead of into CUTLASS's swizzled `((_32,_4),(_32,_4)):((_16,_4),(_0,_1))` 512-byte
+> atoms. The fix (`_sf_scatter_index` machine-verified vs the kernel's `cppmega_mxfp8_sf_offset` →
+> `tile_atom_to_shape_SFA/SFB`, 0 mismatches) drops **rel_err to 0.0377** (E4M3 mxfp8 band, gate 0.12,
+> ALL elements). The **pure kernel crosses bf16 at 1.38–1.78× (46–59 TFLOPs vs 33–34)** on the prod bs4
+> shapes — a real GEMM-phase win, the same band as the native fp8 MMA (lever 2). **It does NOT reach the
+> ~188 TFLOPs / 4–4.5× DGX-Spark target** on this part. The per-call host quant+scatter is 44–79% of the
+> `mxfp8_gemm_from_hp` wall time and must be fused/amortized (weights quantized once) before pipeline use.
+> So this is now the SECOND real CUDA fp8 GEMM asset (alongside the TE nvfp4 route), but the 4× headline
+> is NOT met (honest MEASURED).
 
 **The hard gap this design must close:** every in-house fp8 *GEMM* kernel is **Metal-only**. The only
 fp8 assets that run on gb10/CUDA today are (a) `fp8_amax.py`'s amax+quantize (a scaling utility, not a
