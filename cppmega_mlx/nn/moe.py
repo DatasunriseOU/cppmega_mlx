@@ -98,15 +98,22 @@ class FeedForwardExpert(nn.Module):
         self.down_proj = nn.Linear(hidden_size, d_model, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        h = self.gate_proj(x)
+        # Transformer-block FFN GEMMs (symbol-E layers). When CPPMEGA_FP8_LINEAR is
+        # on AND a projection clears the fp8 eligibility floor, gate/up/down run
+        # through the TE DelayedScaling(E4M3) fp8 GEMM (fwd + dgrad/wgrad); otherwise
+        # the byte-identical bf16 nn.Linear runs. RULE #1: a SELECTED fp8 GEMM that
+        # fails RAISES (no bf16 degrade) — see fp8_te_linear.maybe_fp8_linear_call.
+        from cppmega_mlx.nn._tilelang.fp8_te_linear import maybe_fp8_linear_call
+
+        h = maybe_fp8_linear_call(self.gate_proj, x)
         if self.activation == "swiglu":
             assert self.up_proj is not None
-            h = nn.silu(h) * self.up_proj(x)
+            h = nn.silu(h) * maybe_fp8_linear_call(self.up_proj, x)
         elif self.activation == "relu2":
             h = mx.square(mx.maximum(h, mx.array(0.0, dtype=h.dtype)))
         else:
             h = nn.gelu_approx(h)
-        return self.down_proj(h)
+        return maybe_fp8_linear_call(self.down_proj, h)
 
 
 class TopKRouter(nn.Module):

@@ -662,11 +662,21 @@ class CausalSelfAttention(nn.Module):
     ) -> tuple[mx.array, mx.array, mx.array]:
         batch, seq, _ = hidden_states.shape
         cfg = self.config
-        q = self.q_proj(hidden_states).reshape(
+        # Dense attention q/k/v projection GEMMs (symbol-A layers). fp8-gated:
+        # CPPMEGA_FP8_LINEAR routes these through the TE DelayedScaling(E4M3) fp8
+        # GEMM (fwd + dgrad/wgrad); otherwise the byte-identical bf16 nn.Linear runs.
+        # RULE #1: a SELECTED fp8 GEMM that fails RAISES (no bf16 degrade).
+        from cppmega_mlx.nn._tilelang.fp8_te_linear import maybe_fp8_linear_call
+
+        q = maybe_fp8_linear_call(self.q_proj, hidden_states).reshape(
             batch, seq, cfg.num_q_heads, cfg.q_head_dim
         )
-        k = self.k_proj(hidden_states).reshape(batch, seq, cfg.kv_heads, cfg.q_head_dim)
-        v = self.v_proj(hidden_states).reshape(batch, seq, cfg.kv_heads, cfg.q_head_dim)
+        k = maybe_fp8_linear_call(self.k_proj, hidden_states).reshape(
+            batch, seq, cfg.kv_heads, cfg.q_head_dim
+        )
+        v = maybe_fp8_linear_call(self.v_proj, hidden_states).reshape(
+            batch, seq, cfg.kv_heads, cfg.q_head_dim
+        )
         q = mx.transpose(q, (0, 2, 1, 3))
         k = mx.transpose(k, (0, 2, 1, 3))
         v = mx.transpose(v, (0, 2, 1, 3))
@@ -1078,7 +1088,10 @@ class CausalSelfAttention(nn.Module):
             hidden_states.shape[1],
             self.config.q_proj_dim,
         )
-        return self.out_proj(out)
+        # Dense attention out projection GEMM (symbol-A). fp8-gated like q/k/v above.
+        from cppmega_mlx.nn._tilelang.fp8_te_linear import maybe_fp8_linear_call
+
+        return maybe_fp8_linear_call(self.out_proj, out)
 
 
 __all__ = [
