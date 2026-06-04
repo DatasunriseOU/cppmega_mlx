@@ -19,7 +19,21 @@ RECORDED as the measured gap, never silently skipped):
        tensor-core measurement, with the honest e4m3-vs-bf16 rel_err over all
        elements (the >0.10 gate catches a secret bf16/garbage run). RULE #1:
        compile/dispatch failure is RECORDED with where+what, never a silent
-       fall to the Metal LUT route, to TE, or to bf16.
+       fall to the Metal LUT route, to TE, or to bf16. NOTE: R2 DECODES e4m3
+       to fp16 in register fragments and runs an fp16-MMA — the memory lever,
+       not a speed win (the 0.18-0.42x slow path).
+
+  R2-native = the lever-r2-native-fp8mma rewrite
+       (fp8_scaled_matmul_path_c_cuda_native_prim): the e4m3 shared operands
+       feed T.gemm DIRECTLY, so the CUDA backend dispatches the real SM120 fp8
+       MMA atom (SM120_16x8x32_TN -> mma.sync...kind::f8f6f4.m16n8k32...
+       .e4m3.e4m3.f32) — a REAL fp8-INPUT tensor-core MMA, fp32 accumulate, ZERO
+       fp16 decode (res_r2mma.feasibility=GO, proven on-hardware maxabs-err
+       0.0229). This is the SPEED-lever target. Reported side-by-side with R2 so
+       the A/B (native fp8-MMA vs fp16-decode) is in one run. RULE #1: same
+       record-with-where+what-on-failure, no silent fp16-decode/bf16 fallback;
+       the VERIFY gate (generated CUDA must emit kFloat8_e4m3, not kFloat16) is
+       the GB10 phase's job.
 
 Single-run discipline: ONLY the Profile agent runs this, sequentially, after
 polling gb10 IDLE + free>105GB. It RAISES on NaN/Inf (no degraded path).
@@ -374,6 +388,112 @@ def run_tilelang_fp8(shape: GemmShape, ref_out, a_bf16, w_bf16, *,
 
 
 # -----------------------------------------------------------------------------
+# R2-native — our cppmega_mlx NATIVE fp8-input e4m3 T.gemm (CUDA, sm_121)
+# -----------------------------------------------------------------------------
+def run_tilelang_fp8_native(shape: GemmShape, ref_out, a_bf16, w_bf16, *,
+                            iters: int, warmup: int) -> RouteResult:
+    """In-house NATIVE fp8-input e4m3 ``T.gemm`` (lever r2-native-fp8mma, sm_121).
+
+    This is the A/B counterpart to :func:`run_tilelang_fp8`: SAME per-tensor amax
+    e4m3 quantization of the SAME a_bf16/w_bf16 operands, but it compiles the
+    NATIVE prim (``fp8_scaled_matmul_path_c_cuda_native_prim``) whose e4m3 shared
+    operands feed ``T.gemm`` DIRECTLY -- so the CUDA backend dispatches the real
+    SM120 fp8 MMA atom (``SM120_16x8x32_TN`` ->
+    ``mma.sync...kind::f8f6f4.m16n8k32...e4m3.e4m3.f32``), NOT the fp16-decode +
+    fp16-MMA the R2_tilelang_coop route runs. fp32 accumulate; rel_err over ALL
+    elements (the >0.10 gate catches a secret bf16/garbage run).
+
+    RULE #1: a compile/dispatch failure RAISES (recorded ran=False with the
+    precise where+what). It NEVER falls back to the fp16-decode prim, to TE, or to
+    bf16. The VERIFY gate (the generated CUDA must emit
+    ``tl::mma_sync<kFloat8_e4m3,...>``, not kFloat16) is the GB10 phase's job; this
+    route only MEASURES the native prim's TFLOPs + parity. With native==default,
+    the env CPPMEGA_FP8_PATH_C_CUDA_NATIVE is NOT set here (this route builds the
+    native prim explicitly); the R2_tilelang_coop route above exercises whichever
+    prim the default selection compiles, so running BOTH gives the true A/B.
+    """
+    name = "R2_native_fp8mma"
+    try:
+        import tilelang
+        import torch  # noqa: F401
+
+        from cppmega_mlx.nn._tilelang._msl_transform import _as_cuda_target
+        from cppmega_mlx.nn._tilelang.fp8_matmul_path_c import (
+            fp8_matmul_path_c_status,
+            fp8_scaled_matmul_path_c_cuda_native_prim,
+        )
+    except Exception as exc:
+        return RouteResult(name, ran=False, reason=f"import failed: {exc!r}")
+
+    status = fp8_matmul_path_c_status(target="cuda")
+    if not status.available:
+        return RouteResult(
+            name, ran=False,
+            reason=(
+                f"fp8_matmul_path_c (cuda target) unavailable on this host: "
+                f"{status.reason}."
+            ),
+        )
+
+    M, N, K = shape.M, shape.N, shape.K
+    try:
+        a_fp8, scale_a = _quantize_pertensor_fp8(a_bf16)          # (M,K) e4m3, (1,) f32
+        w_fp8, scale_b = _quantize_pertensor_fp8(w_bf16)          # (N,K) e4m3, (1,) f32
+
+        prim = fp8_scaled_matmul_path_c_cuda_native_prim(
+            M=M, N=N, K=K, c_dtype="float32"
+        )
+        if prim is None:
+            return RouteResult(
+                name, ran=False,
+                reason=(
+                    f"no legal native-fp8 tile divides M={M} N={N} K={K} (the "
+                    "e4m3 m16n8k32 MMA requires K%32==0 + m16n8 divisibility); "
+                    "RULE #1: no silent partial-tile / no fp16-decode fallback."
+                ),
+            )
+        kernel = tilelang.compile(
+            prim,
+            target=_as_cuda_target("cuda"),
+            out_idx=[4],
+            pass_configs={
+                "tl.disable_tma_lower": True,
+                "tl.disable_warp_specialized": True,
+            },
+        )
+    except Exception as exc:
+        return RouteResult(
+            name, ran=False,
+            reason=(
+                f"cuda native fp8 T.gemm compile failed: {type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc(limit=4)}"
+            ),
+        )
+
+    try:
+        def _call():
+            return kernel(a_fp8, scale_a, w_fp8, scale_b)
+
+        median_ms, out = _time_cuda(_call, iters=iters, warmup=warmup)
+    except Exception as exc:
+        return RouteResult(
+            name, ran=False,
+            reason=(
+                f"cuda native fp8 T.gemm dispatch failed: {type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc(limit=4)}"
+            ),
+        )
+
+    tflops = shape.flops / (median_ms * 1e-3) / 1e12
+    rel = _rel_err(out, ref_out)
+    return RouteResult(
+        name, ran=True, tflops=tflops, median_ms=median_ms,
+        rel_err=rel, finite=True,
+        reason="cuda NATIVE fp8-input e4m3 MMA (fp8_matmul_path_c_cuda_native_prim, sm_121)",
+    )
+
+
+# -----------------------------------------------------------------------------
 # fp8 activation cast/round helper (reference; the e2e producer reuses this)
 # -----------------------------------------------------------------------------
 def fp8_quantize_activation_reference(x, *, recipe: str = "tensorwise"):
@@ -412,7 +532,7 @@ def fp8_quantize_activation_reference(x, *, recipe: str = "tensorwise"):
 # driver
 # -----------------------------------------------------------------------------
 def run(shapes: list[GemmShape], *, iters: int, warmup: int,
-        do_te: bool, do_tl: bool) -> list[ShapeResult]:
+        do_te: bool, do_tl: bool, do_tl_native: bool = True) -> list[ShapeResult]:
     import torch
 
     if not torch.cuda.is_available():
@@ -471,6 +591,23 @@ def run(shapes: list[GemmShape], *, iters: int, warmup: int,
                       f"{r.reason.splitlines()[0] if r.reason else 'ok'}", flush=True)
         else:
             res.routes.append(RouteResult("R2_tilelang", ran=False, reason="--no-tl"))
+
+        # R2-native: the lever-r2-native-fp8mma real fp8-input MMA, A/B'd against
+        # the R2_tilelang_coop fp16-decode route directly above (same operands).
+        if do_tl_native:
+            r = run_tilelang_fp8_native(shape, ref_out, a_bf16, w_bf16,
+                                        iters=iters, warmup=warmup)
+            res.routes.append(r)
+            if r.ran:
+                speedup = (r.tflops or 0) / bf16_tflops
+                print(f"   {r.route}: {r.tflops:8.1f} TFLOPs  ({r.median_ms:.3f} ms)  "
+                      f"{speedup:.2f}x vs bf16  rel_err={r.rel_err:.4e}", flush=True)
+            else:
+                print(f"   {r.route}: GAP — "
+                      f"{r.reason.splitlines()[0] if r.reason else 'ok'}", flush=True)
+        else:
+            res.routes.append(RouteResult("R2_native_fp8mma", ran=False,
+                                          reason="--no-tl-native"))
 
         results.append(res)
     return results
@@ -565,7 +702,10 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--no-te", action="store_true")
-    ap.add_argument("--no-tl", action="store_true")
+    ap.add_argument("--no-tl", action="store_true",
+                    help="skip the R2 fp16-decode CUDA route (record as skipped)")
+    ap.add_argument("--no-tl-native", action="store_true",
+                    help="skip the R2-native fp8-input MMA route (record as skipped)")
     args = ap.parse_args()
 
     if not args.prod:
@@ -579,6 +719,7 @@ def main() -> int:
     results = run(
         shapes, iters=args.iters, warmup=args.warmup,
         do_te=not args.no_te, do_tl=not args.no_tl,
+        do_tl_native=not args.no_tl_native,
     )
     _summary(results)
     _emit_json(results)

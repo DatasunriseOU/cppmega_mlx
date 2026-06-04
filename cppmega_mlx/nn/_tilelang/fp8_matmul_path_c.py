@@ -93,6 +93,62 @@ def _coop_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int] | None:
     return None
 
 
+def _native_fp8_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int] | None:
+    """Pick a tile (BM, BN, BK, threads) for the NATIVE fp8-input e4m3 MMA path.
+
+    Unlike the Metal cooperative ``matmul2d`` selector (:func:`_coop_tile_for`),
+    this targets the gb10/sm_121 CUDA ``T.gemm`` SM120 fp8 MMA dispatch
+    (``SM120_16x8x32_TN`` -> ``mma.sync.aligned.kind::f8f6f4.m16n8k32...
+    .e4m3.e4m3.f32``). The hardware atom is m16n8k32, so the gating constraints
+    are (proven on hardware, res_r2mma.feasibility):
+
+      * TN layout (transpose_B=True) -- handled by the kernel, not the tile.
+      * K % 32 == 0 (the fp8 MMA is K=32-deep). HARD FLOOR; BK must be a
+        multiple of 32 and K a multiple of BK.
+      * BM % 16 == 0 and BN % 8 == 0 (the m16n8 output fragment shape); we use
+        the larger, warp-tile-friendly BM % 16, BN % 16 to map cleanly onto
+        128/256-thread warp grids.
+
+    The candidate tiles are ordered best-first per the research recommendation:
+    start from the proven tilelang fp8 example geometry (128x128x64, 128 threads)
+    which divides every prod GEMM (M=16384; N in {3584,10752,37888}; K in
+    {3584,18944}); fall back to smaller tiles for the narrow SSD F2 shape and any
+    residual sub-128 dim. Threadgroup shared memory is the e4m3 operands (1 byte)
+    plus the fp32 C staging -- far under budget, so the dominant constraint is
+    divisibility, not shmem.
+
+    Returns ``None`` when no legal native-fp8 tile divides ``M/N/K`` (e.g. a shape
+    whose K is not a multiple of 32). RULE #1: the caller RAISES on ``None`` (no
+    silent partial-tile / no fp16-decode fallback) -- a K%32!=0 shape simply
+    cannot run the native fp8 MMA and must surface that, not silently degrade.
+    """
+    if K % 32 != 0:
+        # The fp8 m16n8k32 MMA hard-requires K (and thus BK) a multiple of 32.
+        # Surface the violation to the caller (it RAISES) rather than picking an
+        # illegal tile that would mis-tile the K reduction (RULE #1).
+        return None
+    candidates = (
+        (128, 128, 64, 128),  # research-recommended fp8 example geometry
+        (128, 128, 32, 128),  # smaller BK (K=32-deep amortized less)
+        (128, 64, 64, 128),   # narrower N
+        (64, 64, 64, 128),    # SSD F2 tile (64x64x64) and small dims
+        (64, 64, 32, 128),
+        (32, 64, 32, 128),    # current untuned R2 tile (kept as a sweep point)
+        (16, 32, 32, 64),     # smallest legal native-fp8 tile (m16n8 fragment)
+    )
+    for bm, bn, bk, threads in candidates:
+        if bk % 32 != 0:
+            continue
+        if M % bm or N % bn or K % bk:
+            continue
+        if bm % 16 or bn % 8:
+            continue
+        if (M // bm) <= 0 or (N // bn) <= 0:
+            continue
+        return bm, bn, bk, threads
+    return None
+
+
 @dataclass(frozen=True)
 class FP8MatmulPathCStatus:
     available: bool
@@ -297,6 +353,93 @@ def _fp8_scaled_matmul2d_cuda_kernel_template(
         T.copy(C_shared, C[by * _FP8_MM_BM, bx * _FP8_MM_BN], disable_tma=True)  # type: ignore[name-defined]  # noqa: F821
 
 
+def _fp8_scaled_matmul2d_cuda_native_kernel_template(
+    A_fp8: T.Tensor((_FP8_MM_M, _FP8_MM_K), "float8_e4m3"),  # type: ignore[name-defined]  # noqa: F821
+    A_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
+    B_fp8: T.Tensor((_FP8_MM_N, _FP8_MM_K), "float8_e4m3"),  # type: ignore[name-defined]  # noqa: F821
+    B_scale: T.Tensor((1,), "float32"),  # type: ignore[name-defined]  # noqa: F821
+    C: T.Tensor((_FP8_MM_M, _FP8_MM_N), _FP8_MM_C_DTYPE),  # type: ignore[name-defined]  # noqa: F821
+):
+    """NATIVE fp8-input e4m3 tensor-core MMA on gb10 / sm_121 (lever r2-native-fp8mma).
+
+    This is the lever-1 rewrite of :func:`_fp8_scaled_matmul2d_cuda_kernel_template`.
+    The slow twin DECODES each e4m3 byte to ``float16`` in register fragments and
+    runs ``tl.mma_sync<kFloat16,kFloat16,kFloat32,16,8,16>`` -- an fp16-MMA on
+    decoded values (the 0.18-0.42x memory-lever). THIS template instead keeps the
+    e4m3 operands as ``float8_e4m3`` all the way into ``T.gemm``, so TileLang's
+    CUDA GEMM backend dispatches the SM120 fp8 MMA atom
+    (``src/backend/cuda/op/gemm.cc`` lines 60/74 accept fp8-input GEMM ->
+    ``gemm_mma.h`` ``#if __CUDA_ARCH_LIST__ >= 1200`` ->
+    ``TL_DISPATCH_MMA_TEMPLATE(fp8_e4_t, fp8_e4_t, float, SM120_16x8x32_TN)`` ->
+    CuTe ``SM120_16x8x32_TN`` -> the real Blackwell PTX
+    ``mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32``). The
+    generated CUDA emits ``tl::mma_sync<kFloat8_e4m3,kFloat8_e4m3,kFloat32,16,8,32>``
+    over ``fp8_e4_t`` register operands -- a REAL fp8-input MMA, fp32 accumulate,
+    ZERO fp16 decode (PROVEN on the live gb10 sm_121 GPU, res_r2mma.feasibility=GO;
+    on-hardware compile+run gave maxabs-err 0.0229 vs an fp16 reference = honest
+    fp8 quantization noise, RULE #1 clean).
+
+    Deltas vs the fp16-decode twin (the ONLY changes -- everything else identical):
+
+      * ``A_shared``/``B_shared`` are ``float8_e4m3`` (NOT ``float16``); the e4m3
+        bytes are copied straight from global into the e4m3 shared buffers
+        (``disable_tma=True``), with NO ``A_fp8_local``/``B_fp8_local`` fragment
+        stage and NO ``T.cast(e4m3 -> float16)`` Parallel loops.
+      * ``T.gemm(A_shared_e4m3, B_shared_e4m3, C_frag_fp32, transpose_B=True)``
+        now dispatches the native fp8 MMA (the fp8+fp8+fp32 branch of gemm.cc)
+        instead of the fp16 MMA.
+
+    Unchanged: the fp32 ``C_frag`` register accumulator (the fp8 MMA accumulates
+    in fp32 -- do NOT switch to fp16 accumulate; it loses range), the post-K
+    ``sa*sb`` scale epilogue, the ``C_shared`` copy-out staging, and the
+    ``disable_tma=True`` on every copy (sm_121 TMA tensormap mis-aligns at these
+    tile dims -> "Invalid TMA descriptor arguments"; the cp.async path is correct).
+    The compile site (:func:`_fp8_matmul_tvm_ffi_kernel_for`) keeps the same
+    ``tl.disable_tma_lower`` / ``tl.disable_warp_specialized`` pass_configs.
+
+    HARD constraints (gemm.cc CheckWgmma fp8 branch + the m16n8k32 MMA shape),
+    enforced by :func:`_native_fp8_tile_for` (tile=None -> caller RAISES, RULE #1):
+    transpose_B=True (TN) and K % 32 == 0. All prod shapes satisfy them.
+    """
+    with T.Kernel(  # type: ignore[name-defined]  # noqa: F821
+        T.ceildiv(_FP8_MM_N, _FP8_MM_BN),  # type: ignore[name-defined]  # noqa: F821
+        T.ceildiv(_FP8_MM_M, _FP8_MM_BM),  # type: ignore[name-defined]  # noqa: F821
+        threads=_FP8_MM_THREADS,
+    ) as (bx, by):
+        # NATIVE-fp8: the shared operands stay e4m3 (no float16 decode buffers).
+        A_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BK), "float8_e4m3", scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        B_shared = T.alloc_shared((_FP8_MM_BN, _FP8_MM_BK), "float8_e4m3", scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        C_frag = T.alloc_fragment((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE)  # type: ignore[name-defined]  # noqa: F821
+        C_shared = T.alloc_shared((_FP8_MM_BM, _FP8_MM_BN), _FP8_MM_C_DTYPE, scope="shared")  # type: ignore[name-defined]  # noqa: F821
+        T.clear(C_frag)
+        for ko in T.serial(T.ceildiv(_FP8_MM_K, _FP8_MM_BK)):  # type: ignore[name-defined]  # noqa: F821
+            # Copy the e4m3 bytes global->shared DIRECTLY (disable_tma on sm_121).
+            # NO fp16 decode: the e4m3 operands feed T.gemm unchanged so the SM120
+            # fp8 MMA atom fires. This is the whole point of the lever (RULE #1: a
+            # real fp8-input MMA, verified by the kFloat8_e4m3 dtype in the
+            # generated CUDA, not a relabeled fp16 path).
+            T.copy(  # type: ignore[name-defined]  # noqa: F821
+                A_fp8[by * _FP8_MM_BM : by * _FP8_MM_BM + _FP8_MM_BM,
+                      ko * _FP8_MM_BK : ko * _FP8_MM_BK + _FP8_MM_BK],
+                A_shared,
+                disable_tma=True,
+            )
+            T.copy(  # type: ignore[name-defined]  # noqa: F821
+                B_fp8[bx * _FP8_MM_BN : bx * _FP8_MM_BN + _FP8_MM_BN,
+                      ko * _FP8_MM_BK : ko * _FP8_MM_BK + _FP8_MM_BK],
+                B_shared,
+                disable_tma=True,
+            )
+            # transpose_B=True keeps the TN layout the SM120 fp8 MMA requires.
+            T.gemm(A_shared, B_shared, C_frag, transpose_B=True)  # type: ignore[name-defined]  # noqa: F821
+        sa = A_scale[0]
+        sb = B_scale[0]
+        for i, j in T.Parallel(_FP8_MM_BM, _FP8_MM_BN):  # type: ignore[name-defined]  # noqa: F821
+            C_frag[i, j] = C_frag[i, j] * sa * sb
+        T.copy(C_frag, C_shared)  # type: ignore[name-defined]  # noqa: F821
+        T.copy(C_shared, C[by * _FP8_MM_BM, bx * _FP8_MM_BN], disable_tma=True)  # type: ignore[name-defined]  # noqa: F821
+
+
 def _make_scaled_matmul_kernel(
     *,
     M: int,
@@ -417,6 +560,84 @@ def _make_scaled_matmul2d_cuda_kernel(
     return tilelang.language.prim_func(_fp8_scaled_matmul2d_cuda_kernel_template)
 
 
+def _make_scaled_matmul2d_cuda_native_kernel(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    num_stages: int = 0,
+    c_dtype: str = "float32",
+    BM: int | None = None,
+    BN: int | None = None,
+    BK: int | None = None,
+    threads: int | None = None,
+) -> Any:
+    """Build the gb10 (sm_121) NATIVE fp8-input e4m3 ``T.gemm`` owner-output prim.
+
+    Binds :func:`_fp8_scaled_matmul2d_cuda_native_kernel_template` (e4m3 shared
+    operands fed straight into ``T.gemm`` -> SM120 fp8 MMA). Tile selection uses
+    :func:`_native_fp8_tile_for` (K%32==0 + m16n8 divisibility), NOT the Metal
+    cooperative selector -- the fp8 MMA wants larger BM/BN than the narrow Metal
+    matmul2d micro-tile. An explicit (BM,BN,BK,threads) override is accepted so
+    the microbench / a tile sweep can probe a specific geometry; the override is
+    VALIDATED (K%32==0, divisibility, m16n8) and RAISES on an illegal tile rather
+    than silently mis-tiling (RULE #1).
+
+    Returns ``None`` when no legal native-fp8 tile divides ``M/N/K`` (e.g. K not a
+    multiple of 32). RULE #1: the caller RAISES on ``None`` -- the native fp8 MMA
+    is the ONE path when selected; it never falls back to the fp16-decode twin or
+    to bf16. (For an explicit override, an illegal tile RAISES here directly.)
+    """
+    import tilelang
+    from tilelang import language as T
+    from tvm.target import Target
+
+    override = (BM, BN, BK, threads)
+    if any(v is not None for v in override):
+        if any(v is None for v in override):
+            raise ValueError(
+                "fp8_scaled_matmul_path_c (cuda native): a tile override must "
+                "specify all of BM, BN, BK, threads together (RULE #1: no "
+                f"half-specified tile); got BM={BM} BN={BN} BK={BK} threads={threads}"
+            )
+        bm, bn, bk, thr = int(BM), int(BN), int(BK), int(threads)
+        # Validate the override against the fp8 MMA hard constraints (the same
+        # gates _native_fp8_tile_for enforces). An illegal override RAISES.
+        if bk % 32 != 0 or K % bk:
+            raise ValueError(
+                "fp8_scaled_matmul_path_c (cuda native): illegal BK override "
+                f"BK={bk} for K={K}; the e4m3 m16n8k32 MMA requires BK%32==0 and "
+                "K%BK==0 (RULE #1: K%32 is a hard floor, no silent re-tile)."
+            )
+        if bm % 16 or bn % 8 or M % bm or N % bn:
+            raise ValueError(
+                "fp8_scaled_matmul_path_c (cuda native): illegal BM/BN override "
+                f"BM={bm} BN={bn} for M={M} N={N}; require BM%16==0, BN%8==0, "
+                "M%BM==0, N%BN==0 (RULE #1: no wrong partial-tile)."
+            )
+        tile = (bm, bn, bk, thr)
+    else:
+        tile = _native_fp8_tile_for(int(M), int(N), int(K))
+        if tile is None:
+            return None
+    bm, bn, bk, thr = tile
+
+    globals().update(
+        T=T,
+        Target=Target,
+        _FP8_MM_M=int(M),
+        _FP8_MM_N=int(N),
+        _FP8_MM_K=int(K),
+        _FP8_MM_BM=int(bm),
+        _FP8_MM_BN=int(bn),
+        _FP8_MM_BK=int(bk),
+        _FP8_MM_THREADS=int(thr),
+        _FP8_MM_NUM_STAGES=int(num_stages),
+        _FP8_MM_C_DTYPE=str(c_dtype),
+    )
+    return tilelang.language.prim_func(_fp8_scaled_matmul2d_cuda_native_kernel_template)
+
+
 def _resolve_fp8_compile_target(target: Any) -> Any:
     """Resolve the ``target`` kwarg threaded through the FP8 matmul builders.
 
@@ -452,6 +673,34 @@ def _resolve_fp8_compile_target(target: Any) -> Any:
 
 
 FP8_PATH_C_MATMUL2D_ENV = "CPPMEGA_FP8_PATH_C_MATMUL2D"
+
+# Lever r2-native-fp8mma: route the gb10 / sm_121 CUDA fp8 GEMM through the
+# NATIVE fp8-input e4m3 MMA prim (_fp8_scaled_matmul2d_cuda_native_kernel_template)
+# instead of the fp16-decode twin (_fp8_scaled_matmul2d_cuda_kernel_template).
+# DEFAULT: native (the real fp8-input MMA is the intended clear path on sm_121).
+# Set CPPMEGA_FP8_PATH_C_CUDA_NATIVE=0 to A/B against the original correct-but-slow
+# fp16-decode prim (e.g. to compare TFLOPs). This is an explicit A/B opt-out, NOT
+# a silent fallback: a native-prim compile/dispatch FAILURE still RAISES (RULE #1);
+# the env only chooses which CUDA prim is built, never papers over a broken one.
+FP8_PATH_C_CUDA_NATIVE_ENV = "CPPMEGA_FP8_PATH_C_CUDA_NATIVE"
+
+
+def _cuda_native_fp8_enabled() -> bool:
+    """Whether the gb10 CUDA branch builds the NATIVE fp8-input MMA prim.
+
+    Native (real e4m3 tensor-core MMA, SM120_16x8x32_TN) is the DEFAULT clear
+    path on sm_121 (res_r2mma.feasibility=GO, proven on-hardware). The env
+    ``CPPMEGA_FP8_PATH_C_CUDA_NATIVE`` is an explicit A/B opt-OUT only: set it to
+    ``0``/``false``/``off`` to build the original fp16-decode twin instead (for a
+    side-by-side TFLOPs comparison). RULE #1: this never silently degrades -- a
+    native-prim failure RAISES; the env merely selects which prim is compiled.
+    """
+    import os
+
+    val = os.environ.get(FP8_PATH_C_CUDA_NATIVE_ENV, "").strip().lower()
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def _matmul2d_owner_output_enabled() -> bool:
@@ -535,19 +784,40 @@ def _fp8_matmul_tvm_ffi_kernel_for(
     # RAISES (caught + re-raised as FP8MatmulPathCDirectError by the caller); it
     # does NOT silently fall back to dot4, to bf16, or to a degraded precision.
     if "cuda" in kind:
-        cuda_prim = _make_scaled_matmul2d_cuda_kernel(
-            M=M,
-            N=N,
-            K=K,
-            num_stages=num_stages,
-            c_dtype=c_dtype,
-        )
+        # Lever r2-native-fp8mma: DEFAULT to the native fp8-input e4m3 MMA prim
+        # (real SM120 tensor-core fp8 MMA). CPPMEGA_FP8_PATH_C_CUDA_NATIVE=0 opts
+        # back to the fp16-decode twin for an explicit A/B. RULE #1: either prim's
+        # compile/dispatch failure RAISES (re-raised as FP8MatmulPathCDirectError
+        # by the caller); the env only selects which CUDA prim is built.
+        if _cuda_native_fp8_enabled():
+            cuda_prim = _make_scaled_matmul2d_cuda_native_kernel(
+                M=M,
+                N=N,
+                K=K,
+                num_stages=num_stages,
+                c_dtype=c_dtype,
+            )
+            cuda_prim_kind = "native fp8-input e4m3 MMA (SM120_16x8x32_TN)"
+            no_tile_detail = (
+                "no legal native-fp8 tile divides it (the e4m3 m16n8k32 MMA "
+                "requires K%32==0 + m16n8 divisibility)"
+            )
+        else:
+            cuda_prim = _make_scaled_matmul2d_cuda_kernel(
+                M=M,
+                N=N,
+                K=K,
+                num_stages=num_stages,
+                c_dtype=c_dtype,
+            )
+            cuda_prim_kind = "fp16-decode dequant->T.gemm twin (A/B opt-out)"
+            no_tile_detail = "no legal cooperative tile divides it"
         if cuda_prim is None:
             raise FP8MatmulPathCDirectError(
-                f"fp8_scaled_matmul_path_c (cuda): no legal cooperative tile "
-                f"divides M={M} N={N} K={K}; the CUDA dequant->T.gemm kernel "
-                "cannot tile this shape and there is no Metal-only dot4 sibling "
-                "on CUDA (RULE #1: no silent partial-tile / fallback)."
+                f"fp8_scaled_matmul_path_c (cuda, {cuda_prim_kind}): "
+                f"{no_tile_detail} for M={M} N={N} K={K}; the CUDA fp8 T.gemm "
+                "kernel cannot tile this shape and there is no Metal-only dot4 "
+                "sibling on CUDA (RULE #1: no silent partial-tile / fallback)."
             )
         # sm_121 (Blackwell): disable the TMA + warp-specialized lowering so the
         # GEMM operand copies use plain cp.async/vectorized loads (the same
@@ -937,3 +1207,52 @@ def fp8_scaled_matmul_path_c_cuda_prim(
 
 
 __all__.append("fp8_scaled_matmul_path_c_cuda_prim")
+
+
+def fp8_scaled_matmul_path_c_cuda_native_prim(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    num_stages: int = 0,
+    c_dtype: str = "float32",
+    BM: int | None = None,
+    BN: int | None = None,
+    BK: int | None = None,
+    threads: int | None = None,
+) -> Any:
+    """Public alias: build the gb10 (sm_121) NATIVE fp8-input e4m3 ``T.gemm`` prim.
+
+    Thin wrapper over :func:`_make_scaled_matmul2d_cuda_native_kernel` -- the
+    lever-r2-native-fp8mma kernel whose e4m3 shared operands feed ``T.gemm``
+    directly, so the CUDA backend dispatches the SM120 fp8 MMA atom
+    (``SM120_16x8x32_TN`` -> ``mma.sync...kind::f8f6f4.m16n8k32...e4m3.e4m3.f32``)
+    -- a REAL fp8-input tensor-core MMA, fp32 accumulate, NO fp16 decode.
+
+    Returns the compiled-ready ``@T.prim_func``; ``None`` when no legal native-fp8
+    tile divides ``M/N/K`` (the caller RAISES on a CUDA host -- RULE #1). Optional
+    ``BM/BN/BK/threads`` pin a specific tile for a sweep (validated; illegal ->
+    RAISE). Compile it via :func:`tilelang.compile` with
+    ``target=_as_cuda_target("cuda")`` and ``pass_configs={"tl.disable_tma_lower":
+    True, "tl.disable_warp_specialized": True}`` -- exactly what
+    :func:`_fp8_matmul_tvm_ffi_kernel_for` does on the cuda native branch.
+
+    VERIFY-GATE (RULE #1): the GB10 phase must confirm the generated CUDA emits
+    ``tl::mma_sync<kFloat8_e4m3,kFloat8_e4m3,kFloat32,16,8,32>`` (NOT kFloat16) --
+    that proves it is a real fp8-input MMA, not a relabeled fp16 path.
+    """
+    return _make_scaled_matmul2d_cuda_native_kernel(
+        M=M,
+        N=N,
+        K=K,
+        num_stages=num_stages,
+        c_dtype=c_dtype,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        threads=threads,
+    )
+
+
+__all__.append("fp8_scaled_matmul_path_c_cuda_native_prim")
+__all__.append("FP8_PATH_C_CUDA_NATIVE_ENV")
