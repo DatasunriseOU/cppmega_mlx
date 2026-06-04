@@ -51,6 +51,18 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         "backend:cudaMallocAsync,release_threshold:0",
     )
 
+# SECONDARY (§22) export-doubling fix: when CPPMEGA_FP8_BRIDGE_UNIFIED is requested,
+# propagate it to MLX_CUDA_BRIDGE_UNIFIED so the MLX CUDA allocator (rebuilt with the
+# allocator.cpp change) allocates bridge arrays as unified up front — killing the
+# per-tensor cudaMallocManaged doubling that move_to_unified_memory does on each
+# bridge crossing. MUST be set BEFORE ``import mlx.core`` (MLX reads it once at
+# allocator construction). Default OFF so the bf16 arm and un-rebuilt MLX are
+# unchanged; the GB10 phase opts in after rebuilding MLX. RULE #1: managed memory is
+# the same bytes, device-resident — correctness-neutral, never a degrade.
+_bridge_unified = os.environ.get("CPPMEGA_FP8_BRIDGE_UNIFIED", "").strip().lower()
+if _bridge_unified in ("1", "true", "yes", "on") and "MLX_CUDA_BRIDGE_UNIFIED" not in os.environ:
+    os.environ["MLX_CUDA_BRIDGE_UNIFIED"] = "1"
+
 # RULE #1: fix the NVRTC loader BEFORE torch / TE are imported anywhere (gb10).
 # Safe no-op off-gb10. Must precede the first transformer_engine import (which
 # happens lazily inside fp8_te_linear when the fp8 arm runs).
@@ -103,10 +115,20 @@ def _torch_reset_peak() -> None:
 
 
 def _budget_mlx_torch() -> None:
-    """Split the single GB10 unified pool between MLX and torch/TE for the fp8 arm.
+    """Wire the §22 shared-pool fix + budget split for the fp8 arm.
 
-    lever dlpack-fix: the §21 fp8-backward OOM is dual-pool reservation contention,
-    not activation size. Three knobs, all bounds (NOT fallbacks):
+    §22 root cause: the fp8-backward OOM is dual-pool reservation contention (MLX's
+    AND torch/TE's cudaMallocAsync pools each reserve-and-retain the 117 GB unified
+    pool), not activation size. The PRIMARY fix is a SINGLE shared pool; the budget
+    knobs below are complementary bounds (NOT fallbacks):
+
+      (0, PRIMARY) ``install_shared_mempool()`` — route the device-current pool to
+          MLX's default pool (``cudaDeviceSetMemPool``) so MLX and torch/TE draw from
+          ONE pool: one reservation, no double-count. Done ONCE here AFTER torch's
+          CUDA context is initialized (so torch's later allocations honor it). RAISES
+          if the runtime lacks cudaDeviceSetMemPool (then the trim-both fallback in
+          relieve_bridge_memory_pressure still runs each backward). Gated
+          CPPMEGA_FP8_SHARED_POOL (default ON).
       (1) ``mx.set_cache_limit(0)`` — MLX returns freed buffers immediately so the
           bridge trim (``relieve_bridge_memory_pressure``) can reclaim them, instead
           of MLX hoarding them in its cache.
@@ -126,6 +148,9 @@ def _budget_mlx_torch() -> None:
         import torch
 
         if torch.cuda.is_available():
+            # Initialize torch's CUDA context so its cudaMallocAsync pool exists
+            # BEFORE we repoint the device-current pool, then cap its share.
+            torch.cuda.init()
             frac = float(os.environ.get("CPPMEGA_TORCH_MEM_FRAC", "0.45"))
             torch.cuda.set_per_process_memory_fraction(frac)
     except Exception as exc:  # RULE #1: a budget-cap failure is a config bug, surface it.
@@ -134,6 +159,24 @@ def _budget_mlx_torch() -> None:
             f"the fp8 arm (CPPMEGA_TORCH_MEM_FRAC): {type(exc).__name__}: {exc}. The "
             "fp8 bridge needs the MLX+torch budget split to fit the GB10 unified pool."
         ) from exc
+
+    # PRIMARY §22 shared-pool install (once, up front, after torch's CUDA context).
+    from cppmega_mlx.nn._tilelang._cuda_zerocopy import (
+        install_shared_mempool,
+        shared_pool_enabled,
+    )
+
+    if shared_pool_enabled():
+        try:
+            install_shared_mempool()
+        except Exception as exc:  # RULE #1: surface where+what; do NOT silently skip.
+            raise RuntimeError(
+                "bench_fp8_e2e: could not install the single shared cudaMemPool for "
+                f"the fp8 arm (the §22 PRIMARY fix): {type(exc).__name__}: {exc}. "
+                "Set CPPMEGA_FP8_SHARED_POOL=0 to fall to the trim-both path (and "
+                "report that honestly), or rebuild MLX with the allocator shared-pool "
+                "change if cudaDeviceSetMemPool is unavailable."
+            ) from exc
 
 
 def _run_arm(arm: str, args, tokens) -> dict:

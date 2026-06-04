@@ -80,7 +80,9 @@ def _load_cudart():
             "fp8 bridge needs cudaMemPoolTrimTo to fit the dual-pool budget."
         )
     # cudaGetDevice(int*), cudaDeviceGetDefaultMemPool(pool*, int dev),
-    # cudaMemPoolSetAttribute(pool, attr, void*), cudaMemPoolTrimTo(pool, size_t)
+    # cudaMemPoolSetAttribute(pool, attr, void*), cudaMemPoolTrimTo(pool, size_t),
+    # cudaDeviceGetMemPool(pool*, int dev), cudaDeviceSetMemPool(int dev, pool)
+    # (the last two route the device-current pool for the SHARED-POOL fix).
     _cudart.cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
     _cudart.cudaGetDevice.restype = ctypes.c_int
     _cudart.cudaDeviceGetDefaultMemPool.argtypes = [
@@ -96,6 +98,18 @@ def _load_cudart():
     _cudart.cudaMemPoolSetAttribute.restype = ctypes.c_int
     _cudart.cudaMemPoolTrimTo.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     _cudart.cudaMemPoolTrimTo.restype = ctypes.c_int
+    # cudaDeviceGetMemPool reads the device's CURRENT pool (what plain
+    # cudaMallocAsync(&p,size,stream) — used by BOTH MLX and torch — draws from
+    # unless the caller passes an explicit pool). cudaDeviceSetMemPool repoints it.
+    if hasattr(_cudart, "cudaDeviceGetMemPool"):
+        _cudart.cudaDeviceGetMemPool.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int,
+        ]
+        _cudart.cudaDeviceGetMemPool.restype = ctypes.c_int
+    if hasattr(_cudart, "cudaDeviceSetMemPool"):
+        _cudart.cudaDeviceSetMemPool.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        _cudart.cudaDeviceSetMemPool.restype = ctypes.c_int
     return _cudart
 
 
@@ -152,6 +166,171 @@ def trim_cuda_mempool(device: int | None = None) -> None:
         raise RuntimeError(
             f"_cuda_zerocopy: cudaMemPoolTrimTo(dev={device}, 0) failed "
             f"(cudaError={err}); cannot return idle reserved unified memory."
+        )
+
+
+# ---------------------------------------------------------------------------
+# PRIMARY (§22) SHARED-POOL fix — make MLX and torch/TE draw from ONE pool.
+#
+# Root cause (§22 root-cause, MEASURED): the fp8 backward OOMs because TWO
+# stream-ordered cudaMallocAsync mempools coexist — MLX's device-default pool AND
+# torch/TE's OWN cudaMallocAsync pool — each RESERVES-and-RETAINS unified memory
+# and neither releases it. Their COMBINED reserved set exceeds the 117 GB physical
+# GB10 unified pool. Trimming both pools (the §21 fallback below) helps but still
+# double-reserves transiently. The TARGET fix is a SINGLE shared pool: ONE
+# reservation, no double-count.
+#
+# Mechanism (Python-only, NO MLX rebuild): both MLX (allocator.cpp:243) and torch's
+# cudaMallocAsync backend allocate with plain ``cudaMallocAsync(&p, size, stream)``
+# (no explicit pool arg), which draws from the DEVICE-CURRENT mempool. The CUDA
+# default is the device DEFAULT pool, but torch's native-CUDA-allocator path and
+# capture pools can install a private pool as the device-current one. We force ONE
+# pool by setting the device-current pool to MLX's default pool via
+# ``cudaDeviceSetMemPool`` AFTER torch's CUDA context exists, so every subsequent
+# plain ``cudaMallocAsync`` on that device — MLX's AND torch/TE's — reserves from
+# the SAME pool. We then set ReleaseThreshold=0 on that one shared pool.
+#
+# RULE #1: this only makes the zero-copy path FIT (one reservation instead of two);
+# it never host-copies or degrades. On any CUDA failure it RAISES with where+what.
+# If ``cudaDeviceSetMemPool`` is genuinely unavailable in this CUDA runtime we RAISE
+# (the caller falls to the trim-both path and states that honestly — see
+# ``relieve_bridge_memory_pressure``).
+# ---------------------------------------------------------------------------
+
+# Devices on which we have already installed MLX's pool as the shared device pool.
+_SHARED_POOL_INSTALLED: dict[int, ctypes.c_void_p] = {}
+
+
+def _device_current_mempool(rt, device: int) -> ctypes.c_void_p:
+    """Return the device's CURRENT mempool (what plain cudaMallocAsync draws from)."""
+
+    if not hasattr(rt, "cudaDeviceGetMemPool"):
+        raise RuntimeError(
+            "_cuda_zerocopy: this CUDA runtime lacks cudaDeviceGetMemPool; cannot "
+            "inspect the device-current mempool for the shared-pool fix."
+        )
+    pool = ctypes.c_void_p()
+    err = rt.cudaDeviceGetMemPool(ctypes.byref(pool), int(device))
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaDeviceGetMemPool(dev={device}) failed "
+            f"(cudaError={err}); cannot resolve the device-current mempool."
+        )
+    return pool
+
+
+def install_shared_mempool(device: int | None = None) -> int:
+    """Route the device-current pool to MLX's default pool so MLX+torch share ONE.
+
+    PRIMARY §22 fix: sets ``cudaDeviceSetMemPool(device, mlx_default_pool)`` so every
+    subsequent plain ``cudaMallocAsync(&p,size,stream)`` on ``device`` — from MLX AND
+    from torch/TE — reserves from the SAME pool (ONE reservation, no double-count),
+    and sets ReleaseThreshold=0 on it. MUST be called AFTER torch's CUDA context is
+    initialized (so torch's later allocations honor the new device-current pool).
+
+    Returns the device ordinal. Idempotent per device. RAISES (RULE #1) on any CUDA
+    failure or if ``cudaDeviceSetMemPool`` is unavailable — the caller decides whether
+    to fall to the trim-both path. Gated by ``CPPMEGA_FP8_SHARED_POOL`` (default ON;
+    set 0 to A/B the dual-pool behavior).
+    """
+
+    rt = _load_cudart()
+    if device is None:
+        dev = ctypes.c_int(0)
+        err = rt.cudaGetDevice(ctypes.byref(dev))
+        if err != 0:
+            raise RuntimeError(
+                f"_cuda_zerocopy: cudaGetDevice failed (cudaError={err}) resolving "
+                "the device for the shared-pool install."
+            )
+        device = int(dev.value)
+    if device in _SHARED_POOL_INSTALLED:
+        return device
+    if not hasattr(rt, "cudaDeviceSetMemPool"):
+        raise RuntimeError(
+            "_cuda_zerocopy: this CUDA runtime lacks cudaDeviceSetMemPool; the "
+            "single-shared-pool fix is unreachable from Python on this build. Fall to "
+            "relieve_bridge_memory_pressure() (trim BOTH pools) or rebuild MLX with "
+            "the allocator shared-pool change."
+        )
+    # MLX's default device pool is the pool MLX's allocator was constructed against
+    # (cudaDeviceGetDefaultMemPool in allocator.cpp:179). Make it the device-CURRENT
+    # pool so torch/TE's plain cudaMallocAsync draws from it too.
+    mlx_pool = _default_mempool(rt, device)
+    err = rt.cudaDeviceSetMemPool(int(device), mlx_pool)
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaDeviceSetMemPool(dev={device}, mlx_default_pool) "
+            f"failed (cudaError={err}); cannot install the single shared mempool. The "
+            "two allocators would keep double-reserving the GB10 unified pool."
+        )
+    # Bound the shared pool so cudaFreeAsync returns reserved-but-idle memory to the
+    # OS (default threshold is UINT64_MAX = retain everything).
+    if device not in _RELEASE_THRESHOLD_SET:
+        thresh = ctypes.c_uint64(0)
+        err = rt.cudaMemPoolSetAttribute(
+            mlx_pool,
+            _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+        )
+        if err != 0:
+            raise RuntimeError(
+                f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0, "
+                f"dev={device}) on the shared pool failed (cudaError={err})."
+            )
+        _RELEASE_THRESHOLD_SET.add(device)
+    _SHARED_POOL_INSTALLED[device] = mlx_pool
+    return device
+
+
+def shared_pool_enabled() -> bool:
+    """Return whether the §22 single-shared-pool fix is enabled (default ON)."""
+
+    return os.environ.get("CPPMEGA_FP8_SHARED_POOL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def trim_device_current_mempool(device: int | None = None) -> None:
+    """Trim the device-CURRENT pool (torch's pool when not shared) to 0.
+
+    Complements ``trim_cuda_mempool`` (which trims MLX's DEFAULT pool). When the
+    shared-pool fix is NOT active these are two distinct pools; trimming BOTH is the
+    §22 fallback (c). When the shared-pool fix IS active they are the same pool and
+    this is a harmless second trim. RAISES (RULE #1) on any CUDA failure.
+    """
+
+    rt = _load_cudart()
+    if device is None:
+        dev = ctypes.c_int(0)
+        err = rt.cudaGetDevice(ctypes.byref(dev))
+        if err != 0:
+            raise RuntimeError(
+                f"_cuda_zerocopy: cudaGetDevice failed (cudaError={err}) resolving "
+                "the device for the device-current mempool trim."
+            )
+        device = int(dev.value)
+    pool = _device_current_mempool(rt, device)
+    if device not in _RELEASE_THRESHOLD_SET:
+        thresh = ctypes.c_uint64(0)
+        err = rt.cudaMemPoolSetAttribute(
+            pool,
+            _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+        )
+        if err != 0:
+            raise RuntimeError(
+                f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0) on the "
+                f"device-current pool (dev={device}) failed (cudaError={err})."
+            )
+    err = rt.cudaMemPoolTrimTo(pool, ctypes.c_size_t(0))
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaMemPoolTrimTo(device-current, dev={device}, 0) "
+            f"failed (cudaError={err}); cannot return idle reserved memory."
         )
 
 # ---------------------------------------------------------------------------
@@ -238,29 +417,47 @@ def zerocopy_enabled() -> bool:
 
 
 def relieve_bridge_memory_pressure(device: int | None = None) -> None:
-    """Trim BOTH the MLX cache and the CUDA mempool at a bridge boundary.
+    """Relieve the dual-pool contention at a bridge boundary (PRIMARY + fallback).
 
     The fp8 backward crosses the MLX<->torch DLPack bridge while MLX's forward/scan
-    working set and torch/TE's fp8 scratch both hold reserved unified memory. This
-    helper, called immediately BEFORE a backward crossing (after the producer
-    eval/sync), returns MLX's cached buffers (``mx.clear_cache``) and returns the
-    CUDA mempool's reserved-but-idle unified memory (``trim_cuda_mempool``) so the
-    next allocation fits the single GB10 pool. It is gated by
-    ``CPPMEGA_FP8_BRIDGE_TRIM`` (default ON when unset, to fix the §21 OOM; set 0 to
-    A/B the un-trimmed behavior). RULE #1: this only makes the zero-copy path FIT —
-    it never host-copies or degrades. On a genuine CUDA failure it RAISES with
-    where+what (no silent skip).
+    working set and torch/TE's fp8 scratch both hold reserved unified memory. Called
+    immediately BEFORE a backward crossing (after the producer eval/sync), this:
+
+      (PRIMARY §22, when ``CPPMEGA_FP8_SHARED_POOL`` is ON, default) installs MLX's
+      default pool as the device-CURRENT pool so MLX and torch/TE draw from ONE pool
+      (``install_shared_mempool`` -> ``cudaDeviceSetMemPool``). ONE reservation, no
+      double-count. Idempotent. If the CUDA runtime genuinely lacks
+      ``cudaDeviceSetMemPool`` this RAISES; the bench harness installs it once up
+      front and treats unavailability as a hard config error (no silent dual-pool).
+
+      (COMPLEMENTARY §21/§22-fallback) returns MLX's cached buffers
+      (``mx.clear_cache``) and trims BOTH the MLX default pool (``trim_cuda_mempool``)
+      AND the device-current pool (``trim_device_current_mempool`` — torch's pool when
+      not shared) to 0 so reserved-but-idle unified memory returns to the OS. When the
+      shared-pool fix is active these two are the same pool; the second trim is a
+      harmless no-op. When it is NOT active (gate off / older runtime) this trims both
+      distinct pools — the documented fallback.
+
+    Gated by ``CPPMEGA_FP8_BRIDGE_TRIM`` (default ON; set 0 to A/B). RULE #1: this only
+    makes the zero-copy path FIT — it never host-copies or degrades. On a genuine CUDA
+    failure it RAISES with where+what (no silent skip).
     """
 
     if os.environ.get("CPPMEGA_FP8_BRIDGE_TRIM", "1").strip().lower() in ("0", "false", "no", "off"):
         return
+    # PRIMARY: ensure the single shared pool is installed (idempotent). When the gate
+    # is on this is the load-bearing fix — one reservation for both allocators.
+    if shared_pool_enabled():
+        install_shared_mempool(device)
     # MLX side: return cached (non-live) buffers so the unified pool shrinks.
     clear = getattr(mx, "clear_cache", None)
     if callable(clear):
         clear()
-    # CUDA side: set ReleaseThreshold=0 + cudaMemPoolTrimTo(0) so the driver
-    # returns reserved-but-idle unified memory shared with torch/TE's pool.
+    # CUDA side: set ReleaseThreshold=0 + cudaMemPoolTrimTo(0) on BOTH the MLX default
+    # pool AND the device-current pool (torch's, when not shared) so the driver returns
+    # reserved-but-idle unified memory. Same pool when shared -> the second is a no-op.
     trim_cuda_mempool(device)
+    trim_device_current_mempool(device)
 
 
 def _dlpack_device_type() -> int:
