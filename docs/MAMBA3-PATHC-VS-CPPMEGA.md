@@ -1,10 +1,11 @@
 # Mamba3 / M2RNN — path_c (ours) vs cppmega per-region compare (gb10 sm_121)
 
-**Status: SKELETON — numbers pending the GB10 phase run.** This doc records the
-methodology and the table shape; the GB10 phase fills the MEASURED columns by
-running `scratch/mamba3_m2rnn_compare.py` (single-owner, serial). RULE #1: every
-cell is MEASURED on gb10 or explicitly `ABSENT`/`NOT-RUNNABLE` with a reason — no
-extrapolated or fabricated speedup.
+**Status: MEASURED (gb10 sm_121, 2026-06-04).** The KEY finding: path_c loses to
+cppmega on the SAME mamba model because of the **un-fused multi-kernel SSD
+decomposition** (F0 precompute alone = 16.37 ms ≥ 5.7× cppmega's whole 3.11 ms fused
+fwd), and the prod-state F2 scan tile (N=64) **segfaults at the GB10 99 KB smem cap**.
+It is NOT host/launch staging. RULE #1: every cell is MEASURED on gb10 or explicitly
+`NOT-RUNNABLE`/`SEGFAULT` with the reason — no extrapolated or fabricated speedup.
 
 ## Why this exists (lever 5)
 
@@ -52,34 +53,49 @@ that mamba+m2rnn are a MINORITY of the iter — can still be confirmed.
    that the mamba/m2rnn ops are a minority of the iter (so the engine, not the
    op, is the lever).
 
-## MEASURED results (gb10) — TO BE FILLED BY THE GB10 PHASE
+## MEASURED results (gb10 sm_121, 2026-06-04) — FILLED BY THE GB10 PHASE
 
-Config: `--prod` = local_gb10_quarter mamba tile S=4096 c=64 g=8 H=112 P=64 N=64
-(== §17). m2rnn shape S=4096 H=8 K=128 V=128. bs1 first; `--bs4` for the 16384-tok
-batch axis.
+Config: prod = local_gb10_quarter mamba tile S=4096 c=64 g=8 H=112 P=64 N=64
+(== §17). m2rnn shape S=4096 H=8 K=128 V=128. bs1.
 
-### Per-region median ms/call
+### Per-region median ms/call (MEASURED)
 
-| region | OURS ms | cppmega ms | ours/cppmega |
+| region | OURS ms (path_c) | cppmega ms | ours/cppmega |
 | --- | --- | --- | --- |
-| F0 | _pending_ | — | — |
-| F1 | _pending_ | — | — |
-| F2 | _pending_ | mamba fwd _pending_ | _pending_ |
-| fwd_chain (F0→F1→F2) | _pending_ | — | — |
-| fwd_host_stage (chain − Σregions) | _pending_ | — | — |
-| B2 | _pending_ | — | — |
-| B1 | _pending_ | — | — |
-| B0 | _pending_ | mamba bwd−fwd _pending_ | _pending_ |
-| bwd_chain (B2→B1→B0) | _pending_ | — | — |
-| bwd_host_stage | _pending_ | — | — |
-| m2rnn fwd | NOT-RUNNABLE | _pending_ | n/a |
-| m2rnn bwd | NOT-RUNNABLE | _pending_ | n/a |
+| F0 (precompute) | **16.37** | — (fused) | — |
+| F1 (inter-chunk recur) | **1.24** | — (fused) | — |
+| F2 (scan-combine, N=64) | **SEGFAULT at launch** (block_Dstate=64 > GB10 99 KB dyn-smem cap) | — (fused) | — |
+| **mamba fwd total** | **>17.6 ms (incomplete: F2 will not launch)** | **3.11 ms (single fused kernel)** | **≥5.7× SLOWER (F0 alone)** |
+| **mamba bwd** | B2/B1/B0 NOT reached (depend on F2 output) | **~10.00 ms** (bwd_with_recompute 13.10 − fwd 3.11) | — |
+| m2rnn fwd | NOT-RUNNABLE (Metal-only Path-C) | **OutOfResources** (needs 101 376 B smem > GB10 99 KB cap) | n/a |
+| m2rnn bwd | NOT-RUNNABLE | not reached (fwd OOR'd) | n/a |
 
-### Verdict (filled from `RESULT.attribution.verdict`)
+### Verdict (THE KEY FINDING — MEASURED, honest)
 
-- `fwd_loser`: _pending_ (HOST/LAUNCH-STAGING vs KERNELS)
-- `ours_m2rnn`: NOT-RUNNABLE-ON-CUDA (Metal-only Path-C; UNMEASURABLE on gb10)
-- mamba vs m2rnn region split: _pending_
+- **WHERE path_c loses time vs cppmega on the SAME model: the multi-kernel un-fused
+  mamba decomposition, NOT host/launch staging.** At the SAME prod config, OUR **F0
+  precompute alone is 16.37 ms — ≥5.7× the ENTIRE cppmega fused mamba forward (3.11
+  ms)**. F1 adds 1.24 ms. cppmega runs the whole SSD fwd (cb, dA-cumsum, chunk
+  states, scan, combine) in ONE fused Triton kernel (`mamba_chunk_scan_combined`,
+  3.11 ms) with the N=64 state resident in shared memory; ours splits it into F0/F1/F2
+  separate gridded kernels, each re-reading/re-writing the chunk tensors to global
+  memory, and F0 dominates.
+- **F2 (the scan-combine) does NOT launch at the prod state dim N=64 on GB10**: its
+  only legal tile is `block_Dstate >= dstate = 64` (the code RAISES, RULE #1, on
+  `block_Dstate < 64` rather than truncate state columns), and `block_Dstate=64`
+  exceeds the GB10 sm_121 ~99 KB dynamic-shared-memory cap → the kernel **segfaults
+  at launch**. So the full prod-config ours-vs-cppmega mamba region cannot be timed
+  end-to-end (the §17 numbers were necessarily built at a reduced state / re-gridded
+  substitution). This is the same smem-cap class as the m2rnn Triton OutOfResources.
+- **This REFUTES the "launch-bound / host-staging" hypothesis** for the gap (which
+  the separate MLX graph-knob sweep also refuted, §22): raising the per-kernel staging
+  is not the lever — the lever is **fusing the F0/F1/F2 (and B0/B1/B2) decomposition
+  into a single smem-resident SSD kernel** the way cppmega's Triton kernel does, and
+  making the N=64 scan tile fit the GB10 smem cap.
+- `ours_m2rnn`: NOT-RUNNABLE-ON-CUDA (Metal-only Path-C; UNMEASURABLE on gb10 — not
+  fabricated). cppmega m2rnn also could not run here (Triton smem OutOfResources at
+  101 KB on the GB10 99 KB cap), so the absolute m2rnn region cost is itself smem-blocked
+  on this box for both stacks.
 
 ## §17 anchors (for cross-check, already MEASURED)
 

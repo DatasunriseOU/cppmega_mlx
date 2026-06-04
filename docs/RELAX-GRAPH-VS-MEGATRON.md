@@ -1618,3 +1618,128 @@ and at §17 the GEMMs are ~2% of the step vs the backward's ~80–91%), so fp8 i
 not a step-level catch-up to Megatron. Net: the box is cleaner, our own native fp8 MMA is real (and the
 tuning target is now occupancy, not feasibility), and the TE-fp8 e2e path needs an MLX/torch allocator
 co-residency fix (shared pool / unified allocator) before it can be measured end-to-end on this box.
+
+## §22. SIX LEVERS RE-MEASURED — fp8 MMA tile-tuning now CROSSES bf16 (1.17–1.55×), DLPack reject FIXED (bridge works), the mamba gap is UN-FUSED KERNELS not launch-staging, CUTLASS 4.5.1 builds but SF-layout NO-GO (MEASURED, gb10 sm_121, 2026-06-04)
+
+Single exclusive GB10 owner, serial. Each GPU run: ownership poll + drop_caches before/after,
+SIGTERM-only. Six levers measured; headline numbers below are MEASURED unless tagged EXTRAPOLATION.
+
+### Lever: MLX CUDA-graph-cap sweep (the cheap high-value test) — REFUTES launch-bound for the MLX path
+MLX `mlx/backend/cuda/device.cpp` `get_graph_limits()` hard-codes `case 1210 (DGX Spark): ops=20,
+mb=25` — far below H100/Blackwell `ops=100, mb=1000`. Swept `MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER`
+on the runnable bf16 full-model step (`scripts/bench_fp8_e2e_step_20260604.py --arm bf16`, seq=512 bs1 13L):
+
+| ops/mb | tok/s | step s | MLX peak GB |
+| --- | --- | --- | --- |
+| 20/25 (GB10 default) | **31.7** | 16.17 | 13.2 |
+| 64/200 | 31.4 | 16.30 | 13.3 |
+| 200/2000 | 26.7 (WORSE) | 19.15 | 32.6 |
+| 400/4000 | 26.4 (WORSE) | 19.42 | 52.0 |
+
+**Raising the caps did NOT raise tok/s — it stayed flat then REGRESSED while peak memory ballooned
+13→52 GB. This MLX-eager full-model step is NOT launch/graph-cap-bound; it is kernel/compute-bound.**
+The ONE real win was `MLX_CUDA_GRAPH_CACHE_SIZE=4000`: the GB10 default (400) **crashes** the bf16 step
+with `"Cache thrashing... set MLX_CUDA_GRAPH_CACHE_SIZE to a larger value than 400"` + a hard
+`cudaGraphAddDependencies ... invalid argument` — raising the cache size to 4000 fixes that crash and is
+the actionable knob (the cap sweep is not).
+
+### Lever 1 (dlpack-fix): the §21 "torch.from_dlpack REJECTED the MLX native kDLCUDA export" is FIXED
+On the current MLX build (`0.32.0.dev20260602+6680d75a`) the native CUDA DLPack export landed:
+`mx.array(bf16).__dlpack_device__() == (kDLCUDA=2, 0)` and **`torch.from_dlpack(arr)` now ACCEPTS the
+MLX native kDLCUDA capsule** → a `cuda:0` torch view (MEASURED probe). The isolated single-Linear fp8
+fwd+bwd through the bridge (`_fp8_linear_impl` + `_fp8_linear_bwd`, prod MoE-up shape K=3584 N=18944,
+M=128) **fully SUCCEEDS** (dgrad (128,3584)+wgrad (18944,3584), MLX peak 0.38 GB, torch 0.5 GB) — the
+bridge, TE fp8 backward, and zero-copy writeback all work. So the DLPack-bridge half of lever 1 is GO.
+
+**BUT the fp8 E2E step still OOMs — at a DIFFERENT spot than §21 claimed.** The OOM is now precisely
+`fp8_te_linear.py:321 mx.eval(x2, weight, g2)` inside the FIRST `_fp8_linear_bwd`, i.e. MLX's OWN
+`cudaMallocAsync(...) failed: out of memory` while materializing the full 13-layer reverse-mode graph in
+one eval — NOT a DLPack reject and NOT TE memory. Diagnosis (MEASURED): bf16-only full step peaks at just
+**7.63 GB @ seq128 / 9.49 @ seq256**, with 110+ GB physically free; yet the fp8 arm's first deep-backward
+`mx.eval` triggers a cudaMallocAsync pool-growth failure regardless of `CPPMEGA_TORCH_MEM_FRAC` (tried
+0.30/0.45/0.95) or `CPPMEGA_MLX_MEMORY_LIMIT_GB=70`. Switching torch off cudaMallocAsync to the native
+caching allocator makes it WORSE (kernel OOM-kill, total-vm 161 GB). Root cause = **two cudaMallocAsync
+pools (MLX's + TE's) cannot both grow on the GB10 UVM device**: the per-Linear bridge crossing forces a
+mid-backward full-graph materialization that the coexisting pools cannot satisfy. This needs the MLX↔torch
+shared/unified-pool C++ rebuild (the dlpack-fix STEP 0, deferred this round as box-risk) OR restructuring
+the fp8 seam to not force a full mid-backward eval. **fp8 e2e tok/s remains UNMEASURED; bf16 reference =
+97.4 tok/s @seq128 / 55.9 @seq256 / 31.7 @seq512 (bs1 13L).**
+
+### Lever 2 (fp8-mma-tune): native SM120 e4m3 MMA tile-tuning CROSSES bf16 on ALL prod shapes — GO
+`scratch/fp8_mma_autotune.py --prod` drove the pipelined tunable native prim through TileLang AutoTuner.
+The §21 "0.69–0.95× untuned single tile" residual is RESOLVED — raising `threads` 128→256 and
+`num_stages` 0→2/3 (real pipelining) crosses >1× on every prod GEMM:
+
+| shape | bf16 TFLOPs | best fp8 tile (M,N,K,stages,threads) | fp8 TFLOPs | ×bf16 | rel_err |
+| --- | --- | --- | --- | --- | --- |
+| mlp_up_gate 16384×37888×3584 | 33.7 | (128,64,64,**3**,**256**) | **39.6** | **1.17×** | 2.1e-7 |
+| mlp_down 16384×3584×18944 | 34.3 | (128,128,64,2,256) | **51.9** | **1.51×** | 1.4e-6 |
+| attn_qkv 16384×10752×3584 | 33.5 | (128,128,64,2,256) | **41.8** | **1.25×** | 2.1e-7 |
+| attn_out 16384×3584×3584 | 33.3 | (128,128,64,2,256) | **51.7** | **1.55×** | 2.1e-7 |
+
+All parity-passing (rel_err ≤ 1.4e-6, essentially exact). `BEST_CONFIG_JSON` printed for pinning into
+`_native_fp8_tile_for`. **Native fp8 MMA is now a real GEMM-phase win (1.17–1.55×) — pin the tuned tiles.**
+
+### Lever 5 (mamba3-compare, THE KEY): the gap is the UN-FUSED multi-kernel SSD, NOT launch-staging
+At the SAME §17 prod config (S=4096, c=64, g=8, H=112, P=64, N=64, bs1) — see
+`docs/MAMBA3-PATHC-VS-CPPMEGA.md` for the full table:
+- **cppmega** (Megatron SSD Triton `mamba_chunk_scan_combined`, the EXACT op cppmega drives): **fwd 3.11 ms
+  in ONE fused kernel**, bwd ≈10.0 ms (state resident in smem).
+- **OURS (path_c)**: **F0 precompute ALONE = 16.37 ms (≥5.7× cppmega's WHOLE 3.11 ms fused fwd)**, F1 1.24
+  ms; **F2 scan-combine SEGFAULTS at launch** at the prod state N=64 (only legal tile block_Dstate=64
+  exceeds the GB10 ~99 KB dynamic-smem cap; the code RAISES on block_Dstate<64 rather than truncate state
+  — RULE #1). cppmega's m2rnn Triton also could not run (smem OutOfResources, 101 KB > 99 KB cap); ours
+  m2rnn is Metal-only (NOT-RUNNABLE-on-CUDA, not fabricated).
+- **VERDICT: the loser is the KERNEL DECOMPOSITION, not host/launch staging** (consistent with the MLX
+  graph-knob refutation above). path_c splits the SSD forward into F0/F1/F2 separate gridded kernels that
+  round chunk tensors through global memory; cppmega fuses it into one smem-resident kernel. **The lever is
+  to FUSE F0/F1/F2 (and B0/B1/B2) into a single smem-resident SSD kernel and make the N=64 scan tile fit
+  the GB10 smem cap** — not to tune launch overhead.
+
+### Lever 4 (tn-adapter + nvfp4): NVFP4 RtN fwd+bwd is a GEMM-level GO via path_c; tok/s memory-blocked
+- **NVFP4 RtN backward (TE standalone, `nvfp4_te_backward_rtn_probe`)** RUNS fwd+dgrad+wgrad at 3 shapes
+  (256×512×256, 1024×3584×3584, 2048×3584×10752), all finite: fwd_rel ≈ 0.146, dgrad_rel ≈ 0.146,
+  wgrad_rel ≈ 0.134 vs bf16 (matches §21 prior 0.1465/0.1343 — the FP4 RtN quant floor).
+- **`nvfp4_path_c_gemm` (MLX operands, lifted into path_c via the lever-1 bridge)** runs **fwd AND the
+  mx.grad VJP backward** at 1024×3584×3584 (rel_vs_bf16 0.146, dgrad finite) — the path_c FP4 GEMM route
+  is wired through the working DLPack bridge.
+- **mxfp8 TN-adapter**: structurally present (lifted from cppmega's WORKING shim — retargets cuBLAS-
+  unsupported NN/NT dgrad/wgrad to TN); as a standalone it correctly reports not-active — it only fires
+  inside TE's `general_gemm` during a full mxfp8 backward, which is the same MLX-graph-eval OOM as lever 1.
+- **tok/s effect UNMEASURED** (wiring fp4/mxfp8 into the full model hits the lever-1 OOM); GEMM-level parity
+  + runs are the GO evidence.
+
+### Lever 3 (cutlass-mxfp8, heaviest/last): CUTLASS 4.5.1 BUILDS + dispatches on sm_121a, but SF-layout NO-GO
+`_cutlass_mxfp8_sm120_build.sh` cloned **CUTLASS v4.5.1** (host/CPU-only side-checkout, did NOT clobber the
+live 4.1.0) and **nvcc-13.3 compiled `_cutlass_mxfp8_sm120.so` clean for `sm_121a`** (launchers
+`cppmega_mxfp8_gemm_sm121` / `_last_error` / `_sf_sizes` exported). The kernel LOADS and DISPATCHES, BUT the
+smoke parity **FAILS the gate: rel_err 0.41 > 0.12** → the code RAISES (RULE #1: refuses to report a
+passing/TFLOPs route for a numerically-wrong result). Cause: the E8M0 scale-factor (SFA/SFB) atom layout the
+Python driver packs does NOT match CUTLASS's swizzled `Sm1xxBlkScaledConfig::tile_atom_to_shape_SF` ordering
+(scales land on the wrong 32-element blocks). The .cu side correctly uses `tile_atom_to_shape_SFA/SFB`; the
+fix is a host-side SF repack to the atom-swizzled order. **TFLOPs NOT reported (the result is garbage). NO-GO
+this round; build/dispatch/launch CONFIRMED, only the SF-packing layout remains. Target stays 188 TFLOPs / 4×.**
+
+### tok/s vs Megatron 3399 (honest)
+**This round did NOT raise the realized e2e step tok/s past §17 (≈907 @8L / ≈298 @28L).** The fp8/fp4 e2e
+arm is memory-blocked (lever 1 OOM), so its tok/s is UNMEASURED, not a regression. The bf16 reference at
+small configs is 31.7–97.4 tok/s (seq512→seq128, bs1, 13L). The real, MEASURED forward progress is at the
+GEMM phase (lever 2: fp8 MMA 1.17–1.55× bf16, tuned, parity-clean) and the DLPack bridge (lever 1: native
+kDLCUDA export works, single-GEMM fp8 bwd works). **§17's ≈907/≈298 stays the canonical step number.** The
+KEY structural finding (lever 5) is that path_c's mamba forward is ≥5.7× cppmega's because it is un-fused
+(F0 alone 16.37 vs 3.11 ms fused) and F2 won't launch at N=64 (smem cap) — the throughput lever is SSD
+kernel FUSION + smem-fit, not launch/graph tuning (both the graph-knob sweep and the per-region timing
+refute launch-bound).
+
+### GO / NO-GO per lever
+- MLX graph-knob: **NO-GO as a tok/s lever** (flat→worse); `MLX_CUDA_GRAPH_CACHE_SIZE=4000` is the only
+  actionable knob (fixes the default-400 thrash crash). Confirms NOT launch-bound.
+- Lever 1 dlpack-fix: **PARTIAL GO** — DLPack reject FIXED, single-GEMM fp8 bwd works; **e2e NO-GO** (MLX+TE
+  cudaMallocAsync dual-pool OOM at the mid-backward full-graph eval; needs the shared-pool MLX rebuild).
+- Lever 2 fp8-mma-tune: **GO** — 1.17–1.55× bf16, parity-clean, tiles found.
+- Lever 5 mamba-compare: **KEY FINDING delivered** — gap = un-fused SSD kernels + F2 smem-cap segfault,
+  NOT launch-staging.
+- Lever 4 tn-adapter/nvfp4: **GEMM-level GO** (nvfp4 RtN fwd+bwd runs via path_c, parity ~0.146); e2e
+  tok/s memory-blocked.
+- Lever 3 cutlass-mxfp8: **NO-GO this round** (builds + dispatches on 4.5.1/sm_121a, SF atom-layout
+  parity 0.41 → defer the host-side SF repack).

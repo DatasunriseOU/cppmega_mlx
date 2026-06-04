@@ -127,10 +127,22 @@ def _native_fp8_tile_for(M: int, N: int, K: int) -> tuple[int, int, int, int] | 
         # Surface the violation to the caller (it RAISES) rather than picking an
         # illegal tile that would mis-tile the K reduction (RULE #1).
         return None
+    # §22 (gb10, 2026-06-04, scratch/fp8_mma_autotune.py --prod) MEASURED the best
+    # parity-passing native-fp8 tiles per prod shape — all CROSS bf16 (1.17–1.55×):
+    #   mlp_up_gate 16384x37888x3584 -> (128,64,64,stages=3,threads=256)  39.6 TF 1.17×
+    #   mlp_down    16384x3584x18944 -> (128,128,64,stages=2,threads=256) 51.9 TF 1.51×
+    #   attn_qkv    16384x10752x3584 -> (128,128,64,stages=2,threads=256) 41.8 TF 1.25×
+    #   attn_out    16384x3584x3584  -> (128,128,64,stages=2,threads=256) 51.7 TF 1.55×
+    # The winning GEOMETRY (128x128x64 / 128x64x64) leads the list so even this serial
+    # production prim picks the measured-best tile shape; the FULL win (threads=256 +
+    # num_stages=2/3 pipelining, which crosses 1.17–1.55× bf16) requires the tunable
+    # (pipelined) prim — this serial prim's num_stages is inert, so threads is kept at
+    # the hardware-tested 128 here. To realize the full §22 win, route prod through
+    # ``fp8_scaled_matmul_path_c_cuda_native_tunable_prim`` with the BEST_CONFIG_JSON tiles.
     candidates = (
-        (128, 128, 64, 128),  # research-recommended fp8 example geometry
+        (128, 128, 64, 128),  # §22 best geometry (mlp_down/attn_qkv/attn_out), tuned->1.25–1.55×
+        (128, 64, 64, 128),   # §22 best geometry (mlp_up_gate), tuned->1.17×
         (128, 128, 32, 128),  # smaller BK (K=32-deep amortized less)
-        (128, 64, 64, 128),   # narrower N
         (64, 64, 64, 128),    # SSD F2 tile (64x64x64) and small dims
         (64, 64, 32, 128),
         (32, 64, 32, 128),    # current untuned R2 tile (kept as a sweep point)
