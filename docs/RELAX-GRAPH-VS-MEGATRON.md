@@ -1968,3 +1968,106 @@ backward crossings so the deep graph materializes incrementally instead of accum
 - **NO-GO (unchanged): fp8 e2e as a tok/s WIN at floor0.** 16× slower (bridge-crossing-bound, not
   GEMM-bound). The realized e2e tok/s win still awaits floor-tuning + crossing-batching; §17's
   ≈907/≈298 stays the canonical bf16 step number.
+
+
+## §26. F0 PRECOMPUTE RE-EXPRESSED AS TENSOR-CORE T.gemm — the §22/§23 MEASURED 24.57 ms lever is GONE: new F0 = 1.13 ms (REAL sm_121 HMMA, parity PASS all elements), at Tri-Dao chunk_state+bmm parity. F0 is no longer the forward bottleneck; but the §17 STEP is backward-bound so the headline tok/s is essentially unchanged (MEASURED, gb10 sm_121, 2026-06-04)
+
+**What changed.** §22/§23 named the path_c → Megatron 3399 gap root cause: OUR F0 precompute was
+pathologically slow because `chunk_precompute_fwd_metal_prim` computed both its GEMM-shaped
+reductions as SERIAL scalar loops — `cb[L,L] = C@B^T` as a per-`(li,si)` dot over dstate, and
+`summary_states[P,N]` as a `P*N=4096`-cell serial-`l` accumulate — emitting NO tensor-core MMA. This
+round adds `chunk_precompute_fwd_cuda_prim` (the sm_121/gb10 twin), re-expressing those two
+head-independent loops as `T.gemm` and keeping `dA_cumsum` as the single-lane serial scan (it is a
+scan, not a GEMM). `build_chunk_precompute_metal` selects the CUDA prim when the resolved target is
+CUDA (mirrors F2's per-target branch); the serial Metal prim is **byte-identical** and F1 is
+**untouched**.
+
+  - **(1) cb** = `T.gemm(C_shared[L,N], B_shared[L,N], cb_frag[L,L], transpose_B=True)` per
+    `(chunk, group)`, written once/group via the `head_idx % heads_per_group == 0` guard
+    (Tri-Dao `_bmm_chunk_fwd`).
+  - **(2) summary_states** = `T.gemm(x_dec_shared[L,P], B_shared[L,N], states_frag[P,N],
+    transpose_A=True)` per `(chunk, head)` — the dominant `P*N` term. The per-row
+    `decay*dt = exp2((dacs[L-1]-dacs[l])*p)*dt[l]` is folded into the **x operand** (Tri-Dao
+    `_chunk_state_fwd` order; B kept native fp16; no `minimum(.,0)` clamp, matching the serial sign
+    convention). Output stays fp32 (= accum_dtype; the §23 N=64 dtype contract).
+
+DTYPE contract unchanged (§23): fp16 operands, fp32 register-fragment C accumulate, `cb` stored fp16,
+`summary_states` stored fp32. Idioms mirror the proven F2 `chunk_scan_fwd_cuda_prim`: plain
+`scope="shared"` operands (NO `make_swizzled_layout`), `disable_tma=True` on every copy, and
+`pass_configs={tl.disable_tma_lower, tl.disable_warp_specialized}` on the CUDA branch. A smem-budget
+gate (48.5 KB at prod L=P=N=64 « 99 KB) and an m16n8k16 divisibility gate **RAISE** on violation —
+RULE #1, no serial fallback.
+
+### MEASURED on gb10 sm_121 (prod cfg b=1 S=4096 c=64 g=8 H=112 P=64 N=64)
+
+| F0 variant (same gb10 box, same session) | per-call ms (median / min) |
+|---|---:|
+| **NEW tensor-core CUDA F0** | **1.129 / 1.113 ms** |
+| serial F0 prim re-built on CUDA (the §22/§23 kernel, this box) | 16.36 / 16.35 ms |
+| §23-headline serial F0 (slower box state, same kernel) | 24.57 ms |
+| Tri-Dao `_bmm_chunk_fwd` + `_chunk_state_fwd` (cb+state) | 1.061 ms |
+| Tri-Dao cb + state + `_chunk_cumsum_fwd` (≈ all F0 does) | 1.133 ms |
+
+- **vs serial F0:** **14.5×** faster than the same-box serial F0 (16.36 ms), **21.8×** faster than the
+  §23-headline 24.57 ms. The §22/§23 "F0 is the 24.57 ms lever" finding is now CLOSED.
+- **vs cppmega / Tri-Dao:** new F0 (1.129 ms, which ALSO does the `dA_cumsum` scan) is **1.06×**
+  Tri-Dao's cb+state (1.061 ms) and **0.996×** their cb+state+cumsum (1.133 ms) — i.e. at Tri-Dao
+  tensor-core parity for the same work.
+
+### REAL sm_121 tensor-core MMA — verified at codegen AND SASS (not relabeled serial)
+
+- **Codegen** (`/tmp/f0_cuda_src.cu`, dumped via `JITKernel.get_kernel_source()`): the cb and
+  summary_states regions emit `tl::mma_sync<kFloat16,kFloat16,kFloat32,16,8,16,...>` **×4** (2 per
+  GEMM) fed by `ptx_ldmatrix_x4` / `ptx_ldmatrix_x4_trans` **×4**; **zero** leftover
+  `for (int n = 0; n < 64 …)` serial-N reduction dots. `tl::mma_sync` routes to CuTe
+  `SM80_16x8x16_F32F16F16F32_TN`, whose inline asm is
+  `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
+- **SASS** (`nvcc -arch=sm_121a -cubin` of the dumped `.cu`, `cuobjdump -sass`): **64×
+  `HMMA.16816.F32`** (the machine tensor-core op) + **32× `LDSM`** (ldmatrix). A relabeled serial
+  loop cannot produce HMMA in the binary. CONFIRMED real.
+
+### Parity — ALL elements, fp16 gate 5e-4 (PASS)
+
+| output | new F0 vs serial F0 reference (fp32 einsum) | new F0 vs serial Metal prim (rebuilt on CUDA) |
+|---|---:|---:|
+| `cb` | 1.22e-4 | 2.44e-4 |
+| `summary_states` | 3.74e-6 | 3.74e-6 |
+| `dA_cumsum` (fp16-stored) | 4.89e-4 | 0.0 (verbatim scan) |
+
+NaN=False. Both GEMM outputs pass the 5e-4 fp16 gate over the FULL prod tensors (no subset).
+
+### F0 → F1 → F2 chain with the new F0 (MEASURED)
+
+| stage | ms (median) |
+|---|---:|
+| **F0 (new tensor-core)** | **1.129** |
+| F1 inter-chunk recur | 1.230 |
+| F2 scan+combine | 2.885 |
+| **chain SUM** | **5.244** |
+
+The un-fused forward chain drops from **≈30.0 ms** (§23, serial F0) to **5.24 ms** — now **1.69×**
+cppmega's whole fused mamba fwd (3.11 ms), down from ≈9.6×. F0 is no longer the forward bottleneck;
+F2 (2.88 ms) is now the largest forward term.
+
+### tok/s effect — EXTRAPOLATION (clearly labelled; NOT a measured step win)
+
+The §17 canonical step is **backward-bound**: the gridded backward chain is **447.8 ms** while the
+WHOLE forward chain is **7.231 ms** (§15), of which the §17/§15 step already ran F0 as the **5.025 ms**
+chunked precompute (NOT the 24.57 ms serial — that figure is the §23 *fused-probe* re-measure of the
+same kernel). Dropping F0 to **1.13 ms** saves **≈3.9 ms** off the forward chain, i.e. **≈0.86 % of the
+≈455 ms step**. So the §17 headline **tok/s is essentially UNCHANGED**: **≈907 @8L / ≈298 @28L**, gap
+vs Megatron 3399 **unchanged at ≈3.75×/≈11.4×**. (Step-level tok/s was not re-measured this round; the
+above is the honest step-model EXTRAPOLATION.) The win is **forward-chain-level, not step-level**: F0
+is removed as a hot kernel and the forward chain now sits at near-cppmega (1.69×), closing the
+specific §22/§23 lever. The next step-level lever remains the **backward** (B2 at 334.6 ms, §17 honest
+attribution #3), not F0.
+
+### GO / NO-GO
+
+- **GO (kernel-level): F0 is now a REAL tensor-core kernel at Tri-Dao parity.** 1.13 ms (14.5–21.8×
+  over serial), HMMA-verified at SASS, parity PASS all elements, RULE #1 raises (no serial fallback).
+  The §22/§23 "F0 is the 24.57 ms gap lever" finding is CLOSED — the forward chain is now 5.24 ms
+  (1.69× cppmega's 3.11 ms whole fwd).
+- **NO-GO (honest, step-level): this does NOT move the headline tok/s.** The §17 step is
+  backward-bound (447.8 ms bwd vs 7.2 ms fwd), so a 3.9 ms forward saving is ≈0.86 % of the step.
+  §17's ≈907/≈298 stays the canonical number; the next step-level lever is the backward (B2), not F0.
