@@ -145,22 +145,28 @@ def trim_cuda_mempool(device: int | None = None) -> None:
             )
         device = int(dev.value)
     pool = _default_mempool(rt, device)
-    # Set the release threshold to 0 ONCE per device so the driver does not retain
-    # reserved memory across the trim (default threshold is UINT64_MAX = retain all).
-    if device not in _RELEASE_THRESHOLD_SET:
-        thresh = ctypes.c_uint64(0)
-        err = rt.cudaMemPoolSetAttribute(
-            pool,
-            _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+    # Set the release threshold to 0 on EVERY call (NOT once) so the trim actually
+    # returns reserved-but-idle memory. §24 MEASURED: torch's cudaMallocAsync backend
+    # RE-SETS this shared default pool's threshold to UINT64_MAX (retain-everything)
+    # on its FIRST allocation after we zero it, defeating a one-time set. Because the
+    # MLX default pool IS the device-current pool that torch also allocates from
+    # (§24: current==default, both grow the same ReservedMemCurrent), torch keeps
+    # re-poisoning the one shared pool. Re-asserting 0 here (a cheap idempotent driver
+    # call) right before the trim undoes torch's retain-everything so cudaMemPoolTrimTo
+    # can reclaim idle reserved memory before the competing fp8-backward eval.
+    thresh = ctypes.c_uint64(0)
+    err = rt.cudaMemPoolSetAttribute(
+        pool,
+        _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+        ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0, "
+            f"dev={device}) failed (cudaError={err}); cannot bound the CUDA "
+            "mempool reservation for the fp8 bridge."
         )
-        if err != 0:
-            raise RuntimeError(
-                f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0, "
-                f"dev={device}) failed (cudaError={err}); cannot bound the CUDA "
-                "mempool reservation for the fp8 bridge."
-            )
-        _RELEASE_THRESHOLD_SET.add(device)
+    _RELEASE_THRESHOLD_SET.add(device)
     err = rt.cudaMemPoolTrimTo(pool, ctypes.c_size_t(0))
     if err != 0:
         raise RuntimeError(
@@ -314,18 +320,21 @@ def trim_device_current_mempool(device: int | None = None) -> None:
             )
         device = int(dev.value)
     pool = _device_current_mempool(rt, device)
-    if device not in _RELEASE_THRESHOLD_SET:
-        thresh = ctypes.c_uint64(0)
-        err = rt.cudaMemPoolSetAttribute(
-            pool,
-            _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+    # §24: re-assert threshold=0 on EVERY call (torch re-poisons it to UINT64_MAX per
+    # allocation; see trim_cuda_mempool). When the shared-pool fix is active this is
+    # the SAME pool as trim_cuda_mempool's — a harmless second re-assert; when not
+    # active it is torch's distinct pool.
+    thresh = ctypes.c_uint64(0)
+    err = rt.cudaMemPoolSetAttribute(
+        pool,
+        _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+        ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0) on the "
+            f"device-current pool (dev={device}) failed (cudaError={err})."
         )
-        if err != 0:
-            raise RuntimeError(
-                f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0) on the "
-                f"device-current pool (dev={device}) failed (cudaError={err})."
-            )
     err = rt.cudaMemPoolTrimTo(pool, ctypes.c_size_t(0))
     if err != 0:
         raise RuntimeError(

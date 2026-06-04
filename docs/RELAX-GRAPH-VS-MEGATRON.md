@@ -1885,3 +1885,86 @@ running it in the model would only confirm a slowdown.
   un-fused F0/F1/F2 chain (30.0 ms, now N=64-clean) remains the production path. RULE #1: the fused path
   stays env-gated OFF and RAISES on tile/smem/compile failure — it never silently replaces the faster
   un-fused chain.
+
+
+## §24. fp8 E2E BACKWARD OOM CLEARED — the §22 "dual-pool" premise was WRONG (MLX+torch already share ONE cudaMallocAsync pool); the real blocker was torch's `set_per_process_memory_fraction` POISONING that shared pool. fp8 e2e step now COMPLETES (MEASURED, gb10 sm_121, 2026-06-04)
+
+Single exclusive GB10 owner, serial; ownership poll + drop_caches before/after, SIGTERM-only.
+This closes the §21/§22 lever-1 **e2e NO-GO** ("R1-e2e fp8 backward is a memory-NO-GO … needs the
+shared-pool MLX rebuild"). It needed **no MLX rebuild** — the fix is Python-only, and the §22
+root-cause diagnosis was partly wrong. All numbers below are MEASURED.
+
+### MEASURED root cause (the §22 "two pools double-reserve" premise does NOT hold on this build)
+Direct ctypes probe of the CUDA runtime (`libcudart.so`, MLX `0.32.0.dev20260602+6680d75a` + torch
+`cudaMallocAsync` backend):
+- The device's **CURRENT** cudaMallocAsync pool **already EQUALS the device DEFAULT pool**
+  (`cudaDeviceGetMemPool == cudaDeviceGetDefaultMemPool`), so `cudaDeviceSetMemPool(dev, mlx_default)`
+  is a **no-op repoint** — there was never a second device-current pool to merge.
+- **Both** allocators already draw from that ONE pool: a 2 GB torch alloc then a 2 GB MLX alloc grow
+  the SAME pool's `ReservedMemCurrent` 2→4 GB; a 40 GB MLX + 10 GB torch co-allocation reaches **50 GB
+  on the one pool with NO double-count**. So the "MLX pool + torch pool each reserve-and-retain" model
+  from §21/§22 is **refuted** for this MLX+torch combination — there is structurally already one shared
+  pool.
+- The ACTUAL blocker: **`torch.cuda.set_per_process_memory_fraction(F)` POISONS the shared pool.**
+  MEASURED, that call flips the shared default pool's `cudaMemPoolAttrReleaseThreshold` `0 →
+  UINT64_MAX` (retain-everything) AND installs a hard per-process ceiling. Because MLX's `mx.eval`
+  draws from the SAME pool, MLX's deep-backward growth trips torch's ceiling and OOMs at
+  `fp8_te_linear.py:321 mx.eval(x2, weight, g2)` — **even at seq128 with frac 0.95**. Worse, torch's
+  cudaMallocAsync backend **RE-SETS that threshold to UINT64_MAX on its FIRST allocation** after we
+  zero it, so a one-time `ReleaseThreshold=0` is silently clobbered during the fp8 forward.
+
+### THE FIX (Python-only, no MLX rebuild)
+1. **Drop the `set_per_process_memory_fraction` cap when the shared pool is active**
+   (`scripts/bench_fp8_e2e_step_20260604.py` `_budget_mlx_torch`): the cap only makes sense in the
+   genuine dual-pool fallback (`CPPMEGA_FP8_SHARED_POOL=0`); with the one shared pool it starves MLX.
+2. **Re-assert `ReleaseThreshold=0` on EVERY bridge-boundary trim, not once**
+   (`cppmega_mlx/nn/_tilelang/_cuda_zerocopy.py` `trim_cuda_mempool` / `trim_device_current_mempool`):
+   torch keeps re-poisoning the shared pool to retain-everything, so the threshold must be re-zeroed
+   each backward so `cudaMemPoolTrimTo(0)` can actually reclaim idle reserved memory.
+3. `install_shared_mempool()` stays as the up-front (idempotent) **ReleaseThreshold=0 re-assert** after
+   torch's CUDA init — the `cudaDeviceSetMemPool` part is a confirmed no-op here, but the threshold
+   re-assert is load-bearing.
+
+### MEASURED result — the fp8 backward COMPLETES (no `cudaMallocAsync … out of memory`)
+`scripts/bench_fp8_e2e_step_20260604.py`, bs1, `--fp8-floor 0` (fp8 forced on EVERY wired Linear — the
+stress case the §22 OOM hit), `MLX_CUDA_GRAPH_CACHE_SIZE=4000`, `CPPMEGA_FP8_SHARED_POOL=1`:
+
+| arm | seq | optimizer | step s (median) | tok/s | MLX peak GB | torch peak / reserved GB | final loss |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **bf16 ref** | 64 | no | 0.544 | **117.6** | 6.878 | 0.0 | 11.345 |
+| **fp8 e2e** | 64 | no | 8.66 | **7.4** | 40.754 | 40.656 / 40.75 | 11.25562 |
+| **fp8 e2e** | 64 | **yes (AdamW)** | 11.75 | **5.4** | 54.43 | 54.332 / 54.469 | 7.398 |
+
+- **OOM CLEARED:** all 271 per-Linear fp8 backward crossings + the final `mx.eval(loss, grads)` (and
+  the full AdamW update) complete with **EXIT 0**. Traced memory grows monotonically to ~43.7 GB
+  (no-opt) / 54.4 GB (opt) and **stays under the 117 GB part** at seq64. The §22 NO-GO is now a **GO**
+  at a safe config.
+- **ONE shared pool, no double-count (the proof):** at the fp8 peak, `mlx_active ≈ torch_reserved ≈
+  pool_reserved ≈ 40.7 GB` (no-opt) / `≈ 54.4 GB` (opt) — all three counters track the SAME number, i.e.
+  a single reservation feeding both allocators, not two summed pools. The release threshold stayed
+  `thr=0` across every backward (the re-assert holds against torch's re-poisoning).
+- **Parity:** fp8 final loss 11.25562 vs bf16 11.345 (Δ −0.08938) at the un-optimized step; with the
+  AdamW update the fp8 loss drops 11.25 → 7.398, confirming grads flowed end-to-end (finite, applied).
+- **Zero-copy PRESERVED (RULE #1):** the bridge took the **native kDLCUDA export** path
+  (`_mlx_native_cuda_dlpack_available == True` → `torch.from_dlpack(arr)`), a real `cuda:0` device view.
+  Proof of SHARED storage: writing 7.0 through the torch view changed the source MLX array's sum to
+  exactly 224.0 (4×8×7). No host copy, no `.cpu()`, no fallback — the path RAISES on a genuinely
+  uncrossable tensor.
+
+### Residual (honest)
+The fp8 e2e step is **16× SLOWER than bf16** at this config (7.4 vs 117.6 tok/s) — NOT because of the
+GEMM (lever 2 showed the tuned fp8 MMA is 1.17–1.55× bf16) but because `--fp8-floor 0` forces fp8 on
+EVERY tiny Linear, so 271 per-Linear MLX↔torch bridge crossings + TE fp8 quant/dequant per backward
+dominate the step. The realistic config (a sane floor that only fp8s the big GEMMs) was not the goal
+here — the goal was to **clear the OOM and prove the backward completes**, which it does. The memory
+footprint also grows ~linearly with seq and with the number of fp8 sites (seq128 floor0 still peaks at
+~119 GB and OOMs — just over the part); seq64 floor0 is the MEASURED safe config. The next lever is to
+(a) raise the fp8 floor so only the cost-effective GEMMs cross the bridge, and (b) batch the per-Linear
+backward crossings so the deep graph materializes incrementally instead of accumulating to tens of GB.
+
+### GO / NO-GO
+- **GO: the §22 e2e fp8-backward OOM is FIXED, Python-only, no MLX rebuild.** Backward + optimizer
+  complete; shared pool confirmed single-reservation; zero-copy preserved.
+- **NO-GO (unchanged): fp8 e2e as a tok/s WIN at floor0.** 16× slower (bridge-crossing-bound, not
+  GEMM-bound). The realized e2e tok/s win still awaits floor-tuning + crossing-batching; §17's
+  ≈907/≈298 stays the canonical bf16 step number.

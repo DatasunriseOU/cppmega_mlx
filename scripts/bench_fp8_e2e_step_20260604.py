@@ -144,28 +144,56 @@ def _budget_mlx_torch() -> None:
     set_cache = getattr(mx, "set_cache_limit", None)
     if callable(set_cache):
         set_cache(0)
-    try:
-        import torch
 
-        if torch.cuda.is_available():
-            # Initialize torch's CUDA context so its cudaMallocAsync pool exists
-            # BEFORE we repoint the device-current pool, then cap its share.
-            torch.cuda.init()
-            frac = float(os.environ.get("CPPMEGA_TORCH_MEM_FRAC", "0.45"))
-            torch.cuda.set_per_process_memory_fraction(frac)
-    except Exception as exc:  # RULE #1: a budget-cap failure is a config bug, surface it.
-        raise RuntimeError(
-            "bench_fp8_e2e: could not apply the torch CUDA memory-fraction budget for "
-            f"the fp8 arm (CPPMEGA_TORCH_MEM_FRAC): {type(exc).__name__}: {exc}. The "
-            "fp8 bridge needs the MLX+torch budget split to fit the GB10 unified pool."
-        ) from exc
-
-    # PRIMARY §22 shared-pool install (once, up front, after torch's CUDA context).
     from cppmega_mlx.nn._tilelang._cuda_zerocopy import (
         install_shared_mempool,
         shared_pool_enabled,
     )
 
+    # §24 MEASURED root cause: on this MLX(0.32.0.dev+6680d75a)+torch build the
+    # device's CURRENT cudaMallocAsync pool ALREADY EQUALS the device DEFAULT pool,
+    # and BOTH MLX's and torch/TE's plain cudaMallocAsync(&p,size,stream) draw from
+    # it (MEASURED: a 2 GB torch alloc + a 2 GB MLX alloc grow the SAME default-pool
+    # ReservedMemCurrent 2->4 GB; a 40 GB MLX + 10 GB torch co-allocation reaches 50
+    # GB on the one pool with NO double-count). So the §22 "two pools double-reserve"
+    # premise does NOT hold here — there is already ONE shared pool.
+    #
+    # The persistent fp8-backward OOM was NOT dual-pool contention; it was
+    # ``torch.cuda.set_per_process_memory_fraction(F)`` POISONING that shared pool:
+    # MEASURED, the fraction call flips the SHARED default pool's
+    # cudaMemPoolAttrReleaseThreshold 0 -> UINT64_MAX (retain-everything) AND installs
+    # a hard per-process ceiling that MLX's ``mx.eval`` growth — drawing from the SAME
+    # pool — trips, OOMing at fp8_te_linear.py:321 even at seq128/frac0.95. Dropping
+    # the fraction cap and re-asserting ReleaseThreshold=0 lets the shared pool grow
+    # for both allocators (MEASURED: the fp8 backward then COMPLETES). The fraction
+    # split is therefore ONLY meaningful in the genuine dual-pool fallback
+    # (CPPMEGA_FP8_SHARED_POOL=0); with the shared pool it starves MLX. RULE #1: this
+    # is not a degrade — it removes a self-inflicted cap so the ONE zero-copy path FITS.
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            # Initialize torch's CUDA context so its cudaMallocAsync pool exists
+            # BEFORE we (re)assert the shared-pool release threshold below.
+            torch.cuda.init()
+            if not shared_pool_enabled():
+                # DUAL-POOL FALLBACK only: cap torch's share so the two distinct pools
+                # fit. With the shared pool this cap poisons the one pool (see above),
+                # so it is skipped.
+                frac = float(os.environ.get("CPPMEGA_TORCH_MEM_FRAC", "0.45"))
+                torch.cuda.set_per_process_memory_fraction(frac)
+    except Exception as exc:  # RULE #1: a budget-cap failure is a config bug, surface it.
+        raise RuntimeError(
+            "bench_fp8_e2e: could not apply the torch CUDA memory budget for the fp8 "
+            f"arm: {type(exc).__name__}: {exc}. The fp8 bridge needs the MLX+torch "
+            "pool config to fit the GB10 unified pool."
+        ) from exc
+
+    # PRIMARY §22/§24 shared-pool install (once, up front, AFTER torch's CUDA context
+    # so it re-asserts ReleaseThreshold=0 on the shared pool even if torch's init
+    # bumped it to UINT64_MAX). install_shared_mempool() is a no-op repoint here (the
+    # current pool already IS the default pool) BUT its ReleaseThreshold=0 re-assert is
+    # the load-bearing step that undoes any retain-everything torch left behind.
     if shared_pool_enabled():
         try:
             install_shared_mempool()
