@@ -409,7 +409,18 @@ def chunk_scan_fwd_cuda_prim(
         dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
         dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
         C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
-        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), dtype),  # type: ignore
+        # DTYPE CONTRACT FIX (the prod N=64 "segfault"): F1
+        # (``inter_chunk_recur_fwd_metal_prim``) WRITES ``prev_states`` as
+        # ``accum_dtype`` (fp32, design §3.3/§6.6) and the bench/caller allocates it
+        # fp32; the BACKWARD B2 prim already declares it fp32 (backward_core line
+        # 191). This FORWARD prim previously declared it ``dtype`` (fp16) — a
+        # 4-byte/elem buffer read by a 2-byte-typed kernel walks the dstate stride
+        # out of bounds -> OOB global read -> the launch "segfault" at N=64. Reading
+        # it as fp32 (the producer's dtype) is the ONE-path fix; ``prev_state_shared``
+        # below stays fp16 because the off-diagonal ``T.gemm`` contracts in fp16
+        # (the value is downcast on the smem copy, matching the Metal twin's fp16
+        # GEMM operand). RULE #1: surface+fix the contract break, do not paper over.
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
         D: T.Tensor((nheads), dtype),  # type: ignore
         Output: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
     ):
@@ -432,6 +443,12 @@ def chunk_scan_fwd_cuda_prim(
             dA_cs_m_shared = T.alloc_shared((block_M), dtype)
             scale_m_local = T.alloc_fragment((block_M), accum_dtype)
             C_shared = T.alloc_shared((block_M, block_Dstate), dtype)
+            # prev_states is fp32 in global (accum_dtype, F1's output). The
+            # ``T.copy`` below downcasts the 4B/elem global read into this fp16 smem
+            # GEMM operand (matching the Metal twin's fp16 off-diagonal contraction).
+            # The FIX is the fp32 prim-parameter dtype above: with the buffer typed
+            # fp32 the copy walks the correct dstate stride (4B) instead of the
+            # previous fp16 stride (2B), which read out of bounds at N=64.
             prev_state_shared = T.alloc_shared((block_N, block_Dstate), dtype)
             D_local = T.alloc_fragment((1), accum_dtype)
             x_residual_shared = T.alloc_shared((block_M, block_N), dtype)
