@@ -36,6 +36,7 @@ serial fallback (the chunked-vs-serial choice is an explicit gate elsewhere).
 # docstring (TileLang eager frontend reads ``T.Tensor`` annotations as objects).
 
 import math
+import os
 from typing import Any
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "MAMBA3_INTER_CHUNK_RECUR_OP_NAME",
     "chunk_precompute_fwd_metal_prim",
     "chunk_precompute_fwd_cuda_prim",
+    "chunk_precompute_fwd_metal_gemm_prim",
     "inter_chunk_recur_fwd_metal_prim",
     "chunk_precompute_fwd_grid",
     "inter_chunk_recur_fwd_grid",
@@ -412,6 +414,256 @@ def chunk_precompute_fwd_cuda_prim(
     return main
 
 
+def chunk_precompute_fwd_metal_gemm_prim(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    threads: int = 128,
+) -> Any:
+    """Metal TENSOR-OP twin of :func:`chunk_precompute_fwd_metal_prim`.
+
+    IDENTICAL F0 math; the two head-independent serial scalar loops of the Metal
+    prim (``cb`` per-``(li,si)`` dot over ``dstate`` and the ``summary_states``
+    ``P*N``-cell serial-``l`` accumulate — the 24.57 ms F0 term on CUDA) are
+    re-expressed as ``T.gemm``, mirroring the proven CUDA twin
+    :func:`chunk_precompute_fwd_cuda_prim` (24.57 ms -> 1.13 ms, 14.5x, sm_121)
+    and the Metal SSD precedent
+    :func:`mamba3_chunked_scan_core.chunk_scan_fwd_metal_prim`.
+
+    THE ONE LOAD-BEARING METAL-VS-CUDA DELTA (the Metal GEMM-instruction
+    SELECTOR, ``src/backend/metal/op/gemm.cc::SelectInst``): the C accumulator
+    must be a register FRAGMENT (``T.alloc_fragment``, scope ``local.fragment``).
+    That is what forces the STABLE 8x8 ``metal.simdgroup`` path on this M4 Max.
+    A plain ``scope="shared"`` fp32 C with N>=32 and K%16==0 (here N=dstate=64,
+    N=L=64, K=64) instead satisfies ``CanUseCooperativeTensor`` and routes to the
+    EXPERIMENTAL M5-only ``metal.cooperative_tensor`` (MPP matmul2d) path, which
+    fails to compile on M1-M4 (``use of undeclared identifier '__pct_op'`` — the
+    cooperative-tensor op is unavailable pre-M5). ``SelectInst`` returns the
+    simdgroup path unconditionally when ``op.c_.scope()=="local.fragment"``, so a
+    fragment C is the portable choice. (The F2 precedent dodged the same trap a
+    different way — its shared C had block_N=16<32, failing the N%32 divisibility
+    so the cooperative path was rejected; here the logical N is 64 so a fragment C
+    is required.) Everything else (operand staging, decay/dt fold into the x
+    operand, ``transpose_B`` / ``transpose_A`` flags, ``disable_tma`` copies, the
+    serial ``dA_cumsum`` scan kept verbatim, fp32 ``summary_states`` store, the
+    fragment->shared->global copy chain) is the same as the CUDA twin.
+
+    The two GEMMs (per the CUDA twin / Tri-Dao ``_bmm_chunk_fwd`` +
+    ``_chunk_state_fwd``):
+      (1) cb[L,L] = C[L,N] @ B[L,N]^T  (per (chunk, group); written once per group
+          via the ``head_idx % heads_per_group == 0`` guard — cb is head-independent
+          within a group):
+            T.gemm(C_shared[L,N], B_shared[L,N], cb_acc[L,L], transpose_B=True)
+          -> cb_acc[li,si] = sum_n C[li,n]*B[si,n].
+      (2) summary_states[P,N] = (decay*dt-weighted x)^T @ B  (per (chunk, head), the
+          DOMINANT term). decay*dt folded into the x OPERAND:
+            x_dec[l,p] = exp2((dacs[L-1]-dacs[l])*p) * dt[l] * x[l,p]
+            T.gemm(x_dec_shared[L,P], B_shared[L,N], states_acc[P,N], transpose_A=True)
+          -> states_acc[p,n] = sum_l x_dec[l,p]*B[l,n].
+
+    DTYPE CONTRACT (unchanged): operands fp16, accumulate fp32 (fragment C),
+    ``cb`` stored fp16, ``summary_states`` stored fp32 (= accum_dtype; F1 reads it
+    fp32 — NO fp16 downcast). ``A = -softplus(...) <= 0`` so the decay uses
+    ``exp2((dacs[L-1]-dacs[l])*p)`` with NO ``minimum(...,0)`` clamp (the serial
+    parity reference omits it).
+
+    RULE #1: this is the ONE Metal path when the GEMM flag is set; a
+    tile/divisibility/compile failure RAISES with where+what — it NEVER falls back
+    to the serial loop / the byte-identical serial prim (that is the parity
+    reference, selected by an explicit gate, not a silent fallback).
+    """
+    import tilelang  # noqa: F401
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_precompute_fwd_metal_gemm_prim: seqlen ({seqlen}) must be "
+            f"divisible by chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_precompute_fwd_metal_gemm_prim: nheads ({nheads}) must be "
+            f"divisible by ngroups ({ngroups})"
+        )
+    # Metal 8x8 simdgroup tensor-op divisibility (research §gemm.cc PARTIAL-TILE
+    # guard): the ICHECK requires M%8==0 / N%8==0 / K%8==0 for the cb (M=L,N=L,
+    # K=dstate) and summary (M=headdim,N=dstate,K=chunk) GEMMs. RAISE (no silent
+    # pad, RULE #1).
+    for axis_name, axis_val in (
+        ("chunk_size(L)", chunk_size),
+        ("dstate(N/K)", dstate),
+        ("headdim(P)", headdim),
+    ):
+        if axis_val % 8 != 0:
+            raise ValueError(
+                f"chunk_precompute_fwd_metal_gemm_prim: {axis_name}={axis_val} is "
+                f"not a multiple of 8; the Metal 8x8 simdgroup matmul requires "
+                f"M/N/K % 8 == 0 for the cb / summary_states GEMMs. No silent "
+                f"padding (RULE #1) — re-tile or pad the caller buffers."
+            )
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    heads_per_group = nheads // ngroups
+    L = chunk_size
+    p = _LOG2E
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        A: T.Tensor((nheads), dtype),  # type: ignore
+        dt: T.Tensor((batch, seqlen, nheads), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        summary_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nheads, threads=threads) as (bx, by):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            head_idx = by
+            group_idx = head_idx // heads_per_group
+            base = chunk_idx * chunk_size
+
+            # GEMM operands fp16 (plain scope="shared"); the C accumulators are
+            # register FRAGMENTS (scope local.fragment) — this is what forces the
+            # stable 8x8 metal.simdgroup path (see the docstring delta). The
+            # fragment is copied whole-tile to a shared staging buffer before the
+            # global store (the F0 CUDA-twin copy chain).
+            # SMEM-MINIMAL tiling (Apple 32 KB threadgroup-memory limit). The fp16
+            # GEMM A-operand tile ``opA_shared`` is REUSED across the two GEMM phases
+            # (C[L,N] for the cb GEMM under the head-0 guard, then x_dec[L,P] for the
+            # summary GEMM) — disjoint lifetimes separated by T.sync_threads(), so one
+            # [L, max(dstate,headdim)] fp16 tile holds either. ``B_shared`` is the
+            # shared B-operand for both GEMMs (re-staged per head for the summary
+            # GEMM). One fp32 staging tile ``store_f32`` is REUSED for the cb store
+            # (runs FIRST) and the summary_states store (runs LAST). fragment(fp32)->
+            # shared(fp16) is an illegal simdgroup cast, so staging is fp32 and the
+            # global store downcasts (cb->fp16, summary_states->fp32 — supported
+            # two-step copies). fragment->fp32-shared then fp32-shared->global is the
+            # supported downcast path; a fragment->fp16 cast is an illegal
+            # simdgroup_float8x8->half4 conversion. A simdgroup fragment can only be
+            # copied WHOLE (partial row/col slices fail to lower), so the fp32 staging
+            # is a full [L,L] (cb) / [P,N] (summary) tile, 16 KB at L=P=N=64.
+            #
+            # SMEM BUDGET (Apple 32 KB threadgroup limit, hard): the operand tiles
+            # (opA fp16 [L,max(N,P)] 8 KB + B_shared fp16 [L,N] 8 KB) and the fp32
+            # staging (16 KB) exactly fill a 32 KB pool. The single-lane cumsum scratch
+            # would be a SEPARATE 256 B shared tile that overflows the cap, so the scan
+            # instead uses the FIRST ROW of the fp32 staging tile (store_f32[0, 0:L]):
+            # the scan runs FIRST (before cb/summary touch store_f32) and the dA_cumsum
+            # global write completes before cb overwrites it — disjoint lifetimes, no
+            # extra buffer. The summary decay then reloads the fp16 dA_cumsum (the F2
+            # convention), so no persistent fp32 dacs tile is needed.
+            _sm = headdim if headdim > L else L
+            _sn = dstate if dstate > L else L
+            store_f32 = T.alloc_shared((_sm, _sn), accum_dtype, scope="shared")
+            _opn = dstate if dstate > headdim else headdim
+            opA_shared = T.alloc_shared((L, _opn), dtype, scope="shared")
+            B_shared = T.alloc_shared((L, dstate), dtype, scope="shared")
+            cb_frag = T.alloc_fragment((L, L), accum_dtype)
+            states_frag = T.alloc_fragment((headdim, dstate), accum_dtype)
+
+            # --- dA_cumsum: a[l] = A[h]*dt[l]; inclusive cumsum over l. ---
+            # (STAYS a scan — same math as the serial Metal prim; NOT a GEMM.) The
+            # scratch is store_f32's FIRST ROW (no separate tile; the scan precedes any
+            # cb/summary use of store_f32). a[l]=A*dt -> in-place inclusive cumsum.
+            for l in T.Parallel(L):
+                store_f32[0, l] = T.Cast(accum_dtype, A[head_idx]) * T.Cast(
+                    accum_dtype, dt[batch_idx, base + l, head_idx]
+                )
+            T.sync_threads()
+            if T.get_thread_binding(0) == 0:
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                for l in T.serial(L):
+                    acc[0] = acc[0] + store_f32[0, l]  # read a[l] (pre-scan value)
+                    store_f32[0, l] = acc[0]           # overwrite in place w/ cumsum
+            T.sync_threads()
+            for l in T.Parallel(L):
+                dA_cumsum[batch_idx, head_idx, chunk_idx, l] = T.Cast(
+                    dtype, store_f32[0, l]
+                )
+            T.sync_threads()  # dA_cumsum global write done before cb overwrites store_f32
+
+            # --- (1) cb = C @ B^T per (group, chunk): T.gemm, write once/group. ---
+            if head_idx % heads_per_group == 0:
+                T.copy(
+                    C[batch_idx, base : base + L, group_idx, 0:dstate],
+                    opA_shared[0:L, 0:dstate],  # C operand (reused tile)
+                    disable_tma=True,
+                )
+                T.copy(
+                    B[batch_idx, base : base + L, group_idx, 0:dstate],
+                    B_shared,
+                    disable_tma=True,
+                )
+                T.clear(cb_frag)
+                # cb_frag[li,si] = sum_n C[li,n]*B[si,n] = (C @ B^T)[li,si].
+                T.gemm(opA_shared[0:L, 0:dstate], B_shared, cb_frag, transpose_B=True)
+                T.copy(cb_frag, store_f32[0:L, 0:L])  # frag fp32 -> fp32 shared
+                T.copy(
+                    store_f32[0:L, 0:L],
+                    cb[batch_idx, chunk_idx, group_idx, 0:L, 0:L],
+                    disable_tma=True,  # fp32 shared -> fp16 global (downcast)
+                )
+            T.sync_threads()
+
+            # --- (2) summary_states[p,n] = sum_l (decay[l]*dt[l]*x[l,p]) * B[l,n] ---
+            # Fold per-row decay*dt into the x operand;
+            # decay[l] = exp(dA_cs[L-1]-dA_cs[l]) = exp2((dacs[L-1]-dacs[l])*p).
+            # The decay reads dacs back from the GLOBAL dA_cumsum (fp16) just written
+            # above, NOT a persistent fp32 dacs shared tile: keeping dacs live to here
+            # forces it OUT of the threadgroup pool (it overlaps the summary GEMM
+            # staging) and pushes the kernel +256 B over Apple's 32 KB limit.
+            # Reloading the fp16 dA_cumsum and computing the decay in fp32 is EXACTLY
+            # the F2 forward-scan convention (chunk_scan_fwd_metal_prim reads fp16
+            # dA_cumsum -> fp32 exp2). dacs is then live ONLY during the early cumsum
+            # scan and the pool reclaims its bytes (pool = 32768 == the limit, OK).
+            tail_dacs = T.alloc_local((1,), accum_dtype)
+            tail_dacs[0] = T.Cast(
+                accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, L - 1]
+            )
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                dacs_l = T.Cast(
+                    accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, ll]
+                )
+                decay = T.exp2((tail_dacs[0] - dacs_l) * p)
+                dt_l = T.Cast(accum_dtype, dt[batch_idx, base + ll, head_idx])
+                x_l = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
+                opA_shared[ll, pp] = T.Cast(dtype, decay * dt_l * x_l)
+            # Re-stage B for the group (B_shared was last written for the cb GEMM
+            # only under the head-0 guard; every head needs it here).
+            T.copy(
+                B[batch_idx, base : base + L, group_idx, 0:dstate],
+                B_shared,
+                disable_tma=True,
+            )
+            T.clear(states_frag)
+            # states_frag[p,n] = sum_l x_dec[l,p]*B[l,n]; transpose_A contracts L.
+            T.gemm(opA_shared[0:L, 0:headdim], B_shared, states_frag, transpose_A=True)
+            T.sync_threads()  # operands (opA/B) dead after the GEMM -> let the
+            #                    threadgroup-pool alias store_f32 onto their bytes.
+            # Output stays fp32 (= accum_dtype); F1 reads it fp32. NO downcast.
+            T.copy(states_frag, store_f32[0:headdim, 0:dstate])  # frag fp32 -> fp32 shared
+            T.copy(
+                store_f32[0:headdim, 0:dstate],
+                summary_states[batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate],
+                disable_tma=True,
+            )
+
+    return main
+
+
 def build_chunk_precompute_metal(
     batch: int,
     seqlen: int,
@@ -490,9 +742,22 @@ def build_chunk_precompute_metal(
             pass_configs=pass_configs,
         )
 
-    prim = chunk_precompute_fwd_metal_prim(
-        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
-    )
+    # METAL PRIM SELECTION (RULE #1 — the ONE path, failure RAISES, no fallback):
+    #   env ``CPPMEGA_PATH_C_METAL_GEMM`` truthy selects the TENSOR-OP Metal prim
+    #   :func:`chunk_precompute_fwd_metal_gemm_prim` (the two head-independent
+    #   reductions — cb dot + summary_states accumulate — as ``T.gemm`` with a
+    #   SHARED fp32 C accumulator, the Metal 8x8 simdgroup route). When OFF the
+    #   byte-identical serial Metal prim is the parity reference. Explicit gate, NOT
+    #   a silent fallback; a compile/parity failure PROPAGATES.
+    _gemm_flag = str(os.environ.get("CPPMEGA_PATH_C_METAL_GEMM", "")).strip().lower()
+    if _gemm_flag in ("1", "true", "yes", "on"):
+        prim = chunk_precompute_fwd_metal_gemm_prim(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        )
+    else:
+        prim = chunk_precompute_fwd_metal_prim(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        )
     return tilelang.compile(
         prim,
         out_idx=[5, 6, 7],
