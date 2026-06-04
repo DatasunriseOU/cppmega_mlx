@@ -294,6 +294,7 @@ def _fp8_linear_bwd(
 
     from cppmega_mlx.nn._tilelang._cuda_zerocopy import (
         mlx_cuda_array_to_torch_tensor,
+        relieve_bridge_memory_pressure,
         torch_cuda_tensor_to_mlx,
     )
 
@@ -312,6 +313,26 @@ def _fp8_linear_bwd(
     lead = tuple(int(d) for d in x.shape[:-1])
     x2 = x.reshape((-1, k_in)) if x.ndim != 2 else x
     g2 = cotangent.reshape((-1, n_out)) if cotangent.ndim != 2 else cotangent
+
+    # Materialize the three bridge operands and flush MLX's stream BEFORE trimming.
+    # trim_cuda_mempool must run only at a bridge boundary after eval/sync (RISK 3:
+    # trimming mid-kernel could reclaim memory live tensors depend on). After this
+    # eval, x2/w/g2 are the live set; the cache + idle reserved memory are not.
+    mx.eval(x2, weight, g2)
+    mx.synchronize()
+    # Relieve the dual-pool (MLX + torch/TE) cudaMallocAsync reservation contention
+    # that causes the §21 fp8-backward OOM, so the zero-copy crossing FITS. RULE #1:
+    # this does not host-copy — it returns idle reserved unified memory and the
+    # bridge below still RAISES on a genuinely-uncrossable tensor.
+    try:
+        relieve_bridge_memory_pressure()
+    except Exception as exc:  # noqa: BLE001 - RULE #1 surface where+what
+        raise RuntimeError(
+            f"fp8_te_linear(bwd): CUDA mempool trim before the fp8-backward bridge "
+            f"crossing failed (site {site_key!r}): {type(exc).__name__}: {exc}. The "
+            "zero-copy bridge cannot be made to fit; this is a hard memory boundary, "
+            "not a fallback point."
+        ) from exc
 
     try:
         x_t = mlx_cuda_array_to_torch_tensor(x2)

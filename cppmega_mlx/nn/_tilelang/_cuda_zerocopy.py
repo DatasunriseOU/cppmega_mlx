@@ -34,6 +34,127 @@ from typing import Any
 import mlx.core as mx
 
 # ---------------------------------------------------------------------------
+# CUDA mempool release-threshold + trim shim (lever dlpack-fix).
+#
+# Root cause of the R1-e2e fp8-backward OOM (docs/RELAX-GRAPH-VS-MEGATRON.md §21):
+# the error string ``cudaMallocAsync(&data, size, stream) failed: out of memory``
+# is MLX's OWN allocator (mlx/backend/cuda/allocator.cpp:225) hitting genuine
+# physical-memory exhaustion of the single GB10 117 GB unified pool. TWO
+# stream-ordered cudaMallocAsync mempools (MLX's + torch/TE's) each reserve-and-
+# retain unified memory that neither releases, because neither sets
+# ``cudaMemPoolAttrReleaseThreshold`` (MLX only READS ReservedMemCurrent at
+# allocator.cpp:247). The COMBINED reserved set exceeds physical memory.
+#
+# This shim (Python-only, NO MLX rebuild) sets the release threshold to 0 on the
+# device mempool(s) and calls ``cudaMemPoolTrimTo(pool, 0)`` so reserved-but-idle
+# unified memory is RETURNED to the OS before the competing allocation. It is
+# called ONLY at a bridge boundary AFTER eval/sync (never mid-kernel) — see
+# RISK 3 in the lever research. RULE #1: trimming only makes the zero-copy path
+# FIT; it never introduces a host-copy / fp8->bf16 degrade. If libcudart cannot
+# be loaded or a CUDA call fails, this RAISES with where+what (no silent skip) —
+# the caller decides whether trimming is required for its budget.
+# ---------------------------------------------------------------------------
+
+_CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4  # cudaMemPoolAttrReleaseThreshold
+_cudart = None  # lazily-loaded libcudart handle
+_RELEASE_THRESHOLD_SET: set[int] = set()  # devices whose threshold we already set
+
+
+def _load_cudart():
+    """Load libcudart once; RAISE (RULE #1) with where+what if it cannot load."""
+
+    global _cudart
+    if _cudart is not None:
+        return _cudart
+    last_exc = None
+    for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.13", "libcudart.so.11.0"):
+        try:
+            _cudart = ctypes.CDLL(name)
+            break
+        except OSError as exc:  # noqa: PERF203 - try the next soname
+            last_exc = exc
+    if _cudart is None:
+        raise RuntimeError(
+            "_cuda_zerocopy: cannot load libcudart for the CUDA mempool trim shim "
+            f"(tried libcudart.so / .so.12 / .so.13 / .so.11.0): {last_exc}. The "
+            "fp8 bridge needs cudaMemPoolTrimTo to fit the dual-pool budget."
+        )
+    # cudaGetDevice(int*), cudaDeviceGetDefaultMemPool(pool*, int dev),
+    # cudaMemPoolSetAttribute(pool, attr, void*), cudaMemPoolTrimTo(pool, size_t)
+    _cudart.cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    _cudart.cudaGetDevice.restype = ctypes.c_int
+    _cudart.cudaDeviceGetDefaultMemPool.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+    ]
+    _cudart.cudaDeviceGetDefaultMemPool.restype = ctypes.c_int
+    _cudart.cudaMemPoolSetAttribute.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    _cudart.cudaMemPoolSetAttribute.restype = ctypes.c_int
+    _cudart.cudaMemPoolTrimTo.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _cudart.cudaMemPoolTrimTo.restype = ctypes.c_int
+    return _cudart
+
+
+def _default_mempool(rt, device: int) -> ctypes.c_void_p:
+    pool = ctypes.c_void_p()
+    err = rt.cudaDeviceGetDefaultMemPool(ctypes.byref(pool), int(device))
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaDeviceGetDefaultMemPool(dev={device}) failed "
+            f"(cudaError={err}); cannot trim the CUDA mempool for the fp8 bridge."
+        )
+    return pool
+
+
+def trim_cuda_mempool(device: int | None = None) -> None:
+    """Set ReleaseThreshold=0 and trim the default mempool to 0 on ``device``.
+
+    Called at the fp8 bridge boundary (after eval/sync) to return reserved-but-idle
+    unified memory so the competing MLX+torch+TE allocations fit the single GB10
+    pool. RAISES (RULE #1) on any CUDA failure — never silently degrades. If the
+    box genuinely has no idle reserved memory to trim this is a fast no-op (TrimTo
+    returns cudaSuccess and reclaims nothing).
+    """
+
+    rt = _load_cudart()
+    if device is None:
+        dev = ctypes.c_int(0)
+        err = rt.cudaGetDevice(ctypes.byref(dev))
+        if err != 0:
+            raise RuntimeError(
+                f"_cuda_zerocopy: cudaGetDevice failed (cudaError={err}) resolving "
+                "the device for the CUDA mempool trim."
+            )
+        device = int(dev.value)
+    pool = _default_mempool(rt, device)
+    # Set the release threshold to 0 ONCE per device so the driver does not retain
+    # reserved memory across the trim (default threshold is UINT64_MAX = retain all).
+    if device not in _RELEASE_THRESHOLD_SET:
+        thresh = ctypes.c_uint64(0)
+        err = rt.cudaMemPoolSetAttribute(
+            pool,
+            _CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            ctypes.cast(ctypes.byref(thresh), ctypes.c_void_p),
+        )
+        if err != 0:
+            raise RuntimeError(
+                f"_cuda_zerocopy: cudaMemPoolSetAttribute(ReleaseThreshold=0, "
+                f"dev={device}) failed (cudaError={err}); cannot bound the CUDA "
+                "mempool reservation for the fp8 bridge."
+            )
+        _RELEASE_THRESHOLD_SET.add(device)
+    err = rt.cudaMemPoolTrimTo(pool, ctypes.c_size_t(0))
+    if err != 0:
+        raise RuntimeError(
+            f"_cuda_zerocopy: cudaMemPoolTrimTo(dev={device}, 0) failed "
+            f"(cudaError={err}); cannot return idle reserved unified memory."
+        )
+
+# ---------------------------------------------------------------------------
 # DLPack C ABI (DLPack >= 0.5; matches tvm-ffi's expected layout)
 # ---------------------------------------------------------------------------
 
@@ -114,6 +235,32 @@ def zerocopy_enabled() -> bool:
     """Return whether the env opts into the zero-copy CUDA DLPack escape hatch."""
 
     return os.environ.get("CPPMEGA_TILELANG_CUDA_ZEROCOPY", "0") not in ("", "0", "false", "False")
+
+
+def relieve_bridge_memory_pressure(device: int | None = None) -> None:
+    """Trim BOTH the MLX cache and the CUDA mempool at a bridge boundary.
+
+    The fp8 backward crosses the MLX<->torch DLPack bridge while MLX's forward/scan
+    working set and torch/TE's fp8 scratch both hold reserved unified memory. This
+    helper, called immediately BEFORE a backward crossing (after the producer
+    eval/sync), returns MLX's cached buffers (``mx.clear_cache``) and returns the
+    CUDA mempool's reserved-but-idle unified memory (``trim_cuda_mempool``) so the
+    next allocation fits the single GB10 pool. It is gated by
+    ``CPPMEGA_FP8_BRIDGE_TRIM`` (default ON when unset, to fix the §21 OOM; set 0 to
+    A/B the un-trimmed behavior). RULE #1: this only makes the zero-copy path FIT —
+    it never host-copies or degrades. On a genuine CUDA failure it RAISES with
+    where+what (no silent skip).
+    """
+
+    if os.environ.get("CPPMEGA_FP8_BRIDGE_TRIM", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    # MLX side: return cached (non-live) buffers so the unified pool shrinks.
+    clear = getattr(mx, "clear_cache", None)
+    if callable(clear):
+        clear()
+    # CUDA side: set ReleaseThreshold=0 + cudaMemPoolTrimTo(0) so the driver
+    # returns reserved-but-idle unified memory shared with torch/TE's pool.
+    trim_cuda_mempool(device)
 
 
 def _dlpack_device_type() -> int:

@@ -36,6 +36,21 @@ import os
 import statistics
 import time
 
+# RULE #1 (lever dlpack-fix): bound torch/TE's cudaMallocAsync pool so it does NOT
+# reserve-and-retain unified memory that contends with MLX's pool on the single
+# GB10 117 GB unified part (the §21 fp8-backward OOM root cause). This env MUST be
+# set BEFORE the first ``import torch`` anywhere in the process; torch reads it once
+# at CUDA-context init. release_threshold:0 makes torch's stream-ordered pool return
+# reserved-but-idle memory instead of hoarding it, so the combined MLX+torch+TE
+# reserved set fits. Overridable via CPPMEGA_TORCH_ALLOC_CONF for A/B. This is NOT a
+# fallback — it only makes the zero-copy fp8 bridge FIT; the bridge still RAISES on a
+# genuinely-uncrossable tensor.
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
+        "CPPMEGA_TORCH_ALLOC_CONF",
+        "backend:cudaMallocAsync,release_threshold:0",
+    )
+
 # RULE #1: fix the NVRTC loader BEFORE torch / TE are imported anywhere (gb10).
 # Safe no-op off-gb10. Must precede the first transformer_engine import (which
 # happens lazily inside fp8_te_linear when the fp8 arm runs).
@@ -87,6 +102,40 @@ def _torch_reset_peak() -> None:
         pass
 
 
+def _budget_mlx_torch() -> None:
+    """Split the single GB10 unified pool between MLX and torch/TE for the fp8 arm.
+
+    lever dlpack-fix: the §21 fp8-backward OOM is dual-pool reservation contention,
+    not activation size. Three knobs, all bounds (NOT fallbacks):
+      (1) ``mx.set_cache_limit(0)`` — MLX returns freed buffers immediately so the
+          bridge trim (``relieve_bridge_memory_pressure``) can reclaim them, instead
+          of MLX hoarding them in its cache.
+      (2) ``torch.cuda.set_per_process_memory_fraction(F)`` — caps torch/TE's share
+          so MLX + torch/TE + the transient per-tensor export doubling sum < the
+          physical 117 GB part. F is set conservatively (env CPPMEGA_TORCH_MEM_FRAC,
+          default 0.45 = ~52 GB on a 117 GB box) leaving MLX the majority.
+      (3) ``mx.set_memory_limit`` honored via CPPMEGA_MLX_MEMORY_LIMIT_GB (in main).
+    RULE #1: if the split is too tight the bridge still RAISES with where+what — it
+    never host-copies or degrades to bf16.
+    """
+
+    set_cache = getattr(mx, "set_cache_limit", None)
+    if callable(set_cache):
+        set_cache(0)
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            frac = float(os.environ.get("CPPMEGA_TORCH_MEM_FRAC", "0.45"))
+            torch.cuda.set_per_process_memory_fraction(frac)
+    except Exception as exc:  # RULE #1: a budget-cap failure is a config bug, surface it.
+        raise RuntimeError(
+            "bench_fp8_e2e: could not apply the torch CUDA memory-fraction budget for "
+            f"the fp8 arm (CPPMEGA_TORCH_MEM_FRAC): {type(exc).__name__}: {exc}. The "
+            "fp8 bridge needs the MLX+torch budget split to fit the GB10 unified pool."
+        ) from exc
+
+
 def _run_arm(arm: str, args, tokens) -> dict:
     """Run one arm (bf16 | fp8) for warmup+steps timed steps; return the metrics."""
 
@@ -99,6 +148,12 @@ def _run_arm(arm: str, args, tokens) -> dict:
             os.environ["CPPMEGA_FP8_LINEAR_MIN_K"] = str(args.fp8_floor)
             os.environ["CPPMEGA_FP8_LINEAR_MIN_N"] = str(args.fp8_floor)
             os.environ["CPPMEGA_FP8_LINEAR_MIN_M"] = str(args.fp8_floor)
+        # lever dlpack-fix: split the single GB10 unified pool between MLX and
+        # torch/TE so neither hoards. (1) Stop MLX from caching freed buffers so the
+        # bridge trim can return them. (2) Cap torch's share so MLX + torch/TE + the
+        # transient export doubling sum < physical. These are bounds, not fallbacks:
+        # if the split is too tight the bridge RAISES (no host-copy degrade).
+        _budget_mlx_torch()
     else:
         os.environ.pop(FP8_LINEAR_ENV, None)
 
