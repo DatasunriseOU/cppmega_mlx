@@ -214,7 +214,7 @@ def _time(fn, n=20):
 
 
 def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
-                   *, use_dhlast=False, b2_v2_ab=False):
+                   *, use_dhlast=False, b2_v2_ab=False, b2_gemm_ab=False):
     from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
         build_chunk_precompute_metal, build_inter_chunk_recur_metal,
     )
@@ -429,6 +429,91 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
                   f"speedup={speedup:.3f}x  {verdict}  "
                   f"vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eq.items()} }")
         result["B2_v2_ab"] = ab_rows
+
+    # ----- B2 v1-vs-GEMM A/B (LABELLED MEASURED) — single-process medians+speedup ---
+    # Builds BOTH the §17-GO v1 B2 cuda prim AND the new TENSOR-CORE GEMM prim
+    # (DYX/dC_off/dC_diag/dchunk_states as T.gemm) directly (bypassing the env) so
+    # both medians + the GEMM-vs-v1 math-equivalence come from ONE gb10 run. The
+    # GEMM emits the SAME slot-16 dA_cumsum_y shape as v1 (no split axis). RULE #1: a
+    # GEMM prim SLOWER than v1 is reported NO-GO here, never silently used; any
+    # compile/run error raises (no fallback). The GEMM contracts in fp16 where v1
+    # accumulates fp32 from fp16 reads, so vs_v1_max_abs is a fp16-rounding delta
+    # (NOT bit-exact) — the absolute parity vs the GOLD is asserted by the 8-grad
+    # gate below when CPPMEGA_PATH_C_B2_GEMM is set; this A/B is the speed + the
+    # v1-equivalence sanity (dz/dx/dD/dinp/dseg paths are byte-identical -> ~0).
+    if b2_gemm_ab:
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+            chunk_scan_combine_bwd_cuda_prim, chunk_scan_combine_bwd_cuda_prim_gemm,
+        )
+        import tilelang as _tl
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+            _resolve_chunked_compile_target as _rct,
+        )
+        _tgt = _rct("cuda")
+        _pc = {"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True}
+
+        # v1
+        _p1 = chunk_scan_combine_bwd_cuda_prim(b, S, chunk, G, H, P, N)
+        _k1 = _tl.compile(_p1, out_idx=[11, 12, 13, 14, 15, 16, 17], target=_tgt,
+                          pass_configs=_pc)
+        _dC1 = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+        _dx1 = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dz1 = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dck1 = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+        _din1 = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+        _dAy1 = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+        _dD1 = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+        def _run_v1g():
+            _dC1.zero_(); _dx1.zero_(); _dz1.zero_(); _dck1.zero_()
+            _din1.zero_(); _dAy1.zero_(); _dD1.zero_()
+            _k1(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
+                th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
+                _dC1, _dx1, _dz1, _dck1, _din1, _dAy1, _dD1)
+        _run_v1g(); torch.cuda.synchronize()
+        _t1g = _time(_run_v1g)
+
+        # GEMM prim (tensor-core). SAME out_idx + dA_cumsum_y shape as v1.
+        _pg = chunk_scan_combine_bwd_cuda_prim_gemm(b, S, chunk, G, H, P, N)
+        _kg = _tl.compile(_pg, out_idx=[11, 12, 13, 14, 15, 16, 17], target=_tgt,
+                          pass_configs=_pc)
+        _dCg = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+        _dxg = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dzg = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dckg = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+        _ding = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+        _dAyg = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+        _dDg = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+        def _run_gemm():
+            _dCg.zero_(); _dxg.zero_(); _dzg.zero_(); _dckg.zero_()
+            _ding.zero_(); _dAyg.zero_(); _dDg.zero_()
+            _kg(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
+                th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
+                _dCg, _dxg, _dzg, _dckg, _ding, _dAyg, _dDg)
+        _run_gemm(); torch.cuda.synchronize()
+        _tg = _time(_run_gemm)
+
+        # vs-v1 max|abs| (fp16-rounding delta on the GEMM'd dC/dchunk/dA; the
+        # untouched dz/dx/dD/dinp/dseg paths should be ~0). RULE #1: reported, not
+        # silently suppressed.
+        eqg = {
+            "dC": float((_dCg - _dC1).abs().max()),
+            "dx": float((_dxg - _dx1).abs().max()),
+            "dz": float((_dzg - _dz1).abs().max()),
+            "dchunk": float((_dckg - _dck1).abs().max()),
+            "dinp": float((_ding - _din1).abs().max()),
+            "dA_y": float((_dAyg - _dAy1).abs().max()),
+            "dD": float((_dDg - _dD1).abs().max()),
+        }
+        speedup_g = _t1g / _tg if _tg > 0 else float("nan")
+        verdict_g = "GO" if _tg < _t1g else "NO-GO"
+        result["B2_gemm_ab"] = {"v1_ms": _t1g, "gemm_ms": _tg,
+                                "speedup": speedup_g, "verdict": verdict_g,
+                                "vs_v1_max_abs": eqg}
+        print(f"[B2-GEMM-AB] MEASURED v1={_t1g:.3f}ms  gemm={_tg:.3f}ms  "
+              f"speedup={speedup_g:.3f}x  {verdict_g}  "
+              f"vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eqg.items()} }")
 
     # ============================ B1 ============================
     try:
@@ -653,6 +738,13 @@ def main():
     # max|abs|. The parity chain (B1/B0 + the 8-grad gate) is UNCHANGED and uses the
     # env-selected B2 (v1 byte-identical unless CPPMEGA_PATH_C_B2_V2 is set).
     b2_v2_ab = "--b2-v2-ab" in sys.argv
+    # --b2-gemm-ab: in ONE gb10 process build+time BOTH the §17-GO v1 B2 cuda prim and
+    # the NEW TENSOR-CORE GEMM prim (DYX/dC_off/dC_diag/dchunk_states as T.gemm),
+    # printing medians + speedup LABELLED MEASURED and the GEMM-vs-v1 max|abs|. The
+    # parity chain (B1/B0 + the 8-grad gate) is UNCHANGED and uses the env-selected
+    # B2: set CPPMEGA_PATH_C_B2_GEMM=1 to run the chained 8-grad gate THROUGH the
+    # GEMM prim (its dA_cumsum_y shape == v1, so no probe-chain change needed).
+    b2_gemm_ab = "--b2-gemm-ab" in sys.argv
     # TRACK 1 (4x batch): --bs4 flips the prod cfg's micro-batch axis 1 -> 4. The
     # B0/B1/B2 builders + grids already consume ``batch`` (grid total scales by
     # batch); this is a pure cfg change, no kernel edit. RULE #1: --bs4 requires
@@ -684,7 +776,7 @@ def main():
     for cfg in cfgs:
         try:
             cfg_ok, res = probe_backward(**cfg, use_dhlast=use_dhlast,
-                                         b2_v2_ab=b2_v2_ab)
+                                         b2_v2_ab=b2_v2_ab, b2_gemm_ab=b2_gemm_ab)
         except Exception as exc:  # RULE #1: surface WHERE+WHAT, fail loud.
             print("[BWD] PROBE RAISED (RULE #1 fail-loud):")
             traceback.print_exc()
