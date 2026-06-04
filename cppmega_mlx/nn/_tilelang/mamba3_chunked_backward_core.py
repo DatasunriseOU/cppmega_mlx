@@ -55,19 +55,24 @@ __all__ = [
     "MAMBA3_CHUNK_SCAN_COMBINE_BWD_OP_NAME",
     "MAMBA3_INTER_CHUNK_RECUR_BWD_OP_NAME",
     "MAMBA3_CHUNK_PRECOMPUTE_BWD_OP_NAME",
+    "MAMBA3_BWD_MONO_OP_NAME",
     "chunk_scan_combine_bwd_metal_prim",
     "chunk_scan_combine_bwd_cuda_prim",
     "chunk_scan_combine_bwd_cuda_prim_v2",
     "chunk_scan_combine_bwd_cuda_prim_gemm",
     "chunk_scan_combine_bwd_metal_gemm_prim",
+    "bwd_mono_cuda_prim",
+    "bwd_mono_metal_prim",
     "inter_chunk_recur_bwd_metal_prim",
     "chunk_precompute_bwd_metal_prim",
     "chunk_scan_combine_bwd_grid",
     "inter_chunk_recur_bwd_grid",
     "chunk_precompute_bwd_grid",
+    "bwd_mono_grid",
     "build_chunk_scan_combine_bwd_metal",
     "build_inter_chunk_recur_bwd_metal",
     "build_chunk_precompute_bwd_metal",
+    "build_bwd_mono",
 ]
 
 # Stable op-node names for the Path-C B0/B1/B2 backward segments (design §2/§3.2).
@@ -75,6 +80,15 @@ __all__ = [
 MAMBA3_CHUNK_SCAN_COMBINE_BWD_OP_NAME = "mamba3_chunk_scan_combine_bwd"
 MAMBA3_INTER_CHUNK_RECUR_BWD_OP_NAME = "mamba3_inter_chunk_recur_bwd"
 MAMBA3_CHUNK_PRECOMPUTE_BWD_OP_NAME = "mamba3_chunk_precompute_bwd"
+# The MONO-FUSED backward op (the cppmega mono-chunk port, flag-gated). ONE kernel
+# per (chunk,head) keeping chunk state resident: it runs the FULL B2 GEMM body
+# (DYX/dC_off/dC_diag/dchunk_states as T.gemm, the §27 prim) AND the dinp_diag-
+# dependent HALF of B0 (dx/dB/ddt outer-product reductions) BEFORE any dinp_diag
+# global round-trip. B1 (cross-chunk reverse adjoint carry) + the dstates-coupled
+# half of B0 stay SEPARATE (the per-CTA fusion cannot cross chunks). RULE #1: when
+# the mono flag is ON this is the ONE path and it RAISES on failure; OFF leaves the
+# 6-kernel B0/B1/B2 chain byte-identical.
+MAMBA3_BWD_MONO_OP_NAME = "mamba3_bwd_mono"
 
 # 1/ln(2): ``exp2(x*p) == exp(x)`` (matches the forward core convention).
 _LOG2E = 1.4426950408889634
@@ -1927,6 +1941,615 @@ def build_chunk_scan_combine_bwd_metal(
         prim,
         out_idx=[11, 12, 13, 14, 15, 16, 17],
         target=resolved_target,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# MONO — the cppmega mono-chunk port: ONE kernel per (chunk,head) keeping the    #
+#        chunk state resident, large tensor-core GEMMs internal, NO inter-kernel  #
+#        sync. Fuses the FULL B2 GEMM body + the dinp_diag-dependent HALF of B0.  #
+# --------------------------------------------------------------------------- #
+#
+# WHAT THIS IS (the port the task asks for) and its HONEST scope:
+#
+# cppmega's reference mono-fused backward
+# (cppmega/megatron/cuda_ext/mamba3_mono_chunk_skeleton.cu) is ONE kernel, grid
+# (nchunks, head, batch), 256 threads, dynamic smem: it stages the chunk state
+# (Q/K^T/dPhi/Psi) resident in shared, runs ONE large WMMA GEMM (LKQ = K@Q^T,
+# 16x16x16 tiled 4x4 over 64x64) and REUSES that tile from shared BEFORE any
+# global write — the intra-chunk LKQ consumer, the state consumer (K@dstates) and
+# the same-time qk_dot diagonal all read s_lkq/s_k_t directly; the masked/3-index
+# terms stay scalar-threaded in the SAME kernel; outputs scatter via atomicAdd.
+#
+# The path_c analogue of that exact structure is: ONE CTA per (chunk,head) that
+#   (1) keeps dY/x/dA_cumsum resident in shared,
+#   (2) runs the FOUR large GEMMs (DYX = dY@x^T, dC_off = dY@prev_states,
+#       dC_diag = M@B, dchunk_states = (decay*dY)^T@C) as T.gemm — EXACTLY the §27
+#       chunk_scan_combine_bwd_cuda_prim_gemm body, REUSED here verbatim,
+#   (3) keeps the per-position dinp_diag[l,p,n] RESIDENT in shared (it is the
+#       largest B2->B0 handoff buffer: fp32 (b,S,H,P,N)) and consumes it IN THE
+#       SAME CTA to fold the dinp_diag-dependent HALF of B0 (dx_diag/dB_diag/
+#       ddt_diag outer-product reductions) BEFORE any global round-trip — the
+#       cppmega "reuse the resident tile before any global write" move.
+#
+# WHAT CANNOT FUSE (the honest maximum — stated up front, RULE #1):
+#   * B1 (inter_chunk_recur_bwd) carries a reverse adjoint ACROSS chunks; a
+#     per-(chunk,head) CTA cannot express it without cooperative-grid sync. It
+#     STAYS a separate kernel (it is 2.41 ms — cheap).
+#   * B0's dstates-COUPLED half (dinp_states = dstates*decay_l, the decay_states
+#     transpose -> dx_states/dB_states/ddt_states/dlog_decay, the reverse-cumsum
+#     VJP) needs dstates which is the OUTPUT of B1 — so it CANNOT be in the same
+#     CTA as B2. It STAYS in the (post-B1) B0 kernel. The mono kernel folds ONLY
+#     the dinp_diag-dependent additive half (the math is LINEAR in dinp, so
+#     dx = dx_diag + dx_states splits exactly; the mono kernel emits dx_diag/
+#     dB_diag/ddt_diag via atomic_add and the separate B0 adds the _states half).
+#
+# So the maximal honest fusion is  B2 + dinp_diag-B0  in one kernel; B1 and the
+# dstates-coupled B0 remainder stay separate. This ELIMINATES the dinp_diag global
+# round-trip (the largest handoff) and the B2->(dinp_diag consumer) launch, but it
+# does NOT shrink the four single-64-tile GEMMs nor the non-GEMM-able 3-index dinp
+# hotspot that dominates B2.
+#
+# PREDICTED OUTCOME (must be stated before the GB10 measure, RULE #1 honesty):
+# NO-GO for throughput is the PREDICTION, on three independent prior measurements
+# of THIS SAME kernel class:
+#   (1) §27 measured the four-GEMM B2 prim (which this mono kernel REUSES verbatim)
+#       at 0.749x vs the v1 threaded-serial prim (gemm 1371.5 ms vs v1 1027.5 ms,
+#       same gb10 box) — the single-64-tile m16n8k16 GEMMs' ldmatrix/smem-staging +
+#       sync cost EXCEEDS the v1 serial reductions. Fusing B0's dinp_diag work into
+#       the same CTA does not change the GEMM tiles or the 3-index dinp hotspot.
+#   (2) cppmega's identical mono-chunk WMMA kernel closed at 11.155 ms vs TileLang
+#       3.707 ms = 3.0x SLOWER (mamba3_mono_cuda_chunk_wave10_final): "Keep as
+#       reference/profiling material only. Do not merge any monolithic CUDA chunk
+#       implementation as a production path."
+#   (3) §18 measured the B2 kernels occupancy-SATURATED at bs1 (v2 dstate-split
+#       0.997x), so removing the dinp_diag round-trip + one launch saves launch +
+#       memory-traffic latency, NOT compute — and the §27 GEMM-staging tax adds
+#       back more than that saves.
+# The mono kernel is therefore built behind a flag as a MEASURED artifact (mirroring
+# how §27/§18 and both cppmega campaigns committed their NO-GO behind a flag); the
+# §17 447.8 ms 6-kernel chain stays canonical and byte-identical when the flag is
+# OFF. If GB10 measures a GO, that is reported MEASURED; the prediction is NO-GO.
+#
+# RULE #1: when the mono flag is ON the mono prim is the ONE path — a tile/MMA-
+# divisibility/smem/compile/parity failure RAISES with where+what; it NEVER falls
+# back to the 6-kernel chain / the serial prim / numpy.
+# --------------------------------------------------------------------------- #
+
+
+def bwd_mono_grid(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+) -> tuple[int, tuple[int, int, int]]:
+    """Return ``(total_threadgroups, (gx, gy, gz))`` for the MONO grid.
+
+    Grid is ``(batch*nchunks, nheads, 1)`` — one threadgroup per (batch, chunk,
+    head), the SAME resident granularity as B2/B0 and the cppmega mono-chunk
+    skeleton's ``(chunk, head, batch)`` CTA mapping. One CTA owns this head's
+    chunk: it keeps the chunk state resident, runs the four internal GEMMs, and
+    folds the dinp_diag half of B0 before any global write.
+    """
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"bwd_mono_grid: seqlen ({seqlen}) must be divisible by chunk_size "
+            f"({chunk_size}); no padding fallback (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"bwd_mono_grid: nheads ({nheads}) must be divisible by ngroups "
+            f"({ngroups})"
+        )
+    nchunks = seqlen // chunk_size
+    return batch * nchunks * nheads, (batch * nchunks, nheads, 1)
+
+
+def bwd_mono_cuda_prim(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    threads: int = 128,
+) -> Any:
+    """MONO-FUSED CUDA (gb10 / sm_121) backward prim — B2 GEMM + dinp_diag-B0.
+
+    ONE kernel per (chunk,head). Body = the §27
+    :func:`chunk_scan_combine_bwd_cuda_prim_gemm` (the four GEMM-able contractions
+    DYX/dC_off/dC_diag/dchunk_states as ``T.gemm``, byte-identical math) EXTENDED
+    so the per-position ``dinp_diag[l,p,n]`` — the largest B2->B0 handoff buffer —
+    is kept RESIDENT in a shared ``DINP[L,headdim*dstate]`` tile and consumed IN
+    THIS CTA to fold the dinp_diag-dependent HALF of B0 before any global write:
+
+      dx_diag[l,p]  = dt[l] * sum_n  dinp_diag[l,p,n] * B[l,n]   (atomic into dx)
+      dB_diag[l,n]  = dt[l] * sum_p  dinp_diag[l,p,n] * x[l,p]   (atomic into dB)
+      ddt_diag[l]   =          sum_{p,n} dinp_diag[l,p,n]*x[l,p]*B[l,n]  (-> ddt)
+
+    These are EXACTLY the B0 reductions
+    (:func:`chunk_precompute_bwd_metal_prim`, the
+    ``dx_inp``/``dB``/``ddt_inp`` block) restricted to the ``dinp_diag`` source
+    (``dinp_diag`` term only; the ``dstates*decay_l`` term stays in the post-B1 B0
+    kernel — the math is LINEAR in ``dinp`` so the split is exact). The mono kernel
+    therefore STILL emits the per-position ``dinp_diag`` to global (the post-B1 B0
+    kernel adds the dstates half on top of zero — see the build/caller contract),
+    but the dinp_diag-only ``dx``/``dB``/``ddt`` contributions are produced HERE
+    while ``dinp_diag`` is resident, eliminating that read of the (b,S,H,P,N)
+    buffer in the consumer.
+
+    THE FOUR INTERNAL GEMMs (state-resident, sm_121 mma.sync.m16n8k16; the cppmega
+    "large GEMM, reuse from shared before any global write" move):
+      (A) DYX  = dY @ x^T          (M=L, N=L, K=headdim; transpose_B)
+      (B) dC_off = dY @ prev_states (M=L, N=dstate, K=headdim)
+      (C) dC_diag = M @ B           (M=L, N=dstate, K=L; M masked s<=l, decay+dt folded)
+      (D) dchunk_states = (decay*dY)^T @ C (M=headdim, N=dstate, K=L; transpose_A)
+    The DYX shared tile is REUSED by the dC_diag operand AND the dseg dA-grad (zero
+    recompute — the recompute-killer), EXACTLY as §27.
+
+    STAYS THREADED / VERBATIM (documented scope boundary, NOT a fallback — the SAME
+    serial math as §27, selected by the SAME flag):
+      * dz / dx(D-skip) / dD output-gate split,
+      * ``dinp_diag[s,p,n] = sum_{l>=s} dY[l,p]*C[l,n]*Lmat[l,s]`` — the 3-index
+        s-dependent-weight contraction (does NOT collapse to one GEMM); it is built
+        into the resident ``DINP`` tile here, written to global, AND immediately
+        consumed by the dx_diag/dB_diag/ddt_diag folds,
+      * the ``dseg`` Y_diag dA-grad (reuses DYX).
+
+    SMEM (gb10 ~99 KB budget; the §27 GEMM layout 88.5 KB + the resident
+    ``DINP[L,headdim*dstate]`` fp32 tile). At prod L=P=N=64 the DINP tile is
+    64*64*64*4 = 1.0 MB which DOES NOT FIT — see the build-site smem gate, which
+    RAISES (RULE #1). The resident-dinp design therefore only fits when
+    headdim*dstate is small enough; the gate computes the real budget and RAISES
+    with where+what at prod dims. (This is the honest structural wall the task's
+    own §27 analysis predicts: a per-CTA resident dinp_diag tile is 64x larger than
+    the §27 GEMM operands.) A reduced-residency variant that streams dinp_diag in
+    N-strips is documented in the build-site for the over-budget case, but it is
+    NOT auto-substituted — the prim RAISES, the caller picks the in-budget config.
+
+    Same ``pass_configs`` and out_idx as the 6-kernel B2/B0 chain. RULE #1: ONE
+    path when selected; compile/parity/budget failure RAISES (no fallback).
+    """
+    import tilelang  # noqa: F401
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"bwd_mono_cuda_prim: seqlen ({seqlen}) must be divisible by "
+            f"chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"bwd_mono_cuda_prim: nheads ({nheads}) must be divisible by ngroups "
+            f"({ngroups})"
+        )
+    # m16n8k16 fp16 MMA divisibility for the four GEMMs (RULE #1 — no silent pad);
+    # identical constraint set to the §27 GEMM prim.
+    for axis_name, axis_val in (
+        ("chunk_size(L)", chunk_size),
+        ("dstate(N)", dstate),
+        ("headdim(P)", headdim),
+    ):
+        if axis_val % 16 != 0:
+            raise ValueError(
+                f"bwd_mono_cuda_prim: {axis_name}={axis_val} is not a multiple of "
+                f"16; the fp16 m16n8k16 tensor-core MMA requires K%16==0 and "
+                f"M%16==0/N%8==0 for the DYX/dC_off/dC_diag/dchunk_states GEMMs. No "
+                f"silent padding (RULE #1) — re-tile or pad the caller buffers."
+            )
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    heads_per_group = nheads // ngroups
+    L = chunk_size
+    p = _LOG2E
+
+    @T.prim_func
+    def main(
+        dout: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        z: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        D: T.Tensor((nheads), dtype),  # type: ignore
+        y: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dC: T.Tensor((batch, seqlen, nheads, dstate), accum_dtype),  # type: ignore
+        dx: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dz: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dchunk_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dinp: T.Tensor((batch, seqlen, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dA_cumsum_y: T.Tensor((batch, nheads, nchunks, chunk_size), accum_dtype),  # type: ignore
+        dD: T.Tensor((nheads), accum_dtype),  # type: ignore
+        dB_diag: T.Tensor((batch, seqlen, nheads, dstate), accum_dtype),  # type: ignore
+        ddt_diag: T.Tensor((batch, seqlen, nheads), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nheads, threads=threads) as (bx, by):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            head_idx = by
+            group_idx = head_idx // heads_per_group
+            base = chunk_idx * chunk_size
+
+            maxLP = headdim if headdim > L else L
+            dacs = T.alloc_shared((L,), accum_dtype)
+            dY = T.alloc_shared((L, headdim), accum_dtype)
+            dAcs_acc = T.alloc_shared((L,), accum_dtype)
+            DYX = T.alloc_shared((L, L), accum_dtype)
+            # RESIDENT dinp_diag tile (the cppmega "keep the chunk state resident and
+            # consume before any global write" move). [L, headdim*dstate] fp32 — the
+            # largest persistent tile; the build-site smem gate RAISES if it does not
+            # fit the gb10 budget (RULE #1, no silent over-budget launch).
+            DINP = T.alloc_shared((L, headdim * dstate), accum_dtype)
+            ddt_inp_sh = T.alloc_shared((L,), accum_dtype)  # ddt_diag per-l accumulator
+            dY16 = T.alloc_shared((L, headdim), dtype, scope="shared")
+            opA = T.alloc_shared((L, maxLP), dtype, scope="shared")
+            opB = T.alloc_shared((maxLP, dstate), dtype, scope="shared")
+            store_fp32 = T.alloc_shared((maxLP, dstate), accum_dtype, scope="shared")
+            dCdiag_sh = T.alloc_shared((L, dstate), accum_dtype, scope="shared")
+            DYX_frag = T.alloc_fragment((L, L), accum_dtype)
+            dCoff_frag = T.alloc_fragment((L, dstate), accum_dtype)
+            dCdiag_frag = T.alloc_fragment((L, dstate), accum_dtype)
+            dchunk_frag = T.alloc_fragment((headdim, dstate), accum_dtype)
+
+            for l in T.Parallel(L):
+                dacs[l] = T.Cast(accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, l])
+                dAcs_acc[l] = T.Cast(accum_dtype, 0)
+                ddt_inp_sh[l] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+
+            # --- output/gate + D-skip split: dY, dz, dx(D-skip), dD; dY16, x16 ---
+            # (VERBATIM §27 gemm prim.)
+            dD_local = T.alloc_local((1,), accum_dtype)
+            dD_local[0] = T.Cast(accum_dtype, 0)
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                s = base + ll
+                z_v = T.Cast(accum_dtype, z[batch_idx, s, head_idx, pp])
+                gate = z_v / (T.Cast(accum_dtype, 1.0) + T.exp(-z_v))
+                y_v = T.Cast(accum_dtype, y[batch_idx, s, head_idx, pp])
+                dout_v = T.Cast(accum_dtype, dout[batch_idx, s, head_idx, pp])
+                dgate = dout_v * y_v
+                dy_v = dout_v * gate
+                dz[batch_idx, s, head_idx, pp] = dgate * _silu_grad_expr(T, z_v, accum_dtype)
+                d_v = T.Cast(accum_dtype, D[head_idx])
+                x_v = T.Cast(accum_dtype, x[batch_idx, s, head_idx, pp])
+                dx[batch_idx, s, head_idx, pp] = d_v * dy_v
+                dD_local[0] = dD_local[0] + dy_v * x_v
+                dY[ll, pp] = dy_v
+                dY16[ll, pp] = T.Cast(dtype, dy_v)
+                opA[ll, pp] = T.Cast(dtype, x_v)
+            T.sync_threads()
+            T.atomic_add(dD[head_idx], dD_local[0])
+
+            # ---- (A) DYX = dY @ x^T (transpose_B) — GEMM ----
+            T.clear(DYX_frag)
+            T.gemm(dY16, opA[0:L, 0:headdim], DYX_frag, transpose_B=True)
+            T.copy(DYX_frag, DYX)
+            T.sync_threads()
+
+            # ---- (B) dC_off = dY @ prev_states — GEMM ----
+            T.copy(
+                prev_states[batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate],
+                opB[0:headdim, 0:dstate],
+                disable_tma=True,
+            )
+            T.clear(dCoff_frag)
+            T.gemm(dY16, opB[0:headdim, 0:dstate], dCoff_frag)
+            T.copy(dCoff_frag, store_fp32[0:L, 0:dstate])
+            T.sync_threads()
+
+            # ---- (C) dC_diag = M @ B (masked operand) — GEMM ----
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                m_val = DYX[ll, ss] * lmat * dt_s
+                opA[ll, ss] = T.Cast(
+                    dtype, T.if_then_else(ss <= ll, m_val, T.Cast(accum_dtype, 0))
+                )
+            T.copy(
+                B[batch_idx, base : base + L, group_idx, 0:dstate],
+                opB[0:L, 0:dstate],
+                disable_tma=True,
+            )
+            T.sync_threads()
+            T.clear(dCdiag_frag)
+            T.gemm(opA[0:L, 0:L], opB[0:L, 0:dstate], dCdiag_frag)
+            T.copy(dCdiag_frag, dCdiag_sh)
+            T.sync_threads()
+
+            # dC[l,n] = dCoff*sd + dCdiag ; dstate_decay dA grad (thread-strided).
+            for ln0 in T.serial(0, L * dstate, threads):
+                lane = T.get_thread_binding(0)
+                ln = ln0 + lane
+                if ln < L * dstate:
+                    ll = ln // dstate
+                    nn = ln % dstate
+                    s = base + ll
+                    sd = T.exp2(dacs[ll] * p)
+                    dC[batch_idx, s, head_idx, nn] = (
+                        store_fp32[ll, nn] * sd + dCdiag_sh[ll, nn]
+                    )
+                    c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                    T.atomic_add(dAcs_acc[ll], store_fp32[ll, nn] * c_v * sd)
+            T.sync_threads()
+
+            # ---- (D) dchunk_states = (decay*dY)^T @ C — GEMM ----
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                sd = T.exp2(dacs[ll] * p)
+                opA[ll, pp] = T.Cast(dtype, dY[ll, pp] * sd)
+            T.copy(
+                C[batch_idx, base : base + L, group_idx, 0:dstate],
+                opB[0:L, 0:dstate],
+                disable_tma=True,
+            )
+            T.sync_threads()
+            T.clear(dchunk_frag)
+            T.gemm(opA[0:L, 0:headdim], opB[0:L, 0:dstate], dchunk_frag, transpose_A=True)
+            T.copy(dchunk_frag, store_fp32[0:headdim, 0:dstate])
+            T.copy(
+                store_fp32[0:headdim, 0:dstate],
+                dchunk_states[batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate],
+                disable_tma=True,
+            )
+            T.sync_threads()
+
+            # ---- Y_diag transpose -> dinp_diag, kept RESIDENT in DINP[L, P*N] ----
+            #   dinp_diag[s,p,n] = sum_{l>=s} dY[l,p]*C[l,n]*Lmat[l,s] (3-index, the
+            #   non-GEMM-able hotspot; STAYS threaded). Built into the resident DINP
+            #   tile AND written to global (the post-B1 B0 reads it to add the
+            #   dstates*decay_l half). DINP[ss, pp*dstate+nn] is the resident copy.
+            for sp in T.serial(0, L * headdim, threads):
+                lane = T.get_thread_binding(0)
+                spi = sp + lane
+                if spi < L * headdim:
+                    ss = spi // headdim
+                    pp = spi % headdim
+                    sidx = base + ss
+                    for nn in T.serial(dstate):
+                        acc = T.alloc_local((1,), accum_dtype)
+                        acc[0] = T.Cast(accum_dtype, 0)
+                        for ll in T.serial(ss, L):  # l >= s (lower-tri)
+                            lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                            c_v = T.Cast(
+                                accum_dtype, C[batch_idx, base + ll, group_idx, nn]
+                            )
+                            acc[0] = acc[0] + dY[ll, pp] * c_v * lmat
+                        DINP[ss, pp * dstate + nn] = acc[0]
+                        dinp[batch_idx, sidx, head_idx, pp, nn] = acc[0]
+            T.sync_threads()
+
+            # ---- FUSED dinp_diag-B0 HALF: dx_diag, dB_diag, ddt_diag ----
+            # Consume the RESIDENT DINP tile BEFORE any global re-read (the cppmega
+            # "reuse from shared before any global write" move). These are the EXACT
+            # B0 reductions (chunk_precompute_bwd_metal_prim dx_inp/dB/ddt_inp block)
+            # restricted to the dinp_diag source:
+            #   dx_diag[l,p] = dt[l]*sum_n dinp_diag[l,p,n]*B[l,n]   (atomic into dx)
+            #   ddt_diag[l] += sum_n dinp_diag[l,p,n]*x[l,p]*B[l,n]  (-> ddt_diag)
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                dt_l = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ll])
+                x_lp = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
+                acc = T.alloc_local((1,), accum_dtype)   # sum_n dinp_diag*B (no dt yet)
+                acc[0] = T.Cast(accum_dtype, 0)
+                for nn in T.serial(dstate):
+                    b_v = T.Cast(accum_dtype, B[batch_idx, base + ll, group_idx, nn])
+                    acc[0] = acc[0] + DINP[ll, pp * dstate + nn] * b_v
+                T.atomic_add(dx[batch_idx, base + ll, head_idx, pp], acc[0] * dt_l)
+                T.atomic_add(ddt_inp_sh[ll], acc[0] * x_lp)
+            T.sync_threads()
+
+            #   dB_diag[l,n] = dt[l]*sum_p dinp_diag[l,p,n]*x[l,p]  (write dB_diag)
+            for ln in T.Parallel(L * dstate):
+                ll = ln // dstate
+                nn = ln % dstate
+                dt_l = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ll])
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                for pp in T.serial(headdim):
+                    x_v = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
+                    acc[0] = acc[0] + DINP[ll, pp * dstate + nn] * x_v
+                dB_diag[batch_idx, base + ll, head_idx, nn] = acc[0] * dt_l
+            T.sync_threads()
+
+            # ---- Y_diag dA grad (dseg) — reuses DYX, branchless (BYTE-IDENTICAL §27) ----
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                cb_v = T.Cast(accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss])
+                lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                tri = T.if_then_else(
+                    ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+                )
+                dseg = DYX[ll, ss] * cb_v * lmat * dt_s * tri
+                T.atomic_add(dAcs_acc[ll], dseg)
+                T.atomic_add(dAcs_acc[ss], -dseg)
+            T.sync_threads()
+
+            for l in T.Parallel(L):
+                dA_cumsum_y[batch_idx, head_idx, chunk_idx, l] = dAcs_acc[l]
+            # ddt_diag written in a SEPARATE lane-strided loop (NOT fused with the
+            # dA_cumsum_y T.Parallel(L) write): the verify_parallel_loop pass cannot
+            # prove `base+l` injective alongside the 4D dA_cumsum_y index in one
+            # fused parallel body and flags a (false-positive) race. The thread-
+            # strided form — identical to the dC store / dinp loops the verifier
+            # accepts — makes the per-(chunk,head) disjoint `base+l` write
+            # unambiguous (RULE #1: fix the write form, do NOT disable the race
+            # check). Each (batch,chunk,head) CTA owns a disjoint seqlen slice
+            # [base, base+L) of this head, so the global write is race-free.
+            for l0 in T.serial(0, L, threads):
+                lane = T.get_thread_binding(0)
+                ll = l0 + lane
+                if ll < L:
+                    ddt_diag[batch_idx, base + ll, head_idx] = ddt_inp_sh[ll]
+
+    return main
+
+
+def bwd_mono_metal_prim(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    threads: int = 128,
+) -> Any:
+    """Metal MONO-FUSED backward prim — INFEASIBLE at prod dims, RAISES on build.
+
+    The mono kernel keeps BOTH the §27 four-GEMM fragment-staging layout (the Metal
+    twin :func:`chunk_scan_combine_bwd_metal_gemm_prim` already needs ~24 KB and the
+    full 4-GEMM CUDA layout 72.5 KB does NOT fit Apple's HARD 32 KB threadgroup
+    limit) AND the resident ``DINP[L, headdim*dstate]`` fp32 tile (at prod
+    L=P=N=64: 64*4096*4 = 1.0 MB) — far over the 32 KB cap. The resident-dinp
+    fusion is therefore gb10-only. RULE #1: the Metal mono build RAISES (where+what)
+    rather than silently downgrade; the serial 6-kernel Metal chain stays the path.
+
+    This function returns the prim object (so the CUDA-shaped signature is reusable
+    if Apple ever raises the threadgroup limit); the SMEM-budget RAISE is enforced
+    at the build site :func:`build_bwd_mono` (which is where the F0/B2 Metal-GEMM
+    budget gates also live), so a Metal compile is never attempted over-budget.
+    """
+    # The body is identical in shape to bwd_mono_cuda_prim; on Metal the fragment
+    # path + resident DINP tile cannot fit, so the build site RAISES before compile.
+    # We still construct the prim (no GPU touched) so the signature is importable.
+    return bwd_mono_cuda_prim(
+        batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, threads=threads
+    )
+
+
+def build_bwd_mono(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    target: Any = None,
+    **kwargs: Any,
+) -> Any:
+    """Compile the MONO-FUSED backward kernel (B2 GEMM + dinp_diag-B0) to a JITKernel.
+
+    ``target`` selects CUDA (``"cuda"`` / sm_121; the ONLY supported mono target) or
+    Metal (RAISES — the resident-dinp 4-GEMM layout does not fit Apple's 32 KB).
+
+    Outputs (the trailing 9 params): ``dC, dx, dz, dchunk_states, dinp, dA_cumsum_y,
+    dD, dB_diag, ddt_diag`` (out_idx [11..19]). ``dx`` is accumulated (D-skip path +
+    the fused dinp_diag dx half); pass PRE-ZEROED contiguous fp32 buffers.
+
+    CALLER CONTRACT (RULE #1 — the ONE path, double-count-free): the mono kernel has
+    ALREADY folded the dinp_diag-dependent half of dx/dB/ddt (``dx += dx_diag``,
+    ``dB_diag``, ``ddt_diag``). The post-B1 B0 kernel must therefore add ONLY the
+    dstates-COUPLED half (``dinp_states = dstates*decay_l`` -> dx_states/dB_states/
+    ddt_states + dlog_decay + the reverse-cumsum VJP). Since the existing B0 prim
+    (:func:`chunk_precompute_bwd_metal_prim`) computes ``dinp_v = dinp_diag +
+    dstates*decay_l`` for its dx_inp/dB/ddt_inp reductions, the mono-mode caller MUST
+    feed that B0 a ZEROED ``dinp_diag`` (the mono kernel still emits the per-position
+    ``dinp`` to global so B1/B0 see the right ``dstates``, but the dinp_diag→dx/dB/ddt
+    contribution is owned by the mono kernel; passing dinp_diag=0 to B0 makes B0 add
+    only the _states half). The mono ``dB_diag``/``ddt_diag`` + B0's _states dB/ddt
+    sum to the full grads; ``dx`` accumulates across both. (The full mono-mode chain
+    wiring lives in the probe / the caller, NOT here — this builder only compiles the
+    one fused kernel.) The math is LINEAR in ``dinp`` so the split is exact.
+
+    SMEM BUDGET GATE (gb10 ~99 KB) — RAISE (RULE #1) before compile if over budget;
+    never silently re-tile / launch over budget. The mono prim's shared = the §27
+    GEMM layout (88.5 KB at prod L=P=N=64) PLUS the resident ``DINP[L,P*N]`` fp32
+    tile (L*P*N*4) PLUS ``ddt_inp_sh[L]`` fp32. At prod L=P=N=64 the DINP tile alone
+    is 64*64*64*4 = 1,048,576 B — the gate RAISES with where+what (this is the
+    HONEST structural wall: a per-CTA resident dinp_diag tile is ~64x the §27 GEMM
+    operands; the resident-dinp mono fusion only fits when L*P*N is small).
+
+    RULE #1: when this builder is invoked the mono prim is the ONE path — a
+    compile/parity/budget failure PROPAGATES (no fallback to the 6-kernel chain).
+    """
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+        _resolve_chunked_compile_target,
+    )
+
+    resolved_target = _resolve_chunked_compile_target(target)
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
+
+    L = chunk_size
+    P = headdim
+    N = dstate
+    maxLP = P if P > L else L
+    # §27 GEMM layout bytes (matches build_chunk_scan_combine_bwd_metal gemm gate):
+    gemm_smem = (
+        2 * L * 4              # dacs + dAcs_acc (fp32)
+        + L * P * 4            # dY (fp32)
+        + L * L * 4            # DYX (fp32)
+        + L * P * 2            # dY16 (fp16)
+        + L * maxLP * 2        # opA (fp16)
+        + maxLP * N * 2        # opB (fp16)
+        + maxLP * N * 4        # store_fp32 (fp32)
+        + L * N * 4            # dCdiag_sh (fp32)
+    )
+    # MONO additions: the resident dinp_diag tile + the ddt accumulator.
+    mono_extra = L * P * N * 4 + L * 4  # DINP[L,P*N] fp32 + ddt_inp_sh[L] fp32
+    smem_bytes = gemm_smem + mono_extra
+
+    if "cuda" in kind:
+        _GB10_SMEM_BUDGET = 99 * 1024
+        if smem_bytes >= _GB10_SMEM_BUDGET:
+            raise ValueError(
+                f"build_bwd_mono(cuda): per-threadgroup smem {smem_bytes} B "
+                f"(§27 GEMM {gemm_smem} B + resident DINP[L={L},P*N={P*N}] "
+                f"{mono_extra} B; L={L},P={P},N={N}) >= the gb10 budget "
+                f"{_GB10_SMEM_BUDGET} B. The resident-dinp_diag mono fusion is the "
+                f"largest tile (L*P*N*4 = {L*P*N*4} B) and does NOT fit at these "
+                f"dims — this is the HONEST structural wall (per §27 the per-CTA "
+                f"resident dinp_diag tile is ~64x the GEMM operands). RULE #1: "
+                f"refusing to launch over-budget or silently fall back to the "
+                f"6-kernel chain; run the mono fusion only at L*P*N small enough to "
+                f"fit, or keep the §17 447.8 ms 6-kernel chain (mono flag OFF)."
+            )
+        prim = bwd_mono_cuda_prim(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        )
+        pass_configs = {
+            "tl.disable_tma_lower": True,
+            "tl.disable_warp_specialized": True,
+        }
+        return tilelang.compile(
+            prim,
+            out_idx=[11, 12, 13, 14, 15, 16, 17, 18, 19],
+            target=resolved_target,
+            pass_configs=pass_configs,
+        )
+    # METAL: the resident-dinp 4-GEMM layout does not fit Apple's HARD 32 KB.
+    _APPLE_SMEM_BUDGET = 32 * 1024
+    raise NotImplementedError(
+        f"build_bwd_mono(metal): the MONO-FUSED backward needs ~{smem_bytes} B "
+        f"per-threadgroup shared (§27 4-GEMM fragment-staging {gemm_smem} B + "
+        f"resident DINP[L={L},P*N={P*N}] {mono_extra} B) >= Apple's "
+        f"{_APPLE_SMEM_BUDGET} B threadgroup limit. The §27 B2 Metal-GEMM 4-GEMM "
+        f"layout alone does not fit Apple's 32 KB (the gb10 twin uses 72.5 KB); "
+        f"adding the resident dinp_diag tile only worsens it. RULE #1: refusing to "
+        f"launch over-budget or silently downgrade — the mono fusion is gb10-only; "
+        f"use the serial 6-kernel Metal chain (mono flag OFF) on Apple."
     )
 
 

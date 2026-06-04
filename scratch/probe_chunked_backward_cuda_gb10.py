@@ -214,7 +214,8 @@ def _time(fn, n=20):
 
 
 def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
-                   *, use_dhlast=False, b2_v2_ab=False, b2_gemm_ab=False):
+                   *, use_dhlast=False, b2_v2_ab=False, b2_gemm_ab=False,
+                   bwd_mono_ab=False):
     from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
         build_chunk_precompute_metal, build_inter_chunk_recur_metal,
     )
@@ -515,6 +516,133 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
               f"speedup={speedup_g:.3f}x  {verdict_g}  "
               f"vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eqg.items()} }")
 
+    # ----- MONO-FUSED A/B (LABELLED MEASURED) — the cppmega mono-chunk PORT --------
+    # In ONE gb10 process: build+time the §17-GO v1 B2 cuda prim (the 6-kernel chain's
+    # B2) AND the NEW MONO-FUSED prim (build_bwd_mono = the §27 four-GEMM B2 body +
+    # the dinp_diag-dependent HALF of B0 fused in ONE kernel, the dinp_diag tile kept
+    # resident, no inter-kernel sync for the B2->dinp_diag-consumer handoff).
+    #
+    # SMEM WALL (HONEST, RULE #1): build_bwd_mono RAISES at prod L=P=N=64 because the
+    # resident dinp_diag tile is L*P*N*4 = 1,048,576 B >> the gb10 ~99 KB budget. So
+    # at PROD this block reports the budget RAISE as the MEASURED structural NO-GO
+    # (the resident-dinp_diag mono fusion does NOT fit at prod dims — exactly the §27
+    # prediction that a per-CTA resident dinp tile is ~64x the GEMM operands). At an
+    # IN-BUDGET config (small L*P*N) it builds, runs, times vs v1 B2, and checks the
+    # mono outputs vs the §27-equivalent B2 (dC/dz/dchunk/dinp/dA_y/dD) + the fused
+    # dinp_diag-B0 half (dB_diag/ddt_diag and the dinp_diag dx contribution). A mono
+    # kernel SLOWER than the 6-kernel B2+dinp_diag-B0 is reported NO-GO, never used.
+    if bwd_mono_ab:
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+            build_bwd_mono, chunk_scan_combine_bwd_cuda_prim_gemm,
+        )
+        import tilelang as _tl
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+            _resolve_chunked_compile_target as _rct,
+        )
+        _tgt = _rct("cuda")
+        _pc = {"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True}
+        mono_row = {"shape": dict(b=b, S=S, chunk=chunk, G=G, H=H, P=P, N=N)}
+        try:
+            k_mono = build_bwd_mono(b, S, chunk, G, H, P, N, target="cuda")
+        except ValueError as _e:
+            # The HONEST measured wall: resident dinp_diag over budget at these dims.
+            if "smem" in str(_e):
+                mono_row["build"] = "SMEM-NO-GO"
+                mono_row["reason"] = str(_e)
+                print(f"[MONO-AB] BUILD SMEM-NO-GO (resident dinp_diag over budget): "
+                      f"{str(_e)[:200]}")
+                result["bwd_mono_ab"] = mono_row
+                # fall through to the rest of the 6-kernel chain (mono OFF) below.
+                _mono_built = False
+            else:
+                raise
+        else:
+            _mono_built = True
+        if _mono_built:
+            print(f"[MONO-AB] BUILD ok (in-budget L={chunk},P={P},N={N})")
+            # Reference: the §27 four-GEMM B2 prim (mono REUSES its body verbatim).
+            _pg2 = chunk_scan_combine_bwd_cuda_prim_gemm(b, S, chunk, G, H, P, N)
+            _kg2 = _tl.compile(_pg2, out_idx=[11, 12, 13, 14, 15, 16, 17],
+                               target=_tgt, pass_configs=_pc)
+            # mono outputs (9): dC,dx,dz,dchunk,dinp,dA_y,dD,dB_diag,ddt_diag.
+            _mdC = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+            _mdx = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+            _mdz = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+            _mdck = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+            _mdin = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+            _mdAy = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+            _mdD = torch.zeros(H, device=DEV, dtype=torch.float32)
+            _mdBd = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+            _mddt = torch.zeros(b, S, H, device=DEV, dtype=torch.float32)
+
+            def _run_mono():
+                _mdC.zero_(); _mdx.zero_(); _mdz.zero_(); _mdck.zero_()
+                _mdin.zero_(); _mdAy.zero_(); _mdD.zero_(); _mdBd.zero_(); _mddt.zero_()
+                k_mono(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k,
+                       dA.contiguous(), th(C_np), th(B_np), prev.contiguous(),
+                       th(D_np), y_t,
+                       _mdC, _mdx, _mdz, _mdck, _mdin, _mdAy, _mdD, _mdBd, _mddt)
+            _run_mono(); torch.cuda.synchronize()
+            _tm = _time(_run_mono)
+
+            # Reference B2 (§27 GEMM) outputs (dx here is D-skip only).
+            _gdC = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+            _gdx = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+            _gdz = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+            _gdck = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+            _gdin = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+            _gdAy = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+            _gdD = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+            def _run_b2g():
+                _gdC.zero_(); _gdx.zero_(); _gdz.zero_(); _gdck.zero_()
+                _gdin.zero_(); _gdAy.zero_(); _gdD.zero_()
+                _kg2(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k,
+                     dA.contiguous(), th(C_np), th(B_np), prev.contiguous(),
+                     th(D_np), y_t,
+                     _gdC, _gdx, _gdz, _gdck, _gdin, _gdAy, _gdD)
+            _run_b2g(); torch.cuda.synchronize()
+            _tb2 = _time(_run_b2g)
+
+            # The fused dinp_diag-B0 half computed SEPARATELY off the §27 B2's dinp
+            # (the reference the mono kernel must equal): dx_diag, dB_diag, ddt_diag.
+            dt_lk = dt_k.view(b, H, nchunks, chunk)
+            base_idx = (torch.arange(S, device=DEV) // chunk)
+            dt_seq = dt_lk.permute(0, 2, 3, 1).reshape(b, S, H)         # (b,S,H)
+            B_h = th(B_np)[:, :, :, None, :].expand(b, S, G, H // G, N).reshape(b, S, H, N).float()
+            x_f = th(x_np).float()
+            # dx_diag[s,p] = dt*sum_n dinp_diag*B ; dB_diag[s,n] = dt*sum_p dinp_diag*x
+            # ddt_diag[s]  = sum_{p,n} dinp_diag*x*B
+            sum_nB = torch.einsum("bshpn,bshn->bshp", _gdin, B_h)
+            ref_dx_diag = sum_nB * dt_seq[..., None]
+            sum_px = torch.einsum("bshpn,bshp->bshn", _gdin, x_f)
+            ref_dB_diag = sum_px * dt_seq[..., None]
+            ref_ddt_diag = torch.einsum("bshpn,bshp,bshn->bsh", _gdin, x_f, B_h)
+            ref_dx_full = _gdx + ref_dx_diag   # D-skip (B2) + dinp_diag dx half (mono)
+
+            eqm = {
+                "dC": float((_mdC - _gdC).abs().max()),
+                "dx(full)": float((_mdx - ref_dx_full).abs().max()),
+                "dz": float((_mdz - _gdz).abs().max()),
+                "dchunk": float((_mdck - _gdck).abs().max()),
+                "dinp": float((_mdin - _gdin).abs().max()),
+                "dA_y": float((_mdAy - _gdAy).abs().max()),
+                "dD": float((_mdD - _gdD).abs().max()),
+                "dB_diag": float((_mdBd - ref_dB_diag).abs().max()),
+                "ddt_diag": float((_mddt - ref_ddt_diag).abs().max()),
+            }
+            # mono vs (B2 + the dinp_diag fold done separately): the mono should be
+            # the SAME compute; speedup = (B2 + the eliminated dinp_diag round-trip).
+            speedup_m = _tb2 / _tm if _tm > 0 else float("nan")
+            verdict_m = "GO" if _tm < _tb2 else "NO-GO"
+            mono_row.update({"mono_ms": _tm, "b2gemm_ms": _tb2,
+                             "speedup_vs_b2gemm": speedup_m, "verdict": verdict_m,
+                             "vs_ref_max_abs": eqm})
+            result["bwd_mono_ab"] = mono_row
+            print(f"[MONO-AB] MEASURED mono={_tm:.3f}ms  b2gemm={_tb2:.3f}ms  "
+                  f"speedup={speedup_m:.3f}x  {verdict_m}  "
+                  f"vs_ref_max_abs={ {k: f'{v:.2e}' for k, v in eqm.items()} }")
+
     # ============================ B1 ============================
     try:
         k_b1 = build_inter_chunk_recur_bwd_metal(b, S, chunk, G, H, P, N, target="cuda")
@@ -745,6 +873,15 @@ def main():
     # B2: set CPPMEGA_PATH_C_B2_GEMM=1 to run the chained 8-grad gate THROUGH the
     # GEMM prim (its dA_cumsum_y shape == v1, so no probe-chain change needed).
     b2_gemm_ab = "--b2-gemm-ab" in sys.argv
+    # --bwd-mono-ab: in ONE gb10 process build+time BOTH the §27 four-GEMM B2 prim and
+    # the NEW MONO-FUSED prim (build_bwd_mono = B2 GEMM body + the dinp_diag-half of B0
+    # fused in one kernel, dinp_diag tile RESIDENT, no inter-kernel sync). At PROD dims
+    # the resident dinp_diag tile (L*P*N*4 = 1 MB) exceeds the gb10 ~99 KB budget, so
+    # the mono BUILD RAISES — reported as the MEASURED structural NO-GO. At in-budget
+    # (small L*P*N, --nano cfg) it builds, runs, times vs B2, and checks mono outputs
+    # vs B2 + the separately-computed dinp_diag-B0 half. RULE #1: a mono SLOWER than
+    # the multi-kernel path is NO-GO, never silently used; build/run errors propagate.
+    bwd_mono_ab = "--bwd-mono-ab" in sys.argv
     # TRACK 1 (4x batch): --bs4 flips the prod cfg's micro-batch axis 1 -> 4. The
     # B0/B1/B2 builders + grids already consume ``batch`` (grid total scales by
     # batch); this is a pure cfg change, no kernel edit. RULE #1: --bs4 requires
@@ -763,7 +900,16 @@ def main():
         print("NO CUDA DEVICE")
         sys.exit(2)
 
-    if prod:
+    # --nano: an IN-BUDGET mono cfg (L=16,P=32,N=32 -> resident dinp_diag tile
+    # 16*32*32*4 = 65 KB; total mono smem ~79 KB < gb10 ~99 KB) so the mono kernel
+    # actually BUILDS+RUNS+is MEASURED (the prod L=P=N=64 cfg can only report the
+    # budget RAISE). RULE #1: --nano is an honest in-budget measurement point, NOT a
+    # prod claim — the prod mono is SMEM-NO-GO, surfaced separately.
+    nano = "--nano" in sys.argv
+    if nano:
+        cfgs = [dict(batch=1, seqlen=128, chunk=16, ngroups=1, nheads=2,
+                     headdim=32, dstate=32)]
+    elif prod:
         cfgs = [dict(batch=batch, seqlen=4096, chunk=64, ngroups=8, nheads=112,
                      headdim=64, dstate=64)]
     else:
@@ -776,7 +922,8 @@ def main():
     for cfg in cfgs:
         try:
             cfg_ok, res = probe_backward(**cfg, use_dhlast=use_dhlast,
-                                         b2_v2_ab=b2_v2_ab, b2_gemm_ab=b2_gemm_ab)
+                                         b2_v2_ab=b2_v2_ab, b2_gemm_ab=b2_gemm_ab,
+                                         bwd_mono_ab=bwd_mono_ab)
         except Exception as exc:  # RULE #1: surface WHERE+WHAT, fail loud.
             print("[BWD] PROBE RAISED (RULE #1 fail-loud):")
             traceback.print_exc()

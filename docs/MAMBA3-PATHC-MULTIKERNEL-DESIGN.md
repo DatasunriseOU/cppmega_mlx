@@ -380,3 +380,66 @@ gate keyed on shape feasibility (`_mamba3_chunked_forward_scan_feasibility`,
 `path_c_fusion_schedules.py:6300`). There is NO silent fallback: if a selected chunked dispatch
 fails parity or feasibility, it RAISES with where+what; the serial path is only ever chosen up
 front for explicitly-classified non-tile shapes, never as a degraded catch.
+
+## 9. Mono-fused backward port (the cppmega mono-chunk port) — flag-gated, gb10-only
+
+**Status: BUILT + Metal-compile-verified on Apple (Mac); CUDA build+measure is the GB10 phase.**
+
+The cppmega Mamba3 backward mono-chunk kernel
+(`cppmega/megatron/cuda_ext/mamba3_mono_chunk_skeleton.cu`) is ONE kernel, grid
+`(nchunks, head, batch)`, that keeps the chunk state resident in shared, runs ONE large WMMA
+GEMM (`LKQ = K@Q^T`) and REUSES that tile from shared BEFORE any global write, with the
+masked/3-index terms scalar-threaded in the same kernel. The path_c port of that structure is
+`bwd_mono_cuda_prim` / `build_bwd_mono` in `mamba3_chunked_backward_core.py`
+(`MAMBA3_BWD_MONO_OP_NAME = "mamba3_bwd_mono"`).
+
+**What fuses (the honest maximum):** ONE CTA per `(chunk,head)` runs the FULL §27 four-GEMM B2
+body (`DYX = dY@x^T`, `dC_off = dY@prev_states`, `dC_diag = M@B`,
+`dchunk_states = (decay·dY)^T@C` as `T.gemm`, the `chunk_scan_combine_bwd_cuda_prim_gemm` body
+verbatim) AND the dinp_diag-dependent HALF of B0 (`dx_diag = dt·sum_n dinp_diag·B`,
+`dB_diag = dt·sum_p dinp_diag·x`, `ddt_diag = sum_{p,n} dinp_diag·x·B`) by keeping the
+per-position `dinp_diag[l,p,n]` RESIDENT in a shared `DINP[L,P·N]` tile and consuming it before
+any global re-read (the cppmega "reuse before any global write" move). This eliminates the
+largest B2→B0 handoff buffer's round-trip (`dinp_diag` is fp32 `(b,S,H,P,N)`).
+
+**What CANNOT fuse (stated up front, RULE #1):** B1 (`inter_chunk_recur_bwd`) carries a reverse
+adjoint ACROSS chunks → a per-`(chunk,head)` CTA cannot express it without cooperative-grid sync;
+it STAYS a separate kernel (2.41 ms, cheap). B0's dstates-COUPLED half needs `dstates` (the OUTPUT
+of B1) → it STAYS in the post-B1 B0 kernel. The mono-mode caller feeds that B0 a ZEROED
+`dinp_diag` (mono owns the dinp_diag→dx/dB/ddt contribution; B0 adds only the `_states` half — the
+math is LINEAR in `dinp`, so the split is exact). So the maximal honest fusion is **B2 +
+dinp_diag-B0** in one kernel; B1 + the dstates-coupled B0 remainder stay separate.
+
+**SMEM WALL (MEASURED structural NO-GO at prod):** the resident `DINP[L,P·N]` fp32 tile is
+`L·P·N·4`. At prod `L=P=N=64` that is **1,048,576 B**, and the total mono smem
+(§27 GEMM 88.5 KB + DINP 1.0 MB) is **1.139 MB ≫ the gb10 ~99 KB budget**. `build_bwd_mono(cuda)`
+RAISES with where+what at prod dims (RULE #1, no silent over-budget launch / no fallback). The
+resident-dinp_diag mono fusion ONLY fits at small `L·P·N` (envelope: `L=16,P=32,N=32` = 79 KB FIT;
+`L=16,P=16,N=16` = 22 KB; the `--nano` probe cfg exercises it). This is exactly the §27 prediction
+that a per-CTA resident dinp tile is ~64× the GEMM operands. **Metal: `build_bwd_mono(metal)`
+RAISES unconditionally** — the §27 4-GEMM fragment-staging layout alone needs 72.5 KB (the Metal
+B2-GEMM gate already raises at 32 KB), and the resident DINP tile only worsens it → mono is
+gb10-only; the serial 6-kernel Metal chain stays the Apple path.
+
+**PREDICTED OUTCOME (NO-GO for throughput, three prior measurements of this kernel class):**
+(1) §27 measured the four-GEMM B2 prim (which mono reuses verbatim) at **0.749×** vs v1 (1371.5 vs
+1027.5 ms, same gb10 box) — single-64-tile m16n8k16 GEMMs' staging+sync exceed the serial
+reductions; fusing B0's dinp_diag work does not shrink them. (2) cppmega's identical mono-chunk
+WMMA kernel closed at **11.155 ms vs TileLang 3.707 ms = 3.0× SLOWER**
+(`mamba3_mono_cuda_chunk_wave10_final`: "Do not merge any monolithic CUDA chunk implementation as
+a production path"). (3) §18 measured the B2 kernels occupancy-SATURATED at bs1 (v2 dstate-split
+0.997×), so removing the dinp_diag round-trip + one launch saves latency, not compute.
+
+**Flag + measure plan (GB10 phase):** `build_bwd_mono` is invoked only by the probe A/B
+(`scratch/probe_chunked_backward_cuda_gb10.py --bwd-mono-ab`); the §17 447.8 ms 6-kernel chain is
+byte-identical when the mono path is not invoked (no caller wiring change — the mono builder is a
+NEW additive entry point, the 6 builders/grids/op-names are untouched). GB10 mutex + free>105 GB +
+SIGTERM-never-9 per CLAUDE.md, then:
+`--bwd-mono-ab` alone (prod cfg) reports the **SMEM-NO-GO build RAISE** (the structural wall);
+`--bwd-mono-ab --nano` (in-budget `L=16,P=32,N=32`) BUILDS+RUNS+MEASURES the mono kernel vs the §27
+B2 GEMM + the separately-computed dinp_diag-B0 half, printing `mono_ms / b2gemm_ms / speedup /
+verdict` and the per-grad `vs_ref_max_abs` (mono outputs must equal §27 B2 + the dinp_diag fold).
+A mono SLOWER than the multi-kernel path is reported NO-GO, never silently used. The Mac side
+verified: prim constructs at prod dims, all gates (MMA-divisibility, gb10 budget, Apple budget)
+RAISE correctly, and the body lowers to a Metal `JITKernel` (race-free) at the 32 KB-fit config —
+the dinp_diag-B0 fold algebra matches the B0 prim's `ddt_inp = sum_{p,n} dinp·x·B` exactly.
