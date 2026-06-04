@@ -205,6 +205,56 @@ int cppmega_mxfp8_sf_sizes(int M, int N, int K,
   return 0;
 }
 
+// Return the byte offset, inside the swizzled SFA (which==0) or SFB (which==1)
+// scale-factor atom buffer, at which CUTLASS reads the logical scale for row
+// `row` (m for SFA, n for SFB) and K-block `kb` (the kb-th 32-element block, so
+// element-K coordinate kb*32). This lets the Python driver CROSS-CHECK its
+// closed-form swizzle index against CUTLASS's actual Sm1xxBlkScaledConfig
+// tile_atom_to_shape_SF layout on the first call (RULE #1: a future CUTLASS
+// swizzle change is caught loud instead of silently mis-packing).
+//
+// Returns 0 on success and writes *offset; nonzero on bad shape / out-of-range
+// coord (RULE #1: no silent clamp).
+int cppmega_mxfp8_sf_offset(int which, int M, int N, int K,
+                            int row, int kb, int64_t* offset) {
+  if (offset == nullptr) {
+    std::snprintf(g_last_error, sizeof(g_last_error),
+                  "[sf_offset] null offset out-pointer");
+    return 1;
+  }
+  if (M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 || N < 32) {
+    std::snprintf(g_last_error, sizeof(g_last_error),
+                  "[sf_offset] bad shape M=%d N=%d K=%d (need K%%32==0, N>=32)",
+                  M, N, K);
+    return 2;
+  }
+  int rows = (which == 0) ? M : N;
+  int nblk = K / 32;
+  if (which != 0 && which != 1) {
+    std::snprintf(g_last_error, sizeof(g_last_error),
+                  "[sf_offset] which=%d must be 0 (SFA) or 1 (SFB)", which);
+    return 3;
+  }
+  if (row < 0 || row >= rows || kb < 0 || kb >= nblk) {
+    std::snprintf(g_last_error, sizeof(g_last_error),
+                  "[sf_offset] coord out of range row=%d (rows=%d) kb=%d (nblk=%d)",
+                  row, rows, kb, nblk);
+    return 4;
+  }
+  auto problem = cute::make_shape(M, N, K, 1);
+  // The SF layout maps logical (row, element-K, L) -> linear scale index. The
+  // element-K coordinate of the kb-th 32-block is kb*32; the atom's stride-0
+  // inner mode collapses the 32 elements of the block to one scale byte.
+  if (which == 0) {
+    auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem);
+    *offset = static_cast<int64_t>(layout_sfa(cute::make_coord(row, kb * 32, 0)));
+  } else {
+    auto layout_sfb = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem);
+    *offset = static_cast<int64_t>(layout_sfb(cute::make_coord(row, kb * 32, 0)));
+  }
+  return 0;
+}
+
 // Native MXFP8 x MXFP8 GEMM: D(M,N) = A(M,K) @ B(N,K)^T, both e4m3 with E8M0
 // (ue8m0) block-32 scales. TN layout (A row-major, B col-major). All pointers
 // are raw CUdeviceptr (device memory). C may be NULL (alpha*A@B + 0).

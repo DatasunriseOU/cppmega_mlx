@@ -173,6 +173,21 @@ def _load_lib(so_path: str) -> Any:
         ctypes.c_float,   # beta
         ctypes.c_void_p,  # stream
     ]
+
+    # Optional swizzle cross-check export (present only in .so rebuilt with the
+    # cppmega_mxfp8_sf_offset helper). Annotate it only if it exists so an older
+    # .so still loads; the absence is handled gracefully in the cross-check call.
+    if hasattr(lib, "cppmega_mxfp8_sf_offset"):
+        lib.cppmega_mxfp8_sf_offset.restype = ctypes.c_int
+        lib.cppmega_mxfp8_sf_offset.argtypes = [
+            ctypes.c_int,   # which (0=SFA, 1=SFB)
+            ctypes.c_int,   # M
+            ctypes.c_int,   # N
+            ctypes.c_int,   # K
+            ctypes.c_int,   # row
+            ctypes.c_int,   # kb
+            ctypes.POINTER(ctypes.c_int64),  # offset out
+        ]
     return lib
 
 
@@ -327,6 +342,133 @@ def quantize_to_e4m3_blocked(x: "Any", e8m0_scales: "Any") -> "Any":
     q = xf / scale
     q = torch.clamp(q, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
     return q.reshape(rows, K).to(fp8_dtype).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# CUTLASS Sm1xxBlkScaledConfig SFA/SFB swizzled-atom scatter index
+# ---------------------------------------------------------------------------
+#
+# CUTLASS does NOT read the (rows, nblk) ue8m0 byte stream contiguously. The
+# scale-factor tensor uses the interleaved ("swizzled") atom layout
+#   Sm1xxBlockScaledConfig<32>::SfAtom
+#     = Layout< Shape<Shape<_32,_4>, Shape<_32,_4>>,
+#               Stride<Stride<_16,_4>, Stride<_0,_1>> >
+#     = ((_32,_4),(_32,_4)):((_16,_4),(_0,_1))
+# tiled row-major over (m_atom, k_atom) by tile_to_shape(SfAtom, (M,K), Step<_2,_1>)
+# (and (N,K) for SFB). Mode-0 is the M/N (row) dim, mode-1 is the K dim where the
+# inner _32 has stride 0 (collapses 32 contiguous elements to one scale) and the
+# outer _4 (Blk_SF) is stride 1. One atom = 128-row x 4-block tile = 512 bytes.
+# M is implicitly padded to a multiple of 128 and nblk=K/32 to a multiple of 4;
+# cosize = ceil(M/128)*ceil(nblk/4)*512 (exactly what cppmega_mxfp8_sf_sizes
+# returns). The EXACT closed-form byte offset of the logical scale for row r
+# (r=m for SFA, r=n for SFB) and K-block kb in [0, nblk) is (machine-verified
+# 0-mismatch vs CUTLASS over 6 shapes incl. M=130 and nblk=5 edge cases):
+#
+#   n_katom = ceil(nblk / 4)
+#   within  = (r % 32)*16 + ((r // 32) % 4)*4 + (kb % 4)
+#   tile    = (r // 128)*n_katom + (kb // 4)
+#   offset  = within + tile*512
+#
+# So 32 consecutive rows occupy stride-16 lanes; the next group of 4 rows is
+# stride-4 interleaved INTO those lanes (4 scales of 4 different rows packed into
+# one 32-bit word — the TMEM-word swizzle); within a row 4 consecutive K-blocks
+# are stride-1 contiguous before jumping a full 512-byte atom.
+#
+# This is the SM100 config reused for SM120/SM121. A future CUTLASS that pins a
+# distinct sm120 swizzle would make this formula wrong; the optional C-side
+# cppmega_mxfp8_sf_offset cross-check (when present in the .so) catches that
+# loud (RULE #1) instead of silently mis-packing.
+
+
+def _sf_scatter_index(rows: int, nblk: int, device: "Any") -> "Any":
+    """Per-row/per-block byte offset into the CUTLASS swizzled SFA/SFB atom buffer.
+
+    Returns a ``(rows * nblk,)`` int64 tensor; entry ``[r*nblk + kb]`` is the byte
+    offset in the zero-filled atom buffer at which the ue8m0 scale of row ``r``,
+    K-block ``kb`` must be scattered. The (r, kb) ordering matches the row-major
+    ``(rows, nblk)`` stream produced by :func:`build_e8m0_block_scales` after
+    ``.reshape(-1)``, so a plain ``scatter_`` with this index repacks correctly.
+    """
+
+    import torch
+
+    n_katom = -(-nblk // 4)  # ceil(nblk / 4)
+    r = torch.arange(rows, device=device, dtype=torch.int64).view(rows, 1)
+    kb = torch.arange(nblk, device=device, dtype=torch.int64).view(1, nblk)
+    within = (r % 32) * 16 + ((r // 32) % 4) * 4 + (kb % 4)
+    tile = (r // 128) * n_katom + (kb // 4)
+    return (within + tile * 512).reshape(-1)
+
+
+def _py_sf_offset(rows: int, nblk: int, row: int, kb: int) -> int:
+    """Scalar closed-form byte offset (CPU, no torch) — mirrors _sf_scatter_index.
+
+    Used only by the C-side cross-check below so the verification itself needs no
+    GPU tensor allocation.
+    """
+
+    n_katom = -(-nblk // 4)
+    within = (row % 32) * 16 + ((row // 32) % 4) * 4 + (kb % 4)
+    tile = (row // 128) * n_katom + (kb // 4)
+    return within + tile * 512
+
+
+@lru_cache(maxsize=64)
+def _verify_swizzle_against_kernel(
+    so_path: str, M: int, N: int, K: int
+) -> bool:
+    """Cross-check the python swizzle index vs CUTLASS's actual SF layout.
+
+    On the FIRST drive of a given (so_path, M, N, K) this asks the kernel (if the
+    optional ``cppmega_mxfp8_sf_offset`` export is present) for the byte offset of
+    a handful of (row, kb) coords on both SFA and SFB and RAISES (RULE #1) if any
+    disagree with :func:`_py_sf_offset`. Cached so it costs nothing after the
+    first call. If the .so predates the export, returns ``False`` (no silent pass:
+    the python cosize-vs-kernel size assert in mxfp8_gemm_from_hp is the second,
+    independent guard, and the parity gate is the third).
+    """
+
+    lib = _load_lib(so_path)
+    if not hasattr(lib, "cppmega_mxfp8_sf_offset"):
+        return False
+
+    nblk = K // MXFP8_BLOCK
+    # A small spread of coords incl. the swizzle edges (row 0/31/32/127/128,
+    # kb 0/3/4 and the last row/block) on both SFA (rows=M) and SFB (rows=N).
+    def _row_probes(rows: int) -> list[int]:
+        cand = {0, 1, 31, 32, 33, 63, 64, 127, 128, 129, rows - 1}
+        return sorted(c for c in cand if 0 <= c < rows)
+
+    def _kb_probes() -> list[int]:
+        cand = {0, 1, 3, 4, 5, 7, 8, nblk - 1}
+        return sorted(c for c in cand if 0 <= c < nblk)
+
+    for which, rows in ((0, M), (1, N)):
+        for row in _row_probes(rows):
+            for kb in _kb_probes():
+                got = ctypes.c_int64(-1)
+                rc = lib.cppmega_mxfp8_sf_offset(
+                    ctypes.c_int(which), ctypes.c_int(M), ctypes.c_int(N),
+                    ctypes.c_int(K), ctypes.c_int(row), ctypes.c_int(kb),
+                    ctypes.byref(got),
+                )
+                if rc != 0:
+                    raise RuntimeError(
+                        f"cutlass_mxfp8_sm120: cppmega_mxfp8_sf_offset failed "
+                        f"(rc={rc}, which={which} row={row} kb={kb} "
+                        f"M={M} N={N} K={K}): {_last_error(lib)}"
+                    )
+                expect = _py_sf_offset(rows, nblk, row, kb)
+                if int(got.value) != expect:
+                    raise ValueError(
+                        f"cutlass_mxfp8_sm120: SF swizzle MISMATCH vs CUTLASS "
+                        f"Sm1xxBlkScaledConfig (which={'SFA' if which == 0 else 'SFB'} "
+                        f"row={row} kb={kb} M={M} N={N} K={K}): python offset "
+                        f"{expect} != kernel offset {int(got.value)}. The atom "
+                        f"layout changed; the host SF repack would mis-place every "
+                        f"scale (RULE #1, refuse to run with a stale swizzle)."
+                    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -486,25 +628,57 @@ def mxfp8_gemm_from_hp(
     a_q = quantize_to_e4m3_blocked(A_hp, sfa)
     b_q = quantize_to_e4m3_blocked(B_hp, sfb)
 
-    # Lay the per-block scale bytes into the CUTLASS SFA/SFB atom buffers. The
-    # kernel reports the exact buffer sizes; we copy the row-major (rows, nblk)
-    # bytes into the leading region. The atom permutation is applied device-side
-    # by CUTLASS from LayoutSFA/SFB — the contiguous ue8m0 byte stream is the
-    # producer contract documented in build_e8m0_block_scales.
+    # Lay the per-block scale bytes into the CUTLASS SFA/SFB atom buffers. CUTLASS
+    # reads the scale-factor tensor through the INTERLEAVED ("swizzled") atom
+    # layout Sm1xxBlkScaledConfig<32>::tile_atom_to_shape_SFA/SFB — NOT as a
+    # contiguous (rows, nblk) byte stream. A contiguous copy lands every scale on
+    # the wrong block (rel_err ~0.41). We instead SCATTER each ue8m0 byte to its
+    # swizzled offset (see _sf_scatter_index for the machine-verified closed form).
+    nblk = K // MXFP8_BLOCK
     exp_sfa, exp_sfb = sf_sizes(M, N, K, so_path=so_path)
+
+    # Independent sanity check: the python cosize formula (used to bound the
+    # scatter) must equal what the kernel reports, else the swizzle assumption is
+    # stale (RULE #1, fail loud — do not scatter into a buffer of wrong size).
+    n_katom = -(-nblk // 4)  # ceil(nblk / 4)
+    py_cosize_a = -(-M // 128) * n_katom * 512
+    py_cosize_b = -(-N // 128) * n_katom * 512
+    if py_cosize_a != exp_sfa or py_cosize_b != exp_sfb:
+        raise ValueError(
+            f"mxfp8_gemm_from_hp: python SF cosize "
+            f"(SFA={py_cosize_a}, SFB={py_cosize_b}) disagrees with the kernel's "
+            f"cppmega_mxfp8_sf_sizes (SFA={exp_sfa}, SFB={exp_sfb}); the CUTLASS "
+            f"Sm1xxBlkScaledConfig atom layout changed — the swizzle index is "
+            f"stale and would mis-pack (RULE #1, refuse to scatter)."
+        )
+
+    # Stronger guard (RULE #1, only when the .so exports the helper): cross-check
+    # the python closed-form swizzle offset against CUTLASS's actual SF layout for
+    # a spread of (row, kb) coords. RAISES on any mismatch; cached per shape so it
+    # costs nothing after the first drive. A .so predating the export returns
+    # False here and relies on the cosize check above + the parity gate.
+    path = so_path or os.environ.get("CPPMEGA_CUTLASS_MXFP8_SO") or _DEFAULT_SO
+    _verify_swizzle_against_kernel(path, M, N, K)
+
     sfa_buf = torch.zeros(exp_sfa, dtype=torch.uint8, device=A_hp.device)
     sfb_buf = torch.zeros(exp_sfb, dtype=torch.uint8, device=B_hp.device)
-    sfa_flat = sfa.reshape(-1)
-    sfb_flat = sfb.reshape(-1)
-    if sfa_flat.numel() > exp_sfa or sfb_flat.numel() > exp_sfb:
+
+    idx_a = _sf_scatter_index(M, nblk, A_hp.device)  # sfa is (M, nblk)
+    idx_b = _sf_scatter_index(N, nblk, B_hp.device)  # sfb is (N, nblk)
+    # Atom-layout bounds check: every scatter target must land inside the buffer.
+    if int(idx_a.max()) >= exp_sfa or int(idx_b.max()) >= exp_sfb:
         raise ValueError(
-            f"mxfp8_gemm_from_hp: produced scale stream larger than the CUTLASS "
-            f"atom buffer (SFA {sfa_flat.numel()}>{exp_sfa} or SFB "
-            f"{sfb_flat.numel()}>{exp_sfb}); atom-layout mismatch (RULE #1, do not "
-            f"truncate)."
+            f"mxfp8_gemm_from_hp: swizzled SF index out of bounds "
+            f"(SFA max={int(idx_a.max())} vs {exp_sfa}, "
+            f"SFB max={int(idx_b.max())} vs {exp_sfb}); atom-layout mismatch "
+            f"(RULE #1, do not scatter past the buffer)."
         )
-    sfa_buf[: sfa_flat.numel()] = sfa_flat
-    sfb_buf[: sfb_flat.numel()] = sfb_flat
+
+    # scatter_ requires int64 index, same numel as src; both buffers uint8. The
+    # zero-fill correctly handles the M->128 / nblk->4 padding lanes (CUTLASS
+    # reads those scales but they multiply padded/zero data and contribute nothing).
+    sfa_buf.scatter_(0, idx_a, sfa.reshape(-1))
+    sfb_buf.scatter_(0, idx_b, sfb.reshape(-1))
 
     if out is None:
         out = torch.empty((M, N), dtype=torch.bfloat16, device=A_hp.device)
