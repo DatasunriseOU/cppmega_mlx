@@ -42,6 +42,7 @@ __all__ = [
     "MAMBA3_CHUNK_PRECOMPUTE_OP_NAME",
     "MAMBA3_INTER_CHUNK_RECUR_OP_NAME",
     "chunk_precompute_fwd_metal_prim",
+    "chunk_precompute_fwd_cuda_prim",
     "inter_chunk_recur_fwd_metal_prim",
     "chunk_precompute_fwd_grid",
     "inter_chunk_recur_fwd_grid",
@@ -213,6 +214,204 @@ def chunk_precompute_fwd_metal_prim(
     return main
 
 
+def chunk_precompute_fwd_cuda_prim(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    threads: int = 128,
+) -> Any:
+    """CUDA / sm_121 twin of :func:`chunk_precompute_fwd_metal_prim` (gb10).
+
+    IDENTICAL F0 math; the two head-independent serial scalar loops of the Metal
+    prim are re-expressed as TENSOR-CORE ``T.gemm`` (the §22/§23 measured lever —
+    the Metal prim's ``cb`` per-``(li,si)`` dot over ``dstate`` and its
+    ``summary_states`` ``P*N=4096``-cell serial-``l`` accumulate were the 24.57 ms
+    F0 term). ``dA_cumsum`` STAYS a single-lane serial inclusive scan (it is a
+    scan, NOT a GEMM) and is copied verbatim from the Metal prim.
+
+    The two GEMMs, both per the proven sibling CUDA SSD precedent
+    (:func:`mamba3_chunked_scan_core.chunk_scan_fwd_cuda_prim`): register-fragment
+    fp32 C accumulators (:func:`T.alloc_fragment`), plain ``scope="shared"`` fp16
+    operands (NO ``make_swizzled_layout``), and ``disable_tma=True`` on every
+    global<->shared copy (sm_121 TMA tensormap mis-aligns at these 64-tile dims ->
+    "Invalid TMA descriptor arguments" at RUN). The compile site
+    (:func:`build_chunk_precompute_metal`) selects this prim when the resolved
+    target is CUDA and passes the matching
+    ``{tl.disable_tma_lower, tl.disable_warp_specialized}`` pass_configs.
+
+      (1) cb[L,L] = C[L,N] @ B[L,N]^T  (per (chunk, group); written once per group
+          via the ``head_idx % heads_per_group == 0`` guard, exactly as the Metal
+          prim, since cb is head-independent within a group):
+            T.gemm(C_shared[L,N], B_shared[L,N], cb_frag[L,L], transpose_B=True)
+          -> cb_frag[li,si] = sum_n C[li,n]*B[si,n]   (Tri-Dao _bmm_chunk_fwd).
+
+      (2) summary_states[P,N] = (decay*dt-weighted x)^T @ B  (per (chunk, head),
+          the DOMINANT term). The per-row decay*dt is folded into the x OPERAND
+          (exactly Tri-Dao _chunk_state_fwd folds ``scale`` into its operand; this
+          keeps the fp32 output exact and B in native fp16 as the serial reads it):
+            x_dec[l,p] = exp2((dacs[L-1]-dacs[l])*p) * dt[l] * x[l,p]
+            T.gemm(x_dec_shared[L,P], B_shared[L,N], states_frag[P,N], transpose_A=True)
+          -> states_frag[p,n] = sum_l x_dec[l,p]*B[l,n].
+
+    DTYPE CONTRACT (unchanged, §23 F1/F2): operands fp16, fragment accumulate
+    fp32, ``cb`` stored fp16, ``summary_states`` stored fp32 (= accum_dtype; F1
+    reads it fp32 — NO fp16 downcast on the store, the §23 N=64 segfault class).
+
+    DECAY/SIGN: ``A = -softplus(...) <= 0`` so ``a_row <= 0`` and
+    ``dacs[L-1]-dacs[l] <= 0``; the decay uses ``exp2((dacs[L-1]-dacs[l])*p)`` with
+    NO ``minimum(...,0.0)`` clamp (a no-op for this sign convention; the serial
+    prim omits it, so adding it would diverge from the parity reference).
+
+    SMEM at prod ``L=P=N=64`` (fp16 = 2B, fp32 = 4B): a_row[L]+dacs[L] fp32 0.5 KB
+    + C_shared[L,N] 8 KB + B_shared[L,N] 8 KB + cb_store[L,L] fp16 8 KB +
+    x_dec_shared[L,P] 8 KB + states_store[P,N] fp32 16 KB = 48.5 KB combined
+    (cb_frag/states_frag live in REGISTERS), << the gb10 ~99 KB budget. See the
+    compile-site assertion in :func:`build_chunk_precompute_metal`.
+
+    RULE #1: this is the ONE CUDA path when selected; a tile/MMA-divisibility/
+    compile failure RAISES with where+what — it NEVER falls back to a serial loop.
+    """
+    import tilelang  # noqa: F401  (parity with the sibling cuda prim import block)
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_precompute_fwd_cuda_prim: seqlen ({seqlen}) must be "
+            f"divisible by chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_precompute_fwd_cuda_prim: nheads ({nheads}) must be "
+            f"divisible by ngroups ({ngroups})"
+        )
+    # m16n8k16 fp16 MMA divisibility for both GEMMs: cb is M=L,N=L,K=dstate;
+    # states is M=headdim,N=dstate,K=chunk_size. RAISE (no silent pad, RULE #1).
+    for axis_name, axis_val in (
+        ("chunk_size(L)", chunk_size),
+        ("dstate(N/K)", dstate),
+        ("headdim(P)", headdim),
+    ):
+        if axis_val % 16 != 0:
+            raise ValueError(
+                f"chunk_precompute_fwd_cuda_prim: {axis_name}={axis_val} is not a "
+                f"multiple of 16; the fp16 m16n8k16 tensor-core MMA requires "
+                f"K%16==0 and M%16==0/N%8==0 for the cb/summary_states GEMMs. No "
+                f"silent padding (RULE #1) — re-tile or pad the caller buffers."
+            )
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    heads_per_group = nheads // ngroups
+    L = chunk_size
+    p = _LOG2E
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        A: T.Tensor((nheads), dtype),  # type: ignore
+        dt: T.Tensor((batch, seqlen, nheads), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        summary_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nheads, threads=threads) as (bx, by):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            head_idx = by
+            group_idx = head_idx // heads_per_group
+            base = chunk_idx * chunk_size
+
+            a_row = T.alloc_shared((L,), accum_dtype)
+            dacs = T.alloc_shared((L,), accum_dtype)
+            # GEMM operands/outputs: plain scope="shared", fp16; register-fragment
+            # fp32 C accumulators (the CUDA T.gemm asserts C is a fragment).
+            C_shared = T.alloc_shared((L, dstate), dtype, scope="shared")
+            B_shared = T.alloc_shared((L, dstate), dtype, scope="shared")
+            cb_frag = T.alloc_fragment((L, L), accum_dtype)
+            cb_store = T.alloc_shared((L, L), dtype, scope="shared")
+            x_dec_shared = T.alloc_shared((L, headdim), dtype, scope="shared")
+            states_frag = T.alloc_fragment((headdim, dstate), accum_dtype)
+            states_store = T.alloc_shared((headdim, dstate), accum_dtype, scope="shared")
+
+            # --- dA_cumsum: a[l] = A[h]*dt[l]; inclusive cumsum over l. ---
+            # (STAYS a scan — copied verbatim from the Metal prim; NOT a GEMM.)
+            for l in T.Parallel(L):
+                a_row[l] = T.Cast(accum_dtype, A[head_idx]) * T.Cast(
+                    accum_dtype, dt[batch_idx, base + l, head_idx]
+                )
+            T.sync_threads()
+            if T.get_thread_binding(0) == 0:
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                for l in T.serial(L):
+                    acc[0] = acc[0] + a_row[l]
+                    dacs[l] = acc[0]
+            T.sync_threads()
+            for l in T.Parallel(L):
+                dA_cumsum[batch_idx, head_idx, chunk_idx, l] = T.Cast(dtype, dacs[l])
+
+            # --- (1) cb = C @ B^T per (group, chunk): T.gemm, write once/group. ---
+            if head_idx % heads_per_group == 0:
+                T.copy(
+                    C[batch_idx, base : base + L, group_idx, 0:dstate],
+                    C_shared,
+                    disable_tma=True,
+                )
+                T.copy(
+                    B[batch_idx, base : base + L, group_idx, 0:dstate],
+                    B_shared,
+                    disable_tma=True,
+                )
+                T.clear(cb_frag)
+                # cb_frag[li,si] = sum_n C[li,n]*B[si,n] = (C @ B^T)[li,si].
+                T.gemm(C_shared, B_shared, cb_frag, transpose_B=True)
+                T.copy(cb_frag, cb_store)
+                T.copy(
+                    cb_store,
+                    cb[batch_idx, chunk_idx, group_idx, 0:L, 0:L],
+                    disable_tma=True,
+                )
+            T.sync_threads()
+
+            # --- (2) summary_states[p,n] = sum_l (decay[l]*dt[l]*x[l,p]) * B[l,n] ---
+            # Fold per-row decay*dt into the x operand (Tri-Dao _chunk_state_fwd);
+            # decay[l] = exp(dA_cs[L-1]-dA_cs[l]) = exp2((dacs[L-1]-dacs[l])*p).
+            for lp in T.Parallel(L * headdim):
+                ll = lp // headdim
+                pp = lp % headdim
+                decay = T.exp2((dacs[L - 1] - dacs[ll]) * p)
+                dt_l = T.Cast(accum_dtype, dt[batch_idx, base + ll, head_idx])
+                x_l = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
+                x_dec_shared[ll, pp] = T.Cast(dtype, decay * dt_l * x_l)
+            # Re-stage B for the group (B_shared was last written for the cb GEMM
+            # only under the head-0 guard; every head needs it here).
+            T.copy(
+                B[batch_idx, base : base + L, group_idx, 0:dstate],
+                B_shared,
+                disable_tma=True,
+            )
+            T.clear(states_frag)
+            # states_frag[p,n] = sum_l x_dec[l,p]*B[l,n]; transpose_A contracts L.
+            T.gemm(x_dec_shared, B_shared, states_frag, transpose_A=True)
+            # Output stays fp32 (= accum_dtype); F1 reads it fp32. NO downcast.
+            T.copy(states_frag, states_store)
+            T.copy(
+                states_store,
+                summary_states[batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate],
+                disable_tma=True,
+            )
+
+    return main
+
+
 def build_chunk_precompute_metal(
     batch: int,
     seqlen: int,
@@ -232,6 +431,17 @@ def build_chunk_precompute_metal(
     params; pass PRE-ZEROED contiguous buffers positionally (no ``out_idx``
     allocation), and synchronize the device after. RULE #1: compile failures
     propagate.
+
+    F0 is the SECOND chunked stage (after F2) whose prim BODY differs by backend:
+    the Metal prim runs the two head-independent reductions (``cb`` dot,
+    ``summary_states`` accumulate) as serial scalar loops; the CUDA prim
+    (:func:`chunk_precompute_fwd_cuda_prim`) re-expresses them as tensor-core
+    ``T.gemm`` (register-fragment C, plain shared operands, ``disable_tma`` copies)
+    and compiles with the sm_121 ``{tl.disable_tma_lower, tl.disable_warp_specialized}``
+    escape hatch — the SAME per-target codegen choice
+    :func:`mamba3_chunked_scan_core.compile_chunk_scan_fwd_metal` makes for F2
+    (RULE #1: explicit per-target branch, NOT a silent fallback to the serial
+    loop). ``dA_cumsum`` stays a serial scan on both backends.
     """
     import tilelang
 
@@ -239,13 +449,54 @@ def build_chunk_precompute_metal(
         _resolve_chunked_compile_target,
     )
 
+    resolved_target = _resolve_chunked_compile_target(target)
+    kind = str(getattr(getattr(resolved_target, "kind", None), "name", "")).lower()
+    if "cuda" in kind:
+        # SMEM BUDGET GATE (gb10 ~99 KB per-threadgroup dynamic smem). The CUDA
+        # prim's shared allocs at the requested shapes (fp16=2B, fp32=4B):
+        #   a_row[L]+dacs[L] fp32 + C_shared[L,N]fp16 + B_shared[L,N]fp16 +
+        #   cb_store[L,L]fp16 + x_dec_shared[L,P]fp16 + states_store[P,N]fp32.
+        # RAISE (RULE #1) if it would exceed the budget — never silently re-tile.
+        smem_bytes = (
+            2 * chunk_size * 4                  # a_row + dacs (fp32)
+            + chunk_size * dstate * 2           # C_shared (fp16)
+            + chunk_size * dstate * 2           # B_shared (fp16)
+            + chunk_size * chunk_size * 2       # cb_store (fp16)
+            + chunk_size * headdim * 2          # x_dec_shared (fp16)
+            + headdim * dstate * 4              # states_store (fp32)
+        )
+        _GB10_SMEM_BUDGET = 99 * 1024
+        if smem_bytes >= _GB10_SMEM_BUDGET:
+            raise ValueError(
+                f"build_chunk_precompute_metal(cuda): per-threadgroup smem "
+                f"{smem_bytes} B (L={chunk_size},P={headdim},N={dstate}) >= the "
+                f"gb10 budget {_GB10_SMEM_BUDGET} B; re-tile the F0 cuda prim "
+                f"(RULE #1: no silent over-budget launch)."
+            )
+        prim = chunk_precompute_fwd_cuda_prim(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
+        )
+        # sm_121: disable TMA + warp-specialized lowering (the GEMM operand copies
+        # otherwise lower to a TMA tensormap that mis-aligns at these 64-tile dims
+        # -> "Invalid TMA descriptor arguments" at RUN). Same escape hatch as F2.
+        pass_configs = {
+            "tl.disable_tma_lower": True,
+            "tl.disable_warp_specialized": True,
+        }
+        return tilelang.compile(
+            prim,
+            out_idx=[5, 6, 7],
+            target=resolved_target,
+            pass_configs=pass_configs,
+        )
+
     prim = chunk_precompute_fwd_metal_prim(
         batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate, **kwargs
     )
     return tilelang.compile(
         prim,
         out_idx=[5, 6, 7],
-        target=_resolve_chunked_compile_target(target),
+        target=resolved_target,
     )
 
 
