@@ -64,10 +64,11 @@ assert not p_overlap.z3_proved, "NEG overlap_band spuriously z3_proved=True (VAC
 # A-address (gemm reads k*M+i where serial reads i*K+k). operand_maps_match
 # MUST be False (the rewrite would compute the wrong thing).
 src = grp.b2_batched_dchunk_contraction(z3, chunk_size=L, headdim=P, dstate=N)
-orig_a_gemm = src.a_addr_gemm
 M_, K_ = src.m_extent, src.k_extent
-def bugged_a_gemm(i, k):  # transposed flattened address (row<->col swap)
-    return k * M_ + i
+# Real dchunk a_addr_gemm = k*headdim+i (transpose_A). Inject the WRONG
+# (un-transposed) layout i*K+k, which differs whenever i != k -> bug.
+def bugged_a_gemm(i, k):
+    return i * K_ + k
 bad = grp.GemmContraction(
     name=src.name + "_transpose_bug",
     m_extent=src.m_extent, n_extent=src.n_extent, k_extent=src.k_extent,
