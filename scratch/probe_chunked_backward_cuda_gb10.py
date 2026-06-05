@@ -516,6 +516,61 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
               f"speedup={speedup_g:.3f}x  {verdict_g}  "
               f"vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eqg.items()} }")
 
+        # ----- BATCHED LARGE-TILE A/B (the P1/Tri-Dao recipe) ----------------
+        # Same process: build+time the NEW batched-large-tile B2 prim (HEADS_PER_CTA
+        # heads/CTA, tall-M GEMM amortizing ldmatrix/staging/sync over the head band)
+        # vs v1 AND vs the §27 single-64-tile gemm. This is the measure that isolates
+        # the tiling win (run at bs1) — the full recipe adds bs4 (4x CTAs) at the
+        # caller. HEADS_PER_CTA from CPPMEGA_PATH_C_B2_HEADS_PER_CTA (default 4).
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+            chunk_scan_combine_bwd_cuda_prim_gemm_batched,
+            _b2_batched_heads_per_cta,
+        )
+        import os as _os
+        _hpc = int(_os.environ.get("CPPMEGA_PATH_C_B2_HEADS_PER_CTA", "4"))
+        _hpc = _b2_batched_heads_per_cta(H, H // G, _hpc)
+        _pb = chunk_scan_combine_bwd_cuda_prim_gemm_batched(
+            b, S, chunk, G, H, P, N, heads_per_cta=_hpc
+        )
+        _kb = _tl.compile(_pb, out_idx=[11, 12, 13, 14, 15, 16, 17], target=_tgt,
+                          pass_configs=_pc)
+        _dCb = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+        _dxb = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dzb = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dckb = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+        _dinb = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+        _dAyb = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+        _dDb = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+        def _run_batched():
+            _dCb.zero_(); _dxb.zero_(); _dzb.zero_(); _dckb.zero_()
+            _dinb.zero_(); _dAyb.zero_(); _dDb.zero_()
+            _kb(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
+                th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
+                _dCb, _dxb, _dzb, _dckb, _dinb, _dAyb, _dDb)
+        _run_batched(); torch.cuda.synchronize()
+        _tb = _time(_run_batched)
+        eqb = {
+            "dC": float((_dCb - _dC1).abs().max()),
+            "dchunk": float((_dckb - _dck1).abs().max()),
+            "dinp": float((_dinb - _din1).abs().max()),
+            "dA_y": float((_dAyb - _dAy1).abs().max()),
+            "dD": float((_dDb - _dD1).abs().max()),
+        }
+        speedup_b = _t1g / _tb if _tb > 0 else float("nan")
+        speedup_vs_gemm = _tg / _tb if _tb > 0 else float("nan")
+        verdict_b = "GO" if _tb < _t1g else "NO-GO"
+        result["B2_gemm_batched_ab"] = {
+            "v1_ms": _t1g, "single_tile_gemm_ms": _tg, "batched_ms": _tb,
+            "heads_per_cta": _hpc, "speedup_vs_v1": speedup_b,
+            "speedup_vs_single_tile": speedup_vs_gemm, "verdict": verdict_b,
+            "vs_v1_max_abs": eqb,
+        }
+        print(f"[B2-BATCHED-AB] MEASURED v1={_t1g:.3f}ms  single_tile_gemm={_tg:.3f}ms  "
+              f"batched={_tb:.3f}ms  HEADS_PER_CTA={_hpc}  "
+              f"speedup_vs_v1={speedup_b:.3f}x  speedup_vs_single_tile={speedup_vs_gemm:.3f}x  "
+              f"{verdict_b}  vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eqb.items()} }")
+
     # ----- MONO-FUSED A/B (LABELLED MEASURED) — the cppmega mono-chunk PORT --------
     # In ONE gb10 process: build+time the §17-GO v1 B2 cuda prim (the 6-kernel chain's
     # B2) AND the NEW MONO-FUSED prim (build_bwd_mono = the §27 four-GEMM B2 body +

@@ -60,7 +60,9 @@ __all__ = [
     "chunk_scan_combine_bwd_cuda_prim",
     "chunk_scan_combine_bwd_cuda_prim_v2",
     "chunk_scan_combine_bwd_cuda_prim_gemm",
+    "chunk_scan_combine_bwd_cuda_prim_gemm_batched",
     "chunk_scan_combine_bwd_metal_gemm_prim",
+    "chunk_scan_combine_bwd_metal_gemm_prim_batched",
     "bwd_mono_cuda_prim",
     "bwd_mono_metal_prim",
     "inter_chunk_recur_bwd_metal_prim",
@@ -1741,6 +1743,58 @@ def chunk_scan_combine_bwd_metal_gemm_prim(
     return main
 
 
+def _require_batched_b2_gemm_proofs(
+    L: int, P: int, N: int, heads_per_cta: int, *, where: str, metal: bool = False
+) -> None:
+    """z3-gate the batched B2 GEMM rewrites (RULE #1 — RAISES if not proven).
+
+    Builds the GemmContraction/GemmTiling descriptors for the batched-large-tile B2
+    GEMMs and calls :func:`require_gemm_rewrite_proof`, which RAISES
+    :class:`GemmRewriteNotProven` on any sat counter-witness / unknown / disabled
+    solver. CUDA proves all three GEMM-able contractions (dchunk_states transpose_A
+    + decay-fold, dC_off dense, dC_diag lower-tri mask); Metal proves the two it
+    GEMM-ifies (DYX-equivalent dchunk_states + the head-band single-writer). The
+    per-head-band single-writer disjointness (m_blocks=HEADS_PER_CTA, the race-
+    freedom of the head-accumulation tiling) is checked by every tiling. The z3
+    solver can be disabled by the sibling TILELANG_DISABLE_Z3* knobs, in which case
+    the proof reports z3_proved=False and require_* RAISES (fail-closed, RULE #1).
+    """
+    from cppmega_mlx.nn._tilelang import _gemm_rewrite_proof as _grp
+
+    # A live z3 module is needed to build the index-map / scale callables. Preload
+    # libz3 the same way prove_gemm_rewrite does, then import. If z3 is unavailable
+    # the descriptors fall back to plain-int callables (the proof itself will report
+    # z3 unavailable and RAISE in require_*), so we build with the real z3 when we can.
+    _grp._msl_transform.ensure_libz3_preloaded()
+    try:
+        import z3 as _z3
+    except Exception:  # pragma: no cover - optional local dependency
+        _z3 = None  # require_gemm_rewrite_proof RAISES on the z3-unavailable proof.
+
+    dchunk = _grp.b2_batched_dchunk_contraction(
+        _z3, chunk_size=L, headdim=P, dstate=N
+    )
+    tile_dchunk = _grp.b2_batched_tiling(
+        tile_m=P, tile_n=N, tile_k=L, heads_per_cta=heads_per_cta
+    )
+    _grp.require_gemm_rewrite_proof(dchunk, tile_dchunk)
+
+    if not metal:
+        dcoff = _grp.b2_batched_dcoff_contraction(
+            _z3, chunk_size=L, headdim=P, dstate=N
+        )
+        tile_dcoff = _grp.b2_batched_tiling(
+            tile_m=L, tile_n=N, tile_k=P, heads_per_cta=heads_per_cta
+        )
+        _grp.require_gemm_rewrite_proof(dcoff, tile_dcoff)
+
+        dcdiag = _grp.b2_batched_dcdiag_contraction(_z3, chunk_size=L, dstate=N)
+        tile_dcdiag = _grp.b2_batched_tiling(
+            tile_m=L, tile_n=N, tile_k=L, heads_per_cta=heads_per_cta
+        )
+        _grp.require_gemm_rewrite_proof(dcdiag, tile_dcdiag)
+
+
 def build_chunk_scan_combine_bwd_metal(
     batch: int,
     seqlen: int,
@@ -1815,17 +1869,62 @@ def build_chunk_scan_combine_bwd_metal(
         # selected prim is the ONE path and any compile/parity failure propagates.
         _gemm_flag = str(os.environ.get("CPPMEGA_PATH_C_B2_GEMM", "")).strip().lower()
         _gemm_on = _gemm_flag in ("1", "true", "yes", "on")
+        _batched_flag = str(
+            os.environ.get("CPPMEGA_PATH_C_B2_GEMM_BATCHED", "")
+        ).strip().lower()
+        _batched_on = _batched_flag in ("1", "true", "yes", "on")
         _v2_flag = str(os.environ.get("CPPMEGA_PATH_C_B2_V2", "")).strip().lower()
         _v2_on = _v2_flag in ("1", "true", "yes", "on")
-        if _gemm_on and _v2_on:
+        if (int(_gemm_on) + int(_batched_on) + int(_v2_on)) > 1:
             # RULE #1: refuse an ambiguous path — surface WHERE+WHAT, no silent pick.
             raise ValueError(
-                "build_chunk_scan_combine_bwd_metal(cuda): CPPMEGA_PATH_C_B2_GEMM "
-                "and CPPMEGA_PATH_C_B2_V2 are BOTH set — they select mutually "
-                "exclusive B2 cuda prims (tensor-core GEMM vs dstate-split). Unset "
-                "one (RULE #1: no ambiguous fallback)."
+                "build_chunk_scan_combine_bwd_metal(cuda): more than one of "
+                "CPPMEGA_PATH_C_B2_GEMM / CPPMEGA_PATH_C_B2_GEMM_BATCHED / "
+                "CPPMEGA_PATH_C_B2_V2 is set — they select mutually exclusive B2 "
+                "cuda prims (single-tile GEMM / batched-large-tile GEMM / dstate-"
+                "split). Unset all but one (RULE #1: no ambiguous fallback)."
             )
-        if _gemm_on:
+        if _batched_on:
+            # BATCHED LARGE-TILE GEMM prim (the P1/Tri-Dao recipe). HEADS_PER_CTA
+            # from env (default 4); the prim RAISES if it does not divide nheads /
+            # straddles a group. SMEM budget gate (gb10 ~99 KB) scales with HPC.
+            _hpc = int(os.environ.get("CPPMEGA_PATH_C_B2_HEADS_PER_CTA", "4"))
+            L = chunk_size
+            P = headdim
+            N = dstate
+            maxLP = P if P > L else L
+            _hg = nheads // ngroups
+            _hpc = _b2_batched_heads_per_cta(nheads, _hg, _hpc)
+            smem_bytes = (
+                _hpc * L * 4 * 2          # dacs + dAcs_acc (fp32) per head
+                + _hpc * L * P * 4        # dY (fp32) per head
+                + _hpc * L * L * 4        # DYX (fp32) per head
+                + _hpc * L * P * 2        # dY16 (fp16) band
+                + _hpc * L * maxLP * 2    # opA (fp16) band
+                + maxLP * N * 2           # opB (fp16) shared
+                + maxLP * N * 4           # store_fp32 shared
+                + L * N * 4               # dCdiag_sh (fp32) shared
+            )
+            _GB10_SMEM_BUDGET = 99 * 1024
+            if smem_bytes >= _GB10_SMEM_BUDGET:
+                raise ValueError(
+                    f"build_chunk_scan_combine_bwd_metal(cuda,gemm_batched): per-"
+                    f"threadgroup smem {smem_bytes} B (L={L},P={P},N={N},"
+                    f"HEADS_PER_CTA={_hpc}) >= gb10 budget {_GB10_SMEM_BUDGET} B; "
+                    f"lower CPPMEGA_PATH_C_B2_HEADS_PER_CTA (RULE #1: no over-budget "
+                    f"launch)."
+                )
+            # z3/TLA PROOF GATE (RULE #1: no GEMM rewrite without a passing proof).
+            # Prove the three batched GEMM rewrites (dchunk_states transpose_A +
+            # decay-fold, dC_off dense, dC_diag lower-tri mask) AND the per-head-band
+            # single-writer disjointness (m_blocks=HEADS_PER_CTA). require_* RAISES
+            # GemmRewriteNotProven on any sat/unknown — it never returns unproven.
+            _require_batched_b2_gemm_proofs(L, P, N, _hpc, where="cuda")
+            prim = chunk_scan_combine_bwd_cuda_prim_gemm_batched(
+                batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate,
+                heads_per_cta=_hpc, **kwargs
+            )
+        elif _gemm_on:
             # TENSOR-CORE GEMM prim. SMEM BUDGET GATE (gb10 ~99 KB per-threadgroup
             # dynamic smem) — RAISE (RULE #1) before compile if over budget; never
             # silently re-tile / launch over budget. The GEMM prim's shared allocs
@@ -1896,8 +1995,60 @@ def build_chunk_scan_combine_bwd_metal(
     #   accumulators). When OFF the byte-identical serial Metal prim is the parity
     #   reference. Explicit gate, NOT a silent fallback; a compile/parity failure
     #   propagates.
+    _metal_batched_flag = str(
+        os.environ.get("CPPMEGA_PATH_C_METAL_GEMM_BATCHED", "")
+    ).strip().lower()
+    _metal_batched_on = _metal_batched_flag in ("1", "true", "yes", "on")
     _gemm_flag = str(os.environ.get("CPPMEGA_PATH_C_METAL_GEMM", "")).strip().lower()
-    if _gemm_flag in ("1", "true", "yes", "on"):
+    _metal_gemm_on = _gemm_flag in ("1", "true", "yes", "on")
+    if _metal_gemm_on and _metal_batched_on:
+        raise ValueError(
+            "build_chunk_scan_combine_bwd_metal(metal): CPPMEGA_PATH_C_METAL_GEMM and "
+            "CPPMEGA_PATH_C_METAL_GEMM_BATCHED are BOTH set — mutually exclusive "
+            "(single-tile vs batched-large-tile Metal GEMM). Unset one (RULE #1)."
+        )
+    if _metal_batched_on:
+        # BATCHED Metal GEMM prim (head-band). SMEM gate (Apple HARD 32 KB) scales
+        # with HEADS_PER_CTA (default 2). RAISE over-budget (RULE #1).
+        _hpc = int(os.environ.get("CPPMEGA_PATH_C_METAL_HEADS_PER_CTA", "2"))
+        _hg = nheads // ngroups
+        _hpc = _b2_batched_heads_per_cta(nheads, _hg, _hpc)
+        _maxlp = headdim if headdim > chunk_size else chunk_size
+        _maxpn = dstate if dstate > headdim else headdim
+        _smem_est = (
+            _hpc * chunk_size * 4 * 2                       # dacs + dAcs_acc
+            + _hpc * chunk_size * chunk_size * 2            # DYX (fp16) band
+            + _hpc * chunk_size * headdim * 2               # dY16 (fp16) band
+            + _hpc * chunk_size * _maxlp * 2                # opA (fp16) band
+            + _maxlp * dstate * 2                           # opB (fp16)
+            + _maxlp * _maxpn * 4                           # store_f32
+        )
+        _APPLE_SMEM_BUDGET = 32 * 1024
+        if _smem_est >= _APPLE_SMEM_BUDGET:
+            raise NotImplementedError(
+                f"build_chunk_scan_combine_bwd_metal(metal,gemm_batched): "
+                f"~{_smem_est} B per-threadgroup (L={chunk_size},P={headdim},"
+                f"N={dstate},HEADS_PER_CTA={_hpc}) >= Apple's {_APPLE_SMEM_BUDGET} B "
+                f"limit; lower CPPMEGA_PATH_C_METAL_HEADS_PER_CTA (RULE #1: no over-"
+                f"budget launch / no silent fallback). Use the serial Metal prim or a "
+                f"smaller head band."
+            )
+        # z3/TLA PROOF GATE (RULE #1). Metal batches DYX+dchunk_states only, but the
+        # head-band single-writer disjointness is the same obligation; prove the
+        # dchunk_states rewrite + the per-band tiling. RAISES on sat/unknown.
+        _require_batched_b2_gemm_proofs(
+            chunk_size, headdim, dstate, _hpc, where="metal", metal=True
+        )
+        prim = chunk_scan_combine_bwd_metal_gemm_prim_batched(
+            batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate,
+            heads_per_cta=_hpc, **kwargs
+        )
+        return tilelang.compile(
+            prim,
+            out_idx=[11, 12, 13, 14, 15, 16, 17],
+            target=resolved_target,
+        )
+    if _metal_gemm_on:
         # SMEM BUDGET GATE (Apple HARD 32 KB threadgroup-memory limit). The B2
         # Metal-GEMM prim's persistent fp16 dY16 + DYX recompute tiles (8 KB each)
         # plus the fp16 GEMM operand tiles (8 KB each) plus the fp32 fragment-staging
@@ -2046,6 +2197,671 @@ def bwd_mono_grid(
         )
     nchunks = seqlen // chunk_size
     return batch * nchunks * nheads, (batch * nchunks, nheads, 1)
+
+
+def _b2_batched_heads_per_cta(nheads: int, heads_per_group: int, requested: int) -> int:
+    """Resolve HEADS_PER_CTA for the batched B2 GEMM prim (RULE #1: no silent clamp).
+
+    The batched prim stacks ``HEADS_PER_CTA`` heads' GEMM rows into ONE tall-M
+    ``T.gemm`` per CTA so the ldmatrix/operand-staging/sync fixed cost is paid ONCE
+    per CTA across many MMA waves instead of once per (chunk,head) single-64-tile
+    (the §27 NO-GO defect: at M=64 the staging+sync overhead is un-amortized). The
+    head batch is the chunk/head axis P1 measured as the missing lever. It must
+    DIVIDE ``nheads`` exactly (no ragged final CTA — RULE #1, no padding fallback);
+    for the per-GROUP-reduced dC/dB terms it must also not straddle a group boundary
+    cheaply, so we additionally require it to divide ``heads_per_group`` when >1 so
+    a CTA's head band is single-group (keeps the group-indexed C/B operand staging
+    shared across the band). RAISES otherwise.
+    """
+    if requested <= 0:
+        raise ValueError(
+            f"_b2_batched_heads_per_cta: HEADS_PER_CTA={requested} must be >= 1 "
+            f"(RULE #1: no silent clamp)"
+        )
+    if nheads % requested != 0:
+        raise ValueError(
+            f"_b2_batched_heads_per_cta: HEADS_PER_CTA={requested} does not divide "
+            f"nheads={nheads}; the batched B2 GEMM prim forbids a ragged final CTA "
+            f"(RULE #1: no padding fallback). Pick a divisor of nheads."
+        )
+    if heads_per_group > 1 and heads_per_group % requested != 0 and requested % heads_per_group != 0:
+        raise ValueError(
+            f"_b2_batched_heads_per_cta: HEADS_PER_CTA={requested} must divide or be "
+            f"a multiple of heads_per_group={heads_per_group} so a CTA head-band has "
+            f"a clean group structure (the dC/dC_diag operands read C/B per-GROUP). "
+            f"RULE #1: no silent straddle."
+        )
+    return requested
+
+
+def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    heads_per_cta: int = 4,
+    threads: int = 128,
+) -> Any:
+    """B2 BATCHED LARGE-TILE tensor-core twin — the P1/Tri-Dao recipe (sm_121).
+
+    SAME analytic backward math + SAME 17-arg signature + SAME out_idx as
+    :func:`chunk_scan_combine_bwd_cuda_prim_gemm` (the §27 single-64-tile twin), so
+    it is a DROP-IN for the probe/chain. The ONE structural change is the lever P1
+    MEASURED as missing: the grid is re-blocked so each CTA owns ``HEADS_PER_CTA``
+    heads and the four GEMM-able contractions are issued as a HEAD-LOOP over a
+    SHARED operand-staging region, so the ldmatrix / smem-operand-staging /
+    ``sync_threads`` fixed cost is amortized over ``HEADS_PER_CTA`` MMA waves
+    instead of paid once per single 64-tile (the §27 defect: 0.749x because at M=64
+    the staging+sync cost exceeded the threaded serial it replaced).
+
+    GRID: ``(batch*nchunks, nheads // HEADS_PER_CTA)``. CTA ``(bx, hb)`` owns heads
+    ``[hb*HEADS_PER_CTA, (hb+1)*HEADS_PER_CTA)`` of chunk ``bx``. The effective GEMM
+    M is ``HEADS_PER_CTA * 64`` (DYX/dC_off/dchunk_states) — the tall M that
+    amortizes staging, exactly Tri-Dao's nheads_per_program head-accumulation that
+    fattens M. bs4 (4x CTAs, wired in the caller's micro_batch axis) multiplies the
+    CTA supply to hide the per-GEMM ldmatrix latency — the OTHER half of the recipe.
+
+    The four GEMMs are BLOCK-DIAGONAL over the head band (each head has distinct
+    dY/x/prev_states/C/B operands), so the rewrite stages each head's operands into
+    a band of ONE tall shared tile and issues per-head sub-GEMMs that SHARE the CTA's
+    ldmatrix path + the single inter-phase ``sync_threads`` — recovering the
+    amortization a naive dense tall MMA cannot (a dense tall GEMM would compute
+    HEADS_PER_CTA^2 cross-head garbage blocks). This is the honest mechanism: pay
+    ldmatrix/sync ONCE per CTA for HEADS_PER_CTA heads, not once per head.
+
+    Per-head body is the §27 algebra VERBATIM (DYX = dY@x^T, dC_off = dY@prev_states,
+    dC_diag = M@B masked, dchunk_states = (decay*dY)^T@C; dz/dx/dD gate-split, the
+    3-index dinp, and the dseg dA-grad STAY threaded — same documented scope
+    boundary, RULE #1). DTYPE/PARITY identical to §27 (fp16 operands, fp32 fragment
+    accumulate, scaled intermediates downcast pre-GEMM; dC per-HEAD, C/B per-GROUP).
+
+    RULE #1: this is the ONE CUDA path when ``CPPMEGA_PATH_C_B2_GEMM_BATCHED`` is
+    set; a tile/MMA-divisibility/smem/compile failure RAISES with where+what — it
+    NEVER falls back to the §27 single-tile twin / the threaded serial / Metal.
+    """
+    import tilelang  # noqa: F401
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_gemm_batched: seqlen ({seqlen}) must "
+            f"be divisible by chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_cuda_prim_gemm_batched: nheads ({nheads}) must "
+            f"be divisible by ngroups ({ngroups})"
+        )
+    for axis_name, axis_val in (
+        ("chunk_size(L)", chunk_size),
+        ("dstate(N)", dstate),
+        ("headdim(P)", headdim),
+    ):
+        if axis_val % 16 != 0:
+            raise ValueError(
+                f"chunk_scan_combine_bwd_cuda_prim_gemm_batched: {axis_name}="
+                f"{axis_val} not a multiple of 16; fp16 m16n8k16 MMA requires "
+                f"K%16==0 / M%16==0 / N%8==0 for DYX/dC_off/dC_diag/dchunk_states. "
+                f"No silent padding (RULE #1)."
+            )
+
+    heads_per_group = nheads // ngroups
+    HPC = _b2_batched_heads_per_cta(nheads, heads_per_group, heads_per_cta)
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    L = chunk_size
+    p = _LOG2E
+    nhead_blocks = nheads // HPC
+    maxLP = headdim if headdim > L else L
+
+    @T.prim_func
+    def main(
+        dout: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        z: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        D: T.Tensor((nheads), dtype),  # type: ignore
+        y: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dC: T.Tensor((batch, seqlen, nheads, dstate), accum_dtype),  # type: ignore
+        dx: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dz: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dchunk_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dinp: T.Tensor((batch, seqlen, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dA_cumsum_y: T.Tensor((batch, nheads, nchunks, chunk_size), accum_dtype),  # type: ignore
+        dD: T.Tensor((nheads), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nhead_blocks, threads=threads) as (bx, hb):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            base = chunk_idx * chunk_size
+
+            # TALL-M shared operand bands (HPC heads stacked along M). One ldmatrix
+            # path + one inter-phase sync amortized over the head loop (the lever).
+            # opA holds the A-operand for ALL heads in the band: [HPC*L, maxLP].
+            # opB is the per-head B-operand staged inside the loop: [maxLP, N].
+            # Fragments are sized per-head (single 64-band) and accumulate per head.
+            dacs = T.alloc_shared((HPC, L), accum_dtype)
+            dAcs_acc = T.alloc_shared((HPC, L), accum_dtype)
+            dY = T.alloc_shared((HPC, L, headdim), accum_dtype)
+            DYX = T.alloc_shared((HPC, L, L), accum_dtype)
+            dY16 = T.alloc_shared((HPC * L, headdim), dtype, scope="shared")
+            opA = T.alloc_shared((HPC * L, maxLP), dtype, scope="shared")
+            opB = T.alloc_shared((maxLP, dstate), dtype, scope="shared")
+            store_fp32 = T.alloc_shared((maxLP, dstate), accum_dtype, scope="shared")
+            dCdiag_sh = T.alloc_shared((L, dstate), accum_dtype, scope="shared")
+            DYX_frag = T.alloc_fragment((L, L), accum_dtype)
+            dCoff_frag = T.alloc_fragment((L, dstate), accum_dtype)
+            dCdiag_frag = T.alloc_fragment((L, dstate), accum_dtype)
+            dchunk_frag = T.alloc_fragment((headdim, dstate), accum_dtype)
+
+            # ---- per-head load + gate/D-skip split (threaded over the band) ----
+            for hl in T.Parallel(HPC * L):
+                hh = hl // L
+                ll = hl % L
+                head_idx = hb * HPC + hh
+                dacs[hh, ll] = T.Cast(
+                    accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, ll]
+                )
+                dAcs_acc[hh, ll] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+
+            dD_local = T.alloc_local((1,), accum_dtype)
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                dD_local[0] = T.Cast(accum_dtype, 0)
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    s = base + ll
+                    z_v = T.Cast(accum_dtype, z[batch_idx, s, head_idx, pp])
+                    gate = z_v / (T.Cast(accum_dtype, 1.0) + T.exp(-z_v))
+                    y_v = T.Cast(accum_dtype, y[batch_idx, s, head_idx, pp])
+                    dout_v = T.Cast(accum_dtype, dout[batch_idx, s, head_idx, pp])
+                    dgate = dout_v * y_v
+                    dy_v = dout_v * gate
+                    dz[batch_idx, s, head_idx, pp] = dgate * _silu_grad_expr(
+                        T, z_v, accum_dtype
+                    )
+                    d_v = T.Cast(accum_dtype, D[head_idx])
+                    x_v = T.Cast(accum_dtype, x[batch_idx, s, head_idx, pp])
+                    dx[batch_idx, s, head_idx, pp] = d_v * dy_v
+                    dD_local[0] = dD_local[0] + dy_v * x_v
+                    dY[hh, ll, pp] = dy_v
+                    dY16[hh * L + ll, pp] = T.Cast(dtype, dy_v)
+                    opA[hh * L + ll, pp] = T.Cast(dtype, x_v)
+                T.atomic_add(dD[head_idx], dD_local[0])
+            T.sync_threads()
+
+            # zero the dinp slice this CTA owns (whole band).
+            for hlpn0 in T.serial(0, HPC * L * headdim * dstate, threads):
+                lane = T.get_thread_binding(0)
+                idx = hlpn0 + lane
+                if idx < HPC * L * headdim * dstate:
+                    hh = idx // (L * headdim * dstate)
+                    rem0 = idx % (L * headdim * dstate)
+                    ll = rem0 // (headdim * dstate)
+                    rem = rem0 % (headdim * dstate)
+                    pp = rem // dstate
+                    nn = rem % dstate
+                    head_idx = hb * HPC + hh
+                    dinp[batch_idx, base + ll, head_idx, pp, nn] = T.Cast(
+                        accum_dtype, 0
+                    )
+            T.sync_threads()
+
+            # ---- (A) DYX[hh,l,s] = sum_p dY[hh,l,p]*x[hh,s,p] — per-head GEMM band ----
+            # TALL-M: opA holds all HPC heads' x; dY16 all heads' dY. Each head's
+            # 64-band shares the staged tiles + the single sync below (amortized).
+            for hh in T.serial(HPC):
+                T.clear(DYX_frag)
+                T.gemm(
+                    dY16[hh * L : hh * L + L, 0:headdim],
+                    opA[hh * L : hh * L + L, 0:headdim],
+                    DYX_frag,
+                    transpose_B=True,
+                )
+                T.copy(DYX_frag, DYX[hh, 0:L, 0:L])
+            T.sync_threads()
+
+            # ---- (B) dC_off + (C) dC_diag + dC store, per head ----
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                group_idx = head_idx // heads_per_group
+                # (B) dC_off[l,n] = sum_p dY[l,p]*prev_states[p,n]
+                T.copy(
+                    prev_states[
+                        batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate
+                    ],
+                    opB[0:headdim, 0:dstate],
+                    disable_tma=True,
+                )
+                T.sync_threads()
+                T.clear(dCoff_frag)
+                T.gemm(
+                    dY16[hh * L : hh * L + L, 0:headdim],
+                    opB[0:headdim, 0:dstate],
+                    dCoff_frag,
+                )
+                T.copy(dCoff_frag, store_fp32[0:L, 0:dstate])
+                T.sync_threads()
+                # (C) dC_diag[l,n] = sum_{s<=l} M[l,s]*B[s,n] (masked operand)
+                for ls in T.Parallel(L * L):
+                    ll = ls // L
+                    ss = ls % L
+                    lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    m_val = DYX[hh, ll, ss] * lmat * dt_s
+                    opA[hh * L + ll, ss] = T.Cast(
+                        dtype, T.if_then_else(ss <= ll, m_val, T.Cast(accum_dtype, 0))
+                    )
+                T.copy(
+                    B[batch_idx, base : base + L, group_idx, 0:dstate],
+                    opB[0:L, 0:dstate],
+                    disable_tma=True,
+                )
+                T.sync_threads()
+                T.clear(dCdiag_frag)
+                T.gemm(
+                    opA[hh * L : hh * L + L, 0:L],
+                    opB[0:L, 0:dstate],
+                    dCdiag_frag,
+                )
+                T.copy(dCdiag_frag, dCdiag_sh)
+                T.sync_threads()
+                for ln0 in T.serial(0, L * dstate, threads):
+                    lane = T.get_thread_binding(0)
+                    ln = ln0 + lane
+                    if ln < L * dstate:
+                        ll = ln // dstate
+                        nn = ln % dstate
+                        s = base + ll
+                        sd = T.exp2(dacs[hh, ll] * p)
+                        dC[batch_idx, s, head_idx, nn] = (
+                            store_fp32[ll, nn] * sd + dCdiag_sh[ll, nn]
+                        )
+                        c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                        T.atomic_add(dAcs_acc[hh, ll], store_fp32[ll, nn] * c_v * sd)
+                T.sync_threads()
+
+            # ---- (D) dchunk_states[p,n] = sum_l (dY[l,p]*sd[l])*C[l,n], per head ----
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                group_idx = head_idx // heads_per_group
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    sd = T.exp2(dacs[hh, ll] * p)
+                    opA[hh * L + ll, pp] = T.Cast(dtype, dY[hh, ll, pp] * sd)
+                T.copy(
+                    C[batch_idx, base : base + L, group_idx, 0:dstate],
+                    opB[0:L, 0:dstate],
+                    disable_tma=True,
+                )
+                T.sync_threads()
+                T.clear(dchunk_frag)
+                T.gemm(
+                    opA[hh * L : hh * L + L, 0:headdim],
+                    opB[0:L, 0:dstate],
+                    dchunk_frag,
+                    transpose_A=True,
+                )
+                T.copy(dchunk_frag, store_fp32[0:headdim, 0:dstate])
+                T.copy(
+                    store_fp32[0:headdim, 0:dstate],
+                    dchunk_states[
+                        batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate
+                    ],
+                    disable_tma=True,
+                )
+                T.sync_threads()
+
+            # ---- dinp (3-index, STAYS THREADED) + dseg dA-grad, per head ----
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                group_idx = head_idx // heads_per_group
+                for sp in T.serial(0, L * headdim, threads):
+                    lane = T.get_thread_binding(0)
+                    spi = sp + lane
+                    if spi < L * headdim:
+                        ss = spi // headdim
+                        pp = spi % headdim
+                        sidx = base + ss
+                        for nn in T.serial(dstate):
+                            acc = T.alloc_local((1,), accum_dtype)
+                            acc[0] = T.Cast(accum_dtype, 0)
+                            for ll in T.serial(ss, L):
+                                lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
+                                c_v = T.Cast(
+                                    accum_dtype, C[batch_idx, base + ll, group_idx, nn]
+                                )
+                                acc[0] = acc[0] + dY[hh, ll, pp] * c_v * lmat
+                            dinp[batch_idx, sidx, head_idx, pp, nn] = (
+                                dinp[batch_idx, sidx, head_idx, pp, nn] + acc[0]
+                            )
+                T.sync_threads()
+                for ls in T.Parallel(L * L):
+                    ll = ls // L
+                    ss = ls % L
+                    cb_v = T.Cast(
+                        accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
+                    )
+                    lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    tri = T.if_then_else(
+                        ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+                    )
+                    dseg = DYX[hh, ll, ss] * cb_v * lmat * dt_s * tri
+                    T.atomic_add(dAcs_acc[hh, ll], dseg)
+                    T.atomic_add(dAcs_acc[hh, ss], -dseg)
+                T.sync_threads()
+
+            for hl in T.Parallel(HPC * L):
+                hh = hl // L
+                ll = hl % L
+                head_idx = hb * HPC + hh
+                dA_cumsum_y[batch_idx, head_idx, chunk_idx, ll] = dAcs_acc[hh, ll]
+
+    return main
+
+
+def chunk_scan_combine_bwd_metal_gemm_prim_batched(
+    batch: int,
+    seqlen: int,
+    chunk_size: int,
+    ngroups: int,
+    nheads: int,
+    headdim: int,
+    dstate: int,
+    *,
+    heads_per_cta: int = 2,
+    threads: int = 128,
+) -> Any:
+    """B2 BATCHED LARGE-TILE Metal twin — the P1/Tri-Dao recipe (simdgroup C-in-frag).
+
+    SAME analytic math + 17-arg signature + out_idx as the serial/§27 Metal prims;
+    the ONE structural change is the HEAD-BAND batching (``HEADS_PER_CTA`` heads per
+    CTA) that amortizes the simdgroup ldmatrix/staging/sync over the head loop. As in
+    the §27 Metal twin ONLY the two cleanest dominant GEMMs (DYX + dchunk_states) are
+    tensor-op; dC_off/dC_diag/dinp/dseg stay serial (Apple's HARD 32 KB threadgroup
+    pool does not fit the 4-GEMM layout, and the head-band staging makes the operand
+    footprint worse — so the Metal default HEADS_PER_CTA is smaller, 2). The serial
+    parts are the SAME serial math as the byte-identical Metal prim, selected by the
+    SAME flag — NOT a silent per-term fallback (RULE #1).
+
+    The band staging (dY16/opA over HPC*L rows, fp16) + one fp32 whole-tile staging
+    is sized to the Apple pool; the build-site asserts the 32 KB cap and RAISES
+    (RULE #1) rather than launch over-budget. simdgroup 8x8 fragment-C (forces the
+    stable path, not the M5-only cooperative_tensor). bs is local-Metal bs1 only.
+    """
+    import tilelang  # noqa: F401
+    import tilelang.language as T
+
+    if seqlen % chunk_size != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_metal_gemm_prim_batched: seqlen ({seqlen}) must "
+            f"be divisible by chunk_size ({chunk_size}); no padding (RULE #1)"
+        )
+    if nheads % ngroups != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_metal_gemm_prim_batched: nheads ({nheads}) must "
+            f"be divisible by ngroups ({ngroups})"
+        )
+    for axis_name, axis_val in (
+        ("chunk_size(L)", chunk_size),
+        ("dstate(N)", dstate),
+        ("headdim(P)", headdim),
+    ):
+        if axis_val % 8 != 0:
+            raise ValueError(
+                f"chunk_scan_combine_bwd_metal_gemm_prim_batched: {axis_name}="
+                f"{axis_val} not a multiple of 8; Metal 8x8 simdgroup matmul requires "
+                f"M/N/K % 8 == 0. No silent padding (RULE #1)."
+            )
+
+    heads_per_group = nheads // ngroups
+    HPC = _b2_batched_heads_per_cta(nheads, heads_per_group, heads_per_cta)
+
+    dtype = T.float16
+    accum_dtype = T.float32
+    nchunks = seqlen // chunk_size
+    L = chunk_size
+    p = _LOG2E
+    nhead_blocks = nheads // HPC
+    _maxpn = dstate if dstate > headdim else headdim
+    _maxlp = headdim if headdim > L else L
+
+    @T.prim_func
+    def main(
+        dout: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        cb: T.Tensor((batch, nchunks, ngroups, chunk_size, chunk_size), dtype),  # type: ignore
+        x: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        z: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
+        C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        B: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        D: T.Tensor((nheads), dtype),  # type: ignore
+        y: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
+        dC: T.Tensor((batch, seqlen, nheads, dstate), accum_dtype),  # type: ignore
+        dx: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dz: T.Tensor((batch, seqlen, nheads, headdim), accum_dtype),  # type: ignore
+        dchunk_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dinp: T.Tensor((batch, seqlen, nheads, headdim, dstate), accum_dtype),  # type: ignore
+        dA_cumsum_y: T.Tensor((batch, nheads, nchunks, chunk_size), accum_dtype),  # type: ignore
+        dD: T.Tensor((nheads), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch * nchunks, nhead_blocks, threads=threads) as (bx, hb):
+            batch_idx = bx % batch
+            chunk_idx = bx // batch
+            base = chunk_idx * chunk_size
+
+            dacs = T.alloc_shared((HPC, L), accum_dtype)
+            dAcs_acc = T.alloc_shared((HPC, L), accum_dtype)
+            DYX = T.alloc_shared((HPC, L, L), dtype, scope="shared")
+            dY16 = T.alloc_shared((HPC * L, headdim), dtype, scope="shared")
+            opA = T.alloc_shared((HPC * L, _maxlp), dtype, scope="shared")
+            opB = T.alloc_shared((_maxlp, dstate), dtype, scope="shared")
+            store_f32 = T.alloc_shared((_maxlp, _maxpn), accum_dtype, scope="shared")
+            DYX_frag = T.alloc_fragment((L, L), accum_dtype)
+            dchunk_frag = T.alloc_fragment((headdim, dstate), accum_dtype)
+
+            for hl in T.Parallel(HPC * L):
+                hh = hl // L
+                ll = hl % L
+                head_idx = hb * HPC + hh
+                dacs[hh, ll] = T.Cast(
+                    accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, ll]
+                )
+                dAcs_acc[hh, ll] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+
+            dD_local = T.alloc_local((1,), accum_dtype)
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                dD_local[0] = T.Cast(accum_dtype, 0)
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    s = base + ll
+                    z_v = T.Cast(accum_dtype, z[batch_idx, s, head_idx, pp])
+                    gate = z_v / (T.Cast(accum_dtype, 1.0) + T.exp(-z_v))
+                    y_v = T.Cast(accum_dtype, y[batch_idx, s, head_idx, pp])
+                    dout_v = T.Cast(accum_dtype, dout[batch_idx, s, head_idx, pp])
+                    dgate = dout_v * y_v
+                    dy_v = dout_v * gate
+                    dz[batch_idx, s, head_idx, pp] = dgate * _silu_grad_expr(
+                        T, z_v, accum_dtype
+                    )
+                    d_v = T.Cast(accum_dtype, D[head_idx])
+                    x_v = T.Cast(accum_dtype, x[batch_idx, s, head_idx, pp])
+                    dx[batch_idx, s, head_idx, pp] = d_v * dy_v
+                    dD_local[0] = dD_local[0] + dy_v * x_v
+                    dY16[hh * L + ll, pp] = T.Cast(dtype, dy_v)
+                    opA[hh * L + ll, pp] = T.Cast(dtype, x_v)
+                T.atomic_add(dD[head_idx], dD_local[0])
+            T.sync_threads()
+
+            for hlpn0 in T.serial(0, HPC * L * headdim * dstate, threads):
+                lane = T.get_thread_binding(0)
+                idx = hlpn0 + lane
+                if idx < HPC * L * headdim * dstate:
+                    hh = idx // (L * headdim * dstate)
+                    rem0 = idx % (L * headdim * dstate)
+                    ll = rem0 // (headdim * dstate)
+                    rem = rem0 % (headdim * dstate)
+                    pp = rem // dstate
+                    nn = rem % dstate
+                    head_idx = hb * HPC + hh
+                    dinp[batch_idx, base + ll, head_idx, pp, nn] = T.Cast(
+                        accum_dtype, 0
+                    )
+            T.sync_threads()
+
+            # ---- (A) DYX per head (band, fp16 recompute tile) ----
+            for hh in T.serial(HPC):
+                T.clear(DYX_frag)
+                T.gemm(
+                    dY16[hh * L : hh * L + L, 0:headdim],
+                    opA[hh * L : hh * L + L, 0:headdim],
+                    DYX_frag,
+                    transpose_B=True,
+                )
+                T.copy(DYX_frag, store_f32[0:L, 0:L])
+                for ls in T.Parallel(L * L):
+                    ll = ls // L
+                    ss = ls % L
+                    DYX[hh, ll, ss] = T.Cast(dtype, store_f32[ll, ss])
+                T.sync_threads()
+
+            # ---- (D) dchunk_states per head (band, transpose_A) ----
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                group_idx = head_idx // heads_per_group
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    sd = T.exp2(dacs[hh, ll] * p)
+                    opA[hh * L + ll, pp] = T.Cast(
+                        dtype, T.Cast(accum_dtype, dY16[hh * L + ll, pp]) * sd
+                    )
+                T.copy(
+                    C[batch_idx, base : base + L, group_idx, 0:dstate],
+                    opB[0:L, 0:dstate],
+                    disable_tma=True,
+                )
+                T.sync_threads()
+                T.clear(dchunk_frag)
+                T.gemm(
+                    opA[hh * L : hh * L + L, 0:headdim],
+                    opB[0:L, 0:dstate],
+                    dchunk_frag,
+                    transpose_A=True,
+                )
+                T.copy(dchunk_frag, store_f32[0:headdim, 0:dstate])
+                T.copy(
+                    store_f32[0:headdim, 0:dstate],
+                    dchunk_states[
+                        batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate
+                    ],
+                    disable_tma=True,
+                )
+                T.sync_threads()
+
+            # ---- dC (serial) + dinp (serial) + dseg per head ----
+            for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                group_idx = head_idx // heads_per_group
+                for ll in T.serial(L):
+                    s = base + ll
+                    sd = T.exp2(dacs[hh, ll] * p)
+                    dsd = T.alloc_local((1,), accum_dtype)
+                    dsd[0] = T.Cast(accum_dtype, 0)
+                    if T.get_thread_binding(0) == 0:
+                        for nn in T.serial(dstate):
+                            accn = T.alloc_local((1,), accum_dtype)
+                            accn[0] = T.Cast(accum_dtype, 0)
+                            for pp in T.serial(headdim):
+                                cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
+                                accn[0] = accn[0] + T.Cast(
+                                    accum_dtype, dY16[hh * L + ll, pp]
+                                ) * cs
+                            c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                            cdiag = T.alloc_local((1,), accum_dtype)
+                            cdiag[0] = T.Cast(accum_dtype, 0)
+                            for ss in T.serial(0, ll + 1):
+                                lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
+                                dt_s = T.Cast(
+                                    accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss]
+                                )
+                                b_v = T.Cast(
+                                    accum_dtype, B[batch_idx, base + ss, group_idx, nn]
+                                )
+                                cdiag[0] = cdiag[0] + lmat * dt_s * T.Cast(
+                                    accum_dtype, DYX[hh, ll, ss]
+                                ) * b_v
+                            dC[batch_idx, s, head_idx, nn] = accn[0] * sd + cdiag[0]
+                            dsd[0] = dsd[0] + accn[0] * c_v
+                        dAcs_acc[hh, ll] = dAcs_acc[hh, ll] + dsd[0] * sd
+                T.sync_threads()
+
+                for sp in T.serial(0, L * headdim, threads):
+                    lane = T.get_thread_binding(0)
+                    spi = sp + lane
+                    if spi < L * headdim:
+                        ss = spi // headdim
+                        pp = spi % headdim
+                        sidx = base + ss
+                        for nn in T.serial(dstate):
+                            acc = T.alloc_local((1,), accum_dtype)
+                            acc[0] = T.Cast(accum_dtype, 0)
+                            for ll in T.serial(ss, L):
+                                lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
+                                c_v = T.Cast(
+                                    accum_dtype, C[batch_idx, base + ll, group_idx, nn]
+                                )
+                                acc[0] = acc[0] + T.Cast(
+                                    accum_dtype, dY16[hh * L + ll, pp]
+                                ) * c_v * lmat
+                            dinp[batch_idx, sidx, head_idx, pp, nn] = (
+                                dinp[batch_idx, sidx, head_idx, pp, nn] + acc[0]
+                            )
+                T.sync_threads()
+
+                for ls in T.Parallel(L * L):
+                    ll = ls // L
+                    ss = ls % L
+                    cb_v = T.Cast(
+                        accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
+                    )
+                    lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    tri = T.if_then_else(
+                        ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+                    )
+                    dseg = T.Cast(accum_dtype, DYX[hh, ll, ss]) * cb_v * lmat * dt_s * tri
+                    T.atomic_add(dAcs_acc[hh, ll], dseg)
+                    T.atomic_add(dAcs_acc[hh, ss], -dseg)
+                T.sync_threads()
+
+            for hl in T.Parallel(HPC * L):
+                hh = hl // L
+                ll = hl % L
+                head_idx = hb * HPC + hh
+                dA_cumsum_y[batch_idx, head_idx, chunk_idx, ll] = dAcs_acc[hh, ll]
+
+    return main
 
 
 def bwd_mono_cuda_prim(

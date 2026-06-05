@@ -547,6 +547,103 @@ def b2_dinp_contraction(z3, *, chunk_size: int, headdim: int):
     )
 
 
+def b2_batched_dchunk_contraction(z3, *, chunk_size: int, headdim: int, dstate: int):
+    """B2 BATCHED ``dchunk_states[p,n] = sum_l (decay[l]*dY[l,p])*C[l,n]`` (transpose_A).
+
+    The batched-large-tile prim stacks ``HEADS_PER_CTA`` heads along M; each head is
+    a DISJOINT 64-row band of the tall opA tile and is GEMM'd against its own C
+    operand (block-diagonal). This descriptor proves the PER-HEAD contraction (the
+    operand maps + the transpose_A address arithmetic + the decay scale fold); the
+    per-band single-writer disjointness is proved by the GemmTiling
+    ``m_blocks=HEADS_PER_CTA, m_stride=tile_m`` passed alongside (each band owns a
+    contiguous 64-row slice, no overlap). Output rows = p (headdim), cols = n
+    (dstate), reduction k = l (chunk). The decay ``sd[l]=exp2(dacs[l]*p)`` is a
+    function of the reduction index l only, folded into the dY operand BEFORE the
+    GEMM — modeled as an uninterpreted ``scale(l)`` that the GEMM folds identically.
+    """
+
+    scale = z3.Function("b2_sd", z3.IntSort(), z3.RealSort())
+    return GemmContraction(
+        name="B2_batched_dchunk_states",
+        m_extent=headdim,
+        n_extent=dstate,
+        k_extent=chunk_size,
+        a_addr_serial=lambda i, k: k * headdim + i,  # dY[l, p] (transpose_A: k=l rows)
+        a_addr_gemm=lambda i, k: k * headdim + i,
+        b_addr_serial=lambda k, j: k * dstate + j,  # C[l, n]
+        b_addr_gemm=lambda k, j: k * dstate + j,
+        scale_serial=lambda i, k, j: scale(k),
+        scale_gemm=lambda i, k, j: scale(k),
+    )
+
+
+def b2_batched_dcoff_contraction(z3, *, chunk_size: int, headdim: int, dstate: int):
+    """B2 BATCHED ``dC_off[l,n] = sum_p dY[l,p]*prev_states[p,n]`` (dense, un-transposed).
+
+    Per-head sub-GEMM inside the head-band. Output rows = l (chunk), cols = n
+    (dstate), reduction k = p (headdim). No mask, no fold on the GEMM itself (the
+    per-l state_decay is applied post-GEMM in the dC store). Address maps encode the
+    un-transposed ``dY[l,p] @ prev_states[p,n]``.
+    """
+
+    return GemmContraction(
+        name="B2_batched_dC_off",
+        m_extent=chunk_size,
+        n_extent=dstate,
+        k_extent=headdim,
+        a_addr_serial=lambda i, k: i * headdim + k,  # dY[l, p]
+        a_addr_gemm=lambda i, k: i * headdim + k,
+        b_addr_serial=lambda k, j: k * dstate + j,  # prev_states[p, n]
+        b_addr_gemm=lambda k, j: k * dstate + j,
+    )
+
+
+def b2_batched_dcdiag_contraction(z3, *, chunk_size: int, dstate: int):
+    """B2 BATCHED ``dC_diag[l,n] = sum_{s<=l} M[l,s]*B[s,n]`` (lower-tri masked).
+
+    Per-head sub-GEMM. The causal mask ``keep(i,j,k)=(k<=i)`` (s<=l) is applied to
+    the A-operand fragment BEFORE the GEMM — the GEMM must fold the IDENTICAL
+    predicate. Output rows = l (chunk), cols = n (dstate), reduction k = s (chunk).
+    """
+
+    return GemmContraction(
+        name="B2_batched_dC_diag_lowertri",
+        m_extent=chunk_size,
+        n_extent=dstate,
+        k_extent=chunk_size,
+        a_addr_serial=lambda i, k: i * chunk_size + k,  # M[l, s]
+        a_addr_gemm=lambda i, k: i * chunk_size + k,
+        b_addr_serial=lambda k, j: k * dstate + j,  # B[s, n]
+        b_addr_gemm=lambda k, j: k * dstate + j,
+        mask_serial=lambda i, j, k: k <= i,
+        mask_gemm=lambda i, j, k: k <= i,
+    )
+
+
+def b2_batched_tiling(*, tile_m: int, tile_n: int, tile_k: int, heads_per_cta: int) -> "GemmTiling":
+    """The per-head-band tiling for the batched B2 GEMMs.
+
+    M is decomposed into ``heads_per_cta`` DISJOINT bands of ``tile_m`` rows each
+    (``m_blocks=heads_per_cta, m_stride=tile_m`` so band b owns rows
+    ``[b*tile_m, b*tile_m+tile_m)`` — contiguous, non-overlapping). The
+    single-writer obligation proves no two head-bands write the same output row
+    (block-diagonal disjointness, the load-bearing race-freedom property of the
+    head-accumulation tiling). N/K are single-tile (k_steps=1, n_blocks=1) at the
+    prod 64 dims.
+    """
+
+    return GemmTiling(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_blocks=heads_per_cta,
+        n_blocks=1,
+        k_steps=1,
+        m_stride=tile_m,
+        n_stride=tile_n,
+    )
+
+
 def f0_summary_contraction(z3, *, chunk_size: int, headdim: int, dstate: int):
     """F0 ``summary_states[p,n] = sum_l decay[l]*dt[l]*x[l,p]*B[l,n]``.
 
