@@ -126,3 +126,35 @@ race-free; the build dispatcher gates emission behind `require_gemm_rewrite_proo
   is 101376 B, so HPC=2's 66560 B SHOULD be settable — a TVM launch-path gap), or
   (b) drop the resident fp32 dY/DYX bands (recompute in the dinp/dseg tail) to fit
   HPC>=2 under 48KB. Neither is done here; the measured verdict stands.
+
+## §TB1.5 RE-VERIFICATION (2026-06-05, this session, gb10-only run)
+
+Independent re-run on NVIDIA GB10 (CUDA 13.2, tilelang 0.1.9+cuda.git8385a23d).
+The §TB1.1–1.3 verdicts REPRODUCE. NO local Apple GPU was dispatched this session
+(SoC watchdog-panic safety) — Metal is CODEGEN-VERIFIED only, numeric Metal timing
++ parity are DEFERRED (the §TB1.2 4.99x is from a PRIOR local run, not re-measured).
+
+- **CUDA HPC=2 launch failure REPRODUCED VERBATIM**: `tvm.error.InternalError:
+  Failed to set the allowed dynamic shared memory size to 66560` (the lever cannot
+  launch). v1 + §27 built fine; only batched HPC=2 dies at launch.
+- **CUDA HPC=1 timing REPRODUCED** (`probe_b2_batched_cuda_ab_only.py`, prod cfg):
+  v1_threaded=905.5ms, §27_single_tile=1231.6ms, batched=1250.1ms →
+  batched_vs_v1=**0.724x (NO-GO)**, batched_vs_§27=**0.985x** (degenerates to §27).
+  batched-vs-v1 self-consistency worst **1.98e-5** over 7 GEMM-able outputs (math
+  correct; performance NO-GO).
+- **CUDA real-tensor-core SASS PROVEN**: lowered the batched prim to CUDA, compiled
+  the cubin (`nvcc -arch=sm_121a`), `cuobjdump -sass` shows **128 `HMMA.16816.F32`**
+  (m16n8k16 fp16→fp32 tensor-core) + **64 `LDSM`** (ldmatrix). C++ emits
+  `tl::mma_sync<...,16,8,16,...>` x8 (4 contractions × 2 n-tiles). HMMA.16816 = m16
+  per step, 4 m-steps per per-head 64-tile — confirms §TB1.0: per-head M=64 tiles,
+  NOT a tall HPC·64 dense MMA. Real tensor-core, but no head-amortization survives.
+- **z3 proof REPRODUCED**: 3 positives PROVED (z3_used=z3_proved=True, all
+  obligations unsat), 2 negatives FAIL correctly (overlap_band→single_writer=False
+  counter-witness; transpose_bug→operand_maps_match=False counter-witness).
+  VERDICT `ALL_POSITIVES_PROVED_AND_NON_VACUOUS` — non-vacuous.
+- **Metal CODEGEN-VERIFIED (lowered on gb10, ZERO Apple GPU exec)**: lowered the
+  batched Metal prim to MSL at the in-budget L=P=N=32 / HPC=1 config; the MSL emits
+  **`simdgroup_multiply_accumulate`** (the DYX + dchunk GEMMs), **`simdgroup_load`/
+  `simdgroup_store`**, and **`simdgroup_matrix<float, 8, 8>`** (Apple 8×8 fragment).
+  Genuine large-tile simdgroup tensor-op codegen confirmed. Numeric Metal timing
+  + 7-grad parity are DEFERRED (not run locally this session, watchdog safety).
