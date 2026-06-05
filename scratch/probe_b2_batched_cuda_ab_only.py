@@ -74,16 +74,25 @@ def timeit(k, n=20):
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / n * 1e3, o
 
-print("[B2-AB] building v1-threaded ..."); k1 = build(chunk_scan_combine_bwd_cuda_prim(b, S, chunk, G, H, P, N))
-print("[B2-AB] building §27 single-tile gemm ..."); kg = build(chunk_scan_combine_bwd_cuda_prim_gemm(b, S, chunk, G, H, P, N))
-print(f"[B2-AB] building batched HPC={HPC} ..."); kb = build(chunk_scan_combine_bwd_cuda_prim_gemm_batched(b, S, chunk, G, H, P, N, heads_per_cta=HPC))
+FRUGAL = "--frugal" in sys.argv  # bs4: only v1 + batched, free between (mem-lean)
+names = ["dC", "dx", "dz", "dchunk", "dinp", "dA_y", "dD"]
 
+print("[B2-AB] building v1-threaded ..."); k1 = build(chunk_scan_combine_bwd_cuda_prim(b, S, chunk, G, H, P, N))
 t1, o1 = timeit(k1)
-tg, og = timeit(kg)
+if FRUGAL:
+    o1ref = [t.clone() for t in o1]
+    del o1; torch.cuda.empty_cache()
+    tg = float("nan")
+else:
+    print("[B2-AB] building §27 single-tile gemm ..."); kg = build(chunk_scan_combine_bwd_cuda_prim_gemm(b, S, chunk, G, H, P, N))
+    tg, og = timeit(kg)
+    del og; torch.cuda.empty_cache()
+    o1ref = o1
+
+print(f"[B2-AB] building batched HPC={HPC} ..."); kb = build(chunk_scan_combine_bwd_cuda_prim_gemm_batched(b, S, chunk, G, H, P, N, heads_per_cta=HPC))
 tb, ob = timeit(kb)
 
-names = ["dC", "dx", "dz", "dchunk", "dinp", "dA_y", "dD"]
-eq_b_v1 = {nm: float((a - c).abs().max().cpu()) for nm, a, c in zip(names, ob, o1)}
+eq_b_v1 = {nm: float((a - c).abs().max().cpu()) for nm, a, c in zip(names, ob, o1ref)}
 worst = max(eq_b_v1.values())
 
 print(f"\n[B2-AB] MEASURED v1_threaded={t1:.3f}ms  §27_single_tile_gemm={tg:.3f}ms  "
