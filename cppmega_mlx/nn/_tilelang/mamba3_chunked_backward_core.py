@@ -1895,12 +1895,15 @@ def build_chunk_scan_combine_bwd_metal(
             maxLP = P if P > L else L
             _hg = nheads // ngroups
             _hpc = _b2_batched_heads_per_cta(nheads, _hg, _hpc)
+            # §TB1: dY16/opA are now OFFSET-0 head-sized staging tiles (L,*) /
+            # (maxLP,maxLP) reused across the head loop (NOT HPC*L bands) — only
+            # dacs/dAcs_acc/dY/DYX scale with HPC (per-head result bands).
             smem_bytes = (
                 _hpc * L * 4 * 2          # dacs + dAcs_acc (fp32) per head
                 + _hpc * L * P * 4        # dY (fp32) per head
                 + _hpc * L * L * 4        # DYX (fp32) per head
-                + _hpc * L * P * 2        # dY16 (fp16) band
-                + _hpc * L * maxLP * 2    # opA (fp16) band
+                + L * P * 2               # dY16 (fp16) offset-0 staging tile
+                + maxLP * maxLP * 2       # opA (fp16) offset-0 staging tile
                 + maxLP * N * 2           # opB (fp16) shared
                 + maxLP * N * 4           # store_fp32 shared
                 + L * N * 4               # dCdiag_sh (fp32) shared
@@ -2015,11 +2018,14 @@ def build_chunk_scan_combine_bwd_metal(
         _hpc = _b2_batched_heads_per_cta(nheads, _hg, _hpc)
         _maxlp = headdim if headdim > chunk_size else chunk_size
         _maxpn = dstate if dstate > headdim else headdim
+        # §TB1: dY16/opA are OFFSET-0 head-sized staging tiles reused across the
+        # head loop; only dacs/dAcs_acc/DYX/dY_band scale with HPC.
         _smem_est = (
             _hpc * chunk_size * 4 * 2                       # dacs + dAcs_acc
             + _hpc * chunk_size * chunk_size * 2            # DYX (fp16) band
-            + _hpc * chunk_size * headdim * 2               # dY16 (fp16) band
-            + _hpc * chunk_size * _maxlp * 2                # opA (fp16) band
+            + _hpc * chunk_size * headdim * 2               # dY_band (fp16) per head
+            + chunk_size * headdim * 2                      # dY16 (fp16) staging tile
+            + _maxlp * _maxlp * 2                           # opA (fp16) staging tile
             + _maxlp * dstate * 2                           # opB (fp16)
             + _maxlp * _maxpn * 4                           # store_f32
         )
@@ -2353,10 +2359,15 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
             # Fragments are sized per-head (single 64-band) and accumulate per head.
             dacs = T.alloc_shared((HPC, L), accum_dtype)
             dAcs_acc = T.alloc_shared((HPC, L), accum_dtype)
+            # §TB1 offset-0 fix: this tilelang's T.gemm requires the A operand's
+            # first-dim offset == 0, so the GEMM staging tiles (dY16/opA) are
+            # OFFSET-0 head-sized (L,*) tiles REUSED across the serial head loop
+            # (the amortization lever = one staging alloc + band-level syncs shared
+            # over HPC heads). The per-head dY/DYX results stay in (HPC,...) bands.
             dY = T.alloc_shared((HPC, L, headdim), accum_dtype)
             DYX = T.alloc_shared((HPC, L, L), accum_dtype)
-            dY16 = T.alloc_shared((HPC * L, headdim), dtype, scope="shared")
-            opA = T.alloc_shared((HPC * L, maxLP), dtype, scope="shared")
+            dY16 = T.alloc_shared((L, headdim), dtype, scope="shared")
+            opA = T.alloc_shared((maxLP, maxLP), dtype, scope="shared")
             opB = T.alloc_shared((maxLP, dstate), dtype, scope="shared")
             store_fp32 = T.alloc_shared((maxLP, dstate), accum_dtype, scope="shared")
             dCdiag_sh = T.alloc_shared((L, dstate), accum_dtype, scope="shared")
@@ -2398,8 +2409,6 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
                     dx[batch_idx, s, head_idx, pp] = d_v * dy_v
                     dD_local[0] = dD_local[0] + dy_v * x_v
                     dY[hh, ll, pp] = dy_v
-                    dY16[hh * L + ll, pp] = T.Cast(dtype, dy_v)
-                    opA[hh * L + ll, pp] = T.Cast(dtype, x_v)
                 T.atomic_add(dD[head_idx], dD_local[0])
             T.sync_threads()
 
@@ -2420,25 +2429,38 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
                     )
             T.sync_threads()
 
-            # ---- (A) DYX[hh,l,s] = sum_p dY[hh,l,p]*x[hh,s,p] — per-head GEMM band ----
-            # TALL-M: opA holds all HPC heads' x; dY16 all heads' dY. Each head's
-            # 64-band shares the staged tiles + the single sync below (amortized).
+            # ---- (A) DYX[hh,l,s] = sum_p dY[hh,l,p]*x[hh,s,p] — per-head GEMM ----
+            # Offset-0 staging tiles (dY16/opA) reused across the head loop; the
+            # staging region + the single trailing sync are shared over HPC heads.
             for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    dY16[ll, pp] = T.Cast(dtype, dY[hh, ll, pp])
+                    opA[ll, pp] = T.Cast(
+                        dtype, x[batch_idx, base + ll, head_idx, pp]
+                    )
+                T.sync_threads()
                 T.clear(DYX_frag)
                 T.gemm(
-                    dY16[hh * L : hh * L + L, 0:headdim],
-                    opA[hh * L : hh * L + L, 0:headdim],
+                    dY16[0:L, 0:headdim],
+                    opA[0:L, 0:headdim],
                     DYX_frag,
                     transpose_B=True,
                 )
                 T.copy(DYX_frag, DYX[hh, 0:L, 0:L])
-            T.sync_threads()
+                T.sync_threads()
 
             # ---- (B) dC_off + (C) dC_diag + dC store, per head ----
             for hh in T.serial(HPC):
                 head_idx = hb * HPC + hh
                 group_idx = head_idx // heads_per_group
-                # (B) dC_off[l,n] = sum_p dY[l,p]*prev_states[p,n]
+                # (B) dC_off[l,n] = sum_p dY[l,p]*prev_states[p,n] (offset-0 staging)
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    dY16[ll, pp] = T.Cast(dtype, dY[hh, ll, pp])
                 T.copy(
                     prev_states[
                         batch_idx, chunk_idx, head_idx, 0:headdim, 0:dstate
@@ -2449,20 +2471,20 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
                 T.sync_threads()
                 T.clear(dCoff_frag)
                 T.gemm(
-                    dY16[hh * L : hh * L + L, 0:headdim],
+                    dY16[0:L, 0:headdim],
                     opB[0:headdim, 0:dstate],
                     dCoff_frag,
                 )
                 T.copy(dCoff_frag, store_fp32[0:L, 0:dstate])
                 T.sync_threads()
-                # (C) dC_diag[l,n] = sum_{s<=l} M[l,s]*B[s,n] (masked operand)
+                # (C) dC_diag[l,n] = sum_{s<=l} M[l,s]*B[s,n] (masked operand, offset-0)
                 for ls in T.Parallel(L * L):
                     ll = ls // L
                     ss = ls % L
                     lmat = T.exp2((dacs[hh, ll] - dacs[hh, ss]) * p)
                     dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
                     m_val = DYX[hh, ll, ss] * lmat * dt_s
-                    opA[hh * L + ll, ss] = T.Cast(
+                    opA[ll, ss] = T.Cast(
                         dtype, T.if_then_else(ss <= ll, m_val, T.Cast(accum_dtype, 0))
                     )
                 T.copy(
@@ -2473,7 +2495,7 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
                 T.sync_threads()
                 T.clear(dCdiag_frag)
                 T.gemm(
-                    opA[hh * L : hh * L + L, 0:L],
+                    opA[0:L, 0:L],
                     opB[0:L, 0:dstate],
                     dCdiag_frag,
                 )
@@ -2502,7 +2524,7 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
                     ll = lp // headdim
                     pp = lp % headdim
                     sd = T.exp2(dacs[hh, ll] * p)
-                    opA[hh * L + ll, pp] = T.Cast(dtype, dY[hh, ll, pp] * sd)
+                    opA[ll, pp] = T.Cast(dtype, dY[hh, ll, pp] * sd)
                 T.copy(
                     C[batch_idx, base : base + L, group_idx, 0:dstate],
                     opB[0:L, 0:dstate],
@@ -2511,7 +2533,7 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
                 T.sync_threads()
                 T.clear(dchunk_frag)
                 T.gemm(
-                    opA[hh * L : hh * L + L, 0:headdim],
+                    opA[0:L, 0:headdim],
                     opB[0:L, 0:dstate],
                     dchunk_frag,
                     transpose_A=True,
@@ -2667,11 +2689,18 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
             chunk_idx = bx // batch
             base = chunk_idx * chunk_size
 
+            # NOTE (§TB1 offset-0 fix): this tilelang's T.gemm REQUIRES the A
+            # operand's first-dim offset == 0, so we CANNOT slice a tall
+            # (HPC*L,...) band into per-head sub-GEMMs. The amortization lever is
+            # preserved by REUSING one offset-0 head-sized staging tile across the
+            # serial head loop (single alloc, one sync per phase over the band) —
+            # the staging region + syncs are shared, the GEMM is issued per head.
             dacs = T.alloc_shared((HPC, L), accum_dtype)
             dAcs_acc = T.alloc_shared((HPC, L), accum_dtype)
             DYX = T.alloc_shared((HPC, L, L), dtype, scope="shared")
-            dY16 = T.alloc_shared((HPC * L, headdim), dtype, scope="shared")
-            opA = T.alloc_shared((HPC * L, _maxlp), dtype, scope="shared")
+            dY_band = T.alloc_shared((HPC, L, headdim), dtype, scope="shared")
+            dY16 = T.alloc_shared((L, headdim), dtype, scope="shared")
+            opA = T.alloc_shared((_maxlp, _maxlp), dtype, scope="shared")
             opB = T.alloc_shared((_maxlp, dstate), dtype, scope="shared")
             store_f32 = T.alloc_shared((_maxlp, _maxpn), accum_dtype, scope="shared")
             DYX_frag = T.alloc_fragment((L, L), accum_dtype)
@@ -2708,8 +2737,7 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                     x_v = T.Cast(accum_dtype, x[batch_idx, s, head_idx, pp])
                     dx[batch_idx, s, head_idx, pp] = d_v * dy_v
                     dD_local[0] = dD_local[0] + dy_v * x_v
-                    dY16[hh * L + ll, pp] = T.Cast(dtype, dy_v)
-                    opA[hh * L + ll, pp] = T.Cast(dtype, x_v)
+                    dY_band[hh, ll, pp] = T.Cast(dtype, dy_v)
                 T.atomic_add(dD[head_idx], dD_local[0])
             T.sync_threads()
 
@@ -2729,12 +2757,19 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                     )
             T.sync_threads()
 
-            # ---- (A) DYX per head (band, fp16 recompute tile) ----
+            # ---- (A) DYX per head (offset-0 staging tiles, reused across band) ----
             for hh in T.serial(HPC):
+                head_idx = hb * HPC + hh
+                for lp in T.Parallel(L * headdim):
+                    ll = lp // headdim
+                    pp = lp % headdim
+                    dY16[ll, pp] = dY_band[hh, ll, pp]
+                    opA[ll, pp] = T.Cast(dtype, x[batch_idx, base + ll, head_idx, pp])
+                T.sync_threads()
                 T.clear(DYX_frag)
                 T.gemm(
-                    dY16[hh * L : hh * L + L, 0:headdim],
-                    opA[hh * L : hh * L + L, 0:headdim],
+                    dY16[0:L, 0:headdim],
+                    opA[0:L, 0:headdim],
                     DYX_frag,
                     transpose_B=True,
                 )
@@ -2745,7 +2780,7 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                     DYX[hh, ll, ss] = T.Cast(dtype, store_f32[ll, ss])
                 T.sync_threads()
 
-            # ---- (D) dchunk_states per head (band, transpose_A) ----
+            # ---- (D) dchunk_states per head (offset-0 staging, transpose_A) ----
             for hh in T.serial(HPC):
                 head_idx = hb * HPC + hh
                 group_idx = head_idx // heads_per_group
@@ -2753,8 +2788,8 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                     ll = lp // headdim
                     pp = lp % headdim
                     sd = T.exp2(dacs[hh, ll] * p)
-                    opA[hh * L + ll, pp] = T.Cast(
-                        dtype, T.Cast(accum_dtype, dY16[hh * L + ll, pp]) * sd
+                    opA[ll, pp] = T.Cast(
+                        dtype, T.Cast(accum_dtype, dY_band[hh, ll, pp]) * sd
                     )
                 T.copy(
                     C[batch_idx, base : base + L, group_idx, 0:dstate],
@@ -2764,7 +2799,7 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                 T.sync_threads()
                 T.clear(dchunk_frag)
                 T.gemm(
-                    opA[hh * L : hh * L + L, 0:headdim],
+                    opA[0:L, 0:headdim],
                     opB[0:L, 0:dstate],
                     dchunk_frag,
                     transpose_A=True,
@@ -2795,7 +2830,7 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                             for pp in T.serial(headdim):
                                 cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
                                 accn[0] = accn[0] + T.Cast(
-                                    accum_dtype, dY16[hh * L + ll, pp]
+                                    accum_dtype, dY_band[hh, ll, pp]
                                 ) * cs
                             c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
                             cdiag = T.alloc_local((1,), accum_dtype)
@@ -2832,7 +2867,7 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                                     accum_dtype, C[batch_idx, base + ll, group_idx, nn]
                                 )
                                 acc[0] = acc[0] + T.Cast(
-                                    accum_dtype, dY16[hh * L + ll, pp]
+                                    accum_dtype, dY_band[hh, ll, pp]
                                 ) * c_v * lmat
                             dinp[batch_idx, sidx, head_idx, pp, nn] = (
                                 dinp[batch_idx, sidx, head_idx, pp, nn] + acc[0]
