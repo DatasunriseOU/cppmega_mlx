@@ -3744,7 +3744,15 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
                             transpose_A=True,
                         )
                     T.sync_threads()
-                T.copy(dchunk_sc1, Psc1[hh, 0:headdim, 0:dstate])
+                # drain the sc1 partial frag -> 2D store_f32 (vectorizable copy) ->
+                # Psc1[hh] band via an element-wise Parallel copy (a direct frag->3D-
+                # slice T.copy mis-vectorizes to float4 vs simdgroup_float8x8 in MSL).
+                T.copy(dchunk_sc1, store_f32[0:headdim, 0:dstate])
+                T.sync_threads()
+                for pn in T.Parallel(headdim * dstate):
+                    pp = pn // dstate
+                    nn = pn % dstate
+                    Psc1[hh, pp, nn] = store_f32[pp, nn]
                 T.sync_threads()
                 T.copy(dchunk_frag, store_f32[0:headdim, 0:dstate])
                 T.sync_threads()
