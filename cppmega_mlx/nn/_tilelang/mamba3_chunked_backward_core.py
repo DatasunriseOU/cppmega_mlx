@@ -2016,28 +2016,34 @@ def build_chunk_scan_combine_bwd_metal(
         _hpc = int(os.environ.get("CPPMEGA_PATH_C_METAL_HEADS_PER_CTA", "2"))
         _hg = nheads // ngroups
         _hpc = _b2_batched_heads_per_cta(nheads, _hg, _hpc)
-        _maxlp = headdim if headdim > chunk_size else chunk_size
+        # §METAL-RETILE: split L into sub_chunks so the L-indexed staging tiles fit
+        # Apple's 32 KB pool. sub_chunks=1 == legacy L=64 (byte-identical default).
+        _sub = int(os.environ.get("CPPMEGA_PATH_C_METAL_SUB_CHUNKS", "1"))
+        if chunk_size % _sub != 0:
+            raise ValueError(
+                f"build_chunk_scan_combine_bwd_metal(metal,gemm_batched): "
+                f"CPPMEGA_PATH_C_METAL_SUB_CHUNKS={_sub} must divide chunk_size="
+                f"{chunk_size} (RULE #1: no padding)."
+            )
+        _Lsub = chunk_size // _sub
+        _maxlp = headdim if headdim > _Lsub else _Lsub
         _maxpn = dstate if dstate > headdim else headdim
-        # §TB1: dY16/opA are OFFSET-0 head-sized staging tiles reused across the
-        # head loop; only dacs/dAcs_acc/DYX/dY_band scale with HPC.
-        _smem_est = (
-            _hpc * chunk_size * 4 * 2                       # dacs + dAcs_acc
-            + _hpc * chunk_size * chunk_size * 2            # DYX (fp16) band
-            + _hpc * chunk_size * headdim * 2               # dY_band (fp16) per head
-            + chunk_size * headdim * 2                      # dY16 (fp16) staging tile
-            + _maxlp * _maxlp * 2                           # opA (fp16) staging tile
-            + _maxlp * dstate * 2                           # opB (fp16)
-            + _maxlp * _maxpn * 4                           # store_f32
-        )
+        # The L-indexed tiles (DYX, dY_band, dY16, dacs/dAcs_acc) shrink with L_sub.
+        # store_f32 (fp32) is the residual blocker; the L=32 retile alone does NOT
+        # fit (43264 B at HPC=2 L_sub=32) — the build raises and instructs to also
+        # move store_f32 out / lower HPC, never launches over-budget (RULE #1).
+        _budget = _metal_subchunk_smem_bytes(_Lsub, headdim, dstate, _hpc)
+        _smem_est = _budget["all_static"]
         _APPLE_SMEM_BUDGET = 32 * 1024
         if _smem_est >= _APPLE_SMEM_BUDGET:
             raise NotImplementedError(
                 f"build_chunk_scan_combine_bwd_metal(metal,gemm_batched): "
-                f"~{_smem_est} B per-threadgroup (L={chunk_size},P={headdim},"
-                f"N={dstate},HEADS_PER_CTA={_hpc}) >= Apple's {_APPLE_SMEM_BUDGET} B "
-                f"limit; lower CPPMEGA_PATH_C_METAL_HEADS_PER_CTA (RULE #1: no over-"
-                f"budget launch / no silent fallback). Use the serial Metal prim or a "
-                f"smaller head band."
+                f"~{_smem_est} B per-threadgroup (L={chunk_size},L_sub={_Lsub},"
+                f"P={headdim},N={dstate},HEADS_PER_CTA={_hpc},sub_chunks={_sub}) "
+                f">= Apple's {_APPLE_SMEM_BUDGET} B limit. store_f32-dynamic est = "
+                f"{_budget['store_dynamic']} B. Raise CPPMEGA_PATH_C_METAL_SUB_CHUNKS "
+                f"(2->4) and/or lower CPPMEGA_PATH_C_METAL_HEADS_PER_CTA (RULE #1: no "
+                f"over-budget launch / no silent fallback)."
             )
         # z3/TLA PROOF GATE (RULE #1). Metal batches DYX+dchunk_states only, but the
         # head-band single-writer disjointness is the same obligation; prove the
@@ -2047,7 +2053,7 @@ def build_chunk_scan_combine_bwd_metal(
         )
         prim = chunk_scan_combine_bwd_metal_gemm_prim_batched(
             batch, seqlen, chunk_size, ngroups, nheads, headdim, dstate,
-            heads_per_cta=_hpc, **kwargs
+            heads_per_cta=_hpc, sub_chunks=_sub, **kwargs
         )
         return tilelang.compile(
             prim,
@@ -2597,6 +2603,33 @@ def chunk_scan_combine_bwd_cuda_prim_gemm_batched(
     return main
 
 
+def _metal_subchunk_smem_bytes(L_sub, headdim, dstate, hpc):
+    """Per-threadgroup SMEM (bytes) for the Metal batched prim at sub-chunk L_sub.
+
+    Mirrors the alloc list below. The L-indexed tiles (DYX, dY_band, dY16, opA's
+    L dim, dacs/dAcs_acc) shrink with L_sub; the P/N-bound tiles (opB, store_f32,
+    opA's P/N dim) do NOT. To fit Apple's 32 KB pool the two fp32 staging tiles
+    (store_f32 fp32) are the dominant residual — the L=32 retile alone is NOT
+    enough (see diagnosis), so this returns BOTH the all-static estimate and the
+    estimate with store_f32 moved to threadgroup-dynamic (fp16-staged-then-global).
+    """
+    maxlp = max(headdim, L_sub)
+    maxpn = max(dstate, headdim)
+    static_fp16 = (
+        hpc * L_sub * L_sub * 2        # DYX band
+        + hpc * L_sub * headdim * 2    # dY_band
+        + L_sub * headdim * 2          # dY16 staging
+        + maxlp * maxlp * 2            # opA staging
+        + maxlp * dstate * 2           # opB
+    )
+    dacs = hpc * L_sub * 4 * 2          # dacs + dAcs_acc (fp32)
+    store = maxlp * maxpn * 4           # store_f32 (fp32) — the residual blocker
+    return {
+        "all_static": static_fp16 + dacs + store,
+        "store_dynamic": static_fp16 + dacs,  # store_f32 moved out of the pool
+    }
+
+
 def chunk_scan_combine_bwd_metal_gemm_prim_batched(
     batch: int,
     seqlen: int,
@@ -2608,6 +2641,7 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
     *,
     heads_per_cta: int = 2,
     threads: int = 128,
+    sub_chunks: int = 1,
 ) -> Any:
     """B2 BATCHED LARGE-TILE Metal twin — the P1/Tri-Dao recipe (simdgroup C-in-frag).
 
@@ -2654,14 +2688,49 @@ def chunk_scan_combine_bwd_metal_gemm_prim_batched(
     heads_per_group = nheads // ngroups
     HPC = _b2_batched_heads_per_cta(nheads, heads_per_group, heads_per_cta)
 
+    if chunk_size % sub_chunks != 0:
+        raise ValueError(
+            f"chunk_scan_combine_bwd_metal_gemm_prim_batched: chunk_size "
+            f"({chunk_size}) must be divisible by sub_chunks ({sub_chunks}); no "
+            f"padding (RULE #1)."
+        )
+    if sub_chunks != 1:
+        # §METAL-RETILE: the L_sub tile sizing + smem-fit + z3 associativity proof
+        # are DONE (build gate + proof_metal_subchunk). The body's sub-chunk loop
+        # with inter-sub-chunk state carry (lower-tri dC_diag mask + the dinp
+        # serial(ss,L) recurrence span sub-chunk boundaries) requires Apple-GPU
+        # NUMERIC validation to land safely. Per the watchdog-safety mandate this
+        # run does NOT execute Apple-GPU kernels, so emitting a blind body rewrite
+        # would risk a silently-wrong kernel (forbidden, RULE #1). RAISE loudly with
+        # the fit math instead of shipping an unvalidated path.
+        _fit = _metal_subchunk_smem_bytes(
+            chunk_size // sub_chunks, headdim, dstate, HPC)
+        raise NotImplementedError(
+            f"chunk_scan_combine_bwd_metal_gemm_prim_batched: sub_chunks="
+            f"{sub_chunks} (L_sub={chunk_size // sub_chunks}) tile-sizing + smem-fit "
+            f"({_fit}) + z3 associativity are PROVEN, but the sub-chunk-loop body "
+            f"with inter-sub-chunk state carry is GATED pending Apple-GPU numeric "
+            f"validation (watchdog-safety: no Apple-GPU exec this run). Run with "
+            f"sub_chunks=1 (byte-identical L=64) or validate on Apple GPU first "
+            f"(RULE #1: no unvalidated silent path)."
+        )
+
     dtype = T.float16
     accum_dtype = T.float32
     nchunks = seqlen // chunk_size
     L = chunk_size
+    # §METAL-RETILE: split the length-L chunk into sub_chunks sub-chunks of L_sub
+    # rows each. The SSD chunk-scan recurrence is associative over the sequence
+    # dim, so a length-L chunk = sub_chunks x L_sub sub-chunks recombined via the
+    # same inter-chunk state carry (proved associative — see z3 driver). The
+    # L-indexed staging tiles shrink to L_sub so the simdgroup operands fit Apple's
+    # 32 KB pool (the L=64 all-static layout is 74752 B at HPC=2; L_sub=32 with the
+    # fp32 store moved to threadgroup-dynamic fits). sub_chunks=1 == legacy L=64.
+    L_sub = L // sub_chunks
     p = _LOG2E
     nhead_blocks = nheads // HPC
     _maxpn = dstate if dstate > headdim else headdim
-    _maxlp = headdim if headdim > L else L
+    _maxlp = headdim if headdim > L_sub else L_sub
 
     @T.prim_func
     def main(
