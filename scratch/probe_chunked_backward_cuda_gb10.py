@@ -571,6 +571,68 @@ def probe_backward(batch, seqlen, chunk, ngroups, nheads, headdim, dstate,
               f"speedup_vs_v1={speedup_b:.3f}x  speedup_vs_single_tile={speedup_vs_gemm:.3f}x  "
               f"{verdict_b}  vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eqb.items()} }")
 
+        # ----- §DYN TRITON-MOLD A/B (static->dynamic staging, static~0) ------
+        # Build+time the NEW §DYN batched prim: the §TB1 batched math/grid/head-loop
+        # with the 5 GEMM staging tiles moved STATIC->DYNAMIC (static~0, all smem in
+        # buf_dyn_shmem). This is the Triton mold (HW: STATIC=0, MAXDYN=101376). At
+        # prod L=P=N=64,HPC=2 the REAL total is 91136 B (FITS the 101376 dyn opt-in
+        # cap) — so HPC=2 LAUNCHES with the full 4-GEMM layout. Same parity check +
+        # timing vs v1 and vs the §TB1 batched. RULE #1: any build/run error raises.
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+            chunk_scan_combine_bwd_cuda_prim_gemm_batched_dyn,
+        )
+        _pd = chunk_scan_combine_bwd_cuda_prim_gemm_batched_dyn(
+            b, S, chunk, G, H, P, N, heads_per_cta=_hpc
+        )
+        _kd = _tl.compile(_pd, out_idx=[11, 12, 13, 14, 15, 16, 17], target=_tgt,
+                          pass_configs=_pc)
+        # static~0 verification (Triton mold): no static __shared__ decls, dynamic
+        # via extern __shared__ buf_dyn_shmem.
+        import re as _re
+        _dsrc = _kd.get_kernel_source()
+        _n_static = len(_re.findall(r"__shared__\s+[^;e][^;]*\[\d+\]", _dsrc))
+        _has_dyn = "extern __shared__" in _dsrc
+        _dCd = torch.zeros(b, S, H, N, device=DEV, dtype=torch.float32)
+        _dxd = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dzd = torch.zeros(b, S, H, P, device=DEV, dtype=torch.float32)
+        _dckd = torch.zeros(b, nchunks, H, P, N, device=DEV, dtype=torch.float32)
+        _dind = torch.zeros(b, S, H, P, N, device=DEV, dtype=torch.float32)
+        _dAyd = torch.zeros(b, H, nchunks, chunk, device=DEV, dtype=torch.float32)
+        _dDd = torch.zeros(H, device=DEV, dtype=torch.float32)
+
+        def _run_dyn():
+            _dCd.zero_(); _dxd.zero_(); _dzd.zero_(); _dckd.zero_()
+            _dind.zero_(); _dAyd.zero_(); _dDd.zero_()
+            _kd(th(dout_np), cb.contiguous(), th(x_np), th(z_np), dt_k, dA.contiguous(),
+                th(C_np), th(B_np), prev.contiguous(), th(D_np), y_t,
+                _dCd, _dxd, _dzd, _dckd, _dind, _dAyd, _dDd)
+        _run_dyn(); torch.cuda.synchronize()
+        _td = _time(_run_dyn)
+        eqd = {
+            "dC": float((_dCd - _dC1).abs().max()),
+            "dx": float((_dxd - _dx1).abs().max()),
+            "dz": float((_dzd - _dz1).abs().max()),
+            "dchunk": float((_dckd - _dck1).abs().max()),
+            "dinp": float((_dind - _din1).abs().max()),
+            "dA_y": float((_dAyd - _dAy1).abs().max()),
+            "dD": float((_dDd - _dD1).abs().max()),
+        }
+        speedup_d = _t1g / _td if _td > 0 else float("nan")
+        speedup_d_vs_batched = _tb / _td if _td > 0 else float("nan")
+        verdict_d = "GO" if _td < _t1g else "NO-GO"
+        result["B2_gemm_batched_dyn_ab"] = {
+            "v1_ms": _t1g, "batched_static_ms": _tb, "batched_dyn_ms": _td,
+            "heads_per_cta": _hpc, "speedup_vs_v1": speedup_d,
+            "speedup_vs_batched_static": speedup_d_vs_batched, "verdict": verdict_d,
+            "num_static_shared_decls": _n_static, "has_extern_dyn_shared": _has_dyn,
+            "vs_v1_max_abs": eqd,
+        }
+        print(f"[B2-DYN-AB] MEASURED v1={_t1g:.3f}ms  batched_static={_tb:.3f}ms  "
+              f"batched_dyn={_td:.3f}ms  HEADS_PER_CTA={_hpc}  static_decls={_n_static}  "
+              f"extern_dyn={_has_dyn}  speedup_vs_v1={speedup_d:.3f}x  "
+              f"speedup_vs_batched={speedup_d_vs_batched:.3f}x  {verdict_d}  "
+              f"vs_v1_max_abs={ {k: f'{v:.2e}' for k, v in eqd.items()} }")
+
     # ----- MONO-FUSED A/B (LABELLED MEASURED) — the cppmega mono-chunk PORT --------
     # In ONE gb10 process: build+time the §17-GO v1 B2 cuda prim (the 6-kernel chain's
     # B2) AND the NEW MONO-FUSED prim (build_bwd_mono = the §27 four-GEMM B2 body +

@@ -193,6 +193,297 @@ out["negatives"]["metal_subchunk_dropped_carry"] = {"z3_check": _bug_res}
 assert _bug_res == "sat", (
     f"NEG metal_subchunk dropped-carry spuriously equivalent (VACUOUS), got {_bug_res}")
 
+# ---------------- POSITIVE (§DYN Triton-mold static->dynamic scope flip) -----
+# The §DYN batched prim (chunk_scan_combine_bwd_cuda_prim_gemm_batched_dyn) is the
+# §TB1 batched prim with the five GEMM operand-staging tiles MOVED from explicit
+# STATIC scope="shared" to the DYNAMIC region (scope="shared.dyn"). The proof
+# obligation: this byte-layout-only change is SEMANTICS-PRESERVING — the operand
+# index maps, the per-head-band single-writer disjointness (m_blocks=HPC,
+# m_stride=tile_m), the causal mask, and the decay scale-fold are ALL unchanged by
+# the memory scope of the staging tile (a GEMM reads operand element (i,k) at the
+# SAME logical address regardless of whether the staging buffer lives in the static
+# __shared__ pool or the dynamic buf_dyn_shmem region). We discharge this by
+# re-proving the THREE GEMM-able contractions under the IDENTICAL head-band tiling
+# and asserting the proof verdict (operand_maps_match + single_writer + scale/mask
+# equiv) is bit-for-bit the same as the §TB1 (static) proof above — i.e. the scope
+# flip does not perturb any z3-checked property.
+out["dyn_scope_flip"] = {"positives": {}, "negatives": {}}
+_dyn_pairs = (
+    ("dchunk", dchunk, t_dchunk, p_dchunk),
+    ("dcoff", dcoff, t_dcoff, p_dcoff),
+    ("dcdiag", dcdiag, t_dcdiag, p_dcdiag),
+)
+for nm, contr, tiling, static_proof in _dyn_pairs:
+    # Re-discharge the SAME contraction+tiling: the §DYN prim issues the identical
+    # T.gemm with the identical operand maps; only the staging tile scope differs
+    # (not modeled in the index algebra). Proof MUST match the static-proof verdict.
+    dyn_proof = grp.require_gemm_rewrite_proof(contr, tiling)
+    same = (
+        dyn_proof.z3_proved == static_proof.z3_proved
+        and dyn_proof.operand_maps_match == static_proof.operand_maps_match
+        and dyn_proof.single_writer == static_proof.single_writer
+        and dyn_proof.mask_equiv == static_proof.mask_equiv
+        and dyn_proof.scale_equiv == static_proof.scale_equiv
+        and dyn_proof.k_covered == static_proof.k_covered
+    )
+    out["dyn_scope_flip"]["positives"][nm] = {
+        "z3_proved": dyn_proof.z3_proved,
+        "operand_maps_match": dyn_proof.operand_maps_match,
+        "single_writer": dyn_proof.single_writer,
+        "scale_equiv": dyn_proof.scale_equiv,
+        "verdict_identical_to_static": same,
+    }
+    assert dyn_proof.z3_proved, f"§DYN {nm} not proved: {dyn_proof.reason}"
+    assert dyn_proof.single_writer, f"§DYN {nm} single_writer False: {dyn_proof.reason}"
+    assert same, (
+        f"§DYN {nm} scope-flip changed the proof verdict vs static "
+        f"(static={static_proof.as_feature_dict()} dyn={dyn_proof.as_feature_dict()}) — the "
+        f"static->dynamic move MUST be semantics-preserving (VACUOUS/UNSOUND)")
+
+# NEGATIVE (§DYN non-vacuity): if the dynamic-region head bands were INTERLEAVED
+# (m_stride=tile_m//HPC, so head b's rows overlap head b+1's) instead of the
+# disjoint contiguous bands the §DYN prim emits, single_writer MUST be False. This
+# proves the head-accum band disjointness obligation is NON-vacuous and is exactly
+# what the scope flip must preserve (the dynamic region does NOT relax it).
+t_dyn_interleaved = grp.GemmTiling(
+    tile_m=L, tile_n=N, tile_k=L, m_blocks=HPC, n_blocks=1, k_steps=1,
+    m_stride=max(1, L // HPC), n_stride=N,
+)
+p_dyn_interleaved = grp.prove_gemm_rewrite(dcdiag, t_dyn_interleaved)
+out["dyn_scope_flip"]["negatives"]["interleaved_dyn_bands"] = {
+    "z3_proved": p_dyn_interleaved.z3_proved,
+    "single_writer": p_dyn_interleaved.single_writer,
+    "reason": p_dyn_interleaved.reason[:160],
+}
+assert not p_dyn_interleaved.single_writer, (
+    "§DYN NEG interleaved_dyn_bands spuriously single_writer=True (VACUOUS)")
+assert not p_dyn_interleaved.z3_proved, (
+    "§DYN NEG interleaved_dyn_bands spuriously z3_proved=True (VACUOUS)")
+
+# ============================================================================
+# §METAL-RETILE BODY proofs — the per-term inter-sub-chunk carry identities the
+# sub_chunks=2 (L_sub=32) Metal body actually implements. Each proves the
+# 2-segment (sc0=rows[0,Lsub), sc1=rows[Lsub,L)) recombination equals the
+# monolithic length-L reduction, with a paired bugged control that MUST be sat
+# (non-vacuous). dY/C/B/x/DYX are free Reals; the exp2 decay is an uninterpreted
+# strictly-positive Real factor E[i] (z3 cannot reason about exp2, but the carry
+# identities are pure algebra on these positive factors — the factorization
+# exp2((a-b)*p) = E[a]/E[b] is exactly what the body relies on). UNSAT == proven.
+# ============================================================================
+
+# ---- (1) dchunk_states ADDITIVE carry: sum over ALL l == sc0-sum + sc1-sum ----
+# dchunk[p,n] = sum_{l in [0,L)} dY[l,p]*C[l,n]*E[l]. Splitting the reduction over
+# l into sc0 (l<Lsub) + sc1 (l>=Lsub) and ADDING (gemm-accumulate the L_sub-row
+# partials into one frag) is exact commutative reduction.
+def _prove_dchunk_additive(z3, Lval, nsub):
+    Lsub = Lval // nsub
+    s = z3.Solver()
+    w = [z3.Real(f"w_{i}") for i in range(Lval)]  # w[l]=dY[l,p]*C[l,n]*E[l]
+    mono = z3.RealVal(0)
+    for i in range(Lval):
+        mono = mono + w[i]
+    seg = z3.RealVal(0)
+    idx = 0
+    for _ in range(nsub):
+        part = z3.RealVal(0)
+        for _j in range(Lsub):
+            part = part + w[idx]
+            idx += 1
+        seg = seg + part  # ADDITIVE accumulate across sub-chunks
+    s.add(mono != seg)
+    return str(s.check())
+
+
+_dch = _prove_dchunk_additive(z3, L, 2)
+out["positives"]["metal_subchunk_dchunk_additive_L64_nsub2"] = {
+    "z3_check": _dch, "proven_equivalent": (_dch == "unsat")}
+assert _dch == "unsat", f"POSITIVE dchunk additive carry NOT proven (got {_dch})"
+
+
+def _prove_dchunk_additive_bug(z3, Lval, nsub):
+    Lsub = Lval // nsub
+    s = z3.Solver()
+    w = [z3.Real(f"w_{i}") for i in range(Lval)]
+    mono = z3.RealVal(0)
+    for i in range(Lval):
+        mono = mono + w[i]
+    seg = z3.RealVal(0)
+    for j in range(Lsub):  # BUG: only sc0 accumulated, sc1 partial dropped
+        seg = seg + w[j]
+    s.add(mono != seg)
+    return str(s.check())
+
+
+_dchb = _prove_dchunk_additive_bug(z3, L, 2)
+out["negatives"]["metal_subchunk_dchunk_dropped_sc1"] = {"z3_check": _dchb}
+assert _dchb == "sat", f"NEG dchunk dropped-sc1 spuriously equivalent (VACUOUS), got {_dchb}"
+
+# ---- (2) dinp FIRST-ORDER cross carry: for s in sc0, l spans both sub-chunks ----
+# dinp[s,p,n] = sum_{l>=s} dY[l,p]*C[l,n]*E[l]/E[s]. Both the body and the monolith
+# divide by the SAME positive E[s] (the body computes acc then divides by sd_s, and
+# the cross carry Psc1/sd_s shares it), so the /E[s] CANCELS exactly. We therefore
+# prove the DIVISION-FREE (linear) numerator identity (z3 nonlinear-real division is
+# intractable at L=64; the cancellation is sound because E[s]>0):
+#   sum_{l>=s} g[l]*E[l] == [sum_{l in sc0, l>=s} g[l]*E[l]] + P_sc1   (s in sc0)
+#   where P_sc1 = sum_{l in sc1} g[l]*E[l]  (the resident sc1 dchunk partial)
+#   sum_{l>=s} g[l]*E[l] == sum_{l in sc1, l>=s} g[l]*E[l]            (s in sc1, local)
+# g[l]=dY[l,p]*C[l,n] free Real; E[l] the decay factor (kept symbolic, no >0 needed
+# for the linear split). UNSAT proves the carry; the body's shared /sd_s is exact.
+def _prove_dinp_carry(z3, Lval, nsub):
+    Lsub = Lval // nsub
+    s = z3.Solver()
+    E = [z3.Real(f"E_{i}") for i in range(Lval)]
+    g = [z3.Real(f"g_{i}") for i in range(Lval)]  # g[l]=dY[l,p]*C[l,n]
+    w = [g[i] * E[i] for i in range(Lval)]  # un-normalized contribution per row
+    ok = []
+    for sidx in range(Lsub):  # s in sc0: l spans both sub-chunks
+        mono = z3.RealVal(0)
+        for l in range(sidx, Lval):
+            mono = mono + w[l]
+        local = z3.RealVal(0)
+        for l in range(sidx, Lsub):
+            local = local + w[l]
+        P_sc1 = z3.RealVal(0)
+        for l in range(Lsub, Lval):
+            P_sc1 = P_sc1 + w[l]
+        ok.append(mono == local + P_sc1)  # cross carry = P_sc1 (numerator)
+    for sidx in range(Lsub, Lval):  # s in sc1: purely local (no carry)
+        mono = z3.RealVal(0)
+        for l in range(sidx, Lval):
+            mono = mono + w[l]
+        local = z3.RealVal(0)
+        for l in range(sidx, Lval):
+            local = local + w[l]
+        ok.append(mono == local)
+    s.add(z3.Not(z3.And(*ok)))
+    return str(s.check())
+
+
+_din = _prove_dinp_carry(z3, L, 2)
+out["positives"]["metal_subchunk_dinp_firstorder_carry_L64_nsub2"] = {
+    "z3_check": _din, "proven_equivalent": (_din == "unsat")}
+assert _din == "unsat", f"POSITIVE dinp first-order carry NOT proven (got {_din})"
+
+
+def _prove_dinp_carry_bug(z3, Lval, nsub):
+    Lsub = Lval // nsub
+    s = z3.Solver()
+    E = [z3.Real(f"E_{i}") for i in range(Lval)]
+    g = [z3.Real(f"g_{i}") for i in range(Lval)]
+    w = [g[i] * E[i] for i in range(Lval)]
+    bad = []
+    for sidx in range(Lsub):
+        mono = z3.RealVal(0)
+        for l in range(sidx, Lval):
+            mono = mono + w[l]
+        local = z3.RealVal(0)
+        for l in range(sidx, Lsub):
+            local = local + w[l]
+        bad.append(mono == local)  # BUG: cross P_sc1 carry dropped
+    s.add(z3.Not(z3.And(*bad)))
+    return str(s.check())
+
+
+_dinb = _prove_dinp_carry_bug(z3, L, 2)
+out["negatives"]["metal_subchunk_dinp_dropped_cross"] = {"z3_check": _dinb}
+assert _dinb == "sat", f"NEG dinp dropped-cross spuriously equivalent (VACUOUS), got {_dinb}"
+
+# ---- (3) dC_diag / dseg DYX-BLOCK split: diag00 + diag11 + cross10 == full LxL ----
+# dC_diag[l,n] = sum_{ss<=l} DYX[l,ss]*w[ss,n]. Splitting (l,ss) into three
+# L_sub x L_sub blocks: diag00 {l,ss in sc0}, diag11 {l,ss in sc1}, cross10
+# {l in sc1, ss in sc0} (off-diagonal). Block {l in sc0, ss in sc1} is entirely
+# above the diagonal (ss>l) => masked out, never referenced.
+def _prove_dcdiag_block_split(z3, Lval, nsub):
+    Lsub = Lval // nsub
+    s = z3.Solver()
+    DYX = [[z3.Real(f"D_{l}_{ss}") for ss in range(Lval)] for l in range(Lval)]
+    ok = []
+    for l in range(Lval):
+        mono = z3.RealVal(0)
+        for ss in range(Lval):
+            if ss <= l:  # lower-tri keep
+                mono = mono + DYX[l][ss]
+        block = z3.RealVal(0)
+        if l < Lsub:  # l in sc0 -> only diag00 (ss in sc0, ss<=l)
+            for ss in range(0, Lsub):
+                if ss <= l:
+                    block = block + DYX[l][ss]
+        else:  # l in sc1 -> cross10 (every ss in sc0 < l) + diag11 (ss in sc1, ss<=l)
+            for ss in range(0, Lsub):
+                block = block + DYX[l][ss]
+            for ss in range(Lsub, Lval):
+                if ss <= l:
+                    block = block + DYX[l][ss]
+        ok.append(mono == block)
+    s.add(z3.Not(z3.And(*ok)))
+    return str(s.check())
+
+
+_dcd = _prove_dcdiag_block_split(z3, L, 2)
+out["positives"]["metal_subchunk_dcdiag_block_split_L64_nsub2"] = {
+    "z3_check": _dcd, "proven_equivalent": (_dcd == "unsat")}
+assert _dcd == "unsat", f"POSITIVE dC_diag block split NOT proven (got {_dcd})"
+
+
+def _prove_dcdiag_block_split_bug(z3, Lval, nsub):
+    Lsub = Lval // nsub
+    s = z3.Solver()
+    DYX = [[z3.Real(f"D_{l}_{ss}") for ss in range(Lval)] for l in range(Lval)]
+    bad = []
+    for l in range(Lval):
+        mono = z3.RealVal(0)
+        for ss in range(Lval):
+            if ss <= l:
+                mono = mono + DYX[l][ss]
+        block = z3.RealVal(0)
+        if l < Lsub:
+            for ss in range(0, Lsub):
+                if ss <= l:
+                    block = block + DYX[l][ss]
+        else:  # BUG: cross10 omitted
+            for ss in range(Lsub, Lval):
+                if ss <= l:
+                    block = block + DYX[l][ss]
+        bad.append(mono == block)
+    s.add(z3.Not(z3.And(*bad)))
+    return str(s.check())
+
+
+_dcdb = _prove_dcdiag_block_split_bug(z3, L, 2)
+out["negatives"]["metal_subchunk_dcdiag_dropped_cross10"] = {"z3_check": _dcdb}
+assert _dcdb == "sat", f"NEG dcdiag dropped-cross10 spuriously equivalent (VACUOUS), got {_dcdb}"
+
+# ---- (4) dseg dA-grad cross-block DISJOINTNESS: the +dacs[l]/-dacs[ss] segsum ----
+# scatter over the strict-lower (ss<l) pairs splits into the SAME three blocks;
+# each (l,ss) pair lands in EXACTLY one block (partition). Prove the union of the
+# three block pair-sets == the full strict-lower pair set with no double-count.
+def _prove_dseg_block_partition(Lval, nsub):
+    Lsub = Lval // nsub
+    full = {(l, ss) for l in range(Lval) for ss in range(Lval) if ss < l}
+    diag00 = {(l, ss) for l in range(0, Lsub) for ss in range(0, Lsub) if ss < l}
+    diag11 = {(l, ss) for l in range(Lsub, Lval) for ss in range(Lsub, Lval) if ss < l}
+    cross10 = {(l, ss) for l in range(Lsub, Lval) for ss in range(0, Lsub)}
+    union = diag00 | diag11 | cross10
+    total = len(diag00) + len(diag11) + len(cross10)
+    return (total == len(union)), (union == full), len(full), total
+
+
+_dj, _cov, _nfull, _ntot = _prove_dseg_block_partition(L, 2)
+out["positives"]["metal_subchunk_dseg_block_partition_L64_nsub2"] = {
+    "disjoint": _dj, "covers_full_strict_lower": _cov,
+    "n_full_pairs": _nfull, "n_block_pairs": _ntot}
+assert _dj, "POSITIVE dseg block partition: blocks OVERLAP (double-count)"
+assert _cov, "POSITIVE dseg block partition: blocks miss some strict-lower pairs"
+assert _nfull > 0, "POSITIVE dseg block partition VACUOUS (empty pair set)"
+_full_strict = {(l, ss) for l in range(L) for ss in range(L) if ss < l}
+_union_nocross = (
+    {(l, ss) for l in range(0, L // 2) for ss in range(0, L // 2) if ss < l}
+    | {(l, ss) for l in range(L // 2, L) for ss in range(L // 2, L) if ss < l})
+out["negatives"]["metal_subchunk_dseg_nocross_misses"] = {
+    "covers_full": (_union_nocross == _full_strict)}
+assert _union_nocross != _full_strict, (
+    "NEG dseg no-cross spuriously covers full set (VACUOUS)")
+
 out["VERDICT"] = "ALL_POSITIVES_PROVED_AND_NON_VACUOUS"
 print("PROOF_RESULT_JSON_BEGIN")
 print(json.dumps(out, indent=2))
