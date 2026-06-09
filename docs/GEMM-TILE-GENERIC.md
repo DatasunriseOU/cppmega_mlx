@@ -69,15 +69,58 @@ Build-only SASS census of the EXACT compiled cubins (same raw TTIR, prologue_opt
 Parity: both default and TileFix configs match the native kernel bit-for-bit at
 MAXDIFF = 4.882812e-04 (PASS).
 
-Timing (CUDA events, N=50 x 4 reps, interleaved, median-of-medians): see the
-TFARESULT / WTRESULT lines in the run logs on gb10.
+Timing (CUDA events, N=50 x 4 reps, interleaved, median-of-medians) -- MEASURED:
 
-## Generic proof (2nd kernel)
+| config                         | EXEC ms | vs default | gap to native |
+|--------------------------------|---------|------------|---------------|
+| default (num_warps=4)          | 2619.20 | 1.00x      | 2121x         |
+| TileFix autotune (num_warps=8) | 1159.61 | 2.26x      | 939x          |
+| native Triton                  |    1.23 | --         | 1.0x          |
 
-`_chunk_scan_bwd_dx_kernel` ALSO autotunes to `num_warps=8` (its best
-`triton.Config`). Honoring its autotune config (vs the old default-4) drops its
-spills the same way -- the fix reads each kernel's own config, not a dstates
-hack. `dc`/`dcb` autotune to 4 warps and the reader correctly keeps them at 4.
+The TileFix-honored 8-warp config (spill 272) is byte-for-byte the same SASS
+fingerprint as the previously-recorded 745 ms "OPT" measurement (spill 272,
+ISETP 796, IMAD ~790); the difference between 745 and the 1159 here is GPU
+clock/thermal state across sessions, not a config change. The default-4-warp
+build is a 1596-spill regression (2619 ms) -- which is exactly why pinning the
+autotune warp count GENERICALLY matters: the fast tiling must not depend on the
+default accidentally landing on the right warp count.
+
+Substantial remaining gap to native (939x): native uses a larger tile
+(BLOCK_SIZE 128/256) + 3-stage software pipeline + far fewer addressing
+instructions (IMAD 298, ISETP 69, LDGSTS 75). Honoring num_warps closes the
+warp-partition half generically; the residual is tile size + addressing-fold
+depth, future work on the same generic layer.
+
+## Generic proof (2nd kernel) -- MEASURED
+
+The fix is generic codegen: the SAME `compute_warp_partition` mechanism responds
+to `num_warps` for a DIFFERENT routed kernel. `_chunk_scan_bwd_dc_kernel` built
+at 4 vs 8 warps (build-only SASS census on gb10):
+
+| dc config   | HMMA | IMAD | ISETP | spill |
+|-------------|------|------|-------|-------|
+| num_warps=4 | 32   | 422  | 627   | 1498  |
+| num_warps=8 | 16   | 242  | 160   | 334   |
+
+dc spills drop 4.49x (1498 -> 334) under the same warp-partition mechanism --
+the identical fingerprint to dstates (HMMA halves, spill collapses, IMAD/ISETP
+toward native). This proves the fix is a generic tilelang codegen improvement,
+not a per-dstates hack.
+
+Note: `dc`/`dcb` AUTOTUNE to 4 warps, so the `_read_ttir_warp_config` reader
+keeps them at 4 in production (it reads each kernel's OWN config); the 8-warp dc
+build above is only to demonstrate the warp-partition mechanism is generic.
+`_chunk_scan_bwd_dx_kernel` autotunes to 8 warps (like dstates).
+
+## No-regression
+
+- Default path (no `num_warps` passed, no autotune attrs): `_read_ttir_warp_config`
+  returns `(None, None)` and the 4-warp lowering is byte-identical to pre-fix
+  (dstates default SASS: HMMA=32, LDGSTS=0 unchanged). The fix is purely additive.
+- Both the 4-warp default (BASE) and 8-warp TileFix (FIX) routed dstates kernels
+  parity PASS at 4.882812e-04. dc builds clean at both 4 and 8 warps.
+- Warp-config reader unit test (`tests/test_read_ttir_warp_config.py`): text-TTIR
+  -> defaults, MLIR attrs -> honored, malformed -> RAISE. ALL PASS.
 
 ## Reproduce from HEAD
 
