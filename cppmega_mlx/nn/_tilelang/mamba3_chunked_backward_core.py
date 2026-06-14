@@ -368,34 +368,49 @@ def chunk_scan_combine_bwd_metal_prim(
             #   dinp[s,p,n] (grad wrt inp=dt*x⊗B) = sum_{l>=s} dY[l,p]*C[l,n]*Lmat[l,s]
             #   (NO extra dt: inp ALREADY includes dt — the proto einsum has none).
             #   dA grad from Lmat handled in the dseg loop below.
-            # RE-GRIDDED off the serial dstate (N) sweep (§Y-diag re-grid): map the
-            # FULL (ss,pp,nn) output grid (L*headdim*dstate work-items) over
-            # `threads` so the embarrassingly-parallel dstate axis is dispatched to
-            # threads instead of swept SERIALLY inside each lane. ONLY the ll
-            # reduction (a READ axis: l>=s lower-tri) stays serial. Each (ss,pp,nn)
-            # lane writes a UNIQUE dinp[*,base+ss,*,pp,nn] cell -> single-writer `=`,
-            # RACE-FREE, no atomics; the pre-zeroed `+=` collapses to `=`. Mirrors
-            # the dchunk_states (P*N T.Parallel + L serial) pattern already proven
-            # bit-correct in this kernel; the per-cell ll-sweep accumulation order is
-            # UNCHANGED (only the (ss,pp,nn)->lane assignment changes).
-            for spn in T.serial(0, L * headdim * dstate, threads):
+            # LEVER B (O(L) suffix-scan, STABLE adjacent-diff recurrence): the prior
+            # form recomputed an independent O(L) ll-reduction (with an in-loop exp2)
+            # PER (ss) -> O(L^2) MACs and O(L^2) exp2 per (pp,nn) work-item. The decay
+            # telescopes EXACTLY:
+            #   dinp[ss] = sum_{ll>=ss} dY[ll,pp]*C[ll,nn]*exp2((dacs[ll]-dacs[ss])*p)
+            #            = G0[ss] + exp2((dacs[ss+1]-dacs[ss])*p) * dinp[ss+1]
+            # with G0[ll]=dY[ll,pp]*C[ll,nn]. This is a telescoping REASSOCIATION of
+            # the SAME sum (mathematically identical), evaluated as a single descending
+            # ss-recurrence: O(L) MACs and O(L) exp2 per (pp,nn) instead of O(L^2).
+            # The multiplier exp2((dacs[ss+1]-dacs[ss])*p) is a BOUNDED adjacent step
+            # (dacs is the monotone-decreasing intra-chunk A*dt cumsum, so the exponent
+            # is <= 0 and the step lies in (0,1]) -> NEVER over/underflows, unlike the
+            # factored 1/exp2(dacs[ss]*p) form which diverges to inf at large |dacs|.
+            # Grid (pp,nn) over headdim*dstate lanes; each lane serializes the ss
+            # recurrence (the ONLY serial axis, and now O(L) not O(L^2)). Each lane
+            # still writes UNIQUE dinp[*,base+ss,*,pp,nn] cells -> race-free `=`.
+            for pn in T.serial(0, headdim * dstate, threads):
                 lane = T.get_thread_binding(0)
-                spni = spn + lane
-                if spni < L * headdim * dstate:
-                    ss = spni // (headdim * dstate)
-                    rem = spni % (headdim * dstate)
-                    pp = rem // dstate
-                    nn = rem % dstate
-                    sidx = base + ss
-                    acc = T.alloc_local((1,), accum_dtype)
-                    acc[0] = T.Cast(accum_dtype, 0)
-                    for ll in T.serial(ss, L):  # l >= s (lower-tri)
-                        lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                pni = pn + lane
+                if pni < headdim * dstate:
+                    pp = pni // dstate
+                    nn = pni % dstate
+                    S = T.alloc_local((1,), accum_dtype)
+                    S[0] = T.Cast(accum_dtype, 0)
+                    for ssr in T.serial(L):       # descending ss = L-1 .. 0
+                        ss = L - 1 - ssr
                         c_v = T.Cast(
-                            accum_dtype, C[batch_idx, base + ll, group_idx, nn]
+                            accum_dtype, C[batch_idx, base + ss, group_idx, nn]
                         )
-                        acc[0] = acc[0] + dY[ll, pp] * c_v * lmat
-                    dinp[batch_idx, sidx, head_idx, pp, nn] = acc[0]
+                        g0 = dY[ss, pp] * c_v
+                        # step = exp2((dacs[ss+1]-dacs[ss])*p); for ss=L-1 there is no
+                        # ss+1 -> seed S with G0 (decay of an empty tail is 1, S=0).
+                        # if_then_else is a VALUE (both arms evaluate) -> clamp the
+                        # ss+1 index to L-1 so the shared read stays IN-BOUNDS; the
+                        # ss=L-1 arm's step is discarded by the predicate anyway.
+                        ssn = T.if_then_else(ss < L - 1, ss + 1, L - 1)
+                        step = T.if_then_else(
+                            ss < L - 1,
+                            T.exp2((dacs[ssn] - dacs[ss]) * p),
+                            T.Cast(accum_dtype, 0),
+                        )
+                        S[0] = g0 + step * S[0]
+                        dinp[batch_idx, base + ss, head_idx, pp, nn] = S[0]
             T.sync_threads()
 
             # ---- Y_diag dA grad (dseg) — RE-GRIDDED off lane 0 ----
