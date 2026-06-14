@@ -368,25 +368,34 @@ def chunk_scan_combine_bwd_metal_prim(
             #   dinp[s,p,n] (grad wrt inp=dt*x⊗B) = sum_{l>=s} dY[l,p]*C[l,n]*Lmat[l,s]
             #   (NO extra dt: inp ALREADY includes dt — the proto einsum has none).
             #   dA grad from Lmat handled in the dseg loop below.
-            for sp in T.serial(0, L * headdim, threads):
+            # RE-GRIDDED off the serial dstate (N) sweep (§Y-diag re-grid): map the
+            # FULL (ss,pp,nn) output grid (L*headdim*dstate work-items) over
+            # `threads` so the embarrassingly-parallel dstate axis is dispatched to
+            # threads instead of swept SERIALLY inside each lane. ONLY the ll
+            # reduction (a READ axis: l>=s lower-tri) stays serial. Each (ss,pp,nn)
+            # lane writes a UNIQUE dinp[*,base+ss,*,pp,nn] cell -> single-writer `=`,
+            # RACE-FREE, no atomics; the pre-zeroed `+=` collapses to `=`. Mirrors
+            # the dchunk_states (P*N T.Parallel + L serial) pattern already proven
+            # bit-correct in this kernel; the per-cell ll-sweep accumulation order is
+            # UNCHANGED (only the (ss,pp,nn)->lane assignment changes).
+            for spn in T.serial(0, L * headdim * dstate, threads):
                 lane = T.get_thread_binding(0)
-                spi = sp + lane
-                if spi < L * headdim:
-                    ss = spi // headdim
-                    pp = spi % headdim
+                spni = spn + lane
+                if spni < L * headdim * dstate:
+                    ss = spni // (headdim * dstate)
+                    rem = spni % (headdim * dstate)
+                    pp = rem // dstate
+                    nn = rem % dstate
                     sidx = base + ss
-                    for nn in T.serial(dstate):
-                        acc = T.alloc_local((1,), accum_dtype)
-                        acc[0] = T.Cast(accum_dtype, 0)
-                        for ll in T.serial(ss, L):  # l >= s (lower-tri)
-                            lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                            c_v = T.Cast(
-                                accum_dtype, C[batch_idx, base + ll, group_idx, nn]
-                            )
-                            acc[0] = acc[0] + dY[ll, pp] * c_v * lmat
-                        dinp[batch_idx, sidx, head_idx, pp, nn] = (
-                            dinp[batch_idx, sidx, head_idx, pp, nn] + acc[0]
+                    acc = T.alloc_local((1,), accum_dtype)
+                    acc[0] = T.Cast(accum_dtype, 0)
+                    for ll in T.serial(ss, L):  # l >= s (lower-tri)
+                        lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                        c_v = T.Cast(
+                            accum_dtype, C[batch_idx, base + ll, group_idx, nn]
                         )
+                        acc[0] = acc[0] + dY[ll, pp] * c_v * lmat
+                    dinp[batch_idx, sidx, head_idx, pp, nn] = acc[0]
             T.sync_threads()
 
             # ---- Y_diag dA grad (dseg) — RE-GRIDDED off lane 0 ----
