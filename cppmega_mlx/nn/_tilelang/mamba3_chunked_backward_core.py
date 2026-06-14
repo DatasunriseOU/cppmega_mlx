@@ -229,6 +229,10 @@ def chunk_scan_combine_bwd_metal_prim(
             dacs = T.alloc_shared((L,), accum_dtype)        # dA_cumsum row (this head/chunk)
             dY = T.alloc_shared((L, headdim), accum_dtype)  # dY[l,p] (post split)
             dAcs_acc = T.alloc_shared((L,), accum_dtype)     # accumulated dA_cumsum grad
+            # DYX[l,s] = sum_p dY[l,p]*x[s,p] (recompute-killer, reused by dC_diag +
+            # dseg). fp16 so dY(16KB)+DYX(8KB)+dacs/dAcs_acc fit Apple's 32KB budget;
+            # the pp-reduction accumulates fp32, only the settled dyx narrows to fp16.
+            DYX = T.alloc_shared((L, L), dtype)              # dyx[l,s] fp16 (budget)
 
             # --- load dA_cumsum row, init dA grad accumulator ---
             for l in T.Parallel(L):
@@ -288,48 +292,58 @@ def chunk_scan_combine_bwd_metal_prim(
                     )
             T.sync_threads()
 
-            # ---- dC = dC_off + dC_diag (per (l,n)); dchunk_states + state_decay dA ----
-            #   dC_off[l,n]  = sum_p dY[l,p]*chunk_states[p,n]*state_decay[l]
-            #   dC_diag[l,n] = sum_{s<=l} Lmat[l,s]*dt_s*(sum_p dY[l,p]*x[s,p])*B[s,n]
+            # ---- BUILD shared DYX[l,s] = sum_p dY[l,p]*x[s,p] (ss<=ll, lower-tri) ----
+            # The SINGLE quantity the lane-0 prim recomputed dstate-times inside
+            # dC_diag AND a second time as dlmat in dseg. Built ONCE over L*L work
+            # items spread across `threads` (de-funnel: was lane 0, now all lanes).
+            # x is read from GLOBAL here (fp16 cache, already resident) instead of a
+            # staged XT shared tile, so the only added shared tile is fp16 DYX (8 KB)
+            # -> dY(16 KB)+DYX(8 KB)+dacs/dAcs_acc fits Apple's 32 KB budget. The pp
+            # reduction accumulates in fp32; only the settled dyx is narrowed to fp16.
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                acc = T.alloc_local((1,), accum_dtype)
+                acc[0] = T.Cast(accum_dtype, 0)
+                if ss <= ll:
+                    for pp in T.serial(headdim):
+                        acc[0] = acc[0] + dY[ll, pp] * T.Cast(
+                            accum_dtype, x[batch_idx, base + ss, head_idx, pp]
+                        )
+                DYX[ll, ss] = T.Cast(dtype, acc[0])
+            T.sync_threads()
+
+            # ---- dC = dC_off + dC_diag (per (l,n)); dstate_decay -> dAcs_acc ----
+            #   dC_off[l,n]  = sum_p dY[l,p]*prev_states[p,n]*state_decay[l]
+            #   dC_diag[l,n] = sum_{s<=l} Lmat[l,s]*dt_s*DYX[l,s]*B[s,n]
             #     Lmat[l,s] = exp(dacs[l]-dacs[s]).  inp=dt*x⊗B so dt_s appears here.
-            #   dstate_decay[l] = sum_n dC_off-inner * C[l,n] ; dA += dstate_decay*sd
-            for ll in T.serial(L):
+            #   dstate_decay[l] = sum_n (dC_off-inner)*C[l,n] ; dAcs_acc[l] += dsd*sd
+            # Re-gridded off lane 0: each (ll,nn) thread owns one dC cell (UNIQUE ->
+            # race-free write); dstate_decay's nn-reduction folds into dAcs_acc via
+            # atomic_add (the only multi-writer cell). dC slice was pre-zeroed above.
+            for ln in T.Parallel(L * dstate):
+                ll = ln // dstate
+                nn = ln % dstate
                 s = base + ll
                 sd = T.exp2(dacs[ll] * p)
-                dsd = T.alloc_local((1,), accum_dtype)
-                dsd[0] = T.Cast(accum_dtype, 0)
-                if T.get_thread_binding(0) == 0:
-                    for nn in T.serial(dstate):
-                        # dC_off inner: sum_p dY[l,p]*chunk_states[p,n]
-                        accn = T.alloc_local((1,), accum_dtype)
-                        accn[0] = T.Cast(accum_dtype, 0)
-                        for pp in T.serial(headdim):
-                            cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
-                            accn[0] = accn[0] + dY[ll, pp] * cs
-                        c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
-                        # dC_diag inner: sum_{s2<=l} Lmat[l,s2]*dt_s2*(sum_p dY*x)*B[s2,n]
-                        cdiag = T.alloc_local((1,), accum_dtype)
-                        cdiag[0] = T.Cast(accum_dtype, 0)
-                        for ss in T.serial(0, ll + 1):
-                            lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                            dt_s = T.Cast(
-                                accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss]
-                            )
-                            b_v = T.Cast(
-                                accum_dtype, B[batch_idx, base + ss, group_idx, nn]
-                            )
-                            dyx = T.alloc_local((1,), accum_dtype)
-                            dyx[0] = T.Cast(accum_dtype, 0)
-                            for pp in T.serial(headdim):
-                                dyx[0] = dyx[0] + dY[ll, pp] * T.Cast(
-                                    accum_dtype, x[batch_idx, base + ss, head_idx, pp]
-                                )
-                            cdiag[0] = cdiag[0] + lmat * dt_s * dyx[0] * b_v
-                        dC[batch_idx, s, head_idx, nn] = (
-                            dC[batch_idx, s, head_idx, nn] + accn[0] * sd + cdiag[0]
-                        )
-                        dsd[0] = dsd[0] + accn[0] * c_v
-                    dAcs_acc[ll] = dAcs_acc[ll] + dsd[0] * sd
+                # dC_off inner: accn = sum_p dY[l,p]*prev_states[p,n]
+                accn = T.alloc_local((1,), accum_dtype)
+                accn[0] = T.Cast(accum_dtype, 0)
+                for pp in T.serial(headdim):
+                    cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
+                    accn[0] = accn[0] + dY[ll, pp] * cs
+                # dC_diag inner: cdiag = sum_{s2<=l} Lmat[l,s2]*dt_s2*DYX[l,s2]*B[s2,n]
+                cdiag = T.alloc_local((1,), accum_dtype)
+                cdiag[0] = T.Cast(accum_dtype, 0)
+                for ss in T.serial(0, ll + 1):
+                    lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                    b_v = T.Cast(accum_dtype, B[batch_idx, base + ss, group_idx, nn])
+                    cdiag[0] = cdiag[0] + lmat * dt_s * DYX[ll, ss] * b_v
+                dC[batch_idx, s, head_idx, nn] = accn[0] * sd + cdiag[0]
+                # dstate_decay nn-reduction -> dAcs_acc[ll] (multi-writer: atomic).
+                c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
+                T.atomic_add(dAcs_acc[ll], accn[0] * c_v * sd)
             T.sync_threads()
 
             # dchunk_states[p,n] += sum_l dY[l,p]*C[l,n]*state_decay[l]
@@ -375,36 +389,26 @@ def chunk_scan_combine_bwd_metal_prim(
                         )
             T.sync_threads()
 
-            # Y_diag dA grad: dLmat[l,s] = sum_{p,n} dY[l,p]*C[l,n]*inp[s,p,n]*dt[s]
-            #   then dseg = dLmat*Lmat ; segsum-vjp: +dacs[l] over l>=s, -dacs[s] over s<l
-            # Realize via: contribution to dAcs_acc[l] += sum_{s<l} dseg[l,s];
-            #              contribution to dAcs_acc[s] -= sum_{l>s} dseg[l,s].
-            if T.get_thread_binding(0) == 0:
-                for ll in T.serial(L):
-                    for ss in T.serial(0, ll + 1):
-                        # dLmat[l,s]
-                        cb_v = T.Cast(
-                            accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss]
-                        )
-                        lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                        dt_s = T.Cast(
-                            accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss]
-                        )
-                        dlmat = T.alloc_local((1,), accum_dtype)
-                        dlmat[0] = T.Cast(accum_dtype, 0)
-                        for pp in T.serial(headdim):
-                            # sum_n C[l,n]*inp[s,p,n] == (cb folds C@B^T); use the
-                            # cb*x realization: M=cb*lmat*dt, so dM=dY*x; dseg=dM*M.
-                            dlmat[0] = dlmat[0] + dY[ll, pp] * T.Cast(
-                                accum_dtype, x[batch_idx, base + ss, head_idx, pp]
-                            )
-                        # M[l,s] = cb*lmat*dt_s ; dseg = (dM * M) where the lmat
-                        # factor carries the dA dependence.
-                        m_ls = cb_v * lmat * dt_s
-                        dseg = dlmat[0] * m_ls
-                        if ll > ss:
-                            dAcs_acc[ll] = dAcs_acc[ll] + dseg
-                            dAcs_acc[ss] = dAcs_acc[ss] - dseg
+            # ---- Y_diag dA grad (dseg) — RE-GRIDDED off lane 0 ----
+            #   dLmat[l,s] = sum_p dY[l,p]*x[s,p] == DYX[l,s] (reuse, zero recompute)
+            #   M[l,s] = cb*lmat*dt_s ; dseg = DYX[l,s]*M[l,s]
+            #   segsum-vjp: +dAcs_acc[l] / -dAcs_acc[s] over strictly l>s.
+            # Map the L*L (ll,ss) grid over T.Parallel with a BRANCHLESS body (NO
+            # `if ss<ll` mask): the strict-lower-tri selection is a multiplicative
+            # 0/1 `tri` factor (T.if_then_else yields a value, not control flow). The
+            # +/- scatter into shared dAcs_acc uses T.atomic_add (multi-writer).
+            for ls in T.Parallel(L * L):
+                ll = ls // L
+                ss = ls % L
+                cb_v = T.Cast(accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss])
+                lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
+                dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
+                tri = T.if_then_else(
+                    ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
+                )
+                dseg = DYX[ll, ss] * cb_v * lmat * dt_s * tri
+                T.atomic_add(dAcs_acc[ll], dseg)
+                T.atomic_add(dAcs_acc[ss], -dseg)
             T.sync_threads()
 
             for l in T.Parallel(L):
