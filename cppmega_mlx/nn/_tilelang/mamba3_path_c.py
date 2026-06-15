@@ -4480,6 +4480,52 @@ def _mamba3_chunked_fwd_intermediates_path_c(
     return cb, dA_cumsum, prev_states
 
 
+def _mamba3_pre_gate_yskip_path_c(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+) -> mx.array:
+    """PRE-GATE y_skip = C.h + D*x (fp32 lane-scan), the B2 dgate multiplicand.
+
+    The B2 backward forms dz = dout * y_skip * silu'(z) (mamba3_chunked_backward_core
+    :257-259). The production dz VJP (mamba3_path_c.py serial prim :1479-1487) uses
+    the PRE-GATE / pre-silu output y_skip = sum_n C[n]*h[n] + D*x, NOT the gated
+    forward y = silu(z)*y_skip. Recompute y_skip here in fp32 via the SAME recurrence
+    as the forward (mamba3_mimo_reference :483-490 / production serial prim): per
+    position decay = exp(A*dt) (per-head-constant A), h_t = decay*h_{t-1} + x_t (outer)
+    B_t, y_raw = sum_n C.h, y_skip = y_raw + D*x. Returns (batch, seq, heads, headdim).
+
+    RULE #1: must NOT be reconstructed via y_gated/silu(z) (fp16 stash + near-zero
+    silu division is unstable, probe 0.117). Computed pre-cast in fp32 here.
+    """
+    batch, seq, heads, headdim, state = _validate_inputs(
+        x, B, C, x, A, dt, D, h0  # z unused here -> pass x to satisfy the z==x check
+    )
+    x32 = x.astype(mx.float32)
+    B32 = B.astype(mx.float32)
+    C32 = C.astype(mx.float32)
+    A32 = A.astype(mx.float32)
+    dt32 = dt.astype(mx.float32)
+    D32 = D.astype(mx.float32)
+    h = h0.astype(mx.float32)  # (b,H,P,N)
+    log_decay = (A32 * dt32)  # (b,seq,H)
+    y_skip_list: list[mx.array] = []
+    for t in range(seq):
+        decay = mx.exp(log_decay[:, t, :])[:, :, None, None]  # (b,H,1,1)
+        xt = x32[:, t, :, :][:, :, :, None]  # (b,H,P,1)
+        Bt = B32[:, t, :, :][:, :, None, :]  # (b,H,1,N)
+        h = decay * h + xt * Bt
+        Ct = C32[:, t, :, :][:, :, None, :]  # (b,H,1,N)
+        y_raw = mx.sum(h * Ct, axis=-1)  # (b,H,P)
+        y_skip = y_raw + D32[None, :, None] * x32[:, t, :, :]  # (b,H,P)
+        y_skip_list.append(y_skip)
+    return mx.stack(y_skip_list, axis=1)  # (b,seq,H,P)
+
+
 @mx.custom_function
 def mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd(
     x: mx.array,
@@ -4507,8 +4553,13 @@ def mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd(
     cb, dA_cumsum, prev_states = _mamba3_chunked_fwd_intermediates_path_c(
         x, B, C, A, dt, h0
     )
-    # Stash y in the chunked-bwd's fp16 ABI so the .vjp reuses it directly.
-    y_stash = y.astype(mx.float16)
+    # B2 dgate needs the PRE-GATE y_skip = C.h + D*x (production dz VJP, :1479-1487),
+    # NOT the gated forward y = silu(z)*y_skip. Stashing the gated y put an extra
+    # silu(z) factor into dz (the only failing grad). Recompute y_skip in fp32 (same
+    # recurrence as the forward) and stash THAT. The returned forward y (output[0])
+    # and h_last stay byte-identical; only this residual tensor changes.
+    y_skip = _mamba3_pre_gate_yskip_path_c(x, B, C, A, dt, D, h0)
+    y_stash = y_skip.astype(mx.float16)
     return y, h_last, cb, dA_cumsum, prev_states, y_stash
 
 
