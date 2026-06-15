@@ -47,23 +47,45 @@ import pytest
 import mlx.core as mx
 
 
-# nam56r production surface. seq=128 = 2 chunks of 64; b=1; per-head A.
+# nam56r production surface. b=1; per-head A; chunk=64.
+#
+# The chunked Path-C backward is exercised at TWO seqlens so the cross-chunk
+# recurrence carry is covered across the training range, not just the 2-chunk
+# endpoint:
+#   * seq=128  -> 2 chunks  (the original small-seqlen anchor), and
+#   * seq=2048 -> 32 chunks (LARGE: the un-fuse fix a99bef7 fp32 cross-chunk
+#                  carry/decay path; the prior s4096 dstates/dh0 splice RACE +
+#                  fp16 decay drift only ever showed up at many chunks, so a
+#                  large-seqlen case is the CI anchor that catches a regression
+#                  of either failure). The 50-process s4096/64-chunk determinism
+#                  guard (scratch/determinism_guard_s4096.sh) covers the extreme.
 _DIMS = dict(b=1, seq=128, H=128, P=64, N=64, chunk=64)
+_SEQLENS = (128, 2048)
 # Per-grad gate = max|chunked - gold| < 1e-3. This is the SAME established gate the
 # rest of the chunked-backward suite uses (tests/test_mamba3_chunked_backward_
 # b0b1b2.py and scratch/parity_path_c_chunked_bwd.py); it is NOT loosened.
 #
 # The stricter ELEMENTWISE np.allclose(rtol=1e-3, atol=1e-4) is ALSO reported in
-# the test output for every grad and, at this surface, ALL 8 grads pass it too
-# (dD is wrapper-computed in fp32 -> 2.4e-7 vs GOLD, at the fp32 floor; the other
-# 7 are the chunked kernels' fp16-carrier accuracy, each well inside the gate).
-# Both columns are surfaced so nothing is hidden (RULE #1).
+# the test output for every grad. At s128 ALL 8 grads pass it too (dD is
+# wrapper-computed in fp32 -> 2.4e-7 vs GOLD, at the fp32 floor; the other 7 are the
+# chunked kernels' fp16-carrier accuracy, each well inside the gate). At s2048 the
+# absolute gate still holds for all 8 (WORST 7.7e-04 < 1e-3) but the report-only
+# elementwise allclose flips False for the largest-magnitude grads (dx/dB/dC/dh0):
+# a handful of tiny-magnitude elements miss the rtol=1e-3/atol=1e-4 ratio test
+# purely from fp16-carrier noise accumulated over 32 chunks — the asserted gate is
+# the established max|abs| < 1e-3, NOT allclose. Both columns are surfaced so
+# nothing is hidden (RULE #1): allclose is report-only and is NOT loosened away.
 _RTOL = 1e-3
 _ATOL = 1e-4
 _ABS_GATE = 1e-3
 # Re-runs to expose the chunked atomic-output / zero-init command-buffer ordering
-# race as a flaky failure if it returns (each repeat is a fresh vjp dispatch).
-_REPEATS = 16
+# race as a flaky failure if it returns (each repeat is a fresh vjp dispatch). The
+# in-process repeat count is per-seqlen: the small (s128) anchor keeps the dense
+# 16-repeat sweep; the large (s2048/32-chunk) anchor uses fewer in-process repeats
+# (the cross-chunk vjp is ~16x the work) — the extreme-chunk determinism is proven
+# separately by the 50-FRESH-process s4096 guard (scratch/determinism_guard_s4096.sh).
+_REPEATS_BY_SEQ = {128: 16, 2048: 4}
+_DEFAULT_REPEATS = 4
 
 _GRAD_NAMES = ("dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0")
 
@@ -77,8 +99,11 @@ def _metal_mlx_available() -> bool:
         return False
 
 
-def _make_inputs():
-    b, seq, H, P, N = (_DIMS[k] for k in ("b", "seq", "H", "P", "N"))
+def _make_inputs(seq: int | None = None):
+    b, H, P, N = (_DIMS[k] for k in ("b", "H", "P", "N"))
+    if seq is None:
+        seq = _DIMS["seq"]
+    assert seq % _DIMS["chunk"] == 0, f"seq {seq} not a multiple of chunk {_DIMS['chunk']}"
     rng = np.random.RandomState(0)
 
     def f32(*shape, s=0.1):
@@ -121,7 +146,8 @@ def _grad_report(a: mx.array, gold: mx.array) -> tuple[bool, float, bool]:
 @pytest.mark.kernel
 @pytest.mark.parity
 @pytest.mark.skipif(not _metal_mlx_available(), reason="requires MLX Metal GPU")
-def test_path_c_chunked_fwd_matches_path_c_lane_scan():
+@pytest.mark.parametrize("seq", _SEQLENS)
+def test_path_c_chunked_fwd_matches_path_c_lane_scan(seq):
     """The chunked proving-mode forward output[0] is byte-identical to the
     production Path C lane-scan forward (the chunked F0/F1 only feed the bwd
     stash; they must not perturb the returned y/h_last)."""
@@ -130,7 +156,7 @@ def test_path_c_chunked_fwd_matches_path_c_lane_scan():
         mamba3_mimo_fwd_path_c,
     )
 
-    x, B, C, z, A, dt, D, h0, _ = _make_inputs()
+    x, B, C, z, A, dt, D, h0, _ = _make_inputs(seq)
     y_ref, h_ref = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
     out = mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd(x, B, C, z, A, dt, D, h0)
     y_chunk, h_chunk = out[0], out[1]
@@ -145,16 +171,27 @@ def test_path_c_chunked_fwd_matches_path_c_lane_scan():
 @pytest.mark.kernel
 @pytest.mark.parity
 @pytest.mark.skipif(not _metal_mlx_available(), reason="requires MLX Metal GPU")
-def test_path_c_chunked_bwd_all8_grads_match_path_b_gold():
+@pytest.mark.parametrize("seq", _SEQLENS)
+def test_path_c_chunked_bwd_all8_grads_match_path_b_gold(seq):
     """ALL 8 chunked backward grads match the pure-MLX fp32 GOLD oracle within the
-    production rtol=1e-3/atol=1e-4 gate, on EVERY one of _REPEATS runs (the repeat
-    loop is the B1 atomic/zero-init determinism guard)."""
+    production <1e-3 per-grad gate, on EVERY in-process repeat (the repeat loop is
+    the B1 atomic/zero-init determinism guard), at BOTH the small (s128/2-chunk)
+    and the large (s2048/32-chunk) seqlen.
+
+    The large-seqlen case is the regression anchor for commit a99bef7 (fp32
+    cross-chunk decay/carry un-fuse): the prior chunked path's WORST grad at many
+    chunks was ~0.44 (dx/dB/dA/ddt/dh0 all >1e-1, an O(nchunks)-compounding
+    fp16-carrier + dstates/dh0 splice RACE that the 2-chunk s128 case could NOT
+    see). After the fix the WORST is <1e-3 here too."""
     from cppmega_mlx.nn._tilelang.mamba3_path_c import (
         mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd,
     )
     from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_bwd_metal
 
-    x, B, C, z, A, dt, D, h0, cot_y = _make_inputs()
+    repeats = _REPEATS_BY_SEQ.get(seq, _DEFAULT_REPEATS)
+    nchunks = seq // _DIMS["chunk"]
+
+    x, B, C, z, A, dt, D, h0, cot_y = _make_inputs(seq)
     primals = (x, B, C, z, A, dt, D, h0)
 
     # GOLD: step-by-step pure-MLX fp32 backward oracle (deterministic).
@@ -167,7 +204,7 @@ def test_path_c_chunked_bwd_all8_grads_match_path_b_gold():
 
     worst_overall: dict[str, float] = {n: 0.0 for n in _GRAD_NAMES}
     allclose_overall: dict[str, bool] = {n: True for n in _GRAD_NAMES}
-    for rep in range(_REPEATS):
+    for rep in range(repeats):
         _, grads_chunked = mx.vjp(fwd_y_chunked, primals, (cot_y,))
         mx.eval(*grads_chunked)
         for name, gc, gg in zip(_GRAD_NAMES, grads_chunked, grads_gold):
@@ -176,13 +213,16 @@ def test_path_c_chunked_bwd_all8_grads_match_path_b_gold():
                 worst_overall[name] = dmax
             allclose_overall[name] = allclose_overall[name] and allclose
             assert abs_ok, (
-                f"[repeat {rep}] {name} chunked-vs-GOLD max|abs|={dmax:.3e} >= "
-                f"{_ABS_GATE:.0e} (gate NOT loosened). "
-                f"A flaky failure here is the B1 dA_cumsum_tail atomic/zero-init race."
+                f"[seq={seq} nchunks={nchunks} repeat {rep}] {name} chunked-vs-GOLD "
+                f"max|abs|={dmax:.3e} >= {_ABS_GATE:.0e} (gate NOT loosened). "
+                f"At the large seqlen this is the fp32 cross-chunk decay/carry "
+                f"regression (a99bef7); at s128 it is the B1 dA_cumsum_tail "
+                f"atomic/zero-init race."
             )
 
     print(
-        f"\n[path_c_chunked vs path_b GOLD] nam56r {_DIMS} repeats={_REPEATS}"
+        f"\n[path_c_chunked vs path_b GOLD] nam56r seq={seq} nchunks={nchunks} "
+        f"repeats={repeats}"
         f"\n  worst per-grad max|abs| (asserted gate < {_ABS_GATE:.0e}): "
         + " ".join(f"{n}={worst_overall[n]:.2e}" for n in _GRAD_NAMES)
         + "\n  elementwise allclose(rtol=1e-3,atol=1e-4) [report-only]: "
