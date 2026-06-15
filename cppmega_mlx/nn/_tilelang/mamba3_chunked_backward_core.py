@@ -233,11 +233,25 @@ def chunk_scan_combine_bwd_metal_prim(
             # dseg). fp16 so dY(16KB)+DYX(8KB)+dacs/dAcs_acc fit Apple's 32KB budget;
             # the pp-reduction accumulates fp32, only the settled dyx narrows to fp16.
             DYX = T.alloc_shared((L, L), dtype)              # dyx[l,s] fp16 (budget)
+            # SD[l] = exp2(dacs[l]*p) = the single-index state_decay. The SAME fp32
+            # value the inline exp2 produced in dC_diag (dC_off, per (ll,nn)) AND
+            # dchunk_states (per (pp,nn,ll)) — those folds recomputed it dstate- and
+            # headdim*dstate-times. Precompute it ONCE below (a value-identity, NOT a
+            # reassociation: same op, same operand from shared dacs, same p) then read
+            # it back. fp32 (accum_dtype, so NEVER an fp16-narrowed reduction
+            # multiplicand). 256 B -> resident set 25088+256=25344 B, still under
+            # Apple's 32 KB threadgroup budget. The pairwise lmat in dC_diag/dseg
+            # stays recomputed (a shared DECAY[L,L]=8 KB would OVERFLOW 32 KB).
+            SD = T.alloc_shared((L,), accum_dtype)           # state_decay[l]=exp2(dacs[l]*p)
 
             # --- load dA_cumsum row, init dA grad accumulator ---
             for l in T.Parallel(L):
                 dacs[l] = T.Cast(accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, l])
                 dAcs_acc[l] = T.Cast(accum_dtype, 0)
+            T.sync_threads()
+            # Build SD once (dacs is fully written + synced above -> race-free).
+            for l in T.Parallel(L):
+                SD[l] = T.exp2(dacs[l] * p)
             T.sync_threads()
 
             # --- output/gate + D-skip transpose: dY[l,p], dz, dx, dD ---
@@ -325,7 +339,7 @@ def chunk_scan_combine_bwd_metal_prim(
                 ll = ln // dstate
                 nn = ln % dstate
                 s = base + ll
-                sd = T.exp2(dacs[ll] * p)
+                sd = SD[ll]  # state_decay precomputed once (was exp2(dacs[ll]*p))
                 # dC_off inner: accn = sum_p dY[l,p]*prev_states[p,n]
                 accn = T.alloc_local((1,), accum_dtype)
                 accn[0] = T.Cast(accum_dtype, 0)
@@ -346,13 +360,16 @@ def chunk_scan_combine_bwd_metal_prim(
             T.sync_threads()
 
             # dchunk_states[p,n] += sum_l dY[l,p]*C[l,n]*state_decay[l]
+            # sd=SD[ll] read from the precomputed shared tile (was an inline
+            # exp2(dacs[ll]*p) recomputed headdim*dstate times per ll — the single
+            # biggest exp2 count: 262144 @H128 / 65536 @S512 -> 0).
             for pn in T.Parallel(headdim * dstate):
                 pp = pn // dstate
                 nn = pn % dstate
                 acc = T.alloc_local((1,), accum_dtype)
                 acc[0] = T.Cast(accum_dtype, 0)
                 for ll in T.serial(L):
-                    sd = T.exp2(dacs[ll] * p)
+                    sd = SD[ll]  # state_decay precomputed once (was exp2(dacs[ll]*p))
                     c_v = T.Cast(accum_dtype, C[batch_idx, base + ll, group_idx, nn])
                     acc[0] = acc[0] + dY[ll, pp] * c_v * sd
                 dchunk_states[batch_idx, chunk_idx, head_idx, pp, nn] = acc[0]
