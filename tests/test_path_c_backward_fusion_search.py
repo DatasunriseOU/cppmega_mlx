@@ -44,28 +44,50 @@ def _metal_mlx_available() -> bool:
 
 
 def test_phaseA_predict_and_rank():
-    """Static feasibility + ranking (no GPU pipeline-state)."""
+    """Static feasibility + ranking (no GPU pipeline-state).
+
+    The variant space now spans TWO schedule CLASSES: the 4 contiguous
+    partitions of [B2,B1,B0] (CHUNKED_SEGMENT) PLUS the MSL-class single fused
+    lane scan (LANE_SEQUENTIAL). So predict_variants yields 5 candidates.
+    """
     from cppmega_mlx.runtime.path_c_backward_fusion_search import (
         predict_variants, rank_variants,
+        SCHEDULE_CLASS_CHUNKED_SEGMENT, SCHEDULE_CLASS_LANE_SEQUENTIAL,
     )
 
     variants = predict_variants(_DIMS)
-    assert len(variants) == 4, "exactly 4 contiguous partitions of [B2,B1,B0]"
+    assert len(variants) == 5, (
+        "4 contiguous partitions of [B2,B1,B0] + 1 LANE_SEQUENTIAL MSL-class"
+    )
     by_id = {v.variant_id: v for v in variants}
+    chunked = [v for v in variants if v.schedule_class == SCHEDULE_CLASS_CHUNKED_SEGMENT]
+    lane = [v for v in variants if v.schedule_class == SCHEDULE_CLASS_LANE_SEQUENTIAL]
+    assert len(chunked) == 4, "4 chunked-segment groupings"
+    assert len(lane) == 1, "exactly one LANE_SEQUENTIAL schedule-class candidate"
     # all 4 partitions are statically predicted feasible at this surface (P1..P4).
     for vid in ("B2B1B0", "B2B1_B0", "B2_B1B0", "B2_B1_B0"):
         assert vid in by_id, f"missing partition {vid}"
         assert by_id[vid].predicted_feasible, f"{vid} should be P1..P4 feasible"
-    # MSL ceiling never exceeded; buffer count never over 31 (P1/P3 anchors).
-    for v in variants:
+    # the LANE_SEQUENTIAL candidate: single dispatch, no brick grouping, and
+    # predicted feasible at the nam56r surface (HEADDIM=64 SIMD P-reduction).
+    lane_v = lane[0]
+    assert lane_v.variant_id == "LANE"
+    assert lane_v.dispatch_count == 1, "lane scan is single fused dispatch"
+    assert lane_v.grouping == (), "LANE_SEQUENTIAL is not a brick grouping"
+    assert lane_v.predicted_feasible, "HEADDIM=64 SIMD P-reduction is supported"
+    # MSL ceiling never exceeded; buffer count never over 31 (P1/P3 anchors) for
+    # the chunked-segment candidates (the lane variant carries no spliced segments).
+    for v in chunked:
         for seg in v.segments:
             assert seg.msl_bytes < 140000, f"{v.variant_id} seg MSL {seg.msl_bytes}"
             assert seg.nbuf <= 31, f"{v.variant_id} seg nbuf {seg.nbuf}"
             assert seg.phys_shared <= 32768, f"{v.variant_id} seg phys {seg.phys_shared}"
-    # ranking: dispatch ASC, then clean before absorb among equal dispatch.
+    # ranking: dispatch ASC, then clean before absorb among equal dispatch. Both
+    # the absorption-fused B2B1B0 and the LANE candidate are 1-dispatch and rank
+    # ahead of every 2-/3-dispatch chunked grouping.
     ranked = rank_variants(variants)
     ids = [v.variant_id for v in ranked]
-    assert ids[0] == "B2B1B0", "1-dispatch ranks first"
+    assert set(ids[:2]) == {"B2B1B0", "LANE"}, "both 1-dispatch variants rank first"
     assert ids.index("B2B1_B0") < ids.index("B2_B1B0"), (
         "clean 2-dispatch (B2B1_B0) ranks above absorb 2-dispatch (B2_B1B0)"
     )
@@ -115,6 +137,46 @@ def test_b2b1_splice_bitcorrect_vs_baseline_and_gold():
     assert worst_vs_base < 1e-4, (
         f"B2B1-fused vs 3-kernel baseline diverged ({worst_vs_base:.3e}); the "
         "dchunk_states handoff must flow bit-exactly inside the one command buffer")
+
+
+@pytest.mark.kernel
+@pytest.mark.skipif(not _metal_mlx_available(), reason="requires MLX Metal GPU")
+def test_lane_sequential_msl_class_candidate_bitcorrect():
+    """The LANE_SEQUENTIAL MSL-class candidate (mamba3_mimo_bwd_path_c lane scan)
+    is a registered search candidate that produces all 8 grads bit-correct vs the
+    path-b GOLD and is deterministic over repeats -- so the search may SELECT it."""
+    from cppmega_mlx.runtime.path_c_backward_fusion_search import (
+        make_lane_sequential_backward, _build_eval_inputs, _maxabs,
+    )
+
+    inp = _build_eval_inputs(_DIMS)
+    bwd_lane = make_lane_sequential_backward(_DIMS)
+
+    def run():
+        g = bwd_lane(inp["dy"], *inp["primals"], cb=inp["cb"],
+                     dA_cumsum=inp["dA_cumsum"], prev_states=inp["prev_states"],
+                     y=inp["y"])
+        mx.eval(*g)
+        return g
+
+    worst_gold = {nm: 0.0 for nm in _GRAD_NAMES}
+    first = None
+    worst_det = 0.0
+    for _ in range(_REPEATS):
+        g = run()
+        if first is None:
+            first = g
+        else:
+            worst_det = max(worst_det, max(_maxabs(a, b) for a, b in zip(g, first)))
+        for nm, gc, gg in zip(_GRAD_NAMES, g, inp["grads_gold"]):
+            worst_gold[nm] = max(worst_gold[nm], _maxabs(gc, gg))
+
+    for nm in _GRAD_NAMES:
+        assert worst_gold[nm] < _ABS_GATE, (
+            f"LANE_SEQUENTIAL {nm} vs GOLD max|abs|={worst_gold[nm]:.3e} >= "
+            f"{_ABS_GATE:.0e} (gate NOT loosened)")
+    assert worst_det == 0.0, (
+        f"LANE_SEQUENTIAL not deterministic across repeats ({worst_det:.3e})")
 
 
 @pytest.mark.kernel

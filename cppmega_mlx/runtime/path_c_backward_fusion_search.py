@@ -143,6 +143,25 @@ def splice_prims(
 _BRICKS = ("B2", "B1", "B0")
 
 
+# ---------------------------------------------------------------------------
+# SCHEDULE-CLASS axis (the fix). The prior variant space was ONE axis only:
+# groupings of the ONE chunked-parallel schedule (contiguous partitions of
+# [B2,B1,B0]). MSL is NOT a grouping of those bricks -- it is a DIFFERENT
+# schedule CLASS: one per-(b,h,p) lane that does the full reverse-time
+# sequential scan with NO chunked intermediates / NO cross-chunk atomics / NO
+# 88.5KB resident DINP. So the search must enumerate BOTH classes:
+#   * CHUNKED_SEGMENT  -- the current B2/B1/B0 contiguous-partition groupings
+#                         (parallel over nchunks; pays chunked-intermediate +
+#                         multi-dispatch cost).
+#   * LANE_SEQUENTIAL  -- the MSL-class single fused lane scan
+#                         (mamba3_mimo_bwd_path_c / bwd_simd prim_func); per-
+#                         (b,h,p) reverse scan, register state, in-kernel SIMD
+#                         P-reduction; cheap dispatch, fully parallel over
+#                         b*h*p lanes. This is what hand-MSL writes.
+SCHEDULE_CLASS_CHUNKED_SEGMENT = "CHUNKED_SEGMENT"
+SCHEDULE_CLASS_LANE_SEQUENTIAL = "LANE_SEQUENTIAL"
+
+
 def enumerate_contiguous_partitions(
     bricks: Sequence[str] = _BRICKS,
 ) -> list[tuple[tuple[str, ...], ...]]:
@@ -198,6 +217,11 @@ class SegmentVerdict:
 class VariantVerdict:
     variant_id: str
     grouping: tuple[tuple[str, ...], ...]
+    # schedule_class names WHICH schedule-class axis this candidate is on. A
+    # CHUNKED_SEGMENT candidate is a contiguous partition of [B2,B1,B0]; a
+    # LANE_SEQUENTIAL candidate is the MSL-class single fused lane scan (no brick
+    # grouping -- grouping is the empty tuple for it).
+    schedule_class: str = SCHEDULE_CLASS_CHUNKED_SEGMENT
     segments: list[SegmentVerdict] = field(default_factory=list)
     requires_recompute_absorption: bool = False
     # static verdict
@@ -505,7 +529,63 @@ def predict_variants(
         v.max_phys = max((s.phys_shared for s in v.segments), default=0)
         v.max_nbuf = max((s.nbuf for s in v.segments), default=0)
         variants.append(v)
+    # ---- SCHEDULE-CLASS extension: the MSL-class LANE_SEQUENTIAL candidate ----
+    variants.append(predict_lane_sequential_variant(dims))
     return variants
+
+
+def predict_lane_sequential_variant(
+    dims: tuple[int, int, int, int, int, int, int],
+) -> VariantVerdict:
+    """Phase A verdict for the MSL-class LANE_SEQUENTIAL schedule candidate.
+
+    This is the second schedule-CLASS member (not a brick grouping). The
+    executable surface is the TileLang-DSL lane-scan backward
+    ``mamba3_mimo_bwd_path_c`` (bwd_simd prim_func) -- per-(b,h,p) reverse-time
+    sequential scan, register state, in-kernel SIMD P-reduction. It is the same
+    schedule CLASS hand-MSL writes.
+
+    Feasibility is predicted from ``_bwd_simd_p_reduction_supported`` (the SAME
+    legality gate the production lane-scan lowering uses): HEADDIM<=32 or a
+    multiple of 32 with threadgroup-aligned P rows. If unsupported, the variant
+    is recorded INFEASIBLE with the reason (fail-loud; never silently dropped).
+
+    dispatch_count is reported as 1 (the SIMD-fused single-dispatch ideal that
+    MSL pays); the fp32 production route currently lowers to >1 dispatch (a
+    measured codegen gap, surfaced in Phase B), but the SCHEDULE-CLASS itself is
+    single-dispatch -- that is why it ranks first on dispatch_count.
+    """
+    from cppmega_mlx.nn._tilelang.mamba3_path_c import (
+        _bwd_simd_p_reduction_supported,
+    )
+
+    b, s, c, g, h, p, n = dims
+    supported = _bwd_simd_p_reduction_supported(batch=b, heads=h, headdim=p)
+    v = VariantVerdict(
+        variant_id="LANE",
+        grouping=(),
+        schedule_class=SCHEDULE_CLASS_LANE_SEQUENTIAL,
+    )
+    v.dispatch_count = 1
+    # collapsing all 3 chunked dispatches -> the lane scan recovers the whole
+    # chunked multi-dispatch floor delta (reported for parity; measured below).
+    v.recovered_floor_us = (len(_BRICKS) - 1) * _FLOOR_US
+    v.n_internalized_edges = 0
+    v.n_absorbed_recomputes = 0
+    v.requires_recompute_absorption = False
+    v.max_phys = 0
+    v.max_nbuf = 0
+    if supported:
+        v.predicted_feasible = True
+        v.infeasible_characteristic = None
+    else:
+        v.predicted_feasible = False
+        v.infeasible_characteristic = (
+            f"lane-sequential SIMD P-reduction unsupported for "
+            f"HEADDIM={p} (needs <=32 or multiple of 32 with threadgroup-"
+            f"aligned P rows); fail-loud, not silently dropped"
+        )
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +771,33 @@ def make_fused_backward(grouping: tuple[tuple[str, ...], ...], dims):
     return run
 
 
+def make_lane_sequential_backward(dims):
+    """Return the MSL-class LANE_SEQUENTIAL backward callable.
+
+    The executable surface is the production TileLang-DSL lane-scan backward
+    ``mamba3_mimo_bwd_path_c`` (per-(b,h,p) reverse-time sequential scan). It
+    already produces the 8 primal-order grads (dx,dB,dC,dz,dA,ddt,dD,dh0)
+    directly -- NO chunked intermediates, NO cb/dA_cumsum/prev_states/y handoff
+    buffers. So the returned callable accepts (and IGNORES) the chunked
+    forward-intermediate kwargs the harness passes to every candidate, keeping
+    ONE uniform measure/bit-correct ABI across BOTH schedule classes.
+
+    RULE #1: this is the REAL lane-scan kernel, not a re-port. If it cannot
+    lower for these dims it RAISES (the harness catches+records it as an honest
+    infeasible_measured), it never returns degraded output.
+    """
+    from cppmega_mlx.nn._tilelang.mamba3_path_c import mamba3_mimo_bwd_path_c
+
+    def run(dy, x, B, C, z, A, dt, D, h0, *, cb=None, dA_cumsum=None,
+            prev_states=None, y=None):
+        # cb/dA_cumsum/prev_states/y are chunked-schedule forward artifacts; the
+        # lane-sequential schedule re-materializes h[t] in-kernel and needs none
+        # of them. Accepted for ABI uniformity, intentionally unused.
+        return mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+
+    return run
+
+
 def _inv_name(out_names: dict[str, int], pos: int) -> str:
     for nm, p in out_names.items():
         if p == pos:
@@ -715,6 +822,7 @@ def _grouping_is_clean_splice(grouping: tuple[tuple[str, ...], ...]) -> bool:
 def _trace_row(v: VariantVerdict) -> dict:
     return dict(
         variant=v.variant_id,
+        schedule_class=v.schedule_class,
         grouping=str(v.grouping),
         predicted_feasible=v.predicted_feasible,
         dispatch_count=v.dispatch_count,
@@ -906,7 +1014,19 @@ def search_fastest_backward_fusion(
                       f"lb_wall={lb_wall:.0f}us >= best={best.measured_us:.1f}us")
             trace.append(_trace_row(v))
             continue
-        if not _grouping_is_clean_splice(v.grouping):
+        is_lane = v.schedule_class == SCHEDULE_CLASS_LANE_SEQUENTIAL
+        if is_lane and not v.predicted_feasible:
+            # LANE_SEQUENTIAL whose SIMD P-reduction legality gate failed for
+            # these dims -- record the honest reason, never silently dropped.
+            v.status = "infeasible_lane_simd_unsupported"
+            v.crashed = True
+            v.crash_reason = v.infeasible_characteristic or "lane simd unsupported"
+            if verbose:
+                print(f"\n[{v.variant_id}] INFEASIBLE (lane-simd-gate, HONEST): "
+                      f"{v.crash_reason}")
+            trace.append(_trace_row(v))
+            continue
+        if not is_lane and not _grouping_is_clean_splice(v.grouping):
             v.status = "infeasible_recompute_absorption"
             v.crashed = True
             v.crash_reason = (
@@ -923,7 +1043,10 @@ def search_fastest_backward_fusion(
             continue
         # compile (catch XPC/pipeline/watchdog crash -> mark, continue)
         try:
-            bwd = make_fused_backward(v.grouping, dims)
+            if is_lane:
+                bwd = make_lane_sequential_backward(dims)
+            else:
+                bwd = make_fused_backward(v.grouping, dims)
             # force compile NOW (lru cache) so a pipeline crash surfaces here
             _ = _bitcorrect_direct(bwd, inp, 1, abs_gate)
             v.compiled = True

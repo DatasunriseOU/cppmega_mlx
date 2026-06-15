@@ -1615,7 +1615,22 @@ def default_path_c_brick_schedule_descriptor_registry() -> (
                     "mamba3_mimo_bwd_final_gradient_owner_outputs",
                 ),
                 supports_backward=False,
-                description="Mamba3 MIMO backward descriptor",
+                # LANE_SEQUENTIAL schedule CLASS: a WHOLE-GRAPH single fused lane
+                # scan (per-(b,h,p) reverse-time sequential), NOT a B0/B1/B2 brick
+                # fragment. This is the MSL-class descriptor the backward fusion
+                # search enumerates as a SECOND schedule-class axis next to the
+                # chunked-segment B2/B1/B0 partitions (see
+                # cppmega_mlx.runtime.path_c_backward_fusion_search:
+                # SCHEDULE_CLASS_LANE_SEQUENTIAL / predict_lane_sequential_variant).
+                schedule_family="lane_sequential_reverse_scan",
+                description=(
+                    "Mamba3 MIMO backward descriptor (LANE_SEQUENTIAL MSL-class "
+                    "whole-graph schedule: per-(b,h,p) reverse-time sequential "
+                    "scan with register state + in-kernel SIMD P-reduction; no "
+                    "chunked intermediates, no cross-chunk atomics, single fused "
+                    "dispatch). This is a schedule-CLASS member, not a brick "
+                    "fragment of the chunked B2/B1/B0 partition family."
+                ),
                 production_source=(
                     "cppmega_mlx.nn._tilelang.mamba3_path_c:"
                     "mamba3_mimo_bwd_path_c"
