@@ -4504,35 +4504,58 @@ def _mamba3_chunked_backward_path_c(
     A_head16 = _assert_per_head_constant_A(A).astype(mx.float16)
     prev32 = prev_states.astype(mx.float32)
 
-    # --- B2+B1 FUSED (directed-search SELECTED rank-2 {B2,B1}{B0}) ---
-    # The directed backward-fusion search selected the {B2,B1}{B0} grouping: B2 and
-    # B1 are spliced as two sequential T.Kernel grids in ONE prim_func -> ONE tvm_ffi
-    # dispatch (collapses one of the three ~per-dispatch command-buffer floors;
-    # MEASURED ~705us / ~6.4% recovered at nam56r, all 8 grads bit-correct vs path-b
-    # GOLD). The B2->B1 dchunk_states handoff flows INSIDE the one command buffer
-    # (proven byte-equal to the separate-kernel path at the fp32 floor). The
-    # post-kernel dA_cumsum_tail / dD deterministic recomputes below are UNCHANGED
-    # (the determinism fix is untouched -- the dA_tail recompute stays POST this
-    # fused dispatch). The fully-fused {B2,B1,B0} and {B1,B0} groupings are
-    # INFEASIBLE for a clean splice (they would absorb dA_cumsum_tail and re-
-    # introduce the race) -- the search marks them infeasible, never silently fuses
-    # them. See cppmega_mlx.runtime.path_c_backward_fusion_search.
+    # --- B2 then B1 UN-FUSED (3-dispatch B2 -> []-pinned B1 -> B0) ---
+    # DETERMINISM FIX (RULE #1, one clear DETERMINISTIC path). The directed-search
+    # SELECTED {B2,B1}{B0} fusion (_chunked_bwd_b2b1_fused_kernel, B2 and B1 spliced
+    # as two sequential T.Kernel grids in ONE prim_func -> ONE tvm_ffi dispatch)
+    # recovered ~705us / ~6.4% at nam56r BUT is INTERMITTENTLY WRONG: the spliced
+    # B1 grid's dstates/dh0 DEVICE-memory stores are not ordered against the splice's
+    # zero-init/command-buffer boundary on Apple GPUs (the TileLang Metal codegen
+    # PrintStorageSync at codegen_metal.cc:1661-1668 ALWAYS emits
+    # threadgroup_barrier(mem_threadgroup) and NEVER mem_device, so no device-memory
+    # fence can be emitted for the 2nd spliced grid). MEASURED at the nam56r FAILING
+    # surface (b=1,H=G=128,P=64,N=64, s4096=64 chunks): the fused path FAILS ~4/8
+    # fresh processes -> WORST 4.28e-01..4.41e-01 on exactly {dx,dB,dA,ddt,dh0} (the
+    # grads downstream of B1 dstates/dh0; dC/dz/dD stay tiny), bimodal garbage NOT
+    # fp16 drift -- the SAME config also PASSES at WORST 9.599e-04 on the other ~4/8.
+    # No zero_init_output_positions set fully fixes the FUSED kernel (bisect: adding
+    # [7,8]=dstates,dh0 reduces fails 11/12 -> 1/12, necessary but NOT sufficient).
+    # The cross-chunk carry (B1 g, dstates, dh0, dchunk_states, prev_states,
+    # dA_cumsum_tail) is ALREADY entirely fp32 (core inter_chunk_recur_bwd_metal_prim
+    # accum_dtype) -- there is NO fp16 narrowing to promote; the benign sub-1e-3 fp16
+    # ABI drift (9.599e-04 dx at 64 chunks) is well under the gate and is NOT the
+    # failure. The ROBUST fix (matching the dD/dA_tail wrapper-recompute precedent)
+    # is to UN-FUSE B1: run B2 alone, force its completion (mx.eval(dchunk)), then
+    # run the standalone []-pinned _chunked_bwd_b1_kernel (inter_chunk_recur_bwd_metal
+    # _prim with_attr tilelang_metal_zero_init_output_positions=[] -> the kernel owns
+    # all init, no bridge zero-blit) as a SEPARATE dispatch. The B2->B1 dchunk_states
+    # handoff is one MLX round-trip of a buffer that already exists (fp32, ~134 MB at
+    # s4096; allocated in BOTH paths), so NO new large allocation. MEASURED unfused:
+    # s4096 9.599e-04 (8/8 fresh + 12/12 in-process), s128 4.483e-04 -- all 8 grads
+    # <1e-3 DETERMINISTICALLY. Cost: +1 GPU dispatch (gives back the ~6.4% fusion
+    # win); RULE #1: a bit-correct slower path beats a fast intermittently-wrong one.
     #
     # NB: the dD output (B2 cross-threadgroup atomic) is DISCARDED here
     # ("_dD_m_unused") -- the production 8-grad surface uses the deterministic
-    # wrapper-computed dD below. The B1 dA_cumsum_tail (last fused output) is
-    # likewise DISCARDED ("_dA_tail_kernel_unused") in favor of the deterministic
-    # MLX recompute below.
+    # wrapper-computed dD below. The B1 dA_cumsum_tail (3rd B1 output) is likewise
+    # DISCARDED ("_dA_tail_kernel_unused") in favor of the deterministic MLX
+    # recompute below (the 738f31c dA_cumsum_tail wrapper-recompute path, UNCHANGED).
     dh_last = mx.zeros((batch, heads, headdim, state), dtype=mx.float32)
-    k_b2b1 = _chunked_bwd_b2b1_fused_kernel(batch, seq, chunk, G, heads, headdim, state)
+    k_b2 = _chunked_bwd_b2_kernel(batch, seq, chunk, G, heads, headdim, state)
     (
         dC_m, dx_b2, dz_m, dchunk, dinp_diag, dA_y, _dD_m_unused,
-        dstates, dh0_m, _dA_tail_kernel_unused,
-    ) = k_b2b1(
-        dout16, cb16, x16, z16, dt_k, dA16, C16, B16, prev32, D16, y16, dh_last
+    ) = k_b2(
+        dout16, cb16, x16, z16, dt_k, dA16, C16, B16, prev32, D16, y16
     )
+    # Force B2 completion BEFORE the separate B1 dispatch reads dchunk_states (the
+    # B2->B1 handoff). This separate-dispatch boundary is what dissolves the splice
+    # race: B1 runs as its own command buffer with []-pinned zero-init, so its
+    # dstates/dh0 single-writer stores are not raced by a 2nd-spliced-grid ordering.
+    mx.eval(dchunk)
+    k_b1 = _chunked_bwd_b1_kernel(batch, seq, chunk, G, heads, headdim, state)
+    dstates, dh0_m, _dA_tail_kernel_unused = k_b1(dchunk, dA16, dh_last, prev32)
 
-    # --- B1 dstates/dh0 now produced by the fused kernel above (dh_last seeded zero) ---
+    # --- B1 dstates/dh0 produced by the standalone []-pinned B1 above (dh_last 0) ---
     # The B1 kernel's dA_cumsum_tail (3rd output) is INTENTIONALLY DISCARDED for
     # the production grad path (renamed _dA_tail_kernel_unused) — it is produced by
     # an INTRA-threadgroup T.atomic_add over headdim*dstate cell-lanes after an
