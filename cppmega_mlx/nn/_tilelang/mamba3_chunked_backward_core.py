@@ -4580,6 +4580,23 @@ def inter_chunk_recur_bwd_metal_prim(
                         ]
                     dh0[batch_idx, head_idx, pp, nn] = g[0]
 
+    # ZERO-INIT SCOPE (MLX tvm_ffi owner-output correctness, RULE #1 — one clear
+    # path, deterministic). Same hazard the B2 prim fixed (chunk_scan_combine_bwd
+    # :439-457): the MLX bridge detects the ``atomic_add(dA_cumsum_tail...)`` here
+    # and, by default, zero-inits EVERY output ([dstates, dh0, dA_cumsum_tail]) on
+    # its OWN command buffer. But all three outputs are produced by the SINGLE
+    # (batch,head) threadgroup that owns the slice — ``dstates``/``dh0`` are FULLY
+    # WRITTEN (every owned (c,p,n) / (p,n) cell, lines :4566/:4581) and
+    # ``dA_cumsum_tail`` is zeroed IN-BODY (lines :4543-4552) before its
+    # INTRA-threadgroup atomic accumulation (the L-1 slot is summed across this
+    # head's headdim*dstate cell-lanes only; there is NO cross-threadgroup writer).
+    # A bridge zero-blit on top therefore RACES the kernel's own writes/atomic and
+    # intermittently corrupts ``dA_cumsum_tail`` (MEASURED: bridge-default zero-init
+    # -> dA_tail non-deterministic, intra-process run-to-run spread 8.14e-03 ->
+    # dA/ddt flaky FAIL > 1e-3; pin-to-[] -> dA_tail deterministic, dA/ddt PASS).
+    # Pin the bridge zero-init to EXACTLY {} (the kernel owns all initialization)
+    # so the full-write + in-body-zeroed outputs stay race-free.
+    main = main.with_attr("tilelang_metal_zero_init_output_positions", [])
     return main
 
 

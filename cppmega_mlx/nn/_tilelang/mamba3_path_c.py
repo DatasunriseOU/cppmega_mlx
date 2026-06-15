@@ -4253,6 +4253,32 @@ def _chunked_fwd_f1_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: in
     )
 
 
+_MLX_TVM_FFI_FORCE_BOUNDARY_ENV = "TILELANG_MLX_TVM_FFI_FORCE_COMMAND_BUFFER_BOUNDARY"
+
+
+def _force_chunked_command_buffer_boundary() -> None:
+    """Force the MLX tvm_ffi command-buffer ordering boundary for chunked kernels.
+
+    RULE #1 (no silent fallback; one clear, DETERMINISTIC path). The chunked
+    B2/B1/B0 backward kernels accumulate several outputs via ``T.atomic_add`` into
+    bridge-allocated owner buffers (dD cross-threadgroup; dx/dB single-writer but
+    still read-modify-write the bridge buffer; dA_cumsum_tail intra-threadgroup).
+    Each requires its zero-init blit (and the MLX input producers) to complete
+    BEFORE the TVM compute encoder runs. The bridge's active-compute-encoder fast
+    path dispatches the kernel WITHOUT that strict ordering, so the zero-blit /
+    producers RACE the atomic reads -> intermittently garbage dD/dx/dB and flaky
+    dA/ddt (MEASURED at nam56r: ~1/3 of runs FAIL > 1e-3, with rare 1e-1 blow-ups;
+    with the boundary forced, 0/40 runs fail and every grad is deterministic at the
+    fp32-noise floor). ``env_flag_enabled`` is read per-dispatch via ``getenv``, so
+    setting this here (idempotent) takes effect for every subsequent chunked launch
+    without a rebuild. We do NOT silently downgrade on failure — forcing correct
+    ordering is the single correct path; if the bridge ignored it the parity test
+    (test_mamba3_path_c_chunked_vs_path_b) would FAIL loudly.
+    """
+    if os.environ.get(_MLX_TVM_FFI_FORCE_BOUNDARY_ENV, "").strip() in ("", "0", "false", "False", "FALSE"):
+        os.environ[_MLX_TVM_FFI_FORCE_BOUNDARY_ENV] = "1"
+
+
 @lru_cache(maxsize=64)
 def _chunked_bwd_b2_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: int) -> Any:
     """B2 (chunk_scan_combine_bwd) -> (dC,dx,dz,dchunk_states,dinp,dA_cumsum_y,dD)."""
@@ -4383,6 +4409,8 @@ def _mamba3_chunked_backward_path_c(
     chunk = _path_c_chunk_size_for(seq)
     nchunks = seq // chunk
     G = heads  # at the dispatch surface B/C are per-head -> ngroups == nheads
+    # Deterministic atomic-output ordering for the B2/B1/B0 owner outputs (see helper).
+    _force_chunked_command_buffer_boundary()
 
     # fp16 kernel-input casts (the validated chunked ABI). dt_k = (b,H,c,s).
     def f16(a: mx.array) -> mx.array:
@@ -4403,8 +4431,12 @@ def _mamba3_chunked_backward_path_c(
     prev32 = prev_states.astype(mx.float32)
 
     # --- B2: chunk_scan_combine_bwd ---
+    # NB: the 7th kernel output (the B2 cross-threadgroup atomic dD) is intentionally
+    # DISCARDED here ("_dD_m_unused") — the production 8-grad surface uses the
+    # deterministic wrapper-computed dD below instead (see the dD comment). The
+    # kernel still emits it for the b0b1b2 stage test which reads dD_m directly.
     k_b2 = _chunked_bwd_b2_kernel(batch, seq, chunk, G, heads, headdim, state)
-    dC_m, dx_b2, dz_m, dchunk, dinp_diag, dA_y, dD_m = k_b2(
+    dC_m, dx_b2, dz_m, dchunk, dinp_diag, dA_y, _dD_m_unused = k_b2(
         dout16, cb16, x16, z16, dt_k, dA16, C16, B16, prev32, D16, y16
     )
 
@@ -4421,6 +4453,27 @@ def _mamba3_chunked_backward_path_c(
 
     dx_total = dx_b2 + dx_b0  # B2 D-skip/dY*C path + B0 inp path (test: dx_full clone)
 
+    # dD: compute in the wrapper (fp32, deterministic) instead of using the B2
+    # kernel's ``dD_m``. RULE #1 (one clear, DETERMINISTIC path; no silent flaky
+    # output). The B2 ``dD`` is the ONE CROSS-THREADGROUP atomic_add output
+    # (T.atomic_add(dD[head], ...) from every (batch*nchunks) threadgroup into a
+    # bridge-zeroed buffer). Its zero-init blit must complete before ALL those
+    # atomics; the MLX tvm_ffi command-buffer ordering does NOT fully serialize
+    # that cross-threadgroup case, so the kernel ``dD_m`` is INTERMITTENTLY wrong
+    # (MEASURED: ~10% of fresh processes -> dD blow-up 5.33e-1 >> 1e-3, garbage
+    # from the un-zeroed buffer; the other 7 grads are race-free). dD is a cheap,
+    # exact MLX reduction of the SAME production VJP the serial prim uses
+    # (mamba3_path_c serial prim :1484-1488): d_y_skip = dY*silu(z);
+    # dD[h] = sum_{b,t,p} d_y_skip * x. Computing it here is bit-exact vs the
+    # pure-MLX GOLD (max|wrapper_dD - gold_dD| = 2.4e-07, the fp32 floor) and fully
+    # deterministic. The kernel still emits dD_m (used by the b0b1b2 stage test);
+    # only the production 8-grad surface takes the wrapper dD.
+    z32 = z.astype(mx.float32)
+    sig_z = mx.sigmoid(z32)
+    silu_z = z32 * sig_z
+    d_y_skip = dy.astype(mx.float32) * silu_z  # (b,seq,H,P)
+    dD_wrapper = mx.sum(d_y_skip * x.astype(mx.float32), axis=(0, 1, 3))  # (H,)
+
     # Map the chained chain's grads -> MSL primal-order 8-tuple. PRODUCTION model:
     # decay = exp(A*dt) with PER-HEAD scalar A; dlog_m (b,seq,H) is d_logdecay (the
     # grad wrt log_decay = A*dt). The surface dA at (b,seq,H) is d_logdecay*dt
@@ -4436,7 +4489,7 @@ def _mamba3_chunked_backward_path_c(
     dz = dz_m.astype(z.dtype)
     dA = (dlog_m * dt.astype(dlog_m.dtype)).astype(A.dtype)
     ddt = ddt_m.astype(dt.dtype)
-    dD = dD_m.astype(D.dtype)
+    dD = dD_wrapper.astype(D.dtype)  # deterministic wrapper dD (see above); NOT dD_m
     dh0 = dh0_m.astype(h0.dtype)
     return (dx, dB, dC, dz, dA, ddt, dD, dh0)
 
@@ -4460,6 +4513,8 @@ def _mamba3_chunked_fwd_intermediates_path_c(
     state = B.shape[-1]
     chunk = _path_c_chunk_size_for(seq)
     G = heads
+    # Deterministic atomic-output ordering for the F0/F1 owner outputs (see helper).
+    _force_chunked_command_buffer_boundary()
 
     def f16(a: mx.array) -> mx.array:
         return mx.contiguous(a.astype(mx.float16))
