@@ -198,8 +198,10 @@ def chunk_precompute_fwd_metal_prim(
                     cb[batch_idx, chunk_idx, group_idx, li, si] = T.Cast(dtype, acc[0])
             T.sync_threads()
 
-            # --- summary_states[p,n] = sum_l decay[l]*dt[l]*x[l,p]*B[l,n] ---
+            # --- summary_states[p,n] = sum_l decay[l]*x[l,p]*B[l,n] ---
             # decay[l] = exp(dA_cs[L-1] - dA_cs[l]) = exp2((tail - dacs[l]) * p)
+            # PRODUCTION model: input term = x*B (NO dt). dt enters ONLY via decay
+            # (=exp(A*dt) through dacs). prod fwd h_t = decay*h + x*B (path_c :1001).
             for pn in T.Parallel(headdim * dstate):
                 pp = pn // dstate
                 nn = pn % dstate
@@ -207,10 +209,9 @@ def chunk_precompute_fwd_metal_prim(
                 acc[0] = T.Cast(accum_dtype, 0)
                 for l in T.serial(L):
                     decay = T.exp2((dacs[L - 1] - dacs[l]) * p)
-                    dt_l = T.Cast(accum_dtype, dt[batch_idx, base + l, head_idx])
                     x_l = T.Cast(accum_dtype, x[batch_idx, base + l, head_idx, pp])
                     b_l = T.Cast(accum_dtype, B[batch_idx, base + l, group_idx, nn])
-                    acc[0] = acc[0] + decay * dt_l * x_l * b_l
+                    acc[0] = acc[0] + decay * x_l * b_l
                 summary_states[batch_idx, chunk_idx, head_idx, pp, nn] = acc[0]
 
     return main
@@ -383,16 +384,16 @@ def chunk_precompute_fwd_cuda_prim(
                 )
             T.sync_threads()
 
-            # --- (2) summary_states[p,n] = sum_l (decay[l]*dt[l]*x[l,p]) * B[l,n] ---
-            # Fold per-row decay*dt into the x operand (Tri-Dao _chunk_state_fwd);
-            # decay[l] = exp(dA_cs[L-1]-dA_cs[l]) = exp2((dacs[L-1]-dacs[l])*p).
+            # --- (2) summary_states[p,n] = sum_l (decay[l]*x[l,p]) * B[l,n] ---
+            # PRODUCTION model: input term = x*B (NO dt); dt enters ONLY via decay.
+            # Fold per-row decay into the x operand (cf. Tri-Dao _chunk_state_fwd but
+            # WITHOUT the dt weight); decay[l] = exp2((dacs[L-1]-dacs[ll])*p).
             for lp in T.Parallel(L * headdim):
                 ll = lp // headdim
                 pp = lp % headdim
                 decay = T.exp2((dacs[L - 1] - dacs[ll]) * p)
-                dt_l = T.Cast(accum_dtype, dt[batch_idx, base + ll, head_idx])
                 x_l = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
-                x_dec_shared[ll, pp] = T.Cast(dtype, decay * dt_l * x_l)
+                x_dec_shared[ll, pp] = T.Cast(dtype, decay * x_l)
             # Re-stage B for the group (B_shared was last written for the cb GEMM
             # only under the head-0 guard; every head needs it here).
             T.copy(

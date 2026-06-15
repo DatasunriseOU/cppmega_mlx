@@ -4421,15 +4421,20 @@ def _mamba3_chunked_backward_path_c(
 
     dx_total = dx_b2 + dx_b0  # B2 D-skip/dY*C path + B0 inp path (test: dx_full clone)
 
-    # Map the chained chain's grads -> MSL primal-order 8-tuple. At this surface
-    # A is (b,seq,H) and the chain's dlog_decay (b,seq,H) IS the grad wrt A (the
-    # surface's log_decay = A*dt), so dA = dlog_m. B/C are per-head so dB/dC need
-    # no group reduction. Cast each grad to its primal dtype.
+    # Map the chained chain's grads -> MSL primal-order 8-tuple. PRODUCTION model:
+    # decay = exp(A*dt) with PER-HEAD scalar A; dlog_m (b,seq,H) is d_logdecay (the
+    # grad wrt log_decay = A*dt). The surface dA at (b,seq,H) is d_logdecay*dt
+    # (prod single-lane dA[b,t,h] = d_logdecay*dt, path_c :1532). The GOLD
+    # mamba3_mimo_bwd_metal returns dA at (b,seq,H) ELEMENTWISE = d_logdecay*dt with
+    # NO seq reduction (mamba3.py :344/:637 dA=sum_partial over the lane axis only,
+    # and :1133 dA_steps[t]=d_log_decay*dt_f[:,t] stacked to (b,seq,H)); so we match
+    # by multiplying dlog_m by the (b,seq,H) PRIMAL dt (NOT the fp16 dt_k transpose,
+    # to keep native precision). B/C are per-head so dB/dC need no group reduction.
     dx = dx_total.astype(x.dtype)
     dB = dB_m.astype(B.dtype)
     dC = dC_m.astype(C.dtype)
     dz = dz_m.astype(z.dtype)
-    dA = dlog_m.astype(A.dtype)
+    dA = (dlog_m * dt.astype(dlog_m.dtype)).astype(A.dtype)
     ddt = ddt_m.astype(dt.dtype)
     dD = dD_m.astype(D.dtype)
     dh0 = dh0_m.astype(h0.dtype)

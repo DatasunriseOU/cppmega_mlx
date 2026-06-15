@@ -332,14 +332,13 @@ def chunk_scan_combine_bwd_metal_prim(
                 for pp in T.serial(headdim):
                     cs = prev_states[batch_idx, chunk_idx, head_idx, pp, nn]
                     accn[0] = accn[0] + dY[ll, pp] * cs
-                # dC_diag inner: cdiag = sum_{s2<=l} Lmat[l,s2]*dt_s2*DYX[l,s2]*B[s2,n]
+                # dC_diag inner: cdiag = sum_{s2<=l} Lmat[l,s2]*DYX[l,s2]*B[s2,n]  (prod inp=x*B, NO dt)
                 cdiag = T.alloc_local((1,), accum_dtype)
                 cdiag[0] = T.Cast(accum_dtype, 0)
                 for ss in T.serial(0, ll + 1):
                     lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                    dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
                     b_v = T.Cast(accum_dtype, B[batch_idx, base + ss, group_idx, nn])
-                    cdiag[0] = cdiag[0] + lmat * dt_s * DYX[ll, ss] * b_v
+                    cdiag[0] = cdiag[0] + lmat * DYX[ll, ss] * b_v
                 dC[batch_idx, s, head_idx, nn] = accn[0] * sd + cdiag[0]
                 # dstate_decay nn-reduction -> dAcs_acc[ll] (multi-writer: atomic).
                 c_v = T.Cast(accum_dtype, C[batch_idx, s, group_idx, nn])
@@ -426,11 +425,10 @@ def chunk_scan_combine_bwd_metal_prim(
                 ss = ls % L
                 cb_v = T.Cast(accum_dtype, cb[batch_idx, chunk_idx, group_idx, ll, ss])
                 lmat = T.exp2((dacs[ll] - dacs[ss]) * p)
-                dt_s = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ss])
                 tri = T.if_then_else(
                     ss < ll, T.Cast(accum_dtype, 1), T.Cast(accum_dtype, 0)
                 )
-                dseg = DYX[ll, ss] * cb_v * lmat * dt_s * tri
+                dseg = DYX[ll, ss] * cb_v * lmat * tri
                 T.atomic_add(dAcs_acc[ll], dseg)
                 T.atomic_add(dAcs_acc[ss], -dseg)
             T.sync_threads()
@@ -4746,18 +4744,19 @@ def chunk_precompute_bwd_metal_prim(
 
             dacs = T.alloc_shared((L,), accum_dtype)
             dA_full = T.alloc_shared((L,), accum_dtype)  # total dA_cumsum grad per l
-            ddt_inp_sh = T.alloc_shared((L,), accum_dtype)  # inp-path dt grad per l
+            # NOTE: ddt_inp_sh (the input-term ddt accumulator) is REMOVED — the
+            # production model has NO input-term ddt contribution (PROD inp=x*B,
+            # ddt = d_logdecay*A only, path_c :1533).
 
             for l in T.Parallel(L):
                 dacs[l] = T.Cast(accum_dtype, dA_cumsum[batch_idx, head_idx, chunk_idx, l])
-                ddt_inp_sh[l] = T.Cast(accum_dtype, 0)
             T.sync_threads()
 
             # ---- decay_states transpose: dstates -> dinp_states + dA scatter ----
             #   decay_states[l] = exp(dacs[L-1]-dacs[l])
-            #   states[p,n]     = sum_l decay_states[l]*dt[l]*x[l,p]*B[l,n]   (forward F0)
-            #   dinp_states[l,p,n] = dstates[p,n]*decay_states[l]*dt[l] (folded into dx/dB)
-            #   ddecay_states[l]   = sum_{p,n} dstates[p,n]*dt[l]*x[l,p]*B[l,n]
+            #   states[p,n]     = sum_l decay_states[l]*x[l,p]*B[l,n]   (forward F0, PROD inp=x*B)
+            #   dinp_states[l,p,n] = dstates[p,n]*decay_states[l] (folded into dx/dB)
+            #   ddecay_states[l]   = sum_{p,n} dstates[p,n]*x[l,p]*B[l,n]   (NO dt)
             #   t = ddecay_states*decay_states ; dA[l] += -t ; dA[L-1] += sum_l t
             # Plus the Y-path + chunk-tail dA grads.
             # We accumulate dA_full[l] = dA_cumsum_y[l] + (-t[l]); dA_full[L-1] += sum t + tail.
@@ -4768,8 +4767,7 @@ def chunk_precompute_bwd_metal_prim(
 
             for l in T.Parallel(L):
                 decay_l = T.exp2((dacs[L - 1] - dacs[l]) * p)
-                dt_l = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, l])
-                # ddecay_states[l] = sum_{p,n} dstates[p,n]*dt_l*x[l,p]*B[l,n]
+                # ddecay_states[l] = sum_{p,n} dstates[p,n]*x[l,p]*B[l,n]  (PROD: NO dt)
                 dds = T.alloc_local((1,), accum_dtype)
                 dds[0] = T.Cast(accum_dtype, 0)
                 for pn in T.serial(headdim * dstate):
@@ -4778,7 +4776,7 @@ def chunk_precompute_bwd_metal_prim(
                     ds = dstates[batch_idx, chunk_idx, head_idx, pp, nn]
                     x_v = T.Cast(accum_dtype, x[batch_idx, base + l, head_idx, pp])
                     b_v = T.Cast(accum_dtype, B[batch_idx, base + l, group_idx, nn])
-                    dds[0] = dds[0] + ds * dt_l * x_v * b_v
+                    dds[0] = dds[0] + ds * x_v * b_v
                 tt = dds[0] * decay_l
                 dA_full[l] = dA_cumsum_y[batch_idx, head_idx, chunk_idx, l] - tt
                 T.atomic_add(t_sum[0], tt)
@@ -4791,22 +4789,20 @@ def chunk_precompute_bwd_metal_prim(
                 )
             T.sync_threads()
 
-            # ---- assemble dinp = dinp_diag + dinp_states ; reduce to dx_inp, dB, ddt
-            #   dinp[l,p,n] = grad wrt inp = dt*x⊗B (proto native). Two sources:
+            # ---- assemble dinp = dinp_diag + dinp_states ; reduce to dx_inp, dB
+            #   dinp[l,p,n] = grad wrt inp = x⊗B (PRODUCTION model, NO dt). Two sources:
             #     dinp_diag (from B2 Y_diag, NO dt baked in)
             #     dinp_states[l,p,n] = dstates[p,n]*decay_states[l]  (summary chain;
-            #        forward summary = sum_l decay*dt*x*B, so grad wrt inp drops dt)
-            #   Then chain inp = dt*(x⊗B):
-            #     dx_inp[l,p] = sum_n dinp[l,p,n]*dt[l]*B[l,n]
-            #     dB[l,n]     = sum_p dinp[l,p,n]*dt[l]*x[l,p]
-            #     ddt_inp[l]  = sum_{p,n} dinp[l,p,n]*x[l,p]*B[l,n]
+            #        forward summary = sum_l decay*x*B, grad wrt inp = ds*decay)
+            #   Then chain inp = x⊗B (PROD inp=x*B, dt is NOT a factor here):
+            #     dx_inp[l,p] = sum_n dinp[l,p,n]*B[l,n]   (prod dx_inp = dh*B :1506/:1523)
+            #     dB[l,n]     = sum_p dinp[l,p,n]*x[l,p]   (prod dB = dh*x :1502/:1519)
+            #   ddt has NO input-term contribution (prod ddt = d_logdecay*A only :1533).
             for lp in T.Parallel(L * headdim):
                 ll = lp // headdim
                 pp = lp % headdim
                 decay_l = T.exp2((dacs[L - 1] - dacs[ll]) * p)
-                dt_l = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ll])
-                x_lp = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
-                acc = T.alloc_local((1,), accum_dtype)      # sum_n dinp*B  (no dt yet)
+                acc = T.alloc_local((1,), accum_dtype)      # sum_n dinp*B
                 acc[0] = T.Cast(accum_dtype, 0)
                 for nn in T.serial(dstate):
                     ds = dstates[batch_idx, chunk_idx, head_idx, pp, nn]
@@ -4816,16 +4812,14 @@ def chunk_precompute_bwd_metal_prim(
                     )
                     b_v = T.Cast(accum_dtype, B[batch_idx, base + ll, group_idx, nn])
                     acc[0] = acc[0] + dinp_v * b_v
-                # dx_inp = dt * sum_n dinp*B ; ddt_inp += x * sum_n dinp*B
-                T.atomic_add(dx[batch_idx, base + ll, head_idx, pp], acc[0] * dt_l)
-                T.atomic_add(ddt_inp_sh[ll], acc[0] * x_lp)
+                # dx_inp = sum_n dinp*B (NO dt; prod dx_inp = dh*B)
+                T.atomic_add(dx[batch_idx, base + ll, head_idx, pp], acc[0])
             T.sync_threads()
 
             for ln in T.Parallel(L * dstate):
                 ll = ln // dstate
                 nn = ln % dstate
                 decay_l = T.exp2((dacs[L - 1] - dacs[ll]) * p)
-                dt_l = T.Cast(accum_dtype, dt[batch_idx, head_idx, chunk_idx, ll])
                 acc = T.alloc_local((1,), accum_dtype)
                 acc[0] = T.Cast(accum_dtype, 0)
                 for pp in T.serial(headdim):
@@ -4836,8 +4830,8 @@ def chunk_precompute_bwd_metal_prim(
                     )
                     x_v = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
                     acc[0] = acc[0] + dinp_v * x_v
-                # dB[l,n] = dt * sum_p dinp*x ; accumulate over heads in a group
-                T.atomic_add(dB[batch_idx, base + ll, head_idx, nn], acc[0] * dt_l)
+                # dB[l,n] = sum_p dinp*x (NO dt; prod dB = dh*x); accumulate over heads in a group
+                T.atomic_add(dB[batch_idx, base + ll, head_idx, nn], acc[0])
             T.sync_threads()
 
             # ---- A_cumsum = cumsum(a) over l -> da via reverse-cumsum (adjoint) ----
@@ -4854,10 +4848,11 @@ def chunk_precompute_bwd_metal_prim(
                     ll = L - 1 - l
                     racc[0] = racc[0] + dA_full[ll]
                     s = base + ll
-                    # a[l] = A[h]*dt[l]; dlog_decay = da (=dA*dt path, proto).
+                    # a[l] = A[h]*dt[l]; dlog_decay = da = d_logdecay (decay-only).
                     dlog_decay[batch_idx, s, head_idx] = racc[0]
-                    # ddt = decay-chain path (da*A) + inp path (sum dinp*x*B).
-                    ddt[batch_idx, s, head_idx] = racc[0] * a_h + ddt_inp_sh[ll]
+                    # ddt = decay-chain path ONLY (d_logdecay*A); NO input-term
+                    # contribution (PROD ddt = d_logdecay*A, path_c :1533).
+                    ddt[batch_idx, s, head_idx] = racc[0] * a_h
 
     return main
 
