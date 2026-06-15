@@ -4443,7 +4443,35 @@ def _mamba3_chunked_backward_path_c(
     # --- B1: inter_chunk_recur_bwd (dh_last seeded zero) ---
     k_b1 = _chunked_bwd_b1_kernel(batch, seq, chunk, G, heads, headdim, state)
     dh_last = mx.zeros((batch, heads, headdim, state), dtype=mx.float32)
-    dstates, dh0_m, dA_tail = k_b1(dchunk, dA16, dh_last, prev32)
+    # The B1 kernel's dA_cumsum_tail (3rd output) is INTENTIONALLY DISCARDED for
+    # the production grad path (renamed _dA_tail_kernel_unused) — it is produced by
+    # an INTRA-threadgroup T.atomic_add over headdim*dstate cell-lanes after an
+    # in-body zero-store ordered only by a THREADGROUP barrier. The TileLang Metal
+    # codegen PrintStorageSync (tilelang/src/target/codegen_metal.cc:1661-1668)
+    # ALWAYS emits threadgroup_barrier(mem_flags::mem_threadgroup) and NEVER
+    # mem_device, so the zero-store to the DEVICE buffer is not ordered against the
+    # device-atomic RMW on Apple GPUs -> the zero can clobber an accumulated partial
+    # (or the atomic reads an un-zeroed value) only under mx.vjp reverse-graph
+    # scheduling -> dA_cumsum_tail is INTERMITTENTLY corrupt (MEASURED: surfaces at
+    # sporadic repeat indices, propagating to dA/ddt > 1e-3, ~10% of fresh
+    # processes). Apply the dD precedent (deterministic wrapper recompute, RULE #1,
+    # one clear DETERMINISTIC path): recompute the tail in fp32 MLX from the
+    # RACE-FREE B1 outputs/stash — dstates is a plain SINGLE-WRITER store and
+    # prev_states is the stashed fwd buffer, both deterministic. The kernel math is
+    #   dA_tail[b,h,cc,L-1] = exp(dA_cumsum[b,h,cc,L-1]) * sum_{p,n} dstates*prev_states
+    # (core :4584-4593: decay=exp2(tail*log2e)=exp(tail); g[cc]=dstates[cc]). VERIFIED
+    # bit-equal to the kernel tail at the fp32 floor (worst ~4.6e-06 over multi-run).
+    dstates, dh0_m, _dA_tail_kernel_unused = k_b1(dchunk, dA16, dh_last, prev32)
+    L = chunk
+    tail_dacs = dA16[:, :, :, L - 1].astype(mx.float32)  # (b,H,nchunks)
+    decay_tail = mx.exp(tail_dacs)
+    prod_pn = mx.sum(
+        dstates.astype(mx.float32) * prev32, axis=(3, 4)
+    )  # (b,nchunks,H)
+    prod_pn = mx.transpose(prod_pn, (0, 2, 1))  # (b,H,nchunks)
+    dA_tail = mx.zeros((batch, heads, nchunks, L), dtype=mx.float32)
+    dA_tail[:, :, :, L - 1] = decay_tail * prod_pn
+    dA_tail = mx.contiguous(dA_tail)
 
     # --- B0: chunk_precompute_bwd (dx fresh inp-path -> add B2 dx) ---
     k_b0 = _chunked_bwd_b0_kernel(batch, seq, chunk, G, heads, headdim, state)

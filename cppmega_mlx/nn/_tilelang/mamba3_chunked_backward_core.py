@@ -4846,8 +4846,17 @@ def chunk_precompute_bwd_metal_prim(
                     )
                     b_v = T.Cast(accum_dtype, B[batch_idx, base + ll, group_idx, nn])
                     acc[0] = acc[0] + dinp_v * b_v
-                # dx_inp = sum_n dinp*B (NO dt; prod dx_inp = dh*B)
-                T.atomic_add(dx[batch_idx, base + ll, head_idx, pp], acc[0])
+                # dx_inp = sum_n dinp*B (NO dt; prod dx_inp = dh*B). PLAIN STORE,
+                # not T.atomic_add: dx[b,base+ll,head,pp] is SINGLE-WRITER — each
+                # (b,chunk,head) CTA owns a DISJOINT base..base+L seqlen slice, so no
+                # two threads ever write the same cell. The former atomic_add only
+                # satisfied the parallel-loop verifier; it RMW'd the bridge-zeroed
+                # buffer, so it depended on the bridge zero-blit completing first.
+                # Under mx.vjp that producer-ordering boundary is best-effort and was
+                # NOT honored -> sporadic stale/zero reads -> dx blow-up > 1e-3. A
+                # plain `=` has NO dependence on a prior zero-init (kernel-owned init
+                # pinned to [] below), removing the race entirely (RULE #1).
+                dx[batch_idx, base + ll, head_idx, pp] = acc[0]
             T.sync_threads()
 
             for ln in T.Parallel(L * dstate):
@@ -4864,8 +4873,16 @@ def chunk_precompute_bwd_metal_prim(
                     )
                     x_v = T.Cast(accum_dtype, x[batch_idx, base + ll, head_idx, pp])
                     acc[0] = acc[0] + dinp_v * x_v
-                # dB[l,n] = sum_p dinp*x (NO dt; prod dB = dh*x); accumulate over heads in a group
-                T.atomic_add(dB[batch_idx, base + ll, head_idx, nn], acc[0])
+                # dB[l,n] = sum_p dinp*x (NO dt; prod dB = dh*x). PLAIN STORE, not
+                # T.atomic_add: dB[b,base+ll,head,nn] is SINGLE-WRITER — the index is
+                # head_idx (NOT group_idx), so each (b,chunk,head) CTA owns a DISJOINT
+                # (seqlen-slice, head) cell; there is NO cross-head accumulation into a
+                # shared cell. (The "accumulate over heads in a group" note was stale —
+                # the write index is per-head.) Same rationale as dx above: the atomic
+                # was verifier-only and RMW'd the bridge-zeroed buffer, racing the
+                # zero-blit under mx.vjp. Plain `=` onto kernel-owned-zero (pin []
+                # below) is deterministic (RULE #1).
+                dB[batch_idx, base + ll, head_idx, nn] = acc[0]
             T.sync_threads()
 
             # ---- A_cumsum = cumsum(a) over l -> da via reverse-cumsum (adjoint) ----
@@ -4888,6 +4905,21 @@ def chunk_precompute_bwd_metal_prim(
                     # contribution (PROD ddt = d_logdecay*A, path_c :1533).
                     ddt[batch_idx, s, head_idx] = racc[0] * a_h
 
+    # ZERO-INIT SCOPE (MLX tvm_ffi owner-output correctness, RULE #1 — one clear
+    # DETERMINISTIC path). Mirrors the B1 pin (:4616) and the B2 dD pin (:474). The
+    # MLX bridge detects the (now-removed) atomic_add on dx/dB and, by default,
+    # zero-inits the outputs on its OWN command buffer; that zero-blit RMW-races the
+    # kernel writes under mx.vjp scheduling (the producer-ordering boundary is
+    # best-effort and NOT honored on the reverse graph) -> sporadic stale/zero reads
+    # -> dx/dB blow-up > 1e-3. ALL FOUR outputs are now FULLY KERNEL-OWNED with PLAIN
+    # stores: dx (:4850) and dB (:4868) are single-writer plain `=` over each CTA's
+    # disjoint seqlen slice; dlog_decay/ddt (:4886/:4889) are fully written by the
+    # lane-0 serial reverse-cumsum over every l. No cell is left un-written, so the
+    # kernel needs NO bridge zero-init. Pin to EXACTLY {} so the bridge stops
+    # zero-blitting (kills the bridge-zero-vs-store race) and the kernel owns all
+    # initialization. dx in the wrapper is dx_b2 + dx_b0 (separate buffers summed in
+    # MLX, path_c :4454), so the B0 plain-store onto its own buffer is correct.
+    main = main.with_attr("tilelang_metal_zero_init_output_positions", [])
     return main
 
 
