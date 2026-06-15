@@ -438,6 +438,25 @@ def chunk_scan_combine_bwd_metal_prim(
             for l in T.Parallel(L):
                 dA_cumsum_y[batch_idx, head_idx, chunk_idx, l] = dAcs_acc[l]
 
+    # ZERO-INIT SCOPE (MLX tvm_ffi owner-output correctness, RULE #1 — one clear
+    # path, deterministic). The MLX bridge lazily allocates each out_idx owner
+    # buffer GARBAGE (not zeroed) and, by default, zero-inits EVERY output when it
+    # detects any ``atomic_add`` in the kernel source. ``dD`` (output position 6 in
+    # the out_idx order [dC,dx,dz,dchunk_states,dinp,dA_cumsum_y,dD]) is the ONLY
+    # CROSS-THREADGROUP accumulated output: it is written via
+    # ``T.atomic_add(dD[head_idx], ...)`` from every (batch*nchunks) threadgroup
+    # owning that head, so it REQUIRES a zeroed buffer. dC/dx/dz/dchunk_states/
+    # dinp/dA_cumsum_y (positions 0..5) are each FULLY WRITTEN by the single
+    # threadgroup that owns the slice (the in-body prologue ``= 0`` fills are a
+    # value-identity, and the bodies overwrite every owned cell), so they MUST NOT
+    # be pre-cleared by the bridge: an extra zero-blit on those full-write outputs
+    # RACES the dD cross-threadgroup atomic and zeroes/corrupts dD (measured:
+    # zero-init-all -> dD wrong 1.86e-1; zero-init-[6]-only -> dD == fp32 gold
+    # 2.68e-7). Pin the bridge zero-init to EXACTLY {dD} so correctness does not
+    # depend on the caller pre-zeroing and the full-write outputs stay race-free.
+    # dseg/dstate_decay atomics target SHARED ``dAcs_acc`` (not a global output)
+    # and need no bridge zeroing.
+    main = main.with_attr("tilelang_metal_zero_init_output_positions", [6])
     return main
 
 
