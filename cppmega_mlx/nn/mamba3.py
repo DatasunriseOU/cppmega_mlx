@@ -20,12 +20,29 @@ _MAMBA3_PATH_C_PATH_B_BWD_VALUES = {
     "fwd_path_b_bwd",
     "path_c_fwd_path_b_bwd",
 }
+# Explicit proving-phase selector for the chunked B2->B1->B0 backward behind the
+# Path C DSL forward. Selectable ONLY via the env; the receipt keeps AUTO on
+# path_b until a no-worse bwd receipt is checked in. RULE #1: when selected this
+# is the ONE clear path — its failures RAISE, there is no try/except->MSL.
+_MAMBA3_PATH_C_CHUNKED_BWD_VALUES = {
+    "path_c_chunked_bwd",
+    "path_c_fwd_path_c_bwd",
+    "chunked",
+    "chunked_bwd",
+}
 
 
 def _mamba3_path_c_uses_path_b_backward() -> bool:
     return (
         os.environ.get(MAMBA3_PATH_C_BWD_ENV, "").strip().lower()
         in _MAMBA3_PATH_C_PATH_B_BWD_VALUES
+    )
+
+
+def _mamba3_path_c_uses_chunked_backward() -> bool:
+    return (
+        os.environ.get(MAMBA3_PATH_C_BWD_ENV, "").strip().lower()
+        in _MAMBA3_PATH_C_CHUNKED_BWD_VALUES
     )
 
 
@@ -519,12 +536,27 @@ def _dispatch_mamba3_scan(
         from cppmega_mlx.nn._tilelang.mamba3_path_c import (
             mamba3_mimo_apply_with_state_path_c,
             mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd,
+            mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd,
             mamba3_mimo_path_c_status,
         )
 
         status = mamba3_mimo_path_c_status()
         if not status.available:
             raise RuntimeError(f"mamba3_mimo: Path C kernel unavailable ({status.reason})")
+        if _mamba3_path_c_uses_chunked_backward():
+            # EXPLICIT proving-phase selector: Path C DSL fwd + chunked
+            # B2->B1->B0 backward. RULE #1: the ONE clear path once selected —
+            # the custom_function's .vjp RAISES (no try/except->MSL fallback) on
+            # any chunked-chain failure / out-of-regime A. The receipt keeps AUTO
+            # on path_b; this branch is reached only when CPPMEGA_MAMBA3_PATH_C_BWD
+            # names the chunked mode.
+            y, h_last, *_stash = mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd(
+                x, B, C, z, A, dt, D, h0
+            )
+            record_dispatch(
+                "mamba3_mimo", path, "path_c_tilelang_dsl_fwd_path_c_chunked_bwd"
+            )
+            return y, h_last
         if _mamba3_path_c_uses_path_b_backward():
             y, h_last = mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd(
                 x, B, C, z, A, dt, D, h0

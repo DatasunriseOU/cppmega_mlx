@@ -521,13 +521,20 @@ def mamba3_path_c_receipt_auto_mode(
     if not isinstance(decision, dict):
         return "path_b"
     mode = decision.get("mode")
-    if mode not in {"path_c_fwd_path_b_bwd", "path_c_fwd_bwd"}:
+    if mode not in {
+        "path_c_fwd_path_b_bwd",
+        "path_c_fwd_bwd",
+        "path_c_fwd_path_c_bwd",
+    }:
         return "path_b"
     if decision.get("selected_forward_kernel") != "path_c_tilelang_dsl":
         return "path_b"
-    expected_bwd = (
-        "path_c_tilelang_dsl" if mode == "path_c_fwd_bwd" else "metal_kernel_bwd_v1"
-    )
+    expected_bwd_by_mode = {
+        "path_c_fwd_bwd": "path_c_tilelang_dsl",
+        "path_c_fwd_path_b_bwd": "metal_kernel_bwd_v1",
+        "path_c_fwd_path_c_bwd": "path_c_chunked_bwd_v1",
+    }
+    expected_bwd = expected_bwd_by_mode[mode]
     if decision.get("selected_backward_kernel") != expected_bwd:
         return "path_b"
 
@@ -561,7 +568,10 @@ def mamba3_path_c_receipt_auto_mode(
     if (fwd_c_ms / fwd_b_ms) > max_ratio:
         return "path_b"
 
-    if mode == "path_c_fwd_bwd":
+    if mode in {"path_c_fwd_bwd", "path_c_fwd_path_c_bwd"}:
+        # Both Path-C-backward modes must clear the strict bwd + fwd+bwd ratio
+        # gate (fail-closed). The chunked mode additionally needs the no-worse
+        # chunked-backward receipt before AUTO ever promotes it.
         if not plan.bwd_path_c_candidate:
             return "path_b"
         try:
@@ -4163,6 +4173,365 @@ def _mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd_vjp(
     return mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
 
 
+# --------------------------------------------------------------------------- #
+# path_c_fwd_path_c_bwd — Path C DSL forward + the chunked B2->B1->B0 backward.  #
+#                                                                               #
+# The forward is the UNCHANGED Path C lane-scan fwd (mamba3_mimo_fwd_path_c). It #
+# additionally runs the chunked-forward builders F0/F1 to materialize the       #
+# intermediates (cb, dA_cumsum, prev_states, y) the chunked backward consumes,   #
+# and STASHES them as extra custom_function outputs (the MLX VJP residual). The   #
+# .vjp then drives the validated chunked B2->B1->B0 chain (the exact call        #
+# sequence + 8-grad assembly ported from                                         #
+# tests/test_mamba3_chunked_backward_b0b1b2.py::test_chained_backward_*) and      #
+# returns the 8-grad tuple matching the MSL mamba3_mimo_bwd_metal surface         #
+# (dx, dB, dC, dz, dA, ddt, dD, dh0).                                            #
+#                                                                               #
+# ABI (verified by reading the prim signatures + an MLX tvm_ffi probe):          #
+#   * All chunked prims declare dtype=float16 inputs and float32 accumulators.    #
+#     The kernel inputs (x,B,C,z,A,dt,D,dout,cb,dA_cumsum,y,dt_k) are cast to     #
+#     fp16; the accumulators (summary_states, prev_states, dstates, dinp, dx,     #
+#     dB, dlog, ddt, dC, dz, dh0, ...) come back fp32. This is the SAME fp16-in   #
+#     regime the chained-backward test validated < 1e-3 against the fp32 proto.   #
+#   * Each builder compiles with out_idx (F0[5,6,7], F1[3,4], B2[11..17],         #
+#     B1[4,5,6], B0[9,10,11,12]); the MLX route returns those as fresh ZEROED     #
+#     output arrays. B0's dx is therefore a FRESH inp-path grad — the .vjp adds    #
+#     B2's dx (D-skip + dY*C path) to B0's dx to form the total dx (the test's     #
+#     dx_full = dx_m.clone() seeds B0 with B2's dx; out_idx forces an MLX add).    #
+#   * At the _dispatch_mamba3_scan surface ngroups == nheads (B/C are already      #
+#     broadcast per-head, A is (b,seq,H)); the builders run with ngroups=H so      #
+#     cb's group axis is the head axis and dB stays per-head (b,seq,H,N) — no      #
+#     head->group reduction is needed (RISK #3 dissolves at this surface).        #
+#                                                                               #
+# REGIME GUARD (RULE #1 — fail loud, no silent wrong path): the chunked kernels    #
+# reconstruct the per-position log-decay as A_kernel[h]*dt[l] from a PER-HEAD      #
+# scalar A (T.Tensor((nheads,))). The Mamba3 production surface's A is PER-        #
+# POSITION (b,seq,H). When A varies across positions the kernels' ddt = dlog*A[h]  #
+# term cannot represent dlog*A_pos[l] exactly. Rather than silently emit a wrong    #
+# ddt this mode RAISES when A is not per-head-constant (the validated regime), so   #
+# the caller sees WHERE+WHAT instead of degraded grads. Full per-position-A         #
+# parity is the NEXT phase (it needs a kernel-ABI change to accept per-position A   #
+# / a precomputed dA_cumsum override); this mode is selected only explicitly via    #
+# CPPMEGA_MAMBA3_PATH_C_BWD (the receipt keeps AUTO on path_b) for the proving      #
+# phase. NO try/except->MSL fallback anywhere (the dispatcher selects up front).    #
+# --------------------------------------------------------------------------- #
+
+# Metal compile target reused for every chunked-chain kernel.
+_CHUNKED_METAL_TARGET = _msl_transform._as_metal_target("metal")
+
+
+@lru_cache(maxsize=64)
+def _chunked_fwd_f0_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: int) -> Any:
+    """F0 (chunk_precompute) compiled for the MLX tvm_ffi route -> (cb,dA_cumsum,summary)."""
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
+        chunk_precompute_fwd_metal_prim,
+    )
+
+    return tilelang.compile(
+        chunk_precompute_fwd_metal_prim(b, s, c, g, h, p, n),
+        target=_CHUNKED_METAL_TARGET,
+        execution_backend="tvm_ffi",
+        out_idx=[5, 6, 7],
+    )
+
+
+@lru_cache(maxsize=64)
+def _chunked_fwd_f1_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: int) -> Any:
+    """F1 (inter_chunk_recur) compiled for MLX -> (prev_states, final_state)."""
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_precompute_core import (
+        inter_chunk_recur_fwd_metal_prim,
+    )
+
+    return tilelang.compile(
+        inter_chunk_recur_fwd_metal_prim(b, s, c, g, h, p, n),
+        target=_CHUNKED_METAL_TARGET,
+        execution_backend="tvm_ffi",
+        out_idx=[3, 4],
+    )
+
+
+@lru_cache(maxsize=64)
+def _chunked_bwd_b2_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: int) -> Any:
+    """B2 (chunk_scan_combine_bwd) -> (dC,dx,dz,dchunk_states,dinp,dA_cumsum_y,dD)."""
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+        chunk_scan_combine_bwd_metal_prim,
+    )
+
+    return tilelang.compile(
+        chunk_scan_combine_bwd_metal_prim(b, s, c, g, h, p, n),
+        target=_CHUNKED_METAL_TARGET,
+        execution_backend="tvm_ffi",
+        out_idx=[11, 12, 13, 14, 15, 16, 17],
+    )
+
+
+@lru_cache(maxsize=64)
+def _chunked_bwd_b1_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: int) -> Any:
+    """B1 (inter_chunk_recur_bwd) -> (dstates, dh0, dA_cumsum_tail)."""
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+        inter_chunk_recur_bwd_metal_prim,
+    )
+
+    return tilelang.compile(
+        inter_chunk_recur_bwd_metal_prim(b, s, c, g, h, p, n),
+        target=_CHUNKED_METAL_TARGET,
+        execution_backend="tvm_ffi",
+        out_idx=[4, 5, 6],
+    )
+
+
+@lru_cache(maxsize=64)
+def _chunked_bwd_b0_kernel(b: int, s: int, c: int, g: int, h: int, p: int, n: int) -> Any:
+    """B0 (chunk_precompute_bwd) -> (dx_inp, dB, dlog_decay, ddt)."""
+    import tilelang
+
+    from cppmega_mlx.nn._tilelang.mamba3_chunked_backward_core import (
+        chunk_precompute_bwd_metal_prim,
+    )
+
+    return tilelang.compile(
+        chunk_precompute_bwd_metal_prim(b, s, c, g, h, p, n),
+        target=_CHUNKED_METAL_TARGET,
+        execution_backend="tvm_ffi",
+        out_idx=[9, 10, 11, 12],
+    )
+
+
+def _path_c_chunk_size_for(seq: int) -> int:
+    """Return the chunked-backward chunk size; nam56r/prod is 64 and must divide seq."""
+    chunk = 64
+    if seq % chunk != 0:
+        raise ValueError(
+            "mamba3 path_c_fwd_path_c_bwd: seqlen "
+            f"({seq}) must be divisible by the chunked-backward chunk_size "
+            f"({chunk}); the chunked B2->B1->B0 chain does not pad (RULE #1)."
+        )
+    return chunk
+
+
+def _assert_per_head_constant_A(A: mx.array) -> mx.array:
+    """Reduce A (b,seq,H) to the per-head (H,) the chunked kernels need.
+
+    RULE #1: the chunked kernels take a PER-HEAD scalar A. If A varies across
+    positions the chunked decay (A[h]*dt[l]) does not match the surface
+    (A_pos[l]*dt[l]); emitting grads anyway would be a silent wrong path. RAISE
+    with WHERE+WHAT instead. Returns the (H,) per-head A on success.
+    """
+    if A.ndim != 3:
+        raise ValueError(
+            f"mamba3 path_c_fwd_path_c_bwd: A must be (b,seq,H), got shape {A.shape}"
+        )
+    A32 = A.astype(mx.float32)
+    per_head = A32[:, 0, :]  # (b, H)
+    spread = mx.max(mx.abs(A32 - per_head[:, None, :]))
+    mx.eval(spread)
+    spread_f = float(spread)
+    if spread_f > 1e-6:
+        raise RuntimeError(
+            "mamba3 path_c_fwd_path_c_bwd: A is PER-POSITION (max across-seq "
+            f"spread {spread_f:.3e} > 1e-6). The chunked B2->B1->B0 kernels take a "
+            "PER-HEAD scalar A and reconstruct decay as A[h]*dt[l]; a per-position A "
+            "would make the ddt = dlog*A term wrong. Refusing to emit silently-wrong "
+            "grads (RULE #1). Per-position-A support is the next phase (kernel ABI "
+            "change). This mode is for the per-head-constant-A proving regime."
+        )
+    if A32.shape[0] != 1:
+        # The (H,) kernel A is batch-independent; require a single batch's A here
+        # (the per-head reduction already proved A is position-constant, but the
+        # kernel cannot carry a batch axis on A).
+        b0 = per_head[0:1]
+        if float(mx.max(mx.abs(per_head - b0))) > 1e-6:
+            raise RuntimeError(
+                "mamba3 path_c_fwd_path_c_bwd: A differs across the batch axis; the "
+                "chunked kernel A is (H,) batch-independent. Refusing a silent "
+                "reduction (RULE #1)."
+            )
+    return per_head[0]  # (H,)
+
+
+def _mamba3_chunked_backward_path_c(
+    dy: mx.array,
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+    *,
+    cb: mx.array,
+    dA_cumsum: mx.array,
+    prev_states: mx.array,
+    y: mx.array,
+) -> tuple[mx.array, ...]:
+    """Chained B2->B1->B0 chunked backward producing the 8-grad MSL surface.
+
+    The forward intermediates (cb, dA_cumsum fp16; prev_states fp32; y fp16) are
+    STASHED from the fwd custom_function (no forward replay). Inputs are cast to
+    the chunked kernels' fp16 ABI; accumulator grads come back fp32 and are cast
+    to the primal dtypes. Returns (dx, dB, dC, dz, dA, ddt, dD, dh0).
+    """
+    batch, seq, heads, headdim, state = _validate_inputs(x, B, C, z, A, dt, D, h0)
+    chunk = _path_c_chunk_size_for(seq)
+    nchunks = seq // chunk
+    G = heads  # at the dispatch surface B/C are per-head -> ngroups == nheads
+
+    # fp16 kernel-input casts (the validated chunked ABI). dt_k = (b,H,c,s).
+    def f16(a: mx.array) -> mx.array:
+        return mx.contiguous(a.astype(mx.float16))
+
+    x16 = f16(x)
+    B16 = f16(B)
+    C16 = f16(C)
+    z16 = f16(z)
+    D16 = f16(D)
+    dout16 = f16(dy)
+    y16 = f16(y)
+    dt16 = dt.astype(mx.float16)
+    dt_k = mx.contiguous(mx.transpose(dt16.reshape(batch, nchunks, chunk, heads), (0, 3, 1, 2)))
+    cb16 = cb.astype(mx.float16) if cb.dtype != mx.float16 else cb
+    dA16 = dA_cumsum.astype(mx.float16) if dA_cumsum.dtype != mx.float16 else dA_cumsum
+    A_head16 = _assert_per_head_constant_A(A).astype(mx.float16)
+    prev32 = prev_states.astype(mx.float32)
+
+    # --- B2: chunk_scan_combine_bwd ---
+    k_b2 = _chunked_bwd_b2_kernel(batch, seq, chunk, G, heads, headdim, state)
+    dC_m, dx_b2, dz_m, dchunk, dinp_diag, dA_y, dD_m = k_b2(
+        dout16, cb16, x16, z16, dt_k, dA16, C16, B16, prev32, D16, y16
+    )
+
+    # --- B1: inter_chunk_recur_bwd (dh_last seeded zero) ---
+    k_b1 = _chunked_bwd_b1_kernel(batch, seq, chunk, G, heads, headdim, state)
+    dh_last = mx.zeros((batch, heads, headdim, state), dtype=mx.float32)
+    dstates, dh0_m, dA_tail = k_b1(dchunk, dA16, dh_last, prev32)
+
+    # --- B0: chunk_precompute_bwd (dx fresh inp-path -> add B2 dx) ---
+    k_b0 = _chunked_bwd_b0_kernel(batch, seq, chunk, G, heads, headdim, state)
+    dx_b0, dB_m, dlog_m, ddt_m = k_b0(
+        dstates, dinp_diag, dA_y, dA_tail, dA16, x16, B16, dt_k, A_head16
+    )
+
+    dx_total = dx_b2 + dx_b0  # B2 D-skip/dY*C path + B0 inp path (test: dx_full clone)
+
+    # Map the chained chain's grads -> MSL primal-order 8-tuple. At this surface
+    # A is (b,seq,H) and the chain's dlog_decay (b,seq,H) IS the grad wrt A (the
+    # surface's log_decay = A*dt), so dA = dlog_m. B/C are per-head so dB/dC need
+    # no group reduction. Cast each grad to its primal dtype.
+    dx = dx_total.astype(x.dtype)
+    dB = dB_m.astype(B.dtype)
+    dC = dC_m.astype(C.dtype)
+    dz = dz_m.astype(z.dtype)
+    dA = dlog_m.astype(A.dtype)
+    ddt = ddt_m.astype(dt.dtype)
+    dD = dD_m.astype(D.dtype)
+    dh0 = dh0_m.astype(h0.dtype)
+    return (dx, dB, dC, dz, dA, ddt, dD, dh0)
+
+
+def _mamba3_chunked_fwd_intermediates_path_c(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    h0: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Run F0+F1 to materialize (cb, dA_cumsum, prev_states) for the bwd stash.
+
+    summary_states is a fwd-internal feeding F1 -> prev_states; only prev_states
+    (and cb/dA_cumsum) outlive into the backward, so summary_states is not stashed.
+    All inputs are cast to the chunked fp16 ABI; outputs keep their native dtypes
+    (cb/dA_cumsum fp16, prev_states fp32).
+    """
+    batch, seq, heads, headdim = x.shape
+    state = B.shape[-1]
+    chunk = _path_c_chunk_size_for(seq)
+    G = heads
+
+    def f16(a: mx.array) -> mx.array:
+        return mx.contiguous(a.astype(mx.float16))
+
+    A_head16 = _assert_per_head_constant_A(A).astype(mx.float16)
+    x16 = f16(x)
+    B16 = f16(B)
+    C16 = f16(C)
+    dt16 = dt.astype(mx.float16)
+
+    k_f0 = _chunked_fwd_f0_kernel(batch, seq, chunk, G, heads, headdim, state)
+    cb, dA_cumsum, summary_states = k_f0(x16, B16, C16, A_head16, dt16)
+
+    k_f1 = _chunked_fwd_f1_kernel(batch, seq, chunk, G, heads, headdim, state)
+    prev_states, _final_state = k_f1(
+        summary_states, dA_cumsum, h0.astype(mx.float32)
+    )
+    return cb, dA_cumsum, prev_states
+
+
+@mx.custom_function
+def mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd(
+    x: mx.array,
+    B: mx.array,
+    C: mx.array,
+    z: mx.array,
+    A: mx.array,
+    dt: mx.array,
+    D: mx.array,
+    h0: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Path C DSL fwd + stashed chunked-fwd intermediates for the chunked bwd.
+
+    Returns (y, h_last, cb, dA_cumsum, prev_states, y_stash). The trailing four
+    arrays are the MLX custom_function residual the .vjp reads to drive the
+    chunked B2->B1->B0 backward WITHOUT replaying the forward chunk scan.
+
+    The forward y/h_last are the UNCHANGED production Path C lane-scan
+    (mamba3_mimo_fwd_path_c). The chunked-forward F0/F1 are additionally run to
+    materialize the bwd's stash. This is the SELECTABLE proving mode; it is not
+    the default and the receipt keeps AUTO on path_b until a no-worse bwd receipt
+    is checked in (see mamba3_path_c_receipt_auto_mode).
+    """
+    y, h_last = mamba3_mimo_fwd_path_c(x, B, C, z, A, dt, D, h0)
+    cb, dA_cumsum, prev_states = _mamba3_chunked_fwd_intermediates_path_c(
+        x, B, C, A, dt, h0
+    )
+    # Stash y in the chunked-bwd's fp16 ABI so the .vjp reuses it directly.
+    y_stash = y.astype(mx.float16)
+    return y, h_last, cb, dA_cumsum, prev_states, y_stash
+
+
+@mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd.vjp
+def _mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd_vjp(
+    primals: tuple[mx.array, ...],
+    cotangent: tuple[mx.array, ...],
+    output: tuple[mx.array, ...],
+) -> tuple[mx.array, ...]:
+    """Chained chunked B2->B1->B0 backward returning the 8-grad MSL surface.
+
+    Only cotangent[0] (dy) is meaningful; the h_last and stashed-intermediate
+    cotangents have zero loss-gradient (matching the existing ignore-h_last
+    contract). Returns ONE grad per primal in primal order
+    (x,B,C,z,A,dt,D,h0) — the SAME 8-grad surface as mamba3_mimo_bwd_metal.
+    """
+    x, B, C, z, A, dt, D, h0 = primals
+    dy = cotangent[0]
+    cb = output[2]
+    dA_cumsum = output[3]
+    prev_states = output[4]
+    y_stash = output[5]
+    return _mamba3_chunked_backward_path_c(
+        dy, x, B, C, z, A, dt, D, h0,
+        cb=cb, dA_cumsum=dA_cumsum, prev_states=prev_states, y=y_stash,
+    )
+
+
 # Convenience: dump the lowered MSL for the bench shape so reviewers can diff
 # Path B's hand-written MSL against Path C's machine-emitted MSL without
 # having to re-run the lowering pipeline.
@@ -4287,6 +4656,7 @@ __all__ = [
     "mamba3_mimo_apply_with_state_path_c",
     "mamba3_mimo_apply_with_state_training_path_c",
     "mamba3_mimo_apply_with_state_path_c_fwd_path_b_bwd",
+    "mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd",
     "mamba3_path_c_auto_fwd_path_b_bwd_allowed",
     "mamba3_path_c_auto_mode_for_inputs",
     "mamba3_path_c_receipt_allows_auto_promotion",
