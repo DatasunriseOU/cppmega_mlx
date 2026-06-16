@@ -19,6 +19,7 @@ test; the conservative atol/rtol budget is what we ship as the contract.
 """
 
 import json
+import os
 import re
 from typing import cast
 
@@ -1324,6 +1325,47 @@ def test_bwd_path_c_matches_path_b_fp32_small_shape() -> None:
     for name, gpc, gpb in zip(names, g_pc, g_pb):
         np.testing.assert_allclose(_np(gpc), _np(gpb), rtol=1e-3, atol=1e-4,
                                     err_msg=f"grad mismatch on {name}")
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CPPMEGA_RUN_S4096_PARITY"),
+    reason=(
+        "s4096 partial-route parity allocates >=2^31-element lane-grad buffers "
+        "and runs the full backward; opt-in via CPPMEGA_RUN_S4096_PARITY=1"
+    ),
+)
+def test_bwd_path_c_partial_matches_path_b_fp32_s4096_int64_index() -> None:
+    """Partial bwd route is bit-correct at s4096, where the dC/dz lane-grad
+    buffers ([B,S,H,N,P] = 1*4096*128*64*64 = 2^31 elements) flatten to a
+    flat index that reaches 2^31 and wrapped under int32 addressing.
+
+    This is the regression test for the complete Metal int64 indexing fix
+    (make_const guard + BufferNode::ElemOffset int64 fold-order +
+    flatten_buffer GetSimplifiedElemOffset int64 promotion +
+    metal_scalar_intrinsics widening-cast preservation). Before the fix
+    dC=2.96e-1 / dz=7.7e-2 wrapped; after it they are ~2e-7 (bit-correct).
+    All 8 grads must match Path B within rtol=1e-3 / atol=1e-4.
+    """
+
+    _require_mamba3_path_c()
+    inputs = _make_inputs(
+        batch=1, seq=4096, heads=128, headdim=64, state=64, dtype=mx.float32
+    )
+    x, B, C, z, A, dt, D, h0 = inputs
+    mx.random.seed(4096)
+    dy = (mx.random.normal(x.shape) * 0.1).astype(mx.float32)
+    mx.eval(dy)
+
+    g_pc = mamba3_mimo_bwd_path_c(dy, x, B, C, z, A, dt, D, h0)
+    g_pb = mamba3_mimo_bwd_metal(dy, x, B, C, z, A, dt, D, h0)
+    mx.eval(*g_pc, *g_pb)
+
+    names = ["dx", "dB", "dC", "dz", "dA", "ddt", "dD", "dh0"]
+    for name, gpc, gpb in zip(names, g_pc, g_pb):
+        np.testing.assert_allclose(
+            _np(gpc), _np(gpb), rtol=1e-3, atol=1e-4,
+            err_msg=f"s4096 int64-index grad mismatch on {name}",
+        )
 
 
 def test_bwd_scratch_route_matches_path_b_fp32_small_shape() -> None:
