@@ -184,6 +184,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PATH_C_AUTO_PROMOTION_RECEIPT = (
     _REPO_ROOT / "bench" / "tilelang_ports" / "mamba3_path_c.json"
 )
+# EXPLICIT regime crossover (MEASURED): the Path C LANE backward
+# (mamba3_mimo_bwd_path_c) is no-worse-than MSL (Path B) only for seqlen
+# >= 512 (s512 ratio 0.97, s1024 0.88, s2048 0.88/0.91, s4096 0.90); at
+# s128 the 2-dispatch LANE overhead dominates the tiny scan (ratio ~1.23 =>
+# LANE LOSES). The receipt-gated AUTO default therefore promotes any Path-C
+# *backward* mode (path_c_fwd_bwd / path_c_fwd_path_c_bwd) ONLY at seqlen >=
+# this crossover; below it AUTO stays on MSL/Path B. This is an EXPLICIT
+# regime split (both branches are correct paths gated by the measured
+# crossover), NOT a silent fallback: an out-of-regime seqlen fails closed to
+# 'path_b' here, never silently degrading a selected Path-C kernel.
+MAMBA3_LANE_BWD_MIN_SEQ = 512
 _MAX_THREADS = 256
 _REDUCE_MAX_THREADS = 1024
 _Z3_DISABLE_ENV = (
@@ -477,6 +488,43 @@ def mamba3_path_c_schedule_plan(
     )
 
 
+def _select_multi_shape_receipt_record(
+    shapes_list: list,
+    *,
+    batch: int,
+    seq: int,
+    heads: int,
+    headdim: int,
+    state: int,
+    dtype: str,
+) -> dict | None:
+    """Return the per-seqlen receipt block matching the request EXACTLY.
+
+    Fail-closed (RULE #1): returns ``None`` (=> caller selects Path B) unless a
+    single block's ``shape`` matches every requested dimension exactly. No
+    interpolation, no nearest-seqlen match, no "best available" — an absent
+    seqlen is an out-of-regime request and stays on MSL/Path B.
+    """
+
+    expected_shape = {
+        "batch": batch,
+        "seq": seq,
+        "heads": heads,
+        "headdim": headdim,
+        "state": state,
+        "dtype": dtype,
+    }
+    for entry in shapes_list:
+        if not isinstance(entry, dict):
+            continue
+        shape = entry.get("shape")
+        if not isinstance(shape, dict):
+            continue
+        if all(shape.get(k) == v for k, v in expected_shape.items()):
+            return entry
+    return None
+
+
 def mamba3_path_c_receipt_auto_mode(
     receipt_path: Path = _PATH_C_AUTO_PROMOTION_RECEIPT,
     *,
@@ -502,13 +550,40 @@ def mamba3_path_c_receipt_auto_mode(
     if not plan.fwd_path_c_candidate or not plan.z3_proved:
         return "path_b"
     try:
-        data = json.loads(receipt_path.read_text(encoding="utf-8"))
+        file_data = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return "path_b"
-    if not isinstance(data, dict):
+    if not isinstance(file_data, dict):
         return "path_b"
-    if data.get("kernel") != "mamba3_mimo_path_c_vs_path_b":
+    if file_data.get("kernel") != "mamba3_mimo_path_c_vs_path_b":
         return "path_b"
+
+    # Two RULE#1-clean receipt layouts, both fail-closed:
+    #   * legacy single-shape: top-level "shape" + "strict_policy" +
+    #     "scheduler_decision" + "timings" describe ONE seqlen.
+    #   * multi-shape regime: top-level "shapes" is a list of per-seqlen
+    #     blocks, each a self-contained receipt record (its own shape/
+    #     strict_policy/scheduler_decision/timings). The requested seqlen must
+    #     match a block EXACTLY (no interpolation, no nearest-match); if no
+    #     block matches, promotion fails closed to 'path_b'.
+    shapes_list = file_data.get("shapes")
+    if isinstance(shapes_list, list):
+        data = _select_multi_shape_receipt_record(
+            shapes_list,
+            batch=batch,
+            seq=seq,
+            heads=heads,
+            headdim=headdim,
+            state=state,
+            dtype=dtype,
+        )
+        if data is None:
+            # No exact per-seqlen block for this request => out-of-regime =>
+            # MSL/Path B. (e.g. s128 has no block, so it stays Path B.)
+            return "path_b"
+    else:
+        data = file_data
+
     strict_policy = data.get("strict_policy")
     if not isinstance(strict_policy, dict):
         return "path_b"
@@ -569,6 +644,15 @@ def mamba3_path_c_receipt_auto_mode(
         return "path_b"
 
     if mode in {"path_c_fwd_bwd", "path_c_fwd_path_c_bwd"}:
+        # EXPLICIT regime crossover (MEASURED): the LANE backward only beats
+        # MSL at seqlen >= MAMBA3_LANE_BWD_MIN_SEQ. Below the crossover (e.g.
+        # s128) the 2-dispatch LANE overhead dominates and MSL wins, so any
+        # Path-C *backward* promotion is refused here and AUTO stays on Path B.
+        # This is the in-code half of the regime split (the receipt is the
+        # other half): a Path-C-backward receipt for an out-of-regime seqlen is
+        # rejected, never silently run (RULE #1 — no degraded silent path).
+        if seq < MAMBA3_LANE_BWD_MIN_SEQ:
+            return "path_b"
         # Both Path-C-backward modes must clear the strict bwd + fwd+bwd ratio
         # gate (fail-closed). The chunked mode additionally needs the no-worse
         # chunked-backward receipt before AUTO ever promotes it.
@@ -1759,6 +1843,39 @@ def _bwd_simd_reduce_kernel_for_state_snapshots(
         out_idx=list(_BWD_SIMD_OUTPUT_IDX),
     )
     return kernel, lowering
+
+
+# Parallel-scan backward (work-efficient chunked associative scan).
+#
+# The committed snapshot SIMD LANE (``bwd_snap_simd``) walks the reverse
+# recurrence ``dh_t = a_{t+1}*dh_{t+1} + c_t`` with a single ``dh[n]`` carried
+# serially across all S steps per (b,h,p) lane -> an O(S)=4096-deep critical
+# path. Because the recurrence is a first-order linear (affine) recurrence it is
+# ASSOCIATIVE: each step is the affine map f_t(dh) = a_t*(dh + c_t), represented
+# as a pair (A,B) with carry_out = A*carry_in + B (A_t = a_t, B_t = a_t*c_t).
+# Reverse composition combine: (A1,B1) (+) (A2,B2) = (A1*A2, A2*B1 + B2)
+# (element 1 = later/right step). A naive full-sequence Blelloch forms the full
+# decay product (1.37e-204 at s4096) and UNDERFLOWS fp32 -> diverges. So we
+# bound it: a CHUNKED 3-phase scan.
+#
+#   PHASE 1 (intra-chunk reduce, chunks are a PARALLEL grid dim): each chunk
+#     reverse-walks CH steps with ZERO incoming carry, emitting its reduced
+#     element (P_ch = prod a over the chunk, Lacc_ch = local left-carry) into a
+#     boundary buffer. Promoting the chunk index into the grid raises occupancy
+#     from LANES to LANES*nchunks threadgroups -> the bounded walk hides the
+#     per-lane latency the single-carry LANE could not.
+#   PHASE 2 (cross-chunk scan): combine the (P,L) boundary pairs with the
+#     reverse associative op. O(nchunks)=64 per (b,h,p,n) -> 30.6x shorter than
+#     the O(S)=4096 LANE carry; the bounded products never underflow.
+#   PHASE 3 (intra-chunk re-emit, chunks parallel again): each chunk re-walks CH
+#     steps seeded with the phase-2 right-boundary carry, emitting all 8 grads
+#     via the existing in-kernel thread_allreduce_sum -> NO dB/dC expansion.
+#
+# New critical-path depth = 2*CH + nchunks vs LANE's S. Numerics PROVEN stable
+# (numpy probe: WORST_abs 1.79e-7 fast-decay / 2.54e-4 slow-decay at s4096, both
+# finite, both <1e-3). Chunk size autotuned; default 64 (worst intra-chunk decay
+# product 7.25e-5 >> fp32 min 1.2e-38).
+MAMBA3_PARALLEL_SCAN_CHUNK = 64
 
 
 @lru_cache(maxsize=128)
