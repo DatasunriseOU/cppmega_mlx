@@ -38,6 +38,7 @@ from cppmega_mlx.nn._tilelang import (
     mamba3_mimo_reference,
 )
 from cppmega_mlx.nn._tilelang.mamba3_path_c import (
+    MAMBA3_LANE_BWD_MIN_SEQ,
     Mamba3PathCSchedulePlan,
     Mamba3PathCStatus,
     dump_lowered_bwd_msl,
@@ -50,6 +51,7 @@ from cppmega_mlx.nn._tilelang.mamba3_path_c import (
     mamba3_mimo_bwd_path_c,
     mamba3_mimo_fwd_path_c,
     mamba3_mimo_path_c_status,
+    mamba3_path_c_auto_mode_for_inputs,
     mamba3_path_c_receipt_allows_auto_promotion,
     mamba3_path_c_receipt_auto_mode,
     mamba3_path_c_schedule_plan,
@@ -1035,6 +1037,89 @@ def test_mamba3_path_c_receipt_gate_requires_matching_shape_and_fwd_win(
         dtype="float32",
         z3_policy="enabled",
     )
+
+
+@pytest.mark.parametrize(
+    ("seq", "expected_mode"),
+    [
+        (128, "path_b"),            # OUT-OF-REGIME: below crossover => MSL bwd
+        (256, "path_b"),            # OUT-OF-REGIME: below crossover => MSL bwd
+        (512, "path_c_fwd_bwd"),    # IN-REGIME: LANE bwd (mamba3_mimo_bwd_path_c)
+        (1024, "path_c_fwd_bwd"),   # IN-REGIME: LANE bwd
+        (2048, "path_c_fwd_bwd"),   # IN-REGIME: LANE bwd
+        (4096, "path_c_fwd_bwd"),   # IN-REGIME: LANE bwd
+    ],
+)
+def test_checked_in_receipt_promotes_lane_bwd_in_regime_msl_out_of_regime(
+    seq: int, expected_mode: str
+) -> None:
+    """AUTO/default selects the MSL-beating LANE backward in-regime, MSL below.
+
+    Asserts the regime split against the REAL checked-in production receipt
+    (``bench/tilelang_ports/mamba3_path_c.json``, the multi-shape schema_version
+    2 default — not a synthetic tmp receipt) at the prod scan shape
+    B=1 H=112 P=64 N=64 fp32:
+
+      * seqlen >= MAMBA3_LANE_BWD_MIN_SEQ (512): AUTO promotes
+        ``path_c_fwd_bwd`` whose VJP is the LANE backward
+        ``mamba3_mimo_bwd_path_c`` (the MEASURED MSL-beater, <= MSL per the
+        receipt ratios).
+      * seqlen < the crossover (s128/s256): AUTO stays on ``path_b`` => the MSL
+        backward ``mamba3_mimo_bwd_metal``.
+
+    This is the EXPLICIT regime split (RULE #1): both branches are correct paths
+    gated by the measured receipt, not a silent fallback. The out-of-regime
+    seqlens have NO receipt block and fail closed to Path B.
+    """
+
+    pytest.importorskip("z3")
+    mamba3_path_c_schedule_plan.cache_clear()
+
+    # Pure receipt path (no GPU dispatch needed for the selection logic).
+    mode = mamba3_path_c_receipt_auto_mode(
+        batch=1,
+        seq=seq,
+        heads=112,
+        headdim=64,
+        state=64,
+        dtype="float32",
+        z3_policy="enabled",
+    )
+    assert mode == expected_mode, (
+        f"s{seq}: checked-in receipt AUTO mode {mode!r} != expected "
+        f"{expected_mode!r} (crossover MAMBA3_LANE_BWD_MIN_SEQ="
+        f"{MAMBA3_LANE_BWD_MIN_SEQ})"
+    )
+    # The crossover constant must agree with the regime boundary the receipt
+    # encodes (LANE in-regime at/above it, MSL below it).
+    if seq >= MAMBA3_LANE_BWD_MIN_SEQ:
+        assert mode == "path_c_fwd_bwd"
+    else:
+        assert mode == "path_b"
+
+
+def test_end_to_end_auto_mode_for_inputs_matches_regime_split() -> None:
+    """The end-to-end input router agrees with the receipt regime split.
+
+    ``mamba3_path_c_auto_mode_for_inputs`` is what the live dispatch in
+    ``mamba3.py`` calls; assert it yields the LANE-backward mode in-regime and
+    Path B out-of-regime on real prod-shape tensors (one small out-of-regime
+    seqlen + one large in-regime seqlen, keeping the test fast).
+    """
+
+    pytest.importorskip("z3")
+    _require_mamba3_path_c()
+    mamba3_path_c_schedule_plan.cache_clear()
+
+    out_of_regime = _make_inputs(
+        batch=1, seq=128, heads=112, headdim=64, state=64, dtype=mx.float32
+    )
+    assert mamba3_path_c_auto_mode_for_inputs(*out_of_regime) == "path_b"
+
+    in_regime = _make_inputs(
+        batch=1, seq=512, heads=112, headdim=64, state=64, dtype=mx.float32
+    )
+    assert mamba3_path_c_auto_mode_for_inputs(*in_regime) == "path_c_fwd_bwd"
 
 
 def test_fwd_path_c_dispatch_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
