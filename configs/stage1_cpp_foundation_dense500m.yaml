@@ -56,10 +56,10 @@ model:
     indexer_topk: 256
     indexer_loss_coeff: 0.001
     indexer_dtype: bf16
-    warmup: kl_to_dense_attention   # DeepSeek-style; no clang-graph needed
-    optional_graph_supervision:     # Phase 4, OPTIONAL, uses EXISTING call_edges
-      enabled: false
-      edges: [call_edges]           # type_edges/def_use NOT in current parquet; not required
+    warmup: kl_to_dense_attention   # DeepSeek-style KL warm-up to dense attention
+    graph_supervision:              # call-graph supervision IS included (not optional)
+      enabled: true                 # active whenever DSA is on; call_edges already in the parquet
+      edges: [call_edges]           # type_edges/def_use can join later w/o a parquet regen if added
 
   # MLA present in repo but OFF for Stage-1 (GQA chosen for the first run).
   mla:
