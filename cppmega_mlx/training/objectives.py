@@ -1,0 +1,437 @@
+"""Stage-1 objective builders over typed CodePacket / CommitPacket inputs.
+
+Each builder returns an ``ObjectiveExample`` carrying aligned
+``(input_ids, target_ids, loss_mask)`` arrays where ``target_ids[i]`` is the
+next-token label for ``input_ids[i]`` (standard shifted-by-one LM convention) and
+``loss_mask[i]`` is ``1`` exactly on the positions whose prediction should be
+trained for this objective.  All three arrays share length ``S`` (the number of
+INPUT positions; the final position predicts the trailing EOT / sentinel).
+
+The objectives:
+
+  * CAUSAL_LM            — predict every next token (full sequence).
+  * FIM / AST_FIM / IFIM — Fill-in-the-Middle (delegates span selection + token
+                           permutation to :mod:`cppmega_mlx.data.ast_fim`, which
+                           itself reuses :mod:`cppmega_mlx.data.fim`); loss is on
+                           the MIDDLE span (after ``FIM_MIDDLE``).
+  * COMMIT_DIFF          — predict the unified diff (+ trailing EOT) from the
+                           commit message; loss on the diff tokens.
+  * PRE_TO_POST          — predict the post-edit file from the pre-edit file
+                           (+ commit message context); loss on the post tokens.
+  * SYMBOL/TYPE/CALLEE_RECOVERY — mask an identifier / type / callee token span
+                           (located via symbol_ids / type_refs / call_targets) and
+                           train the model to recover the exact masked tokens.
+
+RULE #1 (fail fast / fail loud): every required field is validated; an absent one
+RAISES with WHERE + WHAT.  No silent fallback, no fabricated channels.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import Literal
+
+import mlx.core as mx
+import numpy as np
+
+from cppmega_mlx.data.ast_fim import (
+    AstFimResult,
+    InstructionEncoder,
+    apply_ast_fim,
+    apply_ast_ifim,
+)
+from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.commit_packet import CommitPacket
+from cppmega_mlx.data.fim import (
+    FIMSpecialTokenIds,
+    FIMSpecialTokenInput,
+)
+
+RecoveryKind = Literal["symbol", "type", "callee"]
+
+
+@dataclass(frozen=True)
+class ObjectiveExample:
+    """One training example: aligned input / target / loss-mask token arrays.
+
+    ``input_ids`` and ``target_ids`` are int32 ``mx.array`` of identical length
+    ``S``; ``loss_mask`` is an int32 ``mx.array`` of the same length with ``1`` on
+    trained positions.  ``objective`` records which builder produced it and
+    ``metadata`` carries provenance (e.g. FIM ``kind``/``mode``, recovery span).
+    """
+
+    input_ids: mx.array
+    target_ids: mx.array
+    loss_mask: mx.array
+    objective: str
+    metadata: dict
+
+    def __post_init__(self) -> None:
+        n = int(self.input_ids.shape[0])
+        for name in ("target_ids", "loss_mask"):
+            arr = getattr(self, name)
+            if int(arr.shape[0]) != n:
+                raise ValueError(
+                    f"ObjectiveExample.{name} length {int(arr.shape[0])} != "
+                    f"input_ids length {n}"
+                )
+
+
+def _i32(values) -> mx.array:
+    return mx.array(np.asarray(values, dtype=np.int32))
+
+
+def _token_list(value: mx.array, *, where: str) -> list[int]:
+    if value is None:
+        raise ValueError(f"{where}: required token field is absent (None)")
+    arr = np.asarray(value)
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{where}: expected 1-D token_ids, got shape {tuple(arr.shape)}"
+        )
+    return [int(x) for x in arr.reshape(-1).tolist()]
+
+
+def _shifted(ids: list[int], loss_positions: list[bool]) -> tuple[mx.array, mx.array, mx.array]:
+    """Build (input, target, mask) from a full token id list.
+
+    ``input_ids = ids[:-1]``, ``target_ids = ids[1:]``.  ``loss_positions`` is a
+    per-TARGET boolean (len == len(ids)-1): True where that next-token prediction
+    is trained.
+    """
+
+    if len(ids) < 2:
+        raise ValueError(
+            f"sequence too short to form an LM example: need >=2 tokens, got "
+            f"{len(ids)}"
+        )
+    inputs = ids[:-1]
+    targets = ids[1:]
+    if len(loss_positions) != len(targets):
+        raise ValueError(
+            f"loss_positions length {len(loss_positions)} != targets length "
+            f"{len(targets)}"
+        )
+    mask = [1 if flag else 0 for flag in loss_positions]
+    return _i32(inputs), _i32(targets), _i32(mask)
+
+
+# --------------------------------------------------------------------------- #
+# CAUSAL_LM
+# --------------------------------------------------------------------------- #
+def build_causal_lm(packet: CodePacket) -> ObjectiveExample:
+    """Predict every next token across the packet's full token window."""
+
+    ids = _token_list(packet.token_ids, where="causal_lm: CodePacket.token_ids")
+    inputs, targets, mask = _shifted(ids, [True] * (len(ids) - 1))
+    return ObjectiveExample(
+        input_ids=inputs,
+        target_ids=targets,
+        loss_mask=mask,
+        objective="causal_lm",
+        metadata={"length": len(ids)},
+    )
+
+
+# --------------------------------------------------------------------------- #
+# FIM / AST_FIM / IFIM
+# --------------------------------------------------------------------------- #
+def _resolve_special_ids(special_token_ids: FIMSpecialTokenInput) -> FIMSpecialTokenIds:
+    if special_token_ids is None:
+        return FIMSpecialTokenIds()
+    if isinstance(special_token_ids, FIMSpecialTokenIds):
+        return special_token_ids
+    return FIMSpecialTokenIds.from_mapping(special_token_ids)
+
+
+def _fim_loss_positions(
+    permuted: list[int], *, fim_middle_id: int, eot_id: int
+) -> list[bool]:
+    """Trained TARGET positions for a FIM/iFIM permutation.
+
+    The permutation ends with ``... FIM_MIDDLE <middle...> EOT``.  We train every
+    next-token prediction whose label falls in the middle span OR is the trailing
+    EOT.  Concretely: targets are ``permuted[1:]``; a target position ``j`` (which
+    predicts ``permuted[j+1]``) is trained iff ``permuted[j]`` is the FIM_MIDDLE
+    marker or lies strictly after it.
+    """
+
+    try:
+        middle_pos = len(permuted) - 1 - permuted[::-1].index(fim_middle_id)
+    except ValueError as exc:
+        raise ValueError(
+            "fim: permuted sequence has no FIM_MIDDLE marker; cannot locate the "
+            "middle span to supervise"
+        ) from exc
+    if permuted[-1] != eot_id:
+        raise ValueError(
+            f"fim: permuted sequence must end with EOT id {eot_id}, got "
+            f"{permuted[-1]}"
+        )
+    targets = permuted[1:]
+    # target index j supervises permuted[j+1]; train when its SOURCE permuted[j]
+    # is at or after the FIM_MIDDLE marker.
+    return [(j >= middle_pos) for j in range(len(targets))]
+
+
+def _example_from_fim(
+    result: AstFimResult,
+    *,
+    objective: str,
+    special_token_ids: FIMSpecialTokenInput,
+) -> ObjectiveExample:
+    ids = _resolve_special_ids(special_token_ids)
+    loss_positions = _fim_loss_positions(
+        result.token_ids, fim_middle_id=ids.fim_middle, eot_id=ids.eot
+    )
+    inputs, targets, mask = _shifted(result.token_ids, loss_positions)
+    return ObjectiveExample(
+        input_ids=inputs,
+        target_ids=targets,
+        loss_mask=mask,
+        objective=objective,
+        metadata={
+            "fim_kind": result.kind,
+            "fim_mode": result.mode,
+            "span": result.span,
+            "chunk_index": result.chunk_index,
+        },
+    )
+
+
+def build_ast_fim(
+    packet: CodePacket,
+    *,
+    seed: int | None = None,
+    rng: random.Random | None = None,
+    spm_rate: float = 0.5,
+    special_token_ids: FIMSpecialTokenInput = None,
+) -> ObjectiveExample:
+    """AST-aware FIM (90% whole-chunk middle / 10% char-FIM) objective example."""
+
+    result = apply_ast_fim(
+        packet,
+        seed=seed,
+        rng=rng,
+        spm_rate=spm_rate,
+        special_token_ids=special_token_ids,
+    )
+    return _example_from_fim(
+        result, objective="ast_fim", special_token_ids=special_token_ids
+    )
+
+
+def build_ifim(
+    packet: CodePacket,
+    *,
+    instruction_encoder: InstructionEncoder,
+    seed: int | None = None,
+    rng: random.Random | None = None,
+    spm_rate: float = 0.5,
+    special_token_ids: FIMSpecialTokenInput = None,
+) -> ObjectiveExample:
+    """Instruction-aware AST-FIM objective using a leading comment/docstring."""
+
+    result = apply_ast_ifim(
+        packet,
+        instruction_encoder=instruction_encoder,
+        seed=seed,
+        rng=rng,
+        spm_rate=spm_rate,
+        special_token_ids=special_token_ids,
+    )
+    return _example_from_fim(
+        result, objective="ifim", special_token_ids=special_token_ids
+    )
+
+
+# --------------------------------------------------------------------------- #
+# COMMIT_DIFF / PRE_TO_POST
+# --------------------------------------------------------------------------- #
+def build_commit_diff(
+    packet: CommitPacket,
+    *,
+    special_token_ids: FIMSpecialTokenInput = None,
+) -> ObjectiveExample:
+    """Predict the unified diff from the commit message.
+
+    Sequence: ``<commit_msg> <diff_token_ids> EOT``.  Loss on the diff + EOT.
+    RAISES if either ``commit_msg`` or ``diff_token_ids`` is absent.
+    """
+
+    ids = _resolve_special_ids(special_token_ids)
+    msg = _token_list(packet.commit_msg, where="commit_diff: CommitPacket.commit_msg")
+    diff = _token_list(
+        packet.diff_token_ids, where="commit_diff: CommitPacket.diff_token_ids"
+    )
+    full = [*msg, *diff, ids.eot]
+    # Loss on targets that PREDICT a diff token (or the trailing EOT): target j
+    # predicts full[j+1], so train iff that predicted index is >= prompt_len.
+    prompt_len = len(msg)
+    targets = full[1:]
+    loss_positions = [((j + 1) >= prompt_len) for j in range(len(targets))]
+    inputs, targets_arr, mask = _shifted(full, loss_positions)
+    return ObjectiveExample(
+        input_ids=inputs,
+        target_ids=targets_arr,
+        loss_mask=mask,
+        objective="commit_diff",
+        metadata={"prompt_len": prompt_len, "diff_len": len(diff)},
+    )
+
+
+def build_pre_to_post(
+    packet: CommitPacket,
+    *,
+    special_token_ids: FIMSpecialTokenInput = None,
+) -> ObjectiveExample:
+    """Predict the post-edit file from the pre-edit file (+ commit message).
+
+    Sequence: ``<pre_token_ids> [commit_msg] <post_token_ids> EOT``.  Loss on the
+    post tokens + EOT.  RAISES if ``pre_token_ids`` or ``post_token_ids`` absent.
+    ``commit_msg`` is optional context and included only when present.
+    """
+
+    ids = _resolve_special_ids(special_token_ids)
+    pre = _token_list(packet.pre_token_ids, where="pre_to_post: CommitPacket.pre_token_ids")
+    post = _token_list(
+        packet.post_token_ids, where="pre_to_post: CommitPacket.post_token_ids"
+    )
+    msg: list[int] = []
+    if packet.commit_msg is not None:
+        msg = _token_list(packet.commit_msg, where="pre_to_post: CommitPacket.commit_msg")
+    prompt = [*pre, *msg]
+    full = [*prompt, *post, ids.eot]
+    prompt_len = len(prompt)
+    targets = full[1:]
+    loss_positions = [((j + 1) >= prompt_len) for j in range(len(targets))]
+    inputs, targets_arr, mask = _shifted(full, loss_positions)
+    return ObjectiveExample(
+        input_ids=inputs,
+        target_ids=targets_arr,
+        loss_mask=mask,
+        objective="pre_to_post",
+        metadata={
+            "prompt_len": prompt_len,
+            "post_len": len(post),
+            "msg_len": len(msg),
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
+# SYMBOL / TYPE / CALLEE RECOVERY
+# --------------------------------------------------------------------------- #
+_RECOVERY_FIELD = {
+    "symbol": "symbol_ids",
+    "type": "type_refs",
+    "callee": "call_targets",
+}
+
+
+def _find_recovery_span(
+    marker: list[int], *, rng: random.Random, where: str
+) -> tuple[int, int, int]:
+    """Pick one contiguous non-zero run in ``marker`` -> (start, end, marker_id).
+
+    A run of equal non-zero ids marks the identifier/type/callee token span to
+    recover.  RAISES if no non-zero marker is present (the required channel is
+    populated but carries no recoverable span).
+    """
+
+    runs: list[tuple[int, int, int]] = []
+    i = 0
+    n = len(marker)
+    while i < n:
+        if marker[i] != 0:
+            j = i
+            while j < n and marker[j] == marker[i]:
+                j += 1
+            runs.append((i, j, marker[i]))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        raise ValueError(
+            f"{where}: channel has no non-zero recoverable span (all zeros); "
+            "cannot build a recovery example"
+        )
+    start, end, marker_id = runs[rng.randrange(len(runs))]
+    return start, end, marker_id
+
+
+def build_recovery(
+    packet: CodePacket,
+    *,
+    kind: RecoveryKind,
+    seed: int | None = None,
+    rng: random.Random | None = None,
+) -> ObjectiveExample:
+    """Mask an identifier/type/callee span and train exact-token recovery.
+
+    The masked span is located from the token-aligned ``symbol_ids`` (symbol),
+    ``type_refs`` (type), or ``call_targets`` (callee) channel.  The example is a
+    full causal pass where the loss mask is ``1`` ONLY on the target positions
+    that predict the masked span's tokens (the model must recover the exact
+    identifier/type/callee tokens from surrounding context).
+
+    RAISES if ``kind`` is unknown, the required channel is absent, or the channel
+    carries no non-zero span.
+    """
+
+    if kind not in _RECOVERY_FIELD:
+        raise ValueError(
+            f"recovery: kind must be one of {sorted(_RECOVERY_FIELD)}, got {kind!r}"
+        )
+    if rng is not None and seed is not None:
+        raise ValueError("pass either seed or rng, not both")
+    rand = rng if rng is not None else random.Random(seed)
+
+    field_name = _RECOVERY_FIELD[kind]
+    channel = getattr(packet, field_name)
+    if channel is None:
+        raise ValueError(
+            f"{kind}_recovery: required CodePacket.{field_name} channel is absent "
+            "(None); cannot locate a span to recover"
+        )
+    ids = _token_list(packet.token_ids, where=f"{kind}_recovery: CodePacket.token_ids")
+    marker = _token_list(channel, where=f"{kind}_recovery: CodePacket.{field_name}")
+    if len(marker) != len(ids):
+        raise ValueError(
+            f"{kind}_recovery: {field_name} length {len(marker)} != token_ids "
+            f"length {len(ids)}"
+        )
+    start, end, marker_id = _find_recovery_span(
+        marker, rng=rand, where=f"{kind}_recovery: CodePacket.{field_name}"
+    )
+    # Full causal sequence; supervise only the target positions inside the span.
+    # target index j predicts ids[j+1]; train iff that predicted token (j+1) is in
+    # [start, end).
+    targets = ids[1:]
+    loss_positions = [(start <= (j + 1) < end) for j in range(len(targets))]
+    if not any(loss_positions):
+        raise ValueError(
+            f"{kind}_recovery: span [{start}, {end}) yields no supervised target "
+            "position (span begins at token 0 with length 1); cannot train"
+        )
+    inputs, targets_arr, mask = _shifted(ids, loss_positions)
+    return ObjectiveExample(
+        input_ids=inputs,
+        target_ids=targets_arr,
+        loss_mask=mask,
+        objective=f"{kind}_recovery",
+        metadata={"span": (start, end), "marker_id": marker_id},
+    )
+
+
+__all__ = [
+    "ObjectiveExample",
+    "RecoveryKind",
+    "build_ast_fim",
+    "build_causal_lm",
+    "build_commit_diff",
+    "build_ifim",
+    "build_pre_to_post",
+    "build_recovery",
+]
