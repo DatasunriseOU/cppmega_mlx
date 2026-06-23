@@ -279,27 +279,50 @@ def _pack_prepared_best_fit(
     bos_token_id: int | None,
     pad_token_id: int,
 ) -> PackedSequences:
+    prefix = _row_prefix(bos_token_id)
+    prefix_size = int(prefix.size)
+    capacity = seq_len - prefix_size
+
+    # Best-fit-decreasing: place the largest sample first into the open row that
+    # it leaves with the least residual slack; open a new row only when none
+    # fits. Ties break by original input position for determinism.
+    ordered = sorted(
+        enumerate(samples),
+        key=lambda item: (-int(item[1].shape[0]), item[0]),
+    )
+    row_used: list[int] = []
+    row_members: list[list[int]] = []
+    for sample_idx, sample in ordered:
+        sample_len = int(sample.shape[0])
+        best_row: int | None = None
+        best_slack = capacity + 1
+        for row_idx, used in enumerate(row_used):
+            slack_after = capacity - used - sample_len
+            if slack_after < 0:
+                continue
+            if slack_after < best_slack:
+                best_slack = slack_after
+                best_row = row_idx
+        if best_row is None:
+            best_row = len(row_used)
+            row_used.append(0)
+            row_members.append([])
+        row_used[best_row] += sample_len
+        row_members[best_row].append(sample_idx)
+
+    by_idx = {idx: sample for idx, sample in enumerate(samples)}
     packed_rows: list[np.ndarray] = []
     packed_masks: list[np.ndarray] = []
-    remaining = list(enumerate(samples))
-    prefix = _row_prefix(bos_token_id)
-
-    while remaining:
+    for members in row_members:
         current = np.full(seq_len, pad_token_id, dtype=np.int32)
         current_mask = np.zeros(seq_len, dtype=np.bool_)
         offset = _write_prefix(current, current_mask, prefix)
-
-        while remaining:
-            capacity = seq_len - offset
-            candidate_pos = _largest_fitting_sample(remaining, capacity=capacity)
-            if candidate_pos is None:
-                break
-            _, sample = remaining.pop(candidate_pos)
+        for member_idx in members:
+            sample = by_idx[member_idx]
             end = offset + sample.shape[0]
             current[offset:end] = sample
             current_mask[offset:end] = True
             offset = end
-
         packed_rows.append(current)
         packed_masks.append(current_mask)
 
@@ -467,25 +490,6 @@ def _write_prefix(
         tokens[: prefix.size] = prefix
         token_mask[: prefix.size] = True
     return int(prefix.size)
-
-
-def _largest_fitting_sample(
-    remaining: Sequence[tuple[int, np.ndarray]],
-    *,
-    capacity: int,
-) -> int | None:
-    best_pos: int | None = None
-    best_len = -1
-    best_idx = 0
-    for pos, (sample_idx, sample) in enumerate(remaining):
-        sample_len = sample.shape[0]
-        if sample_len <= capacity and (
-            sample_len > best_len or (sample_len == best_len and sample_idx < best_idx)
-        ):
-            best_pos = pos
-            best_len = sample_len
-            best_idx = sample_idx
-    return best_pos
 
 
 def _validate_token_id(name: str, value: int) -> None:

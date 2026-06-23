@@ -103,9 +103,13 @@ def test_best_fit_strategy_matches_cppmega_largest_fitting_row_order() -> None:
     )
 
     assert overflow == []
-    assert [row[SOURCE_DOC_INDICES_COLUMN] for row in rows] == [[1, 3], [0, 2]]
-    assert rows[0][INPUT_IDS_COLUMN] == [10, 11, 12, 13, 14, 30]
-    assert rows[1][INPUT_IDS_COLUMN] == [1, 2, 20, 21, 22, 0]
+    # Best-fit-decreasing groups {doc1(len5)+doc3(len1)} and {doc0(len2)+doc2(len3)};
+    # rows are emitted deterministically ordered by smallest contained
+    # source_doc_index, and within each row documents are ordered topologically
+    # (here all dep_levels are 0, so by source_doc_index).
+    assert [row[SOURCE_DOC_INDICES_COLUMN] for row in rows] == [[0, 2], [1, 3]]
+    assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 20, 21, 22, 0]
+    assert rows[1][INPUT_IDS_COLUMN] == [10, 11, 12, 13, 14, 30]
 
 
 def test_sequential_strategy_preserves_document_order() -> None:
@@ -182,18 +186,20 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
     assert overflow == []
     row = rows[0]
     assert row[PLATFORM_IDS_COLUMN] == [7, 8]
-    assert row[TOKEN_STRUCTURE_IDS_COLUMN] == [3, 3, 5, 5, 6, 0]
-    assert row[TOKEN_DEP_LEVELS_COLUMN] == [0, 1, 2, 2, 3, 0]
-    assert row[TOKEN_AST_DEPTH_COLUMN] == [2, 3, 4, 4, 5, 0]
-    assert row[TOKEN_CHUNK_STARTS_COLUMN] == [0, 2, 3]
-    assert row[TOKEN_CHUNK_ENDS_COLUMN] == [2, 3, 5]
-    assert row[TOKEN_CHUNK_KINDS_COLUMN] == [4, 1, 2]
-    assert row[TOKEN_CHUNK_DEP_LEVELS_COLUMN] == [1, 0, 2]
-    assert row[TOKEN_CALL_EDGES_COLUMN] == [{"from": 2, "to": 1}]
-    assert row[TOKEN_TYPE_EDGES_COLUMN] == [{"from": 1, "to": 2}]
-    assert row[CHANGED_CHUNK_IDS_COLUMN] == [0, 2]
+    # doc1 has min chunk_dep_level 0 and doc0 has min 1, so the dependency-first
+    # topological order places doc1 (struct ids [5,5,6]) before doc0 ([3,3]).
+    assert row[TOKEN_STRUCTURE_IDS_COLUMN] == [5, 5, 6, 3, 3, 0]
+    assert row[TOKEN_DEP_LEVELS_COLUMN] == [2, 2, 3, 0, 1, 0]
+    assert row[TOKEN_AST_DEPTH_COLUMN] == [4, 4, 5, 2, 3, 0]
+    assert row[TOKEN_CHUNK_STARTS_COLUMN] == [0, 1, 3]
+    assert row[TOKEN_CHUNK_ENDS_COLUMN] == [1, 3, 5]
+    assert row[TOKEN_CHUNK_KINDS_COLUMN] == [1, 2, 4]
+    assert row[TOKEN_CHUNK_DEP_LEVELS_COLUMN] == [0, 2, 1]
+    assert row[TOKEN_CALL_EDGES_COLUMN] == [{"from": 1, "to": 0}]
+    assert row[TOKEN_TYPE_EDGES_COLUMN] == [{"from": 0, "to": 1}]
+    assert row[CHANGED_CHUNK_IDS_COLUMN] == [1, 2]
     assert row[CHANGED_CHUNK_SPANS_COLUMN] == [
-        {"start": 0, "end": 2},
+        {"start": 1, "end": 3},
         {"start": 3, "end": 5},
     ]
 

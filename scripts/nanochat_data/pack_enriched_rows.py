@@ -87,6 +87,10 @@ SOURCE_DOC_INDICES_COLUMN = SOURCE_DOC_IDS_COLUMN
 SOURCE_DOC_TOKEN_LENGTHS_COLUMN = "source_doc_token_lengths"
 SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
 SOURCE_DOC_ID_COLUMN = "source_doc_id"
+# Optional per-document input column carrying doc-level dependency edges
+# (a list of source_doc_index values this document depends on). Used to enforce
+# a cross-document partial order during in-bin topological packing.
+DOC_DEP_EDGES_COLUMN = "doc_dep_edges"
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
 PACKED_CHUNK_METADATA_COLUMNS = PACKED_ROWS_CHUNK_METADATA_COLUMNS
@@ -184,10 +188,34 @@ class NormalizedDoc:
     changed_chunk_ids: list[int]
     changed_chunk_spans: list[tuple[int, int]]
     chronology: dict[str, Any]
+    # Explicit doc-level dependency edges: source_doc_index values this document
+    # depends on (a dependency must be packed BEFORE this document in the row).
+    # Empty when only dep_level ordering applies.
+    doc_dep_edges: tuple[int, ...] = ()
 
     @property
     def token_count(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def dep_level(self) -> int:
+        """Topological level of this document.
+
+        The dep level is the minimum topological level encoded in the
+        document's per-chunk dep levels (``chunk_dep_levels``), falling back to
+        the minimum per-token dep level when chunk levels are absent, and to 0
+        when no dependency metadata exists. Using the minimum makes a document
+        that *defines* low-level (dependency) symbols sort before documents that
+        only *use* higher-level ones, which is the property a dependency-first
+        packed order requires.
+        """
+
+        if self.chunk_dep_levels:
+            return int(min(self.chunk_dep_levels))
+        token_dep_levels = self.token_meta.get(TOKEN_DEP_LEVELS_COLUMN)
+        if token_dep_levels:
+            return int(min(token_dep_levels))
+        return 0
 
     def to_overflow_record(self) -> dict[str, Any]:
         record = {
@@ -285,6 +313,66 @@ def _pack_bin_accepts_doc(bin_docs: list[NormalizedDoc], candidate: NormalizedDo
     return _docs_form_strict_commit_window([*bin_docs, candidate])
 
 
+def _topological_doc_order(docs: list[NormalizedDoc]) -> list[NormalizedDoc]:
+    """Order documents dependency-first within a packed row.
+
+    Ordering is a stable Kahn topological sort over the doc-level dependency DAG
+    implied by ``doc_dep_edges`` (a dependency must precede its dependents),
+    with the ready-set prioritized by ``dep_level`` ascending and
+    ``source_doc_index`` ascending for determinism. When no explicit edges are
+    present this degenerates to a stable sort by ``(dep_level, source_doc_index)``.
+
+    Edges referencing documents outside this bin are ignored (the dependency is
+    in a different row); only intra-bin partial order is enforced here.
+    """
+
+    in_bin = {doc.source_doc_index for doc in docs}
+    by_index = {doc.source_doc_index: doc for doc in docs}
+
+    # Build adjacency: dependency -> dependents, and indegree per doc.
+    dependents: dict[int, list[int]] = {idx: [] for idx in in_bin}
+    indegree: dict[int, int] = {idx: 0 for idx in in_bin}
+    for doc in docs:
+        for dep in doc.doc_dep_edges:
+            dep = int(dep)
+            if dep == doc.source_doc_index or dep not in in_bin:
+                continue
+            dependents[dep].append(doc.source_doc_index)
+            indegree[doc.source_doc_index] += 1
+
+    def _sort_key(idx: int) -> tuple[int, int]:
+        doc = by_index[idx]
+        return (doc.dep_level, doc.source_doc_index)
+
+    ready = sorted((idx for idx in in_bin if indegree[idx] == 0), key=_sort_key)
+    ordered: list[NormalizedDoc] = []
+    while ready:
+        idx = ready.pop(0)
+        ordered.append(by_index[idx])
+        for dependent in dependents[idx]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                # Insert keeping the ready set sorted by (dep_level, index).
+                key = _sort_key(dependent)
+                lo = 0
+                hi = len(ready)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if _sort_key(ready[mid]) < key:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                ready.insert(lo, dependent)
+
+    if len(ordered) != len(docs):
+        cyclic = sorted(set(in_bin) - {doc.source_doc_index for doc in ordered})
+        raise ValueError(
+            "cyclic doc_dep_edges detected within pack bin; cannot topologically "
+            f"order documents involving source_doc_index={cyclic}"
+        )
+    return ordered
+
+
 def _order_docs_for_row(docs: list[NormalizedDoc]) -> list[NormalizedDoc]:
     if len(docs) > 1 and _docs_form_strict_commit_window(docs):
         return sorted(
@@ -295,7 +383,7 @@ def _order_docs_for_row(docs: list[NormalizedDoc]) -> list[NormalizedDoc]:
                 doc.source_doc_index,
             ),
         )
-    return sorted(docs, key=lambda doc: doc.source_doc_index)
+    return _topological_doc_order(docs)
 
 
 def _shared_chronology_for_docs(docs: list[NormalizedDoc]) -> dict[str, Any]:
@@ -584,6 +672,9 @@ def normalize_document_record(
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
         chronology=_normalize_chronology(record),
+        doc_dep_edges=tuple(
+            int(dep) for dep in (record.get(DOC_DEP_EDGES_COLUMN) or [])
+        ),
     )
 
 
@@ -685,50 +776,49 @@ def _pack_docs_best_fit(
     *,
     target_length: int,
 ) -> tuple[list[PackBin], list[dict[str, Any]]]:
-    remaining = sorted(docs, key=lambda doc: doc.source_doc_index)
-    bins: list[PackBin] = []
-    overflow: list[dict[str, Any]] = []
-    while remaining:
-        current = PackBin()
-        next_remaining: list[NormalizedDoc] = []
-        for doc in remaining:
-            if doc.token_count > target_length:
-                overflow.append(doc.to_overflow_record())
-            else:
-                next_remaining.append(doc)
-        remaining = next_remaining
-        if not remaining:
-            break
+    """Best-fit-decreasing bin-packing that minimizes residual padding.
 
-        while remaining:
-            capacity = target_length - current.used_tokens
-            candidate_pos: int | None = None
-            candidate_len = -1
-            candidate_source = 0
-            for pos, doc in enumerate(remaining):
-                if not current.can_fit(doc.token_count, target_length):
-                    continue
-                if not _pack_bin_accepts_doc(current.docs, doc):
-                    continue
-                if doc.token_count > candidate_len or (
-                    doc.token_count == candidate_len
-                    and doc.source_doc_index < candidate_source
-                ):
-                    candidate_pos = pos
-                    candidate_len = doc.token_count
-                    candidate_source = doc.source_doc_index
-            if candidate_pos is None or candidate_len > capacity:
-                break
-            current.add(remaining.pop(candidate_pos))
-        if current.docs:
-            bins.append(current)
+    Documents are placed largest-first; each document goes into the already-open
+    bin whose remaining slack it shrinks the most (least leftover slack after
+    placement) while still satisfying the chronology/commit-window acceptance
+    rule. A new bin opens only when no open bin can take the document. This
+    drives per-row padding toward zero far more aggressively than filling one
+    bin at a time. Ordering *within* a bin is handled later by the dependency
+    topological sort in ``_order_docs_for_row``; placement here only governs
+    which documents share a row.
+    """
+
+    overflow: list[dict[str, Any]] = []
+    fitting: list[NormalizedDoc] = []
+    for doc in docs:
+        if doc.token_count > target_length:
+            overflow.append(doc.to_overflow_record())
         else:
-            # All remaining docs were topology-incompatible with this row shape.
-            # Emit the next one alone to guarantee progress.
-            doc = remaining.pop(0)
-            solo = PackBin()
-            solo.add(doc)
-            bins.append(solo)
+            fitting.append(doc)
+
+    # Largest-first; ties broken by source_doc_index for determinism.
+    ordered = sorted(fitting, key=lambda doc: (-doc.token_count, doc.source_doc_index))
+
+    bins: list[PackBin] = []
+    for doc in ordered:
+        best_bin: PackBin | None = None
+        best_slack = target_length + 1
+        for pack in bins:
+            if not pack.can_fit(doc.token_count, target_length):
+                continue
+            if not _pack_bin_accepts_doc(pack.docs, doc):
+                continue
+            slack_after = target_length - (pack.used_tokens + doc.token_count)
+            if slack_after < best_slack:
+                best_slack = slack_after
+                best_bin = pack
+        if best_bin is None:
+            best_bin = PackBin()
+            bins.append(best_bin)
+        best_bin.add(doc)
+
+    # Deterministic row order: by first (smallest) contained source_doc_index.
+    bins.sort(key=lambda pack: min(doc.source_doc_index for doc in pack.docs))
     return bins, overflow
 
 
