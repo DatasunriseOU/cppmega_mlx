@@ -1,0 +1,104 @@
+# Stage-1 C++ foundation — dense ~500M (structure-debug + fast first run)
+#
+# LOCKED RULES (David, 2026-06-23):
+#   * Build from OUR building blocks (NAM route blocks, attention block, RMSNorm/
+#     MLP, the cppmega_v4 buildspec ModelBuildSpec/LossSpec/OptimSpec). Do NOT
+#     write a parallel from-scratch transformer. Model is standard otherwise.
+#   * DENSE only. pattern = "A" (attention) tiled to depth. NO MoE (E), NO
+#     Mamba3 (M), NO M2RNN (R), NO engram/concept routes (N/C) in this stage.
+#   * DO NOT regenerate the real parquet. Use existing datasets as-is
+#     (clang_semantic_4k_v10, clang_commits_4k_v1). They already carry token_ids
+#     + structure side-channels (POPULATED). Re-materialization is OFF the table
+#     for the corpus; the tiny tests/fixtures/golden_mini is a TEST fixture only.
+#   * DSA is a BUILT-IN capability — everything it needs lives INSIDE the model
+#     (the learned lightning indexer + KL warm-up to dense attention). It does
+#     NOT require clang-graph columns in the data and does NOT need a parquet
+#     regen. It is architecturally available from the start.
+#   * FIRST TEST RUN attention = GQA (not DSA). Get structure + a fast training
+#     step working and the loss going down per plan. DSA is switched on in a
+#     later run (KL warm-up); optional clang-graph supervision (Phase 4) uses the
+#     call_edges that already exist — no full re-materialization required.
+#   * vocab = 65536 (canonical fixed mlx tokenizer, tokenizer_contract_v1.json).
+#   * ~13.2B real tokens (more later) suffice for a 500M dense run.
+#
+# Mirrors cppmega_mlx.config.model.Nam56RModelConfig; Wave-2 wires a
+# build_dense500m_config() profile from it.
+
+model:
+  profile: dense500m
+  pattern: "A"            # attention-only; tiled across depth
+  depth: 24
+  hidden_size: 1280
+  ffn_hidden_size: 3456   # SwiGLU (~2.7x); FFN dominates params
+  num_attention_heads: 20 # head_dim = 64
+  seq_len: 4096
+  max_position_embeddings: 4096
+
+  vocab:
+    default_model_vocab_size: 65536   # local profile (canonical), NOT 131072
+
+  attention:
+    # FIRST RUN: GQA. Plain grouped-query attention from our attention block.
+    mode: gqa
+    num_query_heads: 20
+    num_kv_heads: 4         # GQA grouping (20 q : 4 kv)
+    head_dim: 64
+    rope: true
+
+  # DSA: BUILT-IN, available, OFF for the first run. Self-contained (learned
+  # indexer + KL warm-up). Turn on in a later run by switching attention.mode to
+  # 'dsa'. Needs NOTHING added to the parquet.
+  dsa:
+    enabled: false          # first test run uses GQA
+    a_layer_ranks: [2, 5, 8, 11, 14, 17, 20]
+    indexer_n_heads: 16
+    indexer_head_dim: 64
+    indexer_topk: 256
+    indexer_loss_coeff: 0.001
+    indexer_dtype: bf16
+    warmup: kl_to_dense_attention   # DeepSeek-style; no clang-graph needed
+    optional_graph_supervision:     # Phase 4, OPTIONAL, uses EXISTING call_edges
+      enabled: false
+      edges: [call_edges]           # type_edges/def_use NOT in current parquet; not required
+
+  # MLA present in repo but OFF for Stage-1 (GQA chosen for the first run).
+  mla:
+    enabled: false
+
+  # Input side-channels consumed in Stage-1 (already wired in hybrid_lm; all
+  # POPULATED in the existing parquet): token + position + ngram_hash +
+  # structure(structure_ids/dep_levels/ast_depth/sibling_index/ast_node_type) +
+  # platform. No data change needed.
+  structure:
+    enabled: true
+  ngram_hash:
+    enabled: true
+
+  disabled_routes: ["E", "M", "R", "N", "C"]   # MoE, Mamba3, M2RNN, engram, concept
+
+# Param estimate (~500M): embed(tied) 65536*1280=83.9M + FFN 3*1280*3456*24=318.6M
+# + GQA attn ~60-96M ≈ ~480-500M. Tune depth/ffn to hit target on the build.
+
+loss:
+  kind: cross_entropy        # buildspec LossSpec; FIM/IFIM shaping via rewriters
+  dsa_indexer_kl: false      # only when dsa.enabled (later run)
+
+optim:
+  kind: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  warmup_steps: 2000
+
+data:
+  # USE EXISTING parquet as-is — NO regeneration.
+  tokenizer: cppmega_mlx/tokenizer/tokenizer.json   # 65536
+  seq_len: 4096
+  packing: true               # side-channel-preserving packer (pack_enriched_rows)
+  sources:
+    - /Users/dave/sources/parquet/clang_semantic_4k_v10   # code (token_ids + structure)
+    - /Users/dave/sources/parquet/clang_commits_4k_v1     # commits
+  smoke_fixture: tests/fixtures/golden_mini               # tiny, for structure-debug only
+  # Stage-1 mix (objectives wired in Wave-2 task_mixer):
+  #   ~50% causal LM, ~20% FIM/AST-FIM/IFIM, ~20% commit pre/post/diff, ~10% recovery
