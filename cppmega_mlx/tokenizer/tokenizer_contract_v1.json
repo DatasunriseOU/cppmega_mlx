@@ -1,0 +1,40 @@
+{
+  "contract_version": 1,
+  "description": "Canonical, cross-repo C++ tokenizer contract. Single source of truth for vocab size and special-token ids shared by cppmega (CUDA/Megatron), cppmega_mlx (MLX), and nanochat (data pipeline). The shipped tokenizer.json is FROZEN at 65536; new logical roles are mapped onto pre-existing <RESERVED_N> slots (id == N) rather than adding tokens, so no retrain is required.",
+  "vocab_size": 65536,
+  "tokenizer_artifact_sha_note": "validated against cppmega_mlx/tokenizer/tokenizer.json: model vocab == 65536, max id == 65535, added_tokens ids 0..7199 (incl. 4896 <RESERVED_N> slots).",
+  "special_tokens": {
+    "BOS": 2,
+    "EOS": 3,
+    "FIM_PREFIX": 4,
+    "FIM_MIDDLE": 5,
+    "FIM_SUFFIX": 6,
+    "CODE_START": 7,
+    "CODE_END": 8,
+    "THINK_START": 9,
+    "THINK_END": 10,
+    "QUERY_TOOL": 11,
+    "TOOL_RESULT": 19,
+    "FIM_INSTRUCTION": 45,
+    "SPACE": 46,
+    "NL": 47
+  },
+  "aliases": {
+    "EOT": 3,
+    "INS": 45
+  },
+  "reserved_role_assignments": {
+    "_doc": "Logical roles bound to existing <RESERVED_N> slots (token content '<RESERVED_N>' has id N). Reuse, do not add. Verifier checks each id resolves to its <RESERVED_N> token.",
+    "REPO_NAME": 48,
+    "FILE_SEP": 49,
+    "EDIT_OLD": 50,
+    "EDIT_NEW": 51,
+    "EDIT_HUNK": 52
+  },
+  "vocab_dual_track_note": {
+    "_doc": "Two intentional vocab profiles exist (config/model.py VocabMetadata). The FIRST from-scratch foundation run uses the 65536 local profile (this contract), matching the shipped tokenizer. The 131072 megacpp profile is a separate, larger future tokenizer and MUST NOT be paired with the 65536 artifact.",
+    "local_profile_vocab_size": 65536,
+    "megacpp_tokenizer_vocab_size": 131072,
+    "first_run_vocab_size": 65536
+  }
+}
