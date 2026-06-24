@@ -123,7 +123,11 @@ class DenseCppLMConfig:
     # flattened (B*S, hidden) hidden states. Default False => the dense CE path
     # (full logits) is used, unchanged. Same loss within fp tolerance.
     chunked_ce: bool = False
-    ce_chunk_size: int = 4096
+    # 16384 measured fastest for the 4x4096 Stage-1 step (fewer chunk iterations
+    # / kernel launches than 4096; +memory is trivial at ~29GB of 128GB). The CE
+    # objective is identical for any positive chunk size (it only changes the
+    # accumulation granularity), so this is a pure speed knob.
+    ce_chunk_size: int = 16384
 
     def __post_init__(self) -> None:
         if self.vocab_size < 2:
