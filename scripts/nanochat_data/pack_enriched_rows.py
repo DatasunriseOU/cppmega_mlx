@@ -726,13 +726,31 @@ def _stable_doc_id_for_record(
     return int(doc_id)
 
 
-def read_tokenized_documents(input_path: str | os.PathLike[str]) -> list[NormalizedDoc]:
-    """Read tokenized per-document parquet rows from a file or directory."""
+def read_tokenized_documents(
+    input_path: str | os.PathLike[str],
+    *,
+    token_budget: int | None = None,
+    start_source_doc_index: int = 0,
+    signature_to_id: dict[str, int] | None = None,
+) -> list[NormalizedDoc]:
+    """Read tokenized per-document parquet rows from a file or directory.
+
+    ``token_budget`` caps intake: reading stops (whole docs only, never split)
+    once the running sum of ``token_count`` would meet or exceed the budget. This
+    keeps the loader memory-bounded for very large shard sets while preserving
+    the whole-function invariant. ``start_source_doc_index`` lets a caller mix
+    several sources into one contiguous ``source_doc_index`` space; passing a
+    shared ``signature_to_id`` keeps stable doc IDs unique across sources.
+    """
 
     docs: list[NormalizedDoc] = []
-    source_doc_index = 0
-    signature_to_id: dict[str, int] = {}
+    source_doc_index = int(start_source_doc_index)
+    if signature_to_id is None:
+        signature_to_id = {}
+    accumulated_tokens = 0
     for path in _list_input_files(input_path):
+        if token_budget is not None and accumulated_tokens >= token_budget:
+            break
         parquet_file = pq.ParquetFile(path)
         available = set(parquet_file.schema_arrow.names)
         if TOKEN_IDS_COLUMN not in available:
@@ -754,20 +772,28 @@ def read_tokenized_documents(input_path: str | os.PathLike[str]) -> list[Normali
             if column in available
         ]
 
+        stop = False
         for batch in parquet_file.iter_batches(columns=selected_columns, batch_size=1024):
             for record in batch.to_pylist():
-                docs.append(
-                    normalize_document_record(
+                doc = normalize_document_record(
+                    record,
+                    source_doc_index=source_doc_index,
+                    stable_doc_id=_stable_doc_id_for_record(
                         record,
                         source_doc_index=source_doc_index,
-                        stable_doc_id=_stable_doc_id_for_record(
-                            record,
-                            source_doc_index=source_doc_index,
-                            signature_to_id=signature_to_id,
-                        ),
-                    )
+                        signature_to_id=signature_to_id,
+                    ),
                 )
+                docs.append(doc)
                 source_doc_index += 1
+                accumulated_tokens += doc.token_count
+                if token_budget is not None and accumulated_tokens >= token_budget:
+                    stop = True
+                    break
+            if stop:
+                break
+        if stop:
+            break
     return docs
 
 
@@ -790,8 +816,13 @@ def _pack_docs_best_fit(
 
     overflow: list[dict[str, Any]] = []
     fitting: list[NormalizedDoc] = []
+    oversized: list[NormalizedDoc] = []
     for doc in docs:
         if doc.token_count > target_length:
+            # Whole-function invariant: never split a doc. An over-long doc is
+            # kept WHOLE in its own single-doc block (materialized to a row whose
+            # width grows to the doc length) and is also recorded in overflow.
+            oversized.append(doc)
             overflow.append(doc.to_overflow_record())
         else:
             fitting.append(doc)
@@ -800,6 +831,10 @@ def _pack_docs_best_fit(
     ordered = sorted(fitting, key=lambda doc: (-doc.token_count, doc.source_doc_index))
 
     bins: list[PackBin] = []
+    for doc in oversized:
+        own_block = PackBin()
+        own_block.add(doc)
+        bins.append(own_block)
     for doc in ordered:
         best_bin: PackBin | None = None
         best_slack = target_length + 1
@@ -832,6 +867,15 @@ def _pack_docs_sequential(
     current = PackBin()
     for doc in sorted(docs, key=lambda item: item.source_doc_index):
         if doc.token_count > target_length:
+            # Whole-function invariant: keep an over-long doc WHOLE in its own
+            # block (never split/truncate). Flush any in-progress bin first so the
+            # oversized doc stays in input order, then also record it in overflow.
+            if current.docs:
+                bins.append(current)
+                current = PackBin()
+            own_block = PackBin()
+            own_block.add(doc)
+            bins.append(own_block)
             overflow.append(doc.to_overflow_record())
             continue
         if current.docs and not current.can_fit(doc.token_count, target_length):
@@ -929,42 +973,59 @@ def _materialize_packed_row(
                 fill = PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES.get(column, 0)
                 token_meta_acc[column].extend([int(fill)] * doc.token_count)
 
-        if doc.chunk_starts:
-            chunk_starts.extend(token_offset + value for value in doc.chunk_starts)
-            chunk_ends.extend(token_offset + value for value in doc.chunk_ends)
-            chunk_kinds.extend(doc.chunk_kinds)
-            chunk_dep_levels.extend(doc.chunk_dep_levels)
-            call_edges.extend(
-                {
-                    "from": chunk_offset + int(edge["from"]),
-                    "to": chunk_offset + int(edge["to"]),
-                }
-                for edge in doc.call_edges
-            )
-            type_edges.extend(
-                {
-                    "from": chunk_offset + int(edge["from"]),
-                    "to": chunk_offset + int(edge["to"]),
-                }
-                for edge in doc.type_edges
-            )
-            changed_chunk_ids.extend(chunk_offset + value for value in doc.changed_chunk_ids)
-            changed_chunk_spans.extend(
-                {
-                    "start": token_offset + int(start),
-                    "end": token_offset + int(end),
-                }
-                for start, end in doc.changed_chunk_spans
-            )
-            chunk_offset += len(doc.chunk_starts)
+        # Edge-remap into block-coordinate space. Every per-doc structure that
+        # references positions WITHIN the doc must be shifted by this doc's start
+        # position in the packed block so it points at the correct global slot:
+        #   * chunk_starts / chunk_ends / changed_chunk_spans -> TOKEN coords
+        #     (shift by token_offset, this doc's first-token index in the block).
+        #   * call_edges / type_edges endpoints and changed_chunk_ids -> CHUNK
+        #     indices (shift by chunk_offset, the count of chunks already emitted
+        #     by preceding docs in the block).
+        # The shift is applied unconditionally per kind (not gated on a single
+        # array being truthy), so edges/spans are never silently dropped when a
+        # doc carries graph metadata with a degenerate-but-valid chunk layout,
+        # and chunk_offset always advances by this doc's real chunk count.
+        chunk_starts.extend(token_offset + value for value in doc.chunk_starts)
+        chunk_ends.extend(token_offset + value for value in doc.chunk_ends)
+        chunk_kinds.extend(doc.chunk_kinds)
+        chunk_dep_levels.extend(doc.chunk_dep_levels)
+        call_edges.extend(
+            {
+                "from": chunk_offset + int(edge["from"]),
+                "to": chunk_offset + int(edge["to"]),
+            }
+            for edge in doc.call_edges
+        )
+        type_edges.extend(
+            {
+                "from": chunk_offset + int(edge["from"]),
+                "to": chunk_offset + int(edge["to"]),
+            }
+            for edge in doc.type_edges
+        )
+        changed_chunk_ids.extend(chunk_offset + value for value in doc.changed_chunk_ids)
+        changed_chunk_spans.extend(
+            {
+                "start": token_offset + int(start),
+                "end": token_offset + int(end),
+            }
+            for start, end in doc.changed_chunk_spans
+        )
+        chunk_offset += len(doc.chunk_starts)
 
         token_offset += doc.token_count
 
     valid_token_count = len(concatenated_tokens)
+    # Whole-function invariant: a single document longer than target_length is
+    # NEVER split. Such a doc is packed alone into its own block, and that row's
+    # fixed width must grow to hold the whole doc so no token is truncated. For
+    # all normal (fitting) rows row_length == target_length, leaving behavior and
+    # output shape unchanged.
+    row_length = max(target_length, valid_token_count)
     trained_token_count = sum(
         _loss_mask_for_packed_docs(doc_ids, target_length=valid_token_count)
     )
-    slack_tokens = target_length - valid_token_count
+    slack_tokens = row_length - valid_token_count
     pad_doc_id = max(len(ordered_docs), max(doc_ids, default=0)) if doc_ids else 0
 
     row: dict[str, Any] = {
@@ -973,17 +1034,17 @@ def _materialize_packed_row(
         TRAINED_TOKEN_COUNT_COLUMN: int(trained_token_count),
         NUM_DOCS_COLUMN: int(len(ordered_docs)),
         SLACK_TOKENS_COLUMN: int(slack_tokens),
-        INPUT_IDS_COLUMN: _pad(concatenated_tokens, target_length, pad_value=pad_token_id),
+        INPUT_IDS_COLUMN: _pad(concatenated_tokens, row_length, pad_value=pad_token_id),
         TARGET_IDS_COLUMN: _target_ids_for_packed_tokens(
             concatenated_tokens,
-            target_length=target_length,
+            target_length=row_length,
             pad_token_id=pad_token_id,
         ),
         LOSS_MASK_COLUMN: _loss_mask_for_packed_docs(
             doc_ids,
-            target_length=target_length,
+            target_length=row_length,
         ),
-        DOC_IDS_COLUMN: _pad(doc_ids, target_length, pad_value=pad_doc_id),
+        DOC_IDS_COLUMN: _pad(doc_ids, row_length, pad_value=pad_doc_id),
         SOURCE_DOC_INDICES_COLUMN: source_doc_indices,
         SOURCE_DOC_TOKEN_LENGTHS_COLUMN: source_doc_token_lengths,
         SOURCE_PLATFORM_IDS_COLUMN: source_platform_ids,
@@ -1016,7 +1077,7 @@ def _materialize_packed_row(
             row[column] = value
     for column in PACKED_TOKEN_METADATA_COLUMNS:
         pad_value = int(PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES.get(column, 0))
-        row[column] = _pad(token_meta_acc[column], target_length, pad_value=pad_value)
+        row[column] = _pad(token_meta_acc[column], row_length, pad_value=pad_value)
     return row
 
 
