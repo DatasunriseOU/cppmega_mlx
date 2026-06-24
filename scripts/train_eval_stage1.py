@@ -289,6 +289,30 @@ def main() -> None:
     ap.add_argument("--probe-gen", type=int, default=256)
     ap.add_argument("--probe-temp", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=1234)
+    # Activation-memory controls (opt-in; default path numerically unchanged).
+    ap.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="per-DenseCppBlock gradient checkpointing (recompute activations "
+        "in backward to cut peak memory)",
+    )
+    ap.add_argument(
+        "--chunked-ce",
+        action="store_true",
+        help="streaming cross-entropy over vocab chunks (avoids materializing "
+        "the full (B,S,V) logits tensor for backward)",
+    )
+    ap.add_argument(
+        "--ce-chunk-size",
+        type=int,
+        default=4096,
+        help="row chunk size (over flattened B*S) for --chunked-ce",
+    )
+    ap.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="disable mx.compile of the train step (debugging)",
+    )
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -311,6 +335,9 @@ def main() -> None:
         num_kv_heads=4,
         head_dim=64,
         max_seq_length=max(4096, args.seq_len),
+        grad_checkpoint=args.grad_checkpoint,
+        chunked_ce=args.chunked_ce,
+        ce_chunk_size=args.ce_chunk_size,
     )
     dtype = mx.bfloat16 if args.bf16 else mx.float32
     model = DenseCppLM(cfg, dtype=dtype if args.bf16 else None)
@@ -330,6 +357,11 @@ def main() -> None:
         f"tokens/step={args.batch * args.seq_len} lr={args.lr} wd={args.wd} "
         f"betas=(0.9,0.95) grad_clip={args.grad_clip} warmup={args.warmup} "
         f"cosine_decay=True"
+    )
+    log(
+        f"[config] grad_checkpoint={args.grad_checkpoint} "
+        f"chunked_ce={args.chunked_ce} ce_chunk_size={args.ce_chunk_size} "
+        f"compile={not args.no_compile}"
     )
     log(
         f"[config] eval_every={args.eval_every} ckpt_every={args.ckpt_every} "
@@ -363,6 +395,25 @@ def main() -> None:
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
+    # Compiled train step. ``mx.compile`` with state in/out lets MLX fuse the
+    # forward+backward+optimizer update and (critically for memory) reuse
+    # buffers across the graph. The optimizer + model parameters are the captured
+    # state. Side channels are passed positionally as a fixed-arity tuple so the
+    # compiled signature is stable across steps.
+    state = [model.state, opt.state]
+
+    def _step(input_ids, targets, loss_mask, side_vals):
+        side = {dst: side_vals[i] for i, (_src, dst) in enumerate(CHANNELS)}
+        loss, grads = loss_and_grad(model, input_ids, targets, loss_mask, side)
+        grads, gnorm = optim.clip_grad_norm(grads, args.grad_clip)
+        opt.update(model, grads)
+        return loss, gnorm
+
+    if args.no_compile:
+        step_fn = _step
+    else:
+        step_fn = mx.compile(_step, inputs=state, outputs=state)
+
     val_rows = _load_val_rows(val_shard, args.seq_len, args.val_rows)
     log(f"[data] loaded {len(val_rows)} held-out val rows")
 
@@ -375,14 +426,20 @@ def main() -> None:
 
     for step in range(args.steps):
         input_ids, targets, loss_mask, side = next(batch_iter)
+        # LR is updated outside the compiled step (it changes every step); MLX
+        # picks up the new optimizer scalar via the captured state.
         opt.learning_rate = lr_at(step)
-        loss, grads = loss_and_grad(model, input_ids, targets, loss_mask, side)
-        grads, gnorm = optim.clip_grad_norm(grads, args.grad_clip)
-        opt.update(model, grads)
-        mx.eval(model.parameters(), opt.state, loss)
+        side_vals = tuple(side[dst] for _src, dst in CHANNELS)
+        loss, gnorm = step_fn(input_ids, targets, loss_mask, side_vals)
+        # Single eval boundary per step: forces the compiled graph + optimizer
+        # update to execute and lets MLX free transient activation buffers.
+        mx.eval(state, loss, gnorm)
         last_train_loss = float(loss)
         _check_finite("train_loss", last_train_loss, step)
         _check_finite("grad_norm", float(gnorm), step)
+        # Release cached (freed-but-pooled) buffers so peak memory reflects the
+        # true working set rather than the high-water pool.
+        mx.clear_cache()
 
         if step == 0 or (step + 1) % 50 == 0:
             elapsed = time.time() - t0

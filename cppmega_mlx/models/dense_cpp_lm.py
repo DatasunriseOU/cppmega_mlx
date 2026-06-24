@@ -111,6 +111,20 @@ class DenseCppLMConfig:
     platform_residual_scale: float = 1.0
     ngram_residual_scale: float = 1.0
 
+    # ---- Activation-memory controls (opt-in; default path unchanged) ---- #
+    # Per-block gradient checkpointing: when True, each DenseCppBlock's compute
+    # is wrapped in ``mx.checkpoint`` so its activations are RECOMPUTED in the
+    # backward pass instead of being kept live. Default False => the existing
+    # (non-checkpointed) path is bit-for-bit unchanged.
+    grad_checkpoint: bool = False
+    # Chunked / streaming cross-entropy: when True, the (B, S, V) logits tensor
+    # is NOT fully materialized for the loss. Instead the LM head + CE are
+    # computed over sequence-position chunks of ``ce_chunk_size`` rows of the
+    # flattened (B*S, hidden) hidden states. Default False => the dense CE path
+    # (full logits) is used, unchanged. Same loss within fp tolerance.
+    chunked_ce: bool = False
+    ce_chunk_size: int = 4096
+
     def __post_init__(self) -> None:
         if self.vocab_size < 2:
             raise ValueError(f"vocab_size must be >= 2, got {self.vocab_size}")
@@ -157,6 +171,10 @@ class DenseCppLMConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {value}")
+        if self.ce_chunk_size <= 0:
+            raise ValueError(
+                f"ce_chunk_size must be positive, got {self.ce_chunk_size}"
+            )
         # Validate the attention contract end-to-end at construction time. This
         # is the single source of truth for the GQA<->DSA seam: AttentionConfig
         # rejects e.g. mode='gqa' with num_kv_heads == num_query_heads.
@@ -304,13 +322,18 @@ class DenseCppBlock(nn.Module):
             bias=False,
         )
 
-    def __call__(
+    def _compute(
         self,
         hidden_states: mx.array,
         mask: mx.array | Literal["causal"] | None,
-        *,
-        block_bias: mx.array | None = None,
+        block_bias: mx.array | None,
     ) -> mx.array:
+        """The actual block math: norm->attn->residual, norm->FFN->residual.
+
+        Kept as a separate method so it can be wrapped by ``mx.checkpoint``
+        (gradient checkpointing) without changing the non-checkpointed path.
+        """
+
         if self.is_dsa:
             attn_out = self.attention(
                 self.attn_norm(hidden_states), mask, block_bias=block_bias
@@ -320,6 +343,30 @@ class DenseCppBlock(nn.Module):
         hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
         return hidden_states
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: mx.array | Literal["causal"] | None,
+        *,
+        block_bias: mx.array | None = None,
+    ) -> mx.array:
+        if not self.config.grad_checkpoint:
+            return self._compute(hidden_states, mask, block_bias)
+        # Gradient checkpointing. ``mx.checkpoint`` only tracks gradients w.r.t.
+        # the EXPLICIT inputs of the wrapped function, so the block's trainable
+        # parameters MUST be passed through as an argument (params captured by
+        # closure would silently get zero/constant grads). We pass the live
+        # parameter tree in, re-bind it with ``self.update`` inside, then run the
+        # same ``_compute``. Activations are recomputed in backward; the loss and
+        # parameter grads are identical to the non-checkpointed path.
+        params = self.trainable_parameters()
+
+        def _inner(p, h):
+            self.update(p)
+            return self._compute(h, mask, block_bias)
+
+        return mx.checkpoint(_inner)(params, hidden_states)
 
 
 class DenseCppLM(nn.Module):
@@ -533,6 +580,27 @@ class DenseCppLM(nn.Module):
         is the token-level graph routing prior consumed by the DSA indexer.
         """
 
+        # Chunked / streaming CE: only when a loss is actually requested. This
+        # avoids materializing the full (B, S, V) logits tensor (and its fp32
+        # backward copy). It returns ``logits=None`` because the whole point is
+        # to never build that tensor; callers that need logits must leave
+        # ``chunked_ce`` off (or call ``.logits(...)`` explicitly).
+        if targets is not None and self.config.chunked_ce:
+            hidden = self.decoder_hidden_states(
+                input_ids,
+                block_bias=block_bias,
+                structure_ids=structure_ids,
+                dep_levels=dep_levels,
+                ast_depth_ids=ast_depth_ids,
+                sibling_index_ids=sibling_index_ids,
+                node_type_ids=node_type_ids,
+                platform_ids=platform_ids,
+            )
+            loss = self._chunked_cross_entropy(
+                hidden, targets, loss_mask, self.config.ce_chunk_size
+            )
+            return None, loss
+
         logits = self.logits(
             input_ids,
             block_bias=block_bias,
@@ -573,6 +641,64 @@ class DenseCppLM(nn.Module):
         ntokens = mask.sum()
         denom = mx.maximum(ntokens, mx.array(1.0, dtype=mx.float32))
         return (token_losses * mask).astype(mx.float32).sum() / denom
+
+    def _chunked_cross_entropy(
+        self,
+        hidden: mx.array,
+        targets: mx.array,
+        loss_mask: mx.array | None,
+        chunk_size: int,
+    ) -> mx.array:
+        """Streaming masked next-token CE without a full (B, S, V) logits tensor.
+
+        Identical objective to :meth:`_cross_entropy`:
+        ``sum(token_loss * mask) / max(sum(mask), 1)`` over all (B, S) positions.
+        Here we flatten to (B*S, hidden), apply the tied LM head + CE over
+        ``chunk_size``-row slices, and accumulate the weighted loss sum and the
+        mask denominator. Only one chunk's (chunk, V) logits live at a time, so
+        the 4*4096*65536 tensor is never built. With per-block gradient
+        checkpointing the chunk logits are recomputed in backward as well.
+        """
+
+        batch, seq = int(targets.shape[0]), int(targets.shape[1])
+        if tuple(hidden.shape[:2]) != (batch, seq):
+            raise ValueError(
+                f"hidden prefix shape {tuple(hidden.shape[:2])} must match targets "
+                f"{(batch, seq)}"
+            )
+        d_model = int(hidden.shape[-1])
+        flat_hidden = hidden.reshape(batch * seq, d_model)
+        flat_targets = targets.reshape(batch * seq)
+        if loss_mask is not None:
+            if loss_mask.shape != targets.shape:
+                raise ValueError(
+                    f"loss_mask shape {tuple(loss_mask.shape)} must match targets "
+                    f"{tuple(targets.shape)}"
+                )
+            flat_mask = loss_mask.reshape(batch * seq).astype(mx.float32)
+        else:
+            flat_mask = None
+
+        n = batch * seq
+        loss_sum = mx.zeros((), dtype=mx.float32)
+        if flat_mask is None:
+            denom = mx.array(float(n), dtype=mx.float32)
+        else:
+            denom = mx.maximum(flat_mask.sum(), mx.array(1.0, dtype=mx.float32))
+
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            h_chunk = flat_hidden[start:end]
+            logits_chunk = self.lm_head(h_chunk).astype(mx.float32)
+            tok_loss = nn.losses.cross_entropy(
+                logits_chunk, flat_targets[start:end], reduction="none"
+            )
+            if flat_mask is None:
+                loss_sum = loss_sum + tok_loss.sum()
+            else:
+                loss_sum = loss_sum + (tok_loss * flat_mask[start:end]).sum()
+
+        return loss_sum / denom
 
     # ------------------------------------------------------------------ #
     # CodePacket convenience
