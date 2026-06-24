@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Tuple, cast
 
 import mlx.core as mx
+import numpy as np
 
 
 _INVALID_INDEX_SENTINEL = -1
@@ -446,8 +447,251 @@ def sparse_mla_attention(
     )
 
 
+# ====================================================================== #
+# Graph-supervised lightning indexer (DeepSeek DSA + GraphCodeBERT edges)
+# ====================================================================== #
+#
+# The lightning indexer scores every (query t, key s) pair cheaply, selects the
+# top-k keys per query (plus a local window and attention sinks that are ALWAYS
+# kept), and then runs dense attention only over the gathered set. The score is
+#
+#     I_{t,s} = sum_h w_h * ReLU(q_h . k_s) + beta * S_blk[t, s]
+#
+# where ``q_h`` / ``k_s`` are per-head lightweight index projections, ``w_h`` is
+# a learned per-head weight, ``beta`` is a learned scalar, and ``S_blk`` is the
+# fixed graph routing prior from :mod:`cppmega_mlx.nn.code_graph_routes` mapped
+# from block granularity to token granularity. This mirrors DeepSeek's
+# lightning indexer with the addition of the graph prior (our signature feature)
+# and NSA/SabreCoder-style block top-k selection.
+
+_NEG_INF = -1e9
+
+
+def lightning_indexer_scores(
+    q_index: mx.array,
+    k_index: mx.array,
+    head_weights: mx.array,
+    *,
+    block_bias: mx.array | None = None,
+    beta: mx.array | float = 0.0,
+    causal: bool = True,
+) -> mx.array:
+    """Compute the lightning-indexer score matrix ``I[b, t, s]`` (fp32).
+
+    Args:
+        q_index: ``(B, S, Hi, Di)`` per-head index queries.
+        k_index: ``(B, Skv, Hi, Di)`` per-head index keys.
+        head_weights: ``(Hi,)`` learned non-negative per-head weights ``w_h``.
+        block_bias: optional ``(B, S, Skv)`` token-level graph prior ``S_blk``
+            (already expanded from block to token granularity). Added as a bias.
+        beta: learned scalar (or fp32 0-d array) multiplying ``block_bias``.
+        causal: when True, positions ``s > t`` are set to ``-inf`` (lower-tri).
+
+    Returns:
+        ``(B, S, Skv)`` fp32 score matrix. Masked (future) entries are ``-inf``.
+    """
+
+    if q_index.ndim != 4 or k_index.ndim != 4:
+        raise ValueError(
+            f"lightning_indexer_scores: q/k must be 4-D (B,S,Hi,Di), got "
+            f"q={tuple(q_index.shape)} k={tuple(k_index.shape)}"
+        )
+    B, S, Hi, Di = (int(x) for x in q_index.shape)
+    Bk, Skv, Hik, Dik = (int(x) for x in k_index.shape)
+    if (Bk, Hik, Dik) != (B, Hi, Di):
+        raise ValueError(
+            f"lightning_indexer_scores: q {tuple(q_index.shape)} and k "
+            f"{tuple(k_index.shape)} disagree on (B,Hi,Di)"
+        )
+    if head_weights.shape != (Hi,):
+        raise ValueError(
+            f"lightning_indexer_scores: head_weights must be ({Hi},), got "
+            f"{tuple(head_weights.shape)}"
+        )
+
+    qf = q_index.astype(mx.float32)
+    kf = k_index.astype(mx.float32)
+    # per-head dot products: (B, Hi, S, Skv)
+    dots = mx.einsum("bshd,bthd->bhst", qf, kf)
+    relu = mx.maximum(dots, mx.zeros_like(dots))
+    w = mx.maximum(head_weights.astype(mx.float32), mx.zeros((Hi,), dtype=mx.float32))
+    # weighted sum over heads -> (B, S, Skv)
+    scores = mx.einsum("bhst,h->bst", relu, w)
+
+    if block_bias is not None:
+        if tuple(block_bias.shape) != (B, S, Skv):
+            raise ValueError(
+                f"lightning_indexer_scores: block_bias must be ({B},{S},{Skv}), "
+                f"got {tuple(block_bias.shape)}"
+            )
+        beta_arr = beta if isinstance(beta, mx.array) else mx.array(
+            float(beta), dtype=mx.float32
+        )
+        scores = scores + beta_arr.astype(mx.float32) * block_bias.astype(mx.float32)
+
+    if causal:
+        i = mx.arange(S).reshape(S, 1)
+        j = mx.arange(Skv).reshape(1, Skv)
+        keep = (j <= i)[None, :, :]
+        scores = mx.where(keep, scores, mx.array(_NEG_INF, dtype=mx.float32))
+    return scores
+
+
+def indexer_topk_indices(
+    scores: mx.array,
+    *,
+    topk: int,
+    local_window: int = 0,
+    num_sinks: int = 0,
+    causal: bool = True,
+) -> mx.array:
+    """Select per-query KV indices from indexer ``scores``.
+
+    Top-k by score, with a local sliding window and attention sinks that are
+    ALWAYS forced into the selection (NSA/SabreCoder style). The returned index
+    tensor uses sentinel ``-1`` for padding/invalid entries so it plugs straight
+    into :func:`sparse_mla_attention_reference`.
+
+    Args:
+        scores: ``(B, S, Skv)`` fp32 indexer scores (``-inf`` on masked entries).
+        topk: number of top-scoring keys to keep per query.
+        local_window: also force-keep the ``local_window`` keys immediately at and
+            before each query position (recency window).
+        num_sinks: also force-keep the first ``num_sinks`` keys (sink tokens).
+        causal: when True, never select ``s > t``.
+
+    Returns:
+        ``(B, S, K)`` int32 indices, ``K = topk + local_window + num_sinks``,
+        sentinel ``-1`` for unused slots, de-duplicated per query.
+    """
+
+    if scores.ndim != 3:
+        raise ValueError(
+            f"indexer_topk_indices: scores must be (B,S,Skv), got {tuple(scores.shape)}"
+        )
+    if topk < 1:
+        raise ValueError(f"indexer_topk_indices: topk must be >=1, got {topk}")
+    if local_window < 0 or num_sinks < 0:
+        raise ValueError("indexer_topk_indices: local_window/num_sinks must be >=0")
+    B, S, Skv = (int(x) for x in scores.shape)
+    eff_topk = min(topk, Skv)
+    out_k = min(eff_topk + local_window + num_sinks, Skv)
+
+    # The selection is discrete and non-differentiable; detach so this is safe
+    # under autograd (gradients flow through the gathered attention + the scores
+    # used by the loss, never through the argsort). Pure-MLX so no host sync of a
+    # traced array is required.
+    sc = mx.stop_gradient(scores.astype(mx.float32))
+    pos = mx.arange(Skv).reshape(1, 1, Skv)
+    qpos = mx.arange(S).reshape(1, S, 1)
+
+    # Forced-keep mask: sinks (s < num_sinks) and local window
+    # (t-local_window < s <= t). Boost their score above any real score so they
+    # always land in the top-K, while preserving relative order among them.
+    forced = mx.zeros((1, S, Skv), dtype=mx.bool_)
+    if num_sinks > 0:
+        forced = forced | (pos < num_sinks)
+    if local_window > 0:
+        forced = forced | ((pos > (qpos - local_window)) & (pos <= qpos))
+    if causal:
+        causal_keep = pos <= qpos
+    else:
+        causal_keep = mx.ones((1, S, Skv), dtype=mx.bool_)
+    valid = sc > (_NEG_INF / 2.0)
+    keepable = valid & causal_keep
+    forced = forced & keepable
+
+    big = mx.array(1e6, dtype=mx.float32)
+    ranking = mx.where(keepable, sc, mx.array(_NEG_INF, dtype=mx.float32))
+    ranking = mx.where(forced, ranking + big, ranking)
+    # argsort descending: take the first out_k columns per (B,S) row.
+    order = mx.argsort(-ranking, axis=-1)[:, :, :out_k]  # (B,S,out_k) int32
+    # Mark slots that selected an unusable (non-keepable) key as sentinel -1.
+    gathered_keep = mx.take_along_axis(
+        mx.broadcast_to(keepable, (B, S, Skv)).astype(mx.int32), order, axis=-1
+    )
+    out = mx.where(gathered_keep > 0, order.astype(mx.int32), mx.array(-1, dtype=mx.int32))
+    return mx.stop_gradient(out)
+
+
+def graph_indexed_attention_reference(
+    q: mx.array,
+    kv: mx.array,
+    q_index: mx.array,
+    k_index: mx.array,
+    head_weights: mx.array,
+    *,
+    block_bias: mx.array | None = None,
+    beta: mx.array | float = 0.0,
+    topk: int,
+    local_window: int = 0,
+    num_sinks: int = 0,
+    sm_scale: float | None = None,
+    d_v: int | None = None,
+    kv_group: int = 1,
+    causal: bool = True,
+    return_scores: bool = False,
+) -> mx.array | Tuple[mx.array, mx.array]:
+    """End-to-end graph-supervised indexed attention (pure-MLX reference).
+
+    1. Score every (t, s) with :func:`lightning_indexer_scores` (includes the
+       graph prior ``beta * S_blk``).
+    2. Select top-k (+ local + sink) keys with :func:`indexer_topk_indices`.
+    3. Gather the selected KV and run dense MLA over them via
+       :func:`sparse_mla_attention_reference`.
+
+    Args:
+        q: ``(B, S, H, Dqk)`` attention queries (full heads).
+        kv: ``(B, Skv, G, Dqk)`` packed KV (G = kv groups).
+        q_index/k_index: ``(B, S, Hi, Di)`` / ``(B, Skv, Hi, Di)`` index proj.
+        head_weights: ``(Hi,)`` learned per-head weights.
+        block_bias: optional ``(B, S, Skv)`` token-level graph prior.
+        beta: learned scalar weight on the graph prior.
+        topk/local_window/num_sinks: selection sizes.
+        kv_group: number of KV groups (``H % kv_group == 0``).
+        return_scores: when True also return the ``(B, S, Skv)`` indexer scores
+            (needed by the indexer losses).
+
+    Returns:
+        ``out`` ``(B, S, H, d_v)`` (and the scores when ``return_scores``).
+    """
+
+    scores = lightning_indexer_scores(
+        q_index,
+        k_index,
+        head_weights,
+        block_bias=block_bias,
+        beta=beta,
+        causal=causal,
+    )
+    sel = indexer_topk_indices(
+        scores,
+        topk=topk,
+        local_window=local_window,
+        num_sinks=num_sinks,
+        causal=causal,
+    )  # (B, S, K)
+    # Expand selection to per-kv-group indices: (B, S, G, K).
+    B, S, K = (int(x) for x in sel.shape)
+    indices = mx.broadcast_to(sel[:, :, None, :], (B, S, kv_group, K))
+    out = sparse_mla_attention_reference(
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        return_lse=False,
+    )
+    if return_scores:
+        return out, scores
+    return out
+
+
 __all__ = [
     "SparseMLAShapes",
     "sparse_mla_attention",
     "sparse_mla_attention_reference",
+    "lightning_indexer_scores",
+    "indexer_topk_indices",
+    "graph_indexed_attention_reference",
 ]

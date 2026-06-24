@@ -42,6 +42,7 @@ from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
 from cppmega_mlx.nn.moe import FeedForwardExpert
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.platform_embedding import CppMegaPlatformEmbedding
+from cppmega_mlx.nn.sparse_mla import graph_indexed_attention_reference
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 
 # Reuse the same attention-mode literal the rest of the repo uses. DSA is the
@@ -74,6 +75,11 @@ class DenseCppLMConfig:
     rope: bool = True
     rope_theta: float = 10000.0
     attention_sparse_topk: int = 256  # only consumed when attention_mode='dsa'
+    # Graph-supervised lightning indexer knobs (attention_mode='dsa' only).
+    indexer_heads: int = 4
+    indexer_dim: int = 32
+    indexer_local_window: int = 16
+    indexer_num_sinks: int = 1
 
     # SwiGLU FFN.
     ffn_activation: Literal["swiglu"] = "swiglu"
@@ -193,19 +199,101 @@ class DenseCppLMConfig:
         }
 
 
-class DenseCppBlock(nn.Module):
-    """One pre-norm residual block: RMSNorm -> GQA attention -> +residual,
-    then RMSNorm -> SwiGLU FFN -> +residual.
+class GraphIndexedAttention(nn.Module):
+    """Graph-supervised lightning-indexer attention (``attention_mode='dsa'``).
 
-    Both sub-modules are EXISTING cppmega leaves (``CausalSelfAttention`` and the
-    SwiGLU ``FeedForwardExpert``).  ``self.attention.config.mode`` is the live
-    DSA seam — it is whatever ``DenseCppLMConfig.attention_config`` produced.
+    Reuses the same q/k/v projections as :class:`CausalSelfAttention` but, instead
+    of dense SDPA, scores each (query, key) pair with a cheap lightning indexer
+    (per-head ReLU dot + learned graph-prior bias ``beta * S_blk``), selects the
+    top-k (+ local window + sinks), and runs dense MLA over the gathered KV via
+    :func:`graph_indexed_attention_reference`. The indexer scores are exposed for
+    the indexer losses (KL warm-up / BCE / coverage / contrastive).
     """
 
     def __init__(self, config: DenseCppLMConfig):
         super().__init__()
+        self._dense_config = config
+        acfg = config.attention_config(mode="dsa")
+        # ``config`` mirrors CausalSelfAttention: it is the AttentionConfig so the
+        # DSA seam contract (``layer.attention.config.mode == 'dsa'`` etc.) holds
+        # identically for the GQA and DSA attention modules.
+        self.config = acfg
+        d_model = config.hidden_size
+        self.q_proj = nn.Linear(d_model, acfg.q_proj_dim, bias=False)
+        self.kv_proj = nn.Linear(d_model, acfg.kv_proj_dim, bias=False)
+        self.out_proj = nn.Linear(acfg.q_proj_dim, d_model, bias=False)
+        # Lightning-indexer projections (cheap, low-rank, separate heads).
+        hi, di = config.indexer_heads, config.indexer_dim
+        self.index_q_proj = nn.Linear(d_model, hi * di, bias=False)
+        self.index_k_proj = nn.Linear(d_model, hi * di, bias=False)
+        self.index_head_weights = mx.ones((hi,), dtype=mx.float32)
+        # Learned graph-prior weight beta (init 0.0 -> ablation-friendly: the
+        # graph prior only kicks in once trained, and beta=0 recovers the plain
+        # lightning indexer).
+        self.index_beta = mx.zeros((1,), dtype=mx.float32)
+        # Last computed indexer scores (B, S, Skv) for the loss; not a param.
+        self.last_index_scores: mx.array | None = None
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: mx.array | Literal["causal"] | None,
+        *,
+        block_bias: mx.array | None = None,
+    ) -> mx.array:
+        del mask  # causal handled inside the indexer reference
+        cfg = self._dense_config
+        acfg = self.config
+        batch, seq, _ = hidden_states.shape
+        q = self.q_proj(hidden_states).reshape(
+            batch, seq, acfg.num_q_heads, acfg.q_head_dim
+        )
+        kv = self.kv_proj(hidden_states).reshape(
+            batch, seq, acfg.kv_heads, acfg.q_head_dim
+        )
+        hi, di = cfg.indexer_heads, cfg.indexer_dim
+        q_index = self.index_q_proj(hidden_states).reshape(batch, seq, hi, di)
+        k_index = self.index_k_proj(hidden_states).reshape(batch, seq, hi, di)
+        out, scores = graph_indexed_attention_reference(
+            q,
+            kv,
+            q_index,
+            k_index,
+            self.index_head_weights,
+            block_bias=block_bias,
+            beta=self.index_beta[0],
+            topk=cfg.attention_sparse_topk,
+            local_window=cfg.indexer_local_window,
+            num_sinks=cfg.indexer_num_sinks,
+            kv_group=acfg.kv_heads,
+            causal=True,
+            return_scores=True,
+        )
+        self.last_index_scores = scores
+        out = out.reshape(batch, seq, acfg.q_proj_dim)
+        return self.out_proj(out)
+
+
+class DenseCppBlock(nn.Module):
+    """One pre-norm residual block: RMSNorm -> attention -> +residual,
+    then RMSNorm -> SwiGLU FFN -> +residual.
+
+    The attention sub-module is an EXISTING cppmega leaf in GQA mode
+    (``CausalSelfAttention``); when ``attention_mode='dsa'`` it is the
+    graph-supervised lightning indexer (:class:`GraphIndexedAttention`). Both
+    share the SwiGLU ``FeedForwardExpert``.  ``config.attention_mode`` is the live
+    DSA seam.
+    """
+
+    def __init__(self, config: DenseCppLMConfig):
+        super().__init__()
+        self.config = config
         self.attn_norm = nn.RMSNorm(config.hidden_size)
-        self.attention = CausalSelfAttention(config.attention_config())
+        self.is_dsa = config.attention_mode == "dsa"
+        if self.is_dsa:
+            self.attention = GraphIndexedAttention(config)
+        else:
+            self.attention = CausalSelfAttention(config.attention_config())
         self.ffn_norm = nn.RMSNorm(config.hidden_size)
         # FeedForwardExpert is the shared SwiGLU MLP used by our MoE experts;
         # used standalone here it is a plain SwiGLU FFN (gate/up/down).
@@ -220,10 +308,16 @@ class DenseCppBlock(nn.Module):
         self,
         hidden_states: mx.array,
         mask: mx.array | Literal["causal"] | None,
+        *,
+        block_bias: mx.array | None = None,
     ) -> mx.array:
-        hidden_states = hidden_states + self.attention(
-            self.attn_norm(hidden_states), mask
-        )
+        if self.is_dsa:
+            attn_out = self.attention(
+                self.attn_norm(hidden_states), mask, block_bias=block_bias
+            )
+        else:
+            attn_out = self.attention(self.attn_norm(hidden_states), mask)
+        hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
         return hidden_states
 
@@ -357,6 +451,7 @@ class DenseCppLM(nn.Module):
         node_type_ids: mx.array | None = None,
         platform_ids: mx.array | None = None,
         apply_final_norm: bool = True,
+        block_bias: mx.array | None = None,
     ) -> mx.array:
         hidden = self.embed(
             input_ids,
@@ -371,18 +466,50 @@ class DenseCppLM(nn.Module):
         mask = nn.MultiHeadAttention.create_additive_causal_mask(
             seq_length, dtype=hidden.dtype
         )
+        is_dsa = self.config.attention_mode == "dsa"
         for layer in self.layers:
-            hidden = layer(hidden, mask)
+            if is_dsa:
+                hidden = layer(hidden, mask, block_bias=block_bias)
+            else:
+                hidden = layer(hidden, mask)
         if apply_final_norm:
             return self.norm(hidden)
         return hidden
 
+    def indexer_scores(self) -> list[mx.array]:
+        """Return the per-layer indexer score matrices from the last DSA forward.
+
+        Only meaningful when ``attention_mode='dsa'``; each entry is the
+        ``(B, S, Skv)`` lightning-indexer score used for the indexer losses.
+        Raises (RULE #1) when the model is not in DSA mode or has not run.
+        """
+
+        if self.config.attention_mode != "dsa":
+            raise ValueError(
+                "indexer_scores() is only available when attention_mode='dsa'"
+            )
+        scores: list[mx.array] = []
+        for layer in self.layers:
+            attn = layer.attention
+            if getattr(attn, "last_index_scores", None) is None:
+                raise RuntimeError(
+                    "indexer_scores(): no scores recorded; run a DSA forward first"
+                )
+            scores.append(attn.last_index_scores)
+        return scores
+
     def logits(
         self,
         input_ids: mx.array,
+        *,
+        block_bias: mx.array | None = None,
         **side_channels: mx.array | None,
     ) -> mx.array:
-        return self.lm_head(self.decoder_hidden_states(input_ids, **side_channels))
+        return self.lm_head(
+            self.decoder_hidden_states(
+                input_ids, block_bias=block_bias, **side_channels
+            )
+        )
 
     def __call__(
         self,
@@ -396,16 +523,19 @@ class DenseCppLM(nn.Module):
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
         platform_ids: mx.array | None = None,
+        block_bias: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         """Return ``(logits, loss)``.
 
         ``loss`` is the masked next-token cross-entropy when ``targets`` is
         provided (otherwise ``None``).  ``loss_mask`` (1.0 = contributes) is
-        optional; when absent every target position contributes.
+        optional; when absent every target position contributes. ``block_bias``
+        is the token-level graph routing prior consumed by the DSA indexer.
         """
 
         logits = self.logits(
             input_ids,
+            block_bias=block_bias,
             structure_ids=structure_ids,
             dep_levels=dep_levels,
             ast_depth_ids=ast_depth_ids,
