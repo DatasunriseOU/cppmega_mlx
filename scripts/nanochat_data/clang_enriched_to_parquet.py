@@ -106,6 +106,14 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "call_targets",
     "type_refs",
     "def_use",
+    # Per-char commit edit-signal arrays (from process_commits.py). These are
+    # consumed by materialize_tokenized_enriched_batch via the char->token
+    # mapping; they must be header-offset-aligned exactly like the others so
+    # token positions line up after the platform/language header is prepended.
+    "change_mask_pre",
+    "change_mask_post",
+    "hunk_id_per_char",
+    "edit_op_per_char",
 )
 
 # ---------------------------------------------------------------------------
@@ -253,6 +261,7 @@ def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dic
 
 _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
+    pa.field("source_text", pa.string()),
     pa.field("source_doc_id", pa.string()),
     pa.field("tokenizer_fingerprint", pa.string()),
     pa.field("actual_token_count", pa.int32()),
@@ -279,6 +288,15 @@ _SCHEMA = pa.schema([
     pa.field("call_targets", pa.list_(pa.uint32())),
     pa.field("type_refs", pa.list_(pa.uint32())),
     pa.field("def_use", pa.list_(pa.uint8())),
+    # Per-char commit edit-signal arrays (from process_commits.py). Persisting
+    # them here is what lets the standalone materializer
+    # (materialize_tokenized_enriched_parquet.py) map them to populated
+    # token-level edit columns; without these columns the two-stage path would
+    # silently emit EMPTY token edit signals (a forbidden zero/absent fallback).
+    pa.field("change_mask_pre", pa.list_(pa.uint8())),
+    pa.field("change_mask_post", pa.list_(pa.uint8())),
+    pa.field("hunk_id_per_char", pa.list_(pa.int32())),
+    pa.field("edit_op_per_char", pa.list_(pa.uint8())),
     pa.field("platform_info", pa.string()),
     pa.field("language_info", pa.string()),
     pa.field("build_info", pa.string()),
@@ -348,6 +366,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     """Convert a list of doc dicts to a PyArrow table."""
     tokenized_rows = tokenized_rows or [{} for _ in rows]
     texts = []
+    source_texts = []
     source_doc_ids = []
     tokenizer_fingerprints = []
     token_counts = []
@@ -362,6 +381,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     call_targets_col = []
     type_refs_col = []
     def_use_col = []
+    change_mask_pre_col = []
+    change_mask_post_col = []
+    hunk_id_per_char_col = []
+    edit_op_per_char_col = []
     platform_info_col = []
     language_info_col = []
     build_info_col = []
@@ -406,7 +429,11 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     token_type_edges_col = []
 
     for row, tokenized in zip(rows, tokenized_rows):
-        texts.append(row.get("text", ""))
+        row_text = row.get("text", "")
+        texts.append(row_text)
+        # source_text falls back to the emitted text when absent so the column
+        # is always populated for the IFIM objective.
+        source_texts.append(row.get("source_text") or row_text)
         raw_source_doc_id = row.get("source_doc_id")
         source_doc_ids.append(
             None if raw_source_doc_id is None else str(raw_source_doc_id)
@@ -446,6 +473,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         call_targets_col.append(row.get("call_targets", []))
         type_refs_col.append(row.get("type_refs", []))
         def_use_col.append(row.get("def_use", []))
+        change_mask_pre_col.append(row.get("change_mask_pre", []))
+        change_mask_post_col.append(row.get("change_mask_post", []))
+        hunk_id_per_char_col.append(row.get("hunk_id_per_char", []))
+        edit_op_per_char_col.append(row.get("edit_op_per_char", []))
         pi = row.get("platform_info")
         platform_info_col.append(json.dumps(pi) if pi else None)
         li = row.get("language_info")
@@ -537,6 +568,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     return pa.table(
         {
             "text": pa.array(texts, type=_SCHEMA.field("text").type),
+            "source_text": pa.array(
+                source_texts, type=_SCHEMA.field("source_text").type
+            ),
             "source_doc_id": pa.array(
                 source_doc_ids, type=_SCHEMA.field("source_doc_id").type
             ),
@@ -578,6 +612,18 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 type_refs_col, type=_SCHEMA.field("type_refs").type
             ),
             "def_use": pa.array(def_use_col, type=_SCHEMA.field("def_use").type),
+            "change_mask_pre": pa.array(
+                change_mask_pre_col, type=_SCHEMA.field("change_mask_pre").type
+            ),
+            "change_mask_post": pa.array(
+                change_mask_post_col, type=_SCHEMA.field("change_mask_post").type
+            ),
+            "hunk_id_per_char": pa.array(
+                hunk_id_per_char_col, type=_SCHEMA.field("hunk_id_per_char").type
+            ),
+            "edit_op_per_char": pa.array(
+                edit_op_per_char_col, type=_SCHEMA.field("edit_op_per_char").type
+            ),
             "platform_info": pa.array(
                 platform_info_col, type=_SCHEMA.field("platform_info").type
             ),
@@ -840,6 +886,10 @@ def process_record_with_policy(
                         "call_edges", "type_edges", "actual_token_count",
                         *_CHAR_LEVEL_METADATA_FIELDS)},
         "text": full_text,
+        # source_text mirrors the emitted (header-prefixed) document text so the
+        # IFIM objective, which reads metadata['source_text'], aligns with the
+        # tokenized text exactly.
+        "source_text": full_text,
         "structure_ids": full_sids,
         "chunk_boundaries": adjusted_chunks,
         "call_edges": filtered_call_edges,
