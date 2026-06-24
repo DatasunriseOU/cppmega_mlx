@@ -24,10 +24,10 @@ All inputs are fixed Python constants in `make_golden_mini.py` (no randomness, n
   - enriched docs: 2, call_edges: 0, type_edges: 0
 - **graph** (`code/code_graph.parquet`, 3 packed row(s)) — 3-layer #include + call graph `util -> engine -> api`; struct `Config` field access.
   - files: `include/engine.h`, `include/util.h`, `src/api.cpp`, `src/engine.cpp`, `src/util.cpp`
-  - enriched docs: 3, call_edges: 3, type_edges: 3
+  - enriched docs: 3, call_edges: 3, type_edges: 0
 - **shapes** (`code/code_shapes.parquet`, 3 packed row(s)) — base class `Shape` + virtual `area()` override in `Circle`; struct `Point` field access; cross-file calls (`report.cpp` -> `Shape::area`/`centroid`, `circle_report` -> `area_report`).
   - files: `include/shape.h`, `src/report.cpp`, `src/shape.cpp`
-  - enriched docs: 3, call_edges: 3, type_edges: 3
+  - enriched docs: 3, call_edges: 3, type_edges: 2
 
 ### Commit pairs (`commits/`)
 
@@ -96,6 +96,7 @@ Produced `commits/commits.parquet` with 4 row(s) from 4 enriched commit doc(s).
 ### `commits/commits.parquet` (tokenized enriched commit docs)
 
   - `text`: `string`
+  - `source_text`: `string`
   - `source_doc_id`: `string`
   - `tokenizer_fingerprint`: `string`
   - `actual_token_count`: `int32`
@@ -110,6 +111,10 @@ Produced `commits/commits.parquet` with 4 row(s) from 4 enriched commit doc(s).
   - `call_targets`: `list<element: uint32>`
   - `type_refs`: `list<element: uint32>`
   - `def_use`: `list<element: uint8>`
+  - `change_mask_pre`: `list<element: uint8>`
+  - `change_mask_post`: `list<element: uint8>`
+  - `hunk_id_per_char`: `list<element: int32>`
+  - `edit_op_per_char`: `list<element: uint8>`
   - `platform_info`: `string`
   - `language_info`: `string`
   - `build_info`: `string`
