@@ -56,6 +56,7 @@ from tools.clang_indexer.index_project import (
     PartInfo,
     ProjectIndex,
     extract_callees,
+    extract_referenced_types,
     get_qualified_name,
     FUNCTION_KINDS,
     CONTAINER_KINDS,
@@ -632,6 +633,7 @@ def analyze_file_clang(
             )
             if text and len(text) >= 20:
                 callees = extract_callees(cursor)
+                referenced_types = extract_referenced_types(cursor)
                 qname = get_qualified_name(cursor)
                 start_line = cursor.extent.start.line
                 end_line = cursor.extent.end.line
@@ -647,6 +649,7 @@ def analyze_file_clang(
                     ast_depth=func_ast_depth,
                     sibling_index=func_sibling_index,
                     ast_node_type=func_ast_node_type,
+                    referenced_types=referenced_types,
                 ))
 
         elif cursor.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL,
@@ -1237,6 +1240,8 @@ def _build_enriched_from_parts(
     # Maps for edge computation: chunk_idx -> (qname, callees_list)
     chunk_qnames: dict[int, str] = {}
     chunk_callees: dict[int, list[str]] = {}
+    chunk_all_qnames: dict[int, str] = {}
+    chunk_types: dict[int, list[str]] = {}
 
     # Merge functions from both analyses for callee lookup
     all_funcs: dict[str, FunctionDef] = {}
@@ -1287,9 +1292,12 @@ def _build_enriched_from_parts(
             'name': name,
         })
 
+        if qname:
+            chunk_all_qnames[i] = qname
         if qname and qname in all_funcs:
             chunk_qnames[i] = qname
             chunk_callees[i] = all_funcs[qname].callees
+            chunk_types[i] = getattr(all_funcs[qname], 'referenced_types', [])
 
         offset += part_len
         if i < len(parts_info) - 1:
@@ -1304,7 +1312,13 @@ def _build_enriched_from_parts(
                 if ci != cj and target_qname == callee_qname:
                     call_edges.append({'from': ci, 'to': cj})
 
+    # Compute type_edges: function chunk referencing type T -> chunk defining T.
     type_edges: list[dict[str, object]] = []
+    for ci, ref_types in chunk_types.items():
+        for t in ref_types:
+            for cj, q in chunk_all_qnames.items():
+                if ci != cj and q == t:
+                    type_edges.append({'from': ci, 'to': cj})
 
     semantic_index = ProjectIndex()
     for func in all_funcs.values():

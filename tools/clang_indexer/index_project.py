@@ -269,14 +269,15 @@ SYSTEM_PREFIXES = (
 class FunctionDef:
     """A function definition with its source location and call references."""
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
-                 'callees', 'dep_level', 'is_definition', 'ast_depth',
-                 'sibling_index', 'ast_node_type']
+                 'callees', 'referenced_types', 'dep_level', 'is_definition',
+                 'ast_depth', 'sibling_index', 'ast_node_type']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
                  end_line: int = 0, ast_depth: list[int] | None = None,
                  sibling_index: list[int] | None = None,
-                 ast_node_type: list[int] | None = None):
+                 ast_node_type: list[int] | None = None,
+                 referenced_types: list | None = None):
         self.name = name
         self.qualified_name = qualified_name
         self.file = file
@@ -284,6 +285,11 @@ class FunctionDef:
         self.end_line = end_line or (line + text.count('\n'))
         self.text = text
         self.callees = callees  # list of qualified names called
+        # qualified names of record/enum/typedef types referenced by this
+        # function (params, return, locals, member access) -- captured during the
+        # SAME libclang parse as callees so it round-trips IPC and feeds the
+        # offline type_refs/type_edges builders. Mirrors `callees`.
+        self.referenced_types = list(referenced_types or [])
         self.dep_level = 0
         self.is_definition = is_definition
         self.ast_depth = list(ast_depth or [])
@@ -300,6 +306,7 @@ class FunctionDef:
             'ast_depth': self.ast_depth,
             'sibling_index': self.sibling_index,
             'ast_node_type': self.ast_node_type,
+            'referenced_types': self.referenced_types,
         }
 
     @classmethod
@@ -682,6 +689,45 @@ def extract_callees(cursor: Cursor) -> list[str]:
     return list(callees)
 
 
+_REFERENCED_TYPE_DECL_KINDS = frozenset({
+    CursorKind.STRUCT_DECL,
+    CursorKind.CLASS_DECL,
+    CursorKind.CLASS_TEMPLATE,
+    CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+    CursorKind.ENUM_DECL,
+    CursorKind.UNION_DECL,
+    CursorKind.TYPEDEF_DECL,
+    CursorKind.TYPE_ALIAS_DECL,
+    CursorKind.TYPE_ALIAS_TEMPLATE_DECL,
+})
+
+
+def extract_referenced_types(cursor: Cursor) -> list[str]:
+    """Extract qualified names of record/enum/typedef types referenced by a
+    function (params, return, locals, member access, casts, template args).
+
+    Mirrors :func:`extract_callees` but for TYPE relationships — captured during
+    the SAME libclang parse pass and persisted on ``FunctionDef.referenced_types``
+    so the offline doc-build path can emit ``type_refs``/``type_edges``. TYPE_REF
+    cursors are clang's explicit type-usage markers; we resolve each to its
+    declaring record/enum/typedef qname and drop system types.
+    """
+    types: set[str] = set()
+
+    def walk(node: Cursor):
+        if node.kind == CursorKind.TYPE_REF:
+            ref = node.referenced
+            if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
+                qname = get_qualified_name(ref)
+                if qname and not is_system_function(qname):
+                    types.add(qname)
+        for child in node.get_children():
+            walk(child)
+
+    walk(cursor)
+    return list(types)
+
+
 def get_qualified_name(cursor: Cursor) -> str:
     """Get the fully qualified name of a cursor (namespace::class::func)."""
     parts = []
@@ -786,6 +832,7 @@ def parse_translation_unit(
             )
             if text and len(text) >= 20:
                 callees = extract_callees(cursor)
+                referenced_types = extract_referenced_types(cursor)
                 qname = get_qualified_name(cursor)
                 functions.append(FunctionDef(
                     name=cursor.spelling,
@@ -799,6 +846,7 @@ def parse_translation_unit(
                     ast_depth=func_ast_depth,
                     sibling_index=func_sibling_index,
                     ast_node_type=func_ast_node_type,
+                    referenced_types=referenced_types,
                 ))
 
         elif cursor.kind in CONTAINER_KINDS:
@@ -1288,19 +1336,28 @@ def extract_semantic_metadata_from_parts(
                 symbol_ids[ci] = sym_id
                 def_use_arr[ci] = DEF_USE_DEF
 
-            # Annotate call targets from the index's callee list
+            # Annotate call_targets + type_refs by marking each referenced
+            # name's occurrences within this part (approximate call-site / type-
+            # use spans; exact char offsets would need a re-parse). This replaces
+            # the old 1-char-per-callee stub and the never-written type_refs.
             func_def = index.functions.get(qname)
             if func_def:
+                def _mark(arr, name, value):
+                    if not name or not value:
+                        return
+                    s = 0
+                    plen = len(name)
+                    while True:
+                        idx = part_text.find(name, s)
+                        if idx < 0:
+                            break
+                        for ci in range(offset + idx, min(offset + idx + plen, offset + part_len)):
+                            arr[ci] = value
+                        s = idx + plen
                 for callee_qname in func_def.callees:
-                    callee_id = _compute_symbol_id(callee_qname)
-                    if callee_id:
-                        # Mark the call target on the function body
-                        # (we don't have exact call-site offsets without
-                        # re-parsing, so mark at chunk granularity)
-                        for ci in range(offset, offset + part_len):
-                            if call_targets[ci] == 0:
-                                call_targets[ci] = callee_id
-                                break  # one call target per callee
+                    _mark(call_targets, callee_qname.split('::')[-1], _compute_symbol_id(callee_qname))
+                for type_qname in getattr(func_def, 'referenced_types', []):
+                    _mark(type_refs, type_qname.split('::')[-1], _compute_symbol_id(type_qname))
 
         elif kind == 1:  # PREAMBLE
             # Preamble: mark as use sites (references to included entities)
@@ -1347,8 +1404,10 @@ def build_enriched_doc(
     offset = 0
 
     # Map chunk_idx -> qname for edge computation
-    chunk_qnames = {}
+    chunk_qnames = {}        # function chunks only (call-edge sources/targets)
     chunk_callees = {}
+    chunk_all_qnames = {}    # ANY named chunk incl. type defs (type-edge targets)
+    chunk_types = {}         # referenced_types per function chunk (type-edge sources)
 
     for i, (part_text, kind, dep_level, name, qname) in enumerate(parts_info):
         part_len = len(part_text)
@@ -1367,10 +1426,13 @@ def build_enriched_doc(
             'name': name,
         })
 
-        # Track function qnames for edge computation
+        # Track qnames for edge computation.
+        if qname:
+            chunk_all_qnames[i] = qname
         if qname and qname in index.functions:
             chunk_qnames[i] = qname
             chunk_callees[i] = index.functions[qname].callees
+            chunk_types[i] = getattr(index.functions[qname], 'referenced_types', [])
 
         offset += part_len
         if i < len(parts_info) - 1:
@@ -1385,8 +1447,14 @@ def build_enriched_doc(
                 if ci != cj and target_qname == callee_qname:
                     call_edges.append({'from': ci, 'to': cj})
 
-    # type_edges: empty for now (clang_indexer focuses on functions, not types)
+    # Compute type_edges: a function chunk referencing type T -> the chunk that
+    # defines T (mirror of the call_edges loop, over referenced_types).
     type_edges: list[dict[str, object]] = []
+    for ci, ref_types in chunk_types.items():
+        for t in ref_types:
+            for cj, q in chunk_all_qnames.items():
+                if ci != cj and q == t:
+                    type_edges.append({'from': ci, 'to': cj})
 
     ast_depth, sibling_index, ast_node_type = extract_ast_metadata_from_parts(
         full_text,
