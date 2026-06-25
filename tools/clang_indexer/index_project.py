@@ -255,6 +255,11 @@ PartInfo: TypeAlias = tuple[str, int, int, str, str | None]
 # C++ source file extensions
 CPP_EXTENSIONS = {'.cpp', '.cc', '.cxx', '.c', '.c++', '.cp'}
 HEADER_EXTENSIONS = {'.h', '.hpp', '.hxx', '.hh', '.h++', '.inl', '.inc'}
+# Files we feed to libclang for indexing. Headers are included so that struct/
+# class/enum/typedef DEFINITIONS (which live in headers) enter the index as
+# type-def chunks, enabling function->type-def ``type_edges``. Headers are parsed
+# as standalone TUs; libclang resolves the definitions they contain.
+INDEX_EXTENSIONS = CPP_EXTENSIONS | HEADER_EXTENSIONS
 
 # System/stdlib function prefixes (skip for dependency tracking)
 SYSTEM_PREFIXES = (
@@ -314,6 +319,41 @@ class FunctionDef:
         return cls(**d)
 
 
+class TypeDef:
+    """A type DEFINITION (struct/class/enum/union/typedef/using).
+
+    Captured during the same libclang parse as functions so the offline doc
+    builder can emit a type-def CHUNK whose qname == the type's qualified name.
+    That chunk is the *target* of a function->type ``type_edge`` (the source is
+    the function chunk's ``referenced_types``). Definitions usually live in
+    headers, which is why headers are now part of the index file set.
+    """
+    __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
+                 'kind']
+
+    def __init__(self, name: str, qualified_name: str, file: str, line: int,
+                 text: str, kind: int, end_line: int = 0):
+        self.name = name
+        self.qualified_name = qualified_name
+        self.file = file
+        self.line = line
+        self.end_line = end_line or (line + text.count('\n'))
+        self.text = text
+        # node-bucket kind for parts_info (4=class/struct, 7=typedef/using)
+        self.kind = kind
+
+    def to_dict(self) -> dict:
+        return {
+            'name': self.name, 'qualified_name': self.qualified_name,
+            'file': self.file, 'line': self.line, 'text': self.text,
+            'kind': self.kind, 'end_line': self.end_line,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'TypeDef':
+        return cls(**d)
+
+
 class ProjectIndex:
     """Cross-file function index for a single project."""
 
@@ -326,6 +366,22 @@ class ProjectIndex:
         self.file_preambles: dict[str, str] = {}
         # qualified_name -> list of qualified_names that call it
         self.callers: dict[str, list[str]] = defaultdict(list)
+        # qualified_name -> TypeDef (struct/class/enum/union/typedef/using).
+        # Separate from `functions` so the call graph is untouched; consulted
+        # when building docs to pull a referenced type's DEFINITION in as a
+        # type-edge target chunk.
+        self.typedefs: dict[str, TypeDef] = {}
+
+    def add_typedef(self, td: TypeDef):
+        """Register a type definition. First definition with text wins; never
+        overwrite a real definition with a shorter/forward one."""
+        key = td.qualified_name
+        if not key:
+            return
+        existing = self.typedefs.get(key)
+        if existing is not None and len(existing.text) >= len(td.text):
+            return
+        self.typedefs[key] = td
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
@@ -775,20 +831,42 @@ CONTAINER_KINDS = {
     CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
 }
 
+# Cursor kinds whose DEFINITIONS we register as TypeDef chunks (type-edge
+# targets). class/struct/union map to node-bucket kind 4; typedef/using map to
+# kind 7 (see _CLANG_PART_NODE_BUCKETS). Enums get kind 4 as well (record-like).
+_TYPE_DEF_KIND_BUCKET = {
+    CursorKind.STRUCT_DECL: 4,
+    CursorKind.CLASS_DECL: 4,
+    CursorKind.CLASS_TEMPLATE: 4,
+    CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION: 4,
+    CursorKind.UNION_DECL: 4,
+    CursorKind.ENUM_DECL: 4,
+    CursorKind.TYPEDEF_DECL: 7,
+    CursorKind.TYPE_ALIAS_DECL: 7,
+    CursorKind.TYPE_ALIAS_TEMPLATE_DECL: 7,
+}
+
 
 def parse_translation_unit(
     filepath: str,
     index: Index,
     compile_args: list[str],
     project_dir: str,
-) -> list[FunctionDef]:
-    """Parse a single C++ file and extract function definitions with callees."""
+) -> tuple[list[FunctionDef], list[TypeDef]]:
+    """Parse a single C/C++ file (source OR header) and extract function
+    definitions (with callees + referenced types) AND type definitions
+    (struct/class/enum/union/typedef/using).
+
+    Type definitions are returned alongside functions so the index can register
+    them as type-edge target chunks. Headers are parsed as standalone TUs.
+    """
     functions: list[FunctionDef] = []
+    typedefs: list[TypeDef] = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
             source = source_file.read()
     except OSError:
-        return functions
+        return functions, typedefs
 
     try:
         tu = index.parse(
@@ -801,7 +879,7 @@ def parse_translation_unit(
         )
     except Exception as e:
         print(f"  WARN: Failed to parse {filepath}: {e}", file=sys.stderr)
-        return functions
+        return functions, typedefs
 
     rel_path = os.path.relpath(filepath, project_dir)
     ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
@@ -810,15 +888,39 @@ def parse_translation_unit(
         filepath,
     )
     byte_to_char = _byte_to_char_mapper(source)
+    project_dir_abs = os.path.abspath(project_dir)
+
+    def _in_project(cursor) -> bool:
+        """True if the cursor's location file lives under project_dir.
+
+        Type DEFINITIONS usually live in project HEADERS that get #included into
+        the .cpp TU, so we cannot restrict to ``== filepath`` for them or we'd
+        capture nothing. We DO exclude system/third-party headers (outside
+        project_dir) to avoid indexing std:: types.
+        """
+        loc = cursor.location.file
+        if loc is None:
+            return False
+        return os.path.abspath(loc.name).startswith(project_dir_abs + os.sep)
 
     def visit(cursor):
-        """Recursively visit cursors, descending into namespaces and classes."""
-        if not cursor.location.file:
-            return
-        if cursor.location.file.name != filepath:
-            return
+        """Recursively visit cursors, descending into namespaces and classes.
 
-        if cursor.kind in FUNCTION_KINDS and cursor.is_definition():
+        Functions are captured only from the primary file (``== filepath``) to
+        avoid duplicating inline defs across every TU that includes the header.
+        Type DEFINITIONS are captured from any project-local file (incl. headers
+        pulled in via #include); duplicates across TUs are deduped by qname in
+        ``ProjectIndex.add_typedef``.
+        """
+        loc = cursor.location.file
+        if loc is None:
+            return
+        in_primary_file = loc.name == filepath
+        in_project = in_primary_file or _in_project(cursor)
+        if not in_project:
+            return  # skip system/third-party headers entirely
+
+        if in_primary_file and cursor.kind in FUNCTION_KINDS and cursor.is_definition():
             text, func_ast_depth, func_sibling_index, func_ast_node_type, _offsets = (
                 _cursor_text_and_metadata(
                     cursor,
@@ -848,16 +950,37 @@ def parse_translation_unit(
                     ast_node_type=func_ast_node_type,
                     referenced_types=referenced_types,
                 ))
+            return
 
-        elif cursor.kind in CONTAINER_KINDS:
-            # Recurse into namespaces, classes, structs
+        # Register type DEFINITIONS (struct/class/enum/union/typedef/using) as
+        # type-edge target chunks. We require an actual definition so a forward
+        # declaration never shadows the real body.
+        type_bucket = _TYPE_DEF_KIND_BUCKET.get(cursor.kind)
+        if type_bucket is not None and cursor.is_definition():
+            qname = get_qualified_name(cursor)
+            if qname and not is_system_function(qname):
+                td_text = get_function_text(cursor, tu)
+                if td_text and len(td_text) >= 8:
+                    typedefs.append(TypeDef(
+                        name=cursor.spelling,
+                        qualified_name=qname,
+                        file=rel_path,
+                        line=cursor.location.line,
+                        text=td_text,
+                        kind=type_bucket,
+                        end_line=cursor.extent.end.line,
+                    ))
+            # Records (class/struct) can contain nested types/methods — recurse.
+
+        if cursor.kind in CONTAINER_KINDS:
+            # Recurse into namespaces, classes, structs for nested defs.
             for child in cursor.get_children():
                 visit(child)
 
     for cursor in tu.cursor.get_children():
         visit(cursor)
 
-    return functions
+    return functions, typedefs
 
 
 _DEFAULT_SKIP_DIRS = frozenset({
@@ -885,7 +1008,7 @@ def find_cpp_files(
         dirs[:] = [d for d in dirs if d not in skip_dirs]
         for fname in filenames:
             ext = os.path.splitext(fname)[1].lower()
-            if ext in CPP_EXTENSIONS:
+            if ext in INDEX_EXTENSIONS:
                 filepath = os.path.join(root, fname)
                 # Skip very large files
                 try:
@@ -974,8 +1097,27 @@ def get_default_compile_args(project_dir: str) -> list[str]:
 
 
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
-    """Adapt compile args based on file extension — .c files need C mode, not C++."""
+    """Adapt compile args based on file extension — .c files need C mode, not C++,
+    and headers must be parsed as ``-x c++-header`` (otherwise libclang fails to
+    parse a standalone .h/.hpp as a translation unit)."""
     ext = os.path.splitext(filepath)[1].lower()
+    if ext in HEADER_EXTENSIONS:
+        # Force C++ header mode so struct/class/enum/typedef DEFINITIONS in
+        # header-only files parse and become type-def chunks. Strip any existing
+        # -x <lang> pair / joined -x form first so it doesn't conflict.
+        adapted = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == '-x':
+                skip_next = True
+                continue
+            if arg.startswith('-x') and arg != '-x':
+                continue
+            adapted.append(arg)
+        return ['-x', 'c++-header'] + adapted
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
@@ -1589,6 +1731,30 @@ def build_training_documents(
                                    df.qualified_name))  # kind=2 FUNC
             parts_info.append((func.text, 2, func.dep_level, func.name,
                                func.qualified_name))  # kind=2 FUNC (root)
+
+            # Pull in DEFINITIONS of types referenced by the root func + its
+            # dep funcs as type-edge target chunks. build_enriched_doc matches
+            # a function chunk's referenced_types against any chunk whose qname
+            # equals the type qname (chunk_all_qnames) to emit type_edges; the
+            # type def must therefore be present as a chunk. Definitions live in
+            # headers (now indexed), registered in index.typedefs.
+            func_qnames_in_doc = {func.qualified_name}
+            func_qnames_in_doc.update(df.qualified_name for df in dep_funcs)
+            referenced: list[str] = list(func.referenced_types)
+            for df in dep_funcs:
+                referenced.extend(df.referenced_types)
+            added_type_qnames: set[str] = set()
+            for tq in referenced:
+                if tq in added_type_qnames or tq in func_qnames_in_doc:
+                    continue
+                td = index.typedefs.get(tq)
+                if td is None or not td.text:
+                    continue
+                added_type_qnames.add(tq)
+                # kind from TypeDef (4=class/struct/enum/union, 7=typedef/using)
+                parts_info.append((td.text, td.kind, 0, td.name,
+                                   td.qualified_name))
+
             compile_args = list(default_args or [])
             build_info = dict(default_build_info) if default_build_info else None
             if project_dir is not None:
@@ -1628,16 +1794,18 @@ def _parse_file_batch(args_tuple):
     sys.setrecursionlimit(50000)  # Set in each worker process too
     _configure_libclang()
     clang_index = Index.create()
-    results = []
+    func_results: list[dict] = []
+    type_results: list[dict] = []
     errors = 0
     for filepath in filepaths:
         args = _resolve_file_args(filepath, compile_db, default_args)
         try:
-            functions = parse_translation_unit(filepath, clang_index, args, project_dir)
-            results.extend(f.to_dict() for f in functions)
+            functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+            func_results.extend(f.to_dict() for f in functions)
+            type_results.extend(t.to_dict() for t in typedefs)
         except (Exception, RecursionError):
             errors += 1
-    return results, len(filepaths), errors
+    return {"functions": func_results, "typedefs": type_results}, len(filepaths), errors
 
 
 def _parse_single_file_worker(args_tuple):
@@ -1647,8 +1815,11 @@ def _parse_single_file_worker(args_tuple):
     _configure_libclang()
     clang_index = Index.create()
     args = _resolve_file_args(filepath, compile_db, default_args)
-    functions = parse_translation_unit(filepath, clang_index, args, project_dir)
-    return [f.to_dict() for f in functions]
+    functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+    return {
+        "functions": [f.to_dict() for f in functions],
+        "typedefs": [t.to_dict() for t in typedefs],
+    }
 
 
 def _parse_files_isolated(
@@ -1675,9 +1846,11 @@ def _parse_files_isolated(
         for future in as_completed(futures):
             filepath = futures[future]
             try:
-                func_dicts = future.result(timeout=120)  # 2 min per file
-                for d in func_dicts:
+                payload = future.result(timeout=120)  # 2 min per file
+                for d in payload["functions"]:
                     index_obj.add_function(FunctionDef.from_dict(d))
+                for td in payload["typedefs"]:
+                    index_obj.add_typedef(TypeDef.from_dict(td))
                 parsed += 1
             except TimeoutError:
                 errors += 1
@@ -1747,9 +1920,11 @@ def process_project(
         total_errors = 0
         try:
             with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                for func_dicts, parsed_count, error_count in executor.map(_parse_file_batch, batches):
-                    for d in func_dicts:
+                for payload, parsed_count, error_count in executor.map(_parse_file_batch, batches):
+                    for d in payload["functions"]:
                         index_obj.add_function(FunctionDef.from_dict(d))
+                    for td in payload["typedefs"]:
+                        index_obj.add_typedef(TypeDef.from_dict(td))
                     total_parsed += parsed_count
                     total_errors += error_count
                     check_memory_limit(memory_limit_gb, label="index_project")
@@ -1780,9 +1955,11 @@ def process_project(
         for filepath in cpp_files:
             args = _resolve_file_args(filepath, compile_db, default_args)
             try:
-                functions = parse_translation_unit(filepath, clang_index, args, project_dir)
+                functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
                 for func in functions:
                     index_obj.add_function(func)
+                for td in typedefs:
+                    index_obj.add_typedef(td)
                 parsed += 1
             except Exception as e:
                 errors += 1

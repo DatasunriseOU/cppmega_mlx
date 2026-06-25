@@ -502,7 +502,7 @@ def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
 
     index_project._configure_libclang(None)
     clang_index = index_project.Index.create()
-    funcs = index_project.parse_translation_unit(
+    funcs, _typedefs = index_project.parse_translation_unit(
         str(source),
         clang_index,
         ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
