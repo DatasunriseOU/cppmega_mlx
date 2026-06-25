@@ -67,6 +67,92 @@ from tools.clang_indexer.index_project import (
 )
 from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.pr_ingest import pr_store as _pr_store_mod
+from scripts.pr_ingest.render_discussion import render_discussion as _render_discussion
+
+
+class PRDiscussionLookup:
+    """Live (repo, pr_number|merge_commit_sha) -> pr_discussion lookup glue.
+
+    Opens the Tier-2 PR store (read-only) once, plus the bare-name -> owner/repo
+    map from outputs/pr_ingest/repo_list.json. For each commit record it queries
+    the store FIRST by (owner_repo, pr_number) then by (owner_repo, commit_hash),
+    renders the assembled PR record via render_discussion, and writes the result
+    into ``record['pr_discussion']`` IN PLACE.
+
+    RULE #1 (fail-loud): a missing store / repo_list / malformed JSON RAISES at
+    construction time. A per-record MISS is the NORMAL Tier-1 (git-only) path and
+    does NOT fail — it simply leaves record['pr_discussion'] absent.
+    """
+
+    def __init__(self, store_path: str, repo_list_path: str | None) -> None:
+        if not os.path.exists(store_path):
+            raise FileNotFoundError(f"--pr-store does not exist: {store_path}")
+        # Read-only connection; create=False RAISES on a missing store (fail-loud).
+        self._conn = _pr_store_mod.connect(store_path, create=False)
+        self._name_to_owner_repo: dict[str, str] = {}
+        if repo_list_path:
+            if not os.path.exists(repo_list_path):
+                raise FileNotFoundError(
+                    f"--repo-list does not exist: {repo_list_path}")
+            with open(repo_list_path, "r") as fh:
+                data = json.load(fh)
+            for entry in data.get("repos", []):
+                name = entry.get("name")
+                owner_repo = entry.get("owner_repo")
+                if name and owner_repo:
+                    self._name_to_owner_repo[name] = owner_repo
+        self.hits = 0
+        self.misses = 0
+
+    def _store_key(self, record: dict) -> str | None:
+        """Resolve the (store-keyed) owner/repo for a record.
+
+        The store is keyed by canonical owner/repo. extract_git_history already
+        rewrites record['repo'] to owner/repo when the clone's git remote
+        resolves, so a record['repo'] that already contains '/' IS the key.
+        Otherwise map the bare directory name via repo_list.json.
+        """
+        repo = (record.get("repo") or "").strip()
+        if not repo:
+            return None
+        if "/" in repo:
+            return repo
+        return self._name_to_owner_repo.get(repo)
+
+    def attach(self, record: dict) -> bool:
+        """Look up the PR for this commit and set record['pr_discussion'] on hit.
+
+        Lookup order: (owner_repo, pr_number) THEN (owner_repo, commit_hash).
+        Returns True when a non-empty discussion was attached, else False (MISS,
+        the normal Tier-1 git-only path — never fails).
+        """
+        owner_repo = self._store_key(record)
+        if not owner_repo:
+            self.misses += 1
+            return False
+        rec = None
+        pr_number = record.get("pr_number")
+        if pr_number is not None:
+            rec = _pr_store_mod.get_by_pr(self._conn, owner_repo, int(pr_number))
+        if rec is None:
+            sha = (record.get("commit_hash") or "").strip()
+            if sha:
+                rec = _pr_store_mod.get_by_sha(self._conn, owner_repo, sha)
+        if rec is None:
+            self.misses += 1
+            return False
+        discussion = _render_discussion(rec)
+        if not discussion:
+            self.misses += 1
+            return False
+        record["pr_discussion"] = discussion
+        self.hits += 1
+        return True
+
+    def close(self) -> None:
+        self._conn.close()
+
 
 if TYPE_CHECKING:
     from clang.cindex import CursorKind, Index, TranslationUnit  # pyright: ignore[reportMissingImports]
@@ -1673,6 +1759,7 @@ def process_jsonl_file(
     dedup_store=None,
     dedup_tokenizer=None,
     dedup_near: bool = True,
+    pr_lookup: "PRDiscussionLookup | None" = None,
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output.
 
@@ -1704,6 +1791,14 @@ def process_jsonl_file(
                 continue
 
             stats['records_read'] += 1
+
+            # Tier-2 PR-store lookup glue: set record['pr_discussion'] from the
+            # live store (by pr_number then merge/commit SHA) BEFORE the doc is
+            # built, so build_docstring emits the @discussion block at the HEAD.
+            # A MISS leaves the record Tier-1 (git-only) — never fails (RULE #1:
+            # the lookup is best-effort enrichment; a missing PR is normal).
+            if pr_lookup is not None:
+                pr_lookup.attach(record)
 
             try:
                 docs = process_record(
@@ -1811,6 +1906,21 @@ def main() -> int:
         '--no-near-dedup', action='store_true',
         help='Disable MinHash-LSH near dedup for commit docs (exact-only).',
     )
+    parser.add_argument(
+        '--pr-store', default=None,
+        help='Path to the Tier-2 PR-discussion SQLite store. When set, each '
+             'commit record is looked up by (owner_repo, pr_number) then '
+             '(owner_repo, commit_hash); on a hit render_discussion populates '
+             "record['pr_discussion'] (emitted at the HEAD of the commit doc). "
+             'A miss leaves the record Tier-1 (git-only) — never fails.',
+    )
+    parser.add_argument(
+        '--repo-list', default=None,
+        help='Path to outputs/pr_ingest/repo_list.json (bare-name -> owner/repo '
+             'map) used to resolve the PR-store key for records whose repo is a '
+             'bare directory name. Optional; records whose repo already contains '
+             "'/' are used as-is.",
+    )
     args = parser.parse_args()
     start_memory_guard(args.memory_limit_gb, label="process_commits")
 
@@ -1862,6 +1972,13 @@ def main() -> int:
     else:
         print("  dedup: per-file in-RAM md5 set (no --dedup-db)", file=sys.stderr)
 
+    # Tier-2 PR-discussion lookup glue (fail-loud on a bad store/repo-list path).
+    pr_lookup: PRDiscussionLookup | None = None
+    if args.pr_store:
+        pr_lookup = PRDiscussionLookup(args.pr_store, args.repo_list)
+        print(f"  pr_store: live lookup at {args.pr_store} "
+              f"(repo_list={args.repo_list})", file=sys.stderr)
+
     clang_index = Index.create()
     build_context = BuildContextResolver(repo_root=args.repo_root, repo_dir=args.repo_dir)
 
@@ -1900,6 +2017,7 @@ def main() -> int:
                         dedup_store=dedup_store,
                         dedup_tokenizer=dedup_tokenizer,
                         dedup_near=dedup_near,
+                        pr_lookup=pr_lookup,
                     )
 
                     for k in total_stats:
@@ -1913,6 +2031,10 @@ def main() -> int:
 
     if dedup_store is not None:
         dedup_store.close()
+    if pr_lookup is not None:
+        print(f"  pr_store: {pr_lookup.hits} discussions attached, "
+              f"{pr_lookup.misses} misses (Tier-1 git-only)", file=sys.stderr)
+        pr_lookup.close()
 
     elapsed = time.time() - t0
     print(f"\nTotal: {total_stats}", file=sys.stderr)

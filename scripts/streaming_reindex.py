@@ -327,7 +327,9 @@ def stage_index_source(
 def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
                         repo_root: Path | None, repo_dir: Path | None,
                         dedup_db: Path | None = None,
-                        dedup_near: bool = True) -> Path:
+                        dedup_near: bool = True,
+                        pr_store: Path | None = None,
+                        repo_list: Path | None = None) -> Path:
     """process_commits.py -> <repo>.enriched.jsonl (commit edit-signal docs).
 
     A commit is an ATOMIC change-unit: process_commits dedups whole commit DOCS
@@ -352,6 +354,10 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         cmd += ["--repo-root", str(repo_root)]
     if repo_dir is not None:
         cmd += ["--repo-dir", str(repo_dir)]
+    if pr_store is not None:
+        cmd += ["--pr-store", str(pr_store)]
+    if repo_list is not None:
+        cmd += ["--repo-list", str(repo_list)]
     run_checked(repo, "process_commits", cmd, log_path=work / f"{repo}.commits.log")
     if not enriched.exists() or enriched.stat().st_size == 0:
         raise RepoFailure(repo, "process_commits", f"empty enriched jsonl: {enriched}")

@@ -361,6 +361,8 @@ def process_range(
     repo_work: Path,
     dedup_db: Path | None = None,
     dedup_near: bool = True,
+    pr_store: Path | None = None,
+    repo_list: Path | None = None,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
     rkey = range_key(repo, start_idx)
@@ -372,7 +374,8 @@ def process_range(
 
         # process_commits needs the source tree for include resolution.
         enriched = stage_index_commits(rkey, [slice_jsonl], rwork, repo_dir, None,
-                                       dedup_db, dedup_near)
+                                       dedup_db, dedup_near,
+                                       pr_store=pr_store, repo_list=repo_list)
         tok = stage_materialize(rkey, enriched, rwork)
 
         route_dir = rwork / "routed"
@@ -414,6 +417,8 @@ def process_one_repo(
     keep_temp: bool,
     dedup_db: Path | None = None,
     dedup_near: bool = True,
+    pr_store: Path | None = None,
+    repo_list: Path | None = None,
 ) -> int:
     """Extract one repo, fan its ranges to the pool, wait for completion.
 
@@ -456,7 +461,7 @@ def process_one_repo(
             fut = pool.submit(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
-                dedup_db, dedup_near,
+                dedup_db, dedup_near, pr_store, repo_list,
             )
             futures[fut] = (start, end)
 
@@ -521,6 +526,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "commits / cherry-picks). Fail-loud, no fallback.")
     p.add_argument("--no-near-dedup", action="store_true",
                    help="Disable MinHash-LSH near dedup (exact-only).")
+    p.add_argument("--pr-store", default=None,
+                   help="Path to the Tier-2 PR-discussion SQLite store "
+                        "(e.g. outputs/pr_ingest/prs.sqlite). When set, each "
+                        "commit record is looked up by (owner_repo, pr_number) "
+                        "then (owner_repo, commit_hash) and, on a hit, the "
+                        "rendered PR discussion is attached as "
+                        "record['pr_discussion'] (HEAD of the commit doc). Miss "
+                        "= Tier-1 git-only (no fail).")
+    p.add_argument("--repo-list", default=None,
+                   help="Path to outputs/pr_ingest/repo_list.json (bare-name -> "
+                        "owner/repo map) for resolving the PR-store key.")
     return p.parse_args(argv)
 
 
@@ -553,6 +569,17 @@ def main(argv: list[str]) -> int:
         DedupStore(str(dedup_db), near=dedup_near, commit_every=1000).close()
         _log(f"Dedup: SHARED global commit-doc store at {dedup_db} "
              f"(exact{'+near' if dedup_near else ''}, tokenized hash)")
+
+    # Tier-2 PR-discussion live lookup (fail-loud on a bad path up front).
+    pr_store = Path(args.pr_store) if args.pr_store else None
+    repo_list = Path(args.repo_list) if args.repo_list else None
+    if pr_store is not None and not pr_store.exists():
+        raise SystemExit(f"--pr-store does not exist: {pr_store}")
+    if repo_list is not None and not repo_list.exists():
+        raise SystemExit(f"--repo-list does not exist: {repo_list}")
+    if pr_store is not None:
+        _log(f"PR-store: live lookup into record['pr_discussion'] from {pr_store} "
+             f"(repo_list={repo_list})")
 
     manifest = Manifest.load(COMMIT_MANIFEST)
     manifest_lock = threading.Lock()
@@ -608,7 +635,7 @@ def main(argv: list[str]) -> int:
                     repo, repo_dir, lengths_sorted, args.range_size,
                     work_root, pool, manifest, manifest_lock, resume,
                     args.token_budget, cumulative, args.keep_temp,
-                    dedup_db, dedup_near,
+                    dedup_db, dedup_near, pr_store, repo_list,
                 )
                 ranges_done += done
                 processed_repos += 1
