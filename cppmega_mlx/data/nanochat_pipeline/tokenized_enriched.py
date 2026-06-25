@@ -5,7 +5,9 @@ from __future__ import annotations
 import bisect
 import inspect
 import json
-from typing import Any, cast
+from typing import Any, Sequence, cast
+
+from cppmega_mlx.tokenizer.cpp_tokenizer import normalize_whitespace_with_offsets
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     PLATFORM_IDS_COLUMN,
@@ -106,16 +108,34 @@ def _encode_batch_with_optional_char_spans(
     prepend_id = _resolve_special_id(prepend)
     append_id = _resolve_special_id(append)
 
+    # CRITICAL: apply the SAME whitespace-sentinel normalization as
+    # ``CppMegaTokenizer.encode`` so the stored ``input_ids`` contain
+    # ``<NL>``(47)/``<SPACE>``(46) and newline/indent structure is preserved.
+    # Normalization changes char offsets, so we keep a per-character map from
+    # the normalized string back onto the ORIGINAL text and translate every
+    # per-token span through it. The doc sidecars (structure_ids/ast_depth/
+    # change_mask/...) are char-aligned to the ORIGINAL text, so the returned
+    # spans MUST be in original-text coordinates to stay aligned (no off-by-N).
+    normalized_texts: list[str] = []
+    norm_maps: list[list[tuple[int, int]]] = []
+    for text in texts:
+        normalized, norm_to_orig = normalize_whitespace_with_offsets(text)
+        normalized_texts.append(normalized)
+        norm_maps.append(norm_to_orig)
+
     try:
-        encodings = hf_tok.encode_batch(texts, add_special_tokens=False)
+        encodings = hf_tok.encode_batch(normalized_texts, add_special_tokens=False)
     except TypeError:
-        encodings = hf_tok.encode_batch(texts)
+        encodings = hf_tok.encode_batch(normalized_texts)
 
     token_lists: list[list[int]] = []
     token_spans: list[list[tuple[int, int]]] = []
-    for text, enc in zip(texts, encodings):
+    for text, norm_to_orig, enc in zip(texts, norm_maps, encodings):
         ids = list(enc.ids)
-        spans = [(int(start), int(end)) for start, end in enc.offsets]
+        spans = [
+            _normalized_span_to_original_span(norm_to_orig, int(start), int(end))
+            for start, end in enc.offsets
+        ]
         if prepend is not None:
             assert prepend_id is not None
             ids.insert(0, int(prepend_id))
@@ -128,6 +148,29 @@ def _encode_batch_with_optional_char_spans(
         token_lists.append(ids)
         token_spans.append(spans)
     return token_lists, token_spans
+
+
+def _normalized_span_to_original_span(
+    normalized_to_original: Sequence[tuple[int, int]],
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Translate a [start, end) span in normalized coords to original coords.
+
+    ``normalized_to_original[k]`` is the original ``(start, end)`` span the k-th
+    normalized character came from. A token's normalized span maps to the union
+    of the original spans of the normalized characters it covers. Empty/zero-
+    width tokens map to ``(0, 0)`` (treated as invalid by the char->token
+    projection, matching the prior behavior for special-token positions).
+    """
+    if not normalized_to_original:
+        return (0, 0)
+    start = min(max(start, 0), len(normalized_to_original))
+    end = min(max(end, start), len(normalized_to_original))
+    if end <= start:
+        return (0, 0)
+    covered = normalized_to_original[start:end]
+    return min(item[0] for item in covered), max(item[1] for item in covered)
 
 
 def _extract_token_char_starts_and_valid(

@@ -35,8 +35,139 @@ EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
 # Whitespace normalization: collapse runs to a single sentinel token so that
 # BPE-split identifiers (e.g., "sum" -> "s","u","m") decode without spurious
 # inter-token spaces. Encode normalizes; decode replaces sentinels back.
+#
+# CRITICAL: normalization MUST be string/char/raw-string-literal aware. Spaces
+# and tabs *inside* a literal carry meaning (e.g. ``"a    b"``) and must NOT be
+# collapsed to ``<SPACE>``; doing so would change the program semantics and the
+# re-encoded ids. The scanner below tracks literal state and only collapses
+# whitespace runs that live OUTSIDE any literal.
 _WS_RUN_RE = re.compile(r"[ \t]+")
 _NL_RUN_RE = re.compile(r"[\r\n]+")
+_NL_SENTINEL = "<NL>"
+_SPACE_SENTINEL = "<SPACE>"
+
+
+def normalize_whitespace_with_offsets(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Collapse outside-literal whitespace runs to sentinels, tracking offsets.
+
+    Returns ``(normalized_text, normalized_to_original)`` where
+    ``normalized_to_original[k]`` is the ``(start, end)`` half-open span in the
+    *original* ``text`` that the ``k``-th character of ``normalized_text`` came
+    from. Sentinel characters (the chars of ``<NL>``/``<SPACE>``) all map to the
+    span of the collapsed whitespace run; non-whitespace characters map to their
+    own single-char span. This lets callers translate per-token char offsets
+    computed on the normalized string back onto the original char-aligned
+    sidecar channels with no off-by-N shift.
+
+    Whitespace INSIDE string/char/raw-string literals is preserved verbatim
+    (identity offsets); only whitespace outside any literal is collapsed.
+    """
+    chars: list[str] = []
+    spans: list[tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    # Literal state: None=code, '"'=string, "'"=char, "raw"=raw-string.
+    state: str | None = None
+    raw_delim = ""  # closing delimiter for the active raw string: )<d>"
+    while i < n:
+        ch = text[i]
+        if state is None:
+            # Detect raw-string prefix: R"<delim>( ... )<delim>"
+            if ch in ("R", "u", "U", "L") and _raw_string_opener_at(text, i):
+                r_pos = text.index('R', i)
+                quote = text.index('"', r_pos)
+                paren = text.index('(', quote)
+                delim = text[quote + 1 : paren]
+                # Emit the R"...( prefix verbatim with identity offsets.
+                for k in range(i, paren + 1):
+                    chars.append(text[k])
+                    spans.append((k, k + 1))
+                raw_delim = ")" + delim + '"'
+                state = "raw"
+                i = paren + 1
+                continue
+            if ch == '"' or ch == "'":
+                chars.append(ch)
+                spans.append((i, i + 1))
+                state = ch
+                i += 1
+                continue
+            if ch in "\r\n":
+                j = i + 1
+                while j < n and text[j] in "\r\n":
+                    j += 1
+                _append_sentinel(chars, spans, _NL_SENTINEL, i, j)
+                i = j
+                continue
+            if ch in " \t":
+                j = i + 1
+                while j < n and text[j] in " \t":
+                    j += 1
+                _append_sentinel(chars, spans, _SPACE_SENTINEL, i, j)
+                i = j
+                continue
+            chars.append(ch)
+            spans.append((i, i + 1))
+            i += 1
+        elif state == "raw":
+            if text.startswith(raw_delim, i):
+                for k in range(i, i + len(raw_delim)):
+                    chars.append(text[k])
+                    spans.append((k, k + 1))
+                i += len(raw_delim)
+                state = None
+                raw_delim = ""
+            else:
+                chars.append(ch)
+                spans.append((i, i + 1))
+                i += 1
+        else:  # inside '"' string or "'" char literal
+            chars.append(ch)
+            spans.append((i, i + 1))
+            if ch == "\\" and i + 1 < n:
+                # Escaped char: copy the next char verbatim too.
+                chars.append(text[i + 1])
+                spans.append((i + 1, i + 2))
+                i += 2
+                continue
+            if ch == state:
+                state = None
+            i += 1
+    return "".join(chars), spans
+
+
+def _raw_string_opener_at(text: str, i: int) -> bool:
+    """True if a C++ raw-string literal opens at/just after position ``i``.
+
+    Handles optional encoding prefixes (u8/u/U/L) before ``R"``.
+    """
+    n = len(text)
+    j = i
+    # Optional encoding prefix chars before R.
+    while j < n and text[j] in ("u", "U", "L", "8"):
+        j += 1
+    if j >= n or text[j] != "R":
+        return False
+    j += 1
+    if j >= n or text[j] != '"':
+        return False
+    j += 1
+    # delimiter chars until '('
+    while j < n and text[j] != "(" and text[j] != '"':
+        j += 1
+    return j < n and text[j] == "("
+
+
+def _append_sentinel(
+    chars: list[str],
+    spans: list[tuple[int, int]],
+    sentinel: str,
+    start: int,
+    end: int,
+) -> None:
+    for sentinel_char in sentinel:
+        chars.append(sentinel_char)
+        spans.append((start, end))
 
 
 class TokenizerContractError(ValueError):
@@ -119,10 +250,14 @@ class CppMegaTokenizer:
 
     @staticmethod
     def _normalize_whitespace(text: str) -> str:
-        """Collapse whitespace runs to ``<SPACE>``/``<NL>`` sentinel tokens."""
-        text = _NL_RUN_RE.sub("<NL>", text)
-        text = _WS_RUN_RE.sub("<SPACE>", text)
-        return text
+        """Collapse whitespace runs to ``<SPACE>``/``<NL>`` sentinel tokens.
+
+        String/char/raw-string-literal aware: whitespace inside a literal is
+        preserved verbatim (``"a    b"`` stays ``"a    b"``), only whitespace
+        outside any literal is collapsed.
+        """
+        normalized, _offsets = normalize_whitespace_with_offsets(text)
+        return normalized
 
     def encode(
         self,
@@ -286,4 +421,5 @@ __all__ = [
     "EXPECTED_VOCAB_SIZE",
     "TokenizerContractError",
     "load_cppmega_tokenizer",
+    "normalize_whitespace_with_offsets",
 ]
