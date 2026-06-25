@@ -131,6 +131,38 @@ def run_git(repo_path: str, args: list[str], timeout: int = 60) -> Optional[str]
         return None
 
 
+# GitHub remote URL -> owner/repo. Matches https://github.com/owner/repo(.git)
+# and git@github.com:owner/repo(.git) forms.
+_GH_REMOTE_RE = re.compile(
+    r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
+
+
+def resolve_repo_url(repo_path: str) -> Optional[str]:
+    """Return the clone's raw ``remote.origin.url`` (or None when unset)."""
+    url = run_git(repo_path, ["config", "--get", "remote.origin.url"])
+    if not url:
+        return None
+    url = url.strip()
+    return url or None
+
+
+def resolve_owner_repo(repo_path: str) -> Optional[str]:
+    """Resolve canonical ``owner/repo`` from the clone's git remote.origin.url.
+
+    The authoritative owner/repo is NOT in git history — it lives only in the
+    clone's remote. Returns ``owner/repo`` or None when the remote is missing /
+    not a GitHub URL (caller decides whether to fall back to the bare name).
+    """
+    url = resolve_repo_url(repo_path)
+    if not url:
+        return None
+    m = _GH_REMOTE_RE.search(url)
+    if not m:
+        return None
+    return f"{m.group('owner')}/{m.group('repo')}"
+
+
 def get_commit_list(repo_path: str, max_commits: int = 0) -> list[str]:
     args = ["log", "--format=%H", "--no-merges", "--diff-filter=M"]
     if max_commits > 0:
@@ -341,6 +373,15 @@ def process_repo(
     if not repo_name:
         repo_name = Path(repo_path).name
 
+    # Canonical owner/repo from the clone's git remote (authoritative; not in
+    # git history). When resolvable it overrides the bare directory name so each
+    # record carries the same key the Tier-2 PR store is keyed by. repo_url keeps
+    # the raw remote so downstream consumers can reconstruct the canonical URL.
+    repo_url = resolve_repo_url(repo_path)
+    owner_repo = resolve_owner_repo(repo_path)
+    if owner_repo:
+        repo_name = owner_repo
+
     stats: _ExtractionStats = {
         "repo": repo_name,
         "commits_checked": 0,
@@ -448,6 +489,7 @@ def process_repo(
                 "body": commit_info["body"],
                 "filepath": fd["filepath"],
                 "repo": repo_name,
+                "repo_url": repo_url or "",
                 "repo_path": os.path.abspath(repo_path),
                 "commit_hash": commit_info["hash"],
                 "timestamp": commit_info["timestamp"],

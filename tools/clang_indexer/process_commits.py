@@ -1082,6 +1082,19 @@ def build_docstring(record: dict) -> str:
     if source_branch:
         parts.append(f' * @branch {source_branch}')
 
+    # PR discussion (Tier-2 GH Archive + GraphQL join, attached by the extractor
+    # as record['pr_discussion']). Emitted at the HEAD of the block — right after
+    # provenance and BEFORE note_text / body / (and thus before PRE/POST/diff in
+    # the document) — so the real PR thread (title, body, comments, reviews,
+    # linked issues) leads the commit doc. A bigger discussion grows the doc's
+    # token count, which routes it to a larger length bucket via route-by-fit.
+    pr_discussion = (record.get('pr_discussion') or '').strip()
+    if pr_discussion:
+        parts.append(' *')
+        parts.append(' * @discussion')
+        for line in pr_discussion.splitlines():
+            parts.append(f' * {line.rstrip()}')
+
     # Gerrit / code-review note text (best-effort, attached by the extractor).
     note_text = (record.get('note_text') or '').strip()
     if note_text:
@@ -1454,6 +1467,9 @@ def _build_enriched_from_parts(
     result['timestamp'] = record.get('timestamp', '')
     result['pr_number'] = parse_pr_number(record)
     result['pr_title'] = record.get('pr_title', '')
+    # Tier-2: round-trip the joined PR discussion (title+body+thread+reviews+
+    # linked issues) so it survives into the parquet column alongside the keys.
+    result['pr_discussion'] = record.get('pr_discussion', '')
     result['source_branch'] = record.get('source_branch', '')
     result['parent_hashes'] = list(record.get('parent_hashes', []) or [])
     result['parent_count'] = record.get('parent_count')
