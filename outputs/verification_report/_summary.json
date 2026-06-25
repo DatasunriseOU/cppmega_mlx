@@ -1,0 +1,181 @@
+{
+  "samples_built": 200,
+  "code_examples": 6,
+  "commit_examples": 6,
+  "pr_examples": 8,
+  "skipped_concurrent_writes": [],
+  "code_stats": {
+    "label": "CODE",
+    "n_files": 11,
+    "n_rows": 414,
+    "rt_n": 88,
+    "roundtrip": {
+      "text_roundtrip_pct": 4.55,
+      "reencode_idempotent_pct": 100.0,
+      "id_exact_pct": 0.0,
+      "id_match_modulo_ws_pct": 3.41
+    },
+    "pertoken": {
+      "token_platform_ids": {
+        "rows_nonzero_pct": 0.0,
+        "tokens_nonzero_pct": 0.0
+      },
+      "token_structure_ids": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 83.31
+      },
+      "token_dep_levels": {
+        "rows_nonzero_pct": 65.7,
+        "tokens_nonzero_pct": 36.41
+      },
+      "token_ast_depth": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 48.49
+      },
+      "token_sibling_index": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 30.25
+      },
+      "token_ast_node_type": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 48.49
+      },
+      "token_symbol_ids": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 83.31
+      },
+      "token_def_use": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 83.31
+      },
+      "token_call_targets": {
+        "rows_nonzero_pct": 68.84,
+        "tokens_nonzero_pct": 2.09
+      },
+      "token_type_refs": {
+        "rows_nonzero_pct": 93.72,
+        "tokens_nonzero_pct": 2.58
+      },
+      "token_change_mask_pre": {
+        "rows_nonzero_pct": 0.0,
+        "tokens_nonzero_pct": 0.0
+      },
+      "token_change_mask_post": {
+        "rows_nonzero_pct": 0.0,
+        "tokens_nonzero_pct": 0.0
+      },
+      "hunk_id_per_token": {
+        "rows_nonzero_pct": 0.0,
+        "tokens_nonzero_pct": 0.0
+      },
+      "edit_op_per_token": {
+        "rows_nonzero_pct": 0.0,
+        "tokens_nonzero_pct": 0.0
+      }
+    },
+    "list": {
+      "platform_ids": {
+        "rows_nonempty_pct": 100.0
+      },
+      "token_call_edges": {
+        "rows_nonempty_pct": 65.46
+      },
+      "token_type_edges": {
+        "rows_nonempty_pct": 93.48
+      },
+      "changed_chunk_ids": {
+        "rows_nonempty_pct": 0.0
+      },
+      "changed_chunk_spans": {
+        "rows_nonempty_pct": 0.0
+      }
+    }
+  },
+  "commit_stats": {
+    "label": "COMMIT",
+    "n_files": 5,
+    "n_rows": 193,
+    "rt_n": 40,
+    "roundtrip": {
+      "text_roundtrip_pct": 0.0,
+      "reencode_idempotent_pct": 100.0,
+      "id_exact_pct": 0.0,
+      "id_match_modulo_ws_pct": 0.0
+    },
+    "pertoken": {
+      "token_platform_ids": {
+        "rows_nonzero_pct": 0.0,
+        "tokens_nonzero_pct": 0.0
+      },
+      "token_structure_ids": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 65.51
+      },
+      "token_dep_levels": {
+        "rows_nonzero_pct": 46.11,
+        "tokens_nonzero_pct": 25.4
+      },
+      "token_ast_depth": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 63.51
+      },
+      "token_sibling_index": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 48.24
+      },
+      "token_ast_node_type": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 63.51
+      },
+      "token_symbol_ids": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 63.26
+      },
+      "token_def_use": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 63.51
+      },
+      "token_call_targets": {
+        "rows_nonzero_pct": 69.95,
+        "tokens_nonzero_pct": 3.27
+      },
+      "token_type_refs": {
+        "rows_nonzero_pct": 79.27,
+        "tokens_nonzero_pct": 4.41
+      },
+      "token_change_mask_pre": {
+        "rows_nonzero_pct": 99.48,
+        "tokens_nonzero_pct": 25.4
+      },
+      "token_change_mask_post": {
+        "rows_nonzero_pct": 54.92,
+        "tokens_nonzero_pct": 4.56
+      },
+      "hunk_id_per_token": {
+        "rows_nonzero_pct": 56.99,
+        "tokens_nonzero_pct": 18.68
+      },
+      "edit_op_per_token": {
+        "rows_nonzero_pct": 100.0,
+        "tokens_nonzero_pct": 49.38
+      }
+    },
+    "list": {
+      "platform_ids": {
+        "rows_nonempty_pct": 100.0
+      },
+      "token_call_edges": {
+        "rows_nonempty_pct": 45.08
+      },
+      "token_type_edges": {
+        "rows_nonempty_pct": 2.07
+      },
+      "changed_chunk_ids": {
+        "rows_nonempty_pct": 100.0
+      },
+      "changed_chunk_spans": {
+        "rows_nonempty_pct": 100.0
+      }
+    }
+  }
+}
