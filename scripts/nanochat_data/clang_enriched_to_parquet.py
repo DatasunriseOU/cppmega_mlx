@@ -228,6 +228,10 @@ def filter_dead_platforms(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 PREAMBLE_KIND = 1
+# Build/compilation files are emitted with structure_ids ALL set to this kind
+# (extends the 0-8 code-kind vocab from index_project.build_enriched_doc). A
+# whole 'build' doc is a single BUILD_KIND span; it carries no call/type graph.
+BUILD_KIND = 9
 
 
 def chunk_document_exact(doc: dict, tokenizer, max_tokens: int) -> list:

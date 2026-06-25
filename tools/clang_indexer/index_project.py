@@ -261,6 +261,81 @@ HEADER_EXTENSIONS = {'.h', '.hpp', '.hxx', '.hh', '.h++', '.inl', '.inc'}
 # as standalone TUs; libclang resolves the definitions they contain.
 INDEX_EXTENSIONS = CPP_EXTENSIONS | HEADER_EXTENSIONS
 
+# --------------------------------------------------------------------------- #
+# Build / compilation file discovery (ADDITIVE; C/C++ path unchanged).
+#
+# Build files are ingested as their OWN 'build' doc type (distinct from code):
+# full tokenized text + a 'build' structure kind + a build-system language tag +
+# a platform sidecar where derivable. They carry NO call/type/symbol graph
+# (build files are not C++), exactly like commit docs on the code channels.
+#
+# BUILD_NAME_KINDS maps an EXACT basename -> build-system tag (the language tag).
+# BUILD_EXT_KINDS maps a lowercase extension -> build-system tag. A file is a
+# build file if its basename hits BUILD_NAME_KINDS OR its extension hits
+# BUILD_EXT_KINDS (basename wins on conflict).
+# --------------------------------------------------------------------------- #
+BUILD_NAME_KINDS: dict[str, str] = {
+    # CMake
+    "CMakeLists.txt": "cmake",
+    # Make
+    "Makefile": "make",
+    "GNUmakefile": "make",
+    "makefile": "make",
+    # Autotools
+    "configure": "autotools",
+    "configure.ac": "autotools",
+    "configure.in": "autotools",
+    "Makefile.am": "autotools",
+    "Makefile.in": "autotools",
+    # Bazel
+    "BUILD": "bazel",
+    "BUILD.bazel": "bazel",
+    "WORKSPACE": "bazel",
+    "WORKSPACE.bazel": "bazel",
+    "MODULE.bazel": "bazel",
+    # Meson
+    "meson.build": "meson",
+    "meson_options.txt": "meson",
+    # Ninja
+    "build.ninja": "ninja",
+    # compile_commands
+    "compile_commands.json": "compile_commands",
+    # Conan / vcpkg
+    "conanfile.txt": "conan",
+    "conanfile.py": "conan",
+    "vcpkg.json": "vcpkg",
+    # Docker (build env)
+    "Dockerfile": "dockerfile",
+}
+BUILD_EXT_KINDS: dict[str, str] = {
+    ".cmake": "cmake",
+    ".mk": "make",
+    ".m4": "autotools",
+    ".bzl": "bazel",
+    ".ninja": "ninja",
+    ".vcxproj": "msvc",
+    ".sln": "msvc",
+}
+# Cap the build slice to a sane share of corpus tokens so a giant build tree can
+# never dominate the LM corpus. Applied at discovery (see find_build_files).
+BUILD_FILE_SIZE_CAP = 500_000  # bytes; mirror find_cpp_files' per-file cap
+
+
+def classify_build_file(fname: str) -> str | None:
+    """Return the build-system tag for ``fname`` or None if it is not a build file.
+
+    Exact-basename match (CMakeLists.txt, Makefile, BUILD, ...) takes priority
+    over extension match (.cmake, .mk, .bzl, ...). conanfile.* is matched by the
+    explicit names above; no silent wildcard guessing (RULE #1: ONE clear path).
+    """
+    if fname in BUILD_NAME_KINDS:
+        return BUILD_NAME_KINDS[fname]
+    ext = os.path.splitext(fname)[1].lower()
+    if ext in BUILD_EXT_KINDS:
+        return BUILD_EXT_KINDS[ext]
+    return None
+
+
 # System/stdlib function prefixes (skip for dependency tracking)
 SYSTEM_PREFIXES = (
     'std::', 'boost::', '__builtin', '__', 'operator', 'printf', 'fprintf',
@@ -1020,6 +1095,39 @@ def find_cpp_files(
     return files
 
 
+def find_build_files(
+    project_dir: str,
+    extra_exclude_dirs: set[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Find build/compilation files. Sibling of ``find_cpp_files``.
+
+    Returns a list of ``(abs_path, build_kind)`` tuples so the build-system tag
+    (cmake/make/bazel/ninja/meson/...) is known at discovery time. Same
+    ``os.walk``/skip-dir/size-cap logic as ``find_cpp_files``. Note: build files
+    legitimately live under dirs that code discovery prunes (e.g. ``build/`` for
+    ``compile_commands.json``, ``third_party/`` for vendored CMake), so we do NOT
+    apply ``_DEFAULT_SKIP_DIRS`` here -- only ``.git`` and the caller's extra
+    excludes -- otherwise the richest platform signal (compile_commands.json in
+    ``build/``) would be silently dropped.
+    """
+    skip_dirs = {'.git'} | (extra_exclude_dirs or set())
+    files: list[tuple[str, str]] = []
+    for root, dirs, filenames in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in filenames:
+            build_kind = classify_build_file(fname)
+            if build_kind is None:
+                continue
+            filepath = os.path.join(root, fname)
+            try:
+                if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
+                    continue
+            except OSError:
+                continue
+            files.append((filepath, build_kind))
+    return files
+
+
 def load_compile_commands(project_dir: str) -> Optional[dict]:
     """Load compile_commands.json if available."""
     cc_path = find_compile_commands_file(project_dir)
@@ -1653,6 +1761,99 @@ def build_enriched_doc(
 
 
 # --------------------------------------------------------------------------- #
+# Build-file doc emission (ADDITIVE).
+#
+# A build file is emitted as a 'build' enriched doc with the SAME dict shape as
+# build_enriched_doc, but: full raw text; structure_ids ALL set to BUILD_KIND=9
+# (extends the 0-8 code-kind vocab); EMPTY call/type/symbol graph (correct --
+# build files are not C++, like commit docs on the code channels); a doc_type of
+# 'build'; and a language_info whose primary_language is the build-system tag
+# (cmake/make/bazel/ninja/meson/...). platform_info / build_info carry the
+# derived A-platform signal where available. NO libclang involved.
+# --------------------------------------------------------------------------- #
+BUILD_KIND = 9  # structure_ids kind for build files (extends 0-8 code vocab)
+
+
+def build_build_doc(
+    filepath: str,
+    text: str,
+    build_kind: str,
+    *,
+    platform_info: dict | None = None,
+    build_info: dict | None = None,
+) -> dict:
+    """Build a single 'build' enriched doc from a build/compilation file.
+
+    FAIL LOUD (RULE #1): callers pass already-read text; an empty/whitespace-only
+    build file is a real signal failure and the caller raises rather than skip.
+    """
+    text_len = len(text)
+    structure_ids = [BUILD_KIND] * text_len
+    chunk_boundaries = [{
+        'start': 0,
+        'end': text_len,
+        'kind': BUILD_KIND,
+        'dep_level': 0,
+        'name': os.path.basename(filepath),
+    }]
+
+    # Per-file platform detection from the build text itself (additive to the
+    # repo-level build_info threaded in by process_project).
+    detected_platform: dict[str, object] | None = platform_info
+    if detected_platform is None:
+        import sys as _sys
+        _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _v5_dir = os.path.join(_parent, 'v5_gke_orchestrator')
+        if _v5_dir not in _sys.path:
+            _sys.path.insert(0, _v5_dir)
+        try:
+            _platform_detect = importlib.import_module("platform_detect")
+            _detect_plat = cast(PlatformDetectFn, getattr(_platform_detect, "detect_platforms"))
+            detected_platform = _detect_plat(text)
+        except ImportError:
+            detected_platform = None
+
+    # Language tag: the build-system family IS the primary_language so the model
+    # knows which build system this is. detect_language_info has no build-system
+    # output key, so we set primary_language directly (additive, rendered for
+    # free by language_info_to_prefix as "// language: primary=<build_kind> ...").
+    language_info = {
+        "primary_language": build_kind,
+        "primary_standard": (build_info or {}).get("standard"),
+        "primary_dialect": None,
+        "embedded_languages": [],
+        "signals": [f"build_file:{build_kind}"],
+        "detector_sources": ["build_file"],
+        "confidence": "high",
+    }
+
+    result: dict[str, object] = {
+        'text': text,
+        'doc_type': 'build',
+        'build_kind': build_kind,
+        'structure_ids': structure_ids,
+        'chunk_boundaries': chunk_boundaries,
+        # Build files carry NO call/type/symbol graph (not C++) -- empty/0, like
+        # commit docs on the code channels. This is correct, not a fallback.
+        'call_edges': [],
+        'type_edges': [],
+        'ast_depth': [],
+        'sibling_index': [],
+        'ast_node_type': [],
+        'symbol_ids': [],
+        'call_targets': [],
+        'type_refs': [],
+        'def_use': [],
+        'language_info': language_info,
+    }
+    if detected_platform:
+        result['platform_info'] = detected_platform
+    if build_info:
+        result['build_info'] = build_info
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Function-level tokenized-hash dedup (CORRECTED design).
 #
 # Per the user-specified ordering, dedup happens at the FUNCTION level, on the
@@ -1758,6 +1959,96 @@ def dedup_root_functions(
         "dropped_exact": dropped_exact,
         "dropped_near": dropped_near,
     }
+
+
+def emit_build_documents(
+    build_files: list[tuple[str, str]],
+    *,
+    default_build_info: dict | None,
+    compile_index: object | None = None,
+    tokenizer_path: str | None = None,
+    dedup_db: str | None = None,
+    dedup_near: bool = True,
+) -> list[dict]:
+    """Emit one 'build' doc per build file, with WHOLE-DOC tokenized-hash dedup.
+
+    Build-file dedup is at the WHOLE-DOC level (not function-level): a build file
+    whose tokenized text hash was already seen (this repo OR globally via the
+    shared db) is dropped, mirroring the commit-doc whole-doc dedup. Uses the
+    SAME shared DedupStore tables (token-id exact + near) so build docs dedup
+    against each other globally and resumably.
+
+    FAIL LOUD (RULE #1): a discovered build file that cannot be read/decoded or
+    tokenizes empty RAISES -- we never silently skip a build file.
+    """
+    docs: list[dict] = []
+    if not build_files:
+        return docs
+
+    tok = None
+    store = None
+    seen_local: set[bytes] = set()
+    if tokenizer_path:
+        tok = _load_cppmega_tokenizer(tokenizer_path)
+        if dedup_db:
+            from dedup_store import DedupStore
+            store = DedupStore(dedup_db, near=dedup_near, commit_every=2000)
+
+    dropped = 0
+    for filepath, build_kind in sorted(build_files):
+        # FAIL LOUD on unreadable build files -- do not paper over a broken file.
+        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        if not text or not text.strip():
+            raise RuntimeError(
+                f"build file {filepath} ({build_kind}) is empty/whitespace-only; "
+                f"refusing to emit an empty build doc (RULE #1: fail loud)"
+            )
+
+        per_file_build_info = dict(default_build_info) if default_build_info else {}
+        per_file_build_info["build_system"] = build_kind
+
+        if tok is not None:
+            token_ids = tok.encode(text)
+            if not token_ids:
+                raise RuntimeError(
+                    f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
+                    f"tokenizer/build-doc bug (RULE #1: fail loud)"
+                )
+            if store is not None:
+                if store.seen_exact_tokens(token_ids):
+                    dropped += 1
+                    continue
+                if dedup_near and store.seen_near_tokens(token_ids):
+                    dropped += 1
+                    continue
+            else:
+                from dedup_store import _sha1_tokens
+                h = _sha1_tokens(token_ids)
+                if h in seen_local:
+                    dropped += 1
+                    continue
+                seen_local.add(h)
+
+        docs.append(
+            build_build_doc(
+                filepath,
+                text,
+                build_kind,
+                build_info=per_file_build_info or None,
+            )
+        )
+
+    if store is not None:
+        store.commit()
+        store.close()
+
+    print(
+        f"  Build docs: emitted={len(docs)} dropped_dup={dropped} "
+        f"(whole-doc tokenized-hash dedup)",
+        file=sys.stderr,
+    )
+    return docs
 
 
 def build_training_documents(
@@ -2027,10 +2318,12 @@ def process_project(
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(cpp_files)} C/C++ source files", file=sys.stderr)
 
-    if not cpp_files:
-        return []
+    # Discover build/compilation files (ADDITIVE; emitted as 'build' docs).
+    build_files = find_build_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    print(f"  Found {len(build_files)} build/compilation files", file=sys.stderr)
 
-    # Load or derive build context.
+    # Load or derive build context. Done unconditionally so build-only repos
+    # (no C/C++ at all) still get A-platform enrichment for their build docs.
     compile_db = load_compile_commands(project_dir)
     _platform_info, _raw_args, _compile_index = detect_build_context(project_dir)
     default_args = _sanitize_compile_args_for_clang(
@@ -2047,7 +2340,11 @@ def process_project(
 
     # Use parallel parsing for large projects
     effective_workers = min(parse_workers, max(1, len(cpp_files) // 100))
-    if effective_workers > 1 and len(cpp_files) > 200:
+    if not cpp_files:
+        # Build-only repo (no C/C++): skip libclang parsing entirely. Build docs
+        # are still emitted below so we do NOT silently drop the repo.
+        print("  No C/C++ sources -- emitting build docs only", file=sys.stderr)
+    elif effective_workers > 1 and len(cpp_files) > 200:
         print(f"  Using {effective_workers} parse workers", file=sys.stderr)
         chunk_size = max(50, len(cpp_files) // effective_workers)
         batches = []
@@ -2111,22 +2408,47 @@ def process_project(
         print(f"  Parsed {parsed} files ({errors} errors), "
               f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
 
-    # Build training documents
-    documents = build_training_documents(
-        index_obj,
-        max_tokens,
-        max_dep_depth,
-        enriched=enriched,
-        project_dir=project_dir,
-        compile_db=compile_db,
-        default_args=default_args,
-        default_build_info=default_build_info,
-        tokenizer_path=tokenizer_path,
-        dedup_db=dedup_db,
-        dedup_near=dedup_near,
-    )
+    # Build training documents (C/C++ code path -- unchanged).
+    documents: list = []
+    if cpp_files:
+        documents = build_training_documents(
+            index_obj,
+            max_tokens,
+            max_dep_depth,
+            enriched=enriched,
+            project_dir=project_dir,
+            compile_db=compile_db,
+            default_args=default_args,
+            default_build_info=default_build_info,
+            tokenizer_path=tokenizer_path,
+            dedup_db=dedup_db,
+            dedup_near=dedup_near,
+        )
     check_memory_limit(memory_limit_gb, label="index_project")
-    print(f"  Generated {len(documents)} training documents", file=sys.stderr)
+    print(f"  Generated {len(documents)} code training documents", file=sys.stderr)
+
+    # Emit build/compilation files as their own 'build' docs (ADDITIVE). Only in
+    # enriched mode: build docs are dict-shaped (structure_ids/language_info/
+    # platform_ids); plain-text mode would lose the build-system tag + sidecars.
+    if enriched and build_files:
+        build_docs = emit_build_documents(
+            build_files,
+            default_build_info=default_build_info,
+            compile_index=_compile_index,
+            tokenizer_path=tokenizer_path,
+            dedup_db=dedup_db,
+            dedup_near=dedup_near,
+        )
+        documents.extend(build_docs)
+        check_memory_limit(memory_limit_gb, label="index_project")
+    elif build_files and not enriched:
+        print(
+            "  WARN: build files found but --enriched not set; build docs are "
+            "enriched-only and were NOT emitted",
+            file=sys.stderr,
+        )
+
+    print(f"  Generated {len(documents)} total training documents", file=sys.stderr)
 
     stats = index_obj.stats()
     print(f"  Index stats: {stats}", file=sys.stderr)
