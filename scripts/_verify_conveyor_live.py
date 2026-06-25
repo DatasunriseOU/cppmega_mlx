@@ -169,40 +169,246 @@ def process(parquet, row_idx, forced_type=None):
     rec['_text'] = text; rec['_fmt'] = fmt; rec['_docstring'] = docstring; rec['_code'] = code
     return rec
 
-# ---- build sample plan ----
+# ---- build sample plan: TOKEN-MASS-STRATIFIED selection ----
+# Rationale: the conveyor writes length-bucketed parquet (1024/2048/4096/8192/16384).
+# The old "random.shuffle(files) then take the first-N CODE rows" oversampled the
+# numerous tiny 1024-bucket leaf docs and crowded out the large 4096+ dependency-pack
+# docs, so per-token side-channels (e.g. token_dep_levels) read artificially low
+# (~2.1%) — an artifact of WHICH rows were drawn, not of the data. Fix: enumerate
+# parquet per (type, length-bucket), compute each bucket's TOKEN-MASS (sum of
+# valid_token_count), allocate the N-sample budget across buckets PROPORTIONAL to
+# token-mass (so a 4096 dependency-pack bucket holding most of the corpus tokens
+# gets most of the samples), then draw rows uniformly at random within each bucket.
+# Per-type minimums keep CODE / COMMIT / BUILD all covered. READ-ONLY +
+# concurrent-writer tolerant (skip FileNotFoundError / ArrowInvalid, re-raise else).
 random.seed(1234)
 code_files = sorted(glob.glob(str(ROOT / 'outputs/reindexed/*/*.parquet')))
 commit_files = sorted(glob.glob(str(ROOT / 'outputs/reindexed_commits/*/*.parquet')))
 
+# Configurable total sample budget (default ~300), split across the three types by
+# token-mass share with per-type floors.
+N_TOTAL = int(os.environ.get('VERIFY_N', '300'))
+MIN_CODE = int(os.environ.get('VERIFY_MIN_CODE', '120'))
+MIN_COMMIT = int(os.environ.get('VERIFY_MIN_COMMIT', '70'))
+# BUILD-FILE rows are SPARSE in the C/C++ source corpus (build files are a tiny
+# fraction of all docs and live in the small length buckets). The BUILD floor is the
+# guaranteed minimum we MUST surface; it is found via a cheap head-prefilter scan
+# (see sample_type(prefilter=True)). Keep it modest + achievable for the live corpus.
+MIN_BUILD = int(os.environ.get('VERIFY_MIN_BUILD', '15'))
+
 samples = []
 skipped = []
 counts = collections.Counter()
-TARGET_COMMIT = 70; TARGET_BUILD = 30; TARGET_CODE = 110
+seen_keys = set()  # (parquet, row) guard against double-draw
 
-def iter_rows(files, want, type_filter):
-    got = 0
-    random.shuffle(files)
+def bucket_of(p):
+    return Path(p).parent.name
+
+def file_token_mass(p):
+    """Token-mass (sum of valid_token_count) + row count for a parquet, concurrent-safe.
+    Returns (n_rows, token_mass) or None if the file is mid-write (race)."""
+    try:
+        pf = pq.ParquetFile(p)
+        nrows = pf.metadata.num_rows
+        if nrows == 0:
+            return (0, 0)
+        col = pf.read(columns=['valid_token_count']).column('valid_token_count').to_pylist()
+        return (nrows, int(sum(v for v in col if v is not None)))
+    except (FileNotFoundError, ArrowInvalid) as e:
+        skipped.append((p, 'token_mass', type(e).__name__)); return None
+
+def enumerate_buckets(files):
+    """Group files by length-bucket; aggregate (rows, token_mass) per bucket.
+    Returns {bucket: {'files': [...], 'rows': int, 'mass': int}} (skips raced files)."""
+    buckets = {}
     for p in files:
-        if got >= want: break
+        tm = file_token_mass(p)
+        if tm is None:
+            continue
+        nrows, mass = tm
+        if nrows == 0:
+            continue
+        b = bucket_of(p)
+        d = buckets.setdefault(b, {'files': [], 'rows': 0, 'mass': 0})
+        d['files'].append((p, nrows, mass)); d['rows'] += nrows; d['mass'] += mass
+    return buckets
+
+def allocate_by_mass(buckets, budget):
+    """Allocate `budget` samples across buckets proportional to token-mass.
+    Largest-remainder rounding; never allocate more than a bucket has rows."""
+    total_mass = sum(d['mass'] for d in buckets.values())
+    if total_mass <= 0 or budget <= 0:
+        return {b: 0 for b in buckets}
+    raw = {b: budget * d['mass'] / total_mass for b, d in buckets.items()}
+    alloc = {b: min(int(raw[b]), buckets[b]['rows']) for b in buckets}
+    # distribute leftover by largest fractional remainder (respecting row caps)
+    leftover = budget - sum(alloc.values())
+    order = sorted(buckets, key=lambda b: (raw[b] - int(raw[b])), reverse=True)
+    i = 0
+    while leftover > 0 and order:
+        b = order[i % len(order)]
+        if alloc[b] < buckets[b]['rows']:
+            alloc[b] += 1; leftover -= 1
+        else:
+            order.remove(b); i -= 1
+            if not order: break
+        i += 1
+    return alloc
+
+def classify_head(ids):
+    """CHEAP type classification from the 120-token head only (no clang-format / compile
+    probe). Mirrors process()'s classification. Returns 'COMMIT'/'BUILD-FILE'/'CODE'."""
+    head = tok.decode(ids[:120])
+    if PRE_MARK in head:
+        return 'COMMIT'
+    m = LANG_RE.search(head)
+    prim = m.group(1).lower() if m else None
+    if prim is not None and prim in BUILD_LANGS:
+        return 'BUILD-FILE'
+    return 'CODE'
+
+def collect_sparse_floor(files, type_filter, floor):
+    """DETERMINISTIC enumeration scan to satisfy a per-type FLOOR for a SPARSE type
+    (e.g. BUILD-FILE: ~0.2% of rows). Random sampling with replacement is hopeless for
+    needles in a haystack, so we read each parquet's input_ids column ONCE, cheaply
+    head-classify every row (classify_head), and run the expensive process() ONLY on
+    rows whose head matches `type_filter`, until `floor` are collected. Rows are visited
+    in a fixed (shuffled-once) order for reproducibility. Concurrent-write tolerant.
+    Returns number collected."""
+    got = 0
+    flist = list(files); random.shuffle(flist)
+    for p in flist:
+        if got >= floor:
+            break
         try:
-            nrows = pq.ParquetFile(p).metadata.num_rows
+            col = pq.read_table(p, columns=['input_ids']).column('input_ids')
+            nrows = len(col)
         except (FileNotFoundError, ArrowInvalid) as e:
-            skipped.append((p, type(e).__name__)); continue
+            skipped.append((p, 'sparse_scan', type(e).__name__)); continue
         order = list(range(nrows)); random.shuffle(order)
         for ri in order:
-            if got >= want: break
+            if got >= floor:
+                break
+            key = (p, ri)
+            if key in seen_keys:
+                continue
+            try:
+                ids = list(col[ri].as_py())
+            except (FileNotFoundError, ArrowInvalid) as e:
+                skipped.append((p, ri, 'sparse_head', type(e).__name__)); continue
+            if classify_head(ids) != type_filter:
+                continue  # cheap reject, no full process()
             try:
                 rec = process(p, ri)
             except (FileNotFoundError, ArrowInvalid) as e:
                 skipped.append((p, ri, type(e).__name__)); continue
-            if type_filter and rec['type'] != type_filter:
+            if rec['type'] != type_filter:
                 continue
+            seen_keys.add(key)
             samples.append(rec); counts[rec['type']] += 1; got += 1
-            yield rec
+    return got
 
-list(iter_rows(commit_files[:], TARGET_COMMIT, 'COMMIT'))
-list(iter_rows(code_files[:], TARGET_BUILD, 'BUILD-FILE'))
-list(iter_rows(code_files[:], TARGET_CODE, 'CODE'))
+def draw_bucket(bucket_files, want, type_filter, max_attempts_mult=8):
+    """Draw up to `want` rows of `type_filter` from a bucket's files, weighted across
+    files by token-mass, rows uniform-random within a file. Concurrent-safe.
+    Returns number drawn. Used for ABUNDANT types (CODE/COMMIT) where uniform-random
+    draws hit the wanted type almost every attempt. SPARSE types (BUILD-FILE) instead
+    use collect_sparse_floor (enumeration), since random draws can't find needles."""
+    got = 0
+    if want <= 0 or not bucket_files:
+        return 0
+    fmass = [m for (_p, _n, m) in bucket_files]
+    fnames = [p for (p, _n, _m) in bucket_files]
+    if sum(fmass) <= 0:
+        return 0
+    attempts = 0
+    max_attempts = want * max_attempts_mult + 50
+    while got < want and attempts < max_attempts:
+        attempts += 1
+        p = random.choices(fnames, weights=fmass, k=1)[0]
+        try:
+            nrows = pq.ParquetFile(p).metadata.num_rows
+        except (FileNotFoundError, ArrowInvalid) as e:
+            skipped.append((p, 'draw', type(e).__name__)); continue
+        if nrows == 0:
+            continue
+        ri = random.randrange(nrows)
+        key = (p, ri)
+        if key in seen_keys:
+            continue
+        try:
+            rec = process(p, ri)
+        except (FileNotFoundError, ArrowInvalid) as e:
+            skipped.append((p, ri, type(e).__name__)); continue
+        if type_filter and rec['type'] != type_filter:
+            continue
+        seen_keys.add(key)
+        samples.append(rec); counts[rec['type']] += 1; got += 1
+    return got
+
+def sample_type(files, budget, type_filter, floor=0):
+    """Token-mass-stratified draw across length buckets for an ABUNDANT type.
+
+    Allocates `budget` samples across length buckets PROPORTIONAL to token-mass, then
+    draws rows uniformly at random within each bucket (representative-by-token-mass).
+    `floor`: if >0, this many samples of `type_filter` MUST be found or we RAISE
+    (RULE #1 fail-loud: a per-type minimum that silently goes unmet is forbidden)."""
+    buckets = enumerate_buckets(files)
+    if not buckets:
+        if floor > 0:
+            raise RuntimeError(f"sample_type({type_filter}): NO parquet buckets found "
+                               f"for {files[:2]}... but floor={floor} required")
+        return 0
+    alloc = allocate_by_mass(buckets, budget)
+    total = 0
+    for b, d in sorted(buckets.items(), key=lambda kv: kv[1]['mass'], reverse=True):
+        total += draw_bucket(d['files'], alloc.get(b, 0), type_filter)
+    # Top up from the highest-mass buckets if a bucket ran short on the wanted type.
+    if total < budget:
+        for b, d in sorted(buckets.items(), key=lambda kv: kv[1]['mass'], reverse=True):
+            if total >= budget:
+                break
+            total += draw_bucket(d['files'], budget - total, type_filter)
+    if floor > 0 and total < floor:
+        raise RuntimeError(
+            f"sample_type({type_filter}): per-type floor NOT met "
+            f"(got {total} < floor {floor}) after mass-stratified draw across "
+            f"{sum(d['rows'] for d in buckets.values())} rows — investigate "
+            f"(do NOT silently lower the floor).")
+    return total
+
+# Token-mass share between CODE-stream (code+build live in outputs/reindexed) and the
+# COMMIT-stream (outputs/reindexed_commits). Split the global budget by their share,
+# then enforce per-type floors. CODE and BUILD-FILE both come from the CODE stream.
+code_buckets = enumerate_buckets(code_files)
+commit_buckets = enumerate_buckets(commit_files)
+code_mass = sum(d['mass'] for d in code_buckets.values())
+commit_mass = sum(d['mass'] for d in commit_buckets.values())
+grand_mass = max(code_mass + commit_mass, 1)
+
+# COMMIT budget: mass-share of the global N, floored at MIN_COMMIT.
+commit_budget = max(MIN_COMMIT, round(N_TOTAL * commit_mass / grand_mass))
+# Remaining budget goes to the CODE stream (CODE + BUILD-FILE), with floors.
+code_stream_budget = max(MIN_CODE + MIN_BUILD, N_TOTAL - commit_budget)
+build_budget = MIN_BUILD
+code_budget = max(MIN_CODE, code_stream_budget - build_budget)
+
+# COMMIT (own stream, abundant -> mass-stratified random draw, floor-checked).
+sample_type(commit_files[:], commit_budget, 'COMMIT', floor=MIN_COMMIT)
+# BUILD-FILE (sparse -> deterministic enumeration scan over the CODE stream to
+# guarantee the floor; RAISE if genuinely unmet). Drawn BEFORE CODE so seen_keys
+# excludes them from the CODE pass.
+build_got = collect_sparse_floor(code_files[:], 'BUILD-FILE', MIN_BUILD)
+if build_got < MIN_BUILD:
+    raise RuntimeError(
+        f"BUILD-FILE floor NOT met (got {build_got} < floor {MIN_BUILD}) after a full "
+        f"deterministic enumeration scan of the CODE stream — the live corpus does not "
+        f"yet contain {MIN_BUILD} build-classified rows (cmake/make/bazel/...). "
+        f"Investigate the conveyor's build-file ingestion; do NOT silently lower the "
+        f"floor (RULE #1: fail loud).")
+# CODE (abundant -> token-mass-stratified random draw; this is the channel-fill
+# representativeness path that kills the old first-N-shuffled artifact).
+sample_type(code_files[:], code_budget, 'CODE', floor=MIN_CODE)
 
 # ---- dedup: query db + spot-check duplicate bodies ----
 dedup_info = {}
@@ -269,9 +475,28 @@ def agg(typ):
         'primary_langs': dict(collections.Counter(s['primary_lang'] for s in ss)),
     }
 
+def bucket_report(buckets):
+    return {b: {'files': len(d['files']), 'rows': d['rows'], 'token_mass': d['mass']}
+            for b, d in sorted(buckets.items())}
+
+sampling_plan = {
+    'method': ('CODE/COMMIT: token-mass-stratified across length buckets (budget '
+               'allocated per bucket by sum(valid_token_count), rows drawn uniformly '
+               'within bucket). BUILD-FILE: deterministic enumeration scan (sparse '
+               'type) to guarantee the per-type floor.'),
+    'N_total': N_TOTAL,
+    'per_type_floors': {'CODE': MIN_CODE, 'COMMIT': MIN_COMMIT, 'BUILD-FILE': MIN_BUILD},
+    'budgets': {'CODE': code_budget, 'BUILD-FILE': build_budget, 'COMMIT': commit_budget},
+    'code_stream_token_mass': code_mass,
+    'commit_stream_token_mass': commit_mass,
+    'code_buckets': bucket_report(code_buckets),
+    'commit_buckets': bucket_report(commit_buckets),
+}
+
 report = {
     'total_samples': len(samples),
     'counts': dict(counts),
+    'sampling_plan': sampling_plan,
     'skipped_race': skipped,
     'per_type': {t: agg(t) for t in ('CODE', 'COMMIT', 'BUILD-FILE')},
     'dedup': dedup_info,
