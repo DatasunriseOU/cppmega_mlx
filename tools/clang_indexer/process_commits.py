@@ -1537,6 +1537,27 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# OUR CppMegaTokenizer (with <SPACE>/<NL> whitespace canonicalization) used ONLY
+# for the dedup hash, so the commit-doc hash is sha1(canonical token_ids). This
+# is distinct from the plain `tokenizers.Tokenizer` above used for token COUNTS.
+_dedup_tokenizer = None
+
+
+def _load_dedup_tokenizer(path):
+    """Load OUR CppMegaTokenizer for dedup hashing. FAIL LOUD (RULE #1)."""
+    global _dedup_tokenizer
+    if _dedup_tokenizer is not None:
+        return _dedup_tokenizer
+    if not path:
+        raise ValueError("--dedup-db requires --tokenizer-path for the dedup hash")
+    _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+    _dedup_tokenizer = load_cppmega_tokenizer(path)
+    return _dedup_tokenizer
+
+
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
@@ -1633,8 +1654,18 @@ def process_jsonl_file(
     max_dep_depth: int,
     memory_limit_gb: float,
     build_context: BuildContextResolver | None = None,
+    dedup_store=None,
+    dedup_tokenizer=None,
+    dedup_near: bool = True,
 ) -> dict:
-    """Process a JSONL input file, writing enriched docs to output."""
+    """Process a JSONL input file, writing enriched docs to output.
+
+    A commit is an ATOMIC change-unit: each commit DOC is deduped by the
+    tokenized hash of the WHOLE doc (drops identical commits, e.g. cherry-picks),
+    keeping route-by-fit downstream. When ``dedup_store`` is given the dedup is
+    GLOBAL + resumable + cross-stream (shared SQLite with the code stream). When
+    absent, a per-file in-RAM md5 set is used.
+    """
     stats = {
         'records_read': 0,
         'documents_written': 0,
@@ -1675,11 +1706,21 @@ def process_jsonl_file(
                 continue
 
             for doc in docs:
-                doc_hash = hashlib.md5(doc['text'].encode()).hexdigest()
-                if doc_hash in seen_hashes:
-                    stats['records_skipped'] += 1
-                    continue
-                seen_hashes.add(doc_hash)
+                if dedup_store is not None:
+                    # CANONICAL: tokenized-hash dedup of the WHOLE commit doc.
+                    token_ids = dedup_tokenizer.encode(doc['text'])
+                    if dedup_store.seen_exact_tokens(token_ids):
+                        stats['records_skipped'] += 1
+                        continue
+                    if dedup_near and dedup_store.seen_near_tokens(token_ids):
+                        stats['records_skipped'] += 1
+                        continue
+                else:
+                    doc_hash = hashlib.md5(doc['text'].encode()).hexdigest()
+                    if doc_hash in seen_hashes:
+                        stats['records_skipped'] += 1
+                        continue
+                    seen_hashes.add(doc_hash)
                 output_file.write(json.dumps(doc, ensure_ascii=False) + '\n')
                 stats['documents_written'] += 1
 
@@ -1743,6 +1784,17 @@ def main() -> int:
         '--memory-limit-gb', type=float, default=10.0,
         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).',
     )
+    parser.add_argument(
+        '--dedup-db', default=None,
+        help='Path to the SHARED global dedup SQLite store. When set, whole commit '
+             'DOCS are deduped by their tokenized hash (exact+near) GLOBALLY across '
+             'repos AND across the code+commit streams (fail-loud, no fallback). '
+             'Requires --tokenizer-path. When absent, a per-file in-RAM md5 set.',
+    )
+    parser.add_argument(
+        '--no-near-dedup', action='store_true',
+        help='Disable MinHash-LSH near dedup for commit docs (exact-only).',
+    )
     args = parser.parse_args()
     start_memory_guard(args.memory_limit_gb, label="process_commits")
 
@@ -1771,6 +1823,28 @@ def main() -> int:
         print(f"  tokenizer: {args.tokenizer_path}", file=sys.stderr)
     else:
         print("  tokenizer: estimate (~4 bytes/token)", file=sys.stderr)
+
+    # Commit-doc tokenized-hash dedup store (shared, global, cross-stream).
+    # FAIL LOUD (RULE #1): a bad db / missing datasketch / missing tokenizer
+    # raises here before any processing -- no silent dup pass.
+    dedup_store = None
+    dedup_tokenizer = None
+    dedup_near = not args.no_near_dedup
+    if args.dedup_db:
+        if not args.tokenizer_path:
+            print("ERROR: --dedup-db requires --tokenizer-path", file=sys.stderr)
+            return 1
+        _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from dedup_store import DedupStore
+        dedup_store = DedupStore(args.dedup_db, near=dedup_near, commit_every=1000)
+        dedup_tokenizer = _load_dedup_tokenizer(args.tokenizer_path)
+        print(f"  dedup: GLOBAL commit-doc store at {args.dedup_db} "
+              f"(exact{'+near' if dedup_near else ''}, tokenized hash)", file=sys.stderr)
+    else:
+        print("  dedup: per-file in-RAM md5 set (no --dedup-db)", file=sys.stderr)
 
     clang_index = Index.create()
     build_context = BuildContextResolver(repo_root=args.repo_root, repo_dir=args.repo_dir)
@@ -1807,6 +1881,9 @@ def main() -> int:
                         args.doc_format, args.max_dep_depth,
                         args.memory_limit_gb,
                         build_context=build_context,
+                        dedup_store=dedup_store,
+                        dedup_tokenizer=dedup_tokenizer,
+                        dedup_near=dedup_near,
                     )
 
                     for k in total_stats:
@@ -1817,6 +1894,9 @@ def main() -> int:
             if shm_tmpdir:
                 import shutil
                 shutil.rmtree(shm_tmpdir, ignore_errors=True)
+
+    if dedup_store is not None:
+        dedup_store.close()
 
     elapsed = time.time() - t0
     print(f"\nTotal: {total_stats}", file=sys.stderr)

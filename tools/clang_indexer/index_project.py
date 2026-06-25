@@ -1652,6 +1652,114 @@ def build_enriched_doc(
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Function-level tokenized-hash dedup (CORRECTED design).
+#
+# Per the user-specified ordering, dedup happens at the FUNCTION level, on the
+# function AFTER OUR TOKENIZER (the whitespace sentinels canonicalize format),
+# and BEFORE the dependency grouping. The dedup decides which functions get
+# emitted as their OWN ROOT document: a function whose tokenized hash was already
+# seen (in this repo OR globally via the shared db, including as a dependency of
+# an earlier kept root) does NOT get a duplicate standalone root doc. CRUCIALLY,
+# we do NOT delete deduped functions from index.functions -- collect_transitive_
+# deps must still resolve them so each distinct kept root embeds its full
+# dependency chain (a shared helper legitimately appears as context inside two
+# different roots' docs; it just is not emitted twice as a standalone root).
+# --------------------------------------------------------------------------- #
+_CPPMEGA_TOKENIZER = None
+
+
+def _load_cppmega_tokenizer(tokenizer_path: str):
+    """Load (and memoize) OUR CppMegaTokenizer. FAIL LOUD on failure (RULE #1)."""
+    global _CPPMEGA_TOKENIZER
+    if _CPPMEGA_TOKENIZER is not None:
+        return _CPPMEGA_TOKENIZER
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+    _CPPMEGA_TOKENIZER = load_cppmega_tokenizer(tokenizer_path)
+    return _CPPMEGA_TOKENIZER
+
+
+def dedup_root_functions(
+    index: ProjectIndex,
+    *,
+    tokenizer_path: str,
+    dedup_db: str | None,
+    near: bool = True,
+) -> tuple[set[str], dict[str, int]]:
+    """Decide which root functions are duplicates (drop their standalone doc).
+
+    For each function definition we compute ``token_ids = tokenizer.encode(text)``
+    and test against:
+      * exact: ``sha1(token_ids)`` (identical-after-tokenizer), and
+      * near: MinHash-LSH @0.7 over token-id 5-gram shingles.
+
+    A function whose hash was already seen is marked as a DROPPED ROOT: the
+    grouping loop will not emit a standalone document for it. Functions stay in
+    ``index.functions`` untouched so ``collect_transitive_deps`` still resolves
+    them as dependencies of OTHER kept roots (so the shared canonical copy is
+    embedded in each dependent root's doc -- no duplicate STANDALONE docs, but
+    dependency chains stay intact).
+
+    When ``dedup_db`` is given the dedup is GLOBAL + resumable + cross-stream via
+    the shared SQLite ``DedupStore`` (fail-loud if it cannot open / datasketch is
+    missing). When absent, a per-repo in-RAM exact set is used (no near).
+
+    Returns (dropped_root_qnames, {dropped_exact, dropped_near, kept_roots}).
+    """
+    tok = _load_cppmega_tokenizer(tokenizer_path)
+
+    store = None
+    seen_local: set[bytes] = set()
+    if dedup_db:
+        # FAIL LOUD: open failure / missing datasketch raises inside DedupStore.
+        from dedup_store import DedupStore  # noqa: F401
+        store = DedupStore(dedup_db, near=near, commit_every=2000)
+
+    dropped_roots: set[str] = set()
+    dropped_exact = 0
+    dropped_near = 0
+    kept_roots = 0
+
+    # Deterministic order: by (file, line) so the canonical kept copy is stable
+    # across runs (important for resumability and reproducible packs).
+    items = sorted(
+        index.functions.items(),
+        key=lambda kv: (kv[1].file or "", kv[1].line or 0, kv[0]),
+    )
+    for qname, func in items:
+        if not (func.is_definition and func.text):
+            continue
+        token_ids = tok.encode(func.text)
+        if store is not None:
+            if store.seen_exact_tokens(token_ids):
+                dropped_exact += 1
+                dropped_roots.add(qname)
+                continue
+            if near and store.seen_near_tokens(token_ids):
+                dropped_near += 1
+                dropped_roots.add(qname)
+                continue
+        else:
+            from dedup_store import _sha1_tokens
+            h = _sha1_tokens(token_ids)
+            if h in seen_local:
+                dropped_exact += 1
+                dropped_roots.add(qname)
+                continue
+            seen_local.add(h)
+        kept_roots += 1
+
+    if store is not None:
+        store.commit()
+        store.close()
+
+    return dropped_roots, {
+        "kept_roots": kept_roots,
+        "dropped_exact": dropped_exact,
+        "dropped_near": dropped_near,
+    }
+
+
 def build_training_documents(
     index: ProjectIndex,
     max_tokens: int = 16384,
@@ -1662,18 +1770,47 @@ def build_training_documents(
     compile_db: dict | None = None,
     default_args: list[str] | None = None,
     default_build_info: dict | None = None,
+    tokenizer_path: str | None = None,
+    dedup_db: str | None = None,
+    dedup_near: bool = True,
 ) -> list:
     """Build training documents with bottom-up dependency ordering.
 
     Returns list[str] when enriched=False, list[dict] when enriched=True.
+
+    When ``tokenizer_path`` is given, FUNCTION-LEVEL tokenized-hash dedup runs
+    BEFORE grouping (corrected design): a function whose tokenized hash was
+    already seen does not get its OWN standalone root document, but it stays in
+    the index so it can still be embedded as a DEPENDENCY of other kept roots.
     """
     documents: list[str | dict[str, object]] = []
-    seen_hashes: set[str] = set()
 
     index.compute_dep_levels()
 
+    # Function-level dedup BEFORE grouping (corrected design). Requires OUR
+    # tokenizer; when no tokenizer_path is supplied we skip it (legacy callers /
+    # unit tests) and rely on the caller's higher-level dedup.
+    dropped_roots: set[str] = set()
+    if tokenizer_path:
+        dropped_roots, stats = dedup_root_functions(
+            index,
+            tokenizer_path=tokenizer_path,
+            dedup_db=dedup_db,
+            near=dedup_near,
+        )
+        print(
+            f"  Function-level dedup: kept_roots={stats['kept_roots']} "
+            f"dropped_exact={stats['dropped_exact']} "
+            f"dropped_near={stats['dropped_near']}",
+            file=sys.stderr,
+        )
+
     for qname, func in index.functions.items():
         if not func.is_definition:
+            continue
+        # Skip emitting a STANDALONE root doc for a deduped function (its hash was
+        # already seen). It remains resolvable as a dependency of other roots.
+        if qname in dropped_roots:
             continue
 
         # Collect transitive deps
@@ -1713,11 +1850,10 @@ def build_training_documents(
         if tokens < 20:
             continue
 
-        # Deduplicate
-        doc_hash = hashlib.md5(doc.encode()).hexdigest()
-        if doc_hash in seen_hashes:
-            continue
-        seen_hashes.add(doc_hash)
+        # NOTE: doc-level md5 dedup removed (corrected design). Dedup now happens
+        # at the FUNCTION level on the tokenized hash, BEFORE grouping, via
+        # dedup_root_functions above -- duplicate functions are not emitted as
+        # standalone roots, so no second-pass doc dedup is needed here.
 
         if enriched:
             # Build parts_info for enriched output. Thread repo-level build
@@ -1876,6 +2012,9 @@ def process_project(
     enriched: bool = False,
     extra_exclude_dirs: set[str] | None = None,
     memory_limit_gb: float = 10.0,
+    tokenizer_path: str | None = None,
+    dedup_db: str | None = None,
+    dedup_near: bool = True,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs."""
     project_dir = os.path.abspath(project_dir)
@@ -1982,6 +2121,9 @@ def process_project(
         compile_db=compile_db,
         default_args=default_args,
         default_build_info=default_build_info,
+        tokenizer_path=tokenizer_path,
+        dedup_db=dedup_db,
+        dedup_near=dedup_near,
     )
     check_memory_limit(memory_limit_gb, label="index_project")
     print(f"  Generated {len(documents)} training documents", file=sys.stderr)
@@ -2022,6 +2164,18 @@ def main() -> int:
                         help='Comma-separated extra directory names to exclude from file discovery')
     parser.add_argument('--memory-limit-gb', type=float, default=10.0,
                         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')
+    parser.add_argument('--dedup-db', type=str, default=None,
+                        help='Path to the shared global dedup SQLite store. When set, '
+                             'FUNCTION-LEVEL exact+near duplicates (on the tokenized '
+                             'hash, BEFORE grouping) are dropped GLOBALLY across all '
+                             'repos/streams (no in-RAM fallback). When absent, a '
+                             'per-repo in-RAM exact set is used.')
+    parser.add_argument('--tokenizer-path', type=str, default=None,
+                        help='Path to OUR tokenizer.json. REQUIRED to enable the '
+                             'function-level tokenized-hash dedup (corrected design). '
+                             'Without it, no function-level dedup runs.')
+    parser.add_argument('--no-near-dedup', action='store_true',
+                        help='Disable MinHash-LSH near dedup (exact-only).')
 
     args = parser.parse_args()
     start_memory_guard(args.memory_limit_gb, label="index_project")
@@ -2055,7 +2209,36 @@ def main() -> int:
     extra_exclude = set(args.exclude_dirs.split(',')) if args.exclude_dirs else None
 
     total_docs = 0
-    seen_hashes = set()
+    # CORRECTED design: dedup is FUNCTION-LEVEL, on the tokenized hash, BEFORE
+    # grouping -- it happens inside process_project -> build_training_documents ->
+    # dedup_root_functions, backed by the shared global SQLite DedupStore at
+    # --dedup-db (cross-repo + cross-stream, fail-loud). There is NO second-pass
+    # doc-level dedup here. The per-process DedupStore opens against --dedup-db so
+    # the multi-project ProcessPoolExecutor mode dedups globally via SQLite WAL.
+    dedup_near = not args.no_near_dedup
+    if args.dedup_db:
+        if not args.tokenizer_path:
+            print(
+                "ERROR: --dedup-db requires --tokenizer-path (function-level "
+                "dedup hashes the tokenized function ids).",
+                file=sys.stderr,
+            )
+            return 1
+        # FAIL LOUD up front: open once here so a bad db / missing datasketch
+        # crashes before any heavy parsing (RULE #1). Closed immediately; each
+        # process_project reopens against the same WAL db.
+        from dedup_store import DedupStore
+        DedupStore(args.dedup_db, near=dedup_near, commit_every=1000).close()
+        print(
+            f"Dedup: GLOBAL function-level store at {args.dedup_db} "
+            f"(exact{'+near' if dedup_near else ''}, tokenized hash)",
+            file=sys.stderr,
+        )
+    elif args.tokenizer_path:
+        print("Dedup: per-repo in-RAM function-level exact set (no --dedup-db)",
+              file=sys.stderr)
+    else:
+        print("Dedup: DISABLED (no --tokenizer-path given)", file=sys.stderr)
 
     append_mode = getattr(args, 'append', False)
     enriched = args.enriched
@@ -2067,7 +2250,8 @@ def main() -> int:
                     executor.submit(
                         process_project, pd, args.max_tokens, args.max_dep_depth,
                         args.parse_workers, enriched, extra_exclude,
-                        args.memory_limit_gb,
+                        args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
+                        dedup_near,
                     ): pd
                     for pd in project_dirs
                 }
@@ -2076,14 +2260,6 @@ def main() -> int:
                     try:
                         docs = future.result()
                         for doc in docs:
-                            if enriched:
-                                doc_text = doc['text']
-                            else:
-                                doc_text = doc
-                            doc_hash = hashlib.md5(doc_text.encode()).hexdigest()
-                            if doc_hash in seen_hashes:
-                                continue
-                            seen_hashes.add(doc_hash)
                             if enriched:
                                 json.dump(doc, out)
                             else:
@@ -2098,16 +2274,9 @@ def main() -> int:
                 try:
                     docs = process_project(pd, args.max_tokens, args.max_dep_depth,
                                            args.parse_workers, enriched, extra_exclude,
-                                           args.memory_limit_gb)
+                                           args.memory_limit_gb, args.tokenizer_path,
+                                           args.dedup_db, dedup_near)
                     for doc in docs:
-                        if enriched:
-                            doc_text = doc['text']
-                        else:
-                            doc_text = doc
-                        doc_hash = hashlib.md5(doc_text.encode()).hexdigest()
-                        if doc_hash in seen_hashes:
-                            continue
-                        seen_hashes.add(doc_hash)
                         if enriched:
                             json.dump(doc, out)
                         else:

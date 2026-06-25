@@ -359,6 +359,8 @@ def process_range(
     end_idx: int,
     lengths_sorted: Sequence[int],
     repo_work: Path,
+    dedup_db: Path | None = None,
+    dedup_near: bool = True,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
     rkey = range_key(repo, start_idx)
@@ -369,7 +371,8 @@ def process_range(
         n_records = slice_records_jsonl(records_jsonl, start_idx, end_idx, slice_jsonl)
 
         # process_commits needs the source tree for include resolution.
-        enriched = stage_index_commits(rkey, [slice_jsonl], rwork, repo_dir, None)
+        enriched = stage_index_commits(rkey, [slice_jsonl], rwork, repo_dir, None,
+                                       dedup_db, dedup_near)
         tok = stage_materialize(rkey, enriched, rwork)
 
         route_dir = rwork / "routed"
@@ -409,6 +412,8 @@ def process_one_repo(
     token_budget: int | None,
     cumulative: dict,
     keep_temp: bool,
+    dedup_db: Path | None = None,
+    dedup_near: bool = True,
 ) -> int:
     """Extract one repo, fan its ranges to the pool, wait for completion.
 
@@ -451,6 +456,7 @@ def process_one_repo(
             fut = pool.submit(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
+                dedup_db, dedup_near,
             )
             futures[fut] = (start, end)
 
@@ -508,6 +514,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--repo-path", action="append", default=[],
                    help="Process this local git repo directly (skip tarball). "
                         "Repeatable. The repo basename is the manifest/output key.")
+    p.add_argument("--dedup-db", default=None,
+                   help="Path to the SHARED global dedup SQLite store. Pass the SAME "
+                        "path as streaming_reindex.py so commit DOCS dedup (by "
+                        "tokenized hash) against the code stream too (drops identical "
+                        "commits / cherry-picks). Fail-loud, no fallback.")
+    p.add_argument("--no-near-dedup", action="store_true",
+                   help="Disable MinHash-LSH near dedup (exact-only).")
     return p.parse_args(argv)
 
 
@@ -528,6 +541,19 @@ def main(argv: list[str]) -> int:
     COMMIT_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     for tl in lengths_sorted:
         (COMMIT_OUTPUT_ROOT / str(tl)).mkdir(parents=True, exist_ok=True)
+
+    # Shared global dedup db (SAME path as the code stream for cross-stream dedup).
+    # FAIL LOUD up front (RULE #1): bad path / missing datasketch crashes now.
+    dedup_db = Path(args.dedup_db) if args.dedup_db else None
+    dedup_near = not args.no_near_dedup
+    if dedup_db is not None:
+        sys.path.insert(0, str(MLX_ROOT / "tools" / "clang_indexer"))
+        from dedup_store import DedupStore  # noqa: E402
+        dedup_db.parent.mkdir(parents=True, exist_ok=True)
+        DedupStore(str(dedup_db), near=dedup_near, commit_every=1000).close()
+        _log(f"Dedup: SHARED global commit-doc store at {dedup_db} "
+             f"(exact{'+near' if dedup_near else ''}, tokenized hash)")
+
     manifest = Manifest.load(COMMIT_MANIFEST)
     manifest_lock = threading.Lock()
     resume = not args.no_resume
@@ -582,6 +608,7 @@ def main(argv: list[str]) -> int:
                     repo, repo_dir, lengths_sorted, args.range_size,
                     work_root, pool, manifest, manifest_lock, resume,
                     args.token_budget, cumulative, args.keep_temp,
+                    dedup_db, dedup_near,
                 )
                 ranges_done += done
                 processed_repos += 1
