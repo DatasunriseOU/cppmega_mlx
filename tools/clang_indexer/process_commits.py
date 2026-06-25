@@ -180,16 +180,25 @@ def changed_lines(hunks: list[HunkRange], use_old: bool) -> set[int]:
     return lines
 
 
-def compute_new_line_edit_ops(diff: str) -> dict[int, int]:
-    """Map 1-based new-file lines to edit operation IDs from a unified diff."""
+def compute_new_line_edit_ops(diff: str) -> tuple[dict[int, int], dict[int, int]]:
+    """Map 1-based new-file lines to (edit-op id, 0-based hunk index).
+
+    Returns ``(ops, line_hunk)`` where ``ops[new_line] -> EDIT_OP_*`` and
+    ``line_hunk[new_line] -> hunk_index`` (0 for the first ``@@`` hunk, 1 for the
+    second, ...). The hunk index lets the per-token ``hunk_id`` carry which edit
+    region a token belongs to, not just a binary changed flag.
+    """
     ops: dict[int, int] = {}
+    line_hunk: dict[int, int] = {}
     current_new_line: int | None = None
     pending_removes = 0
+    hunk_idx = -1
     for line in diff.splitlines():
         match = _HUNK_RE.match(line)
         if match:
             current_new_line = int(match.group(3))
             pending_removes = 0
+            hunk_idx += 1
             continue
         if current_new_line is None:
             continue
@@ -202,11 +211,21 @@ def compute_new_line_edit_ops(diff: str) -> dict[int, int]:
                 pending_removes -= 1
             else:
                 ops[current_new_line] = EDIT_OP_INSERTED
+            line_hunk[current_new_line] = hunk_idx
             current_new_line += 1
             continue
         pending_removes = 0
         current_new_line += 1
-    return ops
+    return ops, line_hunk
+
+
+def compute_old_line_hunk(hunks: list[HunkRange]) -> dict[int, int]:
+    """Map 1-based OLD-file lines to the 0-based hunk index that touches them."""
+    line_hunk: dict[int, int] = {}
+    for hunk_idx, h in enumerate(hunks):
+        for line_no in range(h.old_start, h.old_start + max(h.old_count, 1)):
+            line_hunk.setdefault(line_no, hunk_idx)
+    return line_hunk
 
 
 def _line_ranges_by_number(text: str) -> dict[int, tuple[int, int]]:
@@ -249,7 +268,7 @@ def _build_commit_temporal_metadata(
     text_len = len(full_text)
     change_mask_pre = [0] * text_len
     change_mask_post = [0] * text_len
-    hunk_id_per_char = [0] * text_len
+    hunk_id_per_char = [-1] * text_len  # -1 = unchanged/context (no hunk)
     edit_op_per_char = [EDIT_OP_CONTEXT] * text_len
 
     diff = str(record.get('diff', '') or '')
@@ -263,13 +282,18 @@ def _build_commit_temporal_metadata(
         }
 
     old_changed_lines = changed_lines(hunks, use_old=True)
-    new_line_ops = compute_new_line_edit_ops(diff)
+    new_line_ops, new_line_hunk = compute_new_line_edit_ops(diff)
+    old_line_hunk = compute_old_line_hunk(hunks)
     old_changed_ranges = _line_ranges_for_changed_functions(old_analysis, old_changed_lines)
     old_content = str(record.get('old_content', '') or '')
     new_content = str(record.get('new_content', '') or '')
     old_line_ranges = _line_ranges_by_number(str(record.get('old_content', '') or ''))
     new_line_ranges = _line_ranges_by_number(str(record.get('new_content', '') or ''))
+    # Build text->op and the CONSISTENT text->hunk map in one pass so any text
+    # marked changed also carries its hunk index (a changed line always has a
+    # hunk via compute_new_line_edit_ops).
     new_line_ops_by_text: dict[str, int] = {}
+    new_line_hunk_by_text: dict[str, int] = {}
     for line_no, (start, end) in new_line_ranges.items():
         stripped = new_content[start:end].strip()
         if not stripped:
@@ -278,10 +302,12 @@ def _build_commit_temporal_metadata(
         previous = new_line_ops_by_text.get(stripped)
         if previous is None or (previous == EDIT_OP_UNCHANGED and op != EDIT_OP_UNCHANGED):
             new_line_ops_by_text[stripped] = op
+            new_line_hunk_by_text[stripped] = new_line_hunk.get(line_no, -1)
 
-    def old_part_changed(part: str) -> bool:
+    def old_part_hunk(part: str) -> int:
+        """Hunk index of the first hunk overlapping a changed OLD part, else -1."""
         if not part.strip() or not old_changed_ranges:
-            return False
+            return -1
         for start_line, end_line in old_changed_ranges:
             start_end = old_line_ranges.get(start_line)
             end_end = old_line_ranges.get(end_line)
@@ -289,14 +315,23 @@ def _build_commit_temporal_metadata(
                 continue
             changed_text = old_content[start_end[0]:end_end[1]].strip()
             if changed_text and (part.strip() in changed_text or changed_text in part.strip()):
-                return True
-        return False
+                for ln in range(start_line, end_line + 1):
+                    if ln in old_line_hunk:
+                        return old_line_hunk[ln]
+                return -1
+        return -1
 
     def new_line_op(part_line: str) -> int:
         stripped = part_line.strip()
         if not stripped:
             return EDIT_OP_CONTEXT
         return new_line_ops_by_text.get(stripped, EDIT_OP_UNCHANGED)
+
+    def new_line_hunk_for(part_line: str) -> int:
+        stripped = part_line.strip()
+        if not stripped:
+            return -1
+        return new_line_hunk_by_text.get(stripped, -1)
 
     offset = 0
     for idx, part in enumerate(part_texts):
@@ -311,17 +346,26 @@ def _build_commit_temporal_metadata(
                 line_len = len(line)
                 op = new_line_op(line)
                 changed = int(op in (EDIT_OP_INSERTED, EDIT_OP_MODIFIED))
+                h_idx = new_line_hunk_for(line) if changed else -1
+                # RULE #1: a changed new line that maps to no hunk is a real
+                # inconsistency (op and hunk maps are built together), not a
+                # degraded value -> fail loud rather than emit a bogus id.
+                if changed and h_idx < 0:
+                    raise ValueError(
+                        f"process_commits: changed new line maps to no hunk in "
+                        f"{record.get('commit_hash')}:{record.get('filepath')}")
                 end = min(pos + line_len, text_len)
                 for char_idx in range(pos, end):
                     change_mask_post[char_idx] = changed
-                    hunk_id_per_char[char_idx] = 1 if changed else 0
+                    hunk_id_per_char[char_idx] = h_idx
                     edit_op_per_char[char_idx] = op
                 pos = end
         elif source_kind == 'o':
-            changed = int(old_part_changed(part))
+            h_idx = old_part_hunk(part)
+            changed = int(h_idx >= 0)
             for char_idx in range(offset, part_end):
                 change_mask_pre[char_idx] = changed
-                hunk_id_per_char[char_idx] = 1 if changed else 0
+                hunk_id_per_char[char_idx] = h_idx
                 edit_op_per_char[char_idx] = EDIT_OP_CONTEXT
         else:
             for char_idx in range(offset, part_end):
