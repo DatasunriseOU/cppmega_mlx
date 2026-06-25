@@ -71,6 +71,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     IS_MERGE_COMMIT_COLUMN,
     PARENT_COUNT_COLUMN,
     PARENT_HASHES_COLUMN,
+    PR_NUMBER_COLUMN,
     REPO_COLUMN,
     REPO_STABLE_ID_COLUMN,
     TIMESTAMP_COLUMN,
@@ -310,6 +311,7 @@ _SCHEMA = pa.schema([
     pa.field(FILEPATH_COLUMN, pa.string()),
     pa.field(COMMIT_HASH_COLUMN, pa.string()),
     pa.field(TIMESTAMP_COLUMN, pa.string()),
+    pa.field(PR_NUMBER_COLUMN, pa.int64()),
     pa.field(PARENT_HASHES_COLUMN, pa.list_(pa.string())),
     pa.field(PARENT_COUNT_COLUMN, pa.int32()),
     pa.field(IS_MERGE_COMMIT_COLUMN, pa.bool_()),
@@ -394,6 +396,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     filepaths = []
     commits = []
     timestamps = []
+    pr_numbers = []
     parent_hashes = []
     parent_counts = []
     is_merge_commits = []
@@ -515,6 +518,8 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         filepaths.append(row.get(FILEPATH_COLUMN, ""))
         commits.append(row.get(COMMIT_HASH_COLUMN, row.get("commit", "")))
         timestamps.append(row.get(TIMESTAMP_COLUMN, ""))
+        _pr = row.get(PR_NUMBER_COLUMN)
+        pr_numbers.append(int(_pr) if _pr not in (None, "", 0) else None)
         parent_hashes.append(row.get(PARENT_HASHES_COLUMN, []))
         parent_counts.append(row.get(PARENT_COUNT_COLUMN))
         is_merge_commits.append(row.get(IS_MERGE_COMMIT_COLUMN))
@@ -645,6 +650,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             FILEPATH_COLUMN: pa.array(filepaths, type=_SCHEMA.field(FILEPATH_COLUMN).type),
             COMMIT_HASH_COLUMN: pa.array(commits, type=_SCHEMA.field(COMMIT_HASH_COLUMN).type),
             TIMESTAMP_COLUMN: pa.array(timestamps, type=_SCHEMA.field(TIMESTAMP_COLUMN).type),
+            PR_NUMBER_COLUMN: pa.array(pr_numbers, type=_SCHEMA.field(PR_NUMBER_COLUMN).type),
             PARENT_HASHES_COLUMN: pa.array(parent_hashes, type=_SCHEMA.field(PARENT_HASHES_COLUMN).type),
             PARENT_COUNT_COLUMN: pa.array(parent_counts, type=_SCHEMA.field(PARENT_COUNT_COLUMN).type),
             IS_MERGE_COMMIT_COLUMN: pa.array(is_merge_commits, type=_SCHEMA.field(IS_MERGE_COMMIT_COLUMN).type),

@@ -23,11 +23,24 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional, TypedDict
+
+# "Merge pull request #N from owner/source-branch" — GitHub merge-commit subject.
+_MERGE_PR_RE = re.compile(
+    r'Merge pull request #(\d+) from (\S+)',
+)
+# Trailing "(#N)" PR marker in a squash/merge subject.
+_SUBJECT_PR_RE = re.compile(r'\(#(\d+)\)\s*$')
+# Body trailers referencing a PR/issue.
+_BODY_PR_RE = re.compile(
+    r'(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ :]+#(\d+)',
+    re.IGNORECASE,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -129,22 +142,31 @@ def get_commit_list(repo_path: str, max_commits: int = 0) -> list[str]:
 
 
 def get_commit_info(repo_path: str, commit_hash: str) -> Optional[dict]:
-    fmt = "%H%n%s%n%b%n%P%n%aI%n%cI"
+    # NUL-delimit fields so multi-line trailers cannot collide with the
+    # newline-delimited header fields. Order: hash, subject, body, parents,
+    # author-date, commit-date, trailers(unfolded).
+    fmt = (
+        "%H%x00%s%x00%b%x00%P%x00%aI%x00%cI%x00"
+        "%(trailers:only=true,unfold=true)"
+    )
     output = run_git(repo_path, ["show", "-s", f"--format={fmt}", commit_hash])
     if not output:
         return None
-    lines = output.splitlines()
-    if len(lines) < 5:
+    fields = output.split("\x00")
+    if len(fields) < 7:
         return None
-    subject = lines[1]
-    body_lines = lines[2:-3]
-    parent_hashes = [item for item in lines[-3].strip().split() if item]
-    author_timestamp = lines[-2].strip() or None
-    commit_timestamp = lines[-1].strip() or None
+    commit_hash_out = fields[0]
+    subject = fields[1]
+    body = fields[2].strip()
+    parent_hashes = [item for item in fields[3].strip().split() if item]
+    author_timestamp = fields[4].strip() or None
+    commit_timestamp = fields[5].strip() or None
+    trailers = fields[6].strip()
     return {
-        "hash": lines[0],
+        "hash": commit_hash_out,
         "subject": subject,
-        "body": "\n".join(body_lines).strip(),
+        "body": body,
+        "trailers": trailers,
         "parent_hashes": parent_hashes,
         "parent_count": len(parent_hashes),
         "is_merge_commit": len(parent_hashes) > 1,
@@ -152,6 +174,79 @@ def get_commit_info(repo_path: str, commit_hash: str) -> Optional[dict]:
         "commit_timestamp": commit_timestamp,
         "timestamp": commit_timestamp or author_timestamp,
     }
+
+
+def parse_pr_number_from_text(subject: str, body: str) -> Optional[int]:
+    """Parse a PR/issue number from the subject ``(#N)`` trailer or body trailers."""
+    m = _SUBJECT_PR_RE.search(subject or "")
+    if m:
+        return int(m.group(1))
+    m = _BODY_PR_RE.search(body or "")
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def build_merge_pr_map(repo_path: str) -> dict[int, dict[str, str]]:
+    """Mine merge commits for {pr_number -> {pr_title, source_branch}}.
+
+    A SEPARATE ``git log --merges`` pass over 'Merge pull request #N from ...'
+    subjects. Merge commits are NOT added as training records; this map lets a
+    non-merge record carry the real PR title/source branch when its parsed
+    pr_number matches.
+    """
+    out: dict[int, dict[str, str]] = {}
+    fmt = "%x00%s%x00%b%x00"
+    output = run_git(
+        repo_path,
+        ["log", "--merges", f"--format={fmt}"],
+        timeout=180,
+    )
+    if not output:
+        return out
+    # Records are NUL-delimited triples (leading empty, subject, body) per commit.
+    fields = output.split("\x00")
+    # Walk in (subject, body) pairs: fields[1::3]=subject, fields[2::3]=body.
+    for idx in range(1, len(fields) - 1, 3):
+        subject = fields[idx]
+        body = fields[idx + 1] if idx + 1 < len(fields) else ""
+        m = _MERGE_PR_RE.search(subject)
+        if not m:
+            continue
+        pr_number = int(m.group(1))
+        source_branch = m.group(2)
+        # The first non-empty body line is the squashed PR title in GitHub merges.
+        pr_title = ""
+        for line in body.splitlines():
+            if line.strip():
+                pr_title = line.strip()
+                break
+        out[pr_number] = {"pr_title": pr_title, "source_branch": source_branch}
+    return out
+
+
+def get_commit_note(repo_path: str, commit_hash: str) -> Optional[str]:
+    """Best-effort Gerrit/code-review note text for a commit via ``git notes``.
+
+    Reads from all note refs (``--notes=*``). Returns None when no note exists.
+    Raises (via run_git returning None on git failure) are surfaced as absence;
+    a present-but-empty note yields an empty string.
+    """
+    output = run_git(
+        repo_path,
+        ["log", "-1", "--notes=*", "--format=%N", commit_hash],
+        timeout=30,
+    )
+    if output is None:
+        return None
+    text = output.strip()
+    return text or None
+
+
+def repo_has_notes(repo_path: str) -> bool:
+    """True when the repo has any refs/notes/* (so note extraction is meaningful)."""
+    output = run_git(repo_path, ["for-each-ref", "--format=%(refname)", "refs/notes/"])
+    return bool(output and output.strip())
 
 
 def compute_file_local_commit_indices(
@@ -240,6 +335,8 @@ def process_repo(
     max_commits: int = 0,
     repo_name: str = "",
     memory_limit_gb: float = 10.0,
+    *,
+    notes: str = "auto",
 ) -> _ExtractionStats:
     if not repo_name:
         repo_name = Path(repo_path).name
@@ -249,6 +346,29 @@ def process_repo(
         "commits_checked": 0,
         "records_written": 0,
     }
+
+    # Merge-commit mining: per-repo {pr_number -> {pr_title, source_branch}}.
+    merge_pr_map = build_merge_pr_map(repo_path)
+    if merge_pr_map:
+        print(f"  [{repo_name}] Mined {len(merge_pr_map):,} PR merge commits")
+
+    # Gerrit/code-review note extraction. notes="off" disables; "on" requires
+    # refs/notes to exist (fail loud if requested-but-missing); "auto" enables
+    # only when the repo actually has notes.
+    if notes == "off":
+        use_notes = False
+    elif notes == "on":
+        if not repo_has_notes(repo_path):
+            raise RuntimeError(
+                f"[{repo_name}] --notes on requested but repo has no refs/notes/*"
+            )
+        use_notes = True
+    elif notes == "auto":
+        use_notes = repo_has_notes(repo_path)
+    else:
+        raise ValueError(f"Invalid --notes value: {notes!r}")
+    if use_notes:
+        print(f"  [{repo_name}] Gerrit/code-review notes enabled")
 
     depth_output = run_git(repo_path, ["rev-list", "--count", "HEAD"])
     if depth_output:
@@ -302,6 +422,23 @@ def process_repo(
         if not file_diffs:
             continue
 
+        # Resolve PR provenance: parse pr_number from subject/body, then attach
+        # the real PR title / source branch from the merge map when known.
+        pr_number = parse_pr_number_from_text(
+            commit_info["subject"], commit_info["body"]
+        )
+        pr_title = ""
+        source_branch = ""
+        if pr_number is not None and pr_number in merge_pr_map:
+            pr_title = merge_pr_map[pr_number]["pr_title"]
+            source_branch = merge_pr_map[pr_number]["source_branch"]
+
+        note_text = ""
+        if use_notes:
+            fetched_note = get_commit_note(repo_path, commit_hash)
+            if fetched_note:
+                note_text = fetched_note
+
         for fd in file_diffs:
             record = {
                 "old_content": fd["old_content"],
@@ -314,6 +451,11 @@ def process_repo(
                 "repo_path": os.path.abspath(repo_path),
                 "commit_hash": commit_info["hash"],
                 "timestamp": commit_info["timestamp"],
+                "pr_number": pr_number,
+                "pr_title": pr_title,
+                "source_branch": source_branch,
+                "trailers": commit_info.get("trailers", ""),
+                "note_text": note_text,
                 "parent_hashes": list(commit_info["parent_hashes"]),
                 "parent_count": int(commit_info["parent_count"]),
                 "is_merge_commit": bool(commit_info["is_merge_commit"]),
@@ -350,6 +492,15 @@ def main():
         default=10.0,
         help="Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).",
     )
+    parser.add_argument(
+        "--notes",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Gerrit/code-review note extraction: 'auto' (only when refs/notes "
+            "exist), 'on' (require notes, fail loud if absent), 'off' (disable)."
+        ),
+    )
     args = parser.parse_args()
     start_memory_guard(args.memory_limit_gb, label="extract_git_history")
 
@@ -385,6 +536,7 @@ def main():
                     args.max_commits,
                     repo_name,
                     args.memory_limit_gb,
+                    notes=args.notes,
                 )
                 total_records += stats["records_written"]
                 print(f"  [{repo_name}] {stats['records_written']:,} records")
