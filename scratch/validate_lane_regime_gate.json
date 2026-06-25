@@ -1,0 +1,89 @@
+{
+  "guard": {
+    "total_gb": 137.44,
+    "wired_limit_gb": 96.21
+  },
+  "dispatch_table": {
+    "128": {
+      "receipt": "path_b",
+      "e2e": "path_b",
+      "want": "path_b",
+      "regime": "OUT-OF-REGIME",
+      "kernel": "mamba3_mimo_bwd_metal (MSL)"
+    },
+    "256": {
+      "receipt": "path_b",
+      "e2e": "path_b",
+      "want": "path_b",
+      "regime": "OUT-OF-REGIME",
+      "kernel": "mamba3_mimo_bwd_metal (MSL)"
+    },
+    "512": {
+      "receipt": "path_c_fwd_bwd",
+      "e2e": "path_c_fwd_bwd",
+      "want": "path_c_fwd_bwd",
+      "regime": "IN-REGIME",
+      "kernel": "mamba3_mimo_bwd_path_c (LANE)"
+    },
+    "1024": {
+      "receipt": "path_c_fwd_bwd",
+      "e2e": "path_c_fwd_bwd",
+      "want": "path_c_fwd_bwd",
+      "regime": "IN-REGIME",
+      "kernel": "mamba3_mimo_bwd_path_c (LANE)"
+    },
+    "2048": {
+      "receipt": "path_c_fwd_bwd",
+      "e2e": "path_c_fwd_bwd",
+      "want": "path_c_fwd_bwd",
+      "regime": "IN-REGIME",
+      "kernel": "mamba3_mimo_bwd_path_c (LANE)"
+    },
+    "4096": {
+      "receipt": "path_c_fwd_bwd",
+      "e2e": "path_c_fwd_bwd",
+      "want": "path_c_fwd_bwd",
+      "regime": "IN-REGIME",
+      "kernel": "mamba3_mimo_bwd_path_c (LANE)"
+    }
+  },
+  "parity": {
+    "128": {
+      "dx": 9.313225746154785e-10,
+      "dB": 4.94765117764473e-10,
+      "dC": 1.862645149230957e-09,
+      "dz": 5.122274160385132e-09,
+      "dA": 1.862645149230957e-09,
+      "ddt": 1.862645149230957e-08,
+      "dD": 2.2351741790771484e-08,
+      "dh0": 1.1641532182693481e-09,
+      "__worst__": 2.2351741790771484e-08
+    },
+    "2048": {
+      "dx": 1.862645149230957e-09,
+      "dB": 6.984919309616089e-10,
+      "dC": 2.0954757928848267e-09,
+      "dz": 5.122274160385132e-09,
+      "dA": 1.3969838619232178e-09,
+      "ddt": 2.2351741790771484e-08,
+      "dD": 3.5762786865234375e-07,
+      "dh0": 1.3387762010097504e-09,
+      "__worst__": 3.5762786865234375e-07
+    },
+    "4096": {
+      "dx": 1.6298145055770874e-09,
+      "dB": 6.984919309616089e-10,
+      "dC": 1.6298145055770874e-09,
+      "dz": 6.51925802230835e-09,
+      "dA": 1.862645149230957e-09,
+      "ddt": 2.2351741790771484e-08,
+      "dD": 7.152557373046875e-07,
+      "dh0": 1.3969838619232178e-09,
+      "__worst__": 7.152557373046875e-07
+    }
+  },
+  "s4096_ratio": {
+    "bwd": 0.9198080652025952,
+    "fwd_bwd": 0.9242239961895504
+  }
+}

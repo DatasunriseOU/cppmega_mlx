@@ -8,14 +8,14 @@ Three honest metrics. `id_exact` is EXPECTED to be low: stored ids keep raw mult
 
 ### CODE parquet
 
-Roundtrip sample: **88 rows**.
+Roundtrip sample: **216 rows**.
 
 | metric | % |
 |---|---|
-| text_roundtrip (byte-exact) | 4.55 |
+| text_roundtrip (byte-exact) | 98.61 |
 | reencode_idempotent (load-bearing) | 100.0 |
-| id_exact (literal stored ids) | 0.0 |
-| id_match_modulo_ws_collapse | 3.41 |
+| id_exact (literal stored ids) | 90.28 |
+| id_match_modulo_ws_collapse | 90.28 |
 
 
 ### COMMIT parquet
@@ -24,35 +24,35 @@ Roundtrip sample: **40 rows**.
 
 | metric | % |
 |---|---|
-| text_roundtrip (byte-exact) | 0.0 |
+| text_roundtrip (byte-exact) | 100.0 |
 | reencode_idempotent (load-bearing) | 100.0 |
-| id_exact (literal stored ids) | 0.0 |
-| id_match_modulo_ws_collapse | 0.0 |
+| id_exact (literal stored ids) | 65.0 |
+| id_match_modulo_ws_collapse | 65.0 |
 
 
 ## FILL % — CODE parquet
 
-Sample: **11 files**, **414 rows**.
+Sample: **27 files**, **1057 rows**.
 
 | family | channel | kind | rows-filled % | tokens-nonzero % |
 |---|---|---|---|---|
 | A_platform | `token_platform_ids` | per-token | 0.0 | 0.0 |
-| B_structure | `token_structure_ids` | per-token | 100.0 | 83.31 |
-| B_structure | `token_dep_levels` | per-token | 65.7 | 36.41 |
-| B_structure | `token_ast_depth` | per-token | 100.0 | 48.49 |
-| B_structure | `token_sibling_index` | per-token | 100.0 | 30.25 |
-| B_structure | `token_ast_node_type` | per-token | 100.0 | 48.49 |
-| C_graph_semantic | `token_symbol_ids` | per-token | 100.0 | 83.31 |
-| C_graph_semantic | `token_def_use` | per-token | 100.0 | 83.31 |
-| C_graph_semantic | `token_call_targets` | per-token | 68.84 | 2.09 |
-| C_graph_semantic | `token_type_refs` | per-token | 93.72 | 2.58 |
+| B_structure | `token_structure_ids` | per-token | 100.0 | 81.56 |
+| B_structure | `token_dep_levels` | per-token | 40.4 | 18.94 |
+| B_structure | `token_ast_depth` | per-token | 97.92 | 42.64 |
+| B_structure | `token_sibling_index` | per-token | 97.92 | 28.43 |
+| B_structure | `token_ast_node_type` | per-token | 97.92 | 42.64 |
+| C_graph_semantic | `token_symbol_ids` | per-token | 97.92 | 77.68 |
+| C_graph_semantic | `token_def_use` | per-token | 97.92 | 77.68 |
+| C_graph_semantic | `token_call_targets` | per-token | 45.98 | 1.06 |
+| C_graph_semantic | `token_type_refs` | per-token | 79.66 | 1.35 |
 | D_commit_edit | `token_change_mask_pre` | per-token | 0.0 | 0.0 |
 | D_commit_edit | `token_change_mask_post` | per-token | 0.0 | 0.0 |
 | D_commit_edit | `hunk_id_per_token` | per-token | 0.0 | 0.0 |
 | D_commit_edit | `edit_op_per_token` | per-token | 0.0 | 0.0 |
 | A_platform | `platform_ids` | list | 100.0 | (n/a) |
-| C_graph_semantic | `token_call_edges` | list | 65.46 | (n/a) |
-| C_graph_semantic | `token_type_edges` | list | 93.48 | (n/a) |
+| C_graph_semantic | `token_call_edges` | list | 40.4 | (n/a) |
+| C_graph_semantic | `token_type_edges` | list | 78.15 | (n/a) |
 | D_commit_edit | `changed_chunk_ids` | list | 0.0 | (n/a) |
 | D_commit_edit | `changed_chunk_spans` | list | 0.0 | (n/a) |
 
@@ -60,27 +60,27 @@ Sample: **11 files**, **414 rows**.
 
 ## FILL % — COMMIT parquet
 
-Sample: **5 files**, **193 rows**.
+Sample: **5 files**, **198 rows**.
 
 | family | channel | kind | rows-filled % | tokens-nonzero % |
 |---|---|---|---|---|
 | A_platform | `token_platform_ids` | per-token | 0.0 | 0.0 |
-| B_structure | `token_structure_ids` | per-token | 100.0 | 65.51 |
-| B_structure | `token_dep_levels` | per-token | 46.11 | 25.4 |
-| B_structure | `token_ast_depth` | per-token | 100.0 | 63.51 |
-| B_structure | `token_sibling_index` | per-token | 100.0 | 48.24 |
-| B_structure | `token_ast_node_type` | per-token | 100.0 | 63.51 |
-| C_graph_semantic | `token_symbol_ids` | per-token | 100.0 | 63.26 |
-| C_graph_semantic | `token_def_use` | per-token | 100.0 | 63.51 |
-| C_graph_semantic | `token_call_targets` | per-token | 69.95 | 3.27 |
-| C_graph_semantic | `token_type_refs` | per-token | 79.27 | 4.41 |
-| D_commit_edit | `token_change_mask_pre` | per-token | 99.48 | 25.4 |
-| D_commit_edit | `token_change_mask_post` | per-token | 54.92 | 4.56 |
-| D_commit_edit | `hunk_id_per_token` | per-token | 56.99 | 18.68 |
-| D_commit_edit | `edit_op_per_token` | per-token | 100.0 | 49.38 |
+| B_structure | `token_structure_ids` | per-token | 100.0 | 57.12 |
+| B_structure | `token_dep_levels` | per-token | 41.92 | 18.23 |
+| B_structure | `token_ast_depth` | per-token | 100.0 | 54.21 |
+| B_structure | `token_sibling_index` | per-token | 100.0 | 30.67 |
+| B_structure | `token_ast_node_type` | per-token | 100.0 | 54.21 |
+| C_graph_semantic | `token_symbol_ids` | per-token | 100.0 | 53.96 |
+| C_graph_semantic | `token_def_use` | per-token | 100.0 | 54.21 |
+| C_graph_semantic | `token_call_targets` | per-token | 72.22 | 4.33 |
+| C_graph_semantic | `token_type_refs` | per-token | 76.77 | 3.78 |
+| D_commit_edit | `token_change_mask_pre` | per-token | 100.0 | 24.91 |
+| D_commit_edit | `token_change_mask_post` | per-token | 60.61 | 3.02 |
+| D_commit_edit | `hunk_id_per_token` | per-token | 46.97 | 16.6 |
+| D_commit_edit | `edit_op_per_token` | per-token | 100.0 | 49.06 |
 | A_platform | `platform_ids` | list | 100.0 | (n/a) |
-| C_graph_semantic | `token_call_edges` | list | 45.08 | (n/a) |
-| C_graph_semantic | `token_type_edges` | list | 2.07 | (n/a) |
+| C_graph_semantic | `token_call_edges` | list | 41.92 | (n/a) |
+| C_graph_semantic | `token_type_edges` | list | 1.52 | (n/a) |
 | D_commit_edit | `changed_chunk_ids` | list | 100.0 | (n/a) |
 | D_commit_edit | `changed_chunk_spans` | list | 100.0 | (n/a) |
 
@@ -88,7 +88,7 @@ Sample: **5 files**, **193 rows**.
 
 - `token_platform_ids` (per-token A-platform) is **0% in BOTH code and commit** parquet across the whole sample. Platform signal is carried by the row-level `platform_ids` LIST (100% filled) instead; the per-token mirror column is not populated by the current indexer. The A-platform family IS filled — via the list channel, not the per-token column.
 - D-family (`token_change_mask_*`, `hunk_id_per_token`, `edit_op_per_token`, `changed_chunk_*`) is **0% in CODE parquet** — correct/expected, those channels only carry signal in commit docs.
-- `token_change_mask_post` is filled on only 54.92% of commit rows (many commits touch only the PRE side / are pure deletions or have an empty POST), and `token_type_edges` on 2.07% of commit rows — lower fill but present where the diff actually adds type relationships.
+- `token_change_mask_post` is filled on only 60.61% of commit rows (many commits touch only the PRE side / are pure deletions or have an empty POST), and `token_type_edges` on 1.52% of commit rows — lower fill but present where the diff actually adds type relationships.
 - `token_call_targets` / `token_type_refs` have HIGH rows-filled % but LOW tokens-nonzero % (~1-4%): they are sparse by design (only the few call/type reference sites per window carry an id).
 
 ## Worked examples of each sidecar JSON family
@@ -145,8 +145,8 @@ Sample: **5 files**, **193 rows**.
     },
     {
       "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -259,8 +259,8 @@ Sample: **5 files**, **193 rows**.
     },
     {
       "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -330,49 +330,34 @@ Sample: **5 files**, **193 rows**.
       "C_type_ref": 0,
       "D_chg_pre": 0,
       "D_chg_post": 0,
-      "D_hunk": -1,
-    
+      "D_hunk": 
 ```
 ### Family D (commit-edit) — from a COMMIT row
 ```json
 {
   "D_changed_chunks": {
     "changed_chunk_ids": [
-      2,
-      4
+      2
     ],
     "changed_chunk_spans": [
       {
-        "start": 202,
-        "end": 409
-      },
-      {
-        "start": 443,
-        "end": 769
+        "start": 492,
+        "end": 604
       }
     ]
   },
   "D_per_token_window": [
     {
-      "i": 198,
-      "tok_id": 5501,
-      "tok": "COMMIT",
+      "i": 488,
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "D_chg_pre": 0,
       "D_chg_post": 0,
       "D_hunk": -1,
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 199,
-      "tok_id": 1214,
-      "tok": " ",
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "3:CONTEXT"
-    },
-    {
-      "i": 200,
+      "i": 489,
       "tok_id": 327,
       "tok": "==",
       "D_chg_pre": 0,
@@ -381,7 +366,7 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 201,
+      "i": 490,
       "tok_id": 373,
       "tok": "=",
       "D_chg_pre": 0,
@@ -390,7 +375,16 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 202,
+      "i": 491,
+      "tok_id": 47,
+      "tok": "<NL>",
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "3:CONTEXT"
+    },
+    {
+      "i": 492,
       "tok_id": 133,
       "tok": "int",
       "D_chg_pre": 1,
@@ -399,16 +393,16 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 203,
-      "tok_id": 1214,
-      "tok": " ",
+      "i": 493,
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "D_chg_pre": 1,
       "D_chg_post": 0,
       "D_hunk": 0,
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 204,
+      "i": 494,
       "tok_id": 7248,
       "tok": "s",
       "D_chg_pre": 1,
@@ -417,7 +411,7 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 205,
+      "i": 495,
       "tok_id": 4902,
       "tok": "2",
       "D_chg_pre": 1,
@@ -426,7 +420,7 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 206,
+      "i": 496,
       "tok_id": 7243,
       "tok": "n",
       "D_chg_pre": 1,
@@ -435,7 +429,7 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 207,
+      "i": 497,
       "tok_id": 377,
       "tok": "_",
       "D_chg_pre": 1,
@@ -444,18 +438,18 @@ Sample: **5 files**, **193 rows**.
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 208,
-      "tok_id": 2268,
-      "tok": "connect",
+      "i": 498,
+      "tok_id": 7233,
+      "tok": "c",
       "D_chg_pre": 1,
       "D_chg_post": 0,
       "D_hunk": 0,
       "D_edit_op": "3:CONTEXT"
     },
     {
-      "i": 209,
-      "tok_id": 7268,
-      "tok": "ion",
+      "i": 499,
+      "tok_id": 4760,
+      "tok": "er",
       "D_chg_pre": 1,
       "D_chg_post": 0,
       "D_hunk": 0,

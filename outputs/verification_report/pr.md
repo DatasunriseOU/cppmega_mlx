@@ -3,200 +3,384 @@
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 0
+## PR/commit head — `s2n-tls_r2500.parquet` row 0
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "fix: make get_alert idempotent (#5767)",
-  "pr_number": "5767",
-  "sha_in_doc": "5f54315df13a7399136c5093ab43fa24f5411632",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "tls/s2n_connection.c",
-  "commit_hash": "5f54315df13a7399136c5093ab43fa24f5411632",
-  "timestamp": "2026-03-04T21:43:13Z"
+  "brief": "Support wildcard matching to select server certs",
+  "pr_number": null,
+  "sha_in_doc": "032d8f3d707c75e98a1a211315f1173ec93fa918",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "crypto/s2n_certificate.c",
+  "commit_hash": "032d8f3d707c75e98a1a211315f1173ec93fa918",
+  "timestamp": "2019-05-28T13:51:00-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief fix: make get_alert idempotent (#5767) * * @repo _src * File: tls/s2n_connection.c * @sha 5f54315df13a7399136c5093ab43fa24f5411632 * @pr 5767 */
+/**
+ * @brief Support wildcard matching to select server certs
+ *
+ * @repo aws/s2n-tls
+ * File: crypto/s2n_certificate.c
+ * @sha 032d8f3d707c75e98a1a211315f1173ec93fa918
+ *
+ * @details
+ * Only certificates with "simple" wildcards are supported, where simple
+ * means a single * in the left-most DNS label. If s2n is configured with
+ * a certificate that matches a domain name exactly *and* a simple wildcard
+ * certificate that matches a domain name, we will prefer the exact match.
+ * 
+ * TODO:
+ * - [] Add more test cases for wildcardify-ing
+ * - [] Update fuzz test to cover wildcard
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
-standard: c++17// arch: x86_64// mode: user/** * @brief fix: make get_alert idempotent (#5767) * * @repo _src * File: tls/s2n_connection.c * @sha 5f54315df13a7399136c5093ab43fa24f5411632 * @pr 5767 */// === PRE-COMMIT ===int s2n_connection_get_alert(struct s2n_connection *conn){    POSIX_ENSURE_REF(conn);    S2N_ERROR_IF(s2n_stuffer_data_available(&conn->ale
+a simple wildcard
+ * certificate that matches a domain name, we will prefer the exact match.
+ * 
+ * TODO:
+ * - [] Add more test cases for wildcardify-ing
+ * - [] Update fuzz test to cover wildcard
+ */
+// === PRE-COMMIT ===
+int s2n_cert_public_key_set_rsa_from_openssl(s2n_cert_public_key *public_key, RSA *openssl_rsa)
+{
+ notnull_check(openssl_rsa);
+ notnull_c
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 1
+## PR/commit head — `s2n-tls_r2500.parquet` row 1
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "fix: incorrect group reported for TLS 1.2 session resumption (#5673)",
-  "pr_number": "5673",
-  "sha_in_doc": "6b5b32abde98f1a00c414e1a3217465f6a37fa44",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "tls/s2n_connection.c",
-  "commit_hash": "6b5b32abde98f1a00c414e1a3217465f6a37fa44",
-  "timestamp": "2025-12-31T00:54:41Z"
+  "brief": "Support wildcard matching to select server certs",
+  "pr_number": null,
+  "sha_in_doc": "032d8f3d707c75e98a1a211315f1173ec93fa918",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "crypto/s2n_certificate.c",
+  "commit_hash": "032d8f3d707c75e98a1a211315f1173ec93fa918",
+  "timestamp": "2019-05-28T13:51:00-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief fix: incorrect group reported for TLS 1.2 session resumption (#5673) * * @repo _src * File: tls/s2n_connection.c * @sha 6b5b32abde98f1a00c414e1a3217465f6a37fa44 * @pr 5673 * * @details */
+/**
+ * @brief Support wildcard matching to select server certs
+ *
+ * @repo aws/s2n-tls
+ * File: crypto/s2n_certificate.c
+ * @sha 032d8f3d707c75e98a1a211315f1173ec93fa918
+ *
+ * @details
+ * Only certificates with "simple" wildcards are supported, where simple
+ * means a single * in the left-most DNS label. If s2n is configured with
+ * a certificate that matches a domain name exactly *and* a simple wildcard
+ * certificate that matches a domain name, we will prefer the exact match.
+ * 
+ * TODO:
+ * - [] Add more test cases for wildcardify-ing
+ * - [] Update fuzz test to cover wildcard
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
-/** * @brief fix: incorrect group reported for TLS 1.2 session resumption (#5673) * * @repo _src * File: tls/s2n_connection.c * @sha 6b5b32abde98f1a00c414e1a3217465f6a37fa44 * @pr 5673 * * @details */// === PRE-COMMIT ===const char *s2n_connection_get_curve(struct s2n_connection *conn){    PTR_ENSURE_REF(conn);    PTR_ENSURE_REF(conn->secure);    PTR_ENSURE_
+a simple wildcard
+ * certificate that matches a domain name, we will prefer the exact match.
+ * 
+ * TODO:
+ * - [] Add more test cases for wildcardify-ing
+ * - [] Update fuzz test to cover wildcard
+ */
+// === CONTEXT ===
+int s2n_cert_public_key_set_rsa_from_openssl(s2n_cert_public_key *public_key, RSA *openssl_rsa)
+{
+ notnull_check(openssl_rsa);
+ notnull_chec
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 2
+## PR/commit head — `s2n-tls_r2500.parquet` row 2
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "ci: update clang format version (#5661)",
-  "pr_number": "5661",
-  "sha_in_doc": "a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "crypto/s2n_openssl_evp.h",
-  "commit_hash": "a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402",
-  "timestamp": "2025-12-11T18:44:07Z"
+  "brief": "Fix BIKE compressed_idx_dv_ar_cleanup to cleanup the correct memory length",
+  "pr_number": null,
+  "sha_in_doc": "3e91e4531bad3bf9173c04a768856504931382b5",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "pq-crypto/bike/cleanup.h",
+  "commit_hash": "3e91e4531bad3bf9173c04a768856504931382b5",
+  "timestamp": "2019-05-20T11:52:46-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief ci: update clang format version (#5661) * * @repo _src * File: crypto/s2n_openssl_evp.h * @sha a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402 * @pr 5661 */
+/**
+ * @brief Fix BIKE compressed_idx_dv_ar_cleanup to cleanup the correct memory length
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/cleanup.h
+ * @sha 3e91e4531bad3bf9173c04a768856504931382b5
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
-ard: c++17// arch: x86_64// mode: user/** * @brief ci: update clang format version (#5661) * * @repo _src * File: crypto/s2n_openssl_evp.h * @sha a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402 * @pr 5661 */// === PRE-COMMIT ===DEFINE_POINTER_CLEANUP_FUNC(EVP_PKEY*, EVP_PKEY_free)// === POST-COMMIT: ci: update clang format version (#5661) ===DEFINE_POINTER_CLEANUP_
+
+/**
+ * @brief Fix BIKE compressed_idx_dv_ar_cleanup to cleanup the correct memory length
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/cleanup.h
+ * @sha 3e91e4531bad3bf9173c04a768856504931382b5
+ */
+// === PRE-COMMIT ===
+_INLINE_ void compressed_idx_dv_ar_cleanup(IN OUT compressed_idx_dv_ar_t *o) 
+{
+ for(int i=0; i < N0; i++)
+ {
+ secure_clean((uint8_t*)&o[
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 3
+## PR/commit head — `s2n-tls_r2500.parquet` row 3
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "ci: update clang format version (#5661)",
-  "pr_number": "5661",
-  "sha_in_doc": "a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "crypto/s2n_openssl_evp.h",
-  "commit_hash": "a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402",
-  "timestamp": "2025-12-11T18:44:07Z"
+  "brief": "Fix BIKE compressed_idx_dv_ar_cleanup to cleanup the correct memory length",
+  "pr_number": null,
+  "sha_in_doc": "3e91e4531bad3bf9173c04a768856504931382b5",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "pq-crypto/bike/cleanup.h",
+  "commit_hash": "3e91e4531bad3bf9173c04a768856504931382b5",
+  "timestamp": "2019-05-20T11:52:46-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief ci: update clang format version (#5661) * * @repo _src * File: crypto/s2n_openssl_evp.h * @sha a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402 * @pr 5661 */
+/**
+ * @brief Fix BIKE compressed_idx_dv_ar_cleanup to cleanup the correct memory length
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/cleanup.h
+ * @sha 3e91e4531bad3bf9173c04a768856504931382b5
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
-ard: c++17// arch: x86_64// mode: user/** * @brief ci: update clang format version (#5661) * * @repo _src * File: crypto/s2n_openssl_evp.h * @sha a7bdb88ebad5e29c53ac098a1ae6e6c5cd737402 * @pr 5661 */// === CONTEXT ===DEFINE_POINTER_CLEANUP_FUNC(EVP_PKEY*, EVP_PKEY_free)// === DIFF ===diff --git a/crypto/s2n_openssl_evp.h b/crypto/s2n_openssl_evp.hindex 4b03
+
+/**
+ * @brief Fix BIKE compressed_idx_dv_ar_cleanup to cleanup the correct memory length
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/cleanup.h
+ * @sha 3e91e4531bad3bf9173c04a768856504931382b5
+ */
+// === CONTEXT ===
+_INLINE_ void compressed_idx_dv_ar_cleanup(IN OUT compressed_idx_dv_ar_t *o) 
+{
+ for(int i=0; i < N0; i++)
+ {
+ secure_clean((uint8_t*)&o[i],
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 4
+## PR/commit head — `s2n-tls_r2500.parquet` row 4
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "feat: improve performance of getting validated cert chain from libcrypto (#5622)",
-  "pr_number": "5622",
-  "sha_in_doc": "0ffb435c02e95877da27aaa50898bfe0b9eaf057",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "tls/s2n_x509_validator.h",
-  "commit_hash": "0ffb435c02e95877da27aaa50898bfe0b9eaf057",
-  "timestamp": "2025-11-29T00:28:31Z"
+  "brief": "Use inttypes macro to print uint64_t",
+  "pr_number": null,
+  "sha_in_doc": "5cd6e4edff395b12f6e020ccb605597fa50548b6",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "pq-crypto/bike/utilities.c",
+  "commit_hash": "5cd6e4edff395b12f6e020ccb605597fa50548b6",
+  "timestamp": "2019-05-17T21:13:33-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief feat: improve performance of getting validated cert chain from libcrypto (#5622) * * @repo _src * File: tls/s2n_x509_validator.h * @sha 0ffb435c02e95877da27aaa50898bfe0b9eaf057 * @pr 5622 */
+/**
+ * @brief Use inttypes macro to print uint64_t
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/utilities.c
+ * @sha 5cd6e4edff395b12f6e020ccb605597fa50548b6
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
- * @brief feat: improve performance of getting validated cert chain from libcrypto (#5622) * * @repo _src * File: tls/s2n_x509_validator.h * @sha 0ffb435c02e95877da27aaa50898bfe0b9eaf057 * @pr 5622 */// === PRE-COMMIT ===typedef enum {    UNINIT,    INIT,    READY_TO_VERIFY,    AWAITING_CRL_CALLBACK,    VALIDATED,    OCSP_VALIDATED,} validator_statetypedef u
+ c++17
+// arch: x86_64
+// mode: user
+/**
+ * @brief Use inttypes macro to print uint64_t
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/utilities.c
+ * @sha 5cd6e4edff395b12f6e020ccb605597fa50548b6
+ */
+// === PRE-COMMIT ===
+_INLINE_ void print_uint64(IN const uint64_t val)
+{
+ // If printing in BE is requried swap the order of bytes
+#ifdef PRINT_IN_BE
+ uint64_
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 5
+## PR/commit head — `s2n-tls_r2500.parquet` row 5
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "feat: improve performance of getting validated cert chain from libcrypto (#5622)",
-  "pr_number": "5622",
-  "sha_in_doc": "0ffb435c02e95877da27aaa50898bfe0b9eaf057",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "tls/s2n_x509_validator.h",
-  "commit_hash": "0ffb435c02e95877da27aaa50898bfe0b9eaf057",
-  "timestamp": "2025-11-29T00:28:31Z"
+  "brief": "Use inttypes macro to print uint64_t",
+  "pr_number": null,
+  "sha_in_doc": "5cd6e4edff395b12f6e020ccb605597fa50548b6",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "pq-crypto/bike/utilities.c",
+  "commit_hash": "5cd6e4edff395b12f6e020ccb605597fa50548b6",
+  "timestamp": "2019-05-17T21:13:33-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief feat: improve performance of getting validated cert chain from libcrypto (#5622) * * @repo _src * File: tls/s2n_x509_validator.h * @sha 0ffb435c02e95877da27aaa50898bfe0b9eaf057 * @pr 5622 */
+/**
+ * @brief Use inttypes macro to print uint64_t
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/utilities.c
+ * @sha 5cd6e4edff395b12f6e020ccb605597fa50548b6
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
- * @brief feat: improve performance of getting validated cert chain from libcrypto (#5622) * * @repo _src * File: tls/s2n_x509_validator.h * @sha 0ffb435c02e95877da27aaa50898bfe0b9eaf057 * @pr 5622 */// === CONTEXT ===typedef enum {    UNINIT,    INIT,    READY_TO_VERIFY,    AWAITING_CRL_CALLBACK,    VALIDATED,    OCSP_VALIDATED,} validator_statetypedef uint
+ c++17
+// arch: x86_64
+// mode: user
+/**
+ * @brief Use inttypes macro to print uint64_t
+ *
+ * @repo aws/s2n-tls
+ * File: pq-crypto/bike/utilities.c
+ * @sha 5cd6e4edff395b12f6e020ccb605597fa50548b6
+ */
+// === CONTEXT ===
+_INLINE_ void print_uint64(IN const uint64_t val)
+{
+ // If printing in BE is requried swap the order of bytes
+#ifdef PRINT_IN_BE
+ uint64_t t
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 6
+## PR/commit head — `s2n-tls_r2500.parquet` row 6
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "feat: add ML-KEM-1024 kem definition (#5367)",
-  "pr_number": "5367",
-  "sha_in_doc": "4bb511884a886ada7ef422c6e1741252a582f128",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "crypto/s2n_fips_rules.c",
-  "commit_hash": "4bb511884a886ada7ef422c6e1741252a582f128",
-  "timestamp": "2025-07-11T11:03:38-07:00"
+  "brief": "Store certificate san_names in s2n_array",
+  "pr_number": null,
+  "sha_in_doc": "ae9c2efb95474251d1f2815f433af6b3c66d33ae",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "crypto/s2n_certificate.h",
+  "commit_hash": "ae9c2efb95474251d1f2815f433af6b3c66d33ae",
+  "timestamp": "2019-05-17T11:05:40-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief feat: add ML-KEM-1024 kem definition (#5367) * * @repo _src * File: crypto/s2n_fips_rules.c * @sha 4bb511884a886ada7ef422c6e1741252a582f128 * @pr 5367 */
+/**
+ * @brief Store certificate san_names in s2n_array
+ *
+ * @repo aws/s2n-tls
+ * File: crypto/s2n_certificate.h
+ * @sha ae9c2efb95474251d1f2815f433af6b3c66d33ae
+ *
+ * @details
+ * And avoid holding onto a GENERAL_NAMES and X509 object for the
+ * lifetime of the s2n_cert_chain_and_key.
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
- c++17// arch: x86_64// mode: user/** * @brief feat: add ML-KEM-1024 kem definition (#5367) * * @repo _src * File: crypto/s2n_fips_rules.c * @sha 4bb511884a886ada7ef422c6e1741252a582f128 * @pr 5367 */// === PRE-COMMIT ===S2N_RESULT s2n_fips_validate_kem(const struct s2n_kem *kem, bool *valid){    RESULT_ENSURE_REF(kem);    RESULT_ENSURE_REF(valid);    *valid
+rypto/s2n_certificate.h
+ * @sha ae9c2efb95474251d1f2815f433af6b3c66d33ae
+ *
+ * @details
+ * And avoid holding onto a GENERAL_NAMES and X509 object for the
+ * lifetime of the s2n_cert_chain_and_key.
+ */
+// === PRE-COMMIT ===
+typedef enum {
+ S2N_AUTHENTICATION_RSA = 0,
+ S2N_AUTHENTICATION_ECDSA,
+ S2N_AUTHENTICATION_METHOD_SENTINEL
+} s2n_authentication_method
+st
 ```
 
 ---
 
-## PR/commit head — `s2n-tls_r0.parquet` row 7
+## PR/commit head — `s2n-tls_r2500.parquet` row 7
 ### Extracted PR/discussion fields
 ```json
 {
-  "brief": "feat: add ML-KEM-1024 kem definition (#5367)",
-  "pr_number": "5367",
-  "sha_in_doc": "4bb511884a886ada7ef422c6e1741252a582f128",
-  "repo_in_doc": "_src",
-  "repo": "_src",
-  "filepath": "crypto/s2n_fips_rules.c",
-  "commit_hash": "4bb511884a886ada7ef422c6e1741252a582f128",
-  "timestamp": "2025-07-11T11:03:38-07:00"
+  "brief": "Support CN for server cert selection",
+  "pr_number": null,
+  "sha_in_doc": "93abe1d96ad99f28d72996c8a91fae82ffde4f6a",
+  "repo_in_doc": "aws/s2n-tls",
+  "repo": "aws/s2n-tls",
+  "filepath": "crypto/s2n_certificate.h",
+  "commit_hash": "93abe1d96ad99f28d72996c8a91fae82ffde4f6a",
+  "timestamp": "2019-05-17T11:05:40-07:00"
 }
 ```
 ### Raw docstring (sits at the HEAD of the atomic block, before PRE code)
 ```c
-/** * @brief feat: add ML-KEM-1024 kem definition (#5367) * * @repo _src * File: crypto/s2n_fips_rules.c * @sha 4bb511884a886ada7ef422c6e1741252a582f128 * @pr 5367 */
+/**
+ * @brief Support CN for server cert selection
+ *
+ * @repo aws/s2n-tls
+ * File: crypto/s2n_certificate.h
+ * @sha 93abe1d96ad99f28d72996c8a91fae82ffde4f6a
+ *
+ * @details
+ * After this change, s2n will use the CommonName entry from the Subject of
+ * to select from certificates added to s2n_config. Usage of CN has been
+ * deprecated since RFC2818 in favor of SAN. This change only uses the CN
+ * if no valid SANs are available in the cert.
+ * 
+ * Specifics:
+ * - Multiple CommonNames are supported, though practically usage should be
+ * very rare. A CAB thread on dropping support for it:
+ * https://cabforum.org/pipermail/public/2016-April/007242.html .
+ */
 ```
 ### Block head (docstring -> first code lines)
 ```cpp
- c++17// arch: x86_64// mode: user/** * @brief feat: add ML-KEM-1024 kem definition (#5367) * * @repo _src * File: crypto/s2n_fips_rules.c * @sha 4bb511884a886ada7ef422c6e1741252a582f128 * @pr 5367 */// === CONTEXT ===S2N_RESULT s2n_fips_validate_kem(const struct s2n_kem *kem, bool *valid){    RESULT_ENSURE_REF(kem);    RESULT_ENSURE_REF(valid);    *valid = 
+ * - Multiple CommonNames are supported, though practically usage should be
+ * very rare. A CAB thread on dropping support for it:
+ * https://cabforum.org/pipermail/public/2016-April/007242.html .
+ */
+// === PRE-COMMIT ===
+typedef enum {
+ S2N_AUTHENTICATION_RSA = 0,
+ S2N_AUTHENTICATION_ECDSA,
+ S2N_AUTHENTICATION_METHOD_SENTINEL
+} s2n_authentication_method
+st
 ```

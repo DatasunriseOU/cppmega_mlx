@@ -3,7 +3,7 @@
 
 ---
 
-## Example 1 — `fmt.parquet` row 0
+## Example 1 — `WindowsAppSDK.parquet` row 0
 
 ### Provenance
 ```json
@@ -22,18 +22,813 @@
 | metric | value |
 |---|---|
 | text_roundtrip (byte-exact decode) | False |
-| reencode_idempotent (load-bearing) | True |
+| reencode_idempotent (load-bearing) | False |
 | id_exact (literal stored-ids match) | False |
 | id_match_modulo_ws_collapse | False |
-| first_id_divergence | 2 |
+| first_id_divergence | 782 |
+| n_stored_ids / n_reencoded | 1024 / 1005 |
+
+> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
+
+### clang-format'd CODE portion
+clang-format ok: **True**
+```cpp
+osoft::TokuchoNamespace::PurojekutoTenpuretNoFeaturePrefix::
+    PurojekutoTenpuretNoFeaturePrefixManager
+    PurojekutoTenpuretNoFeaturePrefixManager::Open() {
+  throw hresult_not_implemented();
+}
+void Puro jekutoTenpuretNoFeaturePrefixManager
+    : PurojekutoTenpuretNoFeaturePrefixManagerT<
+          PurojekutoTenpuretNoFeaturePrefixManager> {
+  PurojekutoTenpuretNoFeaturePrefixManager() = default;
+  static winrt::Microsoft::TokuchoNamespace::PurojekutoTenpuretNoFeaturePrefix::
+      PurojekutoTenpuretNoFeaturePrefixManager
+      Open();
+  void TODO_ReplaceMeWithRealContent();
+};
+}
+namespace win<BOS> // language: primary=c++ standard=c++17 confidence=high
+    // <BOS>
+    // platform: x86_64-linux-gnu
+    // compiler: g++
+    // standard: c++17
+    // arch: x86_64
+    // mode: user
+    : PackageDependencyManager::ExistsPackageDependency(
+          PSID user, _In_ PCWSTR packageDependencyId) {
+  auto lock{std::unique_lock<std::recursive_mutex>(g_lock)};
+  // Find it (if we can)
+  auto packageDependency{GetPackageDependency(packageDependencyId)};
+  if (packageDependency) {
+    auto packageDependencyUser{packageDependency->User()};
+    if (user) {
+      // We're expecting a definition for the specifiedd user            return
+      // packageDependencyUser && !!EqualSid(user, packageDependencyUser); }
+      // else        {            // We're not expecting a user (i.e. it's for
+      // System)            return !packageDependencyUser;        }    } return
+      // false;}void MddCore::PackageDependencyMan<BOS>// language: primary=c++
+      // standard=c++17 confidence=high
+      // <BOS>
+      // platform: x86_64-linux-gnu
+      // compiler: g++
+      // standard: c++17
+      // arch: x86_64
+      // mode: user
+      eVector::const_iterator{};
+    }
+    return std::ranges::find(m_map->cbegin(), m_map->cend(), key,
+                             &FileTypeChoiceVector::value_type::first);
+  }
+  winrt::Windows::Foundation::Collections::IVector<hstring>
+  OrderedMapView::Lookup(hstring const &key) const {
+    if (!m_map) {
+    throw winrt::h
+```
+### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
+```json
+{
+  "_legend": {
+    "edit_op": {
+      "0": "UNCHANGED",
+      "1": "INSERTED",
+      "2": "MODIFIED",
+      "3": "CONTEXT"
+    },
+    "structure_id": {
+      "0": "none/ws",
+      "1": "comment",
+      "2": "preproc",
+      "3": "decl/signature",
+      "4": "body/stmt",
+      "5": "expr",
+      "6": "identifier-ctx",
+      "7": "literal-ctx",
+      "8": "misc"
+    },
+    "def_use": {
+      "0": "none",
+      "1": "def",
+      "2": "use",
+      "3": "def+use"
+    },
+    "families": {
+      "A": "platform",
+      "B": "structure (syntax+structure)",
+      "C": "graph-semantic (symbol/def_use/call/type + edges)",
+      "D": "commit-edit (change-mask/hunk/edit-op/changed-chunks)"
+    }
+  },
+  "window": {
+    "start": 0,
+    "count": 40
+  },
+  "per_token": [
+    {
+      "i": 0,
+      "tok_id": 2,
+      "tok": "<BOS>",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 1,
+      "tok_id": 347,
+      "tok": "//",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 2,
+      "tok_id": 46,
+      "tok": "<SPACE>",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 3,
+      "tok_id": 923,
+      "tok": "l",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 4,
+      "tok_id": 7587,
+      "tok": "ang",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 5,
+      "tok_id": 921,
+      "tok": "u",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 6,
+      "tok_id": 7429,
+      "tok": "age",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 7,
+      "tok_id": 359,
+      "tok": ":",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 8,
+      "tok_id": 46,
+      "tok": "<SPACE>",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 9,
+      "tok_id": 9677,
+      "tok": "prim",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 10,
+      "tok_id": 4745,
+      "tok": "ary",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 11,
+      "tok_id": 373,
+      "tok": "=",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 12,
+      "tok_id": 7233,
+      "tok": "c",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 13,
+      "tok_id": 335,
+      "tok": "++",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 14,
+      "tok_id": 46,
+      "tok": "<SPACE>",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 15,
+      "tok_id": 7248,
+      "tok": "s",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 16,
+      "tok_id": 2020,
+      "tok": "tan",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 17,
+      "tok_id": 7234,
+      "tok": "d",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 18,
+      "tok_id": 7591,
+      "tok": "ard",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 19,
+      "tok_id": 373,
+      "tok": "=",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 20,
+      "tok_id": 7233,
+      "tok": "c",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 21,
+      "tok_id": 335,
+      "tok": "++",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 22,
+      "tok_id": 4917,
+      "tok": "17",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 23,
+      "tok_id": 46,
+      "tok": "<SPACE>",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 24,
+      "tok_id": 4725,
+      "tok": "co",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 25,
+      "tok_id": 7243,
+      "tok": "n",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 26,
+      "tok_id": 7322,
+      "tok": "fi",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 27,
+      "tok_id": 4704,
+      "tok": "de",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 28,
+      "tok_id": 39482,
+      "tok": "nce",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 29,
+      "tok_id": 373,
+      "tok": "=",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 30,
+      "tok_id": 9123,
+      "tok": "high",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 31,
+      "tok_id": 47,
+      "tok": "<NL>",
+      "A_platform": 0,
+      "B_structure": "0:none/ws",
+      "B_dep_lvl": 0,
+      "B_ast_depth": 0,
+      "B_sibling": 0,
+      "B_ast_node": 0,
+      "C_symbol": 0,
+      "C_def_use": "0:none",
+      "C_call_tgt": 0,
+      "C_type_ref": 0,
+      "D_chg_pre": 0,
+      "D_chg_post": 0,
+      "D_hunk": -1,
+      "D_edit_op": "0:UNCHANGED"
+    },
+    {
+      "i": 32,
+      "tok_id": 347,
+      "tok": "//",
+      "A_platform": 0,
+     
+```
+
+
+---
+
+## Example 2 — `WindowsAppSDK.parquet` row 1
+
+### Provenance
+```json
+{
+  "repo": "",
+  "filepath": "",
+  "commit_hash": "",
+  "timestamp": "",
+  "pr_number": null,
+  "sha_in_doc": null,
+  "repo_in_doc": null,
+  "brief": null
+}
+```
+### Roundtrip (our cpp_tokenizer: detok -> retok)
+| metric | value |
+|---|---|
+| text_roundtrip (byte-exact decode) | True |
+| reencode_idempotent (load-bearing) | True |
+| id_exact (literal stored-ids match) | True |
+| id_match_modulo_ws_collapse | True |
+| first_id_divergence | None |
 | n_stored_ids / n_reencoded | 1024 / 1024 |
 
-> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
-
 ### clang-format'd CODE portion
 clang-format ok: **True**
 ```cpp
-<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename T, typename Context>  auto format(const T& value, Context& ctx) const -> decltype(ctx.out()) {    auto buffer = basic_memory_buffer<Char>();    auto&& formatbuf = detail::formatbuf<std::basic_streambuf<Char>>(buffer);    auto&& output = std::basic_ostream<Char>(&formatbuf);    output.imbue(std::locale::classic());  // The default is always unlocalized.    output << value;    output.exceptions(std::ios_base::failbit | std::ios_base::badbit);    return formatter<basic_string_view<Char>, Char>::format(        {buffer.data(), buffer.size()}, ctx);  }<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename T>FMT_CONSTEXPR auto make_write_int_arg(T value, sign s)    -> write_int_arg<uint32_or_64_or_128_t<T>> {  auto prefix = 0u;  auto abs_value = static_cast<uint32_or_64_or_128_t<T>>(value);  if (is_negative(value)) {    prefix = 0x01000000 | '-';    abs_value = 0 - abs_value;  } else {    constexpr unsigned prefixes[4] = {0, 0, 0x1000000u | '+', 0x1000000u | ' '};    prefix = prefixes[static_cast<int>(s)];  }  return {abs_value, prefix};}enum class sign { none, minus, plus, space }<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userconstexpr auto is_arithmetic_type(type t) -> bool {  return t > type::none_type && t <= type::last_numeric_type;}enum class type {  none_type,  // Integer types should go first,  int_type,  uint_type,  long_long_type,  ulong_long_type,  int128_type,  uint128_type,  bool_type,  char_type,  last_integer_type = char_type,  // followed by floating-point types.  float_type,  double_type,  long_double_type,  last_numeric_type = long_double_type,  cstring_type,  string_type,  pointer_type,  custom_type}
+TenpuretNoFeaturePrefixManager::TODO_ReplaceMeWithRealContent() {
+  throw hresult_not_implemented();
+}
+}
+jekutoTenpuretNoFeaturePrefixManager
+    : PurojekutoTenpuretNoFeaturePrefixManagerT<
+          PurojekutoTenpuretNoFeaturePrefixManager> {
+  PurojekutoTenpuretNoFeaturePrefixManager() = default;
+  static winrt::Microsoft::TokuchoNamespace::PurojekutoTenpuretNoFeaturePrefix::
+      PurojekutoTenpuretNoFeaturePrefixManager
+      Open();
+  void TODO_ReplaceMeWithRealContent();
+};
+}
+namespace win<BOS>// language: primary=c++ standard=c++17 confidence=high
+// <BOS>
+// platform: x86_64-linux-gnu
+// compiler: g++
+// standard: c++17
+// arch: x86_64
+// mode: user
+Str, _Outptr_ DEFSTRINGRESULT** result)
+{
+  *result = nullptr;
+  DEFSTRINGRESULT *pSelf = nullptr;
+  HRESULT hr = _DefStringResult_Alloc(&pSelf);
+  if (SUCCEEDED(hr)) {
+    hr = DefStringResult_InitRef(pSelf, pStr);
+    if (SUCCEEDED(hr)) {
+      *result = pSelf;
+      pSelf = nullptr;
+    }
+  }
+  DefStringResult_Delete(pSelf);
+  return hr;
+}
+HRESULT
+DefStringResult_NewBuf(__in_opt PCWSTR pStr, _Outptr_ DEFS<BOS>// language: primary=c++ standard=c++17 confidence=high
+// <BOS>
+// platform: x86_64-linux-gnu
+// compiler: g++
+// standard: c++17
+// arch: x86_64
+// mode: user
+ RETURN_IF_FAILED(FileDataItemsSection::CreateInstance(this, &u.pDataItems));
+ m_sectionType = SectionTypeDataItems;
+}
+else if (m_sectionType != SectionTypeDataItems) {
+  u.pDataItems = nullptr;
+  return HRESULT_FROM_WIN32(ERROR_MRM_INVALID_PRI_FILE);
+}
+*result = u.pDataItems;
+return S_OK;
+}
+HRESULT GetReverseFileMapSection(_Out_ ReverseFileMap **result) {
+  *result = nullptr;
+  if (m_sectionType == SectionTypeUnknown) {
+  R
 ```
 ### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
 ```json
@@ -114,8 +909,8 @@ clang-format ok: **True**
     },
     {
       "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -228,8 +1023,8 @@ clang-format ok: **True**
     },
     {
       "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -342,8 +1137,8 @@ clang-format ok: **True**
     },
     {
       "i": 14,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -513,8 +1308,8 @@ clang-format ok: **True**
     },
     {
       "i": 23,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -665,8 +1460,8 @@ clang-format ok: **True**
     },
     {
       "i": 31,
-      "tok_id": 347,
-      "tok": "//",
+      "tok_id": 47,
+      "tok": "<NL>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -684,16 +1479,16 @@ clang-format ok: **True**
     },
     {
       "i": 32,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 347,
+      "tok": "//",
       "A_platform": 0,
-      "B_structure": "
+     
 ```
 
 
 ---
 
-## Example 2 — `fmt.parquet` row 1
+## Example 3 — `WindowsAppSDK.parquet` row 2
 
 ### Provenance
 ```json
@@ -711,19 +1506,71 @@ clang-format ok: **True**
 ### Roundtrip (our cpp_tokenizer: detok -> retok)
 | metric | value |
 |---|---|
-| text_roundtrip (byte-exact decode) | False |
+| text_roundtrip (byte-exact decode) | True |
 | reencode_idempotent (load-bearing) | True |
-| id_exact (literal stored-ids match) | False |
-| id_match_modulo_ws_collapse | False |
-| first_id_divergence | 2 |
-| n_stored_ids / n_reencoded | 1024 / 1026 |
-
-> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
+| id_exact (literal stored-ids match) | True |
+| id_match_modulo_ws_collapse | True |
+| first_id_divergence | None |
+| n_stored_ids / n_reencoded | 1024 / 1024 |
 
 ### clang-format'd CODE portion
 clang-format ok: **True**
 ```cpp
-<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename T>constexpr auto streamed(const T& value) -> detail::streamed_view<T> {  return {value};}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userauto get_read_buffer() const -> span<const char> {    return {&next_, has_next_ ? 1u : 0u};  }<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userconstexpr auto use_fixed(int exp, int exp_upper) -> bool {  return exp >= -4 && exp < exp_upper;}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename Out, typename C>  constexpr auto apply(Out out, basic_string_view<C>) const -> Out {    return out;  }<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename T> constexpr auto min_of(T a, T b) -> T {  return a < b ? a : b;}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename T> constexpr auto max_of(T a, T b) -> T {  return a > b ? a : b;}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename... T> constexpr auto count_named_args() -> int {  return count<is_named_arg<T>::value...>();}
+cslen(s) + 1) * sizeof(*s));
+}
+
+private:
+static std::recursive_mutex s_lock;
+static MddCore::PackageGraph
+    s<BOS> // language: primary=c++ standard=c++17 confidence=high
+           // <BOS>
+           // platform: x86_64-linux-gnu
+           // compiler: g++
+           // standard: c++17
+           // arch: x86_64
+           // mode: user
+    delete[] m_pDecisions;
+m_pDecisions = NULL;
+}
+}
+HRESULT
+TestDecisionCollection::InitFromTest rs(__in PCWSTR pPrefix,
+                                        __in TestQualifierSetCollection *pSets,
+                                        __in bool required);
+HRESULT InitFromTestVars(__in PCWSTR pPrefix,
+                         __in TestQualifierSetCollection *pSets) {
+  return InitFromTestVars(pPrefix, pSets, true);
+}
+int GetNumTestDecisions() const { return m_numDecisions; }
+HRESULT GetTestDecision(__in int index, __out TestDecision *pDecisionOut) const;
+HRESULT GetTestDecision(__in PCWSTR pId,
+                        __out TestDecision *pDecisionOut) const;
+bool TryGetDecision(__in PCWSTR pId, __in const IDecisionInfo *pDecisions,
+                    __in const UnifiedEnvironment *pEnvironment,
+                    __inout DecisionResult *pDecisionOut) const;
+static bool TryGetDecision(__in const TestDecision *pTestSpec,
+                           __in const IDecisionInfo *pDecisions,
+                           __in const UnifiedEnvironment *pEnvironment,
+                           __inout DecisionResult *pDecisionOut);
+HRESULT GetOrAddDecision(__in PCWSTR pId, __in DecisionInfoBuilder *pDecisions,
+                         __inout_opt DecisionResult *pDecisionOut);
+static HRESULT GetOrAddDecision(__in const TestDecision *pTestSpec,
+                                __in DecisionInfoBuilder *pDecisions,
+                                __inout_opt DecisionResult *pDecisionOut);
+
+protected:
+int m_numDecisions;
+TestDataArray<String> m_testStrings;
+TestStringArray *m_pSpecs;
+TestDecision *m_pDecisions;
+}
+;
+class TestDecisionInfo {
+public:
+  TestDecisionInfo();
+  ~TestDecisionInfo();
+  HRESULT InitDataFromTestVars(__in PCWSTR pPrefix);
+ HRESULT ApplyTestData(__inout DecisionInfoB
 ```
 ### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
 ```json
@@ -804,8 +1651,8 @@ clang-format ok: **True**
     },
     {
       "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -918,8 +1765,8 @@ clang-format ok: **True**
     },
     {
       "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1032,8 +1879,8 @@ clang-format ok: **True**
     },
     {
       "i": 14,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1203,8 +2050,8 @@ clang-format ok: **True**
     },
     {
       "i": 23,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1355,8 +2202,8 @@ clang-format ok: **True**
     },
     {
       "i": 31,
-      "tok_id": 347,
-      "tok": "//",
+      "tok_id": 47,
+      "tok": "<NL>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1374,16 +2221,16 @@ clang-format ok: **True**
     },
     {
       "i": 32,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 347,
+      "tok": "//",
       "A_platform": 0,
-      "B_structure": "
+     
 ```
 
 
 ---
 
-## Example 3 — `fmt.parquet` row 2
+## Example 4 — `WindowsAppSDK.parquet` row 3
 
 ### Provenance
 ```json
@@ -1401,19 +2248,50 @@ clang-format ok: **True**
 ### Roundtrip (our cpp_tokenizer: detok -> retok)
 | metric | value |
 |---|---|
-| text_roundtrip (byte-exact decode) | False |
+| text_roundtrip (byte-exact decode) | True |
 | reencode_idempotent (load-bearing) | True |
-| id_exact (literal stored-ids match) | False |
-| id_match_modulo_ws_collapse | False |
-| first_id_divergence | 2 |
-| n_stored_ids / n_reencoded | 1024 / 1021 |
-
-> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
+| id_exact (literal stored-ids match) | True |
+| id_match_modulo_ws_collapse | True |
+| first_id_divergence | None |
+| n_stored_ids / n_reencoded | 1024 / 1024 |
 
 ### clang-format'd CODE portion
 clang-format ok: **True**
 ```cpp
-<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userconstexpr locale_ref() : locale_(nullptr) {}void vformat_to(buffer<char>& buf, string_view fmt, format_args args,                         locale_ref loc) {  auto out = appender(buf);  if (fmt.size() == 2 && equal2(fmt.data(), "{}"))    return args.get(0).visit(default_arg_formatter<char>{out});  parse_format_string(fmt,                      format_handler<>{parse_context<>(fmt), {out, args, loc}});}inline void vprint(std::ostream& os, string_view fmt, format_args args) {  auto buffer = memory_buffer();  detail::vformat_to(buffer, fmt, args);  FILE* f = nullptr;#if FMT_MSVC_STL_UPDATE && FMT_USE_RTTI  if (auto* buf = dynamic_cast<std::filebuf*>(os.rdbuf()))    f = detail::get_file(*buf);#elif defined(_WIN32) && defined(__GLIBCXX__) && FMT_USE_RTTI  auto* rdbuf = os.rdbuf();  if (auto* sfbuf = dynamic_cast<__gnu_cxx::stdio_sync_filebuf<char>*>(rdbuf))    f = sfbuf->file();  else if (auto* fbuf = dynamic_cast<__gnu_cxx::stdio_filebuf<char>*>(rdbuf))    f = fbuf->file();#endif#ifdef _WIN32  if (f) {    int fd = _fileno(f);    if (_isatty(fd)) {      os.flush();      if (detail::write_console(fd, {buffer.data(), buffer.size()})) return;    }  }#endif  detail::ignore_unused(f);  detail::write_buffer(os, buffer);}using string_view = basic_string_view<char>using format_args = basic_format_args<context>class locale_ref {#if FMT_USE_LOCALE private:  const void* locale_;  // A type-erased pointer to std::locale. public:  constexpr locale_ref() : locale_(nullptr) {}  template <typename Locale, FMT_ENABLE_IF(sizeof(Locale::collate) != 0)>  locale_ref(const Locale& loc) : locale_(&loc) {    // Check if std::isalpha is found via ADL to reduce the chance of misuse.    detail::ignore_unused(sizeof(isalpha('x', loc)));  }  inline explicit operator bool() const noexcept { return locale_ != nullptr; }#else public:  inline explicit operator bool() const noexcept { return false; }#endif  // FMT_USE_LOCALE public:  template <typename Locale> auto get() const -> Locale;}
+eInfo FromPackageInfoReference(
+    PACKAGE_INFO_REFERENCE packageInfoReference,
+    const UINT32 flags = PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT |
+                         PACKAGE_FILTER_OPTIONAL | PACKAGE_FILTER_RESOURCE |
+                         PACKAGE_FILTER_BUNDLE,
+    const PackagePathType packagePathType = PackagePathType_Effective) {
+  UINT32 bufferLength{};
+  const LONG rc{appmodel::GetPackageInfo2(packageInfoReference, flags,
+                                          packagePathType, &bufferLength,
+                                          nullptr, nullptr)};
+  THROW_HR_IF(HRESULT_FROM_WIN32(rc), rc != ERROR_INSUFFICIENT_BUFFER);
+  std::unique_ptr<BYTE[]> buffer{std::make_unique<BYTE[]>(bufferLength)};
+  UINT32 count{};
+  THROW_IF_WIN32_ERROR(appmodel::GetPackageInfo2(packageInfoReference, flags,
+                                                 packagePathType, &bufferLength,
+                                                 buffer.get(), &count));
+  auto packageInfo{PackageInfo(buffer.get(), count)};
+  buffer.release();
+  return packageInfo;
+}
+ PackageInfo() = defaul<BOS>// language: primary=c++ standard=c++17 confidence=high
+// <BOS>
+// platform: x86_64-linux-gnu
+// compiler: g++
+// standard: c++17
+// arch: x86_64
+// mode: user
+== medStr);
+ }
+ void DefStringResultTests_Reference::GetWritableRef(void) {
+   PWSTR pRef;
+   size_t cchRef;
+   PWSTR stuff = L"pqowl"; // must be shorter than medStr
+ size_t cchStuff = _countof(L"pqowce>, public DefStringResult_Base{public:    TEST_CLASS(DefStringResultTests_Reference);    TEST_METHOD_SETUP(Setup);    TEST_METHOD_CLEANUP(Cleanup);    TEST_METHOD(New);    TEST_METHOD(Basics);    TEST_METHOD(InitRef);    TEST_METHOD(InitRef_Junk);    TEST_METHOD(GetRef);    TEST_METHOD(GetWritableRef);    TEST_METHOD(SetRef);    TEST_METHOD(SetBuf);    TEST_METHOD(SetBufNull);    TEST_METHOD(AcquireBuf);    TEST_METHOD(AcquireBufNull);    TEST_METHOD(SetContents);    TEST_METHOD(SetEmptyContents);    TEST_METHOD(ReleaseAfterAcquire);    TEST_METHOD(ReleaseEmptyBuf);    TEST_METHOD(Length);    TEST_METHOD(Compare);    TEST_METHOD(Concat);    TEST_METHOD(Copy);    TEST_METHOD(InvalidTests);};bool DefStringResultTests_Reference::Setup(void) { return SetupBase(DefResultType_Reference); }bool DefStringRes
 ```
 ### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
 ```json
@@ -1494,8 +2372,8 @@ clang-format ok: **True**
     },
     {
       "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1608,8 +2486,8 @@ clang-format ok: **True**
     },
     {
       "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1722,8 +2600,8 @@ clang-format ok: **True**
     },
     {
       "i": 14,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -1893,8 +2771,8 @@ clang-format ok: **True**
     },
     {
       "i": 23,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2045,8 +2923,8 @@ clang-format ok: **True**
     },
     {
       "i": 31,
-      "tok_id": 347,
-      "tok": "//",
+      "tok_id": 47,
+      "tok": "<NL>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2064,16 +2942,16 @@ clang-format ok: **True**
     },
     {
       "i": 32,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 347,
+      "tok": "//",
       "A_platform": 0,
-      "B_structure": "
+     
 ```
 
 
 ---
 
-## Example 4 — `fmt.parquet` row 3
+## Example 5 — `WindowsAppSDK.parquet` row 4
 
 ### Provenance
 ```json
@@ -2091,19 +2969,77 @@ clang-format ok: **True**
 ### Roundtrip (our cpp_tokenizer: detok -> retok)
 | metric | value |
 |---|---|
-| text_roundtrip (byte-exact decode) | False |
+| text_roundtrip (byte-exact decode) | True |
 | reencode_idempotent (load-bearing) | True |
-| id_exact (literal stored-ids match) | False |
-| id_match_modulo_ws_collapse | False |
-| first_id_divergence | 2 |
-| n_stored_ids / n_reencoded | 1024 / 1022 |
-
-> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
+| id_exact (literal stored-ids match) | True |
+| id_match_modulo_ws_collapse | True |
+| first_id_divergence | None |
+| n_stored_ids / n_reencoded | 1024 / 1024 |
 
 ### clang-format'd CODE portion
 clang-format ok: **True**
 ```cpp
-<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userconstexpr locale_ref() : locale_(nullptr) {}void vformat_to(buffer<char>& buf, string_view fmt, format_args args,                         locale_ref loc) {  auto out = appender(buf);  if (fmt.size() == 2 && equal2(fmt.data(), "{}"))    return args.get(0).visit(default_arg_formatter<char>{out});  parse_format_string(fmt,                      format_handler<>{parse_context<>(fmt), {out, args, loc}});}template <typename... T>void print(std::ostream& os, format_string<T...> fmt, T&&... args) {  fmt::vargs<T...> vargs = {{args...}};  if FMT_CONSTEXPR20 (detail::use_utf8) return vprint(os, fmt.str, vargs);  auto buffer = memory_buffer();  detail::vformat_to(buffer, fmt.str, vargs);  detail::write_buffer(os, buffer);}using string_view = basic_string_view<char>using format_args = basic_format_args<context>class locale_ref {#if FMT_USE_LOCALE private:  const void* locale_;  // A type-erased pointer to std::locale. public:  constexpr locale_ref() : locale_(nullptr) {}  template <typename Locale, FMT_ENABLE_IF(sizeof(Locale::collate) != 0)>  locale_ref(const Locale& loc) : locale_(&loc) {    // Check if std::isalpha is found via ADL to reduce the chance of misuse.    detail::ignore_unused(sizeof(isalpha('x', loc)));  }  inline explicit operator bool() const noexcept { return locale_ != nullptr; }#else public:  inline explicit operator bool() const noexcept { return false; }#endif  // FMT_USE_LOCALE public:  template <typename Locale> auto get() const -> Locale;}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userFMT_CONSTEXPR void multiply(uint32_t value) {    bigit carry = 0;    const double_bigit wide_value = value;    for (size_t i = 0, n = bigits_.size(); i < n; ++i) {      double_bigit result = bigits_[i] * wide_value + carry;      bigits_[i] = static_cast<bigit>(result);      carry = static_cast<bigit>(result >> bigit_bits);    }    if (carry != 0) bigits_.push_back(carry);  }
+:
+ m_packageInfoBuffer(std::move(other.m_packageInfoBuffer)),
+ m_count(other.m_count)
+ {
+   m_packageInfo = reinterpret_cast<PACKAGE_INFO *>(m_packageInfoBuffer.get());
+   other.m_packageInfo = nullptr;
+ }
+ PackageInfo(void* buffer, size_t <BOS>// language: primary=c++ standard=c++17 confidence=high
+// <BOS>
+// platform: x86_64-linux-gnu
+// compiler: g++
+// standard: c++17
+// arch: x86_64
+// mode: user
+ {
+  return 0;
+ }
+ auto base{ (((s[0] == L'0') && s[1] == L'x') ? 16 : 10) };
+ return wcstoul(s, nullptr, base);
+ }
+ static uint64_t uint64_from_string(PCWSTR s) {
+   if (!s)
+     <BOS> // language: primary=c++ standard=c++17 confidence=high
+           // <BOS>
+           // platform: x86_64-linux-gnu
+           // compiler: g++
+           // standard: c++17
+           // arch: x86_64
+           // mode: user
+         decimal truncate() const {
+       decimal value{};
+       THROW_IF_FAILED(
+           ::VarDecFix(const_cast<DECIMAL *>(&m_decimal), &value.m_decimal));
+       return value;
+     }
+   /// Return the integral digits rounded dow<BOS>// language: primary=c++
+   /// standard=c++17 confidence=high
+   // <BOS>
+   // platform: x86_64-linux-gnu
+   // compiler: g++
+   // standard: c++17
+   // arch: x86_64
+   // mode: user
+   RESULT CreateInstance(_In_ AtomPoolGroup * pAtoms, _In_ int major,
+                         _In_ int minor,
+                         _Outptr_ MrmEnvironment **environment) {
+     return MrmEnvironment::CreateInstance(
+         pAtoms, &CoreEnvironmentInitializer, major, minor,
+         e<BOS> // language: primary=c++ standard=c++17 confidence=high
+             // <BOS>
+             // platform: x86_64-linux-gnu
+             // compiler: g++
+             // standard: c++17
+             // arch: x86_64
+             // mode: user
+             ativeToScope,
+         _Inout_ int scopeIndex, _Inout_ StringResult *pNameOut) const {
+       return m_pNames->TryGetRelativeScopeName(relativeToScope, scopeIndex,
+                                                pNameOut);
+     }
+ HRESULT GetNumDescendents(_In_ int
 ```
 ### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
 ```json
@@ -2184,8 +3120,8 @@ clang-format ok: **True**
     },
     {
       "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2298,8 +3234,8 @@ clang-format ok: **True**
     },
     {
       "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2412,8 +3348,8 @@ clang-format ok: **True**
     },
     {
       "i": 14,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2583,8 +3519,8 @@ clang-format ok: **True**
     },
     {
       "i": 23,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2735,8 +3671,8 @@ clang-format ok: **True**
     },
     {
       "i": 31,
-      "tok_id": 347,
-      "tok": "//",
+      "tok_id": 47,
+      "tok": "<NL>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -2754,16 +3690,16 @@ clang-format ok: **True**
     },
     {
       "i": 32,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 347,
+      "tok": "//",
       "A_platform": 0,
-      "B_structure": "
+     
 ```
 
 
 ---
 
-## Example 5 — `fmt.parquet` row 4
+## Example 6 — `WindowsAppSDK.parquet` row 5
 
 ### Provenance
 ```json
@@ -2781,709 +3717,69 @@ clang-format ok: **True**
 ### Roundtrip (our cpp_tokenizer: detok -> retok)
 | metric | value |
 |---|---|
-| text_roundtrip (byte-exact decode) | False |
+| text_roundtrip (byte-exact decode) | True |
 | reencode_idempotent (load-bearing) | True |
-| id_exact (literal stored-ids match) | False |
-| id_match_modulo_ws_collapse | False |
-| first_id_divergence | 2 |
-| n_stored_ids / n_reencoded | 1024 / 1023 |
-
-> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
+| id_exact (literal stored-ids match) | True |
+| id_match_modulo_ws_collapse | True |
+| first_id_divergence | None |
+| n_stored_ids / n_reencoded | 1024 / 1024 |
 
 ### clang-format'd CODE portion
 clang-format ok: **True**
 ```cpp
-<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename... T>void println(std::ostream& os, format_string<T...> fmt, T&&... args) {  fmt::print(os, FMT_STRING("{}\n"),             fmt::format(fmt, std::forward<T>(args)...));}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userinline auto divide_by_10_to_kappa_plus_1(uint32_t n) noexcept -> uint32_t {  // 1374389535 = ceil(2^37/100)  return static_cast<uint32_t>((static_cast<uint64_t>(n) * 1374389535) >> 37);}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: uservoid unget(char c) {    file_base<F>::unget(c);    next_ = c;    has_next_ = true;  }<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userconstexpr auto begin() const noexcept -> iterator { return fmt_.begin(); }FMT_CONSTEXPR void advance_to(iterator it) {    fmt_.remove_prefix(detail::to_unsigned(it - begin()));  }using iterator = const Char*<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: usertemplate <typename Char> constexpr auto is_name_start(Char c) -> bool {  return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '_';}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: uservoid flush() {    auto size = this->size();    this->clear();    const T* begin = data_;    const T* end = begin + this->limit(size);    while (begin != end) *out_++ = *begin++;  }
-```
-### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
-```json
-{
-  "_legend": {
-    "edit_op": {
-      "0": "UNCHANGED",
-      "1": "INSERTED",
-      "2": "MODIFIED",
-      "3": "CONTEXT"
-    },
-    "structure_id": {
-      "0": "none/ws",
-      "1": "comment",
-      "2": "preproc",
-      "3": "decl/signature",
-      "4": "body/stmt",
-      "5": "expr",
-      "6": "identifier-ctx",
-      "7": "literal-ctx",
-      "8": "misc"
-    },
-    "def_use": {
-      "0": "none",
-      "1": "def",
-      "2": "use",
-      "3": "def+use"
-    },
-    "families": {
-      "A": "platform",
-      "B": "structure (syntax+structure)",
-      "C": "graph-semantic (symbol/def_use/call/type + edges)",
-      "D": "commit-edit (change-mask/hunk/edit-op/changed-chunks)"
-    }
-  },
-  "window": {
-    "start": 0,
-    "count": 40
-  },
-  "per_token": [
-    {
-      "i": 0,
-      "tok_id": 2,
-      "tok": "<BOS>",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 1,
-      "tok_id": 347,
-      "tok": "//",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 3,
-      "tok_id": 923,
-      "tok": "l",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 4,
-      "tok_id": 7587,
-      "tok": "ang",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 5,
-      "tok_id": 921,
-      "tok": "u",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 6,
-      "tok_id": 7429,
-      "tok": "age",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 7,
-      "tok_id": 359,
-      "tok": ":",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 9,
-      "tok_id": 9677,
-      "tok": "prim",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 10,
-      "tok_id": 4745,
-      "tok": "ary",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 11,
-      "tok_id": 373,
-      "tok": "=",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 12,
-      "tok_id": 7233,
-      "tok": "c",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 13,
-      "tok_id": 335,
-      "tok": "++",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 14,
-      "tok_id": 1214,
-      "tok": " ",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 15,
-      "tok_id": 7248,
-      "tok": "s",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 16,
-      "tok_id": 2020,
-      "tok": "tan",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 17,
-      "tok_id": 7234,
-      "tok": "d",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 18,
-      "tok_id": 7591,
-      "tok": "ard",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 19,
-      "tok_id": 373,
-      "tok": "=",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 20,
-      "tok_id": 7233,
-      "tok": "c",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 21,
-      "tok_id": 335,
-      "tok": "++",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 22,
-      "tok_id": 4917,
-      "tok": "17",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 23,
-      "tok_id": 1214,
-      "tok": " ",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 24,
-      "tok_id": 4725,
-      "tok": "co",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 25,
-      "tok_id": 7243,
-      "tok": "n",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 26,
-      "tok_id": 7322,
-      "tok": "fi",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 27,
-      "tok_id": 4704,
-      "tok": "de",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 28,
-      "tok_id": 39482,
-      "tok": "nce",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 29,
-      "tok_id": 373,
-      "tok": "=",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 30,
-      "tok_id": 9123,
-      "tok": "high",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 31,
-      "tok_id": 347,
-      "tok": "//",
-      "A_platform": 0,
-      "B_structure": "0:none/ws",
-      "B_dep_lvl": 0,
-      "B_ast_depth": 0,
-      "B_sibling": 0,
-      "B_ast_node": 0,
-      "C_symbol": 0,
-      "C_def_use": "0:none",
-      "C_call_tgt": 0,
-      "C_type_ref": 0,
-      "D_chg_pre": 0,
-      "D_chg_post": 0,
-      "D_hunk": -1,
-      "D_edit_op": "0:UNCHANGED"
-    },
-    {
-      "i": 32,
-      "tok_id": 1214,
-      "tok": " ",
-      "A_platform": 0,
-      "B_structure": "
-```
-
-
----
-
-## Example 6 — `fmt.parquet` row 5
-
-### Provenance
-```json
-{
-  "repo": "",
-  "filepath": "",
-  "commit_hash": "",
-  "timestamp": "",
-  "pr_number": null,
-  "sha_in_doc": null,
-  "repo_in_doc": null,
-  "brief": null
+if (this != &other) {
+  m_packageInfoBuffer = std::move(other.m_packageInfoBuffer);
+  m_packageInfo = reinterpret_cast<PACKAGE_INFO *>(m_packageInfoBuffer.get());
+  m_count = other.m_count;
+  other.m_packageInfo = nullptr;
+  other.m_count = 0;
 }
-```
-### Roundtrip (our cpp_tokenizer: detok -> retok)
-| metric | value |
-|---|---|
-| text_roundtrip (byte-exact decode) | False |
-| reencode_idempotent (load-bearing) | True |
-| id_exact (literal stored-ids match) | False |
-| id_match_modulo_ws_collapse | False |
-| first_id_divergence | 2 |
-| n_stored_ids / n_reencoded | 1024 / 1018 |
+return *this;
+}
+void Reset() {
+  m_packageInfo = nullptr;
+  <BOS> // language: primary=c++ standard=c++17 confidence=high
+      // <BOS>
+      // platform: x86_64-linux-gnu
+      // compiler: g++
+      // standard: c++17
+      // arch: x86_64
+      // mode: user
+      tificateEkuValidator::IsPackageValid(
+          winrt::Windows::Foundation::IInspectable const &appxPackagingObject) {
+    winrt::com_ptr<IAppxPackageReader> packageReader;
+    if (SUCCEEDED(appxPackagingObject.as(IID_PPV_ARGS(&packageReader)))) {
+      winrt::com_ptr<IAppxFile> signatureFile;
+      if (FAILED_LOG(packageReader->GetFootprintFile(
+              APPX_FOOTPRINT_FILE_TYPE_SIGNATURE, signatureFile.put()))) {
+        return false;
+      }
+      return CheckSignature(signatureFile.get());
+    }
+    winrt::com_ptr<IAppxBundleReader> bundleReader;
+    if (SUCCEEDED(appxPackagingObject.as(IID_PPV_ARGS(&bundleReader)))) {
+      winrt::com_ptr<IAppxFile> signatureFile;
+      if (FAILED_LOG(bundleReader->GetFootprintFile(
+              APPX_BUNDLE_FOOTPRINT_FILE_TYPE_SIGNATURE,
+              signatureFile.put()))) {
+        return false;
+      }
+      return CheckSignature(signatureFile.get());
+    }
+    THROW_HR(APPX_E_CORRUPT_CONTENT);
+  }
+  bool PackageCertificateEkuValidator : kageCertificateEkuValidator
+      : PackageCertificateEkuValidatorT<PackageCertificateEkuValidator> {
+    PackageCertificateEkuValidator(hstring const &expectedCertificateEku);
+    bool IsPackageValid(
+        winrt::Windows::Foundation::IInspectable const &appxPackagingObject);
 
-> id_exact=False is EXPECTED: stored ids preserve raw indentation as repeated literal-space tokens, while encode() canonicalizes whitespace runs to a single <SPACE> sentinel. reencode_idempotent is the load-bearing guarantee (deterministic, self-consistent tokenizer).
-
-### clang-format'd CODE portion
-clang-format ok: **True**
-```cpp
-<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: uservoid assert_fail(const char* file, int line, const char* message) {  // Use unchecked std::fprintf to avoid triggering another assertion when  // writing to stderr fails.  std::fprintf(stderr, "%s:%d: assertion failed: %s", file, line, message);  abort();}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userFMT_INLINE auto remove_trailing_zeros(uint32_t& n, int s = 0) noexcept -> int {  FMT_ASSERT(n != 0, "");  // Modular inverse of 5 (mod 2^32): (mod_inv_5 * 5) mod 2^32 = 1.  constexpr uint32_t mod_inv_5 = 0xcccccccd;  constexpr uint32_t mod_inv_25 = 0xc28f5c29;  // = mod_inv_5 * mod_inv_5  while (true) {    auto q = rotr(n * mod_inv_25, 2);    if (q > max_value<uint32_t>() / 100) break;    n = q;    s += 2;  }  auto q = rotr(n * mod_inv_5, 1);  if (q <= max_value<uint32_t>() / 10) {    n = q;    s |= 1;  }  return s;}<BOS>// language: primary=c++ standard=c++17 confidence=high// <BOS>// platform: x86_64-linux-gnu// compiler: g++// standard: c++17// arch: x86_64// mode: userconstexpr explicit compile_parse_context(basic_string_view<Char> fmt,                                           int num_args, const type* types,                                           int next_arg_id = 0)      : base(fmt, next_arg_id), num_args_(num_args), types_(types) {}enum class type {  none_type,  // Integer types should go first,  int_type,  uint_type,  long_long_type,  ulong_long_type,  int128_type,  uint128_type,  bool_type,  char_type,  last_integer_type = char_type,  // followed by floating-point types.  float_type,  double_type,  long_double_type,  last_numeric_type = long_double_type,  cstring_type,  string_type,  pointer_type,  custom_type}using base = parse_context<Char>
+  private:
+    bool CheckSignature(IAppxFile * signatureFile);
+    hstring m_expectedEku{};
+  };
+}
+namespace winr
 ```
 ### Sidecar — per-channel JSON (A platform / B structure / C graph / D edit)
 ```json
@@ -3564,8 +3860,8 @@ clang-format ok: **True**
     },
     {
       "i": 2,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -3678,8 +3974,8 @@ clang-format ok: **True**
     },
     {
       "i": 8,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -3792,8 +4088,8 @@ clang-format ok: **True**
     },
     {
       "i": 14,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -3963,8 +4259,8 @@ clang-format ok: **True**
     },
     {
       "i": 23,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 46,
+      "tok": "<SPACE>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -4115,8 +4411,8 @@ clang-format ok: **True**
     },
     {
       "i": 31,
-      "tok_id": 347,
-      "tok": "//",
+      "tok_id": 47,
+      "tok": "<NL>",
       "A_platform": 0,
       "B_structure": "0:none/ws",
       "B_dep_lvl": 0,
@@ -4134,8 +4430,8 @@ clang-format ok: **True**
     },
     {
       "i": 32,
-      "tok_id": 1214,
-      "tok": " ",
+      "tok_id": 347,
+      "tok": "//",
       "A_platform": 0,
-      "B_structure": "
+     
 ```
