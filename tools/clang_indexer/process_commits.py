@@ -987,8 +987,73 @@ def extract_function_chain(
 # Document formatting
 # ---------------------------------------------------------------------------
 
+# Trailing PR-number marker in commit subjects, e.g. "Fix foo (#1234)".
+_SUBJECT_PR_RE = re.compile(r'\(#(\d+)\)\s*$')
+# Body trailers referencing a PR/issue, e.g. "Closes #42", "fixes #7".
+_BODY_PR_RE = re.compile(
+    r'(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ :]+#(\d+)',
+    re.IGNORECASE,
+)
+# Git trailer lines we KEEP in the NL docstring (provenance / review signal).
+_KEPT_TRAILER_RE = re.compile(
+    r'^(Closes|Fixes|Resolves|Reviewed-by|Reviewed-on|Change-Id|Bug|'
+    r'Differential Revision)\s*:',
+    re.IGNORECASE,
+)
+# Git trailer lines we STRIP from the NL docstring (noise / boilerplate).
+_STRIPPED_TRAILER_RE = re.compile(
+    r'^(Signed-off-by|Co-authored-by)\s*:',
+    re.IGNORECASE,
+)
+
+
+def parse_pr_number(record: dict) -> Optional[int]:
+    """Parse a PR/issue number from the subject trailer or body trailers.
+
+    Precedence: explicit ``pr_number`` already on the record (e.g. attached by
+    merge-commit mining) > subject ``(#N)`` trailer > body ``Closes/Fixes #N``.
+    Returns None when no number can be parsed.
+    """
+    existing = record.get('pr_number')
+    if existing not in (None, '', 0):
+        return int(existing)
+
+    subject = record.get('subject', '') or ''
+    m = _SUBJECT_PR_RE.search(subject)
+    if m:
+        return int(m.group(1))
+
+    body = record.get('body', '') or ''
+    m = _BODY_PR_RE.search(body)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def _filter_body_trailers(body: str) -> list[str]:
+    """Return body lines with Signed-off-by/Co-authored-by trailers stripped.
+
+    Kept trailers (Closes/Fixes/Resolves/Reviewed-by/Reviewed-on/Change-Id/
+    Bug/Differential Revision) and ordinary prose are preserved verbatim.
+    """
+    out: list[str] = []
+    for line in body.splitlines():
+        if _STRIPPED_TRAILER_RE.match(line.strip()):
+            continue
+        out.append(line)
+    return out
+
+
 def build_docstring(record: dict) -> str:
-    """Build C++ docstring comment from commit metadata."""
+    """Build C++ docstring comment from commit metadata.
+
+    Emits provenance lines (@pr / @repo / @sha) so the SHA, repo, and parsed PR
+    number survive into the natural-language docstring that the model trains on,
+    and so downstream joins (e.g. GitHub-Archive PR text) have a key. Strips
+    Signed-off-by / Co-authored-by trailers from the body but keeps review /
+    issue-reference trailers, while still capturing the FULL body as @details.
+    """
     parts = ['/**']
     subject = record.get('subject', '').strip()
     if subject:
@@ -997,21 +1062,44 @@ def build_docstring(record: dict) -> str:
 
     repo = record.get('repo', '')
     filepath = record.get('filepath', '')
+    commit_hash = record.get('commit_hash', '')
+    pr_number = parse_pr_number(record)
+    pr_title = (record.get('pr_title') or '').strip()
+    source_branch = (record.get('source_branch') or '').strip()
+
+    # Provenance block: repo / sha / pr keep the join keys in the NL text.
     if repo:
-        parts.append(f' * Repository: {repo}')
+        parts.append(f' * @repo {repo}')
     if filepath:
         parts.append(f' * File: {filepath}')
+    if commit_hash:
+        parts.append(f' * @sha {commit_hash}')
+    if pr_number is not None:
+        if pr_title:
+            parts.append(f' * @pr {pr_number} {pr_title}')
+        else:
+            parts.append(f' * @pr {pr_number}')
+    if source_branch:
+        parts.append(f' * @branch {source_branch}')
+
+    # Gerrit / code-review note text (best-effort, attached by the extractor).
+    note_text = (record.get('note_text') or '').strip()
+    if note_text:
+        parts.append(' *')
+        for line in note_text.splitlines()[:12]:
+            parts.append(f' * {line.rstrip()}')
 
     # Full commit/PR body as @details: the rationale, design discussion, and any
     # spec text the author put in the message (squash-merged PRs carry the whole
     # PR description here). Capture it ALL (200-line safety cap vs pathological
-    # bodies; the per-doc token limit downstream filters genuine giants). Earlier
-    # this truncated to 8 lines and dropped most of the explanation.
+    # bodies; the per-doc token limit downstream filters genuine giants). The
+    # Signed-off-by / Co-authored-by trailers are stripped first (noise); review
+    # / issue-reference trailers and ordinary prose are kept verbatim.
     body = record.get('body', '').strip()
     if body:
         parts.append(' *')
         parts.append(' * @details')
-        for line in body.splitlines()[:200]:
+        for line in _filter_body_trailers(body)[:200]:
             parts.append(f' * {line.rstrip()}')
 
     parts.append(' */')
@@ -1354,6 +1442,31 @@ def _build_enriched_from_parts(
         new_analysis=new_analysis,
     )
     result.update(temporal_meta)
+
+    # Provenance round-trip: thread commit_hash / timestamp / repo / filepath /
+    # pr_number (+ raw-chronology fields) from the source record into the doc
+    # dict so clang_enriched_to_parquet.py can populate the parquet columns.
+    # Without this the SHA + timestamp columns end up 0% populated and the later
+    # GitHub-Archive PR-text join has no key.
+    result['repo'] = record.get('repo', '')
+    result['filepath'] = record.get('filepath', '')
+    result['commit_hash'] = record.get('commit_hash', record.get('commit', ''))
+    result['timestamp'] = record.get('timestamp', '')
+    result['pr_number'] = parse_pr_number(record)
+    result['pr_title'] = record.get('pr_title', '')
+    result['source_branch'] = record.get('source_branch', '')
+    result['parent_hashes'] = list(record.get('parent_hashes', []) or [])
+    result['parent_count'] = record.get('parent_count')
+    result['is_merge_commit'] = record.get('is_merge_commit')
+    result['author_timestamp'] = record.get('author_timestamp')
+    result['commit_timestamp'] = record.get('commit_timestamp')
+    result['repo_stable_id'] = record.get('repo_stable_id')
+    result['filepath_stable_id'] = record.get('filepath_stable_id')
+    result['file_local_commit_index'] = record.get('file_local_commit_index')
+    result['has_ambiguous_reconstruction'] = record.get(
+        'has_ambiguous_reconstruction', False
+    )
+    result['has_rename_ambiguity'] = record.get('has_rename_ambiguity', False)
 
     # Platform info detection mirrors the source-indexer path.
     _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
