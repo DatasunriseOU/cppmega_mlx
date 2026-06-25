@@ -999,10 +999,16 @@ def build_docstring(record: dict) -> str:
     if filepath:
         parts.append(f' * File: {filepath}')
 
+    # Full commit/PR body as @details: the rationale, design discussion, and any
+    # spec text the author put in the message (squash-merged PRs carry the whole
+    # PR description here). Capture it ALL (200-line safety cap vs pathological
+    # bodies; the per-doc token limit downstream filters genuine giants). Earlier
+    # this truncated to 8 lines and dropped most of the explanation.
     body = record.get('body', '').strip()
     if body:
         parts.append(' *')
-        for line in body.splitlines()[:8]:
+        parts.append(' * @details')
+        for line in body.splitlines()[:200]:
             parts.append(f' * {line.rstrip()}')
 
     parts.append(' */')
