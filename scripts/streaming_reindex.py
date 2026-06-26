@@ -292,12 +292,17 @@ def stage_index_source(
     work: Path,
     dedup_db: Path | None = None,
     dedup_near: bool = True,
+    global_symbol_index: Path | None = None,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.
 
     Passes --tokenizer-path so index_project runs FUNCTION-LEVEL tokenized-hash
     dedup before grouping; --dedup-db makes that dedup GLOBAL + resumable +
     cross-stream (shared with commits) when given.
+
+    --global-symbol-index, when given, enables bounded cross-repo base-lib symbol
+    linking inside index_project (depth-1 pulls tagged crosslib:<repo>). None ->
+    behavior unchanged.
     """
     enriched = work / f"{repo}.enriched.jsonl"
     cmd = [
@@ -313,6 +318,8 @@ def stage_index_source(
         cmd += ["--dedup-db", str(dedup_db)]
     if not dedup_near:
         cmd += ["--no-near-dedup"]
+    if global_symbol_index is not None:
+        cmd += ["--global-symbol-index", str(global_symbol_index)]
     run_checked(
         repo,
         "index_project",
@@ -461,6 +468,7 @@ def process_one_repo(
     work_root: Path,
     dedup_db: Path | None = None,
     dedup_near: bool = True,
+    global_symbol_index: Path | None = None,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
@@ -475,7 +483,8 @@ def process_one_repo(
     work = work_root / repo
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
-    enriched = stage_index_source(repo, repo_dir, work, dedup_db, dedup_near)
+    enriched = stage_index_source(repo, repo_dir, work, dedup_db, dedup_near,
+                                  global_symbol_index)
     tok = stage_materialize(repo, enriched, work)
 
     _bucket_for, route_by_fit = _route_by_fit_impl()
@@ -556,6 +565,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "streams. Pass the SAME path to streaming_reindex_commits.py.")
     p.add_argument("--no-near-dedup", action="store_true",
                    help="Disable MinHash-LSH near dedup (exact-only).")
+    p.add_argument("--global-symbol-index", default=None,
+                   help="Path to the GLOBAL cross-repo base-lib symbol SQLite store "
+                        "(built by scripts/crossrepo/build_global_symbol_index.py). "
+                        "When set, the CODE stage threads it into index_project so "
+                        "unresolved base-lib callees are pulled in as bounded "
+                        "depth-1 deps tagged crosslib:<repo>. DEFAULT off.")
     return p.parse_args(argv)
 
 
@@ -590,6 +605,14 @@ def main(argv: list[str]) -> int:
         print(f"Dedup: SHARED global store at {dedup_db} "
               f"(exact{'+near' if dedup_near else ''}, tokenized hash)",
               file=sys.stderr)
+
+    # Optional cross-repo base-lib symbol index. FAIL LOUD if given but missing.
+    global_symbol_index = Path(args.global_symbol_index) if args.global_symbol_index else None
+    if global_symbol_index is not None:
+        if not global_symbol_index.exists():
+            raise SystemExit(f"--global-symbol-index not found: {global_symbol_index}")
+        print(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
+              f"threaded into CODE stage (bounded depth-1 pulls).", file=sys.stderr)
 
     if args.work_dir:
         work_root = Path(args.work_dir)
@@ -658,7 +681,7 @@ def main(argv: list[str]) -> int:
             for repo, repo_dir in gen:
                 try:
                     info = process_one_repo(repo, repo_dir, target_lengths, work_root,
-                                            dedup_db, dedup_near)
+                                            dedup_db, dedup_near, global_symbol_index)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

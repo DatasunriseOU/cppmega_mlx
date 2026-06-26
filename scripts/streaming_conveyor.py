@@ -120,6 +120,7 @@ def run_code_half(
     work_root: Path,
     dedup_db: Path | None,
     dedup_near: bool,
+    global_symbol_index: Path | None = None,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -130,7 +131,8 @@ def run_code_half(
     RAISES RepoFailure on any stage failure (no fallback).
     """
     info = sr.process_one_repo(
-        repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near
+        repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
+        global_symbol_index,
     )
     # zstd-max the per-length code parquet files this repo just wrote.
     for L in info.get("lengths", {}):
@@ -256,6 +258,7 @@ def process_one_repo(
     dedup_near: bool,
     pr_store: Path | None,
     repo_list: Path | None,
+    global_symbol_index: Path | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -277,7 +280,8 @@ def process_one_repo(
         else:
             try:
                 cinfo = run_code_half(
-                    repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near
+                    repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
+                    global_symbol_index,
                 )
                 with manifest_lock:
                     manifest.mark_done(ck, cinfo)
@@ -360,6 +364,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--repo-list", default=str(DEFAULT_REPO_LIST),
                    help="repo_list.json (bare-name -> owner/repo) for resolving "
                         f"the PR-store key. Default {DEFAULT_REPO_LIST}.")
+    p.add_argument("--global-symbol-index", default=None,
+                   help="Path to the GLOBAL cross-repo base-lib symbol SQLite store "
+                        "(built by scripts/crossrepo/build_global_symbol_index.py). "
+                        "When set, the CODE half threads it into index_project so "
+                        "unresolved base-lib callees are pulled as bounded depth-1 "
+                        "deps tagged crosslib:<repo>. DEFAULT off (unchanged).")
     return p.parse_args(argv)
 
 
@@ -414,6 +424,16 @@ def main(argv: list[str]) -> int:
         _log(f"PR-store: inject record['pr_discussion'] from {pr_store} "
              f"(repo_list={repo_list})")
 
+    # Optional cross-repo base-lib symbol index. FAIL LOUD if given but missing.
+    global_symbol_index = (
+        Path(args.global_symbol_index) if args.global_symbol_index else None
+    )
+    if global_symbol_index is not None:
+        if not global_symbol_index.exists():
+            raise SystemExit(f"--global-symbol-index not found: {global_symbol_index}")
+        _log(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
+             f"threaded into CODE half (bounded depth-1 pulls, crosslib:<repo>).")
+
     manifest = Manifest.load(CONVEYOR_MANIFEST)
     manifest_lock = threading.Lock()
     resume = not args.no_resume
@@ -449,6 +469,7 @@ def main(argv: list[str]) -> int:
                 repo, repo_dir, lengths_code, lengths_commits, args.range_size,
                 work_root, pool, manifest, manifest_lock, resume, cumulative,
                 args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
+                global_symbol_index,
             )
             processed_repos += 1
             if isinstance(res.get("code"), dict):

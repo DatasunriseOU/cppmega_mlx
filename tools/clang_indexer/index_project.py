@@ -31,6 +31,7 @@ import glob
 import importlib
 import json
 import os
+import sqlite3
 import sys
 import hashlib
 
@@ -249,7 +250,18 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
         raise RuntimeError(f"{message} Last error: {last_error}") from last_error
     raise RuntimeError(message)
 
-PartInfo: TypeAlias = tuple[str, int, int, str, str | None]
+# A doc PART. Historically a 5-tuple (text, kind, dep_level, name, qname_or_none).
+# Cross-repo base-lib pulls append a 6th element: dep_source — a provenance
+# marker like 'crosslib:<repo>' (None / absent for normal local parts). Builders
+# accept BOTH the 5- and 6-tuple forms (see _part_dep_source).
+PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
+    str, int, int, str, str | None, str | None
+]
+
+
+def _part_dep_source(part: tuple) -> str | None:
+    """dep_source provenance of a doc part (None for normal local parts)."""
+    return part[5] if len(part) >= 6 else None
 
 
 # C++ source file extensions
@@ -1255,12 +1267,119 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# --------------------------------------------------------------------------- #
+# Cross-repo base-lib symbol linking (OPTIONAL; default off).
+#
+# When --global-symbol-index <path> is given, an unresolved callee (one NOT in
+# the local repo index) is looked up in the GLOBAL base-lib symbol store built by
+# scripts/crossrepo/build_global_symbol_index.py. If it is a selected base-lib
+# symbol, its DEFINITION is pulled in as the DEEPEST dependency chunk of the
+# document and tagged dep_source='crosslib:<repo>' so the model knows it is a
+# base-lib impl and which lib it came from. Behavior is UNCHANGED when the flag
+# is absent (global_symbols is None everywhere).
+#
+# HARD BOUNDS (RULE #1: bounded, no silent explosion):
+#   * cross-lib depth = 1 (pulled defs are leaves; we never follow their callees)
+#   * a cap on the number of cross-lib deps per document
+#   * a cross-lib token budget per document
+#   * trivial/tiny inline bodies are excluded at BUILD time (body-len floor) so
+#     they never enter the store.
+# --------------------------------------------------------------------------- #
+CROSSLINK_MAX_DEPS_PER_DOC = 12
+CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
+
+
+class CrossLinkBudget:
+    """Per-document bound on cross-lib pulls (count + token budget)."""
+
+    __slots__ = ["max_deps", "token_budget", "used_deps", "used_tokens"]
+
+    def __init__(self, max_deps: int = CROSSLINK_MAX_DEPS_PER_DOC,
+                 token_budget: int = CROSSLINK_TOKEN_BUDGET_PER_DOC):
+        self.max_deps = max_deps
+        self.token_budget = token_budget
+        self.used_deps = 0
+        self.used_tokens = 0
+
+    def has_room(self) -> bool:
+        return self.used_deps < self.max_deps and self.used_tokens < self.token_budget
+
+    def can_afford(self, tok: int) -> bool:
+        return (self.used_deps < self.max_deps
+                and self.used_tokens + tok <= self.token_budget)
+
+    def spend(self, tok: int) -> None:
+        self.used_deps += 1
+        self.used_tokens += tok
+
+
+class GlobalSymbolReader:
+    """Read-only accessor over the global base-lib symbol SQLite store.
+
+    A miss returns None (the callee is not a selected base-lib symbol) — that is
+    the normal case for most callees and is NOT a fallback: the ONE clear path is
+    "consult the index; pull if present, otherwise leave unresolved as before".
+    """
+
+    def __init__(self, path: str):
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"--global-symbol-index not found: {path} (build it with "
+                f"scripts/crossrepo/build_global_symbol_index.py)"
+            )
+        self.path = path
+        uri = f"file:{path}?mode=ro"
+        self._conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+        self._cache: dict[str, dict | None] = {}
+
+    def lookup(self, qname: str) -> dict | None:
+        """Return the base-lib FUNCTION def for ``qname`` or None.
+
+        Returns a dict with at least: base_repo, base_lib, text, token_est, kind.
+        Cached per-process; the store is read-only at doc-build time.
+        """
+        if qname in self._cache:
+            return self._cache[qname]
+        row = self._conn.execute(
+            "SELECT base_lib, base_repo, text, token_est, kind "
+            "FROM symbols WHERE qname=? AND sym_type='func' LIMIT 1",
+            (qname,),
+        ).fetchone()
+        if row is None:
+            self._cache[qname] = None
+            return None
+        rec = {
+            "base_lib": row[0], "base_repo": row[1], "text": row[2],
+            "token_est": row[3], "kind": row[4],
+        }
+        self._cache[qname] = rec
+        return rec
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 def collect_transitive_deps(
     root_qname: str,
     index: ProjectIndex,
     max_depth: int = 5,
+    *,
+    global_symbols: "GlobalSymbolReader | None" = None,
+    crosslink_visited: set[str] | None = None,
+    crosslink_budget: "CrossLinkBudget | None" = None,
 ) -> list[str]:
-    """BFS to collect transitive dependencies of a function."""
+    """BFS to collect transitive dependencies of a function.
+
+    When ``global_symbols`` is supplied (the optional cross-repo base-lib symbol
+    index), an UNRESOLVED callee — one that is NOT in the local repo index — is
+    looked up in the global index. If it is a selected base-lib symbol it is
+    recorded as a CROSS-LIB pull in ``crosslink_visited`` (qnames) under HARD
+    BOUNDS enforced by ``crosslink_budget`` (cross-lib depth = 1, a per-doc cap
+    on the number of cross-lib deps, and a per-doc cross-lib token budget). We do
+    NOT recurse into a pulled base-lib function's own transitive closure inside
+    the base lib (depth-1 only), and we SKIP trivial/tiny inline bodies — that is
+    bounded by ``crosslink_budget`` + the builder's body-len floor.
+    """
     visited = {root_qname}
     queue = deque([(root_qname, 0)])
     deps = []
@@ -1273,10 +1392,31 @@ def collect_transitive_deps(
         if not func:
             continue
         for callee in func.callees:
-            if callee not in visited and callee in index.functions:
+            if callee in visited:
+                continue
+            if callee in index.functions:
                 visited.add(callee)
                 deps.append(callee)
                 queue.append((callee, depth + 1))
+            elif (
+                global_symbols is not None
+                and crosslink_visited is not None
+                and crosslink_budget is not None
+            ):
+                # Unresolved callee: try the cross-repo base-lib index. Depth-1
+                # only — a pulled base-lib def is a LEAF here; we never enqueue it
+                # so its base-lib-internal callees are not followed.
+                if callee in crosslink_visited:
+                    continue
+                if not crosslink_budget.has_room():
+                    continue
+                hit = global_symbols.lookup(callee)
+                if hit is None:
+                    continue
+                if not crosslink_budget.can_afford(hit["token_est"]):
+                    continue
+                crosslink_visited.add(callee)
+                crosslink_budget.spend(hit["token_est"])
 
     return deps
 
@@ -1313,7 +1453,10 @@ def extract_ast_metadata_from_parts(
     ast_node_type = [0] * text_len
     offset = 0
 
-    for part_index, (part_text, kind, dep_level, _name, _qname) in enumerate(parts_info):
+    for part_index, part in enumerate(parts_info):
+        part_text, kind, dep_level, _name, _qname = (
+            part[0], part[1], part[2], part[3], part[4]
+        )
         part_len = len(part_text)
         if part_len <= 0:
             continue
@@ -1654,12 +1797,15 @@ def build_enriched_doc(
     offset = 0
 
     # Map chunk_idx -> qname for edge computation
-    chunk_qnames = {}        # function chunks only (call-edge sources/targets)
+    chunk_qnames = {}        # local function chunks (call-edge SOURCES; carry callees)
+    chunk_target_qnames = {} # call-edge TARGETS: local funcs + cross-lib base-lib pulls
     chunk_callees = {}
     chunk_all_qnames = {}    # ANY named chunk incl. type defs (type-edge targets)
     chunk_types = {}         # referenced_types per function chunk (type-edge sources)
 
-    for i, (part_text, kind, dep_level, name, qname) in enumerate(parts_info):
+    for i, part in enumerate(parts_info):
+        part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
+        dep_source = _part_dep_source(part)
         part_len = len(part_text)
         if offset + part_len > text_len:
             break
@@ -1668,17 +1814,30 @@ def build_enriched_doc(
         for j in range(offset, offset + part_len):
             structure_ids[j] = kind
 
-        chunk_boundaries.append({
+        boundary = {
             'start': offset,
             'end': offset + part_len,
             'kind': kind,
             'dep_level': dep_level,
             'name': name,
-        })
+        }
+        # Tag cross-repo base-lib pulls with their provenance so the model knows
+        # this chunk is a base-lib impl and which lib it came from.
+        if dep_source is not None:
+            boundary['dep_source'] = dep_source
+        chunk_boundaries.append(boundary)
 
         # Track qnames for edge computation.
         if qname:
             chunk_all_qnames[i] = qname
+            # Call-edge TARGET candidates = local function chunks AND cross-lib
+            # base-lib pulls (a pulled def is a real callee target even though it
+            # is not in the LOCAL index). This lets root->base-lib call_edges
+            # resolve to the pulled chunk.
+            if qname in index.functions or (
+                dep_source is not None and dep_source.startswith("crosslib:")
+            ):
+                chunk_target_qnames[i] = qname
         if qname and qname in index.functions:
             chunk_qnames[i] = qname
             chunk_callees[i] = index.functions[qname].callees
@@ -1688,12 +1847,13 @@ def build_enriched_doc(
         if i < len(parts_info) - 1:
             offset += 2  # "\n\n"
 
-    # Compute call_edges
+    # Compute call_edges. Sources are local function chunks (they carry callees);
+    # targets include local function chunks AND cross-lib base-lib pulls.
     call_edges = []
     for ci, caller_qname in chunk_qnames.items():
         callees = chunk_callees.get(ci, [])
         for callee_qname in callees:
-            for cj, target_qname in chunk_qnames.items():
+            for cj, target_qname in chunk_target_qnames.items():
                 if ci != cj and target_qname == callee_qname:
                     call_edges.append({'from': ci, 'to': cj})
 
@@ -2064,6 +2224,7 @@ def build_training_documents(
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
     dedup_near: bool = True,
+    global_symbols: "GlobalSymbolReader | None" = None,
 ) -> list:
     """Build training documents with bottom-up dependency ordering.
 
@@ -2073,7 +2234,13 @@ def build_training_documents(
     BEFORE grouping (corrected design): a function whose tokenized hash was
     already seen does not get its OWN standalone root document, but it stays in
     the index so it can still be embedded as a DEPENDENCY of other kept roots.
+
+    When ``global_symbols`` is supplied (the optional --global-symbol-index), an
+    unresolved callee that is a selected base-lib symbol has its DEFINITION pulled
+    in as a DEEPEST dependency chunk tagged dep_source='crosslib:<repo>', under
+    HARD per-doc bounds (CrossLinkBudget). Behavior is unchanged when None.
     """
+    crosslink_total = 0
     documents: list[str | dict[str, object]] = []
 
     index.compute_dep_levels()
@@ -2104,8 +2271,20 @@ def build_training_documents(
         if qname in dropped_roots:
             continue
 
-        # Collect transitive deps
-        dep_qnames = collect_transitive_deps(qname, index, max_dep_depth)
+        # Collect transitive deps. When the global symbol index is present, also
+        # collect cross-lib base-lib pulls (bounded; depth-1; tagged provenance).
+        # When absent, crosslink_budget is None so collect_transitive_deps takes
+        # the exact original path (behavior unchanged).
+        crosslink_visited: set[str] = set()
+        crosslink_budget = (
+            CrossLinkBudget() if global_symbols is not None else None
+        )
+        dep_qnames = collect_transitive_deps(
+            qname, index, max_dep_depth,
+            global_symbols=global_symbols,
+            crosslink_visited=crosslink_visited,
+            crosslink_budget=crosslink_budget,
+        )
 
         # Sort by dep_level (leaves/most foundational first)
         dep_funcs: list[FunctionDef] = []
@@ -2115,6 +2294,16 @@ def build_training_documents(
                 dep_funcs.append(df)
         dep_funcs.sort(key=lambda f: f.dep_level)
 
+        # Resolve cross-lib pulls to (qname, record) DEEPEST deps. They are the
+        # most foundational (base-lib impls) so they precede local deps in text.
+        crosslink_deps: list[tuple[str, dict]] = []
+        if global_symbols is not None and crosslink_visited:
+            for cq in sorted(crosslink_visited):
+                rec = global_symbols.lookup(cq)
+                if rec is None or not rec.get("text"):
+                    continue
+                crosslink_deps.append((cq, rec))
+
         # Build document
         preamble = index.file_preambles.get(func.file, '')
 
@@ -2122,6 +2311,9 @@ def build_training_documents(
             parts: list[str] = []
             if preamble:
                 parts.append(preamble)
+            # Cross-lib base-lib defs are the deepest foundation -> emitted first.
+            for _cq, _rec in crosslink_deps:
+                parts.append(_rec["text"])
             for df in dep_funcs_list:
                 parts.append(df.text)
             parts.append(func.text)
@@ -2130,16 +2322,22 @@ def build_training_documents(
         doc = _assemble(dep_funcs)
         tokens = estimate_tokens(doc)
 
-        # Token budget management
-        if tokens > max_tokens * 2 and dep_funcs:
-            # Too big: trim deps from highest dep_level first
+        # Token budget management. Trim LOCAL deps from highest dep_level first;
+        # cross-lib pulls are already bounded by CrossLinkBudget, but if the doc
+        # is still too big after exhausting local deps, drop cross-lib pulls too.
+        if tokens > max_tokens * 2 and (dep_funcs or crosslink_deps):
             while tokens > max_tokens * 2 and dep_funcs:
-                dep_funcs.pop()  # remove highest-level dep
+                dep_funcs.pop()  # remove highest-level local dep
+                doc = _assemble(dep_funcs)
+                tokens = estimate_tokens(doc)
+            while tokens > max_tokens * 2 and crosslink_deps:
+                crosslink_deps.pop()
                 doc = _assemble(dep_funcs)
                 tokens = estimate_tokens(doc)
 
         if tokens < 20:
             continue
+        crosslink_total += len(crosslink_deps)
 
         # NOTE: doc-level md5 dedup removed (corrected design). Dedup now happens
         # at the FUNCTION level on the tokenized hash, BEFORE grouping, via
@@ -2153,6 +2351,20 @@ def build_training_documents(
             parts_info: list[PartInfo] = []
             if preamble:
                 parts_info.append((preamble, 1, 0, '', None))  # kind=1 PREAMBLE
+            # Cross-lib base-lib pulls: DEEPEST deps. dep_level is set above the
+            # max local dep_level so they sort as the most foundational chunks in
+            # the SAME dep_levels/topo order, and they carry dep_source provenance
+            # 'crosslib:<repo>' (6-tuple) so the model knows this is a base-lib
+            # impl and which lib it came from. kind=2 (FUNC) like any function.
+            _max_local_level = max(
+                (df.dep_level for df in dep_funcs), default=0
+            )
+            for cq, rec in crosslink_deps:
+                cname = cq.split('::')[-1]
+                parts_info.append((
+                    rec["text"], 2, _max_local_level + 1, cname, cq,
+                    f"crosslib:{rec['base_repo']}",
+                ))
             for df in dep_funcs:
                 parts_info.append((df.text, 2, df.dep_level, df.name,
                                    df.qualified_name))  # kind=2 FUNC
@@ -2202,6 +2414,13 @@ def build_training_documents(
         else:
             documents.append(doc)
 
+    if global_symbols is not None:
+        print(
+            f"  Cross-lib base-lib pulls: {crosslink_total} (depth-1, "
+            f"cap {CROSSLINK_MAX_DEPS_PER_DOC}/doc, "
+            f"{CROSSLINK_TOKEN_BUDGET_PER_DOC} tok/doc, tagged crosslib:<repo>)",
+            file=sys.stderr,
+        )
     return documents
 
 
@@ -2306,11 +2525,24 @@ def process_project(
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
     dedup_near: bool = True,
+    global_symbol_index: str | None = None,
 ) -> list:
-    """Process a single project: parse all files, build index, generate docs."""
+    """Process a single project: parse all files, build index, generate docs.
+
+    ``global_symbol_index`` (optional path) enables bounded cross-repo base-lib
+    symbol linking; each worker process opens its OWN read-only connection to the
+    store. None -> behavior unchanged.
+    """
     project_dir = os.path.abspath(project_dir)
     project_name = os.path.basename(project_dir)
     _configure_libclang()
+
+    # Open the cross-repo base-lib symbol index (read-only) for THIS process.
+    global_symbols: GlobalSymbolReader | None = None
+    if global_symbol_index:
+        global_symbols = GlobalSymbolReader(global_symbol_index)
+        print(f"  Cross-lib: using global symbol index {global_symbol_index}",
+              file=sys.stderr)
 
     print(f"\n--- Processing project: {project_name} ---", file=sys.stderr)
 
@@ -2423,6 +2655,7 @@ def process_project(
             tokenizer_path=tokenizer_path,
             dedup_db=dedup_db,
             dedup_near=dedup_near,
+            global_symbols=global_symbols,
         )
     check_memory_limit(memory_limit_gb, label="index_project")
     print(f"  Generated {len(documents)} code training documents", file=sys.stderr)
@@ -2498,6 +2731,15 @@ def main() -> int:
                              'Without it, no function-level dedup runs.')
     parser.add_argument('--no-near-dedup', action='store_true',
                         help='Disable MinHash-LSH near dedup (exact-only).')
+    parser.add_argument('--global-symbol-index', type=str, default=None,
+                        help='Path to the GLOBAL cross-repo base-lib symbol '
+                             'SQLite store (built by '
+                             'scripts/crossrepo/build_global_symbol_index.py). '
+                             'When set, an unresolved callee that is a selected '
+                             'base-lib symbol has its definition PULLED in as a '
+                             'deepest dependency chunk tagged crosslib:<repo>, '
+                             'under hard per-doc bounds. DEFAULT off -> behavior '
+                             'unchanged when absent.')
 
     args = parser.parse_args()
     start_memory_guard(args.memory_limit_gb, label="index_project")
@@ -2562,6 +2804,20 @@ def main() -> int:
     else:
         print("Dedup: DISABLED (no --tokenizer-path given)", file=sys.stderr)
 
+    # FAIL LOUD up front if --global-symbol-index is given but missing (RULE #1).
+    global_symbol_index = args.global_symbol_index
+    if global_symbol_index:
+        if not os.path.exists(global_symbol_index):
+            print(f"ERROR: --global-symbol-index not found: {global_symbol_index}",
+                  file=sys.stderr)
+            return 1
+        # Open+close once now so a corrupt store crashes before heavy parsing.
+        GlobalSymbolReader(global_symbol_index).close()
+        print(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
+              f"(bounded depth-1 pulls, tagged crosslib:<repo>)", file=sys.stderr)
+    else:
+        print("Cross-lib: DISABLED (no --global-symbol-index)", file=sys.stderr)
+
     append_mode = getattr(args, 'append', False)
     enriched = args.enriched
     with open(args.output, 'a' if append_mode else 'w') as out:
@@ -2573,7 +2829,7 @@ def main() -> int:
                         process_project, pd, args.max_tokens, args.max_dep_depth,
                         args.parse_workers, enriched, extra_exclude,
                         args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
-                        dedup_near,
+                        dedup_near, global_symbol_index,
                     ): pd
                     for pd in project_dirs
                 }
@@ -2597,7 +2853,8 @@ def main() -> int:
                     docs = process_project(pd, args.max_tokens, args.max_dep_depth,
                                            args.parse_workers, enriched, extra_exclude,
                                            args.memory_limit_gb, args.tokenizer_path,
-                                           args.dedup_db, dedup_near)
+                                           args.dedup_db, dedup_near,
+                                           global_symbol_index)
                     for doc in docs:
                         if enriched:
                             json.dump(doc, out)
