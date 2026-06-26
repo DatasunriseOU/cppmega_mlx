@@ -185,6 +185,13 @@ class DedupStore:
         self._execute_write(
             "CREATE TABLE IF NOT EXISTS dedup_meta (key TEXT PRIMARY KEY, val INTEGER)"
         )
+        self._execute_write(
+            "CREATE TABLE IF NOT EXISTS chunk_claims ("
+            "namespace TEXT NOT NULL, "
+            "hash BLOB NOT NULL, "
+            "claim_count INTEGER NOT NULL, "
+            "PRIMARY KEY(namespace, hash))"
+        )
         # next doc_id counter for near-dup docs.
         self._execute_write(
             "INSERT OR IGNORE INTO dedup_meta (key, val) VALUES ('next_doc_id', 0)"
@@ -368,6 +375,44 @@ class DedupStore:
         self._lsh.insert(str(doc_id), mh)
         self._mark_pending()
         return False
+
+    def claim_chunk_tokens(
+        self,
+        token_ids: Sequence[int],
+        *,
+        namespace: str = "train_chunk",
+        max_count: int = 1,
+    ) -> bool:
+        """Claim one semantic training chunk by its tokenized body.
+
+        This is separate from the ``exact``/``minhash`` dedup tables. Exact/near
+        dedup decides whether a function may be emitted as a root document;
+        chunk claims decide whether that already-tokenized function/class/type
+        body may appear anywhere in the training stream. The unit of ownership is
+        still the caller-provided semantic chunk; the hash is only the SQLite key.
+
+        Returns True when this call successfully claimed one slot. Returns False
+        when the tokenized chunk has already reached ``max_count`` in ``namespace``.
+        The write is committed immediately so concurrent conveyor processes see
+        the claim before they assemble overlapping 1k/2k/4k/8k buckets.
+        """
+        if max_count < 1:
+            raise ValueError("claim_chunk_tokens requires max_count >= 1")
+        if not namespace:
+            raise ValueError("claim_chunk_tokens requires a non-empty namespace")
+        h = _sha1_tokens(token_ids)
+        cur = self._execute_write(
+            "INSERT INTO chunk_claims(namespace, hash, claim_count) "
+            "VALUES (?, ?, 1) "
+            "ON CONFLICT(namespace, hash) DO UPDATE SET "
+            "claim_count = claim_count + 1 "
+            "WHERE claim_count < ?",
+            (namespace, h, int(max_count)),
+        )
+        # Claims are coordination records, not buffered dedup rows. Commit them
+        # immediately so other WAL connections see the slot before emitting docs.
+        self.commit()
+        return cur.rowcount == 1
 
     # ----------------------------------------------------------------- #
     def _load_minhash(self, doc_id: int):

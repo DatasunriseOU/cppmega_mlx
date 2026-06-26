@@ -2077,18 +2077,15 @@ def build_build_doc(
 
 
 # --------------------------------------------------------------------------- #
-# Function-level tokenized-hash dedup (CORRECTED design).
+# Function-level tokenized-hash dedup + semantic chunk claims.
 #
 # Per the user-specified ordering, dedup happens at the FUNCTION level, on the
 # function AFTER OUR TOKENIZER (the whitespace sentinels canonicalize format),
 # and BEFORE the dependency grouping. The dedup decides which functions get
-# emitted as their OWN ROOT document: a function whose tokenized hash was already
-# seen (in this repo OR globally via the shared db, including as a dependency of
-# an earlier kept root) does NOT get a duplicate standalone root doc. CRUCIALLY,
-# we do NOT delete deduped functions from index.functions -- collect_transitive_
-# deps must still resolve them so each distinct kept root embeds its full
-# dependency chain (a shared helper legitimately appears as context inside two
-# different roots' docs; it just is not emitted twice as a standalone root).
+# emitted as their OWN ROOT document. A separate semantic chunk-claim ledger then
+# decides whether a function/class/type body may appear ANYWHERE in training
+# output. That second ledger is what prevents the same helper from being packed
+# in 1024 and 4096 buckets at the same time.
 # --------------------------------------------------------------------------- #
 _CPPMEGA_TOKENIZER = None
 
@@ -2101,6 +2098,54 @@ def _load_cppmega_tokenizer(tokenizer_path: str):
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
     _CPPMEGA_TOKENIZER = load_cppmega_tokenizer(tokenizer_path)
     return _CPPMEGA_TOKENIZER
+
+
+class TrainingChunkClaims:
+    """Claim semantic function/class/type chunks before assembling training docs.
+
+    The granularity is the caller-provided semantic chunk: function body/text or
+    class/typedef/enum text. The tokenized hash is only the storage key, chosen so
+    claim identity matches what the model will actually see after our tokenizer.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokenizer_path: str,
+        dedup_db: str | None,
+        namespace: str = "semantic_chunk:v1",
+    ):
+        self.tok = _load_cppmega_tokenizer(tokenizer_path)
+        self.namespace = namespace
+        self.store = None
+        self.local_counts: dict[bytes, int] = {}
+        if dedup_db:
+            from dedup_store import DedupStore
+            self.store = DedupStore(dedup_db, near=False, commit_every=1)
+
+    def claim_text(self, text: str, *, max_count: int = 1) -> bool:
+        if not text:
+            return False
+        token_ids = self.tok.encode(text)
+        if not token_ids:
+            return False
+        if self.store is not None:
+            return self.store.claim_chunk_tokens(
+                token_ids,
+                namespace=self.namespace,
+                max_count=max_count,
+            )
+        from dedup_store import _sha1_tokens
+        h = _sha1_tokens(token_ids)
+        count = self.local_counts.get(h, 0)
+        if count >= max_count:
+            return False
+        self.local_counts[h] = count + 1
+        return True
+
+    def close(self) -> None:
+        if self.store is not None:
+            self.store.close()
 
 
 def dedup_root_functions(
@@ -2119,10 +2164,9 @@ def dedup_root_functions(
 
     A function whose hash was already seen is marked as a DROPPED ROOT: the
     grouping loop will not emit a standalone document for it. Functions stay in
-    ``index.functions`` untouched so ``collect_transitive_deps`` still resolves
-    them as dependencies of OTHER kept roots (so the shared canonical copy is
-    embedded in each dependent root's doc -- no duplicate STANDALONE docs, but
-    dependency chains stay intact).
+    ``index.functions`` untouched so ``collect_transitive_deps`` can still
+    resolve graph edges. Whether the resolved dependency text may be embedded is
+    controlled later by ``TrainingChunkClaims``.
 
     When ``dedup_db`` is given the dedup is GLOBAL + resumable + cross-stream via
     the shared SQLite ``DedupStore`` (fail-loud if it cannot open / datasketch is
@@ -2293,10 +2337,10 @@ def build_training_documents(
 
     Returns list[str] when enriched=False, list[dict] when enriched=True.
 
-    When ``tokenizer_path`` is given, FUNCTION-LEVEL tokenized-hash dedup runs
-    BEFORE grouping (corrected design): a function whose tokenized hash was
-    already seen does not get its OWN standalone root document, but it stays in
-    the index so it can still be embedded as a DEPENDENCY of other kept roots.
+    When ``tokenizer_path`` is given, FUNCTION-LEVEL tokenized-hash root dedup
+    runs before grouping, and semantic chunk claims run during grouping. Root
+    dedup prevents duplicate standalone roots; chunk claims prevent the same
+    function/class/type text from appearing in multiple 1k/2k/4k/8k outputs.
 
     When ``global_symbols`` is supplied (the optional --global-symbol-index), an
     unresolved callee that is a selected base-lib symbol has its DEFINITION pulled
@@ -2326,156 +2370,226 @@ def build_training_documents(
             file=sys.stderr,
         )
 
-    for qname, func in index.functions.items():
-        if not func.is_definition:
-            continue
-        # Skip emitting a STANDALONE root doc for a deduped function (its hash was
-        # already seen). It remains resolvable as a dependency of other roots.
-        if qname in dropped_roots:
-            continue
-
-        # Collect transitive deps. When the global symbol index is present, also
-        # collect cross-lib base-lib pulls (bounded; depth-1; tagged provenance).
-        # When absent, crosslink_budget is None so collect_transitive_deps takes
-        # the exact original path (behavior unchanged).
-        crosslink_visited: set[str] = set()
-        crosslink_budget = (
-            CrossLinkBudget() if global_symbols is not None else None
-        )
-        dep_qnames = collect_transitive_deps(
-            qname, index, max_dep_depth,
-            global_symbols=global_symbols,
-            crosslink_visited=crosslink_visited,
-            crosslink_budget=crosslink_budget,
+    chunk_claims: TrainingChunkClaims | None = None
+    chunk_stats: defaultdict[str, int] = defaultdict(int)
+    if tokenizer_path:
+        chunk_claims = TrainingChunkClaims(
+            tokenizer_path=tokenizer_path,
+            dedup_db=dedup_db,
         )
 
-        # Sort by dep_level (leaves/most foundational first)
-        dep_funcs: list[FunctionDef] = []
-        for dq in dep_qnames:
-            df = index.functions.get(dq)
-            if df and df.is_definition and df.text:
+    try:
+        items = sorted(
+            index.functions.items(),
+            key=lambda kv: (
+                -(kv[1].dep_level or 0),
+                kv[1].file or "",
+                kv[1].line or 0,
+                kv[0],
+            ),
+        )
+        for qname, func in items:
+            if not func.is_definition:
+                continue
+            # Skip emitting a STANDALONE root doc for a deduped function. It remains
+            # resolvable as a graph node, but chunk-claiming below controls whether
+            # its text may appear in training output again.
+            if qname in dropped_roots:
+                continue
+
+            # Collect transitive deps. When the global symbol index is present, also
+            # collect cross-lib base-lib pulls (bounded; depth-1; tagged provenance).
+            # When absent, crosslink_budget is None so collect_transitive_deps takes
+            # the exact original path (behavior unchanged).
+            crosslink_visited: set[str] = set()
+            crosslink_budget = (
+                CrossLinkBudget() if global_symbols is not None else None
+            )
+            dep_qnames = collect_transitive_deps(
+                qname, index, max_dep_depth,
+                global_symbols=global_symbols,
+                crosslink_visited=crosslink_visited,
+                crosslink_budget=crosslink_budget,
+            )
+
+            # Sort by dep_level (leaves/most foundational first). Claims are applied
+            # after the candidate document passes the tiny-doc filter so a small
+            # helper can still be used as dependency context for its first caller.
+            dep_funcs: list[FunctionDef] = []
+            for dq in dep_qnames:
+                df = index.functions.get(dq)
+                if not (df and df.is_definition and df.text):
+                    continue
                 dep_funcs.append(df)
-        dep_funcs.sort(key=lambda f: f.dep_level)
+            dep_funcs.sort(key=lambda f: f.dep_level)
 
-        # Resolve cross-lib pulls to (qname, record) DEEPEST deps. They are the
-        # most foundational (base-lib impls) so they precede local deps in text.
-        crosslink_deps: list[tuple[str, dict]] = []
-        if global_symbols is not None and crosslink_visited:
-            for cq in sorted(crosslink_visited):
-                rec = global_symbols.lookup(cq)
-                if rec is None or not rec.get("text"):
+            # Resolve cross-lib pulls to (qname, record) DEEPEST deps. They are the
+            # most foundational (base-lib impls) so they precede local deps in text.
+            crosslink_deps: list[tuple[str, dict]] = []
+            if global_symbols is not None and crosslink_visited:
+                for cq in sorted(crosslink_visited):
+                    rec = global_symbols.lookup(cq)
+                    if rec is None or not rec.get("text"):
+                        continue
+                    crosslink_deps.append((cq, rec))
+
+            # Build document
+            preamble = index.file_preambles.get(func.file, '')
+
+            def _assemble(dep_funcs_list: list[FunctionDef]) -> str:
+                parts: list[str] = []
+                if preamble:
+                    parts.append(preamble)
+                # Cross-lib base-lib defs are the deepest foundation -> emitted first.
+                for _cq, _rec in crosslink_deps:
+                    parts.append(_rec["text"])
+                for df in dep_funcs_list:
+                    parts.append(df.text)
+                parts.append(func.text)
+                return '\n\n'.join(parts)
+
+            doc = _assemble(dep_funcs)
+            tokens = estimate_tokens(doc)
+
+            # Token budget management. Trim LOCAL deps from highest dep_level first;
+            # cross-lib pulls are already bounded by CrossLinkBudget, but if the doc
+            # is still too big after exhausting local deps, drop cross-lib pulls too.
+            if tokens > max_tokens * 2 and (dep_funcs or crosslink_deps):
+                while tokens > max_tokens * 2 and dep_funcs:
+                    dep_funcs.pop()  # remove highest-level local dep
+                    doc = _assemble(dep_funcs)
+                    tokens = estimate_tokens(doc)
+                while tokens > max_tokens * 2 and crosslink_deps:
+                    crosslink_deps.pop()
+                    doc = _assemble(dep_funcs)
+                    tokens = estimate_tokens(doc)
+
+            if tokens < 20:
+                continue
+
+            if chunk_claims is not None:
+                if not chunk_claims.claim_text(func.text, max_count=1):
+                    chunk_stats["skipped_root"] += 1
                     continue
-                crosslink_deps.append((cq, rec))
+                chunk_stats["claimed_root"] += 1
 
-        # Build document
-        preamble = index.file_preambles.get(func.file, '')
+                claimed_dep_funcs: list[FunctionDef] = []
+                for df in dep_funcs:
+                    if not chunk_claims.claim_text(df.text, max_count=1):
+                        chunk_stats["skipped_dep"] += 1
+                        continue
+                    chunk_stats["claimed_dep"] += 1
+                    claimed_dep_funcs.append(df)
+                dep_funcs = claimed_dep_funcs
 
-        def _assemble(dep_funcs_list: list[FunctionDef]) -> str:
-            parts: list[str] = []
-            if preamble:
-                parts.append(preamble)
-            # Cross-lib base-lib defs are the deepest foundation -> emitted first.
-            for _cq, _rec in crosslink_deps:
-                parts.append(_rec["text"])
-            for df in dep_funcs_list:
-                parts.append(df.text)
-            parts.append(func.text)
-            return '\n\n'.join(parts)
-
-        doc = _assemble(dep_funcs)
-        tokens = estimate_tokens(doc)
-
-        # Token budget management. Trim LOCAL deps from highest dep_level first;
-        # cross-lib pulls are already bounded by CrossLinkBudget, but if the doc
-        # is still too big after exhausting local deps, drop cross-lib pulls too.
-        if tokens > max_tokens * 2 and (dep_funcs or crosslink_deps):
-            while tokens > max_tokens * 2 and dep_funcs:
-                dep_funcs.pop()  # remove highest-level local dep
+                claimed_crosslink_deps: list[tuple[str, dict]] = []
+                for cq, rec in crosslink_deps:
+                    if not chunk_claims.claim_text(rec["text"], max_count=1):
+                        chunk_stats["skipped_crosslib"] += 1
+                        continue
+                    chunk_stats["claimed_crosslib"] += 1
+                    claimed_crosslink_deps.append((cq, rec))
+                crosslink_deps = claimed_crosslink_deps
                 doc = _assemble(dep_funcs)
                 tokens = estimate_tokens(doc)
-            while tokens > max_tokens * 2 and crosslink_deps:
-                crosslink_deps.pop()
-                doc = _assemble(dep_funcs)
-                tokens = estimate_tokens(doc)
+            crosslink_total += len(crosslink_deps)
 
-        if tokens < 20:
-            continue
-        crosslink_total += len(crosslink_deps)
+            # NOTE: doc-level md5 dedup removed (corrected design). Dedup/root claim
+            # now happens at semantic function/class/type chunk granularity via
+            # dedup_root_functions + TrainingChunkClaims.
 
-        # NOTE: doc-level md5 dedup removed (corrected design). Dedup now happens
-        # at the FUNCTION level on the tokenized hash, BEFORE grouping, via
-        # dedup_root_functions above -- duplicate functions are not emitted as
-        # standalone roots, so no second-pass doc dedup is needed here.
-
-        if enriched:
-            # Build parts_info for enriched output. Thread repo-level build
-            # context through fallback lanes so build-file-derived args keep
-            # their authoritative provenance in language_info/build_info.
-            parts_info: list[PartInfo] = []
-            if preamble:
-                parts_info.append((preamble, 1, 0, '', None))  # kind=1 PREAMBLE
-            # Cross-lib base-lib pulls: DEEPEST deps. dep_level is set above the
-            # max local dep_level so they sort as the most foundational chunks in
-            # the SAME dep_levels/topo order, and they carry dep_source provenance
-            # 'crosslib:<repo>' (6-tuple) so the model knows this is a base-lib
-            # impl and which lib it came from. kind=2 (FUNC) like any function.
-            _max_local_level = max(
-                (df.dep_level for df in dep_funcs), default=0
-            )
-            for cq, rec in crosslink_deps:
-                cname = cq.split('::')[-1]
-                parts_info.append((
-                    rec["text"], 2, _max_local_level + 1, cname, cq,
-                    f"crosslib:{rec['base_repo']}",
-                ))
-            for df in dep_funcs:
-                parts_info.append((df.text, 2, df.dep_level, df.name,
-                                   df.qualified_name))  # kind=2 FUNC
-            parts_info.append((func.text, 2, func.dep_level, func.name,
-                               func.qualified_name))  # kind=2 FUNC (root)
-
-            # Pull in DEFINITIONS of types referenced by the root func + its
-            # dep funcs as type-edge target chunks. build_enriched_doc matches
-            # a function chunk's referenced_types against any chunk whose qname
-            # equals the type qname (chunk_all_qnames) to emit type_edges; the
-            # type def must therefore be present as a chunk. Definitions live in
-            # headers (now indexed), registered in index.typedefs.
-            func_qnames_in_doc = {func.qualified_name}
-            func_qnames_in_doc.update(df.qualified_name for df in dep_funcs)
-            referenced: list[str] = list(func.referenced_types)
-            for df in dep_funcs:
-                referenced.extend(df.referenced_types)
-            added_type_qnames: set[str] = set()
-            for tq in referenced:
-                if tq in added_type_qnames or tq in func_qnames_in_doc:
-                    continue
-                td = index.typedefs.get(tq)
-                if td is None or not td.text:
-                    continue
-                added_type_qnames.add(tq)
-                # kind from TypeDef (4=class/struct/enum/union, 7=typedef/using)
-                parts_info.append((td.text, td.kind, 0, td.name,
-                                   td.qualified_name))
-
-            compile_args = list(default_args or [])
-            build_info = dict(default_build_info) if default_build_info else None
-            if project_dir is not None:
-                abs_func_path = os.path.normpath(os.path.join(project_dir, func.file))
-                file_build = compile_db.get(abs_func_path) if compile_db else None
-                if file_build:
-                    compile_args = file_build.get("compile_args", compile_args)
-                    build_info = file_build.get("build_info") or build_info
-            documents.append(
-                build_enriched_doc(
-                    parts_info,
-                    index,
-                    filepath=func.file,
-                    compile_args=compile_args,
-                    build_info=build_info,
+            if enriched:
+                # Build parts_info for enriched output. Thread repo-level build
+                # context through fallback lanes so build-file-derived args keep
+                # their authoritative provenance in language_info/build_info.
+                parts_info: list[PartInfo] = []
+                if preamble:
+                    parts_info.append((preamble, 1, 0, '', None))  # kind=1 PREAMBLE
+                # Cross-lib base-lib pulls: DEEPEST deps. dep_level is set above the
+                # max local dep_level so they sort as the most foundational chunks in
+                # the SAME dep_levels/topo order, and they carry dep_source provenance
+                # 'crosslib:<repo>' (6-tuple) so the model knows this is a base-lib
+                # impl and which lib it came from. kind=2 (FUNC) like any function.
+                _max_local_level = max(
+                    (df.dep_level for df in dep_funcs), default=0
                 )
-            )
-        else:
-            documents.append(doc)
+                for cq, rec in crosslink_deps:
+                    cname = cq.split('::')[-1]
+                    parts_info.append((
+                        rec["text"], 2, _max_local_level + 1, cname, cq,
+                        f"crosslib:{rec['base_repo']}",
+                    ))
+                for df in dep_funcs:
+                    parts_info.append((df.text, 2, df.dep_level, df.name,
+                                       df.qualified_name))  # kind=2 FUNC
+                parts_info.append((func.text, 2, func.dep_level, func.name,
+                                   func.qualified_name))  # kind=2 FUNC (root)
+
+                # Pull in DEFINITIONS of types referenced by the root func + its
+                # dep funcs as type-edge target chunks. build_enriched_doc matches
+                # a function chunk's referenced_types against any chunk whose qname
+                # equals the type qname (chunk_all_qnames) to emit type_edges; the
+                # type def must therefore be present as a chunk. Definitions live in
+                # headers (now indexed), registered in index.typedefs.
+                func_qnames_in_doc = {func.qualified_name}
+                func_qnames_in_doc.update(df.qualified_name for df in dep_funcs)
+                referenced: list[str] = list(func.referenced_types)
+                for df in dep_funcs:
+                    referenced.extend(df.referenced_types)
+                added_type_qnames: set[str] = set()
+                for tq in referenced:
+                    if tq in added_type_qnames or tq in func_qnames_in_doc:
+                        continue
+                    td = index.typedefs.get(tq)
+                    if td is None or not td.text:
+                        continue
+                    if chunk_claims is not None:
+                        if not chunk_claims.claim_text(td.text, max_count=1):
+                            chunk_stats["skipped_type"] += 1
+                            continue
+                        chunk_stats["claimed_type"] += 1
+                    added_type_qnames.add(tq)
+                    # kind from TypeDef (4=class/struct/enum/union, 7=typedef/using)
+                    parts_info.append((td.text, td.kind, 0, td.name,
+                                       td.qualified_name))
+
+                compile_args = list(default_args or [])
+                build_info = dict(default_build_info) if default_build_info else None
+                if project_dir is not None:
+                    abs_func_path = os.path.normpath(os.path.join(project_dir, func.file))
+                    file_build = compile_db.get(abs_func_path) if compile_db else None
+                    if file_build:
+                        compile_args = file_build.get("compile_args", compile_args)
+                        build_info = file_build.get("build_info") or build_info
+                documents.append(
+                    build_enriched_doc(
+                        parts_info,
+                        index,
+                        filepath=func.file,
+                        compile_args=compile_args,
+                        build_info=build_info,
+                    )
+                )
+            else:
+                documents.append(doc)
+    finally:
+        if chunk_claims is not None:
+            chunk_claims.close()
+
+    if chunk_claims is not None:
+        print(
+            "  Semantic chunk claims: "
+            f"root={chunk_stats['claimed_root']} "
+            f"dep={chunk_stats['claimed_dep']} "
+            f"crosslib={chunk_stats['claimed_crosslib']} "
+            f"type={chunk_stats['claimed_type']} "
+            f"skipped_root={chunk_stats['skipped_root']} "
+            f"skipped_dep={chunk_stats['skipped_dep']} "
+            f"skipped_crosslib={chunk_stats['skipped_crosslib']} "
+            f"skipped_type={chunk_stats['skipped_type']} "
+            "(function/class/type granularity, max_count=1)",
+            file=sys.stderr,
+        )
 
     if global_symbols is not None:
         print(

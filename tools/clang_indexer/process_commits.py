@@ -1212,6 +1212,10 @@ def format_chain_document(
     new_analysis: FileAnalysis,
     hunks: list[HunkRange],
     max_dep_depth: int = 5,
+    *,
+    dedup_store=None,
+    dedup_tokenizer=None,
+    chunk_claim_stats: dict[str, int] | None = None,
 ) -> Optional[dict]:
     """Format A: PRE-COMMIT chain → POST-COMMIT chain with enriched metadata."""
     old_lines = changed_lines(hunks, use_old=True)
@@ -1232,6 +1236,19 @@ def format_chain_document(
     # Build parts_info: (text, kind, dep_level, name, qname)
     parts_info: list[PartInfo] = []
     section_kinds: list[str] = []
+    semantic_parts = 0
+
+    def _claim_part(text: str) -> bool:
+        ok = _claim_semantic_chunk(
+            text,
+            dedup_store=dedup_store,
+            dedup_tokenizer=dedup_tokenizer,
+            max_count=1,
+        )
+        if chunk_claim_stats is not None:
+            key = 'commit_chunks_claimed' if ok else 'commit_chunks_skipped'
+            chunk_claim_stats[key] = chunk_claim_stats.get(key, 0) + 1
+        return ok
 
     # Docstring (kind=6: comment)
     docstring = build_docstring(record)
@@ -1248,11 +1265,17 @@ def format_chain_document(
             section_kinds.append('o')
         for ci in old_changed_classes:
             cls = old_analysis.classes[ci]
+            if not _claim_part(cls.text):
+                continue
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
             section_kinds.append('o')
+            semantic_parts += 1
         for func in old_chain:
+            if not _claim_part(func.text):
+                continue
             parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
             section_kinds.append('o')
+            semantic_parts += 1
 
     # POST-COMMIT section
     subject = record.get('subject', '').strip()
@@ -1265,13 +1288,19 @@ def format_chain_document(
             section_kinds.append('n')
         for ci in new_changed_classes:
             cls = new_analysis.classes[ci]
+            if not _claim_part(cls.text):
+                continue
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
             section_kinds.append('n')
+            semantic_parts += 1
         for func in new_chain:
+            if not _claim_part(func.text):
+                continue
             parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
             section_kinds.append('n')
+            semantic_parts += 1
 
-    if len(parts_info) <= 1:
+    if len(parts_info) <= 1 or semantic_parts == 0:
         return None
 
     # Compute changed_symbol_ids and ripple_candidates from the NEW analysis
@@ -1293,6 +1322,10 @@ def format_diff_document(
     old_analysis: FileAnalysis,
     hunks: list[HunkRange],
     max_dep_depth: int = 5,
+    *,
+    dedup_store=None,
+    dedup_tokenizer=None,
+    chunk_claim_stats: dict[str, int] | None = None,
 ) -> Optional[dict]:
     """Format B: Context code from old version + raw unified diff."""
     old_lines = changed_lines(hunks, use_old=True)
@@ -1306,6 +1339,18 @@ def format_diff_document(
 
     parts_info: list[PartInfo] = []
     section_kinds: list[str] = []
+
+    def _claim_part(text: str) -> bool:
+        ok = _claim_semantic_chunk(
+            text,
+            dedup_store=dedup_store,
+            dedup_tokenizer=dedup_tokenizer,
+            max_count=1,
+        )
+        if chunk_claim_stats is not None:
+            key = 'commit_chunks_claimed' if ok else 'commit_chunks_skipped'
+            chunk_claim_stats[key] = chunk_claim_stats.get(key, 0) + 1
+        return ok
 
     # Docstring
     docstring = build_docstring(record)
@@ -1321,9 +1366,13 @@ def format_diff_document(
         section_kinds.append('o')
     for ci in old_changed_classes:
         cls = old_analysis.classes[ci]
+        if not _claim_part(cls.text):
+            continue
         parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
         section_kinds.append('o')
     for func in old_chain:
+        if not _claim_part(func.text):
+            continue
         parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
         section_kinds.append('o')
 
@@ -1661,6 +1710,36 @@ def _load_dedup_tokenizer(path):
     return _dedup_tokenizer
 
 
+SEMANTIC_CHUNK_CLAIM_NAMESPACE = "semantic_chunk:v1"
+
+
+def _claim_semantic_chunk(
+    text: str,
+    *,
+    dedup_store,
+    dedup_tokenizer,
+    max_count: int = 1,
+) -> bool:
+    """Claim one function/class semantic part by its tokenized body.
+
+    Commit docs are still commit examples, but their function/class parts share
+    the same claim namespace as static code docs. This keeps the model from
+    seeing the same exact function/class form again in 1k/2k/4k/8k streams.
+    """
+    if dedup_store is None or dedup_tokenizer is None:
+        return True
+    if not text:
+        return False
+    token_ids = dedup_tokenizer.encode(text)
+    if not token_ids:
+        return False
+    return dedup_store.claim_chunk_tokens(
+        token_ids,
+        namespace=SEMANTIC_CHUNK_CLAIM_NAMESPACE,
+        max_count=max_count,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
@@ -1674,6 +1753,9 @@ def process_record(
     doc_format: str,
     max_dep_depth: int,
     build_context: BuildContextResolver | None = None,
+    dedup_store=None,
+    dedup_tokenizer=None,
+    chunk_claim_stats: dict[str, int] | None = None,
 ) -> list[dict]:
     """Process a single commit record into enriched documents."""
     old_content = record.get('old_content', '')
@@ -1728,7 +1810,16 @@ def process_record(
     documents: list[dict[str, object]] = []
 
     if doc_format in ('chain', 'both'):
-        doc = format_chain_document(record, old_analysis, new_analysis, hunks, max_dep_depth)
+        doc = format_chain_document(
+            record,
+            old_analysis,
+            new_analysis,
+            hunks,
+            max_dep_depth,
+            dedup_store=dedup_store,
+            dedup_tokenizer=dedup_tokenizer,
+            chunk_claim_stats=chunk_claim_stats,
+        )
         if doc:
             tokens = count_tokens(doc['text'])
             if tokens <= max_tokens and len(doc['text']) >= 100:
@@ -1736,7 +1827,15 @@ def process_record(
                 documents.append(doc)
 
     if doc_format in ('diff', 'both'):
-        doc = format_diff_document(record, old_analysis, hunks, max_dep_depth)
+        doc = format_diff_document(
+            record,
+            old_analysis,
+            hunks,
+            max_dep_depth,
+            dedup_store=dedup_store,
+            dedup_tokenizer=dedup_tokenizer,
+            chunk_claim_stats=chunk_claim_stats,
+        )
         if doc:
             tokens = count_tokens(doc['text'])
             if tokens <= max_tokens and len(doc['text']) >= 100:
@@ -1776,6 +1875,8 @@ def process_jsonl_file(
         'records_skipped': 0,
         'records_empty': 0,
         'parse_errors': 0,
+        'commit_chunks_claimed': 0,
+        'commit_chunks_skipped': 0,
     }
     seen_hashes: set[str] = set()
 
@@ -1806,6 +1907,9 @@ def process_jsonl_file(
                     record, clang_index, tmpdir,
                     max_tokens, max_file_bytes, doc_format, max_dep_depth,
                     build_context=build_context,
+                    dedup_store=dedup_store,
+                    dedup_tokenizer=dedup_tokenizer,
+                    chunk_claim_stats=stats,
                 )
             except Exception as e:
                 stats['parse_errors'] += 1
@@ -1900,7 +2004,8 @@ def main() -> int:
         '--dedup-db', default=None,
         help='Path to the SHARED global dedup SQLite store. When set, whole commit '
              'DOCS are deduped by their tokenized hash (exact+near) GLOBALLY across '
-             'repos AND across the code+commit streams (fail-loud, no fallback). '
+             'repos AND function/class parts are claimed in the shared semantic '
+             'chunk namespace across code+commit streams (fail-loud, no fallback). '
              'Requires --tokenizer-path. When absent, a per-file in-RAM md5 set.',
     )
     parser.add_argument(
@@ -1990,6 +2095,8 @@ def main() -> int:
         'records_skipped': 0,
         'records_empty': 0,
         'parse_errors': 0,
+        'commit_chunks_claimed': 0,
+        'commit_chunks_skipped': 0,
     }
 
     with tempfile.TemporaryDirectory(prefix='clang_commits_') as tmpdir:
