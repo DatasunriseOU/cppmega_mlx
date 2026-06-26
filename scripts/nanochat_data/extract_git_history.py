@@ -285,22 +285,39 @@ def compute_file_local_commit_indices(
     repo_path: str,
     commit_hashes: list[str],
 ) -> dict[tuple[str, str], int]:
-    counters: dict[str, int] = {}
-    indices: dict[tuple[str, str], int] = {}
-    for commit_hash in reversed(commit_hashes):
-        file_diffs = get_commit_diffs(repo_path, commit_hash)
-        if not file_diffs:
-            continue
-        for item in file_diffs:
-            filepath = item["filepath"]
-            next_index = counters.get(filepath, 0)
-            indices[(commit_hash, filepath)] = next_index
-            counters[filepath] = next_index + 1
+    indices, _files_by_commit = precompute_cpp_file_changes(repo_path, commit_hashes)
     return indices
 
 
-def get_commit_diffs(repo_path: str, commit_hash: str) -> Optional[list[dict]]:
-    """Get per-file diffs for C/C++ files in a commit."""
+def precompute_cpp_file_changes(
+    repo_path: str,
+    commit_hashes: list[str],
+) -> tuple[dict[tuple[str, str], int], dict[str, list[str]]]:
+    """Precompute changed C/C++ files and per-file temporal indices once.
+
+    This is on the hot path for large repos. The old flow called
+    ``git diff-tree --name-status`` once while building ``file_local_commit_index``
+    and then again inside ``get_commit_diffs`` for every commit. Keep the same
+    semantics, but carry the file list forward so each commit pays that git
+    subprocess cost only once.
+    """
+    counters: dict[str, int] = {}
+    indices: dict[tuple[str, str], int] = {}
+    files_by_commit: dict[str, list[str]] = {}
+    for commit_hash in reversed(commit_hashes):
+        files = get_commit_cpp_files(repo_path, commit_hash)
+        if not files:
+            continue
+        files_by_commit[commit_hash] = files
+        for filepath in files:
+            next_index = counters.get(filepath, 0)
+            indices[(commit_hash, filepath)] = next_index
+            counters[filepath] = next_index + 1
+    return indices, files_by_commit
+
+
+def get_commit_cpp_files(repo_path: str, commit_hash: str) -> Optional[list[str]]:
+    """Return modified C/C++ file paths for a commit without reading blobs/diffs."""
     name_status = run_git(
         repo_path, ["diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash]
     )
@@ -326,7 +343,19 @@ def get_commit_diffs(repo_path: str, commit_hash: str) -> Optional[list[dict]]:
 
     if not files or len(files) > MAX_FILES_PER_COMMIT:
         return None
+    return files
 
+
+def get_commit_diffs(
+    repo_path: str,
+    commit_hash: str,
+    files: Optional[list[str]] = None,
+) -> Optional[list[dict]]:
+    """Get per-file diffs for C/C++ files in a commit."""
+    if files is None:
+        files = get_commit_cpp_files(repo_path, commit_hash)
+    if not files:
+        return None
     results = []
     for filepath in files:
         old_content = run_git(
@@ -427,7 +456,9 @@ def process_repo(
         print(f"  [{repo_name}] No commits found")
         return stats
 
-    file_local_commit_indices = compute_file_local_commit_indices(repo_path, commits)
+    file_local_commit_indices, cpp_files_by_commit = precompute_cpp_file_changes(
+        repo_path, commits
+    )
 
     for i, commit_hash in enumerate(commits):
         if i > 0 and i % 1000 == 0:
@@ -459,7 +490,11 @@ def process_repo(
         ):
             continue
 
-        file_diffs = get_commit_diffs(repo_path, commit_hash)
+        file_diffs = get_commit_diffs(
+            repo_path,
+            commit_hash,
+            files=cpp_files_by_commit.get(commit_hash),
+        )
         if not file_diffs:
             continue
 

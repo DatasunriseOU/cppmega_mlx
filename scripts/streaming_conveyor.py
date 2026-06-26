@@ -56,7 +56,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Sequence
 
@@ -94,6 +94,7 @@ DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 
 DEFAULT_TARGET_LENGTHS_CODE = (1024, 2048, 4096)
 DEFAULT_TARGET_LENGTHS_COMMITS = (1024, 2048, 4096, 8192, 16384)
+DEFAULT_PROGRESS_JSONL = CONVEYOR_ROOT / "progress.jsonl"
 
 _PRINT_LOCK = threading.Lock()
 
@@ -101,6 +102,41 @@ _PRINT_LOCK = threading.Lock()
 def _log(msg: str) -> None:
     with _PRINT_LOCK:
         print(msg, file=sys.stderr, flush=True)
+
+
+class ProgressWriter:
+    """Append-only machine-readable progress events for live throughput tracking."""
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.lock = threading.Lock()
+        self.started_at = time.time()
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def emit(self, event: str, **payload) -> None:
+        if self.path is None:
+            return
+        now = time.time()
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "elapsed_s": round(now - self.started_at, 3),
+            "event": event,
+            **payload,
+        }
+        line = json.dumps(row, ensure_ascii=False, sort_keys=True)
+        with self.lock:
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.write("\n")
+
+
+def _length_totals(info: dict) -> dict[str, int]:
+    totals = {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0}
+    for st in info.get("lengths", {}).values():
+        for key in totals:
+            totals[key] += int(st.get(key, 0))
+    return totals
 
 
 def code_key(repo: str) -> str:
@@ -165,6 +201,7 @@ def run_commits_half(
     pr_store: Path | None,
     repo_list: Path | None,
     memory_limit_gb: float = 10.0,
+    progress: ProgressWriter | None = None,
 ) -> tuple[int, int]:
     """Extract commit records once, fan ranges to the pool. Returns (done, failed).
 
@@ -220,10 +257,23 @@ def run_commits_half(
             with manifest_lock:
                 manifest.mark_done(rkey, rinfo)
             done += 1
+            totals = _length_totals(rinfo)
             added = rinfo["lengths"].get(str(smallest), {}).get("valid_tokens", 0)
             with manifest_lock:
-                cumulative["valid"] += sum(
-                    st["valid_tokens"] for st in rinfo["lengths"].values()
+                cumulative["valid"] += totals["valid_tokens"]
+                cumulative_valid = cumulative["valid"]
+            if progress is not None:
+                progress.emit(
+                    "unit_done",
+                    stream="commits",
+                    repo=repo,
+                    unit=rkey,
+                    range=[start, end],
+                    rows=totals["rows"],
+                    valid_tokens=totals["valid_tokens"],
+                    capacity_tokens=totals["capacity_tokens"],
+                    lengths=rinfo.get("lengths", {}),
+                    cumulative_valid_tokens=cumulative_valid,
                 )
             _log(f"DONE {rkey}: ranges [{start}:{end}] "
                  f"buckets={sorted(rinfo['lengths'].keys())} "
@@ -233,11 +283,31 @@ def run_commits_half(
             failed += 1
             with manifest_lock:
                 manifest.mark_failed(rkey, exc.stage, exc.detail)
+            if progress is not None:
+                progress.emit(
+                    "unit_failed",
+                    stream="commits",
+                    repo=repo,
+                    unit=rkey,
+                    range=[start, end],
+                    stage=exc.stage,
+                    detail=exc.detail[:2000],
+                )
         except Exception as exc:  # surface unexpected failures loud
             _log(f"FAIL {rkey}: unexpected {type(exc).__name__}: {exc}")
             failed += 1
             with manifest_lock:
                 manifest.mark_failed(rkey, "unexpected", str(exc))
+            if progress is not None:
+                progress.emit(
+                    "unit_failed",
+                    stream="commits",
+                    repo=repo,
+                    unit=rkey,
+                    range=[start, end],
+                    stage="unexpected",
+                    detail=str(exc)[:2000],
+                )
     return done, failed
 
 
@@ -261,8 +331,10 @@ def process_one_repo(
     dedup_near: bool,
     pr_store: Path | None,
     repo_list: Path | None,
+    streams: str = "both",
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
+    progress: ProgressWriter | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -277,44 +349,70 @@ def process_one_repo(
     result = {"repo": repo, "code": None, "commits_done": 0, "commits_failed": 0}
     try:
         # ---- CODE half (skip if already done) ----
-        ck = code_key(repo)
-        if resume and manifest.is_done(ck):
-            _log(f"SKIP (done) {ck}")
-            result["code"] = "skipped"
-        else:
-            try:
-                cinfo = run_code_half(
-                    repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-                    global_symbol_index, memory_limit_gb,
-                )
-                with manifest_lock:
-                    manifest.mark_done(ck, cinfo)
-                with manifest_lock:
-                    cumulative["valid"] += sum(
-                        st["valid_tokens"] for st in cinfo["lengths"].values()
+        if streams in {"both", "code"}:
+            ck = code_key(repo)
+            if resume and manifest.is_done(ck):
+                _log(f"SKIP (done) {ck}")
+                result["code"] = "skipped"
+            else:
+                try:
+                    cinfo = run_code_half(
+                        repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
+                        global_symbol_index, memory_limit_gb,
                     )
-                result["code"] = cinfo
-                _log(f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
-                     f"(cum_all={cumulative['valid']})")
-            except RepoFailure as exc:
-                _log(f"FAIL {ck}: {exc}")
-                with manifest_lock:
-                    manifest.mark_failed(ck, exc.stage, exc.detail)
-                result["code"] = "failed"
+                    with manifest_lock:
+                        manifest.mark_done(ck, cinfo)
+                    totals = _length_totals(cinfo)
+                    with manifest_lock:
+                        cumulative["valid"] += totals["valid_tokens"]
+                        cumulative_valid = cumulative["valid"]
+                    if progress is not None:
+                        progress.emit(
+                            "unit_done",
+                            stream="code",
+                            repo=repo,
+                            unit=ck,
+                            rows=totals["rows"],
+                            valid_tokens=totals["valid_tokens"],
+                            capacity_tokens=totals["capacity_tokens"],
+                            lengths=cinfo.get("lengths", {}),
+                            cumulative_valid_tokens=cumulative_valid,
+                        )
+                    result["code"] = cinfo
+                    _log(f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
+                         f"(cum_all={cumulative['valid']})")
+                except RepoFailure as exc:
+                    _log(f"FAIL {ck}: {exc}")
+                    with manifest_lock:
+                        manifest.mark_failed(ck, exc.stage, exc.detail)
+                    if progress is not None:
+                        progress.emit(
+                            "unit_failed",
+                            stream="code",
+                            repo=repo,
+                            unit=ck,
+                            stage=exc.stage,
+                            detail=exc.detail[:2000],
+                        )
+                    result["code"] = "failed"
+        else:
+            result["code"] = "disabled"
 
         # ---- COMMITS half (per-range resume + checkpoint inside) ----
-        try:
-            done, failed = run_commits_half(
-                repo, repo_dir, repo_work, lengths_commits, range_size,
-                pool, manifest, manifest_lock, resume, cumulative,
-                dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
-            )
-            result["commits_done"] = done
-            result["commits_failed"] = failed
-        except RepoFailure as exc:
-            _log(f"FAIL {repo}::commits: {exc}")
-            with manifest_lock:
-                manifest.mark_failed(f"{repo}::commits", exc.stage, exc.detail)
+        if streams in {"both", "commits"}:
+            try:
+                done, failed = run_commits_half(
+                    repo, repo_dir, repo_work, lengths_commits, range_size,
+                    pool, manifest, manifest_lock, resume, cumulative,
+                    dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
+                    progress,
+                )
+                result["commits_done"] = done
+                result["commits_failed"] = failed
+            except RepoFailure as exc:
+                _log(f"FAIL {repo}::commits: {exc}")
+                with manifest_lock:
+                    manifest.mark_failed(f"{repo}::commits", exc.stage, exc.detail)
         return result
     finally:
         # CODE half already cleaned work_root/<repo>/<repo>-internal via
@@ -341,6 +439,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=os.cpu_count(),
                    help="ThreadPoolExecutor size for commit ranges "
                         "(default = os.cpu_count()).")
+    p.add_argument("--repo-workers", type=int, default=1,
+                   help="Number of repos to process concurrently. Default 1 "
+                        "preserves the legacy one-repo-at-a-time conveyor.")
+    p.add_argument("--max-active-repos", type=int, default=None,
+                   help="Bound staged, not-yet-finished repos on disk. Default "
+                        "= --repo-workers. Use 20-30 for a wide streaming window "
+                        "when disk has room.")
+    p.add_argument("--streams", choices=("both", "code", "commits"), default="both",
+                   help="Which streams to emit. 'code' uses the source-only tar "
+                        "stream and does not extract .git / run PR/commit stages.")
     p.add_argument("--max-repos", type=int, default=None,
                    help="Process at most N repos this run (after resume filtering).")
     p.add_argument("--token-budget", type=int, default=None,
@@ -377,6 +485,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
+    p.add_argument("--progress-jsonl", default=str(DEFAULT_PROGRESS_JSONL),
+                   help="Append unit-level progress events here for live "
+                        "throughput monitoring. Use empty string to disable.")
     return p.parse_args(argv)
 
 
@@ -391,10 +502,19 @@ def main(argv: list[str]) -> int:
     if not lengths_commits:
         raise SystemExit("--target-lengths-commits produced no lengths")
     workers = max(1, int(args.workers or 1))
+    repo_workers = max(1, int(args.repo_workers or 1))
+    max_active_repos = int(args.max_active_repos or repo_workers)
+    max_active_repos = max(1, max_active_repos)
+    if max_active_repos < repo_workers:
+        raise SystemExit("--max-active-repos must be >= --repo-workers")
 
     # FAIL LOUD up front (RULE #1): every required stage binary must exist.
-    for path in (VENV_PYTHON, sr.TOKENIZER_PATH, sr.INDEX_PROJECT,
-                 sr.PROCESS_COMMITS, sr.MATERIALIZER, sr.PACKER, EXTRACT_GIT):
+    required_paths = [VENV_PYTHON, sr.TOKENIZER_PATH, sr.MATERIALIZER, sr.PACKER]
+    if args.streams in {"both", "code"}:
+        required_paths.append(sr.INDEX_PROJECT)
+    if args.streams in {"both", "commits"}:
+        required_paths.extend([sr.PROCESS_COMMITS, EXTRACT_GIT])
+    for path in required_paths:
         if not Path(path).exists():
             raise SystemExit(f"required path missing: {path}")
 
@@ -427,7 +547,7 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"--pr-store does not exist: {pr_store}")
     if repo_list is not None and not repo_list.exists():
         raise SystemExit(f"--repo-list does not exist: {repo_list}")
-    if pr_store is not None:
+    if pr_store is not None and args.streams in {"both", "commits"}:
         _log(f"PR-store: inject record['pr_discussion'] from {pr_store} "
              f"(repo_list={repo_list})")
 
@@ -438,12 +558,25 @@ def main(argv: list[str]) -> int:
     if global_symbol_index is not None:
         if not global_symbol_index.exists():
             raise SystemExit(f"--global-symbol-index not found: {global_symbol_index}")
-        _log(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
-             f"threaded into CODE half (bounded depth-1 pulls, crosslib:<repo>).")
+        if args.streams in {"both", "code"}:
+            _log(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
+                 f"threaded into CODE half (bounded depth-1 pulls, crosslib:<repo>).")
 
     manifest = Manifest.load(CONVEYOR_MANIFEST)
     manifest_lock = threading.Lock()
     resume = not args.no_resume
+    progress = ProgressWriter(Path(args.progress_jsonl) if args.progress_jsonl else None)
+    progress.emit(
+        "run_started",
+        streams=args.streams,
+        workers=workers,
+        repo_workers=repo_workers,
+        max_active_repos=max_active_repos,
+        range_size=args.range_size,
+        target_lengths_code=list(lengths_code),
+        target_lengths_commits=list(lengths_commits),
+        manifest=str(CONVEYOR_MANIFEST),
+    )
 
     if args.work_dir:
         work_root = Path(args.work_dir)
@@ -466,36 +599,122 @@ def main(argv: list[str]) -> int:
         # otherwise stage every repo. Per-half + per-range resume is downstream.
         if only_repos is not None:
             return repo in only_repos
+        if args.streams == "code" and resume and manifest.is_done(code_key(repo)):
+            return False
         return True
 
-    pool = ThreadPoolExecutor(max_workers=workers)
-    try:
-        gen = stream_repo_subtrees_with_git(work_root, should_process)
-        for repo, repo_dir in gen:
-            res = process_one_repo(
-                repo, repo_dir, lengths_code, lengths_commits, args.range_size,
-                work_root, pool, manifest, manifest_lock, resume, cumulative,
-                args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
-                global_symbol_index, args.memory_limit_gb,
-            )
-            processed_repos += 1
-            if isinstance(res.get("code"), dict):
-                code_done += 1
-            ranges_done += res.get("commits_done", 0)
-            ranges_failed += res.get("commits_failed", 0)
+    range_pool = ThreadPoolExecutor(max_workers=workers)
+    repo_pool = ThreadPoolExecutor(max_workers=repo_workers) if repo_workers > 1 else None
 
-            stop = False
-            if args.max_repos is not None and processed_repos >= args.max_repos:
-                stop = True
-            if args.token_budget is not None and cumulative["valid"] >= args.token_budget:
-                _log(f"Token budget {args.token_budget} reached.")
-                stop = True
-            if stop:
-                if hasattr(gen, "close"):
-                    gen.close()
-                break
+    def _handle_repo_result(fut, repo: str) -> tuple[int, int, int, int]:
+        """Return increments: processed_repos, code_done, ranges_done, ranges_failed."""
+        try:
+            res = fut.result()
+        except RepoFailure as exc:
+            _log(f"FAIL {repo}::repo: {exc}")
+            with manifest_lock:
+                manifest.mark_failed(f"{repo}::repo", exc.stage, exc.detail)
+            return 1, 0, 0, 1
+        except Exception as exc:  # surface unexpected worker failures loudly
+            _log(f"FAIL {repo}::repo: unexpected {type(exc).__name__}: {exc}")
+            with manifest_lock:
+                manifest.mark_failed(f"{repo}::repo", "unexpected", str(exc))
+            return 1, 0, 0, 1
+        return (
+            1,
+            1 if isinstance(res.get("code"), dict) else 0,
+            int(res.get("commits_done", 0)),
+            int(res.get("commits_failed", 0)),
+        )
+
+    try:
+        gen = (
+            sr.stream_repo_subtrees(work_root, should_process)
+            if args.streams == "code"
+            else stream_repo_subtrees_with_git(work_root, should_process)
+        )
+
+        if repo_pool is None:
+            for repo, repo_dir in gen:
+                res = process_one_repo(
+                    repo, repo_dir, lengths_code, lengths_commits, args.range_size,
+                    work_root, range_pool, manifest, manifest_lock, resume, cumulative,
+                    args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
+                    args.streams, global_symbol_index, args.memory_limit_gb,
+                    progress,
+                )
+                processed_repos += 1
+                if isinstance(res.get("code"), dict):
+                    code_done += 1
+                ranges_done += res.get("commits_done", 0)
+                ranges_failed += res.get("commits_failed", 0)
+
+                stop = False
+                if args.max_repos is not None and processed_repos >= args.max_repos:
+                    stop = True
+                if args.token_budget is not None and cumulative["valid"] >= args.token_budget:
+                    _log(f"Token budget {args.token_budget} reached.")
+                    stop = True
+                if stop:
+                    if hasattr(gen, "close"):
+                        gen.close()
+                    break
+        else:
+            inflight: dict = {}
+            submitted_repos = 0
+            stop_submitting = False
+
+            def drain_one_or_more(block: bool = True) -> None:
+                nonlocal processed_repos, code_done, ranges_done, ranges_failed
+                if not inflight:
+                    return
+                timeout = None if block else 0
+                done, _pending = wait(
+                    inflight.keys(),
+                    timeout=timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                for fut in done:
+                    repo = inflight.pop(fut)
+                    pr, cd, rd, rf = _handle_repo_result(fut, repo)
+                    processed_repos += pr
+                    code_done += cd
+                    ranges_done += rd
+                    ranges_failed += rf
+
+            for repo, repo_dir in gen:
+                while len(inflight) >= max_active_repos:
+                    drain_one_or_more(block=True)
+                    if args.token_budget is not None and cumulative["valid"] >= args.token_budget:
+                        _log(f"Token budget {args.token_budget} reached.")
+                        stop_submitting = True
+                        break
+                if stop_submitting:
+                    if hasattr(gen, "close"):
+                        gen.close()
+                    break
+                if args.max_repos is not None and submitted_repos >= args.max_repos:
+                    if hasattr(gen, "close"):
+                        gen.close()
+                    break
+                fut = repo_pool.submit(
+                    process_one_repo,
+                    repo, repo_dir, lengths_code, lengths_commits, args.range_size,
+                    work_root, range_pool, manifest, manifest_lock, resume, cumulative,
+                    args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
+                    args.streams, global_symbol_index, args.memory_limit_gb,
+                    progress,
+                )
+                inflight[fut] = repo
+                submitted_repos += 1
+                drain_one_or_more(block=False)
+
+            while inflight:
+                drain_one_or_more(block=True)
     finally:
-        pool.shutdown(wait=True)
+        if repo_pool is not None:
+            repo_pool.shutdown(wait=True)
+        range_pool.shutdown(wait=True)
         if own_work_root and not args.keep_temp:
             shutil.rmtree(work_root, ignore_errors=True)
 
@@ -524,6 +743,9 @@ def main(argv: list[str]) -> int:
         "commit_ranges_this_run": ranges_done,
         "commit_ranges_failed_this_run": ranges_failed,
         "workers": workers,
+        "repo_workers": repo_workers,
+        "max_active_repos": max_active_repos,
+        "streams": args.streams,
         "range_size": args.range_size,
         "target_lengths_code": list(lengths_code),
         "target_lengths_commits": list(lengths_commits),
@@ -536,6 +758,7 @@ def main(argv: list[str]) -> int:
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
     }
+    progress.emit("run_finished", **summary)
     print(json.dumps(summary, indent=2))
     return 0 if (not manifest.failed or processed_repos > 0) else 1
 

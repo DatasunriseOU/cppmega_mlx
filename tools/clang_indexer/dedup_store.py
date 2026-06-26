@@ -29,6 +29,7 @@ Design (RULE #1 — fail loud, never silent):
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sqlite3
 import struct
@@ -134,7 +135,14 @@ class DedupStore:
     SQLITE_BUSY_TIMEOUT_MS = int(SQLITE_TIMEOUT_SECONDS * 1000)
     WRITE_RETRY_SLEEP_SECONDS = 0.05
     WRITE_RETRY_MAX_SLEEP_SECONDS = 2.0
-    MAX_PENDING_BEFORE_COMMIT = 32
+    # Keep cross-process writer transactions short. WAL lets readers run while a
+    # writer is active, but SQLite still has exactly one writer; holding an
+    # implicit transaction across many dedup rows makes parallel indexers sleep
+    # in sqliteDefaultBusyCallback. Default to one document per transaction and
+    # allow explicit tuning for controlled single-process runs.
+    MAX_PENDING_BEFORE_COMMIT = int(
+        os.environ.get("CPPMEGA_DEDUP_MAX_PENDING_BEFORE_COMMIT", "1")
+    )
 
     def __init__(self, db_path: str, *, near: bool = True, commit_every: int = 1000):
         if not db_path:

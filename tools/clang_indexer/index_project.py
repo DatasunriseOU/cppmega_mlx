@@ -2007,8 +2007,9 @@ def build_build_doc(
 ) -> dict:
     """Build a single 'build' enriched doc from a build/compilation file.
 
-    FAIL LOUD (RULE #1): callers pass already-read text; an empty/whitespace-only
-    build file is a real signal failure and the caller raises rather than skip.
+    Callers pass already-read text. Empty/whitespace-only build files are skipped
+    before this function is called: they carry no training signal and should not
+    make an otherwise valid C/C++ repo fail indexing.
     """
     text_len = len(text)
     structure_ids = [BUILD_KIND] * text_len
@@ -2246,7 +2247,9 @@ def emit_build_documents(
     against each other globally and resumably.
 
     FAIL LOUD (RULE #1): a discovered build file that cannot be read/decoded or
-    tokenizes empty RAISES -- we never silently skip a build file.
+    a non-empty build file that tokenizes empty RAISES. Truly empty/whitespace
+    build files are counted and skipped explicitly; they carry no useful text
+    and should not fail the whole C/C++ repo.
     """
     docs: list[dict] = []
     if not build_files:
@@ -2262,15 +2265,14 @@ def emit_build_documents(
             store = DedupStore(dedup_db, near=dedup_near, commit_every=2000)
 
     dropped = 0
+    skipped_empty = 0
     for filepath, build_kind in sorted(build_files):
         # FAIL LOUD on unreadable build files -- do not paper over a broken file.
         with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
         if not text or not text.strip():
-            raise RuntimeError(
-                f"build file {filepath} ({build_kind}) is empty/whitespace-only; "
-                f"refusing to emit an empty build doc (RULE #1: fail loud)"
-            )
+            skipped_empty += 1
+            continue
 
         per_file_build_info = dict(default_build_info) if default_build_info else {}
         per_file_build_info["build_system"] = build_kind
@@ -2312,7 +2314,7 @@ def emit_build_documents(
 
     print(
         f"  Build docs: emitted={len(docs)} dropped_dup={dropped} "
-        f"(whole-doc tokenized-hash dedup)",
+        f"skipped_empty={skipped_empty} (whole-doc tokenized-hash dedup)",
         file=sys.stderr,
     )
     return docs

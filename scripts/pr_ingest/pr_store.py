@@ -106,8 +106,11 @@ def connect(store_path: str, create: bool = True) -> sqlite3.Connection:
     if create:
         d = os.path.dirname(os.path.abspath(store_path))
         os.makedirs(d, exist_ok=True)
-    conn = sqlite3.connect(store_path)
+    conn = sqlite3.connect(store_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.executescript(SCHEMA)
     return conn
 
@@ -214,7 +217,7 @@ def ingest_gharchive_rows(conn: sqlite3.Connection, rows) -> dict:
     return counts
 
 
-def upsert_record(conn: sqlite3.Connection, rec: dict) -> None:
+def upsert_record(conn: sqlite3.Connection, rec: dict, *, commit: bool = True) -> None:
     """Insert a fully-assembled PR record (used for tests / GraphQL fallback).
 
     Keyed by (repo, pr_number); also indexes merge_commit_sha when present.
@@ -247,7 +250,8 @@ def upsert_record(conn: sqlite3.Connection, rec: dict) -> None:
             "(repo, pr_number, number, title, body) VALUES (?,?,?,?,?)",
             (repo, pr_number, int(li["number"]), li.get("title", ""), li.get("body", "")),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _assemble(conn: sqlite3.Connection, repo: str, pr_number: int) -> Optional[dict]:

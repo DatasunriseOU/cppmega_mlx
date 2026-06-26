@@ -8,7 +8,7 @@ curriculum mixes that want explicit ``pr`` batches.
 
 The output is intentionally compatible with the existing conveyor layout:
 
-    outputs/reindexed_pr/{1024,2048,4096,...}/pr_discussions_<offset>.parquet
+    outputs/reindexed_pr/{1024,2048,4096,...}/pr_discussions_<repo>_<offset>.parquet
 
 RULE #1: every stage uses the existing materializer/packer path and raises on
 missing input, empty output, or malformed store rows. There is no fallback path.
@@ -21,6 +21,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -37,6 +38,7 @@ from scripts.pr_ingest.render_discussion import render_discussion  # noqa: E402
 
 DEFAULT_STORE = REPO_ROOT / "outputs" / "pr_ingest" / "prs.sqlite"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "reindexed_pr"
+DEFAULT_MANIFEST = DEFAULT_OUTPUT_ROOT / "_done.json"
 ZSTD_LEVELS = (1024, 2048, 4096, 8192, 16384)
 
 
@@ -77,6 +79,24 @@ def _iter_pr_keys(
     params.append(-1 if limit is None else int(limit))
     params.append(int(offset))
     yield from conn.execute(sql, params)
+
+
+def _count_pr_keys(
+    conn: sqlite3.Connection,
+    *,
+    repo: str | None,
+    offset: int,
+    limit: int | None,
+) -> int:
+    sql = "SELECT COUNT(*) AS n FROM (SELECT 1 FROM prs"
+    params: list[object] = []
+    if repo:
+        sql += " WHERE repo=?"
+        params.append(repo)
+    sql += " ORDER BY repo, pr_number LIMIT ? OFFSET ?)"
+    params.append(-1 if limit is None else int(limit))
+    params.append(int(offset))
+    return int(conn.execute(sql, params).fetchone()["n"])
 
 
 def _write_pr_jsonl(
@@ -136,6 +156,29 @@ def _append_output(shard_name: str, packed: Path, target_length: int, output_roo
     return sr._parquet_stats(dest, target_length)
 
 
+def _repo_slug(repo: str | None) -> str:
+    if not repo:
+        return "all"
+    return repo.replace("/", "__").replace(":", "_")
+
+
+def _shard_name(repo: str | None, offset: int) -> str:
+    return f"pr_discussions_{_repo_slug(repo)}_{int(offset):08d}"
+
+
+def _load_manifest(path: Path) -> dict:
+    if not path.exists():
+        return {"done": {}, "failed": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_manifest(path: Path, manifest: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
 def export_pr_parquet(args: argparse.Namespace) -> dict:
     store = Path(args.store)
     if not store.exists():
@@ -146,32 +189,35 @@ def export_pr_parquet(args: argparse.Namespace) -> dict:
         raise ValueError("--target-lengths produced no lengths")
 
     conn = connect(str(store), create=False)
-    shard_name = f"pr_discussions_{int(args.offset):08d}"
-    with tempfile.TemporaryDirectory(prefix="pr_parquet_export_") as tmp:
-        work = Path(tmp)
-        jsonl = work / f"{shard_name}.jsonl"
-        n_docs = _write_pr_jsonl(
-            conn,
-            jsonl,
-            repo=args.repo,
-            offset=int(args.offset),
-            limit=args.limit,
-        )
-        tok = sr.stage_materialize(
-            shard_name,
-            jsonl,
-            work,
-            memory_limit_gb=float(args.memory_limit_gb),
-        )
-        routed = route_by_fit(tok, lengths, work / "routed")
-        if not routed:
-            raise RuntimeError(f"no PR docs routed for {jsonl}")
-        per_length: dict[str, dict] = {}
-        for length, route_parquet in sorted(routed.items()):
-            packed = sr.stage_pack(shard_name, route_parquet, length, work)
-            per_length[str(length)] = _append_output(
-                shard_name, packed, length, output_root,
+    try:
+        shard_name = _shard_name(args.repo, int(args.offset))
+        with tempfile.TemporaryDirectory(prefix="pr_parquet_export_") as tmp:
+            work = Path(tmp)
+            jsonl = work / f"{shard_name}.jsonl"
+            n_docs = _write_pr_jsonl(
+                conn,
+                jsonl,
+                repo=args.repo,
+                offset=int(args.offset),
+                limit=args.limit,
             )
+            tok = sr.stage_materialize(
+                shard_name,
+                jsonl,
+                work,
+                memory_limit_gb=float(args.memory_limit_gb),
+            )
+            routed = route_by_fit(tok, lengths, work / "routed")
+            if not routed:
+                raise RuntimeError(f"no PR docs routed for {jsonl}")
+            per_length: dict[str, dict] = {}
+            for length, route_parquet in sorted(routed.items()):
+                packed = sr.stage_pack(shard_name, route_parquet, length, work)
+                per_length[str(length)] = _append_output(
+                    shard_name, packed, length, output_root,
+                )
+    finally:
+        conn.close()
     return {
         "source": "pr",
         "store": str(store),
@@ -182,6 +228,88 @@ def export_pr_parquet(args: argparse.Namespace) -> dict:
     }
 
 
+def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
+    store = Path(args.store)
+    if not store.exists():
+        raise FileNotFoundError(f"--store does not exist: {store}")
+    manifest_path = Path(args.manifest)
+    manifest = _load_manifest(manifest_path)
+    resume = not args.no_resume
+    batch_size = int(args.batch_size)
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+
+    conn = connect(str(store), create=False)
+    try:
+        offset = int(args.offset)
+        max_shards = args.max_shards
+        shards: list[dict] = []
+        totals_by_length: dict[str, dict[str, int]] = {}
+        while True:
+            shard_name = _shard_name(args.repo, offset)
+            done_key = f"{_repo_slug(args.repo)}:{offset}"
+            n_keys = _count_pr_keys(
+                conn,
+                repo=args.repo,
+                offset=offset,
+                limit=batch_size,
+            )
+            if n_keys == 0:
+                break
+            if resume and done_key in manifest.get("done", {}):
+                info = manifest["done"][done_key]
+                shards.append({"shard": shard_name, "skipped": True, **info})
+            else:
+                shard_args = argparse.Namespace(**vars(args))
+                shard_args.limit = batch_size
+                shard_args.offset = offset
+                try:
+                    info = export_pr_parquet(shard_args)
+                except Exception as exc:
+                    manifest.setdefault("failed", {})[done_key] = {
+                        "offset": offset,
+                        "limit": batch_size,
+                        "repo": args.repo,
+                        "stage": "export_pr_parquet",
+                        "detail": str(exc)[:2000],
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+                    _save_manifest(manifest_path, manifest)
+                    raise
+                manifest.setdefault("done", {})[done_key] = info
+                manifest.get("failed", {}).pop(done_key, None)
+                _save_manifest(manifest_path, manifest)
+                shards.append(info)
+
+            last = shards[-1]
+            for length, st in last.get("lengths", {}).items():
+                agg = totals_by_length.setdefault(
+                    length,
+                    {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0},
+                )
+                for key in ("rows", "valid_tokens", "pad_tokens", "capacity_tokens"):
+                    agg[key] += int(st.get(key, 0))
+
+            offset += batch_size
+            if max_shards is not None and len(shards) >= int(max_shards):
+                break
+        return {
+            "source": "pr",
+            "store": str(store),
+            "output_root": str(Path(args.output_root)),
+            "manifest": str(manifest_path),
+            "repo": args.repo,
+            "start_offset": int(args.offset),
+            "batch_size": batch_size,
+            "next_offset": offset,
+            "shards": shards,
+            "n_shards": len(shards),
+            "lengths": totals_by_length,
+        }
+    finally:
+        conn.close()
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--store", default=str(DEFAULT_STORE))
@@ -190,13 +318,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--repo", default=None, help="Optional owner/repo filter.")
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--limit", type=int, default=10_000)
+    p.add_argument("--all", action="store_true",
+                   help="Export every PR row from --offset in resumable batches.")
+    p.add_argument("--batch-size", type=int, default=10_000,
+                   help="Rows per shard when --all is set.")
+    p.add_argument("--max-shards", type=int, default=None,
+                   help="Optional cap on number of shards exported in this run.")
+    p.add_argument("--manifest", default=str(DEFAULT_MANIFEST),
+                   help="Resume manifest for --all batched export.")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Ignore completed PR export shards in --manifest.")
     p.add_argument("--memory-limit-gb", type=float, default=10.0)
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    print(json.dumps(export_pr_parquet(args), indent=2, sort_keys=True))
+    result = export_pr_parquet_batches(args) if args.all else export_pr_parquet(args)
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
