@@ -148,3 +148,108 @@ def test_crosslink_on_pulls_tagged_chunk(tmp_path):
         f"expected root->crosslib call_edge; edges={edges} root={root_idx} cl={cl_idx}"
     )
     reader.close()
+
+
+# --------------------------------------------------------------------------- #
+# REAL libclang parse-path regression. The unit tests above hand-build
+# FunctionDef.callees with a 'boost::' qname, which bypasses extract_callees and
+# its SYSTEM_PREFIXES filter. In the LIVE pipeline, base-lib callees go through
+# extract_callees first -- and 'std::'/'boost::' are in SYSTEM_PREFIXES, so they
+# were silently dropped from `callees` and never reached the cross-lib linker
+# (the feature was dead for boost/std). This test parses real source with
+# libclang to prove the cross-linkable base-lib callee survives into
+# FunctionDef.baselib_callees and is pulled when the index is enabled.
+# --------------------------------------------------------------------------- #
+def _parse_one(ip, src_text, tmp_path):
+    ip._configure_libclang()
+    from clang.cindex import Index  # type: ignore
+    src = tmp_path / "u.cpp"
+    src.write_text(src_text)
+    idx = Index.create()
+    funcs, _types = ip.parse_translation_unit(
+        str(src), idx, ["-std=c++17"], str(tmp_path))
+    return funcs
+
+
+def test_extract_callees_splits_baselib_from_normal():
+    ip = _load_index_project()
+    import clang.cindex  # noqa: F401  (skip cleanly if libclang missing)
+    out = ip.extract_callees  # signature check: returns a 2-tuple
+    assert ip.is_crosslinkable_baselib("boost::beast::make_printable")
+    assert ip.is_crosslinkable_baselib("std::sort")
+    assert not ip.is_crosslinkable_baselib("myrepo::helper")
+    assert not ip.is_crosslinkable_baselib("memcpy")
+    assert callable(out)
+
+
+def test_real_parse_baselib_callee_survives_and_pulls(tmp_path):
+    ip = _load_index_project()
+    try:
+        import clang.cindex  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"libclang unavailable: {exc}")
+
+    # Root calls a boost:: symbol (filtered out of `callees`) + a local helper.
+    src = (
+        "namespace boost { namespace algorithm { template<class R> "
+        "void trim(R& r); } }\n"
+        "static int local_helper(int x) { return x + 1; }\n"
+        "int do_work(int s) {\n"
+        "    boost::algorithm::trim(s);\n"
+        "    return local_helper(s);\n"
+        "}\n"
+    )
+    funcs = _parse_one(ip, src, tmp_path)
+    root = next(f for f in funcs if f.name == "do_work")
+
+    # REGRESSION CORE: boost:: callee is NOT in `callees` (SYSTEM_PREFIXES) but
+    # IS captured in baselib_callees so the cross-lib linker can see it.
+    assert not any(c.startswith("boost::") for c in root.callees), root.callees
+    assert "boost::algorithm::trim" in root.baselib_callees, root.baselib_callees
+    # IPC round-trip preserves the new field.
+    assert ip.FunctionDef.from_dict(root.to_dict()).baselib_callees == \
+        root.baselib_callees
+
+    # Now build a store with the boost def and confirm an actual PULL.
+    db, body = _make_store(tmp_path)
+    reader = ip.GlobalSymbolReader(db)
+    idx = ip.ProjectIndex()
+    for f in funcs:
+        idx.add_function(f)
+    docs = ip.build_training_documents(
+        idx, max_tokens=16384, enriched=True, global_symbols=reader)
+    root_doc = [d for d in docs if "do_work" in d["text"]][0]
+    cl = [b for b in root_doc["chunk_boundaries"]
+          if (b.get("dep_source") or "").startswith("crosslib:")]
+    assert len(cl) == 1, cl
+    assert cl[0]["dep_source"] == "crosslib:boost"
+    assert cl[0]["name"] == "trim"
+    assert "trim impl" in root_doc["text"]
+    reader.close()
+
+
+def test_real_parse_off_has_no_crosslink(tmp_path):
+    """With global_symbols=None the base-lib callee is captured but never pulled
+    (OFF behavior unchanged: no crosslib chunk, no provenance)."""
+    ip = _load_index_project()
+    try:
+        import clang.cindex  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"libclang unavailable: {exc}")
+    src = (
+        "namespace boost { namespace algorithm { template<class R> "
+        "void trim(R& r); } }\n"
+        "int do_work(int seed_value_for_token_floor) {\n"
+        "    int accumulator = seed_value_for_token_floor + 1;\n"
+        "    boost::algorithm::trim(accumulator);\n"
+        "    return accumulator + seed_value_for_token_floor;\n"
+        "}\n"
+    )
+    funcs = _parse_one(ip, src, tmp_path)
+    idx = ip.ProjectIndex()
+    for f in funcs:
+        idx.add_function(f)
+    docs = ip.build_training_documents(idx, max_tokens=16384, enriched=True)
+    root_doc = [d for d in docs if "do_work" in d["text"]][0]
+    assert not any(b.get("dep_source") for b in root_doc["chunk_boundaries"])
+    assert "trim impl" not in root_doc["text"]

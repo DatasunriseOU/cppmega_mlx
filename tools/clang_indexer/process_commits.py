@@ -718,7 +718,7 @@ def analyze_file_clang(
                 )
             )
             if text and len(text) >= 20:
-                callees = extract_callees(cursor)
+                callees, baselib_callees = extract_callees(cursor)
                 referenced_types = extract_referenced_types(cursor)
                 qname = get_qualified_name(cursor)
                 start_line = cursor.extent.start.line
@@ -736,6 +736,7 @@ def analyze_file_clang(
                     sibling_index=func_sibling_index,
                     ast_node_type=func_ast_node_type,
                     referenced_types=referenced_types,
+                    baselib_callees=baselib_callees,
                 ))
 
         elif cursor.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL,

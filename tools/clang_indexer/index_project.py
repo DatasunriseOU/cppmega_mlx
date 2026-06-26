@@ -348,7 +348,10 @@ def classify_build_file(fname: str) -> str | None:
     return None
 
 
-# System/stdlib function prefixes (skip for dependency tracking)
+# System/stdlib function prefixes (skip for dependency tracking). UNCHANGED from
+# the original: callees under these prefixes are NOT recorded as normal callees,
+# so the local dep-resolution / call-edge path behaves EXACTLY as before whether
+# or not cross-repo linking is enabled. (OFF behavior is byte-identical.)
 SYSTEM_PREFIXES = (
     'std::', 'boost::', '__builtin', '__', 'operator', 'printf', 'fprintf',
     'sprintf', 'snprintf', 'scanf', 'malloc', 'calloc', 'realloc', 'free',
@@ -357,19 +360,30 @@ SYSTEM_PREFIXES = (
     'assert', 'pthread_', 'EXPECT_', 'ASSERT_', 'TEST',
 )
 
+# Base-library NAMESPACE prefixes that ARE cross-linkable (present in the global
+# symbol store built by scripts/crossrepo/build_global_symbol_index.py). A callee
+# under one of these is filtered OUT of the normal `callees` list (above) but is
+# captured SEPARATELY in FunctionDef.baselib_callees so the cross-repo linker can
+# resolve it WITHOUT changing the normal callee/call-edge behavior. We do NOT
+# include libc-style bare names here (memcpy/strlen/...) because those are not in
+# the A1 selection and would only add noise; only the namespaced base libs.
+CROSSLINKABLE_NS_PREFIXES = ('std::', 'boost::')
+
 
 class FunctionDef:
     """A function definition with its source location and call references."""
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
                  'callees', 'referenced_types', 'dep_level', 'is_definition',
-                 'ast_depth', 'sibling_index', 'ast_node_type']
+                 'ast_depth', 'sibling_index', 'ast_node_type',
+                 'baselib_callees']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
                  end_line: int = 0, ast_depth: list[int] | None = None,
                  sibling_index: list[int] | None = None,
                  ast_node_type: list[int] | None = None,
-                 referenced_types: list | None = None):
+                 referenced_types: list | None = None,
+                 baselib_callees: list | None = None):
         self.name = name
         self.qualified_name = qualified_name
         self.file = file
@@ -382,6 +396,10 @@ class FunctionDef:
         # SAME libclang parse as callees so it round-trips IPC and feeds the
         # offline type_refs/type_edges builders. Mirrors `callees`.
         self.referenced_types = list(referenced_types or [])
+        # Cross-linkable base-lib callees (std::/boost::) dropped from `callees`
+        # by the normal system-prefix filter, kept SEPARATELY for the optional
+        # cross-repo linker. Empty/ignored unless --global-symbol-index is given.
+        self.baselib_callees = list(baselib_callees or [])
         self.dep_level = 0
         self.is_definition = is_definition
         self.ast_depth = list(ast_depth or [])
@@ -399,6 +417,7 @@ class FunctionDef:
             'sibling_index': self.sibling_index,
             'ast_node_type': self.ast_node_type,
             'referenced_types': self.referenced_types,
+            'baselib_callees': self.baselib_callees,
         }
 
     @classmethod
@@ -535,6 +554,19 @@ def is_system_function(name: str | None) -> bool:
     if not isinstance(name, str) or not name:
         return False
     return any(name.startswith(p) for p in SYSTEM_PREFIXES)
+
+
+def is_crosslinkable_baselib(name: str | None) -> bool:
+    """True if ``name`` is a cross-linkable base-lib symbol (std::/boost::).
+
+    Such a callee is filtered out of the normal ``callees`` list (it matches
+    SYSTEM_PREFIXES) but is captured separately so the cross-repo linker can
+    resolve it against the global symbol index. This does NOT affect normal
+    callee/call-edge behavior.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    return any(name.startswith(p) for p in CROSSLINKABLE_NS_PREFIXES)
 
 
 _DROP_CLANG_ARG_PREFIXES = (
@@ -813,9 +845,22 @@ def _cursor_text_and_metadata(
     )
 
 
-def extract_callees(cursor: Cursor) -> list[str]:
-    """Extract all function call references from a cursor's children."""
-    callees = set()
+def extract_callees(cursor: Cursor) -> tuple[list[str], list[str]]:
+    """Extract function call references from a cursor's children.
+
+    Returns ``(callees, baselib_callees)``:
+
+    * ``callees`` — normal resolvable callees (UNCHANGED filter: system/stdlib
+      prefixes dropped). Feeds local dep-resolution + call-edges exactly as
+      before, so OFF behavior is byte-identical.
+    * ``baselib_callees`` — callees that were dropped by the normal filter BUT
+      are cross-linkable base-lib namespaces (std::/boost::). Captured here in the
+      SAME walk so the cross-repo linker can resolve them against the global
+      symbol index WITHOUT touching the normal callee path. Ignored entirely when
+      cross-repo linking is disabled.
+    """
+    callees: set[str] = set()
+    baselib_callees: set[str] = set()
 
     def walk(node: Cursor):
         if node.kind == CursorKind.CALL_EXPR:
@@ -823,13 +868,16 @@ def extract_callees(cursor: Cursor) -> list[str]:
             if ref and ref.spelling:
                 # Get fully qualified name
                 qname = get_qualified_name(ref)
-                if qname and not is_system_function(qname):
-                    callees.add(qname)
+                if qname:
+                    if not is_system_function(qname):
+                        callees.add(qname)
+                    elif is_crosslinkable_baselib(qname):
+                        baselib_callees.add(qname)
         for child in node.get_children():
             walk(child)
 
     walk(cursor)
-    return list(callees)
+    return list(callees), list(baselib_callees)
 
 
 _REFERENCED_TYPE_DECL_KINDS = frozenset({
@@ -1020,7 +1068,7 @@ def parse_translation_unit(
                 )
             )
             if text and len(text) >= 20:
-                callees = extract_callees(cursor)
+                callees, baselib_callees = extract_callees(cursor)
                 referenced_types = extract_referenced_types(cursor)
                 qname = get_qualified_name(cursor)
                 functions.append(FunctionDef(
@@ -1036,6 +1084,7 @@ def parse_translation_unit(
                     sibling_index=func_sibling_index,
                     ast_node_type=func_ast_node_type,
                     referenced_types=referenced_types,
+                    baselib_callees=baselib_callees,
                 ))
             return
 
@@ -1380,6 +1429,29 @@ def collect_transitive_deps(
     the base lib (depth-1 only), and we SKIP trivial/tiny inline bodies — that is
     bounded by ``crosslink_budget`` + the builder's body-len floor.
     """
+    crosslink_active = (
+        global_symbols is not None
+        and crosslink_visited is not None
+        and crosslink_budget is not None
+    )
+
+    def _try_crosslink(callee: str) -> None:
+        # Depth-1 only: a pulled base-lib def is a LEAF; we never enqueue it, so
+        # its base-lib-internal callees are not followed. Bounds (count + token
+        # budget) are enforced by crosslink_budget. ONE clear path; a miss (not a
+        # selected base-lib symbol) is simply a no-op, never a fallback.
+        if callee in crosslink_visited:
+            return
+        if not crosslink_budget.has_room():
+            return
+        hit = global_symbols.lookup(callee)
+        if hit is None:
+            return
+        if not crosslink_budget.can_afford(hit["token_est"]):
+            return
+        crosslink_visited.add(callee)
+        crosslink_budget.spend(hit["token_est"])
+
     visited = {root_qname}
     queue = deque([(root_qname, 0)])
     deps = []
@@ -1398,25 +1470,16 @@ def collect_transitive_deps(
                 visited.add(callee)
                 deps.append(callee)
                 queue.append((callee, depth + 1))
-            elif (
-                global_symbols is not None
-                and crosslink_visited is not None
-                and crosslink_budget is not None
-            ):
-                # Unresolved callee: try the cross-repo base-lib index. Depth-1
-                # only — a pulled base-lib def is a LEAF here; we never enqueue it
-                # so its base-lib-internal callees are not followed.
-                if callee in crosslink_visited:
-                    continue
-                if not crosslink_budget.has_room():
-                    continue
-                hit = global_symbols.lookup(callee)
-                if hit is None:
-                    continue
-                if not crosslink_budget.can_afford(hit["token_est"]):
-                    continue
-                crosslink_visited.add(callee)
-                crosslink_budget.spend(hit["token_est"])
+            elif crosslink_active:
+                # An unresolved callee (not local) MIGHT be a base-lib symbol
+                # (e.g. a vendored/forward-declared libc-style name). Try it.
+                _try_crosslink(callee)
+        # Base-lib-namespaced callees (std::/boost::) were filtered out of
+        # `callees` by the normal system-prefix filter and live here. They are
+        # the PRIMARY cross-link source. Only consulted when cross-linking is on.
+        if crosslink_active:
+            for callee in func.baselib_callees:
+                _try_crosslink(callee)
 
     return deps
 
