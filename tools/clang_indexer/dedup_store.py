@@ -32,7 +32,8 @@ import hashlib
 import re
 import sqlite3
 import struct
-from typing import Iterable
+import time
+from typing import Iterable, Sequence
 
 # --------------------------------------------------------------------------- #
 # Normalization (NO alpha-rename): strip comments, collapse whitespace, trim.
@@ -129,6 +130,11 @@ class DedupStore:
     NUM_PERM = 256
     THRESHOLD = 0.7
     SHINGLE_K = 5
+    SQLITE_TIMEOUT_SECONDS = 300.0
+    SQLITE_BUSY_TIMEOUT_MS = int(SQLITE_TIMEOUT_SECONDS * 1000)
+    WRITE_RETRY_SLEEP_SECONDS = 0.05
+    WRITE_RETRY_MAX_SLEEP_SECONDS = 2.0
+    MAX_PENDING_BEFORE_COMMIT = 32
 
     def __init__(self, db_path: str, *, near: bool = True, commit_every: int = 1000):
         if not db_path:
@@ -140,7 +146,10 @@ class DedupStore:
 
         # FAIL LOUD: sqlite open failure raises (no in-memory fallback).
         try:
-            self.conn = sqlite3.connect(self.db_path, timeout=60.0)
+            self.conn = sqlite3.connect(
+                self.db_path,
+                timeout=self.SQLITE_TIMEOUT_SECONDS,
+            )
         except sqlite3.Error as exc:
             raise RuntimeError(
                 f"DedupStore: failed to open sqlite db at {self.db_path!r}: {exc}"
@@ -149,7 +158,7 @@ class DedupStore:
         # Cross-process safe pragmas.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA busy_timeout=60000")
+        self.conn.execute(f"PRAGMA busy_timeout={self.SQLITE_BUSY_TIMEOUT_MS}")
         self._init_schema()
 
         # Lazy datasketch objects; built only when near dedup is enabled.
@@ -161,26 +170,50 @@ class DedupStore:
     # ----------------------------------------------------------------- #
     def _init_schema(self) -> None:
         c = self.conn
-        c.execute("CREATE TABLE IF NOT EXISTS exact (hash BLOB PRIMARY KEY)")
-        c.execute(
+        self._execute_write("CREATE TABLE IF NOT EXISTS exact (hash BLOB PRIMARY KEY)")
+        self._execute_write(
             "CREATE TABLE IF NOT EXISTS lsh ("
             "band_id INTEGER NOT NULL, band_hash BLOB NOT NULL, doc_id INTEGER NOT NULL)"
         )
-        c.execute(
+        self._execute_write(
             "CREATE INDEX IF NOT EXISTS lsh_band ON lsh (band_id, band_hash)"
         )
-        c.execute(
+        self._execute_write(
             "CREATE TABLE IF NOT EXISTS minhash ("
             "doc_id INTEGER PRIMARY KEY, sig BLOB NOT NULL)"
         )
-        c.execute(
+        self._execute_write(
             "CREATE TABLE IF NOT EXISTS dedup_meta (key TEXT PRIMARY KEY, val INTEGER)"
         )
         # next doc_id counter for near-dup docs.
-        c.execute(
+        self._execute_write(
             "INSERT OR IGNORE INTO dedup_meta (key, val) VALUES ('next_doc_id', 0)"
         )
         c.commit()
+
+    def _execute_write(self, sql: str, params: tuple = ()):
+        """Execute a SQLite write with bounded retry on cross-process writer locks.
+
+        The corpus conveyor runs code and commit stages concurrently against one
+        global dedup DB. SQLite WAL allows this, but only one writer can commit at
+        a time. We keep fail-loud semantics: lock contention is retried for a
+        bounded window, then raised with WHERE context instead of falling back.
+        """
+        deadline = time.monotonic() + self.SQLITE_TIMEOUT_SECONDS
+        sleep_s = self.WRITE_RETRY_SLEEP_SECONDS
+        while True:
+            try:
+                return self.conn.execute(sql, params)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "DedupStore: sqlite write remained locked after "
+                        f"{self.SQLITE_TIMEOUT_SECONDS:.0f}s at {self.db_path!r}"
+                    ) from exc
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 1.5, self.WRITE_RETRY_MAX_SLEEP_SECONDS)
 
     def _init_near(self) -> None:
         # FAIL LOUD: datasketch import failure raises (no fallback).
@@ -252,7 +285,7 @@ class DedupStore:
         row already existed -> exact duplicate.
         """
         h = _sha1(normalize_body(text))
-        cur = self.conn.execute(
+        cur = self._execute_write(
             "INSERT OR IGNORE INTO exact (hash) VALUES (?)", (h,)
         )
         self._mark_pending()
@@ -282,7 +315,7 @@ class DedupStore:
         # Not a near-dup: persist signature + bands so it becomes a reference.
         doc_id = self._next_doc_id()
         sig = self._minhash_to_blob(mh)
-        self.conn.execute(
+        self._execute_write(
             "INSERT INTO minhash (doc_id, sig) VALUES (?, ?)", (doc_id, sig)
         )
         self._persist_bands(doc_id, mh)
@@ -304,7 +337,7 @@ class DedupStore:
     def seen_exact_tokens(self, token_ids: Sequence[int]) -> bool:
         """Return True if sha1(token_ids) was already seen (exact duplicate)."""
         h = _sha1_tokens(token_ids)
-        cur = self.conn.execute(
+        cur = self._execute_write(
             "INSERT OR IGNORE INTO exact (hash) VALUES (?)", (h,)
         )
         self._mark_pending()
@@ -328,7 +361,7 @@ class DedupStore:
 
         doc_id = self._next_doc_id()
         sig = self._minhash_to_blob(mh)
-        self.conn.execute(
+        self._execute_write(
             "INSERT INTO minhash (doc_id, sig) VALUES (?, ?)", (doc_id, sig)
         )
         self._persist_bands(doc_id, mh)
@@ -361,13 +394,13 @@ class DedupStore:
             band_hash = hashlib.sha1(
                 struct.pack(f"<{len(band_slice)}Q", *(int(x) for x in band_slice))
             ).digest()
-            self.conn.execute(
+            self._execute_write(
                 "INSERT INTO lsh (band_id, band_hash, doc_id) VALUES (?, ?, ?)",
                 (band_id, band_hash, doc_id),
             )
 
     def _next_doc_id(self) -> int:
-        cur = self.conn.execute(
+        cur = self._execute_write(
             "UPDATE dedup_meta SET val = val + 1 WHERE key='next_doc_id'"
         )
         if cur.rowcount != 1:
@@ -379,7 +412,8 @@ class DedupStore:
 
     def _mark_pending(self) -> None:
         self._pending += 1
-        if self._pending >= self.commit_every:
+        threshold = min(self.commit_every, self.MAX_PENDING_BEFORE_COMMIT)
+        if self._pending >= threshold:
             self.commit()
 
     def commit(self) -> None:

@@ -363,6 +363,7 @@ def process_range(
     dedup_near: bool = True,
     pr_store: Path | None = None,
     repo_list: Path | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
     rkey = range_key(repo, start_idx)
@@ -375,8 +376,9 @@ def process_range(
         # process_commits needs the source tree for include resolution.
         enriched = stage_index_commits(rkey, [slice_jsonl], rwork, repo_dir, None,
                                        dedup_db, dedup_near,
-                                       pr_store=pr_store, repo_list=repo_list)
-        tok = stage_materialize(rkey, enriched, rwork)
+                                       pr_store=pr_store, repo_list=repo_list,
+                                       memory_limit_gb=memory_limit_gb)
+        tok = stage_materialize(rkey, enriched, rwork, memory_limit_gb)
 
         route_dir = rwork / "routed"
         routed = route_by_fit(tok, lengths_sorted, route_dir)
@@ -419,6 +421,7 @@ def process_one_repo(
     dedup_near: bool = True,
     pr_store: Path | None = None,
     repo_list: Path | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> int:
     """Extract one repo, fan its ranges to the pool, wait for completion.
 
@@ -461,7 +464,7 @@ def process_one_repo(
             fut = pool.submit(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
-                dedup_db, dedup_near, pr_store, repo_list,
+                dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
             )
             futures[fut] = (start, end)
 
@@ -537,6 +540,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--repo-list", default=None,
                    help="Path to outputs/pr_ingest/repo_list.json (bare-name -> "
                         "owner/repo map) for resolving the PR-store key.")
+    p.add_argument("--memory-limit-gb", type=float, default=10.0,
+                   help="Per-stage fail-loud RSS limit passed to process_commits/"
+                        "materializer (default 10.0).")
     return p.parse_args(argv)
 
 
@@ -636,6 +642,7 @@ def main(argv: list[str]) -> int:
                     work_root, pool, manifest, manifest_lock, resume,
                     args.token_budget, cumulative, args.keep_temp,
                     dedup_db, dedup_near, pr_store, repo_list,
+                    args.memory_limit_gb,
                 )
                 ranges_done += done
                 processed_repos += 1

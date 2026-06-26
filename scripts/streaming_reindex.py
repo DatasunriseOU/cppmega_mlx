@@ -293,6 +293,7 @@ def stage_index_source(
     dedup_db: Path | None = None,
     dedup_near: bool = True,
     global_symbol_index: Path | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.
 
@@ -313,6 +314,7 @@ def stage_index_source(
         "--max-tokens", str(TOKENIZE_BUDGET),
         "--exclude-dirs", SOURCE_EXTRA_EXCLUDE,
         "--tokenizer-path", TOKENIZER_PATH,
+        "--memory-limit-gb", str(memory_limit_gb),
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
@@ -336,7 +338,8 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
                         dedup_db: Path | None = None,
                         dedup_near: bool = True,
                         pr_store: Path | None = None,
-                        repo_list: Path | None = None) -> Path:
+                        repo_list: Path | None = None,
+                        memory_limit_gb: float = 10.0) -> Path:
     """process_commits.py -> <repo>.enriched.jsonl (commit edit-signal docs).
 
     A commit is an ATOMIC change-unit: process_commits dedups whole commit DOCS
@@ -352,6 +355,7 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         "--max-tokens", str(TOKENIZE_BUDGET),
         "--tokenizer-path", TOKENIZER_PATH,
         "--format", "both",
+        "--memory-limit-gb", str(memory_limit_gb),
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
@@ -371,7 +375,12 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
     return enriched
 
 
-def stage_materialize(repo: str, enriched: Path, work: Path) -> Path:
+def stage_materialize(
+    repo: str,
+    enriched: Path,
+    work: Path,
+    memory_limit_gb: float = 10.0,
+) -> Path:
     """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file)."""
     tok = work / f"{repo}.tok.parquet"
     run_checked(
@@ -385,6 +394,7 @@ def stage_materialize(repo: str, enriched: Path, work: Path) -> Path:
             "--materialize-tokenized-enriched",
             "--overflow-policy", "drop",
             "--size", _budget_size_label(TOKENIZE_BUDGET),
+            "--memory-limit-gb", str(memory_limit_gb),
         ],
         log_path=work / f"{repo}.materialize.log",
     )
@@ -469,6 +479,7 @@ def process_one_repo(
     dedup_db: Path | None = None,
     dedup_near: bool = True,
     global_symbol_index: Path | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
@@ -483,9 +494,11 @@ def process_one_repo(
     work = work_root / repo
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
-    enriched = stage_index_source(repo, repo_dir, work, dedup_db, dedup_near,
-                                  global_symbol_index)
-    tok = stage_materialize(repo, enriched, work)
+    enriched = stage_index_source(
+        repo, repo_dir, work, dedup_db, dedup_near,
+        global_symbol_index, memory_limit_gb,
+    )
+    tok = stage_materialize(repo, enriched, work, memory_limit_gb)
 
     _bucket_for, route_by_fit = _route_by_fit_impl()
     route_dir = work / "routed"
@@ -509,13 +522,15 @@ def process_one_commit_source(
     repo_dir: Path | None,
     dedup_db: Path | None = None,
     dedup_near: bool = True,
+    memory_limit_gb: float = 10.0,
 ) -> dict:
     work = work_root / key
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
     enriched = stage_index_commits(key, commit_inputs, work, repo_root, repo_dir,
-                                   dedup_db, dedup_near)
-    tok = stage_materialize(key, enriched, work)
+                                   dedup_db, dedup_near,
+                                   memory_limit_gb=memory_limit_gb)
+    tok = stage_materialize(key, enriched, work, memory_limit_gb)
 
     _bucket_for, route_by_fit = _route_by_fit_impl()
     route_dir = work / "routed"
@@ -571,6 +586,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "When set, the CODE stage threads it into index_project so "
                         "unresolved base-lib callees are pulled in as bounded "
                         "depth-1 deps tagged crosslib:<repo>. DEFAULT off.")
+    p.add_argument("--memory-limit-gb", type=float, default=10.0,
+                   help="Per-stage fail-loud RSS limit passed to index/materialize/"
+                        "commit processors (default 10.0).")
     return p.parse_args(argv)
 
 
@@ -650,7 +668,7 @@ def main(argv: list[str]) -> int:
                 key, files, target_lengths, work_root,
                 Path(args.commit_repo_root) if args.commit_repo_root else None,
                 Path(args.commit_repo_dir) if args.commit_repo_dir else None,
-                dedup_db, dedup_near,
+                dedup_db, dedup_near, args.memory_limit_gb,
             )
             manifest.mark_done(manifest_key, info)
             run_report[manifest_key] = info
@@ -681,7 +699,9 @@ def main(argv: list[str]) -> int:
             for repo, repo_dir in gen:
                 try:
                     info = process_one_repo(repo, repo_dir, target_lengths, work_root,
-                                            dedup_db, dedup_near, global_symbol_index)
+                                            dedup_db, dedup_near,
+                                            global_symbol_index,
+                                            args.memory_limit_gb)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

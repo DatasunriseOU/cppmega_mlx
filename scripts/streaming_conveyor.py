@@ -121,6 +121,7 @@ def run_code_half(
     dedup_db: Path | None,
     dedup_near: bool,
     global_symbol_index: Path | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -132,7 +133,7 @@ def run_code_half(
     """
     info = sr.process_one_repo(
         repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-        global_symbol_index,
+        global_symbol_index, memory_limit_gb,
     )
     # zstd-max the per-length code parquet files this repo just wrote.
     for L in info.get("lengths", {}):
@@ -163,6 +164,7 @@ def run_commits_half(
     dedup_near: bool,
     pr_store: Path | None,
     repo_list: Path | None,
+    memory_limit_gb: float = 10.0,
 ) -> tuple[int, int]:
     """Extract commit records once, fan ranges to the pool. Returns (done, failed).
 
@@ -204,6 +206,7 @@ def run_commits_half(
             process_range, repo, repo_dir, records_jsonl,
             start, end, lengths_sorted, repo_work,
             dedup_db, dedup_near, pr_store, repo_list,
+            memory_limit_gb,
         )
         futures[fut] = (start, end)
 
@@ -259,6 +262,7 @@ def process_one_repo(
     pr_store: Path | None,
     repo_list: Path | None,
     global_symbol_index: Path | None = None,
+    memory_limit_gb: float = 10.0,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -281,7 +285,7 @@ def process_one_repo(
             try:
                 cinfo = run_code_half(
                     repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-                    global_symbol_index,
+                    global_symbol_index, memory_limit_gb,
                 )
                 with manifest_lock:
                     manifest.mark_done(ck, cinfo)
@@ -303,7 +307,7 @@ def process_one_repo(
             done, failed = run_commits_half(
                 repo, repo_dir, repo_work, lengths_commits, range_size,
                 pool, manifest, manifest_lock, resume, cumulative,
-                dedup_db, dedup_near, pr_store, repo_list,
+                dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
             )
             result["commits_done"] = done
             result["commits_failed"] = failed
@@ -370,6 +374,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "When set, the CODE half threads it into index_project so "
                         "unresolved base-lib callees are pulled as bounded depth-1 "
                         "deps tagged crosslib:<repo>. DEFAULT off (unchanged).")
+    p.add_argument("--memory-limit-gb", type=float, default=10.0,
+                   help="Per-stage fail-loud RSS limit passed to index/materialize/"
+                        "commit processors (default 10.0).")
     return p.parse_args(argv)
 
 
@@ -469,7 +476,7 @@ def main(argv: list[str]) -> int:
                 repo, repo_dir, lengths_code, lengths_commits, args.range_size,
                 work_root, pool, manifest, manifest_lock, resume, cumulative,
                 args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
-                global_symbol_index,
+                global_symbol_index, args.memory_limit_gb,
             )
             processed_repos += 1
             if isinstance(res.get("code"), dict):
