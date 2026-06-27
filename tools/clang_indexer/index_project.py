@@ -1004,6 +1004,7 @@ def parse_translation_unit(
     index: Index,
     compile_args: list[str],
     project_dir: str,
+    allow_system_types: bool = False,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -1011,6 +1012,18 @@ def parse_translation_unit(
 
     Type definitions are returned alongside functions so the index can register
     them as type-edge target chunks. Headers are parsed as standalone TUs.
+
+    ``allow_system_types`` (default False): the type-def branch normally DROPS
+    names that look like system/stdlib symbols (``is_system_function`` — e.g.
+    anything under ``std::``/``boost::``) so the NORMAL repo indexer never indexes
+    the standard library's own types. The cross-repo GLOBAL symbol-index builder
+    (scripts/crossrepo/build_global_symbol_index.py), when indexing the C++
+    standard library itself (libc++/libstdc++), sets this True so ``std::vector``,
+    ``std::map``, ``std::basic_string``, ... ARE captured as type definitions.
+    When True we also attribute each captured func/type to its ACTUAL defining
+    file (not the primary TU path) so the same ``std::vector`` reached through many
+    umbrella headers dedups to one row (and carries correct provenance/line).
+    This flag does NOT change behavior for the normal (per-repo) index path.
     """
     functions: list[FunctionDef] = []
     typedefs: list[TypeDef] = []
@@ -1055,6 +1068,21 @@ def parse_translation_unit(
             return False
         return os.path.abspath(loc.name).startswith(project_dir_abs + os.sep)
 
+    def _cursor_rel_file(cursor) -> str:
+        """The cursor's ACTUAL defining file, relative to project_dir.
+
+        Used only under ``allow_system_types`` so a std:: symbol reached via many
+        umbrella TUs is attributed to the one header that defines it (correct
+        provenance + stable dedup key). Falls back to the primary ``rel_path``.
+        """
+        loc = cursor.location.file
+        if loc is None:
+            return rel_path
+        try:
+            return os.path.relpath(loc.name, project_dir)
+        except Exception:
+            return rel_path
+
     def visit(cursor):
         """Recursively visit cursors, descending into namespaces and classes.
 
@@ -1091,7 +1119,7 @@ def parse_translation_unit(
                 functions.append(FunctionDef(
                     name=cursor.spelling,
                     qualified_name=qname,
-                    file=rel_path,
+                    file=(_cursor_rel_file(cursor) if allow_system_types else rel_path),
                     line=cursor.location.line,
                     text=text,
                     callees=callees,
@@ -1111,13 +1139,16 @@ def parse_translation_unit(
         type_bucket = _TYPE_DEF_KIND_BUCKET.get(cursor.kind)
         if type_bucket is not None and cursor.is_definition():
             qname = get_qualified_name(cursor)
-            if qname and not is_system_function(qname):
+            # Normal path drops std::/boost:: ("system") type names; the std
+            # cross-link builder sets allow_system_types so std:: class templates
+            # (std::vector/std::map/std::basic_string/...) ARE captured.
+            if qname and (allow_system_types or not is_system_function(qname)):
                 td_text = get_function_text(cursor, tu)
                 if td_text and len(td_text) >= 8:
                     typedefs.append(TypeDef(
                         name=cursor.spelling,
                         qualified_name=qname,
-                        file=rel_path,
+                        file=(_cursor_rel_file(cursor) if allow_system_types else rel_path),
                         line=cursor.location.line,
                         text=td_text,
                         kind=type_bucket,
