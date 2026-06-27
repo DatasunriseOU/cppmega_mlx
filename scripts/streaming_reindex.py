@@ -485,9 +485,10 @@ def process_one_repo(
 
     Corrected design (route-by-fit, carried over from the commits driver):
     materialize the repo's tokenized docs ONCE, then split rows by whole-doc
-    token count into the smallest fitting length bucket (docs longer than the
-    largest length get their own over-long row in the largest bucket). Each
-    routed bucket is packed independently and landed at
+    token count into the smallest fitting length bucket. Docs longer than the
+    largest length are explicitly dropped from fixed-shape parquet output and
+    reported by the router instead of being written as invalid oversized rows.
+    Each routed bucket is packed independently and landed at
     outputs/reindexed/<L>/<repo>.parquet. A given doc therefore appears in
     exactly one bucket -- never replicated across 1024/2048/4096.
     """
@@ -619,7 +620,9 @@ def main(argv: list[str]) -> int:
         sys.path.insert(0, str(MLX_ROOT / "tools" / "clang_indexer"))
         from dedup_store import DedupStore  # noqa: E402
         dedup_db.parent.mkdir(parents=True, exist_ok=True)
-        DedupStore(str(dedup_db), near=dedup_near, commit_every=1000).close()
+        # Path/schema validation only; avoid rebuilding persisted MinHash/LSH in
+        # the driver parent before any repo work starts.
+        DedupStore(str(dedup_db), near=False, commit_every=1000).close()
         print(f"Dedup: SHARED global store at {dedup_db} "
               f"(exact{'+near' if dedup_near else ''}, tokenized hash)",
               file=sys.stderr)

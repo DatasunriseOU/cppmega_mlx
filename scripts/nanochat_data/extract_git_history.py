@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -98,6 +99,61 @@ SKIP_PATTERNS = {
 MAX_DIFF_CHARS = 50000
 MAX_FILES_PER_COMMIT = 5
 MIN_DIFF_CHARS = 50
+
+
+class OutputFileLock:
+    """Exclusive lock for one output JSONL writer.
+
+    The conveyor may run many repos in parallel, but a single JSONL path must
+    have exactly one writer. Lock before opening the output file so a duplicate
+    invocation cannot truncate or race the active writer.
+    """
+
+    def __init__(self, output_path: str | Path):
+        self.output_path = Path(output_path)
+        self.lock_path = Path(str(self.output_path) + ".lock")
+        self._fh = None
+
+    def acquire(self) -> None:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._fh.seek(0)
+            holder = self._fh.read().strip()
+            self._fh.close()
+            self._fh = None
+            raise RuntimeError(
+                f"output JSONL lock is already held: {self.lock_path}\n"
+                f"holder:\n{holder}"
+            ) from exc
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "ppid": os.getppid(),
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "output": str(self.output_path),
+                    "argv": sys.argv,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        self._fh.write("\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 def stable_repo_id(repo_name: str) -> str:
@@ -600,25 +656,30 @@ def main():
 
     total_records = 0
     start_time = time.time()
+    output_lock = OutputFileLock(args.output)
+    output_lock.acquire()
 
-    with open(args.output, "w") as f:
-        for i, repo_path in enumerate(repos):
-            repo_name = Path(repo_path).name
-            print(f"[{i + 1}/{len(repos)}] {repo_name}...")
+    try:
+        with open(args.output, "w") as f:
+            for i, repo_path in enumerate(repos):
+                repo_name = Path(repo_path).name
+                print(f"[{i + 1}/{len(repos)}] {repo_name}...")
 
-            try:
-                stats = process_repo(
-                    repo_path,
-                    f,
-                    args.max_commits,
-                    repo_name,
-                    args.memory_limit_gb,
-                    notes=args.notes,
-                )
-                total_records += stats["records_written"]
-                print(f"  [{repo_name}] {stats['records_written']:,} records")
-            except Exception as e:
-                print(f"  [{repo_name}] ERROR: {e}")
+                try:
+                    stats = process_repo(
+                        repo_path,
+                        f,
+                        args.max_commits,
+                        repo_name,
+                        args.memory_limit_gb,
+                        notes=args.notes,
+                    )
+                    total_records += stats["records_written"]
+                    print(f"  [{repo_name}] {stats['records_written']:,} records")
+                except Exception as e:
+                    print(f"  [{repo_name}] ERROR: {e}")
+    finally:
+        output_lock.close()
 
     elapsed = time.time() - start_time
     output_size = os.path.getsize(args.output)

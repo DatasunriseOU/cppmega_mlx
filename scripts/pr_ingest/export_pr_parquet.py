@@ -38,7 +38,6 @@ from scripts.pr_ingest.render_discussion import render_discussion  # noqa: E402
 
 DEFAULT_STORE = REPO_ROOT / "outputs" / "pr_ingest" / "prs.sqlite"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "reindexed_pr"
-DEFAULT_MANIFEST = DEFAULT_OUTPUT_ROOT / "_done.json"
 ZSTD_LEVELS = (1024, 2048, 4096, 8192, 16384)
 
 
@@ -232,7 +231,7 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
     store = Path(args.store)
     if not store.exists():
         raise FileNotFoundError(f"--store does not exist: {store}")
-    manifest_path = Path(args.manifest)
+    manifest_path = Path(args.manifest) if args.manifest else Path(args.output_root) / "_done.json"
     manifest = _load_manifest(manifest_path)
     resume = not args.no_resume
     batch_size = int(args.batch_size)
@@ -324,8 +323,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Rows per shard when --all is set.")
     p.add_argument("--max-shards", type=int, default=None,
                    help="Optional cap on number of shards exported in this run.")
-    p.add_argument("--manifest", default=str(DEFAULT_MANIFEST),
-                   help="Resume manifest for --all batched export.")
+    p.add_argument("--manifest", default=None,
+                   help="Resume manifest for --all batched export. Default: "
+                        "<output-root>/_done.json.")
     p.add_argument("--no-resume", action="store_true",
                    help="Ignore completed PR export shards in --manifest.")
     p.add_argument("--memory-limit-gb", type=float, default=10.0)

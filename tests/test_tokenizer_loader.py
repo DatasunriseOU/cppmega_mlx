@@ -7,7 +7,10 @@ from typing import cast
 import pytest
 
 from cppmega_mlx.tokenizer import TokenizerContractError, load_cppmega_tokenizer
-from cppmega_mlx.tokenizer.cpp_tokenizer import EXPECTED_SPECIAL_TOKENS
+from cppmega_mlx.tokenizer.cpp_tokenizer import (
+    EXPECTED_SPECIAL_TOKENS,
+    normalize_whitespace_with_offsets,
+)
 
 NANOCHAT_ROOT = Path("/Volumes/external/sources/nanochat")
 
@@ -84,6 +87,34 @@ def test_load_cppmega_tokenizer_accepts_exact_m01_contract(tmp_path: Path) -> No
     with_specials = tokenizer.encode("hello", prepend="<BOS>", append="<EOS>")
     assert with_specials[0] == 2
     assert with_specials[-1] == 3
+
+
+def test_whitespace_normalizer_keeps_docstring_pre_boundary_after_apostrophe() -> None:
+    text = (
+        "/*\n"
+        " * @discussion\n"
+        " * This can't be compiled with aarch32; see https://github.com/a/b. *\n"
+        " */\n"
+        "// === PRE-COMMIT ===\n"
+        "bool f();\n"
+    )
+
+    normalized, offsets = normalize_whitespace_with_offsets(text)
+
+    assert len(offsets) == len(normalized)
+    assert "can't" in normalized
+    assert "https://github.com/a/b" in normalized
+    assert ".<SPACE>*<NL><SPACE>*/<NL>//<SPACE>===<SPACE>PRE-COMMIT" in normalized
+
+
+def test_whitespace_normalizer_still_preserves_string_literal_whitespace() -> None:
+    text = 'const char* s = "a  b\\n c";\nint x;\n'
+
+    normalized, offsets = normalize_whitespace_with_offsets(text)
+
+    assert len(offsets) == len(normalized)
+    assert '"a  b\\n c"' in normalized
+    assert '=<SPACE>"a  b\\n c";<NL>int<SPACE>x;' in normalized
 
 
 def test_load_cppmega_tokenizer_accepts_directory_path(tmp_path: Path) -> None:

@@ -40,7 +40,9 @@ EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
 # and tabs *inside* a literal carry meaning (e.g. ``"a    b"``) and must NOT be
 # collapsed to ``<SPACE>``; doing so would change the program semantics and the
 # re-encoded ids. The scanner below tracks literal state and only collapses
-# whitespace runs that live OUTSIDE any literal.
+# whitespace runs that live OUTSIDE any literal. It also tracks comments so
+# natural-language apostrophes in docstrings (``can't``) are not mistaken for C++
+# char literals; whitespace inside comments is still normalized.
 _WS_RUN_RE = re.compile(r"[ \t]+")
 _NL_RUN_RE = re.compile(r"[\r\n]+")
 _NL_SENTINEL = "<NL>"
@@ -60,18 +62,37 @@ def normalize_whitespace_with_offsets(text: str) -> tuple[str, list[tuple[int, i
     sidecar channels with no off-by-N shift.
 
     Whitespace INSIDE string/char/raw-string literals is preserved verbatim
-    (identity offsets); only whitespace outside any literal is collapsed.
+    (identity offsets); only whitespace outside any literal is collapsed.  C++
+    comments are not literals: quotes/apostrophes inside comments are copied as
+    plain text, while comment whitespace is still collapsed to sentinels.
     """
     chars: list[str] = []
     spans: list[tuple[int, int]] = []
     n = len(text)
     i = 0
-    # Literal state: None=code, '"'=string, "'"=char, "raw"=raw-string.
+    # State: None=code, '"'=string, "'"=char, "raw"=raw-string,
+    # "line_comment"=// comment, "block_comment"=/* */ comment.
     state: str | None = None
     raw_delim = ""  # closing delimiter for the active raw string: )<d>"
     while i < n:
         ch = text[i]
         if state is None:
+            if ch == "/" and i + 1 < n and text[i + 1] == "/":
+                chars.append("/")
+                spans.append((i, i + 1))
+                chars.append("/")
+                spans.append((i + 1, i + 2))
+                state = "line_comment"
+                i += 2
+                continue
+            if ch == "/" and i + 1 < n and text[i + 1] == "*":
+                chars.append("/")
+                spans.append((i, i + 1))
+                chars.append("*")
+                spans.append((i + 1, i + 2))
+                state = "block_comment"
+                i += 2
+                continue
             # Detect raw-string prefix: R"<delim>( ... )<delim>"
             if ch in ("R", "u", "U", "L") and _raw_string_opener_at(text, i):
                 r_pos = text.index('R', i)
@@ -91,6 +112,51 @@ def normalize_whitespace_with_offsets(text: str) -> tuple[str, list[tuple[int, i
                 spans.append((i, i + 1))
                 state = ch
                 i += 1
+                continue
+            if ch in "\r\n":
+                j = i + 1
+                while j < n and text[j] in "\r\n":
+                    j += 1
+                _append_sentinel(chars, spans, _NL_SENTINEL, i, j)
+                i = j
+                continue
+            if ch in " \t":
+                j = i + 1
+                while j < n and text[j] in " \t":
+                    j += 1
+                _append_sentinel(chars, spans, _SPACE_SENTINEL, i, j)
+                i = j
+                continue
+            chars.append(ch)
+            spans.append((i, i + 1))
+            i += 1
+        elif state == "line_comment":
+            if ch in "\r\n":
+                j = i + 1
+                while j < n and text[j] in "\r\n":
+                    j += 1
+                _append_sentinel(chars, spans, _NL_SENTINEL, i, j)
+                state = None
+                i = j
+                continue
+            if ch in " \t":
+                j = i + 1
+                while j < n and text[j] in " \t":
+                    j += 1
+                _append_sentinel(chars, spans, _SPACE_SENTINEL, i, j)
+                i = j
+                continue
+            chars.append(ch)
+            spans.append((i, i + 1))
+            i += 1
+        elif state == "block_comment":
+            if text.startswith("*/", i):
+                chars.append("*")
+                spans.append((i, i + 1))
+                chars.append("/")
+                spans.append((i + 1, i + 2))
+                state = None
+                i += 2
                 continue
             if ch in "\r\n":
                 j = i + 1

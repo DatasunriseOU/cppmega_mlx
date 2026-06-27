@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Audit and repair packed parquet rows with collapsed generated section markers.
+
+Older tokenizer whitespace normalization could treat apostrophes inside PR
+docstrings (for example ``can't``) as C++ char literals.  Once that happened,
+newlines later in the document were not emitted as ``<NL>`` sentinel tokens, so
+packed commit rows could contain sequences such as::
+
+    */// === PRE-COMMIT ===bool ...
+
+instead of::
+
+    */
+    // === PRE-COMMIT ===
+    bool ...
+
+This fixer is intentionally narrow.  It only inserts ``<NL>`` around generated
+cppmega commit section markers (PRE-COMMIT, POST-COMMIT, CONTEXT, DIFF), and
+only when the row has enough padding slack.  Token-aligned sidecar columns are
+shifted with the inserted token; chunk/span token offsets are adjusted.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+from typing import Any, Iterable
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.render_sidecar_example import get_tokenizer
+
+
+PAD_ID = 0
+BOS_ID = 2
+NL_ID = 47
+EOS_ID = 3
+
+TOKEN_ALIGNED_COLUMNS = (
+    "doc_ids",
+    "platform_ids",
+    "token_platform_ids",
+    "token_structure_ids",
+    "token_dep_levels",
+    "token_ast_depth",
+    "token_sibling_index",
+    "token_ast_node_type",
+    "token_symbol_ids",
+    "token_call_targets",
+    "token_type_refs",
+    "token_def_use",
+    "token_change_mask_pre",
+    "token_change_mask_post",
+    "hunk_id_per_token",
+    "edit_op_per_token",
+)
+
+TOKEN_OFFSET_LIST_COLUMNS = (
+    "token_chunk_starts",
+    "token_chunk_ends",
+)
+
+TOKEN_SPAN_COLUMNS = (
+    "changed_chunk_spans",
+)
+
+MARKER_NAMES = ("PRE-COMMIT", "POST-COMMIT", "CONTEXT", "DIFF")
+
+
+class TokenPieces:
+    def __init__(self, tokenizer: Any) -> None:
+        self._cache: dict[int, str] = {
+            token_id: tokenizer.token_for_id(token_id) or ""
+            for token_id in range(int(tokenizer.vocab_size))
+        }
+
+    def piece(self, token_id: int) -> str:
+        token_id = int(token_id)
+        return self._cache.get(token_id, "")
+
+    def decode(self, ids: list[int]) -> str:
+        text = "".join(self.piece(int(token_id)) for token_id in ids)
+        return text.replace("<SPACE>", " ").replace("<NL>", "\n")
+
+
+def _is_space(piece: str) -> bool:
+    return piece in {" ", "<SPACE>"}
+
+
+def _skip_spaces(pieces: TokenPieces, ids: list[int], idx: int, end: int) -> int:
+    while idx < end and _is_space(pieces.piece(ids[idx])):
+        idx += 1
+    return idx
+
+
+def _generated_marker_end(
+    pieces: TokenPieces,
+    ids: list[int],
+    start: int,
+    valid: int,
+) -> int | None:
+    """Return inclusive end token index for a generated ``// === ... ===`` marker."""
+    if start >= valid or pieces.piece(ids[start]) != "//":
+        return None
+    idx = _skip_spaces(pieces, ids, start + 1, valid)
+    if idx + 1 >= valid or pieces.piece(ids[idx]) != "==" or pieces.piece(ids[idx + 1]) != "=":
+        return None
+    idx = _skip_spaces(pieces, ids, idx + 2, valid)
+
+    scan_limit = min(valid - 1, idx + 160)
+    close: int | None = None
+    while idx <= scan_limit:
+        maybe = _skip_spaces(pieces, ids, idx, valid)
+        if maybe + 1 < valid and pieces.piece(ids[maybe]) == "==" and pieces.piece(ids[maybe + 1]) == "=":
+            close = maybe + 1
+            break
+        idx += 1
+    if close is None:
+        return None
+
+    marker_text = pieces.decode(ids[start : close + 1])
+    if not any(name in marker_text for name in MARKER_NAMES):
+        return None
+    return close
+
+
+def _needed_insert_positions(row: dict[str, Any], pieces: TokenPieces) -> list[int]:
+    ids = [int(x) for x in row["input_ids"]]
+    valid = int(row.get("valid_token_count") or _infer_valid_count(ids))
+    positions: set[int] = set()
+    idx = 0
+    while idx < valid:
+        end = _generated_marker_end(pieces, ids, idx, valid)
+        if end is None:
+            idx += 1
+            continue
+
+        if idx > 0 and ids[idx - 1] != NL_ID:
+            positions.add(idx)
+        after = end + 1
+        if after < valid and ids[after] not in (PAD_ID, BOS_ID, EOS_ID, NL_ID):
+            positions.add(after)
+        idx = max(end + 1, idx + 1)
+    return sorted(positions)
+
+
+def _infer_valid_count(ids: list[int]) -> int:
+    for idx, token_id in enumerate(ids):
+        if int(token_id) == PAD_ID:
+            return idx
+    return len(ids)
+
+
+def _insert_with_source(values: list[Any], positions: list[int], capacity: int) -> list[Any]:
+    if not positions:
+        return values
+    valid = _infer_valid_count([0 if x is None else 1 for x in values])
+    if len(values) == capacity:
+        # Use the row's full fixed-length array, but only inject into the non-pad
+        # prefix.  Tail padding values are preserved after the repaired prefix.
+        valid = capacity
+    position_set = set(positions)
+    out: list[Any] = []
+    for idx, value in enumerate(values):
+        if idx in position_set:
+            source_idx = idx - 1 if idx > 0 else idx
+            out.append(values[source_idx])
+        out.append(value)
+    if len(values) in position_set:
+        out.append(values[-1] if values else 0)
+    return out[:capacity]
+
+
+def _insert_token_aligned(values: list[Any], positions: list[int], valid: int, capacity: int) -> list[Any]:
+    if not positions:
+        return values
+    position_set = set(positions)
+    out: list[Any] = []
+    prefix = values[:valid]
+    tail = values[valid:]
+    for idx, value in enumerate(prefix):
+        if idx in position_set:
+            source_idx = idx - 1 if idx > 0 else idx
+            out.append(prefix[source_idx])
+        out.append(value)
+    if valid in position_set:
+        out.append(prefix[-1] if prefix else 0)
+    out.extend(tail)
+    return out[:capacity]
+
+
+def _insert_newline_tokens(ids: list[int], positions: list[int], valid: int, capacity: int) -> list[int]:
+    if not positions:
+        return ids
+    position_set = set(positions)
+    out: list[int] = []
+    prefix = ids[:valid]
+    tail = ids[valid:]
+    for idx, token_id in enumerate(prefix):
+        if idx in position_set:
+            out.append(NL_ID)
+        out.append(int(token_id))
+    if valid in position_set:
+        out.append(NL_ID)
+    out.extend(int(x) for x in tail)
+    return out[:capacity]
+
+
+def _shift_offset(value: int, positions: list[int]) -> int:
+    out = int(value)
+    for pos in positions:
+        if out >= pos:
+            out += 1
+    return out
+
+
+def _shift_span(span: Any, positions: list[int]) -> Any:
+    if not isinstance(span, dict):
+        return span
+    out = dict(span)
+    if "start" in out:
+        out["start"] = _shift_offset(int(out["start"]), positions)
+    if "end" in out:
+        out["end"] = _shift_offset(int(out["end"]), positions)
+    return out
+
+
+def _update_source_doc_lengths(row: dict[str, Any], positions: list[int], valid: int) -> None:
+    lengths = row.get("source_doc_token_lengths")
+    doc_ids = row.get("doc_ids")
+    source_doc_ids = row.get("source_doc_ids")
+    if not isinstance(lengths, list) or not isinstance(doc_ids, list):
+        return
+    if not lengths:
+        return
+    if len(lengths) == 1:
+        row["source_doc_token_lengths"] = [int(lengths[0]) + len(positions)]
+        return
+    if not isinstance(source_doc_ids, list):
+        return
+    increments = {int(doc_id): 0 for doc_id in source_doc_ids}
+    for pos in positions:
+        source_idx = pos - 1 if pos > 0 else pos
+        if 0 <= source_idx < min(valid, len(doc_ids)):
+            doc_id = int(doc_ids[source_idx])
+            if doc_id in increments:
+                increments[doc_id] += 1
+    row["source_doc_token_lengths"] = [
+        int(length) + increments.get(int(doc_id), 0)
+        for length, doc_id in zip(lengths, source_doc_ids)
+    ]
+
+
+def repair_row(row: dict[str, Any], pieces: TokenPieces) -> tuple[dict[str, Any], dict[str, Any]]:
+    positions = _needed_insert_positions(row, pieces)
+    if not positions:
+        return row, {"changed": False, "insertions": 0, "overflow": False}
+
+    ids = [int(x) for x in row["input_ids"]]
+    capacity = len(ids)
+    old_valid = int(row.get("valid_token_count") or _infer_valid_count(ids))
+    new_valid = old_valid + len(positions)
+    if new_valid > capacity:
+        return row, {
+            "changed": False,
+            "insertions": len(positions),
+            "overflow": True,
+        }
+
+    repaired = dict(row)
+    repaired_ids = _insert_newline_tokens(ids, positions, old_valid, capacity)
+    repaired_ids = repaired_ids[:new_valid] + [PAD_ID] * (capacity - new_valid)
+    repaired["input_ids"] = repaired_ids
+    repaired["target_ids"] = repaired_ids[1:] + [PAD_ID]
+    repaired["loss_mask"] = [1] * max(new_valid - 1, 0) + [0] * (capacity - max(new_valid - 1, 0))
+    repaired["valid_token_count"] = new_valid
+    repaired["trained_token_count"] = max(new_valid - 1, 0)
+    repaired["slack_tokens"] = capacity - new_valid
+
+    for col in TOKEN_ALIGNED_COLUMNS:
+        values = repaired.get(col)
+        if isinstance(values, list) and len(values) == capacity:
+            repaired[col] = _insert_token_aligned(values, positions, old_valid, capacity)
+
+    for col in TOKEN_OFFSET_LIST_COLUMNS:
+        values = repaired.get(col)
+        if isinstance(values, list):
+            repaired[col] = [_shift_offset(int(value), positions) for value in values]
+
+    for col in TOKEN_SPAN_COLUMNS:
+        values = repaired.get(col)
+        if isinstance(values, list):
+            repaired[col] = [_shift_span(span, positions) for span in values]
+
+    _update_source_doc_lengths(repaired, positions, old_valid)
+    return repaired, {
+        "changed": True,
+        "insertions": len(positions),
+        "overflow": False,
+    }
+
+
+def _repair_file(
+    path: Path,
+    pieces: TokenPieces,
+    *,
+    dry_run: bool,
+    backup_suffix: str,
+    drop_unrepairable: bool,
+    compression_level: int,
+) -> dict[str, Any]:
+    scan = _scan_file(path, pieces)
+    if dry_run or (not scan["changed_rows"] and not scan["overflow_rows"]):
+        scan["path"] = str(path)
+        scan.setdefault("dropped_rows", 0)
+        return scan
+
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    changed_rows = 0
+    insertions = 0
+    overflow_rows = 0
+    dropped_rows = 0
+    repaired_rows: list[dict[str, Any]] = []
+    for row in rows:
+        repaired, info = repair_row(row, pieces)
+        changed_rows += int(info["changed"])
+        insertions += int(info["insertions"] if info["changed"] else 0)
+        if info["overflow"]:
+            if drop_unrepairable:
+                dropped_rows += 1
+                continue
+            overflow_rows += 1
+        repaired_rows.append(repaired)
+
+    if (changed_rows or dropped_rows) and not dry_run:
+        if backup_suffix:
+            backup = path.with_name(path.name + backup_suffix)
+            if not backup.exists():
+                shutil.copy2(path, backup)
+        repaired_table = pa.Table.from_pylist(repaired_rows, schema=table.schema)
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=path.name,
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            pq.write_table(
+                repaired_table,
+                tmp_path,
+                compression="zstd",
+                compression_level=compression_level,
+            )
+            tmp_path.replace(path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    return {
+        "path": str(path),
+        "rows": len(rows),
+        "changed_rows": changed_rows,
+        "insertions": insertions,
+        "overflow_rows": overflow_rows,
+        "dropped_rows": dropped_rows,
+    }
+
+
+def _scan_file(path: Path, pieces: TokenPieces) -> dict[str, Any]:
+    table = pq.read_table(path, columns=["input_ids", "valid_token_count"])
+    changed_rows = 0
+    insertions = 0
+    overflow_rows = 0
+    rows = table.to_pylist()
+    for row in rows:
+        positions = _needed_insert_positions(row, pieces)
+        if not positions:
+            continue
+        ids = [int(x) for x in row["input_ids"]]
+        valid = int(row.get("valid_token_count") or _infer_valid_count(ids))
+        if valid + len(positions) > len(ids):
+            overflow_rows += 1
+        else:
+            changed_rows += 1
+            insertions += len(positions)
+    return {
+        "path": str(path),
+        "rows": len(rows),
+        "changed_rows": changed_rows,
+        "insertions": insertions,
+        "overflow_rows": overflow_rows,
+        "dropped_rows": 0,
+    }
+
+
+def _iter_parquet_files(roots: Iterable[Path]) -> list[Path]:
+    files: list[Path] = []
+    for root in roots:
+        if root.is_file() and root.suffix == ".parquet":
+            files.append(root)
+        elif root.is_dir():
+            files.extend(sorted(root.rglob("*.parquet")))
+    return sorted(set(files))
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "roots",
+        nargs="*",
+        type=Path,
+        default=[Path("outputs/reindexed_commits")],
+        help="Parquet file or directory roots to audit/repair.",
+    )
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--report", type=Path, default=Path("outputs/parquet_boundary_fix_report.json"))
+    ap.add_argument("--backup-suffix", default=".pre_boundary_fix")
+    ap.add_argument("--fail-on-remaining", action="store_true")
+    ap.add_argument(
+        "--drop-unrepairable",
+        action="store_true",
+        help="Drop rows that need marker-boundary repair but have no padding slack.",
+    )
+    ap.add_argument("--workers", type=int, default=max(1, min(16, (os.cpu_count() or 4) // 2)))
+    ap.add_argument("--compression-level", type=int, default=6)
+    args = ap.parse_args(argv)
+
+    tokenizer = get_tokenizer()
+    pieces = TokenPieces(tokenizer)
+    files = _iter_parquet_files(args.roots)
+    if not files:
+        raise SystemExit("no parquet files matched roots: " + ", ".join(str(x) for x in args.roots))
+
+    reports: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [
+            pool.submit(
+                _repair_file,
+                path,
+                pieces,
+                dry_run=args.dry_run,
+                backup_suffix=args.backup_suffix,
+                drop_unrepairable=args.drop_unrepairable,
+                compression_level=args.compression_level,
+            )
+            for path in files
+        ]
+        for idx, future in enumerate(as_completed(futures), 1):
+            reports.append(future.result())
+            if idx % 100 == 0:
+                print(f"processed {idx}/{len(files)} parquet files", flush=True)
+
+    total = {
+        "files": len(files),
+        "rows": sum(int(x["rows"]) for x in reports),
+        "changed_files": sum(1 for x in reports if int(x["changed_rows"]) > 0),
+        "changed_rows": sum(int(x["changed_rows"]) for x in reports),
+        "insertions": sum(int(x["insertions"]) for x in reports),
+        "overflow_rows": sum(int(x["overflow_rows"]) for x in reports),
+        "dropped_rows": sum(int(x.get("dropped_rows", 0)) for x in reports),
+        "dry_run": bool(args.dry_run),
+        "drop_unrepairable": bool(args.drop_unrepairable),
+    }
+    payload = {
+        "total": total,
+        "changed": [x for x in reports if int(x["changed_rows"]) or int(x["overflow_rows"])],
+    }
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(total, indent=2), flush=True)
+    remaining_changed = total["changed_rows"] if args.dry_run else 0
+    remaining_overflow = total["overflow_rows"]
+    if args.fail_on_remaining and (remaining_changed or remaining_overflow):
+        raise SystemExit(
+            "unrepaired marker-boundary rows: "
+            f"changed_rows={remaining_changed} overflow_rows={remaining_overflow}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

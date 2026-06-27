@@ -26,8 +26,8 @@ Design (RULE #1: fail-loud, no silent fallback; checkpoints EXACT):
                -> ROUTE-BY-FIT: split tokenized docs by token count into the
                   smallest length bucket that fits the whole commit doc
                   (commits are ATOMIC blocks; never split a doc), ladder
-                  1024/2048/4096/8192/16384; N>16384 -> own over-long row in
-                  the 16384 bucket.
+                  1024/2048/4096/8192/16384; N>16384 is explicitly dropped
+                  from fixed-shape output and reported as over-long.
                -> pack_enriched_rows.py per non-empty bucket at ITS length
                -> recompress packed parquet with MAX zstd (level 22)
                -> outputs/reindexed_commits/{L}/<repo>_r<start>.parquet
@@ -107,6 +107,26 @@ def _is_excluded_commit(within: str) -> bool:
     return any(part in COMMIT_EXCLUDE_PARTS for part in within.split("/"))
 
 
+def _has_git_metadata(repo_dir: Path) -> bool:
+    """True when the staged repo can be used by git before commit extraction."""
+    return (repo_dir / ".git").exists()
+
+
+def _finalize_git_repo_subtree(repo: str, repo_dir: Path | None):
+    """Return a staged git repo, or skip and delete source-only snapshots.
+
+    The commit stream is allowed to see source-only entries in cpp_all, but it
+    must filter them before repo workers call git log / extract_git_history.
+    """
+    if repo_dir is None:
+        return None
+    if _has_git_metadata(repo_dir):
+        return repo, repo_dir
+    _log(f"SKIP (no-git) {repo}: no .git metadata in staged repo")
+    shutil.rmtree(repo_dir.parent, ignore_errors=True)
+    return None
+
+
 def range_key(repo: str, start_idx: int) -> str:
     """Exact checkpoint key for one (repo, range_start_idx)."""
     return f"{repo}::r{start_idx}"
@@ -150,7 +170,9 @@ def stream_repo_subtrees_with_git(work_root: Path, should_process):
             within = rest[slash + 1:]
             if repo != cur_repo:
                 if cur_repo is not None and active:
-                    yield cur_repo, cur_dir
+                    finalized_repo = _finalize_git_repo_subtree(cur_repo, cur_dir)
+                    if finalized_repo is not None:
+                        yield finalized_repo
                     finalized.add(cur_repo)
                 if repo in finalized:
                     raise RepoFailure(
@@ -195,7 +217,9 @@ def stream_repo_subtrees_with_git(work_root: Path, should_process):
             with open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
         if cur_repo is not None and active:
-            yield cur_repo, cur_dir
+            finalized_repo = _finalize_git_repo_subtree(cur_repo, cur_dir)
+            if finalized_repo is not None:
+                yield finalized_repo
             finalized.add(cur_repo)
     finally:
         try:
@@ -278,21 +302,28 @@ def slice_records_jsonl(records_jsonl: Path, start: int, end: int, dest: Path) -
 TOKEN_IDS_COLUMN = "token_ids"
 
 
-def bucket_for(token_count: int, lengths_sorted: Sequence[int]) -> int:
-    """Smallest length L >= token_count; N>max -> the max length (own over-long row)."""
+def bucket_for(token_count: int, lengths_sorted: Sequence[int]) -> int | None:
+    """Smallest length L >= token_count; N>max -> None.
+
+    Packed parquet roots are fixed-shape train inputs.  Older runs placed an
+    over-long document into the largest bucket as an unsplit row, which produced
+    invalid rows such as ``len(input_ids)=56k`` inside ``16384/``.  Those rows
+    are not trainable as a fixed-size 16k batch, so the producer must not emit
+    them into any fixed bucket.
+    """
     for L in lengths_sorted:
         if token_count <= L:
             return L
-    return lengths_sorted[-1]
+    return None
 
 
 def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path) -> dict[int, Path]:
     """Split tok parquet rows into per-length parquet files by whole-doc token count.
 
     Each commit doc (one row) is routed INTACT to the smallest length bucket that
-    fits its full ``token_ids`` length; docs longer than the largest length get
-    their own over-long row in the largest bucket. Returns {length: parquet_path}
-    for non-empty buckets only.
+    fits its full ``token_ids`` length. Docs longer than the largest length are
+    excluded from fixed-shape output and reported in ``dropped_overlong.json``.
+    Returns {length: parquet_path} for non-empty buckets only.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -305,6 +336,9 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     writers: dict[int, pq.ParquetWriter] = {}
     paths: dict[int, Path] = {}
     out_dir.mkdir(parents=True, exist_ok=True)
+    dropped_overlong = 0
+    dropped_overlong_tokens = 0
+    max_length = int(lengths_sorted[-1])
     try:
         for batch in pf.iter_batches(batch_size=512):
             tbl = pa.Table.from_batches([batch], schema=schema)
@@ -314,6 +348,10 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
             for ri, ids in enumerate(tok_col):
                 n = len(ids) if ids is not None else 0
                 L = bucket_for(n, lengths_sorted)
+                if L is None:
+                    dropped_overlong += 1
+                    dropped_overlong_tokens += n
+                    continue
                 by_len.setdefault(L, []).append(ri)
             for L, idxs in by_len.items():
                 sub = tbl.take(pa.array(idxs))
@@ -325,6 +363,21 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     finally:
         for w in writers.values():
             w.close()
+    if dropped_overlong:
+        report = {
+            "source": str(tok_parquet),
+            "max_length": max_length,
+            "dropped_overlong_rows": dropped_overlong,
+            "dropped_overlong_tokens": dropped_overlong_tokens,
+        }
+        (out_dir / "dropped_overlong.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(
+            "DROP overlong docs in route_by_fit: "
+            f"rows={dropped_overlong} tokens={dropped_overlong_tokens} "
+            f"max_length={max_length} source={tok_parquet}",
+            file=sys.stderr,
+            flush=True,
+        )
     return paths
 
 
@@ -572,7 +625,9 @@ def main(argv: list[str]) -> int:
         sys.path.insert(0, str(MLX_ROOT / "tools" / "clang_indexer"))
         from dedup_store import DedupStore  # noqa: E402
         dedup_db.parent.mkdir(parents=True, exist_ok=True)
-        DedupStore(str(dedup_db), near=dedup_near, commit_every=1000).close()
+        # Path/schema validation only; avoid rebuilding persisted MinHash/LSH in
+        # the driver parent before any repo work starts.
+        DedupStore(str(dedup_db), near=False, commit_every=1000).close()
         _log(f"Dedup: SHARED global commit-doc store at {dedup_db} "
              f"(exact{'+near' if dedup_near else ''}, tokenized hash)")
 

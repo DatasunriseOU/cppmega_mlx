@@ -135,13 +135,17 @@ class DedupStore:
     SQLITE_BUSY_TIMEOUT_MS = int(SQLITE_TIMEOUT_SECONDS * 1000)
     WRITE_RETRY_SLEEP_SECONDS = 0.05
     WRITE_RETRY_MAX_SLEEP_SECONDS = 2.0
-    # Keep cross-process writer transactions short. WAL lets readers run while a
-    # writer is active, but SQLite still has exactly one writer; holding an
-    # implicit transaction across many dedup rows makes parallel indexers sleep
-    # in sqliteDefaultBusyCallback. Default to one document per transaction and
-    # allow explicit tuning for controlled single-process runs.
+    # Keep cross-process writer transactions reasonably short without forcing a
+    # commit for every exact/near dedup insert. Chunk claims still commit
+    # immediately because they are the strict cross-process coordination ledger.
     MAX_PENDING_BEFORE_COMMIT = int(
-        os.environ.get("CPPMEGA_DEDUP_MAX_PENDING_BEFORE_COMMIT", "1")
+        os.environ.get("CPPMEGA_DEDUP_MAX_PENDING_BEFORE_COMMIT", "1000")
+    )
+    WAL_AUTOCHECKPOINT_PAGES = int(
+        os.environ.get("CPPMEGA_DEDUP_WAL_AUTOCHECKPOINT_PAGES", "10000")
+    )
+    JOURNAL_SIZE_LIMIT_BYTES = int(
+        os.environ.get("CPPMEGA_DEDUP_JOURNAL_SIZE_LIMIT_BYTES", str(1024**3))
     )
 
     def __init__(self, db_path: str, *, near: bool = True, commit_every: int = 1000):
@@ -167,6 +171,8 @@ class DedupStore:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute(f"PRAGMA busy_timeout={self.SQLITE_BUSY_TIMEOUT_MS}")
+        self.conn.execute(f"PRAGMA wal_autocheckpoint={self.WAL_AUTOCHECKPOINT_PAGES}")
+        self.conn.execute(f"PRAGMA journal_size_limit={self.JOURNAL_SIZE_LIMIT_BYTES}")
         self._init_schema()
 
         # Lazy datasketch objects; built only when near dedup is enabled.

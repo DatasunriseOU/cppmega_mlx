@@ -64,3 +64,29 @@ def test_precomputed_cpp_files_feed_commit_diffs(tmp_path):
     assert diffs[0]["filepath"] == "main.cpp"
     assert "return 1" in diffs[0]["old_content"]
     assert "return 2" in diffs[0]["new_content"]
+
+
+def test_output_file_lock_rejects_second_process(tmp_path):
+    import extract_git_history as egh
+
+    output = tmp_path / "repo_commits.jsonl"
+    lock = egh.OutputFileLock(output)
+    lock.acquire()
+    try:
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(NANOCHAT)!r})\n"
+            "import extract_git_history as egh\n"
+            f"lock = egh.OutputFileLock({str(output)!r})\n"
+            "lock.acquire()\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert "already held" in proc.stderr
+    finally:
+        lock.close()

@@ -46,6 +46,79 @@ SIDE_CHANNELS = {
 }
 ALL_SIDE = [c for v in SIDE_CHANNELS.values() for c in v]
 
+def extract_git_history_process_health():
+    """Report real JSONL writer duplicates, ignoring transient git subprocess forks.
+
+    On macOS a subprocess fork can briefly inherit the parent's command line
+    before exec'ing git. A raw ps grouping by --output sees that as a duplicate
+    extract_git_history.py, but it is parented by the real extract process and
+    is not a JSONL writer. Treat only non-extract-parent processes as writers.
+    """
+    try:
+        out = subprocess.check_output(
+            ['ps', '-axo', 'pid,ppid,stat,etime,command'],
+            text=True,
+        )
+    except Exception as e:
+        return {'error': str(e)}
+
+    proc_re = re.compile(r'\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)')
+    output_re = re.compile(r'--output\s+(\S+)')
+    cmd_by_pid = {}
+    rows = []
+    for line in out.splitlines():
+        m = proc_re.match(line)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        ppid = int(m.group(2))
+        cmd = m.group(5)
+        cmd_by_pid[pid] = cmd
+        if 'extract_git_history.py' not in cmd:
+            continue
+        out_m = output_re.search(cmd)
+        rows.append({
+            'pid': pid,
+            'ppid': ppid,
+            'stat': m.group(3),
+            'etime': m.group(4),
+            'output': out_m.group(1) if out_m else '',
+            'line': line,
+        })
+
+    raw_by_output = collections.defaultdict(list)
+    writer_by_output = collections.defaultdict(list)
+    ignored_children = []
+    for row in rows:
+        raw_by_output[row['output']].append(row)
+        parent_cmd = cmd_by_pid.get(row['ppid'], '')
+        if 'extract_git_history.py' in parent_cmd:
+            ignored_children.append(row)
+        else:
+            writer_by_output[row['output']].append(row)
+
+    raw_dupes = {
+        output: [row['line'] for row in group]
+        for output, group in raw_by_output.items()
+        if len(group) > 1
+    }
+    writer_dupes = {
+        output: [row['line'] for row in group]
+        for output, group in writer_by_output.items()
+        if len(group) > 1
+    }
+    return {
+        'raw_extract_outputs': len(raw_by_output),
+        'raw_extract_procs': sum(len(group) for group in raw_by_output.values()),
+        'raw_dupe_outputs': len(raw_dupes),
+        'root_writer_outputs': len(writer_by_output),
+        'root_writer_procs': sum(len(group) for group in writer_by_output.values()),
+        'root_writer_dupe_outputs': len(writer_dupes),
+        'fork_before_exec_children_ignored': len(ignored_children),
+        'raw_dupe_examples': dict(list(raw_dupes.items())[:5]),
+        'root_writer_dupe_examples': dict(list(writer_dupes.items())[:5]),
+    }
+
 def strip_for_clang(text: str) -> str:
     """Strip leading language/platform header comments + special-token text; keep code."""
     text = SPECIAL_TEXT_RE.sub('', text)
@@ -497,6 +570,7 @@ report = {
     'total_samples': len(samples),
     'counts': dict(counts),
     'sampling_plan': sampling_plan,
+    'process_health': extract_git_history_process_health(),
     'skipped_race': skipped,
     'per_type': {t: agg(t) for t in ('CODE', 'COMMIT', 'BUILD-FILE')},
     'dedup': dedup_info,

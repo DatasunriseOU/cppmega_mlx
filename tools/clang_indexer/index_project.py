@@ -2971,7 +2971,10 @@ def main() -> int:
         # crashes before any heavy parsing (RULE #1). Closed immediately; each
         # process_project reopens against the same WAL db.
         from dedup_store import DedupStore
-        DedupStore(args.dedup_db, near=dedup_near, commit_every=1000).close()
+        # Path/schema validation only. Avoid rebuilding persisted MinHash/LSH in
+        # the parent before project workers start; process_project opens the real
+        # store with near=dedup_near when requested.
+        DedupStore(args.dedup_db, near=False, commit_every=1000).close()
         print(
             f"Dedup: GLOBAL function-level store at {args.dedup_db} "
             f"(exact{'+near' if dedup_near else ''}, tokenized hash)",

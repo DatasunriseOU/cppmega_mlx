@@ -49,9 +49,11 @@ repos AND across the two streams.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -95,6 +97,9 @@ DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 DEFAULT_TARGET_LENGTHS_CODE = (1024, 2048, 4096)
 DEFAULT_TARGET_LENGTHS_COMMITS = (1024, 2048, 4096, 8192, 16384)
 DEFAULT_PROGRESS_JSONL = CONVEYOR_ROOT / "progress.jsonl"
+DEFAULT_DEDUP_CHECKPOINT_TOKENS = 25_000_000
+DEFAULT_RUN_LOCK_DIR = CONVEYOR_ROOT / "locks"
+DEFAULT_WORK_PARENT = CONVEYOR_ROOT / "tmp"
 
 _PRINT_LOCK = threading.Lock()
 
@@ -131,6 +136,141 @@ class ProgressWriter:
                 fh.write("\n")
 
 
+class RunLock:
+    """Fail-loud per-stream process lock.
+
+    The conveyor writes per-stream outputs and uses stream-local temp filenames.
+    Two live conveyors for the same stream can therefore race on repo outputs.
+    This lock prevents that class of bug before any repo is extracted.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fh = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._fh.seek(0)
+            holder = self._fh.read().strip()
+            self._fh.close()
+            self._fh = None
+            raise RuntimeError(
+                f"conveyor stream lock is already held: {self.path}\n"
+                f"holder:\n{holder}"
+            ) from exc
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "ppid": os.getppid(),
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "argv": sys.argv,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        self._fh.write("\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+
+class DedupCheckpointController:
+    """Token-milestone SQLite WAL checkpoints for the shared dedup store."""
+
+    def __init__(
+        self,
+        *,
+        dedup_db: Path | None,
+        interval_tokens: int,
+        mode: str,
+        busy_timeout_ms: int,
+        progress: ProgressWriter,
+    ):
+        self.dedup_db = dedup_db
+        self.interval_tokens = int(interval_tokens)
+        self.mode = mode.upper()
+        self.busy_timeout_ms = int(busy_timeout_ms)
+        self.progress = progress
+        self.lock = threading.Lock()
+        self.next_threshold = (
+            self.interval_tokens if self.dedup_db and self.interval_tokens > 0 else None
+        )
+
+    @staticmethod
+    def _wal_path(db_path: Path) -> Path:
+        return Path(str(db_path) + "-wal")
+
+    def maybe_checkpoint(self, cumulative_valid_tokens: int) -> None:
+        if self.next_threshold is None:
+            return
+        with self.lock:
+            if self.next_threshold is None or cumulative_valid_tokens < self.next_threshold:
+                return
+            threshold = self.next_threshold
+            while self.next_threshold <= cumulative_valid_tokens:
+                self.next_threshold += self.interval_tokens
+        self._checkpoint(threshold, cumulative_valid_tokens)
+
+    def _checkpoint(self, threshold: int, cumulative_valid_tokens: int) -> None:
+        assert self.dedup_db is not None
+        wal = self._wal_path(self.dedup_db)
+        wal_before = wal.stat().st_size if wal.exists() else 0
+        started = time.time()
+        try:
+            conn = sqlite3.connect(
+                str(self.dedup_db),
+                timeout=max(self.busy_timeout_ms / 1000.0, 0.001),
+            )
+            try:
+                conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+                row = conn.execute(f"PRAGMA wal_checkpoint({self.mode})").fetchone()
+            finally:
+                conn.close()
+            wal_after = wal.stat().st_size if wal.exists() else 0
+            busy, log_pages, checkpointed_pages = [int(x) for x in row]
+            self.progress.emit(
+                "dedup_checkpoint",
+                dedup_db=str(self.dedup_db),
+                mode=self.mode,
+                threshold_tokens=threshold,
+                cumulative_valid_tokens=cumulative_valid_tokens,
+                busy=busy,
+                log_pages=log_pages,
+                checkpointed_pages=checkpointed_pages,
+                wal_bytes_before=wal_before,
+                wal_bytes_after=wal_after,
+                checkpoint_elapsed_s=round(time.time() - started, 3),
+            )
+        except Exception as exc:  # noqa: BLE001 - checkpoint failure is telemetry, not data loss
+            wal_after = wal.stat().st_size if wal.exists() else 0
+            self.progress.emit(
+                "dedup_checkpoint_failed",
+                dedup_db=str(self.dedup_db),
+                mode=self.mode,
+                threshold_tokens=threshold,
+                cumulative_valid_tokens=cumulative_valid_tokens,
+                wal_bytes_before=wal_before,
+                wal_bytes_after=wal_after,
+                detail=str(exc)[:2000],
+                checkpoint_elapsed_s=round(time.time() - started, 3),
+            )
+
+
 def _length_totals(info: dict) -> dict[str, int]:
     totals = {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0}
     for st in info.get("lengths", {}).values():
@@ -142,6 +282,12 @@ def _length_totals(info: dict) -> dict[str, int]:
 def code_key(repo: str) -> str:
     """Checkpoint key for one repo's CODE half."""
     return f"{repo}::code"
+
+
+def stream_lock_names(streams: str) -> tuple[str, ...]:
+    if streams == "both":
+        return ("code", "commits")
+    return (streams,)
 
 
 # --------------------------------------------------------------------------- #
@@ -202,6 +348,7 @@ def run_commits_half(
     repo_list: Path | None,
     memory_limit_gb: float = 10.0,
     progress: ProgressWriter | None = None,
+    checkpoint: DedupCheckpointController | None = None,
 ) -> tuple[int, int]:
     """Extract commit records once, fan ranges to the pool. Returns (done, failed).
 
@@ -275,6 +422,8 @@ def run_commits_half(
                     lengths=rinfo.get("lengths", {}),
                     cumulative_valid_tokens=cumulative_valid,
                 )
+            if checkpoint is not None:
+                checkpoint.maybe_checkpoint(cumulative_valid)
             _log(f"DONE {rkey}: ranges [{start}:{end}] "
                  f"buckets={sorted(rinfo['lengths'].keys())} "
                  f"(+{added} @ {smallest}, cum_all={cumulative['valid']})")
@@ -335,6 +484,7 @@ def process_one_repo(
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
     progress: ProgressWriter | None = None,
+    checkpoint: DedupCheckpointController | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -378,6 +528,8 @@ def process_one_repo(
                             lengths=cinfo.get("lengths", {}),
                             cumulative_valid_tokens=cumulative_valid,
                         )
+                    if checkpoint is not None:
+                        checkpoint.maybe_checkpoint(cumulative_valid)
                     result["code"] = cinfo
                     _log(f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
                          f"(cum_all={cumulative['valid']})")
@@ -405,7 +557,7 @@ def process_one_repo(
                     repo, repo_dir, repo_work, lengths_commits, range_size,
                     pool, manifest, manifest_lock, resume, cumulative,
                     dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
-                    progress,
+                    progress, checkpoint,
                 )
                 result["commits_done"] = done
                 result["commits_failed"] = failed
@@ -457,6 +609,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--keep-temp", action="store_true")
     p.add_argument("--work-dir", default=None)
+    p.add_argument("--work-parent-dir", default=str(DEFAULT_WORK_PARENT),
+                   help="Parent directory for conveyor temporary work dirs when "
+                        "--work-dir is not set. Default lives under outputs/ on "
+                        "the external corpus disk, not the macOS /var/folders "
+                        f"temp volume: {DEFAULT_WORK_PARENT}.")
     p.add_argument("--only-repo", action="append", default=[],
                    help="Restrict the conveyor to these repo names (repeatable). "
                         "Other repos are DRAINED from the .git-preserving stream "
@@ -488,6 +645,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--progress-jsonl", default=str(DEFAULT_PROGRESS_JSONL),
                    help="Append unit-level progress events here for live "
                         "throughput monitoring. Use empty string to disable.")
+    p.add_argument("--dedup-checkpoint-tokens", type=int,
+                   default=DEFAULT_DEDUP_CHECKPOINT_TOKENS,
+                   help="Run a SQLite WAL checkpoint on --dedup-db after each "
+                        "N valid tokens produced by this conveyor run. Use 0 "
+                        "to disable. Default 25,000,000.")
+    p.add_argument("--dedup-checkpoint-mode",
+                   choices=("PASSIVE", "FULL", "RESTART", "TRUNCATE"),
+                   default="TRUNCATE",
+                   help="SQLite wal_checkpoint mode for token milestones. "
+                        "Default TRUNCATE caps WAL growth when no writer holds it.")
+    p.add_argument("--dedup-checkpoint-busy-timeout-ms", type=int, default=5000,
+                   help="Busy timeout for token-milestone dedup WAL checkpoints.")
+    p.add_argument("--run-lock-dir", default=str(DEFAULT_RUN_LOCK_DIR),
+                   help="Directory for fail-loud per-stream conveyor locks. "
+                        f"Default {DEFAULT_RUN_LOCK_DIR}.")
+    p.add_argument("--no-run-lock", action="store_true",
+                   help="Disable per-stream conveyor process locks. Intended "
+                        "only for controlled tests; normal runs should keep the "
+                        "lock so duplicate stream writers fail before extraction.")
     return p.parse_args(argv)
 
 
@@ -507,6 +683,23 @@ def main(argv: list[str]) -> int:
     max_active_repos = max(1, max_active_repos)
     if max_active_repos < repo_workers:
         raise SystemExit("--max-active-repos must be >= --repo-workers")
+
+    run_locks: list[RunLock] = []
+    if not args.no_run_lock:
+        lock_dir = Path(args.run_lock_dir)
+        try:
+            for name in stream_lock_names(args.streams):
+                lock = RunLock(lock_dir / f"{name}.lock")
+                lock.acquire()
+                run_locks.append(lock)
+            _log(
+                "Run-lock: acquired "
+                + ", ".join(str(lock.path) for lock in run_locks)
+            )
+        except Exception:
+            for lock in run_locks:
+                lock.close()
+            raise
 
     # FAIL LOUD up front (RULE #1): every required stage binary must exist.
     required_paths = [VENV_PYTHON, sr.TOKENIZER_PATH, sr.MATERIALIZER, sr.PACKER]
@@ -535,7 +728,10 @@ def main(argv: list[str]) -> int:
         sys.path.insert(0, str(MLX_ROOT / "tools" / "clang_indexer"))
         from dedup_store import DedupStore  # noqa: E402
         dedup_db.parent.mkdir(parents=True, exist_ok=True)
-        DedupStore(str(dedup_db), near=dedup_near, commit_every=1000).close()
+        # Path/schema validation only. Do not rebuild the persisted MinHash/LSH
+        # index in the driver parent; real worker stages open near-dedup only
+        # when requested. On full corpora the LSH reload dominates startup.
+        DedupStore(str(dedup_db), near=False, commit_every=1000).close()
         _log(f"Dedup: SHARED global store at {dedup_db} threaded into BOTH "
              f"code + commit stages (exact{'+near' if dedup_near else ''}, "
              f"tokenized hash)")
@@ -566,6 +762,13 @@ def main(argv: list[str]) -> int:
     manifest_lock = threading.Lock()
     resume = not args.no_resume
     progress = ProgressWriter(Path(args.progress_jsonl) if args.progress_jsonl else None)
+    checkpoint = DedupCheckpointController(
+        dedup_db=dedup_db,
+        interval_tokens=args.dedup_checkpoint_tokens,
+        mode=args.dedup_checkpoint_mode,
+        busy_timeout_ms=args.dedup_checkpoint_busy_timeout_ms,
+        progress=progress,
+    )
     progress.emit(
         "run_started",
         streams=args.streams,
@@ -576,6 +779,8 @@ def main(argv: list[str]) -> int:
         target_lengths_code=list(lengths_code),
         target_lengths_commits=list(lengths_commits),
         manifest=str(CONVEYOR_MANIFEST),
+        dedup_checkpoint_tokens=args.dedup_checkpoint_tokens,
+        dedup_checkpoint_mode=args.dedup_checkpoint_mode,
     )
 
     if args.work_dir:
@@ -583,14 +788,21 @@ def main(argv: list[str]) -> int:
         work_root.mkdir(parents=True, exist_ok=True)
         own_work_root = False
     else:
-        work_root = Path(tempfile.mkdtemp(prefix="streaming_conveyor_"))
+        work_parent = Path(args.work_parent_dir)
+        work_parent.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("TMPDIR", str(work_parent))
+        os.environ.setdefault("TMP", str(work_parent))
+        os.environ.setdefault("TEMP", str(work_parent))
+        work_root = Path(tempfile.mkdtemp(prefix="streaming_conveyor_", dir=str(work_parent)))
         own_work_root = True
+    progress.emit("work_root_ready", work_root=str(work_root), own_work_root=own_work_root)
 
     cumulative = {"valid": 0}
     processed_repos = 0
     code_done = 0
     ranges_done = 0
     ranges_failed = 0
+    submitted_repo_names: set[str] = set()
 
     only_repos = set(args.only_repo) if args.only_repo else None
 
@@ -627,6 +839,15 @@ def main(argv: list[str]) -> int:
             int(res.get("commits_failed", 0)),
         )
 
+    def claim_repo_once(repo: str) -> None:
+        if repo in submitted_repo_names:
+            raise RepoFailure(
+                repo,
+                "duplicate_repo",
+                f"repo {repo!r} was yielded/submitted twice in one conveyor run",
+            )
+        submitted_repo_names.add(repo)
+
     try:
         gen = (
             sr.stream_repo_subtrees(work_root, should_process)
@@ -636,12 +857,13 @@ def main(argv: list[str]) -> int:
 
         if repo_pool is None:
             for repo, repo_dir in gen:
+                claim_repo_once(repo)
                 res = process_one_repo(
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
                     work_root, range_pool, manifest, manifest_lock, resume, cumulative,
                     args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
                     args.streams, global_symbol_index, args.memory_limit_gb,
-                    progress,
+                    progress, checkpoint,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -683,6 +905,7 @@ def main(argv: list[str]) -> int:
                     ranges_failed += rf
 
             for repo, repo_dir in gen:
+                claim_repo_once(repo)
                 while len(inflight) >= max_active_repos:
                     drain_one_or_more(block=True)
                     if args.token_budget is not None and cumulative["valid"] >= args.token_budget:
@@ -703,7 +926,7 @@ def main(argv: list[str]) -> int:
                     work_root, range_pool, manifest, manifest_lock, resume, cumulative,
                     args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
                     args.streams, global_symbol_index, args.memory_limit_gb,
-                    progress,
+                    progress, checkpoint,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
@@ -717,6 +940,8 @@ def main(argv: list[str]) -> int:
         range_pool.shutdown(wait=True)
         if own_work_root and not args.keep_temp:
             shutil.rmtree(work_root, ignore_errors=True)
+        for lock in reversed(run_locks):
+            lock.close()
 
     # ----- cumulative per-length report from the manifest (both streams) -----
     def _empty_totals(lengths):
