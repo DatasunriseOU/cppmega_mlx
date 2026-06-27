@@ -109,6 +109,101 @@ def _log(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
 
 
+class ConcurrentManifest(Manifest):
+    """Cross-process-safe conveyor resume manifest (fixes the H4 clobber).
+
+    The base ``streaming_reindex.Manifest.save()`` rewrites the whole file from
+    its in-memory ``done``/``failed`` dicts with NO disk re-read and NO OS-level
+    lock (``manifest_lock`` is only a ``threading.Lock`` -- useless across
+    processes). Two conveyor processes that legitimately run at the same time --
+    a ``--streams code`` run and a ``--streams commits`` run, each holding only
+    its OWN per-stream :class:`RunLock` -- therefore CLOBBER the single shared
+    ``outputs/conveyor/_done.json``: whichever writes last overwrites the file
+    with its own snapshot and drops the other stream's keys (lost update),
+    silently destroying that stream's resume + token accounting even though the
+    two key spaces are disjoint (``<repo>::code`` vs ``<repo>::r<start>``).
+
+    This subclass makes every manifest mutation atomic ACROSS processes: under an
+    exclusive ``flock`` on a sibling ``.lock`` file it RE-READS the on-disk
+    manifest, MERGES only the one changed key into it, then atomically replaces
+    the file. The in-memory dicts are refreshed to the merged on-disk state so
+    in-process resume checks (``is_done``) also observe the other process's
+    committed keys. ONE clear write path; any error RAISES (RULE #1). A blind
+    full-file ``save()`` is disabled so the clobber cannot be reintroduced.
+    """
+
+    def __init__(self, path: Path, done: dict | None = None, failed: dict | None = None):
+        # Bypass the dataclass __init__ so we can attach lock state.
+        self.path = path
+        self.done = dict(done or {})
+        self.failed = dict(failed or {})
+        self._lock_path = Path(str(path) + ".lock")
+        self._thread_lock = threading.Lock()
+
+    @classmethod
+    def load(cls, path: Path) -> "ConcurrentManifest":
+        base = Manifest.load(path)
+        return cls(path=path, done=base.done, failed=base.failed)
+
+    def _read_disk(self) -> tuple[dict, dict]:
+        if self.path.exists():
+            blob = json.loads(self.path.read_text())
+            return blob.get("done", {}), blob.get("failed", {})
+        return {}, {}
+
+    def _atomic_replace(self, done: dict, failed: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+        tmp.write_text(
+            json.dumps({"done": done, "failed": failed}, indent=2, sort_keys=True)
+        )
+        tmp.replace(self.path)  # atomic on POSIX
+
+    def _merge_under_lock(self, apply_change) -> None:
+        """Apply ``apply_change(done, failed)`` to the freshest on-disk state
+        under an exclusive cross-process flock, then atomically persist and
+        refresh the in-memory dicts to the merged result."""
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._thread_lock:
+            fh = self._lock_path.open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                done, failed = self._read_disk()
+                apply_change(done, failed)
+                self._atomic_replace(done, failed)
+                self.done = done
+                self.failed = failed
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                fh.close()
+
+    def mark_done(self, key: str, info: dict) -> None:
+        def apply(done: dict, failed: dict) -> None:
+            done[key] = info
+            failed.pop(key, None)
+
+        self._merge_under_lock(apply)
+
+    def mark_failed(self, key: str, stage: str, detail: str) -> None:
+        rec = {
+            "stage": stage,
+            "detail": detail[:2000],
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+        def apply(done: dict, failed: dict) -> None:
+            failed[key] = rec
+
+        self._merge_under_lock(apply)
+
+    def save(self) -> None:  # pragma: no cover - guard against accidental reuse
+        raise RuntimeError(
+            "ConcurrentManifest persists via mark_done/mark_failed (atomic "
+            "cross-process merge under flock); a blind save() would re-introduce "
+            "the lost-update clobber this class exists to prevent."
+        )
+
+
 class ProgressWriter:
     """Append-only machine-readable progress events for live throughput tracking."""
 
@@ -758,7 +853,11 @@ def main(argv: list[str]) -> int:
             _log(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
                  f"threaded into CODE half (bounded depth-1 pulls, crosslib:<repo>).")
 
-    manifest = Manifest.load(CONVEYOR_MANIFEST)
+    # Cross-process-safe manifest: a concurrent --streams code run and
+    # --streams commits run (each holding only its own per-stream RunLock) share
+    # CONVEYOR_MANIFEST; ConcurrentManifest merges + flocks every write so they
+    # cannot clobber each other's resume/accounting keys (H4 fix).
+    manifest = ConcurrentManifest.load(CONVEYOR_MANIFEST)
     manifest_lock = threading.Lock()
     resume = not args.no_resume
     progress = ProgressWriter(Path(args.progress_jsonl) if args.progress_jsonl else None)

@@ -267,6 +267,7 @@ def _process_file(
     backup_suffix: str,
     compression: str,
     compression_level: int | None,
+    continue_on_error: bool,
 ) -> FileResult:
     path = Path(path_str)
     bucket = path.parent.name
@@ -309,12 +310,25 @@ def _process_file(
             dry_run=dry_run,
         )
     except Exception as exc:
-        return FileResult(
-            path=str(path),
-            bucket=bucket,
-            dry_run=dry_run,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+        # RULE #1: this is a DESTRUCTIVE cleaner for training-critical packed
+        # parquet. A read/schema/rewrite failure must be fatal -- swallowing it
+        # into a report entry and letting the process exit 0 would let an
+        # exit-code-keyed pipeline treat the corpus as cleaned and upload/train
+        # with invalid rows still present. By default we re-raise with WHERE
+        # (path) + WHAT (original error) so the process crashes loud. Recording
+        # the error and continuing is only allowed under the explicit
+        # --continue-on-error opt-in, and even then main() still exits non-zero
+        # whenever any file failed (see exit logic below).
+        if continue_on_error:
+            return FileResult(
+                path=str(path),
+                bucket=bucket,
+                dry_run=dry_run,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        raise RuntimeError(
+            f"failed to process packed parquet {path}: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _discover(paths: list[Path]) -> list[Path]:
@@ -340,6 +354,17 @@ def main() -> int:
     ap.add_argument("--compression-level", type=int, default=6)
     ap.add_argument("--report", type=Path, default=Path("outputs/drop_invalid_packed_parquet_rows_report.json"))
     ap.add_argument("--fail-on-remaining", action="store_true")
+    ap.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help=(
+            "Opt in to processing remaining files past a per-file "
+            "read/schema/write failure instead of crashing on the first one. "
+            "The failure is recorded in the report, but the process STILL exits "
+            "non-zero whenever any file failed. Without this flag a per-file "
+            "failure raises immediately (fail-loud, the default)."
+        ),
+    )
     args = ap.parse_args()
 
     files = _discover(args.paths)
@@ -358,6 +383,7 @@ def main() -> int:
                 backup_suffix=args.backup_suffix,
                 compression=args.compression,
                 compression_level=args.compression_level,
+                continue_on_error=args.continue_on_error,
             )
             for path in files
         ]
@@ -403,7 +429,16 @@ def main() -> int:
     args.report.write_text(json.dumps(report, indent=2))
     print(json.dumps(total, indent=2))
 
-    if args.fail_on_remaining and (total["error_files"] or (args.dry_run and total["dropped_rows"])):
+    # RULE #1: any per-file failure is fatal BY DEFAULT. In the default
+    # (fail-loud) mode a read/schema/write error already propagated out of
+    # future.result() and crashed this process before reaching here, so the only
+    # way error_files can be non-zero now is the narrow non-numeric-bucket guard
+    # or an explicit --continue-on-error run. Either way we MUST exit non-zero --
+    # never report errors and exit 0. --fail-on-remaining stays opt-in only for
+    # the (non-error) dry-run "rows would be dropped" signal.
+    if total["error_files"]:
+        return 2
+    if args.fail_on_remaining and args.dry_run and total["dropped_rows"]:
         return 2
     return 0
 

@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
-import traceback
 from typing import Any
 
 import numpy as np
@@ -310,6 +309,145 @@ def _count_bad_flat_values(
         row_bad |= rows
 
 
+def _validate_loss_mask_against_doc_ids(
+    *,
+    stats: AuditStats,
+    loss_mask_col: Any,
+    doc_ids_col: Any,
+    input_lengths: np.ndarray,
+    valid: np.ndarray,
+    row_bad: np.ndarray,
+) -> None:
+    """Value-level check that `loss_mask` equals the producer's doc-boundary rule.
+
+    This is the check that catches C1-style corruption (an all-ones loss_mask
+    rebuilt over a multi-document packed row). Lengths are preserved by that
+    corruption, so the length checks alone cannot see it; only a value-level
+    comparison against `doc_ids` can.
+
+    Canonical rule (see `pack_enriched_rows._loss_mask_for_packed_docs`):
+
+        loss_mask[pos] == 1  iff  pos + 1 < valid  AND  doc_ids[pos] == doc_ids[pos + 1]
+
+    i.e. 1 only when the next token belongs to the SAME document and is itself a
+    real (non-pad) token; 0 at every inter-document boundary, at the last valid
+    token (no next token to predict), and across the entire pad region.
+    """
+    rows = len(input_lengths)
+    if rows == 0:
+        return
+    lengths = input_lengths.astype(np.int64)
+    n = int(lengths.sum())
+    doc_flat = _flat_numpy(doc_ids_col)
+    lm_flat = _flat_numpy(loss_mask_col)
+    # The vectorized derivation below is only meaningful when both columns share
+    # the canonical per-row layout (length == input_ids length). Any row whose
+    # doc_ids/loss_mask length differs is already flagged as a bad row by the
+    # length checks (and blocks the upload under the fail-closed default), so a
+    # layout-inconsistent file is ALREADY failing the gate -- skip deriving the
+    # mask against wrong offsets rather than fabricate a value comparison.
+    if len(doc_flat) != n or len(lm_flat) != n:
+        return
+    doc_flat = doc_flat.astype(np.int64)
+    lm_flat = lm_flat.astype(np.int64)
+
+    row_idx = np.repeat(np.arange(rows, dtype=np.int64), lengths)
+    starts = np.zeros(rows, dtype=np.int64)
+    if rows > 1:
+        np.cumsum(lengths[:-1], out=starts[1:])
+    pos = np.arange(n, dtype=np.int64) - starts[row_idx]
+
+    same_next = np.zeros(n, dtype=bool)
+    if n > 1:
+        same_next[:-1] = doc_flat[:-1] == doc_flat[1:]
+    # Never let the neighbour comparison cross a row boundary.
+    is_row_last = pos == (lengths[row_idx] - 1)
+    same_next &= ~is_row_last
+    # pos + 1 < valid  (excludes the last valid token and the whole pad region).
+    within_valid = pos < (valid[row_idx].astype(np.int64) - 1)
+
+    expected = (same_next & within_valid).astype(np.int64)
+    mismatch = lm_flat != expected
+    bad_rows = _rows_with_flat_mask(lengths, mismatch)
+    count = int(np.count_nonzero(bad_rows))
+    if count:
+        stats.field_stats["loss_mask"].bad_value_rows += count
+        row_bad |= bad_rows
+
+
+def _validate_target_ids_shift(
+    *,
+    stats: AuditStats,
+    input_ids_col: Any,
+    target_ids_col: Any,
+    input_lengths: np.ndarray,
+    row_bad: np.ndarray,
+    pad_token_id: int = 0,
+) -> None:
+    """Check `target_ids == input_ids[1:] + PAD` for each fixed-width row."""
+    rows = len(input_lengths)
+    if rows == 0:
+        return
+    lengths = input_lengths.astype(np.int64)
+    n = int(lengths.sum())
+    input_flat = _flat_numpy(input_ids_col)
+    target_flat = _flat_numpy(target_ids_col)
+    if len(input_flat) != n or len(target_flat) != n:
+        return
+
+    expected = np.full(n, pad_token_id, dtype=np.asarray(target_flat).dtype)
+    nonempty = lengths > 0
+    if np.any(nonempty):
+        starts = np.zeros(rows, dtype=np.int64)
+        if rows > 1:
+            np.cumsum(lengths[:-1], out=starts[1:])
+        ends = starts + lengths
+        for start, end in zip(starts[nonempty], ends[nonempty]):
+            if end - start > 1:
+                expected[start:end - 1] = input_flat[start + 1:end]
+    mismatch = target_flat != expected
+    bad_rows = _rows_with_flat_mask(lengths, mismatch)
+    count = int(np.count_nonzero(bad_rows))
+    if count:
+        stats.field_stats["target_ids"].bad_value_rows += count
+        row_bad |= bad_rows
+
+
+def _validate_trained_count_against_loss_mask(
+    *,
+    stats: AuditStats,
+    trained: np.ndarray,
+    loss_mask_col: Any,
+    input_lengths: np.ndarray,
+    row_bad: np.ndarray,
+) -> None:
+    """Check `trained_token_count` is exactly the positive loss-mask sum."""
+    rows = len(input_lengths)
+    if rows == 0:
+        return
+    lengths = input_lengths.astype(np.int64)
+    lm_flat = _flat_numpy(loss_mask_col)
+    if len(lm_flat) != int(lengths.sum()) or len(trained) != rows:
+        return
+
+    expected = np.zeros(rows, dtype=np.int64)
+    nonempty = lengths > 0
+    if np.any(nonempty):
+        starts = np.zeros(rows, dtype=np.int64)
+        if rows > 1:
+            np.cumsum(lengths[:-1], out=starts[1:])
+        reduced = np.add.reduceat((lm_flat > 0).astype(np.int64), starts[nonempty])
+        expected[nonempty] = reduced
+
+    mismatch = trained.astype(np.int64) != expected
+    count = int(np.count_nonzero(mismatch))
+    if count:
+        row_bad |= mismatch
+        stats.errors.append(
+            f"{count} rows have trained_token_count != sum(loss_mask)"
+        )
+
+
 def _iter_or_empty(values: Any) -> Any:
     if values is None:
         return ()
@@ -357,14 +495,12 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
         ]
         table = pf.read(columns=cols)
     except Exception as exc:
-        stats.bad_files += 1
-        stats.errors.append(f"{path}: read failed: {type(exc).__name__}: {exc}")
-        return {
-            "kind": kind,
-            "bucket": bucket,
-            "path": path_str,
-            "stats": stats.as_dict(),
-        }
+        # Fail loud: a shard we cannot even read cannot be certified for upload.
+        # Re-raise with where+what so the gate crashes instead of recording a
+        # degraded "bad file" entry that a caller might overlook.
+        raise RuntimeError(
+            f"{path}: parquet read failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
     names = set(cols)
     for name in ALL_FIELDS:
@@ -442,6 +578,37 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                     expected_lengths=input_lengths,
                     row_bad=row_bad,
                 )
+
+        # Value-level loss-target correctness: loss_mask MUST match the
+        # doc_ids-derived boundary rule. Length checks alone cannot catch a
+        # corrupted (e.g. all-ones) loss_mask because lengths are preserved.
+        if "loss_mask" in names and "doc_ids" in names:
+            _validate_loss_mask_against_doc_ids(
+                stats=stats,
+                loss_mask_col=table.column("loss_mask"),
+                doc_ids_col=table.column("doc_ids"),
+                input_lengths=input_lengths,
+                valid=valid,
+                row_bad=row_bad,
+            )
+
+        if "target_ids" in names:
+            _validate_target_ids_shift(
+                stats=stats,
+                input_ids_col=input_ids,
+                target_ids_col=table.column("target_ids"),
+                input_lengths=input_lengths,
+                row_bad=row_bad,
+            )
+
+        if "trained_token_count" in names and "loss_mask" in names:
+            _validate_trained_count_against_loss_mask(
+                stats=stats,
+                trained=trained,
+                loss_mask_col=table.column("loss_mask"),
+                input_lengths=input_lengths,
+                row_bad=row_bad,
+            )
 
         for name in TOKEN_ALIGNED_FIELDS:
             if name in names:
@@ -554,9 +721,11 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                 )
 
     except Exception as exc:
-        stats.bad_files += 1
-        stats.errors.append(f"{path}: batch audit failed: {type(exc).__name__}: {exc}")
-        stats.errors.extend(traceback.format_exc().splitlines()[-8:])
+        # Fail loud: a crash mid-audit cannot certify a shard. Re-raise with
+        # where+what instead of recording partial stats and returning "ok-ish".
+        raise RuntimeError(
+            f"{path}: audit failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
     stats.bad_rows = int(np.count_nonzero(row_bad))
     return {
@@ -693,7 +862,20 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)))
     ap.add_argument("--vocab-size", type=int, default=65536)
     ap.add_argument("--out-dir", type=Path, default=Path("outputs/sidecar_audit"))
-    ap.add_argument("--fail-on-bad", action="store_true")
+    ap.add_argument(
+        "--allow-bad",
+        action="store_true",
+        help=(
+            "Escape hatch: do NOT block on bad files/rows. By default this gate "
+            "is FAIL-CLOSED -- any bad file or bad row exits non-zero so the "
+            "upload is blocked. Pass this flag to opt out explicitly."
+        ),
+    )
+    ap.add_argument(
+        "--fail-on-bad",
+        action="store_true",
+        help="Deprecated no-op: failing on bad files/rows is now the default.",
+    )
     args = ap.parse_args()
 
     buckets = {item.strip() for item in args.buckets.split(",") if item.strip()} or None
@@ -727,7 +909,16 @@ def main() -> int:
         "bad_files": report["total"]["bad_files"],
         "bad_rows": report["total"]["bad_rows"],
     }, indent=2))
-    if args.fail_on_bad and (report["total"]["bad_files"] or report["total"]["bad_rows"]):
+    has_bad = bool(report["total"]["bad_files"] or report["total"]["bad_rows"])
+    if has_bad and not args.allow_bad:
+        # FAIL-CLOSED default: block the upload by exiting non-zero.
+        print(
+            "AUDIT FAILED (fail-closed): "
+            f"bad_files={report['total']['bad_files']} "
+            f"bad_rows={report['total']['bad_rows']}. "
+            "Upload must be blocked. Pass --allow-bad to override explicitly.",
+            flush=True,
+        )
         return 2
     return 0
 

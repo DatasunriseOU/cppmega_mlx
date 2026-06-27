@@ -202,6 +202,7 @@ def _tiny_dsa_model(vocab: int, seq: int) -> DenseCppLM:
         indexer_dim=8,
         indexer_local_window=4,
         indexer_num_sinks=1,
+        require_graph_routes=False,
         ngram_hash_enabled=False,
         structure_residual_scale=0.0,
         platform_residual_scale=0.0,
@@ -218,6 +219,38 @@ def test_dense_cpp_lm_dsa_forward_exposes_indexer_scores():
     scores = model.indexer_scores()
     assert len(scores) == 2  # one per layer
     assert tuple(scores[0].shape) == (2, 24, 24)
+
+
+def test_dense_cpp_lm_dsa_requires_graph_routes_by_default():
+    cfg = DenseCppLMConfig(
+        vocab_size=128,
+        hidden_size=64,
+        depth=1,
+        ffn_hidden_size=128,
+        max_seq_length=64,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=16,
+        attention_mode="dsa",
+        attention_sparse_topk=8,
+        indexer_heads=2,
+        indexer_dim=8,
+        indexer_local_window=2,
+        indexer_num_sinks=1,
+        ngram_hash_enabled=False,
+        structure_residual_scale=0.0,
+        platform_residual_scale=0.0,
+    )
+    model = DenseCppLM(cfg)
+    ids = mx.array(np.random.default_rng(0).integers(0, 128, (1, 16)))
+    tgt = mx.array(np.random.default_rng(1).integers(0, 128, (1, 16)))
+    with pytest.raises(RuntimeError, match="requires graph route block_bias"):
+        model(ids, targets=tgt)
+
+    bias = mx.zeros((1, 16, 16), dtype=mx.float32)
+    logits, loss = model(ids, targets=tgt, block_bias=bias)
+    assert tuple(logits.shape) == (1, 16, 128)
+    assert loss is not None and np.isfinite(float(loss))
 
 
 def test_dense_cpp_lm_dsa_trains_on_golden_mini():

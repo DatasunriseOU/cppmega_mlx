@@ -27,6 +27,41 @@ TOOL_USE_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "TOOL_RESULT": 19,
 }
 
+DOMAIN_DELIMITER_TOKEN_IDS: dict[str, int] = {
+    "CPP_CODE_START": 191,
+    "CPP_CODE_END": 192,
+    "MAKE_START": 193,
+    "MAKE_END": 194,
+    "CMAKE_START": 195,
+    "CMAKE_END": 196,
+    "NINJA_START": 197,
+    "NINJA_END": 198,
+    "BAZEL_START": 199,
+    "BAZEL_END": 200,
+    "BASH_START": 201,
+    "BASH_END": 202,
+    "ZSH_START": 203,
+    "ZSH_END": 204,
+    "SH_START": 205,
+    "SH_END": 206,
+    "TCSH_START": 207,
+    "TCSH_END": 208,
+    "COMPILER_DIAGNOSTIC_START": 209,
+    "COMPILER_DIAGNOSTIC_END": 210,
+    "BUILD_DIAGNOSTIC_START": 211,
+    "BUILD_DIAGNOSTIC_END": 212,
+    "COMPILER_ERROR_START": 213,
+    "COMPILER_ERROR_END": 214,
+    "BUILD_ERROR_START": 215,
+    "BUILD_ERROR_END": 216,
+    "LINKER_ERROR_START": 217,
+    "LINKER_ERROR_END": 218,
+    "TEST_OUTPUT_START": 219,
+    "TEST_OUTPUT_END": 220,
+    "TOOL_OUTPUT_START": 221,
+    "TOOL_OUTPUT_END": 222,
+}
+
 SpecialTokenMapping = Mapping[int, str] | Mapping[str, int]
 
 
@@ -96,6 +131,7 @@ def _is_int_key(value: object) -> bool:
 
 
 __all__ = [
+    "DOMAIN_DELIMITER_TOKEN_IDS",
     "REQUIRED_SPECIAL_TOKEN_IDS",
     "SpecialTokenMapping",
     "TOOL_USE_SPECIAL_TOKEN_IDS",

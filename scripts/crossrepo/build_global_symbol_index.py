@@ -59,6 +59,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 # --------------------------------------------------------------------------- #
 # Locate the indexer module so we reuse its libclang parse helpers verbatim.
@@ -84,6 +85,13 @@ DEFAULT_OUTPUT = MLX_ROOT / "outputs" / "crossrepo" / "global_symbols.sqlite"
 #   tier='A1'|'A2',
 #   public_only=bool,           # A2 libs: only header-declared/exported symbols
 #   namespace_prefixes=[...],   # symbol-namespace cleanliness (prefixed cross-link)
+#   include_path_markers=[...], # (optional) RESTRICT extraction to members whose
+#                               #   path contains one of these — for the huge
+#                               #   gcc/llvm monorepos this pins the cut to the
+#                               #   C++ stdlib header trees and OFF gcc's compiler
+#                               #   / libiberty internals (the C2 root cause).
+#   index_extensionless_headers=bool,  # (optional) also index extensionless std
+#                               #   headers (<vector>, <type_traits>, ...).
 # )
 # A1 = tractable full public-API index. A2 = huge, public symbols only.
 # --------------------------------------------------------------------------- #
@@ -102,8 +110,24 @@ BASE_LIBS: dict[str, dict] = {
     "fmt":        {"subtrees": ["fmt"],          "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["fmt::"]},
     "glib":       {"subtrees": ["glib"],         "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": []},
     # ---- A2 (huge / template-heavy) — PUBLIC symbols only ----
+    # std: gcc-mirror and llvm-project are FULL compiler monorepos (the entire GCC
+    # / LLVM source trees). Without include_path_markers the per-lib file cap is
+    # spent on gcc's compiler + libiberty internals and ZERO real C++ standard
+    # library headers get indexed (the C2 defect). Pin the cut to the libstdc++ /
+    # libc++ / microsoft-STL public header trees only, and index their
+    # EXTENSIONLESS public headers (<vector>, <type_traits>, ...).
     "std":        {"subtrees": ["STL", "stl", "gcc-mirror", "llvm-project"],
-                   "tier": "A2", "public_only": True, "lang": "c++", "namespace_prefixes": ["std::"]},
+                   "tier": "A2", "public_only": True, "lang": "c++",
+                   "namespace_prefixes": ["std::"],
+                   "include_path_markers": [
+                       "/libstdc++-v3/include/",    # gcc-mirror: libstdc++ public headers
+                       "/libstdc++-v3/libsupc++/",  # gcc-mirror: <typeinfo>/<exception>/<new>
+                       "/libcxx/include/",          # llvm-project: libc++ public headers
+                       "/stl/inc/",                 # microsoft/STL public headers
+                   ],
+                   "index_extensionless_headers": True},
+    # libc: C libraries have NO namespace; keep by-name public symbols (no prefix
+    # filter). glibc/musl public surface lives in normal .h headers.
     "libc":       {"subtrees": ["glibc", "musl"],
                    "tier": "A2", "public_only": True, "lang": "c", "namespace_prefixes": []},
 }
@@ -136,23 +160,60 @@ _INTERNAL_QNAME_SEG = re.compile(
     r"(^|::)(detail|internal|impl|_internal|__detail|__internal)(::|$)", re.IGNORECASE
 )
 _RESERVED_LEADING = re.compile(r"(^|::)(_[A-Z]|__)")  # __foo / _Foo reserved names
+_INLINE_NAMESPACE_SEGMENTS = {
+    "__1",
+    "__2",
+    "__3",
+    "__cxx11",
+}
 
 
-def is_public_symbol(qname: str, rel_file: str, public_only: bool) -> bool:
+def normalize_inline_namespace_qname(qname: str) -> str:
+    """Canonicalize common C++ inline ABI namespaces in qualified names.
+
+    libstdc++/libc++ expose public symbols through inline implementation
+    namespaces such as ``std::__1`` or ``std::__cxx11``.  The cross-repo lookup
+    should index those under the stable public spelling so callers resolving
+    ``std::basic_string`` or ``std::vector`` do not miss them because of a
+    library-specific ABI namespace.
+    """
+    if not qname:
+        return qname
+    parts = [part for part in qname.split("::") if part not in _INLINE_NAMESPACE_SEGMENTS]
+    return "::".join(parts)
+
+
+def _is_public_header_path(rel_file: str) -> bool:
+    ext = os.path.splitext(rel_file)[1].lower()
+    if ext in _HEADER_EXTS:
+        return True
+    parts = [part for part in rel_file.replace("\\", "/").split("/") if part]
+    return "include" in parts
+
+
+def is_public_symbol(
+    qname: str,
+    rel_file: str,
+    public_only: bool,
+    namespace_prefixes: Sequence[str] = (),
+) -> bool:
     """Decide whether a parsed symbol belongs in the cross-link index.
 
-    For A1 libs (public_only=False) we accept any non-internal qualified name.
+    For A1 libs (public_only=False) we accept any non-internal qualified name
+    that belongs to the lib's configured namespace prefixes, when provided.
     For A2 libs (public_only=True) we additionally REQUIRE the defining file to
     be a header (public API surface) and reject reserved/internal names — this
     bounds the std/libc index to the public symbol surface and keeps cost down.
     """
+    qname = normalize_inline_namespace_qname(qname)
     if not qname:
+        return False
+    if namespace_prefixes and not any(qname.startswith(prefix) for prefix in namespace_prefixes):
         return False
     if _INTERNAL_QNAME_SEG.search(qname):
         return False
     if public_only:
-        ext = os.path.splitext(rel_file)[1].lower()
-        if ext not in _HEADER_EXTS:
+        if not _is_public_header_path(rel_file):
             return False
         # Reserved-name implementation symbols (__copy, _M_..., _S_...) are not
         # the public API the model should learn; drop them for the A2 surface.
@@ -306,8 +367,88 @@ class GlobalSymbolStore:
 # --------------------------------------------------------------------------- #
 # Streaming extraction of selected subtrees from the tarball.
 # --------------------------------------------------------------------------- #
+# Extensionless files that are documentation / build / metadata, NOT headers.
+_NON_HEADER_BASENAMES = frozenset({
+    "readme", "license", "licence", "copying", "copyright", "authors", "news",
+    "todo", "changelog", "changes", "install", "notice", "version", "credits",
+    "thanks", "bugs", "faq", "makefile", "gnumakefile", "dockerfile", "owners",
+    "contributing", "manifest",
+})
+# Path components that hold the EXTENSIONLESS C++ stdlib public headers:
+#   libstdc++/libc++/microsoft-STL use ``include``/``inc``; libstdc++ also keeps
+#   <typeinfo>/<exception>/<new> under ``libsupc++``.
+_HEADER_DIR_COMPONENTS = frozenset({"include", "inc", "libsupc++"})
+
+
+def _is_extensionless_header(name: str) -> bool:
+    """True if ``name`` is an EXTENSIONLESS C++ standard-library header.
+
+    The libstdc++/libc++ public surface (<vector>, <type_traits>, <memory>,
+    <typeinfo>, ...) has NO file extension, so the normal extension filter skips
+    it entirely. We only treat an extensionless file as a header when it lives
+    under a stdlib header dir component AND its basename is not a well-known
+    doc/build file — this avoids grabbing extensionless license/readme/makefile
+    noise.
+    """
+    base = os.path.basename(name)
+    if not base or base.startswith("."):
+        return False
+    if os.path.splitext(base)[1] != "":
+        return False  # has a real extension
+    if base.lower() in _NON_HEADER_BASENAMES:
+        return False
+    parts = set(Path(name.replace("\\", "/")).parts)
+    return bool(parts & _HEADER_DIR_COMPONENTS)
+
+
+def _member_is_wanted(name: str, index_exts, *, path_markers, extensionless: bool) -> bool:
+    """Decide whether a tarball member (by path) should be extracted for a lib.
+
+    ``path_markers`` (when non-empty) RESTRICTS extraction to members whose path
+    contains one of the markers. This is the C2 fix for the huge gcc/llvm
+    monorepos: ``std`` pulls ONLY the C++ standard-library header trees
+    (``/libstdc++-v3/include/``, ``/libcxx/include/``, ``/stl/inc/``) and NEVER
+    gcc's compiler / libiberty internals, so the per-lib file cap is spent on real
+    ``std::`` headers instead of compiler-internal noise.
+
+    ``extensionless`` additionally admits extensionless std headers (<vector>…).
+    """
+    if path_markers and not any(m in name for m in path_markers):
+        return False
+    ext = os.path.splitext(name)[1].lower()
+    if ext in index_exts:
+        return True
+    if extensionless and ext == "" and _is_extensionless_header(name):
+        return True
+    return False
+
+
+def _find_extensionless_headers(dest: Path) -> list[str]:
+    """Discover EXTENSIONLESS public std headers under ``dest`` (<vector>, …).
+
+    ``ip.find_cpp_files`` filters by INDEX_EXTENSIONS and therefore skips the
+    extensionless libstdc++/libc++ public headers entirely. We augment discovery
+    with them (bounded by the same per-file size cap) so they are parsed.
+    """
+    out: list[str] = []
+    for root, _dirs, files in os.walk(dest):
+        for fn in files:
+            full = os.path.join(root, fn)
+            if not _is_extensionless_header(full):
+                continue
+            try:
+                if os.path.getsize(full) > MAX_BYTES_PER_FILE:
+                    continue
+            except OSError:
+                continue
+            out.append(full)
+    return out
+
+
 def extract_subtrees(tarball: Path, subtrees: list[str], dest: Path,
-                     *, max_files: int, member_cap: int | None = None) -> int:
+                     *, max_files: int, member_cap: int | None = None,
+                     path_markers: list[str] | None = None,
+                     extensionless: bool = False) -> int:
     """Stream the tarball and extract members under cpp_all/<subtree>/ that are
     C/C++ source/header files, up to ``max_files`` per call.
 
@@ -338,8 +479,8 @@ def extract_subtrees(tarball: Path, subtrees: list[str], dest: Path,
             name = member.name
             if not name.startswith(wanted_prefixes):
                 continue
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in index_exts:
+            if not _member_is_wanted(name, index_exts, path_markers=path_markers,
+                                     extensionless=extensionless):
                 continue
             if member.size > MAX_BYTES_PER_FILE:
                 continue
@@ -419,8 +560,11 @@ def extract_many_subtrees(tarball: Path, lib_specs: dict[str, dict], dest_root: 
             lib = prefix_to_lib[matched_prefix]
             if counts[lib] >= max_files:
                 continue
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in index_exts:
+            lspec = lib_specs[lib]
+            if not _member_is_wanted(
+                    name, index_exts,
+                    path_markers=lspec.get("include_path_markers"),
+                    extensionless=bool(lspec.get("index_extensionless_headers"))):
                 continue
             if member.size > MAX_BYTES_PER_FILE:
                 continue
@@ -535,10 +679,20 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
     subtrees = spec["subtrees"]
     tier = spec["tier"]
     public_only = spec["public_only"]
+    namespace_prefixes = tuple(spec.get("namespace_prefixes") or ())
     lang = spec.get("lang", "c++")
     res = LibResult(lib=lib, tier=tier, subtrees=subtrees)
 
     cpp_files = ip.find_cpp_files(str(dest))
+    if spec.get("index_extensionless_headers"):
+        # ip.find_cpp_files skips extensionless files; the libstdc++/libc++ public
+        # headers (<vector>, <type_traits>, ...) are extensionless, so add them or
+        # the std public surface is never parsed (a C2 root cause).
+        seen = set(cpp_files)
+        for fp in _find_extensionless_headers(dest):
+            if fp not in seen:
+                cpp_files.append(fp)
+                seen.add(fp)
     res.n_files = len(cpp_files)
     if res.n_files == 0:
         raise RuntimeError(
@@ -573,9 +727,9 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 res.n_errors += 1
                 continue
             for d in func_dicts:
-                qn = d["qualified_name"]
+                qn = normalize_inline_namespace_qname(d["qualified_name"])
                 frel = d["file"]
-                if not is_public_symbol(qn, frel, public_only):
+                if not is_public_symbol(qn, frel, public_only, namespace_prefixes):
                     continue
                 body = d["text"]
                 blen = normalized_body_len(body)
@@ -590,9 +744,9 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 res.n_funcs += 1
                 res.func_qnames.add(qn)
             for d in type_dicts:
-                qn = d["qualified_name"]
+                qn = normalize_inline_namespace_qname(d["qualified_name"])
                 frel = d["file"]
-                if not is_public_symbol(qn, frel, public_only):
+                if not is_public_symbol(qn, frel, public_only, namespace_prefixes):
                     continue
                 body = d["text"]
                 blen = normalized_body_len(body)
@@ -630,6 +784,8 @@ def index_one_lib(lib: str, spec: dict, tarball: Path, store: GlobalSymbolStore,
         n_extracted = extract_subtrees(
             tarball, spec["subtrees"], dest, max_files=max_files,
             member_cap=member_cap,
+            path_markers=spec.get("include_path_markers"),
+            extensionless=bool(spec.get("index_extensionless_headers")),
         )
         if n_extracted == 0:
             raise RuntimeError(

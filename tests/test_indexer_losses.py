@@ -11,13 +11,21 @@ from cppmega_mlx.training.block_contrastive import (
     hard_negative_blocks,
 )
 from cppmega_mlx.training.indexer_losses import (
+    apply_graph_indexer_bias,
     dense_attn_topk_overlap,
     edge_targets_from_candidates,
     indexer_coverage_hinge_loss,
     indexer_edge_bce_loss,
     indexer_kl_warmup_loss,
     recall_at_k,
+    select_graph_biased_topk,
     total_indexer_loss,
+)
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.nn.code_graph_routes import (
+    GraphRouteConfig,
+    build_attention_bias,
+    build_block_candidates,
 )
 
 
@@ -88,6 +96,114 @@ def test_coverage_hinge_zero_when_edges_in_topk():
     et = mx.array(np.array([[[1.0, 0.0, 0.0, 0.0]]], dtype=np.float32))
     cov = indexer_coverage_hinge_loss(s, et, topk=1, margin=1.0)
     assert float(cov) == 0.0
+
+
+def test_apply_graph_indexer_bias_broadcasts_and_preserves_masks():
+    scores = mx.array(
+        np.array(
+            [
+                [
+                    [0.0, 1.0, -1e9],
+                    [0.0, 1.0, 2.0],
+                    [0.0, 1.0, 2.0],
+                ],
+                [
+                    [3.0, 2.0, -1e9],
+                    [3.0, 2.0, 1.0],
+                    [3.0, 2.0, 1.0],
+                ],
+            ],
+            dtype=np.float32,
+        )
+    )
+    graph_bias = mx.array(
+        np.array(
+            [
+                [0.0, 0.0, 100.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+
+    biased = apply_graph_indexer_bias(scores, graph_bias, beta=10.0)
+    out = np.asarray(biased)
+    assert tuple(biased.shape) == (2, 3, 3)
+    assert out[0, 1, 0] == 10.0
+    assert out[1, 2, 1] == 22.0
+    # A positive graph prior must not resurrect causally/explicitly masked slots.
+    assert out[0, 0, 2] < -1e8
+    assert out[1, 0, 2] < -1e8
+
+
+def test_select_graph_biased_topk_uses_code_graph_routes_for_recall():
+    packet = GraphPacket(
+        edges={
+            "call": EdgeIndex.from_pairs(
+                [[0, 4], [1, 5], [6, 2]], relation="call", num_nodes=8
+            )
+        },
+        num_nodes=8,
+    )
+    cfg = GraphRouteConfig(num_blocks=4, relations=("call",), normalize="binary")
+    graph_bias = build_attention_bias(packet, config=cfg)
+    candidates = build_block_candidates(packet, config=cfg)
+    targets = edge_targets_from_candidates(candidates, num_blocks=4, batch=1)
+
+    # Flat neural scores select block 0 by deterministic argsort.  The graph
+    # prior should move rows 0 and 3 to their true dependency blocks: 2 and 1.
+    scores = mx.zeros((1, 4, 4), dtype=mx.float32)
+    selected_off, final_off = select_graph_biased_topk(
+        scores, topk=1, causal=False
+    )
+    selected_on, final_on = select_graph_biased_topk(
+        scores, graph_bias=graph_bias, beta=20.0, topk=1, causal=False
+    )
+
+    assert recall_at_k(final_off, targets, topk=1) == 0.0
+    assert recall_at_k(final_on, targets, topk=1) == 1.0
+    off = np.asarray(selected_off)
+    on = np.asarray(selected_on)
+    assert off[0, 0, 0] == 0
+    assert on[0, 0, 0] == 2
+    assert on[0, 3, 0] == 1
+
+
+def test_graph_biased_scores_feed_total_indexer_loss_and_beta_grad():
+    packet = GraphPacket(
+        edges={
+            "call": EdgeIndex.from_pairs(
+                [[0, 4], [1, 5], [6, 2]], relation="call", num_nodes=8
+            )
+        },
+        num_nodes=8,
+    )
+    cfg = GraphRouteConfig(num_blocks=4, relations=("call",), normalize="binary")
+    graph_bias = build_attention_bias(packet, config=cfg)
+    targets = edge_targets_from_candidates(
+        build_block_candidates(packet, config=cfg), num_blocks=4, batch=1
+    )
+    scores = mx.zeros((1, 4, 4), dtype=mx.float32)
+
+    def loss_fn(beta):
+        biased = apply_graph_indexer_bias(scores, graph_bias, beta=beta)
+        total, _ = total_indexer_loss(
+            biased,
+            edge_targets=targets,
+            topk=1,
+            bce_coeff=1.0,
+            coverage_coeff=1.0,
+        )
+        return total
+
+    beta0 = mx.array(0.0, dtype=mx.float32)
+    loss0, grad = mx.value_and_grad(loss_fn)(beta0)
+    loss1 = loss_fn(mx.array(10.0, dtype=mx.float32))
+    assert np.isfinite(float(loss0))
+    assert np.isfinite(float(grad))
+    assert float(grad) < 0.0
+    assert float(loss1) < float(loss0)
 
 
 def test_dense_attn_topk_overlap_perfect():

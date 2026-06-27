@@ -3,20 +3,36 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = "scripts/drop_invalid_packed_parquet_rows.py"
+
+
+def _loss_mask_for_doc_ids(doc_ids: list[int], *, valid: int, length: int) -> list[int]:
+    mask: list[int] = []
+    for pos in range(length):
+        if pos + 1 >= valid:
+            mask.append(0)
+        else:
+            mask.append(1 if doc_ids[pos] == doc_ids[pos + 1] else 0)
+    return mask
+
 
 def _row(length: int, *, valid: int | None = None) -> dict:
     valid = length if valid is None else valid
+    doc_ids = [7] * valid + [0] * (length - valid)
+    loss_mask = _loss_mask_for_doc_ids(doc_ids, valid=valid, length=length)
     return {
         "input_ids": [1] * valid + [0] * (length - valid),
         "target_ids": [1] * valid + [0] * (length - valid),
-        "loss_mask": [1] * valid + [0] * (length - valid),
-        "doc_ids": [7] * valid + [0] * (length - valid),
+        "loss_mask": loss_mask,
+        "doc_ids": doc_ids,
         "valid_token_count": valid,
-        "trained_token_count": valid,
+        "trained_token_count": sum(loss_mask),
         "slack_tokens": length - valid,
         "source_doc_ids": [1],
         "source_doc_token_lengths": [valid],
@@ -47,6 +63,119 @@ def _row(length: int, *, valid: int | None = None) -> dict:
         "changed_chunk_ids": [],
         "changed_chunk_spans": [],
     }
+
+
+def _multidoc_row(length: int, *, doc_lengths: tuple[int, ...], valid: int | None = None) -> dict:
+    """A realistic packed row spanning >=2 distinct documents (>=2 doc_ids segments)."""
+    valid = length if valid is None else valid
+    assert sum(doc_lengths) == valid, "doc_lengths must fill the valid region"
+    doc_ids: list[int] = []
+    for i, doc_len in enumerate(doc_lengths):
+        doc_ids.extend([7 + 2 * i] * doc_len)
+    doc_ids.extend([0] * (length - valid))
+    row = _row(length, valid=valid)
+    row["doc_ids"] = doc_ids
+    row["loss_mask"] = _loss_mask_for_doc_ids(doc_ids, valid=valid, length=length)
+    row["trained_token_count"] = sum(row["loss_mask"])
+    return row
+
+
+def test_broken_input_file_fails_loud_by_default(tmp_path):
+    # Real, valid multi-document packed rows alongside a deliberately corrupt
+    # ".parquet" file in the same numeric bucket directory. The corrupt file is
+    # genuine on-disk bytes that are NOT a valid parquet container, so
+    # pq.read_table raises while reading it (a real read/schema failure).
+    root = tmp_path / "commits"
+    bucket_dir = root / "8"
+    bucket_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _multidoc_row(8, doc_lengths=(3, 5)),    # valid (kept)
+                _multidoc_row(11, doc_lengths=(4, 7)),   # over-bucket (would drop)
+            ]
+        ),
+        bucket_dir / "good.parquet",
+    )
+    broken = bucket_dir / "broken.parquet"
+    broken.write_bytes(b"PAR0 this is not a real parquet container \x00\x01\x02\x03")
+
+    report = tmp_path / "drop_report.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            SCRIPT,
+            str(root),
+            "--workers",
+            "1",
+            "--report",
+            str(report),
+        ],
+        cwd=str(REPO_ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    # RULE #1: a per-file read/schema failure must be fatal BY DEFAULT, with no
+    # opt-in flag required. The OLD code swallowed the exception into a report
+    # entry and returned 0; this assertion fails against that behavior.
+    assert result.returncode != 0, (
+        "expected non-zero exit on a broken input file by default; "
+        f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # Crash names WHERE it failed.
+    assert "broken.parquet" in result.stderr, result.stderr
+
+
+def test_continue_on_error_records_failure_but_still_exits_nonzero(tmp_path):
+    # Same fixture as above, but with the explicit --continue-on-error opt-in:
+    # the broken file is recorded and the healthy file is still cleaned, yet the
+    # exit code is STILL non-zero because a file failed.
+    root = tmp_path / "commits"
+    bucket_dir = root / "8"
+    bucket_dir.mkdir(parents=True)
+    good = bucket_dir / "good.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _multidoc_row(8, doc_lengths=(3, 5)),    # valid (kept)
+                _multidoc_row(11, doc_lengths=(4, 7)),   # over-bucket (dropped)
+            ]
+        ),
+        good,
+    )
+    broken = bucket_dir / "broken.parquet"
+    broken.write_bytes(b"PAR0 this is not a real parquet container \x00\x01\x02\x03")
+
+    report = tmp_path / "drop_report.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            SCRIPT,
+            str(root),
+            "--workers",
+            "1",
+            "--continue-on-error",
+            "--report",
+            str(report),
+        ],
+        cwd=str(REPO_ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    # Explicit opt-in keeps processing other files, but exit is STILL non-zero.
+    assert result.returncode == 2, (
+        f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    summary = json.loads(report.read_text())
+    assert summary["total"]["error_files"] == 1
+    # The healthy file was still cleaned: its over-bucket row was dropped.
+    assert summary["total"]["dropped_rows"] == 1
+    assert pq.read_table(good).num_rows == 1
+    assert good.with_name(good.name + ".pre_validity_fix").exists()
 
 
 def test_drop_invalid_rows_removes_over_bucket_rows_and_audit_passes(tmp_path):

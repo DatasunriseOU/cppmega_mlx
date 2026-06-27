@@ -41,6 +41,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.render_sidecar_example import get_tokenizer
 
+# Reuse the producer's EXACT inter-document loss-mask rule so the boundary fixer
+# can never drift from pack_enriched_rows: loss_mask[pos] == 1 iff
+# doc_ids[pos] == doc_ids[pos + 1] within the valid prefix (0 at every
+# inter-document boundary, at the final valid token, and across padding).
+from scripts.nanochat_data.pack_enriched_rows import _loss_mask_for_packed_docs
+
 
 PAD_ID = 0
 BOS_ID = 2
@@ -283,15 +289,36 @@ def repair_row(row: dict[str, Any], pieces: TokenPieces) -> tuple[dict[str, Any]
     repaired_ids = repaired_ids[:new_valid] + [PAD_ID] * (capacity - new_valid)
     repaired["input_ids"] = repaired_ids
     repaired["target_ids"] = repaired_ids[1:] + [PAD_ID]
-    repaired["loss_mask"] = [1] * max(new_valid - 1, 0) + [0] * (capacity - max(new_valid - 1, 0))
     repaired["valid_token_count"] = new_valid
-    repaired["trained_token_count"] = max(new_valid - 1, 0)
     repaired["slack_tokens"] = capacity - new_valid
 
     for col in TOKEN_ALIGNED_COLUMNS:
         values = repaired.get(col)
         if isinstance(values, list) and len(values) == capacity:
             repaired[col] = _insert_token_aligned(values, positions, old_valid, capacity)
+
+    # Rebuild loss_mask / trained_token_count from the REPAIRED doc_ids (above),
+    # NOT as all-ones.  ``doc_ids`` is a TOKEN_ALIGNED_COLUMN, so it has already
+    # been shifted for the inserted <NL> tokens by the loop above.  An all-ones
+    # mask would silently train the model to predict document B's first token
+    # from document A's last token across unrelated packed commits and inflate
+    # trained_token_count by num_docs-1 on every multi-doc row.  We instead apply
+    # the producer's exact rule over the valid prefix so the two paths cannot
+    # drift (pad region of doc_ids holds the constant pad_doc_id and must be
+    # excluded, mirroring how the packer passes only the unpadded valid doc_ids).
+    repaired_doc_ids = repaired.get("doc_ids")
+    if not isinstance(repaired_doc_ids, list) or len(repaired_doc_ids) != capacity:
+        raise ValueError(
+            "repair_row: repaired doc_ids missing or wrong length "
+            f"(expected list of length {capacity}, got "
+            f"type={type(repaired_doc_ids).__name__} "
+            f"len={len(repaired_doc_ids) if isinstance(repaired_doc_ids, list) else 'n/a'}); "
+            "cannot recompute inter-document loss_mask"
+        )
+    valid_doc_ids = [int(x) for x in repaired_doc_ids[:new_valid]]
+    loss_mask = _loss_mask_for_packed_docs(valid_doc_ids, target_length=capacity)
+    repaired["loss_mask"] = loss_mask
+    repaired["trained_token_count"] = sum(loss_mask)
 
     for col in TOKEN_OFFSET_LIST_COLUMNS:
         values = repaired.get(col)

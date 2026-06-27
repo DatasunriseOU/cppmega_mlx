@@ -108,9 +108,14 @@ def connect(store_path: str, create: bool = True) -> sqlite3.Connection:
         os.makedirs(d, exist_ok=True)
     conn = sqlite3.connect(store_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
+    # Set busy_timeout FIRST. The parallel graphql_pr_stream --workers path opens
+    # many writer connections concurrently; with the timeout in place the WAL
+    # switch and the CREATE TABLE statements below WAIT for a competing writer
+    # instead of erroring out with "database is locked" (fail-loud preserved:
+    # SQLite still raises if the lock is not released within the timeout).
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=60000")
     conn.executescript(SCHEMA)
     return conn
 

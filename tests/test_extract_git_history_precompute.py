@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,117 @@ def test_precomputed_cpp_files_feed_commit_diffs(tmp_path):
     assert diffs[0]["filepath"] == "main.cpp"
     assert "return 1" in diffs[0]["old_content"]
     assert "return 2" in diffs[0]["new_content"]
+
+
+def _write_main(repo: Path, first_line: str, last_line: str) -> None:
+    """Write main.cpp with a fixed body so only the first/last line vary.
+
+    The four "// pad" lines keep the (changeable) first line and the
+    (oversizable) last line more than 3 lines apart, so a small edit to the
+    first line never pulls the huge last line into the diff hunk's context.
+    """
+    (repo / "main.cpp").write_text(
+        f"{first_line}\n"
+        "// pad1\n"
+        "// pad2\n"
+        "// pad3\n"
+        "// pad4\n"
+        f"{last_line}\n",
+        encoding="utf-8",
+    )
+
+
+def _build_diff_filtered_repo(tmp_path):
+    """Repo whose middle commit is rejected by the diff-size gate.
+
+    Returns ``(repo, c1, c2, c3)`` where main.cpp is modified by:
+      * c1: small diff  -> accepted (expected file_local_commit_index 0)
+      * c2: diff > MAX_DIFF_CHARS -> REJECTED by get_commit_diffs (no record)
+      * c3: small diff  -> accepted (expected file_local_commit_index 1)
+    """
+    import extract_git_history as egh
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+
+    # Root commit: main.cpp is Added (status 'A'), so it is never an 'M' record
+    # and never enters the index.
+    _write_main(repo, "int v = 0;", "// small")
+    _git(repo, "add", "main.cpp")
+    _commit(repo, "initial")
+
+    _write_main(repo, "int v = 1;", "// small")
+    c1 = _commit(repo, "first real edit")
+
+    # Oversized diff: the changed last line alone blows past MAX_DIFF_CHARS, so
+    # get_commit_diffs rejects this commit. new_content stays under the 200000
+    # content cap, so ONLY the diff-size gate filters it out.
+    huge = "// " + ("x" * (egh.MAX_DIFF_CHARS + 10000))
+    _write_main(repo, "int v = 1;", huge)
+    c2 = _commit(repo, "oversized diff edit")
+
+    _write_main(repo, "int v = 2;", huge)
+    c3 = _commit(repo, "second real edit")
+
+    return repo, c1, c2, c3
+
+
+def test_file_local_commit_index_excludes_diff_filtered_commits(tmp_path):
+    """A diff-filtered commit must NOT advance the per-file index counter.
+
+    Pins the exact sequence so the documented "same semantics as the original
+    post-diff-filter counting" cannot drift silently. Fails on the buggy
+    name-status counting (which gives c3 -> 2 because the rejected c2 is
+    counted) and passes on the post-diff-filter counting (c3 -> 1).
+    """
+    import extract_git_history as egh
+
+    repo, c1, c2, c3 = _build_diff_filtered_repo(tmp_path)
+    commits = [c3, c2, c1]  # newest-first, matching git log output
+
+    # c2 is genuinely diff-filtered out of the emitted set; c1/c3 are not.
+    assert egh.get_commit_diffs(str(repo), c2) is None
+    assert egh.get_commit_diffs(str(repo), c1) is not None
+    assert egh.get_commit_diffs(str(repo), c3) is not None
+
+    indices, files_by_commit = egh.precompute_cpp_file_changes(str(repo), commits)
+
+    assert indices[(c1, "main.cpp")] == 0
+    assert indices[(c3, "main.cpp")] == 1  # contiguous: NOT 2
+    assert (c2, "main.cpp") not in indices
+    assert c2 not in files_by_commit
+    # files_by_commit carries only ACCEPTED (post-diff-filter) files forward.
+    assert files_by_commit[c1] == ["main.cpp"]
+    assert files_by_commit[c3] == ["main.cpp"]
+
+
+def test_emitted_records_carry_contiguous_indices_end_to_end(tmp_path):
+    """End-to-end: the indices written into JSONL records are contiguous.
+
+    Exercises the real process_repo emit path (no mocks). The rejected c2 is
+    absent and c3's emitted file_local_commit_index is 1, not 2.
+    """
+    import extract_git_history as egh
+
+    repo, c1, c2, c3 = _build_diff_filtered_repo(tmp_path)
+
+    out = tmp_path / "commits.jsonl"
+    with out.open("w", encoding="utf-8") as fh:
+        egh.process_repo(str(repo), fh, repo_name="repo", notes="off")
+
+    records = [
+        json.loads(line) for line in out.read_text().splitlines() if line.strip()
+    ]
+    main_records = [r for r in records if r["filepath"] == "main.cpp"]
+    index_by_commit = {
+        r["commit_hash"]: r["file_local_commit_index"] for r in main_records
+    }
+
+    assert len(main_records) == 2  # c1 and c3 only; c2 filtered out
+    assert c2 not in index_by_commit
+    assert index_by_commit[c1] == 0
+    assert index_by_commit[c3] == 1  # the rejected commit did not inflate it
 
 
 def test_output_file_lock_rejects_second_process(tmp_path):

@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Graph-Routed C/C++ World Model</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #14161a;
+        --muted: #5a6372;
+        --line: #d9dde5;
+        --paper: #ffffff;
+        --soft: #f4f6f8;
+        --route: #0f766e;
+        --build: #b45309;
+        --diag: #b91c1c;
+        --model: #1d4ed8;
+        --code: #263238;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--paper);
+        line-height: 1.55;
+      }
+
+      a {
+        color: #0b5cad;
+        text-decoration-thickness: 1px;
+        text-underline-offset: 3px;
+      }
+
+      .page {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 40px 22px 64px;
+      }
+
+      header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 24px;
+        align-items: end;
+        padding-bottom: 24px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(2.1rem, 4vw, 4.4rem);
+        line-height: 0.95;
+        letter-spacing: 0;
+      }
+
+      .lede {
+        max-width: 820px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 1.05rem;
+      }
+
+      .badge {
+        border: 1px solid var(--line);
+        background: var(--soft);
+        border-radius: 8px;
+        padding: 10px 12px;
+        color: var(--muted);
+        font-size: 0.88rem;
+        white-space: nowrap;
+      }
+
+      main {
+        display: grid;
+        gap: 34px;
+        margin-top: 34px;
+      }
+
+      section {
+        border-top: 1px solid var(--line);
+        padding-top: 24px;
+      }
+
+      section:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      h2 {
+        margin: 0 0 14px;
+        font-size: 1.55rem;
+        line-height: 1.15;
+        letter-spacing: 0;
+      }
+
+      h3 {
+        margin: 0 0 8px;
+        font-size: 1rem;
+        letter-spacing: 0;
+      }
+
+      p {
+        margin: 0 0 14px;
+      }
+
+      .grid-2 {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px;
+        min-height: 154px;
+        background: #fff;
+      }
+
+      .card p {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .tag {
+        display: inline-block;
+        margin-bottom: 10px;
+        border-radius: 999px;
+        padding: 3px 9px;
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: #fff;
+      }
+
+      .tag.route { background: var(--route); }
+      .tag.build { background: var(--build); }
+      .tag.diag { background: var(--diag); }
+      .tag.model { background: var(--model); }
+
+      .diagram {
+        display: grid;
+        grid-template-columns: 1fr 34px 1fr 34px 1fr;
+        gap: 10px;
+        align-items: stretch;
+        margin: 18px 0;
+      }
+
+      .lane {
+        display: grid;
+        gap: 10px;
+      }
+
+      .node {
+        border: 1px solid var(--line);
+        border-left: 5px solid var(--model);
+        border-radius: 8px;
+        background: var(--soft);
+        padding: 12px;
+        min-height: 82px;
+      }
+
+      .node.route { border-left-color: var(--route); }
+      .node.build { border-left-color: var(--build); }
+      .node.diag { border-left-color: var(--diag); }
+
+      .node strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .node span {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .arrow {
+        display: grid;
+        place-items: center;
+        color: var(--muted);
+        font-weight: 800;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        font-size: 0.94rem;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 12px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        background: var(--soft);
+        font-weight: 700;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      code {
+        color: var(--code);
+        background: #eef1f4;
+        border-radius: 5px;
+        padding: 1px 5px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        font-size: 0.9em;
+      }
+
+      pre {
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #111827;
+        color: #f9fafb;
+        padding: 14px;
+      }
+
+      pre code {
+        color: inherit;
+        background: transparent;
+        padding: 0;
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 20px;
+      }
+
+      .source-columns {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .source-columns li {
+        margin: 0 0 6px;
+      }
+
+      .callout {
+        border: 1px solid #f0d49b;
+        border-left: 5px solid var(--build);
+        border-radius: 8px;
+        background: #fff8eb;
+        padding: 14px;
+      }
+
+      @media (max-width: 900px) {
+        header,
+        .grid-2,
+        .cards,
+        .source-columns {
+          grid-template-columns: 1fr;
+        }
+
+        .badge {
+          white-space: normal;
+        }
+
+        .diagram {
+          grid-template-columns: 1fr;
+        }
+
+        .arrow {
+          min-height: 22px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <div>
+          <h1>Graph-Routed C/C++ World Model</h1>
+          <p class="lede">
+            Cppmega world models are not generic language models. Every sample
+            carries graph routes and domain-special-token-wrapped C++/build/shell/diagnostic
+            streams so sparse attention is selected from compiler and environment evidence.
+          </p>
+        </div>
+        <div class="badge">Docs-only design contract</div>
+      </header>
+
+      <main>
+        <section>
+          <h2>Mandatory Surfaces</h2>
+          <div class="grid-2">
+            <div>
+              <p>
+                The token stream is a typed transcript. Source is wrapped with
+                code markers; build, shell, tool, and diagnostic spans are
+                represented with tool/result or diagnostic wrappers. The current
+                local anchors are the stable special-token contract, C++ tokenizer,
+                and platform-context renderer.
+              </p>
+              <p>
+                Dense text-only experiments can remain baselines, but they are
+                not cppmega world models unless both mandatory surfaces are present.
+              </p>
+            </div>
+            <div class="callout">
+              <strong>Invariant</strong>
+              <p>
+                Graph bias must be applied before top-k selection. Route metadata
+                is not optional retrieval context and must not be replaced by prose.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Architecture</h2>
+          <div class="diagram" aria-label="Architecture diagram">
+            <div class="lane">
+              <div class="node build">
+                <strong>Evidence</strong>
+                <span>libclang, commits, build profiles, shell output, diagnostics</span>
+              </div>
+              <div class="node">
+                <strong>Packets</strong>
+                <span>CodePacket and TrajectoryPacket bind tokens, chunks, graph edges, edits</span>
+              </div>
+            </div>
+            <div class="arrow">&rarr;</div>
+            <div class="lane">
+              <div class="node">
+                <strong>Domain Stream</strong>
+                <span>&lt;CODE_START&gt;, &lt;CODE_END&gt;, tool spans, platform context</span>
+              </div>
+              <div class="node route">
+                <strong>GraphPacket</strong>
+                <span>call, type, def_use, include, build_error, diagnostic routes</span>
+              </div>
+            </div>
+            <div class="arrow">&rarr;</div>
+            <div class="lane">
+              <div class="node route">
+                <strong>CodeGraphRouter</strong>
+                <span>fixed route topology, learned relation-channel mixing</span>
+              </div>
+              <div class="node model">
+                <strong>DSA + SparseMLA</strong>
+                <span>I_final = I_neural + beta * S_graph, then graph-biased top-k</span>
+              </div>
+              <div class="node diag">
+                <strong>Stable Loop</strong>
+                <span>constrained edit, validate, enrich diagnostics, re-index next state</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Domain Wrappers</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>Wrapper contract</th>
+                <th>Source anchors</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>C/C++ source</td>
+                <td><code>&lt;CODE_START&gt; ... &lt;CODE_END&gt;</code>, code-aware whitespace, file/chunk offsets, platform context</td>
+                <td><a href="../cppmega_mlx/data/tokenizer_contract.py">tokenizer_contract.py</a>, <a href="../cppmega_mlx/tokenizer/cpp_tokenizer.py">cpp_tokenizer.py</a>, <a href="../cppmega_mlx/data/platform_context.py">platform_context.py</a></td>
+              </tr>
+              <tr>
+                <td>Build</td>
+                <td>Tool query/result span with compiler, flags, target triple, exit status, stdout/stderr</td>
+                <td><a href="../cppmega_v4/buildspec/api.py">buildspec/api.py</a>, <a href="../../cppmega/cppmega/recipes/run_profiles.py">../cppmega run_profiles.py</a></td>
+              </tr>
+              <tr>
+                <td>Shell</td>
+                <td>Command/cwd/env profile, stdout/stderr, exit status, touched artifact hints</td>
+                <td><a href="../../cppmega/docs/status/cppmega_run_profiles_and_token_flow.md">run profile and token flow</a></td>
+              </tr>
+              <tr>
+                <td>Diagnostics</td>
+                <td>Error code, source range, symbol, build profile, prior transition link where available</td>
+                <td><a href="../cppmega_v4/buildspec/diagnostics.py">buildspec/diagnostics.py</a>, <a href="../tools/clang_indexer/process_commits.py">process_commits.py</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Route Families</h2>
+          <div class="cards">
+            <div class="card">
+              <span class="tag route">Implemented</span>
+              <h3>call</h3>
+              <p>Caller/callee or use-to-definition call structure, currently routed through graph packets and sidecars.</p>
+            </div>
+            <div class="card">
+              <span class="tag route">Implemented</span>
+              <h3>type</h3>
+              <p>Token or symbol to type relation. Required by type-aware probe requirements and graph routes.</p>
+            </div>
+            <div class="card">
+              <span class="tag model">Promote</span>
+              <h3>def_use</h3>
+              <p>Value-origin and data-flow relation. Present in packet semantics and graph examples, should become a route family.</p>
+            </div>
+            <div class="card">
+              <span class="tag diag">Design target</span>
+              <h3>build_error</h3>
+              <p>Compiler, linker, test, and build-spec failures connected to source spans, symbols, and build commands.</p>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>DSA, Top-k, And Loss</h2>
+          <p>
+            The graph router builds a relation/block bias <code>S_graph</code>.
+            The indexer applies <code>I_final = I_neural + beta * S_graph</code>
+            before top-k selection. Losses combine dense-attention KL warm-up,
+            graph edge BCE, coverage hinge loss, recall-at-k, and top-k overlap
+            metrics.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Layer</th>
+                <th>Contract</th>
+                <th>Live source</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Graph router</td>
+                <td>Fixed route topology with learned relation weights; fail loudly on missing required relations</td>
+                <td><a href="../cppmega_mlx/nn/code_graph_routes.py">code_graph_routes.py</a></td>
+              </tr>
+              <tr>
+                <td>Indexer loss</td>
+                <td>Apply graph bias before top-k and supervise graph coverage</td>
+                <td><a href="../cppmega_mlx/training/indexer_losses.py">indexer_losses.py</a></td>
+              </tr>
+              <tr>
+                <td>MLX sparse attention</td>
+                <td>Consume sparse top-k indices; invalid slots use <code>-1</code></td>
+                <td><a href="../cppmega_mlx/nn/sparse_mla.py">sparse_mla.py</a></td>
+              </tr>
+              <tr>
+                <td>Megatron bridge</td>
+                <td>Avoid full index-score materialization and carry graph sidecars into the batch</td>
+                <td><a href="../../cppmega/cppmega/megatron/dsa_indexer_fused_patch.py">dsa_indexer_fused_patch.py</a>, <a href="../../cppmega/cppmega/megatron/structure_dataset_patch.py">structure_dataset_patch.py</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>LoopWM Stable Loop</h2>
+          <pre><code>observe(domain stream + graph routes)
+  -> predict constrained edit/action
+  -> validate tokenizer, syntax, graph alignment, build/test
+  -> convert failures to diagnostics and build_error routes
+  -> re-index source/build state
+  -> next TrajectoryPacket transition</code></pre>
+          <p>
+            The local trajectory contract is in
+            <a href="../cppmega_mlx/data/trajectory_packet.py">trajectory_packet.py</a>.
+            LoopWM is used as an architectural direction: reuse a stable transition
+            loop over typed state and refresh routes on each step, instead of
+            letting untyped text rollouts drift away from buildable C++.
+          </p>
+        </section>
+
+        <section>
+          <h2>Constrained Valid-Code Generation</h2>
+          <ul>
+            <li>Code is generated only inside source wrappers.</li>
+            <li>Build, shell, and diagnostic content is generated only inside its domain wrapper.</li>
+            <li>Generated edits must match token ranges and chunk metadata before entering the next state.</li>
+            <li>Syntax, build, and test failures become diagnostic streams plus graph routes.</li>
+            <li>Strict verification should fail closed, matching the build-spec diagnostics pattern.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>Source Links</h2>
+          <div class="source-columns">
+            <div>
+              <h3>cppmega.mlx</h3>
+              <ul>
+                <li><a href="graph_supervised_dsa_indexer.md">graph_supervised_dsa_indexer.md</a></li>
+                <li><a href="data_pipeline.md">data_pipeline.md</a></li>
+                <li><a href="side_channel_conditioning_plan.md">side_channel_conditioning_plan.md</a></li>
+                <li><a href="../cppmega_mlx/nn/code_graph_routes.py">code_graph_routes.py</a></li>
+                <li><a href="../cppmega_mlx/data/graph_packet.py">graph_packet.py</a></li>
+                <li><a href="../cppmega_mlx/data/code_packet.py">code_packet.py</a></li>
+                <li><a href="../cppmega_mlx/data/code_packet_builder.py">code_packet_builder.py</a></li>
+                <li><a href="../cppmega_mlx/data/trajectory_packet.py">trajectory_packet.py</a></li>
+                <li><a href="../cppmega_mlx/data/platform_context.py">platform_context.py</a></li>
+                <li><a href="../cppmega_mlx/training/indexer_losses.py">indexer_losses.py</a></li>
+                <li><a href="../cppmega_v4/buildspec/diagnostics.py">buildspec/diagnostics.py</a></li>
+                <li><a href="../tools/clang_indexer/index_project.py">index_project.py</a></li>
+              </ul>
+            </div>
+            <div>
+              <h3>../cppmega</h3>
+              <ul>
+                <li><a href="../../cppmega/cppmega/megatron/structure_dataset_patch.py">structure_dataset_patch.py</a></li>
+                <li><a href="../../cppmega/cppmega/megatron/structure_batch.py">structure_batch.py</a></li>
+                <li><a href="../../cppmega/cppmega/megatron/dsa_indexer_fused_patch.py">dsa_indexer_fused_patch.py</a></li>
+                <li><a href="../../cppmega/cppmega/megatron/dsa_splitk_indexer_loss.py">dsa_splitk_indexer_loss.py</a></li>
+                <li><a href="../../cppmega/cppmega/megatron/dsa_sparse_attention.py">dsa_sparse_attention.py</a></li>
+                <li><a href="../../cppmega/cppmega/megatron/sparse_mla_ops/sparse_mla.py">sparse_mla.py</a></li>
+                <li><a href="../../cppmega/cppmega/megatron/tilelang_sparse_mla/topk_selector.py">topk_selector.py</a></li>
+                <li><a href="../../cppmega/cppmega/recipes/run_profiles.py">run_profiles.py</a></li>
+                <li><a href="../../cppmega/docs/status/cppmega_architecture_status.md">architecture_status.md</a></li>
+                <li><a href="../../cppmega/docs/data_preparation.md">data_preparation.md</a></li>
+              </ul>
+            </div>
+            <div>
+              <h3>External</h3>
+              <ul>
+                <li><a href="https://arxiv.org/abs/2009.08366">GraphCodeBERT</a></li>
+                <li><a href="https://arxiv.org/pdf/2512.02556">DeepSeek-V3.2 DSA</a></li>
+                <li><a href="https://arxiv.org/html/2606.18208v1">Looped World Models</a></li>
+                <li><a href="https://arxiv.org/abs/2606.09806">Topological Neural Operators</a></li>
+                <li><a href="https://clang.llvm.org/docs/LibClang.html">libclang tutorial</a></li>
+                <li><a href="https://ml-explore.github.io/mlx/">MLX docs</a></li>
+                <li><a href="https://huggingface.co/docs/tokenizers/en/index">Hugging Face Tokenizers</a></li>
+                <li><a href="https://tilelang.com/">TileLang docs</a></li>
+                <li><a href="https://github.com/NVIDIA/Megatron-LM">Megatron-LM</a></li>
+                <li><a href="https://github.com/llvm/llvm-project">LLVM corpus source</a></li>
+                <li><a href="https://github.com/boostorg/boost">Boost corpus source</a></li>
+                <li><a href="https://github.com/fmtlib/fmt">{fmt} corpus source</a></li>
+                <li><a href="https://github.com/google/googletest">GoogleTest corpus source</a></li>
+              </ul>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

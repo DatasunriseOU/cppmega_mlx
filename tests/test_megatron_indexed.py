@@ -14,6 +14,7 @@ from numpy.typing import DTypeLike
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
     MegatronIndexedMultiShardDataset,
+    megatron_indexed_graph_sidecar_schema,
     megatron_indexed_side_channel_schema,
     open_megatron_indexed_dataset,
 )
@@ -67,6 +68,77 @@ def _write_mmididx(
         documents.tofile(fh)
         if sequence_modes:
             np.zeros(len(docs), dtype=np.int8).tofile(fh)
+
+
+def _write_graph_sidecars(
+    prefix: Path,
+    *,
+    call_edges: list[np.ndarray],
+    type_edges: list[np.ndarray],
+    chunk_starts: list[np.ndarray],
+    chunk_ends: list[np.ndarray],
+    chunk_kinds: list[np.ndarray],
+    chunk_dep_levels: list[np.ndarray],
+) -> dict[str, object]:
+    def write_edge(name: str, rows: list[np.ndarray]) -> dict[str, object]:
+        offsets = [0]
+        flattened = []
+        total = 0
+        for row in rows:
+            arr = np.asarray(row, dtype=np.int32).reshape(-1, 2)
+            flattened.append(arr)
+            total += int(arr.shape[0])
+            offsets.append(total)
+        data = np.concatenate(flattened, axis=0) if flattened else np.zeros((0, 2), dtype=np.int32)
+        offsets_path = prefix.with_name(f"{prefix.name}_{name}_offsets.bin")
+        data_path = prefix.with_name(f"{prefix.name}_{name}_data.bin")
+        np.asarray(offsets, dtype=np.int64).tofile(offsets_path)
+        data.astype(np.int32, copy=False).tofile(data_path)
+        return {
+            "kind": "edge_pairs",
+            "offsets_path": offsets_path.name,
+            "data_path": data_path.name,
+            "offset_dtype": "int64",
+            "dtype": "int32",
+            "item_count": total,
+            "shape_tail": [2],
+        }
+
+    def write_vector(name: str, rows: list[np.ndarray], dtype: DTypeLike) -> dict[str, object]:
+        dtype = np.dtype(dtype)
+        offsets = [0]
+        flattened = []
+        total = 0
+        for row in rows:
+            arr = np.asarray(row, dtype=dtype).reshape(-1)
+            flattened.append(arr)
+            total += int(arr.shape[0])
+            offsets.append(total)
+        data = np.concatenate(flattened, axis=0) if flattened else np.zeros((0,), dtype=dtype)
+        offsets_path = prefix.with_name(f"{prefix.name}_{name}_offsets.bin")
+        data_path = prefix.with_name(f"{prefix.name}_{name}_data.bin")
+        np.asarray(offsets, dtype=np.int64).tofile(offsets_path)
+        data.tofile(data_path)
+        return {
+            "kind": "ragged_1d",
+            "offsets_path": offsets_path.name,
+            "data_path": data_path.name,
+            "offset_dtype": "int64",
+            "dtype": dtype.name,
+            "item_count": total,
+        }
+
+    return {
+        "graph_sidecar_schema": "cppmega_graph_routes_v1",
+        "graph_sidecar_paths": {
+            "token_call_edges": write_edge("token_call_edges", call_edges),
+            "token_type_edges": write_edge("token_type_edges", type_edges),
+            "token_chunk_starts": write_vector("token_chunk_starts", chunk_starts, np.uint32),
+            "token_chunk_ends": write_vector("token_chunk_ends", chunk_ends, np.uint32),
+            "token_chunk_kinds": write_vector("token_chunk_kinds", chunk_kinds, np.uint16),
+            "token_chunk_dep_levels": write_vector("token_chunk_dep_levels", chunk_dep_levels, np.uint16),
+        },
+    }
 
 
 def _batch_tokens(dataset: MegatronIndexedDataset) -> np.ndarray:
@@ -1068,6 +1140,135 @@ def test_mmididx_token_side_channel_aliases_are_normalized(tmp_path) -> None:
     assert tuple(batch.model_kwargs()) == STRUCTURE_MODEL_KWARG_KEYS
 
 
+def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
+    prefix = tmp_path / "full_cppmega_sidecars"
+    docs = [np.arange(8, dtype=np.int32)]
+    _write_mmididx(prefix, docs, dtype=np.int32)
+    flat = np.concatenate(docs)
+    sidecar_specs = {
+        "token_structure_ids": ((flat % 7).astype(np.uint8), "uint8"),
+        "token_dep_levels": ((flat % 3).astype(np.uint16), "uint16"),
+        "token_ast_depth": ((flat % 5).astype(np.uint16), "uint16"),
+        "token_sibling_index": ((flat % 4).astype(np.uint16), "uint16"),
+        "token_ast_node_type": ((flat % 11).astype(np.uint16), "uint16"),
+        "token_platform_ids": ((flat % 13).astype(np.uint16), "uint16"),
+        "token_symbol_ids": ((flat + 100).astype(np.uint32), "uint32"),
+        "token_call_targets": ((flat + 200).astype(np.uint32), "uint32"),
+        "token_type_refs": ((flat + 300).astype(np.uint32), "uint32"),
+        "token_def_use": ((flat % 2).astype(np.uint8), "uint8"),
+        "token_change_mask_pre": ((flat == 2).astype(np.uint8), "uint8"),
+        "token_change_mask_post": ((flat == 3).astype(np.uint8), "uint8"),
+    }
+    side_channel_paths = {}
+    for name, (values, dtype) in sidecar_specs.items():
+        path = tmp_path / f"{name}.bin"
+        values.tofile(path)
+        side_channel_paths[name] = {"path": path.name, "dtype": dtype}
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps({"side_channel_paths": side_channel_paths}),
+        encoding="utf-8",
+    )
+
+    batch = next(MegatronIndexedDataset(prefix, seq_len=4, batch_size=2).iter_batches())
+
+    np.testing.assert_array_equal(np.array(batch.structure_ids), np.array(batch.tokens) % 7)
+    np.testing.assert_array_equal(np.array(batch.platform_ids), np.array(batch.tokens) % 13)
+    semantic = batch.side_channel_map()["semantic_graph"]
+    temporal = batch.side_channel_map()["temporal_diff"]
+    np.testing.assert_array_equal(
+        np.array(semantic["symbol_ids"]),
+        np.array(batch.tokens) + 100,
+    )
+    np.testing.assert_array_equal(
+        np.array(semantic["call_targets"]),
+        np.array(batch.tokens) + 200,
+    )
+    np.testing.assert_array_equal(
+        np.array(semantic["type_refs"]),
+        np.array(batch.tokens) + 300,
+    )
+    np.testing.assert_array_equal(
+        np.array(semantic["def_use"]),
+        np.array(batch.tokens) % 2,
+    )
+    assert int(np.array(temporal["change_mask_pre"]).sum()) == 1
+    assert int(np.array(temporal["change_mask_post"]).sum()) == 1
+
+
+def test_mmididx_graph_sidecars_are_sequence_aligned_routes(tmp_path) -> None:
+    prefix = tmp_path / "graph_routes"
+    _write_mmididx(
+        prefix,
+        [
+            np.arange(4, dtype=np.int32),
+            np.arange(10, 14, dtype=np.int32),
+        ],
+        dtype=np.int32,
+    )
+    sidecar = _write_graph_sidecars(
+        prefix,
+        call_edges=[
+            np.array([[1, 0], [2, 1]], dtype=np.int32),
+            np.array([[0, 1]], dtype=np.int32),
+        ],
+        type_edges=[
+            np.array([[0, 2]], dtype=np.int32),
+            np.array([], dtype=np.int32).reshape(0, 2),
+        ],
+        chunk_starts=[
+            np.array([0, 1, 3], dtype=np.uint32),
+            np.array([0, 2], dtype=np.uint32),
+        ],
+        chunk_ends=[
+            np.array([1, 3, 4], dtype=np.uint32),
+            np.array([2, 4], dtype=np.uint32),
+        ],
+        chunk_kinds=[
+            np.array([5, 6, 7], dtype=np.uint16),
+            np.array([8, 9], dtype=np.uint16),
+        ],
+        chunk_dep_levels=[
+            np.array([0, 1, 2], dtype=np.uint16),
+            np.array([0, 1], dtype=np.uint16),
+        ],
+    )
+    prefix.with_suffix(".idx.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+    packet0 = dataset.graph_route_packet_for_sample(0)
+    packet1 = dataset.graph_route_packet_for_sample(1)
+
+    assert packet0.num_chunks == 3
+    assert packet0.graph.edge("call").to_pairs() == [(1, 0), (2, 1)]
+    assert packet0.graph.edge("type").to_pairs() == [(0, 2)]
+    np.testing.assert_array_equal(packet0.chunk_starts, np.array([0, 1, 3], dtype=np.int32))
+    np.testing.assert_array_equal(packet0.chunk_ends, np.array([1, 3, 4], dtype=np.int32))
+    np.testing.assert_array_equal(packet0.chunk_kinds, np.array([5, 6, 7], dtype=np.int32))
+    np.testing.assert_array_equal(packet0.chunk_dep_levels, np.array([0, 1, 2], dtype=np.int32))
+    assert packet1.graph.edge("call").to_pairs() == [(0, 1)]
+    assert packet1.graph.edge("type").num_edges == 0
+
+
+def test_mmididx_graph_sidecars_fail_closed_for_window_slicing(tmp_path) -> None:
+    prefix = tmp_path / "graph_routes_long_sequence"
+    _write_mmididx(prefix, [np.arange(8, dtype=np.int32)], dtype=np.int32)
+    sidecar = _write_graph_sidecars(
+        prefix,
+        call_edges=[np.array([[1, 0]], dtype=np.int32)],
+        type_edges=[np.array([], dtype=np.int32).reshape(0, 2)],
+        chunk_starts=[np.array([0, 4], dtype=np.uint32)],
+        chunk_ends=[np.array([4, 8], dtype=np.uint32)],
+        chunk_kinds=[np.array([1, 1], dtype=np.uint16)],
+        chunk_dep_levels=[np.array([0, 1], dtype=np.uint16)],
+    )
+    prefix.with_suffix(".idx.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+    with pytest.raises(NotImplementedError, match="sequence length to equal seq_len"):
+        dataset.graph_route_packet_for_sample(0)
+
+
 def test_mmididx_alias_and_canonical_side_channel_collision_fails_closed(tmp_path) -> None:
     prefix = tmp_path / "duplicate_alias"
     _write_mmididx(prefix, [np.arange(8, dtype=np.int32)], dtype=np.int32)
@@ -1146,6 +1347,7 @@ def test_mmididx_cross_location_alias_and_canonical_collision_fails_closed(
 
 def test_megatron_indexed_side_channel_schema_documents_aliases_and_dtypes() -> None:
     schema = megatron_indexed_side_channel_schema()
+    graph_schema = megatron_indexed_graph_sidecar_schema()
 
     assert schema["attention_mask"]["default_dtype"] == "float32"
     assert schema["attention_mask"]["target_dtype"] == "float32"
@@ -1156,12 +1358,19 @@ def test_megatron_indexed_side_channel_schema_documents_aliases_and_dtypes() -> 
     assert isinstance(ast_depth_aliases, list)
     assert "token_structure_ids" in structure_aliases
     assert "token_ast_depth" in ast_depth_aliases
+    assert "token_symbol_ids" in schema["symbol_ids"]["aliases"]
+    assert schema["symbol_ids"]["family"] == "semantic_graph"
+    assert schema["change_mask_pre"]["family"] == "temporal_diff"
     assert schema["structure_ids"]["default_dtype"] == "int32"
     assert schema["structure_ids"]["target_dtype"] == "int32"
     assert schema["structure_ids"]["model_kwarg"] is True
     structure_dtypes = schema["structure_ids"]["allowed_dtypes"]
     assert isinstance(structure_dtypes, list)
     assert "float32" not in structure_dtypes
+    assert graph_schema["token_call_edges"]["kind"] == "edge_pairs"
+    assert graph_schema["token_call_edges"]["shape_tail"] == [2]
+    assert graph_schema["token_chunk_starts"]["dtype"] == "uint32"
+    assert graph_schema["token_chunk_dep_levels"]["kind"] == "ragged_1d"
 
 
 def test_mmididx_ambiguous_side_channel_list_fails_closed(tmp_path) -> None:

@@ -72,7 +72,7 @@ import urllib.request
 # Local imports of the already-ported Tier-2 toolkit (RULE: REUSE, don't fork).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pr_store  # noqa: E402
-from github_graphql_fallback import TokenPool, load_tokens  # noqa: E402
+from github_graphql_fallback import load_tokens  # noqa: E402
 
 GQL_URL = "https://api.github.com/graphql"
 
@@ -196,12 +196,57 @@ class Manifest:
         os.replace(tmp, self.path)  # atomic on POSIX
 
 
-def _make_worker_pool(tokens: list[str], worker_index: int) -> TokenPool:
-    """Create a per-worker token pool, offset so workers start on different PATs."""
-    pool = TokenPool(list(tokens))
-    if pool.tokens:
-        pool.idx = worker_index % len(pool.tokens)
-    return pool
+class StreamAborted(Exception):
+    """Raised inside a worker when a sibling worker hit a fatal condition.
+
+    The shared ``stop_event`` is set by the failing worker; every other worker
+    checks it between pages / HTTP attempts and raises this so the pool tears
+    down promptly instead of hanging on ``shutdown(wait=True)``."""
+
+
+class SharedTokenPool:
+    """ONE thread-safe token pool shared by ALL workers (fixes the H4 double-spend).
+
+    The previous per-worker ``TokenPool`` gave every worker a PRIVATE
+    ``cooldown_until``, so a 401/rate-limit cooldown on a PAT was invisible to
+    the other workers -- two workers would keep hammering the SAME PAT past its
+    GLOBAL (per-token) GitHub limit, and one worker's cooldown could not stop the
+    others. This single pool serializes ALL token state (rotation + cooldowns)
+    under one lock so a cooldown set by any worker is honored by every worker,
+    and ``AllTokensExhausted`` is raised only when every token is genuinely
+    cooling (RULE #1: fail loud, no silent double-spend).
+    """
+
+    def __init__(self, tokens: list[str]):
+        toks = list(tokens)
+        if not toks:
+            raise SystemExit("[graphql-stream] SharedTokenPool got no tokens")
+        self.tokens = toks
+        self.cooldown_until = [0.0] * len(toks)
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> tuple[int, str]:
+        """Reserve the next non-cooling token (round-robin across workers).
+
+        Returns ``(idx, token)``. RAISES :class:`AllTokensExhausted` when every
+        token is cooling, carrying the soonest reset so the caller can report it.
+        """
+        with self._lock:
+            now = time.time()
+            n = len(self.tokens)
+            for _ in range(n):
+                i = self._idx
+                self._idx = (self._idx + 1) % n
+                if self.cooldown_until[i] <= now:
+                    return i, self.tokens[i]
+            soonest = min(self.cooldown_until) - now
+            raise AllTokensExhausted(soonest)
+
+    def cool(self, idx: int, seconds: float) -> None:
+        """Cool token ``idx`` for ``seconds`` -- visible to ALL workers at once."""
+        with self._lock:
+            self.cooldown_until[idx] = time.time() + max(1.0, seconds)
 
 
 # --------------------------------------------------------------------------- #
@@ -237,31 +282,39 @@ class RepoRateLimited(Exception):
     """Soft signal: this page kept rate-limiting; caller may route to fallback."""
 
 
-def _post_with_rotation(pool: TokenPool, variables: dict, owner: str, name: str,
-                        max_retries: int) -> dict:
-    """POST one page, rotating tokens on rate limits.
+def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, name: str,
+                        max_retries: int,
+                        stop_event: threading.Event | None = None) -> dict:
+    """POST one page via the SHARED pool, rotating tokens on rate limits.
 
     Returns the JSON body on success. RAISES:
+      * StreamAborted when ``stop_event`` was set by a sibling worker's fatal
+        failure (so we abort promptly instead of hanging the pool).
       * SystemExit on auth/other-403/GraphQL-errors (fail loud — real bug).
-      * AllTokensExhausted when every token is cooling (caller records cursor
-        and re-raises as a loud failure).
+      * AllTokensExhausted when every (shared) token is cooling (caller records
+        cursor and re-raises as a loud failure).
       * RepoRateLimited when we burn the per-page retry budget on THIS repo
         (caller decides: route to GH Archive fallback, do NOT abort the stream).
     """
     attempts = 0
     unauthorized = 0
     while True:
-        status, headers, jb = _post(pool.current(), variables)
+        if stop_event is not None and stop_event.is_set():
+            raise StreamAborted(f"{owner}/{name}: aborted by sibling worker failure")
+        # Reserve a usable token from the SHARED pool (raises AllTokensExhausted
+        # when every token is cooling) -- cooldowns set below are seen by all.
+        idx, token = pool.acquire()
+        status, headers, jb = _post(token, variables)
 
         if status == 401:
             unauthorized += 1
             sys.stderr.write(
-                f"[graphql-stream] token #{pool.idx} unauthorized for "
-                f"{owner}/{name}; disabling this token for this worker\n"
+                f"[graphql-stream] token #{idx} unauthorized for "
+                f"{owner}/{name}; cooling it for ALL workers\n"
             )
             sys.stderr.flush()
-            pool.cool(24 * 3600)
-            if unauthorized >= len(pool.tokens) or not pool.advance():
+            pool.cool(idx, 24 * 3600)
+            if unauthorized >= len(pool.tokens):
                 raise SystemExit(
                     f"[graphql-stream] all tokens unauthorized while streaming "
                     f"{owner}/{name}; fix the PAT(s)/gh token"
@@ -291,10 +344,9 @@ def _post_with_rotation(pool: TokenPool, variables: dict, owner: str, name: str,
             else:
                 reset = headers.get("X-RateLimit-Reset")
                 wait = max(1.0, float(reset) - time.time()) if reset else 30.0
-            pool.cool(wait)
-            if not pool.advance():
-                soonest = min(pool.cooldown_until) - time.time()
-                raise AllTokensExhausted(soonest)
+            # Cool THIS token for all workers; the next loop's acquire() rotates
+            # to the next usable token or raises AllTokensExhausted when none.
+            pool.cool(idx, wait)
             continue
 
         if status != 200:
@@ -373,7 +425,7 @@ def _pr_node_to_record(repo: str, node: dict) -> tuple[dict, bool]:
 # Stream ONE repo, paginating + checkpointing per page.                        #
 # --------------------------------------------------------------------------- #
 def stream_repo(
-    pool: TokenPool,
+    pool: "SharedTokenPool",
     conn,
     manifest: Manifest,
     repo: str,
@@ -385,12 +437,15 @@ def stream_repo(
     max_retries: int = 8,
     truncated_targets_path: str | None = None,
     append_lock: threading.Lock | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict:
     """Stream all PRs of ``repo``. Resumes from manifest cursor if present.
 
     Returns a per-repo stats dict. RAISES AllTokensExhausted up to the caller
-    (after the manifest already holds the resumable cursor). Routes the repo to
-    the GH Archive fallback (and returns) when the fallback heuristic trips.
+    (after the manifest already holds the resumable cursor). RAISES StreamAborted
+    if ``stop_event`` is set (a sibling worker failed fatally) so the pool tears
+    down promptly. Routes the repo to the GH Archive fallback (and returns) when
+    the fallback heuristic trips.
     """
     if "/" not in repo:
         raise SystemExit(f"[graphql-stream] repo must be 'owner/name', got {repo!r}")
@@ -402,9 +457,12 @@ def stream_repo(
     total_count = None
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            raise StreamAborted(f"{repo}: aborted by sibling worker failure")
         variables = {"owner": owner, "name": name, "cursor": cursor}
         try:
-            jb = _post_with_rotation(pool, variables, owner, name, max_retries)
+            jb = _post_with_rotation(pool, variables, owner, name, max_retries,
+                                     stop_event=stop_event)
         except RepoRateLimited:
             stats["ratelimit_trips"] += 1
             if stats["ratelimit_trips"] >= fallback_ratelimit_trips:
@@ -579,11 +637,19 @@ def main(argv: list[str] | None = None) -> int:
                     help="Process at most N repos this run (validation/smoke)")
     ap.add_argument("--workers", type=int, default=1,
                     help="Number of repos to stream concurrently. Each worker "
-                         "gets its own SQLite connection and token-pool cursor.")
+                         "gets its own SQLite connection; ALL workers share ONE "
+                         "token pool so per-PAT rate limits are accounted once.")
     args = ap.parse_args(argv)
 
     tokens = load_all_tokens(args.tokens, include_gh_cli=args.include_gh_cli)
     sys.stderr.write(f"[graphql-stream] token pool size = {len(tokens)}\n")
+    # ONE shared, thread-safe token pool for ALL workers: a cooldown set by any
+    # worker is honored by every worker, so concurrent workers cannot double-spend
+    # the SAME PAT's global rate limit (H4 fix).
+    pool = SharedTokenPool(tokens)
+    # Cross-worker abort flag: a worker that hits a fatal condition sets this so
+    # the others stop between pages instead of the pool hanging on shutdown.
+    stop_event = threading.Event()
     # Open once in the parent to create schema and switch the DB into WAL before
     # workers open their own connections.
     parent_conn = pr_store.connect(args.store, create=True)
@@ -613,7 +679,6 @@ def main(argv: list[str] | None = None) -> int:
         runnable.append(repo)
 
     def run_one(repo: str, worker_index: int) -> dict:
-        pool = _make_worker_pool(tokens, worker_index)
         conn = pr_store.connect(args.store, create=True)
         try:
             st = manifest.status(repo)
@@ -631,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_prs=args.max_prs, max_retries=args.max_retries,
                 truncated_targets_path=args.truncated_targets,
                 append_lock=append_lock,
+                stop_event=stop_event,
             )
         finally:
             conn.close()
@@ -666,16 +732,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"(or add more PATs) to RESUME mid-repo. FAILING LOUD per RULE #1."
                 )
     else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_repo = {
-                executor.submit(run_one, repo, i): repo
-                for i, repo in enumerate(runnable)
-            }
+        # NOTE: do NOT use `with ThreadPoolExecutor(...)` here. Its __exit__ runs
+        # shutdown(wait=True), which on a fatal error would BLOCK until every
+        # already-submitted repo finishes streaming (a hang, not a fast abort).
+        # Instead, on a fatal error we set stop_event (workers bail between pages)
+        # and shutdown(wait=False, cancel_futures=True) so the process exits
+        # promptly. FAILING LOUD per RULE #1, without hanging.
+        executor = ThreadPoolExecutor(max_workers=workers)
+        future_repo = {
+            executor.submit(run_one, repo, i): repo
+            for i, repo in enumerate(runnable)
+        }
+        try:
             for fut in as_completed(future_repo):
                 repo = future_repo[fut]
                 try:
                     record_stats(repo, fut.result())
+                except StreamAborted:
+                    # A sibling worker already hit the fatal condition and raises
+                    # the loud SystemExit below; this worker just bailed cleanly.
+                    continue
                 except AllTokensExhausted as e:
+                    stop_event.set()
                     cur = manifest.cursor(repo)
                     raise SystemExit(
                         f"[graphql-stream] ALL {len(tokens)} tokens rate-limited while "
@@ -684,6 +762,9 @@ def main(argv: list[str] | None = None) -> int:
                         f"cursor={cur!r}. Re-run the SAME command after the reset "
                         f"(or add more PATs) to RESUME mid-repo. FAILING LOUD per RULE #1."
                     )
+        finally:
+            stop_event.set()
+            executor.shutdown(wait=False, cancel_futures=True)
 
     sys.stderr.write(
         f"[graphql-stream] DONE repos_done={totals['repos_done']} "

@@ -72,13 +72,40 @@ def test_store_reader_roundtrip(tmp_path):
 def test_is_public_symbol_filters():
     b = _load_builder()
     # A1 (public_only=False): accept normal qnames, reject internal segments.
-    assert b.is_public_symbol("boost::algorithm::trim", "a.hpp", False)
-    assert not b.is_public_symbol("boost::detail::do_trim", "a.hpp", False)
-    assert not b.is_public_symbol("absl::internal::Foo", "a.h", False)
+    assert b.is_public_symbol(
+        "boost::algorithm::trim", "a.hpp", False, ("boost::",)
+    )
+    assert not b.is_public_symbol(
+        "boost::detail::do_trim", "a.hpp", False, ("boost::",)
+    )
+    assert not b.is_public_symbol(
+        "absl::internal::Foo", "a.h", False, ("absl::",)
+    )
     # A2 (public_only=True): require a header file AND reject reserved names.
-    assert b.is_public_symbol("std::vector::push_back", "bits/vector.h", True)
-    assert not b.is_public_symbol("std::vector::push_back", "src/vector.cpp", True)
-    assert not b.is_public_symbol("std::__copy_impl", "bits/algo.h", True)
+    assert b.is_public_symbol(
+        "std::vector::push_back", "bits/vector.h", True, ("std::",)
+    )
+    assert b.is_public_symbol(
+        "std::__1::vector::push_back", "include/vector", True, ("std::",)
+    )
+    assert not b.is_public_symbol(
+        "std::vector::push_back", "src/vector.cpp", True, ("std::",)
+    )
+    assert not b.is_public_symbol(
+        "std::__copy_impl", "bits/algo.h", True, ("std::",)
+    )
+    # C2 regression: std A2 must not index compiler/libiberty or other random
+    # C++ header symbols just because they live under the selected subtree.
+    assert not b.is_public_symbol(
+        "libiberty::demangle_component", "libiberty/demangle.h", True, ("std::",)
+    )
+    assert not b.is_public_symbol(
+        "__gnu_cxx::__normal_iterator", "bits/stl_iterator.h", True, ("std::",)
+    )
+    assert (
+        b.normalize_inline_namespace_qname("std::__cxx11::basic_string::size")
+        == "std::basic_string::size"
+    )
 
 
 def test_crosslink_budget_bounds():

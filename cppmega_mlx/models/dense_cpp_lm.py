@@ -80,6 +80,7 @@ class DenseCppLMConfig:
     indexer_dim: int = 32
     indexer_local_window: int = 16
     indexer_num_sinks: int = 1
+    require_graph_routes: bool = True
 
     # SwiGLU FFN.
     ffn_activation: Literal["swiglu"] = "swiglu"
@@ -267,6 +268,11 @@ class GraphIndexedAttention(nn.Module):
         cfg = self._dense_config
         acfg = self.config
         batch, seq, _ = hidden_states.shape
+        if cfg.require_graph_routes and block_bias is None:
+            raise RuntimeError(
+                "DenseCppLM attention_mode='dsa' requires graph route block_bias; "
+                "set require_graph_routes=False only for explicit ablation tests"
+            )
         q = self.q_proj(hidden_states).reshape(
             batch, seq, acfg.num_q_heads, acfg.q_head_dim
         )

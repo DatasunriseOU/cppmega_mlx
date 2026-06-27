@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from cppmega_mlx.data.tokenizer_contract import (
     REQUIRED_SPECIAL_TOKEN_IDS,
     TOOL_USE_SPECIAL_TOKEN_IDS,
     validate_required_special_token_ids,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_TOKENIZER_CONTRACT_PATH = (
+    _REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer_contract_v1.json"
+)
+_TOKENIZER_JSON_PATH = _REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
+_DOMAIN_DELIMITER_BASES = (
+    "CPP_CODE",
+    "MAKE",
+    "CMAKE",
+    "NINJA",
+    "BAZEL",
+    "BASH",
+    "ZSH",
+    "SH",
+    "TCSH",
+    "COMPILER_DIAGNOSTIC",
+    "BUILD_DIAGNOSTIC",
+    "COMPILER_ERROR",
+    "BUILD_ERROR",
+    "LINKER_ERROR",
+    "TEST_OUTPUT",
+    "TOOL_OUTPUT",
 )
 
 
@@ -32,6 +59,38 @@ def test_tool_use_token_ids_match_vendored_artifact_contract() -> None:
         "QUERY_TOOL": 11,
         "TOOL_RESULT": 19,
     }
+
+
+def test_domain_delimiter_role_ids_are_reserved_contract_pairs() -> None:
+    from cppmega_mlx.data import tokenizer_contract
+
+    contract = json.loads(_TOKENIZER_CONTRACT_PATH.read_text())
+    roles = {
+        role: token_id
+        for role, token_id in contract["reserved_role_assignments"].items()
+        if not role.startswith("_")
+    }
+    expected_roles = {
+        f"{base}_{edge}"
+        for base in _DOMAIN_DELIMITER_BASES
+        for edge in ("START", "END")
+    }
+
+    assert expected_roles.issubset(roles)
+    assert tokenizer_contract.DOMAIN_DELIMITER_TOKEN_IDS == {
+        role: roles[role] for role in sorted(expected_roles)
+    }
+
+    ids = list(tokenizer_contract.DOMAIN_DELIMITER_TOKEN_IDS.values())
+    assert len(ids) == len(set(ids))
+    assert not (set(ids) & set(REQUIRED_SPECIAL_TOKEN_IDS.values()))
+
+    added_tokens = {
+        added["id"]: added["content"]
+        for added in json.loads(_TOKENIZER_JSON_PATH.read_text())["added_tokens"]
+    }
+    for role, token_id in tokenizer_contract.DOMAIN_DELIMITER_TOKEN_IDS.items():
+        assert added_tokens[token_id] == f"<RESERVED_{token_id}>", role
 
 
 def test_missing_required_special_token_fails() -> None:

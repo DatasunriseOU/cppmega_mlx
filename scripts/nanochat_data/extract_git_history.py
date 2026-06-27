@@ -349,23 +349,46 @@ def precompute_cpp_file_changes(
     repo_path: str,
     commit_hashes: list[str],
 ) -> tuple[dict[tuple[str, str], int], dict[str, list[str]]]:
-    """Precompute changed C/C++ files and per-file temporal indices once.
+    """Precompute per-file temporal commit indices over the EMITTED set.
 
-    This is on the hot path for large repos. The old flow called
-    ``git diff-tree --name-status`` once while building ``file_local_commit_index``
-    and then again inside ``get_commit_diffs`` for every commit. Keep the same
-    semantics, but carry the file list forward so each commit pays that git
-    subprocess cost only once.
+    Contract: ``file_local_commit_index`` for ``(commit, filepath)`` is the
+    0-based count of EARLIER commits (chronological, oldest-first) that modified
+    the same file AND were ACCEPTED by :func:`get_commit_diffs` -- i.e. that
+    passed the identical None-blob / diff-length
+    (``MIN_DIFF_CHARS``..``MAX_DIFF_CHARS``) / content-size (``200000``)
+    acceptance gate used when records are written. A commit whose diff is
+    rejected by that gate produces no record and therefore MUST NOT advance the
+    counter, so the indices carried on emitted records are contiguous
+    (0, 1, 2, ...) and byte-identical to the values the original
+    ``compute_file_local_commit_indices`` produced before the precompute
+    refactor.
+
+    Counting over the cheaper name-status-only set (:func:`get_commit_cpp_files`:
+    ``is_cpp_file`` / ``should_skip_path`` / ``status == 'M'`` /
+    ``MAX_FILES_PER_COMMIT``) is NOT equivalent: it counts diff-filtered commits
+    that are never emitted, silently inflating and gapping the indices for any
+    file with an interspersed rejected-diff commit (e.g. 0, 2, 3 instead of
+    0, 1, 2). That is a semantic change that makes corpora built before/after
+    the refactor non-comparable, which is why the index must use the same diff
+    gate as emission.
+
+    Deciding that gate requires the blob/diff content, so this pass runs
+    :func:`get_commit_diffs`. The per-commit ACCEPTED filepaths are carried
+    forward in ``files_by_commit`` so the emit pass can request exactly those
+    files (skipping name-status enumeration and the blobs of rejected files).
+
+    Iteration order is deterministic (``reversed(commit_hashes)``, oldest-first).
     """
     counters: dict[str, int] = {}
     indices: dict[tuple[str, str], int] = {}
     files_by_commit: dict[str, list[str]] = {}
     for commit_hash in reversed(commit_hashes):
-        files = get_commit_cpp_files(repo_path, commit_hash)
-        if not files:
+        file_diffs = get_commit_diffs(repo_path, commit_hash)
+        if not file_diffs:
             continue
-        files_by_commit[commit_hash] = files
-        for filepath in files:
+        accepted = [item["filepath"] for item in file_diffs]
+        files_by_commit[commit_hash] = accepted
+        for filepath in accepted:
             next_index = counters.get(filepath, 0)
             indices[(commit_hash, filepath)] = next_index
             counters[filepath] = next_index + 1

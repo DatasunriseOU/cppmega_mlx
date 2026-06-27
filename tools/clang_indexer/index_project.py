@@ -368,6 +368,23 @@ SYSTEM_PREFIXES = (
 # include libc-style bare names here (memcpy/strlen/...) because those are not in
 # the A1 selection and would only add noise; only the namespaced base libs.
 CROSSLINKABLE_NS_PREFIXES = ('std::', 'boost::')
+_STD_INLINE_NAMESPACE_SEGMENTS = frozenset({'__1', '__2', '__3', '__cxx11'})
+
+
+def normalize_inline_namespace_qname(qname: str) -> str:
+    """Normalize standard-library inline namespaces in qualified names.
+
+    libc++/libstdc++ commonly surface symbols as ``std::__1::...`` or
+    ``std::__cxx11::...`` through libclang while the global base-lib index stores
+    the canonical public spelling.  Keep normalization narrow to ``std::`` so a
+    project namespace named ``__1`` is not rewritten.
+    """
+    if not qname.startswith('std::'):
+        return qname
+    return '::'.join(
+        part for part in qname.split('::')
+        if part not in _STD_INLINE_NAMESPACE_SEGMENTS
+    )
 
 
 class FunctionDef:
@@ -928,7 +945,7 @@ def get_qualified_name(cursor: Cursor) -> str:
             parts.append(c.spelling)
         c = c.semantic_parent
     parts.reverse()
-    return '::'.join(parts)
+    return normalize_inline_namespace_qname('::'.join(parts))
 
 
 def extract_preamble(tu: TranslationUnit, filename: str) -> str:
@@ -1387,21 +1404,22 @@ class GlobalSymbolReader:
         Returns a dict with at least: base_repo, base_lib, text, token_est, kind.
         Cached per-process; the store is read-only at doc-build time.
         """
-        if qname in self._cache:
-            return self._cache[qname]
+        key = normalize_inline_namespace_qname(qname)
+        if key in self._cache:
+            return self._cache[key]
         row = self._conn.execute(
             "SELECT base_lib, base_repo, text, token_est, kind "
             "FROM symbols WHERE qname=? AND sym_type='func' LIMIT 1",
-            (qname,),
+            (key,),
         ).fetchone()
         if row is None:
-            self._cache[qname] = None
+            self._cache[key] = None
             return None
         rec = {
             "base_lib": row[0], "base_repo": row[1], "text": row[2],
             "token_est": row[3], "kind": row[4],
         }
-        self._cache[qname] = rec
+        self._cache[key] = rec
         return rec
 
     def close(self) -> None:

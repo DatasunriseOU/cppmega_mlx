@@ -194,6 +194,112 @@ def indexer_coverage_hinge_loss(
     return (mx.sum(penalty) / denom) * float(loss_coeff)
 
 
+def apply_graph_indexer_bias(
+    indexer_scores: mx.array,
+    graph_bias: mx.array,
+    *,
+    beta: mx.array | float = 1.0,
+) -> mx.array:
+    """Add a fixed graph prior to indexer logits before loss/top-k selection.
+
+    This is the training-side equivalent of the DSA inference formula used by
+    ``sparse_mla.lightning_indexer_scores``:
+
+        I_final[b, t, s] = I_neural[b, t, s] + beta * S_graph[b, t, s]
+
+    Masked logits (``<= -1e9/2``) stay masked even when ``graph_bias`` is large,
+    so a graph prior cannot resurrect a causally invalid or otherwise forbidden
+    block.
+
+    Args:
+        indexer_scores: ``(B, Tq, Sblk)`` learned/neural indexer logits.
+        graph_bias: ``(Tq, Sblk)``, ``(1, Tq, Sblk)``, or ``(B, Tq, Sblk)``
+            fixed route prior from ``code_graph_routes.build_attention_bias``.
+        beta: scalar learnable/fixed graph-prior weight.
+    """
+
+    B, Tq, Sblk = _check_block_scores(
+        indexer_scores, where="apply_graph_indexer_bias"
+    )
+    if graph_bias.ndim == 2:
+        if tuple(graph_bias.shape) != (Tq, Sblk):
+            raise ValueError(
+                "apply_graph_indexer_bias: 2-D graph_bias must be "
+                f"({Tq},{Sblk}), got {tuple(graph_bias.shape)}"
+            )
+        bias = mx.broadcast_to(graph_bias[None, :, :], (B, Tq, Sblk))
+    elif graph_bias.ndim == 3:
+        gB, gTq, gSblk = (int(x) for x in graph_bias.shape)
+        if (gTq, gSblk) != (Tq, Sblk):
+            raise ValueError(
+                "apply_graph_indexer_bias: graph_bias trailing shape must be "
+                f"({Tq},{Sblk}), got {tuple(graph_bias.shape)}"
+            )
+        if gB == B:
+            bias = graph_bias
+        elif gB == 1:
+            bias = mx.broadcast_to(graph_bias, (B, Tq, Sblk))
+        else:
+            raise ValueError(
+                "apply_graph_indexer_bias: graph_bias batch must be 1 or "
+                f"{B}, got {gB}"
+            )
+    else:
+        raise ValueError(
+            "apply_graph_indexer_bias: graph_bias must be 2-D or 3-D, got "
+            f"{tuple(graph_bias.shape)}"
+        )
+
+    beta_arr = (
+        beta
+        if isinstance(beta, mx.array)
+        else mx.array(float(beta), dtype=mx.float32)
+    )
+    if beta_arr.ndim != 0:
+        raise ValueError(
+            "apply_graph_indexer_bias: beta must be a scalar, got "
+            f"{tuple(beta_arr.shape)}"
+        )
+    logits = indexer_scores.astype(mx.float32)
+    valid = logits > (_NEG_INF / 2.0)
+    biased = logits + beta_arr.astype(mx.float32) * bias.astype(mx.float32)
+    return mx.where(valid, biased, mx.array(_NEG_INF, dtype=mx.float32))
+
+
+def select_graph_biased_topk(
+    indexer_scores: mx.array,
+    *,
+    graph_bias: mx.array | None = None,
+    beta: mx.array | float = 1.0,
+    topk: int,
+    local_window: int = 0,
+    num_sinks: int = 0,
+    causal: bool = True,
+) -> tuple[mx.array, mx.array]:
+    """Apply optional graph bias, then select DSA top-k block indices.
+
+    Returns ``(selected_indices, final_scores)``.  The selected indices are the
+    same sentinel ``-1`` format as
+    :func:`cppmega_mlx.nn.sparse_mla.indexer_topk_indices`.
+    """
+
+    final_scores = (
+        indexer_scores
+        if graph_bias is None
+        else apply_graph_indexer_bias(indexer_scores, graph_bias, beta=beta)
+    )
+    from cppmega_mlx.nn.sparse_mla import indexer_topk_indices
+
+    selected = indexer_topk_indices(
+        final_scores,
+        topk=topk,
+        local_window=local_window,
+        num_sinks=num_sinks,
+        causal=causal,
+    )
+    return selected, final_scores
+
+
 def recall_at_k(
     indexer_scores: mx.array,
     edge_targets: mx.array,
@@ -358,6 +464,8 @@ __all__ = [
     "indexer_kl_warmup_loss",
     "indexer_edge_bce_loss",
     "indexer_coverage_hinge_loss",
+    "apply_graph_indexer_bias",
+    "select_graph_biased_topk",
     "recall_at_k",
     "dense_attn_topk_overlap",
     "total_indexer_loss",
