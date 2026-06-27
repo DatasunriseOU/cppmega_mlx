@@ -69,6 +69,30 @@ def test_store_reader_roundtrip(tmp_path):
     reader.close()
 
 
+def test_store_reader_normalizes_std_inline_namespace(tmp_path):
+    ip = _load_index_project()
+    b = _load_builder()
+    db = str(tmp_path / "gsi.sqlite")
+    store = b.GlobalSymbolStore(db)
+    body = "size_t basic_string_size() { return 0; }"
+    store.insert_symbols([(
+        "std::basic_string::size", "std", "STL", 2, "func",
+        "stl/inc/string", 1, 1, 1, len(body) // 4, len(body), body,
+    )])
+    store.commit()
+    store.close()
+
+    reader = ip.GlobalSymbolReader(db)
+    rec = reader.lookup("std::__cxx11::basic_string::size")
+    assert rec is not None
+    assert rec["base_repo"] == "STL"
+    assert "basic_string_size" in rec["text"]
+    assert ip.normalize_inline_namespace_qname("std::__1::vector::push_back") == (
+        "std::vector::push_back"
+    )
+    reader.close()
+
+
 def test_is_public_symbol_filters():
     b = _load_builder()
     # A1 (public_only=False): accept normal qnames, reject internal segments.

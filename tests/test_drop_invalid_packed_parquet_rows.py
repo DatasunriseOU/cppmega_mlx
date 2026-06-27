@@ -28,7 +28,7 @@ def _row(length: int, *, valid: int | None = None) -> dict:
     loss_mask = _loss_mask_for_doc_ids(doc_ids, valid=valid, length=length)
     return {
         "input_ids": [1] * valid + [0] * (length - valid),
-        "target_ids": [1] * valid + [0] * (length - valid),
+        "target_ids": [1] * max(valid - 1, 0) + [0] * (length - max(valid - 1, 0)),
         "loss_mask": loss_mask,
         "doc_ids": doc_ids,
         "valid_token_count": valid,

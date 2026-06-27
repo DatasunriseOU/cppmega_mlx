@@ -12,7 +12,7 @@ def _write_tiny_parquet(
     path,
     *,
     input_ids=(1, 2, 3, 4, 0, 0, 0, 0),
-    target_ids=(2, 3, 4, 5, 0, 0, 0, 0),
+    target_ids=(2, 3, 4, 0, 0, 0, 0, 0),
     # Canonical single-doc loss_mask: 1 on every valid token EXCEPT the last
     # valid token (no next token to predict) and the whole pad region. With a
     # single document (doc_ids all equal) and valid=4 the rule yields
@@ -189,3 +189,48 @@ def test_sidecar_audit_accepts_correct_multidoc_loss_mask(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert report["total"]["bad_rows"] == 0
     assert report["total"]["fields"]["loss_mask"]["bad_value_rows"] == 0
+
+
+def test_sidecar_audit_rejects_bad_target_shift(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+
+    _write_tiny_parquet(code_root / "8" / "code.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+    _write_tiny_parquet(
+        commit_root / "8" / "commit.parquet",
+        input_ids=(10, 11, 12, 13, 0, 0, 0, 0),
+        target_ids=(11, 12, 99, 0, 0, 0, 0, 0),
+    )
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report is not None
+    assert report["total"]["bad_rows"] >= 1
+    assert report["total"]["fields"]["target_ids"]["bad_value_rows"] >= 1
+
+
+def test_sidecar_audit_rejects_bad_trained_token_count(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+
+    _write_tiny_parquet(code_root / "8" / "code.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+    _write_tiny_parquet(
+        commit_root / "8" / "commit.parquet",
+        loss_mask=(1, 1, 1, 0, 0, 0, 0, 0),
+        trained_token_count=4,
+    )
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report is not None
+    assert report["total"]["bad_rows"] >= 1
+    assert any(
+        "trained_token_count != sum(loss_mask)" in err
+        for err in report["total"]["errors"]
+    )
