@@ -20,7 +20,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 from typing import Iterable
 
 
@@ -105,15 +104,77 @@ def _audit_receipts() -> tuple[Path, ...]:
     return FINAL_AUDIT_RECEIPTS
 
 
-def _load_verified_token_total(audit_receipts: tuple[Path, ...]) -> int:
-    total = 0
+def _selected_bucket_keys(selections: tuple[tuple[str, Path], ...]) -> list[str]:
+    """Map each ``parquet/<kind>/<bucket>`` selection to a receipt
+    ``by_kind_bucket`` key ``<kind>/<bucket>``.
+
+    Non-parquet selections (e.g. the audit-receipt mirror under ``audits/``)
+    carry no token count and are not part of the token accounting, so they are
+    excluded here.  Order is preserved for deterministic error messages.
+    """
+    keys: list[str] = []
+    for remote, _local in selections:
+        if remote.startswith("parquet/"):
+            keys.append(remote[len("parquet/"):])
+    return keys
+
+
+def _load_verified_token_total(
+    audit_receipts: tuple[Path, ...],
+    selections: tuple[tuple[str, Path], ...],
+) -> int:
+    """Sum the receipt-verified valid token count for exactly the selected
+    parquet buckets.
+
+    The token total is profile-aware: under ``--code-commits-only`` only the
+    selected ``code``/``commits`` buckets are summed, so the manifest never
+    reports the all-valid (code+commits+pr) total for a subset upload.  Every
+    selected ``(kind, bucket)`` must be covered by the receipt's
+    ``by_kind_bucket`` map and be green (``bad_files == bad_rows == 0``);
+    otherwise this raises ``SystemExit`` rather than uploading on an unverified
+    or stale/narrowly-scoped receipt.
+    """
+    selected_keys = _selected_bucket_keys(selections)
+    if not selected_keys:
+        raise SystemExit(
+            "no parquet buckets selected; refusing to write a verified token total"
+        )
+
+    # Merge by_kind_bucket across all receipts.  A bucket covered by more than
+    # one receipt is ambiguous and would be silently double-counted, so fail loud.
+    merged: dict[str, dict] = {}
     for path in audit_receipts:
         data = json.loads(path.read_text(encoding="utf-8"))
-        bad_files = int(data["total"]["bad_files"])
-        bad_rows = int(data["total"]["bad_rows"])
+        by_kind_bucket = data.get("by_kind_bucket")
+        if not isinstance(by_kind_bucket, dict):
+            raise SystemExit(f"audit receipt missing by_kind_bucket map: {path}")
+        for key, entry in by_kind_bucket.items():
+            if key in merged:
+                raise SystemExit(
+                    f"audit bucket {key!r} covered by multiple receipts; ambiguous coverage"
+                )
+            merged[key] = entry
+
+    missing = [key for key in selected_keys if key not in merged]
+    if missing:
+        raise SystemExit(
+            "audit receipt does not cover selected upload buckets: "
+            + ", ".join(missing)
+        )
+
+    nongreen: list[str] = []
+    total = 0
+    for key in selected_keys:
+        entry = merged[key]
+        bad_files = int(entry["bad_files"])
+        bad_rows = int(entry["bad_rows"])
         if bad_files or bad_rows:
-            raise SystemExit(f"audit receipt is not green: {path} bad_files={bad_files} bad_rows={bad_rows}")
-        total += int(data["total"]["valid_tokens"])
+            nongreen.append(f"{key} bad_files={bad_files} bad_rows={bad_rows}")
+        total += int(entry["valid_tokens"])
+    if nongreen:
+        raise SystemExit(
+            "audit receipt buckets are not green: " + "; ".join(nongreen)
+        )
     return total
 
 
@@ -250,7 +311,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     selections = _selection_items(code_commits_only=args.code_commits_only)
     audit_receipts = _audit_receipts()
-    token_total = _load_verified_token_total(audit_receipts)
+    token_total = _load_verified_token_total(audit_receipts, selections)
     sources = _existing_sources(selections)
     _write_manifest(
         args.manifest,

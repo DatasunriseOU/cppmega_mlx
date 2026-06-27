@@ -126,3 +126,63 @@ def test_commit_stream_finalize_keeps_git_repo(tmp_path):
 
     assert src._finalize_git_repo_subtree("real-repo", repo_dir) == ("real-repo", repo_dir)
     assert repo_dir.exists()
+
+
+def _stat(rows, valid, target_length):
+    """A per-length stat dict in the exact shape produced by
+    streaming_reindex._parquet_stats / append_output."""
+    capacity = rows * target_length
+    pad = capacity - valid
+    return {
+        "rows": rows,
+        "capacity_tokens": capacity,
+        "valid_tokens": valid,
+        "pad_tokens": pad,
+        "pad_frac": (pad / capacity if capacity else 0.0),
+    }
+
+
+def test_length_totals_sums_well_formed_stats():
+    import streaming_conveyor
+
+    info = {
+        "source": "code",
+        "lengths": {
+            "1024": _stat(rows=3, valid=2000, target_length=1024),
+            "2048": _stat(rows=1, valid=2048, target_length=2048),
+        },
+    }
+
+    totals = streaming_conveyor._length_totals(info)
+
+    assert totals["rows"] == 4
+    assert totals["valid_tokens"] == 2000 + 2048
+    assert totals["capacity_tokens"] == 3 * 1024 + 1 * 2048
+    assert totals["pad_tokens"] == totals["capacity_tokens"] - totals["valid_tokens"]
+
+
+def test_length_totals_raises_on_malformed_stat_dict():
+    """RULE #1 regression: a stat dict missing an expected field must crash
+    (identifying the offending length bucket + source) instead of silently
+    defaulting to 0 and undercounting cumulative valid tokens. The old
+    int(st.get(key, 0)) path returned a (wrong) total here without raising."""
+    import pytest
+
+    import streaming_conveyor
+
+    good = _stat(rows=2, valid=1500, target_length=1024)
+    malformed = _stat(rows=1, valid=2048, target_length=2048)
+    del malformed["valid_tokens"]  # simulate a corrupt / truncated stat dict
+
+    info = {
+        "source": "commits",
+        "lengths": {"1024": good, "2048": malformed},
+    }
+
+    with pytest.raises(KeyError) as excinfo:
+        streaming_conveyor._length_totals(info)
+
+    message = str(excinfo.value)
+    assert "valid_tokens" in message
+    assert "2048" in message
+    assert "commits" in message

@@ -6,7 +6,14 @@ import sys
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from scripts.fix_packed_parquet_boundaries import TokenPieces, repair_row
+from scripts.fix_packed_parquet_boundaries import (
+    TokenPieces,
+    _needed_insert_positions,
+    _shift_offset,
+    _shift_offset_exclusive,
+    _shift_span,
+    repair_row,
+)
 from scripts.nanochat_data.pack_enriched_rows import _loss_mask_for_packed_docs
 from scripts.render_sidecar_example import get_tokenizer
 
@@ -212,6 +219,119 @@ def test_repair_row_refuses_when_no_padding_slack() -> None:
 
     assert repaired is row
     assert info == {"changed": False, "insertions": 2, "overflow": True}
+
+
+def test_repair_row_ignores_nongenerated_markerlike_comments() -> None:
+    """MEDIUM finding: ordinary ``// === ... ===`` comments that merely CONTAIN a
+    marker word (DIFF / CONTEXT / PRE-COMMIT / POST-COMMIT) are NOT generated
+    markers and must be left untouched.
+
+    The old substring heuristic (``any(name in marker_text ...)``) matched these
+    real source comments and silently injected <NL> tokens into training text.
+    Each comment below has the exact ``// === ... ===`` structure (so it reaches
+    the classification step) but is not a verbatim generated marker.
+    """
+    tok = get_tokenizer()
+    pieces = TokenPieces(tok)
+    for comment in (
+        "// === DIFF ALGORITHM ===",
+        "// === CONTEXT SWITCH ===",
+        "// === PRE-COMMIT HOOKS ===",
+        "// === POST-COMMIT HOOK SETUP ===",  # no colon -> not the POST-COMMIT form
+        "// === NOTES ===",
+    ):
+        row = _row_for_text(f"int x = 0;{comment}int y = 1;\n")
+        before_ids = list(row["input_ids"])
+        repaired, info = repair_row(row, pieces)
+        assert info == {"changed": False, "insertions": 0, "overflow": False}, comment
+        assert repaired is row, comment
+        assert repaired["input_ids"] == before_ids, comment
+
+
+def test_repair_row_still_repairs_context_and_postcommit_markers() -> None:
+    """The exact-form anchor must still accept genuine generated markers,
+    including CONTEXT and POST-COMMIT (whose subject is variable)."""
+    tok = get_tokenizer()
+    pieces = TokenPieces(tok)
+    for text in (
+        "/* can't compile. */// === CONTEXT ===bool f();\n",
+        "/* can't compile. */// === POST-COMMIT: fix the parser bug ===bool f();\n",
+        # empty subject still starts with the POST-COMMIT prefix.
+        "/* can't compile. */// === POST-COMMIT:  ===bool f();\n",
+    ):
+        row = _row_for_text(text)
+        repaired, info = repair_row(row, pieces)
+        assert info["changed"] is True, text
+        assert info["insertions"] == 2, text
+        decoded = tok.decode(repaired["input_ids"][: repaired["valid_token_count"]])
+        assert "*/// ===" not in decoded, text
+
+
+def test_shift_helpers_use_inclusive_start_exclusive_end_semantics() -> None:
+    """LOW finding: an insertion landing exactly on an EXCLUSIVE end (one-past-
+    last) must not extend the chunk; an INCLUSIVE start at the same index moves
+    with its token."""
+    positions = [10]
+    # Inclusive start at the insertion index moves right (keeps its token).
+    assert _shift_offset(10, positions) == 11
+    # Exclusive end at the insertion index does NOT move (does not absorb <NL>).
+    assert _shift_offset_exclusive(10, positions) == 10
+    # Strictly-inside coordinates move for both.
+    assert _shift_offset(12, positions) == 13
+    assert _shift_offset_exclusive(12, positions) == 13
+    # Coordinates before the insertion never move.
+    assert _shift_offset(9, positions) == 9
+    assert _shift_offset_exclusive(9, positions) == 9
+    # Spans: start inclusive, end exclusive.
+    span = _shift_span({"start": 10, "end": 10}, positions)
+    assert span == {"start": 11, "end": 10}
+
+
+def test_repair_row_chunk_end_not_overshifted_at_marker_edge() -> None:
+    """LOW finding end-to-end: a chunk whose EXCLUSIVE end coincides with a real
+    insertion position must not be over-shifted to absorb the inserted <NL>.
+
+    Insertions happen at marker boundaries, which is exactly where chunk edges
+    fall, so the off-by-one is systematic, not hypothetical.  Positions are read
+    from the real tokenizer-driven detector, then chunk edges are placed on the
+    first insertion index; we assert exclusive-end vs inclusive-start divergence.
+    """
+    tok = get_tokenizer()
+    pieces = TokenPieces(tok)
+    row = _row_for_text(
+        "/* can't compile. */// === PRE-COMMIT ===bool f();\n",
+        slack=16,
+    )
+    positions = _needed_insert_positions(row, pieces)
+    assert len(positions) == 2
+    edge = positions[0]  # an insertion index that coincides with a chunk edge
+    valid = row["valid_token_count"]
+
+    # Place an inclusive start AND an exclusive end exactly at `edge`; the span
+    # likewise starts and ends at `edge`.
+    row["token_chunk_starts"] = [0, edge]
+    row["token_chunk_ends"] = [edge, valid]
+    row["changed_chunk_spans"] = [{"start": edge, "end": edge}]
+
+    repaired, info = repair_row(row, pieces)
+    assert info["changed"] is True
+
+    before = sum(1 for p in positions if p < edge)   # insertions strictly before
+    upto = sum(1 for p in positions if p <= edge)    # insertions up to & incl.
+    assert upto == before + 1  # an insertion lands exactly on `edge`
+
+    # Exclusive end shifts only by insertions strictly before it.
+    assert repaired["token_chunk_ends"][0] == edge + before
+    # Inclusive start shifts by insertions up to and including it.
+    assert repaired["token_chunk_starts"][1] == edge + upto
+    # Span: start inclusive, end exclusive.
+    assert repaired["changed_chunk_spans"][0]["start"] == edge + upto
+    assert repaired["changed_chunk_spans"][0]["end"] == edge + before
+    # The inserted <NL> at `edge` is NOT absorbed into the prior chunk: its
+    # exclusive end stays strictly below the next chunk's (shifted) start.
+    assert repaired["token_chunk_ends"][0] < repaired["token_chunk_starts"][1]
+    # The trailing exclusive end (strictly inside all insertions) shifts fully.
+    assert repaired["token_chunk_ends"][1] == valid + len(positions)
 
 
 def test_dry_run_fail_on_remaining_rejects_repairable_marker_rows(tmp_path) -> None:

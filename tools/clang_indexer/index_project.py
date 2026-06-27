@@ -1396,6 +1396,17 @@ class GlobalSymbolReader:
         self.path = path
         uri = f"file:{path}?mode=ro"
         self._conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(symbols)").fetchall()
+        }
+        if "symbol_uid" not in cols:
+            raise RuntimeError(
+                f"--global-symbol-index uses old qname-only schema: {path}. "
+                "Rebuild it with scripts/crossrepo/build_global_symbol_index.py "
+                "so overloaded symbols and multi-implementation std symbols are "
+                "not collapsed."
+            )
         self._cache: dict[str, dict | None] = {}
 
     def lookup(self, qname: str) -> dict | None:
@@ -1409,7 +1420,8 @@ class GlobalSymbolReader:
             return self._cache[key]
         row = self._conn.execute(
             "SELECT base_lib, base_repo, text, token_est, kind "
-            "FROM symbols WHERE qname=? AND sym_type='func' LIMIT 1",
+            "FROM symbols WHERE qname=? AND sym_type='func' "
+            "ORDER BY token_est DESC, body_len DESC, base_repo, file, line LIMIT 1",
             (key,),
         ).fetchone()
         if row is None:

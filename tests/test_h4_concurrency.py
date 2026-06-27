@@ -187,17 +187,22 @@ def test_shared_token_pool_is_thread_safe():
 # --------------------------------------------------------------------------- #
 # (2) Fail-fast stop flag -- abort promptly, never hang / swallow.            #
 # --------------------------------------------------------------------------- #
-def test_post_with_rotation_aborts_before_http_when_stopped(monkeypatch):
+def test_post_with_rotation_aborts_before_http_when_stopped():
     import graphql_pr_stream as g
 
-    pool = g.SharedTokenPool(["t0"])
+    class FailIfAcquired:
+        tokens = ["t0"]
+
+        def acquire(self):
+            raise AssertionError("token acquisition must not happen once stop_event is set")
+
+        def cool(self, _idx, _seconds):
+            raise AssertionError("token cooldown must not happen once stop_event is set")
+
+    pool = FailIfAcquired()
     ev = threading.Event()
     ev.set()
 
-    def boom(*_a, **_k):  # pragma: no cover - asserts it's never reached
-        raise AssertionError("HTTP must not be issued once stop_event is set")
-
-    monkeypatch.setattr(g, "_post", boom)
     with pytest.raises(g.StreamAborted):
         g._post_with_rotation(
             pool, {"owner": "o", "name": "r", "cursor": None},

@@ -322,8 +322,15 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
 
     Each commit doc (one row) is routed INTACT to the smallest length bucket that
     fits its full ``token_ids`` length. Docs longer than the largest length are
-    excluded from fixed-shape output and reported in ``dropped_overlong.json``.
+    excluded from fixed-shape output and reported in ``dropped_overlong.json``
+    (written into ``out_dir`` only when at least one doc is dropped).
     Returns {length: parquet_path} for non-empty buckets only.
+
+    NOTE: ``out_dir`` is the caller's (per-range) temp dir, so the JSON receipt
+    is not durable on its own. Callers that need a durable audit must lift the
+    counts out before deleting ``out_dir`` (see ``read_dropped_overlong``). The
+    return type is kept as the plain {length: path} dict because this function is
+    SHARED by the code stream and the PR export, which only consume the paths.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -381,6 +388,28 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     return paths
 
 
+def read_dropped_overlong(route_dir: Path) -> dict[str, int]:
+    """Lift route_by_fit's over-long drop counts out of its ephemeral receipt.
+
+    ``route_by_fit`` writes ``dropped_overlong.json`` into ``route_dir`` only when
+    it drops at least one over-long doc, and ``route_dir`` lives under the
+    per-range temp tree that ``process_range`` rmtree's. This reads the receipt
+    BEFORE that cleanup so the counts can be recorded durably in the manifest.
+
+    Contract (RULE #1, one clear path): no receipt == zero drops. A receipt that
+    exists but is malformed/missing its keys RAISES (KeyError/JSONDecodeError) --
+    that is a real route_by_fit bug, never silently swallowed.
+    """
+    receipt = route_dir / "dropped_overlong.json"
+    if not receipt.exists():
+        return {"rows": 0, "tokens": 0}
+    report = json.loads(receipt.read_text())
+    return {
+        "rows": int(report["dropped_overlong_rows"]),
+        "tokens": int(report["dropped_overlong_tokens"]),
+    }
+
+
 def recompress_zstd_max(path: Path) -> None:
     """Rewrite a parquet in place with MAX zstd compression (level 22)."""
     import pyarrow.parquet as pq
@@ -435,9 +464,16 @@ def process_range(
 
         route_dir = rwork / "routed"
         routed = route_by_fit(tok, lengths_sorted, route_dir)
+        # Lift the over-long drop counts out of route_by_fit's receipt BEFORE the
+        # finally below rmtree's rwork, so corpus-scale drops are durably audited.
+        dropped_overlong = read_dropped_overlong(route_dir)
         if not routed:
-            raise RepoFailure(repo, "route_by_fit",
-                              f"no docs routed for range [{start_idx}:{end_idx}]")
+            raise RepoFailure(
+                repo, "route_by_fit",
+                f"no docs routed for range [{start_idx}:{end_idx}] "
+                f"(all {dropped_overlong['rows']} docs over-long, "
+                f"{dropped_overlong['tokens']} tokens dropped)",
+            )
 
         per_length: dict[str, dict] = {}
         for L, route_parquet in sorted(routed.items()):
@@ -449,6 +485,11 @@ def process_range(
             "range": [start_idx, end_idx],
             "n_records": n_records,
             "lengths": per_length,
+            # Durable record of over-long docs excluded from all fixed buckets.
+            # The per-range temp dir (and route_by_fit's dropped_overlong.json
+            # receipt) is rmtree'd below, so this is the only surviving audit of
+            # the drop; main() aggregates it into the final run summary.
+            "dropped_overlong": dropped_overlong,
         }
     finally:
         shutil.rmtree(rwork, ignore_errors=True)
@@ -553,6 +594,39 @@ def process_one_repo(
     finally:
         if not keep_temp:
             shutil.rmtree(repo_work, ignore_errors=True)
+
+
+def summarize_done_manifest(
+    done: dict, lengths_sorted: Sequence[int]
+) -> tuple[dict[str, dict], dict[str, int]]:
+    """Aggregate a manifest's ``done`` entries into the run-level report.
+
+    Returns ``(per_length_totals, dropped_overlong_total)``. ``dropped_overlong_total``
+    is the durable corpus-scale audit of over-long commit docs that route_by_fit
+    excluded from every fixed bucket (see process_range): the per-range temp dir
+    holding the ``dropped_overlong.json`` receipt is rmtree'd, so the manifest is
+    the only surviving record. Done entries written before this field existed
+    simply contribute nothing (None -> skipped).
+    """
+    totals = {
+        str(tl): {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0}
+        for tl in lengths_sorted
+    }
+    dropped_overlong_total = {"rows": 0, "tokens": 0}
+    for info in done.values():
+        for tl_s, st in info.get("lengths", {}).items():
+            if tl_s not in totals:
+                continue
+            agg = totals[tl_s]
+            agg["rows"] += st["rows"]
+            agg["valid_tokens"] += st["valid_tokens"]
+            agg["pad_tokens"] += st["pad_tokens"]
+            agg["capacity_tokens"] += st["capacity_tokens"]
+        dropped = info.get("dropped_overlong")
+        if dropped:
+            dropped_overlong_total["rows"] += dropped["rows"]
+            dropped_overlong_total["tokens"] += dropped["tokens"]
+    return totals, dropped_overlong_total
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -719,18 +793,10 @@ def main(argv: list[str]) -> int:
         if own_work_root and not args.keep_temp:
             shutil.rmtree(work_root, ignore_errors=True)
 
-    # ----- cumulative per-length report from the manifest -----
-    totals = {str(tl): {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0}
-              for tl in lengths_sorted}
-    for info in manifest.done.values():
-        for tl_s, st in info.get("lengths", {}).items():
-            if tl_s not in totals:
-                continue
-            agg = totals[tl_s]
-            agg["rows"] += st["rows"]
-            agg["valid_tokens"] += st["valid_tokens"]
-            agg["pad_tokens"] += st["pad_tokens"]
-            agg["capacity_tokens"] += st["capacity_tokens"]
+    # ----- cumulative per-length + dropped-overlong report from the manifest -----
+    totals, dropped_overlong_total = summarize_done_manifest(
+        manifest.done, lengths_sorted
+    )
     summary = {
         "repos_this_run": processed_repos,
         "ranges_this_run": ranges_done,
@@ -741,6 +807,7 @@ def main(argv: list[str]) -> int:
         "total_failed": len(manifest.failed),
         "cumulative_valid_tokens_this_run": cumulative["valid"],
         "per_length_totals": totals,
+        "dropped_overlong_total": dropped_overlong_total,
         "manifest": str(COMMIT_MANIFEST),
     }
     print(json.dumps(summary, indent=2))

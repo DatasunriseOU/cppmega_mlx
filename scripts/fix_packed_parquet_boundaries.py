@@ -72,16 +72,28 @@ TOKEN_ALIGNED_COLUMNS = (
     "edit_op_per_token",
 )
 
-TOKEN_OFFSET_LIST_COLUMNS = (
-    "token_chunk_starts",
-    "token_chunk_ends",
-)
+# token_chunk_starts (inclusive) and token_chunk_ends (exclusive) are shifted
+# explicitly with their respective semantics in repair_row; see
+# _shift_offset / _shift_offset_exclusive.
 
 TOKEN_SPAN_COLUMNS = (
     "changed_chunk_spans",
 )
 
-MARKER_NAMES = ("PRE-COMMIT", "POST-COMMIT", "CONTEXT", "DIFF")
+# Anchor to the EXACT generated marker forms emitted by the producer
+# (tools/clang_indexer/process_commits.py:1260/1283/1361/1382): PRE-COMMIT,
+# CONTEXT and DIFF are fixed strings; POST-COMMIT carries a variable commit
+# subject after the colon (``// === POST-COMMIT: {subject} ===``).  We compare
+# whitespace-normalized text so that ordinary source comments that merely
+# CONTAIN one of these words (for example ``// === DIFF ALGORITHM ===`` or
+# ``// === CONTEXT SWITCH ===``) are NOT misclassified as generated markers and
+# never have <NL> tokens injected into real training text.
+_EXACT_MARKER_TEXTS = (
+    "// === PRE-COMMIT ===",
+    "// === CONTEXT ===",
+    "// === DIFF ===",
+)
+_POST_COMMIT_MARKER_PREFIX = "// === POST-COMMIT:"
 
 
 class TokenPieces:
@@ -135,10 +147,14 @@ def _generated_marker_end(
     if close is None:
         return None
 
-    marker_text = pieces.decode(ids[start : close + 1])
-    if not any(name in marker_text for name in MARKER_NAMES):
-        return None
-    return close
+    # Require an EXACT generated marker form (whitespace-normalized).  Any other
+    # ``// === ... ===`` comment is ordinary source text and is left untouched
+    # (return None): we do NOT inject newlines into rows we cannot positively
+    # identify as collapsed cppmega commit markers.
+    marker_text = " ".join(pieces.decode(ids[start : close + 1]).split())
+    if marker_text in _EXACT_MARKER_TEXTS or marker_text.startswith(_POST_COMMIT_MARKER_PREFIX):
+        return close
+    return None
 
 
 def _needed_insert_positions(row: dict[str, Any], pieces: TokenPieces) -> list[int]:
@@ -224,9 +240,31 @@ def _insert_newline_tokens(ids: list[int], positions: list[int], valid: int, cap
 
 
 def _shift_offset(value: int, positions: list[int]) -> int:
+    """Shift an INCLUSIVE coordinate (chunk start / token-aligned index).
+
+    A token originally at index ``i`` moves to ``i + 1`` for every insertion at
+    ``pos <= i`` (``out >= pos``), so it keeps pointing at the SAME token.
+    """
     out = int(value)
     for pos in positions:
         if out >= pos:
+            out += 1
+    return out
+
+
+def _shift_offset_exclusive(value: int, positions: list[int]) -> int:
+    """Shift an EXCLUSIVE end coordinate (one-past-last; chunk end / span end).
+
+    A chunk covering ``[start, end)`` has its last token at ``end - 1``.  An
+    insertion at ``pos == end`` lands AFTER that last token (before the first
+    excluded token), so the chunk must NOT grow to absorb the inserted <NL>:
+    shift only when the insertion is strictly inside the covered range
+    (``out > pos``).  Using ``>=`` here would over-shift by +1 and extend the
+    prior chunk over the new token.
+    """
+    out = int(value)
+    for pos in positions:
+        if out > pos:
             out += 1
     return out
 
@@ -238,7 +276,7 @@ def _shift_span(span: Any, positions: list[int]) -> Any:
     if "start" in out:
         out["start"] = _shift_offset(int(out["start"]), positions)
     if "end" in out:
-        out["end"] = _shift_offset(int(out["end"]), positions)
+        out["end"] = _shift_offset_exclusive(int(out["end"]), positions)
     return out
 
 
@@ -320,10 +358,16 @@ def repair_row(row: dict[str, Any], pieces: TokenPieces) -> tuple[dict[str, Any]
     repaired["loss_mask"] = loss_mask
     repaired["trained_token_count"] = sum(loss_mask)
 
-    for col in TOKEN_OFFSET_LIST_COLUMNS:
-        values = repaired.get(col)
-        if isinstance(values, list):
-            repaired[col] = [_shift_offset(int(value), positions) for value in values]
+    # token_chunk_starts are INCLUSIVE starts; token_chunk_ends are EXCLUSIVE
+    # (one-past-last, mirroring the producer in
+    # cppmega_mlx/data/nanochat_pipeline/tokenized_enriched.py).  They must use
+    # different shift semantics at an insertion that falls on a chunk edge.
+    starts = repaired.get("token_chunk_starts")
+    if isinstance(starts, list):
+        repaired["token_chunk_starts"] = [_shift_offset(int(v), positions) for v in starts]
+    ends = repaired.get("token_chunk_ends")
+    if isinstance(ends, list):
+        repaired["token_chunk_ends"] = [_shift_offset_exclusive(int(v), positions) for v in ends]
 
     for col in TOKEN_SPAN_COLUMNS:
         values = repaired.get(col)

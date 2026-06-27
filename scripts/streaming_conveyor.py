@@ -368,9 +368,20 @@ class DedupCheckpointController:
 
 def _length_totals(info: dict) -> dict[str, int]:
     totals = {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0}
-    for st in info.get("lengths", {}).values():
+    for bucket, st in info.get("lengths", {}).items():
         for key in totals:
-            totals[key] += int(st.get(key, 0))
+            # Fail-loud (RULE #1): a malformed stat dict must crash here rather
+            # than silently default to 0 -- cumulative['valid'] drives the
+            # --token-budget stop gate and the dedup WAL checkpoint thresholds,
+            # so an undercount overshoots the budget / skips checkpoints. Mirror
+            # the fail-loud st[...] reads in the run report aggregation below.
+            if key not in st:
+                raise KeyError(
+                    f"_length_totals: malformed stat dict for length bucket "
+                    f"{bucket!r} (source={info.get('source')!r}): missing field "
+                    f"{key!r}; present fields = {sorted(st)}"
+                )
+            totals[key] += int(st[key])
     return totals
 
 
@@ -1007,7 +1018,13 @@ def main(argv: list[str]) -> int:
                 claim_repo_once(repo)
                 while len(inflight) >= max_active_repos:
                     drain_one_or_more(block=True)
-                    if args.token_budget is not None and cumulative["valid"] >= args.token_budget:
+                    # Worker threads mutate cumulative['valid'] under manifest_lock
+                    # (see process_one_repo / run_commits_half); snapshot under the
+                    # same lock before the budget comparison so this drain-path read
+                    # is not a concurrent unlocked read while writers are in flight.
+                    with manifest_lock:
+                        cumulative_valid_snapshot = cumulative["valid"]
+                    if args.token_budget is not None and cumulative_valid_snapshot >= args.token_budget:
                         _log(f"Token budget {args.token_budget} reached.")
                         stop_submitting = True
                         break

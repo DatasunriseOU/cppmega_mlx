@@ -47,6 +47,7 @@ deleted after the lib is indexed (bounded disk: ~1 base-lib of source at a time)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -237,6 +238,7 @@ def normalized_body_len(text: str) -> int:
 # --------------------------------------------------------------------------- #
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS symbols (
+    symbol_uid  TEXT NOT NULL PRIMARY KEY,
     qname        TEXT NOT NULL,
     base_lib     TEXT NOT NULL,   -- logical lib key (boost/std/libc/...)
     base_repo    TEXT NOT NULL,   -- the cpp_all subtree the def came from
@@ -248,10 +250,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_public    INTEGER NOT NULL,
     token_est    INTEGER NOT NULL,
     body_len     INTEGER NOT NULL,
-    text         TEXT NOT NULL,
-    PRIMARY KEY (qname, sym_type)
+    text         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qname);
+CREATE INDEX IF NOT EXISTS idx_symbols_qname_type ON symbols(qname, sym_type);
 CREATE INDEX IF NOT EXISTS idx_symbols_lib   ON symbols(base_lib);
 
 CREATE TABLE IF NOT EXISTS symbol_index_libs (
@@ -288,7 +290,38 @@ class GlobalSymbolStore:
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute("PRAGMA synchronous=NORMAL;")
             self.conn.executescript(SCHEMA)
+            self._require_current_schema()
             self.conn.commit()
+
+    def _require_current_schema(self) -> None:
+        cols = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(symbols)").fetchall()
+        }
+        if "symbol_uid" not in cols:
+            raise RuntimeError(
+                f"{self.path}: global symbol index uses old qname-only schema; "
+                "delete/rebuild it with scripts/crossrepo/build_global_symbol_index.py"
+            )
+
+    @staticmethod
+    def _symbol_uid(row: tuple) -> str:
+        qname, base_lib, base_repo, _kind, sym_type, file, line, end_line, *_rest = row
+        text = row[-1]
+        payload = "\x1f".join(
+            str(part)
+            for part in (
+                base_lib,
+                base_repo,
+                sym_type,
+                qname,
+                file,
+                line,
+                end_line,
+                hashlib.sha1(str(text).encode("utf-8")).hexdigest(),
+            )
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     # ---- write path (builder) ----
     def lib_done(self, lib: str) -> bool:
@@ -300,12 +333,13 @@ class GlobalSymbolStore:
     def insert_symbols(self, rows: list[tuple]) -> None:
         # rows: (qname, base_lib, base_repo, kind, sym_type, file, line,
         #        end_line, is_public, token_est, body_len, text)
+        keyed_rows = [(self._symbol_uid(row), *row) for row in rows]
         self.conn.executemany(
             "INSERT OR IGNORE INTO symbols "
-            "(qname, base_lib, base_repo, kind, sym_type, file, line, end_line, "
+            "(symbol_uid, qname, base_lib, base_repo, kind, sym_type, file, line, end_line, "
             " is_public, token_est, body_len, text) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            rows,
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            keyed_rows,
         )
 
     def mark_lib_done(self, lib: str, tier: str, *, n_files: int, n_funcs: int,

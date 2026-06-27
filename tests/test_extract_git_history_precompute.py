@@ -8,6 +8,7 @@ from pathlib import Path
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
 NANOCHAT = MLX_ROOT / "scripts" / "nanochat_data"
+SCRIPT = NANOCHAT / "extract_git_history.py"
 if str(NANOCHAT) not in sys.path:
     sys.path.insert(0, str(NANOCHAT))
 
@@ -176,6 +177,97 @@ def test_emitted_records_carry_contiguous_indices_end_to_end(tmp_path):
     assert c2 not in index_by_commit
     assert index_by_commit[c1] == 0
     assert index_by_commit[c3] == 1  # the rejected commit did not inflate it
+
+
+def _make_cpp_repo(repo: Path) -> str:
+    """Create a real 2-commit C/C++ repo whose HEAD has an emittable 'M' diff."""
+    repo.mkdir()
+    _git(repo, "init")
+    source = repo / "main.cpp"
+    source.write_text("int f() { return 1; }\n", encoding="utf-8")
+    _git(repo, "add", "main.cpp")
+    _commit(repo, "initial")
+    source.write_text("int f() { return 2; }\n", encoding="utf-8")
+    return _commit(repo, "change value")
+
+
+def test_main_fails_loud_on_per_repo_extraction_failure(tmp_path):
+    """A repo that fails to extract must fail the whole run loud (no silent exit 0).
+
+    Real end-to-end run of the CLI over a --repo_dir with two real git repos:
+      * ``repo_ok`` HAS refs/notes -> ``--notes on`` accepts it and it emits
+        records (a partial corpus is written to the output JSONL).
+      * ``repo_bad`` has NO refs/notes -> ``--notes on`` makes process_repo
+        RAISE for that repo only.
+
+    Before the fix, the per-repo ``except`` printed the error, the JSONL
+    finalized, and main() returned (exit 0) -- a partial corpus looking like a
+    clean run, with no durable record of the failure. After the fix the run must
+    exit non-zero AND drop a durable failures manifest naming the failed repo.
+    """
+    repo_dir = tmp_path / "repos"
+    repo_dir.mkdir()
+
+    ok = repo_dir / "repo_ok"
+    ok_head = _make_cpp_repo(ok)
+    # Give repo_ok a git note so `--notes on` accepts it and it extracts.
+    _git(
+        ok,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.com",
+        "notes",
+        "add",
+        "-m",
+        "code review approved",
+        ok_head,
+    )
+
+    bad = repo_dir / "repo_bad"
+    _make_cpp_repo(bad)  # no notes -> `--notes on` raises for this repo
+
+    out = tmp_path / "commits.jsonl"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo_dir",
+            str(repo_dir),
+            "--output",
+            str(out),
+            "--notes",
+            "on",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Run failed loud (non-zero exit) instead of silently finalizing at exit 0.
+    assert proc.returncode != 0, (
+        f"expected non-zero exit; stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    )
+
+    # Durable failure manifest written next to the output, naming the failed repo.
+    manifest_path = Path(str(out) + ".failures.json")
+    assert manifest_path.exists(), "expected a durable failures manifest"
+    manifest = json.loads(manifest_path.read_text())
+    failed_names = {item["repo_name"] for item in manifest["failed"]}
+    assert "repo_bad" in failed_names
+    assert "repo_ok" not in failed_names
+    assert manifest["failed_count"] == 1
+    assert manifest["total_repos"] == 2
+    # The error is the real, specific extraction failure (not papered over).
+    assert "refs/notes" in manifest["failed"][0]["error"]
+
+    # The partial corpus (repo_ok's records) was still written -- but the run
+    # is marked failed, so it can never be mistaken for a clean extraction.
+    records = [
+        json.loads(line) for line in out.read_text().splitlines() if line.strip()
+    ]
+    assert records, "repo_ok should have produced at least one record"
+    assert all(r["repo"] == "repo_ok" for r in records)
 
 
 def test_output_file_lock_rejects_second_process(tmp_path):

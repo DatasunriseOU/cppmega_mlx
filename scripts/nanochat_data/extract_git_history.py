@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional, TypedDict
 
@@ -678,6 +679,7 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     total_records = 0
+    failed_repos: list[dict[str, str]] = []
     start_time = time.time()
     output_lock = OutputFileLock(args.output)
     output_lock.acquire()
@@ -700,7 +702,20 @@ def main():
                     total_records += stats["records_written"]
                     print(f"  [{repo_name}] {stats['records_written']:,} records")
                 except Exception as e:
+                    # Do NOT swallow: collect the failure and keep going only so a
+                    # multi-repo run reports EVERY failing repo at once instead of
+                    # aborting on the first. The run still fails loud below (durable
+                    # manifest + non-zero exit) -- a partial corpus (some repos
+                    # silently missing) must never look like a clean run.
                     print(f"  [{repo_name}] ERROR: {e}")
+                    failed_repos.append(
+                        {
+                            "repo_path": os.path.abspath(repo_path),
+                            "repo_name": repo_name,
+                            "error": repr(e),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
     finally:
         output_lock.close()
 
@@ -708,9 +723,37 @@ def main():
     output_size = os.path.getsize(args.output)
     print("\n=== SUMMARY ===")
     print(f"Repos: {len(repos)}")
+    print(f"Failed repos: {len(failed_repos)}")
     print(f"Total records: {total_records:,}")
     print(f"Time: {elapsed:.0f}s ({elapsed / 60:.1f}m)")
     print(f"Output: {args.output} ({output_size / (1024**3):.2f} GB)")
+
+    if failed_repos:
+        # One clear path: any repo that fails to extract fails the whole run.
+        # Persist a durable failure manifest next to the output BEFORE raising so
+        # the failing repos survive even when stdout is lost, then raise to exit
+        # non-zero (no silent exit-0 over a partially-extracted corpus).
+        manifest_path = Path(str(args.output) + ".failures.json")
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "total_repos": len(repos),
+                    "failed_count": len(failed_repos),
+                    "failed": failed_repos,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        failed_names = ", ".join(item["repo_name"] for item in failed_repos)
+        raise RuntimeError(
+            f"{len(failed_repos)}/{len(repos)} repos failed extraction "
+            f"({failed_names}); see failure manifest: {manifest_path}"
+        )
 
 
 if __name__ == "__main__":

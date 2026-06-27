@@ -19,12 +19,17 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 from typing import Iterable
 
 
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
 DEFAULT_PREFIX = "cppmega-sidecar/valid-all-20260627"
+
+# The audit receipt is downloaded as one of the selections; this is the remote
+# subprefix and the JSON filename the producer (audit_sidecar_parquet.py) writes.
+RECEIPT_REMOTE = "audits/sidecar_audit_all_final_poststop_valid"
+RECEIPT_FILENAME = "sidecar_parquet_audit.json"
+PARQUET_REMOTE_PREFIX = "parquet/"
 
 
 def _load_env_file(path: Path) -> None:
@@ -166,6 +171,115 @@ def _default_manifest(
     }
 
 
+def _receipt_path_for(dest: Path, manifest: dict) -> Path:
+    """Locate the downloaded audit receipt from the manifest selections, or RAISE."""
+    for item in manifest["selections"]:
+        if item["remote"].strip("/") == RECEIPT_REMOTE:
+            return dest / item["local"] / RECEIPT_FILENAME
+    raise SystemExit(
+        "manifest selections do not include the audit receipt "
+        f"({RECEIPT_REMOTE!r}); the downloaded set cannot be verified."
+    )
+
+
+def _verify_downloaded_set(
+    *,
+    dest: Path,
+    manifest: dict,
+    require_token_total: bool,
+) -> dict:
+    """Fail-closed consume-side gate over the freshly downloaded set.
+
+    ``aws s3 sync`` ETag-checks individual objects, so a single truncated file is
+    already caught, but a *missing-shards SET* (an absent or partial remote
+    prefix) syncs "successfully" and would otherwise be trusted as the verified
+    set. This proves the consume side by RAISING (``SystemExit``) unless ALL of
+    the following hold:
+
+      * the audit receipt is present and green (``bad_files == bad_rows == 0``);
+      * the manifest's ``verified_valid_tokens`` matches the receipt total (when
+        a real downloaded manifest is in use -- not the built-in default);
+      * every downloaded parquet bucket has exactly the shard count the receipt
+        certified for that ``kind/bucket`` -- this is what catches a
+        missing-shards SET that the per-object ETag check cannot see.
+    """
+    receipt_path = _receipt_path_for(dest, manifest)
+    if not receipt_path.exists():
+        raise SystemExit(
+            f"audit receipt missing after download: {receipt_path}. "
+            "Refusing to trust an unverified set."
+        )
+    report = json.loads(receipt_path.read_text(encoding="utf-8"))
+    total = report["total"]
+    bad_files = int(total["bad_files"])
+    bad_rows = int(total["bad_rows"])
+    if bad_files or bad_rows:
+        raise SystemExit(
+            f"audit receipt is not green: {receipt_path} "
+            f"bad_files={bad_files} bad_rows={bad_rows}. Refusing to trust the set."
+        )
+
+    receipt_valid_tokens = int(total["valid_tokens"])
+    manifest_token_total = manifest.get("verified_valid_tokens")
+    if require_token_total and manifest_token_total is None:
+        raise SystemExit(
+            "downloaded manifest is missing verified_valid_tokens; cannot "
+            f"reconcile the downloaded set against the audit receipt {receipt_path}."
+        )
+    if (
+        manifest_token_total is not None
+        and int(manifest_token_total) != receipt_valid_tokens
+    ):
+        raise SystemExit(
+            "manifest verified_valid_tokens "
+            f"({int(manifest_token_total)}) != receipt valid_tokens "
+            f"({receipt_valid_tokens}); manifest/receipt pair is inconsistent. "
+            f"Receipt={receipt_path}."
+        )
+
+    by_kind_bucket = report["by_kind_bucket"]
+    mismatches: list[str] = []
+    checked = 0
+    for item in manifest["selections"]:
+        remote = item["remote"].strip("/")
+        if not remote.startswith(PARQUET_REMOTE_PREFIX):
+            continue
+        key = remote[len(PARQUET_REMOTE_PREFIX):]  # e.g. "parquet/code/1024" -> "code/1024"
+        local_dir = dest / item["local"]
+        downloaded = len(list(local_dir.glob("*.parquet")))
+        if key not in by_kind_bucket:
+            mismatches.append(
+                f"{remote}: downloaded {downloaded} shard(s) but the receipt has "
+                f"no entry for {key!r}"
+            )
+            continue
+        expected = int(by_kind_bucket[key]["files"])
+        if downloaded != expected:
+            mismatches.append(
+                f"{remote}: downloaded {downloaded} shard(s) into {local_dir} but "
+                f"the receipt certified {expected}"
+            )
+        checked += 1
+    if mismatches:
+        raise SystemExit(
+            f"downloaded set does not match the audit receipt ({receipt_path}):\n"
+            + "\n".join(mismatches)
+        )
+    if checked == 0:
+        raise SystemExit(
+            "no parquet bucket selections were verified against the receipt "
+            f"{receipt_path}; refusing to certify an empty set."
+        )
+
+    return {
+        "receipt": str(receipt_path),
+        "verified_valid_tokens": receipt_valid_tokens,
+        "buckets_verified": checked,
+        "bad_files": bad_files,
+        "bad_rows": bad_rows,
+    }
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bucket", required=True)
@@ -245,6 +359,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         for future in as_completed(futures):
             print(f"downloaded {future.result()}", flush=True)
+
+    if not args.dry_run:
+        verification = _verify_downloaded_set(
+            dest=args.dest,
+            manifest=manifest,
+            require_token_total=not args.use_default_manifest,
+        )
+        print(json.dumps({"verified": verification}, indent=2), flush=True)
     return 0
 
 

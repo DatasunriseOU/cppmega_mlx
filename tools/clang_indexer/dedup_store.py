@@ -135,11 +135,20 @@ class DedupStore:
     SQLITE_BUSY_TIMEOUT_MS = int(SQLITE_TIMEOUT_SECONDS * 1000)
     WRITE_RETRY_SLEEP_SECONDS = 0.05
     WRITE_RETRY_MAX_SLEEP_SECONDS = 2.0
-    # Keep cross-process writer transactions reasonably short without forcing a
-    # commit for every exact/near dedup insert. Chunk claims still commit
-    # immediately because they are the strict cross-process coordination ledger.
+    # Bound cross-process writer transactions. ONE dedup DB is shared by several
+    # concurrent producers (the code + commit stages, and --repo-workers>1). Under
+    # SQLite WAL each connection's UNCOMMITTED writes are invisible to every other
+    # connection, so each near-dup reference doc (its minhash signature + lsh band
+    # rows) that a writer buffers before committing is a window in which a
+    # concurrent writer cannot see it and may accept the SAME near-duplicate. Exact
+    # dups are still backstopped (the chunk_claims ledger commits immediately and
+    # the exact table is INSERT-OR-IGNORE), but NEAR dups have no such backstop, so
+    # this buffer size IS the per-writer cross-process near-dedup leak window. Keep
+    # the default modest (128) so that window stays small; only raise
+    # CPPMEGA_DEDUP_MAX_PENDING_BEFORE_COMMIT for single-writer runs, where the near
+    # index is fully self-visible and larger transactions merely cut commit count.
     MAX_PENDING_BEFORE_COMMIT = int(
-        os.environ.get("CPPMEGA_DEDUP_MAX_PENDING_BEFORE_COMMIT", "1000")
+        os.environ.get("CPPMEGA_DEDUP_MAX_PENDING_BEFORE_COMMIT", "128")
     )
     WAL_AUTOCHECKPOINT_PAGES = int(
         os.environ.get("CPPMEGA_DEDUP_WAL_AUTOCHECKPOINT_PAGES", "10000")

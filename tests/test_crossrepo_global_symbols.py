@@ -93,6 +93,42 @@ def test_store_reader_normalizes_std_inline_namespace(tmp_path):
     reader.close()
 
 
+def test_store_preserves_distinct_definitions_with_same_qname(tmp_path):
+    b = _load_builder()
+    db = str(tmp_path / "gsi.sqlite")
+    store = b.GlobalSymbolStore(db)
+    store.insert_symbols([
+        (
+            "std::basic_string::append", "std", "STL", 2, "func",
+            "stl/inc/xstring", 10, 18, 1, 16, 64,
+            "void append(const char*) { /* overload one */ }",
+        ),
+        (
+            "std::basic_string::append", "std", "llvm-project", 2, "func",
+            "llvm-project/libcxx/include/string", 200, 215, 1, 32, 128,
+            "void append(size_type, char) { /* overload two */ }",
+        ),
+    ])
+    store.commit()
+    store.close()
+
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT base_repo, file, line FROM symbols "
+            "WHERE qname='std::basic_string::append' AND sym_type='func' "
+            "ORDER BY base_repo, file, line"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [
+        ("STL", "stl/inc/xstring", 10),
+        ("llvm-project", "llvm-project/libcxx/include/string", 200),
+    ]
+
+
 def test_is_public_symbol_filters():
     b = _load_builder()
     # A1 (public_only=False): accept normal qnames, reject internal segments.
