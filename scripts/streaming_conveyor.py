@@ -53,12 +53,19 @@ import fcntl
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from pathlib import Path
 from typing import Sequence
 
@@ -101,12 +108,210 @@ DEFAULT_DEDUP_CHECKPOINT_TOKENS = 25_000_000
 DEFAULT_RUN_LOCK_DIR = CONVEYOR_ROOT / "locks"
 DEFAULT_WORK_PARENT = CONVEYOR_ROOT / "tmp"
 
+# Stable, repo-keyed cache for the EXPENSIVE git-history extraction output. This
+# deliberately lives OUTSIDE the randomized per-run work_root so the commit
+# records (e.g. php-src's ~6h / 10GB jsonl) survive a kill/restart with the SAME
+# args -- the new run gets a fresh random work_root, so a per-run jsonl would be
+# orphaned and re-extracted from scratch. The cache holds <repo>_commits.jsonl
+# plus a <repo>_commits.jsonl.done sentinel (line/size/mtime), and is only
+# deleted once EVERY unit of the repo (code + all ranges) is marked done.
+EXTRACT_CACHE_ROOT = CONVEYOR_ROOT / "extract_cache"
+
 _PRINT_LOCK = threading.Lock()
+
+# Cooperative shutdown flag set by the SIGINT/SIGTERM handlers in main(). When
+# set, the conveyor stops SUBMITTING new repos/ranges, lets in-flight subprocess
+# tasks drain, and cancels queued-but-unstarted range futures (their units stay
+# un-marked so resume re-runs them). A SECOND signal forces an immediate exit.
+STOP_EVENT = threading.Event()
 
 
 def _log(msg: str) -> None:
     with _PRINT_LOCK:
         print(msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Extract checkpoint: never re-run the (~6h) extract_git_history for a repo whose
+# commit extraction already completed. The records jsonl is written to a STABLE
+# repo-keyed cache (EXTRACT_CACHE_ROOT/<repo>/) guarded by a .done sentinel.
+# --------------------------------------------------------------------------- #
+def extract_cache_dir(repo: str) -> Path:
+    """Stable, repo-keyed dir holding <repo>_commits.jsonl[+.done]."""
+    return EXTRACT_CACHE_ROOT / repo
+
+
+def _extract_sentinel_path(jsonl: Path) -> Path:
+    return Path(str(jsonl) + ".done")
+
+
+def _count_jsonl_lines(path: Path) -> int:
+    n = 0
+    with path.open("rb") as fh:
+        for _ in fh:
+            n += 1
+    return n
+
+
+def _write_extract_sentinel(jsonl: Path, n_records: int) -> Path:
+    """Atomically stamp the completion sentinel next to ``jsonl``.
+
+    Records line_count plus the jsonl's size+mtime so a later resume can validate
+    the cache with a cheap stat() instead of re-reading the (10GB) file.
+    """
+    st = jsonl.stat()
+    sentinel = _extract_sentinel_path(jsonl)
+    payload = {
+        "jsonl": str(jsonl),
+        "line_count": int(n_records),
+        "size_bytes": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    tmp = sentinel.with_name(f"{sentinel.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.replace(sentinel)  # atomic on POSIX
+    return sentinel
+
+
+def _read_valid_sentinel(jsonl: Path) -> int | None:
+    """Return the recorded record count iff a sentinel matches ``jsonl`` exactly.
+
+    A match requires the jsonl to exist non-empty AND its current size+mtime to
+    equal the stamped values. Any mismatch (truncated by a kill mid-extract,
+    corrupt sentinel, missing file) returns None -> the caller re-extracts the
+    full records (the one clear path; NOT a degraded/partial output).
+    """
+    sentinel = _extract_sentinel_path(jsonl)
+    if not jsonl.exists() or not sentinel.exists():
+        return None
+    st = jsonl.stat()
+    if st.st_size == 0:
+        return None
+    try:
+        meta = json.loads(sentinel.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if int(meta.get("size_bytes", -1)) != int(st.st_size):
+        return None
+    if int(meta.get("mtime_ns", -1)) != int(st.st_mtime_ns):
+        return None
+    lc = meta.get("line_count")
+    return int(lc) if lc is not None else None
+
+
+def _discover_existing_jsonl(repo: str, work_root: Path, work_parent: Path) -> Path | None:
+    """Locate a pre-existing <repo>_commits.jsonl from this or a prior run.
+
+    Deterministic search order: stable cache, the current work_root, then any
+    prior randomized conveyor work dir under work_parent / DEFAULT_WORK_PARENT
+    (back-compat: php-src was extracted by older code into a now-orphaned random
+    work_root). Returns the first existing non-empty path, else None. Safe under
+    the per-stream RunLock, which guarantees no OTHER live conveyor owns these
+    dirs while we adopt from them.
+    """
+    candidates: list[Path] = [
+        extract_cache_dir(repo) / f"{repo}_commits.jsonl",
+        work_root / repo / f"{repo}_commits.jsonl",
+    ]
+    parents = {p for p in (work_parent, DEFAULT_WORK_PARENT) if p is not None}
+    for parent in parents:
+        if parent.exists():
+            candidates.extend(
+                sorted(parent.glob(f"streaming_conveyor_*/{repo}/{repo}_commits.jsonl"))
+            )
+    for cand in candidates:
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
+def ensure_commit_records(
+    repo: str,
+    repo_dir: Path,
+    work_root: Path,
+    work_parent: Path,
+    manifest: Manifest,
+    resume: bool,
+) -> tuple[Path, int]:
+    """Return (records_jsonl, n_records), running extract_git_history ONLY if needed.
+
+    Resolution order (all writing/reading the STABLE EXTRACT_CACHE_ROOT/<repo>):
+      (a) HIT: a valid .done sentinel matches the cached jsonl -> reuse instantly.
+      (b) ADOPT/BACK-COMPAT: a jsonl is discoverable from this/a prior run (or the
+          manifest already has a <repo>::r<...> range unit, proving the prior
+          extract finished) -> adopt it into the cache, count lines, stamp the
+          sentinel retroactively, reuse. This is what preserves php-src's ~6h on
+          the upcoming restart.
+      (c) FRESH: nothing reusable -> run extract_git_history into the cache and
+          stamp the sentinel on success.
+    RAISES (RULE #1) on empty git log / empty extract; never returns a partial set.
+    """
+    cache_dir = extract_cache_dir(repo)
+    cache_jsonl = cache_dir / f"{repo}_commits.jsonl"
+    repo_has_range_done = any(k.startswith(f"{repo}::r") for k in manifest.done)
+
+    if resume:
+        # (a) Cheap stat-validated cache hit.
+        lc = _read_valid_sentinel(cache_jsonl)
+        if lc is not None:
+            _log(f"EXTRACT-CKPT HIT {repo}: reuse {cache_jsonl} ({lc} records); "
+                 f"skip ~extract_git_history")
+            return cache_jsonl, lc
+
+        # (b) Adopt an existing jsonl (stable cache miss but a prior extract exists).
+        existing = _discover_existing_jsonl(repo, work_root, work_parent)
+        if existing is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            if existing.resolve() != cache_jsonl.resolve():
+                cache_jsonl.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(existing), str(cache_jsonl))  # rename within fs / copy across
+            n = _count_jsonl_lines(cache_jsonl)
+            if n == 0:
+                raise RepoFailure(repo, "extract_git_history",
+                                  f"adopted commit jsonl is empty: {cache_jsonl}")
+            _write_extract_sentinel(cache_jsonl, n)
+            tag = "BACK-COMPAT" if repo_has_range_done else "ADOPT"
+            _log(f"EXTRACT-CKPT {tag} {repo}: adopted {existing} -> {cache_jsonl} "
+                 f"({n} records); stamped sentinel; skip ~extract_git_history")
+            return cache_jsonl, n
+
+        if repo_has_range_done:
+            # Manifest proves the extract finished, but no jsonl survived anywhere.
+            # extract_git_history is deterministic (git log order), so a fresh
+            # re-extract reproduces the SAME record order and already-done ranges
+            # still resume-skip. Loud, not silent.
+            _log(f"EXTRACT-CKPT MISS {repo}: manifest has done ranges but NO jsonl "
+                 f"found on disk; re-extracting (deterministic order preserves "
+                 f"done-range alignment)")
+
+    # (c) Fresh extract into the stable cache. FAIL LOUD on empty git log / output.
+    commit_list = get_commit_list(repo_dir)
+    if not commit_list:
+        raise RepoFailure(repo, "git_log", "no --no-merges --diff-filter=M commits")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
+    n = _count_jsonl_lines(records_jsonl)
+    if n == 0:
+        raise RepoFailure(repo, "extract_git_history",
+                          f"zero records after extract for {repo}")
+    _write_extract_sentinel(records_jsonl, n)
+    _log(f"EXTRACT-CKPT FRESH {repo}: extracted {n} records -> {records_jsonl}; "
+         f"stamped sentinel")
+    return records_jsonl, n
+
+
+def repo_fully_done(
+    repo: str, manifest: Manifest, streams: str, all_ranges_done: bool
+) -> bool:
+    """True iff EVERY unit this run is responsible for is marked done in the manifest.
+
+    Used to gate temp + extract-cache deletion: a mid-repo kill, a failed unit,
+    or a signal-cancelled range leaves this False -> temp is RETAINED for resume.
+    """
+    code_ok = (streams not in {"both", "code"}) or manifest.is_done(code_key(repo))
+    commits_ok = (streams not in {"both", "commits"}) or all_ranges_done
+    return code_ok and commits_ok
 
 
 class ConcurrentManifest(Manifest):
@@ -441,6 +646,8 @@ def run_commits_half(
     repo: str,
     repo_dir: Path,
     repo_work: Path,
+    work_root: Path,
+    work_parent: Path,
     lengths_commits: Sequence[int],
     range_size: int,
     pool: ThreadPoolExecutor,
@@ -455,31 +662,37 @@ def run_commits_half(
     memory_limit_gb: float = 10.0,
     progress: ProgressWriter | None = None,
     checkpoint: DedupCheckpointController | None = None,
-) -> tuple[int, int]:
-    """Extract commit records once, fan ranges to the pool. Returns (done, failed).
+) -> tuple[int, int, bool]:
+    """Extract commit records once (checkpointed), fan ranges to the pool.
 
-    .git is deleted immediately after extract_git_history (records captured),
-    keeping disk bounded. Each range is checkpointed exactly as ``<repo>::r<start>``
-    so resume skips finished ranges. RAISES RepoFailure only for the up-front
+    Returns ``(done, failed, all_ranges_done)``. The records jsonl comes from
+    :func:`ensure_commit_records`, which REUSES a stable cached extract whenever
+    possible (never re-running the ~6h extract_git_history on resume). .git is
+    deleted immediately after the records are available, keeping disk bounded.
+    Each range is checkpointed exactly as ``<repo>::r<start>`` so resume skips
+    finished ranges. On STOP_EVENT we stop submitting new ranges and cancel any
+    queued-but-unstarted ones (their units stay un-marked -> resume re-runs them),
+    while in-flight ranges drain. RAISES RepoFailure only for the up-front
     git-log / extract steps; per-range failures are recorded and skipped.
+    ``all_ranges_done`` is True iff EVERY range key is marked done afterwards
+    (drives temp/extract-cache retention).
     """
     lengths_sorted = tuple(sorted(int(x) for x in lengths_commits))
     smallest = lengths_sorted[0]
 
-    commit_list = get_commit_list(repo_dir)
-    if not commit_list:
-        raise RepoFailure(repo, "git_log", "no --no-merges --diff-filter=M commits")
-    records_jsonl = stage_extract_commits(repo, repo_dir, repo_work)
+    # Reuse a cached/adopted extract when available; never re-run the ~6h extract
+    # for a repo whose commit extraction already completed (sentinel or manifest).
+    records_jsonl, n_records = ensure_commit_records(
+        repo, repo_dir, work_root, work_parent, manifest, resume,
+    )
 
-    # .git no longer needed -> free disk now (records already captured).
+    # .git no longer needed -> free disk now (records already captured/cached).
     git_dir = repo_dir / ".git"
     if git_dir.exists():
         shutil.rmtree(git_dir, ignore_errors=True)
 
     # Range over ACTUAL emitted record count (extract keeps only C/C++-touching
     # commits, so the records JSONL is a subset; slicing by line index aligns).
-    with records_jsonl.open("r", encoding="utf-8") as fh:
-        n_records = sum(1 for _ in fh)
     if n_records == 0:
         raise RepoFailure(repo, "extract_git_history",
                           f"zero records after extract for {repo}")
@@ -488,6 +701,9 @@ def run_commits_half(
 
     futures = {}
     for (start, end) in ranges:
+        if STOP_EVENT.is_set():
+            _log(f"STOP: not submitting further ranges for {repo} (from r{start})")
+            break
         rkey = range_key(repo, start)
         if resume and manifest.is_done(rkey):
             _log(f"SKIP (done) {rkey}")
@@ -502,11 +718,56 @@ def run_commits_half(
 
     done = 0
     failed = 0
+    cancelled_pending = False
     for fut in as_completed(futures):
+        if STOP_EVENT.is_set() and not cancelled_pending:
+            # Cancel queued-but-unstarted ranges; they stay un-marked so resume
+            # re-runs them. Running ranges cannot be cancelled and drain below.
+            n_cancelled = sum(1 for f in futures if not f.done() and f.cancel())
+            cancelled_pending = True
+            if n_cancelled:
+                _log(f"STOP: cancelled {n_cancelled} queued range(s) for {repo}; "
+                     f"draining in-flight")
         start, end = futures[fut]
         rkey = range_key(repo, start)
         try:
             rinfo = fut.result()
+        except CancelledError:
+            # Never started -> leave un-marked so resume re-runs this range.
+            continue
+        except RepoFailure as exc:
+            _log(f"FAIL {rkey}: {exc}")
+            failed += 1
+            with manifest_lock:
+                manifest.mark_failed(rkey, exc.stage, exc.detail)
+            if progress is not None:
+                progress.emit(
+                    "unit_failed",
+                    stream="commits",
+                    repo=repo,
+                    unit=rkey,
+                    range=[start, end],
+                    stage=exc.stage,
+                    detail=exc.detail[:2000],
+                )
+            continue
+        except Exception as exc:  # surface unexpected failures loud
+            _log(f"FAIL {rkey}: unexpected {type(exc).__name__}: {exc}")
+            failed += 1
+            with manifest_lock:
+                manifest.mark_failed(rkey, "unexpected", str(exc))
+            if progress is not None:
+                progress.emit(
+                    "unit_failed",
+                    stream="commits",
+                    repo=repo,
+                    unit=rkey,
+                    range=[start, end],
+                    stage="unexpected",
+                    detail=str(exc)[:2000],
+                )
+            continue
+        else:
             with manifest_lock:
                 manifest.mark_done(rkey, rinfo)
             done += 1
@@ -533,37 +794,12 @@ def run_commits_half(
             _log(f"DONE {rkey}: ranges [{start}:{end}] "
                  f"buckets={sorted(rinfo['lengths'].keys())} "
                  f"(+{added} @ {smallest}, cum_all={cumulative['valid']})")
-        except RepoFailure as exc:
-            _log(f"FAIL {rkey}: {exc}")
-            failed += 1
-            with manifest_lock:
-                manifest.mark_failed(rkey, exc.stage, exc.detail)
-            if progress is not None:
-                progress.emit(
-                    "unit_failed",
-                    stream="commits",
-                    repo=repo,
-                    unit=rkey,
-                    range=[start, end],
-                    stage=exc.stage,
-                    detail=exc.detail[:2000],
-                )
-        except Exception as exc:  # surface unexpected failures loud
-            _log(f"FAIL {rkey}: unexpected {type(exc).__name__}: {exc}")
-            failed += 1
-            with manifest_lock:
-                manifest.mark_failed(rkey, "unexpected", str(exc))
-            if progress is not None:
-                progress.emit(
-                    "unit_failed",
-                    stream="commits",
-                    repo=repo,
-                    unit=rkey,
-                    range=[start, end],
-                    stage="unexpected",
-                    detail=str(exc)[:2000],
-                )
-    return done, failed
+
+    # True iff EVERY range for this repo is now marked done in the manifest
+    # (covers resume-skipped + newly-done; excludes cancelled/failed). Drives
+    # temp + extract-cache retention in process_one_repo.
+    all_ranges_done = all(manifest.is_done(range_key(repo, s)) for (s, _e) in ranges)
+    return done, failed, all_ranges_done
 
 
 # --------------------------------------------------------------------------- #
@@ -576,6 +812,7 @@ def process_one_repo(
     lengths_commits: Sequence[int],
     range_size: int,
     work_root: Path,
+    work_parent: Path,
     pool: ThreadPoolExecutor,
     manifest: Manifest,
     manifest_lock: threading.Lock,
@@ -596,13 +833,16 @@ def process_one_repo(
 
     The repo was extracted ONCE (incl .git) by the .git-preserving stream into
     ``repo_dir`` (== work_root/<repo>/_src). The CODE half runs first (it does
-    NOT touch .git); then the COMMITS half consumes + deletes .git. The whole
-    repo work dir is removed at the end (bounded disk). RULE #1: a failure in
-    one half is recorded; the other half still runs.
+    NOT touch .git); then the COMMITS half consumes + deletes .git. The repo work
+    dir (and the stable extract cache) are removed at the end ONLY when EVERY unit
+    of the repo is marked done; an interrupted / failed / partial repo RETAINS its
+    temp so resume loses zero work. RULE #1: a failure in one half is recorded;
+    the other half still runs.
     """
     repo_work = work_root / repo
     repo_work.mkdir(parents=True, exist_ok=True)
     result = {"repo": repo, "code": None, "commits_done": 0, "commits_failed": 0}
+    all_ranges_done = streams not in {"both", "commits"}  # True when commits disabled
     try:
         # ---- CODE half (skip if already done) ----
         if streams in {"both", "code"}:
@@ -659,8 +899,9 @@ def process_one_repo(
         # ---- COMMITS half (per-range resume + checkpoint inside) ----
         if streams in {"both", "commits"}:
             try:
-                done, failed = run_commits_half(
-                    repo, repo_dir, repo_work, lengths_commits, range_size,
+                done, failed, all_ranges_done = run_commits_half(
+                    repo, repo_dir, repo_work, work_root, work_parent,
+                    lengths_commits, range_size,
                     pool, manifest, manifest_lock, resume, cumulative,
                     dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
                     progress, checkpoint,
@@ -669,15 +910,27 @@ def process_one_repo(
                 result["commits_failed"] = failed
             except RepoFailure as exc:
                 _log(f"FAIL {repo}::commits: {exc}")
+                all_ranges_done = False
                 with manifest_lock:
                     manifest.mark_failed(f"{repo}::commits", exc.stage, exc.detail)
         return result
     finally:
-        # CODE half already cleaned work_root/<repo>/<repo>-internal via
-        # process_one_repo; here we remove the whole repo dir incl _src so only
-        # ~1 repo of source ever exists on disk.
-        if not keep_temp:
+        # TEMP RETENTION (requirement 3): delete the repo work dir (incl _src) AND
+        # the stable extract cache ONLY when EVERY unit of this repo is marked done
+        # (code + every range). A mid-repo kill, a failed unit, or signal-cancelled
+        # ranges leave this False -> the temp + cached commit records are RETAINED
+        # so resume re-uses them and loses zero work. Only on full completion do we
+        # reclaim disk (bounded ~1 repo of source on disk for fully-done repos).
+        fully_done = repo_fully_done(repo, manifest, streams, all_ranges_done)
+        if keep_temp:
+            pass
+        elif fully_done:
             shutil.rmtree(repo_work, ignore_errors=True)
+            shutil.rmtree(extract_cache_dir(repo), ignore_errors=True)
+        else:
+            _log(f"RETAIN temp for {repo}: not all units marked done "
+                 f"(interrupted/failed/partial); kept {repo_work} + extract cache "
+                 f"{extract_cache_dir(repo)} for resume")
 
 
 # --------------------------------------------------------------------------- #
@@ -790,6 +1043,28 @@ def main(argv: list[str]) -> int:
     if max_active_repos < repo_workers:
         raise SystemExit("--max-active-repos must be >= --repo-workers")
 
+    # SIGNAL HANDLER (requirement 1): cooperative, fail-loud shutdown. The first
+    # SIGINT/SIGTERM sets STOP_EVENT -> the submission loops stop staging new
+    # repos and run_commits_half stops/cancels new ranges, while in-flight
+    # subprocess tasks drain and only COMPLETED units are marked done (the
+    # manifest is already persisted atomically per mark, so nothing partial can be
+    # reported as done). In-progress repo temp + extract caches are RETAINED. A
+    # SECOND signal forces an immediate os._exit (skips all cleanup, so temp is
+    # preserved). Installed in the main thread before any streaming begins.
+    def _on_signal(signum, _frame):
+        name = signal.Signals(signum).name
+        if STOP_EVENT.is_set():
+            _log(f"Signal {name} again: FORCING immediate exit (130). Completed "
+                 "units already persisted; in-progress temp retained for resume.")
+            os._exit(130)
+        STOP_EVENT.set()
+        _log(f"Signal {name} received: CHECKPOINTING -- no new repos/ranges "
+             "submitted; draining in-flight tasks; manifest is atomic. Send the "
+             "signal again to force-exit.")
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
     run_locks: list[RunLock] = []
     if not args.no_run_lock:
         lock_dir = Path(args.run_lock_dir)
@@ -819,6 +1094,7 @@ def main(argv: list[str]) -> int:
 
     # Pre-create output trees for BOTH streams.
     CONVEYOR_ROOT.mkdir(parents=True, exist_ok=True)
+    EXTRACT_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     sr.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     for L in lengths_code:
         (sr.OUTPUT_ROOT / str(L)).mkdir(parents=True, exist_ok=True)
@@ -893,12 +1169,15 @@ def main(argv: list[str]) -> int:
         dedup_checkpoint_mode=args.dedup_checkpoint_mode,
     )
 
+    # work_parent is always the configured parent: it both hosts the randomized
+    # per-run work_root (when --work-dir is unset) AND is scanned by the extract
+    # checkpoint to ADOPT a prior run's orphaned <repo>_commits.jsonl on resume.
+    work_parent = Path(args.work_parent_dir)
     if args.work_dir:
         work_root = Path(args.work_dir)
         work_root.mkdir(parents=True, exist_ok=True)
         own_work_root = False
     else:
-        work_parent = Path(args.work_parent_dir)
         work_parent.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("TMPDIR", str(work_parent))
         os.environ.setdefault("TMP", str(work_parent))
@@ -967,10 +1246,17 @@ def main(argv: list[str]) -> int:
 
         if repo_pool is None:
             for repo, repo_dir in gen:
+                # Signal-driven stop: do not stage a NEW repo. The repo currently
+                # in process_one_repo (if any) already drained its own ranges.
+                if STOP_EVENT.is_set():
+                    if hasattr(gen, "close"):
+                        gen.close()
+                    break
                 claim_repo_once(repo)
                 res = process_one_repo(
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
-                    work_root, range_pool, manifest, manifest_lock, resume, cumulative,
+                    work_root, work_parent, range_pool, manifest, manifest_lock,
+                    resume, cumulative,
                     args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
                     args.streams, global_symbol_index, args.memory_limit_gb,
                     progress, checkpoint,
@@ -981,7 +1267,7 @@ def main(argv: list[str]) -> int:
                 ranges_done += res.get("commits_done", 0)
                 ranges_failed += res.get("commits_failed", 0)
 
-                stop = False
+                stop = STOP_EVENT.is_set()
                 if args.max_repos is not None and processed_repos >= args.max_repos:
                     stop = True
                 if args.token_budget is not None and cumulative["valid"] >= args.token_budget:
@@ -1015,6 +1301,13 @@ def main(argv: list[str]) -> int:
                     ranges_failed += rf
 
             for repo, repo_dir in gen:
+                # Signal-driven stop: stop submitting NEW repos; already-inflight
+                # repos drain (and self-cancel their queued ranges) in the loop
+                # below. Their un-finished units stay un-marked -> resume re-runs.
+                if STOP_EVENT.is_set():
+                    if hasattr(gen, "close"):
+                        gen.close()
+                    break
                 claim_repo_once(repo)
                 while len(inflight) >= max_active_repos:
                     drain_one_or_more(block=True)
@@ -1028,7 +1321,10 @@ def main(argv: list[str]) -> int:
                         _log(f"Token budget {args.token_budget} reached.")
                         stop_submitting = True
                         break
-                if stop_submitting:
+                    if STOP_EVENT.is_set():
+                        stop_submitting = True
+                        break
+                if stop_submitting or STOP_EVENT.is_set():
                     if hasattr(gen, "close"):
                         gen.close()
                     break
@@ -1039,7 +1335,8 @@ def main(argv: list[str]) -> int:
                 fut = repo_pool.submit(
                     process_one_repo,
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
-                    work_root, range_pool, manifest, manifest_lock, resume, cumulative,
+                    work_root, work_parent, range_pool, manifest, manifest_lock,
+                    resume, cumulative,
                     args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
                     args.streams, global_symbol_index, args.memory_limit_gb,
                     progress, checkpoint,
@@ -1054,7 +1351,11 @@ def main(argv: list[str]) -> int:
         if repo_pool is not None:
             repo_pool.shutdown(wait=True)
         range_pool.shutdown(wait=True)
-        if own_work_root and not args.keep_temp:
+        interrupted = STOP_EVENT.is_set()
+        # On a clean full run we reclaim the randomized work_root. On a SIGNAL
+        # stop we RETAIN it (in-progress _src kept for resume; the expensive
+        # commit records already live in the persistent extract cache regardless).
+        if own_work_root and not args.keep_temp and not interrupted:
             shutil.rmtree(work_root, ignore_errors=True)
         for lock in reversed(run_locks):
             lock.close()
@@ -1098,9 +1399,16 @@ def main(argv: list[str]) -> int:
         "dedup_db": str(dedup_db) if dedup_db else None,
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
+        "interrupted": interrupted,
     }
     progress.emit("run_finished", **summary)
     print(json.dumps(summary, indent=2))
+    if interrupted:
+        _log("CHECKPOINTED on signal: every completed unit is recorded in the "
+             f"manifest ({CONVEYOR_MANIFEST}); in-progress repo temp + the "
+             "persistent extract cache were retained. RESUME WITH THE SAME ARGS "
+             "to continue exactly where this left off (zero work lost).")
+        return 130
     return 0 if (not manifest.failed or processed_repos > 0) else 1
 
 
