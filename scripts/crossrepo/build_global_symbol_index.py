@@ -51,6 +51,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -148,7 +149,17 @@ BASE_LIBS: dict[str, dict] = {
                    ],
                    "index_extensionless_headers": True,
                    # ---- per-lib C++ standard-library compile environment ----
-                   "cxx_std": "-std=c++20",          # std umbrella headers need >= c++20
+                   # cxx_std is chosen at BUILD TIME by an explicit probe (see
+                   # _probe_highest_cxx_std): we try the candidates below highest
+                   # first and pick the highest one libclang ACTUALLY accepts on a
+                   # real libc++ <ranges>/<format> parse. A SUPERSET std captures
+                   # the c++23/26 standard surface (ranges/concepts/format/expected/
+                   # flat_map). The static "cxx_std" is the documented FLOOR used
+                   # only if no probe candidates are configured; the probe (which
+                   # includes c++23 as its lowest rung) RAISES rather than silently
+                   # dropping below c++23 (RULE #1).
+                   "cxx_std": "-std=c++23",          # floor; probe bumps to c++26/2c when accepted
+                   "cxx_std_probe_candidates": ("-std=c++26", "-std=c++2c", "-std=c++23"),
                    "needs_cxx_stdlib_env": True,      # inject clang builtins + C sysroot
                    "allow_system_types": True,        # KEEP std:: TYPE definitions
                    "stdlib_include_markers": [        # per-FILE -I root (no cross-tree mix)
@@ -663,6 +674,151 @@ def extract_many_subtrees(tarball: Path, lib_specs: dict[str, dict], dest_root: 
     return counts
 
 
+def _tarball_fingerprint(tarball: Path) -> dict[str, object]:
+    st = tarball.stat()
+    return {
+        "path": str(tarball.resolve()),
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
+def _extract_cache_signature(
+    tarball: Path,
+    spec: dict,
+    *,
+    max_files: int,
+    member_cap: int | None,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "tarball": _tarball_fingerprint(tarball),
+        "subtrees": list(spec["subtrees"]),
+        "include_path_markers": list(spec.get("include_path_markers") or []),
+        "index_extensionless_headers": bool(spec.get("index_extensionless_headers")),
+        "max_files": max_files,
+        "member_cap": member_cap,
+        "max_bytes_per_file": MAX_BYTES_PER_FILE,
+    }
+
+
+def _extract_cache_manifest_path(cache_root: Path, lib: str) -> Path:
+    return cache_root / lib / ".gsi_extract_complete.json"
+
+
+def _read_extract_cache_manifest(cache_root: Path, lib: str) -> dict | None:
+    path = _extract_cache_manifest_path(cache_root, lib)
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"corrupt extraction cache manifest: {path}: {exc}") from exc
+
+
+def _write_extract_cache_manifest(
+    cache_root: Path,
+    lib: str,
+    signature: dict[str, object],
+    *,
+    count: int,
+) -> None:
+    path = _extract_cache_manifest_path(cache_root, lib)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(signature)
+    payload.update({
+        "lib": lib,
+        "count": count,
+        "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _extract_cache_hit(
+    tarball: Path,
+    spec: dict,
+    cache_root: Path,
+    lib: str,
+    *,
+    max_files: int,
+    member_cap: int | None,
+) -> int | None:
+    manifest = _read_extract_cache_manifest(cache_root, lib)
+    if manifest is None:
+        return None
+    signature = _extract_cache_signature(
+        tarball, spec, max_files=max_files, member_cap=member_cap
+    )
+    for key, value in signature.items():
+        if manifest.get(key) != value:
+            return None
+    count = int(manifest.get("count", 0))
+    if count <= 0:
+        return None
+    if not (cache_root / lib).is_dir():
+        return None
+    return count
+
+
+def prepare_extraction_cache(
+    tarball: Path,
+    lib_specs: dict[str, dict],
+    cache_root: Path,
+    *,
+    max_files: int,
+    member_cap: int | None = None,
+) -> tuple[dict[str, Path], dict[str, int]]:
+    """Return extracted source dirs, populating a reusable extraction cache.
+
+    The expensive operation is the 235 GiB ``zstd | tar`` stream. This cache
+    makes that step one-time per (tarball fingerprint, lib spec, max_files,
+    member_cap): later rebuilds re-index the cached source dirs without reading
+    the tarball again. The cache stores SOURCE FILES only; symbol extraction still
+    uses the current parser/indexer code, so C++20/23/26 parser fixes take effect
+    on every rebuild without re-extraction.
+    """
+    cache_root.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, int] = {}
+    dirs: dict[str, Path] = {}
+    missing: dict[str, dict] = {}
+
+    for lib, spec in lib_specs.items():
+        hit = _extract_cache_hit(
+            tarball, spec, cache_root, lib,
+            max_files=max_files, member_cap=member_cap,
+        )
+        dirs[lib] = cache_root / lib
+        if hit is None:
+            missing[lib] = spec
+        else:
+            counts[lib] = hit
+            print(f"  [{lib}] extraction cache hit: {hit} files",
+                  file=sys.stderr, flush=True)
+
+    if missing:
+        for lib in missing:
+            shutil.rmtree(cache_root / lib, ignore_errors=True)
+        print(f"  extraction cache miss for {list(missing)} -> {cache_root}",
+              file=sys.stderr, flush=True)
+        extracted = extract_many_subtrees(
+            tarball, missing, cache_root,
+            max_files=max_files, member_cap=member_cap,
+        )
+        for lib, count in extracted.items():
+            counts[lib] = count
+            if count > 0:
+                _write_extract_cache_manifest(
+                    cache_root, lib,
+                    _extract_cache_signature(
+                        tarball, missing[lib], max_files=max_files,
+                        member_cap=member_cap,
+                    ),
+                    count=count,
+                )
+
+    return dirs, counts
+
+
 # --------------------------------------------------------------------------- #
 # Per-lib C++ standard-library compile environment (the std cross-link fix).
 #
@@ -776,6 +932,95 @@ def _stdlib_include_root_for(filepath: str, markers: Sequence[str] | None) -> st
         if idx != -1:
             return p[:idx] + m.rstrip("/")
     return None
+
+
+def _find_libcxx_include_root(cpp_files: Sequence[str]) -> str | None:
+    """The libc++ public-header include root (``.../libcxx/include``) from the
+    already-discovered std source files. Used as the ``-I`` root for the cxx-std
+    probe so ``#include <ranges>`` / ``#include <format>`` resolve to the REAL
+    extracted libc++ umbrella headers (not a system libc++)."""
+    for fp in cpp_files:
+        root = _stdlib_include_root_for(fp, ("/libcxx/include/",))
+        if root:
+            return root
+    return None
+
+
+def _probe_highest_cxx_std(
+    candidates: Sequence[str],
+    include_root: str | None,
+    sysroot_args: Sequence[str],
+    *,
+    lib: str,
+) -> str:
+    """Pick the HIGHEST ``-std=c++NN`` flag libclang ACTUALLY accepts, verified by
+    a real probe parse of libc++ ``<ranges>`` + ``<format>``.
+
+    Candidates are tried highest-first. A candidate is REJECTED only when libclang
+    emits a *driver-level* std diagnostic for it — ``invalid value '<v>' in
+    '-std=<v>'`` or ``unknown argument '<v>'`` — i.e. the toolchain does not know
+    that standard; we then step DOWN to the next candidate. (A missing-header or
+    template error is NOT a std-flag rejection — stepping down would not fix it —
+    so it never triggers a step-down.) The first accepted candidate wins and is
+    logged with its probe evidence. If NO candidate is accepted we RAISE (RULE #1:
+    this is an EXPLICIT probe, never a silent except — and we never drop below the
+    configured candidate set)."""
+    if not candidates:
+        raise RuntimeError(f"[{lib}] cxx_std probe requested with no candidates")
+    ip._configure_libclang()
+    probe_index = ip.Index.create()
+    parse_opts = int(getattr(ip.TranslationUnit, "PARSE_INCOMPLETE", 0) or 0)
+    rejections: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=f"gsi_stdprobe_{lib}_") as td:
+        probe_src = os.path.join(td, "cxx_std_probe.cpp")
+        with open(probe_src, "w") as fh:
+            fh.write("#include <ranges>\n#include <format>\nint main() { return 0; }\n")
+        for cand in candidates:
+            value = cand.split("=", 1)[1] if "=" in cand else cand
+            compile_args = ["-x", "c++", cand]
+            if include_root:
+                compile_args += ["-I", include_root]
+            compile_args += list(sysroot_args)
+            # An UNKNOWN -std makes libclang's driver fail so hard it produces no
+            # TU and raises TranslationUnitLoadError. That raised parse IS the
+            # rejection signal for this candidate: record it and step DOWN. This
+            # is the probe's explicit detection mechanism ("if the std flag errors,
+            # step down"), NOT a silent fallback — if NO candidate parses we RAISE
+            # below with every collected reason (RULE #1: fail loud).
+            try:
+                tu = probe_index.parse(probe_src, args=compile_args,
+                                       options=parse_opts)
+            except Exception as exc:  # noqa: BLE001 - per-candidate probe rejection
+                rejections.append(f"{cand} (parse raised: {type(exc).__name__})")
+                print(f"  [{lib}] cxx_std probe: {cand} REJECTED by libclang "
+                      f"({type(exc).__name__}) -> stepping down",
+                      file=sys.stderr, flush=True)
+                continue
+            diags = list(tu.diagnostics)
+            std_rejected = any(
+                value in d.spelling
+                and ("invalid value" in d.spelling or "unknown argument" in d.spelling)
+                for d in diags
+            )
+            if std_rejected:
+                rejections.append(f"{cand} (driver diagnostic)")
+                print(f"  [{lib}] cxx_std probe: {cand} REJECTED by libclang "
+                      f"(driver diagnostic) -> stepping down",
+                      file=sys.stderr, flush=True)
+                continue
+            n_fatal = sum(1 for d in diags if d.severity >= 4)
+            headers_parsed = bool(include_root) and n_fatal == 0
+            print(f"  [{lib}] cxx_std probe: chose {cand} "
+                  f"(libclang accepts; diagnostics={len(diags)} fatal={n_fatal} "
+                  f"libcxx_ranges_format="
+                  f"{'parsed' if headers_parsed else 'flag-accepted'})",
+                  file=sys.stderr, flush=True)
+            return cand
+    raise RuntimeError(
+        f"[{lib}] no C++ standard from {tuple(candidates)} was accepted by "
+        f"libclang on a libc++ <ranges>/<format> probe parse (tried: "
+        f"{rejections}). RULE #1: refusing to index std with an unknown -std flag."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -895,13 +1140,6 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
     sysroot_args: list[str] = []
     if spec.get("needs_cxx_stdlib_env"):
         sysroot_args = _cxx_stdlib_sysroot_args()  # RAISES if no builtins found
-    lib_env = {
-        "cxx_std": spec.get("cxx_std"),
-        "sysroot_args": sysroot_args,
-        "stdlib_include_markers": spec.get("stdlib_include_markers"),
-        "msvc_path_marker": spec.get("msvc_path_marker"),
-        "allow_system_types": bool(spec.get("allow_system_types")),
-    }
 
     cpp_files = ip.find_cpp_files(str(dest))
     if spec.get("index_extensionless_headers"):
@@ -921,6 +1159,31 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
         )
     project_dir = str(dest)
     include_dirs = _discover_include_dirs(dest, subtrees)
+
+    # ---- choose the C++ standard for this lib ----
+    # When the spec configures cxx_std_probe_candidates (only std does), pick the
+    # HIGHEST -std the installed libclang actually accepts on a real libc++
+    # <ranges>/<format> probe parse — a SUPERSET std so the c++23/26 standard
+    # surface (ranges/concepts/format/expected/flat_map) is captured. The static
+    # spec["cxx_std"] is only the documented FLOOR; the probe (explicit, logged,
+    # RAISES on total failure) replaces it. Non-std libs keep their static cxx_std.
+    probe_candidates = spec.get("cxx_std_probe_candidates")
+    if probe_candidates:
+        libcxx_root = _find_libcxx_include_root(cpp_files)
+        chosen_cxx_std = _probe_highest_cxx_std(
+            probe_candidates, libcxx_root, sysroot_args, lib=lib,
+        )
+    else:
+        chosen_cxx_std = spec.get("cxx_std")
+
+    lib_env = {
+        "cxx_std": chosen_cxx_std,
+        "sysroot_args": sysroot_args,
+        "stdlib_include_markers": spec.get("stdlib_include_markers"),
+        "msvc_path_marker": spec.get("msvc_path_marker"),
+        "allow_system_types": bool(spec.get("allow_system_types")),
+    }
+
     print(f"  [{lib}] lang={lang} cxx_std={lib_env['cxx_std'] or std_arg} "
           f"include_dirs={len(include_dirs)} "
           f"stdlib_env={'on' if sysroot_args else 'off'} "
@@ -1069,6 +1332,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--work-dir", default=None,
                    help="Staging root for extracted source (default: a fresh "
                         "mkdtemp deleted after the run).")
+    p.add_argument("--extract-cache-dir", default=None,
+                   help="Persistent source extraction cache. When set, the "
+                        "tarball is streamed only for libs missing from the "
+                        "cache; parser/indexer code still re-runs every build.")
     p.add_argument("--libclang-path", default=None)
     p.add_argument("--report-only", action="store_true",
                    help="Print store counts/cost and exit (no indexing).")
@@ -1093,6 +1360,8 @@ def resolve_libs(spec: str) -> list[str]:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     ip._configure_libclang(args.libclang_path)
+    if args.extract_cache_dir and args.work_dir:
+        raise SystemExit("--extract-cache-dir and --work-dir are mutually exclusive")
 
     tarball = Path(args.tarball)
     store = GlobalSymbolStore(args.output, read_only=args.report_only)
@@ -1133,9 +1402,37 @@ def main(argv: list[str]) -> int:
               f"types={res.n_types} errors={res.n_errors} "
               f"elapsed={res.elapsed_s:.1f}s", file=sys.stderr, flush=True)
 
+    # Persistent cache: extract source once, re-index many times. This is the
+    # path for full A1/A2 rebuilds while std/C++20/23/26 parser work evolves.
+    if args.extract_cache_dir:
+        extract_root = Path(args.extract_cache_dir)
+        todo_specs = {lib: BASE_LIBS[lib] for lib in todo}
+        print(f"\n=== extraction cache for {todo} -> {extract_root} ===",
+              file=sys.stderr, flush=True)
+        t_ext = time.time()
+        dirs, counts = prepare_extraction_cache(
+            tarball, todo_specs, extract_root,
+            max_files=args.max_files_per_lib, member_cap=args.member_cap,
+        )
+        print(f"  extraction cache ready in {time.time()-t_ext:.1f}s: {counts}",
+              file=sys.stderr, flush=True)
+        for lib in todo:
+            spec = BASE_LIBS[lib]
+            if counts.get(lib, 0) == 0:
+                raise RuntimeError(
+                    f"[{lib}] extracted 0 files from {spec['subtrees']} — "
+                    f"subtree name(s) wrong/absent (RULE #1: fail loud)."
+                )
+            print(f"\n=== indexing base-lib: {lib} (tier {spec['tier']}) ===",
+                  file=sys.stderr, flush=True)
+            res = index_lib_from_dir(
+                lib, spec, dirs[lib], store,
+                workers=args.workers, std_arg=args.std_arg,
+            )
+            _finish(lib, spec, res)
     # ONE tarball pass extracts ALL todo libs to a shared staging root (the
     # 235 GiB tarball is streamed ONCE, not once per lib), unless --per-lib-pass.
-    if len(todo) > 1 and not args.per_lib_pass:
+    elif len(todo) > 1 and not args.per_lib_pass:
         extract_root = Path(args.work_dir) if args.work_dir else Path(
             tempfile.mkdtemp(prefix="gsi_extract_"))
         extract_root.mkdir(parents=True, exist_ok=True)

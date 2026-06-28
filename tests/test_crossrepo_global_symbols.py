@@ -16,6 +16,10 @@ RULE #1: no mocks of the real store — we build a real (tiny) SQLite store.
 from __future__ import annotations
 
 import sys
+import os
+import shutil
+import subprocess
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -127,6 +131,77 @@ def test_store_preserves_distinct_definitions_with_same_qname(tmp_path):
         ("STL", "stl/inc/xstring", 10),
         ("llvm-project", "llvm-project/libcxx/include/string", 200),
     ]
+
+
+def test_store_read_only_rejects_old_qname_only_schema(tmp_path):
+    b = _load_builder()
+    db = tmp_path / "old.sqlite"
+
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE symbols (
+                qname TEXT NOT NULL,
+                base_lib TEXT NOT NULL,
+                base_repo TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                sym_type TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                is_public INTEGER NOT NULL,
+                token_est INTEGER NOT NULL,
+                body_len INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY (qname, sym_type)
+            );
+            """
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="old qname-only schema"):
+        b.GlobalSymbolStore(str(db), read_only=True)
+
+
+def test_extraction_cache_reuses_complete_lib_without_restreaming(tmp_path):
+    b = _load_builder()
+    zstd = shutil.which("zstd")
+    if not zstd:
+        pytest.skip("zstd is required to exercise the real extraction path")
+
+    raw_tar = tmp_path / "corpus.tar"
+    tarball = tmp_path / "corpus.tar.zst"
+    src = tmp_path / "src.hpp"
+    src.write_text("namespace boost { inline int cached_symbol() { return 7; } }\n")
+    with tarfile.open(raw_tar, "w") as tf:
+        tf.add(src, arcname="cpp_all/boost/include/boost/cached_symbol.hpp")
+    subprocess.run([zstd, "-q", "-f", str(raw_tar), "-o", str(tarball)], check=True)
+
+    specs = {"boost": b.BASE_LIBS["boost"]}
+    cache_root = tmp_path / "extract_cache"
+    dirs, counts = b.prepare_extraction_cache(
+        tarball, specs, cache_root, max_files=10, member_cap=None
+    )
+    cached_file = dirs["boost"] / "boost" / "include" / "boost" / "cached_symbol.hpp"
+    assert counts == {"boost": 1}
+    assert cached_file.read_text().startswith("namespace boost")
+
+    old_mode = tarball.stat().st_mode
+    os.chmod(tarball, 0)
+    try:
+        dirs2, counts2 = b.prepare_extraction_cache(
+            tarball, specs, cache_root, max_files=10, member_cap=None
+        )
+    finally:
+        os.chmod(tarball, old_mode)
+
+    assert dirs2 == dirs
+    assert counts2 == counts
+    assert cached_file.read_text().startswith("namespace boost")
 
 
 def test_is_public_symbol_filters():

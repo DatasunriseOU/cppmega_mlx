@@ -83,9 +83,10 @@ outputs/packed/1024/build_summary.json
 outputs/packed/1024/build.log
 outputs/verification_report/_summary.json
 outputs/verification_report/_samples/_manifest.json
-outputs/crossrepo/global_symbols.sqlite
-outputs/crossrepo/global_symbols.sqlite-shm
-outputs/crossrepo/global_symbols.sqlite-wal
+# Cross-repo symbol stores are large (100MB+) regenerable binaries — never commit.
+outputs/crossrepo/*.sqlite
+outputs/crossrepo/*.sqlite-shm
+outputs/crossrepo/*.sqlite-wal
 outputs/reindexed_commits/*
 outputs/non_strict_backup_20260626_165907/*
 outputs/profiles/*
