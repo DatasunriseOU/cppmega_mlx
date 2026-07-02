@@ -1,6 +1,6 @@
 {
   "active": {
-    "kodi::r0": {
+    "kodi::r41000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -38,15 +38,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r0",
+      "created_at": "2026-07-02T16:51:06",
+      "key": "kodi::r41000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211811568000"
+      "token": "70359:6225752064:1783003866579997000"
     },
-    "kodi::r1000": {
+    "kodi::r44000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -84,15 +84,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r1000",
+      "created_at": "2026-07-02T16:52:40",
+      "key": "kodi::r44000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211813639000"
+      "token": "70359:6225752064:1783003960830095000"
     },
-    "kodi::r10000": {
+    "kodi::r44500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -130,15 +130,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r10000",
+      "created_at": "2026-07-02T16:52:49",
+      "key": "kodi::r44500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211909864000"
+      "token": "70359:6225752064:1783003969728602000"
     },
-    "kodi::r10500": {
+    "kodi::r45000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -176,15 +176,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r10500",
+      "created_at": "2026-07-02T16:52:51",
+      "key": "kodi::r45000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211916959000"
+      "token": "70359:6225752064:1783003971960413000"
     },
-    "kodi::r11000": {
+    "kodi::r45500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -222,15 +222,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r11000",
+      "created_at": "2026-07-02T16:52:54",
+      "key": "kodi::r45500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211928051000"
+      "token": "70359:6225752064:1783003974498269000"
     },
-    "kodi::r11500": {
+    "kodi::r46000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -268,15 +268,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r11500",
+      "created_at": "2026-07-02T16:52:57",
+      "key": "kodi::r46000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211935564000"
+      "token": "70359:6225752064:1783003977804852000"
     },
-    "kodi::r12000": {
+    "kodi::r46500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -314,15 +314,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r12000",
+      "created_at": "2026-07-02T16:53:02",
+      "key": "kodi::r46500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211943913000"
+      "token": "70359:6225752064:1783003982698390000"
     },
-    "kodi::r12500": {
+    "kodi::r47000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -360,15 +360,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r12500",
+      "created_at": "2026-07-02T16:53:06",
+      "key": "kodi::r47000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211951325000"
+      "token": "70359:6225752064:1783003986769426000"
     },
-    "kodi::r13000": {
+    "kodi::r47500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -406,15 +406,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r13000",
+      "created_at": "2026-07-02T16:53:10",
+      "key": "kodi::r47500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211956575000"
+      "token": "70359:6225752064:1783003990896928000"
     },
-    "kodi::r13500": {
+    "kodi::r48500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -452,15 +452,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r13500",
+      "created_at": "2026-07-02T16:53:29",
+      "key": "kodi::r48500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211967663000"
+      "token": "70359:6225752064:1783004009295979000"
     },
-    "kodi::r14000": {
+    "kodi::r49000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -498,15 +498,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:43:56",
-      "key": "kodi::r14000",
+      "created_at": "2026-07-02T16:53:33",
+      "key": "kodi::r49000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003436454318000"
+      "token": "70359:6225752064:1783004013069705000"
     },
-    "kodi::r14500": {
+    "kodi::r49500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -544,15 +544,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:44:02",
-      "key": "kodi::r14500",
+      "created_at": "2026-07-02T16:53:36",
+      "key": "kodi::r49500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003442641095000"
+      "token": "70359:6225752064:1783004016366742000"
     },
-    "kodi::r1500": {
+    "kodi::r50000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -590,15 +590,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r1500",
+      "created_at": "2026-07-02T16:53:38",
+      "key": "kodi::r50000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211814988000"
+      "token": "70359:6225752064:1783004018518306000"
     },
-    "kodi::r15000": {
+    "kodi::r50500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -636,15 +636,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:44:08",
-      "key": "kodi::r15000",
+      "created_at": "2026-07-02T16:53:41",
+      "key": "kodi::r50500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003448940666000"
+      "token": "70359:6225752064:1783004021329245000"
     },
-    "kodi::r2000": {
+    "kodi::r51000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -682,15 +682,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r2000",
+      "created_at": "2026-07-02T16:53:44",
+      "key": "kodi::r51000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211815775000"
+      "token": "70359:6225752064:1783004024269877000"
     },
-    "kodi::r2500": {
+    "kodi::r51500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -728,15 +728,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r2500",
+      "created_at": "2026-07-02T16:53:56",
+      "key": "kodi::r51500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211818569000"
+      "token": "70359:6225752064:1783004036847113000"
     },
-    "kodi::r3000": {
+    "kodi::r52000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -774,15 +774,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r3000",
+      "created_at": "2026-07-02T16:54:07",
+      "key": "kodi::r52000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211821032000"
+      "token": "70359:6225752064:1783004047778167000"
     },
-    "kodi::r3500": {
+    "kodi::r52500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -820,15 +820,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r3500",
+      "created_at": "2026-07-02T16:54:12",
+      "key": "kodi::r52500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211823264000"
+      "token": "70359:6225752064:1783004052853836000"
     },
-    "kodi::r4000": {
+    "kodi::r53000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -866,15 +866,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r4000",
+      "created_at": "2026-07-02T16:54:15",
+      "key": "kodi::r53000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211826013000"
+      "token": "70359:6225752064:1783004055490505000"
     },
-    "kodi::r500": {
+    "kodi::r53500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -912,15 +912,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r500",
+      "created_at": "2026-07-02T16:54:36",
+      "key": "kodi::r53500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211812763000"
+      "token": "70359:6225752064:1783004076557229000"
     },
-    "kodi::r6000": {
+    "kodi::r54000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -958,15 +958,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r6000",
+      "created_at": "2026-07-02T16:54:52",
+      "key": "kodi::r54000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211843644000"
+      "token": "70359:6225752064:1783004092331795000"
     },
-    "kodi::r6500": {
+    "kodi::r54500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -1004,15 +1004,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r6500",
+      "created_at": "2026-07-02T16:55:04",
+      "key": "kodi::r54500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211851405000"
+      "token": "70359:6225752064:1783004104872950000"
     },
-    "kodi::r7000": {
+    "kodi::r55000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -1050,15 +1050,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r7000",
+      "created_at": "2026-07-02T16:55:12",
+      "key": "kodi::r55000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211854412000"
+      "token": "70359:6225752064:1783004112876966000"
     },
-    "kodi::r7500": {
+    "kodi::r55500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -1096,15 +1096,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r7500",
+      "created_at": "2026-07-02T16:55:30",
+      "key": "kodi::r55500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211860317000"
+      "token": "70359:6225752064:1783004130843101000"
     },
-    "kodi::r8000": {
+    "kodi::r56000": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -1142,15 +1142,15 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r8000",
+      "created_at": "2026-07-02T16:55:34",
+      "key": "kodi::r56000",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211872343000"
+      "token": "70359:6225752064:1783004134028642000"
     },
-    "kodi::r8500": {
+    "kodi::r56500": {
       "argv": [
         "scripts/streaming_conveyor.py",
         "--dedup-db",
@@ -1188,105 +1188,13 @@
         "--progress-jsonl",
         "outputs/conveyor/progress_batchcap.jsonl"
       ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r8500",
+      "created_at": "2026-07-02T16:55:34",
+      "key": "kodi::r56500",
       "pid": 70359,
       "repo": "kodi",
       "stream": "commits",
       "thread": 6225752064,
-      "token": "70359:6225752064:1783003211880248000"
-    },
-    "kodi::r9000": {
-      "argv": [
-        "scripts/streaming_conveyor.py",
-        "--dedup-db",
-        "outputs/dedup_seen.sqlite",
-        "--pr-store",
-        "outputs/pr_ingest/prs.sqlite",
-        "--repo-list",
-        "outputs/pr_ingest/repo_list.json",
-        "--global-symbol-index",
-        "outputs/crossrepo/global_symbols.sqlite",
-        "--repo-workers",
-        "4",
-        "--workers",
-        "28",
-        "--max-active-repos",
-        "24",
-        "--parse-workers",
-        "2",
-        "--memory-limit-gb",
-        "8",
-        "--code-memory-limit-gb",
-        "8",
-        "--commit-memory-limit-gb",
-        "3",
-        "--memory-budget-gb",
-        "120",
-        "--range-submit-window",
-        "28",
-        "--analysis-cache-entries",
-        "128",
-        "--dedup-checkpoint-tokens",
-        "25000000",
-        "--reservation-file",
-        "outputs/conveyor/_reservations.json",
-        "--progress-jsonl",
-        "outputs/conveyor/progress_batchcap.jsonl"
-      ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r9000",
-      "pid": 70359,
-      "repo": "kodi",
-      "stream": "commits",
-      "thread": 6225752064,
-      "token": "70359:6225752064:1783003211894267000"
-    },
-    "kodi::r9500": {
-      "argv": [
-        "scripts/streaming_conveyor.py",
-        "--dedup-db",
-        "outputs/dedup_seen.sqlite",
-        "--pr-store",
-        "outputs/pr_ingest/prs.sqlite",
-        "--repo-list",
-        "outputs/pr_ingest/repo_list.json",
-        "--global-symbol-index",
-        "outputs/crossrepo/global_symbols.sqlite",
-        "--repo-workers",
-        "4",
-        "--workers",
-        "28",
-        "--max-active-repos",
-        "24",
-        "--parse-workers",
-        "2",
-        "--memory-limit-gb",
-        "8",
-        "--code-memory-limit-gb",
-        "8",
-        "--commit-memory-limit-gb",
-        "3",
-        "--memory-budget-gb",
-        "120",
-        "--range-submit-window",
-        "28",
-        "--analysis-cache-entries",
-        "128",
-        "--dedup-checkpoint-tokens",
-        "25000000",
-        "--reservation-file",
-        "outputs/conveyor/_reservations.json",
-        "--progress-jsonl",
-        "outputs/conveyor/progress_batchcap.jsonl"
-      ],
-      "created_at": "2026-07-02T16:40:11",
-      "key": "kodi::r9500",
-      "pid": 70359,
-      "repo": "kodi",
-      "stream": "commits",
-      "thread": 6225752064,
-      "token": "70359:6225752064:1783003211903641000"
+      "token": "70359:6225752064:1783004134549483000"
     },
     "open-watcom-v2::code": {
       "argv": [
