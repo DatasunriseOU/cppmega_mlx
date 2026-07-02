@@ -21,6 +21,7 @@ def _write_tiny_parquet(
     doc_ids=(0, 0, 0, 0, 0, 0, 0, 0),
     valid_token_count=4,
     trained_token_count=3,
+    extra=None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {
@@ -60,6 +61,8 @@ def _write_tiny_parquet(
         "changed_chunk_ids": [1],
         "changed_chunk_spans": [{"start": 2, "end": 4}],
     }
+    if extra:
+        row.update(extra)
     table = pa.Table.from_pylist([row])
     pq.write_table(table, path)
 
@@ -112,10 +115,9 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     assert report["total"]["bad_files"] == 0
     assert report["total"]["bad_rows"] == 0
     assert report["total"]["fields"]["loss_mask"]["bad_value_rows"] == 0
-    assert report["total"]["edge_count"] == {
-        "token_call_edges": 3,
-        "token_type_edges": 3,
-    }
+    assert report["total"]["edge_count"]["token_call_edges"] == 3
+    assert report["total"]["edge_count"]["token_type_edges"] == 3
+    assert report["total"]["edge_count"]["token_domain_edges"] == 0
 
 
 def test_sidecar_audit_rejects_allones_loss_mask_on_multidoc_row(tmp_path):
@@ -210,6 +212,66 @@ def test_sidecar_audit_rejects_bad_target_shift(tmp_path):
     assert report is not None
     assert report["total"]["bad_rows"] >= 1
     assert report["total"]["fields"]["target_ids"]["bad_value_rows"] >= 1
+
+
+def test_sidecar_audit_rejects_domain_delimiter_without_domain_sidecars(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        input_ids=(195, 2, 3, 196, 0, 0, 0, 0),
+        target_ids=(2, 3, 196, 0, 0, 0, 0, 0),
+        valid_token_count=4,
+        trained_token_count=3,
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report is not None
+    assert report["total"]["bad_rows"] >= 1
+    assert any("domain delimiter tokens" in err for err in report["total"]["errors"])
+
+
+def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+
+    extra = {
+        "token_domain_ids": [2, 2, 2, 2, 0, 0, 0, 0],
+        "token_role_ids": [1, 6, 4, 1, 0, 0, 0, 0],
+        "token_entity_ids": [0, 1, 2, 0, 0, 0, 0, 0],
+        "token_scope_ids": [0, 0, 1, 0, 0, 0, 0, 0],
+        "token_source_doc_ids": [0, 0, 0, 0, 0, 0, 0, 0],
+        "token_confidence_ids": [4, 4, 4, 4, 0, 0, 0, 0],
+        "token_domain_edges": [{"from": 1, "to": 2, "kind": 26}],
+        "token_build_edges": [{"from": 1, "to": 2, "kind": 26}],
+        "token_shell_edges": [],
+        "token_diagnostic_edges": [],
+        "token_cross_domain_edges": [],
+    }
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        input_ids=(195, 2, 3, 196, 0, 0, 0, 0),
+        target_ids=(2, 3, 196, 0, 0, 0, 0, 0),
+        valid_token_count=4,
+        trained_token_count=3,
+        extra=extra,
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert report["total"]["edge_count"]["token_domain_edges"] == 1
+    assert report["total"]["fields"]["token_domain_ids"]["bad_length_rows"] == 0
+    assert report["total"]["fields"]["token_role_ids"]["bad_value_rows"] == 0
 
 
 def test_sidecar_audit_rejects_bad_trained_token_count(tmp_path):

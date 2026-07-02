@@ -118,6 +118,7 @@ outputs/sidecar_audit_commit_pr_8k_verified/sidecar_parquet_audit.md
 outputs/sidecar_audit_pr_1k_2k_4k_8k/sidecar_parquet_audit.json
 outputs/sidecar_audit_pr_1k_2k_4k_8k/sidecar_parquet_audit.md
 outputs/conveyor/progress_code.jsonl
+outputs/conveyor/extract_cache/kodi/kodi_commits.jsonl
 outputs/conveyor/progress_commits.jsonl
 outputs/conveyor/locks/code.lock
 outputs/conveyor/locks/commits.lock

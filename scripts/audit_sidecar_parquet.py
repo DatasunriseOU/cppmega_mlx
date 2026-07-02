@@ -21,6 +21,9 @@ import numpy as np
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from cppmega_mlx.data.domain_schema import DomainKind, DomainRoleKind, ParseConfidence
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+
 
 TOKEN_COLUMNS = (
     "input_ids",
@@ -39,6 +42,12 @@ SOURCE_COLUMNS = (
 )
 
 TOKEN_ALIGNED_FIELDS = (
+    "token_domain_ids",
+    "token_role_ids",
+    "token_entity_ids",
+    "token_scope_ids",
+    "token_source_doc_ids",
+    "token_confidence_ids",
     "token_platform_ids",
     "token_structure_ids",
     "token_dep_levels",
@@ -66,11 +75,49 @@ LIST_FIELDS = (
     "platform_ids",
     "token_call_edges",
     "token_type_edges",
+    "token_domain_edges",
+    "token_build_edges",
+    "token_shell_edges",
+    "token_diagnostic_edges",
+    "token_cross_domain_edges",
     "changed_chunk_ids",
     "changed_chunk_spans",
 )
 
 ALL_FIELDS = (*TOKEN_COLUMNS, *SOURCE_COLUMNS, *TOKEN_ALIGNED_FIELDS, *CHUNK_ALIGNED_FIELDS, *LIST_FIELDS)
+
+_DIAGNOSTIC_DOMAIN_IDS = {
+    int(DomainKind.COMPILER_DIAGNOSTIC),
+    int(DomainKind.BUILD_DIAGNOSTIC),
+    int(DomainKind.COMPILER_ERROR),
+    int(DomainKind.BUILD_ERROR),
+    int(DomainKind.LINKER_ERROR),
+    int(DomainKind.TEST_OUTPUT),
+    int(DomainKind.TOOL_OUTPUT),
+}
+
+_DIAGNOSTIC_DELIMITER_IDS = np.asarray(
+    [
+        DOMAIN_DELIMITER_TOKEN_IDS[name]
+        for name in (
+            "COMPILER_DIAGNOSTIC_START",
+            "COMPILER_DIAGNOSTIC_END",
+            "BUILD_DIAGNOSTIC_START",
+            "BUILD_DIAGNOSTIC_END",
+            "COMPILER_ERROR_START",
+            "COMPILER_ERROR_END",
+            "BUILD_ERROR_START",
+            "BUILD_ERROR_END",
+            "LINKER_ERROR_START",
+            "LINKER_ERROR_END",
+            "TEST_OUTPUT_START",
+            "TEST_OUTPUT_END",
+            "TOOL_OUTPUT_START",
+            "TOOL_OUTPUT_END",
+        )
+    ],
+    dtype=np.int64,
+)
 
 
 @dataclass
@@ -125,7 +172,17 @@ class AuditStats:
     slack_tokens: int = 0
     bad_rows: int = 0
     bad_files: int = 0
-    edge_count: dict[str, int] = field(default_factory=lambda: {"token_call_edges": 0, "token_type_edges": 0})
+    edge_count: dict[str, int] = field(
+        default_factory=lambda: {
+            "token_call_edges": 0,
+            "token_type_edges": 0,
+            "token_domain_edges": 0,
+            "token_build_edges": 0,
+            "token_shell_edges": 0,
+            "token_diagnostic_edges": 0,
+            "token_cross_domain_edges": 0,
+        }
+    )
     field_stats: dict[str, FieldStats] = field(default_factory=lambda: {name: FieldStats() for name in ALL_FIELDS})
     errors: list[str] = field(default_factory=list)
 
@@ -173,6 +230,18 @@ def _flatten_edge(edge: Any) -> tuple[int | None, int | None]:
     if isinstance(edge, (list, tuple)) and len(edge) >= 2:
         return _as_int(edge[0]), _as_int(edge[1])
     return None, None
+
+
+def _flatten_edge_triple(edge: Any) -> tuple[int | None, int | None, int | None]:
+    if isinstance(edge, dict):
+        return (
+            _as_int(edge.get("from", edge.get("src"))),
+            _as_int(edge.get("to", edge.get("dst"))),
+            _as_int(edge.get("kind")),
+        )
+    if isinstance(edge, (list, tuple)) and len(edge) >= 3:
+        return _as_int(edge[0]), _as_int(edge[1]), _as_int(edge[2])
+    return None, None, None
 
 
 def _as_int(value: Any) -> int | None:
@@ -481,6 +550,145 @@ def _edge_stats_and_validate(
                 break
 
 
+def _edge_triple_stats_and_validate(
+    *,
+    stats: AuditStats,
+    field: str,
+    rows: list[Any],
+    token_lengths: np.ndarray,
+    row_bad: np.ndarray,
+) -> None:
+    fs = stats.field_stats[field]
+    fs.rows_present += len(rows)
+    for idx, edges in enumerate(rows):
+        edges = _iter_or_empty(edges)
+        if len(edges):
+            fs.rows_nonempty += 1
+            fs.rows_nonzero += 1
+        fs.slots_total += len(edges)
+        fs.slots_nonzero += len(edges)
+        stats.edge_count[field] = stats.edge_count.get(field, 0) + len(edges)
+        limit = int(token_lengths[idx]) if idx < len(token_lengths) else 0
+        for edge in edges:
+            src, dst, kind = _flatten_edge_triple(edge)
+            if (
+                src is None
+                or dst is None
+                or kind is None
+                or src < 0
+                or dst < 0
+                or kind < 0
+                or src >= limit
+                or dst >= limit
+            ):
+                row_bad[idx] = True
+                fs.bad_value_rows += 1
+                break
+
+
+def _validate_domain_delimiter_sidecars(
+    *,
+    stats: AuditStats,
+    table: Any,
+    names: set[str],
+    input_ids_col: Any,
+    input_lengths: np.ndarray,
+    row_bad: np.ndarray,
+) -> None:
+    flat_input = _flat_numpy(input_ids_col)
+    if len(flat_input) == 0:
+        return
+    delimiter_ids = np.asarray(sorted(DOMAIN_DELIMITER_TOKEN_IDS.values()), dtype=flat_input.dtype)
+    has_delimiter_flat = np.isin(flat_input, delimiter_ids)
+    if not np.any(has_delimiter_flat):
+        return
+    rows_with_delimiter = _rows_with_flat_mask(input_lengths, has_delimiter_flat)
+    if "token_domain_ids" not in names or "token_role_ids" not in names:
+        row_bad |= rows_with_delimiter
+        missing = [
+            name
+            for name in ("token_domain_ids", "token_role_ids")
+            if name not in names
+        ]
+        stats.errors.append(
+            f"{int(np.count_nonzero(rows_with_delimiter))} rows contain domain delimiter tokens "
+            f"but missing sidecars: {missing}"
+        )
+        return
+    role_flat = _flat_numpy(table.column("token_role_ids"))
+    domain_flat = _flat_numpy(table.column("token_domain_ids"))
+    if len(role_flat) != len(flat_input) or len(domain_flat) != len(flat_input):
+        return
+    bad_delimiter_sidecars = has_delimiter_flat & (
+        (role_flat != int(DomainRoleKind.DELIMITER)) | (domain_flat == 0)
+    )
+    count = int(np.count_nonzero(_rows_with_flat_mask(input_lengths, bad_delimiter_sidecars)))
+    if count:
+        stats.field_stats["token_role_ids"].bad_value_rows += count
+        row_bad |= _rows_with_flat_mask(input_lengths, bad_delimiter_sidecars)
+
+
+def _validate_diagnostic_rows_have_edges_or_raw(
+    *,
+    stats: AuditStats,
+    table: Any,
+    names: set[str],
+    input_ids_col: Any,
+    input_lengths: np.ndarray,
+    row_bad: np.ndarray,
+) -> None:
+    """Fail diagnostic/error rows without parsed edges unless marked RAW.
+
+    Diagnostics are world observations, not comments. A structured diagnostic
+    row should carry token_diagnostic_edges. If a parser could not recover
+    edges, the row must explicitly say so by marking tokens
+    ParseConfidence.RAW; otherwise a silent parser miss would look certified.
+    """
+
+    flat_input = _flat_numpy(input_ids_col)
+    if len(flat_input) == 0:
+        return
+
+    diagnostic_flat = np.isin(flat_input.astype(np.int64), _DIAGNOSTIC_DELIMITER_IDS)
+    if "token_domain_ids" in names:
+        domain_flat = _flat_numpy(table.column("token_domain_ids"))
+        if len(domain_flat) == len(flat_input):
+            diagnostic_flat |= np.isin(domain_flat.astype(np.int64), list(_DIAGNOSTIC_DOMAIN_IDS))
+
+    diagnostic_rows = _rows_with_flat_mask(input_lengths, diagnostic_flat)
+    if not np.any(diagnostic_rows):
+        return
+
+    if "token_diagnostic_edges" in names:
+        edge_lengths = _list_lengths(table.column("token_diagnostic_edges"))
+        has_edges = edge_lengths > 0
+    else:
+        edge_lengths = np.zeros(len(input_lengths), dtype=np.int64)
+        has_edges = np.zeros(len(input_lengths), dtype=bool)
+
+    if "token_confidence_ids" in names:
+        conf_flat = _flat_numpy(table.column("token_confidence_ids"))
+        if len(conf_flat) == len(flat_input):
+            raw_rows = _rows_with_flat_mask(
+                input_lengths,
+                conf_flat.astype(np.int64) == int(ParseConfidence.RAW),
+            )
+        else:
+            raw_rows = np.zeros(len(input_lengths), dtype=bool)
+    else:
+        raw_rows = np.zeros(len(input_lengths), dtype=bool)
+
+    bad = diagnostic_rows & ~has_edges & ~raw_rows
+    count = int(np.count_nonzero(bad))
+    if count:
+        row_bad |= bad
+        stats.field_stats["token_diagnostic_edges"].bad_value_rows += count
+        stats.errors.append(
+            f"{count} diagnostic/error rows have no token_diagnostic_edges "
+            "and no explicit ParseConfidence.RAW"
+        )
+
+
 def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -> dict[str, Any]:
     path = Path(path_str)
     stats = AuditStats(files=1)
@@ -568,6 +776,23 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                     bad_mask=bad_vocab,
                     row_bad=row_bad,
                 )
+
+        _validate_domain_delimiter_sidecars(
+            stats=stats,
+            table=table,
+            names=names,
+            input_ids_col=input_ids,
+            input_lengths=input_lengths,
+            row_bad=row_bad,
+        )
+        _validate_diagnostic_rows_have_edges_or_raw(
+            stats=stats,
+            table=table,
+            names=names,
+            input_ids_col=input_ids,
+            input_lengths=input_lengths,
+            row_bad=row_bad,
+        )
 
         for name in ("target_ids", "loss_mask", "doc_ids"):
             if name in names:
@@ -717,6 +942,22 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                     field=name,
                     rows=table.column(name).to_pylist(),
                     n_chunks=n_chunks,
+                    row_bad=row_bad,
+                )
+
+        for name in (
+            "token_domain_edges",
+            "token_build_edges",
+            "token_shell_edges",
+            "token_diagnostic_edges",
+            "token_cross_domain_edges",
+        ):
+            if name in names:
+                _edge_triple_stats_and_validate(
+                    stats=stats,
+                    field=name,
+                    rows=table.column(name).to_pylist(),
+                    token_lengths=input_lengths,
                     row_bad=row_bad,
                 )
 

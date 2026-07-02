@@ -28,6 +28,7 @@ import numpy as np
 from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.data.parquet_dataset import (
     _TOKEN_CHUNK_METADATA_COLUMNS,
@@ -54,6 +55,17 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
     TOKEN_DEF_USE_COLUMN,
+    TOKEN_BUILD_EDGES_COLUMN,
+    TOKEN_CONFIDENCE_IDS_COLUMN,
+    TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+    TOKEN_DOMAIN_EDGES_COLUMN,
+    TOKEN_DOMAIN_IDS_COLUMN,
+    TOKEN_ENTITY_IDS_COLUMN,
+    TOKEN_ROLE_IDS_COLUMN,
+    TOKEN_SCOPE_IDS_COLUMN,
+    TOKEN_SHELL_EDGES_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
@@ -84,6 +96,23 @@ _GRAPH_COLUMN_TO_FIELD: Mapping[str, tuple[str, str]] = {
     TOKEN_TYPE_EDGES_COLUMN: ("type_edges", "type"),
 }
 assert set(_GRAPH_COLUMN_TO_FIELD) == set(_TOKEN_GRAPH_METADATA_COLUMNS)
+
+_DOMAIN_TOKEN_COLUMN_TO_FIELD: Mapping[str, str] = {
+    TOKEN_DOMAIN_IDS_COLUMN: "domain_ids",
+    TOKEN_ROLE_IDS_COLUMN: "role_ids",
+    TOKEN_ENTITY_IDS_COLUMN: "entity_ids",
+    TOKEN_SCOPE_IDS_COLUMN: "scope_ids",
+    TOKEN_SOURCE_DOC_IDS_COLUMN: "source_doc_ids",
+    TOKEN_CONFIDENCE_IDS_COLUMN: "confidence_ids",
+}
+
+_DOMAIN_EDGE_COLUMN_TO_FIELD: Mapping[str, str] = {
+    TOKEN_DOMAIN_EDGES_COLUMN: "domain_edges",
+    TOKEN_BUILD_EDGES_COLUMN: "build_edges",
+    TOKEN_SHELL_EDGES_COLUMN: "shell_edges",
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN: "diagnostic_edges",
+    TOKEN_CROSS_DOMAIN_EDGES_COLUMN: "cross_domain_edges",
+}
 
 # Temporal token-level parquet column -> CommitPacket field name.
 _TEMPORAL_COLUMN_TO_FIELD: Mapping[str, str] = {
@@ -151,6 +180,46 @@ def _build_edge_index(
     return EdgeIndex.from_pairs(pairs, relation=relation, num_nodes=num_nodes)
 
 
+def _normalize_edge_triples(raw: Any) -> list[tuple[int, int, int]]:
+    if raw is None:
+        return []
+    triples: list[tuple[int, int, int]] = []
+    for edge in raw:
+        if hasattr(edge, "as_py"):
+            edge = edge.as_py()
+        if isinstance(edge, Mapping):
+            src = edge.get("from", edge.get("src"))
+            dst = edge.get("to", edge.get("dst"))
+            kind = edge.get("kind")
+        elif isinstance(edge, (list, tuple, np.ndarray)) and len(edge) >= 3:
+            src, dst, kind = edge[0], edge[1], edge[2]
+        else:
+            raise ValueError(
+                "domain edge triple must be {from,to,kind}/{src,dst,kind} or "
+                f"length-3 sequence, got {type(edge).__name__}"
+            )
+        if src is None or dst is None or kind is None:
+            raise ValueError(f"domain edge triple has missing value: {edge!r}")
+        src_i = int(src)
+        dst_i = int(dst)
+        kind_i = int(kind)
+        if src_i < 0 or dst_i < 0 or kind_i < 0:
+            raise ValueError(f"domain edge triple must be non-negative: {edge!r}")
+        triples.append((src_i, dst_i, kind_i))
+    return triples
+
+
+def _build_domain_edge_index(raw: Any, *, num_tokens: int) -> DomainEdgeIndex:
+    edge_index = DomainEdgeIndex.from_triples(_normalize_edge_triples(raw))
+    if edge_index.num_edges:
+        max_endpoint = int(max(mx.max(edge_index.src).item(), mx.max(edge_index.dst).item()))
+        if max_endpoint >= num_tokens:
+            raise ValueError(
+                f"domain edge endpoint {max_endpoint} outside token range 0..{num_tokens - 1}"
+            )
+    return edge_index
+
+
 def build_code_packet_from_row(
     *,
     token_ids: mx.array,
@@ -207,6 +276,28 @@ def build_code_packet_from_row(
         )
         present.append(column)
 
+    domain_token_kwargs: dict[str, mx.array] = {}
+    for column, field_name in _DOMAIN_TOKEN_COLUMN_TO_FIELD.items():
+        if column not in columns:
+            absent.append(column)
+            continue
+        domain_token_kwargs[field_name] = _int_vector(
+            columns[column][row_index], where=f"{column}[row={row_index}]"
+        )
+        present.append(column)
+
+    domain_edge_kwargs: dict[str, DomainEdgeIndex] = {}
+    num_tokens = int(token_ids.shape[-1])
+    for column, field_name in _DOMAIN_EDGE_COLUMN_TO_FIELD.items():
+        if column not in columns:
+            absent.append(column)
+            continue
+        domain_edge_kwargs[field_name] = _build_domain_edge_index(
+            columns[column][row_index],
+            num_tokens=num_tokens,
+        )
+        present.append(column)
+
     metadata: dict[str, Any] = {
         "absent_columns": tuple(absent),
         "present_columns": tuple(present),
@@ -236,6 +327,8 @@ def build_code_packet_from_row(
         type_edges=edge_kwargs.get("type_edges"),
         metadata=metadata,
         **semantic_kwargs,
+        **domain_token_kwargs,
+        **domain_edge_kwargs,
         **chunk_kwargs,
     )
 

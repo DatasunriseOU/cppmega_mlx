@@ -68,6 +68,14 @@ PERTOKEN_CHANNELS = {
         "token_sibling_index",
         "token_ast_node_type",
     ],
+    "B_domain": [
+        "token_domain_ids",
+        "token_role_ids",
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_source_doc_ids",
+        "token_confidence_ids",
+    ],
     "C_graph_semantic": [
         "token_symbol_ids",
         "token_def_use",
@@ -84,7 +92,15 @@ PERTOKEN_CHANNELS = {
 # variable-length list channels: report rows-nonempty %
 LIST_CHANNELS = {
     "A_platform": ["platform_ids"],
-    "C_graph_semantic": ["token_call_edges", "token_type_edges"],
+    "C_graph_semantic": [
+        "token_call_edges",
+        "token_type_edges",
+        "token_domain_edges",
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+    ],
     "D_commit_edit": ["changed_chunk_ids", "changed_chunk_spans"],
 }
 ALL_PERTOKEN = [c for v in PERTOKEN_CHANNELS.values() for c in v]

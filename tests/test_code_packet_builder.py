@@ -17,6 +17,7 @@ from cppmega_mlx.data.code_packet_builder import (
     build_code_packets,
     build_commit_packet_from_row,
 )
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex
 
 
@@ -45,6 +46,18 @@ def _synthetic_packed_table() -> "pa.Table":
             # Graph edges over chunk indices, stored as list-of-pairs.
             "token_call_edges": [[[0, 1]], [[1, 0]]],
             "token_type_edges": [[[1, 0]], []],
+            # Domain-routing token sidecars and token-local edge triples.
+            "token_domain_ids": [[1] * SEQ, [2] * SEQ],
+            "token_role_ids": [[0, 1, 2, 3, 4, 5], [0] * SEQ],
+            "token_entity_ids": [[0, 10, 10, 0, 0, 0], [0] * SEQ],
+            "token_scope_ids": [[0, 0, 1, 1, 0, 0], [0] * SEQ],
+            "token_source_doc_ids": [[7] * SEQ, [8] * SEQ],
+            "token_confidence_ids": [[4] * SEQ, [2] * SEQ],
+            "token_domain_edges": [[{"from": 1, "to": 2, "kind": 20}], []],
+            "token_build_edges": [[{"from": 2, "to": 3, "kind": 21}], []],
+            "token_shell_edges": [[], []],
+            "token_diagnostic_edges": [[], []],
+            "token_cross_domain_edges": [[], []],
             # Provenance.
             "repo": ["acme/widgets", "acme/gadgets"],
             "filepath": ["src/a.c", "src/b.c"],
@@ -100,10 +113,18 @@ def test_build_code_packets_populates_all_fields() -> None:
     assert p0.call_edges.relation == "call"
     assert p0.call_edges.to_pairs() == [(0, 1)]
     assert p0.type_edges.to_pairs() == [(1, 0)]
+    assert p0.domain_ids is not None
+    assert np.asarray(p0.domain_ids).tolist() == [1] * SEQ
+    assert p0.role_ids is not None
+    assert np.asarray(p0.role_ids).tolist() == [0, 1, 2, 3, 4, 5]
+    assert isinstance(p0.domain_edges, DomainEdgeIndex)
+    assert p0.domain_edges.to_triples() == [(1, 2, 20)]
+    assert p0.build_edges.to_triples() == [(2, 3, 21)]
 
     # Row 1 has an empty type_edges list.
     assert packets[1].type_edges.num_edges == 0
     assert packets[1].call_edges.to_pairs() == [(1, 0)]
+    assert packets[1].domain_edges.num_edges == 0
 
     # GraphPacket bundling + block aggregation works on parsed edges.
     gp = p0.graph_packet()
@@ -129,8 +150,12 @@ def test_build_code_packet_records_absent_columns() -> None:
     p0 = packets[0]
     assert p0.symbol_ids is None
     assert p0.call_edges is None
+    assert p0.domain_ids is None
+    assert p0.domain_edges is None
     assert "token_symbol_ids" in p0.metadata["absent_columns"]
     assert "token_call_edges" in p0.metadata["absent_columns"]
+    assert "token_domain_ids" in p0.metadata["absent_columns"]
+    assert "token_domain_edges" in p0.metadata["absent_columns"]
     # Absent columns are recorded, NOT fabricated.
     assert "token_chunk_starts" in p0.metadata["present_columns"]
 

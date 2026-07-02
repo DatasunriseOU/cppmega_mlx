@@ -287,6 +287,23 @@ def test_crosslink_off_unchanged(tmp_path):
     assert "trim impl" not in root_doc["text"]
 
 
+def test_build_training_documents_streams_without_accumulating(tmp_path):
+    ip = _load_index_project()
+    idx = _tiny_index(ip)
+    emitted = []
+
+    docs = ip.build_training_documents(
+        idx,
+        max_tokens=16384,
+        enriched=True,
+        emit_doc=emitted.append,
+    )
+
+    assert docs == []
+    assert emitted
+    assert any("do_work" in doc["text"] for doc in emitted)
+
+
 def test_crosslink_on_pulls_tagged_chunk(tmp_path):
     ip = _load_index_project()
     db, _ = _make_store(tmp_path)

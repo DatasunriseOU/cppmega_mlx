@@ -44,7 +44,16 @@ def _table_to_docs(table: pa.Table) -> list[dict]:
     docs = []
     for i in range(num_rows):
         row = {name: values[i] for name, values in columns.items()}
-        for json_list_field in ("chunk_boundaries", "call_edges", "type_edges"):
+        for json_list_field in (
+            "chunk_boundaries",
+            "call_edges",
+            "type_edges",
+            "domain_edges",
+            "build_edges",
+            "shell_edges",
+            "diagnostic_edges",
+            "cross_domain_edges",
+        ):
             value = row.get(json_list_field)
             if value is None:
                 continue

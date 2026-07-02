@@ -52,9 +52,11 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -63,11 +65,10 @@ from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
     ThreadPoolExecutor,
-    as_completed,
     wait,
 )
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 # Reuse the proven machinery. streaming_reindex_commits already re-exports the
 # shared primitives from streaming_reindex (MLX_ROOT, Manifest, RepoFailure, ...)
@@ -107,6 +108,13 @@ DEFAULT_PROGRESS_JSONL = CONVEYOR_ROOT / "progress.jsonl"
 DEFAULT_DEDUP_CHECKPOINT_TOKENS = 25_000_000
 DEFAULT_RUN_LOCK_DIR = CONVEYOR_ROOT / "locks"
 DEFAULT_WORK_PARENT = CONVEYOR_ROOT / "tmp"
+DEFAULT_RESERVATION_FILE = CONVEYOR_ROOT / "_reservations.json"
+DEFAULT_RANGE_SUBMIT_WINDOW_MULTIPLIER = 2
+DEFAULT_MEMORY_BUDGET_FRACTION = 0.55
+DEFAULT_MEMORY_BUDGET_FALLBACK_GB = 48.0
+DEFAULT_MIN_RETRY_RANGE_SIZE = 25
+DEFAULT_RANGE_TARGET_BYTES = 32 * 1024 * 1024
+DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
 
 # Stable, repo-keyed cache for the EXPENSIVE git-history extraction output. This
 # deliberately lives OUTSIDE the randomized per-run work_root so the commit
@@ -129,6 +137,104 @@ STOP_EVENT = threading.Event()
 def _log(msg: str) -> None:
     with _PRINT_LOCK:
         print(msg, file=sys.stderr, flush=True)
+
+
+def physical_memory_gb() -> float | None:
+    """Best-effort physical RAM in GiB using only stdlib/system tools."""
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and pages > 0:
+            return float(page_size * pages) / (1024**3)
+    except (AttributeError, OSError, ValueError):
+        pass
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return float(int(proc.stdout.strip())) / (1024**3)
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            return None
+    return None
+
+
+def default_memory_budget_gb() -> float:
+    total = physical_memory_gb()
+    if total is None:
+        return DEFAULT_MEMORY_BUDGET_FALLBACK_GB
+    return max(8.0, total * DEFAULT_MEMORY_BUDGET_FRACTION)
+
+
+def heavy_subprocess_slots(*, streams: str, workers: int, repo_workers: int) -> int:
+    """Conservative count of concurrently alive heavy stage subprocesses.
+
+    Commit range workers spawn process_commits/materialize/pack. Code repo workers
+    spawn index_project/materialize/pack. The exact stage mix changes over time,
+    but this bound catches configurations like 20 repo workers + 16 range workers
+    before they can launch hundreds of GiB worth of native clang processes.
+    """
+    slots = 0
+    if streams in {"both", "commits"}:
+        slots += max(1, int(workers))
+    if streams in {"both", "code"}:
+        slots += max(1, int(repo_workers))
+    return max(1, slots)
+
+
+def validate_memory_plan(
+    *,
+    streams: str,
+    workers: int,
+    repo_workers: int,
+    memory_limit_gb: float,
+    code_memory_limit_gb: float | None = None,
+    commit_memory_limit_gb: float | None = None,
+    memory_budget_gb: float,
+    allow_oversubscription: bool,
+) -> dict[str, float | int | bool]:
+    """Fail before extraction when requested parallelism cannot fit RAM."""
+    stage_limit = max(0.0, float(memory_limit_gb))
+    code_limit = (
+        stage_limit if code_memory_limit_gb is None
+        else max(0.0, float(code_memory_limit_gb))
+    )
+    commit_limit = (
+        stage_limit if commit_memory_limit_gb is None
+        else max(0.0, float(commit_memory_limit_gb))
+    )
+    commit_slots = max(1, int(workers)) if streams in {"both", "commits"} else 0
+    code_slots = max(1, int(repo_workers)) if streams in {"both", "code"} else 0
+    slots = max(1, commit_slots + code_slots)
+    budget = max(0.0, float(memory_budget_gb))
+    code_reserved = code_slots * code_limit
+    commit_reserved = commit_slots * commit_limit
+    reserved = code_reserved + commit_reserved
+    plan = {
+        "heavy_slots": slots,
+        "code_heavy_slots": code_slots,
+        "commit_heavy_slots": commit_slots,
+        "memory_limit_gb": stage_limit,
+        "code_memory_limit_gb": code_limit,
+        "commit_memory_limit_gb": commit_limit,
+        "code_reserved_gb": code_reserved,
+        "commit_reserved_gb": commit_reserved,
+        "memory_budget_gb": budget,
+        "reserved_gb": reserved,
+        "allow_oversubscription": bool(allow_oversubscription),
+    }
+    if budget > 0 and reserved > budget and not allow_oversubscription:
+        raise SystemExit(
+            "unsafe conveyor memory plan: "
+            f"heavy_slots={slots} * --memory-limit-gb={stage_limit:.2f} "
+            f"= {reserved:.2f} GiB exceeds --memory-budget-gb={budget:.2f}. "
+            "Lower --workers/--repo-workers/--memory-limit-gb, increase the "
+            "budget, or pass --allow-memory-oversubscription explicitly."
+        )
+    return plan
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +339,7 @@ def ensure_commit_records(
     work_parent: Path,
     manifest: Manifest,
     resume: bool,
-) -> tuple[Path, int]:
+) -> tuple[Path, int, str]:
     """Return (records_jsonl, n_records), running extract_git_history ONLY if needed.
 
     Resolution order (all writing/reading the STABLE EXTRACT_CACHE_ROOT/<repo>):
@@ -257,7 +363,7 @@ def ensure_commit_records(
         if lc is not None:
             _log(f"EXTRACT-CKPT HIT {repo}: reuse {cache_jsonl} ({lc} records); "
                  f"skip ~extract_git_history")
-            return cache_jsonl, lc
+            return cache_jsonl, lc, "hit"
 
         # (b) Adopt an existing jsonl (stable cache miss but a prior extract exists).
         existing = _discover_existing_jsonl(repo, work_root, work_parent)
@@ -274,8 +380,9 @@ def ensure_commit_records(
             tag = "BACK-COMPAT" if repo_has_range_done else "ADOPT"
             _log(f"EXTRACT-CKPT {tag} {repo}: adopted {existing} -> {cache_jsonl} "
                  f"({n} records); stamped sentinel; skip ~extract_git_history")
-            return cache_jsonl, n
+            return cache_jsonl, n, tag.lower().replace("-", "_")
 
+        cache_status = "fresh"
         if repo_has_range_done:
             # Manifest proves the extract finished, but no jsonl survived anywhere.
             # extract_git_history is deterministic (git log order), so a fresh
@@ -284,6 +391,9 @@ def ensure_commit_records(
             _log(f"EXTRACT-CKPT MISS {repo}: manifest has done ranges but NO jsonl "
                  f"found on disk; re-extracting (deterministic order preserves "
                  f"done-range alignment)")
+            cache_status = "miss_reextract"
+    else:
+        cache_status = "fresh"
 
     # (c) Fresh extract into the stable cache. FAIL LOUD on empty git log / output.
     commit_list = get_commit_list(repo_dir)
@@ -298,7 +408,7 @@ def ensure_commit_records(
     _write_extract_sentinel(records_jsonl, n)
     _log(f"EXTRACT-CKPT FRESH {repo}: extracted {n} records -> {records_jsonl}; "
          f"stamped sentinel")
-    return records_jsonl, n
+    return records_jsonl, n, cache_status
 
 
 def repo_fully_done(
@@ -312,6 +422,204 @@ def repo_fully_done(
     code_ok = (streams not in {"both", "code"}) or manifest.is_done(code_key(repo))
     commits_ok = (streams not in {"both", "commits"}) or all_ranges_done
     return code_ok and commits_ok
+
+
+def manifest_complete_commit_ranges(
+    repo: str, manifest: Manifest, range_size: int
+) -> tuple[tuple[int, int], ...] | None:
+    """Return complete manifest ranges for ``repo`` when completion is provable.
+
+    This is deliberately conservative. A finished repo may have lost its stable
+    extract cache after cleanup; on resume we must not spend hours re-running
+    extract_git_history only to skip already-done ranges. The manifest already
+    records each processed range as ``<repo>::r<start>`` with ``range=[start,end]``.
+
+    We can prove completion without the jsonl only when those done ranges:
+      * have no failed commit-range entry for this repo,
+      * start at 0 and are contiguous, and
+      * end with a short final range (``end - start < range_size``).
+
+    If total records were exactly divisible by ``range_size`` there is no final
+    short range, so the manifest alone cannot distinguish complete coverage from
+    "one more full range exists". In that case return None and let the old
+    extract/count path decide.
+    """
+    if range_size <= 0:
+        raise ValueError(f"range_size must be positive, got {range_size}")
+    if any(k == f"{repo}::commits" or k.startswith(f"{repo}::r")
+           for k in manifest.failed):
+        return None
+
+    ranges: list[tuple[int, int]] = []
+    prefix = f"{repo}::r"
+    for key, info in manifest.done.items():
+        if not key.startswith(prefix):
+            continue
+        raw = info.get("range") if isinstance(info, dict) else None
+        if not isinstance(raw, list | tuple) or len(raw) != 2:
+            return None
+        try:
+            start = int(raw[0])
+            end = int(raw[1])
+        except (TypeError, ValueError):
+            return None
+        if start < 0 or end <= start:
+            return None
+        # The key and payload must agree; otherwise the manifest is not a
+        # reliable source of coverage truth.
+        try:
+            key_start = int(key.rsplit("::r", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        if key_start != start:
+            return None
+        ranges.append((start, end))
+
+    if not ranges:
+        return None
+    ranges.sort()
+    expected_start = 0
+    for start, end in ranges:
+        if start != expected_start:
+            return None
+        if end - start > range_size:
+            return None
+        expected_start = end
+    if ranges[-1][1] - ranges[-1][0] >= range_size:
+        return None
+    return tuple(ranges)
+
+
+def manifest_done_commit_intervals(repo: str, manifest: Manifest) -> tuple[tuple[int, int], ...]:
+    """Return validated done commit intervals for ``repo``.
+
+    Adaptive range splitting means a manifest key such as ``repo::r23000`` may
+    cover only ``[23000, 23250)`` instead of the original 500-record range. All
+    resume and cleanup decisions must therefore use the payload interval, not
+    only the key.
+    """
+    intervals: list[tuple[int, int]] = []
+    prefix = f"{repo}::r"
+    for key, info in manifest.done.items():
+        if not key.startswith(prefix):
+            continue
+        raw = info.get("range") if isinstance(info, dict) else None
+        if not isinstance(raw, list | tuple) or len(raw) != 2:
+            continue
+        try:
+            start = int(raw[0])
+            end = int(raw[1])
+            key_start = int(key.rsplit("::r", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if start < 0 or end <= start or key_start != start:
+            continue
+        intervals.append((start, end))
+    return tuple(sorted(intervals))
+
+
+def missing_commit_subranges(
+    start: int, end: int, done_intervals: Sequence[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """Return uncovered subranges inside ``[start, end)``.
+
+    Used on resume so an adaptively split completed half does not cause the
+    uncompleted half to be skipped.
+    """
+    if end <= start:
+        raise ValueError(f"invalid range [{start}:{end}]")
+    missing: list[tuple[int, int]] = []
+    cursor = start
+    for done_start, done_end in done_intervals:
+        if done_end <= cursor:
+            continue
+        if done_start >= end:
+            break
+        if done_start > cursor:
+            missing.append((cursor, min(done_start, end)))
+        cursor = max(cursor, min(done_end, end))
+        if cursor >= end:
+            break
+    if cursor < end:
+        missing.append((cursor, end))
+    return tuple(missing)
+
+
+def plan_commit_ranges(
+    records_jsonl: Path,
+    n_records: int,
+    *,
+    max_records: int,
+    target_bytes: int = DEFAULT_RANGE_TARGET_BYTES,
+) -> tuple[tuple[int, int], ...]:
+    """Plan commit ranges bounded by both record count and raw JSONL bytes.
+
+    Fixed-size 500-record ranges are badly imbalanced on repos with large diffs:
+    one range can produce 2-3x the JSONL/materialization work of another. This
+    keeps the old ``max_records`` ceiling while cutting earlier when the raw
+    extracted commit-record bytes cross ``target_bytes``. Manifest keys remain
+    ``repo::r<start>`` and payloads carry the exact ``[start, end)`` interval, so
+    resume compatibility is preserved.
+    """
+    if n_records < 0:
+        raise ValueError(f"n_records must be non-negative, got {n_records}")
+    if max_records <= 0:
+        raise ValueError(f"max_records must be positive, got {max_records}")
+    if n_records == 0:
+        return ()
+    if target_bytes <= 0:
+        return tuple(
+            (s, min(s + max_records, n_records))
+            for s in range(0, n_records, max_records)
+        )
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    current_bytes = 0
+    current_records = 0
+    with records_jsonl.open("rb") as fh:
+        for idx, line in enumerate(fh):
+            if idx >= n_records:
+                break
+            line_bytes = len(line)
+            if current_records and (
+                current_records >= max_records
+                or current_bytes + line_bytes > target_bytes
+            ):
+                ranges.append((start, idx))
+                start = idx
+                current_bytes = 0
+                current_records = 0
+            current_bytes += line_bytes
+            current_records += 1
+
+    if current_records:
+        ranges.append((start, start + current_records))
+
+    if not ranges or ranges[-1][1] != n_records:
+        # This means the caller supplied a bad n_records for the file currently on
+        # disk. Fail here instead of silently skipping or duplicating records.
+        raise RuntimeError(
+            f"range planning covered {ranges[-1][1] if ranges else 0} records "
+            f"but n_records={n_records} for {records_jsonl}"
+        )
+    return tuple(ranges)
+
+
+def manifest_covers_commit_span(repo: str, manifest: Manifest, n_records: int) -> bool:
+    """True iff manifest done intervals cover ``[0, n_records)`` exactly enough."""
+    if n_records <= 0:
+        return False
+    cursor = 0
+    for start, end in manifest_done_commit_intervals(repo, manifest):
+        if end <= cursor:
+            continue
+        if start > cursor:
+            return False
+        cursor = max(cursor, end)
+        if cursor >= n_records:
+            return True
+    return False
 
 
 class ConcurrentManifest(Manifest):
@@ -416,21 +724,67 @@ class ProgressWriter:
         self.path = path
         self.lock = threading.Lock()
         self.started_at = time.time()
+        self.extract_cache_seen = 0
+        self.extract_cache_hits = 0
+        self.extract_cache_reused = 0
+        self.extract_cache_status_counts: dict[str, int] = {}
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def extract_cache_metrics(self) -> dict:
+        with self.lock:
+            return {
+                "seen": self.extract_cache_seen,
+                "hits": self.extract_cache_hits,
+                "hit_rate": (
+                    self.extract_cache_hits / self.extract_cache_seen
+                    if self.extract_cache_seen else 0.0
+                ),
+                "reused": self.extract_cache_reused,
+                "reuse_rate": (
+                    self.extract_cache_reused / self.extract_cache_seen
+                    if self.extract_cache_seen else 0.0
+                ),
+                "status_counts": dict(self.extract_cache_status_counts),
+            }
 
     def emit(self, event: str, **payload) -> None:
         if self.path is None:
             return
         now = time.time()
-        row = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "elapsed_s": round(now - self.started_at, 3),
-            "event": event,
-            **payload,
-        }
-        line = json.dumps(row, ensure_ascii=False, sort_keys=True)
         with self.lock:
+            if event == "extract_cache":
+                status = str(payload.get("status") or "unknown")
+                self.extract_cache_seen += 1
+                self.extract_cache_status_counts[status] = (
+                    self.extract_cache_status_counts.get(status, 0) + 1
+                )
+                if status == "hit":
+                    self.extract_cache_hits += 1
+                if status in {"hit", "adopt", "back_compat", "orphan_adopt"}:
+                    self.extract_cache_reused += 1
+                payload = {
+                    **payload,
+                    "extract_cache_seen": self.extract_cache_seen,
+                    "extract_cache_hits": self.extract_cache_hits,
+                    "extract_cache_hit_rate": (
+                        self.extract_cache_hits / self.extract_cache_seen
+                    ),
+                    "extract_cache_reused": self.extract_cache_reused,
+                    "extract_cache_reuse_rate": (
+                        self.extract_cache_reused / self.extract_cache_seen
+                    ),
+                    "extract_cache_status_counts": dict(
+                        self.extract_cache_status_counts
+                    ),
+                }
+            row = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "elapsed_s": round(now - self.started_at, 3),
+                "event": event,
+                **payload,
+            }
+            line = json.dumps(row, ensure_ascii=False, sort_keys=True)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line)
                 fh.write("\n")
@@ -487,6 +841,152 @@ class RunLock:
         finally:
             self._fh.close()
             self._fh = None
+
+
+class WorkReservation:
+    """Handle for one active conveyor unit reservation."""
+
+    def __init__(
+        self,
+        ledger: "UnitReservationLedger",
+        key: str,
+        token: str | None,
+        holder: dict | None,
+    ):
+        self.ledger = ledger
+        self.key = key
+        self.token = token
+        self.holder = holder
+        self.acquired = token is not None
+        self._released = False
+
+    def release(self) -> None:
+        if not self.acquired or self._released:
+            return
+        assert self.token is not None
+        self.ledger.release(self.key, self.token)
+        self._released = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
+class UnitReservationLedger:
+    """Small cross-process active-unit ledger for high-parallel conveyor runs.
+
+    The dedup DB no longer accepts staging writes from subprocesses. This ledger
+    solves a different problem: do not let two parent conveyor workers process
+    the same output unit at once when repo/range parallelism is high or when
+    separate stream-specific conveyors share the manifest. It is a tiny JSON
+    file under an OS flock; completed history still lives in the manifest.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock_path = Path(str(self.path) + ".lock")
+        self._thread_lock = threading.Lock()
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _read(self) -> dict:
+        if not self.path.exists():
+            return {"active": {}}
+        try:
+            blob = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"reservation ledger is corrupt: {self.path}") from exc
+        active = blob.get("active", {})
+        if not isinstance(active, dict):
+            raise RuntimeError(f"reservation ledger has invalid active map: {self.path}")
+        return {"active": active}
+
+    def _atomic_replace(self, blob: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(blob, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def _with_lock(self, fn):
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._thread_lock:
+            fh = self._lock_path.open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                blob = self._read()
+                result = fn(blob)
+                self._atomic_replace(blob)
+                return result
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                fh.close()
+
+    def cleanup_stale(self) -> int:
+        """Drop reservations whose owning parent process no longer exists."""
+
+        def apply(blob: dict) -> int:
+            active = blob["active"]
+            stale = [
+                key for key, rec in active.items()
+                if not self._pid_alive(int(rec.get("pid", -1)))
+            ]
+            for key in stale:
+                active.pop(key, None)
+            return len(stale)
+
+        return int(self._with_lock(apply))
+
+    def acquire(self, key: str, *, stream: str, repo: str) -> WorkReservation:
+        if not key:
+            raise ValueError("reservation key must be non-empty")
+        token = f"{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
+
+        def apply(blob: dict) -> WorkReservation:
+            active = blob["active"]
+            stale = [
+                item_key for item_key, rec in active.items()
+                if not self._pid_alive(int(rec.get("pid", -1)))
+            ]
+            for item_key in stale:
+                active.pop(item_key, None)
+            holder = active.get(key)
+            if holder is not None:
+                return WorkReservation(self, key, None, dict(holder))
+            active[key] = {
+                "key": key,
+                "stream": stream,
+                "repo": repo,
+                "pid": os.getpid(),
+                "thread": threading.get_ident(),
+                "token": token,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "argv": sys.argv,
+            }
+            return WorkReservation(self, key, token, None)
+
+        return self._with_lock(apply)
+
+    def release(self, key: str, token: str) -> None:
+        def apply(blob: dict) -> None:
+            active = blob["active"]
+            rec = active.get(key)
+            if rec is not None and rec.get("token") == token:
+                active.pop(key, None)
+
+        self._with_lock(apply)
 
 
 class DedupCheckpointController:
@@ -590,9 +1090,61 @@ def _length_totals(info: dict) -> dict[str, int]:
     return totals
 
 
+def _primary_bucket_progress(info: dict, lengths: Sequence[int]) -> dict[str, int]:
+    """Return the smallest configured bucket's real-token count for live logs."""
+    if not lengths:
+        return {"primary_bucket_length": 0, "primary_bucket_valid_tokens": 0}
+    primary = min(int(x) for x in lengths)
+    stats = (info.get("lengths") or {}).get(str(primary), {})
+    return {
+        "primary_bucket_length": primary,
+        "primary_bucket_valid_tokens": int(stats.get("valid_tokens", 0)),
+    }
+
+
 def code_key(repo: str) -> str:
     """Checkpoint key for one repo's CODE half."""
     return f"{repo}::code"
+
+
+def no_git_key(repo: str) -> str:
+    """Checkpoint key proving the .git-preserving stream saw no git metadata."""
+    return f"{repo}::no_git"
+
+
+def manifest_repo_known_no_git(repo: str, manifest: Manifest) -> bool:
+    info = manifest.done.get(no_git_key(repo))
+    return isinstance(info, dict) and info.get("no_git") is True
+
+
+def should_stage_repo_from_manifest(
+    repo: str,
+    *,
+    streams: str,
+    resume: bool,
+    manifest: Manifest,
+    range_size: int,
+    only_repos: set[str] | None,
+) -> bool:
+    """Return False when the manifest proves this repo needs no extraction.
+
+    The conservative commit proof comes from ``manifest_complete_commit_ranges``:
+    if it cannot prove full coverage without reading the repo's commit JSONL, we
+    keep the old safe behavior and stage the repo.
+    """
+    if only_repos is not None:
+        return repo in only_repos
+    if not resume:
+        return True
+    if streams in {"both", "commits"} and manifest_repo_known_no_git(repo, manifest):
+        return False
+
+    code_needed = streams in {"both", "code"} and not manifest.is_done(code_key(repo))
+    commits_needed = (
+        streams in {"both", "commits"}
+        and manifest_complete_commit_ranges(repo, manifest, range_size) is None
+    )
+    return code_needed or commits_needed
 
 
 def stream_lock_names(streams: str) -> tuple[str, ...]:
@@ -615,6 +1167,7 @@ def run_code_half(
     dedup_near: bool,
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
+    parse_workers: int = 2,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -624,16 +1177,354 @@ def run_code_half(
     plain parquet; the commit stage already recompresses, so we make code match).
     RAISES RepoFailure on any stage failure (no fallback).
     """
-    info = sr.process_one_repo(
-        repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-        global_symbol_index, memory_limit_gb,
+    stage_id = sr.code_stage_id(repo) if dedup_db is not None else None
+    stage_db = sr.code_stage_db(work_root / repo, repo) if dedup_db is not None else None
+    promoted = False
+    try:
+        info = sr.process_one_repo(
+            repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
+            global_symbol_index, memory_limit_gb, parse_workers,
+            promote_dedup_on_success=False,
+        )
+        # zstd-max the per-length code parquet files this repo just wrote.
+        timings = dict(info.get("stage_timings_s", {}))
+        started = time.monotonic()
+        for L in info.get("lengths", {}):
+            dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
+            if dest.exists():
+                src.recompress_zstd_max(dest)
+        timings["recompress_s"] = round(time.monotonic() - started, 6)
+        timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
+        info["stage_timings_s"] = timings
+        promoted = True
+        return info
+    finally:
+        if not promoted:
+            sr.discard_dedup_stage(dedup_db, stage_id, stage_db)
+
+
+CodeRunner = Callable[
+    [
+        str,
+        Path,
+        Sequence[int],
+        Path,
+        Path | None,
+        bool,
+        Path | None,
+        float,
+        int,
+    ],
+    dict,
+]
+
+
+def is_index_project_memory_failure(exc: RepoFailure) -> bool:
+    detail = exc.detail.lower()
+    return (
+        exc.stage == "index_project"
+        and (
+            "exceeded memory limit" in detail
+            or "exit code 137" in detail
+            or "killed: 9" in detail
+        )
     )
-    # zstd-max the per-length code parquet files this repo just wrote.
-    for L in info.get("lengths", {}):
-        dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
-        if dest.exists():
-            src.recompress_zstd_max(dest)
-    return info
+
+
+_PARSE_WORKERS_RE = re.compile(r"\bUsing\s+(\d+)\s+parse workers\b", re.IGNORECASE)
+
+
+def _failure_parse_workers(detail: str) -> int | None:
+    match = _PARSE_WORKERS_RE.search(detail)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def failed_code_unit_was_index_memory(
+    repo: str,
+    manifest: Manifest,
+    *,
+    parse_workers: int | None = None,
+) -> bool:
+    rec = manifest.failed.get(code_key(repo))
+    if not isinstance(rec, dict):
+        return False
+    detail = str(rec.get("detail", "")).lower()
+    is_memory_failure = (
+        rec.get("stage") == "index_project"
+        and (
+            "exceeded memory limit" in detail
+            or "exit code 137" in detail
+            or "killed: 9" in detail
+        )
+    )
+    if not is_memory_failure:
+        return False
+    if parse_workers is not None:
+        prior_parse_workers = _failure_parse_workers(detail)
+        if prior_parse_workers is not None and prior_parse_workers > parse_workers:
+            return False
+    return True
+
+
+def run_code_half_adaptive(
+    repo: str,
+    repo_dir: Path,
+    lengths_code: Sequence[int],
+    work_root: Path,
+    dedup_db: Path | None,
+    dedup_near: bool,
+    global_symbol_index: Path | None = None,
+    memory_limit_gb: float = 10.0,
+    parse_workers: int = 2,
+    *,
+    runner: CodeRunner | None = None,
+    isolate_dedup_on_retry: bool = True,
+) -> dict:
+    """Run the code half, retrying memory peaks with one parse worker.
+
+    Large repos can peak while merging multiprocessing parse payloads into the
+    repo-wide ProjectIndex. Retrying with one parser preserves the same enriched
+    output contract and graph routes while removing that avoidable IPC peak.
+    """
+    active_runner = run_code_half if runner is None else runner
+    try:
+        return active_runner(
+            repo,
+            repo_dir,
+            lengths_code,
+            work_root,
+            dedup_db,
+            dedup_near,
+            global_symbol_index,
+            memory_limit_gb,
+            parse_workers,
+        )
+    except RepoFailure as exc:
+        if parse_workers <= 1 or not is_index_project_memory_failure(exc):
+            raise
+        _log(
+            f"RETRY {code_key(repo)}: {exc.stage} peak failure with "
+            f"parse_workers={parse_workers}; retrying parse_workers=1"
+            + (" with isolated per-repo dedup" if isolate_dedup_on_retry else "")
+        )
+        retry_dedup_db = None if isolate_dedup_on_retry else dedup_db
+        retry_dedup_near = False if isolate_dedup_on_retry else dedup_near
+        return active_runner(
+            repo,
+            repo_dir,
+            lengths_code,
+            work_root,
+            retry_dedup_db,
+            retry_dedup_near,
+            global_symbol_index,
+            memory_limit_gb,
+            1,
+        )
+
+
+RangeRunner = Callable[
+    [
+        str,
+        Path,
+        Path,
+        int,
+        int,
+        Sequence[int],
+        Path,
+        Path | None,
+        bool,
+        Path | None,
+        Path | None,
+        float,
+        int,
+    ],
+    dict,
+]
+
+CommitRecordsProvider = Callable[
+    [
+        str,
+        Path,
+        Path,
+        Path,
+        Manifest,
+        bool,
+    ],
+    tuple[Path, int, str],
+]
+
+
+def is_splitworthy_range_failure(exc: RepoFailure) -> bool:
+    """Return True for range-local peak failures that may shrink by splitting."""
+    detail = exc.detail.lower()
+    return (
+        exc.stage in {"process_commits", "materialize", "pack"}
+        and (
+            "exceeded memory limit" in detail
+            or "exit code 137" in detail
+            or "killed: 9" in detail
+        )
+    )
+
+
+def process_range_adaptive(
+    repo: str,
+    repo_dir: Path,
+    records_jsonl: Path,
+    start: int,
+    end: int,
+    lengths_sorted: Sequence[int],
+    repo_work: Path,
+    dedup_db: Path | None,
+    dedup_near: bool,
+    pr_store: Path | None,
+    repo_list: Path | None,
+    memory_limit_gb: float,
+    *,
+    analysis_cache_entries: int = 128,
+    min_range_size: int = DEFAULT_MIN_RETRY_RANGE_SIZE,
+    runner: RangeRunner | None = None,
+) -> dict[str, list[tuple[int, int, dict]] | list[tuple[int, int, RepoFailure]]]:
+    """Run a commit range, recursively splitting only peak-OOM failures.
+
+    Large C++ repos contain pathological commits/ranges whose enriched sidecars
+    transiently peak above the per-stage RSS guard. Splitting the affected range
+    preserves the exact same downstream processors and manifest accounting while
+    keeping retry work transactional.
+    """
+    if end <= start:
+        raise ValueError(f"invalid range [{start}:{end}]")
+    if min_range_size <= 0:
+        raise ValueError(f"min_range_size must be positive, got {min_range_size}")
+    active_runner = process_range if runner is None else runner
+
+    try:
+        info = active_runner(
+            repo,
+            repo_dir,
+            records_jsonl,
+            start,
+            end,
+            lengths_sorted,
+            repo_work,
+            dedup_db,
+            dedup_near,
+            pr_store,
+            repo_list,
+            memory_limit_gb,
+            analysis_cache_entries,
+        )
+        return {"done": [(start, end, info)], "failed": []}
+    except RepoFailure as exc:
+        if (end - start) <= min_range_size or not is_splitworthy_range_failure(exc):
+            return {"done": [], "failed": [(start, end, exc)]}
+        mid = start + ((end - start) // 2)
+        _log(
+            f"SPLIT {range_key(repo, start)} [{start}:{end}] after "
+            f"{exc.stage} peak failure -> [{start}:{mid}] + [{mid}:{end}]"
+        )
+        left = process_range_adaptive(
+            repo,
+            repo_dir,
+            records_jsonl,
+            start,
+            mid,
+            lengths_sorted,
+            repo_work,
+            dedup_db,
+            dedup_near,
+            pr_store,
+            repo_list,
+            memory_limit_gb,
+            analysis_cache_entries=analysis_cache_entries,
+            min_range_size=min_range_size,
+            runner=active_runner,
+        )
+        right = process_range_adaptive(
+            repo,
+            repo_dir,
+            records_jsonl,
+            mid,
+            end,
+            lengths_sorted,
+            repo_work,
+            dedup_db,
+            dedup_near,
+            pr_store,
+            repo_list,
+            memory_limit_gb,
+            analysis_cache_entries=analysis_cache_entries,
+            min_range_size=min_range_size,
+            runner=active_runner,
+        )
+        return {
+            "done": [*left["done"], *right["done"]],
+            "failed": [*left["failed"], *right["failed"]],
+        }
+
+
+def run_bounded_future_queue(
+    items,
+    *,
+    max_pending: int,
+    submit: Callable,
+    handle_done: Callable,
+    stop_event: threading.Event | None = None,
+    cancel_pending_on_stop: bool = False,
+) -> int:
+    """Submit futures lazily and keep at most ``max_pending`` outstanding.
+
+    ``submit(item)`` returns ``(future, state)`` or ``None`` to skip an item.
+    ``handle_done(item, future, state)`` is called for every submitted future,
+    including futures cancelled by ``cancel_pending_on_stop``.
+    """
+    if max_pending < 1:
+        raise ValueError("max_pending must be >= 1")
+
+    iterator = iter(items)
+    futures = {}
+    submitted = 0
+    exhausted = False
+    cancelled_pending = False
+
+    def fill_window() -> None:
+        nonlocal exhausted, submitted
+        while len(futures) < max_pending and not exhausted:
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                item = next(iterator)
+            except StopIteration:
+                exhausted = True
+                return
+            submitted_future = submit(item)
+            if submitted_future is None:
+                continue
+            future, state = submitted_future
+            futures[future] = (item, state)
+            submitted += 1
+
+    fill_window()
+    while futures:
+        if (
+            stop_event is not None
+            and stop_event.is_set()
+            and cancel_pending_on_stop
+            and not cancelled_pending
+        ):
+            for future in list(futures):
+                if not future.done():
+                    future.cancel()
+            cancelled_pending = True
+        done, _pending = wait(futures.keys(), return_when=FIRST_COMPLETED)
+        for future in done:
+            item, state = futures.pop(future)
+            handle_done(item, future, state)
+        fill_window()
+
+    return submitted
 
 
 # --------------------------------------------------------------------------- #
@@ -662,6 +1553,13 @@ def run_commits_half(
     memory_limit_gb: float = 10.0,
     progress: ProgressWriter | None = None,
     checkpoint: DedupCheckpointController | None = None,
+    reservations: UnitReservationLedger | None = None,
+    range_submit_window: int | None = None,
+    analysis_cache_entries: int = 128,
+    range_target_bytes: int = DEFAULT_RANGE_TARGET_BYTES,
+    dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
+    range_runner_override: RangeRunner | None = None,
+    commit_records_override: CommitRecordsProvider | None = None,
 ) -> tuple[int, int, bool]:
     """Extract commit records once (checkpointed), fan ranges to the pool.
 
@@ -680,11 +1578,35 @@ def run_commits_half(
     lengths_sorted = tuple(sorted(int(x) for x in lengths_commits))
     smallest = lengths_sorted[0]
 
+    if resume:
+        complete_ranges = manifest_complete_commit_ranges(repo, manifest, range_size)
+        if complete_ranges is not None:
+            first = complete_ranges[0][0]
+            last = complete_ranges[-1][1]
+            _log(
+                f"SKIP (done) {repo}::commits: manifest covers "
+                f"{len(complete_ranges)} range(s) [{first}:{last}); "
+                "skip ~extract_git_history"
+            )
+            return 0, 0, True
+
     # Reuse a cached/adopted extract when available; never re-run the ~6h extract
     # for a repo whose commit extraction already completed (sentinel or manifest).
-    records_jsonl, n_records = ensure_commit_records(
+    records_provider = (
+        ensure_commit_records if commit_records_override is None else commit_records_override
+    )
+    records_jsonl, n_records, extract_cache_status = records_provider(
         repo, repo_dir, work_root, work_parent, manifest, resume,
     )
+    if progress is not None:
+        progress.emit(
+            "extract_cache",
+            stream="commits",
+            repo=repo,
+            status=extract_cache_status,
+            n_records=n_records,
+            records_jsonl=str(records_jsonl),
+        )
 
     # .git no longer needed -> free disk now (records already captured/cached).
     git_dir = repo_dir / ".git"
@@ -696,109 +1618,325 @@ def run_commits_half(
     if n_records == 0:
         raise RepoFailure(repo, "extract_git_history",
                           f"zero records after extract for {repo}")
-    ranges = [(s, min(s + range_size, n_records))
-              for s in range(0, n_records, range_size)]
+    ranges = plan_commit_ranges(
+        records_jsonl,
+        n_records,
+        max_records=range_size,
+        target_bytes=range_target_bytes,
+    )
+    if progress is not None:
+        range_lengths = [end - start for start, end in ranges]
+        progress.emit(
+            "commit_range_plan",
+            stream="commits",
+            repo=repo,
+            n_records=n_records,
+            range_count=len(ranges),
+            range_size=range_size,
+            range_target_bytes=range_target_bytes,
+            min_range_records=min(range_lengths) if range_lengths else 0,
+            max_range_records=max(range_lengths) if range_lengths else 0,
+        )
+    if ranges:
+        range_lengths = [end - start for start, end in ranges]
+        _log(
+            f"Commit range plan for {repo}: {len(ranges)} ranges, "
+            f"records={n_records}, max_records={range_size}, "
+            f"target_bytes={range_target_bytes}, "
+            f"range_records=[{min(range_lengths)}..{max(range_lengths)}]"
+        )
 
-    futures = {}
+    done_intervals = manifest_done_commit_intervals(repo, manifest) if resume else ()
+    pending_ranges: list[tuple[int, int]] = []
     for (start, end) in ranges:
         if STOP_EVENT.is_set():
             _log(f"STOP: not submitting further ranges for {repo} (from r{start})")
             break
-        rkey = range_key(repo, start)
-        if resume and manifest.is_done(rkey):
-            _log(f"SKIP (done) {rkey}")
-            continue
-        fut = pool.submit(
-            process_range, repo, repo_dir, records_jsonl,
-            start, end, lengths_sorted, repo_work,
-            dedup_db, dedup_near, pr_store, repo_list,
-            memory_limit_gb,
+        pending_subranges = (
+            missing_commit_subranges(start, end, done_intervals)
+            if resume
+            else ((start, end),)
         )
-        futures[fut] = (start, end)
+        if not pending_subranges:
+            _log(f"SKIP (done) {range_key(repo, start)}")
+            continue
+        for sub_start, sub_end in pending_subranges:
+            pending_ranges.append((sub_start, sub_end))
+
+    submit_window = max(
+        1,
+        int(range_submit_window or len(pending_ranges) or 1),
+    )
+    if pending_ranges and submit_window < len(pending_ranges):
+        _log(
+            f"Commit range queue for {repo}: {len(pending_ranges)} pending, "
+            f"submit_window={submit_window}"
+        )
 
     done = 0
     failed = 0
-    cancelled_pending = False
-    for fut in as_completed(futures):
-        if STOP_EVENT.is_set() and not cancelled_pending:
-            # Cancel queued-but-unstarted ranges; they stay un-marked so resume
-            # re-runs them. Running ranges cannot be cancelled and drain below.
-            n_cancelled = sum(1 for f in futures if not f.done() and f.cancel())
-            cancelled_pending = True
-            if n_cancelled:
-                _log(f"STOP: cancelled {n_cancelled} queued range(s) for {repo}; "
-                     f"draining in-flight")
-        start, end = futures[fut]
+    promote_batch_size = max(1, int(dedup_promote_batch_size or 1))
+    defer_range_promotes = dedup_db is not None and promote_batch_size > 1
+    deferred_stage_dir = repo_work / "_deferred_promote"
+    deferred_promotions: list[
+        tuple[list[tuple[int, int, dict]], WorkReservation | None]
+    ] = []
+
+    def unlink_sqlite_family(db_path: Path) -> None:
+        for path in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def range_runner(
+        range_repo,
+        range_repo_dir,
+        range_records_jsonl,
+        range_start,
+        range_end,
+        range_lengths_sorted,
+        range_repo_work,
+        range_dedup_db,
+        range_dedup_near,
+        range_pr_store,
+        range_repo_list,
+        range_memory_limit_gb,
+        range_analysis_cache_entries,
+    ):
+        args = (
+            range_repo,
+            range_repo_dir,
+            range_records_jsonl,
+            range_start,
+            range_end,
+            range_lengths_sorted,
+            range_repo_work,
+            range_dedup_db,
+            range_dedup_near,
+            range_pr_store,
+            range_repo_list,
+            range_memory_limit_gb,
+            range_analysis_cache_entries,
+        )
+        active_process_range = (
+            process_range if range_runner_override is None else range_runner_override
+        )
+        if defer_range_promotes:
+            return active_process_range(
+                *args,
+                defer_promote=True,
+                deferred_stage_dir=deferred_stage_dir,
+            )
+        return active_process_range(*args)
+
+    def mark_failed_range(
+        failed_start: int,
+        failed_end: int,
+        exc: RepoFailure,
+    ) -> None:
+        nonlocal failed
+        frkey = range_key(repo, failed_start)
+        _log(f"FAIL {frkey}: {exc}")
+        failed += 1
+        with manifest_lock:
+            manifest.mark_failed(frkey, exc.stage, exc.detail)
+        if progress is not None:
+            progress.emit(
+                "unit_failed",
+                stream="commits",
+                repo=repo,
+                unit=frkey,
+                range=[failed_start, failed_end],
+                stage=exc.stage,
+                detail=exc.detail[:2000],
+            )
+
+    def mark_done_range(done_start: int, done_end: int, rinfo: dict) -> None:
+        nonlocal done
+        drkey = range_key(repo, done_start)
+        rinfo["extract_cache_status"] = extract_cache_status
+        with manifest_lock:
+            manifest.mark_done(drkey, rinfo)
+        done += 1
+        totals = _length_totals(rinfo)
+        added = rinfo["lengths"].get(str(smallest), {}).get("valid_tokens", 0)
+        with manifest_lock:
+            cumulative["valid"] += totals["valid_tokens"]
+            cumulative_valid = cumulative["valid"]
+        if progress is not None:
+            progress.emit(
+                "unit_done",
+                stream="commits",
+                repo=repo,
+                unit=drkey,
+                range=[done_start, done_end],
+                rows=totals["rows"],
+                valid_tokens=totals["valid_tokens"],
+                capacity_tokens=totals["capacity_tokens"],
+                **_primary_bucket_progress(rinfo, lengths_sorted),
+                lengths=rinfo.get("lengths", {}),
+                stage_timings_s=rinfo.get("stage_timings_s", {}),
+                extract_cache_status=extract_cache_status,
+                cumulative_valid_tokens=cumulative_valid,
+            )
+        if checkpoint is not None:
+            checkpoint.maybe_checkpoint(cumulative_valid)
+        _log(
+            f"DONE {drkey}: ranges [{done_start}:{done_end}] "
+            f"buckets={sorted(rinfo['lengths'].keys())} "
+            f"(+{added} @ {smallest}, cum_all={cumulative['valid']})"
+        )
+
+    def flush_deferred_promotions() -> None:
+        if not deferred_promotions:
+            return
+        batch = list(deferred_promotions)
+        deferred_promotions.clear()
+        stages: list[tuple[str, Path | None]] = []
+        stage_paths: list[Path] = []
+        for done_items, _reservation in batch:
+            for _done_start, _done_end, rinfo in done_items:
+                stage = rinfo.get("dedup_stage")
+                if not stage:
+                    continue
+                stage_id = stage["stage_id"]
+                stage_db = Path(stage["stage_db"])
+                stages.append((stage_id, stage_db))
+                stage_paths.append(stage_db)
+        metrics = sr.promote_dedup_stages(dedup_db, stages)
+        stage_count = max(1, int(metrics.get("promote_batch_size") or len(stages) or 1))
+        per_wait = float(metrics.get("promote_wait_s", 0.0)) / stage_count
+        per_duration = float(metrics.get("promote_duration_s", 0.0)) / stage_count
+        try:
+            for done_items, reservation in batch:
+                try:
+                    for done_start, done_end, rinfo in done_items:
+                        stage = rinfo.pop("dedup_stage", None)
+                        if stage:
+                            timings = dict(rinfo.get("stage_timings_s", {}))
+                            timings["promote_wait_s"] = round(per_wait, 6)
+                            timings["promote_duration_s"] = round(per_duration, 6)
+                            timings["promote_batch_size"] = stage_count
+                            timings["promote_batch_wait_s"] = metrics.get(
+                                "promote_wait_s", 0.0
+                            )
+                            timings["promote_batch_duration_s"] = metrics.get(
+                                "promote_duration_s", 0.0
+                            )
+                            timings["promote_deferred"] = 0.0
+                            rinfo["stage_timings_s"] = timings
+                            rinfo["dedup_stage_promoted"] = {
+                                "stage_id": stage["stage_id"],
+                            }
+                        mark_done_range(done_start, done_end, rinfo)
+                finally:
+                    if reservation is not None:
+                        reservation.release()
+        finally:
+            for stage_db in stage_paths:
+                unlink_sqlite_family(stage_db)
+
+    def submit_commit_range(item: tuple[int, int]):
+        sub_start, sub_end = item
+        rkey = range_key(repo, sub_start)
+        if STOP_EVENT.is_set():
+            _log(f"STOP: not submitting further ranges for {repo} (from r{sub_start})")
+            return None
+        reservation: WorkReservation | None = None
+        if reservations is not None:
+            reservation = reservations.acquire(rkey, stream="commits", repo=repo)
+            if not reservation.acquired:
+                _log(
+                    f"SKIP (reserved) {rkey}: holder="
+                    f"{reservation.holder}"
+                )
+                return None
+        try:
+            if progress is not None:
+                progress.emit(
+                    "unit_started",
+                    stream="commits",
+                    repo=repo,
+                    unit=rkey,
+                    range=[sub_start, sub_end],
+                    extract_cache_status=extract_cache_status,
+                )
+            fut = pool.submit(
+                process_range_adaptive, repo, repo_dir, records_jsonl,
+                sub_start, sub_end, lengths_sorted, repo_work,
+                dedup_db, dedup_near, pr_store, repo_list,
+                memory_limit_gb,
+                analysis_cache_entries=analysis_cache_entries,
+                runner=range_runner,
+            )
+        except Exception:
+            if reservation is not None:
+                reservation.release()
+            raise
+        return fut, reservation
+
+    def handle_commit_range(
+        item: tuple[int, int],
+        fut,
+        reservation: WorkReservation | None,
+    ) -> None:
+        nonlocal done, failed
+        start, end = item
         rkey = range_key(repo, start)
         try:
-            rinfo = fut.result()
+            adaptive_result = fut.result()
         except CancelledError:
             # Never started -> leave un-marked so resume re-runs this range.
-            continue
+            return
         except RepoFailure as exc:
-            _log(f"FAIL {rkey}: {exc}")
-            failed += 1
-            with manifest_lock:
-                manifest.mark_failed(rkey, exc.stage, exc.detail)
-            if progress is not None:
-                progress.emit(
-                    "unit_failed",
-                    stream="commits",
-                    repo=repo,
-                    unit=rkey,
-                    range=[start, end],
-                    stage=exc.stage,
-                    detail=exc.detail[:2000],
-                )
-            continue
+            mark_failed_range(start, end, exc)
+            return
         except Exception as exc:  # surface unexpected failures loud
-            _log(f"FAIL {rkey}: unexpected {type(exc).__name__}: {exc}")
-            failed += 1
-            with manifest_lock:
-                manifest.mark_failed(rkey, "unexpected", str(exc))
-            if progress is not None:
-                progress.emit(
-                    "unit_failed",
-                    stream="commits",
-                    repo=repo,
-                    unit=rkey,
-                    range=[start, end],
-                    stage="unexpected",
-                    detail=str(exc)[:2000],
+            mark_failed_range(
+                start,
+                end,
+                RepoFailure(
+                    repo,
+                    "unexpected",
+                    f"{type(exc).__name__}: {exc}",
                 )
-            continue
+            )
+            return
         else:
-            with manifest_lock:
-                manifest.mark_done(rkey, rinfo)
-            done += 1
-            totals = _length_totals(rinfo)
-            added = rinfo["lengths"].get(str(smallest), {}).get("valid_tokens", 0)
-            with manifest_lock:
-                cumulative["valid"] += totals["valid_tokens"]
-                cumulative_valid = cumulative["valid"]
-            if progress is not None:
-                progress.emit(
-                    "unit_done",
-                    stream="commits",
-                    repo=repo,
-                    unit=rkey,
-                    range=[start, end],
-                    rows=totals["rows"],
-                    valid_tokens=totals["valid_tokens"],
-                    capacity_tokens=totals["capacity_tokens"],
-                    lengths=rinfo.get("lengths", {}),
-                    cumulative_valid_tokens=cumulative_valid,
-                )
-            if checkpoint is not None:
-                checkpoint.maybe_checkpoint(cumulative_valid)
-            _log(f"DONE {rkey}: ranges [{start}:{end}] "
-                 f"buckets={sorted(rinfo['lengths'].keys())} "
-                 f"(+{added} @ {smallest}, cum_all={cumulative['valid']})")
+            for failed_start, failed_end, exc in adaptive_result["failed"]:
+                mark_failed_range(failed_start, failed_end, exc)
+
+            done_items = list(adaptive_result["done"])
+            if done_items and defer_range_promotes and any(
+                bool(rinfo.get("dedup_stage"))
+                for _done_start, _done_end, rinfo in done_items
+            ):
+                deferred_promotions.append((done_items, reservation))
+                reservation = None
+                if len(deferred_promotions) >= promote_batch_size:
+                    flush_deferred_promotions()
+            else:
+                for done_start, done_end, rinfo in done_items:
+                    mark_done_range(done_start, done_end, rinfo)
+        finally:
+            if reservation is not None:
+                reservation.release()
+
+    run_bounded_future_queue(
+        pending_ranges,
+        max_pending=submit_window,
+        submit=submit_commit_range,
+        handle_done=handle_commit_range,
+        stop_event=STOP_EVENT,
+        cancel_pending_on_stop=True,
+    )
+    flush_deferred_promotions()
 
     # True iff EVERY range for this repo is now marked done in the manifest
     # (covers resume-skipped + newly-done; excludes cancelled/failed). Drives
     # temp + extract-cache retention in process_one_repo.
-    all_ranges_done = all(manifest.is_done(range_key(repo, s)) for (s, _e) in ranges)
+    all_ranges_done = manifest_covers_commit_span(repo, manifest, n_records)
     return done, failed, all_ranges_done
 
 
@@ -811,6 +1949,7 @@ def process_one_repo(
     lengths_code: Sequence[int],
     lengths_commits: Sequence[int],
     range_size: int,
+    range_target_bytes: int,
     work_root: Path,
     work_parent: Path,
     pool: ThreadPoolExecutor,
@@ -826,8 +1965,16 @@ def process_one_repo(
     streams: str = "both",
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
+    parse_workers: int = 2,
     progress: ProgressWriter | None = None,
     checkpoint: DedupCheckpointController | None = None,
+    *,
+    code_memory_limit_gb: float | None = None,
+    commit_memory_limit_gb: float | None = None,
+    reservations: UnitReservationLedger | None = None,
+    range_submit_window: int = 1,
+    analysis_cache_entries: int = 128,
+    dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -843,6 +1990,10 @@ def process_one_repo(
     repo_work.mkdir(parents=True, exist_ok=True)
     result = {"repo": repo, "code": None, "commits_done": 0, "commits_failed": 0}
     all_ranges_done = streams not in {"both", "commits"}  # True when commits disabled
+    code_limit = memory_limit_gb if code_memory_limit_gb is None else code_memory_limit_gb
+    commit_limit = (
+        memory_limit_gb if commit_memory_limit_gb is None else commit_memory_limit_gb
+    )
     try:
         # ---- CODE half (skip if already done) ----
         if streams in {"both", "code"}:
@@ -851,34 +2002,85 @@ def process_one_repo(
                 _log(f"SKIP (done) {ck}")
                 result["code"] = "skipped"
             else:
+                code_reservation: WorkReservation | None = None
+                run_code_unit = True
                 try:
-                    cinfo = run_code_half(
-                        repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-                        global_symbol_index, memory_limit_gb,
-                    )
-                    with manifest_lock:
-                        manifest.mark_done(ck, cinfo)
-                    totals = _length_totals(cinfo)
-                    with manifest_lock:
-                        cumulative["valid"] += totals["valid_tokens"]
-                        cumulative_valid = cumulative["valid"]
-                    if progress is not None:
-                        progress.emit(
-                            "unit_done",
+                    if reservations is not None:
+                        code_reservation = reservations.acquire(
+                            ck,
                             stream="code",
                             repo=repo,
-                            unit=ck,
-                            rows=totals["rows"],
-                            valid_tokens=totals["valid_tokens"],
-                            capacity_tokens=totals["capacity_tokens"],
-                            lengths=cinfo.get("lengths", {}),
-                            cumulative_valid_tokens=cumulative_valid,
                         )
-                    if checkpoint is not None:
-                        checkpoint.maybe_checkpoint(cumulative_valid)
-                    result["code"] = cinfo
-                    _log(f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
-                         f"(cum_all={cumulative['valid']})")
+                        if not code_reservation.acquired:
+                            _log(
+                                f"SKIP (reserved) {ck}: holder="
+                                f"{code_reservation.holder}"
+                            )
+                            result["code"] = "reserved"
+                            code_reservation = None
+                            run_code_unit = False
+                    if run_code_unit:
+                        code_parse_workers = parse_workers
+                        code_dedup_db = dedup_db
+                        code_dedup_near = dedup_near
+                        if (
+                            parse_workers > 1
+                            and resume
+                            and failed_code_unit_was_index_memory(
+                                repo,
+                                manifest,
+                                parse_workers=parse_workers,
+                            )
+                        ):
+                            code_parse_workers = 1
+                            code_dedup_db = None
+                            code_dedup_near = False
+                            _log(
+                                f"RETRY {ck}: prior manifest failure was "
+                                "index_project memory; starting parse_workers=1 "
+                                "with isolated per-repo dedup"
+                            )
+                        if progress is not None:
+                            progress.emit(
+                                "unit_started",
+                                stream="code",
+                                repo=repo,
+                                unit=ck,
+                                parse_workers=code_parse_workers,
+                                memory_limit_gb=code_limit,
+                            )
+                        cinfo = run_code_half_adaptive(
+                            repo, repo_dir, lengths_code, work_root,
+                            code_dedup_db, code_dedup_near,
+                            global_symbol_index, code_limit, code_parse_workers,
+                        )
+                        with manifest_lock:
+                            manifest.mark_done(ck, cinfo)
+                        totals = _length_totals(cinfo)
+                        with manifest_lock:
+                            cumulative["valid"] += totals["valid_tokens"]
+                            cumulative_valid = cumulative["valid"]
+                        if progress is not None:
+                            progress.emit(
+                                "unit_done",
+                                stream="code",
+                                repo=repo,
+                                unit=ck,
+                                rows=totals["rows"],
+                                valid_tokens=totals["valid_tokens"],
+                                capacity_tokens=totals["capacity_tokens"],
+                                **_primary_bucket_progress(cinfo, lengths_code),
+                                lengths=cinfo.get("lengths", {}),
+                                stage_timings_s=cinfo.get("stage_timings_s", {}),
+                                cumulative_valid_tokens=cumulative_valid,
+                            )
+                        if checkpoint is not None:
+                            checkpoint.maybe_checkpoint(cumulative_valid)
+                        result["code"] = cinfo
+                        _log(
+                            f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
+                            f"(cum_all={cumulative['valid']})"
+                        )
                 except RepoFailure as exc:
                     _log(f"FAIL {ck}: {exc}")
                     with manifest_lock:
@@ -891,8 +2093,11 @@ def process_one_repo(
                             unit=ck,
                             stage=exc.stage,
                             detail=exc.detail[:2000],
-                        )
+                    )
                     result["code"] = "failed"
+                finally:
+                    if code_reservation is not None:
+                        code_reservation.release()
         else:
             result["code"] = "disabled"
 
@@ -903,8 +2108,11 @@ def process_one_repo(
                     repo, repo_dir, repo_work, work_root, work_parent,
                     lengths_commits, range_size,
                     pool, manifest, manifest_lock, resume, cumulative,
-                    dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
-                    progress, checkpoint,
+                    dedup_db, dedup_near, pr_store, repo_list, commit_limit,
+                    progress, checkpoint, reservations, range_submit_window,
+                    analysis_cache_entries,
+                    range_target_bytes=range_target_bytes,
+                    dedup_promote_batch_size=dedup_promote_batch_size,
                 )
                 result["commits_done"] = done
                 result["commits_failed"] = failed
@@ -947,6 +2155,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "(default 1024,2048,4096,8192,16384).")
     p.add_argument("--range-size", type=int, default=DEFAULT_RANGE_SIZE,
                    help="Commits per checkpointed range (default 500).")
+    p.add_argument("--range-target-bytes", type=int,
+                   default=DEFAULT_RANGE_TARGET_BYTES,
+                   help="Soft cap for raw extracted commit-record JSONL bytes per "
+                        "range. The conveyor still respects --range-size as a hard "
+                        "record-count cap. Use 0 to restore fixed --range-size "
+                        f"ranges. Default {DEFAULT_RANGE_TARGET_BYTES}.")
+    p.add_argument("--range-submit-window", type=int, default=0,
+                   help="Maximum outstanding commit range futures per repo. "
+                        "Default 0 means 2 * --workers. Bounds reservation "
+                        "claims and ThreadPoolExecutor queue size for huge repos.")
+    p.add_argument("--dedup-promote-batch-size", type=int,
+                   default=DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
+                   help="Commit ranges defer local dedup stage promotion and the "
+                        "parent promotes this many completed stages while holding "
+                        "the global SQLite writer lock once. Use 1 to restore "
+                        "per-range promotion. "
+                        f"Default {DEFAULT_DEDUP_PROMOTE_BATCH_SIZE}.")
+    p.add_argument("--analysis-cache-entries", type=int, default=128,
+                   help="Bounded per-process LRU entries passed to "
+                        "process_commits.py for repeated old/new file analyses. "
+                        "Default 128; use 0 to disable.")
     p.add_argument("--workers", type=int, default=os.cpu_count(),
                    help="ThreadPoolExecutor size for commit ranges "
                         "(default = os.cpu_count()).")
@@ -1001,6 +2230,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
+    p.add_argument("--code-memory-limit-gb", type=float, default=None,
+                   help="CODE-stage RSS limit passed to index_project/materialize/"
+                        "pack. Default: --memory-limit-gb.")
+    p.add_argument("--commit-memory-limit-gb", type=float, default=None,
+                   help="COMMITS-stage RSS limit passed to process_commits/"
+                        "materialize/pack. Default: --memory-limit-gb. Use this "
+                        "to raise --workers without over-reserving for code.")
+    p.add_argument("--parse-workers", type=int, default=2,
+                   help="Parse workers passed to index_project for the CODE half "
+                        "(default 2; avoid multiplying --repo-workers by the old "
+                        "index_project default of 8 clang workers).")
+    p.add_argument("--memory-budget-gb", type=float, default=None,
+                   help="Global conveyor memory budget for heavy subprocesses. "
+                        "Default is 55%% of physical RAM (or 48 GiB if RAM size "
+                        "cannot be detected). Use 0 to disable the preflight.")
+    p.add_argument("--allow-memory-oversubscription", action="store_true",
+                   help="Allow heavy_slots * --memory-limit-gb to exceed "
+                        "--memory-budget-gb. This is intentionally explicit.")
     p.add_argument("--progress-jsonl", default=str(DEFAULT_PROGRESS_JSONL),
                    help="Append unit-level progress events here for live "
                         "throughput monitoring. Use empty string to disable.")
@@ -1023,6 +2270,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Disable per-stream conveyor process locks. Intended "
                         "only for controlled tests; normal runs should keep the "
                         "lock so duplicate stream writers fail before extraction.")
+    p.add_argument("--reservation-file", default=str(DEFAULT_RESERVATION_FILE),
+                   help="Cross-process active-unit reservation JSON file. Prevents "
+                        "duplicate repo/range workers from processing the same "
+                        f"output unit. Default {DEFAULT_RESERVATION_FILE}.")
+    p.add_argument("--no-reservation-ledger", action="store_true",
+                   help="Disable active-unit reservations. Intended only for "
+                        "controlled tests.")
     return p.parse_args(argv)
 
 
@@ -1042,6 +2296,39 @@ def main(argv: list[str]) -> int:
     max_active_repos = max(1, max_active_repos)
     if max_active_repos < repo_workers:
         raise SystemExit("--max-active-repos must be >= --repo-workers")
+    parse_workers = max(1, int(args.parse_workers or 1))
+    args.parse_workers = parse_workers
+    range_submit_window = (
+        max(1, workers * DEFAULT_RANGE_SUBMIT_WINDOW_MULTIPLIER)
+        if int(args.range_submit_window or 0) <= 0
+        else max(1, int(args.range_submit_window))
+    )
+    dedup_promote_batch_size = max(1, int(args.dedup_promote_batch_size or 1))
+    code_memory_limit_gb = (
+        float(args.memory_limit_gb)
+        if args.code_memory_limit_gb is None
+        else float(args.code_memory_limit_gb)
+    )
+    commit_memory_limit_gb = (
+        float(args.memory_limit_gb)
+        if args.commit_memory_limit_gb is None
+        else float(args.commit_memory_limit_gb)
+    )
+    memory_budget_gb = (
+        default_memory_budget_gb()
+        if args.memory_budget_gb is None
+        else float(args.memory_budget_gb)
+    )
+    memory_plan = validate_memory_plan(
+        streams=args.streams,
+        workers=workers,
+        repo_workers=repo_workers,
+        memory_limit_gb=args.memory_limit_gb,
+        code_memory_limit_gb=code_memory_limit_gb,
+        commit_memory_limit_gb=commit_memory_limit_gb,
+        memory_budget_gb=memory_budget_gb,
+        allow_oversubscription=args.allow_memory_oversubscription,
+    )
 
     # SIGNAL HANDLER (requirement 1): cooperative, fail-loud shutdown. The first
     # SIGINT/SIGTERM sets STOP_EVENT -> the submission loops stop staging new
@@ -1148,6 +2435,12 @@ def main(argv: list[str]) -> int:
     manifest_lock = threading.Lock()
     resume = not args.no_resume
     progress = ProgressWriter(Path(args.progress_jsonl) if args.progress_jsonl else None)
+    reservations = None
+    if not args.no_reservation_ledger:
+        reservations = UnitReservationLedger(Path(args.reservation_file))
+        stale = reservations.cleanup_stale()
+        if stale:
+            _log(f"Reservations: cleaned {stale} stale active unit claim(s)")
     checkpoint = DedupCheckpointController(
         dedup_db=dedup_db,
         interval_tokens=args.dedup_checkpoint_tokens,
@@ -1162,11 +2455,33 @@ def main(argv: list[str]) -> int:
         repo_workers=repo_workers,
         max_active_repos=max_active_repos,
         range_size=args.range_size,
+        range_target_bytes=args.range_target_bytes,
+        range_submit_window=range_submit_window,
+        dedup_promote_batch_size=dedup_promote_batch_size,
         target_lengths_code=list(lengths_code),
         target_lengths_commits=list(lengths_commits),
         manifest=str(CONVEYOR_MANIFEST),
         dedup_checkpoint_tokens=args.dedup_checkpoint_tokens,
         dedup_checkpoint_mode=args.dedup_checkpoint_mode,
+        parse_workers=parse_workers,
+        code_memory_limit_gb=code_memory_limit_gb,
+        commit_memory_limit_gb=commit_memory_limit_gb,
+        reservation_file=str(args.reservation_file)
+        if reservations is not None else None,
+        memory_plan=memory_plan,
+    )
+    _log(
+        "Memory plan: "
+        f"heavy_slots={memory_plan['heavy_slots']} "
+        f"code_slots={memory_plan['code_heavy_slots']} "
+        f"commit_slots={memory_plan['commit_heavy_slots']} "
+        f"code_limit={memory_plan['code_memory_limit_gb']:.2f}GiB "
+        f"commit_limit={memory_plan['commit_memory_limit_gb']:.2f}GiB "
+        f"reserved={memory_plan['reserved_gb']:.2f}GiB "
+        f"budget={memory_plan['memory_budget_gb']:.2f}GiB "
+        f"parse_workers={parse_workers} "
+        f"range_submit_window={range_submit_window} "
+        f"dedup_promote_batch_size={dedup_promote_batch_size}"
     )
 
     # work_parent is always the configured parent: it both hosts the randomized
@@ -1196,13 +2511,18 @@ def main(argv: list[str]) -> int:
     only_repos = set(args.only_repo) if args.only_repo else None
 
     def should_process(repo: str) -> bool:
-        # Restrict to --only-repo when given (others drained without extraction);
-        # otherwise stage every repo. Per-half + per-range resume is downstream.
-        if only_repos is not None:
-            return repo in only_repos
-        if args.streams == "code" and resume and manifest.is_done(code_key(repo)):
-            return False
-        return True
+        # Restrict to --only-repo when given (others drained without extraction).
+        # Otherwise skip extraction when the manifest itself proves every stream
+        # for this repo is complete; partial/ambiguous repos still stage and use
+        # the existing per-half/per-range resume below.
+        return should_stage_repo_from_manifest(
+            repo,
+            streams=args.streams,
+            resume=resume,
+            manifest=manifest,
+            range_size=args.range_size,
+            only_repos=only_repos,
+        )
 
     range_pool = ThreadPoolExecutor(max_workers=workers)
     repo_pool = ThreadPoolExecutor(max_workers=repo_workers) if repo_workers > 1 else None
@@ -1237,11 +2557,26 @@ def main(argv: list[str]) -> int:
             )
         submitted_repo_names.add(repo)
 
+    def mark_no_git_repo(repo: str) -> None:
+        info = {
+            "source": "commits",
+            "no_git": True,
+            "reason": "missing .git metadata",
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        with manifest_lock:
+            manifest.mark_done(no_git_key(repo), info)
+        progress.emit("repo_no_git", repo=repo, unit=no_git_key(repo), **info)
+
     try:
         gen = (
             sr.stream_repo_subtrees(work_root, should_process)
             if args.streams == "code"
-            else stream_repo_subtrees_with_git(work_root, should_process)
+            else stream_repo_subtrees_with_git(
+                work_root,
+                should_process,
+                on_no_git=mark_no_git_repo,
+            )
         )
 
         if repo_pool is None:
@@ -1255,11 +2590,19 @@ def main(argv: list[str]) -> int:
                 claim_repo_once(repo)
                 res = process_one_repo(
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
+                    args.range_target_bytes,
                     work_root, work_parent, range_pool, manifest, manifest_lock,
                     resume, cumulative,
                     args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
                     args.streams, global_symbol_index, args.memory_limit_gb,
+                    args.parse_workers,
                     progress, checkpoint,
+                    code_memory_limit_gb=code_memory_limit_gb,
+                    commit_memory_limit_gb=commit_memory_limit_gb,
+                    reservations=reservations,
+                    range_submit_window=range_submit_window,
+                    analysis_cache_entries=args.analysis_cache_entries,
+                    dedup_promote_batch_size=dedup_promote_batch_size,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -1335,11 +2678,19 @@ def main(argv: list[str]) -> int:
                 fut = repo_pool.submit(
                     process_one_repo,
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
+                    args.range_target_bytes,
                     work_root, work_parent, range_pool, manifest, manifest_lock,
                     resume, cumulative,
                     args.keep_temp, dedup_db, dedup_near, pr_store, repo_list,
                     args.streams, global_symbol_index, args.memory_limit_gb,
+                    args.parse_workers,
                     progress, checkpoint,
+                    code_memory_limit_gb=code_memory_limit_gb,
+                    commit_memory_limit_gb=commit_memory_limit_gb,
+                    reservations=reservations,
+                    range_submit_window=range_submit_window,
+                    analysis_cache_entries=args.analysis_cache_entries,
+                    dedup_promote_batch_size=dedup_promote_batch_size,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
@@ -1387,6 +2738,8 @@ def main(argv: list[str]) -> int:
         "workers": workers,
         "repo_workers": repo_workers,
         "max_active_repos": max_active_repos,
+        "parse_workers": parse_workers,
+        "memory_plan": memory_plan,
         "streams": args.streams,
         "range_size": args.range_size,
         "target_lengths_code": list(lengths_code),
@@ -1399,6 +2752,7 @@ def main(argv: list[str]) -> int:
         "dedup_db": str(dedup_db) if dedup_db else None,
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
+        "extract_cache_metrics": progress.extract_cache_metrics(),
         "interrupted": interrupted,
     }
     progress.emit("run_finished", **summary)

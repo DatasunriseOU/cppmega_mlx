@@ -52,6 +52,7 @@ from cppmega_mlx.tokenizer.cpp_tokenizer import (  # noqa: E402
     CppMegaTokenizer,
     load_cppmega_tokenizer,
 )
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS  # noqa: E402
 
 CLANG_FORMAT = "/opt/homebrew/opt/llvm/bin/clang-format"
 TOKENIZER_DIR = _REPO_ROOT / "cppmega_mlx" / "tokenizer"
@@ -77,6 +78,10 @@ STRUCTURE_ID_NAMES = {
 }
 CHUNK_KIND_NAMES = STRUCTURE_ID_NAMES
 DEF_USE_NAMES = {0: "none", 1: "def", 2: "use", 3: "def+use"}
+DOMAIN_DELIMITER_NAMES_BY_ID = {
+    int(token_id): f"<{role}>"
+    for role, token_id in DOMAIN_DELIMITER_TOKEN_IDS.items()
+}
 
 # block markers that delimit the commit DOC layout inside decoded text.
 # The indexer emits "=== PRE-COMMIT ... ===" / "=== POST-COMMIT: <brief> ===",
@@ -265,6 +270,38 @@ def _code_portion(text: str, is_commit: bool, blocks: dict[str, str]) -> str:
     return "\n".join(out) if out else text
 
 
+def _domain_segment_text(
+    ids: list[int],
+    tok: CppMegaTokenizer,
+    *,
+    start_role: str,
+    end_role: str,
+) -> str | None:
+    start_id = DOMAIN_DELIMITER_TOKEN_IDS[start_role]
+    end_id = DOMAIN_DELIMITER_TOKEN_IDS[end_role]
+    try:
+        start = ids.index(start_id)
+    except ValueError:
+        return None
+    try:
+        end = ids.index(end_id, start + 1)
+    except ValueError:
+        return None
+    if end <= start + 1:
+        return ""
+    return tok.decode(ids[start + 1:end])
+
+
+def _token_debug_label(token_id: int, tok: CppMegaTokenizer) -> str | None:
+    logical = DOMAIN_DELIMITER_NAMES_BY_ID.get(int(token_id))
+    raw = tok.token_for_id(int(token_id))
+    if logical is None:
+        return raw
+    if raw and raw != logical:
+        return f"{logical} ({raw})"
+    return logical
+
+
 def _per_token_table(ids: list[int], tok: CppMegaTokenizer, row: dict, start: int,
                      count: int) -> list[dict[str, Any]]:
     """Aligned per-token rows for a window so it's obvious which channel carries what."""
@@ -285,7 +322,8 @@ def _per_token_table(ids: list[int], tok: CppMegaTokenizer, row: dict, start: in
         table.append({
             "i": i,
             "tok_id": int(tid),
-            "tok": tok.token_for_id(int(tid)),
+            "tok": _token_debug_label(int(tid), tok),
+            "tok_raw": tok.token_for_id(int(tid)),
             "A_platform": int(g("token_platform_ids", i)),
             "B_structure": f"{st}:{STRUCTURE_ID_NAMES.get(st, '?')}",
             "B_dep_lvl": int(g("token_dep_levels", i)),
@@ -300,6 +338,12 @@ def _per_token_table(ids: list[int], tok: CppMegaTokenizer, row: dict, start: in
             "D_chg_post": int(g("token_change_mask_post", i)),
             "D_hunk": int(g("hunk_id_per_token", i, -1)),
             "D_edit_op": f"{eo}:{EDIT_OP_NAMES.get(eo, '?')}",
+            "E_domain": int(g("token_domain_ids", i)),
+            "E_role": int(g("token_role_ids", i)),
+            "E_entity": int(g("token_entity_ids", i)),
+            "E_scope": int(g("token_scope_ids", i)),
+            "E_source_doc": int(g("token_source_doc_ids", i)),
+            "E_confidence": int(g("token_confidence_ids", i)),
         })
     return table
 
@@ -308,6 +352,25 @@ def _struct_list(v: Any) -> list[Any]:
     if v is None:
         return []
     return list(v)
+
+
+def _edge_records(edges: Any, *, with_kind: bool) -> list[dict[str, int]]:
+    out: list[dict[str, int]] = []
+    for edge in _struct_list(edges):
+        if isinstance(edge, dict):
+            if "from" not in edge or "to" not in edge:
+                continue
+            record = {"from": int(edge["from"]), "to": int(edge["to"])}
+            if with_kind and "kind" in edge:
+                record["kind"] = int(edge["kind"])
+            out.append(record)
+            continue
+        if isinstance(edge, (list, tuple)) and len(edge) >= 2:
+            record = {"from": int(edge[0]), "to": int(edge[1])}
+            if with_kind and len(edge) >= 3:
+                record["kind"] = int(edge[2])
+            out.append(record)
+    return out
 
 
 def build_sidecar(row: dict, ids: list[int], tok: CppMegaTokenizer, *,
@@ -321,14 +384,13 @@ def build_sidecar(row: dict, ids: list[int], tok: CppMegaTokenizer, *,
                 window_start = max(0, i - 4)
                 break
 
-    edges_call = [
-        {"from": int(e["from"]), "to": int(e["to"])}
-        for e in _struct_list(row.get("token_call_edges"))
-    ]
-    edges_type = [
-        {"from": int(e["from"]), "to": int(e["to"])}
-        for e in _struct_list(row.get("token_type_edges"))
-    ]
+    edges_call = _edge_records(row.get("token_call_edges"), with_kind=False)
+    edges_type = _edge_records(row.get("token_type_edges"), with_kind=False)
+    edges_domain = _edge_records(row.get("token_domain_edges"), with_kind=True)
+    edges_build = _edge_records(row.get("token_build_edges"), with_kind=True)
+    edges_shell = _edge_records(row.get("token_shell_edges"), with_kind=True)
+    edges_diagnostic = _edge_records(row.get("token_diagnostic_edges"), with_kind=True)
+    edges_cross_domain = _edge_records(row.get("token_cross_domain_edges"), with_kind=True)
     chunk_ids = [int(x) for x in _struct_list(row.get("changed_chunk_ids"))]
     chunk_spans = [
         {"start": int(s["start"]), "end": int(s["end"])}
@@ -345,6 +407,11 @@ def build_sidecar(row: dict, ids: list[int], tok: CppMegaTokenizer, *,
                 "B": "structure (syntax+structure)",
                 "C": "graph-semantic (symbol/def_use/call/type + edges)",
                 "D": "commit-edit (change-mask/hunk/edit-op/changed-chunks)",
+                "E": "domain routes (build/shell/diagnostic delimiters, roles, edges)",
+            },
+            "domain_delimiters_by_id": {
+                str(token_id): name
+                for token_id, name in sorted(DOMAIN_DELIMITER_NAMES_BY_ID.items())
             },
         },
         "window": {"start": window_start, "count": window},
@@ -361,6 +428,18 @@ def build_sidecar(row: dict, ids: list[int], tok: CppMegaTokenizer, *,
         "D_changed_chunks": {
             "changed_chunk_ids": chunk_ids,
             "changed_chunk_spans": chunk_spans,
+        },
+        "E_domain_routes": {
+            "token_domain_edges": edges_domain[:64],
+            "token_domain_edges_total": len(edges_domain),
+            "token_build_edges": edges_build[:64],
+            "token_build_edges_total": len(edges_build),
+            "token_shell_edges": edges_shell[:64],
+            "token_shell_edges_total": len(edges_shell),
+            "token_diagnostic_edges": edges_diagnostic[:64],
+            "token_diagnostic_edges_total": len(edges_diagnostic),
+            "token_cross_domain_edges": edges_cross_domain[:64],
+            "token_cross_domain_edges_total": len(edges_cross_domain),
         },
     }
 
@@ -381,7 +460,14 @@ def render_row(parquet: str, row_idx: int, *, window: int = 48) -> RenderResult:
 
     rt = verify_roundtrip(ids, tok)
     blocks = _split_commit_blocks(text) if is_commit else {}
-    code = _code_portion(text, is_commit, blocks)
+    code = _domain_segment_text(
+        ids,
+        tok,
+        start_role="CPP_CODE_START",
+        end_role="CPP_CODE_END",
+    )
+    if code is None:
+        code = _code_portion(text, is_commit, blocks)
     formatted, ok = clang_format(code)
 
     docstring = blocks.get("docstring", "")

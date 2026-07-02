@@ -386,6 +386,84 @@ def _validate_attention_sinks(
     return sinks
 
 
+def _merge_dense_attention_bias(
+    mask: mx.array | Literal["causal"] | None,
+    attention_bias: mx.array | None,
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_length: int,
+    key_length: int,
+) -> mx.array | Literal["causal"] | None:
+    if attention_bias is None:
+        return mask
+    if not isinstance(attention_bias, mx.array):
+        raise TypeError(
+            "attention_bias must be an mlx.core.array, got "
+            f"{type(attention_bias).__name__}"
+        )
+    if attention_bias.ndim == 2:
+        if tuple(attention_bias.shape) != (query_length, key_length):
+            raise ValueError(
+                "attention_bias must be shaped (S,K), (B,S,K), or (B,H,S,K); "
+                f"got {tuple(attention_bias.shape)} for S={query_length}, K={key_length}"
+            )
+        bias = attention_bias
+    elif attention_bias.ndim == 3:
+        if tuple(attention_bias.shape[-2:]) != (query_length, key_length):
+            raise ValueError(
+                "attention_bias must be shaped (S,K), (B,S,K), or (B,H,S,K); "
+                f"got {tuple(attention_bias.shape)} for S={query_length}, K={key_length}"
+            )
+        if int(attention_bias.shape[0]) not in (1, batch_size):
+            raise ValueError(
+                "attention_bias batch dimension must be 1 or "
+                f"{batch_size}, got {attention_bias.shape[0]}"
+            )
+        bias = attention_bias[:, None, :, :]
+    elif attention_bias.ndim == 4:
+        if tuple(attention_bias.shape[-2:]) != (query_length, key_length):
+            raise ValueError(
+                "attention_bias must be shaped (S,K), (B,S,K), or (B,H,S,K); "
+                f"got {tuple(attention_bias.shape)} for S={query_length}, K={key_length}"
+            )
+        if int(attention_bias.shape[0]) not in (1, batch_size):
+            raise ValueError(
+                "attention_bias batch dimension must be 1 or "
+                f"{batch_size}, got {attention_bias.shape[0]}"
+            )
+        if int(attention_bias.shape[1]) not in (1, num_heads):
+            raise ValueError(
+                "attention_bias head dimension must be 1 or "
+                f"{num_heads}, got {attention_bias.shape[1]}"
+            )
+        bias = attention_bias
+    else:
+        raise ValueError(
+            "attention_bias must be shaped (S,K), (B,S,K), or (B,H,S,K); "
+            f"got ndim={attention_bias.ndim}"
+        )
+
+    if isinstance(mask, str):
+        if mask != "causal":
+            raise ValueError(f"unsupported attention mask sentinel {mask!r}")
+        mask = causal_sdpa_mask(query_length, key_length=key_length)
+    if mask is None:
+        return bias.astype(mx.float32)
+    if not isinstance(mask, mx.array):
+        raise TypeError(f"mask must be an mlx.core.array, got {type(mask).__name__}")
+    mask_value = mask
+    if mask.dtype == mx.bool_:
+        mask_value = mx.where(
+            mask,
+            mx.zeros(mask.shape, dtype=mx.float32),
+            mx.full(mask.shape, -mx.inf, dtype=mx.float32),
+        )
+    else:
+        mask_value = mask_value.astype(mx.float32)
+    return mask_value + bias.astype(mx.float32)
+
+
 def sparse_mla_fp8_route_enabled(path: KernelPath) -> bool:
     """Return whether the active dtype route explicitly enables FP8 Sparse-MLA."""
 
@@ -527,7 +605,7 @@ def precompute_rotary_embeddings(
 
 
 def apply_rotary_emb(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Apply nanochat split-half RoPE to ``x`` shaped ``(B,H,S,D)``."""
+    """Apply Megatron-compatible split-half RoPE to ``x`` shaped ``(B,H,S,D)``."""
 
     if x.ndim != 4:
         raise ValueError(f"expected a 4-D attention tensor, got shape {x.shape}")
@@ -538,7 +616,10 @@ def apply_rotary_emb(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     sin = sin.astype(x.dtype)
     x1 = x[..., :half]
     x2 = x[..., half:]
-    return mx.concatenate([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], axis=-1)
+    # Megatron non-interleaved RoPE uses rotate_half(x) = [-x2, x1]:
+    #   x * cos + rotate_half(x) * sin
+    # = [x1*cos - x2*sin, x2*cos + x1*sin]
+    return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -989,6 +1070,7 @@ class CausalSelfAttention(nn.Module):
         hidden_states: mx.array,
         mask: mx.array | Literal["causal"] | None = None,
         *,
+        attention_bias: mx.array | None = None,
         sinks: mx.array | None = None,
         kv_cache: ContiguousKVCache | None = None,
         layer_idx: int | None = None,
@@ -1069,6 +1151,14 @@ class CausalSelfAttention(nn.Module):
                 query_offset=cache_position,
                 key_length=key_length,
             )
+        mask = _merge_dense_attention_bias(
+            mask,
+            attention_bias,
+            batch_size=int(hidden_states.shape[0]),
+            num_heads=self.config.num_q_heads,
+            query_length=int(hidden_states.shape[1]),
+            key_length=int(key_length),
+        )
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
         from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
 

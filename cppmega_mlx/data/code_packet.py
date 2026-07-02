@@ -29,6 +29,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 
 
@@ -46,6 +47,14 @@ _SEMANTIC_FIELDS = (
     "type_refs",
     "def_use",
 )
+_DOMAIN_TOKEN_FIELDS = (
+    "domain_ids",
+    "role_ids",
+    "entity_ids",
+    "scope_ids",
+    "source_doc_ids",
+    "confidence_ids",
+)
 # Token-aligned channels that must match token_ids length exactly.
 _TOKEN_ALIGNED_FIELDS = (
     "target_ids",
@@ -53,6 +62,7 @@ _TOKEN_ALIGNED_FIELDS = (
     "document_ids",
     *_STRUCTURE_FIELDS,
     *_SEMANTIC_FIELDS,
+    *_DOMAIN_TOKEN_FIELDS,
 )
 # Chunk-aligned channels (all four must agree with each other, not with tokens).
 _CHUNK_FIELDS = (
@@ -102,9 +112,24 @@ class CodePacket:
     type_refs: mx.array | None = None
     def_use: mx.array | None = None
 
+    # Domain-routing side-channels (token-aligned).
+    domain_ids: mx.array | None = None
+    role_ids: mx.array | None = None
+    entity_ids: mx.array | None = None
+    scope_ids: mx.array | None = None
+    source_doc_ids: mx.array | None = None
+    confidence_ids: mx.array | None = None
+
     # Graph edges (chunk-index space).
     call_edges: EdgeIndex | None = None
     type_edges: EdgeIndex | None = None
+
+    # Domain graph edges (token-index space).
+    domain_edges: DomainEdgeIndex | None = None
+    build_edges: DomainEdgeIndex | None = None
+    shell_edges: DomainEdgeIndex | None = None
+    diagnostic_edges: DomainEdgeIndex | None = None
+    cross_domain_edges: DomainEdgeIndex | None = None
 
     # Chunk metadata.
     chunk_starts: mx.array | None = None
@@ -188,6 +213,20 @@ class CodePacket:
                     f"{type(value).__name__}"
                 )
 
+        for name in (
+            "domain_edges",
+            "build_edges",
+            "shell_edges",
+            "diagnostic_edges",
+            "cross_domain_edges",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, DomainEdgeIndex):
+                raise TypeError(
+                    f"CodePacket.{name} must be a DomainEdgeIndex or None, got "
+                    f"{type(value).__name__}"
+                )
+
         if not isinstance(self.metadata, Mapping):
             raise TypeError(
                 f"CodePacket.metadata must be a Mapping, got "
@@ -212,6 +251,9 @@ class CodePacket:
     def semantic_fields(self) -> dict[str, mx.array | None]:
         return {name: getattr(self, name) for name in _SEMANTIC_FIELDS}
 
+    def domain_token_fields(self) -> dict[str, mx.array | None]:
+        return {name: getattr(self, name) for name in _DOMAIN_TOKEN_FIELDS}
+
     def present_fields(self) -> tuple[str, ...]:
         """Names of optional array/edge fields that are populated (not None)."""
 
@@ -221,8 +263,14 @@ class CodePacket:
             "document_ids",
             *_STRUCTURE_FIELDS,
             *_SEMANTIC_FIELDS,
+            *_DOMAIN_TOKEN_FIELDS,
             "call_edges",
             "type_edges",
+            "domain_edges",
+            "build_edges",
+            "shell_edges",
+            "diagnostic_edges",
+            "cross_domain_edges",
             *_CHUNK_FIELDS,
         )
         return tuple(name for name in candidates if getattr(self, name) is not None)

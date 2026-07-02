@@ -107,6 +107,30 @@ def test_gqa_kv_head_broadcasting_shapes():
     assert tuple(out.shape) == (b, s, cfg.hidden_size)
 
 
+def test_gqa_attention_consumes_graph_route_bias():
+    cfg = _smoke_config(depth=1, ngram_hash_enabled=False)
+    model = DenseCppLM(cfg)
+    b = _rand_batch(cfg, 1, 8, seed=17)
+    block_bias = mx.zeros((1, 8, 8), dtype=mx.float32)
+    block_bias[:, 7, 1] = 50.0
+
+    logits_plain, _ = model(b["input_ids"])
+    logits_biased, _ = model(b["input_ids"], block_bias=block_bias)
+    mx.eval(logits_plain, logits_biased)
+
+    delta = mx.abs(logits_plain - logits_biased).sum()
+    assert float(delta.item()) > 1e-4
+
+
+def test_gqa_attention_rejects_malformed_graph_route_bias():
+    cfg = _smoke_config(depth=1)
+    model = DenseCppLM(cfg)
+    b = _rand_batch(cfg, 1, 8, seed=19)
+
+    with pytest.raises(ValueError, match="attention_bias must be shaped"):
+        model(b["input_ids"], block_bias=mx.zeros((1, 7, 8), dtype=mx.float32))
+
+
 def test_gqa_config_rejects_equal_kv_heads():
     # mode='gqa' requires num_kv_heads strictly < num_query_heads (the seam's
     # contract lives in AttentionConfig and is validated at config construction).

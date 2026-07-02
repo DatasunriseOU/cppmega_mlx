@@ -45,10 +45,21 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     TOKEN_CHUNK_ENDS_COLUMN,
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_CONFIDENCE_IDS_COLUMN,
+    TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     TOKEN_DEF_USE_COLUMN,
     TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+    TOKEN_DOMAIN_EDGES_COLUMN,
+    TOKEN_DOMAIN_IDS_COLUMN,
+    TOKEN_BUILD_EDGES_COLUMN,
+    TOKEN_ENTITY_IDS_COLUMN,
     TOKEN_IDS_COLUMN,
+    TOKEN_ROLE_IDS_COLUMN,
+    TOKEN_SCOPE_IDS_COLUMN,
     TOKEN_SIBLING_INDEX_COLUMN,
+    TOKEN_SHELL_EDGES_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
@@ -115,6 +126,12 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "change_mask_post",
     "hunk_id_per_char",
     "edit_op_per_char",
+    "domain_ids",
+    "domain_role_ids",
+    "domain_entity_ids",
+    "domain_scope_ids",
+    "domain_source_doc_ids",
+    "domain_confidence_ids",
 )
 
 # ---------------------------------------------------------------------------
@@ -293,6 +310,38 @@ _SCHEMA = pa.schema([
     pa.field("call_targets", pa.list_(pa.uint32())),
     pa.field("type_refs", pa.list_(pa.uint32())),
     pa.field("def_use", pa.list_(pa.uint8())),
+    pa.field("domain_kind", pa.uint16()),
+    pa.field("domain_ids", pa.list_(pa.uint16())),
+    pa.field("domain_role_ids", pa.list_(pa.uint16())),
+    pa.field("domain_entity_ids", pa.list_(pa.uint32())),
+    pa.field("domain_scope_ids", pa.list_(pa.uint32())),
+    pa.field("domain_source_doc_ids", pa.list_(pa.uint32())),
+    pa.field("domain_confidence_ids", pa.list_(pa.uint8())),
+    pa.field("domain_edges", pa.list_(pa.struct([
+        pa.field("from_char", pa.int32()),
+        pa.field("to_char", pa.int32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field("build_edges", pa.list_(pa.struct([
+        pa.field("from_char", pa.int32()),
+        pa.field("to_char", pa.int32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field("shell_edges", pa.list_(pa.struct([
+        pa.field("from_char", pa.int32()),
+        pa.field("to_char", pa.int32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field("diagnostic_edges", pa.list_(pa.struct([
+        pa.field("from_char", pa.int32()),
+        pa.field("to_char", pa.int32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field("cross_domain_edges", pa.list_(pa.struct([
+        pa.field("from_char", pa.int32()),
+        pa.field("to_char", pa.int32()),
+        pa.field("kind", pa.int32()),
+    ]))),
     # Per-char commit edit-signal arrays (from process_commits.py). Persisting
     # them here is what lets the standalone materializer
     # (materialize_tokenized_enriched_parquet.py) map them to populated
@@ -337,6 +386,12 @@ _SCHEMA = pa.schema([
     pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
     pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
     pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
+    pa.field(TOKEN_DOMAIN_IDS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_ROLE_IDS_COLUMN, pa.list_(pa.uint16())),
+    pa.field(TOKEN_ENTITY_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
     pa.field(HUNK_ID_PER_TOKEN_COLUMN, pa.list_(pa.int32())),
@@ -365,6 +420,31 @@ _SCHEMA = pa.schema([
         pa.field("from", pa.uint16()),
         pa.field("to", pa.uint16()),
     ]))),
+    pa.field(TOKEN_DOMAIN_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field(TOKEN_BUILD_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field(TOKEN_SHELL_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field(TOKEN_DIAGNOSTIC_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
+    ]))),
+    pa.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, pa.list_(pa.struct([
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
+    ]))),
 ])
 
 
@@ -387,6 +467,18 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     call_targets_col = []
     type_refs_col = []
     def_use_col = []
+    domain_kind_col = []
+    domain_ids_col = []
+    domain_role_ids_col = []
+    domain_entity_ids_col = []
+    domain_scope_ids_col = []
+    domain_source_doc_ids_col = []
+    domain_confidence_ids_col = []
+    domain_edges_col = []
+    build_edges_col = []
+    shell_edges_col = []
+    diagnostic_edges_col = []
+    cross_domain_edges_col = []
     change_mask_pre_col = []
     change_mask_post_col = []
     hunk_id_per_char_col = []
@@ -422,6 +514,12 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     token_call_targets_col = []
     token_type_refs_col = []
     token_def_use_col = []
+    token_domain_ids_col = []
+    token_role_ids_col = []
+    token_entity_ids_col = []
+    token_scope_ids_col = []
+    token_source_doc_ids_col = []
+    token_confidence_ids_col = []
     token_change_mask_pre_col = []
     token_change_mask_post_col = []
     hunk_id_per_token_col = []
@@ -434,6 +532,11 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     changed_chunk_spans_col = []
     token_call_edges_col = []
     token_type_edges_col = []
+    token_domain_edges_col = []
+    token_build_edges_col = []
+    token_shell_edges_col = []
+    token_diagnostic_edges_col = []
+    token_cross_domain_edges_col = []
 
     for row, tokenized in zip(rows, tokenized_rows):
         row_text = row.get("text", "")
@@ -480,6 +583,53 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         call_targets_col.append(row.get("call_targets", []))
         type_refs_col.append(row.get("type_refs", []))
         def_use_col.append(row.get("def_use", []))
+        domain_kind_col.append(row.get("domain_kind"))
+        domain_ids_col.append(row.get("domain_ids", []))
+        domain_role_ids_col.append(row.get("domain_role_ids", []))
+        domain_entity_ids_col.append(row.get("domain_entity_ids", []))
+        domain_scope_ids_col.append(row.get("domain_scope_ids", []))
+        domain_source_doc_ids_col.append(row.get("domain_source_doc_ids", []))
+        domain_confidence_ids_col.append(row.get("domain_confidence_ids", []))
+        domain_edges_col.append([
+            {
+                "from_char": int(e.get("from_char", e.get("from", 0))),
+                "to_char": int(e.get("to_char", e.get("to", 0))),
+                "kind": int(e.get("kind", 0)),
+            }
+            for e in row.get("domain_edges", [])
+        ])
+        build_edges_col.append([
+            {
+                "from_char": int(e.get("from_char", e.get("from", 0))),
+                "to_char": int(e.get("to_char", e.get("to", 0))),
+                "kind": int(e.get("kind", 0)),
+            }
+            for e in row.get("build_edges", [])
+        ])
+        shell_edges_col.append([
+            {
+                "from_char": int(e.get("from_char", e.get("from", 0))),
+                "to_char": int(e.get("to_char", e.get("to", 0))),
+                "kind": int(e.get("kind", 0)),
+            }
+            for e in row.get("shell_edges", [])
+        ])
+        diagnostic_edges_col.append([
+            {
+                "from_char": int(e.get("from_char", e.get("from", 0))),
+                "to_char": int(e.get("to_char", e.get("to", 0))),
+                "kind": int(e.get("kind", 0)),
+            }
+            for e in row.get("diagnostic_edges", [])
+        ])
+        cross_domain_edges_col.append([
+            {
+                "from_char": int(e.get("from_char", e.get("from", 0))),
+                "to_char": int(e.get("to_char", e.get("to", 0))),
+                "kind": int(e.get("kind", 0)),
+            }
+            for e in row.get("cross_domain_edges", [])
+        ])
         change_mask_pre_col.append(row.get("change_mask_pre", []))
         change_mask_post_col.append(row.get("change_mask_post", []))
         hunk_id_per_char_col.append(row.get("hunk_id_per_char", []))
@@ -547,6 +697,12 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         token_call_targets_col.append(tokenized.get(TOKEN_CALL_TARGETS_COLUMN, []))
         token_type_refs_col.append(tokenized.get(TOKEN_TYPE_REFS_COLUMN, []))
         token_def_use_col.append(tokenized.get(TOKEN_DEF_USE_COLUMN, []))
+        token_domain_ids_col.append(tokenized.get(TOKEN_DOMAIN_IDS_COLUMN, []))
+        token_role_ids_col.append(tokenized.get(TOKEN_ROLE_IDS_COLUMN, []))
+        token_entity_ids_col.append(tokenized.get(TOKEN_ENTITY_IDS_COLUMN, []))
+        token_scope_ids_col.append(tokenized.get(TOKEN_SCOPE_IDS_COLUMN, []))
+        token_source_doc_ids_col.append(tokenized.get(TOKEN_SOURCE_DOC_IDS_COLUMN, []))
+        token_confidence_ids_col.append(tokenized.get(TOKEN_CONFIDENCE_IDS_COLUMN, []))
         token_change_mask_pre_col.append(
             tokenized.get(TOKEN_CHANGE_MASK_PRE_COLUMN, row.get(TOKEN_CHANGE_MASK_PRE_COLUMN, []))
         )
@@ -573,6 +729,11 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         )
         token_call_edges_col.append(tokenized.get(TOKEN_CALL_EDGES_COLUMN, []))
         token_type_edges_col.append(tokenized.get(TOKEN_TYPE_EDGES_COLUMN, []))
+        token_domain_edges_col.append(tokenized.get(TOKEN_DOMAIN_EDGES_COLUMN, []))
+        token_build_edges_col.append(tokenized.get(TOKEN_BUILD_EDGES_COLUMN, []))
+        token_shell_edges_col.append(tokenized.get(TOKEN_SHELL_EDGES_COLUMN, []))
+        token_diagnostic_edges_col.append(tokenized.get(TOKEN_DIAGNOSTIC_EDGES_COLUMN, []))
+        token_cross_domain_edges_col.append(tokenized.get(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, []))
 
     return pa.table(
         {
@@ -621,6 +782,45 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 type_refs_col, type=_SCHEMA.field("type_refs").type
             ),
             "def_use": pa.array(def_use_col, type=_SCHEMA.field("def_use").type),
+            "domain_kind": pa.array(
+                domain_kind_col, type=_SCHEMA.field("domain_kind").type
+            ),
+            "domain_ids": pa.array(
+                domain_ids_col, type=_SCHEMA.field("domain_ids").type
+            ),
+            "domain_role_ids": pa.array(
+                domain_role_ids_col, type=_SCHEMA.field("domain_role_ids").type
+            ),
+            "domain_entity_ids": pa.array(
+                domain_entity_ids_col, type=_SCHEMA.field("domain_entity_ids").type
+            ),
+            "domain_scope_ids": pa.array(
+                domain_scope_ids_col, type=_SCHEMA.field("domain_scope_ids").type
+            ),
+            "domain_source_doc_ids": pa.array(
+                domain_source_doc_ids_col,
+                type=_SCHEMA.field("domain_source_doc_ids").type,
+            ),
+            "domain_confidence_ids": pa.array(
+                domain_confidence_ids_col,
+                type=_SCHEMA.field("domain_confidence_ids").type,
+            ),
+            "domain_edges": pa.array(
+                domain_edges_col, type=_SCHEMA.field("domain_edges").type
+            ),
+            "build_edges": pa.array(
+                build_edges_col, type=_SCHEMA.field("build_edges").type
+            ),
+            "shell_edges": pa.array(
+                shell_edges_col, type=_SCHEMA.field("shell_edges").type
+            ),
+            "diagnostic_edges": pa.array(
+                diagnostic_edges_col, type=_SCHEMA.field("diagnostic_edges").type
+            ),
+            "cross_domain_edges": pa.array(
+                cross_domain_edges_col,
+                type=_SCHEMA.field("cross_domain_edges").type,
+            ),
             "change_mask_pre": pa.array(
                 change_mask_pre_col, type=_SCHEMA.field("change_mask_pre").type
             ),
@@ -714,6 +914,30 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 token_def_use_col,
                 type=_SCHEMA.field(TOKEN_DEF_USE_COLUMN).type,
             ),
+            TOKEN_DOMAIN_IDS_COLUMN: pa.array(
+                token_domain_ids_col,
+                type=_SCHEMA.field(TOKEN_DOMAIN_IDS_COLUMN).type,
+            ),
+            TOKEN_ROLE_IDS_COLUMN: pa.array(
+                token_role_ids_col,
+                type=_SCHEMA.field(TOKEN_ROLE_IDS_COLUMN).type,
+            ),
+            TOKEN_ENTITY_IDS_COLUMN: pa.array(
+                token_entity_ids_col,
+                type=_SCHEMA.field(TOKEN_ENTITY_IDS_COLUMN).type,
+            ),
+            TOKEN_SCOPE_IDS_COLUMN: pa.array(
+                token_scope_ids_col,
+                type=_SCHEMA.field(TOKEN_SCOPE_IDS_COLUMN).type,
+            ),
+            TOKEN_SOURCE_DOC_IDS_COLUMN: pa.array(
+                token_source_doc_ids_col,
+                type=_SCHEMA.field(TOKEN_SOURCE_DOC_IDS_COLUMN).type,
+            ),
+            TOKEN_CONFIDENCE_IDS_COLUMN: pa.array(
+                token_confidence_ids_col,
+                type=_SCHEMA.field(TOKEN_CONFIDENCE_IDS_COLUMN).type,
+            ),
             TOKEN_CHANGE_MASK_PRE_COLUMN: pa.array(
                 token_change_mask_pre_col,
                 type=_SCHEMA.field(TOKEN_CHANGE_MASK_PRE_COLUMN).type,
@@ -757,6 +981,26 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             ),
             TOKEN_TYPE_EDGES_COLUMN: pa.array(
                 token_type_edges_col, type=_SCHEMA.field(TOKEN_TYPE_EDGES_COLUMN).type
+            ),
+            TOKEN_DOMAIN_EDGES_COLUMN: pa.array(
+                token_domain_edges_col,
+                type=_SCHEMA.field(TOKEN_DOMAIN_EDGES_COLUMN).type,
+            ),
+            TOKEN_BUILD_EDGES_COLUMN: pa.array(
+                token_build_edges_col,
+                type=_SCHEMA.field(TOKEN_BUILD_EDGES_COLUMN).type,
+            ),
+            TOKEN_SHELL_EDGES_COLUMN: pa.array(
+                token_shell_edges_col,
+                type=_SCHEMA.field(TOKEN_SHELL_EDGES_COLUMN).type,
+            ),
+            TOKEN_DIAGNOSTIC_EDGES_COLUMN: pa.array(
+                token_diagnostic_edges_col,
+                type=_SCHEMA.field(TOKEN_DIAGNOSTIC_EDGES_COLUMN).type,
+            ),
+            TOKEN_CROSS_DOMAIN_EDGES_COLUMN: pa.array(
+                token_cross_domain_edges_col,
+                type=_SCHEMA.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN).type,
             ),
         },
         schema=_SCHEMA,
@@ -863,11 +1107,43 @@ def process_record_with_policy(
         filtered_chunk_boundaries = []
         filtered_call_edges = []
         filtered_type_edges = []
+        filtered_domain_edge_fields = {
+            "domain_edges": [],
+            "build_edges": [],
+            "shell_edges": [],
+            "diagnostic_edges": [],
+            "cross_domain_edges": [],
+        }
     else:
         filtered_structure_ids = _align_structure_ids(structure_ids, len(filtered_text))
         filtered_chunk_boundaries = chunk_boundaries
         filtered_call_edges = record.get("call_edges", [])
         filtered_type_edges = record.get("type_edges", [])
+
+        def _shift_char_edge_triples(raw_edges):
+            shifted = []
+            for edge in raw_edges or []:
+                if not isinstance(edge, dict):
+                    continue
+                shifted.append(
+                    {
+                        "from_char": int(edge.get("from_char", edge.get("from", 0))) + header_len,
+                        "to_char": int(edge.get("to_char", edge.get("to", 0))) + header_len,
+                        "kind": int(edge.get("kind", 0)),
+                    }
+                )
+            return shifted
+
+        filtered_domain_edge_fields = {
+            name: _shift_char_edge_triples(record.get(name, []))
+            for name in (
+                "domain_edges",
+                "build_edges",
+                "shell_edges",
+                "diagnostic_edges",
+                "cross_domain_edges",
+            )
+        }
 
     full_sids = [0] * header_len + filtered_structure_ids
     char_metadata: dict[str, list[int]] = {}
@@ -894,6 +1170,8 @@ def process_record_with_policy(
         **{k: v for k, v in record.items()
            if k not in ("text", "structure_ids", "chunk_boundaries",
                         "call_edges", "type_edges", "actual_token_count",
+                        "domain_edges", "build_edges", "shell_edges",
+                        "diagnostic_edges", "cross_domain_edges",
                         *_CHAR_LEVEL_METADATA_FIELDS)},
         "text": full_text,
         # source_text mirrors the emitted (header-prefixed) document text so the
@@ -904,6 +1182,7 @@ def process_record_with_policy(
         "chunk_boundaries": adjusted_chunks,
         "call_edges": filtered_call_edges,
         "type_edges": filtered_type_edges,
+        **filtered_domain_edge_fields,
         **char_metadata,
     }
     if not combined.get("platform_info"):

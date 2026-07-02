@@ -15,6 +15,12 @@ from cppmega_mlx.data.parquet_dataset import (
     TokenParquetDataset,
 )
 from cppmega_mlx.data.packing import document_boundary_mask
+from cppmega_mlx.data.domain_schema import (
+    DomainEdgeKind,
+    DomainKind,
+    DomainRoleKind,
+    delimiter_token_ids,
+)
 from cppmega_mlx.data.nanochat_pipeline import platform_vocab
 from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched_schema as schema
 from cppmega_mlx.data.nanochat_pipeline.build_context import (
@@ -40,10 +46,12 @@ from scripts.nanochat_data.token_budget import tokenizer_fingerprint
 from tools.clang_indexer import index_project
 from tools.clang_indexer.index_project import FunctionDef, PartInfo
 from tools.clang_indexer.process_commits import (
+    AnalysisCache,
     BuildContextResolver,
     FileAnalysis,
     _build_enriched_from_parts,
     analyze_file_clang,
+    process_record,
 )
 
 
@@ -694,6 +702,65 @@ def test_commit_enriched_builder_emits_temporal_char_annotations() -> None:
     assert any(doc["hunk_id_per_char"])
 
 
+def test_process_record_reuses_identical_file_analysis_with_cache(tmp_path) -> None:
+    source = "\n".join(
+        [
+            "int helper() { return 1; }",
+            "int main() { return helper(); }",
+            "// enough text to pass the process_record minimum length guard",
+        ]
+    )
+    main = FunctionDef(
+        "main",
+        "main",
+        "src/demo.cc",
+        2,
+        "int main() { return helper(); }",
+        [],
+        end_line=2,
+    )
+    record = {
+        "old_content": source,
+        "new_content": source,
+        "diff": "\n".join(
+            [
+                "diff --git a/src/demo.cc b/src/demo.cc",
+                "--- a/src/demo.cc",
+                "+++ b/src/demo.cc",
+                "@@ -2 +2 @@",
+                "-int main() { return helper(); }",
+                "+int main() { return helper(); }",
+            ]
+        ),
+        "filepath": "src/demo.cc",
+        "subject": "cache analysis",
+    }
+    calls = []
+
+    def analyzer(content, filepath, clang_index, tmpdir, **_kwargs):
+        calls.append((content, filepath, tmpdir))
+        return FileAnalysis("", functions=[main])
+
+    cache = AnalysisCache(max_entries=8)
+    for _ in range(2):
+        docs = process_record(
+            record,
+            clang_index=object(),
+            tmpdir=str(tmp_path),
+            max_tokens=8192,
+            max_file_bytes=10000,
+            doc_format="diff",
+            max_dep_depth=1,
+            analysis_cache=cache,
+            analyzer=analyzer,
+        )
+        assert docs
+
+    assert len(calls) == 1
+    assert cache.hits == 3
+    assert cache.misses == 1
+
+
 def test_tokenized_materializer_maps_temporal_char_annotations_to_tokens() -> None:
     text = "int main() { return 2; }"
     change_mask = [0] * len(text)
@@ -720,3 +787,50 @@ def test_tokenized_materializer_maps_temporal_char_annotations_to_tokens() -> No
     assert any(value == 2 for value in row[schema.EDIT_OP_PER_TOKEN_COLUMN])
     assert row[schema.CHANGED_CHUNK_IDS_COLUMN] == [0]
     assert row[schema.CHANGED_CHUNK_SPANS_COLUMN]
+
+
+def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
+    text = "add_executable(app main.cpp)\n"
+    target_start = text.index("app")
+    source_start = text.index("main.cpp")
+    role_ids = [0] * len(text)
+    role_ids[target_start : target_start + 3] = [int(DomainRoleKind.TARGET)] * 3
+    role_ids[source_start : source_start + len("main.cpp")] = [
+        int(DomainRoleKind.SOURCE)
+    ] * len("main.cpp")
+    docs = [
+        {
+            "text": text,
+            "domain_kind": int(DomainKind.CMAKE),
+            "domain_ids": [int(DomainKind.CMAKE)] * len(text),
+            "domain_role_ids": role_ids,
+            "domain_edges": [
+                {
+                    "from_char": target_start,
+                    "to_char": source_start,
+                    "kind": int(DomainEdgeKind.BUILD_TARGET_SOURCE),
+                }
+            ],
+            "build_edges": [
+                {
+                    "from_char": target_start,
+                    "to_char": source_start,
+                    "kind": int(DomainEdgeKind.BUILD_TARGET_SOURCE),
+                }
+            ],
+        }
+    ]
+
+    row = materialize_tokenized_enriched_batch(docs, load_tokenizer())[0]
+    start_id, end_id = delimiter_token_ids(DomainKind.CMAKE)
+
+    assert row[schema.TOKEN_IDS_COLUMN][1] == start_id
+    assert row[schema.TOKEN_IDS_COLUMN][-1] == end_id
+    assert row[schema.TOKEN_DOMAIN_IDS_COLUMN][1] == int(DomainKind.CMAKE)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][1] == int(DomainRoleKind.DELIMITER)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][-1] == int(DomainRoleKind.DELIMITER)
+    assert row[schema.TOKEN_BUILD_EDGES_COLUMN]
+    edge = row[schema.TOKEN_BUILD_EDGES_COLUMN][0]
+    assert edge["kind"] == int(DomainEdgeKind.BUILD_TARGET_SOURCE)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][edge["from"]] == int(DomainRoleKind.TARGET)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][edge["to"]] == int(DomainRoleKind.SOURCE)

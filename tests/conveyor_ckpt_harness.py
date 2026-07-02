@@ -119,7 +119,7 @@ for _mod, _name in (
 # --------------------------------------------------------------------------- #
 # Fake leaf stages -- match the exact signatures the real orchestration calls.
 # --------------------------------------------------------------------------- #
-def fake_stream_repo_subtrees_with_git(work_root, should_process):
+def fake_stream_repo_subtrees_with_git(work_root, should_process, *, on_no_git=None):
     """Yield (repo, repo_dir==work_root/<repo>/_src) for each configured repo."""
     for repo in REPOS:
         if not should_process(repo):
@@ -164,13 +164,14 @@ def _lengths_info(lengths, valid):
 
 
 def fake_run_code_half(repo, repo_dir, lengths_code, work_root, dedup_db,
-                       dedup_near, global_symbol_index=None, memory_limit_gb=10.0):
+                       dedup_near, global_symbol_index=None, memory_limit_gb=10.0,
+                       parse_workers=2):
     return {"source": f"{repo}::code", "lengths": _lengths_info(lengths_code, 10)}
 
 
 def fake_process_range(repo, repo_dir, records_jsonl, start, end, lengths_sorted,
                        repo_work, dedup_db, dedup_near, pr_store, repo_list,
-                       memory_limit_gb=10.0):
+                       memory_limit_gb=10.0, analysis_cache_entries=128):
     """Fake per-range commit stage. Sleeps (so the test can SIGTERM mid-repo),
     records ONE durable event per ACTUAL execution, and writes a persistent
     marker 'parquet' so final completeness can be checked."""
@@ -181,7 +182,12 @@ def fake_process_range(repo, repo_dir, records_jsonl, start, end, lengths_sorted
     })
     MARKERS.mkdir(parents=True, exist_ok=True)
     (MARKERS / f"{repo}_r{int(start)}.parquet").write_text("ok", encoding="utf-8")
-    return {"source": f"{repo}::r{start}", "lengths": _lengths_info(lengths_sorted, 5)}
+    return {
+        "source": f"{repo}::r{start}",
+        "repo": repo,
+        "range": [int(start), int(end)],
+        "lengths": _lengths_info(lengths_sorted, 5),
+    }
 
 
 conv.stream_repo_subtrees_with_git = fake_stream_repo_subtrees_with_git

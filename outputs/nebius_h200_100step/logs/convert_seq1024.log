@@ -1,0 +1,9 @@
+CMD /Volumes/external/sources/nanochat/.venv/bin/python /Volumes/external/sources/cppmega/scripts/data_prep_parquet_to_megatron.py --input-dir /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/parquet/1024 --output-prefix /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq1024_graph_train --split all --token-column input_ids --dtype uint16
+WARNING: megatron import failed (No module named 'megatron'), using fallback writer
+found 18 all shards
+  read 10/18 shards, 6,172 docs, 6,320,128 tokens
+  read 18/18 shards, 30,016 docs, 30,736,384 tokens
+total: 30016 documents
+
+all: 30016 docs, 30,736,384 tokens, 0.06 GiB in 111.0s
+output: /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq1024_graph_train.bin + /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq1024_graph_train.idx

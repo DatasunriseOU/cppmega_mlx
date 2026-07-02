@@ -69,10 +69,21 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_CHUNK_ENDS_COLUMN,
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_CONFIDENCE_IDS_COLUMN,
+    TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     TOKEN_DEF_USE_COLUMN,
     TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+    TOKEN_DOMAIN_EDGES_COLUMN,
+    TOKEN_DOMAIN_IDS_COLUMN,
+    TOKEN_BUILD_EDGES_COLUMN,
+    TOKEN_ENTITY_IDS_COLUMN,
+    TOKEN_ROLE_IDS_COLUMN,
+    TOKEN_SCOPE_IDS_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_SIBLING_INDEX_COLUMN,
+    TOKEN_SHELL_EDGES_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
@@ -109,6 +120,14 @@ EDGE_STRUCT = pa.struct(
     [
         pa.field("from", pa.uint16()),
         pa.field("to", pa.uint16()),
+    ]
+)
+
+EDGE_TRIPLE_STRUCT = pa.struct(
+    [
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
     ]
 )
 
@@ -150,6 +169,12 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_AST_DEPTH_COLUMN, pa.list_(pa.int32())),
         pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.int32())),
         pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.int32())),
+        pa.field(TOKEN_DOMAIN_IDS_COLUMN, pa.list_(pa.uint16())),
+        pa.field(TOKEN_ROLE_IDS_COLUMN, pa.list_(pa.uint16())),
+        pa.field(TOKEN_ENTITY_IDS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
@@ -164,6 +189,11 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_CHUNK_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
         pa.field(TOKEN_CALL_EDGES_COLUMN, pa.list_(EDGE_STRUCT)),
         pa.field(TOKEN_TYPE_EDGES_COLUMN, pa.list_(EDGE_STRUCT)),
+        pa.field(TOKEN_DOMAIN_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
+        pa.field(TOKEN_BUILD_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
+        pa.field(TOKEN_SHELL_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
+        pa.field(TOKEN_DIAGNOSTIC_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
+        pa.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
         pa.field(CHANGED_CHUNK_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(CHANGED_CHUNK_SPANS_COLUMN, pa.list_(CHANGED_CHUNK_SPAN_STRUCT)),
     ]
@@ -192,6 +222,11 @@ class NormalizedDoc:
     # depends on (a dependency must be packed BEFORE this document in the row).
     # Empty when only dep_level ordering applies.
     doc_dep_edges: tuple[int, ...] = ()
+    domain_edges: list[dict[str, int]] = field(default_factory=list)
+    build_edges: list[dict[str, int]] = field(default_factory=list)
+    shell_edges: list[dict[str, int]] = field(default_factory=list)
+    diagnostic_edges: list[dict[str, int]] = field(default_factory=list)
+    cross_domain_edges: list[dict[str, int]] = field(default_factory=list)
 
     @property
     def token_count(self) -> int:
@@ -230,6 +265,15 @@ class NormalizedDoc:
             TOKEN_CHUNK_DEP_LEVELS_COLUMN: list(self.chunk_dep_levels),
             TOKEN_CALL_EDGES_COLUMN: [dict(edge) for edge in self.call_edges],
             TOKEN_TYPE_EDGES_COLUMN: [dict(edge) for edge in self.type_edges],
+            TOKEN_DOMAIN_EDGES_COLUMN: [dict(edge) for edge in self.domain_edges],
+            TOKEN_BUILD_EDGES_COLUMN: [dict(edge) for edge in self.build_edges],
+            TOKEN_SHELL_EDGES_COLUMN: [dict(edge) for edge in self.shell_edges],
+            TOKEN_DIAGNOSTIC_EDGES_COLUMN: [
+                dict(edge) for edge in self.diagnostic_edges
+            ],
+            TOKEN_CROSS_DOMAIN_EDGES_COLUMN: [
+                dict(edge) for edge in self.cross_domain_edges
+            ],
             CHANGED_CHUNK_IDS_COLUMN: list(self.changed_chunk_ids),
             CHANGED_CHUNK_SPANS_COLUMN: [
                 {"start": int(start), "end": int(end)}
@@ -443,6 +487,38 @@ def _normalize_edge_list(value: Any) -> list[dict[str, int]]:
     return edges
 
 
+def _normalize_edge_triples(value: Any) -> list[dict[str, int]]:
+    edges: list[dict[str, int]] = []
+    for item in value or []:
+        if isinstance(item, dict):
+            src = int(item.get("from", item.get("src", 0)))
+            dst = int(item.get("to", item.get("dst", 0)))
+            kind = int(item.get("kind", 0))
+        else:
+            src = int(item[0])
+            dst = int(item[1])
+            kind = int(item[2])
+        edges.append({"from": src, "to": dst, "kind": kind})
+    return edges
+
+
+def _validate_token_edge_triples(
+    *,
+    source_doc_index: int,
+    token_count: int,
+    column: str,
+    edges: list[dict[str, int]],
+) -> None:
+    for edge in edges:
+        src = int(edge["from"])
+        dst = int(edge["to"])
+        if not (0 <= src < token_count and 0 <= dst < token_count):
+            raise ValueError(
+                f"{column} edge out of range for source_doc_index={source_doc_index}: "
+                f"got ({src}, {dst}) with token_count={token_count}"
+            )
+
+
 def _normalize_changed_chunk_spans(value: Any) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for item in value or []:
@@ -623,6 +699,36 @@ def _normalize_chunk_meta(
     )
 
 
+def _normalize_domain_graph_meta(
+    record: dict[str, Any],
+    *,
+    source_doc_index: int,
+    token_count: int,
+) -> tuple[
+    list[dict[str, int]],
+    list[dict[str, int]],
+    list[dict[str, int]],
+    list[dict[str, int]],
+    list[dict[str, int]],
+]:
+    columns = (
+        TOKEN_DOMAIN_EDGES_COLUMN,
+        TOKEN_BUILD_EDGES_COLUMN,
+        TOKEN_SHELL_EDGES_COLUMN,
+        TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+        TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
+    )
+    normalized = tuple(_normalize_edge_triples(record.get(column)) for column in columns)
+    for column, edges in zip(columns, normalized):
+        _validate_token_edge_triples(
+            source_doc_index=source_doc_index,
+            token_count=token_count,
+            column=column,
+            edges=edges,
+        )
+    return normalized
+
+
 def normalize_document_record(
     record: dict[str, Any],
     *,
@@ -656,6 +762,17 @@ def normalize_document_record(
         source_doc_index=source_doc_index,
         token_count=len(token_ids),
     )
+    (
+        domain_edges,
+        build_edges,
+        shell_edges,
+        diagnostic_edges,
+        cross_domain_edges,
+    ) = _normalize_domain_graph_meta(
+        record,
+        source_doc_index=source_doc_index,
+        token_count=len(token_ids),
+    )
 
     return NormalizedDoc(
         source_doc_index=int(source_doc_index),
@@ -668,6 +785,11 @@ def normalize_document_record(
         chunk_dep_levels=chunk_dep_levels,
         call_edges=call_edges,
         type_edges=type_edges,
+        domain_edges=domain_edges,
+        build_edges=build_edges,
+        shell_edges=shell_edges,
+        diagnostic_edges=diagnostic_edges,
+        cross_domain_edges=cross_domain_edges,
         platform_ids=_as_int_list(record.get(PLATFORM_IDS_COLUMN)),
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
@@ -947,6 +1069,11 @@ def _materialize_packed_row(
     chunk_dep_levels: list[int] = []
     call_edges: list[dict[str, int]] = []
     type_edges: list[dict[str, int]] = []
+    domain_edges: list[dict[str, int]] = []
+    build_edges: list[dict[str, int]] = []
+    shell_edges: list[dict[str, int]] = []
+    diagnostic_edges: list[dict[str, int]] = []
+    cross_domain_edges: list[dict[str, int]] = []
     changed_chunk_ids: list[int] = []
     changed_chunk_spans: list[dict[str, int]] = []
 
@@ -1003,6 +1130,21 @@ def _materialize_packed_row(
             }
             for edge in doc.type_edges
         )
+        for dest, source in (
+            (domain_edges, doc.domain_edges),
+            (build_edges, doc.build_edges),
+            (shell_edges, doc.shell_edges),
+            (diagnostic_edges, doc.diagnostic_edges),
+            (cross_domain_edges, doc.cross_domain_edges),
+        ):
+            dest.extend(
+                {
+                    "from": token_offset + int(edge["from"]),
+                    "to": token_offset + int(edge["to"]),
+                    "kind": int(edge.get("kind", 0)),
+                }
+                for edge in source
+            )
         changed_chunk_ids.extend(chunk_offset + value for value in doc.changed_chunk_ids)
         changed_chunk_spans.extend(
             {
@@ -1060,6 +1202,11 @@ def _materialize_packed_row(
         TOKEN_CHUNK_DEP_LEVELS_COLUMN: chunk_dep_levels,
         TOKEN_CALL_EDGES_COLUMN: call_edges,
         TOKEN_TYPE_EDGES_COLUMN: type_edges,
+        TOKEN_DOMAIN_EDGES_COLUMN: domain_edges,
+        TOKEN_BUILD_EDGES_COLUMN: build_edges,
+        TOKEN_SHELL_EDGES_COLUMN: shell_edges,
+        TOKEN_DIAGNOSTIC_EDGES_COLUMN: diagnostic_edges,
+        TOKEN_CROSS_DOMAIN_EDGES_COLUMN: cross_domain_edges,
     }
     for column in PACKED_ROW_PROVENANCE_COLUMNS:
         value = chronology.get(column) if chronology else None
@@ -1193,6 +1340,16 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 TOKEN_AST_NODE_TYPE_COLUMN: _as_int_list(
                     row.get(TOKEN_AST_NODE_TYPE_COLUMN)
                 ),
+                TOKEN_DOMAIN_IDS_COLUMN: _as_int_list(row.get(TOKEN_DOMAIN_IDS_COLUMN)),
+                TOKEN_ROLE_IDS_COLUMN: _as_int_list(row.get(TOKEN_ROLE_IDS_COLUMN)),
+                TOKEN_ENTITY_IDS_COLUMN: _as_int_list(row.get(TOKEN_ENTITY_IDS_COLUMN)),
+                TOKEN_SCOPE_IDS_COLUMN: _as_int_list(row.get(TOKEN_SCOPE_IDS_COLUMN)),
+                TOKEN_SOURCE_DOC_IDS_COLUMN: _as_int_list(
+                    row.get(TOKEN_SOURCE_DOC_IDS_COLUMN)
+                ),
+                TOKEN_CONFIDENCE_IDS_COLUMN: _as_int_list(
+                    row.get(TOKEN_CONFIDENCE_IDS_COLUMN)
+                ),
                 TOKEN_SYMBOL_IDS_COLUMN: _as_int_list(row.get(TOKEN_SYMBOL_IDS_COLUMN)),
                 TOKEN_CALL_TARGETS_COLUMN: _as_int_list(
                     row.get(TOKEN_CALL_TARGETS_COLUMN)
@@ -1236,6 +1393,46 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                         "to": int(edge["to"]),
                     }
                     for edge in row.get(TOKEN_TYPE_EDGES_COLUMN, [])
+                ],
+                TOKEN_DOMAIN_EDGES_COLUMN: [
+                    {
+                        "from": int(edge["from"]),
+                        "to": int(edge["to"]),
+                        "kind": int(edge["kind"]),
+                    }
+                    for edge in row.get(TOKEN_DOMAIN_EDGES_COLUMN, [])
+                ],
+                TOKEN_BUILD_EDGES_COLUMN: [
+                    {
+                        "from": int(edge["from"]),
+                        "to": int(edge["to"]),
+                        "kind": int(edge["kind"]),
+                    }
+                    for edge in row.get(TOKEN_BUILD_EDGES_COLUMN, [])
+                ],
+                TOKEN_SHELL_EDGES_COLUMN: [
+                    {
+                        "from": int(edge["from"]),
+                        "to": int(edge["to"]),
+                        "kind": int(edge["kind"]),
+                    }
+                    for edge in row.get(TOKEN_SHELL_EDGES_COLUMN, [])
+                ],
+                TOKEN_DIAGNOSTIC_EDGES_COLUMN: [
+                    {
+                        "from": int(edge["from"]),
+                        "to": int(edge["to"]),
+                        "kind": int(edge["kind"]),
+                    }
+                    for edge in row.get(TOKEN_DIAGNOSTIC_EDGES_COLUMN, [])
+                ],
+                TOKEN_CROSS_DOMAIN_EDGES_COLUMN: [
+                    {
+                        "from": int(edge["from"]),
+                        "to": int(edge["to"]),
+                        "kind": int(edge["kind"]),
+                    }
+                    for edge in row.get(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, [])
                 ],
             }
         )

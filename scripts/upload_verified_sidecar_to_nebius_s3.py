@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Upload verified cppmega sidecar parquet shards to Nebius Object Storage.
 
-Default policy is fail-closed and broad: upload every parquet bucket covered by
-the final green sidecar audit receipt.  The old code+commits-only H200 smoke
-subset is still available, but only by explicit request via ``--code-commits-only``.
+Default policy is the training contract: upload C/C++ code and commit parquet
+only.  PR/discussion text is expected to be integrated into commit documents as
+the HEAD docstring before PRE/POST/diff.  Standalone PR parquet is diagnostic
+material and is uploaded only with explicit ``--include-standalone-pr``.
 
 Nebius Object Storage exposes an S3-compatible object API.  The current Nebius
 CLI manages buckets/transfers, but not individual object syncs, so this script
@@ -24,9 +25,9 @@ from typing import Iterable
 
 
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
-DEFAULT_PREFIX = "cppmega-sidecar/valid-all-20260627"
+DEFAULT_PREFIX = "cppmega-sidecar/code-commits-integrated-pr-20260627"
 
-ALL_VALID_SELECTIONS = (
+CODE_COMMIT_SELECTIONS = (
     ("parquet/code/1024", Path("outputs/reindexed/1024")),
     ("parquet/code/2048", Path("outputs/reindexed/2048")),
     ("parquet/code/4096", Path("outputs/reindexed/4096")),
@@ -36,32 +37,24 @@ ALL_VALID_SELECTIONS = (
     ("parquet/commits/4096", Path("outputs/reindexed_commits/4096")),
     ("parquet/commits/8192", Path("outputs/reindexed_commits/8192")),
     ("parquet/commits/16384", Path("outputs/reindexed_commits/16384")),
+    (
+        "audits/sidecar_audit_all_final_poststop_valid",
+        Path("outputs/sidecar_audit_all_final_poststop_valid"),
+    ),
+)
+
+STANDALONE_PR_SELECTIONS = (
     ("parquet/pr/1024", Path("outputs/reindexed_pr/1024")),
     ("parquet/pr/2048", Path("outputs/reindexed_pr/2048")),
     ("parquet/pr/4096", Path("outputs/reindexed_pr/4096")),
     ("parquet/pr/8192", Path("outputs/reindexed_pr/8192")),
     ("parquet/pr/16384", Path("outputs/reindexed_pr/16384")),
-    (
-        "audits/sidecar_audit_all_final_poststop_valid",
-        Path("outputs/sidecar_audit_all_final_poststop_valid"),
-    ),
 )
 
-CODE_COMMITS_ONLY_SELECTIONS = (
-    ("parquet/code/1024", Path("outputs/reindexed/1024")),
-    ("parquet/code/2048", Path("outputs/reindexed/2048")),
-    ("parquet/code/4096", Path("outputs/reindexed/4096")),
-    ("parquet/code/8192", Path("outputs/reindexed/8192")),
-    ("parquet/commits/1024", Path("outputs/reindexed_commits/1024")),
-    ("parquet/commits/2048", Path("outputs/reindexed_commits/2048")),
-    ("parquet/commits/4096", Path("outputs/reindexed_commits/4096")),
-    ("parquet/commits/8192", Path("outputs/reindexed_commits/8192")),
-    ("parquet/commits/16384", Path("outputs/reindexed_commits/16384")),
-    (
-        "audits/sidecar_audit_all_final_poststop_valid",
-        Path("outputs/sidecar_audit_all_final_poststop_valid"),
-    ),
-)
+# Backward-compatible names for older tests/imports.  "all valid" now means all
+# training-valid buckets, not standalone PR diagnostics.
+ALL_VALID_SELECTIONS = CODE_COMMIT_SELECTIONS
+CODE_COMMITS_ONLY_SELECTIONS = CODE_COMMIT_SELECTIONS
 
 FINAL_AUDIT_RECEIPTS = (
     Path("outputs/sidecar_audit_all_final_poststop_valid/sidecar_parquet_audit.json"),
@@ -96,8 +89,18 @@ def _s3_env() -> dict[str, str]:
     return env
 
 
-def _selection_items(*, code_commits_only: bool = False) -> tuple[tuple[str, Path], ...]:
-    return CODE_COMMITS_ONLY_SELECTIONS if code_commits_only else ALL_VALID_SELECTIONS
+def _selection_items(
+    *,
+    include_standalone_pr: bool = False,
+    code_commits_only: bool = False,
+) -> tuple[tuple[str, Path], ...]:
+    if include_standalone_pr and code_commits_only:
+        raise SystemExit(
+            "--include-standalone-pr conflicts with deprecated --code-commits-only"
+        )
+    if include_standalone_pr:
+        return CODE_COMMIT_SELECTIONS + STANDALONE_PR_SELECTIONS
+    return CODE_COMMIT_SELECTIONS
 
 
 def _audit_receipts() -> tuple[Path, ...]:
@@ -260,15 +263,19 @@ def _write_manifest(
     token_total: int,
     selections: tuple[tuple[str, Path], ...],
     audit_receipts: tuple[Path, ...],
-    code_commits_only: bool,
+    include_standalone_pr: bool,
 ) -> None:
     payload = {
         "bucket": bucket,
         "prefix": prefix,
         "endpoint_url": endpoint_url,
         "verified_valid_tokens": token_total,
-        "profile": "code_commits_only" if code_commits_only else "all_valid",
-        "standalone_pr_included": not code_commits_only,
+        "profile": (
+            "code_commits_plus_standalone_pr"
+            if include_standalone_pr
+            else "code_commits_integrated_pr"
+        ),
+        "standalone_pr_included": include_standalone_pr,
         "selections": [
             {"remote": remote, "local": str(local)}
             for remote, local in selections
@@ -276,9 +283,10 @@ def _write_manifest(
         "audit_receipts": [str(path) for path in audit_receipts],
         "excluded": [],
     }
-    if code_commits_only:
+    if not include_standalone_pr:
         payload["excluded"].append(
-            "outputs/reindexed_pr/* (explicit --code-commits-only request)"
+            "outputs/reindexed_pr/* (standalone PR diagnostics; PR text is "
+            "integrated into commit docstrings)"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -297,19 +305,25 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--include-standalone-pr",
         action="store_true",
         help=(
-            "Deprecated no-op. Standalone PR parquet is included by default in "
-            "the all-valid upload profile. Use --code-commits-only to exclude it."
+            "Also upload standalone PR discussion parquet. This is diagnostic/"
+            "curriculum material; default training upload excludes it because "
+            "PR discussion is integrated into commit docstrings."
         ),
     )
     ap.add_argument(
         "--code-commits-only",
         action="store_true",
-        help="Upload only code+commit parquet buckets. Default uploads every final-audit-valid bucket.",
+        help=(
+            "Deprecated compatibility flag. Code+commit buckets are already the "
+            "default training upload profile."
+        ),
     )
     args = ap.parse_args(argv)
+    if args.include_standalone_pr and args.code_commits_only:
+        raise SystemExit("--include-standalone-pr conflicts with --code-commits-only")
     _load_env_file(args.env_file)
 
-    selections = _selection_items(code_commits_only=args.code_commits_only)
+    selections = _selection_items(include_standalone_pr=args.include_standalone_pr)
     audit_receipts = _audit_receipts()
     token_total = _load_verified_token_total(audit_receipts, selections)
     sources = _existing_sources(selections)
@@ -321,7 +335,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         token_total=token_total,
         selections=selections,
         audit_receipts=audit_receipts,
-        code_commits_only=args.code_commits_only,
+        include_standalone_pr=args.include_standalone_pr,
     )
     print(
         json.dumps(

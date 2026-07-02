@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+from array import array
 import ctypes.util
 import glob
 import importlib
@@ -419,9 +420,13 @@ class FunctionDef:
         self.baselib_callees = list(baselib_callees or [])
         self.dep_level = 0
         self.is_definition = is_definition
-        self.ast_depth = list(ast_depth or [])
-        self.sibling_index = list(sibling_index or [])
-        self.ast_node_type = list(ast_node_type or [])
+        # Store per-character AST sidecars compactly in the repo-wide index.
+        # Large projects can have 80k+ function bodies; Python list[int] would
+        # dominate RSS before document emission even starts. Values are already
+        # clamped to uint16 by extract_clang_ast_metadata().
+        self.ast_depth = array('H', ast_depth or [])
+        self.sibling_index = array('H', sibling_index or [])
+        self.ast_node_type = array('H', ast_node_type or [])
 
     def to_dict(self) -> dict:
         """Serialize for multiprocessing IPC."""
@@ -1037,10 +1042,10 @@ def parse_translation_unit(
         tu = index.parse(
             filepath,
             args=compile_args,
-            options=(
-                TranslationUnit.PARSE_INCOMPLETE |
-                TranslationUnit.PARSE_PRECOMPILED_PREAMBLE
-            ),
+            # Corpus indexing parses each translation unit once. PCH preamble
+            # caches are a native-memory win only for repeated reparses; here they
+            # make many parallel clang workers retain large buffers.
+            options=TranslationUnit.PARSE_INCOMPLETE,
         )
     except Exception as e:
         print(f"  WARN: Failed to parse {filepath}: {e}", file=sys.stderr)
@@ -1294,6 +1299,30 @@ def _is_sane_compile_args(args: list[str]) -> bool:
 
 
 _SIMPLE_FALLBACK_ARGS = ["-fsyntax-only", "-Wno-everything"]
+DEFAULT_PARSE_BATCH_FILES = 100
+
+
+def compute_parse_batch_size(
+    num_files: int,
+    effective_workers: int,
+    *,
+    max_batch_files: int = DEFAULT_PARSE_BATCH_FILES,
+) -> int:
+    """Bound parse IPC payload size independently of worker count.
+
+    Each parse future returns serialized FunctionDef/TypeDef payloads to the
+    parent process. For very large repos, ``len(files) / workers`` creates huge
+    IPC payloads and parent RSS spikes; keep each future's payload bounded while
+    preserving a minimum batch size for scheduler overhead.
+    """
+    if num_files <= 0:
+        return 0
+    if effective_workers <= 0:
+        raise ValueError(f"effective_workers must be positive, got {effective_workers}")
+    if max_batch_files <= 0:
+        raise ValueError(f"max_batch_files must be positive, got {max_batch_files}")
+    nominal = max(50, (num_files + effective_workers - 1) // effective_workers)
+    return min(max_batch_files, nominal)
 
 
 def get_default_compile_args(project_dir: str) -> list[str]:
@@ -2058,6 +2087,136 @@ def build_enriched_doc(
 BUILD_KIND = 9  # structure_ids kind for build files (extends 0-8 code vocab)
 
 
+def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
+    """Parse build-system text into char-aligned domain sidecars.
+
+    The Clang path emits C++ call/type graph metadata.  Build systems need a
+    different graph: target->source, target->dependency, rule->command, and
+    shell-like command/file relations.  This helper keeps those routes as
+    char-origin edge triples so the token materializer can map them to LLM token
+    positions after tokenizer normalization.
+    """
+
+    from cppmega_mlx.data.domain_schema import DomainKind, ParseConfidence
+    from cppmega_mlx.data.build_parsers import (
+        parse_autoconf,
+        parse_automake,
+        parse_bazel,
+        parse_cmake,
+        parse_make,
+        parse_ninja,
+    )
+    from cppmega_mlx.data.shell_parsers import parse_sh
+
+    kind = build_kind.lower().replace("-", "_")
+    if kind in {"cmake", "cmakelists"}:
+        parsed = parse_cmake(text)
+    elif kind in {"make", "gmake", "makefile"}:
+        parsed = parse_make(text)
+    elif kind in {"automake", "makefile_am"}:
+        parsed = parse_automake(text)
+    elif kind in {"autoconf", "configure_ac", "configure_in"}:
+        parsed = parse_autoconf(text)
+    elif kind == "configure":
+        parsed = parse_sh(text)
+        parsed.metadata["build_kind"] = "configure"
+    elif kind == "ninja":
+        parsed = parse_ninja(text)
+    elif kind in {"bazel", "build_bazel", "workspace_bazel"}:
+        parsed = parse_bazel(text)
+    else:
+        raw_domain_by_kind = {
+            "meson": DomainKind.MESON,
+            "gn": DomainKind.GN,
+            "scons": DomainKind.SCONS,
+            "xmake": DomainKind.XMAKE,
+            "compile_commands": DomainKind.COMPILE_COMMANDS,
+        }
+        domain = raw_domain_by_kind.get(kind, DomainKind.BUILD_DIAGNOSTIC)
+        text_len = len(text)
+        return {
+            "domain_kind": int(domain),
+            "domain_ids": [int(domain)] * text_len,
+            "domain_role_ids": [0] * text_len,
+            "domain_entity_ids": [0] * text_len,
+            "domain_scope_ids": [0] * text_len,
+            "domain_source_doc_ids": [0] * text_len,
+            "domain_confidence_ids": [int(ParseConfidence.RAW)] * text_len,
+            "domain_edges": [],
+            "build_edges": [],
+            "shell_edges": [],
+            "diagnostic_edges": [],
+            "cross_domain_edges": [],
+            "domain_parse_info": {
+                "parser": "raw",
+                "build_kind": build_kind,
+                "tokens": 0,
+                "edges": 0,
+            },
+        }
+
+    text_len = len(text)
+    domain_id = int(parsed.domain)
+    domain_ids = [domain_id] * text_len
+    role_ids = [0] * text_len
+    entity_ids = [0] * text_len
+    scope_ids = [0] * text_len
+    source_doc_ids = [0] * text_len
+    confidence_ids = [int(ParseConfidence.HEURISTIC)] * text_len
+    for token_index, token in enumerate(parsed.tokens):
+        start = max(0, min(int(token.start), text_len))
+        end = max(start, min(int(token.end), text_len))
+        if start == end:
+            continue
+        role = int(parsed.role_ids[token_index])
+        entity = int(parsed.entity_ids[token_index])
+        scope = int(parsed.scope_ids[token_index])
+        confidence = int(parsed.confidence_ids[token_index])
+        for char_idx in range(start, end):
+            role_ids[char_idx] = role
+            entity_ids[char_idx] = entity
+            scope_ids[char_idx] = scope
+            confidence_ids[char_idx] = confidence
+
+    edge_triples = [
+        {
+            "from_char": int(parsed.tokens[src].start),
+            "to_char": int(parsed.tokens[dst].start),
+            "kind": int(kind),
+        }
+        for src, dst, kind in parsed.edges
+        if 0 <= src < len(parsed.tokens) and 0 <= dst < len(parsed.tokens)
+    ]
+    is_shell_domain = parsed.domain in {
+        DomainKind.BASH,
+        DomainKind.ZSH,
+        DomainKind.SH,
+        DomainKind.TCSH,
+    }
+    return {
+        "domain_kind": domain_id,
+        "domain_ids": domain_ids,
+        "domain_role_ids": role_ids,
+        "domain_entity_ids": entity_ids,
+        "domain_scope_ids": scope_ids,
+        "domain_source_doc_ids": source_doc_ids,
+        "domain_confidence_ids": confidence_ids,
+        "domain_edges": edge_triples,
+        "build_edges": [] if is_shell_domain else edge_triples,
+        "shell_edges": edge_triples if is_shell_domain else [],
+        "diagnostic_edges": [],
+        "cross_domain_edges": [],
+        "domain_parse_info": {
+            "parser": parsed.metadata.get("build_kind")
+            or parsed.metadata.get("shell_kind")
+            or "build",
+            "build_kind": build_kind,
+            "tokens": len(parsed.tokens),
+            "edges": len(edge_triples),
+        },
+    }
+
+
 def build_build_doc(
     filepath: str,
     text: str,
@@ -2073,6 +2232,7 @@ def build_build_doc(
     make an otherwise valid C/C++ repo fail indexing.
     """
     text_len = len(text)
+    domain_sidecars = _build_domain_sidecars(text, build_kind)
     structure_ids = [BUILD_KIND] * text_len
     chunk_boundaries = [{
         'start': 0,
@@ -2130,6 +2290,7 @@ def build_build_doc(
         'type_refs': [],
         'def_use': [],
         'language_info': language_info,
+        **domain_sidecars,
     }
     if detected_platform:
         result['platform_info'] = detected_platform
@@ -2175,6 +2336,8 @@ class TrainingChunkClaims:
         *,
         tokenizer_path: str,
         dedup_db: str | None,
+        dedup_stage_id: str | None = None,
+        dedup_stage_db: str | None = None,
         namespace: str = "semantic_chunk:v1",
     ):
         self.tok = _load_cppmega_tokenizer(tokenizer_path)
@@ -2183,7 +2346,13 @@ class TrainingChunkClaims:
         self.local_counts: dict[bytes, int] = {}
         if dedup_db:
             from dedup_store import DedupStore
-            self.store = DedupStore(dedup_db, near=False, commit_every=1)
+            self.store = DedupStore(
+                dedup_db,
+                near=False,
+                commit_every=1,
+                stage_id=dedup_stage_id,
+                stage_db_path=dedup_stage_db,
+            )
 
     def claim_text(self, text: str, *, max_count: int = 1) -> bool:
         if not text:
@@ -2215,6 +2384,8 @@ def dedup_root_functions(
     *,
     tokenizer_path: str,
     dedup_db: str | None,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: str | None = None,
     near: bool = True,
 ) -> tuple[set[str], dict[str, int]]:
     """Decide which root functions are duplicates (drop their standalone doc).
@@ -2243,7 +2414,13 @@ def dedup_root_functions(
     if dedup_db:
         # FAIL LOUD: open failure / missing datasketch raises inside DedupStore.
         from dedup_store import DedupStore  # noqa: F401
-        store = DedupStore(dedup_db, near=near, commit_every=2000)
+        store = DedupStore(
+            dedup_db,
+            near=near,
+            commit_every=2000,
+            stage_id=dedup_stage_id,
+            stage_db_path=dedup_stage_db,
+        )
 
     dropped_roots: set[str] = set()
     dropped_exact = 0
@@ -2297,6 +2474,8 @@ def emit_build_documents(
     compile_index: object | None = None,
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: str | None = None,
     dedup_near: bool = True,
 ) -> list[dict]:
     """Emit one 'build' doc per build file, with WHOLE-DOC tokenized-hash dedup.
@@ -2323,7 +2502,13 @@ def emit_build_documents(
         tok = _load_cppmega_tokenizer(tokenizer_path)
         if dedup_db:
             from dedup_store import DedupStore
-            store = DedupStore(dedup_db, near=dedup_near, commit_every=2000)
+            store = DedupStore(
+                dedup_db,
+                near=dedup_near,
+                commit_every=2000,
+                stage_id=dedup_stage_id,
+                stage_db_path=dedup_stage_db,
+            )
 
     dropped = 0
     skipped_empty = 0
@@ -2393,12 +2578,19 @@ def build_training_documents(
     default_build_info: dict | None = None,
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: str | None = None,
     dedup_near: bool = True,
     global_symbols: "GlobalSymbolReader | None" = None,
+    emit_doc: Callable[[str | dict[str, object]], None] | None = None,
 ) -> list:
     """Build training documents with bottom-up dependency ordering.
 
-    Returns list[str] when enriched=False, list[dict] when enriched=True.
+    Returns list[str] when enriched=False, list[dict] when enriched=True.  When
+    ``emit_doc`` is supplied, documents are streamed to the callback as soon as
+    they are built and the returned list stays empty.  Large repos carry
+    per-token/per-char sidecar arrays, so holding all emitted docs until the end
+    of the repo creates an avoidable RSS peak.
 
     When ``tokenizer_path`` is given, FUNCTION-LEVEL tokenized-hash root dedup
     runs before grouping, and semantic chunk claims run during grouping. Root
@@ -2413,6 +2605,12 @@ def build_training_documents(
     crosslink_total = 0
     documents: list[str | dict[str, object]] = []
 
+    def _record_doc(doc: str | dict[str, object]) -> None:
+        if emit_doc is not None:
+            emit_doc(doc)
+        else:
+            documents.append(doc)
+
     index.compute_dep_levels()
 
     # Function-level dedup BEFORE grouping (corrected design). Requires OUR
@@ -2424,6 +2622,8 @@ def build_training_documents(
             index,
             tokenizer_path=tokenizer_path,
             dedup_db=dedup_db,
+            dedup_stage_id=dedup_stage_id,
+            dedup_stage_db=dedup_stage_db,
             near=dedup_near,
         )
         print(
@@ -2439,6 +2639,8 @@ def build_training_documents(
         chunk_claims = TrainingChunkClaims(
             tokenizer_path=tokenizer_path,
             dedup_db=dedup_db,
+            dedup_stage_id=dedup_stage_id,
+            dedup_stage_db=dedup_stage_db,
         )
 
     try:
@@ -2624,7 +2826,7 @@ def build_training_documents(
                     if file_build:
                         compile_args = file_build.get("compile_args", compile_args)
                         build_info = file_build.get("build_info") or build_info
-                documents.append(
+                _record_doc(
                     build_enriched_doc(
                         parts_info,
                         index,
@@ -2634,7 +2836,7 @@ def build_training_documents(
                     )
                 )
             else:
-                documents.append(doc)
+                _record_doc(doc)
     finally:
         if chunk_claims is not None:
             chunk_claims.close()
@@ -2764,14 +2966,18 @@ def process_project(
     memory_limit_gb: float = 10.0,
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: str | None = None,
     dedup_near: bool = True,
     global_symbol_index: str | None = None,
+    emit_doc: Callable[[str | dict[str, object]], None] | None = None,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
     ``global_symbol_index`` (optional path) enables bounded cross-repo base-lib
     symbol linking; each worker process opens its OWN read-only connection to the
-    store. None -> behavior unchanged.
+    store. None -> behavior unchanged. When ``emit_doc`` is supplied, generated
+    docs are streamed to it and not accumulated in the returned list.
     """
     project_dir = os.path.abspath(project_dir)
     project_name = os.path.basename(project_dir)
@@ -2818,7 +3024,12 @@ def process_project(
         print("  No C/C++ sources -- emitting build docs only", file=sys.stderr)
     elif effective_workers > 1 and len(cpp_files) > 200:
         print(f"  Using {effective_workers} parse workers", file=sys.stderr)
-        chunk_size = max(50, len(cpp_files) // effective_workers)
+        chunk_size = compute_parse_batch_size(len(cpp_files), effective_workers)
+        print(
+            f"  Parse batch size: {chunk_size} files "
+            f"(max {DEFAULT_PARSE_BATCH_FILES}; bounded IPC payload)",
+            file=sys.stderr,
+        )
         batches = []
         for i in range(0, len(cpp_files), chunk_size):
             batch = cpp_files[i:i + chunk_size]
@@ -2882,6 +3093,15 @@ def process_project(
 
     # Build training documents (C/C++ code path -- unchanged).
     documents: list = []
+    emitted_docs = 0
+
+    def _emit_counted(doc: str | dict[str, object]) -> None:
+        nonlocal emitted_docs
+        if emit_doc is None:
+            raise RuntimeError("_emit_counted called without emit_doc")
+        emit_doc(doc)
+        emitted_docs += 1
+
     if cpp_files:
         documents = build_training_documents(
             index_obj,
@@ -2894,11 +3114,15 @@ def process_project(
             default_build_info=default_build_info,
             tokenizer_path=tokenizer_path,
             dedup_db=dedup_db,
+            dedup_stage_id=dedup_stage_id,
+            dedup_stage_db=dedup_stage_db,
             dedup_near=dedup_near,
             global_symbols=global_symbols,
+            emit_doc=_emit_counted if emit_doc is not None else None,
         )
     check_memory_limit(memory_limit_gb, label="index_project")
-    print(f"  Generated {len(documents)} code training documents", file=sys.stderr)
+    code_doc_count = emitted_docs if emit_doc is not None else len(documents)
+    print(f"  Generated {code_doc_count} code training documents", file=sys.stderr)
 
     # Emit build/compilation files as their own 'build' docs (ADDITIVE). Only in
     # enriched mode: build docs are dict-shaped (structure_ids/language_info/
@@ -2910,9 +3134,15 @@ def process_project(
             compile_index=_compile_index,
             tokenizer_path=tokenizer_path,
             dedup_db=dedup_db,
+            dedup_stage_id=dedup_stage_id,
+            dedup_stage_db=dedup_stage_db,
             dedup_near=dedup_near,
         )
-        documents.extend(build_docs)
+        if emit_doc is not None:
+            for doc in build_docs:
+                _emit_counted(doc)
+        else:
+            documents.extend(build_docs)
         check_memory_limit(memory_limit_gb, label="index_project")
     elif build_files and not enriched:
         print(
@@ -2921,7 +3151,8 @@ def process_project(
             file=sys.stderr,
         )
 
-    print(f"  Generated {len(documents)} total training documents", file=sys.stderr)
+    total_doc_count = emitted_docs if emit_doc is not None else len(documents)
+    print(f"  Generated {total_doc_count} total training documents", file=sys.stderr)
 
     stats = index_obj.stats()
     print(f"  Index stats: {stats}", file=sys.stderr)
@@ -2965,6 +3196,17 @@ def main() -> int:
                              'hash, BEFORE grouping) are dropped GLOBALLY across all '
                              'repos/streams (no in-RAM fallback). When absent, a '
                              'per-repo in-RAM exact set is used.')
+    parser.add_argument('--dedup-stage-id', type=str, default=None,
+                        help='Optional transactional dedup stage id. When set, '
+                             'dedup claims are written only to staging tables; the '
+                             'parent conveyor must promote after successful '
+                             'materialize/pack/append or discard on failure.')
+    parser.add_argument('--dedup-stage-db', type=str, default=None,
+                        help='Optional local SQLite stage DB under rwork. When set '
+                             'with --dedup-stage-id, this process writes staging '
+                             'claims there while reading --dedup-db read-only; the '
+                             'parent promotes the local stage DB after append '
+                             'success.')
     parser.add_argument('--tokenizer-path', type=str, default=None,
                         help='Path to OUR tokenizer.json. REQUIRED to enable the '
                              'function-level tokenized-hash dedup (corrected design). '
@@ -3028,17 +3270,54 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        if args.dedup_stage_id and len(project_dirs) != 1:
+            print(
+                "ERROR: --dedup-stage-id is only supported for one project per "
+                "index_project process; parent pipeline must own promotion.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.dedup_stage_db and not args.dedup_stage_id:
+            print(
+                "ERROR: --dedup-stage-db requires --dedup-stage-id.",
+                file=sys.stderr,
+            )
+            return 1
         # FAIL LOUD up front: open once here so a bad db / missing datasketch
         # crashes before any heavy parsing (RULE #1). Closed immediately; each
         # process_project reopens against the same WAL db.
         from dedup_store import DedupStore
-        # Path/schema validation only. Avoid rebuilding persisted MinHash/LSH in
-        # the parent before project workers start; process_project opens the real
-        # store with near=dedup_near when requested.
-        DedupStore(args.dedup_db, near=False, commit_every=1000).close()
+        if args.dedup_stage_id:
+            if args.dedup_stage_db:
+                # Local-stage subprocess path: global db is read-only even during
+                # validation; stale cleanup touches only the local rwork stage db.
+                DedupStore.discard_stage(
+                    args.dedup_db,
+                    args.dedup_stage_id,
+                    stage_db_path=args.dedup_stage_db,
+                )
+                DedupStore(
+                    args.dedup_db,
+                    near=False,
+                    commit_every=1000,
+                    stage_id=args.dedup_stage_id,
+                    stage_db_path=args.dedup_stage_db,
+                ).close()
+            else:
+                # Backward-compatible same-DB staging path.
+                DedupStore(args.dedup_db, near=False, commit_every=1000).close()
+                DedupStore.discard_stage(args.dedup_db, args.dedup_stage_id)
+        else:
+            # Path/schema validation only. Avoid rebuilding persisted MinHash/LSH
+            # in the parent before project workers start; process_project opens
+            # the real store with near=dedup_near when requested.
+            DedupStore(args.dedup_db, near=False, commit_every=1000).close()
         print(
-            f"Dedup: GLOBAL function-level store at {args.dedup_db} "
-            f"(exact{'+near' if dedup_near else ''}, tokenized hash)",
+            f"Dedup: {'STAGED' if args.dedup_stage_id else 'GLOBAL'} "
+            f"function-level store at {args.dedup_db} "
+            f"(exact{'+near' if dedup_near else ''}, tokenized hash"
+            f"{', stage_id=' + args.dedup_stage_id if args.dedup_stage_id else ''}"
+            f"{', stage_db=' + args.dedup_stage_db if args.dedup_stage_db else ''})",
             file=sys.stderr,
         )
     elif args.tokenizer_path:
@@ -3064,6 +3343,15 @@ def main() -> int:
     append_mode = getattr(args, 'append', False)
     enriched = args.enriched
     with open(args.output, 'a' if append_mode else 'w') as out:
+        def _write_doc(doc: str | dict[str, object]) -> None:
+            nonlocal total_docs
+            if enriched:
+                json.dump(doc, out)
+            else:
+                json.dump({'text': doc}, out)
+            out.write('\n')
+            total_docs += 1
+
         if args.workers > 1 and len(project_dirs) > 1:
             # Multi-project parallel mode
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -3072,7 +3360,8 @@ def main() -> int:
                         process_project, pd, args.max_tokens, args.max_dep_depth,
                         args.parse_workers, enriched, extra_exclude,
                         args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
-                        dedup_near, global_symbol_index,
+                        args.dedup_stage_id, args.dedup_stage_db, dedup_near,
+                        global_symbol_index,
                     ): pd
                     for pd in project_dirs
                 }
@@ -3081,12 +3370,7 @@ def main() -> int:
                     try:
                         docs = future.result()
                         for doc in docs:
-                            if enriched:
-                                json.dump(doc, out)
-                            else:
-                                json.dump({'text': doc}, out)
-                            out.write('\n')
-                            total_docs += 1
+                            _write_doc(doc)
                     except Exception as e:
                         print(f"ERROR processing {pd}: {e}", file=sys.stderr)
         else:
@@ -3096,15 +3380,13 @@ def main() -> int:
                     docs = process_project(pd, args.max_tokens, args.max_dep_depth,
                                            args.parse_workers, enriched, extra_exclude,
                                            args.memory_limit_gb, args.tokenizer_path,
-                                           args.dedup_db, dedup_near,
-                                           global_symbol_index)
+                                           args.dedup_db, args.dedup_stage_id,
+                                           args.dedup_stage_db,
+                                           dedup_near,
+                                           global_symbol_index,
+                                           emit_doc=_write_doc)
                     for doc in docs:
-                        if enriched:
-                            json.dump(doc, out)
-                        else:
-                            json.dump({'text': doc}, out)
-                        out.write('\n')
-                        total_docs += 1
+                        _write_doc(doc)
                     out.flush()
                 except Exception as e:
                     print(f"ERROR processing {pd}: {e}", file=sys.stderr)

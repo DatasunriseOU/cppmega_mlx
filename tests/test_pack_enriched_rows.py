@@ -13,10 +13,14 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     PLATFORM_IDS_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
+    TOKEN_BUILD_EDGES_COLUMN,
     TOKEN_CHUNK_DEP_LEVELS_COLUMN,
     TOKEN_CHUNK_ENDS_COLUMN,
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_DOMAIN_EDGES_COLUMN,
+    TOKEN_DOMAIN_IDS_COLUMN,
+    TOKEN_ROLE_IDS_COLUMN,
     TOKEN_DEP_LEVELS_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
@@ -54,6 +58,10 @@ def _doc(
     token_chunk_dep_levels: list[int] | None = None,
     token_call_edges: list[dict[str, int]] | None = None,
     token_type_edges: list[dict[str, int]] | None = None,
+    token_domain_ids: list[int] | None = None,
+    token_role_ids: list[int] | None = None,
+    token_domain_edges: list[dict[str, int]] | None = None,
+    token_build_edges: list[dict[str, int]] | None = None,
     changed_chunk_ids: list[int] | None = None,
     changed_chunk_spans: list[dict[str, int]] | None = None,
 ) -> dict[str, object]:
@@ -69,6 +77,10 @@ def _doc(
         TOKEN_CHUNK_DEP_LEVELS_COLUMN: list(token_chunk_dep_levels or []),
         TOKEN_CALL_EDGES_COLUMN: list(token_call_edges or []),
         TOKEN_TYPE_EDGES_COLUMN: list(token_type_edges or []),
+        TOKEN_DOMAIN_IDS_COLUMN: list(token_domain_ids or []),
+        TOKEN_ROLE_IDS_COLUMN: list(token_role_ids or []),
+        TOKEN_DOMAIN_EDGES_COLUMN: list(token_domain_edges or []),
+        TOKEN_BUILD_EDGES_COLUMN: list(token_build_edges or []),
         CHANGED_CHUNK_IDS_COLUMN: list(changed_chunk_ids or []),
         CHANGED_CHUNK_SPANS_COLUMN: list(changed_chunk_spans or []),
     }
@@ -169,12 +181,16 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
                 token_structure_ids=[5, 5, 6],
                 token_dep_levels=[2, 2, 3],
                 token_ast_depth=[4, 4, 5],
+                token_domain_ids=[2, 2, 2],
+                token_role_ids=[1, 4, 13],
                 token_chunk_starts=[0, 1],
                 token_chunk_ends=[1, 3],
                 token_chunk_kinds=[1, 2],
                 token_chunk_dep_levels=[0, 2],
                 token_call_edges=[{"from": 1, "to": 0}],
                 token_type_edges=[{"from": 0, "to": 1}],
+                token_domain_edges=[{"from": 1, "to": 2, "kind": 21}],
+                token_build_edges=[{"from": 1, "to": 2, "kind": 21}],
                 changed_chunk_ids=[1],
                 changed_chunk_spans=[{"start": 1, "end": 3}],
             ),
@@ -191,12 +207,16 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
     assert row[TOKEN_STRUCTURE_IDS_COLUMN] == [5, 5, 6, 3, 3, 0]
     assert row[TOKEN_DEP_LEVELS_COLUMN] == [2, 2, 3, 0, 1, 0]
     assert row[TOKEN_AST_DEPTH_COLUMN] == [4, 4, 5, 2, 3, 0]
+    assert row[TOKEN_DOMAIN_IDS_COLUMN] == [2, 2, 2, 0, 0, 0]
+    assert row[TOKEN_ROLE_IDS_COLUMN] == [1, 4, 13, 0, 0, 0]
     assert row[TOKEN_CHUNK_STARTS_COLUMN] == [0, 1, 3]
     assert row[TOKEN_CHUNK_ENDS_COLUMN] == [1, 3, 5]
     assert row[TOKEN_CHUNK_KINDS_COLUMN] == [1, 2, 4]
     assert row[TOKEN_CHUNK_DEP_LEVELS_COLUMN] == [0, 2, 1]
     assert row[TOKEN_CALL_EDGES_COLUMN] == [{"from": 1, "to": 0}]
     assert row[TOKEN_TYPE_EDGES_COLUMN] == [{"from": 0, "to": 1}]
+    assert row[TOKEN_DOMAIN_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 21}]
+    assert row[TOKEN_BUILD_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 21}]
     assert row[CHANGED_CHUNK_IDS_COLUMN] == [1, 2]
     assert row[CHANGED_CHUNK_SPANS_COLUMN] == [
         {"start": 1, "end": 3},

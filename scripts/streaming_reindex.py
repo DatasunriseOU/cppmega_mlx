@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -90,6 +91,131 @@ class RepoFailure(RuntimeError):
         self.repo = repo
         self.stage = stage
         self.detail = detail
+
+
+def code_stage_id(repo: str) -> str:
+    return f"code:{repo}"
+
+
+def commit_stage_id(key: str) -> str:
+    return f"commit:{key}"
+
+
+def _safe_stage_name(value: str) -> str:
+    return value.replace("/", "_").replace(":", "_")
+
+
+def code_stage_db(work: Path, repo: str) -> Path:
+    return work / f"{_safe_stage_name(repo)}.dedup_stage.sqlite"
+
+
+def commit_stage_db(work: Path, key: str) -> Path:
+    return work / f"{_safe_stage_name(key)}.dedup_stage.sqlite"
+
+
+def _dedup_store_cls():
+    sys.path.insert(0, str(MLX_ROOT / "tools" / "clang_indexer"))
+    from dedup_store import DedupStore
+    return DedupStore
+
+
+def dedup_promote_lock_path(dedup_db: Path) -> Path:
+    return Path(str(dedup_db) + ".promote.lock")
+
+
+@contextmanager
+def dedup_promote_lock(dedup_db: Path):
+    """Serialize parent-stage promotion before touching the global SQLite DB."""
+    import fcntl
+
+    lock_path = dedup_promote_lock_path(dedup_db)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_s = float(os.environ.get("CPPMEGA_DEDUP_PROMOTE_LOCK_TIMEOUT_SECONDS", "600"))
+    deadline = time.monotonic() + timeout_s
+    sleep_s = 0.05
+    started = time.monotonic()
+    with lock_path.open("a+b") as handle:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "DedupStore: global promote lock remained held after "
+                        f"{timeout_s:.0f}s at {str(lock_path)!r}"
+                    ) from exc
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 1.5, 2.0)
+        wait_s = time.monotonic() - started
+        try:
+            yield wait_s
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def promote_dedup_stage(
+    dedup_db: Path | None,
+    stage_id: str | None,
+    stage_db: Path | None = None,
+) -> dict[str, float]:
+    if dedup_db is None or stage_id is None:
+        return {"promote_wait_s": 0.0, "promote_duration_s": 0.0}
+    with dedup_promote_lock(dedup_db) as wait_s:
+        started = time.monotonic()
+        DedupStore = _dedup_store_cls()
+        if stage_db is not None:
+            DedupStore.promote_stage_from_db(str(dedup_db), str(stage_db), stage_id)
+        else:
+            DedupStore.promote_stage_in_db(str(dedup_db), stage_id)
+        duration_s = time.monotonic() - started
+    return {
+        "promote_wait_s": round(wait_s, 6),
+        "promote_duration_s": round(duration_s, 6),
+    }
+
+
+def promote_dedup_stages(
+    dedup_db: Path | None,
+    stages: Sequence[tuple[str, Path | None]],
+) -> dict[str, float | int]:
+    """Promote multiple dedup stages while holding the global writer lock once."""
+    real_stages = [(sid, sdb) for sid, sdb in stages if dedup_db is not None and sid]
+    if dedup_db is None or not real_stages:
+        return {
+            "promote_wait_s": 0.0,
+            "promote_duration_s": 0.0,
+            "promote_batch_size": 0,
+        }
+    with dedup_promote_lock(dedup_db) as wait_s:
+        started = time.monotonic()
+        DedupStore = _dedup_store_cls()
+        for stage_id, stage_db in real_stages:
+            if stage_db is not None:
+                DedupStore.promote_stage_from_db(str(dedup_db), str(stage_db), stage_id)
+            else:
+                DedupStore.promote_stage_in_db(str(dedup_db), stage_id)
+        duration_s = time.monotonic() - started
+    return {
+        "promote_wait_s": round(wait_s, 6),
+        "promote_duration_s": round(duration_s, 6),
+        "promote_batch_size": len(real_stages),
+    }
+
+
+def discard_dedup_stage(
+    dedup_db: Path | None,
+    stage_id: str | None,
+    stage_db: Path | None = None,
+) -> None:
+    if dedup_db is None or stage_id is None:
+        return
+    DedupStore = _dedup_store_cls()
+    DedupStore.discard_stage(
+        str(dedup_db),
+        stage_id,
+        stage_db_path=str(stage_db) if stage_db is not None else None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -292,8 +418,11 @@ def stage_index_source(
     work: Path,
     dedup_db: Path | None = None,
     dedup_near: bool = True,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: Path | None = None,
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
+    parse_workers: int = 2,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.
 
@@ -315,9 +444,14 @@ def stage_index_source(
         "--exclude-dirs", SOURCE_EXTRA_EXCLUDE,
         "--tokenizer-path", TOKENIZER_PATH,
         "--memory-limit-gb", str(memory_limit_gb),
+        "--parse-workers", str(max(1, int(parse_workers))),
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
+        if dedup_stage_id is not None:
+            cmd += ["--dedup-stage-id", dedup_stage_id]
+            if dedup_stage_db is not None:
+                cmd += ["--dedup-stage-db", str(dedup_stage_db)]
     if not dedup_near:
         cmd += ["--no-near-dedup"]
     if global_symbol_index is not None:
@@ -337,9 +471,13 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
                         repo_root: Path | None, repo_dir: Path | None,
                         dedup_db: Path | None = None,
                         dedup_near: bool = True,
+                        dedup_stage_id: str | None = None,
+                        dedup_stage_db: Path | None = None,
                         pr_store: Path | None = None,
                         repo_list: Path | None = None,
-                        memory_limit_gb: float = 10.0) -> Path:
+                        memory_limit_gb: float = 10.0,
+                        analysis_cache_entries: int = 128,
+                        allow_empty: bool = False) -> Path | None:
     """process_commits.py -> <repo>.enriched.jsonl (commit edit-signal docs).
 
     A commit is an ATOMIC change-unit: process_commits dedups whole commit DOCS
@@ -356,9 +494,14 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         "--tokenizer-path", TOKENIZER_PATH,
         "--format", "both",
         "--memory-limit-gb", str(memory_limit_gb),
+        "--analysis-cache-entries", str(max(0, int(analysis_cache_entries))),
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
+        if dedup_stage_id is not None:
+            cmd += ["--dedup-stage-id", dedup_stage_id]
+            if dedup_stage_db is not None:
+                cmd += ["--dedup-stage-db", str(dedup_stage_db)]
     if not dedup_near:
         cmd += ["--no-near-dedup"]
     if repo_root is not None:
@@ -370,7 +513,11 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
     if repo_list is not None:
         cmd += ["--repo-list", str(repo_list)]
     run_checked(repo, "process_commits", cmd, log_path=work / f"{repo}.commits.log")
-    if not enriched.exists() or enriched.stat().st_size == 0:
+    if not enriched.exists():
+        raise RepoFailure(repo, "process_commits", f"empty enriched jsonl: {enriched}")
+    if enriched.stat().st_size == 0:
+        if allow_empty:
+            return None
         raise RepoFailure(repo, "process_commits", f"empty enriched jsonl: {enriched}")
     return enriched
 
@@ -480,6 +627,9 @@ def process_one_repo(
     dedup_near: bool = True,
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
+    parse_workers: int = 2,
+    *,
+    promote_dedup_on_success: bool = True,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
@@ -495,23 +645,46 @@ def process_one_repo(
     work = work_root / repo
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
-    enriched = stage_index_source(
-        repo, repo_dir, work, dedup_db, dedup_near,
-        global_symbol_index, memory_limit_gb,
-    )
-    tok = stage_materialize(repo, enriched, work, memory_limit_gb)
+    stage_id = code_stage_id(repo) if dedup_db is not None else None
+    stage_db = code_stage_db(work, repo) if dedup_db is not None else None
+    promoted = False
+    success_without_promote = False
+    try:
+        timings: dict[str, float] = {}
+        started = time.monotonic()
+        enriched = stage_index_source(
+            repo, repo_dir, work, dedup_db, dedup_near,
+            stage_id, stage_db, global_symbol_index, memory_limit_gb,
+            parse_workers,
+        )
+        timings["index_project_s"] = round(time.monotonic() - started, 6)
+        started = time.monotonic()
+        tok = stage_materialize(repo, enriched, work, memory_limit_gb)
+        timings["materialize_s"] = round(time.monotonic() - started, 6)
 
-    _bucket_for, route_by_fit = _route_by_fit_impl()
-    route_dir = work / "routed"
-    routed = route_by_fit(tok, lengths_sorted, route_dir)
-    if not routed:
-        raise RepoFailure(repo, "route_by_fit", f"no docs routed for {repo}")
+        started = time.monotonic()
+        _bucket_for, route_by_fit = _route_by_fit_impl()
+        route_dir = work / "routed"
+        routed = route_by_fit(tok, lengths_sorted, route_dir)
+        if not routed:
+            raise RepoFailure(repo, "route_by_fit", f"no docs routed for {repo}")
+        timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-    per_length: dict[str, dict] = {}
-    for L, route_parquet in sorted(routed.items()):
-        packed = stage_pack(repo, route_parquet, L, work)
-        per_length[str(L)] = append_output(repo, packed, L)
-    return {"source": "code", "lengths": per_length}
+        per_length: dict[str, dict] = {}
+        started = time.monotonic()
+        for L, route_parquet in sorted(routed.items()):
+            packed = stage_pack(repo, route_parquet, L, work)
+            per_length[str(L)] = append_output(repo, packed, L)
+        timings["pack_s"] = round(time.monotonic() - started, 6)
+        if promote_dedup_on_success:
+            timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
+            promoted = True
+        else:
+            success_without_promote = True
+        return {"source": "code", "lengths": per_length, "stage_timings_s": timings}
+    finally:
+        if not promoted and not success_without_promote:
+            discard_dedup_stage(dedup_db, stage_id, stage_db)
 
 
 def process_one_commit_source(
@@ -524,26 +697,51 @@ def process_one_commit_source(
     dedup_db: Path | None = None,
     dedup_near: bool = True,
     memory_limit_gb: float = 10.0,
+    analysis_cache_entries: int = 128,
 ) -> dict:
     work = work_root / key
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
-    enriched = stage_index_commits(key, commit_inputs, work, repo_root, repo_dir,
-                                   dedup_db, dedup_near,
-                                   memory_limit_gb=memory_limit_gb)
-    tok = stage_materialize(key, enriched, work, memory_limit_gb)
+    stage_id = commit_stage_id(key) if dedup_db is not None else None
+    stage_db = commit_stage_db(work, key) if dedup_db is not None else None
+    promoted = False
+    try:
+        timings: dict[str, float] = {}
+        started = time.monotonic()
+        enriched = stage_index_commits(
+            key, commit_inputs, work, repo_root, repo_dir,
+            dedup_db, dedup_near, stage_id,
+            stage_db,
+            memory_limit_gb=memory_limit_gb,
+            analysis_cache_entries=analysis_cache_entries,
+        )
+        timings["process_commits_s"] = round(time.monotonic() - started, 6)
+        if enriched is None:
+            return {"source": "commits", "lengths": {}, "stage_timings_s": timings}
+        started = time.monotonic()
+        tok = stage_materialize(key, enriched, work, memory_limit_gb)
+        timings["materialize_s"] = round(time.monotonic() - started, 6)
 
-    _bucket_for, route_by_fit = _route_by_fit_impl()
-    route_dir = work / "routed"
-    routed = route_by_fit(tok, lengths_sorted, route_dir)
-    if not routed:
-        raise RepoFailure(key, "route_by_fit", f"no docs routed for {key}")
+        started = time.monotonic()
+        _bucket_for, route_by_fit = _route_by_fit_impl()
+        route_dir = work / "routed"
+        routed = route_by_fit(tok, lengths_sorted, route_dir)
+        if not routed:
+            raise RepoFailure(key, "route_by_fit", f"no docs routed for {key}")
+        timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-    per_length: dict[str, dict] = {}
-    for L, route_parquet in sorted(routed.items()):
-        packed = stage_pack(key, route_parquet, L, work)
-        per_length[str(L)] = append_output(key, packed, L)
-    return {"source": "commits", "lengths": per_length}
+        per_length: dict[str, dict] = {}
+        started = time.monotonic()
+        for L, route_parquet in sorted(routed.items()):
+            packed = stage_pack(key, route_parquet, L, work)
+            per_length[str(L)] = append_output(key, packed, L)
+        timings["pack_s"] = round(time.monotonic() - started, 6)
+        timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
+        promoted = True
+        return {"source": "commits", "lengths": per_length, "stage_timings_s": timings}
+    finally:
+        if not promoted:
+            discard_dedup_stage(dedup_db, stage_id, stage_db)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -590,6 +788,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
+    p.add_argument("--analysis-cache-entries", type=int, default=128,
+                   help="Bounded per-process LRU entries passed to "
+                        "process_commits.py for commit-source runs. Default 128; "
+                        "use 0 to disable.")
+    p.add_argument("--parse-workers", type=int, default=2,
+                   help="Parse workers passed to index_project for the code stage "
+                        "(default 2; keep this low when multiple repos run).")
     return p.parse_args(argv)
 
 
@@ -672,6 +877,7 @@ def main(argv: list[str]) -> int:
                 Path(args.commit_repo_root) if args.commit_repo_root else None,
                 Path(args.commit_repo_dir) if args.commit_repo_dir else None,
                 dedup_db, dedup_near, args.memory_limit_gb,
+                args.analysis_cache_entries,
             )
             manifest.mark_done(manifest_key, info)
             run_report[manifest_key] = info
@@ -704,7 +910,8 @@ def main(argv: list[str]) -> int:
                     info = process_one_repo(repo, repo_dir, target_lengths, work_root,
                                             dedup_db, dedup_near,
                                             global_symbol_index,
-                                            args.memory_limit_gb)
+                                            args.memory_limit_gb,
+                                            args.parse_workers)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

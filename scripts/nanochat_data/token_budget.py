@@ -115,6 +115,12 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "call_targets",
     "type_refs",
     "def_use",
+    "domain_ids",
+    "domain_role_ids",
+    "domain_entity_ids",
+    "domain_scope_ids",
+    "domain_source_doc_ids",
+    "domain_confidence_ids",
 )
 
 
@@ -205,6 +211,32 @@ def _slice_doc_char_range(
 
     sliced["call_edges"] = _remap_edges(doc.get("call_edges", []))
     sliced["type_edges"] = _remap_edges(doc.get("type_edges", []))
+
+    def _remap_char_edge_triples(raw_edges: Any) -> list[dict[str, int]]:
+        remapped: list[dict[str, int]] = []
+        for edge in raw_edges or []:
+            if not isinstance(edge, dict):
+                continue
+            src = int(edge.get("from_char", edge.get("from", -1)))
+            dst = int(edge.get("to_char", edge.get("to", -1)))
+            if start_char <= src < end_char and start_char <= dst < end_char:
+                remapped.append(
+                    {
+                        "from_char": src - start_char,
+                        "to_char": dst - start_char,
+                        "kind": int(edge.get("kind", 0)),
+                    }
+                )
+        return remapped
+
+    for edge_field in (
+        "domain_edges",
+        "build_edges",
+        "shell_edges",
+        "diagnostic_edges",
+        "cross_domain_edges",
+    ):
+        sliced[edge_field] = _remap_char_edge_triples(doc.get(edge_field, []))
     return sliced
 
 

@@ -1,0 +1,102 @@
+# Domain-routed cppmega world-code training recipe.
+#
+# This config is intentionally declarative: runners may map these weights into
+# their own task-mixer implementation, but graph routes are not optional for
+# cppmega world/code model runs.
+
+tokenizer_contract: cppmega_mlx/tokenizer/tokenizer_contract_v1.json
+sequence_curriculum: [1024, 2048, 4096, 8192, 16384]
+
+requirements:
+  require_domain_delimiters: true
+  require_token_sidecars:
+    - token_domain_ids
+    - token_role_ids
+    - token_confidence_ids
+    - token_structure_ids
+    - token_dep_levels
+  require_graph_sidecars:
+    - token_call_edges
+    - token_type_edges
+    - token_domain_edges
+    - token_build_edges
+    - token_shell_edges
+    - token_diagnostic_edges
+    - token_cross_domain_edges
+  allow_token_only_baseline: false
+
+model_inputs:
+  side_embeddings:
+    domain_ids: true
+    role_ids: true
+    confidence_ids: true
+    structure_ids: true
+    dep_levels: true
+    ast_depth: true
+  graph_bias:
+    dense_gqa: true
+    dsa_topk: true
+    beta_code: 1.0
+    beta_build: 1.0
+    beta_shell: 0.75
+    beta_diagnostic: 2.0
+    beta_cross_domain: 2.0
+
+stages:
+  stage1_foundation:
+    mix:
+      cpp_code: 0.58
+      build_files: 0.10
+      shell_scripts: 0.04
+      diagnostics: 0.03
+      fim_ifim: 0.15
+      graph_indexer: 0.10
+    objectives:
+      causal_lm: 1.0
+      opener_domain_classification: 0.05
+      graph_edge_prediction: 0.05
+      graph_indexer_bce: 0.10
+      graph_indexer_coverage: 0.05
+  stage2_repair_midtrain:
+    mix:
+      cpp_code: 0.20
+      commit_pr_transform: 0.45
+      build_diagnostics: 0.15
+      fim_ifim: 0.15
+      graph_indexer: 0.05
+    objectives:
+      causal_lm: 1.0
+      diff_prediction: 0.25
+      cross_domain_retrieval: 0.10
+      diagnostic_conditioned_ifim: 0.20
+  stage3_world_trajectory:
+    mix:
+      tool_trajectories: 0.35
+      compile_test_observations: 0.25
+      commit_pr_transform: 0.25
+      cpp_code: 0.15
+    objectives:
+      transition_model: 0.50
+      reward_prediction: 0.05
+      next_action_prediction: 0.15
+      patch_generation: 0.30
+
+domains:
+  build_kinds:
+    - cmake
+    - make
+    - ninja
+    - bazel
+    - autoconf
+    - automake
+    - meson
+    - gn
+    - scons
+    - xmake
+  shell_kinds:
+    - sh
+    - bash
+    - zsh
+    - tcsh
+  diagnostics:
+    raw_without_edges_allowed_only_with_parse_confidence_raw: true

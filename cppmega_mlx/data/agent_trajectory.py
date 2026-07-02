@@ -37,6 +37,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cppmega_mlx.data.build_parsers.base import ParsedDomainDocument
+from cppmega_mlx.data.diagnostic_parsers import (
+    parse_build_error,
+    parse_clang_diagnostic,
+    parse_linker_error,
+)
+from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+
 # --------------------------------------------------------------------------- #
 # Action-kind classification
 # --------------------------------------------------------------------------- #
@@ -114,6 +122,59 @@ def classify_action(tool_name: str, command: str | None) -> str:
     if command is not None:
         return _classify_command(command)
     return ACTION_OTHER
+
+
+def parse_shell_action_domain(
+    command: str,
+    *,
+    shell_kind: str | None = None,
+) -> ParsedDomainDocument:
+    """Parse a trajectory shell action into the matching shell domain.
+
+    Unknown shell stays POSIX ``sh``. We do not label it bash unless the caller
+    or command itself gives evidence, because bash/zsh/tcsh have different
+    syntax and should remain separate domains for training.
+    """
+
+    kind = (shell_kind or "").strip().lower()
+    stripped = command.lstrip()
+    if not kind:
+        if stripped.startswith("#!"):
+            first = stripped.splitlines()[0]
+            if "zsh" in first:
+                kind = "zsh"
+            elif "tcsh" in first or "csh" in first:
+                kind = "tcsh"
+            elif "bash" in first:
+                kind = "bash"
+            else:
+                kind = "sh"
+        else:
+            head = stripped.split(maxsplit=1)[0] if stripped else ""
+            kind = head if head in {"bash", "zsh", "tcsh", "sh"} else "sh"
+
+    if kind == "bash":
+        return parse_bash(command)
+    if kind == "zsh":
+        return parse_zsh(command)
+    if kind == "tcsh":
+        return parse_tcsh(command)
+    return parse_sh(command)
+
+
+def parse_result_diagnostic_domain(result_text: str) -> ParsedDomainDocument | None:
+    """Parse a build/test/tool result into a diagnostic domain when possible."""
+
+    if not result_text.strip():
+        return None
+    lower = result_text.lower()
+    if "undefined reference" in lower or "unresolved external symbol" in lower:
+        return parse_linker_error(result_text)
+    if re.search(r"^[^\n:]+:\d+:\d+:\s+(fatal error|error|warning|note):", result_text, re.MULTILINE):
+        return parse_clang_diagnostic(result_text)
+    if "cmake error" in lower or "ninja:" in lower or "build stopped" in lower:
+        return parse_build_error(result_text)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -799,6 +860,8 @@ __all__ = [
     "enumerate_remote_sessions",
     "extract_all",
     "extract_session",
+    "parse_result_diagnostic_domain",
+    "parse_shell_action_domain",
     "walk_claude",
     "walk_codex",
     "write_parquet",

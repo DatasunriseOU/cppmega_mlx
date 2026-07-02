@@ -256,6 +256,39 @@ def test_bpe_split_identifier_decodes_without_spurious_spaces() -> None:
         )
 
 
+def test_line_comment_newline_survives_encode_decode_roundtrip() -> None:
+    """A // comment must not absorb the following source line.
+
+    C++ single-line comments are syntactically terminated only by the newline.
+    If the tokenizer/detokenizer ever drops that <NL>, clang-format cannot
+    reconstruct the program: the next code line becomes part of the comment.
+    """
+
+    tokenizer_path = (
+        Path(__file__).resolve().parents[1]
+        / "cppmega_mlx"
+        / "tokenizer"
+        / "tokenizer.json"
+    )
+    if not tokenizer_path.is_file():
+        pytest.skip("vendored tokenizer.json not present")
+
+    tokenizer = load_cppmega_tokenizer(tokenizer_path)
+    source = (
+        "int a = 0; // keep this comment\n"
+        "int b = 1; // second comment\n"
+        "return a + b;\n"
+    )
+
+    ids = cast(list[int], tokenizer.encode(source))
+    tokens = [tokenizer.token_for_id(token_id) for token_id in ids]
+
+    assert "//" in tokens
+    assert tokens.count("<NL>") == 3
+    assert tokens[tokens.index("//") + 1 :].index("<NL>") >= 1
+    assert tokenizer.decode(ids) == source
+
+
 def test_nanochat_v3_fixed_tokens_config_matches_special_id_contract() -> None:
     config_path = NANOCHAT_ROOT / "config" / "tokenizer_v3_fixed_tokens.json"
     if not config_path.is_file():

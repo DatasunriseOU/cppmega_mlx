@@ -113,6 +113,7 @@ def _build(ckpt_root: Path):
         "--repo-list", "",
         "--dedup-checkpoint-tokens", "0",
         "--memory-limit-gb", "99",
+        "--memory-budget-gb", "0",
     ]
     return paths, env, argv
 

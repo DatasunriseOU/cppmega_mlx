@@ -349,7 +349,9 @@ class DenseCppBlock(nn.Module):
                 self.attn_norm(hidden_states), mask, block_bias=block_bias
             )
         else:
-            attn_out = self.attention(self.attn_norm(hidden_states), mask)
+            attn_out = self.attention(
+                self.attn_norm(hidden_states), mask, attention_bias=block_bias
+            )
         hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
         return hidden_states
@@ -528,7 +530,7 @@ class DenseCppLM(nn.Module):
             if is_dsa:
                 hidden = layer(hidden, mask, block_bias=block_bias)
             else:
-                hidden = layer(hidden, mask)
+                hidden = layer(hidden, mask, block_bias=block_bias)
         if apply_final_norm:
             return self.norm(hidden)
         return hidden

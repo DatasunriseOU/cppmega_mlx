@@ -6,9 +6,10 @@ NEBIUS_S3_SECRET_ACCESS_KEY for the Nebius Object Storage access key.  Nebius
 Object Storage exposes an S3-compatible object API; the S3 client is pointed at
 the Nebius endpoint and does not use AWS cloud services.
 
-The built-in default manifest is the final all-valid profile.  The old
-code+commits-only subset is available only by explicit request via
-``--code-commits-only``.
+The built-in default manifest is the training profile: C/C++ code plus commit
+parquet, where PR discussion is already integrated into commit docstrings.
+Standalone PR parquet is diagnostic material and is downloaded only with
+explicit ``--include-standalone-pr``.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Iterable
 
 
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
-DEFAULT_PREFIX = "cppmega-sidecar/valid-all-20260627"
+DEFAULT_PREFIX = "cppmega-sidecar/code-commits-integrated-pr-20260627"
 
 # The audit receipt is downloaded as one of the selections; this is the remote
 # subprefix and the JSON filename the producer (audit_sidecar_parquet.py) writes.
@@ -125,7 +126,15 @@ def _sync_one(
     return str(local)
 
 
-def _default_selections(*, code_commits_only: bool = False) -> list[dict[str, str]]:
+def _default_selections(
+    *,
+    include_standalone_pr: bool = False,
+    code_commits_only: bool = False,
+) -> list[dict[str, str]]:
+    if include_standalone_pr and code_commits_only:
+        raise SystemExit(
+            "--include-standalone-pr conflicts with deprecated --code-commits-only"
+        )
     selections = [
         {"remote": "parquet/code/1024", "local": "outputs/reindexed/1024"},
         {"remote": "parquet/code/2048", "local": "outputs/reindexed/2048"},
@@ -141,7 +150,7 @@ def _default_selections(*, code_commits_only: bool = False) -> list[dict[str, st
             "local": "outputs/sidecar_audit_all_final_poststop_valid",
         },
     ]
-    if not code_commits_only:
+    if include_standalone_pr:
         selections.extend(
             [
                 {"remote": "parquet/pr/1024", "local": "outputs/reindexed_pr/1024"},
@@ -159,15 +168,27 @@ def _default_manifest(
     prefix: str,
     endpoint_url: str,
     *,
+    include_standalone_pr: bool = False,
     code_commits_only: bool = False,
 ) -> dict:
+    if include_standalone_pr and code_commits_only:
+        raise SystemExit(
+            "--include-standalone-pr conflicts with deprecated --code-commits-only"
+        )
     return {
         "bucket": bucket,
         "prefix": prefix,
         "endpoint_url": endpoint_url,
-        "profile": "code_commits_only" if code_commits_only else "all_valid",
-        "standalone_pr_included": not code_commits_only,
-        "selections": _default_selections(code_commits_only=code_commits_only),
+        "profile": (
+            "code_commits_plus_standalone_pr"
+            if include_standalone_pr
+            else "code_commits_integrated_pr"
+        ),
+        "standalone_pr_included": include_standalone_pr,
+        "selections": _default_selections(
+            include_standalone_pr=include_standalone_pr,
+            code_commits_only=code_commits_only,
+        ),
     }
 
 
@@ -196,12 +217,17 @@ def _verify_downloaded_set(
     set. This proves the consume side by RAISING (``SystemExit``) unless ALL of
     the following hold:
 
-      * the audit receipt is present and green (``bad_files == bad_rows == 0``);
-      * the manifest's ``verified_valid_tokens`` matches the receipt total (when
-        a real downloaded manifest is in use -- not the built-in default);
+      * every selected parquet bucket is present in the audit receipt and green;
+      * the manifest's ``verified_valid_tokens`` matches the selected buckets'
+        receipt total (when a real downloaded manifest is in use -- not the
+        built-in default);
       * every downloaded parquet bucket has exactly the shard count the receipt
         certified for that ``kind/bucket`` -- this is what catches a
         missing-shards SET that the per-object ETag check cannot see.
+
+    The receipt may cover diagnostic standalone PR buckets that this manifest
+    intentionally does not select. Those unselected buckets do not participate
+    in the consume-side training gate.
     """
     receipt_path = _receipt_path_for(dest, manifest)
     if not receipt_path.exists():
@@ -210,34 +236,18 @@ def _verify_downloaded_set(
             "Refusing to trust an unverified set."
         )
     report = json.loads(receipt_path.read_text(encoding="utf-8"))
-    total = report["total"]
-    bad_files = int(total["bad_files"])
-    bad_rows = int(total["bad_rows"])
-    if bad_files or bad_rows:
-        raise SystemExit(
-            f"audit receipt is not green: {receipt_path} "
-            f"bad_files={bad_files} bad_rows={bad_rows}. Refusing to trust the set."
-        )
-
-    receipt_valid_tokens = int(total["valid_tokens"])
+    by_kind_bucket = report["by_kind_bucket"]
+    receipt_valid_tokens = 0
+    selected_bad_files = 0
+    selected_bad_rows = 0
+    nongreen: list[str] = []
     manifest_token_total = manifest.get("verified_valid_tokens")
     if require_token_total and manifest_token_total is None:
         raise SystemExit(
             "downloaded manifest is missing verified_valid_tokens; cannot "
             f"reconcile the downloaded set against the audit receipt {receipt_path}."
         )
-    if (
-        manifest_token_total is not None
-        and int(manifest_token_total) != receipt_valid_tokens
-    ):
-        raise SystemExit(
-            "manifest verified_valid_tokens "
-            f"({int(manifest_token_total)}) != receipt valid_tokens "
-            f"({receipt_valid_tokens}); manifest/receipt pair is inconsistent. "
-            f"Receipt={receipt_path}."
-        )
 
-    by_kind_bucket = report["by_kind_bucket"]
     mismatches: list[str] = []
     checked = 0
     for item in manifest["selections"]:
@@ -253,6 +263,14 @@ def _verify_downloaded_set(
                 f"no entry for {key!r}"
             )
             continue
+        entry = by_kind_bucket[key]
+        bad_files = int(entry["bad_files"])
+        bad_rows = int(entry["bad_rows"])
+        if bad_files or bad_rows:
+            nongreen.append(f"{key} bad_files={bad_files} bad_rows={bad_rows}")
+        selected_bad_files += bad_files
+        selected_bad_rows += bad_rows
+        receipt_valid_tokens += int(entry["valid_tokens"])
         expected = int(by_kind_bucket[key]["files"])
         if downloaded != expected:
             mismatches.append(
@@ -270,13 +288,28 @@ def _verify_downloaded_set(
             "no parquet bucket selections were verified against the receipt "
             f"{receipt_path}; refusing to certify an empty set."
         )
+    if nongreen:
+        raise SystemExit(
+            "selected audit receipt buckets are not green: "
+            + "; ".join(nongreen)
+        )
+    if (
+        manifest_token_total is not None
+        and int(manifest_token_total) != receipt_valid_tokens
+    ):
+        raise SystemExit(
+            "manifest verified_valid_tokens "
+            f"({int(manifest_token_total)}) != selected receipt valid_tokens "
+            f"({receipt_valid_tokens}); manifest/receipt pair is inconsistent. "
+            f"Receipt={receipt_path}."
+        )
 
     return {
         "receipt": str(receipt_path),
         "verified_valid_tokens": receipt_valid_tokens,
         "buckets_verified": checked,
-        "bad_files": bad_files,
-        "bad_rows": bad_rows,
+        "bad_files": selected_bad_files,
+        "bad_rows": selected_bad_rows,
     }
 
 
@@ -298,16 +331,22 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--include-standalone-pr",
         action="store_true",
         help=(
-            "Deprecated no-op for --use-default-manifest. Standalone PR parquet "
-            "is included by default in the all-valid profile."
+            "With --use-default-manifest, also download standalone PR discussion "
+            "parquet. Default excludes it because PR discussion is integrated "
+            "into commit docstrings."
         ),
     )
     ap.add_argument(
         "--code-commits-only",
         action="store_true",
-        help="With --use-default-manifest, download only code+commit buckets.",
+        help=(
+            "Deprecated compatibility flag. Code+commit buckets are already the "
+            "built-in default manifest."
+        ),
     )
     args = ap.parse_args(argv)
+    if args.include_standalone_pr and args.code_commits_only:
+        raise SystemExit("--include-standalone-pr conflicts with --code-commits-only")
     _load_env_file(args.env_file)
 
     s3_env = None if args.dry_run else _s3_env()
@@ -318,6 +357,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.bucket,
             args.prefix,
             args.endpoint_url,
+            include_standalone_pr=args.include_standalone_pr,
             code_commits_only=args.code_commits_only,
         )
     else:
@@ -334,6 +374,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.bucket,
                 args.prefix,
                 args.endpoint_url,
+                include_standalone_pr=args.include_standalone_pr,
                 code_commits_only=args.code_commits_only,
             )
             if args.dry_run

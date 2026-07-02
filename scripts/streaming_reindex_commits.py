@@ -60,7 +60,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 # Reuse the proven machinery from the code driver.
 import streaming_reindex as sr
@@ -112,7 +112,12 @@ def _has_git_metadata(repo_dir: Path) -> bool:
     return (repo_dir / ".git").exists()
 
 
-def _finalize_git_repo_subtree(repo: str, repo_dir: Path | None):
+def _finalize_git_repo_subtree(
+    repo: str,
+    repo_dir: Path | None,
+    *,
+    on_no_git: Callable[[str], None] | None = None,
+):
     """Return a staged git repo, or skip and delete source-only snapshots.
 
     The commit stream is allowed to see source-only entries in cpp_all, but it
@@ -123,6 +128,8 @@ def _finalize_git_repo_subtree(repo: str, repo_dir: Path | None):
     if _has_git_metadata(repo_dir):
         return repo, repo_dir
     _log(f"SKIP (no-git) {repo}: no .git metadata in staged repo")
+    if on_no_git is not None:
+        on_no_git(repo)
     shutil.rmtree(repo_dir.parent, ignore_errors=True)
     return None
 
@@ -135,7 +142,12 @@ def range_key(repo: str, start_idx: int) -> str:
 # --------------------------------------------------------------------------- #
 # Sequential .git-preserving producer (one repo at a time, bounded disk).
 # --------------------------------------------------------------------------- #
-def stream_repo_subtrees_with_git(work_root: Path, should_process):
+def stream_repo_subtrees_with_git(
+    work_root: Path,
+    should_process,
+    *,
+    on_no_git: Callable[[str], None] | None = None,
+):
     """Yield (repo, repo_dir) for every cpp_all/<repo>/ subtree, ONE pass, .git kept.
 
     Only ONE repo is on disk at a time. Resume-skipped repos are drained from the
@@ -170,7 +182,11 @@ def stream_repo_subtrees_with_git(work_root: Path, should_process):
             within = rest[slash + 1:]
             if repo != cur_repo:
                 if cur_repo is not None and active:
-                    finalized_repo = _finalize_git_repo_subtree(cur_repo, cur_dir)
+                    finalized_repo = _finalize_git_repo_subtree(
+                        cur_repo,
+                        cur_dir,
+                        on_no_git=on_no_git,
+                    )
                     if finalized_repo is not None:
                         yield finalized_repo
                     finalized.add(cur_repo)
@@ -217,7 +233,11 @@ def stream_repo_subtrees_with_git(work_root: Path, should_process):
             with open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
         if cur_repo is not None and active:
-            finalized_repo = _finalize_git_repo_subtree(cur_repo, cur_dir)
+            finalized_repo = _finalize_git_repo_subtree(
+                cur_repo,
+                cur_dir,
+                on_no_git=on_no_git,
+            )
             if finalized_repo is not None:
                 yield finalized_repo
             finalized.add(cur_repo)
@@ -446,22 +466,59 @@ def process_range(
     pr_store: Path | None = None,
     repo_list: Path | None = None,
     memory_limit_gb: float = 10.0,
+    analysis_cache_entries: int = 128,
+    defer_promote: bool = False,
+    deferred_stage_dir: Path | None = None,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
     rkey = range_key(repo, start_idx)
     rwork = repo_work / f"r{start_idx}"
     rwork.mkdir(parents=True, exist_ok=True)
+    stage_id = sr.commit_stage_id(f"{repo}:r{start_idx}:{end_idx}") if dedup_db is not None else None
+    stage_db = sr.commit_stage_db(rwork, rkey) if dedup_db is not None else None
+    promoted = False
+    deferred_stage: dict[str, str] | None = None
+
+    def sqlite_family(path: Path):
+        yield path
+        yield Path(str(path) + "-wal")
+        yield Path(str(path) + "-shm")
+
+    def move_sqlite_family(src_db: Path, dst_db: Path) -> None:
+        dst_db.parent.mkdir(parents=True, exist_ok=True)
+        for path in sqlite_family(dst_db):
+            if path.exists():
+                path.unlink()
+        for src_path in sqlite_family(src_db):
+            if src_path.exists():
+                suffix = str(src_path)[len(str(src_db)):]
+                shutil.move(str(src_path), str(Path(str(dst_db) + suffix)))
+
     try:
+        timings: dict[str, float] = {}
         slice_jsonl = rwork / f"{repo}_r{start_idx}.jsonl"
         n_records = slice_records_jsonl(records_jsonl, start_idx, end_idx, slice_jsonl)
 
         # process_commits needs the source tree for include resolution.
+        started = time.monotonic()
         enriched = stage_index_commits(rkey, [slice_jsonl], rwork, repo_dir, None,
-                                       dedup_db, dedup_near,
+                                       dedup_db, dedup_near, stage_id,
+                                       stage_db,
                                        pr_store=pr_store, repo_list=repo_list,
-                                       memory_limit_gb=memory_limit_gb)
+                                       memory_limit_gb=memory_limit_gb,
+                                       analysis_cache_entries=analysis_cache_entries,
+                                       allow_empty=True)
+        timings["process_commits_s"] = round(time.monotonic() - started, 6)
+        if enriched is None:
+            sr.discard_dedup_stage(dedup_db, stage_id, stage_db)
+            info = empty_after_dedup_info(repo, start_idx, end_idx, n_records)
+            info["stage_timings_s"] = timings
+            return info
+        started = time.monotonic()
         tok = stage_materialize(rkey, enriched, rwork, memory_limit_gb)
+        timings["materialize_s"] = round(time.monotonic() - started, 6)
 
+        started = time.monotonic()
         route_dir = rwork / "routed"
         routed = route_by_fit(tok, lengths_sorted, route_dir)
         # Lift the over-long drop counts out of route_by_fit's receipt BEFORE the
@@ -474,25 +531,67 @@ def process_range(
                 f"(all {dropped_overlong['rows']} docs over-long, "
                 f"{dropped_overlong['tokens']} tokens dropped)",
             )
+        timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
         per_length: dict[str, dict] = {}
+        started = time.monotonic()
         for L, route_parquet in sorted(routed.items()):
             packed = stage_pack(rkey, route_parquet, L, rwork)
             per_length[str(L)] = append_range_output(repo, start_idx, packed, L)
-        return {
+        timings["pack_s"] = round(time.monotonic() - started, 6)
+        if dedup_db is not None and stage_id is not None:
+            if defer_promote:
+                if stage_db is None:
+                    raise RuntimeError("defer_promote requires a local stage_db")
+                promote_dir = deferred_stage_dir or (repo_work / "_deferred_promote")
+                deferred_db = promote_dir / stage_db.name
+                move_sqlite_family(stage_db, deferred_db)
+                deferred_stage = {
+                    "stage_id": stage_id,
+                    "stage_db": str(deferred_db),
+                }
+                timings["promote_wait_s"] = 0.0
+                timings["promote_duration_s"] = 0.0
+                timings["promote_deferred"] = 1.0
+                promoted = True
+            else:
+                timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
+                promoted = True
+        info = {
             "source": "commits",
             "repo": repo,
             "range": [start_idx, end_idx],
             "n_records": n_records,
             "lengths": per_length,
+            "stage_timings_s": timings,
             # Durable record of over-long docs excluded from all fixed buckets.
             # The per-range temp dir (and route_by_fit's dropped_overlong.json
             # receipt) is rmtree'd below, so this is the only surviving audit of
             # the drop; main() aggregates it into the final run summary.
             "dropped_overlong": dropped_overlong,
         }
+        if deferred_stage is not None:
+            info["dedup_stage"] = deferred_stage
+        return info
     finally:
+        if not promoted:
+            sr.discard_dedup_stage(dedup_db, stage_id, stage_db)
         shutil.rmtree(rwork, ignore_errors=True)
+
+
+def empty_after_dedup_info(
+    repo: str, start_idx: int, end_idx: int, n_records: int
+) -> dict:
+    """Manifest info for a commit range whose docs all deduped away."""
+    return {
+        "source": "commits",
+        "repo": repo,
+        "range": [start_idx, end_idx],
+        "n_records": n_records,
+        "lengths": {},
+        "dropped_overlong": {"rows": 0, "tokens": 0},
+        "empty_after_dedup": True,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +615,7 @@ def process_one_repo(
     pr_store: Path | None = None,
     repo_list: Path | None = None,
     memory_limit_gb: float = 10.0,
+    analysis_cache_entries: int = 128,
 ) -> int:
     """Extract one repo, fan its ranges to the pool, wait for completion.
 
@@ -559,6 +659,7 @@ def process_one_repo(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
                 dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
+                analysis_cache_entries,
             )
             futures[fut] = (start, end)
 
@@ -670,6 +771,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to process_commits/"
                         "materializer (default 10.0).")
+    p.add_argument("--analysis-cache-entries", type=int, default=128,
+                   help="Bounded per-process LRU entries passed to "
+                        "process_commits.py. Default 128; use 0 to disable.")
     return p.parse_args(argv)
 
 
@@ -772,6 +876,7 @@ def main(argv: list[str]) -> int:
                     args.token_budget, cumulative, args.keep_temp,
                     dedup_db, dedup_near, pr_store, repo_list,
                     args.memory_limit_gb,
+                    args.analysis_cache_entries,
                 )
                 ranges_done += done
                 processed_repos += 1

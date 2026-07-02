@@ -8,6 +8,12 @@ import json
 from typing import Any, Sequence, cast
 
 from cppmega_mlx.tokenizer.cpp_tokenizer import normalize_whitespace_with_offsets
+from cppmega_mlx.data.domain_schema import (
+    DomainKind,
+    DomainRoleKind,
+    ParseConfidence,
+    delimiter_token_ids,
+)
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     PLATFORM_IDS_COLUMN,
@@ -23,10 +29,21 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_CHUNK_ENDS_COLUMN,
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_CONFIDENCE_IDS_COLUMN,
+    TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     TOKEN_DEF_USE_COLUMN,
     TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+    TOKEN_DOMAIN_EDGES_COLUMN,
+    TOKEN_DOMAIN_IDS_COLUMN,
+    TOKEN_BUILD_EDGES_COLUMN,
+    TOKEN_ENTITY_IDS_COLUMN,
     TOKEN_IDS_COLUMN,
+    TOKEN_ROLE_IDS_COLUMN,
+    TOKEN_SCOPE_IDS_COLUMN,
     TOKEN_SIBLING_INDEX_COLUMN,
+    TOKEN_SHELL_EDGES_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
@@ -65,6 +82,27 @@ def _normalize_graph_edge_pairs(raw_edges: Any) -> list[tuple[int, int]]:
         elif isinstance(edge, (list, tuple)) and len(edge) >= 2:
             pairs.append((int(edge[0]), int(edge[1])))
     return pairs
+
+
+def _normalize_graph_edge_triples(raw_edges: Any) -> list[tuple[int, int, int]]:
+    triples: list[tuple[int, int, int]] = []
+    for edge in raw_edges or []:
+        if isinstance(edge, dict):
+            if "from_char" in edge and "to_char" in edge:
+                src = edge["from_char"]
+                dst = edge["to_char"]
+            elif "from" in edge and "to" in edge:
+                src = edge["from"]
+                dst = edge["to"]
+            elif "src" in edge and "dst" in edge:
+                src = edge["src"]
+                dst = edge["dst"]
+            else:
+                continue
+            triples.append((int(src), int(dst), int(edge.get("kind", 0))))
+        elif isinstance(edge, (list, tuple)) and len(edge) >= 3:
+            triples.append((int(edge[0]), int(edge[1]), int(edge[2])))
+    return triples
 
 
 def _encode_batch_with_optional_char_spans(
@@ -280,6 +318,47 @@ def _remap_token_edges(
     return remapped
 
 
+def _char_position_to_token_index(
+    token_spans: list[tuple[int, int]],
+    char_pos: int,
+) -> int | None:
+    if not token_spans:
+        return None
+    char_pos = max(int(char_pos), 0)
+    for idx, (start, end) in enumerate(token_spans):
+        start_i = int(start)
+        end_i = int(end)
+        if end_i > start_i and start_i <= char_pos < end_i:
+            return idx
+
+    valid_starts = [
+        (int(start), idx)
+        for idx, (start, end) in enumerate(token_spans)
+        if int(end) > int(start)
+    ]
+    if not valid_starts:
+        return None
+    starts = [item[0] for item in valid_starts]
+    pos = bisect.bisect_right(starts, char_pos) - 1
+    if pos < 0:
+        return valid_starts[0][1]
+    return valid_starts[min(pos, len(valid_starts) - 1)][1]
+
+
+def _remap_char_edge_triples_to_tokens(
+    raw_edges: Any,
+    token_spans: list[tuple[int, int]],
+) -> list[dict[str, int]]:
+    remapped: list[dict[str, int]] = []
+    for src_char, dst_char, kind in _normalize_graph_edge_triples(raw_edges):
+        src = _char_position_to_token_index(token_spans, src_char)
+        dst = _char_position_to_token_index(token_spans, dst_char)
+        if src is None or dst is None:
+            continue
+        remapped.append({"from": int(src), "to": int(dst), "kind": int(kind)})
+    return remapped
+
+
 def _build_token_chunk_layout(
     doc: dict[str, Any],
     tok_chunks: list[dict[str, Any]],
@@ -336,6 +415,129 @@ def _tokenize_optional_char_field(
         if values:
             return _chars_to_tokens_structure_ids(values, "", token_spans)
     return []
+
+
+def _domain_kind_from_doc(doc: dict[str, Any]) -> DomainKind | None:
+    raw = doc.get("domain_kind")
+    if raw in (None, "", 0, "0"):
+        return None
+    try:
+        if isinstance(raw, str) and not raw.isdigit():
+            return DomainKind[raw.upper()]
+        return DomainKind(int(raw))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _shift_token_span_values(values: list[int], *, insert_at: int) -> list[int]:
+    return [int(value) + 1 if int(value) >= insert_at else int(value) for value in values]
+
+
+def _shift_token_edge_triples(
+    edges: list[dict[str, int]],
+    *,
+    insert_at: int,
+) -> list[dict[str, int]]:
+    shifted: list[dict[str, int]] = []
+    for edge in edges:
+        src = int(edge["from"])
+        dst = int(edge["to"])
+        shifted.append(
+            {
+                "from": src + 1 if src >= insert_at else src,
+                "to": dst + 1 if dst >= insert_at else dst,
+                "kind": int(edge.get("kind", 0)),
+            }
+        )
+    return shifted
+
+
+def _insert_domain_delimiters(
+    row: dict[str, Any],
+    *,
+    domain: DomainKind,
+    insert_at: int = 1,
+) -> None:
+    try:
+        start_id, end_id = delimiter_token_ids(domain)
+    except KeyError:
+        return
+    token_ids = list(row[TOKEN_IDS_COLUMN])
+    if insert_at > len(token_ids):
+        insert_at = len(token_ids)
+    row[TOKEN_IDS_COLUMN] = token_ids[:insert_at] + [int(start_id)] + token_ids[insert_at:] + [int(end_id)]
+
+    token_count_before = len(token_ids)
+    token_count_after = token_count_before + 2
+    domain_value = int(domain)
+    delimiter_role = int(DomainRoleKind.DELIMITER)
+    exact_confidence = int(ParseConfidence.EXACT)
+
+    dense_defaults = {
+        TOKEN_DOMAIN_IDS_COLUMN: domain_value,
+        TOKEN_ROLE_IDS_COLUMN: delimiter_role,
+        TOKEN_ENTITY_IDS_COLUMN: 0,
+        TOKEN_SCOPE_IDS_COLUMN: 0,
+        TOKEN_SOURCE_DOC_IDS_COLUMN: 0,
+        TOKEN_CONFIDENCE_IDS_COLUMN: exact_confidence,
+    }
+    for column, delimiter_value in dense_defaults.items():
+        values = list(row.get(column, []))
+        if not values:
+            values = [0] * token_count_before
+        if len(values) != token_count_before:
+            raise ValueError(
+                f"{column} length {len(values)} does not match token count {token_count_before}"
+            )
+        row[column] = (
+            values[:insert_at]
+            + [int(delimiter_value)]
+            + values[insert_at:]
+            + [int(delimiter_value)]
+        )
+
+    for column in (
+        TOKEN_STRUCTURE_IDS_COLUMN,
+        TOKEN_DEP_LEVELS_COLUMN,
+        TOKEN_AST_DEPTH_COLUMN,
+        TOKEN_SIBLING_INDEX_COLUMN,
+        TOKEN_AST_NODE_TYPE_COLUMN,
+        TOKEN_SYMBOL_IDS_COLUMN,
+        TOKEN_CALL_TARGETS_COLUMN,
+        TOKEN_TYPE_REFS_COLUMN,
+        TOKEN_DEF_USE_COLUMN,
+        TOKEN_CHANGE_MASK_PRE_COLUMN,
+        TOKEN_CHANGE_MASK_POST_COLUMN,
+        HUNK_ID_PER_TOKEN_COLUMN,
+        EDIT_OP_PER_TOKEN_COLUMN,
+    ):
+        values = list(row.get(column, []))
+        if not values:
+            continue
+        if len(values) != token_count_before:
+            raise ValueError(
+                f"{column} length {len(values)} does not match token count {token_count_before}"
+            )
+        pad_value = -1 if column == HUNK_ID_PER_TOKEN_COLUMN else 0
+        row[column] = values[:insert_at] + [pad_value] + values[insert_at:] + [pad_value]
+
+    for column in (TOKEN_CHUNK_STARTS_COLUMN, TOKEN_CHUNK_ENDS_COLUMN):
+        row[column] = _shift_token_span_values(list(row.get(column, [])), insert_at=insert_at)
+
+    for column in (
+        TOKEN_DOMAIN_EDGES_COLUMN,
+        TOKEN_BUILD_EDGES_COLUMN,
+        TOKEN_SHELL_EDGES_COLUMN,
+        TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+        TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
+    ):
+        row[column] = _shift_token_edge_triples(
+            list(row.get(column, [])),
+            insert_at=insert_at,
+        )
+
+    if len(row[TOKEN_IDS_COLUMN]) != token_count_after:
+        raise AssertionError("domain delimiter insertion corrupted token length")
 
 
 def _changed_chunk_metadata(
@@ -492,16 +694,72 @@ def materialize_tokenized_enriched_batch(
                 "",
                 token_spans,
             ),
+            TOKEN_DOMAIN_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("domain_ids", []),
+                "",
+                token_spans,
+            ),
+            TOKEN_ROLE_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("domain_role_ids", doc.get("role_ids", [])),
+                "",
+                token_spans,
+            ),
+            TOKEN_ENTITY_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("domain_entity_ids", doc.get("entity_ids", [])),
+                "",
+                token_spans,
+            ),
+            TOKEN_SCOPE_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("domain_scope_ids", doc.get("scope_ids", [])),
+                "",
+                token_spans,
+            ),
+            TOKEN_SOURCE_DOC_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("domain_source_doc_ids", doc.get("source_doc_ids", [])),
+                "",
+                token_spans,
+            ),
+            TOKEN_CONFIDENCE_IDS_COLUMN: _chars_to_tokens_structure_ids(
+                doc.get("domain_confidence_ids", doc.get("confidence_ids", [])),
+                "",
+                token_spans,
+            ),
+            TOKEN_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
+                doc.get("domain_edges", []),
+                token_spans,
+            ),
+            TOKEN_BUILD_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
+                doc.get("build_edges", []),
+                token_spans,
+            ),
+            TOKEN_SHELL_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
+                doc.get("shell_edges", []),
+                token_spans,
+            ),
+            TOKEN_DIAGNOSTIC_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
+                doc.get("diagnostic_edges", []),
+                token_spans,
+            ),
+            TOKEN_CROSS_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
+                doc.get("cross_domain_edges", []),
+                token_spans,
+            ),
             TOKEN_CHANGE_MASK_PRE_COLUMN: token_change_mask_pre,
             TOKEN_CHANGE_MASK_POST_COLUMN: token_change_mask_post,
             HUNK_ID_PER_TOKEN_COLUMN: hunk_id_per_token,
             EDIT_OP_PER_TOKEN_COLUMN: edit_op_per_token,
         }
         row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
+        domain = _domain_kind_from_doc(doc)
+        if domain is not None:
+            _insert_domain_delimiters(row, domain=domain)
         changed_chunk_ids, changed_chunk_spans = _changed_chunk_metadata(
             cast(list[int], row[TOKEN_CHUNK_STARTS_COLUMN]),
             cast(list[int], row[TOKEN_CHUNK_ENDS_COLUMN]),
-            (token_change_mask_pre, token_change_mask_post),
+            (
+                cast(list[int], row[TOKEN_CHANGE_MASK_PRE_COLUMN]),
+                cast(list[int], row[TOKEN_CHANGE_MASK_POST_COLUMN]),
+            ),
         )
         row[CHANGED_CHUNK_IDS_COLUMN] = changed_chunk_ids
         row[CHANGED_CHUNK_SPANS_COLUMN] = changed_chunk_spans

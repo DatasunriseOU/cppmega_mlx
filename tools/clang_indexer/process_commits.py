@@ -27,6 +27,8 @@ Usage:
 """
 
 import argparse
+from array import array
+import gc
 import hashlib
 import importlib
 import json
@@ -35,7 +37,7 @@ import re
 import sys
 import tempfile
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
@@ -201,6 +203,11 @@ class ClassDef:
     sibling_index: list[int] = field(default_factory=list)
     ast_node_type: list[int] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.ast_depth = array('H', self.ast_depth)
+        self.sibling_index = array('H', self.sibling_index)
+        self.ast_node_type = array('H', self.ast_node_type)
+
 
 @dataclass
 class FileAnalysis:
@@ -214,6 +221,11 @@ class FileAnalysis:
     compile_args: list[str] = field(default_factory=list)
     build_info: dict[str, object] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.preamble_ast_depth = array('H', self.preamble_ast_depth)
+        self.preamble_sibling_index = array('H', self.preamble_sibling_index)
+        self.preamble_ast_node_type = array('H', self.preamble_ast_node_type)
+
     def build_local_index(self) -> ProjectIndex:
         """Build a ProjectIndex from this file's functions for dep computation."""
         idx = ProjectIndex()
@@ -221,6 +233,126 @@ class FileAnalysis:
             idx.add_function(func)
         idx.compute_dep_levels()
         return idx
+
+
+def _clone_function_def(func: FunctionDef) -> FunctionDef:
+    return FunctionDef(
+        func.name,
+        func.qualified_name,
+        func.file,
+        func.line,
+        func.text,
+        list(func.callees),
+        is_definition=func.is_definition,
+        end_line=func.end_line,
+        ast_depth=list(func.ast_depth),
+        sibling_index=list(func.sibling_index),
+        ast_node_type=list(func.ast_node_type),
+        referenced_types=list(func.referenced_types),
+        baselib_callees=list(func.baselib_callees),
+    )
+
+
+def _clone_class_def(cls: ClassDef) -> ClassDef:
+    return ClassDef(
+        name=cls.name,
+        qualified_name=cls.qualified_name,
+        text=cls.text,
+        start_line=cls.start_line,
+        end_line=cls.end_line,
+        ast_depth=list(cls.ast_depth),
+        sibling_index=list(cls.sibling_index),
+        ast_node_type=list(cls.ast_node_type),
+    )
+
+
+def _clone_file_analysis(analysis: FileAnalysis) -> FileAnalysis:
+    return FileAnalysis(
+        preamble=analysis.preamble,
+        functions=[_clone_function_def(func) for func in analysis.functions],
+        classes=[_clone_class_def(cls) for cls in analysis.classes],
+        preamble_ast_depth=list(analysis.preamble_ast_depth),
+        preamble_sibling_index=list(analysis.preamble_sibling_index),
+        preamble_ast_node_type=list(analysis.preamble_ast_node_type),
+        compile_args=list(analysis.compile_args),
+        build_info=dict(analysis.build_info),
+    )
+
+
+class AnalysisCache:
+    """Small LRU for expensive libclang file analyses inside one range worker."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self.max_entries = max(0, int(max_entries))
+        self._items: OrderedDict[tuple[str, str, tuple[str, ...], str, str], FileAnalysis] = (
+            OrderedDict()
+        )
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @staticmethod
+    def _key(
+        content: str,
+        filepath: str,
+        compile_args: list[str] | None,
+        repo_root: str | None,
+        build_info: dict[str, object] | None,
+    ) -> tuple[str, str, tuple[str, ...], str, str]:
+        digest = hashlib.sha1(
+            content.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        build_key = json.dumps(build_info or {}, sort_keys=True, default=str)
+        root_key = os.path.abspath(repo_root) if repo_root else ""
+        return (filepath, root_key, tuple(compile_args or ()), build_key, digest)
+
+    def get_or_analyze(
+        self,
+        content: str,
+        filepath: str,
+        clang_index: Index,
+        tmpdir: str,
+        *,
+        compile_args: list[str] | None,
+        repo_root: str | None,
+        build_info: dict[str, object] | None,
+        analyzer: Callable[..., FileAnalysis],
+    ) -> FileAnalysis:
+        if self.max_entries <= 0:
+            self.misses += 1
+            return analyzer(
+                content,
+                filepath,
+                clang_index,
+                tmpdir,
+                compile_args=compile_args,
+                repo_root=repo_root,
+                build_info=build_info,
+            )
+
+        key = self._key(content, filepath, compile_args, repo_root, build_info)
+        cached = self._items.get(key)
+        if cached is not None:
+            self._items.move_to_end(key)
+            self.hits += 1
+            return _clone_file_analysis(cached)
+
+        self.misses += 1
+        analysis = analyzer(
+            content,
+            filepath,
+            clang_index,
+            tmpdir,
+            compile_args=compile_args,
+            repo_root=repo_root,
+            build_info=build_info,
+        )
+        self._items[key] = _clone_file_analysis(analysis)
+        self._items.move_to_end(key)
+        while len(self._items) > self.max_entries:
+            self._items.popitem(last=False)
+            self.evictions += 1
+        return analysis
 
 
 @dataclass
@@ -664,10 +796,11 @@ def analyze_file_clang(
             source_path,
             args=args,
             unsaved_files=unsaved_files,
-            options=(
-                TranslationUnit.PARSE_INCOMPLETE
-                | TranslationUnit.PARSE_PRECOMPILED_PREAMBLE
-            ),
+            # Each commit record parses throwaway old/new buffers once. A
+            # precompiled preamble cache is useful for repeated reparses of the
+            # same TU, but here it pins native clang memory across hundreds of
+            # unrelated records and was the main per-process RSS amplifier.
+            options=TranslationUnit.PARSE_INCOMPLETE,
         )
     except Exception:
         return FileAnalysis(preamble='')
@@ -1756,6 +1889,8 @@ def process_record(
     dedup_store=None,
     dedup_tokenizer=None,
     chunk_claim_stats: dict[str, int] | None = None,
+    analysis_cache: AnalysisCache | None = None,
+    analyzer: Callable[..., FileAnalysis] | None = None,
 ) -> list[dict]:
     """Process a single commit record into enriched documents."""
     old_content = record.get('old_content', '')
@@ -1788,24 +1923,47 @@ def process_record(
     os.makedirs(old_dir, exist_ok=True)
     os.makedirs(new_dir, exist_ok=True)
 
-    old_analysis = analyze_file_clang(
-        old_content,
-        filepath,
-        clang_index,
-        old_dir,
-        compile_args=compile_args,
-        repo_root=repo_root,
-        build_info=build_info,
-    )
-    new_analysis = analyze_file_clang(
-        new_content,
-        filepath,
-        clang_index,
-        new_dir,
-        compile_args=compile_args,
-        repo_root=repo_root,
-        build_info=build_info,
-    )
+    active_analyzer = analyze_file_clang if analyzer is None else analyzer
+    if analysis_cache is not None:
+        old_analysis = analysis_cache.get_or_analyze(
+            old_content,
+            filepath,
+            clang_index,
+            old_dir,
+            compile_args=compile_args,
+            repo_root=repo_root,
+            build_info=build_info,
+            analyzer=active_analyzer,
+        )
+        new_analysis = analysis_cache.get_or_analyze(
+            new_content,
+            filepath,
+            clang_index,
+            new_dir,
+            compile_args=compile_args,
+            repo_root=repo_root,
+            build_info=build_info,
+            analyzer=active_analyzer,
+        )
+    else:
+        old_analysis = active_analyzer(
+            old_content,
+            filepath,
+            clang_index,
+            old_dir,
+            compile_args=compile_args,
+            repo_root=repo_root,
+            build_info=build_info,
+        )
+        new_analysis = active_analyzer(
+            new_content,
+            filepath,
+            clang_index,
+            new_dir,
+            compile_args=compile_args,
+            repo_root=repo_root,
+            build_info=build_info,
+        )
 
     documents: list[dict[str, object]] = []
 
@@ -1860,6 +2018,7 @@ def process_jsonl_file(
     dedup_tokenizer=None,
     dedup_near: bool = True,
     pr_lookup: "PRDiscussionLookup | None" = None,
+    analysis_cache_entries: int = 128,
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output.
 
@@ -1877,8 +2036,16 @@ def process_jsonl_file(
         'parse_errors': 0,
         'commit_chunks_claimed': 0,
         'commit_chunks_skipped': 0,
+        'analysis_cache_hits': 0,
+        'analysis_cache_misses': 0,
+        'analysis_cache_evictions': 0,
     }
     seen_hashes: set[str] = set()
+    analysis_cache = (
+        AnalysisCache(max_entries=analysis_cache_entries)
+        if analysis_cache_entries > 0
+        else None
+    )
 
     with open(input_path, 'r', errors='replace') as f:
         for line_num, line in enumerate(f, 1):
@@ -1910,6 +2077,7 @@ def process_jsonl_file(
                     dedup_store=dedup_store,
                     dedup_tokenizer=dedup_tokenizer,
                     chunk_claim_stats=stats,
+                    analysis_cache=analysis_cache,
                 )
             except Exception as e:
                 stats['parse_errors'] += 1
@@ -1940,7 +2108,9 @@ def process_jsonl_file(
                 output_file.write(json.dumps(doc, ensure_ascii=False) + '\n')
                 stats['documents_written'] += 1
 
-            if stats['records_read'] % 1000 == 0:
+            if stats['records_read'] % 100 == 0:
+                output_file.flush()
+                gc.collect()
                 check_memory_limit(memory_limit_gb, label="process_commits")
                 print(
                     f"  [{input_path}] {stats['records_read']} records, "
@@ -1948,6 +2118,10 @@ def process_jsonl_file(
                     file=sys.stderr,
                 )
 
+    if analysis_cache is not None:
+        stats['analysis_cache_hits'] = analysis_cache.hits
+        stats['analysis_cache_misses'] = analysis_cache.misses
+        stats['analysis_cache_evictions'] = analysis_cache.evictions
     return stats
 
 
@@ -2001,12 +2175,31 @@ def main() -> int:
         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).',
     )
     parser.add_argument(
+        '--analysis-cache-entries', type=int, default=128,
+        help='Bounded per-range LRU for expensive libclang file analyses. '
+             'Default 128; use 0 to disable.',
+    )
+    parser.add_argument(
         '--dedup-db', default=None,
         help='Path to the SHARED global dedup SQLite store. When set, whole commit '
              'DOCS are deduped by their tokenized hash (exact+near) GLOBALLY across '
              'repos AND function/class parts are claimed in the shared semantic '
              'chunk namespace across code+commit streams (fail-loud, no fallback). '
              'Requires --tokenizer-path. When absent, a per-file in-RAM md5 set.',
+    )
+    parser.add_argument(
+        '--dedup-stage-id', default=None,
+        help='Optional transactional dedup stage id. When set, commit-doc/chunk '
+             'claims are written only to staging tables; the parent conveyor '
+             'promotes after successful materialize/pack/append or discards on '
+             'failure.',
+    )
+    parser.add_argument(
+        '--dedup-stage-db', default=None,
+        help='Optional local SQLite stage DB under rwork. When set with '
+             '--dedup-stage-id, this process writes staging claims there while '
+             'reading --dedup-db read-only; the parent promotes after append '
+             'success.',
     )
     parser.add_argument(
         '--no-near-dedup', action='store_true',
@@ -2036,6 +2229,7 @@ def main() -> int:
     print(f"  max_tokens: {args.max_tokens}", file=sys.stderr)
     print(f"  format: {args.doc_format}", file=sys.stderr)
     print(f"  memory_limit_gb: {args.memory_limit_gb}", file=sys.stderr)
+    print(f"  analysis_cache_entries: {args.analysis_cache_entries}", file=sys.stderr)
     if args.repo_root:
         print(f"  repo_root: {args.repo_root}", file=sys.stderr)
     if args.repo_dir:
@@ -2066,15 +2260,36 @@ def main() -> int:
         if not args.tokenizer_path:
             print("ERROR: --dedup-db requires --tokenizer-path", file=sys.stderr)
             return 1
+        if args.dedup_stage_db and not args.dedup_stage_id:
+            print("ERROR: --dedup-stage-db requires --dedup-stage-id", file=sys.stderr)
+            return 1
         _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         if _repo_root not in sys.path:
             sys.path.insert(0, _repo_root)
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from dedup_store import DedupStore
-        dedup_store = DedupStore(args.dedup_db, near=dedup_near, commit_every=1000)
+        if args.dedup_stage_id:
+            DedupStore.discard_stage(
+                args.dedup_db,
+                args.dedup_stage_id,
+                stage_db_path=args.dedup_stage_db,
+            )
+        dedup_store = DedupStore(
+            args.dedup_db,
+            near=dedup_near,
+            commit_every=1000,
+            stage_id=args.dedup_stage_id,
+            stage_db_path=args.dedup_stage_db,
+        )
         dedup_tokenizer = _load_dedup_tokenizer(args.tokenizer_path)
-        print(f"  dedup: GLOBAL commit-doc store at {args.dedup_db} "
-              f"(exact{'+near' if dedup_near else ''}, tokenized hash)", file=sys.stderr)
+        print(
+            f"  dedup: {'STAGED' if args.dedup_stage_id else 'GLOBAL'} "
+            f"commit-doc store at {args.dedup_db} "
+            f"(exact{'+near' if dedup_near else ''}, tokenized hash"
+            f"{', stage_id=' + args.dedup_stage_id if args.dedup_stage_id else ''}"
+            f"{', stage_db=' + args.dedup_stage_db if args.dedup_stage_db else ''})",
+            file=sys.stderr,
+        )
     else:
         print("  dedup: per-file in-RAM md5 set (no --dedup-db)", file=sys.stderr)
 
@@ -2097,6 +2312,9 @@ def main() -> int:
         'parse_errors': 0,
         'commit_chunks_claimed': 0,
         'commit_chunks_skipped': 0,
+        'analysis_cache_hits': 0,
+        'analysis_cache_misses': 0,
+        'analysis_cache_evictions': 0,
     }
 
     with tempfile.TemporaryDirectory(prefix='clang_commits_') as tmpdir:
@@ -2126,6 +2344,7 @@ def main() -> int:
                         dedup_tokenizer=dedup_tokenizer,
                         dedup_near=dedup_near,
                         pr_lookup=pr_lookup,
+                        analysis_cache_entries=args.analysis_cache_entries,
                     )
 
                     for k in total_stats:

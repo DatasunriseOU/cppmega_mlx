@@ -9,52 +9,62 @@ from scripts import download_verified_sidecar_from_nebius_s3 as download
 from scripts import upload_verified_sidecar_to_nebius_s3 as upload
 
 
-def _remotes_from_upload(*, code_commits_only: bool = False) -> set[str]:
+def _remotes_from_upload(
+    *,
+    include_standalone_pr: bool = False,
+    code_commits_only: bool = False,
+) -> set[str]:
     return {
         remote
         for remote, _local in upload._selection_items(
-            code_commits_only=code_commits_only
+            include_standalone_pr=include_standalone_pr,
+            code_commits_only=code_commits_only,
         )
     }
 
 
-def _remotes_from_download(*, code_commits_only: bool = False) -> set[str]:
+def _remotes_from_download(
+    *,
+    include_standalone_pr: bool = False,
+    code_commits_only: bool = False,
+) -> set[str]:
     manifest = download._default_manifest(
         "bucket",
         "prefix",
         "https://storage.eu-north1.nebius.cloud",
+        include_standalone_pr=include_standalone_pr,
         code_commits_only=code_commits_only,
     )
     return {item["remote"] for item in manifest["selections"]}
 
 
-def test_upload_default_includes_every_final_audit_valid_bucket() -> None:
+def test_upload_default_excludes_standalone_pr_diagnostics() -> None:
     remotes = _remotes_from_upload()
 
     assert "parquet/code/1024" in remotes
     assert "parquet/code/8192" in remotes
     assert "parquet/commits/1024" in remotes
     assert "parquet/commits/16384" in remotes
-    assert "parquet/pr/1024" in remotes
-    assert "parquet/pr/16384" in remotes
+    assert not any(remote.startswith("parquet/pr/") for remote in remotes)
     assert "audits/sidecar_audit_all_final_poststop_valid" in remotes
 
 
-def test_upload_code_commits_only_is_explicit_opt_out_from_pr() -> None:
-    remotes = _remotes_from_upload(code_commits_only=True)
+def test_upload_standalone_pr_is_explicit_opt_in() -> None:
+    remotes = _remotes_from_upload(include_standalone_pr=True)
 
     assert "parquet/code/8192" in remotes
     assert "parquet/commits/16384" in remotes
-    assert not any(remote.startswith("parquet/pr/") for remote in remotes)
+    assert "parquet/pr/1024" in remotes
+    assert "parquet/pr/16384" in remotes
 
 
-def test_download_default_manifest_matches_upload_all_valid_policy() -> None:
+def test_download_default_manifest_matches_upload_training_policy() -> None:
     default_remotes = _remotes_from_download()
-    code_commits_only_remotes = _remotes_from_download(code_commits_only=True)
+    standalone_remotes = _remotes_from_download(include_standalone_pr=True)
 
-    assert "parquet/pr/1024" in default_remotes
-    assert "parquet/pr/16384" in default_remotes
-    assert not any(remote.startswith("parquet/pr/") for remote in code_commits_only_remotes)
+    assert not any(remote.startswith("parquet/pr/") for remote in default_remotes)
+    assert "parquet/pr/1024" in standalone_remotes
+    assert "parquet/pr/16384" in standalone_remotes
 
 
 # --- verified token-total accounting (real receipt JSON, no mocks) -----------
@@ -102,6 +112,7 @@ def _build_receipt(
         bf, br = bad.get(key, (0, 0))
         by_kind_bucket[key] = {
             "valid_tokens": tokens,
+            "files": 0,
             "bad_files": bf,
             "bad_rows": br,
         }
@@ -124,23 +135,21 @@ def test_token_total_is_profile_aware_subset(tmp_path: Path) -> None:
     )
     receipts = (receipt,)
 
-    all_sel = upload._selection_items(code_commits_only=False)
-    cc_sel = upload._selection_items(code_commits_only=True)
+    default_sel = upload._selection_items()
+    standalone_sel = upload._selection_items(include_standalone_pr=True)
 
-    all_total = upload._load_verified_token_total(receipts, all_sel)
-    cc_total = upload._load_verified_token_total(receipts, cc_sel)
+    default_total = upload._load_verified_token_total(receipts, default_sel)
+    standalone_total = upload._load_verified_token_total(receipts, standalone_sel)
 
     code_commits_sum = sum(
         v for k, v in _BUCKET_VALID_TOKENS.items() if not k.startswith("pr/")
     )
     pr_sum = sum(v for k, v in _BUCKET_VALID_TOKENS.items() if k.startswith("pr/"))
 
-    # all-valid sums every parquet bucket; the subset must drop the PR tokens
-    # entirely instead of reusing the full all-valid total.
-    assert all_total == sum(_BUCKET_VALID_TOKENS.values())
-    assert cc_total == code_commits_sum
-    assert all_total - cc_total == pr_sum
-    assert cc_total < all_total
+    assert default_total == code_commits_sum
+    assert standalone_total == sum(_BUCKET_VALID_TOKENS.values())
+    assert standalone_total - default_total == pr_sum
+    assert default_total < standalone_total
 
 
 def test_token_total_raises_when_selected_bucket_uncovered(tmp_path: Path) -> None:
@@ -151,7 +160,7 @@ def test_token_total_raises_when_selected_bucket_uncovered(tmp_path: Path) -> No
         valid_tokens=_BUCKET_VALID_TOKENS,
         omit={"commits/16384"},
     )
-    cc_sel = upload._selection_items(code_commits_only=True)
+    cc_sel = upload._selection_items()
 
     with pytest.raises(SystemExit) as exc:
         upload._load_verified_token_total((receipt,), cc_sel)
@@ -164,7 +173,7 @@ def test_token_total_raises_when_selected_bucket_not_green(tmp_path: Path) -> No
         valid_tokens=_BUCKET_VALID_TOKENS,
         bad={"code/4096": (0, 3)},
     )
-    cc_sel = upload._selection_items(code_commits_only=True)
+    cc_sel = upload._selection_items()
 
     with pytest.raises(SystemExit) as exc:
         upload._load_verified_token_total((receipt,), cc_sel)
@@ -172,8 +181,9 @@ def test_token_total_raises_when_selected_bucket_not_green(tmp_path: Path) -> No
 
 
 def test_token_total_gate_is_scoped_to_selected_buckets(tmp_path: Path) -> None:
-    # A non-green PR bucket must not block a code+commits-only upload, but must
-    # block the all-valid upload that includes it.
+    # A non-green PR bucket must not block the default training upload, because
+    # standalone PR parquet is diagnostic-only. It must block the explicit
+    # standalone PR profile that includes it.
     receipt = _build_receipt(
         tmp_path / "sidecar_parquet_audit.json",
         valid_tokens=_BUCKET_VALID_TOKENS,
@@ -181,13 +191,13 @@ def test_token_total_gate_is_scoped_to_selected_buckets(tmp_path: Path) -> None:
     )
     receipts = (receipt,)
 
-    cc_sel = upload._selection_items(code_commits_only=True)
+    cc_sel = upload._selection_items()
     code_commits_sum = sum(
         v for k, v in _BUCKET_VALID_TOKENS.items() if not k.startswith("pr/")
     )
     assert upload._load_verified_token_total(receipts, cc_sel) == code_commits_sum
 
-    all_sel = upload._selection_items(code_commits_only=False)
+    all_sel = upload._selection_items(include_standalone_pr=True)
     with pytest.raises(SystemExit) as exc:
         upload._load_verified_token_total(receipts, all_sel)
     assert "pr/8192" in str(exc.value)
@@ -205,7 +215,7 @@ def test_token_total_raises_on_ambiguous_multi_receipt_coverage(tmp_path: Path) 
         tmp_path / "b" / "sidecar_parquet_audit.json",
         valid_tokens=_BUCKET_VALID_TOKENS,
     )
-    cc_sel = upload._selection_items(code_commits_only=True)
+    cc_sel = upload._selection_items()
     with pytest.raises(SystemExit) as exc:
         upload._load_verified_token_total((r1, r2), cc_sel)
     assert "multiple receipts" in str(exc.value)
@@ -219,20 +229,42 @@ def test_upload_download_remote_sets_match_for_both_profiles() -> None:
     silently diverge.
     """
     assert _remotes_from_upload() == _remotes_from_download()
-    assert _remotes_from_upload(code_commits_only=True) == _remotes_from_download(
-        code_commits_only=True
+    assert _remotes_from_upload(
+        include_standalone_pr=True
+    ) == _remotes_from_download(
+        include_standalone_pr=True
     )
-    # The only difference between the two profiles is the standalone PR buckets.
-    only_in_all_valid = _remotes_from_upload() - _remotes_from_upload(
-        code_commits_only=True
-    )
-    assert only_in_all_valid == {
+    only_in_standalone_profile = _remotes_from_upload(
+        include_standalone_pr=True
+    ) - _remotes_from_upload()
+    assert only_in_standalone_profile == {
         "parquet/pr/1024",
         "parquet/pr/2048",
         "parquet/pr/4096",
         "parquet/pr/8192",
         "parquet/pr/16384",
     }
+
+
+def test_legacy_code_commits_only_alias_matches_default_training_profile() -> None:
+    assert _remotes_from_upload(code_commits_only=True) == _remotes_from_upload()
+    assert _remotes_from_download(code_commits_only=True) == _remotes_from_download()
+
+
+def test_standalone_pr_flag_conflicts_with_legacy_code_commits_only() -> None:
+    with pytest.raises(SystemExit):
+        upload._selection_items(
+            include_standalone_pr=True,
+            code_commits_only=True,
+        )
+    with pytest.raises(SystemExit):
+        download._default_manifest(
+            "bucket",
+            "prefix",
+            "https://storage.eu-north1.nebius.cloud",
+            include_standalone_pr=True,
+            code_commits_only=True,
+        )
 
 
 # --- _s3_env(): credential RAISE + NEBIUS_* -> AWS_* mapping -----------------
@@ -344,7 +376,7 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
     assert "aws s3 sync" in out
     # URI template: s3://{bucket}/{prefix}/{remote}/
     assert "s3://mybucket/myprefix/parquet/code/1024/" in out
-    assert "s3://mybucket/myprefix/parquet/pr/16384/" in out
+    assert "parquet/pr/" not in out
     assert "s3://mybucket/myprefix/audits/sidecar_audit_all_final_poststop_valid/" in out
     # The manifest itself is cp'd to s3://.../manifest.json.
     assert "s3://mybucket/myprefix/manifest.json" in out
@@ -352,17 +384,46 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
     written = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert written["bucket"] == "mybucket"
     assert written["prefix"] == "myprefix"
-    assert written["profile"] == "all_valid"
-    assert written["standalone_pr_included"] is True
-    assert written["verified_valid_tokens"] == sum(_BUCKET_VALID_TOKENS.values())
+    assert written["profile"] == "code_commits_integrated_pr"
+    assert written["standalone_pr_included"] is False
+    assert written["verified_valid_tokens"] == sum(
+        v for k, v in _BUCKET_VALID_TOKENS.items() if not k.startswith("pr/")
+    )
     assert {s["remote"] for s in written["selections"]} == _remotes_from_upload()
+    assert any("outputs/reindexed_pr" in item for item in written["excluded"])
 
 
-def test_upload_main_dry_run_raises_on_non_green_selected_bucket(
+def test_upload_main_dry_run_does_not_gate_default_on_standalone_pr_bucket(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     for _remote, local in upload.ALL_VALID_SELECTIONS:
+        local.mkdir(parents=True, exist_ok=True)
+    _build_receipt(
+        upload._audit_receipts()[0],
+        valid_tokens=_BUCKET_VALID_TOKENS,
+        bad={"pr/8192": (1, 0)},
+    )
+
+    rc = upload.main(
+        [
+            "--bucket",
+            "mybucket",
+            "--dry-run",
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--env-file",
+            str(tmp_path / "nonexistent.env"),
+        ]
+    )
+    assert rc == 0
+
+
+def test_upload_main_dry_run_raises_on_non_green_explicit_standalone_pr_bucket(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for _remote, local in upload.CODE_COMMIT_SELECTIONS + upload.STANDALONE_PR_SELECTIONS:
         local.mkdir(parents=True, exist_ok=True)
     _build_receipt(
         upload._audit_receipts()[0],
@@ -376,6 +437,7 @@ def test_upload_main_dry_run_raises_on_non_green_selected_bucket(
                 "--bucket",
                 "mybucket",
                 "--dry-run",
+                "--include-standalone-pr",
                 "--manifest",
                 str(tmp_path / "manifest.json"),
                 "--env-file",
@@ -408,8 +470,91 @@ def test_download_main_dry_run_default_manifest_prints_source_uris(
     out = capsys.readouterr().out
     assert "aws s3 sync" in out
     assert "s3://mybucket/myprefix/parquet/code/1024/" in out
-    assert "s3://mybucket/myprefix/parquet/pr/16384/" in out
+    assert "parquet/pr/" not in out
     assert "s3://mybucket/myprefix/audits/sidecar_audit_all_final_poststop_valid/" in out
+
+
+def test_download_verify_scopes_token_total_and_green_gate_to_selected_buckets(
+    tmp_path: Path,
+) -> None:
+    receipt_dir = tmp_path / "dl" / "outputs" / "sidecar_audit_all_final_poststop_valid"
+    receipt_dir.mkdir(parents=True)
+    _build_receipt(
+        receipt_dir / "sidecar_parquet_audit.json",
+        valid_tokens=_BUCKET_VALID_TOKENS,
+        bad={"pr/8192": (1, 0)},
+    )
+    code_commits_sum = sum(
+        v for k, v in _BUCKET_VALID_TOKENS.items() if not k.startswith("pr/")
+    )
+    manifest = download._default_manifest(
+        "bucket",
+        "prefix",
+        "https://storage.eu-north1.nebius.cloud",
+    )
+    manifest["verified_valid_tokens"] = code_commits_sum
+
+    result = download._verify_downloaded_set(
+        dest=tmp_path / "dl",
+        manifest=manifest,
+        require_token_total=True,
+    )
+
+    assert result["verified_valid_tokens"] == code_commits_sum
+    assert result["bad_files"] == 0
+    assert result["bad_rows"] == 0
+
+
+def test_download_verify_rejects_non_green_explicit_standalone_pr_bucket(
+    tmp_path: Path,
+) -> None:
+    receipt_dir = tmp_path / "dl" / "outputs" / "sidecar_audit_all_final_poststop_valid"
+    receipt_dir.mkdir(parents=True)
+    _build_receipt(
+        receipt_dir / "sidecar_parquet_audit.json",
+        valid_tokens=_BUCKET_VALID_TOKENS,
+        bad={"pr/8192": (1, 0)},
+    )
+    manifest = download._default_manifest(
+        "bucket",
+        "prefix",
+        "https://storage.eu-north1.nebius.cloud",
+        include_standalone_pr=True,
+    )
+    manifest["verified_valid_tokens"] = sum(_BUCKET_VALID_TOKENS.values())
+
+    with pytest.raises(SystemExit) as exc:
+        download._verify_downloaded_set(
+            dest=tmp_path / "dl",
+            manifest=manifest,
+            require_token_total=True,
+        )
+    assert "pr/8192" in str(exc.value)
+
+
+def test_download_main_dry_run_explicit_standalone_pr_prints_pr_uris(
+    tmp_path: Path, capsys
+) -> None:
+    dest = tmp_path / "dl"
+    rc = download.main(
+        [
+            "--bucket",
+            "mybucket",
+            "--prefix",
+            "myprefix",
+            "--dest",
+            str(dest),
+            "--dry-run",
+            "--use-default-manifest",
+            "--include-standalone-pr",
+            "--env-file",
+            str(tmp_path / "nonexistent.env"),
+        ]
+    )
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "s3://mybucket/myprefix/parquet/pr/16384/" in out
 
 
 def test_download_main_dry_run_code_commits_only_excludes_pr_uris(
@@ -463,5 +608,7 @@ def test_download_main_dry_run_copies_manifest_uri(
     out = capsys.readouterr().out
     assert "aws s3 cp" in out
     assert "s3://mybucket/myprefix/manifest.json" in out
-    # Falls back to the default manifest under --dry-run and still syncs buckets.
-    assert "s3://mybucket/myprefix/parquet/pr/16384/" in out
+    # Falls back to the default training manifest under --dry-run and still
+    # syncs code/commit buckets, but not standalone PR diagnostics.
+    assert "s3://mybucket/myprefix/parquet/code/1024/" in out
+    assert "parquet/pr/" not in out

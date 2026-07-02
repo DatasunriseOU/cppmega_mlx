@@ -1,0 +1,38 @@
+CMD /Volumes/external/sources/nanochat/.venv/bin/python /Volumes/external/sources/cppmega/scripts/data_prep_parquet_to_megatron.py --input-dir /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/parquet/2048 --output-prefix /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq2048_graph_train --split all --token-column input_ids --dtype uint16
+WARNING: megatron import failed (No module named 'megatron'), using fallback writer
+found 303 all shards
+  read 10/303 shards, 1,235 docs, 2,529,280 tokens
+  read 20/303 shards, 9,506 docs, 19,468,288 tokens
+  read 30/303 shards, 12,786 docs, 26,185,728 tokens
+  read 40/303 shards, 13,584 docs, 27,820,032 tokens
+  read 50/303 shards, 14,494 docs, 29,683,712 tokens
+  read 60/303 shards, 15,374 docs, 31,485,952 tokens
+  read 70/303 shards, 16,873 docs, 34,555,904 tokens
+  read 80/303 shards, 18,343 docs, 37,566,464 tokens
+  read 90/303 shards, 19,134 docs, 39,186,432 tokens
+  read 100/303 shards, 20,116 docs, 41,197,568 tokens
+  read 110/303 shards, 21,079 docs, 43,169,792 tokens
+  read 120/303 shards, 21,701 docs, 44,443,648 tokens
+  read 130/303 shards, 22,456 docs, 45,989,888 tokens
+  read 140/303 shards, 23,713 docs, 48,564,224 tokens
+  read 150/303 shards, 25,005 docs, 51,210,240 tokens
+  read 160/303 shards, 26,242 docs, 53,743,616 tokens
+  read 170/303 shards, 27,549 docs, 56,420,352 tokens
+  read 180/303 shards, 28,754 docs, 58,888,192 tokens
+  read 190/303 shards, 29,982 docs, 61,403,136 tokens
+  read 200/303 shards, 31,139 docs, 63,772,672 tokens
+  read 210/303 shards, 31,847 docs, 65,222,656 tokens
+  read 220/303 shards, 32,526 docs, 66,613,248 tokens
+  read 230/303 shards, 33,162 docs, 67,915,776 tokens
+  read 240/303 shards, 34,056 docs, 69,746,688 tokens
+  read 250/303 shards, 34,992 docs, 71,663,616 tokens
+  read 260/303 shards, 35,927 docs, 73,578,496 tokens
+  read 270/303 shards, 37,051 docs, 75,880,448 tokens
+  read 280/303 shards, 38,191 docs, 78,215,168 tokens
+  read 290/303 shards, 39,236 docs, 80,355,328 tokens
+  read 300/303 shards, 40,155 docs, 82,237,440 tokens
+  read 303/303 shards, 40,372 docs, 82,681,856 tokens
+total: 40372 documents
+
+all: 40372 docs, 82,681,856 tokens, 0.15 GiB in 216.1s
+output: /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq2048_graph_train.bin + /Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq2048_graph_train.idx

@@ -1,0 +1,2 @@
+outputs/**/*.bin filter=lfs diff=lfs merge=lfs -text
+outputs/conveyor/**/*.jsonl filter=lfs diff=lfs merge=lfs -text

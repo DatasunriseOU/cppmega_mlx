@@ -1,0 +1,3433 @@
+{
+  "created_at": "2026-06-28T18:45:12+0200",
+  "profile": "h200_100step_seq4096_code_commits_graph_with_8192_commit_filler",
+  "seq": 4096,
+  "standalone_pr_included": false,
+  "target_tokens_bs256_100": 104857600,
+  "target_valid_tokens_with_margin": 115343360,
+  "selected_valid_tokens": 115352749,
+  "selected_files": [
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/paraview.parquet",
+      "name": "code4096_paraview.parquet",
+      "valid_tokens": 5683689
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/openjdk.parquet",
+      "name": "code4096_openjdk.parquet",
+      "valid_tokens": 1817709
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/systemd.parquet",
+      "name": "code4096_systemd.parquet",
+      "valid_tokens": 1643018
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/php-src.parquet",
+      "name": "code4096_php-src.parquet",
+      "valid_tokens": 1184868
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/qmk-firmware.parquet",
+      "name": "code4096_qmk-firmware.parquet",
+      "valid_tokens": 1123114
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/radare2.parquet",
+      "name": "code4096_radare2.parquet",
+      "valid_tokens": 1047564
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/suricata.parquet",
+      "name": "code4096_suricata.parquet",
+      "valid_tokens": 376383
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/folly.parquet",
+      "name": "code4096_folly.parquet",
+      "valid_tokens": 308393
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/aosp-system-core.parquet",
+      "name": "code4096_aosp-system-core.parquet",
+      "valid_tokens": 287669
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/xiaomi-mace.parquet",
+      "name": "code4096_xiaomi-mace.parquet",
+      "valid_tokens": 243777
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/openfoam.parquet",
+      "name": "code4096_openfoam.parquet",
+      "valid_tokens": 204394
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/hpx.parquet",
+      "name": "code4096_hpx.parquet",
+      "valid_tokens": 195585
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/WindowsAppSDK.parquet",
+      "name": "code4096_WindowsAppSDK.parquet",
+      "valid_tokens": 176747
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/aria2.parquet",
+      "name": "code4096_aria2.parquet",
+      "valid_tokens": 140914
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/faiss.parquet",
+      "name": "code4096_faiss.parquet",
+      "valid_tokens": 127144
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/luajit.parquet",
+      "name": "code4096_luajit.parquet",
+      "valid_tokens": 118270
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/lvgl.parquet",
+      "name": "code4096_lvgl.parquet",
+      "valid_tokens": 118249
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/flac.parquet",
+      "name": "code4096_flac.parquet",
+      "valid_tokens": 111564
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/s2n-tls.parquet",
+      "name": "code4096_s2n-tls.parquet",
+      "valid_tokens": 108281
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/transformer-engine.parquet",
+      "name": "code4096_transformer-engine.parquet",
+      "valid_tokens": 94726
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/botan.parquet",
+      "name": "code4096_botan.parquet",
+      "valid_tokens": 90388
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/libjpeg-turbo.parquet",
+      "name": "code4096_libjpeg-turbo.parquet",
+      "valid_tokens": 88027
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/qnnpack.parquet",
+      "name": "code4096_qnnpack.parquet",
+      "valid_tokens": 79883
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/rocdbgapi.parquet",
+      "name": "code4096_rocdbgapi.parquet",
+      "valid_tokens": 53349
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/tensorpipe.parquet",
+      "name": "code4096_tensorpipe.parquet",
+      "valid_tokens": 33388
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/fmt.parquet",
+      "name": "code4096_fmt.parquet",
+      "valid_tokens": 30476
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/glfw.parquet",
+      "name": "code4096_glfw.parquet",
+      "valid_tokens": 16370
+    },
+    {
+      "kind": "code4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed/4096/Windows-Driver-Frameworks.parquet",
+      "name": "code4096_Windows-Driver-Frameworks.parquet",
+      "valid_tokens": 10536
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r1500.parquet",
+      "name": "commits4096_s2n-tls_r1500.parquet",
+      "valid_tokens": 683630
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r500.parquet",
+      "name": "commits4096_s2n-tls_r500.parquet",
+      "valid_tokens": 657276
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r1000.parquet",
+      "name": "commits4096_s2n-tls_r1000.parquet",
+      "valid_tokens": 563442
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r2000.parquet",
+      "name": "commits4096_s2n-tls_r2000.parquet",
+      "valid_tokens": 510663
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/WindowsAppSDK_r0.parquet",
+      "name": "commits4096_WindowsAppSDK_r0.parquet",
+      "valid_tokens": 468269
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r0.parquet",
+      "name": "commits4096_s2n-tls_r0.parquet",
+      "valid_tokens": 440672
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r4500.parquet",
+      "name": "commits4096_fmt_r4500.parquet",
+      "valid_tokens": 378702
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/rocdbgapi_r0.parquet",
+      "name": "commits4096_rocdbgapi_r0.parquet",
+      "valid_tokens": 349247
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r2500.parquet",
+      "name": "commits4096_s2n-tls_r2500.parquet",
+      "valid_tokens": 345659
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r500.parquet",
+      "name": "commits4096_fmt_r500.parquet",
+      "valid_tokens": 341501
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r1000.parquet",
+      "name": "commits4096_glfw_r1000.parquet",
+      "valid_tokens": 315947
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/rocdbgapi_r500.parquet",
+      "name": "commits4096_rocdbgapi_r500.parquet",
+      "valid_tokens": 313399
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r500.parquet",
+      "name": "commits4096_glfw_r500.parquet",
+      "valid_tokens": 302989
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r12000.parquet",
+      "name": "commits4096_php-src_r12000.parquet",
+      "valid_tokens": 300568
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r2500.parquet",
+      "name": "commits4096_fmt_r2500.parquet",
+      "valid_tokens": 297686
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r7500.parquet",
+      "name": "commits4096_php-src_r7500.parquet",
+      "valid_tokens": 294906
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r1000.parquet",
+      "name": "commits4096_php-src_r1000.parquet",
+      "valid_tokens": 292270
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r0.parquet",
+      "name": "commits4096_hpx_r0.parquet",
+      "valid_tokens": 287689
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r2500.parquet",
+      "name": "commits4096_hpx_r2500.parquet",
+      "valid_tokens": 286639
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/xiaomi-mace_r500.parquet",
+      "name": "commits4096_xiaomi-mace_r500.parquet",
+      "valid_tokens": 277668
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r8500.parquet",
+      "name": "commits4096_php-src_r8500.parquet",
+      "valid_tokens": 274463
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r10500.parquet",
+      "name": "commits4096_php-src_r10500.parquet",
+      "valid_tokens": 273284
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r2000.parquet",
+      "name": "commits4096_fmt_r2000.parquet",
+      "valid_tokens": 269705
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r25500.parquet",
+      "name": "commits4096_php-src_r25500.parquet",
+      "valid_tokens": 267838
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r2000.parquet",
+      "name": "commits4096_php-src_r2000.parquet",
+      "valid_tokens": 267651
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r3500.parquet",
+      "name": "commits4096_fmt_r3500.parquet",
+      "valid_tokens": 265465
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r0.parquet",
+      "name": "commits4096_php-src_r0.parquet",
+      "valid_tokens": 265283
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r1500.parquet",
+      "name": "commits4096_glfw_r1500.parquet",
+      "valid_tokens": 265040
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r0.parquet",
+      "name": "commits4096_glfw_r0.parquet",
+      "valid_tokens": 264371
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r8000.parquet",
+      "name": "commits4096_php-src_r8000.parquet",
+      "valid_tokens": 263767
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r0.parquet",
+      "name": "commits4096_fmt_r0.parquet",
+      "valid_tokens": 261457
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r2500.parquet",
+      "name": "commits4096_php-src_r2500.parquet",
+      "valid_tokens": 261244
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r36000.parquet",
+      "name": "commits4096_php-src_r36000.parquet",
+      "valid_tokens": 260708
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r33500.parquet",
+      "name": "commits4096_php-src_r33500.parquet",
+      "valid_tokens": 258690
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r30000.parquet",
+      "name": "commits4096_php-src_r30000.parquet",
+      "valid_tokens": 256450
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r5000.parquet",
+      "name": "commits4096_php-src_r5000.parquet",
+      "valid_tokens": 252223
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/xiaomi-mace_r0.parquet",
+      "name": "commits4096_xiaomi-mace_r0.parquet",
+      "valid_tokens": 251961
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r3500.parquet",
+      "name": "commits4096_php-src_r3500.parquet",
+      "valid_tokens": 249835
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r8000.parquet",
+      "name": "commits4096_hpx_r8000.parquet",
+      "valid_tokens": 247224
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r2000.parquet",
+      "name": "commits4096_glfw_r2000.parquet",
+      "valid_tokens": 246661
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r1000.parquet",
+      "name": "commits4096_botan_r1000.parquet",
+      "valid_tokens": 243514
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r3000.parquet",
+      "name": "commits4096_fmt_r3000.parquet",
+      "valid_tokens": 241277
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r27500.parquet",
+      "name": "commits4096_php-src_r27500.parquet",
+      "valid_tokens": 240990
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r15500.parquet",
+      "name": "commits4096_php-src_r15500.parquet",
+      "valid_tokens": 238971
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r72000.parquet",
+      "name": "commits4096_php-src_r72000.parquet",
+      "valid_tokens": 237553
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r4000.parquet",
+      "name": "commits4096_fmt_r4000.parquet",
+      "valid_tokens": 237103
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r1000.parquet",
+      "name": "commits4096_fmt_r1000.parquet",
+      "valid_tokens": 236389
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r500.parquet",
+      "name": "commits4096_php-src_r500.parquet",
+      "valid_tokens": 234563
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r32500.parquet",
+      "name": "commits4096_php-src_r32500.parquet",
+      "valid_tokens": 233543
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r9000.parquet",
+      "name": "commits4096_php-src_r9000.parquet",
+      "valid_tokens": 230992
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r3000.parquet",
+      "name": "commits4096_php-src_r3000.parquet",
+      "valid_tokens": 229450
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r33000.parquet",
+      "name": "commits4096_php-src_r33000.parquet",
+      "valid_tokens": 229274
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r4000.parquet",
+      "name": "commits4096_hpx_r4000.parquet",
+      "valid_tokens": 229230
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r3000.parquet",
+      "name": "commits4096_hpx_r3000.parquet",
+      "valid_tokens": 229106
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r11500.parquet",
+      "name": "commits4096_php-src_r11500.parquet",
+      "valid_tokens": 227711
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r3000.parquet",
+      "name": "commits4096_s2n-tls_r3000.parquet",
+      "valid_tokens": 227060
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r13000.parquet",
+      "name": "commits4096_php-src_r13000.parquet",
+      "valid_tokens": 224375
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r3500.parquet",
+      "name": "commits4096_hpx_r3500.parquet",
+      "valid_tokens": 224125
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r18500.parquet",
+      "name": "commits4096_php-src_r18500.parquet",
+      "valid_tokens": 221554
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r1500.parquet",
+      "name": "commits4096_fmt_r1500.parquet",
+      "valid_tokens": 220495
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r2000.parquet",
+      "name": "commits4096_hpx_r2000.parquet",
+      "valid_tokens": 220254
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r10000.parquet",
+      "name": "commits4096_php-src_r10000.parquet",
+      "valid_tokens": 218279
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r7000.parquet",
+      "name": "commits4096_php-src_r7000.parquet",
+      "valid_tokens": 217662
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r4500.parquet",
+      "name": "commits4096_php-src_r4500.parquet",
+      "valid_tokens": 217001
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r1000.parquet",
+      "name": "commits4096_openfoam_r1000.parquet",
+      "valid_tokens": 216619
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r38500.parquet",
+      "name": "commits4096_php-src_r38500.parquet",
+      "valid_tokens": 216216
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r30500.parquet",
+      "name": "commits4096_php-src_r30500.parquet",
+      "valid_tokens": 215646
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r6000.parquet",
+      "name": "commits4096_hpx_r6000.parquet",
+      "valid_tokens": 215425
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r24500.parquet",
+      "name": "commits4096_php-src_r24500.parquet",
+      "valid_tokens": 214380
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r11000.parquet",
+      "name": "commits4096_php-src_r11000.parquet",
+      "valid_tokens": 212598
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r17000.parquet",
+      "name": "commits4096_php-src_r17000.parquet",
+      "valid_tokens": 211639
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r35500.parquet",
+      "name": "commits4096_php-src_r35500.parquet",
+      "valid_tokens": 211266
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r34000.parquet",
+      "name": "commits4096_php-src_r34000.parquet",
+      "valid_tokens": 209555
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r4500.parquet",
+      "name": "commits4096_botan_r4500.parquet",
+      "valid_tokens": 209497
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r3000.parquet",
+      "name": "commits4096_glfw_r3000.parquet",
+      "valid_tokens": 208984
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r17500.parquet",
+      "name": "commits4096_php-src_r17500.parquet",
+      "valid_tokens": 208880
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r16000.parquet",
+      "name": "commits4096_php-src_r16000.parquet",
+      "valid_tokens": 208755
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r6500.parquet",
+      "name": "commits4096_php-src_r6500.parquet",
+      "valid_tokens": 208271
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r1500.parquet",
+      "name": "commits4096_php-src_r1500.parquet",
+      "valid_tokens": 207439
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r4500.parquet",
+      "name": "commits4096_hpx_r4500.parquet",
+      "valid_tokens": 205304
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r19000.parquet",
+      "name": "commits4096_php-src_r19000.parquet",
+      "valid_tokens": 202509
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r38000.parquet",
+      "name": "commits4096_php-src_r38000.parquet",
+      "valid_tokens": 201140
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r26500.parquet",
+      "name": "commits4096_php-src_r26500.parquet",
+      "valid_tokens": 200067
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/xiaomi-mace_r1000.parquet",
+      "name": "commits4096_xiaomi-mace_r1000.parquet",
+      "valid_tokens": 199658
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r27000.parquet",
+      "name": "commits4096_php-src_r27000.parquet",
+      "valid_tokens": 198272
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r19500.parquet",
+      "name": "commits4096_php-src_r19500.parquet",
+      "valid_tokens": 197333
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r13500.parquet",
+      "name": "commits4096_php-src_r13500.parquet",
+      "valid_tokens": 196080
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r75500.parquet",
+      "name": "commits4096_php-src_r75500.parquet",
+      "valid_tokens": 195922
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r3500.parquet",
+      "name": "commits4096_s2n-tls_r3500.parquet",
+      "valid_tokens": 195323
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r37500.parquet",
+      "name": "commits4096_php-src_r37500.parquet",
+      "valid_tokens": 195231
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r3500.parquet",
+      "name": "commits4096_glfw_r3500.parquet",
+      "valid_tokens": 194328
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r21000.parquet",
+      "name": "commits4096_php-src_r21000.parquet",
+      "valid_tokens": 194066
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r14500.parquet",
+      "name": "commits4096_php-src_r14500.parquet",
+      "valid_tokens": 193925
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r5000.parquet",
+      "name": "commits4096_hpx_r5000.parquet",
+      "valid_tokens": 193085
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r14500.parquet",
+      "name": "commits4096_hpx_r14500.parquet",
+      "valid_tokens": 192565
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r35000.parquet",
+      "name": "commits4096_php-src_r35000.parquet",
+      "valid_tokens": 192183
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r10000.parquet",
+      "name": "commits4096_hpx_r10000.parquet",
+      "valid_tokens": 191470
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r5000.parquet",
+      "name": "commits4096_botan_r5000.parquet",
+      "valid_tokens": 190671
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r64500.parquet",
+      "name": "commits4096_php-src_r64500.parquet",
+      "valid_tokens": 190321
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r1500.parquet",
+      "name": "commits4096_hpx_r1500.parquet",
+      "valid_tokens": 189603
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r56000.parquet",
+      "name": "commits4096_php-src_r56000.parquet",
+      "valid_tokens": 189284
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r13000.parquet",
+      "name": "commits4096_hpx_r13000.parquet",
+      "valid_tokens": 188229
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r74500.parquet",
+      "name": "commits4096_php-src_r74500.parquet",
+      "valid_tokens": 187955
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r28000.parquet",
+      "name": "commits4096_php-src_r28000.parquet",
+      "valid_tokens": 187527
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r3500.parquet",
+      "name": "commits4096_openfoam_r3500.parquet",
+      "valid_tokens": 184985
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r20000.parquet",
+      "name": "commits4096_php-src_r20000.parquet",
+      "valid_tokens": 184848
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r29500.parquet",
+      "name": "commits4096_php-src_r29500.parquet",
+      "valid_tokens": 183065
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r76500.parquet",
+      "name": "commits4096_php-src_r76500.parquet",
+      "valid_tokens": 182959
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r14000.parquet",
+      "name": "commits4096_php-src_r14000.parquet",
+      "valid_tokens": 182917
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r28500.parquet",
+      "name": "commits4096_php-src_r28500.parquet",
+      "valid_tokens": 181868
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r31500.parquet",
+      "name": "commits4096_php-src_r31500.parquet",
+      "valid_tokens": 181157
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r36500.parquet",
+      "name": "commits4096_php-src_r36500.parquet",
+      "valid_tokens": 181019
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r20500.parquet",
+      "name": "commits4096_php-src_r20500.parquet",
+      "valid_tokens": 180954
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r70000.parquet",
+      "name": "commits4096_php-src_r70000.parquet",
+      "valid_tokens": 180799
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r6500.parquet",
+      "name": "commits4096_hpx_r6500.parquet",
+      "valid_tokens": 179397
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r29000.parquet",
+      "name": "commits4096_php-src_r29000.parquet",
+      "valid_tokens": 179168
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r25000.parquet",
+      "name": "commits4096_php-src_r25000.parquet",
+      "valid_tokens": 178893
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r3000.parquet",
+      "name": "commits4096_openfoam_r3000.parquet",
+      "valid_tokens": 178172
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r22500.parquet",
+      "name": "commits4096_php-src_r22500.parquet",
+      "valid_tokens": 177706
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r2500.parquet",
+      "name": "commits4096_openfoam_r2500.parquet",
+      "valid_tokens": 177119
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r34500.parquet",
+      "name": "commits4096_php-src_r34500.parquet",
+      "valid_tokens": 176357
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r0.parquet",
+      "name": "commits4096_openfoam_r0.parquet",
+      "valid_tokens": 175167
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r12500.parquet",
+      "name": "commits4096_hpx_r12500.parquet",
+      "valid_tokens": 173881
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r31000.parquet",
+      "name": "commits4096_php-src_r31000.parquet",
+      "valid_tokens": 172391
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r68500.parquet",
+      "name": "commits4096_php-src_r68500.parquet",
+      "valid_tokens": 171461
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r500.parquet",
+      "name": "commits4096_botan_r500.parquet",
+      "valid_tokens": 171060
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r9500.parquet",
+      "name": "commits4096_php-src_r9500.parquet",
+      "valid_tokens": 169701
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r15000.parquet",
+      "name": "commits4096_php-src_r15000.parquet",
+      "valid_tokens": 169060
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r4000.parquet",
+      "name": "commits4096_php-src_r4000.parquet",
+      "valid_tokens": 168691
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r67500.parquet",
+      "name": "commits4096_php-src_r67500.parquet",
+      "valid_tokens": 168239
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r4000.parquet",
+      "name": "commits4096_botan_r4000.parquet",
+      "valid_tokens": 167719
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r26000.parquet",
+      "name": "commits4096_php-src_r26000.parquet",
+      "valid_tokens": 167714
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r6000.parquet",
+      "name": "commits4096_fmt_r6000.parquet",
+      "valid_tokens": 167646
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r500.parquet",
+      "name": "commits4096_hpx_r500.parquet",
+      "valid_tokens": 167369
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r13500.parquet",
+      "name": "commits4096_hpx_r13500.parquet",
+      "valid_tokens": 166488
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r1500.parquet",
+      "name": "commits4096_botan_r1500.parquet",
+      "valid_tokens": 165723
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r22000.parquet",
+      "name": "commits4096_php-src_r22000.parquet",
+      "valid_tokens": 165501
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r91500.parquet",
+      "name": "commits4096_php-src_r91500.parquet",
+      "valid_tokens": 165284
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r82000.parquet",
+      "name": "commits4096_php-src_r82000.parquet",
+      "valid_tokens": 164529
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r5000.parquet",
+      "name": "commits4096_fmt_r5000.parquet",
+      "valid_tokens": 164458
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r66500.parquet",
+      "name": "commits4096_php-src_r66500.parquet",
+      "valid_tokens": 163894
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r7500.parquet",
+      "name": "commits4096_hpx_r7500.parquet",
+      "valid_tokens": 162775
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r9500.parquet",
+      "name": "commits4096_hpx_r9500.parquet",
+      "valid_tokens": 161203
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r5500.parquet",
+      "name": "commits4096_php-src_r5500.parquet",
+      "valid_tokens": 161101
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r2000.parquet",
+      "name": "commits4096_openfoam_r2000.parquet",
+      "valid_tokens": 160255
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r83000.parquet",
+      "name": "commits4096_php-src_r83000.parquet",
+      "valid_tokens": 160038
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r5500.parquet",
+      "name": "commits4096_hpx_r5500.parquet",
+      "valid_tokens": 159902
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r70500.parquet",
+      "name": "commits4096_php-src_r70500.parquet",
+      "valid_tokens": 159671
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r3500.parquet",
+      "name": "commits4096_botan_r3500.parquet",
+      "valid_tokens": 159292
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r55500.parquet",
+      "name": "commits4096_php-src_r55500.parquet",
+      "valid_tokens": 159137
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r32000.parquet",
+      "name": "commits4096_php-src_r32000.parquet",
+      "valid_tokens": 158375
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r0.parquet",
+      "name": "commits4096_botan_r0.parquet",
+      "valid_tokens": 158032
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r24000.parquet",
+      "name": "commits4096_php-src_r24000.parquet",
+      "valid_tokens": 157593
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r15000.parquet",
+      "name": "commits4096_hpx_r15000.parquet",
+      "valid_tokens": 157428
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r62500.parquet",
+      "name": "commits4096_php-src_r62500.parquet",
+      "valid_tokens": 156675
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r500.parquet",
+      "name": "commits4096_openfoam_r500.parquet",
+      "valid_tokens": 155534
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r6500.parquet",
+      "name": "commits4096_botan_r6500.parquet",
+      "valid_tokens": 154757
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r18000.parquet",
+      "name": "commits4096_php-src_r18000.parquet",
+      "valid_tokens": 154440
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r23000.parquet",
+      "name": "commits4096_php-src_r23000.parquet",
+      "valid_tokens": 154412
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r12500.parquet",
+      "name": "commits4096_php-src_r12500.parquet",
+      "valid_tokens": 154406
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r4500.parquet",
+      "name": "commits4096_openfoam_r4500.parquet",
+      "valid_tokens": 154146
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r7500.parquet",
+      "name": "commits4096_openfoam_r7500.parquet",
+      "valid_tokens": 154042
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r79500.parquet",
+      "name": "commits4096_php-src_r79500.parquet",
+      "valid_tokens": 153611
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r5000.parquet",
+      "name": "commits4096_openfoam_r5000.parquet",
+      "valid_tokens": 153378
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r6000.parquet",
+      "name": "commits4096_php-src_r6000.parquet",
+      "valid_tokens": 152954
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r16500.parquet",
+      "name": "commits4096_php-src_r16500.parquet",
+      "valid_tokens": 152792
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r58000.parquet",
+      "name": "commits4096_php-src_r58000.parquet",
+      "valid_tokens": 150908
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r71000.parquet",
+      "name": "commits4096_php-src_r71000.parquet",
+      "valid_tokens": 150686
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r72500.parquet",
+      "name": "commits4096_php-src_r72500.parquet",
+      "valid_tokens": 150446
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r67000.parquet",
+      "name": "commits4096_php-src_r67000.parquet",
+      "valid_tokens": 149447
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r76000.parquet",
+      "name": "commits4096_php-src_r76000.parquet",
+      "valid_tokens": 149367
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r9000.parquet",
+      "name": "commits4096_hpx_r9000.parquet",
+      "valid_tokens": 148957
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r63000.parquet",
+      "name": "commits4096_php-src_r63000.parquet",
+      "valid_tokens": 148629
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r78500.parquet",
+      "name": "commits4096_php-src_r78500.parquet",
+      "valid_tokens": 146356
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r62000.parquet",
+      "name": "commits4096_php-src_r62000.parquet",
+      "valid_tokens": 145996
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r47500.parquet",
+      "name": "commits4096_php-src_r47500.parquet",
+      "valid_tokens": 145908
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/fmt_r5500.parquet",
+      "name": "commits4096_fmt_r5500.parquet",
+      "valid_tokens": 145624
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r77000.parquet",
+      "name": "commits4096_php-src_r77000.parquet",
+      "valid_tokens": 145416
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r64000.parquet",
+      "name": "commits4096_php-src_r64000.parquet",
+      "valid_tokens": 144505
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r12000.parquet",
+      "name": "commits4096_botan_r12000.parquet",
+      "valid_tokens": 144305
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r23500.parquet",
+      "name": "commits4096_hpx_r23500.parquet",
+      "valid_tokens": 144181
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r21500.parquet",
+      "name": "commits4096_php-src_r21500.parquet",
+      "valid_tokens": 144169
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r83500.parquet",
+      "name": "commits4096_php-src_r83500.parquet",
+      "valid_tokens": 143985
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r37000.parquet",
+      "name": "commits4096_php-src_r37000.parquet",
+      "valid_tokens": 143661
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r11000.parquet",
+      "name": "commits4096_hpx_r11000.parquet",
+      "valid_tokens": 141732
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r74000.parquet",
+      "name": "commits4096_php-src_r74000.parquet",
+      "valid_tokens": 141381
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r84000.parquet",
+      "name": "commits4096_php-src_r84000.parquet",
+      "valid_tokens": 140547
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r4000.parquet",
+      "name": "commits4096_glfw_r4000.parquet",
+      "valid_tokens": 140233
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r44500.parquet",
+      "name": "commits4096_php-src_r44500.parquet",
+      "valid_tokens": 140173
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r7000.parquet",
+      "name": "commits4096_hpx_r7000.parquet",
+      "valid_tokens": 139512
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/xiaomi-mace_r1500.parquet",
+      "name": "commits4096_xiaomi-mace_r1500.parquet",
+      "valid_tokens": 139190
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r14000.parquet",
+      "name": "commits4096_hpx_r14000.parquet",
+      "valid_tokens": 138758
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r8500.parquet",
+      "name": "commits4096_hpx_r8500.parquet",
+      "valid_tokens": 138452
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r8000.parquet",
+      "name": "commits4096_openfoam_r8000.parquet",
+      "valid_tokens": 138155
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r10500.parquet",
+      "name": "commits4096_hpx_r10500.parquet",
+      "valid_tokens": 138025
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r75000.parquet",
+      "name": "commits4096_php-src_r75000.parquet",
+      "valid_tokens": 137589
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r80000.parquet",
+      "name": "commits4096_php-src_r80000.parquet",
+      "valid_tokens": 137313
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r79000.parquet",
+      "name": "commits4096_php-src_r79000.parquet",
+      "valid_tokens": 137093
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r65500.parquet",
+      "name": "commits4096_php-src_r65500.parquet",
+      "valid_tokens": 136972
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r17000.parquet",
+      "name": "commits4096_hpx_r17000.parquet",
+      "valid_tokens": 136959
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r65000.parquet",
+      "name": "commits4096_php-src_r65000.parquet",
+      "valid_tokens": 136853
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r12500.parquet",
+      "name": "commits4096_botan_r12500.parquet",
+      "valid_tokens": 136836
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r4000.parquet",
+      "name": "commits4096_openfoam_r4000.parquet",
+      "valid_tokens": 135339
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r16000.parquet",
+      "name": "commits4096_hpx_r16000.parquet",
+      "valid_tokens": 134498
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r6500.parquet",
+      "name": "commits4096_openfoam_r6500.parquet",
+      "valid_tokens": 134477
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r77500.parquet",
+      "name": "commits4096_php-src_r77500.parquet",
+      "valid_tokens": 134179
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r23500.parquet",
+      "name": "commits4096_php-src_r23500.parquet",
+      "valid_tokens": 133898
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r81000.parquet",
+      "name": "commits4096_php-src_r81000.parquet",
+      "valid_tokens": 133193
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r58500.parquet",
+      "name": "commits4096_php-src_r58500.parquet",
+      "valid_tokens": 133099
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/glfw_r2500.parquet",
+      "name": "commits4096_glfw_r2500.parquet",
+      "valid_tokens": 132038
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r63500.parquet",
+      "name": "commits4096_php-src_r63500.parquet",
+      "valid_tokens": 132015
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r39000.parquet",
+      "name": "commits4096_php-src_r39000.parquet",
+      "valid_tokens": 131583
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r69500.parquet",
+      "name": "commits4096_php-src_r69500.parquet",
+      "valid_tokens": 131078
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r80500.parquet",
+      "name": "commits4096_php-src_r80500.parquet",
+      "valid_tokens": 130404
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r5500.parquet",
+      "name": "commits4096_botan_r5500.parquet",
+      "valid_tokens": 129793
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r12000.parquet",
+      "name": "commits4096_hpx_r12000.parquet",
+      "valid_tokens": 129567
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r73500.parquet",
+      "name": "commits4096_php-src_r73500.parquet",
+      "valid_tokens": 129545
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r56500.parquet",
+      "name": "commits4096_php-src_r56500.parquet",
+      "valid_tokens": 127579
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r7500.parquet",
+      "name": "commits4096_botan_r7500.parquet",
+      "valid_tokens": 125891
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r53000.parquet",
+      "name": "commits4096_php-src_r53000.parquet",
+      "valid_tokens": 125528
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r90500.parquet",
+      "name": "commits4096_php-src_r90500.parquet",
+      "valid_tokens": 125235
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r86000.parquet",
+      "name": "commits4096_php-src_r86000.parquet",
+      "valid_tokens": 125059
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r11500.parquet",
+      "name": "commits4096_botan_r11500.parquet",
+      "valid_tokens": 124948
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r7000.parquet",
+      "name": "commits4096_openfoam_r7000.parquet",
+      "valid_tokens": 124473
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r1500.parquet",
+      "name": "commits4096_openfoam_r1500.parquet",
+      "valid_tokens": 123762
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r87000.parquet",
+      "name": "commits4096_php-src_r87000.parquet",
+      "valid_tokens": 123603
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r66000.parquet",
+      "name": "commits4096_php-src_r66000.parquet",
+      "valid_tokens": 123564
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r73000.parquet",
+      "name": "commits4096_php-src_r73000.parquet",
+      "valid_tokens": 122180
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r2000.parquet",
+      "name": "commits4096_botan_r2000.parquet",
+      "valid_tokens": 122054
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r69000.parquet",
+      "name": "commits4096_php-src_r69000.parquet",
+      "valid_tokens": 121657
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r59500.parquet",
+      "name": "commits4096_php-src_r59500.parquet",
+      "valid_tokens": 121578
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r68000.parquet",
+      "name": "commits4096_php-src_r68000.parquet",
+      "valid_tokens": 121086
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r90000.parquet",
+      "name": "commits4096_php-src_r90000.parquet",
+      "valid_tokens": 120747
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r57500.parquet",
+      "name": "commits4096_php-src_r57500.parquet",
+      "valid_tokens": 120474
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r46000.parquet",
+      "name": "commits4096_php-src_r46000.parquet",
+      "valid_tokens": 120194
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r88500.parquet",
+      "name": "commits4096_php-src_r88500.parquet",
+      "valid_tokens": 120121
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r59000.parquet",
+      "name": "commits4096_php-src_r59000.parquet",
+      "valid_tokens": 120092
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r91000.parquet",
+      "name": "commits4096_php-src_r91000.parquet",
+      "valid_tokens": 119963
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r43000.parquet",
+      "name": "commits4096_php-src_r43000.parquet",
+      "valid_tokens": 119173
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r3000.parquet",
+      "name": "commits4096_botan_r3000.parquet",
+      "valid_tokens": 117667
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r8500.parquet",
+      "name": "commits4096_botan_r8500.parquet",
+      "valid_tokens": 117043
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r15500.parquet",
+      "name": "commits4096_hpx_r15500.parquet",
+      "valid_tokens": 116793
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r89500.parquet",
+      "name": "commits4096_php-src_r89500.parquet",
+      "valid_tokens": 115932
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r85000.parquet",
+      "name": "commits4096_php-src_r85000.parquet",
+      "valid_tokens": 115853
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r57000.parquet",
+      "name": "commits4096_php-src_r57000.parquet",
+      "valid_tokens": 115026
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r71500.parquet",
+      "name": "commits4096_php-src_r71500.parquet",
+      "valid_tokens": 114185
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r43500.parquet",
+      "name": "commits4096_php-src_r43500.parquet",
+      "valid_tokens": 114073
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r92000.parquet",
+      "name": "commits4096_php-src_r92000.parquet",
+      "valid_tokens": 113281
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r89000.parquet",
+      "name": "commits4096_php-src_r89000.parquet",
+      "valid_tokens": 113176
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r84500.parquet",
+      "name": "commits4096_php-src_r84500.parquet",
+      "valid_tokens": 112953
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r5500.parquet",
+      "name": "commits4096_openfoam_r5500.parquet",
+      "valid_tokens": 112310
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r42500.parquet",
+      "name": "commits4096_php-src_r42500.parquet",
+      "valid_tokens": 111879
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r45500.parquet",
+      "name": "commits4096_php-src_r45500.parquet",
+      "valid_tokens": 111595
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r10000.parquet",
+      "name": "commits4096_botan_r10000.parquet",
+      "valid_tokens": 110472
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r48000.parquet",
+      "name": "commits4096_php-src_r48000.parquet",
+      "valid_tokens": 109415
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r49000.parquet",
+      "name": "commits4096_php-src_r49000.parquet",
+      "valid_tokens": 108131
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r82500.parquet",
+      "name": "commits4096_php-src_r82500.parquet",
+      "valid_tokens": 107172
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r7000.parquet",
+      "name": "commits4096_botan_r7000.parquet",
+      "valid_tokens": 107153
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r42000.parquet",
+      "name": "commits4096_php-src_r42000.parquet",
+      "valid_tokens": 106764
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r11500.parquet",
+      "name": "commits4096_hpx_r11500.parquet",
+      "valid_tokens": 106544
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r81500.parquet",
+      "name": "commits4096_php-src_r81500.parquet",
+      "valid_tokens": 106156
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r1000.parquet",
+      "name": "commits4096_hpx_r1000.parquet",
+      "valid_tokens": 105542
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r50500.parquet",
+      "name": "commits4096_php-src_r50500.parquet",
+      "valid_tokens": 105079
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r44000.parquet",
+      "name": "commits4096_php-src_r44000.parquet",
+      "valid_tokens": 104993
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r6000.parquet",
+      "name": "commits4096_openfoam_r6000.parquet",
+      "valid_tokens": 104753
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r61000.parquet",
+      "name": "commits4096_php-src_r61000.parquet",
+      "valid_tokens": 104241
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r13000.parquet",
+      "name": "commits4096_botan_r13000.parquet",
+      "valid_tokens": 103927
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r88000.parquet",
+      "name": "commits4096_php-src_r88000.parquet",
+      "valid_tokens": 103880
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r8000.parquet",
+      "name": "commits4096_botan_r8000.parquet",
+      "valid_tokens": 103693
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r85500.parquet",
+      "name": "commits4096_php-src_r85500.parquet",
+      "valid_tokens": 103020
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r9500.parquet",
+      "name": "commits4096_botan_r9500.parquet",
+      "valid_tokens": 102926
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r86500.parquet",
+      "name": "commits4096_php-src_r86500.parquet",
+      "valid_tokens": 102677
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/hpx_r18000.parquet",
+      "name": "commits4096_hpx_r18000.parquet",
+      "valid_tokens": 100165
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r60000.parquet",
+      "name": "commits4096_php-src_r60000.parquet",
+      "valid_tokens": 99873
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r11000.parquet",
+      "name": "commits4096_botan_r11000.parquet",
+      "valid_tokens": 97978
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r46500.parquet",
+      "name": "commits4096_php-src_r46500.parquet",
+      "valid_tokens": 97876
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r45000.parquet",
+      "name": "commits4096_php-src_r45000.parquet",
+      "valid_tokens": 96660
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r49500.parquet",
+      "name": "commits4096_php-src_r49500.parquet",
+      "valid_tokens": 96538
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r54500.parquet",
+      "name": "commits4096_php-src_r54500.parquet",
+      "valid_tokens": 95201
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r47000.parquet",
+      "name": "commits4096_php-src_r47000.parquet",
+      "valid_tokens": 94632
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r60500.parquet",
+      "name": "commits4096_php-src_r60500.parquet",
+      "valid_tokens": 94021
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r55000.parquet",
+      "name": "commits4096_php-src_r55000.parquet",
+      "valid_tokens": 93587
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r87500.parquet",
+      "name": "commits4096_php-src_r87500.parquet",
+      "valid_tokens": 91033
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r6000.parquet",
+      "name": "commits4096_botan_r6000.parquet",
+      "valid_tokens": 90340
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r61500.parquet",
+      "name": "commits4096_php-src_r61500.parquet",
+      "valid_tokens": 89571
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r39500.parquet",
+      "name": "commits4096_php-src_r39500.parquet",
+      "valid_tokens": 88683
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r2500.parquet",
+      "name": "commits4096_botan_r2500.parquet",
+      "valid_tokens": 87477
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r78000.parquet",
+      "name": "commits4096_php-src_r78000.parquet",
+      "valid_tokens": 86808
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r40000.parquet",
+      "name": "commits4096_php-src_r40000.parquet",
+      "valid_tokens": 82300
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r53500.parquet",
+      "name": "commits4096_php-src_r53500.parquet",
+      "valid_tokens": 82208
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r41500.parquet",
+      "name": "commits4096_php-src_r41500.parquet",
+      "valid_tokens": 82078
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r40500.parquet",
+      "name": "commits4096_php-src_r40500.parquet",
+      "valid_tokens": 82032
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r41000.parquet",
+      "name": "commits4096_php-src_r41000.parquet",
+      "valid_tokens": 77685
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/openfoam_r8500.parquet",
+      "name": "commits4096_openfoam_r8500.parquet",
+      "valid_tokens": 72141
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r9000.parquet",
+      "name": "commits4096_botan_r9000.parquet",
+      "valid_tokens": 68659
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/botan_r10500.parquet",
+      "name": "commits4096_botan_r10500.parquet",
+      "valid_tokens": 66675
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r50000.parquet",
+      "name": "commits4096_php-src_r50000.parquet",
+      "valid_tokens": 60598
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/qnnpack_r0.parquet",
+      "name": "commits4096_qnnpack_r0.parquet",
+      "valid_tokens": 56932
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/WindowsAppSDK_r500.parquet",
+      "name": "commits4096_WindowsAppSDK_r500.parquet",
+      "valid_tokens": 53439
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r52000.parquet",
+      "name": "commits4096_php-src_r52000.parquet",
+      "valid_tokens": 50975
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r54000.parquet",
+      "name": "commits4096_php-src_r54000.parquet",
+      "valid_tokens": 40230
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r51500.parquet",
+      "name": "commits4096_php-src_r51500.parquet",
+      "valid_tokens": 32931
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/s2n-tls_r4000.parquet",
+      "name": "commits4096_s2n-tls_r4000.parquet",
+      "valid_tokens": 31672
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/intel-neural-compressor_r0.parquet",
+      "name": "commits4096_intel-neural-compressor_r0.parquet",
+      "valid_tokens": 23953
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r48500.parquet",
+      "name": "commits4096_php-src_r48500.parquet",
+      "valid_tokens": 17181
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/rocdbgapi_r1000.parquet",
+      "name": "commits4096_rocdbgapi_r1000.parquet",
+      "valid_tokens": 16045
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r52500.parquet",
+      "name": "commits4096_php-src_r52500.parquet",
+      "valid_tokens": 13095
+    },
+    {
+      "kind": "commits4096",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/4096/php-src_r51000.parquet",
+      "name": "commits4096_php-src_r51000.parquet",
+      "valid_tokens": 10700
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r1500.parquet",
+      "name": "commits8192_filler_s2n-tls_r1500.parquet",
+      "valid_tokens": 653473
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/rocdbgapi_r500.parquet",
+      "name": "commits8192_filler_rocdbgapi_r500.parquet",
+      "valid_tokens": 588364
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/WindowsAppSDK_r0.parquet",
+      "name": "commits8192_filler_WindowsAppSDK_r0.parquet",
+      "valid_tokens": 559191
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r1000.parquet",
+      "name": "commits8192_filler_s2n-tls_r1000.parquet",
+      "valid_tokens": 532880
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r500.parquet",
+      "name": "commits8192_filler_s2n-tls_r500.parquet",
+      "valid_tokens": 507266
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/rocdbgapi_r0.parquet",
+      "name": "commits8192_filler_rocdbgapi_r0.parquet",
+      "valid_tokens": 486152
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r0.parquet",
+      "name": "commits8192_filler_s2n-tls_r0.parquet",
+      "valid_tokens": 422879
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r4500.parquet",
+      "name": "commits8192_filler_fmt_r4500.parquet",
+      "valid_tokens": 413473
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r2500.parquet",
+      "name": "commits8192_filler_hpx_r2500.parquet",
+      "valid_tokens": 411920
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r2000.parquet",
+      "name": "commits8192_filler_s2n-tls_r2000.parquet",
+      "valid_tokens": 381661
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r3000.parquet",
+      "name": "commits8192_filler_hpx_r3000.parquet",
+      "valid_tokens": 375531
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r2000.parquet",
+      "name": "commits8192_filler_php-src_r2000.parquet",
+      "valid_tokens": 369942
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r8500.parquet",
+      "name": "commits8192_filler_php-src_r8500.parquet",
+      "valid_tokens": 336211
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r25500.parquet",
+      "name": "commits8192_filler_php-src_r25500.parquet",
+      "valid_tokens": 334949
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r11000.parquet",
+      "name": "commits8192_filler_php-src_r11000.parquet",
+      "valid_tokens": 332590
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r19000.parquet",
+      "name": "commits8192_filler_php-src_r19000.parquet",
+      "valid_tokens": 331139
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r35000.parquet",
+      "name": "commits8192_filler_php-src_r35000.parquet",
+      "valid_tokens": 328985
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r33000.parquet",
+      "name": "commits8192_filler_php-src_r33000.parquet",
+      "valid_tokens": 312808
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r10500.parquet",
+      "name": "commits8192_filler_php-src_r10500.parquet",
+      "valid_tokens": 312403
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r27500.parquet",
+      "name": "commits8192_filler_php-src_r27500.parquet",
+      "valid_tokens": 311507
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r33500.parquet",
+      "name": "commits8192_filler_php-src_r33500.parquet",
+      "valid_tokens": 310951
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r0.parquet",
+      "name": "commits8192_filler_hpx_r0.parquet",
+      "valid_tokens": 310486
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/xiaomi-mace_r500.parquet",
+      "name": "commits8192_filler_xiaomi-mace_r500.parquet",
+      "valid_tokens": 307444
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r8000.parquet",
+      "name": "commits8192_filler_hpx_r8000.parquet",
+      "valid_tokens": 299375
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r3500.parquet",
+      "name": "commits8192_filler_hpx_r3500.parquet",
+      "valid_tokens": 298117
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r10000.parquet",
+      "name": "commits8192_filler_php-src_r10000.parquet",
+      "valid_tokens": 296493
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r500.parquet",
+      "name": "commits8192_filler_fmt_r500.parquet",
+      "valid_tokens": 295247
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r3500.parquet",
+      "name": "commits8192_filler_fmt_r3500.parquet",
+      "valid_tokens": 293869
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r32500.parquet",
+      "name": "commits8192_filler_php-src_r32500.parquet",
+      "valid_tokens": 291310
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r28500.parquet",
+      "name": "commits8192_filler_php-src_r28500.parquet",
+      "valid_tokens": 289284
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r34000.parquet",
+      "name": "commits8192_filler_php-src_r34000.parquet",
+      "valid_tokens": 288867
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r500.parquet",
+      "name": "commits8192_filler_glfw_r500.parquet",
+      "valid_tokens": 284626
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r8000.parquet",
+      "name": "commits8192_filler_php-src_r8000.parquet",
+      "valid_tokens": 283921
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r72000.parquet",
+      "name": "commits8192_filler_php-src_r72000.parquet",
+      "valid_tokens": 275842
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r15000.parquet",
+      "name": "commits8192_filler_php-src_r15000.parquet",
+      "valid_tokens": 274656
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r4500.parquet",
+      "name": "commits8192_filler_php-src_r4500.parquet",
+      "valid_tokens": 272813
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r13000.parquet",
+      "name": "commits8192_filler_php-src_r13000.parquet",
+      "valid_tokens": 271637
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r30500.parquet",
+      "name": "commits8192_filler_php-src_r30500.parquet",
+      "valid_tokens": 270324
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r12000.parquet",
+      "name": "commits8192_filler_php-src_r12000.parquet",
+      "valid_tokens": 269524
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r0.parquet",
+      "name": "commits8192_filler_php-src_r0.parquet",
+      "valid_tokens": 268612
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r500.parquet",
+      "name": "commits8192_filler_hpx_r500.parquet",
+      "valid_tokens": 267538
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r13000.parquet",
+      "name": "commits8192_filler_hpx_r13000.parquet",
+      "valid_tokens": 263719
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r7500.parquet",
+      "name": "commits8192_filler_php-src_r7500.parquet",
+      "valid_tokens": 262276
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r0.parquet",
+      "name": "commits8192_filler_fmt_r0.parquet",
+      "valid_tokens": 261448
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r9000.parquet",
+      "name": "commits8192_filler_hpx_r9000.parquet",
+      "valid_tokens": 260329
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r7500.parquet",
+      "name": "commits8192_filler_hpx_r7500.parquet",
+      "valid_tokens": 258997
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r11500.parquet",
+      "name": "commits8192_filler_php-src_r11500.parquet",
+      "valid_tokens": 257989
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/xiaomi-mace_r1000.parquet",
+      "name": "commits8192_filler_xiaomi-mace_r1000.parquet",
+      "valid_tokens": 257378
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r3500.parquet",
+      "name": "commits8192_filler_php-src_r3500.parquet",
+      "valid_tokens": 255237
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r9000.parquet",
+      "name": "commits8192_filler_php-src_r9000.parquet",
+      "valid_tokens": 254865
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r7000.parquet",
+      "name": "commits8192_filler_php-src_r7000.parquet",
+      "valid_tokens": 252386
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r3000.parquet",
+      "name": "commits8192_filler_s2n-tls_r3000.parquet",
+      "valid_tokens": 252028
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r6500.parquet",
+      "name": "commits8192_filler_hpx_r6500.parquet",
+      "valid_tokens": 250456
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r1000.parquet",
+      "name": "commits8192_filler_php-src_r1000.parquet",
+      "valid_tokens": 250397
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r17000.parquet",
+      "name": "commits8192_filler_php-src_r17000.parquet",
+      "valid_tokens": 250181
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r16000.parquet",
+      "name": "commits8192_filler_php-src_r16000.parquet",
+      "valid_tokens": 247395
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r2500.parquet",
+      "name": "commits8192_filler_s2n-tls_r2500.parquet",
+      "valid_tokens": 247222
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r1500.parquet",
+      "name": "commits8192_filler_php-src_r1500.parquet",
+      "valid_tokens": 246982
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r4000.parquet",
+      "name": "commits8192_filler_hpx_r4000.parquet",
+      "valid_tokens": 245818
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r74500.parquet",
+      "name": "commits8192_filler_php-src_r74500.parquet",
+      "valid_tokens": 243103
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r3000.parquet",
+      "name": "commits8192_filler_fmt_r3000.parquet",
+      "valid_tokens": 242573
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r1500.parquet",
+      "name": "commits8192_filler_glfw_r1500.parquet",
+      "valid_tokens": 241653
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r6000.parquet",
+      "name": "commits8192_filler_hpx_r6000.parquet",
+      "valid_tokens": 239944
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r3000.parquet",
+      "name": "commits8192_filler_glfw_r3000.parquet",
+      "valid_tokens": 239631
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r13500.parquet",
+      "name": "commits8192_filler_php-src_r13500.parquet",
+      "valid_tokens": 238781
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r15500.parquet",
+      "name": "commits8192_filler_php-src_r15500.parquet",
+      "valid_tokens": 234822
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r32000.parquet",
+      "name": "commits8192_filler_php-src_r32000.parquet",
+      "valid_tokens": 234817
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r1000.parquet",
+      "name": "commits8192_filler_botan_r1000.parquet",
+      "valid_tokens": 233917
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r1500.parquet",
+      "name": "commits8192_filler_hpx_r1500.parquet",
+      "valid_tokens": 233825
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r1000.parquet",
+      "name": "commits8192_filler_glfw_r1000.parquet",
+      "valid_tokens": 233453
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r57000.parquet",
+      "name": "commits8192_filler_php-src_r57000.parquet",
+      "valid_tokens": 232475
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r5000.parquet",
+      "name": "commits8192_filler_fmt_r5000.parquet",
+      "valid_tokens": 231967
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r5500.parquet",
+      "name": "commits8192_filler_hpx_r5500.parquet",
+      "valid_tokens": 231023
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r21000.parquet",
+      "name": "commits8192_filler_php-src_r21000.parquet",
+      "valid_tokens": 230358
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r23500.parquet",
+      "name": "commits8192_filler_php-src_r23500.parquet",
+      "valid_tokens": 230273
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r2500.parquet",
+      "name": "commits8192_filler_php-src_r2500.parquet",
+      "valid_tokens": 229404
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r4500.parquet",
+      "name": "commits8192_filler_hpx_r4500.parquet",
+      "valid_tokens": 227473
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r15000.parquet",
+      "name": "commits8192_filler_hpx_r15000.parquet",
+      "valid_tokens": 226990
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r24500.parquet",
+      "name": "commits8192_filler_php-src_r24500.parquet",
+      "valid_tokens": 226666
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r13500.parquet",
+      "name": "commits8192_filler_hpx_r13500.parquet",
+      "valid_tokens": 226053
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r18500.parquet",
+      "name": "commits8192_filler_php-src_r18500.parquet",
+      "valid_tokens": 225439
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r27000.parquet",
+      "name": "commits8192_filler_php-src_r27000.parquet",
+      "valid_tokens": 224853
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r2000.parquet",
+      "name": "commits8192_filler_fmt_r2000.parquet",
+      "valid_tokens": 224338
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r3500.parquet",
+      "name": "commits8192_filler_glfw_r3500.parquet",
+      "valid_tokens": 223292
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r24000.parquet",
+      "name": "commits8192_filler_php-src_r24000.parquet",
+      "valid_tokens": 221842
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r25000.parquet",
+      "name": "commits8192_filler_php-src_r25000.parquet",
+      "valid_tokens": 220355
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r20000.parquet",
+      "name": "commits8192_filler_php-src_r20000.parquet",
+      "valid_tokens": 220171
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r500.parquet",
+      "name": "commits8192_filler_php-src_r500.parquet",
+      "valid_tokens": 219444
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r5500.parquet",
+      "name": "commits8192_filler_fmt_r5500.parquet",
+      "valid_tokens": 218938
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r2500.parquet",
+      "name": "commits8192_filler_fmt_r2500.parquet",
+      "valid_tokens": 215548
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r19500.parquet",
+      "name": "commits8192_filler_php-src_r19500.parquet",
+      "valid_tokens": 214900
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r21500.parquet",
+      "name": "commits8192_filler_php-src_r21500.parquet",
+      "valid_tokens": 214304
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/xiaomi-mace_r0.parquet",
+      "name": "commits8192_filler_xiaomi-mace_r0.parquet",
+      "valid_tokens": 213352
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r59000.parquet",
+      "name": "commits8192_filler_php-src_r59000.parquet",
+      "valid_tokens": 212024
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r29500.parquet",
+      "name": "commits8192_filler_php-src_r29500.parquet",
+      "valid_tokens": 211783
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r5000.parquet",
+      "name": "commits8192_filler_openfoam_r5000.parquet",
+      "valid_tokens": 208315
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r14500.parquet",
+      "name": "commits8192_filler_php-src_r14500.parquet",
+      "valid_tokens": 207321
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r72500.parquet",
+      "name": "commits8192_filler_php-src_r72500.parquet",
+      "valid_tokens": 207180
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r56500.parquet",
+      "name": "commits8192_filler_php-src_r56500.parquet",
+      "valid_tokens": 206578
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r5500.parquet",
+      "name": "commits8192_filler_php-src_r5500.parquet",
+      "valid_tokens": 206151
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r3000.parquet",
+      "name": "commits8192_filler_php-src_r3000.parquet",
+      "valid_tokens": 206133
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r31500.parquet",
+      "name": "commits8192_filler_php-src_r31500.parquet",
+      "valid_tokens": 204657
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r66500.parquet",
+      "name": "commits8192_filler_php-src_r66500.parquet",
+      "valid_tokens": 204074
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r0.parquet",
+      "name": "commits8192_filler_botan_r0.parquet",
+      "valid_tokens": 202251
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r29000.parquet",
+      "name": "commits8192_filler_php-src_r29000.parquet",
+      "valid_tokens": 201972
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r22000.parquet",
+      "name": "commits8192_filler_php-src_r22000.parquet",
+      "valid_tokens": 201817
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r77000.parquet",
+      "name": "commits8192_filler_php-src_r77000.parquet",
+      "valid_tokens": 201523
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r76500.parquet",
+      "name": "commits8192_filler_php-src_r76500.parquet",
+      "valid_tokens": 199750
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r14500.parquet",
+      "name": "commits8192_filler_hpx_r14500.parquet",
+      "valid_tokens": 198390
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r56000.parquet",
+      "name": "commits8192_filler_php-src_r56000.parquet",
+      "valid_tokens": 197388
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r4000.parquet",
+      "name": "commits8192_filler_php-src_r4000.parquet",
+      "valid_tokens": 197316
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r3000.parquet",
+      "name": "commits8192_filler_openfoam_r3000.parquet",
+      "valid_tokens": 196847
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r16500.parquet",
+      "name": "commits8192_filler_php-src_r16500.parquet",
+      "valid_tokens": 196435
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r22500.parquet",
+      "name": "commits8192_filler_php-src_r22500.parquet",
+      "valid_tokens": 195098
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r12500.parquet",
+      "name": "commits8192_filler_php-src_r12500.parquet",
+      "valid_tokens": 194264
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r64000.parquet",
+      "name": "commits8192_filler_php-src_r64000.parquet",
+      "valid_tokens": 193060
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r9500.parquet",
+      "name": "commits8192_filler_php-src_r9500.parquet",
+      "valid_tokens": 192441
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r55000.parquet",
+      "name": "commits8192_filler_php-src_r55000.parquet",
+      "valid_tokens": 192084
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r76000.parquet",
+      "name": "commits8192_filler_php-src_r76000.parquet",
+      "valid_tokens": 191415
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r58000.parquet",
+      "name": "commits8192_filler_php-src_r58000.parquet",
+      "valid_tokens": 190722
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r0.parquet",
+      "name": "commits8192_filler_glfw_r0.parquet",
+      "valid_tokens": 190199
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r18000.parquet",
+      "name": "commits8192_filler_hpx_r18000.parquet",
+      "valid_tokens": 188343
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r26000.parquet",
+      "name": "commits8192_filler_php-src_r26000.parquet",
+      "valid_tokens": 188295
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r14000.parquet",
+      "name": "commits8192_filler_php-src_r14000.parquet",
+      "valid_tokens": 187462
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r1000.parquet",
+      "name": "commits8192_filler_fmt_r1000.parquet",
+      "valid_tokens": 186345
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r30000.parquet",
+      "name": "commits8192_filler_php-src_r30000.parquet",
+      "valid_tokens": 185747
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r64500.parquet",
+      "name": "commits8192_filler_php-src_r64500.parquet",
+      "valid_tokens": 185691
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r23000.parquet",
+      "name": "commits8192_filler_php-src_r23000.parquet",
+      "valid_tokens": 185337
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r17000.parquet",
+      "name": "commits8192_filler_hpx_r17000.parquet",
+      "valid_tokens": 184808
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r2500.parquet",
+      "name": "commits8192_filler_openfoam_r2500.parquet",
+      "valid_tokens": 184685
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r38500.parquet",
+      "name": "commits8192_filler_php-src_r38500.parquet",
+      "valid_tokens": 184640
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r2000.parquet",
+      "name": "commits8192_filler_hpx_r2000.parquet",
+      "valid_tokens": 184351
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r5000.parquet",
+      "name": "commits8192_filler_hpx_r5000.parquet",
+      "valid_tokens": 182943
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r18000.parquet",
+      "name": "commits8192_filler_php-src_r18000.parquet",
+      "valid_tokens": 182856
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r17500.parquet",
+      "name": "commits8192_filler_php-src_r17500.parquet",
+      "valid_tokens": 181370
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r26500.parquet",
+      "name": "commits8192_filler_php-src_r26500.parquet",
+      "valid_tokens": 180490
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r11500.parquet",
+      "name": "commits8192_filler_hpx_r11500.parquet",
+      "valid_tokens": 179598
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r3500.parquet",
+      "name": "commits8192_filler_openfoam_r3500.parquet",
+      "valid_tokens": 178537
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r43000.parquet",
+      "name": "commits8192_filler_php-src_r43000.parquet",
+      "valid_tokens": 178003
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r6000.parquet",
+      "name": "commits8192_filler_openfoam_r6000.parquet",
+      "valid_tokens": 177374
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r6000.parquet",
+      "name": "commits8192_filler_fmt_r6000.parquet",
+      "valid_tokens": 175605
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r500.parquet",
+      "name": "commits8192_filler_openfoam_r500.parquet",
+      "valid_tokens": 174490
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r6500.parquet",
+      "name": "commits8192_filler_php-src_r6500.parquet",
+      "valid_tokens": 173098
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r36000.parquet",
+      "name": "commits8192_filler_php-src_r36000.parquet",
+      "valid_tokens": 171679
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r1500.parquet",
+      "name": "commits8192_filler_fmt_r1500.parquet",
+      "valid_tokens": 171647
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r65500.parquet",
+      "name": "commits8192_filler_php-src_r65500.parquet",
+      "valid_tokens": 170454
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r36500.parquet",
+      "name": "commits8192_filler_php-src_r36500.parquet",
+      "valid_tokens": 170111
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r10000.parquet",
+      "name": "commits8192_filler_hpx_r10000.parquet",
+      "valid_tokens": 170033
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r79000.parquet",
+      "name": "commits8192_filler_php-src_r79000.parquet",
+      "valid_tokens": 168606
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r34500.parquet",
+      "name": "commits8192_filler_php-src_r34500.parquet",
+      "valid_tokens": 168412
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r31000.parquet",
+      "name": "commits8192_filler_php-src_r31000.parquet",
+      "valid_tokens": 168354
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r37000.parquet",
+      "name": "commits8192_filler_php-src_r37000.parquet",
+      "valid_tokens": 168024
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r80500.parquet",
+      "name": "commits8192_filler_php-src_r80500.parquet",
+      "valid_tokens": 167036
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r11000.parquet",
+      "name": "commits8192_filler_hpx_r11000.parquet",
+      "valid_tokens": 167002
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r4000.parquet",
+      "name": "commits8192_filler_botan_r4000.parquet",
+      "valid_tokens": 166556
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r14000.parquet",
+      "name": "commits8192_filler_hpx_r14000.parquet",
+      "valid_tokens": 166513
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r90500.parquet",
+      "name": "commits8192_filler_php-src_r90500.parquet",
+      "valid_tokens": 166047
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r75000.parquet",
+      "name": "commits8192_filler_php-src_r75000.parquet",
+      "valid_tokens": 164675
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r4000.parquet",
+      "name": "commits8192_filler_openfoam_r4000.parquet",
+      "valid_tokens": 164222
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r43500.parquet",
+      "name": "commits8192_filler_php-src_r43500.parquet",
+      "valid_tokens": 163585
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r23500.parquet",
+      "name": "commits8192_filler_hpx_r23500.parquet",
+      "valid_tokens": 163511
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r77500.parquet",
+      "name": "commits8192_filler_php-src_r77500.parquet",
+      "valid_tokens": 162449
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r55500.parquet",
+      "name": "commits8192_filler_php-src_r55500.parquet",
+      "valid_tokens": 160444
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/glfw_r2000.parquet",
+      "name": "commits8192_filler_glfw_r2000.parquet",
+      "valid_tokens": 159477
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r16000.parquet",
+      "name": "commits8192_filler_hpx_r16000.parquet",
+      "valid_tokens": 159271
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r70500.parquet",
+      "name": "commits8192_filler_php-src_r70500.parquet",
+      "valid_tokens": 158440
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r38000.parquet",
+      "name": "commits8192_filler_php-src_r38000.parquet",
+      "valid_tokens": 157143
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r79500.parquet",
+      "name": "commits8192_filler_php-src_r79500.parquet",
+      "valid_tokens": 156796
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r28000.parquet",
+      "name": "commits8192_filler_php-src_r28000.parquet",
+      "valid_tokens": 155247
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r5500.parquet",
+      "name": "commits8192_filler_openfoam_r5500.parquet",
+      "valid_tokens": 155173
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r2000.parquet",
+      "name": "commits8192_filler_botan_r2000.parquet",
+      "valid_tokens": 155069
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r20500.parquet",
+      "name": "commits8192_filler_php-src_r20500.parquet",
+      "valid_tokens": 155068
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r7000.parquet",
+      "name": "commits8192_filler_hpx_r7000.parquet",
+      "valid_tokens": 153221
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r84000.parquet",
+      "name": "commits8192_filler_php-src_r84000.parquet",
+      "valid_tokens": 152585
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r2000.parquet",
+      "name": "commits8192_filler_openfoam_r2000.parquet",
+      "valid_tokens": 151998
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r71000.parquet",
+      "name": "commits8192_filler_php-src_r71000.parquet",
+      "valid_tokens": 151629
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r0.parquet",
+      "name": "commits8192_filler_openfoam_r0.parquet",
+      "valid_tokens": 151226
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/xiaomi-mace_r1500.parquet",
+      "name": "commits8192_filler_xiaomi-mace_r1500.parquet",
+      "valid_tokens": 150731
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r68500.parquet",
+      "name": "commits8192_filler_php-src_r68500.parquet",
+      "valid_tokens": 147075
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r81500.parquet",
+      "name": "commits8192_filler_php-src_r81500.parquet",
+      "valid_tokens": 146773
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/fmt_r4000.parquet",
+      "name": "commits8192_filler_fmt_r4000.parquet",
+      "valid_tokens": 146664
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r65000.parquet",
+      "name": "commits8192_filler_php-src_r65000.parquet",
+      "valid_tokens": 146396
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r62000.parquet",
+      "name": "commits8192_filler_php-src_r62000.parquet",
+      "valid_tokens": 145166
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r5000.parquet",
+      "name": "commits8192_filler_botan_r5000.parquet",
+      "valid_tokens": 144606
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r63000.parquet",
+      "name": "commits8192_filler_php-src_r63000.parquet",
+      "valid_tokens": 142804
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r48000.parquet",
+      "name": "commits8192_filler_php-src_r48000.parquet",
+      "valid_tokens": 142541
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r83500.parquet",
+      "name": "commits8192_filler_php-src_r83500.parquet",
+      "valid_tokens": 142472
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r70000.parquet",
+      "name": "commits8192_filler_php-src_r70000.parquet",
+      "valid_tokens": 142051
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r8500.parquet",
+      "name": "commits8192_filler_hpx_r8500.parquet",
+      "valid_tokens": 141525
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r5000.parquet",
+      "name": "commits8192_filler_php-src_r5000.parquet",
+      "valid_tokens": 140916
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r68000.parquet",
+      "name": "commits8192_filler_php-src_r68000.parquet",
+      "valid_tokens": 140850
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r83000.parquet",
+      "name": "commits8192_filler_php-src_r83000.parquet",
+      "valid_tokens": 140542
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r85000.parquet",
+      "name": "commits8192_filler_php-src_r85000.parquet",
+      "valid_tokens": 140225
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r44500.parquet",
+      "name": "commits8192_filler_php-src_r44500.parquet",
+      "valid_tokens": 139877
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r8500.parquet",
+      "name": "commits8192_filler_botan_r8500.parquet",
+      "valid_tokens": 139506
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r42000.parquet",
+      "name": "commits8192_filler_php-src_r42000.parquet",
+      "valid_tokens": 137046
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r73000.parquet",
+      "name": "commits8192_filler_php-src_r73000.parquet",
+      "valid_tokens": 137016
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r81000.parquet",
+      "name": "commits8192_filler_php-src_r81000.parquet",
+      "valid_tokens": 136632
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r78000.parquet",
+      "name": "commits8192_filler_php-src_r78000.parquet",
+      "valid_tokens": 136071
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r60000.parquet",
+      "name": "commits8192_filler_php-src_r60000.parquet",
+      "valid_tokens": 135237
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r6000.parquet",
+      "name": "commits8192_filler_php-src_r6000.parquet",
+      "valid_tokens": 135229
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r37500.parquet",
+      "name": "commits8192_filler_php-src_r37500.parquet",
+      "valid_tokens": 135143
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r10500.parquet",
+      "name": "commits8192_filler_hpx_r10500.parquet",
+      "valid_tokens": 135106
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/openfoam_r6500.parquet",
+      "name": "commits8192_filler_openfoam_r6500.parquet",
+      "valid_tokens": 134632
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r12000.parquet",
+      "name": "commits8192_filler_botan_r12000.parquet",
+      "valid_tokens": 134076
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r73500.parquet",
+      "name": "commits8192_filler_php-src_r73500.parquet",
+      "valid_tokens": 133685
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r40500.parquet",
+      "name": "commits8192_filler_php-src_r40500.parquet",
+      "valid_tokens": 133350
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r3500.parquet",
+      "name": "commits8192_filler_botan_r3500.parquet",
+      "valid_tokens": 132306
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r12000.parquet",
+      "name": "commits8192_filler_hpx_r12000.parquet",
+      "valid_tokens": 132195
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r71500.parquet",
+      "name": "commits8192_filler_php-src_r71500.parquet",
+      "valid_tokens": 131542
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/botan_r500.parquet",
+      "name": "commits8192_filler_botan_r500.parquet",
+      "valid_tokens": 131242
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/s2n-tls_r3500.parquet",
+      "name": "commits8192_filler_s2n-tls_r3500.parquet",
+      "valid_tokens": 130252
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r57500.parquet",
+      "name": "commits8192_filler_php-src_r57500.parquet",
+      "valid_tokens": 129658
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/php-src_r39000.parquet",
+      "name": "commits8192_filler_php-src_r39000.parquet",
+      "valid_tokens": 128942
+    },
+    {
+      "kind": "commits8192_filler",
+      "source": "/Volumes/external/sources/cppmega.mlx/outputs/reindexed_commits/8192/hpx_r15500.parquet",
+      "name": "commits8192_filler_hpx_r15500.parquet",
+      "valid_tokens": 128491
+    }
+  ],
+  "megatron_prefix": "/Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/megatron_ready/cppmega_h200_100step_seq4096_graph_train",
+  "converter_log": "/Volumes/external/sources/cppmega.mlx/outputs/nebius_h200_100step/logs/convert_seq4096.log",
+  "megatron_manifest": {
+    "vocab_size": 65536,
+    "tokenizer_contract": "megacpp",
+    "dtype": "uint16",
+    "token_count": 166383616,
+    "document_count": 32344,
+    "side_channel_paths": {
+      "token_structure_ids": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_structure_ids.bin",
+        "dtype": "uint8"
+      },
+      "token_dep_levels": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_dep_levels.bin",
+        "dtype": "uint16"
+      },
+      "token_ast_depth": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_ast_depth.bin",
+        "dtype": "uint16"
+      },
+      "token_sibling_index": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_sibling_index.bin",
+        "dtype": "uint16"
+      },
+      "token_ast_node_type": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_ast_node_type.bin",
+        "dtype": "uint16"
+      },
+      "token_symbol_ids": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_symbol_ids.bin",
+        "dtype": "uint32"
+      },
+      "token_call_targets": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_call_targets.bin",
+        "dtype": "uint32"
+      },
+      "token_type_refs": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_type_refs.bin",
+        "dtype": "uint32"
+      },
+      "token_def_use": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_def_use.bin",
+        "dtype": "uint8"
+      },
+      "token_change_mask_pre": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_change_mask_pre.bin",
+        "dtype": "uint8"
+      },
+      "token_change_mask_post": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_change_mask_post.bin",
+        "dtype": "uint8"
+      },
+      "token_platform_ids": {
+        "path": "cppmega_h200_100step_seq4096_graph_train_token_platform_ids.bin",
+        "dtype": "uint16"
+      }
+    },
+    "graph_sidecar_schema": "cppmega_graph_routes_v1",
+    "graph_sidecar_paths": {
+      "token_call_edges": {
+        "kind": "edge_pairs",
+        "offsets_path": "cppmega_h200_100step_seq4096_graph_train_token_call_edges_offsets.bin",
+        "data_path": "cppmega_h200_100step_seq4096_graph_train_token_call_edges_data.bin",
+        "offset_dtype": "int64",
+        "dtype": "int32",
+        "item_count": 11406,
+        "shape_tail": [
+          2
+        ]
+      },
+      "token_type_edges": {
+        "kind": "edge_pairs",
+        "offsets_path": "cppmega_h200_100step_seq4096_graph_train_token_type_edges_offsets.bin",
+        "data_path": "cppmega_h200_100step_seq4096_graph_train_token_type_edges_data.bin",
+        "offset_dtype": "int64",
+        "dtype": "int32",
+        "item_count": 7853,
+        "shape_tail": [
+          2
+        ]
+      },
+      "token_chunk_starts": {
+        "kind": "ragged_1d",
+        "offsets_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_starts_offsets.bin",
+        "data_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_starts_data.bin",
+        "offset_dtype": "int64",
+        "dtype": "uint32",
+        "item_count": 189121
+      },
+      "token_chunk_ends": {
+        "kind": "ragged_1d",
+        "offsets_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_ends_offsets.bin",
+        "data_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_ends_data.bin",
+        "offset_dtype": "int64",
+        "dtype": "uint32",
+        "item_count": 189121
+      },
+      "token_chunk_kinds": {
+        "kind": "ragged_1d",
+        "offsets_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_kinds_offsets.bin",
+        "data_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_kinds_data.bin",
+        "offset_dtype": "int64",
+        "dtype": "uint16",
+        "item_count": 189121
+      },
+      "token_chunk_dep_levels": {
+        "kind": "ragged_1d",
+        "offsets_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_dep_levels_offsets.bin",
+        "data_path": "cppmega_h200_100step_seq4096_graph_train_token_chunk_dep_levels_data.bin",
+        "offset_dtype": "int64",
+        "dtype": "uint16",
+        "item_count": 189121
+      }
+    }
+  }
+}

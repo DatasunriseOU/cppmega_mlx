@@ -171,13 +171,13 @@ def test_verify_raises_on_nongreen_receipt(
     dest, tokens = _fresh(pristine, tmp_path)
     receipt_path = dest / "audit" / "sidecar_parquet_audit.json"
     report = json.loads(receipt_path.read_text())
-    report["total"]["bad_rows"] = 1
+    report["by_kind_bucket"][f"code/{BUCKET}"]["bad_rows"] = 1
     receipt_path.write_text(json.dumps(report))
     with pytest.raises(SystemExit) as exc:
         download._verify_downloaded_set(
             dest=dest, manifest=_manifest(tokens), require_token_total=True
         )
-    assert "not green" in str(exc.value)
+    assert f"code/{BUCKET}" in str(exc.value)
 
 
 def test_verify_raises_when_token_total_required_but_absent(
