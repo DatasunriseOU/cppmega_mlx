@@ -35,6 +35,10 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_DOC_IDS_COLUMN,
     SOURCE_FILEPATH_STABLE_IDS_COLUMN,
     SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN,
+    SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+    SOURCE_PR_DISCUSSION_CHARS_COLUMN,
+    SOURCE_PR_DISCUSSION_LINES_COLUMN,
+    SOURCE_PR_NUMBERS_COLUMN,
     SOURCE_REPO_STABLE_IDS_COLUMN,
     TARGET_IDS_COLUMN,
     TOKEN_PLATFORM_IDS_COLUMN,
@@ -49,12 +53,16 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     FILEPATH_STABLE_ID_COLUMN,
     FILE_LOCAL_COMMIT_INDEX_COLUMN,
     HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN,
+    HAS_PR_DISCUSSION_COLUMN,
     HAS_RENAME_AMBIGUITY_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
     IS_MERGE_COMMIT_COLUMN,
     PARENT_COUNT_COLUMN,
     PARENT_HASHES_COLUMN,
     PLATFORM_IDS_COLUMN,
+    PR_DISCUSSION_CHARS_COLUMN,
+    PR_DISCUSSION_LINES_COLUMN,
+    PR_NUMBER_COLUMN,
     RAW_COMMIT_CHRONOLOGY_COLUMNS,
     REPO_COLUMN,
     REPO_STABLE_ID_COLUMN,
@@ -148,11 +156,19 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_REPO_STABLE_IDS_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_FILEPATH_STABLE_IDS_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN, pa.list_(pa.int32())),
+        pa.field(SOURCE_PR_NUMBERS_COLUMN, pa.list_(pa.int64())),
+        pa.field(SOURCE_HAS_PR_DISCUSSIONS_COLUMN, pa.list_(pa.bool_())),
+        pa.field(SOURCE_PR_DISCUSSION_CHARS_COLUMN, pa.list_(pa.int32())),
+        pa.field(SOURCE_PR_DISCUSSION_LINES_COLUMN, pa.list_(pa.int32())),
         pa.field(ROW_PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
         pa.field(REPO_COLUMN, pa.string()),
         pa.field(FILEPATH_COLUMN, pa.string()),
         pa.field(COMMIT_HASH_COLUMN, pa.string()),
         pa.field(TIMESTAMP_COLUMN, pa.string()),
+        pa.field(PR_NUMBER_COLUMN, pa.int64()),
+        pa.field(HAS_PR_DISCUSSION_COLUMN, pa.bool_()),
+        pa.field(PR_DISCUSSION_CHARS_COLUMN, pa.int32()),
+        pa.field(PR_DISCUSSION_LINES_COLUMN, pa.int32()),
         pa.field(PARENT_HASHES_COLUMN, pa.list_(pa.string())),
         pa.field(PARENT_COUNT_COLUMN, pa.int32()),
         pa.field(IS_MERGE_COMMIT_COLUMN, pa.bool_()),
@@ -468,6 +484,12 @@ def _coerce_optional_int(value: object) -> int | None:
     return None
 
 
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+    return bool(value)
+
+
 def _as_int_list(value: Any) -> list[int]:
     if value is None:
         return []
@@ -575,6 +597,16 @@ def _normalize_chronology(record: dict[str, Any]) -> dict[str, Any]:
         FILEPATH_COLUMN: record.get(FILEPATH_COLUMN),
         COMMIT_HASH_COLUMN: record.get(COMMIT_HASH_COLUMN),
         TIMESTAMP_COLUMN: record.get(TIMESTAMP_COLUMN),
+        PR_NUMBER_COLUMN: _coerce_optional_int(record.get(PR_NUMBER_COLUMN)),
+        HAS_PR_DISCUSSION_COLUMN: _coerce_bool(
+            record.get(HAS_PR_DISCUSSION_COLUMN, False)
+        ),
+        PR_DISCUSSION_CHARS_COLUMN: int(
+            record.get(PR_DISCUSSION_CHARS_COLUMN) or 0
+        ),
+        PR_DISCUSSION_LINES_COLUMN: int(
+            record.get(PR_DISCUSSION_LINES_COLUMN) or 0
+        ),
         PARENT_HASHES_COLUMN: [
             str(item) for item in (record.get(PARENT_HASHES_COLUMN) or [])
         ],
@@ -888,6 +920,9 @@ def read_tokenized_documents(
                 "doc_id",
                 PLATFORM_IDS_COLUMN,
                 *RAW_COMMIT_CHRONOLOGY_COLUMNS,
+                HAS_PR_DISCUSSION_COLUMN,
+                PR_DISCUSSION_CHARS_COLUMN,
+                PR_DISCUSSION_LINES_COLUMN,
                 *PACKED_TOKEN_METADATA_COLUMNS,
                 *PACKED_CHUNK_METADATA_COLUMNS,
             )
@@ -1058,6 +1093,10 @@ def _materialize_packed_row(
     source_repo_stable_ids: list[str | None] = []
     source_filepath_stable_ids: list[str | None] = []
     source_file_local_commit_indices: list[int | None] = []
+    source_pr_numbers: list[int | None] = []
+    source_has_pr_discussions: list[bool] = []
+    source_pr_discussion_chars: list[int] = []
+    source_pr_discussion_lines: list[int] = []
     chronology = _shared_chronology_for_docs(ordered_docs)
 
     token_meta_acc: dict[str, list[int]] = {
@@ -1090,6 +1129,16 @@ def _materialize_packed_row(
         source_filepath_stable_ids.append(doc.chronology.get(FILEPATH_STABLE_ID_COLUMN))
         source_file_local_commit_indices.append(
             doc.chronology.get(FILE_LOCAL_COMMIT_INDEX_COLUMN)
+        )
+        source_pr_numbers.append(doc.chronology.get(PR_NUMBER_COLUMN))
+        source_has_pr_discussions.append(
+            bool(doc.chronology.get(HAS_PR_DISCUSSION_COLUMN, False))
+        )
+        source_pr_discussion_chars.append(
+            int(doc.chronology.get(PR_DISCUSSION_CHARS_COLUMN) or 0)
+        )
+        source_pr_discussion_lines.append(
+            int(doc.chronology.get(PR_DISCUSSION_LINES_COLUMN) or 0)
         )
 
         for column in PACKED_TOKEN_METADATA_COLUMNS:
@@ -1193,7 +1242,14 @@ def _materialize_packed_row(
         SOURCE_REPO_STABLE_IDS_COLUMN: source_repo_stable_ids,
         SOURCE_FILEPATH_STABLE_IDS_COLUMN: source_filepath_stable_ids,
         SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN: source_file_local_commit_indices,
+        SOURCE_PR_NUMBERS_COLUMN: source_pr_numbers,
+        SOURCE_HAS_PR_DISCUSSIONS_COLUMN: source_has_pr_discussions,
+        SOURCE_PR_DISCUSSION_CHARS_COLUMN: source_pr_discussion_chars,
+        SOURCE_PR_DISCUSSION_LINES_COLUMN: source_pr_discussion_lines,
         ROW_PLATFORM_IDS_COLUMN: _merged_platform_ids_for_docs(ordered_docs),
+        HAS_PR_DISCUSSION_COLUMN: any(source_has_pr_discussions),
+        PR_DISCUSSION_CHARS_COLUMN: sum(source_pr_discussion_chars),
+        PR_DISCUSSION_LINES_COLUMN: sum(source_pr_discussion_lines),
         CHANGED_CHUNK_IDS_COLUMN: changed_chunk_ids,
         CHANGED_CHUNK_SPANS_COLUMN: changed_chunk_spans,
         TOKEN_CHUNK_STARTS_COLUMN: chunk_starts,
@@ -1295,11 +1351,39 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                     int(item) if item is not None else None
                     for item in row.get(SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN, [])
                 ],
+                SOURCE_PR_NUMBERS_COLUMN: [
+                    int(item) if item is not None else None
+                    for item in row.get(SOURCE_PR_NUMBERS_COLUMN, [])
+                ],
+                SOURCE_HAS_PR_DISCUSSIONS_COLUMN: [
+                    bool(item)
+                    for item in row.get(SOURCE_HAS_PR_DISCUSSIONS_COLUMN, [])
+                ],
+                SOURCE_PR_DISCUSSION_CHARS_COLUMN: [
+                    int(item)
+                    for item in row.get(SOURCE_PR_DISCUSSION_CHARS_COLUMN, [])
+                ],
+                SOURCE_PR_DISCUSSION_LINES_COLUMN: [
+                    int(item)
+                    for item in row.get(SOURCE_PR_DISCUSSION_LINES_COLUMN, [])
+                ],
                 ROW_PLATFORM_IDS_COLUMN: _as_int_list(row.get(ROW_PLATFORM_IDS_COLUMN)),
                 REPO_COLUMN: row.get(REPO_COLUMN),
                 FILEPATH_COLUMN: row.get(FILEPATH_COLUMN),
                 COMMIT_HASH_COLUMN: row.get(COMMIT_HASH_COLUMN),
                 TIMESTAMP_COLUMN: row.get(TIMESTAMP_COLUMN),
+                PR_NUMBER_COLUMN: _coerce_optional_int(row.get(PR_NUMBER_COLUMN)),
+                HAS_PR_DISCUSSION_COLUMN: (
+                    bool(row.get(HAS_PR_DISCUSSION_COLUMN))
+                    if row.get(HAS_PR_DISCUSSION_COLUMN) is not None
+                    else None
+                ),
+                PR_DISCUSSION_CHARS_COLUMN: int(
+                    row.get(PR_DISCUSSION_CHARS_COLUMN) or 0
+                ),
+                PR_DISCUSSION_LINES_COLUMN: int(
+                    row.get(PR_DISCUSSION_LINES_COLUMN) or 0
+                ),
                 PARENT_HASHES_COLUMN: [
                     str(item) for item in row.get(PARENT_HASHES_COLUMN, [])
                 ],

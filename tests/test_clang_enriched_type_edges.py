@@ -141,3 +141,16 @@ def test_semantic_char_columns_propagate():
     assert table.column("symbol_ids").type == conv._SCHEMA.field("symbol_ids").type
     assert table.column("type_refs").type == conv._SCHEMA.field("type_refs").type
     assert table.column("def_use").type == conv._SCHEMA.field("def_use").type
+
+
+def test_pr_discussion_audit_columns_propagate():
+    row = _minimal_row(
+        pr_number=17,
+        pr_discussion="title\nbody line",
+    )
+    table = conv.rows_to_table([row])
+
+    assert table.column("pr_number").to_pylist() == [17]
+    assert table.column("has_pr_discussion").to_pylist() == [True]
+    assert table.column("pr_discussion_chars").to_pylist() == [15]
+    assert table.column("pr_discussion_lines").to_pylist() == [2]

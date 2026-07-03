@@ -77,11 +77,14 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     FILEPATH_STABLE_ID_COLUMN,
     FILE_LOCAL_COMMIT_INDEX_COLUMN,
     HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN,
+    HAS_PR_DISCUSSION_COLUMN,
     HAS_RENAME_AMBIGUITY_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
     IS_MERGE_COMMIT_COLUMN,
     PARENT_COUNT_COLUMN,
     PARENT_HASHES_COLUMN,
+    PR_DISCUSSION_CHARS_COLUMN,
+    PR_DISCUSSION_LINES_COLUMN,
     PR_NUMBER_COLUMN,
     REPO_COLUMN,
     REPO_STABLE_ID_COLUMN,
@@ -365,6 +368,9 @@ _SCHEMA = pa.schema([
     pa.field(COMMIT_HASH_COLUMN, pa.string()),
     pa.field(TIMESTAMP_COLUMN, pa.string()),
     pa.field(PR_NUMBER_COLUMN, pa.int64()),
+    pa.field(HAS_PR_DISCUSSION_COLUMN, pa.bool_()),
+    pa.field(PR_DISCUSSION_CHARS_COLUMN, pa.int32()),
+    pa.field(PR_DISCUSSION_LINES_COLUMN, pa.int32()),
     pa.field(PARENT_HASHES_COLUMN, pa.list_(pa.string())),
     pa.field(PARENT_COUNT_COLUMN, pa.int32()),
     pa.field(IS_MERGE_COMMIT_COLUMN, pa.bool_()),
@@ -493,6 +499,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     commits = []
     timestamps = []
     pr_numbers = []
+    has_pr_discussions = []
+    pr_discussion_chars = []
+    pr_discussion_lines = []
     parent_hashes = []
     parent_counts = []
     is_merge_commits = []
@@ -674,6 +683,12 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         timestamps.append(row.get(TIMESTAMP_COLUMN, ""))
         _pr = row.get(PR_NUMBER_COLUMN)
         pr_numbers.append(int(_pr) if _pr not in (None, "", 0) else None)
+        _discussion = str(row.get("pr_discussion") or "").strip()
+        has_pr_discussions.append(bool(_discussion))
+        pr_discussion_chars.append(len(_discussion))
+        pr_discussion_lines.append(
+            0 if not _discussion else _discussion.count("\n") + 1
+        )
         parent_hashes.append(row.get(PARENT_HASHES_COLUMN, []))
         parent_counts.append(row.get(PARENT_COUNT_COLUMN))
         is_merge_commits.append(row.get(IS_MERGE_COMMIT_COLUMN))
@@ -855,6 +870,18 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             COMMIT_HASH_COLUMN: pa.array(commits, type=_SCHEMA.field(COMMIT_HASH_COLUMN).type),
             TIMESTAMP_COLUMN: pa.array(timestamps, type=_SCHEMA.field(TIMESTAMP_COLUMN).type),
             PR_NUMBER_COLUMN: pa.array(pr_numbers, type=_SCHEMA.field(PR_NUMBER_COLUMN).type),
+            HAS_PR_DISCUSSION_COLUMN: pa.array(
+                has_pr_discussions,
+                type=_SCHEMA.field(HAS_PR_DISCUSSION_COLUMN).type,
+            ),
+            PR_DISCUSSION_CHARS_COLUMN: pa.array(
+                pr_discussion_chars,
+                type=_SCHEMA.field(PR_DISCUSSION_CHARS_COLUMN).type,
+            ),
+            PR_DISCUSSION_LINES_COLUMN: pa.array(
+                pr_discussion_lines,
+                type=_SCHEMA.field(PR_DISCUSSION_LINES_COLUMN).type,
+            ),
             PARENT_HASHES_COLUMN: pa.array(parent_hashes, type=_SCHEMA.field(PARENT_HASHES_COLUMN).type),
             PARENT_COUNT_COLUMN: pa.array(parent_counts, type=_SCHEMA.field(PARENT_COUNT_COLUMN).type),
             IS_MERGE_COMMIT_COLUMN: pa.array(is_merge_commits, type=_SCHEMA.field(IS_MERGE_COMMIT_COLUMN).type),

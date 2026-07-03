@@ -10,7 +10,16 @@ from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_HASH_COLUMN,
+    HAS_PR_DISCUSSION_COLUMN,
     PLATFORM_IDS_COLUMN,
+    PR_DISCUSSION_CHARS_COLUMN,
+    PR_DISCUSSION_LINES_COLUMN,
+    PR_NUMBER_COLUMN,
+    REPO_COLUMN,
+    REPO_STABLE_ID_COLUMN,
+    FILEPATH_STABLE_ID_COLUMN,
+    FILE_LOCAL_COMMIT_INDEX_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
     TOKEN_BUILD_EDGES_COLUMN,
@@ -33,6 +42,10 @@ from scripts.nanochat_data.pack_enriched_rows import (
     NUM_DOCS_COLUMN,
     PACK_ID_COLUMN,
     SOURCE_DOC_INDICES_COLUMN,
+    SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+    SOURCE_PR_DISCUSSION_CHARS_COLUMN,
+    SOURCE_PR_DISCUSSION_LINES_COLUMN,
+    SOURCE_PR_NUMBERS_COLUMN,
     TARGET_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
     normalize_document_record,
@@ -157,6 +170,47 @@ def test_loss_mask_excludes_padding_and_cross_document_targets() -> None:
     assert row[TARGET_IDS_COLUMN] == [2, 10, 11, 0, 0]
     assert row[DOC_IDS_COLUMN] == [1, 1, 2, 2, 2]
     assert row[LOSS_MASK_COLUMN] == [1, 0, 1, 0, 0]
+
+
+def test_pack_documents_preserves_pr_discussion_source_metadata() -> None:
+    first = _doc([1, 2])
+    first.update(
+        {
+            REPO_COLUMN: "owner/repo",
+            COMMIT_HASH_COLUMN: "abc123",
+            REPO_STABLE_ID_COLUMN: "repo-id",
+            FILEPATH_STABLE_ID_COLUMN: "file-id",
+            FILE_LOCAL_COMMIT_INDEX_COLUMN: 0,
+            PR_NUMBER_COLUMN: 42,
+            HAS_PR_DISCUSSION_COLUMN: True,
+            PR_DISCUSSION_CHARS_COLUMN: 17,
+            PR_DISCUSSION_LINES_COLUMN: 2,
+        }
+    )
+    second = _doc([10, 11])
+    second.update(
+        {
+            REPO_COLUMN: "owner/repo",
+            COMMIT_HASH_COLUMN: "def456",
+            REPO_STABLE_ID_COLUMN: "repo-id",
+            FILEPATH_STABLE_ID_COLUMN: "file-id",
+            FILE_LOCAL_COMMIT_INDEX_COLUMN: 1,
+        }
+    )
+    docs = _normalize([first, second])
+
+    rows, overflow = pack_documents(docs, target_length=5, pad_token_id=0)
+
+    assert overflow == []
+    row = rows[0]
+    assert row[SOURCE_PR_NUMBERS_COLUMN] == [42, None]
+    assert row[SOURCE_HAS_PR_DISCUSSIONS_COLUMN] == [True, False]
+    assert row[SOURCE_PR_DISCUSSION_CHARS_COLUMN] == [17, 0]
+    assert row[SOURCE_PR_DISCUSSION_LINES_COLUMN] == [2, 0]
+    assert row[HAS_PR_DISCUSSION_COLUMN] is True
+    assert row[PR_DISCUSSION_CHARS_COLUMN] == 17
+    assert row[PR_DISCUSSION_LINES_COLUMN] == 2
+    assert row[PR_NUMBER_COLUMN] is None
 
 
 def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
