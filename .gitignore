@@ -65,10 +65,14 @@ vbgui/.DS_Store
 secrets/
 .env
 outputs/secrets/
+outputs/
 *.gh_tokens
 outputs/logs/*
 outputs/*.log
 outputs/megatron*
+outputs/megatron_ready/
+outputs/checkpoints/
+outputs/nebius_h200_100step/
 outputs/reindexed/*
 outputs/pr_ingest/*
 outputs/verification_report/*
@@ -92,6 +96,11 @@ outputs/non_strict_backup_20260626_165907/*
 outputs/profiles/*
 outputs/reindexed_pr/*
 outputs/conveyor/tmp/*
+outputs/conveyor/tmp/
+outputs/conveyor/extract_cache/
+outputs/conveyor/locks/
+outputs/conveyor/*.jsonl
+outputs/conveyor/_reservations.json
 outputs/conveyor/tmp/streaming_conveyor_aq5oisfq/aosp-frameworks-native/_src/METADATA
 outputs/nebius_smoke/parquet/*
 outputs/*.json

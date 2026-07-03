@@ -1,9 +1,0 @@
-step 1 action: load preset deepseek_v4_flash
-step 2 action: Auto Align Graph (folded), then measure
-  [folded] nodes=9 edges=9 node_overlaps=0 edge_crossings=0
-step 3 action: unpack modal -> stepper+ =True stepper- =True numeric_input=True
-step 4 action: Unpack All, then Auto Align Graph on expanded graph
-  [unpacked] nodes=32 edges=62 node_overlaps=0 edge_crossings=221
-RESULT CP4 no_overlap (folded+unpacked) = PASS
-RESULT CP7 unpack_stepper+numeric        = PASS
-FINAL: folded(nodes=9,xings=0,ovl=0) unpacked(nodes=32,xings=221,ovl=0)

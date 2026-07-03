@@ -403,6 +403,123 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
     assert (done, failed, all_done) == (0, 0, True)
 
 
+def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "repo"
+    work_root = tmp_path / "work"
+    repo_work = work_root / repo
+    repo_dir = repo_work / "_src"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "main.cpp").write_text("int f() { return 1; }\n", encoding="utf-8")
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    cache_dir.mkdir(parents=True)
+    (cache_dir / f"{repo}_commits.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+
+    def fake_code_half(*_args, **_kwargs):
+        return {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=32, target_length=1024)},
+        }
+
+    def fake_commits_half(*_args, **_kwargs):
+        return 0, 0, False
+
+    monkeypatch.setattr(streaming_conveyor, "run_code_half_adaptive", fake_code_half)
+    monkeypatch.setattr(streaming_conveyor, "run_commits_half", fake_commits_half)
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        streaming_conveyor.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(1024,),
+            range_size=500,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=streaming_conveyor.threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=False,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=None,
+            streams="both",
+        )
+
+    assert manifest.is_done("repo::code")
+    assert not repo_work.exists()
+    assert not cache_dir.exists()
+
+
+def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "repo"
+    work_root = tmp_path / "work"
+    repo_work = work_root / repo
+    repo_dir = repo_work / "_src"
+    repo_dir.mkdir(parents=True)
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+
+    def fake_code_half(*_args, **_kwargs):
+        return {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=32, target_length=1024)},
+        }
+
+    def fake_commits_half(*_args, **_kwargs):
+        return 0, 0, False
+
+    monkeypatch.setattr(streaming_conveyor, "run_code_half_adaptive", fake_code_half)
+    monkeypatch.setattr(streaming_conveyor, "run_commits_half", fake_commits_half)
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        streaming_conveyor.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(1024,),
+            range_size=500,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=streaming_conveyor.threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=False,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=None,
+            streams="both",
+            retain_partial_work=True,
+        )
+
+    assert repo_work.exists()
+    assert cache_dir.exists()
+
+
 def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -608,6 +725,33 @@ def test_default_conveyor_work_parent_lives_under_outputs():
     assert args.work_dir is None
     assert Path(args.work_parent_dir) == streaming_conveyor.DEFAULT_WORK_PARENT
     assert "outputs/conveyor/tmp" in str(streaming_conveyor.DEFAULT_WORK_PARENT)
+    assert args.retain_partial_work is False
+    assert args.min_free_disk_gb == streaming_conveyor.DEFAULT_MIN_FREE_DISK_GB
+
+
+def test_min_free_disk_guard_fails_loud_before_staging(tmp_path, monkeypatch):
+    from collections import namedtuple
+
+    import pytest
+
+    import streaming_conveyor
+
+    Usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        streaming_conveyor.shutil,
+        "disk_usage",
+        lambda _path: Usage(total=100 * 1024**3, used=96 * 1024**3, free=4 * 1024**3),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        streaming_conveyor.ensure_min_free_disk(
+            tmp_path,
+            10.0,
+            context="unit test",
+        )
+
+    assert "unsafe conveyor disk state" in str(excinfo.value)
+    assert "unit test" in str(excinfo.value)
 
 
 def test_conveyor_memory_plan_rejects_oversubscribed_parallelism():

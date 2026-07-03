@@ -115,6 +115,7 @@ DEFAULT_MEMORY_BUDGET_FALLBACK_GB = 48.0
 DEFAULT_MIN_RETRY_RANGE_SIZE = 25
 DEFAULT_RANGE_TARGET_BYTES = 32 * 1024 * 1024
 DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
+DEFAULT_MIN_FREE_DISK_GB = 50.0
 
 # Stable, repo-keyed cache for the EXPENSIVE git-history extraction output. This
 # deliberately lives OUTSIDE the randomized per-run work_root so the commit
@@ -137,6 +138,36 @@ STOP_EVENT = threading.Event()
 def _log(msg: str) -> None:
     with _PRINT_LOCK:
         print(msg, file=sys.stderr, flush=True)
+
+
+def disk_free_gb(path: Path) -> float:
+    """Return free space on the filesystem containing ``path`` in GiB."""
+    probe = path if path.exists() else path.parent
+    usage = shutil.disk_usage(probe)
+    return float(usage.free) / (1024**3)
+
+
+def ensure_min_free_disk(path: Path, min_free_gb: float, *, context: str) -> None:
+    """Fail loud before staging more raw source when the work disk is too full."""
+    threshold = float(min_free_gb or 0.0)
+    if threshold <= 0.0:
+        return
+    free = disk_free_gb(path)
+    if free < threshold:
+        raise SystemExit(
+            f"unsafe conveyor disk state before {context}: "
+            f"{free:.2f} GiB free under {path}, "
+            f"minimum required is {threshold:.2f} GiB. "
+            "Clean outputs/conveyor/tmp or lower --min-free-disk-gb explicitly."
+        )
+
+
+def remove_tree(path: Path, *, reason: str) -> None:
+    """Best-effort tree removal with a single useful log line."""
+    if not path.exists():
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    _log(f"CLEANUP {reason}: removed {path}")
 
 
 def physical_memory_gb() -> float | None:
@@ -1975,16 +2006,18 @@ def process_one_repo(
     range_submit_window: int = 1,
     analysis_cache_entries: int = 128,
     dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
+    retain_partial_work: bool = False,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
     The repo was extracted ONCE (incl .git) by the .git-preserving stream into
     ``repo_dir`` (== work_root/<repo>/_src). The CODE half runs first (it does
     NOT touch .git); then the COMMITS half consumes + deletes .git. The repo work
-    dir (and the stable extract cache) are removed at the end ONLY when EVERY unit
-    of the repo is marked done; an interrupted / failed / partial repo RETAINS its
-    temp so resume loses zero work. RULE #1: a failure in one half is recorded;
-    the other half still runs.
+    dir (and the stable extract cache) are removed at the end. Fully-done repos
+    are always cleaned. Interrupted / failed / partial repos are also cleaned by
+    default so the conveyor cannot fill the disk with raw source clones; use
+    --retain-partial-work for the older zero-rework resume mode. RULE #1: a
+    failure in one half is recorded; the other half still runs.
     """
     repo_work = work_root / repo
     repo_work.mkdir(parents=True, exist_ok=True)
@@ -2123,22 +2156,26 @@ def process_one_repo(
                     manifest.mark_failed(f"{repo}::commits", exc.stage, exc.detail)
         return result
     finally:
-        # TEMP RETENTION (requirement 3): delete the repo work dir (incl _src) AND
-        # the stable extract cache ONLY when EVERY unit of this repo is marked done
-        # (code + every range). A mid-repo kill, a failed unit, or signal-cancelled
-        # ranges leave this False -> the temp + cached commit records are RETAINED
-        # so resume re-uses them and loses zero work. Only on full completion do we
-        # reclaim disk (bounded ~1 repo of source on disk for fully-done repos).
+        # Production default is disk-bounded: keep completed parquet + manifest,
+        # but delete raw source / JSONL / stage scratch even when a repo is only
+        # partially done. Resume re-extracts unfinished units instead of pinning
+        # hundreds of GiB in outputs/conveyor/tmp. The old zero-rework behavior is
+        # still explicit via --retain-partial-work or --keep-temp.
         fully_done = repo_fully_done(repo, manifest, streams, all_ranges_done)
         if keep_temp:
             pass
         elif fully_done:
-            shutil.rmtree(repo_work, ignore_errors=True)
-            shutil.rmtree(extract_cache_dir(repo), ignore_errors=True)
-        else:
+            remove_tree(repo_work, reason=f"{repo} fully done work")
+            remove_tree(extract_cache_dir(repo), reason=f"{repo} fully done extract cache")
+        elif retain_partial_work:
             _log(f"RETAIN temp for {repo}: not all units marked done "
                  f"(interrupted/failed/partial); kept {repo_work} + extract cache "
-                 f"{extract_cache_dir(repo)} for resume")
+                 f"{extract_cache_dir(repo)} for zero-rework resume")
+        else:
+            remove_tree(repo_work, reason=f"{repo} partial work")
+            remove_tree(extract_cache_dir(repo), reason=f"{repo} partial extract cache")
+            _log(f"CLEANUP partial for {repo}: unfinished units remain unmarked; "
+                 "resume will re-extract/re-run only unfinished work from manifest")
 
 
 # --------------------------------------------------------------------------- #
@@ -2196,6 +2233,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "buckets) reaches this.")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--keep-temp", action="store_true")
+    p.add_argument("--retain-partial-work", action="store_true",
+                   help="Retain raw source clones, range scratch and extracted "
+                        "commit JSONL for interrupted/failed/partial repos. "
+                        "Default is OFF: completed parquet + manifest are kept, "
+                        "but intermediates are deleted so disk stays bounded.")
+    p.add_argument("--min-free-disk-gb", type=float,
+                   default=DEFAULT_MIN_FREE_DISK_GB,
+                   help="Fail loud before staging a new repo when the filesystem "
+                        "under --work-parent-dir has less free space than this. "
+                        "Use 0 to disable. "
+                        f"Default {DEFAULT_MIN_FREE_DISK_GB:.0f} GiB.")
     p.add_argument("--work-dir", default=None)
     p.add_argument("--work-parent-dir", default=str(DEFAULT_WORK_PARENT),
                    help="Parent directory for conveyor temporary work dirs when "
@@ -2342,7 +2390,7 @@ def main(argv: list[str]) -> int:
         name = signal.Signals(signum).name
         if STOP_EVENT.is_set():
             _log(f"Signal {name} again: FORCING immediate exit (130). Completed "
-                 "units already persisted; in-progress temp retained for resume.")
+                 "units already persisted; in-progress temp may be retained.")
             os._exit(130)
         STOP_EVENT.set()
         _log(f"Signal {name} received: CHECKPOINTING -- no new repos/ranges "
@@ -2461,6 +2509,9 @@ def main(argv: list[str]) -> int:
         target_lengths_code=list(lengths_code),
         target_lengths_commits=list(lengths_commits),
         manifest=str(CONVEYOR_MANIFEST),
+        retain_partial_work=args.retain_partial_work,
+        keep_temp=args.keep_temp,
+        min_free_disk_gb=args.min_free_disk_gb,
         dedup_checkpoint_tokens=args.dedup_checkpoint_tokens,
         dedup_checkpoint_mode=args.dedup_checkpoint_mode,
         parse_workers=parse_workers,
@@ -2494,11 +2545,21 @@ def main(argv: list[str]) -> int:
         own_work_root = False
     else:
         work_parent.mkdir(parents=True, exist_ok=True)
+        ensure_min_free_disk(
+            work_parent,
+            args.min_free_disk_gb,
+            context="creating conveyor work root",
+        )
         os.environ.setdefault("TMPDIR", str(work_parent))
         os.environ.setdefault("TMP", str(work_parent))
         os.environ.setdefault("TEMP", str(work_parent))
         work_root = Path(tempfile.mkdtemp(prefix="streaming_conveyor_", dir=str(work_parent)))
         own_work_root = True
+    ensure_min_free_disk(
+        work_parent,
+        args.min_free_disk_gb,
+        context="starting conveyor",
+    )
     progress.emit("work_root_ready", work_root=str(work_root), own_work_root=own_work_root)
 
     cumulative = {"valid": 0}
@@ -2515,7 +2576,7 @@ def main(argv: list[str]) -> int:
         # Otherwise skip extraction when the manifest itself proves every stream
         # for this repo is complete; partial/ambiguous repos still stage and use
         # the existing per-half/per-range resume below.
-        return should_stage_repo_from_manifest(
+        should_stage = should_stage_repo_from_manifest(
             repo,
             streams=args.streams,
             resume=resume,
@@ -2523,6 +2584,13 @@ def main(argv: list[str]) -> int:
             range_size=args.range_size,
             only_repos=only_repos,
         )
+        if should_stage:
+            ensure_min_free_disk(
+                work_parent,
+                args.min_free_disk_gb,
+                context=f"staging repo {repo}",
+            )
+        return should_stage
 
     range_pool = ThreadPoolExecutor(max_workers=workers)
     repo_pool = ThreadPoolExecutor(max_workers=repo_workers) if repo_workers > 1 else None
@@ -2603,6 +2671,7 @@ def main(argv: list[str]) -> int:
                     range_submit_window=range_submit_window,
                     analysis_cache_entries=args.analysis_cache_entries,
                     dedup_promote_batch_size=dedup_promote_batch_size,
+                    retain_partial_work=args.retain_partial_work,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -2691,6 +2760,7 @@ def main(argv: list[str]) -> int:
                     range_submit_window=range_submit_window,
                     analysis_cache_entries=args.analysis_cache_entries,
                     dedup_promote_batch_size=dedup_promote_batch_size,
+                    retain_partial_work=args.retain_partial_work,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
@@ -2703,11 +2773,12 @@ def main(argv: list[str]) -> int:
             repo_pool.shutdown(wait=True)
         range_pool.shutdown(wait=True)
         interrupted = STOP_EVENT.is_set()
-        # On a clean full run we reclaim the randomized work_root. On a SIGNAL
-        # stop we RETAIN it (in-progress _src kept for resume; the expensive
-        # commit records already live in the persistent extract cache regardless).
+        # Reclaim the randomized work_root whenever production cleanup is active.
+        # --retain-partial-work keeps the older zero-rework signal/debug mode.
         if own_work_root and not args.keep_temp and not interrupted:
-            shutil.rmtree(work_root, ignore_errors=True)
+            remove_tree(work_root, reason="clean run work_root")
+        elif own_work_root and not args.keep_temp and interrupted and not args.retain_partial_work:
+            remove_tree(work_root, reason="interrupted run work_root")
         for lock in reversed(run_locks):
             lock.close()
 

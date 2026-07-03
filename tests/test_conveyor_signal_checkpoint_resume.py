@@ -114,6 +114,7 @@ def _build(ckpt_root: Path):
         "--dedup-checkpoint-tokens", "0",
         "--memory-limit-gb", "99",
         "--memory-budget-gb", "0",
+        "--retain-partial-work",
     ]
     return paths, env, argv
 
