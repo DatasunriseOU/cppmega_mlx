@@ -2896,6 +2896,13 @@ def _parse_file_batch(args_tuple):
     return {"functions": func_results, "typedefs": type_results}, len(filepaths), errors
 
 
+def _iter_parse_batch_results(executor, batches):
+    """Yield parse batch results as workers finish, not in submit order."""
+    futures = [executor.submit(_parse_file_batch, batch) for batch in batches]
+    for future in as_completed(futures):
+        yield future.result()
+
+
 def _parse_single_file_worker(args_tuple):
     """Parse one file in a fresh subprocess so a segfault is file-local."""
     filepath, compile_db, default_args, project_dir = args_tuple
@@ -3039,7 +3046,10 @@ def process_project(
         total_errors = 0
         try:
             with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                for payload, parsed_count, error_count in executor.map(_parse_file_batch, batches):
+                for payload, parsed_count, error_count in _iter_parse_batch_results(
+                    executor,
+                    batches,
+                ):
                     for d in payload["functions"]:
                         index_obj.add_function(FunctionDef.from_dict(d))
                     for td in payload["typedefs"]:
