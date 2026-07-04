@@ -665,6 +665,7 @@ def populate_source_cache(
     source_cache_dir: Path,
     *,
     max_repos: int | None = None,
+    on_repo_ready: Callable[[str, Path, int], None] | None = None,
 ) -> dict:
     """Materialize source-cache repos without running the tokenization pipeline.
 
@@ -684,6 +685,8 @@ def populate_source_cache(
     try:
         for repo, repo_dir in gen:
             repos.append({"repo": repo, "path": str(repo_dir)})
+            if on_repo_ready is not None:
+                on_repo_ready(repo, repo_dir, len(repos))
             if max_repos is not None and len(repos) >= max_repos:
                 break
     finally:

@@ -66,15 +66,25 @@ def test_populate_code_source_cache_emits_ready_and_summary(tmp_path, monkeypatc
     cache = tmp_path / "source_cache"
     observed = {}
 
-    def fake_populate(work_root, should_process, source_cache_dir, *, max_repos):
+    def fake_populate(
+        work_root,
+        should_process,
+        source_cache_dir,
+        *,
+        max_repos,
+        on_repo_ready,
+    ):
         observed["work_root"] = work_root
         observed["source_cache_dir"] = source_cache_dir
         observed["max_repos"] = max_repos
+        observed["has_callback"] = on_repo_ready is not None
         repos = []
         for repo in ("repo-a", "repo.bare", "repo-b"):
             if should_process(repo):
                 repos.append({"repo": repo, "path": str(source_cache_dir / repo)})
         repos = repos[:max_repos]
+        for idx, item in enumerate(repos, start=1):
+            on_repo_ready(item["repo"], Path(item["path"]), idx)
         return {
             "source_cache_dir": str(source_cache_dir),
             "repos": repos,
@@ -95,6 +105,7 @@ def test_populate_code_source_cache_emits_ready_and_summary(tmp_path, monkeypatc
         "work_root": tmp_path / "work",
         "source_cache_dir": cache,
         "max_repos": 1,
+        "has_callback": True,
     }
     assert report["repo_count"] == 1
     rows = [

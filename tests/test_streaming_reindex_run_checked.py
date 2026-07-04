@@ -170,14 +170,17 @@ def test_populate_source_cache_only_materializes_cache(tmp_path, monkeypatch) ->
 
     monkeypatch.setattr(streaming_reindex, "stream_repo_subtrees", fake_stream)
 
+    ready = []
     report = streaming_reindex.populate_source_cache(
         tmp_path / "work",
         streaming_reindex.is_code_worktree_repo,
         cache,
         max_repos=1,
+        on_repo_ready=lambda repo, path, count: ready.append((repo, path, count)),
     )
 
     assert calls == [(tmp_path / "work", cache, False)]
+    assert ready == [("repo-a", cache / "repo-a", 1)]
     assert report == {
         "source_cache_dir": str(cache),
         "repos": [{"repo": "repo-a", "path": str(cache / "repo-a")}],

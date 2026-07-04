@@ -1224,20 +1224,23 @@ def populate_code_source_cache(
 ) -> dict:
     """Populate the code source cache without running index/tokenize stages."""
     started = time.monotonic()
+
+    def emit_repo_ready(repo: str, repo_dir: Path, repo_count: int) -> None:
+        progress.emit(
+            "source_cache_repo_ready",
+            repo=repo,
+            repo_dir=str(repo_dir),
+            source_cache_dir=str(source_cache_dir),
+            repo_count=repo_count,
+        )
+
     report = sr.populate_source_cache(
         work_root,
         should_process,
         source_cache_dir,
         max_repos=max_repos,
+        on_repo_ready=emit_repo_ready,
     )
-    for idx, item in enumerate(report["repos"], start=1):
-        progress.emit(
-            "source_cache_repo_ready",
-            repo=item["repo"],
-            repo_dir=item["path"],
-            source_cache_dir=str(source_cache_dir),
-            repo_count=idx,
-        )
     report = {
         **report,
         "elapsed_s": round(time.monotonic() - started, 6),
