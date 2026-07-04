@@ -35,6 +35,7 @@ import os
 import sqlite3
 import sys
 import hashlib
+import time
 
 # Increase recursion limit for deeply nested ASTs (gcc-mirror, llvm-project, boost)
 sys.setrecursionlimit(50000)
@@ -1299,7 +1300,9 @@ def _is_sane_compile_args(args: list[str]) -> bool:
 
 
 _SIMPLE_FALLBACK_ARGS = ["-fsyntax-only", "-Wno-everything"]
-DEFAULT_PARSE_BATCH_FILES = 100
+DEFAULT_PARSE_BATCH_FILES = 25
+PARSE_HEARTBEAT_FILES = 25
+PARSE_HEARTBEAT_SECONDS = 30.0
 
 
 def compute_parse_batch_size(
@@ -1321,7 +1324,7 @@ def compute_parse_batch_size(
         raise ValueError(f"effective_workers must be positive, got {effective_workers}")
     if max_batch_files <= 0:
         raise ValueError(f"max_batch_files must be positive, got {max_batch_files}")
-    nominal = max(50, (num_files + effective_workers - 1) // effective_workers)
+    nominal = max(25, (num_files + effective_workers - 1) // effective_workers)
     return min(max_batch_files, nominal)
 
 
@@ -2885,7 +2888,8 @@ def _parse_file_batch(args_tuple):
     func_results: list[dict] = []
     type_results: list[dict] = []
     errors = 0
-    for filepath in filepaths:
+    last_heartbeat = time.monotonic()
+    for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
         try:
             functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
@@ -2893,6 +2897,18 @@ def _parse_file_batch(args_tuple):
             type_results.extend(t.to_dict() for t in typedefs)
         except (Exception, RecursionError):
             errors += 1
+        now = time.monotonic()
+        if (
+            idx == len(filepaths)
+            or idx % PARSE_HEARTBEAT_FILES == 0
+            or now - last_heartbeat >= PARSE_HEARTBEAT_SECONDS
+        ):
+            print(
+                f"  Parse worker heartbeat: {idx}/{len(filepaths)} files",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_heartbeat = now
     return {"functions": func_results, "typedefs": type_results}, len(filepaths), errors
 
 
@@ -3081,6 +3097,7 @@ def process_project(
         clang_index = Index.create()
         parsed = 0
         errors = 0
+        last_heartbeat = time.monotonic()
         for filepath in cpp_files:
             args = _resolve_file_args(filepath, compile_db, default_args)
             try:
@@ -3094,10 +3111,21 @@ def process_project(
                 errors += 1
                 if errors <= 5:
                     print(f"  ERROR parsing {filepath}: {e}", file=sys.stderr)
-            if parsed % 500 == 0 and parsed > 0:
+            processed = parsed + errors
+            now = time.monotonic()
+            if (
+                processed == len(cpp_files)
+                or (processed > 0 and processed % PARSE_HEARTBEAT_FILES == 0)
+                or now - last_heartbeat >= PARSE_HEARTBEAT_SECONDS
+            ):
                 check_memory_limit(memory_limit_gb, label="index_project")
-                print(f"  Parsed {parsed}/{len(cpp_files)} files, "
-                      f"{len(index_obj.functions)} functions", file=sys.stderr)
+                print(
+                    f"  Parsed {processed}/{len(cpp_files)} files "
+                    f"({errors} errors), {len(index_obj.functions)} functions",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                last_heartbeat = now
         print(f"  Parsed {parsed} files ({errors} errors), "
               f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
 

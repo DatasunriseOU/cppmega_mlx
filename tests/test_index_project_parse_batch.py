@@ -16,14 +16,14 @@ def test_parse_batch_size_caps_huge_repo_ipc_payloads():
 
     # xemu-scale repos previously used len(files) / parse_workers, so with
     # parse_workers=2 this became ~17.5k files in one returned payload.
-    assert index_project.compute_parse_batch_size(35_046, 2) == 100
+    assert index_project.compute_parse_batch_size(35_046, 2) == 25
 
 
 def test_parse_batch_size_keeps_small_parallel_repos_reasonable():
     import index_project
 
-    assert index_project.compute_parse_batch_size(300, 2) == 100
-    assert index_project.compute_parse_batch_size(80, 2) == 50
+    assert index_project.compute_parse_batch_size(300, 2) == 25
+    assert index_project.compute_parse_batch_size(80, 2) == 25
 
 
 def test_parse_batch_size_rejects_invalid_worker_count():
