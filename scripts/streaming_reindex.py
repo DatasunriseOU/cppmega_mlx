@@ -578,6 +578,21 @@ def stream_repo_subtrees(
             zstd.kill()
 
 
+def stream_repo_dirs(source_roots: Sequence[Path], should_process):
+    """Yield already-extracted repo directories without opening the tarball."""
+    seen: set[str] = set()
+    for root in source_roots:
+        if not root.exists():
+            raise FileNotFoundError(f"source dir root missing: {root}")
+        for entry in sorted(p for p in root.iterdir() if p.is_dir()):
+            repo = entry.name
+            if repo in seen or not is_code_worktree_repo(repo) or not should_process(repo):
+                continue
+            repo_dir = entry / "_src" if (entry / "_src").is_dir() else entry
+            seen.add(repo)
+            yield repo, repo_dir
+
+
 # --------------------------------------------------------------------------- #
 # Per-repo pipeline stages.
 # --------------------------------------------------------------------------- #
@@ -989,6 +1004,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--source-cache-only", action="store_true",
                    help="Only process repos already complete in --source-cache-dir; "
                         "do not open/decompress the source tarball.")
+    p.add_argument("--source-dir-root", action="append", default=[],
+                   help="Already-extracted repo root to process directly, without "
+                        "opening the source tarball. May be passed multiple times; "
+                        "children named <repo>/_src or <repo> are treated as repo dirs.")
     return p.parse_args(argv)
 
 
@@ -1098,13 +1117,20 @@ def main(argv: list[str]) -> int:
             return is_code_worktree_repo(repo) and not (resume and manifest.is_done(repo))
 
         source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
+        source_dir_roots = [Path(p) for p in args.source_dir_root]
         if args.source_cache_only and source_cache_dir is None:
             raise SystemExit("--source-cache-only requires --source-cache-dir")
-        gen = stream_repo_subtrees(
-            work_root,
-            should_process,
-            source_cache_dir=source_cache_dir,
-            source_cache_only=args.source_cache_only,
+        if source_dir_roots and (source_cache_dir is not None or args.source_cache_only):
+            raise SystemExit("--source-dir-root cannot be combined with source cache flags")
+        gen = (
+            stream_repo_dirs(source_dir_roots, should_process)
+            if source_dir_roots
+            else stream_repo_subtrees(
+                work_root,
+                should_process,
+                source_cache_dir=source_cache_dir,
+                source_cache_only=args.source_cache_only,
+            )
         )
         try:
             for repo, repo_dir in gen:

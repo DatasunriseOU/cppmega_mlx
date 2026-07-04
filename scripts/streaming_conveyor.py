@@ -2402,6 +2402,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="For --streams code, only process complete repos already "
                         "in --source-cache-dir; do not open/decompress the source "
                         "tarball.")
+    p.add_argument("--source-dir-root", action="append", default=[],
+                   help="For --streams code, process already-extracted repo dirs "
+                        "directly without opening the source tarball. May be passed "
+                        "multiple times; children named <repo>/_src or <repo> are "
+                        "treated as repo dirs.")
     p.add_argument("--memory-budget-gb", type=float, default=None,
                    help="Global conveyor memory budget for heavy subprocesses. "
                         "Default is 55%% of physical RAM (or 48 GiB if RAM size "
@@ -2461,12 +2466,17 @@ def main(argv: list[str]) -> int:
     args.parse_workers = parse_workers
     code_index_stall_timeout_s = int(args.code_index_stall_timeout_s or 0)
     source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
+    source_dir_roots = [Path(p) for p in args.source_dir_root]
     if args.source_cache_only and source_cache_dir is None:
         raise SystemExit("--source-cache-only requires --source-cache-dir")
     if args.source_cache_only and args.streams != "code":
         raise SystemExit("--source-cache-only is only valid with --streams code")
     if source_cache_dir is not None and args.streams != "code":
         raise SystemExit("--source-cache-dir is currently only supported with --streams code")
+    if source_dir_roots and args.streams != "code":
+        raise SystemExit("--source-dir-root is currently only supported with --streams code")
+    if source_dir_roots and (source_cache_dir is not None or args.source_cache_only):
+        raise SystemExit("--source-dir-root cannot be combined with source cache flags")
     range_submit_window = (
         max(1, workers * DEFAULT_RANGE_SUBMIT_WINDOW_MULTIPLIER)
         if int(args.range_submit_window or 0) <= 0
@@ -2649,6 +2659,7 @@ def main(argv: list[str]) -> int:
         code_recompress_workers=args.code_recompress_workers if code_recompressor else 0,
         source_cache_dir=str(source_cache_dir) if source_cache_dir is not None else None,
         source_cache_only=args.source_cache_only,
+        source_dir_roots=[str(p) for p in source_dir_roots],
         reservation_file=str(args.reservation_file)
         if reservations is not None else None,
         memory_plan=memory_plan,
@@ -2772,7 +2783,9 @@ def main(argv: list[str]) -> int:
 
     try:
         gen = (
-            sr.stream_repo_subtrees(
+            sr.stream_repo_dirs(source_dir_roots, should_process)
+            if source_dir_roots
+            else sr.stream_repo_subtrees(
                 work_root,
                 should_process,
                 source_cache_dir=source_cache_dir,

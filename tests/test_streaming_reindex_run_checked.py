@@ -101,3 +101,21 @@ def test_stream_repo_subtrees_source_cache_skips_bare_git_repos(tmp_path) -> Non
     )
 
     assert yielded == []
+
+
+def test_stream_repo_dirs_yields_extracted_src_without_tar(tmp_path) -> None:
+    import streaming_reindex
+
+    root = tmp_path / "root"
+    (root / "repo" / "_src").mkdir(parents=True)
+    (root / "repo" / "_src" / "x.cc").write_text("int x;\n", encoding="utf-8")
+    (root / "repo.bare").mkdir(parents=True)
+
+    yielded = list(
+        streaming_reindex.stream_repo_dirs(
+            [root],
+            lambda repo: streaming_reindex.is_code_worktree_repo(repo),
+        )
+    )
+
+    assert yielded == [("repo", root / "repo" / "_src")]
