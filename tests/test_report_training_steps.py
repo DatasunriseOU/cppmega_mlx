@@ -94,12 +94,13 @@ def test_summary_reports_every_length_once(tmp_path: Path, capsys) -> None:
     _print_summary(rows)
     out = capsys.readouterr().out
 
-    assert "| 1024 | 2 | 2,048 |" in out
-    assert "| 2048 | 2 | 4,096 |" in out
-    assert out.count("| 1024 |") == 1
-    assert out.count("| 2048 |") == 1
-    assert "main tokens" in out
-    assert "standalone PR tokens" in out
+    assert "LEN" in out
+    assert "TOK/STEP" in out
+    assert "MAIN_TOK" in out
+    assert "MAIN+PR_ST" in out
+    assert out.count("  1024 ") == 1
+    assert out.count("  2048 ") == 1
+    assert "MAIN = code_only + commits_with_pr_docstring" in out
 
 
 def test_parse_batch_schedule_rejects_bad_items() -> None:

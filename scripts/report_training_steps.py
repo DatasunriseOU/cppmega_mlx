@@ -233,11 +233,16 @@ def _rows_by_length_and_kind(rows: Iterable[ReportRow]) -> dict[int, dict[str, R
 
 
 def _print_summary(rows: Iterable[ReportRow]) -> None:
-    """Print one unambiguous curriculum row per context length."""
-    print(
-        "| length | bs | tokens/step | code tokens | code steps | commit+PR-doc tokens | commit steps | main tokens | main steps | standalone PR tokens | +PR total steps | skipped files |"
+    """Print one fixed-width curriculum row per context length."""
+    header = (
+        f"{'LEN':>6} {'BS':>5} {'TOK/STEP':>10} "
+        f"{'CODE_TOK':>10} {'CODE_ST':>8} "
+        f"{'COMMIT_TOK':>11} {'COMMIT_ST':>9} "
+        f"{'MAIN_TOK':>10} {'MAIN_ST':>8} "
+        f"{'PR_TOK':>10} {'MAIN+PR_ST':>10} {'SKIP':>5}"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print(header)
+    print("-" * len(header))
     for length, by_kind in sorted(_rows_by_length_and_kind(rows).items()):
         main = by_kind.get("main_code_plus_commits")
         if main is None:
@@ -248,25 +253,22 @@ def _print_summary(rows: Iterable[ReportRow]) -> None:
         main_pr = by_kind.get("main_plus_standalone_pr")
         skipped = sum(row.skipped_files for row in by_kind.values())
         print(
-            "| "
-            + " | ".join(
-                [
-                    str(length),
-                    str(main.batch_size),
-                    _format_int(main.tokens_per_step),
-                    _format_short_tokens(code.trained_tokens) if code else "-",
-                    _format_int(code.steps_by_trained_tokens) if code else "-",
-                    _format_short_tokens(commits.trained_tokens) if commits else "-",
-                    _format_int(commits.steps_by_trained_tokens) if commits else "-",
-                    _format_short_tokens(main.trained_tokens),
-                    _format_int(main.steps_by_trained_tokens),
-                    _format_short_tokens(pr.trained_tokens) if pr else "-",
-                    _format_int(main_pr.steps_by_trained_tokens) if main_pr else "-",
-                    _format_int(skipped),
-                ]
-            )
-            + " |"
+            f"{length:6d} {main.batch_size:5d} {_format_int(main.tokens_per_step):>10} "
+            f"{(_format_short_tokens(code.trained_tokens) if code else '-'):>10} "
+            f"{(_format_int(code.steps_by_trained_tokens) if code else '-'):>8} "
+            f"{(_format_short_tokens(commits.trained_tokens) if commits else '-'):>11} "
+            f"{(_format_int(commits.steps_by_trained_tokens) if commits else '-'):>9} "
+            f"{_format_short_tokens(main.trained_tokens):>10} "
+            f"{_format_int(main.steps_by_trained_tokens):>8} "
+            f"{(_format_short_tokens(pr.trained_tokens) if pr else '-'):>10} "
+            f"{(_format_int(main_pr.steps_by_trained_tokens) if main_pr else '-'):>10} "
+            f"{_format_int(skipped):>5}"
         )
+    print()
+    print(
+        "MAIN = code_only + commits_with_pr_docstring. "
+        "PR_TOK/MAIN+PR_ST includes standalone PR side stream only for comparison."
+    )
 
 
 def _print_markdown(rows: Iterable[ReportRow]) -> None:
