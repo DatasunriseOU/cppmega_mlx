@@ -42,7 +42,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).
@@ -239,6 +239,7 @@ def run_checked(
     cwd: Path | None = None,
     log_path: Path | None = None,
     timeout: int | None = None,
+    stall_timeout: int | None = None,
 ) -> None:
     """Run a command; RAISE RepoFailure on any non-zero exit. No fallback."""
     printable = " ".join(str(c) for c in cmd)
@@ -246,6 +247,30 @@ def run_checked(
     log_fh = open(log_path, "wb") if log_path else None
     stdout_data: bytes | None = None
     proc: subprocess.Popen[bytes] | None = None
+
+    def terminate_process(reason: str) -> None:
+        if proc is None:
+            return
+        try:
+            if timeout or stall_timeout:
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                if timeout or stall_timeout:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        print(f"  [{repo}] {stage}: killed after {reason}", file=sys.stderr, flush=True)
+
     try:
         proc = subprocess.Popen(
             [str(c) for c in cmd],
@@ -253,29 +278,41 @@ def run_checked(
             env=_subprocess_env(),
             stdout=log_fh if log_fh else subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            start_new_session=bool(timeout),
+            start_new_session=bool(timeout or stall_timeout),
         )
-        stdout_data, _ = proc.communicate(timeout=timeout)
+        if stall_timeout and log_path is not None:
+            deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+            last_activity = time.monotonic()
+            last_signature: tuple[int, int] | None = None
+            while proc.poll() is None:
+                now = time.monotonic()
+                if deadline is not None and now > deadline:
+                    terminate_process(f"timeout {timeout}s")
+                    raise RepoFailure(
+                        repo,
+                        stage,
+                        f"timed out after {timeout}s",
+                    )
+                if log_path.exists():
+                    stat = log_path.stat()
+                    signature = (stat.st_size, stat.st_mtime_ns)
+                    if signature != last_signature:
+                        last_signature = signature
+                        last_activity = now
+                if now - last_activity > stall_timeout:
+                    terminate_process(f"no log progress for {stall_timeout}s")
+                    raise RepoFailure(
+                        repo,
+                        stage,
+                        f"stalled after {stall_timeout}s without log progress",
+                    )
+                time.sleep(1.0)
+            stdout_data, _ = proc.communicate(timeout=1)
+        else:
+            stdout_data, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         if proc is not None:
-            try:
-                if timeout:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                else:
-                    proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    if timeout:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    else:
-                        proc.kill()
-                except ProcessLookupError:
-                    pass
-                proc.wait()
+            terminate_process(f"timeout {timeout}s")
         raise RepoFailure(repo, stage, f"timed out after {timeout}s: {exc}") from exc
     finally:
         if log_fh:
@@ -348,7 +385,65 @@ def _is_excluded(within: str) -> bool:
     return any(part in EXCLUDE_PARTS for part in within.split("/"))
 
 
-def stream_repo_subtrees(work_root: Path, should_process):
+SOURCE_CACHE_SENTINEL = ".cppmega_source_cache_complete.json"
+
+
+def _source_cache_repo_dir(source_cache_dir: Path, repo: str) -> Path:
+    return source_cache_dir / repo
+
+
+def _source_cache_staging_dir(source_cache_dir: Path, repo: str) -> Path:
+    staging = source_cache_dir / ".staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging / f"{repo}.{os.getpid()}.{time.time_ns()}"
+
+
+def _source_cache_complete(repo_dir: Path) -> bool:
+    return (repo_dir / SOURCE_CACHE_SENTINEL).exists()
+
+
+def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
+    sentinel = repo_dir / SOURCE_CACHE_SENTINEL
+    tmp = sentinel.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "repo": repo,
+                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "source": str(TARBALL),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(sentinel)
+
+
+def _iter_complete_source_cache(
+    source_cache_dir: Path,
+    should_process: Callable[[str], bool],
+) -> set[str]:
+    yielded: set[str] = set()
+    if not source_cache_dir.exists():
+        return yielded
+    for repo_dir in sorted(p for p in source_cache_dir.iterdir() if p.is_dir()):
+        if repo_dir.name == ".staging":
+            continue
+        repo = repo_dir.name
+        if not _source_cache_complete(repo_dir) or not should_process(repo):
+            continue
+        yielded.add(repo)
+    return yielded
+
+
+def stream_repo_subtrees(
+    work_root: Path,
+    should_process,
+    *,
+    source_cache_dir: Path | None = None,
+    source_cache_only: bool = False,
+):
     """Yield (repo, repo_dir) for every cpp_all/<repo>/ subtree, in ONE pass.
 
     A single `zstd -dc --long=31 TARBALL` is piped into a Python
@@ -366,6 +461,15 @@ def stream_repo_subtrees(work_root: Path, should_process):
     """
     import tarfile
 
+    cached_yielded: set[str] = set()
+    if source_cache_dir is not None:
+        source_cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_yielded = _iter_complete_source_cache(source_cache_dir, should_process)
+        for repo in sorted(cached_yielded):
+            yield repo, _source_cache_repo_dir(source_cache_dir, repo)
+        if source_cache_only:
+            return
+
     if not TARBALL.exists():
         raise FileNotFoundError(f"source tarball missing: {TARBALL}")
     zstd = subprocess.Popen(
@@ -379,6 +483,7 @@ def stream_repo_subtrees(work_root: Path, should_process):
     finalized: set[str] = set()
     cur_repo: str | None = None
     cur_dir: Path | None = None
+    cur_final_dir: Path | None = None
     active = False
     try:
         for member in tar:
@@ -393,7 +498,19 @@ def stream_repo_subtrees(work_root: Path, should_process):
             within = rest[slash + 1:]
             if repo != cur_repo:
                 if cur_repo is not None and active:
-                    yield cur_repo, cur_dir
+                    assert cur_dir is not None
+                    yield_dir = cur_dir
+                    if cur_final_dir is not None:
+                        _mark_source_cache_complete(cur_dir, cur_repo)
+                        if cur_final_dir.exists() and _source_cache_complete(cur_final_dir):
+                            shutil.rmtree(cur_dir, ignore_errors=True)
+                            yield_dir = cur_final_dir
+                        else:
+                            if cur_final_dir.exists():
+                                shutil.rmtree(cur_final_dir)
+                            cur_dir.rename(cur_final_dir)
+                            yield_dir = cur_final_dir
+                    yield cur_repo, yield_dir
                     finalized.add(cur_repo)
                 if repo in finalized:
                     raise RepoFailure(
@@ -402,9 +519,20 @@ def stream_repo_subtrees(work_root: Path, should_process):
                         "(would re-extract an already-closed repo)",
                     )
                 cur_repo = repo
-                active = should_process(repo)
-                cur_dir = work_root / repo / "_src"
+                active = repo not in cached_yielded and should_process(repo)
+                cur_final_dir = None
+                if active and source_cache_dir is not None:
+                    cur_final_dir = _source_cache_repo_dir(source_cache_dir, repo)
+                    if _source_cache_complete(cur_final_dir):
+                        active = False
+                        cached_yielded.add(repo)
+                        cur_dir = None
+                    else:
+                        cur_dir = _source_cache_staging_dir(source_cache_dir, repo)
+                else:
+                    cur_dir = work_root / repo / "_src"
                 if active:
+                    assert cur_dir is not None
                     cur_dir.mkdir(parents=True, exist_ok=True)
             if not active or not within:
                 continue
@@ -418,7 +546,19 @@ def stream_repo_subtrees(work_root: Path, should_process):
             with open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
         if cur_repo is not None and active:
-            yield cur_repo, cur_dir
+            assert cur_dir is not None
+            yield_dir = cur_dir
+            if cur_final_dir is not None:
+                _mark_source_cache_complete(cur_dir, cur_repo)
+                if cur_final_dir.exists() and _source_cache_complete(cur_final_dir):
+                    shutil.rmtree(cur_dir, ignore_errors=True)
+                    yield_dir = cur_final_dir
+                else:
+                    if cur_final_dir.exists():
+                        shutil.rmtree(cur_final_dir)
+                    cur_dir.rename(cur_final_dir)
+                    yield_dir = cur_final_dir
+            yield cur_repo, yield_dir
             finalized.add(cur_repo)
     finally:
         try:
@@ -448,6 +588,7 @@ def stage_index_source(
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
     index_timeout_s: int | None = None,
+    index_stall_timeout_s: int | None = None,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.
 
@@ -487,6 +628,11 @@ def stage_index_source(
         cmd,
         log_path=work / f"{repo}.index.log",
         timeout=index_timeout_s if index_timeout_s and index_timeout_s > 0 else None,
+        stall_timeout=(
+            index_stall_timeout_s
+            if index_stall_timeout_s and index_stall_timeout_s > 0
+            else None
+        ),
     )
     if not enriched.exists() or enriched.stat().st_size == 0:
         raise RepoFailure(repo, "index_project", f"empty enriched jsonl: {enriched}")
@@ -655,6 +801,7 @@ def process_one_repo(
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
     index_timeout_s: int | None = None,
+    index_stall_timeout_s: int | None = None,
     *,
     promote_dedup_on_success: bool = True,
 ) -> dict:
@@ -682,7 +829,7 @@ def process_one_repo(
         enriched = stage_index_source(
             repo, repo_dir, work, dedup_db, dedup_near,
             stage_id, stage_db, global_symbol_index, memory_limit_gb,
-            parse_workers, index_timeout_s,
+            parse_workers, index_timeout_s, index_stall_timeout_s,
         )
         timings["index_project_s"] = round(time.monotonic() - started, 6)
         started = time.monotonic()
@@ -825,6 +972,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--code-index-timeout-s", type=int, default=0,
                    help="Optional fail-loud timeout for each index_project code "
                         "stage. 0 disables the timeout (default).")
+    p.add_argument("--code-index-stall-timeout-s", type=int, default=0,
+                   help="Optional fail-loud stall watchdog for index_project: "
+                        "kill when the log file has no size/mtime progress for "
+                        "this many seconds. 0 disables the watchdog (default).")
+    p.add_argument("--source-cache-dir", default=None,
+                   help="Optional repo-level source cache for code-only runs. "
+                        "Complete cached repos are reused before opening the "
+                        "source tarball; uncached repos are materialized into "
+                        "the cache and marked with a completion sentinel.")
+    p.add_argument("--source-cache-only", action="store_true",
+                   help="Only process repos already complete in --source-cache-dir; "
+                        "do not open/decompress the source tarball.")
     return p.parse_args(argv)
 
 
@@ -933,7 +1092,15 @@ def main(argv: list[str]) -> int:
         def should_process(repo: str) -> bool:
             return not (resume and manifest.is_done(repo))
 
-        gen = stream_repo_subtrees(work_root, should_process)
+        source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
+        if args.source_cache_only and source_cache_dir is None:
+            raise SystemExit("--source-cache-only requires --source-cache-dir")
+        gen = stream_repo_subtrees(
+            work_root,
+            should_process,
+            source_cache_dir=source_cache_dir,
+            source_cache_only=args.source_cache_only,
+        )
         try:
             for repo, repo_dir in gen:
                 try:
@@ -942,7 +1109,8 @@ def main(argv: list[str]) -> int:
                                             global_symbol_index,
                                             args.memory_limit_gb,
                                             args.parse_workers,
-                                            args.code_index_timeout_s)
+                                            args.code_index_timeout_s,
+                                            args.code_index_stall_timeout_s)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

@@ -140,6 +140,36 @@ def _log(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
 
 
+class BackgroundRecompressor:
+    """Track deferred parquet recompress jobs and surface failures at shutdown."""
+
+    def __init__(self, max_workers: int) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
+        self._lock = threading.Lock()
+        self._futures = []
+
+    def submit(self, path: Path) -> None:
+        fut = self._pool.submit(src.recompress_zstd_max, path)
+        with self._lock:
+            self._futures.append((path, fut))
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=True)
+        failures: list[str] = []
+        with self._lock:
+            futures = list(self._futures)
+        for path, fut in futures:
+            try:
+                fut.result()
+            except Exception as exc:
+                failures.append(f"{path}: {type(exc).__name__}: {exc}")
+        if failures:
+            raise RuntimeError(
+                "background code parquet recompress failed:\n"
+                + "\n".join(failures[:20])
+            )
+
+
 def disk_free_gb(path: Path) -> float:
     """Return free space on the filesystem containing ``path`` in GiB."""
     probe = path if path.exists() else path.parent
@@ -1200,6 +1230,8 @@ def run_code_half(
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
     index_timeout_s: int | None = None,
+    index_stall_timeout_s: int | None = None,
+    recompressor: BackgroundRecompressor | None = None,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -1216,16 +1248,24 @@ def run_code_half(
         info = sr.process_one_repo(
             repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
             global_symbol_index, memory_limit_gb, parse_workers, index_timeout_s,
+            index_stall_timeout_s,
             promote_dedup_on_success=False,
         )
         # zstd-max the per-length code parquet files this repo just wrote.
         timings = dict(info.get("stage_timings_s", {}))
         started = time.monotonic()
+        deferred = 0
         for L in info.get("lengths", {}):
             dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
             if dest.exists():
-                src.recompress_zstd_max(dest)
+                if recompressor is None:
+                    src.recompress_zstd_max(dest)
+                else:
+                    recompressor.submit(dest)
+                    deferred += 1
         timings["recompress_s"] = round(time.monotonic() - started, 6)
+        if deferred:
+            timings["recompress_deferred"] = float(deferred)
         timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
         info["stage_timings_s"] = timings
         promoted = True
@@ -1247,12 +1287,14 @@ CodeRunner = Callable[
         float,
         int,
         int | None,
+        int | None,
+        BackgroundRecompressor | None,
     ],
     dict,
 ]
 
 
-def is_index_project_memory_failure(exc: RepoFailure) -> bool:
+def is_retryable_index_project_failure(exc: RepoFailure) -> bool:
     detail = exc.detail.lower()
     return (
         exc.stage == "index_project"
@@ -1260,8 +1302,14 @@ def is_index_project_memory_failure(exc: RepoFailure) -> bool:
             "exceeded memory limit" in detail
             or "exit code 137" in detail
             or "killed: 9" in detail
+            or "timed out after" in detail
+            or "stalled after" in detail
         )
     )
+
+
+def is_index_project_memory_failure(exc: RepoFailure) -> bool:
+    return is_retryable_index_project_failure(exc)
 
 
 _PARSE_WORKERS_RE = re.compile(r"\bUsing\s+(\d+)\s+parse workers\b", re.IGNORECASE)
@@ -1284,15 +1332,17 @@ def failed_code_unit_was_index_memory(
     if not isinstance(rec, dict):
         return False
     detail = str(rec.get("detail", "")).lower()
-    is_memory_failure = (
+    is_retryable_failure = (
         rec.get("stage") == "index_project"
         and (
             "exceeded memory limit" in detail
             or "exit code 137" in detail
             or "killed: 9" in detail
+            or "timed out after" in detail
+            or "stalled after" in detail
         )
     )
-    if not is_memory_failure:
+    if not is_retryable_failure:
         return False
     if parse_workers is not None:
         prior_parse_workers = _failure_parse_workers(detail)
@@ -1312,15 +1362,18 @@ def run_code_half_adaptive(
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
     index_timeout_s: int | None = None,
+    index_stall_timeout_s: int | None = None,
     *,
     runner: CodeRunner | None = None,
     isolate_dedup_on_retry: bool = True,
+    recompressor: BackgroundRecompressor | None = None,
 ) -> dict:
-    """Run the code half, retrying memory peaks with one parse worker.
+    """Run the code half, retrying index_project peaks/stalls with one parser.
 
     Large repos can peak while merging multiprocessing parse payloads into the
-    repo-wide ProjectIndex. Retrying with one parser preserves the same enriched
-    output contract and graph routes while removing that avoidable IPC peak.
+    repo-wide ProjectIndex; some also stall in parser-heavy paths. Retrying with
+    one parser preserves the same enriched output contract and graph routes
+    while removing avoidable IPC/parser concurrency pressure.
     """
     active_runner = run_code_half if runner is None else runner
     try:
@@ -1335,12 +1388,14 @@ def run_code_half_adaptive(
             memory_limit_gb,
             parse_workers,
             index_timeout_s,
+            index_stall_timeout_s,
+            recompressor,
         )
     except RepoFailure as exc:
-        if parse_workers <= 1 or not is_index_project_memory_failure(exc):
+        if parse_workers <= 1 or not is_retryable_index_project_failure(exc):
             raise
         _log(
-            f"RETRY {code_key(repo)}: {exc.stage} peak failure with "
+            f"RETRY {code_key(repo)}: {exc.stage} retryable failure with "
             f"parse_workers={parse_workers}; retrying parse_workers=1"
             + (" with isolated per-repo dedup" if isolate_dedup_on_retry else "")
         )
@@ -1357,6 +1412,8 @@ def run_code_half_adaptive(
             memory_limit_gb,
             1,
             index_timeout_s,
+            index_stall_timeout_s,
+            recompressor,
         )
 
 
@@ -2008,6 +2065,8 @@ def process_one_repo(
     code_memory_limit_gb: float | None = None,
     commit_memory_limit_gb: float | None = None,
     code_index_timeout_s: int | None = None,
+    code_index_stall_timeout_s: int | None = None,
+    code_recompressor: BackgroundRecompressor | None = None,
     reservations: UnitReservationLedger | None = None,
     range_submit_window: int = 1,
     analysis_cache_entries: int = 128,
@@ -2076,7 +2135,7 @@ def process_one_repo(
                             code_dedup_near = False
                             _log(
                                 f"RETRY {ck}: prior manifest failure was "
-                                "index_project memory; starting parse_workers=1 "
+                                "retryable index_project failure; starting parse_workers=1 "
                                 "with isolated per-repo dedup"
                             )
                         if progress is not None:
@@ -2087,12 +2146,16 @@ def process_one_repo(
                                 unit=ck,
                                 parse_workers=code_parse_workers,
                                 memory_limit_gb=code_limit,
+                                index_timeout_s=code_index_timeout_s,
+                                index_stall_timeout_s=code_index_stall_timeout_s,
                             )
                         cinfo = run_code_half_adaptive(
                             repo, repo_dir, lengths_code, work_root,
                             code_dedup_db, code_dedup_near,
                             global_symbol_index, code_limit, code_parse_workers,
                             code_index_timeout_s,
+                            code_index_stall_timeout_s,
+                            recompressor=code_recompressor,
                         )
                         with manifest_lock:
                             manifest.mark_done(ck, cinfo)
@@ -2299,6 +2362,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--code-index-timeout-s", type=int, default=0,
                    help="Optional fail-loud timeout for each CODE index_project "
                         "stage. 0 disables the timeout (default).")
+    p.add_argument("--code-index-stall-timeout-s", type=int, default=0,
+                   help="Optional fail-loud CODE index_project stall watchdog: "
+                        "kill when the index log has no size/mtime progress for "
+                        "this many seconds. 0 disables the watchdog (default).")
+    p.add_argument("--background-code-recompress", action="store_true",
+                   help="Defer code parquet zstd-max recompress to a background "
+                        "pool so repo processing can continue after valid parquet "
+                        "has been written. The pool is drained before exit.")
+    p.add_argument("--code-recompress-workers", type=int, default=2,
+                   help="Background code parquet recompress workers when "
+                        "--background-code-recompress is set (default 2).")
+    p.add_argument("--source-cache-dir", default=None,
+                   help="Optional repo-level source cache for --streams code. "
+                        "Complete cached repos are processed before opening the "
+                        "source tarball; uncached repos are materialized into the "
+                        "cache with a completion sentinel.")
+    p.add_argument("--source-cache-only", action="store_true",
+                   help="For --streams code, only process complete repos already "
+                        "in --source-cache-dir; do not open/decompress the source "
+                        "tarball.")
     p.add_argument("--memory-budget-gb", type=float, default=None,
                    help="Global conveyor memory budget for heavy subprocesses. "
                         "Default is 55%% of physical RAM (or 48 GiB if RAM size "
@@ -2356,6 +2439,14 @@ def main(argv: list[str]) -> int:
         raise SystemExit("--max-active-repos must be >= --repo-workers")
     parse_workers = max(1, int(args.parse_workers or 1))
     args.parse_workers = parse_workers
+    code_index_stall_timeout_s = int(args.code_index_stall_timeout_s or 0)
+    source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
+    if args.source_cache_only and source_cache_dir is None:
+        raise SystemExit("--source-cache-only requires --source-cache-dir")
+    if args.source_cache_only and args.streams != "code":
+        raise SystemExit("--source-cache-only is only valid with --streams code")
+    if source_cache_dir is not None and args.streams != "code":
+        raise SystemExit("--source-cache-dir is currently only supported with --streams code")
     range_submit_window = (
         max(1, workers * DEFAULT_RANGE_SUBMIT_WINDOW_MULTIPLIER)
         if int(args.range_submit_window or 0) <= 0
@@ -2493,6 +2584,11 @@ def main(argv: list[str]) -> int:
     manifest_lock = threading.Lock()
     resume = not args.no_resume
     progress = ProgressWriter(Path(args.progress_jsonl) if args.progress_jsonl else None)
+    code_recompressor = (
+        BackgroundRecompressor(args.code_recompress_workers)
+        if args.background_code_recompress and args.streams in {"both", "code"}
+        else None
+    )
     reservations = None
     if not args.no_reservation_ledger:
         reservations = UnitReservationLedger(Path(args.reservation_file))
@@ -2525,8 +2621,14 @@ def main(argv: list[str]) -> int:
         dedup_checkpoint_tokens=args.dedup_checkpoint_tokens,
         dedup_checkpoint_mode=args.dedup_checkpoint_mode,
         parse_workers=parse_workers,
+        code_index_timeout_s=args.code_index_timeout_s,
+        code_index_stall_timeout_s=code_index_stall_timeout_s,
         code_memory_limit_gb=code_memory_limit_gb,
         commit_memory_limit_gb=commit_memory_limit_gb,
+        background_code_recompress=code_recompressor is not None,
+        code_recompress_workers=args.code_recompress_workers if code_recompressor else 0,
+        source_cache_dir=str(source_cache_dir) if source_cache_dir is not None else None,
+        source_cache_only=args.source_cache_only,
         reservation_file=str(args.reservation_file)
         if reservations is not None else None,
         memory_plan=memory_plan,
@@ -2648,7 +2750,12 @@ def main(argv: list[str]) -> int:
 
     try:
         gen = (
-            sr.stream_repo_subtrees(work_root, should_process)
+            sr.stream_repo_subtrees(
+                work_root,
+                should_process,
+                source_cache_dir=source_cache_dir,
+                source_cache_only=args.source_cache_only,
+            )
             if args.streams == "code"
             else stream_repo_subtrees_with_git(
                 work_root,
@@ -2678,6 +2785,8 @@ def main(argv: list[str]) -> int:
                     code_memory_limit_gb=code_memory_limit_gb,
                     commit_memory_limit_gb=commit_memory_limit_gb,
                     code_index_timeout_s=args.code_index_timeout_s,
+                    code_index_stall_timeout_s=code_index_stall_timeout_s,
+                    code_recompressor=code_recompressor,
                     reservations=reservations,
                     range_submit_window=range_submit_window,
                     analysis_cache_entries=args.analysis_cache_entries,
@@ -2768,6 +2877,8 @@ def main(argv: list[str]) -> int:
                     code_memory_limit_gb=code_memory_limit_gb,
                     commit_memory_limit_gb=commit_memory_limit_gb,
                     code_index_timeout_s=args.code_index_timeout_s,
+                    code_index_stall_timeout_s=code_index_stall_timeout_s,
+                    code_recompressor=code_recompressor,
                     reservations=reservations,
                     range_submit_window=range_submit_window,
                     analysis_cache_entries=args.analysis_cache_entries,
@@ -2781,9 +2892,15 @@ def main(argv: list[str]) -> int:
             while inflight:
                 drain_one_or_more(block=True)
     finally:
+        recompress_error: Exception | None = None
         if repo_pool is not None:
             repo_pool.shutdown(wait=True)
         range_pool.shutdown(wait=True)
+        if code_recompressor is not None:
+            try:
+                code_recompressor.shutdown()
+            except Exception as exc:
+                recompress_error = exc
         interrupted = STOP_EVENT.is_set()
         # Reclaim the randomized work_root whenever production cleanup is active.
         # --retain-partial-work keeps the older zero-rework signal/debug mode.
@@ -2793,6 +2910,8 @@ def main(argv: list[str]) -> int:
             remove_tree(work_root, reason="interrupted run work_root")
         for lock in reversed(run_locks):
             lock.close()
+        if recompress_error is not None:
+            raise recompress_error
 
     # ----- cumulative per-length report from the manifest (both streams) -----
     def _empty_totals(lengths):

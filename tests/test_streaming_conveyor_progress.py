@@ -58,6 +58,28 @@ def test_progress_writer_tracks_extract_cache_rates(tmp_path):
     assert writer.extract_cache_metrics()["status_counts"]["hit"] == 1
 
 
+def test_background_recompressor_runs_and_surfaces_completion(tmp_path, monkeypatch):
+    import streaming_conveyor
+
+    calls = []
+
+    def fake_recompress(path):
+        calls.append(Path(path).name)
+
+    monkeypatch.setattr(
+        streaming_conveyor.src,
+        "recompress_zstd_max",
+        fake_recompress,
+    )
+
+    recompressor = streaming_conveyor.BackgroundRecompressor(max_workers=2)
+    recompressor.submit(tmp_path / "a.parquet")
+    recompressor.submit(tmp_path / "b.parquet")
+    recompressor.shutdown()
+
+    assert sorted(calls) == ["a.parquet", "b.parquet"]
+
+
 def test_manifest_complete_commit_ranges_detects_short_final_range(tmp_path):
     import streaming_conveyor
 
@@ -285,8 +307,12 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
         memory_limit_gb,
         parse_workers,
         index_timeout_s,
+        index_stall_timeout_s,
+        recompressor,
     ):
-        calls.append((parse_workers, dedup_db, dedup_near, index_timeout_s))
+        calls.append(
+            (parse_workers, dedup_db, dedup_near, index_timeout_s, index_stall_timeout_s, recompressor)
+        )
         if parse_workers > 1:
             raise streaming_conveyor.RepoFailure(
                 repo,
@@ -310,12 +336,67 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
         8.0,
         2,
         7200,
+        900,
         runner=runner,
     )
 
     assert calls == [
-        (2, tmp_path / "global.sqlite", True, 7200),
-        (1, None, False, 7200),
+        (2, tmp_path / "global.sqlite", True, 7200, 900, None),
+        (1, None, False, 7200, 900, None),
+    ]
+    assert info["lengths"]["1024"]["valid_tokens"] == 1024
+
+
+def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path):
+    import streaming_conveyor
+
+    calls = []
+
+    def runner(
+        repo,
+        repo_dir,
+        lengths_code,
+        work_root,
+        dedup_db,
+        dedup_near,
+        global_symbol_index,
+        memory_limit_gb,
+        parse_workers,
+        index_timeout_s,
+        index_stall_timeout_s,
+        recompressor,
+    ):
+        calls.append((parse_workers, dedup_db, dedup_near, index_timeout_s, index_stall_timeout_s))
+        if parse_workers > 1:
+            raise streaming_conveyor.RepoFailure(
+                repo,
+                "index_project",
+                "timed out after 7200s",
+            )
+        return {
+            "source": "code",
+            "repo": repo,
+            "lengths": {"1024": _stat(rows=1, valid=1024, target_length=1024)},
+        }
+
+    info = streaming_conveyor.run_code_half_adaptive(
+        "repo",
+        tmp_path,
+        (1024,),
+        tmp_path / "work",
+        tmp_path / "global.sqlite",
+        True,
+        None,
+        8.0,
+        2,
+        7200,
+        900,
+        runner=runner,
+    )
+
+    assert calls == [
+        (2, tmp_path / "global.sqlite", True, 7200, 900),
+        (1, None, False, 7200, 900),
     ]
     assert info["lengths"]["1024"]["valid_tokens"] == 1024
 
