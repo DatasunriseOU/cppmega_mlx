@@ -78,3 +78,26 @@ def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:
     )
 
     assert yielded == [("repo", cache / "repo")]
+
+
+def test_stream_repo_subtrees_source_cache_skips_bare_git_repos(tmp_path) -> None:
+    import streaming_reindex
+
+    cache = tmp_path / "cache"
+    bare = cache / "repo.bare"
+    bare.mkdir(parents=True)
+    (bare / streaming_reindex.SOURCE_CACHE_SENTINEL).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+    yielded = list(
+        streaming_reindex.stream_repo_subtrees(
+            tmp_path / "work",
+            lambda repo: streaming_reindex.is_code_worktree_repo(repo),
+            source_cache_dir=cache,
+            source_cache_only=True,
+        )
+    )
+
+    assert yielded == []

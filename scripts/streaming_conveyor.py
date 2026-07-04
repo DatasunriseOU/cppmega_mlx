@@ -2096,7 +2096,27 @@ def process_one_repo(
         # ---- CODE half (skip if already done) ----
         if streams in {"both", "code"}:
             ck = code_key(repo)
-            if resume and manifest.is_done(ck):
+            if not sr.is_code_worktree_repo(repo):
+                info = {
+                    "source": "code",
+                    "repo": repo,
+                    "skipped": True,
+                    "reason": "bare git repository, not a source worktree",
+                    "lengths": {},
+                    "stage_timings_s": {},
+                }
+                with manifest_lock:
+                    manifest.mark_done(ck, info)
+                if progress is not None:
+                    progress.emit(
+                        "unit_skipped",
+                        stream="code",
+                        repo=repo,
+                        unit=ck,
+                        reason=info["reason"],
+                    )
+                result["code"] = "skipped_non_worktree"
+            elif resume and manifest.is_done(ck):
                 _log(f"SKIP (done) {ck}")
                 result["code"] = "skipped"
             else:
@@ -2684,6 +2704,8 @@ def main(argv: list[str]) -> int:
     only_repos = set(args.only_repo) if args.only_repo else None
 
     def should_process(repo: str) -> bool:
+        if args.streams == "code" and not sr.is_code_worktree_repo(repo):
+            return False
         # Restrict to --only-repo when given (others drained without extraction).
         # Otherwise skip extraction when the manifest itself proves every stream
         # for this repo is complete; partial/ambiguous repos still stage and use

@@ -113,6 +113,11 @@ def commit_stage_db(work: Path, key: str) -> Path:
     return work / f"{_safe_stage_name(key)}.dedup_stage.sqlite"
 
 
+def is_code_worktree_repo(repo: str) -> bool:
+    """Return False for archive members that are git object stores, not sources."""
+    return not repo.endswith(".bare")
+
+
 def _dedup_store_cls():
     sys.path.insert(0, str(MLX_ROOT / "tools" / "clang_indexer"))
     from dedup_store import DedupStore
@@ -1090,7 +1095,7 @@ def main(argv: list[str]) -> int:
 
     if not budget_reached and not cap_reached:
         def should_process(repo: str) -> bool:
-            return not (resume and manifest.is_done(repo))
+            return is_code_worktree_repo(repo) and not (resume and manifest.is_done(repo))
 
         source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
         if args.source_cache_only and source_cache_dir is None:
