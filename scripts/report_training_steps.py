@@ -217,6 +217,58 @@ def _format_int(value: int) -> str:
     return f"{value:,}"
 
 
+def _format_short_tokens(value: int) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.3f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    return _format_int(value)
+
+
+def _rows_by_length_and_kind(rows: Iterable[ReportRow]) -> dict[int, dict[str, ReportRow]]:
+    result: dict[int, dict[str, ReportRow]] = {}
+    for row in rows:
+        result.setdefault(row.length, {})[row.kind] = row
+    return result
+
+
+def _print_summary(rows: Iterable[ReportRow]) -> None:
+    """Print one unambiguous curriculum row per context length."""
+    print(
+        "| length | bs | tokens/step | code tokens | code steps | commit+PR-doc tokens | commit steps | main tokens | main steps | standalone PR tokens | +PR total steps | skipped files |"
+    )
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for length, by_kind in sorted(_rows_by_length_and_kind(rows).items()):
+        main = by_kind.get("main_code_plus_commits")
+        if main is None:
+            continue
+        code = by_kind.get("code_only")
+        commits = by_kind.get("commits_with_pr_docstring")
+        pr = by_kind.get("standalone_pr_side_stream")
+        main_pr = by_kind.get("main_plus_standalone_pr")
+        skipped = sum(row.skipped_files for row in by_kind.values())
+        print(
+            "| "
+            + " | ".join(
+                [
+                    str(length),
+                    str(main.batch_size),
+                    _format_int(main.tokens_per_step),
+                    _format_short_tokens(code.trained_tokens) if code else "-",
+                    _format_int(code.steps_by_trained_tokens) if code else "-",
+                    _format_short_tokens(commits.trained_tokens) if commits else "-",
+                    _format_int(commits.steps_by_trained_tokens) if commits else "-",
+                    _format_short_tokens(main.trained_tokens),
+                    _format_int(main.steps_by_trained_tokens),
+                    _format_short_tokens(pr.trained_tokens) if pr else "-",
+                    _format_int(main_pr.steps_by_trained_tokens) if main_pr else "-",
+                    _format_int(skipped),
+                ]
+            )
+            + " |"
+        )
+
+
 def _print_markdown(rows: Iterable[ReportRow]) -> None:
     print(
         "| kind | length | bs | tokens/step | files | skipped | rows | docs | trained tokens | steps(trained) | valid tokens | steps(valid) |"
@@ -272,7 +324,12 @@ def main() -> int:
         action="store_true",
         help="Skip files that disappear or are unreadable during live conveyor writes, and report the skip count.",
     )
-    parser.add_argument("--format", choices=("text", "markdown", "json"), default="text")
+    parser.add_argument(
+        "--format",
+        choices=("summary", "text", "markdown", "json"),
+        default="summary",
+        help="summary prints one row per bucket; text/markdown print every source kind.",
+    )
     args = parser.parse_args()
 
     rows = build_report(
@@ -285,6 +342,8 @@ def main() -> int:
     )
     if args.format == "json":
         print(json.dumps([asdict(row) for row in rows], indent=2, sort_keys=True))
+    elif args.format == "summary":
+        _print_summary(rows)
     elif args.format == "markdown":
         _print_markdown(rows)
     else:

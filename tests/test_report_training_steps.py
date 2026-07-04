@@ -5,7 +5,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from scripts.report_training_steps import build_report, parse_batch_schedule
+from scripts.report_training_steps import build_report, parse_batch_schedule, _print_summary
 
 
 def _write_counter_parquet(path: Path, rows: list[dict[str, int]]) -> None:
@@ -63,6 +63,43 @@ def test_report_keeps_code_commits_main_and_pr_stream_distinct(tmp_path: Path) -
     assert by_kind["standalone_pr_side_stream"].trained_tokens == 600
     assert by_kind["main_plus_standalone_pr"].trained_tokens == 3600
     assert by_kind["main_plus_standalone_pr"].steps_by_trained_tokens == 1
+
+
+def test_summary_reports_every_length_once(tmp_path: Path, capsys) -> None:
+    code = tmp_path / "code"
+    commits = tmp_path / "commits"
+    pr = tmp_path / "pr"
+    _write_counter_parquet(
+        code / "1024" / "code.parquet",
+        [{"valid": 4096, "trained": 4096, "docs": 1}],
+    )
+    _write_counter_parquet(
+        commits / "2048" / "commits.parquet",
+        [{"valid": 8192, "trained": 8192, "docs": 1}],
+    )
+    _write_counter_parquet(
+        pr / "2048" / "pr.parquet",
+        [{"valid": 4096, "trained": 4096, "docs": 1}],
+    )
+
+    rows = build_report(
+        code_root=code,
+        commit_root=commits,
+        pr_root=pr,
+        batch_by_length={1024: 2, 2048: 2},
+        max_workers=1,
+        allow_concurrent_skips=False,
+    )
+
+    _print_summary(rows)
+    out = capsys.readouterr().out
+
+    assert "| 1024 | 2 | 2,048 |" in out
+    assert "| 2048 | 2 | 4,096 |" in out
+    assert out.count("| 1024 |") == 1
+    assert out.count("| 2048 |") == 1
+    assert "main tokens" in out
+    assert "standalone PR tokens" in out
 
 
 def test_parse_batch_schedule_rejects_bad_items() -> None:
