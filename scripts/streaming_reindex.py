@@ -1135,6 +1135,18 @@ def main(argv: list[str]) -> int:
         (OUTPUT_ROOT / str(tl)).mkdir(parents=True, exist_ok=True)
     manifest = Manifest.load(MANIFEST_PATH)
     resume = not args.no_resume
+    source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
+    source_dir_roots = [Path(p) for p in args.source_dir_root]
+    if args.source_cache_only and source_cache_dir is None:
+        raise SystemExit("--source-cache-only requires --source-cache-dir")
+    if args.source_cache_populate_only and source_cache_dir is None:
+        raise SystemExit("--source-cache-populate-only requires --source-cache-dir")
+    if args.source_cache_populate_only and args.source_cache_only:
+        raise SystemExit("--source-cache-populate-only cannot be combined with --source-cache-only")
+    if args.source_cache_populate_only and args.commit_source:
+        raise SystemExit("--source-cache-populate-only is code-only; remove --commit-source")
+    if source_dir_roots and (source_cache_dir is not None or args.source_cache_only):
+        raise SystemExit("--source-dir-root cannot be combined with source cache flags")
 
     # Shared global dedup db (cross-repo + cross-stream). FAIL LOUD up front:
     # open it once here so a bad path / missing datasketch crashes before any
@@ -1223,18 +1235,6 @@ def main(argv: list[str]) -> int:
         def should_process(repo: str) -> bool:
             return is_code_worktree_repo(repo) and not (resume and manifest.is_done(repo))
 
-        source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
-        source_dir_roots = [Path(p) for p in args.source_dir_root]
-        if args.source_cache_only and source_cache_dir is None:
-            raise SystemExit("--source-cache-only requires --source-cache-dir")
-        if args.source_cache_populate_only and source_cache_dir is None:
-            raise SystemExit("--source-cache-populate-only requires --source-cache-dir")
-        if args.source_cache_populate_only and args.source_cache_only:
-            raise SystemExit("--source-cache-populate-only cannot be combined with --source-cache-only")
-        if args.source_cache_populate_only and args.commit_source:
-            raise SystemExit("--source-cache-populate-only is code-only; remove --commit-source")
-        if source_dir_roots and (source_cache_dir is not None or args.source_cache_only):
-            raise SystemExit("--source-dir-root cannot be combined with source cache flags")
         if args.source_cache_populate_only:
             report = populate_source_cache(
                 work_root,

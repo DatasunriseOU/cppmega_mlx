@@ -183,3 +183,51 @@ def test_populate_source_cache_only_materializes_cache(tmp_path, monkeypatch) ->
         "repos": [{"repo": "repo-a", "path": str(cache / "repo-a")}],
         "repo_count": 1,
     }
+
+
+def test_source_cache_populate_rejects_commit_source_before_processing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import streaming_reindex
+
+    commit_source = tmp_path / "commits.jsonl"
+    commit_source.write_text("{}\n", encoding="utf-8")
+    calls = []
+
+    def fake_process_one_commit_source(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("commit source should not be processed")
+
+    monkeypatch.setattr(
+        streaming_reindex,
+        "OUTPUT_ROOT",
+        tmp_path / "outputs" / "reindexed",
+    )
+    monkeypatch.setattr(
+        streaming_reindex,
+        "MANIFEST_PATH",
+        tmp_path / "outputs" / "reindexed" / "_done.json",
+    )
+    monkeypatch.setattr(
+        streaming_reindex,
+        "process_one_commit_source",
+        fake_process_one_commit_source,
+    )
+
+    try:
+        streaming_reindex.main(
+            [
+                "--source-cache-dir",
+                str(tmp_path / "cache"),
+                "--source-cache-populate-only",
+                "--commit-source",
+                f"sample={commit_source}",
+            ]
+        )
+    except SystemExit as exc:
+        assert "--source-cache-populate-only is code-only" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected source-cache populate validation failure")
+
+    assert calls == []
