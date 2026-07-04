@@ -491,6 +491,36 @@ def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
     tmp.replace(sentinel)
 
 
+def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> bool:
+    """Copy a tar file member, explicitly skipping legacy file/dir conflicts.
+
+    Some old source archives contain path-type collisions, for example a
+    directory and a regular file at the same path. Blocking the whole corpus on
+    that single path is worse than losing one impossible-to-materialize member,
+    but the skip must be visible in logs.
+    """
+    if target.exists() and target.is_dir():
+        print(
+            f"WARN {repo}: skip tar file {member_name!r}; target path is already "
+            f"a directory: {target}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    if target.parent.exists() and not target.parent.is_dir():
+        print(
+            f"WARN {repo}: skip tar file {member_name!r}; parent path is not a "
+            f"directory: {target.parent}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "wb") as out:
+        shutil.copyfileobj(src, out)
+    return True
+
+
 def _iter_complete_source_cache(
     source_cache_dir: Path,
     should_process: Callable[[str], bool],
@@ -613,9 +643,7 @@ def stream_repo_subtrees(
             if src is None:
                 continue
             target = cur_dir / within
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with open(target, "wb") as out:
-                shutil.copyfileobj(src, out)
+            _copy_tar_member_file(src, target, repo=repo, member_name=name)
         if cur_repo is not None and active:
             assert cur_dir is not None
             yield_dir = cur_dir

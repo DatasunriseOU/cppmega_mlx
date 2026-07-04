@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
 import sys
+import tarfile
+import subprocess
 
 
 def test_run_checked_times_out_fail_loud(tmp_path) -> None:
@@ -154,6 +157,50 @@ def test_stream_repo_dirs_yields_extracted_src_without_tar(tmp_path) -> None:
     )
 
     assert yielded == [("repo", root / "repo" / "_src")]
+
+
+def test_stream_repo_subtrees_skips_legacy_file_directory_conflict(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    import streaming_reindex
+
+    tar_path = tmp_path / "source.tar"
+    zst_path = tmp_path / "source.tar.zst"
+    with tarfile.open(tar_path, "w") as tf:
+        child_info = tarfile.TarInfo("cpp_all/repo/conflict/child.txt")
+        child_payload = b"child creates the conflict directory\n"
+        child_info.size = len(child_payload)
+        child_info.mode = 0o644
+        tf.addfile(child_info, io.BytesIO(child_payload))
+
+        file_info = tarfile.TarInfo("cpp_all/repo/conflict")
+        payload = b"this cannot be materialized over a directory\n"
+        file_info.size = len(payload)
+        file_info.mode = 0o644
+        tf.addfile(file_info, io.BytesIO(payload))
+
+        good_info = tarfile.TarInfo("cpp_all/repo/good.cpp")
+        good_payload = b"int good;\n"
+        good_info.size = len(good_payload)
+        good_info.mode = 0o644
+        tf.addfile(good_info, io.BytesIO(good_payload))
+
+    subprocess.run(["zstd", "-q", "-f", str(tar_path), "-o", str(zst_path)], check=True)
+    monkeypatch.setattr(streaming_reindex, "TARBALL", zst_path)
+
+    yielded = list(
+        streaming_reindex.stream_repo_subtrees(
+            tmp_path / "work",
+            lambda repo: repo == "repo",
+        )
+    )
+
+    assert yielded == [("repo", tmp_path / "work" / "repo" / "_src")]
+    assert (tmp_path / "work" / "repo" / "_src" / "conflict").is_dir()
+    assert (tmp_path / "work" / "repo" / "_src" / "good.cpp").read_text() == "int good;\n"
+    assert "skip tar file" in capsys.readouterr().err
 
 
 def test_populate_source_cache_only_materializes_cache(tmp_path, monkeypatch) -> None:
