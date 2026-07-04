@@ -244,27 +244,51 @@ def run_checked(
     printable = " ".join(str(c) for c in cmd)
     print(f"  [{repo}] {stage}: {printable}", file=sys.stderr, flush=True)
     log_fh = open(log_path, "wb") if log_path else None
+    stdout_data: bytes | None = None
+    proc: subprocess.Popen[bytes] | None = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [str(c) for c in cmd],
             cwd=str(cwd) if cwd else None,
             env=_subprocess_env(),
             stdout=log_fh if log_fh else subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
+            start_new_session=bool(timeout),
         )
+        stdout_data, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        if proc is not None:
+            try:
+                if timeout:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    if timeout:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait()
         raise RepoFailure(repo, stage, f"timed out after {timeout}s: {exc}") from exc
     finally:
         if log_fh:
             log_fh.close()
+    if proc is None:
+        raise RepoFailure(repo, stage, "subprocess did not start")
     if proc.returncode != 0:
         tail = ""
         if log_path and log_path.exists():
             data = log_path.read_bytes()[-4000:]
             tail = data.decode("utf-8", errors="replace")
-        elif proc.stdout:
-            tail = proc.stdout.decode("utf-8", errors="replace")[-4000:]
+        elif stdout_data:
+            tail = stdout_data.decode("utf-8", errors="replace")[-4000:]
         raise RepoFailure(
             repo, stage, f"exit code {proc.returncode}\n--- last output ---\n{tail}"
         )
@@ -423,6 +447,7 @@ def stage_index_source(
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
+    index_timeout_s: int | None = None,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.
 
@@ -461,6 +486,7 @@ def stage_index_source(
         "index_project",
         cmd,
         log_path=work / f"{repo}.index.log",
+        timeout=index_timeout_s if index_timeout_s and index_timeout_s > 0 else None,
     )
     if not enriched.exists() or enriched.stat().st_size == 0:
         raise RepoFailure(repo, "index_project", f"empty enriched jsonl: {enriched}")
@@ -628,6 +654,7 @@ def process_one_repo(
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
+    index_timeout_s: int | None = None,
     *,
     promote_dedup_on_success: bool = True,
 ) -> dict:
@@ -655,7 +682,7 @@ def process_one_repo(
         enriched = stage_index_source(
             repo, repo_dir, work, dedup_db, dedup_near,
             stage_id, stage_db, global_symbol_index, memory_limit_gb,
-            parse_workers,
+            parse_workers, index_timeout_s,
         )
         timings["index_project_s"] = round(time.monotonic() - started, 6)
         started = time.monotonic()
@@ -795,6 +822,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--parse-workers", type=int, default=2,
                    help="Parse workers passed to index_project for the code stage "
                         "(default 2; keep this low when multiple repos run).")
+    p.add_argument("--code-index-timeout-s", type=int, default=0,
+                   help="Optional fail-loud timeout for each index_project code "
+                        "stage. 0 disables the timeout (default).")
     return p.parse_args(argv)
 
 
@@ -911,7 +941,8 @@ def main(argv: list[str]) -> int:
                                             dedup_db, dedup_near,
                                             global_symbol_index,
                                             args.memory_limit_gb,
-                                            args.parse_workers)
+                                            args.parse_workers,
+                                            args.code_index_timeout_s)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

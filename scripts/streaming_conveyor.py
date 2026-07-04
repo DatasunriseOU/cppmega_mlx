@@ -1199,6 +1199,7 @@ def run_code_half(
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
+    index_timeout_s: int | None = None,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -1214,7 +1215,7 @@ def run_code_half(
     try:
         info = sr.process_one_repo(
             repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-            global_symbol_index, memory_limit_gb, parse_workers,
+            global_symbol_index, memory_limit_gb, parse_workers, index_timeout_s,
             promote_dedup_on_success=False,
         )
         # zstd-max the per-length code parquet files this repo just wrote.
@@ -1245,6 +1246,7 @@ CodeRunner = Callable[
         Path | None,
         float,
         int,
+        int | None,
     ],
     dict,
 ]
@@ -1309,6 +1311,7 @@ def run_code_half_adaptive(
     global_symbol_index: Path | None = None,
     memory_limit_gb: float = 10.0,
     parse_workers: int = 2,
+    index_timeout_s: int | None = None,
     *,
     runner: CodeRunner | None = None,
     isolate_dedup_on_retry: bool = True,
@@ -1331,6 +1334,7 @@ def run_code_half_adaptive(
             global_symbol_index,
             memory_limit_gb,
             parse_workers,
+            index_timeout_s,
         )
     except RepoFailure as exc:
         if parse_workers <= 1 or not is_index_project_memory_failure(exc):
@@ -1352,6 +1356,7 @@ def run_code_half_adaptive(
             global_symbol_index,
             memory_limit_gb,
             1,
+            index_timeout_s,
         )
 
 
@@ -2002,6 +2007,7 @@ def process_one_repo(
     *,
     code_memory_limit_gb: float | None = None,
     commit_memory_limit_gb: float | None = None,
+    code_index_timeout_s: int | None = None,
     reservations: UnitReservationLedger | None = None,
     range_submit_window: int = 1,
     analysis_cache_entries: int = 128,
@@ -2086,6 +2092,7 @@ def process_one_repo(
                             repo, repo_dir, lengths_code, work_root,
                             code_dedup_db, code_dedup_near,
                             global_symbol_index, code_limit, code_parse_workers,
+                            code_index_timeout_s,
                         )
                         with manifest_lock:
                             manifest.mark_done(ck, cinfo)
@@ -2289,6 +2296,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Parse workers passed to index_project for the CODE half "
                         "(default 2; avoid multiplying --repo-workers by the old "
                         "index_project default of 8 clang workers).")
+    p.add_argument("--code-index-timeout-s", type=int, default=0,
+                   help="Optional fail-loud timeout for each CODE index_project "
+                        "stage. 0 disables the timeout (default).")
     p.add_argument("--memory-budget-gb", type=float, default=None,
                    help="Global conveyor memory budget for heavy subprocesses. "
                         "Default is 55%% of physical RAM (or 48 GiB if RAM size "
@@ -2667,6 +2677,7 @@ def main(argv: list[str]) -> int:
                     progress, checkpoint,
                     code_memory_limit_gb=code_memory_limit_gb,
                     commit_memory_limit_gb=commit_memory_limit_gb,
+                    code_index_timeout_s=args.code_index_timeout_s,
                     reservations=reservations,
                     range_submit_window=range_submit_window,
                     analysis_cache_entries=args.analysis_cache_entries,
@@ -2756,6 +2767,7 @@ def main(argv: list[str]) -> int:
                     progress, checkpoint,
                     code_memory_limit_gb=code_memory_limit_gb,
                     commit_memory_limit_gb=commit_memory_limit_gb,
+                    code_index_timeout_s=args.code_index_timeout_s,
                     reservations=reservations,
                     range_submit_window=range_submit_window,
                     analysis_cache_entries=args.analysis_cache_entries,

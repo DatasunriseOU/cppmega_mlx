@@ -284,8 +284,9 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
         global_symbol_index,
         memory_limit_gb,
         parse_workers,
+        index_timeout_s,
     ):
-        calls.append((parse_workers, dedup_db, dedup_near))
+        calls.append((parse_workers, dedup_db, dedup_near, index_timeout_s))
         if parse_workers > 1:
             raise streaming_conveyor.RepoFailure(
                 repo,
@@ -308,12 +309,13 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
         None,
         8.0,
         2,
+        7200,
         runner=runner,
     )
 
     assert calls == [
-        (2, tmp_path / "global.sqlite", True),
-        (1, None, False),
+        (2, tmp_path / "global.sqlite", True, 7200),
+        (1, None, False, 7200),
     ]
     assert info["lengths"]["1024"]["valid_tokens"] == 1024
 
