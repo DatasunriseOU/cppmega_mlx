@@ -1214,6 +1214,38 @@ def stream_lock_names(streams: str) -> tuple[str, ...]:
     return (streams,)
 
 
+def populate_code_source_cache(
+    work_root: Path,
+    source_cache_dir: Path,
+    should_process,
+    progress: ProgressWriter,
+    *,
+    max_repos: int | None = None,
+) -> dict:
+    """Populate the code source cache without running index/tokenize stages."""
+    started = time.monotonic()
+    report = sr.populate_source_cache(
+        work_root,
+        should_process,
+        source_cache_dir,
+        max_repos=max_repos,
+    )
+    for idx, item in enumerate(report["repos"], start=1):
+        progress.emit(
+            "source_cache_repo_ready",
+            repo=item["repo"],
+            repo_dir=item["path"],
+            source_cache_dir=str(source_cache_dir),
+            repo_count=idx,
+        )
+    report = {
+        **report,
+        "elapsed_s": round(time.monotonic() - started, 6),
+    }
+    progress.emit("source_cache_populated", **report)
+    return report
+
+
 # --------------------------------------------------------------------------- #
 # CODE half: orchestrate streaming_reindex.process_one_repo (no reimplementation).
 # Its append_output already lands outputs/reindexed/<L>/<repo>.parquet; we then
@@ -2402,6 +2434,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="For --streams code, only process complete repos already "
                         "in --source-cache-dir; do not open/decompress the source "
                         "tarball.")
+    p.add_argument("--source-cache-populate-only", action="store_true",
+                   help="For --streams code, populate --source-cache-dir from "
+                        "the source tarball and exit without indexing/tokenizing. "
+                        "Follow with --source-cache-only for hot code runs.")
     p.add_argument("--source-dir-root", action="append", default=[],
                    help="For --streams code, process already-extracted repo dirs "
                         "directly without opening the source tarball. May be passed "
@@ -2469,6 +2505,12 @@ def main(argv: list[str]) -> int:
     source_dir_roots = [Path(p) for p in args.source_dir_root]
     if args.source_cache_only and source_cache_dir is None:
         raise SystemExit("--source-cache-only requires --source-cache-dir")
+    if args.source_cache_populate_only and source_cache_dir is None:
+        raise SystemExit("--source-cache-populate-only requires --source-cache-dir")
+    if args.source_cache_populate_only and args.source_cache_only:
+        raise SystemExit("--source-cache-populate-only cannot be combined with --source-cache-only")
+    if args.source_cache_populate_only and args.streams != "code":
+        raise SystemExit("--source-cache-populate-only is only valid with --streams code")
     if args.source_cache_only and args.streams != "code":
         raise SystemExit("--source-cache-only is only valid with --streams code")
     if source_cache_dir is not None and args.streams != "code":
@@ -2659,6 +2701,7 @@ def main(argv: list[str]) -> int:
         code_recompress_workers=args.code_recompress_workers if code_recompressor else 0,
         source_cache_dir=str(source_cache_dir) if source_cache_dir is not None else None,
         source_cache_only=args.source_cache_only,
+        source_cache_populate_only=args.source_cache_populate_only,
         source_dir_roots=[str(p) for p in source_dir_roots],
         reservation_file=str(args.reservation_file)
         if reservations is not None else None,
@@ -2736,6 +2779,42 @@ def main(argv: list[str]) -> int:
                 context=f"staging repo {repo}",
             )
         return should_stage
+
+    if args.source_cache_populate_only:
+        try:
+            report = populate_code_source_cache(
+                work_root,
+                source_cache_dir,
+                should_process,
+                progress,
+                max_repos=args.max_repos,
+            )
+            summary = {
+                "repos_this_run": 0,
+                "code_halves_this_run": 0,
+                "commit_ranges_this_run": 0,
+                "commit_ranges_failed_this_run": 0,
+                "workers": workers,
+                "repo_workers": repo_workers,
+                "max_active_repos": max_active_repos,
+                "parse_workers": parse_workers,
+                "memory_plan": memory_plan,
+                "streams": args.streams,
+                "source_cache_populate_only": True,
+                "source_cache_report": report,
+                "manifest": str(CONVEYOR_MANIFEST),
+                "interrupted": STOP_EVENT.is_set(),
+            }
+            progress.emit("run_finished", **summary)
+            print(json.dumps(summary, indent=2))
+            return 130 if STOP_EVENT.is_set() else 0
+        finally:
+            if code_recompressor is not None:
+                code_recompressor.shutdown()
+            if own_work_root and not args.keep_temp:
+                remove_tree(work_root, reason="source-cache populate work_root")
+            for lock in reversed(run_locks):
+                lock.close()
 
     range_pool = ThreadPoolExecutor(max_workers=workers)
     repo_pool = ThreadPoolExecutor(max_workers=repo_workers) if repo_workers > 1 else None

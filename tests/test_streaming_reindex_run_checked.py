@@ -154,3 +154,32 @@ def test_stream_repo_dirs_yields_extracted_src_without_tar(tmp_path) -> None:
     )
 
     assert yielded == [("repo", root / "repo" / "_src")]
+
+
+def test_populate_source_cache_only_materializes_cache(tmp_path, monkeypatch) -> None:
+    import streaming_reindex
+
+    cache = tmp_path / "cache"
+    calls = []
+
+    def fake_stream(work_root, should_process, *, source_cache_dir, source_cache_only):
+        calls.append((work_root, source_cache_dir, source_cache_only))
+        for repo in ("repo-a", "repo.bare", "repo-b"):
+            if should_process(repo):
+                yield repo, source_cache_dir / repo
+
+    monkeypatch.setattr(streaming_reindex, "stream_repo_subtrees", fake_stream)
+
+    report = streaming_reindex.populate_source_cache(
+        tmp_path / "work",
+        streaming_reindex.is_code_worktree_repo,
+        cache,
+        max_repos=1,
+    )
+
+    assert calls == [(tmp_path / "work", cache, False)]
+    assert report == {
+        "source_cache_dir": str(cache),
+        "repos": [{"repo": "repo-a", "path": str(cache / "repo-a")}],
+        "repo_count": 1,
+    }

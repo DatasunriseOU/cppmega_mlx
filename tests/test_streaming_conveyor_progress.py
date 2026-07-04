@@ -58,6 +58,59 @@ def test_progress_writer_tracks_extract_cache_rates(tmp_path):
     assert writer.extract_cache_metrics()["status_counts"]["hit"] == 1
 
 
+def test_populate_code_source_cache_emits_ready_and_summary(tmp_path, monkeypatch):
+    import streaming_conveyor
+
+    progress_path = tmp_path / "progress.jsonl"
+    progress = streaming_conveyor.ProgressWriter(progress_path)
+    cache = tmp_path / "source_cache"
+    observed = {}
+
+    def fake_populate(work_root, should_process, source_cache_dir, *, max_repos):
+        observed["work_root"] = work_root
+        observed["source_cache_dir"] = source_cache_dir
+        observed["max_repos"] = max_repos
+        repos = []
+        for repo in ("repo-a", "repo.bare", "repo-b"):
+            if should_process(repo):
+                repos.append({"repo": repo, "path": str(source_cache_dir / repo)})
+        repos = repos[:max_repos]
+        return {
+            "source_cache_dir": str(source_cache_dir),
+            "repos": repos,
+            "repo_count": len(repos),
+        }
+
+    monkeypatch.setattr(streaming_conveyor.sr, "populate_source_cache", fake_populate)
+
+    report = streaming_conveyor.populate_code_source_cache(
+        tmp_path / "work",
+        cache,
+        streaming_conveyor.sr.is_code_worktree_repo,
+        progress,
+        max_repos=1,
+    )
+
+    assert observed == {
+        "work_root": tmp_path / "work",
+        "source_cache_dir": cache,
+        "max_repos": 1,
+    }
+    assert report["repo_count"] == 1
+    rows = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "source_cache_repo_ready",
+        "source_cache_populated",
+    ]
+    assert rows[0]["repo"] == "repo-a"
+    assert rows[0]["repo_dir"] == str(cache / "repo-a")
+    assert rows[1]["repo_count"] == 1
+    assert rows[1]["repos"] == [{"repo": "repo-a", "path": str(cache / "repo-a")}]
+
+
 def test_background_recompressor_runs_and_surfaces_completion(tmp_path, monkeypatch):
     import streaming_conveyor
 

@@ -659,6 +659,43 @@ def stream_repo_dirs(source_roots: Sequence[Path], should_process):
             yield repo, repo_dir
 
 
+def populate_source_cache(
+    work_root: Path,
+    should_process,
+    source_cache_dir: Path,
+    *,
+    max_repos: int | None = None,
+) -> dict:
+    """Materialize source-cache repos without running the tokenization pipeline.
+
+    This is the explicit "cold source-store build" phase. It may read the
+    monolithic source tar once, but callers can then run the hot code conveyor
+    with --source-cache-only and avoid any sequential tar drain in production.
+    """
+    if source_cache_dir is None:
+        raise ValueError("source_cache_dir is required")
+    repos: list[dict[str, str]] = []
+    gen = stream_repo_subtrees(
+        work_root,
+        should_process,
+        source_cache_dir=source_cache_dir,
+        source_cache_only=False,
+    )
+    try:
+        for repo, repo_dir in gen:
+            repos.append({"repo": repo, "path": str(repo_dir)})
+            if max_repos is not None and len(repos) >= max_repos:
+                break
+    finally:
+        if hasattr(gen, "close"):
+            gen.close()
+    return {
+        "source_cache_dir": str(source_cache_dir),
+        "repos": repos,
+        "repo_count": len(repos),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Per-repo pipeline stages.
 # --------------------------------------------------------------------------- #
@@ -1070,6 +1107,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--source-cache-only", action="store_true",
                    help="Only process repos already complete in --source-cache-dir; "
                         "do not open/decompress the source tarball.")
+    p.add_argument("--source-cache-populate-only", action="store_true",
+                   help="Populate --source-cache-dir from the source tarball and "
+                        "exit without indexing/tokenizing. Use the resulting cache "
+                        "with --source-cache-only for hot code runs.")
     p.add_argument("--source-dir-root", action="append", default=[],
                    help="Already-extracted repo root to process directly, without "
                         "opening the source tarball. May be passed multiple times; "
@@ -1186,8 +1227,25 @@ def main(argv: list[str]) -> int:
         source_dir_roots = [Path(p) for p in args.source_dir_root]
         if args.source_cache_only and source_cache_dir is None:
             raise SystemExit("--source-cache-only requires --source-cache-dir")
+        if args.source_cache_populate_only and source_cache_dir is None:
+            raise SystemExit("--source-cache-populate-only requires --source-cache-dir")
+        if args.source_cache_populate_only and args.source_cache_only:
+            raise SystemExit("--source-cache-populate-only cannot be combined with --source-cache-only")
+        if args.source_cache_populate_only and args.commit_source:
+            raise SystemExit("--source-cache-populate-only is code-only; remove --commit-source")
         if source_dir_roots and (source_cache_dir is not None or args.source_cache_only):
             raise SystemExit("--source-dir-root cannot be combined with source cache flags")
+        if args.source_cache_populate_only:
+            report = populate_source_cache(
+                work_root,
+                should_process,
+                source_cache_dir,
+                max_repos=args.max_repos,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
+            if own_work_root and not args.keep_temp:
+                shutil.rmtree(work_root, ignore_errors=True)
+            return 0
         gen = (
             stream_repo_dirs(source_dir_roots, should_process)
             if source_dir_roots
