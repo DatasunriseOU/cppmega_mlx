@@ -32,17 +32,19 @@ import glob
 import importlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import hashlib
 import time
+import warnings
 
 # Increase recursion limit for deeply nested ASTs (gcc-mirror, llvm-project, boost)
 sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -254,26 +256,52 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
 
 # A doc PART. Historically a 5-tuple (text, kind, dep_level, name, qname_or_none).
 # Cross-repo base-lib pulls append a 6th element: dep_source — a provenance
-# marker like 'crosslib:<repo>' (None / absent for normal local parts). Builders
-# accept BOTH the 5- and 6-tuple forms (see _part_dep_source).
+# marker like 'crosslib:<repo>' (None / absent for normal local parts). Macro
+# chunks may append a 7th element with scanner provenance so domain route edges
+# point to the precise conditional/redefinition/include-order macro nodes rather
+# than being re-derived from assembled text. Builders accept all forms.
 PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
     str, int, int, str, str | None, str | None
+] | tuple[
+    str, int, int, str, str | None, str | None, dict[str, object] | None
 ]
 
 
 def _part_dep_source(part: tuple) -> str | None:
     """dep_source provenance of a doc part (None for normal local parts)."""
-    return part[5] if len(part) >= 6 else None
+    value = part[5] if len(part) >= 6 else None
+    return value if isinstance(value, str) else None
+
+
+def _part_macro_provenance(part: tuple) -> dict[str, object] | None:
+    """Scanner-derived macro provenance of a doc part, when present."""
+    value = part[6] if len(part) >= 7 else None
+    return value if isinstance(value, dict) else None
 
 
 # C++ source file extensions
 CPP_EXTENSIONS = {'.cpp', '.cc', '.cxx', '.c', '.c++', '.cp'}
-HEADER_EXTENSIONS = {'.h', '.hpp', '.hxx', '.hh', '.h++', '.inl', '.inc'}
+HEADER_EXTENSIONS = {
+    '.h',
+    '.hpp',
+    '.hxx',
+    '.hh',
+    '.h++',
+    '.inl',
+    '.inc',
+    '.ipp',
+    '.tpp',
+    '.txx',
+}
 # Files we feed to libclang for indexing. Headers are included so that struct/
 # class/enum/typedef DEFINITIONS (which live in headers) enter the index as
 # type-def chunks, enabling function->type-def ``type_edges``. Headers are parsed
 # as standalone TUs; libclang resolves the definitions they contain.
 INDEX_EXTENSIONS = CPP_EXTENSIONS | HEADER_EXTENSIONS
+
+
+def _is_header_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in HEADER_EXTENSIONS
 
 # --------------------------------------------------------------------------- #
 # Build / compilation file discovery (ADDITIVE; C/C++ path unchanged).
@@ -333,6 +361,15 @@ BUILD_EXT_KINDS: dict[str, str] = {
 # Cap the build slice to a sane share of corpus tokens so a giant build tree can
 # never dominate the LM corpus. Applied at discovery (see find_build_files).
 BUILD_FILE_SIZE_CAP = 500_000  # bytes; mirror find_cpp_files' per-file cap
+
+# Source structure ids.  The first 0-8 values are the historical code kinds used
+# by build_enriched_doc; build/domain docs extended that with BUILD_KIND=9.  Header
+# fragments are C++ code, but need their own small ids so the model can distinguish
+# standalone header context and preprocessor macro bodies from ordinary function
+# chunks.
+BUILD_KIND = 9
+HEADER_FRAGMENT_KIND = 10
+MACRO_KIND = 11
 
 
 def classify_build_file(fname: str) -> str | None:
@@ -483,6 +520,54 @@ class TypeDef:
         return cls(**d)
 
 
+class MacroDef:
+    """A trainable preprocessor macro definition captured from project headers."""
+
+    __slots__ = [
+        'name',
+        'file',
+        'line',
+        'text',
+        'params',
+        'visible_in_file',
+        'visible_line',
+        'sequence',
+        'condition_names',
+        'condition_lines',
+        'undef_text',
+        'previous',
+    ]
+
+    def __init__(
+        self,
+        name: str,
+        file: str,
+        line: int,
+        text: str,
+        params: list[str] | None = None,
+        *,
+        visible_in_file: str | None = None,
+        visible_line: int | None = None,
+        sequence: int = 0,
+        condition_names: list[str] | None = None,
+        condition_lines: list[str] | None = None,
+        undef_text: str = "",
+        previous: "MacroDef | None" = None,
+    ):
+        self.name = name
+        self.file = file
+        self.line = line
+        self.text = text
+        self.params = list(params or [])
+        self.visible_in_file = visible_in_file or file
+        self.visible_line = visible_line if visible_line is not None else line
+        self.sequence = int(sequence)
+        self.condition_names = list(condition_names or [])
+        self.condition_lines = list(condition_lines or [])
+        self.undef_text = undef_text
+        self.previous = previous
+
+
 class ProjectIndex:
     """Cross-file function index for a single project."""
 
@@ -500,6 +585,12 @@ class ProjectIndex:
         # when building docs to pull a referenced type's DEFINITION in as a
         # type-edge target chunk.
         self.typedefs: dict[str, TypeDef] = {}
+        # macro name -> latest MacroDef plus full definition history. Header macro
+        # definitions are not clang AST nodes, so they live in a small side registry
+        # used for standalone macro docs and same-document invocation routes.
+        self.macros: dict[str, MacroDef] = {}
+        self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
+        self.macro_definitions: list[MacroDef] = []
 
     def add_typedef(self, td: TypeDef):
         """Register a type definition. First definition with text wins; never
@@ -511,6 +602,30 @@ class ProjectIndex:
         if existing is not None and len(existing.text) >= len(td.text):
             return
         self.typedefs[key] = td
+
+    def add_macro(self, macro: MacroDef):
+        if not macro.name:
+            return
+        for existing in self.macros_by_name.get(macro.name, []):
+            if (
+                existing.file == macro.file
+                and existing.line == macro.line
+                and existing.visible_in_file == macro.visible_in_file
+                and existing.sequence == macro.sequence
+            ):
+                return
+        existing = self.macros.get(macro.name)
+        if (
+            existing is not None
+            and existing.visible_in_file == macro.visible_in_file
+            and existing.sequence > macro.sequence
+        ):
+            self.macros_by_name[macro.name].append(macro)
+            self.macro_definitions.append(macro)
+            return
+        self.macros_by_name[macro.name].append(macro)
+        self.macro_definitions.append(macro)
+        self.macros[macro.name] = macro
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
@@ -989,6 +1104,10 @@ CONTAINER_KINDS = {
     CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
 }
 
+
+def _cursor_kind_or_none(name: str):
+    return getattr(CursorKind, name, None)
+
 # Cursor kinds whose DEFINITIONS we register as TypeDef chunks (type-edge
 # targets). class/struct/union map to node-bucket kind 4; typedef/using map to
 # kind 7 (see _CLANG_PART_NODE_BUCKETS). Enums get kind 4 as well (record-like).
@@ -1003,6 +1122,27 @@ _TYPE_DEF_KIND_BUCKET = {
     CursorKind.TYPE_ALIAS_DECL: 7,
     CursorKind.TYPE_ALIAS_TEMPLATE_DECL: 7,
 }
+_CONCEPT_DECL_KIND = _cursor_kind_or_none("CONCEPT_DECL")
+_UNEXPOSED_DECL_KIND = _cursor_kind_or_none("UNEXPOSED_DECL")
+
+
+def _header_decl_kind(cursor, text: str, *, in_primary_file: bool) -> int | None:
+    """Return a structure kind for trainable non-type header declarations."""
+    if not in_primary_file:
+        return None
+    if cursor.kind == _CONCEPT_DECL_KIND:
+        return HEADER_FRAGMENT_KIND
+    if cursor.kind not in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND}:
+        return None
+    stripped = text.lstrip()
+    padded = f" {stripped} "
+    if stripped.startswith("template ") and (
+        " inline " in padded or " constexpr " in padded
+    ):
+        return HEADER_FRAGMENT_KIND
+    if stripped.startswith("inline constexpr ") or stripped.startswith("constexpr inline "):
+        return HEADER_FRAGMENT_KIND
+    return None
 
 
 def parse_translation_unit(
@@ -1026,10 +1166,10 @@ def parse_translation_unit(
     (scripts/crossrepo/build_global_symbol_index.py), when indexing the C++
     standard library itself (libc++/libstdc++), sets this True so ``std::vector``,
     ``std::map``, ``std::basic_string``, ... ARE captured as type definitions.
-    When True we also attribute each captured func/type to its ACTUAL defining
-    file (not the primary TU path) so the same ``std::vector`` reached through many
-    umbrella headers dedups to one row (and carries correct provenance/line).
-    This flag does NOT change behavior for the normal (per-repo) index path.
+    Type definitions are always attributed to their ACTUAL project-local defining
+    file (not the primary TU path) so a class/template reached through a .cc
+    include still emits as a standalone header fragment.  When True we apply the
+    same actual-file attribution to std/base-lib symbols too.
     """
     functions: list[FunctionDef] = []
     typedefs: list[TypeDef] = []
@@ -1077,9 +1217,9 @@ def parse_translation_unit(
     def _cursor_rel_file(cursor) -> str:
         """The cursor's ACTUAL defining file, relative to project_dir.
 
-        Used only under ``allow_system_types`` so a std:: symbol reached via many
-        umbrella TUs is attributed to the one header that defines it (correct
-        provenance + stable dedup key). Falls back to the primary ``rel_path``.
+        Type definitions reached through includes must keep their header
+        provenance (correct standalone header docs + stable dedup key). Falls
+        back to the primary ``rel_path``.
         """
         loc = cursor.location.file
         if loc is None:
@@ -1154,13 +1294,36 @@ def parse_translation_unit(
                     typedefs.append(TypeDef(
                         name=cursor.spelling,
                         qualified_name=qname,
-                        file=(_cursor_rel_file(cursor) if allow_system_types else rel_path),
+                        file=_cursor_rel_file(cursor),
                         line=cursor.location.line,
                         text=td_text,
                         kind=type_bucket,
                         end_line=cursor.extent.end.line,
                     ))
             # Records (class/struct) can contain nested types/methods — recurse.
+
+        header_decl_text = ""
+        header_decl_kind = None
+        if cursor.kind in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND, _CONCEPT_DECL_KIND}:
+            header_decl_text = get_function_text(cursor, tu)
+            if header_decl_text:
+                header_decl_kind = _header_decl_kind(
+                    cursor,
+                    header_decl_text,
+                    in_primary_file=in_primary_file,
+                )
+        if header_decl_kind is not None and header_decl_text and len(header_decl_text) >= 8:
+            qname = get_qualified_name(cursor)
+            if qname and (allow_system_types or not is_system_function(qname)):
+                typedefs.append(TypeDef(
+                    name=cursor.spelling,
+                    qualified_name=qname,
+                    file=_cursor_rel_file(cursor),
+                    line=cursor.location.line,
+                    text=header_decl_text,
+                    kind=header_decl_kind,
+                    end_line=cursor.extent.end.line,
+                ))
 
         if cursor.kind in CONTAINER_KINDS:
             # Recurse into namespaces, classes, structs for nested defs.
@@ -1353,7 +1516,10 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     if ext in HEADER_EXTENSIONS:
         # Force C++ header mode so struct/class/enum/typedef DEFINITIONS in
         # header-only files parse and become type-def chunks. Strip any existing
-        # -x <lang> pair / joined -x form first so it doesn't conflict.
+        # -x <lang> pair / joined -x form first so it doesn't conflict.  Standalone
+        # header parsing must understand C++20/23 header-only declarations
+        # (concepts, inline variable templates) even when the repo has no
+        # compile_commands.json and the old fallback would have been c++17.
         adapted = []
         skip_next = False
         for arg in args:
@@ -1365,8 +1531,10 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 continue
             if arg.startswith('-x') and arg != '-x':
                 continue
+            if arg.startswith('-std='):
+                continue
             adapted.append(arg)
-        return ['-x', 'c++-header'] + adapted
+        return ['-x', 'c++-header', '-std=c++23'] + adapted
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
@@ -1587,6 +1755,8 @@ _CLANG_PART_NODE_BUCKETS = {
     6: 80,  # comment/docstring
     7: 9,   # typedef/using
     8: 5,   # namespace
+    HEADER_FRAGMENT_KIND: 2,  # standalone header fragment
+    MACRO_KIND: 81,  # preprocessor macro definition
 }
 
 
@@ -1629,6 +1799,12 @@ def extract_ast_metadata_from_parts(
             ast_depth[offset:end] = func.ast_depth[: end - offset]
             sibling_index[offset:end] = func.sibling_index[: end - offset]
             ast_node_type[offset:end] = func.ast_node_type[: end - offset]
+        else:
+            fallback_node_type = _CLANG_PART_NODE_BUCKETS.get(int(kind), 0)
+            if fallback_node_type:
+                span_len = end - offset
+                ast_node_type[offset:end] = [fallback_node_type] * span_len
+                sibling_index[offset:end] = [min(part_index, 65535)] * span_len
         offset += part_len
         if part_index < len(parts_info) - 1:
             offset += 2
@@ -1925,6 +2101,647 @@ def extract_semantic_metadata_from_parts(
     }
 
 
+_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+def _apply_char_span(values: list[int], start: int, end: int, value: int) -> None:
+    for idx in range(max(0, start), min(len(values), end)):
+        values[idx] = value
+
+
+def _stable_entity_id(name: str) -> int:
+    digest = hashlib.sha1(name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def _parse_macro_signature(
+    macro_text: str,
+) -> tuple[str, tuple[int, int], dict[str, tuple[int, int]], int] | None:
+    match = _DEFINE_RE.match(macro_text)
+    if match is None:
+        return None
+    name = match.group(1)
+    name_span = (match.start(1), match.end(1))
+    params: dict[str, tuple[int, int]] = {}
+    body_start = match.end()
+    if body_start < len(macro_text) and macro_text[body_start] == "(":
+        close = macro_text.find(")", body_start + 1)
+        newline = macro_text.find("\n", body_start + 1)
+        if close != -1 and (newline == -1 or close < newline):
+            param_text = macro_text[body_start + 1:close]
+            base = body_start + 1
+            search_from = 0
+            for raw_param in param_text.split(","):
+                param = raw_param.strip()
+                if not param or param == "...":
+                    search_from += len(raw_param) + 1
+                    continue
+                if param.endswith("..."):
+                    param = param[:-3].strip()
+                param_match = re.search(r"[A-Za-z_][A-Za-z0-9_]*$", param)
+                if param_match is None:
+                    search_from += len(raw_param) + 1
+                    continue
+                param_name = param_match.group(0)
+                local_start = param_text.find(param_name, search_from)
+                if local_start == -1:
+                    local_start = param_text.find(param_name)
+                if local_start != -1:
+                    params[param_name] = (
+                        base + local_start,
+                        base + local_start + len(param_name),
+                    )
+                search_from += len(raw_param) + 1
+            body_start = close + 1
+    return name, name_span, params, body_start
+
+
+def _macro_body_dependency_names(
+    macro_text: str,
+    *,
+    macro_name: str,
+    params: Sequence[str] | None = None,
+) -> list[str]:
+    """Macro identifiers referenced by the replacement list.
+
+    Scanner ``MacroDef.text`` may include condition and undef lines before the
+    real ``#define``.  Parse the logical define block inside that text, then
+    inspect only the replacement list so parameter names and the macro's own
+    name do not become expansion dependencies.
+    """
+
+    blocks = extract_macro_blocks(macro_text)
+    if blocks:
+        matching = [
+            block_text for _start, _end, name, block_text in blocks
+            if name == macro_name
+        ]
+        source = matching[-1] if matching else blocks[-1][3]
+    else:
+        source = macro_text
+
+    parsed = _parse_macro_signature(source)
+    if parsed is None:
+        return []
+    name, _name_span, parsed_params, body_start = parsed
+    ignored = {name, macro_name, *(params or ()), *parsed_params}
+    out: list[str] = []
+    seen: set[str] = set()
+    body = source[body_start:]
+    for match in _IDENTIFIER_RE.finditer(body):
+        dep_name = match.group(0)
+        if dep_name in ignored or dep_name.lower() in _CONDITION_SKIP_IDENTIFIERS:
+            continue
+        if dep_name in seen:
+            continue
+        seen.add(dep_name)
+        out.append(dep_name)
+    return out
+
+
+def _macro_part_metadata(macro: MacroDef) -> dict[str, object]:
+    previous_sequence = macro.previous.sequence if macro.previous is not None else None
+    return {
+        "name": macro.name,
+        "file": macro.file,
+        "line": macro.line,
+        "visible_in_file": macro.visible_in_file,
+        "visible_line": macro.visible_line,
+        "sequence": macro.sequence,
+        "previous_sequence": previous_sequence,
+        "condition_names": list(macro.condition_names),
+        "body_macro_names": _macro_body_dependency_names(
+            macro.text,
+            macro_name=macro.name,
+            params=macro.params,
+        ),
+    }
+
+
+def _macro_route_part(
+    part_text: str,
+    *,
+    offset: int,
+    metadata: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not metadata:
+        return None
+    target_name = metadata.get("name")
+    if not isinstance(target_name, str) or not target_name:
+        return None
+    for start, end, name, macro_text in extract_macro_blocks(part_text):
+        if name != target_name:
+            continue
+        parsed = _parse_macro_signature(macro_text)
+        if parsed is None:
+            return None
+        _name, name_span, _params, _body_start = parsed
+        condition_names = [
+            str(value) for value in metadata.get("condition_names", [])
+            if isinstance(value, str) and value
+        ]
+        condition_name_set = set(condition_names)
+        condition_spans: list[dict[str, object]] = []
+        if condition_name_set:
+            prefix = part_text[:start]
+            for match in _IDENTIFIER_RE.finditer(prefix):
+                if match.group(0) not in condition_name_set:
+                    continue
+                condition_spans.append(
+                    {
+                        "name": match.group(0),
+                        "start": offset + match.start(),
+                        "end": offset + match.end(),
+                    }
+                )
+        condition_directive_spans: list[dict[str, object]] = []
+        prefix = part_text[:start]
+        for line_match in re.finditer(
+            r"(?m)^\s*#\s*(if|ifdef|ifndef|elif|else)\b",
+            prefix,
+        ):
+            condition_directive_spans.append(
+                {
+                    "name": line_match.group(1),
+                    "start": offset + line_match.start(1),
+                    "end": offset + line_match.end(1),
+                    "role": "keyword",
+                }
+            )
+        suffix = part_text[end:]
+        for line_match in re.finditer(r"(?m)^\s*#\s*(endif)\b", suffix):
+            condition_directive_spans.append(
+                {
+                    "name": line_match.group(1),
+                    "start": offset + end + line_match.start(1),
+                    "end": offset + end + line_match.end(1),
+                    "role": "keyword",
+                }
+            )
+        route_part = dict(metadata)
+        route_part.update(
+            {
+                "name_start": offset + start + name_span[0],
+                "name_end": offset + start + name_span[1],
+                "macro_start": offset + start,
+                "macro_end": offset + end,
+                "condition_spans": condition_spans,
+                "condition_directive_spans": condition_directive_spans,
+            }
+        )
+        return route_part
+    return None
+
+
+def _source_line_for_text_offset(text: str, *, start_line: int, char_offset: int) -> int:
+    return int(start_line) + text.count("\n", 0, max(0, char_offset))
+
+
+def _macro_invocation_route_parts(
+    part_text: str,
+    *,
+    offset: int,
+    index: ProjectIndex,
+    target_file: str,
+    start_line: int,
+) -> list[dict[str, object]]:
+    """Precise use-site -> macro-definition routes for one source chunk.
+
+    The assembled training document puts all pulled macro definitions before the
+    source chunks.  Pure lexical remapping inside the assembled text would route
+    every use to the last pulled definition, which is wrong for dependency
+    functions that live before a later ``#undef/#define`` window.  Use the
+    original source line for each identifier so each invocation points at the
+    macro definition visible at that source location.
+    """
+
+    macro_ranges = [
+        (start, end) for start, end, _name, _macro_text in extract_macro_blocks(part_text)
+    ]
+    routes: list[dict[str, object]] = []
+    for match in _IDENTIFIER_RE.finditer(part_text):
+        if any(start <= match.start() < end for start, end in macro_ranges):
+            continue
+        source_line = _source_line_for_text_offset(
+            part_text,
+            start_line=start_line,
+            char_offset=match.start(),
+        )
+        macro = _select_visible_macro(
+            index,
+            match.group(0),
+            target_file=target_file,
+            max_line=source_line,
+        )
+        if macro is None:
+            continue
+        routes.append(
+            {
+                "name": macro.name,
+                "start": offset + match.start(),
+                "end": offset + match.end(),
+                "target_sequence": macro.sequence,
+            }
+        )
+    return routes
+
+
+def _cpp_domain_sidecars(
+    text: str,
+    index: ProjectIndex | None = None,
+    *,
+    macro_parts: list[dict[str, object]] | None = None,
+    macro_invocations: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Char-aligned domain sidecars for C/C++ code documents.
+
+    The token materializer uses ``domain_kind`` to insert the existing
+    <CPP_CODE_START>/<CPP_CODE_END> reserved tokens.  The dense char arrays keep
+    the C++ domain distinct from build/shell/diagnostic docs without pretending
+    that we have a separate build-style parser for C++ tokens here; clang graph
+    routes remain in the code-specific sidecars.
+    """
+    from cppmega_mlx.data.domain_schema import (
+        DomainEdgeKind,
+        DomainKind,
+        DomainRoleKind,
+        ParseConfidence,
+    )
+
+    text_len = len(text)
+    domain = int(DomainKind.CPP)
+    role_ids = [0] * text_len
+    entity_ids = [0] * text_len
+    domain_edges: list[dict[str, int]] = []
+    macro_definitions_by_name: dict[str, list[dict[str, int | str]]] = defaultdict(list)
+    macro_occurrences: list[dict[str, int | str]] = []
+    macro_ranges: list[tuple[int, int]] = []
+    use_precise_macro_graph = bool(macro_parts)
+
+    def _condition_identifier_spans(define_start: int) -> list[tuple[str, int, int]]:
+        block_start = text.rfind("\n\n", 0, define_start)
+        block_start = 0 if block_start == -1 else block_start + 2
+        prefix = text[block_start:define_start]
+        spans: list[tuple[str, int, int]] = []
+        for line_match in re.finditer(r"(?m)^\s*#\s*(if|ifdef|ifndef|elif)\b.*$", prefix):
+            line = line_match.group(0)
+            abs_line_start = block_start + line_match.start()
+            for ident in _IDENTIFIER_RE.finditer(line):
+                name = ident.group(0)
+                if name.lower() in _CONDITION_SKIP_IDENTIFIERS or name in {
+                    "if",
+                    "ifdef",
+                    "ifndef",
+                    "elif",
+                }:
+                    continue
+                spans.append((name, abs_line_start + ident.start(), abs_line_start + ident.end()))
+        return spans
+
+    for start, end, _name, macro_text in extract_macro_blocks(text):
+        parsed = _parse_macro_signature(macro_text)
+        if parsed is None:
+            continue
+        name, name_span, params, body_start = parsed
+        entity = _stable_entity_id(f"macro:{name}")
+        macro_ranges.append((start, end))
+        occurrence = {
+            "name": name,
+            "name_start": start + name_span[0],
+            "name_end": start + name_span[1],
+        }
+        macro_definitions_by_name[name].append(occurrence)
+        macro_occurrences.append(occurrence)
+        _apply_char_span(
+            role_ids,
+            start + name_span[0],
+            start + name_span[1],
+            int(DomainRoleKind.IDENTIFIER),
+        )
+        _apply_char_span(entity_ids, start + name_span[0], start + name_span[1], entity)
+        for param_name, (param_start, param_end) in params.items():
+            param_entity = _stable_entity_id(f"macro:{name}:param:{param_name}")
+            _apply_char_span(
+                role_ids,
+                start + param_start,
+                start + param_end,
+                int(DomainRoleKind.VARIABLE),
+            )
+            _apply_char_span(entity_ids, start + param_start, start + param_end, param_entity)
+            body = macro_text[body_start:]
+            for use in _IDENTIFIER_RE.finditer(body):
+                if use.group(0) != param_name:
+                    continue
+                use_start = start + body_start + use.start()
+                use_end = start + body_start + use.end()
+                _apply_char_span(role_ids, use_start, use_end, int(DomainRoleKind.VARIABLE))
+                _apply_char_span(entity_ids, use_start, use_end, param_entity)
+                domain_edges.append(
+                    {
+                        "from_char": use_start,
+                        "to_char": start + param_start,
+                        "kind": int(DomainEdgeKind.MACRO_PARAM_USE),
+                    }
+                )
+        if not use_precise_macro_graph:
+            for cond_name, cond_start, cond_end in _condition_identifier_spans(start):
+                cond_entity = _stable_entity_id(f"macro_condition:{cond_name}")
+                _apply_char_span(role_ids, cond_start, cond_end, int(DomainRoleKind.VARIABLE))
+                _apply_char_span(entity_ids, cond_start, cond_end, cond_entity)
+                domain_edges.append(
+                    {
+                        "from_char": start + name_span[0],
+                        "to_char": cond_start,
+                        "kind": int(DomainEdgeKind.MACRO_CONDITION),
+                    }
+                )
+
+    if use_precise_macro_graph:
+        precise_parts = [
+            part for part in (macro_parts or [])
+            if isinstance(part.get("name"), str)
+            and isinstance(part.get("sequence"), int)
+            and isinstance(part.get("name_start"), int)
+            and isinstance(part.get("name_end"), int)
+        ]
+        precise_parts.sort(key=lambda item: int(item["sequence"]))
+        by_sequence = {int(item["sequence"]): item for item in precise_parts}
+        by_name: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for item in precise_parts:
+            by_name[str(item["name"])].append(item)
+        previous_by_sequence: dict[int, dict[str, object]] = {}
+        for previous, current in zip(precise_parts, precise_parts[1:]):
+            previous_by_sequence[int(current["sequence"])] = previous
+
+        def _iter_condition_spans(item: dict[str, object]) -> Iterator[dict[str, object]]:
+            for key in ("condition_spans", "condition_directive_spans"):
+                for span in item.get(key, []):
+                    if isinstance(span, dict):
+                        yield span
+
+        def _latest_prior_part(name: str, before_sequence: int) -> dict[str, object] | None:
+            candidates = [
+                candidate for candidate in by_name.get(name, [])
+                if int(candidate["sequence"]) < before_sequence
+            ]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda candidate: int(candidate["sequence"]))
+
+        def _expansion_context_targets(
+            item: dict[str, object],
+        ) -> list[tuple[int, int]]:
+            current_sequence = int(item["sequence"])
+            targets: list[tuple[int, int]] = []
+            for cond_span in _iter_condition_spans(item):
+                cond_start = cond_span.get("start")
+                if isinstance(cond_start, int):
+                    targets.append((cond_start, int(DomainEdgeKind.MACRO_EXPANSION_CONDITION)))
+            for cond_name in item.get("condition_names", []):
+                target = _latest_prior_part(str(cond_name), current_sequence)
+                if target is not None:
+                    targets.append((
+                        int(target["name_start"]),
+                        int(DomainEdgeKind.MACRO_EXPANSION_CONDITION),
+                    ))
+            for body_name in item.get("body_macro_names", []):
+                target = _latest_prior_part(str(body_name), current_sequence)
+                if target is not None:
+                    targets.append((
+                        int(target["name_start"]),
+                        int(DomainEdgeKind.MACRO_EXPANSION_INCLUDE_ORDER),
+                    ))
+            previous_sequence = item.get("previous_sequence")
+            seen_previous: set[int] = set()
+            while isinstance(previous_sequence, int) and previous_sequence not in seen_previous:
+                seen_previous.add(previous_sequence)
+                previous = by_sequence.get(previous_sequence)
+                if previous is None:
+                    break
+                targets.append((
+                    int(previous["name_start"]),
+                    int(DomainEdgeKind.MACRO_EXPANSION_REDEFINITION),
+                ))
+                previous_sequence = previous.get("previous_sequence")
+            include_previous = previous_by_sequence.get(current_sequence)
+            if include_previous is not None:
+                targets.append((
+                    int(include_previous["name_start"]),
+                    int(DomainEdgeKind.MACRO_EXPANSION_INCLUDE_ORDER),
+                ))
+            return targets
+
+        def _emit_macro_invocation(
+            *,
+            use_start: int,
+            use_end: int,
+            selected: dict[str, object],
+        ) -> None:
+            name = str(selected["name"])
+            entity = _stable_entity_id(f"macro:{name}")
+            _apply_char_span(role_ids, use_start, use_end, int(DomainRoleKind.IDENTIFIER))
+            _apply_char_span(entity_ids, use_start, use_end, entity)
+            domain_edges.append(
+                {
+                    "from_char": use_start,
+                    "to_char": int(selected["name_start"]),
+                    "kind": int(DomainEdgeKind.MACRO_INVOCATION),
+                }
+            )
+            for target_start, edge_kind in _expansion_context_targets(selected):
+                domain_edges.append(
+                    {
+                        "from_char": use_start,
+                        "to_char": target_start,
+                        "kind": edge_kind,
+                    }
+                )
+
+        for item in precise_parts:
+            name = str(item["name"])
+            name_start = int(item["name_start"])
+            name_end = int(item["name_end"])
+            current_sequence = int(item["sequence"])
+            for cond_span in _iter_condition_spans(item):
+                cond_name = str(cond_span.get("name", ""))
+                cond_start = cond_span.get("start")
+                cond_end = cond_span.get("end")
+                if not isinstance(cond_start, int) or not isinstance(cond_end, int):
+                    continue
+                entity_prefix = (
+                    "macro_branch"
+                    if cond_span.get("role") == "keyword"
+                    else "macro_condition"
+                )
+                role = (
+                    int(DomainRoleKind.KEYWORD)
+                    if cond_span.get("role") == "keyword"
+                    else int(DomainRoleKind.VARIABLE)
+                )
+                cond_entity = _stable_entity_id(f"{entity_prefix}:{cond_name}")
+                _apply_char_span(role_ids, cond_start, cond_end, role)
+                _apply_char_span(entity_ids, cond_start, cond_end, cond_entity)
+                domain_edges.append(
+                    {
+                        "from_char": name_start,
+                        "to_char": cond_start,
+                        "kind": int(DomainEdgeKind.MACRO_CONDITION),
+                    }
+                )
+
+            for cond_name in item.get("condition_names", []):
+                cond_defs = [
+                    candidate for candidate in by_name.get(str(cond_name), [])
+                    if int(candidate["sequence"]) < current_sequence
+                ]
+                if not cond_defs:
+                    continue
+                target = max(cond_defs, key=lambda candidate: int(candidate["sequence"]))
+                domain_edges.append(
+                    {
+                        "from_char": name_start,
+                        "to_char": int(target["name_start"]),
+                        "kind": int(DomainEdgeKind.MACRO_CONDITION),
+                    }
+                )
+
+            previous_sequence = item.get("previous_sequence")
+            if isinstance(previous_sequence, int) and previous_sequence in by_sequence:
+                previous = by_sequence[previous_sequence]
+                domain_edges.append(
+                    {
+                        "from_char": name_start,
+                        "to_char": int(previous["name_start"]),
+                        "kind": int(DomainEdgeKind.MACRO_REDEFINITION),
+                    }
+                )
+
+            _apply_char_span(role_ids, name_start, name_end, int(DomainRoleKind.IDENTIFIER))
+            _apply_char_span(entity_ids, name_start, name_end, _stable_entity_id(f"macro:{name}"))
+
+        for previous, current in zip(precise_parts, precise_parts[1:]):
+            domain_edges.append(
+                {
+                    "from_char": int(current["name_start"]),
+                    "to_char": int(previous["name_start"]),
+                    "kind": int(DomainEdgeKind.MACRO_INCLUDE_ORDER),
+                }
+            )
+
+        precise_ranges = [
+            (int(item["macro_start"]), int(item["macro_end"]))
+            for item in precise_parts
+            if isinstance(item.get("macro_start"), int)
+            and isinstance(item.get("macro_end"), int)
+        ]
+
+        routed_invocation_spans: set[tuple[int, int]] = set()
+        for route in macro_invocations or []:
+            use_start = route.get("start")
+            use_end = route.get("end")
+            target_sequence = route.get("target_sequence")
+            if (
+                not isinstance(use_start, int)
+                or not isinstance(use_end, int)
+                or not isinstance(target_sequence, int)
+            ):
+                continue
+            selected = by_sequence.get(target_sequence)
+            if selected is None:
+                continue
+            _emit_macro_invocation(
+                use_start=use_start,
+                use_end=use_end,
+                selected=selected,
+            )
+            routed_invocation_spans.add((use_start, use_end))
+
+        for match in _IDENTIFIER_RE.finditer(text):
+            if (match.start(), match.end()) in routed_invocation_spans:
+                continue
+            definitions = by_name.get(match.group(0), [])
+            if not definitions:
+                continue
+            if any(start <= match.start() < end for start, end in precise_ranges):
+                continue
+            selected = max(definitions, key=lambda item: int(item["sequence"]))
+            _emit_macro_invocation(
+                use_start=match.start(),
+                use_end=match.end(),
+                selected=selected,
+            )
+    else:
+        macro_occurrences.sort(key=lambda item: int(item["name_start"]))
+        for previous, current in zip(macro_occurrences, macro_occurrences[1:]):
+            domain_edges.append(
+                {
+                    "from_char": int(current["name_start"]),
+                    "to_char": int(previous["name_start"]),
+                    "kind": int(DomainEdgeKind.MACRO_INCLUDE_ORDER),
+                }
+            )
+        for definitions in macro_definitions_by_name.values():
+            definitions.sort(key=lambda item: int(item["name_start"]))
+            for previous, current in zip(definitions, definitions[1:]):
+                domain_edges.append(
+                    {
+                        "from_char": int(current["name_start"]),
+                        "to_char": int(previous["name_start"]),
+                        "kind": int(DomainEdgeKind.MACRO_REDEFINITION),
+                    }
+                )
+
+    if not use_precise_macro_graph and index is not None and macro_definitions_by_name:
+        for match in _IDENTIFIER_RE.finditer(text):
+            definitions = macro_definitions_by_name.get(match.group(0), [])
+            if not definitions:
+                continue
+            if any(start <= match.start() < end for start, end in macro_ranges):
+                continue
+            selected: dict[str, int | str] | None = None
+            for definition in definitions:
+                if int(definition["name_start"]) < match.start():
+                    selected = definition
+                else:
+                    break
+            if selected is None:
+                continue
+            entity = _stable_entity_id(f"macro:{match.group(0)}")
+            _apply_char_span(role_ids, match.start(), match.end(), int(DomainRoleKind.IDENTIFIER))
+            _apply_char_span(entity_ids, match.start(), match.end(), entity)
+            domain_edges.append(
+                {
+                    "from_char": match.start(),
+                    "to_char": int(selected["name_start"]),
+                    "kind": int(DomainEdgeKind.MACRO_INVOCATION),
+                }
+            )
+
+    deduped_domain_edges: list[dict[str, int]] = []
+    seen_edges: set[tuple[int, int, int]] = set()
+    for edge in domain_edges:
+        key = (int(edge["from_char"]), int(edge["to_char"]), int(edge["kind"]))
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
+        deduped_domain_edges.append(edge)
+
+    return {
+        "domain_kind": domain,
+        "domain_ids": [domain] * text_len,
+        "domain_role_ids": role_ids,
+        "domain_entity_ids": entity_ids,
+        "domain_scope_ids": [0] * text_len,
+        "domain_source_doc_ids": [0] * text_len,
+        "domain_confidence_ids": [int(ParseConfidence.EXACT)] * text_len,
+        "domain_edges": deduped_domain_edges,
+        "build_edges": [],
+        "shell_edges": [],
+        "diagnostic_edges": [],
+        "cross_domain_edges": [],
+    }
+
+
 def build_enriched_doc(
     parts_info: list[PartInfo],
     index: ProjectIndex,
@@ -1958,10 +2775,13 @@ def build_enriched_doc(
     chunk_callees = {}
     chunk_all_qnames = {}    # ANY named chunk incl. type defs (type-edge targets)
     chunk_types = {}         # referenced_types per function chunk (type-edge sources)
+    macro_route_parts: list[dict[str, object]] = []
+    macro_invocation_routes: list[dict[str, object]] = []
 
     for i, part in enumerate(parts_info):
         part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
         dep_source = _part_dep_source(part)
+        macro_metadata = _part_macro_provenance(part)
         part_len = len(part_text)
         if offset + part_len > text_len:
             break
@@ -1995,9 +2815,26 @@ def build_enriched_doc(
             ):
                 chunk_target_qnames[i] = qname
         if qname and qname in index.functions:
+            func = index.functions[qname]
             chunk_qnames[i] = qname
-            chunk_callees[i] = index.functions[qname].callees
-            chunk_types[i] = getattr(index.functions[qname], 'referenced_types', [])
+            chunk_callees[i] = func.callees
+            chunk_types[i] = getattr(func, 'referenced_types', [])
+            macro_invocation_routes.extend(
+                _macro_invocation_route_parts(
+                    part_text,
+                    offset=offset,
+                    index=index,
+                    target_file=func.file,
+                    start_line=func.line,
+                )
+            )
+        macro_route_part = _macro_route_part(
+            part_text,
+            offset=offset,
+            metadata=macro_metadata,
+        )
+        if macro_route_part is not None:
+            macro_route_parts.append(macro_route_part)
 
         offset += part_len
         if i < len(parts_info) - 1:
@@ -2047,6 +2884,8 @@ def build_enriched_doc(
 
     result = {
         'text': full_text,
+        'doc_type': 'code',
+        'filepath': filepath or '',
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
         'call_edges': call_edges,
@@ -2058,6 +2897,12 @@ def build_enriched_doc(
         'call_targets': semantic_meta['call_targets'],
         'type_refs': semantic_meta['type_refs'],
         'def_use': semantic_meta['def_use'],
+        **_cpp_domain_sidecars(
+            full_text,
+            index,
+            macro_parts=macro_route_parts,
+            macro_invocations=macro_invocation_routes,
+        ),
     }
     language_info = detect_language_info(
         full_text,
@@ -2086,10 +2931,6 @@ def build_enriched_doc(
 # 'build'; and a language_info whose primary_language is the build-system tag
 # (cmake/make/bazel/ninja/meson/...). platform_info / build_info carry the
 # derived A-platform signal where available. NO libclang involved.
-# --------------------------------------------------------------------------- #
-BUILD_KIND = 9  # structure_ids kind for build files (extends 0-8 code vocab)
-
-
 def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
     """Parse build-system text into char-aligned domain sidecars.
 
@@ -2279,6 +3120,7 @@ def build_build_doc(
         'text': text,
         'doc_type': 'build',
         'build_kind': build_kind,
+        'filepath': filepath,
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
         # Build files carry NO call/type/symbol graph (not C++) -- empty/0, like
@@ -2300,6 +3142,848 @@ def build_build_doc(
     if build_info:
         result['build_info'] = build_info
     return result
+
+
+_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(?:\b|(?=\())")
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+["<]([^">]+)[">]')
+_UNDEF_RE = re.compile(r"^\s*#\s*undef\s+([A-Za-z_][A-Za-z0-9_]*)")
+_IF_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif)\b(.*)")
+_ELSE_RE = re.compile(r"^\s*#\s*else\b")
+_ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
+DEFAULT_MACRO_INCLUDE_DEPTH = int(os.environ.get("CPPMEGA_MACRO_INCLUDE_DEPTH", "0"))
+DEFAULT_MACRO_INCLUDE_FILES_PER_ROOT = int(
+    os.environ.get("CPPMEGA_MACRO_INCLUDE_FILES_PER_ROOT", "0")
+)
+_CONDITION_SKIP_IDENTIFIERS = {
+    "defined",
+    "and",
+    "or",
+    "not",
+    "true",
+    "false",
+}
+_INCLUDE_GUARD_SUFFIXES = (
+    "_H",
+    "_H_",
+    "_HH",
+    "_HH_",
+    "_HPP",
+    "_HPP_",
+    "_HXX",
+    "_HXX_",
+    "_H_INCLUDED",
+    "_HH_INCLUDED",
+    "_HPP_INCLUDED",
+    "_INCLUDED",
+    "_INCLUDED_",
+    "_INCLUDE_GUARD",
+    "_INCLUDE_GUARD_",
+    "_GUARD",
+    "_GUARD_",
+)
+
+
+def _is_probable_include_guard_define(macro_text: str, name: str) -> bool:
+    lines = macro_text.splitlines()
+    if len(lines) != 1:
+        return False
+    match = _DEFINE_RE.match(lines[0])
+    if match is None:
+        return False
+    rest = lines[0][match.end():].strip()
+    if rest not in {"", "1"}:
+        return False
+    upper = name.upper()
+    return upper.endswith(_INCLUDE_GUARD_SUFFIXES)
+
+
+def extract_macro_blocks(text: str) -> list[tuple[int, int, str, str]]:
+    """Return trainable ``#define`` logical lines, preserving continuations."""
+    lines = text.splitlines(keepends=True)
+    blocks: list[tuple[int, int, str, str]] = []
+    offset = 0
+    line_offsets: list[int] = []
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        match = _DEFINE_RE.match(line)
+        if match is None:
+            i += 1
+            continue
+        name = match.group(1)
+        start = line_offsets[i]
+        end_line = i
+        while lines[end_line].rstrip("\r\n").endswith("\\") and end_line + 1 < len(lines):
+            end_line += 1
+        end = line_offsets[end_line] + len(lines[end_line])
+        macro_text = text[start:end]
+        if (
+            len(macro_text.strip()) >= 8
+            and not _is_probable_include_guard_define(macro_text, name)
+        ):
+            blocks.append((start, end, name, macro_text))
+        i = end_line + 1
+    return blocks
+
+
+def _condition_macro_names(line: str) -> list[str]:
+    match = _IF_RE.match(line)
+    if match is None:
+        return []
+    directive = match.group(1)
+    rest = match.group(2)
+    if directive in {"ifdef", "ifndef"}:
+        ident = _IDENTIFIER_RE.search(rest)
+        return [ident.group(0)] if ident else []
+    names: list[str] = []
+    for ident in _IDENTIFIER_RE.finditer(rest):
+        name = ident.group(0)
+        if name.lower() in _CONDITION_SKIP_IDENTIFIERS:
+            continue
+        names.append(name)
+    return names
+
+
+def _import_dedup_store_symbols():
+    try:
+        from dedup_store import DedupStore, _sha1_tokens  # type: ignore
+    except ModuleNotFoundError:
+        from tools.clang_indexer.dedup_store import DedupStore, _sha1_tokens
+    return DedupStore, _sha1_tokens
+
+
+def _resolve_local_include(
+    include_name: str,
+    *,
+    current_abs: str,
+    project_dir: str | None,
+    include_dirs: list[str] | None = None,
+    known_local_files: set[str] | None = None,
+) -> str | None:
+    candidates = [os.path.join(os.path.dirname(current_abs), include_name)]
+    for include_dir in include_dirs or []:
+        candidates.append(os.path.join(include_dir, include_name))
+    if project_dir is not None:
+        candidates.append(os.path.join(project_dir, include_name))
+        candidates.append(os.path.join(project_dir, "include", include_name))
+    for candidate in candidates:
+        norm = os.path.normpath(candidate)
+        if known_local_files is not None:
+            if norm in known_local_files:
+                return norm
+            continue
+        if os.path.isfile(norm):
+            return norm
+    return None
+
+
+def _build_macro_local_file_index(project_dir: str | None) -> set[str] | None:
+    """Index project-local files once for macro include resolution.
+
+    Macro scanning runs per source root. Calling os.path.isfile for every
+    include candidate across every root explodes on large projects with many
+    include dirs (ITK hit a post-parse stat loop). The macro scanner only needs
+    project-local headers/sources; system headers are intentionally not scanned
+    into training docs.
+    """
+    if project_dir is None:
+        return None
+    root = os.path.normpath(os.path.abspath(project_dir))
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"macro include index project_dir is not a directory: {root}")
+    indexed: set[str] = set()
+    skip_dirs = {
+        ".git",
+        ".svn",
+        "node_modules",
+        "build",
+        "_build",
+        "cmake-build-debug",
+    }
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in skip_dirs]
+        for filename in filenames:
+            indexed.add(os.path.normpath(os.path.join(dirpath, filename)))
+    return indexed
+
+
+def _include_dirs_from_args(
+    args: list[str] | None,
+    *,
+    project_dir: str | None,
+) -> list[str]:
+    include_dirs: list[str] = []
+    if not args:
+        return include_dirs
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        value: str | None = None
+        if arg in {"-I", "-iquote", "-isystem", "-idirafter"} and i + 1 < len(args):
+            value = args[i + 1]
+            i += 2
+        elif arg.startswith("-I") and len(arg) > 2:
+            value = arg[2:]
+            i += 1
+        elif arg.startswith("-iquote") and len(arg) > len("-iquote"):
+            value = arg[len("-iquote"):]
+            i += 1
+        elif arg.startswith("-isystem") and len(arg) > len("-isystem"):
+            value = arg[len("-isystem"):]
+            i += 1
+        else:
+            i += 1
+        if not value:
+            continue
+        if project_dir is not None and not os.path.isabs(value):
+            value = os.path.join(project_dir, value)
+        norm = os.path.normpath(value)
+        if norm not in include_dirs:
+            include_dirs.append(norm)
+    return include_dirs
+
+
+def _collect_macro_include_dirs(
+    *,
+    project_dir: str | None,
+    compile_db: dict | None,
+    default_args: list[str] | None,
+) -> list[str]:
+    dirs: list[str] = []
+
+    def add_many(values: list[str]) -> None:
+        for value in values:
+            if value not in dirs:
+                dirs.append(value)
+
+    add_many(_include_dirs_from_args(default_args, project_dir=project_dir))
+    if compile_db:
+        for entry in compile_db.values():
+            if not isinstance(entry, dict):
+                continue
+            add_many(
+                _include_dirs_from_args(
+                    entry.get("compile_args", []),
+                    project_dir=project_dir,
+                )
+            )
+    return dirs
+
+
+def register_header_macros(
+    index: ProjectIndex,
+    header_files: list[str],
+    *,
+    project_dir: str | None,
+    include_dirs: list[str] | None = None,
+    max_include_depth: int | None = None,
+    max_include_files_per_root: int | None = None,
+) -> dict[str, int]:
+    sequence = [0]
+    directive_cache: dict[str, list[dict[str, object]]] = {}
+    resolve_cache: dict[tuple[str, str], str | None] = {}
+    stats: defaultdict[str, int] = defaultdict(int)
+    local_file_index = _build_macro_local_file_index(project_dir)
+    if local_file_index is not None:
+        stats["local_file_index_entries"] = len(local_file_index)
+    max_include_depth = (
+        DEFAULT_MACRO_INCLUDE_DEPTH
+        if max_include_depth is None
+        else int(max_include_depth)
+    )
+    max_include_files_per_root = (
+        DEFAULT_MACRO_INCLUDE_FILES_PER_ROOT
+        if max_include_files_per_root is None
+        else int(max_include_files_per_root)
+    )
+    if max_include_depth < 0:
+        raise ValueError(f"max_include_depth must be >= 0, got {max_include_depth}")
+    if max_include_files_per_root < 0:
+        raise ValueError(
+            f"max_include_files_per_root must be >= 0, got {max_include_files_per_root}"
+        )
+
+    def _rel(path: str) -> str:
+        return (
+            os.path.relpath(path, project_dir)
+            if project_dir is not None and os.path.isabs(path)
+            else path
+        )
+
+    def _directive_events(norm_abs: str) -> list[dict[str, object]]:
+        cached = directive_cache.get(norm_abs)
+        if cached is not None:
+            stats["directive_cache_hits"] += 1
+            return cached
+        try:
+            with open(norm_abs, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            raise RuntimeError(f"failed to read C/C++ file for macro scan: {norm_abs}") from exc
+
+        stats["directive_file_reads"] += 1
+        events: list[dict[str, object]] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            line_no = i + 1
+
+            include_match = _INCLUDE_RE.match(line)
+            if include_match is not None:
+                events.append(
+                    {
+                        "kind": "include",
+                        "line_no": line_no,
+                        "include_name": include_match.group(1),
+                    }
+                )
+                i += 1
+                continue
+
+            if _ENDIF_RE.match(line):
+                events.append({"kind": "endif"})
+                i += 1
+                continue
+            if _ELSE_RE.match(line):
+                events.append({"kind": "else", "line": line})
+                i += 1
+                continue
+            if _IF_RE.match(line) is not None:
+                events.append({"kind": "if", "line": line})
+                i += 1
+                continue
+
+            undef_match = _UNDEF_RE.match(line)
+            if undef_match is not None:
+                events.append(
+                    {
+                        "kind": "undef",
+                        "line": line,
+                        "name": undef_match.group(1),
+                    }
+                )
+                i += 1
+                continue
+
+            define_match = _DEFINE_RE.match(line)
+            if define_match is None:
+                i += 1
+                continue
+            name = define_match.group(1)
+            start_line = i
+            end_line = i
+            while lines[end_line].rstrip("\r\n").endswith("\\") and end_line + 1 < len(lines):
+                end_line += 1
+            macro_text = "".join(lines[start_line:end_line + 1])
+            if len(macro_text.strip()) >= 8:
+                parsed = _parse_macro_signature(macro_text)
+                params = list(parsed[2]) if parsed is not None else []
+                events.append(
+                    {
+                        "kind": "define",
+                        "line_no": line_no,
+                        "name": name,
+                        "macro_text": macro_text,
+                        "params": params,
+                        "include_guard": _is_probable_include_guard_define(
+                            macro_text,
+                            name,
+                        ),
+                    }
+                )
+            i = end_line + 1
+        directive_cache[norm_abs] = events
+        return events
+
+    def _resolve_include_cached(include_name: str, *, current_abs: str) -> str | None:
+        key = (include_name, os.path.dirname(current_abs))
+        if key in resolve_cache:
+            stats["include_resolve_cache_hits"] += 1
+            return resolve_cache[key]
+        resolved = _resolve_local_include(
+            include_name,
+            current_abs=current_abs,
+            project_dir=project_dir,
+            include_dirs=include_dirs,
+            known_local_files=local_file_index,
+        )
+        resolve_cache[key] = resolved
+        return resolved
+
+    def _scan_root(root_abs: str, root_rel: str) -> None:
+        stats["roots"] += 1
+        if stats["roots"] == 1 or stats["roots"] % 250 == 0:
+            print(
+                "  Macro scan heartbeat: "
+                f"roots={stats['roots']} scanned_files={stats['scanned_files']} "
+                f"registered={stats['registered_macros']} "
+                f"resolve_cache_hits={stats['include_resolve_cache_hits']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        visited_files: set[str] = set()
+        active_defs: dict[str, MacroDef] = {}
+        last_defs: dict[str, MacroDef] = {}
+        pending_undef: dict[str, str] = {}
+        condition_stack: list[dict[str, object]] = []
+
+        def _conditions_active() -> bool:
+            return all(bool(item["active"]) for item in condition_stack)
+
+        def _condition_lines(item: dict[str, object]) -> list[str]:
+            lines = item.get("lines")
+            if isinstance(lines, list):
+                return [str(line) for line in lines]
+            return [str(item.get("line", ""))]
+
+        def _macro_value(name: str) -> int:
+            macro = active_defs.get(name)
+            if macro is None:
+                return 0
+            parsed = _parse_macro_signature(macro.text)
+            if parsed is None:
+                return 1
+            body = macro.text[parsed[3]:].strip()
+            if body in {"", "true", "TRUE"}:
+                return 1
+            if body in {"false", "FALSE"}:
+                return 0
+            body = body.strip("() \t")
+            try:
+                return int(body, 0)
+            except ValueError:
+                return 1
+
+        def _macro_truthy(name: str) -> bool:
+            return _macro_value(name) != 0
+
+        def _eval_expr(rest: str) -> bool:
+            def repl_defined(match: re.Match[str]) -> str:
+                name = match.group(1) or match.group(2)
+                return "1" if name in active_defs else "0"
+
+            expr = re.sub(
+                r"\bdefined\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)"
+                r"|\bdefined\s+([A-Za-z_][A-Za-z0-9_]*)",
+                repl_defined,
+                rest,
+            )
+
+            def repl_ident(match: re.Match[str]) -> str:
+                name = match.group(0)
+                low = name.lower()
+                if low == "true":
+                    return "1"
+                if low == "false":
+                    return "0"
+                if low in _CONDITION_SKIP_IDENTIFIERS:
+                    return name
+                return str(_macro_value(name))
+
+            expr = _IDENTIFIER_RE.sub(repl_ident, expr)
+            expr = expr.replace("&&", " and ").replace("||", " or ")
+            expr = re.sub(r"(?<![=!<>])!(?!=)", " not ", expr)
+            expr = expr.strip()
+            if not expr:
+                return True
+            safe_expr = re.sub(r"\b(?:and|or|not)\b", "", expr)
+            if not re.fullmatch(r"[0-9A-Fa-fxXbBoO_() \t.+*/%<>=!&|^~ -]+", safe_expr):
+                return any(_macro_truthy(name) for name in _condition_macro_names("#if " + rest))
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", SyntaxWarning)
+                    return bool(eval(expr, {"__builtins__": {}}, {}))
+            except (Exception, SyntaxWarning):
+                return any(_macro_truthy(name) for name in _condition_macro_names("#if " + rest))
+
+        def _evaluate_condition(line: str) -> tuple[bool, list[str]]:
+            match = _IF_RE.match(line)
+            if match is None:
+                return True, []
+            directive = match.group(1)
+            rest = match.group(2)
+            names = _condition_macro_names(line)
+            if directive == "ifdef":
+                return (names[0] in active_defs if names else False), names
+            if directive == "ifndef":
+                return (names[0] not in active_defs if names else True), names
+            stripped = rest.strip()
+            if stripped in {"0", "(0)"}:
+                return False, names
+            if stripped in {"1", "(1)"}:
+                return True, names
+            return _eval_expr(rest), names
+
+        def _scan_file(
+            abs_path: str,
+            rel_path: str,
+            *,
+            root_visible_line: int | None,
+            include_stack: set[str],
+            depth: int,
+        ) -> None:
+            norm_abs = os.path.normpath(abs_path)
+            if norm_abs in include_stack:
+                stats["skipped_include_cycle"] += 1
+                return
+            if norm_abs in visited_files:
+                stats["skipped_include_revisit"] += 1
+                return
+            if max_include_files_per_root and len(visited_files) >= max_include_files_per_root:
+                stats["skipped_include_file_cap"] += 1
+                return
+            visited_files.add(norm_abs)
+            stats["scanned_files"] += 1
+            include_stack.add(norm_abs)
+            try:
+                for event in _directive_events(norm_abs):
+                    kind = str(event["kind"])
+                    if kind == "include":
+                        stats["include_directives"] += 1
+                        if max_include_depth and depth >= max_include_depth:
+                            stats["skipped_include_depth"] += 1
+                            continue
+                        included = _resolve_include_cached(
+                            str(event["include_name"]),
+                            current_abs=norm_abs,
+                        )
+                        if included is not None:
+                            _scan_file(
+                                included,
+                                _rel(included),
+                                root_visible_line=root_visible_line
+                                or int(event["line_no"]),
+                                include_stack=include_stack,
+                                depth=depth + 1,
+                            )
+                        else:
+                            stats["skipped_unresolved_include"] += 1
+                        continue
+
+                    if kind == "endif":
+                        if condition_stack:
+                            condition_stack.pop()
+                        continue
+                    if kind == "else":
+                        line = str(event["line"])
+                        if condition_stack:
+                            previous = condition_stack.pop()
+                            parent_active = _conditions_active()
+                            active = parent_active and not bool(previous["branch_taken"])
+                            branch_lines = [*_condition_lines(previous), line]
+                            condition_stack.append(
+                                {
+                                    "line": line,
+                                    "lines": branch_lines,
+                                    "names": previous["names"],
+                                    "active": active,
+                                    "branch_taken": bool(previous["branch_taken"]) or active,
+                                }
+                            )
+                        continue
+                    if kind == "if":
+                        line = str(event["line"])
+                        if_match = _IF_RE.match(line)
+                        if if_match and if_match.group(1) == "elif" and condition_stack:
+                            previous = condition_stack.pop()
+                            parent_active = _conditions_active()
+                            expr_active, names = _evaluate_condition(line)
+                            active = (
+                                parent_active
+                                and not bool(previous["branch_taken"])
+                                and expr_active
+                            )
+                            branch_lines = [*_condition_lines(previous), line]
+                            condition_stack.append(
+                                {
+                                    "line": line,
+                                    "lines": branch_lines,
+                                    "names": names,
+                                    "active": active,
+                                    "branch_taken": bool(previous["branch_taken"]) or active,
+                                }
+                            )
+                        else:
+                            parent_active = _conditions_active()
+                            expr_active, names = _evaluate_condition(line)
+                            active = parent_active and expr_active
+                            condition_stack.append(
+                                {
+                                    "line": line,
+                                    "lines": [line],
+                                    "names": names,
+                                    "active": active,
+                                    "branch_taken": active,
+                                }
+                            )
+                        continue
+
+                    if not _conditions_active():
+                        continue
+
+                    if kind == "undef":
+                        name = str(event["name"])
+                        line = str(event["line"])
+                        pending_undef[name] = line
+                        active_defs.pop(name, None)
+                        continue
+
+                    if kind != "define":
+                        continue
+                    name = str(event["name"])
+                    line_no = int(event["line_no"])
+                    macro_text = str(event["macro_text"])
+                    params = cast(list[str], event["params"])
+                    if not bool(event["include_guard"]):
+                        condition_lines = [
+                            line
+                            for item in condition_stack
+                            for line in _condition_lines(item)
+                            if line
+                        ]
+                        condition_names: list[str] = []
+                        for item in condition_stack:
+                            condition_names.extend(cast(list[str], item["names"]))
+                        undef_text = pending_undef.pop(name, "")
+                        text_parts = [*condition_lines]
+                        if undef_text:
+                            text_parts.append(undef_text)
+                        text_parts.append(macro_text)
+                        text_parts.extend("#endif\n" for _item in condition_stack)
+                        macro = MacroDef(
+                            name=name,
+                            file=rel_path,
+                            line=line_no,
+                            text="".join(text_parts),
+                            params=params,
+                            visible_in_file=root_rel,
+                            visible_line=root_visible_line or line_no,
+                            sequence=sequence[0],
+                            condition_names=condition_names,
+                            condition_lines=condition_lines,
+                            undef_text=undef_text,
+                            previous=last_defs.get(name),
+                        )
+                        sequence[0] += 1
+                        active_defs[name] = macro
+                        last_defs[name] = macro
+                        index.add_macro(macro)
+                        stats["registered_macros"] += 1
+                    else:
+                        guard_macro = MacroDef(
+                            name=name,
+                            file=rel_path,
+                            line=line_no,
+                            text=macro_text,
+                            params=params,
+                            visible_in_file=root_rel,
+                            visible_line=root_visible_line or line_no,
+                            sequence=sequence[0],
+                        )
+                        sequence[0] += 1
+                        active_defs[name] = guard_macro
+                        last_defs[name] = guard_macro
+            finally:
+                include_stack.remove(norm_abs)
+
+        _scan_file(
+            root_abs,
+            root_rel,
+            root_visible_line=None,
+            include_stack=set(),
+            depth=0,
+        )
+
+    for path in header_files:
+        rel = _rel(path)
+        ext = os.path.splitext(rel)[1].lower()
+        if ext not in INDEX_EXTENSIONS:
+            continue
+        abs_path = path
+        if project_dir is not None and not os.path.isabs(abs_path):
+            abs_path = os.path.join(project_dir, abs_path)
+        _scan_root(os.path.normpath(abs_path), rel)
+
+    return dict(stats)
+
+
+def _select_visible_macro(
+    index: ProjectIndex,
+    name: str,
+    *,
+    target_file: str | None,
+    max_line: int | None,
+    before_sequence: int | None = None,
+) -> MacroDef | None:
+    candidates = list(index.macros_by_name.get(name, []))
+    if not candidates:
+        return None
+    if target_file is not None:
+        scoped = [
+            macro for macro in candidates
+            if macro.visible_in_file == target_file
+            and (max_line is None or macro.visible_line <= max_line)
+            and (before_sequence is None or macro.sequence < before_sequence)
+        ]
+        if not scoped:
+            return None
+        candidates = scoped
+    elif before_sequence is not None:
+        scoped = [macro for macro in candidates if macro.sequence < before_sequence]
+        if scoped:
+            candidates = scoped
+    return max(candidates, key=lambda macro: (macro.visible_line, macro.sequence))
+
+
+def _macro_dependency_closure(
+    index: ProjectIndex,
+    selected: list[MacroDef],
+    *,
+    target_file: str | None,
+    max_line: int | None,
+) -> list[MacroDef]:
+    out: dict[tuple[str, str, int, int], MacroDef] = {}
+    visiting: set[tuple[str, str, int, int]] = set()
+
+    def add(macro: MacroDef | None) -> None:
+        if macro is None:
+            return
+        key = (macro.visible_in_file, macro.file, macro.line, macro.sequence)
+        if key in out or key in visiting:
+            return
+        visiting.add(key)
+        if macro.previous is not None:
+            add(macro.previous)
+        for cond_name in macro.condition_names:
+            add(
+                _select_visible_macro(
+                    index,
+                    cond_name,
+                    target_file=target_file,
+                    max_line=max_line,
+                    before_sequence=macro.sequence,
+                )
+            )
+        for body_name in _macro_body_dependency_names(
+            macro.text,
+            macro_name=macro.name,
+            params=macro.params,
+        ):
+            add(
+                _select_visible_macro(
+                    index,
+                    body_name,
+                    target_file=target_file,
+                    max_line=max_line,
+                    before_sequence=macro.sequence,
+                )
+            )
+        out[key] = macro
+        visiting.remove(key)
+
+    for macro in selected:
+        add(macro)
+    return sorted(out.values(), key=lambda macro: macro.sequence)
+
+
+def _used_macro_defs(
+    index: ProjectIndex,
+    texts: list[str] | list[tuple[str, int | None]],
+    *,
+    target_file: str | None = None,
+    max_line: int | None = None,
+) -> list[MacroDef]:
+    used: dict[tuple[str, str, int, int], MacroDef] = {}
+    if not index.macros_by_name:
+        return []
+
+    def _iter_texts() -> Iterator[tuple[str, int | None]]:
+        for item in texts:
+            if isinstance(item, tuple):
+                text, start_line = item
+                yield str(text), int(start_line) if start_line is not None else None
+            else:
+                yield str(item), max_line
+
+    for text, start_line in _iter_texts():
+        for match in _IDENTIFIER_RE.finditer(text):
+            use_line = (
+                _source_line_for_text_offset(
+                    text,
+                    start_line=start_line,
+                    char_offset=match.start(),
+                )
+                if start_line is not None
+                else max_line
+            )
+            macro = _select_visible_macro(
+                index,
+                match.group(0),
+                target_file=target_file,
+                max_line=use_line,
+            )
+            if macro is not None:
+                key = (
+                    macro.visible_in_file,
+                    macro.file,
+                    macro.line,
+                    macro.sequence,
+                )
+                used[key] = macro
+    return _macro_dependency_closure(
+        index,
+        list(used.values()),
+        target_file=target_file,
+        max_line=max_line,
+    )
+
+
+def _compile_context_for_rel_file(
+    rel_file: str,
+    *,
+    project_dir: str | None,
+    compile_db: dict | None,
+    default_args: list[str] | None,
+    default_build_info: dict | None,
+) -> tuple[list[str], dict | None]:
+    compile_args = list(default_args or [])
+    build_info = dict(default_build_info) if default_build_info else None
+    if project_dir is None:
+        return compile_args, build_info
+    abs_path = os.path.normpath(os.path.join(project_dir, rel_file))
+    file_build = compile_db.get(abs_path) if compile_db else None
+    if file_build:
+        compile_args = file_build.get("compile_args", compile_args)
+        build_info = file_build.get("build_info") or build_info
+    return compile_args, build_info
+
+
+def build_header_fragment_doc(
+    *,
+    index: ProjectIndex,
+    rel_file: str,
+    text: str,
+    kind: int,
+    name: str,
+    qname: str | None,
+    fragment_kind: str,
+    compile_args: list[str] | None,
+    build_info: dict | None,
+) -> dict:
+    doc = build_enriched_doc(
+        [(text, kind, 0, name, qname)],
+        index,
+        filepath=rel_file,
+        compile_args=compile_args,
+        build_info=build_info,
+    )
+    doc["doc_type"] = "code_header"
+    doc["header_fragment_kind"] = fragment_kind
+    return doc
 
 
 # --------------------------------------------------------------------------- #
@@ -2348,7 +4032,7 @@ class TrainingChunkClaims:
         self.store = None
         self.local_counts: dict[bytes, int] = {}
         if dedup_db:
-            from dedup_store import DedupStore
+            DedupStore, _sha1_tokens = _import_dedup_store_symbols()
             self.store = DedupStore(
                 dedup_db,
                 near=False,
@@ -2369,7 +4053,7 @@ class TrainingChunkClaims:
                 namespace=self.namespace,
                 max_count=max_count,
             )
-        from dedup_store import _sha1_tokens
+        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
         h = _sha1_tokens(token_ids)
         count = self.local_counts.get(h, 0)
         if count >= max_count:
@@ -2380,6 +4064,115 @@ class TrainingChunkClaims:
     def close(self) -> None:
         if self.store is not None:
             self.store.close()
+
+
+def emit_header_documents(
+    *,
+    index: ProjectIndex,
+    header_files: list[str],
+    project_dir: str | None,
+    compile_db: dict | None,
+    default_args: list[str] | None,
+    default_build_info: dict | None,
+    max_tokens: int,
+    enriched: bool,
+    chunk_claims: TrainingChunkClaims | None,
+    emit_doc: Callable[[str | dict[str, object]], None],
+) -> dict[str, int]:
+    """Emit standalone header fragments for templates/types and macros.
+
+    Function-root documents cannot cover header-only libraries by themselves:
+    class templates, alias templates, and macro APIs often have no standalone
+    function root.  This pass emits those fragments as C++ header docs while
+    sharing the same semantic chunk-claim ledger as function/type chunks.
+    """
+    stats: defaultdict[str, int] = defaultdict(int)
+    if not header_files:
+        return stats
+
+    header_rel_files: set[str] = set()
+    header_abs_by_rel: dict[str, str] = {}
+    for path in header_files:
+        rel = (
+            os.path.relpath(path, project_dir)
+            if project_dir is not None and os.path.isabs(path)
+            else path
+        )
+        ext = os.path.splitext(rel)[1].lower()
+        if ext not in HEADER_EXTENSIONS:
+            continue
+        header_rel_files.add(rel)
+        abs_path = path
+        if project_dir is not None and not os.path.isabs(abs_path):
+            abs_path = os.path.join(project_dir, abs_path)
+        header_abs_by_rel[rel] = abs_path
+
+    typedefs_by_file: dict[str, list[TypeDef]] = defaultdict(list)
+    for td in index.typedefs.values():
+        if td.file in header_rel_files and td.text:
+            typedefs_by_file[td.file].append(td)
+
+    for rel in sorted(header_rel_files):
+        compile_args, build_info = _compile_context_for_rel_file(
+            rel,
+            project_dir=project_dir,
+            compile_db=compile_db,
+            default_args=default_args,
+            default_build_info=default_build_info,
+        )
+
+        for td in sorted(typedefs_by_file.get(rel, []), key=lambda item: (item.line, item.qualified_name)):
+            if estimate_tokens(td.text) > max_tokens * 2:
+                stats["skipped_header_type_oversize"] += 1
+                continue
+            if chunk_claims is not None and not chunk_claims.claim_text(td.text, max_count=2):
+                stats["skipped_header_type"] += 1
+                continue
+            stats["header_type"] += 1
+            doc = build_header_fragment_doc(
+                index=index,
+                rel_file=rel,
+                text=td.text,
+                kind=td.kind,
+                name=td.name,
+                qname=td.qualified_name,
+                fragment_kind="header_decl" if td.kind == HEADER_FRAGMENT_KIND else "type",
+                compile_args=compile_args,
+                build_info=build_info,
+            )
+            emit_doc(doc if enriched else td.text)
+
+        abs_path = header_abs_by_rel.get(rel)
+        if not abs_path:
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                header_text = fh.read()
+        except OSError as exc:
+            raise RuntimeError(f"failed to read header for macro extraction: {abs_path}") from exc
+
+        for _start, _end, name, macro_text in extract_macro_blocks(header_text):
+            if estimate_tokens(macro_text) > max_tokens * 2:
+                stats["skipped_header_macro_oversize"] += 1
+                continue
+            if chunk_claims is not None and not chunk_claims.claim_text(macro_text, max_count=2):
+                stats["skipped_header_macro"] += 1
+                continue
+            stats["header_macro"] += 1
+            doc = build_header_fragment_doc(
+                index=index,
+                rel_file=rel,
+                text=macro_text,
+                kind=MACRO_KIND,
+                name=name,
+                qname=None,
+                fragment_kind="macro",
+                compile_args=compile_args,
+                build_info=build_info,
+            )
+            emit_doc(doc if enriched else macro_text)
+
+    return stats
 
 
 def dedup_root_functions(
@@ -2416,7 +4209,7 @@ def dedup_root_functions(
     seen_local: set[bytes] = set()
     if dedup_db:
         # FAIL LOUD: open failure / missing datasketch raises inside DedupStore.
-        from dedup_store import DedupStore  # noqa: F401
+        DedupStore, _sha1_tokens = _import_dedup_store_symbols()
         store = DedupStore(
             dedup_db,
             near=near,
@@ -2450,7 +4243,7 @@ def dedup_root_functions(
                 dropped_roots.add(qname)
                 continue
         else:
-            from dedup_store import _sha1_tokens
+            _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
             h = _sha1_tokens(token_ids)
             if h in seen_local:
                 dropped_exact += 1
@@ -2585,6 +4378,8 @@ def build_training_documents(
     dedup_stage_db: str | None = None,
     dedup_near: bool = True,
     global_symbols: "GlobalSymbolReader | None" = None,
+    header_files: list[str] | None = None,
+    macro_scan_files: list[str] | None = None,
     emit_doc: Callable[[str | dict[str, object]], None] | None = None,
 ) -> list:
     """Build training documents with bottom-up dependency ordering.
@@ -2615,6 +4410,42 @@ def build_training_documents(
             documents.append(doc)
 
     index.compute_dep_levels()
+    if header_files or macro_scan_files:
+        macro_stats = register_header_macros(
+            index,
+            macro_scan_files or header_files or [],
+            project_dir=project_dir,
+            include_dirs=_collect_macro_include_dirs(
+                project_dir=project_dir,
+                compile_db=compile_db,
+                default_args=default_args,
+            ),
+        )
+        print(
+            "  Macro scan: "
+            f"roots={macro_stats.get('roots', 0)} "
+            f"files={macro_stats.get('scanned_files', 0)} "
+            f"file_reads={macro_stats.get('directive_file_reads', 0)} "
+            f"directive_cache_hits={macro_stats.get('directive_cache_hits', 0)} "
+            f"include_directives={macro_stats.get('include_directives', 0)} "
+            f"resolve_cache_hits={macro_stats.get('include_resolve_cache_hits', 0)} "
+            f"registered={macro_stats.get('registered_macros', 0)} "
+            f"local_file_index_entries={macro_stats.get('local_file_index_entries', 0)} "
+            f"skipped_depth={macro_stats.get('skipped_include_depth', 0)} "
+            f"skipped_file_cap={macro_stats.get('skipped_include_file_cap', 0)} "
+            f"skipped_unresolved={macro_stats.get('skipped_unresolved_include', 0)}",
+            file=sys.stderr,
+        )
+        capped_skips = {
+            "skipped_include_depth": macro_stats.get("skipped_include_depth", 0),
+            "skipped_include_file_cap": macro_stats.get("skipped_include_file_cap", 0),
+        }
+        if any(int(value) for value in capped_skips.values()):
+            raise RuntimeError(
+                "macro scan truncated project-local include traversal; "
+                f"{capped_skips}. Increase/disable CPPMEGA_MACRO_INCLUDE_DEPTH "
+                "and CPPMEGA_MACRO_INCLUDE_FILES_PER_ROOT before emitting docs."
+            )
 
     # Function-level dedup BEFORE grouping (corrected design). Requires OUR
     # tokenizer; when no tokenizer_path is supplied we skip it (legacy callers /
@@ -2690,6 +4521,18 @@ def build_training_documents(
                     continue
                 dep_funcs.append(df)
             dep_funcs.sort(key=lambda f: f.dep_level)
+            preamble = index.file_preambles.get(func.file, '')
+            macro_scan_inputs: list[tuple[str, int | None]] = []
+            if preamble:
+                macro_scan_inputs.append((preamble, 1))
+            macro_scan_inputs.extend((df.text, df.line) for df in dep_funcs)
+            macro_scan_inputs.append((func.text, func.line))
+            macro_deps = _used_macro_defs(
+                index,
+                macro_scan_inputs,
+                target_file=func.file,
+                max_line=func.line,
+            )
 
             # Resolve cross-lib pulls to (qname, record) DEEPEST deps. They are the
             # most foundational (base-lib impls) so they precede local deps in text.
@@ -2701,13 +4544,12 @@ def build_training_documents(
                         continue
                     crosslink_deps.append((cq, rec))
 
-            # Build document
-            preamble = index.file_preambles.get(func.file, '')
-
             def _assemble(dep_funcs_list: list[FunctionDef]) -> str:
                 parts: list[str] = []
                 if preamble:
                     parts.append(preamble)
+                for macro in macro_deps:
+                    parts.append(macro.text)
                 # Cross-lib base-lib defs are the deepest foundation -> emitted first.
                 for _cq, _rec in crosslink_deps:
                     parts.append(_rec["text"])
@@ -2722,9 +4564,13 @@ def build_training_documents(
             # Token budget management. Trim LOCAL deps from highest dep_level first;
             # cross-lib pulls are already bounded by CrossLinkBudget, but if the doc
             # is still too big after exhausting local deps, drop cross-lib pulls too.
-            if tokens > max_tokens * 2 and (dep_funcs or crosslink_deps):
+            if tokens > max_tokens * 2 and (dep_funcs or macro_deps or crosslink_deps):
                 while tokens > max_tokens * 2 and dep_funcs:
                     dep_funcs.pop()  # remove highest-level local dep
+                    doc = _assemble(dep_funcs)
+                    tokens = estimate_tokens(doc)
+                while tokens > max_tokens * 2 and macro_deps:
+                    macro_deps.pop()
                     doc = _assemble(dep_funcs)
                     tokens = estimate_tokens(doc)
                 while tokens > max_tokens * 2 and crosslink_deps:
@@ -2750,6 +4596,15 @@ def build_training_documents(
                     claimed_dep_funcs.append(df)
                 dep_funcs = claimed_dep_funcs
 
+                claimed_macro_deps: list[MacroDef] = []
+                for macro in macro_deps:
+                    if not chunk_claims.claim_text(macro.text, max_count=1):
+                        chunk_stats["skipped_macro_dep"] += 1
+                        continue
+                    chunk_stats["claimed_macro_dep"] += 1
+                    claimed_macro_deps.append(macro)
+                macro_deps = claimed_macro_deps
+
                 claimed_crosslink_deps: list[tuple[str, dict]] = []
                 for cq, rec in crosslink_deps:
                     if not chunk_claims.claim_text(rec["text"], max_count=1):
@@ -2773,6 +4628,16 @@ def build_training_documents(
                 parts_info: list[PartInfo] = []
                 if preamble:
                     parts_info.append((preamble, 1, 0, '', None))  # kind=1 PREAMBLE
+                for macro in macro_deps:
+                    parts_info.append((
+                        macro.text,
+                        MACRO_KIND,
+                        0,
+                        macro.name,
+                        None,
+                        None,
+                        _macro_part_metadata(macro),
+                    ))
                 # Cross-lib base-lib pulls: DEEPEST deps. dep_level is set above the
                 # max local dep_level so they sort as the most foundational chunks in
                 # the SAME dep_levels/topo order, and they carry dep_source provenance
@@ -2829,17 +4694,35 @@ def build_training_documents(
                     if file_build:
                         compile_args = file_build.get("compile_args", compile_args)
                         build_info = file_build.get("build_info") or build_info
-                _record_doc(
-                    build_enriched_doc(
-                        parts_info,
-                        index,
-                        filepath=func.file,
-                        compile_args=compile_args,
-                        build_info=build_info,
-                    )
+                out_doc = build_enriched_doc(
+                    parts_info,
+                    index,
+                    filepath=func.file,
+                    compile_args=compile_args,
+                    build_info=build_info,
                 )
+                if _is_header_path(func.file) and func.text.lstrip().startswith("template"):
+                    out_doc["doc_type"] = "code_header"
+                    out_doc["header_fragment_kind"] = "function_template"
+                _record_doc(out_doc)
             else:
                 _record_doc(doc)
+
+        if header_files:
+            header_stats = emit_header_documents(
+                index=index,
+                header_files=header_files,
+                project_dir=project_dir,
+                compile_db=compile_db,
+                default_args=default_args,
+                default_build_info=default_build_info,
+                max_tokens=max_tokens,
+                enriched=enriched,
+                chunk_claims=chunk_claims,
+                emit_doc=_record_doc,
+            )
+            for key, value in header_stats.items():
+                chunk_stats[key] += value
     finally:
         if chunk_claims is not None:
             chunk_claims.close()
@@ -2849,12 +4732,20 @@ def build_training_documents(
             "  Semantic chunk claims: "
             f"root={chunk_stats['claimed_root']} "
             f"dep={chunk_stats['claimed_dep']} "
+            f"macro_dep={chunk_stats['claimed_macro_dep']} "
             f"crosslib={chunk_stats['claimed_crosslib']} "
             f"type={chunk_stats['claimed_type']} "
+            f"header_type={chunk_stats['header_type']} "
+            f"header_macro={chunk_stats['header_macro']} "
             f"skipped_root={chunk_stats['skipped_root']} "
             f"skipped_dep={chunk_stats['skipped_dep']} "
+            f"skipped_macro_dep={chunk_stats['skipped_macro_dep']} "
             f"skipped_crosslib={chunk_stats['skipped_crosslib']} "
             f"skipped_type={chunk_stats['skipped_type']} "
+            f"skipped_header_type={chunk_stats['skipped_header_type']} "
+            f"skipped_header_macro={chunk_stats['skipped_header_macro']} "
+            f"skipped_header_type_oversize={chunk_stats['skipped_header_type_oversize']} "
+            f"skipped_header_macro_oversize={chunk_stats['skipped_header_macro_oversize']} "
             "(function/class/type granularity, max_count=1)",
             file=sys.stderr,
         )
@@ -3141,6 +5032,10 @@ def process_project(
         emitted_docs += 1
 
     if cpp_files:
+        header_files = [
+            path for path in cpp_files
+            if os.path.splitext(path)[1].lower() in HEADER_EXTENSIONS
+        ]
         documents = build_training_documents(
             index_obj,
             max_tokens,
@@ -3156,6 +5051,8 @@ def process_project(
             dedup_stage_db=dedup_stage_db,
             dedup_near=dedup_near,
             global_symbols=global_symbols,
+            header_files=header_files,
+            macro_scan_files=cpp_files,
             emit_doc=_emit_counted if emit_doc is not None else None,
         )
     check_memory_limit(memory_limit_gb, label="index_project")

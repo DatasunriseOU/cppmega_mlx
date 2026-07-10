@@ -42,6 +42,33 @@ def test_route_by_fit_drops_docs_longer_than_largest_fixed_bucket(tmp_path):
     assert read_dropped_overlong(route_dir) == {"rows": 1, "tokens": 17}
 
 
+def test_route_by_fit_releases_arrow_pool_after_streaming(tmp_path, monkeypatch):
+    sys.path.insert(0, "scripts")
+    import streaming_reindex_commits
+
+    source = tmp_path / "tok.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"token_ids": [1] * 4, "name": "small"},
+                {"token_ids": [2] * 9, "name": "medium"},
+            ]
+        ),
+        source,
+    )
+    calls = []
+    monkeypatch.setattr(
+        streaming_reindex_commits,
+        "release_arrow_unused",
+        lambda: calls.append("released"),
+    )
+
+    routed = streaming_reindex_commits.route_by_fit(source, [8, 16], tmp_path / "routed")
+
+    assert sorted(routed) == [8, 16]
+    assert calls == ["released"]
+
+
 def test_read_dropped_overlong_zero_when_all_fit(tmp_path):
     sys.path.insert(0, "scripts")
     from streaming_reindex_commits import route_by_fit, read_dropped_overlong
@@ -65,6 +92,38 @@ def test_read_dropped_overlong_zero_when_all_fit(tmp_path):
     # (documented contract, not a swallowed error).
     assert not (route_dir / "dropped_overlong.json").exists()
     assert read_dropped_overlong(route_dir) == {"rows": 0, "tokens": 0}
+
+
+def test_recompress_zstd_max_streams_row_groups_without_full_read(
+    tmp_path,
+    monkeypatch,
+):
+    sys.path.insert(0, "scripts")
+    from streaming_reindex_commits import recompress_zstd_max
+
+    source = tmp_path / "packed.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"input_ids": [1, 2, 3], "valid_token_count": 3},
+                {"input_ids": [4, 5], "valid_token_count": 2},
+                {"input_ids": [6], "valid_token_count": 1},
+            ]
+        ),
+        source,
+        row_group_size=1,
+    )
+
+    def fail_full_file_read(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("recompress_zstd_max must not read whole parquet")
+
+    monkeypatch.setattr(pq, "read_table", fail_full_file_read)
+
+    recompress_zstd_max(source)
+
+    pf = pq.ParquetFile(source)
+    assert pf.num_row_groups == 3
+    assert pf.read().column("valid_token_count").to_pylist() == [3, 2, 1]
 
 
 def test_summarize_done_manifest_aggregates_dropped_overlong_durably(tmp_path):

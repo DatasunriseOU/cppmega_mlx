@@ -11,7 +11,9 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
     COMMIT_HASH_COLUMN,
+    DOC_TYPE_COLUMN,
     HAS_PR_DISCUSSION_COLUMN,
+    HEADER_FRAGMENT_KIND_COLUMN,
     PLATFORM_IDS_COLUMN,
     PR_DISCUSSION_CHARS_COLUMN,
     PR_DISCUSSION_LINES_COLUMN,
@@ -19,6 +21,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     REPO_COLUMN,
     REPO_STABLE_ID_COLUMN,
     FILEPATH_STABLE_ID_COLUMN,
+    FILEPATH_COLUMN,
     FILE_LOCAL_COMMIT_INDEX_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
@@ -35,17 +38,24 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
 )
+from scripts.nanochat_data import pack_enriched_rows as packer
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
     LOSS_MASK_COLUMN,
     NUM_DOCS_COLUMN,
+    PACKED_ROW_MACRO_ROUTES_METADATA_KEY,
+    PACKED_ROW_MACRO_ROUTES_VERSION,
     PACK_ID_COLUMN,
     SOURCE_DOC_INDICES_COLUMN,
     SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+    SOURCE_HEADER_FRAGMENT_KINDS_COLUMN,
+    SOURCE_FILEPATH_STABLE_IDS_COLUMN,
     SOURCE_PR_DISCUSSION_CHARS_COLUMN,
     SOURCE_PR_DISCUSSION_LINES_COLUMN,
     SOURCE_PR_NUMBERS_COLUMN,
+    SOURCE_REPO_STABLE_IDS_COLUMN,
+    SOURCE_DOC_TYPES_COLUMN,
     TARGET_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
     normalize_document_record,
@@ -185,6 +195,8 @@ def test_pack_documents_preserves_pr_discussion_source_metadata() -> None:
             HAS_PR_DISCUSSION_COLUMN: True,
             PR_DISCUSSION_CHARS_COLUMN: 17,
             PR_DISCUSSION_LINES_COLUMN: 2,
+            DOC_TYPE_COLUMN: "code_header",
+            HEADER_FRAGMENT_KIND_COLUMN: "macro",
         }
     )
     second = _doc([10, 11])
@@ -207,10 +219,100 @@ def test_pack_documents_preserves_pr_discussion_source_metadata() -> None:
     assert row[SOURCE_HAS_PR_DISCUSSIONS_COLUMN] == [True, False]
     assert row[SOURCE_PR_DISCUSSION_CHARS_COLUMN] == [17, 0]
     assert row[SOURCE_PR_DISCUSSION_LINES_COLUMN] == [2, 0]
+    assert row[SOURCE_DOC_TYPES_COLUMN] == ["code_header", None]
+    assert row[SOURCE_HEADER_FRAGMENT_KINDS_COLUMN] == ["macro", None]
     assert row[HAS_PR_DISCUSSION_COLUMN] is True
     assert row[PR_DISCUSSION_CHARS_COLUMN] == 17
     assert row[PR_DISCUSSION_LINES_COLUMN] == 2
     assert row[PR_NUMBER_COLUMN] is None
+
+
+def test_static_code_file_provenance_does_not_force_commit_window() -> None:
+    first = _doc([1, 2])
+    first.update(
+        {
+            REPO_COLUMN: "owner/repo",
+            FILEPATH_COLUMN: "include/a.hpp",
+            REPO_STABLE_ID_COLUMN: "repo-id",
+            FILEPATH_STABLE_ID_COLUMN: "file-a",
+        }
+    )
+    second = _doc([10, 11])
+    second.update(
+        {
+            REPO_COLUMN: "owner/repo",
+            FILEPATH_COLUMN: "include/b.hpp",
+            REPO_STABLE_ID_COLUMN: "repo-id",
+            FILEPATH_STABLE_ID_COLUMN: "file-b",
+        }
+    )
+    docs = _normalize([first, second])
+
+    rows, overflow = pack_documents(docs, target_length=5, pad_token_id=0)
+
+    assert overflow == []
+    assert len(rows) == 1
+    assert rows[0][NUM_DOCS_COLUMN] == 2
+    assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 10, 11, 0]
+
+
+def test_static_code_provenance_derives_source_stable_ids() -> None:
+    first = _doc([1, 2])
+    first.update(
+        {
+            REPO_COLUMN: "owner/repo",
+            FILEPATH_COLUMN: "include/a.hpp",
+        }
+    )
+    second = _doc([10, 11])
+    second.update(
+        {
+            REPO_COLUMN: "owner/repo",
+            FILEPATH_COLUMN: "include/b.hpp",
+        }
+    )
+    docs = _normalize([first, second])
+
+    rows, overflow = pack_documents(docs, target_length=5, pad_token_id=0)
+
+    assert overflow == []
+    row = rows[0]
+    assert row[REPO_COLUMN] == "owner/repo"
+    assert row[FILEPATH_COLUMN] is None
+    assert row[SOURCE_REPO_STABLE_IDS_COLUMN] == [
+        "b0a93768b870824e",
+        "b0a93768b870824e",
+    ]
+    assert row[SOURCE_FILEPATH_STABLE_IDS_COLUMN] == [
+        "0c753e816fb7ec6e",
+        "9b62957865f894aa",
+    ]
+
+
+def test_static_code_missing_repo_provenance_fails_loud() -> None:
+    record = _doc([1, 2])
+    record.update(
+        {
+            DOC_TYPE_COLUMN: "code",
+            FILEPATH_COLUMN: "src/f.cc",
+        }
+    )
+
+    with pytest.raises(ValueError, match="missing repo provenance"):
+        normalize_document_record(record, source_doc_index=0)
+
+
+def test_static_code_missing_filepath_provenance_fails_loud() -> None:
+    record = _doc([1, 2])
+    record.update(
+        {
+            DOC_TYPE_COLUMN: "code_header",
+            REPO_COLUMN: "owner/repo",
+        }
+    )
+
+    with pytest.raises(ValueError, match="missing filepath provenance"):
+        normalize_document_record(record, source_doc_index=0)
 
 
 def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
@@ -426,6 +528,63 @@ def test_pack_parquet_dataset_writes_rows_consumed_by_training_reader(tmp_path: 
         np.array(batch.loss_mask),
         np.array([[1, 1, 0, 1, 0, 0]], dtype=np.float32),
     )
+
+
+def test_pack_parquet_dataset_marks_macro_route_schema_version(tmp_path: Path) -> None:
+    input_path = tmp_path / "enriched.parquet"
+    output_path = tmp_path / "packed.parquet"
+    _write_input_parquet(input_path, [_doc([1, 2, 3, 4])])
+
+    pack_parquet_dataset(input_path, output_path, target_length=8)
+
+    metadata = pq.ParquetFile(output_path).schema_arrow.metadata or {}
+    assert metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] == (
+        PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
+    )
+
+
+def test_pack_parquet_dataset_streams_windows_without_full_input_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "enriched.parquet"
+    output_path = tmp_path / "packed.parquet"
+    _write_input_parquet(
+        input_path,
+        [
+            _doc([1, 2]),
+            _doc([10, 11]),
+            _doc([20, 21]),
+            _doc([30, 31]),
+        ],
+    )
+
+    def fail_if_full_loader_is_used(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("pack_parquet_dataset must stream input documents")
+
+    monkeypatch.setattr(
+        packer,
+        "read_tokenized_documents",
+        fail_if_full_loader_is_used,
+    )
+
+    summary = packer.pack_parquet_dataset(
+        input_path,
+        output_path,
+        target_length=6,
+        pad_token_id=0,
+        strategy="best_fit",
+        pack_token_window=4,
+        row_group_size=1,
+    )
+
+    assert summary == {"input_docs": 4, "packed_rows": 2, "overflow_docs": 0}
+    table = pq.read_table(output_path)
+    assert table.column(PACK_ID_COLUMN).to_pylist() == [0, 1]
+    assert table.column(INPUT_IDS_COLUMN).to_pylist() == [
+        [1, 2, 10, 11, 0, 0],
+        [20, 21, 30, 31, 0, 0],
+    ]
 
 
 def test_pack_parquet_dataset_threads_doc_local_platform_ids(tmp_path: Path) -> None:

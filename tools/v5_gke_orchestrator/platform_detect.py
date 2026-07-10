@@ -410,7 +410,12 @@ _STD_HEADERS = {
 _STD_ORDER = {"c++98": 0, "c++11": 1, "c++14": 2, "c++17": 3, "c++20": 4, "c++23": 5, "c++26": 6}
 
 
-def detect_platforms(source: str) -> PlatformInfo | None:
+def detect_platforms(
+    source: str,
+    *,
+    macro_regexes: dict[str, object] | None = None,
+    macro_set: dict[str, list[tuple[str, str]]] | None = None,
+) -> PlatformInfo | None:
     """Detect platforms from C++ source code.
 
     Returns dict matching PlatformInfo:
@@ -431,10 +436,16 @@ def detect_platforms(source: str) -> PlatformInfo | None:
         "arch": arch_set, "compiler": compiler_set, "cpp_std": cpp_std_set,
     }
 
-    # Pass 1: Macro pattern matching with word boundaries
-    for pat, regex in _MACRO_REGEXES.items():
+    # Pass 1: Macro pattern matching with word boundaries. The injectable maps
+    # are an explicit test/embedding seam; production callers use the module-level
+    # compiled tables.
+    regex_table = _MACRO_REGEXES if macro_regexes is None else macro_regexes
+    macro_table = _MACRO_SET if macro_set is None else macro_set
+    for pat, regex in regex_table.items():
+        if pat not in source:
+            continue
         if regex.search(source):
-            for cat, label in _MACRO_SET[pat]:
+            for cat, label in macro_table[pat]:
                 cat_map[cat].add(label)
 
     # Pass 2: #include header matching

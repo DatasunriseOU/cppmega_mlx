@@ -16,6 +16,13 @@ def test_domain_delimiter_contract_is_complete() -> None:
 
     assert DomainKind.CMAKE in DOMAIN_DELIMITER_ROLES
     assert DomainKind.BAZEL in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.AUTOCONF in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.AUTOMAKE in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.MESON in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.GN in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.SCONS in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.XMAKE in DOMAIN_DELIMITER_ROLES
+    assert DomainKind.COMPILE_COMMANDS in DOMAIN_DELIMITER_ROLES
     assert DomainKind.BASH in DOMAIN_DELIMITER_ROLES
     assert DomainKind.COMPILER_ERROR in DOMAIN_DELIMITER_ROLES
     assert DomainKind.LINKER_ERROR in DOMAIN_DELIMITER_ROLES
@@ -29,6 +36,14 @@ def test_delimiter_token_ids_use_reserved_contract() -> None:
     assert delimiter_token_ids(DomainKind.SH) == (
         DOMAIN_DELIMITER_TOKEN_IDS["SH_START"],
         DOMAIN_DELIMITER_TOKEN_IDS["SH_END"],
+    )
+    assert delimiter_token_ids(DomainKind.MESON) == (
+        DOMAIN_DELIMITER_TOKEN_IDS["MESON_START"],
+        DOMAIN_DELIMITER_TOKEN_IDS["MESON_END"],
+    )
+    assert delimiter_token_ids(DomainKind.COMPILE_COMMANDS) == (
+        DOMAIN_DELIMITER_TOKEN_IDS["COMPILE_COMMANDS_START"],
+        DOMAIN_DELIMITER_TOKEN_IDS["COMPILE_COMMANDS_END"],
     )
 
 

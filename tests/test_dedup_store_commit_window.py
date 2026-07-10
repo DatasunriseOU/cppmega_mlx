@@ -310,6 +310,38 @@ def test_local_stage_db_writes_do_not_block_on_global_writer_lock(tmp_path):
         stage_reader.close()
 
 
+def test_local_stage_db_uses_fast_temp_pragmas_without_weakening_global_db(tmp_path):
+    """Local stage DBs are discardable rwork ledgers; global DB stays durable."""
+    from dedup_store import DedupStore
+
+    global_db = tmp_path / "dedup.sqlite"
+    stage_db = tmp_path / "rwork" / "code-repo.stage.sqlite"
+    stage_db.parent.mkdir()
+
+    DedupStore(str(global_db), near=False, commit_every=1).close()
+
+    staged = DedupStore(
+        str(global_db),
+        near=False,
+        commit_every=1,
+        stage_id="code:repo",
+        stage_db_path=str(stage_db),
+    )
+    try:
+        global_sync = staged.conn.execute("PRAGMA synchronous").fetchone()[0]
+        local_sync = staged.stage_conn.execute("PRAGMA synchronous").fetchone()[0]
+        local_journal = staged.stage_conn.execute("PRAGMA journal_mode").fetchone()[0]
+        global_autockpt = staged.conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+    finally:
+        staged.close()
+
+    assert global_sync == 2  # read-only connection reports default FULL
+    assert global_autockpt == 1000  # read-only connection default, not tuned here
+    assert local_sync == 0
+    assert local_journal == "memory"
+    assert not Path(f"{stage_db}-wal").exists()
+
+
 def test_local_stage_promote_uses_set_based_bulk_sql_not_python_row_loop():
     """Local stage promotion is a hot parent path; keep it set-based in SQLite."""
     from dedup_store import DedupStore

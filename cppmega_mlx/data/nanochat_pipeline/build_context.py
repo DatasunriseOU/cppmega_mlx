@@ -878,7 +878,7 @@ def detect_build_context(repo_dir: str) -> tuple[dict, list[str], CompileCommand
             path = compile_commands_path
         else:
             path = os.path.join(repo_dir, name)
-        if not os.path.exists(path):
+        if not os.path.isfile(path):
             return None
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()

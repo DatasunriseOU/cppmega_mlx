@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -93,6 +94,62 @@ class RepoFailure(RuntimeError):
         self.detail = detail
 
 
+class RepoNoTrainingDocs(RuntimeError):
+    """index_project completed successfully but produced no new trainable docs."""
+
+    def __init__(self, repo: str, *, reason: str, detail: str):
+        super().__init__(f"[{repo}] no training docs: {reason}: {detail}")
+        self.repo = repo
+        self.reason = reason
+        self.detail = detail
+
+
+_FOUND_CPP_RE = re.compile(r"\bFound\s+(\d+)\s+C/C\+\+ source files\b")
+_FOUND_BUILD_RE = re.compile(r"\bFound\s+(\d+)\s+build/compilation files\b")
+_TOTAL_ZERO_RE = re.compile(r"\bGenerated\s+0\s+total training documents\b")
+_FUNCTION_DEDUP_RE = re.compile(
+    r"\bFunction-level dedup:\s+kept_roots=(\d+)\s+"
+    r"dropped_exact=(\d+)\s+dropped_near=(\d+)\b"
+)
+_BUILD_DOCS_RE = re.compile(
+    r"\bBuild docs:\s+emitted=(\d+)\s+dropped_dup=(\d+)\s+skipped_empty=(\d+)\b"
+)
+
+
+def _int_match(pattern: re.Pattern[str], text: str, default: int = 0) -> int:
+    match = pattern.search(text)
+    return int(match.group(1)) if match else default
+
+
+def _classify_empty_index_project_log(text: str) -> str | None:
+    """Classify a successful zero-doc index_project run.
+
+    Empty output after a successful indexer run is not always a pipeline error:
+    aliases can be fully exhausted by global dedup, and some source-cache entries
+    simply contain no C/C++/build training signal.  Non-zero exit/stall paths
+    still fail through run_checked before this classifier is consulted.
+    """
+
+    if not _TOTAL_ZERO_RE.search(text):
+        return None
+
+    cpp_files = _int_match(_FOUND_CPP_RE, text)
+    build_files = _int_match(_FOUND_BUILD_RE, text)
+    dedup = _FUNCTION_DEDUP_RE.search(text)
+    build_docs = _BUILD_DOCS_RE.search(text)
+    dropped_functions = 0
+    if dedup is not None:
+        _kept, dropped_exact, dropped_near = (int(dedup.group(i)) for i in (1, 2, 3))
+        dropped_functions = dropped_exact + dropped_near
+    dropped_build_docs = int(build_docs.group(2)) if build_docs is not None else 0
+
+    if dropped_functions > 0 or dropped_build_docs > 0:
+        return "dedup_exhausted"
+    if cpp_files == 0 and build_files == 0:
+        return "no_trainable_source"
+    return "no_training_documents"
+
+
 def code_stage_id(repo: str) -> str:
     return f"code:{repo}"
 
@@ -114,8 +171,12 @@ def commit_stage_db(work: Path, key: str) -> Path:
 
 
 def is_code_worktree_repo(repo: str) -> bool:
-    """Return False for archive members that are git object stores, not sources."""
-    return not repo.endswith(".bare")
+    """Return False for archive members that are not C/C++ source worktrees."""
+    if repo.endswith(".bare"):
+        return False
+    if repo.startswith("windows_"):
+        return False
+    return True
 
 
 def _dedup_store_cls():
@@ -776,11 +837,12 @@ def stage_index_source(
         cmd += ["--no-near-dedup"]
     if global_symbol_index is not None:
         cmd += ["--global-symbol-index", str(global_symbol_index)]
+    log_path = work / f"{repo}.index.log"
     run_checked(
         repo,
         "index_project",
         cmd,
-        log_path=work / f"{repo}.index.log",
+        log_path=log_path,
         timeout=index_timeout_s if index_timeout_s and index_timeout_s > 0 else None,
         stall_timeout=(
             index_stall_timeout_s
@@ -789,6 +851,18 @@ def stage_index_source(
         ),
     )
     if not enriched.exists() or enriched.stat().st_size == 0:
+        log_text = (
+            log_path.read_text(encoding="utf-8", errors="replace")
+            if log_path.exists()
+            else ""
+        )
+        reason = _classify_empty_index_project_log(log_text)
+        if reason is not None:
+            raise RepoNoTrainingDocs(
+                repo,
+                reason=reason,
+                detail=f"empty enriched jsonl after successful index_project: {enriched}",
+            )
         raise RepoFailure(repo, "index_project", f"empty enriched jsonl: {enriched}")
     return enriched
 
@@ -868,6 +942,7 @@ def stage_materialize(
             "--overflow-policy", "drop",
             "--size", _budget_size_label(TOKENIZE_BUDGET),
             "--memory-limit-gb", str(memory_limit_gb),
+            "--default-repo", repo,
         ],
         log_path=work / f"{repo}.materialize.log",
     )
@@ -980,11 +1055,19 @@ def process_one_repo(
     try:
         timings: dict[str, float] = {}
         started = time.monotonic()
-        enriched = stage_index_source(
-            repo, repo_dir, work, dedup_db, dedup_near,
-            stage_id, stage_db, global_symbol_index, memory_limit_gb,
-            parse_workers, index_timeout_s, index_stall_timeout_s,
-        )
+        try:
+            enriched = stage_index_source(
+                repo, repo_dir, work, dedup_db, dedup_near,
+                stage_id, stage_db, global_symbol_index, memory_limit_gb,
+                parse_workers, index_timeout_s, index_stall_timeout_s,
+            )
+        except RepoNoTrainingDocs as exc:
+            timings["index_project_s"] = round(time.monotonic() - started, 6)
+            raise RepoFailure(
+                repo,
+                "index_project",
+                f"no training docs ({exc.reason}): {exc.detail}",
+            ) from exc
         timings["index_project_s"] = round(time.monotonic() - started, 6)
         started = time.monotonic()
         tok = stage_materialize(repo, enriched, work, memory_limit_gb)

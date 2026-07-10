@@ -81,6 +81,14 @@ class DomainEdgeKind(IntEnum):
     TYPE = 3
     DEF_USE = 4
     INCLUDE = 5
+    MACRO_PARAM_USE = 6
+    MACRO_INVOCATION = 7
+    MACRO_CONDITION = 8
+    MACRO_REDEFINITION = 9
+    MACRO_INCLUDE_ORDER = 10
+    MACRO_EXPANSION_CONDITION = 11
+    MACRO_EXPANSION_REDEFINITION = 12
+    MACRO_EXPANSION_INCLUDE_ORDER = 13
     BUILD_TARGET_DEP = 20
     BUILD_TARGET_SOURCE = 21
     BUILD_RULE_COMMAND = 22
@@ -118,10 +126,16 @@ DOMAIN_DELIMITER_ROLES: dict[DomainKind, tuple[str, str]] = {
     DomainKind.MAKE: ("MAKE_START", "MAKE_END"),
     DomainKind.NINJA: ("NINJA_START", "NINJA_END"),
     DomainKind.BAZEL: ("BAZEL_START", "BAZEL_END"),
-    # Autotools/Automake are Make-family text, but remain distinct in
-    # token_domain_ids so the model does not collapse them semantically.
-    DomainKind.AUTOCONF: ("MAKE_START", "MAKE_END"),
-    DomainKind.AUTOMAKE: ("MAKE_START", "MAKE_END"),
+    DomainKind.AUTOCONF: ("AUTOCONF_START", "AUTOCONF_END"),
+    DomainKind.AUTOMAKE: ("AUTOMAKE_START", "AUTOMAKE_END"),
+    DomainKind.MESON: ("MESON_START", "MESON_END"),
+    DomainKind.GN: ("GN_START", "GN_END"),
+    DomainKind.SCONS: ("SCONS_START", "SCONS_END"),
+    DomainKind.XMAKE: ("XMAKE_START", "XMAKE_END"),
+    DomainKind.COMPILE_COMMANDS: (
+        "COMPILE_COMMANDS_START",
+        "COMPILE_COMMANDS_END",
+    ),
     DomainKind.BASH: ("BASH_START", "BASH_END"),
     DomainKind.ZSH: ("ZSH_START", "ZSH_END"),
     DomainKind.SH: ("SH_START", "SH_END"),

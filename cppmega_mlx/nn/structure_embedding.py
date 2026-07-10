@@ -22,7 +22,7 @@ class StructureEmbedding(nn.Module):
         self,
         *,
         hidden_size: int,
-        num_categories: int = 9,
+        num_categories: int = 12,
         max_dep_level: int = 16,
         max_ast_depth: int = 64,
         max_sibling_index: int = 64,

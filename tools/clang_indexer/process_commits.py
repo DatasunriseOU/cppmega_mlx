@@ -53,10 +53,19 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.clang_indexer.index_project import (
     _configure_libclang,
     _adapt_args_for_file,
+    _collect_macro_include_dirs,
+    _macro_invocation_route_parts,
+    _macro_part_metadata,
+    _macro_route_part,
+    _part_macro_provenance,
     _sanitize_compile_args_for_clang,
+    _used_macro_defs,
     FunctionDef,
+    MACRO_KIND,
+    MacroDef,
     PartInfo,
     ProjectIndex,
+    _cpp_domain_sidecars,
     extract_callees,
     extract_referenced_types,
     get_qualified_name,
@@ -66,6 +75,7 @@ from tools.clang_indexer.index_project import (
     _cursor_text_and_metadata,
     extract_clang_ast_metadata,
     extract_semantic_metadata_from_parts,
+    register_header_macros,
 )
 from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
@@ -704,6 +714,8 @@ class BuildContextResolver:
         self.repo_root = os.path.abspath(repo_root) if repo_root else None
         self.repo_dir = os.path.abspath(repo_dir) if repo_dir else None
         self._cache: dict[str, tuple[dict, list[str], object | None]] = {}
+        self._macro_cache: OrderedDict[tuple[str, str, tuple[str, ...]], ProjectIndex] = OrderedDict()
+        self._macro_cache_max_entries = int(os.environ.get("CPPMEGA_COMMIT_MACRO_CACHE_ENTRIES", "16"))
 
     def _record_repo_root(self, record: dict) -> str | None:
         explicit = record.get("repo_path")
@@ -756,6 +768,54 @@ class BuildContextResolver:
         if args is None:
             args = list(default_args)
         return repo_root, args, info
+
+    def macro_index_for(
+        self,
+        *,
+        repo_root: str | None,
+        filepath: str,
+        compile_args: list[str] | None,
+    ) -> ProjectIndex | None:
+        """Return an include-aware macro index for this commit file.
+
+        Commit records carry old/new buffers, but include resolution still comes
+        from the checked-out repository and compile context.  Cache by
+        repo_root/file/args so a range worker does not rescan the same include
+        tree for every commit touching the same file.
+        """
+
+        if not repo_root or not filepath:
+            return None
+        root = os.path.abspath(repo_root)
+        if not os.path.isdir(root):
+            return None
+        root_file = filepath if os.path.isabs(filepath) else os.path.join(root, filepath)
+        root_file = os.path.normpath(root_file)
+        if not os.path.exists(root_file):
+            return None
+        key = (root, os.path.relpath(root_file, root), tuple(compile_args or ()))
+        cached = self._macro_cache.get(key)
+        if cached is not None:
+            self._macro_cache.move_to_end(key)
+            return cached
+
+        include_dirs = _collect_macro_include_dirs(
+            project_dir=root,
+            compile_db=None,
+            default_args=compile_args or [],
+        )
+        index = ProjectIndex()
+        register_header_macros(
+            index,
+            [root_file],
+            project_dir=root,
+            include_dirs=include_dirs,
+        )
+        self._macro_cache[key] = index
+        self._macro_cache.move_to_end(key)
+        while len(self._macro_cache) > max(0, self._macro_cache_max_entries):
+            self._macro_cache.popitem(last=False)
+        return index
 
 
 def analyze_file_clang(
@@ -1203,6 +1263,63 @@ def extract_function_chain(
     return result
 
 
+def _macro_dependency_parts_for_commit_targets(
+    macro_index: ProjectIndex | None,
+    targets: list[tuple[str, str | None, int | None]],
+    *,
+    claim_part: Callable[[str], bool] | None = None,
+    chunk_claim_stats: dict[str, int] | None = None,
+) -> list[PartInfo]:
+    """Build commit macro dependency parts from source-visible macro defs.
+
+    Static code docs already prepend macro dependencies before a root chunk.
+    Commit docs need the same shape, otherwise PRE/POST function chains contain
+    macro invocations whose definitions are only implicit in headers.  Targets
+    are ``(text, source_file, max_line)`` tuples so redefinition windows route
+    through the macro definition visible at the original source location.
+    """
+
+    if macro_index is None or not macro_index.macros_by_name or not targets:
+        return []
+    selected: dict[tuple[str, str, int, int], MacroDef] = {}
+    for text, target_file, max_line in targets:
+        if not text:
+            continue
+        for macro in _used_macro_defs(
+            macro_index,
+            [text],
+            target_file=target_file,
+            max_line=max_line,
+        ):
+            key = (macro.visible_in_file, macro.file, macro.line, macro.sequence)
+            selected[key] = macro
+
+    parts: list[PartInfo] = []
+    for macro in sorted(selected.values(), key=lambda item: item.sequence):
+        if claim_part is not None and not claim_part(macro.text):
+            if chunk_claim_stats is not None:
+                chunk_claim_stats["commit_macro_chunks_skipped"] = (
+                    chunk_claim_stats.get("commit_macro_chunks_skipped", 0) + 1
+                )
+            continue
+        if chunk_claim_stats is not None:
+            chunk_claim_stats["commit_macro_chunks_claimed"] = (
+                chunk_claim_stats.get("commit_macro_chunks_claimed", 0) + 1
+            )
+        parts.append(
+            (
+                macro.text,
+                MACRO_KIND,
+                0,
+                macro.name,
+                None,
+                None,
+                _macro_part_metadata(macro),
+            )
+        )
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # Document formatting
 # ---------------------------------------------------------------------------
@@ -1346,6 +1463,7 @@ def format_chain_document(
     hunks: list[HunkRange],
     max_dep_depth: int = 5,
     *,
+    macro_index: ProjectIndex | None = None,
     dedup_store=None,
     dedup_tokenizer=None,
     chunk_claim_stats: dict[str, int] | None = None,
@@ -1370,6 +1488,7 @@ def format_chain_document(
     parts_info: list[PartInfo] = []
     section_kinds: list[str] = []
     semantic_parts = 0
+    macro_targets: list[tuple[str, str | None, int | None]] = []
 
     def _claim_part(text: str) -> bool:
         ok = _claim_semantic_chunk(
@@ -1402,12 +1521,14 @@ def format_chain_document(
                 continue
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
             section_kinds.append('o')
+            macro_targets.append((cls.text, record.get('filepath'), cls.end_line))
             semantic_parts += 1
         for func in old_chain:
             if not _claim_part(func.text):
                 continue
             parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
             section_kinds.append('o')
+            macro_targets.append((func.text, func.file, func.end_line))
             semantic_parts += 1
 
     # POST-COMMIT section
@@ -1425,16 +1546,28 @@ def format_chain_document(
                 continue
             parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
             section_kinds.append('n')
+            macro_targets.append((cls.text, record.get('filepath'), cls.end_line))
             semantic_parts += 1
         for func in new_chain:
             if not _claim_part(func.text):
                 continue
             parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
             section_kinds.append('n')
+            macro_targets.append((func.text, func.file, func.end_line))
             semantic_parts += 1
 
     if len(parts_info) <= 1 or semantic_parts == 0:
         return None
+
+    macro_parts = _macro_dependency_parts_for_commit_targets(
+        macro_index,
+        macro_targets,
+        claim_part=_claim_part,
+        chunk_claim_stats=chunk_claim_stats,
+    )
+    if macro_parts:
+        parts_info[1:1] = macro_parts
+        section_kinds[1:1] = ['c'] * len(macro_parts)
 
     # Compute changed_symbol_ids and ripple_candidates from the NEW analysis
     # (post-commit state is what the model learns to predict).  Fall back to
@@ -1456,6 +1589,7 @@ def format_diff_document(
     hunks: list[HunkRange],
     max_dep_depth: int = 5,
     *,
+    macro_index: ProjectIndex | None = None,
     dedup_store=None,
     dedup_tokenizer=None,
     chunk_claim_stats: dict[str, int] | None = None,
@@ -1472,6 +1606,7 @@ def format_diff_document(
 
     parts_info: list[PartInfo] = []
     section_kinds: list[str] = []
+    macro_targets: list[tuple[str, str | None, int | None]] = []
 
     def _claim_part(text: str) -> bool:
         ok = _claim_semantic_chunk(
@@ -1503,11 +1638,13 @@ def format_diff_document(
             continue
         parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
         section_kinds.append('o')
+        macro_targets.append((cls.text, record.get('filepath'), cls.end_line))
     for func in old_chain:
         if not _claim_part(func.text):
             continue
         parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
         section_kinds.append('o')
+        macro_targets.append((func.text, func.file, func.end_line))
 
     # Raw diff
     diff_text = record.get('diff', '')
@@ -1519,6 +1656,16 @@ def format_diff_document(
 
     if len(parts_info) <= 2:
         return None
+
+    macro_parts = _macro_dependency_parts_for_commit_targets(
+        macro_index,
+        macro_targets,
+        claim_part=_claim_part,
+        chunk_claim_stats=chunk_claim_stats,
+    )
+    if macro_parts:
+        parts_info[1:1] = macro_parts
+        section_kinds[1:1] = ['c'] * len(macro_parts)
 
     # Compute changed_symbol_ids and ripple_candidates from old analysis
     csids = compute_changed_symbol_ids(old_analysis, old_lines)
@@ -1620,10 +1767,43 @@ def _build_enriched_from_parts(
     if new_analysis:
         for func in new_analysis.functions:
             all_funcs[func.qualified_name] = func
+    semantic_index = ProjectIndex()
+    for func in all_funcs.values():
+        semantic_index.add_function(func)
+    for part in parts_info:
+        metadata = _part_macro_provenance(part)
+        if metadata is None:
+            continue
+        name = metadata.get("name")
+        sequence = metadata.get("sequence")
+        if not isinstance(name, str) or not isinstance(sequence, int):
+            continue
+        file = str(metadata.get("file") or "")
+        line = int(metadata.get("line") or 1)
+        semantic_index.add_macro(
+            MacroDef(
+                name=name,
+                file=file,
+                line=line,
+                text=part[0],
+                visible_in_file=str(metadata.get("visible_in_file") or file),
+                visible_line=int(metadata.get("visible_line") or line),
+                sequence=sequence,
+                condition_names=[
+                    str(value)
+                    for value in metadata.get("condition_names", [])
+                    if isinstance(value, str)
+                ],
+            )
+        )
     old_ast = _analysis_ast_maps(old_analysis)
     new_ast = _analysis_ast_maps(new_analysis)
+    macro_route_parts: list[dict[str, object]] = []
+    macro_invocation_routes: list[dict[str, object]] = []
 
-    for i, (part_text, kind, dep_level, name, qname) in enumerate(parts_info):
+    for i, part in enumerate(parts_info):
+        part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
+        macro_metadata = _part_macro_provenance(part)
         part_len = len(part_text)
         if offset + part_len > text_len:
             break
@@ -1665,9 +1845,26 @@ def _build_enriched_from_parts(
         if qname:
             chunk_all_qnames[i] = qname
         if qname and qname in all_funcs:
+            func = all_funcs[qname]
             chunk_qnames[i] = qname
-            chunk_callees[i] = all_funcs[qname].callees
-            chunk_types[i] = getattr(all_funcs[qname], 'referenced_types', [])
+            chunk_callees[i] = func.callees
+            chunk_types[i] = getattr(func, 'referenced_types', [])
+            macro_invocation_routes.extend(
+                _macro_invocation_route_parts(
+                    part_text,
+                    offset=offset,
+                    index=semantic_index,
+                    target_file=func.file,
+                    start_line=func.line,
+                )
+            )
+        macro_route_part = _macro_route_part(
+            part_text,
+            offset=offset,
+            metadata=macro_metadata,
+        )
+        if macro_route_part is not None:
+            macro_route_parts.append(macro_route_part)
 
         offset += part_len
         if i < len(parts_info) - 1:
@@ -1690,9 +1887,6 @@ def _build_enriched_from_parts(
                 if ci != cj and q == t:
                     type_edges.append({'from': ci, 'to': cj})
 
-    semantic_index = ProjectIndex()
-    for func in all_funcs.values():
-        semantic_index.add_function(func)
     semantic_meta = extract_semantic_metadata_from_parts(
         full_text,
         parts_info,
@@ -1715,6 +1909,17 @@ def _build_enriched_from_parts(
         'changed_symbol_ids': changed_symbol_ids or [],
         'ripple_candidates': ripple_candidates or [],
     }
+    # Commit docs are also C++ world-code documents.  When macro dependency
+    # parts are present, route use-sites by original source line instead of
+    # assembled lexical order, matching the static code path.
+    result.update(
+        _cpp_domain_sidecars(
+            full_text,
+            semantic_index,
+            macro_parts=macro_route_parts,
+            macro_invocations=macro_invocation_routes,
+        )
+    )
     temporal_meta = _build_commit_temporal_metadata(
         full_text,
         texts,
@@ -1965,6 +2170,16 @@ def process_record(
             build_info=build_info,
         )
 
+    macro_index = (
+        build_context.macro_index_for(
+            repo_root=repo_root,
+            filepath=filepath,
+            compile_args=compile_args,
+        )
+        if build_context is not None
+        else None
+    )
+
     documents: list[dict[str, object]] = []
 
     if doc_format in ('chain', 'both'):
@@ -1974,6 +2189,7 @@ def process_record(
             new_analysis,
             hunks,
             max_dep_depth,
+            macro_index=macro_index,
             dedup_store=dedup_store,
             dedup_tokenizer=dedup_tokenizer,
             chunk_claim_stats=chunk_claim_stats,
@@ -1990,6 +2206,7 @@ def process_record(
             old_analysis,
             hunks,
             max_dep_depth,
+            macro_index=macro_index,
             dedup_store=dedup_store,
             dedup_tokenizer=dedup_tokenizer,
             chunk_claim_stats=chunk_claim_stats,

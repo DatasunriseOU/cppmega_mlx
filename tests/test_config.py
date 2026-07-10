@@ -101,7 +101,7 @@ def test_structure_defaults_match_cppmega_source_contract():
     assert config.structure == StructureConfig(
         active_components="core",
         bottleneck_dim=64,
-        num_categories=9,
+        num_categories=12,
         max_dep_level=16,
         max_ast_depth=64,
         max_sibling_index=64,

@@ -212,13 +212,14 @@ class DedupStore:
         self.conn.execute(f"PRAGMA busy_timeout={self.SQLITE_BUSY_TIMEOUT_MS}")
         if self._local_stage:
             self.conn.execute("PRAGMA query_only=ON")
-            self.stage_conn.execute("PRAGMA journal_mode=WAL")
-            self.stage_conn.execute("PRAGMA synchronous=NORMAL")
+            # Local stage DBs are discardable rwork ledgers. The parent promotes
+            # them only after parquet append succeeds; on subprocess failure the
+            # whole stage file is thrown away. Avoid fsync/WAL checkpoint work
+            # here while keeping the global committed DB on the durable path below.
+            self.stage_conn.execute("PRAGMA journal_mode=MEMORY")
+            self.stage_conn.execute("PRAGMA synchronous=OFF")
             self.stage_conn.execute(
                 f"PRAGMA busy_timeout={self.SQLITE_BUSY_TIMEOUT_MS}"
-            )
-            self.stage_conn.execute(
-                f"PRAGMA wal_autocheckpoint={self.WAL_AUTOCHECKPOINT_PAGES}"
             )
             self.stage_conn.execute(
                 f"PRAGMA journal_size_limit={self.JOURNAL_SIZE_LIMIT_BYTES}"

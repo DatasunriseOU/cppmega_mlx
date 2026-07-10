@@ -44,11 +44,12 @@ from scripts.nanochat_data.pack_enriched_rows import (
 from scripts.nanochat_data.token_budget import chunk_enriched_document, load_tokenizer
 from scripts.nanochat_data.token_budget import tokenizer_fingerprint
 from tools.clang_indexer import index_project
-from tools.clang_indexer.index_project import FunctionDef, PartInfo
+from tools.clang_indexer.index_project import FunctionDef, MacroDef, PartInfo, ProjectIndex
 from tools.clang_indexer.process_commits import (
     AnalysisCache,
     BuildContextResolver,
     FileAnalysis,
+    _macro_dependency_parts_for_commit_targets,
     _build_enriched_from_parts,
     analyze_file_clang,
     process_record,
@@ -58,6 +59,9 @@ from tools.clang_indexer.process_commits import (
 class _CharTokenizer:
     def encode(self, text: str) -> list[int]:
         return [ord(ch) for ch in text]
+
+    def get_vocab(self) -> dict[str, int]:
+        return {}
 
 
 def _write_token_parquet(
@@ -104,7 +108,25 @@ def test_local_platform_vocab_matches_nanochat_source_of_truth() -> None:
 def test_local_tokenized_schema_keeps_full_nanochat_column_contract() -> None:
     nanochat_schema = _load_nanochat_module("nanochat/tokenized_enriched_schema.py")
 
-    assert schema.TOKENIZED_ENRICHED_COLUMNS == nanochat_schema.TOKENIZED_ENRICHED_COLUMNS
+    local_columns = schema.TOKENIZED_ENRICHED_COLUMNS
+    local_positions = {column: index for index, column in enumerate(local_columns)}
+    upstream_columns = nanochat_schema.TOKENIZED_ENRICHED_COLUMNS
+
+    assert set(upstream_columns) <= set(local_columns)
+    assert [
+        column for column in local_columns
+        if column in upstream_columns
+    ] == list(upstream_columns)
+    assert {
+        schema.TOKEN_DOMAIN_IDS_COLUMN,
+        schema.TOKEN_BUILD_EDGES_COLUMN,
+        schema.TOKEN_SHELL_EDGES_COLUMN,
+        schema.TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+        schema.TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
+    } <= set(local_columns)
+    assert local_positions[schema.TOKEN_TYPE_EDGES_COLUMN] < local_positions[
+        schema.TOKEN_DOMAIN_IDS_COLUMN
+    ]
 
 
 def test_clang_enriched_parquet_schema_preserves_token_semantic_columns() -> None:
@@ -130,6 +152,8 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
         {
             "text": "int main() { return f(); }",
             "source_doc_id": "demo.cc@main",
+            schema.DOC_TYPE_COLUMN: "code_header",
+            schema.HEADER_FRAGMENT_KIND_COLUMN: "function_template",
             "actual_token_count": 4,
             "structure_ids": [3, 3, 3, 3],
             "chunk_boundaries": [{"start": 0, "end": 24, "kind": 3, "dep_level": 0}],
@@ -160,6 +184,10 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
     )
 
     assert table.column("source_doc_id").to_pylist() == ["demo.cc@main"]
+    assert table.column(schema.DOC_TYPE_COLUMN).to_pylist() == ["code_header"]
+    assert table.column(schema.HEADER_FRAGMENT_KIND_COLUMN).to_pylist() == [
+        "function_template"
+    ]
     for column in (
         "ast_depth",
         "sibling_index",
@@ -177,6 +205,92 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
             tokenized_rows[0][column] if column in tokenized_rows[0] else rows[0][column]
         )
         assert table.column(column).to_pylist() == [expected]
+
+
+def test_local_convert_backfills_static_code_repo_provenance(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "out.parquet"
+    input_path.write_text(
+        json.dumps(
+            {
+                "text": "int add(int a, int b) { return a + b; }",
+                "filepath": "include/math.hpp",
+                "structure_ids": [3] * 40,
+                "chunk_boundaries": [
+                    {"start": 0, "end": 40, "kind": 3, "dep_level": 0}
+                ],
+                "call_edges": [],
+                "type_edges": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    clang_enriched_to_parquet.convert_local_jsonl_to_parquet(
+        input_path,
+        output_path,
+        tokenizer=_CharTokenizer(),
+        max_tokens=4096,
+        overflow_policy="drop",
+        default_repo="demo-lib",
+    )
+
+    table = pq.read_table(
+        output_path,
+        columns=[
+            schema.REPO_COLUMN,
+            schema.FILEPATH_COLUMN,
+            schema.REPO_STABLE_ID_COLUMN,
+            schema.FILEPATH_STABLE_ID_COLUMN,
+        ],
+    )
+    assert table.column(schema.REPO_COLUMN).to_pylist() == ["demo-lib"]
+    assert table.column(schema.FILEPATH_COLUMN).to_pylist() == ["include/math.hpp"]
+    assert table.column(schema.REPO_STABLE_ID_COLUMN).to_pylist() == [
+        clang_enriched_to_parquet.stable_repo_id("demo-lib")
+    ]
+    assert table.column(schema.FILEPATH_STABLE_ID_COLUMN).to_pylist() == [
+        clang_enriched_to_parquet.stable_filepath_id(
+            "demo-lib",
+            "include/math.hpp",
+        )
+    ]
+
+
+def test_local_convert_fails_on_static_code_without_repo_context(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "out.parquet"
+    input_path.write_text(
+        json.dumps(
+            {
+                "text": "int f() { return 1; }",
+                "doc_type": "code",
+                "filepath": "src/f.cc",
+                "structure_ids": [3] * 21,
+                "chunk_boundaries": [
+                    {"start": 0, "end": 21, "kind": 3, "dep_level": 0}
+                ],
+                "call_edges": [],
+                "type_edges": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing static code repo provenance"):
+        clang_enriched_to_parquet.convert_local_jsonl_to_parquet(
+            input_path,
+            output_path,
+            tokenizer=_CharTokenizer(),
+            max_tokens=4096,
+            overflow_policy="drop",
+        )
 
 
 def test_converter_header_alignment_preserves_char_metadata_coordinates() -> None:
@@ -218,6 +332,85 @@ def test_converter_header_alignment_preserves_char_metadata_coordinates() -> Non
         "def_use",
     ):
         assert doc[key] == [0] * header_len + record[key]
+
+
+def test_dead_platform_filter_remaps_live_sidecars_and_drops_removed_edges() -> None:
+    live_a = "int live_a() { return 1; }\n"
+    dead = "#ifdef __SYMBIAN32__\nint dead() { return 0; }\n#endif\n"
+    live_b = "int live_b() { return live_a(); }\n"
+    text = live_a + dead + live_b
+    live_b_start = text.index("int live_b")
+    live_b_name = text.index("live_b")
+    live_a_call = text.rindex("live_a")
+    dead_name = text.index("dead")
+
+    record = {
+        "text": text,
+        "structure_ids": [3] * len(text),
+        "chunk_boundaries": [
+            {"start": 0, "end": len(live_a), "kind": 3, "dep_level": 0, "name": "live_a"},
+            {
+                "start": len(live_a),
+                "end": len(live_a) + len(dead),
+                "kind": 3,
+                "dep_level": 0,
+                "name": "dead",
+            },
+            {
+                "start": live_b_start,
+                "end": len(text),
+                "kind": 3,
+                "dep_level": 0,
+                "name": "live_b",
+            },
+        ],
+        "call_edges": [
+            {"from": 2, "to": 0},
+            {"from": 2, "to": 1},
+        ],
+        "type_edges": [{"from": 0, "to": 2}],
+        "symbol_ids": list(range(1000, 1000 + len(text))),
+        "domain_edges": [
+            {
+                "from_char": live_b_name,
+                "to_char": live_a_call,
+                "kind": int(DomainEdgeKind.CALL),
+            },
+            {
+                "from_char": live_b_name,
+                "to_char": dead_name,
+                "kind": int(DomainEdgeKind.CALL),
+            },
+        ],
+    }
+
+    docs = clang_enriched_to_parquet.process_record_with_policy(
+        record,
+        _CharTokenizer(),
+        max_tokens=4096,
+        overflow_policy="drop",
+    )
+
+    assert len(docs) == 1
+    doc = docs[0]
+    assert "__SYMBIAN32__" not in doc["text"]
+    assert "int dead()" not in doc["text"]
+    live_b_out = doc["text"].index("int live_b")
+    live_b_name_out = doc["text"].index("live_b")
+    live_a_call_out = doc["text"].rindex("live_a")
+
+    assert doc["structure_ids"][live_b_out] == 3
+    assert doc["symbol_ids"][live_b_out] == record["symbol_ids"][live_b_start]
+    assert [chunk["name"] for chunk in doc["chunk_boundaries"]] == ["live_a", "live_b"]
+    assert doc["call_edges"] == [{"from": 1, "to": 0}]
+    assert doc["type_edges"] == [{"from": 0, "to": 1}]
+    assert doc["domain_edges"] == [
+        {
+            "from_char": live_b_name_out,
+            "to_char": live_a_call_out,
+            "kind": int(DomainEdgeKind.CALL),
+        }
+    ]
 
 
 def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
@@ -659,6 +852,197 @@ def test_commit_enriched_builder_emits_semantic_columns_without_libclang_runtime
     assert any(value == 1 for value in doc["def_use"])
 
 
+def test_commit_enriched_builder_emits_cpp_domain_macro_sidecars() -> None:
+    macro_text = "#define CPPMEGA_COMMIT_WRAP(x) ((x) + 1)\n"
+    main_text = "int main(int x) { return CPPMEGA_COMMIT_WRAP(x); }"
+    main = FunctionDef(
+        "main",
+        "main",
+        "src/demo.cc",
+        3,
+        main_text,
+        [],
+    )
+    analysis = FileAnalysis(macro_text, functions=[main])
+    parts: list[PartInfo] = [
+        (macro_text, 1, 0, "", None),
+        (main_text, 3, 0, "main", "main"),
+    ]
+
+    doc = _build_enriched_from_parts(
+        parts,
+        analysis,
+        None,
+        {"filepath": "src/demo.cc"},
+    )
+
+    text_len = len(doc["text"])
+    assert doc["domain_kind"] == int(DomainKind.CPP)
+    for key in (
+        "domain_ids",
+        "domain_role_ids",
+        "domain_entity_ids",
+        "domain_scope_ids",
+        "domain_source_doc_ids",
+        "domain_confidence_ids",
+    ):
+        assert len(doc[key]) == text_len
+    assert any(
+        edge["kind"] == int(DomainEdgeKind.MACRO_PARAM_USE)
+        for edge in doc["domain_edges"]
+    )
+    assert any(
+        edge["kind"] == int(DomainEdgeKind.MACRO_INVOCATION)
+        for edge in doc["domain_edges"]
+    )
+
+
+def test_commit_macro_dependency_parts_emit_precise_expansion_routes() -> None:
+    macro_index = ProjectIndex()
+    base = MacroDef(
+        "CPPMEGA_COMMIT_BASE",
+        "include/macros.h",
+        1,
+        "#define CPPMEGA_COMMIT_BASE(x) ((x) + 1)\n",
+        params=["x"],
+        visible_in_file="src/demo.cc",
+        visible_line=1,
+        sequence=0,
+    )
+    wrap = MacroDef(
+        "CPPMEGA_COMMIT_WRAP",
+        "include/macros.h",
+        2,
+        "#define CPPMEGA_COMMIT_WRAP(x) CPPMEGA_COMMIT_BASE(x)\n",
+        params=["x"],
+        visible_in_file="src/demo.cc",
+        visible_line=1,
+        sequence=1,
+    )
+    macro_index.add_macro(base)
+    macro_index.add_macro(wrap)
+    main_text = "int main(int x) { return CPPMEGA_COMMIT_WRAP(x); }"
+    main = FunctionDef("main", "main", "src/demo.cc", 3, main_text, [])
+    macro_parts = _macro_dependency_parts_for_commit_targets(
+        macro_index,
+        [(main_text, "src/demo.cc", 3)],
+    )
+
+    assert [part[3] for part in macro_parts] == [
+        "CPPMEGA_COMMIT_BASE",
+        "CPPMEGA_COMMIT_WRAP",
+    ]
+
+    doc = _build_enriched_from_parts(
+        [*macro_parts, (main_text, 3, 0, "main", "main")],
+        FileAnalysis("", functions=[main]),
+        None,
+        {"filepath": "src/demo.cc"},
+    )
+
+    assert any(
+        edge["kind"] == int(DomainEdgeKind.MACRO_INVOCATION)
+        for edge in doc["domain_edges"]
+    )
+    assert any(
+        edge["kind"] == int(DomainEdgeKind.MACRO_EXPANSION_INCLUDE_ORDER)
+        for edge in doc["domain_edges"]
+    )
+
+
+def test_process_record_pulls_header_macros_into_commit_docs_without_libclang(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "include").mkdir()
+    (tmp_path / "include" / "macros.h").write_text(
+        "#define CPPMEGA_COMMIT_BASE(x) ((x) + 1)\n"
+        "#define CPPMEGA_COMMIT_WRAP(x) CPPMEGA_COMMIT_BASE(x)\n",
+        encoding="utf-8",
+    )
+    old_content = (
+        '#include "../include/macros.h"\n'
+        "int main(int x) {\n"
+        "  return CPPMEGA_COMMIT_WRAP(x);\n"
+        "}\n"
+        "// enough trailing text for the minimum file-size guard\n"
+    )
+    new_content = old_content.replace(
+        "return CPPMEGA_COMMIT_WRAP(x);",
+        "return CPPMEGA_COMMIT_WRAP(x) + 2;",
+    )
+    (tmp_path / "src" / "demo.cc").write_text(new_content, encoding="utf-8")
+
+    def fake_analyzer(
+        content: str,
+        filepath: str,
+        clang_index,
+        tmpdir: str,
+        **_kwargs,
+    ) -> FileAnalysis:
+        body_line = (
+            "  return CPPMEGA_COMMIT_WRAP(x) + 2;"
+            if "+ 2" in content
+            else "  return CPPMEGA_COMMIT_WRAP(x);"
+        )
+        text = f"int main(int x) {{\n{body_line}\n}}"
+        return FileAnalysis(
+            '#include "../include/macros.h"\n',
+            functions=[
+                FunctionDef(
+                    "main",
+                    "main",
+                    filepath,
+                    2,
+                    text,
+                    [],
+                    end_line=4,
+                )
+            ],
+        )
+
+    docs = process_record(
+        {
+            "repo": "demo",
+            "filepath": "src/demo.cc",
+            "old_content": old_content,
+            "new_content": new_content,
+            "diff": "\n".join(
+                [
+                    "diff --git a/src/demo.cc b/src/demo.cc",
+                    "--- a/src/demo.cc",
+                    "+++ b/src/demo.cc",
+                    "@@ -3 +3 @@",
+                    "-  return CPPMEGA_COMMIT_WRAP(x);",
+                    "+  return CPPMEGA_COMMIT_WRAP(x) + 2;",
+                ]
+            ),
+            "subject": "Use wrapped macro",
+        },
+        clang_index=object(),
+        tmpdir=str(tmp_path / "tmp"),
+        max_tokens=4096,
+        max_file_bytes=100000,
+        doc_format="chain",
+        max_dep_depth=1,
+        build_context=BuildContextResolver(repo_root=str(tmp_path)),
+        analyzer=fake_analyzer,
+    )
+
+    assert docs
+    doc = docs[0]
+    assert "#define CPPMEGA_COMMIT_BASE" in doc["text"]
+    assert "#define CPPMEGA_COMMIT_WRAP" in doc["text"]
+    assert any(
+        edge["kind"] == int(DomainEdgeKind.MACRO_INVOCATION)
+        for edge in doc["domain_edges"]
+    )
+    assert any(
+        edge["kind"] == int(DomainEdgeKind.MACRO_EXPANSION_INCLUDE_ORDER)
+        for edge in doc["domain_edges"]
+    )
+
+
 def test_commit_enriched_builder_emits_temporal_char_annotations() -> None:
     old_text = "int main() { return 1; }"
     new_text = "int main() { return 2; }"
@@ -834,3 +1218,47 @@ def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
     assert edge["kind"] == int(DomainEdgeKind.BUILD_TARGET_SOURCE)
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][edge["from"]] == int(DomainRoleKind.TARGET)
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][edge["to"]] == int(DomainRoleKind.SOURCE)
+
+
+def test_tokenized_materializer_inserts_distinct_meson_delimiters() -> None:
+    text = "project('demo', 'cpp', default_options: ['cpp_std=c++23'])\n"
+    docs = [
+        {
+            "text": text,
+            "domain_kind": int(DomainKind.MESON),
+            "domain_ids": [int(DomainKind.MESON)] * len(text),
+            "domain_role_ids": [0] * len(text),
+        }
+    ]
+
+    row = materialize_tokenized_enriched_batch(docs, load_tokenizer())[0]
+    start_id, end_id = delimiter_token_ids(DomainKind.MESON)
+
+    assert row[schema.TOKEN_IDS_COLUMN][1] == start_id
+    assert row[schema.TOKEN_IDS_COLUMN][-1] == end_id
+    assert row[schema.TOKEN_DOMAIN_IDS_COLUMN][1] == int(DomainKind.MESON)
+    assert row[schema.TOKEN_DOMAIN_IDS_COLUMN][-1] == int(DomainKind.MESON)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][1] == int(DomainRoleKind.DELIMITER)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][-1] == int(DomainRoleKind.DELIMITER)
+
+
+def test_tokenized_materializer_inserts_compile_commands_delimiters() -> None:
+    text = '[{"file": "src/main.cc", "command": "c++ -std=c++23 src/main.cc"}]\n'
+    docs = [
+        {
+            "text": text,
+            "domain_kind": int(DomainKind.COMPILE_COMMANDS),
+            "domain_ids": [int(DomainKind.COMPILE_COMMANDS)] * len(text),
+            "domain_role_ids": [0] * len(text),
+        }
+    ]
+
+    row = materialize_tokenized_enriched_batch(docs, load_tokenizer())[0]
+    start_id, end_id = delimiter_token_ids(DomainKind.COMPILE_COMMANDS)
+
+    assert row[schema.TOKEN_IDS_COLUMN][1] == start_id
+    assert row[schema.TOKEN_IDS_COLUMN][-1] == end_id
+    assert row[schema.TOKEN_DOMAIN_IDS_COLUMN][1] == int(DomainKind.COMPILE_COMMANDS)
+    assert row[schema.TOKEN_DOMAIN_IDS_COLUMN][-1] == int(DomainKind.COMPILE_COMMANDS)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][1] == int(DomainRoleKind.DELIMITER)
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN][-1] == int(DomainRoleKind.DELIMITER)

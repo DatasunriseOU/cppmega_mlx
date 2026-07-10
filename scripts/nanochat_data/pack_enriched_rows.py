@@ -10,11 +10,14 @@ not parse C++; it only repacks whole enriched documents into dense LM rows.
 from __future__ import annotations
 
 import argparse
+import bisect
+import hashlib
 import json
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, SupportsInt
+from typing import Any, Iterator, SupportsInt
 
 import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
@@ -36,10 +39,12 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_FILEPATH_STABLE_IDS_COLUMN,
     SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN,
     SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
+    SOURCE_HEADER_FRAGMENT_KINDS_COLUMN,
     SOURCE_PR_DISCUSSION_CHARS_COLUMN,
     SOURCE_PR_DISCUSSION_LINES_COLUMN,
     SOURCE_PR_NUMBERS_COLUMN,
     SOURCE_REPO_STABLE_IDS_COLUMN,
+    SOURCE_DOC_TYPES_COLUMN,
     TARGET_IDS_COLUMN,
     TOKEN_PLATFORM_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
@@ -48,11 +53,13 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     AUTHOR_TIMESTAMP_COLUMN,
     COMMIT_HASH_COLUMN,
     COMMIT_TIMESTAMP_COLUMN,
+    DOC_TYPE_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     FILEPATH_COLUMN,
     FILEPATH_STABLE_ID_COLUMN,
     FILE_LOCAL_COMMIT_INDEX_COLUMN,
     HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN,
+    HEADER_FRAGMENT_KIND_COLUMN,
     HAS_PR_DISCUSSION_COLUMN,
     HAS_RENAME_AMBIGUITY_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
@@ -110,8 +117,66 @@ SOURCE_DOC_ID_COLUMN = "source_doc_id"
 # (a list of source_doc_index values this document depends on). Used to enforce
 # a cross-document partial order during in-bin topological packing.
 DOC_DEP_EDGES_COLUMN = "doc_dep_edges"
+PACKED_ROW_MACRO_ROUTES_METADATA_KEY = "cppmega.macro_routes_version"
+PACKED_ROW_MACRO_ROUTES_VERSION = "full_macro_concept_routes_v1"
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
+_STATIC_DOC_TYPES = {"code", "code_header", "build"}
+DEFAULT_PACK_TOKEN_WINDOW = 1024 * 1024
+
+
+def stable_repo_id(repo_name: str) -> str:
+    return hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:16]
+
+
+def stable_filepath_id(repo_name: str, filepath: str) -> str:
+    key = f"{repo_name}\0{filepath}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _has_value(value: object) -> bool:
+    return value is not None and value != ""
+
+
+def _is_static_code_record(record: dict[str, Any]) -> bool:
+    has_temporal_provenance = any(
+        _has_value(record.get(column))
+        for column in (
+            COMMIT_HASH_COLUMN,
+            FILE_LOCAL_COMMIT_INDEX_COLUMN,
+            AUTHOR_TIMESTAMP_COLUMN,
+            COMMIT_TIMESTAMP_COLUMN,
+            TIMESTAMP_COLUMN,
+        )
+    )
+    if has_temporal_provenance:
+        return False
+    doc_type = record.get(DOC_TYPE_COLUMN)
+    if doc_type in _STATIC_DOC_TYPES:
+        return True
+    if not _has_value(record.get(FILEPATH_COLUMN)):
+        return False
+    return True
+
+
+def _validate_static_provenance(
+    record: dict[str, Any],
+    *,
+    repo: object,
+    filepath: object,
+) -> None:
+    if not _is_static_code_record(record):
+        return
+    if not _has_value(repo):
+        raise ValueError(
+            "static code document missing repo provenance "
+            f"for filepath={filepath!r}"
+        )
+    if not _has_value(filepath):
+        raise ValueError(
+            "static code document missing filepath provenance "
+            f"for repo={repo!r}"
+        )
 PACKED_CHUNK_METADATA_COLUMNS = PACKED_ROWS_CHUNK_METADATA_COLUMNS
 PACKED_ROW_PROVENANCE_COLUMNS = tuple(
     column for column in RAW_COMMIT_CHRONOLOGY_COLUMNS if column != TIMESTAMP_COLUMN
@@ -160,6 +225,8 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_HAS_PR_DISCUSSIONS_COLUMN, pa.list_(pa.bool_())),
         pa.field(SOURCE_PR_DISCUSSION_CHARS_COLUMN, pa.list_(pa.int32())),
         pa.field(SOURCE_PR_DISCUSSION_LINES_COLUMN, pa.list_(pa.int32())),
+        pa.field(SOURCE_DOC_TYPES_COLUMN, pa.list_(pa.string())),
+        pa.field(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, pa.list_(pa.string())),
         pa.field(ROW_PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
         pa.field(REPO_COLUMN, pa.string()),
         pa.field(FILEPATH_COLUMN, pa.string()),
@@ -214,6 +281,17 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(CHANGED_CHUNK_SPANS_COLUMN, pa.list_(CHANGED_CHUNK_SPAN_STRUCT)),
     ]
 )
+
+
+def _packed_row_schema_with_metadata() -> pa.Schema:
+    metadata = dict(PACKED_ROW_SCHEMA.metadata or {})
+    metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] = (
+        PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
+    )
+    return PACKED_ROW_SCHEMA.with_metadata(metadata)
+
+
+PACKED_ROW_OUTPUT_SCHEMA = _packed_row_schema_with_metadata()
 
 
 @dataclass(frozen=True)
@@ -318,16 +396,22 @@ class PackBin:
 
 
 def _doc_has_temporal_chronology(doc: NormalizedDoc) -> bool:
+    """Return True only for commit/PR chronology, not static code provenance.
+
+    Static code/header rows legitimately carry repo/filepath stable IDs.  Those
+    identifiers must stay available for audit/sampling, but they are not a
+    commit window and must not prevent unrelated static documents from sharing a
+    packed row.
+    """
     return any(
         doc.chronology.get(column) not in (None, "")
         for column in (
-            REPO_COLUMN,
-            FILEPATH_COLUMN,
             COMMIT_HASH_COLUMN,
             TIMESTAMP_COLUMN,
-            REPO_STABLE_ID_COLUMN,
-            FILEPATH_STABLE_ID_COLUMN,
             FILE_LOCAL_COMMIT_INDEX_COLUMN,
+            AUTHOR_TIMESTAMP_COLUMN,
+            COMMIT_TIMESTAMP_COLUMN,
+            PR_NUMBER_COLUMN,
         )
     )
 
@@ -592,9 +676,22 @@ def _validate_chunk_graph_references(
 
 
 def _normalize_chronology(record: dict[str, Any]) -> dict[str, Any]:
+    repo = record.get(REPO_COLUMN)
+    filepath = record.get(FILEPATH_COLUMN)
+    repo_stable_id = record.get(REPO_STABLE_ID_COLUMN)
+    if not _has_value(repo_stable_id) and _has_value(repo):
+        repo_stable_id = stable_repo_id(str(repo))
+    filepath_stable_id = record.get(FILEPATH_STABLE_ID_COLUMN)
+    if (
+        not _has_value(filepath_stable_id)
+        and _has_value(repo)
+        and _has_value(filepath)
+    ):
+        filepath_stable_id = stable_filepath_id(str(repo), str(filepath))
+    _validate_static_provenance(record, repo=repo, filepath=filepath)
     chronology: dict[str, Any] = {
-        REPO_COLUMN: record.get(REPO_COLUMN),
-        FILEPATH_COLUMN: record.get(FILEPATH_COLUMN),
+        REPO_COLUMN: repo,
+        FILEPATH_COLUMN: filepath,
         COMMIT_HASH_COLUMN: record.get(COMMIT_HASH_COLUMN),
         TIMESTAMP_COLUMN: record.get(TIMESTAMP_COLUMN),
         PR_NUMBER_COLUMN: _coerce_optional_int(record.get(PR_NUMBER_COLUMN)),
@@ -612,8 +709,10 @@ def _normalize_chronology(record: dict[str, Any]) -> dict[str, Any]:
         ],
         AUTHOR_TIMESTAMP_COLUMN: record.get(AUTHOR_TIMESTAMP_COLUMN),
         COMMIT_TIMESTAMP_COLUMN: record.get(COMMIT_TIMESTAMP_COLUMN),
-        REPO_STABLE_ID_COLUMN: record.get(REPO_STABLE_ID_COLUMN),
-        FILEPATH_STABLE_ID_COLUMN: record.get(FILEPATH_STABLE_ID_COLUMN),
+        REPO_STABLE_ID_COLUMN: repo_stable_id,
+        FILEPATH_STABLE_ID_COLUMN: filepath_stable_id,
+        DOC_TYPE_COLUMN: record.get(DOC_TYPE_COLUMN),
+        HEADER_FRAGMENT_KIND_COLUMN: record.get(HEADER_FRAGMENT_KIND_COLUMN),
     }
     parent_count = record.get(PARENT_COUNT_COLUMN)
     if parent_count is None:
@@ -897,40 +996,68 @@ def read_tokenized_documents(
     shared ``signature_to_id`` keeps stable doc IDs unique across sources.
     """
 
+    if signature_to_id is None:
+        signature_to_id = {}
     docs: list[NormalizedDoc] = []
+    accumulated_tokens = 0
+    for doc in iter_tokenized_documents(
+        input_path,
+        start_source_doc_index=start_source_doc_index,
+        signature_to_id=signature_to_id,
+    ):
+        docs.append(doc)
+        accumulated_tokens += doc.token_count
+        if token_budget is not None and accumulated_tokens >= token_budget:
+            break
+    return docs
+
+
+def _selected_input_columns(available: set[str]) -> list[str]:
+    return [
+        column
+        for column in (
+            TOKEN_IDS_COLUMN,
+            SOURCE_DOC_ID_COLUMN,
+            "source_document_id",
+            "document_id",
+            "doc_id",
+            PLATFORM_IDS_COLUMN,
+            *RAW_COMMIT_CHRONOLOGY_COLUMNS,
+            HAS_PR_DISCUSSION_COLUMN,
+            PR_DISCUSSION_CHARS_COLUMN,
+            PR_DISCUSSION_LINES_COLUMN,
+            DOC_TYPE_COLUMN,
+            HEADER_FRAGMENT_KIND_COLUMN,
+            *PACKED_TOKEN_METADATA_COLUMNS,
+            *PACKED_CHUNK_METADATA_COLUMNS,
+        )
+        if column in available
+    ]
+
+
+def iter_tokenized_documents(
+    input_path: str | os.PathLike[str],
+    *,
+    start_source_doc_index: int = 0,
+    signature_to_id: dict[str, int] | None = None,
+    input_batch_size: int = 1024,
+) -> Iterator[NormalizedDoc]:
+    """Yield normalized input documents without materializing a whole shard."""
+
     source_doc_index = int(start_source_doc_index)
     if signature_to_id is None:
         signature_to_id = {}
-    accumulated_tokens = 0
     for path in _list_input_files(input_path):
-        if token_budget is not None and accumulated_tokens >= token_budget:
-            break
         parquet_file = pq.ParquetFile(path)
         available = set(parquet_file.schema_arrow.names)
         if TOKEN_IDS_COLUMN not in available:
             raise ValueError(f"{path} is missing required column {TOKEN_IDS_COLUMN}")
 
-        selected_columns = [
-            column
-            for column in (
-                TOKEN_IDS_COLUMN,
-                SOURCE_DOC_ID_COLUMN,
-                "source_document_id",
-                "document_id",
-                "doc_id",
-                PLATFORM_IDS_COLUMN,
-                *RAW_COMMIT_CHRONOLOGY_COLUMNS,
-                HAS_PR_DISCUSSION_COLUMN,
-                PR_DISCUSSION_CHARS_COLUMN,
-                PR_DISCUSSION_LINES_COLUMN,
-                *PACKED_TOKEN_METADATA_COLUMNS,
-                *PACKED_CHUNK_METADATA_COLUMNS,
-            )
-            if column in available
-        ]
-
-        stop = False
-        for batch in parquet_file.iter_batches(columns=selected_columns, batch_size=1024):
+        selected_columns = _selected_input_columns(available)
+        for batch in parquet_file.iter_batches(
+            columns=selected_columns,
+            batch_size=input_batch_size,
+        ):
             for record in batch.to_pylist():
                 doc = normalize_document_record(
                     record,
@@ -941,17 +1068,8 @@ def read_tokenized_documents(
                         signature_to_id=signature_to_id,
                     ),
                 )
-                docs.append(doc)
+                yield doc
                 source_doc_index += 1
-                accumulated_tokens += doc.token_count
-                if token_budget is not None and accumulated_tokens >= token_budget:
-                    stop = True
-                    break
-            if stop:
-                break
-        if stop:
-            break
-    return docs
 
 
 def _pack_docs_best_fit(
@@ -992,6 +1110,42 @@ def _pack_docs_best_fit(
         own_block = PackBin()
         own_block.add(doc)
         bins.append(own_block)
+    if not any(_doc_has_temporal_chronology(doc) for doc in ordered):
+        # Fast indexed best-fit for static code/header docs.  The generic path
+        # below scans all open bins for every document so it becomes quadratic on
+        # macro-heavy header shards with tens of thousands of tiny documents.
+        bins_by_remaining: dict[int, deque[PackBin]] = {}
+        remaining_keys: list[int] = []
+
+        def _push_open_bin(pack: PackBin) -> None:
+            remaining = target_length - pack.used_tokens
+            if remaining <= 0:
+                return
+            queue = bins_by_remaining.get(remaining)
+            if queue is None:
+                bins_by_remaining[remaining] = deque([pack])
+                bisect.insort(remaining_keys, remaining)
+            else:
+                queue.append(pack)
+
+        for doc in ordered:
+            key_idx = bisect.bisect_left(remaining_keys, doc.token_count)
+            if key_idx == len(remaining_keys):
+                best_bin = PackBin()
+                bins.append(best_bin)
+            else:
+                remaining = remaining_keys[key_idx]
+                queue = bins_by_remaining[remaining]
+                best_bin = queue.popleft()
+                if not queue:
+                    del bins_by_remaining[remaining]
+                    remaining_keys.pop(key_idx)
+            best_bin.add(doc)
+            _push_open_bin(best_bin)
+
+        bins.sort(key=lambda pack: min(doc.source_doc_index for doc in pack.docs))
+        return bins, overflow
+
     for doc in ordered:
         best_bin: PackBin | None = None
         best_slack = target_length + 1
@@ -1097,6 +1251,8 @@ def _materialize_packed_row(
     source_has_pr_discussions: list[bool] = []
     source_pr_discussion_chars: list[int] = []
     source_pr_discussion_lines: list[int] = []
+    source_doc_types: list[str | None] = []
+    source_header_fragment_kinds: list[str | None] = []
     chronology = _shared_chronology_for_docs(ordered_docs)
 
     token_meta_acc: dict[str, list[int]] = {
@@ -1139,6 +1295,10 @@ def _materialize_packed_row(
         )
         source_pr_discussion_lines.append(
             int(doc.chronology.get(PR_DISCUSSION_LINES_COLUMN) or 0)
+        )
+        source_doc_types.append(doc.chronology.get(DOC_TYPE_COLUMN))
+        source_header_fragment_kinds.append(
+            doc.chronology.get(HEADER_FRAGMENT_KIND_COLUMN)
         )
 
         for column in PACKED_TOKEN_METADATA_COLUMNS:
@@ -1246,6 +1406,8 @@ def _materialize_packed_row(
         SOURCE_HAS_PR_DISCUSSIONS_COLUMN: source_has_pr_discussions,
         SOURCE_PR_DISCUSSION_CHARS_COLUMN: source_pr_discussion_chars,
         SOURCE_PR_DISCUSSION_LINES_COLUMN: source_pr_discussion_lines,
+        SOURCE_DOC_TYPES_COLUMN: source_doc_types,
+        SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: source_header_fragment_kinds,
         ROW_PLATFORM_IDS_COLUMN: _merged_platform_ids_for_docs(ordered_docs),
         HAS_PR_DISCUSSION_COLUMN: any(source_has_pr_discussions),
         PR_DISCUSSION_CHARS_COLUMN: sum(source_pr_discussion_chars),
@@ -1366,6 +1528,14 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 SOURCE_PR_DISCUSSION_LINES_COLUMN: [
                     int(item)
                     for item in row.get(SOURCE_PR_DISCUSSION_LINES_COLUMN, [])
+                ],
+                SOURCE_DOC_TYPES_COLUMN: [
+                    None if item is None else str(item)
+                    for item in row.get(SOURCE_DOC_TYPES_COLUMN, [])
+                ],
+                SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: [
+                    None if item is None else str(item)
+                    for item in row.get(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, [])
                 ],
                 ROW_PLATFORM_IDS_COLUMN: _as_int_list(row.get(ROW_PLATFORM_IDS_COLUMN)),
                 REPO_COLUMN: row.get(REPO_COLUMN),
@@ -1520,7 +1690,20 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 ],
             }
         )
-    return pa.Table.from_pylist(normalized_rows, schema=PACKED_ROW_SCHEMA)
+    return pa.Table.from_pylist(normalized_rows, schema=PACKED_ROW_OUTPUT_SCHEMA)
+
+
+def _write_packed_rows(
+    writer: pq.ParquetWriter,
+    rows: list[dict[str, Any]],
+    *,
+    row_group_size: int,
+) -> None:
+    for start in range(0, len(rows), row_group_size):
+        writer.write_table(
+            rows_to_table(rows[start : start + row_group_size]),
+            row_group_size=row_group_size,
+        )
 
 
 def _empty_overflow_table() -> pa.Table:
@@ -1569,28 +1752,80 @@ def pack_parquet_dataset(
     pad_token_id: int = 0,
     strategy: PackingStrategy = "best_fit",
     overflow_output: str | os.PathLike[str] | None = None,
-    row_group_size: int = 1024,
+    row_group_size: int = 128,
+    pack_token_window: int = DEFAULT_PACK_TOKEN_WINDOW,
+    input_batch_size: int = 1024,
 ) -> dict[str, int]:
     """Pack a parquet dataset end to end and write packed rows."""
 
-    docs = read_tokenized_documents(input_path)
-    packed_rows, overflow = pack_documents(
-        docs,
-        target_length=target_length,
-        pad_token_id=pad_token_id,
-        strategy=strategy,
-    )
+    if pack_token_window <= 0:
+        raise ValueError("pack_token_window must be > 0")
+    if row_group_size <= 0:
+        raise ValueError("row_group_size must be > 0")
+    if input_batch_size <= 0:
+        raise ValueError("input_batch_size must be > 0")
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(rows_to_table(packed_rows), output, row_group_size=row_group_size)
+
+    input_docs = 0
+    packed_rows_count = 0
+    overflow: list[dict[str, Any]] = []
+    window_docs: list[NormalizedDoc] = []
+    window_tokens = 0
+    signature_to_id: dict[str, int] = {}
+    writer: pq.ParquetWriter | None = None
+
+    def flush_window() -> None:
+        nonlocal packed_rows_count, window_docs, window_tokens, writer
+        if not window_docs:
+            return
+        packed_rows, window_overflow = pack_documents(
+            window_docs,
+            target_length=target_length,
+            pad_token_id=pad_token_id,
+            strategy=strategy,
+        )
+        for row in packed_rows:
+            row[PACK_ID_COLUMN] = packed_rows_count + int(row.get(PACK_ID_COLUMN, 0))
+        if packed_rows:
+            if writer is None:
+                writer = pq.ParquetWriter(output, PACKED_ROW_OUTPUT_SCHEMA)
+            _write_packed_rows(
+                writer,
+                packed_rows,
+                row_group_size=row_group_size,
+            )
+            packed_rows_count += len(packed_rows)
+        overflow.extend(window_overflow)
+        window_docs = []
+        window_tokens = 0
+
+    try:
+        for doc in iter_tokenized_documents(
+            input_path,
+            signature_to_id=signature_to_id,
+            input_batch_size=input_batch_size,
+        ):
+            input_docs += 1
+            window_docs.append(doc)
+            window_tokens += doc.token_count
+            if window_tokens >= pack_token_window:
+                flush_window()
+        flush_window()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if writer is None:
+        pq.write_table(rows_to_table([]), output, row_group_size=row_group_size)
 
     if overflow_output is not None:
         write_overflow_records(overflow, overflow_output)
 
     return {
-        "input_docs": len(docs),
-        "packed_rows": len(packed_rows),
+        "input_docs": input_docs,
+        "packed_rows": packed_rows_count,
         "overflow_docs": len(overflow),
     }
 
@@ -1635,8 +1870,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--row-group-size",
         type=int,
+        default=128,
+        help="Output parquet row group size (default: 128).",
+    )
+    parser.add_argument(
+        "--pack-token-window",
+        type=int,
+        default=DEFAULT_PACK_TOKEN_WINDOW,
+        help=(
+            "Maximum real tokens to hold while best-fit packing before writing "
+            f"a bounded parquet window (default: {DEFAULT_PACK_TOKEN_WINDOW})."
+        ),
+    )
+    parser.add_argument(
+        "--input-batch-size",
+        type=int,
         default=1024,
-        help="Output parquet row group size (default: 1024).",
+        help="Input parquet row batch size for streaming normalization (default: 1024).",
     )
     return parser
 
@@ -1651,6 +1901,8 @@ def main() -> None:
         strategy=args.strategy,
         overflow_output=args.overflow_output or None,
         row_group_size=args.row_group_size,
+        pack_token_window=args.pack_token_window,
+        input_batch_size=args.input_batch_size,
     )
     print(json.dumps(summary, sort_keys=True))
 
@@ -1664,12 +1916,15 @@ __all__ = [
     "INPUT_IDS_COLUMN",
     "LOSS_MASK_COLUMN",
     "NUM_DOCS_COLUMN",
+    "PACKED_ROW_MACRO_ROUTES_METADATA_KEY",
+    "PACKED_ROW_MACRO_ROUTES_VERSION",
     "PACK_ID_COLUMN",
     "SOURCE_DOC_INDICES_COLUMN",
     "TARGET_IDS_COLUMN",
     "VALID_TOKEN_COUNT_COLUMN",
     "NormalizedDoc",
     "normalize_document_record",
+    "iter_tokenized_documents",
     "pack_documents",
     "pack_parquet_dataset",
     "read_tokenized_documents",

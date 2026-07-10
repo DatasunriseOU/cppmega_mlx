@@ -74,6 +74,9 @@ from typing import Callable, Sequence
 # shared primitives from streaming_reindex (MLX_ROOT, Manifest, RepoFailure, ...)
 # and adds the .git-preserving stream + range pipeline. Import BOTH, do not
 # duplicate a single line of stage logic.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 import streaming_reindex as sr
 import streaming_reindex_commits as src
 
@@ -127,6 +130,78 @@ DEFAULT_MIN_FREE_DISK_GB = 50.0
 EXTRACT_CACHE_ROOT = CONVEYOR_ROOT / "extract_cache"
 
 _PRINT_LOCK = threading.Lock()
+
+
+def configure_output_roots(
+    *,
+    code_output_root: str | os.PathLike[str] | None = None,
+    commit_output_root: str | os.PathLike[str] | None = None,
+    conveyor_root: str | os.PathLike[str] | None = None,
+) -> None:
+    """Rebase all runtime output roots used by the conveyor.
+
+    The conveyor orchestrates code and commit drivers that historically kept
+    module-level output constants. This explicit production seam lets a full
+    regeneration run write to a fresh tree instead of mixing new packed shards
+    with legacy ``outputs/reindexed*`` files.
+    """
+
+    global CONVEYOR_ROOT
+    global CONVEYOR_MANIFEST
+    global DEFAULT_PROGRESS_JSONL
+    global DEFAULT_RUN_LOCK_DIR
+    global DEFAULT_WORK_PARENT
+    global DEFAULT_RESERVATION_FILE
+    global EXTRACT_CACHE_ROOT
+
+    if code_output_root is not None:
+        sr.OUTPUT_ROOT = Path(code_output_root)
+        sr.MANIFEST_PATH = sr.OUTPUT_ROOT / "_done.json"
+    if commit_output_root is not None:
+        src.COMMIT_OUTPUT_ROOT = Path(commit_output_root)
+        src.COMMIT_MANIFEST = src.COMMIT_OUTPUT_ROOT / "_done.json"
+    if conveyor_root is not None:
+        CONVEYOR_ROOT = Path(conveyor_root)
+        CONVEYOR_MANIFEST = CONVEYOR_ROOT / "_done.json"
+        DEFAULT_PROGRESS_JSONL = CONVEYOR_ROOT / "progress.jsonl"
+        DEFAULT_RUN_LOCK_DIR = CONVEYOR_ROOT / "locks"
+        DEFAULT_WORK_PARENT = CONVEYOR_ROOT / "tmp"
+        DEFAULT_RESERVATION_FILE = CONVEYOR_ROOT / "_reservations.json"
+        EXTRACT_CACHE_ROOT = CONVEYOR_ROOT / "extract_cache"
+
+
+def configure_runtime_paths_from_args(args: argparse.Namespace) -> None:
+    old_defaults = {
+        "progress_jsonl": DEFAULT_PROGRESS_JSONL,
+        "run_lock_dir": DEFAULT_RUN_LOCK_DIR,
+        "work_parent_dir": DEFAULT_WORK_PARENT,
+        "reservation_file": DEFAULT_RESERVATION_FILE,
+    }
+    configure_output_roots(
+        code_output_root=args.code_output_root,
+        commit_output_root=args.commit_output_root,
+        conveyor_root=args.conveyor_root,
+    )
+
+    if Path(args.progress_jsonl) == old_defaults["progress_jsonl"]:
+        args.progress_jsonl = str(DEFAULT_PROGRESS_JSONL)
+    if Path(args.run_lock_dir) == old_defaults["run_lock_dir"]:
+        args.run_lock_dir = str(DEFAULT_RUN_LOCK_DIR)
+    if Path(args.work_parent_dir) == old_defaults["work_parent_dir"]:
+        args.work_parent_dir = str(DEFAULT_WORK_PARENT)
+    if Path(args.reservation_file) == old_defaults["reservation_file"]:
+        args.reservation_file = str(DEFAULT_RESERVATION_FILE)
+
+
+class RepoNoCommitRecords(RuntimeError):
+    """Commit stream completed discovery but has no trainable commit records."""
+
+    def __init__(self, repo: str, *, reason: str, detail: str):
+        super().__init__(f"[{repo}] no commit records: {reason}: {detail}")
+        self.repo = repo
+        self.reason = reason
+        self.detail = detail
+
 
 # Cooperative shutdown flag set by the SIGINT/SIGTERM handlers in main(). When
 # set, the conveyor stops SUBMITTING new repos/ranges, lets in-flight subprocess
@@ -459,13 +534,20 @@ def ensure_commit_records(
     # (c) Fresh extract into the stable cache. FAIL LOUD on empty git log / output.
     commit_list = get_commit_list(repo_dir)
     if not commit_list:
-        raise RepoFailure(repo, "git_log", "no --no-merges --diff-filter=M commits")
+        raise RepoNoCommitRecords(
+            repo,
+            reason="no_matching_commits",
+            detail="no --no-merges --diff-filter=M commits",
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
     n = _count_jsonl_lines(records_jsonl)
     if n == 0:
-        raise RepoFailure(repo, "extract_git_history",
-                          f"zero records after extract for {repo}")
+        raise RepoNoCommitRecords(
+            repo,
+            reason="no_cpp_commit_records",
+            detail=f"zero records after extract for {repo}",
+        )
     _write_extract_sentinel(records_jsonl, n)
     _log(f"EXTRACT-CKPT FRESH {repo}: extracted {n} records -> {records_jsonl}; "
          f"stamped sentinel")
@@ -1286,6 +1368,8 @@ def run_code_half(
             index_stall_timeout_s,
             promote_dedup_on_success=False,
         )
+        if info.get("skipped"):
+            return info
         # zstd-max the per-length code parquet files this repo just wrote.
         timings = dict(info.get("stage_timings_s", {}))
         started = time.monotonic()
@@ -1723,9 +1807,16 @@ def run_commits_half(
     records_provider = (
         ensure_commit_records if commit_records_override is None else commit_records_override
     )
-    records_jsonl, n_records, extract_cache_status = records_provider(
-        repo, repo_dir, work_root, work_parent, manifest, resume,
-    )
+    try:
+        records_jsonl, n_records, extract_cache_status = records_provider(
+            repo, repo_dir, work_root, work_parent, manifest, resume,
+        )
+    except RepoNoCommitRecords as exc:
+        raise RepoFailure(
+            repo,
+            "extract_git_history",
+            f"no commit records ({exc.reason}): {exc.detail}",
+        ) from exc
     if progress is not None:
         progress.emit(
             "extract_cache",
@@ -2296,6 +2387,10 @@ def process_one_repo(
             _log(f"RETAIN temp for {repo}: not all units marked done "
                  f"(interrupted/failed/partial); kept {repo_work} + extract cache "
                  f"{extract_cache_dir(repo)} for zero-rework resume")
+        elif STOP_EVENT.is_set():
+            remove_tree(repo_work, reason=f"{repo} interrupted partial work")
+            _log(f"RETAIN extract cache for interrupted {repo}: "
+                 f"{extract_cache_dir(repo)} kept for checkpoint resume")
         else:
             remove_tree(repo_work, reason=f"{repo} partial work")
             remove_tree(extract_cache_dir(repo), reason=f"{repo} partial extract cache")
@@ -2375,6 +2470,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "--work-dir is not set. Default lives under outputs/ on "
                         "the external corpus disk, not the macOS /var/folders "
                         f"temp volume: {DEFAULT_WORK_PARENT}.")
+    p.add_argument("--code-output-root", default=str(sr.OUTPUT_ROOT),
+                   help="Output root for packed CODE parquet buckets. "
+                        f"Default {sr.OUTPUT_ROOT}.")
+    p.add_argument("--commit-output-root", default=str(src.COMMIT_OUTPUT_ROOT),
+                   help="Output root for packed COMMIT parquet buckets. "
+                        f"Default {src.COMMIT_OUTPUT_ROOT}.")
+    p.add_argument("--conveyor-root", default=str(CONVEYOR_ROOT),
+                   help="Root for conveyor manifest, locks, extract cache, "
+                        f"progress and tmp defaults. Default {CONVEYOR_ROOT}.")
     p.add_argument("--only-repo", action="append", default=[],
                    help="Restrict the conveyor to these repo names (repeatable). "
                         "Other repos are DRAINED from the .git-preserving stream "
@@ -2487,6 +2591,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    configure_runtime_paths_from_args(args)
     lengths_code = tuple(sorted(
         int(x) for x in args.target_lengths_code.split(",") if x.strip()))
     lengths_commits = tuple(sorted(

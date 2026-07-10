@@ -5,10 +5,19 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from scripts.nanochat_data.pack_enriched_rows import (
+    PACKED_ROW_MACRO_ROUTES_METADATA_KEY,
+    PACKED_ROW_MACRO_ROUTES_VERSION,
+)
 from scripts.report_training_steps import build_report, parse_batch_schedule, _print_summary
 
 
-def _write_counter_parquet(path: Path, rows: list[dict[str, int]]) -> None:
+def _write_counter_parquet(
+    path: Path,
+    rows: list[dict[str, int]],
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table(
         {
@@ -17,6 +26,10 @@ def _write_counter_parquet(path: Path, rows: list[dict[str, int]]) -> None:
             "num_docs": pa.array([row["docs"] for row in rows], pa.int64()),
         }
     )
+    if metadata:
+        table = table.replace_schema_metadata(
+            {key.encode("utf-8"): value.encode("utf-8") for key, value in metadata.items()}
+        )
     pq.write_table(table, path)
 
 
@@ -94,13 +107,70 @@ def test_summary_reports_every_length_once(tmp_path: Path, capsys) -> None:
     _print_summary(rows)
     out = capsys.readouterr().out
 
-    assert "LEN" in out
-    assert "TOK/STEP" in out
-    assert "MAIN_TOK" in out
-    assert "MAIN+PR_ST" in out
-    assert out.count("  1024 ") == 1
-    assert out.count("  2048 ") == 1
-    assert "MAIN = code_only + commits_with_pr_docstring" in out
+    assert "bucket_len" in out
+    assert "tokens_per_step" in out
+    assert "main_trained_tokens" in out
+    assert "main_plus_standalone_pr_steps" in out
+    assert out.count("|       1024 |") == 1
+    assert out.count("|       2048 |") == 1
+    assert "steps = floor(trained_token_count / tokens_per_step)" in out
+    assert "main = code_only + commits_with_pr_docstring" in out
+
+    table_lines = [line for line in out.splitlines() if line.startswith(("+", "|"))]
+    assert len({len(line) for line in table_lines}) == 1
+
+
+def test_summary_handles_no_rows(capsys) -> None:
+    _print_summary([])
+    out = capsys.readouterr().out
+
+    assert "bucket_len" in out
+    assert "steps = floor(trained_token_count / tokens_per_step)" in out
+
+
+def test_report_can_filter_to_current_macro_route_shards(tmp_path: Path) -> None:
+    code = tmp_path / "code"
+    commits = tmp_path / "commits"
+    pr = tmp_path / "pr"
+    required = {
+        PACKED_ROW_MACRO_ROUTES_METADATA_KEY: PACKED_ROW_MACRO_ROUTES_VERSION,
+    }
+    _write_counter_parquet(
+        code / "1024" / "old.parquet",
+        [{"valid": 1000, "trained": 900, "docs": 2}],
+    )
+    _write_counter_parquet(
+        code / "1024" / "current.parquet",
+        [{"valid": 2000, "trained": 1800, "docs": 3}],
+        metadata=required,
+    )
+    _write_counter_parquet(
+        commits / "1024" / "wrong.parquet",
+        [{"valid": 4000, "trained": 3600, "docs": 4}],
+        metadata={PACKED_ROW_MACRO_ROUTES_METADATA_KEY: "old"},
+    )
+    _write_counter_parquet(
+        commits / "1024" / "current.parquet",
+        [{"valid": 5000, "trained": 4500, "docs": 5}],
+        metadata=required,
+    )
+
+    rows = build_report(
+        code_root=code,
+        commit_root=commits,
+        pr_root=pr,
+        batch_by_length={1024: 1},
+        max_workers=1,
+        allow_concurrent_skips=False,
+        required_metadata=required,
+    )
+    by_kind = {row.kind: row for row in rows}
+
+    assert by_kind["code_only"].trained_tokens == 1800
+    assert by_kind["code_only"].skipped_files == 1
+    assert by_kind["commits_with_pr_docstring"].trained_tokens == 4500
+    assert by_kind["commits_with_pr_docstring"].skipped_files == 1
+    assert by_kind["main_code_plus_commits"].trained_tokens == 6300
 
 
 def test_parse_batch_schedule_rejects_bad_items() -> None:

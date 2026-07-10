@@ -62,22 +62,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Sequence
 
-# Reuse the proven machinery from the code driver.
-import streaming_reindex as sr
-from streaming_reindex import (  # noqa: F401
-    MLX_ROOT,
-    VENV_PYTHON,
-    TARBALL,
-    TAR_MEMBER_ROOT,
-    RepoFailure,
-    Manifest,
-    run_checked,
-    stage_index_commits,
-    stage_materialize,
-    stage_pack,
-    _parquet_stats,
-    _subprocess_env,
-)
+# Reuse the proven machinery from the code driver.  Tests import this module as
+# ``scripts.streaming_reindex_commits`` while production launches it as a file;
+# support both without relying on ambient sys.path order.
+try:
+    from scripts import streaming_reindex as sr
+except ImportError:  # pragma: no cover - exercised by file-mode execution.
+    import streaming_reindex as sr
+
+MLX_ROOT = sr.MLX_ROOT
+VENV_PYTHON = sr.VENV_PYTHON
+TARBALL = sr.TARBALL
+TAR_MEMBER_ROOT = sr.TAR_MEMBER_ROOT
+RepoFailure = sr.RepoFailure
+Manifest = sr.Manifest
+run_checked = sr.run_checked
+stage_index_commits = sr.stage_index_commits
+stage_materialize = sr.stage_materialize
+stage_pack = sr.stage_pack
+_parquet_stats = sr._parquet_stats
+_subprocess_env = sr._subprocess_env
 
 EXTRACT_GIT = MLX_ROOT / "scripts" / "nanochat_data" / "extract_git_history.py"
 COMMIT_OUTPUT_ROOT = MLX_ROOT / "outputs" / "reindexed_commits"
@@ -337,6 +341,13 @@ def bucket_for(token_count: int, lengths_sorted: Sequence[int]) -> int | None:
     return None
 
 
+def release_arrow_unused() -> None:
+    """Return unused PyArrow buffers to the OS between long-lived repo stages."""
+    import pyarrow as pa
+
+    pa.default_memory_pool().release_unused()
+
+
 def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path) -> dict[int, Path]:
     """Split tok parquet rows into per-length parquet files by whole-doc token count.
 
@@ -390,6 +401,7 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     finally:
         for w in writers.values():
             w.close()
+        release_arrow_unused()
     if dropped_overlong:
         report = {
             "source": str(tok_parquet),
@@ -431,12 +443,28 @@ def read_dropped_overlong(route_dir: Path) -> dict[str, int]:
 
 
 def recompress_zstd_max(path: Path) -> None:
-    """Rewrite a parquet in place with MAX zstd compression (level 22)."""
+    """Rewrite a parquet in place with MAX zstd compression (level 22).
+
+    Keep this row-group streaming. Some code buckets are tens of millions of
+    sidecar-rich tokens; a whole-file ``pq.read_table`` here balloons the
+    long-lived conveyor parent RSS even when the packer itself is bounded.
+    """
     import pyarrow.parquet as pq
 
-    tbl = pq.read_table(str(path))
+    pf = pq.ParquetFile(str(path))
     tmp = path.with_suffix(".zstd.tmp.parquet")
-    pq.write_table(tbl, str(tmp), compression="zstd", compression_level=ZSTD_LEVEL)
+    writer = pq.ParquetWriter(
+        str(tmp),
+        pf.schema_arrow,
+        compression="zstd",
+        compression_level=ZSTD_LEVEL,
+    )
+    try:
+        for row_group_index in range(pf.num_row_groups):
+            writer.write_table(pf.read_row_group(row_group_index))
+    finally:
+        writer.close()
+        release_arrow_unused()
     tmp.replace(path)
 
 

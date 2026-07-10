@@ -240,7 +240,7 @@ class HybridTinyConfig:
     structure_vocab_size: int = 32
     structure_components: str = "core"
     structure_bottleneck_dim: int = 64
-    structure_num_categories: int = 9
+    structure_num_categories: int = 12
     structure_max_dep_level: int = 16
     structure_max_ast_depth: int = 64
     structure_max_sibling_index: int = 64

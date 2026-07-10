@@ -88,7 +88,7 @@ class DenseCppLMConfig:
     # Side-channel structure embedding (CppMegaStructureEmbedding).
     structure_components: str = "all"
     structure_bottleneck_dim: int = 128
-    structure_num_categories: int = 9
+    structure_num_categories: int = 12
     structure_max_dep_level: int = 64
     structure_max_ast_depth: int = 128
     structure_max_sibling_index: int = 128

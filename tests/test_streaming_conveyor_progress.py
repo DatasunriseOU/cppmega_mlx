@@ -667,6 +667,70 @@ def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
     assert cache_dir.exists()
 
 
+def test_process_one_repo_interrupted_keeps_extract_cache_without_temp(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "repo"
+    work_root = tmp_path / "work"
+    repo_work = work_root / repo
+    repo_dir = repo_work / "_src"
+    repo_dir.mkdir(parents=True)
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    cache_dir.mkdir(parents=True)
+    (cache_dir / f"{repo}_commits.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+
+    def fake_code_half(*_args, **_kwargs):
+        return {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=32, target_length=1024)},
+        }
+
+    def fake_commits_half(*_args, **_kwargs):
+        return 0, 0, False
+
+    monkeypatch.setattr(streaming_conveyor, "run_code_half_adaptive", fake_code_half)
+    monkeypatch.setattr(streaming_conveyor, "run_commits_half", fake_commits_half)
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    streaming_conveyor.STOP_EVENT.set()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            streaming_conveyor.process_one_repo(
+                repo=repo,
+                repo_dir=repo_dir,
+                lengths_code=(1024,),
+                lengths_commits=(1024,),
+                range_size=500,
+                range_target_bytes=0,
+                work_root=work_root,
+                work_parent=tmp_path / "parent",
+                pool=pool,
+                manifest=manifest,
+                manifest_lock=streaming_conveyor.threading.Lock(),
+                resume=True,
+                cumulative={"valid": 0},
+                keep_temp=False,
+                dedup_db=None,
+                dedup_near=False,
+                pr_store=None,
+                repo_list=None,
+                streams="both",
+                retain_partial_work=False,
+            )
+    finally:
+        streaming_conveyor.STOP_EVENT.clear()
+
+    assert not repo_work.exists()
+    assert cache_dir.exists()
+
+
 def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -874,6 +938,57 @@ def test_default_conveyor_work_parent_lives_under_outputs():
     assert "outputs/conveyor/tmp" in str(streaming_conveyor.DEFAULT_WORK_PARENT)
     assert args.retain_partial_work is False
     assert args.min_free_disk_gb == streaming_conveyor.DEFAULT_MIN_FREE_DISK_GB
+
+
+def test_output_root_args_rebase_runtime_paths(tmp_path):
+    import streaming_conveyor
+
+    old_code_root = streaming_conveyor.sr.OUTPUT_ROOT
+    old_commit_root = streaming_conveyor.src.COMMIT_OUTPUT_ROOT
+    old_conveyor_root = streaming_conveyor.CONVEYOR_ROOT
+    try:
+        args = streaming_conveyor.parse_args(
+            [
+                "--code-output-root",
+                str(tmp_path / "fresh_code"),
+                "--commit-output-root",
+                str(tmp_path / "fresh_commits"),
+                "--conveyor-root",
+                str(tmp_path / "fresh_conveyor"),
+            ]
+        )
+
+        streaming_conveyor.configure_runtime_paths_from_args(args)
+
+        assert streaming_conveyor.sr.OUTPUT_ROOT == tmp_path / "fresh_code"
+        assert streaming_conveyor.sr.MANIFEST_PATH == (
+            tmp_path / "fresh_code" / "_done.json"
+        )
+        assert streaming_conveyor.src.COMMIT_OUTPUT_ROOT == (
+            tmp_path / "fresh_commits"
+        )
+        assert streaming_conveyor.src.COMMIT_MANIFEST == (
+            tmp_path / "fresh_commits" / "_done.json"
+        )
+        assert streaming_conveyor.CONVEYOR_ROOT == tmp_path / "fresh_conveyor"
+        assert streaming_conveyor.CONVEYOR_MANIFEST == (
+            tmp_path / "fresh_conveyor" / "_done.json"
+        )
+        assert streaming_conveyor.EXTRACT_CACHE_ROOT == (
+            tmp_path / "fresh_conveyor" / "extract_cache"
+        )
+        assert Path(args.progress_jsonl) == tmp_path / "fresh_conveyor" / "progress.jsonl"
+        assert Path(args.run_lock_dir) == tmp_path / "fresh_conveyor" / "locks"
+        assert Path(args.work_parent_dir) == tmp_path / "fresh_conveyor" / "tmp"
+        assert Path(args.reservation_file) == (
+            tmp_path / "fresh_conveyor" / "_reservations.json"
+        )
+    finally:
+        streaming_conveyor.configure_output_roots(
+            code_output_root=old_code_root,
+            commit_output_root=old_commit_root,
+            conveyor_root=old_conveyor_root,
+        )
 
 
 def test_min_free_disk_guard_fails_loud_before_staging(tmp_path, monkeypatch):

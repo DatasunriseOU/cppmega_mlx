@@ -458,10 +458,12 @@ def _insert_domain_delimiters(
     domain: DomainKind,
     insert_at: int = 1,
 ) -> None:
+    if DomainKind(domain) == DomainKind.UNKNOWN:
+        return
     try:
         start_id, end_id = delimiter_token_ids(domain)
-    except KeyError:
-        return
+    except KeyError as exc:
+        raise ValueError(f"missing delimiter token contract for domain {domain!r}") from exc
     token_ids = list(row[TOKEN_IDS_COLUMN])
     if insert_at > len(token_ids):
         insert_at = len(token_ids)

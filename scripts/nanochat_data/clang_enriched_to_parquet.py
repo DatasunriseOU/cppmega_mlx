@@ -17,7 +17,9 @@ Usage:
 """
 
 import argparse
+from bisect import bisect_left
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -72,11 +74,13 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_SPANS_COLUMN,
     COMMIT_HASH_COLUMN,
     COMMIT_TIMESTAMP_COLUMN,
+    DOC_TYPE_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     FILEPATH_COLUMN,
     FILEPATH_STABLE_ID_COLUMN,
     FILE_LOCAL_COMMIT_INDEX_COLUMN,
     HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN,
+    HEADER_FRAGMENT_KIND_COLUMN,
     HAS_PR_DISCUSSION_COLUMN,
     HAS_RENAME_AMBIGUITY_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
@@ -136,6 +140,84 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "domain_source_doc_ids",
     "domain_confidence_ids",
 )
+_STATIC_DOC_TYPES = {"code", "code_header", "build"}
+
+
+def stable_repo_id(repo_name: str) -> str:
+    return hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:16]
+
+
+def stable_filepath_id(repo_name: str, filepath: str) -> str:
+    key = f"{repo_name}\0{filepath}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _has_value(value: object) -> bool:
+    return value is not None and value != ""
+
+
+def _is_static_code_record(record: dict) -> bool:
+    has_temporal_provenance = any(
+        _has_value(record.get(column))
+        for column in (
+            COMMIT_HASH_COLUMN,
+            FILE_LOCAL_COMMIT_INDEX_COLUMN,
+            AUTHOR_TIMESTAMP_COLUMN,
+            COMMIT_TIMESTAMP_COLUMN,
+            TIMESTAMP_COLUMN,
+        )
+    )
+    if has_temporal_provenance:
+        return False
+    doc_type = record.get(DOC_TYPE_COLUMN)
+    if doc_type in _STATIC_DOC_TYPES:
+        return True
+    if not _has_value(record.get(FILEPATH_COLUMN)):
+        return False
+    return True
+
+
+def _validate_static_provenance(record: dict) -> None:
+    if not _is_static_code_record(record):
+        return
+    if not _has_value(record.get(REPO_COLUMN)):
+        raise ValueError(
+            "missing static code repo provenance "
+            f"for filepath={record.get(FILEPATH_COLUMN)!r}"
+        )
+    if not _has_value(record.get(FILEPATH_COLUMN)):
+        raise ValueError(
+            "missing static code filepath provenance "
+            f"for repo={record.get(REPO_COLUMN)!r}"
+        )
+
+
+def _with_default_static_provenance(
+    record: dict,
+    *,
+    default_repo: str | None,
+) -> dict:
+    repo = record.get(REPO_COLUMN)
+    if not _has_value(repo) and default_repo:
+        record = dict(record)
+        record[REPO_COLUMN] = default_repo
+        repo = default_repo
+    if not _has_value(repo):
+        _validate_static_provenance(record)
+        return record
+
+    filepath = record.get(FILEPATH_COLUMN)
+    if not _has_value(record.get(REPO_STABLE_ID_COLUMN)):
+        record = dict(record)
+        record[REPO_STABLE_ID_COLUMN] = stable_repo_id(str(repo))
+    if _has_value(filepath) and not _has_value(record.get(FILEPATH_STABLE_ID_COLUMN)):
+        record = dict(record)
+        record[FILEPATH_STABLE_ID_COLUMN] = stable_filepath_id(
+            str(repo),
+            str(filepath),
+        )
+    _validate_static_provenance(record)
+    return record
 
 # ---------------------------------------------------------------------------
 # Platform header (default — enriched docs are already processed, no repo_dir)
@@ -189,22 +271,28 @@ _DEAD_PLATFORM_MARKERS = [
 ]
 
 
-def filter_dead_platforms(text: str) -> str:
-    """Remove dead-platform #ifdef blocks from C++ source text.
+def filter_dead_platforms_with_mapping(text: str) -> tuple[str, list[int] | None]:
+    """Remove dead-platform #ifdef blocks and return kept-char provenance.
 
-    Handles nested #ifdef/#endif correctly by tracking depth.
+    Returns ``(filtered_text, kept_indices)``.  ``kept_indices`` is ``None`` when
+    no filtering was applied; otherwise each filtered char maps back to its
+    original char offset.  Downstream sidecars use this to remap metadata instead
+    of zeroing graph routes for the whole document.
     """
     if not any(marker in text for marker in _DEAD_PLATFORM_MARKERS):
-        return text
+        return text, None
 
-    lines = text.split("\n")
-    result_lines = []
+    lines = text.splitlines(keepends=True)
+    result_parts: list[str] = []
+    kept_indices: list[int] = []
     skip_depth = 0
-    overall_depth = 0
+    offset = 0
 
     i = 0
     while i < len(lines):
         line = lines[i]
+        line_start = offset
+        offset += len(line)
         stripped = line.strip()
 
         if skip_depth == 0:
@@ -219,16 +307,11 @@ def filter_dead_platforms(text: str) -> str:
 
             if is_dead:
                 skip_depth = 1
-                overall_depth += 1
                 i += 1
                 continue
 
-            if re.match(r'^\s*#\s*(?:ifdef|ifndef|if)\b', stripped):
-                overall_depth += 1
-            elif re.match(r'^\s*#\s*endif\b', stripped):
-                overall_depth = max(0, overall_depth - 1)
-
-            result_lines.append(line)
+            result_parts.append(line)
+            kept_indices.extend(range(line_start, line_start + len(line)))
         else:
             if re.match(r'^\s*#\s*(?:ifdef|ifndef|if)\b', stripped):
                 skip_depth += 1
@@ -240,7 +323,15 @@ def filter_dead_platforms(text: str) -> str:
 
         i += 1
 
-    return "\n".join(result_lines)
+    filtered = "".join(result_parts)
+    if len(kept_indices) == len(text):
+        return filtered, None
+    return filtered, kept_indices
+
+
+def filter_dead_platforms(text: str) -> str:
+    """Remove dead-platform #ifdef blocks from C++ source text."""
+    return filter_dead_platforms_with_mapping(text)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +379,8 @@ _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
     pa.field("source_text", pa.string()),
     pa.field("source_doc_id", pa.string()),
+    pa.field(DOC_TYPE_COLUMN, pa.string()),
+    pa.field(HEADER_FRAGMENT_KIND_COLUMN, pa.string()),
     pa.field("tokenizer_fingerprint", pa.string()),
     pa.field("actual_token_count", pa.int32()),
     pa.field("structure_ids", pa.list_(pa.int8())),
@@ -460,6 +553,8 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     texts = []
     source_texts = []
     source_doc_ids = []
+    doc_types = []
+    header_fragment_kinds = []
     tokenizer_fingerprints = []
     token_counts = []
     structure_ids_col = []
@@ -556,6 +651,14 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         raw_source_doc_id = row.get("source_doc_id")
         source_doc_ids.append(
             None if raw_source_doc_id is None else str(raw_source_doc_id)
+        )
+        raw_doc_type = row.get(DOC_TYPE_COLUMN)
+        doc_types.append(None if raw_doc_type is None else str(raw_doc_type))
+        raw_header_fragment_kind = row.get(HEADER_FRAGMENT_KIND_COLUMN)
+        header_fragment_kinds.append(
+            None
+            if raw_header_fragment_kind is None
+            else str(raw_header_fragment_kind)
         )
         raw_tokenizer_fingerprint = row.get("tokenizer_fingerprint")
         tokenizer_fingerprints.append(
@@ -758,6 +861,13 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             ),
             "source_doc_id": pa.array(
                 source_doc_ids, type=_SCHEMA.field("source_doc_id").type
+            ),
+            DOC_TYPE_COLUMN: pa.array(
+                doc_types, type=_SCHEMA.field(DOC_TYPE_COLUMN).type
+            ),
+            HEADER_FRAGMENT_KIND_COLUMN: pa.array(
+                header_fragment_kinds,
+                type=_SCHEMA.field(HEADER_FRAGMENT_KIND_COLUMN).type,
             ),
             "tokenizer_fingerprint": pa.array(
                 tokenizer_fingerprints,
@@ -1089,7 +1199,127 @@ def _align_optional_char_metadata(values: list, text_len: int) -> list[int]:
     """Return per-char metadata aligned to `text_len`, preserving absence."""
     if not values:
         return []
-    return _align_structure_ids(values, text_len)
+    if len(values) != text_len:
+        raise ValueError(
+            f"optional char metadata length {len(values)} does not match text length {text_len}"
+        )
+    return [int(v) for v in values]
+
+
+def _remap_structure_ids(values: list, kept_indices: list[int], original_text_len: int) -> list[int]:
+    aligned = _align_structure_ids(values, original_text_len)
+    return [aligned[i] if 0 <= i < len(aligned) else 0 for i in kept_indices]
+
+
+def _remap_optional_char_metadata(
+    values: list,
+    kept_indices: list[int],
+    original_text_len: int,
+) -> list[int]:
+    aligned = _align_optional_char_metadata(values, original_text_len)
+    if not aligned:
+        return []
+    return [aligned[i] if 0 <= i < len(aligned) else 0 for i in kept_indices]
+
+
+def _remap_chunk_boundaries(
+    chunk_boundaries: list,
+    kept_indices: list[int],
+) -> tuple[list[dict], dict[int, int]]:
+    remapped: list[dict] = []
+    old_to_new: dict[int, int] = {}
+    if not kept_indices:
+        return remapped, old_to_new
+
+    for old_idx, cb in enumerate(chunk_boundaries or []):
+        if not isinstance(cb, dict):
+            continue
+        start = max(0, int(cb.get("start", 0)))
+        end = max(start, int(cb.get("end", start)))
+        new_start = bisect_left(kept_indices, start)
+        new_end = bisect_left(kept_indices, end)
+        if new_start >= new_end:
+            continue
+        old_to_new[old_idx] = len(remapped)
+        remapped.append(
+            {
+                "start": new_start,
+                "end": new_end,
+                "kind": cb.get("kind", 0),
+                "dep_level": cb.get("dep_level", 0),
+                "name": cb.get("name", ""),
+            }
+        )
+    return remapped, old_to_new
+
+
+def _remap_chunk_edges(raw_edges: list, old_to_new_chunk: dict[int, int]) -> list[dict]:
+    remapped: list[dict] = []
+    for edge in raw_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        old_from = int(edge.get("from", -1))
+        old_to = int(edge.get("to", -1))
+        if old_from not in old_to_new_chunk or old_to not in old_to_new_chunk:
+            continue
+        remapped.append(
+            {
+                "from": old_to_new_chunk[old_from],
+                "to": old_to_new_chunk[old_to],
+            }
+        )
+    return remapped
+
+
+def _map_exact_kept_char(kept_indices: list[int], original_offset: int) -> int | None:
+    pos = bisect_left(kept_indices, original_offset)
+    if pos < len(kept_indices) and kept_indices[pos] == original_offset:
+        return pos
+    return None
+
+
+def _shift_char_edge_triples(raw_edges: list, header_len: int) -> list[dict]:
+    shifted = []
+    for edge in raw_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        shifted.append(
+            {
+                "from_char": int(edge.get("from_char", edge.get("from", 0))) + header_len,
+                "to_char": int(edge.get("to_char", edge.get("to", 0))) + header_len,
+                "kind": int(edge.get("kind", 0)),
+            }
+        )
+    return shifted
+
+
+def _remap_char_edge_triples(
+    raw_edges: list,
+    kept_indices: list[int],
+    header_len: int,
+) -> list[dict]:
+    remapped = []
+    for edge in raw_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        mapped_from = _map_exact_kept_char(
+            kept_indices,
+            int(edge.get("from_char", edge.get("from", -1))),
+        )
+        mapped_to = _map_exact_kept_char(
+            kept_indices,
+            int(edge.get("to_char", edge.get("to", -1))),
+        )
+        if mapped_from is None or mapped_to is None:
+            continue
+        remapped.append(
+            {
+                "from_char": mapped_from + header_len,
+                "to_char": mapped_to + header_len,
+                "kind": int(edge.get("kind", 0)),
+            }
+        )
+    return remapped
 
 
 def process_record(record: dict, tokenizer, max_tokens: int) -> list:
@@ -1121,8 +1351,8 @@ def process_record_with_policy(
     chunk_boundaries = record.get("chunk_boundaries", [])
 
     # 1. Dead-platform filter
-    filtered_text = filter_dead_platforms(text)
-    metadata_stale = filtered_text != text
+    filtered_text, kept_indices = filter_dead_platforms_with_mapping(text)
+    metadata_stale = kept_indices is not None
 
     # 2. Prepend metadata headers; adjust structure_ids + chunk offsets
     language_prefix = language_info_to_prefix(record.get("language_info"))
@@ -1130,16 +1360,32 @@ def process_record_with_policy(
     header_len = len(header_prefix)
     full_text = header_prefix + filtered_text
     if metadata_stale:
-        filtered_structure_ids = [0] * len(filtered_text)
-        filtered_chunk_boundaries = []
-        filtered_call_edges = []
-        filtered_type_edges = []
+        filtered_structure_ids = _remap_structure_ids(
+            structure_ids,
+            kept_indices,
+            len(text),
+        )
+        filtered_chunk_boundaries, old_to_new_chunk = _remap_chunk_boundaries(
+            chunk_boundaries,
+            kept_indices,
+        )
+        filtered_call_edges = _remap_chunk_edges(
+            record.get("call_edges", []),
+            old_to_new_chunk,
+        )
+        filtered_type_edges = _remap_chunk_edges(
+            record.get("type_edges", []),
+            old_to_new_chunk,
+        )
         filtered_domain_edge_fields = {
-            "domain_edges": [],
-            "build_edges": [],
-            "shell_edges": [],
-            "diagnostic_edges": [],
-            "cross_domain_edges": [],
+            name: _remap_char_edge_triples(record.get(name, []), kept_indices, header_len)
+            for name in (
+                "domain_edges",
+                "build_edges",
+                "shell_edges",
+                "diagnostic_edges",
+                "cross_domain_edges",
+            )
         }
     else:
         filtered_structure_ids = _align_structure_ids(structure_ids, len(filtered_text))
@@ -1147,22 +1393,8 @@ def process_record_with_policy(
         filtered_call_edges = record.get("call_edges", [])
         filtered_type_edges = record.get("type_edges", [])
 
-        def _shift_char_edge_triples(raw_edges):
-            shifted = []
-            for edge in raw_edges or []:
-                if not isinstance(edge, dict):
-                    continue
-                shifted.append(
-                    {
-                        "from_char": int(edge.get("from_char", edge.get("from", 0))) + header_len,
-                        "to_char": int(edge.get("to_char", edge.get("to", 0))) + header_len,
-                        "kind": int(edge.get("kind", 0)),
-                    }
-                )
-            return shifted
-
         filtered_domain_edge_fields = {
-            name: _shift_char_edge_triples(record.get(name, []))
+            name: _shift_char_edge_triples(record.get(name, []), header_len)
             for name in (
                 "domain_edges",
                 "build_edges",
@@ -1177,7 +1409,8 @@ def process_record_with_policy(
     for key in _CHAR_LEVEL_METADATA_FIELDS:
         values = record.get(key, [])
         if metadata_stale:
-            char_metadata[key] = [0] * len(full_text) if values else []
+            remapped = _remap_optional_char_metadata(values, kept_indices, len(text))
+            char_metadata[key] = [0] * header_len + remapped if remapped else []
         else:
             aligned = _align_optional_char_metadata(values, len(filtered_text))
             char_metadata[key] = [0] * header_len + aligned if aligned else []
@@ -1247,6 +1480,7 @@ def convert_local_jsonl_to_parquet(
     materialize_tokenized_enriched: bool = False,
     local_batch_size: int = 512,
     memory_limit_gb: float = 10.0,
+    default_repo: str | None = None,
 ) -> dict[str, int]:
     """Convert a local clang JSONL/JSONL.GZ file into one parquet file."""
     if overflow_policy not in _OVERFLOW_POLICIES:
@@ -1291,7 +1525,10 @@ def convert_local_jsonl_to_parquet(
                 line = line.strip()
                 if not line:
                     continue
-                record = json.loads(line)
+                record = _with_default_static_provenance(
+                    json.loads(line),
+                    default_repo=default_repo,
+                )
                 docs_in += 1
                 sub_docs = process_record_with_policy(
                     record,
@@ -1386,7 +1623,10 @@ def process_input_file(gcs_uri: str, tmpdir: str,
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                record = _with_default_static_provenance(
+                    json.loads(line),
+                    default_repo=None,
+                )
             except json.JSONDecodeError as e:
                 log.warning("JSON decode error in %s: %s", fname, e)
                 continue
@@ -1585,6 +1825,14 @@ def main():
         default=10.0,
         help="Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).",
     )
+    parser.add_argument(
+        "--default-repo",
+        default="",
+        help=(
+            "Backfill repo/repo_stable_id/filepath_stable_id for local static-code "
+            "JSONL rows that do not carry repo provenance."
+        ),
+    )
     args = parser.parse_args()
     start_memory_guard(args.memory_limit_gb, label="clang_enriched_to_parquet")
 
@@ -1623,6 +1871,7 @@ def main():
             materialize_tokenized_enriched=args.materialize_tokenized_enriched,
             local_batch_size=args.local_batch_size,
             memory_limit_gb=args.memory_limit_gb,
+            default_repo=args.default_repo or None,
         )
         log.info(
             "Done. Local convert: %d docs in -> %d docs out.",

@@ -96,6 +96,9 @@ CHANGED_CHUNK_SPANS_COLUMN = "changed_chunk_spans"
 HUNK_ID_PER_TOKEN_COLUMN = "hunk_id_per_token"
 EDIT_OP_PER_TOKEN_COLUMN = "edit_op_per_token"
 
+DOC_TYPE_COLUMN = "doc_type"
+HEADER_FRAGMENT_KIND_COLUMN = "header_fragment_kind"
+
 REPO_COLUMN = "repo"
 FILEPATH_COLUMN = "filepath"
 COMMIT_HASH_COLUMN = "commit_hash"
@@ -351,6 +354,8 @@ __all__ = [
     "CHANGED_CHUNK_SPANS_COLUMN",
     "HUNK_ID_PER_TOKEN_COLUMN",
     "EDIT_OP_PER_TOKEN_COLUMN",
+    "DOC_TYPE_COLUMN",
+    "HEADER_FRAGMENT_KIND_COLUMN",
     "REPO_COLUMN",
     "FILEPATH_COLUMN",
     "COMMIT_HASH_COLUMN",
