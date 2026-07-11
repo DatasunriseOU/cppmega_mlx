@@ -68,7 +68,7 @@ from concurrent.futures import (
     wait,
 )
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterable, Sequence
 
 # Reuse the proven machinery. streaming_reindex_commits already re-exports the
 # shared primitives from streaming_reindex (MLX_ROOT, Manifest, RepoFailure, ...)
@@ -1362,16 +1362,40 @@ def run_code_half(
     stage_db = sr.code_stage_db(work_root / repo, repo) if dedup_db is not None else None
     promoted = False
     try:
-        info = sr.process_one_repo(
-            repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
-            global_symbol_index, memory_limit_gb, parse_workers, index_timeout_s,
-            index_stall_timeout_s,
-            promote_dedup_on_success=False,
-        )
+        try:
+            info = sr.process_one_repo(
+                repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
+                global_symbol_index, memory_limit_gb, parse_workers, index_timeout_s,
+                index_stall_timeout_s,
+                promote_dedup_on_success=False,
+            )
+        except RepoFailure as exc:
+            if is_no_trainable_source_failure(exc):
+                promoted = True
+                return {
+                    "source": "code",
+                    "repo": repo,
+                    "skipped": True,
+                    "skip_reason": "no_trainable_source",
+                    "lengths": {},
+                    "stage_timings_s": {},
+                    "detail": exc.detail,
+                }
+            raise
         if info.get("skipped"):
             return info
-        # zstd-max the per-length code parquet files this repo just wrote.
         timings = dict(info.get("stage_timings_s", {}))
+        try:
+            timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
+        except Exception as exc:
+            remove_code_outputs(repo, info.get("lengths", {}).keys())
+            raise RepoFailure(
+                repo,
+                "dedup_promote",
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
+        promoted = True
+        # zstd-max the per-length code parquet files this repo just wrote.
         started = time.monotonic()
         deferred = 0
         for L in info.get("lengths", {}):
@@ -1385,9 +1409,7 @@ def run_code_half(
         timings["recompress_s"] = round(time.monotonic() - started, 6)
         if deferred:
             timings["recompress_deferred"] = float(deferred)
-        timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
         info["stage_timings_s"] = timings
-        promoted = True
         return info
     finally:
         if not promoted:
@@ -1411,6 +1433,20 @@ CodeRunner = Callable[
     ],
     dict,
 ]
+
+
+def remove_code_outputs(repo: str, lengths: Iterable[str | int]) -> None:
+    for length in lengths:
+        dest = sr.OUTPUT_ROOT / str(length) / f"{repo}.parquet"
+        if dest.exists():
+            dest.unlink()
+
+
+def is_no_trainable_source_failure(exc: RepoFailure) -> bool:
+    return (
+        exc.stage == "index_project"
+        and "no training docs (no_trainable_source)" in exc.detail.lower()
+    )
 
 
 def is_retryable_index_project_failure(exc: RepoFailure) -> bool:
@@ -2303,33 +2339,50 @@ def process_one_repo(
                             code_index_stall_timeout_s,
                             recompressor=code_recompressor,
                         )
-                        with manifest_lock:
-                            manifest.mark_done(ck, cinfo)
-                        totals = _length_totals(cinfo)
-                        with manifest_lock:
-                            cumulative["valid"] += totals["valid_tokens"]
-                            cumulative_valid = cumulative["valid"]
-                        if progress is not None:
-                            progress.emit(
-                                "unit_done",
-                                stream="code",
-                                repo=repo,
-                                unit=ck,
-                                rows=totals["rows"],
-                                valid_tokens=totals["valid_tokens"],
-                                capacity_tokens=totals["capacity_tokens"],
-                                **_primary_bucket_progress(cinfo, lengths_code),
-                                lengths=cinfo.get("lengths", {}),
-                                stage_timings_s=cinfo.get("stage_timings_s", {}),
-                                cumulative_valid_tokens=cumulative_valid,
+                        if cinfo.get("skipped"):
+                            with manifest_lock:
+                                manifest.mark_done(ck, cinfo)
+                            if progress is not None:
+                                progress.emit(
+                                    "unit_skipped",
+                                    stream="code",
+                                    repo=repo,
+                                    unit=ck,
+                                    reason=cinfo.get("skip_reason", "skipped"),
+                                    detail=str(cinfo.get("detail", ""))[:2000],
+                                )
+                            result["code"] = cinfo
+                            _log(
+                                f"SKIP {ck}: {cinfo.get('skip_reason', 'skipped')}"
                             )
-                        if checkpoint is not None:
-                            checkpoint.maybe_checkpoint(cumulative_valid)
-                        result["code"] = cinfo
-                        _log(
-                            f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
-                            f"(cum_all={cumulative['valid']})"
-                        )
+                        else:
+                            with manifest_lock:
+                                manifest.mark_done(ck, cinfo)
+                            totals = _length_totals(cinfo)
+                            with manifest_lock:
+                                cumulative["valid"] += totals["valid_tokens"]
+                                cumulative_valid = cumulative["valid"]
+                            if progress is not None:
+                                progress.emit(
+                                    "unit_done",
+                                    stream="code",
+                                    repo=repo,
+                                    unit=ck,
+                                    rows=totals["rows"],
+                                    valid_tokens=totals["valid_tokens"],
+                                    capacity_tokens=totals["capacity_tokens"],
+                                    **_primary_bucket_progress(cinfo, lengths_code),
+                                    lengths=cinfo.get("lengths", {}),
+                                    stage_timings_s=cinfo.get("stage_timings_s", {}),
+                                    cumulative_valid_tokens=cumulative_valid,
+                                )
+                            if checkpoint is not None:
+                                checkpoint.maybe_checkpoint(cumulative_valid)
+                            result["code"] = cinfo
+                            _log(
+                                f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
+                                f"(cum_all={cumulative['valid']})"
+                            )
                 except RepoFailure as exc:
                     _log(f"FAIL {ck}: {exc}")
                     with manifest_lock:

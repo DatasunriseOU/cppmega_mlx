@@ -465,6 +465,73 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path)
     assert info["lengths"]["1024"]["valid_tokens"] == 1024
 
 
+def test_run_code_half_removes_outputs_when_dedup_promote_fails(tmp_path, monkeypatch):
+    import streaming_conveyor
+
+    repo = "repo"
+    output_root = tmp_path / "out"
+    dest = output_root / "1024" / f"{repo}.parquet"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"partial parquet already appended")
+    monkeypatch.setattr(streaming_conveyor.sr, "OUTPUT_ROOT", output_root)
+
+    def fake_process_one_repo(*_args, **_kwargs):
+        return {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=1024, target_length=1024)},
+            "stage_timings_s": {},
+        }
+
+    def fail_promote(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(streaming_conveyor.sr, "process_one_repo", fake_process_one_repo)
+    monkeypatch.setattr(streaming_conveyor.sr, "promote_dedup_stage", fail_promote)
+
+    try:
+        streaming_conveyor.run_code_half(
+            repo,
+            tmp_path / "src",
+            (1024,),
+            tmp_path / "work",
+            tmp_path / "dedup.sqlite",
+            True,
+        )
+    except streaming_conveyor.RepoFailure as exc:
+        assert exc.stage == "dedup_promote"
+        assert "OperationalError" in exc.detail
+    else:
+        raise AssertionError("run_code_half should fail when dedup promote fails")
+
+    assert not dest.exists()
+
+
+def test_run_code_half_skips_no_trainable_source(tmp_path, monkeypatch):
+    import streaming_conveyor
+
+    def no_trainable_source(*_args, **_kwargs):
+        raise streaming_conveyor.RepoFailure(
+            "repo",
+            "index_project",
+            "no training docs (no_trainable_source): empty enriched jsonl",
+        )
+
+    monkeypatch.setattr(streaming_conveyor.sr, "process_one_repo", no_trainable_source)
+
+    info = streaming_conveyor.run_code_half(
+        "repo",
+        tmp_path / "src",
+        (1024,),
+        tmp_path / "work",
+        tmp_path / "dedup.sqlite",
+        True,
+    )
+
+    assert info["skipped"] is True
+    assert info["skip_reason"] == "no_trainable_source"
+    assert info["lengths"] == {}
+
+
 def test_failed_code_unit_was_index_memory_reads_manifest_receipt(tmp_path):
     import streaming_conveyor
 

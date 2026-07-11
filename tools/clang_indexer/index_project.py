@@ -3382,6 +3382,7 @@ def register_header_macros(
     include_dirs: list[str] | None = None,
     max_include_depth: int | None = None,
     max_include_files_per_root: int | None = None,
+    memory_limit_gb: float | None = None,
 ) -> dict[str, int]:
     sequence = [0]
     directive_cache: dict[str, list[dict[str, object]]] = {}
@@ -3406,6 +3407,10 @@ def register_header_macros(
         raise ValueError(
             f"max_include_files_per_root must be >= 0, got {max_include_files_per_root}"
         )
+
+    def _check_memory() -> None:
+        if memory_limit_gb is not None and memory_limit_gb > 0:
+            check_memory_limit(memory_limit_gb, label="index_project macro scan")
 
     def _rel(path: str) -> str:
         return (
@@ -3517,6 +3522,7 @@ def register_header_macros(
     def _scan_root(root_abs: str, root_rel: str) -> None:
         stats["roots"] += 1
         if stats["roots"] == 1 or stats["roots"] % 250 == 0:
+            _check_memory()
             print(
                 "  Macro scan heartbeat: "
                 f"roots={stats['roots']} scanned_files={stats['scanned_files']} "
@@ -3638,6 +3644,8 @@ def register_header_macros(
                 return
             visited_files.add(norm_abs)
             stats["scanned_files"] += 1
+            if stats["scanned_files"] % 500 == 0:
+                _check_memory()
             include_stack.add(norm_abs)
             try:
                 for event in _directive_events(norm_abs):
@@ -3809,6 +3817,57 @@ def register_header_macros(
         _scan_root(os.path.normpath(abs_path), rel)
 
     return dict(stats)
+
+
+def select_macro_scan_files(
+    cpp_files: list[str],
+    index: ProjectIndex,
+    header_files: list[str],
+    *,
+    project_dir: str | None,
+) -> list[str]:
+    """Return macro roots that can contribute to emitted training documents.
+
+    Full macro routing needs source-file visibility, but scanning every file in
+    an archive dump also records millions of duplicate visible definitions for
+    files that never emit docs. Keep files with indexed functions/types; their
+    include traversal still reaches macro/type headers that are actually visible
+    to trainable code. Skip no-signal sources and no-signal headers as roots.
+    """
+    known_by_rel: dict[str, str] = {}
+    for path in cpp_files:
+        rel = (
+            os.path.relpath(path, project_dir)
+            if project_dir is not None and os.path.isabs(path)
+            else path
+        )
+        known_by_rel[os.path.normpath(rel)] = path
+
+    selected: dict[str, str] = {}
+
+    def add_path(path_or_rel: str) -> None:
+        rel = (
+            os.path.relpath(path_or_rel, project_dir)
+            if project_dir is not None and os.path.isabs(path_or_rel)
+            else path_or_rel
+        )
+        rel = os.path.normpath(rel)
+        path = known_by_rel.get(rel)
+        if path is None:
+            path = (
+                os.path.join(project_dir, rel)
+                if project_dir is not None and not os.path.isabs(rel)
+                else rel
+            )
+        selected[rel] = path
+
+    for rel in index.file_functions:
+        add_path(rel)
+    for td in index.typedefs.values():
+        if td.file:
+            add_path(td.file)
+
+    return [selected[rel] for rel in sorted(selected)]
 
 
 def _select_visible_macro(
@@ -4381,6 +4440,7 @@ def build_training_documents(
     header_files: list[str] | None = None,
     macro_scan_files: list[str] | None = None,
     emit_doc: Callable[[str | dict[str, object]], None] | None = None,
+    memory_limit_gb: float | None = None,
 ) -> list:
     """Build training documents with bottom-up dependency ordering.
 
@@ -4420,6 +4480,7 @@ def build_training_documents(
                 compile_db=compile_db,
                 default_args=default_args,
             ),
+            memory_limit_gb=memory_limit_gb,
         )
         print(
             "  Macro scan: "
@@ -5036,6 +5097,18 @@ def process_project(
             path for path in cpp_files
             if os.path.splitext(path)[1].lower() in HEADER_EXTENSIONS
         ]
+        macro_scan_files = select_macro_scan_files(
+            cpp_files,
+            index_obj,
+            header_files,
+            project_dir=project_dir,
+        )
+        print(
+            "  Macro scan roots selected: "
+            f"{len(macro_scan_files)}/{len(cpp_files)} C/C++ files "
+            "(function/type/header roots)",
+            file=sys.stderr,
+        )
         documents = build_training_documents(
             index_obj,
             max_tokens,
@@ -5052,8 +5125,9 @@ def process_project(
             dedup_near=dedup_near,
             global_symbols=global_symbols,
             header_files=header_files,
-            macro_scan_files=cpp_files,
+            macro_scan_files=macro_scan_files,
             emit_doc=_emit_counted if emit_doc is not None else None,
+            memory_limit_gb=memory_limit_gb,
         )
     check_memory_limit(memory_limit_gb, label="index_project")
     code_doc_count = emitted_docs if emit_doc is not None else len(documents)
