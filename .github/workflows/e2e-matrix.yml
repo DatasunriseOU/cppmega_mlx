@@ -27,11 +27,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # On every push/PR: smoke matrix (912 cells, ubuntu, no real MLX
-  # training — backend just verifies). Quick gate, ~10 min.
+  # On every push/PR: smoke matrix (912 cells). The backend imports MLX, so
+  # this runs on the repository's persistent Apple Silicon runner.
   preset-matrix:
-    name: Preset matrix (smoke, ubuntu)
-    runs-on: ubuntu-latest
+    name: Preset matrix (smoke, self-hosted macOS)
+    runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -44,16 +44,19 @@ jobs:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: vbgui/package-lock.json
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
+      - name: Bind repository MLX Python
+        run: |
+          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          test -x "$python_bin"
+          echo "VBGUI_E2E_PYTHON=$python_bin" >> "$GITHUB_ENV"
       - name: Python deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[gui,parquet,widget]"
-          pip install jsonschema pyarrow tokenizers anywidget
+          "$VBGUI_E2E_PYTHON" -m pip install --upgrade pip
+          "$VBGUI_E2E_PYTHON" -m pip install -e ".[gui,parquet,widget]"
+          "$VBGUI_E2E_PYTHON" -m pip install jsonschema pyarrow tokenizers anywidget
       - name: Generate fixtures
-        run: python tests/fixtures/build_e2e_matrix.py
+        run: |
+          "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - name: Vbgui install + typecheck
         working-directory: vbgui
         env:
@@ -63,7 +66,7 @@ jobs:
           npm run typecheck
       - name: Playwright browsers
         working-directory: vbgui
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - name: Run preset matrix shard ${{ matrix.shard }}/4
         working-directory: vbgui
         env:
@@ -87,27 +90,31 @@ jobs:
   # Specialised + canvas smoke scenarios — run on every push (lightweight).
   specialised:
     name: Specialised + canvas smoke
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: "npm",
                 cache-dependency-path: vbgui/package-lock.json }
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - name: Bind repository MLX Python
+        run: |
+          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          test -x "$python_bin"
+          echo "VBGUI_E2E_PYTHON=$python_bin" >> "$GITHUB_ENV"
       - run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[gui,parquet,widget]"
-          pip install jsonschema pyarrow tokenizers anywidget
-      - run: python tests/fixtures/build_e2e_matrix.py
+          "$VBGUI_E2E_PYTHON" -m pip install --upgrade pip
+          "$VBGUI_E2E_PYTHON" -m pip install -e ".[gui,parquet,widget]"
+          "$VBGUI_E2E_PYTHON" -m pip install jsonschema pyarrow tokenizers anywidget
+      - run: |
+          "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
         env: { NODE_ENV: development }
         run: |
           npm ci
           npm run typecheck
       - working-directory: vbgui
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - working-directory: vbgui
         env: { NODE_ENV: development, CI: "1" }
         run: |
@@ -131,27 +138,31 @@ jobs:
   mini-train-matrix:
     name: Mini-train matrix (macOS, nightly)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: "npm",
                 cache-dependency-path: vbgui/package-lock.json }
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - name: Bind repository MLX Python
+        run: |
+          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          test -x "$python_bin"
+          echo "VBGUI_E2E_PYTHON=$python_bin" >> "$GITHUB_ENV"
       - run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[gui,parquet,widget]"
-          pip install jsonschema pyarrow tokenizers anywidget mlx mlx-lm
-      - run: python tests/fixtures/build_e2e_matrix.py
+          "$VBGUI_E2E_PYTHON" -m pip install --upgrade pip
+          "$VBGUI_E2E_PYTHON" -m pip install -e ".[gui,parquet,widget]"
+          "$VBGUI_E2E_PYTHON" -m pip install jsonschema pyarrow tokenizers anywidget mlx mlx-lm
+      - run: |
+          "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
         env: { NODE_ENV: development }
         run: |
           npm ci
           npm run typecheck
       - working-directory: vbgui
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - working-directory: vbgui
         env: { NODE_ENV: development, CI: "1" }
         run: |
@@ -172,7 +183,7 @@ jobs:
   matrix-report:
     name: Matrix report
     needs: [preset-matrix, specialised]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     if: always()
     steps:
       - uses: actions/checkout@v4

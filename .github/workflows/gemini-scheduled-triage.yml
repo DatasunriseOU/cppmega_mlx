@@ -27,7 +27,7 @@ defaults:
 
 jobs:
   triage:
-    runs-on: 'ubuntu-latest'
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     timeout-minutes: 7
     permissions:
       contents: 'read'
@@ -136,7 +136,7 @@ jobs:
           prompt: '/gemini-scheduled-triage'
 
   label:
-    runs-on: 'ubuntu-latest'
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     needs:
       - 'triage'
     if: |-

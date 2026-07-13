@@ -36,7 +36,8 @@ jobs:
             tests/test_pack_enriched_rows.py \
             tests/test_streaming_conveyor_progress.py \
             tests/test_process_commits_fail_loud.py \
-            tests/test_repair_packed_document_boundaries.py
+            tests/test_repair_packed_document_boundaries.py \
+            tests/test_workflow_runner_policy.py
           git diff --check
 
   linux-portable:
@@ -62,6 +63,7 @@ jobs:
             tests/test_data_package_imports.py \
             tests/test_streaming_conveyor_progress.py \
             tests/test_process_commits_fail_loud.py \
-            tests/test_repair_packed_document_boundaries.py
+            tests/test_repair_packed_document_boundaries.py \
+            tests/test_workflow_runner_policy.py
           python -m compileall -q scripts tools/clang_indexer
           git diff --check
