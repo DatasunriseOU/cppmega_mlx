@@ -18,6 +18,10 @@ def test_native_build_dependencies_are_declared() -> None:
     assert "mlx==0.32.0" in requirements
     assert any(requirement.startswith("nanobind>=") for requirement in requirements)
     assert "mlx==0.32.0" in pyproject["project"]["dependencies"]
+    assert "z3-solver>=4.15" in pyproject["project"]["dependencies"]
+    assert "python-multipart>=0.0.20" in pyproject["project"][
+        "optional-dependencies"
+    ]["gui"]
 
 
 def test_native_build_pins_cmake_to_invoking_python(monkeypatch) -> None:
