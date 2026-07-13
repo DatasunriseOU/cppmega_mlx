@@ -9,6 +9,7 @@ import sys
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 
 def _load_audit_module():
@@ -111,6 +112,19 @@ def _run_audit(tmp_path, code_root, commit_root, pr_root, *, extra_args=()):
     if report_path.exists():
         report = json.loads(report_path.read_text())
     return proc, report
+
+
+def test_sidecar_audit_requires_all_source_roots_explicitly(capsys):
+    audit = _load_audit_module()
+
+    with pytest.raises(SystemExit) as exc:
+        audit.build_arg_parser().parse_args([])
+
+    assert exc.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "--code-root" in stderr
+    assert "--commit-root" in stderr
+    assert "--pr-root" in stderr
 
 
 def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):

@@ -12,22 +12,80 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
+from types import ModuleType
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+def _load_schema_contracts():
+    """Load dependency-free data contracts without importing the MLX data package."""
 
-from cppmega_mlx.data.domain_schema import DomainKind, DomainRoleKind, ParseConfidence
-from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+    import cppmega_mlx
+
+    data_dir = REPO_ROOT / "cppmega_mlx" / "data"
+
+    def load(name: str, path: Path) -> ModuleType:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load schema contract: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    tokenizer = load(
+        "_cppmega_audit_tokenizer_contract", data_dir / "tokenizer_contract.py"
+    )
+    data_name = "cppmega_mlx.data"
+    tokenizer_name = f"{data_name}.tokenizer_contract"
+    missing = object()
+    previous_data = sys.modules.get(data_name, missing)
+    previous_tokenizer = sys.modules.get(tokenizer_name, missing)
+    previous_data_attr = cppmega_mlx.__dict__.get("data", missing)
+    lightweight_data = ModuleType(data_name)
+    lightweight_data.__path__ = [str(data_dir)]
+    lightweight_data.__package__ = "cppmega_mlx"
+    try:
+        sys.modules[data_name] = lightweight_data
+        sys.modules[tokenizer_name] = tokenizer
+        cppmega_mlx.data = lightweight_data
+        domain = load("_cppmega_audit_domain_schema", data_dir / "domain_schema.py")
+    finally:
+        for name, previous in (
+            (tokenizer_name, previous_tokenizer),
+            (data_name, previous_data),
+        ):
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        if previous_data_attr is missing:
+            cppmega_mlx.__dict__.pop("data", None)
+        else:
+            cppmega_mlx.data = previous_data_attr
+
+    return (
+        domain.DomainKind,
+        domain.DomainRoleKind,
+        domain.ParseConfidence,
+        tokenizer.DOMAIN_DELIMITER_TOKEN_IDS,
+    )
+
+
+DomainKind, DomainRoleKind, ParseConfidence, DOMAIN_DELIMITER_TOKEN_IDS = (
+    _load_schema_contracts()
+)
 
 
 TOKEN_COLUMNS = (
@@ -1145,11 +1203,11 @@ def _write_md(report: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--code-root", type=Path, default=Path("outputs/reindexed"))
-    ap.add_argument("--commit-root", type=Path, default=Path("outputs/reindexed_commits"))
-    ap.add_argument("--pr-root", type=Path, default=Path("outputs/reindexed_pr"))
+    ap.add_argument("--code-root", type=Path, required=True)
+    ap.add_argument("--commit-root", type=Path, required=True)
+    ap.add_argument("--pr-root", type=Path, required=True)
     ap.add_argument("--buckets", default="", help="Comma-separated buckets to include, e.g. 1024,2048")
     ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)))
     ap.add_argument("--vocab-size", type=int, default=65536)
@@ -1168,7 +1226,11 @@ def main() -> int:
         action="store_true",
         help="Deprecated no-op: failing on bad files/rows is now the default.",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
 
     buckets = {item.strip() for item in args.buckets.split(",") if item.strip()} or None
     files: list[tuple[str, str, str]] = []
