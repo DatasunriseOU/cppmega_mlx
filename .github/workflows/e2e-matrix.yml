@@ -44,16 +44,18 @@ jobs:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: vbgui/package-lock.json
-      - name: Bind repository MLX Python
+      - name: Create isolated MLX Python
         run: |
-          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
-          test -x "$python_bin"
-          echo "VBGUI_E2E_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          test -x "$base_python"
+          job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"
+          rm -rf "$job_venv"
+          "$base_python" -m venv --system-site-packages "$job_venv"
+          echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
       - name: Python deps
         run: |
-          "$VBGUI_E2E_PYTHON" -m pip install --upgrade pip
-          "$VBGUI_E2E_PYTHON" -m pip install -e ".[gui,parquet,widget]"
-          "$VBGUI_E2E_PYTHON" -m pip install jsonschema pyarrow tokenizers anywidget
+          "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
+            --no-build-isolation -e ".[gui,parquet,widget]"
       - name: Generate fixtures
         run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
@@ -97,15 +99,17 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: "npm",
                 cache-dependency-path: vbgui/package-lock.json }
-      - name: Bind repository MLX Python
+      - name: Create isolated MLX Python
         run: |
-          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
-          test -x "$python_bin"
-          echo "VBGUI_E2E_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          test -x "$base_python"
+          job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"
+          rm -rf "$job_venv"
+          "$base_python" -m venv --system-site-packages "$job_venv"
+          echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
       - run: |
-          "$VBGUI_E2E_PYTHON" -m pip install --upgrade pip
-          "$VBGUI_E2E_PYTHON" -m pip install -e ".[gui,parquet,widget]"
-          "$VBGUI_E2E_PYTHON" -m pip install jsonschema pyarrow tokenizers anywidget
+          "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
+            --no-build-isolation -e ".[gui,parquet,widget]"
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
@@ -145,15 +149,17 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: "npm",
                 cache-dependency-path: vbgui/package-lock.json }
-      - name: Bind repository MLX Python
+      - name: Create isolated MLX Python
         run: |
-          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
-          test -x "$python_bin"
-          echo "VBGUI_E2E_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          test -x "$base_python"
+          job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"
+          rm -rf "$job_venv"
+          "$base_python" -m venv --system-site-packages "$job_venv"
+          echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
       - run: |
-          "$VBGUI_E2E_PYTHON" -m pip install --upgrade pip
-          "$VBGUI_E2E_PYTHON" -m pip install -e ".[gui,parquet,widget]"
-          "$VBGUI_E2E_PYTHON" -m pip install jsonschema pyarrow tokenizers anywidget mlx mlx-lm
+          "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
+            --no-build-isolation -e ".[gui,parquet,widget]"
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
