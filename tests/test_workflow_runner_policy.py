@@ -81,10 +81,13 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     )
 
     assert "pip install --upgrade pip" not in workflow
+    assert 'job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"' not in workflow
+    assert workflow.count('mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-') == 3
     assert workflow.count("-m venv --system-site-packages") == 3
     assert "--no-build-isolation" not in workflow
     assert workflow.count('-e ".[gui,parquet,widget]"') == 3
     assert workflow.count('echo "VBGUI_E2E_PYTHON=$job_venv/bin/python"') == 3
+    assert workflow.count('rm -rf "$VBGUI_E2E_VENV"') == 3
 
 
 def test_build_backend_declares_mlx_imported_by_setup_py() -> None:

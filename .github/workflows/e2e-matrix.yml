@@ -49,10 +49,10 @@ jobs:
         run: |
           base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
           test -x "$base_python"
-          job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"
-          rm -rf "$job_venv"
+          job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
           "$base_python" -m venv --system-site-packages "$job_venv"
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
       - name: Python deps
         run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
@@ -89,6 +89,9 @@ jobs:
             vbgui/e2e/screenshots/
             vbgui/e2e/logs/
           retention-days: 3
+      - name: Remove isolated MLX Python
+        if: always()
+        run: rm -rf "$VBGUI_E2E_VENV"
 
   # Specialised + canvas smoke scenarios — run on every push (lightweight).
   specialised:
@@ -105,10 +108,10 @@ jobs:
         run: |
           base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
           test -x "$base_python"
-          job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"
-          rm -rf "$job_venv"
+          job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
           "$base_python" -m venv --system-site-packages "$job_venv"
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"
@@ -139,6 +142,9 @@ jobs:
             vbgui/e2e/screenshots/
             vbgui/e2e/logs/
           retention-days: 3
+      - name: Remove isolated MLX Python
+        if: always()
+        run: rm -rf "$VBGUI_E2E_VENV"
 
   # Mini-train matrix (192 cells, real mlx) — macOS only, nightly.
   mini-train-matrix:
@@ -155,10 +161,10 @@ jobs:
         run: |
           base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
           test -x "$base_python"
-          job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"
-          rm -rf "$job_venv"
+          job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
           "$base_python" -m venv --system-site-packages "$job_venv"
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"
@@ -185,6 +191,9 @@ jobs:
             vbgui/e2e/screenshots/
             vbgui/e2e/logs/
           retention-days: 7
+      - name: Remove isolated MLX Python
+        if: always()
+        run: rm -rf "$VBGUI_E2E_VENV"
 
   # Matrix report — aggregates shard artefacts into one Markdown
   # summary, posted as a build summary + uploaded as standalone artefact.
