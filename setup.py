@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 from setuptools import setup
 
@@ -15,7 +16,7 @@ class CppmegaCMakeBuild(extension.CMakeBuild):
         build_contract_args = (
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dnanobind_DIR={nanobind.cmake_dir()}",
-            f"-DMLX_ROOT={extension._MLX_PATH}",
+            f"-DMLX_ROOT={Path(extension.__file__).resolve().parent}",
         )
         os.environ["CMAKE_ARGS"] = " ".join(
             part for part in (previous_args, *build_contract_args) if part
