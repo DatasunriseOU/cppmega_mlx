@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -12,6 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "cpp_jsonl_generation_compile_eval.py"
+CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
 
 
 def _load_module():
@@ -51,20 +53,210 @@ class _FakeTokenizer:
         return ([prepend] if prepend is not None else []) + ids
 
 
+def _case3_prompt() -> str:
+    row = json.loads((CASE3_FIXTURE / "cases.jsonl").read_text().splitlines()[0])
+    return row["source_prefix"]
+
+
 def test_build_prompt_context_zero_sidecars_align_with_prepend():
     mod = _load_module()
-    ids, side, provenance = mod.build_prompt_context(
+    context = mod.build_prompt_context(
         _FakeTokenizer(),
         "int f() {",
+        prompt_graph_mode="off",
         prompt_sidecars="zero",
         prepend_code_start=True,
     )
 
-    assert ids[0] == _FakeTokenizer.code_start_id
-    assert provenance == {"prompt_sidecars": "zero"}
-    assert set(side) == set(mod.SIDE_CHANNEL_NAMES)
-    assert all(len(values) == len(ids) for values in side.values())
-    assert all(sum(values) == 0 for values in side.values())
+    assert context.token_ids[0] == _FakeTokenizer.code_start_id
+    assert context.receipt == {"prompt_graph_mode": "off", "prompt_sidecars": "zero"}
+    assert context.graph_artifact is None
+    assert set(context.side_channels) == set(mod.SIDE_CHANNEL_NAMES)
+    assert all(
+        len(values) == len(context.token_ids)
+        for values in context.side_channels.values()
+    )
+    assert all(sum(values) == 0 for values in context.side_channels.values())
+
+
+def test_build_model_config_requires_graph_routes_only_in_repo_mode():
+    mod = _load_module()
+    base = {
+        "vocab_size": 128,
+        "hidden": 32,
+        "depth": 1,
+        "ffn": 64,
+        "num_query_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 8,
+        "seq_len": 64,
+        "attention_mode": "dsa",
+        "structure_components": "all",
+        "structure_num_categories": 9,
+        "structure_max_dep_level": 64,
+        "structure_bottleneck_dim": 16,
+        "disable_ngram": True,
+        "ngram_hash_heads": 1,
+        "ngram_hash_table_size": 64,
+        "ngram_hash_embed_dim": 4,
+    }
+
+    graph_cfg = mod.build_model_config(
+        SimpleNamespace(**base, prompt_graph_mode="repo"), {}
+    )
+    off_cfg = mod.build_model_config(
+        SimpleNamespace(**base, prompt_graph_mode="off"), {}
+    )
+    assert graph_cfg.require_graph_routes is True
+    assert off_cfg.require_graph_routes is False
+
+
+def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
+    from cppmega_mlx.data.prompt_graph import PromptProjectIndex
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    project_index = PromptProjectIndex.from_json_path(
+        CASE3_FIXTURE / "project_index.json"
+    )
+
+    context = mod.build_prompt_context(
+        tokenizer,
+        _case3_prompt(),
+        prompt_graph_mode="repo",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        project_index=project_index,
+        prompt_source_start=0,
+        prompt_graph_cache_dir=tmp_path,
+    )
+    side, block_bias, window_receipt = mod.prompt_model_inputs(
+        context,
+        total_token_count=len(context.token_ids) + 1,
+        window_start=0,
+        window_end=len(context.token_ids) + 1,
+    )
+
+    assert context.graph_artifact is not None
+    assert context.receipt["edge_counts"] == {
+        "build": 0,
+        "call": 1,
+        "cross_domain": 0,
+        "def_use": 1,
+        "diagnostic": 0,
+        "domain": 1,
+        "shell": 0,
+        "type": 1,
+    }
+    assert all(tuple(value.shape) == (1, len(context.token_ids) + 1) for value in side.values())
+    assert tuple(block_bias.shape) == (
+        1,
+        len(context.token_ids) + 1,
+        len(context.token_ids) + 1,
+    )
+    assert float(mx.sum(block_bias).item()) > 0.0
+    assert window_receipt["edge_counts"]["call"] == 1
+
+
+def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path):
+    from cppmega_mlx.data.prompt_graph import PromptProjectIndex
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    project_index = PromptProjectIndex.from_json_path(
+        CASE3_FIXTURE / "project_index.json"
+    )
+
+    class CapturingModel:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append((input_ids, kwargs))
+            logits = mx.zeros(
+                (1, input_ids.shape[1], tokenizer.vocab_size),
+                dtype=mx.float32,
+            )
+            return logits, None
+
+    model = CapturingModel()
+    _completion, prompt_tokens, generated_tokens, receipt = mod.generate_completion(
+        model,
+        tokenizer,
+        _case3_prompt(),
+        seq_len=1024,
+        max_new_tokens=1,
+        temperature=0.0,
+        top_k=None,
+        top_p=None,
+        prompt_graph_mode="repo",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        project_index=project_index,
+        prompt_source_start=0,
+        prompt_graph_cache_dir=tmp_path,
+    )
+
+    assert prompt_tokens > 0
+    assert generated_tokens == 1
+    assert receipt["edge_counts"]["call"] == 1
+    assert len(model.calls) == 1
+    input_ids, kwargs = model.calls[0]
+    assert tuple(input_ids.shape) == (1, prompt_tokens)
+    assert float(mx.sum(kwargs["block_bias"]).item()) > 0.0
+    assert int(mx.sum(kwargs["structure_ids"]).item()) > 0
+    assert receipt["edge_counts"]["type"] == 1
+    assert receipt["edge_counts"]["def_use"] == 1
+    assert receipt["edge_counts"]["domain"] == 1
+
+
+def test_generate_completion_refuses_to_discard_repository_graph_window(
+    tmp_path: Path,
+):
+    from cppmega_mlx.data.prompt_graph import PromptProjectIndex
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    project_index = PromptProjectIndex.from_json_path(
+        CASE3_FIXTURE / "project_index.json"
+    )
+
+    class ModelMustNotRun:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("decode started before graph window validation")
+
+    with pytest.raises(ValueError, match="discard.*repository graph"):
+        mod.generate_completion(
+            ModelMustNotRun(),
+            tokenizer,
+            _case3_prompt(),
+            seq_len=1024,
+            max_new_tokens=1024,
+            temperature=0.0,
+            top_k=None,
+            top_p=None,
+            prompt_graph_mode="repo",
+            prompt_sidecars="zero",
+            prepend_code_start=False,
+            project_index=project_index,
+            prompt_source_start=0,
+            prompt_graph_cache_dir=tmp_path,
+        )
+
+
+def test_resolve_case_prompt_graph_fails_closed_when_requested(tmp_path: Path):
+    mod = _load_module()
+    case = {"task_id": "missing", "source_prefix": "int f() {\n"}
+
+    with pytest.raises(ValueError, match="missing.*prompt_graph_index"):
+        mod.resolve_case_prompt_graph(case, cases_dir=tmp_path, mode="repo")
+
+    assert mod.resolve_case_prompt_graph(
+        case, cases_dir=tmp_path, mode="off"
+    ) == (None, None)
 
 
 def test_build_prompt_context_rejects_clang_sidecars_with_prepended_code_start():
@@ -86,18 +278,22 @@ def test_build_prompt_context_clang_sidecars_are_fail_closed_when_available():
     if not capabilities.available:
         pytest.skip(f"clang adapter unavailable: {capabilities.reason}")
 
-    ids, side, provenance = mod.build_prompt_context(
+    context = mod.build_prompt_context(
         tokenizer.load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER),
         "int f() {\n  return 1;\n}\n",
+        prompt_graph_mode="off",
         prompt_sidecars="clang",
         prepend_code_start=False,
     )
 
-    assert ids
-    assert set(side) == set(mod.SIDE_CHANNEL_NAMES)
-    assert all(len(values) == len(ids) for values in side.values())
-    assert provenance.get("adapter") == "cpp:clang-ast-v1"
-    assert not any("dropped" in str(value) for value in provenance.values())
+    assert context.token_ids
+    assert set(context.side_channels) == set(mod.SIDE_CHANNEL_NAMES)
+    assert all(
+        len(values) == len(context.token_ids)
+        for values in context.side_channels.values()
+    )
+    assert context.receipt.get("adapter") == "cpp:clang-ast-v1"
+    assert not any("dropped" in str(value) for value in context.receipt.values())
 
 
 def test_body_decode_constraints_ban_specials_and_degenerate_token_run():
@@ -176,6 +372,7 @@ def test_script_help_bootstraps_repo_root_from_sibling_cwd():
     )
     assert proc.returncode == 0, proc.stderr
     assert "--prompt-sidecars" in proc.stdout
+    assert "--prompt-graph-mode" in proc.stdout
 
 
 def test_rejects_megatron_distcp_file(tmp_path: Path):

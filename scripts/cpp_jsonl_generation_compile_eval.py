@@ -28,6 +28,12 @@ if str(REPO_ROOT) not in sys.path:
 
 import mlx.core as mx
 
+from cppmega_mlx.data.prompt_graph import (
+    PromptGraphArtifact,
+    PromptGraphBuilder,
+    PromptGraphContext,
+    PromptProjectIndex,
+)
 from cppmega_mlx.inference.sampling import sample_next_token
 from cppmega_mlx.inference.side_channels import (
     InferenceSideChannelBuilder,
@@ -39,6 +45,7 @@ from cppmega_mlx.training.checkpoint import load_checkpoint
 
 PromptMode = Literal["source-prefix", "docstring"]
 PromptSidecars = Literal["zero", "clang"]
+PromptGraphMode = Literal["off", "repo"]
 
 DEFAULT_TOKENIZER = REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
 DEFAULT_COMPILE_GATE = REPO_ROOT.parent / "cppmega" / "scripts" / "cpp_generation_compile_eval.py"
@@ -58,6 +65,23 @@ DEFAULT_COMPILE_PATH_DIRS = (
     Path("/usr/sbin"),
     Path("/sbin"),
 )
+
+
+class GenerationPromptContext:
+    __slots__ = ("token_ids", "side_channels", "receipt", "graph_artifact")
+
+    def __init__(
+        self,
+        *,
+        token_ids: list[int],
+        side_channels: dict[str, list[int]],
+        receipt: dict[str, Any],
+        graph_artifact: PromptGraphArtifact | None = None,
+    ) -> None:
+        self.token_ids = token_ids
+        self.side_channels = side_channels
+        self.receipt = receipt
+        self.graph_artifact = graph_artifact
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -108,6 +132,76 @@ def prompt_text(case: dict[str, Any], mode: PromptMode) -> str:
     return value
 
 
+def _resolve_contained_path(
+    root: Path,
+    raw_path: Any,
+    *,
+    where: str,
+) -> Path:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"{where} must be a non-empty relative path")
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{where} must be a contained relative path")
+    root = root.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{where} escapes {root}: {raw_path!r}") from exc
+    return resolved
+
+
+def resolve_case_prompt_graph(
+    case: dict[str, Any],
+    *,
+    cases_dir: Path,
+    mode: PromptGraphMode,
+) -> tuple[PromptProjectIndex | None, int | None]:
+    if mode == "off":
+        return None, None
+    if mode != "repo":
+        raise ValueError(f"unsupported prompt graph mode {mode!r}")
+
+    task_id = str(case.get("task_id") or "<unknown>")
+    raw_index = case.get("prompt_graph_index")
+    if not isinstance(raw_index, str) or not raw_index:
+        raise ValueError(
+            f"case {task_id!r}: missing non-empty prompt_graph_index "
+            "while prompt graph mode is repo"
+        )
+    index_path = _resolve_contained_path(
+        cases_dir,
+        raw_index,
+        where=f"case {task_id!r} prompt_graph_index",
+    )
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"case {task_id!r}: prompt graph index not found: {index_path}"
+        )
+    project_index = PromptProjectIndex.from_json_path(index_path)
+    project_index.verify_source_file(index_path.parent)
+
+    source_start = case.get("prompt_source_start")
+    if (
+        isinstance(source_start, bool)
+        or not isinstance(source_start, int)
+        or source_start < 0
+    ):
+        raise ValueError(
+            f"case {task_id!r}: prompt_source_start must be a "
+            "non-negative integer"
+        )
+    prompt = prompt_text(case, "source-prefix")
+    source_end = source_start + len(prompt)
+    if project_index.source[source_start:source_end] != prompt:
+        raise ValueError(
+            f"case {task_id!r}: source_prefix does not match project index "
+            f"source span [{source_start},{source_end})"
+        )
+    return project_index, source_start
+
+
 def default_side_channels(seq_len: int) -> dict[str, mx.array]:
     """Zero/default token sidecars for standalone prompt-only evals."""
     if seq_len <= 0:
@@ -128,9 +222,13 @@ def build_prompt_context(
     tokenizer: Any,
     prompt: str,
     *,
+    prompt_graph_mode: PromptGraphMode = "off",
     prompt_sidecars: PromptSidecars,
     prepend_code_start: bool,
-) -> tuple[list[int], dict[str, list[int]], dict[str, str]]:
+    project_index: PromptProjectIndex | None = None,
+    prompt_source_start: int | None = None,
+    prompt_graph_cache_dir: Path | None = None,
+) -> GenerationPromptContext:
     """Encode a prompt and build token-aligned prompt sidecars.
 
     Generated suffix tokens get zero/default sidecars until the full candidate is
@@ -138,11 +236,69 @@ def build_prompt_context(
     structure channels the model saw during training when requested.
     """
 
+    if prompt_graph_mode == "repo":
+        if prompt_sidecars != "zero":
+            raise ValueError(
+                "--prompt-graph-mode repo owns prompt sidecars; "
+                "--prompt-sidecars must be zero"
+            )
+        if prepend_code_start:
+            raise ValueError(
+                "--prepend-code-start is not supported with "
+                "--prompt-graph-mode repo because the synthetic token has "
+                "no source offset"
+            )
+        if project_index is None:
+            raise ValueError(
+                "prompt graph mode repo requires a PromptProjectIndex"
+            )
+        if prompt_source_start is None:
+            raise ValueError(
+                "prompt graph mode repo requires prompt_source_start"
+            )
+        if prompt_graph_cache_dir is None:
+            raise ValueError(
+                "prompt graph mode repo requires a deterministic cache directory"
+            )
+        artifact = PromptGraphBuilder(
+            tokenizer,
+            cache_dir=prompt_graph_cache_dir,
+        ).build(
+            project_index,
+            PromptGraphContext.from_prompt(
+                prompt,
+                source_start=prompt_source_start,
+                language="cpp",
+            ),
+        )
+        side_channels = {
+            name: list(artifact.side_channels[name])
+            for name in SIDE_CHANNEL_NAMES
+        }
+        receipt = dict(artifact.receipt)
+        receipt["prompt_graph_mode"] = "repo"
+        return GenerationPromptContext(
+            token_ids=list(artifact.token_ids),
+            side_channels=side_channels,
+            receipt=receipt,
+            graph_artifact=artifact,
+        )
+
+    if prompt_graph_mode != "off":
+        raise ValueError(f"unsupported prompt_graph_mode={prompt_graph_mode!r}")
+
     if prompt_sidecars == "zero":
         prepend = tokenizer.code_start_id if prepend_code_start else None
         ids = list(tokenizer.encode(prompt, prepend=prepend))
         side = {name: [0] * len(ids) for name in SIDE_CHANNEL_NAMES}
-        return ids, side, {"prompt_sidecars": "zero"}
+        return GenerationPromptContext(
+            token_ids=ids,
+            side_channels=side,
+            receipt={
+                "prompt_graph_mode": "off",
+                "prompt_sidecars": "zero",
+            },
+        )
 
     if prompt_sidecars != "clang":
         raise ValueError(f"unsupported prompt_sidecars={prompt_sidecars!r}")
@@ -161,7 +317,70 @@ def build_prompt_context(
     for name in SIDE_CHANNEL_NAMES:
         value = result.model_kwargs.get(name)
         side[name] = _row_to_ints(value) if isinstance(value, mx.array) else list(zero)
-    return ids, side, dict(result.provenance)
+    receipt = dict(result.provenance)
+    receipt["prompt_graph_mode"] = "off"
+    return GenerationPromptContext(
+        token_ids=ids,
+        side_channels=side,
+        receipt=receipt,
+    )
+
+
+def prompt_model_inputs(
+    context: GenerationPromptContext,
+    *,
+    total_token_count: int,
+    window_start: int,
+    window_end: int,
+) -> tuple[dict[str, mx.array], mx.array | None, dict[str, Any]]:
+    if context.graph_artifact is not None:
+        graph_inputs = context.graph_artifact.model_inputs(
+            total_token_count=total_token_count,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        side = {
+            name: mx.array([graph_inputs.side_channels[name]], dtype=mx.int32)
+            for name in SIDE_CHANNEL_NAMES
+        }
+        block_bias = mx.array(
+            [graph_inputs.dense_attention_bias()],
+            dtype=mx.float32,
+        )
+        return side, block_bias, dict(graph_inputs.receipt)
+
+    if total_token_count < len(context.token_ids):
+        raise ValueError(
+            "total_token_count cannot be shorter than the prompt context"
+        )
+    if (
+        window_start < 0
+        or window_end <= window_start
+        or window_end > total_token_count
+    ):
+        raise ValueError(
+            f"invalid prompt window [{window_start},{window_end}) "
+            f"for total {total_token_count}"
+        )
+    generated = total_token_count - len(context.token_ids)
+    side = {
+        name: mx.array(
+            [
+                (list(context.side_channels[name]) + [0] * generated)[
+                    window_start:window_end
+                ]
+            ],
+            dtype=mx.int32,
+        )
+        for name in SIDE_CHANNEL_NAMES
+    }
+    receipt = {
+        **context.receipt,
+        "window_start": window_start,
+        "window_end": window_end,
+        "total_token_count": total_token_count,
+    }
+    return side, None, receipt
 
 
 class BodyDecodeConstraints:
@@ -387,12 +606,11 @@ def _cfg_value(
     return checkpoint_config.get(key, fallback)
 
 
-def build_model(args: argparse.Namespace) -> DenseCppLM:
-    dtype = mx.bfloat16 if args.bf16 else None
-    checkpoint = Path(args.checkpoint)
-    reject_unsupported_checkpoint(checkpoint)
-    checkpoint_config = checkpoint_model_config(checkpoint)
-    cfg = DenseCppLMConfig(
+def build_model_config(
+    args: argparse.Namespace,
+    checkpoint_config: dict[str, Any],
+) -> DenseCppLMConfig:
+    return DenseCppLMConfig(
         vocab_size=int(_cfg_value(checkpoint_config, "vocab_size", args.vocab_size)),
         hidden_size=int(_cfg_value(checkpoint_config, "hidden_size", args.hidden)),
         depth=int(_cfg_value(checkpoint_config, "depth", args.depth)),
@@ -403,16 +621,41 @@ def build_model(args: argparse.Namespace) -> DenseCppLM:
         max_seq_length=int(_cfg_value(checkpoint_config, "max_seq_length", args.seq_len)),
         attention_mode=args.attention_mode,
         structure_components=str(_cfg_value(checkpoint_config, "structure_components", args.structure_components)),
-        structure_num_categories=int(_cfg_value(checkpoint_config, "structure_num_categories", args.structure_num_categories)),
-        structure_max_dep_level=int(_cfg_value(checkpoint_config, "structure_max_dep_level", args.structure_max_dep_level)),
-        structure_bottleneck_dim=int(_cfg_value(checkpoint_config, "structure_bottleneck_dim", args.structure_bottleneck_dim)),
-        # Standalone docstring/source-prefix eval has no repo graph routes.
-        require_graph_routes=False,
+        structure_num_categories=int(
+            _cfg_value(
+                checkpoint_config,
+                "structure_num_categories",
+                args.structure_num_categories,
+            )
+        ),
+        structure_max_dep_level=int(
+            _cfg_value(
+                checkpoint_config,
+                "structure_max_dep_level",
+                args.structure_max_dep_level,
+            )
+        ),
+        structure_bottleneck_dim=int(
+            _cfg_value(
+                checkpoint_config,
+                "structure_bottleneck_dim",
+                args.structure_bottleneck_dim,
+            )
+        ),
+        require_graph_routes=args.prompt_graph_mode == "repo",
         ngram_hash_enabled=not args.disable_ngram,
         ngram_hash_heads=int(_cfg_value(checkpoint_config, "ngram_hash_heads", args.ngram_hash_heads)),
         ngram_hash_table_size=int(_cfg_value(checkpoint_config, "ngram_hash_table_size", args.ngram_hash_table_size)),
         ngram_hash_embed_dim=int(_cfg_value(checkpoint_config, "ngram_hash_embed_dim", args.ngram_hash_embed_dim)),
     )
+
+
+def build_model(args: argparse.Namespace) -> DenseCppLM:
+    dtype = mx.bfloat16 if args.bf16 else None
+    checkpoint = Path(args.checkpoint)
+    reject_unsupported_checkpoint(checkpoint)
+    checkpoint_config = checkpoint_model_config(checkpoint)
+    cfg = build_model_config(args, checkpoint_config)
     model = DenseCppLM(cfg, dtype=dtype)
     if checkpoint.is_dir():
         load_checkpoint(model, checkpoint, strict=not args.non_strict)
@@ -457,26 +700,57 @@ def generate_completion(
     temperature: float,
     top_k: int | None,
     top_p: float | None,
+    prompt_graph_mode: PromptGraphMode,
     prompt_sidecars: PromptSidecars,
     prepend_code_start: bool,
-) -> tuple[str, int, int, dict[str, str]]:
-    prompt_ids, side_context, side_provenance = build_prompt_context(
+    project_index: PromptProjectIndex | None,
+    prompt_source_start: int | None,
+    prompt_graph_cache_dir: Path | None,
+) -> tuple[str, int, int, dict[str, Any]]:
+    prompt_context = build_prompt_context(
         tokenizer,
         prompt,
+        prompt_graph_mode=prompt_graph_mode,
         prompt_sidecars=prompt_sidecars,
         prepend_code_start=prepend_code_start,
+        project_index=project_index,
+        prompt_source_start=prompt_source_start,
+        prompt_graph_cache_dir=prompt_graph_cache_dir,
     )
-    context = list(prompt_ids)
+    prompt_ids = list(prompt_context.token_ids)
+    if not prompt_ids:
+        raise ValueError("prompt tokenized to zero tokens")
+    if len(prompt_ids) >= seq_len:
+        raise ValueError(
+            f"prompt has {len(prompt_ids)} tokens but seq_len={seq_len}; "
+            "refusing to truncate prompt graph coordinates"
+        )
+    if (
+        prompt_context.graph_artifact is not None
+        and len(prompt_ids) + max_new_tokens > seq_len
+    ):
+        raise ValueError(
+            "prompt plus max_new_tokens exceeds seq_len; refusing to discard "
+            "indexed repository graph tokens during decode"
+        )
+    token_context = list(prompt_ids)
     generated: list[int] = []
     constraints = BodyDecodeConstraints(tokenizer, prompt_len=len(prompt_ids))
     for _ in range(max_new_tokens):
-        window = context[-seq_len:]
+        window_start = max(0, len(token_context) - seq_len)
+        window = token_context[window_start:]
         input_ids = mx.array([window], dtype=mx.int32)
-        side = {
-            name: mx.array([values[-len(window) :]], dtype=mx.int32)
-            for name, values in side_context.items()
-        }
-        logits, _loss = model(input_ids, **side)
+        side, block_bias, _window_receipt = prompt_model_inputs(
+            prompt_context,
+            total_token_count=len(token_context),
+            window_start=window_start,
+            window_end=len(token_context),
+        )
+        logits, _loss = model(
+            input_ids,
+            block_bias=block_bias,
+            **side,
+        )
         next_id = _sample_next(
             logits,
             temperature=temperature,
@@ -489,14 +763,12 @@ def generate_completion(
         if next_id in {tokenizer.eos_token_id, tokenizer.code_end_id}:
             break
         generated.append(next_id)
-        context.append(next_id)
-        for values in side_context.values():
-            values.append(0)
+        token_context.append(next_id)
     return (
         trim_body_completion(tokenizer.decode(generated)),
         len(prompt_ids),
         len(generated),
-        side_provenance,
+        dict(prompt_context.receipt),
     )
 
 
@@ -512,13 +784,21 @@ def write_completions(
     temperature: float,
     top_k: int | None,
     top_p: float | None,
+    prompt_graph_mode: PromptGraphMode,
     prompt_sidecars: PromptSidecars,
     prepend_code_start: bool,
+    cases_dir: Path,
+    prompt_graph_cache_dir: Path | None,
 ) -> list[dict[str, Any]]:
     completions_path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     with completions_path.open("w", encoding="utf-8") as fh:
         for case in cases:
+            project_index, prompt_source_start = resolve_case_prompt_graph(
+                case,
+                cases_dir=cases_dir,
+                mode=prompt_graph_mode,
+            )
             completion, prompt_tokens, generated_tokens, side_provenance = generate_completion(
                 model,
                 tokenizer,
@@ -528,15 +808,19 @@ def write_completions(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                prompt_graph_mode=prompt_graph_mode,
                 prompt_sidecars=prompt_sidecars,
                 prepend_code_start=prepend_code_start,
+                project_index=project_index,
+                prompt_source_start=prompt_source_start,
+                prompt_graph_cache_dir=prompt_graph_cache_dir,
             )
             row = {
                 "task_id": case["task_id"],
                 "completion": completion,
                 "prompt_tokens": prompt_tokens,
                 "generated_tokens": generated_tokens,
-                "prompt_sidecars": side_provenance,
+                "prompt_graph_receipt": side_provenance,
             }
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             rows.append(row)
@@ -604,6 +888,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-compile-gate", action="store_true")
     ap.add_argument("--keep-workdir", action="store_true")
     ap.add_argument("--prompt-mode", choices=("source-prefix", "docstring"), default="source-prefix")
+    ap.add_argument(
+        "--prompt-graph-mode",
+        choices=("repo", "off"),
+        default="repo",
+        help="Use a case-linked repository graph, or explicitly ablate graph routes.",
+    )
+    ap.add_argument(
+        "--prompt-graph-cache-dir",
+        type=Path,
+        default=None,
+        help="Hash-addressed graph artifact cache (defaults under --out-dir).",
+    )
     ap.add_argument("--prompt-sidecars", choices=("zero", "clang"), default="zero")
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--max-new-tokens", type=int, default=128)
@@ -638,17 +934,43 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--top-k must be non-negative")
     if args.top_p is not None and not (0.0 < args.top_p <= 1.0):
         raise ValueError("--top-p must be in (0, 1]")
+    if args.prompt_graph_mode == "repo" and args.prompt_sidecars != "zero":
+        raise ValueError(
+            "--prompt-graph-mode repo cannot be combined with "
+            "--prompt-sidecars clang"
+        )
+    if args.prompt_graph_mode == "repo" and args.prepend_code_start:
+        raise ValueError(
+            "--prompt-graph-mode repo cannot be combined with "
+            "--prepend-code-start"
+        )
     return args
 
 
 def main() -> None:
     args = parse_args()
     cases = load_cases(args.cases)
-    tokenizer = load_cppmega_tokenizer(args.tokenizer)
-    model = build_model(args)
+    cases_dir = args.cases.resolve().parent
+    for case in cases:
+        resolve_case_prompt_graph(
+            case,
+            cases_dir=cases_dir,
+            mode=args.prompt_graph_mode,
+        )
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    prompt_graph_cache_dir = (
+        args.prompt_graph_cache_dir
+        if args.prompt_graph_cache_dir is not None
+        else out_dir / "prompt_graph_cache"
+    )
+    if args.prompt_graph_mode == "off":
+        prompt_graph_cache_dir = None
+
+    tokenizer = load_cppmega_tokenizer(args.tokenizer)
+    model = build_model(args)
+
     completions = out_dir / "completions.jsonl"
     report = out_dir / "compile_report.json"
     rows = write_completions(
@@ -662,8 +984,11 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        prompt_graph_mode=args.prompt_graph_mode,
         prompt_sidecars=args.prompt_sidecars,
         prepend_code_start=args.prepend_code_start,
+        cases_dir=cases_dir,
+        prompt_graph_cache_dir=prompt_graph_cache_dir,
     )
     summary = {
         "cases": len(cases),
@@ -675,6 +1000,12 @@ def main() -> None:
         "temperature": args.temperature,
         "top_k": args.top_k,
         "top_p": args.top_p,
+        "prompt_graph_mode": args.prompt_graph_mode,
+        "prompt_graph_cache_dir": (
+            None
+            if prompt_graph_cache_dir is None
+            else str(prompt_graph_cache_dir)
+        ),
         "prompt_sidecars": args.prompt_sidecars,
     }
     (out_dir / "generation_summary.json").write_text(
