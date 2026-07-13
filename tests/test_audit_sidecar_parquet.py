@@ -36,6 +36,8 @@ def _write_tiny_parquet(
     valid_token_count=4,
     trained_token_count=3,
     extra=None,
+    omit=(),
+    token_source_doc_type=pa.uint32(),
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {
@@ -77,7 +79,50 @@ def _write_tiny_parquet(
     }
     if extra:
         row.update(extra)
+    if len(row["source_doc_ids"]) > 1 and not (
+        extra and any(name in extra for name in ("token_chunk_starts", "token_call_edges"))
+    ):
+        starts = []
+        ends = []
+        offset = 0
+        for length in row["source_doc_token_lengths"]:
+            starts.append(offset)
+            offset += int(length)
+            ends.append(offset)
+        row.update(
+            {
+                "token_chunk_starts": starts,
+                "token_chunk_ends": ends,
+                "token_chunk_kinds": [1] * len(starts),
+                "token_chunk_dep_levels": [0] * len(starts),
+                "token_call_edges": [],
+                "token_type_edges": [],
+            }
+        )
+    if "token_source_doc_ids" not in row:
+        token_source_doc_ids = [
+            int(source_id)
+            for source_id, length in zip(
+                row["source_doc_ids"],
+                row["source_doc_token_lengths"],
+                strict=True,
+            )
+            for _ in range(int(length))
+        ]
+        row["token_source_doc_ids"] = (
+            token_source_doc_ids
+            + [0] * (len(row["input_ids"]) - len(token_source_doc_ids))
+        )
+    for name in omit:
+        row.pop(name, None)
     table = pa.Table.from_pylist([row])
+    if "token_source_doc_ids" in row:
+        index = table.schema.get_field_index("token_source_doc_ids")
+        table = table.set_column(
+            index,
+            "token_source_doc_ids",
+            pa.array([row["token_source_doc_ids"]], type=pa.list_(token_source_doc_type)),
+        )
     pq.write_table(table, path)
 
 
@@ -353,9 +398,9 @@ def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(t
         "token_role_ids": [1, 6, 4, 1, 0, 0, 0, 0],
         "token_entity_ids": [0, 1, 2, 0, 0, 0, 0, 0],
         "token_scope_ids": [0, 0, 1, 0, 0, 0, 0, 0],
-        "token_source_doc_ids": [0, 0, 0, 0, 0, 0, 0, 0],
+        "token_source_doc_ids": [1, 1, 1, 1, 0, 0, 0, 0],
         "token_confidence_ids": [4, 4, 4, 4, 0, 0, 0, 0],
-        "token_domain_edges": [{"from": 1, "to": 2, "kind": 26}],
+        "token_domain_edges": [{"from": 1, "to": 2, "kind": 5}],
         "token_build_edges": [{"from": 1, "to": 2, "kind": 26}],
         "token_shell_edges": [],
         "token_diagnostic_edges": [],
@@ -378,6 +423,192 @@ def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(t
     assert report["total"]["edge_count"]["token_domain_edges"] == 1
     assert report["total"]["fields"]["token_domain_ids"]["bad_length_rows"] == 0
     assert report["total"]["fields"]["token_role_ids"]["bad_value_rows"] == 0
+
+
+def test_sidecar_audit_requires_uint32_positive_token_source_doc_ids(tmp_path):
+    cases = (
+        ("missing", {"omit": ("token_source_doc_ids",)}),
+        (
+            "zero",
+            {
+                "extra": {
+                    "token_source_doc_ids": [0, 0, 0, 0, 0, 0, 0, 0]
+                }
+            },
+        ),
+        ("wrong_dtype", {"token_source_doc_type": pa.int64()}),
+    )
+    for label, kwargs in cases:
+        case_root = tmp_path / label
+        code_root = case_root / "code"
+        commit_root = case_root / "commits"
+        pr_root = case_root / "pr"
+        _write_tiny_parquet(code_root / "8" / "code.parquet", **kwargs)
+        _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+        _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+        proc, report = _run_audit(case_root, code_root, commit_root, pr_root)
+
+        assert proc.returncode == 2, (label, proc.stdout, proc.stderr)
+        assert report["total"]["bad_rows"] >= 1
+
+
+def test_sidecar_audit_rejects_edge_crossing_source_document_provenance(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        doc_ids=(1, 1, 2, 2, 2, 2, 2, 2),
+        loss_mask=(1, 0, 1, 0, 0, 0, 0, 0),
+        trained_token_count=2,
+        extra={
+            "source_doc_ids": [11, 22],
+            "source_doc_token_lengths": [2, 2],
+            "token_source_doc_ids": [11, 11, 22, 22, 0, 0, 0, 0],
+            "token_domain_edges": [{"from": 0, "to": 2, "kind": 5}],
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report["total"]["fields"]["token_domain_edges"]["bad_value_rows"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("field", "valid_kind", "wrong_kind"),
+    [
+        ("token_domain_edges", 5, 26),
+        ("token_build_edges", 26, 5),
+        ("token_shell_edges", 44, 26),
+        ("token_diagnostic_edges", 60, 26),
+        ("token_cross_domain_edges", 100, 26),
+    ],
+)
+def test_sidecar_audit_enforces_independent_edge_kind_families(
+    tmp_path, field, valid_kind, wrong_kind
+):
+    for label, kind, expected_code in (
+        ("valid", valid_kind, 0),
+        ("wrong", wrong_kind, 2),
+    ):
+        case_root = tmp_path / label
+        code_root = case_root / "code"
+        commit_root = case_root / "commits"
+        pr_root = case_root / "pr"
+        _write_tiny_parquet(
+            code_root / "8" / "code.parquet",
+            extra={field: [{"from": 1, "to": 2, "kind": kind}]},
+        )
+        _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+        _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+        proc, report = _run_audit(case_root, code_root, commit_root, pr_root)
+
+        assert proc.returncode == expected_code, (label, proc.stdout, proc.stderr)
+        if expected_code:
+            assert report["total"]["fields"][field]["bad_value_rows"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("label", "input_ids", "valid", "domains", "roles", "confidence"),
+    [
+        (
+            "wrong_domain",
+            (195, 2, 3, 196, 0, 0, 0, 0),
+            4,
+            [3, 2, 2, 2, 0, 0, 0, 0],
+            [1, 6, 4, 1, 0, 0, 0, 0],
+            [4, 4, 4, 4, 0, 0, 0, 0],
+        ),
+        (
+            "swapped",
+            (196, 2, 3, 195, 0, 0, 0, 0),
+            4,
+            [2, 2, 2, 2, 0, 0, 0, 0],
+            [1, 6, 4, 1, 0, 0, 0, 0],
+            [4, 4, 4, 4, 0, 0, 0, 0],
+        ),
+        (
+            "crossing",
+            (195, 193, 2, 196, 194, 3, 0, 0),
+            6,
+            [2, 3, 3, 2, 3, 0, 0, 0],
+            [1, 1, 6, 1, 1, 2, 0, 0],
+            [4, 4, 4, 4, 4, 4, 0, 0],
+        ),
+        (
+            "unclosed",
+            (195, 2, 3, 4, 0, 0, 0, 0),
+            4,
+            [2, 2, 2, 2, 0, 0, 0, 0],
+            [1, 6, 4, 2, 0, 0, 0, 0],
+            [4, 4, 4, 4, 0, 0, 0, 0],
+        ),
+        (
+            "wrong_confidence",
+            (195, 2, 3, 196, 0, 0, 0, 0),
+            4,
+            [2, 2, 2, 2, 0, 0, 0, 0],
+            [1, 6, 4, 1, 0, 0, 0, 0],
+            [3, 4, 4, 4, 0, 0, 0, 0],
+        ),
+    ],
+)
+def test_sidecar_audit_rejects_invalid_delimiter_semantics(
+    tmp_path, label, input_ids, valid, domains, roles, confidence
+):
+    code_root = tmp_path / label / "code"
+    commit_root = tmp_path / label / "commits"
+    pr_root = tmp_path / label / "pr"
+    target_ids = tuple(input_ids[1:valid]) + (0,) * (len(input_ids) - valid + 1)
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        input_ids=input_ids,
+        target_ids=target_ids,
+        loss_mask=(1,) * (valid - 1) + (0,) * (len(input_ids) - valid + 1),
+        valid_token_count=valid,
+        trained_token_count=valid - 1,
+        extra={
+            "source_doc_token_lengths": [valid],
+            "token_domain_ids": domains,
+            "token_role_ids": roles,
+            "token_entity_ids": [0] * len(input_ids),
+            "token_scope_ids": [0] * len(input_ids),
+            "token_confidence_ids": confidence,
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path / label, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report["total"]["bad_rows"] >= 1
+
+
+def test_sidecar_audit_rejects_delimiter_role_on_arbitrary_token(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={
+            "token_domain_ids": [0] * 8,
+            "token_role_ids": [0, 1, 0, 0, 0, 0, 0, 0],
+            "token_confidence_ids": [0] * 8,
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report["total"]["fields"]["token_role_ids"]["bad_value_rows"] >= 1
 
 
 def test_sidecar_audit_rejects_bad_trained_token_count(tmp_path):

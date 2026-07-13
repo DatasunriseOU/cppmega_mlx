@@ -22,6 +22,10 @@ _DOMAIN_DELIMITER_BASES = (
     "CMAKE",
     "NINJA",
     "BAZEL",
+    "CONFIGURE",
+    "SQL",
+    "LINKER_DIAGNOSTIC",
+    "SANITIZER_OUTPUT",
     "AUTOCONF",
     "AUTOMAKE",
     "MESON",
@@ -41,6 +45,8 @@ _DOMAIN_DELIMITER_BASES = (
     "TEST_OUTPUT",
     "TOOL_OUTPUT",
 )
+
+_CASE5_SEMANTIC_DELIMITER_IDS = set(range(237, 245))
 
 
 def test_valid_id_to_token_mapping_passes() -> None:
@@ -91,6 +97,7 @@ def test_domain_delimiter_role_ids_are_reserved_contract_pairs() -> None:
     ids = list(tokenizer_contract.DOMAIN_DELIMITER_TOKEN_IDS.values())
     assert len(ids) == len(set(ids))
     assert not (set(ids) & set(REQUIRED_SPECIAL_TOKEN_IDS.values()))
+    assert _CASE5_SEMANTIC_DELIMITER_IDS.issubset(ids)
 
     added_tokens = {
         added["id"]: added["content"]

@@ -8,7 +8,11 @@ MLX route tests, and the Megatron sidecar converter.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from enum import IntEnum
+import json
+from pathlib import Path
+from typing import Any
 
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 
@@ -27,10 +31,12 @@ class DomainKind(IntEnum):
     SCONS = 10
     XMAKE = 11
     COMPILE_COMMANDS = 12
+    CONFIGURE = 13
     BASH = 20
     ZSH = 21
     SH = 22
     TCSH = 23
+    SQL = 30
     COMPILER_DIAGNOSTIC = 40
     BUILD_DIAGNOSTIC = 41
     COMPILER_ERROR = 42
@@ -38,6 +44,8 @@ class DomainKind(IntEnum):
     LINKER_ERROR = 44
     TEST_OUTPUT = 45
     TOOL_OUTPUT = 46
+    LINKER_DIAGNOSTIC = 47
+    SANITIZER_OUTPUT = 48
 
 
 class DomainRoleKind(IntEnum):
@@ -62,6 +70,9 @@ class DomainRoleKind(IntEnum):
     ENVIRONMENT = 18
     REDIRECT = 19
     PIPE = 20
+    COMMENT = 21
+    DOCSTRING = 22
+    PREPROCESSOR = 23
     SEVERITY = 30
     MESSAGE = 31
     FILE = 32
@@ -110,6 +121,7 @@ class DomainEdgeKind(IntEnum):
     LINK_CANDIDATE_DEF = 71
     TEST_FAILURE_LOCATION = 80
     TOOL_ACTION_RESULT = 90
+    EMBEDDED_DOMAIN = 100
 
 
 class ParseConfidence(IntEnum):
@@ -120,39 +132,103 @@ class ParseConfidence(IntEnum):
     EXACT = 4
 
 
+DOMAIN_SCHEMA_PATH = Path(__file__).with_name("domain_schema_v1.json")
+DOMAIN_SCHEMA = json.loads(DOMAIN_SCHEMA_PATH.read_text(encoding="utf-8"))
+if DOMAIN_SCHEMA.get("schema") != "cppmega_domain_sidecars_v1":
+    raise RuntimeError(f"unsupported frozen domain schema: {DOMAIN_SCHEMA_PATH}")
+
+
+def _enum_contract(enum_type: type[IntEnum], field: str) -> dict[str, int]:
+    expected = DOMAIN_SCHEMA.get(field)
+    actual = {item.name: int(item) for item in enum_type}
+    if expected != actual:
+        raise RuntimeError(
+            f"{DOMAIN_SCHEMA_PATH}: {field} drift: expected={expected}, actual={actual}"
+        )
+    return actual
+
+
+_enum_contract(DomainKind, "domain_kinds")
+_enum_contract(DomainRoleKind, "role_kinds")
+_enum_contract(DomainEdgeKind, "edge_kinds")
+_enum_contract(ParseConfidence, "confidence_kinds")
+
+DOMAIN_EDGE_FAMILIES: dict[str, frozenset[DomainEdgeKind]] = {
+    family: frozenset(DomainEdgeKind(int(kind)) for kind in kinds)
+    for family, kinds in DOMAIN_SCHEMA["edge_families"].items()
+}
+
+
+def domain_edge_family(kind: DomainEdgeKind | int) -> str:
+    """Return the one graph channel that owns ``kind``."""
+
+    try:
+        edge_kind = DomainEdgeKind(int(kind))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unknown domain edge kind {kind!r}") from exc
+    if edge_kind == DomainEdgeKind.UNKNOWN:
+        raise ValueError("unknown domain edge kind 0")
+    for family, kinds in DOMAIN_EDGE_FAMILIES.items():
+        if edge_kind in kinds:
+            return family
+    raise ValueError(f"domain edge kind {int(edge_kind)} has no graph family")
+
+
+def validate_domain_edge_kind(
+    kind: DomainEdgeKind | int,
+    *,
+    family: str | None = None,
+) -> DomainEdgeKind:
+    """Validate an edge kind and its graph-channel family."""
+
+    actual_family = domain_edge_family(kind)
+    if family is not None and actual_family != family:
+        raise ValueError(
+            f"domain edge kind {int(kind)} belongs to {actual_family}, not {family}"
+        )
+    return DomainEdgeKind(int(kind))
+
+
+def normalize_domain_edge_record(edge: Any, *, family: str) -> tuple[int, int, int]:
+    """Normalize one serialized edge without inventing fields."""
+
+    if hasattr(edge, "as_py"):
+        edge = edge.as_py()
+    if isinstance(edge, Mapping):
+        endpoint_pairs = (
+            ("from_char", "to_char"),
+            ("from", "to"),
+            ("src", "dst"),
+        )
+        selected = next(
+            (
+                (src_key, dst_key)
+                for src_key, dst_key in endpoint_pairs
+                if src_key in edge and dst_key in edge
+            ),
+            None,
+        )
+        if selected is None or "kind" not in edge:
+            raise ValueError("domain edge missing src/dst/kind")
+        src, dst, kind = edge[selected[0]], edge[selected[1]], edge["kind"]
+    elif (
+        isinstance(edge, Sequence)
+        and not isinstance(edge, (str, bytes, bytearray))
+        and len(edge) == 3
+    ):
+        src, dst, kind = edge
+    else:
+        raise ValueError("domain edge must be a mapping or length-3 sequence")
+    src_i, dst_i = int(src), int(dst)
+    if src_i < 0 or dst_i < 0:
+        raise ValueError(f"domain edge endpoints must be non-negative: {src_i}->{dst_i}")
+    edge_kind = validate_domain_edge_kind(int(kind), family=family)
+    return src_i, dst_i, int(edge_kind)
+
+
 DOMAIN_DELIMITER_ROLES: dict[DomainKind, tuple[str, str]] = {
-    DomainKind.CPP: ("CPP_CODE_START", "CPP_CODE_END"),
-    DomainKind.CMAKE: ("CMAKE_START", "CMAKE_END"),
-    DomainKind.MAKE: ("MAKE_START", "MAKE_END"),
-    DomainKind.NINJA: ("NINJA_START", "NINJA_END"),
-    DomainKind.BAZEL: ("BAZEL_START", "BAZEL_END"),
-    DomainKind.AUTOCONF: ("AUTOCONF_START", "AUTOCONF_END"),
-    DomainKind.AUTOMAKE: ("AUTOMAKE_START", "AUTOMAKE_END"),
-    DomainKind.MESON: ("MESON_START", "MESON_END"),
-    DomainKind.GN: ("GN_START", "GN_END"),
-    DomainKind.SCONS: ("SCONS_START", "SCONS_END"),
-    DomainKind.XMAKE: ("XMAKE_START", "XMAKE_END"),
-    DomainKind.COMPILE_COMMANDS: (
-        "COMPILE_COMMANDS_START",
-        "COMPILE_COMMANDS_END",
-    ),
-    DomainKind.BASH: ("BASH_START", "BASH_END"),
-    DomainKind.ZSH: ("ZSH_START", "ZSH_END"),
-    DomainKind.SH: ("SH_START", "SH_END"),
-    DomainKind.TCSH: ("TCSH_START", "TCSH_END"),
-    DomainKind.COMPILER_DIAGNOSTIC: (
-        "COMPILER_DIAGNOSTIC_START",
-        "COMPILER_DIAGNOSTIC_END",
-    ),
-    DomainKind.BUILD_DIAGNOSTIC: (
-        "BUILD_DIAGNOSTIC_START",
-        "BUILD_DIAGNOSTIC_END",
-    ),
-    DomainKind.COMPILER_ERROR: ("COMPILER_ERROR_START", "COMPILER_ERROR_END"),
-    DomainKind.BUILD_ERROR: ("BUILD_ERROR_START", "BUILD_ERROR_END"),
-    DomainKind.LINKER_ERROR: ("LINKER_ERROR_START", "LINKER_ERROR_END"),
-    DomainKind.TEST_OUTPUT: ("TEST_OUTPUT_START", "TEST_OUTPUT_END"),
-    DomainKind.TOOL_OUTPUT: ("TOOL_OUTPUT_START", "TOOL_OUTPUT_END"),
+    DomainKind(int(spec["domain_id"])): (str(spec["start"]), str(spec["end"]))
+    for spec in DOMAIN_SCHEMA["delimiter_roles"].values()
 }
 
 
@@ -192,11 +268,17 @@ def validate_domain_delimiter_contract() -> None:
 
 
 __all__ = [
+    "DOMAIN_SCHEMA",
+    "DOMAIN_SCHEMA_PATH",
+    "DOMAIN_EDGE_FAMILIES",
     "DOMAIN_DELIMITER_ROLES",
     "DomainEdgeKind",
     "DomainKind",
     "DomainRoleKind",
     "ParseConfidence",
+    "domain_edge_family",
     "delimiter_token_ids",
+    "normalize_domain_edge_record",
     "validate_domain_delimiter_contract",
+    "validate_domain_edge_kind",
 ]

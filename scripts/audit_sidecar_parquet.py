@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
@@ -78,14 +79,41 @@ def _load_schema_contracts():
     return (
         domain.DomainKind,
         domain.DomainRoleKind,
+        domain.DomainEdgeKind,
         domain.ParseConfidence,
+        domain.DOMAIN_EDGE_FAMILIES,
+        domain.DOMAIN_DELIMITER_ROLES,
         tokenizer.DOMAIN_DELIMITER_TOKEN_IDS,
     )
 
 
-DomainKind, DomainRoleKind, ParseConfidence, DOMAIN_DELIMITER_TOKEN_IDS = (
-    _load_schema_contracts()
-)
+(
+    DomainKind,
+    DomainRoleKind,
+    DomainEdgeKind,
+    ParseConfidence,
+    DOMAIN_EDGE_FAMILIES,
+    DOMAIN_DELIMITER_ROLES,
+    DOMAIN_DELIMITER_TOKEN_IDS,
+) = _load_schema_contracts()
+
+_EDGE_FAMILY_BY_FIELD = {
+    "token_domain_edges": "domain",
+    "token_build_edges": "build",
+    "token_shell_edges": "shell",
+    "token_diagnostic_edges": "diagnostic",
+    "token_cross_domain_edges": "cross_domain",
+}
+_EDGE_KIND_IDS_BY_FAMILY = {
+    family: frozenset(int(kind) for kind in kinds)
+    for family, kinds in DOMAIN_EDGE_FAMILIES.items()
+}
+_DOMAIN_DELIMITER_BY_ID: dict[int, tuple[int, str, int]] = {}
+for _domain, (_start_role, _end_role) in DOMAIN_DELIMITER_ROLES.items():
+    _start_id = int(DOMAIN_DELIMITER_TOKEN_IDS[_start_role])
+    _end_id = int(DOMAIN_DELIMITER_TOKEN_IDS[_end_role])
+    _DOMAIN_DELIMITER_BY_ID[_start_id] = (int(_domain), "start", _end_id)
+    _DOMAIN_DELIMITER_BY_ID[_end_id] = (int(_domain), "end", _end_id)
 
 
 TOKEN_COLUMNS = (
@@ -157,6 +185,8 @@ _DIAGNOSTIC_DOMAIN_IDS = {
     int(DomainKind.LINKER_ERROR),
     int(DomainKind.TEST_OUTPUT),
     int(DomainKind.TOOL_OUTPUT),
+    int(DomainKind.LINKER_DIAGNOSTIC),
+    int(DomainKind.SANITIZER_OUTPUT),
 }
 
 _DIAGNOSTIC_DELIMITER_IDS = np.asarray(
@@ -596,6 +626,9 @@ def _edge_stats_and_validate(
     field: str,
     rows: list[Any],
     n_chunks: np.ndarray,
+    chunk_starts: list[Any],
+    chunk_ends: list[Any],
+    source_doc_rows: list[Any],
     row_bad: np.ndarray,
 ) -> None:
     fs = stats.field_stats[field]
@@ -615,6 +648,25 @@ def _edge_stats_and_validate(
                 row_bad[idx] = True
                 fs.bad_value_rows += 1
                 break
+            starts = list(_iter_or_empty(chunk_starts[idx]))
+            ends = list(_iter_or_empty(chunk_ends[idx]))
+            source_ids = list(_iter_or_empty(source_doc_rows[idx]))
+            endpoint_docs: list[int] = []
+            for chunk_index in (src, dst):
+                start = _as_int(starts[chunk_index]) if chunk_index < len(starts) else None
+                end = _as_int(ends[chunk_index]) if chunk_index < len(ends) else None
+                if start is None or end is None or start < 0 or end <= start or end > len(source_ids):
+                    endpoint_docs = []
+                    break
+                docs = {int(value) for value in source_ids[start:end] if _as_int(value) is not None}
+                if len(docs) != 1 or next(iter(docs)) <= 0:
+                    endpoint_docs = []
+                    break
+                endpoint_docs.append(next(iter(docs)))
+            if len(endpoint_docs) != 2 or endpoint_docs[0] != endpoint_docs[1]:
+                row_bad[idx] = True
+                fs.bad_value_rows += 1
+                break
 
 
 def _edge_triple_stats_and_validate(
@@ -622,7 +674,8 @@ def _edge_triple_stats_and_validate(
     stats: AuditStats,
     field: str,
     rows: list[Any],
-    token_lengths: np.ndarray,
+    valid_lengths: np.ndarray,
+    source_doc_rows: list[Any],
     row_bad: np.ndarray,
 ) -> None:
     fs = stats.field_stats[field]
@@ -635,7 +688,10 @@ def _edge_triple_stats_and_validate(
         fs.slots_total += len(edges)
         fs.slots_nonzero += len(edges)
         stats.edge_count[field] = stats.edge_count.get(field, 0) + len(edges)
-        limit = int(token_lengths[idx]) if idx < len(token_lengths) else 0
+        limit = int(valid_lengths[idx]) if idx < len(valid_lengths) else 0
+        family = _EDGE_FAMILY_BY_FIELD[field]
+        allowed_kinds = _EDGE_KIND_IDS_BY_FAMILY[family]
+        source_ids = list(_iter_or_empty(source_doc_rows[idx]))
         for edge in edges:
             src, dst, kind = _flatten_edge_triple(edge)
             if (
@@ -644,9 +700,16 @@ def _edge_triple_stats_and_validate(
                 or kind is None
                 or src < 0
                 or dst < 0
-                or kind < 0
+                or kind not in allowed_kinds
                 or src >= limit
                 or dst >= limit
+                or src >= len(source_ids)
+                or dst >= len(source_ids)
+                or _as_int(source_ids[src]) is None
+                or _as_int(source_ids[dst]) is None
+                or int(source_ids[src]) <= 0
+                or int(source_ids[dst]) <= 0
+                or int(source_ids[src]) != int(source_ids[dst])
             ):
                 row_bad[idx] = True
                 fs.bad_value_rows += 1
@@ -659,40 +722,147 @@ def _validate_domain_delimiter_sidecars(
     table: Any,
     names: set[str],
     input_ids_col: Any,
-    input_lengths: np.ndarray,
+    valid_lengths: np.ndarray,
     row_bad: np.ndarray,
 ) -> None:
-    flat_input = _flat_numpy(input_ids_col)
-    if len(flat_input) == 0:
-        return
-    delimiter_ids = np.asarray(sorted(DOMAIN_DELIMITER_TOKEN_IDS.values()), dtype=flat_input.dtype)
-    has_delimiter_flat = np.isin(flat_input, delimiter_ids)
-    if not np.any(has_delimiter_flat):
-        return
-    rows_with_delimiter = _rows_with_flat_mask(input_lengths, has_delimiter_flat)
-    if "token_domain_ids" not in names or "token_role_ids" not in names:
+    token_rows = input_ids_col.to_pylist()
+    rows_with_delimiter = np.asarray(
+        [
+            any(
+                int(token_id) in _DOMAIN_DELIMITER_BY_ID
+                for token_id in list(_iter_or_empty(tokens))[: int(valid_lengths[index])]
+            )
+            for index, tokens in enumerate(token_rows)
+        ],
+        dtype=bool,
+    )
+    required = ("token_domain_ids", "token_role_ids", "token_confidence_ids")
+    if np.any(rows_with_delimiter) and any(name not in names for name in required):
         row_bad |= rows_with_delimiter
-        missing = [
-            name
-            for name in ("token_domain_ids", "token_role_ids")
-            if name not in names
-        ]
+        missing = [name for name in required if name not in names]
         stats.errors.append(
             f"{int(np.count_nonzero(rows_with_delimiter))} rows contain domain delimiter tokens "
             f"but missing sidecars: {missing}"
         )
         return
-    role_flat = _flat_numpy(table.column("token_role_ids"))
-    domain_flat = _flat_numpy(table.column("token_domain_ids"))
-    if len(role_flat) != len(flat_input) or len(domain_flat) != len(flat_input):
+    if "token_role_ids" not in names:
         return
-    bad_delimiter_sidecars = has_delimiter_flat & (
-        (role_flat != int(DomainRoleKind.DELIMITER)) | (domain_flat == 0)
+    if any(name not in names for name in required):
+        role_rows = table.column("token_role_ids").to_pylist()
+        for row_index, roles in enumerate(role_rows):
+            valid = int(valid_lengths[row_index])
+            if any(
+                int(role) == int(DomainRoleKind.DELIMITER)
+                for role in list(_iter_or_empty(roles))[:valid]
+            ):
+                row_bad[row_index] = True
+                stats.field_stats["token_role_ids"].bad_value_rows += 1
+        return
+    domain_rows = table.column("token_domain_ids").to_pylist()
+    role_rows = table.column("token_role_ids").to_pylist()
+    confidence_rows = table.column("token_confidence_ids").to_pylist()
+    for row_index, (tokens, domains, roles, confidence) in enumerate(
+        zip(token_rows, domain_rows, role_rows, confidence_rows, strict=True)
+    ):
+        valid = int(valid_lengths[row_index])
+        tokens = list(_iter_or_empty(tokens))[:valid]
+        domains = list(_iter_or_empty(domains))[:valid]
+        roles = list(_iter_or_empty(roles))[:valid]
+        confidence = list(_iter_or_empty(confidence))[:valid]
+        if not (len(tokens) == len(domains) == len(roles) == len(confidence) == valid):
+            continue
+        stack: list[tuple[int, int]] = []
+        bad_fields: set[str] = set()
+        for token_id, domain_id, role_id, confidence_id in zip(
+            tokens, domains, roles, confidence, strict=True
+        ):
+            marker = _DOMAIN_DELIMITER_BY_ID.get(int(token_id))
+            if marker is None:
+                if int(role_id) == int(DomainRoleKind.DELIMITER):
+                    bad_fields.add("token_role_ids")
+                continue
+            expected_domain, direction, expected_close = marker
+            if int(domain_id) != expected_domain:
+                bad_fields.add("token_domain_ids")
+            if int(role_id) != int(DomainRoleKind.DELIMITER):
+                bad_fields.add("token_role_ids")
+            if int(confidence_id) != int(ParseConfidence.EXACT):
+                bad_fields.add("token_confidence_ids")
+            if direction == "start":
+                stack.append((expected_domain, expected_close))
+            elif not stack or stack[-1] != (expected_domain, int(token_id)):
+                bad_fields.add("token_role_ids")
+            else:
+                stack.pop()
+        if stack:
+            bad_fields.add("token_role_ids")
+        if bad_fields:
+            row_bad[row_index] = True
+            for field in bad_fields:
+                stats.field_stats[field].bad_value_rows += 1
+
+
+def _validate_token_source_doc_ids(
+    *,
+    stats: AuditStats,
+    table: Any,
+    names: set[str],
+    input_lengths: np.ndarray,
+    valid_lengths: np.ndarray,
+    row_bad: np.ndarray,
+) -> list[Any]:
+    field = "token_source_doc_ids"
+    nonempty_rows = valid_lengths > 0
+    if field not in names:
+        row_bad |= nonempty_rows
+        stats.errors.append(
+            f"{int(np.count_nonzero(nonempty_rows))} rows are missing required {field}"
+        )
+        return [[] for _ in range(len(valid_lengths))]
+
+    column = table.column(field)
+    value_type = getattr(column.type, "value_type", None)
+    if value_type != pa.uint32():
+        row_bad |= nonempty_rows
+        stats.field_stats[field].bad_value_rows += int(np.count_nonzero(nonempty_rows))
+        stats.errors.append(f"{field} must be list<uint32>, got {column.type}")
+
+    rows = column.to_pylist()
+    declared_id_rows = (
+        table.column("source_doc_ids").to_pylist()
+        if "source_doc_ids" in names
+        else [[] for _ in rows]
     )
-    count = int(np.count_nonzero(_rows_with_flat_mask(input_lengths, bad_delimiter_sidecars)))
-    if count:
-        stats.field_stats["token_role_ids"].bad_value_rows += count
-        row_bad |= _rows_with_flat_mask(input_lengths, bad_delimiter_sidecars)
+    declared_length_rows = (
+        table.column("source_doc_token_lengths").to_pylist()
+        if "source_doc_token_lengths" in names
+        else [[] for _ in rows]
+    )
+    for row_index, (values, declared_ids, declared_lengths) in enumerate(
+        zip(rows, declared_id_rows, declared_length_rows, strict=True)
+    ):
+        capacity = int(input_lengths[row_index])
+        valid = int(valid_lengths[row_index])
+        values = list(_iter_or_empty(values))
+        expected = [
+            int(source_id)
+            for source_id, length in zip(
+                _iter_or_empty(declared_ids),
+                _iter_or_empty(declared_lengths),
+                strict=True,
+            )
+            for _ in range(int(length))
+        ]
+        bad = (
+            len(values) != capacity
+            or len(expected) != valid
+            or any(_as_int(value) is None or int(value) <= 0 for value in values[:valid])
+            or [int(value) for value in values[:valid]] != expected
+        )
+        if bad:
+            row_bad[row_index] = True
+            stats.field_stats[field].bad_value_rows += 1
+    return rows
 
 
 def _validate_diagnostic_rows_have_edges_or_raw(
@@ -827,7 +997,7 @@ def _audit_table(
             table=table,
             names=names,
             input_ids_col=input_ids,
-            input_lengths=input_lengths,
+            valid_lengths=valid,
             row_bad=row_bad,
         )
         _validate_diagnostic_rows_have_edges_or_raw(
@@ -890,6 +1060,15 @@ def _audit_table(
                     hunk=(name == "hunk_id_per_token"),
                     row_bad=row_bad,
                 )
+
+        source_doc_rows = _validate_token_source_doc_ids(
+            stats=stats,
+            table=table,
+            names=names,
+            input_lengths=input_lengths,
+            valid_lengths=valid,
+            row_bad=row_bad,
+        )
 
         for name in SOURCE_COLUMNS:
             if name in names:
@@ -1001,6 +1180,17 @@ def _audit_table(
                     field=name,
                     rows=table.column(name).to_pylist(),
                     n_chunks=n_chunks,
+                    chunk_starts=(
+                        table.column("token_chunk_starts").to_pylist()
+                        if "token_chunk_starts" in names
+                        else [[] for _ in range(stats.rows)]
+                    ),
+                    chunk_ends=(
+                        table.column("token_chunk_ends").to_pylist()
+                        if "token_chunk_ends" in names
+                        else [[] for _ in range(stats.rows)]
+                    ),
+                    source_doc_rows=source_doc_rows,
                     row_bad=row_bad,
                 )
 
@@ -1016,7 +1206,8 @@ def _audit_table(
                     stats=stats,
                     field=name,
                     rows=table.column(name).to_pylist(),
-                    token_lengths=input_lengths,
+                    valid_lengths=valid,
+                    source_doc_rows=source_doc_rows,
                     row_bad=row_bad,
                 )
 
