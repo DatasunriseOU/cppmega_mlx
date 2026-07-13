@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import struct
@@ -255,9 +256,15 @@ def _write_structured_multishard_fixture(
 
 
 def _run_train_hybrid_tiny(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    # This suite validates indexed-dataset ingress, not optional kernel discovery.
+    # An explicit reference route keeps the subprocess independent of any shared
+    # TileLang/TVM development checkout configured by the parent pytest process.
+    env["CPPMEGA_KERNEL_PATH"] = "ref"
     return subprocess.run(
         [sys.executable, str(TRAIN_HYBRID_TINY), *args],
         cwd=ROOT,
+        env=env,
         text=True,
         capture_output=True,
         timeout=45,
@@ -1247,6 +1254,185 @@ def test_mmididx_graph_sidecars_are_sequence_aligned_routes(tmp_path) -> None:
     np.testing.assert_array_equal(packet0.chunk_dep_levels, np.array([0, 1, 2], dtype=np.int32))
     assert packet1.graph.edge("call").to_pairs() == [(0, 1)]
     assert packet1.graph.edge("type").num_edges == 0
+
+
+def test_compact_fixed_rows_restore_padding_and_document_graphs(tmp_path) -> None:
+    prefix = tmp_path / "compact_fixed_rows"
+    docs = [
+        np.array([1, 2, 3], dtype=np.int32),
+        np.array([10, 11], dtype=np.int32),
+    ]
+    _write_mmididx(prefix, docs, dtype=np.int32)
+    sidecar = _write_graph_sidecars(
+        prefix,
+        call_edges=[
+            np.array([[0, 1]], dtype=np.int32),
+            np.zeros((0, 2), dtype=np.int32),
+        ],
+        type_edges=[
+            np.zeros((0, 2), dtype=np.int32),
+            np.array([[0, 0]], dtype=np.int32),
+        ],
+        chunk_starts=[np.array([0, 1]), np.array([0])],
+        chunk_ends=[np.array([1, 3]), np.array([2])],
+        chunk_kinds=[np.array([4, 5]), np.array([6])],
+        chunk_dep_levels=[np.array([0, 1]), np.array([0])],
+    )
+    loss_mask = np.array([1, 1, 0, 1, 0], dtype=np.uint8)
+    document_ids = np.array([1, 1, 1, 2, 2], dtype=np.uint16)
+    hunk_ids = np.array([0, 0, -1, 2, -1], dtype=np.int32)
+    loss_mask.tofile(tmp_path / "loss_mask.bin")
+    document_ids.tofile(tmp_path / "doc_ids.bin")
+    hunk_ids.tofile(tmp_path / "hunk_ids.bin")
+    sidecar.update(
+        {
+            "token_count": 5,
+            "source_capacity_token_count": 8,
+            "document_count": 2,
+            "side_channel_paths": {
+                "loss_mask": {"path": "loss_mask.bin", "dtype": "uint8"},
+                "doc_ids": {"path": "doc_ids.bin", "dtype": "uint16"},
+                "hunk_id_per_token": {"path": "hunk_ids.bin", "dtype": "int32"},
+            },
+        }
+    )
+    prefix.with_suffix(".idx.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=2)
+    batch = next(dataset.iter_batches())
+
+    assert dataset.num_samples == 2
+    np.testing.assert_array_equal(
+        np.array(batch.tokens),
+        np.array([[1, 2, 3, 0], [10, 11, 0, 0]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.loss_mask),
+        np.array([[1, 1, 0, 0], [1, 0, 0, 0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.document_ids),
+        np.array([[1, 1, 1, 0], [2, 2, 0, 0]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(batch.side_channel_map()["temporal_diff"]["hunk_ids"]),
+        np.array([[0, 0, -1, -1], [2, -1, -1, -1]], dtype=np.int32),
+    )
+    assert dataset.graph_route_packet_for_sample(0).graph.edge("call").to_pairs() == [
+        (0, 1)
+    ]
+    assert dataset.graph_route_packet_for_sample(1).graph.edge("type").to_pairs() == [
+        (0, 0)
+    ]
+
+
+def test_compact_fixed_rows_reject_inconsistent_capacity_metadata(tmp_path) -> None:
+    prefix = tmp_path / "bad_compact_fixed_rows"
+    _write_mmididx(prefix, [np.arange(3, dtype=np.int32)], dtype=np.int32)
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(
+            {
+                "token_count": 3,
+                "source_capacity_token_count": 5,
+                "document_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"sequence_count \* seq_len"):
+        MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+
+def test_mmididx_v2_domain_routes_and_token_sidecars_round_trip(tmp_path) -> None:
+    prefix = tmp_path / "domain_routes_v2"
+    docs = [np.arange(4, dtype=np.int32), np.arange(10, 14, dtype=np.int32)]
+    _write_mmididx(prefix, docs, dtype=np.int32)
+    sidecar = _write_graph_sidecars(
+        prefix,
+        call_edges=[np.array([[0, 1]], dtype=np.int32), np.zeros((0, 2), dtype=np.int32)],
+        type_edges=[np.zeros((0, 2), dtype=np.int32), np.zeros((0, 2), dtype=np.int32)],
+        chunk_starts=[np.array([0, 2]), np.array([0, 2])],
+        chunk_ends=[np.array([2, 4]), np.array([2, 4])],
+        chunk_kinds=[np.array([1, 2]), np.array([1, 2])],
+        chunk_dep_levels=[np.array([0, 1]), np.array([0, 1])],
+    )
+    sidecar["graph_sidecar_schema"] = "cppmega_graph_routes_v2"
+    graph_paths = sidecar["graph_sidecar_paths"]
+    for key, entry in graph_paths.items():
+        entry["coordinate_space"] = (
+            "chunk_index"
+            if key in {"token_call_edges", "token_type_edges", "token_chunk_kinds", "token_chunk_dep_levels"}
+            else "token_index"
+        )
+
+    offsets_path = tmp_path / "domain_offsets.bin"
+    data_path = tmp_path / "domain_data.bin"
+    np.array([0, 1, 2], dtype=np.int64).tofile(offsets_path)
+    np.array([[0, 3, 20], [1, 2, 21]], dtype=np.int32).tofile(data_path)
+    graph_paths["token_domain_edges"] = {
+        "kind": "edge_triples",
+        "offsets_path": offsets_path.name,
+        "data_path": data_path.name,
+        "offset_dtype": "int64",
+        "dtype": "int32",
+        "item_count": 2,
+        "shape_tail": [3],
+        "coordinate_space": "token_index",
+    }
+    for name in (
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+    ):
+        empty_offsets = tmp_path / f"{name}_offsets.bin"
+        empty_data = tmp_path / f"{name}_data.bin"
+        np.zeros(3, dtype=np.int64).tofile(empty_offsets)
+        np.zeros((0, 3), dtype=np.int32).tofile(empty_data)
+        graph_paths[name] = {
+            "kind": "edge_triples",
+            "offsets_path": empty_offsets.name,
+            "data_path": empty_data.name,
+            "offset_dtype": "int64",
+            "dtype": "int32",
+            "item_count": 0,
+            "shape_tail": [3],
+            "coordinate_space": "token_index",
+        }
+
+    side_channel_paths = {}
+    token_sidecars = {
+        "loss_mask": np.array([1, 1, 1, 0, 1, 1, 1, 0], dtype=np.uint8),
+        "doc_ids": np.array([1] * 8, dtype=np.int32),
+        "token_domain_ids": np.array([20, 20, 20, 20, 21, 21, 21, 21], dtype=np.uint16),
+        "token_role_ids": np.arange(8, dtype=np.uint16),
+        "token_entity_ids": np.arange(8, dtype=np.uint32),
+        "token_scope_ids": np.arange(8, dtype=np.uint32),
+        "token_source_doc_ids": np.array([1, 1, 1, 1, 2, 2, 2, 2], dtype=np.uint32),
+        "token_confidence_ids": np.ones(8, dtype=np.uint8),
+        "hunk_id_per_token": np.array([-1, 0, 0, -1, -1, 1, 1, -1], dtype=np.int32),
+        "edit_op_per_token": np.arange(8, dtype=np.uint8),
+    }
+    for name, values in token_sidecars.items():
+        path = tmp_path / f"{name}.bin"
+        values.tofile(path)
+        side_channel_paths[name] = {"path": path.name, "dtype": values.dtype.name}
+    sidecar["side_channel_paths"] = side_channel_paths
+    prefix.with_suffix(".idx.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+    batch = next(dataset.iter_batches())
+    packet = dataset.graph_route_packet_for_sample(0)
+
+    np.testing.assert_array_equal(np.array(batch.loss_mask), [np.array([1, 1, 1, 0])])
+    domain = batch.side_channel_map()["domain_routes"]
+    np.testing.assert_array_equal(np.array(domain["domain_ids"]), [[20, 20, 20, 20]])
+    temporal = batch.side_channel_map()["temporal_diff"]
+    np.testing.assert_array_equal(np.array(temporal["hunk_ids"]), [[-1, 0, 0, -1]])
+    assert packet.graph.edge("call").to_pairs() == [(0, 1)]
+    assert packet.graph.edge("domain").to_pairs() == [(0, 3)]
+    np.testing.assert_array_equal(packet.edge_kinds["domain"], np.array([20], dtype=np.int32))
 
 
 def test_mmididx_graph_sidecars_fail_closed_for_window_slicing(tmp_path) -> None:

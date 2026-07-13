@@ -15,11 +15,16 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from cppmega_mlx.data.domain_schema import DomainKind, DomainRoleKind, ParseConfidence
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
@@ -378,70 +383,74 @@ def _count_bad_flat_values(
         row_bad |= rows
 
 
-def _validate_loss_mask_against_doc_ids(
+def _validate_packed_document_boundaries(
     *,
     stats: AuditStats,
     loss_mask_col: Any,
     doc_ids_col: Any,
+    source_doc_token_lengths_col: Any,
     input_lengths: np.ndarray,
     valid: np.ndarray,
     row_bad: np.ndarray,
 ) -> None:
-    """Value-level check that `loss_mask` equals the producer's doc-boundary rule.
+    """Validate boundaries against independent logical-document lengths.
 
-    This is the check that catches C1-style corruption (an all-ones loss_mask
-    rebuilt over a multi-document packed row). Lengths are preserved by that
-    corruption, so the length checks alone cannot see it; only a value-level
-    comparison against `doc_ids` can.
-
-    Canonical rule (see `pack_enriched_rows._loss_mask_for_packed_docs`):
-
-        loss_mask[pos] == 1  iff  pos + 1 < valid  AND  doc_ids[pos] == doc_ids[pos + 1]
-
-    i.e. 1 only when the next token belongs to the SAME document and is itself a
-    real (non-pad) token; 0 at every inter-document boundary, at the last valid
-    token (no next token to predict), and across the entire pad region.
+    ``doc_ids`` cannot be its own oracle: an old producer assigned the same ID
+    to distinct functions sharing file provenance, and a mask derived from those
+    IDs looked internally consistent while still training across documents.
+    ``source_doc_token_lengths`` is the independent packed-document contract.
     """
-    rows = len(input_lengths)
-    if rows == 0:
-        return
-    lengths = input_lengths.astype(np.int64)
-    n = int(lengths.sum())
-    doc_flat = _flat_numpy(doc_ids_col)
-    lm_flat = _flat_numpy(loss_mask_col)
-    # The vectorized derivation below is only meaningful when both columns share
-    # the canonical per-row layout (length == input_ids length). Any row whose
-    # doc_ids/loss_mask length differs is already flagged as a bad row by the
-    # length checks (and blocks the upload under the fail-closed default), so a
-    # layout-inconsistent file is ALREADY failing the gate -- skip deriving the
-    # mask against wrong offsets rather than fabricate a value comparison.
-    if len(doc_flat) != n or len(lm_flat) != n:
-        return
-    doc_flat = doc_flat.astype(np.int64)
-    lm_flat = lm_flat.astype(np.int64)
+    doc_rows = doc_ids_col.to_pylist()
+    mask_rows = loss_mask_col.to_pylist()
+    source_length_rows = source_doc_token_lengths_col.to_pylist()
+    bad_doc_ids = 0
+    bad_masks = 0
 
-    row_idx = np.repeat(np.arange(rows, dtype=np.int64), lengths)
-    starts = np.zeros(rows, dtype=np.int64)
-    if rows > 1:
-        np.cumsum(lengths[:-1], out=starts[1:])
-    pos = np.arange(n, dtype=np.int64) - starts[row_idx]
+    for row_index, (capacity, valid_count) in enumerate(zip(input_lengths, valid)):
+        capacity = int(capacity)
+        valid_count = int(valid_count)
+        raw_lengths = source_length_rows[row_index]
+        if raw_lengths is None:
+            row_bad[row_index] = True
+            stats.errors.append(f"row {row_index}: missing source_doc_token_lengths")
+            continue
+        logical_lengths = [int(value) for value in raw_lengths]
+        if (
+            (valid_count > 0 and not logical_lengths)
+            or any(length <= 0 for length in logical_lengths)
+            or sum(logical_lengths) != valid_count
+        ):
+            row_bad[row_index] = True
+            stats.field_stats["source_doc_token_lengths"].bad_value_rows += 1
+            stats.errors.append(
+                f"row {row_index}: source_doc_token_lengths={logical_lengths!r} "
+                f"do not partition valid_token_count={valid_count}"
+            )
+            continue
 
-    same_next = np.zeros(n, dtype=bool)
-    if n > 1:
-        same_next[:-1] = doc_flat[:-1] == doc_flat[1:]
-    # Never let the neighbour comparison cross a row boundary.
-    is_row_last = pos == (lengths[row_idx] - 1)
-    same_next &= ~is_row_last
-    # pos + 1 < valid  (excludes the last valid token and the whole pad region).
-    within_valid = pos < (valid[row_idx].astype(np.int64) - 1)
+        expected_doc_ids: list[int] = []
+        expected_loss_mask: list[int] = []
+        for local_doc_id, length in enumerate(logical_lengths, start=1):
+            expected_doc_ids.extend([local_doc_id] * length)
+            expected_loss_mask.extend([1] * (length - 1))
+            expected_loss_mask.append(0)
+        pad_doc_id = len(logical_lengths) if logical_lengths else 0
+        expected_doc_ids.extend([pad_doc_id] * (capacity - valid_count))
+        expected_loss_mask.extend([0] * (capacity - valid_count))
 
-    expected = (same_next & within_valid).astype(np.int64)
-    mismatch = lm_flat != expected
-    bad_rows = _rows_with_flat_mask(lengths, mismatch)
-    count = int(np.count_nonzero(bad_rows))
-    if count:
-        stats.field_stats["loss_mask"].bad_value_rows += count
-        row_bad |= bad_rows
+        actual_doc_ids = [int(value) for value in (doc_rows[row_index] or [])]
+        actual_loss_mask = [int(value) for value in (mask_rows[row_index] or [])]
+        if actual_doc_ids != expected_doc_ids:
+            row_bad[row_index] = True
+            bad_doc_ids += 1
+        if actual_loss_mask != expected_loss_mask:
+            row_bad[row_index] = True
+            bad_masks += 1
+
+    if bad_doc_ids:
+        stats.field_stats["doc_ids"].bad_value_rows += bad_doc_ids
+    if bad_masks:
+        stats.field_stats["loss_mask"].bad_value_rows += bad_masks
 
 
 def _validate_target_ids_shift(
@@ -689,47 +698,25 @@ def _validate_diagnostic_rows_have_edges_or_raw(
         )
 
 
-def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -> dict[str, Any]:
-    path = Path(path_str)
-    stats = AuditStats(files=1)
-    try:
-        pf = pq.ParquetFile(path)
-        top_level_names = set(pf.schema_arrow.names)
-        cols = [name for name in ALL_FIELDS if name in top_level_names]
-        cols += [
-            name
-            for name in ("valid_token_count", "trained_token_count", "slack_tokens")
-            if name in top_level_names
-        ]
-        table = pf.read(columns=cols)
-    except Exception as exc:
-        # Fail loud: a shard we cannot even read cannot be certified for upload.
-        # Re-raise with where+what so the gate crashes instead of recording a
-        # degraded "bad file" entry that a caller might overlook.
-        raise RuntimeError(
-            f"{path}: parquet read failed: {type(exc).__name__}: {exc}"
-        ) from exc
+def _audit_table(
+    *,
+    path: Path,
+    table: object,
+    names: set[str],
+    expected_len: int | None,
+    vocab_size: int | None,
+) -> AuditStats:
+    """Audit one bounded parquet row group and return additive statistics."""
 
-    names = set(cols)
-    for name in ALL_FIELDS:
-        if name not in names:
-            stats.field_stats[name].missing_files += 1
-
-    expected_len = int(bucket) if bucket.isdigit() else None
+    stats = AuditStats()
     stats.rows = table.num_rows
     row_bad = np.zeros(stats.rows, dtype=bool)
 
     try:
         if "input_ids" not in names:
-            stats.bad_files += 1
             stats.bad_rows = stats.rows
             stats.errors.append(f"{path}: missing input_ids")
-            return {
-                "kind": kind,
-                "bucket": bucket,
-                "path": path_str,
-                "stats": stats.as_dict(),
-            }
+            return stats
 
         input_ids = table.column("input_ids")
         input_lengths = _add_numeric_list_stats(
@@ -804,14 +791,14 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                     row_bad=row_bad,
                 )
 
-        # Value-level loss-target correctness: loss_mask MUST match the
-        # doc_ids-derived boundary rule. Length checks alone cannot catch a
-        # corrupted (e.g. all-ones) loss_mask because lengths are preserved.
-        if "loss_mask" in names and "doc_ids" in names:
-            _validate_loss_mask_against_doc_ids(
+        # Derive both doc_ids and loss_mask from logical source-document lengths.
+        # Never trust doc_ids as the oracle for its own boundary correctness.
+        if all(name in names for name in ("loss_mask", "doc_ids", "source_doc_token_lengths")):
+            _validate_packed_document_boundaries(
                 stats=stats,
                 loss_mask_col=table.column("loss_mask"),
                 doc_ids_col=table.column("doc_ids"),
+                source_doc_token_lengths_col=table.column("source_doc_token_lengths"),
                 input_lengths=input_lengths,
                 valid=valid,
                 row_bad=row_bad,
@@ -894,6 +881,20 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                     bad_mask=bad_ends,
                     row_bad=row_bad,
                 )
+        if "token_chunk_starts" in names and "token_chunk_ends" in names:
+            start_rows = table.column("token_chunk_starts").to_pylist()
+            end_rows = table.column("token_chunk_ends").to_pylist()
+            for row_idx, (row_starts, row_ends) in enumerate(
+                zip(start_rows, end_rows, strict=True)
+            ):
+                if len(row_starts or []) != len(row_ends or []):
+                    continue
+                if any(
+                    int(start) >= int(end)
+                    for start, end in zip(row_starts or [], row_ends or [], strict=True)
+                ):
+                    row_bad[row_idx] = True
+                    stats.field_stats["token_chunk_ends"].bad_value_rows += 1
 
         if "platform_ids" in names:
             _add_numeric_list_stats(
@@ -969,6 +970,56 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
         ) from exc
 
     stats.bad_rows = int(np.count_nonzero(row_bad))
+    return stats
+
+
+def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -> dict[str, Any]:
+    path = Path(path_str)
+    stats = AuditStats(files=1)
+    try:
+        pf = pq.ParquetFile(path)
+        top_level_names = set(pf.schema_arrow.names)
+        cols = [name for name in ALL_FIELDS if name in top_level_names]
+        cols += [
+            name
+            for name in ("valid_token_count", "trained_token_count", "slack_tokens")
+            if name in top_level_names
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            f"{path}: parquet open failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    names = set(cols)
+    for name in ALL_FIELDS:
+        if name not in names:
+            stats.field_stats[name].missing_files += 1
+
+    if "input_ids" not in names:
+        stats.rows = int(pf.metadata.num_rows)
+        stats.bad_files = 1
+        stats.bad_rows = stats.rows
+        stats.errors.append(f"{path}: missing input_ids")
+    else:
+        expected_len = int(bucket) if bucket.isdigit() else None
+        for row_group_idx in range(pf.metadata.num_row_groups):
+            try:
+                table = pf.read_row_group(row_group_idx, columns=cols)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{path}#row_group{row_group_idx}: parquet read failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            stats.add(
+                _audit_table(
+                    path=path,
+                    table=table,
+                    names=names,
+                    expected_len=expected_len,
+                    vocab_size=vocab_size,
+                )
+            )
+
     return {
         "kind": kind,
         "bucket": bucket,

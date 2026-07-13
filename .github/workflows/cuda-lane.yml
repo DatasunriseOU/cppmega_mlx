@@ -1,10 +1,9 @@
 name: CUDA Lane
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # CUDA capacity is provisioned explicitly (for example on Nebius H200).
+  # Do not leave ordinary PRs queued forever when no self-hosted CUDA runner
+  # is attached to this repository.
   workflow_dispatch:
 
 jobs:

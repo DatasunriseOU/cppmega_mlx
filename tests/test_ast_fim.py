@@ -119,6 +119,26 @@ def test_ast_ifim_uses_leading_comment_as_instruction() -> None:
     assert FIM_PREFIX_ID in result.token_ids
     assert FIM_SUFFIX_ID in result.token_ids
     assert result.token_ids[-1] == EOT_ID
+    assert result.kind == "ast_ifim"
+
+
+def test_ast_ifim_char_fallback_remains_instruction_aware() -> None:
+    packet = _packet(
+        list(range(10)),
+        [(0, 10)],
+        source_text="// Fill the function body\nint f() {\n",
+    )
+
+    result = apply_ast_ifim(
+        packet,
+        instruction_encoder=lambda _text: [101, 102],
+        seed=1,
+        spm_rate=0.0,
+        ast_fim_rate=1.0,
+    )
+
+    assert result.kind == "char_ifim"
+    assert result.token_ids[0] == FIM_INSTRUCTION_ID
 
 
 def test_ast_ifim_missing_source_text_raises() -> None:

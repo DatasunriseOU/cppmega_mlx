@@ -194,6 +194,14 @@ class BodyDecodeConstraints:
             tokenizer.tool_result_id,
             tokenizer.code_start_id,
         }
+        token_for_id = getattr(tokenizer, "token_for_id", None)
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if callable(token_for_id) and isinstance(vocab_size, int):
+            self._always_banned.update(
+                token_id
+                for token_id in range(vocab_size)
+                if str(token_for_id(token_id) or "").startswith("<RESERVED_")
+            )
 
     def __call__(self, logits: mx.array, tokens: mx.array) -> mx.array:
         if logits.ndim != 2 or tokens.ndim != 2:
@@ -255,18 +263,86 @@ def trim_body_completion(text: str) -> str:
         "<QUERY_TOOL>",
         "<TOOL_RESULT>",
         "<THINK_",
+        "<RESERVED_",
     )
     for marker in stop_markers:
         pos = stripped.find(marker)
         if pos >= 0:
             stripped = stripped[:pos]
-    kept: list[str] = []
-    for line in stripped.splitlines():
-        if line.startswith("}"):
-            break
-        kept.append(line)
-    body = "\n".join(kept).strip()
+    stripped = _trim_at_function_closing_brace(stripped)
+    body = stripped.strip()
     return body + ("\n" if body else "")
+
+
+def _trim_at_function_closing_brace(text: str) -> str:
+    """Drop only the brace that closes the prompt's already-open function."""
+    depth = 1
+    index = 0
+    state = "code"
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+
+        if state == "line-comment":
+            if char == "\n":
+                state = "code"
+            index += 1
+            continue
+        if state == "block-comment":
+            if char == "*" and following == "/":
+                state = "code"
+                index += 2
+            else:
+                index += 1
+            continue
+        if state in {"string", "character"}:
+            quote = '"' if state == "string" else "'"
+            if char == "\\":
+                index += 2
+            elif char == quote:
+                state = "code"
+                index += 1
+            else:
+                index += 1
+            continue
+
+        if char == "/" and following == "/":
+            state = "line-comment"
+            index += 2
+            continue
+        if char == "/" and following == "*":
+            state = "block-comment"
+            index += 2
+            continue
+        if char == "R" and following == '"':
+            delimiter_end = text.find("(", index + 2, min(len(text), index + 20))
+            if delimiter_end >= 0:
+                delimiter = text[index + 2 : delimiter_end]
+                if len(delimiter) <= 16 and not any(
+                    item.isspace() or item in "()\\" for item in delimiter
+                ):
+                    terminator = ")" + delimiter + '"'
+                    raw_end = text.find(terminator, delimiter_end + 1)
+                    if raw_end < 0:
+                        return text
+                    index = raw_end + len(terminator)
+                    continue
+        if char == '"':
+            state = "string"
+            index += 1
+            continue
+        if char == "'":
+            state = "character"
+            index += 1
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[:index]
+        index += 1
+    return text
 
 
 def reject_unsupported_checkpoint(path: Path) -> None:

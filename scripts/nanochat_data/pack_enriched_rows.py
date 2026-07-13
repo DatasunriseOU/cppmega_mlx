@@ -104,7 +104,6 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
 )
-from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.packing import PackingStrategy
 
 TRAINED_TOKEN_COUNT_COLUMN = "trained_token_count"
@@ -540,7 +539,12 @@ def _shared_chronology_for_docs(docs: list[NormalizedDoc]) -> dict[str, Any]:
 
 
 def _merged_platform_ids_for_docs(docs: list[NormalizedDoc]) -> list[int]:
-    ids = sorted(
+    # This row-level value is provenance, not the fixed-width model input.
+    # Mixed packed rows may legitimately describe more platforms than one
+    # source document.  Exact per-document bags remain in
+    # ``source_platform_ids`` and are expanded through row-local ``doc_ids`` by
+    # the data loader, so capping the union here only makes valid packs fail.
+    return sorted(
         {
             int(platform_id)
             for doc in docs
@@ -548,12 +552,6 @@ def _merged_platform_ids_for_docs(docs: list[NormalizedDoc]) -> list[int]:
             if int(platform_id) > 0
         }
     )
-    if len(ids) > MAX_PLATFORM_IDS:
-        raise ValueError(
-            f"packed row platform_ids has {len(ids)} unique IDs; "
-            f"MAX_PLATFORM_IDS={MAX_PLATFORM_IDS}"
-        )
-    return ids
 
 
 def _coerce_optional_int(value: object) -> int | None:
@@ -1274,10 +1272,14 @@ def _materialize_packed_row(
 
     token_offset = 0
     chunk_offset = 0
-    for doc in ordered_docs:
-        doc_id = max(0, int(doc.stable_doc_id))
+    # ``doc_ids`` is a row-local attention/loss boundary channel.  It must
+    # identify every logical packed document independently, even when two
+    # documents share file-level provenance (for example two functions from the
+    # same header).  ``stable_doc_id`` remains provenance metadata; using it here
+    # collapsed those functions into one segment and trained across the boundary.
+    for row_doc_id, doc in enumerate(ordered_docs, start=1):
         concatenated_tokens.extend(doc.token_ids)
-        doc_ids.extend([doc_id] * doc.token_count)
+        doc_ids.extend([row_doc_id] * doc.token_count)
         source_doc_indices.append(doc.source_doc_index)
         source_doc_token_lengths.append(doc.token_count)
         source_platform_ids.append(list(doc.platform_ids))

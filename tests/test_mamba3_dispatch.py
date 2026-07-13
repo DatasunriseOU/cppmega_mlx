@@ -9,6 +9,8 @@ fall back to the reference (PATH_B raises in that case).
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -82,6 +84,20 @@ def test_reference_policy_forces_pure_mlx(monkeypatch: pytest.MonkeyPatch) -> No
     mx.eval(out)
     matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
     assert matches[-1]["path"] == "ref"
+    assert matches[-1]["kernel_used"] == "reference_pure_mlx"
+
+
+def test_reference_policy_does_not_import_tilelang_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "ref")
+    monkeypatch.setitem(sys.modules, "cppmega_mlx.nn._tilelang.mamba3", None)
+
+    block, hidden = _make_block()
+    out, _ = block(hidden)
+    mx.eval(out)
+
+    matches = [e for e in get_dispatch_log() if e["op_name"] == "mamba3_mimo"]
     assert matches[-1]["kernel_used"] == "reference_pure_mlx"
 
 

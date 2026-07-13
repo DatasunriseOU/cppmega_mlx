@@ -282,27 +282,30 @@ def _shift_span(span: Any, positions: list[int]) -> Any:
 
 def _update_source_doc_lengths(row: dict[str, Any], positions: list[int], valid: int) -> None:
     lengths = row.get("source_doc_token_lengths")
-    doc_ids = row.get("doc_ids")
-    source_doc_ids = row.get("source_doc_ids")
-    if not isinstance(lengths, list) or not isinstance(doc_ids, list):
+    if not isinstance(lengths, list):
         return
     if not lengths:
         return
     if len(lengths) == 1:
         row["source_doc_token_lengths"] = [int(lengths[0]) + len(positions)]
         return
-    if not isinstance(source_doc_ids, list):
-        return
-    increments = {int(doc_id): 0 for doc_id in source_doc_ids}
+    normalized_lengths = [int(length) for length in lengths]
+    increments = [0] * len(normalized_lengths)
+    cumulative: list[int] = []
+    running = 0
+    for length in normalized_lengths:
+        running += length
+        cumulative.append(running)
     for pos in positions:
         source_idx = pos - 1 if pos > 0 else pos
-        if 0 <= source_idx < min(valid, len(doc_ids)):
-            doc_id = int(doc_ids[source_idx])
-            if doc_id in increments:
-                increments[doc_id] += 1
+        if 0 <= source_idx < valid:
+            for doc_index, end in enumerate(cumulative):
+                if source_idx < end:
+                    increments[doc_index] += 1
+                    break
     row["source_doc_token_lengths"] = [
-        int(length) + increments.get(int(doc_id), 0)
-        for length, doc_id in zip(lengths, source_doc_ids)
+        length + increments[index]
+        for index, length in enumerate(normalized_lengths)
     ]
 
 

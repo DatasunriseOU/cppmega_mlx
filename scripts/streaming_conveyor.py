@@ -64,6 +64,7 @@ import time
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
+    Future,
     ThreadPoolExecutor,
     wait,
 )
@@ -221,18 +222,41 @@ class BackgroundRecompressor:
     def __init__(self, max_workers: int) -> None:
         self._pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
         self._lock = threading.Lock()
-        self._futures = []
+        self._futures: list[tuple[Path, Future]] = []
+        self._handled: set[int] = set()
 
-    def submit(self, path: Path) -> None:
+    def submit(self, path: Path) -> Future:
         fut = self._pool.submit(src.recompress_zstd_max, path)
         with self._lock:
             self._futures.append((path, fut))
+        return fut
+
+    def wait(self, jobs: Sequence[tuple[Path, Future]]) -> None:
+        failures: list[str] = []
+        try:
+            for path, fut in jobs:
+                try:
+                    fut.result()
+                except Exception as exc:
+                    failures.append(f"{path}: {type(exc).__name__}: {exc}")
+        finally:
+            with self._lock:
+                self._handled.update(id(fut) for _path, fut in jobs)
+        if failures:
+            raise RuntimeError(
+                "background code parquet recompress failed:\n"
+                + "\n".join(failures[:20])
+            )
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)
         failures: list[str] = []
         with self._lock:
-            futures = list(self._futures)
+            futures = [
+                (path, fut)
+                for path, fut in self._futures
+                if id(fut) not in self._handled
+            ]
         for path, fut in futures:
             try:
                 fut.result()
@@ -567,30 +591,33 @@ def repo_fully_done(
     return code_ok and commits_ok
 
 
+def commit_plan_key(repo: str) -> str:
+    return f"{repo}::commit_plan"
+
+
 def manifest_complete_commit_ranges(
     repo: str, manifest: Manifest, range_size: int
 ) -> tuple[tuple[int, int], ...] | None:
-    """Return complete manifest ranges for ``repo`` when completion is provable.
+    """Return done ranges only with an authoritative extracted record count.
 
-    This is deliberately conservative. A finished repo may have lost its stable
-    extract cache after cleanup; on resume we must not spend hours re-running
-    extract_git_history only to skip already-done ranges. The manifest already
-    records each processed range as ``<repo>::r<start>`` with ``range=[start,end]``.
-
-    We can prove completion without the jsonl only when those done ranges:
-      * have no failed commit-range entry for this repo,
-      * start at 0 and are contiguous, and
-      * end with a short final range (``end - start < range_size``).
-
-    If total records were exactly divisible by ``range_size`` there is no final
-    short range, so the manifest alone cannot distinguish complete coverage from
-    "one more full range exists". In that case return None and let the old
-    extract/count path decide.
+    A range shorter than ``range_size`` is not EOF evidence because adaptive
+    planning also cuts ranges at a byte target. Completion is proven only by a
+    persisted commit-plan record and exact coverage of ``[0, n_records)``.
     """
     if range_size <= 0:
         raise ValueError(f"range_size must be positive, got {range_size}")
     if any(k == f"{repo}::commits" or k.startswith(f"{repo}::r")
            for k in manifest.failed):
+        return None
+
+    plan = manifest.done.get(commit_plan_key(repo))
+    if not isinstance(plan, dict) or plan.get("source") != "commit_plan":
+        return None
+    try:
+        n_records = int(plan["n_records"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if n_records <= 0:
         return None
 
     ranges: list[tuple[int, int]] = []
@@ -628,7 +655,7 @@ def manifest_complete_commit_ranges(
         if end - start > range_size:
             return None
         expected_start = end
-    if ranges[-1][1] - ranges[-1][0] >= range_size:
+    if expected_start != n_records:
         return None
     return tuple(ranges)
 
@@ -1370,13 +1397,13 @@ def run_code_half(
                 promote_dedup_on_success=False,
             )
         except RepoFailure as exc:
-            if is_no_trainable_source_failure(exc):
-                promoted = True
+            skip_reason = code_skip_reason(exc)
+            if skip_reason is not None:
                 return {
                     "source": "code",
                     "repo": repo,
                     "skipped": True,
-                    "skip_reason": "no_trainable_source",
+                    "skip_reason": skip_reason,
                     "lengths": {},
                     "stage_timings_s": {},
                     "detail": exc.detail,
@@ -1385,6 +1412,26 @@ def run_code_half(
         if info.get("skipped"):
             return info
         timings = dict(info.get("stage_timings_s", {}))
+        # Recompression is part of publication, not deferred cleanup. Multiple
+        # bucket files can still run concurrently, but this unit cannot promote
+        # dedup or become manifest-done until every recompress future succeeds.
+        started = time.monotonic()
+        jobs: list[tuple[Path, Future]] = []
+        try:
+            for L in info.get("lengths", {}):
+                dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
+                if dest.exists():
+                    if recompressor is None:
+                        src.recompress_zstd_max(dest)
+                    else:
+                        jobs.append((dest, recompressor.submit(dest)))
+            if recompressor is not None:
+                recompressor.wait(jobs)
+        except Exception as exc:
+            remove_code_outputs(repo, info.get("lengths", {}).keys())
+            raise RepoFailure(repo, "recompress", f"{type(exc).__name__}: {exc}") from exc
+        timings["recompress_s"] = round(time.monotonic() - started, 6)
+
         try:
             timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
         except Exception as exc:
@@ -1395,20 +1442,6 @@ def run_code_half(
                 f"{type(exc).__name__}: {exc}",
             ) from exc
         promoted = True
-        # zstd-max the per-length code parquet files this repo just wrote.
-        started = time.monotonic()
-        deferred = 0
-        for L in info.get("lengths", {}):
-            dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
-            if dest.exists():
-                if recompressor is None:
-                    src.recompress_zstd_max(dest)
-                else:
-                    recompressor.submit(dest)
-                    deferred += 1
-        timings["recompress_s"] = round(time.monotonic() - started, 6)
-        if deferred:
-            timings["recompress_deferred"] = float(deferred)
         info["stage_timings_s"] = timings
         return info
     finally:
@@ -1447,6 +1480,17 @@ def is_no_trainable_source_failure(exc: RepoFailure) -> bool:
         exc.stage == "index_project"
         and "no training docs (no_trainable_source)" in exc.detail.lower()
     )
+
+
+def code_skip_reason(exc: RepoFailure) -> str | None:
+    if is_no_trainable_source_failure(exc):
+        return "no_trainable_source"
+    if (
+        exc.stage == "index_project"
+        and "no training docs (dedup_exhausted)" in exc.detail.lower()
+    ):
+        return "dedup_exhausted"
+    return None
 
 
 def is_retryable_index_project_failure(exc: RepoFailure) -> bool:
@@ -1520,7 +1564,6 @@ def run_code_half_adaptive(
     index_stall_timeout_s: int | None = None,
     *,
     runner: CodeRunner | None = None,
-    isolate_dedup_on_retry: bool = True,
     recompressor: BackgroundRecompressor | None = None,
 ) -> dict:
     """Run the code half, retrying index_project peaks/stalls with one parser.
@@ -1551,18 +1594,16 @@ def run_code_half_adaptive(
             raise
         _log(
             f"RETRY {code_key(repo)}: {exc.stage} retryable failure with "
-            f"parse_workers={parse_workers}; retrying parse_workers=1"
-            + (" with isolated per-repo dedup" if isolate_dedup_on_retry else "")
+            f"parse_workers={parse_workers}; retrying parse_workers=1 with "
+            "global exact/chunk dedup and near-dedup disabled"
         )
-        retry_dedup_db = None if isolate_dedup_on_retry else dedup_db
-        retry_dedup_near = False if isolate_dedup_on_retry else dedup_near
         return active_runner(
             repo,
             repo_dir,
             lengths_code,
             work_root,
-            retry_dedup_db,
-            retry_dedup_near,
+            dedup_db,
+            False,
             global_symbol_index,
             memory_limit_gb,
             1,
@@ -1861,6 +1902,20 @@ def run_commits_half(
             status=extract_cache_status,
             n_records=n_records,
             records_jsonl=str(records_jsonl),
+        )
+
+    # This is the only safe EOF proof. Old manifests without it are deliberately
+    # re-staged and counted from the extraction cache before ranges are skipped.
+    records_stat = records_jsonl.stat()
+    with manifest_lock:
+        manifest.mark_done(
+            commit_plan_key(repo),
+            {
+                "source": "commit_plan",
+                "repo": repo,
+                "n_records": int(n_records),
+                "records_size_bytes": int(records_stat.st_size),
+            },
         )
 
     # .git no longer needed -> free disk now (records already captured/cached).
@@ -2313,12 +2368,12 @@ def process_one_repo(
                             )
                         ):
                             code_parse_workers = 1
-                            code_dedup_db = None
+                            code_dedup_db = dedup_db
                             code_dedup_near = False
                             _log(
                                 f"RETRY {ck}: prior manifest failure was "
                                 "retryable index_project failure; starting parse_workers=1 "
-                                "with isolated per-repo dedup"
+                                "with global exact/chunk dedup and near-dedup disabled"
                             )
                         if progress is not None:
                             progress.emit(
@@ -3240,7 +3295,7 @@ def main(argv: list[str]) -> int:
              "persistent extract cache were retained. RESUME WITH THE SAME ARGS "
              "to continue exactly where this left off (zero work lost).")
         return 130
-    return 0 if (not manifest.failed or processed_repos > 0) else 1
+    return 0 if not manifest.failed else 1
 
 
 if __name__ == "__main__":

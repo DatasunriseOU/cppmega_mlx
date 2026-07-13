@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+from pathlib import Path
 import subprocess
 import sys
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def _load_audit_module():
+    path = Path(__file__).parents[1] / "scripts" / "audit_sidecar_parquet.py"
+    spec = importlib.util.spec_from_file_location("cppmega_test_audit_sidecars", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write_tiny_parquet(
@@ -18,7 +31,7 @@ def _write_tiny_parquet(
     # single document (doc_ids all equal) and valid=4 the rule yields
     # [1,1,1,0, 0,0,0,0] and trained_token_count = sum = 3 = valid - num_docs.
     loss_mask=(1, 1, 1, 0, 0, 0, 0, 0),
-    doc_ids=(0, 0, 0, 0, 0, 0, 0, 0),
+    doc_ids=(1, 1, 1, 1, 1, 1, 1, 1),
     valid_token_count=4,
     trained_token_count=3,
     extra=None,
@@ -69,6 +82,8 @@ def _write_tiny_parquet(
 
 def _run_audit(tmp_path, code_root, commit_root, pr_root, *, extra_args=()):
     out_dir = tmp_path / "audit"
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
     proc = subprocess.run(
         [
             sys.executable,
@@ -88,6 +103,7 @@ def _run_audit(tmp_path, code_root, commit_root, pr_root, *, extra_args=()):
             *extra_args,
         ],
         capture_output=True,
+        env=env,
         text=True,
     )
     report = None
@@ -120,6 +136,55 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     assert report["total"]["edge_count"]["token_domain_edges"] == 0
 
 
+def test_sidecar_audit_reads_large_files_by_row_group(tmp_path, monkeypatch):
+    path = tmp_path / "code" / "8" / "code.parquet"
+    _write_tiny_parquet(path)
+    one_row = pq.read_table(path)
+    pq.write_table(pa.concat_tables([one_row, one_row]), path, row_group_size=1)
+
+    audit = _load_audit_module()
+    real_factory = audit.pq.ParquetFile
+    calls: list[int] = []
+
+    class RowGroupOnlyParquetFile:
+        def __init__(self, parquet_path):
+            self._inner = real_factory(parquet_path)
+            self.schema_arrow = self._inner.schema_arrow
+            self.metadata = self._inner.metadata
+
+        def read(self, *args, **kwargs):
+            raise AssertionError("whole-file parquet reads are forbidden")
+
+        def read_row_group(self, index, *, columns):
+            calls.append(index)
+            return self._inner.read_row_group(index, columns=columns)
+
+    monkeypatch.setattr(audit.pq, "ParquetFile", RowGroupOnlyParquetFile)
+    result = audit._audit_file(str(path), "code", "8", 65536)
+
+    assert calls == [0, 1]
+    assert result["stats"]["rows"] == 2
+    assert result["stats"]["valid_tokens"] == 8
+
+
+def test_sidecar_audit_rejects_empty_or_reversed_chunk_span(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={"token_chunk_starts": [0, 2], "token_chunk_ends": [0, 4]},
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2
+    assert report["total"]["bad_rows"] == 1
+    assert report["total"]["fields"]["token_chunk_ends"]["bad_value_rows"] >= 1
+
+
 def test_sidecar_audit_rejects_allones_loss_mask_on_multidoc_row(tmp_path):
     """C1 regression: an all-ones loss_mask over a MULTI-document packed row.
 
@@ -145,10 +210,11 @@ def test_sidecar_audit_rejects_allones_loss_mask_on_multidoc_row(tmp_path):
         commit_root / "8" / "commit.parquet",
         input_ids=(10, 11, 12, 13, 14, 0, 0, 0),
         target_ids=(11, 12, 13, 14, 0, 0, 0, 0),
-        doc_ids=(7, 7, 7, 9, 9, 0, 0, 0),
+        doc_ids=(1, 1, 1, 2, 2, 2, 2, 2),
         loss_mask=(1, 1, 1, 1, 0, 0, 0, 0),  # WRONG: boundary at pos 2 is masked 1
         valid_token_count=5,
         trained_token_count=4,
+        extra={"source_doc_ids": [7, 9], "source_doc_token_lengths": [3, 2]},
     )
 
     proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
@@ -180,10 +246,11 @@ def test_sidecar_audit_accepts_correct_multidoc_loss_mask(tmp_path):
         commit_root / "8" / "commit.parquet",
         input_ids=(10, 11, 12, 13, 14, 0, 0, 0),
         target_ids=(11, 12, 13, 14, 0, 0, 0, 0),
-        doc_ids=(7, 7, 7, 9, 9, 0, 0, 0),
+        doc_ids=(1, 1, 1, 2, 2, 2, 2, 2),
         loss_mask=(1, 1, 0, 1, 0, 0, 0, 0),  # canonical: 0 at the inter-doc boundary
         valid_token_count=5,
         trained_token_count=3,
+        extra={"source_doc_ids": [7, 9], "source_doc_token_lengths": [3, 2]},
     )
 
     proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
@@ -191,6 +258,31 @@ def test_sidecar_audit_accepts_correct_multidoc_loss_mask(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert report["total"]["bad_rows"] == 0
     assert report["total"]["fields"]["loss_mask"]["bad_value_rows"] == 0
+
+
+def test_sidecar_audit_rejects_collapsed_doc_ids_even_when_mask_matches_them(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+
+    _write_tiny_parquet(code_root / "8" / "code.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+    _write_tiny_parquet(
+        commit_root / "8" / "commit.parquet",
+        input_ids=(10, 11, 12, 13, 14, 0, 0, 0),
+        target_ids=(11, 12, 13, 14, 0, 0, 0, 0),
+        doc_ids=(11, 11, 11, 11, 11, 11, 11, 11),
+        loss_mask=(1, 1, 1, 1, 0, 0, 0, 0),
+        valid_token_count=5,
+        trained_token_count=4,
+        extra={"source_doc_ids": [38, 41], "source_doc_token_lengths": [3, 2]},
+    )
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report["total"]["fields"]["doc_ids"]["bad_value_rows"] >= 1
+    assert report["total"]["fields"]["loss_mask"]["bad_value_rows"] >= 1
 
 
 def test_sidecar_audit_rejects_bad_target_shift(tmp_path):

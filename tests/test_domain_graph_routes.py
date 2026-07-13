@@ -11,6 +11,12 @@ from cppmega_mlx.nn.domain_graph_routes import (
 )
 
 
+def test_default_config_prioritizes_diagnostic_locations():
+    assert DomainGraphRouteConfig().edge_weights[
+        int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)
+    ] == 2.0
+
+
 def test_domain_attention_bias_routes_edge_triples_to_blocks() -> None:
     packet = DomainPacket.filled(
         list(range(8)),

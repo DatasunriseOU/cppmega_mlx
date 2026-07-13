@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -22,6 +22,7 @@ from cppmega_mlx.data.token_dataset import BatchCursor, TokenDatasetMetadata
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
 _INDEX_VERSION = 1
 _ATTENTION_SIDE_CHANNEL_KEY = "attention_mask"
+_LOSS_MASK_SIDE_CHANNEL_KEY = "loss_mask"
 _STRUCTURE_SIDE_CHANNEL_KEYS = (
     "structure_ids",
     "dep_levels",
@@ -39,22 +40,36 @@ _SEMANTIC_SIDE_CHANNEL_KEYS = (
 _TEMPORAL_SIDE_CHANNEL_KEYS = (
     "change_mask_pre",
     "change_mask_post",
+    "hunk_ids",
+    "edit_ops",
+)
+_DOMAIN_SIDE_CHANNEL_KEYS = (
+    "domain_ids",
+    "role_ids",
+    "entity_ids",
+    "scope_ids",
+    "source_doc_ids",
+    "confidence_ids",
 )
 _SIDE_CHANNEL_KEYS = (
     _ATTENTION_SIDE_CHANNEL_KEY,
+    _LOSS_MASK_SIDE_CHANNEL_KEY,
     *_STRUCTURE_SIDE_CHANNEL_KEYS,
     *_PLATFORM_SIDE_CHANNEL_KEYS,
     *_SEMANTIC_SIDE_CHANNEL_KEYS,
     *_TEMPORAL_SIDE_CHANNEL_KEYS,
+    *_DOMAIN_SIDE_CHANNEL_KEYS,
 )
 _LM_BATCH_DIRECT_SIDE_CHANNEL_KEYS = (
     _ATTENTION_SIDE_CHANNEL_KEY,
+    _LOSS_MASK_SIDE_CHANNEL_KEY,
     *_STRUCTURE_SIDE_CHANNEL_KEYS,
     *_PLATFORM_SIDE_CHANNEL_KEYS,
 )
 _FAMILY_SIDE_CHANNEL_KEYS: dict[str, tuple[str, ...]] = {
     "semantic_graph": _SEMANTIC_SIDE_CHANNEL_KEYS,
     "temporal_diff": _TEMPORAL_SIDE_CHANNEL_KEYS,
+    "domain_routes": _DOMAIN_SIDE_CHANNEL_KEYS,
 }
 _SIDE_CHANNEL_SCHEMA_VERSION = 1
 _SIDE_CHANNEL_KEY_ALIASES: dict[str, tuple[str, ...]] = {
@@ -71,6 +86,14 @@ _SIDE_CHANNEL_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "def_use": ("token_def_use",),
     "change_mask_pre": ("token_change_mask_pre",),
     "change_mask_post": ("token_change_mask_post",),
+    "hunk_ids": ("hunk_id_per_token",),
+    "edit_ops": ("edit_op_per_token",),
+    "domain_ids": ("token_domain_ids",),
+    "role_ids": ("token_role_ids",),
+    "entity_ids": ("token_entity_ids",),
+    "scope_ids": ("token_scope_ids",),
+    "source_doc_ids": ("token_source_doc_ids",),
+    "confidence_ids": ("token_confidence_ids",),
 }
 _DOCUMENT_ID_KEYS = ("document_ids", "doc_ids", "packing_document_ids")
 _SIDE_CHANNEL_ALIAS_TO_KEY = {
@@ -92,8 +115,16 @@ _UNSUPPORTED_NGRAM_SIDECAR_KEYS = (
     "ngram_sidecar",
     "ngrams",
 )
-_GRAPH_SIDECAR_SCHEMA = "cppmega_graph_routes_v1"
-_GRAPH_EDGE_KEYS = ("token_call_edges", "token_type_edges")
+_GRAPH_SIDECAR_SCHEMAS = ("cppmega_graph_routes_v1", "cppmega_graph_routes_v2")
+_GRAPH_PAIR_EDGE_KEYS = ("token_call_edges", "token_type_edges")
+_GRAPH_TRIPLE_EDGE_KEYS = (
+    "token_domain_edges",
+    "token_build_edges",
+    "token_shell_edges",
+    "token_diagnostic_edges",
+    "token_cross_domain_edges",
+)
+_GRAPH_EDGE_KEYS = (*_GRAPH_PAIR_EDGE_KEYS, *_GRAPH_TRIPLE_EDGE_KEYS)
 _GRAPH_CHUNK_KEYS = (
     "token_chunk_starts",
     "token_chunk_ends",
@@ -104,6 +135,11 @@ _GRAPH_SIDECAR_KEYS = (*_GRAPH_EDGE_KEYS, *_GRAPH_CHUNK_KEYS)
 _GRAPH_RELATION_BY_KEY = {
     "token_call_edges": "call",
     "token_type_edges": "type",
+    "token_domain_edges": "domain",
+    "token_build_edges": "build",
+    "token_shell_edges": "shell",
+    "token_diagnostic_edges": "diagnostic",
+    "token_cross_domain_edges": "cross_domain",
 }
 
 _INDEX_DTYPES: dict[int, np.dtype] = {
@@ -168,6 +204,7 @@ class MegatronGraphRoutePacket:
     chunk_ends: np.ndarray
     chunk_kinds: np.ndarray
     chunk_dep_levels: np.ndarray
+    edge_kinds: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def num_chunks(self) -> int:
@@ -248,12 +285,22 @@ class MegatronIndexedDataset:
             offsets=sequence_offsets,
             lengths=sequence_lengths,
         )
-        windows = _build_windows(
-            sequence_offsets,
-            sequence_lengths,
-            self.seq_len,
-            itemsize=token_dtype.itemsize,
+        self._restores_compact_fixed_rows = _is_compact_fixed_row_shard(
+            sidecar,
+            sequence_lengths=sequence_lengths,
+            seq_len=self.seq_len,
         )
+        if self._restores_compact_fixed_rows:
+            windows = sequence_offsets.astype(np.int64, copy=True)
+            window_lengths = sequence_lengths.astype(np.int64, copy=True)
+        else:
+            windows = _build_windows(
+                sequence_offsets,
+                sequence_lengths,
+                self.seq_len,
+                itemsize=token_dtype.itemsize,
+            )
+            window_lengths = np.full(windows.shape, self.seq_len, dtype=np.int64)
         if not len(windows):
             raise ValueError("Megatron token data does not contain a full fixed-shape sample")
 
@@ -262,6 +309,7 @@ class MegatronIndexedDataset:
         self._sequence_lengths = sequence_lengths.astype(np.int64, copy=True)
         self._bin_mmap = np.memmap(self.bin_path, mode="r", dtype=np.uint8)
         self._windows = windows
+        self._window_lengths = window_lengths
         self._side_channels = _load_side_channels(
             sidecar,
             prefix=resolved.prefix,
@@ -419,15 +467,35 @@ class MegatronIndexedDataset:
         if len(set(lengths.values())) != 1:
             raise ValueError(f"graph chunk sidecar length mismatch: {lengths}")
         num_nodes = int(starts.shape[0])
+        if (
+            np.any(starts < 0)
+            or np.any(ends <= starts)
+            or np.any(ends > self.seq_len)
+        ):
+            raise ValueError(
+                "graph chunk spans must satisfy 0 <= start < end <= sequence length"
+            )
         edges: dict[str, EdgeIndex] = {}
+        edge_kinds: dict[str, np.ndarray] = {}
         for key, relation in _GRAPH_RELATION_BY_KEY.items():
             if key not in self._graph_sidecars:
                 continue
-            pairs = _read_graph_pairs(self._graph_sidecars[key], sequence_index)
+            if key in _GRAPH_PAIR_EDGE_KEYS:
+                pairs = _read_graph_pairs(self._graph_sidecars[key], sequence_index)
+                relation_num_nodes = num_nodes
+            else:
+                triples = _read_graph_triples(self._graph_sidecars[key], sequence_index)
+                pairs = triples[:, :2]
+                edge_kinds[relation] = triples[:, 2].astype(np.int32, copy=False)
+                relation_num_nodes = self.seq_len
+            if pairs.size and (np.any(pairs < 0) or np.any(pairs >= relation_num_nodes)):
+                raise ValueError(
+                    f"{key} endpoints exceed {relation_num_nodes} nodes for sample {sample_index}"
+                )
             edges[relation] = EdgeIndex.from_pairs(
                 pairs,
                 relation=relation,
-                num_nodes=num_nodes,
+                num_nodes=relation_num_nodes,
             )
         return MegatronGraphRoutePacket(
             graph=GraphPacket(edges=edges, num_nodes=num_nodes),
@@ -435,6 +503,7 @@ class MegatronIndexedDataset:
             chunk_ends=ends.astype(np.int32, copy=False),
             chunk_kinds=kinds.astype(np.int32, copy=False),
             chunk_dep_levels=dep_levels.astype(np.int32, copy=False),
+            edge_kinds=edge_kinds,
         )
 
     def _sequence_index_for_window(self, window_index: int) -> int:
@@ -447,7 +516,13 @@ class MegatronIndexedDataset:
                 "graph route sidecars are document-aligned; token-window slicing "
                 "requires a sequence-aligned sample start"
             )
-        if int(self._sequence_lengths[sequence_index]) != self.seq_len:
+        sequence_length = int(self._sequence_lengths[sequence_index])
+        if self._restores_compact_fixed_rows:
+            if sequence_length > self.seq_len:
+                raise ValueError(
+                    "compact fixed-row sequence length exceeds the configured seq_len"
+                )
+        elif sequence_length != self.seq_len:
             raise NotImplementedError(
                 "graph route sidecars require sequence length to equal seq_len; "
                 "regenerate packed graph sidecars at the training block size"
@@ -458,44 +533,50 @@ class MegatronIndexedDataset:
         return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
 
     def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
-        tokens = np.empty((sample_idx.shape[0], self.seq_len), dtype=np.int32)
+        tokens = np.zeros((sample_idx.shape[0], self.seq_len), dtype=np.int32)
         side_channels = {
-            key: np.empty(
+            key: np.zeros(
                 (sample_idx.shape[0], self.seq_len),
                 dtype=_target_side_channel_dtype(key),
             )
             for key in self._side_channels
         }
+        if "hunk_ids" in side_channels:
+            side_channels["hunk_ids"].fill(-1)
         document_ids = (
-            np.empty((sample_idx.shape[0], self.seq_len), dtype=np.int32)
+            np.zeros((sample_idx.shape[0], self.seq_len), dtype=np.int32)
             if self._document_ids is not None
             else None
         )
         for row, window_index in enumerate(sample_idx):
-            byte_offset = int(self._windows[int(window_index)])
+            resolved_window = int(window_index)
+            byte_offset = int(self._windows[resolved_window])
+            window_length = int(self._window_lengths[resolved_window])
             token_view = np.frombuffer(
                 self._bin_mmap,
                 dtype=self._dtype,
-                count=self.seq_len,
+                count=window_length,
                 offset=byte_offset,
             )
-            tokens[row] = _to_int32_tokens(token_view)
+            tokens[row, :window_length] = _to_int32_tokens(token_view)
             for key, storage in self._side_channels.items():
                 side_view = np.frombuffer(
                     storage.mmap,
                     dtype=storage.dtype,
-                    count=self.seq_len,
-                    offset=int(storage.windows[int(window_index)]),
+                    count=window_length,
+                    offset=int(storage.windows[resolved_window]),
                 )
-                side_channels[key][row] = _to_side_channel_values(key, side_view)
+                side_channels[key][row, :window_length] = _to_side_channel_values(
+                    key, side_view
+                )
             if self._document_ids is not None and document_ids is not None:
                 doc_view = np.frombuffer(
                     self._document_ids.mmap,
                     dtype=self._document_ids.dtype,
-                    count=self.seq_len,
-                    offset=int(self._document_ids.windows[int(window_index)]),
+                    count=window_length,
+                    offset=int(self._document_ids.windows[resolved_window]),
                 )
-                document_ids[row] = _to_document_id_values(doc_view)
+                document_ids[row, :window_length] = _to_document_id_values(doc_view)
 
         batch: dict[str, np.ndarray] = {"tokens": tokens}
         for key in _SIDE_CHANNEL_KEYS:
@@ -789,14 +870,22 @@ def megatron_indexed_graph_sidecar_schema() -> dict[str, dict[str, object]]:
 
     return {
         key: {
-            "kind": "edge_pairs" if key in _GRAPH_EDGE_KEYS else "ragged_1d",
+            "kind": "edge_pairs"
+            if key in _GRAPH_PAIR_EDGE_KEYS
+            else "edge_triples"
+            if key in _GRAPH_TRIPLE_EDGE_KEYS
+            else "ragged_1d",
             "dtype": "int32"
             if key in _GRAPH_EDGE_KEYS
             else "uint32"
             if key in ("token_chunk_starts", "token_chunk_ends")
             else "uint16",
-            "shape_tail": [2] if key in _GRAPH_EDGE_KEYS else [],
-            "schema": _GRAPH_SIDECAR_SCHEMA,
+            "shape_tail": [2]
+            if key in _GRAPH_PAIR_EDGE_KEYS
+            else [3]
+            if key in _GRAPH_TRIPLE_EDGE_KEYS
+            else [],
+            "schema": "cppmega_graph_routes_v2",
         }
         for key in _GRAPH_SIDECAR_KEYS
     }
@@ -863,6 +952,7 @@ class _GraphSidecarStorage:
     data: np.ndarray
     item_count: int
     shape_tail: tuple[int, ...]
+    coordinate_space: str | None
 
 
 @dataclass(frozen=True)
@@ -1094,9 +1184,10 @@ def _load_graph_sidecars(
     if not isinstance(entries, dict):
         raise ValueError("graph_sidecar_paths must be a mapping of key to CSR metadata")
     schema = sidecar.get("graph_sidecar_schema")
-    if schema != _GRAPH_SIDECAR_SCHEMA:
+    if schema not in _GRAPH_SIDECAR_SCHEMAS:
         raise ValueError(
-            f"unsupported graph_sidecar_schema {schema!r}; expected {_GRAPH_SIDECAR_SCHEMA!r}"
+            f"unsupported graph_sidecar_schema {schema!r}; expected one of "
+            f"{_GRAPH_SIDECAR_SCHEMAS!r}"
         )
     base_dir = metadata_path.parent if metadata_path is not None else prefix.parent
     storages: dict[str, _GraphSidecarStorage] = {}
@@ -1104,6 +1195,8 @@ def _load_graph_sidecars(
         key = str(raw_key)
         if key not in _GRAPH_SIDECAR_KEYS:
             raise NotImplementedError(f"unsupported graph sidecar key {key!r}")
+        if schema == "cppmega_graph_routes_v1" and key in _GRAPH_TRIPLE_EDGE_KEYS:
+            raise ValueError(f"{key} requires cppmega_graph_routes_v2")
         if key in storages:
             raise ValueError(f"{key} graph sidecar declared more than once")
         storages[key] = _parse_graph_sidecar_entry(
@@ -1111,6 +1204,7 @@ def _load_graph_sidecars(
             entry,
             base_dir=base_dir,
             sequence_count=sequence_count,
+            schema=str(schema),
         )
     missing = [key for key in _GRAPH_CHUNK_KEYS if key not in storages]
     if missing:
@@ -1125,6 +1219,7 @@ def _parse_graph_sidecar_entry(
     *,
     base_dir: Path,
     sequence_count: int,
+    schema: str,
 ) -> _GraphSidecarStorage:
     if not isinstance(entry, dict):
         raise ValueError(f"{key} graph sidecar entry must be an object")
@@ -1136,18 +1231,37 @@ def _parse_graph_sidecar_entry(
         dtype = _coerce_graph_sidecar_dtype(key, entry.get("dtype"))
     except KeyError as error:
         raise ValueError(f"{key} graph sidecar entry missing required field {error.args[0]!r}") from error
-    if key in _GRAPH_EDGE_KEYS:
+    if key in _GRAPH_PAIR_EDGE_KEYS:
         if kind != "edge_pairs":
             raise ValueError(f"{key} graph sidecar kind must be edge_pairs, got {kind!r}")
         shape_tail = tuple(int(x) for x in entry.get("shape_tail", [2]))
         if shape_tail != (2,):
             raise ValueError(f"{key} edge sidecar shape_tail must be [2], got {shape_tail}")
+    elif key in _GRAPH_TRIPLE_EDGE_KEYS:
+        if kind != "edge_triples":
+            raise ValueError(f"{key} graph sidecar kind must be edge_triples, got {kind!r}")
+        shape_tail = tuple(int(x) for x in entry.get("shape_tail", [3]))
+        if shape_tail != (3,):
+            raise ValueError(f"{key} edge sidecar shape_tail must be [3], got {shape_tail}")
     elif key in _GRAPH_CHUNK_KEYS:
         if kind != "ragged_1d":
             raise ValueError(f"{key} graph sidecar kind must be ragged_1d, got {kind!r}")
         shape_tail = ()
     else:
         raise NotImplementedError(f"unsupported graph sidecar key {key!r}")
+    coordinate_space = entry.get("coordinate_space")
+    if schema == "cppmega_graph_routes_v2":
+        expected_coordinate = (
+            "chunk_index"
+            if key in _GRAPH_PAIR_EDGE_KEYS
+            or key in {"token_chunk_kinds", "token_chunk_dep_levels"}
+            else "token_index"
+        )
+        if coordinate_space != expected_coordinate:
+            raise ValueError(
+                f"{key} coordinate_space must be {expected_coordinate!r}, "
+                f"got {coordinate_space!r}"
+            )
     if offset_dtype != "int64":
         raise ValueError(f"{key} graph sidecar offsets must be int64, got {offset_dtype!r}")
     if not offsets_path.is_absolute():
@@ -1204,6 +1318,7 @@ def _parse_graph_sidecar_entry(
         data=data,
         item_count=item_count,
         shape_tail=shape_tail,
+        coordinate_space=None if coordinate_space is None else str(coordinate_space),
     )
 
 
@@ -1241,6 +1356,19 @@ def _read_graph_pairs(storage: _GraphSidecarStorage, sequence_index: int) -> np.
     if np.any(pairs < 0) or np.any(pairs > np.iinfo(np.int32).max):
         raise ValueError(f"{storage.key} graph edge values must fit int32")
     return pairs.astype(np.int32, copy=False)
+
+
+def _read_graph_triples(storage: _GraphSidecarStorage, sequence_index: int) -> np.ndarray:
+    if storage.kind != "edge_triples" or storage.shape_tail != (3,):
+        raise ValueError(f"{storage.key} graph storage is not edge_triples")
+    start, end = _graph_range(storage, sequence_index)
+    values = np.asarray(storage.data[start * 3 : end * 3], dtype=np.int64)
+    if values.size == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+    triples = values.reshape(-1, 3)
+    if np.any(triples < 0) or np.any(triples > np.iinfo(np.int32).max):
+        raise ValueError(f"{storage.key} graph edge values must fit non-negative int32")
+    return triples.astype(np.int32, copy=False)
 
 
 def _read_graph_vector(storage: _GraphSidecarStorage, sequence_index: int) -> np.ndarray:
@@ -1397,7 +1525,7 @@ def _allowed_side_channel_dtype_names(key: str) -> list[str]:
 
 
 def _side_channel_family(key: str) -> str:
-    if key == _ATTENTION_SIDE_CHANNEL_KEY:
+    if key in {_ATTENTION_SIDE_CHANNEL_KEY, _LOSS_MASK_SIDE_CHANNEL_KEY}:
         return "attention"
     if key in _STRUCTURE_SIDE_CHANNEL_KEYS:
         return "structure"
@@ -1407,14 +1535,18 @@ def _side_channel_family(key: str) -> str:
         return "semantic_graph"
     if key in _TEMPORAL_SIDE_CHANNEL_KEYS:
         return "temporal_diff"
+    if key in _DOMAIN_SIDE_CHANNEL_KEYS:
+        return "domain_routes"
     raise ValueError(f"unknown side-channel key {key!r}")
 
 
 def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return values.astype(np.float32, copy=False)
-    if np.any(values < 0):
+    if key != "hunk_ids" and np.any(values < 0):
         raise ValueError(f"{key} side-channel IDs must be non-negative")
+    if key == "hunk_ids" and np.any(values < np.iinfo(np.int32).min):
+        raise ValueError("hunk_ids side-channel values are below int32 range")
     if np.any(values > np.iinfo(np.int32).max):
         raise ValueError(f"{key} side-channel IDs exceed int32 range")
     return values.astype(np.int32, copy=False)
@@ -1582,6 +1714,40 @@ def _validate_bin_references(
         raise ValueError(f"Megatron .idx references bytes past {bin_path}")
     if np.any(offsets % itemsize != 0):
         raise ValueError("Megatron .idx sequence pointers must align to dtype size")
+
+
+def _is_compact_fixed_row_shard(
+    sidecar: dict[str, Any],
+    *,
+    sequence_lengths: np.ndarray,
+    seq_len: int,
+) -> bool:
+    """Recognize converter output that omits only fixed-row padding."""
+
+    declared_capacity = sidecar.get("source_capacity_token_count")
+    if declared_capacity is None:
+        return False
+
+    sequence_count = int(sequence_lengths.shape[0])
+    expected_capacity = sequence_count * seq_len
+    if int(declared_capacity) != expected_capacity:
+        raise ValueError(
+            "source_capacity_token_count does not match sequence_count * seq_len"
+        )
+    if int(sidecar.get("document_count", -1)) != sequence_count:
+        raise ValueError(
+            "compact fixed-row document_count does not match MMIDIDX sequence count"
+        )
+    token_count = int(sequence_lengths.sum(dtype=np.int64))
+    if int(sidecar.get("token_count", -1)) != token_count:
+        raise ValueError(
+            "compact fixed-row token_count does not match MMIDIDX sequence lengths"
+        )
+    if np.any(sequence_lengths <= 0) or np.any(sequence_lengths > seq_len):
+        raise ValueError(
+            "compact fixed-row sequence lengths must satisfy 0 < length <= seq_len"
+        )
+    return True
 
 
 def _build_windows(

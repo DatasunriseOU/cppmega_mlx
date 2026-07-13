@@ -22,8 +22,8 @@ Mix (mid-token robustness):
   * 10% of the time we emit a random-CHAR-FIM example whose middle is a random
     token span (``fim.sample_middle_span``) that may start/end mid-statement —
     this teaches robustness to arbitrary cursor positions.  The fall-back to the
-    char path is RECORDED in the returned ``AstFimResult.kind`` ("char_fim"),
-    never silent.
+    char path is RECORDED in the returned ``AstFimResult.kind`` ("char_fim"
+    or "char_ifim" for instruction-aware examples), never silent.
 
 iFIM variant: when the document carries a leading comment / docstring we extract
 it via ``fim.extract_ifim_instruction_text`` and emit through
@@ -58,7 +58,7 @@ from cppmega_mlx.data.fim import (
 # Fraction of AST-FIM examples; the remaining slice is random-char-FIM.
 DEFAULT_AST_FIM_RATE = 0.9
 
-AstFimKind = Literal["ast_fim", "char_fim", "ast_ifim"]
+AstFimKind = Literal["ast_fim", "char_fim", "ast_ifim", "char_ifim"]
 
 
 class NoEligibleChunkError(ValueError):
@@ -306,11 +306,11 @@ def apply_ast_ifim(
         except NoEligibleChunkError:
             start, end = sample_middle_span(length, rng=rand)
             chunk_index = None
-            kind = "char_fim"
+            kind = "char_ifim"
     else:
         start, end = sample_middle_span(length, rng=rand)
         chunk_index = None
-        kind = "char_fim"
+        kind = "char_ifim"
 
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
     permuted = apply_ifim_permutation(

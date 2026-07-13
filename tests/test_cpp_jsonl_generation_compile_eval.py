@@ -104,6 +104,7 @@ def test_body_decode_constraints_ban_specials_and_degenerate_token_run():
     mod = _load_module()
 
     class Tok:
+        vocab_size = 64
         bos_token_id = 2
         eos_token_id = 3
         fim_prefix_id = 4
@@ -116,6 +117,10 @@ def test_body_decode_constraints_ban_specials_and_degenerate_token_run():
         query_tool_id = 11
         tool_result_id = 19
 
+        @staticmethod
+        def token_for_id(token_id):
+            return "<RESERVED_48>" if token_id == 48 else None
+
     constraints = mod.BodyDecodeConstraints(Tok(), prompt_len=2, max_token_run=4)
     logits = mx.zeros((1, 64), dtype=mx.float32)
     tokens = mx.array([[100, 101, 42, 42, 42, 42]], dtype=mx.int32)
@@ -125,6 +130,37 @@ def test_body_decode_constraints_ban_specials_and_degenerate_token_run():
     assert float(masked[0, 42].item()) == float("-inf")
     assert float(masked[0, Tok.code_start_id].item()) == float("-inf")
     assert float(masked[0, Tok.fim_prefix_id].item()) == float("-inf")
+    assert float(masked[0, 48].item()) == float("-inf")
+
+
+def test_trim_body_completion_preserves_nested_blocks_and_trailing_statements():
+    mod = _load_module()
+    completion = """if (value < lo) {
+    value = lo;
+}
+// A brace in a comment does not close the function: }
+const char* marker = "}";
+return value;
+}
+int main() { return 0; }
+"""
+
+    assert mod.trim_body_completion(completion) == """if (value < lo) {
+    value = lo;
+}
+// A brace in a comment does not close the function: }
+const char* marker = "}";
+return value;
+"""
+
+
+def test_trim_body_completion_ignores_braces_in_raw_strings():
+    mod = _load_module()
+    completion = 'auto text = R"tag(})tag";\nreturn text.size();\n}\n'
+
+    assert mod.trim_body_completion(completion) == (
+        'auto text = R"tag(})tag";\nreturn text.size();\n'
+    )
 
 
 def test_script_help_bootstraps_repo_root_from_sibling_cwd():

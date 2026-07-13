@@ -487,6 +487,36 @@ def test_generate_tokens_rejects_mtp_tuple_output() -> None:
         )
 
 
+def test_generate_tokens_accepts_dense_cpp_lm_inference_tuple() -> None:
+    class DenseInferenceModel:
+        def __call__(self, tokens: mx.array) -> tuple[mx.array, None]:
+            logits = mx.concatenate(
+                [
+                    mx.full(
+                        (tokens.shape[0], tokens.shape[1], 3),
+                        -100.0,
+                        dtype=mx.float32,
+                    ),
+                    mx.full(
+                        (tokens.shape[0], tokens.shape[1], 1),
+                        100.0,
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=-1,
+            )
+            return logits, None
+
+    generated = generate_tokens(
+        DenseInferenceModel(),
+        mx.array([[1, 2]], dtype=mx.int32),
+        max_new_tokens=1,
+        temperature=0.0,
+    )
+
+    np.testing.assert_array_equal(_as_numpy(generated), np.array([[1, 2, 3]]))
+
+
 def test_generate_tokens_rejects_structured_mtp_output() -> None:
     class StructuredMTPModel:
         def __call__(self, tokens: mx.array) -> dict[str, mx.array]:

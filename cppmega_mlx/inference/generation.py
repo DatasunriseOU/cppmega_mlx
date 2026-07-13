@@ -764,10 +764,18 @@ def _resolve_kv_cache(
 
 def _standard_generation_logits(model_output: Any, tokens: mx.array) -> mx.array:
     if isinstance(model_output, tuple | list):
-        raise ValueError(
-            "MTP/draft tuple outputs are not supported by standard next-token "
-            "inference"
-        )
+        if (
+            len(model_output) == 2
+            and isinstance(model_output[0], mx.array)
+            and model_output[1] is None
+        ):
+            model_output = model_output[0]
+        else:
+            raise ValueError(
+                "MTP/draft tuple outputs are not supported by standard next-token "
+                "inference; only the DenseCppLM (logits, None) inference contract "
+                "is accepted"
+            )
     if isinstance(model_output, dict):
         raise ValueError(
             "structured model outputs are not supported by standard next-token "

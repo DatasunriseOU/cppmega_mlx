@@ -28,3 +28,12 @@ See CLAUDE.md. This overrides every rule below.
     format directly;
   - only use casts/reshapes as explicit graph decisions, not hidden adapter
     staging.
+
+## Native subagents
+
+- Use Codex native subagents for independent, bounded parallel work when it
+  materially improves throughput.
+- Every native subagent must use `gpt-5.6-sol` with `ultra` or `max`
+  reasoning. Use `ultra` by default.
+- Do not use another model or a lower reasoning level unless the user
+  explicitly overrides this rule.

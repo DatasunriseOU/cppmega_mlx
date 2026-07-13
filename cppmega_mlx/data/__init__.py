@@ -1,137 +1,90 @@
-"""Data readers and batch collation helpers."""
+"""Data readers and batch collation helpers.
 
-from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch, synthetic_token_batch
-from cppmega_mlx.data.dataloader_bridge import (
-    LocalTokenBatchDataset,
-    TorchDataLoaderBridgeConfig,
-    TorchDataLoaderBridgeError,
-    build_spawn_dataloader,
-    is_torch_dataloader_available,
-    iter_mlx_batches,
-)
-from cppmega_mlx.data.fim import (
-    EOT_ID,
-    FIMSpecialTokenIds,
-    FIM_INSTRUCTION_ID,
-    FIMMode,
-    FIM_MIDDLE_ID,
-    FIM_PREFIX_ID,
-    FIM_SPECIAL_TOKEN_IDS,
-    FIM_SUFFIX_ID,
-    apply_fim_permutation,
-    apply_fim_transform,
-    apply_ifim_permutation,
-    apply_ifim_transform,
-    extract_ifim_instruction_text,
-    sample_middle_span,
-)
-from cppmega_mlx.data.megatron_indexed import (
-    MegatronIndexedDataset,
-    MegatronIndexedMetadata,
-    MegatronIndexedMultiShardDataset,
-    MegatronIndexedMultiShardMetadata,
-    megatron_indexed_side_channel_schema,
-    open_megatron_indexed_dataset,
-)
-from cppmega_mlx.data.packing import (
-    OversizedSamplePolicy,
-    PackedSequences,
-    PackingStrategy,
-    cumulative_doc_ids_from_eos,
-    document_boundary_mask,
-    mlx_cumulative_doc_ids_from_eos,
-    mlx_document_boundary_mask,
-    mlx_sequence_packing_attention_mask,
-    pack_bos_aligned_best_fit,
-    pack_documents_with_eos,
-)
-from cppmega_mlx.data.parquet_dataset import (
-    MultiShardTokenParquetDataset,
-    ParquetColumns,
-    TokenParquetDataset,
-)
-from cppmega_mlx.data.platform_context import (
-    MAX_PLATFORM_IDS,
-    PLATFORM_VOCAB,
-    PLATFORM_VOCAB_SIZE,
-    PlatformContext,
-    encode_platform_context,
-    parse_platform_context,
-    platform_ids_array,
-    render_platform_context,
-)
-from cppmega_mlx.data.tokenizer_contract import (
-    REQUIRED_SPECIAL_TOKEN_IDS,
-    SpecialTokenMapping,
-    TOOL_USE_SPECIAL_TOKEN_IDS,
-    validate_required_special_token_ids,
-)
-from cppmega_mlx.data.token_dataset import (
-    BatchCursor,
-    TokenDatasetMetadata,
-    TokenNpzDataset,
-    iterate_token_batches,
-    open_token_dataset,
-)
+The package also contains portable corpus/indexer modules used on Linux hosts
+where Apple's MLX runtime is unavailable. Public MLX-backed exports are loaded
+on first attribute access so importing a portable submodule does not eagerly
+import the entire training runtime.
+"""
 
-__all__ = [
-    "BatchCursor",
-    "EOT_ID",
-    "FIMSpecialTokenIds",
-    "FIM_INSTRUCTION_ID",
-    "FIMMode",
-    "FIM_MIDDLE_ID",
-    "FIM_PREFIX_ID",
-    "FIM_SPECIAL_TOKEN_IDS",
-    "FIM_SUFFIX_ID",
-    "LMTokenBatch",
-    "LocalTokenBatchDataset",
-    "MAX_PLATFORM_IDS",
-    "MegatronIndexedDataset",
-    "MegatronIndexedMetadata",
-    "MegatronIndexedMultiShardDataset",
-    "MegatronIndexedMultiShardMetadata",
-    "MultiShardTokenParquetDataset",
-    "OversizedSamplePolicy",
-    "PLATFORM_VOCAB",
-    "PLATFORM_VOCAB_SIZE",
-    "ParquetColumns",
-    "PackedSequences",
-    "PackingStrategy",
-    "PlatformContext",
-    "REQUIRED_SPECIAL_TOKEN_IDS",
-    "SpecialTokenMapping",
-    "TokenDatasetMetadata",
-    "TorchDataLoaderBridgeConfig",
-    "TorchDataLoaderBridgeError",
-    "TOOL_USE_SPECIAL_TOKEN_IDS",
-    "TokenNpzDataset",
-    "TokenParquetDataset",
-    "apply_fim_permutation",
-    "apply_fim_transform",
-    "apply_ifim_permutation",
-    "apply_ifim_transform",
-    "build_spawn_dataloader",
-    "cumulative_doc_ids_from_eos",
-    "document_boundary_mask",
-    "encode_platform_context",
-    "ensure_lm_batch",
-    "extract_ifim_instruction_text",
-    "is_torch_dataloader_available",
-    "iter_mlx_batches",
-    "iterate_token_batches",
-    "megatron_indexed_side_channel_schema",
-    "mlx_cumulative_doc_ids_from_eos",
-    "mlx_document_boundary_mask",
-    "mlx_sequence_packing_attention_mask",
-    "open_megatron_indexed_dataset",
-    "open_token_dataset",
-    "pack_bos_aligned_best_fit",
-    "pack_documents_with_eos",
-    "parse_platform_context",
-    "platform_ids_array",
-    "render_platform_context",
-    "sample_middle_span",
-    "synthetic_token_batch",
-    "validate_required_special_token_ids",
-]
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
+
+
+_EXPORT_MODULES = {
+    "LMTokenBatch": "cppmega_mlx.data.batch",
+    "ensure_lm_batch": "cppmega_mlx.data.batch",
+    "synthetic_token_batch": "cppmega_mlx.data.batch",
+    "LocalTokenBatchDataset": "cppmega_mlx.data.dataloader_bridge",
+    "TorchDataLoaderBridgeConfig": "cppmega_mlx.data.dataloader_bridge",
+    "TorchDataLoaderBridgeError": "cppmega_mlx.data.dataloader_bridge",
+    "build_spawn_dataloader": "cppmega_mlx.data.dataloader_bridge",
+    "is_torch_dataloader_available": "cppmega_mlx.data.dataloader_bridge",
+    "iter_mlx_batches": "cppmega_mlx.data.dataloader_bridge",
+    "EOT_ID": "cppmega_mlx.data.fim",
+    "FIMSpecialTokenIds": "cppmega_mlx.data.fim",
+    "FIM_INSTRUCTION_ID": "cppmega_mlx.data.fim",
+    "FIMMode": "cppmega_mlx.data.fim",
+    "FIM_MIDDLE_ID": "cppmega_mlx.data.fim",
+    "FIM_PREFIX_ID": "cppmega_mlx.data.fim",
+    "FIM_SPECIAL_TOKEN_IDS": "cppmega_mlx.data.fim",
+    "FIM_SUFFIX_ID": "cppmega_mlx.data.fim",
+    "apply_fim_permutation": "cppmega_mlx.data.fim",
+    "apply_fim_transform": "cppmega_mlx.data.fim",
+    "apply_ifim_permutation": "cppmega_mlx.data.fim",
+    "apply_ifim_transform": "cppmega_mlx.data.fim",
+    "extract_ifim_instruction_text": "cppmega_mlx.data.fim",
+    "sample_middle_span": "cppmega_mlx.data.fim",
+    "MegatronIndexedDataset": "cppmega_mlx.data.megatron_indexed",
+    "MegatronIndexedMetadata": "cppmega_mlx.data.megatron_indexed",
+    "MegatronIndexedMultiShardDataset": "cppmega_mlx.data.megatron_indexed",
+    "MegatronIndexedMultiShardMetadata": "cppmega_mlx.data.megatron_indexed",
+    "megatron_indexed_side_channel_schema": "cppmega_mlx.data.megatron_indexed",
+    "open_megatron_indexed_dataset": "cppmega_mlx.data.megatron_indexed",
+    "OversizedSamplePolicy": "cppmega_mlx.data.packing",
+    "PackedSequences": "cppmega_mlx.data.packing",
+    "PackingStrategy": "cppmega_mlx.data.packing",
+    "cumulative_doc_ids_from_eos": "cppmega_mlx.data.packing",
+    "document_boundary_mask": "cppmega_mlx.data.packing",
+    "mlx_cumulative_doc_ids_from_eos": "cppmega_mlx.data.packing",
+    "mlx_document_boundary_mask": "cppmega_mlx.data.packing",
+    "mlx_sequence_packing_attention_mask": "cppmega_mlx.data.packing",
+    "pack_bos_aligned_best_fit": "cppmega_mlx.data.packing",
+    "pack_documents_with_eos": "cppmega_mlx.data.packing",
+    "MultiShardTokenParquetDataset": "cppmega_mlx.data.parquet_dataset",
+    "ParquetColumns": "cppmega_mlx.data.parquet_dataset",
+    "TokenParquetDataset": "cppmega_mlx.data.parquet_dataset",
+    "MAX_PLATFORM_IDS": "cppmega_mlx.data.platform_context",
+    "PLATFORM_VOCAB": "cppmega_mlx.data.platform_context",
+    "PLATFORM_VOCAB_SIZE": "cppmega_mlx.data.platform_context",
+    "PlatformContext": "cppmega_mlx.data.platform_context",
+    "encode_platform_context": "cppmega_mlx.data.platform_context",
+    "parse_platform_context": "cppmega_mlx.data.platform_context",
+    "platform_ids_array": "cppmega_mlx.data.platform_context",
+    "render_platform_context": "cppmega_mlx.data.platform_context",
+    "REQUIRED_SPECIAL_TOKEN_IDS": "cppmega_mlx.data.tokenizer_contract",
+    "SpecialTokenMapping": "cppmega_mlx.data.tokenizer_contract",
+    "TOOL_USE_SPECIAL_TOKEN_IDS": "cppmega_mlx.data.tokenizer_contract",
+    "validate_required_special_token_ids": "cppmega_mlx.data.tokenizer_contract",
+    "BatchCursor": "cppmega_mlx.data.token_dataset",
+    "TokenDatasetMetadata": "cppmega_mlx.data.token_dataset",
+    "TokenNpzDataset": "cppmega_mlx.data.token_dataset",
+    "iterate_token_batches": "cppmega_mlx.data.token_dataset",
+    "open_token_dataset": "cppmega_mlx.data.token_dataset",
+}
+
+__all__ = list(_EXPORT_MODULES)
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

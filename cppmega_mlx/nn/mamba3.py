@@ -523,7 +523,6 @@ def _dispatch_mamba3_scan(
     lowered TileLang DSL fwd+bwd kernel and fails closed if unavailable.
     """
 
-    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_metal_status
     from cppmega_mlx.runtime.kernel_policy import (
         KernelPath,
         record_dispatch,
@@ -576,6 +575,8 @@ def _dispatch_mamba3_scan(
         )
 
     # AUTO + PATH_B share the Metal-availability check.
+    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_metal_status
+
     status = mamba3_mimo_metal_status(x)
     if path is KernelPath.PATH_B and not status.available:
         # Device-aware Path B: on a CUDA host (Metal unavailable, default

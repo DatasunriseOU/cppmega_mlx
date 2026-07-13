@@ -16,7 +16,9 @@ from cppmega_mlx.data.domain_schema import DomainEdgeKind
 class DomainGraphRouteConfig:
     num_blocks: int = 64
     normalize: str = "binary"
-    edge_weights: Mapping[int, float] = field(default_factory=dict)
+    edge_weights: Mapping[int, float] = field(
+        default_factory=lambda: DEFAULT_EDGE_WEIGHTS.copy()
+    )
     default_weight: float = 1.0
     max_candidates_per_query: int | None = None
 
