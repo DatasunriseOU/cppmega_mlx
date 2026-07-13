@@ -21,6 +21,10 @@ NON_PR_ONLY_GUARD = (
     "github.event_name == 'schedule' || "
     "github.event_name == 'workflow_dispatch'"
 )
+ACTION_USE = re.compile(
+    r"uses:\s*['\"]?(?P<action>actions/[A-Za-z0-9_.-]+)"
+    r"@(?P<ref>[^\s'\"#]+)"
+)
 
 
 def test_workflows_do_not_use_github_hosted_runners() -> None:
@@ -54,6 +58,21 @@ def test_pull_requests_cannot_execute_on_persistent_self_hosted_runners() -> Non
         "pull_request jobs may not execute untrusted code on persistent "
         f"self-hosted runners: {violations}"
     )
+
+
+def test_persistent_pr_ci_actions_are_pinned_to_commits() -> None:
+    violations = []
+    for name in ("ci-self-hosted.yml", "e2e-matrix.yml"):
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / name
+        ).read_text(encoding="utf-8")
+        violations.extend(
+            f"{name}:{match.group('action')}@{match.group('ref')}"
+            for match in ACTION_USE.finditer(workflow)
+            if re.fullmatch(r"[0-9a-f]{40}", match.group("ref")) is None
+        )
+
+    assert not violations, f"mutable action references are forbidden: {violations}"
 
 
 def test_macos_e2e_uses_an_isolated_job_venv() -> None:
