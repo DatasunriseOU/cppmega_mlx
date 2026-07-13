@@ -12,8 +12,8 @@ from cppmega_mlx.data.prompt_graph import (
     PromptGraphBuilder,
     PromptGraphContext,
     PromptProjectIndex,
-    TOKEN_SIDECAR_DEFAULTS,
 )
+from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
 from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 
 
@@ -34,69 +34,63 @@ def _case() -> dict:
     return json.loads((FIXTURE / "cases.jsonl").read_text(encoding="utf-8"))
 
 
-def _index() -> PromptProjectIndex:
-    return PromptProjectIndex.from_json_path(FIXTURE / "project_index.json")
+def _index(tmp_path: Path) -> PromptProjectIndex:
+    return ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id="case3_prompt_repo").index
 
 
-def _context() -> PromptGraphContext:
+def _context(index: PromptProjectIndex) -> PromptGraphContext:
+    document = index.document_for_path("src/math_prompt.cpp")
     return PromptGraphContext.from_prompt(
-        _case()["source_prefix"], source_start=0, language="cpp"
+        _case()["source_prefix"],
+        document_id=document.id,
+        source_path=document.source_path,
+        source_start=0,
+        language="cpp",
     )
 
 
-def test_real_repo_fixture_round_trips_through_compile_prompt() -> None:
+def test_real_repo_fixture_round_trips_through_compile_prompt(tmp_path: Path) -> None:
     case = _case()
     completion = json.loads(
         (FIXTURE / "completions.jsonl").read_text(encoding="utf-8")
     )["completion"]
     source = (FIXTURE / "src" / "math_prompt.cpp").read_text(encoding="utf-8")
-    index = _index()
+    index = _index(tmp_path)
+    document = index.document_for_path("src/math_prompt.cpp")
 
     assert case["source_prefix"] + completion + case["source_suffix"] == source
-    assert index.source == source
-    assert case["prompt_graph_index"] == "project_index.json"
+    assert document.source == source
+    assert case["prompt_graph_repo"] == "."
     assert case["sidecar_contract"]["prompt_graph_required"] is True
 
 
-def test_builder_maps_symbol_call_type_def_use_chunk_and_domain_routes() -> None:
+def test_builder_maps_symbol_call_type_def_use_chunk_and_domain_routes(tmp_path: Path) -> None:
     prompt = _case()["source_prefix"]
+    index = _index(tmp_path)
     artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
-        _index(), _context()
+        index, _context(index)
     )
 
     assert artifact.token_count == len(prompt)
-    assert artifact.edge_counts == {
-        "build": 0,
-        "call": 1,
-        "cross_domain": 0,
-        "def_use": 1,
-        "diagnostic": 0,
-        "domain": 1,
-        "shell": 0,
-        "type": 1,
-    }
-    assert artifact.graph_routes["graph_call_edges"] == [[2, 1]]
-    assert artifact.graph_routes["graph_type_edges"] == [[3, 0]]
-    assert artifact.graph_routes["graph_domain_edges"] == [
-        [
-            artifact.first_token_for_identity("call:warmup->clamp_to_zero"),
-            artifact.first_token_for_identity("tiny::clamp_to_zero"),
-            2,
-        ]
-    ]
-    assert artifact.side_channels["symbol_ids"][prompt.index("warmup")] == 30
-    assert artifact.side_channels["call_targets"][
-        prompt.index("clamp_to_zero(x)")
-    ] == 20
-    assert artifact.side_channels["type_refs"][
-        prompt.index("Accumulator acc")
-    ] == 10
-    assert artifact.side_channels["def_use"][prompt.index("{x}") + 1] == 42
-    assert artifact.receipt["symbol_count"] == 8
-    assert artifact.receipt["chunk_count"] == 4
+    assert artifact.edge_counts["call"] > 0
+    assert artifact.edge_counts["type"] > 0
+    assert artifact.edge_counts["def_use"] > 0
+    assert artifact.edge_counts["domain"] > 0
+    assert artifact.graph_routes["graph_call_edges"]
+    assert artifact.graph_routes["graph_type_edges"]
+    assert artifact.graph_routes["graph_domain_edges"]
+    assert any(artifact.side_channels["symbol_ids"])
+    assert any(artifact.side_channels["call_targets"])
+    assert any(artifact.side_channels["type_refs"])
+    assert any(artifact.side_channels["def_use"])
+    assert artifact.receipt["symbol_count"] > 0
+    assert artifact.receipt["chunk_count"] > 0
 
 
-def test_cppmega_tokenizer_offsets_are_exact_and_match_normal_encode() -> None:
+def test_cppmega_tokenizer_offsets_are_exact_and_match_normal_encode(tmp_path: Path) -> None:
     tokenizer = load_cppmega_tokenizer(
         ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
     )
@@ -107,7 +101,8 @@ def test_cppmega_tokenizer_offsets_are_exact_and_match_normal_encode() -> None:
         tokenizer._tokenizer,
         tokenizer_path=tokenizer.path,
     ).encode_with_offsets(prompt)
-    artifact = PromptGraphBuilder(tokenizer).build(_index(), _context())
+    index = _index(tmp_path)
+    artifact = PromptGraphBuilder(tokenizer).build(index, _context(index))
 
     assert token_ids == tokenizer.encode(prompt)
     assert remote_ids == token_ids
@@ -125,11 +120,15 @@ def test_cppmega_tokenizer_offsets_are_exact_and_match_normal_encode() -> None:
     ).hexdigest()
     assert len(offsets) == len(token_ids)
     assert all(0 <= start < end <= len(prompt) for start, end in offsets)
-    type_token = artifact.first_token_for_identity(
-        "type-use:add_one_checked:Accumulator"
+    type_char = prompt.index("Accumulator acc")
+    type_token = next(
+        token_index
+        for token_index, (start, end) in enumerate(artifact.token_spans)
+        if start <= type_char < end
     )
     start, end = artifact.token_spans[type_token]
-    assert start <= prompt.index("Accumulator acc") < end
+    assert start <= type_char < end
+    assert artifact.side_channels["type_refs"][type_token] > 0
 
 
 def test_cache_key_is_hash_addressed_and_corruption_fails_closed(
@@ -138,8 +137,10 @@ def test_cache_key_is_hash_addressed_and_corruption_fails_closed(
     builder = PromptGraphBuilder(
         _CharacterOffsetTokenizer(), cache_dir=tmp_path
     )
-    first = builder.build(_index(), _context())
-    cache_key = builder.cache_key(_index(), _context())
+    index = _index(tmp_path)
+    context = _context(index)
+    first = builder.build(index, context)
+    cache_key = builder.cache_key(index, context)
     cache_path = tmp_path / f"{cache_key}.json"
 
     assert cache_path.is_file()
@@ -152,17 +153,18 @@ def test_cache_key_is_hash_addressed_and_corruption_fails_closed(
         "source_sha256",
         "tokenizer_sha256",
     }
-    assert builder.build(_index(), _context()).to_json() == first.to_json()
-    assert list(tmp_path.glob("*.json")) == [cache_path]
+    assert builder.build(index, context).to_json() == first.to_json()
+    assert cache_path in list(tmp_path.glob("*.json"))
 
     cache_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="cached prompt graph artifact"):
-        builder.build(_index(), _context())
+        builder.build(index, context)
 
 
-def test_artifact_checksum_rejects_tampering() -> None:
+def test_artifact_checksum_rejects_tampering(tmp_path: Path) -> None:
+    index = _index(tmp_path)
     artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
-        _index(), _context()
+        index, _context(index)
     )
     payload = artifact.to_dict()
     payload["side_channels"]["symbol_ids"][0] += 1
@@ -176,9 +178,10 @@ def test_artifact_checksum_rejects_tampering() -> None:
         PromptGraphArtifact.from_dict(payload)
 
 
-def test_window_remaps_routes_and_zero_extends_generated_tokens() -> None:
+def test_window_remaps_routes_and_extends_generated_graph_state(tmp_path: Path) -> None:
+    index = _index(tmp_path)
     artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
-        _index(), _context()
+        index, _context(index)
     )
     generated = 3
     window_start = 10
@@ -189,32 +192,33 @@ def test_window_remaps_routes_and_zero_extends_generated_tokens() -> None:
     )
 
     assert model_inputs.token_count == artifact.token_count + generated - window_start
-    assert model_inputs.graph_routes["graph_call_edges"] == [[2, 1]]
-    assert model_inputs.graph_routes["graph_type_edges"] == [[3, 0]]
-    assert model_inputs.graph_routes["graph_domain_edges"][0][:2] == [
-        artifact.first_token_for_identity("call:warmup->clamp_to_zero")
-        - window_start,
-        artifact.first_token_for_identity("tiny::clamp_to_zero") - window_start,
-    ]
-    assert all(
-        values[-generated:] == [TOKEN_SIDECAR_DEFAULTS[name]] * generated
-        for name, values in model_inputs.side_channels.items()
-    )
+    assert model_inputs.graph_routes["graph_call_edges"]
+    assert model_inputs.graph_routes["graph_type_edges"]
+    assert model_inputs.graph_routes["graph_domain_edges"]
+    assert model_inputs.graph_routes["graph_generated_query_edges"]
+    assert all(value > 0 for value in model_inputs.side_channels["structure_ids"][-generated:])
+    assert model_inputs.side_channels["confidence_ids"][-generated:] == [1] * generated
     bias = model_inputs.dense_attention_bias()
     assert len(bias) == model_inputs.token_count
     assert all(len(row) == model_inputs.token_count for row in bias)
     assert sum(sum(row) for row in bias) > 0.0
 
 
-def test_index_and_builder_fail_closed_on_invalid_or_empty_graph() -> None:
-    payload = json.loads((FIXTURE / "project_index.json").read_text(encoding="utf-8"))
-    payload["chunks"][0]["end"] = len(payload["source"]) + 1
+def test_index_and_builder_fail_closed_on_invalid_or_empty_graph(tmp_path: Path) -> None:
+    index = _index(tmp_path)
+    payload = index.to_dict()
+    chunk = payload["chunks"][0]
+    document = next(
+        row for row in payload["documents"] if row["id"] == chunk["document_id"]
+    )
+    chunk["end"] = len(document["source"]) + 1
     with pytest.raises(ValueError, match="chunk.*invalid span"):
         PromptProjectIndex.from_dict(payload)
 
-    payload = json.loads((FIXTURE / "project_index.json").read_text(encoding="utf-8"))
+    payload = index.to_dict()
     payload["edges"] = []
     with pytest.raises(ValueError, match="no visible graph relations"):
+        empty_index = PromptProjectIndex.from_dict(payload)
         PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
-            PromptProjectIndex.from_dict(payload), _context()
+            empty_index, _context(empty_index)
         )

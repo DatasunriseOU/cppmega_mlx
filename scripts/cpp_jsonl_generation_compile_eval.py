@@ -33,7 +33,11 @@ from cppmega_mlx.data.prompt_graph import (
     PromptGraphBuilder,
     PromptGraphContext,
     PromptProjectIndex,
+    GENERATED_TOKEN_SIDECAR_DEFAULTS,
+    TOKEN_SIDECAR_DEFAULTS,
+    TOKEN_SIDECAR_NAMES,
 )
+from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
 from cppmega_mlx.inference.sampling import sample_next_token
 from cppmega_mlx.inference.side_channels import (
     InferenceSideChannelBuilder,
@@ -49,13 +53,14 @@ PromptGraphMode = Literal["off", "repo"]
 
 DEFAULT_TOKENIZER = REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
 DEFAULT_COMPILE_GATE = REPO_ROOT.parent / "cppmega" / "scripts" / "cpp_generation_compile_eval.py"
-SIDE_CHANNEL_NAMES = (
+MODEL_SIDE_CHANNEL_NAMES = (
     "structure_ids",
     "dep_levels",
     "ast_depth_ids",
     "sibling_index_ids",
     "node_type_ids",
 )
+SIDE_CHANNEL_NAMES = TOKEN_SIDECAR_NAMES
 DEFAULT_COMPILE_PATH_DIRS = (
     Path("/opt/homebrew/opt/llvm/bin"),
     Path("/opt/homebrew/bin"),
@@ -82,6 +87,37 @@ class GenerationPromptContext:
         self.side_channels = side_channels
         self.receipt = receipt
         self.graph_artifact = graph_artifact
+
+
+class ResolvedPromptGraph:
+    __slots__ = (
+        "project_index",
+        "document_id",
+        "source_path",
+        "source_start",
+        "repository_root",
+        "index_path",
+        "index_receipt",
+    )
+
+    def __init__(
+        self,
+        *,
+        project_index: PromptProjectIndex,
+        document_id: int,
+        source_path: str,
+        source_start: int,
+        repository_root: Path,
+        index_path: Path,
+        index_receipt: dict[str, Any],
+    ) -> None:
+        self.project_index = project_index
+        self.document_id = document_id
+        self.source_path = source_path
+        self.source_start = source_start
+        self.repository_root = repository_root
+        self.index_path = index_path
+        self.index_receipt = index_receipt
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -152,36 +188,98 @@ def _resolve_contained_path(
     return resolved
 
 
+def effective_case_prompt_graph_mode(
+    case: dict[str, Any],
+    global_mode: PromptGraphMode,
+) -> PromptGraphMode:
+    if global_mode not in {"repo", "off"}:
+        raise ValueError(f"unsupported prompt graph mode {global_mode!r}")
+    task_id = str(case.get("task_id") or "<unknown>")
+    case_mode = case.get("prompt_graph_mode")
+    if case_mode not in {"repo", "off"}:
+        raise ValueError(
+            f"case {task_id!r}: prompt_graph_mode must be explicitly "
+            "'repo' or 'off'"
+        )
+    if global_mode == "off":
+        return "off"
+    return case_mode
+
+
 def resolve_case_prompt_graph(
     case: dict[str, Any],
     *,
     cases_dir: Path,
     mode: PromptGraphMode,
-) -> tuple[PromptProjectIndex | None, int | None]:
+    prompt_index_cache_dir: Path | None = None,
+    indexer_root: Path | None = None,
+) -> ResolvedPromptGraph | None:
     if mode == "off":
-        return None, None
+        return None
     if mode != "repo":
         raise ValueError(f"unsupported prompt graph mode {mode!r}")
 
     task_id = str(case.get("task_id") or "<unknown>")
     raw_index = case.get("prompt_graph_index")
-    if not isinstance(raw_index, str) or not raw_index:
-        raise ValueError(
-            f"case {task_id!r}: missing non-empty prompt_graph_index "
-            "while prompt graph mode is repo"
+    raw_repo = case.get("prompt_graph_repo")
+    if raw_repo is None:
+        if isinstance(raw_index, str) and raw_index:
+            repository_root = _resolve_contained_path(
+                cases_dir,
+                str(Path(raw_index).parent or "."),
+                where=f"case {task_id!r} prompt graph index repository",
+            )
+        else:
+            raise ValueError(
+                f"case {task_id!r}: missing non-empty prompt_graph_repo "
+                "while prompt graph mode is repo"
+            )
+    else:
+        repository_root = _resolve_contained_path(
+            cases_dir,
+            raw_repo,
+            where=f"case {task_id!r} prompt_graph_repo",
         )
-    index_path = _resolve_contained_path(
-        cases_dir,
-        raw_index,
-        where=f"case {task_id!r} prompt_graph_index",
-    )
-    if not index_path.is_file():
-        raise FileNotFoundError(
-            f"case {task_id!r}: prompt graph index not found: {index_path}"
-        )
-    project_index = PromptProjectIndex.from_json_path(index_path)
-    project_index.verify_source_file(index_path.parent)
 
+    if isinstance(raw_index, str) and raw_index:
+        index_path = _resolve_contained_path(
+            cases_dir,
+            raw_index,
+            where=f"case {task_id!r} prompt_graph_index",
+        )
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"case {task_id!r}: prompt graph index not found: {index_path}"
+            )
+        project_index = PromptProjectIndex.from_json_path(index_path)
+        project_index.verify_repository(repository_root)
+        index_receipt = dict(project_index.provenance)
+    else:
+        if prompt_index_cache_dir is None:
+            raise ValueError(
+                f"case {task_id!r}: automatic prompt graph index build requires "
+                "a deterministic prompt_index_cache_dir"
+            )
+        raw_project_id = case.get("prompt_graph_project_id")
+        project_id = (
+            raw_project_id
+            if isinstance(raw_project_id, str) and raw_project_id
+            else repository_root.name
+        )
+        built = ClangPromptProjectIndexProducer(
+            cache_dir=prompt_index_cache_dir,
+            indexer_root=indexer_root,
+        ).build(repository_root, project_id=project_id)
+        project_index = built.index
+        index_path = built.path
+        index_receipt = dict(built.receipt)
+
+    raw_source_path = case.get("prompt_source_path")
+    if not isinstance(raw_source_path, str) or not raw_source_path:
+        raise ValueError(
+            f"case {task_id!r}: prompt_source_path must be a non-empty relative path"
+        )
+    source_document = project_index.document_for_path(raw_source_path)
     source_start = case.get("prompt_source_start")
     if (
         isinstance(source_start, bool)
@@ -194,12 +292,21 @@ def resolve_case_prompt_graph(
         )
     prompt = prompt_text(case, "source-prefix")
     source_end = source_start + len(prompt)
-    if project_index.source[source_start:source_end] != prompt:
+    if source_document.source[source_start:source_end] != prompt:
         raise ValueError(
             f"case {task_id!r}: source_prefix does not match project index "
-            f"source span [{source_start},{source_end})"
+            f"document {source_document.source_path!r} span "
+            f"[{source_start},{source_end})"
         )
-    return project_index, source_start
+    return ResolvedPromptGraph(
+        project_index=project_index,
+        document_id=source_document.id,
+        source_path=source_document.source_path,
+        source_start=source_start,
+        repository_root=repository_root,
+        index_path=index_path,
+        index_receipt=index_receipt,
+    )
 
 
 def default_side_channels(seq_len: int) -> dict[str, mx.array]:
@@ -226,14 +333,16 @@ def build_prompt_context(
     prompt_sidecars: PromptSidecars,
     prepend_code_start: bool,
     project_index: PromptProjectIndex | None = None,
+    prompt_document_id: int | None = None,
+    prompt_source_path: str | None = None,
     prompt_source_start: int | None = None,
     prompt_graph_cache_dir: Path | None = None,
 ) -> GenerationPromptContext:
     """Encode a prompt and build token-aligned prompt sidecars.
 
-    Generated suffix tokens get zero/default sidecars until the full candidate is
-    reparsed by the compile gate. Prompt tokens, however, should carry the same
-    structure channels the model saw during training when requested.
+    Repository mode keeps a live generated continuation chunk and routes every
+    generated query to a deterministic visible repository summary. Explicit
+    graph-off mode still keeps every sidecar shape token-aligned.
     """
 
     if prompt_graph_mode == "repo":
@@ -256,6 +365,11 @@ def build_prompt_context(
             raise ValueError(
                 "prompt graph mode repo requires prompt_source_start"
             )
+        if prompt_document_id is None or not prompt_source_path:
+            raise ValueError(
+                "prompt graph mode repo requires prompt_document_id and "
+                "prompt_source_path"
+            )
         if prompt_graph_cache_dir is None:
             raise ValueError(
                 "prompt graph mode repo requires a deterministic cache directory"
@@ -267,6 +381,8 @@ def build_prompt_context(
             project_index,
             PromptGraphContext.from_prompt(
                 prompt,
+                document_id=prompt_document_id,
+                source_path=prompt_source_path,
                 source_start=prompt_source_start,
                 language="cpp",
             ),
@@ -312,11 +428,14 @@ def build_prompt_context(
     )
     result = builder.build(prompt, language="cpp")
     ids = _row_to_ints(result.prompt_ids)
-    zero = [0] * len(ids)
     side: dict[str, list[int]] = {}
     for name in SIDE_CHANNEL_NAMES:
         value = result.model_kwargs.get(name)
-        side[name] = _row_to_ints(value) if isinstance(value, mx.array) else list(zero)
+        side[name] = (
+            _row_to_ints(value)
+            if isinstance(value, mx.array)
+            else [int(TOKEN_SIDECAR_DEFAULTS[name])] * len(ids)
+        )
     receipt = dict(result.provenance)
     receipt["prompt_graph_mode"] = "off"
     return GenerationPromptContext(
@@ -363,10 +482,31 @@ def prompt_model_inputs(
             f"for total {total_token_count}"
         )
     generated = total_token_count - len(context.token_ids)
+    if context.receipt.get("prompt_sidecars") == "zero":
+        generated_values = {name: 0 for name in SIDE_CHANNEL_NAMES}
+        generated_policy = "explicit_graph_off_zero_sidecars_v1"
+    else:
+        generated_values = {
+            name: int(GENERATED_TOKEN_SIDECAR_DEFAULTS[name])
+            for name in SIDE_CHANNEL_NAMES
+        }
+        anchor_candidates = [
+            index
+            for index, value in enumerate(context.side_channels["structure_ids"])
+            if int(value) > 0
+        ]
+        if anchor_candidates:
+            anchor = anchor_candidates[-1]
+            for name in MODEL_SIDE_CHANNEL_NAMES:
+                generated_values[name] = int(context.side_channels[name][anchor])
+        generated_policy = "generated_syntax_continuation_chunk_v1"
     side = {
         name: mx.array(
             [
-                (list(context.side_channels[name]) + [0] * generated)[
+                (
+                    list(context.side_channels[name])
+                    + [generated_values[name]] * generated
+                )[
                     window_start:window_end
                 ]
             ],
@@ -379,6 +519,8 @@ def prompt_model_inputs(
         "window_start": window_start,
         "window_end": window_end,
         "total_token_count": total_token_count,
+        "generated_token_policy": generated_policy,
+        "generated_token_count": generated,
     }
     return side, None, receipt
 
@@ -642,7 +784,13 @@ def build_model_config(
                 args.structure_bottleneck_dim,
             )
         ),
-        require_graph_routes=args.prompt_graph_mode == "repo",
+        require_graph_routes=bool(
+            getattr(
+                args,
+                "require_graph_routes",
+                args.prompt_graph_mode == "repo",
+            )
+        ),
         ngram_hash_enabled=not args.disable_ngram,
         ngram_hash_heads=int(_cfg_value(checkpoint_config, "ngram_hash_heads", args.ngram_hash_heads)),
         ngram_hash_table_size=int(_cfg_value(checkpoint_config, "ngram_hash_table_size", args.ngram_hash_table_size)),
@@ -704,6 +852,8 @@ def generate_completion(
     prompt_sidecars: PromptSidecars,
     prepend_code_start: bool,
     project_index: PromptProjectIndex | None,
+    prompt_document_id: int | None,
+    prompt_source_path: str | None,
     prompt_source_start: int | None,
     prompt_graph_cache_dir: Path | None,
 ) -> tuple[str, int, int, dict[str, Any]]:
@@ -714,6 +864,8 @@ def generate_completion(
         prompt_sidecars=prompt_sidecars,
         prepend_code_start=prepend_code_start,
         project_index=project_index,
+        prompt_document_id=prompt_document_id,
+        prompt_source_path=prompt_source_path,
         prompt_source_start=prompt_source_start,
         prompt_graph_cache_dir=prompt_graph_cache_dir,
     )
@@ -735,12 +887,13 @@ def generate_completion(
         )
     token_context = list(prompt_ids)
     generated: list[int] = []
+    last_window_receipt: dict[str, Any] | None = None
     constraints = BodyDecodeConstraints(tokenizer, prompt_len=len(prompt_ids))
     for _ in range(max_new_tokens):
         window_start = max(0, len(token_context) - seq_len)
         window = token_context[window_start:]
         input_ids = mx.array([window], dtype=mx.int32)
-        side, block_bias, _window_receipt = prompt_model_inputs(
+        side, block_bias, last_window_receipt = prompt_model_inputs(
             prompt_context,
             total_token_count=len(token_context),
             window_start=window_start,
@@ -749,7 +902,7 @@ def generate_completion(
         logits, _loss = model(
             input_ids,
             block_bias=block_bias,
-            **side,
+            **{name: side[name] for name in MODEL_SIDE_CHANNEL_NAMES},
         )
         next_id = _sample_next(
             logits,
@@ -764,11 +917,16 @@ def generate_completion(
             break
         generated.append(next_id)
         token_context.append(next_id)
+    receipt = dict(prompt_context.receipt)
+    receipt["aligned_side_channels"] = list(SIDE_CHANNEL_NAMES)
+    receipt["model_consumed_side_channels"] = list(MODEL_SIDE_CHANNEL_NAMES)
+    if last_window_receipt is not None:
+        receipt["last_decode_window"] = last_window_receipt
     return (
         trim_body_completion(tokenizer.decode(generated)),
         len(prompt_ids),
         len(generated),
-        dict(prompt_context.receipt),
+        receipt,
     )
 
 
@@ -789,15 +947,23 @@ def write_completions(
     prepend_code_start: bool,
     cases_dir: Path,
     prompt_graph_cache_dir: Path | None,
+    prompt_index_cache_dir: Path | None,
+    indexer_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     completions_path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     with completions_path.open("w", encoding="utf-8") as fh:
         for case in cases:
-            project_index, prompt_source_start = resolve_case_prompt_graph(
+            case_graph_mode = effective_case_prompt_graph_mode(
+                case,
+                prompt_graph_mode,
+            )
+            resolved = resolve_case_prompt_graph(
                 case,
                 cases_dir=cases_dir,
-                mode=prompt_graph_mode,
+                mode=case_graph_mode,
+                prompt_index_cache_dir=prompt_index_cache_dir,
+                indexer_root=indexer_root,
             )
             completion, prompt_tokens, generated_tokens, side_provenance = generate_completion(
                 model,
@@ -808,11 +974,13 @@ def write_completions(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                prompt_graph_mode=prompt_graph_mode,
+                prompt_graph_mode=case_graph_mode,
                 prompt_sidecars=prompt_sidecars,
                 prepend_code_start=prepend_code_start,
-                project_index=project_index,
-                prompt_source_start=prompt_source_start,
+                project_index=(None if resolved is None else resolved.project_index),
+                prompt_document_id=(None if resolved is None else resolved.document_id),
+                prompt_source_path=(None if resolved is None else resolved.source_path),
+                prompt_source_start=(None if resolved is None else resolved.source_start),
                 prompt_graph_cache_dir=prompt_graph_cache_dir,
             )
             row = {
@@ -820,7 +988,11 @@ def write_completions(
                 "completion": completion,
                 "prompt_tokens": prompt_tokens,
                 "generated_tokens": generated_tokens,
+                "prompt_graph_mode": case_graph_mode,
                 "prompt_graph_receipt": side_provenance,
+                "prompt_graph_index_receipt": (
+                    None if resolved is None else resolved.index_receipt
+                ),
             }
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             rows.append(row)
@@ -872,6 +1044,7 @@ def run_compile_gate(
         "--out",
         str(report),
         "--json",
+        "--fail-on-fail",
     ]
     if keep_workdir:
         cmd.append("--keep-workdir")
@@ -899,6 +1072,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Hash-addressed graph artifact cache (defaults under --out-dir).",
+    )
+    ap.add_argument(
+        "--prompt-index-cache-dir",
+        type=Path,
+        default=None,
+        help="Hash-addressed clang project-index cache (defaults under --out-dir).",
+    )
+    ap.add_argument(
+        "--clang-indexer-root",
+        type=Path,
+        default=None,
+        help="Checkout containing tools/clang_indexer/index_project.py.",
     )
     ap.add_argument("--prompt-sidecars", choices=("zero", "clang"), default="zero")
     ap.add_argument("--seq-len", type=int, default=1024)
@@ -934,16 +1119,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--top-k must be non-negative")
     if args.top_p is not None and not (0.0 < args.top_p <= 1.0):
         raise ValueError("--top-p must be in (0, 1]")
-    if args.prompt_graph_mode == "repo" and args.prompt_sidecars != "zero":
-        raise ValueError(
-            "--prompt-graph-mode repo cannot be combined with "
-            "--prompt-sidecars clang"
-        )
-    if args.prompt_graph_mode == "repo" and args.prepend_code_start:
-        raise ValueError(
-            "--prompt-graph-mode repo cannot be combined with "
-            "--prepend-code-start"
-        )
     return args
 
 
@@ -951,13 +1126,6 @@ def main() -> None:
     args = parse_args()
     cases = load_cases(args.cases)
     cases_dir = args.cases.resolve().parent
-    for case in cases:
-        resolve_case_prompt_graph(
-            case,
-            cases_dir=cases_dir,
-            mode=args.prompt_graph_mode,
-        )
-
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     prompt_graph_cache_dir = (
@@ -965,8 +1133,38 @@ def main() -> None:
         if args.prompt_graph_cache_dir is not None
         else out_dir / "prompt_graph_cache"
     )
-    if args.prompt_graph_mode == "off":
+    prompt_index_cache_dir = (
+        args.prompt_index_cache_dir
+        if args.prompt_index_cache_dir is not None
+        else out_dir / "prompt_index_cache"
+    )
+    case_graph_modes = [
+        effective_case_prompt_graph_mode(case, args.prompt_graph_mode)
+        for case in cases
+    ]
+    args.require_graph_routes = any(mode == "repo" for mode in case_graph_modes)
+    if args.require_graph_routes and args.prompt_sidecars != "zero":
+        raise ValueError(
+            "repository prompt graph cases cannot be combined with "
+            "--prompt-sidecars clang"
+        )
+    if args.require_graph_routes and args.prepend_code_start:
+        raise ValueError(
+            "repository prompt graph cases cannot be combined with "
+            "--prepend-code-start"
+        )
+    if not args.require_graph_routes:
         prompt_graph_cache_dir = None
+        prompt_index_cache_dir = None
+
+    for case, case_graph_mode in zip(cases, case_graph_modes):
+        resolve_case_prompt_graph(
+            case,
+            cases_dir=cases_dir,
+            mode=case_graph_mode,
+            prompt_index_cache_dir=prompt_index_cache_dir,
+            indexer_root=args.clang_indexer_root,
+        )
 
     tokenizer = load_cppmega_tokenizer(args.tokenizer)
     model = build_model(args)
@@ -989,6 +1187,8 @@ def main() -> None:
         prepend_code_start=args.prepend_code_start,
         cases_dir=cases_dir,
         prompt_graph_cache_dir=prompt_graph_cache_dir,
+        prompt_index_cache_dir=prompt_index_cache_dir,
+        indexer_root=args.clang_indexer_root,
     )
     summary = {
         "cases": len(cases),
@@ -1001,10 +1201,18 @@ def main() -> None:
         "top_k": args.top_k,
         "top_p": args.top_p,
         "prompt_graph_mode": args.prompt_graph_mode,
+        "prompt_graph_case_counts": {
+            mode: case_graph_modes.count(mode) for mode in ("repo", "off")
+        },
         "prompt_graph_cache_dir": (
             None
             if prompt_graph_cache_dir is None
             else str(prompt_graph_cache_dir)
+        ),
+        "prompt_index_cache_dir": (
+            None
+            if prompt_index_cache_dir is None
+            else str(prompt_index_cache_dir)
         ),
         "prompt_sidecars": args.prompt_sidecars,
     }

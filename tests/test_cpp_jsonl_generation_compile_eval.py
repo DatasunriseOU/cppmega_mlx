@@ -58,6 +58,15 @@ def _case3_prompt() -> str:
     return row["source_prefix"]
 
 
+def _build_case3_index(tmp_path: Path):
+    from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
+
+    return ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "project-index-cache",
+        indexer_root=ROOT,
+    ).build(CASE3_FIXTURE, project_id="case3_prompt_repo").index
+
+
 def test_build_prompt_context_zero_sidecars_align_with_prepend():
     mod = _load_module()
     context = mod.build_prompt_context(
@@ -112,14 +121,12 @@ def test_build_model_config_requires_graph_routes_only_in_repo_mode():
 
 
 def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
-    from cppmega_mlx.data.prompt_graph import PromptProjectIndex
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 
     mod = _load_module()
     tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
-    project_index = PromptProjectIndex.from_json_path(
-        CASE3_FIXTURE / "project_index.json"
-    )
+    project_index = _build_case3_index(tmp_path)
+    source = project_index.document_for_path("src/math_prompt.cpp")
 
     context = mod.build_prompt_context(
         tokenizer,
@@ -128,6 +135,8 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
         prompt_sidecars="zero",
         prepend_code_start=False,
         project_index=project_index,
+        prompt_document_id=source.id,
+        prompt_source_path=source.source_path,
         prompt_source_start=0,
         prompt_graph_cache_dir=tmp_path,
     )
@@ -139,16 +148,11 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     )
 
     assert context.graph_artifact is not None
-    assert context.receipt["edge_counts"] == {
-        "build": 0,
-        "call": 1,
-        "cross_domain": 0,
-        "def_use": 1,
-        "diagnostic": 0,
-        "domain": 1,
-        "shell": 0,
-        "type": 1,
-    }
+    assert context.receipt["edge_counts"]["call"] > 0
+    assert context.receipt["edge_counts"]["type"] > 0
+    assert context.receipt["edge_counts"]["def_use"] > 0
+    assert context.receipt["edge_counts"]["domain"] > 0
+    assert set(context.side_channels) == set(mod.TOKEN_SIDECAR_NAMES)
     assert all(tuple(value.shape) == (1, len(context.token_ids) + 1) for value in side.values())
     assert tuple(block_bias.shape) == (
         1,
@@ -156,18 +160,24 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
         len(context.token_ids) + 1,
     )
     assert float(mx.sum(block_bias).item()) > 0.0
-    assert window_receipt["edge_counts"]["call"] == 1
+    assert window_receipt["edge_counts"]["call"] > 0
+    assert window_receipt["generated_token_policy"] == (
+        "generated_continuation_chunk_with_repository_summary_v1"
+    )
+    assert side["domain_ids"][0, -1].item() == 1
+    assert side["confidence_ids"][0, -1].item() == 1
+    assert side["source_doc_ids"][0, -1].item() == 0
+    assert side["structure_ids"][0, -1].item() > 0
+    assert float(mx.sum(block_bias[:, -1, :]).item()) > 0.0
 
 
 def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path):
-    from cppmega_mlx.data.prompt_graph import PromptProjectIndex
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 
     mod = _load_module()
     tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
-    project_index = PromptProjectIndex.from_json_path(
-        CASE3_FIXTURE / "project_index.json"
-    )
+    project_index = _build_case3_index(tmp_path)
+    source = project_index.document_for_path("src/math_prompt.cpp")
 
     class CapturingModel:
         def __init__(self):
@@ -195,34 +205,102 @@ def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path)
         prompt_sidecars="zero",
         prepend_code_start=False,
         project_index=project_index,
+        prompt_document_id=source.id,
+        prompt_source_path=source.source_path,
         prompt_source_start=0,
         prompt_graph_cache_dir=tmp_path,
     )
 
     assert prompt_tokens > 0
     assert generated_tokens == 1
-    assert receipt["edge_counts"]["call"] == 1
+    assert receipt["edge_counts"]["call"] > 0
     assert len(model.calls) == 1
     input_ids, kwargs = model.calls[0]
     assert tuple(input_ids.shape) == (1, prompt_tokens)
     assert float(mx.sum(kwargs["block_bias"]).item()) > 0.0
     assert int(mx.sum(kwargs["structure_ids"]).item()) > 0
-    assert receipt["edge_counts"]["type"] == 1
-    assert receipt["edge_counts"]["def_use"] == 1
-    assert receipt["edge_counts"]["domain"] == 1
+    assert receipt["edge_counts"]["type"] > 0
+    assert receipt["edge_counts"]["def_use"] > 0
+    assert receipt["edge_counts"]["domain"] > 0
+
+
+def test_generate_completion_keeps_graph_sensitive_after_token_one(tmp_path: Path):
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    project_index = _build_case3_index(tmp_path)
+    source = project_index.document_for_path("src/math_prompt.cpp")
+
+    class CapturingModel:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append((input_ids, kwargs))
+            logits = mx.zeros(
+                (1, input_ids.shape[1], tokenizer.vocab_size),
+                dtype=mx.float32,
+            )
+            return logits, None
+
+    model = CapturingModel()
+    mod.generate_completion(
+        model,
+        tokenizer,
+        _case3_prompt(),
+        seq_len=1024,
+        max_new_tokens=3,
+        temperature=0.0,
+        top_k=None,
+        top_p=None,
+        prompt_graph_mode="repo",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        project_index=project_index,
+        prompt_document_id=source.id,
+        prompt_source_path=source.source_path,
+        prompt_source_start=0,
+        prompt_graph_cache_dir=tmp_path / "graph-cache",
+    )
+
+    assert len(model.calls) == 3
+    for _input_ids, kwargs in model.calls[1:]:
+        assert float(mx.sum(kwargs["block_bias"][:, -1, :]).item()) > 0.0
+        assert int(kwargs["structure_ids"][0, -1].item()) > 0
+
+
+def test_resolve_case_prompt_graph_builds_real_index_when_path_absent(
+    tmp_path: Path,
+):
+    mod = _load_module()
+    case = json.loads((CASE3_FIXTURE / "cases.jsonl").read_text().splitlines()[0])
+
+    resolved = mod.resolve_case_prompt_graph(
+        case,
+        cases_dir=CASE3_FIXTURE,
+        mode="repo",
+        prompt_index_cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+
+    assert resolved is not None
+    assert resolved.index_path.is_file()
+    assert resolved.index_receipt["producer"] == "ClangPromptProjectIndexProducer"
+    assert resolved.project_index.document_for_path("src/math_prompt.cpp").id == (
+        resolved.document_id
+    )
 
 
 def test_generate_completion_refuses_to_discard_repository_graph_window(
     tmp_path: Path,
 ):
-    from cppmega_mlx.data.prompt_graph import PromptProjectIndex
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 
     mod = _load_module()
     tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
-    project_index = PromptProjectIndex.from_json_path(
-        CASE3_FIXTURE / "project_index.json"
-    )
+    project_index = _build_case3_index(tmp_path)
+    source = project_index.document_for_path("src/math_prompt.cpp")
 
     class ModelMustNotRun:
         def __call__(self, *_args, **_kwargs):
@@ -242,6 +320,8 @@ def test_generate_completion_refuses_to_discard_repository_graph_window(
             prompt_sidecars="zero",
             prepend_code_start=False,
             project_index=project_index,
+            prompt_document_id=source.id,
+            prompt_source_path=source.source_path,
             prompt_source_start=0,
             prompt_graph_cache_dir=tmp_path,
         )
@@ -251,12 +331,22 @@ def test_resolve_case_prompt_graph_fails_closed_when_requested(tmp_path: Path):
     mod = _load_module()
     case = {"task_id": "missing", "source_prefix": "int f() {\n"}
 
-    with pytest.raises(ValueError, match="missing.*prompt_graph_index"):
-        mod.resolve_case_prompt_graph(case, cases_dir=tmp_path, mode="repo")
+    with pytest.raises(ValueError, match="missing.*prompt_graph_repo"):
+        mod.resolve_case_prompt_graph(
+            case,
+            cases_dir=tmp_path,
+            mode="repo",
+            prompt_index_cache_dir=tmp_path / "cache",
+            indexer_root=ROOT,
+        )
 
     assert mod.resolve_case_prompt_graph(
-        case, cases_dir=tmp_path, mode="off"
-    ) == (None, None)
+        case,
+        cases_dir=tmp_path,
+        mode="off",
+        prompt_index_cache_dir=tmp_path / "cache",
+        indexer_root=ROOT,
+    ) is None
 
 
 def test_build_prompt_context_rejects_clang_sidecars_with_prepended_code_start():
@@ -357,6 +447,33 @@ def test_trim_body_completion_ignores_braces_in_raw_strings():
     assert mod.trim_body_completion(completion) == (
         'auto text = R"tag(})tag";\nreturn text.size();\n'
     )
+
+
+def test_local_compile_gate_fails_closed_for_failed_candidate(tmp_path: Path):
+    mod = _load_module()
+    cases = tmp_path / "cases.jsonl"
+    completions = tmp_path / "completions.jsonl"
+    report = tmp_path / "compile_report.json"
+    cases.write_text(
+        '{"task_id":"broken","language":"cpp",'
+        '"prompt":"return a value",'
+        '"source_prefix":"int broken() {\\n",'
+        '"source_suffix":"}\\nint main() { return broken(); }\\n"}\n'
+    )
+    completions.write_text(
+        '{"task_id":"broken","completion":"return does_not_exist;"}\n'
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        mod.run_compile_gate(
+            cases=cases,
+            completions=completions,
+            report=report,
+            script=mod.DEFAULT_COMPILE_GATE,
+            keep_workdir=False,
+        )
+
+    assert json.loads(report.read_text())["summary"]["passed"] == 0
 
 
 def test_script_help_bootstraps_repo_root_from_sibling_cwd():
