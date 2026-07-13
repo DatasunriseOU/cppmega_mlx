@@ -20,7 +20,6 @@ import os
 import shutil
 import subprocess
 import tarfile
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -44,17 +43,48 @@ def _load_builder():
     return b
 
 
-def _make_store(tmp: Path):
+def _make_store(tmp: Path, *, reference: dict[str, object] | None = None):
     b = _load_builder()
     db = str(tmp / "gsi.sqlite")
     store = b.GlobalSymbolStore(db)
     body = ("template<class R> void trim(R& r) "
             "{ /* boost trim impl, long enough body to keep */ }")
-    store.insert_symbols([(
-        "boost::algorithm::trim", "boost", "boost", 2, "func",
-        "boost/algorithm/string/trim.hpp", 5, 40, 1,
-        len(body) // 4, len(body), body,
-    )])
+    if reference is None:
+        record = (
+            "boost::algorithm::trim", "boost", "boost", 2, "func",
+            "boost/algorithm/string/trim.hpp", 5, 40, 1,
+            len(body) // 4, len(body), body,
+        )
+    else:
+        usr = str(reference.get("usr") or "")
+        signature = str(reference.get("canonical_signature") or "")
+        symbol_kind = str(reference.get("symbol_kind") or "FUNCTION_TEMPLATE")
+        record = b.GlobalSymbolRecord(
+            qname="boost::algorithm::trim",
+            base_lib="boost",
+            base_repo="boost",
+            kind=2,
+            sym_type="func",
+            file="boost/algorithm/string/trim.hpp",
+            line=5,
+            end_line=40,
+            is_public=1,
+            token_est=len(body) // 4,
+            body_len=len(body),
+            text=body,
+            symbol_key=b.ip.canonical_symbol_identity(
+                qname="boost::algorithm::trim",
+                kind=symbol_kind,
+                usr=usr,
+                canonical_signature=signature,
+                project="boost",
+                file="boost/algorithm/string/trim.hpp",
+            ),
+            usr=usr,
+            canonical_signature=signature,
+            symbol_kind=symbol_kind,
+        )
+    store.insert_symbols([record])
     store.commit()
     store.close()
     return db, body
@@ -390,7 +420,7 @@ def test_real_parse_baselib_callee_survives_and_pulls(tmp_path):
         root.baselib_callees
 
     # Now build a store with the boost def and confirm an actual PULL.
-    db, body = _make_store(tmp_path)
+    db, body = _make_store(tmp_path, reference=root.baselib_callee_refs[0])
     reader = ip.GlobalSymbolReader(db)
     idx = ip.ProjectIndex()
     for f in funcs:

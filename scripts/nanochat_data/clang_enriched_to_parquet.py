@@ -117,6 +117,8 @@ GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
 _TOKENIZED_ENRICHED_TOKENIZER = None
 _MEMORY_LIMIT_GB = 10.0
 _OVERFLOW_POLICIES = ("split", "drop")
+SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = 2
 _CHAR_LEVEL_METADATA_FIELDS = (
     "ast_depth",
     "sibling_index",
@@ -390,6 +392,7 @@ _SCHEMA = pa.schema([
         pa.field("kind", pa.int8()),
         pa.field("dep_level", pa.int32()),
         pa.field("name", pa.string()),
+        pa.field("symbol_id", pa.uint32()),
     ]))),
     pa.field("call_edges", pa.list_(pa.struct([
         pa.field("from", pa.int32()),
@@ -544,7 +547,11 @@ _SCHEMA = pa.schema([
         pa.field("to", pa.uint32()),
         pa.field("kind", pa.int32()),
     ]))),
-])
+], metadata={
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
+        REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+    ).encode("ascii"),
+})
 
 
 def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa.Table:
@@ -643,6 +650,13 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     token_cross_domain_edges_col = []
 
     for row, tokenized in zip(rows, tokenized_rows):
+        identity_version = row.get("symbol_identity_schema_version")
+        if identity_version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise RuntimeError(
+                "clang-enriched row has missing or stale symbol identity schema "
+                f"version {identity_version!r}; regenerate it with clang USR/signature "
+                f"schema v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            )
         row_text = row.get("text", "")
         texts.append(row_text)
         # source_text falls back to the emitted text when absent so the column
@@ -677,6 +691,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 "kind": int(cb.get("kind", 0)),
                 "dep_level": int(cb.get("dep_level", 0)),
                 "name": str(cb.get("name", "")),
+                "symbol_id": (
+                    None if cb.get("symbol_id") is None else int(cb["symbol_id"])
+                ),
             }
             for cb in cbs
         ])
@@ -1248,6 +1265,7 @@ def _remap_chunk_boundaries(
                 "kind": cb.get("kind", 0),
                 "dep_level": cb.get("dep_level", 0),
                 "name": cb.get("name", ""),
+                "symbol_id": cb.get("symbol_id"),
             }
         )
     return remapped, old_to_new
@@ -1422,6 +1440,7 @@ def process_record_with_policy(
             "kind": cb.get("kind", 0),
             "dep_level": cb.get("dep_level", 0),
             "name": cb.get("name", ""),
+            "symbol_id": cb.get("symbol_id"),
         }
         for cb in filtered_chunk_boundaries
     ]

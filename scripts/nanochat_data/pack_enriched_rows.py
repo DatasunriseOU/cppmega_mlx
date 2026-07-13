@@ -118,6 +118,8 @@ SOURCE_DOC_ID_COLUMN = "source_doc_id"
 DOC_DEP_EDGES_COLUMN = "doc_dep_edges"
 PACKED_ROW_MACRO_ROUTES_METADATA_KEY = "cppmega.macro_routes_version"
 PACKED_ROW_MACRO_ROUTES_VERSION = "full_macro_concept_routes_v1"
+SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = 2
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
 _STATIC_DOC_TYPES = {"code", "code_header", "build"}
@@ -287,6 +289,9 @@ def _packed_row_schema_with_metadata() -> pa.Schema:
     metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] = (
         PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
     )
+    metadata[SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] = str(
+        REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+    ).encode("ascii")
     return PACKED_ROW_SCHEMA.with_metadata(metadata)
 
 
@@ -941,6 +946,23 @@ def _list_input_files(input_path: str | os.PathLike[str]) -> list[Path]:
             raise FileNotFoundError(f"No parquet files found under {path}")
         return files
     raise FileNotFoundError(f"Input path does not exist: {path}")
+
+
+def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
+    key = SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    for path in _list_input_files(input_path):
+        metadata = pq.ParquetFile(path).schema_arrow.metadata or {}
+        raw_version = metadata.get(key)
+        try:
+            version = int(raw_version) if raw_version is not None else None
+        except (TypeError, ValueError):
+            version = None
+        if version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{path}: missing or stale symbol identity metadata {raw_version!r}; "
+                "regenerate tokenized parquet with clang USR/signature identities "
+                f"before packing (required v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION})"
+            )
 
 
 def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
@@ -1767,6 +1789,7 @@ def pack_parquet_dataset(
     if input_batch_size <= 0:
         raise ValueError("input_batch_size must be > 0")
 
+    _require_symbol_identity_schema(input_path)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1920,6 +1943,8 @@ __all__ = [
     "NUM_DOCS_COLUMN",
     "PACKED_ROW_MACRO_ROUTES_METADATA_KEY",
     "PACKED_ROW_MACRO_ROUTES_VERSION",
+    "REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION",
+    "SYMBOL_IDENTITY_SCHEMA_METADATA_KEY",
     "PACK_ID_COLUMN",
     "SOURCE_DOC_INDICES_COLUMN",
     "TARGET_IDS_COLUMN",

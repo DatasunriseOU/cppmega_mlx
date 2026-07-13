@@ -117,7 +117,12 @@ def _normalize(records: list[dict[str, object]]):
 
 
 def _write_input_parquet(path: Path, records: list[dict[str, object]]) -> None:
-    pq.write_table(pa.Table.from_pylist(records), path)
+    table = pa.Table.from_pylist(records).replace_schema_metadata({
+        packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
+            packer.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+        ).encode("ascii")
+    })
+    pq.write_table(table, path)
 
 
 def test_best_fit_strategy_matches_cppmega_largest_fitting_row_order() -> None:
@@ -581,6 +586,17 @@ def test_pack_parquet_dataset_marks_macro_route_schema_version(tmp_path: Path) -
     assert metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] == (
         PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
     )
+    assert metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] == b"2"
+
+
+def test_pack_parquet_dataset_rejects_stale_symbol_identity_schema(tmp_path: Path) -> None:
+    input_path = tmp_path / "stale.parquet"
+    output_path = tmp_path / "packed.parquet"
+    pq.write_table(pa.Table.from_pylist([_doc([1, 2, 3])]), input_path)
+
+    with pytest.raises(RuntimeError, match="regenerate.*clang USR"):
+        pack_parquet_dataset(input_path, output_path, target_length=8)
+    assert not output_path.exists()
 
 
 def test_pack_parquet_dataset_streams_windows_without_full_input_load(

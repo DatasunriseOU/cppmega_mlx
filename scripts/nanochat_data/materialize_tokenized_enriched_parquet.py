@@ -79,7 +79,7 @@ def _merge_table_with_tokenized(
         base_columns[column_name] = pa.array(
             [row.get(column_name, []) for row in tokenized_rows]
         )
-    return pa.table(base_columns)
+    return pa.table(base_columns).replace_schema_metadata(table.schema.metadata)
 
 
 def _copy_metadata_files(input_dir: str, output_dir: str) -> None:

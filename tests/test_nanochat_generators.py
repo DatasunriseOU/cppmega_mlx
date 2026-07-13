@@ -150,6 +150,7 @@ def test_clang_enriched_parquet_schema_preserves_token_semantic_columns() -> Non
 def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
     rows = [
         {
+            "symbol_identity_schema_version": 2,
             "text": "int main() { return f(); }",
             "source_doc_id": "demo.cc@main",
             schema.DOC_TYPE_COLUMN: "code_header",
@@ -215,6 +216,7 @@ def test_local_convert_backfills_static_code_repo_provenance(
     input_path.write_text(
         json.dumps(
             {
+                "symbol_identity_schema_version": 2,
                 "text": "int add(int a, int b) { return a + b; }",
                 "filepath": "include/math.hpp",
                 "structure_ids": [3] * 40,
@@ -418,6 +420,7 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     output_path = tmp_path / "out.parquet"
     records = [
         {
+            "symbol_identity_schema_version": 2,
             "text": "int one() { return 1; }",
             "structure_ids": [3] * len("int one() { return 1; }"),
             "chunk_boundaries": [
@@ -427,6 +430,7 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
             "type_edges": [],
         },
         {
+            "symbol_identity_schema_version": 2,
             "text": "int two() { return 2; }",
             "structure_ids": [3] * len("int two() { return 2; }"),
             "chunk_boundaries": [
@@ -491,6 +495,7 @@ def test_tokenizer_fingerprint_and_ids_stable_across_independent_shards(
             "\n".join(
                 json.dumps(
                     {
+                        "symbol_identity_schema_version": 2,
                         "text": text,
                         "structure_ids": [3] * len(text),
                         "chunk_boundaries": [

@@ -259,12 +259,23 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
 # marker like 'crosslib:<repo>' (None / absent for normal local parts). Macro
 # chunks may append a 7th element with scanner provenance so domain route edges
 # point to the precise conditional/redefinition/include-order macro nodes rather
-# than being re-derived from assembled text. Builders accept all forms.
+# than being re-derived from assembled text. Symbol-bearing chunks may append an
+# 8th element with canonical identity metadata. Builders accept all forms.
 PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
     str, int, int, str, str | None, str | None
 ] | tuple[
     str, int, int, str, str | None, str | None, dict[str, object] | None
+] | tuple[
+    str,
+    int,
+    int,
+    str,
+    str | None,
+    str | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
 ]
+SymbolReference: TypeAlias = dict[str, object]
 
 
 def _part_dep_source(part: tuple) -> str | None:
@@ -277,6 +288,125 @@ def _part_macro_provenance(part: tuple) -> dict[str, object] | None:
     """Scanner-derived macro provenance of a doc part, when present."""
     value = part[6] if len(part) >= 7 else None
     return value if isinstance(value, dict) else None
+
+
+def _symbol_part_metadata(
+    symbol_key: str | None,
+    *,
+    qname: str | None = None,
+    symbol_id: int | None = None,
+    canonical_signature: str | None = None,
+    usr: str | None = None,
+    kind: str | None = None,
+) -> dict[str, object] | None:
+    if not symbol_key:
+        return None
+    return {
+        "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+        "symbol_key": symbol_key,
+        "symbol_id": int(symbol_id if symbol_id is not None else _compute_symbol_id(symbol_key)),
+        "qname": qname or "",
+        "canonical_signature": canonical_signature or "",
+        "usr": usr or "",
+        "kind": kind or "",
+    }
+
+
+def _function_part(
+    func: "FunctionDef",
+    *,
+    kind: int = 2,
+    dep_source: str | None = None,
+) -> PartInfo:
+    return (
+        func.text,
+        kind,
+        func.dep_level,
+        func.name,
+        func.qualified_name,
+        dep_source,
+        None,
+        _symbol_part_metadata(
+            func.symbol_key,
+            qname=func.qualified_name,
+            symbol_id=func.symbol_id,
+            canonical_signature=func.canonical_signature,
+            usr=func.usr,
+            kind=func.symbol_kind,
+        ),
+    )
+
+
+def _typedef_part(td: "TypeDef") -> PartInfo:
+    return (
+        td.text,
+        td.kind,
+        0,
+        td.name,
+        td.qualified_name,
+        None,
+        None,
+        _symbol_part_metadata(
+            td.symbol_key,
+            qname=td.qualified_name,
+            symbol_id=td.symbol_id,
+            canonical_signature=td.canonical_signature,
+            usr=td.usr,
+            kind=td.symbol_kind,
+        ),
+    )
+
+
+def _macro_part(macro: "MacroDef") -> PartInfo:
+    return (
+        macro.text,
+        MACRO_KIND,
+        0,
+        macro.name,
+        macro.name,
+        None,
+        _macro_part_metadata(macro),
+        _symbol_part_metadata(
+            macro.symbol_key,
+            qname=macro.name,
+            symbol_id=macro.symbol_id,
+            canonical_signature="(" + ",".join(macro.params) + ")",
+            kind="MACRO_DEFINITION",
+        ),
+    )
+
+
+def _global_symbol_part(record: dict[str, object], dep_level: int) -> PartInfo:
+    qname = str(record.get("qname") or "")
+    return (
+        str(record.get("text") or ""),
+        2,
+        dep_level,
+        qname.split("::")[-1],
+        qname,
+        f"crosslib:{record.get('base_repo')}",
+        None,
+        _symbol_part_metadata(
+            str(record.get("symbol_key") or ""),
+            qname=qname,
+            canonical_signature=str(record.get("canonical_signature") or ""),
+            usr=str(record.get("usr") or ""),
+            kind=str(record.get("symbol_kind") or ""),
+        ),
+    )
+
+
+def _part_symbol_metadata(part: tuple) -> dict[str, object] | None:
+    value = part[7] if len(part) >= 8 else None
+    return value if isinstance(value, dict) else None
+
+
+def _part_symbol_key(part: tuple) -> str | None:
+    metadata = _part_symbol_metadata(part)
+    if metadata is None:
+        return None
+    value = metadata.get("symbol_key")
+    return value if isinstance(value, str) and value else None
 
 
 # C++ source file extensions
@@ -408,6 +538,7 @@ SYSTEM_PREFIXES = (
 # the A1 selection and would only add noise; only the namespaced base libs.
 CROSSLINKABLE_NS_PREFIXES = ('std::', 'boost::')
 _STD_INLINE_NAMESPACE_SEGMENTS = frozenset({'__1', '__2', '__3', '__cxx11'})
+SYMBOL_IDENTITY_SCHEMA_VERSION = 2
 
 
 def normalize_inline_namespace_qname(qname: str) -> str:
@@ -426,12 +557,275 @@ def normalize_inline_namespace_qname(qname: str) -> str:
     )
 
 
+def _normalize_signature_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _cursor_kind_name(cursor: Cursor) -> str:
+    kind = getattr(cursor, "kind", None)
+    name = getattr(kind, "name", None)
+    if isinstance(name, str):
+        return name
+    text = str(kind or "")
+    return text.rsplit(".", 1)[-1]
+
+
+def _cursor_usr(cursor: Cursor) -> str:
+    get_usr = getattr(cursor, "get_usr", None)
+    if not callable(get_usr):
+        return ""
+    try:
+        usr = str(get_usr() or "")
+    except Exception:
+        return ""
+    # Clang can surface empty/placeholder USRs for unexposed/local constructs.
+    if not usr or usr.startswith("<") or "invalid" in usr.lower():
+        return ""
+    return usr
+
+
+def _cursor_canonical_signature(cursor: Cursor) -> str:
+    """Return a stable, clang-derived signature string for identity fallback."""
+    pieces: list[str] = []
+    display = _normalize_signature_text(getattr(cursor, "displayname", "") or "")
+    if display:
+        pieces.append(f"display={display}")
+    cursor_type = getattr(cursor, "type", None)
+    type_spelling = _normalize_signature_text(getattr(cursor_type, "spelling", "") or "")
+    if type_spelling:
+        pieces.append(f"type={type_spelling}")
+    result_type = getattr(cursor, "result_type", None)
+    result_spelling = _normalize_signature_text(getattr(result_type, "spelling", "") or "")
+    if result_spelling:
+        pieces.append(f"result={result_spelling}")
+    arg_types: list[str] = []
+    get_arguments = getattr(cursor, "get_arguments", None)
+    if callable(get_arguments):
+        try:
+            for arg in get_arguments():
+                arg_type = getattr(arg, "type", None)
+                arg_types.append(
+                    _normalize_signature_text(getattr(arg_type, "spelling", "") or "")
+                )
+        except Exception:
+            arg_types = []
+    if arg_types:
+        pieces.append("args=(" + ",".join(arg_types) + ")")
+    return "|".join(pieces)
+
+
+def _identity_scope_key(
+    *,
+    project: str | None = None,
+    file: str | None = None,
+    line: int | None = None,
+    force_file_scope: bool = False,
+) -> str:
+    parts: list[str] = []
+    if project:
+        parts.append(f"project={project}")
+    if file:
+        parts.append(f"file={file}")
+    if line is not None and line > 0 and force_file_scope:
+        parts.append(f"line={int(line)}")
+    return "|".join(parts)
+
+
+def canonical_symbol_identity(
+    *,
+    qname: str,
+    kind: str,
+    usr: str | None = None,
+    canonical_signature: str | None = None,
+    project: str | None = None,
+    repo: str | None = None,
+    file: str | None = None,
+    line: int | None = None,
+    force_file_scope: bool = False,
+) -> str:
+    """Canonical symbol identity.
+
+    qname is retained as display/search text only. Stable clang USR wins when
+    present and is namespaced by the owning project so independent repositories
+    cannot alias. Otherwise the fallback includes kind, canonical signature,
+    and scoped provenance so overloads, templates, file-static/local symbols,
+    and same-qname definitions in different files do not collapse.
+    """
+    normalized_kind = _normalize_signature_text(kind or "symbol")
+    normalized_signature = _normalize_signature_text(canonical_signature)
+    normalized_usr = _normalize_signature_text(usr)
+    owning_project = _normalize_signature_text(project or repo)
+    if normalized_usr:
+        project_scope = f"project={owning_project}\x1f" if owning_project else ""
+        return (
+            f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+            f"{project_scope}usr={normalized_usr}"
+        )
+    scope = _identity_scope_key(
+        project=owning_project,
+        file=file,
+        line=line,
+        force_file_scope=force_file_scope,
+    )
+    payload = [
+        f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}",
+        f"kind={normalized_kind}",
+        f"sig={normalized_signature}",
+    ]
+    if scope:
+        payload.append(f"scope={scope}")
+    return "fallback:" + "\x1f".join(payload)
+
+
+def _cursor_identity_location(
+    cursor: Cursor,
+    *,
+    project_dir: str | None,
+    fallback_file: str | None,
+) -> tuple[str, bool]:
+    """Return identity file plus whether clang locates it inside project_dir."""
+    rel_file = fallback_file or ""
+    location = getattr(cursor, "location", None)
+    location_file = getattr(location, "file", None)
+    location_name = getattr(location_file, "name", None)
+    if not location_name:
+        return rel_file, True
+    if not project_dir:
+        return str(location_name), True
+    try:
+        absolute_file = os.path.abspath(str(location_name))
+        absolute_project = os.path.abspath(project_dir)
+        is_project_local = os.path.commonpath(
+            (absolute_file, absolute_project)
+        ) == absolute_project
+        rel_file = os.path.relpath(absolute_file, absolute_project)
+    except (OSError, ValueError):
+        return fallback_file or str(location_name), False
+    return rel_file, is_project_local
+
+
+def symbol_identity_for_cursor(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project: str | None = None,
+    repo: str | None = None,
+    fallback_file: str | None = None,
+    force_file_scope: bool = False,
+) -> tuple[str, str, str]:
+    """Return ``(identity_key, usr, canonical_signature)`` for a clang cursor."""
+    qname = get_qualified_name(cursor)
+    usr = _cursor_usr(cursor)
+    signature = _cursor_canonical_signature(cursor)
+    file_scope = force_file_scope
+    rel_file, is_project_local = _cursor_identity_location(
+        cursor,
+        project_dir=project_dir,
+        fallback_file=fallback_file,
+    )
+    loc = getattr(cursor, "location", None)
+    linkage = getattr(cursor, "linkage", None)
+    linkage_name = getattr(linkage, "name", "") or str(linkage or "")
+    storage = getattr(cursor, "storage_class", None)
+    storage_name = getattr(storage, "name", "") or str(storage or "")
+    if "INTERNAL" in linkage_name or storage_name == "STATIC":
+        file_scope = True
+    identity_key = canonical_symbol_identity(
+        qname=qname,
+        kind=_cursor_kind_name(cursor),
+        usr=usr,
+        canonical_signature=signature,
+        project=(project or repo) if is_project_local else None,
+        file=rel_file,
+        line=getattr(loc, "line", None),
+        force_file_scope=file_scope,
+    )
+    return identity_key, usr, signature
+
+
+def symbol_reference_for_cursor(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
+    force_file_scope: bool = False,
+) -> SymbolReference:
+    key, usr, signature = symbol_identity_for_cursor(
+        cursor,
+        project_dir=project_dir,
+        project=project_id,
+        fallback_file=fallback_file,
+        force_file_scope=force_file_scope,
+    )
+    relative_file, is_project_local = _cursor_identity_location(
+        cursor,
+        project_dir=project_dir,
+        fallback_file=fallback_file,
+    )
+    location = getattr(cursor, "location", None)
+    return {
+        "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+        "symbol_key": key,
+        "symbol_id": _compute_symbol_id(key),
+        "qname": get_qualified_name(cursor),
+        "usr": usr,
+        "canonical_signature": signature,
+        "symbol_kind": _cursor_kind_name(cursor),
+        "project": project_id if is_project_local else "",
+        "file": relative_file,
+        "line": int(getattr(location, "line", 0) or 0),
+    }
+
+
+def _normalize_symbol_reference(value: object) -> SymbolReference | None:
+    if not isinstance(value, dict):
+        return None
+    key = value.get("symbol_key")
+    qname = value.get("qname")
+    if not isinstance(key, str) or not key:
+        return None
+    if not isinstance(qname, str):
+        qname = ""
+    return {
+        "symbol_identity_schema_version": int(
+            value.get("symbol_identity_schema_version") or SYMBOL_IDENTITY_SCHEMA_VERSION
+        ),
+        "symbol_key": key,
+        "symbol_id": int(value.get("symbol_id") or _compute_symbol_id(key)),
+        "qname": qname,
+        "usr": str(value.get("usr") or ""),
+        "canonical_signature": _normalize_signature_text(
+            str(value.get("canonical_signature") or "")
+        ),
+        "symbol_kind": str(value.get("symbol_kind") or value.get("kind") or ""),
+        "project": str(value.get("project") or ""),
+        "file": str(value.get("file") or ""),
+        "line": int(value.get("line") or 0),
+    }
+
+
+def _compute_symbol_id(symbol_key: str) -> int:
+    """Deterministic positive uint32-ish ID from a canonical symbol identity."""
+    if not symbol_key:
+        return 0
+    h = int(hashlib.md5(symbol_key.encode("utf-8", errors="replace")).hexdigest(), 16)
+    return (h & 0x7FFFFFFF) or 1
+
+
 class FunctionDef:
     """A function definition with its source location and call references."""
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
                  'callees', 'referenced_types', 'dep_level', 'is_definition',
                  'ast_depth', 'sibling_index', 'ast_node_type',
-                 'baselib_callees']
+                 'baselib_callees', 'symbol_key', 'symbol_id', 'usr',
+                 'canonical_signature', 'symbol_kind', 'callee_keys',
+                 'referenced_type_keys', 'callee_refs', 'baselib_callee_refs',
+                 'referenced_type_refs', 'semantic_symbol_ids',
+                 'semantic_call_targets', 'semantic_type_refs',
+                 'semantic_def_use']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
@@ -439,7 +833,20 @@ class FunctionDef:
                  sibling_index: list[int] | None = None,
                  ast_node_type: list[int] | None = None,
                  referenced_types: list | None = None,
-                 baselib_callees: list | None = None):
+                 baselib_callees: list | None = None,
+                 symbol_key: str | None = None,
+                 usr: str | None = None,
+                 canonical_signature: str | None = None,
+                 symbol_kind: str = "function",
+                 callee_keys: list | None = None,
+                 referenced_type_keys: list | None = None,
+                 callee_refs: list[SymbolReference] | None = None,
+                 baselib_callee_refs: list[SymbolReference] | None = None,
+                 referenced_type_refs: list[SymbolReference] | None = None,
+                 semantic_symbol_ids: list[int] | None = None,
+                 semantic_call_targets: list[int] | None = None,
+                 semantic_type_refs: list[int] | None = None,
+                 semantic_def_use: list[int] | None = None):
         self.name = name
         self.qualified_name = qualified_name
         self.file = file
@@ -456,6 +863,39 @@ class FunctionDef:
         # by the normal system-prefix filter, kept SEPARATELY for the optional
         # cross-repo linker. Empty/ignored unless --global-symbol-index is given.
         self.baselib_callees = list(baselib_callees or [])
+        self.usr = str(usr or "")
+        self.canonical_signature = _normalize_signature_text(canonical_signature)
+        self.symbol_kind = str(symbol_kind or "function")
+        self.symbol_key = symbol_key or canonical_symbol_identity(
+            qname=qualified_name,
+            kind=self.symbol_kind,
+            canonical_signature=self.canonical_signature,
+            file=file,
+            line=line,
+            force_file_scope=True,
+        )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
+        # Identity-key mirrors of display qnames. Parsed clang paths populate
+        # these with canonical identities; legacy/manual tests may leave them
+        # empty and ProjectIndex will resolve unique qnames as a compatibility
+        # fallback.
+        self.callee_keys = list(callee_keys or [])
+        self.referenced_type_keys = list(referenced_type_keys or [])
+        self.callee_refs = [
+            normalized
+            for value in (callee_refs or [])
+            if (normalized := _normalize_symbol_reference(value)) is not None
+        ]
+        self.baselib_callee_refs = [
+            normalized
+            for value in (baselib_callee_refs or [])
+            if (normalized := _normalize_symbol_reference(value)) is not None
+        ]
+        self.referenced_type_refs = [
+            normalized
+            for value in (referenced_type_refs or [])
+            if (normalized := _normalize_symbol_reference(value)) is not None
+        ]
         self.dep_level = 0
         self.is_definition = is_definition
         # Store per-character AST sidecars compactly in the repo-wide index.
@@ -465,6 +905,10 @@ class FunctionDef:
         self.ast_depth = array('H', ast_depth or [])
         self.sibling_index = array('H', sibling_index or [])
         self.ast_node_type = array('H', ast_node_type or [])
+        self.semantic_symbol_ids = array('I', semantic_symbol_ids or [])
+        self.semantic_call_targets = array('I', semantic_call_targets or [])
+        self.semantic_type_refs = array('I', semantic_type_refs or [])
+        self.semantic_def_use = array('B', semantic_def_use or [])
 
     def to_dict(self) -> dict:
         """Serialize for multiprocessing IPC."""
@@ -478,6 +922,19 @@ class FunctionDef:
             'ast_node_type': self.ast_node_type,
             'referenced_types': self.referenced_types,
             'baselib_callees': self.baselib_callees,
+            'symbol_key': self.symbol_key,
+            'usr': self.usr,
+            'canonical_signature': self.canonical_signature,
+            'symbol_kind': self.symbol_kind,
+            'callee_keys': self.callee_keys,
+            'referenced_type_keys': self.referenced_type_keys,
+            'callee_refs': self.callee_refs,
+            'baselib_callee_refs': self.baselib_callee_refs,
+            'referenced_type_refs': self.referenced_type_refs,
+            'semantic_symbol_ids': self.semantic_symbol_ids,
+            'semantic_call_targets': self.semantic_call_targets,
+            'semantic_type_refs': self.semantic_type_refs,
+            'semantic_def_use': self.semantic_def_use,
         }
 
     @classmethod
@@ -495,10 +952,14 @@ class TypeDef:
     headers, which is why headers are now part of the index file set.
     """
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
-                 'kind']
+                 'kind', 'symbol_key', 'symbol_id', 'usr',
+                 'canonical_signature', 'symbol_kind']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
-                 text: str, kind: int, end_line: int = 0):
+                 text: str, kind: int, end_line: int = 0,
+                 symbol_key: str | None = None, usr: str | None = None,
+                 canonical_signature: str | None = None,
+                 symbol_kind: str = "type"):
         self.name = name
         self.qualified_name = qualified_name
         self.file = file
@@ -507,12 +968,28 @@ class TypeDef:
         self.text = text
         # node-bucket kind for parts_info (4=class/struct, 7=typedef/using)
         self.kind = kind
+        self.usr = str(usr or "")
+        self.canonical_signature = _normalize_signature_text(canonical_signature)
+        self.symbol_kind = str(symbol_kind or "type")
+        self.symbol_key = symbol_key or canonical_symbol_identity(
+            qname=qualified_name,
+            kind=self.symbol_kind,
+            canonical_signature=self.canonical_signature,
+            file=file,
+            line=line,
+            force_file_scope=True,
+        )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
 
     def to_dict(self) -> dict:
         return {
             'name': self.name, 'qualified_name': self.qualified_name,
             'file': self.file, 'line': self.line, 'text': self.text,
             'kind': self.kind, 'end_line': self.end_line,
+            'symbol_key': self.symbol_key,
+            'usr': self.usr,
+            'canonical_signature': self.canonical_signature,
+            'symbol_kind': self.symbol_kind,
         }
 
     @classmethod
@@ -536,6 +1013,9 @@ class MacroDef:
         'condition_lines',
         'undef_text',
         'previous',
+        'project_id',
+        'symbol_key',
+        'symbol_id',
     ]
 
     def __init__(
@@ -546,6 +1026,7 @@ class MacroDef:
         text: str,
         params: list[str] | None = None,
         *,
+        project_id: str | None = None,
         visible_in_file: str | None = None,
         visible_line: int | None = None,
         sequence: int = 0,
@@ -559,6 +1040,7 @@ class MacroDef:
         self.line = line
         self.text = text
         self.params = list(params or [])
+        self.project_id = project_id or ""
         self.visible_in_file = visible_in_file or file
         self.visible_line = visible_line if visible_line is not None else line
         self.sequence = int(sequence)
@@ -566,46 +1048,79 @@ class MacroDef:
         self.condition_lines = list(condition_lines or [])
         self.undef_text = undef_text
         self.previous = previous
+        self.symbol_key = canonical_symbol_identity(
+            qname=name,
+            kind="macro",
+            canonical_signature="(" + ",".join(self.params) + ")",
+            project=self.project_id,
+            file=self.file,
+            line=self.line,
+            force_file_scope=True,
+        )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
 
 
 class ProjectIndex:
     """Cross-file function index for a single project."""
 
     def __init__(self):
-        # qualified_name -> FunctionDef (definitions only)
+        # canonical symbol identity -> FunctionDef (definitions only).
+        # qname remains display/search metadata; qname indexes below are only
+        # compatibility/lookup aids and can be ambiguous.
         self.functions: dict[str, FunctionDef] = {}
-        # file -> list of function qualified_names defined there
+        self.function_qnames: dict[str, list[str]] = defaultdict(list)
+        # file -> list of function symbol identities defined there
         self.file_functions: dict[str, list[str]] = defaultdict(list)
         # file -> preamble text (includes, typedefs, forward decls)
         self.file_preambles: dict[str, str] = {}
-        # qualified_name -> list of qualified_names that call it
+        # callee symbol identity -> list of caller symbol identities
         self.callers: dict[str, list[str]] = defaultdict(list)
-        # qualified_name -> TypeDef (struct/class/enum/union/typedef/using).
+        # symbol identity -> TypeDef (struct/class/enum/union/typedef/using).
         # Separate from `functions` so the call graph is untouched; consulted
         # when building docs to pull a referenced type's DEFINITION in as a
         # type-edge target chunk.
         self.typedefs: dict[str, TypeDef] = {}
+        self.typedef_qnames: dict[str, list[str]] = defaultdict(list)
         # macro name -> latest MacroDef plus full definition history. Header macro
         # definitions are not clang AST nodes, so they live in a small side registry
         # used for standalone macro docs and same-document invocation routes.
         self.macros: dict[str, MacroDef] = {}
         self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
         self.macro_definitions: list[MacroDef] = []
+        self.symbol_id_keys: dict[int, str] = {}
+
+    def _register_symbol_key(self, symbol_key: str) -> None:
+        if not symbol_key:
+            return
+        symbol_id = _compute_symbol_id(symbol_key)
+        existing = self.symbol_id_keys.get(symbol_id)
+        if existing is not None and existing != symbol_key:
+            raise RuntimeError(
+                "canonical symbol ID collision: "
+                f"id={symbol_id} first={existing!r} second={symbol_key!r}. "
+                "Refusing to emit aliased semantic supervision."
+            )
+        self.symbol_id_keys[symbol_id] = symbol_key
 
     def add_typedef(self, td: TypeDef):
         """Register a type definition. First definition with text wins; never
         overwrite a real definition with a shorter/forward one."""
-        key = td.qualified_name
+        key = td.symbol_key
         if not key:
             return
+        self._register_symbol_key(key)
         existing = self.typedefs.get(key)
         if existing is not None and len(existing.text) >= len(td.text):
             return
         self.typedefs[key] = td
+        qname = normalize_inline_namespace_qname(td.qualified_name)
+        if qname and key not in self.typedef_qnames[qname]:
+            self.typedef_qnames[qname].append(key)
 
     def add_macro(self, macro: MacroDef):
         if not macro.name:
             return
+        self._register_symbol_key(macro.symbol_key)
         for existing in self.macros_by_name.get(macro.name, []):
             if (
                 existing.file == macro.file
@@ -629,41 +1144,165 @@ class ProjectIndex:
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
-        key = func.qualified_name
+        key = func.symbol_key
+        self._register_symbol_key(key)
+        for ref in (
+            list(getattr(func, "callee_refs", []))
+            + list(getattr(func, "baselib_callee_refs", []))
+            + list(getattr(func, "referenced_type_refs", []))
+        ):
+            ref_key = ref.get("symbol_key")
+            if isinstance(ref_key, str):
+                self._register_symbol_key(ref_key)
         if key in self.functions and self.functions[key].is_definition:
             return  # don't overwrite definitions with declarations
         self.functions[key] = func
+        qname = normalize_inline_namespace_qname(func.qualified_name)
+        if qname and key not in self.function_qnames[qname]:
+            self.function_qnames[qname].append(key)
         if func.is_definition:
             self.file_functions[func.file].append(key)
+
+    def resolve_function_key(
+        self, ref: str | SymbolReference | None
+    ) -> str | None:
+        """Resolve an identity/reference or an unambiguous display qname."""
+        if not ref:
+            return None
+        if isinstance(ref, dict):
+            normalized = _normalize_symbol_reference(ref)
+            if normalized is None:
+                return None
+            symbol_key = str(normalized["symbol_key"])
+            if symbol_key in self.functions:
+                return symbol_key
+            candidates = list(
+                self.function_qnames.get(
+                    normalize_inline_namespace_qname(str(normalized["qname"])), []
+                )
+            )
+            usr = str(normalized.get("usr") or "")
+            if usr:
+                candidates = [key for key in candidates if self.functions[key].usr == usr]
+            signature = str(normalized.get("canonical_signature") or "")
+            if signature:
+                candidates = [
+                    key
+                    for key in candidates
+                    if self.functions[key].canonical_signature == signature
+                ]
+            symbol_kind = str(normalized.get("symbol_kind") or "")
+            if symbol_kind:
+                candidates = [
+                    key for key in candidates if self.functions[key].symbol_kind == symbol_kind
+                ]
+            return candidates[0] if len(candidates) == 1 else None
+        if ref in self.functions:
+            return ref
+        keys = self.function_qnames.get(normalize_inline_namespace_qname(ref), [])
+        if len(keys) == 1:
+            return keys[0]
+        return None
+
+    def resolve_type_key(self, ref: str | SymbolReference | None) -> str | None:
+        if not ref:
+            return None
+        if isinstance(ref, dict):
+            normalized = _normalize_symbol_reference(ref)
+            if normalized is None:
+                return None
+            symbol_key = str(normalized["symbol_key"])
+            if symbol_key in self.typedefs:
+                return symbol_key
+            candidates = list(
+                self.typedef_qnames.get(
+                    normalize_inline_namespace_qname(str(normalized["qname"])), []
+                )
+            )
+            usr = str(normalized.get("usr") or "")
+            if usr:
+                candidates = [key for key in candidates if self.typedefs[key].usr == usr]
+            signature = str(normalized.get("canonical_signature") or "")
+            if signature:
+                candidates = [
+                    key
+                    for key in candidates
+                    if self.typedefs[key].canonical_signature == signature
+                ]
+            symbol_kind = str(normalized.get("symbol_kind") or "")
+            if symbol_kind:
+                candidates = [
+                    key for key in candidates if self.typedefs[key].symbol_kind == symbol_kind
+                ]
+            return candidates[0] if len(candidates) == 1 else None
+        if ref in self.typedefs:
+            return ref
+        keys = self.typedef_qnames.get(normalize_inline_namespace_qname(ref), [])
+        if len(keys) == 1:
+            return keys[0]
+        return None
+
+    def _function_callee_keys(self, func: FunctionDef) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        refs: list[str | SymbolReference] = list(getattr(func, "callee_refs", []) or [])
+        refs.extend(list(getattr(func, "callee_keys", []) or []))
+        refs.extend(func.callees)
+        for ref in refs:
+            key = self.resolve_function_key(ref)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
+
+    def _function_referenced_type_keys(self, func: FunctionDef) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        refs: list[str | SymbolReference] = list(
+            getattr(func, "referenced_type_refs", []) or []
+        )
+        refs.extend(list(getattr(func, "referenced_type_keys", []) or []))
+        refs.extend(list(getattr(func, "referenced_types", []) or []))
+        for ref in refs:
+            key = self.resolve_type_key(ref)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
 
     def build_reverse_edges(self):
         """Build caller -> callee reverse edges for dep level computation."""
         self.callers.clear()
-        for qname, func in self.functions.items():
-            for callee in func.callees:
+        for symbol_key, func in self.functions.items():
+            for callee in self._function_callee_keys(func):
                 if callee in self.functions:
-                    self.callers[callee].append(qname)
+                    self.callers[callee].append(symbol_key)
 
     def compute_dep_levels(self):
         """Compute dependency levels via BFS from leaves."""
         # Find leaves: functions with no callees in the index
         in_degree = {}
-        for qname, func in self.functions.items():
-            local_callees = [c for c in func.callees if c in self.functions and c != qname]
-            in_degree[qname] = len(local_callees)
+        for symbol_key, func in self.functions.items():
+            local_callees = [
+                c for c in self._function_callee_keys(func)
+                if c in self.functions and c != symbol_key
+            ]
+            in_degree[symbol_key] = len(local_callees)
 
         queue = deque()
-        for qname, deg in in_degree.items():
+        for symbol_key, deg in in_degree.items():
             if deg == 0:
-                self.functions[qname].dep_level = 0
-                queue.append(qname)
+                self.functions[symbol_key].dep_level = 0
+                queue.append(symbol_key)
 
         self.build_reverse_edges()
 
         while queue:
-            qname = queue.popleft()
-            level = self.functions[qname].dep_level
-            for caller_name in self.callers.get(qname, []):
+            symbol_key = queue.popleft()
+            level = self.functions[symbol_key].dep_level
+            for caller_name in self.callers.get(symbol_key, []):
                 new_level = level + 1
                 if new_level > self.functions[caller_name].dep_level:
                     self.functions[caller_name].dep_level = new_level
@@ -673,9 +1312,9 @@ class ProjectIndex:
 
         # Handle cycles
         max_level = max((f.dep_level for f in self.functions.values()), default=0)
-        for qname, deg in in_degree.items():
+        for symbol_key, deg in in_degree.items():
             if deg > 0:
-                self.functions[qname].dep_level = max_level + 1
+                self.functions[symbol_key].dep_level = max_level + 1
 
     def stats(self) -> dict:
         """Return index statistics."""
@@ -1018,6 +1657,63 @@ def extract_callees(cursor: Cursor) -> tuple[list[str], list[str]]:
     return list(callees), list(baselib_callees)
 
 
+def extract_callee_symbol_keys(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    repo: str | None = None,
+    fallback_file: str | None = None,
+) -> list[str]:
+    """Extract canonical identity keys for non-system call targets."""
+    return [
+        str(ref["symbol_key"])
+        for ref in extract_callee_references(
+            cursor,
+            project_dir=project_dir,
+            project_id=repo,
+            fallback_file=fallback_file,
+        )[0]
+    ]
+
+
+def extract_callee_references(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
+) -> tuple[list[SymbolReference], list[SymbolReference]]:
+    """Return resolved local and base-library call references from one AST walk."""
+    local: dict[str, SymbolReference] = {}
+    baselib: dict[str, SymbolReference] = {}
+
+    def walk(node: Cursor):
+        if node.kind == CursorKind.CALL_EXPR:
+            ref = node.referenced
+            if ref and ref.spelling:
+                qname = get_qualified_name(ref)
+                if qname:
+                    reference = symbol_reference_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project_id=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    key = str(reference["symbol_key"])
+                    if not is_system_function(qname):
+                        local[key] = reference
+                    elif is_crosslinkable_baselib(qname):
+                        baselib[key] = reference
+        for child in node.get_children():
+            walk(child)
+
+    walk(cursor)
+    return (
+        [local[key] for key in sorted(local)],
+        [baselib[key] for key in sorted(baselib)],
+    )
+
+
 _REFERENCED_TYPE_DECL_KINDS = frozenset({
     CursorKind.STRUCT_DECL,
     CursorKind.CLASS_DECL,
@@ -1055,6 +1751,55 @@ def extract_referenced_types(cursor: Cursor) -> list[str]:
 
     walk(cursor)
     return list(types)
+
+
+def extract_referenced_type_keys(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    repo: str | None = None,
+    fallback_file: str | None = None,
+) -> list[str]:
+    """Extract canonical identity keys of referenced record/enum/typedef types."""
+    return [
+        str(ref["symbol_key"])
+        for ref in extract_referenced_type_references(
+            cursor,
+            project_dir=project_dir,
+            project_id=repo,
+            fallback_file=fallback_file,
+        )
+    ]
+
+
+def extract_referenced_type_references(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
+) -> list[SymbolReference]:
+    """Return canonical references for non-system record/enum/typedef uses."""
+    refs: dict[str, SymbolReference] = {}
+
+    def walk(node: Cursor):
+        if node.kind == CursorKind.TYPE_REF:
+            ref = node.referenced
+            if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
+                qname = get_qualified_name(ref)
+                if qname and not is_system_function(qname):
+                    reference = symbol_reference_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project_id=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    refs[str(reference["symbol_key"])] = reference
+        for child in node.get_children():
+            walk(child)
+
+    walk(cursor)
+    return [refs[key] for key in sorted(refs)]
 
 
 def get_qualified_name(cursor: Cursor) -> str:
@@ -1151,6 +1896,7 @@ def parse_translation_unit(
     compile_args: list[str],
     project_dir: str,
     allow_system_types: bool = False,
+    project_id: str | None = None,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -1173,6 +1919,7 @@ def parse_translation_unit(
     """
     functions: list[FunctionDef] = []
     typedefs: list[TypeDef] = []
+    stable_project_id = project_id or os.path.basename(os.path.abspath(project_dir))
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
             source = source_file.read()
@@ -1188,15 +1935,22 @@ def parse_translation_unit(
             # make many parallel clang workers retain large buffers.
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
-    except Exception as e:
-        print(f"  WARN: Failed to parse {filepath}: {e}", file=sys.stderr)
-        return functions, typedefs
+    except Exception as exc:
+        raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
 
     rel_path = os.path.relpath(filepath, project_dir)
     ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
         source,
         tu,
         filepath,
+    )
+    semantic_meta = extract_semantic_metadata(
+        source,
+        tu,
+        filepath,
+        project_dir=project_dir,
+        project_id=stable_project_id,
+        fallback_file=rel_path,
     )
     byte_to_char = _byte_to_char_mapper(source)
     project_dir_abs = os.path.abspath(project_dir)
@@ -1235,8 +1989,8 @@ def parse_translation_unit(
         Functions are captured only from the primary file (``== filepath``) to
         avoid duplicating inline defs across every TU that includes the header.
         Type DEFINITIONS are captured from any project-local file (incl. headers
-        pulled in via #include); duplicates across TUs are deduped by qname in
-        ``ProjectIndex.add_typedef``.
+        pulled in via #include); duplicates across TUs are deduped by canonical
+        symbol identity in ``ProjectIndex.add_typedef``.
         """
         loc = cursor.location.file
         if loc is None:
@@ -1247,7 +2001,7 @@ def parse_translation_unit(
             return  # skip system/third-party headers entirely
 
         if in_primary_file and cursor.kind in FUNCTION_KINDS and cursor.is_definition():
-            text, func_ast_depth, func_sibling_index, func_ast_node_type, _offsets = (
+            text, func_ast_depth, func_sibling_index, func_ast_node_type, offsets = (
                 _cursor_text_and_metadata(
                     cursor,
                     source,
@@ -1259,9 +2013,42 @@ def parse_translation_unit(
                 )
             )
             if text and len(text) >= 20:
-                callees, baselib_callees = extract_callees(cursor)
-                referenced_types = extract_referenced_types(cursor)
+                callee_refs, baselib_callee_refs = extract_callee_references(
+                    cursor,
+                    project_dir=project_dir,
+                    project_id=stable_project_id,
+                    fallback_file=rel_path,
+                )
+                referenced_type_refs = extract_referenced_type_references(
+                    cursor,
+                    project_dir=project_dir,
+                    project_id=stable_project_id,
+                    fallback_file=rel_path,
+                )
+                callees = [str(ref["qname"]) for ref in callee_refs]
+                baselib_callees = [str(ref["qname"]) for ref in baselib_callee_refs]
+                callee_keys = [str(ref["symbol_key"]) for ref in callee_refs]
+                referenced_types = [str(ref["qname"]) for ref in referenced_type_refs]
+                referenced_type_keys = [
+                    str(ref["symbol_key"]) for ref in referenced_type_refs
+                ]
                 qname = get_qualified_name(cursor)
+                symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=project_dir,
+                    project=stable_project_id,
+                    fallback_file=rel_path,
+                )
+                sem_symbol_ids: list[int] = []
+                sem_call_targets: list[int] = []
+                sem_type_refs: list[int] = []
+                sem_def_use: list[int] = []
+                if offsets is not None:
+                    s0, s1 = offsets
+                    sem_symbol_ids = list(semantic_meta["symbol_ids"][s0:s1])
+                    sem_call_targets = list(semantic_meta["call_targets"][s0:s1])
+                    sem_type_refs = list(semantic_meta["type_refs"][s0:s1])
+                    sem_def_use = list(semantic_meta["def_use"][s0:s1])
                 functions.append(FunctionDef(
                     name=cursor.spelling,
                     qualified_name=qname,
@@ -1276,6 +2063,19 @@ def parse_translation_unit(
                     ast_node_type=func_ast_node_type,
                     referenced_types=referenced_types,
                     baselib_callees=baselib_callees,
+                    symbol_key=symbol_key,
+                    usr=usr,
+                    canonical_signature=canonical_signature,
+                    symbol_kind=_cursor_kind_name(cursor),
+                    callee_keys=callee_keys,
+                    referenced_type_keys=referenced_type_keys,
+                    callee_refs=callee_refs,
+                    baselib_callee_refs=baselib_callee_refs,
+                    referenced_type_refs=referenced_type_refs,
+                    semantic_symbol_ids=sem_symbol_ids,
+                    semantic_call_targets=sem_call_targets,
+                    semantic_type_refs=sem_type_refs,
+                    semantic_def_use=sem_def_use,
                 ))
             return
 
@@ -1291,6 +2091,12 @@ def parse_translation_unit(
             if qname and (allow_system_types or not is_system_function(qname)):
                 td_text = get_function_text(cursor, tu)
                 if td_text and len(td_text) >= 8:
+                    symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                        cursor,
+                        project_dir=project_dir,
+                        project=stable_project_id,
+                        fallback_file=_cursor_rel_file(cursor),
+                    )
                     typedefs.append(TypeDef(
                         name=cursor.spelling,
                         qualified_name=qname,
@@ -1299,6 +2105,10 @@ def parse_translation_unit(
                         text=td_text,
                         kind=type_bucket,
                         end_line=cursor.extent.end.line,
+                        symbol_key=symbol_key,
+                        usr=usr,
+                        canonical_signature=canonical_signature,
+                        symbol_kind=_cursor_kind_name(cursor),
                     ))
             # Records (class/struct) can contain nested types/methods — recurse.
 
@@ -1315,6 +2125,12 @@ def parse_translation_unit(
         if header_decl_kind is not None and header_decl_text and len(header_decl_text) >= 8:
             qname = get_qualified_name(cursor)
             if qname and (allow_system_types or not is_system_function(qname)):
+                symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=project_dir,
+                    project=stable_project_id,
+                    fallback_file=_cursor_rel_file(cursor),
+                )
                 typedefs.append(TypeDef(
                     name=cursor.spelling,
                     qualified_name=qname,
@@ -1323,6 +2139,10 @@ def parse_translation_unit(
                     text=header_decl_text,
                     kind=header_decl_kind,
                     end_line=cursor.extent.end.line,
+                    symbol_key=symbol_key,
+                    usr=usr,
+                    canonical_signature=canonical_signature,
+                    symbol_kind=_cursor_kind_name(cursor),
                 ))
 
         if cursor.kind in CONTAINER_KINDS:
@@ -1584,6 +2404,7 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------- #
 CROSSLINK_MAX_DEPS_PER_DOC = 12
 CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 2
 
 
 class CrossLinkBudget:
@@ -1638,44 +2459,119 @@ class GlobalSymbolReader:
                 "so overloaded symbols and multi-implementation std symbols are "
                 "not collapsed."
             )
-        self._cache: dict[str, dict | None] = {}
+        required = {
+            "symbol_key",
+            "usr",
+            "canonical_signature",
+            "symbol_kind",
+            "identity_schema_version",
+        }
+        missing = sorted(required - cols)
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if missing or version != GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"--global-symbol-index schema is incompatible: {path}; "
+                f"user_version={version}, missing_columns={missing}. Open it once "
+                "with scripts/crossrepo/build_global_symbol_index.py to migrate and "
+                "backfill identity fields, or rebuild it."
+            )
+        incompatible_rows = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM symbols "
+                "WHERE identity_schema_version!=? OR symbol_key=''",
+                (SYMBOL_IDENTITY_SCHEMA_VERSION,),
+            ).fetchone()[0]
+        )
+        if incompatible_rows:
+            raise RuntimeError(
+                f"--global-symbol-index has incompatible symbol identity rows: {path}; "
+                f"count={incompatible_rows}, expected_version="
+                f"{SYMBOL_IDENTITY_SCHEMA_VERSION}. Migrate or rebuild the index."
+            )
+        self._cache: dict[str, tuple[dict[str, object], ...]] = {}
 
-    def lookup(self, qname: str) -> dict | None:
-        """Return the base-lib FUNCTION def for ``qname`` or None.
-
-        Returns a dict with at least: base_repo, base_lib, text, token_est, kind.
-        Cached per-process; the store is read-only at doc-build time.
-        """
+    def lookup_candidates(self, qname: str) -> list[dict[str, object]]:
+        """Return every function candidate for a display/search qname."""
         key = normalize_inline_namespace_qname(qname)
         if key in self._cache:
-            return self._cache[key]
-        row = self._conn.execute(
-            "SELECT base_lib, base_repo, text, token_est, kind "
+            return [dict(record) for record in self._cache[key]]
+        rows = self._conn.execute(
+            "SELECT symbol_uid, symbol_key, qname, base_lib, base_repo, text, "
+            "token_est, kind, file, line, end_line, usr, canonical_signature, "
+            "symbol_kind, identity_schema_version "
             "FROM symbols WHERE qname=? AND sym_type='func' "
-            "ORDER BY token_est DESC, body_len DESC, base_repo, file, line LIMIT 1",
+            "ORDER BY base_repo, file, line, symbol_uid",
             (key,),
-        ).fetchone()
-        if row is None:
-            self._cache[key] = None
-            return None
-        rec = {
-            "base_lib": row[0], "base_repo": row[1], "text": row[2],
-            "token_est": row[3], "kind": row[4],
-        }
-        self._cache[key] = rec
-        return rec
+        ).fetchall()
+        records = tuple(
+            {
+                "symbol_uid": row[0],
+                "symbol_key": row[1],
+                "qname": row[2],
+                "base_lib": row[3],
+                "base_repo": row[4],
+                "text": row[5],
+                "token_est": row[6],
+                "kind": row[7],
+                "file": row[8],
+                "line": row[9],
+                "end_line": row[10],
+                "usr": row[11],
+                "canonical_signature": row[12],
+                "symbol_kind": row[13],
+                "identity_schema_version": row[14],
+            }
+            for row in rows
+        )
+        self._cache[key] = records
+        return [dict(record) for record in records]
+
+    def lookup(
+        self,
+        qname: str,
+        *,
+        symbol_key: str | None = None,
+        usr: str | None = None,
+        canonical_signature: str | None = None,
+        symbol_kind: str | None = None,
+        project: str | None = None,
+        file: str | None = None,
+    ) -> dict[str, object] | None:
+        """Resolve one exact/unambiguous candidate; ambiguity returns ``None``."""
+        all_candidates = self.lookup_candidates(qname)
+        candidates = list(all_candidates)
+        if symbol_key:
+            candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
+        if usr:
+            candidates = [row for row in candidates if row["usr"] == usr]
+        if canonical_signature:
+            signature = _normalize_signature_text(canonical_signature)
+            candidates = [
+                row
+                for row in candidates
+                if _normalize_signature_text(str(row["canonical_signature"])) == signature
+            ]
+        if symbol_kind:
+            candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
+        if project:
+            candidates = [row for row in candidates if row["base_repo"] == project]
+        if file:
+            candidates = [row for row in candidates if row["file"] == file]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def close(self) -> None:
         self._conn.close()
 
 
 def collect_transitive_deps(
-    root_qname: str,
+    root_symbol: str,
     index: ProjectIndex,
     max_depth: int = 5,
     *,
     global_symbols: "GlobalSymbolReader | None" = None,
-    crosslink_visited: set[str] | None = None,
+    crosslink_visited: dict[str, dict[str, object]] | None = None,
     crosslink_budget: "CrossLinkBudget | None" = None,
 ) -> list[str]:
     """BFS to collect transitive dependencies of a function.
@@ -1683,7 +2579,7 @@ def collect_transitive_deps(
     When ``global_symbols`` is supplied (the optional cross-repo base-lib symbol
     index), an UNRESOLVED callee — one that is NOT in the local repo index — is
     looked up in the global index. If it is a selected base-lib symbol it is
-    recorded as a CROSS-LIB pull in ``crosslink_visited`` (qnames) under HARD
+    recorded as a CROSS-LIB pull in ``crosslink_visited`` (symbol UIDs) under HARD
     BOUNDS enforced by ``crosslink_budget`` (cross-lib depth = 1, a per-doc cap
     on the number of cross-lib deps, and a per-doc cross-lib token budget). We do
     NOT recurse into a pulled base-lib function's own transitive closure inside
@@ -1696,51 +2592,96 @@ def collect_transitive_deps(
         and crosslink_budget is not None
     )
 
-    def _try_crosslink(callee: str) -> None:
+    def _try_crosslink(reference: str | SymbolReference) -> None:
         # Depth-1 only: a pulled base-lib def is a LEAF; we never enqueue it, so
         # its base-lib-internal callees are not followed. Bounds (count + token
         # budget) are enforced by crosslink_budget. ONE clear path; a miss (not a
         # selected base-lib symbol) is simply a no-op, never a fallback.
-        if callee in crosslink_visited:
-            return
         if not crosslink_budget.has_room():
             return
-        hit = global_symbols.lookup(callee)
+        if isinstance(reference, dict):
+            qname = str(reference.get("qname") or "")
+            reference_project = (
+                None
+                if is_crosslinkable_baselib(qname)
+                else str(reference.get("project") or "") or None
+            )
+            hit = global_symbols.lookup(
+                qname,
+                symbol_key=(
+                    str(reference.get("symbol_key") or "") or None
+                    if reference_project
+                    else None
+                ),
+                usr=str(reference.get("usr") or "") or None,
+                canonical_signature=(
+                    str(reference.get("canonical_signature") or "") or None
+                ),
+                symbol_kind=str(reference.get("symbol_kind") or "") or None,
+                project=reference_project,
+                file=(str(reference.get("file") or "") or None)
+                if reference_project
+                else None,
+            )
+        else:
+            qname = reference
+            hit = global_symbols.lookup(qname)
         if hit is None:
+            return
+        target_key = hit.get("symbol_key")
+        if not isinstance(target_key, str) or not target_key:
+            return
+        index._register_symbol_key(target_key)
+        uid = str(hit["symbol_uid"])
+        if uid in crosslink_visited:
             return
         if not crosslink_budget.can_afford(hit["token_est"]):
             return
-        crosslink_visited.add(callee)
+        crosslink_visited[uid] = hit
         crosslink_budget.spend(hit["token_est"])
 
-    visited = {root_qname}
-    queue = deque([(root_qname, 0)])
+    resolved_root = index.resolve_function_key(root_symbol)
+    if resolved_root is None:
+        return []
+    visited = {resolved_root}
+    queue = deque([(resolved_root, 0)])
     deps = []
 
     while queue:
-        qname, depth = queue.popleft()
+        symbol_key, depth = queue.popleft()
         if depth >= max_depth:
             continue
-        func = index.functions.get(qname)
+        func = index.functions.get(symbol_key)
         if not func:
             continue
-        for callee in func.callees:
-            if callee in visited:
+        local_refs: list[str | SymbolReference] = list(
+            getattr(func, "callee_refs", []) or []
+        )
+        if not local_refs:
+            local_refs = list(getattr(func, "callee_keys", []) or []) + list(func.callees)
+        for reference in local_refs:
+            callee = index.resolve_function_key(reference)
+            if callee is not None and callee in visited:
                 continue
-            if callee in index.functions:
+            if callee is not None:
                 visited.add(callee)
                 deps.append(callee)
                 queue.append((callee, depth + 1))
             elif crosslink_active:
                 # An unresolved callee (not local) MIGHT be a base-lib symbol
                 # (e.g. a vendored/forward-declared libc-style name). Try it.
-                _try_crosslink(callee)
+                _try_crosslink(reference)
         # Base-lib-namespaced callees (std::/boost::) were filtered out of
         # `callees` by the normal system-prefix filter and live here. They are
         # the PRIMARY cross-link source. Only consulted when cross-linking is on.
         if crosslink_active:
-            for callee in func.baselib_callees:
-                _try_crosslink(callee)
+            base_refs: list[str | SymbolReference] = list(
+                getattr(func, "baselib_callee_refs", []) or []
+            )
+            if not base_refs:
+                base_refs = list(func.baselib_callees)
+            for reference in base_refs:
+                _try_crosslink(reference)
 
     return deps
 
@@ -1780,7 +2721,7 @@ def extract_ast_metadata_from_parts(
     offset = 0
 
     for part_index, part in enumerate(parts_info):
-        part_text, kind, dep_level, _name, _qname = (
+        part_text, kind, _dep_level, _name, display_qname = (
             part[0], part[1], part[2], part[3], part[4]
         )
         part_len = len(part_text)
@@ -1789,7 +2730,13 @@ def extract_ast_metadata_from_parts(
         end = min(offset + part_len, text_len)
         if offset >= text_len or offset >= end:
             break
-        func = index.functions.get(_qname) if index is not None and _qname else None
+        func = None
+        if index is not None:
+            key = _part_symbol_key(part) or (
+                display_qname if isinstance(display_qname, str) else None
+            )
+            resolved = index.resolve_function_key(key)
+            func = index.functions.get(resolved) if resolved is not None else None
         if (
             func is not None
             and len(func.ast_depth) == part_len
@@ -1866,23 +2813,14 @@ _REFERENCE_KINDS = {
 }
 
 
-def _compute_symbol_id(qname: str) -> int:
-    """Deterministic 32-bit symbol ID from a qualified name.
-
-    Uses the lower 31 bits of md5, leaving 0 as the sentinel for 'no symbol'.
-    """
-    if not qname:
-        return 0
-    h = int(hashlib.md5(qname.encode("utf-8", errors="replace")).hexdigest(), 16)
-    # Mask to 31 bits (positive int32), reserve 0 for no-symbol
-    result = (h & 0x7FFFFFFF) or 1
-    return result
-
-
 def extract_semantic_metadata(
     source: str,
     tu: 'TranslationUnit',
     filename: str,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
 ) -> dict:
     """Extract per-character semantic metadata from a translation unit.
 
@@ -1968,7 +2906,13 @@ def extract_semantic_metadata(
         if kind in _DEFINITION_KINDS and cursor.is_definition():
             qname = get_qualified_name(cursor)
             if qname:
-                sym_id = _compute_symbol_id(qname)
+                symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=project_dir,
+                    project=project_id,
+                    fallback_file=fallback_file,
+                )
+                sym_id = _compute_symbol_id(symbol_key)
                 for ci in range(char_start, char_end):
                     symbol_ids[ci] = sym_id
                     def_use[ci] = DEF_USE_DEF
@@ -1978,7 +2922,13 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 qname = get_qualified_name(ref)
                 if qname:
-                    sym_id = _compute_symbol_id(qname)
+                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    sym_id = _compute_symbol_id(symbol_key)
                     for ci in range(char_start, char_end):
                         symbol_ids[ci] = sym_id
                         def_use[ci] = DEF_USE_USE
@@ -1989,7 +2939,13 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 target_qname = get_qualified_name(ref)
                 if target_qname:
-                    target_id = _compute_symbol_id(target_qname)
+                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    target_id = _compute_symbol_id(symbol_key)
                     for ci in range(char_start, char_end):
                         call_targets[ci] = target_id
 
@@ -1999,7 +2955,13 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 ref_qname = get_qualified_name(ref)
                 if ref_qname:
-                    ref_id = _compute_symbol_id(ref_qname)
+                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    ref_id = _compute_symbol_id(symbol_key)
                     for ci in range(char_start, char_end):
                         type_refs[ci] = ref_id
 
@@ -2007,12 +2969,8 @@ def extract_semantic_metadata(
         for child in cursor.get_children():
             _visit(child)
 
-    try:
-        for child in tu.cursor.get_children():
-            _visit(child)
-    except (RecursionError, Exception):
-        # Graceful degradation: return whatever we have so far
-        pass
+    for child in tu.cursor.get_children():
+        _visit(child)
 
     return {
         "symbol_ids": symbol_ids,
@@ -2026,13 +2984,16 @@ def extract_semantic_metadata_from_parts(
     full_text: str,
     parts_info: list[PartInfo],
     index: ProjectIndex,
+    part_functions: dict[int, FunctionDef] | None = None,
+    part_semantic_arrays: dict[int, dict[str, object]] | None = None,
 ) -> dict:
     """Produce semantic metadata from pre-extracted parts without running libclang.
 
     This is the offline path used when the enriched doc is built from
     already-parsed FunctionDef objects. It assigns symbol_ids and def_use
-    based on the parts_info metadata (qname, kind) and the call graph in
-    the ProjectIndex.
+    based on canonical part metadata and the call graph in the ProjectIndex.
+    A display qname may resolve an already-indexed unique symbol but never
+    synthesizes identity on its own.
 
     Returns:
         dict with keys 'symbol_ids', 'call_targets', 'type_refs', 'def_use',
@@ -2053,20 +3014,56 @@ def extract_semantic_metadata_from_parts(
             break
 
         qname = part[4] if len(part) > 4 else None
+        symbol_key = _part_symbol_key(part) or (
+            index.resolve_function_key(qname) if isinstance(qname, str) else None
+        ) or (
+            index.resolve_type_key(qname) if isinstance(qname, str) else None
+        )
+
+        exact_semantics = (part_semantic_arrays or {}).get(i)
+        exact_applied = False
+        if exact_semantics is not None:
+            exact_values = (
+                exact_semantics.get("symbol_ids"),
+                exact_semantics.get("call_targets"),
+                exact_semantics.get("type_refs"),
+                exact_semantics.get("def_use"),
+            )
+            if all(value is not None and len(value) == part_len for value in exact_values):
+                symbol_ids[offset:offset + part_len] = list(exact_values[0])
+                call_targets[offset:offset + part_len] = list(exact_values[1])
+                type_refs[offset:offset + part_len] = list(exact_values[2])
+                def_use_arr[offset:offset + part_len] = list(exact_values[3])
+                exact_applied = True
 
         if qname:
-            sym_id = _compute_symbol_id(qname)
-            # Function parts are definition sites
-            for ci in range(offset, offset + part_len):
-                symbol_ids[ci] = sym_id
-                def_use_arr[ci] = DEF_USE_DEF
+            func_def = (part_functions or {}).get(i)
+            if func_def is None:
+                func_key = index.resolve_function_key(symbol_key) or index.resolve_function_key(qname)
+                func_def = index.functions.get(func_key) if func_key is not None else None
+            if not exact_applied and (
+                func_def is not None
+                and len(func_def.semantic_symbol_ids) == part_len
+                and len(func_def.semantic_call_targets) == part_len
+                and len(func_def.semantic_type_refs) == part_len
+                and len(func_def.semantic_def_use) == part_len
+            ):
+                symbol_ids[offset:offset + part_len] = func_def.semantic_symbol_ids[:]
+                call_targets[offset:offset + part_len] = func_def.semantic_call_targets[:]
+                type_refs[offset:offset + part_len] = func_def.semantic_type_refs[:]
+                def_use_arr[offset:offset + part_len] = func_def.semantic_def_use[:]
+            elif not exact_applied and symbol_key:
+                sym_id = _compute_symbol_id(symbol_key)
+                # Function/type parts are definition sites.
+                for ci in range(offset, offset + part_len):
+                    symbol_ids[ci] = sym_id
+                    def_use_arr[ci] = DEF_USE_DEF
 
-            # Annotate call_targets + type_refs by marking each referenced
-            # name's occurrences within this part (approximate call-site / type-
-            # use spans; exact char offsets would need a re-parse). This replaces
-            # the old 1-char-per-callee stub and the never-written type_refs.
-            func_def = index.functions.get(qname)
-            if func_def:
+            if (
+                not exact_applied
+                and func_def
+                and not any(call_targets[offset:offset + part_len])
+            ):
                 def _mark(arr, name, value):
                     if not name or not value:
                         return
@@ -2079,10 +3076,24 @@ def extract_semantic_metadata_from_parts(
                         for ci in range(offset + idx, min(offset + idx + plen, offset + part_len)):
                             arr[ci] = value
                         s = idx + plen
-                for callee_qname in func_def.callees:
-                    _mark(call_targets, callee_qname.split('::')[-1], _compute_symbol_id(callee_qname))
-                for type_qname in getattr(func_def, 'referenced_types', []):
-                    _mark(type_refs, type_qname.split('::')[-1], _compute_symbol_id(type_qname))
+                for callee_qname, callee_key in zip(
+                    func_def.callees,
+                    func_def.callee_keys or func_def.callees,
+                ):
+                    _mark(
+                        call_targets,
+                        callee_qname.split('::')[-1],
+                        _compute_symbol_id(callee_key),
+                    )
+                for type_qname, type_key in zip(
+                    getattr(func_def, 'referenced_types', []),
+                    getattr(func_def, 'referenced_type_keys', []) or getattr(func_def, 'referenced_types', []),
+                ):
+                    _mark(
+                        type_refs,
+                        type_qname.split('::')[-1],
+                        _compute_symbol_id(type_key),
+                    )
 
         elif kind == 1:  # PREAMBLE
             # Preamble: mark as use sites (references to included entities)
@@ -2205,6 +3216,7 @@ def _macro_part_metadata(macro: MacroDef) -> dict[str, object]:
         "name": macro.name,
         "file": macro.file,
         "line": macro.line,
+        "project_id": macro.project_id,
         "visible_in_file": macro.visible_in_file,
         "visible_line": macro.visible_line,
         "sequence": macro.sequence,
@@ -2769,14 +3781,87 @@ def build_enriched_doc(
     chunk_boundaries = []
     offset = 0
 
-    # Map chunk_idx -> qname for edge computation
-    chunk_qnames = {}        # local function chunks (call-edge SOURCES; carry callees)
-    chunk_target_qnames = {} # call-edge TARGETS: local funcs + cross-lib base-lib pulls
+    # Map chunk_idx -> canonical symbol identity for edge computation.
+    chunk_symbols = {}       # local function chunks (call-edge SOURCES; carry callees)
+    chunk_target_symbols = {} # local funcs + cross-lib base-lib pull targets
     chunk_callees = {}
-    chunk_all_qnames = {}    # ANY named chunk incl. type defs (type-edge targets)
+    chunk_all_symbols = {}   # ANY named chunk incl. type defs (type-edge targets)
     chunk_types = {}         # referenced_types per function chunk (type-edge sources)
+    chunk_ranges: dict[int, tuple[int, int]] = {}
+    call_target_id_rewrites: dict[int, dict[int, int]] = defaultdict(dict)
     macro_route_parts: list[dict[str, object]] = []
     macro_invocation_routes: list[dict[str, object]] = []
+    crosslink_targets: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for candidate_part in parts_info:
+        source = _part_dep_source(candidate_part)
+        metadata = _part_symbol_metadata(candidate_part)
+        candidate_qname = candidate_part[4] if len(candidate_part) > 4 else None
+        if (
+            source is not None
+            and source.startswith("crosslib:")
+            and metadata is not None
+            and isinstance(candidate_qname, str)
+        ):
+            crosslink_targets[
+                normalize_inline_namespace_qname(candidate_qname)
+            ].append(metadata)
+
+    def _resolve_pulled_crosslink(reference: str | SymbolReference) -> str | None:
+        if isinstance(reference, dict):
+            qname = normalize_inline_namespace_qname(
+                str(reference.get("qname") or "")
+            )
+            candidates = list(crosslink_targets.get(qname, []))
+            if not candidates:
+                return None
+            reference_key = str(reference.get("symbol_key") or "")
+            exact_key_matches = [
+                target
+                for target in candidates
+                if reference_key and target.get("symbol_key") == reference_key
+            ]
+            identity_filter_used = bool(exact_key_matches)
+            if exact_key_matches:
+                candidates = exact_key_matches
+            usr = str(reference.get("usr") or "")
+            if usr:
+                identity_filter_used = True
+                candidates = [target for target in candidates if target.get("usr") == usr]
+            signature = _normalize_signature_text(
+                str(reference.get("canonical_signature") or "")
+            )
+            if signature:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if _normalize_signature_text(
+                        str(target.get("canonical_signature") or "")
+                    ) == signature
+                ]
+            symbol_kind = str(reference.get("symbol_kind") or "")
+            if symbol_kind:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if str(target.get("kind") or "") == symbol_kind
+                ]
+            if not identity_filter_used:
+                return None
+        else:
+            qname = normalize_inline_namespace_qname(reference)
+            candidates = [
+                target
+                for target in crosslink_targets.get(qname, [])
+                if str(target.get("canonical_signature") or "").startswith(
+                    "legacy-kind="
+                )
+            ]
+        if len(candidates) != 1:
+            return None
+        key = candidates[0].get("symbol_key")
+        return key if isinstance(key, str) and key else None
 
     for i, part in enumerate(parts_info):
         part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
@@ -2785,6 +3870,7 @@ def build_enriched_doc(
         part_len = len(part_text)
         if offset + part_len > text_len:
             break
+        chunk_ranges[i] = (offset, offset + part_len)
 
         # Fill structure_ids
         for j in range(offset, offset + part_len):
@@ -2797,28 +3883,56 @@ def build_enriched_doc(
             'dep_level': dep_level,
             'name': name,
         }
+        symbol_metadata = _part_symbol_metadata(part)
+        if symbol_metadata is not None:
+            boundary['symbol_id'] = int(symbol_metadata['symbol_id'])
         # Tag cross-repo base-lib pulls with their provenance so the model knows
         # this chunk is a base-lib impl and which lib it came from.
         if dep_source is not None:
             boundary['dep_source'] = dep_source
         chunk_boundaries.append(boundary)
 
-        # Track qnames for edge computation.
+        part_symbol_key = _part_symbol_key(part)
+        # Track identities for edge computation. qname only resolves when
+        # unambiguous; ambiguous qnames intentionally do not create graph edges.
         if qname:
-            chunk_all_qnames[i] = qname
+            resolved_type_key = part_symbol_key or index.resolve_type_key(qname)
+            resolved_func_key = part_symbol_key or index.resolve_function_key(qname)
+            if resolved_type_key:
+                chunk_all_symbols[i] = resolved_type_key
             # Call-edge TARGET candidates = local function chunks AND cross-lib
             # base-lib pulls (a pulled def is a real callee target even though it
             # is not in the LOCAL index). This lets root->base-lib call_edges
             # resolve to the pulled chunk.
-            if qname in index.functions or (
+            if (resolved_func_key and resolved_func_key in index.functions) or (
                 dep_source is not None and dep_source.startswith("crosslib:")
             ):
-                chunk_target_qnames[i] = qname
-        if qname and qname in index.functions:
-            func = index.functions[qname]
-            chunk_qnames[i] = qname
-            chunk_callees[i] = func.callees
-            chunk_types[i] = getattr(func, 'referenced_types', [])
+                target_key = part_symbol_key or resolved_func_key
+                if target_key:
+                    chunk_target_symbols[i] = target_key
+        if qname:
+            func_key = part_symbol_key or index.resolve_function_key(qname)
+        else:
+            func_key = None
+        if func_key and func_key in index.functions:
+            func = index.functions[func_key]
+            chunk_symbols[i] = func_key
+            callee_refs = index._function_callee_keys(func)
+            for ref in getattr(func, "baselib_callee_refs", []):
+                ref_key = _resolve_pulled_crosslink(ref)
+                if isinstance(ref_key, str) and ref_key and ref_key not in callee_refs:
+                    callee_refs.append(ref_key)
+                    source_key = ref.get("symbol_key")
+                    if isinstance(source_key, str) and source_key != ref_key:
+                        call_target_id_rewrites[i][
+                            _compute_symbol_id(source_key)
+                        ] = _compute_symbol_id(ref_key)
+            for ref in list(func.callees) + list(getattr(func, "baselib_callees", [])):
+                edge_key = _resolve_pulled_crosslink(ref)
+                if edge_key is not None and edge_key not in callee_refs:
+                    callee_refs.append(edge_key)
+            chunk_callees[i] = callee_refs
+            chunk_types[i] = index._function_referenced_type_keys(func)
             macro_invocation_routes.extend(
                 _macro_invocation_route_parts(
                     part_text,
@@ -2843,20 +3957,20 @@ def build_enriched_doc(
     # Compute call_edges. Sources are local function chunks (they carry callees);
     # targets include local function chunks AND cross-lib base-lib pulls.
     call_edges = []
-    for ci, caller_qname in chunk_qnames.items():
+    for ci, caller_symbol in chunk_symbols.items():
         callees = chunk_callees.get(ci, [])
-        for callee_qname in callees:
-            for cj, target_qname in chunk_target_qnames.items():
-                if ci != cj and target_qname == callee_qname:
+        for callee_symbol in callees:
+            for cj, target_symbol in chunk_target_symbols.items():
+                if ci != cj and target_symbol == callee_symbol:
                     call_edges.append({'from': ci, 'to': cj})
 
     # Compute type_edges: a function chunk referencing type T -> the chunk that
     # defines T (mirror of the call_edges loop, over referenced_types).
     type_edges: list[dict[str, object]] = []
     for ci, ref_types in chunk_types.items():
-        for t in ref_types:
-            for cj, q in chunk_all_qnames.items():
-                if ci != cj and q == t:
+        for type_symbol in ref_types:
+            for cj, symbol in chunk_all_symbols.items():
+                if ci != cj and symbol == type_symbol:
                     type_edges.append({'from': ci, 'to': cj})
 
     ast_depth, sibling_index, ast_node_type = extract_ast_metadata_from_parts(
@@ -2881,10 +3995,20 @@ def build_enriched_doc(
 
     # Extract semantic metadata (symbol IDs, call targets, type refs, def-use)
     semantic_meta = extract_semantic_metadata_from_parts(full_text, parts_info, index)
+    for part_index, rewrites in call_target_id_rewrites.items():
+        start, end = chunk_ranges[part_index]
+        for char_index in range(start, end):
+            call_id = semantic_meta['call_targets'][char_index]
+            if call_id in rewrites:
+                semantic_meta['call_targets'][char_index] = rewrites[call_id]
+            symbol_id = semantic_meta['symbol_ids'][char_index]
+            if symbol_id in rewrites:
+                semantic_meta['symbol_ids'][char_index] = rewrites[symbol_id]
 
     result = {
         'text': full_text,
         'doc_type': 'code',
+        'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
         'filepath': filepath or '',
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
@@ -3379,11 +4503,15 @@ def register_header_macros(
     header_files: list[str],
     *,
     project_dir: str | None,
+    project_id: str | None = None,
     include_dirs: list[str] | None = None,
     max_include_depth: int | None = None,
     max_include_files_per_root: int | None = None,
     memory_limit_gb: float | None = None,
 ) -> dict[str, int]:
+    stable_project_id = project_id or (
+        os.path.basename(os.path.abspath(project_dir)) if project_dir else ""
+    )
     sequence = [0]
     directive_cache: dict[str, list[dict[str, object]]] = {}
     resolve_cache: dict[tuple[str, str], str | None] = {}
@@ -3768,6 +4896,7 @@ def register_header_macros(
                             line=line_no,
                             text="".join(text_parts),
                             params=params,
+                            project_id=stable_project_id,
                             visible_in_file=root_rel,
                             visible_line=root_visible_line or line_no,
                             sequence=sequence[0],
@@ -3788,6 +4917,7 @@ def register_header_macros(
                             line=line_no,
                             text=macro_text,
                             params=params,
+                            project_id=stable_project_id,
                             visible_in_file=root_rel,
                             visible_line=root_visible_line or line_no,
                             sequence=sequence[0],
@@ -4032,9 +5162,10 @@ def build_header_fragment_doc(
     fragment_kind: str,
     compile_args: list[str] | None,
     build_info: dict | None,
+    part: PartInfo | None = None,
 ) -> dict:
     doc = build_enriched_doc(
-        [(text, kind, 0, name, qname)],
+        [part or (text, kind, 0, name, qname)],
         index,
         filepath=rel_file,
         compile_args=compile_args,
@@ -4198,6 +5329,7 @@ def emit_header_documents(
                 fragment_kind="header_decl" if td.kind == HEADER_FRAGMENT_KIND else "type",
                 compile_args=compile_args,
                 build_info=build_info,
+                part=_typedef_part(td),
             )
             emit_doc(doc if enriched else td.text)
 
@@ -4210,7 +5342,7 @@ def emit_header_documents(
         except OSError as exc:
             raise RuntimeError(f"failed to read header for macro extraction: {abs_path}") from exc
 
-        for _start, _end, name, macro_text in extract_macro_blocks(header_text):
+        for start, _end, name, macro_text in extract_macro_blocks(header_text):
             if estimate_tokens(macro_text) > max_tokens * 2:
                 stats["skipped_header_macro_oversize"] += 1
                 continue
@@ -4218,6 +5350,25 @@ def emit_header_documents(
                 stats["skipped_header_macro"] += 1
                 continue
             stats["header_macro"] += 1
+            line = header_text.count("\n", 0, start) + 1
+            macro = next(
+                (
+                    candidate
+                    for candidate in index.macros_by_name.get(name, [])
+                    if candidate.file == rel and candidate.line == line
+                ),
+                MacroDef(
+                    name,
+                    rel,
+                    line,
+                    macro_text,
+                    project_id=(
+                        os.path.basename(os.path.abspath(project_dir))
+                        if project_dir
+                        else None
+                    ),
+                ),
+            )
             doc = build_header_fragment_doc(
                 index=index,
                 rel_file=rel,
@@ -4228,6 +5379,7 @@ def emit_header_documents(
                 fragment_kind="macro",
                 compile_args=compile_args,
                 build_info=build_info,
+                part=_macro_part(macro),
             )
             emit_doc(doc if enriched else macro_text)
 
@@ -4260,7 +5412,7 @@ def dedup_root_functions(
     the shared SQLite ``DedupStore`` (fail-loud if it cannot open / datasketch is
     missing). When absent, a per-repo in-RAM exact set is used (no near).
 
-    Returns (dropped_root_qnames, {dropped_exact, dropped_near, kept_roots}).
+    Returns (dropped_root_symbol_keys, {dropped_exact, dropped_near, kept_roots}).
     """
     tok = _load_cppmega_tokenizer(tokenizer_path)
 
@@ -4288,25 +5440,25 @@ def dedup_root_functions(
         index.functions.items(),
         key=lambda kv: (kv[1].file or "", kv[1].line or 0, kv[0]),
     )
-    for qname, func in items:
+    for symbol_key, func in items:
         if not (func.is_definition and func.text):
             continue
         token_ids = tok.encode(func.text)
         if store is not None:
             if store.seen_exact_tokens(token_ids):
                 dropped_exact += 1
-                dropped_roots.add(qname)
+                dropped_roots.add(symbol_key)
                 continue
             if near and store.seen_near_tokens(token_ids):
                 dropped_near += 1
-                dropped_roots.add(qname)
+                dropped_roots.add(symbol_key)
                 continue
         else:
             _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
             h = _sha1_tokens(token_ids)
             if h in seen_local:
                 dropped_exact += 1
-                dropped_roots.add(qname)
+                dropped_roots.add(symbol_key)
                 continue
             seen_local.add(h)
         kept_roots += 1
@@ -4548,25 +5700,25 @@ def build_training_documents(
                 kv[0],
             ),
         )
-        for qname, func in items:
+        for symbol_key, func in items:
             if not func.is_definition:
                 continue
             # Skip emitting a STANDALONE root doc for a deduped function. It remains
             # resolvable as a graph node, but chunk-claiming below controls whether
             # its text may appear in training output again.
-            if qname in dropped_roots:
+            if symbol_key in dropped_roots:
                 continue
 
             # Collect transitive deps. When the global symbol index is present, also
             # collect cross-lib base-lib pulls (bounded; depth-1; tagged provenance).
             # When absent, crosslink_budget is None so collect_transitive_deps takes
             # the exact original path (behavior unchanged).
-            crosslink_visited: set[str] = set()
+            crosslink_visited: dict[str, dict[str, object]] = {}
             crosslink_budget = (
                 CrossLinkBudget() if global_symbols is not None else None
             )
-            dep_qnames = collect_transitive_deps(
-                qname, index, max_dep_depth,
+            dep_keys = collect_transitive_deps(
+                symbol_key, index, max_dep_depth,
                 global_symbols=global_symbols,
                 crosslink_visited=crosslink_visited,
                 crosslink_budget=crosslink_budget,
@@ -4576,8 +5728,8 @@ def build_training_documents(
             # after the candidate document passes the tiny-doc filter so a small
             # helper can still be used as dependency context for its first caller.
             dep_funcs: list[FunctionDef] = []
-            for dq in dep_qnames:
-                df = index.functions.get(dq)
+            for dep_key in dep_keys:
+                df = index.functions.get(dep_key)
                 if not (df and df.is_definition and df.text):
                     continue
                 dep_funcs.append(df)
@@ -4597,13 +5749,11 @@ def build_training_documents(
 
             # Resolve cross-lib pulls to (qname, record) DEEPEST deps. They are the
             # most foundational (base-lib impls) so they precede local deps in text.
-            crosslink_deps: list[tuple[str, dict]] = []
-            if global_symbols is not None and crosslink_visited:
-                for cq in sorted(crosslink_visited):
-                    rec = global_symbols.lookup(cq)
-                    if rec is None or not rec.get("text"):
-                        continue
-                    crosslink_deps.append((cq, rec))
+            crosslink_deps: list[dict[str, object]] = [
+                crosslink_visited[uid]
+                for uid in sorted(crosslink_visited)
+                if crosslink_visited[uid].get("text")
+            ]
 
             def _assemble(dep_funcs_list: list[FunctionDef]) -> str:
                 parts: list[str] = []
@@ -4612,8 +5762,8 @@ def build_training_documents(
                 for macro in macro_deps:
                     parts.append(macro.text)
                 # Cross-lib base-lib defs are the deepest foundation -> emitted first.
-                for _cq, _rec in crosslink_deps:
-                    parts.append(_rec["text"])
+                for record in crosslink_deps:
+                    parts.append(str(record["text"]))
                 for df in dep_funcs_list:
                     parts.append(df.text)
                 parts.append(func.text)
@@ -4666,13 +5816,13 @@ def build_training_documents(
                     claimed_macro_deps.append(macro)
                 macro_deps = claimed_macro_deps
 
-                claimed_crosslink_deps: list[tuple[str, dict]] = []
-                for cq, rec in crosslink_deps:
+                claimed_crosslink_deps: list[dict[str, object]] = []
+                for rec in crosslink_deps:
                     if not chunk_claims.claim_text(rec["text"], max_count=1):
                         chunk_stats["skipped_crosslib"] += 1
                         continue
                     chunk_stats["claimed_crosslib"] += 1
-                    claimed_crosslink_deps.append((cq, rec))
+                    claimed_crosslink_deps.append(rec)
                 crosslink_deps = claimed_crosslink_deps
                 doc = _assemble(dep_funcs)
                 tokens = estimate_tokens(doc)
@@ -4690,15 +5840,7 @@ def build_training_documents(
                 if preamble:
                     parts_info.append((preamble, 1, 0, '', None))  # kind=1 PREAMBLE
                 for macro in macro_deps:
-                    parts_info.append((
-                        macro.text,
-                        MACRO_KIND,
-                        0,
-                        macro.name,
-                        None,
-                        None,
-                        _macro_part_metadata(macro),
-                    ))
+                    parts_info.append(_macro_part(macro))
                 # Cross-lib base-lib pulls: DEEPEST deps. dep_level is set above the
                 # max local dep_level so they sort as the most foundational chunks in
                 # the SAME dep_levels/topo order, and they carry dep_source provenance
@@ -4707,34 +5849,28 @@ def build_training_documents(
                 _max_local_level = max(
                     (df.dep_level for df in dep_funcs), default=0
                 )
-                for cq, rec in crosslink_deps:
-                    cname = cq.split('::')[-1]
-                    parts_info.append((
-                        rec["text"], 2, _max_local_level + 1, cname, cq,
-                        f"crosslib:{rec['base_repo']}",
-                    ))
+                for rec in crosslink_deps:
+                    parts_info.append(_global_symbol_part(rec, _max_local_level + 1))
                 for df in dep_funcs:
-                    parts_info.append((df.text, 2, df.dep_level, df.name,
-                                       df.qualified_name))  # kind=2 FUNC
-                parts_info.append((func.text, 2, func.dep_level, func.name,
-                                   func.qualified_name))  # kind=2 FUNC (root)
+                    parts_info.append(_function_part(df))
+                parts_info.append(_function_part(func))
 
                 # Pull in DEFINITIONS of types referenced by the root func + its
                 # dep funcs as type-edge target chunks. build_enriched_doc matches
-                # a function chunk's referenced_types against any chunk whose qname
-                # equals the type qname (chunk_all_qnames) to emit type_edges; the
-                # type def must therefore be present as a chunk. Definitions live in
+                # canonical referenced-type identities against type-definition
+                # chunks to emit type_edges; the type def must therefore be present.
+                # Definitions live in
                 # headers (now indexed), registered in index.typedefs.
-                func_qnames_in_doc = {func.qualified_name}
-                func_qnames_in_doc.update(df.qualified_name for df in dep_funcs)
-                referenced: list[str] = list(func.referenced_types)
+                func_symbols_in_doc = {func.symbol_key}
+                func_symbols_in_doc.update(df.symbol_key for df in dep_funcs)
+                referenced: list[str] = index._function_referenced_type_keys(func)
                 for df in dep_funcs:
-                    referenced.extend(df.referenced_types)
-                added_type_qnames: set[str] = set()
-                for tq in referenced:
-                    if tq in added_type_qnames or tq in func_qnames_in_doc:
+                    referenced.extend(index._function_referenced_type_keys(df))
+                added_type_keys: set[str] = set()
+                for type_key in referenced:
+                    if type_key in added_type_keys or type_key in func_symbols_in_doc:
                         continue
-                    td = index.typedefs.get(tq)
+                    td = index.typedefs.get(type_key)
                     if td is None or not td.text:
                         continue
                     if chunk_claims is not None:
@@ -4742,10 +5878,9 @@ def build_training_documents(
                             chunk_stats["skipped_type"] += 1
                             continue
                         chunk_stats["claimed_type"] += 1
-                    added_type_qnames.add(tq)
+                    added_type_keys.add(type_key)
                     # kind from TypeDef (4=class/struct/enum/union, 7=typedef/using)
-                    parts_info.append((td.text, td.kind, 0, td.name,
-                                       td.qualified_name))
+                    parts_info.append(_typedef_part(td))
 
                 compile_args = list(default_args or [])
                 build_info = dict(default_build_info) if default_build_info else None

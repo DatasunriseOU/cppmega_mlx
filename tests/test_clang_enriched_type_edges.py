@@ -65,6 +65,7 @@ conv = importlib.import_module("scripts.nanochat_data.clang_enriched_to_parquet"
 def _minimal_row(**overrides):
     """A row dict with just enough fields for rows_to_table to build a table."""
     row = {
+        "symbol_identity_schema_version": 2,
         "text": "struct B{int x;};\n\nint D::f(){return x;}",
         "source_doc_id": "doc-1",
         "tokenizer_fingerprint": "fp-1",
@@ -141,6 +142,15 @@ def test_semantic_char_columns_propagate():
     assert table.column("symbol_ids").type == conv._SCHEMA.field("symbol_ids").type
     assert table.column("type_refs").type == conv._SCHEMA.field("type_refs").type
     assert table.column("def_use").type == conv._SCHEMA.field("def_use").type
+    assert table.schema.metadata[
+        conv.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    ] == b"2"
+
+
+def test_converter_rejects_stale_symbol_identity_rows():
+    row = _minimal_row(symbol_identity_schema_version=1)
+    with pytest.raises(RuntimeError, match="regenerate.*clang USR"):
+        conv.rows_to_table([row])
 
 
 def test_pr_discussion_audit_columns_propagate():

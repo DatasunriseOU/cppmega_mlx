@@ -189,6 +189,7 @@ def _slice_doc_char_range(
                 "kind": cb.get("kind", 0),
                 "dep_level": cb.get("dep_level", 0),
                 "name": cb.get("name", ""),
+                "symbol_id": cb.get("symbol_id"),
             }
         )
     sliced["chunk_boundaries"] = adjusted_boundaries

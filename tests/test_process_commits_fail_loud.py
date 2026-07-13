@@ -87,6 +87,30 @@ def test_process_commits_rejects_missing_input_before_clang_init(tmp_path, monke
     assert not output.exists()
 
 
+def test_analyze_file_clang_surfaces_translation_unit_parse_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class BrokenIndex:
+        def parse(self, *_args, **_kwargs):
+            raise RuntimeError("synthetic clang failure")
+
+    monkeypatch.setattr(
+        process_commits,
+        "TranslationUnit",
+        SimpleNamespace(PARSE_INCOMPLETE=0),
+    )
+
+    with pytest.raises(RuntimeError, match=r"libclang parse failed.*src/broken\.cpp"):
+        process_commits.analyze_file_clang(
+            "int broken(int value) { return value; }",
+            "src/broken.cpp",
+            BrokenIndex(),
+            str(tmp_path / "clang-tmp"),
+            repo_root=str(tmp_path),
+            project_id="repo-a",
+        )
+
+
 def test_sha_pr_lookup_restores_number_title_and_uses_readonly_store(
     tmp_path: Path,
 ) -> None:

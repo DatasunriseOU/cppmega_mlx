@@ -59,7 +59,7 @@ import tarfile
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -278,6 +278,30 @@ def normalized_body_len(text: str) -> int:
 # --------------------------------------------------------------------------- #
 # SQLite global symbol store.
 # --------------------------------------------------------------------------- #
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class GlobalSymbolRecord:
+    qname: str
+    base_lib: str
+    base_repo: str
+    kind: int
+    sym_type: str
+    file: str
+    line: int
+    end_line: int
+    is_public: int
+    token_est: int
+    body_len: int
+    text: str
+    symbol_key: str
+    usr: str = ""
+    canonical_signature: str = ""
+    symbol_kind: str = ""
+    identity_schema_version: int = ip.SYMBOL_IDENTITY_SCHEMA_VERSION
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS symbols (
     symbol_uid  TEXT NOT NULL PRIMARY KEY,
@@ -292,7 +316,12 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_public    INTEGER NOT NULL,
     token_est    INTEGER NOT NULL,
     body_len     INTEGER NOT NULL,
-    text         TEXT NOT NULL
+    text         TEXT NOT NULL,
+    symbol_key   TEXT NOT NULL,
+    usr          TEXT NOT NULL,
+    canonical_signature TEXT NOT NULL,
+    symbol_kind  TEXT NOT NULL,
+    identity_schema_version INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qname);
 CREATE INDEX IF NOT EXISTS idx_symbols_qname_type ON symbols(qname, sym_type);
@@ -316,9 +345,9 @@ CREATE TABLE IF NOT EXISTS symbol_index_libs (
 class GlobalSymbolStore:
     """Resumable SQLite store for cross-repo base-lib symbol definitions.
 
-    Read path used by index_project at doc-build time is intentionally tiny:
-    ``lookup(qname)`` returns the function def (or None). The write path is used
-    only by THIS builder.
+    The read path returns all display-qname candidates and resolves one only by
+    canonical identity fields or proven uniqueness. The write path is used only
+    by this builder.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -332,9 +361,167 @@ class GlobalSymbolStore:
             self.conn = sqlite3.connect(path, timeout=60.0)
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute("PRAGMA synchronous=NORMAL;")
-            self.conn.executescript(SCHEMA)
+            self._initialize_or_migrate_schema()
             self._require_current_schema()
             self.conn.commit()
+
+    @staticmethod
+    def _legacy_signature(*, kind: int, sym_type: str, text: str) -> str:
+        digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+        return f"legacy-kind={kind}|type={sym_type}|text-sha1={digest}"
+
+    @classmethod
+    def _legacy_record(cls, row: tuple) -> GlobalSymbolRecord:
+        if len(row) != 12:
+            raise ValueError(f"expected 12 legacy symbol fields, got {len(row)}")
+        (
+            qname,
+            base_lib,
+            base_repo,
+            kind,
+            sym_type,
+            file,
+            line,
+            end_line,
+            is_public,
+            token_est,
+            body_len,
+            text,
+        ) = row
+        signature = cls._legacy_signature(
+            kind=int(kind), sym_type=str(sym_type), text=str(text)
+        )
+        symbol_kind = "FUNCTION_DECL" if sym_type == "func" else "TYPE_DECL"
+        symbol_key = ip.canonical_symbol_identity(
+            qname=str(qname),
+            kind=symbol_kind,
+            canonical_signature=signature,
+            project=str(base_repo),
+            file=str(file),
+            line=int(line),
+            force_file_scope=True,
+        )
+        return GlobalSymbolRecord(
+            qname=str(qname),
+            base_lib=str(base_lib),
+            base_repo=str(base_repo),
+            kind=int(kind),
+            sym_type=str(sym_type),
+            file=str(file),
+            line=int(line),
+            end_line=int(end_line),
+            is_public=int(is_public),
+            token_est=int(token_est),
+            body_len=int(body_len),
+            text=str(text),
+            symbol_key=symbol_key,
+            canonical_signature=signature,
+            symbol_kind=symbol_kind,
+        )
+
+    def _initialize_or_migrate_schema(self) -> None:
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{self.path}: newer global symbol schema cannot be downgraded: "
+                f"user_version={version}, supported={GLOBAL_SYMBOL_DB_SCHEMA_VERSION}"
+            )
+        table_exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbols'"
+        ).fetchone()
+        if table_exists is None:
+            self.conn.executescript(SCHEMA)
+        else:
+            cols = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(symbols)").fetchall()
+            }
+            if "symbol_uid" not in cols:
+                raise RuntimeError(
+                    f"{self.path}: global symbol index uses old qname-only schema; "
+                    "delete/rebuild it with scripts/crossrepo/build_global_symbol_index.py"
+                )
+            additions = {
+                "symbol_key": "TEXT NOT NULL DEFAULT ''",
+                "usr": "TEXT NOT NULL DEFAULT ''",
+                "canonical_signature": "TEXT NOT NULL DEFAULT ''",
+                "symbol_kind": "TEXT NOT NULL DEFAULT ''",
+                "identity_schema_version": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, declaration in additions.items():
+                if column not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE symbols ADD COLUMN {column} {declaration}"
+                    )
+            stale_rows = self.conn.execute(
+                "SELECT symbol_uid, qname, base_lib, base_repo, kind, sym_type, "
+                "file, line, end_line, is_public, token_est, body_len, text, "
+                "usr, canonical_signature, symbol_kind "
+                "FROM symbols WHERE symbol_key='' OR canonical_signature='' "
+                "OR symbol_kind='' OR identity_schema_version!=?",
+                (ip.SYMBOL_IDENTITY_SCHEMA_VERSION,),
+            ).fetchall()
+            for row in stale_rows:
+                record = self._legacy_record(tuple(row[1:13]))
+                existing_usr = str(row[13] or "")
+                existing_signature = str(row[14] or "")
+                existing_kind = str(row[15] or "")
+                if existing_usr or existing_signature or existing_kind:
+                    signature = existing_signature or record.canonical_signature
+                    symbol_kind = existing_kind or record.symbol_kind
+                    record = replace(
+                        record,
+                        symbol_key=ip.canonical_symbol_identity(
+                            qname=record.qname,
+                            kind=symbol_kind,
+                            usr=existing_usr,
+                            canonical_signature=signature,
+                            project=record.base_repo,
+                            file=record.file,
+                            line=record.line,
+                            force_file_scope=not bool(existing_usr),
+                        ),
+                        usr=existing_usr,
+                        canonical_signature=signature,
+                        symbol_kind=symbol_kind,
+                    )
+                self.conn.execute(
+                    "UPDATE symbols SET symbol_key=?, usr=?, canonical_signature=?, "
+                    "symbol_kind=?, identity_schema_version=? WHERE symbol_uid=?",
+                    (
+                        record.symbol_key,
+                        record.usr,
+                        record.canonical_signature,
+                        record.symbol_kind,
+                        record.identity_schema_version,
+                        row[0],
+                    ),
+                )
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS symbol_index_libs (
+                    lib TEXT PRIMARY KEY,
+                    tier TEXT NOT NULL,
+                    done INTEGER NOT NULL DEFAULT 0,
+                    n_files INTEGER NOT NULL DEFAULT 0,
+                    n_funcs INTEGER NOT NULL DEFAULT 0,
+                    n_types INTEGER NOT NULL DEFAULT 0,
+                    n_errors INTEGER NOT NULL DEFAULT 0,
+                    elapsed_s REAL NOT NULL DEFAULT 0,
+                    subtrees TEXT NOT NULL DEFAULT '',
+                    finished_utc TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key);
+            CREATE INDEX IF NOT EXISTS idx_symbols_usr ON symbols(usr);
+            CREATE INDEX IF NOT EXISTS idx_symbols_qname_signature
+                ON symbols(qname, canonical_signature, symbol_kind);
+            """
+        )
+        self.conn.execute(f"PRAGMA user_version={GLOBAL_SYMBOL_DB_SCHEMA_VERSION}")
 
     def _require_current_schema(self) -> None:
         cols = {
@@ -346,22 +533,47 @@ class GlobalSymbolStore:
                 f"{self.path}: global symbol index uses old qname-only schema; "
                 "delete/rebuild it with scripts/crossrepo/build_global_symbol_index.py"
             )
+        required = {
+            "symbol_key",
+            "usr",
+            "canonical_signature",
+            "symbol_kind",
+            "identity_schema_version",
+        }
+        missing = sorted(required - cols)
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if missing or version != GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{self.path}: incompatible global symbol schema: "
+                f"user_version={version}, missing_columns={missing}"
+            )
+        incompatible_rows = int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM symbols "
+                "WHERE identity_schema_version!=? OR symbol_key=''",
+                (ip.SYMBOL_IDENTITY_SCHEMA_VERSION,),
+            ).fetchone()[0]
+        )
+        if incompatible_rows:
+            raise RuntimeError(
+                f"{self.path}: incompatible symbol identity rows: "
+                f"count={incompatible_rows}, expected_version="
+                f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            )
 
     @staticmethod
-    def _symbol_uid(row: tuple) -> str:
-        qname, base_lib, base_repo, _kind, sym_type, file, line, end_line, *_rest = row
-        text = row[-1]
+    def _symbol_uid(record: GlobalSymbolRecord) -> str:
         payload = "\x1f".join(
             str(part)
             for part in (
-                base_lib,
-                base_repo,
-                sym_type,
-                qname,
-                file,
-                line,
-                end_line,
-                hashlib.sha1(str(text).encode("utf-8")).hexdigest(),
+                record.base_lib,
+                record.base_repo,
+                record.sym_type,
+                record.symbol_key,
+                record.file,
+                record.line,
+                record.end_line,
+                hashlib.sha1(record.text.encode("utf-8")).hexdigest(),
             )
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
@@ -373,15 +585,42 @@ class GlobalSymbolStore:
         ).fetchone()
         return bool(row and row[0])
 
-    def insert_symbols(self, rows: list[tuple]) -> None:
+    def insert_symbols(self, rows: list[tuple | GlobalSymbolRecord]) -> None:
         # rows: (qname, base_lib, base_repo, kind, sym_type, file, line,
         #        end_line, is_public, token_est, body_len, text)
-        keyed_rows = [(self._symbol_uid(row), *row) for row in rows]
+        records = [
+            row if isinstance(row, GlobalSymbolRecord) else self._legacy_record(row)
+            for row in rows
+        ]
+        keyed_rows = [
+            (
+                self._symbol_uid(record),
+                record.qname,
+                record.base_lib,
+                record.base_repo,
+                record.kind,
+                record.sym_type,
+                record.file,
+                record.line,
+                record.end_line,
+                record.is_public,
+                record.token_est,
+                record.body_len,
+                record.text,
+                record.symbol_key,
+                record.usr,
+                record.canonical_signature,
+                record.symbol_kind,
+                record.identity_schema_version,
+            )
+            for record in records
+        ]
         self.conn.executemany(
             "INSERT OR IGNORE INTO symbols "
             "(symbol_uid, qname, base_lib, base_repo, kind, sym_type, file, line, end_line, "
-            " is_public, token_est, body_len, text) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " is_public, token_est, body_len, text, symbol_key, usr, canonical_signature, "
+            " symbol_kind, identity_schema_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             keyed_rows,
         )
 
@@ -405,21 +644,48 @@ class GlobalSymbolStore:
         self.conn.close()
 
     # ---- read path (consulted by index_project) ----
-    def lookup(self, qname: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT qname, base_lib, base_repo, kind, sym_type, file, line, "
-            "end_line, is_public, token_est, body_len, text "
-            "FROM symbols WHERE qname=? AND sym_type='func' LIMIT 1",
+    def lookup_candidates(self, qname: str) -> list[dict[str, object]]:
+        qname = normalize_inline_namespace_qname(qname)
+        rows = self.conn.execute(
+            "SELECT symbol_uid, symbol_key, qname, base_lib, base_repo, kind, "
+            "sym_type, file, line, end_line, is_public, token_est, body_len, text, "
+            "usr, canonical_signature, symbol_kind, identity_schema_version "
+            "FROM symbols WHERE qname=? AND sym_type='func' "
+            "ORDER BY base_repo, file, line, symbol_uid",
             (qname,),
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "qname": row[0], "base_lib": row[1], "base_repo": row[2],
-            "kind": row[3], "sym_type": row[4], "file": row[5], "line": row[6],
-            "end_line": row[7], "is_public": row[8], "token_est": row[9],
-            "body_len": row[10], "text": row[11],
-        }
+        ).fetchall()
+        fields = (
+            "symbol_uid", "symbol_key", "qname", "base_lib", "base_repo", "kind",
+            "sym_type", "file", "line", "end_line", "is_public", "token_est",
+            "body_len", "text", "usr", "canonical_signature", "symbol_kind",
+            "identity_schema_version",
+        )
+        return [dict(zip(fields, row, strict=True)) for row in rows]
+
+    def lookup(
+        self,
+        qname: str,
+        *,
+        symbol_key: str | None = None,
+        usr: str | None = None,
+        canonical_signature: str | None = None,
+        symbol_kind: str | None = None,
+    ) -> dict[str, object] | None:
+        candidates = self.lookup_candidates(qname)
+        if symbol_key:
+            candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
+        if usr:
+            candidates = [row for row in candidates if row["usr"] == usr]
+        if canonical_signature:
+            signature = ip._normalize_signature_text(canonical_signature)
+            candidates = [
+                row
+                for row in candidates
+                if ip._normalize_signature_text(str(row["canonical_signature"])) == signature
+            ]
+        if symbol_kind:
+            candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
+        return candidates[0] if len(candidates) == 1 else None
 
     def counts(self) -> dict:
         cur = self.conn.execute("SELECT base_lib, sym_type, COUNT(*) FROM symbols "
@@ -1066,9 +1332,12 @@ def _parse_file_worker(args_tuple):
                          "-fdelayed-template-parsing"]
     # clang builtin headers + C sysroot (required by std umbrella headers).
     compile_args += lib_env.get("sysroot_args") or []
+    relative = os.path.relpath(filepath, project_dir)
+    project_id = relative.split(os.sep, 1)[0]
     funcs, types = ip.parse_translation_unit(
         filepath, clang_index, compile_args, project_dir,
         allow_system_types=bool(lib_env.get("allow_system_types")),
+        project_id=project_id,
     )
     return (
         [f.to_dict() for f in funcs],
@@ -1194,7 +1463,7 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
         print(f"  [{lib}] stdlib sysroot_args: {' '.join(sysroot_args)}",
               file=sys.stderr, flush=True)
 
-    batch: list[tuple] = []
+    batch: list[GlobalSymbolRecord] = []
     BATCH_COMMIT = 5000
     parsed = 0
     with ProcessPoolExecutor(max_workers=max(1, workers)) as ex:
@@ -1228,8 +1497,24 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 if blen < 12:
                     continue
                 tok = ip.estimate_tokens(body)
-                batch.append((qn, lib, base_repo, 2, "func", frel,
-                              d["line"], d.get("end_line", 0), 1, tok, blen, body))
+                batch.append(GlobalSymbolRecord(
+                    qname=qn,
+                    base_lib=lib,
+                    base_repo=base_repo,
+                    kind=2,
+                    sym_type="func",
+                    file=frel,
+                    line=d["line"],
+                    end_line=d.get("end_line", 0),
+                    is_public=1,
+                    token_est=tok,
+                    body_len=blen,
+                    text=body,
+                    symbol_key=d["symbol_key"],
+                    usr=d.get("usr", ""),
+                    canonical_signature=d.get("canonical_signature", ""),
+                    symbol_kind=d.get("symbol_kind", "FUNCTION_DECL"),
+                ))
                 res.n_funcs += 1
                 res.func_qnames.add(qn)
             for d in type_dicts:
@@ -1242,8 +1527,24 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 if blen < 8:
                     continue
                 tok = ip.estimate_tokens(body)
-                batch.append((qn, lib, base_repo, d["kind"], "type", frel,
-                              d["line"], d.get("end_line", 0), 1, tok, blen, body))
+                batch.append(GlobalSymbolRecord(
+                    qname=qn,
+                    base_lib=lib,
+                    base_repo=base_repo,
+                    kind=d["kind"],
+                    sym_type="type",
+                    file=frel,
+                    line=d["line"],
+                    end_line=d.get("end_line", 0),
+                    is_public=1,
+                    token_est=tok,
+                    body_len=blen,
+                    text=body,
+                    symbol_key=d["symbol_key"],
+                    usr=d.get("usr", ""),
+                    canonical_signature=d.get("canonical_signature", ""),
+                    symbol_kind=d.get("symbol_kind", "TYPE_DECL"),
+                ))
                 res.n_types += 1
             parsed += 1
             if len(batch) >= BATCH_COMMIT:
