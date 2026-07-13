@@ -666,7 +666,7 @@ def manifest_complete_commit_ranges(
 def mark_commit_stream_complete(
     repo: str,
     manifest: Manifest,
-    manifest_lock: threading.Lock,
+    manifest_lock: threading.Lock | None,
     complete_ranges: Sequence[tuple[int, int]],
 ) -> dict:
     """Persist aggregate completion proven by the plan and exact range coverage.
@@ -701,8 +701,11 @@ def mark_commit_stream_complete(
         "n_records": n_records,
         "range_count": len(complete_ranges),
     }
-    with manifest_lock:
+    if manifest_lock is None:
         manifest.mark_done(f"{repo}::commits", info)
+    else:
+        with manifest_lock:
+            manifest.mark_done(f"{repo}::commits", info)
     return info
 
 
@@ -1341,6 +1344,7 @@ def should_stage_repo_from_manifest(
     manifest: Manifest,
     range_size: int,
     only_repos: set[str] | None,
+    manifest_lock: threading.Lock | None = None,
 ) -> bool:
     """Return False when the manifest proves this repo needs no extraction.
 
@@ -1356,10 +1360,20 @@ def should_stage_repo_from_manifest(
         return False
 
     code_needed = streams in {"both", "code"} and not manifest.is_done(code_key(repo))
-    commits_needed = (
-        streams in {"both", "commits"}
-        and manifest_complete_commit_ranges(repo, manifest, range_size) is None
-    )
+    commits_needed = False
+    if streams in {"both", "commits"}:
+        complete_ranges = manifest_complete_commit_ranges(repo, manifest, range_size)
+        commits_needed = complete_ranges is None
+        if complete_ranges is not None:
+            # This callback can skip extraction entirely, so reconcile the
+            # derived aggregate sentinel here instead of waiting for
+            # run_commits_half, which will never be called for this repo.
+            mark_commit_stream_complete(
+                repo,
+                manifest,
+                manifest_lock,
+                complete_ranges,
+            )
     return code_needed or commits_needed
 
 
@@ -3047,6 +3061,7 @@ def main(argv: list[str]) -> int:
             manifest=manifest,
             range_size=args.range_size,
             only_repos=only_repos,
+            manifest_lock=manifest_lock,
         )
         if should_stage:
             ensure_min_free_disk(

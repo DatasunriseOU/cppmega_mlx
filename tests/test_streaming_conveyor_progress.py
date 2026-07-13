@@ -1371,7 +1371,12 @@ def test_should_stage_repo_skips_manifest_proven_complete_both_streams(tmp_path)
             "repo::r0": {"range": [0, 500], "source": "commits"},
             "repo::r500": {"range": [500, 612], "source": "commits"},
         },
-        failed={},
+        failed={
+            "repo::commits": {
+                "stage": "extract_git_history",
+                "detail": "stale failure from an earlier attempt",
+            }
+        },
     )
 
     assert not streaming_conveyor.should_stage_repo_from_manifest(
@@ -1382,6 +1387,15 @@ def test_should_stage_repo_skips_manifest_proven_complete_both_streams(tmp_path)
         range_size=500,
         only_repos=None,
     )
+    assert manifest.done["repo::commits"] == {
+        "source": "commits",
+        "repo": "repo",
+        "complete": True,
+        "completion_proof": "commit_plan_exact_range_coverage",
+        "n_records": 612,
+        "range_count": 2,
+    }
+    assert "repo::commits" not in manifest.failed
     assert streaming_conveyor.should_stage_repo_from_manifest(
         "repo",
         streams="both",
