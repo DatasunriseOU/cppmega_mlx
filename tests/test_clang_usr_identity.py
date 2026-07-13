@@ -56,7 +56,7 @@ def _function(functions: list, *, name: str, signature_fragment: str):
     )
 
 
-def test_canonical_identity_namespaces_usr_by_project_and_never_uses_qname_alone() -> None:
+def test_canonical_identity_namespaces_usr_and_fallback_uses_normalized_qname() -> None:
     shared = {
         "qname": "api::route",
         "kind": "FUNCTION_DECL",
@@ -78,13 +78,68 @@ def test_canonical_identity_namespaces_usr_by_project_and_never_uses_qname_alone
         "project": "repo-a",
         "file": "route.cpp",
     }
-    assert ip.canonical_symbol_identity(qname="left::route", **fallback) == (
+    assert ip.canonical_symbol_identity(qname="left::route", **fallback) != (
         ip.canonical_symbol_identity(qname="right::route", **fallback)
+    )
+    assert ip.canonical_symbol_identity(qname=" left :: route ", **fallback) == (
+        ip.canonical_symbol_identity(qname="left::route", **fallback)
     )
     assert ip.canonical_symbol_identity(
         qname="api::route",
         **{**fallback, "canonical_signature": "display=route(double)|type=double (double)"},
     ) != ip.canonical_symbol_identity(qname="api::route", **fallback)
+
+
+def test_fallback_identity_and_symbol_ids_separate_qnames_and_overloads() -> None:
+    shared = {
+        "kind": "FUNCTION_DECL",
+        "project": "repo-a",
+        "file": "route.cpp",
+    }
+    left_int = ip.canonical_symbol_identity(
+        qname="left::route",
+        canonical_signature="display=route(int)|type=int (int)",
+        **shared,
+    )
+    right_int = ip.canonical_symbol_identity(
+        qname="right::route",
+        canonical_signature="display=route(int)|type=int (int)",
+        **shared,
+    )
+    left_double = ip.canonical_symbol_identity(
+        qname="left::route",
+        canonical_signature="display=route(double)|type=double (double)",
+        **shared,
+    )
+
+    assert len({left_int, right_int, left_double}) == 3
+    symbol_ids = {ip._compute_symbol_id(key) for key in (left_int, right_int, left_double)}
+    assert len(symbol_ids) == 3
+    assert max(symbol_ids) > 0xFFFFFFFF
+    assert all(0 < symbol_id <= 0xFFFFFFFFFFFFFFFF for symbol_id in symbol_ids)
+
+
+def test_corpus_registry_fails_closed_on_cross_project_symbol_id_collision() -> None:
+    first_key = ip.canonical_symbol_identity(
+        qname="left::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo-a",
+        file="route.cpp",
+    )
+    second_key = ip.canonical_symbol_identity(
+        qname="right::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo-b",
+        file="route.cpp",
+    )
+    claimed_id = ip._compute_symbol_id(first_key)
+    registry = ip.SymbolIdentityRegistry()
+    registry.register(first_key, symbol_id=claimed_id, source="owner/repo-a")
+
+    with pytest.raises(RuntimeError, match="symbol ID collision.*owner/repo-a.*owner/repo-b"):
+        registry.register(second_key, symbol_id=claimed_id, source="owner/repo-b")
 
 
 def test_qname_only_part_never_synthesizes_semantic_identity() -> None:
@@ -453,6 +508,70 @@ def test_global_store_migrates_composite_schema_and_backfills_identity(tmp_path:
     assert all(row[0] for row in rows)
     assert all(row[1] for row in rows)
     assert {row[2] for row in rows} == {ip.SYMBOL_IDENTITY_SCHEMA_VERSION}
+
+
+def test_global_store_fails_closed_on_cross_project_symbol_id_collision(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "symbols.sqlite"
+    signature = "display=route(int)|type=int (int)|result=int|args=(int)"
+    first_key = ip.canonical_symbol_identity(
+        qname="left::route",
+        kind="FUNCTION_DECL",
+        canonical_signature=signature,
+        project="owner/repo-a",
+        file="route.cpp",
+    )
+    second_key = ip.canonical_symbol_identity(
+        qname="right::route",
+        kind="FUNCTION_DECL",
+        canonical_signature=signature,
+        project="owner/repo-b",
+        file="route.cpp",
+    )
+    claimed_id = ip._compute_symbol_id(first_key)
+    first = gsi.GlobalSymbolRecord(
+        qname="left::route",
+        base_lib="api",
+        base_repo="owner/repo-a",
+        kind=2,
+        sym_type="func",
+        file="route.cpp",
+        line=1,
+        end_line=1,
+        is_public=1,
+        token_est=8,
+        body_len=32,
+        text="int route(int value) { return value; }",
+        symbol_key=first_key,
+        symbol_id=claimed_id,
+        canonical_signature=signature,
+        symbol_kind="FUNCTION_DECL",
+    )
+    second = gsi.GlobalSymbolRecord(
+        qname="right::route",
+        base_lib="api",
+        base_repo="owner/repo-b",
+        kind=2,
+        sym_type="func",
+        file="route.cpp",
+        line=1,
+        end_line=1,
+        is_public=1,
+        token_est=8,
+        body_len=32,
+        text="int route(int value) { return value; }",
+        symbol_key=second_key,
+        symbol_id=claimed_id,
+        canonical_signature=signature,
+        symbol_kind="FUNCTION_DECL",
+    )
+
+    store = gsi.GlobalSymbolStore(str(db))
+    store.insert_symbols([first])
+    with pytest.raises(RuntimeError, match="symbol ID collision"):
+        store.insert_symbols([second])
+    store.close()
 
 
 def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Path) -> None:

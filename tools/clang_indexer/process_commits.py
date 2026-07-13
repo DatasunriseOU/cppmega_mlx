@@ -55,6 +55,7 @@ from tools.clang_indexer.index_project import (
     _adapt_args_for_file,
     _collect_macro_include_dirs,
     _compute_symbol_id,
+    _document_symbol_identities,
     _function_part,
     _macro_invocation_route_parts,
     _macro_part,
@@ -63,6 +64,7 @@ from tools.clang_indexer.index_project import (
     _part_symbol_key,
     _part_symbol_metadata,
     _sanitize_compile_args_for_clang,
+    _semantic_identity_records_for_arrays,
     _symbol_part_metadata,
     _used_macro_defs,
     canonical_symbol_identity,
@@ -86,6 +88,7 @@ from tools.clang_indexer.index_project import (
     register_header_macros,
     symbol_identity_for_cursor,
 )
+from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
 from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.pr_ingest import pr_store as _pr_store_mod
@@ -243,6 +246,7 @@ class ClassDef:
     semantic_call_targets: list[int] = field(default_factory=list)
     semantic_type_refs: list[int] = field(default_factory=list)
     semantic_def_use: list[int] = field(default_factory=list)
+    semantic_symbol_identities: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.symbol_key:
@@ -258,9 +262,9 @@ class ClassDef:
         self.ast_depth = array('H', self.ast_depth)
         self.sibling_index = array('H', self.sibling_index)
         self.ast_node_type = array('H', self.ast_node_type)
-        self.semantic_symbol_ids = array('I', self.semantic_symbol_ids)
-        self.semantic_call_targets = array('I', self.semantic_call_targets)
-        self.semantic_type_refs = array('I', self.semantic_type_refs)
+        self.semantic_symbol_ids = array('Q', self.semantic_symbol_ids)
+        self.semantic_call_targets = array('Q', self.semantic_call_targets)
+        self.semantic_type_refs = array('Q', self.semantic_type_refs)
         self.semantic_def_use = array('B', self.semantic_def_use)
 
 
@@ -338,6 +342,7 @@ def _clone_function_def(func: FunctionDef) -> FunctionDef:
         semantic_call_targets=list(func.semantic_call_targets),
         semantic_type_refs=list(func.semantic_type_refs),
         semantic_def_use=list(func.semantic_def_use),
+        semantic_symbol_identities=list(func.semantic_symbol_identities),
     )
 
 
@@ -361,6 +366,7 @@ def _clone_class_def(cls: ClassDef) -> ClassDef:
         semantic_call_targets=list(cls.semantic_call_targets),
         semantic_type_refs=list(cls.semantic_type_refs),
         semantic_def_use=list(cls.semantic_def_use),
+        semantic_symbol_identities=list(cls.semantic_symbol_identities),
     )
 
 
@@ -1075,6 +1081,13 @@ def analyze_file_clang(
                     semantic_call_targets=semantic_metadata["call_targets"][start_offset:end_offset],
                     semantic_type_refs=semantic_metadata["type_refs"][start_offset:end_offset],
                     semantic_def_use=semantic_metadata["def_use"][start_offset:end_offset],
+                    semantic_symbol_identities=_semantic_identity_records_for_arrays(
+                        semantic_metadata,
+                        semantic_metadata["symbol_ids"][start_offset:end_offset],
+                        semantic_metadata["call_targets"][start_offset:end_offset],
+                        semantic_metadata["type_refs"][start_offset:end_offset],
+                        source=f"{filepath}:{start_line}:{qname}",
+                    ),
                 ))
 
         elif cursor.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL,
@@ -1131,6 +1144,15 @@ def analyze_file_clang(
                         semantic_call_targets=semantic_metadata["call_targets"][start_offset:end_offset],
                         semantic_type_refs=semantic_metadata["type_refs"][start_offset:end_offset],
                         semantic_def_use=semantic_metadata["def_use"][start_offset:end_offset],
+                        semantic_symbol_identities=_semantic_identity_records_for_arrays(
+                            semantic_metadata,
+                            semantic_metadata["symbol_ids"][start_offset:end_offset],
+                            semantic_metadata["call_targets"][start_offset:end_offset],
+                            semantic_metadata["type_refs"][start_offset:end_offset],
+                            source=(
+                                f"{filepath}:{cursor.extent.start.line}:{qname}"
+                            ),
+                        ),
                     ))
                 # Recurse into class children to extract inline methods,
                 # constructors, and destructors defined inside the class body.
@@ -1945,6 +1967,10 @@ def _build_enriched_from_parts(
             canonical_signature=cls.canonical_signature,
             symbol_kind=cls.symbol_kind,
         ))
+        semantic_index.symbol_id_registry.register_records(
+            cls.semantic_symbol_identities,
+            source=f"commit class:{cls.file}:{cls.start_line}:{cls.qualified_name}",
+        )
     for part in parts_info:
         metadata = _part_macro_provenance(part)
         if metadata is None:
@@ -2130,10 +2156,30 @@ def _build_enriched_from_parts(
         part_functions=part_functions,
         part_semantic_arrays=part_semantic_arrays,
     )
+    ripple_symbol_ids = [
+        int(symbol_id)
+        for ripple in (ripple_candidates or [])
+        for symbol_id in (
+            [ripple.get('changed_symbol_id')]
+            + [candidate.get('symbol_id') for candidate in ripple.get('candidates', [])]
+        )
+        if symbol_id is not None
+    ]
+    symbol_identities = _document_symbol_identities(
+        parts_info,
+        semantic_index,
+        semantic_meta['symbol_ids'],
+        semantic_meta['call_targets'],
+        semantic_meta['type_refs'],
+        changed_symbol_ids or [],
+        ripple_symbol_ids,
+        source=str(record.get('filepath') or 'clang commit document'),
+    )
 
     result: dict = {
         'text': full_text,
         'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: symbol_identities,
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
         'call_edges': call_edges,

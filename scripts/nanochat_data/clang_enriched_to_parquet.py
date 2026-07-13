@@ -37,6 +37,13 @@ import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_mlx.data.nanochat_pipeline.language_info import language_info_to_prefix
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityError,
+    SymbolIdentityRegistry,
+)
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     PLATFORM_IDS_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
@@ -117,8 +124,7 @@ GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
 _TOKENIZED_ENRICHED_TOKENIZER = None
 _MEMORY_LIMIT_GB = 10.0
 _OVERFLOW_POLICIES = ("split", "drop")
-SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
-REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = 2
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 _CHAR_LEVEL_METADATA_FIELDS = (
     "ast_depth",
     "sibling_index",
@@ -379,6 +385,10 @@ def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dic
 
 _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
+    pa.field(SYMBOL_IDENTITIES_COLUMN, pa.list_(pa.struct([
+        pa.field("symbol_id", pa.uint64()),
+        pa.field("symbol_key", pa.string()),
+    ]))),
     pa.field("source_text", pa.string()),
     pa.field("source_doc_id", pa.string()),
     pa.field(DOC_TYPE_COLUMN, pa.string()),
@@ -392,7 +402,7 @@ _SCHEMA = pa.schema([
         pa.field("kind", pa.int8()),
         pa.field("dep_level", pa.int32()),
         pa.field("name", pa.string()),
-        pa.field("symbol_id", pa.uint32()),
+        pa.field("symbol_id", pa.uint64()),
     ]))),
     pa.field("call_edges", pa.list_(pa.struct([
         pa.field("from", pa.int32()),
@@ -405,9 +415,9 @@ _SCHEMA = pa.schema([
     pa.field("ast_depth", pa.list_(pa.uint16())),
     pa.field("sibling_index", pa.list_(pa.uint16())),
     pa.field("ast_node_type", pa.list_(pa.uint16())),
-    pa.field("symbol_ids", pa.list_(pa.uint32())),
-    pa.field("call_targets", pa.list_(pa.uint32())),
-    pa.field("type_refs", pa.list_(pa.uint32())),
+    pa.field("symbol_ids", pa.list_(pa.uint64())),
+    pa.field("call_targets", pa.list_(pa.uint64())),
+    pa.field("type_refs", pa.list_(pa.uint64())),
     pa.field("def_use", pa.list_(pa.uint8())),
     pa.field("domain_kind", pa.uint16()),
     pa.field("domain_ids", pa.list_(pa.uint16())),
@@ -484,9 +494,9 @@ _SCHEMA = pa.schema([
     pa.field(TOKEN_AST_DEPTH_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
-    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
     pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_DOMAIN_IDS_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_ROLE_IDS_COLUMN, pa.list_(pa.uint16())),
@@ -554,10 +564,22 @@ _SCHEMA = pa.schema([
 })
 
 
-def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa.Table:
+def rows_to_table(
+    rows: list,
+    *,
+    tokenized_rows: list[dict] | None = None,
+    identity_registry: SymbolIdentityRegistry | None = None,
+) -> pa.Table:
     """Convert a list of doc dicts to a PyArrow table."""
     tokenized_rows = tokenized_rows or [{} for _ in rows]
+    if len(tokenized_rows) != len(rows):
+        raise ValueError(
+            "tokenized_rows length must match rows: "
+            f"{len(tokenized_rows)} != {len(rows)}"
+        )
+    corpus_registry = identity_registry or SymbolIdentityRegistry()
     texts = []
+    symbol_identities_col = []
     source_texts = []
     source_doc_ids = []
     doc_types = []
@@ -649,7 +671,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     token_diagnostic_edges_col = []
     token_cross_domain_edges_col = []
 
-    for row, tokenized in zip(rows, tokenized_rows):
+    for row_index, (row, tokenized) in enumerate(
+        zip(rows, tokenized_rows, strict=True)
+    ):
         identity_version = row.get("symbol_identity_schema_version")
         if identity_version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
             raise RuntimeError(
@@ -657,6 +681,46 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 f"version {identity_version!r}; regenerate it with clang USR/signature "
                 f"schema v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION}"
             )
+        if SYMBOL_IDENTITIES_COLUMN not in row:
+            raise SymbolIdentityError(
+                f"clang-enriched row {row_index} has no {SYMBOL_IDENTITIES_COLUMN!r} "
+                "collision registry; regenerate it with symbol identity schema v3"
+            )
+        row_registry = SymbolIdentityRegistry()
+        normalized_identities = row_registry.register_records(
+            row.get(SYMBOL_IDENTITIES_COLUMN),
+            source=f"clang-enriched row {row_index}",
+        )
+        corpus_registry.register_records(
+            normalized_identities,
+            source=f"clang-enriched row {row_index}",
+        )
+        used_symbol_ids = {
+            int(value)
+            for field in ("symbol_ids", "call_targets", "type_refs")
+            for value in row.get(field, [])
+            if int(value) != 0
+        }
+        used_symbol_ids.update(
+            int(boundary["symbol_id"])
+            for boundary in row.get("chunk_boundaries", [])
+            if isinstance(boundary, dict) and boundary.get("symbol_id") not in (None, 0)
+        )
+        used_symbol_ids.update(
+            int(value)
+            for field in (
+                TOKEN_SYMBOL_IDS_COLUMN,
+                TOKEN_CALL_TARGETS_COLUMN,
+                TOKEN_TYPE_REFS_COLUMN,
+            )
+            for value in tokenized.get(field, [])
+            if int(value) != 0
+        )
+        row_registry.require_ids(
+            used_symbol_ids,
+            source=f"clang-enriched row {row_index}",
+        )
+        symbol_identities_col.append(row_registry.records(used_symbol_ids))
         row_text = row.get("text", "")
         texts.append(row_text)
         # source_text falls back to the emitted text when absent so the column
@@ -873,6 +937,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     return pa.table(
         {
             "text": pa.array(texts, type=_SCHEMA.field("text").type),
+            SYMBOL_IDENTITIES_COLUMN: pa.array(
+                symbol_identities_col,
+                type=_SCHEMA.field(SYMBOL_IDENTITIES_COLUMN).type,
+            ),
             "source_text": pa.array(
                 source_texts, type=_SCHEMA.field("source_text").type
             ),
@@ -1515,6 +1583,7 @@ def convert_local_jsonl_to_parquet(
     rows: list[dict] = []
     wrote_rows = False
     active_tokenizer_fingerprint = tokenizer_fingerprint(tokenizer)
+    identity_registry = SymbolIdentityRegistry()
 
     def flush_rows() -> None:
         nonlocal rows, wrote_rows, writer
@@ -1529,7 +1598,11 @@ def convert_local_jsonl_to_parquet(
             if materialize_tokenized_enriched
             else None
         )
-        table = rows_to_table(rows, tokenized_rows=tokenized_rows)
+        table = rows_to_table(
+            rows,
+            tokenized_rows=tokenized_rows,
+            identity_registry=identity_registry,
+        )
         if writer is None:
             writer = pq.ParquetWriter(target, _SCHEMA, compression="snappy")
         writer.write_table(table)
@@ -1617,7 +1690,8 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                        output_prefix_gcs: str,
                        tokenizer,
                        max_tokens: int,
-                       overflow_policy: str = "split") -> tuple:
+                       overflow_policy: str = "split",
+                       identity_registry: SymbolIdentityRegistry | None = None) -> tuple:
     """Download, decompress, and process one .jsonl.gz file.
 
     Returns (docs_in, docs_out) counts.
@@ -1692,6 +1766,7 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                     dry_run,
                     output_prefix_local,
                     output_prefix_gcs,
+                    identity_registry=identity_registry,
                 )
 
     os.unlink(local_gz)
@@ -1704,6 +1779,8 @@ def _flush_shard(
     dry_run: bool,
     output_prefix_local: str,
     output_prefix_gcs: str,
+    *,
+    identity_registry: SymbolIdentityRegistry | None = None,
 ):
     """Write rows to a parquet file and upload to GCS."""
     shard_idx = counter[0]
@@ -1724,6 +1801,7 @@ def _flush_shard(
             if _TOKENIZED_ENRICHED_TOKENIZER is not None
             else None
         ),
+        identity_registry=identity_registry,
     )
     check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
     pq.write_table(table, local_path, compression="snappy")
@@ -1923,6 +2001,7 @@ def main():
     total_out = 0
     shard_counter = [0]  # mutable counter shared across calls
     output_rows = []
+    identity_registry = SymbolIdentityRegistry()
 
     with tempfile.TemporaryDirectory(prefix=f"clang_{size_label}_") as tmpdir:
         # Local dir for shard staging
@@ -1939,12 +2018,15 @@ def main():
                     tokenizer,
                     max_tokens,
                     args.overflow_policy,
+                    identity_registry,
                 )
                 total_in += docs_in
                 total_out += docs_out
                 log.info("  %s: %d in -> %d out (cumulative: %d in, %d out, %d shards)",
                          gcs_uri.split("/")[-1], docs_in, docs_out,
                          total_in, total_out, shard_counter[0])
+            except SymbolIdentityError:
+                raise
             except Exception as e:
                 log.error("Failed to process %s: %s", gcs_uri, e)
                 continue
@@ -1957,6 +2039,7 @@ def main():
                 args.dry_run,
                 output_prefix_local,
                 args.output_prefix,
+                identity_registry=identity_registry,
             )
             output_rows.clear()
 

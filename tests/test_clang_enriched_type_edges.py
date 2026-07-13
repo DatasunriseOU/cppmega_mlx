@@ -20,6 +20,8 @@ from pathlib import Path
 import pyarrow as pa  # type: ignore[import-not-found]
 import pytest
 
+from cppmega_mlx.data.symbol_identity import compute_symbol_id
+
 # Make the cppmega.mlx ``scripts.nanochat_data`` package importable regardless
 # of pytest's rootdir / pythonpath. When this test is collected together with
 # tests from a *different* repo (e.g. the nanochat indexer tests), pytest picks
@@ -65,7 +67,8 @@ conv = importlib.import_module("scripts.nanochat_data.clang_enriched_to_parquet"
 def _minimal_row(**overrides):
     """A row dict with just enough fields for rows_to_table to build a table."""
     row = {
-        "symbol_identity_schema_version": 2,
+        "symbol_identity_schema_version": 3,
+        "symbol_identities": [],
         "text": "struct B{int x;};\n\nint D::f(){return x;}",
         "source_doc_id": "doc-1",
         "tokenizer_fingerprint": "fp-1",
@@ -127,16 +130,22 @@ def test_type_edges_coerces_non_int_endpoints():
 
 
 def test_semantic_char_columns_propagate():
+    keys = [f"usr:schema=v3\x1fproject=test\x1fusr=c:@F@edge{i}#" for i in range(3)]
+    ids = [compute_symbol_id(key) for key in keys]
     row = _minimal_row(
-        symbol_ids=[10, 10, 0],
-        call_targets=[0, 0, 42],
-        type_refs=[7, 0, 0],
+        symbol_identities=[
+            {"symbol_id": symbol_id, "symbol_key": key}
+            for key, symbol_id in zip(keys, ids, strict=True)
+        ],
+        symbol_ids=[ids[0], ids[0], 0],
+        call_targets=[0, 0, ids[1]],
+        type_refs=[ids[2], 0, 0],
         def_use=[1, 1, 2],
     )
     table = conv.rows_to_table([row])
-    assert table.column("symbol_ids").to_pylist()[0] == [10, 10, 0]
-    assert table.column("call_targets").to_pylist()[0] == [0, 0, 42]
-    assert table.column("type_refs").to_pylist()[0] == [7, 0, 0]
+    assert table.column("symbol_ids").to_pylist()[0] == [ids[0], ids[0], 0]
+    assert table.column("call_targets").to_pylist()[0] == [0, 0, ids[1]]
+    assert table.column("type_refs").to_pylist()[0] == [ids[2], 0, 0]
     assert table.column("def_use").to_pylist()[0] == [1, 1, 2]
     # Confirm the declared schema dtypes are honored.
     assert table.column("symbol_ids").type == conv._SCHEMA.field("symbol_ids").type
@@ -144,7 +153,7 @@ def test_semantic_char_columns_propagate():
     assert table.column("def_use").type == conv._SCHEMA.field("def_use").type
     assert table.schema.metadata[
         conv.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
-    ] == b"2"
+    ] == b"3"
 
 
 def test_converter_rejects_stale_symbol_identity_rows():

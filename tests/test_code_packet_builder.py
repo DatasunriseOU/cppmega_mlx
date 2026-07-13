@@ -160,6 +160,34 @@ def test_build_code_packet_records_absent_columns() -> None:
     assert "token_chunk_starts" in p0.metadata["present_columns"]
 
 
+def test_build_code_packet_preserves_full_width_symbol_ids() -> None:
+    batch = _synthetic_batch()
+    high_id = 0xF123456789ABCDEF
+    table = pa.table(
+        {
+            "token_symbol_ids": pa.array(
+                [[high_id] * SEQ, [high_id - 1] * SEQ],
+                type=pa.list_(pa.uint64()),
+            ),
+            "token_call_targets": pa.array(
+                [[0] * SEQ, [high_id] * SEQ], type=pa.list_(pa.uint64())
+            ),
+            "token_type_refs": pa.array(
+                [[high_id - 2] * SEQ, [0] * SEQ], type=pa.list_(pa.uint64())
+            ),
+            "token_def_use": [[0] * SEQ, [1] * SEQ],
+        }
+    )
+
+    packets = build_code_packets(batch, table)
+
+    assert packets[0].symbol_ids is not None
+    assert packets[0].symbol_ids.dtype == mx.uint64
+    assert np.asarray(packets[0].symbol_ids).tolist() == [high_id] * SEQ
+    assert packets[1].call_targets is not None
+    assert packets[1].call_targets.dtype == mx.uint64
+
+
 def test_build_code_packet_misaligned_semantic_column_raises() -> None:
     batch = _synthetic_batch()
     bad = pa.table(

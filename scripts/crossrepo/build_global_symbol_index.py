@@ -278,7 +278,7 @@ def normalized_body_len(text: str) -> int:
 # --------------------------------------------------------------------------- #
 # SQLite global symbol store.
 # --------------------------------------------------------------------------- #
-GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 2
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -296,6 +296,7 @@ class GlobalSymbolRecord:
     body_len: int
     text: str
     symbol_key: str
+    symbol_id: int | None = None
     usr: str = ""
     canonical_signature: str = ""
     symbol_kind: str = ""
@@ -318,6 +319,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     body_len     INTEGER NOT NULL,
     text         TEXT NOT NULL,
     symbol_key   TEXT NOT NULL,
+    symbol_id    TEXT NOT NULL,
     usr          TEXT NOT NULL,
     canonical_signature TEXT NOT NULL,
     symbol_kind  TEXT NOT NULL,
@@ -326,6 +328,11 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qname);
 CREATE INDEX IF NOT EXISTS idx_symbols_qname_type ON symbols(qname, sym_type);
 CREATE INDEX IF NOT EXISTS idx_symbols_lib   ON symbols(base_lib);
+
+CREATE TABLE IF NOT EXISTS symbol_identities (
+    symbol_id TEXT NOT NULL PRIMARY KEY,
+    symbol_key TEXT NOT NULL UNIQUE
+);
 
 CREATE TABLE IF NOT EXISTS symbol_index_libs (
     lib       TEXT PRIMARY KEY,
@@ -432,6 +439,10 @@ class GlobalSymbolStore:
         if table_exists is None:
             self.conn.executescript(SCHEMA)
         else:
+            registry_was_missing = self.conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='symbol_identities'"
+            ).fetchone() is None
             cols = {
                 row[1]
                 for row in self.conn.execute("PRAGMA table_info(symbols)").fetchall()
@@ -443,6 +454,7 @@ class GlobalSymbolStore:
                 )
             additions = {
                 "symbol_key": "TEXT NOT NULL DEFAULT ''",
+                "symbol_id": "TEXT NOT NULL DEFAULT ''",
                 "usr": "TEXT NOT NULL DEFAULT ''",
                 "canonical_signature": "TEXT NOT NULL DEFAULT ''",
                 "symbol_kind": "TEXT NOT NULL DEFAULT ''",
@@ -458,9 +470,10 @@ class GlobalSymbolStore:
                 "file, line, end_line, is_public, token_est, body_len, text, "
                 "usr, canonical_signature, symbol_kind "
                 "FROM symbols WHERE symbol_key='' OR canonical_signature='' "
-                "OR symbol_kind='' OR identity_schema_version!=?",
+                "OR symbol_kind='' OR symbol_id='' OR identity_schema_version!=?",
                 (ip.SYMBOL_IDENTITY_SCHEMA_VERSION,),
             ).fetchall()
+            migrated_rows: list[tuple[str, str, GlobalSymbolRecord]] = []
             for row in stale_rows:
                 record = self._legacy_record(tuple(row[1:13]))
                 existing_usr = str(row[13] or "")
@@ -485,20 +498,58 @@ class GlobalSymbolStore:
                         canonical_signature=signature,
                         symbol_kind=symbol_kind,
                     )
+                migrated_rows.append((str(row[0]), self._symbol_uid(record), record))
+
+            migrated_uids = [new_uid for _old_uid, new_uid, _record in migrated_rows]
+            if len(set(migrated_uids)) != len(migrated_uids):
+                raise RuntimeError(
+                    f"{self.path}: v3 symbol identity migration produced duplicate "
+                    "global symbol records; rebuild the index"
+                )
+            old_uids = {old_uid for old_uid, _new_uid, _record in migrated_rows}
+            conflicts: list[str] = []
+            for new_uid in migrated_uids:
+                row = self.conn.execute(
+                    "SELECT symbol_uid FROM symbols WHERE symbol_uid=?", (new_uid,)
+                ).fetchone()
+                if row is not None and str(row[0]) not in old_uids:
+                    conflicts.append(str(row[0]))
+                    if len(conflicts) == 8:
+                        break
+            if conflicts:
+                raise RuntimeError(
+                    f"{self.path}: v3 symbol identity migration conflicts with "
+                    f"existing symbol records: {sorted(conflicts)}"
+                )
+
+            for old_uid, _new_uid, _record in migrated_rows:
                 self.conn.execute(
-                    "UPDATE symbols SET symbol_key=?, usr=?, canonical_signature=?, "
-                    "symbol_kind=?, identity_schema_version=? WHERE symbol_uid=?",
+                    "UPDATE symbols SET symbol_uid=? WHERE symbol_uid=?",
+                    (f"migration-v3:{old_uid}", old_uid),
+                )
+            for old_uid, new_uid, record in migrated_rows:
+                symbol_id = ip._compute_symbol_id(record.symbol_key)
+                self.conn.execute(
+                    "UPDATE symbols SET symbol_uid=?, symbol_key=?, symbol_id=?, usr=?, "
+                    "canonical_signature=?, symbol_kind=?, identity_schema_version=? "
+                    "WHERE symbol_uid=?",
                     (
+                        new_uid,
                         record.symbol_key,
+                        self._symbol_id_hex(symbol_id),
                         record.usr,
                         record.canonical_signature,
                         record.symbol_kind,
                         record.identity_schema_version,
-                        row[0],
+                        f"migration-v3:{old_uid}",
                     ),
                 )
             self.conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS symbol_identities (
+                    symbol_id TEXT NOT NULL PRIMARY KEY,
+                    symbol_key TEXT NOT NULL UNIQUE
+                );
                 CREATE TABLE IF NOT EXISTS symbol_index_libs (
                     lib TEXT PRIMARY KEY,
                     tier TEXT NOT NULL,
@@ -513,6 +564,12 @@ class GlobalSymbolStore:
                 );
                 """
             )
+            if (
+                stale_rows
+                or version != GLOBAL_SYMBOL_DB_SCHEMA_VERSION
+                or registry_was_missing
+            ):
+                self._rebuild_symbol_identity_registry()
         self.conn.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key);
@@ -535,6 +592,7 @@ class GlobalSymbolStore:
             )
         required = {
             "symbol_key",
+            "symbol_id",
             "usr",
             "canonical_signature",
             "symbol_kind",
@@ -560,6 +618,122 @@ class GlobalSymbolStore:
                 f"count={incompatible_rows}, expected_version="
                 f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
             )
+        registry_table = self.conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='symbol_identities'"
+        ).fetchone()
+        if registry_table is None:
+            raise RuntimeError(
+                f"{self.path}: global symbol schema has no corpus collision registry"
+            )
+        unregistered_rows = int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM symbols AS s "
+                "LEFT JOIN symbol_identities AS i "
+                "ON i.symbol_id=s.symbol_id AND i.symbol_key=s.symbol_key "
+                "WHERE i.symbol_id IS NULL"
+            ).fetchone()[0]
+        )
+        if unregistered_rows:
+            raise RuntimeError(
+                f"{self.path}: global symbol index has unregistered symbol IDs: "
+                f"count={unregistered_rows}"
+            )
+
+    @staticmethod
+    def _symbol_id_hex(symbol_id: int) -> str:
+        value = int(symbol_id)
+        if not 0 < value <= ip.SYMBOL_ID_MAX:
+            raise RuntimeError(f"symbol_id is outside unsigned 64-bit range: {value}")
+        return f"{value:016x}"
+
+    def _rebuild_symbol_identity_registry(self) -> None:
+        self.conn.execute("DELETE FROM symbol_identities")
+        rows = self.conn.execute(
+            "SELECT symbol_uid, symbol_key, symbol_id FROM symbols "
+            "ORDER BY symbol_uid"
+        )
+        for symbol_uid, symbol_key, symbol_id_hex in rows:
+            expected_id = ip._compute_symbol_id(str(symbol_key))
+            expected_hex = self._symbol_id_hex(expected_id)
+            if str(symbol_id_hex) != expected_hex:
+                raise RuntimeError(
+                    f"{self.path}: symbol {symbol_uid} has ID {symbol_id_hex!r}, "
+                    f"expected {expected_hex} for {symbol_key!r}"
+                )
+            existing = self.conn.execute(
+                "SELECT symbol_key FROM symbol_identities WHERE symbol_id=?",
+                (expected_hex,),
+            ).fetchone()
+            if existing is not None and str(existing[0]) != str(symbol_key):
+                raise RuntimeError(
+                    "canonical symbol ID collision while rebuilding global index: "
+                    f"id={expected_id} first={existing[0]!r} second={symbol_key!r}"
+                )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO symbol_identities(symbol_id, symbol_key) "
+                "VALUES (?, ?)",
+                (expected_hex, str(symbol_key)),
+            )
+
+    def _validate_symbol_identity_claims(
+        self, records: Sequence[GlobalSymbolRecord]
+    ) -> list[int]:
+        staged_by_id: dict[str, str] = {}
+        staged_by_key: dict[str, str] = {}
+        symbol_ids: list[int] = []
+        for record in records:
+            claimed_id = (
+                ip._compute_symbol_id(record.symbol_key)
+                if record.symbol_id is None
+                else int(record.symbol_id)
+            )
+            claimed_hex = self._symbol_id_hex(claimed_id)
+            source = f"{record.base_repo}:{record.file}:{record.line}"
+
+            existing_key = staged_by_id.get(claimed_hex)
+            if existing_key is None:
+                row = self.conn.execute(
+                    "SELECT symbol_key FROM symbol_identities WHERE symbol_id=?",
+                    (claimed_hex,),
+                ).fetchone()
+                existing_key = None if row is None else str(row[0])
+            if existing_key is not None and existing_key != record.symbol_key:
+                raise RuntimeError(
+                    "canonical symbol ID collision in global index: "
+                    f"id={claimed_id} first={existing_key!r} "
+                    f"second={record.symbol_key!r} ({source})"
+                )
+
+            existing_id = staged_by_key.get(record.symbol_key)
+            if existing_id is None:
+                row = self.conn.execute(
+                    "SELECT symbol_id FROM symbol_identities WHERE symbol_key=?",
+                    (record.symbol_key,),
+                ).fetchone()
+                existing_id = None if row is None else str(row[0])
+            if existing_id is not None and existing_id != claimed_hex:
+                raise RuntimeError(
+                    f"{source}: canonical key {record.symbol_key!r} is already "
+                    f"registered as ID {int(existing_id, 16)}, not {claimed_id}"
+                )
+
+            expected_id = ip._compute_symbol_id(record.symbol_key)
+            if claimed_id != expected_id:
+                raise RuntimeError(
+                    f"{source}: symbol_id {claimed_id} does not match v"
+                    f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION} ID {expected_id} for "
+                    f"{record.symbol_key!r}"
+                )
+            if record.identity_schema_version != ip.SYMBOL_IDENTITY_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"{source}: symbol identity schema v{record.identity_schema_version} "
+                    f"is incompatible with v{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
+                )
+            staged_by_id[claimed_hex] = record.symbol_key
+            staged_by_key[record.symbol_key] = claimed_hex
+            symbol_ids.append(claimed_id)
+        return symbol_ids
 
     @staticmethod
     def _symbol_uid(record: GlobalSymbolRecord) -> str:
@@ -592,6 +766,14 @@ class GlobalSymbolStore:
             row if isinstance(row, GlobalSymbolRecord) else self._legacy_record(row)
             for row in rows
         ]
+        symbol_ids = self._validate_symbol_identity_claims(records)
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO symbol_identities(symbol_id, symbol_key) VALUES (?, ?)",
+            [
+                (self._symbol_id_hex(symbol_id), record.symbol_key)
+                for record, symbol_id in zip(records, symbol_ids, strict=True)
+            ],
+        )
         keyed_rows = [
             (
                 self._symbol_uid(record),
@@ -608,19 +790,20 @@ class GlobalSymbolStore:
                 record.body_len,
                 record.text,
                 record.symbol_key,
+                self._symbol_id_hex(symbol_id),
                 record.usr,
                 record.canonical_signature,
                 record.symbol_kind,
                 record.identity_schema_version,
             )
-            for record in records
+            for record, symbol_id in zip(records, symbol_ids, strict=True)
         ]
         self.conn.executemany(
             "INSERT OR IGNORE INTO symbols "
             "(symbol_uid, qname, base_lib, base_repo, kind, sym_type, file, line, end_line, "
-            " is_public, token_est, body_len, text, symbol_key, usr, canonical_signature, "
+            " is_public, token_est, body_len, text, symbol_key, symbol_id, usr, canonical_signature, "
             " symbol_kind, identity_schema_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             keyed_rows,
         )
 
@@ -647,7 +830,7 @@ class GlobalSymbolStore:
     def lookup_candidates(self, qname: str) -> list[dict[str, object]]:
         qname = normalize_inline_namespace_qname(qname)
         rows = self.conn.execute(
-            "SELECT symbol_uid, symbol_key, qname, base_lib, base_repo, kind, "
+            "SELECT symbol_uid, symbol_key, symbol_id, qname, base_lib, base_repo, kind, "
             "sym_type, file, line, end_line, is_public, token_est, body_len, text, "
             "usr, canonical_signature, symbol_kind, identity_schema_version "
             "FROM symbols WHERE qname=? AND sym_type='func' "
@@ -655,12 +838,15 @@ class GlobalSymbolStore:
             (qname,),
         ).fetchall()
         fields = (
-            "symbol_uid", "symbol_key", "qname", "base_lib", "base_repo", "kind",
+            "symbol_uid", "symbol_key", "symbol_id", "qname", "base_lib", "base_repo", "kind",
             "sym_type", "file", "line", "end_line", "is_public", "token_est",
             "body_len", "text", "usr", "canonical_signature", "symbol_kind",
             "identity_schema_version",
         )
-        return [dict(zip(fields, row, strict=True)) for row in rows]
+        records = [dict(zip(fields, row, strict=True)) for row in rows]
+        for record in records:
+            record["symbol_id"] = int(str(record["symbol_id"]), 16)
+        return records
 
     def lookup(
         self,

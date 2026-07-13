@@ -145,12 +145,34 @@ def test_clang_enriched_parquet_schema_preserves_token_semantic_columns() -> Non
     }
 
     assert required <= set(clang_enriched_to_parquet._SCHEMA.names)
+    assert clang_enriched_to_parquet.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION == 3
+    assert "symbol_identities" in clang_enriched_to_parquet._SCHEMA.names
+    for column in (
+        "symbol_ids",
+        "call_targets",
+        "type_refs",
+        schema.TOKEN_SYMBOL_IDS_COLUMN,
+        schema.TOKEN_CALL_TARGETS_COLUMN,
+        schema.TOKEN_TYPE_REFS_COLUMN,
+    ):
+        assert clang_enriched_to_parquet._SCHEMA.field(column).type.value_type == pa.uint64()
+    boundary_type = clang_enriched_to_parquet._SCHEMA.field(
+        "chunk_boundaries"
+    ).type.value_type
+    assert boundary_type.field("symbol_id").type == pa.uint64()
 
 
 def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
+    keys = [f"usr:schema=v3\x1fproject=test\x1fusr=c:@F@symbol{i}#" for i in range(3)]
+    symbol_id, call_id, type_id = [index_project._compute_symbol_id(key) for key in keys]
+    identities = [
+        {"symbol_id": value, "symbol_key": key}
+        for key, value in zip(keys, (symbol_id, call_id, type_id), strict=True)
+    ]
     rows = [
         {
-            "symbol_identity_schema_version": 2,
+            "symbol_identity_schema_version": 3,
+            "symbol_identities": identities,
             "text": "int main() { return f(); }",
             "source_doc_id": "demo.cc@main",
             schema.DOC_TYPE_COLUMN: "code_header",
@@ -163,18 +185,18 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
             "ast_depth": [0, 1, 2, 1],
             "sibling_index": [0, 0, 1, 2],
             "ast_node_type": [1, 2, 3, 4],
-            "symbol_ids": [0, 11, 11, 0],
-            "call_targets": [0, 22, 0, 0],
-            "type_refs": [0, 0, 33, 0],
+            "symbol_ids": [0, symbol_id, symbol_id, 0],
+            "call_targets": [0, call_id, 0, 0],
+            "type_refs": [0, 0, type_id, 0],
             "def_use": [0, 1, 2, 0],
         }
     ]
     tokenized_rows = [
         {
             schema.TOKEN_IDS_COLUMN: [1, 2, 3, 4],
-            schema.TOKEN_SYMBOL_IDS_COLUMN: [0, 11, 11, 0],
-            schema.TOKEN_CALL_TARGETS_COLUMN: [0, 22, 0, 0],
-            schema.TOKEN_TYPE_REFS_COLUMN: [0, 0, 33, 0],
+            schema.TOKEN_SYMBOL_IDS_COLUMN: [0, symbol_id, symbol_id, 0],
+            schema.TOKEN_CALL_TARGETS_COLUMN: [0, call_id, 0, 0],
+            schema.TOKEN_TYPE_REFS_COLUMN: [0, 0, type_id, 0],
             schema.TOKEN_DEF_USE_COLUMN: [0, 1, 2, 0],
         }
     ]
@@ -216,7 +238,8 @@ def test_local_convert_backfills_static_code_repo_provenance(
     input_path.write_text(
         json.dumps(
             {
-                "symbol_identity_schema_version": 2,
+                "symbol_identity_schema_version": 3,
+                "symbol_identities": [],
                 "text": "int add(int a, int b) { return a + b; }",
                 "filepath": "include/math.hpp",
                 "structure_ids": [3] * 40,
@@ -420,7 +443,8 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     output_path = tmp_path / "out.parquet"
     records = [
         {
-            "symbol_identity_schema_version": 2,
+            "symbol_identity_schema_version": 3,
+            "symbol_identities": [],
             "text": "int one() { return 1; }",
             "structure_ids": [3] * len("int one() { return 1; }"),
             "chunk_boundaries": [
@@ -430,7 +454,8 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
             "type_edges": [],
         },
         {
-            "symbol_identity_schema_version": 2,
+            "symbol_identity_schema_version": 3,
+            "symbol_identities": [],
             "text": "int two() { return 2; }",
             "structure_ids": [3] * len("int two() { return 2; }"),
             "chunk_boundaries": [
@@ -495,7 +520,8 @@ def test_tokenizer_fingerprint_and_ids_stable_across_independent_shards(
             "\n".join(
                 json.dumps(
                     {
-                        "symbol_identity_schema_version": 2,
+                        "symbol_identity_schema_version": 3,
+                        "symbol_identities": [],
                         "text": text,
                         "structure_ids": [3] * len(text),
                         "chunk_boundaries": [

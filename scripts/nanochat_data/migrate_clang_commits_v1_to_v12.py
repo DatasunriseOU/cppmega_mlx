@@ -84,6 +84,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_DEF_USE_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
 )
+from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,9 +149,13 @@ V12_SCHEMA = pa.schema([
     pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
     # Semantic token columns (v12 additions)
-    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(SYMBOL_IDENTITIES_COLUMN, pa.list_(pa.struct([
+        pa.field("symbol_id", pa.uint64()),
+        pa.field("symbol_key", pa.string()),
+    ]))),
     pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
     # Temporal token columns
     pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),

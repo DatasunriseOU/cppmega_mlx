@@ -39,6 +39,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_TYPE_EDGES_COLUMN,
 )
 from scripts.nanochat_data import pack_enriched_rows as packer
+from tools.clang_indexer import index_project as symbol_identity
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
@@ -117,7 +118,47 @@ def _normalize(records: list[dict[str, object]]):
 
 
 def _write_input_parquet(path: Path, records: list[dict[str, object]]) -> None:
-    table = pa.Table.from_pylist(records).replace_schema_metadata({
+    symbol_columns = (
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+    )
+    special_columns = {*symbol_columns, "token_def_use", "symbol_identities"}
+    table = pa.Table.from_pylist(
+        [
+            {key: value for key, value in record.items() if key not in special_columns}
+            for record in records
+        ]
+    )
+    for column in symbol_columns:
+        table = table.append_column(
+            column,
+            pa.array(
+                [record.get(column, []) for record in records],
+                type=pa.list_(pa.uint64()),
+            ),
+        )
+    table = table.append_column(
+        "token_def_use",
+        pa.array(
+            [record.get("token_def_use", []) for record in records],
+            type=pa.list_(pa.uint8()),
+        ),
+    )
+    table = table.append_column(
+        "symbol_identities",
+        pa.array(
+            [record.get("symbol_identities", []) for record in records],
+            type=pa.list_(
+                pa.struct(
+                    [
+                        pa.field("symbol_id", pa.uint64()),
+                        pa.field("symbol_key", pa.string()),
+                    ]
+                )
+            ),
+        ),
+    ).replace_schema_metadata({
         packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
             packer.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
         ).encode("ascii")
@@ -586,7 +627,72 @@ def test_pack_parquet_dataset_marks_macro_route_schema_version(tmp_path: Path) -
     assert metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] == (
         PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
     )
-    assert metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] == b"2"
+    assert metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] == b"3"
+
+
+def test_packer_rejects_cross_project_symbol_id_collision_across_shards(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    first_key = symbol_identity.canonical_symbol_identity(
+        qname="left::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo-a",
+        file="route.cpp",
+    )
+    second_key = symbol_identity.canonical_symbol_identity(
+        qname="right::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo-b",
+        file="route.cpp",
+    )
+    claimed_id = symbol_identity._compute_symbol_id(first_key)
+    identity_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("symbol_id", pa.uint64()),
+                pa.field("symbol_key", pa.string()),
+            ]
+        )
+    )
+    shard_schema = pa.schema(
+        [
+            pa.field(TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+            pa.field("token_symbol_ids", pa.list_(pa.uint64())),
+            pa.field("token_call_targets", pa.list_(pa.uint64())),
+            pa.field("token_type_refs", pa.list_(pa.uint64())),
+            pa.field("token_def_use", pa.list_(pa.uint8())),
+            pa.field("symbol_identities", identity_type),
+        ],
+        metadata={
+            packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): b"3"
+        },
+    )
+    for shard_index, key in enumerate((first_key, second_key)):
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        TOKEN_IDS_COLUMN: [1],
+                        "token_symbol_ids": [claimed_id],
+                        "token_call_targets": [0],
+                        "token_type_refs": [0],
+                        "token_def_use": [0],
+                        "symbol_identities": [
+                            {"symbol_id": claimed_id, "symbol_key": key}
+                        ],
+                    }
+                ],
+                schema=shard_schema,
+            ),
+            input_dir / f"shard_{shard_index:05d}.parquet",
+        )
+
+    with pytest.raises(RuntimeError, match="symbol ID collision"):
+        packer._require_symbol_identity_schema(input_dir)
 
 
 def test_pack_parquet_dataset_rejects_stale_symbol_identity_schema(tmp_path: Path) -> None:

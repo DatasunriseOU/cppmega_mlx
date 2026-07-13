@@ -105,6 +105,12 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_TYPE_REFS_COLUMN,
 )
 from cppmega_mlx.data.packing import PackingStrategy
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityRegistry,
+)
 
 TRAINED_TOKEN_COUNT_COLUMN = "trained_token_count"
 SLACK_TOKENS_COLUMN = "slack_tokens"
@@ -118,8 +124,7 @@ SOURCE_DOC_ID_COLUMN = "source_doc_id"
 DOC_DEP_EDGES_COLUMN = "doc_dep_edges"
 PACKED_ROW_MACRO_ROUTES_METADATA_KEY = "cppmega.macro_routes_version"
 PACKED_ROW_MACRO_ROUTES_VERSION = "full_macro_concept_routes_v1"
-SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
-REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = 2
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
 _STATIC_DOC_TYPES = {"code", "code_header", "build"}
@@ -229,6 +234,10 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_DOC_TYPES_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, pa.list_(pa.string())),
         pa.field(ROW_PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
+        pa.field(SYMBOL_IDENTITIES_COLUMN, pa.list_(pa.struct([
+            pa.field("symbol_id", pa.uint64()),
+            pa.field("symbol_key", pa.string()),
+        ]))),
         pa.field(REPO_COLUMN, pa.string()),
         pa.field(FILEPATH_COLUMN, pa.string()),
         pa.field(COMMIT_HASH_COLUMN, pa.string()),
@@ -259,9 +268,9 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
-        pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-        pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-        pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+        pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+        pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
         pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
@@ -316,6 +325,7 @@ class NormalizedDoc:
     changed_chunk_ids: list[int]
     changed_chunk_spans: list[tuple[int, int]]
     chronology: dict[str, Any]
+    symbol_identities: list[dict[str, object]] = field(default_factory=list)
     # Explicit doc-level dependency edges: source_doc_index values this document
     # depends on (a dependency must be packed BEFORE this document in the row).
     # Empty when only dep_level ordering applies.
@@ -377,6 +387,7 @@ class NormalizedDoc:
                 {"start": int(start), "end": int(end)}
                 for start, end in self.changed_chunk_spans
             ],
+            SYMBOL_IDENTITIES_COLUMN: [dict(item) for item in self.symbol_identities],
         }
         record.update(self.chronology)
         for column, values in self.token_meta.items():
@@ -868,6 +879,7 @@ def normalize_document_record(
     *,
     source_doc_index: int,
     stable_doc_id: int | None = None,
+    identity_registry: SymbolIdentityRegistry | None = None,
 ) -> NormalizedDoc:
     """Validate and normalize one input parquet record."""
 
@@ -882,6 +894,30 @@ def normalize_document_record(
         token_count=len(token_ids),
         source_doc_index=source_doc_index,
     )
+    row_registry = SymbolIdentityRegistry()
+    normalized_identities = row_registry.register_records(
+        record.get(SYMBOL_IDENTITIES_COLUMN, []),
+        source=f"source_doc_index={source_doc_index}",
+    )
+    used_symbol_ids = {
+        int(value)
+        for column in (
+            TOKEN_SYMBOL_IDS_COLUMN,
+            TOKEN_CALL_TARGETS_COLUMN,
+            TOKEN_TYPE_REFS_COLUMN,
+        )
+        for value in token_meta[column]
+        if int(value) != 0
+    }
+    row_registry.require_ids(
+        used_symbol_ids,
+        source=f"source_doc_index={source_doc_index}",
+    )
+    if identity_registry is not None:
+        identity_registry.register_records(
+            normalized_identities,
+            source=f"source_doc_index={source_doc_index}",
+        )
     (
         chunk_starts,
         chunk_ends,
@@ -928,6 +964,7 @@ def normalize_document_record(
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
         chronology=_normalize_chronology(record),
+        symbol_identities=row_registry.records(used_symbol_ids),
         doc_dep_edges=tuple(
             int(dep) for dep in (record.get(DOC_DEP_EDGES_COLUMN) or [])
         ),
@@ -950,8 +987,19 @@ def _list_input_files(input_path: str | os.PathLike[str]) -> list[Path]:
 
 def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
     key = SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    corpus_registry = SymbolIdentityRegistry()
+    identity_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("symbol_id", pa.uint64()),
+                pa.field("symbol_key", pa.string()),
+            ]
+        )
+    )
     for path in _list_input_files(input_path):
-        metadata = pq.ParquetFile(path).schema_arrow.metadata or {}
+        parquet_file = pq.ParquetFile(path)
+        schema = parquet_file.schema_arrow
+        metadata = schema.metadata or {}
         raw_version = metadata.get(key)
         try:
             version = int(raw_version) if raw_version is not None else None
@@ -963,6 +1011,35 @@ def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
                 "regenerate tokenized parquet with clang USR/signature identities "
                 f"before packing (required v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION})"
             )
+        if SYMBOL_IDENTITIES_COLUMN not in schema.names:
+            raise RuntimeError(
+                f"{path}: missing {SYMBOL_IDENTITIES_COLUMN!r} collision registry"
+            )
+        if schema.field(SYMBOL_IDENTITIES_COLUMN).type != identity_type:
+            raise RuntimeError(
+                f"{path}: {SYMBOL_IDENTITIES_COLUMN} must be {identity_type}, got "
+                f"{schema.field(SYMBOL_IDENTITIES_COLUMN).type}"
+            )
+        for column in (
+            TOKEN_SYMBOL_IDS_COLUMN,
+            TOKEN_CALL_TARGETS_COLUMN,
+            TOKEN_TYPE_REFS_COLUMN,
+        ):
+            if column in schema.names and schema.field(column).type.value_type != pa.uint64():
+                raise RuntimeError(
+                    f"{path}: {column} must use uint64 symbol IDs, got "
+                    f"{schema.field(column).type}"
+                )
+        row_offset = 0
+        for batch in parquet_file.iter_batches(columns=[SYMBOL_IDENTITIES_COLUMN]):
+            for local_index, records in enumerate(
+                batch.column(0).to_pylist()
+            ):
+                corpus_registry.register_records(
+                    records,
+                    source=f"{path}:row={row_offset + local_index}",
+                )
+            row_offset += batch.num_rows
 
 
 def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
@@ -1037,6 +1114,7 @@ def _selected_input_columns(available: set[str]) -> list[str]:
         column
         for column in (
             TOKEN_IDS_COLUMN,
+            SYMBOL_IDENTITIES_COLUMN,
             SOURCE_DOC_ID_COLUMN,
             "source_document_id",
             "document_id",
@@ -1067,6 +1145,7 @@ def iter_tokenized_documents(
     source_doc_index = int(start_source_doc_index)
     if signature_to_id is None:
         signature_to_id = {}
+    identity_registry = SymbolIdentityRegistry()
     for path in _list_input_files(input_path):
         parquet_file = pq.ParquetFile(path)
         available = set(parquet_file.schema_arrow.names)
@@ -1087,6 +1166,7 @@ def iter_tokenized_documents(
                         source_doc_index=source_doc_index,
                         signature_to_id=signature_to_id,
                     ),
+                    identity_registry=identity_registry,
                 )
                 yield doc
                 source_doc_index += 1
@@ -1274,6 +1354,7 @@ def _materialize_packed_row(
     source_doc_types: list[str | None] = []
     source_header_fragment_kinds: list[str | None] = []
     chronology = _shared_chronology_for_docs(ordered_docs)
+    symbol_identity_registry = SymbolIdentityRegistry()
 
     token_meta_acc: dict[str, list[int]] = {
         column: [] for column in PACKED_TOKEN_METADATA_COLUMNS
@@ -1300,6 +1381,10 @@ def _materialize_packed_row(
     # same header).  ``stable_doc_id`` remains provenance metadata; using it here
     # collapsed those functions into one segment and trained across the boundary.
     for row_doc_id, doc in enumerate(ordered_docs, start=1):
+        symbol_identity_registry.register_records(
+            doc.symbol_identities,
+            source=f"packed row {pack_id}:source_doc_index={doc.source_doc_index}",
+        )
         concatenated_tokens.extend(doc.token_ids)
         doc_ids.extend([row_doc_id] * doc.token_count)
         source_doc_indices.append(doc.source_doc_index)
@@ -1402,6 +1487,20 @@ def _materialize_packed_row(
     )
     slack_tokens = row_length - valid_token_count
     pad_doc_id = max(len(ordered_docs), max(doc_ids, default=0)) if doc_ids else 0
+    used_symbol_ids = {
+        int(value)
+        for column in (
+            TOKEN_SYMBOL_IDS_COLUMN,
+            TOKEN_CALL_TARGETS_COLUMN,
+            TOKEN_TYPE_REFS_COLUMN,
+        )
+        for value in token_meta_acc[column]
+        if int(value) != 0
+    }
+    symbol_identity_registry.require_ids(
+        used_symbol_ids,
+        source=f"packed row {pack_id}",
+    )
 
     row: dict[str, Any] = {
         PACK_ID_COLUMN: int(pack_id),
@@ -1433,6 +1532,7 @@ def _materialize_packed_row(
         SOURCE_DOC_TYPES_COLUMN: source_doc_types,
         SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: source_header_fragment_kinds,
         ROW_PLATFORM_IDS_COLUMN: _merged_platform_ids_for_docs(ordered_docs),
+        SYMBOL_IDENTITIES_COLUMN: symbol_identity_registry.records(used_symbol_ids),
         HAS_PR_DISCUSSION_COLUMN: any(source_has_pr_discussions),
         PR_DISCUSSION_CHARS_COLUMN: sum(source_pr_discussion_chars),
         PR_DISCUSSION_LINES_COLUMN: sum(source_pr_discussion_lines),
@@ -1562,6 +1662,13 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                     for item in row.get(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, [])
                 ],
                 ROW_PLATFORM_IDS_COLUMN: _as_int_list(row.get(ROW_PLATFORM_IDS_COLUMN)),
+                SYMBOL_IDENTITIES_COLUMN: [
+                    {
+                        "symbol_id": int(item["symbol_id"]),
+                        "symbol_key": str(item["symbol_key"]),
+                    }
+                    for item in row.get(SYMBOL_IDENTITIES_COLUMN, [])
+                ],
                 REPO_COLUMN: row.get(REPO_COLUMN),
                 FILEPATH_COLUMN: row.get(FILEPATH_COLUMN),
                 COMMIT_HASH_COLUMN: row.get(COMMIT_HASH_COLUMN),

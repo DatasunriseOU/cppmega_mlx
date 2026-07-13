@@ -1152,6 +1152,9 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
     docs = [np.arange(8, dtype=np.int32)]
     _write_mmididx(prefix, docs, dtype=np.int32)
     flat = np.concatenate(docs)
+    symbol_values = np.arange(8, dtype=np.uint64) + np.uint64((1 << 63) + 100)
+    call_values = np.arange(8, dtype=np.uint64) + np.uint64((1 << 63) + 200)
+    type_values = np.arange(8, dtype=np.uint64) + np.uint64((1 << 63) + 300)
     sidecar_specs = {
         "token_structure_ids": ((flat % 7).astype(np.uint8), "uint8"),
         "token_dep_levels": ((flat % 3).astype(np.uint16), "uint16"),
@@ -1159,9 +1162,9 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
         "token_sibling_index": ((flat % 4).astype(np.uint16), "uint16"),
         "token_ast_node_type": ((flat % 11).astype(np.uint16), "uint16"),
         "token_platform_ids": ((flat % 13).astype(np.uint16), "uint16"),
-        "token_symbol_ids": ((flat + 100).astype(np.uint32), "uint32"),
-        "token_call_targets": ((flat + 200).astype(np.uint32), "uint32"),
-        "token_type_refs": ((flat + 300).astype(np.uint32), "uint32"),
+        "token_symbol_ids": (symbol_values, "uint64"),
+        "token_call_targets": (call_values, "uint64"),
+        "token_type_refs": (type_values, "uint64"),
         "token_def_use": ((flat % 2).astype(np.uint8), "uint8"),
         "token_change_mask_pre": ((flat == 2).astype(np.uint8), "uint8"),
         "token_change_mask_post": ((flat == 3).astype(np.uint8), "uint8"),
@@ -1172,7 +1175,12 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
         values.tofile(path)
         side_channel_paths[name] = {"path": path.name, "dtype": dtype}
     prefix.with_suffix(".idx.json").write_text(
-        json.dumps({"side_channel_paths": side_channel_paths}),
+        json.dumps(
+            {
+                "symbol_identity_schema_version": 3,
+                "side_channel_paths": side_channel_paths,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1184,15 +1192,15 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
     temporal = batch.side_channel_map()["temporal_diff"]
     np.testing.assert_array_equal(
         np.array(semantic["symbol_ids"]),
-        np.array(batch.tokens) + 100,
+        symbol_values.reshape(2, 4),
     )
     np.testing.assert_array_equal(
         np.array(semantic["call_targets"]),
-        np.array(batch.tokens) + 200,
+        call_values.reshape(2, 4),
     )
     np.testing.assert_array_equal(
         np.array(semantic["type_refs"]),
-        np.array(batch.tokens) + 300,
+        type_values.reshape(2, 4),
     )
     np.testing.assert_array_equal(
         np.array(semantic["def_use"]),

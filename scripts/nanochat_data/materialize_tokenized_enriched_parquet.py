@@ -20,6 +20,22 @@ import pyarrow.parquet as pq  # type: ignore[import-not-found]
 from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import materialize_tokenized_enriched_batch
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import TOKENIZED_ENRICHED_COLUMNS
+from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    TOKEN_CALL_TARGETS_COLUMN,
+    TOKEN_SYMBOL_IDS_COLUMN,
+    TOKEN_TYPE_REFS_COLUMN,
+)
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityRegistry,
+)
+
+
+_SYMBOL_ID_TOKEN_COLUMNS = frozenset(
+    (TOKEN_SYMBOL_IDS_COLUMN, TOKEN_CALL_TARGETS_COLUMN, TOKEN_TYPE_REFS_COLUMN)
+)
 
 
 def _decode_json_like(value):
@@ -77,9 +93,57 @@ def _merge_table_with_tokenized(
     base_columns = {name: table.column(name) for name in table.column_names}
     for column_name in TOKENIZED_ENRICHED_COLUMNS:
         base_columns[column_name] = pa.array(
-            [row.get(column_name, []) for row in tokenized_rows]
+            [row.get(column_name, []) for row in tokenized_rows],
+            type=(pa.list_(pa.uint64()) if column_name in _SYMBOL_ID_TOKEN_COLUMNS else None),
         )
     return pa.table(base_columns).replace_schema_metadata(table.schema.metadata)
+
+
+def _validate_symbol_identity_table(
+    table: pa.Table,
+    *,
+    source: Path,
+    corpus_registry: SymbolIdentityRegistry,
+) -> None:
+    raw_version = (table.schema.metadata or {}).get(
+        SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    )
+    if raw_version != str(SYMBOL_IDENTITY_SCHEMA_VERSION).encode("ascii"):
+        raise RuntimeError(
+            f"{source}: symbol identity schema must be v"
+            f"{SYMBOL_IDENTITY_SCHEMA_VERSION}, got {raw_version!r}"
+        )
+    if SYMBOL_IDENTITIES_COLUMN not in table.column_names:
+        raise RuntimeError(f"{source}: missing {SYMBOL_IDENTITIES_COLUMN!r}")
+    for column in ("symbol_ids", "call_targets", "type_refs"):
+        if column in table.column_names and table.schema.field(column).type.value_type != pa.uint64():
+            raise RuntimeError(
+                f"{source}: {column} must use uint64 symbol IDs, got "
+                f"{table.schema.field(column).type}"
+            )
+    identity_rows = table.column(SYMBOL_IDENTITIES_COLUMN).to_pylist()
+    semantic_rows = {
+        column: table.column(column).to_pylist()
+        for column in ("symbol_ids", "call_targets", "type_refs")
+        if column in table.column_names
+    }
+    for row_index, records in enumerate(identity_rows):
+        row_registry = SymbolIdentityRegistry()
+        normalized = row_registry.register_records(
+            records,
+            source=f"{source}:row={row_index}",
+        )
+        corpus_registry.register_records(
+            normalized,
+            source=f"{source}:row={row_index}",
+        )
+        used_ids = {
+            int(value)
+            for rows in semantic_rows.values()
+            for value in rows[row_index]
+            if int(value) != 0
+        }
+        row_registry.require_ids(used_ids, source=f"{source}:row={row_index}")
 
 
 def _copy_metadata_files(input_dir: str, output_dir: str) -> None:
@@ -123,11 +187,17 @@ def main() -> None:
     if not tokenizer_path:
         raise ValueError("--tokenizer-path is required for parquet materialization")
     tokenizer = load_cppmega_tokenizer(tokenizer_path)
+    identity_registry = SymbolIdentityRegistry()
 
     for idx, src_path in enumerate(parquet_files, 1):
         dst_path = Path(args.output_dir) / src_path.name
         print(f"[{idx}/{len(parquet_files)}] {src_path.name}")
         table = pq.read_table(src_path)
+        _validate_symbol_identity_table(
+            table,
+            source=src_path,
+            corpus_registry=identity_registry,
+        )
         docs = _table_to_docs(table)
         tokenized_rows = materialize_tokenized_enriched_batch(docs, tokenizer)
         merged = _merge_table_with_tokenized(table, tokenized_rows)

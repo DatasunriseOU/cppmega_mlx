@@ -44,7 +44,7 @@ sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -55,6 +55,13 @@ from cppmega_mlx.data.nanochat_pipeline.build_context import (
     detect_build_context,
     find_compile_commands_file,
     load_compile_commands_file,
+)
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SYMBOL_ID_MAX,
+    SymbolIdentityRegistry,
+    compute_symbol_id,
 )
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 
@@ -409,6 +416,76 @@ def _part_symbol_key(part: tuple) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _document_symbol_identities(
+    parts_info: Sequence[tuple],
+    index: "ProjectIndex",
+    *symbol_id_sequences: Iterable[int],
+    source: str,
+) -> list[dict[str, object]]:
+    """Return complete, collision-checked ID/key claims used by one document."""
+
+    registry = SymbolIdentityRegistry()
+    for part_index, part in enumerate(parts_info):
+        metadata = _part_symbol_metadata(part)
+        if metadata is None:
+            continue
+        symbol_key = metadata.get("symbol_key")
+        symbol_id = metadata.get("symbol_id")
+        if not isinstance(symbol_key, str) or symbol_id is None:
+            raise RuntimeError(
+                f"{source}: part {part_index} has incomplete canonical symbol metadata"
+            )
+        registry.register(
+            symbol_key,
+            symbol_id=int(symbol_id),
+            source=f"{source}:part[{part_index}]",
+        )
+
+    used_ids = {
+        int(symbol_id)
+        for sequence in symbol_id_sequences
+        for symbol_id in sequence
+        if int(symbol_id) != 0
+    }
+    for symbol_id in sorted(used_ids):
+        if symbol_id in registry.keys_by_id:
+            continue
+        symbol_key = index.symbol_id_keys.get(symbol_id)
+        if symbol_key is None:
+            raise RuntimeError(
+                f"{source}: semantic symbol ID {symbol_id} has no canonical identity key"
+            )
+        registry.register(
+            symbol_key,
+            symbol_id=symbol_id,
+            source=f"{source}:ProjectIndex",
+        )
+    registry.require_ids(used_ids, source=source)
+    return registry.records(used_ids)
+
+
+def _semantic_identity_records_for_arrays(
+    semantic_metadata: dict[str, object],
+    *semantic_arrays: Iterable[int],
+    source: str,
+) -> list[dict[str, object]]:
+    """Select the canonical claims needed by sliced semantic arrays."""
+
+    registry = SymbolIdentityRegistry()
+    registry.register_records(
+        semantic_metadata.get(SYMBOL_IDENTITIES_COLUMN, []),
+        source=source,
+    )
+    used_ids = {
+        int(symbol_id)
+        for values in semantic_arrays
+        for symbol_id in values
+        if int(symbol_id) != 0
+    }
+    registry.require_ids(used_ids, source=source)
+    return registry.records(used_ids)
+
+
 # C++ source file extensions
 CPP_EXTENSIONS = {'.cpp', '.cc', '.cxx', '.c', '.c++', '.cp'}
 HEADER_EXTENSIONS = {
@@ -538,7 +615,6 @@ SYSTEM_PREFIXES = (
 # the A1 selection and would only add noise; only the namespaced base libs.
 CROSSLINKABLE_NS_PREFIXES = ('std::', 'boost::')
 _STD_INLINE_NAMESPACE_SEGMENTS = frozenset({'__1', '__2', '__3', '__cxx11'})
-SYMBOL_IDENTITY_SCHEMA_VERSION = 2
 
 
 def normalize_inline_namespace_qname(qname: str) -> str:
@@ -561,6 +637,14 @@ def _normalize_signature_text(value: str | None) -> str:
     if not value:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def normalize_qualified_name(qname: str) -> str:
+    """Return the stable qualified-name spelling used by fallback identity."""
+
+    normalized = _normalize_signature_text(qname)
+    normalized = re.sub(r"\s*::\s*", "::", normalized)
+    return normalize_inline_namespace_qname(normalized)
 
 
 def _cursor_kind_name(cursor: Cursor) -> str:
@@ -647,15 +731,16 @@ def canonical_symbol_identity(
 ) -> str:
     """Canonical symbol identity.
 
-    qname is retained as display/search text only. Stable clang USR wins when
-    present and is namespaced by the owning project so independent repositories
-    cannot alias. Otherwise the fallback includes kind, canonical signature,
-    and scoped provenance so overloads, templates, file-static/local symbols,
-    and same-qname definitions in different files do not collapse.
+    Stable clang USR wins when present and is namespaced by the owning project so
+    independent repositories cannot alias. Otherwise the fallback includes the
+    normalized qualified name, kind, canonical signature, and scoped provenance
+    so namespaces, overloads, templates, file-static/local symbols, and
+    same-qname definitions in different files do not collapse.
     """
     normalized_kind = _normalize_signature_text(kind or "symbol")
     normalized_signature = _normalize_signature_text(canonical_signature)
     normalized_usr = _normalize_signature_text(usr)
+    normalized_qname = normalize_qualified_name(qname)
     owning_project = _normalize_signature_text(project or repo)
     if normalized_usr:
         project_scope = f"project={owning_project}\x1f" if owning_project else ""
@@ -671,6 +756,7 @@ def canonical_symbol_identity(
     )
     payload = [
         f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}",
+        f"qname={normalized_qname}",
         f"kind={normalized_kind}",
         f"sig={normalized_signature}",
     ]
@@ -789,12 +875,25 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         return None
     if not isinstance(qname, str):
         qname = ""
+    identity_version = int(
+        value.get("symbol_identity_schema_version") or SYMBOL_IDENTITY_SCHEMA_VERSION
+    )
+    if identity_version != SYMBOL_IDENTITY_SCHEMA_VERSION:
+        raise RuntimeError(
+            "symbol reference uses incompatible identity schema: "
+            f"got v{identity_version}, expected v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+        )
+    expected_symbol_id = _compute_symbol_id(key)
+    claimed_symbol_id = value.get("symbol_id")
+    if claimed_symbol_id is not None and int(claimed_symbol_id) != expected_symbol_id:
+        raise RuntimeError(
+            "symbol reference ID does not match canonical key: "
+            f"claimed={claimed_symbol_id} expected={expected_symbol_id} key={key!r}"
+        )
     return {
-        "symbol_identity_schema_version": int(
-            value.get("symbol_identity_schema_version") or SYMBOL_IDENTITY_SCHEMA_VERSION
-        ),
+        "symbol_identity_schema_version": identity_version,
         "symbol_key": key,
-        "symbol_id": int(value.get("symbol_id") or _compute_symbol_id(key)),
+        "symbol_id": expected_symbol_id,
         "qname": qname,
         "usr": str(value.get("usr") or ""),
         "canonical_signature": _normalize_signature_text(
@@ -808,11 +907,9 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
 
 
 def _compute_symbol_id(symbol_key: str) -> int:
-    """Deterministic positive uint32-ish ID from a canonical symbol identity."""
-    if not symbol_key:
-        return 0
-    h = int(hashlib.md5(symbol_key.encode("utf-8", errors="replace")).hexdigest(), 16)
-    return (h & 0x7FFFFFFF) or 1
+    """Deterministic unsigned 64-bit ID from a canonical symbol identity."""
+
+    return compute_symbol_id(symbol_key)
 
 
 class FunctionDef:
@@ -825,7 +922,7 @@ class FunctionDef:
                  'referenced_type_keys', 'callee_refs', 'baselib_callee_refs',
                  'referenced_type_refs', 'semantic_symbol_ids',
                  'semantic_call_targets', 'semantic_type_refs',
-                 'semantic_def_use']
+                 'semantic_def_use', 'semantic_symbol_identities']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
@@ -846,7 +943,8 @@ class FunctionDef:
                  semantic_symbol_ids: list[int] | None = None,
                  semantic_call_targets: list[int] | None = None,
                  semantic_type_refs: list[int] | None = None,
-                 semantic_def_use: list[int] | None = None):
+                 semantic_def_use: list[int] | None = None,
+                 semantic_symbol_identities: list[dict[str, object]] | None = None):
         self.name = name
         self.qualified_name = qualified_name
         self.file = file
@@ -905,10 +1003,15 @@ class FunctionDef:
         self.ast_depth = array('H', ast_depth or [])
         self.sibling_index = array('H', sibling_index or [])
         self.ast_node_type = array('H', ast_node_type or [])
-        self.semantic_symbol_ids = array('I', semantic_symbol_ids or [])
-        self.semantic_call_targets = array('I', semantic_call_targets or [])
-        self.semantic_type_refs = array('I', semantic_type_refs or [])
+        self.semantic_symbol_ids = array('Q', semantic_symbol_ids or [])
+        self.semantic_call_targets = array('Q', semantic_call_targets or [])
+        self.semantic_type_refs = array('Q', semantic_type_refs or [])
         self.semantic_def_use = array('B', semantic_def_use or [])
+        identity_registry = SymbolIdentityRegistry()
+        self.semantic_symbol_identities = identity_registry.register_records(
+            semantic_symbol_identities or [],
+            source=f"FunctionDef({self.qualified_name})",
+        )
 
     def to_dict(self) -> dict:
         """Serialize for multiprocessing IPC."""
@@ -935,6 +1038,7 @@ class FunctionDef:
             'semantic_call_targets': self.semantic_call_targets,
             'semantic_type_refs': self.semantic_type_refs,
             'semantic_def_use': self.semantic_def_use,
+            'semantic_symbol_identities': self.semantic_symbol_identities,
         }
 
     @classmethod
@@ -1087,20 +1191,13 @@ class ProjectIndex:
         self.macros: dict[str, MacroDef] = {}
         self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
         self.macro_definitions: list[MacroDef] = []
-        self.symbol_id_keys: dict[int, str] = {}
+        self.symbol_id_registry = SymbolIdentityRegistry()
+        self.symbol_id_keys = self.symbol_id_registry.keys_by_id
 
     def _register_symbol_key(self, symbol_key: str) -> None:
         if not symbol_key:
             return
-        symbol_id = _compute_symbol_id(symbol_key)
-        existing = self.symbol_id_keys.get(symbol_id)
-        if existing is not None and existing != symbol_key:
-            raise RuntimeError(
-                "canonical symbol ID collision: "
-                f"id={symbol_id} first={existing!r} second={symbol_key!r}. "
-                "Refusing to emit aliased semantic supervision."
-            )
-        self.symbol_id_keys[symbol_id] = symbol_key
+        self.symbol_id_registry.register(symbol_key, source="ProjectIndex")
 
     def add_typedef(self, td: TypeDef):
         """Register a type definition. First definition with text wins; never
@@ -1146,6 +1243,10 @@ class ProjectIndex:
         """Add a function definition to the index."""
         key = func.symbol_key
         self._register_symbol_key(key)
+        self.symbol_id_registry.register_records(
+            func.semantic_symbol_identities,
+            source=f"ProjectIndex:{func.file}:{func.line}:{func.qualified_name}",
+        )
         for ref in (
             list(getattr(func, "callee_refs", []))
             + list(getattr(func, "baselib_callee_refs", []))
@@ -2076,6 +2177,13 @@ def parse_translation_unit(
                     semantic_call_targets=sem_call_targets,
                     semantic_type_refs=sem_type_refs,
                     semantic_def_use=sem_def_use,
+                    semantic_symbol_identities=_semantic_identity_records_for_arrays(
+                        semantic_meta,
+                        sem_symbol_ids,
+                        sem_call_targets,
+                        sem_type_refs,
+                        source=f"{rel_path}:{cursor.location.line}:{qname}",
+                    ),
                 ))
             return
 
@@ -2404,7 +2512,7 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------- #
 CROSSLINK_MAX_DEPS_PER_DOC = 12
 CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
-GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 2
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 3
 
 
 class CrossLinkBudget:
@@ -2461,6 +2569,7 @@ class GlobalSymbolReader:
             )
         required = {
             "symbol_key",
+            "symbol_id",
             "usr",
             "canonical_signature",
             "symbol_kind",
@@ -2478,7 +2587,7 @@ class GlobalSymbolReader:
         incompatible_rows = int(
             self._conn.execute(
                 "SELECT COUNT(*) FROM symbols "
-                "WHERE identity_schema_version!=? OR symbol_key=''",
+                "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id=''",
                 (SYMBOL_IDENTITY_SCHEMA_VERSION,),
             ).fetchone()[0]
         )
@@ -2488,6 +2597,27 @@ class GlobalSymbolReader:
                 f"count={incompatible_rows}, expected_version="
                 f"{SYMBOL_IDENTITY_SCHEMA_VERSION}. Migrate or rebuild the index."
             )
+        registry_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbol_identities'"
+        ).fetchone()
+        if registry_table is None:
+            raise RuntimeError(
+                f"--global-symbol-index has no corpus collision registry: {path}. "
+                "Migrate or rebuild the index."
+            )
+        unregistered_rows = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM symbols AS s "
+                "LEFT JOIN symbol_identities AS i "
+                "ON i.symbol_id=s.symbol_id AND i.symbol_key=s.symbol_key "
+                "WHERE i.symbol_id IS NULL"
+            ).fetchone()[0]
+        )
+        if unregistered_rows:
+            raise RuntimeError(
+                f"--global-symbol-index has unregistered symbol IDs: {path}; "
+                f"count={unregistered_rows}. Migrate or rebuild the index."
+            )
         self._cache: dict[str, tuple[dict[str, object], ...]] = {}
 
     def lookup_candidates(self, qname: str) -> list[dict[str, object]]:
@@ -2496,7 +2626,7 @@ class GlobalSymbolReader:
         if key in self._cache:
             return [dict(record) for record in self._cache[key]]
         rows = self._conn.execute(
-            "SELECT symbol_uid, symbol_key, qname, base_lib, base_repo, text, "
+            "SELECT symbol_uid, symbol_key, symbol_id, qname, base_lib, base_repo, text, "
             "token_est, kind, file, line, end_line, usr, canonical_signature, "
             "symbol_kind, identity_schema_version "
             "FROM symbols WHERE qname=? AND sym_type='func' "
@@ -2507,19 +2637,20 @@ class GlobalSymbolReader:
             {
                 "symbol_uid": row[0],
                 "symbol_key": row[1],
-                "qname": row[2],
-                "base_lib": row[3],
-                "base_repo": row[4],
-                "text": row[5],
-                "token_est": row[6],
-                "kind": row[7],
-                "file": row[8],
-                "line": row[9],
-                "end_line": row[10],
-                "usr": row[11],
-                "canonical_signature": row[12],
-                "symbol_kind": row[13],
-                "identity_schema_version": row[14],
+                "symbol_id": int(str(row[2]), 16),
+                "qname": row[3],
+                "base_lib": row[4],
+                "base_repo": row[5],
+                "text": row[6],
+                "token_est": row[7],
+                "kind": row[8],
+                "file": row[9],
+                "line": row[10],
+                "end_line": row[11],
+                "usr": row[12],
+                "canonical_signature": row[13],
+                "symbol_kind": row[14],
+                "identity_schema_version": row[15],
             }
             for row in rows
         )
@@ -2843,6 +2974,7 @@ def extract_semantic_metadata(
     call_targets = [0] * text_len
     type_refs = [0] * text_len
     def_use = [0] * text_len
+    identity_registry = SymbolIdentityRegistry()
 
     if text_len == 0 or tu is None:
         return {
@@ -2850,6 +2982,7 @@ def extract_semantic_metadata(
             "call_targets": call_targets,
             "type_refs": type_refs,
             "def_use": def_use,
+            SYMBOL_IDENTITIES_COLUMN: [],
         }
 
     source_bytes = source.encode("utf-8")
@@ -2874,6 +3007,15 @@ def extract_semantic_metadata(
         if byte_off >= byte_len:
             return text_len
         return byte_to_char[byte_off]
+
+    def _register_symbol_key(symbol_key: str, cursor: Cursor) -> int:
+        return identity_registry.register(
+            symbol_key,
+            source=(
+                f"{filename}:{int(getattr(cursor.location, 'line', 0) or 0)}:"
+                f"{_cursor_kind_name(cursor)}"
+            ),
+        )
 
     def _visit(cursor):
         """Walk the AST and annotate char ranges."""
@@ -2912,7 +3054,7 @@ def extract_semantic_metadata(
                     project=project_id,
                     fallback_file=fallback_file,
                 )
-                sym_id = _compute_symbol_id(symbol_key)
+                sym_id = _register_symbol_key(symbol_key, cursor)
                 for ci in range(char_start, char_end):
                     symbol_ids[ci] = sym_id
                     def_use[ci] = DEF_USE_DEF
@@ -2928,7 +3070,7 @@ def extract_semantic_metadata(
                         project=project_id,
                         fallback_file=fallback_file,
                     )
-                    sym_id = _compute_symbol_id(symbol_key)
+                    sym_id = _register_symbol_key(symbol_key, ref)
                     for ci in range(char_start, char_end):
                         symbol_ids[ci] = sym_id
                         def_use[ci] = DEF_USE_USE
@@ -2945,7 +3087,7 @@ def extract_semantic_metadata(
                         project=project_id,
                         fallback_file=fallback_file,
                     )
-                    target_id = _compute_symbol_id(symbol_key)
+                    target_id = _register_symbol_key(symbol_key, ref)
                     for ci in range(char_start, char_end):
                         call_targets[ci] = target_id
 
@@ -2961,7 +3103,7 @@ def extract_semantic_metadata(
                         project=project_id,
                         fallback_file=fallback_file,
                     )
-                    ref_id = _compute_symbol_id(symbol_key)
+                    ref_id = _register_symbol_key(symbol_key, ref)
                     for ci in range(char_start, char_end):
                         type_refs[ci] = ref_id
 
@@ -2977,6 +3119,7 @@ def extract_semantic_metadata(
         "call_targets": call_targets,
         "type_refs": type_refs,
         "def_use": def_use,
+        SYMBOL_IDENTITIES_COLUMN: identity_registry.records(),
     }
 
 
@@ -3076,19 +3219,19 @@ def extract_semantic_metadata_from_parts(
                         for ci in range(offset + idx, min(offset + idx + plen, offset + part_len)):
                             arr[ci] = value
                         s = idx + plen
-                for callee_qname, callee_key in zip(
-                    func_def.callees,
-                    func_def.callee_keys or func_def.callees,
-                ):
+                for callee_qname in func_def.callees:
+                    callee_key = index.resolve_function_key(callee_qname)
+                    if callee_key is None:
+                        continue
                     _mark(
                         call_targets,
                         callee_qname.split('::')[-1],
                         _compute_symbol_id(callee_key),
                     )
-                for type_qname, type_key in zip(
-                    getattr(func_def, 'referenced_types', []),
-                    getattr(func_def, 'referenced_type_keys', []) or getattr(func_def, 'referenced_types', []),
-                ):
+                for type_qname in getattr(func_def, 'referenced_types', []):
+                    type_key = index.resolve_type_key(type_qname)
+                    if type_key is None:
+                        continue
                     _mark(
                         type_refs,
                         type_qname.split('::')[-1],
@@ -4005,10 +4148,20 @@ def build_enriched_doc(
             if symbol_id in rewrites:
                 semantic_meta['symbol_ids'][char_index] = rewrites[symbol_id]
 
+    symbol_identities = _document_symbol_identities(
+        parts_info,
+        index,
+        semantic_meta['symbol_ids'],
+        semantic_meta['call_targets'],
+        semantic_meta['type_refs'],
+        source=filepath or "clang enriched document",
+    )
+
     result = {
         'text': full_text,
         'doc_type': 'code',
         'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: symbol_identities,
         'filepath': filepath or '',
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,

@@ -163,6 +163,24 @@ def _int_vector(value: Any, *, where: str) -> mx.array:
     return mx.array(arr.astype(np.int32))
 
 
+def _symbol_id_vector(value: Any, *, where: str) -> mx.array:
+    if value is None:
+        raise ValueError(f"{where}: cannot build symbol ID vector from None")
+    arr = np.asarray(value, dtype=object)
+    if arr.ndim != 1:
+        if arr.size == 0:
+            arr = arr.reshape(0)
+        else:
+            raise ValueError(
+                f"{where}: expected a 1-D token-aligned sequence, got shape "
+                f"{tuple(arr.shape)}"
+            )
+    values = [int(item) for item in arr.tolist()]
+    if any(item < 0 or item > np.iinfo(np.uint64).max for item in values):
+        raise ValueError(f"{where}: symbol IDs must fit unsigned 64-bit")
+    return mx.array(np.asarray(values, dtype=np.uint64))
+
+
 def _str_scalar(value: Any) -> str | None:
     if value is None:
         return None
@@ -245,7 +263,10 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        semantic_kwargs[field_name] = _int_vector(
+        vector_builder = (
+            _int_vector if column == TOKEN_DEF_USE_COLUMN else _symbol_id_vector
+        )
+        semantic_kwargs[field_name] = vector_builder(
             columns[column][row_index], where=f"{column}[row={row_index}]"
         )
         present.append(column)

@@ -18,6 +18,7 @@ from cppmega_mlx.config.model import (
 from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 from cppmega_mlx.data.token_dataset import BatchCursor, TokenDatasetMetadata
+from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
 
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
 _INDEX_VERSION = 1
@@ -37,6 +38,7 @@ _SEMANTIC_SIDE_CHANNEL_KEYS = (
     "type_refs",
     "def_use",
 )
+_SYMBOL_ID_SIDE_CHANNEL_KEYS = ("symbol_ids", "call_targets", "type_refs")
 _TEMPORAL_SIDE_CHANNEL_KEYS = (
     "change_mask_pre",
     "change_mask_post",
@@ -159,6 +161,7 @@ _NAMED_DTYPES: dict[str, np.dtype] = {
     "int32": np.dtype(np.int32),
     "uint32": np.dtype(np.uint32),
     "int64": np.dtype(np.int64),
+    "uint64": np.dtype(np.uint64),
 }
 
 _SIDE_CHANNEL_NAMED_DTYPES: dict[str, np.dtype] = {
@@ -1110,6 +1113,13 @@ def _load_side_channels(
 ) -> dict[str, _SideChannelStorage]:
     _reject_ambiguous_side_channel_metadata(sidecar)
     entries = _side_channel_entries(sidecar)
+    if any(key in entries for key in _SYMBOL_ID_SIDE_CHANNEL_KEYS):
+        version = sidecar.get("symbol_identity_schema_version")
+        if version != SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise ValueError(
+                "semantic symbol sidecars require symbol_identity_schema_version="
+                f"{SYMBOL_IDENTITY_SCHEMA_VERSION}, got {version!r}"
+            )
     base_dir = metadata_path.parent if metadata_path is not None else prefix.parent
     storages: dict[str, _SideChannelStorage] = {}
     for key, entry in entries.items():
@@ -1495,6 +1505,13 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
         if dtype != np.dtype(np.float32):
             raise ValueError("attention_mask side-channel dtype must be float32")
         return dtype
+    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+        if dtype != np.dtype(np.uint64):
+            raise ValueError(
+                f"{key} side-channel dtype must be uint64 for v"
+                f"{SYMBOL_IDENTITY_SCHEMA_VERSION} symbol identities, got {dtype.name}"
+            )
+        return dtype
     if dtype.kind not in {"i", "u"}:
         raise ValueError(f"{key} side-channel dtype must be an integer dtype")
     if dtype.itemsize > np.dtype(np.int64).itemsize:
@@ -1505,18 +1522,24 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
 def _default_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
+    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+        return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
 
 def _target_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
+    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+        return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
 
 def _allowed_side_channel_dtype_names(key: str) -> list[str]:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return ["float32"]
+    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+        return ["uint64"]
     return [
         name
         for name, dtype in _SIDE_CHANNEL_NAMED_DTYPES.items()
@@ -1543,6 +1566,12 @@ def _side_channel_family(key: str) -> str:
 def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return values.astype(np.float32, copy=False)
+    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+        if values.dtype.kind not in {"i", "u"}:
+            raise ValueError(f"{key} side-channel IDs must use an integer dtype")
+        if values.dtype.kind == "i" and np.any(values < 0):
+            raise ValueError(f"{key} side-channel IDs must be non-negative")
+        return values.astype(np.uint64, copy=False)
     if key != "hunk_ids" and np.any(values < 0):
         raise ValueError(f"{key} side-channel IDs must be non-negative")
     if key == "hunk_ids" and np.any(values < np.iinfo(np.int32).min):
