@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import struct
@@ -255,9 +256,15 @@ def _write_structured_multishard_fixture(
 
 
 def _run_train_hybrid_tiny(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    # This suite validates indexed-dataset ingress, not optional kernel discovery.
+    # An explicit reference route keeps the subprocess independent of any shared
+    # TileLang/TVM development checkout configured by the parent pytest process.
+    env["CPPMEGA_KERNEL_PATH"] = "ref"
     return subprocess.run(
         [sys.executable, str(TRAIN_HYBRID_TINY), *args],
         cwd=ROOT,
+        env=env,
         text=True,
         capture_output=True,
         timeout=45,

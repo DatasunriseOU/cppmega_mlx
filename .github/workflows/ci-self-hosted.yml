@@ -39,7 +39,7 @@ jobs:
           git diff --check
 
   linux-portable:
-    name: Linux portable conveyor contracts
+    name: Linux portable syntax and conveyor contracts
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     timeout-minutes: 20
     steps:
@@ -53,10 +53,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pytest -q \
+          # cppmega.mlx imports Apple's MLX runtime at package import time. The
+          # Linux runner exercises only portable scripts and deliberately skips
+          # the macOS-only root conftest/package initialization.
+          python -m pytest -q --noconftest \
             tests/test_audit_sidecar_parquet.py \
-            tests/test_pack_enriched_rows.py \
             tests/test_streaming_conveyor_progress.py \
             tests/test_process_commits_fail_loud.py \
             tests/test_repair_packed_document_boundaries.py
+          python -m compileall -q scripts tools/clang_indexer
           git diff --check
