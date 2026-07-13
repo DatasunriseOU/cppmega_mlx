@@ -49,6 +49,7 @@ import argparse
 import glob
 import json
 import os
+from pathlib import Path
 import sqlite3
 import sys
 from typing import Optional
@@ -100,13 +101,24 @@ CREATE TABLE IF NOT EXISTS linked_issues (
 """
 
 
-def connect(store_path: str, create: bool = True) -> sqlite3.Connection:
+def connect(
+    store_path: str,
+    create: bool = True,
+    *,
+    readonly: bool = False,
+) -> sqlite3.Connection:
+    if readonly and create:
+        raise ValueError("readonly PR store connections cannot create a database")
     if not create and not os.path.exists(store_path):
         raise SystemExit(f"[pr_store] store does not exist: {store_path}")
     if create:
         d = os.path.dirname(os.path.abspath(store_path))
         os.makedirs(d, exist_ok=True)
-    conn = sqlite3.connect(store_path, timeout=60.0)
+    if readonly:
+        uri = Path(store_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=60.0)
+    else:
+        conn = sqlite3.connect(store_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
     # Set busy_timeout FIRST. The parallel graphql_pr_stream --workers path opens
     # many writer connections concurrently; with the timeout in place the WAL
@@ -114,6 +126,8 @@ def connect(store_path: str, create: bool = True) -> sqlite3.Connection:
     # instead of erroring out with "database is locked" (fail-loud preserved:
     # SQLite still raises if the lock is not released within the timeout).
     conn.execute("PRAGMA busy_timeout=60000")
+    if readonly:
+        return conn
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)

@@ -169,6 +169,17 @@ def test_sequential_strategy_preserves_document_order() -> None:
     assert rows[2][INPUT_IDS_COLUMN] == [20, 21, 22, 30, 0, 0]
 
 
+def test_row_platform_provenance_union_is_not_limited_by_model_bag_width() -> None:
+    docs = _normalize(
+        [_doc([100 + index], platform_ids=[index + 1]) for index in range(22)]
+    )
+
+    rows, overflow = pack_documents(docs, target_length=32, pad_token_id=0)
+
+    assert overflow == []
+    assert rows[0][PLATFORM_IDS_COLUMN] == list(range(1, 23))
+
+
 def test_loss_mask_excludes_padding_and_cross_document_targets() -> None:
     docs = _normalize([_doc([1, 2]), _doc([10, 11])])
 
@@ -178,6 +189,35 @@ def test_loss_mask_excludes_padding_and_cross_document_targets() -> None:
     row = rows[0]
     assert row[INPUT_IDS_COLUMN] == [1, 2, 10, 11, 0]
     assert row[TARGET_IDS_COLUMN] == [2, 10, 11, 0, 0]
+    assert row[DOC_IDS_COLUMN] == [1, 1, 2, 2, 2]
+    assert row[LOSS_MASK_COLUMN] == [1, 0, 1, 0, 0]
+
+
+def test_packed_doc_ids_do_not_collapse_same_file_documents() -> None:
+    first = normalize_document_record(
+        {
+            **_doc([1, 2]),
+            REPO_STABLE_ID_COLUMN: "same-repo",
+            FILEPATH_STABLE_ID_COLUMN: "same-file",
+        },
+        source_doc_index=38,
+        stable_doc_id=11,
+    )
+    second = normalize_document_record(
+        {
+            **_doc([10, 11]),
+            REPO_STABLE_ID_COLUMN: "same-repo",
+            FILEPATH_STABLE_ID_COLUMN: "same-file",
+        },
+        source_doc_index=41,
+        stable_doc_id=11,
+    )
+
+    rows, overflow = pack_documents([first, second], target_length=5, pad_token_id=0)
+
+    assert overflow == []
+    row = rows[0]
+    assert row[SOURCE_DOC_INDICES_COLUMN] == [38, 41]
     assert row[DOC_IDS_COLUMN] == [1, 1, 2, 2, 2]
     assert row[LOSS_MASK_COLUMN] == [1, 0, 1, 0, 0]
 

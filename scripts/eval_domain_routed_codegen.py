@@ -27,6 +27,7 @@ class DomainEvalPrompt:
     expected_sidecars: tuple[str, ...]
     compile_prefix: str = ""
     compile_suffix: str = ""
+    run_binary: bool = False
 
     @classmethod
     def from_row(cls, row: dict[str, Any], *, path: Path, line_no: int) -> "DomainEvalPrompt":
@@ -44,6 +45,7 @@ class DomainEvalPrompt:
             expected_sidecars=tuple(str(x) for x in row.get("expected_sidecars", ())),
             compile_prefix=str(row.get("compile_prefix", "")),
             compile_suffix=str(row.get("compile_suffix", "")),
+            run_binary=bool(row.get("run_binary", False)),
         )
 
 
@@ -90,7 +92,14 @@ def _find_cpp_compiler() -> str | None:
     return None
 
 
-def compile_cpp_completion(prompt: DomainEvalPrompt, completion: str, *, compiler: str | None = None) -> dict[str, Any]:
+def compile_cpp_completion(
+    prompt: DomainEvalPrompt,
+    completion: str,
+    *,
+    compiler: str | None = None,
+    compile_timeout_s: float = 120.0,
+    run_timeout_s: float = 10.0,
+) -> dict[str, Any]:
     compiler = compiler or _find_cpp_compiler()
     if compiler is None:
         return {"status": "compile_skipped", "reason": "no local C++ compiler found"}
@@ -99,14 +108,52 @@ def compile_cpp_completion(prompt: DomainEvalPrompt, completion: str, *, compile
         src = Path(tmp) / "main.cpp"
         exe = Path(tmp) / "a.out"
         src.write_text(source, encoding="utf-8")
-        proc = subprocess.run(
-            [compiler, "-std=c++20", "-Wall", "-Wextra", str(src), "-o", str(exe)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        try:
+            proc = subprocess.run(
+                [compiler, "-std=c++20", "-Wall", "-Wextra", str(src), "-o", str(exe)],
+                capture_output=True,
+                text=True,
+                timeout=compile_timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "status": "compile_timeout",
+                "timeout_s": compile_timeout_s,
+                "stderr": str(exc.stderr or "")[-4000:],
+            }
+        if proc.returncode != 0:
+            return {
+                "status": "compile_failed",
+                "returncode": proc.returncode,
+                "stderr": proc.stderr[-4000:],
+            }
+        if prompt.run_binary:
+            try:
+                run = subprocess.run(
+                    [str(exe)],
+                    capture_output=True,
+                    text=True,
+                    timeout=run_timeout_s,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return {
+                    "status": "runtime_timeout",
+                    "returncode": proc.returncode,
+                    "timeout_s": run_timeout_s,
+                    "stderr": proc.stderr[-4000:],
+                    "runtime_stdout": str(exc.stdout or "")[-4000:],
+                    "runtime_stderr": str(exc.stderr or "")[-4000:],
+                }
+            return {
+                "status": "compile_passed" if run.returncode == 0 else "runtime_failed",
+                "returncode": proc.returncode,
+                "runtime_returncode": run.returncode,
+                "stderr": proc.stderr[-4000:],
+                "runtime_stdout": run.stdout[-4000:],
+                "runtime_stderr": run.stderr[-4000:],
+            }
         return {
-            "status": "compile_passed" if proc.returncode == 0 else "compile_failed",
+            "status": "compile_passed",
             "returncode": proc.returncode,
             "stderr": proc.stderr[-4000:],
         }
@@ -139,12 +186,14 @@ def evaluate(
         rows.append(row)
     passed = sum(1 for row in rows if row.get("status") == "compile_passed")
     failed = sum(1 for row in rows if row.get("status") == "compile_failed")
+    runtime_failed = sum(1 for row in rows if row.get("status") == "runtime_failed")
     missing = sum(1 for row in rows if row.get("status") == "missing_completion")
     return {
         "prompts": len(prompts),
         "completion_rows": len(completions),
         "compile_passed": passed,
         "compile_failed": failed,
+        "runtime_failed": runtime_failed,
         "missing_completion": missing,
         "rows": rows,
     }
@@ -163,8 +212,8 @@ def main() -> int:
     report = evaluate(prompts, completions, compile=not args.no_compile)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps({k: report[k] for k in ("prompts", "completion_rows", "compile_passed", "compile_failed", "missing_completion")}, sort_keys=True))
-    return 2 if report["compile_failed"] else 0
+    print(json.dumps({k: report[k] for k in ("prompts", "completion_rows", "compile_passed", "compile_failed", "runtime_failed", "missing_completion")}, sort_keys=True))
+    return 2 if report["compile_failed"] or report["runtime_failed"] else 0
 
 
 if __name__ == "__main__":

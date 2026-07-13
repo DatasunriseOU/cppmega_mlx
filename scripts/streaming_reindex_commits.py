@@ -944,7 +944,7 @@ def main(argv: list[str]) -> int:
         "manifest": str(COMMIT_MANIFEST),
     }
     print(json.dumps(summary, indent=2))
-    return 0 if not manifest.failed or ranges_done > 0 else 1
+    return 0 if not manifest.failed else 1
 
 
 if __name__ == "__main__":

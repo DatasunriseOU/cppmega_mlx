@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = MLX_ROOT / "scripts"
@@ -144,12 +146,13 @@ def test_background_recompressor_runs_and_surfaces_completion(tmp_path, monkeypa
     assert sorted(calls) == ["a.parquet", "b.parquet"]
 
 
-def test_manifest_complete_commit_ranges_detects_short_final_range(tmp_path):
+def test_manifest_complete_commit_ranges_uses_authoritative_record_count(tmp_path):
     import streaming_conveyor
 
     manifest = streaming_conveyor.Manifest(
         path=tmp_path / "_done.json",
         done={
+            "repo::commit_plan": {"source": "commit_plan", "n_records": 823},
             "repo::r0": {"range": [0, 500], "source": "commits"},
             "repo::r500": {"range": [500, 823], "source": "commits"},
         },
@@ -169,6 +172,23 @@ def test_manifest_complete_commit_ranges_refuses_exact_multiple(tmp_path):
         done={
             "repo::r0": {"range": [0, 500], "source": "commits"},
             "repo::r500": {"range": [500, 1000], "source": "commits"},
+        },
+        failed={},
+    )
+
+    assert streaming_conveyor.manifest_complete_commit_ranges(
+        "repo", manifest, 500
+    ) is None
+
+
+def test_manifest_complete_commit_ranges_refuses_adaptive_short_nonfinal_range(tmp_path):
+    import streaming_conveyor
+
+    manifest = streaming_conveyor.Manifest(
+        path=tmp_path / "_done.json",
+        done={
+            "repo::commit_plan": {"source": "commit_plan", "n_records": 1200},
+            "repo::r0": {"range": [0, 468], "source": "commits"},
         },
         failed={},
     )
@@ -406,7 +426,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
 
     assert calls == [
         (2, tmp_path / "global.sqlite", True, 7200, 900, None),
-        (1, None, False, 7200, 900, None),
+        (1, tmp_path / "global.sqlite", False, 7200, 900, None),
     ]
     assert info["lengths"]["1024"]["valid_tokens"] == 1024
 
@@ -460,7 +480,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path)
 
     assert calls == [
         (2, tmp_path / "global.sqlite", True, 7200, 900),
-        (1, None, False, 7200, 900),
+        (1, tmp_path / "global.sqlite", False, 7200, 900),
     ]
     assert info["lengths"]["1024"]["valid_tokens"] == 1024
 
@@ -486,6 +506,7 @@ def test_run_code_half_removes_outputs_when_dedup_promote_fails(tmp_path, monkey
         raise sqlite3.OperationalError("unable to open database file")
 
     monkeypatch.setattr(streaming_conveyor.sr, "process_one_repo", fake_process_one_repo)
+    monkeypatch.setattr(streaming_conveyor.src, "recompress_zstd_max", lambda _path: None)
     monkeypatch.setattr(streaming_conveyor.sr, "promote_dedup_stage", fail_promote)
 
     try:
@@ -503,6 +524,99 @@ def test_run_code_half_removes_outputs_when_dedup_promote_fails(tmp_path, monkey
     else:
         raise AssertionError("run_code_half should fail when dedup promote fails")
 
+    assert not dest.exists()
+
+
+def test_run_code_half_recompresses_before_dedup_promote(tmp_path, monkeypatch):
+    import streaming_conveyor
+
+    repo = "repo"
+    output_root = tmp_path / "out"
+    dest = output_root / "1024" / f"{repo}.parquet"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"parquet")
+    monkeypatch.setattr(streaming_conveyor.sr, "OUTPUT_ROOT", output_root)
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        streaming_conveyor.sr,
+        "process_one_repo",
+        lambda *_args, **_kwargs: {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=1024, target_length=1024)},
+            "stage_timings_s": {},
+        },
+    )
+    monkeypatch.setattr(
+        streaming_conveyor.src,
+        "recompress_zstd_max",
+        lambda _path: events.append("recompress"),
+    )
+
+    def promote(*_args, **_kwargs):
+        events.append("promote")
+        return {}
+
+    monkeypatch.setattr(streaming_conveyor.sr, "promote_dedup_stage", promote)
+    recompressor = streaming_conveyor.BackgroundRecompressor(max_workers=1)
+    try:
+        streaming_conveyor.run_code_half(
+            repo,
+            tmp_path / "src",
+            (1024,),
+            tmp_path / "work",
+            tmp_path / "dedup.sqlite",
+            True,
+            recompressor=recompressor,
+        )
+    finally:
+        recompressor.shutdown()
+
+    assert events == ["recompress", "promote"]
+
+
+def test_run_code_half_recompress_failure_rolls_back_before_promote(tmp_path, monkeypatch):
+    import streaming_conveyor
+
+    repo = "repo"
+    output_root = tmp_path / "out"
+    dest = output_root / "1024" / f"{repo}.parquet"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"parquet")
+    monkeypatch.setattr(streaming_conveyor.sr, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(
+        streaming_conveyor.sr,
+        "process_one_repo",
+        lambda *_args, **_kwargs: {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=1024, target_length=1024)},
+            "stage_timings_s": {},
+        },
+    )
+    monkeypatch.setattr(
+        streaming_conveyor.src,
+        "recompress_zstd_max",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("zstd failed")),
+    )
+    monkeypatch.setattr(
+        streaming_conveyor.sr,
+        "promote_dedup_stage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dedup must not promote before recompress")
+        ),
+    )
+
+    with pytest.raises(streaming_conveyor.RepoFailure, match="zstd failed") as exc_info:
+        streaming_conveyor.run_code_half(
+            repo,
+            tmp_path / "src",
+            (1024,),
+            tmp_path / "work",
+            tmp_path / "dedup.sqlite",
+            True,
+        )
+
+    assert exc_info.value.stage == "recompress"
     assert not dest.exists()
 
 
@@ -530,6 +644,40 @@ def test_run_code_half_skips_no_trainable_source(tmp_path, monkeypatch):
     assert info["skipped"] is True
     assert info["skip_reason"] == "no_trainable_source"
     assert info["lengths"] == {}
+
+
+def test_run_code_half_skips_dedup_exhausted_and_discards_stage(
+    tmp_path, monkeypatch
+):
+    import streaming_conveyor
+
+    def dedup_exhausted(*_args, **_kwargs):
+        raise streaming_conveyor.RepoFailure(
+            "repo",
+            "index_project",
+            "no training docs (dedup_exhausted): all functions already claimed",
+        )
+
+    discarded = []
+    monkeypatch.setattr(streaming_conveyor.sr, "process_one_repo", dedup_exhausted)
+    monkeypatch.setattr(
+        streaming_conveyor.sr,
+        "discard_dedup_stage",
+        lambda *args: discarded.append(args),
+    )
+
+    info = streaming_conveyor.run_code_half(
+        "repo",
+        tmp_path / "src",
+        (1024,),
+        tmp_path / "work",
+        tmp_path / "dedup.sqlite",
+        True,
+    )
+
+    assert info["skipped"] is True
+    assert info["skip_reason"] == "dedup_exhausted"
+    assert len(discarded) == 1
 
 
 def test_failed_code_unit_was_index_memory_reads_manifest_receipt(tmp_path):
@@ -588,6 +736,7 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
     manifest = streaming_conveyor.Manifest(
         path=tmp_path / "_done.json",
         done={
+            "repo::commit_plan": {"source": "commit_plan", "n_records": 612},
             "repo::r0": {"range": [0, 500], "source": "commits"},
             "repo::r500": {"range": [500, 612], "source": "commits"},
         },
@@ -908,7 +1057,9 @@ def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
         )
 
     assert (done, failed, all_done) == (3, 0, True)
-    assert sorted(manifest.done) == ["repo::r0", "repo::r1", "repo::r2"]
+    range_keys = sorted(key for key in manifest.done if key.startswith("repo::r"))
+    assert range_keys == ["repo::r0", "repo::r1", "repo::r2"]
+    assert manifest.done["repo::commit_plan"]["n_records"] == 3
     assert len(observed_kwargs) == 3
     reader = DedupStore(str(db), near=False, commit_every=1)
     try:
@@ -1147,6 +1298,7 @@ def test_should_stage_repo_skips_manifest_proven_complete_both_streams(tmp_path)
         path=tmp_path / "_done.json",
         done={
             "repo::code": {"source": "code"},
+            "repo::commit_plan": {"source": "commit_plan", "n_records": 612},
             "repo::r0": {"range": [0, 500], "source": "commits"},
             "repo::r500": {"range": [500, 612], "source": "commits"},
         },

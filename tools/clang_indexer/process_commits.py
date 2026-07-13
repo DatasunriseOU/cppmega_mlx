@@ -101,7 +101,11 @@ class PRDiscussionLookup:
         if not os.path.exists(store_path):
             raise FileNotFoundError(f"--pr-store does not exist: {store_path}")
         # Read-only connection; create=False RAISES on a missing store (fail-loud).
-        self._conn = _pr_store_mod.connect(store_path, create=False)
+        self._conn = _pr_store_mod.connect(
+            store_path,
+            create=False,
+            readonly=True,
+        )
         self._name_to_owner_repo: dict[str, str] = {}
         if repo_list_path:
             if not os.path.exists(repo_list_path):
@@ -158,6 +162,13 @@ class PRDiscussionLookup:
         if not discussion:
             self.misses += 1
             return False
+        canonical_pr_number = rec.get("pr_number")
+        if canonical_pr_number is None:
+            raise ValueError(
+                f"PR store hit for {owner_repo} has no canonical pr_number"
+            )
+        record["pr_number"] = int(canonical_pr_number)
+        record["pr_title"] = str(rec.get("pr_title") or "")
         record["pr_discussion"] = discussion
         self.hits += 1
         return True
@@ -2397,6 +2408,14 @@ def main() -> int:
              'Default 128; use 0 to disable.',
     )
     parser.add_argument(
+        '--allow-parse-errors',
+        action='store_true',
+        help=(
+            'Explicitly allow malformed/failed records to be skipped. Default '
+            'fails the whole range so staged dedup and parquet publication roll back.'
+        ),
+    )
+    parser.add_argument(
         '--dedup-db', default=None,
         help='Path to the SHARED global dedup SQLite store. When set, whole commit '
              'DOCS are deduped by their tokenized hash (exact+near) GLOBALLY across '
@@ -2438,6 +2457,13 @@ def main() -> int:
              "'/' are used as-is.",
     )
     args = parser.parse_args()
+    missing_inputs = [path for path in args.inputs if not os.path.exists(path)]
+    if missing_inputs:
+        print(
+            "ERROR: missing input file(s): " + ", ".join(missing_inputs),
+            file=sys.stderr,
+        )
+        return 1
     start_memory_guard(args.memory_limit_gb, label="process_commits")
 
     print("Clang commit processor starting", file=sys.stderr)
@@ -2546,10 +2572,6 @@ def main() -> int:
         try:
             with open(args.output, 'w') as out_f:
                 for input_path in args.inputs:
-                    if not os.path.exists(input_path):
-                        print(f"  WARN: {input_path} not found, skipping", file=sys.stderr)
-                        continue
-
                     print(f"\n  Processing {input_path}...", file=sys.stderr)
                     stats = process_jsonl_file(
                         input_path, out_f, clang_index, actual_tmpdir,
@@ -2586,6 +2608,14 @@ def main() -> int:
     if total_stats['records_read'] > 0:
         rate = total_stats['records_read'] / elapsed
         print(f"Rate: {rate:.1f} records/sec", file=sys.stderr)
+    if total_stats['parse_errors'] and not args.allow_parse_errors:
+        print(
+            "ERROR: refusing partial commit range: "
+            f"{total_stats['parse_errors']} record parse error(s); "
+            "use --allow-parse-errors only for an explicitly lossy run",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
