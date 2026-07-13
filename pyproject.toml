@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "mlx>=0.31"]
+requires = ["setuptools>=68", "mlx>=0.31", "nanobind>=2.4"]
 build-backend = "setuptools.build_meta"
 
 [project]
