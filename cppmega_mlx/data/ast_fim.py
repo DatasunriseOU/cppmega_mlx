@@ -1,9 +1,9 @@
 """AST-aware Fill-in-the-Middle span sampling driven by clang chunk boundaries.
 
 This module sits on top of :mod:`cppmega_mlx.data.fim` — it does NOT reimplement
-the PSM/SPM/iFIM permutations.  Its only job is to *choose the middle span* from a
+the PSM/SPM permutations.  Its only job is to *choose the middle span* from a
 ``CodePacket``'s token-aligned structure side-channels, then hand that span to the
-existing ``fim.apply_fim_permutation`` / ``fim.apply_ifim_permutation`` emitters.
+existing ``fim.apply_fim_permutation`` emitter.
 
 Span selection (research-grounded AST-FIM):
 
@@ -22,23 +22,18 @@ Mix (mid-token robustness):
   * 10% of the time we emit a random-CHAR-FIM example whose middle is a random
     token span (``fim.sample_middle_span``) that may start/end mid-statement —
     this teaches robustness to arbitrary cursor positions.  The fall-back to the
-    char path is RECORDED in the returned ``AstFimResult.kind`` ("char_fim"
-    or "char_ifim" for instruction-aware examples), never silent.
-
-iFIM variant: when the document carries a leading comment / docstring we extract
-it via ``fim.extract_ifim_instruction_text`` and emit through
-``fim.apply_ifim_permutation`` using that text (tokenized by an injected encoder)
-as the ``FIM_INSTRUCTION`` span.
+    char path is RECORDED in the returned ``AstFimResult.kind`` ("char_fim"),
+    never silent.
 
 RULE #1 (fail fast / fail loud): every required field (``chunk_starts`` /
-``chunk_ends`` for AST-FIM, ``metadata['source_text']`` + an encoder for iFIM) is
-validated up-front and a missing one RAISES with WHERE + WHAT — no silent path.
+``chunk_ends``) is validated up-front and a missing one RAISES with WHERE +
+WHAT — no silent path.
 """
 
 from __future__ import annotations
 
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -51,7 +46,6 @@ from cppmega_mlx.data.fim import (
     FIMSpecialTokenInput,
     apply_fim_permutation,
     apply_ifim_permutation,
-    extract_ifim_instruction_text,
     sample_middle_span,
 )
 
@@ -68,10 +62,6 @@ class NoEligibleChunkError(ValueError):
     distinct from a genuinely absent ``chunk_starts``/``chunk_ends`` field, which
     raises a plain ``ValueError`` and propagates (fail-loud).
     """
-
-# An encoder turns instruction text into token ids; injected so this module stays
-# tokenizer-artifact-free (mirrors fim.py's contract).
-InstructionEncoder = Callable[[str], Sequence[int]]
 
 
 @dataclass(frozen=True)
@@ -178,6 +168,16 @@ def select_ast_span(
     return starts[chunk_index], ends[chunk_index], chunk_index
 
 
+def eligible_ast_chunk_indices(packet: CodePacket) -> tuple[int, ...]:
+    """Return validated interior clang chunks without drawing randomness."""
+
+    length = _token_count(packet)
+    if length < 3:
+        return ()
+    starts, ends, _kinds = _chunk_arrays(packet)
+    return tuple(_eligible_chunks(starts, ends, length))
+
+
 def apply_ast_fim(
     packet: CodePacket,
     *,
@@ -246,51 +246,28 @@ def apply_ast_fim(
 def apply_ast_ifim(
     packet: CodePacket,
     *,
-    instruction_encoder: InstructionEncoder,
+    instruction_token_ids: Sequence[int] | None = None,
     seed: int | None = None,
     rng: random.Random | None = None,
     spm_rate: float = 0.5,
     ast_fim_rate: float = DEFAULT_AST_FIM_RATE,
     special_token_ids: FIMSpecialTokenInput = None,
 ) -> AstFimResult:
-    """Emit an instruction-aware AST-FIM example using a leading comment/docstring.
+    """Emit typed instruction-aware AST-iFIM with an observable char fallback."""
 
-    The instruction text is the document's leading comment/docstring extracted by
-    ``fim.extract_ifim_instruction_text`` from ``packet.metadata['source_text']``;
-    it is tokenized by the injected ``instruction_encoder`` and emitted as the
-    ``FIM_INSTRUCTION`` span via ``fim.apply_ifim_permutation``.
-
-    RAISES if ``source_text`` is absent, if no instruction can be extracted, or if
-    the encoder yields an empty token list (fail-loud, no silent fallback to plain
-    FIM).
-    """
-
-    source_text = packet.metadata.get("source_text")
-    if source_text is None:
-        raise ValueError(
-            "ast_ifim requires CodePacket.metadata['source_text'] to extract the "
-            "leading comment/docstring instruction; it is absent"
-        )
-    if not isinstance(source_text, str):
-        raise TypeError(
-            f"ast_ifim: metadata['source_text'] must be a str, got "
-            f"{type(source_text).__name__}"
-        )
-    instruction_text = extract_ifim_instruction_text(source_text)
-    if instruction_text is None:
-        raise ValueError(
-            "ast_ifim: no leading comment/docstring instruction found in "
-            "source_text; cannot build an iFIM example"
-        )
-    instruction_ids = [int(x) for x in instruction_encoder(instruction_text)]
-    if not instruction_ids:
-        raise ValueError(
-            "ast_ifim: instruction_encoder produced no tokens for instruction "
-            f"text {instruction_text!r}"
-        )
-
+    if instruction_token_ids is None:
+        raise ValueError("ast_ifim requires typed instruction_token_ids")
+    instruction = list(instruction_token_ids)
+    if not instruction:
+        raise ValueError("ast_ifim instruction_token_ids must not be empty")
+    if any(not isinstance(token_id, int) or isinstance(token_id, bool) for token_id in instruction):
+        raise ValueError("ast_ifim instruction_token_ids must contain integer token ids")
     if rng is not None and seed is not None:
         raise ValueError("pass either seed or rng, not both")
+    if not 0.0 <= ast_fim_rate <= 1.0:
+        raise ValueError(f"ast_fim_rate must be in [0, 1], got {ast_fim_rate}")
+    if not 0.0 <= spm_rate <= 1.0:
+        raise ValueError(f"spm_rate must be in [0, 1], got {spm_rate}")
     rand = rng if rng is not None else random.Random(seed)
 
     tokens = _packet_token_list(packet)
@@ -315,7 +292,7 @@ def apply_ast_ifim(
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
     permuted = apply_ifim_permutation(
         tokens,
-        instruction_token_ids=instruction_ids,
+        instruction_token_ids=instruction,
         span=(start, end),
         mode=mode,
         special_token_ids=special_token_ids,
@@ -333,9 +310,9 @@ __all__ = [
     "DEFAULT_AST_FIM_RATE",
     "AstFimKind",
     "AstFimResult",
-    "InstructionEncoder",
     "NoEligibleChunkError",
     "apply_ast_fim",
     "apply_ast_ifim",
+    "eligible_ast_chunk_indices",
     "select_ast_span",
 ]

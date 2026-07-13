@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-not-found]
@@ -57,8 +57,26 @@ from tools.clang_indexer.process_commits import (
 
 
 class _CharTokenizer:
+    def __init__(self) -> None:
+        self._tokenizer = self
+
     def encode(self, text: str) -> list[int]:
         return [ord(ch) for ch in text]
+
+    def encode_batch(
+        self, texts: list[str], *, add_special_tokens: bool = False
+    ) -> list[SimpleNamespace]:
+        del add_special_tokens
+        return [
+            SimpleNamespace(
+                ids=[ord(ch) for ch in text],
+                offsets=[(index, index + 1) for index in range(len(text))],
+            )
+            for text in texts
+        ]
+
+    def get_bos_token_id(self) -> int:
+        return 1
 
     def get_vocab(self) -> dict[str, int]:
         return {}
@@ -138,6 +156,16 @@ def test_clang_enriched_parquet_schema_preserves_token_semantic_columns() -> Non
         "call_targets",
         "type_refs",
         "def_use",
+        "ifim_instruction_text",
+        "commit_msg_text",
+        "pre_text",
+        "post_text",
+        "diff_text",
+        schema.IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+        schema.COMMIT_MSG_TOKEN_IDS_COLUMN,
+        schema.PRE_TOKEN_IDS_COLUMN,
+        schema.POST_TOKEN_IDS_COLUMN,
+        schema.DIFF_TOKEN_IDS_COLUMN,
         schema.TOKEN_SYMBOL_IDS_COLUMN,
         schema.TOKEN_CALL_TARGETS_COLUMN,
         schema.TOKEN_TYPE_REFS_COLUMN,
@@ -166,6 +194,11 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
             "call_targets": [0, 22, 0, 0],
             "type_refs": [0, 0, 33, 0],
             "def_use": [0, 1, 2, 0],
+            "ifim_instruction_text": "Implement main",
+            "commit_msg_text": "Implement main",
+            "pre_text": "return 0;",
+            "post_text": "return f();",
+            "diff_text": "-return 0;\n+return f();",
         }
     ]
     tokenized_rows = [
@@ -175,6 +208,11 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
             schema.TOKEN_CALL_TARGETS_COLUMN: [0, 22, 0, 0],
             schema.TOKEN_TYPE_REFS_COLUMN: [0, 0, 33, 0],
             schema.TOKEN_DEF_USE_COLUMN: [0, 1, 2, 0],
+            schema.IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: [51, 52],
+            schema.COMMIT_MSG_TOKEN_IDS_COLUMN: [51, 52],
+            schema.PRE_TOKEN_IDS_COLUMN: [61, 62],
+            schema.POST_TOKEN_IDS_COLUMN: [63, 64],
+            schema.DIFF_TOKEN_IDS_COLUMN: [71, 72, 73],
         }
     ]
 
@@ -200,6 +238,11 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
         schema.TOKEN_CALL_TARGETS_COLUMN,
         schema.TOKEN_TYPE_REFS_COLUMN,
         schema.TOKEN_DEF_USE_COLUMN,
+        schema.IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+        schema.COMMIT_MSG_TOKEN_IDS_COLUMN,
+        schema.PRE_TOKEN_IDS_COLUMN,
+        schema.POST_TOKEN_IDS_COLUMN,
+        schema.DIFF_TOKEN_IDS_COLUMN,
     ):
         expected = (
             tokenized_rows[0][column] if column in tokenized_rows[0] else rows[0][column]
@@ -664,8 +707,42 @@ def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
 
     assert overflow == []
     assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 3, 4, 9, 10]
-    assert rows[0][DOC_IDS_COLUMN][0] == rows[0][DOC_IDS_COLUMN][2]
-    assert rows[0][DOC_IDS_COLUMN][3] != rows[0][DOC_IDS_COLUMN][4]
+    # Packed segment IDs express attention/loss boundaries. Separate source rows
+    # remain separate segments even when they are fragments of the same source.
+    assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2, 3, 3]
+    stable_sources = rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert stable_sources[0] == stable_sources[2]
+    assert stable_sources[3] != stable_sources[4]
+    assert all(value > 0 for value in stable_sources)
+
+
+def test_pack_enriched_rows_does_not_collide_anonymous_and_typed_source_ids(
+    tmp_path: Path,
+) -> None:
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[1, 2], [3, 4]],
+                "source_doc_id": [None, "alpha"],
+            }
+        ),
+        tmp_path / "train_00000.parquet",
+    )
+
+    docs = read_tokenized_documents(tmp_path)
+    rows, overflow = pack_documents(
+        docs,
+        target_length=4,
+        pad_token_id=0,
+        strategy="sequential",
+    )
+
+    assert overflow == []
+    source_ids = rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert source_ids[:2] == [source_ids[0], source_ids[0]]
+    assert source_ids[2:] == [source_ids[2], source_ids[2]]
+    assert source_ids[0] > 0 and source_ids[2] > 0
+    assert source_ids[0] != source_ids[2]
 
 
 def test_token_budget_slices_semantic_char_metadata() -> None:
@@ -1074,6 +1151,8 @@ def test_commit_enriched_builder_emits_temporal_char_annotations() -> None:
             "old_content": old_text,
             "new_content": new_text,
             "diff": diff,
+            "subject": "Return the updated value",
+            "body": "Keep the implementation aligned with the new contract.",
         },
         section_kinds=["c", "o", "c", "n"],
     )
@@ -1084,6 +1163,14 @@ def test_commit_enriched_builder_emits_temporal_char_annotations() -> None:
     assert any(doc["change_mask_post"])
     assert any(value == 2 for value in doc["edit_op_per_char"])
     assert any(doc["hunk_id_per_char"])
+    assert doc["ifim_instruction_text"] == (
+        "Return the updated value\n\n"
+        "Keep the implementation aligned with the new contract."
+    )
+    assert doc["commit_msg_text"] == doc["ifim_instruction_text"]
+    assert doc["pre_text"] == old_text
+    assert doc["post_text"] == new_text
+    assert doc["diff_text"] == diff
 
 
 def test_process_record_reuses_identical_file_analysis_with_cache(tmp_path) -> None:
@@ -1171,6 +1258,48 @@ def test_tokenized_materializer_maps_temporal_char_annotations_to_tokens() -> No
     assert any(value == 2 for value in row[schema.EDIT_OP_PER_TOKEN_COLUMN])
     assert row[schema.CHANGED_CHUNK_IDS_COLUMN] == [0]
     assert row[schema.CHANGED_CHUNK_SPANS_COLUMN]
+
+
+def test_tokenized_materializer_uses_only_typed_objective_sections() -> None:
+    text = "int main() { return 2; }"
+    base = {
+        "text": text,
+        "structure_ids": [3] * len(text),
+        "chunk_boundaries": [
+            {"start": 0, "end": len(text), "kind": 3, "dep_level": 0}
+        ],
+        "call_edges": [],
+        "type_edges": [],
+    }
+    docs = [
+        {
+            **base,
+            "source_text": "/** @brief rendered wrapper must be ignored */",
+            "ifim_instruction_text": "Return the updated value",
+            "commit_msg_text": "Return the updated value",
+            "pre_text": "return 1;",
+            "post_text": "return 2;",
+            "diff_text": "-return 1;\n+return 2;",
+        },
+        {
+            **base,
+            "source_text": "/** @brief wrapper-only instruction */",
+        },
+    ]
+
+    typed, wrapper_only = materialize_tokenized_enriched_batch(
+        docs, _CharTokenizer()
+    )
+
+    for column in (
+        schema.IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+        schema.COMMIT_MSG_TOKEN_IDS_COLUMN,
+        schema.PRE_TOKEN_IDS_COLUMN,
+        schema.POST_TOKEN_IDS_COLUMN,
+        schema.DIFF_TOKEN_IDS_COLUMN,
+    ):
+        assert typed[column]
+        assert wrapper_only[column] == []
 
 
 def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:

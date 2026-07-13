@@ -5,6 +5,7 @@ into model, loss, and indexer code.  It carries:
 
   * core LM tensors  : token_ids (+ optional target_ids / loss_mask / document_ids)
   * provenance       : repo / filepath / commit_or_ref
+  * objective source : typed IFIM instruction token ids
   * structure        : structure_ids / ast_depth / sibling_index / ast_node_type /
                        dep_levels  (token-aligned side channels)
   * token semantics  : symbol_ids / call_targets / type_refs / def_use
@@ -98,6 +99,9 @@ class CodePacket:
     repo: str | None = None
     filepath: str | None = None
     commit_or_ref: str | None = None
+
+    # Non-token-aligned objective context from an authoritative source column.
+    ifim_instruction_token_ids: mx.array | None = None
 
     # Structure side-channels (token-aligned).
     structure_ids: mx.array | None = None
@@ -241,6 +245,19 @@ class CodePacket:
                     f"{type(value).__name__}"
                 )
 
+        instruction_ids = self.ifim_instruction_token_ids
+        if instruction_ids is not None:
+            if not isinstance(instruction_ids, mx.array):
+                raise TypeError(
+                    "CodePacket.ifim_instruction_token_ids must be an mx.array "
+                    f"or None, got {type(instruction_ids).__name__}"
+                )
+            if instruction_ids.ndim != 1:
+                raise ValueError(
+                    "CodePacket.ifim_instruction_token_ids must be 1-D, got "
+                    f"shape {tuple(instruction_ids.shape)}"
+                )
+
     @property
     def token_axis_len(self) -> int:
         return int(self.token_ids.shape[-1])
@@ -261,6 +278,7 @@ class CodePacket:
             "target_ids",
             "loss_mask",
             "document_ids",
+            "ifim_instruction_token_ids",
             *_STRUCTURE_FIELDS,
             *_SEMANTIC_FIELDS,
             *_DOMAIN_TOKEN_FIELDS,

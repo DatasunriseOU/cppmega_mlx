@@ -16,11 +16,21 @@ from cppmega_mlx.data.domain_schema import (
 )
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    COMMIT_MSG_TEXT_COLUMN,
+    COMMIT_MSG_TOKEN_IDS_COLUMN,
+    DIFF_TEXT_COLUMN,
+    DIFF_TOKEN_IDS_COLUMN,
+    IFIM_INSTRUCTION_TEXT_COLUMN,
+    IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
     PLATFORM_IDS_COLUMN,
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
+    POST_TEXT_COLUMN,
+    POST_TOKEN_IDS_COLUMN,
+    PRE_TEXT_COLUMN,
+    PRE_TOKEN_IDS_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_AST_NODE_TYPE_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
@@ -616,8 +626,33 @@ def materialize_tokenized_enriched_batch(
             "cannot materialize token-level enriched metadata offline."
         )
 
+    objective_token_batches: dict[str, list[list[int]]] = {}
+    for text_column, token_column in (
+        (IFIM_INSTRUCTION_TEXT_COLUMN, IFIM_INSTRUCTION_TOKEN_IDS_COLUMN),
+        (COMMIT_MSG_TEXT_COLUMN, COMMIT_MSG_TOKEN_IDS_COLUMN),
+        (PRE_TEXT_COLUMN, PRE_TOKEN_IDS_COLUMN),
+        (POST_TEXT_COLUMN, POST_TOKEN_IDS_COLUMN),
+        (DIFF_TEXT_COLUMN, DIFF_TOKEN_IDS_COLUMN),
+    ):
+        section_texts = [
+            value if isinstance(value, str) and value.strip() else ""
+            for doc in docs
+            for value in (doc.get(text_column),)
+        ]
+        encoded, _ = _encode_batch_with_optional_char_spans(
+            tokenizer,
+            section_texts,
+            num_threads=num_threads,
+        )
+        objective_token_batches[token_column] = [
+            [int(token_id) for token_id in token_ids] if text else []
+            for text, token_ids in zip(section_texts, encoded)
+        ]
+
     out = []
-    for doc, token_ids, token_spans in zip(docs, token_lists, token_spans_batch):
+    for doc_index, (doc, token_ids, token_spans) in enumerate(
+        zip(docs, token_lists, token_spans_batch)
+    ):
         token_ids = [int(tok) for tok in token_ids]
         token_structure_ids = _chars_to_tokens_structure_ids(
             doc.get("structure_ids", []),
@@ -750,6 +785,10 @@ def materialize_tokenized_enriched_batch(
             TOKEN_CHANGE_MASK_POST_COLUMN: token_change_mask_post,
             HUNK_ID_PER_TOKEN_COLUMN: hunk_id_per_token,
             EDIT_OP_PER_TOKEN_COLUMN: edit_op_per_token,
+            **{
+                column: token_batches[doc_index]
+                for column, token_batches in objective_token_batches.items()
+            },
         }
         row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
         domain = _domain_kind_from_doc(doc)

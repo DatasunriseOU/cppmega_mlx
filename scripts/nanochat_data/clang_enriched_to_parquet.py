@@ -72,9 +72,13 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     AUTHOR_TIMESTAMP_COLUMN,
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_MSG_TEXT_COLUMN,
+    COMMIT_MSG_TOKEN_IDS_COLUMN,
     COMMIT_HASH_COLUMN,
     COMMIT_TIMESTAMP_COLUMN,
     DOC_TYPE_COLUMN,
+    DIFF_TEXT_COLUMN,
+    DIFF_TOKEN_IDS_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     FILEPATH_COLUMN,
     FILEPATH_STABLE_ID_COLUMN,
@@ -84,9 +88,15 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     HAS_PR_DISCUSSION_COLUMN,
     HAS_RENAME_AMBIGUITY_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
+    IFIM_INSTRUCTION_TEXT_COLUMN,
+    IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
     IS_MERGE_COMMIT_COLUMN,
     PARENT_COUNT_COLUMN,
     PARENT_HASHES_COLUMN,
+    POST_TEXT_COLUMN,
+    POST_TOKEN_IDS_COLUMN,
+    PRE_TEXT_COLUMN,
+    PRE_TOKEN_IDS_COLUMN,
     PR_DISCUSSION_CHARS_COLUMN,
     PR_DISCUSSION_LINES_COLUMN,
     PR_NUMBER_COLUMN,
@@ -378,6 +388,11 @@ def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dic
 _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
     pa.field("source_text", pa.string()),
+    pa.field(IFIM_INSTRUCTION_TEXT_COLUMN, pa.string()),
+    pa.field(COMMIT_MSG_TEXT_COLUMN, pa.string()),
+    pa.field(PRE_TEXT_COLUMN, pa.string()),
+    pa.field(POST_TEXT_COLUMN, pa.string()),
+    pa.field(DIFF_TEXT_COLUMN, pa.string()),
     pa.field("source_doc_id", pa.string()),
     pa.field(DOC_TYPE_COLUMN, pa.string()),
     pa.field(HEADER_FRAGMENT_KIND_COLUMN, pa.string()),
@@ -475,6 +490,11 @@ _SCHEMA = pa.schema([
     pa.field(HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN, pa.bool_()),
     pa.field(HAS_RENAME_AMBIGUITY_COLUMN, pa.bool_()),
     pa.field(TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(IFIM_INSTRUCTION_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(COMMIT_MSG_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(PRE_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(POST_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(DIFF_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
     pa.field(PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_STRUCTURE_IDS_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
@@ -552,6 +572,11 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     tokenized_rows = tokenized_rows or [{} for _ in rows]
     texts = []
     source_texts = []
+    ifim_instruction_texts = []
+    commit_msg_texts = []
+    pre_texts = []
+    post_texts = []
+    diff_texts = []
     source_doc_ids = []
     doc_types = []
     header_fragment_kinds = []
@@ -608,6 +633,11 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     ambiguous_reconstruction = []
     rename_ambiguity = []
     token_ids_col = []
+    ifim_instruction_token_ids_col = []
+    commit_msg_token_ids_col = []
+    pre_token_ids_col = []
+    post_token_ids_col = []
+    diff_token_ids_col = []
     platform_ids_col = []
     token_structure_ids_col = []
     token_dep_levels_col = []
@@ -645,9 +675,12 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     for row, tokenized in zip(rows, tokenized_rows):
         row_text = row.get("text", "")
         texts.append(row_text)
-        # source_text falls back to the emitted text when absent so the column
-        # is always populated for the IFIM objective.
-        source_texts.append(row.get("source_text") or row_text)
+        source_texts.append(row.get("source_text"))
+        ifim_instruction_texts.append(row.get(IFIM_INSTRUCTION_TEXT_COLUMN))
+        commit_msg_texts.append(row.get(COMMIT_MSG_TEXT_COLUMN))
+        pre_texts.append(row.get(PRE_TEXT_COLUMN))
+        post_texts.append(row.get(POST_TEXT_COLUMN))
+        diff_texts.append(row.get(DIFF_TEXT_COLUMN))
         raw_source_doc_id = row.get("source_doc_id")
         source_doc_ids.append(
             None if raw_source_doc_id is None else str(raw_source_doc_id)
@@ -805,6 +838,15 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         )
         rename_ambiguity.append(row.get(HAS_RENAME_AMBIGUITY_COLUMN, False))
         token_ids_col.append(tokenized.get(TOKEN_IDS_COLUMN, []))
+        ifim_instruction_token_ids_col.append(
+            tokenized.get(IFIM_INSTRUCTION_TOKEN_IDS_COLUMN, [])
+        )
+        commit_msg_token_ids_col.append(
+            tokenized.get(COMMIT_MSG_TOKEN_IDS_COLUMN, [])
+        )
+        pre_token_ids_col.append(tokenized.get(PRE_TOKEN_IDS_COLUMN, []))
+        post_token_ids_col.append(tokenized.get(POST_TOKEN_IDS_COLUMN, []))
+        diff_token_ids_col.append(tokenized.get(DIFF_TOKEN_IDS_COLUMN, []))
         platform_ids_col.append(tokenized.get(PLATFORM_IDS_COLUMN, []))
         token_structure_ids_col.append(tokenized.get(TOKEN_STRUCTURE_IDS_COLUMN, []))
         token_dep_levels_col.append(tokenized.get(TOKEN_DEP_LEVELS_COLUMN, []))
@@ -858,6 +900,22 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             "text": pa.array(texts, type=_SCHEMA.field("text").type),
             "source_text": pa.array(
                 source_texts, type=_SCHEMA.field("source_text").type
+            ),
+            IFIM_INSTRUCTION_TEXT_COLUMN: pa.array(
+                ifim_instruction_texts,
+                type=_SCHEMA.field(IFIM_INSTRUCTION_TEXT_COLUMN).type,
+            ),
+            COMMIT_MSG_TEXT_COLUMN: pa.array(
+                commit_msg_texts, type=_SCHEMA.field(COMMIT_MSG_TEXT_COLUMN).type
+            ),
+            PRE_TEXT_COLUMN: pa.array(
+                pre_texts, type=_SCHEMA.field(PRE_TEXT_COLUMN).type
+            ),
+            POST_TEXT_COLUMN: pa.array(
+                post_texts, type=_SCHEMA.field(POST_TEXT_COLUMN).type
+            ),
+            DIFF_TEXT_COLUMN: pa.array(
+                diff_texts, type=_SCHEMA.field(DIFF_TEXT_COLUMN).type
             ),
             "source_doc_id": pa.array(
                 source_doc_ids, type=_SCHEMA.field("source_doc_id").type
@@ -1013,6 +1071,23 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             ),
             TOKEN_IDS_COLUMN: pa.array(
                 token_ids_col, type=_SCHEMA.field(TOKEN_IDS_COLUMN).type
+            ),
+            IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: pa.array(
+                ifim_instruction_token_ids_col,
+                type=_SCHEMA.field(IFIM_INSTRUCTION_TOKEN_IDS_COLUMN).type,
+            ),
+            COMMIT_MSG_TOKEN_IDS_COLUMN: pa.array(
+                commit_msg_token_ids_col,
+                type=_SCHEMA.field(COMMIT_MSG_TOKEN_IDS_COLUMN).type,
+            ),
+            PRE_TOKEN_IDS_COLUMN: pa.array(
+                pre_token_ids_col, type=_SCHEMA.field(PRE_TOKEN_IDS_COLUMN).type
+            ),
+            POST_TOKEN_IDS_COLUMN: pa.array(
+                post_token_ids_col, type=_SCHEMA.field(POST_TOKEN_IDS_COLUMN).type
+            ),
+            DIFF_TOKEN_IDS_COLUMN: pa.array(
+                diff_token_ids_col, type=_SCHEMA.field(DIFF_TOKEN_IDS_COLUMN).type
             ),
             PLATFORM_IDS_COLUMN: pa.array(
                 platform_ids_col, type=_SCHEMA.field(PLATFORM_IDS_COLUMN).type

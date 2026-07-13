@@ -828,6 +828,24 @@ def _audit_table(
                     row_bad=row_bad,
                 )
 
+        if "token_source_doc_ids" in names:
+            source_rows = table.column("token_source_doc_ids").to_pylist()
+            bad_source_rows = 0
+            for row_index, valid_count in enumerate(valid):
+                source_ids = [int(value) for value in (source_rows[row_index] or [])]
+                prefix = source_ids[: int(valid_count)]
+                if len(prefix) != int(valid_count) or any(value <= 0 for value in prefix):
+                    row_bad[row_index] = True
+                    bad_source_rows += 1
+            if bad_source_rows:
+                stats.field_stats["token_source_doc_ids"].bad_value_rows += (
+                    bad_source_rows
+                )
+                stats.errors.append(
+                    f"{bad_source_rows} rows: token_source_doc_ids must "
+                    "be positive within valid_token_count"
+                )
+
         for name in SOURCE_COLUMNS:
             if name in names:
                 _add_generic_list_stats(stats, name, table.column(name))

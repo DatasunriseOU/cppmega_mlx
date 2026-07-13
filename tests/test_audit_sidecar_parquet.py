@@ -56,6 +56,7 @@ def _write_tiny_parquet(
         "token_ast_depth": [1, 2, 2, 1, 0, 0, 0, 0],
         "token_sibling_index": [0, 1, 2, 3, 0, 0, 0, 0],
         "token_ast_node_type": [3, 4, 4, 3, 0, 0, 0, 0],
+        "token_source_doc_ids": [7, 7, 7, 7, 0, 0, 0, 0],
         "token_symbol_ids": [0, 21, 0, 0, 0, 0, 0, 0],
         "token_call_targets": [0, 0, 22, 0, 0, 0, 0, 0],
         "token_type_refs": [0, 0, 0, 23, 0, 0, 0, 0],
@@ -245,9 +246,13 @@ def test_sidecar_audit_accepts_correct_multidoc_loss_mask(tmp_path):
         doc_ids=(1, 1, 1, 2, 2, 2, 2, 2),
         loss_mask=(1, 1, 0, 1, 0, 0, 0, 0),  # canonical: 0 at the inter-doc boundary
         valid_token_count=5,
-        trained_token_count=3,
-        extra={"source_doc_ids": [7, 9], "source_doc_token_lengths": [3, 2]},
-    )
+            trained_token_count=3,
+            extra={
+                "source_doc_ids": [7, 9],
+                "source_doc_token_lengths": [3, 2],
+                "token_source_doc_ids": [7, 7, 7, 7, 7, 0, 0, 0],
+            },
+        )
 
     proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
 
@@ -335,7 +340,7 @@ def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(t
         "token_role_ids": [1, 6, 4, 1, 0, 0, 0, 0],
         "token_entity_ids": [0, 1, 2, 0, 0, 0, 0, 0],
         "token_scope_ids": [0, 0, 1, 0, 0, 0, 0, 0],
-        "token_source_doc_ids": [0, 0, 0, 0, 0, 0, 0, 0],
+        "token_source_doc_ids": [7, 7, 7, 7, 0, 0, 0, 0],
         "token_confidence_ids": [4, 4, 4, 4, 0, 0, 0, 0],
         "token_domain_edges": [{"from": 1, "to": 2, "kind": 26}],
         "token_build_edges": [{"from": 1, "to": 2, "kind": 26}],
@@ -360,6 +365,29 @@ def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(t
     assert report["total"]["edge_count"]["token_domain_edges"] == 1
     assert report["total"]["fields"]["token_domain_ids"]["bad_length_rows"] == 0
     assert report["total"]["fields"]["token_role_ids"]["bad_value_rows"] == 0
+
+
+def test_sidecar_audit_rejects_zero_stable_source_id_inside_valid_prefix(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={"token_source_doc_ids": [7, 0, 7, 7, 0, 0, 0, 0]},
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report is not None
+    assert report["total"]["fields"]["token_source_doc_ids"]["bad_value_rows"] >= 1
+    assert any(
+        "token_source_doc_ids must be positive" in error
+        for error in report["total"]["errors"]
+    )
 
 
 def test_sidecar_audit_rejects_bad_trained_token_count(tmp_path):

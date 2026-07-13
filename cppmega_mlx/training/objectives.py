@@ -36,16 +36,24 @@ import mlx.core as mx
 import numpy as np
 
 from cppmega_mlx.data.ast_fim import (
+    DEFAULT_AST_FIM_RATE,
     AstFimResult,
-    InstructionEncoder,
     apply_ast_fim,
-    apply_ast_ifim,
 )
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.fim import (
+    FIMMode,
     FIMSpecialTokenIds,
     FIMSpecialTokenInput,
+    apply_fim_permutation,
+    apply_ifim_permutation,
+    sample_middle_span,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    OBJECTIVE_BOUNDARY_TOKEN_IDS,
+    REQUIRED_SPECIAL_TOKEN_IDS,
+    TOOL_USE_SPECIAL_TOKEN_IDS,
 )
 
 RecoveryKind = Literal["symbol", "type", "callee"]
@@ -206,6 +214,7 @@ def build_ast_fim(
     seed: int | None = None,
     rng: random.Random | None = None,
     spm_rate: float = 0.5,
+    ast_fim_rate: float = DEFAULT_AST_FIM_RATE,
     special_token_ids: FIMSpecialTokenInput = None,
 ) -> ObjectiveExample:
     """AST-aware FIM (90% whole-chunk middle / 10% char-FIM) objective example."""
@@ -215,27 +224,103 @@ def build_ast_fim(
         seed=seed,
         rng=rng,
         spm_rate=spm_rate,
+        ast_fim_rate=ast_fim_rate,
         special_token_ids=special_token_ids,
     )
     return _example_from_fim(
-        result, objective="ast_fim", special_token_ids=special_token_ids
+        result,
+        objective="ast_fim" if result.kind == "ast_fim" else "fim",
+        special_token_ids=special_token_ids,
     )
 
 
-def build_ifim(
+def _random_fim_result(
     packet: CodePacket,
     *,
-    instruction_encoder: InstructionEncoder,
+    instruction_token_ids: list[int] | None,
+    seed: int | None,
+    rng: random.Random | None,
+    spm_rate: float,
+    special_token_ids: FIMSpecialTokenInput,
+) -> AstFimResult:
+    if rng is not None and seed is not None:
+        raise ValueError("pass either seed or rng, not both")
+    if not 0.0 <= spm_rate <= 1.0:
+        raise ValueError(f"spm_rate must be in [0, 1], got {spm_rate}")
+    rand = rng if rng is not None else random.Random(seed)
+    tokens = _token_list(packet.token_ids, where="fim: CodePacket.token_ids")
+    if len(tokens) < 3:
+        raise ValueError(f"fim requires at least 3 tokens, got {len(tokens)}")
+    span = sample_middle_span(len(tokens), rng=rand)
+    mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
+    if instruction_token_ids is None:
+        permuted = apply_fim_permutation(
+            tokens,
+            span=span,
+            mode=mode,
+            special_token_ids=special_token_ids,
+        )
+        kind = "fim"
+    else:
+        permuted = apply_ifim_permutation(
+            tokens,
+            instruction_token_ids=instruction_token_ids,
+            span=span,
+            mode=mode,
+            special_token_ids=special_token_ids,
+        )
+        kind = "ifim"
+    return AstFimResult(
+        token_ids=permuted,
+        span=span,
+        mode=mode,
+        kind=kind,
+        chunk_index=None,
+    )
+
+
+def build_fim(
+    packet: CodePacket,
+    *,
     seed: int | None = None,
     rng: random.Random | None = None,
     spm_rate: float = 0.5,
     special_token_ids: FIMSpecialTokenInput = None,
 ) -> ObjectiveExample:
-    """Instruction-aware AST-FIM objective using a leading comment/docstring."""
+    """Plain token-span FIM, distinct from clang chunk-aware AST-FIM."""
 
-    result = apply_ast_ifim(
+    result = _random_fim_result(
         packet,
-        instruction_encoder=instruction_encoder,
+        instruction_token_ids=None,
+        seed=seed,
+        rng=rng,
+        spm_rate=spm_rate,
+        special_token_ids=special_token_ids,
+    )
+    return _example_from_fim(result, objective="fim", special_token_ids=special_token_ids)
+
+
+def build_ifim(
+    packet: CodePacket,
+    *,
+    seed: int | None = None,
+    rng: random.Random | None = None,
+    spm_rate: float = 0.5,
+    special_token_ids: FIMSpecialTokenInput = None,
+) -> ObjectiveExample:
+    """Instruction-aware token-span FIM from typed upstream instruction IDs."""
+
+    instruction_ids = _token_list(
+        packet.ifim_instruction_token_ids,
+        where="ifim: CodePacket.ifim_instruction_token_ids",
+    )
+    if not instruction_ids:
+        raise ValueError(
+            "ifim: CodePacket.ifim_instruction_token_ids must not be empty"
+        )
+    result = _random_fim_result(
+        packet,
+        instruction_token_ids=instruction_ids,
         seed=seed,
         rng=rng,
         spm_rate=spm_rate,
@@ -256,7 +341,8 @@ def build_commit_diff(
 ) -> ObjectiveExample:
     """Predict the unified diff from the commit message.
 
-    Sequence: ``<commit_msg> <diff_token_ids> EOT``.  Loss on the diff + EOT.
+    Sequence: ``COMMENT_START <commit_msg> COMMENT_END DIFF_START
+    <diff_token_ids> DIFF_END EOT``.  Loss on the diff body, DIFF_END, and EOT.
     RAISES if either ``commit_msg`` or ``diff_token_ids`` is absent.
     """
 
@@ -265,19 +351,34 @@ def build_commit_diff(
     diff = _token_list(
         packet.diff_token_ids, where="commit_diff: CommitPacket.diff_token_ids"
     )
-    full = [*msg, *diff, ids.eot]
-    # Loss on targets that PREDICT a diff token (or the trailing EOT): target j
-    # predicts full[j+1], so train iff that predicted index is >= prompt_len.
-    prompt_len = len(msg)
+    comment_start = OBJECTIVE_BOUNDARY_TOKEN_IDS["COMMENT_START"]
+    comment_end = OBJECTIVE_BOUNDARY_TOKEN_IDS["COMMENT_END"]
+    diff_start = OBJECTIVE_BOUNDARY_TOKEN_IDS["DIFF_START"]
+    diff_end = OBJECTIVE_BOUNDARY_TOKEN_IDS["DIFF_END"]
+    message_section = [comment_start, *msg, comment_end]
+    diff_section = [diff_start, *diff, diff_end]
+    full = [*message_section, *diff_section, ids.eot]
+    # DIFF_START is context. Supervision begins with the first real diff token.
+    diff_content_start = len(message_section) + 1
     targets = full[1:]
-    loss_positions = [((j + 1) >= prompt_len) for j in range(len(targets))]
+    loss_positions = [
+        (target_index + 1) >= diff_content_start
+        for target_index in range(len(targets))
+    ]
     inputs, targets_arr, mask = _shifted(full, loss_positions)
     return ObjectiveExample(
         input_ids=inputs,
         target_ids=targets_arr,
         loss_mask=mask,
         objective="commit_diff",
-        metadata={"prompt_len": prompt_len, "diff_len": len(diff)},
+        metadata={
+            "prompt_len": diff_content_start,
+            "diff_len": len(diff),
+            "section_boundaries": {
+                "commit_message": (0, len(message_section)),
+                "diff": (len(message_section), len(message_section) + len(diff_section)),
+            },
+        },
     )
 
 
@@ -288,9 +389,9 @@ def build_pre_to_post(
 ) -> ObjectiveExample:
     """Predict the post-edit file from the pre-edit file (+ commit message).
 
-    Sequence: ``<pre_token_ids> [commit_msg] <post_token_ids> EOT``.  Loss on the
-    post tokens + EOT.  RAISES if ``pre_token_ids`` or ``post_token_ids`` absent.
-    ``commit_msg`` is optional context and included only when present.
+    Sequence: ``CODE_START <pre> CODE_END COMMENT_START <commit_msg> COMMENT_END
+    FILE_SEP CODE_START <post> CODE_END EOT``. Loss is on the post body,
+    CODE_END, and EOT. All three typed sections are required.
     """
 
     ids = _resolve_special_ids(special_token_ids)
@@ -298,14 +399,25 @@ def build_pre_to_post(
     post = _token_list(
         packet.post_token_ids, where="pre_to_post: CommitPacket.post_token_ids"
     )
-    msg: list[int] = []
-    if packet.commit_msg is not None:
-        msg = _token_list(packet.commit_msg, where="pre_to_post: CommitPacket.commit_msg")
-    prompt = [*pre, *msg]
-    full = [*prompt, *post, ids.eot]
-    prompt_len = len(prompt)
+    msg = _token_list(
+        packet.commit_msg, where="pre_to_post: CommitPacket.commit_msg"
+    )
+    code_start = REQUIRED_SPECIAL_TOKEN_IDS["CODE_START"]
+    code_end = TOOL_USE_SPECIAL_TOKEN_IDS["CODE_END"]
+    comment_start = OBJECTIVE_BOUNDARY_TOKEN_IDS["COMMENT_START"]
+    comment_end = OBJECTIVE_BOUNDARY_TOKEN_IDS["COMMENT_END"]
+    file_sep = OBJECTIVE_BOUNDARY_TOKEN_IDS["FILE_SEP"]
+    pre_section = [code_start, *pre, code_end]
+    message_section = [comment_start, *msg, comment_end]
+    post_section = [code_start, *post, code_end]
+    post_section_start = len(pre_section) + len(message_section) + 1
+    post_content_start = post_section_start + 1
+    full = [*pre_section, *message_section, file_sep, *post_section, ids.eot]
     targets = full[1:]
-    loss_positions = [((j + 1) >= prompt_len) for j in range(len(targets))]
+    loss_positions = [
+        (target_index + 1) >= post_content_start
+        for target_index in range(len(targets))
+    ]
     inputs, targets_arr, mask = _shifted(full, loss_positions)
     return ObjectiveExample(
         input_ids=inputs,
@@ -313,9 +425,17 @@ def build_pre_to_post(
         loss_mask=mask,
         objective="pre_to_post",
         metadata={
-            "prompt_len": prompt_len,
+            "prompt_len": post_content_start,
             "post_len": len(post),
             "msg_len": len(msg),
+            "section_boundaries": {
+                "pre": (0, len(pre_section)),
+                "commit_message": (
+                    len(pre_section),
+                    len(pre_section) + len(message_section),
+                ),
+                "post": (post_section_start, post_section_start + len(post_section)),
+            },
         },
     )
 
@@ -367,14 +487,15 @@ def build_recovery(
     kind: RecoveryKind,
     seed: int | None = None,
     rng: random.Random | None = None,
+    special_token_ids: FIMSpecialTokenInput = None,
 ) -> ObjectiveExample:
-    """Mask an identifier/type/callee span and train exact-token recovery.
+    """Remove an identifier/type/callee span and train exact-token recovery.
 
     The masked span is located from the token-aligned ``symbol_ids`` (symbol),
     ``type_refs`` (type), or ``call_targets`` (callee) channel.  The example is a
-    full causal pass where the loss mask is ``1`` ONLY on the target positions
-    that predict the masked span's tokens (the model must recover the exact
-    identifier/type/callee tokens from surrounding context).
+    FIM permutation where the answer occurs only after ``FIM_MIDDLE``. The
+    objective marker identifies the typed recovery channel, while the source
+    answer cannot leak through the causal prefix.
 
     RAISES if ``kind`` is unknown, the required channel is absent, or the channel
     carries no non-zero span.
@@ -405,23 +526,43 @@ def build_recovery(
     start, end, marker_id = _find_recovery_span(
         marker, rng=rand, where=f"{kind}_recovery: CodePacket.{field_name}"
     )
-    # Full causal sequence; supervise only the target positions inside the span.
-    # target index j predicts ids[j+1]; train iff that predicted token (j+1) is in
-    # [start, end).
-    targets = ids[1:]
-    loss_positions = [(start <= (j + 1) < end) for j in range(len(targets))]
-    if not any(loss_positions):
-        raise ValueError(
-            f"{kind}_recovery: span [{start}, {end}) yields no supervised target "
-            "position (span begins at token 0 with length 1); cannot train"
-        )
-    inputs, targets_arr, mask = _shifted(ids, loss_positions)
+    special = _resolve_special_ids(special_token_ids)
+    recovery_marker = {
+        "symbol": OBJECTIVE_BOUNDARY_TOKEN_IDS["SYMBOL_REF"],
+        "type": OBJECTIVE_BOUNDARY_TOKEN_IDS["TYPE_INFO"],
+        "callee": OBJECTIVE_BOUNDARY_TOKEN_IDS["OVERLOAD_SET"],
+    }[kind]
+    prefix = ids[:start]
+    answer = ids[start:end]
+    suffix = ids[end:]
+    full = [
+        special.fim_prefix,
+        recovery_marker,
+        *prefix,
+        special.fim_suffix,
+        *suffix,
+        special.fim_middle,
+        *answer,
+        special.eot,
+    ]
+    answer_start = len(full) - len(answer) - 1
+    targets = full[1:]
+    loss_positions = [
+        (target_index + 1) >= answer_start
+        for target_index in range(len(targets))
+    ]
+    inputs, targets_arr, mask = _shifted(full, loss_positions)
     return ObjectiveExample(
         input_ids=inputs,
         target_ids=targets_arr,
         loss_mask=mask,
         objective=f"{kind}_recovery",
-        metadata={"span": (start, end), "marker_id": marker_id},
+        metadata={
+            "span": (start, end),
+            "marker_id": marker_id,
+            "recovery_marker_id": recovery_marker,
+            "answer_start": answer_start,
+        },
     )
 
 
@@ -431,6 +572,7 @@ __all__ = [
     "build_ast_fim",
     "build_causal_lm",
     "build_commit_diff",
+    "build_fim",
     "build_ifim",
     "build_pre_to_post",
     "build_recovery",

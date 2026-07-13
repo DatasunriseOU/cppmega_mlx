@@ -1920,6 +1920,36 @@ def _build_enriched_from_parts(
         'changed_symbol_ids': changed_symbol_ids or [],
         'ripple_candidates': ripple_candidates or [],
     }
+    typed_message_parts = [
+        value.strip()
+        for value in (record.get('subject'), record.get('body'))
+        if isinstance(value, str) and value.strip()
+    ]
+    typed_commit_message = '\n\n'.join(typed_message_parts)
+    typed_section_kinds = section_kinds or ['c'] * len(texts)
+    result.update(
+        {
+            # These fields come from typed upstream values. Downstream objective
+            # code must never recover them by parsing rendered doc wrappers.
+            'ifim_instruction_text': typed_commit_message,
+            'commit_msg_text': typed_commit_message,
+            'pre_text': '\n\n'.join(
+                text
+                for text, section_kind in zip(texts, typed_section_kinds)
+                if section_kind == 'o'
+            ),
+            'post_text': '\n\n'.join(
+                text
+                for text, section_kind in zip(texts, typed_section_kinds)
+                if section_kind == 'n'
+            ),
+            'diff_text': (
+                record.get('diff', '')
+                if isinstance(record.get('diff', ''), str)
+                else ''
+            ),
+        }
+    )
     # Commit docs are also C++ world-code documents.  When macro dependency
     # parts are present, route use-sites by original source line instead of
     # assembled lexical order, matching the static code path.
@@ -1934,7 +1964,7 @@ def _build_enriched_from_parts(
     temporal_meta = _build_commit_temporal_metadata(
         full_text,
         texts,
-        section_kinds or ['c'] * len(texts),
+        typed_section_kinds,
         record=record,
         old_analysis=old_analysis,
         new_analysis=new_analysis,

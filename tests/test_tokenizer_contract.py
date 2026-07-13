@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from cppmega_mlx.data.tokenizer_contract import (
+    OBJECTIVE_BOUNDARY_TOKEN_IDS,
     REQUIRED_SPECIAL_TOKEN_IDS,
     TOOL_USE_SPECIAL_TOKEN_IDS,
     validate_required_special_token_ids,
@@ -66,6 +67,26 @@ def test_tool_use_token_ids_match_vendored_artifact_contract() -> None:
         "QUERY_TOOL": 11,
         "TOOL_RESULT": 19,
     }
+
+
+def test_objective_boundary_ids_are_existing_frozen_tokens() -> None:
+    assert OBJECTIVE_BOUNDARY_TOKEN_IDS == {
+        "FILE_SEP": 14,
+        "DIFF_START": 15,
+        "DIFF_END": 16,
+        "COMMENT_START": 17,
+        "COMMENT_END": 18,
+        "SYMBOL_REF": 38,
+        "TYPE_INFO": 39,
+        "OVERLOAD_SET": 44,
+    }
+    added_tokens = {
+        added["content"].strip("<>"): added["id"]
+        for added in json.loads(_TOKENIZER_JSON_PATH.read_text())["added_tokens"]
+    }
+    assert {
+        name: added_tokens[name] for name in OBJECTIVE_BOUNDARY_TOKEN_IDS
+    } == OBJECTIVE_BOUNDARY_TOKEN_IDS
 
 
 def test_domain_delimiter_role_ids_are_reserved_contract_pairs() -> None:

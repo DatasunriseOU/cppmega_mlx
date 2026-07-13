@@ -32,6 +32,7 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     NUM_DOCS_COLUMN,
     PACKED_ROWS_CHUNK_METADATA_COLUMNS,
     PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES,
+    PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN,
     PACKED_ROWS_TOKEN_METADATA_COLUMNS,
     PACK_ID_COLUMN,
     ROW_PLATFORM_IDS_COLUMN,
@@ -40,6 +41,11 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN,
     SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
     SOURCE_HEADER_FRAGMENT_KINDS_COLUMN,
+    SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+    SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
+    SOURCE_PRE_TOKEN_IDS_COLUMN,
+    SOURCE_POST_TOKEN_IDS_COLUMN,
+    SOURCE_DIFF_TOKEN_IDS_COLUMN,
     SOURCE_PR_DISCUSSION_CHARS_COLUMN,
     SOURCE_PR_DISCUSSION_LINES_COLUMN,
     SOURCE_PR_NUMBERS_COLUMN,
@@ -226,6 +232,14 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_PR_DISCUSSION_LINES_COLUMN, pa.list_(pa.int32())),
         pa.field(SOURCE_DOC_TYPES_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, pa.list_(pa.string())),
+        pa.field(
+            SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+            pa.list_(pa.list_(pa.uint32())),
+        ),
+        pa.field(SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
+        pa.field(SOURCE_PRE_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
+        pa.field(SOURCE_POST_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
+        pa.field(SOURCE_DIFF_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
         pa.field(ROW_PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
         pa.field(REPO_COLUMN, pa.string()),
         pa.field(FILEPATH_COLUMN, pa.string()),
@@ -311,6 +325,7 @@ class NormalizedDoc:
     changed_chunk_ids: list[int]
     changed_chunk_spans: list[tuple[int, int]]
     chronology: dict[str, Any]
+    objective_token_ids: dict[str, list[int]] = field(default_factory=dict)
     # Explicit doc-level dependency edges: source_doc_index values this document
     # depends on (a dependency must be packed BEFORE this document in the row).
     # Empty when only dep_level ordering applies.
@@ -374,6 +389,12 @@ class NormalizedDoc:
             ],
         }
         record.update(self.chronology)
+        record.update(
+            {
+                token_column: list(values)
+                for token_column, values in self.objective_token_ids.items()
+            }
+        )
         for column, values in self.token_meta.items():
             record[column] = list(values)
         return record
@@ -923,6 +944,10 @@ def normalize_document_record(
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
         chronology=_normalize_chronology(record),
+        objective_token_ids={
+            token_column: _as_int_list(record.get(token_column))
+            for token_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.values()
+        },
         doc_dep_edges=tuple(
             int(dep) for dep in (record.get(DOC_DEP_EDGES_COLUMN) or [])
         ),
@@ -967,12 +992,17 @@ def _stable_doc_id_for_record(
     source_doc_index: int,
     signature_to_id: dict[str, int],
 ) -> int:
-    if not _has_stable_doc_signature(record):
-        return int(source_doc_index + 1)
-    signature = stable_doc_signature(record)
+    signature = (
+        stable_doc_signature(record)
+        if _has_stable_doc_signature(record)
+        else f"__anonymous_source_row__:{source_doc_index}"
+    )
     doc_id = signature_to_id.get(signature)
     if doc_id is None:
-        doc_id = len(signature_to_id) + 1
+        doc_id = max(
+            max(signature_to_id.values(), default=0),
+            int(source_doc_index),
+        ) + 1
         signature_to_id[signature] = doc_id
     return int(doc_id)
 
@@ -1028,6 +1058,7 @@ def _selected_input_columns(available: set[str]) -> list[str]:
             HEADER_FRAGMENT_KIND_COLUMN,
             *PACKED_TOKEN_METADATA_COLUMNS,
             *PACKED_CHUNK_METADATA_COLUMNS,
+            *PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.values(),
         )
         if column in available
     ]
@@ -1251,6 +1282,10 @@ def _materialize_packed_row(
     source_pr_discussion_lines: list[int] = []
     source_doc_types: list[str | None] = []
     source_header_fragment_kinds: list[str | None] = []
+    objective_source_ids: dict[str, list[list[int]]] = {
+        source_column: []
+        for source_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN
+    }
     chronology = _shared_chronology_for_docs(ordered_docs)
 
     token_meta_acc: dict[str, list[int]] = {
@@ -1302,9 +1337,22 @@ def _materialize_packed_row(
         source_header_fragment_kinds.append(
             doc.chronology.get(HEADER_FRAGMENT_KIND_COLUMN)
         )
+        for source_column, token_column in (
+            PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.items()
+        ):
+            objective_source_ids[source_column].append(
+                list(doc.objective_token_ids.get(token_column, []))
+            )
 
         for column in PACKED_TOKEN_METADATA_COLUMNS:
-            values = doc.token_meta[column]
+            # Stable logical source identity is independent of row-local packed
+            # segment IDs. Repeated fragments keep the same positive source ID,
+            # while ``doc_ids`` above still opens a new attention/loss segment.
+            values = (
+                [doc.stable_doc_id] * doc.token_count
+                if column == TOKEN_SOURCE_DOC_IDS_COLUMN
+                else doc.token_meta[column]
+            )
             if values:
                 token_meta_acc[column].extend(values)
             else:
@@ -1410,6 +1458,7 @@ def _materialize_packed_row(
         SOURCE_PR_DISCUSSION_LINES_COLUMN: source_pr_discussion_lines,
         SOURCE_DOC_TYPES_COLUMN: source_doc_types,
         SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: source_header_fragment_kinds,
+        **objective_source_ids,
         ROW_PLATFORM_IDS_COLUMN: _merged_platform_ids_for_docs(ordered_docs),
         HAS_PR_DISCUSSION_COLUMN: any(source_has_pr_discussions),
         PR_DISCUSSION_CHARS_COLUMN: sum(source_pr_discussion_chars),
@@ -1539,6 +1588,13 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                     None if item is None else str(item)
                     for item in row.get(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, [])
                 ],
+                **{
+                    source_column: [
+                        _as_int_list(item)
+                        for item in row.get(source_column, [])
+                    ]
+                    for source_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN
+                },
                 ROW_PLATFORM_IDS_COLUMN: _as_int_list(row.get(ROW_PLATFORM_IDS_COLUMN)),
                 REPO_COLUMN: row.get(REPO_COLUMN),
                 FILEPATH_COLUMN: row.get(FILEPATH_COLUMN),
