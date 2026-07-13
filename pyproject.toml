@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "mlx>=0.31", "nanobind>=2.4"]
+requires = ["setuptools>=68", "mlx==0.32.0", "nanobind>=2.4"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "MLX-native local training port of cppmega model semantics"
 requires-python = ">=3.11"
 dependencies = [
-    "mlx>=0.31",
+    "mlx==0.32.0",
     "mlx-lm>=0.31",
     "numpy>=1.26",
     "safetensors>=0.7",

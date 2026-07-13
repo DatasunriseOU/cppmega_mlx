@@ -50,13 +50,21 @@ jobs:
           base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
           test -x "$base_python"
           job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
-          "$base_python" -m venv --system-site-packages "$job_venv"
+          "$base_python" -m venv "$job_venv"
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
           echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=" >> "$GITHUB_ENV"
+          echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
       - name: Python deps
         run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"
+          "$VBGUI_E2E_PYTHON" - <<'PY'
+          from cppmega_mlx.training.native_optim import status
+          native_status = status()
+          if not native_status.get("available", False):
+              raise RuntimeError(native_status.get("reason", "native optimizer extension unavailable"))
+          PY
       - name: Generate fixtures
         run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
@@ -109,12 +117,20 @@ jobs:
           base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
           test -x "$base_python"
           job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
-          "$base_python" -m venv --system-site-packages "$job_venv"
+          "$base_python" -m venv "$job_venv"
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
           echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=" >> "$GITHUB_ENV"
+          echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"
+          "$VBGUI_E2E_PYTHON" - <<'PY'
+          from cppmega_mlx.training.native_optim import status
+          native_status = status()
+          if not native_status.get("available", False):
+              raise RuntimeError(native_status.get("reason", "native optimizer extension unavailable"))
+          PY
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
@@ -162,12 +178,20 @@ jobs:
           base_python=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
           test -x "$base_python"
           job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
-          "$base_python" -m venv --system-site-packages "$job_venv"
+          "$base_python" -m venv "$job_venv"
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
           echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=" >> "$GITHUB_ENV"
+          echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"
+          "$VBGUI_E2E_PYTHON" - <<'PY'
+          from cppmega_mlx.training.native_optim import status
+          native_status = status()
+          if not native_status.get("available", False):
+              raise RuntimeError(native_status.get("reason", "native optimizer extension unavailable"))
+          PY
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui

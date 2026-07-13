@@ -83,14 +83,19 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     assert "pip install --upgrade pip" not in workflow
     assert 'job_venv="$RUNNER_TEMP/cppmega-mlx-e2e-venv"' not in workflow
     assert workflow.count('mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-') == 3
-    assert workflow.count("-m venv --system-site-packages") == 3
+    assert "--system-site-packages" not in workflow
+    assert workflow.count('"$base_python" -m venv "$job_venv"') == 3
+    assert workflow.count('echo "PYTHONPATH=" >> "$GITHUB_ENV"') == 3
+    assert workflow.count('echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"') == 3
     assert "--no-build-isolation" not in workflow
     assert workflow.count('-e ".[gui,parquet,widget]"') == 3
     assert workflow.count('echo "VBGUI_E2E_PYTHON=$job_venv/bin/python"') == 3
     assert workflow.count('rm -rf "$VBGUI_E2E_VENV"') == 3
+    assert workflow.count("native optimizer extension unavailable") == 3
 
 
 def test_build_backend_declares_mlx_imported_by_setup_py() -> None:
     config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "mlx>=0.31" in config["build-system"]["requires"]
+    assert "mlx==0.32.0" in config["build-system"]["requires"]
+    assert "mlx==0.32.0" in config["project"]["dependencies"]
