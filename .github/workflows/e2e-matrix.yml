@@ -31,6 +31,7 @@ jobs:
   # this runs on the repository's persistent Apple Silicon runner.
   preset-matrix:
     name: Preset matrix (smoke, self-hosted macOS)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 25
     strategy:
@@ -92,6 +93,7 @@ jobs:
   # Specialised + canvas smoke scenarios — run on every push (lightweight).
   specialised:
     name: Specialised + canvas smoke
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 15
     steps:
@@ -190,7 +192,7 @@ jobs:
     name: Matrix report
     needs: [preset-matrix, specialised]
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
-    if: always()
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

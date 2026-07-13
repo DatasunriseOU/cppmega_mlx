@@ -27,6 +27,7 @@ defaults:
 
 jobs:
   triage:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     timeout-minutes: 7
     permissions:
@@ -140,6 +141,8 @@ jobs:
     needs:
       - 'triage'
     if: |-
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
       needs.triage.outputs.available_labels != '' &&
       needs.triage.outputs.available_labels != '[]' &&
       needs.triage.outputs.triaged_issues != '' &&

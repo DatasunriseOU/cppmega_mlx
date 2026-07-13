@@ -25,7 +25,13 @@ defaults:
 jobs:
   debugger:
     if: |-
-      ${{ fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false) }}
+      ${{
+        fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false) &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      }}
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     permissions:
       contents: 'read'
@@ -189,7 +195,15 @@ jobs:
       - 'invoke'
       - 'plan-execute'
     if: |-
-      ${{ always() && !cancelled() && (failure() || needs.dispatch.outputs.command == 'fallthrough') }}
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) &&
+        (failure() || needs.dispatch.outputs.command == 'fallthrough')
+      }}
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     permissions:
       contents: 'read'

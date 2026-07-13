@@ -14,6 +14,7 @@ concurrency:
 jobs:
   mac-contracts:
     name: macOS MLX data, model, and eval contracts
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 30
     steps:
@@ -42,6 +43,7 @@ jobs:
 
   linux-portable:
     name: Linux portable syntax and conveyor contracts
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     timeout-minutes: 20
     steps:
