@@ -6,7 +6,11 @@ import os
 from pathlib import Path
 from typing import Any, Protocol
 
-from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_EDGE_FIELD_FAMILIES,
+    normalize_domain_edge_record,
+    slice_embedded_domain_spans,
+)
 from cppmega_mlx.tokenizer.cpp_tokenizer import CppMegaTokenizer, load_cppmega_tokenizer
 from cppmega_mlx.tokenizer.fingerprint import (
     tokenizer_fingerprint as _tokenizer_fingerprint,
@@ -15,15 +19,6 @@ from cppmega_mlx.tokenizer.fingerprint import (
 
 class TokenCounter(Protocol):
     def encode(self, text: str) -> list[int]: ...
-
-
-_DOMAIN_EDGE_FIELD_FAMILIES = {
-    "domain_edges": "domain",
-    "build_edges": "build",
-    "shell_edges": "shell",
-    "diagnostic_edges": "diagnostic",
-    "cross_domain_edges": "cross_domain",
-}
 
 
 def resolve_tokenizer_path(tokenizer_path: str | None = None) -> str:
@@ -154,10 +149,17 @@ def _slice_doc_char_range(
             "call_edges",
             "type_edges",
             "actual_token_count",
+            "embedded_domain_spans",
             *_CHAR_LEVEL_METADATA_FIELDS,
         }
     }
     sliced["text"] = text[start_char:end_char]
+    sliced["embedded_domain_spans"] = slice_embedded_domain_spans(
+        doc.get("embedded_domain_spans", []),
+        source_length=len(text),
+        start=start_char,
+        end=end_char,
+    )
 
     structure_ids = doc.get("structure_ids", [])
     if structure_ids:
@@ -243,7 +245,7 @@ def _slice_doc_char_range(
                 )
         return remapped
 
-    for edge_field, family in _DOMAIN_EDGE_FIELD_FAMILIES.items():
+    for edge_field, family in DOMAIN_EDGE_FIELD_FAMILIES.items():
         sliced[edge_field] = _remap_char_edge_triples(
             doc.get(edge_field, []),
             family=family,

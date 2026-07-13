@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from cppmega_mlx.data.build_parsers.base import ParsedDomainDocument, is_option
 from cppmega_mlx.data.domain_schema import (
     DomainEdgeKind,
@@ -24,32 +22,90 @@ _REDIR_OUT = {">", ">>", "2>", "&>"}
 _REDIR_IN = {"<"}
 
 
-def _has_unbalanced_shell_syntax(text: str, shell_kind: str) -> bool:
+def _shell_syntax_words(text: str) -> tuple[list[str], bool]:
+    words: list[str] = []
+    current: list[str] = []
     quote: str | None = None
     escaped = False
-    for char in text:
+    comment = False
+
+    def flush() -> None:
+        if current:
+            words.append("".join(current).lower())
+            current.clear()
+
+    for index, char in enumerate(text):
+        if comment:
+            if char == "\n":
+                comment = False
+            continue
         if escaped:
             escaped = False
             continue
         if char == "\\" and quote != "'":
             escaped = True
             continue
-        if quote is None and char in {'"', "'"}:
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            flush()
             quote = char
-        elif char == quote:
-            quote = None
-    if quote is not None:
+            continue
+        comment_start = (
+            char == "#"
+            and (
+                index == 0
+                or text[index - 1].isspace()
+                or text[index - 1] in ";|&(){}"
+            )
+        )
+        if comment_start:
+            flush()
+            comment = True
+            continue
+        if char.isalnum() or char == "_":
+            current.append(char)
+        else:
+            flush()
+    flush()
+    return words, quote is None
+
+
+def _has_unbalanced_shell_syntax(text: str, shell_kind: str) -> bool:
+    words, quotes_balanced = _shell_syntax_words(text)
+    if not quotes_balanced:
         return True
 
-    words = [token for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)]
     if shell_kind == "tcsh":
-        return words.count("foreach") != words.count("end") or words.count("switch") != words.count("endsw")
-    return (
-        words.count("if") != words.count("fi")
-        or words.count("case") != words.count("esac")
-        or sum(words.count(word) for word in ("for", "while", "until"))
-        > words.count("done")
-    )
+        openers = {
+            "if": "endif",
+            "foreach": "end",
+            "while": "end",
+            "switch": "endsw",
+        }
+        closers = {"end", "endsw", "endif"}
+    else:
+        openers = {
+            "if": "fi",
+            "case": "esac",
+            "for": "done",
+            "while": "done",
+            "until": "done",
+        }
+        if shell_kind in {"bash", "zsh"}:
+            openers["select"] = "done"
+        closers = {"fi", "esac", "done"}
+
+    expected_closers: list[str] = []
+    for word in words:
+        if word in openers:
+            expected_closers.append(openers[word])
+        elif word in closers:
+            if not expected_closers or expected_closers.pop() != word:
+                return True
+    return bool(expected_closers)
 
 
 def parse_shell(

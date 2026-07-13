@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
 from typing import Callable, Mapping, Sequence
 
@@ -31,6 +32,10 @@ from cppmega_mlx.data.domain_schema import (
     ParseConfidence,
 )
 from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+from cppmega_mlx.data.source_identity import (
+    MAX_SOURCE_ID,
+    stable_source_identity_id,
+)
 
 
 Parser = Callable[[str], ParsedDomainDocument]
@@ -223,15 +228,13 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
     lower_name = name.lower()
     suffix = path_obj.suffix.lower()
 
-    if suffix in _CPP_EXTENSIONS:
-        return _ADAPTERS["cpp"]
-    if name == "CMakeLists.txt" or suffix == ".cmake":
+    if name == "CMakeLists.txt":
         return _ADAPTERS["cmake"]
-    if name in {"Makefile", "GNUmakefile", "makefile"} or suffix == ".mk":
+    if name in {"Makefile", "GNUmakefile", "makefile"}:
         return _ADAPTERS["make"]
-    if name == "build.ninja" or suffix == ".ninja":
+    if name == "build.ninja":
         return _ADAPTERS["ninja"]
-    if name in {"BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"} or suffix == ".bzl":
+    if name in {"BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"}:
         return _ADAPTERS["bazel"]
     if name == "configure":
         return _ADAPTERS["configure"]
@@ -239,6 +242,21 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["autoconf"]
     if name in {"Makefile.am", "Makefile.in"}:
         return _ADAPTERS["automake"]
+
+    shebang_kind = _shell_kind_from_shebang(text)
+    if shebang_kind is not None:
+        return _ADAPTERS[shebang_kind]
+
+    if suffix in _CPP_EXTENSIONS:
+        return _ADAPTERS["cpp"]
+    if suffix == ".cmake":
+        return _ADAPTERS["cmake"]
+    if suffix == ".mk":
+        return _ADAPTERS["make"]
+    if suffix == ".ninja":
+        return _ADAPTERS["ninja"]
+    if suffix == ".bzl":
+        return _ADAPTERS["bazel"]
     if suffix in {".bash"}:
         return _ADAPTERS["bash"]
     if suffix == ".sh":
@@ -249,10 +267,6 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["tcsh"]
     if suffix == ".sql":
         return _ADAPTERS["sql"]
-
-    shebang_kind = _shell_kind_from_shebang(text)
-    if shebang_kind is not None:
-        return _ADAPTERS[shebang_kind]
 
     lower = text.lower()
     if any(tool.lower() in lower for tool in (
@@ -317,6 +331,22 @@ def _call_argument_spans(text: str, open_paren: int) -> list[tuple[int, int]]:
                 escaped = True
             elif char == quote:
                 quote = None
+        elif text.startswith('R"', idx):
+            raw_literal = _CPP_RAW_SQL_RE.match(text, idx)
+            if raw_literal is None:
+                return []
+            idx = raw_literal.end()
+            continue
+        elif text.startswith("//", idx):
+            newline = text.find("\n", idx + 2)
+            idx = len(text) if newline < 0 else newline
+            continue
+        elif text.startswith("/*", idx):
+            comment_end = text.find("*/", idx + 2)
+            if comment_end < 0:
+                return []
+            idx = comment_end + 2
+            continue
         elif char in {'"', "'"}:
             quote = char
         elif char in "([{":
@@ -333,38 +363,54 @@ def _call_argument_spans(text: str, open_paren: int) -> list[tuple[int, int]]:
     return []
 
 
-def extract_embedded_domain_blocks(
-    text: str,
-    *,
-    host_domain: DomainKind,
-    source_doc_id: int = 0,
-) -> list[EmbeddedDomainBlock]:
-    """Extract exact host-character spans for supported embedded languages."""
-
-    if DomainKind(host_domain) != DomainKind.CPP:
-        return []
-    candidates: list[tuple[int, int, int]] = []
-    for match in _CPP_RAW_SQL_RE.finditer(text):
-        body = match.group("body")
-        tag = match.group("tag").upper()
-        if "SQL" not in tag and not _SQL_PREFIX_RE.match(body):
-            continue
-        start, end = match.span("body")
-        call_anchor = max(
-            text.rfind("sqlite3_exec", 0, start),
-            text.rfind("PQexec", 0, start),
-            text.rfind("mysql_query", 0, start),
-        )
-        if call_anchor < 0:
-            call_anchor = start
-        candidates.append((start, end, call_anchor))
-
+def _sql_call_query_spans(text: str) -> list[tuple[int, int, int]]:
+    query_spans: list[tuple[int, int, int]] = []
     for call_match in _SQL_CALL_RE.finditer(text):
         argument_spans = _call_argument_spans(text, call_match.end() - 1)
         query_index = _SQL_CALL_QUERY_ARGUMENT[call_match.group("call")]
         if query_index >= len(argument_spans):
             continue
         argument_start, argument_end = argument_spans[query_index]
+        query_spans.append((argument_start, argument_end, call_match.start("call")))
+    return query_spans
+
+
+def extract_embedded_domain_blocks(
+    text: str,
+    *,
+    host_domain: DomainKind,
+    source_doc_id: int | None = None,
+) -> list[EmbeddedDomainBlock]:
+    """Extract exact host-character spans for supported embedded languages."""
+
+    if DomainKind(host_domain) != DomainKind.CPP:
+        return []
+    resolved_source_id = (
+        stable_source_identity_id({"text": text})
+        if source_doc_id in (None, 0)
+        else int(source_doc_id)
+    )
+    if not 0 < resolved_source_id <= MAX_SOURCE_ID:
+        raise ValueError(f"source_doc_id must be positive uint32, got {resolved_source_id}")
+    candidates: list[tuple[int, int, int]] = []
+    query_call_spans = _sql_call_query_spans(text)
+    for match in _CPP_RAW_SQL_RE.finditer(text):
+        body = match.group("body")
+        tag = match.group("tag").upper()
+        if "SQL" not in tag and not _SQL_PREFIX_RE.match(body):
+            continue
+        start, end = match.span("body")
+        owner = next(
+            (
+                call_start
+                for argument_start, argument_end, call_start in query_call_spans
+                if argument_start <= match.start() and match.end() <= argument_end
+            ),
+            None,
+        )
+        candidates.append((start, end, start if owner is None else owner))
+
+    for argument_start, argument_end, call_anchor in query_call_spans:
         argument = text[argument_start:argument_end]
         for literal in re.finditer(r'"(?P<body>(?:\\.|[^"\\])*)"', argument):
             body = literal.group("body")
@@ -372,7 +418,7 @@ def extract_embedded_domain_blocks(
                 continue
             start = argument_start + literal.start("body")
             end = argument_start + literal.end("body")
-            candidates.append((start, end, call_match.start("call")))
+            candidates.append((start, end, call_anchor))
 
     for match in _EXEC_SQL_RE.finditer(text):
         candidates.append((match.start(), match.end(), match.start()))
@@ -384,7 +430,7 @@ def extract_embedded_domain_blocks(
             continue
         body = text[start:end]
         parsed = parse_sql_lexical(body)
-        parsed.set_source_doc_id(source_doc_id)
+        parsed.set_source_doc_id(resolved_source_id)
         parsed.metadata["embedded_in"] = host_domain.name
         blocks.append(
             EmbeddedDomainBlock(
@@ -407,13 +453,26 @@ def parse_domain_document(
     path: str | Path,
     text: str,
     *,
-    source_doc_id: int = 0,
+    source_doc_id: int | None = None,
     provenance: Mapping[str, object] | None = None,
     diagnostic_links: Sequence[Mapping[str, object]] | None = None,
 ) -> ParsedDomainDocument:
     """Parse one file and enforce token-aligned domain/provenance vectors."""
 
     adapter = resolve_domain_parser(path, text)
+    resolved_source_id = (
+        stable_source_identity_id(
+            {
+                **dict(provenance or {}),
+                "source_path": str(path),
+                "text": text,
+            }
+        )
+        if source_doc_id in (None, 0)
+        else int(source_doc_id)
+    )
+    if not 0 < resolved_source_id <= MAX_SOURCE_ID:
+        raise ValueError(f"source_doc_id must be positive uint32, got {resolved_source_id}")
     parsed = adapter.parser(text)
     if parsed.domain != adapter.domain:
         allowed_dynamic = {
@@ -428,7 +487,7 @@ def parse_domain_document(
             )
     parsed.metadata["parser_adapter"] = adapter.name
     parsed.metadata["source_path"] = str(path)
-    parsed.set_source_doc_id(source_doc_id)
+    parsed.set_source_doc_id(resolved_source_id)
     if provenance is not None:
         parsed.metadata["provenance"] = dict(provenance)
     if diagnostic_links is not None:
@@ -437,20 +496,28 @@ def parse_domain_document(
         parsed.embedded_blocks = extract_embedded_domain_blocks(
             text,
             host_domain=DomainKind.CPP,
-            source_doc_id=source_doc_id,
+            source_doc_id=resolved_source_id,
         )
     parsed.validate()
     return parsed
 
 
-def discover_project_domain_files(root: str | Path) -> list[DiscoveredDomainFile]:
+def discover_project_domain_files(
+    root: str | Path,
+    *,
+    extra_exclude_dirs: set[str] | None = None,
+    include_cpp: bool = True,
+) -> list[DiscoveredDomainFile]:
     """Discover supported project-domain files without treating every file as raw."""
 
     root_path = Path(root)
+    skip_dirs = {".git"} | (extra_exclude_dirs or set())
     discovered: list[DiscoveredDomainFile] = []
-    for path in sorted(root_path.rglob("*")):
-        if not path.is_file() or ".git" in path.parts:
-            continue
+    candidate_paths: list[Path] = []
+    for directory, dirs, filenames in os.walk(root_path):
+        dirs[:] = sorted(name for name in dirs if name not in skip_dirs)
+        candidate_paths.extend(Path(directory) / name for name in sorted(filenames))
+    for path in candidate_paths:
         try:
             if path.stat().st_size > 500_000:
                 continue
@@ -458,7 +525,9 @@ def discover_project_domain_files(root: str | Path) -> list[DiscoveredDomainFile
         except OSError:
             continue
         adapter = resolve_domain_parser(path, text)
-        if adapter.name == "raw-output":
+        if adapter.name == "raw-output" or (
+            not include_cpp and adapter.domain == DomainKind.CPP
+        ):
             continue
         discovered.append(
             DiscoveredDomainFile(path=path, domain=adapter.domain, adapter=adapter.name)

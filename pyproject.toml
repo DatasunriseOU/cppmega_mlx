@@ -40,6 +40,7 @@ include = ["cppmega_mlx*", "cppmega_v4*"]
 
 [tool.setuptools.package-data]
 "cppmega_v4.widget" = ["static/*.mjs", "static/*.css"]
+"cppmega_mlx.tokenizer" = ["tokenizer_contract_v1.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from cppmega_mlx.data import domain_schema
 from cppmega_mlx.data.build_parsers import (
     parse_autoconf,
     parse_automake,
@@ -22,6 +23,7 @@ from cppmega_mlx.data.domain_schema import (
     DomainRoleKind,
     ParseConfidence,
     delimiter_token_ids,
+    normalize_domain_edge_record,
     validate_domain_delimiter_contract,
 )
 from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched
@@ -250,6 +252,78 @@ def test_index_project_discovers_shells_and_keeps_autotools_kinds_distinct(
     }
 
 
+def test_shell_shebang_overrides_generic_sh_suffix_in_both_discovery_paths(
+    tmp_path: Path,
+) -> None:
+    from cppmega_mlx.data.domain_ingestion import resolve_domain_parser
+    from tools.clang_indexer import index_project
+
+    text = "#!/usr/bin/env bash\ndeclare -A seen=([app]=1)\n"
+    script = tmp_path / "scripts" / "release.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(text)
+
+    assert resolve_domain_parser(script, text).domain == DomainKind.BASH
+    assert index_project.find_shell_files(str(tmp_path)) == [(str(script), "bash")]
+
+
+def test_process_project_emits_every_discovered_domain_once_with_source_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    files = {
+        "CMakeLists.txt": "add_executable(app main.cpp)\n",
+        "configure": "#!/bin/sh\nexec ./config.status \"$@\"\n",
+        "scripts/release.sh": "#!/usr/bin/env bash\necho release\n",
+        "schema.sql": "CREATE TABLE jobs(id INTEGER PRIMARY KEY);\n",
+        "compiler.log": "src/main.cpp:4:2: warning: unused variable 'x'\n",
+        "link.log": "ld: undefined reference to `missing_symbol'\n",
+        "sanitizer.log": "ERROR: AddressSanitizer: heap-use-after-free\n",
+        "test-results.log": "12 passed, 0 failed, 0 errors\n",
+    }
+    for relative, text in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    monkeypatch.setattr(index_project, "_configure_libclang", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(index_project, "load_compile_commands", lambda *_args: None)
+    monkeypatch.setattr(
+        index_project,
+        "detect_build_context",
+        lambda *_args: ({}, [], None),
+    )
+    monkeypatch.setattr(index_project, "get_default_compile_args", lambda *_args: [])
+    monkeypatch.setattr(index_project, "check_memory_limit", lambda *_args, **_kwargs: None)
+
+    docs = index_project.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="fixtures/case5-domain-ingestion",
+    )
+    docs_by_path = {Path(str(doc["filepath"])).relative_to(tmp_path).as_posix(): doc for doc in docs}
+
+    assert set(docs_by_path) == set(files)
+    assert len(docs) == len(files)
+    expected_domains = {
+        "CMakeLists.txt": DomainKind.CMAKE,
+        "configure": DomainKind.CONFIGURE,
+        "scripts/release.sh": DomainKind.BASH,
+        "schema.sql": DomainKind.SQL,
+        "compiler.log": DomainKind.COMPILER_DIAGNOSTIC,
+        "link.log": DomainKind.LINKER_ERROR,
+        "sanitizer.log": DomainKind.SANITIZER_OUTPUT,
+        "test-results.log": DomainKind.TEST_OUTPUT,
+    }
+    for relative, domain in expected_domains.items():
+        doc = docs_by_path[relative]
+        assert doc["domain_kind"] == int(domain)
+        assert doc["domain_source_doc_ids"]
+        assert min(doc["domain_source_doc_ids"]) > 0
+
+
 def test_shell_dialects_keep_distinct_adapters_roles_and_metadata() -> None:
     parsed = {
         "bash": parse_bash("declare -A seen=([app]=1)\nprintf '%s\\n' \"${!seen[@]}\"\n"),
@@ -273,6 +347,24 @@ def test_shell_dialects_keep_distinct_adapters_roles_and_metadata() -> None:
     assert "CXX" in _role_tokens(parsed["tcsh"], DomainRoleKind.ENVIRONMENT)
     assert "declare" in _role_tokens(parsed["bash"], DomainRoleKind.KEYWORD)
     assert "export" in _role_tokens(parsed["sh"], DomainRoleKind.KEYWORD)
+
+
+def test_shell_syntax_balance_ignores_comments_and_quotes_and_rejects_extra_closers() -> None:
+    quoted = parse_sh('printf "%s\\n" "if"\n# for value in ignored\necho ok\n')
+    extra_done = parse_sh("echo ok\ndone\n")
+    nested = parse_bash(
+        "if true; then\n"
+        "  for value in one; do echo \"$value\"; done\n"
+        "fi\n"
+    )
+    tcsh_if = parse_tcsh("if (1) then\n  echo ok\nendif\n")
+
+    assert set(quoted.confidence_ids) == {int(ParseConfidence.HEURISTIC)}
+    assert "unsupported_syntax" not in quoted.metadata
+    assert set(nested.confidence_ids) == {int(ParseConfidence.HEURISTIC)}
+    assert set(tcsh_if.confidence_ids) == {int(ParseConfidence.HEURISTIC)}
+    assert set(extra_done.confidence_ids) == {int(ParseConfidence.RAW)}
+    assert extra_done.metadata["unsupported_syntax"] == "malformed_sh_shell"
 
 
 def test_warning_build_linker_test_and_sanitizer_diagnostics_keep_severity_metadata() -> None:
@@ -303,6 +395,18 @@ def test_warning_build_linker_test_and_sanitizer_diagnostics_keep_severity_metad
     assert test.metadata["severity"] == "failure"
     assert sanitizer.domain == DomainKind.SANITIZER_OUTPUT
     assert sanitizer.metadata["tool"] == "AddressSanitizer"
+
+
+def test_test_runtime_status_counts_do_not_turn_zero_failures_into_failure() -> None:
+    clean = parse_test_output("12 passed, 0 failed, 0 errors in 1.2s\n")
+    empty = parse_test_output("0 passed, 0 failed, 0 errors\n")
+    status_first = parse_test_output("Tests run: 12, failures: 0, errors: 0\nOK\n")
+    failed = parse_test_output("11 passed, 1 failed, 0 errors\n")
+
+    assert clean.metadata["severity"] == "pass"
+    assert empty.metadata["severity"] == "pass"
+    assert status_first.metadata["severity"] == "pass"
+    assert failed.metadata["severity"] == "failure"
 
 
 def test_gcc_no_column_test_and_sanitizer_locations_keep_diagnostic_links() -> None:
@@ -390,6 +494,30 @@ def test_embedded_sql_finds_ordinary_database_strings_and_exec_sql() -> None:
     )
 
 
+def test_raw_sql_literal_only_links_to_the_call_argument_that_contains_it() -> None:
+    from cppmega_mlx.data.domain_ingestion import extract_embedded_domain_blocks
+
+    standalone = (
+        'sqlite3_exec(db, "SELECT 1;", nullptr, nullptr, nullptr);\n'
+        'auto schema = R"SQL(CREATE TABLE jobs(id INTEGER);)SQL";\n'
+    )
+    blocks = extract_embedded_domain_blocks(standalone, host_domain=DomainKind.CPP)
+    raw_block = next(
+        block
+        for block in blocks
+        if standalone[block.start : block.end].startswith("CREATE TABLE")
+    )
+    assert raw_block.cross_domain_edge[:2] == (raw_block.start, raw_block.start)
+
+    inside_call = (
+        'sqlite3_exec(db, R"SQL(CREATE TABLE "jobs"(id INTEGER);)SQL", '
+        "nullptr, nullptr, nullptr);\n"
+    )
+    inside = extract_embedded_domain_blocks(inside_call, host_domain=DomainKind.CPP)
+    assert len(inside) == 1
+    assert inside[0].cross_domain_edge[0] == inside_call.index("sqlite3_exec")
+
+
 def test_cpp_lexical_roles_and_embedded_sql_reach_tokenized_sidecars() -> None:
     from tools.clang_indexer import index_project
 
@@ -423,6 +551,7 @@ def test_cpp_lexical_roles_and_embedded_sql_reach_tokenized_sidecars() -> None:
     assert int(DomainRoleKind.PREPROCESSOR) in sidecars["domain_role_ids"]
     assert int(DomainRoleKind.DOCSTRING) in sidecars["domain_role_ids"]
     assert sidecars["cross_domain_edges"]
+    assert sidecars["cross_domain_edges"][0] in sidecars["domain_edges"]
 
     row = tokenized_enriched.materialize_tokenized_enriched_batch(
         [{"text": cpp, **sidecars}],
@@ -477,7 +606,16 @@ def test_parser_output_preserves_provenance_and_token_alignment() -> None:
     assert enriched["domain_parse_info"]["diagnostic_links"] == [
         {"diagnostic_id": "diag-1", "line": 9}
     ]
+    assert enriched["domain_edges"] == enriched["build_edges"]
     assert enriched["build_edges"]
+
+
+def test_domain_edge_route_is_canonical_aggregate_with_specialized_mirrors() -> None:
+    assert domain_schema.DOMAIN_EDGE_FIELD_FAMILIES["domain_edges"] == "aggregate"
+    assert normalize_domain_edge_record(
+        {"from": 0, "to": 1, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)},
+        family="aggregate",
+    ) == (0, 1, int(DomainEdgeKind.BUILD_TARGET_DEP))
 
 
 def test_malformed_domain_edges_and_unknown_domain_kind_fail_closed() -> None:
@@ -501,6 +639,44 @@ def test_malformed_domain_edges_and_unknown_domain_kind_fail_closed() -> None:
             [{"from": 0, "to": 1, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)}],
             [],
         )
+
+    with pytest.raises(ValueError, match="outside source text bounds"):
+        tokenized_enriched._remap_char_edge_triples_to_tokens(
+            [{"from": 0, "to": 3, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)}],
+            [(0, 1), (1, 2), (2, 3)],
+            family="build",
+            source_length=3,
+        )
+
+    with pytest.raises(ValueError, match="not contained in a nonempty token span"):
+        tokenized_enriched._remap_char_edge_triples_to_tokens(
+            [{"from": 0, "to": 1, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)}],
+            [(0, 1), (2, 3)],
+            family="build",
+            source_length=3,
+        )
+
+
+def test_delimiter_insertion_keeps_exclusive_chunk_ends_before_closing_marker() -> None:
+    from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched_schema as schema
+
+    row = {
+        schema.TOKEN_IDS_COLUMN: [10, 11, 12, 13],
+        schema.TOKEN_CHUNK_STARTS_COLUMN: [1, 3],
+        schema.TOKEN_CHUNK_ENDS_COLUMN: [3, 4],
+    }
+
+    tokenized_enriched._insert_domain_delimiter_pair(
+        row,
+        domain=DomainKind.SQL,
+        start_at=1,
+        end_at=3,
+    )
+
+    sql_start, sql_end = delimiter_token_ids(DomainKind.SQL)
+    assert row[schema.TOKEN_IDS_COLUMN] == [10, sql_start, 11, 12, sql_end, 13]
+    assert row[schema.TOKEN_CHUNK_STARTS_COLUMN] == [2, 5]
+    assert row[schema.TOKEN_CHUNK_ENDS_COLUMN] == [4, 6]
 
 
 def test_packer_rejects_malformed_edges_and_assigns_source_provenance() -> None:
@@ -535,4 +711,8 @@ def test_packer_rejects_malformed_edges_and_assigns_source_provenance() -> None:
         strategy="sequential",
     )
     assert overflow == []
-    assert rows[0][TOKEN_SOURCE_DOC_IDS_COLUMN] == [1, 1, 2, 2, 0]
+    source_ids = rows[0][TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert source_ids[0] == source_ids[1] > 0
+    assert source_ids[2] == source_ids[3] > 0
+    assert source_ids[0] != source_ids[2]
+    assert source_ids[4] == 0

@@ -29,7 +29,10 @@ from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
-from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
+from cppmega_mlx.data.domain_schema import (
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    normalize_domain_edge_record,
+)
 from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.data.parquet_dataset import (
     _TOKEN_CHUNK_METADATA_COLUMNS,
@@ -125,14 +128,6 @@ _DOMAIN_EDGE_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_DIAGNOSTIC_EDGES_COLUMN: "diagnostic_edges",
     TOKEN_CROSS_DOMAIN_EDGES_COLUMN: "cross_domain_edges",
 }
-_DOMAIN_EDGE_COLUMN_TO_FAMILY: Mapping[str, str] = {
-    TOKEN_DOMAIN_EDGES_COLUMN: "domain",
-    TOKEN_BUILD_EDGES_COLUMN: "build",
-    TOKEN_SHELL_EDGES_COLUMN: "shell",
-    TOKEN_DIAGNOSTIC_EDGES_COLUMN: "diagnostic",
-    TOKEN_CROSS_DOMAIN_EDGES_COLUMN: "cross_domain",
-}
-
 # Temporal token-level parquet column -> CommitPacket field name.
 _TEMPORAL_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_CHANGE_MASK_PRE_COLUMN: "change_mask_pre",
@@ -326,7 +321,7 @@ def build_code_packet_from_row(
         domain_edge_kwargs[field_name] = _build_domain_edge_index(
             columns[column][row_index],
             num_tokens=num_tokens,
-            family=_DOMAIN_EDGE_COLUMN_TO_FAMILY[column],
+            family=TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES[column],
         )
         present.append(column)
 

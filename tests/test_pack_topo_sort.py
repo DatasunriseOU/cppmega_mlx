@@ -77,6 +77,7 @@ def _make_doc(
     return NormalizedDoc(
         source_doc_index=source_doc_index,
         stable_doc_id=source_doc_index + 1,
+        stable_source_id=source_doc_index + 1,
         token_ids=token_ids,
         token_meta=_token_meta(
             **{
@@ -236,13 +237,13 @@ def test_side_channels_stay_aligned_to_tokens_after_reorder() -> None:
     loss_mask = list(row[LOSS_MASK_COLUMN])  # type: ignore[arg-type]
 
     pos = 0
-    for idx in ordered:
+    for row_doc_id, idx in enumerate(ordered, start=1):
         count = len_by_index[idx]
         expected_token0 = 1000 + idx * 100
         assert input_ids[pos] == expected_token0
         for offset in range(count):
             assert structure[pos + offset] == fill_by_index[idx]
-            assert doc_ids[pos + offset] == idx + 1
+            assert doc_ids[pos + offset] == row_doc_id
         # last token of each doc is not a valid LM target (cross-doc boundary).
         assert loss_mask[pos + count - 1] == 0
         pos += count
@@ -288,6 +289,7 @@ def _reconstruct_docs_from_packed_row(row: dict[str, object]) -> list[Normalized
             NormalizedDoc(
                 source_doc_index=int(sdi),
                 stable_doc_id=int(sdi) + 1,
+                stable_source_id=int(sdi) + 1,
                 token_ids=token_ids,
                 token_meta=token_meta,
                 chunk_starts=[0],
@@ -321,6 +323,7 @@ def _load_golden_mini_docs() -> list[NormalizedDoc]:
             NormalizedDoc(
                 source_doc_index=new_idx,
                 stable_doc_id=new_idx + 1,
+                stable_source_id=doc.stable_source_id,
                 token_ids=doc.token_ids,
                 token_meta=doc.token_meta,
                 chunk_starts=doc.chunk_starts,

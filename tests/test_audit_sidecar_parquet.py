@@ -398,7 +398,7 @@ def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(t
         "token_role_ids": [1, 6, 4, 1, 0, 0, 0, 0],
         "token_entity_ids": [0, 1, 2, 0, 0, 0, 0, 0],
         "token_scope_ids": [0, 0, 1, 0, 0, 0, 0, 0],
-        "token_source_doc_ids": [1, 1, 1, 1, 0, 0, 0, 0],
+        "token_source_doc_ids": [17, 17, 17, 17, 0, 0, 0, 0],
         "token_confidence_ids": [4, 4, 4, 4, 0, 0, 0, 0],
         "token_domain_edges": [{"from": 1, "to": 2, "kind": 5}],
         "token_build_edges": [{"from": 1, "to": 2, "kind": 26}],

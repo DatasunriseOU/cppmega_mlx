@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
     OBJECTIVE_BOUNDARY_TOKEN_IDS,
     REQUIRED_SPECIAL_TOKEN_IDS,
     TOOL_USE_SPECIAL_TOKEN_IDS,
+    validate_checked_out_tokenizer_contract,
     validate_required_special_token_ids,
 )
 
@@ -17,36 +19,6 @@ _TOKENIZER_CONTRACT_PATH = (
     _REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer_contract_v1.json"
 )
 _TOKENIZER_JSON_PATH = _REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
-_DOMAIN_DELIMITER_BASES = (
-    "CPP_CODE",
-    "MAKE",
-    "CMAKE",
-    "NINJA",
-    "BAZEL",
-    "CONFIGURE",
-    "AUTOCONF",
-    "AUTOMAKE",
-    "MESON",
-    "GN",
-    "SCONS",
-    "XMAKE",
-    "COMPILE_COMMANDS",
-    "SQL",
-    "BASH",
-    "ZSH",
-    "SH",
-    "TCSH",
-    "COMPILER_DIAGNOSTIC",
-    "BUILD_DIAGNOSTIC",
-    "COMPILER_ERROR",
-    "BUILD_ERROR",
-    "LINKER_ERROR",
-    "LINKER_DIAGNOSTIC",
-    "TEST_OUTPUT",
-    "SANITIZER_OUTPUT",
-    "TOOL_OUTPUT",
-)
-
 _CASE5_SEMANTIC_DELIMITER_IDS = set(range(237, 245))
 
 
@@ -104,10 +76,11 @@ def test_domain_delimiter_role_ids_are_reserved_contract_pairs() -> None:
         for role, token_id in contract["reserved_role_assignments"].items()
         if not role.startswith("_")
     }
+    start_bases = {role.removesuffix("_START") for role in roles if role.endswith("_START")}
+    end_bases = {role.removesuffix("_END") for role in roles if role.endswith("_END")}
+    assert start_bases == end_bases
     expected_roles = {
-        f"{base}_{edge}"
-        for base in _DOMAIN_DELIMITER_BASES
-        for edge in ("START", "END")
+        f"{base}_{edge}" for base in start_bases for edge in ("START", "END")
     }
 
     assert expected_roles.issubset(roles)
@@ -126,6 +99,12 @@ def test_domain_delimiter_role_ids_are_reserved_contract_pairs() -> None:
     }
     for role, token_id in tokenizer_contract.DOMAIN_DELIMITER_TOKEN_IDS.items():
         assert added_tokens[token_id] == f"<RESERVED_{token_id}>", role
+
+
+def test_checked_out_tokenizer_artifacts_match_imported_domain_contract() -> None:
+    validated = validate_checked_out_tokenizer_contract(_REPO_ROOT)
+
+    assert validated == DOMAIN_DELIMITER_TOKEN_IDS
 
 
 def test_missing_required_special_token_fails() -> None:

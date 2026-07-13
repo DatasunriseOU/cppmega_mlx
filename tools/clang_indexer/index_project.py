@@ -66,6 +66,7 @@ from cppmega_mlx.data.symbol_identity import (
     compute_symbol_id,
     require_project_identity,
 )
+from cppmega_mlx.data.source_identity import stable_source_identity_for_path
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
@@ -2474,21 +2475,17 @@ def find_build_files(
 def _classify_shell_file(filepath: str, fname: str) -> str | None:
     if classify_build_file(fname) is not None:
         return None
-    extension_kind = SHELL_EXT_KINDS.get(os.path.splitext(fname)[1].lower())
-    if extension_kind is not None:
-        return extension_kind
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
             first_line = fh.readline(512).lower()
     except OSError:
         return None
-    if not first_line.startswith("#!"):
-        return None
-    words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
-    for shell in ("tcsh", "csh", "zsh", "bash", "sh"):
-        if shell in words:
-            return "tcsh" if shell == "csh" else shell
-    return None
+    if first_line.startswith("#!"):
+        words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
+        for shell in ("tcsh", "csh", "zsh", "bash", "sh"):
+            if shell in words:
+                return "tcsh" if shell == "csh" else shell
+    return SHELL_EXT_KINDS.get(os.path.splitext(fname)[1].lower())
 
 
 def find_shell_files(
@@ -3740,6 +3737,7 @@ def _cpp_domain_sidecars(
     text: str,
     index: ProjectIndex | None = None,
     *,
+    source_doc_id: int | None = None,
     macro_parts: list[dict[str, object]] | None = None,
     macro_invocations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -3759,6 +3757,10 @@ def _cpp_domain_sidecars(
     )
 
     text_len = len(text)
+    resolved_source_doc_id = source_doc_id or stable_source_identity_for_path(
+        "assembled.cpp",
+        text=text,
+    )
     domain = int(DomainKind.CPP)
     role_ids = [0] * text_len
     entity_ids = [0] * text_len
@@ -4118,11 +4120,21 @@ def _cpp_domain_sidecars(
 
     from cppmega_mlx.data.domain_ingestion import parse_domain_document
 
-    lexical = parse_domain_document("source.cpp", text).to_enriched_document()
+    lexical = parse_domain_document(
+        "source.cpp",
+        text,
+        source_doc_id=resolved_source_doc_id,
+    ).to_enriched_document()
     lexical_domains = cast(list[int], lexical["domain_ids"])
     lexical_roles = cast(list[int], lexical["domain_role_ids"])
     lexical_entities = cast(list[int], lexical["domain_entity_ids"])
     lexical_confidence = cast(list[int], lexical["domain_confidence_ids"])
+    for edge in cast(list[dict[str, int]], lexical["domain_edges"]):
+        key = (int(edge["from_char"]), int(edge["to_char"]), int(edge["kind"]))
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
+        deduped_domain_edges.append(edge)
     for char_idx in range(text_len):
         is_embedded = lexical_domains[char_idx] != domain
         if is_embedded or role_ids[char_idx] == int(DomainRoleKind.NONE):
@@ -4143,7 +4155,7 @@ def _cpp_domain_sidecars(
         "domain_role_ids": role_ids,
         "domain_entity_ids": entity_ids,
         "domain_scope_ids": [0] * text_len,
-        "domain_source_doc_ids": [0] * text_len,
+        "domain_source_doc_ids": [int(resolved_source_doc_id)] * text_len,
         "domain_confidence_ids": confidence_ids,
         "domain_edges": deduped_domain_edges,
         "build_edges": [],
@@ -4458,6 +4470,10 @@ def build_enriched_doc(
         **_cpp_domain_sidecars(
             full_text,
             index,
+            source_doc_id=stable_source_identity_for_path(
+                filepath or "assembled.cpp",
+                text=full_text,
+            ),
             macro_parts=macro_route_parts,
             macro_invocations=macro_invocation_routes,
         ),
@@ -4489,7 +4505,13 @@ def build_enriched_doc(
 # 'build'; and a language_info whose primary_language is the build-system tag
 # (cmake/make/bazel/ninja/meson/...). platform_info / build_info carry the
 # derived A-platform signal where available. NO libclang involved.
-def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
+def _build_domain_sidecars(
+    text: str,
+    build_kind: str,
+    *,
+    filepath: str | None = None,
+    source_doc_id: int,
+) -> dict[str, object]:
     """Parse build-system text into char-aligned domain sidecars.
 
     The Clang path emits C++ call/type graph metadata.  Build systems need a
@@ -4500,7 +4522,10 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
     """
 
     from cppmega_mlx.data.build_parsers.base import ParsedDomainDocument
-    from cppmega_mlx.data.domain_ingestion import parse_domain_document
+    from cppmega_mlx.data.domain_ingestion import (
+        parse_domain_document,
+        resolve_domain_parser,
+    )
     from cppmega_mlx.data.domain_schema import DomainKind, ParseConfidence
 
     kind = build_kind.lower().replace("-", "_")
@@ -4526,8 +4551,22 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
         "tcsh": "script.tcsh",
     }
     parser_path = parser_path_by_kind.get(kind)
-    if parser_path is not None:
-        parsed = parse_domain_document(parser_path, text)
+    resolved_path = filepath or parser_path
+    resolved_adapter = (
+        resolve_domain_parser(resolved_path, text) if resolved_path is not None else None
+    )
+    if resolved_adapter is not None and resolved_adapter.name != "raw-output":
+        parsed = parse_domain_document(
+            resolved_path,
+            text,
+            source_doc_id=source_doc_id,
+        )
+    elif parser_path is not None:
+        parsed = parse_domain_document(
+            parser_path,
+            text,
+            source_doc_id=source_doc_id,
+        )
     else:
         raw_domain_by_kind = {
             "meson": DomainKind.MESON,
@@ -4548,6 +4587,7 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
                 "raw_reason": f"unsupported_build_domain:{build_kind}",
             },
         )
+        parsed.set_source_doc_id(source_doc_id)
 
     enriched = parsed.to_enriched_document()
     enriched["domain_parse_info"].update(
@@ -4565,6 +4605,7 @@ def build_build_doc(
     text: str,
     build_kind: str,
     *,
+    source_root: str | None = None,
     platform_info: dict | None = None,
     build_info: dict | None = None,
 ) -> dict:
@@ -4575,7 +4616,17 @@ def build_build_doc(
     make an otherwise valid C/C++ repo fail indexing.
     """
     text_len = len(text)
-    domain_sidecars = _build_domain_sidecars(text, build_kind)
+    source_doc_id = stable_source_identity_for_path(
+        filepath,
+        text=text,
+        source_root=source_root,
+    )
+    domain_sidecars = _build_domain_sidecars(
+        text,
+        build_kind,
+        filepath=filepath,
+        source_doc_id=source_doc_id,
+    )
     structure_ids = [BUILD_KIND] * text_len
     chunk_boundaries = [{
         'start': 0,
@@ -4605,7 +4656,25 @@ def build_build_doc(
     # knows which build system this is. detect_language_info has no build-system
     # output key, so we set primary_language directly (additive, rendered for
     # free by language_info_to_prefix as "// language: primary=<build_kind> ...").
-    is_shell_doc = build_kind in {"bash", "sh", "zsh", "tcsh"}
+    from cppmega_mlx.data.domain_schema import DomainKind
+
+    domain = DomainKind(int(domain_sidecars["domain_kind"]))
+    is_shell_doc = domain in {
+        DomainKind.BASH,
+        DomainKind.SH,
+        DomainKind.ZSH,
+        DomainKind.TCSH,
+    }
+    is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
+    doc_type = (
+        "shell"
+        if is_shell_doc
+        else "diagnostic"
+        if is_diagnostic_doc
+        else "sql"
+        if domain == DomainKind.SQL
+        else "build"
+    )
     language_info = {
         "primary_language": build_kind,
         "primary_standard": (build_info or {}).get("standard"),
@@ -4620,7 +4689,8 @@ def build_build_doc(
 
     result: dict[str, object] = {
         'text': text,
-        'doc_type': 'shell' if is_shell_doc else 'build',
+        'doc_type': doc_type,
+        'source_identity_id': source_doc_id,
         'build_kind': build_kind,
         'filepath': filepath,
         'structure_ids': structure_ids,
@@ -5853,6 +5923,7 @@ def dedup_root_functions(
 def emit_build_documents(
     build_files: list[tuple[str, str]],
     *,
+    source_root: str | None = None,
     default_build_info: dict | None,
     compile_index: object | None = None,
     tokenizer_path: str | None = None,
@@ -5904,7 +5975,19 @@ def emit_build_documents(
             continue
 
         per_file_build_info = dict(default_build_info) if default_build_info else {}
-        if build_kind not in {"bash", "sh", "zsh", "tcsh"}:
+        if build_kind not in {
+            "bash",
+            "sh",
+            "zsh",
+            "tcsh",
+            "sql",
+            "compiler_diagnostic",
+            "linker_diagnostic",
+            "build_diagnostic",
+            "sanitizer_output",
+            "test_output",
+            "tool_output",
+        }:
             per_file_build_info["build_system"] = build_kind
 
         if tok is not None:
@@ -5934,6 +6017,7 @@ def emit_build_documents(
                 filepath,
                 text,
                 build_kind,
+                source_root=source_root,
                 build_info=per_file_build_info or None,
             )
         )
@@ -6522,7 +6606,28 @@ def process_project(
     print(f"  Found {len(build_files)} build/compilation files", file=sys.stderr)
     shell_files = find_shell_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(shell_files)} project shell files", file=sys.stderr)
-    domain_files = build_files + shell_files
+    from cppmega_mlx.data.domain_ingestion import discover_project_domain_files
+
+    typed_domain_files = discover_project_domain_files(
+        project_dir,
+        extra_exclude_dirs=extra_exclude_dirs,
+        include_cpp=False,
+    )
+    domain_files_by_path = {
+        os.path.abspath(filepath): (os.path.abspath(filepath), build_kind)
+        for filepath, build_kind in (*build_files, *shell_files)
+    }
+    for discovered in typed_domain_files:
+        filepath = os.path.abspath(discovered.path)
+        domain_files_by_path[filepath] = (
+            filepath,
+            discovered.domain.name.lower(),
+        )
+    domain_files = sorted(domain_files_by_path.values())
+    print(
+        f"  Found {len(domain_files)} total typed domain files after dedup",
+        file=sys.stderr,
+    )
 
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
@@ -6702,6 +6807,7 @@ def process_project(
     if enriched and domain_files:
         build_docs = emit_build_documents(
             domain_files,
+            source_root=project_dir,
             default_build_info=default_build_info,
             compile_index=_compile_index,
             tokenizer_path=tokenizer_path,

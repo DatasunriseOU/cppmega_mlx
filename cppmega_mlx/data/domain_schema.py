@@ -8,6 +8,7 @@ MLX route tests, and the Megatron sidecar converter.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
 import json
@@ -157,6 +158,20 @@ DOMAIN_EDGE_FAMILIES: dict[str, frozenset[DomainEdgeKind]] = {
     family: frozenset(DomainEdgeKind(int(kind)) for kind in kinds)
     for family, kinds in DOMAIN_SCHEMA["edge_families"].items()
 }
+VALID_DOMAIN_EDGE_KINDS = frozenset(
+    kind for kind in DomainEdgeKind if kind != DomainEdgeKind.UNKNOWN
+)
+DOMAIN_EDGE_FIELD_FAMILIES: dict[str, str] = {
+    "domain_edges": "aggregate",
+    "build_edges": "build",
+    "shell_edges": "shell",
+    "diagnostic_edges": "diagnostic",
+    "cross_domain_edges": "cross_domain",
+}
+TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES: dict[str, str] = {
+    f"token_{field}": family
+    for field, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
+}
 
 
 def domain_edge_family(kind: DomainEdgeKind | int) -> str:
@@ -186,6 +201,10 @@ def validate_domain_edge_kind(
     """Validate an edge kind and, when supplied, its graph-channel family."""
 
     actual_family = domain_edge_family(kind)
+    if family == "aggregate":
+        return DomainEdgeKind(int(kind))
+    if family is not None and family not in DOMAIN_EDGE_FAMILIES:
+        raise ValueError(f"unknown domain edge family {family!r}")
     if family is not None and actual_family != family:
         raise ValueError(
             f"domain edge kind {int(kind)} belongs to {actual_family}, not {family}"
@@ -240,6 +259,148 @@ def normalize_domain_edge_record(
     return src_i, dst_i, int(edge_kind)
 
 
+def normalize_embedded_domain_spans(
+    raw_spans: Any,
+    *,
+    source_length: int,
+) -> list[dict[str, Any]]:
+    """Validate sorted, non-overlapping ``[start, end)`` embedded spans."""
+
+    source_length = int(source_length)
+    if source_length < 0:
+        raise ValueError("embedded domain source_length must be non-negative")
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_spans or []:
+        if hasattr(raw, "as_py"):
+            raw = raw.as_py()
+        if not isinstance(raw, Mapping):
+            raise ValueError("embedded domain span must be a mapping")
+        if not {"start", "end", "domain_kind"} <= set(raw):
+            raise ValueError("embedded domain span requires start/end/domain_kind")
+        start = int(raw["start"])
+        end = int(raw["end"])
+        if start < 0 or end <= start or end > source_length:
+            raise ValueError(
+                f"invalid embedded domain span {start}:{end} for source length "
+                f"{source_length}"
+            )
+        try:
+            domain = DomainKind(int(raw["domain_kind"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"unknown embedded domain_kind {raw['domain_kind']!r}"
+            ) from exc
+        if domain == DomainKind.UNKNOWN:
+            raise ValueError("embedded UNKNOWN domain disables delimiter insertion")
+        span = dict(raw)
+        span.update(start=start, end=end, domain_kind=int(domain))
+        normalized.append(span)
+
+    normalized.sort(key=lambda span: (int(span["start"]), int(span["end"])))
+    previous_end = 0
+    for span in normalized:
+        if int(span["start"]) < previous_end:
+            raise ValueError("overlapping embedded domain spans are unsupported")
+        previous_end = int(span["end"])
+    return normalized
+
+
+def remap_embedded_domain_spans(
+    raw_spans: Any,
+    *,
+    source_length: int,
+    kept_indices: Sequence[int] | None,
+    prefix_length: int = 0,
+) -> list[dict[str, Any]]:
+    """Remap spans through exact character filtering and prefix insertion."""
+
+    spans = normalize_embedded_domain_spans(
+        raw_spans,
+        source_length=source_length,
+    )
+    prefix_length = int(prefix_length)
+    if prefix_length < 0:
+        raise ValueError("embedded domain prefix_length must be non-negative")
+    if kept_indices is None:
+        return [
+            {
+                **span,
+                "start": int(span["start"]) + prefix_length,
+                "end": int(span["end"]) + prefix_length,
+            }
+            for span in spans
+        ]
+
+    kept = [int(value) for value in kept_indices]
+    if any(value < 0 or value >= source_length for value in kept):
+        raise ValueError("kept character mapping is outside source text bounds")
+    if any(left >= right for left, right in zip(kept, kept[1:])):
+        raise ValueError("kept character mapping must be strictly increasing")
+
+    remapped: list[dict[str, Any]] = []
+    for span in spans:
+        start = int(span["start"])
+        end = int(span["end"])
+        left = bisect_left(kept, start)
+        right = bisect_left(kept, end)
+        covered = kept[left:right]
+        if not covered:
+            continue
+        if (
+            len(covered) != end - start
+            or covered[0] != start
+            or covered[-1] != end - 1
+        ):
+            raise ValueError(
+                f"cannot exactly remap embedded domain span {start}:{end} "
+                "through filtered text"
+            )
+        remapped.append(
+            {
+                **span,
+                "start": left + prefix_length,
+                "end": right + prefix_length,
+            }
+        )
+    return remapped
+
+
+def slice_embedded_domain_spans(
+    raw_spans: Any,
+    *,
+    source_length: int,
+    start: int,
+    end: int,
+) -> list[dict[str, Any]]:
+    """Clip embedded spans to one exact source slice and make them slice-local."""
+
+    start = int(start)
+    end = int(end)
+    if start < 0 or end < start or end > int(source_length):
+        raise ValueError(
+            f"invalid embedded domain slice {start}:{end} for source length "
+            f"{source_length}"
+        )
+    spans = normalize_embedded_domain_spans(
+        raw_spans,
+        source_length=source_length,
+    )
+    sliced: list[dict[str, Any]] = []
+    for span in spans:
+        clipped_start = max(int(span["start"]), start)
+        clipped_end = min(int(span["end"]), end)
+        if clipped_start >= clipped_end:
+            continue
+        sliced.append(
+            {
+                **span,
+                "start": clipped_start - start,
+                "end": clipped_end - start,
+            }
+        )
+    return sliced
+
+
 DOMAIN_DELIMITER_ROLES: dict[DomainKind, tuple[str, str]] = {
     DomainKind(int(spec["domain_id"])): (str(spec["start"]), str(spec["end"]))
     for spec in DOMAIN_SCHEMA["delimiter_roles"].values()
@@ -279,13 +440,26 @@ def validate_domain_delimiter_contract() -> None:
                 raise ValueError(f"{domain.name}: start/end delimiter ids collide")
     if missing:
         raise ValueError(f"missing domain delimiter token roles: {sorted(set(missing))}")
+    expected_roles = {
+        role for role_pair in DOMAIN_DELIMITER_ROLES.values() for role in role_pair
+    }
+    contract_roles = set(DOMAIN_DELIMITER_TOKEN_IDS)
+    if contract_roles != expected_roles:
+        raise ValueError(
+            "domain delimiter parser map differs from tokenizer contract: "
+            f"unmapped={sorted(contract_roles - expected_roles)} "
+            f"undefined={sorted(expected_roles - contract_roles)}"
+        )
 
 
 __all__ = [
     "DOMAIN_SCHEMA",
     "DOMAIN_SCHEMA_PATH",
-    "DOMAIN_EDGE_FAMILIES",
     "DOMAIN_DELIMITER_ROLES",
+    "DOMAIN_EDGE_FAMILIES",
+    "DOMAIN_EDGE_FIELD_FAMILIES",
+    "TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES",
+    "VALID_DOMAIN_EDGE_KINDS",
     "DomainEdgeKind",
     "DomainKind",
     "DomainRoleKind",
@@ -293,6 +467,9 @@ __all__ = [
     "domain_edge_family",
     "delimiter_token_ids",
     "normalize_domain_edge_record",
+    "normalize_embedded_domain_spans",
+    "remap_embedded_domain_spans",
+    "slice_embedded_domain_spans",
     "validate_domain_delimiter_contract",
     "validate_domain_edge_kind",
 ]

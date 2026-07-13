@@ -266,7 +266,11 @@ def test_packed_doc_ids_do_not_collapse_same_file_documents() -> None:
     row = rows[0]
     assert row[SOURCE_DOC_INDICES_COLUMN] == [38, 41]
     assert row[DOC_IDS_COLUMN] == [1, 1, 2, 2, 2]
-    assert row[TOKEN_SOURCE_DOC_IDS_COLUMN] == [11, 11, 11, 11, 0]
+    valid_source_ids = row[TOKEN_SOURCE_DOC_IDS_COLUMN][:4]
+    assert all(source_id > 0 for source_id in valid_source_ids)
+    assert len(set(valid_source_ids)) == 1
+    assert valid_source_ids[0] != 11
+    assert row[TOKEN_SOURCE_DOC_IDS_COLUMN][-1] == 0
     assert row[LOSS_MASK_COLUMN] == [1, 0, 1, 0, 0]
 
 

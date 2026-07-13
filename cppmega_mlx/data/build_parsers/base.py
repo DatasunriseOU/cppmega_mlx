@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cppmega_mlx.data.domain_packet import DomainPacket
 
 from cppmega_mlx.data.domain_schema import (
     DomainEdgeKind,
@@ -228,13 +231,14 @@ class ParsedDomainDocument:
         ) -> None:
             for src, dst, kind in parsed.edges:
                 family = domain_edge_family(kind)
-                result[edge_columns[family]].append(
-                    {
-                        "from_char": offset + int(parsed.tokens[src].start),
-                        "to_char": offset + int(parsed.tokens[dst].start),
-                        "kind": int(kind),
-                    }
-                )
+                edge = {
+                    "from_char": offset + int(parsed.tokens[src].start),
+                    "to_char": offset + int(parsed.tokens[dst].start),
+                    "kind": int(kind),
+                }
+                result["domain_edges"].append(edge)
+                if family != "domain":
+                    result[edge_columns[family]].append(dict(edge))
 
         append_token_edges(self)
         for block in self.embedded_blocks:
@@ -273,9 +277,9 @@ class ParsedDomainDocument:
             )
             src, dst, kind = block.cross_domain_edge
             validate_domain_edge_kind(kind, family="cross_domain")
-            result["cross_domain_edges"].append(
-                {"from_char": int(src), "to_char": int(dst), "kind": int(kind)}
-            )
+            edge = {"from_char": int(src), "to_char": int(dst), "kind": int(kind)}
+            result["domain_edges"].append(edge)
+            result["cross_domain_edges"].append(dict(edge))
 
         result["domain_parse_info"].update(
             {

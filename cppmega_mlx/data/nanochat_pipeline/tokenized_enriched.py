@@ -15,6 +15,11 @@ from cppmega_mlx.data.domain_schema import (
     delimiter_token_ids,
     domain_edge_family,
     normalize_domain_edge_record,
+    normalize_embedded_domain_spans,
+)
+from cppmega_mlx.data.source_identity import (
+    normalize_positive_source_ids,
+    stable_source_identity_id,
 )
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
@@ -361,28 +366,21 @@ def _remap_token_edges(
 def _char_position_to_token_index(
     token_spans: list[tuple[int, int]],
     char_pos: int,
+    *,
+    source_length: int,
 ) -> int | None:
-    if not token_spans:
-        return None
-    char_pos = max(int(char_pos), 0)
+    char_pos = int(char_pos)
+    if char_pos < 0 or char_pos >= int(source_length):
+        raise ValueError(
+            f"character endpoint {char_pos} is outside source text bounds "
+            f"[0, {source_length})"
+        )
     for idx, (start, end) in enumerate(token_spans):
         start_i = int(start)
         end_i = int(end)
         if end_i > start_i and start_i <= char_pos < end_i:
             return idx
-
-    valid_starts = [
-        (int(start), idx)
-        for idx, (start, end) in enumerate(token_spans)
-        if int(end) > int(start)
-    ]
-    if not valid_starts:
-        return None
-    starts = [item[0] for item in valid_starts]
-    pos = bisect.bisect_right(starts, char_pos) - 1
-    if pos < 0:
-        return valid_starts[0][1]
-    return valid_starts[min(pos, len(valid_starts) - 1)][1]
+    return None
 
 
 def _remap_char_edge_triples_to_tokens(
@@ -390,17 +388,35 @@ def _remap_char_edge_triples_to_tokens(
     token_spans: list[tuple[int, int]],
     *,
     family: str | None = None,
+    source_length: int | None = None,
 ) -> list[dict[str, int]]:
     remapped: list[dict[str, int]] = []
-    for src_char, dst_char, kind in _normalize_graph_edge_triples(
+    triples = _normalize_graph_edge_triples(
         raw_edges,
         family=family,
-    ):
-        src = _char_position_to_token_index(token_spans, src_char)
-        dst = _char_position_to_token_index(token_spans, dst_char)
+    )
+    if triples and not token_spans:
+        src_char, dst_char, _kind = triples[0]
+        raise ValueError(
+            f"domain edge {src_char}->{dst_char} could not be mapped to token spans"
+        )
+    if source_length is None:
+        source_length = max((int(end) for _start, end in token_spans), default=0)
+    for src_char, dst_char, kind in triples:
+        src = _char_position_to_token_index(
+            token_spans,
+            src_char,
+            source_length=source_length,
+        )
+        dst = _char_position_to_token_index(
+            token_spans,
+            dst_char,
+            source_length=source_length,
+        )
         if src is None or dst is None:
             raise ValueError(
-                f"domain edge {src_char}->{dst_char} could not be mapped to token spans"
+                f"domain edge {src_char}->{dst_char} endpoint is not contained "
+                "in a nonempty token span"
             )
         remapped.append({"from": int(src), "to": int(dst), "kind": int(kind)})
     return remapped
@@ -483,9 +499,19 @@ def _domain_kind_from_doc(doc: dict[str, Any]) -> DomainKind | None:
     return domain
 
 
-def _shift_index_for_pair(value: int, *, start_at: int, end_at: int) -> int:
+def _shift_token_index_for_pair(value: int, *, start_at: int, end_at: int) -> int:
     value_i = int(value)
     return value_i + int(value_i >= start_at) + int(value_i >= end_at)
+
+
+def _shift_exclusive_end_for_pair(
+    value: int,
+    *,
+    start_at: int,
+    end_at: int,
+) -> int:
+    value_i = int(value)
+    return value_i + int(value_i > start_at) + int(value_i > end_at)
 
 
 def _insert_domain_delimiter_pair(
@@ -579,11 +605,14 @@ def _insert_domain_delimiter_pair(
             + values[end_at:]
         )
 
-    for column in (TOKEN_CHUNK_STARTS_COLUMN, TOKEN_CHUNK_ENDS_COLUMN):
-        row[column] = [
-            _shift_index_for_pair(value, start_at=start_at, end_at=end_at)
-            for value in row.get(column, [])
-        ]
+    row[TOKEN_CHUNK_STARTS_COLUMN] = [
+        _shift_token_index_for_pair(value, start_at=start_at, end_at=end_at)
+        for value in row.get(TOKEN_CHUNK_STARTS_COLUMN, [])
+    ]
+    row[TOKEN_CHUNK_ENDS_COLUMN] = [
+        _shift_exclusive_end_for_pair(value, start_at=start_at, end_at=end_at)
+        for value in row.get(TOKEN_CHUNK_ENDS_COLUMN, [])
+    ]
 
     for column in (
         TOKEN_DOMAIN_EDGES_COLUMN,
@@ -596,10 +625,10 @@ def _insert_domain_delimiter_pair(
         for edge in row.get(column, []):
             shifted.append(
                 {
-                    "from": _shift_index_for_pair(
+                    "from": _shift_token_index_for_pair(
                         int(edge["from"]), start_at=start_at, end_at=end_at
                     ),
-                    "to": _shift_index_for_pair(
+                    "to": _shift_token_index_for_pair(
                         int(edge["to"]), start_at=start_at, end_at=end_at
                     ),
                     "kind": int(edge["kind"]),
@@ -632,29 +661,25 @@ def _insert_embedded_domain_delimiters(
     token_spans: list[tuple[int, int]],
 ) -> None:
     resolved: list[tuple[int, int, DomainKind]] = []
-    previous_start = len(doc.get("text", "")) + 1
-    for span in sorted(
-        doc.get("embedded_domain_spans", []) or [],
-        key=lambda item: int(item["start"]),
-        reverse=True,
-    ):
-        if not isinstance(span, dict) or not {"start", "end", "domain_kind"} <= set(span):
-            raise ValueError("embedded domain span requires start/end/domain_kind")
+    text_length = len(doc.get("text", ""))
+    spans = normalize_embedded_domain_spans(
+        doc.get("embedded_domain_spans", []),
+        source_length=text_length,
+    )
+    for span in reversed(spans):
         start_char = int(span["start"])
         end_char = int(span["end"])
-        if start_char < 0 or end_char <= start_char or end_char > len(doc.get("text", "")):
-            raise ValueError(f"invalid embedded domain span {start_char}:{end_char}")
-        if end_char > previous_start:
-            raise ValueError("overlapping embedded domain spans are unsupported")
-        previous_start = start_char
-        try:
-            domain = DomainKind(int(span["domain_kind"]))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"unknown embedded domain_kind {span['domain_kind']!r}") from exc
-        if domain == DomainKind.UNKNOWN:
-            raise ValueError("embedded UNKNOWN domain disables delimiter insertion")
-        start_token = _char_position_to_token_index(token_spans, start_char)
-        end_token_inclusive = _char_position_to_token_index(token_spans, end_char - 1)
+        domain = DomainKind(int(span["domain_kind"]))
+        start_token = _char_position_to_token_index(
+            token_spans,
+            start_char,
+            source_length=text_length,
+        )
+        end_token_inclusive = _char_position_to_token_index(
+            token_spans,
+            end_char - 1,
+            source_length=text_length,
+        )
         if start_token is None or end_token_inclusive is None:
             raise ValueError(
                 f"embedded domain span {start_char}:{end_char} could not be mapped to token spans"
@@ -808,6 +833,15 @@ def materialize_tokenized_enriched_batch(
             ("edit_op_per_char", "token_edit_op", EDIT_OP_PER_TOKEN_COLUMN),
             token_spans,
         )
+        token_source_doc_ids = normalize_positive_source_ids(
+            _chars_to_tokens_structure_ids(
+                doc.get("domain_source_doc_ids", doc.get("source_doc_ids", [])),
+                "",
+                token_spans,
+            ),
+            length=len(token_ids),
+            fallback_source_id=stable_source_identity_id(doc),
+        )
 
         row: dict[str, Any] = {
             TOKEN_IDS_COLUMN: token_ids,
@@ -869,11 +903,7 @@ def materialize_tokenized_enriched_batch(
                 "",
                 token_spans,
             ),
-            TOKEN_SOURCE_DOC_IDS_COLUMN: _chars_to_tokens_structure_ids(
-                doc.get("domain_source_doc_ids", doc.get("source_doc_ids", [])),
-                "",
-                token_spans,
-            ),
+            TOKEN_SOURCE_DOC_IDS_COLUMN: token_source_doc_ids,
             TOKEN_CONFIDENCE_IDS_COLUMN: _chars_to_tokens_structure_ids(
                 doc.get("domain_confidence_ids", doc.get("confidence_ids", [])),
                 "",
@@ -882,27 +912,32 @@ def materialize_tokenized_enriched_batch(
             TOKEN_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("domain_edges", []),
                 token_spans,
-                family="domain",
+                family="aggregate",
+                source_length=len(doc.get("text", "")),
             ),
             TOKEN_BUILD_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("build_edges", []),
                 token_spans,
                 family="build",
+                source_length=len(doc.get("text", "")),
             ),
             TOKEN_SHELL_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("shell_edges", []),
                 token_spans,
                 family="shell",
+                source_length=len(doc.get("text", "")),
             ),
             TOKEN_DIAGNOSTIC_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("diagnostic_edges", []),
                 token_spans,
                 family="diagnostic",
+                source_length=len(doc.get("text", "")),
             ),
             TOKEN_CROSS_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("cross_domain_edges", []),
                 token_spans,
                 family="cross_domain",
+                source_length=len(doc.get("text", "")),
             ),
             TOKEN_CHANGE_MASK_PRE_COLUMN: token_change_mask_pre,
             TOKEN_CHANGE_MASK_POST_COLUMN: token_change_mask_post,

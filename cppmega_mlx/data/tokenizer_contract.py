@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
+from pathlib import Path
 
 REQUIRED_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "BOS": 2,
@@ -40,62 +42,62 @@ OBJECTIVE_BOUNDARY_TOKEN_IDS: dict[str, int] = {
     "OVERLOAD_SET": 44,
 }
 
-DOMAIN_DELIMITER_TOKEN_IDS: dict[str, int] = {
-    "CPP_CODE_START": 191,
-    "CPP_CODE_END": 192,
-    "MAKE_START": 193,
-    "MAKE_END": 194,
-    "CMAKE_START": 195,
-    "CMAKE_END": 196,
-    "NINJA_START": 197,
-    "NINJA_END": 198,
-    "BAZEL_START": 199,
-    "BAZEL_END": 200,
-    "CONFIGURE_START": 237,
-    "CONFIGURE_END": 238,
-    "SQL_START": 239,
-    "SQL_END": 240,
-    "LINKER_DIAGNOSTIC_START": 241,
-    "LINKER_DIAGNOSTIC_END": 242,
-    "SANITIZER_OUTPUT_START": 243,
-    "SANITIZER_OUTPUT_END": 244,
-    "AUTOCONF_START": 223,
-    "AUTOCONF_END": 224,
-    "AUTOMAKE_START": 225,
-    "AUTOMAKE_END": 226,
-    "MESON_START": 227,
-    "MESON_END": 228,
-    "GN_START": 229,
-    "GN_END": 230,
-    "SCONS_START": 231,
-    "SCONS_END": 232,
-    "XMAKE_START": 233,
-    "XMAKE_END": 234,
-    "COMPILE_COMMANDS_START": 235,
-    "COMPILE_COMMANDS_END": 236,
-    "BASH_START": 201,
-    "BASH_END": 202,
-    "ZSH_START": 203,
-    "ZSH_END": 204,
-    "SH_START": 205,
-    "SH_END": 206,
-    "TCSH_START": 207,
-    "TCSH_END": 208,
-    "COMPILER_DIAGNOSTIC_START": 209,
-    "COMPILER_DIAGNOSTIC_END": 210,
-    "BUILD_DIAGNOSTIC_START": 211,
-    "BUILD_DIAGNOSTIC_END": 212,
-    "COMPILER_ERROR_START": 213,
-    "COMPILER_ERROR_END": 214,
-    "BUILD_ERROR_START": 215,
-    "BUILD_ERROR_END": 216,
-    "LINKER_ERROR_START": 217,
-    "LINKER_ERROR_END": 218,
-    "TEST_OUTPUT_START": 219,
-    "TEST_OUTPUT_END": 220,
-    "TOOL_OUTPUT_START": 221,
-    "TOOL_OUTPUT_END": 222,
-}
+_TOKENIZER_DIR = Path(__file__).resolve().parents[1] / "tokenizer"
+_TOKENIZER_CONTRACT_PATH = _TOKENIZER_DIR / "tokenizer_contract_v1.json"
+
+
+def _read_contract(path: Path) -> dict:
+    try:
+        contract = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load tokenizer contract {path}: {exc}") from exc
+    if not isinstance(contract, dict):
+        raise ValueError(f"tokenizer contract {path} must be an object")
+    return contract
+
+
+def _derive_domain_delimiter_token_ids(contract: Mapping[str, object]) -> dict[str, int]:
+    assignments = contract.get("reserved_role_assignments")
+    if not isinstance(assignments, Mapping):
+        raise ValueError("reserved_role_assignments must be an object")
+    starts = {
+        str(role).removesuffix("_START")
+        for role in assignments
+        if isinstance(role, str) and role.endswith("_START")
+    }
+    ends = {
+        str(role).removesuffix("_END")
+        for role in assignments
+        if isinstance(role, str) and role.endswith("_END")
+    }
+    if starts != ends:
+        missing = sorted(
+            [f"{base}_END" for base in starts - ends]
+            + [f"{base}_START" for base in ends - starts]
+        )
+        raise ValueError(f"unpaired domain delimiter roles: {missing}")
+    result: dict[str, int] = {}
+    seen_ids: dict[int, str] = {}
+    for base in sorted(starts):
+        for edge in ("START", "END"):
+            role = f"{base}_{edge}"
+            raw_id = assignments[role]
+            if not isinstance(raw_id, int) or isinstance(raw_id, bool):
+                raise ValueError(f"domain delimiter {role} id must be int")
+            existing = seen_ids.setdefault(raw_id, role)
+            if existing != role:
+                raise ValueError(
+                    f"domain delimiter id {raw_id} maps to both {existing} and {role}"
+                )
+            result[role] = raw_id
+    if not result:
+        raise ValueError("tokenizer contract defines no domain delimiter pairs")
+    return result
+
+
+DOMAIN_DELIMITER_TOKEN_IDS = _derive_domain_delimiter_token_ids(
+    _read_contract(_TOKENIZER_CONTRACT_PATH)
+)
 
 SpecialTokenMapping = Mapping[int, str] | Mapping[str, int]
 
@@ -126,6 +128,41 @@ def validate_required_special_token_ids(mapping: SpecialTokenMapping) -> None:
                 f"special token id collision: id {token_id} maps to both "
                 f"{existing!r} and {token!r}"
             )
+
+
+def validate_checked_out_tokenizer_contract(
+    repo_root: str | Path | None = None,
+) -> dict[str, int]:
+    """Validate the contract and tokenizer from this checkout, never a sibling."""
+
+    tokenizer_dir = (
+        Path(repo_root).resolve() / "cppmega_mlx" / "tokenizer"
+        if repo_root is not None
+        else _TOKENIZER_DIR
+    )
+    contract_path = tokenizer_dir / "tokenizer_contract_v1.json"
+    tokenizer_path = tokenizer_dir / "tokenizer.json"
+    contract = _read_contract(contract_path)
+    delimiter_ids = _derive_domain_delimiter_token_ids(contract)
+    try:
+        tokenizer = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load tokenizer artifact {tokenizer_path}: {exc}") from exc
+    added_tokens = {
+        int(item["id"]): str(item["content"])
+        for item in tokenizer.get("added_tokens", [])
+        if isinstance(item, dict) and "id" in item and "content" in item
+    }
+    for role, token_id in delimiter_ids.items():
+        expected = f"<RESERVED_{token_id}>"
+        if added_tokens.get(token_id) != expected:
+            raise ValueError(
+                f"{tokenizer_path}: {role} id {token_id} maps to "
+                f"{added_tokens.get(token_id)!r}, expected {expected!r}"
+            )
+    if tokenizer_dir == _TOKENIZER_DIR and delimiter_ids != DOMAIN_DELIMITER_TOKEN_IDS:
+        raise ValueError("imported domain delimiter mapping differs from checked-out contract")
+    return delimiter_ids
 
 
 def _normalize_special_token_mapping(mapping: SpecialTokenMapping) -> dict[str, int]:
@@ -171,5 +208,6 @@ __all__ = [
     "REQUIRED_SPECIAL_TOKEN_IDS",
     "SpecialTokenMapping",
     "TOOL_USE_SPECIAL_TOKEN_IDS",
+    "validate_checked_out_tokenizer_contract",
     "validate_required_special_token_ids",
 ]

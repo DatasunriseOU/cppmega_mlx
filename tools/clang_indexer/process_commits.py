@@ -94,6 +94,7 @@ from cppmega_mlx.data.symbol_identity import (
     require_project_identity,
 )
 from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
+from cppmega_mlx.data.source_identity import stable_source_identity_for_path
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 from scripts.pr_ingest import pr_store as _pr_store_mod
@@ -2253,6 +2254,10 @@ def _build_enriched_from_parts(
         _cpp_domain_sidecars(
             full_text,
             semantic_index,
+            source_doc_id=stable_source_identity_for_path(
+                str(record.get("filepath") or "commit.cpp"),
+                text=full_text,
+            ),
             macro_parts=macro_route_parts,
             macro_invocations=macro_invocation_routes,
         )

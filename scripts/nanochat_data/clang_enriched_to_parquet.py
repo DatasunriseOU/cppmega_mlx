@@ -37,7 +37,11 @@ if str(_REPO_ROOT) not in sys.path:
 import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
-from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_EDGE_FIELD_FAMILIES,
+    normalize_domain_edge_record,
+    remap_embedded_domain_spans,
+)
 from cppmega_mlx.data.nanochat_pipeline.language_info import language_info_to_prefix
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
@@ -46,6 +50,10 @@ from cppmega_mlx.data.symbol_identity import (
     SymbolIdentityError,
     SymbolIdentityRegistry,
     require_project_identity,
+)
+from cppmega_mlx.data.source_identity import (
+    normalize_positive_source_ids,
+    stable_source_identity_id,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     PLATFORM_IDS_COLUMN,
@@ -116,15 +124,6 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_CHANGE_MASK_POST_COLUMN,
     TOKEN_CHANGE_MASK_PRE_COLUMN,
 )
-
-_DOMAIN_EDGE_FIELD_FAMILIES = {
-    "domain_edges": "domain",
-    "build_edges": "build",
-    "shell_edges": "shell",
-    "diagnostic_edges": "diagnostic",
-    "cross_domain_edges": "cross_domain",
-}
-
 
 def _normalize_char_domain_edges(
     raw_edges: object,
@@ -1583,8 +1582,14 @@ def process_record_with_policy(
                 header_len,
                 family=family,
             )
-            for name, family in _DOMAIN_EDGE_FIELD_FAMILIES.items()
+            for name, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
         }
+        filtered_embedded_domain_spans = remap_embedded_domain_spans(
+            record.get("embedded_domain_spans", []),
+            source_length=len(text),
+            kept_indices=kept_indices,
+            prefix_length=header_len,
+        )
     else:
         filtered_structure_ids = _align_structure_ids(structure_ids, len(filtered_text))
         filtered_chunk_boundaries = chunk_boundaries
@@ -1595,19 +1600,42 @@ def process_record_with_policy(
             name: _shift_char_edge_triples(
                 record.get(name, []), header_len, family=family
             )
-            for name, family in _DOMAIN_EDGE_FIELD_FAMILIES.items()
+            for name, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
         }
+        filtered_embedded_domain_spans = remap_embedded_domain_spans(
+            record.get("embedded_domain_spans", []),
+            source_length=len(text),
+            kept_indices=None,
+            prefix_length=header_len,
+        )
 
     full_sids = [0] * header_len + filtered_structure_ids
+    source_identity_id = stable_source_identity_id(record)
     char_metadata: dict[str, list[int]] = {}
     for key in _CHAR_LEVEL_METADATA_FIELDS:
         values = record.get(key, [])
         if metadata_stale:
             remapped = _remap_optional_char_metadata(values, kept_indices, len(text))
-            char_metadata[key] = [0] * header_len + remapped if remapped else []
+            if key == "domain_source_doc_ids":
+                remapped = normalize_positive_source_ids(
+                    remapped,
+                    length=len(filtered_text),
+                    fallback_source_id=source_identity_id,
+                )
+                char_metadata[key] = [source_identity_id] * header_len + remapped
+            else:
+                char_metadata[key] = [0] * header_len + remapped if remapped else []
         else:
             aligned = _align_optional_char_metadata(values, len(filtered_text))
-            char_metadata[key] = [0] * header_len + aligned if aligned else []
+            if key == "domain_source_doc_ids":
+                aligned = normalize_positive_source_ids(
+                    aligned,
+                    length=len(filtered_text),
+                    fallback_source_id=source_identity_id,
+                )
+                char_metadata[key] = [source_identity_id] * header_len + aligned
+            else:
+                char_metadata[key] = [0] * header_len + aligned if aligned else []
 
     adjusted_chunks = [
         {
@@ -1627,16 +1655,19 @@ def process_record_with_policy(
                         "call_edges", "type_edges", "actual_token_count",
                         "domain_edges", "build_edges", "shell_edges",
                         "diagnostic_edges", "cross_domain_edges",
+                        "embedded_domain_spans",
                         *_CHAR_LEVEL_METADATA_FIELDS)},
         "text": full_text,
         # source_text mirrors the emitted (header-prefixed) document text so the
         # IFIM objective, which reads metadata['source_text'], aligns with the
         # tokenized text exactly.
         "source_text": full_text,
+        "source_identity_id": source_identity_id,
         "structure_ids": full_sids,
         "chunk_boundaries": adjusted_chunks,
         "call_edges": filtered_call_edges,
         "type_edges": filtered_type_edges,
+        "embedded_domain_spans": filtered_embedded_domain_spans,
         **filtered_domain_edge_fields,
         **char_metadata,
     }

@@ -29,6 +29,44 @@ _SANITIZER_TOOLS = (
     "ThreadSanitizer",
     "UndefinedBehaviorSanitizer",
 )
+_STATUS_COUNT_RE = re.compile(
+    r"\b(?P<count>\d+)\s+(?:tests?\s+)?"
+    r"(?P<status>passed|failed|failures?|errors?)\b",
+    re.IGNORECASE,
+)
+_STATUS_FIRST_COUNT_RE = re.compile(
+    r"\b(?P<status>passed|failed|failures?|errors?)\s*[:=]\s*"
+    r"(?P<count>\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _test_result_severity(text: str) -> str:
+    counts = [
+        (int(match.group("count")), match.group("status").lower())
+        for pattern in (_STATUS_COUNT_RE, _STATUS_FIRST_COUNT_RE)
+        for match in pattern.finditer(text)
+    ]
+    failure_count = sum(
+        count
+        for count, status in counts
+        if status in {"failed", "failure", "failures", "error", "errors"}
+    )
+    if failure_count > 0:
+        return "failure"
+
+    residual = _STATUS_FIRST_COUNT_RE.sub("", _STATUS_COUNT_RE.sub("", text))
+    if re.search(r"(?mi)^(?:FAILED|FAIL|ERROR)\b", residual) or re.search(
+        r"\b(?:AssertionError|Traceback)\b",
+        residual,
+        re.IGNORECASE,
+    ):
+        return "failure"
+    if counts:
+        return "pass"
+    if re.search(r"(?mi)^(?:PASSED|PASS|OK)\b|\bpassed\b", residual):
+        return "pass"
+    return "unknown"
 
 
 def _token_at_span(
@@ -65,13 +103,12 @@ def _mark_location(
 
 
 def parse_test_output(text: str, *, tool: str = "test") -> ParsedDomainDocument:
-    lower = text.lower()
-    failed = any(word in lower for word in ("failed", "failure", "assertionerror", "error"))
+    severity = _test_result_severity(text)
     doc = new_diagnostic_doc(
         text,
         domain=DomainKind.TEST_OUTPUT,
         tool=tool,
-        severity="failure" if failed else "pass" if "passed" in lower else "unknown",
+        severity=severity,
         stage="test",
         confidence=ParseConfidence.HEURISTIC if text.strip() else ParseConfidence.RAW,
     )

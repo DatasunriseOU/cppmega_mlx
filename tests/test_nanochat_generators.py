@@ -34,7 +34,7 @@ from cppmega_v4.data.doc_id_assignment import (
     assign_sharded_doc_ids,
     write_doc_id_manifest,
 )
-from scripts.nanochat_data import clang_enriched_to_parquet
+from scripts.nanochat_data import clang_enriched_to_parquet, token_budget
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
@@ -362,6 +362,89 @@ def test_converter_header_alignment_preserves_char_metadata_coordinates() -> Non
         assert doc[key] == [0] * header_len + record[key]
 
 
+def test_embedded_domain_spans_follow_filtering_and_header_insertion() -> None:
+    dead = "#ifdef __SYMBIAN32__\nconst char* dead = \"SELECT dead\";\n#endif\n"
+    live = 'const char* live = R"SQL(SELECT live;)SQL";\n'
+    text = dead + live
+    live_start = text.index("SELECT live")
+    live_end = live_start + len("SELECT live;")
+    record = {
+        "text": text,
+        "structure_ids": [1] * len(text),
+        "embedded_domain_spans": [
+            {
+                "start": live_start,
+                "end": live_end,
+                "domain_kind": int(DomainKind.SQL),
+            }
+        ],
+    }
+
+    docs = clang_enriched_to_parquet.process_record_with_policy(
+        record,
+        _CharTokenizer(),
+        max_tokens=10_000,
+    )
+
+    assert len(docs) == 1
+    doc = docs[0]
+    filtered, _ = clang_enriched_to_parquet.filter_dead_platforms_with_mapping(text)
+    header_len = len(doc["text"]) - len(filtered)
+    expected_start = header_len + filtered.index("SELECT live")
+    assert doc["embedded_domain_spans"] == [
+        {
+            "start": expected_start,
+            "end": expected_start + len("SELECT live;"),
+            "domain_kind": int(DomainKind.SQL),
+        }
+    ]
+
+
+def test_embedded_domain_spans_discard_deleted_regions_and_fail_on_partial_filter() -> None:
+    text = (
+        "before\n"
+        "#ifdef __SYMBIAN32__\n"
+        'const char* dead = R"SQL(SELECT dead;)SQL";\n'
+        "#endif\n"
+        "after\n"
+    )
+    dead_start = text.index("SELECT dead")
+    dead_end = dead_start + len("SELECT dead;")
+    deleted = clang_enriched_to_parquet.process_record_with_policy(
+        {
+            "text": text,
+            "structure_ids": [1] * len(text),
+            "embedded_domain_spans": [
+                {
+                    "start": dead_start,
+                    "end": dead_end,
+                    "domain_kind": int(DomainKind.SQL),
+                }
+            ],
+        },
+        _CharTokenizer(),
+        max_tokens=10_000,
+    )[0]
+    assert deleted["embedded_domain_spans"] == []
+
+    with pytest.raises(ValueError, match="cannot exactly remap embedded domain span"):
+        clang_enriched_to_parquet.process_record_with_policy(
+            {
+                "text": text,
+                "structure_ids": [1] * len(text),
+                "embedded_domain_spans": [
+                    {
+                        "start": 0,
+                        "end": len(text),
+                        "domain_kind": int(DomainKind.SQL),
+                    }
+                ],
+            },
+            _CharTokenizer(),
+            max_tokens=10_000,
+        )
+
+
 def test_dead_platform_filter_remaps_live_sidecars_and_drops_removed_edges() -> None:
     live_a = "int live_a() { return 1; }\n"
     dead = "#ifdef __SYMBIAN32__\nint dead() { return 0; }\n#endif\n"
@@ -501,6 +584,14 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
         for v in source_doc_ids
     ), source_doc_ids
     assert len(set(source_doc_ids)) == 2
+    token_source_doc_ids = parquet_file.read(
+        columns=["token_source_doc_ids"]
+    ).column("token_source_doc_ids").to_pylist()
+    assert all(
+        source_id > 0
+        for row in token_source_doc_ids
+        for source_id in row
+    )
     fingerprints = parquet_file.read(
         columns=["tokenizer_fingerprint"]
     ).column("tokenizer_fingerprint").to_pylist()
@@ -791,6 +882,43 @@ def test_token_budget_slices_semantic_char_metadata() -> None:
     assert pieces[1]["symbol_ids"] == [43, 44, 45]
     assert pieces[0]["def_use"] == [0, 1, 2]
     assert pieces[1]["def_use"] == [0, 1, 2]
+
+
+def test_token_budget_clips_embedded_domain_spans_at_every_split_boundary() -> None:
+    text = "aaSELECT123bb"
+    span_start = text.index("SELECT")
+    span_end = span_start + len("SELECT123")
+    doc = {
+        "text": text,
+        "structure_ids": [1] * len(text),
+        "embedded_domain_spans": [
+            {
+                "start": span_start,
+                "end": span_end,
+                "domain_kind": int(DomainKind.SQL),
+            }
+        ],
+    }
+
+    pieces = token_budget.chunk_enriched_document(doc, 5, _CharTokenizer())
+
+    source_offset = 0
+    for piece in pieces:
+        piece_end = source_offset + len(piece["text"])
+        overlap_start = max(span_start, source_offset)
+        overlap_end = min(span_end, piece_end)
+        expected = []
+        if overlap_start < overlap_end:
+            expected = [
+                {
+                    "start": overlap_start - source_offset,
+                    "end": overlap_end - source_offset,
+                    "domain_kind": int(DomainKind.SQL),
+                }
+            ]
+        assert piece["embedded_domain_spans"] == expected
+        source_offset = piece_end
+    assert source_offset == len(text)
 
 
 def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
@@ -1294,6 +1422,9 @@ def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
             "domain_kind": int(DomainKind.CMAKE),
             "domain_ids": [int(DomainKind.CMAKE)] * len(text),
             "domain_role_ids": role_ids,
+            "domain_source_doc_ids": [0] * len(text),
+            "repo_stable_id": "repo-17",
+            "filepath_stable_id": "cmake-file-23",
             "domain_edges": [],
             "build_edges": [
                 {
@@ -1314,6 +1445,7 @@ def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][1] == int(DomainRoleKind.DELIMITER)
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][-1] == int(DomainRoleKind.DELIMITER)
     assert row[schema.TOKEN_BUILD_EDGES_COLUMN]
+    assert min(row[schema.TOKEN_SOURCE_DOC_IDS_COLUMN]) > 0
     edge = row[schema.TOKEN_BUILD_EDGES_COLUMN][0]
     assert edge["kind"] == int(DomainEdgeKind.BUILD_TARGET_SOURCE)
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][edge["from"]] == int(DomainRoleKind.TARGET)

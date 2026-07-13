@@ -36,7 +36,7 @@ def _write_parquet(path, *, extra):
         ],
         "token_entity_ids": [0] * 8,
         "token_scope_ids": [0] * 8,
-        "token_source_doc_ids": [0] * 8,
+        "token_source_doc_ids": [17, 17, 17, 17, 0, 0, 0, 0],
         "token_confidence_ids": [int(ParseConfidence.HEURISTIC)] * 4 + [0, 0, 0, 0],
         "token_diagnostic_edges": [],
     }

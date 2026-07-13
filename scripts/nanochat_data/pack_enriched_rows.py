@@ -24,7 +24,10 @@ import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_v4.data.doc_id_assignment import stable_doc_signature
-from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
+from cppmega_mlx.data.domain_schema import (
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    normalize_domain_edge_record,
+)
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
@@ -120,6 +123,7 @@ from cppmega_mlx.data.symbol_identity import (
     SymbolIdentityError,
     SymbolIdentityRegistry,
 )
+from cppmega_mlx.data.source_identity import stable_source_identity_id
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 TRAINED_TOKEN_COUNT_COLUMN = "trained_token_count"
@@ -331,6 +335,7 @@ class NormalizedDoc:
 
     source_doc_index: int
     stable_doc_id: int
+    stable_source_id: int
     token_ids: list[int]
     token_meta: dict[str, list[int]]
     chunk_starts: list[int]
@@ -885,10 +890,12 @@ def _normalize_domain_graph_meta(
         TOKEN_DIAGNOSTIC_EDGES_COLUMN,
         TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     )
-    families = ("domain", "build", "shell", "diagnostic", "cross_domain")
     normalized = tuple(
-        _normalize_edge_triples(record.get(column), family=family)
-        for column, family in zip(columns, families)
+        _normalize_edge_triples(
+            record.get(column),
+            family=TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES[column],
+        )
+        for column in columns
     )
     for column, edges in zip(columns, normalized):
         _validate_token_edge_triples(
@@ -973,6 +980,7 @@ def normalize_document_record(
     return NormalizedDoc(
         source_doc_index=int(source_doc_index),
         stable_doc_id=int(source_doc_index + 1 if stable_doc_id is None else stable_doc_id),
+        stable_source_id=stable_source_identity_id(record),
         token_ids=token_ids,
         token_meta=token_meta,
         chunk_starts=chunk_starts,
@@ -1459,15 +1467,13 @@ def _materialize_packed_row(
             )
 
         for column in PACKED_TOKEN_METADATA_COLUMNS:
-            # Stable logical source identity is independent of row-local packed
-            # segment IDs. Repeated fragments keep the same positive source ID,
-            # while ``doc_ids`` above still opens a new attention/loss segment.
-            values = (
-                [doc.stable_doc_id] * doc.token_count
-                if column == TOKEN_SOURCE_DOC_IDS_COLUMN
-                else doc.token_meta[column]
-            )
-            if values:
+            values = doc.token_meta[column]
+            if column == TOKEN_SOURCE_DOC_IDS_COLUMN:
+                token_meta_acc[column].extend(
+                    int(value) if int(value) > 0 else doc.stable_source_id
+                    for value in (values or [0] * doc.token_count)
+                )
+            elif values:
                 token_meta_acc[column].extend(values)
             else:
                 fill = PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES.get(column, 0)

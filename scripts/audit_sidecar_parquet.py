@@ -178,36 +178,15 @@ LIST_FIELDS = (
 ALL_FIELDS = (*TOKEN_COLUMNS, *SOURCE_COLUMNS, *TOKEN_ALIGNED_FIELDS, *CHUNK_ALIGNED_FIELDS, *LIST_FIELDS)
 
 _DIAGNOSTIC_DOMAIN_IDS = {
-    int(DomainKind.COMPILER_DIAGNOSTIC),
-    int(DomainKind.BUILD_DIAGNOSTIC),
-    int(DomainKind.COMPILER_ERROR),
-    int(DomainKind.BUILD_ERROR),
-    int(DomainKind.LINKER_ERROR),
-    int(DomainKind.TEST_OUTPUT),
-    int(DomainKind.TOOL_OUTPUT),
-    int(DomainKind.LINKER_DIAGNOSTIC),
-    int(DomainKind.SANITIZER_OUTPUT),
+    int(domain) for domain in DomainKind if int(domain) >= 40
 }
 
 _DIAGNOSTIC_DELIMITER_IDS = np.asarray(
     [
         DOMAIN_DELIMITER_TOKEN_IDS[name]
-        for name in (
-            "COMPILER_DIAGNOSTIC_START",
-            "COMPILER_DIAGNOSTIC_END",
-            "BUILD_DIAGNOSTIC_START",
-            "BUILD_DIAGNOSTIC_END",
-            "COMPILER_ERROR_START",
-            "COMPILER_ERROR_END",
-            "BUILD_ERROR_START",
-            "BUILD_ERROR_END",
-            "LINKER_ERROR_START",
-            "LINKER_ERROR_END",
-            "TEST_OUTPUT_START",
-            "TEST_OUTPUT_END",
-            "TOOL_OUTPUT_START",
-            "TOOL_OUTPUT_END",
-        )
+        for domain, roles in DOMAIN_DELIMITER_ROLES.items()
+        if int(domain) >= 40
+        for name in roles
     ],
     dtype=np.int64,
 )
@@ -344,6 +323,31 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _validate_positive_valid_token_source_ids(
+    *,
+    stats: AuditStats,
+    column: Any,
+    valid: np.ndarray,
+    row_bad: np.ndarray,
+    path: str,
+) -> None:
+    bad_rows = 0
+    for row_idx, values in enumerate(column.to_pylist()):
+        limit = int(valid[row_idx])
+        valid_values = list(values or [])[:limit]
+        if len(valid_values) != limit or any(
+            (value := _as_int(raw)) is None or value <= 0 or value > (1 << 32) - 1
+            for raw in valid_values
+        ):
+            row_bad[row_idx] = True
+            bad_rows += 1
+    if bad_rows:
+        stats.field_stats["token_source_doc_ids"].bad_value_rows += bad_rows
+        stats.errors.append(
+            f"{path}: {bad_rows} rows have zero/invalid source ids on valid tokens"
+        )
 
 
 def _nonzero_count(values: Any, *, hunk: bool = False) -> int:
@@ -828,36 +832,18 @@ def _validate_token_source_doc_ids(
         stats.errors.append(f"{field} must be list<uint32>, got {column.type}")
 
     rows = column.to_pylist()
-    declared_id_rows = (
-        table.column("source_doc_ids").to_pylist()
-        if "source_doc_ids" in names
-        else [[] for _ in rows]
-    )
-    declared_length_rows = (
-        table.column("source_doc_token_lengths").to_pylist()
-        if "source_doc_token_lengths" in names
-        else [[] for _ in rows]
-    )
-    for row_index, (values, declared_ids, declared_lengths) in enumerate(
-        zip(rows, declared_id_rows, declared_length_rows, strict=True)
-    ):
+    for row_index, values in enumerate(rows):
         capacity = int(input_lengths[row_index])
         valid = int(valid_lengths[row_index])
         values = list(_iter_or_empty(values))
-        expected = [
-            int(source_id)
-            for source_id, length in zip(
-                _iter_or_empty(declared_ids),
-                _iter_or_empty(declared_lengths),
-                strict=True,
-            )
-            for _ in range(int(length))
-        ]
         bad = (
             len(values) != capacity
-            or len(expected) != valid
-            or any(_as_int(value) is None or int(value) <= 0 for value in values[:valid])
-            or [int(value) for value in values[:valid]] != expected
+            or any(
+                _as_int(value) is None
+                or int(value) <= 0
+                or int(value) > (1 << 32) - 1
+                for value in values[:valid]
+            )
         )
         if bad:
             row_bad[row_index] = True
@@ -1382,9 +1368,9 @@ def _write_md(report: dict[str, Any], path: Path) -> None:
             f"{fmt_int(stats['valid_tokens'])} | {fmt_int(stats['capacity_tokens'])} | {stats['pad_pct']} | {fmt_int(stats['bad_rows'])} |"
         )
     lines.extend(["", "## Field Coverage And Correctness", "", "| field | rows present % | rows nonempty % | rows nonzero % | slots nonzero % | bad length rows | bad value rows | missing files |", "|---|---:|---:|---:|---:|---:|---:|---:|"])
-    for field, stats in total["fields"].items():
+    for field_name, stats in total["fields"].items():
         lines.append(
-            f"| `{field}` | {stats['rows_present_pct']} | {stats['rows_nonempty_pct']} | "
+            f"| `{field_name}` | {stats['rows_present_pct']} | {stats['rows_nonempty_pct']} | "
             f"{stats['rows_nonzero_pct']} | {stats['slots_nonzero_pct']} | "
             f"{fmt_int(stats['bad_length_rows'])} | {fmt_int(stats['bad_value_rows'])} | {fmt_int(stats['missing_files'])} |"
         )

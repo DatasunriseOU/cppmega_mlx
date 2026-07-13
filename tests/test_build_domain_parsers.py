@@ -9,7 +9,12 @@ from cppmega_mlx.data.build_parsers import (
     parse_make,
     parse_ninja,
 )
-from cppmega_mlx.data.domain_schema import DomainEdgeKind, DomainKind, DomainRoleKind
+from cppmega_mlx.data.domain_schema import (
+    DomainEdgeKind,
+    DomainKind,
+    DomainRoleKind,
+    ParseConfidence,
+)
 
 
 def _roles(parsed):
@@ -40,6 +45,60 @@ def test_cmake_parser_marks_target_sources_and_libraries() -> None:
     packet = parsed.to_packet()
     assert packet.domain == DomainKind.CMAKE
     assert int(np.asarray(packet.domain_ids)[0]) == int(DomainKind.CMAKE)
+
+
+def test_cmake_parser_routes_balanced_multiline_command_arguments() -> None:
+    parsed = parse_cmake(
+        "add_executable(\n"
+        "  app\n"
+        "  src/main.cpp\n"
+        "  src/util.cc\n"
+        ")\n"
+        "target_link_libraries(\n"
+        "  app\n"
+        "  PRIVATE\n"
+        "  ssl\n"
+        "  crypto\n"
+        ")\n"
+    )
+
+    assert _has_role(parsed, "app", DomainRoleKind.TARGET)
+    assert _has_role(parsed, "src/main.cpp", DomainRoleKind.SOURCE)
+    assert _has_role(parsed, "src/util.cc", DomainRoleKind.SOURCE)
+    assert _has_role(parsed, "ssl", DomainRoleKind.LIBRARY)
+    assert _has_role(parsed, "crypto", DomainRoleKind.LIBRARY)
+    source_edges = [
+        edge
+        for edge in parsed.edges
+        if edge[2] == int(DomainEdgeKind.BUILD_TARGET_SOURCE)
+    ]
+    dependency_edges = [
+        edge
+        for edge in parsed.edges
+        if edge[2] == int(DomainEdgeKind.BUILD_TARGET_DEP)
+    ]
+    assert len(source_edges) == 2
+    assert len(dependency_edges) == 2
+    assert parsed.metadata["targets_seen"] == 2
+
+
+def test_cmake_parser_marks_missing_and_extra_command_parentheses_raw() -> None:
+    missing = parse_cmake("add_executable(app\n  main.cpp\n")
+    extra = parse_cmake("add_executable(app main.cpp))\n")
+    no_open = parse_cmake("add_executable app main.cpp\n")
+    comment = parse_cmake(
+        "# add_executable(fake ( in a line comment\n"
+        "#[=[\n"
+        "target_link_libraries(fake ( missing\n"
+        "]=]\n"
+        'set(TEXT "unmatched ) in a string")\n'
+        "add_executable(app main.cpp)\n"
+    )
+
+    for parsed in (missing, extra, no_open):
+        assert set(parsed.confidence_ids) == {int(ParseConfidence.RAW)}
+        assert parsed.metadata["unsupported_syntax"] == "malformed_cmake_command_parentheses"
+    assert set(comment.confidence_ids) == {int(ParseConfidence.HEURISTIC)}
 
 
 def test_make_parser_marks_targets_prereqs_and_recipe_command() -> None:
