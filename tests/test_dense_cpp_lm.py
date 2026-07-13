@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
+from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.models.dense_cpp_lm import (
     DenseCppBlock,
     DenseCppLM,
     DenseCppLMConfig,
 )
+from cppmega_mlx.training.loss import next_token_cross_entropy
 
 
 def _smoke_config(**overrides) -> DenseCppLMConfig:
@@ -244,6 +249,413 @@ def test_forward_packet_single_window():
     mx.eval(logits, loss)
     assert tuple(logits.shape) == (1, s, cfg.vocab_size)
     assert loss is not None and mx.isfinite(loss).item()
+
+
+def test_forward_packet_promotes_platform_metadata_into_model():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        structure_residual_scale=0.0,
+    )
+    model = DenseCppLM(cfg)
+    mx.random.seed(211)
+    model.platform_embedding.embedding.weight = mx.random.normal(
+        model.platform_embedding.embedding.weight.shape
+    )
+    tokens = mx.array(np.arange(8, dtype=np.int32)) % cfg.vocab_size
+    packet_one = CodePacket(
+        token_ids=tokens,
+        metadata={"platform_ids": mx.array([1, 2], dtype=mx.int32)},
+    )
+    packet_two = CodePacket(
+        token_ids=tokens,
+        metadata={"platform_ids": mx.array([3, 4], dtype=mx.int32)},
+    )
+
+    logits_one, _ = model.forward_packet(packet_one)
+    logits_two, _ = model.forward_packet(packet_two)
+    mx.eval(logits_one, logits_two)
+
+    assert float(mx.sum(mx.abs(logits_one - logits_two)).item()) > 1e-4
+
+
+def _single_token_chunk_graph(seq: int, pairs: list[list[int]]) -> GraphBatch:
+    starts = mx.arange(seq, dtype=mx.int32)
+    ends = starts + 1
+    graph = EdgeIndex.from_pairs(pairs, relation="call", num_nodes=seq)
+    return GraphBatch(
+        graphs=(CodePacket(token_ids=mx.zeros((seq,), dtype=mx.int32), call_edges=graph).graph_packet(),),
+        chunk_starts=(starts,),
+        chunk_ends=(ends,),
+        chunk_kinds=(mx.zeros((seq,), dtype=mx.int32),),
+        chunk_dep_levels=(mx.zeros((seq,), dtype=mx.int32),),
+    )
+
+
+def test_forward_packet_consumes_codepacket_graph_edges_when_enabled():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+        graph_attention_bias_beta=25.0,
+    )
+    model = DenseCppLM(cfg)
+    seq = 8
+    tokens = mx.array(np.arange(seq, dtype=np.int32))[None, :] % cfg.vocab_size
+    targets = (tokens + 1) % cfg.vocab_size
+    chunk_starts = mx.arange(seq, dtype=mx.int32)
+    chunk_ends = chunk_starts + 1
+    with_graph = CodePacket(
+        token_ids=tokens,
+        target_ids=targets,
+        call_edges=EdgeIndex.from_pairs([[7, 1]], relation="call", num_nodes=seq),
+        chunk_starts=chunk_starts,
+        chunk_ends=chunk_ends,
+        chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
+        chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
+    )
+    empty_graph = CodePacket(
+        token_ids=tokens,
+        target_ids=targets,
+        call_edges=EdgeIndex.from_pairs([], relation="call", num_nodes=seq),
+        chunk_starts=chunk_starts,
+        chunk_ends=chunk_ends,
+        chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
+        chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
+    )
+
+    logits_graph, loss_graph = model.forward_packet(with_graph)
+    logits_empty, loss_empty = model.forward_packet(empty_graph)
+    mx.eval(logits_graph, logits_empty, loss_graph, loss_empty)
+
+    assert float(mx.sum(mx.abs(logits_graph - logits_empty)).item()) > 1e-4
+    assert abs(float(loss_graph.item()) - float(loss_empty.item())) > 1e-5
+
+
+def test_graph_disabled_is_exact_baseline_even_when_packet_edges_exist():
+    cfg = _smoke_config(depth=1, ngram_hash_enabled=False, graph_routes_enabled=False)
+    model = DenseCppLM(cfg)
+    seq = 8
+    tokens = mx.array(np.arange(seq, dtype=np.int32))[None, :] % cfg.vocab_size
+    targets = (tokens + 1) % cfg.vocab_size
+    chunk_starts = mx.arange(seq, dtype=mx.int32)
+    chunk_ends = chunk_starts + 1
+    with_graph = CodePacket(
+        token_ids=tokens,
+        target_ids=targets,
+        call_edges=EdgeIndex.from_pairs([[7, 1]], relation="call", num_nodes=seq),
+        chunk_starts=chunk_starts,
+        chunk_ends=chunk_ends,
+        chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
+        chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
+    )
+    empty_graph = CodePacket(
+        token_ids=tokens,
+        target_ids=targets,
+        chunk_starts=chunk_starts,
+        chunk_ends=chunk_ends,
+        chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
+        chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
+    )
+
+    logits_graph, loss_graph = model.forward_packet(with_graph)
+    logits_empty, loss_empty = model.forward_packet(empty_graph)
+    mx.eval(logits_graph, logits_empty, loss_graph, loss_empty)
+
+    np.testing.assert_array_equal(np.asarray(logits_graph), np.asarray(logits_empty))
+    assert float(loss_graph.item()) == float(loss_empty.item())
+
+
+def test_forward_packet_rejects_malformed_graph_edges_when_enabled():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    seq = 8
+    chunk_starts = mx.arange(seq, dtype=mx.int32)
+    chunk_ends = chunk_starts + 1
+    packet = CodePacket(
+        token_ids=mx.array(np.arange(seq, dtype=np.int32))[None, :] % cfg.vocab_size,
+        target_ids=mx.array(np.arange(1, seq + 1, dtype=np.int32))[None, :] % cfg.vocab_size,
+        call_edges=EdgeIndex.from_pairs([[99, 0]], relation="call", num_nodes=seq),
+        chunk_starts=chunk_starts,
+        chunk_ends=chunk_ends,
+        chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
+        chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
+    )
+
+    with pytest.raises(ValueError, match="graph call edge.*out of range"):
+        model.forward_packet(packet)
+
+
+def test_graph_enabled_rejects_missing_typed_graph_batch():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+
+    with pytest.raises(RuntimeError, match="graph routes are enabled.*GraphBatch"):
+        model(tokens)
+
+
+def test_graph_enabled_rejects_relationless_typed_graph_batch():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    relationless = GraphBatch(
+        graphs=(GraphPacket(),),
+        chunk_starts=(mx.zeros((0,), dtype=mx.int32),),
+        chunk_ends=(mx.zeros((0,), dtype=mx.int32),),
+    )
+
+    with pytest.raises(KeyError, match="no route relations"):
+        model(tokens, graph_batch=relationless)
+
+
+def test_loss_path_consumes_lmtokenbatch_graph_batch_when_enabled():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+        graph_attention_bias_beta=25.0,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    with_graph = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=(tokens + 1) % cfg.vocab_size,
+        graph_batch=_single_token_chunk_graph(8, [[7, 1]]),
+    )
+    empty_graph = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=(tokens + 1) % cfg.vocab_size,
+        graph_batch=_single_token_chunk_graph(8, []),
+    )
+
+    loss_graph, _ = next_token_cross_entropy(model, with_graph)
+    loss_empty, _ = next_token_cross_entropy(model, empty_graph)
+    mx.eval(loss_graph, loss_empty)
+
+    assert abs(float(loss_graph.item()) - float(loss_empty.item())) > 1e-5
+
+
+def test_loss_path_input_aligns_graph_batch_for_implicit_next_token_targets():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+        graph_attention_bias_beta=25.0,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    with_graph = LMTokenBatch(
+        tokens=tokens,
+        graph_batch=_single_token_chunk_graph(8, [[6, 1]]),
+    )
+    empty_graph = LMTokenBatch(
+        tokens=tokens,
+        graph_batch=_single_token_chunk_graph(8, []),
+    )
+
+    loss_graph, ntokens_graph = next_token_cross_entropy(model, with_graph)
+    loss_empty, ntokens_empty = next_token_cross_entropy(model, empty_graph)
+    mx.eval(loss_graph, loss_empty, ntokens_graph, ntokens_empty)
+
+    assert int(ntokens_graph.item()) == int(ntokens_empty.item()) == 7
+    assert abs(float(loss_graph.item()) - float(loss_empty.item())) > 1e-5
+
+
+def test_loss_path_rejects_source_invalid_edges_before_graph_input_alignment():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    batch = LMTokenBatch(
+        tokens=tokens,
+        graph_batch=_single_token_chunk_graph(8, [[8, 0]]),
+    )
+
+    with pytest.raises(ValueError, match="call edge.*source chunks"):
+        next_token_cross_entropy(model, batch)
+
+
+def test_typed_graph_batch_loss_backpropagates_through_dense_attention():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    batch = LMTokenBatch(
+        tokens=tokens,
+        graph_batch=_single_token_chunk_graph(8, [[6, 1]]),
+    )
+    loss_and_grad = nn.value_and_grad(model, next_token_cross_entropy)
+
+    (loss, ntokens), grads = loss_and_grad(model, batch)
+    attention_grad = grads["layers"][0]["attention"]["q_proj"]["weight"]
+    mx.eval(loss, ntokens, attention_grad)
+
+    assert mx.isfinite(loss).item()
+    assert int(ntokens.item()) == 7
+    assert float(mx.sum(mx.abs(attention_grad)).item()) > 0.0
+
+
+def test_graph_beta_default_matches_megatron_contract():
+    assert _smoke_config().graph_attention_bias_beta == 1.0
+
+    dsa = DenseCppLM(
+        _smoke_config(
+            depth=1,
+            ngram_hash_enabled=False,
+            attention_mode="dsa",
+            require_graph_routes=False,
+        )
+    )
+    assert float(dsa.layers[0].attention.index_beta.item()) == 1.0
+
+
+def test_domain_side_channels_change_loss_through_lm_batch():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        domain_residual_scale=1.0,
+        platform_residual_scale=0.0,
+    )
+    model = DenseCppLM(cfg)
+    model.domain_embedding.stacked_emb.weight = mx.random.normal(
+        model.domain_embedding.stacked_emb.weight.shape
+    ) * 0.5
+    model.domain_embedding.up_proj.weight = mx.random.normal(
+        model.domain_embedding.up_proj.weight.shape
+    ) * 0.5
+
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    target_tokens = (tokens + 1) % cfg.vocab_size
+    domain_one = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=target_tokens,
+        side_channels={
+            "domain_routes": {
+                "domain_ids": mx.ones((1, 8), dtype=mx.int32),
+                "role_ids": mx.ones((1, 8), dtype=mx.int32),
+                "confidence_ids": mx.ones((1, 8), dtype=mx.int32),
+            }
+        },
+    )
+    domain_two = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=target_tokens,
+        side_channels={
+            "domain_routes": {
+                "domain_ids": mx.full((1, 8), 2, dtype=mx.int32),
+                "role_ids": mx.ones((1, 8), dtype=mx.int32),
+                "confidence_ids": mx.ones((1, 8), dtype=mx.int32),
+            }
+        },
+    )
+
+    loss_one, _ = next_token_cross_entropy(model, domain_one)
+    loss_two, _ = next_token_cross_entropy(model, domain_two)
+    mx.eval(loss_one, loss_two)
+
+    assert abs(float(loss_one.item()) - float(loss_two.item())) > 1e-5
+
+
+def test_platform_side_channels_change_loss_through_lm_batch():
+    cfg = _smoke_config(depth=1, ngram_hash_enabled=False)
+    model = DenseCppLM(cfg)
+    model.platform_embedding.embedding.weight = mx.random.normal(
+        model.platform_embedding.embedding.weight.shape
+    ) * 0.5
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    targets = (tokens + 1) % cfg.vocab_size
+    platform_one = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=targets,
+        platform_ids=mx.array([[1, 2]], dtype=mx.int32),
+    )
+    platform_two = LMTokenBatch(
+        tokens=tokens,
+        target_tokens=targets,
+        platform_ids=mx.array([[3, 4]], dtype=mx.int32),
+    )
+
+    loss_one, _ = next_token_cross_entropy(model, platform_one)
+    loss_two, _ = next_token_cross_entropy(model, platform_two)
+    mx.eval(loss_one, loss_two)
+
+    assert abs(float(loss_one.item()) - float(loss_two.item())) > 1e-5
+
+
+def test_forward_packet_consumes_domain_graph_edges():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+        graph_attention_bias_beta=25.0,
+    )
+    model = DenseCppLM(cfg)
+    seq = 8
+    tokens = mx.array(np.arange(seq, dtype=np.int32))[None, :] % cfg.vocab_size
+    targets = (tokens + 1) % cfg.vocab_size
+    with_edge = CodePacket(
+        token_ids=tokens,
+        target_ids=targets,
+        domain_edges=DomainEdgeIndex.from_triples([(7, 1, 20)]),
+    )
+    empty = CodePacket(
+        token_ids=tokens,
+        target_ids=targets,
+        domain_edges=DomainEdgeIndex.empty(),
+    )
+
+    logits_edge, loss_edge = model.forward_packet(with_edge)
+    logits_empty, loss_empty = model.forward_packet(empty)
+    mx.eval(logits_edge, logits_empty, loss_edge, loss_empty)
+
+    assert float(mx.sum(mx.abs(logits_edge - logits_empty)).item()) > 1e-4
+    assert abs(float(loss_edge.item()) - float(loss_empty.item())) > 1e-5
+
+
+def test_dsa_graph_batch_changes_indexer_scores_with_production_beta():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        attention_mode="dsa",
+        graph_routes_enabled=True,
+        graph_attention_bias_beta=1.0,
+        attention_sparse_topk=2,
+        indexer_local_window=0,
+        indexer_num_sinks=0,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    graph = _single_token_chunk_graph(8, [[7, 1]])
+    empty = _single_token_chunk_graph(8, [])
+
+    model(tokens, graph_batch=graph)
+    graph_scores = model.indexer_scores()[0]
+    mx.eval(graph_scores)
+    graph_scores_np = np.asarray(graph_scores).copy()
+    model(tokens, graph_batch=empty)
+    empty_scores = model.indexer_scores()[0]
+    mx.eval(empty_scores)
+
+    assert graph_scores_np[0, 7, 1] - np.asarray(empty_scores)[0, 7, 1] == pytest.approx(1.0)
 
 
 def test_dsa_seam_rebuilds_without_restructuring():

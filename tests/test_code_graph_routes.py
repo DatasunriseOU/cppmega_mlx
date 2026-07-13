@@ -6,12 +6,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.nn.code_graph_routes import (
     CodeGraphRouter,
     GraphRouteConfig,
     build_attention_bias,
     build_block_candidates,
+    build_token_attention_bias,
 )
 
 
@@ -102,3 +103,72 @@ def test_router_and_config_mutually_exclusive():
     router = CodeGraphRouter(GraphRouteConfig(num_blocks=4, relations=("call",)))
     with pytest.raises(ValueError):
         build_attention_bias(pkt, router=router, config=GraphRouteConfig())
+
+
+def test_token_attention_bias_expands_chunks_and_routes_domain_tokens():
+    graph = GraphPacket(
+        edges={
+            "call": EdgeIndex.from_pairs([[1, 0]], relation="call", num_nodes=2),
+            "domain": EdgeIndex.from_pairs(
+                [[3, 0]], relation="domain", num_nodes=4
+            ),
+        },
+        num_nodes=2,
+    )
+    graph_batch = GraphBatch(
+        graphs=(graph,),
+        chunk_starts=(mx.array([0, 2], dtype=mx.int32),),
+        chunk_ends=(mx.array([2, 4], dtype=mx.int32),),
+    )
+
+    bias = build_token_attention_bias(
+        graph_batch,
+        batch_size=1,
+        seq_length=4,
+    )
+    mx.eval(bias)
+    actual = np.asarray(bias)[0]
+
+    expected_block = np.ones((2, 2))
+    expected_block[1, 0] = 2.0
+    np.testing.assert_array_equal(actual[2:4, 0:2], expected_block)
+    assert actual[3, 0] == 2.0
+    assert actual.sum() == 5.0
+
+
+def test_token_attention_bias_rejects_invalid_chunk_and_token_endpoints():
+    starts = (mx.array([0, 2], dtype=mx.int32),)
+    ends = (mx.array([2, 4], dtype=mx.int32),)
+    invalid_call = GraphBatch(
+        graphs=(
+            GraphPacket(
+                edges={
+                    "call": EdgeIndex.from_pairs(
+                        [[2, 0]], relation="call", num_nodes=2
+                    )
+                },
+                num_nodes=2,
+            ),
+        ),
+        chunk_starts=starts,
+        chunk_ends=ends,
+    )
+    with pytest.raises(ValueError, match="graph call edge.*out of range"):
+        build_token_attention_bias(invalid_call, batch_size=1, seq_length=4)
+
+    invalid_domain = GraphBatch(
+        graphs=(
+            GraphPacket(
+                edges={
+                    "domain": EdgeIndex.from_pairs(
+                        [[4, 0]], relation="domain", num_nodes=4
+                    )
+                },
+                num_nodes=2,
+            ),
+        ),
+        chunk_starts=starts,
+        chunk_ends=ends,
+    )
+    with pytest.raises(ValueError, match="graph domain edge.*out of range"):
+        build_token_attention_bias(invalid_domain, batch_size=1, seq_length=4)

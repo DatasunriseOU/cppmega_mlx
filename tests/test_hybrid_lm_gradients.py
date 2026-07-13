@@ -140,6 +140,44 @@ def test_hybrid_lm_single_route_compiled_eager_train_matrix_with_side_channels(
     np.testing.assert_allclose(compiled_delta, eager_delta, rtol=1e-4, atol=1e-7)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "expected_message"),
+    [
+        ("structure_ids", "structure_ids out of range"),
+        ("platform_ids", "platform_ids must be less than vocab_size"),
+    ],
+)
+def test_compiled_step_rejects_invalid_side_channel_ids_before_tracing(
+    field_name: str,
+    expected_message: str,
+) -> None:
+    config = _single_route_config("A")
+    batch = synthetic_token_batch(
+        batch_size=1,
+        seq_length=5,
+        vocab_size=config.vocab_size,
+        seed=179,
+        include_structure=True,
+    ).as_dict()
+    if field_name == "structure_ids":
+        batch[field_name] = mx.full(
+            batch["tokens"].shape,
+            config.structure_num_categories,
+            dtype=mx.int32,
+        )
+    else:
+        batch[field_name] = mx.full(
+            (*batch["tokens"].shape, 1),
+            config.platform_vocab_size,
+            dtype=mx.int32,
+        )
+
+    model = HybridTinyLM(config)
+    optimizer = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+    with pytest.raises(ValueError, match=expected_message):
+        CompiledPretrainingStep(model, optimizer, compile=True)(batch)
+
+
 def test_hybrid_lm_single_route_losses_reach_active_route_gradients() -> None:
     # The sibling cppmega NAM layout treats A/E/M/R as distinct active layer
     # routes. A single-route LM should therefore backprop through that route's

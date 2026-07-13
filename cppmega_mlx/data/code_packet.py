@@ -30,7 +30,7 @@ from typing import Any
 import mlx.core as mx
 
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 
 
 # Token-aligned 1-D/2-D channels whose leading length must equal token_ids length.
@@ -276,17 +276,74 @@ class CodePacket:
         return tuple(name for name in candidates if getattr(self, name) is not None)
 
     def graph_packet(self) -> GraphPacket:
-        """Bundle present call/type edges into a typed GraphPacket."""
+        """Bundle all present route edges into a typed GraphPacket."""
 
         edges: dict[str, EdgeIndex] = {}
         if self.call_edges is not None:
             edges["call"] = self.call_edges
         if self.type_edges is not None:
             edges["type"] = self.type_edges
+        for relation, field_name in (
+            ("domain", "domain_edges"),
+            ("build", "build_edges"),
+            ("shell", "shell_edges"),
+            ("diagnostic", "diagnostic_edges"),
+            ("cross_domain", "cross_domain_edges"),
+        ):
+            edge = getattr(self, field_name)
+            if edge is not None:
+                edges[relation] = EdgeIndex(
+                    src=edge.src,
+                    dst=edge.dst,
+                    relation=relation,
+                    num_nodes=self.token_axis_len,
+                )
         num_nodes = None
         if self.chunk_starts is not None:
             num_nodes = int(self.chunk_starts.shape[0])
         return GraphPacket(edges=edges, num_nodes=num_nodes)
+
+    def graph_batch(self) -> GraphBatch:
+        """Return this packet's routes and chunk layout as a typed graph batch."""
+
+        chunk_fields = (
+            self.chunk_starts,
+            self.chunk_ends,
+            self.chunk_kinds,
+            self.chunk_dep_levels,
+        )
+        if any(value is not None for value in chunk_fields) and (
+            self.chunk_starts is None or self.chunk_ends is None
+        ):
+            raise ValueError(
+                "CodePacket.graph_batch requires both chunk_starts and chunk_ends "
+                "when any chunk metadata is present"
+            )
+        if (
+            any(
+                edge is not None and edge.num_edges > 0
+                for edge in (self.call_edges, self.type_edges)
+            )
+            and self.chunk_starts is None
+        ):
+            raise ValueError(
+                "CodePacket.graph_batch requires chunk spans for call/type edges"
+            )
+
+        empty = mx.zeros((0,), dtype=mx.int32)
+        starts = self.chunk_starts if self.chunk_starts is not None else empty
+        ends = self.chunk_ends if self.chunk_ends is not None else empty
+        return GraphBatch(
+            graphs=(self.graph_packet(),),
+            chunk_starts=(starts,),
+            chunk_ends=(ends,),
+            chunk_kinds=()
+            if self.chunk_kinds is None
+            else (self.chunk_kinds,),
+            chunk_dep_levels=()
+            if self.chunk_dep_levels is None
+            else (self.chunk_dep_levels,),
+        )
 
 
 __all__ = ["CodePacket"]

@@ -31,14 +31,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, cast
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.graph_packet import GraphBatch
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
 from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
+from cppmega_mlx.nn.code_graph_routes import build_token_attention_bias
+from cppmega_mlx.nn.domain_embedding import CppMegaDomainEmbedding
 from cppmega_mlx.nn.moe import FeedForwardExpert
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
 from cppmega_mlx.nn.platform_embedding import CppMegaPlatformEmbedding
@@ -81,6 +84,8 @@ class DenseCppLMConfig:
     indexer_local_window: int = 16
     indexer_num_sinks: int = 1
     require_graph_routes: bool = True
+    graph_routes_enabled: bool = False
+    graph_attention_bias_beta: float = 1.0
 
     # SwiGLU FFN.
     ffn_activation: Literal["swiglu"] = "swiglu"
@@ -98,6 +103,12 @@ class DenseCppLMConfig:
     platform_vocab_size: int = PLATFORM_VOCAB_SIZE
     platform_max_ids: int = MAX_PLATFORM_IDS
 
+    # Stable low-cardinality world-code routing sidecars.
+    domain_num_domains: int = 64
+    domain_num_roles: int = 128
+    domain_num_confidences: int = 8
+    domain_bottleneck_dim: int = 32
+
     # N-gram hash embedding.
     ngram_hash_enabled: bool = True
     ngram_hash_orders: tuple[int, ...] = (2, 3)
@@ -110,6 +121,7 @@ class DenseCppLMConfig:
     # Side-channel residual scales (0.0 disables a family cleanly).
     structure_residual_scale: float = 1.0
     platform_residual_scale: float = 1.0
+    domain_residual_scale: float = 0.0
     ngram_residual_scale: float = 1.0
 
     # ---- Activation-memory controls (opt-in; default path unchanged) ---- #
@@ -171,11 +183,17 @@ class DenseCppLMConfig:
         for name in (
             "structure_residual_scale",
             "platform_residual_scale",
+            "domain_residual_scale",
             "ngram_residual_scale",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {value}")
+        if not math.isfinite(float(self.graph_attention_bias_beta)):
+            raise ValueError(
+                "graph_attention_bias_beta must be finite, got "
+                f"{self.graph_attention_bias_beta}"
+            )
         if self.ce_chunk_size <= 0:
             raise ValueError(
                 f"ce_chunk_size must be positive, got {self.ce_chunk_size}"
@@ -250,10 +268,12 @@ class GraphIndexedAttention(nn.Module):
         self.index_q_proj = nn.Linear(d_model, hi * di, bias=False)
         self.index_k_proj = nn.Linear(d_model, hi * di, bias=False)
         self.index_head_weights = mx.ones((hi,), dtype=mx.float32)
-        # Learned graph-prior weight beta (init 0.0 -> ablation-friendly: the
-        # graph prior only kicks in once trained, and beta=0 recovers the plain
-        # lightning indexer).
-        self.index_beta = mx.zeros((1,), dtype=mx.float32)
+        # Keep the checkpoint-visible scalar while matching the production
+        # CPPMEGA_DSA_GRAPH_BIAS_BETA default (1.0). Beta=0 remains an explicit
+        # config/checkpoint ablation.
+        self.index_beta = mx.full(
+            (1,), config.graph_attention_bias_beta, dtype=mx.float32
+        )
         # Last computed indexer scores (B, S, Skv) for the loss; not a param.
         self.last_index_scores: mx.array | None = None
 
@@ -425,6 +445,18 @@ class DenseCppLM(nn.Module):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
 
+        # Instantiate this opt-in branch after every baseline module so enabling
+        # it cannot perturb initialization of the existing dense GQA parameters.
+        self.domain_embedding: CppMegaDomainEmbedding | None = None
+        if cfg.domain_residual_scale:
+            self.domain_embedding = CppMegaDomainEmbedding(
+                hidden_size=cfg.hidden_size,
+                num_domains=cfg.domain_num_domains,
+                num_roles=cfg.domain_num_roles,
+                num_confidences=cfg.domain_num_confidences,
+                bottleneck_dim=cfg.domain_bottleneck_dim,
+            )
+
         if dtype is not None and dtype != mx.float32:
             self.set_dtype(dtype)
 
@@ -441,6 +473,9 @@ class DenseCppLM(nn.Module):
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
         platform_ids: mx.array | None = None,
+        domain_ids: mx.array | None = None,
+        role_ids: mx.array | None = None,
+        confidence_ids: mx.array | None = None,
     ) -> mx.array:
         """Token + position + scaled side-channel residual embeddings."""
 
@@ -488,6 +523,27 @@ class DenseCppLM(nn.Module):
                     structure, self.config.structure_residual_scale, hidden
                 )
 
+        if self.config.domain_residual_scale:
+            if self.domain_embedding is None:
+                raise RuntimeError(
+                    "domain_residual_scale is enabled but domain_embedding is absent"
+                )
+            domain = self.domain_embedding(
+                domain_ids=_check_side_channel(
+                    "domain_ids", domain_ids, batch_size, seq_length
+                ),
+                role_ids=_check_side_channel(
+                    "role_ids", role_ids, batch_size, seq_length
+                ),
+                confidence_ids=_check_side_channel(
+                    "confidence_ids", confidence_ids, batch_size, seq_length
+                ),
+                target_dtype=hidden.dtype,
+            )
+            hidden = hidden + _scaled(
+                domain, self.config.domain_residual_scale, hidden
+            )
+
         platform_ids = _check_platform_ids(platform_ids, batch_size, seq_length)
         if platform_ids is not None and self.config.platform_residual_scale:
             platform = self.platform_embedding(
@@ -509,9 +565,18 @@ class DenseCppLM(nn.Module):
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
         platform_ids: mx.array | None = None,
+        domain_ids: mx.array | None = None,
+        role_ids: mx.array | None = None,
+        confidence_ids: mx.array | None = None,
+        graph_batch: GraphBatch | None = None,
         apply_final_norm: bool = True,
         block_bias: mx.array | None = None,
     ) -> mx.array:
+        block_bias = self._resolve_graph_bias(
+            input_ids,
+            graph_batch=graph_batch,
+            block_bias=block_bias,
+        )
         hidden = self.embed(
             input_ids,
             structure_ids=structure_ids,
@@ -520,6 +585,9 @@ class DenseCppLM(nn.Module):
             sibling_index_ids=sibling_index_ids,
             node_type_ids=node_type_ids,
             platform_ids=platform_ids,
+            domain_ids=domain_ids,
+            role_ids=role_ids,
+            confidence_ids=confidence_ids,
         )
         seq_length = int(input_ids.shape[1])
         mask = nn.MultiHeadAttention.create_additive_causal_mask(
@@ -534,6 +602,38 @@ class DenseCppLM(nn.Module):
         if apply_final_norm:
             return self.norm(hidden)
         return hidden
+
+    def _resolve_graph_bias(
+        self,
+        input_ids: mx.array,
+        *,
+        graph_batch: GraphBatch | None,
+        block_bias: mx.array | None,
+    ) -> mx.array | None:
+        if not self.config.graph_routes_enabled:
+            return block_bias
+        if graph_batch is None:
+            if block_bias is None:
+                raise RuntimeError(
+                    "DenseCppLM graph routes are enabled but no typed GraphBatch "
+                    "or explicit block_bias was provided; refusing token-only forward"
+                )
+            return block_bias
+        if block_bias is not None:
+            raise ValueError(
+                "DenseCppLM received both graph_batch and block_bias while graph "
+                "routes are enabled; provide one graph prior source"
+            )
+        bias = build_token_attention_bias(
+            graph_batch,
+            batch_size=int(input_ids.shape[0]),
+            seq_length=int(input_ids.shape[1]),
+        )
+        if self.config.attention_mode != "dsa":
+            beta = float(self.config.graph_attention_bias_beta)
+            if beta != 1.0:
+                bias = bias * mx.array(beta, dtype=bias.dtype)
+        return bias
 
     def indexer_scores(self) -> list[mx.array]:
         """Return the per-layer indexer score matrices from the last DSA forward.
@@ -561,12 +661,16 @@ class DenseCppLM(nn.Module):
         self,
         input_ids: mx.array,
         *,
+        graph_batch: GraphBatch | None = None,
         block_bias: mx.array | None = None,
         **side_channels: mx.array | None,
     ) -> mx.array:
         return self.lm_head(
             self.decoder_hidden_states(
-                input_ids, block_bias=block_bias, **side_channels
+                input_ids,
+                graph_batch=graph_batch,
+                block_bias=block_bias,
+                **side_channels,
             )
         )
 
@@ -582,6 +686,10 @@ class DenseCppLM(nn.Module):
         sibling_index_ids: mx.array | None = None,
         node_type_ids: mx.array | None = None,
         platform_ids: mx.array | None = None,
+        domain_ids: mx.array | None = None,
+        role_ids: mx.array | None = None,
+        confidence_ids: mx.array | None = None,
+        graph_batch: GraphBatch | None = None,
         block_bias: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         """Return ``(logits, loss)``.
@@ -600,6 +708,7 @@ class DenseCppLM(nn.Module):
         if targets is not None and self.config.chunked_ce:
             hidden = self.decoder_hidden_states(
                 input_ids,
+                graph_batch=graph_batch,
                 block_bias=block_bias,
                 structure_ids=structure_ids,
                 dep_levels=dep_levels,
@@ -607,6 +716,9 @@ class DenseCppLM(nn.Module):
                 sibling_index_ids=sibling_index_ids,
                 node_type_ids=node_type_ids,
                 platform_ids=platform_ids,
+                domain_ids=domain_ids,
+                role_ids=role_ids,
+                confidence_ids=confidence_ids,
             )
             loss = self._chunked_cross_entropy(
                 hidden, targets, loss_mask, self.config.ce_chunk_size
@@ -615,6 +727,7 @@ class DenseCppLM(nn.Module):
 
         logits = self.logits(
             input_ids,
+            graph_batch=graph_batch,
             block_bias=block_bias,
             structure_ids=structure_ids,
             dep_levels=dep_levels,
@@ -622,6 +735,9 @@ class DenseCppLM(nn.Module):
             sibling_index_ids=sibling_index_ids,
             node_type_ids=node_type_ids,
             platform_ids=platform_ids,
+            domain_ids=domain_ids,
+            role_ids=role_ids,
+            confidence_ids=confidence_ids,
         )
         if targets is None:
             return logits, None
@@ -720,17 +836,19 @@ class DenseCppLM(nn.Module):
     ) -> tuple[mx.array, mx.array | None]:
         """Forward a :class:`CodePacket` (single window or batch).
 
-        Token-aligned channels carried by the packet (structure_ids / dep_levels
-        / ast_depth / sibling_index / ast_node_type) are routed to the matching
-        embedding inputs.  1-D packets are promoted to a batch of 1; 2-D packets
-        pass through.  Platform ids are taken from ``packet.metadata['platform_ids']``
-        when present (the packed parquet stores per-document platform ids there).
+        Token-aligned structure/domain channels and graph routes are sent through
+        the same model path as dataset batches. 1-D packets are promoted to a
+        batch of 1; 2-D packets pass through. Platform ids are taken from
+        ``packet.metadata['platform_ids']`` when present.
         """
 
         input_ids = _as_batch(packet.token_ids)
         targets = _as_batch(packet.target_ids) if packet.target_ids is not None else None
         loss_mask = _as_batch(packet.loss_mask) if packet.loss_mask is not None else None
-        platform_ids = packet.metadata.get("platform_ids") if packet.metadata else None
+        raw_platform_ids = (
+            packet.metadata.get("platform_ids") if packet.metadata else None
+        )
+        platform_ids = _as_platform_batch(raw_platform_ids)
         return self(
             input_ids,
             targets=targets,
@@ -741,6 +859,12 @@ class DenseCppLM(nn.Module):
             sibling_index_ids=_as_batch_opt(packet.sibling_index),
             node_type_ids=_as_batch_opt(packet.ast_node_type),
             platform_ids=platform_ids,
+            domain_ids=_as_batch_opt(packet.domain_ids),
+            role_ids=_as_batch_opt(packet.role_ids),
+            confidence_ids=_as_batch_opt(packet.confidence_ids),
+            graph_batch=packet.graph_batch()
+            if self.config.graph_routes_enabled
+            else None,
         )
 
     # ------------------------------------------------------------------ #
@@ -849,6 +973,25 @@ def _as_batch(tensor: mx.array) -> mx.array:
 
 def _as_batch_opt(tensor: mx.array | None) -> mx.array | None:
     return None if tensor is None else _as_batch(tensor)
+
+
+def _as_platform_batch(tensor: object | None) -> mx.array | None:
+    if tensor is None:
+        return None
+    if not isinstance(tensor, mx.array):
+        raise TypeError(
+            "CodePacket.metadata['platform_ids'] must be an mx.array, got "
+            f"{type(tensor).__name__}"
+        )
+    platform_ids = cast(mx.array, tensor)
+    if platform_ids.ndim == 1:
+        return platform_ids[None, :]
+    if platform_ids.ndim in (2, 3):
+        return platform_ids
+    raise ValueError(
+        "CodePacket.metadata['platform_ids'] must be shaped (K), (B,K), or "
+        f"(B,S,K), got {tuple(platform_ids.shape)}"
+    )
 
 
 __all__ = [

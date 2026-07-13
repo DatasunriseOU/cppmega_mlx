@@ -5,6 +5,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from cppmega_mlx.data.batch import batch_values_are_prevalidated
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
 
 
@@ -40,18 +41,11 @@ class PlatformEmbedding(nn.Module):
         dtype = target_dtype or self.embedding.weight.dtype
         if platform_ids is None:
             return mx.array(0.0, dtype=dtype)
-        if platform_ids.ndim not in (2, 3):
-            raise ValueError(
-                "platform_ids must be shaped (B, K) or (B, S, K), "
-                f"got {platform_ids.shape}"
-            )
-        if platform_ids.shape[-1] > self.max_ids:
-            raise ValueError(
-                f"platform_ids width {platform_ids.shape[-1]} exceeds max_ids={self.max_ids}"
-            )
+        self._validate_shape(platform_ids)
 
         ids = platform_ids.astype(mx.int64)
-        self._validate_range(ids)
+        if not batch_values_are_prevalidated():
+            self._validate_range(ids)
         embeddings = self.embedding(ids)
         mask = (ids != 0)[..., None].astype(embeddings.dtype)
         if ids.ndim == 2:
@@ -61,6 +55,25 @@ class PlatformEmbedding(nn.Module):
         if out.dtype != dtype:
             out = out.astype(dtype)
         return out
+
+    def validate_input_ids(self, platform_ids: mx.array | None) -> None:
+        """Validate host-visible IDs before entering an MLX transform."""
+
+        if platform_ids is None:
+            return
+        self._validate_shape(platform_ids)
+        self._validate_range(platform_ids.astype(mx.int64))
+
+    def _validate_shape(self, platform_ids: mx.array) -> None:
+        if platform_ids.ndim not in (2, 3):
+            raise ValueError(
+                "platform_ids must be shaped (B, K) or (B, S, K), "
+                f"got {platform_ids.shape}"
+            )
+        if platform_ids.shape[-1] > self.max_ids:
+            raise ValueError(
+                f"platform_ids width {platform_ids.shape[-1]} exceeds max_ids={self.max_ids}"
+            )
 
     def _validate_range(self, ids: mx.array) -> None:
         has_negative = mx.any(ids < 0)

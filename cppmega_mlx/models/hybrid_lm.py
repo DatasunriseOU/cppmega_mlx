@@ -851,6 +851,21 @@ class HybridTinyLM(nn.Module):
         if dtype is not None and dtype != mx.float32:
             self.set_dtype(dtype)
 
+    def validate_compiled_batch(
+        self,
+        batch: Mapping[str, mx.array | None],
+    ) -> None:
+        """Validate transform-unsafe side-channel ranges before compilation."""
+
+        self.structure_embedding.validate_inputs(
+            structure_ids=batch.get("structure_ids"),
+            dep_levels=batch.get("dep_levels"),
+            ast_depth_ids=batch.get("ast_depth_ids"),
+            sibling_index_ids=batch.get("sibling_index_ids"),
+            node_type_ids=batch.get("node_type_ids"),
+        )
+        self.platform_embedding.validate_input_ids(batch.get("platform_ids"))
+
     @property
     def route_symbols(self) -> tuple[str, ...]:
         return tuple(layer.symbol for layer in self.pattern.layers)

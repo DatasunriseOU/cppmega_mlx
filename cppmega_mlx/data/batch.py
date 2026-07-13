@@ -2,13 +2,40 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 import mlx.core as mx
 import numpy as np
 
+from cppmega_mlx.data.graph_packet import GraphBatch
+
 SideChannelDropoutPolicy = Mapping[str, float]
+
+_BATCH_VALUES_PREVALIDATED: ContextVar[bool] = ContextVar(
+    "cppmega_mlx_batch_values_prevalidated",
+    default=False,
+)
+
+
+def batch_values_are_prevalidated() -> bool:
+    """Return whether eager device-value checks ran before an MLX transform."""
+
+    return _BATCH_VALUES_PREVALIDATED.get()
+
+
+@contextmanager
+def prevalidated_batch_values() -> Iterator[None]:
+    """Skip transform-unsafe checks after the caller validates the same batch."""
+
+    token = _BATCH_VALUES_PREVALIDATED.set(True)
+    try:
+        yield
+    finally:
+        _BATCH_VALUES_PREVALIDATED.reset(token)
 
 _SIDE_CHANNEL_FAMILY_FIELDS: Mapping[str, tuple[str, ...]] = {
     "platform": ("platform_ids",),
@@ -32,6 +59,7 @@ class LMTokenBatch:
     sibling_index_ids: mx.array | None = None
     node_type_ids: mx.array | None = None
     platform_ids: mx.array | None = None
+    graph_batch: GraphBatch | None = None
     side_channels: Mapping[str, Mapping[str, mx.array]] | None = None
     metadata: Mapping[str, Any] | None = None
 
@@ -90,10 +118,11 @@ class LMTokenBatch:
                     "document_ids must match tokens shape "
                     f"{self.tokens.shape}, got {self.document_ids.shape}"
                 )
-            has_negative_doc = mx.any(self.document_ids.astype(mx.int32) < 0)
-            mx.eval(has_negative_doc)
-            if bool(has_negative_doc.item()):
-                raise ValueError("document_ids must be non-negative")
+            if not batch_values_are_prevalidated():
+                has_negative_doc = mx.any(self.document_ids.astype(mx.int32) < 0)
+                mx.eval(has_negative_doc)
+                if bool(has_negative_doc.item()):
+                    raise ValueError("document_ids must be non-negative")
         if self.platform_ids is not None:
             if self.platform_ids.ndim not in (2, 3):
                 raise ValueError(
@@ -110,10 +139,22 @@ class LMTokenBatch:
                     "token-local platform_ids sequence dimension must match tokens "
                     f"{self.tokens.shape[1]}, got {self.platform_ids.shape[1]}"
                 )
-            has_negative = mx.any(self.platform_ids.astype(mx.int32) < 0)
-            mx.eval(has_negative)
-            if bool(has_negative.item()):
-                raise ValueError("platform_ids must be non-negative")
+            if not batch_values_are_prevalidated():
+                has_negative = mx.any(self.platform_ids.astype(mx.int32) < 0)
+                mx.eval(has_negative)
+                if bool(has_negative.item()):
+                    raise ValueError("platform_ids must be non-negative")
+        if self.graph_batch is not None:
+            if not isinstance(self.graph_batch, GraphBatch):
+                raise TypeError(
+                    "graph_batch must be a GraphBatch when provided, got "
+                    f"{type(self.graph_batch).__name__}"
+                )
+            if self.graph_batch.batch_size not in (1, int(self.tokens.shape[0])):
+                raise ValueError(
+                    "graph_batch batch size must be 1 or tokens batch "
+                    f"{int(self.tokens.shape[0])}, got {self.graph_batch.batch_size}"
+                )
         if self.side_channels is not None:
             _validate_side_channel_map(self.side_channels)
         if self.metadata is not None and not isinstance(self.metadata, Mapping):
@@ -160,7 +201,7 @@ class LMTokenBatch:
             "node_type_ids": self.node_type_ids,
         }
 
-    def model_kwargs(self) -> dict[str, mx.array]:
+    def model_kwargs(self) -> dict[str, Any]:
         kwargs = {
             name: self._input_aligned(value)
             for name, value in self.structure_fields().items()
@@ -172,6 +213,18 @@ class LMTokenBatch:
                 if self.platform_ids.ndim == 3
                 else self.platform_ids
             )
+        if self.graph_batch is not None:
+            kwargs["graph_batch"] = self.graph_batch.input_aligned(
+                source_sequence_length=int(self.tokens.shape[1]),
+                input_sequence_length=int(self.inputs.shape[1]),
+            )
+        if self.side_channels is not None:
+            domain_routes = self.side_channels.get("domain_routes")
+            if domain_routes is not None:
+                for field_name in ("domain_ids", "role_ids", "confidence_ids"):
+                    value = domain_routes.get(field_name)
+                    if value is not None:
+                        kwargs[field_name] = self._input_aligned(value)
         return kwargs
 
     def side_channel_map(self) -> dict[str, dict[str, mx.array]]:
@@ -291,6 +344,8 @@ class LMTokenBatch:
         data.update({k: v for k, v in self.structure_fields().items() if v is not None})
         if self.platform_ids is not None:
             data["platform_ids"] = self.platform_ids
+        if self.graph_batch is not None:
+            data["graph_batch"] = self.graph_batch
         if include_side_channels and self.side_channels is not None:
             data["side_channels"] = self.side_channels
         if include_metadata and self.metadata is not None:
@@ -351,10 +406,11 @@ def _document_ids_from_mapping(batch: Mapping[str, Any]) -> Any | None:
         return None
     alias = present[0]
     value = batch[alias]
-    has_negative_doc = mx.any(value.astype(mx.int32) < 0)
-    mx.eval(has_negative_doc)
-    if bool(has_negative_doc.item()):
-        raise ValueError(f"{alias} must be non-negative")
+    if not batch_values_are_prevalidated():
+        has_negative_doc = mx.any(value.astype(mx.int32) < 0)
+        mx.eval(has_negative_doc)
+        if bool(has_negative_doc.item()):
+            raise ValueError(f"{alias} must be non-negative")
     return value
 
 
@@ -380,6 +436,7 @@ def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTok
             sibling_index_ids=batch.get("sibling_index_ids"),
             node_type_ids=batch.get("node_type_ids"),
             platform_ids=batch.get("platform_ids"),
+            graph_batch=batch.get("graph_batch"),
             side_channels=batch.get("side_channels"),
             metadata=batch.get("metadata"),
         )
@@ -412,7 +469,10 @@ def synthetic_token_batch(
     if not include_structure:
         return LMTokenBatch(tokens=tokens, attention_mask=attention_mask)
 
-    structure_vocab = max(2, min(vocab_size, 32))
+    # Match the default StructureEmbedding/DenseCppLM category contract. The old
+    # arbitrary cap of 32 generated corrupt IDs that only worked because the
+    # embedding silently clamped them into its final bucket.
+    structure_vocab = max(2, min(vocab_size, 12))
     structure_ids = mx.array(
         rng.integers(
             0, structure_vocab, size=(batch_size, seq_length), dtype=np.int32
@@ -444,6 +504,8 @@ def synthetic_token_batch(
 __all__ = [
     "LMTokenBatch",
     "SideChannelDropoutPolicy",
+    "batch_values_are_prevalidated",
     "ensure_lm_batch",
+    "prevalidated_batch_values",
     "synthetic_token_batch",
 ]

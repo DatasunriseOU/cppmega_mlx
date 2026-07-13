@@ -1252,6 +1252,7 @@ def test_mmididx_graph_sidecars_are_sequence_aligned_routes(tmp_path) -> None:
     dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
     packet0 = dataset.graph_route_packet_for_sample(0)
     packet1 = dataset.graph_route_packet_for_sample(1)
+    batch0 = next(dataset.iter_batches())
 
     assert packet0.num_chunks == 3
     assert packet0.graph.edge("call").to_pairs() == [(1, 0), (2, 1)]
@@ -1262,6 +1263,12 @@ def test_mmididx_graph_sidecars_are_sequence_aligned_routes(tmp_path) -> None:
     np.testing.assert_array_equal(packet0.chunk_dep_levels, np.array([0, 1, 2], dtype=np.int32))
     assert packet1.graph.edge("call").to_pairs() == [(0, 1)]
     assert packet1.graph.edge("type").num_edges == 0
+    assert batch0.graph_batch is not None
+    assert batch0.graph_batch.graphs[0].edge("call").to_pairs() == [(1, 0), (2, 1)]
+    np.testing.assert_array_equal(
+        np.asarray(batch0.graph_batch.chunk_starts[0]),
+        np.array([0, 1, 3], dtype=np.int32),
+    )
 
 
 def test_compact_fixed_rows_restore_padding_and_document_graphs(tmp_path) -> None:

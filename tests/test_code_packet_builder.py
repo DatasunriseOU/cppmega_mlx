@@ -128,7 +128,17 @@ def test_build_code_packets_populates_all_fields() -> None:
 
     # GraphPacket bundling + block aggregation works on parsed edges.
     gp = p0.graph_packet()
-    assert set(gp.relations) == {"call", "type"}
+    assert set(gp.relations) == {
+        "call",
+        "type",
+        "domain",
+        "build",
+        "shell",
+        "diagnostic",
+        "cross_domain",
+    }
+    assert gp.edge("domain").to_pairs() == [(1, 2)]
+    assert gp.edge("build").to_pairs() == [(2, 3)]
     assert gp.num_nodes == 2
 
 

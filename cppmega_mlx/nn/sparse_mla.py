@@ -473,7 +473,7 @@ def lightning_indexer_scores(
     head_weights: mx.array,
     *,
     block_bias: mx.array | None = None,
-    beta: mx.array | float = 0.0,
+    beta: mx.array | float = 1.0,
     causal: bool = True,
 ) -> mx.array:
     """Compute the lightning-indexer score matrix ``I[b, t, s]`` (fp32).
@@ -524,8 +524,10 @@ def lightning_indexer_scores(
                 f"lightning_indexer_scores: block_bias must be ({B},{S},{Skv}), "
                 f"got {tuple(block_bias.shape)}"
             )
-        beta_arr = beta if isinstance(beta, mx.array) else mx.array(
-            float(beta), dtype=mx.float32
+        beta_arr = (
+            cast(mx.array, beta)
+            if isinstance(beta, mx.array)
+            else mx.array(float(beta), dtype=mx.float32)
         )
         scores = scores + beta_arr.astype(mx.float32) * block_bias.astype(mx.float32)
 
@@ -622,7 +624,7 @@ def graph_indexed_attention_reference(
     head_weights: mx.array,
     *,
     block_bias: mx.array | None = None,
-    beta: mx.array | float = 0.0,
+    beta: mx.array | float = 1.0,
     topk: int,
     local_window: int = 0,
     num_sinks: int = 0,

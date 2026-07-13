@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Mapping, cast
+from typing import Any, Mapping, cast
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -34,7 +34,7 @@ from cppmega_mlx.training.stp_loss import (
 
 def next_token_cross_entropy(
     model: nn.Module,
-    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     *,
     side_channel_dropout: SideChannelDropoutPolicy | None = None,
     side_channel_dropout_seed: int | None = None,
@@ -51,7 +51,7 @@ def next_token_cross_entropy(
     model_kwargs = lm_batch.model_kwargs()
     if document_ids is not None:
         model_kwargs["document_ids"] = document_ids
-    logits = model(lm_batch.inputs, **model_kwargs)
+    logits = _extract_logits(model(lm_batch.inputs, **model_kwargs))
     targets = lm_batch.targets
 
     if logits.shape[:2] != targets.shape:
@@ -71,7 +71,7 @@ def next_token_cross_entropy(
 
 def next_token_cut_cross_entropy(
     model: nn.Module,
-    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     *,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     eval_chunks: bool = True,
@@ -127,7 +127,7 @@ def next_token_cut_cross_entropy(
 
 def next_token_cross_entropy_with_mtp(
     model: nn.Module,
-    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     *,
     config: MTPLossConfig | None = None,
 ) -> tuple[mx.array, mx.array, MTPLossMetrics]:
@@ -199,7 +199,7 @@ def next_token_cross_entropy_with_mtp(
 
 def next_token_cross_entropy_with_stp(
     model: nn.Module,
-    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     *,
     config: STPLossConfig | None = None,
 ) -> tuple[mx.array, mx.array, STPLossMetrics]:
@@ -239,7 +239,7 @@ def next_token_cross_entropy_with_stp(
 
 def next_token_cross_entropy_mtp_loss(
     model: nn.Module,
-    batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
+    batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     *,
     config: MTPLossConfig | None = None,
 ) -> tuple[mx.array, mx.array]:
@@ -328,6 +328,31 @@ def _decoder_hidden_states_for_mtp(
         hidden_states = layer(hidden_states, mask)
     apply_norm = cast(Callable[[mx.array], mx.array], norm)
     return apply_norm(hidden_states)
+
+
+def _extract_logits(output: object) -> mx.array:
+    """Normalize model logits without hiding unsupported forward contracts."""
+
+    if isinstance(output, tuple):
+        if len(output) != 2:
+            raise TypeError(
+                "next_token_cross_entropy model tuple output must be "
+                f"(logits, loss), got {len(output)} values"
+            )
+        logits, embedded_loss = output
+        if embedded_loss is not None:
+            raise ValueError(
+                "next_token_cross_entropy called a model without targets but it "
+                "returned a non-None embedded loss"
+            )
+    else:
+        logits = output
+    if not isinstance(logits, mx.array):
+        raise TypeError(
+            "next_token_cross_entropy model must return logits as an mx.array "
+            f"or (logits, None), got {type(logits).__name__}"
+        )
+    return logits
 
 
 def _structure_hidden_state_delta(

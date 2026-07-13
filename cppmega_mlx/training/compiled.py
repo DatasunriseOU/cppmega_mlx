@@ -9,6 +9,7 @@ optimizer.state so fixed-shape batches can be replayed efficiently.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Literal, Mapping, Sequence, TypeVar, cast
@@ -19,7 +20,11 @@ from mlx.nn.utils import average_gradients
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
-from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
+from cppmega_mlx.data.batch import (
+    LMTokenBatch,
+    ensure_lm_batch,
+    prevalidated_batch_values,
+)
 from cppmega_mlx.runtime.path_c_physical_abi import (
     physical_abi_runtime_kernel_args,
 )
@@ -1732,20 +1737,31 @@ class CompiledPretrainingStep:
     ) -> PretrainingMetrics:
         self.model.train()
         batch_dict = normalize_compiled_batch(batch)
+        batch_is_prevalidated = False
         if self.compile:
+            validator = getattr(self.model, "validate_compiled_batch", None)
+            if callable(validator):
+                validator(batch_dict)
+                batch_is_prevalidated = True
             self._check_compiled_batch_signature(batch_dict)
         pending_microbatches = self._pending_microbatches + 1
         do_update = pending_microbatches == self.grad_accum_steps
 
         start = time.perf_counter()
         if self.compile:
-            if self._compiled_step is None:
-                self._compiled_step = self._build_compiled_step()
-            loss, ntokens, self._grad_accum = self._compiled_step(
-                batch_dict,
-                self._grad_accum,
-                do_update,
+            validation_context = (
+                prevalidated_batch_values()
+                if batch_is_prevalidated
+                else nullcontext()
             )
+            with validation_context:
+                if self._compiled_step is None:
+                    self._compiled_step = self._build_compiled_step()
+                loss, ntokens, self._grad_accum = self._compiled_step(
+                    batch_dict,
+                    self._grad_accum,
+                    do_update,
+                )
         else:
             loss, ntokens, self._grad_accum = self._eager_step(
                 batch_dict,

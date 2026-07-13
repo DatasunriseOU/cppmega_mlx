@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
+
+from cppmega_mlx.data.batch import batch_values_are_prevalidated
 
 
 class StructureEmbedding(nn.Module):
@@ -135,6 +138,46 @@ class StructureEmbedding(nn.Module):
                 )
         return inputs
 
+    def validate_inputs(
+        self,
+        *,
+        structure_ids: mx.array | None,
+        dep_levels: mx.array | None,
+        ast_depth_ids: mx.array | None = None,
+        sibling_index_ids: mx.array | None = None,
+        node_type_ids: mx.array | None = None,
+    ) -> None:
+        """Validate host-visible IDs before entering an MLX transform."""
+
+        inputs = self._collect_inputs(
+            structure_ids=structure_ids,
+            dep_levels=dep_levels,
+            ast_depth_ids=ast_depth_ids,
+            sibling_index_ids=sibling_index_ids,
+            node_type_ids=node_type_ids,
+        )
+        self._validate_collected_ids(inputs)
+
+    def _validate_collected_ids(
+        self,
+        inputs: dict[str, mx.array | None],
+    ) -> None:
+        for index, name in enumerate(self.active_component_names):
+            tensor = inputs[name]
+            if tensor is None:
+                continue
+            ids = tensor.astype(mx.int64)
+            max_id = int(self._comp_clamp_max[index].item())
+            invalid = mx.any((ids < 0) | (ids > max_id))
+            mx.eval(invalid)
+            if bool(invalid.item()):
+                values = np.asarray(ids)
+                bad = values[(values < 0) | (values > max_id)][:8].tolist()
+                raise ValueError(
+                    f"[cppmega-structure] {name}_ids out of range [0,{max_id}]: "
+                    f"offending values {bad}; refusing to clamp"
+                )
+
     def __call__(
         self,
         *,
@@ -152,6 +195,8 @@ class StructureEmbedding(nn.Module):
             sibling_index_ids=sibling_index_ids,
             node_type_ids=node_type_ids,
         )
+        if not batch_values_are_prevalidated():
+            self._validate_collected_ids(inputs)
         ref = next((inputs[name] for name in self.active_component_names if inputs[name] is not None), None)
         dtype = target_dtype or self.up_proj.weight.dtype
         if ref is None:
@@ -167,8 +212,7 @@ class StructureEmbedding(nn.Module):
                 present.append(0.0)
                 continue
             ids = tensor.astype(mx.int64)
-            clamped = mx.clip(ids, mx.array(0, dtype=mx.int64), self._comp_clamp_max[index])
-            ids_list.append(clamped + self._comp_offsets[index])
+            ids_list.append(ids + self._comp_offsets[index])
             present.append(1.0)
 
         stacked_ids = mx.stack(ids_list, axis=-1)

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import numpy as np
@@ -104,7 +104,7 @@ class EdgeIndex:
         """Build an EdgeIndex from an ``(E, 2)`` list/array of ``(src, dst)`` pairs."""
 
         if isinstance(pairs, mx.array):
-            arr = np.asarray(pairs.astype(mx.int32))
+            arr = np.asarray(cast(mx.array, pairs).astype(mx.int32))
         elif isinstance(pairs, np.ndarray):
             arr = pairs
         else:
@@ -271,4 +271,230 @@ class GraphPacket:
         return mx.array(result)
 
 
-__all__ = ["EdgeIndex", "GraphPacket"]
+def _as_int_tuple(values: Sequence[Any], *, where: str) -> tuple[mx.array, ...]:
+    out: list[mx.array] = []
+    for index, value in enumerate(values):
+        arr = _as_int_vector(value, where=f"{where}[{index}]")
+        out.append(arr)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class GraphBatch:
+    """A typed batch of graph packets plus per-row chunk spans.
+
+    ``GraphPacket`` carries edges; ``GraphBatch`` carries the chunk layout needed
+    by model/loss code to expand chunk-index call/type edges into token-level
+    attention bias. Empty graphs are explicit and valid. Malformed spans fail
+    closed here or at the sequence-length-aware builder.
+    """
+
+    graphs: tuple[GraphPacket, ...]
+    chunk_starts: tuple[mx.array, ...]
+    chunk_ends: tuple[mx.array, ...]
+    chunk_kinds: tuple[mx.array, ...] = field(default_factory=tuple)
+    chunk_dep_levels: tuple[mx.array, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not self.graphs:
+            raise ValueError("GraphBatch.graphs must be non-empty")
+        graphs = tuple(self.graphs)
+        for index, graph in enumerate(graphs):
+            if not isinstance(graph, GraphPacket):
+                raise TypeError(
+                    f"GraphBatch.graphs[{index}] must be a GraphPacket, "
+                    f"got {type(graph).__name__}"
+                )
+        object.__setattr__(self, "graphs", graphs)
+
+        batch_size = len(graphs)
+        starts = _as_int_tuple(self.chunk_starts, where="chunk_starts")
+        ends = _as_int_tuple(self.chunk_ends, where="chunk_ends")
+        kinds = _as_int_tuple(self.chunk_kinds, where="chunk_kinds")
+        dep_levels = _as_int_tuple(self.chunk_dep_levels, where="chunk_dep_levels")
+        if len(starts) != batch_size or len(ends) != batch_size:
+            raise ValueError(
+                "GraphBatch chunk_starts/chunk_ends length must match graphs "
+                f"({batch_size}); got {len(starts)}/{len(ends)}"
+            )
+        if kinds and len(kinds) != batch_size:
+            raise ValueError(
+                f"GraphBatch.chunk_kinds length {len(kinds)} must match graphs {batch_size}"
+            )
+        if dep_levels and len(dep_levels) != batch_size:
+            raise ValueError(
+                "GraphBatch.chunk_dep_levels length "
+                f"{len(dep_levels)} must match graphs {batch_size}"
+            )
+        for row, (row_starts, row_ends) in enumerate(zip(starts, ends)):
+            if row_starts.shape != row_ends.shape:
+                raise ValueError(
+                    f"GraphBatch row {row} chunk_starts shape {tuple(row_starts.shape)} "
+                    f"must match chunk_ends {tuple(row_ends.shape)}"
+                )
+            if kinds and kinds[row].shape != row_starts.shape:
+                raise ValueError(
+                    f"GraphBatch row {row} chunk_kinds shape {tuple(kinds[row].shape)} "
+                    f"must match chunk_starts {tuple(row_starts.shape)}"
+                )
+            if dep_levels and dep_levels[row].shape != row_starts.shape:
+                raise ValueError(
+                    "GraphBatch row "
+                    f"{row} chunk_dep_levels shape {tuple(dep_levels[row].shape)} "
+                    f"must match chunk_starts {tuple(row_starts.shape)}"
+                )
+            invalid_span = mx.any((row_starts < 0) | (row_ends <= row_starts))
+            mx.eval(invalid_span)
+            if bool(invalid_span.item()):
+                raise ValueError(
+                    f"GraphBatch row {row} chunk spans must satisfy 0 <= start < end"
+                )
+            if int(row_starts.shape[0]) > 1:
+                overlaps = mx.any(row_starts[1:] < row_ends[:-1])
+                mx.eval(overlaps)
+                if bool(overlaps.item()):
+                    raise ValueError(
+                        f"GraphBatch row {row} chunk spans overlap or are out of order"
+                    )
+            graph_nodes = graphs[row].num_nodes
+            if graph_nodes is not None and int(graph_nodes) != int(row_starts.shape[0]):
+                raise ValueError(
+                    f"GraphBatch row {row} graph num_nodes {graph_nodes} must match "
+                    f"chunk count {int(row_starts.shape[0])}"
+                )
+        object.__setattr__(self, "chunk_starts", starts)
+        object.__setattr__(self, "chunk_ends", ends)
+        object.__setattr__(self, "chunk_kinds", kinds)
+        object.__setattr__(self, "chunk_dep_levels", dep_levels)
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.graphs)
+
+    def is_empty(self) -> bool:
+        return all(graph.is_empty() for graph in self.graphs)
+
+    def input_aligned(
+        self,
+        *,
+        source_sequence_length: int,
+        input_sequence_length: int,
+    ) -> "GraphBatch":
+        """Trim graph metadata when next-token training removes the last token.
+
+        Every declared endpoint is validated against the unshifted source first.
+        Edges that only touch the target-only suffix are then removed deliberately;
+        malformed source edges are never hidden by the alignment.
+        """
+
+        source_length = int(source_sequence_length)
+        input_length = int(input_sequence_length)
+        if source_length <= 0 or input_length <= 0:
+            raise ValueError(
+                "GraphBatch.input_aligned sequence lengths must be positive, got "
+                f"{source_length}/{input_length}"
+            )
+        if input_length > source_length:
+            raise ValueError(
+                "GraphBatch.input_aligned input length cannot exceed source length, "
+                f"got {input_length}>{source_length}"
+            )
+        if input_length == source_length:
+            return self
+
+        graphs: list[GraphPacket] = []
+        starts_out: list[mx.array] = []
+        ends_out: list[mx.array] = []
+        kinds_out: list[mx.array] = []
+        dep_levels_out: list[mx.array] = []
+        for row, graph in enumerate(self.graphs):
+            starts = np.asarray(self.chunk_starts[row], dtype=np.int64)
+            ends = np.asarray(self.chunk_ends[row], dtype=np.int64)
+            if np.any(ends > source_length):
+                bad = ends[ends > source_length][:8].tolist()
+                raise ValueError(
+                    f"GraphBatch row {row} chunk ends exceed source sequence "
+                    f"length {source_length}: {bad}"
+                )
+            keep_chunks = int(np.count_nonzero(starts < input_length))
+            starts_out.append(mx.array(starts[:keep_chunks], dtype=mx.int32))
+            ends_out.append(
+                mx.array(
+                    np.minimum(ends[:keep_chunks], input_length),
+                    dtype=mx.int32,
+                )
+            )
+            if self.chunk_kinds:
+                kinds_out.append(self.chunk_kinds[row][:keep_chunks])
+            if self.chunk_dep_levels:
+                dep_levels_out.append(self.chunk_dep_levels[row][:keep_chunks])
+
+            aligned_edges: dict[str, EdgeIndex] = {}
+            for relation, edge in graph.edges.items():
+                if relation in ("call", "type"):
+                    source_bound = int(starts.shape[0])
+                    input_bound = keep_chunks
+                    coordinate_name = "chunks"
+                elif relation in (
+                    "domain",
+                    "build",
+                    "shell",
+                    "diagnostic",
+                    "cross_domain",
+                ):
+                    source_bound = source_length
+                    input_bound = input_length
+                    coordinate_name = "tokens"
+                else:
+                    raise KeyError(
+                        "GraphBatch.input_aligned cannot align unsupported relation "
+                        f"{relation!r}"
+                    )
+                aligned_edges[relation] = _input_aligned_edge(
+                    edge,
+                    source_bound=source_bound,
+                    input_bound=input_bound,
+                    coordinate_name=coordinate_name,
+                )
+            graphs.append(GraphPacket(edges=aligned_edges, num_nodes=keep_chunks))
+
+        return GraphBatch(
+            graphs=tuple(graphs),
+            chunk_starts=tuple(starts_out),
+            chunk_ends=tuple(ends_out),
+            chunk_kinds=tuple(kinds_out),
+            chunk_dep_levels=tuple(dep_levels_out),
+        )
+
+
+def _input_aligned_edge(
+    edge: EdgeIndex,
+    *,
+    source_bound: int,
+    input_bound: int,
+    coordinate_name: str,
+) -> EdgeIndex:
+    src = np.asarray(edge.src, dtype=np.int64)
+    dst = np.asarray(edge.dst, dtype=np.int64)
+    if edge.mask is not None:
+        active = np.asarray(edge.mask) > 0
+        src = src[active]
+        dst = dst[active]
+    invalid = (src < 0) | (dst < 0) | (src >= source_bound) | (dst >= source_bound)
+    if np.any(invalid):
+        first = int(np.flatnonzero(invalid)[0])
+        raise ValueError(
+            f"GraphBatch.input_aligned {edge.relation} edge "
+            f"({int(src[first])},{int(dst[first])}) out of range for "
+            f"{source_bound} source {coordinate_name}"
+        )
+    keep = (src < input_bound) & (dst < input_bound)
+    return EdgeIndex(
+        src=mx.array(src[keep], dtype=mx.int32),
+        dst=mx.array(dst[keep], dtype=mx.int32),
+        relation=edge.relation,
+        num_nodes=input_bound,
+    )
+
+
+__all__ = ["EdgeIndex", "GraphBatch", "GraphPacket"]

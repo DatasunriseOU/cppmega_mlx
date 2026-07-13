@@ -16,7 +16,7 @@ from cppmega_mlx.config.model import (
     MEGACPP_TOKENIZER_VOCAB_SIZE,
 )
 from cppmega_mlx.data.batch import LMTokenBatch
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.token_dataset import BatchCursor, TokenDatasetMetadata
 from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
 
@@ -533,7 +533,16 @@ class MegatronIndexedDataset:
         return sequence_index
 
     def _make_batch(self, sample_idx: np.ndarray) -> LMTokenBatch:
-        return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
+        return _lm_batch_from_numpy(
+            self._make_numpy_batch(sample_idx),
+            graph_batch=self._make_graph_batch(sample_idx),
+        )
+
+    def _make_graph_batch(self, sample_idx: np.ndarray) -> GraphBatch | None:
+        if not self._graph_sidecars:
+            return None
+        packets = [self.graph_route_packet_for_sample(int(index)) for index in sample_idx]
+        return _graph_batch_from_route_packets(packets)
 
     def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
         tokens = np.zeros((sample_idx.shape[0], self.seq_len), dtype=np.int32)
@@ -761,7 +770,16 @@ class MegatronIndexedMultiShardDataset:
         return self._shards[shard_index].graph_route_packet_for_sample(local_sample_index)
 
     def _make_batch(self, sample_idx: np.ndarray) -> LMTokenBatch:
-        return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
+        return _lm_batch_from_numpy(
+            self._make_numpy_batch(sample_idx),
+            graph_batch=self._make_graph_batch(sample_idx),
+        )
+
+    def _make_graph_batch(self, sample_idx: np.ndarray) -> GraphBatch | None:
+        if not any(shard._graph_sidecars for shard in self._shards):
+            return None
+        packets = [self.graph_route_packet_for_sample(int(index)) for index in sample_idx]
+        return _graph_batch_from_route_packets(packets)
 
     def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
         shard_indices = np.searchsorted(
@@ -894,7 +912,25 @@ def megatron_indexed_graph_sidecar_schema() -> dict[str, dict[str, object]]:
     }
 
 
-def _lm_batch_from_numpy(arrays: dict[str, np.ndarray]) -> LMTokenBatch:
+def _graph_batch_from_route_packets(
+    packets: list[MegatronGraphRoutePacket],
+) -> GraphBatch | None:
+    if not packets:
+        return None
+    return GraphBatch(
+        graphs=tuple(packet.graph for packet in packets),
+        chunk_starts=tuple(mx.array(packet.chunk_starts) for packet in packets),
+        chunk_ends=tuple(mx.array(packet.chunk_ends) for packet in packets),
+        chunk_kinds=tuple(mx.array(packet.chunk_kinds) for packet in packets),
+        chunk_dep_levels=tuple(mx.array(packet.chunk_dep_levels) for packet in packets),
+    )
+
+
+def _lm_batch_from_numpy(
+    arrays: dict[str, np.ndarray],
+    *,
+    graph_batch: GraphBatch | None = None,
+) -> LMTokenBatch:
     kwargs = {
         key: mx.array(arrays[key])
         for key in _LM_BATCH_DIRECT_SIDE_CHANNEL_KEYS
@@ -917,6 +953,7 @@ def _lm_batch_from_numpy(arrays: dict[str, np.ndarray]) -> LMTokenBatch:
     return LMTokenBatch(
         tokens=mx.array(arrays["tokens"]),
         document_ids=None if document_ids is None else mx.array(document_ids),
+        graph_batch=graph_batch,
         side_channels=side_channels or None,
         **kwargs,
     )
