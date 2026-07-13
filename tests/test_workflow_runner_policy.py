@@ -63,7 +63,8 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
 
     assert "pip install --upgrade pip" not in workflow
     assert workflow.count("-m venv --system-site-packages") == 3
-    assert workflow.count("--no-build-isolation -e") == 3
+    assert "--no-build-isolation" not in workflow
+    assert workflow.count('-e ".[gui,parquet,widget]"') == 3
     assert workflow.count('echo "VBGUI_E2E_PYTHON=$job_venv/bin/python"') == 3
 
 

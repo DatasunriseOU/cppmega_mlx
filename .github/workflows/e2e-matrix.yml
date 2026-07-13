@@ -56,7 +56,7 @@ jobs:
       - name: Python deps
         run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
-            --no-build-isolation -e ".[gui,parquet,widget]"
+            -e ".[gui,parquet,widget]"
       - name: Generate fixtures
         run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
@@ -111,7 +111,7 @@ jobs:
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
-            --no-build-isolation -e ".[gui,parquet,widget]"
+            -e ".[gui,parquet,widget]"
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
@@ -161,7 +161,7 @@ jobs:
           echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
-            --no-build-isolation -e ".[gui,parquet,widget]"
+            -e ".[gui,parquet,widget]"
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
