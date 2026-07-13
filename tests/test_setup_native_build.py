@@ -22,6 +22,7 @@ def test_native_build_dependencies_are_declared() -> None:
     assert "python-multipart>=0.0.20" in pyproject["project"][
         "optional-dependencies"
     ]["gui"]
+    assert "websockets>=12" in pyproject["project"]["optional-dependencies"]["gui"]
 
 
 def test_native_build_pins_cmake_to_invoking_python(monkeypatch) -> None:
