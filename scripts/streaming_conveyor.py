@@ -606,8 +606,11 @@ def manifest_complete_commit_ranges(
     """
     if range_size <= 0:
         raise ValueError(f"range_size must be positive, got {range_size}")
-    if any(k == f"{repo}::commits" or k.startswith(f"{repo}::r")
-           for k in manifest.failed):
+    # A repo-level failure records an earlier extraction attempt, not a unit of
+    # range coverage. Once the authoritative plan and every range prove exact
+    # coverage it is stale. A failed range remains authoritative and must keep
+    # completion fail-closed until that same range key is marked done.
+    if any(k.startswith(f"{repo}::r") for k in manifest.failed):
         return None
 
     plan = manifest.done.get(commit_plan_key(repo))
@@ -658,6 +661,49 @@ def manifest_complete_commit_ranges(
     if expected_start != n_records:
         return None
     return tuple(ranges)
+
+
+def mark_commit_stream_complete(
+    repo: str,
+    manifest: Manifest,
+    manifest_lock: threading.Lock,
+    complete_ranges: Sequence[tuple[int, int]],
+) -> dict:
+    """Persist aggregate completion proven by the plan and exact range coverage.
+
+    ``Manifest.mark_done`` also removes an earlier aggregate failure. Keeping
+    this as a derived summary avoids treating ``repo::commits`` as a second,
+    independent source of completion truth.
+    """
+    if not complete_ranges:
+        raise ValueError(f"cannot mark {repo}::commits complete without ranges")
+    plan = manifest.done.get(commit_plan_key(repo))
+    if not isinstance(plan, dict) or plan.get("source") != "commit_plan":
+        raise RuntimeError(
+            f"cannot mark {repo}::commits complete without authoritative commit_plan"
+        )
+    try:
+        n_records = int(plan["n_records"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot mark {repo}::commits complete: invalid commit_plan n_records"
+        ) from exc
+    if complete_ranges[0][0] != 0 or complete_ranges[-1][1] != n_records:
+        raise RuntimeError(
+            f"cannot mark {repo}::commits complete: ranges do not cover "
+            f"[0, {n_records})"
+        )
+    info = {
+        "source": "commits",
+        "repo": repo,
+        "complete": True,
+        "completion_proof": "commit_plan_exact_range_coverage",
+        "n_records": n_records,
+        "range_count": len(complete_ranges),
+    }
+    with manifest_lock:
+        manifest.mark_done(f"{repo}::commits", info)
+    return info
 
 
 def manifest_done_commit_intervals(repo: str, manifest: Manifest) -> tuple[tuple[int, int], ...]:
@@ -1872,6 +1918,12 @@ def run_commits_half(
         if complete_ranges is not None:
             first = complete_ranges[0][0]
             last = complete_ranges[-1][1]
+            mark_commit_stream_complete(
+                repo,
+                manifest,
+                manifest_lock,
+                complete_ranges,
+            )
             _log(
                 f"SKIP (done) {repo}::commits: manifest covers "
                 f"{len(complete_ranges)} range(s) [{first}:{last}); "
@@ -2246,7 +2298,15 @@ def run_commits_half(
     # True iff EVERY range for this repo is now marked done in the manifest
     # (covers resume-skipped + newly-done; excludes cancelled/failed). Drives
     # temp + extract-cache retention in process_one_repo.
-    all_ranges_done = manifest_covers_commit_span(repo, manifest, n_records)
+    complete_ranges = manifest_complete_commit_ranges(repo, manifest, range_size)
+    all_ranges_done = complete_ranges is not None
+    if complete_ranges is not None:
+        mark_commit_stream_complete(
+            repo,
+            manifest,
+            manifest_lock,
+            complete_ranges,
+        )
     return done, failed, all_ranges_done
 
 

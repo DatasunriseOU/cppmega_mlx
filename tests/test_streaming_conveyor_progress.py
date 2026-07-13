@@ -164,6 +164,52 @@ def test_manifest_complete_commit_ranges_uses_authoritative_record_count(tmp_pat
     ) == ((0, 500), (500, 823))
 
 
+def test_manifest_complete_commit_ranges_ignores_stale_aggregate_failure(tmp_path):
+    import streaming_conveyor
+
+    manifest = streaming_conveyor.Manifest(
+        path=tmp_path / "_done.json",
+        done={
+            "repo::commit_plan": {"source": "commit_plan", "n_records": 823},
+            "repo::r0": {"range": [0, 500], "source": "commits"},
+            "repo::r500": {"range": [500, 823], "source": "commits"},
+        },
+        failed={
+            "repo::commits": {
+                "stage": "extract_git_history",
+                "detail": "stale failure from an earlier attempt",
+            }
+        },
+    )
+
+    assert streaming_conveyor.manifest_complete_commit_ranges(
+        "repo", manifest, 500
+    ) == ((0, 500), (500, 823))
+
+
+def test_manifest_complete_commit_ranges_rejects_failed_range(tmp_path):
+    import streaming_conveyor
+
+    manifest = streaming_conveyor.Manifest(
+        path=tmp_path / "_done.json",
+        done={
+            "repo::commit_plan": {"source": "commit_plan", "n_records": 823},
+            "repo::r0": {"range": [0, 500], "source": "commits"},
+            "repo::r500": {"range": [500, 823], "source": "commits"},
+        },
+        failed={
+            "repo::r500": {
+                "stage": "pack",
+                "detail": "range is not authoritatively complete",
+            }
+        },
+    )
+
+    assert streaming_conveyor.manifest_complete_commit_ranges(
+        "repo", manifest, 500
+    ) is None
+
+
 def test_manifest_complete_commit_ranges_refuses_exact_multiple(tmp_path):
     import streaming_conveyor
 
@@ -740,7 +786,12 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
             "repo::r0": {"range": [0, 500], "source": "commits"},
             "repo::r500": {"range": [500, 612], "source": "commits"},
         },
-        failed={},
+        failed={
+            "repo::commits": {
+                "stage": "extract_git_history",
+                "detail": "stale failure from an earlier attempt",
+            }
+        },
     )
 
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -764,6 +815,15 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
         )
 
     assert (done, failed, all_done) == (0, 0, True)
+    assert manifest.done["repo::commits"] == {
+        "source": "commits",
+        "repo": "repo",
+        "complete": True,
+        "completion_proof": "commit_plan_exact_range_coverage",
+        "n_records": 612,
+        "range_count": 2,
+    }
+    assert "repo::commits" not in manifest.failed
 
 
 def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monkeypatch):
@@ -1060,6 +1120,15 @@ def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
     range_keys = sorted(key for key in manifest.done if key.startswith("repo::r"))
     assert range_keys == ["repo::r0", "repo::r1", "repo::r2"]
     assert manifest.done["repo::commit_plan"]["n_records"] == 3
+    assert manifest.done["repo::commits"] == {
+        "source": "commits",
+        "repo": "repo",
+        "complete": True,
+        "completion_proof": "commit_plan_exact_range_coverage",
+        "n_records": 3,
+        "range_count": 3,
+    }
+    assert "repo::commits" not in manifest.failed
     assert len(observed_kwargs) == 3
     reader = DedupStore(str(db), near=False, commit_every=1)
     try:
