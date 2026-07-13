@@ -28,6 +28,7 @@ jobs:
             tests/test_ast_fim.py \
             tests/test_audit_sidecar_parquet.py \
             tests/test_cpp_jsonl_generation_compile_eval.py \
+            tests/test_data_package_imports.py \
             tests/test_domain_graph_routes.py \
             tests/test_eval_domain_routed_codegen.py \
             tests/test_inference_generation.py \
@@ -58,6 +59,7 @@ jobs:
           # the macOS-only root conftest/package initialization.
           python -m pytest -q --noconftest \
             tests/test_audit_sidecar_parquet.py \
+            tests/test_data_package_imports.py \
             tests/test_streaming_conveyor_progress.py \
             tests/test_process_commits_fail_loud.py \
             tests/test_repair_packed_document_boundaries.py
