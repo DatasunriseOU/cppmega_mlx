@@ -15,11 +15,16 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from cppmega_mlx.data.domain_schema import DomainKind, DomainRoleKind, ParseConfidence
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS

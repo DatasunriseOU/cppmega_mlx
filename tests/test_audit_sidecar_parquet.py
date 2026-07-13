@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -81,6 +82,8 @@ def _write_tiny_parquet(
 
 def _run_audit(tmp_path, code_root, commit_root, pr_root, *, extra_args=()):
     out_dir = tmp_path / "audit"
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
     proc = subprocess.run(
         [
             sys.executable,
@@ -100,6 +103,7 @@ def _run_audit(tmp_path, code_root, commit_root, pr_root, *, extra_args=()):
             *extra_args,
         ],
         capture_output=True,
+        env=env,
         text=True,
     )
     report = None
