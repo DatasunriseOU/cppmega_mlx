@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, cast
+from typing import Literal, Tuple, cast
 
 import mlx.core as mx
 import numpy as np
@@ -473,6 +473,7 @@ def lightning_indexer_scores(
     head_weights: mx.array,
     *,
     block_bias: mx.array | None = None,
+    attention_mask: mx.array | Literal["causal"] | None = None,
     beta: mx.array | float = 1.0,
     causal: bool = True,
 ) -> mx.array:
@@ -484,6 +485,8 @@ def lightning_indexer_scores(
         head_weights: ``(Hi,)`` learned non-negative per-head weights ``w_h``.
         block_bias: optional ``(B, S, Skv)`` token-level graph prior ``S_blk``
             (already expanded from block to token granularity). Added as a bias.
+        attention_mask: optional dense keep/additive mask. Packed-document masks
+            must be supplied here so index selection cannot cross boundaries.
         beta: learned scalar (or fp32 0-d array) multiplying ``block_bias``.
         causal: when True, positions ``s > t`` are set to ``-inf`` (lower-tri).
 
@@ -535,6 +538,38 @@ def lightning_indexer_scores(
         i = mx.arange(S).reshape(S, 1)
         j = mx.arange(Skv).reshape(1, Skv)
         keep = (j <= i)[None, :, :]
+        scores = mx.where(keep, scores, mx.array(_NEG_INF, dtype=mx.float32))
+    if attention_mask is not None and not (
+        isinstance(attention_mask, str) and attention_mask == "causal"
+    ):
+        if not isinstance(attention_mask, mx.array):
+            raise TypeError(
+                "lightning_indexer_scores: attention_mask must be an MLX array, "
+                f"'causal', or None, got {type(attention_mask).__name__}"
+            )
+        keep = attention_mask
+        if keep.ndim == 2:
+            keep = keep[None, :, :]
+        elif keep.ndim == 4:
+            if int(keep.shape[1]) != 1:
+                raise ValueError(
+                    "lightning_indexer_scores: 4-D attention_mask head dimension "
+                    f"must be 1, got {int(keep.shape[1])}"
+                )
+            keep = keep[:, 0, :, :]
+        if keep.ndim != 3 or tuple(keep.shape[-2:]) != (S, Skv):
+            raise ValueError(
+                "lightning_indexer_scores: attention_mask must be shaped "
+                f"(S,Skv), (B,S,Skv), or (B,1,S,Skv); got {tuple(keep.shape)}"
+            )
+        if int(keep.shape[0]) not in (1, B):
+            raise ValueError(
+                "lightning_indexer_scores: attention_mask batch dimension must "
+                f"be 1 or {B}, got {int(keep.shape[0])}"
+            )
+        if keep.dtype != mx.bool_:
+            keep = mx.isfinite(keep) & (keep > (_NEG_INF / 2.0))
+        keep = mx.broadcast_to(keep, (B, S, Skv))
         scores = mx.where(keep, scores, mx.array(_NEG_INF, dtype=mx.float32))
     return scores
 
@@ -624,6 +659,7 @@ def graph_indexed_attention_reference(
     head_weights: mx.array,
     *,
     block_bias: mx.array | None = None,
+    attention_mask: mx.array | Literal["causal"] | None = None,
     beta: mx.array | float = 1.0,
     topk: int,
     local_window: int = 0,
@@ -663,6 +699,7 @@ def graph_indexed_attention_reference(
         k_index,
         head_weights,
         block_bias=block_bias,
+        attention_mask=attention_mask,
         beta=beta,
         causal=causal,
     )

@@ -28,6 +28,7 @@ from cppmega_mlx.data.batch import (
 from cppmega_mlx.runtime.path_c_physical_abi import (
     physical_abi_runtime_kernel_args,
 )
+from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.training.loss import next_token_cross_entropy
 
 
@@ -84,6 +85,11 @@ STABLE_BATCH_KEYS = (
     "sibling_index_ids",
     "node_type_ids",
     "platform_ids",
+    "domain_ids",
+    "role_ids",
+    "confidence_ids",
+    "graph_attention_bias",
+    "graph_edge_kind_bias",
 )
 
 CompiledBatch = dict[str, mx.array | None]
@@ -1621,6 +1627,8 @@ def maybe_compile_region(
 
 def normalize_compiled_batch(
     batch: LMTokenBatch | Mapping[str, mx.array | None] | mx.array,
+    *,
+    graph_routes_enabled: bool | None = None,
 ) -> CompiledBatch:
     """Return the fixed-key batch pytree used by compiled train steps.
 
@@ -1631,7 +1639,42 @@ def normalize_compiled_batch(
     training batches, and structured batches.
     """
 
-    batch_dict = ensure_lm_batch(batch).as_dict()
+    lm_batch = ensure_lm_batch(batch)
+    batch_dict = lm_batch.as_dict()
+    nested_domain = (
+        None
+        if lm_batch.side_channels is None
+        else lm_batch.side_channels.get("domain_routes")
+    )
+    if nested_domain is not None:
+        for key in ("domain_ids", "role_ids", "confidence_ids"):
+            direct = batch_dict.get(key)
+            nested = nested_domain.get(key)
+            if direct is not None and nested is not None:
+                raise ValueError(
+                    f"compiled batch received duplicate direct/nested {key}"
+                )
+            if nested is not None:
+                batch_dict[key] = nested
+
+    graph_attention_bias = lm_batch.graph_attention_bias
+    graph_edge_kind_bias = lm_batch.graph_edge_kind_bias
+    if graph_routes_enabled is False:
+        graph_attention_bias = None
+        graph_edge_kind_bias = None
+    elif lm_batch.graph_batch is not None:
+        aligned = lm_batch.graph_batch.input_aligned(
+            source_sequence_length=int(lm_batch.tokens.shape[1]),
+            input_sequence_length=int(lm_batch.inputs.shape[1]),
+        )
+        graph_attention_bias, graph_edge_kind_bias = build_token_graph_biases(
+            aligned,
+            batch_size=int(lm_batch.inputs.shape[0]),
+            seq_length=int(lm_batch.inputs.shape[1]),
+            document_ids=lm_batch.input_document_ids,
+        )
+    batch_dict["graph_attention_bias"] = graph_attention_bias
+    batch_dict["graph_edge_kind_bias"] = graph_edge_kind_bias
     return {key: batch_dict.get(key) for key in STABLE_BATCH_KEYS}
 
 
@@ -1736,7 +1779,14 @@ class CompiledPretrainingStep:
         batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
     ) -> PretrainingMetrics:
         self.model.train()
-        batch_dict = normalize_compiled_batch(batch)
+        model_config = getattr(self.model, "config", None)
+        graph_routes_enabled = getattr(model_config, "graph_routes_enabled", None)
+        if graph_routes_enabled is not None and not isinstance(graph_routes_enabled, bool):
+            raise TypeError("model config graph_routes_enabled must be a boolean")
+        batch_dict = normalize_compiled_batch(
+            batch,
+            graph_routes_enabled=graph_routes_enabled,
+        )
         batch_is_prevalidated = False
         if self.compile:
             validator = getattr(self.model, "validate_compiled_batch", None)

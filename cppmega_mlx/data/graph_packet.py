@@ -294,6 +294,7 @@ class GraphBatch:
     chunk_ends: tuple[mx.array, ...]
     chunk_kinds: tuple[mx.array, ...] = field(default_factory=tuple)
     chunk_dep_levels: tuple[mx.array, ...] = field(default_factory=tuple)
+    edge_kinds: tuple[Mapping[str, mx.array], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not self.graphs:
@@ -312,6 +313,16 @@ class GraphBatch:
         ends = _as_int_tuple(self.chunk_ends, where="chunk_ends")
         kinds = _as_int_tuple(self.chunk_kinds, where="chunk_kinds")
         dep_levels = _as_int_tuple(self.chunk_dep_levels, where="chunk_dep_levels")
+        edge_kinds: tuple[dict[str, mx.array], ...] = tuple(
+            {
+                relation: _as_int_vector(
+                    values,
+                    where=f"edge_kinds[{row}][{relation!r}]",
+                )
+                for relation, values in row_kinds.items()
+            }
+            for row, row_kinds in enumerate(self.edge_kinds)
+        )
         if len(starts) != batch_size or len(ends) != batch_size:
             raise ValueError(
                 "GraphBatch chunk_starts/chunk_ends length must match graphs "
@@ -325,6 +336,11 @@ class GraphBatch:
             raise ValueError(
                 "GraphBatch.chunk_dep_levels length "
                 f"{len(dep_levels)} must match graphs {batch_size}"
+            )
+        if edge_kinds and len(edge_kinds) != batch_size:
+            raise ValueError(
+                f"GraphBatch.edge_kinds length {len(edge_kinds)} must match "
+                f"graphs {batch_size}"
             )
         for row, (row_starts, row_ends) in enumerate(zip(starts, ends)):
             if row_starts.shape != row_ends.shape:
@@ -362,10 +378,26 @@ class GraphBatch:
                     f"GraphBatch row {row} graph num_nodes {graph_nodes} must match "
                     f"chunk count {int(row_starts.shape[0])}"
                 )
+            if edge_kinds:
+                unknown_relations = sorted(set(edge_kinds[row]) - set(graphs[row].edges))
+                if unknown_relations:
+                    raise ValueError(
+                        f"GraphBatch row {row} edge_kinds contains relations without "
+                        f"edges: {unknown_relations}"
+                    )
+                for relation, relation_kinds in edge_kinds[row].items():
+                    edge_count = graphs[row].edges[relation].num_edges
+                    if tuple(relation_kinds.shape) != (edge_count,):
+                        raise ValueError(
+                            f"GraphBatch row {row} edge_kinds[{relation!r}] edge "
+                            f"count must be {edge_count}, got "
+                            f"{tuple(relation_kinds.shape)}"
+                        )
         object.__setattr__(self, "chunk_starts", starts)
         object.__setattr__(self, "chunk_ends", ends)
         object.__setattr__(self, "chunk_kinds", kinds)
         object.__setattr__(self, "chunk_dep_levels", dep_levels)
+        object.__setattr__(self, "edge_kinds", edge_kinds)
 
     @property
     def batch_size(self) -> int:
@@ -407,6 +439,7 @@ class GraphBatch:
         ends_out: list[mx.array] = []
         kinds_out: list[mx.array] = []
         dep_levels_out: list[mx.array] = []
+        edge_kinds_out: list[dict[str, mx.array]] = []
         for row, graph in enumerate(self.graphs):
             starts = np.asarray(self.chunk_starts[row], dtype=np.int64)
             ends = np.asarray(self.chunk_ends[row], dtype=np.int64)
@@ -430,6 +463,7 @@ class GraphBatch:
                 dep_levels_out.append(self.chunk_dep_levels[row][:keep_chunks])
 
             aligned_edges: dict[str, EdgeIndex] = {}
+            aligned_edge_kinds: dict[str, mx.array] = {}
             for relation, edge in graph.edges.items():
                 if relation in ("call", "type"):
                     source_bound = int(starts.shape[0])
@@ -450,13 +484,22 @@ class GraphBatch:
                         "GraphBatch.input_aligned cannot align unsupported relation "
                         f"{relation!r}"
                     )
-                aligned_edges[relation] = _input_aligned_edge(
+                aligned_edge, retained_indices = _input_aligned_edge(
                     edge,
                     source_bound=source_bound,
                     input_bound=input_bound,
                     coordinate_name=coordinate_name,
                 )
+                aligned_edges[relation] = aligned_edge
+                if self.edge_kinds and relation in self.edge_kinds[row]:
+                    relation_kinds = np.asarray(
+                        self.edge_kinds[row][relation], dtype=np.int32
+                    )
+                    aligned_edge_kinds[relation] = mx.array(
+                        relation_kinds[retained_indices], dtype=mx.int32
+                    )
             graphs.append(GraphPacket(edges=aligned_edges, num_nodes=keep_chunks))
+            edge_kinds_out.append(aligned_edge_kinds)
 
         return GraphBatch(
             graphs=tuple(graphs),
@@ -464,6 +507,7 @@ class GraphBatch:
             chunk_ends=tuple(ends_out),
             chunk_kinds=tuple(kinds_out),
             chunk_dep_levels=tuple(dep_levels_out),
+            edge_kinds=tuple(edge_kinds_out) if self.edge_kinds else (),
         )
 
 
@@ -473,13 +517,15 @@ def _input_aligned_edge(
     source_bound: int,
     input_bound: int,
     coordinate_name: str,
-) -> EdgeIndex:
+) -> tuple[EdgeIndex, np.ndarray]:
     src = np.asarray(edge.src, dtype=np.int64)
     dst = np.asarray(edge.dst, dtype=np.int64)
+    retained_indices = np.arange(src.shape[0], dtype=np.int64)
     if edge.mask is not None:
         active = np.asarray(edge.mask) > 0
         src = src[active]
         dst = dst[active]
+        retained_indices = retained_indices[active]
     invalid = (src < 0) | (dst < 0) | (src >= source_bound) | (dst >= source_bound)
     if np.any(invalid):
         first = int(np.flatnonzero(invalid)[0])
@@ -489,11 +535,14 @@ def _input_aligned_edge(
             f"{source_bound} source {coordinate_name}"
         )
     keep = (src < input_bound) & (dst < input_bound)
-    return EdgeIndex(
-        src=mx.array(src[keep], dtype=mx.int32),
-        dst=mx.array(dst[keep], dtype=mx.int32),
-        relation=edge.relation,
-        num_nodes=input_bound,
+    return (
+        EdgeIndex(
+            src=mx.array(src[keep], dtype=mx.int32),
+            dst=mx.array(dst[keep], dtype=mx.int32),
+            relation=edge.relation,
+            num_nodes=input_bound,
+        ),
+        retained_indices[keep],
     )
 
 

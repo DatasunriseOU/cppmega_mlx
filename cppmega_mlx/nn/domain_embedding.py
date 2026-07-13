@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from cppmega_mlx.data.batch import batch_values_are_prevalidated
+
 
 class DomainEmbedding(nn.Module):
     """Additive token embedding over the stable domain-routing sidecars."""
@@ -35,6 +37,7 @@ class DomainEmbedding(nn.Module):
         self.hidden_size = int(hidden_size)
         self.bottleneck_dim = int(bottleneck_dim)
         vocab_sizes = (int(num_domains), int(num_roles), int(num_confidences))
+        self._component_maxima = tuple(value - 1 for value in vocab_sizes)
         offsets = (0, vocab_sizes[0], vocab_sizes[0] + vocab_sizes[1])
         self._comp_offsets = mx.array(offsets, dtype=mx.int64)
         self._comp_max = mx.array(
@@ -74,6 +77,12 @@ class DomainEmbedding(nn.Module):
             raise ValueError(f"domain sidecars must be shaped (B, S), got {shape}")
 
         expected_shape = tuple(ref.shape)
+        if not batch_values_are_prevalidated():
+            self.validate_inputs(
+                domain_ids=domain_ids,
+                role_ids=role_ids,
+                confidence_ids=confidence_ids,
+            )
         ids_list: list[mx.array] = []
         present: list[float] = []
         for index, name in enumerate(self.COMPONENTS):
@@ -91,16 +100,6 @@ class DomainEmbedding(nn.Module):
                     f"{expected_shape}"
                 )
             ids = tensor.astype(mx.int64)
-            max_id = int(self._comp_max[index].item())
-            invalid = mx.any((ids < 0) | (ids > max_id))
-            mx.eval(invalid)
-            if bool(invalid.item()):
-                values = np.asarray(ids)
-                bad = values[(values < 0) | (values > max_id)][:8].tolist()
-                raise ValueError(
-                    f"[cppmega-domain] {name}_ids out of range [0,{max_id}]: "
-                    f"offending values {bad}; refusing to clamp"
-                )
             ids_list.append(ids + self._comp_offsets[index])
             present.append(1.0)
 
@@ -119,6 +118,59 @@ class DomainEmbedding(nn.Module):
         if weight.dtype != dtype:
             weight = weight.astype(dtype)
         return weighted @ weight.T
+
+    def validate_inputs(
+        self,
+        *,
+        domain_ids: mx.array | None,
+        role_ids: mx.array | None,
+        confidence_ids: mx.array | None,
+        expected_shape: tuple[int, int] | None = None,
+        require_all: bool = False,
+    ) -> None:
+        inputs = {
+            "domain": domain_ids,
+            "role": role_ids,
+            "confidence": confidence_ids,
+        }
+        present = [value for value in inputs.values() if value is not None]
+        if not present:
+            raise ValueError(
+                "[cppmega-domain] domain embedding is enabled but all domain "
+                "sidecars are absent"
+            )
+        if require_all and len(present) != len(inputs):
+            missing = [f"{name}_ids" for name, value in inputs.items() if value is None]
+            raise ValueError(
+                "[cppmega-domain] production domain routes require all sidecars; "
+                f"missing {missing}"
+            )
+        shape = expected_shape or tuple(present[0].shape)
+        for index, (name, tensor) in enumerate(inputs.items()):
+            if tensor is None:
+                continue
+            if not isinstance(tensor, mx.array) or tensor.ndim != 2:
+                tensor_shape = getattr(tensor, "shape", None)
+                raise ValueError(f"{name}_ids must be shaped (B, S), got {tensor_shape}")
+            if tuple(tensor.shape) != tuple(shape):
+                raise ValueError(
+                    f"{name}_ids shape {tuple(tensor.shape)} must match {tuple(shape)}"
+                )
+            if tensor.dtype not in (mx.int16, mx.int32, mx.int64, mx.uint16, mx.uint32):
+                raise ValueError(
+                    f"{name}_ids must use an integer dtype, got {tensor.dtype}"
+                )
+            ids = tensor.astype(mx.int64)
+            max_id = self._component_maxima[index]
+            invalid = mx.any((ids < 0) | (ids > max_id))
+            mx.eval(invalid)
+            if bool(invalid.item()):
+                values = np.asarray(ids)
+                bad = values[(values < 0) | (values > max_id)][:8].tolist()
+                raise ValueError(
+                    f"[cppmega-domain] {name}_ids out of range [0,{max_id}]: "
+                    f"offending values {bad}; refusing to clamp"
+                )
 
 
 CppMegaDomainEmbedding = DomainEmbedding

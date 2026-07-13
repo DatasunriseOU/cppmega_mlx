@@ -329,7 +329,11 @@ def _broadcast_groups_to_heads(x: mx.array, nheads: int, name: str) -> mx.array:
     return mx.repeat(x, repeats=nheads // groups, axis=2)
 
 
-def _compute_trapezoidal_scale(dt: mx.array, trap: mx.array) -> mx.array:
+def _compute_trapezoidal_scale(
+    dt: mx.array,
+    trap: mx.array,
+    document_ids: mx.array | None = None,
+) -> mx.array:
     """Author Mamba3 trapezoidal input scale for B/K, shaped (B,S,H)."""
 
     if dt.ndim != 3:
@@ -345,6 +349,17 @@ def _compute_trapezoidal_scale(dt: mx.array, trap: mx.array) -> mx.array:
         [sig_trap[:, 1:, :], mx.zeros_like(sig_trap[:, :1, :]) + 0.5],
         axis=1,
     )
+    if document_ids is not None and dt.shape[1] > 1:
+        same_next = document_ids[:, 1:] == document_ids[:, :-1]
+        same_next = mx.concatenate(
+            [same_next, mx.zeros_like(same_next[:, :1])], axis=1
+        )[:, :, None]
+        dt_shifted = mx.where(same_next, dt_shifted, mx.zeros_like(dt_shifted))
+        sig_shifted = mx.where(
+            same_next,
+            sig_shifted,
+            mx.full(sig_shifted.shape, 0.5, dtype=sig_shifted.dtype),
+        )
     return dt_shifted * (1.0 - sig_shifted) + dt * sig_trap
 
 
@@ -413,7 +428,13 @@ def _expand_mimo_rank_to_heads(tensor: mx.array, nheads: int, name: str) -> mx.a
     return mx.repeat(tensor, repeats=nheads // groups, axis=3)
 
 
-def causal_depthwise_conv1d(x: mx.array, weight: mx.array, bias: mx.array | None = None) -> mx.array:
+def causal_depthwise_conv1d(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array | None = None,
+    *,
+    document_ids: mx.array | None = None,
+) -> mx.array:
     """Causal depthwise Conv1d over MLX NLC tensors."""
 
     if x.ndim != 3:
@@ -423,11 +444,76 @@ def causal_depthwise_conv1d(x: mx.array, weight: mx.array, bias: mx.array | None
         raise ValueError(f"weight must be shaped (C,K,1) for C={channels}, got {weight.shape}")
 
     kernel_size = weight.shape[1]
-    padded = mx.pad(x, [(0, 0), (kernel_size - 1, 0), (0, 0)])
-    y = mx.conv1d(padded, weight, stride=1, padding=0, dilation=1, groups=channels)
+    if document_ids is None:
+        padded = mx.pad(x, [(0, 0), (kernel_size - 1, 0), (0, 0)])
+        y = mx.conv1d(padded, weight, stride=1, padding=0, dilation=1, groups=channels)
+    else:
+        if document_ids.ndim != 2 or tuple(document_ids.shape) != tuple(x.shape[:2]):
+            raise ValueError(
+                f"document_ids shape {document_ids.shape} must match x leading "
+                f"dims {x.shape[:2]}"
+            )
+        y = mx.zeros_like(x)
+        for kernel_index in range(kernel_size):
+            lag = kernel_size - 1 - kernel_index
+            if lag == 0:
+                shifted = x
+                same_document = mx.ones(document_ids.shape, dtype=mx.bool_)
+            else:
+                shifted = mx.concatenate(
+                    [mx.zeros_like(x[:, :lag, :]), x[:, :-lag, :]], axis=1
+                )
+                same = document_ids[:, lag:] == document_ids[:, :-lag]
+                same_document = mx.concatenate(
+                    [
+                        mx.zeros(
+                            (document_ids.shape[0], lag), dtype=mx.bool_
+                        ),
+                        same,
+                    ],
+                    axis=1,
+                )
+            y = y + shifted * same_document[:, :, None].astype(x.dtype) * weight[
+                :, kernel_index, 0
+            ][None, None, :]
     if bias is not None:
         y = y + bias
     return y
+
+
+def _document_reset_mask(document_ids: mx.array) -> mx.array:
+    if document_ids.ndim != 2:
+        raise ValueError(
+            f"document_ids must be shaped (B,S), got {document_ids.shape}"
+        )
+    if document_ids.shape[1] == 0:
+        return mx.zeros(document_ids.shape, dtype=mx.bool_)
+    return mx.concatenate(
+        [
+            mx.ones((document_ids.shape[0], 1), dtype=mx.bool_),
+            document_ids[:, 1:] != document_ids[:, :-1],
+        ],
+        axis=1,
+    )
+
+
+def _segmented_cumsum(values: mx.array, document_ids: mx.array) -> mx.array:
+    if tuple(values.shape[:2]) != tuple(document_ids.shape):
+        raise ValueError(
+            f"segmented cumsum values leading dims {values.shape[:2]} must match "
+            f"document_ids {document_ids.shape}"
+        )
+    if values.shape[1] == 0:
+        return values
+    running = mx.zeros_like(values[:, 0])
+    outputs: list[mx.array] = []
+    reset = _document_reset_mask(document_ids)
+    expand = (slice(None),) + (None,) * (values.ndim - 2)
+    for step in range(values.shape[1]):
+        keep = (~reset[:, step])[expand]
+        running = mx.where(keep, running, mx.zeros_like(running)) + values[:, step]
+        outputs.append(running)
+    return mx.stack(outputs, axis=1)
 
 
 def _chunked_mamba3_diagonal_scan(
@@ -440,6 +526,7 @@ def _chunked_mamba3_diagonal_scan(
     h0: mx.array,
     *,
     chunk_size: int,
+    reset_mask: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Chunked diagonal SSM scan for the local Mamba3 reference block.
 
@@ -494,6 +581,12 @@ def _chunked_mamba3_diagonal_scan(
         # after dtype-changing modules run earlier in-process. Keep chunking for
         # bounded Python work, but compute the recurrence in source order.
         for step in range(start, end):
+            if reset_mask is not None:
+                h = mx.where(
+                    reset_mask[:, step, None, None, None],
+                    mx.zeros_like(h),
+                    h,
+                )
             h = mx.exp(log_decay[:, step]) * h + inp[:, step]
             y = mx.sum(h * C[:, step, :, None, :], axis=-1)
             y = y + D_skip.astype(y.dtype) * x[:, step]
@@ -513,6 +606,7 @@ def _dispatch_mamba3_scan(
     D: mx.array,
     h0: mx.array,
     chunk_size: int,
+    reset_mask: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Route the Mamba3 selective scan according to :class:`KernelPath`.
 
@@ -530,6 +624,26 @@ def _dispatch_mamba3_scan(
     )
 
     path = selected_path("mamba3_mimo")
+
+    if reset_mask is not None:
+        if path in (KernelPath.PATH_B, KernelPath.PATH_C):
+            raise RuntimeError(
+                "mamba3_mimo: packed document resets are unsupported by the "
+                f"explicit {path.value} backend; use reference or auto"
+            )
+        record_dispatch("mamba3_mimo", path, "reference_packed_document_resets")
+        return _reference_scan(
+            x=x,
+            B=B,
+            C=C,
+            z=z,
+            A=A,
+            dt=dt,
+            D=D,
+            h0=h0,
+            chunk_size=chunk_size,
+            reset_mask=reset_mask,
+        )
 
     if path is KernelPath.PATH_C:
         from cppmega_mlx.nn._tilelang.mamba3_path_c import (
@@ -573,6 +687,8 @@ def _dispatch_mamba3_scan(
         return _reference_scan(
             x=x, B=B, C=C, z=z, A=A, dt=dt, D=D, h0=h0, chunk_size=chunk_size,
         )
+
+    from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_metal_status
 
     # AUTO + PATH_B share the Metal-availability check.
     from cppmega_mlx.nn._tilelang.mamba3 import mamba3_mimo_metal_status
@@ -681,6 +797,7 @@ def _reference_scan(
     D: mx.array,
     h0: mx.array,
     chunk_size: int,
+    reset_mask: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Adapter that builds (log_decay, inp) and runs the chunked diagonal scan."""
 
@@ -695,6 +812,7 @@ def _reference_scan(
         D,
         h0,
         chunk_size=chunk_size,
+        reset_mask=reset_mask,
     )
 
 
@@ -827,6 +945,7 @@ class Mamba3ReferenceBlock(nn.Module):
         *,
         h0: mx.array | None = None,
         cache: Mamba3CacheState | None = None,
+        document_ids: mx.array | None = None,
         return_cache: Literal[False] = False,
     ) -> tuple[mx.array, mx.array]: ...
 
@@ -837,6 +956,7 @@ class Mamba3ReferenceBlock(nn.Module):
         *,
         h0: mx.array | None = None,
         cache: Mamba3CacheState | None = None,
+        document_ids: mx.array | None = None,
         return_cache: Literal[True],
     ) -> tuple[mx.array, Mamba3CacheState]: ...
 
@@ -846,6 +966,7 @@ class Mamba3ReferenceBlock(nn.Module):
         *,
         h0: mx.array | None = None,
         cache: Mamba3CacheState | None = None,
+        document_ids: mx.array | None = None,
         return_cache: bool = False,
     ) -> tuple[mx.array, mx.array] | tuple[mx.array, Mamba3CacheState]:
         if hidden_states.ndim != 3:
@@ -855,6 +976,17 @@ class Mamba3ReferenceBlock(nn.Module):
 
         cfg = self.config
         batch, seq, _ = hidden_states.shape
+        if document_ids is not None:
+            if document_ids.ndim != 2 or tuple(document_ids.shape) != (batch, seq):
+                raise ValueError(
+                    f"document_ids must have shape {(batch, seq)}, got "
+                    f"{document_ids.shape}"
+                )
+            if h0 is not None or cache is not None or return_cache:
+                raise ValueError(
+                    "packed document_ids cannot be combined with Mamba3 "
+                    "continuation state/cache"
+                )
         if cache is not None:
             self._validate_cache_state(cache, batch=batch, dtype=hidden_states.dtype)
 
@@ -865,6 +997,7 @@ class Mamba3ReferenceBlock(nn.Module):
             xBC,
             self.conv_weight.astype(xBC.dtype),
             self.conv_bias.astype(xBC.dtype),
+            document_ids=document_ids,
         )
         x, B, C = _split_by_sizes(nn.silu(xBC), [cfg.d_inner, self.dims.d_bc, self.dims.d_bc])
         x = x.reshape(batch, seq, cfg.nheads, cfg.headdim)
@@ -877,14 +1010,19 @@ class Mamba3ReferenceBlock(nn.Module):
         C = mx.mean(C_mimo, axis=2)
 
         dt = nn.softplus(dd_dt + self.dt_bias.astype(dd_dt.dtype))
-        trap_scale = _compute_trapezoidal_scale(dt, trap)
+        trap_scale = _compute_trapezoidal_scale(dt, trap, document_ids)
         B = B * _heads_to_group_scale(trap_scale, cfg.ngroups)[:, :, :, None]
 
         angles = mx.broadcast_to(
             angles[:, :, None, :],
             (batch, seq, cfg.nheads, self.dims.num_rope_angles),
         )
-        angles_cumsum = mx.cumsum(angles * dt[:, :, :, None], axis=1)
+        angle_steps = angles * dt[:, :, :, None]
+        angles_cumsum = (
+            mx.cumsum(angle_steps, axis=1)
+            if document_ids is None
+            else _segmented_cumsum(angle_steps, document_ids)
+        )
         if cache is not None:
             angles_cumsum = angles_cumsum + cache.angle_dt[:, None, :, :].astype(angles_cumsum.dtype)
         B = _apply_rope_on_state_dim(B, angles_cumsum)
@@ -935,6 +1073,9 @@ class Mamba3ReferenceBlock(nn.Module):
             D=self.D,
             h0=h,
             chunk_size=cfg.chunk_size,
+            reset_mask=None
+            if document_ids is None
+            else _document_reset_mask(document_ids),
         )
         y = y.reshape(batch, seq, cfg.d_inner)
         out = self.out_proj(y)

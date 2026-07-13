@@ -38,6 +38,7 @@ def prevalidated_batch_values() -> Iterator[None]:
         _BATCH_VALUES_PREVALIDATED.reset(token)
 
 _SIDE_CHANNEL_FAMILY_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "domain_routes": ("domain_ids", "role_ids", "confidence_ids"),
     "platform": ("platform_ids",),
     "syntax": ("ast_depth_ids", "sibling_index_ids", "node_type_ids"),
     "structure": ("structure_ids", "dep_levels"),
@@ -59,7 +60,12 @@ class LMTokenBatch:
     sibling_index_ids: mx.array | None = None
     node_type_ids: mx.array | None = None
     platform_ids: mx.array | None = None
+    domain_ids: mx.array | None = None
+    role_ids: mx.array | None = None
+    confidence_ids: mx.array | None = None
     graph_batch: GraphBatch | None = None
+    graph_attention_bias: mx.array | None = None
+    graph_edge_kind_bias: mx.array | None = None
     side_channels: Mapping[str, Mapping[str, mx.array]] | None = None
     metadata: Mapping[str, Any] | None = None
 
@@ -144,6 +150,25 @@ class LMTokenBatch:
                 mx.eval(has_negative)
                 if bool(has_negative.item()):
                     raise ValueError("platform_ids must be non-negative")
+        for name, value in self.domain_route_fields().items():
+            if value is not None and value.shape != self.tokens.shape:
+                raise ValueError(
+                    f"{name} must match tokens shape {self.tokens.shape}, got {value.shape}"
+                )
+        nested_domain_routes = (
+            None if self.side_channels is None else self.side_channels.get("domain_routes")
+        )
+        if nested_domain_routes is not None:
+            duplicated = sorted(
+                name
+                for name, value in self.domain_route_fields().items()
+                if value is not None and nested_domain_routes.get(name) is not None
+            )
+            if duplicated:
+                raise ValueError(
+                    "domain routes cannot be provided both directly and through "
+                    f"side_channels.domain_routes: {duplicated}"
+                )
         if self.graph_batch is not None:
             if not isinstance(self.graph_batch, GraphBatch):
                 raise TypeError(
@@ -155,6 +180,25 @@ class LMTokenBatch:
                     "graph_batch batch size must be 1 or tokens batch "
                     f"{int(self.tokens.shape[0])}, got {self.graph_batch.batch_size}"
                 )
+        if self.graph_attention_bias is not None or self.graph_edge_kind_bias is not None:
+            if self.graph_batch is not None:
+                raise ValueError(
+                    "provide graph_batch or fixed graph biases, not both"
+                )
+            expected = (
+                int(self.inputs.shape[0]),
+                int(self.inputs.shape[1]),
+                int(self.inputs.shape[1]),
+            )
+            for name, value in (
+                ("graph_attention_bias", self.graph_attention_bias),
+                ("graph_edge_kind_bias", self.graph_edge_kind_bias),
+            ):
+                if value is not None and tuple(value.shape) != expected:
+                    raise ValueError(
+                        f"{name} must be shaped for model inputs as {expected}, "
+                        f"got {tuple(value.shape)}"
+                    )
         if self.side_channels is not None:
             _validate_side_channel_map(self.side_channels)
         if self.metadata is not None and not isinstance(self.metadata, Mapping):
@@ -201,6 +245,13 @@ class LMTokenBatch:
             "node_type_ids": self.node_type_ids,
         }
 
+    def domain_route_fields(self) -> dict[str, mx.array | None]:
+        return {
+            "domain_ids": self.domain_ids,
+            "role_ids": self.role_ids,
+            "confidence_ids": self.confidence_ids,
+        }
+
     def model_kwargs(self) -> dict[str, Any]:
         kwargs = {
             name: self._input_aligned(value)
@@ -218,6 +269,11 @@ class LMTokenBatch:
                 source_sequence_length=int(self.tokens.shape[1]),
                 input_sequence_length=int(self.inputs.shape[1]),
             )
+        if self.graph_attention_bias is not None:
+            kwargs["block_bias"] = self.graph_attention_bias
+        if self.graph_edge_kind_bias is not None:
+            kwargs["edge_kind_bias"] = self.graph_edge_kind_bias
+        direct_domain_routes = self.domain_route_fields()
         if self.side_channels is not None:
             domain_routes = self.side_channels.get("domain_routes")
             if domain_routes is not None:
@@ -225,6 +281,9 @@ class LMTokenBatch:
                     value = domain_routes.get(field_name)
                     if value is not None:
                         kwargs[field_name] = self._input_aligned(value)
+        for field_name, value in direct_domain_routes.items():
+            if value is not None:
+                kwargs[field_name] = self._input_aligned(value)
         return kwargs
 
     def side_channel_map(self) -> dict[str, dict[str, mx.array]]:
@@ -344,8 +403,15 @@ class LMTokenBatch:
         data.update({k: v for k, v in self.structure_fields().items() if v is not None})
         if self.platform_ids is not None:
             data["platform_ids"] = self.platform_ids
+        data.update(
+            {key: value for key, value in self.domain_route_fields().items() if value is not None}
+        )
         if self.graph_batch is not None:
             data["graph_batch"] = self.graph_batch
+        if self.graph_attention_bias is not None:
+            data["graph_attention_bias"] = self.graph_attention_bias
+        if self.graph_edge_kind_bias is not None:
+            data["graph_edge_kind_bias"] = self.graph_edge_kind_bias
         if include_side_channels and self.side_channels is not None:
             data["side_channels"] = self.side_channels
         if include_metadata and self.metadata is not None:
@@ -436,7 +502,12 @@ def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTok
             sibling_index_ids=batch.get("sibling_index_ids"),
             node_type_ids=batch.get("node_type_ids"),
             platform_ids=batch.get("platform_ids"),
+            domain_ids=batch.get("domain_ids"),
+            role_ids=batch.get("role_ids"),
+            confidence_ids=batch.get("confidence_ids"),
             graph_batch=batch.get("graph_batch"),
+            graph_attention_bias=batch.get("graph_attention_bias"),
+            graph_edge_kind_bias=batch.get("graph_edge_kind_bias"),
             side_channels=batch.get("side_channels"),
             metadata=batch.get("metadata"),
         )

@@ -923,6 +923,13 @@ def _graph_batch_from_route_packets(
         chunk_ends=tuple(mx.array(packet.chunk_ends) for packet in packets),
         chunk_kinds=tuple(mx.array(packet.chunk_kinds) for packet in packets),
         chunk_dep_levels=tuple(mx.array(packet.chunk_dep_levels) for packet in packets),
+        edge_kinds=tuple(
+            {
+                relation: mx.array(values, dtype=mx.int32)
+                for relation, values in packet.edge_kinds.items()
+            }
+            for packet in packets
+        ),
     )
 
 

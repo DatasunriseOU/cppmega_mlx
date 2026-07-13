@@ -13,6 +13,8 @@ Covers:
 
 from __future__ import annotations
 
+from typing import get_args
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -24,6 +26,7 @@ from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.models.dense_cpp_lm import (
     DenseCppBlock,
+    DenseAttentionMode,
     DenseCppLM,
     DenseCppLMConfig,
 )
@@ -141,6 +144,12 @@ def test_gqa_config_rejects_equal_kv_heads():
     # contract lives in AttentionConfig and is validated at config construction).
     with pytest.raises(ValueError):
         _smoke_config(num_query_heads=8, num_kv_heads=8)
+
+
+def test_dense_stage1_rejects_advertised_mla_alias():
+    assert "mla" not in get_args(DenseAttentionMode)
+    with pytest.raises(ValueError, match="MLA.*not implemented"):
+        _smoke_config(attention_mode="mla")
 
 
 def test_side_channels_change_loss():
@@ -290,6 +299,55 @@ def _single_token_chunk_graph(seq: int, pairs: list[list[int]]) -> GraphBatch:
         chunk_kinds=(mx.zeros((seq,), dtype=mx.int32),),
         chunk_dep_levels=(mx.zeros((seq,), dtype=mx.int32),),
     )
+
+
+@pytest.mark.parametrize("attention_mode", ["gqa", "dsa"])
+def test_dense_graph_routes_and_attention_do_not_cross_documents(
+    attention_mode: str,
+) -> None:
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+        attention_mode=attention_mode,
+        attention_sparse_topk=4,
+        indexer_local_window=0,
+        indexer_num_sinks=0,
+    )
+    mx.random.seed(149)
+    model = DenseCppLM(cfg)
+    document_ids = mx.array([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=mx.int32)
+    suffix = mx.array([[23, 29, 31, 37]], dtype=mx.int32)
+    left = mx.concatenate(
+        [mx.array([[2, 3, 5, 7]], dtype=mx.int32), suffix], axis=1
+    )
+    right = mx.concatenate(
+        [mx.array([[11, 13, 17, 19]], dtype=mx.int32), suffix], axis=1
+    )
+    graph = _single_token_chunk_graph(8, [[7, 5]])
+
+    left_logits = model.logits(
+        left,
+        graph_batch=graph,
+        document_ids=document_ids,
+    )
+    right_logits = model.logits(
+        right,
+        graph_batch=graph,
+        document_ids=document_ids,
+    )
+    mx.eval(left_logits, right_logits)
+
+    np.testing.assert_allclose(
+        np.asarray(left_logits[:, 4:]),
+        np.asarray(right_logits[:, 4:]),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    if attention_mode == "dsa":
+        scores = model.indexer_scores()[0]
+        mx.eval(scores)
+        assert np.all(np.asarray(scores)[0, 4:, :4] < -1e8)
 
 
 def test_forward_packet_consumes_codepacket_graph_edges_when_enabled():

@@ -36,11 +36,13 @@ from typing import Literal, cast
 import mlx.core as mx
 import mlx.nn as nn
 
+from cppmega_mlx.data.batch import batch_values_are_prevalidated, ensure_lm_batch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.graph_packet import GraphBatch
+from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
 from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
-from cppmega_mlx.nn.code_graph_routes import build_token_attention_bias
+from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.nn.domain_embedding import CppMegaDomainEmbedding
 from cppmega_mlx.nn.moe import FeedForwardExpert
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
@@ -48,9 +50,9 @@ from cppmega_mlx.nn.platform_embedding import CppMegaPlatformEmbedding
 from cppmega_mlx.nn.sparse_mla import graph_indexed_attention_reference
 from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 
-# Reuse the same attention-mode literal the rest of the repo uses. DSA is the
-# later (Sparse-MLA) replacement for GQA; "full"/"gqa" are the dense SDPA paths.
-DenseAttentionMode = Literal["mla", "dsa", "full", "gqa"]
+# DSA is the later sparse replacement for GQA; ``full``/``gqa`` are the dense
+# SDPA paths. MLA is deliberately absent until this model has latent projections.
+DenseAttentionMode = Literal["dsa", "full", "gqa"]
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class DenseCppLMConfig:
     domain_num_roles: int = 128
     domain_num_confidences: int = 8
     domain_bottleneck_dim: int = 32
+    require_domain_routes: bool = False
 
     # N-gram hash embedding.
     ngram_hash_enabled: bool = True
@@ -143,6 +146,11 @@ class DenseCppLMConfig:
     ce_chunk_size: int = 16384
 
     def __post_init__(self) -> None:
+        if self.attention_mode == "mla":
+            raise ValueError(
+                "DenseCppLM MLA is not implemented: full-rank QKV projections "
+                "cannot be advertised as latent attention"
+            )
         if self.vocab_size < 2:
             raise ValueError(f"vocab_size must be >= 2, got {self.vocab_size}")
         if self.hidden_size <= 0:
@@ -284,7 +292,6 @@ class GraphIndexedAttention(nn.Module):
         *,
         block_bias: mx.array | None = None,
     ) -> mx.array:
-        del mask  # causal handled inside the indexer reference
         cfg = self._dense_config
         acfg = self.config
         batch, seq, _ = hidden_states.shape
@@ -309,6 +316,7 @@ class GraphIndexedAttention(nn.Module):
             k_index,
             self.index_head_weights,
             block_bias=block_bias,
+            attention_mask=mask,
             beta=self.index_beta[0],
             topk=cfg.attention_sparse_topk,
             local_window=cfg.indexer_local_window,
@@ -568,14 +576,24 @@ class DenseCppLM(nn.Module):
         domain_ids: mx.array | None = None,
         role_ids: mx.array | None = None,
         confidence_ids: mx.array | None = None,
+        document_ids: mx.array | None = None,
         graph_batch: GraphBatch | None = None,
         apply_final_norm: bool = True,
         block_bias: mx.array | None = None,
+        edge_kind_bias: mx.array | None = None,
     ) -> mx.array:
+        batch_size, seq_length = int(input_ids.shape[0]), int(input_ids.shape[1])
+        document_ids = _validate_dense_document_ids(
+            document_ids,
+            batch_size=batch_size,
+            seq_length=seq_length,
+        )
         block_bias = self._resolve_graph_bias(
             input_ids,
             graph_batch=graph_batch,
             block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            document_ids=document_ids,
         )
         hidden = self.embed(
             input_ids,
@@ -589,9 +607,16 @@ class DenseCppLM(nn.Module):
             role_ids=role_ids,
             confidence_ids=confidence_ids,
         )
-        seq_length = int(input_ids.shape[1])
-        mask = nn.MultiHeadAttention.create_additive_causal_mask(
-            seq_length, dtype=hidden.dtype
+        mask = (
+            nn.MultiHeadAttention.create_additive_causal_mask(
+                seq_length, dtype=hidden.dtype
+            )
+            if document_ids is None
+            else mlx_document_boundary_mask(
+                document_ids,
+                causal=True,
+                expand_heads=True,
+            )
         )
         is_dsa = self.config.attention_mode == "dsa"
         for layer in self.layers:
@@ -609,26 +634,45 @@ class DenseCppLM(nn.Module):
         *,
         graph_batch: GraphBatch | None,
         block_bias: mx.array | None,
+        edge_kind_bias: mx.array | None,
+        document_ids: mx.array | None,
     ) -> mx.array | None:
         if not self.config.graph_routes_enabled:
-            return block_bias
+            if block_bias is None:
+                return edge_kind_bias
+            if edge_kind_bias is None:
+                return block_bias
+            return block_bias + edge_kind_bias
         if graph_batch is None:
             if block_bias is None:
                 raise RuntimeError(
                     "DenseCppLM graph routes are enabled but no typed GraphBatch "
                     "or explicit block_bias was provided; refusing token-only forward"
                 )
-            return block_bias
-        if block_bias is not None:
+            if edge_kind_bias is None:
+                if self.config.require_graph_routes:
+                    raise RuntimeError(
+                        "DenseCppLM graph routes require graph_edge_kind_bias so "
+                        "categorical edge supervision cannot be dropped"
+                    )
+                edge_kind_bias = mx.zeros_like(block_bias)
+            bias = block_bias + edge_kind_bias
+        elif block_bias is not None or edge_kind_bias is not None:
             raise ValueError(
-                "DenseCppLM received both graph_batch and block_bias while graph "
-                "routes are enabled; provide one graph prior source"
+                "DenseCppLM received both graph_batch and fixed graph biases while "
+                "graph routes are enabled; provide one graph prior source"
             )
-        bias = build_token_attention_bias(
-            graph_batch,
-            batch_size=int(input_ids.shape[0]),
-            seq_length=int(input_ids.shape[1]),
-        )
+        else:
+            relation_bias, kind_bias = build_token_graph_biases(
+                graph_batch,
+                batch_size=int(input_ids.shape[0]),
+                seq_length=int(input_ids.shape[1]),
+                document_ids=document_ids,
+            )
+            bias = relation_bias + kind_bias
+        if document_ids is not None:
+            same_document = document_ids[:, :, None] == document_ids[:, None, :]
+            bias = mx.where(same_document, bias, mx.zeros_like(bias))
         if self.config.attention_mode != "dsa":
             beta = float(self.config.graph_attention_bias_beta)
             if beta != 1.0:
@@ -656,6 +700,81 @@ class DenseCppLM(nn.Module):
                 )
             scores.append(attn.last_index_scores)
         return scores
+
+    def validate_compiled_batch(
+        self, batch: dict[str, mx.array | None]
+    ) -> None:
+        """Validate array values before ``mx.compile`` traces the train step."""
+
+        lm_batch = ensure_lm_batch(batch)
+        expected_bias_shape = (
+            int(lm_batch.inputs.shape[0]),
+            int(lm_batch.inputs.shape[1]),
+            int(lm_batch.inputs.shape[1]),
+        )
+        relation_bias = lm_batch.graph_attention_bias
+        kind_bias = lm_batch.graph_edge_kind_bias
+        if self.config.graph_routes_enabled and (
+            relation_bias is None or kind_bias is None
+        ):
+            raise ValueError(
+                "compiled DenseCppLM graph routes require graph_attention_bias "
+                "and graph_edge_kind_bias"
+            )
+        for name, bias in (
+            ("graph_attention_bias", relation_bias),
+            ("graph_edge_kind_bias", kind_bias),
+        ):
+            if bias is None:
+                continue
+            if tuple(bias.shape) != expected_bias_shape:
+                raise ValueError(
+                    f"{name} shape must be {expected_bias_shape}, got "
+                    f"{tuple(bias.shape)}"
+                )
+            if bias.dtype != mx.float32:
+                raise ValueError(f"{name} dtype must be float32, got {bias.dtype}")
+            finite = mx.all(mx.isfinite(bias))
+            mx.eval(finite)
+            if not bool(finite.item()):
+                raise ValueError(f"{name} contains non-finite values")
+
+        document_ids = lm_batch.input_document_ids
+        if document_ids is not None:
+            _validate_dense_document_ids(
+                document_ids,
+                batch_size=expected_bias_shape[0],
+                seq_length=expected_bias_shape[1],
+            )
+            if relation_bias is not None or kind_bias is not None:
+                combined = mx.zeros(expected_bias_shape, dtype=mx.float32)
+                if relation_bias is not None:
+                    combined = combined + relation_bias
+                if kind_bias is not None:
+                    combined = combined + kind_bias
+                cross_document = (
+                    document_ids[:, :, None] != document_ids[:, None, :]
+                )
+                leaks = mx.any(cross_document & (mx.abs(combined) > 0))
+                mx.eval(leaks)
+                if bool(leaks.item()):
+                    raise ValueError(
+                        "compiled graph bias contains a route that crosses "
+                        "document boundary"
+                    )
+
+        if self.config.domain_residual_scale:
+            if self.domain_embedding is None:
+                raise RuntimeError(
+                    "domain_residual_scale is enabled but domain_embedding is absent"
+                )
+            self.domain_embedding.validate_inputs(
+                domain_ids=lm_batch.domain_ids,
+                role_ids=lm_batch.role_ids,
+                confidence_ids=lm_batch.confidence_ids,
+                expected_shape=tuple(int(x) for x in lm_batch.tokens.shape),
+                require_all=self.config.require_domain_routes,
+            )
 
     def logits(
         self,
@@ -689,8 +808,10 @@ class DenseCppLM(nn.Module):
         domain_ids: mx.array | None = None,
         role_ids: mx.array | None = None,
         confidence_ids: mx.array | None = None,
+        document_ids: mx.array | None = None,
         graph_batch: GraphBatch | None = None,
         block_bias: mx.array | None = None,
+        edge_kind_bias: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         """Return ``(logits, loss)``.
 
@@ -710,6 +831,7 @@ class DenseCppLM(nn.Module):
                 input_ids,
                 graph_batch=graph_batch,
                 block_bias=block_bias,
+                edge_kind_bias=edge_kind_bias,
                 structure_ids=structure_ids,
                 dep_levels=dep_levels,
                 ast_depth_ids=ast_depth_ids,
@@ -719,6 +841,7 @@ class DenseCppLM(nn.Module):
                 domain_ids=domain_ids,
                 role_ids=role_ids,
                 confidence_ids=confidence_ids,
+                document_ids=document_ids,
             )
             loss = self._chunked_cross_entropy(
                 hidden, targets, loss_mask, self.config.ce_chunk_size
@@ -729,6 +852,7 @@ class DenseCppLM(nn.Module):
             input_ids,
             graph_batch=graph_batch,
             block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
             structure_ids=structure_ids,
             dep_levels=dep_levels,
             ast_depth_ids=ast_depth_ids,
@@ -738,6 +862,7 @@ class DenseCppLM(nn.Module):
             domain_ids=domain_ids,
             role_ids=role_ids,
             confidence_ids=confidence_ids,
+            document_ids=document_ids,
         )
         if targets is None:
             return logits, None
@@ -935,6 +1060,44 @@ def _check_side_channel(
             f"({batch_size}, {seq_length})"
         )
     return tensor
+
+
+def _validate_dense_document_ids(
+    document_ids: mx.array | None,
+    *,
+    batch_size: int,
+    seq_length: int,
+) -> mx.array | None:
+    if document_ids is None:
+        return None
+    if document_ids.ndim != 2 or tuple(document_ids.shape) != (
+        batch_size,
+        seq_length,
+    ):
+        raise ValueError(
+            "document_ids must exactly match input_ids shape "
+            f"({batch_size}, {seq_length}), got {tuple(document_ids.shape)}"
+        )
+    integer_dtypes = (
+        mx.int8,
+        mx.int16,
+        mx.int32,
+        mx.int64,
+        mx.uint8,
+        mx.uint16,
+        mx.uint32,
+        mx.uint64,
+    )
+    if document_ids.dtype not in integer_dtypes:
+        raise TypeError(
+            f"document_ids dtype must be integer, got {document_ids.dtype}"
+        )
+    if not batch_values_are_prevalidated():
+        negative = mx.any(document_ids.astype(mx.int32) < 0)
+        mx.eval(negative)
+        if bool(negative.item()):
+            raise ValueError("document_ids must be non-negative")
+    return document_ids.astype(mx.int32)
 
 
 def _check_platform_ids(

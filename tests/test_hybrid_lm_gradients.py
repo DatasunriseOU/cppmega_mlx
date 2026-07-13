@@ -16,7 +16,11 @@ from cppmega_mlx.config.model import (
     Mamba3Config,
     Nam56RModelConfig,
 )
-from cppmega_mlx.data.batch import LMTokenBatch, synthetic_token_batch
+from cppmega_mlx.data.batch import (
+    LMTokenBatch,
+    prevalidated_batch_values,
+    synthetic_token_batch,
+)
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 from cppmega_mlx.recipes.nam56r import build_hybrid_tiny_config_from_nam56r
 from cppmega_mlx.training.compiled import CompiledPretrainingStep
@@ -320,6 +324,9 @@ def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
         mask_calls.append((seq_length, dtype))
         return original(seq_length, dtype=dtype)
 
+    def fake_quant(x: mx.array) -> tuple[mx.array, mx.array]:
+        return x.astype(mx.float16), mx.ones(x.shape[:-1], dtype=mx.float32)
+
     def fake_apply(
         q_fp8: mx.array,
         q_scale: mx.array,
@@ -352,6 +359,7 @@ def test_hybrid_lm_dsa_path_c_uses_sparse_causal_sentinel(
         recording_mask,
     )
     monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+    monkeypatch.setattr(fp8_path_c, "_to_fp8_with_per_token_scale", fake_quant)
 
     model = HybridTinyLM(
         _hybrid_config(
@@ -380,6 +388,9 @@ def test_hybrid_lm_dsa_path_c_threads_document_mask_to_sparse_indices(
 
     seen_indices: list[mx.array] = []
 
+    def fake_quant(x: mx.array) -> tuple[mx.array, mx.array]:
+        return x.astype(mx.float16), mx.ones(x.shape[:-1], dtype=mx.float32)
+
     def fake_apply(
         q_fp8: mx.array,
         q_scale: mx.array,
@@ -406,6 +417,7 @@ def test_hybrid_lm_dsa_path_c_threads_document_mask_to_sparse_indices(
     monkeypatch.setenv("CPPMEGA_KERNEL_PATH__SPARSE_MLA", "path_c")
     monkeypatch.setenv("CPPMEGA_SPARSE_MLA_FP8_ROUTE", "path_c")
     monkeypatch.setattr(fp8_path_c, "sparse_mla_fp8_path_c_apply", fake_apply)
+    monkeypatch.setattr(fp8_path_c, "_to_fp8_with_per_token_scale", fake_quant)
 
     model = HybridTinyLM(
         _hybrid_config(
@@ -459,6 +471,79 @@ def test_hybrid_lm_document_ids_mask_cross_document_attention() -> None:
         )
 
 
+@pytest.mark.parametrize("symbol", ["M", "R"])
+def test_hybrid_lm_document_ids_reset_recurrent_routes(
+    symbol: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "reference")
+    mx.random.seed(462)
+    model = HybridTinyLM(_single_route_config(symbol))
+    prefix_a = mx.array([[1, 2, 3]], dtype=mx.int32)
+    prefix_b = mx.array([[7, 8, 9]], dtype=mx.int32)
+    suffix = mx.array([[4, 5]], dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 0, 1, 1]], dtype=mx.int32)
+
+    out_a = model(
+        mx.concatenate([prefix_a, suffix], axis=1),
+        document_ids=document_ids,
+    )
+    out_b = model(
+        mx.concatenate([prefix_b, suffix], axis=1),
+        document_ids=document_ids,
+    )
+    mx.eval(out_a, out_b)
+
+    np.testing.assert_allclose(
+        np.asarray(out_a[:, 3:, :]),
+        np.asarray(out_b[:, 3:, :]),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    unsegmented = model(mx.concatenate([prefix_b, suffix], axis=1))
+    mx.eval(unsegmented)
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(out_a[:, 3:, :]),
+            np.asarray(unsegmented[:, 3:, :]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("symbol", ["M", "R"])
+def test_compiled_hybrid_recurrent_document_reset_is_array_only(
+    symbol: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_KERNEL_PATH", "reference")
+    mx.random.seed(464)
+    model = HybridTinyLM(_single_route_config(symbol))
+    document_ids = mx.array([[0, 0, 0, 1, 1]], dtype=mx.int32)
+    suffix = mx.array([[4, 5]], dtype=mx.int32)
+    left = mx.concatenate(
+        [mx.array([[1, 2, 3]], dtype=mx.int32), suffix], axis=1
+    )
+    right = mx.concatenate(
+        [mx.array([[7, 8, 9]], dtype=mx.int32), suffix], axis=1
+    )
+    compiled_forward = mx.compile(
+        lambda input_ids, docs: model(input_ids, document_ids=docs)
+    )
+
+    with prevalidated_batch_values():
+        left_out = compiled_forward(left, document_ids)
+        right_out = compiled_forward(right, document_ids)
+    mx.eval(left_out, right_out)
+
+    np.testing.assert_allclose(
+        np.asarray(left_out[:, 3:, :]),
+        np.asarray(right_out[:, 3:, :]),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_hybrid_lm_document_ids_fail_closed_on_shape_and_negative_values() -> None:
     model = HybridTinyLM(_single_route_config("A"))
     input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
@@ -491,6 +576,19 @@ def test_hybrid_lm_document_ids_fail_closed_even_without_attention_routes() -> N
         model(input_ids, document_ids=mx.array([[0, 0, 0]], dtype=mx.int32))
     with pytest.raises(ValueError, match="document_ids.*non-negative"):
         model(input_ids, document_ids=mx.array([[0, 0, -1, 1]], dtype=mx.int32))
+
+
+def test_hybrid_compiled_validator_checks_document_ids_before_trace() -> None:
+    model = HybridTinyLM(_single_route_config("M"))
+    tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="document_ids.*non-negative"):
+        model.validate_compiled_batch(
+            {
+                "tokens": tokens,
+                "document_ids": mx.array([[0, 0, -1, 1, 1]], dtype=mx.int32),
+            }
+        )
 
 
 def test_next_token_loss_accepts_document_id_aliases_and_rejects_conflicts() -> None:

@@ -46,6 +46,10 @@ from mlx.utils import tree_flatten
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.runtime.code_verifier import CodeVerifier
 from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+from cppmega_mlx.training.stage1_production import (
+    add_stage1_production_arguments,
+    run_stage1_graph_domain_production,
+)
 
 DATA_GLOB = "/Users/dave/sources/parquet/clang_semantic_4k_v10/shard_*.parquet"
 OUT_DIR = Path("/Volumes/external/sources/cppmega.mlx/outputs")
@@ -323,7 +327,25 @@ def main() -> None:
         "longer tight at 4x4096 (~29GB of 128GB), so the default 0 skips the "
         "per-step cache flush, which measured +6%% steps/s with identical peak.",
     )
+    add_stage1_production_arguments(ap)
     args = ap.parse_args()
+
+    if args.production_graph_domain_data is not None:
+        run_stage1_graph_domain_production(
+            data_path=args.production_graph_domain_data,
+            steps=args.steps,
+            batch_size=args.batch,
+            seq_len=args.seq_len,
+            hidden_size=args.hidden,
+            depth=args.depth,
+            ffn_hidden_size=args.ffn,
+            learning_rate=args.lr,
+            seed=args.seed,
+            attention_mode=args.production_attention_mode,
+            compile=not args.no_compile,
+            bf16=args.bf16,
+        )
+        return
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 

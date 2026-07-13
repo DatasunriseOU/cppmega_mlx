@@ -31,6 +31,10 @@ import pyarrow.parquet as pq
 from mlx.utils import tree_flatten
 
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
+from cppmega_mlx.training.stage1_production import (
+    add_stage1_production_arguments,
+    run_stage1_graph_domain_production,
+)
 
 DATA_GLOB = "/Users/dave/sources/parquet/clang_semantic_4k_v10/shard_*.parquet"
 
@@ -125,7 +129,24 @@ def main() -> None:
     ap.add_argument("--depth", type=int, default=24)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--seed", type=int, default=1234)
+    add_stage1_production_arguments(ap)
     args = ap.parse_args()
+
+    if args.production_graph_domain_data is not None:
+        run_stage1_graph_domain_production(
+            data_path=args.production_graph_domain_data,
+            steps=args.steps,
+            batch_size=args.batch,
+            seq_len=args.seq_len,
+            hidden_size=args.hidden,
+            depth=args.depth,
+            ffn_hidden_size=3456,
+            learning_rate=3e-4,
+            seed=args.seed,
+            attention_mode=args.production_attention_mode,
+            bf16=args.bf16,
+        )
+        return
 
     shard_paths = sorted(glob.glob(DATA_GLOB))
     if not shard_paths:

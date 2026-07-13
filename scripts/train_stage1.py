@@ -64,6 +64,10 @@ from cppmega_mlx.data.fim import FIMSpecialTokenIds
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.training.objectives import ObjectiveExample
 from cppmega_mlx.training.task_mixer import TaskKind, TaskMixer
+from cppmega_mlx.training.stage1_production import (
+    add_stage1_production_arguments,
+    run_stage1_graph_domain_production,
+)
 
 GOLDEN_MINI = _REPO_ROOT / "tests" / "fixtures" / "golden_mini"
 
@@ -645,7 +649,22 @@ def main() -> int:
         default=None,
         help="optional dir with a real clang_semantic_4k_v10 shard (one *.parquet)",
     )
+    add_stage1_production_arguments(parser)
     args = parser.parse_args()
+    if args.production_graph_domain_data is not None:
+        run_stage1_graph_domain_production(
+            data_path=args.production_graph_domain_data,
+            steps=args.steps,
+            batch_size=4,
+            seq_len=4096,
+            hidden_size=1280,
+            depth=24,
+            ffn_hidden_size=3456,
+            learning_rate=args.lr,
+            seed=args.seed,
+            attention_mode=args.production_attention_mode,
+        )
+        return 0
     extra = Path(args.extra_source) if args.extra_source else None
     run_training(
         num_steps=args.steps, seed=args.seed, lr=args.lr, extra_source=extra

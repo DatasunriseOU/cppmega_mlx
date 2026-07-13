@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import subprocess
@@ -10,8 +11,12 @@ from typing import Any
 
 import numpy as np
 import pytest
+import mlx.core as mx
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten
 from numpy.typing import DTypeLike
 
+from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
     MegatronIndexedMultiShardDataset,
@@ -20,6 +25,9 @@ from cppmega_mlx.data.megatron_indexed import (
     open_megatron_indexed_dataset,
 )
 from cppmega_mlx.data.token_dataset import open_token_dataset
+from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
+from cppmega_mlx.training.compiled import CompiledPretrainingStep
+from cppmega_mlx.training.compiled import normalize_compiled_batch
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_HYBRID_TINY = ROOT / "scripts" / "train_hybrid_tiny.py"
@@ -30,6 +38,8 @@ STRUCTURE_MODEL_KWARG_KEYS = (
     "sibling_index_ids",
     "node_type_ids",
 )
+CONTRACT_SUBPROCESS_TIMEOUT_SECONDS = 60
+BACKEND_SMOKE_TIMEOUT_SECONDS = 180
 
 _HEADER = b"MMIDIDX\x00\x00"
 _DTYPE_CODES = {
@@ -255,21 +265,29 @@ def _write_structured_multishard_fixture(
     return prefixes
 
 
-def _run_train_hybrid_tiny(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_train_hybrid_tiny(
+    *args: str,
+    timeout_seconds: int,
+    kernel_path: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    # This suite validates indexed-dataset ingress, not optional kernel discovery.
-    # An explicit reference route keeps the subprocess independent of any shared
-    # TileLang/TVM development checkout configured by the parent pytest process.
-    env["CPPMEGA_KERNEL_PATH"] = "ref"
-    return subprocess.run(
-        [sys.executable, str(TRAIN_HYBRID_TINY), *args],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=45,
-        check=False,
-    )
+    if kernel_path is not None:
+        env["CPPMEGA_KERNEL_PATH"] = kernel_path
+    try:
+        return subprocess.run(
+            [sys.executable, str(TRAIN_HYBRID_TINY), *args],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            "train_hybrid_tiny subprocess timed out after "
+            f"{timeout_seconds}s; stdout={exc.stdout!r}; stderr={exc.stderr!r}"
+        ) from exc
 
 
 def _load_script_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -360,7 +378,7 @@ def test_open_megatron_indexed_dataset_is_standalone_training_ingress(tmp_path) 
     )
 
 
-def test_megatron_indexed_fixture_flows_through_token_dataset_and_train_script(
+def test_megatron_indexed_fixture_has_deterministic_training_contract(
     tmp_path,
 ) -> None:
     prefix = tmp_path / "clang_semantic_4k_v10_train"
@@ -397,6 +415,13 @@ def test_megatron_indexed_fixture_flows_through_token_dataset_and_train_script(
     np.testing.assert_array_equal(np.array(model_kwargs["sibling_index_ids"]), [[0, 1, 2]])
     np.testing.assert_array_equal(np.array(model_kwargs["node_type_ids"]), [[0, 1, 2]])
 
+
+def test_train_hybrid_tiny_reference_backend_smoke_reports_full_receipt(
+    tmp_path,
+) -> None:
+    prefix = tmp_path / "clang_semantic_4k_v10_train"
+    _write_indexed_train_smoke_fixture(prefix)
+
     result = _run_train_hybrid_tiny(
         str(prefix),
         "--json",
@@ -426,6 +451,8 @@ def test_megatron_indexed_fixture_flows_through_token_dataset_and_train_script(
         "1",
         "--mamba-chunk-size",
         "4",
+        timeout_seconds=BACKEND_SMOKE_TIMEOUT_SECONDS,
+        kernel_path="reference",
     )
     payload = _load_script_json(result)
 
@@ -512,6 +539,7 @@ def test_train_script_megatron_format_validation_accepts_suffixless_prefix(
         "A",
         "--depth",
         "1",
+        timeout_seconds=CONTRACT_SUBPROCESS_TIMEOUT_SECONDS,
     )
     payload = _load_script_json(result)
 
@@ -546,6 +574,7 @@ def test_train_script_reports_missing_megatron_prefix_cleanly(tmp_path) -> None:
         "--json",
         "--data-format",
         "megatron",
+        timeout_seconds=CONTRACT_SUBPROCESS_TIMEOUT_SECONDS,
     )
     payload = json.loads(result.stdout)
 
@@ -756,6 +785,7 @@ def test_train_script_accepts_multishard_megatron_directory(tmp_path) -> None:
         "A",
         "--depth",
         "1",
+        timeout_seconds=CONTRACT_SUBPROCESS_TIMEOUT_SECONDS,
     )
     payload = _load_script_json(result)
 
@@ -1384,7 +1414,7 @@ def test_mmididx_v2_domain_routes_and_token_sidecars_round_trip(tmp_path) -> Non
     offsets_path = tmp_path / "domain_offsets.bin"
     data_path = tmp_path / "domain_data.bin"
     np.array([0, 1, 2], dtype=np.int64).tofile(offsets_path)
-    np.array([[0, 3, 20], [1, 2, 21]], dtype=np.int32).tofile(data_path)
+    np.array([[1, 0, 60], [1, 2, 21]], dtype=np.int32).tofile(data_path)
     graph_paths["token_domain_edges"] = {
         "kind": "edge_triples",
         "offsets_path": offsets_path.name,
@@ -1446,8 +1476,71 @@ def test_mmididx_v2_domain_routes_and_token_sidecars_round_trip(tmp_path) -> Non
     temporal = batch.side_channel_map()["temporal_diff"]
     np.testing.assert_array_equal(np.array(temporal["hunk_ids"]), [[-1, 0, 0, -1]])
     assert packet.graph.edge("call").to_pairs() == [(0, 1)]
-    assert packet.graph.edge("domain").to_pairs() == [(0, 3)]
-    np.testing.assert_array_equal(packet.edge_kinds["domain"], np.array([20], dtype=np.int32))
+    assert packet.graph.edge("domain").to_pairs() == [(1, 0)]
+    np.testing.assert_array_equal(packet.edge_kinds["domain"], np.array([60], dtype=np.int32))
+    assert batch.graph_batch is not None
+    np.testing.assert_array_equal(
+        np.asarray(batch.graph_batch.edge_kinds[0]["domain"]),
+        np.array([60], dtype=np.int32),
+    )
+    normalized = normalize_compiled_batch(batch, graph_routes_enabled=True)
+    assert float(normalized["graph_attention_bias"][0, 1, 0].item()) == 1.0
+    assert float(normalized["graph_edge_kind_bias"][0, 1, 0].item()) == 1.0
+
+    build_graph = replace(
+        batch.graph_batch,
+        edge_kinds=({"domain": mx.array([20], dtype=mx.int32)},),
+    )
+    build_batch = replace(batch, graph_batch=build_graph)
+    cfg = DenseCppLMConfig(
+        vocab_size=256,
+        hidden_size=32,
+        depth=1,
+        ffn_hidden_size=64,
+        max_seq_length=4,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        graph_routes_enabled=True,
+        graph_attention_bias_beta=1.0,
+        ngram_hash_enabled=False,
+        structure_residual_scale=0.0,
+        platform_residual_scale=0.0,
+    )
+
+    def run(current: LMTokenBatch):
+        mx.random.seed(211)
+        model = DenseCppLM(cfg)
+        optimizer = optim.SGD(learning_rate=1e-2)
+        mx.eval(model.parameters(), optimizer.state)
+        before = {
+            name: np.asarray(value).copy()
+            for name, value in tree_flatten(model.parameters())
+            if isinstance(value, mx.array)
+        }
+        fixed = normalize_compiled_batch(current, graph_routes_enabled=True)
+        logits = model.logits(
+            current.inputs,
+            block_bias=fixed["graph_attention_bias"],
+            edge_kind_bias=fixed["graph_edge_kind_bias"],
+        )
+        metrics = CompiledPretrainingStep(model, optimizer, compile=True)(current)
+        mx.eval(logits, model.parameters())
+        updates = {
+            name: np.asarray(value) - before[name]
+            for name, value in tree_flatten(model.parameters())
+            if isinstance(value, mx.array)
+        }
+        return np.asarray(logits), metrics.loss, updates
+
+    diagnostic_logits, diagnostic_loss, diagnostic_updates = run(batch)
+    build_logits, build_loss, build_updates = run(build_batch)
+    assert not np.array_equal(diagnostic_logits, build_logits)
+    assert abs(diagnostic_loss - build_loss) > 1e-6
+    assert any(
+        not np.array_equal(diagnostic_updates[name], build_updates[name])
+        for name in diagnostic_updates
+    )
 
 
 def test_mmididx_graph_sidecars_fail_closed_for_window_slicing(tmp_path) -> None:
