@@ -111,8 +111,18 @@ def _graph_to_specs(graph: GraphSpec) -> list[dict[str, Any]]:
     error; the caller should pre-resolve parallel-block emit on the
     frontend.
     """
+    # ``residual_add`` was emitted by older VBGui canvases as the wire kind
+    # for an explicit residual join.  The model/fusion contract calls that
+    # executable identity brick ``residual``; the fan-in itself is represented
+    # by graph edges.  Accept the legacy wire spelling so saved canvases remain
+    # runnable, but materialise only the canonical kind downstream.
+    kind_aliases = {"residual_add": "residual"}
     return [
-        {"kind": n.kind, "name": n.id, "params": dict(n.params)}
+        {
+            "kind": kind_aliases.get(n.kind, n.kind),
+            "name": n.id,
+            "params": dict(n.params),
+        }
         for n in graph.nodes
     ]
 
@@ -747,4 +757,3 @@ def platform_get_info(
         available_topologies=info["available_topologies"],
         available_comm_backends=info["available_comm_backends"],
     )
-

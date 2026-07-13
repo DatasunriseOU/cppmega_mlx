@@ -12,6 +12,7 @@ import pytest
 
 from cppmega_v4.jsonrpc import LRUCache
 from cppmega_v4.jsonrpc.methods import (
+    _graph_to_specs,
     _make_optim,
     build_preset_specs,
     probe_run,
@@ -48,6 +49,22 @@ def _simple_verify_params(**extra) -> VerifyParams:
     }
     payload.update(extra)
     return VerifyParams.model_validate(payload)
+
+
+def test_graph_to_specs_canonicalizes_legacy_residual_add() -> None:
+    params = _simple_verify_params(
+        graph={
+            "nodes": [
+                {"id": "branch", "kind": "mlp"},
+                {"id": "join", "kind": "residual_add"},
+            ],
+            "edges": [{"src": "branch", "dst": "join"}],
+        }
+    )
+
+    specs = _graph_to_specs(params.graph)
+
+    assert [spec["kind"] for spec in specs] == ["mlp", "residual"]
 
 
 def test_make_optim_threads_mixed_precision_flag():

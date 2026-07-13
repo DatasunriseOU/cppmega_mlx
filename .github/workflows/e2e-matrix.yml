@@ -55,6 +55,12 @@ jobs:
           echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
           echo "PYTHONPATH=" >> "$GITHUB_ENV"
           echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
+      - name: Allocate isolated E2E ports
+        run: |
+          port_base=$((22000 + (GITHUB_RUN_ID % 1000) * 20))
+          port_offset=${{ matrix.shard }}
+          echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
       - name: Python deps
         run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
@@ -122,6 +128,12 @@ jobs:
           echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
           echo "PYTHONPATH=" >> "$GITHUB_ENV"
           echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
+      - name: Allocate isolated E2E ports
+        run: |
+          port_base=$((22000 + (GITHUB_RUN_ID % 1000) * 20))
+          port_offset=8
+          echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"
@@ -183,6 +195,12 @@ jobs:
           echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
           echo "PYTHONPATH=" >> "$GITHUB_ENV"
           echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
+      - name: Allocate isolated E2E ports
+        run: |
+          port_base=$((22000 + (GITHUB_RUN_ID % 1000) * 20))
+          port_offset=9
+          echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
       - run: |
           "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
             -e ".[gui,parquet,widget]"

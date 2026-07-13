@@ -94,6 +94,17 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     assert workflow.count("native optimizer extension unavailable") == 3
 
 
+def test_macos_e2e_jobs_use_run_scoped_ports() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "e2e-matrix.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("Allocate isolated E2E ports") == 3
+    assert workflow.count("GITHUB_RUN_ID % 1000") == 3
+    assert workflow.count('echo "VBGUI_E2E_BACKEND_PORT=') == 3
+    assert workflow.count('echo "VBGUI_E2E_FRONTEND_PORT=') == 3
+
+
 def test_build_backend_declares_mlx_imported_by_setup_py() -> None:
     config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
