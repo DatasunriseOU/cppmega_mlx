@@ -58,6 +58,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     SOURCE_REPO_STABLE_IDS_COLUMN,
     SOURCE_DOC_TYPES_COLUMN,
     TARGET_IDS_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
     normalize_document_record,
     pack_documents,
@@ -265,6 +266,7 @@ def test_packed_doc_ids_do_not_collapse_same_file_documents() -> None:
     row = rows[0]
     assert row[SOURCE_DOC_INDICES_COLUMN] == [38, 41]
     assert row[DOC_IDS_COLUMN] == [1, 1, 2, 2, 2]
+    assert row[TOKEN_SOURCE_DOC_IDS_COLUMN] == [11, 11, 11, 11, 0]
     assert row[LOSS_MASK_COLUMN] == [1, 0, 1, 0, 0]
 
 
@@ -431,7 +433,7 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
                 token_chunk_dep_levels=[0, 2],
                 token_call_edges=[{"from": 1, "to": 0}],
                 token_type_edges=[{"from": 0, "to": 1}],
-                token_domain_edges=[{"from": 1, "to": 2, "kind": 21}],
+                token_domain_edges=[{"from": 1, "to": 2, "kind": 5}],
                 token_build_edges=[{"from": 1, "to": 2, "kind": 21}],
                 changed_chunk_ids=[1],
                 changed_chunk_spans=[{"start": 1, "end": 3}],
@@ -457,7 +459,7 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
     assert row[TOKEN_CHUNK_DEP_LEVELS_COLUMN] == [0, 2, 1]
     assert row[TOKEN_CALL_EDGES_COLUMN] == [{"from": 1, "to": 0}]
     assert row[TOKEN_TYPE_EDGES_COLUMN] == [{"from": 0, "to": 1}]
-    assert row[TOKEN_DOMAIN_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 21}]
+    assert row[TOKEN_DOMAIN_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 5}]
     assert row[TOKEN_BUILD_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 21}]
     assert row[CHANGED_CHUNK_IDS_COLUMN] == [1, 2]
     assert row[CHANGED_CHUNK_SPANS_COLUMN] == [

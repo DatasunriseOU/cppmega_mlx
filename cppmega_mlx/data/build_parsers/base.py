@@ -11,6 +11,8 @@ from cppmega_mlx.data.domain_schema import (
     DomainKind,
     DomainRoleKind,
     ParseConfidence,
+    domain_edge_family,
+    validate_domain_edge_kind,
 )
 
 
@@ -33,12 +35,16 @@ class LexedToken:
 @dataclass
 class ParsedDomainDocument:
     domain: DomainKind
+    text: str
     tokens: list[LexedToken]
+    domain_ids: list[int]
     role_ids: list[int]
     entity_ids: list[int]
     scope_ids: list[int]
+    source_doc_ids: list[int]
     confidence_ids: list[int]
     edges: list[tuple[int, int, int]] = field(default_factory=list)
+    embedded_blocks: list[Any] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -48,19 +54,36 @@ class ParsedDomainDocument:
         domain: DomainKind,
         text: str,
         confidence: ParseConfidence = ParseConfidence.HEURISTIC,
+        source_doc_id: int = 0,
         metadata: dict[str, Any] | None = None,
     ) -> "ParsedDomainDocument":
         tokens = lex_text(text)
         n = len(tokens)
         return cls(
             domain=domain,
+            text=text,
             tokens=tokens,
+            domain_ids=[int(domain)] * n,
             role_ids=[int(DomainRoleKind.NONE)] * n,
             entity_ids=[0] * n,
             scope_ids=[0] * n,
+            source_doc_ids=[int(source_doc_id)] * n,
             confidence_ids=[int(confidence)] * n,
-            metadata=metadata or {},
+            metadata=dict(metadata or {}),
         )
+
+    def mark_raw(self, reason: str) -> "ParsedDomainDocument":
+        """Keep the text/domain but explicitly mark unsupported syntax."""
+
+        self.confidence_ids = [int(ParseConfidence.RAW)] * len(self.tokens)
+        self.metadata["unsupported_syntax"] = reason
+        self.metadata["raw_reason"] = reason
+        return self
+
+    def set_source_doc_id(self, source_doc_id: int) -> None:
+        if int(source_doc_id) < 0:
+            raise ValueError("source_doc_id must be non-negative")
+        self.source_doc_ids = [int(source_doc_id)] * len(self.tokens)
 
     def set_role(
         self,
@@ -89,10 +112,179 @@ class ParsedDomainDocument:
     ) -> None:
         if not (0 <= src < len(self.tokens)) or not (0 <= dst < len(self.tokens)):
             raise IndexError(f"edge endpoint out of range: {src}->{dst}")
-        self.edges.append((int(src), int(dst), int(kind)))
+        edge_kind = validate_domain_edge_kind(kind)
+        self.edges.append((int(src), int(dst), int(edge_kind)))
 
     def token_indices_on_line(self, line_no: int) -> list[int]:
         return [idx for idx, token in enumerate(self.tokens) if token.line == line_no]
+
+    def validate(self) -> None:
+        expected = len(self.tokens)
+        vectors = {
+            "domain_ids": self.domain_ids,
+            "role_ids": self.role_ids,
+            "entity_ids": self.entity_ids,
+            "scope_ids": self.scope_ids,
+            "source_doc_ids": self.source_doc_ids,
+            "confidence_ids": self.confidence_ids,
+        }
+        for name, values in vectors.items():
+            if len(values) != expected:
+                raise ValueError(
+                    f"ParsedDomainDocument.{name}: length {len(values)} != "
+                    f"token count {expected}"
+                )
+        for value in self.domain_ids:
+            DomainKind(int(value))
+        for value in self.role_ids:
+            DomainRoleKind(int(value))
+        for value in self.confidence_ids:
+            ParseConfidence(int(value))
+        for name in ("entity_ids", "scope_ids", "source_doc_ids"):
+            if any(int(value) < 0 for value in vectors[name]):
+                raise ValueError(f"ParsedDomainDocument.{name} must be non-negative")
+        for src, dst, kind in self.edges:
+            if not (0 <= int(src) < expected and 0 <= int(dst) < expected):
+                raise ValueError(f"edge endpoint out of range: {src}->{dst}")
+            validate_domain_edge_kind(kind)
+
+    def to_enriched_document(self) -> dict[str, Any]:
+        """Project token parser output onto character-aligned ingestion sidecars."""
+
+        self.validate()
+        text_len = len(self.text)
+        default_confidence = (
+            min(self.confidence_ids)
+            if self.confidence_ids
+            else int(ParseConfidence.ABSENT)
+        )
+        default_source = self.source_doc_ids[0] if self.source_doc_ids else 0
+        result: dict[str, Any] = {
+            "text": self.text,
+            "domain_kind": int(self.domain),
+            "domain_ids": [int(self.domain)] * text_len,
+            "domain_role_ids": [int(DomainRoleKind.NONE)] * text_len,
+            "domain_entity_ids": [0] * text_len,
+            "domain_scope_ids": [0] * text_len,
+            "domain_source_doc_ids": [int(default_source)] * text_len,
+            "domain_confidence_ids": [int(default_confidence)] * text_len,
+            "domain_edges": [],
+            "build_edges": [],
+            "shell_edges": [],
+            "diagnostic_edges": [],
+            "cross_domain_edges": [],
+            "embedded_domain_spans": [],
+            "domain_parse_info": {
+                key: value
+                for key, value in self.metadata.items()
+                if not key.startswith("_")
+            },
+        }
+
+        def apply_token(
+            token: LexedToken,
+            *,
+            domain_id: int,
+            role_id: int,
+            entity_id: int,
+            scope_id: int,
+            source_doc_id: int,
+            confidence_id: int,
+            offset: int = 0,
+        ) -> None:
+            start = max(0, min(offset + int(token.start), text_len))
+            end = max(start, min(offset + int(token.end), text_len))
+            for char_idx in range(start, end):
+                result["domain_ids"][char_idx] = int(domain_id)
+                result["domain_role_ids"][char_idx] = int(role_id)
+                result["domain_entity_ids"][char_idx] = int(entity_id)
+                result["domain_scope_ids"][char_idx] = int(scope_id)
+                result["domain_source_doc_ids"][char_idx] = int(source_doc_id)
+                result["domain_confidence_ids"][char_idx] = int(confidence_id)
+
+        for idx, token in enumerate(self.tokens):
+            apply_token(
+                token,
+                domain_id=self.domain_ids[idx],
+                role_id=self.role_ids[idx],
+                entity_id=self.entity_ids[idx],
+                scope_id=self.scope_ids[idx],
+                source_doc_id=self.source_doc_ids[idx],
+                confidence_id=self.confidence_ids[idx],
+            )
+
+        edge_columns = {
+            "domain": "domain_edges",
+            "build": "build_edges",
+            "shell": "shell_edges",
+            "diagnostic": "diagnostic_edges",
+            "cross_domain": "cross_domain_edges",
+        }
+
+        def append_token_edges(
+            parsed: "ParsedDomainDocument",
+            *,
+            offset: int = 0,
+        ) -> None:
+            for src, dst, kind in parsed.edges:
+                family = domain_edge_family(kind)
+                result[edge_columns[family]].append(
+                    {
+                        "from_char": offset + int(parsed.tokens[src].start),
+                        "to_char": offset + int(parsed.tokens[dst].start),
+                        "kind": int(kind),
+                    }
+                )
+
+        append_token_edges(self)
+        for block in self.embedded_blocks:
+            parsed = block.parsed
+            parsed.validate()
+            block_start = max(0, min(int(block.start), text_len))
+            block_end = max(block_start, min(int(block.end), text_len))
+            block_confidence = (
+                min(parsed.confidence_ids)
+                if parsed.confidence_ids
+                else int(ParseConfidence.ABSENT)
+            )
+            block_source = parsed.source_doc_ids[0] if parsed.source_doc_ids else default_source
+            for char_idx in range(block_start, block_end):
+                result["domain_ids"][char_idx] = int(parsed.domain)
+                result["domain_source_doc_ids"][char_idx] = int(block_source)
+                result["domain_confidence_ids"][char_idx] = int(block_confidence)
+            for idx, token in enumerate(parsed.tokens):
+                apply_token(
+                    token,
+                    domain_id=parsed.domain_ids[idx],
+                    role_id=parsed.role_ids[idx],
+                    entity_id=parsed.entity_ids[idx],
+                    scope_id=parsed.scope_ids[idx],
+                    source_doc_id=parsed.source_doc_ids[idx],
+                    confidence_id=parsed.confidence_ids[idx],
+                    offset=int(block.start),
+                )
+            append_token_edges(parsed, offset=int(block.start))
+            result["embedded_domain_spans"].append(
+                {
+                    "start": int(block.start),
+                    "end": int(block.end),
+                    "domain_kind": int(block.domain),
+                }
+            )
+            src, dst, kind = block.cross_domain_edge
+            validate_domain_edge_kind(kind, family="cross_domain")
+            result["cross_domain_edges"].append(
+                {"from_char": int(src), "to_char": int(dst), "kind": int(kind)}
+            )
+
+        result["domain_parse_info"].update(
+            {
+                "tokens": len(self.tokens),
+                "edges": sum(len(result[column]) for column in edge_columns.values()),
+                "confidence": int(default_confidence),
+            }
+        )
+        return result
 
     def to_packet(self, token_ids: list[int] | None = None) -> DomainPacket:
         import mlx.core as mx
@@ -100,6 +292,7 @@ class ParsedDomainDocument:
 
         from cppmega_mlx.data.domain_packet import DomainEdgeIndex, DomainPacket
 
+        self.validate()
         if token_ids is None:
             token_ids = [debug_token_id(token.text) for token in self.tokens]
             metadata = dict(self.metadata)
@@ -110,15 +303,14 @@ class ParsedDomainDocument:
             raise ValueError(
                 f"token_ids length {len(token_ids)} != parsed token count {len(self.tokens)}"
             )
-        n = len(token_ids)
         return DomainPacket(
             token_ids=mx.array(np.asarray(token_ids, dtype=np.int32)),
             domain=self.domain,
-            domain_ids=mx.array(np.full((n,), int(self.domain), dtype=np.int32)),
+            domain_ids=mx.array(np.asarray(self.domain_ids, dtype=np.int32)),
             role_ids=mx.array(np.asarray(self.role_ids, dtype=np.int32)),
             entity_ids=mx.array(np.asarray(self.entity_ids, dtype=np.int32)),
             scope_ids=mx.array(np.asarray(self.scope_ids, dtype=np.int32)),
-            source_doc_ids=mx.array(np.zeros((n,), dtype=np.int32)),
+            source_doc_ids=mx.array(np.asarray(self.source_doc_ids, dtype=np.int32)),
             confidence_ids=mx.array(np.asarray(self.confidence_ids, dtype=np.int32)),
             graph_edges=DomainEdgeIndex.from_triples(self.edges),
             metadata=metadata,

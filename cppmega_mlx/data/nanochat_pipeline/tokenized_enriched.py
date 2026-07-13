@@ -13,6 +13,8 @@ from cppmega_mlx.data.domain_schema import (
     DomainRoleKind,
     ParseConfidence,
     delimiter_token_ids,
+    domain_edge_family,
+    normalize_domain_edge_record,
 )
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
@@ -94,24 +96,23 @@ def _normalize_graph_edge_pairs(raw_edges: Any) -> list[tuple[int, int]]:
     return pairs
 
 
-def _normalize_graph_edge_triples(raw_edges: Any) -> list[tuple[int, int, int]]:
+def _normalize_graph_edge_triples(
+    raw_edges: Any,
+    *,
+    family: str | None = None,
+) -> list[tuple[int, int, int]]:
     triples: list[tuple[int, int, int]] = []
     for edge in raw_edges or []:
-        if isinstance(edge, dict):
-            if "from_char" in edge and "to_char" in edge:
-                src = edge["from_char"]
-                dst = edge["to_char"]
-            elif "from" in edge and "to" in edge:
-                src = edge["from"]
-                dst = edge["to"]
-            elif "src" in edge and "dst" in edge:
-                src = edge["src"]
-                dst = edge["dst"]
+        edge_family = family
+        if family is None:
+            if isinstance(edge, dict) and "kind" in edge:
+                edge_family = domain_edge_family(int(edge["kind"]))
+            elif hasattr(edge, "__len__") and len(edge) == 3:
+                edge_family = domain_edge_family(int(edge[2]))
             else:
-                continue
-            triples.append((int(src), int(dst), int(edge.get("kind", 0))))
-        elif isinstance(edge, (list, tuple)) and len(edge) >= 3:
-            triples.append((int(edge[0]), int(edge[1]), int(edge[2])))
+                raise ValueError("domain edge missing src/dst/kind")
+        assert edge_family is not None
+        triples.append(normalize_domain_edge_record(edge, family=edge_family))
     return triples
 
 
@@ -387,13 +388,20 @@ def _char_position_to_token_index(
 def _remap_char_edge_triples_to_tokens(
     raw_edges: Any,
     token_spans: list[tuple[int, int]],
+    *,
+    family: str | None = None,
 ) -> list[dict[str, int]]:
     remapped: list[dict[str, int]] = []
-    for src_char, dst_char, kind in _normalize_graph_edge_triples(raw_edges):
+    for src_char, dst_char, kind in _normalize_graph_edge_triples(
+        raw_edges,
+        family=family,
+    ):
         src = _char_position_to_token_index(token_spans, src_char)
         dst = _char_position_to_token_index(token_spans, dst_char)
         if src is None or dst is None:
-            continue
+            raise ValueError(
+                f"domain edge {src_char}->{dst_char} could not be mapped to token spans"
+            )
         remapped.append({"from": int(src), "to": int(dst), "kind": int(kind)})
     return remapped
 
@@ -461,71 +469,64 @@ def _tokenize_optional_char_field(
 
 def _domain_kind_from_doc(doc: dict[str, Any]) -> DomainKind | None:
     raw = doc.get("domain_kind")
-    if raw in (None, "", 0, "0"):
+    if raw in (None, ""):
         return None
     try:
         if isinstance(raw, str) and not raw.isdigit():
-            return DomainKind[raw.upper()]
-        return DomainKind(int(raw))
-    except (KeyError, TypeError, ValueError):
-        return None
+            domain = DomainKind[raw.upper()]
+        else:
+            domain = DomainKind(int(raw))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"unknown domain_kind {raw!r}") from exc
+    if domain == DomainKind.UNKNOWN:
+        raise ValueError("unknown domain_kind 0 disables delimiter insertion")
+    return domain
 
 
-def _shift_token_span_values(values: list[int], *, insert_at: int) -> list[int]:
-    return [int(value) + 1 if int(value) >= insert_at else int(value) for value in values]
+def _shift_index_for_pair(value: int, *, start_at: int, end_at: int) -> int:
+    value_i = int(value)
+    return value_i + int(value_i >= start_at) + int(value_i >= end_at)
 
 
-def _shift_token_edge_triples(
-    edges: list[dict[str, int]],
-    *,
-    insert_at: int,
-) -> list[dict[str, int]]:
-    shifted: list[dict[str, int]] = []
-    for edge in edges:
-        src = int(edge["from"])
-        dst = int(edge["to"])
-        shifted.append(
-            {
-                "from": src + 1 if src >= insert_at else src,
-                "to": dst + 1 if dst >= insert_at else dst,
-                "kind": int(edge.get("kind", 0)),
-            }
-        )
-    return shifted
-
-
-def _insert_domain_delimiters(
+def _insert_domain_delimiter_pair(
     row: dict[str, Any],
     *,
     domain: DomainKind,
-    insert_at: int = 1,
+    start_at: int,
+    end_at: int,
 ) -> None:
-    if DomainKind(domain) == DomainKind.UNKNOWN:
-        return
+    domain = DomainKind(domain)
+    if domain == DomainKind.UNKNOWN:
+        raise ValueError("UNKNOWN domain cannot be inserted without delimiters")
     try:
         start_id, end_id = delimiter_token_ids(domain)
     except KeyError as exc:
         raise ValueError(f"missing delimiter token contract for domain {domain!r}") from exc
-    token_ids = list(row[TOKEN_IDS_COLUMN])
-    if insert_at > len(token_ids):
-        insert_at = len(token_ids)
-    row[TOKEN_IDS_COLUMN] = token_ids[:insert_at] + [int(start_id)] + token_ids[insert_at:] + [int(end_id)]
 
+    token_ids = list(row[TOKEN_IDS_COLUMN])
     token_count_before = len(token_ids)
-    token_count_after = token_count_before + 2
+    start_at = max(0, min(int(start_at), token_count_before))
+    end_at = max(start_at, min(int(end_at), token_count_before))
+    row[TOKEN_IDS_COLUMN] = (
+        token_ids[:start_at]
+        + [int(start_id)]
+        + token_ids[start_at:end_at]
+        + [int(end_id)]
+        + token_ids[end_at:]
+    )
+
     domain_value = int(domain)
     delimiter_role = int(DomainRoleKind.DELIMITER)
     exact_confidence = int(ParseConfidence.EXACT)
-
     dense_defaults = {
-        TOKEN_DOMAIN_IDS_COLUMN: domain_value,
-        TOKEN_ROLE_IDS_COLUMN: delimiter_role,
-        TOKEN_ENTITY_IDS_COLUMN: 0,
-        TOKEN_SCOPE_IDS_COLUMN: 0,
-        TOKEN_SOURCE_DOC_IDS_COLUMN: 0,
-        TOKEN_CONFIDENCE_IDS_COLUMN: exact_confidence,
+        TOKEN_DOMAIN_IDS_COLUMN: (domain_value, domain_value),
+        TOKEN_ROLE_IDS_COLUMN: (delimiter_role, delimiter_role),
+        TOKEN_ENTITY_IDS_COLUMN: (0, 0),
+        TOKEN_SCOPE_IDS_COLUMN: (0, 0),
+        TOKEN_SOURCE_DOC_IDS_COLUMN: (0, 0),
+        TOKEN_CONFIDENCE_IDS_COLUMN: (exact_confidence, exact_confidence),
     }
-    for column, delimiter_value in dense_defaults.items():
+    for column, marker_values in dense_defaults.items():
         values = list(row.get(column, []))
         if not values:
             values = [0] * token_count_before
@@ -533,11 +534,18 @@ def _insert_domain_delimiters(
             raise ValueError(
                 f"{column} length {len(values)} does not match token count {token_count_before}"
             )
+        start_marker, end_marker = marker_values
+        if column == TOKEN_SOURCE_DOC_IDS_COLUMN and values:
+            start_source_idx = min(start_at, token_count_before - 1)
+            end_source_idx = max(0, min(end_at - 1, token_count_before - 1))
+            start_marker = int(values[start_source_idx])
+            end_marker = int(values[end_source_idx])
         row[column] = (
-            values[:insert_at]
-            + [int(delimiter_value)]
-            + values[insert_at:]
-            + [int(delimiter_value)]
+            values[:start_at]
+            + [int(start_marker)]
+            + values[start_at:end_at]
+            + [int(end_marker)]
+            + values[end_at:]
         )
 
     for column in (
@@ -563,10 +571,19 @@ def _insert_domain_delimiters(
                 f"{column} length {len(values)} does not match token count {token_count_before}"
             )
         pad_value = -1 if column == HUNK_ID_PER_TOKEN_COLUMN else 0
-        row[column] = values[:insert_at] + [pad_value] + values[insert_at:] + [pad_value]
+        row[column] = (
+            values[:start_at]
+            + [pad_value]
+            + values[start_at:end_at]
+            + [pad_value]
+            + values[end_at:]
+        )
 
     for column in (TOKEN_CHUNK_STARTS_COLUMN, TOKEN_CHUNK_ENDS_COLUMN):
-        row[column] = _shift_token_span_values(list(row.get(column, [])), insert_at=insert_at)
+        row[column] = [
+            _shift_index_for_pair(value, start_at=start_at, end_at=end_at)
+            for value in row.get(column, [])
+        ]
 
     for column in (
         TOKEN_DOMAIN_EDGES_COLUMN,
@@ -575,13 +592,82 @@ def _insert_domain_delimiters(
         TOKEN_DIAGNOSTIC_EDGES_COLUMN,
         TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     ):
-        row[column] = _shift_token_edge_triples(
-            list(row.get(column, [])),
-            insert_at=insert_at,
-        )
+        shifted: list[dict[str, int]] = []
+        for edge in row.get(column, []):
+            shifted.append(
+                {
+                    "from": _shift_index_for_pair(
+                        int(edge["from"]), start_at=start_at, end_at=end_at
+                    ),
+                    "to": _shift_index_for_pair(
+                        int(edge["to"]), start_at=start_at, end_at=end_at
+                    ),
+                    "kind": int(edge["kind"]),
+                }
+            )
+        row[column] = shifted
 
-    if len(row[TOKEN_IDS_COLUMN]) != token_count_after:
+    if len(row[TOKEN_IDS_COLUMN]) != token_count_before + 2:
         raise AssertionError("domain delimiter insertion corrupted token length")
+
+
+def _insert_domain_delimiters(
+    row: dict[str, Any],
+    *,
+    domain: DomainKind,
+    insert_at: int = 1,
+) -> None:
+    _insert_domain_delimiter_pair(
+        row,
+        domain=domain,
+        start_at=insert_at,
+        end_at=len(row[TOKEN_IDS_COLUMN]),
+    )
+
+
+def _insert_embedded_domain_delimiters(
+    row: dict[str, Any],
+    *,
+    doc: dict[str, Any],
+    token_spans: list[tuple[int, int]],
+) -> None:
+    resolved: list[tuple[int, int, DomainKind]] = []
+    previous_start = len(doc.get("text", "")) + 1
+    for span in sorted(
+        doc.get("embedded_domain_spans", []) or [],
+        key=lambda item: int(item["start"]),
+        reverse=True,
+    ):
+        if not isinstance(span, dict) or not {"start", "end", "domain_kind"} <= set(span):
+            raise ValueError("embedded domain span requires start/end/domain_kind")
+        start_char = int(span["start"])
+        end_char = int(span["end"])
+        if start_char < 0 or end_char <= start_char or end_char > len(doc.get("text", "")):
+            raise ValueError(f"invalid embedded domain span {start_char}:{end_char}")
+        if end_char > previous_start:
+            raise ValueError("overlapping embedded domain spans are unsupported")
+        previous_start = start_char
+        try:
+            domain = DomainKind(int(span["domain_kind"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unknown embedded domain_kind {span['domain_kind']!r}") from exc
+        if domain == DomainKind.UNKNOWN:
+            raise ValueError("embedded UNKNOWN domain disables delimiter insertion")
+        start_token = _char_position_to_token_index(token_spans, start_char)
+        end_token_inclusive = _char_position_to_token_index(token_spans, end_char - 1)
+        if start_token is None or end_token_inclusive is None:
+            raise ValueError(
+                f"embedded domain span {start_char}:{end_char} could not be mapped to token spans"
+            )
+        resolved.append((start_token, end_token_inclusive + 1, domain))
+
+    for start_token, end_token, domain in resolved:
+        _insert_domain_delimiter_pair(
+            row,
+            domain=domain,
+            start_at=start_token,
+            end_at=end_token,
+        )
 
 
 def _changed_chunk_metadata(
@@ -796,22 +882,27 @@ def materialize_tokenized_enriched_batch(
             TOKEN_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("domain_edges", []),
                 token_spans,
+                family="domain",
             ),
             TOKEN_BUILD_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("build_edges", []),
                 token_spans,
+                family="build",
             ),
             TOKEN_SHELL_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("shell_edges", []),
                 token_spans,
+                family="shell",
             ),
             TOKEN_DIAGNOSTIC_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("diagnostic_edges", []),
                 token_spans,
+                family="diagnostic",
             ),
             TOKEN_CROSS_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
                 doc.get("cross_domain_edges", []),
                 token_spans,
+                family="cross_domain",
             ),
             TOKEN_CHANGE_MASK_PRE_COLUMN: token_change_mask_pre,
             TOKEN_CHANGE_MASK_POST_COLUMN: token_change_mask_post,
@@ -823,6 +914,7 @@ def materialize_tokenized_enriched_batch(
             },
         }
         row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
+        _insert_embedded_domain_delimiters(row, doc=doc, token_spans=token_spans)
         domain = _domain_kind_from_doc(doc)
         if domain is not None:
             _insert_domain_delimiters(row, domain=domain)

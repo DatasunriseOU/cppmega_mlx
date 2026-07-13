@@ -33,7 +33,7 @@ def parse_cmake(text: str) -> ParsedDomainDocument:
         domain=DomainKind.CMAKE,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"build_kind": "cmake"},
+        metadata={"build_kind": "cmake", "parser_adapter": "cmake"},
     )
     next_entity = 1
     last_target_by_line: dict[int, int] = {}

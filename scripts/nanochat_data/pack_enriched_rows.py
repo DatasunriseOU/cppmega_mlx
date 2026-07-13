@@ -24,6 +24,7 @@ import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_v4.data.doc_id_assignment import stable_doc_signature
+from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
@@ -136,7 +137,7 @@ PACKED_ROW_MACRO_ROUTES_VERSION = "full_macro_concept_routes_v1"
 REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
-_STATIC_DOC_TYPES = {"code", "code_header", "build"}
+_STATIC_DOC_TYPES = {"code", "code_header", "build", "shell"}
 DEFAULT_PACK_TOKEN_WINDOW = 1024 * 1024
 
 
@@ -631,17 +632,14 @@ def _normalize_edge_list(value: Any) -> list[dict[str, int]]:
     return edges
 
 
-def _normalize_edge_triples(value: Any) -> list[dict[str, int]]:
+def _normalize_edge_triples(
+    value: Any,
+    *,
+    family: str,
+) -> list[dict[str, int]]:
     edges: list[dict[str, int]] = []
     for item in value or []:
-        if isinstance(item, dict):
-            src = int(item.get("from", item.get("src", 0)))
-            dst = int(item.get("to", item.get("dst", 0)))
-            kind = int(item.get("kind", 0))
-        else:
-            src = int(item[0])
-            dst = int(item[1])
-            kind = int(item[2])
+        src, dst, kind = normalize_domain_edge_record(item, family=family)
         edges.append({"from": src, "to": dst, "kind": kind})
     return edges
 
@@ -887,7 +885,11 @@ def _normalize_domain_graph_meta(
         TOKEN_DIAGNOSTIC_EDGES_COLUMN,
         TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     )
-    normalized = tuple(_normalize_edge_triples(record.get(column)) for column in columns)
+    families = ("domain", "build", "shell", "diagnostic", "cross_domain")
+    normalized = tuple(
+        _normalize_edge_triples(record.get(column), family=family)
+        for column, family in zip(columns, families)
+    )
     for column, edges in zip(columns, normalized):
         _validate_token_edge_triples(
             source_doc_index=source_doc_index,

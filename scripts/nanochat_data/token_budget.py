@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Protocol
 
+from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
 from cppmega_mlx.tokenizer.cpp_tokenizer import CppMegaTokenizer, load_cppmega_tokenizer
 from cppmega_mlx.tokenizer.fingerprint import (
     tokenizer_fingerprint as _tokenizer_fingerprint,
@@ -14,6 +15,15 @@ from cppmega_mlx.tokenizer.fingerprint import (
 
 class TokenCounter(Protocol):
     def encode(self, text: str) -> list[int]: ...
+
+
+_DOMAIN_EDGE_FIELD_FAMILIES = {
+    "domain_edges": "domain",
+    "build_edges": "build",
+    "shell_edges": "shell",
+    "diagnostic_edges": "diagnostic",
+    "cross_domain_edges": "cross_domain",
+}
 
 
 def resolve_tokenizer_path(tokenizer_path: str | None = None) -> str:
@@ -213,31 +223,31 @@ def _slice_doc_char_range(
     sliced["call_edges"] = _remap_edges(doc.get("call_edges", []))
     sliced["type_edges"] = _remap_edges(doc.get("type_edges", []))
 
-    def _remap_char_edge_triples(raw_edges: Any) -> list[dict[str, int]]:
+    def _remap_char_edge_triples(
+        raw_edges: Any,
+        *,
+        family: str,
+    ) -> list[dict[str, int]]:
         remapped: list[dict[str, int]] = []
-        for edge in raw_edges or []:
-            if not isinstance(edge, dict):
-                continue
-            src = int(edge.get("from_char", edge.get("from", -1)))
-            dst = int(edge.get("to_char", edge.get("to", -1)))
+        for src, dst, kind in (
+            normalize_domain_edge_record(edge, family=family)
+            for edge in raw_edges or []
+        ):
             if start_char <= src < end_char and start_char <= dst < end_char:
                 remapped.append(
                     {
                         "from_char": src - start_char,
                         "to_char": dst - start_char,
-                        "kind": int(edge.get("kind", 0)),
+                        "kind": kind,
                     }
                 )
         return remapped
 
-    for edge_field in (
-        "domain_edges",
-        "build_edges",
-        "shell_edges",
-        "diagnostic_edges",
-        "cross_domain_edges",
-    ):
-        sliced[edge_field] = _remap_char_edge_triples(doc.get(edge_field, []))
+    for edge_field, family in _DOMAIN_EDGE_FIELD_FAMILIES.items():
+        sliced[edge_field] = _remap_char_edge_triples(
+            doc.get(edge_field, []),
+            family=family,
+        )
     return sliced
 
 

@@ -545,11 +545,11 @@ BUILD_NAME_KINDS: dict[str, str] = {
     "GNUmakefile": "make",
     "makefile": "make",
     # Autotools
-    "configure": "autotools",
-    "configure.ac": "autotools",
-    "configure.in": "autotools",
-    "Makefile.am": "autotools",
-    "Makefile.in": "autotools",
+    "configure": "configure",
+    "configure.ac": "autoconf",
+    "configure.in": "autoconf",
+    "Makefile.am": "automake",
+    "Makefile.in": "automake",
     # Bazel
     "BUILD": "bazel",
     "BUILD.bazel": "bazel",
@@ -573,7 +573,7 @@ BUILD_NAME_KINDS: dict[str, str] = {
 BUILD_EXT_KINDS: dict[str, str] = {
     ".cmake": "cmake",
     ".mk": "make",
-    ".m4": "autotools",
+    ".m4": "autoconf",
     ".bzl": "bazel",
     ".ninja": "ninja",
     ".vcxproj": "msvc",
@@ -582,6 +582,13 @@ BUILD_EXT_KINDS: dict[str, str] = {
 # Cap the build slice to a sane share of corpus tokens so a giant build tree can
 # never dominate the LM corpus. Applied at discovery (see find_build_files).
 BUILD_FILE_SIZE_CAP = 500_000  # bytes; mirror find_cpp_files' per-file cap
+SHELL_EXT_KINDS: dict[str, str] = {
+    ".bash": "bash",
+    ".sh": "sh",
+    ".zsh": "zsh",
+    ".csh": "tcsh",
+    ".tcsh": "tcsh",
+}
 
 # Source structure ids.  The first 0-8 values are the historical code kinds used
 # by build_enriched_doc; build/domain docs extended that with BUILD_KIND=9.  Header
@@ -2464,6 +2471,50 @@ def find_build_files(
     return files
 
 
+def _classify_shell_file(filepath: str, fname: str) -> str | None:
+    if classify_build_file(fname) is not None:
+        return None
+    extension_kind = SHELL_EXT_KINDS.get(os.path.splitext(fname)[1].lower())
+    if extension_kind is not None:
+        return extension_kind
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            first_line = fh.readline(512).lower()
+    except OSError:
+        return None
+    if not first_line.startswith("#!"):
+        return None
+    words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
+    for shell in ("tcsh", "csh", "zsh", "bash", "sh"):
+        if shell in words:
+            return "tcsh" if shell == "csh" else shell
+    return None
+
+
+def find_shell_files(
+    project_dir: str,
+    extra_exclude_dirs: set[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Find shell sources, including extensionless files with a shell shebang."""
+
+    skip_dirs = {'.git'} | (extra_exclude_dirs or set())
+    files: list[tuple[str, str]] = []
+    for root, dirs, filenames in os.walk(project_dir):
+        dirs[:] = [directory for directory in dirs if directory not in skip_dirs]
+        for fname in filenames:
+            filepath = os.path.join(root, fname)
+            shell_kind = _classify_shell_file(filepath, fname)
+            if shell_kind is None:
+                continue
+            try:
+                if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
+                    continue
+            except OSError:
+                continue
+            files.append((filepath, shell_kind))
+    return files
+
+
 def load_compile_commands(project_dir: str) -> Optional[dict]:
     """Load compile_commands.json if available."""
     cc_path = find_compile_commands_file(project_dir)
@@ -4065,19 +4116,42 @@ def _cpp_domain_sidecars(
         seen_edges.add(key)
         deduped_domain_edges.append(edge)
 
+    from cppmega_mlx.data.domain_ingestion import parse_domain_document
+
+    lexical = parse_domain_document("source.cpp", text).to_enriched_document()
+    lexical_domains = cast(list[int], lexical["domain_ids"])
+    lexical_roles = cast(list[int], lexical["domain_role_ids"])
+    lexical_entities = cast(list[int], lexical["domain_entity_ids"])
+    lexical_confidence = cast(list[int], lexical["domain_confidence_ids"])
+    for char_idx in range(text_len):
+        is_embedded = lexical_domains[char_idx] != domain
+        if is_embedded or role_ids[char_idx] == int(DomainRoleKind.NONE):
+            role_ids[char_idx] = lexical_roles[char_idx]
+        if is_embedded or entity_ids[char_idx] == 0:
+            entity_ids[char_idx] = lexical_entities[char_idx]
+
+    cross_domain_edges = cast(list[dict[str, int]], lexical["cross_domain_edges"])
+    embedded_domain_spans = cast(list[dict[str, int]], lexical["embedded_domain_spans"])
+    confidence_ids = [int(ParseConfidence.EXACT)] * text_len
+    for char_idx, lexical_domain in enumerate(lexical_domains):
+        if lexical_domain != domain:
+            confidence_ids[char_idx] = lexical_confidence[char_idx]
+
     return {
         "domain_kind": domain,
-        "domain_ids": [domain] * text_len,
+        "domain_ids": lexical_domains,
         "domain_role_ids": role_ids,
         "domain_entity_ids": entity_ids,
         "domain_scope_ids": [0] * text_len,
         "domain_source_doc_ids": [0] * text_len,
-        "domain_confidence_ids": [int(ParseConfidence.EXACT)] * text_len,
+        "domain_confidence_ids": confidence_ids,
         "domain_edges": deduped_domain_edges,
         "build_edges": [],
         "shell_edges": [],
         "diagnostic_edges": [],
-        "cross_domain_edges": [],
+        "cross_domain_edges": cross_domain_edges,
+        "embedded_domain_spans": embedded_domain_spans,
+        "domain_parse_info": lexical["domain_parse_info"],
     }
 
 
@@ -4425,33 +4499,35 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
     positions after tokenizer normalization.
     """
 
+    from cppmega_mlx.data.build_parsers.base import ParsedDomainDocument
+    from cppmega_mlx.data.domain_ingestion import parse_domain_document
     from cppmega_mlx.data.domain_schema import DomainKind, ParseConfidence
-    from cppmega_mlx.data.build_parsers import (
-        parse_autoconf,
-        parse_automake,
-        parse_bazel,
-        parse_cmake,
-        parse_make,
-        parse_ninja,
-    )
-    from cppmega_mlx.data.shell_parsers import parse_sh
 
     kind = build_kind.lower().replace("-", "_")
-    if kind in {"cmake", "cmakelists"}:
-        parsed = parse_cmake(text)
-    elif kind in {"make", "gmake", "makefile"}:
-        parsed = parse_make(text)
-    elif kind in {"automake", "makefile_am"}:
-        parsed = parse_automake(text)
-    elif kind in {"autoconf", "configure_ac", "configure_in"}:
-        parsed = parse_autoconf(text)
-    elif kind == "configure":
-        parsed = parse_sh(text)
-        parsed.metadata["build_kind"] = "configure"
-    elif kind == "ninja":
-        parsed = parse_ninja(text)
-    elif kind in {"bazel", "build_bazel", "workspace_bazel"}:
-        parsed = parse_bazel(text)
+    parser_path_by_kind = {
+        "cmake": "CMakeLists.txt",
+        "cmakelists": "CMakeLists.txt",
+        "make": "Makefile",
+        "gmake": "Makefile",
+        "makefile": "Makefile",
+        "automake": "Makefile.am",
+        "makefile_am": "Makefile.am",
+        "autoconf": "configure.ac",
+        "configure_ac": "configure.ac",
+        "configure_in": "configure.in",
+        "configure": "configure",
+        "ninja": "build.ninja",
+        "bazel": "BUILD.bazel",
+        "build_bazel": "BUILD.bazel",
+        "workspace_bazel": "WORKSPACE.bazel",
+        "bash": "script.bash",
+        "sh": "script.sh",
+        "zsh": "script.zsh",
+        "tcsh": "script.tcsh",
+    }
+    parser_path = parser_path_by_kind.get(kind)
+    if parser_path is not None:
+        parsed = parse_domain_document(parser_path, text)
     else:
         raw_domain_by_kind = {
             "meson": DomainKind.MESON,
@@ -4461,88 +4537,27 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
             "compile_commands": DomainKind.COMPILE_COMMANDS,
         }
         domain = raw_domain_by_kind.get(kind, DomainKind.BUILD_DIAGNOSTIC)
-        text_len = len(text)
-        return {
-            "domain_kind": int(domain),
-            "domain_ids": [int(domain)] * text_len,
-            "domain_role_ids": [0] * text_len,
-            "domain_entity_ids": [0] * text_len,
-            "domain_scope_ids": [0] * text_len,
-            "domain_source_doc_ids": [0] * text_len,
-            "domain_confidence_ids": [int(ParseConfidence.RAW)] * text_len,
-            "domain_edges": [],
-            "build_edges": [],
-            "shell_edges": [],
-            "diagnostic_edges": [],
-            "cross_domain_edges": [],
-            "domain_parse_info": {
-                "parser": "raw",
+        parsed = ParsedDomainDocument.new(
+            domain=domain,
+            text=text,
+            confidence=ParseConfidence.RAW,
+            metadata={
+                "parser_adapter": "raw-build",
                 "build_kind": build_kind,
-                "tokens": 0,
-                "edges": 0,
+                "unsupported_syntax": f"unsupported_build_domain:{build_kind}",
+                "raw_reason": f"unsupported_build_domain:{build_kind}",
             },
-        }
+        )
 
-    text_len = len(text)
-    domain_id = int(parsed.domain)
-    domain_ids = [domain_id] * text_len
-    role_ids = [0] * text_len
-    entity_ids = [0] * text_len
-    scope_ids = [0] * text_len
-    source_doc_ids = [0] * text_len
-    confidence_ids = [int(ParseConfidence.HEURISTIC)] * text_len
-    for token_index, token in enumerate(parsed.tokens):
-        start = max(0, min(int(token.start), text_len))
-        end = max(start, min(int(token.end), text_len))
-        if start == end:
-            continue
-        role = int(parsed.role_ids[token_index])
-        entity = int(parsed.entity_ids[token_index])
-        scope = int(parsed.scope_ids[token_index])
-        confidence = int(parsed.confidence_ids[token_index])
-        for char_idx in range(start, end):
-            role_ids[char_idx] = role
-            entity_ids[char_idx] = entity
-            scope_ids[char_idx] = scope
-            confidence_ids[char_idx] = confidence
-
-    edge_triples = [
+    enriched = parsed.to_enriched_document()
+    enriched["domain_parse_info"].update(
         {
-            "from_char": int(parsed.tokens[src].start),
-            "to_char": int(parsed.tokens[dst].start),
-            "kind": int(kind),
-        }
-        for src, dst, kind in parsed.edges
-        if 0 <= src < len(parsed.tokens) and 0 <= dst < len(parsed.tokens)
-    ]
-    is_shell_domain = parsed.domain in {
-        DomainKind.BASH,
-        DomainKind.ZSH,
-        DomainKind.SH,
-        DomainKind.TCSH,
-    }
-    return {
-        "domain_kind": domain_id,
-        "domain_ids": domain_ids,
-        "domain_role_ids": role_ids,
-        "domain_entity_ids": entity_ids,
-        "domain_scope_ids": scope_ids,
-        "domain_source_doc_ids": source_doc_ids,
-        "domain_confidence_ids": confidence_ids,
-        "domain_edges": edge_triples,
-        "build_edges": [] if is_shell_domain else edge_triples,
-        "shell_edges": edge_triples if is_shell_domain else [],
-        "diagnostic_edges": [],
-        "cross_domain_edges": [],
-        "domain_parse_info": {
-            "parser": parsed.metadata.get("build_kind")
-            or parsed.metadata.get("shell_kind")
-            or "build",
+            "parser": parsed.metadata.get("parser_adapter", "raw-build"),
             "build_kind": build_kind,
-            "tokens": len(parsed.tokens),
-            "edges": len(edge_triples),
-        },
-    }
+        }
+    )
+    enriched.pop("text", None)
+    return enriched
 
 
 def build_build_doc(
@@ -4590,19 +4605,22 @@ def build_build_doc(
     # knows which build system this is. detect_language_info has no build-system
     # output key, so we set primary_language directly (additive, rendered for
     # free by language_info_to_prefix as "// language: primary=<build_kind> ...").
+    is_shell_doc = build_kind in {"bash", "sh", "zsh", "tcsh"}
     language_info = {
         "primary_language": build_kind,
         "primary_standard": (build_info or {}).get("standard"),
         "primary_dialect": None,
         "embedded_languages": [],
-        "signals": [f"build_file:{build_kind}"],
-        "detector_sources": ["build_file"],
+        "signals": [
+            f"shell_file:{build_kind}" if is_shell_doc else f"build_file:{build_kind}"
+        ],
+        "detector_sources": ["shell_file" if is_shell_doc else "build_file"],
         "confidence": "high",
     }
 
     result: dict[str, object] = {
         'text': text,
-        'doc_type': 'build',
+        'doc_type': 'shell' if is_shell_doc else 'build',
         'build_kind': build_kind,
         'filepath': filepath,
         'structure_ids': structure_ids,
@@ -5886,7 +5904,8 @@ def emit_build_documents(
             continue
 
         per_file_build_info = dict(default_build_info) if default_build_info else {}
-        per_file_build_info["build_system"] = build_kind
+        if build_kind not in {"bash", "sh", "zsh", "tcsh"}:
+            per_file_build_info["build_system"] = build_kind
 
         if tok is not None:
             token_ids = tok.encode(text)
@@ -6501,6 +6520,9 @@ def process_project(
     # Discover build/compilation files (ADDITIVE; emitted as 'build' docs).
     build_files = find_build_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(build_files)} build/compilation files", file=sys.stderr)
+    shell_files = find_shell_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    print(f"  Found {len(shell_files)} project shell files", file=sys.stderr)
+    domain_files = build_files + shell_files
 
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
@@ -6677,9 +6699,9 @@ def process_project(
     # Emit build/compilation files as their own 'build' docs (ADDITIVE). Only in
     # enriched mode: build docs are dict-shaped (structure_ids/language_info/
     # platform_ids); plain-text mode would lose the build-system tag + sidecars.
-    if enriched and build_files:
+    if enriched and domain_files:
         build_docs = emit_build_documents(
-            build_files,
+            domain_files,
             default_build_info=default_build_info,
             compile_index=_compile_index,
             tokenizer_path=tokenizer_path,
@@ -6694,10 +6716,10 @@ def process_project(
         else:
             documents.extend(build_docs)
         check_memory_limit(memory_limit_gb, label="index_project")
-    elif build_files and not enriched:
+    elif domain_files and not enriched:
         print(
-            "  WARN: build files found but --enriched not set; build docs are "
-            "enriched-only and were NOT emitted",
+            "  WARN: build/shell files found but --enriched not set; domain docs "
+            "are enriched-only and were NOT emitted",
             file=sys.stderr,
         )
 

@@ -24,9 +24,6 @@ _DOMAIN_DELIMITER_BASES = (
     "NINJA",
     "BAZEL",
     "CONFIGURE",
-    "SQL",
-    "LINKER_DIAGNOSTIC",
-    "SANITIZER_OUTPUT",
     "AUTOCONF",
     "AUTOMAKE",
     "MESON",
@@ -34,6 +31,7 @@ _DOMAIN_DELIMITER_BASES = (
     "SCONS",
     "XMAKE",
     "COMPILE_COMMANDS",
+    "SQL",
     "BASH",
     "ZSH",
     "SH",
@@ -43,7 +41,9 @@ _DOMAIN_DELIMITER_BASES = (
     "COMPILER_ERROR",
     "BUILD_ERROR",
     "LINKER_ERROR",
+    "LINKER_DIAGNOSTIC",
     "TEST_OUTPUT",
+    "SANITIZER_OUTPUT",
     "TOOL_OUTPUT",
 )
 

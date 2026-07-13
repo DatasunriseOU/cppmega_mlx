@@ -40,6 +40,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     INPUT_IDS_COLUMN,
     LOSS_MASK_COLUMN,
     NUM_DOCS_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     read_tokenized_documents,
     pack_documents,
 )
@@ -1293,13 +1294,7 @@ def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
             "domain_kind": int(DomainKind.CMAKE),
             "domain_ids": [int(DomainKind.CMAKE)] * len(text),
             "domain_role_ids": role_ids,
-            "domain_edges": [
-                {
-                    "from_char": target_start,
-                    "to_char": source_start,
-                    "kind": int(DomainEdgeKind.BUILD_TARGET_SOURCE),
-                }
-            ],
+            "domain_edges": [],
             "build_edges": [
                 {
                     "from_char": target_start,

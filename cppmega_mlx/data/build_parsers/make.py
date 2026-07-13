@@ -16,7 +16,7 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
         domain=domain,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"build_kind": build_kind},
+        metadata={"build_kind": build_kind, "parser_adapter": build_kind},
     )
     next_entity = 1
     current_target: int | None = None
@@ -72,7 +72,20 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
 
 
 def parse_automake(text: str) -> ParsedDomainDocument:
-    return parse_make(text, domain=DomainKind.AUTOMAKE, build_kind="automake")
+    doc = parse_make(text, domain=DomainKind.AUTOMAKE, build_kind="automake")
+    for quote in ('"', "'"):
+        escaped = False
+        count = 0
+        for char in text:
+            if char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == quote and not escaped:
+                count += 1
+            escaped = False
+        if count % 2:
+            return doc.mark_raw("malformed_automake_syntax")
+    return doc
 
 
 __all__ = ["parse_automake", "parse_make"]

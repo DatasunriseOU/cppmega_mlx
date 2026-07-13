@@ -5,6 +5,10 @@ from cppmega_mlx.data.diagnostic_parsers.cmake import parse_build_error
 from cppmega_mlx.data.diagnostic_parsers.gcc import parse_gcc_diagnostic
 from cppmega_mlx.data.diagnostic_parsers.linker import parse_linker_error
 from cppmega_mlx.data.diagnostic_parsers.msvc import parse_msvc_diagnostic
+from cppmega_mlx.data.diagnostic_parsers.runtime import (
+    parse_sanitizer_output,
+    parse_test_output,
+)
 
 __all__ = [
     "parse_build_error",
@@ -12,4 +16,6 @@ __all__ = [
     "parse_gcc_diagnostic",
     "parse_linker_error",
     "parse_msvc_diagnostic",
+    "parse_sanitizer_output",
+    "parse_test_output",
 ]

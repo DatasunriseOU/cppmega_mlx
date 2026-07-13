@@ -37,6 +37,7 @@ if str(_REPO_ROOT) not in sys.path:
 import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
+from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
 from cppmega_mlx.data.nanochat_pipeline.language_info import language_info_to_prefix
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
@@ -115,6 +116,30 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_CHANGE_MASK_POST_COLUMN,
     TOKEN_CHANGE_MASK_PRE_COLUMN,
 )
+
+_DOMAIN_EDGE_FIELD_FAMILIES = {
+    "domain_edges": "domain",
+    "build_edges": "build",
+    "shell_edges": "shell",
+    "diagnostic_edges": "diagnostic",
+    "cross_domain_edges": "cross_domain",
+}
+
+
+def _normalize_char_domain_edges(
+    raw_edges: object,
+    *,
+    family: str,
+) -> list[dict[str, int]]:
+    return [
+        {"from_char": src, "to_char": dst, "kind": kind}
+        for src, dst, kind in (
+            normalize_domain_edge_record(edge, family=family)
+            for edge in (raw_edges or [])  # type: ignore[union-attr]
+        )
+    ]
+
+
 from scripts.nanochat_data.token_budget import (
     chunk_enriched_document,
     count_tokens,
@@ -825,46 +850,25 @@ def rows_to_table(
         domain_scope_ids_col.append(row.get("domain_scope_ids", []))
         domain_source_doc_ids_col.append(row.get("domain_source_doc_ids", []))
         domain_confidence_ids_col.append(row.get("domain_confidence_ids", []))
-        domain_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("domain_edges", [])
-        ])
-        build_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("build_edges", [])
-        ])
-        shell_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("shell_edges", [])
-        ])
-        diagnostic_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("diagnostic_edges", [])
-        ])
-        cross_domain_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("cross_domain_edges", [])
-        ])
+        domain_edges_col.append(
+            _normalize_char_domain_edges(row.get("domain_edges", []), family="domain")
+        )
+        build_edges_col.append(
+            _normalize_char_domain_edges(row.get("build_edges", []), family="build")
+        )
+        shell_edges_col.append(
+            _normalize_char_domain_edges(row.get("shell_edges", []), family="shell")
+        )
+        diagnostic_edges_col.append(
+            _normalize_char_domain_edges(
+                row.get("diagnostic_edges", []), family="diagnostic"
+            )
+        )
+        cross_domain_edges_col.append(
+            _normalize_char_domain_edges(
+                row.get("cross_domain_edges", []), family="cross_domain"
+            )
+        )
         change_mask_pre_col.append(row.get("change_mask_pre", []))
         change_mask_post_col.append(row.get("change_mask_post", []))
         hunk_id_per_char_col.append(row.get("hunk_id_per_char", []))
@@ -1464,16 +1468,22 @@ def _map_exact_kept_char(kept_indices: list[int], original_offset: int) -> int |
     return None
 
 
-def _shift_char_edge_triples(raw_edges: list, header_len: int) -> list[dict]:
+def _shift_char_edge_triples(
+    raw_edges: list,
+    header_len: int,
+    *,
+    family: str,
+) -> list[dict]:
     shifted = []
-    for edge in raw_edges or []:
-        if not isinstance(edge, dict):
-            continue
+    for src, dst, kind in (
+        normalize_domain_edge_record(edge, family=family)
+        for edge in raw_edges or []
+    ):
         shifted.append(
             {
-                "from_char": int(edge.get("from_char", edge.get("from", 0))) + header_len,
-                "to_char": int(edge.get("to_char", edge.get("to", 0))) + header_len,
-                "kind": int(edge.get("kind", 0)),
+                "from_char": src + header_len,
+                "to_char": dst + header_len,
+                "kind": kind,
             }
         )
     return shifted
@@ -1483,18 +1493,21 @@ def _remap_char_edge_triples(
     raw_edges: list,
     kept_indices: list[int],
     header_len: int,
+    *,
+    family: str,
 ) -> list[dict]:
     remapped = []
-    for edge in raw_edges or []:
-        if not isinstance(edge, dict):
-            continue
+    for src, dst, kind in (
+        normalize_domain_edge_record(edge, family=family)
+        for edge in raw_edges or []
+    ):
         mapped_from = _map_exact_kept_char(
             kept_indices,
-            int(edge.get("from_char", edge.get("from", -1))),
+            src,
         )
         mapped_to = _map_exact_kept_char(
             kept_indices,
-            int(edge.get("to_char", edge.get("to", -1))),
+            dst,
         )
         if mapped_from is None or mapped_to is None:
             continue
@@ -1502,7 +1515,7 @@ def _remap_char_edge_triples(
             {
                 "from_char": mapped_from + header_len,
                 "to_char": mapped_to + header_len,
-                "kind": int(edge.get("kind", 0)),
+                "kind": kind,
             }
         )
     return remapped
@@ -1564,14 +1577,13 @@ def process_record_with_policy(
             old_to_new_chunk,
         )
         filtered_domain_edge_fields = {
-            name: _remap_char_edge_triples(record.get(name, []), kept_indices, header_len)
-            for name in (
-                "domain_edges",
-                "build_edges",
-                "shell_edges",
-                "diagnostic_edges",
-                "cross_domain_edges",
+            name: _remap_char_edge_triples(
+                record.get(name, []),
+                kept_indices,
+                header_len,
+                family=family,
             )
+            for name, family in _DOMAIN_EDGE_FIELD_FAMILIES.items()
         }
     else:
         filtered_structure_ids = _align_structure_ids(structure_ids, len(filtered_text))
@@ -1580,14 +1592,10 @@ def process_record_with_policy(
         filtered_type_edges = record.get("type_edges", [])
 
         filtered_domain_edge_fields = {
-            name: _shift_char_edge_triples(record.get(name, []), header_len)
-            for name in (
-                "domain_edges",
-                "build_edges",
-                "shell_edges",
-                "diagnostic_edges",
-                "cross_domain_edges",
+            name: _shift_char_edge_triples(
+                record.get(name, []), header_len, family=family
             )
+            for name, family in _DOMAIN_EDGE_FIELD_FAMILIES.items()
         }
 
     full_sids = [0] * header_len + filtered_structure_ids

@@ -29,6 +29,7 @@ from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
+from cppmega_mlx.data.domain_schema import normalize_domain_edge_record
 from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.data.parquet_dataset import (
     _TOKEN_CHUNK_METADATA_COLUMNS,
@@ -124,6 +125,13 @@ _DOMAIN_EDGE_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_DIAGNOSTIC_EDGES_COLUMN: "diagnostic_edges",
     TOKEN_CROSS_DOMAIN_EDGES_COLUMN: "cross_domain_edges",
 }
+_DOMAIN_EDGE_COLUMN_TO_FAMILY: Mapping[str, str] = {
+    TOKEN_DOMAIN_EDGES_COLUMN: "domain",
+    TOKEN_BUILD_EDGES_COLUMN: "build",
+    TOKEN_SHELL_EDGES_COLUMN: "shell",
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN: "diagnostic",
+    TOKEN_CROSS_DOMAIN_EDGES_COLUMN: "cross_domain",
+}
 
 # Temporal token-level parquet column -> CommitPacket field name.
 _TEMPORAL_COLUMN_TO_FIELD: Mapping[str, str] = {
@@ -209,37 +217,28 @@ def _build_edge_index(
     return EdgeIndex.from_pairs(pairs, relation=relation, num_nodes=num_nodes)
 
 
-def _normalize_edge_triples(raw: Any) -> list[tuple[int, int, int]]:
+def _normalize_edge_triples(
+    raw: Any,
+    *,
+    family: str,
+) -> list[tuple[int, int, int]]:
     if raw is None:
         return []
     triples: list[tuple[int, int, int]] = []
     for edge in raw:
-        if hasattr(edge, "as_py"):
-            edge = edge.as_py()
-        if isinstance(edge, Mapping):
-            src = edge.get("from", edge.get("src"))
-            dst = edge.get("to", edge.get("dst"))
-            kind = edge.get("kind")
-        elif isinstance(edge, (list, tuple, np.ndarray)) and len(edge) >= 3:
-            src, dst, kind = edge[0], edge[1], edge[2]
-        else:
-            raise ValueError(
-                "domain edge triple must be {from,to,kind}/{src,dst,kind} or "
-                f"length-3 sequence, got {type(edge).__name__}"
-            )
-        if src is None or dst is None or kind is None:
-            raise ValueError(f"domain edge triple has missing value: {edge!r}")
-        src_i = int(src)
-        dst_i = int(dst)
-        kind_i = int(kind)
-        if src_i < 0 or dst_i < 0 or kind_i < 0:
-            raise ValueError(f"domain edge triple must be non-negative: {edge!r}")
-        triples.append((src_i, dst_i, kind_i))
+        triples.append(normalize_domain_edge_record(edge, family=family))
     return triples
 
 
-def _build_domain_edge_index(raw: Any, *, num_tokens: int) -> DomainEdgeIndex:
-    edge_index = DomainEdgeIndex.from_triples(_normalize_edge_triples(raw))
+def _build_domain_edge_index(
+    raw: Any,
+    *,
+    num_tokens: int,
+    family: str,
+) -> DomainEdgeIndex:
+    edge_index = DomainEdgeIndex.from_triples(
+        _normalize_edge_triples(raw, family=family)
+    )
     if edge_index.num_edges:
         max_endpoint = int(max(mx.max(edge_index.src).item(), mx.max(edge_index.dst).item()))
         if max_endpoint >= num_tokens:
@@ -327,6 +326,7 @@ def build_code_packet_from_row(
         domain_edge_kwargs[field_name] = _build_domain_edge_index(
             columns[column][row_index],
             num_tokens=num_tokens,
+            family=_DOMAIN_EDGE_COLUMN_TO_FAMILY[column],
         )
         present.append(column)
 

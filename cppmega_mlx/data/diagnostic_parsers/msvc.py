@@ -9,6 +9,7 @@ from cppmega_mlx.data.domain_schema import (
     DomainEdgeKind,
     DomainKind,
     DomainRoleKind,
+    ParseConfidence,
 )
 
 
@@ -19,7 +20,23 @@ _MSVC_RE = re.compile(
 
 
 def parse_msvc_diagnostic(text: str) -> object:
-    doc = new_diagnostic_doc(text, domain=DomainKind.COMPILER_ERROR, tool="msvc")
+    matches = [match for line in text.splitlines() if (match := _MSVC_RE.match(line))]
+    severities = [match.group("severity") for match in matches]
+    primary_severity = severities[0] if severities else "unknown"
+    domain = (
+        DomainKind.COMPILER_ERROR
+        if any(severity in {"fatal error", "error"} for severity in severities)
+        else DomainKind.COMPILER_DIAGNOSTIC
+    )
+    doc = new_diagnostic_doc(
+        text,
+        domain=domain,
+        tool="msvc",
+        severity=primary_severity,
+        stage="compile",
+        platform="windows",
+        confidence=ParseConfidence.HEURISTIC if matches else ParseConfidence.RAW,
+    )
     for line_no, raw_line in enumerate(text.splitlines()):
         match = _MSVC_RE.match(raw_line)
         if not match:

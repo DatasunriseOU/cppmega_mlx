@@ -42,6 +42,8 @@ from cppmega_mlx.data.diagnostic_parsers import (
     parse_build_error,
     parse_clang_diagnostic,
     parse_linker_error,
+    parse_sanitizer_output,
+    parse_test_output,
 )
 from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
 
@@ -168,9 +170,28 @@ def parse_result_diagnostic_domain(result_text: str) -> ParsedDomainDocument | N
     if not result_text.strip():
         return None
     lower = result_text.lower()
+    if any(
+        marker.lower() in lower
+        for marker in (
+            "AddressSanitizer",
+            "LeakSanitizer",
+            "MemorySanitizer",
+            "ThreadSanitizer",
+            "UndefinedBehaviorSanitizer",
+        )
+    ):
+        return parse_sanitizer_output(result_text)
+    if re.search(r"(?m)^(FAILED|PASSED)\s+\S+::", result_text) or (
+        "assertionerror" in lower and "test" in lower
+    ):
+        return parse_test_output(result_text)
     if "undefined reference" in lower or "unresolved external symbol" in lower:
         return parse_linker_error(result_text)
-    if re.search(r"^[^\n:]+:\d+:\d+:\s+(fatal error|error|warning|note):", result_text, re.MULTILINE):
+    if re.search(
+        r"^[^\n:]+:\d+:(?:\d+:)?\s*(fatal error|error|warning|note):",
+        result_text,
+        re.MULTILINE,
+    ):
         return parse_clang_diagnostic(result_text)
     if "cmake error" in lower or "ninja:" in lower or "build stopped" in lower:
         return parse_build_error(result_text)

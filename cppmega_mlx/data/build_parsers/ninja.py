@@ -16,7 +16,7 @@ def parse_ninja(text: str) -> ParsedDomainDocument:
         domain=DomainKind.NINJA,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"build_kind": "ninja"},
+        metadata={"build_kind": "ninja", "parser_adapter": "ninja"},
     )
     next_entity = 1
     current_rule: int | None = None

@@ -53,7 +53,7 @@ def _synthetic_packed_table() -> "pa.Table":
             "token_scope_ids": [[0, 0, 1, 1, 0, 0], [0] * SEQ],
             "token_source_doc_ids": [[7] * SEQ, [8] * SEQ],
             "token_confidence_ids": [[4] * SEQ, [2] * SEQ],
-            "token_domain_edges": [[{"from": 1, "to": 2, "kind": 20}], []],
+            "token_domain_edges": [[{"from": 1, "to": 2, "kind": 5}], []],
             "token_build_edges": [[{"from": 2, "to": 3, "kind": 21}], []],
             "token_shell_edges": [[], []],
             "token_diagnostic_edges": [[], []],
@@ -118,7 +118,7 @@ def test_build_code_packets_populates_all_fields() -> None:
     assert p0.role_ids is not None
     assert np.asarray(p0.role_ids).tolist() == [0, 1, 2, 3, 4, 5]
     assert isinstance(p0.domain_edges, DomainEdgeIndex)
-    assert p0.domain_edges.to_triples() == [(1, 2, 20)]
+    assert p0.domain_edges.to_triples() == [(1, 2, 5)]
     assert p0.build_edges.to_triples() == [(2, 3, 21)]
 
     # Row 1 has an empty type_edges list.
@@ -196,6 +196,14 @@ def test_build_code_packet_preserves_full_width_symbol_ids() -> None:
     assert np.asarray(packets[0].symbol_ids).tolist() == [high_id] * SEQ
     assert packets[1].call_targets is not None
     assert packets[1].call_targets.dtype == mx.uint64
+
+
+def test_build_code_packet_rejects_wrong_domain_edge_family() -> None:
+    columns = _synthetic_packed_table().to_pydict()
+    columns["token_build_edges"][0] = [{"from": 2, "to": 3, "kind": 60}]
+
+    with pytest.raises(ValueError, match="belongs to diagnostic, not build"):
+        build_code_packets(_synthetic_batch(), pa.table(columns))
 
 
 def test_build_code_packet_misaligned_semantic_column_raises() -> None:

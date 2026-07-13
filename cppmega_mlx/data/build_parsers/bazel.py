@@ -24,7 +24,7 @@ def parse_bazel(text: str) -> ParsedDomainDocument:
         domain=DomainKind.BAZEL,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"build_kind": "bazel"},
+        metadata={"build_kind": "bazel", "parser_adapter": "bazel-starlark"},
     )
     next_entity = 1
     current_target: int | None = None

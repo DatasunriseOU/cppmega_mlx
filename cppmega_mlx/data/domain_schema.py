@@ -160,7 +160,11 @@ DOMAIN_EDGE_FAMILIES: dict[str, frozenset[DomainEdgeKind]] = {
 
 
 def domain_edge_family(kind: DomainEdgeKind | int) -> str:
-    """Return the one graph channel that owns ``kind``."""
+    """Return the one graph channel that owns ``kind``.
+
+    Unknown and sentinel kinds are rejected. They must never be serialized as a
+    plausible edge on a different graph channel.
+    """
 
     try:
         edge_kind = DomainEdgeKind(int(kind))
@@ -179,7 +183,7 @@ def validate_domain_edge_kind(
     *,
     family: str | None = None,
 ) -> DomainEdgeKind:
-    """Validate an edge kind and its graph-channel family."""
+    """Validate an edge kind and, when supplied, its graph-channel family."""
 
     actual_family = domain_edge_family(kind)
     if family is not None and actual_family != family:
@@ -189,8 +193,12 @@ def validate_domain_edge_kind(
     return DomainEdgeKind(int(kind))
 
 
-def normalize_domain_edge_record(edge: Any, *, family: str) -> tuple[int, int, int]:
-    """Normalize one serialized edge without inventing fields."""
+def normalize_domain_edge_record(
+    edge: Any,
+    *,
+    family: str,
+) -> tuple[int, int, int]:
+    """Normalize one serialized edge without inventing endpoints or a kind."""
 
     if hasattr(edge, "as_py"):
         edge = edge.as_py()
@@ -210,16 +218,22 @@ def normalize_domain_edge_record(edge: Any, *, family: str) -> tuple[int, int, i
         )
         if selected is None or "kind" not in edge:
             raise ValueError("domain edge missing src/dst/kind")
-        src, dst, kind = edge[selected[0]], edge[selected[1]], edge["kind"]
+        src = edge[selected[0]]
+        dst = edge[selected[1]]
+        kind = edge["kind"]
     elif (
-        isinstance(edge, Sequence)
+        (
+            isinstance(edge, Sequence)
+            or (hasattr(edge, "__len__") and hasattr(edge, "__getitem__"))
+        )
         and not isinstance(edge, (str, bytes, bytearray))
         and len(edge) == 3
     ):
         src, dst, kind = edge
     else:
         raise ValueError("domain edge must be a mapping or length-3 sequence")
-    src_i, dst_i = int(src), int(dst)
+    src_i = int(src)
+    dst_i = int(dst)
     if src_i < 0 or dst_i < 0:
         raise ValueError(f"domain edge endpoints must be non-negative: {src_i}->{dst_i}")
     edge_kind = validate_domain_edge_kind(int(kind), family=family)
