@@ -16,11 +16,15 @@ _DIRECT_MSL_LEGACY_DEBUG_ALLOWLIST: dict[tuple[str, ...], dict[str, object]] = {
         "kind": "legacy_path_b_fallback",
         "reason": (
             "Path C Mamba3 bwd is finite but slower on the checked-in receipt, "
-            "so AUTO keeps Path B; Path B bwd writes final owner-output "
-            "gradients with direct-MSL atomic adds instead of public P-axis buffers."
+            "so AUTO keeps Path B; Path B bwd keeps P-axis intermediates behind "
+            "private kernel bindings and reduces them inside the wrapper before "
+            "returning final owner-output gradients."
         ),
         "replacement": "cppmega_mlx/nn/_tilelang/mamba3_path_c.py",
-        "reduction_surface": ["atomic_owner_output_p_axis"],
+        "reduction_surface": [
+            "private_p_axis_intermediate",
+            "internal_mlx_p_axis_reduce",
+        ],
         "public_partial_outputs": [],
     },
 }
@@ -118,6 +122,7 @@ class _MlxLintVisitor(ast.NodeVisitor):
         self._function_stack: list[str] = []
         self._model_backend_intrinsic_findings: set[tuple[int, str]] = set()
         self._public_partial_output_findings: set[tuple[int, str]] = set()
+        self._private_output_surface_calls: set[int] = set()
         self._uses_autodiff = False
         self._uses_custom_function = False
         self._defines_custom_gradient = False
@@ -227,7 +232,8 @@ class _MlxLintVisitor(ast.NodeVisitor):
             self._function_stack.pop()
 
     def visit_Call(self, node: ast.Call) -> None:
-        self._check_public_partial_call_outputs(node)
+        if id(node) not in self._private_output_surface_calls:
+            self._check_public_partial_call_outputs(node)
         if self._is_mlx_array_call(node) and self._has_unsafe_scalar_literal_arg(node):
             self.findings.append(
                 Finding(
@@ -277,12 +283,14 @@ class _MlxLintVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
+        self._mark_private_output_surface_call(node.targets, node.value)
         self._check_timing_assignment(node.targets, node.value, node.lineno)
         self._check_public_partial_assignment(node.targets, node.value, node.lineno)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.value is not None:
+            self._mark_private_output_surface_call([node.target], node.value)
             self._check_timing_assignment([node.target], node.value, node.lineno)
             self._check_public_partial_assignment([node.target], node.value, node.lineno)
         self.generic_visit(node)
@@ -588,6 +596,19 @@ class _MlxLintVisitor(ast.NodeVisitor):
         for keyword in node.keywords:
             if keyword.arg in _PUBLIC_OUTPUT_SURFACE_NAMES:
                 self._check_public_partial_value(keyword.value, node.lineno)
+
+    def _mark_private_output_surface_call(
+        self,
+        targets: Iterable[ast.expr],
+        value: ast.expr,
+    ) -> None:
+        """Mark direct underscore bindings as internal primitive APIs."""
+
+        if not isinstance(value, ast.Call):
+            return
+        target_names = {name for target in targets for name in _target_names(target)}
+        if target_names and all(name.startswith("_") for name in target_names):
+            self._private_output_surface_calls.add(id(value))
 
     def _check_public_partial_assignment(
         self,

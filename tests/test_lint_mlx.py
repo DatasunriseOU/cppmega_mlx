@@ -408,6 +408,45 @@ def test_lint_allows_internal_partial_intermediates(
     assert result.stderr == ""
 
 
+def test_lint_allows_private_kernel_partial_outputs_for_internal_reduction(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "private_kernel.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "import mlx.core as mx",
+                "",
+                "_private_kernel = mx.fast.metal_kernel(",
+                "    name='private_partial',",
+                "    input_names=['x'],",
+                "    output_names=['dB_partial'],",
+                "    source='uint elem = thread_position_in_grid.x;'",
+                ")",
+                "",
+                "def public_bwd(x):",
+                "    dB_partial = _private_kernel(",
+                "        inputs=[x],",
+                "        output_shapes=[x.shape],",
+                "        output_dtypes=[x.dtype],",
+                "        grid=(x.size, 1, 1),",
+                "        threadgroup=(1, 1, 1),",
+                "    )[0]",
+                "    dB = mx.sum(dB_partial, axis=0)",
+                "    return dB",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX009", source)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
 def test_lint_blocks_native_tvm_ffi_bridge_parent_imports(
     tmp_path: Path,
 ) -> None:
@@ -519,7 +558,10 @@ def test_lint_explains_legacy_direct_msl_reduction_allowlist() -> None:
     assert "slower on the checked-in receipt" in mamba3["reason"]
     assert mamba3["replacement"].endswith("mamba3_path_c.py")
     assert mamba3["public_partial_outputs"] == []
-    assert mamba3["reduction_surface"] == ["atomic_owner_output_p_axis"]
+    assert mamba3["reduction_surface"] == [
+        "private_p_axis_intermediate",
+        "internal_mlx_p_axis_reduce",
+    ]
     assert "final owner-output" in mamba3["reason"]
     assert "cppmega_mlx/nn/_tilelang/fp8_msl_kernels.py" not in by_path
     assert "cppmega_mlx/nn/_tilelang/sparse_mla_blockscaled.py" not in by_path

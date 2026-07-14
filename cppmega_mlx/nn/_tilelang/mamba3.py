@@ -215,16 +215,17 @@ _BWD_KERNEL_SOURCE = """
     // Outputs:
     //   dx     [B, T, H, P]
     //   dz     [B, T, H, P]
-    //   dB_partial [B, T, H, P, N]  -- caller sums over P
-    //   dC_partial [B, T, H, P, N]  -- caller sums over P
-    //   dA_partial [B, T, H, P]     -- caller sums over P
-    //   ddt_partial[B, T, H, P]     -- caller sums over P
-    //   dD_partial [B, H, P]        -- caller sums over (B, P)
+    //   dB_partial [B, T, H, P, N]  -- private wrapper sums over P
+    //   dC_partial [B, T, H, P, N]  -- private wrapper sums over P
+    //   dA_partial [B, T, H, P]     -- private wrapper sums over P
+    //   ddt_partial[B, T, H, P]     -- private wrapper sums over P
+    //   dD_partial [B, H, P]        -- private wrapper sums over (B, P)
     //   dh0        [B, H, P, N]
     //
     // One thread per (b, h, p) lane. The (b, h, p) decomposition keeps each
     // lane fully owning a single P slice, so per-lane partial outputs do not
-    // need atomics. The caller reduces partials into final shapes.
+    // need atomics. The private Python wrapper reduces them before the public
+    // backward API returns final owner-output gradients.
 
     uint tid = thread_position_in_grid.x;
     uint total_lanes = uint(BATCH) * uint(HEADS) * uint(HEADDIM);
@@ -360,6 +361,10 @@ _BWD_KERNEL_SOURCE = """
 """
 
 
+# This is a private primitive ABI. Its P-axis intermediates are intentionally
+# not a public gradient surface; _mamba3_mimo_bwd_metal_kernel reduces them
+# before mamba3_mimo_bwd_metal returns.
+#
 # TODO(wave-6): port to TileLang DSL. Reverse-time scan with both per-thread
 # ``float dh[STATE]`` accumulator and a persistent ``h_steps_scratch[tid][t][n]``
 # slab; needs ``T.serial(reverse=True)`` over ``t`` plus careful fragment
@@ -884,9 +889,10 @@ def mamba3_mimo_bwd_metal(
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Backward pass for the Mamba3 MIMO selective scan.
 
-    The Metal kernel emits per-lane partial gradients which are reduced on the
-    host. The pure-MLX path (used as a fallback and reachable via
-    ``backend='mlx'``) reproduces the same math step-by-step on the GPU graph.
+    The private Metal primitive emits per-lane partial gradients; its wrapper
+    reduces those intermediates before returning final owner gradients. The
+    pure-MLX path (reachable via ``backend='mlx'``) reproduces the same math
+    step-by-step on the GPU graph.
 
     Inputs match the forward; ``trap`` is optional and only used for the
     extra ``ddt``/``dtrap`` contributions when the caller wants to wire the
