@@ -20,7 +20,7 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -32,6 +32,7 @@ from cppmega_mlx.data.prompt_graph import (  # noqa: E402
     PromptGraphArtifact,
     PromptGraphBuilder,
     PromptGraphContext,
+    PromptGraphSegment,
     PromptProjectIndex,
     GENERATED_TOKEN_SIDECAR_DEFAULTS,
     TOKEN_SIDECAR_DEFAULTS,
@@ -39,6 +40,8 @@ from cppmega_mlx.data.prompt_graph import (  # noqa: E402
     require_prompt_graph_project_id,
 )
 from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer  # noqa: E402
+from cppmega_mlx.data.fim import FIMSpecialTokenIds  # noqa: E402
+from cppmega_mlx.inference.infilling import build_fim_prompt_ids  # noqa: E402
 from cppmega_mlx.inference.sampling import sample_next_token  # noqa: E402
 from cppmega_mlx.inference.side_channels import (  # noqa: E402
     InferenceSideChannelBuilder,
@@ -48,9 +51,29 @@ from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig  # noqa
 from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer  # noqa: E402
 from cppmega_mlx.training.checkpoint import load_checkpoint  # noqa: E402
 
-PromptMode = Literal["source-prefix", "docstring"]
+PromptMode = Literal[
+    "source-prefix",
+    "docstring",
+    "causal-docstring",
+    "fim",
+    "ifim",
+]
+CanonicalPromptMode = Literal["source-prefix", "causal-docstring", "fim", "ifim"]
 PromptSidecars = Literal["zero", "clang"]
 PromptGraphMode = Literal["off", "repo"]
+
+PROMPT_MODE_CHOICES: tuple[PromptMode, ...] = (
+    "source-prefix",
+    "docstring",
+    "causal-docstring",
+    "fim",
+    "ifim",
+)
+FIM_PROMPT_MODES = frozenset({"fim", "ifim"})
+FIM_PREFIX_TOKEN = "<FIM_PREFIX>"
+FIM_MIDDLE_TOKEN = "<FIM_MIDDLE>"
+FIM_SUFFIX_TOKEN = "<FIM_SUFFIX>"
+FIM_INSTRUCTION_TOKEN = "<FIM_INSTRUCTION>"
 
 DEFAULT_TOKENIZER = REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
 DEFAULT_CASES = REPO_ROOT / "evals" / "cpp_generation_cases.jsonl"
@@ -95,6 +118,35 @@ class GenerationPromptContext:
         self.side_channels = side_channels
         self.receipt = receipt
         self.graph_artifact = graph_artifact
+
+
+class EvaluationPrompt(NamedTuple):
+    mode: CanonicalPromptMode
+    source_prefix: str
+    source_suffix: str = ""
+    instruction: str | None = None
+
+    @property
+    def is_fim(self) -> bool:
+        return self.mode in FIM_PROMPT_MODES
+
+    def render(self) -> str:
+        if self.mode == "source-prefix":
+            return self.source_prefix
+        if self.mode == "causal-docstring":
+            assert self.instruction is not None
+            return self.instruction + self.source_prefix
+        fim = (
+            FIM_PREFIX_TOKEN
+            + self.source_prefix
+            + FIM_SUFFIX_TOKEN
+            + self.source_suffix
+            + FIM_MIDDLE_TOKEN
+        )
+        if self.mode == "ifim":
+            assert self.instruction is not None
+            return FIM_INSTRUCTION_TOKEN + self.instruction + fim
+        return fim
 
 
 class ResolvedPromptGraph:
@@ -158,22 +210,66 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def prompt_text(case: dict[str, Any], mode: PromptMode) -> str:
-    if mode == "source-prefix":
-        value = case.get("source_prefix")
-        key = "source_prefix"
-    elif mode == "docstring":
-        # The model was trained to consume task intent as C/C++ comments around
-        # real code, not as a naked English instruction.  Use the case's C++
-        # source prefix because it already contains the doc comment and function
-        # signature, which also lets clang sidecars align with actual code text.
-        value = case.get("source_prefix")
-        key = "source_prefix"
-    else:
-        raise ValueError(f"unsupported prompt mode {mode!r}")
+def _is_cpp_comment(text: str) -> bool:
+    stripped = text.strip()
+    if stripped.startswith("//"):
+        return all(
+            not line.strip() or line.lstrip().startswith("//")
+            for line in stripped.splitlines()
+        )
+    return stripped.startswith("/*") and stripped.endswith("*/")
+
+
+def _require_case_text(case: dict[str, Any], key: str) -> str:
+    value = case.get(key)
     if not isinstance(value, str) or not value:
         raise ValueError(f"case {case.get('task_id')!r}: missing non-empty {key}")
     return value
+
+
+def cpp_comment_instruction(case: dict[str, Any]) -> str:
+    """Render task intent as syntax the C/C++ objective actually trains on."""
+
+    intent = " ".join(_require_case_text(case, "prompt").split())
+    if not intent:
+        raise ValueError(
+            f"case {case.get('task_id')!r}: prompt is empty after normalization"
+        )
+    return f"// {intent}\n"
+
+
+def evaluation_prompt(
+    case: dict[str, Any],
+    mode: PromptMode,
+) -> EvaluationPrompt:
+    source_prefix = _require_case_text(case, "source_prefix")
+    source_suffix = case.get("source_suffix", "")
+    if not isinstance(source_suffix, str):
+        raise ValueError(
+            f"case {case.get('task_id')!r}: source_suffix must be a string"
+        )
+    canonical_mode: CanonicalPromptMode
+    if mode == "docstring":
+        canonical_mode = "causal-docstring"
+    elif mode in {"source-prefix", "causal-docstring", "fim", "ifim"}:
+        canonical_mode = mode
+    else:
+        raise ValueError(f"unsupported prompt mode {mode!r}")
+    instruction = (
+        cpp_comment_instruction(case)
+        if canonical_mode in {"causal-docstring", "ifim"}
+        else None
+    )
+    return EvaluationPrompt(
+        canonical_mode,
+        source_prefix,
+        source_suffix,
+        instruction,
+    )
+
+
+def prompt_text(case: dict[str, Any], mode: PromptMode) -> str:
+    return evaluation_prompt(case, mode).render()
 
 
 def _resolve_contained_path(
@@ -355,9 +451,162 @@ def _row_to_ints(array: mx.array) -> list[int]:
     return [int(item) for item in array[0].tolist()]
 
 
+def _as_evaluation_prompt(prompt: str | EvaluationPrompt) -> EvaluationPrompt:
+    if isinstance(prompt, str):
+        prompt = EvaluationPrompt("source-prefix", prompt)
+    if not isinstance(prompt, EvaluationPrompt):
+        raise TypeError(
+            "prompt must be a string or EvaluationPrompt, got "
+            f"{type(prompt).__name__}"
+        )
+    if prompt.mode not in {
+        "source-prefix",
+        "causal-docstring",
+        "fim",
+        "ifim",
+    }:
+        raise ValueError(f"unsupported prompt mode {prompt.mode!r}")
+    if not prompt.source_prefix:
+        raise ValueError("evaluation prompt requires non-empty source_prefix")
+    if prompt.is_fim and not prompt.source_suffix:
+        raise ValueError(f"{prompt.mode} prompt requires non-empty source_suffix")
+    if prompt.mode in {"causal-docstring", "ifim"}:
+        if not prompt.instruction or not _is_cpp_comment(prompt.instruction):
+            raise ValueError(
+                f"{prompt.mode} instruction must be a C/C++ comment or docstring"
+            )
+    elif prompt.instruction is not None:
+        raise ValueError(f"{prompt.mode} prompt must not carry an instruction")
+    return prompt
+
+
+def tokenizer_fim_special_ids(tokenizer: Any) -> FIMSpecialTokenIds:
+    return FIMSpecialTokenIds(
+        eot=tokenizer.eos_token_id,
+        fim_prefix=tokenizer.fim_prefix_id,
+        fim_middle=tokenizer.fim_middle_id,
+        fim_suffix=tokenizer.fim_suffix_id,
+        fim_instruction=tokenizer.fim_instruction_id,
+    )
+
+
+def evaluation_prompt_token_ids(
+    tokenizer: Any,
+    prompt: str | EvaluationPrompt,
+) -> list[int]:
+    resolved = _as_evaluation_prompt(prompt)
+    if not resolved.is_fim:
+        return list(tokenizer.encode(resolved.render()))
+    instruction_ids = (
+        None
+        if resolved.instruction is None
+        else list(tokenizer.encode(resolved.instruction))
+    )
+    return build_fim_prompt_ids(
+        tokenizer.encode(resolved.source_prefix),
+        tokenizer.encode(resolved.source_suffix),
+        mode="psm",
+        instruction_token_ids=instruction_ids,
+        special_token_ids=tokenizer_fim_special_ids(tokenizer),
+    )
+
+
+def _resolve_source_suffix_start(
+    project_index: PromptProjectIndex,
+    prompt: EvaluationPrompt,
+    *,
+    document_id: int,
+    source_start: int,
+) -> int:
+    source = project_index.document_for_id(document_id).source
+    minimum_start = source_start + len(prompt.source_prefix)
+    match = source.find(prompt.source_suffix, minimum_start)
+    repeated = match >= 0 and source.find(prompt.source_suffix, match + 1) >= 0
+    if match < 0 or repeated:
+        reason = "not found" if match < 0 else "ambiguous"
+        raise ValueError(
+            "source_suffix must map to exactly one project index span after "
+            f"source_prefix; {reason}"
+        )
+    return match
+
+
+def _repository_prompt_context(
+    project_index: PromptProjectIndex,
+    prompt: EvaluationPrompt,
+    *,
+    document_id: int,
+    source_path: str,
+    source_start: int,
+) -> PromptGraphContext:
+    prefix_context = PromptGraphContext.from_repository_prompt(
+        project_index,
+        prompt.source_prefix,
+        document_id=document_id,
+        source_path=source_path,
+        source_start=source_start,
+        language="cpp",
+    )
+    if prompt.mode == "source-prefix":
+        return prefix_context
+    if prompt.mode == "causal-docstring":
+        assert prompt.instruction is not None
+        if prefix_context.segments[-1].role != "target":
+            raise ValueError("repository prompt graph target segment is missing")
+        return PromptGraphContext(
+            segments=(
+                *prefix_context.segments[:-1],
+                PromptGraphSegment(prompt.instruction, role="instruction"),
+                prefix_context.segments[-1],
+            ),
+            language="cpp",
+        )
+
+    suffix_start = _resolve_source_suffix_start(
+        project_index,
+        prompt,
+        document_id=document_id,
+        source_start=source_start,
+    )
+    segments = list(prefix_context.segments[:-1])
+    if prompt.mode == "ifim":
+        assert prompt.instruction is not None
+        segments.extend(
+            (
+                PromptGraphSegment(
+                    FIM_INSTRUCTION_TOKEN,
+                    role="fim_instruction_marker",
+                ),
+                PromptGraphSegment(prompt.instruction, role="instruction"),
+            )
+        )
+    segments.extend(
+        (
+            PromptGraphSegment(FIM_PREFIX_TOKEN, role="fim_prefix_marker"),
+            PromptGraphSegment(
+                prompt.source_prefix,
+                document_id=document_id,
+                source_path=source_path,
+                source_start=source_start,
+                role="target_prefix",
+            ),
+            PromptGraphSegment(FIM_SUFFIX_TOKEN, role="fim_suffix_marker"),
+            PromptGraphSegment(
+                prompt.source_suffix,
+                document_id=document_id,
+                source_path=source_path,
+                source_start=suffix_start,
+                role="target_suffix",
+            ),
+            PromptGraphSegment(FIM_MIDDLE_TOKEN, role="fim_middle_marker"),
+        )
+    )
+    return PromptGraphContext(segments=tuple(segments), language="cpp")
+
+
 def build_prompt_context(
     tokenizer: Any,
-    prompt: str,
+    prompt: str | EvaluationPrompt,
     *,
     prompt_graph_mode: PromptGraphMode = "off",
     prompt_sidecars: PromptSidecars,
@@ -374,6 +623,18 @@ def build_prompt_context(
     generated query to a deterministic visible repository summary. Explicit
     graph-off mode still keeps every sidecar shape token-aligned.
     """
+
+    resolved_prompt = _as_evaluation_prompt(prompt)
+    if resolved_prompt.is_fim and prompt_sidecars != "zero":
+        raise ValueError(
+            "FIM/IFIM prompts require --prompt-sidecars zero; clang cannot "
+            "align reordered source_prefix/source_suffix tokens"
+        )
+    if resolved_prompt.is_fim and prepend_code_start:
+        raise ValueError(
+            "FIM/IFIM prompts cannot use --prepend-code-start because the "
+            "special-token contract must start with FIM_PREFIX or FIM_INSTRUCTION"
+        )
 
     if prompt_graph_mode == "repo":
         if prompt_sidecars != "zero":
@@ -409,21 +670,28 @@ def build_prompt_context(
             cache_dir=prompt_graph_cache_dir,
         ).build(
             project_index,
-            PromptGraphContext.from_repository_prompt(
+            _repository_prompt_context(
                 project_index,
-                prompt,
+                resolved_prompt,
                 document_id=prompt_document_id,
                 source_path=prompt_source_path,
                 source_start=prompt_source_start,
-                language="cpp",
             ),
         )
+        if resolved_prompt.is_fim:
+            expected = evaluation_prompt_token_ids(tokenizer, resolved_prompt)
+            if list(artifact.token_ids[-len(expected) :]) != expected:
+                raise ValueError(
+                    "repository prompt graph changed the exact FIM/IFIM "
+                    "special-token contract"
+                )
         side_channels = {
             name: list(artifact.side_channels[name])
             for name in SIDE_CHANNEL_NAMES
         }
         receipt = dict(artifact.receipt)
         receipt["prompt_graph_mode"] = "repo"
+        receipt["prompt_mode"] = resolved_prompt.mode
         return GenerationPromptContext(
             token_ids=list(artifact.token_ids),
             side_channels=side_channels,
@@ -435,8 +703,9 @@ def build_prompt_context(
         raise ValueError(f"unsupported prompt_graph_mode={prompt_graph_mode!r}")
 
     if prompt_sidecars == "zero":
-        prepend = tokenizer.code_start_id if prepend_code_start else None
-        ids = list(tokenizer.encode(prompt, prepend=prepend))
+        ids = evaluation_prompt_token_ids(tokenizer, resolved_prompt)
+        if prepend_code_start:
+            ids.insert(0, tokenizer.code_start_id)
         side = {name: [0] * len(ids) for name in SIDE_CHANNEL_NAMES}
         return GenerationPromptContext(
             token_ids=ids,
@@ -444,6 +713,7 @@ def build_prompt_context(
             receipt={
                 "prompt_graph_mode": "off",
                 "prompt_sidecars": "zero",
+                "prompt_mode": resolved_prompt.mode,
             },
         )
 
@@ -457,7 +727,7 @@ def build_prompt_context(
         adapter=get_builtin_code_metadata_adapter("cpp"),
         fail_policy="error",
     )
-    result = builder.build(prompt, language="cpp")
+    result = builder.build(resolved_prompt.render(), language="cpp")
     ids = _row_to_ints(result.prompt_ids)
     side: dict[str, list[int]] = {}
     for name in SIDE_CHANNEL_NAMES:
@@ -469,6 +739,7 @@ def build_prompt_context(
         )
     receipt = dict(result.provenance)
     receipt["prompt_graph_mode"] = "off"
+    receipt["prompt_mode"] = resolved_prompt.mode
     return GenerationPromptContext(
         token_ids=ids,
         side_channels=side,
@@ -589,6 +860,11 @@ class BodyDecodeConstraints:
             tokenizer.tool_result_id,
             tokenizer.code_start_id,
         }
+        fim_instruction_id = getattr(tokenizer, "fim_instruction_id", None)
+        if isinstance(fim_instruction_id, int) and not isinstance(
+            fim_instruction_id, bool
+        ):
+            self._always_banned.add(fim_instruction_id)
         token_for_id = getattr(tokenizer, "token_for_id", None)
         vocab_size = getattr(tokenizer, "vocab_size", None)
         if callable(token_for_id) and isinstance(vocab_size, int):
@@ -882,7 +1158,7 @@ def _sample_next(
 def generate_completion(
     model: DenseCppLM,
     tokenizer: Any,
-    prompt: str,
+    prompt: str | EvaluationPrompt,
     *,
     seq_len: int,
     max_new_tokens: int,
@@ -1019,6 +1295,7 @@ def write_completions(
     rows: list[dict[str, Any]] = []
     with completions_path.open("w", encoding="utf-8") as fh:
         for case in cases:
+            case_prompt = evaluation_prompt(case, prompt_mode)
             case_graph_mode = effective_case_prompt_graph_mode(
                 case,
                 prompt_graph_mode,
@@ -1033,7 +1310,7 @@ def write_completions(
             completion, prompt_tokens, generated_tokens, side_provenance = generate_completion(
                 model,
                 tokenizer,
-                prompt_text(case, prompt_mode),
+                case_prompt,
                 seq_len=seq_len,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -1054,6 +1331,7 @@ def write_completions(
                 "completion_source": "model_generation",
                 "prompt_tokens": prompt_tokens,
                 "generated_tokens": generated_tokens,
+                "prompt_mode": case_prompt.mode,
                 "prompt_graph_mode": case_graph_mode,
                 "prompt_graph_receipt": side_provenance,
                 "prompt_graph_index_receipt": (
@@ -1126,7 +1404,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--compile-gate-script", type=Path, default=DEFAULT_COMPILE_GATE)
     ap.add_argument("--skip-compile-gate", action="store_true")
     ap.add_argument("--keep-workdir", action="store_true")
-    ap.add_argument("--prompt-mode", choices=("source-prefix", "docstring"), default="source-prefix")
+    ap.add_argument(
+        "--prompt-mode",
+        choices=PROMPT_MODE_CHOICES,
+        default="source-prefix",
+        help=(
+            "Prompt contract: causal C/C++ comment plus prefix, exact PSM FIM, "
+            "or comment-instructed IFIM. 'docstring' is a legacy alias for "
+            "'causal-docstring'."
+        ),
+    )
     ap.add_argument(
         "--prompt-graph-mode",
         choices=("repo", "off"),
@@ -1185,6 +1472,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--top-k must be non-negative")
     if args.top_p is not None and not (0.0 < args.top_p <= 1.0):
         raise ValueError("--top-p must be in (0, 1]")
+    if args.prompt_mode in FIM_PROMPT_MODES and args.prompt_sidecars != "zero":
+        raise ValueError(
+            "FIM/IFIM prompt modes require --prompt-sidecars zero"
+        )
+    if args.prompt_mode in FIM_PROMPT_MODES and args.prepend_code_start:
+        raise ValueError(
+            "FIM/IFIM prompt modes cannot use --prepend-code-start"
+        )
     return args
 
 
@@ -1226,13 +1521,21 @@ def main() -> None:
         prompt_index_cache_dir = None
 
     for case, case_graph_mode in zip(cases, case_graph_modes):
-        resolve_case_prompt_graph(
+        case_prompt = evaluation_prompt(case, args.prompt_mode)
+        resolved = resolve_case_prompt_graph(
             case,
             cases_dir=cases_dir,
             mode=case_graph_mode,
             prompt_index_cache_dir=prompt_index_cache_dir,
             indexer_root=args.clang_indexer_root,
         )
+        if resolved is not None and case_prompt.is_fim:
+            _resolve_source_suffix_start(
+                resolved.project_index,
+                case_prompt,
+                document_id=resolved.document_id,
+                source_start=resolved.source_start,
+            )
 
     tokenizer = load_cppmega_tokenizer(args.tokenizer)
     model = build_model(args)

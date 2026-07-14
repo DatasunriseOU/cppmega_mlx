@@ -30,15 +30,67 @@ def _load_module():
     return module
 
 
-def test_prompt_text_source_prefix_and_docstring():
+def test_prompt_text_modes_use_comment_instruction_and_source_spans():
     mod = _load_module()
     case = {
         "task_id": "x",
         "prompt": "complete it",
         "source_prefix": "int f(){\n",
+        "source_suffix": "}\n",
     }
     assert mod.prompt_text(case, "source-prefix") == "int f(){\n"
-    assert mod.prompt_text(case, "docstring") == "int f(){\n"
+    assert mod.prompt_text(case, "docstring") == "// complete it\nint f(){\n"
+    assert mod.prompt_text(case, "causal-docstring") == (
+        "// complete it\nint f(){\n"
+    )
+    assert mod.prompt_text(case, "fim") == (
+        "<FIM_PREFIX>int f(){\n<FIM_SUFFIX>}\n<FIM_MIDDLE>"
+    )
+    assert mod.prompt_text(case, "ifim") == (
+        "<FIM_INSTRUCTION>// complete it\n"
+        "<FIM_PREFIX>int f(){\n<FIM_SUFFIX>}\n<FIM_MIDDLE>"
+    )
+
+
+def test_prompt_modes_have_deterministic_exact_token_ids():
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    case = {
+        "task_id": "add",
+        "prompt": "Return the sum.",
+        "source_prefix": "int add(int a, int b) {\n",
+        "source_suffix": "}\n",
+    }
+    prefix_ids = tokenizer.encode(case["source_prefix"])
+    suffix_ids = tokenizer.encode(case["source_suffix"])
+    instruction_ids = tokenizer.encode("// Return the sum.\n")
+
+    assert mod.evaluation_prompt_token_ids(
+        tokenizer, mod.evaluation_prompt(case, "causal-docstring")
+    ) == tokenizer.encode("// Return the sum.\n" + case["source_prefix"])
+    assert mod.evaluation_prompt_token_ids(
+        tokenizer, mod.evaluation_prompt(case, "fim")
+    ) == [
+        tokenizer.fim_prefix_id,
+        *prefix_ids,
+        tokenizer.fim_suffix_id,
+        *suffix_ids,
+        tokenizer.fim_middle_id,
+    ]
+    assert mod.evaluation_prompt_token_ids(
+        tokenizer, mod.evaluation_prompt(case, "ifim")
+    ) == [
+        tokenizer.fim_instruction_id,
+        *instruction_ids,
+        tokenizer.fim_prefix_id,
+        *prefix_ids,
+        tokenizer.fim_suffix_id,
+        *suffix_ids,
+        tokenizer.fim_middle_id,
+    ]
+    assert instruction_ids != tokenizer.encode(case["prompt"])
 
 
 def test_default_side_channels_are_token_aligned_zero_arrays():
@@ -89,7 +141,11 @@ def test_build_prompt_context_zero_sidecars_align_with_prepend():
     )
 
     assert context.token_ids[0] == _FakeTokenizer.code_start_id
-    assert context.receipt == {"prompt_graph_mode": "off", "prompt_sidecars": "zero"}
+    assert context.receipt == {
+        "prompt_graph_mode": "off",
+        "prompt_sidecars": "zero",
+        "prompt_mode": "source-prefix",
+    }
     assert context.graph_artifact is None
     assert set(context.side_channels) == set(mod.SIDE_CHANNEL_NAMES)
     assert all(
@@ -147,6 +203,34 @@ def test_shipped_default_cases_exercise_mixed_per_case_graph_contract():
     assert mod.batch_requires_graph_routes(modes) is False
     assert mod.batch_requires_graph_routes(["repo"]) is True
     assert mod.batch_requires_graph_routes(["off"]) is False
+
+
+def test_cli_exposes_fim_modes_and_rejects_unalignable_options():
+    mod = _load_module()
+    for mode in ("causal-docstring", "fim", "ifim"):
+        assert mode in mod.PROMPT_MODE_CHOICES
+
+    with pytest.raises(ValueError, match="require --prompt-sidecars zero"):
+        mod.parse_args(
+            [
+                "--checkpoint",
+                "unused.safetensors",
+                "--prompt-mode",
+                "fim",
+                "--prompt-sidecars",
+                "clang",
+            ]
+        )
+    with pytest.raises(ValueError, match="cannot use --prepend-code-start"):
+        mod.parse_args(
+            [
+                "--checkpoint",
+                "unused.safetensors",
+                "--prompt-mode",
+                "ifim",
+                "--prepend-code-start",
+            ]
+        )
 
 
 def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
@@ -208,6 +292,154 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     assert side["source_doc_ids"][0, -1].item() == 0
     assert side["structure_ids"][0, -1].item() > 0
     assert float(mx.sum(block_bias[:, -1, :]).item()) > 0.0
+
+
+def test_repo_ifim_prompt_keeps_prefix_and_suffix_source_alignment(
+    tmp_path: Path,
+):
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    case = json.loads((CASE3_FIXTURE / "cases.jsonl").read_text().splitlines()[0])
+    prompt = mod.evaluation_prompt(case, "ifim")
+    project_index = _build_case3_index(tmp_path)
+    source = project_index.document_for_path("src/math_prompt.cpp")
+
+    context = mod.build_prompt_context(
+        tokenizer,
+        prompt,
+        prompt_graph_mode="repo",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        project_index=project_index,
+        prompt_document_id=source.id,
+        prompt_source_path=source.source_path,
+        prompt_source_start=0,
+        prompt_graph_cache_dir=tmp_path / "graph-cache",
+    )
+
+    target_ids = mod.evaluation_prompt_token_ids(tokenizer, prompt)
+    target_start = len(context.token_ids) - len(target_ids)
+    instruction_ids = tokenizer.encode(prompt.instruction)
+    prefix_ids = tokenizer.encode(prompt.source_prefix)
+    suffix_ids = tokenizer.encode(prompt.source_suffix)
+    prefix_start = target_start + 1 + len(instruction_ids) + 1
+    suffix_marker = prefix_start + len(prefix_ids)
+    suffix_start = suffix_marker + 1
+    source_doc_ids = context.side_channels["source_doc_ids"]
+
+    assert context.token_ids[target_start:] == target_ids
+    assert source_doc_ids[target_start : prefix_start] == [0] * (
+        prefix_start - target_start
+    )
+    assert source_doc_ids[prefix_start:suffix_marker] == [source.id] * len(
+        prefix_ids
+    )
+    assert source_doc_ids[suffix_marker] == 0
+    assert source_doc_ids[suffix_start : suffix_start + len(suffix_ids)] == [
+        source.id
+    ] * len(suffix_ids)
+    assert source_doc_ids[-1] == 0
+    assert context.receipt["prompt_mode"] == "ifim"
+    assert context.receipt["edge_counts"]["call"] > 0
+
+    with pytest.raises(ValueError, match="source_suffix.*ambiguous"):
+        mod.build_prompt_context(
+            tokenizer,
+            mod.EvaluationPrompt("fim", prompt.source_prefix, "}"),
+            prompt_graph_mode="repo",
+            prompt_sidecars="zero",
+            prepend_code_start=False,
+            project_index=project_index,
+            prompt_document_id=source.id,
+            prompt_source_path=source.source_path,
+            prompt_source_start=0,
+            prompt_graph_cache_dir=tmp_path / "ambiguous-cache",
+        )
+
+
+@pytest.mark.parametrize("mode", ["fim", "ifim"])
+def test_fim_prompt_modes_reject_unalignable_options(mode: str):
+    mod = _load_module()
+    prompt = mod.EvaluationPrompt(
+        mode=mode,
+        source_prefix="int f() {\n",
+        source_suffix="}\n",
+        instruction="// Return one.\n" if mode == "ifim" else None,
+    )
+
+    with pytest.raises(ValueError, match="require --prompt-sidecars zero"):
+        mod.build_prompt_context(
+            _FakeTokenizer(),
+            prompt,
+            prompt_sidecars="clang",
+            prepend_code_start=False,
+        )
+    with pytest.raises(ValueError, match="cannot use --prepend-code-start"):
+        mod.build_prompt_context(
+            _FakeTokenizer(),
+            prompt,
+            prompt_sidecars="zero",
+            prepend_code_start=True,
+        )
+
+
+def test_ifim_prompt_ids_are_threaded_unchanged_into_model():
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    prompt = mod.EvaluationPrompt(
+        mode="ifim",
+        source_prefix="int answer() {\n",
+        source_suffix="}\n",
+        instruction="// Return forty two.\n",
+    )
+    expected_ids = mod.evaluation_prompt_token_ids(tokenizer, prompt)
+
+    class CapturingModel:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append((input_ids, kwargs))
+            return (
+                mx.zeros(
+                    (1, input_ids.shape[1], tokenizer.vocab_size),
+                    dtype=mx.float32,
+                ),
+                None,
+            )
+
+    model = CapturingModel()
+    _completion, prompt_tokens, generated_tokens, receipt = mod.generate_completion(
+        model,
+        tokenizer,
+        prompt,
+        seq_len=256,
+        max_new_tokens=1,
+        temperature=0.0,
+        top_k=None,
+        top_p=None,
+        prompt_graph_mode="off",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        project_index=None,
+        prompt_document_id=None,
+        prompt_source_path=None,
+        prompt_source_start=None,
+        prompt_graph_cache_dir=None,
+    )
+
+    assert prompt_tokens == len(expected_ids)
+    assert generated_tokens == 1
+    assert len(model.calls) == 1
+    input_ids, kwargs = model.calls[0]
+    assert input_ids.tolist() == [expected_ids]
+    assert kwargs["block_bias"] is None
+    assert kwargs["edge_kind_bias"] is None
+    assert receipt["prompt_mode"] == "ifim"
 
 
 def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path):
@@ -588,6 +820,67 @@ def test_local_compile_gate_fails_closed_for_failed_candidate(tmp_path: Path):
     assert json.loads(report.read_text())["summary"]["passed"] == 0
 
 
+def test_fim_generated_middle_is_composed_between_prefix_and_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mod = _load_module()
+    case = {
+        "task_id": "answer",
+        "language": "cpp",
+        "prompt": "Return forty two.",
+        "source_prefix": "int answer() {\n",
+        "source_suffix": (
+            "}\nint main() { return answer() == 42 ? 0 : 1; }\n"
+        ),
+        "compile_args": ["-std=c++20", "-O0"],
+        "timeout_s": 10,
+        "prompt_graph_mode": "off",
+    }
+    cases = tmp_path / "cases.jsonl"
+    completions = tmp_path / "completions.jsonl"
+    cases.write_text(json.dumps(case) + "\n", encoding="utf-8")
+
+    def fake_generate(*_args, **_kwargs):
+        return "return 42;\n", 9, 2, {"prompt_mode": "fim"}
+
+    monkeypatch.setattr(mod, "generate_completion", fake_generate)
+    rows = mod.write_completions(
+        [case],
+        completions,
+        model=object(),
+        tokenizer=object(),
+        prompt_mode="fim",
+        seq_len=64,
+        max_new_tokens=8,
+        temperature=0.0,
+        top_k=None,
+        top_p=None,
+        prompt_graph_mode="off",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        cases_dir=tmp_path,
+        prompt_graph_cache_dir=None,
+        prompt_index_cache_dir=None,
+    )
+    spec = importlib.util.spec_from_file_location(
+        "cpp_generation_compile_eval_for_fim_test",
+        CASE3_COMPILE_GATE,
+    )
+    assert spec is not None and spec.loader is not None
+    compile_gate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = compile_gate
+    spec.loader.exec_module(compile_gate)
+    loaded_case = compile_gate.load_cases(cases)["answer"]
+    loaded_completion = compile_gate.load_completions(completions)["answer"]
+
+    assert rows[0]["completion"] == "return 42;\n"
+    assert rows[0]["prompt_mode"] == "fim"
+    assert compile_gate.compose_source(loaded_case, loaded_completion) == (
+        case["source_prefix"] + "return 42;\n" + case["source_suffix"]
+    )
+
+
 def test_gold_fixture_is_explicit_and_repository_gate_links_all_sources(
     tmp_path: Path,
 ):
@@ -629,6 +922,9 @@ def test_script_help_bootstraps_repo_root_from_sibling_cwd():
     assert proc.returncode == 0, proc.stderr
     assert "--prompt-sidecars" in proc.stdout
     assert "--prompt-graph-mode" in proc.stdout
+    assert "causal-docstring" in proc.stdout
+    assert "fim" in proc.stdout
+    assert "ifim" in proc.stdout
 
 
 def test_rejects_megatron_distcp_file(tmp_path: Path):
