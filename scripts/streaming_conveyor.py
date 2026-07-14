@@ -945,6 +945,28 @@ class ConcurrentManifest(Manifest):
 
         self._merge_under_lock(apply)
 
+    def mark_started(self, key: str) -> None:
+        """Invalidate stale terminal state before a real retry starts."""
+
+        def apply(done: dict, failed: dict) -> None:
+            done.pop(key, None)
+            failed.pop(key, None)
+
+        self._merge_under_lock(apply)
+
+    def mark_started_prefix(self, prefix: str) -> None:
+        """Invalidate every stale range state for one logical parent."""
+
+        def apply(done: dict, failed: dict) -> None:
+            for key in tuple(done):
+                if key.startswith(prefix):
+                    done.pop(key)
+            for key in tuple(failed):
+                if key.startswith(prefix):
+                    failed.pop(key)
+
+        self._merge_under_lock(apply)
+
     def mark_failed(self, key: str, stage: str, detail: str) -> None:
         rec = {
             "stage": stage,
@@ -953,6 +975,7 @@ class ConcurrentManifest(Manifest):
         }
 
         def apply(done: dict, failed: dict) -> None:
+            done.pop(key, None)
             failed[key] = rec
 
         self._merge_under_lock(apply)
@@ -1970,6 +1993,12 @@ def run_commits_half(
     lengths_sorted = tuple(sorted(int(x) for x in lengths_commits))
     smallest = lengths_sorted[0]
 
+    if not resume:
+        with manifest_lock:
+            manifest.mark_started_prefix(f"{repo}::r")
+            manifest.mark_started(commit_plan_key(repo))
+            manifest.mark_started(f"{repo}::commits")
+
     if resume:
         complete_ranges = manifest_complete_commit_ranges(repo, manifest, range_size)
         if complete_ranges is not None:
@@ -2272,6 +2301,8 @@ def run_commits_half(
                 )
                 return None
         try:
+            with manifest_lock:
+                manifest.mark_started(rkey)
             if progress is not None:
                 progress.emit(
                     "unit_started",
@@ -2493,6 +2524,8 @@ def process_one_repo(
                                 "retryable index_project failure; starting parse_workers=1 "
                                 "with global exact/chunk dedup and near-dedup disabled"
                             )
+                        with manifest_lock:
+                            manifest.mark_started(ck)
                         if progress is not None:
                             progress.emit(
                                 "unit_started",

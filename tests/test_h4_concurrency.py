@@ -96,6 +96,44 @@ def test_concurrent_manifest_save_is_disabled(tmp_path):
         m.save()
 
 
+def test_concurrent_manifest_retry_invalidates_stale_terminal_state(tmp_path):
+    """A failed re-run must never leave an older done receipt resumable."""
+    import streaming_conveyor as sc
+
+    path = tmp_path / "_done.json"
+    manifest = sc.ConcurrentManifest.load(path)
+    manifest.mark_done("repo::code", {"generation": "old"})
+    manifest.mark_started("repo::code")
+
+    started = sc.ConcurrentManifest.load(path)
+    assert "repo::code" not in started.done
+    assert "repo::code" not in started.failed
+
+    started.mark_failed("repo::code", "index", "new run failed")
+    failed = sc.ConcurrentManifest.load(path)
+    assert "repo::code" not in failed.done
+    assert failed.failed["repo::code"]["stage"] == "index"
+
+
+def test_concurrent_manifest_prefix_restart_preserves_other_stream(tmp_path):
+    """A commit restart clears its ranges without clobbering code receipts."""
+    import streaming_conveyor as sc
+
+    path = tmp_path / "_done.json"
+    code_writer = sc.ConcurrentManifest.load(path)
+    commit_writer = sc.ConcurrentManifest.load(path)
+    code_writer.mark_done("repo::code", {"rows": 1})
+    commit_writer.mark_done("repo::r0", {"rows": 2})
+    commit_writer.mark_failed("repo::r10", "pack", "old failure")
+
+    commit_writer.mark_started_prefix("repo::r")
+
+    reloaded = sc.ConcurrentManifest.load(path)
+    assert reloaded.is_done("repo::code")
+    assert "repo::r0" not in reloaded.done
+    assert "repo::r10" not in reloaded.failed
+
+
 def _mp_manifest_writer(manifest_path: str, keys: list[str]) -> None:
     """Top-level worker for the spawn-based contention test."""
     import sys as _sys
