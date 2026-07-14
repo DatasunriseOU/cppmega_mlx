@@ -21,6 +21,7 @@ from cppmega_mlx.data.code_packet_builder import build_commit_packets_from_packe
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
     SOURCE_DIFF_TOKEN_IDS_COLUMN,
@@ -81,6 +82,10 @@ from scripts.train_eval_stage1 import _objective_batches
 
 def _arr(values: list[int]) -> mx.array:
     return mx.array(np.asarray(values, dtype=np.int32))
+
+
+def _physical_source(name: str):
+    return source_identity({"repo": "org/repo", "filepath": name})
 
 
 def _code_packet(*, instruction_ids: list[int] | None = None) -> CodePacket:
@@ -204,7 +209,10 @@ def test_task_specific_columns_are_optional_until_that_objective_is_selected() -
     assert partial_commit.commit_packet is not None
     assert partial_commit.commit_packet.pre_token_ids is None
     commit_diff = EligibilityAwareTaskMixer({TaskKind.COMMIT_DIFF: 1.0}, seed=3)
-    assert commit_diff.materialize(partial_commit, step_index=0).task is TaskKind.COMMIT_DIFF
+    assert (
+        commit_diff.materialize(partial_commit, step_index=0).task
+        is TaskKind.COMMIT_DIFF
+    )
     with pytest.raises(ValueError, match="pre_token_ids.*post_token_ids"):
         EligibilityAwareTaskMixer({TaskKind.PRE_TO_POST: 1.0}, seed=3).materialize(
             partial_commit, step_index=0
@@ -398,8 +406,8 @@ def test_production_batch_window_preserves_exact_task_quotas() -> None:
             "ast_depth": _arr([0] * 8),
             "sibling_index": _arr([0] * 8),
             "ast_node_type": _arr([1] * 8),
-                "call_edges": EdgeIndex.from_pairs([(1, 0)], relation="call", num_nodes=3),
-                "type_edges": EdgeIndex.from_pairs([], relation="type", num_nodes=3),
+            "call_edges": EdgeIndex.from_pairs([(1, 0)], relation="call", num_nodes=3),
+            "type_edges": EdgeIndex.from_pairs([], relation="type", num_nodes=3),
         }
     )
     commit = CommitPacket(
@@ -542,9 +550,7 @@ def test_graph_direct_token_relations_use_the_same_document_and_upstream_mask() 
     packet = CodePacket(
         token_ids=_arr([10, 11, 12, 13]),
         document_ids=_arr([1, 1, 2, 2]),
-        domain_edges=DomainEdgeIndex.from_triples(
-            [(3, 2, 20), (2, 1, 20), (1, 0, 20)]
-        ),
+        domain_edges=DomainEdgeIndex.from_triples([(3, 2, 20), (2, 1, 20), (1, 0, 20)]),
     )
     upstream = np.ones((4, 4), dtype=np.uint8)
     upstream[1, 0] = 0
@@ -609,16 +615,23 @@ def test_materialized_causal_document_preserves_unique_document_ids() -> None:
 
 
 def test_permuted_objective_preserves_one_stable_source_identity() -> None:
+    physical = _physical_source("src/one.cpp")
     packet = CodePacket(
         token_ids=_arr([10, 11, 12, 13, 14, 15]),
         document_ids=_arr([1, 1, 1, 1, 1, 1]),
         source_doc_ids=_arr([77, 77, 77, 77, 77, 77]),
-        metadata={"platform_ids": [2]},
+        source_identity_ids=mx.array(
+            np.asarray([physical.source_identity_id] * 6, dtype=np.uint64)
+        ),
+        metadata={
+            "platform_ids": [2],
+            "source_identity_registry": [physical.as_dict()],
+        },
     )
     source = ObjectiveSource(code_packet=packet)
-    realized = EligibilityAwareTaskMixer(
-        {TaskKind.FIM: 1.0}, seed=47
-    ).materialize(source, step_index=0)
+    realized = EligibilityAwareTaskMixer({TaskKind.FIM: 1.0}, seed=47).materialize(
+        source, step_index=0
+    )
 
     document = materialize_megatron_document(
         realized,
@@ -627,20 +640,35 @@ def test_permuted_objective_preserves_one_stable_source_identity() -> None:
     )
 
     assert set(document.row["token_source_doc_ids"]) == {77}
+    assert set(document.row["token_source_identity_ids"]) == {
+        physical.source_identity_id
+    }
+    assert document.row["source_identity_registry"] == [physical.as_dict()]
     assert set(document.row["doc_ids"]) == {1}
 
 
 def test_permuted_objective_selects_exactly_one_logical_document() -> None:
+    first = _physical_source("src/first.cpp")
+    second = _physical_source("src/second.cpp")
     packet = CodePacket(
         token_ids=_arr([10, 11, 12, 13, 14, 15]),
         document_ids=_arr([1, 1, 1, 2, 2, 2]),
         source_doc_ids=_arr([77, 77, 77, 88, 88, 88]),
-        metadata={"platform_ids": [2]},
+        source_identity_ids=mx.array(
+            np.asarray(
+                [first.source_identity_id] * 3 + [second.source_identity_id] * 3,
+                dtype=np.uint64,
+            )
+        ),
+        metadata={
+            "platform_ids": [2],
+            "source_identity_registry": [first.as_dict(), second.as_dict()],
+        },
     )
     source = ObjectiveSource(code_packet=packet)
-    realized = EligibilityAwareTaskMixer(
-        {TaskKind.FIM: 1.0}, seed=53
-    ).materialize(source, step_index=0)
+    realized = EligibilityAwareTaskMixer({TaskKind.FIM: 1.0}, seed=53).materialize(
+        source, step_index=0
+    )
 
     document = materialize_megatron_document(
         realized,
@@ -650,7 +678,12 @@ def test_permuted_objective_selects_exactly_one_logical_document() -> None:
 
     selected_span = realized.example.metadata["source_document_span"]
     selected_source = 77 if selected_span == (0, 3) else 88
+    selected_physical = first if selected_span == (0, 3) else second
     assert set(document.row["token_source_doc_ids"]) == {selected_source}
+    assert set(document.row["token_source_identity_ids"]) == {
+        selected_physical.source_identity_id
+    }
+    assert document.row["source_identity_registry"] == [selected_physical.as_dict()]
     selected_tokens = {10, 11, 12} if selected_source == 77 else {13, 14, 15}
     assert set(document.token_ids) & {10, 11, 12, 13, 14, 15} <= selected_tokens
 
@@ -1151,6 +1184,7 @@ def test_materialized_document_serializes_with_production_arrow_schema() -> None
         "token_entity_ids",
         "token_scope_ids",
         "token_source_doc_ids",
+        "token_source_identity_ids",
         "token_confidence_ids",
         "token_structure_ids",
         "token_dep_levels",
@@ -1165,6 +1199,8 @@ def test_materialized_document_serializes_with_production_arrow_schema() -> None
         "token_change_mask_post",
     ):
         row[column] = [0, 0]
+    row["symbol_identities"] = []
+    row["source_identity_registry"] = []
     document = MaterializedMegatronDocument(
         objective_kind="causal_lm",
         token_ids=[10, 11],
@@ -1225,42 +1261,49 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
     assert artifact["schema"] == OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA
     assert artifact["documents"] == 2
     assert artifact["objective_contract"]["path"] == "objective_contract.json"
-    assert artifact["objective_contract"]["sha256"] == hashlib.sha256(
-        canonical_contract
-    ).hexdigest()
+    assert (
+        artifact["objective_contract"]["sha256"]
+        == hashlib.sha256(canonical_contract).hexdigest()
+    )
     contract_bytes = (tmp_path / "objective_contract.json").read_bytes()
     assert artifact["objective_contract"]["size_bytes"] == len(contract_bytes)
-    assert artifact["objective_contract"]["file_sha256"] == hashlib.sha256(
-        contract_bytes
-    ).hexdigest()
+    assert (
+        artifact["objective_contract"]["file_sha256"]
+        == hashlib.sha256(contract_bytes).hexdigest()
+    )
     assert [row["path"] for row in artifact["parquet_shards"]] == [
         first.name,
         second.name,
     ]
     assert artifact["converter"]["side_channels"][1] == {
         "column": "doc_ids",
-        "dtype": "uint16",
+        "dtype": "uint32",
     }
     assert {
         "column": "token_source_doc_ids",
         "dtype": "uint32",
     } in artifact["converter"]["side_channels"]
+    assert {
+        "column": "token_source_identity_ids",
+        "dtype": "uint64",
+    } in artifact["converter"]["side_channels"]
     assert artifact["converter"]["graph_pair_mask"] == (
         "causal_same_document_upstream_v1"
     )
-    assert artifact["converter"]["chunk_edge_expansion"] == (
-        "cartesian_token_spans_v1"
-    )
+    assert artifact["converter"]["chunk_edge_expansion"] == ("cartesian_token_spans_v1")
     artifact_set_payload = dict(artifact)
     artifact_set_sha256 = artifact_set_payload.pop("artifact_set_sha256")
-    assert artifact_set_sha256 == hashlib.sha256(
-        json.dumps(
-            artifact_set_payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("ascii")
-    ).hexdigest()
+    assert (
+        artifact_set_sha256
+        == hashlib.sha256(
+            json.dumps(
+                artifact_set_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("ascii")
+        ).hexdigest()
+    )
     assert json.loads((tmp_path / "objective_contract.json").read_text()) == contract
 
 
@@ -1289,8 +1332,7 @@ def test_objective_order_and_source_ids_ignore_mapping_encounter_order() -> None
     }
     source_signatures = ("repo-a\0path\0commit", "repo-b\0path\0commit")
     forward_ids = {
-        signature: deterministic_source_id(signature)
-        for signature in source_signatures
+        signature: deterministic_source_id(signature) for signature in source_signatures
     }
     reverse_ids = {
         signature: deterministic_source_id(signature)

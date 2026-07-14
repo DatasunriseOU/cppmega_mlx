@@ -15,6 +15,11 @@ from typing import Any
 import numpy as np
 
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.source_identity import validate_source_identity_registry
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SymbolIdentityRegistry,
+)
 from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ObjectiveSource,
@@ -29,12 +34,13 @@ OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
 OBJECTIVE_MATERIALIZATION_ARTIFACT_NAME = "objective_materialization.json"
 OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("loss_mask", "uint8"),
-    ("doc_ids", "uint16"),
+    ("doc_ids", "uint32"),
     ("token_domain_ids", "uint16"),
     ("token_role_ids", "uint16"),
     ("token_entity_ids", "uint32"),
     ("token_scope_ids", "uint32"),
     ("token_source_doc_ids", "uint32"),
+    ("token_source_identity_ids", "uint64"),
     ("token_confidence_ids", "uint8"),
     ("token_structure_ids", "uint8"),
     ("token_dep_levels", "uint16"),
@@ -58,7 +64,7 @@ OBJECTIVE_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_cross_domain_edges", "edge_triples", "int32"),
     ("token_chunk_starts", "ragged_1d", "uint32"),
     ("token_chunk_ends", "ragged_1d", "uint32"),
-    ("token_chunk_kinds", "ragged_1d", "uint16"),
+    ("token_chunk_kinds", "ragged_1d", "uint8"),
     ("token_chunk_dep_levels", "ragged_1d", "uint16"),
 )
 _KNOWN_TASKS = frozenset(task.value for task in TaskKind)
@@ -104,8 +110,10 @@ _TOKEN_SIDECARS = {
     "token_entity_ids": "entity_ids",
     "token_scope_ids": "scope_ids",
     "token_source_doc_ids": "source_doc_ids",
+    "token_source_identity_ids": "source_identity_ids",
     "token_confidence_ids": "confidence_ids",
 }
+SOURCE_IDENTITY_REGISTRY_COLUMN = "source_identity_registry"
 _DOMAIN_GRAPH_FIELDS = {
     "token_domain_edges": "domain_edges",
     "token_build_edges": "build_edges",
@@ -209,9 +217,7 @@ def _transformed_source_identity(
 ) -> int:
     packet = source.code_packet
     if packet is not None and packet.source_doc_ids is not None:
-        source_ids = _ints(
-            packet.source_doc_ids, where="CodePacket.source_doc_ids"
-        )
+        source_ids = _ints(packet.source_doc_ids, where="CodePacket.source_doc_ids")
         if source_document_span is not None:
             if (
                 not isinstance(source_document_span, (tuple, list))
@@ -256,9 +262,7 @@ def _transformed_source_identity(
             "diff_token_ids": (
                 None
                 if commit.diff_token_ids is None
-                else _ints(
-                    commit.diff_token_ids, where="CommitPacket.diff_token_ids"
-                )
+                else _ints(commit.diff_token_ids, where="CommitPacket.diff_token_ids")
             ),
             "pre_token_ids": (
                 None
@@ -278,6 +282,85 @@ def _transformed_source_identity(
     ).digest()
     identity = int.from_bytes(digest[:4], "big")
     return identity or 1
+
+
+def _source_identity_registry_for_ids(
+    packet: CodePacket,
+    source_identity_ids: Sequence[int],
+    *,
+    required: bool,
+) -> list[dict[str, int | str]]:
+    referenced = sorted({int(value) for value in source_identity_ids if int(value) > 0})
+    raw_registry = packet.metadata.get(SOURCE_IDENTITY_REGISTRY_COLUMN)
+    if raw_registry is None:
+        if required:
+            raise ValueError(
+                "pre-materialized production objective requires "
+                "CodePacket.metadata['source_identity_registry']"
+            )
+        return []
+    if not isinstance(raw_registry, Sequence) or isinstance(raw_registry, (str, bytes)):
+        raise ValueError("source_identity_registry must be a sequence of records")
+    validated = validate_source_identity_registry(
+        raw_registry,
+        referenced_ids=referenced,
+    )
+    return [validated[identity_id].as_dict() for identity_id in referenced]
+
+
+def _transformed_physical_source_identity(
+    packet: CodePacket | None,
+    *,
+    source_document_span: object,
+    required: bool,
+) -> tuple[int, list[dict[str, int | str]]]:
+    if packet is not None and packet.source_identity_ids is not None:
+        source_ids = _ints(
+            packet.source_identity_ids,
+            where="CodePacket.source_identity_ids",
+        )
+        if source_document_span is not None:
+            if (
+                not isinstance(source_document_span, (tuple, list))
+                or len(source_document_span) != 2
+            ):
+                raise ValueError("objective source_document_span must be a pair")
+            start, end = (int(value) for value in source_document_span)
+            if not 0 <= start < end <= len(source_ids):
+                raise ValueError(
+                    f"objective source_document_span [{start}, {end}) is outside "
+                    f"{len(source_ids)} physical source identity tokens"
+                )
+            source_ids = source_ids[start:end]
+        unique = {source_id for source_id in source_ids if source_id > 0}
+        if len(unique) == 1 and all(source_id > 0 for source_id in source_ids):
+            identity_id = next(iter(unique))
+            return identity_id, _source_identity_registry_for_ids(
+                packet,
+                [identity_id],
+                required=required,
+            )
+    if required:
+        raise ValueError(
+            "pre-materialized transformed objective requires exactly one positive "
+            "physical source in CodePacket.source_identity_ids"
+        )
+    return 0, []
+
+
+def _symbol_identity_records(packet: CodePacket) -> list[dict[str, object]]:
+    raw_records = packet.metadata.get(SYMBOL_IDENTITIES_COLUMN, [])
+    registry = SymbolIdentityRegistry()
+    registry.register_records(raw_records, source="pre-materialized objective")
+    used_ids: set[int] = set()
+    for field in ("symbol_ids", "call_targets", "type_refs"):
+        value = getattr(packet, field)
+        if value is not None:
+            used_ids.update(
+                item for item in _ints(value, where=f"CodePacket.{field}") if item != 0
+            )
+    registry.require_ids(used_ids, source="pre-materialized objective")
+    return registry.records(used_ids)
 
 
 def _canonical_contract_sha256(contract: Mapping[str, object]) -> str:
@@ -342,8 +425,10 @@ def write_objective_materialization_artifact(
     if expansion != "cartesian_token_spans_v1":
         raise ValueError("objective contract graph span expansion semantics drifted")
     relations = graph.get("relations")
-    if not isinstance(relations, list) or not relations or not all(
-        isinstance(relation, str) and relation for relation in relations
+    if (
+        not isinstance(relations, list)
+        or not relations
+        or not all(isinstance(relation, str) and relation for relation in relations)
     ):
         raise ValueError("objective contract graph relations must be non-empty strings")
 
@@ -358,7 +443,9 @@ def write_objective_materialization_artifact(
             )
     existing_shards = sorted(root.glob("*.parquet"))
     if existing_shards != resolved_shards:
-        unbound = sorted(path.name for path in set(existing_shards) - set(resolved_shards))
+        unbound = sorted(
+            path.name for path in set(existing_shards) - set(resolved_shards)
+        )
         raise ValueError(f"output_dir contains unbound parquet shards: {unbound}")
 
     contract_path = root / "objective_contract.json"
@@ -492,7 +579,15 @@ def materialize_megatron_document(
                 )
         row["doc_ids"] = _packet_vector(packet, "document_ids", length=len(tokens))
         for column, field in _TOKEN_SIDECARS.items():
-            row[column] = _packet_vector(packet, field, length=len(tokens))
+            if column == "token_source_identity_ids" and getattr(packet, field) is None:
+                if require_production_sidecars:
+                    raise ValueError(
+                        "pre-materialized production objective requires "
+                        "CodePacket.source_identity_ids"
+                    )
+                row[column] = [0] * len(tokens)
+            else:
+                row[column] = _packet_vector(packet, field, length=len(tokens))
         if require_production_sidecars and any(
             int(value) <= 0 for value in row["token_source_doc_ids"]
         ):
@@ -500,6 +595,19 @@ def materialize_megatron_document(
                 "pre-materialized production objective requires positive "
                 "token_source_doc_ids"
             )
+        if require_production_sidecars and any(
+            int(value) <= 0 for value in row["token_source_identity_ids"]
+        ):
+            raise ValueError(
+                "pre-materialized production objective requires positive "
+                "token_source_identity_ids"
+            )
+        row[SOURCE_IDENTITY_REGISTRY_COLUMN] = _source_identity_registry_for_ids(
+            packet,
+            row["token_source_identity_ids"],
+            required=require_production_sidecars,
+        )
+        row[SYMBOL_IDENTITIES_COLUMN] = _symbol_identity_records(packet)
         row["token_change_mask_pre"] = _metadata_vector(
             packet, "token_change_mask_pre", length=len(tokens)
         )
@@ -528,10 +636,18 @@ def materialize_megatron_document(
             source_document_span=example.metadata.get("source_document_span"),
             required=require_production_sidecars,
         )
+        physical_identity, physical_registry = _transformed_physical_source_identity(
+            packet,
+            source_document_span=example.metadata.get("source_document_span"),
+            required=require_production_sidecars,
+        )
         row["doc_ids"] = [1] * len(tokens)
         for column in _TOKEN_SIDECARS:
             row[column] = list(zeros)
         row["token_source_doc_ids"] = [source_identity] * len(tokens)
+        row["token_source_identity_ids"] = [physical_identity] * len(tokens)
+        row[SOURCE_IDENTITY_REGISTRY_COLUMN] = physical_registry
+        row[SYMBOL_IDENTITIES_COLUMN] = []
         row["token_change_mask_pre"] = list(zeros)
         row["token_change_mask_post"] = list(zeros)
         for column in (
@@ -586,9 +702,7 @@ def _exact_rates(
         if fraction > 0:
             by_task[task] = fraction
     raw = [
-        (task.value, by_task[task.value])
-        for task in TaskKind
-        if task.value in by_task
+        (task.value, by_task[task.value]) for task in TaskKind if task.value in by_task
     ]
     if not raw:
         raise ValueError("objective contract rates have no positive task")
@@ -711,8 +825,7 @@ def build_pre_materialized_objective_contract(
                     source = int(edge["from"])
                     destination = int(edge["to"])
                     if not (
-                        0 <= source < len(starts)
-                        and 0 <= destination < len(starts)
+                        0 <= source < len(starts) and 0 <= destination < len(starts)
                     ):
                         raise ValueError("materialized chunk edge endpoint is invalid")
                     for query in range(
@@ -753,10 +866,7 @@ def build_pre_materialized_objective_contract(
         "seed": int(seed),
         "quota_window_samples": int(quota_window_samples),
         "task_order": list(task_order),
-        "objective_ids": {
-            task: OBJECTIVE_KIND_IDS[task]
-            for task in task_order
-        },
+        "objective_ids": {task: OBJECTIVE_KIND_IDS[task] for task in task_order},
         "configured_rates": {
             task: _fraction_string(exact_rates[task]) for task in task_order
         },
@@ -786,9 +896,7 @@ def build_pre_materialized_objective_contract(
             "indexer_weight": _fraction_string(
                 Fraction(str(graph_config.indexer_weight))
             ),
-            "layer_weight": _fraction_string(
-                Fraction(str(graph_config.layer_weight))
-            ),
+            "layer_weight": _fraction_string(Fraction(str(graph_config.layer_weight))),
             "layer_reduction": "sum",
             "bce_weight": _fraction_string(Fraction(str(graph_config.bce_weight))),
             "coverage_weight": _fraction_string(

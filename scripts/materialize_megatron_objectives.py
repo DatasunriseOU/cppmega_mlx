@@ -26,10 +26,18 @@ from cppmega_mlx.data.domain_schema import (
     validate_case5_contract_metadata,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
 )
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+)
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
@@ -58,8 +66,7 @@ _ARROW_DTYPES = {
     "uint64": pa.uint64(),
 }
 TOKEN_SIDECAR_TYPES = {
-    column: _ARROW_DTYPES[dtype]
-    for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
+    column: _ARROW_DTYPES[dtype] for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
 }
 PAIR_TYPE = pa.struct([pa.field("from", pa.int32()), pa.field("to", pa.int32())])
 TRIPLE_TYPE = pa.struct(
@@ -67,6 +74,19 @@ TRIPLE_TYPE = pa.struct(
         pa.field("from", pa.int32()),
         pa.field("to", pa.int32()),
         pa.field("kind", pa.int32()),
+    ]
+)
+SYMBOL_IDENTITY_TYPE = pa.struct(
+    [
+        pa.field("symbol_id", pa.uint64(), nullable=False),
+        pa.field("symbol_key", pa.string(), nullable=False),
+    ]
+)
+SOURCE_IDENTITY_TYPE = pa.struct(
+    [
+        pa.field("source_identity_id", pa.uint64(), nullable=False),
+        pa.field("canonical_sha256", pa.string(), nullable=False),
+        pa.field("source", pa.string(), nullable=False),
     ]
 )
 
@@ -92,17 +112,35 @@ def materialized_schema() -> pa.Schema:
         pa.field("token_cross_domain_edges", pa.list_(TRIPLE_TYPE), nullable=False),
         pa.field("token_chunk_starts", pa.list_(pa.uint32()), nullable=False),
         pa.field("token_chunk_ends", pa.list_(pa.uint32()), nullable=False),
-        pa.field("token_chunk_kinds", pa.list_(pa.uint16()), nullable=False),
+        pa.field("token_chunk_kinds", pa.list_(pa.uint8()), nullable=False),
         pa.field("token_chunk_dep_levels", pa.list_(pa.uint16()), nullable=False),
+        pa.field(
+            SYMBOL_IDENTITIES_COLUMN,
+            pa.list_(SYMBOL_IDENTITY_TYPE),
+            nullable=False,
+        ),
+        pa.field(
+            SOURCE_IDENTITY_REGISTRY_COLUMN,
+            pa.list_(SOURCE_IDENTITY_TYPE),
+            nullable=False,
+        ),
     ]
     return pa.schema(fields).with_metadata(
         {
+            SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
+                SYMBOL_IDENTITY_SCHEMA_VERSION
+            ).encode("ascii"),
+            DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
+                DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+            ),
             DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): (
                 DOMAIN_SCHEMA_SHA256.encode("ascii")
             ),
             TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8"): (
                 TOKENIZER_CONTRACT_SHA256.encode("ascii")
             ),
+            b"cppmega.case5_schema": b"case5_domain_routes_v1",
+            b"cppmega.macro_routes_version": b"full_macro_concept_routes_v1",
         }
     )
 
@@ -205,9 +243,7 @@ def _iter_sources(shards: list[str], *, seed: int):
                         f"{TOKEN_SOURCE_DOC_IDS_COLUMN} mixes positive and "
                         "non-positive IDs"
                     )
-                positive_source_ids = {
-                    value for value in raw_source_ids if value > 0
-                }
+                positive_source_ids = {value for value in raw_source_ids if value > 0}
                 if len(positive_source_ids) > 1:
                     raise ValueError(
                         "objective source row contains multiple logical source IDs; "

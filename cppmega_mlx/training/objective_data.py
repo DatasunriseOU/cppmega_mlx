@@ -13,7 +13,6 @@ from cppmega_mlx.data.code_packet_builder import (
     build_code_packet_from_row,
     build_commit_packet_from_row,
 )
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     COMMIT_MSG_TOKEN_IDS_COLUMN,
     DIFF_TOKEN_IDS_COLUMN,
@@ -33,7 +32,10 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKENIZED_ENRICHED_DOMAIN_TOKEN_COLUMNS,
     TOKENIZED_ENRICHED_SEMANTIC_COLUMNS,
     TOKENIZED_ENRICHED_TEMPORAL_TOKEN_COLUMNS,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
 from cppmega_mlx.training.objective_mixer import ObjectiveSource
 
 _CHUNK_GRAPH_FIELDS = {"call": "call_edges", "type": "type_edges"}
@@ -72,6 +74,8 @@ OBJECTIVE_SOURCE_COLUMNS = (
     *TOKENIZED_ENRICHED_DOMAIN_TOKEN_COLUMNS,
     *TOKENIZED_ENRICHED_DOMAIN_GRAPH_COLUMNS,
     *TOKENIZED_ENRICHED_TEMPORAL_TOKEN_COLUMNS,
+    SYMBOL_IDENTITIES_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
 
 OBJECTIVE_MEGATRON_REQUIRED_SOURCE_COLUMNS = tuple(
@@ -148,6 +152,8 @@ def objective_source_from_tokenized_row(
         extra_metadata={
             "source_index": int(source_index),
             "platform_ids": row.get(PLATFORM_IDS_COLUMN),
+            SOURCE_IDENTITY_REGISTRY_COLUMN: row.get(SOURCE_IDENTITY_REGISTRY_COLUMN),
+            SYMBOL_IDENTITIES_COLUMN: row.get(SYMBOL_IDENTITIES_COLUMN),
             "token_change_mask_pre": row.get("token_change_mask_pre"),
             "token_change_mask_post": row.get("token_change_mask_post"),
         },
@@ -229,9 +235,7 @@ def _graph_arrays(
             f"graph input_length {input_length} exceeds token count {token_count}"
         )
     supported_relations = set(_CHUNK_GRAPH_FIELDS) | set(_TOKEN_GRAPH_FIELDS)
-    selected_relations = (
-        supported_relations if relations is None else set(relations)
-    )
+    selected_relations = supported_relations if relations is None else set(relations)
     unknown_relations = sorted(selected_relations - supported_relations)
     if unknown_relations:
         raise ValueError(f"unsupported graph relations: {unknown_relations}")
@@ -305,8 +309,7 @@ def _graph_arrays(
         expanded: list[tuple[int, int]] = []
         for source_chunk, destination_chunk in edge.to_pairs():
             if not (
-                0 <= source_chunk < len(starts)
-                and 0 <= destination_chunk < len(starts)
+                0 <= source_chunk < len(starts) and 0 <= destination_chunk < len(starts)
             ):
                 raise ValueError(
                     f"{relation} edge ({source_chunk}, {destination_chunk}) is "
@@ -332,8 +335,7 @@ def _graph_arrays(
         expanded = []
         for source_token, destination_token, _kind in edge.to_triples():
             if not (
-                0 <= source_token < token_count
-                and 0 <= destination_token < token_count
+                0 <= source_token < token_count and 0 <= destination_token < token_count
             ):
                 raise ValueError(
                     f"{relation} edge ({source_token}, {destination_token}) is "
