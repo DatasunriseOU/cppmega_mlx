@@ -453,6 +453,12 @@ def test_parse_worker_timeout_is_real_wall_clock():
     assert time.monotonic() - started < 8.0
 
 
+def test_parse_timeout_is_explicitly_configurable():
+    b = _load_builder()
+    args = b.parse_args(["--parse-timeout-seconds", "300"])
+    assert args.parse_timeout_seconds == 300.0
+
+
 def test_crosslink_budget_bounds():
     ip = _load_index_project()
     b = ip.CrossLinkBudget(max_deps=2, token_budget=1000)

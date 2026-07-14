@@ -2027,6 +2027,7 @@ def _index_lib_from_dir_uncommitted(
     *,
     workers: int,
     std_arg: str,
+    parse_timeout_s: float = PARSE_TIMEOUT_S,
 ) -> LibResult:
     """Parse an extracted base-lib inside the caller's SQLite transaction."""
     t0 = time.time()
@@ -2126,7 +2127,7 @@ def _index_lib_from_dir_uncommitted(
             )
 
     parse_results = _iter_parse_results(
-        parse_tasks(), workers=workers, timeout_s=PARSE_TIMEOUT_S
+        parse_tasks(), workers=workers, timeout_s=parse_timeout_s
     )
     try:
         for _fp, base_repo, (func_dicts, type_dicts) in parse_results:
@@ -2247,6 +2248,7 @@ def index_lib_from_dir(
     *,
     workers: int,
     std_arg: str,
+    parse_timeout_s: float = PARSE_TIMEOUT_S,
 ) -> LibResult:
     """Atomically replace one base-lib generation and mark it complete."""
     with store.rebuild_lib(lib, spec["tier"], spec["subtrees"]):
@@ -2257,6 +2259,7 @@ def index_lib_from_dir(
             store,
             workers=workers,
             std_arg=std_arg,
+            parse_timeout_s=parse_timeout_s,
         )
         store.mark_lib_done(
             lib,
@@ -2273,7 +2276,8 @@ def index_lib_from_dir(
 
 def index_one_lib(lib: str, spec: dict, tarball: Path, store: GlobalSymbolStore,
                   *, workers: int, max_files: int, std_arg: str,
-                  member_cap: int | None) -> LibResult:
+                  member_cap: int | None,
+                  parse_timeout_s: float = PARSE_TIMEOUT_S) -> LibResult:
     """Extract (own tarball pass) + index ONE base-lib. Used for single-lib runs."""
     with tempfile.TemporaryDirectory(prefix=f"gsi_{lib}_") as td:
         dest = Path(td)
@@ -2293,7 +2297,8 @@ def index_one_lib(lib: str, spec: dict, tarball: Path, store: GlobalSymbolStore,
         print(f"  [{lib}] extracted {n_extracted} files; indexing...",
               file=sys.stderr, flush=True)
         return index_lib_from_dir(lib, spec, dest, store,
-                                  workers=workers, std_arg=std_arg)
+                                  workers=workers, std_arg=std_arg,
+                                  parse_timeout_s=parse_timeout_s)
 
 
 # --------------------------------------------------------------------------- #
@@ -2311,6 +2316,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "(default A1 — the tractable high-value set).")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
                    help="Parallel parse workers.")
+    p.add_argument(
+        "--parse-timeout-seconds",
+        type=float,
+        default=PARSE_TIMEOUT_S,
+        help=(
+            "Hard wall-clock deadline for one libclang source parse "
+            f"(default {PARSE_TIMEOUT_S}s). Increase explicitly for unusually "
+            "heavy template translation units; timeouts remain fail-closed."
+        ),
+    )
     p.add_argument("--max-files-per-lib", type=int, default=MAX_FILES_PER_LIB_DEFAULT,
                    help=f"Cap files indexed per base-lib (default {MAX_FILES_PER_LIB_DEFAULT}).")
     p.add_argument("--std-arg", default="-std=c++17",
@@ -2365,6 +2380,8 @@ def main(argv: list[str]) -> int:
         raise SystemExit("--source-cache-dir requires --extract-cache-dir")
     if args.source_cache_dir and args.member_cap is not None:
         raise SystemExit("--source-cache-dir cannot be combined with --member-cap")
+    if args.parse_timeout_seconds <= 0:
+        raise SystemExit("--parse-timeout-seconds must be positive")
 
     tarball = Path(args.tarball)
     store = GlobalSymbolStore(args.output, read_only=args.report_only)
@@ -2437,6 +2454,7 @@ def main(argv: list[str]) -> int:
             res = index_lib_from_dir(
                 lib, spec, dirs[lib], store,
                 workers=args.workers, std_arg=args.std_arg,
+                parse_timeout_s=args.parse_timeout_seconds,
             )
             _finish(lib, spec, res)
     # ONE tarball pass extracts ALL todo libs to a shared staging root (the
@@ -2468,6 +2486,7 @@ def main(argv: list[str]) -> int:
                 res = index_lib_from_dir(
                     lib, spec, extract_root / lib, store,
                     workers=args.workers, std_arg=args.std_arg,
+                    parse_timeout_s=args.parse_timeout_seconds,
                 )
                 _finish(lib, spec, res)
                 if not args.keep_extract:
@@ -2486,6 +2505,7 @@ def main(argv: list[str]) -> int:
                 lib, spec, tarball, store,
                 workers=args.workers, max_files=args.max_files_per_lib,
                 std_arg=args.std_arg, member_cap=args.member_cap,
+                parse_timeout_s=args.parse_timeout_seconds,
             )
             _finish(lib, spec, res)
 
