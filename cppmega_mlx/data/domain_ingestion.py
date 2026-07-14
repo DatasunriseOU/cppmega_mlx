@@ -8,7 +8,6 @@ from pathlib import Path
 import os
 import re
 from typing import BinaryIO, Callable, Iterator, Mapping, Sequence, cast
-import warnings
 
 from cppmega_mlx.data.build_parsers import (
     parse_autoconf,
@@ -71,6 +70,7 @@ class DomainFileChunk:
     char_start: int
     char_end: int
     source_size_bytes: int
+    chunk_limit_bytes: int
     split_reason: str
 
     def source_span(self) -> dict[str, int | str]:
@@ -83,6 +83,7 @@ class DomainFileChunk:
             "char_start": self.char_start,
             "char_end": self.char_end,
             "source_size_bytes": self.source_size_bytes,
+            "chunk_limit_bytes": self.chunk_limit_bytes,
             "split_reason": self.split_reason,
         }
 
@@ -124,7 +125,80 @@ _SQL_TARGET_PREDECESSORS = {"TABLE", "INTO", "UPDATE", "FROM", "JOIN", "VIEW", "
 
 DOMAIN_INPUT_SIZE_LIMIT_BYTES = 500_000
 DOMAIN_STREAM_READ_BYTES = 64 * 1024
-_LARGE_DOMAIN_KINDS = frozenset({DomainKind.SQL})
+DOMAIN_SIGNATURE_READ_BYTES = 4 * 1024
+_LARGE_DOMAIN_KINDS = frozenset(
+    {
+        DomainKind.CMAKE,
+        DomainKind.MAKE,
+        DomainKind.NINJA,
+        DomainKind.BAZEL,
+        DomainKind.AUTOCONF,
+        DomainKind.AUTOMAKE,
+        DomainKind.MESON,
+        DomainKind.GN,
+        DomainKind.SCONS,
+        DomainKind.XMAKE,
+        DomainKind.CONFIGURE,
+        DomainKind.BASH,
+        DomainKind.ZSH,
+        DomainKind.SH,
+        DomainKind.TCSH,
+        DomainKind.SQL,
+        DomainKind.COMPILER_DIAGNOSTIC,
+        DomainKind.BUILD_DIAGNOSTIC,
+        DomainKind.COMPILER_ERROR,
+        DomainKind.BUILD_ERROR,
+        DomainKind.LINKER_ERROR,
+        DomainKind.TEST_OUTPUT,
+        DomainKind.LINKER_DIAGNOSTIC,
+        DomainKind.SANITIZER_OUTPUT,
+    }
+)
+_EXPLICIT_DOMAIN_NAMES = frozenset(
+    {
+        "CMakeLists.txt",
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "build.ninja",
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "WORKSPACE.bazel",
+        "MODULE.bazel",
+        "configure",
+        "configure.ac",
+        "configure.in",
+        "Makefile.am",
+        "Makefile.in",
+        "meson.build",
+        "meson_options.txt",
+        "conanfile.txt",
+        "conanfile.py",
+        "vcpkg.json",
+        "Dockerfile",
+    }
+)
+_EXPLICIT_DOMAIN_SUFFIXES = frozenset(
+    {
+        ".cmake",
+        ".mk",
+        ".ninja",
+        ".bzl",
+        ".bash",
+        ".sh",
+        ".zsh",
+        ".tcsh",
+        ".csh",
+        ".sql",
+        ".m4",
+        ".vcxproj",
+        ".sln",
+    }
+)
+_TEXT_SIGNATURE_SUFFIXES = frozenset(
+    {".diag", ".err", ".log", ".stderr", ".stdout", ".txt"}
+)
 
 
 @dataclass(frozen=True)
@@ -141,29 +215,61 @@ def _validate_utf8_domain_stream(
     *,
     path: Path,
     expected_size: int,
-) -> None:
+) -> bytes:
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     bytes_read = 0
-    while block := stream.read(DOMAIN_STREAM_READ_BYTES):
-        bytes_read += len(block)
-        if b"\0" in block:
-            raise ValueError(f"binary domain input contains NUL byte: {path}")
-        decoder.decode(block, final=False)
-    decoder.decode(b"", final=True)
+    prefix = bytearray()
+    try:
+        while block := stream.read(DOMAIN_STREAM_READ_BYTES):
+            bytes_read += len(block)
+            if b"\0" in block:
+                raise ValueError(f"binary domain input contains NUL byte: {path}")
+            decoder.decode(block, final=False)
+            if len(prefix) < DOMAIN_SIGNATURE_READ_BYTES:
+                remaining = DOMAIN_SIGNATURE_READ_BYTES - len(prefix)
+                prefix.extend(block[:remaining])
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid UTF-8 domain input {path}: {exc}") from exc
     if bytes_read != expected_size:
         raise OSError(
             f"domain input changed size while reading {path}: "
             f"expected {expected_size}, read {bytes_read}"
         )
+    return bytes(prefix)
 
 
-def _validate_utf8_domain_path(path: Path, *, expected_size: int) -> None:
+def _validate_utf8_domain_path(path: Path, *, expected_size: int) -> bytes:
     with path.open("rb") as stream:
-        _validate_utf8_domain_stream(
+        return _validate_utf8_domain_stream(
             stream,
             path=path,
             expected_size=expected_size,
         )
+
+
+def _decode_domain_bytes(raw: bytes, *, path: Path) -> str:
+    if b"\0" in raw:
+        raise ValueError(f"binary domain input contains NUL byte: {path}")
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid UTF-8 domain input {path}: {exc}") from exc
+
+
+def _read_validated_domain_text(path: Path, *, expected_size: int) -> str:
+    if expected_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+        raise ValueError(
+            f"whole domain read exceeds {DOMAIN_INPUT_SIZE_LIMIT_BYTES}-byte cap: {path}"
+        )
+    with path.open("rb") as stream:
+        raw = stream.read(DOMAIN_INPUT_SIZE_LIMIT_BYTES + 1)
+    if len(raw) != expected_size:
+        raise OSError(
+            f"domain input changed size while reading {path}: "
+            f"expected {expected_size}, read {len(raw)}"
+        )
+    return _decode_domain_bytes(raw, path=path)
 
 
 def _utf8_boundary_at_or_before(data: bytearray, limit: int) -> int:
@@ -294,6 +400,44 @@ def _sql_chunk_cut(
     return limit, "hard_limit", hard_state
 
 
+def _line_chunk_cut(
+    data: bytearray,
+    *,
+    max_chunk_bytes: int,
+) -> tuple[int, str]:
+    """Prefer a complete line without allowing tiny or oversized chunks."""
+
+    limit = _utf8_boundary_at_or_before(data, max_chunk_bytes)
+    minimum_preferred = max(1, max_chunk_bytes // 2)
+    newline = data.rfind(b"\n", minimum_preferred - 1, limit)
+    if newline >= 0:
+        return newline + 1, "line_boundary"
+    return limit, "hard_limit"
+
+
+def _is_explicit_domain_path(path: Path, *, include_cpp: bool) -> bool:
+    if path.name in _EXPLICIT_DOMAIN_NAMES:
+        return True
+    suffix = path.suffix.lower()
+    if suffix in _EXPLICIT_DOMAIN_SUFFIXES:
+        return True
+    return include_cpp and suffix in _CPP_EXTENSIONS
+
+
+def _allows_domain_content_signatures(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    return not suffix or suffix in _TEXT_SIGNATURE_SUFFIXES
+
+
+def _large_domain_is_chunkable(path: Path, adapter: DomainParserAdapter) -> bool:
+    if adapter.domain in _LARGE_DOMAIN_KINDS:
+        return True
+    return adapter.name == "raw-output" and _is_explicit_domain_path(
+        path,
+        include_cpp=False,
+    )
+
+
 def iter_domain_file_chunks(
     path: str | Path,
     *,
@@ -303,8 +447,9 @@ def iter_domain_file_chunks(
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid UTF-8 or binary data cannot leave a partially ingested document.
-    Only SQL has a typed oversized-file policy; every other domain retains the
-    existing fail-closed size limit.
+    SQL prefers statement boundaries; build, shell, and diagnostic text prefers
+    line boundaries. Every emitted chunk has an explicit hard byte cap and exact
+    byte/character provenance into the original file.
     """
 
     if not 4 <= max_chunk_bytes <= DOMAIN_INPUT_SIZE_LIMIT_BYTES:
@@ -316,14 +461,7 @@ def iter_domain_file_chunks(
     try:
         with path_obj.open("rb") as stream:
             source_size = os.fstat(stream.fileno()).st_size
-            path_adapter = resolve_domain_parser(path_obj)
-            if source_size > max_chunk_bytes and path_adapter.domain not in _LARGE_DOMAIN_KINDS:
-                raise ValueError(
-                    f"domain input exceeds {max_chunk_bytes}-byte limit and "
-                    f"{path_adapter.domain.name} has no large-input chunk policy: {path_obj}"
-                )
-
-            _validate_utf8_domain_stream(
+            signature_prefix = _validate_utf8_domain_stream(
                 stream,
                 path=path_obj,
                 expected_size=source_size,
@@ -337,7 +475,7 @@ def iter_domain_file_chunks(
                         f"domain input changed size while reading {path_obj}: "
                         f"expected {source_size}, read {len(raw)}"
                     )
-                text = raw.decode("utf-8", errors="strict")
+                text = _decode_domain_bytes(raw, path=path_obj)
                 adapter = resolve_domain_parser(path_obj, text)
                 yield DomainFileChunk(
                     path=path_obj,
@@ -350,9 +488,18 @@ def iter_domain_file_chunks(
                     char_start=0,
                     char_end=len(text),
                     source_size_bytes=source_size,
+                    chunk_limit_bytes=max_chunk_bytes,
                     split_reason="eof",
                 )
                 return
+
+            prefix_text = _decode_domain_bytes(signature_prefix, path=path_obj)
+            path_adapter = resolve_domain_parser(path_obj, prefix_text)
+            if not _large_domain_is_chunkable(path_obj, path_adapter):
+                raise ValueError(
+                    f"domain input exceeds {max_chunk_bytes}-byte limit and "
+                    f"{path_adapter.domain.name} has no large-input chunk policy: {path_obj}"
+                )
 
             buffer = bytearray()
             byte_start = 0
@@ -362,14 +509,20 @@ def iter_domain_file_chunks(
             while block := stream.read(DOMAIN_STREAM_READ_BYTES):
                 buffer.extend(block)
                 while len(buffer) > max_chunk_bytes:
-                    cut, split_reason, sql_state = _sql_chunk_cut(
-                        buffer,
-                        max_chunk_bytes=max_chunk_bytes,
-                        initial_state=sql_state,
-                    )
+                    if path_adapter.domain == DomainKind.SQL:
+                        cut, split_reason, sql_state = _sql_chunk_cut(
+                            buffer,
+                            max_chunk_bytes=max_chunk_bytes,
+                            initial_state=sql_state,
+                        )
+                    else:
+                        cut, split_reason = _line_chunk_cut(
+                            buffer,
+                            max_chunk_bytes=max_chunk_bytes,
+                        )
                     raw = bytes(buffer[:cut])
                     del buffer[:cut]
-                    text = raw.decode("utf-8", errors="strict")
+                    text = _decode_domain_bytes(raw, path=path_obj)
                     byte_end = byte_start + len(raw)
                     char_end = char_start + len(text)
                     yield DomainFileChunk(
@@ -383,6 +536,7 @@ def iter_domain_file_chunks(
                         char_start=char_start,
                         char_end=char_end,
                         source_size_bytes=source_size,
+                        chunk_limit_bytes=max_chunk_bytes,
                         split_reason=split_reason,
                     )
                     byte_start = byte_end
@@ -390,7 +544,7 @@ def iter_domain_file_chunks(
                     chunk_index += 1
 
             raw = bytes(buffer)
-            text = raw.decode("utf-8", errors="strict")
+            text = _decode_domain_bytes(raw, path=path_obj)
             byte_end = byte_start + len(raw)
             if byte_end != source_size:
                 raise OSError(
@@ -408,6 +562,7 @@ def iter_domain_file_chunks(
                 char_start=char_start,
                 char_end=char_start + len(text),
                 source_size_bytes=source_size,
+                chunk_limit_bytes=max_chunk_bytes,
                 split_reason="eof",
             )
     except OSError as exc:
@@ -596,6 +751,19 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["tcsh"]
     if suffix == ".sql":
         return _ADAPTERS["sql"]
+
+    # Known but currently raw build formats are still path-typed inputs. Do not
+    # reinterpret their contents as diagnostics before the indexer's build-kind
+    # adapter assigns the final domain identity.
+    if _is_explicit_domain_path(path_obj, include_cpp=False):
+        return _ADAPTERS["raw"]
+
+    # Content signatures are only meaningful for text-like logs or
+    # extensionless files. Arbitrary assets must not become diagnostics because
+    # their basename starts with "link", "test", or "build", or because binary
+    # bytes happen to contain one of the textual markers below.
+    if not _allows_domain_content_signatures(path_obj):
+        return _ADAPTERS["raw"]
 
     lower = text.lower()
     if any(tool.lower() in lower for tool in (
@@ -871,20 +1039,11 @@ def discover_project_domain_files(
     extra_exclude_dirs: set[str] | None = None,
     include_cpp: bool = True,
 ) -> list[DiscoveredDomainFile]:
-    """Discover supported project-domain files without treating every file as raw."""
+    """Discover typed text inputs without opening unrelated binary assets."""
 
     root_path = Path(root)
     skip_dirs = {".git"} | (extra_exclude_dirs or set())
     discovered: list[DiscoveredDomainFile] = []
-    known_names = {
-        "CMakeLists.txt", "Makefile", "GNUmakefile", "makefile", "build.ninja",
-        "BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel",
-        "configure", "configure.ac", "configure.in", "Makefile.am", "Makefile.in",
-    }
-    known_suffixes = {
-        ".cmake", ".mk", ".ninja", ".bzl", ".bash", ".sh", ".zsh", ".tcsh",
-        ".csh", ".sql", ".m4", *(_CPP_EXTENSIONS if include_cpp else set()),
-    }
 
     def candidate_paths() -> Iterator[Path]:
         for directory, dirs, filenames in os.walk(root_path):
@@ -893,40 +1052,55 @@ def discover_project_domain_files(
                 yield Path(directory) / name
 
     for path in candidate_paths():
-        known_candidate = path.name in known_names or path.suffix.lower() in known_suffixes
+        explicit_candidate = _is_explicit_domain_path(path, include_cpp=include_cpp)
+        signature_candidate = _allows_domain_content_signatures(path)
+        if not explicit_candidate and not signature_candidate:
+            continue
+
+        ambiguous_extensionless = not explicit_candidate and not path.suffix
         try:
             source_size = path.stat().st_size
-            if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
-                if not known_candidate:
+            if ambiguous_extensionless:
+                with path.open("rb") as stream:
+                    prefix = stream.read(DOMAIN_SIGNATURE_READ_BYTES)
+                try:
+                    prefix_text = _decode_domain_bytes(prefix, path=path)
+                except ValueError:
                     continue
-                adapter = resolve_domain_parser(path)
-                if adapter.domain not in _LARGE_DOMAIN_KINDS:
+                prefix_adapter = resolve_domain_parser(path, prefix_text)
+                implicit_typed = prefix_adapter.name != "raw-output"
+                if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES and not implicit_typed:
+                    continue
+            else:
+                implicit_typed = False
+
+            if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+                prefix = _validate_utf8_domain_path(path, expected_size=source_size)
+                adapter = resolve_domain_parser(
+                    path,
+                    _decode_domain_bytes(prefix, path=path),
+                )
+                if adapter.name == "raw-output" and not explicit_candidate:
+                    continue
+                if not _large_domain_is_chunkable(path, adapter):
                     raise ValueError(
                         "domain input exceeds "
                         f"{DOMAIN_INPUT_SIZE_LIMIT_BYTES}-byte limit and "
                         f"{adapter.domain.name} has no large-input chunk policy: {path}"
                     )
-                _validate_utf8_domain_path(path, expected_size=source_size)
-                text = None
             else:
-                text = path.read_text(
-                    encoding="utf-8",
-                    errors="strict" if known_candidate else "replace",
-                )
-        except UnicodeError as exc:
-            if known_candidate:
-                warnings.warn(
-                    f"skipping non-UTF-8 domain input {path}: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            continue
+                try:
+                    text = _read_validated_domain_text(path, expected_size=source_size)
+                except ValueError:
+                    if ambiguous_extensionless and not implicit_typed:
+                        continue
+                    raise
+                adapter = resolve_domain_parser(path, text)
         except OSError as exc:
-            if known_candidate:
+            if explicit_candidate or not ambiguous_extensionless:
                 raise OSError(f"failed to read domain input {path}: {exc}") from exc
             continue
-        if text is not None:
-            adapter = resolve_domain_parser(path, text)
+
         if adapter.name == "raw-output" or (
             not include_cpp and adapter.domain == DomainKind.CPP
         ):

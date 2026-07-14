@@ -254,7 +254,7 @@ def test_index_project_discovers_shells_and_keeps_autotools_kinds_distinct(
     }
 
 
-def test_domain_discovery_fails_loud_on_large_or_unreadable_inputs(
+def test_domain_discovery_chunks_large_and_fails_loud_on_unreadable_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -263,20 +263,22 @@ def test_domain_discovery_fails_loud_on_large_or_unreadable_inputs(
 
     build_file = tmp_path / "CMakeLists.txt"
     build_file.write_text("x" * 500_001)
-    with pytest.raises(ValueError, match="exceeds"):
-        discover_project_domain_files(tmp_path)
-    with pytest.raises(ValueError, match="exceeds"):
-        index_project.find_build_files(str(tmp_path))
+    assert [item.path for item in discover_project_domain_files(tmp_path)] == [
+        build_file
+    ]
+    assert index_project.find_build_files(str(tmp_path)) == [
+        (str(build_file), "cmake")
+    ]
 
     build_file.write_text("add_library(app app.cpp)\n")
-    original_read_text = Path.read_text
+    original_open = Path.open
 
-    def _read_text(path: Path, *args, **kwargs):
+    def _open(path: Path, *args, **kwargs):
         if path == build_file:
             raise OSError("simulated read failure")
-        return original_read_text(path, *args, **kwargs)
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", _read_text)
+    monkeypatch.setattr(Path, "open", _open)
     with pytest.raises(OSError, match="failed to read domain input"):
         discover_project_domain_files(tmp_path)
 
@@ -318,9 +320,8 @@ def test_compile_commands_is_compile_db_input_not_build_domain_text(
     assert "-std=c++20" in compile_db[first_source]["compile_args"]
 
 
-def test_non_utf8_domain_input_is_explicitly_excluded_without_lossy_decode(
+def test_non_utf8_domain_input_fails_closed_without_lossy_decode(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from cppmega_mlx.data.domain_ingestion import discover_project_domain_files
     from tools.clang_indexer import index_project
@@ -328,16 +329,14 @@ def test_non_utf8_domain_input_is_explicitly_excluded_without_lossy_decode(
     script = tmp_path / "invalid.sh"
     script.write_bytes(b"#!/bin/sh\nprintf '\xff'\n")
 
-    with pytest.warns(RuntimeWarning, match="skipping non-UTF-8 domain input"):
-        assert discover_project_domain_files(tmp_path) == []
+    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+        discover_project_domain_files(tmp_path)
 
-    assert index_project.emit_build_documents(
-        [(str(script), "sh")],
-        default_build_info=None,
-    ) == []
-    captured = capsys.readouterr()
-    assert "SKIP domain_non_utf8" in captured.err
-    assert "skipped_non_utf8=1" in captured.err
+    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+        index_project.emit_build_documents(
+            [(str(script), "sh")],
+            default_build_info=None,
+        )
 
 
 def test_shell_shebang_overrides_generic_sh_suffix_in_both_discovery_paths(

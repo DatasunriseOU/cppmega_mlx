@@ -682,9 +682,9 @@ BUILD_EXT_KINDS: dict[str, str] = {
     ".vcxproj": "msvc",
     ".sln": "msvc",
 }
-# Cap the build slice to a sane share of corpus tokens so a giant build tree can
-# never dominate the LM corpus. Applied at discovery (see find_build_files).
-BUILD_FILE_SIZE_CAP = 500_000  # bytes; mirror find_cpp_files' per-file cap
+# Hard cap for each emitted build/domain document. Legitimate larger text files
+# are streamed into chunks at this size instead of aborting repository ingestion.
+BUILD_FILE_SIZE_CAP = 500_000
 SHELL_EXT_KINDS: dict[str, str] = {
     ".bash": "bash",
     ".sh": "sh",
@@ -2620,10 +2620,7 @@ def find_build_files(
                 continue
             filepath = os.path.join(root, fname)
             try:
-                if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
-                    raise ValueError(
-                        f"build/domain input exceeds {BUILD_FILE_SIZE_CAP}-byte limit: {filepath}"
-                    )
+                _ = os.path.getsize(filepath)
             except OSError as exc:
                 raise OSError(f"failed to stat build/domain input {filepath}: {exc}") from exc
             files.append((filepath, build_kind))
@@ -2633,13 +2630,26 @@ def find_build_files(
 def _classify_shell_file(filepath: str, fname: str) -> str | None:
     if classify_build_file(fname) is not None:
         return None
-    extension_kind = SHELL_EXT_KINDS.get(os.path.splitext(fname)[1].lower())
+    suffix = os.path.splitext(fname)[1].lower()
+    extension_kind = SHELL_EXT_KINDS.get(suffix)
+    if extension_kind is None and suffix:
+        return None
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-            first_line = fh.readline(512).lower()
+        with Path(filepath).open("rb") as fh:
+            first_line_bytes = fh.readline(512)
     except OSError as exc:
         if extension_kind is not None:
             raise OSError(f"failed to read shell/domain input {filepath}: {exc}") from exc
+        return None
+    if b"\0" in first_line_bytes:
+        if extension_kind is not None:
+            raise ValueError(f"binary shell/domain input contains NUL byte: {filepath}")
+        return None
+    try:
+        first_line = first_line_bytes.decode("utf-8", errors="strict").lower()
+    except UnicodeDecodeError as exc:
+        if extension_kind is not None:
+            raise ValueError(f"invalid UTF-8 shell/domain input {filepath}: {exc}") from exc
         return None
     if first_line.startswith("#!"):
         words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
@@ -2665,10 +2675,7 @@ def find_shell_files(
             if shell_kind is None:
                 continue
             try:
-                if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
-                    raise ValueError(
-                        f"shell/domain input exceeds {BUILD_FILE_SIZE_CAP}-byte limit: {filepath}"
-                    )
+                _ = os.path.getsize(filepath)
             except OSError as exc:
                 raise OSError(f"failed to stat shell/domain input {filepath}: {exc}") from exc
             files.append((filepath, shell_kind))
@@ -4983,8 +4990,9 @@ def build_enriched_doc(
 # --------------------------------------------------------------------------- #
 # Build-file doc emission (ADDITIVE).
 #
-# A build file is emitted as a 'build' enriched doc with the SAME dict shape as
-# build_enriched_doc, but: full raw text; structure_ids ALL set to BUILD_KIND=9
+# A build-file chunk is emitted as a 'build' enriched doc with the SAME dict
+# shape as build_enriched_doc, but: exact span text; structure_ids ALL set to
+# BUILD_KIND=9
 # (extends the 0-8 code-kind vocab); EMPTY call/type/symbol graph (correct --
 # build files are not C++, like commit docs on the code channels); a doc_type of
 # 'build'; and a language_info whose primary_language is the build-system tag
@@ -5045,16 +5053,21 @@ def _build_domain_sidecars(
     resolved_adapter = (
         resolve_domain_parser(resolved_path, text) if resolved_path is not None else None
     )
-    if resolved_adapter is not None and resolved_adapter.name != "raw-output":
-        assert resolved_path is not None
+    if parser_path is not None:
         parsed = parse_domain_document(
-            resolved_path,
+            parser_path,
             text,
             source_doc_id=source_doc_id,
         )
-    elif parser_path is not None:
+        if resolved_path is not None and resolved_path != parser_path:
+            parsed.metadata["source_path"] = resolved_path
+            parsed.set_source_identity(
+                source_identity_for_path(resolved_path, text=text)
+            )
+    elif resolved_adapter is not None and resolved_adapter.name != "raw-output":
+        assert resolved_path is not None
         parsed = parse_domain_document(
-            parser_path,
+            resolved_path,
             text,
             source_doc_id=source_doc_id,
         )
@@ -6769,17 +6782,16 @@ def emit_build_documents(
 ) -> list[dict]:
     """Emit bounded domain docs with tokenized-hash dedup.
 
-    Inputs within the domain cap remain one whole-file document. Oversized SQL
-    uses deterministic typed chunks; each chunk is deduplicated independently
-    and carries its exact source byte/character span. Uses the SAME shared
-    DedupStore tables (token-id exact + near) so domain docs dedup globally and
-    resumably.
+    Inputs within the domain cap remain one whole-file document. Oversized SQL,
+    build, shell, and diagnostic text use deterministic typed chunks; each
+    chunk is deduplicated independently and carries its exact source
+    byte/character span. Uses the SAME shared DedupStore tables (token-id exact
+    + near) so domain docs dedup globally and resumably.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
-    that tokenizes empty RAISES. Non-UTF-8 text inputs are not replacement-decoded:
-    they are explicitly counted and logged as skipped because their bytes cannot
-    satisfy the tokenizer/source-identity text contract. Truly empty/whitespace
-    files are likewise counted and skipped.
+    that tokenizes empty RAISES. NUL-bearing and invalid UTF-8 explicit domain
+    inputs also raise before any chunk is emitted. Truly empty/whitespace files
+    are counted and skipped.
     """
     docs: list[dict] = []
     if not build_files:
@@ -6812,75 +6824,68 @@ def emit_build_documents(
 
     dropped = 0
     skipped_empty = 0
-    skipped_non_utf8 = 0
     from cppmega_mlx.data.domain_ingestion import iter_domain_file_chunks
 
     for filepath, build_kind in sorted(build_files):
-        try:
-            source_chunks = iter_domain_file_chunks(filepath)
-            for source_chunk in source_chunks:
-                text = source_chunk.text
-                if not text or not text.strip():
-                    skipped_empty += 1
-                    continue
+        source_chunks = iter_domain_file_chunks(
+            filepath,
+            max_chunk_bytes=BUILD_FILE_SIZE_CAP,
+        )
+        for source_chunk in source_chunks:
+            text = source_chunk.text
+            if not text or not text.strip():
+                skipped_empty += 1
+                continue
 
-                per_file_build_info = dict(default_build_info) if default_build_info else {}
-                if build_kind not in {
-                    "bash",
-                    "sh",
-                    "zsh",
-                    "tcsh",
-                    "sql",
-                    "compiler_diagnostic",
-                    "linker_diagnostic",
-                    "build_diagnostic",
-                    "sanitizer_output",
-                    "test_output",
-                    "tool_output",
-                }:
-                    per_file_build_info["build_system"] = build_kind
+            per_file_build_info = dict(default_build_info) if default_build_info else {}
+            if build_kind not in {
+                "bash",
+                "sh",
+                "zsh",
+                "tcsh",
+                "sql",
+                "compiler_diagnostic",
+                "linker_diagnostic",
+                "build_diagnostic",
+                "sanitizer_output",
+                "test_output",
+                "tool_output",
+            }:
+                per_file_build_info["build_system"] = build_kind
 
-                if tok is not None:
-                    token_ids = tok.encode(text)
-                    if not token_ids:
-                        raise RuntimeError(
-                            f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
-                            f"tokenizer/build-doc bug (RULE #1: fail loud)"
-                        )
-                    if store is not None:
-                        if store.seen_exact_tokens(token_ids):
-                            dropped += 1
-                            continue
-                        if dedup_near and store.seen_near_tokens(token_ids):
-                            dropped += 1
-                            continue
-                    else:
-                        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
-                        h = _sha1_tokens(token_ids)
-                        if h in seen_local:
-                            dropped += 1
-                            continue
-                        seen_local.add(h)
-
-                record_doc(
-                    build_build_doc(
-                        filepath,
-                        text,
-                        build_kind,
-                        source_root=source_root,
-                        project_id=project_id,
-                        build_info=per_file_build_info or None,
-                        source_span=source_chunk.source_span(),
+            if tok is not None:
+                token_ids = tok.encode(text)
+                if not token_ids:
+                    raise RuntimeError(
+                        f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
+                        f"tokenizer/build-doc bug (RULE #1: fail loud)"
                     )
+                if store is not None:
+                    if store.seen_exact_tokens(token_ids):
+                        dropped += 1
+                        continue
+                    if dedup_near and store.seen_near_tokens(token_ids):
+                        dropped += 1
+                        continue
+                else:
+                    _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
+                    h = _sha1_tokens(token_ids)
+                    if h in seen_local:
+                        dropped += 1
+                        continue
+                    seen_local.add(h)
+
+            record_doc(
+                build_build_doc(
+                    filepath,
+                    text,
+                    build_kind,
+                    source_root=source_root,
+                    project_id=project_id,
+                    build_info=per_file_build_info or None,
+                    source_span=source_chunk.source_span(),
                 )
-        except UnicodeError as exc:
-            skipped_non_utf8 += 1
-            print(
-                "  SKIP domain_non_utf8 "
-                f"kind={build_kind} path={filepath!r} error={exc}",
-                file=sys.stderr,
             )
-            continue
 
     if store is not None:
         store.commit()
@@ -6888,7 +6893,7 @@ def emit_build_documents(
 
     print(
         f"  Build docs: emitted={emitted} dropped_dup={dropped} "
-        f"skipped_empty={skipped_empty} skipped_non_utf8={skipped_non_utf8} "
+        f"skipped_empty={skipped_empty} "
         "(bounded-domain tokenized-hash dedup)",
         file=sys.stderr,
     )
