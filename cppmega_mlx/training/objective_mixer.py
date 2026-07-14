@@ -662,6 +662,7 @@ def production_training_loss(
     loss_mask: mx.array,
     *,
     side_channels: Mapping[str, mx.array],
+    document_ids: mx.array | None,
     block_bias: mx.array | None,
     graph_targets: mx.array | None,
     graph_pair_mask: mx.array | None,
@@ -683,11 +684,19 @@ def production_training_loss(
         )
     if block_bias is None:
         raise ValueError("production graph objective requires graph route block_bias")
+    if document_ids is None:
+        raise ValueError("production graph objective requires document_ids")
+    if tuple(document_ids.shape) != tuple(input_ids.shape):
+        raise ValueError(
+            "production graph objective document_ids must match input_ids shape "
+            f"{tuple(input_ids.shape)}, got {tuple(document_ids.shape)}"
+        )
     model_config = getattr(model, "config", None)
     if (
         model_config is None
         or getattr(model_config, "attention_mode", None) != "dsa"
         or getattr(model_config, "require_graph_routes", None) is not True
+        or getattr(model_config, "graph_routes_enabled", None) is not True
     ):
         raise ValueError(
             "production graph objective requires active fail-closed DSA graph routes"
@@ -713,11 +722,14 @@ def production_training_loss(
             "production graph objective is missing required structure sidecars: "
             + ", ".join(missing_structure_channels)
         )
+    edge_kind_bias = mx.zeros_like(block_bias)
     _, lm_loss = model(
         input_ids,
         targets=targets,
         loss_mask=loss_mask,
+        document_ids=document_ids,
         block_bias=block_bias,
+        edge_kind_bias=edge_kind_bias,
         **side_channels,
     )
     if lm_loss is None:  # pragma: no cover - targets make this unreachable
@@ -725,7 +737,9 @@ def production_training_loss(
     graph_loss = graph_auxiliary_loss_from_targets(
         model.indexer_scores(
             input_ids,
+            document_ids=document_ids,
             block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
             **side_channels,
         ),
         graph_targets,

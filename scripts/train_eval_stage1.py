@@ -163,6 +163,7 @@ class ObjectiveBatch:
     input_ids: mx.array
     targets: mx.array
     loss_mask: mx.array
+    document_ids: mx.array
     side_channels: dict[str, mx.array]
     block_bias: mx.array
     graph_targets: mx.array
@@ -203,6 +204,22 @@ def _materialize_batch(
     loss_mask = mx.array(
         [_pad(example.loss_mask, seq_len) for example in examples], dtype=mx.float32
     )
+    document_rows: list[list[int]] = []
+    for example, source in entries:
+        input_length = int(example.input_ids.shape[0])
+        if task in _ALIGNED_TASKS:
+            packet = _code_packet(source, task)
+            assert packet is not None
+            if packet.document_ids is None:
+                raise ValueError(
+                    f"{task.value}: required aligned channel document_ids is absent"
+                )
+            document_rows.append(
+                _pad(packet.document_ids[:input_length], seq_len)
+            )
+        else:
+            document_rows.append([1] * input_length + [0] * (seq_len - input_length))
+    document_ids = mx.array(document_rows, dtype=mx.int32)
 
     side_channels: dict[str, mx.array] = {}
     if task in _ALIGNED_TASKS:
@@ -258,6 +275,7 @@ def _materialize_batch(
         input_ids=input_ids,
         targets=targets,
         loss_mask=loss_mask,
+        document_ids=document_ids,
         side_channels=side_channels,
         block_bias=targets_array,
         graph_targets=targets_array,
@@ -314,7 +332,7 @@ def _objective_batches(
 def _load_val_rows(val_shard: str, seq_len: int, max_rows: int) -> list[dict]:
     """Load a FIXED held-out validation row set (never trained on)."""
     need = seq_len + 1
-    val_columns = [TOKEN_COL, *(source for source, _target in CHANNELS)]
+    val_columns = [TOKEN_COL, "doc_ids", *(source for source, _target in CHANNELS)]
     table = pq.read_table(val_shard, columns=val_columns)
     cols = {name: table[name].to_pylist() for name in val_columns}
     n = len(cols[TOKEN_COL])
@@ -324,6 +342,10 @@ def _load_val_rows(val_shard: str, seq_len: int, max_rows: int) -> list[dict]:
         if toks is None or len(toks) < need:
             continue
         row = {"token_ids": toks}
+        doc_ids = cols["doc_ids"][ri]
+        if doc_ids is None or len(doc_ids) < need:
+            continue
+        row["doc_ids"] = doc_ids
         skip = False
         for src, _dst in CHANNELS:
             chan = cols[src][ri]
@@ -347,11 +369,14 @@ def _val_batch(rows: list[dict], idx: list[int], seq_len: int):
     toks = [rows[i]["token_ids"] for i in idx]
     input_ids = _stack(toks, seq_len, 0)
     targets = _stack(toks, seq_len, 1)
+    docs = [rows[i]["doc_ids"] for i in idx]
+    document_ids = _stack(docs, seq_len, 0)
+    target_document_ids = _stack(docs, seq_len, 1)
     side = {}
     for src, dst in CHANNELS:
         side[dst] = _stack([rows[i][src] for i in idx], seq_len, 0)
-    loss_mask = mx.ones((len(idx), seq_len), dtype=mx.float32)
-    return input_ids, targets, loss_mask, side
+    loss_mask = (document_ids == target_document_ids).astype(mx.float32)
+    return input_ids, targets, loss_mask, document_ids, side
 
 
 def _peak_gb() -> float:
@@ -367,7 +392,9 @@ def evaluate_val(model, val_rows, batch, seq_len, step) -> tuple[float, float]:
         idx = list(range(start, min(start + batch, len(val_rows))))
         if len(idx) < 1:
             continue
-        input_ids, targets, loss_mask, side = _val_batch(val_rows, idx, seq_len)
+        input_ids, targets, loss_mask, document_ids, side = _val_batch(
+            val_rows, idx, seq_len
+        )
         block_bias = (
             mx.zeros((len(idx), seq_len, seq_len), dtype=mx.float32)
             if model.config.attention_mode == "dsa"
@@ -377,7 +404,9 @@ def evaluate_val(model, val_rows, batch, seq_len, step) -> tuple[float, float]:
             input_ids,
             targets=targets,
             loss_mask=loss_mask,
+            document_ids=document_ids,
             block_bias=block_bias,
+            edge_kind_bias=None if block_bias is None else mx.zeros_like(block_bias),
             **side,
         )
         mx.eval(loss)
@@ -397,12 +426,18 @@ def _decode_continuation(model, prefix_ids, gen_tokens, seq_len, temperature):
     for _ in range(gen_tokens):
         window = ctx[-seq_len:]
         inp = mx.array([window], dtype=mx.int32)
+        document_ids = mx.ones_like(inp)
         block_bias = (
             mx.zeros((1, len(window), len(window)), dtype=mx.float32)
             if model.config.attention_mode == "dsa"
             else None
         )
-        logits, _ = model(inp, block_bias=block_bias)
+        logits, _ = model(
+            inp,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=None if block_bias is None else mx.zeros_like(block_bias),
+        )
         last = logits[0, -1]
         if temperature and temperature > 0:
             probs = mx.softmax(last.astype(mx.float32) / temperature)
@@ -627,6 +662,7 @@ def main() -> None:
         attention_mode="dsa" if graph_aux_enabled else "gqa",
         attention_sparse_topk=args.graph_topk,
         require_graph_routes=graph_aux_enabled,
+        graph_routes_enabled=graph_aux_enabled,
         grad_checkpoint=args.grad_checkpoint,
         chunked_ce=args.chunked_ce,
         ce_chunk_size=args.ce_chunk_size,
@@ -691,6 +727,7 @@ def main() -> None:
         input_ids,
         targets,
         loss_mask,
+        document_ids,
         side,
         block_bias,
         graph_targets,
@@ -702,6 +739,7 @@ def main() -> None:
             targets,
             loss_mask,
             side_channels=side,
+            document_ids=document_ids,
             block_bias=block_bias if graph_aux_enabled else None,
             graph_targets=graph_targets if graph_aux_enabled else None,
             graph_pair_mask=graph_pair_mask if graph_aux_enabled else None,
@@ -711,12 +749,13 @@ def main() -> None:
 
     aligned_loss_and_grad = nn.value_and_grad(
         model,
-        lambda input_ids, targets, loss_mask, side_vals, block_bias,
+        lambda input_ids, targets, loss_mask, document_ids, side_vals, block_bias,
         graph_targets, graph_pair_mask: _objective_loss(
             model,
             input_ids,
             targets,
             loss_mask,
+            document_ids,
             {
                 dst: side_vals[index]
                 for index, (_src, dst) in enumerate(CHANNELS)
@@ -728,7 +767,7 @@ def main() -> None:
     )
 
     def _reordered_lm_loss(
-        model, input_ids, targets, loss_mask, block_bias, graph_targets,
+        model, input_ids, targets, loss_mask, document_ids, block_bias, graph_targets,
         graph_pair_mask,
     ):
         del graph_targets, graph_pair_mask
@@ -736,7 +775,9 @@ def main() -> None:
             input_ids,
             targets=targets,
             loss_mask=loss_mask,
+            document_ids=document_ids,
             block_bias=block_bias,
+            edge_kind_bias=mx.zeros_like(block_bias),
         )
         if lm_loss is None:
             raise RuntimeError("model returned no LM loss despite supplied targets")
@@ -744,12 +785,13 @@ def main() -> None:
 
     reordered_loss_and_grad = nn.value_and_grad(
         model,
-        lambda input_ids, targets, loss_mask, block_bias, graph_targets,
+        lambda input_ids, targets, loss_mask, document_ids, block_bias, graph_targets,
         graph_pair_mask: _reordered_lm_loss(
             model,
             input_ids,
             targets,
             loss_mask,
+            document_ids,
             block_bias,
             graph_targets,
             graph_pair_mask,
@@ -773,6 +815,7 @@ def main() -> None:
         input_ids,
         targets,
         loss_mask,
+        document_ids,
         side_vals,
         block_bias,
         graph_targets,
@@ -782,6 +825,7 @@ def main() -> None:
             input_ids,
             targets,
             loss_mask,
+            document_ids,
             side_vals,
             block_bias,
             graph_targets,
@@ -793,6 +837,7 @@ def main() -> None:
         input_ids,
         targets,
         loss_mask,
+        document_ids,
         block_bias,
         graph_targets,
         graph_pair_mask,
@@ -801,6 +846,7 @@ def main() -> None:
             input_ids,
             targets,
             loss_mask,
+            document_ids,
             block_bias,
             graph_targets,
             graph_pair_mask,
@@ -851,6 +897,7 @@ def main() -> None:
                 objective_batch.input_ids,
                 objective_batch.targets,
                 objective_batch.loss_mask,
+                objective_batch.document_ids,
                 side_vals,
                 objective_batch.block_bias,
                 objective_batch.graph_targets,
@@ -861,6 +908,7 @@ def main() -> None:
                 objective_batch.input_ids,
                 objective_batch.targets,
                 objective_batch.loss_mask,
+                objective_batch.document_ids,
                 objective_batch.block_bias,
                 objective_batch.graph_targets,
                 objective_batch.graph_pair_mask,

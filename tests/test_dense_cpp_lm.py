@@ -116,14 +116,27 @@ def test_gqa_kv_head_broadcasting_shapes():
 
 
 def test_gqa_attention_consumes_graph_route_bias():
-    cfg = _smoke_config(depth=1, ngram_hash_enabled=False)
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
     model = DenseCppLM(cfg)
     b = _rand_batch(cfg, 1, 8, seed=17)
+    zero_bias = mx.zeros((1, 8, 8), dtype=mx.float32)
     block_bias = mx.zeros((1, 8, 8), dtype=mx.float32)
     block_bias[:, 7, 1] = 50.0
 
-    logits_plain, _ = model(b["input_ids"])
-    logits_biased, _ = model(b["input_ids"], block_bias=block_bias)
+    logits_plain, _ = model(
+        b["input_ids"],
+        block_bias=zero_bias,
+        edge_kind_bias=zero_bias,
+    )
+    logits_biased, _ = model(
+        b["input_ids"],
+        block_bias=block_bias,
+        edge_kind_bias=zero_bias,
+    )
     mx.eval(logits_plain, logits_biased)
 
     delta = mx.abs(logits_plain - logits_biased).sum()
@@ -131,12 +144,16 @@ def test_gqa_attention_consumes_graph_route_bias():
 
 
 def test_gqa_attention_rejects_malformed_graph_route_bias():
-    cfg = _smoke_config(depth=1)
+    cfg = _smoke_config(depth=1, graph_routes_enabled=True)
     model = DenseCppLM(cfg)
     b = _rand_batch(cfg, 1, 8, seed=19)
 
     with pytest.raises(ValueError, match="attention_bias must be shaped"):
-        model(b["input_ids"], block_bias=mx.zeros((1, 7, 8), dtype=mx.float32))
+        model(
+            b["input_ids"],
+            block_bias=mx.zeros((1, 7, 8), dtype=mx.float32),
+            edge_kind_bias=mx.zeros((1, 8, 8), dtype=mx.float32),
+        )
 
 
 def test_gqa_config_rejects_equal_kv_heads():
@@ -288,6 +305,40 @@ def test_forward_packet_promotes_platform_metadata_into_model():
     assert float(mx.sum(mx.abs(logits_one - logits_two)).item()) > 1e-4
 
 
+def test_default_ngram_forward_packet_cannot_leak_between_packed_documents():
+    cfg = _smoke_config(depth=1)
+    model = DenseCppLM(cfg)
+    assert model.ngram_hash_embedding is not None
+    model.ngram_hash_embedding.out_proj.weight = mx.ones_like(
+        model.ngram_hash_embedding.out_proj.weight
+    )
+    document_ids = mx.array([1, 1, 1, 1, 2, 2, 2, 2], dtype=mx.int32)
+    suffix = mx.array([23, 29, 31, 37], dtype=mx.int32)
+    left = CodePacket(
+        token_ids=mx.concatenate(
+            [mx.array([2, 3, 5, 7], dtype=mx.int32), suffix]
+        ),
+        document_ids=document_ids,
+    )
+    right = CodePacket(
+        token_ids=mx.concatenate(
+            [mx.array([11, 13, 17, 19], dtype=mx.int32), suffix]
+        ),
+        document_ids=document_ids,
+    )
+
+    left_logits, _ = model.forward_packet(left)
+    right_logits, _ = model.forward_packet(right)
+    mx.eval(left_logits, right_logits)
+
+    np.testing.assert_allclose(
+        np.asarray(left_logits[:, 4:]),
+        np.asarray(right_logits[:, 4:]),
+        rtol=0.0,
+        atol=1e-6,
+    )
+
+
 def _single_token_chunk_graph(seq: int, pairs: list[list[int]]) -> GraphBatch:
     starts = mx.arange(seq, dtype=mx.int32)
     ends = starts + 1
@@ -394,7 +445,7 @@ def test_forward_packet_consumes_codepacket_graph_edges_when_enabled():
     assert abs(float(loss_graph.item()) - float(loss_empty.item())) > 1e-5
 
 
-def test_graph_disabled_is_exact_baseline_even_when_packet_edges_exist():
+def test_forward_packet_rejects_graph_data_when_routes_are_disabled():
     cfg = _smoke_config(depth=1, ngram_hash_enabled=False, graph_routes_enabled=False)
     model = DenseCppLM(cfg)
     seq = 8
@@ -411,21 +462,17 @@ def test_graph_disabled_is_exact_baseline_even_when_packet_edges_exist():
         chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
         chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
     )
-    empty_graph = CodePacket(
-        token_ids=tokens,
-        target_ids=targets,
-        chunk_starts=chunk_starts,
-        chunk_ends=chunk_ends,
-        chunk_kinds=mx.zeros((seq,), dtype=mx.int32),
-        chunk_dep_levels=mx.zeros((seq,), dtype=mx.int32),
-    )
+    with pytest.raises(ValueError, match="graph data.*graph_routes_enabled is false"):
+        model.forward_packet(with_graph)
 
-    logits_graph, loss_graph = model.forward_packet(with_graph)
-    logits_empty, loss_empty = model.forward_packet(empty_graph)
-    mx.eval(logits_graph, logits_empty, loss_graph, loss_empty)
 
-    np.testing.assert_array_equal(np.asarray(logits_graph), np.asarray(logits_empty))
-    assert float(loss_graph.item()) == float(loss_empty.item())
+def test_model_rejects_fixed_graph_bias_when_routes_are_disabled():
+    cfg = _smoke_config(depth=1, ngram_hash_enabled=False, graph_routes_enabled=False)
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+
+    with pytest.raises(ValueError, match="graph data.*graph_routes_enabled is false"):
+        model(tokens, block_bias=mx.zeros((1, 8, 8), dtype=mx.float32))
 
 
 def test_forward_packet_rejects_malformed_graph_edges_when_enabled():

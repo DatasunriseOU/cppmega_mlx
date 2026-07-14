@@ -429,6 +429,7 @@ def test_production_batch_window_preserves_exact_task_quotas() -> None:
 
     assert Counter(batch.task for batch in window) == Counter(rates.keys())
     assert all(batch.input_ids.shape == (2, 32) for batch in window)
+    assert all(batch.document_ids.shape == (2, 32) for batch in window)
     causal = next(batch for batch in window if batch.task is TaskKind.CAUSAL_LM)
     assert causal.graph_samples == 2
     assert float(mx.sum(causal.graph_targets).item()) == 12.0
@@ -672,12 +673,14 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
             indexer_local_window=0,
             indexer_num_sinks=0,
             require_graph_routes=True,
+            graph_routes_enabled=True,
             ngram_hash_enabled=False,
             structure_residual_scale=1.0,
             platform_residual_scale=0.0,
         )
     )
     input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    document_ids = mx.ones_like(input_ids)
     targets = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
     loss_mask = mx.ones((1, 4), dtype=mx.float32)
     graph_targets = mx.zeros((1, 4, 4), dtype=mx.float32)
@@ -709,6 +712,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
         targets,
         loss_mask,
         side_channels=structure_sidecars,
+        document_ids=document_ids,
         block_bias=graph_targets,
         graph_targets=graph_targets,
         graph_pair_mask=pair_mask,
@@ -722,7 +726,9 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
     unweighted_graph_loss = graph_auxiliary_loss_from_targets(
         model.indexer_scores(
             input_ids,
+            document_ids=document_ids,
             block_bias=graph_targets,
+            edge_kind_bias=mx.zeros_like(graph_targets),
             **structure_sidecars,
         ),
         graph_targets,
@@ -751,6 +757,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
             targets,
             loss_mask,
             side_channels=structure_sidecars,
+            document_ids=document_ids,
             block_bias=graph_targets,
             graph_targets=graph_targets,
             graph_pair_mask=pair_mask,
@@ -781,6 +788,7 @@ def test_production_loss_rejects_non_finite_graph_weight_before_forward() -> Non
             values,
             mx.ones_like(values),
             side_channels={},
+            document_ids=None,
             block_bias=None,
             graph_targets=None,
             graph_pair_mask=None,
@@ -790,16 +798,24 @@ def test_production_loss_rejects_non_finite_graph_weight_before_forward() -> Non
 
 
 @pytest.mark.parametrize(
-    ("attention_mode", "require_graph_routes", "structure_scale", "message"),
     (
-        ("gqa", True, 1.0, "active fail-closed DSA graph routes"),
-        ("dsa", False, 1.0, "active fail-closed DSA graph routes"),
-        ("dsa", True, 0.0, "active structure residual routing"),
+        "attention_mode",
+        "require_graph_routes",
+        "graph_routes_enabled",
+        "structure_scale",
+        "message",
+    ),
+    (
+        ("gqa", True, True, 1.0, "active fail-closed DSA graph routes"),
+        ("dsa", False, True, 1.0, "active fail-closed DSA graph routes"),
+        ("dsa", True, False, 1.0, "active fail-closed DSA graph routes"),
+        ("dsa", True, True, 0.0, "active structure residual routing"),
     ),
 )
 def test_production_graph_loss_rejects_disabled_routes(
     attention_mode: str,
     require_graph_routes: bool,
+    graph_routes_enabled: bool,
     structure_scale: float,
     message: str,
 ) -> None:
@@ -808,6 +824,7 @@ def test_production_graph_loss_rejects_disabled_routes(
         config=SimpleNamespace(
             attention_mode=attention_mode,
             require_graph_routes=require_graph_routes,
+            graph_routes_enabled=graph_routes_enabled,
             structure_residual_scale=structure_scale,
         )
     )
@@ -819,6 +836,7 @@ def test_production_graph_loss_rejects_disabled_routes(
             values,
             mx.ones_like(values),
             side_channels={},
+            document_ids=values,
             block_bias=mx.zeros((1, 2, 2)),
             graph_targets=mx.zeros((1, 2, 2)),
             graph_pair_mask=mx.ones((1, 2, 2)),
@@ -833,6 +851,7 @@ def test_production_graph_loss_rejects_missing_structure_sidecars() -> None:
         config=SimpleNamespace(
             attention_mode="dsa",
             require_graph_routes=True,
+            graph_routes_enabled=True,
             structure_residual_scale=1.0,
         )
     )
@@ -844,6 +863,7 @@ def test_production_graph_loss_rejects_missing_structure_sidecars() -> None:
             values,
             mx.ones_like(values),
             side_channels={"structure_ids": values},
+            document_ids=values,
             block_bias=mx.zeros((1, 2, 2)),
             graph_targets=mx.zeros((1, 2, 2)),
             graph_pair_mask=mx.ones((1, 2, 2)),

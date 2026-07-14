@@ -61,6 +61,20 @@ from cppmega_mlx.nn.structure_embedding import CppMegaStructureEmbedding
 # SDPA paths. MLA is deliberately absent until this model has latent projections.
 DenseAttentionMode = Literal["dsa", "full", "gqa"]
 
+_PACKET_GRAPH_FIELDS = (
+    "call_edges",
+    "type_edges",
+    "domain_edges",
+    "build_edges",
+    "shell_edges",
+    "diagnostic_edges",
+    "cross_domain_edges",
+    "chunk_starts",
+    "chunk_ends",
+    "chunk_kinds",
+    "chunk_dep_levels",
+)
+
 
 @dataclass(frozen=True)
 class DenseCppLMConfig:
@@ -518,6 +532,7 @@ class DenseCppLM(nn.Module):
         self,
         input_ids: mx.array,
         *,
+        document_ids: mx.array | None = None,
         structure_ids: mx.array | None = None,
         dep_levels: mx.array | None = None,
         ast_depth_ids: mx.array | None = None,
@@ -541,11 +556,17 @@ class DenseCppLM(nn.Module):
                 f"{self.config.max_seq_length}"
             )
 
+        document_ids = _check_side_channel(
+            "document_ids", document_ids, batch_size, seq_length
+        )
         positions = mx.arange(seq_length)[None, :]
         hidden = self.token_embedding(input_ids) + self.position_embedding(positions)
 
         if self.ngram_hash_embedding is not None and self.config.ngram_residual_scale:
-            ngram = self.ngram_hash_embedding(input_ids).astype(hidden.dtype)
+            ngram = self.ngram_hash_embedding(
+                input_ids,
+                document_ids=document_ids,
+            ).astype(hidden.dtype)
             hidden = hidden + _scaled(ngram, self.config.ngram_residual_scale, hidden)
 
         if self.config.structure_residual_scale:
@@ -645,6 +666,7 @@ class DenseCppLM(nn.Module):
         )
         hidden = self.embed(
             input_ids,
+            document_ids=document_ids,
             structure_ids=structure_ids,
             dep_levels=dep_levels,
             ast_depth_ids=ast_depth_ids,
@@ -697,6 +719,16 @@ class DenseCppLM(nn.Module):
         edge_kind_bias: mx.array | None,
         document_ids: mx.array | None,
     ) -> mx.array | None:
+        if not self.config.graph_routes_enabled:
+            if (
+                graph_batch is not None
+                or block_bias is not None
+                or edge_kind_bias is not None
+            ):
+                raise ValueError(
+                    "DenseCppLM received graph data while graph_routes_enabled is false"
+                )
+            return None
         expected_shape = (
             int(input_ids.shape[0]),
             int(input_ids.shape[1]),
@@ -712,12 +744,6 @@ class DenseCppLM(nn.Module):
             edge_kind_bias,
             expected_shape=expected_shape,
         )
-        if not self.config.graph_routes_enabled:
-            if block_bias is None:
-                return edge_kind_bias
-            if edge_kind_bias is None:
-                return block_bias
-            return block_bias + edge_kind_bias
         if graph_batch is None:
             if block_bias is None:
                 raise RuntimeError(
@@ -792,6 +818,14 @@ class DenseCppLM(nn.Module):
         )
         relation_bias = lm_batch.graph_attention_bias
         kind_bias = lm_batch.graph_edge_kind_bias
+        if not self.config.graph_routes_enabled and (
+            lm_batch.graph_batch is not None
+            or relation_bias is not None
+            or kind_bias is not None
+        ):
+            raise ValueError(
+                "DenseCppLM received graph data while graph_routes_enabled is false"
+            )
         if self.config.graph_routes_enabled and (
             relation_bias is None or kind_bias is None
         ):
@@ -1060,6 +1094,14 @@ class DenseCppLM(nn.Module):
             packet.metadata.get("platform_ids") if packet.metadata else None
         )
         platform_ids = _as_platform_batch(raw_platform_ids)
+        packet_graph_fields = tuple(
+            name for name in _PACKET_GRAPH_FIELDS if name in packet.present_fields()
+        )
+        if not self.config.graph_routes_enabled and packet_graph_fields:
+            raise ValueError(
+                "DenseCppLM.forward_packet received graph data while "
+                "graph_routes_enabled is false: " + ", ".join(packet_graph_fields)
+            )
         return self(
             input_ids,
             targets=targets,
@@ -1073,6 +1115,7 @@ class DenseCppLM(nn.Module):
             domain_ids=_as_batch_opt(packet.domain_ids),
             role_ids=_as_batch_opt(packet.role_ids),
             confidence_ids=_as_batch_opt(packet.confidence_ids),
+            document_ids=_as_batch_opt(packet.document_ids),
             graph_batch=packet.graph_batch()
             if self.config.graph_routes_enabled
             else None,

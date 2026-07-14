@@ -79,6 +79,56 @@ def test_ngram_hash_has_stable_indices_when_seeded():
     assert np.array_equal(to_numpy(first._hash_all(token_ids)), to_numpy(second._hash_all(token_ids)))
 
 
+def test_ngram_hash_resets_history_at_packed_document_boundary():
+    module = CppMegaNgramHashEmbedding(
+        hidden_size=8,
+        orders=(2, 3),
+        num_heads=2,
+        table_size=257,
+        embed_dim=4,
+        seed=17,
+    )
+    document_ids = mx.array([[1, 1, 2, 2]], dtype=mx.int32)
+    left = mx.array([[3, 5, 11, 13]], dtype=mx.int32)
+    right = mx.array([[7, 9, 11, 13]], dtype=mx.int32)
+
+    left_isolated = module._hash_all(left, document_ids=document_ids)
+    right_isolated = module._hash_all(right, document_ids=document_ids)
+    left_unsegmented = module._hash_all(left)
+    right_unsegmented = module._hash_all(right)
+
+    np.testing.assert_array_equal(
+        to_numpy(left_isolated[:, :, 2:]),
+        to_numpy(right_isolated[:, :, 2:]),
+    )
+    assert not np.array_equal(
+        to_numpy(left_unsegmented[:, :, 2]),
+        to_numpy(right_unsegmented[:, :, 2]),
+    )
+
+
+def test_ngram_hash_resets_when_document_id_is_reused_after_boundary():
+    module = CppMegaNgramHashEmbedding(
+        hidden_size=8,
+        orders=(3,),
+        num_heads=2,
+        table_size=257,
+        embed_dim=4,
+        seed=19,
+    )
+    document_ids = mx.array([[4, 9, 4, 4]], dtype=mx.int32)
+    left = mx.array([[3, 5, 11, 13]], dtype=mx.int32)
+    right = mx.array([[7, 5, 11, 13]], dtype=mx.int32)
+
+    left_indices = module._hash_all(left, document_ids=document_ids)
+    right_indices = module._hash_all(right, document_ids=document_ids)
+
+    np.testing.assert_array_equal(
+        to_numpy(left_indices[:, :, 2:]),
+        to_numpy(right_indices[:, :, 2:]),
+    )
+
+
 def test_ngram_hash_gradients_reach_unified_table_after_projection_is_enabled():
     module = CppMegaNgramHashEmbedding(
         hidden_size=16,
@@ -117,4 +167,3 @@ def test_ngram_hash_gradients_reach_unified_table_after_projection_is_enabled():
 def test_ngram_hash_validates_constructor_args(kwargs, error):
     with pytest.raises(ValueError, match=error):
         CppMegaNgramHashEmbedding(hidden_size=8, **kwargs)
-
