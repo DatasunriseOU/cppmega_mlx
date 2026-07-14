@@ -79,3 +79,41 @@ def test_objective_receipt_hash_binding_rejects_stale_values() -> None:
     stale = {"domain_schema_sha256": "0" * 64}
     with pytest.raises(ValueError, match="stale domain_schema_sha256"):
         materializer._bind_case5_contract_hashes(stale)
+
+
+def test_objective_source_snapshot_binds_exact_parquet_bytes_and_sampling(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "code.parquet"
+    second = tmp_path / "commits.parquet"
+    pq.write_table(pa.table({"value": [[1], [2]]}), first)
+    pq.write_table(pa.table({"value": [[3], [4], [5]]}), second)
+
+    snapshot, signatures = materializer._build_source_snapshot(
+        [str(second), str(first)],
+        sequence_length=1024,
+        requested_samples=12,
+        seed=17,
+    )
+
+    assert snapshot["schema"] == "cppmega_objective_source_snapshot_v1"
+    assert snapshot["sequence_length"] == 1024
+    assert snapshot["file_count"] == 2
+    assert snapshot["row_count"] == 5
+    assert snapshot["sampling"] == {
+        "mode": "deterministic_epoch_shuffle_v1",
+        "seed": 17,
+        "requested_samples": 12,
+        "full_passes": 2,
+        "tail_rows": 2,
+        "min_row_reuse": 2,
+        "max_row_reuse": 3,
+    }
+    assert snapshot["artifact_set_sha256"] == (
+        materializer._source_artifact_set_sha256(snapshot["files"])
+    )
+    materializer._require_source_snapshot_unchanged(signatures)
+
+    pq.write_table(pa.table({"value": [[9]]}), first)
+    with pytest.raises(RuntimeError, match="changed while materializing"):
+        materializer._require_source_snapshot_unchanged(signatures)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import glob
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -96,6 +97,106 @@ SOURCE_IDENTITY_TYPE = pa.struct(
         pa.field("source", pa.string(), nullable=False),
     ]
 )
+_SourceStat = tuple[int, int, int, int, int]
+
+
+def _source_stat(path: Path) -> _SourceStat:
+    stat = path.stat()
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_artifact_set_sha256(records: list[dict[str, object]]) -> str:
+    canonical = [
+        {
+            "path": str(record["path"]),
+            "size": int(record["size_bytes"]),
+            "sha256": str(record["sha256"]),
+        }
+        for record in sorted(records, key=lambda item: str(item["path"]))
+    ]
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_source_snapshot(
+    shards: list[str],
+    *,
+    sequence_length: int,
+    requested_samples: int,
+    seed: int,
+) -> tuple[dict[str, object], dict[Path, _SourceStat]]:
+    paths = sorted(Path(shard).resolve() for shard in shards)
+    if not paths or len(paths) != len(set(paths)):
+        raise ValueError("objective source shards must be non-empty and unique")
+    records: list[dict[str, object]] = []
+    signatures: dict[Path, _SourceStat] = {}
+    row_count = 0
+    for path in paths:
+        before = _source_stat(path)
+        digest = _file_sha256(path)
+        rows = int(pq.ParquetFile(path).metadata.num_rows)
+        after = _source_stat(path)
+        if before != after:
+            raise RuntimeError(f"objective source changed while hashing: {path}")
+        if rows < 1:
+            raise ValueError(f"objective source parquet is empty: {path}")
+        signatures[path] = after
+        records.append(
+            {
+                "path": path.as_posix(),
+                "size_bytes": after[2],
+                "sha256": digest,
+                "rows": rows,
+            }
+        )
+        row_count += rows
+    full_passes, tail_rows = divmod(requested_samples, row_count)
+    return (
+        {
+            "schema": "cppmega_objective_source_snapshot_v1",
+            "sequence_length": int(sequence_length),
+            "file_count": len(records),
+            "row_count": row_count,
+            "files": records,
+            "sampling": {
+                "mode": "deterministic_epoch_shuffle_v1",
+                "seed": int(seed),
+                "requested_samples": int(requested_samples),
+                "full_passes": full_passes,
+                "tail_rows": tail_rows,
+                "min_row_reuse": full_passes,
+                "max_row_reuse": full_passes + int(tail_rows > 0),
+            },
+            "artifact_set_sha256": _source_artifact_set_sha256(records),
+        },
+        signatures,
+    )
+
+
+def _require_source_snapshot_unchanged(
+    signatures: dict[Path, _SourceStat],
+) -> None:
+    for path, expected in signatures.items():
+        if _source_stat(path) != expected:
+            raise RuntimeError(
+                f"objective source changed while materializing documents: {path}"
+            )
 
 
 def materialized_schema() -> pa.Schema:
@@ -340,6 +441,12 @@ def main() -> int:
     shards = sorted(glob.glob(args.data_glob))
     if not shards:
         raise FileNotFoundError(f"no parquet shards match {args.data_glob!r}")
+    source_snapshot, source_signatures = _build_source_snapshot(
+        shards,
+        sequence_length=args.seq_len,
+        requested_samples=args.samples,
+        seed=args.seed,
+    )
 
     mixer = EligibilityAwareTaskMixer(
         STAGE1_DEFAULT_RATES,
@@ -361,6 +468,7 @@ def main() -> int:
             for item in realized
         )
         start_step += args.quota_window_samples
+    _require_source_snapshot_unchanged(source_signatures)
 
     graph_relations = tuple(
         relation.strip()
@@ -384,6 +492,7 @@ def main() -> int:
         graph_config=graph_config,
         graph_weight=args.graph_aux_weight,
     )
+    contract["source_snapshot"] = source_snapshot
     _bind_case5_contract_hashes(contract)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
