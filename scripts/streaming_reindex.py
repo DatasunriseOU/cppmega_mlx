@@ -43,13 +43,22 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
+
+_MODULE_ROOT = Path(__file__).resolve().parents[1]
+if str(_MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MODULE_ROOT))
+
+from cppmega_mlx.data.symbol_identity import (  # noqa: E402
+    SymbolIdentityError,
+    require_project_identity,
+)
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).
 # --------------------------------------------------------------------------- #
-MLX_ROOT = Path("/Volumes/external/sources/cppmega.mlx")
-VENV_PYTHON = MLX_ROOT / ".venv" / "bin" / "python"
+MLX_ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = Path(sys.executable)
 TOKENIZER_PATH = MLX_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
 
 INDEX_PROJECT = MLX_ROOT / "tools" / "clang_indexer" / "index_project.py"
@@ -62,6 +71,7 @@ TAR_MEMBER_ROOT = "cpp_all"
 
 OUTPUT_ROOT = MLX_ROOT / "outputs" / "reindexed"
 MANIFEST_PATH = OUTPUT_ROOT / "_done.json"
+DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 
 # Tokenize at the model's full context so packing decides the final lengths.
 TOKENIZE_BUDGET = 65536
@@ -73,6 +83,51 @@ DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
 # NOT strip it there.
 SOURCE_EXTRA_EXCLUDE = ".git,.svn,node_modules,build,_build,cmake-build-debug"
 EXCLUDE_PARTS = frozenset(SOURCE_EXTRA_EXCLUDE.split(","))
+
+
+def load_project_identity_map(repo_list: Path) -> dict[str, str]:
+    if not repo_list.exists():
+        raise FileNotFoundError(f"repo identity map does not exist: {repo_list}")
+    with repo_list.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    entries = data.get("repos")
+    if not isinstance(entries, list):
+        raise SymbolIdentityError(f"{repo_list}: expected a repos list")
+    identities: dict[str, str] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise SymbolIdentityError(f"{repo_list}: repos[{index}] must be an object")
+        name = entry.get("name") or entry.get("bare_name")
+        owner_repo = entry.get("owner_repo")
+        if not isinstance(name, str) or not name:
+            continue
+        project_id = require_project_identity(
+            owner_repo, source=f"{repo_list}:repos[{index}]"
+        )
+        previous = identities.get(name)
+        if previous is not None and previous != project_id:
+            raise SymbolIdentityError(
+                f"{repo_list}: bare repo {name!r} maps to both "
+                f"{previous!r} and {project_id!r}"
+            )
+        identities[name] = project_id
+    return identities
+
+
+def resolve_project_identity(repo: str, repo_list: Path | None) -> str:
+    if "/" in repo:
+        return require_project_identity(repo, source="streaming repo")
+    if repo_list is None:
+        raise SymbolIdentityError(
+            f"repo {repo!r} has no owner/repo identity; provide --repo-list"
+        )
+    identities = load_project_identity_map(repo_list)
+    try:
+        return identities[repo]
+    except KeyError as exc:
+        raise SymbolIdentityError(
+            f"{repo_list}: no canonical owner/repo identity for bare repo {repo!r}"
+        ) from exc
 
 
 def _route_by_fit_impl():
@@ -723,6 +778,8 @@ def stream_repo_subtrees(
     finally:
         try:
             tar.close()
+        except SymbolIdentityError:
+            raise
         except Exception:
             pass
         if zstd.poll() is None:
@@ -793,6 +850,7 @@ def populate_source_cache(
 # --------------------------------------------------------------------------- #
 def stage_index_source(
     repo: str,
+    project_id: str,
     repo_dir: Path,
     work: Path,
     dedup_db: Path | None = None,
@@ -815,10 +873,14 @@ def stage_index_source(
     linking inside index_project (depth-1 pulls tagged crosslib:<repo>). None ->
     behavior unchanged.
     """
+    project_id = require_project_identity(
+        project_id, source=f"stage_index_source({repo})"
+    )
     enriched = work / f"{repo}.enriched.jsonl"
     cmd = [
         VENV_PYTHON, INDEX_PROJECT,
         "--project-dir", repo_dir,
+        "--project-id", project_id,
         "--output", enriched,
         "--enriched",
         "--max-tokens", str(TOKENIZE_BUDGET),
@@ -1032,6 +1094,7 @@ def process_one_repo(
     index_timeout_s: int | None = None,
     index_stall_timeout_s: int | None = None,
     *,
+    project_id: str,
     promote_dedup_on_success: bool = True,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
@@ -1046,6 +1109,9 @@ def process_one_repo(
     exactly one bucket -- never replicated across 1024/2048/4096.
     """
     work = work_root / repo
+    project_id = require_project_identity(
+        project_id, source=f"process_one_repo({repo})"
+    )
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
     stage_id = code_stage_id(repo) if dedup_db is not None else None
@@ -1057,7 +1123,7 @@ def process_one_repo(
         started = time.monotonic()
         try:
             enriched = stage_index_source(
-                repo, repo_dir, work, dedup_db, dedup_near,
+                repo, project_id, repo_dir, work, dedup_db, dedup_near,
                 stage_id, stage_db, global_symbol_index, memory_limit_gb,
                 parse_workers, index_timeout_s, index_stall_timeout_s,
             )
@@ -1196,6 +1262,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "When set, the CODE stage threads it into index_project so "
                         "unresolved base-lib callees are pulled in as bounded "
                         "depth-1 deps tagged crosslib:<repo>. DEFAULT off.")
+    p.add_argument(
+        "--repo-list",
+        default=str(DEFAULT_REPO_LIST),
+        help="repo_list.json mapping bare extraction names to canonical owner/repo "
+        f"identities. Default {DEFAULT_REPO_LIST}.",
+    )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
@@ -1285,6 +1357,10 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"--global-symbol-index not found: {global_symbol_index}")
         print(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
               f"threaded into CODE stage (bounded depth-1 pulls).", file=sys.stderr)
+    repo_list = Path(args.repo_list) if args.repo_list else None
+    project_id_map = (
+        load_project_identity_map(repo_list) if repo_list is not None else {}
+    )
 
     if args.work_dir:
         work_root = Path(args.work_dir)
@@ -1373,13 +1449,25 @@ def main(argv: list[str]) -> int:
         try:
             for repo, repo_dir in gen:
                 try:
+                    try:
+                        project_id = (
+                            require_project_identity(repo, source="streaming repo")
+                            if "/" in repo
+                            else project_id_map[repo]
+                        )
+                    except KeyError as exc:
+                        raise SymbolIdentityError(
+                            f"{repo_list}: no canonical owner/repo identity for "
+                            f"bare repo {repo!r}"
+                        ) from exc
                     info = process_one_repo(repo, repo_dir, target_lengths, work_root,
                                             dedup_db, dedup_near,
                                             global_symbol_index,
                                             args.memory_limit_gb,
                                             args.parse_workers,
                                             args.code_index_timeout_s,
-                                            args.code_index_stall_timeout_s)
+                                            args.code_index_stall_timeout_s,
+                                            project_id=project_id)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

@@ -163,7 +163,7 @@ def _lengths_info(lengths, valid):
     }
 
 
-def fake_run_code_half(repo, repo_dir, lengths_code, work_root, dedup_db,
+def fake_run_code_half(repo, project_id, repo_dir, lengths_code, work_root, dedup_db,
                        dedup_near, global_symbol_index=None, memory_limit_gb=10.0,
                        parse_workers=2, index_timeout_s=None,
                        index_stall_timeout_s=None, recompressor=None):

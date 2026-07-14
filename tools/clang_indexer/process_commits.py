@@ -88,11 +88,20 @@ from tools.clang_indexer.index_project import (
     register_header_macros,
     symbol_identity_for_cursor,
 )
-from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SymbolIdentityError,
+    require_project_identity,
+)
 from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 from scripts.pr_ingest import pr_store as _pr_store_mod
 from scripts.pr_ingest.render_discussion import render_discussion as _render_discussion
+
+
+class PartialParseError(RuntimeError):
+    """Raised when a commit range would publish after ordinary parse failures."""
 
 
 class PRDiscussionLookup:
@@ -877,7 +886,7 @@ class BuildContextResolver:
         repo_root: str | None,
         filepath: str,
         compile_args: list[str] | None,
-        project_id: str | None = None,
+        project_id: str,
     ) -> ProjectIndex | None:
         """Return an include-aware macro index for this commit file.
 
@@ -896,8 +905,12 @@ class BuildContextResolver:
         root_file = os.path.normpath(root_file)
         if not os.path.exists(root_file):
             return None
+        stable_project_id = require_project_identity(
+            project_id,
+            source=f"macro_index_for({filepath})",
+        )
         key = (
-            project_id or "",
+            stable_project_id,
             root,
             os.path.relpath(root_file, root),
             tuple(compile_args or ()),
@@ -917,7 +930,7 @@ class BuildContextResolver:
             index,
             [root_file],
             project_dir=root,
-            project_id=project_id,
+            project_id=stable_project_id,
             include_dirs=include_dirs,
         )
         self._macro_cache[key] = index
@@ -936,7 +949,7 @@ def analyze_file_clang(
     compile_args: list[str] | None = None,
     repo_root: str | None = None,
     build_info: dict[str, object] | None = None,
-    project_id: str | None = None,
+    project_id: str,
 ) -> FileAnalysis:
     """Parse a single file's content with libclang and extract functions/classes.
 
@@ -944,6 +957,10 @@ def analyze_file_clang(
     includes and compile_commands flags describe the real translation unit.
     Fall back to a temp source only when no repository root is available.
     """
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"analyze_file_clang({filepath})",
+    )
     if not content or len(content) < 20:
         return FileAnalysis(preamble='')
 
@@ -972,6 +989,8 @@ def analyze_file_clang(
             # unrelated records and was the main per-process RSS amplifier.
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
+    except SymbolIdentityError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
 
@@ -986,7 +1005,7 @@ def analyze_file_clang(
         tu,
         source_path,
         project_dir=identity_project_dir,
-        project_id=project_id,
+        project_id=stable_project_id,
         fallback_file=filepath,
     )
     byte_to_char = _byte_to_char_mapper(content)
@@ -1033,20 +1052,20 @@ def analyze_file_clang(
                 callee_refs, baselib_callee_refs = extract_callee_references(
                     cursor,
                     project_dir=identity_project_dir,
-                    project_id=project_id,
+                    project_id=stable_project_id,
                     fallback_file=filepath,
                 )
                 referenced_type_refs = extract_referenced_type_references(
                     cursor,
                     project_dir=identity_project_dir,
-                    project_id=project_id,
+                    project_id=stable_project_id,
                     fallback_file=filepath,
                 )
                 qname = get_qualified_name(cursor)
                 symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
                     cursor,
                     project_dir=identity_project_dir,
-                    project=project_id,
+                    project=stable_project_id,
                     fallback_file=filepath,
                 )
                 start_line = cursor.extent.start.line
@@ -1110,7 +1129,7 @@ def analyze_file_clang(
                     symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
                         cursor,
                         project_dir=identity_project_dir,
-                        project=project_id,
+                        project=stable_project_id,
                         fallback_file=filepath,
                     )
                     member_symbol_keys = []
@@ -1120,7 +1139,7 @@ def analyze_file_clang(
                         member_key, _member_usr, _member_signature = symbol_identity_for_cursor(
                             child,
                             project_dir=identity_project_dir,
-                            project=project_id,
+                            project=stable_project_id,
                             fallback_file=filepath,
                         )
                         member_symbol_keys.append(member_key)
@@ -1987,7 +2006,10 @@ def _build_enriched_from_parts(
                 file=file,
                 line=line,
                 text=part[0],
-                project_id=str(metadata.get("project_id") or "") or None,
+                project_id=require_project_identity(
+                    metadata.get("project_id"),
+                    source=f"commit macro metadata {file}:{line}:{name}",
+                ),
                 visible_in_file=str(metadata.get("visible_in_file") or file),
                 visible_line=int(metadata.get("visible_line") or line),
                 sequence=sequence,
@@ -2330,6 +2352,8 @@ def _load_tokenizer(path: Optional[str]):
             from tokenizers import Tokenizer  # type: ignore[reportMissingImports]
             _tokenizer = Tokenizer.from_file(path)
             return
+        except SymbolIdentityError:
+            raise
         except Exception:
             pass
     # Fallback: estimate ~4 bytes per token
@@ -2427,7 +2451,10 @@ def process_record(
         return []
 
     filepath = record.get('filepath', 'source.cpp')
-    project_id = str(record.get('repo') or '') or None
+    project_id = require_project_identity(
+        record.get("repo"),
+        source=f"commit record {record.get('commit_hash') or '<unknown>'}",
+    )
     repo_root: str | None = None
     compile_args: list[str] | None = None
     build_info: dict[str, object] = {}
@@ -2617,6 +2644,8 @@ def process_jsonl_file(
                     chunk_claim_stats=stats,
                     analysis_cache=analysis_cache,
                 )
+            except SymbolIdentityError:
+                raise
             except Exception as e:
                 stats['parse_errors'] += 1
                 if stats['parse_errors'] <= 10:
@@ -2870,47 +2899,61 @@ def main() -> int:
         'analysis_cache_evictions': 0,
     }
 
-    with tempfile.TemporaryDirectory(prefix='clang_commits_') as tmpdir:
-        # Use /dev/shm if available for faster temp file I/O
-        shm_tmpdir = None
-        if os.path.isdir('/dev/shm'):
-            shm_tmpdir = tempfile.mkdtemp(prefix='clang_commits_', dir='/dev/shm')
-            actual_tmpdir = shm_tmpdir
-        else:
-            actual_tmpdir = tmpdir
-
-        try:
-            with open(args.output, 'w') as out_f:
-                for input_path in args.inputs:
-                    print(f"\n  Processing {input_path}...", file=sys.stderr)
-                    stats = process_jsonl_file(
-                        input_path, out_f, clang_index, actual_tmpdir,
-                        args.max_tokens, args.max_file_bytes,
-                        args.doc_format, args.max_dep_depth,
-                        args.memory_limit_gb,
-                        build_context=build_context,
-                        dedup_store=dedup_store,
-                        dedup_tokenizer=dedup_tokenizer,
-                        dedup_near=dedup_near,
-                        pr_lookup=pr_lookup,
-                        analysis_cache_entries=args.analysis_cache_entries,
+    try:
+        with atomic_output_file(args.output) as staged_output:
+            with tempfile.TemporaryDirectory(prefix='clang_commits_') as tmpdir:
+                # Use /dev/shm if available for faster temp file I/O
+                shm_tmpdir = None
+                if os.path.isdir('/dev/shm'):
+                    shm_tmpdir = tempfile.mkdtemp(
+                        prefix='clang_commits_', dir='/dev/shm'
                     )
+                    actual_tmpdir = shm_tmpdir
+                else:
+                    actual_tmpdir = tmpdir
 
-                    for k in total_stats:
-                        total_stats[k] += stats[k]
+                try:
+                    with staged_output.open('w') as out_f:
+                        for input_path in args.inputs:
+                            print(f"\n  Processing {input_path}...", file=sys.stderr)
+                            stats = process_jsonl_file(
+                                input_path, out_f, clang_index, actual_tmpdir,
+                                args.max_tokens, args.max_file_bytes,
+                                args.doc_format, args.max_dep_depth,
+                                args.memory_limit_gb,
+                                build_context=build_context,
+                                dedup_store=dedup_store,
+                                dedup_tokenizer=dedup_tokenizer,
+                                dedup_near=dedup_near,
+                                pr_lookup=pr_lookup,
+                                analysis_cache_entries=args.analysis_cache_entries,
+                            )
 
-                    print(f"  Done: {stats}", file=sys.stderr)
-        finally:
-            if shm_tmpdir:
-                import shutil
-                shutil.rmtree(shm_tmpdir, ignore_errors=True)
+                            for k in total_stats:
+                                total_stats[k] += stats[k]
 
-    if dedup_store is not None:
-        dedup_store.close()
-    if pr_lookup is not None:
-        print(f"  pr_store: {pr_lookup.hits} discussions attached, "
-              f"{pr_lookup.misses} misses (Tier-1 git-only)", file=sys.stderr)
-        pr_lookup.close()
+                            print(f"  Done: {stats}", file=sys.stderr)
+                finally:
+                    if shm_tmpdir:
+                        import shutil
+                        shutil.rmtree(shm_tmpdir, ignore_errors=True)
+
+            if total_stats['parse_errors'] and not args.allow_parse_errors:
+                raise PartialParseError(
+                    "refusing partial commit range: "
+                    f"{total_stats['parse_errors']} record parse error(s); "
+                    "use --allow-parse-errors only for an explicitly lossy run"
+                )
+    except PartialParseError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if dedup_store is not None:
+            dedup_store.close()
+        if pr_lookup is not None:
+            print(f"  pr_store: {pr_lookup.hits} discussions attached, "
+                  f"{pr_lookup.misses} misses (Tier-1 git-only)", file=sys.stderr)
+            pr_lookup.close()
 
     elapsed = time.time() - t0
     print(f"\nTotal: {total_stats}", file=sys.stderr)
@@ -2918,14 +2961,6 @@ def main() -> int:
     if total_stats['records_read'] > 0:
         rate = total_stats['records_read'] / elapsed
         print(f"Rate: {rate:.1f} records/sec", file=sys.stderr)
-    if total_stats['parse_errors'] and not args.allow_parse_errors:
-        print(
-            "ERROR: refusing partial commit range: "
-            f"{total_stats['parse_errors']} record parse error(s); "
-            "use --allow-parse-errors only for an explicitly lossy run",
-            file=sys.stderr,
-        )
-        return 1
     return 0
 
 

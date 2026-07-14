@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, SupportsInt
@@ -115,8 +116,10 @@ from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityError,
     SymbolIdentityRegistry,
 )
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 TRAINED_TOKEN_COUNT_COLUMN = "trained_token_count"
 SLACK_TOKENS_COLUMN = "slack_tokens"
@@ -1031,17 +1034,17 @@ def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
         except (TypeError, ValueError):
             version = None
         if version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"{path}: missing or stale symbol identity metadata {raw_version!r}; "
                 "regenerate tokenized parquet with clang USR/signature identities "
                 f"before packing (required v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION})"
             )
         if SYMBOL_IDENTITIES_COLUMN not in schema.names:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"{path}: missing {SYMBOL_IDENTITIES_COLUMN!r} collision registry"
             )
         if schema.field(SYMBOL_IDENTITIES_COLUMN).type != identity_type:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"{path}: {SYMBOL_IDENTITIES_COLUMN} must be {identity_type}, got "
                 f"{schema.field(SYMBOL_IDENTITIES_COLUMN).type}"
             )
@@ -1050,10 +1053,13 @@ def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
             TOKEN_CALL_TARGETS_COLUMN,
             TOKEN_TYPE_REFS_COLUMN,
         ):
-            if column in schema.names and schema.field(column).type.value_type != pa.uint64():
-                raise RuntimeError(
+            if column not in schema.names:
+                continue
+            field_type = schema.field(column).type
+            if not pa.types.is_list(field_type) or field_type.value_type != pa.uint64():
+                raise SymbolIdentityError(
                     f"{path}: {column} must use uint64 symbol IDs, got "
-                    f"{schema.field(column).type}"
+                    f"{field_type}"
                 )
         row_offset = 0
         for batch in parquet_file.iter_batches(columns=[SYMBOL_IDENTITIES_COLUMN]):
@@ -1930,7 +1936,7 @@ def write_overflow_records(
     pq.write_table(table, path)
 
 
-def pack_parquet_dataset(
+def _pack_parquet_dataset_to_paths(
     input_path: str | os.PathLike[str],
     output_path: str | os.PathLike[str],
     *,
@@ -2015,6 +2021,40 @@ def pack_parquet_dataset(
         "packed_rows": packed_rows_count,
         "overflow_docs": len(overflow),
     }
+
+
+def pack_parquet_dataset(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    target_length: int,
+    pad_token_id: int = 0,
+    strategy: PackingStrategy = "best_fit",
+    overflow_output: str | os.PathLike[str] | None = None,
+    row_group_size: int = 128,
+    pack_token_window: int = DEFAULT_PACK_TOKEN_WINDOW,
+    input_batch_size: int = 1024,
+) -> dict[str, int]:
+    """Stage every artifact and publish the primary packed parquet last."""
+
+    with ExitStack() as stack:
+        staged_output = stack.enter_context(atomic_output_file(output_path))
+        staged_overflow = None
+        if overflow_output is not None:
+            staged_overflow = stack.enter_context(
+                atomic_output_file(overflow_output)
+            )
+        return _pack_parquet_dataset_to_paths(
+            input_path,
+            staged_output,
+            target_length=target_length,
+            pad_token_id=pad_token_id,
+            strategy=strategy,
+            overflow_output=staged_overflow,
+            row_group_size=row_group_size,
+            pack_token_window=pack_token_window,
+            input_batch_size=input_batch_size,
+        )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

@@ -262,7 +262,7 @@ def test_local_convert_backfills_static_code_repo_provenance(
         tokenizer=_CharTokenizer(),
         max_tokens=4096,
         overflow_policy="drop",
-        default_repo="demo-lib",
+        default_repo="tests/demo-lib",
     )
 
     table = pq.read_table(
@@ -274,14 +274,14 @@ def test_local_convert_backfills_static_code_repo_provenance(
             schema.FILEPATH_STABLE_ID_COLUMN,
         ],
     )
-    assert table.column(schema.REPO_COLUMN).to_pylist() == ["demo-lib"]
+    assert table.column(schema.REPO_COLUMN).to_pylist() == ["tests/demo-lib"]
     assert table.column(schema.FILEPATH_COLUMN).to_pylist() == ["include/math.hpp"]
     assert table.column(schema.REPO_STABLE_ID_COLUMN).to_pylist() == [
-        clang_enriched_to_parquet.stable_repo_id("demo-lib")
+        clang_enriched_to_parquet.stable_repo_id("tests/demo-lib")
     ]
     assert table.column(schema.FILEPATH_STABLE_ID_COLUMN).to_pylist() == [
         clang_enriched_to_parquet.stable_filepath_id(
-            "demo-lib",
+            "tests/demo-lib",
             "include/math.hpp",
         )
     ]
@@ -704,6 +704,8 @@ def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
     assert stable_sources[0] == stable_sources[2]
     assert stable_sources[3] != stable_sources[4]
     assert all(value > 0 for value in stable_sources)
+    assert docs[0].stable_doc_id == docs[1].stable_doc_id
+    assert docs[1].stable_doc_id != docs[2].stable_doc_id
 
 
 def test_pack_enriched_rows_does_not_merge_file_provenance_without_logical_id(
@@ -805,6 +807,7 @@ def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
         clang_index,
         ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
         str(tmp_path),
+        project_id="tests/nanochat-fixture",
     )
 
     main = next(func for func in funcs if func.name == "main")
@@ -881,6 +884,7 @@ def test_commit_clang_analysis_uses_repo_build_context_for_virtual_source(
         "src/main.cc",
         clang_index,
         str(tmp_path / "fallback"),
+        project_id="tests/nanochat-fixture",
     )
     repo_root, compile_args, build_info = BuildContextResolver(
         repo_root=str(tmp_path)
@@ -893,6 +897,7 @@ def test_commit_clang_analysis_uses_repo_build_context_for_virtual_source(
         compile_args=compile_args,
         repo_root=repo_root,
         build_info=build_info,
+        project_id="tests/nanochat-fixture",
     )
 
     assert next(func for func in fallback.functions if func.name == "main").callees == []
@@ -1002,6 +1007,7 @@ def test_commit_macro_dependency_parts_emit_precise_expansion_routes() -> None:
         1,
         "#define CPPMEGA_COMMIT_BASE(x) ((x) + 1)\n",
         params=["x"],
+        project_id="tests/nanochat-fixture",
         visible_in_file="src/demo.cc",
         visible_line=1,
         sequence=0,
@@ -1012,6 +1018,7 @@ def test_commit_macro_dependency_parts_emit_precise_expansion_routes() -> None:
         2,
         "#define CPPMEGA_COMMIT_WRAP(x) CPPMEGA_COMMIT_BASE(x)\n",
         params=["x"],
+        project_id="tests/nanochat-fixture",
         visible_in_file="src/demo.cc",
         visible_line=1,
         sequence=1,
@@ -1100,7 +1107,7 @@ def test_process_record_pulls_header_macros_into_commit_docs_without_libclang(
 
     docs = process_record(
         {
-            "repo": "demo",
+            "repo": "tests/demo",
             "filepath": "src/demo.cc",
             "old_content": old_content,
             "new_content": new_content,
@@ -1201,6 +1208,7 @@ def test_process_record_reuses_identical_file_analysis_with_cache(tmp_path) -> N
         end_line=2,
     )
     record = {
+        "repo": "tests/demo",
         "old_content": source,
         "new_content": source,
         "diff": "\n".join(

@@ -75,6 +75,7 @@ def test_process_one_repo_fails_for_empty_training_docs(tmp_path: Path) -> None:
             dedup_db=None,
             dedup_near=True,
             parse_workers=1,
+            project_id="tests/problem-fixture",
         )
 
 
@@ -141,6 +142,7 @@ def test_header_only_class_template_emits_standalone_header_doc(tmp_path: Path) 
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     header_docs = [
@@ -194,6 +196,7 @@ def test_header_type_provenance_survives_source_first_parse_order(tmp_path: Path
             clang_index,
             index_project._adapt_args_for_file(args, str(path)),
             str(tmp_path),
+            project_id="tests/problem-fixture",
         )
         for func in functions:
             project_index.add_function(func)
@@ -209,6 +212,7 @@ def test_header_type_provenance_survives_source_first_parse_order(tmp_path: Path
         default_args=args,
         header_files=[str(header)],
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     header_docs = [
@@ -242,6 +246,7 @@ def test_register_header_macros_reuses_directive_parse_cache_for_shared_includes
         index,
         [str(root_a), str(root_b)],
         project_dir=str(tmp_path),
+        project_id="tests/problem-fixture",
         include_dirs=[str(tmp_path)],
     )
 
@@ -280,6 +285,7 @@ def test_register_header_macros_caps_per_root_include_fanout(tmp_path: Path) -> 
         index,
         [str(root)],
         project_dir=str(tmp_path),
+        project_id="tests/problem-fixture",
         include_dirs=[str(tmp_path)],
         max_include_files_per_root=2,
     )
@@ -352,6 +358,7 @@ def test_header_function_template_emits_trainable_cpp_doc(tmp_path: Path) -> Non
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     template_docs = [
@@ -392,6 +399,7 @@ def test_header_cxx20_concept_and_inline_variable_template_emit_docs(tmp_path: P
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     concept_docs = [doc for doc in docs if "concept CppMegaAddable" in doc.get("text", "")]
@@ -445,6 +453,7 @@ def test_macro_only_header_emits_macro_doc_and_cpp_delimiters(tmp_path: Path) ->
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     macro_docs = [
@@ -502,6 +511,7 @@ def test_function_doc_pulls_used_macro_and_routes_invocation_to_definition(tmp_p
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed_docs = [
@@ -547,6 +557,7 @@ def test_conditional_macro_route_preserves_condition_stack(tmp_path: Path) -> No
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -598,6 +609,7 @@ def test_macro_redefinition_window_routes_to_latest_visible_definition(tmp_path:
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -661,6 +673,7 @@ def test_pulled_dependency_macro_invocation_keeps_source_redefinition_window(
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -738,6 +751,7 @@ def test_macro_include_order_routes_across_local_headers(tmp_path: Path) -> None
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -801,6 +815,7 @@ def test_macro_body_dependency_is_pulled_and_expansion_routes_to_included_macro(
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -856,6 +871,7 @@ def test_macro_condition_dependency_cycle_does_not_recurse_forever(tmp_path: Pat
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -896,6 +912,7 @@ def test_function_like_macro_condition_does_not_emit_python_syntax_warning(
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     captured = capsys.readouterr()
@@ -935,6 +952,7 @@ def test_macro_elif_branch_can_become_active_after_false_if(tmp_path: Path) -> N
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -982,6 +1000,7 @@ def test_macro_else_branch_routes_to_branch_directive(tmp_path: Path) -> None:
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -1060,6 +1079,7 @@ def test_macro_if_not_defined_condition_is_respected(tmp_path: Path) -> None:
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -1100,6 +1120,7 @@ def test_include_guard_defines_affect_repeated_local_include_scan(tmp_path: Path
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -1145,6 +1166,7 @@ def test_source_include_order_uses_only_headers_visible_to_source(tmp_path: Path
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -1195,6 +1217,7 @@ def test_source_include_order_redefinition_window_routes_each_use_by_source_line
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -1272,6 +1295,7 @@ def test_macro_include_resolution_uses_compile_include_dirs(tmp_path: Path) -> N
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = next(
@@ -1304,6 +1328,7 @@ def test_standalone_header_macros_survive_chunk_claims_when_used_as_deps(tmp_pat
         enriched=True,
         tokenizer_path=str(Path("cppmega_mlx/tokenizer/tokenizer.json").resolve()),
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     routed = [
@@ -1348,6 +1373,7 @@ def test_header_template_extensions_emit_template_and_macro_docs(
         parse_workers=1,
         enriched=True,
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     template_docs = [
@@ -1427,6 +1453,7 @@ def test_header_template_docs_survive_tokenized_route_and_pack_e2e(tmp_path: Pat
         enriched=True,
         tokenizer_path=str(Path("cppmega_mlx/tokenizer/tokenizer.json").resolve()),
         emit_doc=docs.append,
+        project_id="tests/problem-fixture",
     )
 
     assert any(
@@ -1468,7 +1495,7 @@ def test_header_template_docs_survive_tokenized_route_and_pack_e2e(tmp_path: Pat
         max_tokens=65536,
         overflow_policy="drop",
         materialize_tokenized_enriched=True,
-        default_repo="header-e2e",
+            default_repo="tests/header-e2e",
     )
 
     route_dir = tmp_path / "routes"

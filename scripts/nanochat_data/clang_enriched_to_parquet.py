@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -43,6 +44,7 @@ from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     SymbolIdentityError,
     SymbolIdentityRegistry,
+    require_project_identity,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     PLATFORM_IDS_COLUMN,
@@ -121,6 +123,7 @@ from scripts.nanochat_data.token_budget import (
     tokenizer_fingerprint,
 )
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,6 +226,12 @@ def _with_default_static_provenance(
     if not _has_value(repo):
         _validate_static_provenance(record)
         return record
+    repo = require_project_identity(
+        repo, source=f"clang enriched row {record.get(FILEPATH_COLUMN)!r}"
+    )
+    if record.get(REPO_COLUMN) != repo:
+        record = dict(record)
+        record[REPO_COLUMN] = repo
 
     filepath = record.get(FILEPATH_COLUMN)
     if not _has_value(record.get(REPO_STABLE_ID_COLUMN)):
@@ -706,7 +715,7 @@ def rows_to_table(
     ):
         identity_version = row.get("symbol_identity_schema_version")
         if identity_version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 "clang-enriched row has missing or stale symbol identity schema "
                 f"version {identity_version!r}; regenerate it with clang USR/signature "
                 f"schema v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION}"
@@ -1316,9 +1325,25 @@ def gcs_list_files(prefix: str) -> list:
         capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
-        log.error("gcloud storage ls failed: %s", result.stderr)
-        return []
+        raise RuntimeError(f"gcloud storage ls failed for {uri}: {result.stderr}")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def gcs_object_exists(uri: str) -> bool:
+    """Return whether one exact GCS object exists, failing on access errors."""
+
+    result = subprocess.run(
+        ["gcloud", "storage", "ls", uri],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        return True
+    detail = f"{result.stdout}\n{result.stderr}".lower()
+    if "matched no objects" in detail or "no urls matched" in detail:
+        return False
+    raise RuntimeError(f"gcloud storage ls failed for {uri}: {result.stderr}")
 
 
 def gcs_download(gcs_uri: str, local_path: str):
@@ -1631,7 +1656,7 @@ def _open_jsonl(path: str | os.PathLike[str]):
     return open(target, "r", encoding="utf-8", errors="replace")
 
 
-def convert_local_jsonl_to_parquet(
+def _convert_local_jsonl_to_parquet_path(
     input_path: str | os.PathLike[str],
     output_path: str | os.PathLike[str],
     *,
@@ -1714,6 +1739,8 @@ def convert_local_jsonl_to_parquet(
                             stable_doc_signature)
                         sig = stable_doc_signature(record)
                         source_doc_id = sig or f"{source.name}:{docs_in}"
+                    except SymbolIdentityError:
+                        raise
                     except Exception:
                         source_doc_id = f"{source.name}:{docs_in}"
                 for sub_doc in sub_docs:
@@ -1756,6 +1783,45 @@ def convert_local_jsonl_to_parquet(
         overflow_policy,
     )
     return {"docs_in": docs_in, "docs_out": docs_out}
+
+
+def convert_local_jsonl_to_parquet(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    tokenizer,
+    max_tokens: int,
+    overflow_policy: str = "split",
+    dry_run: bool = False,
+    materialize_tokenized_enriched: bool = False,
+    local_batch_size: int = 512,
+    memory_limit_gb: float = 10.0,
+    default_repo: str | None = None,
+) -> dict[str, int]:
+    """Convert locally, publishing the parquet only after full validation."""
+
+    if default_repo is not None:
+        default_repo = require_project_identity(
+            default_repo, source="clang_enriched_to_parquet --default-repo"
+        )
+    kwargs = {
+        "tokenizer": tokenizer,
+        "max_tokens": max_tokens,
+        "overflow_policy": overflow_policy,
+        "dry_run": dry_run,
+        "materialize_tokenized_enriched": materialize_tokenized_enriched,
+        "local_batch_size": local_batch_size,
+        "memory_limit_gb": memory_limit_gb,
+        "default_repo": default_repo,
+    }
+    if dry_run:
+        return _convert_local_jsonl_to_parquet_path(
+            input_path, output_path, **kwargs
+        )
+    with atomic_output_file(output_path) as staged_output:
+        return _convert_local_jsonl_to_parquet_path(
+            input_path, staged_output, **kwargs
+        )
 
 
 def process_input_file(gcs_uri: str, tmpdir: str,
@@ -1818,6 +1884,8 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                         stable_doc_signature)
                     sig = stable_doc_signature(record)
                     source_doc_id = sig or f"{fname}:{docs_in}"
+                except SymbolIdentityError:
+                    raise
                 except Exception:
                     source_doc_id = f"{fname}:{docs_in}"
             for sub_doc in sub_docs:
@@ -1893,7 +1961,9 @@ def _flush_shard(
             for col_token_ids in table.column(TOKEN_IDS_COLUMN).to_pylist():
                 if col_token_ids:
                     token_lists.append(list(col_token_ids))
-        except (KeyError, Exception):
+        except SymbolIdentityError:
+            raise
+        except Exception:
             token_lists = []
         if token_lists and _TOKENIZED_ENRICHED_TOKENIZER is not None:
             stats = compute_corpus_stats(
@@ -1906,12 +1976,18 @@ def _flush_shard(
                 _json.dump(stats, _f)
             try:
                 gcs_upload(stats_path, gcs_uri + ".corpus_stats.json")
+            except SymbolIdentityError:
+                raise
             except Exception:
                 pass
             try:
                 os.unlink(stats_path)
+            except SymbolIdentityError:
+                raise
             except Exception:
                 pass
+    except SymbolIdentityError:
+        raise
     except Exception as _exc:
         log.warning("corpus_stats emit failed: %s", _exc)
     gcs_upload(local_path, gcs_uri)
@@ -2054,7 +2130,8 @@ def main():
 
     log.info("Listing input files at gs://%s/%s/", GCS_BUCKET, args.input_prefix)
     input_files = gcs_list_files(args.input_prefix)
-    gz_files = [f for f in input_files if f.endswith(".jsonl.gz")]
+    all_gz_files = [f for f in input_files if f.endswith(".jsonl.gz")]
+    gz_files = list(all_gz_files)
 
     if not gz_files:
         log.error("No .jsonl.gz files found at gs://%s/%s/",
@@ -2063,6 +2140,7 @@ def main():
 
     if args.max_files > 0:
         gz_files = gz_files[:args.max_files]
+    full_input = len(gz_files) == len(all_gz_files)
 
     log.info(
         "Found %d input files. Processing with hard_budget=%d tokens, shard_size=%d, dry_run=%s",
@@ -2077,6 +2155,11 @@ def main():
     shard_counter = [0]  # mutable counter shared across calls
     output_rows = []
     identity_registry = SymbolIdentityRegistry()
+    staging_prefix = (
+        f"{args.output_prefix}/.staging-{uuid.uuid4().hex}"
+        if not args.dry_run
+        else args.output_prefix
+    )
 
     with tempfile.TemporaryDirectory(prefix=f"clang_{size_label}_") as tmpdir:
         # Local dir for shard staging
@@ -2089,7 +2172,7 @@ def main():
                     gcs_uri, tmpdir, args.dry_run,
                     args.shard_size, shard_counter, output_rows,
                     output_prefix_local,
-                    args.output_prefix,
+                    staging_prefix,
                     tokenizer,
                     max_tokens,
                     args.overflow_policy,
@@ -2103,8 +2186,7 @@ def main():
             except SymbolIdentityError:
                 raise
             except Exception as e:
-                log.error("Failed to process %s: %s", gcs_uri, e)
-                continue
+                raise RuntimeError(f"Failed to process {gcs_uri}: {e}") from e
 
         # Flush remaining rows
         if output_rows:
@@ -2113,7 +2195,7 @@ def main():
                 shard_counter,
                 args.dry_run,
                 output_prefix_local,
-                args.output_prefix,
+                staging_prefix,
                 identity_registry=identity_registry,
             )
             output_rows.clear()
@@ -2122,15 +2204,43 @@ def main():
              total_in, total_out, shard_counter[0])
 
     if not args.dry_run:
-        # Write _COMPLETE sentinel
-        sentinel_uri = (
-            f"gs://{GCS_BUCKET}/{args.output_prefix}/_COMPLETE"
-        )
-        subprocess.run(
-            ["gcloud", "storage", "cp", "/dev/null", sentinel_uri],
-            check=False,
-        )
-        log.info("Wrote sentinel: %s", sentinel_uri)
+        staged_root = f"gs://{GCS_BUCKET}/{staging_prefix}/"
+        final_root = f"gs://{GCS_BUCKET}/{args.output_prefix}/"
+        sentinel_uri = final_root + "_COMPLETE"
+        try:
+            if gcs_object_exists(sentinel_uri):
+                subprocess.run(
+                    ["gcloud", "storage", "rm", sentinel_uri],
+                    check=True,
+                    timeout=600,
+                )
+            staged_files = gcs_list_files(staging_prefix)
+            if not staged_files:
+                raise RuntimeError(f"no staged parquet outputs under {staged_root}")
+            for staged_uri in staged_files:
+                relative = staged_uri.removeprefix(staged_root)
+                if not relative or relative == "_COMPLETE":
+                    continue
+                subprocess.run(
+                    ["gcloud", "storage", "cp", staged_uri, final_root + relative],
+                    check=True,
+                    timeout=600,
+                )
+            if full_input:
+                subprocess.run(
+                    ["gcloud", "storage", "cp", "/dev/null", sentinel_uri],
+                    check=True,
+                    timeout=600,
+                )
+                log.info("Wrote sentinel: %s", sentinel_uri)
+            else:
+                log.info("Partial --max-files run: not publishing _COMPLETE")
+        finally:
+            subprocess.run(
+                ["gcloud", "storage", "rm", "--recursive", staged_root],
+                check=False,
+                timeout=600,
+            )
 
 
 if __name__ == "__main__":

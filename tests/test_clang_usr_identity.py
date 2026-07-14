@@ -38,6 +38,7 @@ def _parse_project(tmp_path: Path, files: dict[str, str]) -> tuple[ip.ProjectInd
             clang_index,
             ["-std=c++20"],
             str(tmp_path),
+            project_id="tests/clang-fixture",
         )
         parsed[relative] = functions
         for function in functions:
@@ -63,10 +64,14 @@ def test_canonical_identity_namespaces_usr_and_fallback_uses_normalized_qname() 
         "usr": "c:@N@api@F@route#I#",
         "canonical_signature": "display=route(int)|type=int (int)",
     }
-    repo_a = ip.canonical_symbol_identity(**shared, project="repo-a", file="a.cpp")
-    repo_b = ip.canonical_symbol_identity(**shared, project="repo-b", file="b.cpp")
+    repo_a = ip.canonical_symbol_identity(
+        **shared, project="owner/repo-a", file="a.cpp"
+    )
+    repo_b = ip.canonical_symbol_identity(
+        **shared, project="owner/repo-b", file="b.cpp"
+    )
     repo_a_other_file = ip.canonical_symbol_identity(
-        **shared, project="repo-a", file="other.cpp"
+        **shared, project="owner/repo-a", file="other.cpp"
     )
 
     assert repo_a != repo_b
@@ -75,7 +80,7 @@ def test_canonical_identity_namespaces_usr_and_fallback_uses_normalized_qname() 
     fallback = {
         "kind": "FUNCTION_DECL",
         "canonical_signature": "display=route(int)|type=int (int)",
-        "project": "repo-a",
+        "project": "owner/repo-a",
         "file": "route.cpp",
     }
     assert ip.canonical_symbol_identity(qname="left::route", **fallback) != (
@@ -93,7 +98,7 @@ def test_canonical_identity_namespaces_usr_and_fallback_uses_normalized_qname() 
 def test_fallback_identity_and_symbol_ids_separate_qnames_and_overloads() -> None:
     shared = {
         "kind": "FUNCTION_DECL",
-        "project": "repo-a",
+        "project": "owner/repo-a",
         "file": "route.cpp",
     }
     left_int = ip.canonical_symbol_identity(
@@ -117,6 +122,70 @@ def test_fallback_identity_and_symbol_ids_separate_qnames_and_overloads() -> Non
     assert len(symbol_ids) == 3
     assert max(symbol_ids) > 0xFFFFFFFF
     assert all(0 < symbol_id <= 0xFFFFFFFFFFFFFFFF for symbol_id in symbol_ids)
+
+
+def _fallback_cursor(path: Path, *, storage: str = "NONE", parent_kind: str = "NAMESPACE"):
+    type_info = SimpleNamespace(spelling="int (int)", get_canonical=lambda: type_info)
+    result_info = SimpleNamespace(spelling="int", get_canonical=lambda: result_info)
+    parent = SimpleNamespace(
+        kind=SimpleNamespace(name=parent_kind),
+        spelling="api" if parent_kind == "NAMESPACE" else "caller",
+        semantic_parent=None,
+    )
+    return SimpleNamespace(
+        kind=SimpleNamespace(name="FUNCTION_DECL"),
+        spelling="route",
+        displayname="route(int)",
+        semantic_parent=parent,
+        lexical_parent=parent,
+        location=SimpleNamespace(file=SimpleNamespace(name=str(path)), line=7),
+        linkage=SimpleNamespace(name="EXTERNAL"),
+        storage_class=SimpleNamespace(name=storage),
+        type=type_info,
+        result_type=result_info,
+        get_arguments=lambda: [],
+        get_usr=lambda: "",
+        exception_specification_kind=SimpleNamespace(name="NONE"),
+    )
+
+
+def test_external_no_usr_fallback_is_global_but_static_and_local_are_file_scoped(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+    external_a = _fallback_cursor(tmp_path / "sdk-a" / "route.hpp")
+    external_b = _fallback_cursor(tmp_path / "sdk-b" / "route.hpp")
+    external_key_a, _, _ = ip.symbol_identity_for_cursor(
+        external_a, project_dir=str(project_dir), project="owner/repo"
+    )
+    external_key_b, _, _ = ip.symbol_identity_for_cursor(
+        external_b, project_dir=str(project_dir), project="owner/repo"
+    )
+    assert external_key_a == external_key_b
+    assert "file=" not in external_key_a
+
+    static_keys = []
+    local_keys = []
+    for name in ("one.cpp", "two.cpp"):
+        path = project_dir / name
+        static_keys.append(
+            ip.symbol_identity_for_cursor(
+                _fallback_cursor(path, storage="STATIC"),
+                project_dir=str(project_dir),
+                project="owner/repo",
+            )[0]
+        )
+        local_keys.append(
+            ip.symbol_identity_for_cursor(
+                _fallback_cursor(path, parent_kind="FUNCTION_DECL"),
+                project_dir=str(project_dir),
+                project="owner/repo",
+            )[0]
+        )
+    assert len(set(static_keys)) == 2
+    assert len(set(local_keys)) == 2
+    assert all("file=" in key for key in static_keys + local_keys)
 
 
 def test_corpus_registry_fails_closed_on_cross_project_symbol_id_collision() -> None:
@@ -172,7 +241,7 @@ def test_static_indexer_surfaces_translation_unit_parse_failure(
             BrokenIndex(),
             ["-std=c++20"],
             str(tmp_path),
-            project_id="repo-a",
+            project_id="owner/repo-a",
         )
 
 
@@ -200,6 +269,40 @@ int caller(int value) { return route(value); }
     int_route = _function(routes, name="route", signature_fragment="args=(int)")
     assert caller.callee_keys == [int_route.symbol_key]
     assert int_route.symbol_key in project._function_callee_keys(caller)
+
+
+def test_real_clang_usr_separates_cv_ref_noexcept_and_conversion_operators(
+    tmp_path: Path,
+) -> None:
+    source = r"""
+namespace api {
+struct Box {
+  int value;
+  int read() & { return value; }
+  int read() const & noexcept { return value; }
+  int read() && { return value + 1; }
+  explicit operator int() const & noexcept { return value; }
+  explicit operator double() && { return static_cast<double>(value); }
+  template<class T> T cast(T value) const noexcept { return static_cast<T>(value); }
+};
+}
+"""
+    _project, parsed = _parse_project(tmp_path, {"operators.cpp": source})
+    methods = [
+        function
+        for function in parsed["operators.cpp"]
+        if function.name in {"read", "operator int", "operator double", "cast"}
+    ]
+    reads = [function for function in methods if function.name == "read"]
+    conversions = [
+        function for function in methods if function.name.startswith("operator ")
+    ]
+    assert len(reads) == 3
+    assert len({function.usr for function in reads}) == 3
+    assert len({function.symbol_key for function in reads}) == 3
+    assert len(conversions) == 2
+    assert len({function.usr for function in conversions}) == 2
+    assert any("NOEXCEPT" in function.canonical_signature.upper() for function in methods)
 
 
 def test_real_clang_same_usr_is_project_scoped_across_repositories(tmp_path: Path) -> None:
@@ -320,8 +423,14 @@ int caller(Item item) {
 
 
 def test_macro_identity_is_definition_scoped_and_part_metadata_is_versioned(tmp_path: Path) -> None:
-    first = ip.MacroDef("ROUTE", "one.hpp", 4, "#define ROUTE(x) (x)", ["x"])
-    second = ip.MacroDef("ROUTE", "two.hpp", 4, "#define ROUTE(x) ((x) + 1)", ["x"])
+    first = ip.MacroDef(
+        "ROUTE", "one.hpp", 4, "#define ROUTE(x) (x)", ["x"],
+        project_id="owner/repo",
+    )
+    second = ip.MacroDef(
+        "ROUTE", "two.hpp", 4, "#define ROUTE(x) ((x) + 1)", ["x"],
+        project_id="owner/repo",
+    )
     repo_a = ip.MacroDef(
         "ROUTE",
         "include/route.hpp",
@@ -487,27 +596,72 @@ def _create_composite_v1_store(path: Path) -> None:
         conn.close()
 
 
-def test_global_store_migrates_composite_schema_and_backfills_identity(tmp_path: Path) -> None:
+def _global_record(
+    *,
+    qname: str = "api::route",
+    project: str = "owner/repo-a",
+    file: str = "route.cpp",
+    usr: str = "",
+    signature: str = "display=route(int)|type=int (int)|result=int|args=(int)",
+    symbol_kind: str = "FUNCTION_DECL",
+    base_lib: str = "api",
+    provider: str | None = None,
+    include_provenance: str | None = None,
+    text: str = "int route(int value) { return value; }",
+) -> gsi.GlobalSymbolRecord:
+    symbol_key = ip.canonical_symbol_identity(
+        qname=qname,
+        kind=symbol_kind,
+        usr=usr,
+        canonical_signature=signature,
+        project=project,
+        file=file,
+    )
+    return gsi.GlobalSymbolRecord(
+        qname=qname,
+        base_lib=base_lib,
+        base_repo=project,
+        kind=2,
+        sym_type="func",
+        file=file,
+        line=1,
+        end_line=1,
+        is_public=1,
+        token_est=8,
+        body_len=32,
+        text=text,
+        symbol_key=symbol_key,
+        usr=usr,
+        canonical_signature=signature,
+        symbol_kind=symbol_kind,
+        provider=provider or project,
+        include_provenance=include_provenance or file,
+    )
+
+
+def test_global_store_rejects_legacy_schema_without_fabricating_identity(
+    tmp_path: Path,
+) -> None:
     db = tmp_path / "symbols.sqlite"
     _create_composite_v1_store(db)
 
-    store = gsi.GlobalSymbolStore(str(db))
-    store.close()
+    with pytest.raises(ip.SymbolIdentityError, match="cannot be migrated"):
+        gsi.GlobalSymbolStore(str(db))
 
     conn = sqlite3.connect(db)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        rows = conn.execute(
-            "SELECT symbol_key, canonical_signature, identity_schema_version "
-            "FROM symbols ORDER BY base_repo"
-        ).fetchall()
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(symbols)").fetchall()
+        }
+        metadata_table = conn.execute(
+            "SELECT COUNT(*) FROM symbol_index_libs"
+        ).fetchone()[0]
     finally:
         conn.close()
-    assert version == gsi.GLOBAL_SYMBOL_DB_SCHEMA_VERSION
-    assert len({row[0] for row in rows}) == 2
-    assert all(row[0] for row in rows)
-    assert all(row[1] for row in rows)
-    assert {row[2] for row in rows} == {ip.SYMBOL_IDENTITY_SCHEMA_VERSION}
+    assert version == 0
+    assert "symbol_key" not in columns
+    assert metadata_table == 0
 
 
 def test_global_store_fails_closed_on_cross_project_symbol_id_collision(
@@ -547,6 +701,8 @@ def test_global_store_fails_closed_on_cross_project_symbol_id_collision(
         symbol_id=claimed_id,
         canonical_signature=signature,
         symbol_kind="FUNCTION_DECL",
+        provider="owner/repo-a",
+        include_provenance="route.cpp",
     )
     second = gsi.GlobalSymbolRecord(
         qname="right::route",
@@ -565,6 +721,8 @@ def test_global_store_fails_closed_on_cross_project_symbol_id_collision(
         symbol_id=claimed_id,
         canonical_signature=signature,
         symbol_kind="FUNCTION_DECL",
+        provider="owner/repo-b",
+        include_provenance="route.cpp",
     )
 
     store = gsi.GlobalSymbolStore(str(db))
@@ -574,7 +732,9 @@ def test_global_store_fails_closed_on_cross_project_symbol_id_collision(
     store.close()
 
 
-def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Path) -> None:
+def test_global_store_rejects_stale_usr_row_without_rewriting_metadata(
+    tmp_path: Path,
+) -> None:
     db = tmp_path / "symbols.sqlite"
     usr = "c:@N@api@F@route#I#"
     signature = "display=route(int)|type=int (int)|result=int|args=(int)"
@@ -583,7 +743,7 @@ def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Pat
         kind="FUNCTION_DECL",
         usr=usr,
         canonical_signature=signature,
-        project="repo-a",
+        project="owner/repo-a",
         file="route.cpp",
     )
     store = gsi.GlobalSymbolStore(str(db))
@@ -592,7 +752,7 @@ def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Pat
             gsi.GlobalSymbolRecord(
                 qname="api::route",
                 base_lib="api",
-                base_repo="repo-a",
+                base_repo="owner/repo-a",
                 kind=2,
                 sym_type="func",
                 file="route.cpp",
@@ -606,6 +766,8 @@ def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Pat
                 usr=usr,
                 canonical_signature=signature,
                 symbol_kind="FUNCTION_DECL",
+                provider="owner/repo-a",
+                include_provenance="route.cpp",
             )
         ]
     )
@@ -620,8 +782,8 @@ def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Pat
     finally:
         conn.close()
 
-    store = gsi.GlobalSymbolStore(str(db))
-    store.close()
+    with pytest.raises(ip.SymbolIdentityError, match="cannot be promoted"):
+        gsi.GlobalSymbolStore(str(db))
     conn = sqlite3.connect(db)
     try:
         row = conn.execute(
@@ -631,10 +793,10 @@ def test_global_store_migration_preserves_recoverable_usr_identity(tmp_path: Pat
     finally:
         conn.close()
     assert row == (
-        expected_key,
+        "old-key",
         usr,
         signature,
-        ip.SYMBOL_IDENTITY_SCHEMA_VERSION,
+        1,
     )
 
 
@@ -656,24 +818,7 @@ def test_global_store_refuses_to_downgrade_newer_schema(tmp_path: Path) -> None:
 def test_global_reader_rejects_stale_identity_rows_in_current_db(tmp_path: Path) -> None:
     db = tmp_path / "symbols.sqlite"
     store = gsi.GlobalSymbolStore(str(db))
-    store.insert_symbols(
-        [
-            (
-                "api::route",
-                "api",
-                "repo-a",
-                2,
-                "func",
-                "route.cpp",
-                1,
-                1,
-                1,
-                8,
-                32,
-                "int route(int value) { return value; }",
-            )
-        ]
-    )
+    store.insert_symbols([_global_record()])
     store.commit()
     store.close()
     conn = sqlite3.connect(db)
@@ -690,24 +835,7 @@ def test_global_reader_rejects_stale_identity_rows_in_current_db(tmp_path: Path)
 def test_structured_lookup_never_falls_back_to_lone_legacy_qname(tmp_path: Path) -> None:
     db = tmp_path / "symbols.sqlite"
     store = gsi.GlobalSymbolStore(str(db))
-    store.insert_symbols(
-        [
-            (
-                "api::route",
-                "api",
-                "repo-a",
-                2,
-                "func",
-                "route.cpp",
-                1,
-                1,
-                1,
-                8,
-                32,
-                "int route(int value) { return value; }",
-            )
-        ]
-    )
+    store.insert_symbols([_global_record()])
     store.commit()
     store.close()
 
@@ -730,59 +858,25 @@ def test_global_reader_returns_candidates_and_never_selects_ambiguous_qname(
     store = gsi.GlobalSymbolStore(str(db))
     store.insert_symbols(
         [
-            gsi.GlobalSymbolRecord(
-                qname="api::route",
-                base_lib="api",
-                base_repo="repo-a",
-                kind=2,
-                sym_type="func",
+            _global_record(
+                project="owner/repo-a",
                 file="a.cpp",
-                line=1,
-                end_line=1,
-                is_public=1,
-                token_est=8,
-                body_len=32,
-                text="int route(int value) { return value; }",
-                symbol_key="usr:c:@N@api@F@route#I#",
                 usr="c:@N@api@F@route#I#",
-                canonical_signature="type=int (int)|result=int|args=(int)",
-                symbol_kind="FUNCTION_DECL",
+                signature="type=int (int)|result=int|args=(int)",
             ),
-            gsi.GlobalSymbolRecord(
-                qname="api::route",
-                base_lib="api",
-                base_repo="repo-b",
-                kind=2,
-                sym_type="func",
+            _global_record(
+                project="owner/repo-b",
                 file="b.cpp",
-                line=1,
-                end_line=1,
-                is_public=1,
-                token_est=8,
-                body_len=32,
-                text="double route(double value) { return value; }",
-                symbol_key="usr:c:@N@api@F@route#d#",
                 usr="c:@N@api@F@route#d#",
-                canonical_signature="type=double (double)|result=double|args=(double)",
-                symbol_kind="FUNCTION_DECL",
+                signature="type=double (double)|result=double|args=(double)",
+                text="double route(double value) { return value; }",
             ),
-            gsi.GlobalSymbolRecord(
-                qname="api::route",
-                base_lib="api",
-                base_repo="repo-c",
-                kind=2,
-                sym_type="func",
+            _global_record(
+                project="owner/repo-c",
                 file="c.cpp",
-                line=1,
-                end_line=1,
-                is_public=1,
-                token_est=8,
-                body_len=32,
-                text="int route(int value) { return value + 1; }",
-                symbol_key="usr:c:@N@api@F@route#I#",
                 usr="c:@N@api@F@route#I#",
-                canonical_signature="type=int (int)|result=int|args=(int)",
-                symbol_kind="FUNCTION_DECL",
+                signature="type=int (int)|result=int|args=(int)",
+                text="int route(int value) { return value + 1; }",
             ),
         ]
     )
@@ -793,22 +887,82 @@ def test_global_reader_returns_candidates_and_never_selects_ambiguous_qname(
     try:
         candidates = reader.lookup_candidates("api::route")
         assert len(candidates) == 3
-        assert reader.lookup("api::route") is None
-        assert reader.lookup(
-            "api::route",
-            usr="c:@N@api@F@route#I#",
-            canonical_signature="type=int (int)|result=int|args=(int)",
-            symbol_kind="FUNCTION_DECL",
-        ) is None
+        with pytest.raises(ip.SymbolIdentityError, match="ambiguous global symbol"):
+            reader.lookup("api::route")
+        with pytest.raises(ip.SymbolIdentityError, match="ambiguous global symbol"):
+            reader.lookup(
+                "api::route",
+                usr="c:@N@api@F@route#I#",
+                canonical_signature="intentionally wrong fallback signature",
+                symbol_kind="WRONG_KIND",
+            )
         resolved = reader.lookup(
             "api::route",
+            symbol_key="intentionally wrong canonical key",
             usr="c:@N@api@F@route#I#",
-            canonical_signature="type=int (int)|result=int|args=(int)",
-            symbol_kind="FUNCTION_DECL",
-            project="repo-a",
+            canonical_signature="intentionally wrong fallback signature",
+            symbol_kind="WRONG_KIND",
+            project="owner/repo-a",
         )
         assert resolved is not None
-        assert resolved["base_repo"] == "repo-a"
+        assert resolved["base_repo"] == "owner/repo-a"
+    finally:
+        reader.close()
+
+
+def test_std_lookup_requires_authoritative_provider_provenance(tmp_path: Path) -> None:
+    db = tmp_path / "symbols.sqlite"
+    usr = "c:@N@std@FT@move>#t0.0#&&t0.0#"
+    signature = "display=move(T &&)|type=T &&(T &&)"
+    store = gsi.GlobalSymbolStore(str(db))
+    store.insert_symbols(
+        [
+            _global_record(
+                qname="std::move",
+                project="llvm/llvm-project",
+                file="llvm-project/libcxx/include/vector",
+                usr=usr,
+                signature=signature,
+                symbol_kind="FUNCTION_TEMPLATE",
+                base_lib="std",
+                provider="libc++",
+                include_provenance="vector",
+            ),
+            _global_record(
+                qname="std::move",
+                project="gcc-mirror/gcc",
+                file="gcc-mirror/libstdc++-v3/include/bits/stl_vector.h",
+                usr=usr,
+                signature=signature,
+                symbol_kind="FUNCTION_TEMPLATE",
+                base_lib="std",
+                provider="libstdc++",
+                include_provenance="bits/stl_vector.h",
+            ),
+        ]
+    )
+    store.commit()
+    store.close()
+
+    reader = ip.GlobalSymbolReader(str(db))
+    try:
+        with pytest.raises(ip.SymbolIdentityError, match="ambiguous global symbol"):
+            reader.lookup(
+                "std::move",
+                usr=usr,
+                canonical_signature="wrong fallback signature",
+                symbol_kind="WRONG_KIND",
+            )
+        resolved = reader.lookup(
+            "std::move",
+            usr=usr,
+            canonical_signature="wrong fallback signature",
+            symbol_kind="WRONG_KIND",
+            provider="libc++",
+            include_provenance="vector",
+        )
+        assert resolved is not None
+        assert resolved["base_repo"] == "llvm/llvm-project"
     finally:
         reader.close()
 
@@ -824,7 +978,7 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
         kind="FUNCTION_TEMPLATE",
         usr=usr,
         canonical_signature=signature,
-        project="boost",
+        project="boostorg/boost",
         file="boost/algorithm/string/trim.hpp",
     )
     store = gsi.GlobalSymbolStore(str(db))
@@ -833,7 +987,7 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
             gsi.GlobalSymbolRecord(
                 qname="boost::algorithm::trim",
                 base_lib="boost",
-                base_repo="boost",
+                base_repo="boostorg/boost",
                 kind=2,
                 sym_type="func",
                 file="boost/algorithm/string/trim.hpp",
@@ -847,6 +1001,8 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
                 usr=usr,
                 canonical_signature=signature,
                 symbol_kind="FUNCTION_TEMPLATE",
+                provider="boost",
+                include_provenance="boost/algorithm/string/trim.hpp",
             )
         ]
     )
@@ -886,6 +1042,8 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
                 "project": "",
                 "file": "/opt/boost/include/boost/algorithm/string/trim.hpp",
                 "line": 10,
+                "provider": "boost",
+                "include_provenance": "boost/algorithm/string/trim.hpp",
             }
         ],
         semantic_symbol_ids=symbol_ids,
@@ -930,7 +1088,7 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
     target_chunk = next(
         index
         for index, boundary in enumerate(caller_doc["chunk_boundaries"])
-        if boundary.get("dep_source") == "crosslib:boost"
+        if boundary.get("dep_source") == "crosslib:boostorg/boost"
     )
     assert {"from": caller_chunk, "to": target_chunk} in caller_doc["call_edges"]
     assembled_trim = caller_doc["text"].index("trim(value)")

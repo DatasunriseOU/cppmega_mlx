@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 import hashlib
+import re
 
 
 SYMBOL_IDENTITY_SCHEMA_VERSION = 3
@@ -21,6 +22,29 @@ _SYMBOL_ID_HASH_DOMAIN = b"cppmega.symbol-id.v3\0"
 
 class SymbolIdentityError(RuntimeError):
     """Raised when a symbol identity claim violates the v3 contract."""
+
+
+_PROJECT_IDENTITY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+
+def require_project_identity(value: object, *, source: str) -> str:
+    """Validate and return the canonical ``owner/repo`` project identity."""
+
+    if not isinstance(value, str) or value != value.strip():
+        raise SymbolIdentityError(
+            f"{source}: project identity must be an exact owner/repo string, got {value!r}"
+        )
+    if not _PROJECT_IDENTITY_RE.fullmatch(value):
+        raise SymbolIdentityError(
+            f"{source}: project identity must be stable owner/repo, got {value!r}"
+        )
+    owner, repo = value.split("/", 1)
+    if owner in {".", ".."} or repo in {".", ".."} or repo.endswith(".git"):
+        raise SymbolIdentityError(
+            f"{source}: project identity must be canonical owner/repo without .git, "
+            f"got {value!r}"
+        )
+    return value
 
 
 def compute_symbol_id(symbol_key: str) -> int:
@@ -167,4 +191,5 @@ __all__ = [
     "SymbolIdentityError",
     "SymbolIdentityRegistry",
     "compute_symbol_id",
+    "require_project_identity",
 ]

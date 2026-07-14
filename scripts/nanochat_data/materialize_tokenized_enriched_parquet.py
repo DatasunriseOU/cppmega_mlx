@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import pyarrow as pa  # type: ignore[import-not-found]
@@ -29,8 +28,10 @@ from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityError,
     SymbolIdentityRegistry,
 )
+from scripts.nanochat_data.atomic_publish import atomic_output_directory
 
 
 _SYMBOL_ID_TOKEN_COLUMNS = frozenset(
@@ -109,17 +110,20 @@ def _validate_symbol_identity_table(
         SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
     )
     if raw_version != str(SYMBOL_IDENTITY_SCHEMA_VERSION).encode("ascii"):
-        raise RuntimeError(
+        raise SymbolIdentityError(
             f"{source}: symbol identity schema must be v"
             f"{SYMBOL_IDENTITY_SCHEMA_VERSION}, got {raw_version!r}"
         )
     if SYMBOL_IDENTITIES_COLUMN not in table.column_names:
-        raise RuntimeError(f"{source}: missing {SYMBOL_IDENTITIES_COLUMN!r}")
+        raise SymbolIdentityError(f"{source}: missing {SYMBOL_IDENTITIES_COLUMN!r}")
     for column in ("symbol_ids", "call_targets", "type_refs"):
-        if column in table.column_names and table.schema.field(column).type.value_type != pa.uint64():
-            raise RuntimeError(
+        if column not in table.column_names:
+            continue
+        field_type = table.schema.field(column).type
+        if not pa.types.is_list(field_type) or field_type.value_type != pa.uint64():
+            raise SymbolIdentityError(
                 f"{source}: {column} must use uint64 symbol IDs, got "
-                f"{table.schema.field(column).type}"
+                f"{field_type}"
             )
     identity_rows = table.column(SYMBOL_IDENTITIES_COLUMN).to_pylist()
     semantic_rows = {
@@ -146,11 +150,10 @@ def _validate_symbol_identity_table(
         row_registry.require_ids(used_ids, source=f"{source}:row={row_index}")
 
 
-def _copy_metadata_files(input_dir: str, output_dir: str) -> None:
-    for name in ("_COMPLETE",):
-        src = Path(input_dir) / name
-        if src.exists():
-            Path(output_dir, name).write_text(src.read_text())
+def _copy_completion_marker(input_dir: str, output_dir: Path) -> None:
+    src = Path(input_dir) / "_COMPLETE"
+    if src.exists():
+        (output_dir / "_COMPLETE").write_bytes(src.read_bytes())
 
 
 def main() -> None:
@@ -176,8 +179,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    parquet_files = _list_parquet_files(args.input_dir)
+    all_parquet_files = _list_parquet_files(args.input_dir)
+    parquet_files = list(all_parquet_files)
     if args.max_files > 0:
         parquet_files = parquet_files[: args.max_files]
     if not parquet_files:
@@ -189,26 +192,28 @@ def main() -> None:
     tokenizer = load_cppmega_tokenizer(tokenizer_path)
     identity_registry = SymbolIdentityRegistry()
 
-    for idx, src_path in enumerate(parquet_files, 1):
-        dst_path = Path(args.output_dir) / src_path.name
-        print(f"[{idx}/{len(parquet_files)}] {src_path.name}")
-        table = pq.read_table(src_path)
-        _validate_symbol_identity_table(
-            table,
-            source=src_path,
-            corpus_registry=identity_registry,
-        )
-        docs = _table_to_docs(table)
-        tokenized_rows = materialize_tokenized_enriched_batch(docs, tokenizer)
-        merged = _merge_table_with_tokenized(table, tokenized_rows)
-        pq.write_table(
-            merged,
-            dst_path,
-            row_group_size=args.row_group_size,
-            compression="snappy",
-        )
+    with atomic_output_directory(args.output_dir) as staged_output:
+        for idx, src_path in enumerate(parquet_files, 1):
+            dst_path = staged_output / src_path.name
+            print(f"[{idx}/{len(parquet_files)}] {src_path.name}")
+            table = pq.read_table(src_path)
+            _validate_symbol_identity_table(
+                table,
+                source=src_path,
+                corpus_registry=identity_registry,
+            )
+            docs = _table_to_docs(table)
+            tokenized_rows = materialize_tokenized_enriched_batch(docs, tokenizer)
+            merged = _merge_table_with_tokenized(table, tokenized_rows)
+            pq.write_table(
+                merged,
+                dst_path,
+                row_group_size=args.row_group_size,
+                compression="snappy",
+            )
 
-    _copy_metadata_files(args.input_dir, args.output_dir)
+        if len(parquet_files) == len(all_parquet_files):
+            _copy_completion_marker(args.input_dir, staged_output)
     print(f"Wrote tokenized parquet dataset to {args.output_dir}")
 
 

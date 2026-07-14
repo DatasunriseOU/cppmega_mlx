@@ -16,10 +16,10 @@ Architecture:
 
 Usage:
   # With compile_commands.json (best quality):
-  python index_project.py --project-dir /path/to/project --output chunks.jsonl
+  python index_project.py --project-dir /path/to/project --project-id owner/repo --output chunks.jsonl
 
   # Without build system (fallback mode):
-  python index_project.py --project-dir /path/to/project --output chunks.jsonl --no-compile-db
+  python index_project.py --project-dir /path/to/project --project-id owner/repo --output chunks.jsonl --no-compile-db
 
   # Process multiple projects in parallel:
   python index_project.py --projects-list projects.txt --output chunks.jsonl --workers 48
@@ -33,6 +33,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import hashlib
@@ -59,11 +60,14 @@ from cppmega_mlx.data.nanochat_pipeline.build_context import (
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
-    SYMBOL_ID_MAX,
+    SYMBOL_ID_MAX,  # noqa: F401 - re-exported for global index consumers
+    SymbolIdentityError,
     SymbolIdentityRegistry,
     compute_symbol_id,
+    require_project_identity,
 )
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 if TYPE_CHECKING:
     import clang.cindex as clang_cindex  # pyright: ignore[reportMissingImports]
@@ -238,6 +242,8 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
         try:
             clang_config_cls.set_library_file(candidate)
             index_cls.create()
+        except SymbolIdentityError:
+            raise
         except Exception as exc:  # pragma: no cover - runtime-specific
             last_error = exc
             continue
@@ -247,6 +253,8 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
 
     try:
         index_cls.create()
+    except SymbolIdentityError:
+        raise
     except Exception as exc:
         last_error = exc
     else:
@@ -305,6 +313,8 @@ def _symbol_part_metadata(
     canonical_signature: str | None = None,
     usr: str | None = None,
     kind: str | None = None,
+    provider: str | None = None,
+    include_provenance: str | None = None,
 ) -> dict[str, object] | None:
     if not symbol_key:
         return None
@@ -316,6 +326,8 @@ def _symbol_part_metadata(
         "canonical_signature": canonical_signature or "",
         "usr": usr or "",
         "kind": kind or "",
+        "provider": provider or "",
+        "include_provenance": include_provenance or "",
     }
 
 
@@ -399,6 +411,8 @@ def _global_symbol_part(record: dict[str, object], dep_level: int) -> PartInfo:
             canonical_signature=str(record.get("canonical_signature") or ""),
             usr=str(record.get("usr") or ""),
             kind=str(record.get("symbol_kind") or ""),
+            provider=str(record.get("provider") or ""),
+            include_provenance=str(record.get("include_provenance") or ""),
         ),
     )
 
@@ -432,7 +446,7 @@ def _document_symbol_identities(
         symbol_key = metadata.get("symbol_key")
         symbol_id = metadata.get("symbol_id")
         if not isinstance(symbol_key, str) or symbol_id is None:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"{source}: part {part_index} has incomplete canonical symbol metadata"
             )
         registry.register(
@@ -452,7 +466,7 @@ def _document_symbol_identities(
             continue
         symbol_key = index.symbol_id_keys.get(symbol_id)
         if symbol_key is None:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"{source}: semantic symbol ID {symbol_id} has no canonical identity key"
             )
         registry.register(
@@ -639,6 +653,46 @@ def _normalize_signature_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+_PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("libc++", ("/libcxx/include/", "/include/c++/v1/")),
+    (
+        "libstdc++",
+        ("/libstdc++-v3/include/", "/libstdc++-v3/libsupc++/", "/include/c++/"),
+    ),
+    ("msvc-stl", ("/stl/inc/", "/microsoft visual studio/")),
+    ("boost", ("/boost/",)),
+)
+
+
+def symbol_provider_provenance(file_path: str | None) -> tuple[str, str]:
+    """Return authoritative implementation provider and provider-relative include."""
+
+    if not file_path:
+        return "", ""
+    normalized = "/" + str(file_path).replace("\\", "/").strip("/")
+    lowered = normalized.lower()
+    for provider, markers in _PROVIDER_PATH_MARKERS:
+        for marker in markers:
+            offset = lowered.rfind(marker) if provider == "boost" else lowered.find(marker)
+            if offset < 0:
+                continue
+            include_path = normalized[offset + len(marker) :]
+            if provider == "libstdc++" and marker == "/include/c++/":
+                parts = include_path.split("/", 1)
+                if len(parts) == 2 and re.fullmatch(r"[0-9.]+", parts[0]):
+                    include_path = parts[1]
+            elif provider == "msvc-stl" and marker == "/microsoft visual studio/":
+                include_marker = "/include/"
+                include_offset = include_path.lower().rfind(include_marker)
+                if include_offset < 0:
+                    return provider, ""
+                include_path = include_path[include_offset + len(include_marker) :]
+            elif provider == "boost":
+                include_path = "boost/" + include_path
+            return provider, include_path.strip("/")
+    return "", ""
+
+
 def normalize_qualified_name(qname: str) -> str:
     """Return the stable qualified-name spelling used by fallback identity."""
 
@@ -662,6 +716,8 @@ def _cursor_usr(cursor: Cursor) -> str:
         return ""
     try:
         usr = str(get_usr() or "")
+    except SymbolIdentityError:
+        raise
     except Exception:
         return ""
     # Clang can surface empty/placeholder USRs for unexposed/local constructs.
@@ -677,11 +733,37 @@ def _cursor_canonical_signature(cursor: Cursor) -> str:
     if display:
         pieces.append(f"display={display}")
     cursor_type = getattr(cursor, "type", None)
-    type_spelling = _normalize_signature_text(getattr(cursor_type, "spelling", "") or "")
+    canonical_type = cursor_type
+    get_canonical = getattr(cursor_type, "get_canonical", None)
+    if callable(get_canonical):
+        try:
+            canonical_type = get_canonical()
+        except SymbolIdentityError:
+            raise
+        except Exception:
+            canonical_type = cursor_type
+    type_spelling = _normalize_signature_text(
+        getattr(canonical_type, "spelling", "")
+        or getattr(cursor_type, "spelling", "")
+        or ""
+    )
     if type_spelling:
         pieces.append(f"type={type_spelling}")
     result_type = getattr(cursor, "result_type", None)
-    result_spelling = _normalize_signature_text(getattr(result_type, "spelling", "") or "")
+    canonical_result = result_type
+    get_canonical_result = getattr(result_type, "get_canonical", None)
+    if callable(get_canonical_result):
+        try:
+            canonical_result = get_canonical_result()
+        except SymbolIdentityError:
+            raise
+        except Exception:
+            canonical_result = result_type
+    result_spelling = _normalize_signature_text(
+        getattr(canonical_result, "spelling", "")
+        or getattr(result_type, "spelling", "")
+        or ""
+    )
     if result_spelling:
         pieces.append(f"result={result_spelling}")
     arg_types: list[str] = []
@@ -690,13 +772,27 @@ def _cursor_canonical_signature(cursor: Cursor) -> str:
         try:
             for arg in get_arguments():
                 arg_type = getattr(arg, "type", None)
+                canonical_arg = arg_type
+                get_canonical_arg = getattr(arg_type, "get_canonical", None)
+                if callable(get_canonical_arg):
+                    canonical_arg = get_canonical_arg()
                 arg_types.append(
-                    _normalize_signature_text(getattr(arg_type, "spelling", "") or "")
+                    _normalize_signature_text(
+                        getattr(canonical_arg, "spelling", "")
+                        or getattr(arg_type, "spelling", "")
+                        or ""
+                    )
                 )
+        except SymbolIdentityError:
+            raise
         except Exception:
             arg_types = []
     if arg_types:
         pieces.append("args=(" + ",".join(arg_types) + ")")
+    exception_kind = getattr(cursor, "exception_specification_kind", None)
+    exception_name = getattr(exception_kind, "name", "") or str(exception_kind or "")
+    if exception_name:
+        pieces.append(f"exception={exception_name.rsplit('.', 1)[-1]}")
     return "|".join(pieces)
 
 
@@ -710,7 +806,7 @@ def _identity_scope_key(
     parts: list[str] = []
     if project:
         parts.append(f"project={project}")
-    if file:
+    if file and force_file_scope:
         parts.append(f"file={file}")
     if line is not None and line > 0 and force_file_scope:
         parts.append(f"line={int(line)}")
@@ -741,7 +837,12 @@ def canonical_symbol_identity(
     normalized_signature = _normalize_signature_text(canonical_signature)
     normalized_usr = _normalize_signature_text(usr)
     normalized_qname = normalize_qualified_name(qname)
-    owning_project = _normalize_signature_text(project or repo)
+    raw_project = project or repo
+    owning_project = (
+        require_project_identity(raw_project, source="canonical_symbol_identity")
+        if raw_project
+        else ""
+    )
     if normalized_usr:
         project_scope = f"project={owning_project}\x1f" if owning_project else ""
         return (
@@ -816,7 +917,18 @@ def symbol_identity_for_cursor(
     linkage_name = getattr(linkage, "name", "") or str(linkage or "")
     storage = getattr(cursor, "storage_class", None)
     storage_name = getattr(storage, "name", "") or str(storage or "")
-    if "INTERNAL" in linkage_name or storage_name == "STATIC":
+    semantic_parent = getattr(cursor, "semantic_parent", None)
+    parent_kind = _cursor_kind_name(semantic_parent) if semantic_parent is not None else ""
+    is_local = parent_kind in {
+        "FUNCTION_DECL",
+        "FUNCTION_TEMPLATE",
+        "CXX_METHOD",
+        "CONSTRUCTOR",
+        "DESTRUCTOR",
+        "CONVERSION_FUNCTION",
+        "LAMBDA_EXPR",
+    }
+    if "INTERNAL" in linkage_name or storage_name == "STATIC" or is_local:
         file_scope = True
     identity_key = canonical_symbol_identity(
         qname=qname,
@@ -852,6 +964,7 @@ def symbol_reference_for_cursor(
         fallback_file=fallback_file,
     )
     location = getattr(cursor, "location", None)
+    provider, include_provenance = symbol_provider_provenance(relative_file)
     return {
         "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
         "symbol_key": key,
@@ -863,6 +976,8 @@ def symbol_reference_for_cursor(
         "project": project_id if is_project_local else "",
         "file": relative_file,
         "line": int(getattr(location, "line", 0) or 0),
+        "provider": provider,
+        "include_provenance": include_provenance,
     }
 
 
@@ -879,14 +994,14 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         value.get("symbol_identity_schema_version") or SYMBOL_IDENTITY_SCHEMA_VERSION
     )
     if identity_version != SYMBOL_IDENTITY_SCHEMA_VERSION:
-        raise RuntimeError(
+        raise SymbolIdentityError(
             "symbol reference uses incompatible identity schema: "
             f"got v{identity_version}, expected v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
         )
     expected_symbol_id = _compute_symbol_id(key)
     claimed_symbol_id = value.get("symbol_id")
     if claimed_symbol_id is not None and int(claimed_symbol_id) != expected_symbol_id:
-        raise RuntimeError(
+        raise SymbolIdentityError(
             "symbol reference ID does not match canonical key: "
             f"claimed={claimed_symbol_id} expected={expected_symbol_id} key={key!r}"
         )
@@ -903,6 +1018,8 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         "project": str(value.get("project") or ""),
         "file": str(value.get("file") or ""),
         "line": int(value.get("line") or 0),
+        "provider": str(value.get("provider") or ""),
+        "include_provenance": str(value.get("include_provenance") or ""),
     }
 
 
@@ -1130,7 +1247,7 @@ class MacroDef:
         text: str,
         params: list[str] | None = None,
         *,
-        project_id: str | None = None,
+        project_id: str,
         visible_in_file: str | None = None,
         visible_line: int | None = None,
         sequence: int = 0,
@@ -1144,7 +1261,10 @@ class MacroDef:
         self.line = line
         self.text = text
         self.params = list(params or [])
-        self.project_id = project_id or ""
+        self.project_id = require_project_identity(
+            project_id,
+            source=f"MacroDef({name})",
+        )
         self.visible_in_file = visible_in_file or file
         self.visible_line = visible_line if visible_line is not None else line
         self.sequence = int(sequence)
@@ -1514,6 +1634,8 @@ def get_function_text(cursor: Cursor, tu: TranslationUnit) -> str:
         end_offset = end.offset
         if start_offset < len(content) and end_offset <= len(content):
             return content[start_offset:end_offset]
+    except SymbolIdentityError:
+        raise
     except Exception:
         pass
     return ""
@@ -1997,7 +2119,8 @@ def parse_translation_unit(
     compile_args: list[str],
     project_dir: str,
     allow_system_types: bool = False,
-    project_id: str | None = None,
+    *,
+    project_id: str,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -2020,7 +2143,10 @@ def parse_translation_unit(
     """
     functions: list[FunctionDef] = []
     typedefs: list[TypeDef] = []
-    stable_project_id = project_id or os.path.basename(os.path.abspath(project_dir))
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"parse_translation_unit({filepath})",
+    )
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
             source = source_file.read()
@@ -2036,6 +2162,8 @@ def parse_translation_unit(
             # make many parallel clang workers retain large buffers.
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
+    except SymbolIdentityError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
 
@@ -2081,6 +2209,8 @@ def parse_translation_unit(
             return rel_path
         try:
             return os.path.relpath(loc.name, project_dir)
+        except SymbolIdentityError:
+            raise
         except Exception:
             return rel_path
 
@@ -2512,7 +2642,7 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------- #
 CROSSLINK_MAX_DEPS_PER_DOC = 12
 CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
-GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 3
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 4
 
 
 class CrossLinkBudget:
@@ -2561,7 +2691,7 @@ class GlobalSymbolReader:
             for row in self._conn.execute("PRAGMA table_info(symbols)").fetchall()
         }
         if "symbol_uid" not in cols:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"--global-symbol-index uses old qname-only schema: {path}. "
                 "Rebuild it with scripts/crossrepo/build_global_symbol_index.py "
                 "so overloaded symbols and multi-implementation std symbols are "
@@ -2574,34 +2704,54 @@ class GlobalSymbolReader:
             "canonical_signature",
             "symbol_kind",
             "identity_schema_version",
+            "provider",
+            "include_provenance",
         }
         missing = sorted(required - cols)
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
         if missing or version != GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"--global-symbol-index schema is incompatible: {path}; "
-                f"user_version={version}, missing_columns={missing}. Open it once "
-                "with scripts/crossrepo/build_global_symbol_index.py to migrate and "
-                "backfill identity fields, or rebuild it."
+                f"user_version={version}, missing_columns={missing}. Migrate only "
+                "when provider provenance is reconstructable, or rebuild it."
             )
         incompatible_rows = int(
             self._conn.execute(
                 "SELECT COUNT(*) FROM symbols "
-                "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id=''",
+                "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id='' "
+                "OR symbol_kind='' OR (usr='' AND canonical_signature='') "
+                "OR canonical_signature LIKE 'legacy-kind=%text-sha1=%' "
+                "OR provider='' OR include_provenance=''",
                 (SYMBOL_IDENTITY_SCHEMA_VERSION,),
             ).fetchone()[0]
         )
         if incompatible_rows:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"--global-symbol-index has incompatible symbol identity rows: {path}; "
                 f"count={incompatible_rows}, expected_version="
                 f"{SYMBOL_IDENTITY_SCHEMA_VERSION}. Migrate or rebuild the index."
+            )
+        for (project_id,) in self._conn.execute(
+            "SELECT DISTINCT base_repo FROM symbols"
+        ):
+            require_project_identity(
+                project_id, source=f"global symbol index {path}"
+            )
+        missing_std_provenance = self._conn.execute(
+            "SELECT symbol_uid, file FROM symbols WHERE base_lib='std' "
+            "AND (provider NOT IN ('libc++', 'libstdc++', 'msvc-stl') "
+            "OR include_provenance='') LIMIT 1"
+        ).fetchone()
+        if missing_std_provenance is not None:
+            raise SymbolIdentityError(
+                f"{path}: std symbol lacks authoritative provider/include provenance: "
+                f"uid={missing_std_provenance[0]} file={missing_std_provenance[1]!r}"
             )
         registry_table = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbol_identities'"
         ).fetchone()
         if registry_table is None:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"--global-symbol-index has no corpus collision registry: {path}. "
                 "Migrate or rebuild the index."
             )
@@ -2614,7 +2764,7 @@ class GlobalSymbolReader:
             ).fetchone()[0]
         )
         if unregistered_rows:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"--global-symbol-index has unregistered symbol IDs: {path}; "
                 f"count={unregistered_rows}. Migrate or rebuild the index."
             )
@@ -2628,7 +2778,7 @@ class GlobalSymbolReader:
         rows = self._conn.execute(
             "SELECT symbol_uid, symbol_key, symbol_id, qname, base_lib, base_repo, text, "
             "token_est, kind, file, line, end_line, usr, canonical_signature, "
-            "symbol_kind, identity_schema_version "
+            "symbol_kind, identity_schema_version, provider, include_provenance "
             "FROM symbols WHERE qname=? AND sym_type='func' "
             "ORDER BY base_repo, file, line, symbol_uid",
             (key,),
@@ -2651,6 +2801,8 @@ class GlobalSymbolReader:
                 "canonical_signature": row[13],
                 "symbol_kind": row[14],
                 "identity_schema_version": row[15],
+                "provider": row[16],
+                "include_provenance": row[17],
             }
             for row in rows
         )
@@ -2667,29 +2819,53 @@ class GlobalSymbolReader:
         symbol_kind: str | None = None,
         project: str | None = None,
         file: str | None = None,
+        provider: str | None = None,
+        include_provenance: str | None = None,
     ) -> dict[str, object] | None:
-        """Resolve one exact/unambiguous candidate; ambiguity returns ``None``."""
+        """Resolve one exact candidate and fail closed on ambiguity."""
         all_candidates = self.lookup_candidates(qname)
         candidates = list(all_candidates)
-        if symbol_key:
-            candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
         if usr:
             candidates = [row for row in candidates if row["usr"] == usr]
-        if canonical_signature:
-            signature = _normalize_signature_text(canonical_signature)
-            candidates = [
-                row
-                for row in candidates
-                if _normalize_signature_text(str(row["canonical_signature"])) == signature
-            ]
-        if symbol_kind:
-            candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
+        else:
+            fallback_used = False
+            if canonical_signature:
+                fallback_used = True
+                signature = _normalize_signature_text(canonical_signature)
+                candidates = [
+                    row
+                    for row in candidates
+                    if _normalize_signature_text(str(row["canonical_signature"])) == signature
+                ]
+            if symbol_kind:
+                fallback_used = True
+                candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
+            if not fallback_used and symbol_key:
+                candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
         if project:
             candidates = [row for row in candidates if row["base_repo"] == project]
         if file:
             candidates = [row for row in candidates if row["file"] == file]
+        if provider:
+            candidates = [row for row in candidates if row["provider"] == provider]
+        if include_provenance:
+            candidates = [
+                row
+                for row in candidates
+                if row["include_provenance"] == include_provenance
+            ]
         if len(candidates) == 1:
             return candidates[0]
+        if len(candidates) > 1:
+            preview = [
+                f"{row['base_repo']}:{row['file']}:{row['line']}"
+                for row in candidates[:8]
+            ]
+            raise SymbolIdentityError(
+                "ambiguous global symbol lookup: "
+                f"qname={qname!r} usr={usr or ''!r} provider={provider or ''!r} "
+                f"include={include_provenance or ''!r} candidates={preview}"
+            )
         return None
 
     def close(self) -> None:
@@ -2753,6 +2929,10 @@ def collect_transitive_deps(
                 file=(str(reference.get("file") or "") or None)
                 if reference_project
                 else None,
+                provider=str(reference.get("provider") or "") or None,
+                include_provenance=(
+                    str(reference.get("include_provenance") or "") or None
+                ),
             )
         else:
             qname = reference
@@ -2950,7 +3130,7 @@ def extract_semantic_metadata(
     filename: str,
     *,
     project_dir: str | None = None,
-    project_id: str | None = None,
+    project_id: str,
     fallback_file: str | None = None,
 ) -> dict:
     """Extract per-character semantic metadata from a translation unit.
@@ -2969,6 +3149,10 @@ def extract_semantic_metadata(
         dict with keys 'symbol_ids', 'call_targets', 'type_refs', 'def_use',
         each a list[int] of length len(source).
     """
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"extract_semantic_metadata({filename})",
+    )
     text_len = len(source)
     symbol_ids = [0] * text_len
     call_targets = [0] * text_len
@@ -3051,7 +3235,7 @@ def extract_semantic_metadata(
                 symbol_key, _usr, _sig = symbol_identity_for_cursor(
                     cursor,
                     project_dir=project_dir,
-                    project=project_id,
+                    project=stable_project_id,
                     fallback_file=fallback_file,
                 )
                 sym_id = _register_symbol_key(symbol_key, cursor)
@@ -3067,7 +3251,7 @@ def extract_semantic_metadata(
                     symbol_key, _usr, _sig = symbol_identity_for_cursor(
                         ref,
                         project_dir=project_dir,
-                        project=project_id,
+                        project=stable_project_id,
                         fallback_file=fallback_file,
                     )
                     sym_id = _register_symbol_key(symbol_key, ref)
@@ -3084,7 +3268,7 @@ def extract_semantic_metadata(
                     symbol_key, _usr, _sig = symbol_identity_for_cursor(
                         ref,
                         project_dir=project_dir,
-                        project=project_id,
+                        project=stable_project_id,
                         fallback_file=fallback_file,
                     )
                     target_id = _register_symbol_key(symbol_key, ref)
@@ -3100,7 +3284,7 @@ def extract_semantic_metadata(
                     symbol_key, _usr, _sig = symbol_identity_for_cursor(
                         ref,
                         project_dir=project_dir,
-                        project=project_id,
+                        project=stable_project_id,
                         fallback_file=fallback_file,
                     )
                     ref_id = _register_symbol_key(symbol_key, ref)
@@ -3957,38 +4141,56 @@ def build_enriched_doc(
             candidates = list(crosslink_targets.get(qname, []))
             if not candidates:
                 return None
-            reference_key = str(reference.get("symbol_key") or "")
-            exact_key_matches = [
-                target
-                for target in candidates
-                if reference_key and target.get("symbol_key") == reference_key
-            ]
-            identity_filter_used = bool(exact_key_matches)
-            if exact_key_matches:
-                candidates = exact_key_matches
+            identity_filter_used = False
             usr = str(reference.get("usr") or "")
             if usr:
                 identity_filter_used = True
                 candidates = [target for target in candidates if target.get("usr") == usr]
-            signature = _normalize_signature_text(
-                str(reference.get("canonical_signature") or "")
-            )
-            if signature:
+            else:
+                reference_key = str(reference.get("symbol_key") or "")
+                signature = _normalize_signature_text(
+                    str(reference.get("canonical_signature") or "")
+                )
+                if signature:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if _normalize_signature_text(
+                            str(target.get("canonical_signature") or "")
+                        ) == signature
+                    ]
+                symbol_kind = str(reference.get("symbol_kind") or "")
+                if symbol_kind:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if str(target.get("kind") or "") == symbol_kind
+                    ]
+                if not identity_filter_used and reference_key:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if target.get("symbol_key") == reference_key
+                    ]
+            provider = str(reference.get("provider") or "")
+            if provider:
                 identity_filter_used = True
                 candidates = [
                     target
                     for target in candidates
-                    if _normalize_signature_text(
-                        str(target.get("canonical_signature") or "")
-                    ) == signature
+                    if str(target.get("provider") or "") == provider
                 ]
-            symbol_kind = str(reference.get("symbol_kind") or "")
-            if symbol_kind:
+            include_provenance = str(reference.get("include_provenance") or "")
+            if include_provenance:
                 identity_filter_used = True
                 candidates = [
                     target
                     for target in candidates
-                    if str(target.get("kind") or "") == symbol_kind
+                    if str(target.get("include_provenance") or "")
+                    == include_provenance
                 ]
             if not identity_filter_used:
                 return None
@@ -4001,6 +4203,11 @@ def build_enriched_doc(
                     "legacy-kind="
                 )
             ]
+        if len(candidates) > 1:
+            raise SymbolIdentityError(
+                f"ambiguous pulled crosslink for {qname!r}: "
+                f"{[target.get('symbol_key') for target in candidates[:8]]}"
+            )
         if len(candidates) != 1:
             return None
         key = candidates[0].get("symbol_key")
@@ -4656,14 +4863,15 @@ def register_header_macros(
     header_files: list[str],
     *,
     project_dir: str | None,
-    project_id: str | None = None,
+    project_id: str,
     include_dirs: list[str] | None = None,
     max_include_depth: int | None = None,
     max_include_files_per_root: int | None = None,
     memory_limit_gb: float | None = None,
 ) -> dict[str, int]:
-    stable_project_id = project_id or (
-        os.path.basename(os.path.abspath(project_dir)) if project_dir else ""
+    stable_project_id = require_project_identity(
+        project_id,
+        source="register_header_macros",
     )
     sequence = [0]
     directive_cache: dict[str, list[dict[str, object]]] = {}
@@ -5414,6 +5622,7 @@ def emit_header_documents(
     index: ProjectIndex,
     header_files: list[str],
     project_dir: str | None,
+    project_id: str,
     compile_db: dict | None,
     default_args: list[str] | None,
     default_build_info: dict | None,
@@ -5515,11 +5724,7 @@ def emit_header_documents(
                     rel,
                     line,
                     macro_text,
-                    project_id=(
-                        os.path.basename(os.path.abspath(project_dir))
-                        if project_dir
-                        else None
-                    ),
+                    project_id=project_id,
                 ),
             )
             doc = build_header_fragment_doc(
@@ -5733,6 +5938,7 @@ def build_training_documents(
     enriched: bool = False,
     *,
     project_dir: str | None = None,
+    project_id: str | None = None,
     compile_db: dict | None = None,
     default_args: list[str] | None = None,
     default_build_info: dict | None = None,
@@ -5775,11 +5981,17 @@ def build_training_documents(
             documents.append(doc)
 
     index.compute_dep_levels()
+    stable_project_id: str | None = None
     if header_files or macro_scan_files:
+        stable_project_id = require_project_identity(
+            project_id,
+            source="build_training_documents macro scan",
+        )
         macro_stats = register_header_macros(
             index,
             macro_scan_files or header_files or [],
             project_dir=project_dir,
+            project_id=stable_project_id,
             include_dirs=_collect_macro_include_dirs(
                 project_dir=project_dir,
                 compile_db=compile_db,
@@ -6058,10 +6270,15 @@ def build_training_documents(
                 _record_doc(doc)
 
         if header_files:
+            if stable_project_id is None:
+                raise SymbolIdentityError(
+                    "header emission requires a canonical owner/repo identity"
+                )
             header_stats = emit_header_documents(
                 index=index,
                 header_files=header_files,
                 project_dir=project_dir,
+                project_id=stable_project_id,
                 compile_db=compile_db,
                 default_args=default_args,
                 default_build_info=default_build_info,
@@ -6121,7 +6338,7 @@ def _resolve_file_args(filepath, compile_db, default_args):
 
 def _parse_file_batch(args_tuple):
     """Worker function for parallel parsing. Each worker creates its own Index."""
-    filepaths, compile_db, default_args, project_dir = args_tuple
+    filepaths, compile_db, default_args, project_dir, project_id = args_tuple
     sys.setrecursionlimit(50000)  # Set in each worker process too
     _configure_libclang()
     clang_index = Index.create()
@@ -6132,9 +6349,17 @@ def _parse_file_batch(args_tuple):
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
         try:
-            functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+            functions, typedefs = parse_translation_unit(
+                filepath,
+                clang_index,
+                args,
+                project_dir,
+                project_id=project_id,
+            )
             func_results.extend(f.to_dict() for f in functions)
             type_results.extend(t.to_dict() for t in typedefs)
+        except SymbolIdentityError:
+            raise
         except (Exception, RecursionError):
             errors += 1
         now = time.monotonic()
@@ -6161,12 +6386,18 @@ def _iter_parse_batch_results(executor, batches):
 
 def _parse_single_file_worker(args_tuple):
     """Parse one file in a fresh subprocess so a segfault is file-local."""
-    filepath, compile_db, default_args, project_dir = args_tuple
+    filepath, compile_db, default_args, project_dir, project_id = args_tuple
     sys.setrecursionlimit(50000)
     _configure_libclang()
     clang_index = Index.create()
     args = _resolve_file_args(filepath, compile_db, default_args)
-    functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+    functions, typedefs = parse_translation_unit(
+        filepath,
+        clang_index,
+        args,
+        project_dir,
+        project_id=project_id,
+    )
     return {
         "functions": [f.to_dict() for f in functions],
         "typedefs": [t.to_dict() for t in typedefs],
@@ -6178,6 +6409,7 @@ def _parse_files_isolated(
     compile_db: dict | None,
     default_args: list[str],
     project_dir: str,
+    project_id: str,
     *,
     max_workers: int,
 ) -> tuple[ProjectIndex, int, int]:
@@ -6190,7 +6422,7 @@ def _parse_files_isolated(
         futures = {
             executor.submit(
                 _parse_single_file_worker,
-                (filepath, compile_db, default_args, project_dir),
+                (filepath, compile_db, default_args, project_dir, project_id),
             ): filepath
             for filepath in cpp_files
         }
@@ -6207,6 +6439,8 @@ def _parse_files_isolated(
                 errors += 1
                 if errors <= 5:
                     print(f"  TIMEOUT parsing {filepath} (>120s)", file=sys.stderr)
+            except SymbolIdentityError:
+                raise
             except Exception as e:
                 errors += 1
                 if errors <= 5:
@@ -6234,6 +6468,8 @@ def process_project(
     dedup_near: bool = True,
     global_symbol_index: str | None = None,
     emit_doc: Callable[[str | dict[str, object]], None] | None = None,
+    *,
+    project_id: str,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -6243,7 +6479,10 @@ def process_project(
     docs are streamed to it and not accumulated in the returned list.
     """
     project_dir = os.path.abspath(project_dir)
-    project_name = os.path.basename(project_dir)
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"process_project({project_dir})",
+    )
     _configure_libclang()
 
     # Open the cross-repo base-lib symbol index (read-only) for THIS process.
@@ -6253,7 +6492,7 @@ def process_project(
         print(f"  Cross-lib: using global symbol index {global_symbol_index}",
               file=sys.stderr)
 
-    print(f"\n--- Processing project: {project_name} ---", file=sys.stderr)
+    print(f"\n--- Processing project: {stable_project_id} ---", file=sys.stderr)
 
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
@@ -6296,7 +6535,9 @@ def process_project(
         batches = []
         for i in range(0, len(cpp_files), chunk_size):
             batch = cpp_files[i:i + chunk_size]
-            batches.append((batch, compile_db, default_args, project_dir))
+            batches.append(
+                (batch, compile_db, default_args, project_dir, stable_project_id)
+            )
 
         total_parsed = 0
         total_errors = 0
@@ -6318,6 +6559,8 @@ def process_project(
 
             print(f"  Parsed {total_parsed} files ({total_errors} errors), "
                   f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
+        except SymbolIdentityError:
+            raise
         except Exception as exc:
             print(
                 f"  WARN: parallel parse failed ({exc}); retrying isolated per-file workers",
@@ -6328,6 +6571,7 @@ def process_project(
                 compile_db,
                 default_args,
                 project_dir,
+                stable_project_id,
                 max_workers=min(4, effective_workers),
             )
             print(f"  Parsed {parsed} files ({errors} errors), "
@@ -6341,12 +6585,20 @@ def process_project(
         for filepath in cpp_files:
             args = _resolve_file_args(filepath, compile_db, default_args)
             try:
-                functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+                functions, typedefs = parse_translation_unit(
+                    filepath,
+                    clang_index,
+                    args,
+                    project_dir,
+                    project_id=stable_project_id,
+                )
                 for func in functions:
                     index_obj.add_function(func)
                 for td in typedefs:
                     index_obj.add_typedef(td)
                 parsed += 1
+            except SymbolIdentityError:
+                raise
             except Exception as e:
                 errors += 1
                 if errors <= 5:
@@ -6403,6 +6655,7 @@ def process_project(
             max_dep_depth,
             enriched=enriched,
             project_dir=project_dir,
+            project_id=stable_project_id,
             compile_db=compile_db,
             default_args=default_args,
             default_build_info=default_build_info,
@@ -6462,10 +6715,15 @@ def main() -> int:
         description='Clang-based cross-file C++ dependency indexer')
     parser.add_argument('--project-dir', type=str,
                         help='Single project directory to process')
+    parser.add_argument('--project-id', type=str,
+                        help='Canonical owner/repo identity for --project-dir')
     parser.add_argument('--projects-list', type=str,
-                        help='File listing project directories (one per line)')
+                        help='Tab-separated owner/repo and project directory per line')
     parser.add_argument('--projects-dir', type=str,
                         help='Directory containing multiple project subdirectories')
+    parser.add_argument('--project-map', type=str,
+                        help='JSON object mapping absolute project directories to owner/repo; '
+                             'required with --projects-dir')
     parser.add_argument('--output', type=str, required=True,
                         help='Output JSONL file path')
     parser.add_argument('--max-tokens', type=int, default=16384,
@@ -6529,22 +6787,64 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Collect project directories
-    project_dirs = []
+    # Collect project directories together with their canonical corpus identity.
+    project_specs: list[tuple[str, str]] = []
     if args.project_dir:
-        project_dirs.append(args.project_dir)
+        if not args.project_id:
+            parser.error("--project-dir requires --project-id owner/repo")
+        project_specs.append(
+            (
+                os.path.abspath(args.project_dir),
+                require_project_identity(args.project_id, source="--project-id"),
+            )
+        )
     elif args.projects_list:
         with open(args.projects_list) as f:
-            project_dirs = [line.strip() for line in f if line.strip()]
+            for line_number, raw_line in enumerate(f, 1):
+                line = raw_line.rstrip("\n")
+                if not line.strip():
+                    continue
+                fields = line.split("\t")
+                if len(fields) != 2:
+                    parser.error(
+                        f"{args.projects_list}:{line_number}: expected "
+                        "owner/repo<TAB>/project/path"
+                    )
+                project_id, project_dir = fields
+                project_specs.append(
+                    (
+                        os.path.abspath(project_dir),
+                        require_project_identity(
+                            project_id,
+                            source=f"{args.projects_list}:{line_number}",
+                        ),
+                    )
+                )
     elif args.projects_dir:
+        if not args.project_map:
+            parser.error("--projects-dir requires --project-map")
+        with open(args.project_map, encoding="utf-8") as project_map_file:
+            raw_project_map = json.load(project_map_file)
+        if not isinstance(raw_project_map, dict):
+            parser.error("--project-map must contain a JSON object")
+        project_map = {
+            os.path.abspath(str(path)): require_project_identity(
+                project_id,
+                source=f"--project-map[{path!r}]",
+            )
+            for path, project_id in raw_project_map.items()
+        }
         for entry in sorted(os.listdir(args.projects_dir)):
-            full = os.path.join(args.projects_dir, entry)
+            full = os.path.abspath(os.path.join(args.projects_dir, entry))
             if os.path.isdir(full):
-                project_dirs.append(full)
+                project_id = project_map.get(full)
+                if project_id is None:
+                    parser.error(f"--project-map has no identity for {full}")
+                project_specs.append((full, project_id))
     else:
         parser.error("Provide --project-dir, --projects-list, or --projects-dir")
 
-    print(f"Processing {len(project_dirs)} project(s)", file=sys.stderr)
+    print(f"Processing {len(project_specs)} project(s)", file=sys.stderr)
     print(f"Output: {args.output}", file=sys.stderr)
     print(f"Max tokens: {args.max_tokens}", file=sys.stderr)
     print(f"Memory limit: {args.memory_limit_gb} GiB", file=sys.stderr)
@@ -6567,7 +6867,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if args.dedup_stage_id and len(project_dirs) != 1:
+        if args.dedup_stage_id and len(project_specs) != 1:
             print(
                 "ERROR: --dedup-stage-id is only supported for one project per "
                 "index_project process; parent pipeline must own promotion.",
@@ -6639,57 +6939,66 @@ def main() -> int:
 
     append_mode = getattr(args, 'append', False)
     enriched = args.enriched
-    with open(args.output, 'a' if append_mode else 'w') as out:
-        def _write_doc(doc: str | dict[str, object]) -> None:
-            nonlocal total_docs
-            if enriched:
-                json.dump(doc, out)
-            else:
-                json.dump({'text': doc}, out)
-            out.write('\n')
-            total_docs += 1
+    final_output = Path(args.output)
+    with atomic_output_file(final_output) as staged_output:
+        if append_mode and final_output.exists():
+            shutil.copyfile(final_output, staged_output)
+        with staged_output.open('a' if append_mode else 'w') as out:
+            def _write_doc(doc: str | dict[str, object]) -> None:
+                nonlocal total_docs
+                if enriched:
+                    json.dump(doc, out)
+                else:
+                    json.dump({'text': doc}, out)
+                out.write('\n')
+                total_docs += 1
 
-        if args.workers > 1 and len(project_dirs) > 1:
-            # Multi-project parallel mode
-            with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                futures = {
-                    executor.submit(
-                        process_project, pd, args.max_tokens, args.max_dep_depth,
-                        args.parse_workers, enriched, extra_exclude,
-                        args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
-                        args.dedup_stage_id, args.dedup_stage_db, dedup_near,
-                        global_symbol_index,
-                    ): pd
-                    for pd in project_dirs
-                }
-                for future in as_completed(futures):
-                    pd = futures[future]
+            if args.workers > 1 and len(project_specs) > 1:
+                with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                    futures = {
+                        executor.submit(
+                            process_project, pd, args.max_tokens, args.max_dep_depth,
+                            args.parse_workers, enriched, extra_exclude,
+                            args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
+                            args.dedup_stage_id, args.dedup_stage_db, dedup_near,
+                            global_symbol_index,
+                            project_id=project_id,
+                        ): (pd, project_id)
+                        for pd, project_id in project_specs
+                    }
+                    for future in as_completed(futures):
+                        pd, project_id = futures[future]
+                        try:
+                            docs = future.result()
+                            for doc in docs:
+                                _write_doc(doc)
+                        except SymbolIdentityError:
+                            raise
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"failed processing {project_id} ({pd}): {exc}"
+                            ) from exc
+            else:
+                for pd, project_id in project_specs:
                     try:
-                        docs = future.result()
+                        docs = process_project(
+                            pd, args.max_tokens, args.max_dep_depth,
+                            args.parse_workers, enriched, extra_exclude,
+                            args.memory_limit_gb, args.tokenizer_path,
+                            args.dedup_db, args.dedup_stage_id,
+                            args.dedup_stage_db, dedup_near,
+                            global_symbol_index, emit_doc=_write_doc,
+                            project_id=project_id,
+                        )
                         for doc in docs:
                             _write_doc(doc)
-                    except Exception as e:
-                        print(f"ERROR processing {pd}: {e}", file=sys.stderr)
-        else:
-            # Sequential mode
-            for pd in project_dirs:
-                try:
-                    docs = process_project(pd, args.max_tokens, args.max_dep_depth,
-                                           args.parse_workers, enriched, extra_exclude,
-                                           args.memory_limit_gb, args.tokenizer_path,
-                                           args.dedup_db, args.dedup_stage_id,
-                                           args.dedup_stage_db,
-                                           dedup_near,
-                                           global_symbol_index,
-                                           emit_doc=_write_doc)
-                    for doc in docs:
-                        _write_doc(doc)
-                    out.flush()
-                except Exception as e:
-                    print(f"ERROR processing {pd}: {e}", file=sys.stderr)
-                    if len(project_dirs) == 1:
-                        return 1
-                    print("  Skipping project, continuing...", file=sys.stderr)
+                        out.flush()
+                    except SymbolIdentityError:
+                        raise
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"failed processing {project_id} ({pd}): {exc}"
+                        ) from exc
 
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"Total documents: {total_docs}", file=sys.stderr)

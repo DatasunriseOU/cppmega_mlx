@@ -573,6 +573,8 @@ def build_code_fixture(work: Path) -> dict[str, dict]:
                 str(INDEX_PROJECT),
                 "--project-dir",
                 str(repo_dir),
+                "--project-id",
+                f"cppmega-fixtures/{repo_name}",
                 "--output",
                 str(enriched_jsonl),
                 "--enriched",

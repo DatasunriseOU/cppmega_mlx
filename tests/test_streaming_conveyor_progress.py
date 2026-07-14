@@ -14,6 +14,17 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 
+def _repo_identity_map(tmp_path: Path) -> Path:
+    path = tmp_path / "repo_list.json"
+    path.write_text(
+        json.dumps(
+            {"repos": [{"name": "repo", "owner_repo": "tests/repo"}]}
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_progress_writer_appends_jsonl(tmp_path):
     import streaming_conveyor
 
@@ -428,6 +439,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
 
     def runner(
         repo,
+        project_id,
         repo_dir,
         lengths_code,
         work_root,
@@ -457,6 +469,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
 
     info = streaming_conveyor.run_code_half_adaptive(
         "repo",
+        "tests/repo",
         tmp_path,
         (1024,),
         tmp_path / "work",
@@ -484,6 +497,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path)
 
     def runner(
         repo,
+        project_id,
         repo_dir,
         lengths_code,
         work_root,
@@ -511,6 +525,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path)
 
     info = streaming_conveyor.run_code_half_adaptive(
         "repo",
+        "tests/repo",
         tmp_path,
         (1024,),
         tmp_path / "work",
@@ -558,6 +573,7 @@ def test_run_code_half_removes_outputs_when_dedup_promote_fails(tmp_path, monkey
     try:
         streaming_conveyor.run_code_half(
             repo,
+            "tests/repo",
             tmp_path / "src",
             (1024,),
             tmp_path / "work",
@@ -608,6 +624,7 @@ def test_run_code_half_recompresses_before_dedup_promote(tmp_path, monkeypatch):
     try:
         streaming_conveyor.run_code_half(
             repo,
+            "tests/repo",
             tmp_path / "src",
             (1024,),
             tmp_path / "work",
@@ -655,6 +672,7 @@ def test_run_code_half_recompress_failure_rolls_back_before_promote(tmp_path, mo
     with pytest.raises(streaming_conveyor.RepoFailure, match="zstd failed") as exc_info:
         streaming_conveyor.run_code_half(
             repo,
+            "tests/repo",
             tmp_path / "src",
             (1024,),
             tmp_path / "work",
@@ -680,6 +698,7 @@ def test_run_code_half_skips_no_trainable_source(tmp_path, monkeypatch):
 
     info = streaming_conveyor.run_code_half(
         "repo",
+        "tests/repo",
         tmp_path / "src",
         (1024,),
         tmp_path / "work",
@@ -714,6 +733,7 @@ def test_run_code_half_skips_dedup_exhausted_and_discards_stage(
 
     info = streaming_conveyor.run_code_half(
         "repo",
+        "tests/repo",
         tmp_path / "src",
         (1024,),
         tmp_path / "work",
@@ -811,7 +831,7 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            repo_list=_repo_identity_map(tmp_path),
         )
 
     assert (done, failed, all_done) == (0, 0, True)
@@ -875,7 +895,7 @@ def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monk
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            repo_list=_repo_identity_map(tmp_path),
             streams="both",
         )
 
@@ -934,7 +954,7 @@ def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            repo_list=_repo_identity_map(tmp_path),
             streams="both",
             retain_partial_work=True,
         )
@@ -996,7 +1016,7 @@ def test_process_one_repo_interrupted_keeps_extract_cache_without_temp(
                 dedup_db=None,
                 dedup_near=False,
                 pr_store=None,
-                repo_list=None,
+                repo_list=_repo_identity_map(tmp_path),
                 streams="both",
                 retain_partial_work=False,
             )

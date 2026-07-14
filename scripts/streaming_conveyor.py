@@ -78,10 +78,12 @@ from typing import Callable, Iterable, Sequence
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
-import streaming_reindex as sr
-import streaming_reindex_commits as src
+import streaming_reindex as sr  # noqa: E402
+import streaming_reindex_commits as src  # noqa: E402
 
-from streaming_reindex_commits import (  # noqa: F401
+SymbolIdentityError = sr.SymbolIdentityError
+
+from streaming_reindex_commits import (  # noqa: E402,F401
     MLX_ROOT,
     VENV_PYTHON,
     RepoFailure,
@@ -237,6 +239,8 @@ class BackgroundRecompressor:
             for path, fut in jobs:
                 try:
                     fut.result()
+                except SymbolIdentityError:
+                    raise
                 except Exception as exc:
                     failures.append(f"{path}: {type(exc).__name__}: {exc}")
         finally:
@@ -260,6 +264,8 @@ class BackgroundRecompressor:
         for path, fut in futures:
             try:
                 fut.result()
+            except SymbolIdentityError:
+                raise
             except Exception as exc:
                 failures.append(f"{path}: {type(exc).__name__}: {exc}")
         if failures:
@@ -1275,6 +1281,8 @@ class DedupCheckpointController:
                 wal_bytes_after=wal_after,
                 checkpoint_elapsed_s=round(time.time() - started, 3),
             )
+        except SymbolIdentityError:
+            raise
         except Exception as exc:  # noqa: BLE001 - checkpoint failure is telemetry, not data loss
             wal_after = wal.stat().st_size if wal.exists() else 0
             self.progress.emit(
@@ -1425,6 +1433,7 @@ def populate_code_source_cache(
 # --------------------------------------------------------------------------- #
 def run_code_half(
     repo: str,
+    project_id: str,
     repo_dir: Path,
     lengths_code: Sequence[int],
     work_root: Path,
@@ -1454,6 +1463,7 @@ def run_code_half(
                 repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
                 global_symbol_index, memory_limit_gb, parse_workers, index_timeout_s,
                 index_stall_timeout_s,
+                project_id=project_id,
                 promote_dedup_on_success=False,
             )
         except RepoFailure as exc:
@@ -1487,6 +1497,9 @@ def run_code_half(
                         jobs.append((dest, recompressor.submit(dest)))
             if recompressor is not None:
                 recompressor.wait(jobs)
+        except SymbolIdentityError:
+            remove_code_outputs(repo, info.get("lengths", {}).keys())
+            raise
         except Exception as exc:
             remove_code_outputs(repo, info.get("lengths", {}).keys())
             raise RepoFailure(repo, "recompress", f"{type(exc).__name__}: {exc}") from exc
@@ -1494,6 +1507,9 @@ def run_code_half(
 
         try:
             timings.update(sr.promote_dedup_stage(dedup_db, stage_id, stage_db))
+        except SymbolIdentityError:
+            remove_code_outputs(repo, info.get("lengths", {}).keys())
+            raise
         except Exception as exc:
             remove_code_outputs(repo, info.get("lengths", {}).keys())
             raise RepoFailure(
@@ -1511,6 +1527,7 @@ def run_code_half(
 
 CodeRunner = Callable[
     [
+        str,
         str,
         Path,
         Sequence[int],
@@ -1612,6 +1629,7 @@ def failed_code_unit_was_index_memory(
 
 def run_code_half_adaptive(
     repo: str,
+    project_id: str,
     repo_dir: Path,
     lengths_code: Sequence[int],
     work_root: Path,
@@ -1637,6 +1655,7 @@ def run_code_half_adaptive(
     try:
         return active_runner(
             repo,
+            project_id,
             repo_dir,
             lengths_code,
             work_root,
@@ -1659,6 +1678,7 @@ def run_code_half_adaptive(
         )
         return active_runner(
             repo,
+            project_id,
             repo_dir,
             lengths_code,
             work_root,
@@ -2259,7 +2279,6 @@ def run_commits_half(
     ) -> None:
         nonlocal done, failed
         start, end = item
-        rkey = range_key(repo, start)
         try:
             adaptive_result = fut.result()
         except CancelledError:
@@ -2268,6 +2287,8 @@ def run_commits_half(
         except RepoFailure as exc:
             mark_failed_range(start, end, exc)
             return
+        except SymbolIdentityError:
+            raise
         except Exception as exc:  # surface unexpected failures loud
             mark_failed_range(
                 start,
@@ -2461,7 +2482,9 @@ def process_one_repo(
                                 index_stall_timeout_s=code_index_stall_timeout_s,
                             )
                         cinfo = run_code_half_adaptive(
-                            repo, repo_dir, lengths_code, work_root,
+                            repo,
+                            sr.resolve_project_identity(repo, repo_list),
+                            repo_dir, lengths_code, work_root,
                             code_dedup_db, code_dedup_near,
                             global_symbol_index, code_limit, code_parse_workers,
                             code_index_timeout_s,
@@ -3119,6 +3142,8 @@ def main(argv: list[str]) -> int:
             with manifest_lock:
                 manifest.mark_failed(f"{repo}::repo", exc.stage, exc.detail)
             return 1, 0, 0, 1
+        except SymbolIdentityError:
+            raise
         except Exception as exc:  # surface unexpected worker failures loudly
             _log(f"FAIL {repo}::repo: unexpected {type(exc).__name__}: {exc}")
             with manifest_lock:
@@ -3304,6 +3329,8 @@ def main(argv: list[str]) -> int:
         if code_recompressor is not None:
             try:
                 code_recompressor.shutdown()
+            except SymbolIdentityError:
+                raise
             except Exception as exc:
                 recompress_error = exc
         interrupted = STOP_EVENT.is_set()

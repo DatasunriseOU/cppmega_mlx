@@ -58,10 +58,45 @@ def _run_main(tmp_path: Path, monkeypatch, *, allow: bool) -> int:
 
 def test_process_commits_rejects_partial_range_by_default(tmp_path, monkeypatch) -> None:
     assert _run_main(tmp_path, monkeypatch, allow=False) == 1
+    assert not (tmp_path / "out.jsonl").exists()
 
 
 def test_process_commits_allows_explicit_lossy_mode(tmp_path, monkeypatch) -> None:
     assert _run_main(tmp_path, monkeypatch, allow=True) == 0
+    assert (tmp_path / "out.jsonl").exists()
+
+
+def test_allow_parse_errors_never_swallows_identity_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "records.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    output = tmp_path / "out.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "process_commits.py",
+            "--inputs",
+            str(source),
+            "--output",
+            str(output),
+            "--allow-parse-errors",
+        ],
+    )
+    monkeypatch.setattr(process_commits, "start_memory_guard", lambda *_a, **_k: None)
+    monkeypatch.setattr(process_commits, "_configure_libclang", lambda _path: None)
+    monkeypatch.setattr(process_commits, "_load_tokenizer", lambda _path: None)
+    monkeypatch.setattr(process_commits, "Index", SimpleNamespace(create=lambda: object()))
+
+    def fail_identity(_input, out_f, *_args, **_kwargs):
+        out_f.write('{"partial": true}\n')
+        raise process_commits.SymbolIdentityError("synthetic identity collision")
+
+    monkeypatch.setattr(process_commits, "process_jsonl_file", fail_identity)
+    with pytest.raises(process_commits.SymbolIdentityError, match="identity collision"):
+        process_commits.main()
+    assert not output.exists()
 
 
 def test_process_commits_rejects_missing_input_before_clang_init(tmp_path, monkeypatch) -> None:
@@ -107,7 +142,7 @@ def test_analyze_file_clang_surfaces_translation_unit_parse_failure(
             BrokenIndex(),
             str(tmp_path / "clang-tmp"),
             repo_root=str(tmp_path),
-            project_id="repo-a",
+            project_id="owner/repo-a",
         )
 
 

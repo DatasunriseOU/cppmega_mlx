@@ -49,41 +49,40 @@ def _make_store(tmp: Path, *, reference: dict[str, object] | None = None):
     store = b.GlobalSymbolStore(db)
     body = ("template<class R> void trim(R& r) "
             "{ /* boost trim impl, long enough body to keep */ }")
-    if reference is None:
-        record = (
-            "boost::algorithm::trim", "boost", "boost", 2, "func",
-            "boost/algorithm/string/trim.hpp", 5, 40, 1,
-            len(body) // 4, len(body), body,
-        )
-    else:
-        usr = str(reference.get("usr") or "")
-        signature = str(reference.get("canonical_signature") or "")
-        symbol_kind = str(reference.get("symbol_kind") or "FUNCTION_TEMPLATE")
-        record = b.GlobalSymbolRecord(
+    reference = reference or {}
+    usr = str(reference.get("usr") or "")
+    signature = str(
+        reference.get("canonical_signature")
+        or "display=trim(R &)|type=void (R &)"
+    )
+    symbol_kind = str(reference.get("symbol_kind") or "FUNCTION_TEMPLATE")
+    record = b.GlobalSymbolRecord(
+        qname="boost::algorithm::trim",
+        base_lib="boost",
+        base_repo="boostorg/boost",
+        kind=2,
+        sym_type="func",
+        file="boost/algorithm/string/trim.hpp",
+        line=5,
+        end_line=40,
+        is_public=1,
+        token_est=len(body) // 4,
+        body_len=len(body),
+        text=body,
+        symbol_key=b.ip.canonical_symbol_identity(
             qname="boost::algorithm::trim",
-            base_lib="boost",
-            base_repo="boost",
-            kind=2,
-            sym_type="func",
-            file="boost/algorithm/string/trim.hpp",
-            line=5,
-            end_line=40,
-            is_public=1,
-            token_est=len(body) // 4,
-            body_len=len(body),
-            text=body,
-            symbol_key=b.ip.canonical_symbol_identity(
-                qname="boost::algorithm::trim",
-                kind=symbol_kind,
-                usr=usr,
-                canonical_signature=signature,
-                project="boost",
-                file="boost/algorithm/string/trim.hpp",
-            ),
+            kind=symbol_kind,
             usr=usr,
             canonical_signature=signature,
-            symbol_kind=symbol_kind,
-        )
+            project="boostorg/boost",
+            file="boost/algorithm/string/trim.hpp",
+        ),
+        usr=usr,
+        canonical_signature=signature,
+        symbol_kind=symbol_kind,
+        provider="boost",
+        include_provenance="boost/algorithm/string/trim.hpp",
+    )
     store.insert_symbols([record])
     store.commit()
     store.close()
@@ -96,7 +95,7 @@ def test_store_reader_roundtrip(tmp_path):
     reader = ip.GlobalSymbolReader(db)
     rec = reader.lookup("boost::algorithm::trim")
     assert rec is not None
-    assert rec["base_repo"] == "boost"
+    assert rec["base_repo"] == "boostorg/boost"
     assert rec["base_lib"] == "boost"
     assert "trim impl" in rec["text"]
     assert reader.lookup("does::not::exist") is None
@@ -109,9 +108,31 @@ def test_store_reader_normalizes_std_inline_namespace(tmp_path):
     db = str(tmp_path / "gsi.sqlite")
     store = b.GlobalSymbolStore(db)
     body = "size_t basic_string_size() { return 0; }"
-    store.insert_symbols([(
-        "std::basic_string::size", "std", "STL", 2, "func",
-        "stl/inc/string", 1, 1, 1, len(body) // 4, len(body), body,
+    signature = "display=size()|type=size_t ()"
+    store.insert_symbols([b.GlobalSymbolRecord(
+        qname="std::basic_string::size",
+        base_lib="std",
+        base_repo="microsoft/STL",
+        kind=2,
+        sym_type="func",
+        file="STL/stl/inc/string",
+        line=1,
+        end_line=1,
+        is_public=1,
+        token_est=len(body) // 4,
+        body_len=len(body),
+        text=body,
+        symbol_key=b.ip.canonical_symbol_identity(
+            qname="std::basic_string::size",
+            kind="CXX_METHOD",
+            canonical_signature=signature,
+            project="microsoft/STL",
+            file="STL/stl/inc/string",
+        ),
+        canonical_signature=signature,
+        symbol_kind="CXX_METHOD",
+        provider="msvc-stl",
+        include_provenance="string",
     )])
     store.commit()
     store.close()
@@ -119,7 +140,7 @@ def test_store_reader_normalizes_std_inline_namespace(tmp_path):
     reader = ip.GlobalSymbolReader(db)
     rec = reader.lookup("std::__cxx11::basic_string::size")
     assert rec is not None
-    assert rec["base_repo"] == "STL"
+    assert rec["base_repo"] == "microsoft/STL"
     assert "basic_string_size" in rec["text"]
     assert ip.normalize_inline_namespace_qname("std::__1::vector::push_back") == (
         "std::vector::push_back"
@@ -131,16 +152,36 @@ def test_store_preserves_distinct_definitions_with_same_qname(tmp_path):
     b = _load_builder()
     db = str(tmp_path / "gsi.sqlite")
     store = b.GlobalSymbolStore(db)
+    msvc_signature = "display=append(const char *)|type=void (const char *)"
+    libcxx_signature = "display=append(size_type, char)|type=void (size_type, char)"
     store.insert_symbols([
-        (
-            "std::basic_string::append", "std", "STL", 2, "func",
-            "stl/inc/xstring", 10, 18, 1, 16, 64,
-            "void append(const char*) { /* overload one */ }",
+        b.GlobalSymbolRecord(
+            qname="std::basic_string::append", base_lib="std",
+            base_repo="microsoft/STL", kind=2, sym_type="func",
+            file="STL/stl/inc/xstring", line=10, end_line=18,
+            is_public=1, token_est=16, body_len=64,
+            text="void append(const char*) { /* overload one */ }",
+            symbol_key=b.ip.canonical_symbol_identity(
+                qname="std::basic_string::append", kind="CXX_METHOD",
+                canonical_signature=msvc_signature, project="microsoft/STL",
+                file="STL/stl/inc/xstring",
+            ),
+            canonical_signature=msvc_signature, symbol_kind="CXX_METHOD",
+            provider="msvc-stl", include_provenance="xstring",
         ),
-        (
-            "std::basic_string::append", "std", "llvm-project", 2, "func",
-            "llvm-project/libcxx/include/string", 200, 215, 1, 32, 128,
-            "void append(size_type, char) { /* overload two */ }",
+        b.GlobalSymbolRecord(
+            qname="std::basic_string::append", base_lib="std",
+            base_repo="llvm/llvm-project", kind=2, sym_type="func",
+            file="llvm-project/libcxx/include/string", line=200, end_line=215,
+            is_public=1, token_est=32, body_len=128,
+            text="void append(size_type, char) { /* overload two */ }",
+            symbol_key=b.ip.canonical_symbol_identity(
+                qname="std::basic_string::append", kind="CXX_METHOD",
+                canonical_signature=libcxx_signature, project="llvm/llvm-project",
+                file="llvm-project/libcxx/include/string",
+            ),
+            canonical_signature=libcxx_signature, symbol_kind="CXX_METHOD",
+            provider="libc++", include_provenance="string",
         ),
     ])
     store.commit()
@@ -158,8 +199,8 @@ def test_store_preserves_distinct_definitions_with_same_qname(tmp_path):
     finally:
         conn.close()
     assert rows == [
-        ("STL", "stl/inc/xstring", 10),
-        ("llvm-project", "llvm-project/libcxx/include/string", 200),
+        ("llvm/llvm-project", "llvm-project/libcxx/include/string", 200),
+        ("microsoft/STL", "STL/stl/inc/xstring", 10),
     ]
 
 
@@ -290,11 +331,31 @@ def test_crosslink_budget_bounds():
 
 def _tiny_index(ip):
     idx = ip.ProjectIndex()
+    signature = "display=trim(R &)|type=void (R &)"
+    external_key = ip.canonical_symbol_identity(
+        qname="boost::algorithm::trim",
+        kind="FUNCTION_TEMPLATE",
+        canonical_signature=signature,
+    )
     root = ip.FunctionDef(
         name="do_work", qualified_name="myrepo::do_work", file="a.cpp", line=1,
         text=("void do_work() {\n  boost::algorithm::trim(s);\n"
               "  myrepo::local_helper();\n}"),
-        callees=["boost::algorithm::trim", "myrepo::local_helper"],
+        callees=["myrepo::local_helper"],
+        baselib_callees=["boost::algorithm::trim"],
+        baselib_callee_refs=[{
+            "symbol_key": external_key,
+            "symbol_id": ip._compute_symbol_id(external_key),
+            "qname": "boost::algorithm::trim",
+            "usr": "",
+            "canonical_signature": signature,
+            "symbol_kind": "FUNCTION_TEMPLATE",
+            "project": "",
+            "file": "/opt/boost/include/boost/algorithm/string/trim.hpp",
+            "line": 5,
+            "provider": "boost",
+            "include_provenance": "boost/algorithm/string/trim.hpp",
+        }],
         is_definition=True,
     )
     helper = ip.FunctionDef(
@@ -346,7 +407,7 @@ def test_crosslink_on_pulls_tagged_chunk(tmp_path):
     crosslib_idxs = [i for i, b in enumerate(boundaries) if b.get("dep_source")]
     assert len(crosslib_idxs) == 1
     cl_idx = crosslib_idxs[0]
-    assert boundaries[cl_idx]["dep_source"] == "crosslib:boost"
+    assert boundaries[cl_idx]["dep_source"] == "crosslib:boostorg/boost"
     assert boundaries[cl_idx]["name"] == "trim"
     assert "trim impl" in root_doc["text"]
     # The root function chunk's call_edge to the unresolved base-lib callee must
@@ -376,13 +437,15 @@ def _parse_one(ip, src_text, tmp_path):
     src.write_text(src_text)
     idx = Index.create()
     funcs, _types = ip.parse_translation_unit(
-        str(src), idx, ["-std=c++17"], str(tmp_path))
+        str(src), idx, ["-std=c++17"], str(tmp_path),
+        project_id="tests/crossrepo-fixture",
+    )
     return funcs
 
 
 def test_extract_callees_splits_baselib_from_normal():
     ip = _load_index_project()
-    import clang.cindex  # noqa: F401  (skip cleanly if libclang missing)
+    pytest.importorskip("clang.cindex")
     out = ip.extract_callees  # signature check: returns a 2-tuple
     assert ip.is_crosslinkable_baselib("boost::beast::make_printable")
     assert ip.is_crosslinkable_baselib("std::sort")
@@ -431,7 +494,7 @@ def test_real_parse_baselib_callee_survives_and_pulls(tmp_path):
     cl = [b for b in root_doc["chunk_boundaries"]
           if (b.get("dep_source") or "").startswith("crosslib:")]
     assert len(cl) == 1, cl
-    assert cl[0]["dep_source"] == "crosslib:boost"
+    assert cl[0]["dep_source"] == "crosslib:boostorg/boost"
     assert cl[0]["name"] == "trim"
     assert "trim impl" in root_doc["text"]
     reader.close()
