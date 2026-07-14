@@ -20,8 +20,6 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 30
-    env:
-      SELF_HOSTED_RECEIPT_DIR: ${{ runner.temp }}/cppmega-mlx-ci-macos-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Run focused MLX contract suite
@@ -34,14 +32,14 @@ jobs:
             --lane macos-mlx \
             --python "${python_bin}" \
             --repo-root "${GITHUB_WORKSPACE}" \
-            --receipt-dir "${SELF_HOSTED_RECEIPT_DIR}" \
+            --receipt-dir "${RUNNER_TEMP}/cppmega-mlx-ci-macos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --timeout-seconds 1500
       - name: Upload macOS runner receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: self-hosted-ci-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.SELF_HOSTED_RECEIPT_DIR }}
+          path: ${{ runner.temp }}/cppmega-mlx-ci-macos-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
 
@@ -50,8 +48,6 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     timeout-minutes: 20
-    env:
-      SELF_HOSTED_RECEIPT_DIR: ${{ runner.temp }}/cppmega-mlx-ci-linux-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -65,7 +61,7 @@ jobs:
             --lane linux-portable \
             --python python \
             --repo-root "${GITHUB_WORKSPACE}" \
-            --receipt-dir "${SELF_HOSTED_RECEIPT_DIR}" \
+            --receipt-dir "${RUNNER_TEMP}/cppmega-mlx-ci-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --timeout-seconds 900 \
             --bootstrap-portable
       - name: Upload Linux runner receipt
@@ -73,6 +69,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: self-hosted-ci-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.SELF_HOSTED_RECEIPT_DIR }}
+          path: ${{ runner.temp }}/cppmega-mlx-ci-linux-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
