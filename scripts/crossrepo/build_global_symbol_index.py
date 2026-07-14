@@ -1497,6 +1497,7 @@ def populate_extraction_cache_from_source_cache(
         shutil.rmtree(stage, ignore_errors=True)
         stage.mkdir(parents=True)
         count = 0
+        seen_source_dirs: set[tuple[int, int]] = set()
         try:
             for subtree in spec["subtrees"]:
                 source_dir = source_cache_root / subtree
@@ -1505,6 +1506,16 @@ def populate_extraction_cache_from_source_cache(
                     raise RuntimeError(
                         f"[{lib}] incomplete source-cache subtree: {source_dir}"
                     )
+                source_stat = source_dir.stat()
+                source_key = (int(source_stat.st_dev), int(source_stat.st_ino))
+                if source_key in seen_source_dirs:
+                    print(
+                        f"  [{lib}] source-cache alias skipped: {subtree}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                seen_source_dirs.add(source_key)
                 completion = json.loads(sentinel.read_text(encoding="utf-8"))
                 cached_repo = completion.get("repo")
                 if (

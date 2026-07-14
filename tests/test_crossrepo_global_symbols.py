@@ -298,10 +298,15 @@ def test_extraction_cache_hardlinks_complete_code_cache(tmp_path):
         "source": str(tarball),
         "completed_at": "2026-07-14T00:00:00",
     }))
+    alias = source_root / "BOOST"
+    if not alias.exists():
+        alias.symlink_to(boost_root, target_is_directory=True)
+    spec = dict(b.BASE_LIBS["boost"])
+    spec["subtrees"] = ["boost", "BOOST"]
 
     cache_root = tmp_path / "extract_cache"
     counts = b.populate_extraction_cache_from_source_cache(
-        tarball, {"boost": b.BASE_LIBS["boost"]}, source_root, cache_root,
+        tarball, {"boost": spec}, source_root, cache_root,
         max_files=10,
     )
     cached = cache_root / "boost/boost/include/boost/cached_symbol.hpp"
@@ -313,7 +318,7 @@ def test_extraction_cache_hardlinks_complete_code_cache(tmp_path):
     assert manifest["publication"] == "hardlink"
 
     dirs, reused = b.prepare_extraction_cache(
-        tarball, {"boost": b.BASE_LIBS["boost"]}, cache_root, max_files=10)
+        tarball, {"boost": spec}, cache_root, max_files=10)
     assert reused == counts
     assert dirs["boost"] == cache_root / "boost"
 
