@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass
 from pathlib import Path
 import os
 import re
-from typing import Callable, Mapping, Sequence, cast
+from typing import BinaryIO, Callable, Iterator, Mapping, Sequence, cast
 import warnings
 
 from cppmega_mlx.data.build_parsers import (
@@ -59,6 +60,34 @@ class DiscoveredDomainFile:
 
 
 @dataclass(frozen=True)
+class DomainFileChunk:
+    path: Path
+    domain: DomainKind
+    adapter: str
+    index: int
+    text: str
+    byte_start: int
+    byte_end: int
+    char_start: int
+    char_end: int
+    source_size_bytes: int
+    split_reason: str
+
+    def source_span(self) -> dict[str, int | str]:
+        """Return the exact original-file span represented by this chunk."""
+
+        return {
+            "chunk_index": self.index,
+            "byte_start": self.byte_start,
+            "byte_end": self.byte_end,
+            "char_start": self.char_start,
+            "char_end": self.char_end,
+            "source_size_bytes": self.source_size_bytes,
+            "split_reason": self.split_reason,
+        }
+
+
+@dataclass(frozen=True)
 class EmbeddedDomainBlock:
     start: int
     end: int
@@ -92,6 +121,297 @@ _SQL_KEYWORDS = {
     "WHERE", "WITH",
 }
 _SQL_TARGET_PREDECESSORS = {"TABLE", "INTO", "UPDATE", "FROM", "JOIN", "VIEW", "INDEX"}
+
+DOMAIN_INPUT_SIZE_LIMIT_BYTES = 500_000
+DOMAIN_STREAM_READ_BYTES = 64 * 1024
+_LARGE_DOMAIN_KINDS = frozenset({DomainKind.SQL})
+
+
+@dataclass(frozen=True)
+class _SqlLexState:
+    mode: str = "normal"
+    delimiter: bytes = b""
+
+
+_SQL_DOLLAR_QUOTE_RE = re.compile(rb"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _validate_utf8_domain_stream(
+    stream: BinaryIO,
+    *,
+    path: Path,
+    expected_size: int,
+) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    bytes_read = 0
+    while block := stream.read(DOMAIN_STREAM_READ_BYTES):
+        bytes_read += len(block)
+        if b"\0" in block:
+            raise ValueError(f"binary domain input contains NUL byte: {path}")
+        decoder.decode(block, final=False)
+    decoder.decode(b"", final=True)
+    if bytes_read != expected_size:
+        raise OSError(
+            f"domain input changed size while reading {path}: "
+            f"expected {expected_size}, read {bytes_read}"
+        )
+
+
+def _validate_utf8_domain_path(path: Path, *, expected_size: int) -> None:
+    with path.open("rb") as stream:
+        _validate_utf8_domain_stream(
+            stream,
+            path=path,
+            expected_size=expected_size,
+        )
+
+
+def _utf8_boundary_at_or_before(data: bytearray, limit: int) -> int:
+    cut = min(int(limit), len(data))
+    while cut > 0 and cut < len(data) and data[cut] & 0xC0 == 0x80:
+        cut -= 1
+    if cut == 0:
+        raise UnicodeDecodeError(
+            "utf-8",
+            bytes(data[: min(len(data), 4)]),
+            0,
+            min(len(data), 1),
+            "no complete UTF-8 code point within chunk limit",
+        )
+    return cut
+
+
+def _scan_sql_chunk_prefix(
+    data: bytearray,
+    *,
+    limit: int,
+    initial_state: _SqlLexState,
+) -> tuple[int, int, _SqlLexState]:
+    """Find SQL statement and neutral lexical boundaries in ``data[:limit]``."""
+
+    mode = initial_state.mode
+    delimiter = initial_state.delimiter
+    statement_cut = 0
+    lexical_cut = 0
+    index = 0
+    while index < limit:
+        byte = data[index]
+        following = data[index + 1] if index + 1 < len(data) else None
+
+        if mode == "normal":
+            if byte == 0x2D and following == 0x2D:  # -- line comment
+                mode = "line_comment"
+                index += 2
+                continue
+            if byte == 0x2F and following == 0x2A:  # /* block comment */
+                mode = "block_comment"
+                index += 2
+                continue
+            if byte == 0x27:
+                mode = "single_quote"
+            elif byte == 0x22:
+                mode = "double_quote"
+            elif byte == 0x60:
+                mode = "backtick_quote"
+            elif byte == 0x5B:
+                mode = "bracket_quote"
+            elif byte == 0x24:
+                match = _SQL_DOLLAR_QUOTE_RE.match(data, index, limit)
+                if match is not None:
+                    mode = "dollar_quote"
+                    delimiter = bytes(match.group())
+                    index = match.end()
+                    continue
+            elif byte == 0x3B:  # ;
+                statement_cut = index + 1
+                lexical_cut = index + 1
+            elif byte in b" \t\r\n,":
+                lexical_cut = index + 1
+        elif mode in {"single_quote", "double_quote", "backtick_quote"}:
+            quote = {
+                "single_quote": 0x27,
+                "double_quote": 0x22,
+                "backtick_quote": 0x60,
+            }[mode]
+            if byte == 0x5C and following is not None:
+                index += 2
+                continue
+            if byte == quote:
+                if following == quote:
+                    index += 2
+                    continue
+                mode = "normal"
+                lexical_cut = index + 1
+        elif mode == "bracket_quote":
+            if byte == 0x5D:
+                if following == 0x5D:
+                    index += 2
+                    continue
+                mode = "normal"
+                lexical_cut = index + 1
+        elif mode == "line_comment":
+            if byte in {0x0A, 0x0D}:
+                mode = "normal"
+                lexical_cut = index + 1
+        elif mode == "block_comment":
+            if byte == 0x2A and following == 0x2F:
+                mode = "normal"
+                if index + 2 <= limit:
+                    lexical_cut = index + 2
+                index += 2
+                continue
+        elif mode == "dollar_quote":
+            if delimiter and data.startswith(delimiter, index, limit):
+                index += len(delimiter)
+                mode = "normal"
+                delimiter = b""
+                lexical_cut = index
+                continue
+        else:
+            raise ValueError(f"unknown SQL chunk lexical state {mode!r}")
+        index += 1
+
+    return statement_cut, lexical_cut, _SqlLexState(mode, delimiter)
+
+
+def _sql_chunk_cut(
+    data: bytearray,
+    *,
+    max_chunk_bytes: int,
+    initial_state: _SqlLexState,
+) -> tuple[int, str, _SqlLexState]:
+    limit = _utf8_boundary_at_or_before(data, max_chunk_bytes)
+    statement_cut, lexical_cut, hard_state = _scan_sql_chunk_prefix(
+        data,
+        limit=limit,
+        initial_state=initial_state,
+    )
+    minimum_preferred = max(1, max_chunk_bytes // 2)
+    if statement_cut >= minimum_preferred:
+        return statement_cut, "sql_statement", _SqlLexState()
+    if lexical_cut >= minimum_preferred:
+        return lexical_cut, "sql_lexical_boundary", _SqlLexState()
+    return limit, "hard_limit", hard_state
+
+
+def iter_domain_file_chunks(
+    path: str | Path,
+    *,
+    max_chunk_bytes: int = DOMAIN_INPUT_SIZE_LIMIT_BYTES,
+) -> Iterator[DomainFileChunk]:
+    """Yield complete, bounded UTF-8 chunks for one typed domain input.
+
+    Inputs are validated in a bounded first pass before any chunk is yielded, so
+    invalid UTF-8 or binary data cannot leave a partially ingested document.
+    Only SQL has a typed oversized-file policy; every other domain retains the
+    existing fail-closed size limit.
+    """
+
+    if not 4 <= max_chunk_bytes <= DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+        raise ValueError(
+            "max_chunk_bytes must be between 4 and "
+            f"{DOMAIN_INPUT_SIZE_LIMIT_BYTES}, got {max_chunk_bytes}"
+        )
+    path_obj = Path(path)
+    try:
+        with path_obj.open("rb") as stream:
+            source_size = os.fstat(stream.fileno()).st_size
+            path_adapter = resolve_domain_parser(path_obj)
+            if source_size > max_chunk_bytes and path_adapter.domain not in _LARGE_DOMAIN_KINDS:
+                raise ValueError(
+                    f"domain input exceeds {max_chunk_bytes}-byte limit and "
+                    f"{path_adapter.domain.name} has no large-input chunk policy: {path_obj}"
+                )
+
+            _validate_utf8_domain_stream(
+                stream,
+                path=path_obj,
+                expected_size=source_size,
+            )
+            stream.seek(0)
+
+            if source_size <= max_chunk_bytes:
+                raw = stream.read(max_chunk_bytes + 1)
+                if len(raw) != source_size:
+                    raise OSError(
+                        f"domain input changed size while reading {path_obj}: "
+                        f"expected {source_size}, read {len(raw)}"
+                    )
+                text = raw.decode("utf-8", errors="strict")
+                adapter = resolve_domain_parser(path_obj, text)
+                yield DomainFileChunk(
+                    path=path_obj,
+                    domain=adapter.domain,
+                    adapter=adapter.name,
+                    index=0,
+                    text=text,
+                    byte_start=0,
+                    byte_end=source_size,
+                    char_start=0,
+                    char_end=len(text),
+                    source_size_bytes=source_size,
+                    split_reason="eof",
+                )
+                return
+
+            buffer = bytearray()
+            byte_start = 0
+            char_start = 0
+            chunk_index = 0
+            sql_state = _SqlLexState()
+            while block := stream.read(DOMAIN_STREAM_READ_BYTES):
+                buffer.extend(block)
+                while len(buffer) > max_chunk_bytes:
+                    cut, split_reason, sql_state = _sql_chunk_cut(
+                        buffer,
+                        max_chunk_bytes=max_chunk_bytes,
+                        initial_state=sql_state,
+                    )
+                    raw = bytes(buffer[:cut])
+                    del buffer[:cut]
+                    text = raw.decode("utf-8", errors="strict")
+                    byte_end = byte_start + len(raw)
+                    char_end = char_start + len(text)
+                    yield DomainFileChunk(
+                        path=path_obj,
+                        domain=path_adapter.domain,
+                        adapter=path_adapter.name,
+                        index=chunk_index,
+                        text=text,
+                        byte_start=byte_start,
+                        byte_end=byte_end,
+                        char_start=char_start,
+                        char_end=char_end,
+                        source_size_bytes=source_size,
+                        split_reason=split_reason,
+                    )
+                    byte_start = byte_end
+                    char_start = char_end
+                    chunk_index += 1
+
+            raw = bytes(buffer)
+            text = raw.decode("utf-8", errors="strict")
+            byte_end = byte_start + len(raw)
+            if byte_end != source_size:
+                raise OSError(
+                    f"domain input changed size while reading {path_obj}: "
+                    f"expected {source_size}, read {byte_end}"
+                )
+            yield DomainFileChunk(
+                path=path_obj,
+                domain=path_adapter.domain,
+                adapter=path_adapter.name,
+                index=chunk_index,
+                text=text,
+                byte_start=byte_start,
+                byte_end=byte_end,
+                char_start=char_start,
+                char_end=char_start + len(text),
+                source_size_bytes=source_size,
+                split_reason="eof",
+            )
+    except OSError as exc:
+        raise OSError(f"failed to read domain input {path_obj}: {exc}") from exc
 
 
 def _tokens_overlapping(
@@ -556,10 +876,6 @@ def discover_project_domain_files(
     root_path = Path(root)
     skip_dirs = {".git"} | (extra_exclude_dirs or set())
     discovered: list[DiscoveredDomainFile] = []
-    candidate_paths: list[Path] = []
-    for directory, dirs, filenames in os.walk(root_path):
-        dirs[:] = sorted(name for name in dirs if name not in skip_dirs)
-        candidate_paths.extend(Path(directory) / name for name in sorted(filenames))
     known_names = {
         "CMakeLists.txt", "Makefile", "GNUmakefile", "makefile", "build.ninja",
         "BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel",
@@ -569,19 +885,34 @@ def discover_project_domain_files(
         ".cmake", ".mk", ".ninja", ".bzl", ".bash", ".sh", ".zsh", ".tcsh",
         ".csh", ".sql", ".m4", *(_CPP_EXTENSIONS if include_cpp else set()),
     }
-    for path in candidate_paths:
+
+    def candidate_paths() -> Iterator[Path]:
+        for directory, dirs, filenames in os.walk(root_path):
+            dirs[:] = sorted(name for name in dirs if name not in skip_dirs)
+            for name in sorted(filenames):
+                yield Path(directory) / name
+
+    for path in candidate_paths():
         known_candidate = path.name in known_names or path.suffix.lower() in known_suffixes
         try:
-            if path.stat().st_size > 500_000:
-                if known_candidate:
+            source_size = path.stat().st_size
+            if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+                if not known_candidate:
+                    continue
+                adapter = resolve_domain_parser(path)
+                if adapter.domain not in _LARGE_DOMAIN_KINDS:
                     raise ValueError(
-                        f"domain input exceeds 500000-byte limit: {path}"
+                        "domain input exceeds "
+                        f"{DOMAIN_INPUT_SIZE_LIMIT_BYTES}-byte limit and "
+                        f"{adapter.domain.name} has no large-input chunk policy: {path}"
                     )
-                continue
-            text = path.read_text(
-                encoding="utf-8",
-                errors="strict" if known_candidate else "replace",
-            )
+                _validate_utf8_domain_path(path, expected_size=source_size)
+                text = None
+            else:
+                text = path.read_text(
+                    encoding="utf-8",
+                    errors="strict" if known_candidate else "replace",
+                )
         except UnicodeError as exc:
             if known_candidate:
                 warnings.warn(
@@ -594,7 +925,8 @@ def discover_project_domain_files(
             if known_candidate:
                 raise OSError(f"failed to read domain input {path}: {exc}") from exc
             continue
-        adapter = resolve_domain_parser(path, text)
+        if text is not None:
+            adapter = resolve_domain_parser(path, text)
         if adapter.name == "raw-output" or (
             not include_cpp and adapter.domain == DomainKind.CPP
         ):
@@ -606,11 +938,14 @@ def discover_project_domain_files(
 
 
 __all__ = [
+    "DOMAIN_INPUT_SIZE_LIMIT_BYTES",
     "DiscoveredDomainFile",
+    "DomainFileChunk",
     "DomainParserAdapter",
     "EmbeddedDomainBlock",
     "discover_project_domain_files",
     "extract_embedded_domain_blocks",
+    "iter_domain_file_chunks",
     "parse_cpp_lexical",
     "parse_domain_document",
     "parse_sql_lexical",

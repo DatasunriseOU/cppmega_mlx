@@ -5117,6 +5117,7 @@ def build_build_doc(
     project_id: str | None = None,
     platform_info: dict | None = None,
     build_info: dict | None = None,
+    source_span: dict[str, int | str] | None = None,
 ) -> dict:
     """Build a single 'build' enriched doc from a build/compilation file.
 
@@ -5148,6 +5149,10 @@ def build_build_doc(
         source_doc_id=source_doc_id,
         project_id=stable_project_id,
     )
+    if source_span is not None:
+        cast(dict[str, object], domain_sidecars["domain_parse_info"])[
+            "source_span"
+        ] = dict(source_span)
     structure_ids = [BUILD_KIND] * text_len
     chunk_boundaries = [{
         'start': 0,
@@ -5248,6 +5253,8 @@ def build_build_doc(
         result['platform_info'] = detected_platform
     if build_info:
         result['build_info'] = build_info
+    if source_span is not None:
+        result['source_span'] = dict(source_span)
     return result
 
 
@@ -6758,14 +6765,15 @@ def emit_build_documents(
     dedup_stage_id: str | None = None,
     dedup_stage_db: str | None = None,
     dedup_near: bool = True,
+    emit_doc: Callable[[dict[str, object]], None] | None = None,
 ) -> list[dict]:
-    """Emit one 'build' doc per build file, with WHOLE-DOC tokenized-hash dedup.
+    """Emit bounded domain docs with tokenized-hash dedup.
 
-    Build-file dedup is at the WHOLE-DOC level (not function-level): a build file
-    whose tokenized text hash was already seen (this repo OR globally via the
-    shared db) is dropped, mirroring the commit-doc whole-doc dedup. Uses the
-    SAME shared DedupStore tables (token-id exact + near) so build docs dedup
-    against each other globally and resumably.
+    Inputs within the domain cap remain one whole-file document. Oversized SQL
+    uses deterministic typed chunks; each chunk is deduplicated independently
+    and carries its exact source byte/character span. Uses the SAME shared
+    DedupStore tables (token-id exact + near) so domain docs dedup globally and
+    resumably.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
     that tokenizes empty RAISES. Non-UTF-8 text inputs are not replacement-decoded:
@@ -6776,6 +6784,16 @@ def emit_build_documents(
     docs: list[dict] = []
     if not build_files:
         return docs
+
+    emitted = 0
+
+    def record_doc(doc: dict[str, object]) -> None:
+        nonlocal emitted
+        if emit_doc is None:
+            docs.append(doc)
+        else:
+            emit_doc(doc)
+        emitted += 1
 
     tok = None
     store = None
@@ -6795,12 +6813,66 @@ def emit_build_documents(
     dropped = 0
     skipped_empty = 0
     skipped_non_utf8 = 0
+    from cppmega_mlx.data.domain_ingestion import iter_domain_file_chunks
+
     for filepath, build_kind in sorted(build_files):
-        # Unreadable files remain fatal. Invalid UTF-8 is a data exclusion, not a
-        # lossy decode: record it explicitly and never train replacement glyphs.
         try:
-            with open(filepath, "r", encoding="utf-8", errors="strict") as fh:
-                text = fh.read()
+            source_chunks = iter_domain_file_chunks(filepath)
+            for source_chunk in source_chunks:
+                text = source_chunk.text
+                if not text or not text.strip():
+                    skipped_empty += 1
+                    continue
+
+                per_file_build_info = dict(default_build_info) if default_build_info else {}
+                if build_kind not in {
+                    "bash",
+                    "sh",
+                    "zsh",
+                    "tcsh",
+                    "sql",
+                    "compiler_diagnostic",
+                    "linker_diagnostic",
+                    "build_diagnostic",
+                    "sanitizer_output",
+                    "test_output",
+                    "tool_output",
+                }:
+                    per_file_build_info["build_system"] = build_kind
+
+                if tok is not None:
+                    token_ids = tok.encode(text)
+                    if not token_ids:
+                        raise RuntimeError(
+                            f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
+                            f"tokenizer/build-doc bug (RULE #1: fail loud)"
+                        )
+                    if store is not None:
+                        if store.seen_exact_tokens(token_ids):
+                            dropped += 1
+                            continue
+                        if dedup_near and store.seen_near_tokens(token_ids):
+                            dropped += 1
+                            continue
+                    else:
+                        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
+                        h = _sha1_tokens(token_ids)
+                        if h in seen_local:
+                            dropped += 1
+                            continue
+                        seen_local.add(h)
+
+                record_doc(
+                    build_build_doc(
+                        filepath,
+                        text,
+                        build_kind,
+                        source_root=source_root,
+                        project_id=project_id,
+                        build_info=per_file_build_info or None,
+                        source_span=source_chunk.source_span(),
+                    )
+                )
         except UnicodeError as exc:
             skipped_non_utf8 += 1
             print(
@@ -6809,67 +6881,15 @@ def emit_build_documents(
                 file=sys.stderr,
             )
             continue
-        if not text or not text.strip():
-            skipped_empty += 1
-            continue
-
-        per_file_build_info = dict(default_build_info) if default_build_info else {}
-        if build_kind not in {
-            "bash",
-            "sh",
-            "zsh",
-            "tcsh",
-            "sql",
-            "compiler_diagnostic",
-            "linker_diagnostic",
-            "build_diagnostic",
-            "sanitizer_output",
-            "test_output",
-            "tool_output",
-        }:
-            per_file_build_info["build_system"] = build_kind
-
-        if tok is not None:
-            token_ids = tok.encode(text)
-            if not token_ids:
-                raise RuntimeError(
-                    f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
-                    f"tokenizer/build-doc bug (RULE #1: fail loud)"
-                )
-            if store is not None:
-                if store.seen_exact_tokens(token_ids):
-                    dropped += 1
-                    continue
-                if dedup_near and store.seen_near_tokens(token_ids):
-                    dropped += 1
-                    continue
-            else:
-                _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
-                h = _sha1_tokens(token_ids)
-                if h in seen_local:
-                    dropped += 1
-                    continue
-                seen_local.add(h)
-
-        docs.append(
-            build_build_doc(
-                filepath,
-                text,
-                build_kind,
-                source_root=source_root,
-                project_id=project_id,
-                build_info=per_file_build_info or None,
-            )
-        )
 
     if store is not None:
         store.commit()
         store.close()
 
     print(
-        f"  Build docs: emitted={len(docs)} dropped_dup={dropped} "
+        f"  Build docs: emitted={emitted} dropped_dup={dropped} "
         f"skipped_empty={skipped_empty} skipped_non_utf8={skipped_non_utf8} "
-        "(whole-doc tokenized-hash dedup)",
+        "(bounded-domain tokenized-hash dedup)",
         file=sys.stderr,
     )
     return docs
@@ -7680,11 +7700,9 @@ def process_project(
             dedup_stage_id=dedup_stage_id,
             dedup_stage_db=dedup_stage_db,
             dedup_near=dedup_near,
+            emit_doc=_emit_counted if emit_doc is not None else None,
         )
-        if emit_doc is not None:
-            for doc in build_docs:
-                _emit_counted(doc)
-        else:
+        if emit_doc is None:
             documents.extend(build_docs)
         check_memory_limit(memory_limit_gb, label="index_project")
     elif domain_files and not enriched:
