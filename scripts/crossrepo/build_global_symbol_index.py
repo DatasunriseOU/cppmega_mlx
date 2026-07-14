@@ -62,7 +62,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wai
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 # --------------------------------------------------------------------------- #
 # Locate the indexer module so we reuse its libclang parse helpers verbatim.
@@ -104,7 +104,16 @@ DEFAULT_OUTPUT = MLX_ROOT / "outputs" / "crossrepo" / "global_symbols.sqlite"
 BASE_LIBS: dict[str, dict] = {
     # ---- A1 (high-value, tractable) ----
     "boost":      {"subtrees": ["boost"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["boost::"]},
-    "abseil":     {"subtrees": ["abseil-cpp"],   "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["absl::"]},
+    "abseil":     {"subtrees": ["abseil-cpp"],   "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["absl::"],
+                   # Unit tests and benchmarks are useful training code but are
+                   # not providers for the cross-library public API graph. Some
+                   # benchmark TUs instantiate the full flags stack and can take
+                   # minutes / GiBs in libclang, so exclude them explicitly here
+                   # rather than weakening the per-file timeout.
+                   "index_exclude_suffixes": [
+                       "_test.cc", "_test.cpp", "_test.cxx",
+                       "_benchmark.cc", "_benchmark.cpp", "_benchmark.cxx",
+                   ]},
     "folly":      {"subtrees": ["folly"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["folly::"]},
     "openssl":    {"subtrees": ["openssl"],      "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": []},
     "boringssl":  {"subtrees": ["boringssl"],    "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": []},
@@ -249,6 +258,18 @@ def _is_public_header_path(rel_file: str) -> bool:
         return True
     parts = [part for part in rel_file.replace("\\", "/").split("/") if part]
     return "include" in parts
+
+
+def _filter_non_provider_sources(
+    paths: Sequence[str], spec: Mapping[str, object]
+) -> tuple[list[str], int]:
+    suffixes = tuple(
+        str(value).lower() for value in spec.get("index_exclude_suffixes", ())
+    )
+    if not suffixes:
+        return list(paths), 0
+    kept = [path for path in paths if not path.lower().endswith(suffixes)]
+    return kept, len(paths) - len(kept)
 
 
 def is_public_symbol(
@@ -2057,6 +2078,14 @@ def _index_lib_from_dir_uncommitted(
             if fp not in seen:
                 cpp_files.append(fp)
                 seen.add(fp)
+    cpp_files, excluded = _filter_non_provider_sources(cpp_files, spec)
+    if excluded:
+        print(
+            f"  [{lib}] configured non-provider source exclusions: {excluded} files "
+            f"(suffixes={tuple(spec['index_exclude_suffixes'])})",
+            file=sys.stderr,
+            flush=True,
+        )
     res.n_files = len(cpp_files)
     if res.n_files == 0:
         raise RuntimeError(
