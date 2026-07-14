@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -278,6 +279,43 @@ def test_domain_discovery_fails_loud_on_large_or_unreadable_inputs(
     monkeypatch.setattr(Path, "read_text", _read_text)
     with pytest.raises(OSError, match="failed to read domain input"):
         discover_project_domain_files(tmp_path)
+
+
+def test_compile_commands_is_compile_db_input_not_build_domain_text(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    cmake_file = tmp_path / "CMakeLists.txt"
+    cmake_file.write_text("add_library(app src/app.cpp)\n")
+    entries = [
+        {
+            "directory": str(tmp_path),
+            "file": f"src/unit_{index:05d}.cpp",
+            "arguments": [
+                "clang++",
+                "-Iinclude",
+                "-std=c++20",
+                "-c",
+                f"src/unit_{index:05d}.cpp",
+            ],
+        }
+        for index in range(5_000)
+    ]
+    compile_commands = tmp_path / "compile_commands.json"
+    compile_commands.write_text(json.dumps(entries))
+    assert compile_commands.stat().st_size > index_project.BUILD_FILE_SIZE_CAP
+
+    assert index_project.find_build_files(str(tmp_path)) == [
+        (str(cmake_file), "cmake")
+    ]
+
+    compile_db = index_project.load_compile_commands(str(tmp_path))
+    assert compile_db is not None
+    assert len(compile_db) == len(entries)
+    first_source = str(tmp_path / "src" / "unit_00000.cpp")
+    assert compile_db[first_source]["build_info"]["source"] == "compile_commands"
+    assert "-std=c++20" in compile_db[first_source]["compile_args"]
 
 
 def test_non_utf8_domain_input_is_explicitly_excluded_without_lossy_decode(

@@ -2598,16 +2598,15 @@ def find_build_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
 ) -> list[tuple[str, str]]:
-    """Find build/compilation files. Sibling of ``find_cpp_files``.
+    """Find build/domain text files. Sibling of ``find_cpp_files``.
 
     Returns a list of ``(abs_path, build_kind)`` tuples so the build-system tag
-    (cmake/make/bazel/ninja/meson/...) is known at discovery time. Same
-    ``os.walk``/skip-dir/size-cap logic as ``find_cpp_files``. Note: build files
-    legitimately live under dirs that code discovery prunes (e.g. ``build/`` for
-    ``compile_commands.json``, ``third_party/`` for vendored CMake), so we do NOT
-    apply ``_DEFAULT_SKIP_DIRS`` here -- only ``.git`` and the caller's extra
-    excludes -- otherwise the richest platform signal (compile_commands.json in
-    ``build/``) would be silently dropped.
+    (cmake/make/bazel/ninja/meson/...) is known at discovery time. Compilation
+    databases are structured inputs consumed separately by
+    ``load_compile_commands`` and are never returned as build/domain text. Build
+    files legitimately live under dirs that code discovery prunes (e.g.
+    ``third_party/`` for vendored CMake), so only ``.git`` and the caller's extra
+    excludes are pruned here.
     """
     skip_dirs = {'.git'} | (extra_exclude_dirs or set())
     files: list[tuple[str, str]] = []
@@ -2616,6 +2615,8 @@ def find_build_files(
         for fname in filenames:
             build_kind = classify_build_file(fname)
             if build_kind is None:
+                continue
+            if build_kind == "compile_commands":
                 continue
             filepath = os.path.join(root, fname)
             try:
