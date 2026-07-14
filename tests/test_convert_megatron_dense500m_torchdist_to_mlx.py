@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
@@ -135,22 +137,34 @@ def test_key_plan_folds_megatron_af_layers_into_dense_blocks():
 
     plan = mod.build_key_plan(cfg)
 
-    assert mod.KeyPlan(
-        "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
-        "layers.0.attn_norm.weight",
-    ) in plan
-    assert mod.KeyPlan(
-        "decoder.layers.1.mlp.linear_fc1.layer_norm_weight",
-        "layers.0.ffn_norm.weight",
-    ) in plan
-    assert mod.KeyPlan(
-        "decoder.layers.2.self_attention.linear_qkv.layer_norm_weight",
-        "layers.1.attn_norm.weight",
-    ) in plan
-    assert mod.KeyPlan(
-        "decoder.layers.3.mlp.linear_fc1.layer_norm_weight",
-        "layers.1.ffn_norm.weight",
-    ) in plan
+    assert (
+        mod.KeyPlan(
+            "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
+            "layers.0.attn_norm.weight",
+        )
+        in plan
+    )
+    assert (
+        mod.KeyPlan(
+            "decoder.layers.1.mlp.linear_fc1.layer_norm_weight",
+            "layers.0.ffn_norm.weight",
+        )
+        in plan
+    )
+    assert (
+        mod.KeyPlan(
+            "decoder.layers.2.self_attention.linear_qkv.layer_norm_weight",
+            "layers.1.attn_norm.weight",
+        )
+        in plan
+    )
+    assert (
+        mod.KeyPlan(
+            "decoder.layers.3.mlp.linear_fc1.layer_norm_weight",
+            "layers.1.ffn_norm.weight",
+        )
+        in plan
+    )
 
 
 def test_converter_rejects_unsupported_dsa_checkpoint_mapping() -> None:
@@ -260,7 +274,12 @@ def test_validate_plan_rejects_unmapped_target_tensor():
                 shape = (16, 3)
             elif item.source_key.endswith("order_mask"):
                 shape = (3, 16)
-            elif item.source_key.endswith("table_offsets") or item.source_key.endswith("table_sizes_t") or item.source_key.endswith("hash_bias") or item.source_key.endswith("order_for_table"):
+            elif (
+                item.source_key.endswith("table_offsets")
+                or item.source_key.endswith("table_sizes_t")
+                or item.source_key.endswith("hash_bias")
+                or item.source_key.endswith("order_for_table")
+            ):
                 shape = (16,)
             source_sizes[item.source_key] = shape
         target_shape = source_sizes[item.source_key]
@@ -272,7 +291,9 @@ def test_validate_plan_rejects_unmapped_target_tensor():
         target_arrays[item.target_key] = _FakeTarget(target_shape)
 
     with pytest.raises(KeyError, match="unexpected.weight"):
-        mod.validate_plan_against_metadata(cfg, _FakeMetadata(source_sizes), target_arrays)
+        mod.validate_plan_against_metadata(
+            cfg, _FakeMetadata(source_sizes), target_arrays
+        )
 
 
 def test_validate_plan_accepts_full_toy_mapping_with_neutral_tensors():
@@ -316,7 +337,12 @@ def test_validate_plan_accepts_full_toy_mapping_with_neutral_tensors():
             source_sizes[item.source_key] = (16, 3)
         elif item.source_key.endswith("order_mask"):
             source_sizes[item.source_key] = (3, 16)
-        elif item.source_key.endswith("table_offsets") or item.source_key.endswith("table_sizes_t") or item.source_key.endswith("hash_bias") or item.source_key.endswith("order_for_table"):
+        elif (
+            item.source_key.endswith("table_offsets")
+            or item.source_key.endswith("table_sizes_t")
+            or item.source_key.endswith("hash_bias")
+            or item.source_key.endswith("order_for_table")
+        ):
             source_sizes[item.source_key] = (16,)
         else:
             source_sizes[item.source_key] = (8,)
@@ -328,7 +354,9 @@ def test_validate_plan_accepts_full_toy_mapping_with_neutral_tensors():
             target_shape = (len(item.source_rows), *target_shape[1:])
         target_arrays[item.target_key] = _FakeTarget(target_shape)
 
-    receipt = mod.validate_plan_against_metadata(cfg, _FakeMetadata(source_sizes), target_arrays)
+    receipt = mod.validate_plan_against_metadata(
+        cfg, _FakeMetadata(source_sizes), target_arrays
+    )
 
     assert receipt["mapped_tensors"] == len(mod.build_key_plan(cfg))
     assert "position_embedding.weight" in receipt["neutral_tensors"]
@@ -386,9 +414,7 @@ def test_validate_plan_rejects_every_unmapped_learned_source_tensor() -> None:
     source_sizes["decoder.unmapped_learned.weight"] = (8, 8)
 
     with pytest.raises(KeyError, match="unmapped learned source tensors"):
-        mod.validate_plan_against_metadata(
-            cfg, _FakeMetadata(source_sizes), targets
-        )
+        mod.validate_plan_against_metadata(cfg, _FakeMetadata(source_sizes), targets)
 
 
 def test_validate_plan_rejects_unmapped_learned_tensor_outside_model_prefixes() -> None:
@@ -405,9 +431,7 @@ def test_validate_plan_rejects_unmapped_learned_tensor_outside_model_prefixes() 
     source_sizes["auxiliary_adapter.weight"] = (8, 8)
 
     with pytest.raises(KeyError, match="auxiliary_adapter.weight"):
-        mod.validate_plan_against_metadata(
-            cfg, _FakeMetadata(source_sizes), targets
-        )
+        mod.validate_plan_against_metadata(cfg, _FakeMetadata(source_sizes), targets)
 
 
 def test_runtime_requirements_do_not_claim_domain_tensors_for_old_checkpoint() -> None:
@@ -424,6 +448,106 @@ def test_runtime_requirements_do_not_claim_domain_tensors_for_old_checkpoint() -
     assert enriched["domain_routes"]["learned_tensors_present"] is True
     assert enriched["domain_routes"]["required"] is True
     assert enriched["domain_routes"]["residual_scale"] == 1.0
+
+
+def test_converter_writes_evaluator_metadata_as_model_json(tmp_path: Path) -> None:
+    mod = _load_module()
+
+    weights_path, manifest_path = mod.conversion_output_paths(
+        tmp_path / "dense500m.safetensors"
+    )
+
+    assert weights_path == (tmp_path / "dense500m.safetensors").resolve()
+    assert manifest_path == (tmp_path / "model.json").resolve()
+
+
+def test_converter_rejects_output_without_safetensors_suffix(tmp_path: Path) -> None:
+    mod = _load_module()
+
+    with pytest.raises(ValueError, match="must end in .safetensors"):
+        mod.conversion_output_paths(tmp_path / "dense500m.bin")
+
+
+def test_convert_checkpoint_publishes_only_after_reloaded_parity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mod = _load_module()
+    cfg = mod.Dense500MConversionConfig()
+    metadata = object()
+    target = {"fixture.weight": mx.array([[1.0, 2.0]], dtype=mx.float32)}
+    source_model = object()
+    parity_inputs = {
+        "input_ids": object(),
+        "graph_attention_bias": object(),
+        "graph_edge_kind_bias": object(),
+        "domain_ids": object(),
+        "role_ids": object(),
+        "confidence_ids": object(),
+        "document_ids": object(),
+    }
+    checkpoint = tmp_path / "iter_0000001"
+    checkpoint.mkdir()
+    output = tmp_path / "converted" / "weights.safetensors"
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(mod, "_import_runtime", lambda: (mx, None, None, None))
+    monkeypatch.setattr(mod, "resolve_checkpoint_iter", lambda _path: checkpoint)
+    monkeypatch.setattr(mod, "read_dcp_metadata", lambda _path: metadata)
+    monkeypatch.setattr(mod, "_metadata_tensor_specs", lambda _metadata: {})
+    monkeypatch.setattr(mod, "_target_arrays", lambda *_args, **_kwargs: dict(target))
+    monkeypatch.setattr(
+        mod,
+        "validate_plan_against_metadata",
+        lambda *_args, **_kwargs: {"mapped_tensors": 1},
+    )
+    monkeypatch.setattr(
+        mod, "load_required_source_tensors", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        mod,
+        "apply_mapping",
+        lambda arrays, *_args, **_kwargs: arrays,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_mapped_source_reference_model",
+        lambda *_args, **_kwargs: source_model,
+    )
+    monkeypatch.setattr(mod, "_fixed_parity_inputs", lambda _cfg: parity_inputs)
+    monkeypatch.setattr(
+        mod,
+        "_make_target_model",
+        lambda *_args, **_kwargs: (object(), object()),
+    )
+
+    def verify_emitted(**kwargs):
+        staged = Path(kwargs["weights_path"])
+        assert staged.is_file()
+        np.testing.assert_array_equal(
+            np.asarray(mx.load(str(staged))["fixture.weight"]),
+            np.array([[1.0, 2.0]], dtype=np.float32),
+        )
+        assert kwargs["target_model_factory"]() is not None
+        observed["weights_path"] = staged
+        return {"max_abs_logit_error": 0.0}
+
+    monkeypatch.setattr(
+        mod,
+        "verify_emitted_safetensors_logit_parity",
+        verify_emitted,
+    )
+
+    manifest = mod.convert_checkpoint(checkpoint, output, cfg=cfg, bf16=False)
+
+    assert observed["weights_path"] != output
+    assert output.is_file()
+    assert not output.with_suffix(".json").exists()
+    model_json = output.parent / "model.json"
+    assert model_json.is_file()
+    payload = json.loads(model_json.read_text(encoding="utf-8"))
+    assert payload == manifest
+    assert payload["logit_parity"]["reloaded_safetensors"] == str(output.resolve())
 
 
 def _parity_model() -> DenseCppLM:
@@ -448,59 +572,265 @@ def _parity_model() -> DenseCppLM:
     )
 
 
-def test_sidecar_rich_source_target_logit_parity_seam() -> None:
+class _ConvertedGQAFixture:
+    _KEYS = {
+        "token.weight",
+        "q.weight",
+        "k.weight",
+        "v.weight",
+        "out.weight",
+        "lm_head.weight",
+        "domain.scale",
+        "role.scale",
+        "confidence.scale",
+    }
+
+    def __init__(self, cfg) -> None:
+        self.cfg = cfg
+        self.weights: dict[str, mx.array] = {}
+
+    def load_weights(self, path: str, *, strict: bool = True):
+        weights = dict(mx.load(path))
+        if strict and set(weights) != self._KEYS:
+            raise ValueError(
+                f"fixture weight keys {sorted(weights)} do not match {sorted(self._KEYS)}"
+            )
+        self.weights = weights
+        return self
+
+    def parameters(self) -> dict[str, mx.array]:
+        return self.weights
+
+    def logits(
+        self,
+        input_ids: mx.array,
+        *,
+        block_bias: mx.array,
+        edge_kind_bias: mx.array,
+        domain_ids: mx.array,
+        role_ids: mx.array,
+        confidence_ids: mx.array,
+        document_ids: mx.array,
+    ) -> mx.array:
+        cfg = self.cfg
+        batch, seq = input_ids.shape
+        hidden = (
+            self.weights["token.weight"][input_ids]
+            + domain_ids[..., None] * self.weights["domain.scale"]
+            + role_ids[..., None] * self.weights["role.scale"]
+            + confidence_ids[..., None] * self.weights["confidence.scale"]
+        )
+        q = (hidden @ self.weights["q.weight"].T).reshape(
+            batch, seq, cfg.num_query_heads, cfg.head_dim
+        )
+        k = (hidden @ self.weights["k.weight"].T).reshape(
+            batch, seq, cfg.num_kv_heads, cfg.head_dim
+        )
+        v = (hidden @ self.weights["v.weight"].T).reshape(
+            batch, seq, cfg.num_kv_heads, cfg.head_dim
+        )
+        q = mx.transpose(q, (0, 2, 1, 3))
+        k = mx.transpose(k, (0, 2, 1, 3))
+        v = mx.transpose(v, (0, 2, 1, 3))
+        heads_per_group = cfg.num_query_heads // cfg.num_kv_heads
+        k = mx.broadcast_to(
+            k[:, :, None, :, :],
+            (batch, cfg.num_kv_heads, heads_per_group, seq, cfg.head_dim),
+        ).reshape(batch, cfg.num_query_heads, seq, cfg.head_dim)
+        v = mx.broadcast_to(
+            v[:, :, None, :, :],
+            (batch, cfg.num_kv_heads, heads_per_group, seq, cfg.head_dim),
+        ).reshape(batch, cfg.num_query_heads, seq, cfg.head_dim)
+        scores = (q @ mx.transpose(k, (0, 1, 3, 2))) / np.sqrt(cfg.head_dim)
+        causal = mx.arange(seq)[:, None] >= mx.arange(seq)[None, :]
+        same_document = document_ids[:, :, None] == document_ids[:, None, :]
+        mask = causal[None, None, :, :] & same_document[:, None, :, :]
+        scores = scores + (block_bias + edge_kind_bias)[:, None, :, :]
+        scores = mx.where(mask, scores, mx.full(scores.shape, -mx.inf))
+        attention = mx.softmax(scores, axis=-1) @ v
+        attention = mx.transpose(attention, (0, 2, 1, 3)).reshape(
+            batch, seq, cfg.hidden_size
+        )
+        hidden = hidden + attention @ self.weights["out.weight"].T
+        return hidden @ self.weights["lm_head.weight"].T
+
+
+def test_emitted_safetensors_match_independent_grouped_gqa_source(
+    tmp_path: Path,
+) -> None:
     mod = _load_module()
-    mx.random.seed(73)
-    source = _parity_model()
-    source.domain_embedding.stacked_emb.weight = mx.random.normal(
-        source.domain_embedding.stacked_emb.weight.shape
+    cfg = mod.Dense500MConversionConfig(
+        vocab_size=32,
+        hidden_size=8,
+        depth=1,
+        ffn_hidden_size=16,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=2,
+        max_seq_length=6,
     )
-    source.domain_embedding.up_proj.weight = mx.random.normal(
-        source.domain_embedding.up_proj.weight.shape
+    rng = np.random.default_rng(811)
+    source_qkv = rng.normal(0.0, 0.2, (cfg.qkv_dim, cfg.hidden_size)).astype(np.float32)
+    weights_np = {
+        "token.weight": rng.normal(0.0, 0.2, (cfg.vocab_size, cfg.hidden_size)).astype(
+            np.float32
+        ),
+        "q.weight": source_qkv[list(mod.qkv_source_rows(cfg, "q"))],
+        "k.weight": source_qkv[list(mod.qkv_source_rows(cfg, "k"))],
+        "v.weight": source_qkv[list(mod.qkv_source_rows(cfg, "v"))],
+        "out.weight": rng.normal(0.0, 0.2, (cfg.hidden_size, cfg.q_proj_dim)).astype(
+            np.float32
+        ),
+        "lm_head.weight": rng.normal(
+            0.0, 0.2, (cfg.vocab_size, cfg.hidden_size)
+        ).astype(np.float32),
+        "domain.scale": rng.normal(0.0, 0.1, (cfg.hidden_size,)).astype(np.float32),
+        "role.scale": rng.normal(0.0, 0.1, (cfg.hidden_size,)).astype(np.float32),
+        "confidence.scale": rng.normal(0.0, 0.1, (cfg.hidden_size,)).astype(np.float32),
+    }
+    emitted = tmp_path / "converted.safetensors"
+    mx.save_safetensors(
+        str(emitted),
+        {key: mx.array(value) for key, value in weights_np.items()},
+        metadata={"format": "mlx"},
     )
-    mx.random.seed(73)
-    target = _parity_model()
-    target.domain_embedding.stacked_emb.weight = mx.random.normal(
-        target.domain_embedding.stacked_emb.weight.shape
-    )
-    target.domain_embedding.up_proj.weight = mx.random.normal(
-        target.domain_embedding.up_proj.weight.shape
-    )
-    tokens = mx.array([[2, 3, 5, 7, 11, 13, 17, 19]], dtype=mx.int32)
-    graph_bias = mx.zeros((1, 8, 8), dtype=mx.float32)
-    graph_bias[:, 7, 1] = 1.0
+
+    tokens = mx.array([[2, 3, 5, 7, 11, 13]], dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 0, 1, 1, 1]], dtype=mx.int32)
+    graph_bias = mx.zeros((1, 6, 6), dtype=mx.float32)
+    graph_bias[:, 2, 0] = 1.25
+    graph_bias[:, 5, 3] = -0.75
     kind_bias = mx.zeros_like(graph_bias)
-    kind_bias[:, 7, 1] = 1.0
-    domain_ids = mx.full(tokens.shape, 3, dtype=mx.int32)
-    role_ids = mx.full(tokens.shape, 2, dtype=mx.int32)
-    confidence_ids = mx.ones(tokens.shape, dtype=mx.int32)
+    kind_bias[:, 2, 1] = 0.5
+    kind_bias[:, 5, 4] = 0.25
+    domain_ids = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+    role_ids = mx.array([[2, 3, 4, 5, 6, 7]], dtype=mx.int32)
+    confidence_ids = mx.array([[1, 2, 3, 1, 2, 3]], dtype=mx.int32)
 
     def source_forward(input_ids, **sidecars):
-        graph_attention_bias = sidecars.pop("graph_attention_bias")
-        graph_edge_kind_bias = sidecars.pop("graph_edge_kind_bias")
-        return source.logits(
-            input_ids,
-            block_bias=graph_attention_bias,
-            edge_kind_bias=graph_edge_kind_bias,
-            **sidecars,
+        token_ids = np.asarray(input_ids, dtype=np.int64)
+        docs = np.asarray(sidecars["document_ids"], dtype=np.int64)
+        batch, seq = token_ids.shape
+        hidden = (
+            weights_np["token.weight"][token_ids]
+            + np.asarray(sidecars["domain_ids"])[..., None] * weights_np["domain.scale"]
+            + np.asarray(sidecars["role_ids"])[..., None] * weights_np["role.scale"]
+            + np.asarray(sidecars["confidence_ids"])[..., None]
+            * weights_np["confidence.scale"]
         )
+        fused = hidden @ source_qkv.T
+        heads_per_group = cfg.num_query_heads // cfg.num_kv_heads
+        q_rows_per_group = heads_per_group * cfg.head_dim
+        rows_per_group = q_rows_per_group + 2 * cfg.head_dim
+        grouped = fused.reshape(batch, seq, cfg.num_kv_heads, rows_per_group)
+        q = grouped[..., :q_rows_per_group].reshape(
+            batch, seq, cfg.num_query_heads, cfg.head_dim
+        )
+        k = grouped[..., q_rows_per_group : q_rows_per_group + cfg.head_dim]
+        v = grouped[..., q_rows_per_group + cfg.head_dim :]
+        q = q.transpose(0, 2, 1, 3)
+        k = np.repeat(k.transpose(0, 2, 1, 3), heads_per_group, axis=1)
+        v = np.repeat(v.transpose(0, 2, 1, 3), heads_per_group, axis=1)
+        scores = np.matmul(q, k.transpose(0, 1, 3, 2)) / np.sqrt(cfg.head_dim)
+        scores += (
+            np.asarray(sidecars["graph_attention_bias"])
+            + np.asarray(sidecars["graph_edge_kind_bias"])
+        )[:, None, :, :]
+        causal = np.arange(seq)[:, None] >= np.arange(seq)[None, :]
+        same_document = docs[:, :, None] == docs[:, None, :]
+        scores = np.where(causal[None, None] & same_document[:, None], scores, -np.inf)
+        scores -= np.max(scores, axis=-1, keepdims=True)
+        probabilities = np.exp(scores)
+        probabilities /= probabilities.sum(axis=-1, keepdims=True)
+        attention = (
+            np.matmul(probabilities, v)
+            .transpose(0, 2, 1, 3)
+            .reshape(batch, seq, cfg.hidden_size)
+        )
+        hidden += attention @ weights_np["out.weight"].T
+        return hidden @ weights_np["lm_head.weight"].T
 
-    receipt = mod.verify_sidecar_logit_parity(
+    receipt = mod.verify_emitted_safetensors_logit_parity(
         source_forward=source_forward,
-        target_model=target,
+        target_model_factory=lambda: _ConvertedGQAFixture(cfg),
+        weights_path=emitted,
         input_ids=tokens,
         graph_attention_bias=graph_bias,
         graph_edge_kind_bias=kind_bias,
         domain_ids=domain_ids,
         role_ids=role_ids,
         confidence_ids=confidence_ids,
-        atol=1e-6,
-        rtol=1e-6,
+        document_ids=document_ids,
+        atol=2e-5,
+        rtol=2e-5,
     )
 
-    assert receipt["graph_prior_nonzero"] == 1
-    assert receipt["edge_kind_prior_nonzero"] == 1
-    assert receipt["domain_tokens_nonzero"] == 8
+    assert receipt["relation_prior_nonzero"] == 2
+    assert receipt["edge_kind_prior_nonzero"] == 2
+    assert receipt["domain_tokens_nonzero"] == 6
+    assert receipt["role_tokens_nonzero"] == 6
+    assert receipt["confidence_tokens_nonzero"] == 6
+    assert receipt["document_boundaries"] == 1
+    assert receipt["reloaded_safetensors"] == str(emitted.resolve())
+    assert receipt["max_abs_logit_error"] <= 2e-5
+
+
+def test_dense_mapped_source_matches_reloaded_emitted_weights(
+    tmp_path: Path,
+) -> None:
+    mod = _load_module()
+    cfg = mod.Dense500MConversionConfig(
+        vocab_size=64,
+        hidden_size=16,
+        depth=1,
+        ffn_hidden_size=32,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=4,
+        max_seq_length=8,
+        ngram_hash_heads=1,
+        ngram_hash_table_size=31,
+        ngram_hash_embed_dim=4,
+        structure_bottleneck_dim=8,
+        domain_num_domains=8,
+        domain_num_roles=8,
+        domain_num_confidences=4,
+        domain_bottleneck_dim=4,
+    )
+    mx.random.seed(141)
+    arrays = mod._target_arrays(cfg, bf16=False, domain_tensors_present=True)
+    arrays["domain_embedding.stacked_emb.weight"] = mx.random.normal(
+        arrays["domain_embedding.stacked_emb.weight"].shape
+    )
+    arrays["domain_embedding.up_proj.weight"] = mx.random.normal(
+        arrays["domain_embedding.up_proj.weight"].shape
+    )
+    source_model = mod._mapped_source_reference_model(
+        cfg,
+        arrays,
+        bf16=False,
+        domain_tensors_present=True,
+    )
+    emitted = tmp_path / "dense.safetensors"
+    mx.save_safetensors(str(emitted), arrays, metadata={"format": "mlx"})
+
+    def target_model_factory():
+        return mod._make_target_model(
+            cfg,
+            bf16=False,
+            domain_tensors_present=True,
+        )[1]
+
+    receipt = mod.verify_emitted_safetensors_logit_parity(
+        source_forward=mod._source_forward(source_model),
+        target_model_factory=target_model_factory,
+        weights_path=emitted,
+        **mod._fixed_parity_inputs(cfg),
+    )
+
+    assert receipt["relation_prior_nonzero"] == 2
+    assert receipt["edge_kind_prior_nonzero"] == 2
+    assert receipt["document_boundaries"] == 1
     assert receipt["max_abs_logit_error"] <= 1e-6
 
 
@@ -512,11 +842,13 @@ def test_sidecar_parity_seam_detects_dropped_graph_route() -> None:
     target = _parity_model()
     tokens = mx.array([[2, 3, 5, 7, 11, 13, 17, 19]], dtype=mx.int32)
     graph_bias = mx.zeros((1, 8, 8), dtype=mx.float32)
-    graph_bias[:, 7, 1] = 25.0
+    graph_bias[:, 7, 4] = 25.0
     kind_bias = mx.zeros_like(graph_bias)
+    kind_bias[:, 6, 4] = 1.0
     domain_ids = mx.full(tokens.shape, 3, dtype=mx.int32)
     role_ids = mx.full(tokens.shape, 2, dtype=mx.int32)
     confidence_ids = mx.ones(tokens.shape, dtype=mx.int32)
+    document_ids = mx.array([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=mx.int32)
 
     def source_forward(input_ids, **sidecars):
         sidecars.pop("graph_attention_bias")
@@ -538,6 +870,7 @@ def test_sidecar_parity_seam_detects_dropped_graph_route() -> None:
             domain_ids=domain_ids,
             role_ids=role_ids,
             confidence_ids=confidence_ids,
+            document_ids=document_ids,
             atol=1e-7,
             rtol=1e-7,
         )

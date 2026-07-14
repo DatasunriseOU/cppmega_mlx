@@ -17,6 +17,7 @@ import json
 import os
 import pickle
 import sys
+import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -88,6 +89,17 @@ DOMAIN_SOURCE_TO_TARGET: dict[str, str] = {
 UNMAPPED_SOURCE_TENSOR_ALLOWLIST: dict[str, str] = {}
 
 
+def conversion_output_paths(output: Path) -> tuple[Path, Path]:
+    """Return the evaluator-compatible weights and metadata paths."""
+
+    weights_path = output.expanduser().resolve()
+    if weights_path.suffix != ".safetensors":
+        raise ValueError(
+            f"conversion output must end in .safetensors, got {weights_path}"
+        )
+    return weights_path, weights_path.parent / "model.json"
+
+
 def _require_supported_attention_mode(cfg: Dense500MConversionConfig) -> None:
     if cfg.attention_mode != "gqa":
         raise NotImplementedError(
@@ -127,7 +139,10 @@ def qkv_source_rows(
         if part == "q":
             start, end = base, base + q_rows_per_group
         elif part == "k":
-            start, end = base + q_rows_per_group, base + q_rows_per_group + kv_rows_per_group
+            start, end = (
+                base + q_rows_per_group,
+                base + q_rows_per_group + kv_rows_per_group,
+            )
         elif part == "v":
             start = base + q_rows_per_group + kv_rows_per_group
             end = start + kv_rows_per_group
@@ -197,7 +212,11 @@ def resolve_checkpoint_iter(path: Path) -> Path:
     """Return the Megatron iteration directory for a stage or iter path."""
 
     path = path.expanduser().resolve()
-    if path.is_dir() and (path / ".metadata").is_file() and (path / "__0_0.distcp").is_file():
+    if (
+        path.is_dir()
+        and (path / ".metadata").is_file()
+        and (path / "__0_0.distcp").is_file()
+    ):
         return path
     latest = path / "latest_checkpointed_iteration.txt"
     if path.is_dir() and latest.is_file():
@@ -221,17 +240,47 @@ def build_key_plan(
     plan = [
         KeyPlan("embedding.word_embeddings.weight", "token_embedding.weight"),
         KeyPlan("embedding.word_embeddings.weight", "lm_head.weight"),
-        KeyPlan("embedding.cppmega_ngram_hash.table_offsets", "ngram_hash_embedding.table_offsets"),
-        KeyPlan("embedding.cppmega_ngram_hash.table_sizes_t", "ngram_hash_embedding.table_sizes_t"),
-        KeyPlan("embedding.cppmega_ngram_hash.hash_mults", "ngram_hash_embedding.hash_mults"),
-        KeyPlan("embedding.cppmega_ngram_hash.hash_bias", "ngram_hash_embedding.hash_bias"),
-        KeyPlan("embedding.cppmega_ngram_hash.order_for_table", "ngram_hash_embedding.order_for_table"),
-        KeyPlan("embedding.cppmega_ngram_hash.order_mask", "ngram_hash_embedding.order_mask"),
-        KeyPlan("embedding.cppmega_ngram_hash.unified_table.weight", "ngram_hash_embedding.unified_table.weight"),
-        KeyPlan("embedding.cppmega_ngram_hash.out_proj.weight", "ngram_hash_embedding.out_proj.weight"),
-        KeyPlan("embedding.cppmega_structure.component_scales", "structure_embedding.component_scales"),
-        KeyPlan("embedding.cppmega_structure.stacked_emb.weight", "structure_embedding.stacked_emb.weight"),
-        KeyPlan("embedding.cppmega_structure.up_proj.weight", "structure_embedding.up_proj.weight"),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.table_offsets",
+            "ngram_hash_embedding.table_offsets",
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.table_sizes_t",
+            "ngram_hash_embedding.table_sizes_t",
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.hash_mults", "ngram_hash_embedding.hash_mults"
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.hash_bias", "ngram_hash_embedding.hash_bias"
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.order_for_table",
+            "ngram_hash_embedding.order_for_table",
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.order_mask", "ngram_hash_embedding.order_mask"
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.unified_table.weight",
+            "ngram_hash_embedding.unified_table.weight",
+        ),
+        KeyPlan(
+            "embedding.cppmega_ngram_hash.out_proj.weight",
+            "ngram_hash_embedding.out_proj.weight",
+        ),
+        KeyPlan(
+            "embedding.cppmega_structure.component_scales",
+            "structure_embedding.component_scales",
+        ),
+        KeyPlan(
+            "embedding.cppmega_structure.stacked_emb.weight",
+            "structure_embedding.stacked_emb.weight",
+        ),
+        KeyPlan(
+            "embedding.cppmega_structure.up_proj.weight",
+            "structure_embedding.up_proj.weight",
+        ),
         KeyPlan("decoder.final_norm.weight", "norm.weight"),
     ]
     for block in range(cfg.depth):
@@ -287,8 +336,7 @@ def build_key_plan(
         if present_domain and present_domain != set(DOMAIN_SOURCE_TO_TARGET):
             missing = sorted(set(DOMAIN_SOURCE_TO_TARGET) - present_domain)
             raise KeyError(
-                "partial domain tensor set in Megatron checkpoint; missing "
-                f"{missing}"
+                f"partial domain tensor set in Megatron checkpoint; missing {missing}"
             )
         if present_domain:
             plan.extend(
@@ -346,7 +394,8 @@ def _make_target_model(
         ngram_hash_heads=cfg.ngram_hash_heads,
         ngram_hash_table_size=cfg.ngram_hash_table_size,
         ngram_hash_embed_dim=cfg.ngram_hash_embed_dim,
-        require_graph_routes=False,
+        require_graph_routes=True,
+        graph_routes_enabled=True,
         domain_residual_scale=1.0 if domain_tensors_present else 0.0,
         require_domain_routes=domain_tensors_present,
         domain_num_domains=cfg.domain_num_domains,
@@ -373,7 +422,9 @@ def _target_arrays(
     # Megatron used RoPE-only positions and has no platform embedding in this
     # checkpoint. Keep the target tensors explicit and neutral.
     if "position_embedding.weight" in arrays:
-        arrays["position_embedding.weight"] = mx.zeros_like(arrays["position_embedding.weight"])
+        arrays["position_embedding.weight"] = mx.zeros_like(
+            arrays["position_embedding.weight"]
+        )
     if "platform_embedding.embedding.weight" in arrays:
         arrays["platform_embedding.embedding.weight"] = mx.zeros_like(
             arrays["platform_embedding.embedding.weight"]
@@ -432,7 +483,9 @@ def validate_plan_against_metadata(
     required_sources = sorted({item.source_key for item in plan})
     missing_sources = [key for key in required_sources if key not in specs]
     if missing_sources:
-        raise KeyError(f"Megatron checkpoint missing required source tensors: {missing_sources[:20]}")
+        raise KeyError(
+            f"Megatron checkpoint missing required source tensors: {missing_sources[:20]}"
+        )
     mapped_sources = set(required_sources)
     allowed_sources = set(UNMAPPED_SOURCE_TENSOR_ALLOWLIST)
     unmapped_learned_sources = sorted(
@@ -442,19 +495,14 @@ def validate_plan_against_metadata(
     )
     if unmapped_learned_sources:
         raise KeyError(
-            "unmapped learned source tensors: "
-            f"{unmapped_learned_sources[:30]}"
+            f"unmapped learned source tensors: {unmapped_learned_sources[:30]}"
         )
 
     plan_targets = {item.target_key for item in plan}
     neutral_targets = {
         "position_embedding.weight",
         "platform_embedding.embedding.weight",
-    } | {
-        key
-        for key in target_arrays
-        if key.endswith(".rope_inv_freq")
-    }
+    } | {key for key in target_arrays if key.endswith(".rope_inv_freq")}
     missing_targets = [key for key in plan_targets if key not in target_arrays]
     if missing_targets:
         raise KeyError(f"MLX model missing target tensors: {missing_targets[:20]}")
@@ -488,9 +536,7 @@ def validate_plan_against_metadata(
         "neutral_tensors": sorted(neutral_targets & set(target_arrays)),
         "target_tensors": len(target_arrays),
         "domain_tensors_present": set(DOMAIN_SOURCE_TO_TARGET) <= set(specs),
-        "allowed_unmapped_source_tensors": sorted(
-            set(specs) & allowed_sources
-        ),
+        "allowed_unmapped_source_tensors": sorted(set(specs) & allowed_sources),
     }
 
 
@@ -509,10 +555,7 @@ def load_required_source_tensors(
 ) -> dict[str, np.ndarray]:
     specs = _metadata_tensor_specs(metadata)
     source_keys = sorted(
-        {
-            item.source_key
-            for item in build_key_plan(cfg, source_keys=set(specs))
-        }
+        {item.source_key for item in build_key_plan(cfg, source_keys=set(specs))}
     )
     state: dict[str, np.ndarray] = {}
     for key in source_keys:
@@ -545,13 +588,19 @@ def _read_dcp_tensor(
             f"{len(chunk_sizes)}"
         )
     full = np.empty(shape, dtype=_numpy_storage_dtype(dtype))
-    for index, info in sorted(matches, key=lambda item: int(getattr(item[0], "index", 0) or 0)):
+    for index, info in sorted(
+        matches, key=lambda item: int(getattr(item[0], "index", 0) or 0)
+    ):
         offsets = tuple(int(x) for x in getattr(index, "offset", ()))
         if offsets not in chunk_sizes:
-            raise ValueError(f"{key}: storage offset {offsets} missing from chunk metadata")
+            raise ValueError(
+                f"{key}: storage offset {offsets} missing from chunk metadata"
+            )
         chunk_shape = chunk_sizes[offsets]
         chunk = _read_dcp_tensor_chunk(iter_dir, info, key, chunk_shape, dtype)
-        target = tuple(slice(start, start + size) for start, size in zip(offsets, chunk_shape))
+        target = tuple(
+            slice(start, start + size) for start, size in zip(offsets, chunk_shape)
+        )
         full[target] = chunk
     return full
 
@@ -574,22 +623,30 @@ def _read_dcp_tensor_chunk(
     if dtype in {"torch.bfloat16", "bfloat16"}:
         expected_bytes = expected_items * 2
         if len(raw) != expected_bytes:
-            raise ValueError(f"{key}: expected {expected_bytes} bf16 bytes, got {len(raw)}")
+            raise ValueError(
+                f"{key}: expected {expected_bytes} bf16 bytes, got {len(raw)}"
+            )
         return np.frombuffer(raw, dtype=np.uint16).reshape(shape)
     if dtype in {"torch.float32", "torch.float", "float32", "float"}:
         expected_bytes = expected_items * 4
         if len(raw) != expected_bytes:
-            raise ValueError(f"{key}: expected {expected_bytes} fp32 bytes, got {len(raw)}")
+            raise ValueError(
+                f"{key}: expected {expected_bytes} fp32 bytes, got {len(raw)}"
+            )
         return np.frombuffer(raw, dtype="<f4").reshape(shape)
     if dtype in {"torch.int64", "int64", "LongStorage"}:
         expected_bytes = expected_items * 8
         if len(raw) != expected_bytes:
-            raise ValueError(f"{key}: expected {expected_bytes} int64 bytes, got {len(raw)}")
+            raise ValueError(
+                f"{key}: expected {expected_bytes} int64 bytes, got {len(raw)}"
+            )
         return np.frombuffer(raw, dtype="<i8").reshape(shape)
     if dtype in {"torch.int32", "int32", "IntStorage"}:
         expected_bytes = expected_items * 4
         if len(raw) != expected_bytes:
-            raise ValueError(f"{key}: expected {expected_bytes} int32 bytes, got {len(raw)}")
+            raise ValueError(
+                f"{key}: expected {expected_bytes} int32 bytes, got {len(raw)}"
+            )
         return np.frombuffer(raw, dtype="<i4").reshape(shape)
     raise TypeError(f"{key}: unsupported source tensor dtype {dtype!r}")
 
@@ -685,7 +742,7 @@ def verify_sidecar_logit_parity(
     domain_ids: Any,
     role_ids: Any,
     confidence_ids: Any,
-    document_ids: Any | None = None,
+    document_ids: Any,
     atol: float = 1e-6,
     rtol: float = 1e-6,
 ) -> dict[str, Any]:
@@ -711,17 +768,52 @@ def verify_sidecar_logit_parity(
         "domain_ids": domain_ids,
         "role_ids": role_ids,
         "confidence_ids": confidence_ids,
+        "document_ids": document_ids,
     }
-    if document_ids is not None:
-        sidecars["document_ids"] = document_ids
-    for name in ("domain_ids", "role_ids", "confidence_ids"):
+    for name in ("domain_ids", "role_ids", "confidence_ids", "document_ids"):
         if tuple(sidecars[name].shape) != batch_shape:
             raise ValueError(
                 f"{name} must match input_ids shape {batch_shape}, got "
                 f"{tuple(sidecars[name].shape)}"
             )
 
-    source_logits = source_forward(input_ids, **sidecars)
+    relation_np = np.asarray(graph_attention_bias)
+    edge_kind_np = np.asarray(graph_edge_kind_bias)
+    document_np = np.asarray(document_ids)
+    if not np.issubdtype(document_np.dtype, np.integer):
+        raise ValueError(
+            f"document_ids must use an integer dtype, got {document_np.dtype}"
+        )
+    document_boundaries = int(
+        np.count_nonzero(document_np[:, 1:] != document_np[:, :-1])
+    )
+    if document_boundaries == 0:
+        raise ValueError(
+            "fixed-input logit parity requires at least one document boundary"
+        )
+    for name, values in (
+        ("graph_attention_bias", relation_np),
+        ("graph_edge_kind_bias", edge_kind_np),
+    ):
+        if not np.count_nonzero(values):
+            raise ValueError(f"fixed-input logit parity requires nonzero {name}")
+        cross_document = document_np[:, :, None] != document_np[:, None, :]
+        if np.any(values[cross_document] != 0):
+            raise ValueError(
+                f"{name} contains a route crossing a fixed-input document boundary"
+            )
+    channel_nonzero = {
+        name: int(np.count_nonzero(np.asarray(sidecars[name])))
+        for name in ("domain_ids", "role_ids", "confidence_ids")
+    }
+    missing_channels = [name for name, count in channel_nonzero.items() if count == 0]
+    if missing_channels:
+        raise ValueError(
+            "fixed-input logit parity requires nonzero domain channels; got zero "
+            f"values for {missing_channels}"
+        )
+
+    source_logits = source_forward(input_ids, **dict(sidecars))
     if isinstance(source_logits, tuple):
         source_logits = source_logits[0]
     target_logits = target_model.logits(
@@ -733,7 +825,10 @@ def verify_sidecar_logit_parity(
         confidence_ids=confidence_ids,
         document_ids=document_ids,
     )
-    mx.eval(source_logits, target_logits)
+    if isinstance(source_logits, mx.array):
+        mx.eval(source_logits, target_logits)
+    else:
+        mx.eval(target_logits)
     source_np = np.asarray(source_logits, dtype=np.float32)
     target_np = np.asarray(target_logits, dtype=np.float32)
     if source_np.shape != target_np.shape:
@@ -748,17 +843,125 @@ def verify_sidecar_logit_parity(
             "logit parity failed: max_abs_error="
             f"{float(error.max(initial=0.0)):.9g} atol={atol} rtol={rtol}"
         )
-    combined_graph = np.asarray(graph_attention_bias) + np.asarray(
-        graph_edge_kind_bias
-    )
+    combined_graph = relation_np + edge_kind_np
     return {
         "max_abs_logit_error": float(error.max(initial=0.0)),
         "graph_prior_nonzero": int(np.count_nonzero(combined_graph)),
-        "edge_kind_prior_nonzero": int(
-            np.count_nonzero(np.asarray(graph_edge_kind_bias))
-        ),
-        "domain_tokens_nonzero": int(np.count_nonzero(np.asarray(domain_ids))),
+        "relation_prior_nonzero": int(np.count_nonzero(relation_np)),
+        "edge_kind_prior_nonzero": int(np.count_nonzero(edge_kind_np)),
+        "domain_tokens_nonzero": channel_nonzero["domain_ids"],
+        "role_tokens_nonzero": channel_nonzero["role_ids"],
+        "confidence_tokens_nonzero": channel_nonzero["confidence_ids"],
+        "document_boundaries": document_boundaries,
     }
+
+
+def verify_emitted_safetensors_logit_parity(
+    *,
+    source_forward: Any,
+    target_model_factory: Any,
+    weights_path: Path,
+    input_ids: Any,
+    graph_attention_bias: Any,
+    graph_edge_kind_bias: Any,
+    domain_ids: Any,
+    role_ids: Any,
+    confidence_ids: Any,
+    document_ids: Any,
+    atol: float = 1e-6,
+    rtol: float = 1e-6,
+) -> dict[str, Any]:
+    """Reload emitted safetensors before comparing fixed-input logits."""
+
+    weights_path = weights_path.expanduser().resolve()
+    if weights_path.suffix != ".safetensors":
+        raise ValueError(f"parity weights must be .safetensors, got {weights_path}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(weights_path)
+    target_model = target_model_factory()
+    target_model.load_weights(str(weights_path), strict=True)
+    mx, _tree_flatten, _DenseCppLM, _DenseCppLMConfig = _import_runtime()
+    mx.eval(target_model.parameters())
+    receipt = verify_sidecar_logit_parity(
+        source_forward=source_forward,
+        target_model=target_model,
+        input_ids=input_ids,
+        graph_attention_bias=graph_attention_bias,
+        graph_edge_kind_bias=graph_edge_kind_bias,
+        domain_ids=domain_ids,
+        role_ids=role_ids,
+        confidence_ids=confidence_ids,
+        document_ids=document_ids,
+        atol=atol,
+        rtol=rtol,
+    )
+    receipt["reloaded_safetensors"] = str(weights_path)
+    return receipt
+
+
+def _mapped_source_reference_model(
+    cfg: Dense500MConversionConfig,
+    target_arrays: dict[str, Any],
+    *,
+    bf16: bool,
+    domain_tensors_present: bool,
+) -> Any:
+    mx, _tree_flatten, _DenseCppLM, _DenseCppLMConfig = _import_runtime()
+    _model_cfg, model = _make_target_model(
+        cfg,
+        bf16=bf16,
+        domain_tensors_present=domain_tensors_present,
+    )
+    model.load_weights(list(target_arrays.items()), strict=True)
+    mx.eval(model.parameters())
+    return model
+
+
+def _fixed_parity_inputs(cfg: Dense500MConversionConfig) -> dict[str, Any]:
+    mx, _tree_flatten, _DenseCppLM, _DenseCppLMConfig = _import_runtime()
+    seq_length = min(8, cfg.max_seq_length)
+    if seq_length < 4:
+        raise ValueError(
+            "conversion logit parity requires max_seq_length >= 4, got "
+            f"{cfg.max_seq_length}"
+        )
+    split = seq_length // 2
+    token_values = (
+        np.arange(1, seq_length + 1, dtype=np.int32) % max(cfg.vocab_size - 1, 1)
+    ) + 1
+    input_ids = mx.array(token_values[None, :], dtype=mx.int32)
+    bias_shape = (1, seq_length, seq_length)
+    graph_attention_bias = mx.zeros(bias_shape, dtype=mx.float32)
+    graph_attention_bias[:, split - 1, 0] = 2.0
+    graph_attention_bias[:, seq_length - 1, split] = -1.25
+    graph_edge_kind_bias = mx.zeros(bias_shape, dtype=mx.float32)
+    graph_edge_kind_bias[:, split - 1, split - 2] = 0.5
+    graph_edge_kind_bias[:, seq_length - 1, seq_length - 2] = 0.75
+    document_ids = mx.zeros((1, seq_length), dtype=mx.int32)
+    document_ids[:, split:] = 1
+    return {
+        "input_ids": input_ids,
+        "graph_attention_bias": graph_attention_bias,
+        "graph_edge_kind_bias": graph_edge_kind_bias,
+        "domain_ids": mx.ones((1, seq_length), dtype=mx.int32),
+        "role_ids": mx.full((1, seq_length), 2, dtype=mx.int32),
+        "confidence_ids": mx.ones((1, seq_length), dtype=mx.int32),
+        "document_ids": document_ids,
+    }
+
+
+def _source_forward(model: Any) -> Any:
+    def forward(input_ids: Any, **sidecars: Any) -> Any:
+        graph_attention_bias = sidecars.pop("graph_attention_bias")
+        graph_edge_kind_bias = sidecars.pop("graph_edge_kind_bias")
+        return model.logits(
+            input_ids,
+            block_bias=graph_attention_bias,
+            edge_kind_bias=graph_edge_kind_bias,
+            **sidecars,
+        )
+
+    return forward
 
 
 def convert_checkpoint(
@@ -770,6 +973,7 @@ def convert_checkpoint(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     _require_supported_attention_mode(cfg)
+    output, manifest_path = conversion_output_paths(output)
     mx, _tree_flatten, _DenseCppLM, _DenseCppLMConfig = _import_runtime()
     iter_dir = resolve_checkpoint_iter(checkpoint)
     metadata = read_dcp_metadata(iter_dir)
@@ -782,7 +986,7 @@ def convert_checkpoint(
     )
     validation = validate_plan_against_metadata(cfg, metadata, target)
     manifest = {
-        "schema": "cppmega_megatron_dense500m_to_mlx_v2",
+        "schema": "cppmega_megatron_dense500m_to_mlx_v3",
         "source_checkpoint": str(iter_dir),
         "output": str(output),
         "config": asdict(cfg),
@@ -796,6 +1000,7 @@ def convert_checkpoint(
             "position_embedding.weight is zero because source checkpoint used RoPE-only positions",
             "platform_embedding.embedding.weight is zero because source checkpoint has doc-level platform sidecars, not a learned platform table",
             "optimizer state is intentionally ignored for inference conversion",
+            "fixed-input logits are compared before publishing against a fresh model reloaded from the emitted safetensors",
             (
                 "domain learned tensors were present and mapped; production domain residual is required"
                 if domain_tensors_present
@@ -805,13 +1010,48 @@ def convert_checkpoint(
     }
     if dry_run:
         return manifest
-    output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     source = load_required_source_tensors(iter_dir, cfg, metadata)
     target = apply_mapping(target, source, cfg, bf16=bf16)
-    mx.save_safetensors(str(output), target, metadata={"format": "mlx"})
-    manifest_path = output.with_suffix(".json")
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    source_model = _mapped_source_reference_model(
+        cfg,
+        target,
+        bf16=bf16,
+        domain_tensors_present=domain_tensors_present,
+    )
+    parity_inputs = _fixed_parity_inputs(cfg)
+
+    def target_model_factory() -> Any:
+        return _make_target_model(
+            cfg,
+            bf16=bf16,
+            domain_tensors_present=domain_tensors_present,
+        )[1]
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.stem}-conversion-",
+        dir=output.parent,
+    ) as tmp:
+        stage_dir = Path(tmp)
+        staged_weights = stage_dir / output.name
+        staged_manifest = stage_dir / "model.json"
+        mx.save_safetensors(str(staged_weights), target, metadata={"format": "mlx"})
+        parity = verify_emitted_safetensors_logit_parity(
+            source_forward=_source_forward(source_model),
+            target_model_factory=target_model_factory,
+            weights_path=staged_weights,
+            **parity_inputs,
+        )
+        parity["reloaded_safetensors"] = str(output)
+        parity["source_reference"] = "mapped_dcp_tensors_before_serialization"
+        parity["domain_tensors_present"] = domain_tensors_present
+        manifest["logit_parity"] = parity
+        staged_manifest.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(staged_weights, output)
+        os.replace(staged_manifest, manifest_path)
     return manifest
 
 
