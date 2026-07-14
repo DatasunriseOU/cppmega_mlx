@@ -538,29 +538,54 @@ def delimiter_token_ids(domain: DomainKind) -> tuple[int, int]:
     )
 
 
-def validate_domain_delimiter_contract() -> None:
+def validate_domain_delimiter_contract(
+    delimiter_roles: Mapping[DomainKind, tuple[str, str]] | None = None,
+) -> None:
     """Fail loud if any logical domain delimiter is missing or malformed."""
 
+    roles = DOMAIN_DELIMITER_ROLES if delimiter_roles is None else delimiter_roles
+    expected_domains = set(DomainKind) - {DomainKind.UNKNOWN}
+    actual_domains = set(roles)
+    if actual_domains != expected_domains:
+        raise ValueError(
+            "domain delimiter map is incomplete: "
+            f"missing={sorted(domain.name for domain in expected_domains - actual_domains)} "
+            f"extra={sorted(domain.name for domain in actual_domains - expected_domains)}"
+        )
     missing: list[str] = []
-    for domain, (start_role, end_role) in DOMAIN_DELIMITER_ROLES.items():
-        if not start_role.endswith("_START"):
-            raise ValueError(f"{domain.name}: start role must end with _START")
-        if not end_role.endswith("_END"):
-            raise ValueError(f"{domain.name}: end role must end with _END")
+    seen_ids: dict[int, str] = {}
+    for domain, (start_role, end_role) in roles.items():
+        role_base = "CPP_CODE" if domain == DomainKind.CPP else domain.name
+        expected_pair = (f"{role_base}_START", f"{role_base}_END")
+        if (start_role, end_role) != expected_pair:
+            raise ValueError(
+                f"{domain.name}: delimiter roles must be {expected_pair}, got "
+                f"{(start_role, end_role)}"
+            )
         if start_role not in DOMAIN_DELIMITER_TOKEN_IDS:
             missing.append(start_role)
         if end_role not in DOMAIN_DELIMITER_TOKEN_IDS:
             missing.append(end_role)
-        if start_role in DOMAIN_DELIMITER_TOKEN_IDS and end_role in DOMAIN_DELIMITER_TOKEN_IDS:
+        if (
+            start_role in DOMAIN_DELIMITER_TOKEN_IDS
+            and end_role in DOMAIN_DELIMITER_TOKEN_IDS
+        ):
             start_id = DOMAIN_DELIMITER_TOKEN_IDS[start_role]
             end_id = DOMAIN_DELIMITER_TOKEN_IDS[end_role]
             if start_id == end_id:
                 raise ValueError(f"{domain.name}: start/end delimiter ids collide")
+            for role, token_id in ((start_role, start_id), (end_role, end_id)):
+                existing = seen_ids.setdefault(token_id, role)
+                if existing != role:
+                    raise ValueError(
+                        f"domain delimiter id {token_id} maps to both "
+                        f"{existing} and {role}"
+                    )
     if missing:
-        raise ValueError(f"missing domain delimiter token roles: {sorted(set(missing))}")
-    expected_roles = {
-        role for role_pair in DOMAIN_DELIMITER_ROLES.values() for role in role_pair
-    }
+        raise ValueError(
+            f"missing domain delimiter token roles: {sorted(set(missing))}"
+        )
+    expected_roles = {role for role_pair in roles.values() for role in role_pair}
     contract_roles = set(DOMAIN_DELIMITER_TOKEN_IDS)
     if contract_roles != expected_roles:
         raise ValueError(
@@ -568,6 +593,9 @@ def validate_domain_delimiter_contract() -> None:
             f"unmapped={sorted(contract_roles - expected_roles)} "
             f"undefined={sorted(expected_roles - contract_roles)}"
         )
+
+
+validate_domain_delimiter_contract()
 
 
 __all__ = [

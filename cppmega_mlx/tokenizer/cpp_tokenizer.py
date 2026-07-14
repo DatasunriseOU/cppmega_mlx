@@ -7,32 +7,39 @@ nearby nanochat tokenizer with different reserved IDs.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Sequence
+import operator
 from pathlib import Path
 from typing import Any
 
+from cppmega_mlx.data.tokenizer_contract import (
+    EXPECTED_VOCAB_SIZE,
+    SPECIAL_TOKEN_IDS,
+    validate_tokenizer_artifact_contract,
+)
 from cppmega_mlx.data.prompt_graph import (
     CppPromptTokenizerAdapter,
     normalize_cpp_whitespace_with_offsets as normalize_whitespace_with_offsets,
 )
 
-EXPECTED_VOCAB_SIZE = 65_536
 EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
-    "<BOS>": 2,
-    "<EOS>": 3,
-    "<FIM_PREFIX>": 4,
-    "<FIM_MIDDLE>": 5,
-    "<FIM_SUFFIX>": 6,
-    "<CODE_START>": 7,
-    "<CODE_END>": 8,
-    "<THINK_START>": 9,
-    "<THINK_END>": 10,
-    "<QUERY_TOOL>": 11,
-    "<TOOL_RESULT>": 19,
-    "<FIM_INSTRUCTION>": 45,
-    "<SPACE>": 46,
-    "<NL>": 47,
+    f"<{role}>": SPECIAL_TOKEN_IDS[role]
+    for role in (
+        "BOS",
+        "EOS",
+        "FIM_PREFIX",
+        "FIM_MIDDLE",
+        "FIM_SUFFIX",
+        "CODE_START",
+        "CODE_END",
+        "THINK_START",
+        "THINK_END",
+        "QUERY_TOOL",
+        "TOOL_RESULT",
+        "FIM_INSTRUCTION",
+        "SPACE",
+        "NL",
+    )
 }
 
 
@@ -181,7 +188,26 @@ class CppMegaTokenizer:
         single space or single newline (longer runs are collapsed by the
         normalizer). Matches the CUDA-side ``nanochat.cpp_tokenizer`` decode.
         """
-        parts = [self._id_to_token.get(int(i), "") for i in ids]
+        parts: list[str] = []
+        for position, raw_id in enumerate(ids):
+            if isinstance(raw_id, bool):
+                raise TokenizerContractError(
+                    f"decode id at position {position} must be an integer, got bool"
+                )
+            try:
+                token_id = operator.index(raw_id)
+            except TypeError as exc:
+                raise TokenizerContractError(
+                    f"decode id at position {position} must be an integer, "
+                    f"got {type(raw_id).__name__}"
+                ) from exc
+            token = self._id_to_token.get(token_id)
+            if token is None:
+                raise TokenizerContractError(
+                    f"decode id at position {position} is outside tokenizer vocab: "
+                    f"{token_id}"
+                )
+            parts.append(token)
         s = "".join(parts)
         return s.replace("<SPACE>", " ").replace("<NL>", "\n")
 
@@ -198,6 +224,10 @@ class CppMegaTokenizer:
         if token is None:
             return None
         if isinstance(token, int) and not isinstance(token, bool):
+            if token not in self._id_to_token:
+                raise TokenizerContractError(
+                    f"special token id {token} is outside tokenizer vocab"
+                )
             return token
         if isinstance(token, str):
             token_id = self.id_for_token(token)
@@ -221,9 +251,13 @@ def load_cppmega_tokenizer(path: str | Path) -> CppMegaTokenizer:
     """Load a tokenizer only if it satisfies the M0.1 contract."""
 
     tokenizer_path = _resolve_tokenizer_path(path)
-    payload = _load_tokenizer_json(tokenizer_path)
-    vocab = _extract_vocab(payload, tokenizer_path)
-    _validate_vocab_contract(vocab, tokenizer_path)
+    try:
+        validate_tokenizer_artifact_contract(
+            tokenizer_path,
+            require_frozen_artifact=True,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise TokenizerContractError(str(exc)) from exc
 
     try:
         from tokenizers import Tokenizer  # pyright: ignore[reportMissingImports]
@@ -242,61 +276,6 @@ def _resolve_tokenizer_path(path: str | Path) -> Path:
     if not candidate.is_file():
         raise FileNotFoundError(f"tokenizer artifact not found: {candidate}")
     return candidate
-
-
-def _load_tokenizer_json(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise TokenizerContractError(f"{path}: invalid tokenizer JSON") from exc
-    if not isinstance(payload, dict):
-        raise TokenizerContractError(f"{path}: tokenizer JSON must be an object")
-    return payload
-
-
-def _extract_vocab(payload: dict[str, Any], path: Path) -> dict[str, int]:
-    model = payload.get("model")
-    if not isinstance(model, dict):
-        raise TokenizerContractError(f"{path}: missing tokenizer model")
-    raw_vocab = model.get("vocab")
-    if not isinstance(raw_vocab, dict):
-        raise TokenizerContractError(f"{path}: missing tokenizer model vocab")
-
-    vocab: dict[str, int] = {}
-    seen_ids: set[int] = set()
-    for token, token_id in raw_vocab.items():
-        if not isinstance(token, str) or not isinstance(token_id, int):
-            raise TokenizerContractError(f"{path}: vocab entries must be str->int")
-        if token_id in seen_ids:
-            raise TokenizerContractError(f"{path}: duplicate vocab id {token_id}")
-        seen_ids.add(token_id)
-        vocab[token] = token_id
-    return vocab
-
-
-def _validate_vocab_contract(vocab: dict[str, int], path: Path) -> None:
-    if len(vocab) != EXPECTED_VOCAB_SIZE:
-        raise TokenizerContractError(
-            f"{path}: expected vocab size {EXPECTED_VOCAB_SIZE}, got {len(vocab)}"
-        )
-
-    id_to_token = {token_id: token for token, token_id in vocab.items()}
-    if len(id_to_token) != len(vocab):
-        raise TokenizerContractError(f"{path}: vocab ids must be unique")
-
-    for token, expected_id in EXPECTED_SPECIAL_TOKENS.items():
-        actual_id = vocab.get(token)
-        if actual_id != expected_id:
-            occupant = id_to_token.get(expected_id)
-            raise TokenizerContractError(
-                f"{path}: token {token!r} must use id {expected_id}, "
-                f"got {actual_id}; id {expected_id} maps to {occupant!r}"
-            )
-        actual_token = id_to_token.get(expected_id)
-        if actual_token != token:
-            raise TokenizerContractError(
-                f"{path}: id {expected_id} must map to {token!r}, got {actual_token!r}"
-            )
 
 
 __all__ = [

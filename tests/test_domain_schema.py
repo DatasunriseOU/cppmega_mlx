@@ -45,6 +45,28 @@ def test_domain_delimiter_contract_is_complete() -> None:
     assert DomainKind.SANITIZER_OUTPUT in DOMAIN_DELIMITER_ROLES
 
 
+def test_domain_delimiter_roles_match_each_domain_name_exactly() -> None:
+    expected = {
+        domain: (
+            f"{'CPP_CODE' if domain == DomainKind.CPP else domain.name}_START",
+            f"{'CPP_CODE' if domain == DomainKind.CPP else domain.name}_END",
+        )
+        for domain in DomainKind
+        if domain != DomainKind.UNKNOWN
+    }
+
+    assert DOMAIN_DELIMITER_ROLES == expected
+
+
+def test_domain_delimiter_validator_rejects_swapped_domain_pairs() -> None:
+    swapped = dict(DOMAIN_DELIMITER_ROLES)
+    swapped[DomainKind.CMAKE] = DOMAIN_DELIMITER_ROLES[DomainKind.MAKE]
+    swapped[DomainKind.MAKE] = DOMAIN_DELIMITER_ROLES[DomainKind.CMAKE]
+
+    with pytest.raises(ValueError, match="CMAKE: delimiter roles must be"):
+        validate_domain_delimiter_contract(swapped)
+
+
 def test_domain_schema_sha256_covers_exact_frozen_json_bytes() -> None:
     assert DOMAIN_SCHEMA_SHA256 == hashlib.sha256(
         DOMAIN_SCHEMA_PATH.read_bytes()
