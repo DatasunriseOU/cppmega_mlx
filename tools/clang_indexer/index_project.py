@@ -66,7 +66,7 @@ from cppmega_mlx.data.symbol_identity import (
     compute_symbol_id,
     require_project_identity,
 )
-from cppmega_mlx.data.source_identity import source_identity_for_path
+from cppmega_mlx.data.source_identity import source_identity, source_identity_for_path
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
@@ -559,6 +559,48 @@ def _part_source_path(
     return fallback
 
 
+def _stable_repo_id(repo_name: str) -> str:
+    return hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_filepath_id(repo_name: str, filepath: str) -> str:
+    return hashlib.sha1(f"{repo_name}\0{filepath}".encode("utf-8")).hexdigest()[:16]
+
+
+def _canonical_project_path(filepath: str) -> str:
+    if "://" in filepath:
+        return filepath
+    normalized = os.path.normpath(filepath).replace(os.sep, "/")
+    return normalized.removeprefix("./")
+
+
+def _project_path_provenance(project_id: str, filepath: str) -> dict[str, str]:
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"source provenance for {filepath}",
+    )
+    canonical_filepath = _canonical_project_path(filepath)
+    return {
+        "repo": stable_project_id,
+        "filepath": canonical_filepath,
+        "repo_stable_id": _stable_repo_id(stable_project_id),
+        "filepath_stable_id": _stable_filepath_id(
+            stable_project_id,
+            canonical_filepath,
+        ),
+    }
+
+
+def _source_identity_for_project_path(
+    filepath: str,
+    *,
+    project_id: str | None,
+):
+    if project_id is None:
+        return source_identity_for_path(filepath)
+    return source_identity(_project_path_provenance(project_id, filepath))
+
+
 # C++ source file extensions
 CPP_EXTENSIONS = {'.cpp', '.cc', '.cxx', '.c', '.c++', '.cp'}
 HEADER_EXTENSIONS = {
@@ -694,7 +736,20 @@ SYSTEM_PREFIXES = (
 # include libc-style bare names here (memcpy/strlen/...) because those are not in
 # the A1 selection and would only add noise; only the namespaced base libs.
 CROSSLINKABLE_NS_PREFIXES = ('std::', 'boost::')
-_STD_INLINE_NAMESPACE_SEGMENTS = frozenset({'__1', '__2', '__3', '__cxx11'})
+_STD_INLINE_NAMESPACE_SEGMENTS = ('__1', '__2', '__3', '__cxx11', '__ndk1')
+_STD_INLINE_NAMESPACE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])std::(?:"
+    + "|".join(map(re.escape, _STD_INLINE_NAMESPACE_SEGMENTS))
+    + r")::"
+)
+
+
+def _normalize_inline_namespace_text(value: str) -> str:
+    previous = None
+    while value != previous:
+        previous = value
+        value = _STD_INLINE_NAMESPACE_RE.sub("std::", value)
+    return value
 
 
 def normalize_inline_namespace_qname(qname: str) -> str:
@@ -707,16 +762,15 @@ def normalize_inline_namespace_qname(qname: str) -> str:
     """
     if not qname.startswith('std::'):
         return qname
-    return '::'.join(
-        part for part in qname.split('::')
-        if part not in _STD_INLINE_NAMESPACE_SEGMENTS
-    )
+    return _normalize_inline_namespace_text(qname)
 
 
 def _normalize_signature_text(value: str | None) -> str:
     if not value:
         return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
+    return _normalize_inline_namespace_text(
+        re.sub(r"\s+", " ", str(value)).strip()
+    )
 
 
 _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -1075,7 +1129,7 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         "symbol_identity_schema_version": identity_version,
         "symbol_key": key,
         "symbol_id": expected_symbol_id,
-        "qname": qname,
+        "qname": normalize_qualified_name(qname),
         "usr": str(value.get("usr") or ""),
         "canonical_signature": _normalize_signature_text(
             str(value.get("canonical_signature") or "")
@@ -1129,21 +1183,25 @@ class FunctionDef:
                  semantic_def_use: list[int] | None = None,
                  semantic_symbol_identities: list[dict[str, object]] | None = None):
         self.name = name
-        self.qualified_name = qualified_name
+        self.qualified_name = normalize_qualified_name(qualified_name)
         self.file = file
         self.line = line
         self.end_line = end_line or (line + text.count('\n'))
         self.text = text
-        self.callees = callees  # list of qualified names called
+        self.callees = [normalize_qualified_name(value) for value in callees]
         # qualified names of record/enum/typedef types referenced by this
         # function (params, return, locals, member access) -- captured during the
         # SAME libclang parse as callees so it round-trips IPC and feeds the
         # offline type_refs/type_edges builders. Mirrors `callees`.
-        self.referenced_types = list(referenced_types or [])
+        self.referenced_types = [
+            normalize_qualified_name(value) for value in (referenced_types or [])
+        ]
         # Cross-linkable base-lib callees (std::/boost::) dropped from `callees`
         # by the normal system-prefix filter, kept SEPARATELY for the optional
         # cross-repo linker. Empty/ignored unless --global-symbol-index is given.
-        self.baselib_callees = list(baselib_callees or [])
+        self.baselib_callees = [
+            normalize_qualified_name(value) for value in (baselib_callees or [])
+        ]
         self.usr = str(usr or "")
         self.canonical_signature = _normalize_signature_text(canonical_signature)
         self.symbol_kind = str(symbol_kind or "function")
@@ -1248,7 +1306,7 @@ class TypeDef:
                  canonical_signature: str | None = None,
                  symbol_kind: str = "type"):
         self.name = name
-        self.qualified_name = qualified_name
+        self.qualified_name = normalize_qualified_name(qualified_name)
         self.file = file
         self.line = line
         self.end_line = end_line or (line + text.count('\n'))
@@ -1377,6 +1435,7 @@ class ProjectIndex:
         self.macros: dict[str, MacroDef] = {}
         self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
         self.macro_definitions: list[MacroDef] = []
+        self._macro_occurrence_keys: set[tuple[str, str, str, int, int]] = set()
         self.symbol_id_registry = SymbolIdentityRegistry()
         self.symbol_id_keys = self.symbol_id_registry.keys_by_id
 
@@ -1404,14 +1463,16 @@ class ProjectIndex:
         if not macro.name:
             return
         self._register_symbol_key(macro.symbol_key)
-        for existing in self.macros_by_name.get(macro.name, []):
-            if (
-                existing.file == macro.file
-                and existing.line == macro.line
-                and existing.visible_in_file == macro.visible_in_file
-                and existing.sequence == macro.sequence
-            ):
-                return
+        occurrence_key = (
+            macro.name,
+            macro.visible_in_file,
+            macro.file,
+            macro.line,
+            macro.sequence,
+        )
+        if occurrence_key in self._macro_occurrence_keys:
+            return
+        self._macro_occurrence_keys.add(occurrence_key)
         existing = self.macros.get(macro.name)
         if (
             existing is not None
@@ -2014,6 +2075,10 @@ _REFERENCED_TYPE_DECL_KINDS = frozenset({
     CursorKind.TYPE_ALIAS_DECL,
     CursorKind.TYPE_ALIAS_TEMPLATE_DECL,
 })
+_REFERENCED_TYPE_CURSOR_KINDS = frozenset({
+    CursorKind.TYPE_REF,
+    CursorKind.TEMPLATE_REF,
+})
 
 
 def extract_referenced_types(cursor: Cursor) -> list[str]:
@@ -2022,14 +2087,15 @@ def extract_referenced_types(cursor: Cursor) -> list[str]:
 
     Mirrors :func:`extract_callees` but for TYPE relationships — captured during
     the SAME libclang parse pass and persisted on ``FunctionDef.referenced_types``
-    so the offline doc-build path can emit ``type_refs``/``type_edges``. TYPE_REF
-    cursors are clang's explicit type-usage markers; we resolve each to its
-    declaring record/enum/typedef qname and drop system types.
+    so the offline doc-build path can emit ``type_refs``/``type_edges``.
+    TYPE_REF and TEMPLATE_REF cursors are clang's explicit type-usage markers;
+    we resolve each to its declaring record/enum/typedef qname and drop system
+    types.
     """
     types: set[str] = set()
 
     def walk(node: Cursor):
-        if node.kind == CursorKind.TYPE_REF:
+        if node.kind in _REFERENCED_TYPE_CURSOR_KINDS:
             ref = node.referenced
             if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
                 qname = get_qualified_name(ref)
@@ -2072,7 +2138,7 @@ def extract_referenced_type_references(
     refs: dict[str, SymbolReference] = {}
 
     def walk(node: Cursor):
-        if node.kind == CursorKind.TYPE_REF:
+        if node.kind in _REFERENCED_TYPE_CURSOR_KINDS:
             ref = node.referenced
             if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
                 qname = get_qualified_name(ref)
@@ -2681,19 +2747,32 @@ def get_default_compile_args(project_dir: str) -> list[str]:
 
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     """Adapt compile args based on file extension — .c files need C mode, not C++,
-    and headers must be parsed as ``-x c++-header`` (otherwise libclang fails to
-    parse a standalone .h/.hpp as a translation unit)."""
+    and headers need an explicit header language (otherwise libclang can infer
+    the wrong mode for a standalone .h/.hpp translation unit)."""
     ext = os.path.splitext(filepath)[1].lower()
     if ext in HEADER_EXTENSIONS:
-        # Force C++ header mode so struct/class/enum/typedef DEFINITIONS in
-        # header-only files parse and become type-def chunks. Strip any existing
-        # -x <lang> pair / joined -x form first so it doesn't conflict.  Standalone
-        # header parsing must understand C++20/23 header-only declarations
-        # (concepts, inline variable templates) even when the repo has no
-        # compile_commands.json and the old fallback would have been c++17.
+        explicit_language: str | None = None
+        for arg_index, arg in enumerate(args):
+            if arg == '-x' and arg_index + 1 < len(args):
+                explicit_language = args[arg_index + 1].lower()
+            elif arg.startswith('-x') and arg != '-x':
+                explicit_language = arg[2:].lower()
+        is_c_header = explicit_language in {'c', 'c-header'}
+        if explicit_language is None:
+            is_c_header = any(
+                arg.startswith('-std=c') and not arg.startswith('-std=c++')
+                for arg in args
+            )
+
+        # Change only the language form. The compile database or detected project
+        # context owns the dialect flag, including C++20/C++23/C++26.
         adapted = []
         skip_next = False
-        for arg in args:
+        standard_indexes = [
+            index for index, arg in enumerate(args) if arg.startswith('-std=')
+        ]
+        last_standard_index = standard_indexes[-1] if standard_indexes else None
+        for arg_index, arg in enumerate(args):
             if skip_next:
                 skip_next = False
                 continue
@@ -2702,10 +2781,11 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 continue
             if arg.startswith('-x') and arg != '-x':
                 continue
-            if arg.startswith('-std='):
+            if arg.startswith('-std=') and arg_index != last_standard_index:
                 continue
             adapted.append(arg)
-        return ['-x', 'c++-header', '-std=c++23'] + adapted
+        header_language = 'c-header' if is_c_header else 'c++-header'
+        return ['-x', header_language] + adapted
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
@@ -3222,7 +3302,6 @@ _CALL_KINDS = {
 _TYPE_REF_KINDS = {
     CursorKind.TYPE_REF,
     CursorKind.TEMPLATE_REF,
-    CursorKind.NAMESPACE_REF,
 }
 
 _REFERENCE_KINDS = {
@@ -3252,9 +3331,9 @@ def extract_semantic_metadata(
 
     - symbol_ids:   per-char deterministic hash of the symbol's qualified name
                     (0 = no symbol)
-    - call_targets: per-char symbol ID of the call target for CALL_EXPR tokens
+    - call_targets: per-char symbol ID on the explicit callee token
                     (0 = not a call)
-    - type_refs:    per-char symbol ID of the referenced type for TYPE_REF tokens
+    - type_refs:    per-char symbol ID on TYPE_REF/TEMPLATE_REF name tokens
                     (0 = not a type reference)
     - def_use:      per-char def/use marker (0=none, 1=def, 2=use)
 
@@ -3314,6 +3393,92 @@ def extract_semantic_metadata(
             ),
         )
 
+    def _char_span(byte_start: int, byte_end: int) -> tuple[int, int] | None:
+        char_start = _byte_to_char_offset(byte_start)
+        char_end = _byte_to_char_offset(byte_end)
+        if char_start >= text_len or char_start >= char_end:
+            return None
+        return char_start, min(char_end, text_len)
+
+    def _cursor_name_spans(cursor: Cursor, spelling: str) -> list[tuple[int, int]]:
+        """Return only the source token(s) that spell a cursor's name."""
+        if not spelling:
+            return []
+        location = getattr(cursor, "location", None)
+        raw_location_offset = getattr(location, "offset", None)
+        location_offset = (
+            int(raw_location_offset) if raw_location_offset is not None else -1
+        )
+        spelling_bytes = spelling.encode("utf-8")
+        if (
+            location_offset >= 0
+            and source_bytes[location_offset:location_offset + len(spelling_bytes)]
+            == spelling_bytes
+        ):
+            span = _char_span(
+                location_offset,
+                location_offset + len(spelling_bytes),
+            )
+            return [span] if span is not None else []
+
+        token_spellings = {spelling}
+        if spelling.startswith("operator"):
+            operator_token = spelling.removeprefix("operator").strip()
+            if operator_token:
+                token_spellings.add(operator_token)
+        matches: list[tuple[int, int]] = []
+        for token in cursor.get_tokens():
+            if token.spelling not in token_spellings:
+                continue
+            span = _char_span(token.extent.start.offset, token.extent.end.offset)
+            if span is not None:
+                matches.append(span)
+        return matches[:1]
+
+    def _symbol_key_for_reference(ref: Cursor) -> str:
+        return symbol_identity_for_cursor(
+            ref,
+            project_dir=project_dir,
+            project=stable_project_id,
+            fallback_file=fallback_file,
+        )[0]
+
+    def _call_target_spans(
+        call_cursor: Cursor,
+        target: Cursor,
+        target_key: str,
+    ) -> list[tuple[int, int]]:
+        def find_reference(node: Cursor) -> list[tuple[int, int]]:
+            for child in node.get_children():
+                if child.kind in _REFERENCE_KINDS:
+                    child_target = child.referenced
+                    if (
+                        child_target is not None
+                        and child_target.spelling
+                        and _symbol_key_for_reference(child_target) == target_key
+                    ):
+                        spans = _cursor_name_spans(child, child_target.spelling)
+                        if spans:
+                            return spans
+                if child.kind not in _CALL_KINDS:
+                    spans = find_reference(child)
+                    if spans:
+                        return spans
+            return []
+
+        return find_reference(call_cursor) or _cursor_name_spans(
+            call_cursor,
+            target.spelling,
+        )
+
+    def _annotate(
+        values: list[int],
+        spans: Iterable[tuple[int, int]],
+        value: int,
+    ) -> None:
+        for span_start, span_end in spans:
+            values[span_start:span_end] = [value] * (span_end - span_start)
+
     def _visit(cursor):
         """Walk the AST and annotate char ranges."""
         loc = cursor.location
@@ -3322,22 +3487,6 @@ def extract_semantic_metadata(
         if loc.file.name != filename:
             return
 
-        extent = cursor.extent
-        if not extent:
-            return
-
-        start_offset = extent.start.offset
-        end_offset = extent.end.offset
-        if start_offset >= end_offset:
-            return
-
-        # Convert to char offsets
-        char_start = _byte_to_char_offset(start_offset)
-        char_end = _byte_to_char_offset(end_offset)
-        if char_start >= text_len or char_start >= char_end:
-            return
-
-        char_end = min(char_end, text_len)
         kind = cursor.kind
 
         # Symbol identification: get qualified name for definitions and refs
@@ -3352,9 +3501,9 @@ def extract_semantic_metadata(
                     fallback_file=fallback_file,
                 )
                 sym_id = _register_symbol_key(symbol_key, cursor)
-                for ci in range(char_start, char_end):
-                    symbol_ids[ci] = sym_id
-                    def_use[ci] = DEF_USE_DEF
+                spans = _cursor_name_spans(cursor, cursor.spelling)
+                _annotate(symbol_ids, spans, sym_id)
+                _annotate(def_use, spans, DEF_USE_DEF)
 
         elif kind in _REFERENCE_KINDS:
             ref = cursor.referenced
@@ -3368,9 +3517,9 @@ def extract_semantic_metadata(
                         fallback_file=fallback_file,
                     )
                     sym_id = _register_symbol_key(symbol_key, ref)
-                    for ci in range(char_start, char_end):
-                        symbol_ids[ci] = sym_id
-                        def_use[ci] = DEF_USE_USE
+                    spans = _cursor_name_spans(cursor, ref.spelling)
+                    _annotate(symbol_ids, spans, sym_id)
+                    _annotate(def_use, spans, DEF_USE_USE)
 
         # Call target annotation
         if kind in _CALL_KINDS:
@@ -3385,8 +3534,11 @@ def extract_semantic_metadata(
                         fallback_file=fallback_file,
                     )
                     target_id = _register_symbol_key(symbol_key, ref)
-                    for ci in range(char_start, char_end):
-                        call_targets[ci] = target_id
+                    _annotate(
+                        call_targets,
+                        _call_target_spans(cursor, ref, symbol_key),
+                        target_id,
+                    )
 
         # Type reference annotation
         if kind in _TYPE_REF_KINDS:
@@ -3401,8 +3553,11 @@ def extract_semantic_metadata(
                         fallback_file=fallback_file,
                     )
                     ref_id = _register_symbol_key(symbol_key, ref)
-                    for ci in range(char_start, char_end):
-                        type_refs[ci] = ref_id
+                    _annotate(
+                        type_refs,
+                        _cursor_name_spans(cursor, ref.spelling),
+                        ref_id,
+                    )
 
         # Recurse into children
         for child in cursor.get_children():
@@ -3444,6 +3599,26 @@ def extract_semantic_metadata_from_parts(
     call_targets = [0] * text_len
     type_refs = [0] * text_len
     def_use_arr = [0] * text_len
+
+    def _named_token_spans(text: str, name: str) -> list[tuple[int, int]]:
+        simple_name = name.split("::")[-1]
+        if not simple_name:
+            return []
+        return [
+            (match.start(), match.end())
+            for match in _iter_code_identifiers(text)
+            if match.group(0) == simple_name
+        ]
+
+    def _annotate_part_spans(
+        values: list[int],
+        spans: Iterable[tuple[int, int]],
+        value: int,
+        *,
+        part_offset: int,
+    ) -> None:
+        for start, end in spans:
+            values[part_offset + start:part_offset + end] = [value] * (end - start)
 
     offset = 0
     for i, part in enumerate(parts_info):
@@ -3494,10 +3669,29 @@ def extract_semantic_metadata_from_parts(
                 def_use_arr[offset:offset + part_len] = func_def.semantic_def_use[:]
             elif not exact_applied and symbol_key:
                 sym_id = _compute_symbol_id(symbol_key)
-                # Function/type parts are definition sites.
-                for ci in range(offset, offset + part_len):
-                    symbol_ids[ci] = sym_id
-                    def_use_arr[ci] = DEF_USE_DEF
+                definition_spans = _named_token_spans(part_text, str(part[3]))
+                if func_def is not None and definition_spans:
+                    open_paren = part_text.find("(")
+                    before_parameters = [
+                        span for span in definition_spans if span[0] < open_paren
+                    ]
+                    definition_spans = [
+                        (before_parameters or definition_spans)[-1]
+                    ]
+                elif definition_spans:
+                    definition_spans = definition_spans[:1]
+                _annotate_part_spans(
+                    symbol_ids,
+                    definition_spans,
+                    sym_id,
+                    part_offset=offset,
+                )
+                _annotate_part_spans(
+                    def_use_arr,
+                    definition_spans,
+                    DEF_USE_DEF,
+                    part_offset=offset,
+                )
 
             if (
                 not exact_applied
@@ -3507,15 +3701,12 @@ def extract_semantic_metadata_from_parts(
                 def _mark(arr, name, value):
                     if not name or not value:
                         return
-                    s = 0
-                    plen = len(name)
-                    while True:
-                        idx = part_text.find(name, s)
-                        if idx < 0:
-                            break
-                        for ci in range(offset + idx, min(offset + idx + plen, offset + part_len)):
-                            arr[ci] = value
-                        s = idx + plen
+                    _annotate_part_spans(
+                        arr,
+                        _named_token_spans(part_text, name),
+                        value,
+                        part_offset=offset,
+                    )
                 for callee_qname in func_def.callees:
                     callee_key = index.resolve_function_key(callee_qname)
                     if callee_key is None:
@@ -3553,6 +3744,115 @@ def extract_semantic_metadata_from_parts(
 
 
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_RAW_LITERAL_PREFIXES = ('u8R"', 'uR"', 'UR"', 'LR"', 'R"')
+_QUOTED_LITERAL_PREFIXES = (
+    'u8"', "u8'", 'u"', "u'", 'U"', "U'", 'L"', "L'", '"', "'",
+)
+_IDENTIFIER_CHARS = frozenset(
+    "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+
+
+def _mask_non_code(text: str) -> str:
+    """Blank comments and literals while preserving offsets and newlines."""
+    masked = list(text)
+    text_len = len(text)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, min(end, text_len)):
+            if text[index] not in "\r\n":
+                masked[index] = " "
+
+    def prefixed_at(index: int, prefixes: Sequence[str]) -> str | None:
+        for prefix in prefixes:
+            if not text.startswith(prefix, index):
+                continue
+            if (
+                prefix[0].isalpha()
+                and index > 0
+                and text[index - 1] in _IDENTIFIER_CHARS
+            ):
+                continue
+            return prefix
+        return None
+
+    def include_literal_suffix(end: int) -> int:
+        while end < text_len and text[end] in _IDENTIFIER_CHARS:
+            end += 1
+        return end
+
+    index = 0
+    while index < text_len:
+        if text.startswith("//", index):
+            end = index + 2
+            while True:
+                newline = text.find("\n", end)
+                if newline < 0:
+                    end = text_len
+                    break
+                slash_index = newline - 1
+                if slash_index >= index and text[slash_index] == "\r":
+                    slash_index -= 1
+                continued = slash_index >= index and text[slash_index] == "\\"
+                end = newline + 1
+                if not continued:
+                    break
+            blank(index, end)
+            index = end
+            continue
+
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            end = text_len if close < 0 else close + 2
+            blank(index, end)
+            index = end
+            continue
+
+        raw_prefix = prefixed_at(index, _RAW_LITERAL_PREFIXES)
+        if raw_prefix is not None:
+            delimiter_start = index + len(raw_prefix)
+            open_paren = text.find("(", delimiter_start, delimiter_start + 17)
+            if open_paren >= 0:
+                delimiter = text[delimiter_start:open_paren]
+                if not any(char in " ()\\\t\v\f\r\n" for char in delimiter):
+                    marker = ")" + delimiter + '"'
+                    close = text.find(marker, open_paren + 1)
+                    end = text_len if close < 0 else close + len(marker)
+                    end = include_literal_suffix(end)
+                    blank(index, end)
+                    index = end
+                    continue
+
+        quoted_prefix = prefixed_at(index, _QUOTED_LITERAL_PREFIXES)
+        if quoted_prefix is not None:
+            quote = quoted_prefix[-1]
+            end = index + len(quoted_prefix)
+            while end < text_len:
+                char = text[end]
+                if char == "\\":
+                    if end + 1 < text_len and text[end + 1] == "\r":
+                        end += 3 if end + 2 < text_len and text[end + 2] == "\n" else 2
+                    else:
+                        end += 2
+                    continue
+                if char == quote:
+                    end += 1
+                    break
+                if char in "\r\n":
+                    break
+                end += 1
+            end = include_literal_suffix(end)
+            blank(index, end)
+            index = end
+            continue
+
+        index += 1
+
+    return "".join(masked)
+
+
+def _iter_code_identifiers(text: str) -> Iterator[re.Match[str]]:
+    return _IDENTIFIER_RE.finditer(_mask_non_code(text))
 
 
 def _apply_char_span(values: list[int], start: int, end: int, value: int) -> None:
@@ -3639,7 +3939,7 @@ def _macro_body_dependency_names(
     out: list[str] = []
     seen: set[str] = set()
     body = source[body_start:]
-    for match in _IDENTIFIER_RE.finditer(body):
+    for match in _iter_code_identifiers(body):
         dep_name = match.group(0)
         if dep_name in ignored or dep_name.lower() in _CONDITION_SKIP_IDENTIFIERS:
             continue
@@ -3696,7 +3996,7 @@ def _macro_route_part(
         condition_spans: list[dict[str, object]] = []
         if condition_name_set:
             prefix = part_text[:start]
-            for match in _IDENTIFIER_RE.finditer(prefix):
+            for match in _iter_code_identifiers(prefix):
                 if match.group(0) not in condition_name_set:
                     continue
                 condition_spans.append(
@@ -3771,7 +4071,7 @@ def _macro_invocation_route_parts(
         (start, end) for start, end, _name, _macro_text in extract_macro_blocks(part_text)
     ]
     routes: list[dict[str, object]] = []
-    for match in _IDENTIFIER_RE.finditer(part_text):
+    for match in _iter_code_identifiers(part_text):
         if any(start <= match.start() < end for start, end in macro_ranges):
             continue
         source_line = _source_line_for_text_offset(
@@ -3804,7 +4104,10 @@ def _cpp_domain_sidecars(
     *,
     source_doc_id: int | None = None,
     source_path: str = "assembled.cpp",
-    fragment_sources: list[tuple[int, int, str, int]] | None = None,
+    project_id: str | None = None,
+    fragment_sources: list[
+        tuple[int, int, str, int] | tuple[int, int, str, int, str | None]
+    ] | None = None,
     macro_parts: list[dict[str, object]] | None = None,
     macro_invocations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -3842,7 +4145,7 @@ def _cpp_domain_sidecars(
         for line_match in re.finditer(r"(?m)^\s*#\s*(if|ifdef|ifndef|elif)\b.*$", prefix):
             line = line_match.group(0)
             abs_line_start = block_start + line_match.start()
-            for ident in _IDENTIFIER_RE.finditer(line):
+            for ident in _iter_code_identifiers(line):
                 name = ident.group(0)
                 if name.lower() in _CONDITION_SKIP_IDENTIFIERS or name in {
                     "if",
@@ -3885,7 +4188,7 @@ def _cpp_domain_sidecars(
             )
             _apply_char_span(entity_ids, start + param_start, start + param_end, param_entity)
             body = macro_text[body_start:]
-            for use in _IDENTIFIER_RE.finditer(body):
+            for use in _iter_code_identifiers(body):
                 if use.group(0) != param_name:
                     continue
                 use_start = start + body_start + use.start()
@@ -4112,7 +4415,7 @@ def _cpp_domain_sidecars(
             )
             routed_invocation_spans.add((use_start, use_end))
 
-        for match in _IDENTIFIER_RE.finditer(text):
+        for match in _iter_code_identifiers(text):
             if (match.start(), match.end()) in routed_invocation_spans:
                 continue
             definitions = by_name.get(match.group(0), [])
@@ -4148,7 +4451,7 @@ def _cpp_domain_sidecars(
                 )
 
     if not use_precise_macro_graph and index is not None and macro_definitions_by_name:
-        for match in _IDENTIFIER_RE.finditer(text):
+        for match in _iter_code_identifiers(text):
             definitions = macro_definitions_by_name.get(match.group(0), [])
             if not definitions:
                 continue
@@ -4193,8 +4496,13 @@ def _cpp_domain_sidecars(
         source_doc_ids = [0] * text_len
         source_identity_ids = [0] * text_len
         registry: dict[int, dict[str, int | str]] = {}
-        for start, end, fragment_path, row_local_id in fragment_sources:
-            identity = source_identity_for_path(fragment_path)
+        for fragment in fragment_sources:
+            start, end, fragment_path, row_local_id = fragment[:4]
+            fragment_project_id = fragment[4] if len(fragment) >= 5 else project_id
+            identity = _source_identity_for_project_path(
+                fragment_path,
+                project_id=fragment_project_id,
+            )
             entry = identity.as_dict()
             previous = registry.get(identity.source_identity_id)
             if previous is not None and previous != entry:
@@ -4260,6 +4568,8 @@ def build_enriched_doc(
     filepath: str | None = None,
     compile_args: list[str] | None = None,
     build_info: dict | None = None,
+    *,
+    project_id: str | None = None,
 ) -> dict:
     """Build enriched document from parts with metadata.
 
@@ -4273,6 +4583,11 @@ def build_enriched_doc(
         dict with text, structure_ids, chunk_boundaries, call_edges, type_edges,
         ast_depth, sibling_index, ast_node_type
     """
+    stable_project_id = (
+        require_project_identity(project_id, source="build_enriched_doc")
+        if project_id is not None
+        else None
+    )
     texts = [p[0] for p in parts_info]
     full_text = '\n\n'.join(texts)
     text_len = len(full_text)
@@ -4386,7 +4701,7 @@ def build_enriched_doc(
         key = candidates[0].get("symbol_key")
         return key if isinstance(key, str) and key else None
 
-    fragment_sources: list[tuple[int, int, str, int]] = []
+    fragment_sources: list[tuple[int, int, str, int, str | None]] = []
 
     for i, part in enumerate(parts_info):
         part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
@@ -4403,6 +4718,14 @@ def build_enriched_doc(
                 fragment_end,
                 _part_source_path(part, index, filepath or "assembled.cpp"),
                 i + 1,
+                (
+                    require_project_identity(
+                        dep_source.removeprefix("crosslib:"),
+                        source=f"crosslib source for {name}",
+                    )
+                    if dep_source is not None and dep_source.startswith("crosslib:")
+                    else stable_project_id
+                ),
             )
         )
 
@@ -4570,11 +4893,19 @@ def build_enriched_doc(
             index,
             source_doc_id=1,
             source_path=filepath or "assembled.cpp",
+            project_id=stable_project_id,
             fragment_sources=fragment_sources,
             macro_parts=macro_route_parts,
             macro_invocations=macro_invocation_routes,
         ),
     }
+    if stable_project_id is not None:
+        result.update(
+            _project_path_provenance(
+                stable_project_id,
+                filepath or "assembled.cpp",
+            )
+        )
     language_info = detect_language_info(
         full_text,
         filepath,
@@ -4608,6 +4939,7 @@ def _build_domain_sidecars(
     *,
     filepath: str | None = None,
     source_doc_id: int,
+    project_id: str | None = None,
 ) -> dict[str, object]:
     """Parse build-system text into char-aligned domain sidecars.
 
@@ -4623,7 +4955,11 @@ def _build_domain_sidecars(
         parse_domain_document,
         resolve_domain_parser,
     )
-    from cppmega_mlx.data.domain_schema import DomainKind, ParseConfidence
+    from cppmega_mlx.data.domain_schema import (
+        DomainKind,
+        ParseConfidence,
+        domain_edge_family,
+    )
 
     kind = build_kind.lower().replace("-", "_")
     parser_path_by_kind = {
@@ -4691,6 +5027,20 @@ def _build_domain_sidecars(
         )
 
     enriched = parsed.to_enriched_document()
+    enriched["domain_edges"] = [
+        edge
+        for edge in cast(list[dict[str, int]], enriched["domain_edges"])
+        if domain_edge_family(int(edge["kind"])) == "domain"
+    ]
+    if project_id is not None and resolved_path is not None:
+        identity = _source_identity_for_project_path(
+            resolved_path,
+            project_id=project_id,
+        )
+        enriched["domain_source_identity_ids"] = [
+            identity.source_identity_id
+        ] * len(text)
+        enriched["source_identity_registry"] = [identity.as_dict()]
     enriched["domain_parse_info"].update(
         {
             "parser": parsed.metadata.get("parser_adapter", "raw-build"),
@@ -4707,6 +5057,7 @@ def build_build_doc(
     build_kind: str,
     *,
     source_root: str | None = None,
+    project_id: str | None = None,
     platform_info: dict | None = None,
     build_info: dict | None = None,
 ) -> dict:
@@ -4716,13 +5067,29 @@ def build_build_doc(
     before this function is called: they carry no training signal and should not
     make an otherwise valid C/C++ repo fail indexing.
     """
+    emitted_filepath = filepath
+    if source_root is not None:
+        absolute_root = os.path.abspath(source_root)
+        absolute_file = os.path.abspath(filepath)
+        try:
+            if os.path.commonpath((absolute_root, absolute_file)) == absolute_root:
+                emitted_filepath = os.path.relpath(absolute_file, absolute_root)
+        except ValueError:
+            pass
+    emitted_filepath = _canonical_project_path(emitted_filepath)
+    stable_project_id = (
+        require_project_identity(project_id, source="build_build_doc")
+        if project_id is not None
+        else None
+    )
     text_len = len(text)
     source_doc_id = 1
     domain_sidecars = _build_domain_sidecars(
         text,
         build_kind,
-        filepath=filepath,
+        filepath=emitted_filepath,
         source_doc_id=source_doc_id,
+        project_id=stable_project_id,
     )
     structure_ids = [BUILD_KIND] * text_len
     chunk_boundaries = [{
@@ -4730,7 +5097,7 @@ def build_build_doc(
         'end': text_len,
         'kind': BUILD_KIND,
         'dep_level': 0,
-        'name': os.path.basename(filepath),
+        'name': os.path.basename(emitted_filepath),
     }]
 
     # Per-file platform detection from the build text itself (additive to the
@@ -4787,6 +5154,8 @@ def build_build_doc(
     result: dict[str, object] = {
         'text': text,
         'doc_type': doc_type,
+        'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: [],
         'source_identity_id': int(
             cast(
                 int,
@@ -4797,7 +5166,7 @@ def build_build_doc(
             )
         ),
         'build_kind': build_kind,
-        'filepath': filepath,
+        'filepath': emitted_filepath,
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
         # Build files carry NO call/type/symbol graph (not C++) -- empty/0, like
@@ -4814,6 +5183,10 @@ def build_build_doc(
         'language_info': language_info,
         **domain_sidecars,
     }
+    if stable_project_id is not None:
+        result.update(
+            _project_path_provenance(stable_project_id, emitted_filepath)
+        )
     if detected_platform:
         result['platform_info'] = detected_platform
     if build_info:
@@ -4830,6 +5203,18 @@ _ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
 DEFAULT_MACRO_INCLUDE_DEPTH = int(os.environ.get("CPPMEGA_MACRO_INCLUDE_DEPTH", "0"))
 DEFAULT_MACRO_INCLUDE_FILES_PER_ROOT = int(
     os.environ.get("CPPMEGA_MACRO_INCLUDE_FILES_PER_ROOT", "0")
+)
+DEFAULT_MACRO_DIRECTIVE_CACHE_ENTRIES = int(
+    os.environ.get("CPPMEGA_MACRO_DIRECTIVE_CACHE_ENTRIES", "4096")
+)
+DEFAULT_MACRO_RESOLVE_CACHE_ENTRIES = int(
+    os.environ.get("CPPMEGA_MACRO_RESOLVE_CACHE_ENTRIES", "65536")
+)
+DEFAULT_MAX_MACRO_CANDIDATES_PER_ROOT = int(
+    os.environ.get("CPPMEGA_MAX_MACRO_CANDIDATES_PER_ROOT", "200000")
+)
+DEFAULT_MAX_RETAINED_MACROS = int(
+    os.environ.get("CPPMEGA_MAX_RETAINED_MACROS", "250000")
 )
 _CONDITION_SKIP_IDENTIFIERS = {
     "defined",
@@ -4877,6 +5262,7 @@ def _is_probable_include_guard_define(macro_text: str, name: str) -> bool:
 def extract_macro_blocks(text: str) -> list[tuple[int, int, str, str]]:
     """Return trainable ``#define`` logical lines, preserving continuations."""
     lines = text.splitlines(keepends=True)
+    code_lines = _mask_non_code(text).splitlines(keepends=True)
     blocks: list[tuple[int, int, str, str]] = []
     offset = 0
     line_offsets: list[int] = []
@@ -4887,7 +5273,7 @@ def extract_macro_blocks(text: str) -> list[tuple[int, int, str, str]]:
     i = 0
     while i < len(lines):
         line = lines[i]
-        match = _DEFINE_RE.match(line)
+        match = _DEFINE_RE.match(code_lines[i])
         if match is None:
             i += 1
             continue
@@ -4914,10 +5300,10 @@ def _condition_macro_names(line: str) -> list[str]:
     directive = match.group(1)
     rest = match.group(2)
     if directive in {"ifdef", "ifndef"}:
-        ident = _IDENTIFIER_RE.search(rest)
+        ident = next(_iter_code_identifiers(rest), None)
         return [ident.group(0)] if ident else []
     names: list[str] = []
-    for ident in _IDENTIFIER_RE.finditer(rest):
+    for ident in _iter_code_identifiers(rest):
         name = ident.group(0)
         if name.lower() in _CONDITION_SKIP_IDENTIFIERS:
             continue
@@ -5061,6 +5447,14 @@ def register_header_macros(
     max_include_depth: int | None = None,
     max_include_files_per_root: int | None = None,
     memory_limit_gb: float | None = None,
+    macro_usage_texts_by_file: dict[
+        str,
+        Sequence[str | tuple[str, int | None]],
+    ] | None = None,
+    directive_cache_entries: int | None = None,
+    resolve_cache_entries: int | None = None,
+    max_macro_candidates_per_root: int | None = None,
+    max_retained_macros: int | None = None,
 ) -> dict[str, int]:
     stable_project_id = require_project_identity(
         project_id,
@@ -5083,11 +5477,48 @@ def register_header_macros(
         if max_include_files_per_root is None
         else int(max_include_files_per_root)
     )
+    directive_cache_entries = (
+        DEFAULT_MACRO_DIRECTIVE_CACHE_ENTRIES
+        if directive_cache_entries is None
+        else int(directive_cache_entries)
+    )
+    resolve_cache_entries = (
+        DEFAULT_MACRO_RESOLVE_CACHE_ENTRIES
+        if resolve_cache_entries is None
+        else int(resolve_cache_entries)
+    )
+    max_macro_candidates_per_root = (
+        DEFAULT_MAX_MACRO_CANDIDATES_PER_ROOT
+        if max_macro_candidates_per_root is None
+        else int(max_macro_candidates_per_root)
+    )
+    max_retained_macros = (
+        DEFAULT_MAX_RETAINED_MACROS
+        if max_retained_macros is None
+        else int(max_retained_macros)
+    )
     if max_include_depth < 0:
         raise ValueError(f"max_include_depth must be >= 0, got {max_include_depth}")
     if max_include_files_per_root < 0:
         raise ValueError(
             f"max_include_files_per_root must be >= 0, got {max_include_files_per_root}"
+        )
+    if directive_cache_entries < 0:
+        raise ValueError(
+            f"directive_cache_entries must be >= 0, got {directive_cache_entries}"
+        )
+    if resolve_cache_entries < 0:
+        raise ValueError(
+            f"resolve_cache_entries must be >= 0, got {resolve_cache_entries}"
+        )
+    if max_macro_candidates_per_root <= 0:
+        raise ValueError(
+            "max_macro_candidates_per_root must be > 0, got "
+            f"{max_macro_candidates_per_root}"
+        )
+    if max_retained_macros <= 0:
+        raise ValueError(
+            f"max_retained_macros must be > 0, got {max_retained_macros}"
         )
 
     def _check_memory() -> None:
@@ -5101,26 +5532,74 @@ def register_header_macros(
             else path
         )
 
+    derived_usage_texts: defaultdict[
+        str,
+        list[str | tuple[str, int | None]],
+    ] = defaultdict(list)
+    for function in index.functions.values():
+        if function.text:
+            derived_usage_texts[os.path.normpath(function.file)].append(
+                (function.text, function.line)
+            )
+    for type_def in index.typedefs.values():
+        if type_def.file and type_def.text:
+            derived_usage_texts[os.path.normpath(type_def.file)].append(
+                (type_def.text, type_def.line)
+            )
+    for file, preamble in index.file_preambles.items():
+        if preamble:
+            derived_usage_texts[os.path.normpath(file)].append((preamble, 1))
+
+    explicit_usage_texts = {
+        os.path.normpath(file): list(texts)
+        for file, texts in (macro_usage_texts_by_file or {}).items()
+    }
+
+    def _usage_texts_for_root(
+        root_abs: str,
+        root_rel: str,
+    ) -> list[str | tuple[str, int | None]]:
+        normalized_rel = os.path.normpath(root_rel)
+        if normalized_rel in explicit_usage_texts:
+            return explicit_usage_texts[normalized_rel]
+        derived = derived_usage_texts.get(normalized_rel)
+        if derived:
+            return list(derived)
+        try:
+            with open(root_abs, "r", encoding="utf-8", errors="replace") as fh:
+                return [(fh.read(), 1)]
+        except OSError as exc:
+            raise RuntimeError(
+                f"failed to read C/C++ macro root for usage scan: {root_abs}"
+            ) from exc
+
     def _directive_events(norm_abs: str) -> list[dict[str, object]]:
-        cached = directive_cache.get(norm_abs)
+        cached = directive_cache.pop(norm_abs, None)
         if cached is not None:
+            directive_cache[norm_abs] = cached
             stats["directive_cache_hits"] += 1
             return cached
         try:
             with open(norm_abs, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
+                file_text = fh.read()
         except OSError as exc:
             raise RuntimeError(f"failed to read C/C++ file for macro scan: {norm_abs}") from exc
 
+        lines = file_text.splitlines(keepends=True)
+        code_lines = _mask_non_code(file_text).splitlines(keepends=True)
         stats["directive_file_reads"] += 1
         events: list[dict[str, object]] = []
         i = 0
         while i < len(lines):
             line = lines[i]
+            code_line = code_lines[i]
             line_no = i + 1
 
             include_match = _INCLUDE_RE.match(line)
-            if include_match is not None:
+            if include_match is not None and re.match(
+                r"^\s*#\s*include\b",
+                code_line,
+            ):
                 events.append(
                     {
                         "kind": "include",
@@ -5131,20 +5610,20 @@ def register_header_macros(
                 i += 1
                 continue
 
-            if _ENDIF_RE.match(line):
+            if _ENDIF_RE.match(code_line):
                 events.append({"kind": "endif"})
                 i += 1
                 continue
-            if _ELSE_RE.match(line):
-                events.append({"kind": "else", "line": line})
+            if _ELSE_RE.match(code_line):
+                events.append({"kind": "else", "line": line, "code_line": code_line})
                 i += 1
                 continue
-            if _IF_RE.match(line) is not None:
-                events.append({"kind": "if", "line": line})
+            if _IF_RE.match(code_line) is not None:
+                events.append({"kind": "if", "line": line, "code_line": code_line})
                 i += 1
                 continue
 
-            undef_match = _UNDEF_RE.match(line)
+            undef_match = _UNDEF_RE.match(code_line)
             if undef_match is not None:
                 events.append(
                     {
@@ -5156,7 +5635,7 @@ def register_header_macros(
                 i += 1
                 continue
 
-            define_match = _DEFINE_RE.match(line)
+            define_match = _DEFINE_RE.match(code_line)
             if define_match is None:
                 i += 1
                 continue
@@ -5183,14 +5662,24 @@ def register_header_macros(
                     }
                 )
             i = end_line + 1
-        directive_cache[norm_abs] = events
+        if directive_cache_entries:
+            directive_cache[norm_abs] = events
+            while len(directive_cache) > directive_cache_entries:
+                directive_cache.pop(next(iter(directive_cache)))
+                stats["directive_cache_evictions"] += 1
+            stats["directive_cache_peak_entries"] = max(
+                stats["directive_cache_peak_entries"],
+                len(directive_cache),
+            )
         return events
 
     def _resolve_include_cached(include_name: str, *, current_abs: str) -> str | None:
         key = (include_name, os.path.dirname(current_abs))
         if key in resolve_cache:
+            resolved = resolve_cache.pop(key)
+            resolve_cache[key] = resolved
             stats["include_resolve_cache_hits"] += 1
-            return resolve_cache[key]
+            return resolved
         resolved = _resolve_local_include(
             include_name,
             current_abs=current_abs,
@@ -5198,7 +5687,15 @@ def register_header_macros(
             include_dirs=include_dirs,
             known_local_files=local_file_index,
         )
-        resolve_cache[key] = resolved
+        if resolve_cache_entries:
+            resolve_cache[key] = resolved
+            while len(resolve_cache) > resolve_cache_entries:
+                resolve_cache.pop(next(iter(resolve_cache)))
+                stats["resolve_cache_evictions"] += 1
+            stats["resolve_cache_peak_entries"] = max(
+                stats["resolve_cache_peak_entries"],
+                len(resolve_cache),
+            )
         return resolved
 
     def _scan_root(root_abs: str, root_rel: str) -> None:
@@ -5208,16 +5705,45 @@ def register_header_macros(
             print(
                 "  Macro scan heartbeat: "
                 f"roots={stats['roots']} scanned_files={stats['scanned_files']} "
-                f"registered={stats['registered_macros']} "
+                f"discovered={stats['discovered_macro_occurrences']} "
+                f"retained={stats['registered_macros']} "
                 f"resolve_cache_hits={stats['include_resolve_cache_hits']}",
                 file=sys.stderr,
                 flush=True,
             )
+        root_index = ProjectIndex()
+        root_macro_objects = 0
+        root_discovered_macros = 0
         visited_files: set[str] = set()
         active_defs: dict[str, MacroDef] = {}
+        active_macro_texts: dict[str, str] = {}
         last_defs: dict[str, MacroDef] = {}
         pending_undef: dict[str, str] = {}
         condition_stack: list[dict[str, object]] = []
+        usage_names = {
+            match.group(0)
+            for item in _usage_texts_for_root(root_abs, root_rel)
+            for match in _iter_code_identifiers(
+                str(item[0]) if isinstance(item, tuple) else str(item)
+            )
+        }
+        relevant_names = set(usage_names)
+
+        def _count_macro_object() -> None:
+            nonlocal root_macro_objects
+            root_macro_objects += 1
+            stats["peak_root_macro_candidates"] = max(
+                stats["peak_root_macro_candidates"],
+                root_macro_objects,
+            )
+            if root_macro_objects > max_macro_candidates_per_root:
+                raise MemoryError(
+                    "macro scan exceeded the per-root candidate bound: "
+                    f"root={root_rel} candidates={root_macro_objects} "
+                    f"limit={max_macro_candidates_per_root}. "
+                    "Raise CPPMEGA_MAX_MACRO_CANDIDATES_PER_ROOT only after "
+                    "profiling this include graph."
+                )
 
         def _conditions_active() -> bool:
             return all(bool(item["active"]) for item in condition_stack)
@@ -5229,13 +5755,13 @@ def register_header_macros(
             return [str(item.get("line", ""))]
 
         def _macro_value(name: str) -> int:
-            macro = active_defs.get(name)
-            if macro is None:
+            macro_text = active_macro_texts.get(name)
+            if macro_text is None:
                 return 0
-            parsed = _parse_macro_signature(macro.text)
+            parsed = _parse_macro_signature(macro_text)
             if parsed is None:
                 return 1
-            body = macro.text[parsed[3]:].strip()
+            body = macro_text[parsed[3]:].strip()
             if body in {"", "true", "TRUE"}:
                 return 1
             if body in {"false", "FALSE"}:
@@ -5252,7 +5778,7 @@ def register_header_macros(
         def _eval_expr(rest: str) -> bool:
             def repl_defined(match: re.Match[str]) -> str:
                 name = match.group(1) or match.group(2)
-                return "1" if name in active_defs else "0"
+                return "1" if name in active_macro_texts else "0"
 
             expr = re.sub(
                 r"\bdefined\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)"
@@ -5296,15 +5822,103 @@ def register_header_macros(
             rest = match.group(2)
             names = _condition_macro_names(line)
             if directive == "ifdef":
-                return (names[0] in active_defs if names else False), names
+                return (names[0] in active_macro_texts if names else False), names
             if directive == "ifndef":
-                return (names[0] not in active_defs if names else True), names
+                return (names[0] not in active_macro_texts if names else True), names
             stripped = rest.strip()
             if stripped in {"0", "(0)"}:
                 return False, names
             if stripped in {"1", "(1)"}:
                 return True, names
             return _eval_expr(rest), names
+
+        def _expand_relevant_names() -> None:
+            """Resolve replacement/condition dependencies without MacroDef objects."""
+
+            while True:
+                before = len(relevant_names)
+                discovery_visited: set[str] = set()
+                discovery_conditions: list[list[str]] = []
+
+                def walk(
+                    abs_path: str,
+                    *,
+                    include_stack: set[str],
+                    depth: int,
+                ) -> None:
+                    norm_abs = os.path.normpath(abs_path)
+                    if norm_abs in include_stack or norm_abs in discovery_visited:
+                        return
+                    if (
+                        max_include_files_per_root
+                        and len(discovery_visited) >= max_include_files_per_root
+                    ):
+                        return
+                    discovery_visited.add(norm_abs)
+                    include_stack.add(norm_abs)
+                    try:
+                        for event in _directive_events(norm_abs):
+                            kind = str(event["kind"])
+                            if kind == "include":
+                                if max_include_depth and depth >= max_include_depth:
+                                    continue
+                                included = _resolve_include_cached(
+                                    str(event["include_name"]),
+                                    current_abs=norm_abs,
+                                )
+                                if included is not None:
+                                    walk(
+                                        included,
+                                        include_stack=include_stack,
+                                        depth=depth + 1,
+                                    )
+                                continue
+                            if kind == "endif":
+                                if discovery_conditions:
+                                    discovery_conditions.pop()
+                                continue
+                            if kind == "else":
+                                continue
+                            if kind == "if":
+                                code_line = str(event["code_line"])
+                                match = _IF_RE.match(code_line)
+                                names = _condition_macro_names(code_line)
+                                if (
+                                    match is not None
+                                    and match.group(1) == "elif"
+                                    and discovery_conditions
+                                ):
+                                    discovery_conditions[-1] = names
+                                else:
+                                    discovery_conditions.append(names)
+                                continue
+                            if kind != "define" or bool(event["include_guard"]):
+                                continue
+                            name = str(event["name"])
+                            if name not in relevant_names:
+                                continue
+                            relevant_names.update(
+                                _macro_body_dependency_names(
+                                    str(event["macro_text"]),
+                                    macro_name=name,
+                                    params=cast(list[str], event["params"]),
+                                )
+                            )
+                            for condition_names in discovery_conditions:
+                                relevant_names.update(condition_names)
+                    finally:
+                        include_stack.remove(norm_abs)
+
+                walk(root_abs, include_stack=set(), depth=0)
+                if len(relevant_names) == before:
+                    break
+
+            stats["peak_root_relevant_macro_names"] = max(
+                stats["peak_root_relevant_macro_names"],
+                len(relevant_names),
+            )
+
+        _expand_relevant_names()
 
         def _scan_file(
             abs_path: str,
@@ -5314,6 +5928,7 @@ def register_header_macros(
             include_stack: set[str],
             depth: int,
         ) -> None:
+            nonlocal root_discovered_macros
             norm_abs = os.path.normpath(abs_path)
             if norm_abs in include_stack:
                 stats["skipped_include_cycle"] += 1
@@ -5377,11 +5992,12 @@ def register_header_macros(
                         continue
                     if kind == "if":
                         line = str(event["line"])
-                        if_match = _IF_RE.match(line)
+                        code_line = str(event["code_line"])
+                        if_match = _IF_RE.match(code_line)
                         if if_match and if_match.group(1) == "elif" and condition_stack:
                             previous = condition_stack.pop()
                             parent_active = _conditions_active()
-                            expr_active, names = _evaluate_condition(line)
+                            expr_active, names = _evaluate_condition(code_line)
                             active = (
                                 parent_active
                                 and not bool(previous["branch_taken"])
@@ -5399,7 +6015,7 @@ def register_header_macros(
                             )
                         else:
                             parent_active = _conditions_active()
-                            expr_active, names = _evaluate_condition(line)
+                            expr_active, names = _evaluate_condition(code_line)
                             active = parent_active and expr_active
                             condition_stack.append(
                                 {
@@ -5418,8 +6034,10 @@ def register_header_macros(
                     if kind == "undef":
                         name = str(event["name"])
                         line = str(event["line"])
-                        pending_undef[name] = line
+                        if name in relevant_names:
+                            pending_undef[name] = line
                         active_defs.pop(name, None)
+                        active_macro_texts.pop(name, None)
                         continue
 
                     if kind != "define":
@@ -5428,7 +6046,12 @@ def register_header_macros(
                     line_no = int(event["line_no"])
                     macro_text = str(event["macro_text"])
                     params = cast(list[str], event["params"])
+                    active_macro_texts[name] = macro_text
                     if not bool(event["include_guard"]):
+                        root_discovered_macros += 1
+                        stats["discovered_macro_occurrences"] += 1
+                        if name not in relevant_names:
+                            continue
                         condition_lines = [
                             line
                             for item in condition_stack
@@ -5459,26 +6082,11 @@ def register_header_macros(
                             undef_text=undef_text,
                             previous=last_defs.get(name),
                         )
+                        _count_macro_object()
                         sequence[0] += 1
                         active_defs[name] = macro
                         last_defs[name] = macro
-                        index.add_macro(macro)
-                        stats["registered_macros"] += 1
-                    else:
-                        guard_macro = MacroDef(
-                            name=name,
-                            file=rel_path,
-                            line=line_no,
-                            text=macro_text,
-                            params=params,
-                            project_id=stable_project_id,
-                            visible_in_file=root_rel,
-                            visible_line=root_visible_line or line_no,
-                            sequence=sequence[0],
-                        )
-                        sequence[0] += 1
-                        active_defs[name] = guard_macro
-                        last_defs[name] = guard_macro
+                        root_index.add_macro(macro)
             finally:
                 include_stack.remove(norm_abs)
 
@@ -5490,6 +6098,53 @@ def register_header_macros(
             depth=0,
         )
 
+        directly_used = [
+            macro
+            for name in sorted(usage_names)
+            if (
+                macro := _select_visible_macro(
+                    root_index,
+                    name,
+                    target_file=root_rel,
+                    max_line=None,
+                )
+            )
+            is not None
+        ]
+        retained = _macro_dependency_closure(
+            root_index,
+            directly_used,
+            target_file=root_rel,
+            max_line=None,
+        )
+        stats["peak_root_retained_macros"] = max(
+            stats["peak_root_retained_macros"],
+            len(retained),
+        )
+        root_candidate_ids = {id(macro) for macro in root_index.macro_definitions}
+        retained_candidate_ids = {
+            id(macro) for macro in retained if id(macro) in root_candidate_ids
+        }
+        stats["pruned_macro_occurrences"] += max(
+            0,
+            root_discovered_macros - len(retained_candidate_ids),
+        )
+        if len(index.macro_definitions) + len(retained) > max_retained_macros:
+            raise MemoryError(
+                "macro scan exceeded the retained registry bound: "
+                f"root={root_rel} retained={len(index.macro_definitions)} "
+                f"incoming={len(retained)} limit={max_retained_macros}. "
+                "Raise CPPMEGA_MAX_RETAINED_MACROS only after inspecting macro "
+                "retention telemetry."
+            )
+        before = len(index.macro_definitions)
+        for macro in retained:
+            index.add_macro(macro)
+        registered = len(index.macro_definitions) - before
+        stats["registered_macros"] += registered
+        stats["retained_macro_occurrences"] += registered
+
+    seen_roots: set[str] = set()
     for path in header_files:
         rel = _rel(path)
         ext = os.path.splitext(rel)[1].lower()
@@ -5498,7 +6153,12 @@ def register_header_macros(
         abs_path = path
         if project_dir is not None and not os.path.isabs(abs_path):
             abs_path = os.path.join(project_dir, abs_path)
-        _scan_root(os.path.normpath(abs_path), rel)
+        normalized_abs = os.path.normpath(abs_path)
+        if normalized_abs in seen_roots:
+            stats["skipped_duplicate_roots"] += 1
+            continue
+        seen_roots.add(normalized_abs)
+        _scan_root(normalized_abs, rel)
 
     return dict(stats)
 
@@ -5653,7 +6313,7 @@ def _used_macro_defs(
                 yield str(item), max_line
 
     for text, start_line in _iter_texts():
-        for match in _IDENTIFIER_RE.finditer(text):
+        for match in _iter_code_identifiers(text):
             use_line = (
                 _source_line_for_text_offset(
                     text,
@@ -5716,6 +6376,7 @@ def build_header_fragment_doc(
     fragment_kind: str,
     compile_args: list[str] | None,
     build_info: dict | None,
+    project_id: str,
     part: PartInfo | None = None,
 ) -> dict:
     doc = build_enriched_doc(
@@ -5724,6 +6385,7 @@ def build_header_fragment_doc(
         filepath=rel_file,
         compile_args=compile_args,
         build_info=build_info,
+        project_id=project_id,
     )
     doc["doc_type"] = "code_header"
     doc["header_fragment_kind"] = fragment_kind
@@ -5884,6 +6546,7 @@ def emit_header_documents(
                 fragment_kind="header_decl" if td.kind == HEADER_FRAGMENT_KIND else "type",
                 compile_args=compile_args,
                 build_info=build_info,
+                project_id=project_id,
                 part=_typedef_part(td),
             )
             emit_doc(doc if enriched else td.text)
@@ -5930,6 +6593,7 @@ def emit_header_documents(
                 fragment_kind="macro",
                 compile_args=compile_args,
                 build_info=build_info,
+                project_id=project_id,
                 part=_macro_part(macro),
             )
             emit_doc(doc if enriched else macro_text)
@@ -6029,6 +6693,7 @@ def emit_build_documents(
     build_files: list[tuple[str, str]],
     *,
     source_root: str | None = None,
+    project_id: str | None = None,
     default_build_info: dict | None,
     compile_index: object | None = None,
     tokenizer_path: str | None = None,
@@ -6110,7 +6775,7 @@ def emit_build_documents(
                     dropped += 1
                     continue
             else:
-                from dedup_store import _sha1_tokens
+                _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
                 h = _sha1_tokens(token_ids)
                 if h in seen_local:
                     dropped += 1
@@ -6123,6 +6788,7 @@ def emit_build_documents(
                 text,
                 build_kind,
                 source_root=source_root,
+                project_id=project_id,
                 build_info=per_file_build_info or None,
             )
         )
@@ -6189,12 +6855,19 @@ def build_training_documents(
             documents.append(doc)
 
     index.compute_dep_levels()
-    stable_project_id: str | None = None
-    if header_files or macro_scan_files:
-        stable_project_id = require_project_identity(
+    stable_project_id = (
+        require_project_identity(
             project_id,
-            source="build_training_documents macro scan",
+            source="build_training_documents",
         )
+        if project_id is not None
+        else None
+    )
+    if header_files or macro_scan_files:
+        if stable_project_id is None:
+            raise SymbolIdentityError(
+                "build_training_documents macro scan requires project_id"
+            )
         macro_stats = register_header_macros(
             index,
             macro_scan_files or header_files or [],
@@ -6215,7 +6888,12 @@ def build_training_documents(
             f"directive_cache_hits={macro_stats.get('directive_cache_hits', 0)} "
             f"include_directives={macro_stats.get('include_directives', 0)} "
             f"resolve_cache_hits={macro_stats.get('include_resolve_cache_hits', 0)} "
-            f"registered={macro_stats.get('registered_macros', 0)} "
+            f"discovered={macro_stats.get('discovered_macro_occurrences', 0)} "
+            f"materialized_peak={macro_stats.get('peak_root_macro_candidates', 0)} "
+            f"retained={macro_stats.get('registered_macros', 0)} "
+            f"pruned={macro_stats.get('pruned_macro_occurrences', 0)} "
+            f"directive_cache_peak={macro_stats.get('directive_cache_peak_entries', 0)} "
+            f"resolve_cache_peak={macro_stats.get('resolve_cache_peak_entries', 0)} "
             f"local_file_index_entries={macro_stats.get('local_file_index_entries', 0)} "
             f"skipped_depth={macro_stats.get('skipped_include_depth', 0)} "
             f"skipped_file_cap={macro_stats.get('skipped_include_file_cap', 0)} "
@@ -6469,6 +7147,7 @@ def build_training_documents(
                     filepath=func.file,
                     compile_args=compile_args,
                     build_info=build_info,
+                    project_id=stable_project_id,
                 )
                 if _is_header_path(func.file) and func.text.lstrip().startswith("template"):
                     out_doc["doc_type"] = "code_header"
@@ -6914,6 +7593,7 @@ def process_project(
         build_docs = emit_build_documents(
             domain_files,
             source_root=project_dir,
+            project_id=stable_project_id,
             default_build_info=default_build_info,
             compile_index=_compile_index,
             tokenizer_path=tokenizer_path,

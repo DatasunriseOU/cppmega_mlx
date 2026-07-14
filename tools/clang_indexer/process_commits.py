@@ -40,7 +40,7 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, Sequence, cast
 
 # Increase recursion limit for deeply nested ASTs
 sys.setrecursionlimit(50000)
@@ -57,9 +57,11 @@ from tools.clang_indexer.index_project import (
     _compute_symbol_id,
     _document_symbol_identities,
     _function_part,
+    _iter_code_identifiers,
     _macro_invocation_route_parts,
     _macro_part,
     _macro_route_part,
+    _normalize_signature_text,
     _part_macro_provenance,
     _part_symbol_key,
     _part_symbol_metadata,
@@ -85,6 +87,7 @@ from tools.clang_indexer.index_project import (
     extract_clang_ast_metadata,
     extract_semantic_metadata,
     extract_semantic_metadata_from_parts,
+    normalize_qualified_name,
     register_header_macros,
     symbol_identity_for_cursor,
 )
@@ -258,6 +261,8 @@ class ClassDef:
     semantic_symbol_identities: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.qualified_name = normalize_qualified_name(self.qualified_name)
+        self.canonical_signature = _normalize_signature_text(self.canonical_signature)
         if not self.symbol_key:
             self.symbol_key = canonical_symbol_identity(
                 qname=self.qualified_name,
@@ -824,7 +829,7 @@ class BuildContextResolver:
         self.repo_dir = os.path.abspath(repo_dir) if repo_dir else None
         self._cache: dict[str, tuple[dict, list[str], object | None]] = {}
         self._macro_cache: OrderedDict[
-            tuple[str, str, str, tuple[str, ...]], ProjectIndex
+            tuple[str, str, str, tuple[str, ...], str], ProjectIndex
         ] = OrderedDict()
         self._macro_cache_max_entries = int(os.environ.get("CPPMEGA_COMMIT_MACRO_CACHE_ENTRIES", "16"))
 
@@ -887,6 +892,7 @@ class BuildContextResolver:
         filepath: str,
         compile_args: list[str] | None,
         project_id: str,
+        usage_texts: Sequence[str] | None = None,
     ) -> ProjectIndex | None:
         """Return an include-aware macro index for this commit file.
 
@@ -909,11 +915,21 @@ class BuildContextResolver:
             project_id,
             source=f"macro_index_for({filepath})",
         )
+        usage_names = sorted({
+            match.group(0)
+            for text in (usage_texts or ())
+            for match in _iter_code_identifiers(text)
+        })
+        usage_fingerprint = hashlib.sha1(
+            "\0".join(usage_names).encode("utf-8")
+        ).hexdigest()
+        relative_root_file = os.path.relpath(root_file, root)
         key = (
             stable_project_id,
             root,
-            os.path.relpath(root_file, root),
+            relative_root_file,
             tuple(compile_args or ()),
+            usage_fingerprint,
         )
         cached = self._macro_cache.get(key)
         if cached is not None:
@@ -932,6 +948,11 @@ class BuildContextResolver:
             project_dir=root,
             project_id=stable_project_id,
             include_dirs=include_dirs,
+            macro_usage_texts_by_file=(
+                {relative_root_file: list(usage_texts)}
+                if usage_texts is not None
+                else None
+            ),
         )
         self._macro_cache[key] = index
         self._macro_cache.move_to_end(key)
@@ -2028,7 +2049,12 @@ def _build_enriched_from_parts(
     macro_invocation_routes: list[dict[str, object]] = []
 
     def _unique_qname_value(values, qname: str):
-        matches = [value for value in values if value.qualified_name == qname]
+        normalized_qname = normalize_qualified_name(qname)
+        matches = [
+            value
+            for value in values
+            if normalize_qualified_name(value.qualified_name) == normalized_qname
+        ]
         return matches[0] if len(matches) == 1 else None
 
     for i, part in enumerate(parts_info):
@@ -2525,6 +2551,7 @@ def process_record(
             filepath=filepath,
             compile_args=compile_args,
             project_id=project_id,
+            usage_texts=(old_content, new_content),
         )
         if build_context is not None
         else None

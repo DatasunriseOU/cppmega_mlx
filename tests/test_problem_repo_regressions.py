@@ -378,6 +378,12 @@ def test_header_function_template_emits_trainable_cpp_doc(tmp_path: Path) -> Non
 def test_header_cxx20_concept_and_inline_variable_template_emit_docs(tmp_path: Path) -> None:
     index_project = _load_index_project_or_skip()
 
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(cppmega_header_fixture LANGUAGES CXX)\n"
+        "set(CMAKE_CXX_STANDARD 20)\n",
+        encoding="utf-8",
+    )
     include = tmp_path / "include"
     include.mkdir()
     (include / "traits.hpp").write_text(
@@ -1413,6 +1419,12 @@ def test_header_template_docs_survive_tokenized_route_and_pack_e2e(tmp_path: Pat
     from scripts.streaming_reindex_commits import route_by_fit
     import pyarrow.parquet as pq
 
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(cppmega_header_e2e LANGUAGES CXX)\n"
+        "set(CMAKE_CXX_STANDARD 20)\n",
+        encoding="utf-8",
+    )
     include = tmp_path / "include"
     include.mkdir()
     (include / "box.hpp").write_text(
