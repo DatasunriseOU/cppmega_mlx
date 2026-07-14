@@ -472,6 +472,32 @@ def test_abseil_global_api_index_excludes_test_and_benchmark_tus() -> None:
     assert excluded == 2
 
 
+def test_global_api_index_excludes_non_provider_trees_and_libc_sources() -> None:
+    b = _load_builder()
+    folly_paths = [
+        "/src/folly/container/Map.cpp",
+        "/src/folly/container/test/MapTest.cpp",
+        "/src/folly/benchmark/MapBenchmark.cpp",
+    ]
+    kept, excluded = b._filter_non_provider_sources(
+        folly_paths, b.BASE_LIBS["folly"]
+    )
+    assert kept == [folly_paths[0]]
+    assert excluded == 2
+
+    libc_paths = [
+        "/src/glibc/include/stdio.h",
+        "/src/musl/include/stdlib.h",
+        "/src/glibc/stdlib/strtol.c",
+        "/src/musl/tests/stdio.c",
+    ]
+    kept, excluded = b._filter_non_provider_sources(
+        libc_paths, b.BASE_LIBS["libc"]
+    )
+    assert kept == libc_paths[:2]
+    assert excluded == 2
+
+
 def test_crosslink_budget_bounds():
     ip = _load_index_project()
     b = ip.CrossLinkBudget(max_deps=2, token_budget=1000)

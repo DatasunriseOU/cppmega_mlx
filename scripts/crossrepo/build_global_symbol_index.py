@@ -101,6 +101,7 @@ DEFAULT_OUTPUT = MLX_ROOT / "outputs" / "crossrepo" / "global_symbols.sqlite"
 # ``lang`` controls how headers (.h/.inc) are parsed: 'c++' (default for the C++
 # libs — header-only template libs like boost/eigen/fmt MUST parse as C++ or the
 # templated public API yields zero symbols) or 'c' (glib/openssl/libc are C).
+_NON_PROVIDER_PATH_SEGMENTS = ("test", "tests", "testing", "benchmark", "benchmarks")
 BASE_LIBS: dict[str, dict] = {
     # ---- A1 (high-value, tractable) ----
     "boost":      {"subtrees": ["boost"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["boost::"]},
@@ -113,14 +114,22 @@ BASE_LIBS: dict[str, dict] = {
                    "index_exclude_suffixes": [
                        "_test.cc", "_test.cpp", "_test.cxx",
                        "_benchmark.cc", "_benchmark.cpp", "_benchmark.cxx",
-                   ]},
-    "folly":      {"subtrees": ["folly"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["folly::"]},
-    "openssl":    {"subtrees": ["openssl"],      "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": []},
-    "boringssl":  {"subtrees": ["boringssl"],    "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": []},
-    "protobuf":   {"subtrees": ["protobuf"],     "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["google::protobuf::"]},
-    "eigen":      {"subtrees": ["eigen"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["Eigen::"]},
-    "fmt":        {"subtrees": ["fmt"],          "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["fmt::"]},
-    "glib":       {"subtrees": ["glib"],         "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": []},
+                   ],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "folly":      {"subtrees": ["folly"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["folly::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "openssl":    {"subtrees": ["openssl"],      "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": [],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "boringssl":  {"subtrees": ["boringssl"],    "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": [],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "protobuf":   {"subtrees": ["protobuf"],     "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["google::protobuf::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "eigen":      {"subtrees": ["eigen"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["Eigen::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "fmt":        {"subtrees": ["fmt"],          "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["fmt::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "glib":       {"subtrees": ["glib"],         "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": [],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
     # ---- A2 (huge / template-heavy) — PUBLIC symbols only ----
     # std: gcc-mirror and llvm-project are FULL compiler monorepos (the entire GCC
     # / LLVM source trees). Without include_path_markers the per-lib file cap is
@@ -182,7 +191,9 @@ BASE_LIBS: dict[str, dict] = {
     # libc: C libraries have NO namespace; keep by-name public symbols (no prefix
     # filter). glibc/musl public surface lives in normal .h headers.
     "libc":       {"subtrees": ["glibc", "musl"],
-                   "tier": "A2", "public_only": True, "lang": "c", "namespace_prefixes": []},
+                   "tier": "A2", "public_only": True, "lang": "c", "namespace_prefixes": [],
+                   "index_public_headers_only": True,
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
 }
 
 # Corpus subtree names are extraction details, not project identities. Keep the
@@ -266,9 +277,25 @@ def _filter_non_provider_sources(
     suffixes = tuple(
         str(value).lower() for value in spec.get("index_exclude_suffixes", ())
     )
-    if not suffixes:
-        return list(paths), 0
-    kept = [path for path in paths if not path.lower().endswith(suffixes)]
+    excluded_segments = {
+        str(value).lower()
+        for value in spec.get("index_exclude_path_segments", ())
+    }
+
+    def keep(path: str) -> bool:
+        normalized = path.replace("\\", "/")
+        if suffixes and normalized.lower().endswith(suffixes):
+            return False
+        parts = {part.lower() for part in normalized.split("/") if part}
+        if excluded_segments.intersection(parts):
+            return False
+        if spec.get("index_public_headers_only") and not _is_public_header_path(
+            normalized
+        ):
+            return False
+        return True
+
+    kept = [path for path in paths if keep(path)]
     return kept, len(paths) - len(kept)
 
 
@@ -2082,7 +2109,9 @@ def _index_lib_from_dir_uncommitted(
     if excluded:
         print(
             f"  [{lib}] configured non-provider source exclusions: {excluded} files "
-            f"(suffixes={tuple(spec['index_exclude_suffixes'])})",
+            f"(suffixes={tuple(spec.get('index_exclude_suffixes', ()))}, "
+            f"path_segments={tuple(spec.get('index_exclude_path_segments', ()))}, "
+            f"public_headers_only={bool(spec.get('index_public_headers_only'))})",
             file=sys.stderr,
             flush=True,
         )
