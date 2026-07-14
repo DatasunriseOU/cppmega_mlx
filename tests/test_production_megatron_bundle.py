@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+import cppmega_mlx.data.production_bundle as production_bundle
 from cppmega_mlx.data.domain_schema import DOMAIN_SCHEMA_SHA256
 from cppmega_mlx.data.production_bundle import (
     ProductionMegatronDatasetMetadata,
@@ -279,6 +280,11 @@ def _build_bundle(
             {
                 "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
                 "record_batch_rows": 64,
+                "producer": {
+                    "name": "pyarrow.parquet.ParquetFile.iter_batches",
+                    "version": 1,
+                    "row_group_rows": [[1]],
+                },
                 "ordering": {
                     "permutation": "sha256_sort_key_v1",
                     "epochs": "ascending",
@@ -645,6 +651,69 @@ def test_open_production_megatron_bundle_accepts_bounded_source_sampling(
 
     assert tuple(batch.tokens.shape) == (1, _BUCKET)
     assert batch.graph_batch is not None
+
+
+def test_bounded_source_sampling_producer_is_fully_bound() -> None:
+    sampling = {
+        "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
+        "seed": 7,
+        "requested_samples": 3,
+        "full_passes": 1,
+        "tail_rows": 1,
+        "min_row_reuse": 1,
+        "max_row_reuse": 2,
+        "record_batch_rows": 2,
+        "producer": {
+            "name": "pyarrow.parquet.ParquetFile.iter_batches",
+            "version": 1,
+            "row_group_rows": [[2]],
+        },
+        "ordering": dict(production_bundle._BOUNDED_SOURCE_ORDERING),
+        "cursor_semantics": "last_yielded_row_v1",
+        "final_cursor": {
+            "epoch": 1,
+            "shard_position": 0,
+            "shard_index": 0,
+            "row_group_position": 0,
+            "row_group_index": 0,
+            "record_batch_index": 0,
+            "row_shuffle_position": 0,
+            "row_index_in_record_batch": 0,
+            "source_index": 2,
+        },
+    }
+
+    validated = production_bundle._validate_objective_source_sampling(
+        sampling,
+        row_count=2,
+        file_count=1,
+        file_row_counts=[2],
+        bucket=8,
+    )
+    assert validated["producer"] == sampling["producer"]
+
+    for mutation, message in (
+        ({"producer": None}, "producer"),
+        ({"producer": {**sampling["producer"], "version": 2}}, "producer drifted"),
+        (
+            {
+                "producer": {
+                    **sampling["producer"],
+                    "row_group_rows": [[1]],
+                }
+            },
+            "row count drifted",
+        ),
+    ):
+        candidate = {**sampling, **mutation}
+        with pytest.raises((TypeError, ValueError), match=message):
+            production_bundle._validate_objective_source_sampling(
+                candidate,
+                row_count=2,
+                file_count=1,
+                file_row_counts=[2],
+                bucket=8,
+            )
 
 
 def test_one_byte_mutation_fails_before_mmap(

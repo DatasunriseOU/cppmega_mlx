@@ -52,6 +52,8 @@ _BOUNDED_SOURCE_ORDERING = {
     "record_batches": "physical_order_within_row_group",
     "rows": "seeded_permutation_within_record_batch",
 }
+_BOUNDED_SOURCE_PRODUCER = "pyarrow.parquet.ParquetFile.iter_batches"
+_BOUNDED_SOURCE_PRODUCER_VERSION = 1
 _BOUNDED_SOURCE_CURSOR_FIELDS = {
     "epoch",
     "shard_position",
@@ -1245,6 +1247,7 @@ def _objective_source_summary(
         raise ValueError(f"objective source snapshot has no files for bucket {bucket}")
     records: list[dict[str, object]] = []
     source_counter: Counter[tuple[int, str]] = Counter()
+    file_row_counts: list[int] = []
     row_count = 0
     for raw_record in files:
         record = _require_mapping(
@@ -1269,6 +1272,7 @@ def _objective_source_summary(
             record.get("rows"), where=f"objective source rows for bucket {bucket}"
         )
         records.append({"path": path, "size": size, "sha256": digest})
+        file_row_counts.append(rows)
         source_counter[(size, digest)] += 1
         row_count += rows
     if source.get("file_count") != len(files) or source.get("row_count") != row_count:
@@ -1284,6 +1288,7 @@ def _objective_source_summary(
         source.get("sampling"),
         row_count=row_count,
         file_count=len(files),
+        file_row_counts=file_row_counts,
         bucket=bucket,
     )
     return (
@@ -1303,6 +1308,7 @@ def _validate_objective_source_sampling(
     *,
     row_count: int,
     file_count: int,
+    file_row_counts: list[int],
     bucket: int,
 ) -> dict[str, object]:
     sampling = _require_mapping(
@@ -1323,6 +1329,7 @@ def _validate_objective_source_sampling(
     elif mode == _BOUNDED_SOURCE_SAMPLING_MODE:
         expected_fields = common_fields | {
             "record_batch_rows",
+            "producer",
             "ordering",
             "cursor_semantics",
             "final_cursor",
@@ -1360,6 +1367,50 @@ def _validate_objective_source_sampling(
         sampling.get("record_batch_rows"),
         where=f"objective source record_batch_rows for bucket {bucket}",
     )
+    producer = _require_mapping(
+        sampling.get("producer"),
+        where=f"objective source producer for bucket {bucket}",
+    )
+    if set(producer) != {"name", "version", "row_group_rows"}:
+        raise ValueError(
+            f"objective source producer fields drifted for bucket {bucket}"
+        )
+    if (
+        producer.get("name") != _BOUNDED_SOURCE_PRODUCER
+        or producer.get("version") != _BOUNDED_SOURCE_PRODUCER_VERSION
+    ):
+        raise ValueError(f"objective source producer drifted for bucket {bucket}")
+    raw_row_groups = producer.get("row_group_rows")
+    if not isinstance(raw_row_groups, list) or len(raw_row_groups) != file_count:
+        raise ValueError(
+            f"objective source producer shard layout drifted for bucket {bucket}"
+        )
+    row_group_rows: list[list[int]] = []
+    for shard_index, (raw_groups, expected_rows) in enumerate(
+        zip(raw_row_groups, file_row_counts, strict=True)
+    ):
+        if not isinstance(raw_groups, list) or not raw_groups:
+            raise ValueError(
+                f"objective source producer row groups are invalid for bucket "
+                f"{bucket}, shard {shard_index}"
+            )
+        groups: list[int] = []
+        for raw_rows in raw_groups:
+            groups.append(
+                _require_positive_int(
+                    raw_rows,
+                    where=(
+                        f"objective source producer row-group size for bucket "
+                        f"{bucket}, shard {shard_index}"
+                    ),
+                )
+            )
+        if sum(groups) != expected_rows:
+            raise ValueError(
+                f"objective source producer row count drifted for bucket {bucket}, "
+                f"shard {shard_index}"
+            )
+        row_group_rows.append(groups)
     if sampling.get("ordering") != _BOUNDED_SOURCE_ORDERING:
         raise ValueError(
             f"objective source bounded ordering drifted for bucket {bucket}"
@@ -1395,9 +1446,25 @@ def _validate_objective_source_sampling(
         raise ValueError(
             f"objective source final cursor shard drifted for bucket {bucket}"
         )
+    shard_row_groups = row_group_rows[cursor["shard_index"]]
     if (
-        cursor["row_shuffle_position"] >= record_batch_rows
-        or cursor["row_index_in_record_batch"] >= record_batch_rows
+        cursor["row_group_position"] >= len(shard_row_groups)
+        or cursor["row_group_index"] >= len(shard_row_groups)
+    ):
+        raise ValueError(
+            f"objective source final cursor row group drifted for bucket {bucket}"
+        )
+    group_rows = shard_row_groups[cursor["row_group_index"]]
+    record_batch_count = (group_rows + record_batch_rows - 1) // record_batch_rows
+    if cursor["record_batch_index"] >= record_batch_count:
+        raise ValueError(
+            f"objective source final cursor record batch drifted for bucket {bucket}"
+        )
+    batch_start = cursor["record_batch_index"] * record_batch_rows
+    batch_rows = min(record_batch_rows, group_rows - batch_start)
+    if (
+        cursor["row_shuffle_position"] >= batch_rows
+        or cursor["row_index_in_record_batch"] >= batch_rows
     ):
         raise ValueError(
             f"objective source final cursor row drifted for bucket {bucket}"
