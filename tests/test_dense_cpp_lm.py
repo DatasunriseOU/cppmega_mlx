@@ -475,6 +475,28 @@ def test_model_rejects_fixed_graph_bias_when_routes_are_disabled():
         model(tokens, block_bias=mx.zeros((1, 8, 8), dtype=mx.float32))
 
 
+def test_eager_model_rejects_cross_document_fixed_graph_bias():
+    cfg = _smoke_config(
+        depth=1,
+        ngram_hash_enabled=False,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    tokens = mx.array(np.arange(8, dtype=np.int32))[None, :] % cfg.vocab_size
+    document_ids = mx.array([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=mx.int32)
+    block_bias = mx.zeros((1, 8, 8), dtype=mx.float32)
+    block_bias = block_bias.at[0, 6, 1].add(mx.array(1.0, dtype=mx.float32))
+    edge_kind_bias = mx.zeros_like(block_bias)
+
+    with pytest.raises(ValueError, match="crosses document boundary"):
+        model(
+            tokens,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            document_ids=document_ids,
+        )
+
+
 def test_forward_packet_rejects_malformed_graph_edges_when_enabled():
     cfg = _smoke_config(
         depth=1,

@@ -126,6 +126,19 @@ def _check_finite(name: str, value: float, step: int) -> None:
         )
 
 
+def _parse_graph_relations(value: str) -> tuple[str, ...]:
+    relations = tuple(
+        relation.strip() for relation in value.split(",") if relation.strip()
+    )
+    unsupported = sorted(set(relations) - set(STAGE1_GRAPH_RELATIONS))
+    if unsupported:
+        raise ValueError(
+            "local Stage-1 graph supervision received non-canonical relations: "
+            f"{unsupported}"
+        )
+    return relations
+
+
 # --------------------------------------------------------------------------- #
 def _iter_sources(shard_paths: list[str], seed: int):
     """Infinitely yield typed objective sources in deterministic shuffled order."""
@@ -686,19 +699,7 @@ def main() -> None:
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{name} must be finite and positive")
     graph_aux_enabled = True
-    graph_relations = tuple(
-        relation.strip()
-        for relation in args.graph_relations.split(",")
-        if relation.strip()
-    )
-    unsupported_graph_relations = sorted(
-        set(graph_relations) - {"call", "type"}
-    )
-    if unsupported_graph_relations:
-        raise ValueError(
-            "local Stage-1 graph supervision supports call/type relations; got "
-            f"{unsupported_graph_relations}"
-        )
+    graph_relations = _parse_graph_relations(args.graph_relations)
     if args.quota_window_samples < 0:
         raise ValueError("--quota-window-samples must be non-negative")
     quota_window_samples = args.quota_window_samples or (60 * args.batch)

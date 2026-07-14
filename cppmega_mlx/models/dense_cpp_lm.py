@@ -758,6 +758,11 @@ class DenseCppLM(nn.Module):
                     )
                 edge_kind_bias = mx.zeros_like(block_bias)
             bias = block_bias + edge_kind_bias
+            _validate_graph_bias_document_boundaries(
+                bias,
+                document_ids,
+                where="eager",
+            )
         elif block_bias is not None or edge_kind_bias is not None:
             raise ValueError(
                 "DenseCppLM received both graph_batch and fixed graph biases while "
@@ -856,16 +861,11 @@ class DenseCppLM(nn.Module):
                     combined = combined + relation_bias
                 if kind_bias is not None:
                     combined = combined + kind_bias
-                cross_document = (
-                    document_ids[:, :, None] != document_ids[:, None, :]
+                _validate_graph_bias_document_boundaries(
+                    combined,
+                    document_ids,
+                    where="compiled",
                 )
-                leaks = mx.any(cross_document & (mx.abs(combined) > 0))
-                mx.eval(leaks)
-                if bool(leaks.item()):
-                    raise ValueError(
-                        "compiled graph bias contains a route that crosses "
-                        "document boundary"
-                    )
 
         self.structure_embedding.validate_inputs(
             structure_ids=lm_batch.structure_ids,
@@ -1189,6 +1189,23 @@ def _validate_fixed_graph_bias(
     mx.eval(finite)
     if not bool(finite.item()):
         raise ValueError(f"{name} contains non-finite values")
+
+
+def _validate_graph_bias_document_boundaries(
+    bias: mx.array,
+    document_ids: mx.array | None,
+    *,
+    where: str,
+) -> None:
+    if document_ids is None or batch_values_are_prevalidated():
+        return
+    cross_document = document_ids[:, :, None] != document_ids[:, None, :]
+    leaks = mx.any(cross_document & (mx.abs(bias) > 0))
+    mx.eval(leaks)
+    if bool(leaks.item()):
+        raise ValueError(
+            f"{where} graph bias contains a route that crosses document boundary"
+        )
 
 
 def _scaled(residual: mx.array, scale: float, like: mx.array) -> mx.array:

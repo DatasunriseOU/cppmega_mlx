@@ -13,9 +13,11 @@ import pytest
 from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
+from cppmega_mlx.data.graph_recipe import STAGE1_GRAPH_RELATIONS
 from cppmega_mlx.models.dense_cpp_lm import GraphIndexedAttention
 from cppmega_mlx.training.stage1_production import (
     STAGE1_GRAPH_DOMAIN_RECIPE,
+    _batch_route_counts,
     add_stage1_production_arguments,
     build_stage1_production_model,
     run_stage1_graph_domain_production,
@@ -56,17 +58,19 @@ def _production_batch(
     domain_id: int = 3,
     include_edge_kinds: bool = True,
     include_document_ids: bool = True,
+    with_edge: bool = True,
     edge_kind: DomainEdgeKind | int = DomainEdgeKind.DIAG_PRIMARY_LOCATION,
 ) -> LMTokenBatch:
     tokens = mx.array([[2, 3, 5, 7, 11, 13, 17, 19]], dtype=mx.int32)
     graph = None
     if include_graph:
+        pairs = [(6, 5)] if with_edge else []
         graph = GraphBatch(
             graphs=(
                 GraphPacket(
                     edges={
                         "domain": EdgeIndex.from_pairs(
-                            [(6, 5)], relation="domain", num_nodes=8
+                            pairs, relation="domain", num_nodes=8
                         )
                     },
                     num_nodes=8,
@@ -77,7 +81,7 @@ def _production_batch(
             edge_kinds=(
                 {
                     "domain": mx.array(
-                        [int(edge_kind)],
+                        [int(edge_kind)] if with_edge else [],
                         dtype=mx.int32,
                     )
                 }
@@ -158,6 +162,32 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
         "domain_ids",
         "role_ids",
     ]
+
+
+def test_stage1_production_receipt_and_counts_accept_graphless_batch() -> None:
+    cfg = stage1_production_config(
+        vocab_size=64,
+        hidden_size=32,
+        depth=1,
+        ffn_hidden_size=64,
+        max_seq_length=8,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        ngram_hash_enabled=False,
+    )
+    batch = _production_batch(with_edge=False)
+
+    receipt = stage1_production_batch_receipt(batch, config=cfg)
+    counts = _batch_route_counts(batch)
+
+    assert receipt["graph_edges"] == 0
+    assert receipt["graph_prior_nonzero"] == 0
+    assert receipt["edge_kind_edges"] == 0
+    assert receipt["edge_kind_ids"] == []
+    assert counts["graph_edges"] == 0
+    assert counts["graph_prior_nonzero"] == 0
+    assert counts["edge_kind_edges"] == 0
 
 
 def test_stage1_production_accepts_valid_categories_with_zero_kind_delta() -> None:
@@ -246,6 +276,16 @@ def test_stage1_production_cli_does_not_offer_mla() -> None:
                 "mla",
             ]
         )
+
+
+def test_stage1_eval_cli_accepts_canonical_graph_relations() -> None:
+    module = importlib.import_module("scripts.train_eval_stage1")
+    parse_graph_relations = getattr(module, "_parse_graph_relations", None)
+
+    assert callable(parse_graph_relations)
+    assert parse_graph_relations(",".join(STAGE1_GRAPH_RELATIONS)) == (
+        STAGE1_GRAPH_RELATIONS
+    )
 
 
 @pytest.mark.parametrize(

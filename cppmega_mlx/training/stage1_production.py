@@ -84,7 +84,6 @@ class Stage1ProductionObjective:
         values = _stage1_objective_batch(batch)
         finite_relation = mx.all(mx.isfinite(values.relation_bias))
         finite_edge_kind = mx.all(mx.isfinite(values.edge_kind_bias))
-        positive_pairs = mx.sum(values.graph_targets)
         targets_outside_mask = mx.any(
             (values.graph_targets > 0) & (values.graph_pair_mask <= 0)
         )
@@ -92,7 +91,6 @@ class Stage1ProductionObjective:
         mx.eval(
             finite_relation,
             finite_edge_kind,
-            positive_pairs,
             targets_outside_mask,
             loss_tokens,
         )
@@ -100,10 +98,6 @@ class Stage1ProductionObjective:
             raise ValueError("production graph relation prior must be finite")
         if not bool(finite_edge_kind.item()):
             raise ValueError("production graph edge-kind prior must be finite")
-        if float(positive_pairs.item()) <= 0.0:
-            raise ValueError(
-                "production Stage-1 graph objective requires nonzero graph targets"
-            )
         if bool(targets_outside_mask.item()):
             raise ValueError(
                 "production Stage-1 graph target crosses a causal/document boundary"
@@ -222,6 +216,10 @@ def _stage1_objective_batch(
         active = token_mask > 0
         pair_mask = pair_mask & active[:, :, None] & active[:, None, :]
 
+    graph_targets = (relation_bias != 0) & pair_mask
+    eligible_rows = mx.any(graph_targets, axis=(1, 2))
+    pair_mask = pair_mask & eligible_rows[:, None, None]
+
     return _Stage1ObjectiveBatch(
         input_ids=input_ids,
         targets=lm_batch.targets,
@@ -229,7 +227,7 @@ def _stage1_objective_batch(
         document_ids=document_ids,
         relation_bias=relation_bias,
         edge_kind_bias=edge_kind_bias,
-        graph_targets=(relation_bias != 0).astype(mx.float32),
+        graph_targets=graph_targets.astype(mx.float32),
         graph_pair_mask=pair_mask.astype(mx.float32),
         side_channels={
             name: value
@@ -333,7 +331,7 @@ def stage1_production_batch_receipt(
     *,
     config: DenseCppLMConfig,
 ) -> dict[str, Any]:
-    """Validate one startup batch and return proof of live graph/domain signal."""
+    """Validate one startup batch and return its graph/domain signal receipt."""
 
     _validate_stage1_production_config(config)
     lm_batch = ensure_lm_batch(batch)
@@ -347,8 +345,6 @@ def stage1_production_batch_receipt(
         for graph in lm_batch.graph_batch.graphs
         for edge in graph.edges.values()
     )
-    if graph_edges <= 0:
-        raise ValueError("production Stage-1 requires nonzero graph edges")
     edge_kind_edges, edge_kind_ids = _validate_edge_kind_categories(
         lm_batch.graph_batch
     )
@@ -387,8 +383,6 @@ def stage1_production_batch_receipt(
     graph_prior_nonzero = int(graph_prior_nonzero_array.item())
     edge_kind_prior_nonzero = int(edge_kind_prior_nonzero_array.item())
     domain_tokens_nonzero = int(domain_tokens_array.item())
-    if graph_prior_nonzero <= 0:
-        raise ValueError("production Stage-1 requires a nonzero graph prior")
     if domain_tokens_nonzero <= 0:
         raise ValueError("production Stage-1 requires nonzero domain tokens")
 
@@ -583,7 +577,14 @@ def _validate_stage1_production_config(config: DenseCppLMConfig) -> None:
 def _validate_edge_kind_categories(
     graph_batch: GraphBatch,
 ) -> tuple[int, list[int]]:
+    graph_edges = sum(
+        len(edge.to_pairs())
+        for graph in graph_batch.graphs
+        for edge in graph.edges.values()
+    )
     if not graph_batch.edge_kinds:
+        if graph_edges == 0:
+            return 0, []
         raise ValueError(
             "production Stage-1 requires edge-kind sidecars for graph triples"
         )
@@ -595,7 +596,7 @@ def _validate_edge_kind_categories(
             raw = np.asarray(values)
             edge_count += int(raw.size)
             observed.update(int(value) for value in raw.tolist())
-    if edge_count <= 0:
+    if edge_count <= 0 and graph_edges > 0:
         raise ValueError(
             "production Stage-1 requires edge-kind sidecars for graph triples"
         )
