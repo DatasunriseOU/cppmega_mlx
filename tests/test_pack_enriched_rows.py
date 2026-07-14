@@ -855,6 +855,40 @@ def test_uint64_source_and_symbol_ids_reach_training_batch_and_code_packet(
     assert int(np.asarray(packet.symbol_ids)[0]) == symbol_high_id
 
 
+def test_pack_parquet_dataset_preserves_multi_source_identity_registry(
+    tmp_path: Path,
+) -> None:
+    identities = [
+        source_identity({"source_path": "repo/src/root.cpp"}),
+        source_identity({"source_path": "boost/include/boost/route.hpp"}),
+    ]
+    record = _doc([10, 11])
+    record[TOKEN_SOURCE_IDENTITY_IDS_COLUMN] = [
+        identity.source_identity_id for identity in identities
+    ]
+    record[SOURCE_IDENTITY_REGISTRY_COLUMN] = [
+        identity.as_dict() for identity in identities
+    ]
+    input_path = tmp_path / "multi_source.parquet"
+    output_path = tmp_path / "packed.parquet"
+    _write_input_parquet(input_path, [record])
+
+    pack_parquet_dataset(
+        input_path,
+        output_path,
+        target_length=2,
+        strategy="sequential",
+    )
+
+    row = pq.read_table(output_path).to_pylist()[0]
+    expected = {identity.source_identity_id for identity in identities}
+    assert set(row[TOKEN_SOURCE_IDENTITY_IDS_COLUMN]) == expected
+    assert {
+        int(entry["source_identity_id"])
+        for entry in row[SOURCE_IDENTITY_REGISTRY_COLUMN]
+    } == expected
+
+
 def test_pack_parquet_dataset_streams_windows_without_full_input_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

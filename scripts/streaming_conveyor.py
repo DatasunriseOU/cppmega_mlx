@@ -305,6 +305,13 @@ def remove_tree(path: Path, *, reason: str) -> None:
     _log(f"CLEANUP {reason}: removed {path}")
 
 
+def should_remove_owned_work_root(
+    *, own_work_root: bool, keep_temp: bool, retain_partial_work: bool
+) -> bool:
+    """Honor both explicit retention modes at the parent work-root boundary."""
+    return own_work_root and not keep_temp and not retain_partial_work
+
+
 def physical_memory_gb() -> float | None:
     """Best-effort physical RAM in GiB using only stdlib/system tools."""
     try:
@@ -3194,7 +3201,11 @@ def main(argv: list[str]) -> int:
         finally:
             if code_recompressor is not None:
                 code_recompressor.shutdown()
-            if own_work_root and not args.keep_temp:
+            if should_remove_owned_work_root(
+                own_work_root=own_work_root,
+                keep_temp=args.keep_temp,
+                retain_partial_work=args.retain_partial_work,
+            ):
                 remove_tree(work_root, reason="source-cache populate work_root")
             for lock in reversed(run_locks):
                 lock.close()
@@ -3405,10 +3416,15 @@ def main(argv: list[str]) -> int:
         interrupted = STOP_EVENT.is_set()
         # Reclaim the randomized work_root whenever production cleanup is active.
         # --retain-partial-work keeps the older zero-rework signal/debug mode.
-        if own_work_root and not args.keep_temp and not interrupted:
-            remove_tree(work_root, reason="clean run work_root")
-        elif own_work_root and not args.keep_temp and interrupted and not args.retain_partial_work:
-            remove_tree(work_root, reason="interrupted run work_root")
+        if should_remove_owned_work_root(
+            own_work_root=own_work_root,
+            keep_temp=args.keep_temp,
+            retain_partial_work=args.retain_partial_work,
+        ):
+            remove_tree(
+                work_root,
+                reason="interrupted run work_root" if interrupted else "clean run work_root",
+            )
         for lock in reversed(run_locks):
             lock.close()
         if recompress_error is not None:

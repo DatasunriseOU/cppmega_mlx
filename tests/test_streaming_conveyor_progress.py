@@ -1384,6 +1384,26 @@ def test_default_conveyor_work_parent_lives_under_outputs():
     assert args.min_free_disk_gb == streaming_conveyor.DEFAULT_MIN_FREE_DISK_GB
 
 
+def test_parent_work_root_cleanup_honors_retain_partial_work():
+    import streaming_conveyor
+
+    assert not streaming_conveyor.should_remove_owned_work_root(
+        own_work_root=True,
+        keep_temp=False,
+        retain_partial_work=True,
+    )
+    assert not streaming_conveyor.should_remove_owned_work_root(
+        own_work_root=True,
+        keep_temp=True,
+        retain_partial_work=False,
+    )
+    assert streaming_conveyor.should_remove_owned_work_root(
+        own_work_root=True,
+        keep_temp=False,
+        retain_partial_work=False,
+    )
+
+
 def test_output_root_args_rebase_runtime_paths(tmp_path):
     import streaming_conveyor
 

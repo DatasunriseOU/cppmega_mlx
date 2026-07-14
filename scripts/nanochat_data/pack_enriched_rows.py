@@ -1254,6 +1254,7 @@ def _selected_input_columns(available: set[str]) -> list[str]:
         for column in (
             TOKEN_IDS_COLUMN,
             SYMBOL_IDENTITIES_COLUMN,
+            SOURCE_IDENTITY_REGISTRY_COLUMN,
             SOURCE_DOC_ID_COLUMN,
             "source_document_id",
             "document_id",
