@@ -14,6 +14,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "cpp_jsonl_generation_compile_eval.py"
 CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
+CASE3_COMPILE_GATE = (
+    ROOT.parent
+    / "cppmega_case3_prompt"
+    / "scripts"
+    / "cpp_generation_compile_eval.py"
+)
 
 
 def _load_module():
@@ -120,6 +126,22 @@ def test_build_model_config_requires_graph_routes_only_in_repo_mode():
     assert off_cfg.require_graph_routes is False
 
 
+def test_shipped_default_cases_exercise_mixed_per_case_graph_contract():
+    mod = _load_module()
+    args = mod.parse_args(["--checkpoint", "unused.safetensors"])
+    cases = mod.load_cases(args.cases)
+    modes = [
+        mod.effective_case_prompt_graph_mode(case, args.prompt_graph_mode)
+        for case in cases
+    ]
+
+    assert args.cases == mod.DEFAULT_CASES
+    assert set(modes) == {"repo", "off"}
+    assert mod.batch_requires_graph_routes(modes) is False
+    assert mod.batch_requires_graph_routes(["repo"]) is True
+    assert mod.batch_requires_graph_routes(["off"]) is False
+
+
 def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 
@@ -152,6 +174,13 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     assert context.receipt["edge_counts"]["type"] > 0
     assert context.receipt["edge_counts"]["def_use"] > 0
     assert context.receipt["edge_counts"]["domain"] > 0
+    dependency_paths = {
+        row["source_path"]
+        for row in context.receipt["provenance"]["context_segments"]
+        if row["role"] == "dependency"
+    }
+    assert "include/repo_api.hpp" in dependency_paths
+    assert "src/repo_helper.cpp" in dependency_paths
     assert set(context.side_channels) == set(mod.TOKEN_SIDECAR_NAMES)
     assert all(tuple(value.shape) == (1, len(context.token_ids) + 1) for value in side.values())
     assert tuple(block_bias.shape) == (
@@ -268,6 +297,56 @@ def test_generate_completion_keeps_graph_sensitive_after_token_one(tmp_path: Pat
     for _input_ids, kwargs in model.calls[1:]:
         assert float(mx.sum(kwargs["block_bias"][:, -1, :]).item()) > 0.0
         assert int(kwargs["structure_ids"][0, -1].item()) > 0
+
+
+def test_generation_e2e_output_is_distinct_from_gold_fixture(tmp_path: Path):
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    cases = mod.load_cases(mod.DEFAULT_CASES)
+
+    class OneStepModel:
+        def __init__(self):
+            self.graph_bias_presence = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.graph_bias_presence.append(kwargs["block_bias"] is not None)
+            return (
+                mx.zeros(
+                    (1, input_ids.shape[1], tokenizer.vocab_size),
+                    dtype=mx.float32,
+                ),
+                None,
+            )
+
+    model = OneStepModel()
+    completions = tmp_path / "generated.jsonl"
+    rows = mod.write_completions(
+        cases,
+        completions,
+        model=model,
+        tokenizer=tokenizer,
+        prompt_mode="source-prefix",
+        seq_len=1024,
+        max_new_tokens=1,
+        temperature=0.0,
+        top_k=None,
+        top_p=1.0,
+        prompt_graph_mode="repo",
+        prompt_sidecars="zero",
+        prepend_code_start=False,
+        cases_dir=mod.DEFAULT_CASES.parent,
+        prompt_graph_cache_dir=tmp_path / "graph-cache",
+        prompt_index_cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+
+    assert model.graph_bias_presence == [True, False]
+    assert [row["prompt_graph_mode"] for row in rows] == ["repo", "off"]
+    assert all(row["completion_source"] == "model_generation" for row in rows)
+    written = [json.loads(line) for line in completions.read_text().splitlines()]
+    assert all(row["completion_source"] == "model_generation" for row in written)
 
 
 def test_resolve_case_prompt_graph_builds_real_index_when_path_absent(
@@ -469,11 +548,38 @@ def test_local_compile_gate_fails_closed_for_failed_candidate(tmp_path: Path):
             cases=cases,
             completions=completions,
             report=report,
-            script=mod.DEFAULT_COMPILE_GATE,
+            script=CASE3_COMPILE_GATE,
             keep_workdir=False,
         )
 
     assert json.loads(report.read_text())["summary"]["passed"] == 0
+
+
+def test_gold_fixture_is_explicit_and_repository_gate_links_all_sources(
+    tmp_path: Path,
+):
+    mod = _load_module()
+    gold = CASE3_FIXTURE / "gold_completions.jsonl"
+    gold_row = json.loads(gold.read_text(encoding="utf-8"))
+    assert gold_row["completion_source"] == "gold_fixture"
+
+    report = tmp_path / "report.json"
+    mod.run_compile_gate(
+        cases=CASE3_FIXTURE / "cases.jsonl",
+        completions=gold,
+        report=report,
+        script=CASE3_COMPILE_GATE,
+        keep_workdir=False,
+    )
+
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["summary"]["passed"] == 1
+    assert payload["summary"]["repository_cases"] == 1
+    assert payload["results"][0]["linked_sources"] == [
+        "src/math_prompt.cpp",
+        "src/repo_helper.cpp",
+        "src/repo_caller.cpp",
+    ]
 
 
 def test_script_help_bootstraps_repo_root_from_sibling_cwd():

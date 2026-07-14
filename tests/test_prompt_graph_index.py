@@ -45,7 +45,8 @@ def test_real_clang_producer_builds_fixture_index_and_prompt_graph(tmp_path: Pat
         _CharacterOffsetTokenizer(), cache_dir=tmp_path / "graph-cache"
     ).build(
         index,
-        PromptGraphContext.from_prompt(
+        PromptGraphContext.from_repository_prompt(
+            index,
             str(case["source_prefix"]),
             document_id=source.id,
             source_path=source.source_path,
@@ -71,6 +72,23 @@ def test_real_clang_producer_builds_fixture_index_and_prompt_graph(tmp_path: Pat
     assert all(symbol.usr for symbol in definitions)
     assert all(symbol.canonical_signature for symbol in definitions)
     assert result.receipt["edge_counts"]["call"] > 0
+    assert result.receipt["hashes"]["compile_args_sha256"]
+    assert result.receipt["hashes"]["dependency_closure_sha256"]
+    assert result.receipt["hashes"]["libclang_version_sha256"]
+    assert result.receipt["toolchain"]["libclang_version"]
+    dependency_paths = {
+        segment.source_path
+        for segment in PromptGraphContext.from_repository_prompt(
+            index,
+            str(case["source_prefix"]),
+            document_id=source.id,
+            source_path=source.source_path,
+            source_start=0,
+        ).segments
+        if segment.role == "dependency"
+    }
+    assert "include/repo_api.hpp" in dependency_paths
+    assert "src/repo_helper.cpp" in dependency_paths
 
 
 def test_real_producer_preserves_overloads_and_cross_document_calls(tmp_path: Path) -> None:
@@ -89,6 +107,28 @@ def test_real_producer_preserves_overloads_and_cross_document_calls(tmp_path: Pa
     assert len({symbol.usr for symbol in overloads}) == 2
     assert len({symbol.canonical_signature for symbol in overloads}) == 2
     assert len({symbol.semantic_identity for symbol in overloads}) == 2
+    assert all(
+        index.document_for_id(symbol.document_id).source[
+            symbol.start : symbol.end
+        ]
+        == "repository_helper"
+        for symbol in overloads
+    )
+
+    constructors = [
+        symbol
+        for symbol in index.symbols
+        if symbol.kind == "function"
+        and symbol.qname == "case3_repo::Accumulator::Accumulator"
+    ]
+    assert len(constructors) == 1
+    constructor = constructors[0]
+    constructor_source = index.document_for_id(constructor.document_id).source
+    assert constructor_source[constructor.start : constructor.end] == "Accumulator"
+    qualifier_start = constructor_source.index("Accumulator")
+    assert constructor.start == constructor_source.index(
+        "Accumulator", qualifier_start + 1
+    )
 
     helper = index.document_for_path("src/repo_helper.cpp")
     caller = index.document_for_path("src/repo_caller.cpp")
@@ -145,7 +185,10 @@ def test_index_cache_key_tracks_repository_and_indexer_freshness(tmp_path: Path)
 
     helper = repo / "src" / "repo_helper.cpp"
     helper.write_text(
-        helper.read_text(encoding="utf-8").replace("value + 2", "value + 3"),
+        helper.read_text(encoding="utf-8").replace(
+            "value < 0 ? 0 : value",
+            "value < 1 ? 0 : value",
+        ),
         encoding="utf-8",
     )
 
@@ -157,6 +200,76 @@ def test_index_cache_key_tracks_repository_and_indexer_freshness(tmp_path: Path)
     assert changed.receipt["hashes"]["repository_sha256"] != first.receipt["hashes"][
         "repository_sha256"
     ]
+    assert changed.receipt["hashes"]["dependency_closure_sha256"] != first.receipt[
+        "hashes"
+    ]["dependency_closure_sha256"]
+
+
+def test_index_cache_key_tracks_resolved_compile_arguments(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURE, repo)
+    compile_commands = repo / "compile_commands.json"
+
+    def write_commands(define: str) -> None:
+        rows = []
+        for relative in (
+            "src/math_prompt.cpp",
+            "src/repo_helper.cpp",
+            "src/repo_caller.cpp",
+        ):
+            source = repo / relative
+            rows.append(
+                {
+                    "directory": str(repo),
+                    "file": str(source),
+                    "arguments": [
+                        "clang++",
+                        "-std=c++20",
+                        f"-I{repo / 'include'}",
+                        define,
+                        "-c",
+                        str(source),
+                    ],
+                }
+            )
+        compile_commands.write_text(json.dumps(rows), encoding="utf-8")
+
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    write_commands("-DCASE3_CACHE_VERSION=1")
+    first = producer.build(repo, project_id="case3-compile-args")
+    write_commands("-DCASE3_CACHE_VERSION=2")
+    second = producer.build(repo, project_id="case3-compile-args")
+
+    assert first.path != second.path
+    assert first.receipt["hashes"]["compile_args_sha256"] != second.receipt[
+        "hashes"
+    ]["compile_args_sha256"]
+    assert any(
+        "-DCASE3_CACHE_VERSION=2" in args
+        for args in second.receipt["toolchain"]["compile_args_by_file"].values()
+    )
+
+
+def test_producer_dependency_is_explicit() -> None:
+    with pytest.raises(ValueError, match="requires explicit indexer_root"):
+        ClangPromptProjectIndexProducer(cache_dir="unused")
+
+
+def test_strict_producer_rejects_clang_parse_errors(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURE, repo)
+    broken = repo / "src" / "broken.cpp"
+    broken.write_text("int broken( {\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="strict clang.*rejected.*broken.cpp"):
+        ClangPromptProjectIndexProducer(
+            cache_dir=tmp_path / "index-cache",
+            indexer_root=ROOT,
+            strict_diagnostics=True,
+        ).build(repo, project_id="case3-strict-error")
 
 
 def test_corrupt_producer_cache_fails_closed(tmp_path: Path) -> None:

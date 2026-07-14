@@ -43,7 +43,8 @@ def _index(tmp_path: Path) -> PromptProjectIndex:
 
 def _context(index: PromptProjectIndex) -> PromptGraphContext:
     document = index.document_for_path("src/math_prompt.cpp")
-    return PromptGraphContext.from_prompt(
+    return PromptGraphContext.from_repository_prompt(
+        index,
         _case()["source_prefix"],
         document_id=document.id,
         source_path=document.source_path,
@@ -55,7 +56,7 @@ def _context(index: PromptProjectIndex) -> PromptGraphContext:
 def test_real_repo_fixture_round_trips_through_compile_prompt(tmp_path: Path) -> None:
     case = _case()
     completion = json.loads(
-        (FIXTURE / "completions.jsonl").read_text(encoding="utf-8")
+        (FIXTURE / "gold_completions.jsonl").read_text(encoding="utf-8")
     )["completion"]
     source = (FIXTURE / "src" / "math_prompt.cpp").read_text(encoding="utf-8")
     index = _index(tmp_path)
@@ -74,7 +75,8 @@ def test_builder_maps_symbol_call_type_def_use_chunk_and_domain_routes(tmp_path:
         index, _context(index)
     )
 
-    assert artifact.token_count == len(prompt)
+    assert artifact.token_count == len(_context(index).text)
+    assert artifact.token_count > len(prompt)
     assert artifact.edge_counts["call"] > 0
     assert artifact.edge_counts["type"] > 0
     assert artifact.edge_counts["def_use"] > 0
@@ -95,16 +97,16 @@ def test_cppmega_tokenizer_offsets_are_exact_and_match_normal_encode(tmp_path: P
         ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
     )
     prompt = _case()["source_prefix"]
-
-    token_ids, offsets = tokenizer.encode_with_offsets(prompt)
+    index = _index(tmp_path)
+    context = _context(index)
+    token_ids, offsets = tokenizer.encode_with_offsets(context.text)
     remote_ids, remote_offsets = CppPromptTokenizerAdapter(
         tokenizer._tokenizer,
         tokenizer_path=tokenizer.path,
-    ).encode_with_offsets(prompt)
-    index = _index(tmp_path)
-    artifact = PromptGraphBuilder(tokenizer).build(index, _context(index))
+    ).encode_with_offsets(context.text)
+    artifact = PromptGraphBuilder(tokenizer).build(index, context)
 
-    assert token_ids == tokenizer.encode(prompt)
+    assert token_ids == tokenizer.encode(context.text)
     assert remote_ids == token_ids
     assert remote_offsets == offsets
     assert list(artifact.token_ids) == token_ids
@@ -119,8 +121,9 @@ def test_cppmega_tokenizer_offsets_are_exact_and_match_normal_encode(tmp_path: P
         canonical_tokenizer.encode("utf-8")
     ).hexdigest()
     assert len(offsets) == len(token_ids)
-    assert all(0 <= start < end <= len(prompt) for start, end in offsets)
-    type_char = prompt.index("Accumulator acc")
+    assert all(0 <= start < end <= len(context.text) for start, end in offsets)
+    target_start = sum(len(segment.text) for segment in context.segments[:-1])
+    type_char = target_start + prompt.index("Accumulator acc")
     type_token = next(
         token_index
         for token_index, (start, end) in enumerate(artifact.token_spans)

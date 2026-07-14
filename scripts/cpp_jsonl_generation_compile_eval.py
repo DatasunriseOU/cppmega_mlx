@@ -52,6 +52,7 @@ PromptSidecars = Literal["zero", "clang"]
 PromptGraphMode = Literal["off", "repo"]
 
 DEFAULT_TOKENIZER = REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
+DEFAULT_CASES = REPO_ROOT / "evals" / "cpp_generation_cases.jsonl"
 DEFAULT_COMPILE_GATE = REPO_ROOT.parent / "cppmega" / "scripts" / "cpp_generation_compile_eval.py"
 MODEL_SIDE_CHANNEL_NAMES = (
     "structure_ids",
@@ -206,6 +207,14 @@ def effective_case_prompt_graph_mode(
     return case_mode
 
 
+def batch_requires_graph_routes(
+    case_modes: Iterable[PromptGraphMode],
+) -> bool:
+    """Use the model-global assertion only when every case requires routes."""
+    modes = tuple(case_modes)
+    return bool(modes) and all(mode == "repo" for mode in modes)
+
+
 def resolve_case_prompt_graph(
     case: dict[str, Any],
     *,
@@ -269,6 +278,7 @@ def resolve_case_prompt_graph(
         built = ClangPromptProjectIndexProducer(
             cache_dir=prompt_index_cache_dir,
             indexer_root=indexer_root,
+            strict_diagnostics=True,
         ).build(repository_root, project_id=project_id)
         project_index = built.index
         index_path = built.path
@@ -379,7 +389,8 @@ def build_prompt_context(
             cache_dir=prompt_graph_cache_dir,
         ).build(
             project_index,
-            PromptGraphContext.from_prompt(
+            PromptGraphContext.from_repository_prompt(
+                project_index,
                 prompt,
                 document_id=prompt_document_id,
                 source_path=prompt_source_path,
@@ -986,6 +997,7 @@ def write_completions(
             row = {
                 "task_id": case["task_id"],
                 "completion": completion,
+                "completion_source": "model_generation",
                 "prompt_tokens": prompt_tokens,
                 "generated_tokens": generated_tokens,
                 "prompt_graph_mode": case_graph_mode,
@@ -1051,9 +1063,9 @@ def run_compile_gate(
     subprocess.run(cmd, check=True, env=compile_gate_env())
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--cases", type=Path, required=True)
+    ap.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, default=REPO_ROOT / "outputs" / "mlx_generation_eval")
     ap.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
@@ -1082,7 +1094,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--clang-indexer-root",
         type=Path,
-        default=None,
+        default=REPO_ROOT,
         help="Checkout containing tools/clang_indexer/index_project.py.",
     )
     ap.add_argument("--prompt-sidecars", choices=("zero", "clang"), default="zero")
@@ -1110,7 +1122,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ngram-hash-heads", type=int, default=8)
     ap.add_argument("--ngram-hash-table-size", type=int, default=500_000)
     ap.add_argument("--ngram-hash-embed-dim", type=int, default=16)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.seq_len <= 0:
         raise ValueError("--seq-len must be positive")
     if args.max_new_tokens < 0:
@@ -1142,18 +1154,19 @@ def main() -> None:
         effective_case_prompt_graph_mode(case, args.prompt_graph_mode)
         for case in cases
     ]
-    args.require_graph_routes = any(mode == "repo" for mode in case_graph_modes)
-    if args.require_graph_routes and args.prompt_sidecars != "zero":
+    has_graph_cases = any(mode == "repo" for mode in case_graph_modes)
+    args.require_graph_routes = batch_requires_graph_routes(case_graph_modes)
+    if has_graph_cases and args.prompt_sidecars != "zero":
         raise ValueError(
             "repository prompt graph cases cannot be combined with "
             "--prompt-sidecars clang"
         )
-    if args.require_graph_routes and args.prepend_code_start:
+    if has_graph_cases and args.prepend_code_start:
         raise ValueError(
             "repository prompt graph cases cannot be combined with "
             "--prepend-code-start"
         )
-    if not args.require_graph_routes:
+    if not has_graph_cases:
         prompt_graph_cache_dir = None
         prompt_index_cache_dir = None
 
