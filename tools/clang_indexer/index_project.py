@@ -821,8 +821,25 @@ def normalize_qualified_name(qname: str) -> str:
     return normalize_inline_namespace_qname(normalized)
 
 
+def _cursor_kind(cursor: Cursor):
+    """Return a binding-known CursorKind, or None for newer opaque kinds.
+
+    Some libclang releases emit cursor IDs that their bundled Python cindex
+    table does not register.  Accessing ``cursor.kind`` then raises ValueError;
+    those cursors are non-semantic attributes for our purposes and must not
+    abort the translation unit.
+    """
+    try:
+        return cursor.kind
+    except ValueError:
+        return None
+
+
 def _cursor_kind_name(cursor: Cursor) -> str:
-    kind = getattr(cursor, "kind", None)
+    kind = _cursor_kind(cursor)
+    if kind is None:
+        raw_kind = getattr(cursor, "_kind_id", None)
+        return f"UNKNOWN_CURSOR_{raw_kind}" if raw_kind is not None else "UNKNOWN_CURSOR"
     name = getattr(kind, "name", None)
     if isinstance(name, str):
         return name
@@ -1926,7 +1943,7 @@ def extract_clang_ast_metadata(
         if offsets is not None:
             start, end = offsets
             end = min(end, text_len)
-            bucket = _bucket_clang_cursor_kind(cursor.kind)
+            bucket = _bucket_clang_cursor_kind(_cursor_kind(cursor))
             clamped_depth = min(depth, 65535)
             clamped_sib = min(sib_idx, 65535)
             for char_idx in range(start, end):
@@ -1990,7 +2007,7 @@ def extract_callees(cursor: Cursor) -> tuple[list[str], list[str]]:
     baselib_callees: set[str] = set()
 
     def walk(node: Cursor):
-        if node.kind == CursorKind.CALL_EXPR:
+        if _cursor_kind(node) == CursorKind.CALL_EXPR:
             ref = node.referenced
             if ref and ref.spelling:
                 # Get fully qualified name
@@ -2038,7 +2055,7 @@ def extract_callee_references(
     baselib: dict[str, SymbolReference] = {}
 
     def walk(node: Cursor):
-        if node.kind == CursorKind.CALL_EXPR:
+        if _cursor_kind(node) == CursorKind.CALL_EXPR:
             ref = node.referenced
             if ref and ref.spelling:
                 qname = get_qualified_name(ref)
@@ -2095,9 +2112,13 @@ def extract_referenced_types(cursor: Cursor) -> list[str]:
     types: set[str] = set()
 
     def walk(node: Cursor):
-        if node.kind in _REFERENCED_TYPE_CURSOR_KINDS:
+        if _cursor_kind(node) in _REFERENCED_TYPE_CURSOR_KINDS:
             ref = node.referenced
-            if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
+            if (
+                ref is not None
+                and ref.spelling
+                and _cursor_kind(ref) in _REFERENCED_TYPE_DECL_KINDS
+            ):
                 qname = get_qualified_name(ref)
                 if qname and not is_system_function(qname):
                     types.add(qname)
@@ -2138,9 +2159,13 @@ def extract_referenced_type_references(
     refs: dict[str, SymbolReference] = {}
 
     def walk(node: Cursor):
-        if node.kind in _REFERENCED_TYPE_CURSOR_KINDS:
+        if _cursor_kind(node) in _REFERENCED_TYPE_CURSOR_KINDS:
             ref = node.referenced
-            if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
+            if (
+                ref is not None
+                and ref.spelling
+                and _cursor_kind(ref) in _REFERENCED_TYPE_DECL_KINDS
+            ):
                 qname = get_qualified_name(ref)
                 if qname and not is_system_function(qname):
                     reference = symbol_reference_for_cursor(
@@ -2161,7 +2186,7 @@ def get_qualified_name(cursor: Cursor) -> str:
     """Get the fully qualified name of a cursor (namespace::class::func)."""
     parts = []
     c = cursor
-    while c and c.kind != CursorKind.TRANSLATION_UNIT:
+    while c and _cursor_kind(c) != CursorKind.TRANSLATION_UNIT:
         if c.spelling:
             parts.append(c.spelling)
         c = c.semantic_parent
@@ -2175,12 +2200,14 @@ def extract_preamble(tu: TranslationUnit, filename: str) -> str:
     for cursor in tu.cursor.get_children():
         if cursor.location.file and cursor.location.file.name != filename:
             continue
-        if cursor.kind in (CursorKind.INCLUSION_DIRECTIVE,
-                           CursorKind.USING_DIRECTIVE,
-                           CursorKind.USING_DECLARATION,
-                           CursorKind.TYPEDEF_DECL,
-                           CursorKind.TYPE_ALIAS_DECL,
-                           CursorKind.NAMESPACE_ALIAS):
+        if _cursor_kind(cursor) in (
+            CursorKind.INCLUSION_DIRECTIVE,
+            CursorKind.USING_DIRECTIVE,
+            CursorKind.USING_DECLARATION,
+            CursorKind.TYPEDEF_DECL,
+            CursorKind.TYPE_ALIAS_DECL,
+            CursorKind.NAMESPACE_ALIAS,
+        ):
             text = get_function_text(cursor, tu)
             if text:
                 preamble_parts.append(text)
@@ -2230,9 +2257,10 @@ def _header_decl_kind(cursor, text: str, *, in_primary_file: bool) -> int | None
     """Return a structure kind for trainable non-type header declarations."""
     if not in_primary_file:
         return None
-    if cursor.kind == _CONCEPT_DECL_KIND:
+    kind = _cursor_kind(cursor)
+    if kind == _CONCEPT_DECL_KIND:
         return HEADER_FRAGMENT_KIND
-    if cursor.kind not in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND}:
+    if kind not in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND}:
         return None
     stripped = text.lstrip()
     padded = f" {stripped} "
@@ -2363,7 +2391,8 @@ def parse_translation_unit(
         if not in_project:
             return  # skip system/third-party headers entirely
 
-        if in_primary_file and cursor.kind in FUNCTION_KINDS and cursor.is_definition():
+        kind = _cursor_kind(cursor)
+        if in_primary_file and kind in FUNCTION_KINDS and cursor.is_definition():
             text, func_ast_depth, func_sibling_index, func_ast_node_type, offsets = (
                 _cursor_text_and_metadata(
                     cursor,
@@ -2452,7 +2481,7 @@ def parse_translation_unit(
         # Register type DEFINITIONS (struct/class/enum/union/typedef/using) as
         # type-edge target chunks. We require an actual definition so a forward
         # declaration never shadows the real body.
-        type_bucket = _TYPE_DEF_KIND_BUCKET.get(cursor.kind)
+        type_bucket = _TYPE_DEF_KIND_BUCKET.get(kind)
         if type_bucket is not None and cursor.is_definition():
             qname = get_qualified_name(cursor)
             # Normal path drops std::/boost:: ("system") type names; the std
@@ -2484,7 +2513,7 @@ def parse_translation_unit(
 
         header_decl_text = ""
         header_decl_kind = None
-        if cursor.kind in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND, _CONCEPT_DECL_KIND}:
+        if kind in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND, _CONCEPT_DECL_KIND}:
             header_decl_text = get_function_text(cursor, tu)
             if header_decl_text:
                 header_decl_kind = _header_decl_kind(
@@ -2515,7 +2544,7 @@ def parse_translation_unit(
                     symbol_kind=_cursor_kind_name(cursor),
                 ))
 
-        if cursor.kind in CONTAINER_KINDS:
+        if kind in CONTAINER_KINDS:
             # Recurse into namespaces, classes, structs for nested defs.
             for child in cursor.get_children():
                 visit(child)
@@ -3450,7 +3479,8 @@ def extract_semantic_metadata(
     ) -> list[tuple[int, int]]:
         def find_reference(node: Cursor) -> list[tuple[int, int]]:
             for child in node.get_children():
-                if child.kind in _REFERENCE_KINDS:
+                child_kind = _cursor_kind(child)
+                if child_kind in _REFERENCE_KINDS:
                     child_target = child.referenced
                     if (
                         child_target is not None
@@ -3460,7 +3490,7 @@ def extract_semantic_metadata(
                         spans = _cursor_name_spans(child, child_target.spelling)
                         if spans:
                             return spans
-                if child.kind not in _CALL_KINDS:
+                if child_kind not in _CALL_KINDS:
                     spans = find_reference(child)
                     if spans:
                         return spans
@@ -3487,7 +3517,7 @@ def extract_semantic_metadata(
         if loc.file.name != filename:
             return
 
-        kind = cursor.kind
+        kind = _cursor_kind(cursor)
 
         # Symbol identification: get qualified name for definitions and refs
         qname = ""

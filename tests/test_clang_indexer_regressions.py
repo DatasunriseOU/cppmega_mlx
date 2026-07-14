@@ -23,6 +23,20 @@ def _std_flags(args: list[str]) -> list[str]:
     return [arg for arg in args if arg.startswith("-std=")]
 
 
+def test_unknown_libclang_cursor_kind_is_opaque_not_fatal() -> None:
+    class UnknownCursor:
+        _kind_id = 437
+
+        @property
+        def kind(self):
+            raise ValueError("Unknown template argument kind 437")
+
+    cursor = UnknownCursor()
+    assert ip._cursor_kind(cursor) is None
+    assert ip._cursor_kind_name(cursor) == "UNKNOWN_CURSOR_437"
+    assert ip._bucket_clang_cursor_kind(ip._cursor_kind(cursor)) == 255
+
+
 def test_semantic_metadata_uses_name_tokens_and_template_type_edges(
     tmp_path: Path,
 ) -> None:
