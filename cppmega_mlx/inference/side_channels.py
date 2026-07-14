@@ -1058,6 +1058,17 @@ def _token_aligned_array(
         raise ValueError(
             f"{name} must have one value per token: got {len(items)}, expected {token_count}"
         )
+    if name in {
+        "symbol_ids",
+        "call_targets",
+        "type_refs",
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+    }:
+        if any(item < 0 or item > (1 << 64) - 1 for item in items):
+            raise ValueError(f"{name} opaque identities must fit unsigned 64-bit")
+        return mx.array([items], dtype=mx.uint64)
     return mx.array([items], dtype=mx.int32)
 
 

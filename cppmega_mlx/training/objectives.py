@@ -39,6 +39,7 @@ from cppmega_mlx.data.ast_fim import (
     DEFAULT_AST_FIM_RATE,
     AstFimResult,
     apply_ast_fim,
+    logical_document_spans,
 )
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
@@ -129,16 +130,31 @@ def _shifted(ids: list[int], loss_positions: list[bool]) -> tuple[mx.array, mx.a
 # CAUSAL_LM
 # --------------------------------------------------------------------------- #
 def build_causal_lm(packet: CodePacket) -> ObjectiveExample:
-    """Predict every next token across the packet's full token window."""
+    """Predict next tokens without supervising cross-document transitions."""
 
     ids = _token_list(packet.token_ids, where="causal_lm: CodePacket.token_ids")
-    inputs, targets, mask = _shifted(ids, [True] * (len(ids) - 1))
+    document_spans = logical_document_spans(packet)
+    document_ids = [0] * len(ids)
+    for start, end, document_id in document_spans:
+        document_ids[start:end] = [document_id] * (end - start)
+    loss_positions = [
+        document_ids[index] == document_ids[index + 1]
+        for index in range(len(ids) - 1)
+    ]
+    if not any(loss_positions):
+        raise ValueError(
+            "causal_lm requires at least one within-document token transition"
+        )
+    inputs, targets, mask = _shifted(ids, loss_positions)
     return ObjectiveExample(
         input_ids=inputs,
         target_ids=targets,
         loss_mask=mask,
         objective="causal_lm",
-        metadata={"length": len(ids)},
+        metadata={
+            "length": len(ids),
+            "document_spans": tuple((start, end) for start, end, _ in document_spans),
+        },
     )
 
 
@@ -204,6 +220,7 @@ def _example_from_fim(
             "fim_mode": result.mode,
             "span": result.span,
             "chunk_index": result.chunk_index,
+            "source_document_span": result.document_span,
         },
     )
 
@@ -248,9 +265,20 @@ def _random_fim_result(
     if not 0.0 <= spm_rate <= 1.0:
         raise ValueError(f"spm_rate must be in [0, 1], got {spm_rate}")
     rand = rng if rng is not None else random.Random(seed)
-    tokens = _token_list(packet.token_ids, where="fim: CodePacket.token_ids")
-    if len(tokens) < 3:
-        raise ValueError(f"fim requires at least 3 tokens, got {len(tokens)}")
+    all_tokens = _token_list(packet.token_ids, where="fim: CodePacket.token_ids")
+    eligible_documents = [
+        span
+        for span in logical_document_spans(packet)
+        if span[1] - span[0] >= 3
+    ]
+    if not eligible_documents:
+        raise ValueError(
+            "fim requires at least one logical document with at least 3 tokens"
+        )
+    document_start, document_end, _document_id = eligible_documents[
+        rand.randrange(len(eligible_documents))
+    ]
+    tokens = all_tokens[document_start:document_end]
     span = sample_middle_span(len(tokens), rng=rand)
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
     if instruction_token_ids is None:
@@ -276,6 +304,7 @@ def _random_fim_result(
         mode=mode,
         kind=kind,
         chunk_index=None,
+        document_span=(document_start, document_end),
     )
 
 

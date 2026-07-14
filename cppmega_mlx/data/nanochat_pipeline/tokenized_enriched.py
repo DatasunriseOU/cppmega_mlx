@@ -272,22 +272,51 @@ def _chunk_boundaries_to_token_offsets(
     del text
     if not chunk_boundaries or not token_lengths:
         return []
-    starts, _valid = _extract_token_char_starts_and_valid(token_lengths)
-    if not starts:
+    if token_lengths and isinstance(token_lengths[0], tuple):
+        spans = [
+            (int(start), int(end))
+            for start, end in cast(list[tuple[int, int]], token_lengths)
+        ]
+    else:
+        starts, valid = _extract_token_char_starts_and_valid(token_lengths)
+        lengths = cast(list[int], token_lengths)
+        spans = [
+            (start, start + max(int(length), 0)) if is_valid else (start, start)
+            for start, length, is_valid in zip(starts, lengths, valid, strict=True)
+        ]
+    if not spans:
         return []
 
     result: list[dict[str, Any]] = []
-    for cb in chunk_boundaries:
-        char_start = int(cb.get("start", 0))
-        tok_idx = bisect.bisect_right(starts, char_start) - 1
-        if tok_idx < 0:
-            tok_idx = 0
-        elif tok_idx >= len(starts):
-            tok_idx = len(starts) - 1
+    for chunk_index, cb in enumerate(chunk_boundaries):
+        if "start" not in cb or "end" not in cb:
+            raise ValueError(
+                f"chunk_boundaries[{chunk_index}] requires exact clang start/end"
+            )
+        char_start = int(cb["start"])
+        char_end = int(cb["end"])
+        if not 0 <= char_start < char_end:
+            raise ValueError(
+                f"chunk_boundaries[{chunk_index}] invalid half-open clang span "
+                f"[{char_start}, {char_end})"
+            )
+        overlapping = [
+            token_index
+            for token_index, (token_start, token_end) in enumerate(spans)
+            if token_end > token_start
+            and token_end > char_start
+            and token_start < char_end
+        ]
+        if not overlapping:
+            raise ValueError(
+                f"chunk_boundaries[{chunk_index}] clang span "
+                f"[{char_start}, {char_end}) overlaps no tokenizer span"
+            )
         result.append(
             {
-                "token_offset": int(tok_idx),
-                "end_char": cb.get("end", cb.get("start", 0)),
+                "token_offset": overlapping[0],
+                "token_end": overlapping[-1] + 1,
+                "end_char": char_end,
                 "kind": cb.get("kind", 0),
                 "name": cb.get("name", ""),
                 "dep_level": cb.get("dep_level", 0),
@@ -389,10 +418,13 @@ def _build_token_chunk_layout(
     index_map = {orig_idx: new_idx for new_idx, (orig_idx, _) in enumerate(chunk_entries)}
 
     starts = [int(chunk.get("token_offset", 0)) for _, chunk in chunk_entries]
-    ends = [
-        starts[i + 1] if i + 1 < len(starts) else int(token_count)
-        for i in range(len(starts))
-    ]
+    ends = [int(chunk["token_end"]) for _, chunk in chunk_entries]
+    for chunk_index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        if not 0 <= start < end <= token_count:
+            raise ValueError(
+                f"token chunk {chunk_index} exact span [{start}, {end}) is "
+                f"outside 0..{token_count}"
+            )
     kinds = [_kind_to_int(chunk.get("kind", 0)) for _, chunk in chunk_entries]
     dep_levels = [int(chunk.get("dep_level", 0)) for _, chunk in chunk_entries]
 

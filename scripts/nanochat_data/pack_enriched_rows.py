@@ -271,9 +271,9 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
-        pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-        pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-        pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+        pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+        pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
         pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
@@ -968,41 +968,32 @@ def _list_input_files(input_path: str | os.PathLike[str]) -> list[Path]:
     raise FileNotFoundError(f"Input path does not exist: {path}")
 
 
-def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
-    explicit = (
-        SOURCE_DOC_ID_COLUMN,
-        "source_document_id",
-        "document_id",
-        "doc_id",
-    )
-    if any(record.get(column) is not None for column in explicit):
-        return True
-    provenance = (
-        REPO_STABLE_ID_COLUMN,
-        FILEPATH_STABLE_ID_COLUMN,
-        COMMIT_HASH_COLUMN,
-        FILE_LOCAL_COMMIT_INDEX_COLUMN,
-    )
-    return any(record.get(column) is not None for column in provenance)
-
-
 def _stable_doc_id_for_record(
     record: dict[str, Any],
     *,
     source_doc_index: int,
     signature_to_id: dict[str, int],
 ) -> int:
-    signature = (
-        stable_doc_signature(record)
-        if _has_stable_doc_signature(record)
-        else f"__anonymous_source_row__:{source_doc_index}"
-    )
+    del source_doc_index
+    signature = stable_doc_signature(record)
     doc_id = signature_to_id.get(signature)
     if doc_id is None:
-        doc_id = max(
-            max(signature_to_id.values(), default=0),
-            int(source_doc_index),
-        ) + 1
+        doc_id = int.from_bytes(
+            hashlib.sha256(signature.encode("utf-8")).digest()[:4], "big"
+        ) or 1
+        collision = next(
+            (
+                existing_signature
+                for existing_signature, existing_id in signature_to_id.items()
+                if existing_id == doc_id and existing_signature != signature
+            ),
+            None,
+        )
+        if collision is not None:
+            raise ValueError(
+                "stable document identity hash collision: "
+                f"id={doc_id} signatures={collision!r}, {signature!r}"
+            )
         signature_to_id[signature] = doc_id
     return int(doc_id)
 

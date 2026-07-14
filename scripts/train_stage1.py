@@ -102,6 +102,10 @@ def _i32(values) -> mx.array:
     return mx.array(np.asarray(values, dtype=np.int32))
 
 
+def _u64(values) -> mx.array:
+    return mx.array(np.asarray(values, dtype=np.uint64))
+
+
 def load_code_packets(
     parquet_paths: Iterable[Path],
     *,
@@ -140,6 +144,12 @@ def load_code_packets(
                         f"{path.name}[row={row_index}].{name}: length {len(vals)} "
                         f"!= valid_token_count {vtc}"
                     )
+                if name in {
+                    "token_symbol_ids",
+                    "token_call_targets",
+                    "token_type_refs",
+                }:
+                    return _u64(vals)
                 return _i32(vals)
 
             # Chunk-aligned (NOT token-aligned) clang boundaries — required by the

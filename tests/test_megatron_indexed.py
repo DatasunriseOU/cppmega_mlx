@@ -1145,6 +1145,7 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
     docs = [np.arange(8, dtype=np.int32)]
     _write_mmididx(prefix, docs, dtype=np.int32)
     flat = np.concatenate(docs)
+    high_identity = np.uint64((1 << 63) + 1000)
     sidecar_specs = {
         "token_structure_ids": ((flat % 7).astype(np.uint8), "uint8"),
         "token_dep_levels": ((flat % 3).astype(np.uint16), "uint16"),
@@ -1152,9 +1153,18 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
         "token_sibling_index": ((flat % 4).astype(np.uint16), "uint16"),
         "token_ast_node_type": ((flat % 11).astype(np.uint16), "uint16"),
         "token_platform_ids": ((flat % 13).astype(np.uint16), "uint16"),
-        "token_symbol_ids": ((flat + 100).astype(np.uint32), "uint32"),
-        "token_call_targets": ((flat + 200).astype(np.uint32), "uint32"),
-        "token_type_refs": ((flat + 300).astype(np.uint32), "uint32"),
+        "token_symbol_ids": (
+            np.arange(flat.size, dtype=np.uint64) + high_identity,
+            "uint64",
+        ),
+        "token_call_targets": (
+            np.arange(flat.size, dtype=np.uint64) + high_identity + np.uint64(100),
+            "uint64",
+        ),
+        "token_type_refs": (
+            np.arange(flat.size, dtype=np.uint64) + high_identity + np.uint64(200),
+            "uint64",
+        ),
         "token_def_use": ((flat % 2).astype(np.uint8), "uint8"),
         "token_change_mask_pre": ((flat == 2).astype(np.uint8), "uint8"),
         "token_change_mask_post": ((flat == 3).astype(np.uint8), "uint8"),
@@ -1177,16 +1187,21 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
     temporal = batch.side_channel_map()["temporal_diff"]
     np.testing.assert_array_equal(
         np.array(semantic["symbol_ids"]),
-        np.array(batch.tokens) + 100,
+        np.arange(flat.size, dtype=np.uint64).reshape(2, 4) + high_identity,
     )
     np.testing.assert_array_equal(
         np.array(semantic["call_targets"]),
-        np.array(batch.tokens) + 200,
+        np.arange(flat.size, dtype=np.uint64).reshape(2, 4)
+        + high_identity
+        + np.uint64(100),
     )
     np.testing.assert_array_equal(
         np.array(semantic["type_refs"]),
-        np.array(batch.tokens) + 300,
+        np.arange(flat.size, dtype=np.uint64).reshape(2, 4)
+        + high_identity
+        + np.uint64(200),
     )
+    assert np.array(semantic["symbol_ids"]).dtype == np.dtype(np.uint64)
     np.testing.assert_array_equal(
         np.array(semantic["def_use"]),
         np.array(batch.tokens) % 2,
@@ -1539,6 +1554,8 @@ def test_megatron_indexed_side_channel_schema_documents_aliases_and_dtypes() -> 
     assert "token_ast_depth" in ast_depth_aliases
     assert "token_symbol_ids" in schema["symbol_ids"]["aliases"]
     assert schema["symbol_ids"]["family"] == "semantic_graph"
+    assert schema["symbol_ids"]["default_dtype"] == "uint64"
+    assert schema["symbol_ids"]["target_dtype"] == "uint64"
     assert schema["change_mask_pre"]["family"] == "temporal_diff"
     assert schema["structure_ids"]["default_dtype"] == "int32"
     assert schema["structure_ids"]["target_dtype"] == "int32"

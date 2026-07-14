@@ -133,7 +133,11 @@ def normalize_rates(
             f"task rates must sum to 1.0 (within {_RATE_SUM_TOL}); got {total} "
             f"for {{ {', '.join(f'{k.value}={v}' for k, v in canonical.items())} }}"
         )
-    return canonical
+    return {
+        task: canonical[task]
+        for task in TaskKind
+        if task in canonical
+    }
 
 
 class TaskMixer:

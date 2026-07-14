@@ -63,6 +63,9 @@ _TOKEN_SEMANTIC_METADATA_COLUMNS = (
     "token_type_refs",
     "token_def_use",
 )
+_OPAQUE_IDENTITY_METADATA_COLUMNS = frozenset(
+    ("token_symbol_ids", "token_call_targets", "token_type_refs")
+)
 _TOKEN_TEMPORAL_METADATA_COLUMNS = (
     "token_change_mask_pre",
     "token_change_mask_post",
@@ -365,7 +368,7 @@ class TokenParquetDataset:
         }
         self._family_side_channels = {
             family: {
-                column: value.astype(np.int32, copy=False)
+                column: _family_side_channel_values(column, value)
                 for column, value in family_columns.items()
             }
             for family, family_columns in family_side_channel_columns.channels.items()
@@ -1048,6 +1051,18 @@ def _family_side_channel_windows(
                 "type": columns.type_label(column),
             }
     return _FamilySideChannelColumns(channels=channels, sources=sources)
+
+
+def _family_side_channel_values(column: str, values: np.ndarray) -> np.ndarray:
+    if column in _OPAQUE_IDENTITY_METADATA_COLUMNS:
+        if values.dtype.kind not in {"i", "u"} or (
+            values.dtype.kind == "i" and np.any(values < 0)
+        ):
+            raise ValueError(
+                f"{column} opaque identities must be non-negative integers"
+            )
+        return values.astype(np.uint64, copy=False)
+    return values.astype(np.int32, copy=False)
 
 
 def _family_graph_side_channel_windows(

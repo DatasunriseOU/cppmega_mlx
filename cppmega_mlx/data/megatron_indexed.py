@@ -37,6 +37,11 @@ _SEMANTIC_SIDE_CHANNEL_KEYS = (
     "type_refs",
     "def_use",
 )
+_OPAQUE_IDENTITY_SIDE_CHANNEL_KEYS = (
+    "symbol_ids",
+    "call_targets",
+    "type_refs",
+)
 _TEMPORAL_SIDE_CHANNEL_KEYS = (
     "change_mask_pre",
     "change_mask_post",
@@ -158,6 +163,7 @@ _NAMED_DTYPES: dict[str, np.dtype] = {
     "uint16": np.dtype(np.uint16),
     "int32": np.dtype(np.int32),
     "uint32": np.dtype(np.uint32),
+    "uint64": np.dtype(np.uint64),
     "int64": np.dtype(np.int64),
 }
 
@@ -1505,12 +1511,16 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
 def _default_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
+    if key in _OPAQUE_IDENTITY_SIDE_CHANNEL_KEYS:
+        return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
 
 def _target_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
+    if key in _OPAQUE_IDENTITY_SIDE_CHANNEL_KEYS:
+        return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
 
@@ -1543,6 +1553,14 @@ def _side_channel_family(key: str) -> str:
 def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return values.astype(np.float32, copy=False)
+    if key in _OPAQUE_IDENTITY_SIDE_CHANNEL_KEYS:
+        if values.dtype.kind not in {"i", "u"} or (
+            values.dtype.kind == "i" and np.any(values < 0)
+        ):
+            raise ValueError(
+                f"{key} opaque identities must be non-negative integers"
+            )
+        return values.astype(np.uint64, copy=False)
     if key != "hunk_ids" and np.any(values < 0):
         raise ValueError(f"{key} side-channel IDs must be non-negative")
     if key == "hunk_ids" and np.any(values < np.iinfo(np.int32).min):

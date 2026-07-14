@@ -41,9 +41,9 @@ OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("token_ast_depth", "uint16"),
     ("token_sibling_index", "uint16"),
     ("token_ast_node_type", "uint16"),
-    ("token_symbol_ids", "uint32"),
-    ("token_call_targets", "uint32"),
-    ("token_type_refs", "uint32"),
+    ("token_symbol_ids", "uint64"),
+    ("token_call_targets", "uint64"),
+    ("token_type_refs", "uint64"),
     ("token_def_use", "uint8"),
     ("token_change_mask_pre", "uint8"),
     ("token_change_mask_post", "uint8"),
@@ -62,6 +62,17 @@ OBJECTIVE_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_chunk_dep_levels", "ragged_1d", "uint16"),
 )
 _KNOWN_TASKS = frozenset(task.value for task in TaskKind)
+OBJECTIVE_KIND_IDS = {
+    TaskKind.CAUSAL_LM.value: 1,
+    TaskKind.FIM.value: 2,
+    TaskKind.AST_FIM.value: 3,
+    TaskKind.IFIM.value: 4,
+    TaskKind.COMMIT_DIFF.value: 5,
+    TaskKind.PRE_TO_POST.value: 6,
+    TaskKind.SYMBOL_RECOVERY.value: 7,
+    TaskKind.TYPE_RECOVERY.value: 8,
+    TaskKind.CALLEE_RECOVERY.value: 9,
+}
 _REQUIRED_PRODUCTION_TASKS = frozenset(
     {
         TaskKind.CAUSAL_LM.value,
@@ -193,7 +204,7 @@ class MaterializedMegatronDocument:
 def _transformed_source_identity(
     source: ObjectiveSource,
     *,
-    fallback: int,
+    source_document_span: object,
     required: bool,
 ) -> int:
     packet = source.code_packet
@@ -201,15 +212,72 @@ def _transformed_source_identity(
         source_ids = _ints(
             packet.source_doc_ids, where="CodePacket.source_doc_ids"
         )
+        if source_document_span is not None:
+            if (
+                not isinstance(source_document_span, (tuple, list))
+                or len(source_document_span) != 2
+            ):
+                raise ValueError("objective source_document_span must be a pair")
+            start, end = (int(value) for value in source_document_span)
+            if not 0 <= start < end <= len(source_ids):
+                raise ValueError(
+                    f"objective source_document_span [{start}, {end}) is outside "
+                    f"{len(source_ids)} source identity tokens"
+                )
+            source_ids = source_ids[start:end]
         unique = {source_id for source_id in source_ids if source_id > 0}
-        if len(unique) == 1 and len(unique) == len(set(source_ids)):
+        if len(unique) == 1 and all(source_id > 0 for source_id in source_ids):
             return next(iter(unique))
     if required:
         raise ValueError(
             "pre-materialized transformed objective requires exactly one positive "
             "stable source in CodePacket.source_doc_ids"
         )
-    return fallback
+    if packet is not None:
+        fingerprint = {
+            "kind": "code",
+            "repo": packet.repo,
+            "filepath": packet.filepath,
+            "commit_or_ref": packet.commit_or_ref,
+            "token_ids": _ints(packet.token_ids, where="CodePacket.token_ids"),
+        }
+    elif source.commit_packet is not None:
+        commit = source.commit_packet
+        fingerprint = {
+            "kind": "commit",
+            "repo": commit.repo,
+            "filepath": commit.filepath,
+            "commit_or_ref": commit.commit_or_ref,
+            "commit_msg": (
+                None
+                if commit.commit_msg is None
+                else _ints(commit.commit_msg, where="CommitPacket.commit_msg")
+            ),
+            "diff_token_ids": (
+                None
+                if commit.diff_token_ids is None
+                else _ints(
+                    commit.diff_token_ids, where="CommitPacket.diff_token_ids"
+                )
+            ),
+            "pre_token_ids": (
+                None
+                if commit.pre_token_ids is None
+                else _ints(commit.pre_token_ids, where="CommitPacket.pre_token_ids")
+            ),
+            "post_token_ids": (
+                None
+                if commit.post_token_ids is None
+                else _ints(commit.post_token_ids, where="CommitPacket.post_token_ids")
+            ),
+        }
+    else:  # pragma: no cover - ObjectiveSource validates this invariant
+        raise ValueError("transformed objective has no source packet")
+    digest = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).digest()
+    identity = int.from_bytes(digest[:4], "big")
+    return identity or 1
 
 
 def _canonical_contract_sha256(contract: Mapping[str, object]) -> str:
@@ -299,39 +367,44 @@ def write_objective_materialization_artifact(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     contract_tmp.replace(contract_path)
+    shard_records = [
+        {
+            "path": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": _file_sha256(path),
+        }
+        for path in resolved_shards
+    ]
+    converter = {
+        "split": "all",
+        "token_column": "input_ids",
+        "length_column": "valid_token_count",
+        "side_channels": [
+            {"column": column, "dtype": dtype}
+            for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
+        ],
+        "graph_sidecars": [
+            {"column": column, "kind": kind, "dtype": dtype}
+            for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
+        ],
+        "source_platform_sidecar": "require",
+        "graph_relations": list(relations),
+        "graph_pair_mask": pair_mask,
+        "chunk_edge_expansion": expansion,
+    }
     artifact = {
         "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
         "documents": documents,
         "objective_contract": {
             "path": contract_path.name,
             "sha256": _canonical_contract_sha256(payload),
+            "size_bytes": contract_path.stat().st_size,
+            "file_sha256": _file_sha256(contract_path),
         },
-        "parquet_shards": [
-            {
-                "path": path.name,
-                "size_bytes": path.stat().st_size,
-                "sha256": _file_sha256(path),
-            }
-            for path in resolved_shards
-        ],
-        "converter": {
-            "split": "all",
-            "token_column": "input_ids",
-            "length_column": "valid_token_count",
-            "side_channels": [
-                {"column": column, "dtype": dtype}
-                for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
-            ],
-            "graph_sidecars": [
-                {"column": column, "kind": kind, "dtype": dtype}
-                for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
-            ],
-            "source_platform_sidecar": "require",
-            "graph_relations": list(relations),
-            "graph_pair_mask": pair_mask,
-            "chunk_edge_expansion": expansion,
-        },
+        "parquet_shards": shard_records,
+        "converter": converter,
     }
+    artifact["artifact_set_sha256"] = _canonical_contract_sha256(artifact)
     artifact_path = root / OBJECTIVE_MATERIALIZATION_ARTIFACT_NAME
     artifact_tmp = artifact_path.with_suffix(".json.tmp")
     artifact_tmp.write_text(
@@ -375,7 +448,6 @@ def materialize_megatron_document(
         )
     tokens = [inputs[0], *targets]
     materialized_mask = [*mask, 0]
-    fallback_source_id = int(realized.source_index) + 1
     aligned = realized.task in _ALIGNED_TASKS
     packet = source.code_packet
     if aligned and packet is None:
@@ -407,6 +479,17 @@ def materialize_megatron_document(
                 f"{realized.task.value}: aligned materialized tokens differ from "
                 "CodePacket.token_ids"
             )
+        if require_production_sidecars:
+            missing_graph_sidecars = [
+                field
+                for field in ("call_edges", "type_edges")
+                if getattr(packet, field) is None
+            ]
+            if missing_graph_sidecars:
+                raise ValueError(
+                    "pre-materialized production graph objective is missing "
+                    "required sidecars: " + ", ".join(missing_graph_sidecars)
+                )
         row["doc_ids"] = _packet_vector(packet, "document_ids", length=len(tokens))
         for column, field in _TOKEN_SIDECARS.items():
             row[column] = _packet_vector(packet, field, length=len(tokens))
@@ -442,7 +525,7 @@ def materialize_megatron_document(
         zeros = [0] * len(tokens)
         source_identity = _transformed_source_identity(
             source,
-            fallback=fallback_source_id,
+            source_document_span=example.metadata.get("source_document_span"),
             required=require_production_sidecars,
         )
         row["doc_ids"] = [1] * len(tokens)
@@ -485,7 +568,7 @@ def _fraction_string(value: Fraction) -> str:
 def _exact_rates(
     rates: Mapping[TaskKind | str, float],
 ) -> tuple[tuple[str, ...], dict[str, Fraction]]:
-    raw: list[tuple[str, Fraction]] = []
+    by_task: dict[str, Fraction] = {}
     seen: set[str] = set()
     for key, value in rates.items():
         task = key.value if isinstance(key, TaskKind) else str(key)
@@ -501,7 +584,12 @@ def _exact_rates(
             )
         fraction = Fraction(str(numeric))
         if fraction > 0:
-            raw.append((task, fraction))
+            by_task[task] = fraction
+    raw = [
+        (task.value, by_task[task.value])
+        for task in TaskKind
+        if task.value in by_task
+    ]
     if not raw:
         raise ValueError("objective contract rates have no positive task")
     missing = sorted(_REQUIRED_PRODUCTION_TASKS - {task for task, _ in raw})
@@ -557,6 +645,11 @@ def build_pre_materialized_objective_contract(
         raise ValueError("document count must contain complete objective quota windows")
     if not math.isfinite(graph_weight) or graph_weight <= 0.0:
         raise ValueError("graph auxiliary global weight must be > 0")
+    if graph_weight != graph_config.global_weight:
+        raise ValueError(
+            "graph auxiliary global weight differs from GraphAuxLossConfig: "
+            f"{graph_weight} != {graph_config.global_weight}"
+        )
     unknown_relations = sorted(
         set(graph_config.relations) - set(_GRAPH_RELATION_COLUMNS)
     )
@@ -660,6 +753,10 @@ def build_pre_materialized_objective_contract(
         "seed": int(seed),
         "quota_window_samples": int(quota_window_samples),
         "task_order": list(task_order),
+        "objective_ids": {
+            task: OBJECTIVE_KIND_IDS[task]
+            for task in task_order
+        },
         "configured_rates": {
             task: _fraction_string(exact_rates[task]) for task in task_order
         },
@@ -683,7 +780,16 @@ def build_pre_materialized_objective_contract(
             "relations": list(graph_config.relations),
             "eligible_samples": len(graph_documents),
             "positive_edges": positive_edges,
-            "global_weight": _fraction_string(Fraction(str(graph_weight))),
+            "global_weight": _fraction_string(
+                Fraction(str(graph_config.global_weight))
+            ),
+            "indexer_weight": _fraction_string(
+                Fraction(str(graph_config.indexer_weight))
+            ),
+            "layer_weight": _fraction_string(
+                Fraction(str(graph_config.layer_weight))
+            ),
+            "layer_reduction": "sum",
             "bce_weight": _fraction_string(Fraction(str(graph_config.bce_weight))),
             "coverage_weight": _fraction_string(
                 Fraction(str(graph_config.coverage_weight))
@@ -712,6 +818,7 @@ __all__ = [
     "MaterializedMegatronDocument",
     "OBJECTIVE_CONTRACT_SCHEMA",
     "OBJECTIVE_GRAPH_SIDECARS",
+    "OBJECTIVE_KIND_IDS",
     "OBJECTIVE_MATERIALIZATION_ARTIFACT_NAME",
     "OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
     "OBJECTIVE_TOKEN_SIDE_CHANNELS",

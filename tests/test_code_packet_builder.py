@@ -172,6 +172,29 @@ def test_build_code_packet_misaligned_semantic_column_raises() -> None:
         build_code_packets(batch, bad)
 
 
+def test_opaque_semantic_identities_preserve_full_uint64_range() -> None:
+    high = (1 << 63) + 987654321
+    packet = build_code_packet_from_row(
+        token_ids=mx.array([1, 2, 3], dtype=mx.int32),
+        columns={
+            "token_symbol_ids": [[0, high, high + 1]],
+            "token_call_targets": [[high + 2, 0, high + 3]],
+            "token_type_refs": [[high + 4, high + 5, 0]],
+            "token_def_use": [[0, 1, 2]],
+        },
+        row_index=0,
+    )
+
+    for field, expected in (
+        ("symbol_ids", [0, high, high + 1]),
+        ("call_targets", [high + 2, 0, high + 3]),
+        ("type_refs", [high + 4, high + 5, 0]),
+    ):
+        values = np.asarray(getattr(packet, field))
+        assert values.dtype == np.dtype(np.uint64)
+        assert values.tolist() == expected
+
+
 def test_build_code_packets_row_count_mismatch_raises() -> None:
     batch = _synthetic_batch()  # batch size 2
     one_row = pa.table({"token_symbol_ids": [[10, 11, 12, 13, 14, 15]]})

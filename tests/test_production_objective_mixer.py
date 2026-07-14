@@ -7,6 +7,7 @@ import itertools
 import json
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -42,12 +43,14 @@ from cppmega_mlx.training.objective_mixer import (
     ObjectiveSource,
     combine_lm_and_aux_losses,
     compute_graph_auxiliary_loss,
+    graph_auxiliary_loss_from_targets,
     production_training_loss,
     RealizedObjective,
 )
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     OBJECTIVE_CONTRACT_SCHEMA,
+    OBJECTIVE_KIND_IDS,
     OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     build_pre_materialized_objective_contract,
     materialize_megatron_document,
@@ -62,13 +65,17 @@ from cppmega_mlx.training.objective_data import (
     require_objective_source_columns,
 )
 from cppmega_mlx.training.objectives import build_causal_lm
-from cppmega_mlx.training.task_mixer import TaskKind
+from cppmega_mlx.training.task_mixer import TaskKind, normalize_rates
 from scripts.nanochat_data.pack_enriched_rows import (
     INPUT_IDS_COLUMN,
     pack_documents,
     read_tokenized_documents,
 )
-from scripts.materialize_megatron_objectives import materialized_schema, padded_row
+from scripts.materialize_megatron_objectives import (
+    deterministic_source_id,
+    materialized_schema,
+    padded_row,
+)
 from scripts.train_eval_stage1 import _objective_batches
 
 
@@ -183,7 +190,7 @@ def test_task_specific_columns_are_optional_until_that_objective_is_selected() -
 
     assert source.code_packet is not None
     assert source.commit_packet is None
-    assert np.asarray(source.code_packet.document_ids).tolist() == [10, 10, 10, 10]
+    assert np.asarray(source.code_packet.document_ids).tolist() == [1, 1, 1, 1]
     causal = EligibilityAwareTaskMixer({TaskKind.CAUSAL_LM: 1.0}, seed=3)
     assert causal.materialize(source, step_index=0).task is TaskKind.CAUSAL_LM
     with pytest.raises(ValueError, match="ifim_instruction_token_ids"):
@@ -391,7 +398,8 @@ def test_production_batch_window_preserves_exact_task_quotas() -> None:
             "ast_depth": _arr([0] * 8),
             "sibling_index": _arr([0] * 8),
             "ast_node_type": _arr([1] * 8),
-            "call_edges": EdgeIndex.from_pairs([(1, 0)], relation="call", num_nodes=3),
+                "call_edges": EdgeIndex.from_pairs([(1, 0)], relation="call", num_nodes=3),
+                "type_edges": EdgeIndex.from_pairs([], relation="type", num_nodes=3),
         }
     )
     commit = CommitPacket(
@@ -463,7 +471,7 @@ def test_graph_auxiliary_loss_enters_total_loss() -> None:
         relations=("call",),
         topk=1,
         bce_weight=1.0,
-        coverage_weight=0.0,
+        coverage_weight=0.25,
     )
 
     aux_loss, aux_metrics = compute_graph_auxiliary_loss(indexer_scores, graph, cfg)
@@ -477,6 +485,22 @@ def test_graph_auxiliary_loss_enters_total_loss() -> None:
     assert aux_metrics["graph_indexer_layers"] == 1
     assert abs(float(total.item()) - (1.0 + 2.0 * float(aux_loss.item()))) < 1e-6
     assert metrics["loss_graph_indexer_weight"] == 2.0
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "global_weight",
+        "indexer_weight",
+        "layer_weight",
+        "bce_weight",
+        "coverage_weight",
+        "pos_weight",
+    ),
+)
+def test_graph_weight_semantics_require_positive_coefficients(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        GraphAuxLossConfig(**{field: 0.0})
 
 
 def test_graph_token_span_expansion_honors_edge_doc_and_upstream_masks() -> None:
@@ -579,6 +603,8 @@ def test_materialized_causal_document_preserves_unique_document_ids() -> None:
     )
 
     assert document.row["doc_ids"] == [41, 41, 42, 42]
+    assert np.asarray(realized.example.loss_mask).tolist() == [1, 0, 1]
+    assert document.row["loss_mask"] == [1, 0, 1, 0]
 
 
 def test_permuted_objective_preserves_one_stable_source_identity() -> None:
@@ -603,7 +629,7 @@ def test_permuted_objective_preserves_one_stable_source_identity() -> None:
     assert set(document.row["doc_ids"]) == {1}
 
 
-def test_permuted_objective_rejects_multiple_stable_sources_in_production() -> None:
+def test_permuted_objective_selects_exactly_one_logical_document() -> None:
     packet = CodePacket(
         token_ids=_arr([10, 11, 12, 13, 14, 15]),
         document_ids=_arr([1, 1, 1, 2, 2, 2]),
@@ -615,12 +641,17 @@ def test_permuted_objective_rejects_multiple_stable_sources_in_production() -> N
         {TaskKind.FIM: 1.0}, seed=53
     ).materialize(source, step_index=0)
 
-    with pytest.raises(ValueError, match="exactly one positive stable source"):
-        materialize_megatron_document(
-            realized,
-            source,
-            require_production_sidecars=True,
-        )
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    selected_span = realized.example.metadata["source_document_span"]
+    selected_source = 77 if selected_span == (0, 3) else 88
+    assert set(document.row["token_source_doc_ids"]) == {selected_source}
+    selected_tokens = {10, 11, 12} if selected_source == 77 else {13, 14, 15}
+    assert set(document.token_ids) & {10, 11, 12, 13, 14, 15} <= selected_tokens
 
 
 def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
@@ -642,7 +673,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
             indexer_num_sinks=0,
             require_graph_routes=True,
             ngram_hash_enabled=False,
-            structure_residual_scale=0.0,
+            structure_residual_scale=1.0,
             platform_residual_scale=0.0,
         )
     )
@@ -653,15 +684,31 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
     graph_targets = graph_targets.at[0, 2, 0].add(1.0)
     pair_mask = mx.ones((1, 4, 4), dtype=mx.float32)
     config = GraphAuxLossConfig(
-        relations=("call",), topk=1, bce_weight=1.0, coverage_weight=0.0
+        relations=("call",),
+        topk=1,
+        global_weight=0.5,
+        indexer_weight=0.25,
+        layer_weight=0.5,
+        bce_weight=1.0,
+        coverage_weight=0.25,
     )
+    structure_sidecars = {
+        name: mx.zeros_like(input_ids)
+        for name in (
+            "structure_ids",
+            "dep_levels",
+            "ast_depth_ids",
+            "sibling_index_ids",
+            "node_type_ids",
+        )
+    }
 
     total, lm_loss, graph_loss = production_training_loss(
         model,
         input_ids,
         targets,
         loss_mask,
-        side_channels={},
+        side_channels=structure_sidecars,
         block_bias=graph_targets,
         graph_targets=graph_targets,
         graph_pair_mask=pair_mask,
@@ -671,7 +718,26 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
     mx.eval(total, lm_loss, graph_loss)
 
     assert float(graph_loss.item()) > 0.0
-    assert abs(float(total.item()) - float((lm_loss + 0.5 * graph_loss).item())) < 1e-6
+    assert abs(float(total.item()) - float((lm_loss + graph_loss).item())) < 1e-6
+    unweighted_graph_loss = graph_auxiliary_loss_from_targets(
+        model.indexer_scores(),
+        graph_targets,
+        pair_mask,
+        GraphAuxLossConfig(
+            relations=("call",),
+            topk=1,
+            global_weight=1.0,
+            indexer_weight=1.0,
+            layer_weight=1.0,
+            bce_weight=1.0,
+            coverage_weight=0.25,
+        ),
+    )
+    mx.eval(unweighted_graph_loss)
+    assert float(graph_loss.item()) == pytest.approx(
+        0.5 * 0.25 * 0.5 * float(unweighted_graph_loss.item()),
+        rel=1e-5,
+    )
 
     loss_and_grad = nn.value_and_grad(
         model,
@@ -680,7 +746,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
             input_ids,
             targets,
             loss_mask,
-            side_channels={},
+            side_channels=structure_sidecars,
             block_bias=graph_targets,
             graph_targets=graph_targets,
             graph_pair_mask=pair_mask,
@@ -716,6 +782,69 @@ def test_production_loss_rejects_non_finite_graph_weight_before_forward() -> Non
             graph_pair_mask=None,
             graph_config=None,
             graph_weight=float("nan"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("attention_mode", "require_graph_routes", "structure_scale", "message"),
+    (
+        ("gqa", True, 1.0, "active fail-closed DSA graph routes"),
+        ("dsa", False, 1.0, "active fail-closed DSA graph routes"),
+        ("dsa", True, 0.0, "active structure residual routing"),
+    ),
+)
+def test_production_graph_loss_rejects_disabled_routes(
+    attention_mode: str,
+    require_graph_routes: bool,
+    structure_scale: float,
+    message: str,
+) -> None:
+    values = mx.array([[1, 2]], dtype=mx.int32)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            attention_mode=attention_mode,
+            require_graph_routes=require_graph_routes,
+            structure_residual_scale=structure_scale,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        production_training_loss(
+            model,
+            values,
+            values,
+            mx.ones_like(values),
+            side_channels={},
+            block_bias=mx.zeros((1, 2, 2)),
+            graph_targets=mx.zeros((1, 2, 2)),
+            graph_pair_mask=mx.ones((1, 2, 2)),
+            graph_config=GraphAuxLossConfig(relations=("call",)),
+            graph_weight=1.0,
+        )
+
+
+def test_production_graph_loss_rejects_missing_structure_sidecars() -> None:
+    values = mx.array([[1, 2]], dtype=mx.int32)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            attention_mode="dsa",
+            require_graph_routes=True,
+            structure_residual_scale=1.0,
+        )
+    )
+
+    with pytest.raises(ValueError, match="missing required structure sidecars"):
+        production_training_loss(
+            model,
+            values,
+            values,
+            mx.ones_like(values),
+            side_channels={"structure_ids": values},
+            block_bias=mx.zeros((1, 2, 2)),
+            graph_targets=mx.zeros((1, 2, 2)),
+            graph_pair_mask=mx.ones((1, 2, 2)),
+            graph_config=GraphAuxLossConfig(relations=("call",)),
+            graph_weight=1.0,
         )
 
 
@@ -851,7 +980,14 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
     }
     assert contract["typed_sources"]["diff"] == "diff_token_ids"
     assert contract["typed_sources"]["rendered_text_parsing"] is False
+    assert contract["objective_ids"] == {
+        task.value: OBJECTIVE_KIND_IDS[task.value] for task in rates
+    }
     assert contract["graph_auxiliary"]["included_in_total_loss"] is True
+    assert contract["graph_auxiliary"]["global_weight"] == "1"
+    assert contract["graph_auxiliary"]["indexer_weight"] == "1/1000"
+    assert contract["graph_auxiliary"]["layer_weight"] == "1"
+    assert contract["graph_auxiliary"]["layer_reduction"] == "sum"
     assert contract["graph_auxiliary"]["pair_mask"] == (
         "causal_same_document_upstream_v1"
     )
@@ -1064,10 +1200,15 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
     ).encode("ascii")
     assert artifact["schema"] == OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA
     assert artifact["documents"] == 2
-    assert artifact["objective_contract"] == {
-        "path": "objective_contract.json",
-        "sha256": hashlib.sha256(canonical_contract).hexdigest(),
-    }
+    assert artifact["objective_contract"]["path"] == "objective_contract.json"
+    assert artifact["objective_contract"]["sha256"] == hashlib.sha256(
+        canonical_contract
+    ).hexdigest()
+    contract_bytes = (tmp_path / "objective_contract.json").read_bytes()
+    assert artifact["objective_contract"]["size_bytes"] == len(contract_bytes)
+    assert artifact["objective_contract"]["file_sha256"] == hashlib.sha256(
+        contract_bytes
+    ).hexdigest()
     assert [row["path"] for row in artifact["parquet_shards"]] == [
         first.name,
         second.name,
@@ -1086,4 +1227,94 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
     assert artifact["converter"]["chunk_edge_expansion"] == (
         "cartesian_token_spans_v1"
     )
+    artifact_set_payload = dict(artifact)
+    artifact_set_sha256 = artifact_set_payload.pop("artifact_set_sha256")
+    assert artifact_set_sha256 == hashlib.sha256(
+        json.dumps(
+            artifact_set_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
     assert json.loads((tmp_path / "objective_contract.json").read_text()) == contract
+
+
+def test_objective_order_and_source_ids_ignore_mapping_encounter_order() -> None:
+    forward = {
+        TaskKind.CAUSAL_LM: 0.5,
+        TaskKind.FIM: 0.3,
+        TaskKind.IFIM: 0.2,
+    }
+    reverse = dict(reversed(tuple(forward.items())))
+
+    assert tuple(normalize_rates(forward)) == tuple(normalize_rates(reverse))
+    assert EligibilityAwareTaskMixer(forward, seed=29).quotas(10) == (
+        EligibilityAwareTaskMixer(reverse, seed=29).quotas(10)
+    )
+    assert OBJECTIVE_KIND_IDS == {
+        "causal_lm": 1,
+        "fim": 2,
+        "ast_fim": 3,
+        "ifim": 4,
+        "commit_diff": 5,
+        "pre_to_post": 6,
+        "symbol_recovery": 7,
+        "type_recovery": 8,
+        "callee_recovery": 9,
+    }
+    source_signatures = ("repo-a\0path\0commit", "repo-b\0path\0commit")
+    forward_ids = {
+        signature: deterministic_source_id(signature)
+        for signature in source_signatures
+    }
+    reverse_ids = {
+        signature: deterministic_source_id(signature)
+        for signature in reversed(source_signatures)
+    }
+    assert forward_ids == reverse_ids
+    assert len(set(forward_ids.values())) == len(source_signatures)
+
+
+def test_anonymous_tokenized_source_ids_ignore_encounter_order(tmp_path: Path) -> None:
+    forward_dir = tmp_path / "forward"
+    reverse_dir = tmp_path / "reverse"
+    forward_dir.mkdir()
+    reverse_dir.mkdir()
+    token_rows = [[101, 102], [201, 202]]
+    pq.write_table(
+        pa.table({"token_ids": token_rows}),
+        forward_dir / "rows.parquet",
+    )
+    pq.write_table(
+        pa.table({"token_ids": list(reversed(token_rows))}),
+        reverse_dir / "rows.parquet",
+    )
+
+    def identities(path: Path) -> dict[tuple[int, ...], int]:
+        return {
+            tuple(document.token_ids): document.stable_doc_id
+            for document in read_tokenized_documents(path)
+        }
+
+    assert identities(forward_dir) == identities(reverse_dir)
+    assert len(set(identities(forward_dir).values())) == len(token_rows)
+
+
+def test_graph_supervision_rejects_missing_configured_relation_sidecar() -> None:
+    packet = CodePacket(
+        token_ids=_arr([10, 11, 12, 13]),
+        document_ids=_arr([1, 1, 1, 1]),
+        chunk_starts=_arr([0, 2]),
+        chunk_ends=_arr([2, 4]),
+        chunk_kinds=_arr([1, 1]),
+        chunk_dep_levels=_arr([0, 0]),
+        call_edges=EdgeIndex.from_pairs([], relation="call", num_nodes=2),
+    )
+
+    with pytest.raises(ValueError, match="missing required relation sidecars: type"):
+        graph_targets_and_pair_mask(
+            packet,
+            input_length=4,
+            relations=("call", "type"),
+        )

@@ -51,8 +51,9 @@ def stable_doc_signature(row: Mapping[str, Any]) -> str:
     """Return the stable logical-document signature for a row.
 
     Explicit source/document id columns win. If they are absent, use commit/file
-    provenance when complete enough to identify the logical document; otherwise
-    fall back to a text hash for backwards compatibility with older fixtures.
+    provenance when complete enough to identify the logical document. Otherwise
+    hash source text, or canonical token IDs when tokenized rows no longer carry
+    text.
     """
 
     for column in _EXPLICIT_DOC_ID_COLUMNS:
@@ -64,6 +65,18 @@ def stable_doc_signature(row: Mapping[str, Any]) -> str:
     if any(value is not None for value in provenance):
         return "provenance:" + "\0".join("" if value is None else str(value)
                                         for value in provenance)
+
+    text = row.get("text")
+    if isinstance(text, str) and text:
+        return _text_signature(row)
+
+    token_ids = row.get("token_ids")
+    if token_ids is not None:
+        encoded = json.dumps(
+            [int(token_id) for token_id in token_ids],
+            separators=(",", ":"),
+        ).encode("ascii")
+        return "token_ids_sha256:" + hashlib.sha256(encoded).hexdigest()
 
     return _text_signature(row)
 

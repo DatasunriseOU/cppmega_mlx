@@ -483,6 +483,8 @@ def main() -> None:
         help="objective sample window (0 = 60 * batch; quotas must divide batch)",
     )
     ap.add_argument("--graph-aux-weight", type=float, default=1.0)
+    ap.add_argument("--graph-indexer-weight", type=float, default=0.001)
+    ap.add_argument("--graph-layer-weight", type=float, default=1.0)
     ap.add_argument("--graph-bce-weight", type=float, default=0.10)
     ap.add_argument("--graph-coverage-weight", type=float, default=0.05)
     ap.add_argument("--graph-topk", type=int, default=32)
@@ -543,6 +545,8 @@ def main() -> None:
     if not math.isfinite(args.graph_aux_weight) or args.graph_aux_weight <= 0.0:
         raise ValueError("--graph-aux-weight must be finite and positive")
     for name, value in (
+        ("--graph-indexer-weight", args.graph_indexer_weight),
+        ("--graph-layer-weight", args.graph_layer_weight),
         ("--graph-bce-weight", args.graph_bce_weight),
         ("--graph-coverage-weight", args.graph_coverage_weight),
     ):
@@ -582,6 +586,9 @@ def main() -> None:
     graph_config = GraphAuxLossConfig(
         relations=graph_relations,
         topk=args.graph_topk,
+        global_weight=args.graph_aux_weight,
+        indexer_weight=args.graph_indexer_weight,
+        layer_weight=args.graph_layer_weight,
         bce_weight=args.graph_bce_weight,
         coverage_weight=args.graph_coverage_weight,
     )
@@ -697,15 +704,30 @@ def main() -> None:
             graph_pair_mask,
         ),
     )
+
+    def _reordered_lm_loss(
+        model, input_ids, targets, loss_mask, block_bias, graph_targets,
+        graph_pair_mask,
+    ):
+        del graph_targets, graph_pair_mask
+        _, lm_loss = model(
+            input_ids,
+            targets=targets,
+            loss_mask=loss_mask,
+            block_bias=block_bias,
+        )
+        if lm_loss is None:
+            raise RuntimeError("model returned no LM loss despite supplied targets")
+        return lm_loss, lm_loss, mx.array(0.0, dtype=mx.float32)
+
     reordered_loss_and_grad = nn.value_and_grad(
         model,
         lambda input_ids, targets, loss_mask, block_bias, graph_targets,
-        graph_pair_mask: _objective_loss(
+        graph_pair_mask: _reordered_lm_loss(
             model,
             input_ids,
             targets,
             loss_mask,
-            {},
             block_bias,
             graph_targets,
             graph_pair_mask,

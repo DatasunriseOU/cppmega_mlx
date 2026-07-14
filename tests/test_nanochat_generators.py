@@ -1260,6 +1260,28 @@ def test_tokenized_materializer_maps_temporal_char_annotations_to_tokens() -> No
     assert row[schema.CHANGED_CHUNK_SPANS_COLUMN]
 
 
+def test_tokenized_materializer_preserves_exact_clang_chunk_ends() -> None:
+    text = "abcdefghij"
+    docs = [
+        {
+            "text": text,
+            "chunk_boundaries": [
+                {"start": 0, "end": 2, "kind": 1, "dep_level": 0},
+                {"start": 6, "end": 9, "kind": 2, "dep_level": 1},
+            ],
+            "call_edges": [],
+            "type_edges": [],
+        }
+    ]
+
+    row = materialize_tokenized_enriched_batch(docs, _CharTokenizer())[0]
+
+    # BOS occupies token 0. The four-token gap between clang chunks must remain
+    # a gap; the first end must never be fabricated from the next chunk start.
+    assert row[schema.TOKEN_CHUNK_STARTS_COLUMN] == [1, 7]
+    assert row[schema.TOKEN_CHUNK_ENDS_COLUMN] == [3, 10]
+
+
 def test_tokenized_materializer_uses_only_typed_objective_sections() -> None:
     text = "int main() { return 2; }"
     base = {

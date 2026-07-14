@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -45,6 +46,7 @@ _ARROW_DTYPES = {
     "uint8": pa.uint8(),
     "uint16": pa.uint16(),
     "uint32": pa.uint32(),
+    "uint64": pa.uint64(),
 }
 TOKEN_SIDECAR_TYPES = {
     column: _ARROW_DTYPES[dtype]
@@ -116,6 +118,7 @@ def _iter_sources(shards: list[str], *, seed: int):
     rng = random.Random(seed)
     source_index = 0
     signature_to_id: dict[str, int] = {}
+    id_to_signature: dict[int, str] = {}
     identity_columns = (
         "source_doc_id",
         "source_document_id",
@@ -153,8 +156,16 @@ def _iter_sources(shards: list[str], *, seed: int):
                 signature = stable_doc_signature(row)
                 stable_source_id = signature_to_id.get(signature)
                 if stable_source_id is None:
-                    stable_source_id = max(signature_to_id.values(), default=0) + 1
+                    stable_source_id = deterministic_source_id(signature)
+                    collision = id_to_signature.get(stable_source_id)
+                    if collision is not None and collision != signature:
+                        raise ValueError(
+                            "stable source identity hash collision: "
+                            f"id={stable_source_id} signatures={collision!r}, "
+                            f"{signature!r}"
+                        )
                     signature_to_id[signature] = stable_source_id
+                    id_to_signature[stable_source_id] = signature
                 token_count = len(row[TOKEN_IDS_COLUMN])
                 raw_source_ids = [
                     int(value) for value in row[TOKEN_SOURCE_DOC_IDS_COLUMN]
@@ -187,6 +198,17 @@ def _iter_sources(shards: list[str], *, seed: int):
                 source_index += 1
 
 
+def deterministic_source_id(signature: str) -> int:
+    """Map one stable source signature to a non-zero uint32 identity."""
+
+    if not isinstance(signature, str) or not signature:
+        raise ValueError("stable source signature must be a non-empty string")
+    identity = int.from_bytes(
+        hashlib.sha256(signature.encode("utf-8")).digest()[:4], "big"
+    )
+    return identity or 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-glob", required=True)
@@ -197,6 +219,8 @@ def main() -> int:
     parser.add_argument("--shard-rows", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--graph-aux-weight", type=float, default=1.0)
+    parser.add_argument("--graph-indexer-weight", type=float, default=0.001)
+    parser.add_argument("--graph-layer-weight", type=float, default=1.0)
     parser.add_argument("--graph-bce-weight", type=float, default=0.10)
     parser.add_argument("--graph-coverage-weight", type=float, default=0.05)
     parser.add_argument("--graph-topk", type=int, default=8)
@@ -246,6 +270,9 @@ def main() -> int:
     graph_config = GraphAuxLossConfig(
         relations=graph_relations,
         topk=args.graph_topk,
+        global_weight=args.graph_aux_weight,
+        indexer_weight=args.graph_indexer_weight,
+        layer_weight=args.graph_layer_weight,
         bce_weight=args.graph_bce_weight,
         coverage_weight=args.graph_coverage_weight,
     )

@@ -148,9 +148,9 @@ V12_SCHEMA = pa.schema([
     pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
     # Semantic token columns (v12 additions)
-    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
     pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
     # Temporal token columns
     pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),

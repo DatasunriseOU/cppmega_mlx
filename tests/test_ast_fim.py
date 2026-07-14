@@ -27,7 +27,12 @@ def _arr(values: list[int]) -> mx.array:
     return mx.array(np.asarray(values, dtype=np.int32))
 
 
-def _packet(tokens: list[int], chunks: list[tuple[int, int]]) -> CodePacket:
+def _packet(
+    tokens: list[int],
+    chunks: list[tuple[int, int]],
+    *,
+    document_ids: list[int] | None = None,
+) -> CodePacket:
     starts = [c[0] for c in chunks]
     ends = [c[1] for c in chunks]
     return CodePacket(
@@ -36,6 +41,7 @@ def _packet(tokens: list[int], chunks: list[tuple[int, int]]) -> CodePacket:
         chunk_ends=_arr(ends),
         chunk_kinds=_arr([1] * len(chunks)),
         chunk_dep_levels=_arr([0] * len(chunks)),
+        document_ids=_arr(document_ids) if document_ids is not None else None,
     )
 
 
@@ -94,6 +100,39 @@ def test_ast_fim_deterministic_for_fixed_seed() -> None:
     b = apply_ast_fim(packet, seed=7)
     assert a.token_ids == b.token_ids
     assert a.span == b.span and a.kind == b.kind and a.mode == b.mode
+
+
+def test_ast_fim_is_confined_to_one_logical_document() -> None:
+    tokens = [100 + index for index in range(12)]
+    packet = _packet(
+        tokens,
+        [(1, 3), (8, 10)],
+        document_ids=[1] * 6 + [2] * 6,
+    )
+
+    result = apply_ast_fim(
+        packet,
+        seed=4,
+        spm_rate=0.0,
+        ast_fim_rate=1.0,
+    )
+
+    assert result.document_span is not None
+    assert result.document_span in {(0, 6), (6, 12)}
+    source_tokens = [token for token in result.token_ids if token in tokens]
+    start, end = result.document_span
+    assert sorted(source_tokens) == sorted(tokens[start:end])
+
+
+def test_ast_fim_rejects_a_clang_chunk_crossing_documents() -> None:
+    packet = _packet(
+        list(range(12)),
+        [(4, 8)],
+        document_ids=[1] * 6 + [2] * 6,
+    )
+
+    with pytest.raises(ValueError, match="crosses a document_ids boundary"):
+        apply_ast_fim(packet, seed=0, ast_fim_rate=1.0)
 
 
 def test_ast_fim_requires_chunk_boundaries() -> None:

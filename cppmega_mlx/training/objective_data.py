@@ -124,7 +124,7 @@ def objective_source_from_tokenized_row(
     token_ids = _i32(row.get(TOKEN_IDS_COLUMN), where=TOKEN_IDS_COLUMN)
     raw_document_ids = row.get("doc_ids")
     document_ids = (
-        [int(source_index) + 1] * int(token_ids.shape[0])
+        [1] * int(token_ids.shape[0])
         if raw_document_ids is None
         else [int(value) for value in raw_document_ids]
     )
@@ -236,6 +236,21 @@ def _graph_arrays(
     if unknown_relations:
         raise ValueError(f"unsupported graph relations: {unknown_relations}")
 
+    if relations is not None:
+        missing_relations = sorted(
+            relation
+            for relation in selected_relations
+            if getattr(
+                packet,
+                _CHUNK_GRAPH_FIELDS.get(relation, _TOKEN_GRAPH_FIELDS.get(relation)),
+            )
+            is None
+        )
+        if missing_relations:
+            raise ValueError(
+                "graph supervision is missing required relation sidecars: "
+                + ", ".join(missing_relations)
+            )
     chunk_edges = {
         relation: getattr(packet, field)
         for relation, field in _CHUNK_GRAPH_FIELDS.items()

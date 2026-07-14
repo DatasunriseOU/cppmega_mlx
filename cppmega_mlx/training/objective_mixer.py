@@ -13,7 +13,10 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from cppmega_mlx.data.ast_fim import eligible_ast_chunk_indices
+from cppmega_mlx.data.ast_fim import (
+    eligible_ast_chunk_indices,
+    logical_document_spans,
+)
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.fim import FIMSpecialTokenInput
@@ -68,16 +71,26 @@ def _eligibility_reason(
         if not isinstance(packet, CodePacket):
             return "requires CodePacket"
         token_count = int(packet.token_ids.shape[-1])
+        document_lengths = [
+            end - start
+            for start, end, _document_id in logical_document_spans(packet)
+        ]
         if task is TaskKind.CAUSAL_LM:
             reason = (
-                None if token_count >= 2 else "token_ids requires at least 2 tokens"
+                None
+                if any(length >= 2 for length in document_lengths)
+                else "requires a logical document with at least 2 tokens"
             )
             estimated_input = token_count - 1
             return _length_reason(reason, estimated_input, max_input_tokens)
-        if token_count < 3:
-            return "token_ids requires at least 3 tokens"
+        eligible_document_lengths = [
+            length for length in document_lengths if length >= 3
+        ]
+        if not eligible_document_lengths:
+            return "requires a logical document with at least 3 tokens"
+        selected_token_count = max(eligible_document_lengths)
         if task is TaskKind.FIM:
-            return _length_reason(None, token_count + 3, max_input_tokens)
+            return _length_reason(None, selected_token_count + 3, max_input_tokens)
         if task is TaskKind.AST_FIM:
             missing = [
                 name
@@ -95,7 +108,7 @@ def _eligibility_reason(
                 reason = "no interior clang chunk with non-empty context"
             else:
                 reason = None
-            return _length_reason(reason, token_count + 3, max_input_tokens)
+            return _length_reason(reason, selected_token_count + 3, max_input_tokens)
         if task is TaskKind.IFIM:
             instruction_count = _array_length(packet.ifim_instruction_token_ids)
             reason = (
@@ -105,7 +118,7 @@ def _eligibility_reason(
             )
             return _length_reason(
                 reason,
-                token_count + instruction_count + 4,
+                selected_token_count + instruction_count + 4,
                 max_input_tokens,
             )
         field_name = {
@@ -442,6 +455,9 @@ class ObjectiveAccounting:
 class GraphAuxLossConfig:
     relations: tuple[str, ...] = ("call", "type")
     topk: int = 8
+    global_weight: float = 1.0
+    indexer_weight: float = 0.001
+    layer_weight: float = 1.0
     bce_weight: float = 1.0
     coverage_weight: float = 1.0
     pos_weight: float = 1.0
@@ -456,14 +472,19 @@ class GraphAuxLossConfig:
             raise ValueError("graph auxiliary relations must not contain duplicates")
         if self.topk < 1:
             raise ValueError(f"graph auxiliary topk must be >=1, got {self.topk}")
-        for name in ("bce_weight", "coverage_weight", "pos_weight", "margin"):
+        for name in (
+            "global_weight",
+            "indexer_weight",
+            "layer_weight",
+            "bce_weight",
+            "coverage_weight",
+            "pos_weight",
+        ):
             value = float(getattr(self, name))
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"graph auxiliary {name} must be non-negative")
-        if self.pos_weight == 0.0:
-            raise ValueError("graph auxiliary pos_weight must be positive")
-        if self.bce_weight == 0.0 and self.coverage_weight == 0.0:
-            raise ValueError("graph auxiliary loss has no enabled component")
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"graph auxiliary {name} must be positive")
+        if not math.isfinite(float(self.margin)) or self.margin < 0.0:
+            raise ValueError("graph auxiliary margin must be non-negative")
 
 
 def _graph_targets(
@@ -490,7 +511,9 @@ def _graph_targets(
     for relation in relations:
         edge = graph.edge(relation)
         if edge is None:
-            continue
+            raise ValueError(
+                f"graph auxiliary relation {relation!r} is configured but absent"
+            )
         for source, destination in edge.to_pairs():
             if not (0 <= source < queries and 0 <= destination < keys):
                 raise ValueError(
@@ -546,12 +569,21 @@ def compute_graph_auxiliary_loss(
         layer_losses.append(layer_loss)
         bce_total += float(components.get("bce", mx.array(0.0)).item())
         coverage_total += float(components.get("coverage", mx.array(0.0)).item())
-    total = mx.mean(mx.stack(layer_losses))
+    total = (
+        mx.sum(mx.stack(layer_losses))
+        * config.global_weight
+        * config.indexer_weight
+        * config.layer_weight
+    )
     layer_count = len(layer_losses)
     return total, {
         "graph_indexer_layers": layer_count,
         "graph_indexer_bce": bce_total / layer_count,
         "graph_indexer_coverage": coverage_total / layer_count,
+        "graph_indexer_global_weight": config.global_weight,
+        "graph_indexer_indexer_weight": config.indexer_weight,
+        "graph_indexer_layer_weight": config.layer_weight,
+        "graph_indexer_layer_reduction": "sum",
     }
 
 
@@ -591,7 +623,12 @@ def graph_auxiliary_loss_from_targets(
             margin=config.margin,
         )
         losses.append(loss)
-    return mx.mean(mx.stack(losses))
+    return (
+        mx.sum(mx.stack(losses))
+        * config.global_weight
+        * config.indexer_weight
+        * config.layer_weight
+    )
 
 
 def combine_lm_and_aux_losses(
@@ -633,8 +670,49 @@ def production_training_loss(
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Compute the differentiated LM + configured graph auxiliary objective."""
 
-    if not math.isfinite(float(graph_weight)) or graph_weight < 0.0:
-        raise ValueError("graph auxiliary weight must be finite and non-negative")
+    if not math.isfinite(float(graph_weight)) or graph_weight <= 0.0:
+        raise ValueError("graph auxiliary global weight must be finite and positive")
+    if graph_config is None or graph_targets is None or graph_pair_mask is None:
+        raise ValueError(
+            "production graph objective requires config/targets/pair_mask"
+        )
+    if graph_weight != graph_config.global_weight:
+        raise ValueError(
+            "graph auxiliary global weight differs from GraphAuxLossConfig: "
+            f"{graph_weight} != {graph_config.global_weight}"
+        )
+    if block_bias is None:
+        raise ValueError("production graph objective requires graph route block_bias")
+    model_config = getattr(model, "config", None)
+    if (
+        model_config is None
+        or getattr(model_config, "attention_mode", None) != "dsa"
+        or getattr(model_config, "require_graph_routes", None) is not True
+    ):
+        raise ValueError(
+            "production graph objective requires active fail-closed DSA graph routes"
+        )
+    if float(getattr(model_config, "structure_residual_scale", 0.0)) <= 0.0:
+        raise ValueError(
+            "production graph objective requires active structure residual routing"
+        )
+    required_structure_channels = {
+        "structure_ids",
+        "dep_levels",
+        "ast_depth_ids",
+        "sibling_index_ids",
+        "node_type_ids",
+    }
+    missing_structure_channels = sorted(
+        name
+        for name in required_structure_channels
+        if side_channels.get(name) is None
+    )
+    if missing_structure_channels:
+        raise ValueError(
+            "production graph objective is missing required structure sidecars: "
+            + ", ".join(missing_structure_channels)
+        )
     _, lm_loss = model(
         input_ids,
         targets=targets,
@@ -644,20 +722,13 @@ def production_training_loss(
     )
     if lm_loss is None:  # pragma: no cover - targets make this unreachable
         raise RuntimeError("model returned no LM loss despite supplied targets")
-    if graph_weight == 0.0:
-        zero = mx.array(0.0, dtype=mx.float32)
-        return lm_loss, lm_loss, zero
-    if graph_config is None or graph_targets is None or graph_pair_mask is None:
-        raise ValueError(
-            "graph auxiliary weight is non-zero but config/targets/pair_mask is absent"
-        )
     graph_loss = graph_auxiliary_loss_from_targets(
         model.indexer_scores(),
         graph_targets,
         graph_pair_mask,
         graph_config,
     )
-    return lm_loss + graph_weight * graph_loss, lm_loss, graph_loss
+    return lm_loss + graph_loss, lm_loss, graph_loss
 
 
 __all__ = [
