@@ -12,8 +12,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_DELIMITER_ROLES,
+    DomainKind,
+    DomainRoleKind,
+    ParseConfidence,
+)
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.symbol_identity import compute_symbol_id
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.training.megatron_objectives import materialize_megatron_document
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
@@ -31,6 +38,12 @@ DEPENDENCY_SOURCE_DOC_IDS = [
     constituent for constituent in (1, 2, 3, 4) for _ in range(CONSTITUENT_TOKEN_COUNT)
 ]
 CASE3_FIXTURE = Path(__file__).parent / "fixtures" / "case3_prompt_repo"
+_DELIMITER_BY_ID: dict[int, tuple[int, bool, int]] = {}
+for _domain, (_start_role, _end_role) in DOMAIN_DELIMITER_ROLES.items():
+    _start_id = DOMAIN_DELIMITER_TOKEN_IDS[_start_role]
+    _end_id = DOMAIN_DELIMITER_TOKEN_IDS[_end_role]
+    _DELIMITER_BY_ID[_start_id] = (int(_domain), True, _end_id)
+    _DELIMITER_BY_ID[_end_id] = (int(_domain), False, _end_id)
 
 
 def _physical_source(filepath: str):
@@ -46,11 +59,14 @@ def _base_row(*, filepath: str) -> dict[str, object]:
     symbol = _symbol_record("symbol")
     callee = _symbol_record("callee")
     type_ref = _symbol_record("type")
+    cpp_start = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]
+    cpp_end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
+    code_tokens = list(range(1000, 1000 + TOKEN_COUNT - 3))
     return {
         "repo": "example/dependency-project",
         "filepath": filepath,
         "commit_hash": "0123456789abcdef",
-        "token_ids": list(range(100, 100 + TOKEN_COUNT)),
+        "token_ids": [2, cpp_start, *code_tokens, cpp_end],
         "platform_ids": [2, 62],
         "token_structure_ids": [1] * TOKEN_COUNT,
         "token_dep_levels": [
@@ -59,19 +75,31 @@ def _base_row(*, filepath: str) -> dict[str, object]:
         "token_ast_depth": [0, 1, 1, 0] * (TOKEN_COUNT // 4),
         "token_sibling_index": [0, 0, 1, 0] * (TOKEN_COUNT // 4),
         "token_ast_node_type": [1, 2, 2, 1] * (TOKEN_COUNT // 4),
-        "token_symbol_ids": [int(symbol["symbol_id"])] * 2 + [0] * (TOKEN_COUNT - 2),
-        "token_call_targets": [0] * 6
+        "token_symbol_ids": [0] * 5
+        + [int(symbol["symbol_id"])] * 2
+        + [0] * (TOKEN_COUNT - 7),
+        "token_call_targets": [0] * 10
         + [int(callee["symbol_id"])] * 2
-        + [0] * (TOKEN_COUNT - 8),
-        "token_type_refs": [0] * 10
-        + [int(type_ref["symbol_id"])] * 2
         + [0] * (TOKEN_COUNT - 12),
+        "token_type_refs": [0] * 15
+        + [int(type_ref["symbol_id"])] * 2
+        + [0] * (TOKEN_COUNT - 17),
         "token_def_use": [0] * TOKEN_COUNT,
-        "token_domain_ids": [1] * TOKEN_COUNT,
-        "token_role_ids": [1] * TOKEN_COUNT,
+        "token_domain_ids": [0] + [int(DomainKind.CPP)] * (TOKEN_COUNT - 1),
+        "token_role_ids": [
+            int(DomainRoleKind.NONE),
+            int(DomainRoleKind.DELIMITER),
+            *([int(DomainRoleKind.NONE)] * (TOKEN_COUNT - 3)),
+            int(DomainRoleKind.DELIMITER),
+        ],
         "token_entity_ids": [0] * TOKEN_COUNT,
         "token_scope_ids": [0] * TOKEN_COUNT,
-        "token_confidence_ids": [1] * TOKEN_COUNT,
+        "token_confidence_ids": [
+            int(ParseConfidence.ABSENT),
+            int(ParseConfidence.EXACT),
+            *([int(ParseConfidence.RAW)] * (TOKEN_COUNT - 3)),
+            int(ParseConfidence.EXACT),
+        ],
         "token_change_mask_pre": [],
         "token_change_mask_post": [],
         "token_chunk_starts": [offset * CONSTITUENT_TOKEN_COUNT for offset in range(4)],
@@ -96,7 +124,7 @@ def _dependency_row() -> tuple[dict[str, object], int]:
     row = _base_row(filepath="src/dependency.cpp")
     row.update(
         {
-            "ifim_instruction_token_ids": [700, 701],
+            "ifim_instruction_token_ids": [1700, 1701],
             "token_source_doc_ids": DEPENDENCY_SOURCE_DOC_IDS,
             "token_source_identity_ids": [physical.source_identity_id] * TOKEN_COUNT,
             "source_identity_registry": [physical.as_dict()],
@@ -117,10 +145,10 @@ def _commit_row() -> tuple[dict[str, object], int]:
             "token_call_targets": [0] * TOKEN_COUNT,
             "token_type_refs": [0] * TOKEN_COUNT,
             "token_call_edges": [],
-            "commit_msg_token_ids": [800, 801],
-            "pre_token_ids": [810, 811, 812],
-            "post_token_ids": [820, 821, 822],
-            "diff_token_ids": [830, 831, 832],
+            "commit_msg_token_ids": [1800, 1801],
+            "pre_token_ids": [1810, 1811, 1812],
+            "post_token_ids": [1820, 1821, 1822],
+            "diff_token_ids": [1830, 1831, 1832],
             "token_source_doc_ids": [1] * TOKEN_COUNT,
             "token_source_identity_ids": [physical.source_identity_id] * TOKEN_COUNT,
             "source_identity_registry": [physical.as_dict()],
@@ -135,11 +163,11 @@ def _fully_eligible_commit_row(*, filepath: str) -> dict[str, object]:
     row.update(
         {
             "doc_ids": [1] * TOKEN_COUNT,
-            "ifim_instruction_token_ids": [700, 701],
-            "commit_msg_token_ids": [800, 801],
-            "pre_token_ids": [810, 811, 812],
-            "post_token_ids": [820, 821, 822],
-            "diff_token_ids": [830, 831, 832],
+            "ifim_instruction_token_ids": [1700, 1701],
+            "commit_msg_token_ids": [1800, 1801],
+            "pre_token_ids": [1810, 1811, 1812],
+            "post_token_ids": [1820, 1821, 1822],
+            "diff_token_ids": [1830, 1831, 1832],
             "token_source_doc_ids": [1] * TOKEN_COUNT,
             "token_source_identity_ids": [physical.source_identity_id] * TOKEN_COUNT,
             "source_identity_registry": [physical.as_dict()],
@@ -215,6 +243,50 @@ def _valid_values(table: pa.Table, column: str, row_index: int) -> list[int]:
     return [int(value) for value in table[column][row_index].as_py()[:valid]]
 
 
+def _assert_domain_stack_values(
+    tokens: list[int],
+    domains: list[int],
+    roles: list[int],
+    confidence: list[int],
+) -> None:
+    stack: list[tuple[int, int]] = []
+    for token_id, domain_id, role_id, confidence_id in zip(
+        tokens,
+        domains,
+        roles,
+        confidence,
+        strict=True,
+    ):
+        marker = _DELIMITER_BY_ID.get(token_id)
+        if marker is None:
+            expected_domain = stack[-1][0] if stack else int(DomainKind.UNKNOWN)
+            assert domain_id == expected_domain
+            assert role_id != int(DomainRoleKind.DELIMITER)
+            continue
+        expected_domain, is_start, expected_close = marker
+        assert domain_id == expected_domain
+        assert role_id == int(DomainRoleKind.DELIMITER)
+        assert confidence_id == int(ParseConfidence.EXACT)
+        if is_start:
+            stack.append((expected_domain, expected_close))
+        else:
+            assert stack[-1] == (expected_domain, token_id)
+            stack.pop()
+    assert not stack
+
+
+def _assert_converter_equivalent_domain_stack(
+    table: pa.Table,
+    row_index: int,
+) -> None:
+    _assert_domain_stack_values(
+        _valid_values(table, "input_ids", row_index),
+        _valid_values(table, "token_domain_ids", row_index),
+        _valid_values(table, "token_role_ids", row_index),
+        _valid_values(table, "token_confidence_ids", row_index),
+    )
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -222,11 +294,13 @@ def _sha256(path: Path) -> str:
 def test_materialized_graph_arrow_types_match_case5_source_contract() -> None:
     schema = materializer.materialized_schema()
     pair = pa.struct([pa.field("from", pa.uint16()), pa.field("to", pa.uint16())])
-    triple = pa.struct([
-        pa.field("from", pa.uint32()),
-        pa.field("to", pa.uint32()),
-        pa.field("kind", pa.int32()),
-    ])
+    triple = pa.struct(
+        [
+            pa.field("from", pa.uint32()),
+            pa.field("to", pa.uint32()),
+            pa.field("kind", pa.int32()),
+        ]
+    )
     assert schema.field("token_call_edges").type == pa.list_(pair)
     assert schema.field("token_type_edges").type == pa.list_(pair)
     for column in (
@@ -302,7 +376,7 @@ def test_dependency_source_rejects_nonempty_misaligned_change_mask(
     "task",
     (TaskKind.FIM, TaskKind.AST_FIM, TaskKind.IFIM),
 )
-def test_transformed_dependency_objective_derives_only_uint32_document_identity(
+def test_transformed_dependency_objective_preserves_exact_document_identity(
     tmp_path: Path,
     task: TaskKind,
 ) -> None:
@@ -320,12 +394,179 @@ def test_transformed_dependency_objective_derives_only_uint32_document_identity(
         require_production_sidecars=True,
     )
 
-    derived_ids = set(document.row["token_source_doc_ids"])
-    assert len(derived_ids) == 1
-    assert derived_ids.isdisjoint({1, 2, 3, 4})
-    assert 0 < next(iter(derived_ids)) < (1 << 32)
+    assert set(document.row["token_source_doc_ids"]) == {1, 2, 3, 4}
     assert set(document.row["token_source_identity_ids"]) == {physical_id}
     assert document.row["source_identity_registry"] == row["source_identity_registry"]
+
+
+@pytest.mark.parametrize(("spm_rate", "mode"), ((0.0, "psm"), (1.0, "spm")))
+def test_domain_wrapped_fim_modes_preserve_exact_sidecars(
+    tmp_path: Path,
+    spm_rate: float,
+    mode: str,
+) -> None:
+    row, _physical_id = _dependency_row()
+    source_path = tmp_path / f"fim-{mode}.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=31))
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.FIM: 1.0},
+        seed=31,
+        spm_rate=spm_rate,
+    ).materialize(source, step_index=0)
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    source_map = list(realized.example.metadata["source_token_indices"])
+    assert realized.example.metadata["fim_mode"] == mode
+    assert sorted(index for index in source_map if index >= 0) == list(
+        range(TOKEN_COUNT)
+    )
+    assert document.token_ids[:2] == [2, DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]]
+    assert document.token_ids[-2:] == [
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+        3,
+    ]
+    assert source_map[:2] == [0, 1]
+    assert source_map[-2:] == [TOKEN_COUNT - 1, -1]
+    for output_index, source_index in enumerate(source_map):
+        if source_index < 0:
+            for output_column in (
+                "token_structure_ids",
+                "token_dep_levels",
+                "token_ast_depth",
+                "token_sibling_index",
+                "token_ast_node_type",
+                "token_symbol_ids",
+                "token_call_targets",
+                "token_type_refs",
+                "token_def_use",
+                "token_entity_ids",
+                "token_scope_ids",
+            ):
+                assert document.row[output_column][output_index] == 0
+            assert document.row["token_role_ids"][output_index] == int(
+                DomainRoleKind.NONE
+            )
+            assert document.row["token_confidence_ids"][output_index] == int(
+                ParseConfidence.ABSENT
+            )
+            assert document.row["token_source_doc_ids"][output_index] > 0
+            assert document.row["token_source_identity_ids"][output_index] > 0
+            continue
+        for output_column, source_column in (
+            ("token_structure_ids", "token_structure_ids"),
+            ("token_dep_levels", "token_dep_levels"),
+            ("token_ast_depth", "token_ast_depth"),
+            ("token_sibling_index", "token_sibling_index"),
+            ("token_ast_node_type", "token_ast_node_type"),
+            ("token_symbol_ids", "token_symbol_ids"),
+            ("token_call_targets", "token_call_targets"),
+            ("token_type_refs", "token_type_refs"),
+            ("token_def_use", "token_def_use"),
+            ("token_domain_ids", "token_domain_ids"),
+            ("token_role_ids", "token_role_ids"),
+            ("token_entity_ids", "token_entity_ids"),
+            ("token_scope_ids", "token_scope_ids"),
+            ("token_confidence_ids", "token_confidence_ids"),
+            ("token_source_doc_ids", "token_source_doc_ids"),
+            ("token_source_identity_ids", "token_source_identity_ids"),
+        ):
+            assert (
+                document.row[output_column][output_index]
+                == row[source_column][source_index]
+            )
+    _assert_domain_stack_values(
+        document.row["input_ids"],
+        document.row["token_domain_ids"],
+        document.row["token_role_ids"],
+        document.row["token_confidence_ids"],
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    (
+        TaskKind.SYMBOL_RECOVERY,
+        TaskKind.TYPE_RECOVERY,
+        TaskKind.CALLEE_RECOVERY,
+    ),
+)
+def test_domain_wrapped_recovery_preserves_converter_stack(
+    tmp_path: Path,
+    task: TaskKind,
+) -> None:
+    row, physical_id = _dependency_row()
+    source_path = tmp_path / f"{task.value}.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=37))
+    realized = EligibilityAwareTaskMixer({task: 1.0}, seed=37).materialize(
+        source,
+        step_index=0,
+    )
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    assert set(document.row["token_source_identity_ids"]) == {physical_id}
+    assert document.token_ids[:2] == [2, DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]]
+    assert document.token_ids[-2:] == [
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+        3,
+    ]
+    _assert_domain_stack_values(
+        document.row["input_ids"],
+        document.row["token_domain_ids"],
+        document.row["token_role_ids"],
+        document.row["token_confidence_ids"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("task", "cpp_pairs"),
+    ((TaskKind.COMMIT_DIFF, 1), (TaskKind.PRE_TO_POST, 2)),
+)
+def test_commit_objectives_emit_explicit_cpp_domain_sidecars(
+    tmp_path: Path,
+    task: TaskKind,
+    cpp_pairs: int,
+) -> None:
+    row = _fully_eligible_commit_row(filepath=f"src/{task.value}.cpp")
+    source_path = tmp_path / f"{task.value}.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=41))
+    realized = EligibilityAwareTaskMixer({task: 1.0}, seed=41).materialize(
+        source,
+        step_index=0,
+    )
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    assert (
+        document.token_ids.count(DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"])
+        == cpp_pairs
+    )
+    assert (
+        document.token_ids.count(DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"])
+        == cpp_pairs
+    )
+    assert all(value > 0 for value in document.row["token_source_doc_ids"])
+    assert all(value > 0 for value in document.row["token_source_identity_ids"])
+    assert set(realized.example.metadata["source_token_indices"]) == {-1}
+    _assert_domain_stack_values(
+        document.row["input_ids"],
+        document.row["token_domain_ids"],
+        document.row["token_role_ids"],
+        document.row["token_confidence_ids"],
+    )
 
 
 def test_transformed_dependency_objective_rejects_multiple_physical_sources(
@@ -421,6 +662,8 @@ def test_full_quota_materialization_accepts_mixed_dependency_and_commit_rows(
     tables = [pq.read_table(path) for path in shard_paths]
     table = pa.concat_tables(tables)
     assert table.num_rows == 60
+    for row_index in range(table.num_rows):
+        _assert_converter_equivalent_domain_stack(table, row_index)
     assert table.schema.field("doc_ids").type == pa.list_(pa.uint32())
     assert table.schema.field("token_source_doc_ids").type == pa.list_(pa.uint32())
     assert table.schema.field("token_source_identity_ids").type == pa.list_(pa.uint64())
@@ -466,9 +709,12 @@ def test_full_quota_materialization_accepts_mixed_dependency_and_commit_rows(
             assert set(
                 _valid_values(table, "token_source_identity_ids", row_index)
             ) == {dependency_physical_id}
-            derived = set(_valid_values(table, "token_source_doc_ids", row_index))
-            assert len(derived) == 1
-            assert derived.isdisjoint({1, 2, 3, 4})
+            assert set(_valid_values(table, "token_source_doc_ids", row_index)) == {
+                1,
+                2,
+                3,
+                4,
+            }
 
     artifact_path = output_dir / "objective_materialization.json"
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -500,6 +746,7 @@ def test_actual_case3_multi_physical_mix_materializes_full_quota_via_cli(
         [
             _fully_eligible_commit_row(filepath="src/commit-one.cpp"),
             _fully_eligible_commit_row(filepath="src/commit-two.cpp"),
+            _fully_eligible_commit_row(filepath="src/commit-three.cpp"),
         ],
     )
     output_dir = tmp_path / "objectives"
@@ -541,6 +788,9 @@ def test_actual_case3_multi_physical_mix_materializes_full_quota_via_cli(
 
     shard_paths = sorted(output_dir.glob("objectives_*.parquet"))
     table = pa.concat_tables([pq.read_table(path) for path in shard_paths])
+    assert table.num_rows == 60
+    for row_index in range(table.num_rows):
+        _assert_converter_equivalent_domain_stack(table, row_index)
     kinds = table["objective_kind"].to_pylist()
     expected_quotas = EligibilityAwareTaskMixer(STAGE1_DEFAULT_RATES, seed=17).quotas(
         60
@@ -555,7 +805,7 @@ def test_actual_case3_multi_physical_mix_materializes_full_quota_via_cli(
         if identities == multi_physical_ids:
             assert kind == TaskKind.CAUSAL_LM.value
             multi_causal_rows.append(row_index)
-    assert len(multi_causal_rows) == 12
+    assert multi_causal_rows
     for row_index in multi_causal_rows:
         assert (
             _valid_values(table, "token_source_doc_ids", row_index)

@@ -15,6 +15,13 @@ from typing import Any
 import numpy as np
 
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_DELIMITER_ROLES,
+    DomainKind,
+    DomainRoleKind,
+    ParseConfidence,
+)
+from cppmega_mlx.data.fim import INSERTED_TOKEN_SOURCE_INDEX
 from cppmega_mlx.data.source_identity import (
     MAX_ROW_LOCAL_DOC_ID,
     MAX_SOURCE_ID,
@@ -24,11 +31,13 @@ from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SymbolIdentityRegistry,
 )
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ObjectiveSource,
     RealizedObjective,
 )
+from cppmega_mlx.training.objectives import SOURCE_TOKEN_INDICES_METADATA_KEY
 from cppmega_mlx.training.task_mixer import TaskKind
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
@@ -98,6 +107,17 @@ _ALIGNED_TASKS = frozenset(
         TaskKind.CAUSAL_LM,
     }
 )
+_TRANSFORMED_CODE_TASKS = frozenset(
+    {
+        TaskKind.FIM,
+        TaskKind.AST_FIM,
+        TaskKind.IFIM,
+        TaskKind.SYMBOL_RECOVERY,
+        TaskKind.TYPE_RECOVERY,
+        TaskKind.CALLEE_RECOVERY,
+    }
+)
+_COMMIT_TASKS = frozenset({TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST})
 
 _TOKEN_SIDECARS = {
     "token_structure_ids": "structure_ids",
@@ -134,6 +154,12 @@ _GRAPH_RELATION_COLUMNS = {
     "diagnostic": "token_diagnostic_edges",
     "cross_domain": "token_cross_domain_edges",
 }
+_DOMAIN_DELIMITER_BY_ID: dict[int, tuple[int, str, int]] = {}
+for _domain, (_start_role, _end_role) in DOMAIN_DELIMITER_ROLES.items():
+    _start_id = int(DOMAIN_DELIMITER_TOKEN_IDS[_start_role])
+    _end_id = int(DOMAIN_DELIMITER_TOKEN_IDS[_end_role])
+    _DOMAIN_DELIMITER_BY_ID[_start_id] = (int(_domain), "start", _end_id)
+    _DOMAIN_DELIMITER_BY_ID[_end_id] = (int(_domain), "end", _end_id)
 
 
 def _ints(value: Any, *, where: str) -> list[int]:
@@ -173,6 +199,221 @@ def _optional_metadata_vector(
             f"token length {length}"
         )
     return values
+
+
+def _validated_source_token_indices(
+    *,
+    metadata: Mapping[str, object],
+    packet: CodePacket,
+    transformed_tokens: Sequence[int],
+    objective_kind: str,
+) -> list[int]:
+    raw_indices = metadata.get(SOURCE_TOKEN_INDICES_METADATA_KEY)
+    if not isinstance(raw_indices, (tuple, list)):
+        raise ValueError(
+            f"{objective_kind}: missing exact {SOURCE_TOKEN_INDICES_METADATA_KEY}"
+        )
+    source_indices = [int(index) for index in raw_indices]
+    if len(source_indices) != len(transformed_tokens):
+        raise ValueError(
+            f"{objective_kind}: source-token map length {len(source_indices)} != "
+            f"transformed token length {len(transformed_tokens)}"
+        )
+    source_tokens = _ints(packet.token_ids, where="CodePacket.token_ids")
+    for output_index, source_index in enumerate(source_indices):
+        if source_index == INSERTED_TOKEN_SOURCE_INDEX:
+            continue
+        if not 0 <= source_index < len(source_tokens):
+            raise ValueError(
+                f"{objective_kind}: source-token map index {source_index} at "
+                f"output token {output_index} is outside {len(source_tokens)} tokens"
+            )
+        if int(transformed_tokens[output_index]) != source_tokens[source_index]:
+            raise ValueError(
+                f"{objective_kind}: transformed token {output_index} does not match "
+                f"CodePacket token {source_index}"
+            )
+
+    raw_span = metadata.get("source_document_span")
+    if not isinstance(raw_span, (tuple, list)) or len(raw_span) != 2:
+        raise ValueError(f"{objective_kind}: source_document_span must be a pair")
+    start, end = (int(value) for value in raw_span)
+    if not 0 <= start < end <= len(source_tokens):
+        raise ValueError(
+            f"{objective_kind}: source_document_span [{start}, {end}) is outside "
+            f"{len(source_tokens)} CodePacket tokens"
+        )
+    mapped = sorted(
+        index for index in source_indices if index != INSERTED_TOKEN_SOURCE_INDEX
+    )
+    if mapped != list(range(start, end)):
+        raise ValueError(
+            f"{objective_kind}: source-token map must cover source_document_span "
+            "exactly once"
+        )
+    return source_indices
+
+
+def _source_vector(
+    packet: CodePacket,
+    field: str,
+    *,
+    source_length: int,
+    required: bool,
+) -> list[int] | None:
+    value = getattr(packet, field)
+    if value is None:
+        if required:
+            raise ValueError(
+                "pre-materialized production transformed objective requires "
+                f"CodePacket.{field}"
+            )
+        return None
+    return _packet_vector(packet, field, length=source_length)
+
+
+def _permute_source_vector(
+    source_values: Sequence[int] | None,
+    source_indices: Sequence[int],
+    *,
+    inserted_value: int = 0,
+) -> list[int]:
+    if source_values is None:
+        return [inserted_value] * len(source_indices)
+    return [
+        inserted_value
+        if source_index == INSERTED_TOKEN_SOURCE_INDEX
+        else int(source_values[source_index])
+        for source_index in source_indices
+    ]
+
+
+def _permute_provenance_vector(
+    source_values: Sequence[int],
+    source_indices: Sequence[int],
+    *,
+    where: str,
+) -> list[int]:
+    """Copy mapped values and assign insertions to their nearest source token."""
+
+    result: list[int | None] = [
+        None
+        if source_index == INSERTED_TOKEN_SOURCE_INDEX
+        else int(source_values[source_index])
+        for source_index in source_indices
+    ]
+    mapped_positions = [
+        index for index, value in enumerate(result) if value is not None
+    ]
+    if not mapped_positions:
+        raise ValueError(f"{where}: source-token map contains no original tokens")
+    previous: list[int | None] = [None] * len(result)
+    next_position: list[int | None] = [None] * len(result)
+    last: int | None = None
+    for index, value in enumerate(result):
+        if value is not None:
+            last = index
+        previous[index] = last
+    last = None
+    for index in range(len(result) - 1, -1, -1):
+        if result[index] is not None:
+            last = index
+        next_position[index] = last
+    for index, value in enumerate(result):
+        if value is not None:
+            continue
+        left = previous[index]
+        right = next_position[index]
+        if right is None or (left is not None and index - left <= right - index):
+            source_position = left
+        else:
+            source_position = right
+        if source_position is None:  # pragma: no cover - mapped_positions proves this
+            raise AssertionError(f"{where}: cannot resolve inserted-token provenance")
+        result[index] = result[source_position]
+    return [int(value) for value in result if value is not None]
+
+
+def _domain_stack_defaults(
+    token_ids: Sequence[int],
+    *,
+    where: str,
+) -> tuple[list[int], list[int], list[int]]:
+    domains: list[int] = []
+    roles: list[int] = []
+    confidence: list[int] = []
+    stack: list[tuple[int, int]] = []
+    for index, token_id in enumerate(token_ids):
+        marker = _DOMAIN_DELIMITER_BY_ID.get(int(token_id))
+        if marker is None:
+            domains.append(stack[-1][0] if stack else int(DomainKind.UNKNOWN))
+            roles.append(int(DomainRoleKind.NONE))
+            confidence.append(int(ParseConfidence.ABSENT))
+            continue
+        domain_id, direction, expected_close = marker
+        domains.append(domain_id)
+        roles.append(int(DomainRoleKind.DELIMITER))
+        confidence.append(int(ParseConfidence.EXACT))
+        if direction == "start":
+            stack.append((domain_id, expected_close))
+        elif not stack or stack[-1] != (domain_id, int(token_id)):
+            raise ValueError(
+                f"{where}: mismatched domain closer {token_id} at token {index}"
+            )
+        else:
+            stack.pop()
+    if stack:
+        raise ValueError(f"{where}: unclosed domain delimiter stack {stack}")
+    return domains, roles, confidence
+
+
+def _validate_domain_stack_sidecars(
+    token_ids: Sequence[int],
+    domain_ids: Sequence[int],
+    role_ids: Sequence[int],
+    confidence_ids: Sequence[int],
+    *,
+    where: str,
+) -> None:
+    if not (len(token_ids) == len(domain_ids) == len(role_ids) == len(confidence_ids)):
+        raise ValueError(f"{where}: domain sidecars must be token aligned")
+    stack: list[tuple[int, int]] = []
+    for index, (token_id, domain_id, role_id, confidence_id) in enumerate(
+        zip(token_ids, domain_ids, role_ids, confidence_ids, strict=True)
+    ):
+        marker = _DOMAIN_DELIMITER_BY_ID.get(int(token_id))
+        if marker is None:
+            expected_domain = stack[-1][0] if stack else int(DomainKind.UNKNOWN)
+            if int(domain_id) != expected_domain:
+                raise ValueError(
+                    f"{where}: token {index} requires domain {expected_domain}, "
+                    f"got {domain_id}"
+                )
+            if int(role_id) == int(DomainRoleKind.DELIMITER):
+                raise ValueError(
+                    f"{where}: non-delimiter token {index} has DELIMITER role"
+                )
+            continue
+        expected_domain, direction, expected_close = marker
+        if int(domain_id) != expected_domain:
+            raise ValueError(
+                f"{where}: delimiter {token_id} requires domain {expected_domain}, "
+                f"got {domain_id}"
+            )
+        if int(role_id) != int(DomainRoleKind.DELIMITER):
+            raise ValueError(f"{where}: delimiter {token_id} requires DELIMITER role")
+        if int(confidence_id) != int(ParseConfidence.EXACT):
+            raise ValueError(f"{where}: delimiter {token_id} requires EXACT confidence")
+        if direction == "start":
+            stack.append((expected_domain, expected_close))
+        elif not stack or stack[-1] != (expected_domain, int(token_id)):
+            raise ValueError(
+                f"{where}: mismatched domain closer {token_id} at token {index}"
+            )
+        else:
+            stack.pop()
+    if stack:
+        raise ValueError(f"{where}: unclosed domain delimiter stack {stack}")
 
 
 def _causal_chunk_pairs(
@@ -215,115 +456,6 @@ class MaterializedMegatronDocument:
     row: dict[str, object]
 
 
-def _transformed_source_document_id(
-    source: ObjectiveSource,
-    *,
-    source_document_span: object,
-    objective_kind: str,
-    transformed_tokens: Sequence[int],
-    required: bool,
-) -> int:
-    """Return one honest row-local constituent ID for transformed output.
-
-    A selected span from one constituent retains that uint32 ID. A span assembled
-    from several constituents receives a deterministic derived ID; stable physical
-    provenance is validated and retained separately as uint64.
-    """
-
-    packet = source.code_packet
-    if packet is not None and packet.source_doc_ids is not None:
-        source_ids = _ints(packet.source_doc_ids, where="CodePacket.source_doc_ids")
-        if source_document_span is not None:
-            if (
-                not isinstance(source_document_span, (tuple, list))
-                or len(source_document_span) != 2
-            ):
-                raise ValueError("objective source_document_span must be a pair")
-            start, end = (int(value) for value in source_document_span)
-            if not 0 <= start < end <= len(source_ids):
-                raise ValueError(
-                    f"objective source_document_span [{start}, {end}) is outside "
-                    f"{len(source_ids)} source document provenance tokens"
-                )
-            source_ids = source_ids[start:end]
-        if any(not 0 < source_id <= MAX_ROW_LOCAL_DOC_ID for source_id in source_ids):
-            raise ValueError(
-                "pre-materialized transformed objective requires positive uint32 "
-                "CodePacket.source_doc_ids"
-            )
-        unique = set(source_ids)
-        if len(unique) == 1:
-            return next(iter(unique))
-        if unique:
-            payload = {
-                "schema": "cppmega_transformed_source_document_v1",
-                "objective": objective_kind,
-                "source_document_span": source_document_span,
-                "source_doc_ids": source_ids,
-                "transformed_token_ids": [int(value) for value in transformed_tokens],
-            }
-            digest = hashlib.sha256(
-                json.dumps(
-                    payload,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=True,
-                ).encode("ascii")
-            ).digest()
-            derived = int.from_bytes(digest[:4], "big") or 1
-            while derived in unique:
-                derived = derived % MAX_ROW_LOCAL_DOC_ID + 1
-            return derived
-    if required:
-        raise ValueError(
-            "pre-materialized transformed objective requires positive uint32 "
-            "source provenance in CodePacket.source_doc_ids"
-        )
-    if packet is not None:
-        fingerprint = {
-            "kind": "code",
-            "repo": packet.repo,
-            "filepath": packet.filepath,
-            "commit_or_ref": packet.commit_or_ref,
-            "token_ids": _ints(packet.token_ids, where="CodePacket.token_ids"),
-        }
-    elif source.commit_packet is not None:
-        commit = source.commit_packet
-        fingerprint = {
-            "kind": "commit",
-            "repo": commit.repo,
-            "filepath": commit.filepath,
-            "commit_or_ref": commit.commit_or_ref,
-            "commit_msg": (
-                None
-                if commit.commit_msg is None
-                else _ints(commit.commit_msg, where="CommitPacket.commit_msg")
-            ),
-            "diff_token_ids": (
-                None
-                if commit.diff_token_ids is None
-                else _ints(commit.diff_token_ids, where="CommitPacket.diff_token_ids")
-            ),
-            "pre_token_ids": (
-                None
-                if commit.pre_token_ids is None
-                else _ints(commit.pre_token_ids, where="CommitPacket.pre_token_ids")
-            ),
-            "post_token_ids": (
-                None
-                if commit.post_token_ids is None
-                else _ints(commit.post_token_ids, where="CommitPacket.post_token_ids")
-            ),
-        }
-    else:  # pragma: no cover - ObjectiveSource validates this invariant
-        raise ValueError("transformed objective has no source packet")
-    digest = hashlib.sha256(
-        json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).digest()
-    identity = int.from_bytes(digest[:4], "big")
-    return identity or 1
-
-
 def _source_identity_registry_for_ids(
     packet: CodePacket,
     source_identity_ids: Sequence[int],
@@ -346,51 +478,6 @@ def _source_identity_registry_for_ids(
         referenced_ids=referenced,
     )
     return [validated[identity_id].as_dict() for identity_id in referenced]
-
-
-def _transformed_physical_source_identity(
-    packet: CodePacket | None,
-    *,
-    source_document_span: object,
-    required: bool,
-) -> tuple[int, list[dict[str, int | str]]]:
-    if packet is not None and packet.source_identity_ids is not None:
-        source_ids = _ints(
-            packet.source_identity_ids,
-            where="CodePacket.source_identity_ids",
-        )
-        if source_document_span is not None:
-            if (
-                not isinstance(source_document_span, (tuple, list))
-                or len(source_document_span) != 2
-            ):
-                raise ValueError("objective source_document_span must be a pair")
-            start, end = (int(value) for value in source_document_span)
-            if not 0 <= start < end <= len(source_ids):
-                raise ValueError(
-                    f"objective source_document_span [{start}, {end}) is outside "
-                    f"{len(source_ids)} physical source identity tokens"
-                )
-            source_ids = source_ids[start:end]
-        if any(not 0 < source_id <= MAX_SOURCE_ID for source_id in source_ids):
-            raise ValueError(
-                "pre-materialized transformed objective requires positive uint64 "
-                "CodePacket.source_identity_ids"
-            )
-        unique = set(source_ids)
-        if len(unique) == 1:
-            identity_id = next(iter(unique))
-            return identity_id, _source_identity_registry_for_ids(
-                packet,
-                [identity_id],
-                required=required,
-            )
-    if required:
-        raise ValueError(
-            "pre-materialized transformed objective requires exactly one positive "
-            "physical source in CodePacket.source_identity_ids"
-        )
-    return 0, []
 
 
 def _symbol_identity_records(packet: CodePacket) -> list[dict[str, object]]:
@@ -633,6 +720,13 @@ def materialize_megatron_document(
                 row[column] = [0] * len(tokens)
             else:
                 row[column] = _packet_vector(packet, field, length=len(tokens))
+        _validate_domain_stack_sidecars(
+            tokens,
+            row["token_domain_ids"],
+            row["token_role_ids"],
+            row["token_confidence_ids"],
+            where=realized.task.value,
+        )
         if require_production_sidecars and any(
             int(value) <= 0 for value in row["token_source_doc_ids"]
         ):
@@ -674,29 +768,236 @@ def materialize_megatron_document(
         row["token_type_edges"] = _causal_chunk_pairs(packet, "type_edges", starts)
         for column, field in _DOMAIN_GRAPH_FIELDS.items():
             row[column] = _causal_domain_triples(packet, field)
-    else:
-        zeros = [0] * len(tokens)
-        source_document_id = _transformed_source_document_id(
-            source,
-            source_document_span=example.metadata.get("source_document_span"),
-            objective_kind=realized.task.value,
+    elif realized.task in _TRANSFORMED_CODE_TASKS:
+        if packet is None:
+            raise ValueError(
+                f"{realized.task.value}: transformed code objective requires "
+                "ObjectiveSource.code_packet"
+            )
+        source_length = int(packet.token_ids.shape[0])
+        source_indices = _validated_source_token_indices(
+            metadata=example.metadata,
+            packet=packet,
             transformed_tokens=tokens,
-            required=require_production_sidecars,
+            objective_kind=realized.task.value,
         )
-        physical_identity, physical_registry = _transformed_physical_source_identity(
+        source_document_ids = (
+            [1] * source_length
+            if packet.document_ids is None
+            else _packet_vector(packet, "document_ids", length=source_length)
+        )
+        row["doc_ids"] = _permute_provenance_vector(
+            source_document_ids,
+            source_indices,
+            where=f"{realized.task.value}.doc_ids",
+        )
+
+        special_domain_columns = {
+            "token_domain_ids",
+            "token_role_ids",
+            "token_confidence_ids",
+            "token_source_doc_ids",
+            "token_source_identity_ids",
+        }
+        for column, field in _TOKEN_SIDECARS.items():
+            if column in special_domain_columns:
+                continue
+            source_values = _source_vector(
+                packet,
+                field,
+                source_length=source_length,
+                required=require_production_sidecars,
+            )
+            row[column] = _permute_source_vector(source_values, source_indices)
+
+        domains, roles, confidence = _domain_stack_defaults(
+            tokens,
+            where=realized.task.value,
+        )
+        for target, field in (
+            (domains, "domain_ids"),
+            (roles, "role_ids"),
+            (confidence, "confidence_ids"),
+        ):
+            source_values = _source_vector(
+                packet,
+                field,
+                source_length=source_length,
+                required=require_production_sidecars,
+            )
+            if source_values is None:
+                continue
+            for output_index, source_index in enumerate(source_indices):
+                if source_index != INSERTED_TOKEN_SOURCE_INDEX:
+                    target[output_index] = source_values[source_index]
+        _validate_domain_stack_sidecars(
+            tokens,
+            domains,
+            roles,
+            confidence,
+            where=realized.task.value,
+        )
+        row["token_domain_ids"] = domains
+        row["token_role_ids"] = roles
+        row["token_confidence_ids"] = confidence
+
+        source_doc_ids = _source_vector(
             packet,
-            source_document_span=example.metadata.get("source_document_span"),
+            "source_doc_ids",
+            source_length=source_length,
             required=require_production_sidecars,
         )
-        row["doc_ids"] = [1] * len(tokens)
+        if source_doc_ids is None:
+            row["token_source_doc_ids"] = [0] * len(tokens)
+        else:
+            row["token_source_doc_ids"] = _permute_provenance_vector(
+                source_doc_ids,
+                source_indices,
+                where=f"{realized.task.value}.token_source_doc_ids",
+            )
+            if any(
+                not 0 < value <= MAX_ROW_LOCAL_DOC_ID
+                for value in row["token_source_doc_ids"]
+            ):
+                raise ValueError(
+                    f"{realized.task.value}: transformed token_source_doc_ids "
+                    "must remain positive uint32 values"
+                )
+
+        source_identity_ids = _source_vector(
+            packet,
+            "source_identity_ids",
+            source_length=source_length,
+            required=require_production_sidecars,
+        )
+        if source_identity_ids is None:
+            row["token_source_identity_ids"] = [0] * len(tokens)
+        else:
+            row["token_source_identity_ids"] = _permute_provenance_vector(
+                source_identity_ids,
+                source_indices,
+                where=f"{realized.task.value}.token_source_identity_ids",
+            )
+            if any(
+                not 0 < value <= MAX_SOURCE_ID
+                for value in row["token_source_identity_ids"]
+            ):
+                raise ValueError(
+                    f"{realized.task.value}: transformed "
+                    "token_source_identity_ids must remain positive uint64 values"
+                )
+            if len(set(row["token_source_identity_ids"])) != 1:
+                raise ValueError(
+                    f"{realized.task.value}: transformed objective requires "
+                    "exactly one positive physical source identity"
+                )
+        row[SOURCE_IDENTITY_REGISTRY_COLUMN] = _source_identity_registry_for_ids(
+            packet,
+            row["token_source_identity_ids"],
+            required=require_production_sidecars,
+        )
+        row[SYMBOL_IDENTITIES_COLUMN] = _symbol_identity_records(packet)
+        for column in ("token_change_mask_pre", "token_change_mask_post"):
+            source_values = _optional_metadata_vector(
+                packet,
+                column,
+                length=source_length,
+            )
+            row[column] = _permute_source_vector(source_values, source_indices)
+    elif realized.task in _COMMIT_TASKS:
+        commit_source_indices = example.metadata.get(SOURCE_TOKEN_INDICES_METADATA_KEY)
+        if (
+            not isinstance(commit_source_indices, (tuple, list))
+            or len(commit_source_indices) != len(tokens)
+            or any(
+                int(index) != INSERTED_TOKEN_SOURCE_INDEX
+                for index in commit_source_indices
+            )
+        ):
+            raise ValueError(
+                f"{realized.task.value}: CommitPacket tokens must use only the "
+                "inserted-token source sentinel"
+            )
+        zeros = [0] * len(tokens)
         for column in _TOKEN_SIDECARS:
             row[column] = list(zeros)
+        domains, roles, confidence = _domain_stack_defaults(
+            tokens,
+            where=realized.task.value,
+        )
+        _validate_domain_stack_sidecars(
+            tokens,
+            domains,
+            roles,
+            confidence,
+            where=realized.task.value,
+        )
+        row["token_domain_ids"] = domains
+        row["token_role_ids"] = roles
+        row["token_confidence_ids"] = confidence
+
+        source_document_id = 0
+        source_identity_id = 0
+        if packet is not None and packet.source_doc_ids is not None:
+            source_doc_ids = _ints(
+                packet.source_doc_ids,
+                where="CodePacket.source_doc_ids",
+            )
+            if any(not 0 < value <= MAX_ROW_LOCAL_DOC_ID for value in source_doc_ids):
+                raise ValueError(
+                    f"{realized.task.value}: commit source_doc_ids must be "
+                    "positive uint32 values"
+                )
+            if len(set(source_doc_ids)) != 1:
+                raise ValueError(
+                    f"{realized.task.value}: commit objective requires exactly "
+                    "one source document identity"
+                )
+            source_document_id = source_doc_ids[0]
+        elif require_production_sidecars:
+            raise ValueError(
+                f"{realized.task.value}: production commit objective requires "
+                "CodePacket.source_doc_ids"
+            )
+        if packet is not None and packet.source_identity_ids is not None:
+            source_identity_ids = _ints(
+                packet.source_identity_ids,
+                where="CodePacket.source_identity_ids",
+            )
+            if any(not 0 < value <= MAX_SOURCE_ID for value in source_identity_ids):
+                raise ValueError(
+                    f"{realized.task.value}: commit physical source identities "
+                    "must be positive uint64 values"
+                )
+            if len(set(source_identity_ids)) != 1:
+                raise ValueError(
+                    f"{realized.task.value}: commit objective requires exactly "
+                    "one physical source identity"
+                )
+            source_identity_id = source_identity_ids[0]
+        elif require_production_sidecars:
+            raise ValueError(
+                f"{realized.task.value}: production commit objective requires "
+                "CodePacket.source_identity_ids"
+            )
         row["token_source_doc_ids"] = [source_document_id] * len(tokens)
-        row["token_source_identity_ids"] = [physical_identity] * len(tokens)
-        row[SOURCE_IDENTITY_REGISTRY_COLUMN] = physical_registry
+        row["token_source_identity_ids"] = [source_identity_id] * len(tokens)
+        row[SOURCE_IDENTITY_REGISTRY_COLUMN] = (
+            []
+            if packet is None
+            else _source_identity_registry_for_ids(
+                packet,
+                row["token_source_identity_ids"],
+                required=require_production_sidecars,
+            )
+        )
         row[SYMBOL_IDENTITIES_COLUMN] = []
         row["token_change_mask_pre"] = list(zeros)
         row["token_change_mask_post"] = list(zeros)
+    else:  # pragma: no cover - TaskKind exhaustiveness guard
+        raise ValueError(f"unsupported materialized objective {realized.task.value}")
+
+    if not aligned:
         for column in (
             "token_chunk_starts",
             "token_chunk_ends",

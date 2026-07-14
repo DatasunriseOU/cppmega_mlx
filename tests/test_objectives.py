@@ -9,6 +9,7 @@ import pytest
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.fim import EOT_ID, FIM_MIDDLE_ID, FIM_PREFIX_ID, FIM_SUFFIX_ID
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.training.objectives import (
     ObjectiveExample,
     build_ast_fim,
@@ -94,7 +95,7 @@ def test_ifim_aligned() -> None:
         chunk_ends=packet.chunk_ends,
         chunk_kinds=packet.chunk_kinds,
         chunk_dep_levels=packet.chunk_dep_levels,
-        ifim_instruction_token_ids=_arr([200, 201, 202]),
+        ifim_instruction_token_ids=_arr([1200, 1201, 1202]),
     )
     ex = build_ifim(packet, seed=1, spm_rate=0.0)
     _assert_aligned(ex)
@@ -109,13 +110,26 @@ def test_commit_diff_loss_on_diff() -> None:
     )
     ex = build_commit_diff(packet)
     _assert_aligned(ex)
-    full = [17, 100, 101, 18, 15, 50, 51, 52, 16, EOT_ID]
+    full = [
+        17,
+        100,
+        101,
+        18,
+        15,
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"],
+        50,
+        51,
+        52,
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+        16,
+        EOT_ID,
+    ]
     assert _np(ex.input_ids) == full[:-1]
     assert _np(ex.target_ids) == full[1:]
-    assert _np(ex.loss_mask) == [0, 0, 0, 0, 1, 1, 1, 1, 1]
+    assert _np(ex.loss_mask) == [0] * 5 + [1] * 6
     assert ex.metadata["section_boundaries"] == {
         "commit_message": (0, 4),
-        "diff": (4, 9),
+        "diff": (4, 11),
     }
 
 
@@ -127,7 +141,23 @@ def test_pre_to_post_loss_on_post() -> None:
     )
     ex = build_pre_to_post(packet)
     _assert_aligned(ex)
-    full = [7, 10, 11, 8, 17, 30, 18, 14, 7, 20, 21, 8, EOT_ID]
+    cpp_start = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]
+    cpp_end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
+    full = [
+        cpp_start,
+        10,
+        11,
+        cpp_end,
+        17,
+        30,
+        18,
+        14,
+        cpp_start,
+        20,
+        21,
+        cpp_end,
+        EOT_ID,
+    ]
     assert _np(ex.input_ids) == full[:-1]
     assert _np(ex.target_ids) == full[1:]
     assert _np(ex.loss_mask) == [0] * 8 + [1] * 4

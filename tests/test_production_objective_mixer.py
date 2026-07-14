@@ -22,6 +22,7 @@ from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 from cppmega_mlx.data.source_identity import source_identity
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
     SOURCE_DIFF_TOKEN_IDS_COLUMN,
@@ -99,6 +100,29 @@ def _code_packet(*, instruction_ids: list[int] | None = None) -> CodePacket:
         chunk_kinds=_arr([1, 1, 1]),
         chunk_dep_levels=_arr([0, 0, 0]),
     )
+
+
+def _with_required_token_sidecars(packet: CodePacket) -> CodePacket:
+    token_count = int(packet.token_ids.shape[0])
+    zeros = _arr([0] * token_count)
+    values = dict(packet.__dict__)
+    values.update(
+        structure_ids=_arr([1] * token_count),
+        dep_levels=zeros,
+        ast_depth=zeros,
+        sibling_index=zeros,
+        ast_node_type=_arr([1] * token_count),
+        symbol_ids=zeros,
+        call_targets=zeros,
+        type_refs=zeros,
+        def_use=zeros,
+        domain_ids=zeros,
+        role_ids=zeros,
+        entity_ids=zeros,
+        scope_ids=zeros,
+        confidence_ids=_arr([1] * token_count),
+    )
+    return CodePacket(**values)
 
 
 def test_commit_packets_use_only_typed_real_fields() -> None:
@@ -326,10 +350,66 @@ def test_no_interior_chunk_does_not_consume_ast_fim_quota_as_plain_fim() -> None
         )
 
 
+@pytest.mark.parametrize(
+    ("token_ids", "expected_reason"),
+    [
+        (
+            [
+                2,
+                DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"],
+                DOMAIN_DELIMITER_TOKEN_IDS["CMAKE_START"],
+                1000,
+                DOMAIN_DELIMITER_TOKEN_IDS["CMAKE_END"],
+                DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+            ],
+            "nested domain delimiters are unsupported",
+        ),
+        (
+            [
+                2,
+                DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"],
+                1000,
+                DOMAIN_DELIMITER_TOKEN_IDS["CMAKE_END"],
+                DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+            ],
+            "crossing/mismatched domain pair",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "task",
+    (
+        TaskKind.FIM,
+        TaskKind.AST_FIM,
+        TaskKind.IFIM,
+        TaskKind.SYMBOL_RECOVERY,
+        TaskKind.TYPE_RECOVERY,
+        TaskKind.CALLEE_RECOVERY,
+    ),
+)
+def test_unsupported_domain_structure_is_explicitly_ineligible(
+    token_ids: list[int],
+    expected_reason: str,
+    task: TaskKind,
+) -> None:
+    packet = CodePacket(token_ids=_arr(token_ids))
+    mixer = EligibilityAwareTaskMixer(
+        {TaskKind.CAUSAL_LM: 0.5, task: 0.5},
+        seed=17,
+    )
+
+    realized = mixer.materialize(packet, step_index=0)
+
+    assert realized.task is TaskKind.CAUSAL_LM
+    assert expected_reason in realized.ineligible[task]
+
+
 def test_true_ifim_uses_typed_instruction_tokens_not_ast_fim() -> None:
     mixer = EligibilityAwareTaskMixer({TaskKind.IFIM: 1.0}, seed=11)
 
-    realized = mixer.materialize(_code_packet(instruction_ids=[201, 202]), step_index=3)
+    realized = mixer.materialize(
+        _code_packet(instruction_ids=[1201, 1202]), step_index=3
+    )
 
     assert realized.task is TaskKind.IFIM
     assert realized.example.objective == "ifim"
@@ -345,10 +425,10 @@ def test_eligibility_aware_window_hits_exact_deterministic_quotas() -> None:
         commit_msg=_arr([40, 41]),
     )
     packets = [
-        _code_packet(instruction_ids=[201, 202]),
-        _code_packet(instruction_ids=[203]),
-        _code_packet(instruction_ids=[204]),
-        _code_packet(instruction_ids=[205]),
+        _code_packet(instruction_ids=[1201, 1202]),
+        _code_packet(instruction_ids=[1203]),
+        _code_packet(instruction_ids=[1204]),
+        _code_packet(instruction_ids=[1205]),
         commit,
         commit,
         commit,
@@ -399,7 +479,7 @@ def test_eligibility_aware_window_fails_when_quota_is_impossible() -> None:
 def test_production_batch_window_preserves_exact_task_quotas() -> None:
     code = CodePacket(
         **{
-            **_code_packet(instruction_ids=[201, 202]).__dict__,
+            **_code_packet(instruction_ids=[1201, 1202]).__dict__,
             "structure_ids": _arr([1] * 8),
             "dep_levels": _arr([0] * 8),
             "ast_depth": _arr([0] * 8),
@@ -615,17 +695,19 @@ def test_materialized_causal_document_preserves_unique_document_ids() -> None:
 
 def test_permuted_objective_preserves_one_stable_source_identity() -> None:
     physical = _physical_source("src/one.cpp")
-    packet = CodePacket(
-        token_ids=_arr([10, 11, 12, 13, 14, 15]),
-        document_ids=_arr([1, 1, 1, 1, 1, 1]),
-        source_doc_ids=_arr([77, 77, 77, 77, 77, 77]),
-        source_identity_ids=mx.array(
-            np.asarray([physical.source_identity_id] * 6, dtype=np.uint64)
-        ),
-        metadata={
-            "platform_ids": [2],
-            "source_identity_registry": [physical.as_dict()],
-        },
+    packet = _with_required_token_sidecars(
+        CodePacket(
+            token_ids=_arr([10, 11, 12, 13, 14, 15]),
+            document_ids=_arr([1, 1, 1, 1, 1, 1]),
+            source_doc_ids=_arr([77, 77, 77, 77, 77, 77]),
+            source_identity_ids=mx.array(
+                np.asarray([physical.source_identity_id] * 6, dtype=np.uint64)
+            ),
+            metadata={
+                "platform_ids": [2],
+                "source_identity_registry": [physical.as_dict()],
+            },
+        )
     )
     source = ObjectiveSource(code_packet=packet)
     realized = EligibilityAwareTaskMixer({TaskKind.FIM: 1.0}, seed=47).materialize(
@@ -649,20 +731,22 @@ def test_permuted_objective_preserves_one_stable_source_identity() -> None:
 def test_permuted_objective_selects_exactly_one_logical_document() -> None:
     first = _physical_source("src/first.cpp")
     second = _physical_source("src/second.cpp")
-    packet = CodePacket(
-        token_ids=_arr([10, 11, 12, 13, 14, 15]),
-        document_ids=_arr([1, 1, 1, 2, 2, 2]),
-        source_doc_ids=_arr([77, 77, 77, 88, 88, 88]),
-        source_identity_ids=mx.array(
-            np.asarray(
-                [first.source_identity_id] * 3 + [second.source_identity_id] * 3,
-                dtype=np.uint64,
-            )
-        ),
-        metadata={
-            "platform_ids": [2],
-            "source_identity_registry": [first.as_dict(), second.as_dict()],
-        },
+    packet = _with_required_token_sidecars(
+        CodePacket(
+            token_ids=_arr([10, 11, 12, 13, 14, 15]),
+            document_ids=_arr([1, 1, 1, 2, 2, 2]),
+            source_doc_ids=_arr([77, 77, 77, 88, 88, 88]),
+            source_identity_ids=mx.array(
+                np.asarray(
+                    [first.source_identity_id] * 3 + [second.source_identity_id] * 3,
+                    dtype=np.uint64,
+                )
+            ),
+            metadata={
+                "platform_ids": [2],
+                "source_identity_registry": [first.as_dict(), second.as_dict()],
+            },
+        )
     )
     source = ObjectiveSource(code_packet=packet)
     realized = EligibilityAwareTaskMixer({TaskKind.FIM: 1.0}, seed=53).materialize(
@@ -919,7 +1003,7 @@ def test_megatron_document_materializes_real_commit_diff_not_post_tokens() -> No
     )
 
     assert document.objective_kind == "commit_diff"
-    assert document.token_ids[:8] == [17, 40, 41, 18, 15, 30, 31, 32]
+    assert document.token_ids[:8] == [17, 40, 41, 18, 15, 191, 30, 31]
     assert 20 not in document.token_ids and 21 not in document.token_ids
     assert document.loss_mask[-1] == 0
     assert sum(document.loss_mask[:-1]) == int(
@@ -956,7 +1040,7 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
     code = CodePacket(
         token_ids=_arr([100, 101, 102, 103, 104, 105, 106, 107]),
         document_ids=_arr([1] * n),
-        ifim_instruction_token_ids=_arr([201, 202]),
+        ifim_instruction_token_ids=_arr([1201, 1202]),
         structure_ids=_arr([1] * n),
         dep_levels=zeros,
         ast_depth=zeros,
@@ -1336,7 +1420,7 @@ def test_anonymous_tokenized_source_ids_ignore_encounter_order(tmp_path: Path) -
     reverse_dir = tmp_path / "reverse"
     forward_dir.mkdir()
     reverse_dir.mkdir()
-    token_rows = [[101, 102], [201, 202]]
+    token_rows = [[1001, 1002], [1201, 1202]]
     pq.write_table(
         pa.table({"token_ids": token_rows}),
         forward_dir / "rows.parquet",

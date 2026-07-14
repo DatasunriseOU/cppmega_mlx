@@ -14,12 +14,16 @@ import mlx.core as mx
 import numpy as np
 
 from cppmega_mlx.data.ast_fim import (
+    domain_preserving_document_spans,
     eligible_ast_chunk_indices,
     logical_document_spans,
 )
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
-from cppmega_mlx.data.fim import FIMSpecialTokenInput
+from cppmega_mlx.data.fim import (
+    FIMSpecialTokenInput,
+    UnsupportedDomainDelimiterStructureError,
+)
 from cppmega_mlx.data.graph_packet import GraphPacket
 from cppmega_mlx.data.source_identity import MAX_SOURCE_ID
 from cppmega_mlx.training.indexer_losses import total_indexer_loss
@@ -142,15 +146,32 @@ def _eligibility_reason(
             )
             estimated_input = token_count - 1
             return _length_reason(reason, estimated_input, max_input_tokens)
-        eligible_document_lengths = [
-            length for length in document_lengths if length >= 3
-        ]
-        if not eligible_document_lengths:
-            return "requires a logical document with at least 3 tokens"
-        selected_token_count = max(eligible_document_lengths)
+        try:
+            transform_regions = domain_preserving_document_spans(packet)
+        except UnsupportedDomainDelimiterStructureError as exc:
+            return str(exc)
         if task in {TaskKind.FIM, TaskKind.AST_FIM, TaskKind.IFIM}:
+            eligible_regions = [
+                region
+                for region in transform_regions
+                if region.content_end - region.content_start >= 3
+            ]
+            if not eligible_regions:
+                return "requires a supported domain interior with at least 3 tokens"
+            selected_token_count = max(
+                region.document_end - region.document_start
+                for region in eligible_regions
+            )
             physical_reason = _transformed_document_physical_identity_reason(
-                packet, document_spans
+                packet,
+                [
+                    (
+                        region.document_start,
+                        region.document_end,
+                        region.document_id,
+                    )
+                    for region in eligible_regions
+                ],
             )
             if physical_reason is not None:
                 return physical_reason
@@ -197,9 +218,33 @@ def _eligibility_reason(
         values = getattr(packet, field_name)
         if values is None:
             return f"missing {field_name}"
-        if not np.any(np.asarray(values) != 0):
-            return f"{field_name} has no non-zero span"
-        return _length_reason(None, token_count + 4, max_input_tokens)
+        markers = [int(value) for value in np.asarray(values).reshape(-1).tolist()]
+        candidate_regions: list[tuple[int, int]] = []
+        index = 0
+        while index < len(markers):
+            if markers[index] == 0:
+                index += 1
+                continue
+            end = index + 1
+            while end < len(markers) and markers[end] == markers[index]:
+                end += 1
+            for region in transform_regions:
+                if region.content_start <= index < end <= region.content_end:
+                    candidate_regions.append(
+                        (region.document_start, region.document_end)
+                    )
+                    break
+            index = end
+        if not candidate_regions:
+            return (
+                f"{field_name} has no non-zero span inside a supported domain interior"
+            )
+        selected_token_count = max(end - start for start, end in candidate_regions)
+        return _length_reason(
+            None,
+            selected_token_count + 4,
+            max_input_tokens,
+        )
 
     if not isinstance(packet, CommitPacket):
         return "requires CommitPacket"
@@ -213,7 +258,7 @@ def _eligibility_reason(
     reason = None if not missing else "missing or empty " + ", ".join(missing)
     if task is TaskKind.COMMIT_DIFF:
         estimated_input = (
-            _array_length(packet.commit_msg) + _array_length(packet.diff_token_ids) + 4
+            _array_length(packet.commit_msg) + _array_length(packet.diff_token_ids) + 6
         )
     else:
         estimated_input = (

@@ -42,17 +42,23 @@ import numpy as np
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.fim import (
     FIMMode,
-    FIMSpecialTokenIds,
     FIMSpecialTokenInput,
-    apply_fim_permutation,
-    apply_ifim_permutation,
+    apply_domain_preserving_fim_permutation,
+    domain_preserving_fim_region,
     sample_middle_span,
 )
 
 # Fraction of AST-FIM examples; the remaining slice is random-char-FIM.
 DEFAULT_AST_FIM_RATE = 0.9
 
-AstFimKind = Literal["ast_fim", "char_fim", "ast_ifim", "char_ifim"]
+AstFimKind = Literal[
+    "fim",
+    "ifim",
+    "ast_fim",
+    "char_fim",
+    "ast_ifim",
+    "char_ifim",
+]
 
 
 class NoEligibleChunkError(ValueError):
@@ -78,7 +84,19 @@ class AstFimResult:
     mode: FIMMode
     kind: AstFimKind
     chunk_index: int | None
+    source_token_indices: list[int]
     document_span: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class DomainPreservingDocumentSpan:
+    """One logical document and the absolute interior safe to permute."""
+
+    document_start: int
+    document_end: int
+    document_id: int
+    content_start: int
+    content_end: int
 
 
 def _token_count(packet: CodePacket) -> int:
@@ -101,8 +119,7 @@ def logical_document_spans(packet: CodePacket) -> tuple[tuple[int, int, int], ..
     if packet.document_ids is None:
         return ((0, length, 1),)
     document_ids = [
-        int(value)
-        for value in np.asarray(packet.document_ids).reshape(-1).tolist()
+        int(value) for value in np.asarray(packet.document_ids).reshape(-1).tolist()
     ]
     if len(document_ids) != length:
         raise ValueError(
@@ -117,6 +134,30 @@ def logical_document_spans(packet: CodePacket) -> tuple[tuple[int, int, int], ..
             spans.append((start, index, document_ids[start]))
             start = index
     return tuple(spans)
+
+
+def domain_preserving_document_spans(
+    packet: CodePacket,
+) -> tuple[DomainPreservingDocumentSpan, ...]:
+    """Validate every logical document and expose its transformable interior."""
+
+    tokens = _packet_token_list(packet)
+    regions: list[DomainPreservingDocumentSpan] = []
+    for document_start, document_end, document_id in logical_document_spans(packet):
+        region = domain_preserving_fim_region(
+            tokens[document_start:document_end],
+            where=f"fim logical document [{document_start}, {document_end})",
+        )
+        regions.append(
+            DomainPreservingDocumentSpan(
+                document_start=document_start,
+                document_end=document_end,
+                document_id=document_id,
+                content_start=document_start + region.content_start,
+                content_end=document_start + region.content_end,
+            )
+        )
+    return tuple(regions)
 
 
 def _containing_document(
@@ -163,21 +204,35 @@ def _eligible_chunks(
     starts: Sequence[int],
     ends: Sequence[int],
     length: int,
-    document_spans: Sequence[tuple[int, int, int]],
+    document_regions: Sequence[DomainPreservingDocumentSpan],
 ) -> list[int]:
-    """Chunks with non-empty prefix/suffix inside one logical document."""
+    """Chunks with non-empty context inside one domain-safe interior."""
 
     eligible: list[int] = []
+    document_spans = [
+        (region.document_start, region.document_end, region.document_id)
+        for region in document_regions
+    ]
     for idx, (start, end) in enumerate(zip(starts, ends)):
         if not 0 <= start < end <= length:
             raise ValueError(
                 f"ast_fim: chunk {idx} span [{start}, {end}) out of bounds for "
                 f"{length} tokens (chunk boundaries must be valid token offsets)"
             )
-        document_start, document_end, _document_id = _containing_document(
+        document_start, document_end, document_id = _containing_document(
             start, end, document_spans, chunk_index=idx
         )
-        if document_start < start and end < document_end:
+        region = next(
+            region
+            for region in document_regions
+            if (
+                region.document_start,
+                region.document_end,
+                region.document_id,
+            )
+            == (document_start, document_end, document_id)
+        )
+        if region.content_start < start and end < region.content_end:
             eligible.append(idx)
     return eligible
 
@@ -186,7 +241,7 @@ def _select_ast_span_in_document(
     packet: CodePacket,
     *,
     rng: random.Random,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     """Return document-relative span, chunk index, and absolute document span."""
 
     length = _token_count(packet)
@@ -196,8 +251,8 @@ def _select_ast_span_in_document(
             f"got {length}"
         )
     starts, ends, _kinds = _chunk_arrays(packet)
-    document_spans = logical_document_spans(packet)
-    eligible = _eligible_chunks(starts, ends, length, document_spans)
+    document_regions = domain_preserving_document_spans(packet)
+    eligible = _eligible_chunks(starts, ends, length, document_regions)
     if not eligible:
         raise NoEligibleChunkError(
             "ast_fim: no clang chunk yields non-empty context inside one "
@@ -206,18 +261,18 @@ def _select_ast_span_in_document(
     chunk_index = eligible[rng.randrange(len(eligible))]
     absolute_start = starts[chunk_index]
     absolute_end = ends[chunk_index]
-    document_start, document_end, _document_id = _containing_document(
-        absolute_start,
-        absolute_end,
-        document_spans,
-        chunk_index=chunk_index,
+    region = next(
+        region
+        for region in document_regions
+        if region.document_start <= absolute_start < absolute_end <= region.document_end
     )
     return (
-        absolute_start - document_start,
-        absolute_end - document_start,
+        absolute_start - region.content_start,
+        absolute_end - region.content_start,
         chunk_index,
-        document_start,
-        document_end,
+        region.document_start,
+        region.document_end,
+        region.content_start,
     )
 
 
@@ -233,10 +288,10 @@ def select_ast_span(
     to route to the char-FIM slice).
     """
 
-    start, end, chunk_index, document_start, _document_end = (
+    start, end, chunk_index, _document_start, _document_end, content_start = (
         _select_ast_span_in_document(packet, rng=rng)
     )
-    return start + document_start, end + document_start, chunk_index
+    return start + content_start, end + content_start, chunk_index
 
 
 def eligible_ast_chunk_indices(packet: CodePacket) -> tuple[int, ...]:
@@ -247,17 +302,17 @@ def eligible_ast_chunk_indices(packet: CodePacket) -> tuple[int, ...]:
         return ()
     starts, ends, _kinds = _chunk_arrays(packet)
     return tuple(
-        _eligible_chunks(starts, ends, length, logical_document_spans(packet))
+        _eligible_chunks(starts, ends, length, domain_preserving_document_spans(packet))
     )
 
 
 def _char_document_span(
     packet: CodePacket, *, rng: random.Random
-) -> tuple[int, int, int]:
+) -> DomainPreservingDocumentSpan:
     eligible = [
-        span
-        for span in logical_document_spans(packet)
-        if span[1] - span[0] >= 3
+        region
+        for region in domain_preserving_document_spans(packet)
+        if region.content_end - region.content_start >= 3
     ]
     if not eligible:
         raise ValueError(
@@ -294,14 +349,12 @@ def apply_ast_fim(
     all_tokens = _packet_token_list(packet)
     length = len(all_tokens)
     if length < 3:
-        raise ValueError(
-            f"ast_fim requires at least 3 tokens, got {length}"
-        )
+        raise ValueError(f"ast_fim requires at least 3 tokens, got {length}")
 
     use_ast = rand.random() < ast_fim_rate
     if use_ast:
         try:
-            start, end, chunk_index, document_start, document_end = (
+            start, end, chunk_index, document_start, document_end, _content_start = (
                 _select_ast_span_in_document(packet, rng=rand)
             )
             kind: AstFimKind = "ast_fim"
@@ -309,34 +362,43 @@ def apply_ast_fim(
             # No usable chunk for THIS window: fall to the char slice and RECORD
             # it (not a silent degraded path — the kind makes it observable).
             # A genuinely absent chunk field is a plain ValueError and propagates.
-            document_start, document_end, _document_id = _char_document_span(
-                packet, rng=rand
+            region = _char_document_span(packet, rng=rand)
+            document_start = region.document_start
+            document_end = region.document_end
+            start, end = sample_middle_span(
+                region.content_end - region.content_start,
+                rng=rand,
             )
-            start, end = sample_middle_span(document_end - document_start, rng=rand)
             chunk_index = None
             kind = "char_fim"
     else:
-        document_start, document_end, _document_id = _char_document_span(
-            packet, rng=rand
+        region = _char_document_span(packet, rng=rand)
+        document_start = region.document_start
+        document_end = region.document_end
+        start, end = sample_middle_span(
+            region.content_end - region.content_start,
+            rng=rand,
         )
-        start, end = sample_middle_span(document_end - document_start, rng=rand)
         chunk_index = None
         kind = "char_fim"
 
     tokens = all_tokens[document_start:document_end]
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
-    permuted = apply_fim_permutation(
+    permuted = apply_domain_preserving_fim_permutation(
         tokens,
+        source_start=document_start,
         span=(start, end),
         mode=mode,
         special_token_ids=special_token_ids,
+        where=f"ast_fim logical document [{document_start}, {document_end})",
     )
     return AstFimResult(
-        token_ids=permuted,
+        token_ids=permuted.token_ids,
         span=(start, end),
         mode=mode,
         kind=kind,
         chunk_index=chunk_index,
+        source_token_indices=permuted.source_token_indices,
         document_span=(document_start, document_end),
     )
 
@@ -358,8 +420,13 @@ def apply_ast_ifim(
     instruction = list(instruction_token_ids)
     if not instruction:
         raise ValueError("ast_ifim instruction_token_ids must not be empty")
-    if any(not isinstance(token_id, int) or isinstance(token_id, bool) for token_id in instruction):
-        raise ValueError("ast_ifim instruction_token_ids must contain integer token ids")
+    if any(
+        not isinstance(token_id, int) or isinstance(token_id, bool)
+        for token_id in instruction
+    ):
+        raise ValueError(
+            "ast_ifim instruction_token_ids must contain integer token ids"
+        )
     if rng is not None and seed is not None:
         raise ValueError("pass either seed or rng, not both")
     if not 0.0 <= ast_fim_rate <= 1.0:
@@ -376,40 +443,49 @@ def apply_ast_ifim(
     use_ast = rand.random() < ast_fim_rate
     if use_ast:
         try:
-            start, end, chunk_index, document_start, document_end = (
+            start, end, chunk_index, document_start, document_end, _content_start = (
                 _select_ast_span_in_document(packet, rng=rand)
             )
             kind: AstFimKind = "ast_ifim"
         except NoEligibleChunkError:
-            document_start, document_end, _document_id = _char_document_span(
-                packet, rng=rand
+            region = _char_document_span(packet, rng=rand)
+            document_start = region.document_start
+            document_end = region.document_end
+            start, end = sample_middle_span(
+                region.content_end - region.content_start,
+                rng=rand,
             )
-            start, end = sample_middle_span(document_end - document_start, rng=rand)
             chunk_index = None
             kind = "char_ifim"
     else:
-        document_start, document_end, _document_id = _char_document_span(
-            packet, rng=rand
+        region = _char_document_span(packet, rng=rand)
+        document_start = region.document_start
+        document_end = region.document_end
+        start, end = sample_middle_span(
+            region.content_end - region.content_start,
+            rng=rand,
         )
-        start, end = sample_middle_span(document_end - document_start, rng=rand)
         chunk_index = None
         kind = "char_ifim"
 
     tokens = all_tokens[document_start:document_end]
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
-    permuted = apply_ifim_permutation(
+    permuted = apply_domain_preserving_fim_permutation(
         tokens,
+        source_start=document_start,
         instruction_token_ids=instruction,
         span=(start, end),
         mode=mode,
         special_token_ids=special_token_ids,
+        where=f"ast_ifim logical document [{document_start}, {document_end})",
     )
     return AstFimResult(
-        token_ids=permuted,
+        token_ids=permuted.token_ids,
         span=(start, end),
         mode=mode,
         kind=kind,
         chunk_index=chunk_index,
+        source_token_indices=permuted.source_token_indices,
         document_span=(document_start, document_end),
     )
 
@@ -418,9 +494,11 @@ __all__ = [
     "DEFAULT_AST_FIM_RATE",
     "AstFimKind",
     "AstFimResult",
+    "DomainPreservingDocumentSpan",
     "NoEligibleChunkError",
     "apply_ast_fim",
     "apply_ast_ifim",
+    "domain_preserving_document_spans",
     "eligible_ast_chunk_indices",
     "logical_document_spans",
     "select_ast_span",
