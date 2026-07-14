@@ -605,6 +605,12 @@ def _insert_domain_delimiter_pair(
                 f"{column} length {len(values)} does not match token count {token_count_before}"
             )
         start_marker, end_marker = marker_values
+        interior = values[start_at:end_at]
+        if column == TOKEN_DOMAIN_IDS_COLUMN:
+            interior = [
+                domain_value if int(value) == int(DomainKind.UNKNOWN) else int(value)
+                for value in interior
+            ]
         if column in {
             TOKEN_SOURCE_DOC_IDS_COLUMN,
             TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
@@ -616,7 +622,7 @@ def _insert_domain_delimiter_pair(
         row[column] = (
             values[:start_at]
             + [int(start_marker)]
-            + values[start_at:end_at]
+            + interior
             + [int(end_marker)]
             + values[end_at:]
         )

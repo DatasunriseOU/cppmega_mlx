@@ -334,7 +334,7 @@ def test_process_project_emits_every_discovered_domain_once_with_source_identity
         enriched=True,
         project_id="fixtures/case5-domain-ingestion",
     )
-    docs_by_path = {Path(str(doc["filepath"])).relative_to(tmp_path).as_posix(): doc for doc in docs}
+    docs_by_path = {Path(str(doc["filepath"])).as_posix(): doc for doc in docs}
 
     assert set(docs_by_path) == set(files)
     assert len(docs) == len(files)
@@ -785,6 +785,22 @@ def test_delimiter_insertion_keeps_exclusive_chunk_ends_before_closing_marker() 
 
     sql_start, sql_end = delimiter_token_ids(DomainKind.SQL)
     assert row[schema.TOKEN_IDS_COLUMN] == [10, sql_start, 11, 12, sql_end, 13]
+    assert row[schema.TOKEN_DOMAIN_IDS_COLUMN] == [
+        0,
+        int(DomainKind.SQL),
+        int(DomainKind.SQL),
+        int(DomainKind.SQL),
+        int(DomainKind.SQL),
+        0,
+    ]
+    assert row[schema.TOKEN_ROLE_IDS_COLUMN] == [
+        0,
+        int(DomainRoleKind.DELIMITER),
+        0,
+        0,
+        int(DomainRoleKind.DELIMITER),
+        0,
+    ]
     assert row[schema.TOKEN_CHUNK_STARTS_COLUMN] == [2, 5]
     assert row[schema.TOKEN_CHUNK_ENDS_COLUMN] == [4, 6]
 
