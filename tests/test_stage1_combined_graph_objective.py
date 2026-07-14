@@ -47,6 +47,7 @@ def _production_batch_rows(
     relation: str = "domain",
     chunk_spans: tuple[tuple[int, int], ...] | None = None,
     document_rows: tuple[tuple[int, ...], ...] | None = None,
+    attention_rows: tuple[tuple[int, ...], ...] | None = None,
 ) -> LMTokenBatch:
     row_count = len(pairs_by_row)
     tokens = mx.broadcast_to(
@@ -91,6 +92,11 @@ def _production_batch_rows(
         document_rows = tuple((0, 0, 0, 1, 1, 1) for _ in pairs_by_row)
     return LMTokenBatch(
         tokens=tokens,
+        attention_mask=(
+            None
+            if attention_rows is None
+            else mx.array(attention_rows, dtype=mx.float32)
+        ),
         loss_mask=mx.ones(tokens.shape, dtype=mx.float32),
         document_ids=mx.array(document_rows, dtype=mx.int32),
         structure_ids=structure,
@@ -208,6 +214,36 @@ def test_stage1_graphless_row_is_excluded_from_pair_mask_and_loss() -> None:
 
     assert float(mx.sum(values.graph_pair_mask[1]).item()) == 0.0
     assert float(changed.total.item()) == float(baseline.total.item())
+
+
+def test_stage1_padding_pairs_are_excluded_from_graph_loss() -> None:
+    values = _stage1_objective_batch(
+        _production_batch_rows(
+            (((2, 1),),),
+            document_rows=((1, 1, 1, 0, 0, 0),),
+            attention_rows=((1, 1, 1, 0, 0, 0),),
+        )
+    )
+    baseline_scores = mx.zeros_like(values.graph_targets)
+    padding_scores = baseline_scores.at[:, 3:, :].add(11.0)
+    padding_scores = padding_scores.at[:, :, 3:].add(11.0)
+    baseline = graph_auxiliary_loss_breakdown_from_targets(
+        (baseline_scores,),
+        values.graph_targets,
+        values.graph_pair_mask,
+        Stage1ProductionObjective().graph_config,
+    )
+    changed = graph_auxiliary_loss_breakdown_from_targets(
+        (padding_scores,),
+        values.graph_targets,
+        values.graph_pair_mask,
+        Stage1ProductionObjective().graph_config,
+    )
+    mx.eval(values.graph_pair_mask, baseline.total, changed.total)
+
+    assert float(mx.sum(values.graph_pair_mask[:, 3:, :]).item()) == 0.0
+    assert float(mx.sum(values.graph_pair_mask[:, :, 3:]).item()) == 0.0
+    assert float(changed.total.item()) == pytest.approx(float(baseline.total.item()))
 
 
 def test_stage1_graphless_batch_is_lm_only_and_updates_optimizer() -> None:

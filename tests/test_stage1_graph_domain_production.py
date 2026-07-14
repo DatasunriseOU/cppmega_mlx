@@ -60,17 +60,19 @@ def _production_batch(
     include_document_ids: bool = True,
     with_edge: bool = True,
     edge_kind: DomainEdgeKind | int = DomainEdgeKind.DIAG_PRIMARY_LOCATION,
+    pairs: list[tuple[int, int]] | None = None,
+    attention_mask: mx.array | None = None,
 ) -> LMTokenBatch:
     tokens = mx.array([[2, 3, 5, 7, 11, 13, 17, 19]], dtype=mx.int32)
     graph = None
     if include_graph:
-        pairs = [(6, 5)] if with_edge else []
+        graph_pairs = ([(6, 5)] if with_edge else []) if pairs is None else pairs
         graph = GraphBatch(
             graphs=(
                 GraphPacket(
                     edges={
                         "domain": EdgeIndex.from_pairs(
-                            pairs, relation="domain", num_nodes=8
+                            graph_pairs, relation="domain", num_nodes=8
                         )
                     },
                     num_nodes=8,
@@ -81,7 +83,7 @@ def _production_batch(
             edge_kinds=(
                 {
                     "domain": mx.array(
-                        [int(edge_kind)] if with_edge else [],
+                        [int(edge_kind)] * len(graph_pairs),
                         dtype=mx.int32,
                     )
                 }
@@ -100,6 +102,7 @@ def _production_batch(
         }
     return LMTokenBatch(
         tokens=tokens,
+        attention_mask=attention_mask,
         document_ids=(
             mx.array([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=mx.int32)
             if include_document_ids
@@ -150,6 +153,7 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
     assert receipt["recipe"] == STAGE1_GRAPH_DOMAIN_RECIPE
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
+    assert receipt["graph_positive_pairs"] == 1
     assert receipt["edge_kind_edges"] == 1
     assert receipt["edge_kind_ids"] == [int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)]
     assert receipt["edge_kind_prior_nonzero"] == 1
@@ -183,11 +187,51 @@ def test_stage1_production_receipt_and_counts_accept_graphless_batch() -> None:
 
     assert receipt["graph_edges"] == 0
     assert receipt["graph_prior_nonzero"] == 0
+    assert receipt["graph_positive_pairs"] == 0
     assert receipt["edge_kind_edges"] == 0
     assert receipt["edge_kind_ids"] == []
     assert counts["graph_edges"] == 0
     assert counts["graph_prior_nonzero"] == 0
     assert counts["edge_kind_edges"] == 0
+    assert counts["graph_positive_pairs"] == 0
+
+
+def test_stage1_receipt_reports_zero_for_raw_noncausal_only_graph() -> None:
+    cfg = stage1_production_config(
+        vocab_size=64,
+        hidden_size=32,
+        depth=1,
+        ffn_hidden_size=64,
+        max_seq_length=8,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        ngram_hash_enabled=False,
+    )
+    receipt = stage1_production_batch_receipt(
+        _production_batch(
+            pairs=[(5, 6)],
+            attention_mask=mx.ones((1, 8), dtype=mx.float32),
+        ),
+        config=cfg,
+    )
+
+    assert receipt["graph_edges"] == 1
+    assert receipt["graph_prior_nonzero"] == 1
+    assert receipt["graph_positive_pairs"] == 0
+
+
+def test_stage1_route_counts_reject_raw_noncausal_edges_as_graph_signal() -> None:
+    counts = _batch_route_counts(
+        _production_batch(
+            pairs=[(5, 6)],
+            attention_mask=mx.ones((1, 8), dtype=mx.float32),
+        )
+    )
+
+    assert counts["graph_edges"] == 1
+    assert counts["graph_prior_nonzero"] == 1
+    assert counts["graph_positive_pairs"] == 0
 
 
 def test_stage1_production_accepts_valid_categories_with_zero_kind_delta() -> None:

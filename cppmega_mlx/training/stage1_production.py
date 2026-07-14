@@ -362,6 +362,8 @@ def stage1_production_batch_receipt(
         raise ValueError("production Stage-1 edge-kind prior was not materialized")
     graph_prior_nonzero_array = mx.sum(graph_bias != 0)
     edge_kind_prior_nonzero_array = mx.sum(edge_kind_bias != 0)
+    objective_values = _stage1_objective_batch(lm_batch)
+    graph_positive_pairs_array = mx.sum(objective_values.graph_targets)
 
     domain_arrays: dict[str, mx.array] = {}
     for name in PRODUCTION_DOMAIN_FIELDS:
@@ -378,10 +380,12 @@ def stage1_production_batch_receipt(
     mx.eval(
         graph_prior_nonzero_array,
         edge_kind_prior_nonzero_array,
+        graph_positive_pairs_array,
         domain_tokens_array,
     )
     graph_prior_nonzero = int(graph_prior_nonzero_array.item())
     edge_kind_prior_nonzero = int(edge_kind_prior_nonzero_array.item())
+    graph_positive_pairs = int(graph_positive_pairs_array.item())
     domain_tokens_nonzero = int(domain_tokens_array.item())
     if domain_tokens_nonzero <= 0:
         raise ValueError("production Stage-1 requires nonzero domain tokens")
@@ -400,6 +404,7 @@ def stage1_production_batch_receipt(
             }
         ),
         "graph_prior_nonzero": graph_prior_nonzero,
+        "graph_positive_pairs": graph_positive_pairs,
         "edge_kind_prior_nonzero": edge_kind_prior_nonzero,
         "graph_attention_bias_beta": config.graph_attention_bias_beta,
         "domain_sidecars": sorted(domain_arrays),
@@ -514,6 +519,7 @@ def run_stage1_graph_domain_production(
     )
     batch_iter = dataset.iter_batches(loop=True)
     observed_edges = 0
+    observed_graph_positive_pairs = 0
     observed_edge_kind_edges = 0
     observed_graph_prior_nonzero = 0
     observed_edge_kind_prior_nonzero = 0
@@ -525,6 +531,7 @@ def run_stage1_graph_domain_production(
         current = next(batch_iter)
         counts = _batch_route_counts(current)
         observed_edges += counts["graph_edges"]
+        observed_graph_positive_pairs += counts["graph_positive_pairs"]
         observed_edge_kind_edges += counts["edge_kind_edges"]
         observed_graph_prior_nonzero += counts["graph_prior_nonzero"]
         observed_edge_kind_prior_nonzero += counts["edge_kind_prior_nonzero"]
@@ -534,6 +541,7 @@ def run_stage1_graph_domain_production(
         last_domain_residual_l1 = _domain_residual_l1(model, current)
     if (
         observed_edges <= 0
+        or observed_graph_positive_pairs <= 0
         or observed_edge_kind_edges <= 0
         or observed_graph_prior_nonzero <= 0
         or observed_domain_tokens <= 0
@@ -549,6 +557,7 @@ def run_stage1_graph_domain_production(
         "steps": steps,
         "compiled": compile,
         "observed_graph_edges": observed_edges,
+        "observed_graph_positive_pairs": observed_graph_positive_pairs,
         "observed_edge_kind_edges": observed_edge_kind_edges,
         "observed_graph_prior_nonzero": observed_graph_prior_nonzero,
         "observed_edge_kind_prior_nonzero": observed_edge_kind_prior_nonzero,
@@ -664,11 +673,14 @@ def _batch_route_counts(batch: LMTokenBatch) -> dict[str, int]:
     count = mx.sum(domain_ids != 0)
     relation_count = mx.sum(relation_bias != 0)
     kind_count = mx.sum(kind_bias != 0)
-    mx.eval(count, relation_count, kind_count)
+    objective_values = _stage1_objective_batch(lm_batch)
+    graph_positive_pairs = mx.sum(objective_values.graph_targets)
+    mx.eval(count, relation_count, kind_count, graph_positive_pairs)
     return {
         "graph_edges": graph_edges,
         "edge_kind_edges": edge_kind_edges,
         "graph_prior_nonzero": int(relation_count.item()),
+        "graph_positive_pairs": int(graph_positive_pairs.item()),
         "edge_kind_prior_nonzero": int(kind_count.item()),
         "domain_tokens_nonzero": int(count.item()),
         "document_boundaries": _document_boundary_count(lm_batch),

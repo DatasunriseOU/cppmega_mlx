@@ -571,6 +571,9 @@ class MegatronIndexedDataset:
         }
         if "hunk_ids" in side_channels:
             side_channels["hunk_ids"].fill(-1)
+        derived_attention_mask = np.zeros(
+            (sample_idx.shape[0], self.seq_len), dtype=np.float32
+        )
         document_ids = (
             np.zeros(
                 (sample_idx.shape[0], self.seq_len),
@@ -590,6 +593,7 @@ class MegatronIndexedDataset:
                 offset=byte_offset,
             )
             tokens[row, :window_length] = _to_int32_tokens(token_view)
+            derived_attention_mask[row, :window_length] = 1.0
             for key, storage in self._side_channels.items():
                 side_view = np.frombuffer(
                     storage.mmap,
@@ -608,6 +612,13 @@ class MegatronIndexedDataset:
                     offset=int(self._document_ids.windows[resolved_window]),
                 )
                 document_ids[row, :window_length] = _to_document_id_values(doc_view)
+
+        # Indexed windows know their exact real-token length even when the
+        # producer did not materialize an attention sidecar. Preserve that
+        # fact for graph pair masking; padding document id 0 is not a real
+        # document and must not become a pool of graph negatives.
+        if _ATTENTION_SIDE_CHANNEL_KEY not in side_channels:
+            side_channels[_ATTENTION_SIDE_CHANNEL_KEY] = derived_attention_mask
 
         batch: dict[str, np.ndarray] = {"tokens": tokens}
         for key in _SIDE_CHANNEL_KEYS:
@@ -665,7 +676,16 @@ class MegatronIndexedMultiShardDataset:
             for prefix in prefixes
         )
         schema = _validate_multishard_schema(self._shards)
-        self._side_channel_keys = schema.side_channel_keys
+        # Standalone shards may omit an on-disk attention sidecar; each shard
+        # derives one from its fixed window lengths at read time. Keep the
+        # multi-shard merge schema aware of that runtime-produced key.
+        runtime_side_channel_keys = {
+            *schema.side_channel_keys,
+            _ATTENTION_SIDE_CHANNEL_KEY,
+        }
+        self._side_channel_keys = tuple(
+            key for key in _SIDE_CHANNEL_KEYS if key in runtime_side_channel_keys
+        )
         self._document_ids_present = schema.document_ids_present
         self._batch_keys = (
             "tokens",

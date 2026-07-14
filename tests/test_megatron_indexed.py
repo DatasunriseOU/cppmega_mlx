@@ -1518,6 +1518,10 @@ def test_compact_fixed_rows_restore_padding_and_document_graphs(tmp_path) -> Non
         np.array([[1, 1, 1, 0], [2, 2, 0, 0]], dtype=np.int32),
     )
     np.testing.assert_array_equal(
+        np.array(batch.attention_mask),
+        np.array([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
         np.array(batch.side_channel_map()["temporal_diff"]["hunk_ids"]),
         np.array([[0, 0, -1, -1], [2, -1, -1, -1]], dtype=np.int32),
     )
