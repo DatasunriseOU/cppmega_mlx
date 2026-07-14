@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
 import inspect
 import json
 from typing import Any, Sequence, cast
@@ -272,6 +271,46 @@ def _chars_to_tokens_structure_ids(
         else:
             out.append(0)
     return out
+
+
+def _inherit_zero_width_source_tokens(
+    values: list[int],
+    token_spans: list[tuple[int, int]],
+    *,
+    field: str,
+) -> list[int]:
+    """Assign synthetic zero-width tokens to the nearest exact source token.
+
+    BOS/EOS-like tokenizer insertions have no character span. They are part of
+    the surrounding document and may inherit its nearest source identity. A
+    zero on a token that covers real source characters is data loss and remains
+    a hard error.
+    """
+
+    if len(values) != len(token_spans):
+        raise ValueError(
+            f"{field} length {len(values)} != token span count {len(token_spans)}"
+        )
+    positive_indices = [index for index, value in enumerate(values) if int(value) > 0]
+    if not positive_indices:
+        return [int(value) for value in values]
+
+    result = [int(value) for value in values]
+    for index, value in enumerate(result):
+        if value > 0:
+            continue
+        start, end = (int(part) for part in token_spans[index])
+        if end > start:
+            raise ValueError(
+                f"{field} is missing exact source identity for nonempty token "
+                f"span [{start}, {end}) at token {index}"
+            )
+        nearest = min(
+            positive_indices,
+            key=lambda candidate: (abs(candidate - index), candidate),
+        )
+        result[index] = result[nearest]
+    return result
 
 
 def _chunk_boundaries_to_token_offsets(
@@ -848,12 +887,18 @@ def materialize_tokenized_enriched_batch(
             resolved_identity = source_identity(doc)
             registry_entries = [resolved_identity.as_dict()]
         fallback_identity_id = int(registry_entries[0]["source_identity_id"])
+        raw_token_source_doc_ids = _chars_to_tokens_structure_ids(
+            doc.get("domain_source_doc_ids", doc.get("source_doc_ids", [])),
+            "",
+            token_spans,
+        )
+        raw_token_source_doc_ids = _inherit_zero_width_source_tokens(
+            raw_token_source_doc_ids,
+            token_spans,
+            field=TOKEN_SOURCE_DOC_IDS_COLUMN,
+        )
         token_source_doc_ids = normalize_row_local_doc_ids(
-            _chars_to_tokens_structure_ids(
-                doc.get("domain_source_doc_ids", doc.get("source_doc_ids", [])),
-                "",
-                token_spans,
-            ),
+            raw_token_source_doc_ids,
             length=len(token_ids),
             fallback_doc_id=1,
         )
@@ -861,6 +906,11 @@ def materialize_tokenized_enriched_batch(
             doc.get("domain_source_identity_ids", []),
             "",
             token_spans,
+        )
+        raw_token_source_identity_ids = _inherit_zero_width_source_tokens(
+            raw_token_source_identity_ids,
+            token_spans,
+            field=TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
         )
         if len(registry_entries) > 1 and (
             not raw_token_source_identity_ids

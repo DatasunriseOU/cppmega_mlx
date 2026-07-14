@@ -445,6 +445,7 @@ def test_case3_mixed_indexer_batch_reaches_converter_parquet(tmp_path: Path) -> 
         ),
         max_tokens=16384,
         overflow_policy="drop",
+        materialize_tokenized_enriched=True,
     )
     table = pq.read_table(output_path)
 

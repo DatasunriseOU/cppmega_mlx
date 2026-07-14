@@ -28,6 +28,7 @@ from cppmega_mlx.data.nanochat_pipeline.build_context import (
     find_compile_commands_file,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
+    _inherit_zero_width_source_tokens,
     materialize_tokenized_enriched_batch,
 )
 from cppmega_v4.data.doc_id_assignment import (
@@ -40,7 +41,6 @@ from scripts.nanochat_data.pack_enriched_rows import (
     INPUT_IDS_COLUMN,
     LOSS_MASK_COLUMN,
     NUM_DOCS_COLUMN,
-    TOKEN_SOURCE_DOC_IDS_COLUMN,
     read_tokenized_documents,
     pack_documents,
 )
@@ -106,6 +106,23 @@ def test_local_platform_vocab_matches_nanochat_source_of_truth() -> None:
     assert platform_vocab.PLATFORM_VOCAB == nanochat_vocab.PLATFORM_VOCAB
     assert platform_vocab.PLATFORM_VOCAB_SIZE == nanochat_vocab.PLATFORM_VOCAB_SIZE
     assert platform_vocab.MAX_PLATFORM_IDS == nanochat_vocab.MAX_PLATFORM_IDS
+
+
+def test_synthetic_special_token_inherits_nearest_exact_source() -> None:
+    assert _inherit_zero_width_source_tokens(
+        [0, 11, 22, 0],
+        [(0, 0), (0, 1), (1, 2), (2, 2)],
+        field="token_source_identity_ids",
+    ) == [11, 11, 22, 22]
+
+
+def test_nonempty_token_without_source_identity_fails_closed() -> None:
+    with pytest.raises(ValueError, match="nonempty token span"):
+        _inherit_zero_width_source_tokens(
+            [11, 0, 22],
+            [(0, 1), (1, 2), (2, 3)],
+            field="token_source_identity_ids",
+        )
 
 
 def test_local_tokenized_schema_keeps_full_nanochat_column_contract() -> None:
