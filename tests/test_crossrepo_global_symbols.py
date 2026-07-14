@@ -16,6 +16,7 @@ RULE #1: no mocks of the real store — we build a real (tiny) SQLite store.
 from __future__ import annotations
 
 import sys
+import json
 import os
 import shutil
 import subprocess
@@ -280,6 +281,41 @@ def test_extraction_cache_reuses_complete_lib_without_restreaming(tmp_path):
     assert dirs2 == dirs
     assert counts2 == counts
     assert cached_file.read_text().startswith("namespace boost")
+
+
+def test_extraction_cache_hardlinks_complete_code_cache(tmp_path):
+    b = _load_builder()
+    tarball = tmp_path / "corpus.tar.zst"
+    tarball.write_bytes(b"stable corpus fingerprint")
+    source_root = tmp_path / "source_cache"
+    boost_root = source_root / "boost"
+    wanted = boost_root / "include" / "boost" / "cached_symbol.hpp"
+    wanted.parent.mkdir(parents=True)
+    wanted.write_text("namespace boost { inline int cached_symbol() { return 7; } }\n")
+    (boost_root / "README.txt").write_text("not an index input\n")
+    (boost_root / ".cppmega_source_cache_complete.json").write_text(json.dumps({
+        "repo": "boost",
+        "source": str(tarball),
+        "completed_at": "2026-07-14T00:00:00",
+    }))
+
+    cache_root = tmp_path / "extract_cache"
+    counts = b.populate_extraction_cache_from_source_cache(
+        tarball, {"boost": b.BASE_LIBS["boost"]}, source_root, cache_root,
+        max_files=10,
+    )
+    cached = cache_root / "boost/boost/include/boost/cached_symbol.hpp"
+    assert counts == {"boost": 1}
+    assert cached.read_text() == wanted.read_text()
+    assert cached.stat().st_ino == wanted.stat().st_ino
+    manifest = json.loads(
+        (cache_root / "boost/.gsi_extract_complete.json").read_text())
+    assert manifest["publication"] == "hardlink"
+
+    dirs, reused = b.prepare_extraction_cache(
+        tarball, {"boost": b.BASE_LIBS["boost"]}, cache_root, max_files=10)
+    assert reused == counts
+    assert dirs["boost"] == cache_root / "boost"
 
 
 def test_is_public_symbol_filters():

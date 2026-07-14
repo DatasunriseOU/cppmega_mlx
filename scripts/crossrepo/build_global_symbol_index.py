@@ -1464,6 +1464,128 @@ def prepare_extraction_cache(
     return dirs, counts
 
 
+def populate_extraction_cache_from_source_cache(
+    tarball: Path,
+    lib_specs: dict[str, dict],
+    source_cache_root: Path,
+    cache_root: Path,
+    *,
+    max_files: int,
+    member_cap: int | None = None,
+) -> dict[str, int]:
+    """Hardlink missing per-lib caches from a complete conveyor source cache."""
+    if member_cap is not None:
+        raise ValueError(
+            "member_cap is archive-order-specific and cannot be used with "
+            "source-cache extraction"
+        )
+    if not source_cache_root.is_dir():
+        raise FileNotFoundError(f"source cache root not found: {source_cache_root}")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    populated: dict[str, int] = {}
+
+    for lib, spec in lib_specs.items():
+        hit = _extract_cache_hit(
+            tarball, spec, cache_root, lib,
+            max_files=max_files, member_cap=None,
+        )
+        if hit is not None:
+            populated[lib] = hit
+            continue
+
+        stage = cache_root / f".{lib}.building-{os.getpid()}"
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True)
+        count = 0
+        try:
+            for subtree in spec["subtrees"]:
+                source_dir = source_cache_root / subtree
+                sentinel = source_dir / ".cppmega_source_cache_complete.json"
+                if not source_dir.is_dir() or not sentinel.is_file():
+                    raise RuntimeError(
+                        f"[{lib}] incomplete source-cache subtree: {source_dir}"
+                    )
+                completion = json.loads(sentinel.read_text(encoding="utf-8"))
+                if completion.get("repo") != subtree:
+                    raise RuntimeError(
+                        f"[{lib}] source-cache sentinel repo mismatch at {sentinel}"
+                    )
+                cached_source = completion.get("source")
+                if not isinstance(cached_source, str) or not cached_source:
+                    raise RuntimeError(
+                        f"[{lib}] source-cache sentinel has no source at {sentinel}"
+                    )
+                try:
+                    same_tarball = Path(cached_source).samefile(tarball)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"[{lib}] source-cache tarball is unavailable: "
+                        f"{cached_source}"
+                    ) from exc
+                if not same_tarball:
+                    raise RuntimeError(
+                        f"[{lib}] source cache came from {cached_source}, not "
+                        f"{tarball}"
+                    )
+
+                for current_root, dirnames, filenames in os.walk(source_dir):
+                    dirnames.sort()
+                    filenames.sort()
+                    for filename in filenames:
+                        if count >= max_files:
+                            break
+                        source = Path(current_root) / filename
+                        if source == sentinel or not source.is_file():
+                            continue
+                        relative = source.relative_to(source_dir)
+                        member_name = f"cpp_all/{subtree}/{relative.as_posix()}"
+                        if not _member_is_wanted(
+                                member_name, ip.INDEX_EXTENSIONS,
+                                path_markers=spec.get("include_path_markers"),
+                                extensionless=bool(spec.get("index_extensionless_headers"))):
+                            continue
+                        if source.stat().st_size > MAX_BYTES_PER_FILE:
+                            continue
+                        target = stage / subtree / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        os.link(source, target)
+                        count += 1
+                    if count >= max_files:
+                        break
+                if count >= max_files:
+                    break
+
+            if count <= 0:
+                raise RuntimeError(
+                    f"[{lib}] source cache produced zero indexable files"
+                )
+            manifest = _extract_cache_signature(
+                tarball, spec, max_files=max_files, member_cap=None
+            )
+            manifest.update({
+                "lib": lib,
+                "count": count,
+                "finished_utc": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "materialized_from": str(source_cache_root.resolve()),
+                "publication": "hardlink",
+            })
+            (stage / ".gsi_extract_complete.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            final = cache_root / lib
+            shutil.rmtree(final, ignore_errors=True)
+            os.replace(stage, final)
+            populated[lib] = count
+            print(f"  [{lib}] source-cache extraction: {count} hardlinked files",
+                  file=sys.stderr, flush=True)
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+    return populated
+
+
 # --------------------------------------------------------------------------- #
 # Per-lib C++ standard-library compile environment (the std cross-link fix).
 #
@@ -2194,6 +2316,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Persistent source extraction cache. When set, the "
                         "tarball is streamed only for libs missing from the "
                         "cache; parser/indexer code still re-runs every build.")
+    p.add_argument("--source-cache-dir", default=None,
+                   help="Complete streaming-conveyor code source cache. Requires "
+                        "--extract-cache-dir and hardlinks missing parser cache "
+                        "inputs instead of re-reading the tarball.")
     p.add_argument("--libclang-path", default=None)
     p.add_argument("--report-only", action="store_true",
                    help="Print store counts/cost and exit (no indexing).")
@@ -2220,6 +2346,10 @@ def main(argv: list[str]) -> int:
     ip._configure_libclang(args.libclang_path)
     if args.extract_cache_dir and args.work_dir:
         raise SystemExit("--extract-cache-dir and --work-dir are mutually exclusive")
+    if args.source_cache_dir and not args.extract_cache_dir:
+        raise SystemExit("--source-cache-dir requires --extract-cache-dir")
+    if args.source_cache_dir and args.member_cap is not None:
+        raise SystemExit("--source-cache-dir cannot be combined with --member-cap")
 
     tarball = Path(args.tarball)
     store = GlobalSymbolStore(args.output, read_only=args.report_only)
@@ -2269,6 +2399,11 @@ def main(argv: list[str]) -> int:
         print(f"\n=== extraction cache for {todo} -> {extract_root} ===",
               file=sys.stderr, flush=True)
         t_ext = time.time()
+        if args.source_cache_dir:
+            populate_extraction_cache_from_source_cache(
+                tarball, todo_specs, Path(args.source_cache_dir), extract_root,
+                max_files=args.max_files_per_lib,
+            )
         dirs, counts = prepare_extraction_cache(
             tarball, todo_specs, extract_root,
             max_files=args.max_files_per_lib, member_cap=args.member_cap,
