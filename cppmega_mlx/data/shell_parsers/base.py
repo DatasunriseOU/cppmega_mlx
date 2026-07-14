@@ -136,6 +136,10 @@ def parse_shell(
     idx = 0
     while idx < len(doc.tokens):
         token = doc.tokens[idx]
+        if idx > 0 and token.line != doc.tokens[idx - 1].line:
+            previous_command = None
+            command_expected = True
+            pending_redir = None
         value = token.text
         if shell_kind == "tcsh" and value in _TCSH_KEYWORDS:
             doc.set_role(idx, DomainRoleKind.KEYWORD, entity=next_entity)

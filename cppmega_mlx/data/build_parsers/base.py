@@ -17,6 +17,12 @@ from cppmega_mlx.data.domain_schema import (
     domain_edge_family,
     validate_domain_edge_kind,
 )
+from cppmega_mlx.data.source_identity import (
+    MAX_ROW_LOCAL_DOC_ID,
+    MAX_SOURCE_ID,
+    SourceIdentity,
+    validate_source_identity_registry,
+)
 
 
 _TOKEN_RE = re.compile(
@@ -45,7 +51,9 @@ class ParsedDomainDocument:
     entity_ids: list[int]
     scope_ids: list[int]
     source_doc_ids: list[int]
+    source_identity_ids: list[int]
     confidence_ids: list[int]
+    source_identity_registry: list[dict[str, int | str]] = field(default_factory=list)
     edges: list[tuple[int, int, int]] = field(default_factory=list)
     embedded_blocks: list[Any] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -58,6 +66,7 @@ class ParsedDomainDocument:
         text: str,
         confidence: ParseConfidence = ParseConfidence.HEURISTIC,
         source_doc_id: int = 0,
+        source_identity: SourceIdentity | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "ParsedDomainDocument":
         tokens = lex_text(text)
@@ -71,7 +80,13 @@ class ParsedDomainDocument:
             entity_ids=[0] * n,
             scope_ids=[0] * n,
             source_doc_ids=[int(source_doc_id)] * n,
+            source_identity_ids=[
+                0 if source_identity is None else int(source_identity.source_identity_id)
+            ] * n,
             confidence_ids=[int(confidence)] * n,
+            source_identity_registry=(
+                [] if source_identity is None else [source_identity.as_dict()]
+            ),
             metadata=dict(metadata or {}),
         )
 
@@ -84,9 +99,16 @@ class ParsedDomainDocument:
         return self
 
     def set_source_doc_id(self, source_doc_id: int) -> None:
-        if int(source_doc_id) < 0:
-            raise ValueError("source_doc_id must be non-negative")
+        if not 0 <= int(source_doc_id) <= MAX_ROW_LOCAL_DOC_ID:
+            raise ValueError("source_doc_id must be uint32")
         self.source_doc_ids = [int(source_doc_id)] * len(self.tokens)
+
+    def set_source_identity(self, identity: SourceIdentity) -> None:
+        identity_id = int(identity.source_identity_id)
+        if not 0 < identity_id <= MAX_SOURCE_ID:
+            raise ValueError("source_identity_id must be positive uint64")
+        self.source_identity_ids = [identity_id] * len(self.tokens)
+        self.source_identity_registry = [identity.as_dict()]
 
     def set_role(
         self,
@@ -129,6 +151,7 @@ class ParsedDomainDocument:
             "entity_ids": self.entity_ids,
             "scope_ids": self.scope_ids,
             "source_doc_ids": self.source_doc_ids,
+            "source_identity_ids": self.source_identity_ids,
             "confidence_ids": self.confidence_ids,
         }
         for name, values in vectors.items():
@@ -143,9 +166,19 @@ class ParsedDomainDocument:
             DomainRoleKind(int(value))
         for value in self.confidence_ids:
             ParseConfidence(int(value))
-        for name in ("entity_ids", "scope_ids", "source_doc_ids"):
+        for name in ("entity_ids", "scope_ids", "source_doc_ids", "source_identity_ids"):
             if any(int(value) < 0 for value in vectors[name]):
                 raise ValueError(f"ParsedDomainDocument.{name} must be non-negative")
+        if any(int(value) > MAX_ROW_LOCAL_DOC_ID for value in self.source_doc_ids):
+            raise ValueError("ParsedDomainDocument.source_doc_ids must be uint32")
+        if any(int(value) > MAX_SOURCE_ID for value in self.source_identity_ids):
+            raise ValueError("ParsedDomainDocument.source_identity_ids must be uint64")
+        referenced = [value for value in self.source_identity_ids if int(value) != 0]
+        if referenced or self.source_identity_registry:
+            validate_source_identity_registry(
+                self.source_identity_registry,
+                referenced_ids=referenced,
+            )
         for src, dst, kind in self.edges:
             if not (0 <= int(src) < expected and 0 <= int(dst) < expected):
                 raise ValueError(f"edge endpoint out of range: {src}->{dst}")
@@ -162,6 +195,9 @@ class ParsedDomainDocument:
             else int(ParseConfidence.ABSENT)
         )
         default_source = self.source_doc_ids[0] if self.source_doc_ids else 0
+        default_source_identity = (
+            self.source_identity_ids[0] if self.source_identity_ids else 0
+        )
         result: dict[str, Any] = {
             "text": self.text,
             "domain_kind": int(self.domain),
@@ -170,6 +206,10 @@ class ParsedDomainDocument:
             "domain_entity_ids": [0] * text_len,
             "domain_scope_ids": [0] * text_len,
             "domain_source_doc_ids": [int(default_source)] * text_len,
+            "domain_source_identity_ids": [int(default_source_identity)] * text_len,
+            "source_identity_registry": [
+                dict(entry) for entry in self.source_identity_registry
+            ],
             "domain_confidence_ids": [int(default_confidence)] * text_len,
             "domain_edges": [],
             "build_edges": [],
@@ -192,6 +232,7 @@ class ParsedDomainDocument:
             entity_id: int,
             scope_id: int,
             source_doc_id: int,
+            source_identity_id: int,
             confidence_id: int,
             offset: int = 0,
         ) -> None:
@@ -203,6 +244,7 @@ class ParsedDomainDocument:
                 result["domain_entity_ids"][char_idx] = int(entity_id)
                 result["domain_scope_ids"][char_idx] = int(scope_id)
                 result["domain_source_doc_ids"][char_idx] = int(source_doc_id)
+                result["domain_source_identity_ids"][char_idx] = int(source_identity_id)
                 result["domain_confidence_ids"][char_idx] = int(confidence_id)
 
         for idx, token in enumerate(self.tokens):
@@ -213,6 +255,7 @@ class ParsedDomainDocument:
                 entity_id=self.entity_ids[idx],
                 scope_id=self.scope_ids[idx],
                 source_doc_id=self.source_doc_ids[idx],
+                source_identity_id=self.source_identity_ids[idx],
                 confidence_id=self.confidence_ids[idx],
             )
 
@@ -252,9 +295,26 @@ class ParsedDomainDocument:
                 else int(ParseConfidence.ABSENT)
             )
             block_source = parsed.source_doc_ids[0] if parsed.source_doc_ids else default_source
+            block_source_identity = (
+                parsed.source_identity_ids[0]
+                if parsed.source_identity_ids
+                else default_source_identity
+            )
+            registry_by_id = {
+                int(entry["source_identity_id"]): dict(entry)
+                for entry in result["source_identity_registry"]
+            }
+            for entry in parsed.source_identity_registry:
+                identity_id = int(entry["source_identity_id"])
+                previous = registry_by_id.get(identity_id)
+                if previous is not None and previous != dict(entry):
+                    raise ValueError(f"source identity uint64 collision for id {identity_id}")
+                registry_by_id[identity_id] = dict(entry)
+            result["source_identity_registry"] = list(registry_by_id.values())
             for char_idx in range(block_start, block_end):
                 result["domain_ids"][char_idx] = int(parsed.domain)
                 result["domain_source_doc_ids"][char_idx] = int(block_source)
+                result["domain_source_identity_ids"][char_idx] = int(block_source_identity)
                 result["domain_confidence_ids"][char_idx] = int(block_confidence)
             for idx, token in enumerate(parsed.tokens):
                 apply_token(
@@ -264,6 +324,7 @@ class ParsedDomainDocument:
                     entity_id=parsed.entity_ids[idx],
                     scope_id=parsed.scope_ids[idx],
                     source_doc_id=parsed.source_doc_ids[idx],
+                    source_identity_id=parsed.source_identity_ids[idx],
                     confidence_id=parsed.confidence_ids[idx],
                     offset=int(block.start),
                 )

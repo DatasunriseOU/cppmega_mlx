@@ -75,6 +75,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SCOPE_IDS_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
@@ -118,6 +119,7 @@ _DOMAIN_TOKEN_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_ENTITY_IDS_COLUMN: "entity_ids",
     TOKEN_SCOPE_IDS_COLUMN: "scope_ids",
     TOKEN_SOURCE_DOC_IDS_COLUMN: "source_doc_ids",
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN: "source_identity_ids",
     TOKEN_CONFIDENCE_IDS_COLUMN: "confidence_ids",
 }
 
@@ -177,9 +179,9 @@ def _int_vector(value: Any, *, where: str) -> mx.array:
     return mx.array(arr.astype(np.int32))
 
 
-def _opaque_identity_vector(value: Any, *, where: str) -> mx.array:
+def _uint64_vector(value: Any, *, where: str) -> mx.array:
     if value is None:
-        raise ValueError(f"{where}: cannot build opaque identity vector from None")
+        raise ValueError(f"{where}: cannot build uint64 vector from None")
     arr = np.asarray(value, dtype=object)
     if arr.ndim != 1:
         if arr.size == 0:
@@ -191,7 +193,7 @@ def _opaque_identity_vector(value: Any, *, where: str) -> mx.array:
             )
     values = [int(item) for item in arr.tolist()]
     if any(item < 0 or item > np.iinfo(np.uint64).max for item in values):
-        raise ValueError(f"{where}: opaque identities must fit unsigned 64-bit")
+        raise ValueError(f"{where}: IDs must fit unsigned 64-bit")
     return mx.array(np.asarray(values, dtype=np.uint64))
 
 
@@ -268,9 +270,7 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        vector_builder = (
-            _int_vector if column == TOKEN_DEF_USE_COLUMN else _opaque_identity_vector
-        )
+        vector_builder = _int_vector if column == TOKEN_DEF_USE_COLUMN else _uint64_vector
         semantic_kwargs[field_name] = vector_builder(
             columns[column][row_index], where=f"{column}[row={row_index}]"
         )
@@ -297,9 +297,12 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        edge_kwargs[field_name] = _build_edge_index(
+        edge_index = _build_edge_index(
             columns[column][row_index], relation=relation, num_nodes=num_chunks
         )
+        if edge_index is None:
+            raise AssertionError(f"{column}: present graph column produced no edge index")
+        edge_kwargs[field_name] = edge_index
         present.append(column)
 
     domain_token_kwargs: dict[str, mx.array] = {}
@@ -307,7 +310,12 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        domain_token_kwargs[field_name] = _int_vector(
+        vector_builder = (
+            _uint64_vector
+            if column == TOKEN_SOURCE_IDENTITY_IDS_COLUMN
+            else _int_vector
+        )
+        domain_token_kwargs[field_name] = vector_builder(
             columns[column][row_index], where=f"{column}[row={row_index}]"
         )
         present.append(column)

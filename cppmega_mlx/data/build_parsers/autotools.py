@@ -23,15 +23,40 @@ _AUTOCONF_MACROS = {
 
 
 def _is_balanced(text: str) -> bool:
-    pairs = {"(": ")", "[": "]"}
-    stack: list[str] = []
-    for ch in text:
-        if ch in pairs:
-            stack.append(pairs[ch])
-        elif ch in pairs.values():
-            if not stack or stack.pop() != ch:
+    paren_depth = 0
+    quote_depth = 0
+    idx = 0
+    while idx < len(text):
+        char = text[idx]
+        if quote_depth:
+            if char == "[":
+                quote_depth += 1
+            elif char == "]":
+                quote_depth -= 1
+            idx += 1
+            continue
+        if char == "[":
+            quote_depth = 1
+        elif char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
                 return False
-    return not stack
+        elif char == "#":
+            newline = text.find("\n", idx)
+            idx = len(text) if newline < 0 else newline
+            continue
+        elif text[idx:idx + 3].lower() == "dnl" and (
+            idx == 0 or not (text[idx - 1].isalnum() or text[idx - 1] == "_")
+        ):
+            after = idx + 3
+            if after == len(text) or not (text[after].isalnum() or text[after] == "_"):
+                newline = text.find("\n", after)
+                idx = len(text) if newline < 0 else newline
+                continue
+        idx += 1
+    return paren_depth == 0 and quote_depth == 0
 
 
 def parse_autoconf(text: str) -> ParsedDomainDocument:

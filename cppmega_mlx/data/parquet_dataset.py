@@ -63,8 +63,22 @@ _TOKEN_SEMANTIC_METADATA_COLUMNS = (
     "token_type_refs",
     "token_def_use",
 )
-_OPAQUE_IDENTITY_METADATA_COLUMNS = frozenset(
-    ("token_symbol_ids", "token_call_targets", "token_type_refs")
+_TOKEN_DOMAIN_METADATA_COLUMNS = (
+    "token_domain_ids",
+    "token_role_ids",
+    "token_entity_ids",
+    "token_scope_ids",
+    "token_source_doc_ids",
+    "token_source_identity_ids",
+    "token_confidence_ids",
+)
+_TOKEN_UINT64_METADATA_COLUMNS = frozenset(
+    (
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+        "token_source_identity_ids",
+    )
 )
 _TOKEN_TEMPORAL_METADATA_COLUMNS = (
     "token_change_mask_pre",
@@ -75,6 +89,7 @@ _TOKEN_TEMPORAL_METADATA_COLUMNS = (
 _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "semantic_graph": _TOKEN_SEMANTIC_METADATA_COLUMNS,
     "temporal_diff": _TOKEN_TEMPORAL_METADATA_COLUMNS,
+    "domain_routes": _TOKEN_DOMAIN_METADATA_COLUMNS,
 }
 _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "semantic_graph": _TOKEN_GRAPH_METADATA_COLUMNS,
@@ -129,6 +144,7 @@ _ROW_METADATA_COLUMNS = (
 )
 _RECOGNIZED_BATCH_METADATA_COLUMNS = (
     *_TOKEN_SEMANTIC_METADATA_COLUMNS,
+    *_TOKEN_DOMAIN_METADATA_COLUMNS,
     *_TOKEN_TEMPORAL_METADATA_COLUMNS,
     *_TOKEN_CHUNK_METADATA_COLUMNS,
     *_TOKEN_GRAPH_METADATA_COLUMNS,
@@ -1047,7 +1063,7 @@ def _family_side_channel_windows(
                 seq_len,
                 dtype=(
                     np.dtype(np.uint64)
-                    if column in _OPAQUE_IDENTITY_METADATA_COLUMNS
+                    if column in _TOKEN_UINT64_METADATA_COLUMNS
                     else np.dtype(np.int32)
                 ),
             )
@@ -1059,7 +1075,7 @@ def _family_side_channel_windows(
 
 
 def _family_side_channel_values(column: str, values: np.ndarray) -> np.ndarray:
-    if column in _OPAQUE_IDENTITY_METADATA_COLUMNS:
+    if column in _TOKEN_UINT64_METADATA_COLUMNS:
         if values.dtype.kind not in {"i", "u"} or (
             values.dtype.kind == "i" and np.any(values < 0)
         ):

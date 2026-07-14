@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import re
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence, cast
 
 from cppmega_mlx.data.build_parsers import (
     parse_autoconf,
@@ -33,8 +33,10 @@ from cppmega_mlx.data.domain_schema import (
 )
 from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
 from cppmega_mlx.data.source_identity import (
+    MAX_ROW_LOCAL_DOC_ID,
     MAX_SOURCE_ID,
-    stable_source_identity_id,
+    SourceIdentity,
+    source_identity,
 )
 
 
@@ -192,13 +194,19 @@ _ADAPTERS = {
     "zsh": DomainParserAdapter("zsh", DomainKind.ZSH, parse_zsh),
     "tcsh": DomainParserAdapter("tcsh", DomainKind.TCSH, parse_tcsh),
     "compiler": DomainParserAdapter(
-        "clang-diagnostic", DomainKind.COMPILER_DIAGNOSTIC, parse_clang_diagnostic
+        "clang-diagnostic",
+        DomainKind.COMPILER_DIAGNOSTIC,
+        cast(Parser, parse_clang_diagnostic),
     ),
     "linker": DomainParserAdapter(
-        "linker-diagnostic", DomainKind.LINKER_DIAGNOSTIC, parse_linker_error
+        "linker-diagnostic",
+        DomainKind.LINKER_DIAGNOSTIC,
+        cast(Parser, parse_linker_error),
     ),
     "build-diagnostic": DomainParserAdapter(
-        "build-diagnostic", DomainKind.BUILD_DIAGNOSTIC, parse_build_error
+        "build-diagnostic",
+        DomainKind.BUILD_DIAGNOSTIC,
+        cast(Parser, parse_build_error),
     ),
     "test": DomainParserAdapter("test-output", DomainKind.TEST_OUTPUT, parse_test_output),
     "sanitizer": DomainParserAdapter(
@@ -297,6 +305,14 @@ _CPP_RAW_SQL_RE = re.compile(
     r'R"(?P<tag>[A-Za-z0-9_]{0,16})\((?P<body>.*?)\)(?P=tag)"',
     re.DOTALL,
 )
+_CPP_ORDINARY_STRING_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(?:u8|u|U|L)?"(?P<body>(?:\\.|[^"\\])*)"',
+    re.DOTALL,
+)
+_CPP_LITERAL_SEPARATOR_RE = re.compile(
+    r"(?:\s|//[^\n]*(?:\n|$)|/\*.*?\*/)*\Z",
+    re.DOTALL,
+)
 _SQL_PREFIX_RE = re.compile(
     r"^\s*(?:CREATE|ALTER|INSERT|UPDATE|DELETE|SELECT|DROP|WITH|PRAGMA|BEGIN)\b",
     re.IGNORECASE,
@@ -375,23 +391,47 @@ def _sql_call_query_spans(text: str) -> list[tuple[int, int, int]]:
     return query_spans
 
 
+def _adjacent_cpp_string_body_groups(
+    text: str,
+    start: int,
+    end: int,
+) -> list[list[tuple[int, int, str]]]:
+    matches = list(_CPP_ORDINARY_STRING_RE.finditer(text, start, end))
+    groups: list[list[tuple[int, int, str]]] = []
+    current: list[tuple[int, int, str]] = []
+    previous_end = start
+    for match in matches:
+        separator = text[previous_end:match.start()]
+        item = (*match.span("body"), match.group("body"))
+        if current and _CPP_LITERAL_SEPARATOR_RE.fullmatch(separator) is None:
+            groups.append(current)
+            current = []
+        current.append(item)
+        previous_end = match.end()
+    if current:
+        groups.append(current)
+    return groups
+
+
 def extract_embedded_domain_blocks(
     text: str,
     *,
     host_domain: DomainKind,
     source_doc_id: int | None = None,
+    source_identity_value: SourceIdentity | None = None,
 ) -> list[EmbeddedDomainBlock]:
     """Extract exact host-character spans for supported embedded languages."""
 
     if DomainKind(host_domain) != DomainKind.CPP:
         return []
-    resolved_source_id = (
-        stable_source_identity_id({"text": text})
-        if source_doc_id in (None, 0)
-        else int(source_doc_id)
-    )
-    if not 0 < resolved_source_id <= MAX_SOURCE_ID:
-        raise ValueError(f"source_doc_id must be positive uint32, got {resolved_source_id}")
+    resolved_source_doc_id = 1 if source_doc_id in (None, 0) else int(source_doc_id)
+    if not 0 < resolved_source_doc_id <= MAX_ROW_LOCAL_DOC_ID:
+        raise ValueError(
+            f"source_doc_id must be positive uint32, got {resolved_source_doc_id}"
+        )
+    resolved_identity = source_identity_value or source_identity({"text": text})
+    if not 0 < resolved_identity.source_identity_id <= MAX_SOURCE_ID:
+        raise ValueError("source identity must be positive uint64")
     candidates: list[tuple[int, int, int]] = []
     query_call_spans = _sql_call_query_spans(text)
     for match in _CPP_RAW_SQL_RE.finditer(text):
@@ -411,14 +451,14 @@ def extract_embedded_domain_blocks(
         candidates.append((start, end, start if owner is None else owner))
 
     for argument_start, argument_end, call_anchor in query_call_spans:
-        argument = text[argument_start:argument_end]
-        for literal in re.finditer(r'"(?P<body>(?:\\.|[^"\\])*)"', argument):
-            body = literal.group("body")
-            if not _SQL_PREFIX_RE.match(body):
+        for group in _adjacent_cpp_string_body_groups(
+            text,
+            argument_start,
+            argument_end,
+        ):
+            if not _SQL_PREFIX_RE.match("".join(body for _, _, body in group)):
                 continue
-            start = argument_start + literal.start("body")
-            end = argument_start + literal.end("body")
-            candidates.append((start, end, call_anchor))
+            candidates.extend((start, end, call_anchor) for start, end, _ in group)
 
     for match in _EXEC_SQL_RE.finditer(text):
         candidates.append((match.start(), match.end(), match.start()))
@@ -430,7 +470,8 @@ def extract_embedded_domain_blocks(
             continue
         body = text[start:end]
         parsed = parse_sql_lexical(body)
-        parsed.set_source_doc_id(resolved_source_id)
+        parsed.set_source_doc_id(resolved_source_doc_id)
+        parsed.set_source_identity(resolved_identity)
         parsed.metadata["embedded_in"] = host_domain.name
         blocks.append(
             EmbeddedDomainBlock(
@@ -460,19 +501,18 @@ def parse_domain_document(
     """Parse one file and enforce token-aligned domain/provenance vectors."""
 
     adapter = resolve_domain_parser(path, text)
-    resolved_source_id = (
-        stable_source_identity_id(
-            {
-                **dict(provenance or {}),
-                "source_path": str(path),
-                "text": text,
-            }
+    resolved_source_doc_id = 1 if source_doc_id in (None, 0) else int(source_doc_id)
+    if not 0 < resolved_source_doc_id <= MAX_ROW_LOCAL_DOC_ID:
+        raise ValueError(
+            f"source_doc_id must be positive uint32, got {resolved_source_doc_id}"
         )
-        if source_doc_id in (None, 0)
-        else int(source_doc_id)
+    resolved_identity = source_identity(
+        {
+            **dict(provenance or {}),
+            "source_path": str(path),
+            "text": text,
+        }
     )
-    if not 0 < resolved_source_id <= MAX_SOURCE_ID:
-        raise ValueError(f"source_doc_id must be positive uint32, got {resolved_source_id}")
     parsed = adapter.parser(text)
     if parsed.domain != adapter.domain:
         allowed_dynamic = {
@@ -487,7 +527,8 @@ def parse_domain_document(
             )
     parsed.metadata["parser_adapter"] = adapter.name
     parsed.metadata["source_path"] = str(path)
-    parsed.set_source_doc_id(resolved_source_id)
+    parsed.set_source_doc_id(resolved_source_doc_id)
+    parsed.set_source_identity(resolved_identity)
     if provenance is not None:
         parsed.metadata["provenance"] = dict(provenance)
     if diagnostic_links is not None:
@@ -496,7 +537,8 @@ def parse_domain_document(
         parsed.embedded_blocks = extract_embedded_domain_blocks(
             text,
             host_domain=DomainKind.CPP,
-            source_doc_id=resolved_source_id,
+            source_doc_id=resolved_source_doc_id,
+            source_identity_value=resolved_identity,
         )
     parsed.validate()
     return parsed
@@ -517,12 +559,31 @@ def discover_project_domain_files(
     for directory, dirs, filenames in os.walk(root_path):
         dirs[:] = sorted(name for name in dirs if name not in skip_dirs)
         candidate_paths.extend(Path(directory) / name for name in sorted(filenames))
+    known_names = {
+        "CMakeLists.txt", "Makefile", "GNUmakefile", "makefile", "build.ninja",
+        "BUILD", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel",
+        "configure", "configure.ac", "configure.in", "Makefile.am", "Makefile.in",
+    }
+    known_suffixes = {
+        ".cmake", ".mk", ".ninja", ".bzl", ".bash", ".sh", ".zsh", ".tcsh",
+        ".csh", ".sql", ".m4", *(_CPP_EXTENSIONS if include_cpp else set()),
+    }
     for path in candidate_paths:
+        known_candidate = path.name in known_names or path.suffix.lower() in known_suffixes
         try:
             if path.stat().st_size > 500_000:
+                if known_candidate:
+                    raise ValueError(
+                        f"domain input exceeds 500000-byte limit: {path}"
+                    )
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            text = path.read_text(
+                encoding="utf-8",
+                errors="strict" if known_candidate else "replace",
+            )
+        except (OSError, UnicodeError) as exc:
+            if known_candidate:
+                raise OSError(f"failed to read domain input {path}: {exc}") from exc
             continue
         adapter = resolve_domain_parser(path, text)
         if adapter.name == "raw-output" or (

@@ -4,44 +4,50 @@ import json
 import subprocess
 import sys
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cppmega_mlx.data.domain_schema import DomainKind, DomainRoleKind, ParseConfidence
+from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+from scripts.nanochat_data.pack_enriched_rows import (
+    normalize_document_record,
+    pack_documents,
+    rows_to_table,
+)
 
 
 def _write_parquet(path, *, extra):
     path.parent.mkdir(parents=True, exist_ok=True)
     start = DOMAIN_DELIMITER_TOKEN_IDS["COMPILER_ERROR_START"]
     end = DOMAIN_DELIMITER_TOKEN_IDS["COMPILER_ERROR_END"]
+    identity = source_identity({"source_path": "diagnostic.log"})
     row = {
-        "input_ids": [start, 101, 102, end, 0, 0, 0, 0],
-        "target_ids": [101, 102, end, 0, 0, 0, 0, 0],
-        "loss_mask": [1, 1, 1, 0, 0, 0, 0, 0],
-        "doc_ids": [0, 0, 0, 0, 0, 0, 0, 0],
-        "valid_token_count": 4,
-        "trained_token_count": 3,
-        "slack_tokens": 4,
-        "token_domain_ids": [int(DomainKind.COMPILER_ERROR)] * 4 + [0, 0, 0, 0],
+        "token_ids": [start, 101, 102, end],
+        "token_domain_ids": [int(DomainKind.COMPILER_ERROR)] * 4,
         "token_role_ids": [
             int(DomainRoleKind.DELIMITER),
             int(DomainRoleKind.FILE),
             int(DomainRoleKind.MESSAGE),
             int(DomainRoleKind.DELIMITER),
-            0,
-            0,
-            0,
-            0,
         ],
-        "token_entity_ids": [0] * 8,
-        "token_scope_ids": [0] * 8,
-        "token_source_doc_ids": [17, 17, 17, 17, 0, 0, 0, 0],
-        "token_confidence_ids": [int(ParseConfidence.HEURISTIC)] * 4 + [0, 0, 0, 0],
+        "token_entity_ids": [0] * 4,
+        "token_scope_ids": [0] * 4,
+        "token_source_doc_ids": [17] * 4,
+        "token_source_identity_ids": [identity.source_identity_id] * 4,
+        "source_identity_registry": [identity.as_dict()],
+        "token_confidence_ids": [
+            int(ParseConfidence.EXACT),
+            int(ParseConfidence.HEURISTIC),
+            int(ParseConfidence.HEURISTIC),
+            int(ParseConfidence.EXACT),
+        ],
         "token_diagnostic_edges": [],
     }
     row.update(extra)
-    pq.write_table(pa.Table.from_pylist([row]), path)
+    doc = normalize_document_record(row, source_doc_index=0)
+    packed, overflow = pack_documents([doc], target_length=8, strategy="sequential")
+    assert overflow == []
+    pq.write_table(rows_to_table(packed), path)
 
 
 def _run_audit(tmp_path, root):
@@ -86,7 +92,12 @@ def test_audit_accepts_raw_diagnostic_row_without_edges(tmp_path):
     _write_parquet(
         root / "8" / "diag.parquet",
         extra={
-            "token_confidence_ids": [int(ParseConfidence.RAW)] * 4 + [0, 0, 0, 0],
+            "token_confidence_ids": [
+                int(ParseConfidence.EXACT),
+                int(ParseConfidence.RAW),
+                int(ParseConfidence.RAW),
+                int(ParseConfidence.EXACT),
+            ],
         },
     )
 

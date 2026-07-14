@@ -6,6 +6,12 @@ import numpy as np
 import pytest
 
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset
+from cppmega_mlx.data.code_packet_builder import build_code_packets
+from cppmega_mlx.data.source_identity import source_identity
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+)
 from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
@@ -36,6 +42,11 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_DEP_LEVELS_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
+    TOKEN_SYMBOL_IDS_COLUMN,
+    TOKEN_CALL_TARGETS_COLUMN,
+    TOKEN_TYPE_REFS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
 )
 from scripts.nanochat_data import pack_enriched_rows as packer
@@ -63,6 +74,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     normalize_document_record,
     pack_documents,
     pack_parquet_dataset,
+    rows_to_table,
 )
 
 
@@ -634,6 +646,9 @@ def test_pack_parquet_dataset_marks_macro_route_schema_version(tmp_path: Path) -
         PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
     )
     assert metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] == b"3"
+    assert metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] == (
+        DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+    )
 
 
 def test_packer_rejects_cross_project_symbol_id_collision_across_shards(
@@ -709,6 +724,81 @@ def test_pack_parquet_dataset_rejects_stale_symbol_identity_schema(tmp_path: Pat
     with pytest.raises(RuntimeError, match="regenerate.*clang USR"):
         pack_parquet_dataset(input_path, output_path, target_length=8)
     assert not output_path.exists()
+
+
+def test_uint64_source_and_symbol_ids_reach_training_batch_and_code_packet(
+    tmp_path: Path,
+) -> None:
+    identity = next(
+        candidate
+        for index in range(100)
+        if (
+            candidate := source_identity(
+                {"source_path": f"training-receipt-{index}.cpp"}
+            )
+        ).source_identity_id > (1 << 63)
+    )
+    high_id = identity.source_identity_id
+    symbol_key = next(
+        key
+        for index in range(100)
+        if symbol_identity._compute_symbol_id(
+            key := symbol_identity.canonical_symbol_identity(
+                qname=f"receipt::symbol_{index}",
+                kind="FUNCTION_DECL",
+                canonical_signature=f"display=symbol_{index}()|type=void ()",
+                project="fixtures/training-receipt",
+                file="receipt.cpp",
+            )
+        )
+        > (1 << 63)
+    )
+    symbol_high_id = symbol_identity._compute_symbol_id(symbol_key)
+    doc = normalize_document_record(
+        {
+            TOKEN_IDS_COLUMN: [10, 11, 12, 13],
+            TOKEN_SOURCE_IDENTITY_IDS_COLUMN: [high_id] * 4,
+            TOKEN_SYMBOL_IDS_COLUMN: [symbol_high_id, 0, 0, 0],
+            TOKEN_CALL_TARGETS_COLUMN: [0, symbol_high_id, 0, 0],
+            TOKEN_TYPE_REFS_COLUMN: [0, 0, symbol_high_id, 0],
+            "symbol_identities": [
+                {"symbol_id": symbol_high_id, "symbol_key": symbol_key}
+            ],
+            SOURCE_IDENTITY_REGISTRY_COLUMN: [identity.as_dict()],
+        },
+        source_doc_index=0,
+    )
+    rows, overflow = pack_documents([doc], target_length=4, strategy="sequential")
+    assert overflow == []
+    packed_path = tmp_path / "training_receipt.parquet"
+    table = rows_to_table(rows)
+    pq.write_table(table, packed_path)
+
+    dataset = TokenParquetDataset(
+        packed_path,
+        seq_len=4,
+        batch_size=1,
+        token_key=INPUT_IDS_COLUMN,
+    )
+    batch = next(dataset.iter_batches())
+    domain_ids = np.asarray(
+        batch.side_channels["domain_routes"][TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    )
+    semantic_ids = np.asarray(
+        batch.side_channels["semantic_graph"][TOKEN_SYMBOL_IDS_COLUMN]
+    )
+    assert domain_ids.dtype == np.uint64
+    assert semantic_ids.dtype == np.uint64
+    assert int(domain_ids[0, 0]) == high_id
+    assert int(semantic_ids[0, 0]) == symbol_high_id
+    receipt = dataset.parquet_receipt["family_side_channel_sources"]
+    assert receipt["domain_routes"][TOKEN_SOURCE_IDENTITY_IDS_COLUMN]["type"] == (
+        "list<element: uint64>"
+    )
+
+    packet = build_code_packets(batch, table)[0]
+    assert int(np.asarray(packet.source_identity_ids)[0]) == high_id
+    assert int(np.asarray(packet.symbol_ids)[0]) == symbol_high_id
 
 
 def test_pack_parquet_dataset_streams_windows_without_full_input_load(

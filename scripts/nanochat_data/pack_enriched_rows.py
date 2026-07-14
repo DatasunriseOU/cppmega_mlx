@@ -110,10 +110,12 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SIBLING_INDEX_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
 from cppmega_mlx.data.packing import PackingStrategy
 from cppmega_mlx.data.symbol_identity import (
@@ -123,7 +125,14 @@ from cppmega_mlx.data.symbol_identity import (
     SymbolIdentityError,
     SymbolIdentityRegistry,
 )
-from cppmega_mlx.data.source_identity import stable_source_identity_id
+from cppmega_mlx.data.source_identity import (
+    source_identity,
+    validate_source_identity_registry,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+)
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 TRAINED_TOKEN_COUNT_COLUMN = "trained_token_count"
@@ -224,6 +233,14 @@ EDGE_TRIPLE_STRUCT = pa.struct(
     ]
 )
 
+SOURCE_IDENTITY_STRUCT = pa.struct(
+    [
+        pa.field("source_identity_id", pa.uint64(), nullable=False),
+        pa.field("canonical_sha256", pa.string(), nullable=False),
+        pa.field("source", pa.string(), nullable=False),
+    ]
+)
+
 PACKED_ROW_SCHEMA = pa.schema(
     [
         pa.field(PACK_ID_COLUMN, pa.int64()),
@@ -289,6 +306,7 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_ENTITY_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SOURCE_IDENTITY_IDS_COLUMN, pa.list_(pa.uint64())),
         pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
         pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
@@ -311,6 +329,7 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
         pa.field(CHANGED_CHUNK_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(CHANGED_CHUNK_SPANS_COLUMN, pa.list_(CHANGED_CHUNK_SPAN_STRUCT)),
+        pa.field(SOURCE_IDENTITY_REGISTRY_COLUMN, pa.list_(SOURCE_IDENTITY_STRUCT)),
     ]
 )
 
@@ -323,6 +342,10 @@ def _packed_row_schema_with_metadata() -> pa.Schema:
     metadata[SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] = str(
         REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
     ).encode("ascii")
+    metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] = (
+        DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+    )
+    metadata[b"cppmega.case5_schema"] = b"case5_domain_routes_v1"
     return PACKED_ROW_SCHEMA.with_metadata(metadata)
 
 
@@ -336,6 +359,7 @@ class NormalizedDoc:
     source_doc_index: int
     stable_doc_id: int
     stable_source_id: int
+    source_identity_registry: tuple[dict[str, int | str], ...]
     token_ids: list[int]
     token_meta: dict[str, list[int]]
     chunk_starts: list[int]
@@ -412,6 +436,9 @@ class NormalizedDoc:
                 for start, end in self.changed_chunk_spans
             ],
             SYMBOL_IDENTITIES_COLUMN: [dict(item) for item in self.symbol_identities],
+            SOURCE_IDENTITY_REGISTRY_COLUMN: [
+                dict(entry) for entry in self.source_identity_registry
+            ],
         }
         record.update(self.chronology)
         record.update(
@@ -904,7 +931,13 @@ def _normalize_domain_graph_meta(
             column=column,
             edges=edges,
         )
-    return normalized
+    return (
+        normalized[0],
+        normalized[1],
+        normalized[2],
+        normalized[3],
+        normalized[4],
+    )
 
 
 def normalize_document_record(
@@ -951,6 +984,52 @@ def normalize_document_record(
             normalized_identities,
             source=f"source_doc_index={source_doc_index}",
         )
+
+    raw_registry = [
+        dict(entry) for entry in record.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
+    ]
+    if raw_registry:
+        registry = validate_source_identity_registry(raw_registry)
+        stable_source_id = next(iter(registry))
+    else:
+        identity = source_identity(record)
+        raw_registry = [identity.as_dict()]
+        stable_source_id = identity.source_identity_id
+
+    source_doc_values = token_meta[TOKEN_SOURCE_DOC_IDS_COLUMN]
+    token_meta[TOKEN_SOURCE_DOC_IDS_COLUMN] = [
+        int(value) if int(value) > 0 else 1
+        for value in (source_doc_values or [1] * len(token_ids))
+    ]
+    source_identity_values = token_meta[TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    if len(raw_registry) > 1 and (
+        not source_identity_values
+        or any(int(value) == 0 for value in source_identity_values)
+    ):
+        raise ValueError(
+            "multi-source document is missing exact token source identities"
+        )
+    token_meta[TOKEN_SOURCE_IDENTITY_IDS_COLUMN] = [
+        int(value) if int(value) > 0 else stable_source_id
+        for value in (source_identity_values or [stable_source_id] * len(token_ids))
+    ]
+    validate_source_identity_registry(
+        raw_registry,
+        referenced_ids=token_meta[TOKEN_SOURCE_IDENTITY_IDS_COLUMN],
+    )
+    for column in (
+        TOKEN_SYMBOL_IDS_COLUMN,
+        TOKEN_CALL_TARGETS_COLUMN,
+        TOKEN_TYPE_REFS_COLUMN,
+        TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
+    ):
+        if any(not 0 <= int(value) < (1 << 64) for value in token_meta[column]):
+            raise ValueError(f"{column} must contain uint64 values")
+    if any(
+        not 0 <= int(value) < (1 << 32)
+        for value in token_meta[TOKEN_SOURCE_DOC_IDS_COLUMN]
+    ):
+        raise ValueError(f"{TOKEN_SOURCE_DOC_IDS_COLUMN} must contain uint32 values")
     (
         chunk_starts,
         chunk_ends,
@@ -980,7 +1059,8 @@ def normalize_document_record(
     return NormalizedDoc(
         source_doc_index=int(source_doc_index),
         stable_doc_id=int(source_doc_index + 1 if stable_doc_id is None else stable_doc_id),
-        stable_source_id=stable_source_identity_id(record),
+        stable_source_id=stable_source_id,
+        source_identity_registry=tuple(raw_registry),
         token_ids=token_ids,
         token_meta=token_meta,
         chunk_starts=chunk_starts,
@@ -1424,6 +1504,7 @@ def _materialize_packed_row(
     cross_domain_edges: list[dict[str, int]] = []
     changed_chunk_ids: list[int] = []
     changed_chunk_spans: list[dict[str, int]] = []
+    source_identity_registry: dict[int, dict[str, int | str]] = {}
 
     token_offset = 0
     chunk_offset = 0
@@ -1465,10 +1546,22 @@ def _materialize_packed_row(
             objective_source_ids[source_column].append(
                 list(doc.objective_token_ids.get(token_column, []))
             )
+        for entry in doc.source_identity_registry:
+            identity_id = int(entry["source_identity_id"])
+            normalized_entry = dict(entry)
+            previous = source_identity_registry.get(identity_id)
+            if previous is not None and previous != normalized_entry:
+                raise ValueError(f"source identity uint64 collision for id {identity_id}")
+            source_identity_registry[identity_id] = normalized_entry
 
         for column in PACKED_TOKEN_METADATA_COLUMNS:
             values = doc.token_meta[column]
             if column == TOKEN_SOURCE_DOC_IDS_COLUMN:
+                token_meta_acc[column].extend(
+                    int(value) if int(value) > 0 else 1
+                    for value in (values or [0] * doc.token_count)
+                )
+            elif column == TOKEN_SOURCE_IDENTITY_IDS_COLUMN:
                 token_meta_acc[column].extend(
                     int(value) if int(value) > 0 else doc.stable_source_id
                     for value in (values or [0] * doc.token_count)
@@ -1611,6 +1704,7 @@ def _materialize_packed_row(
         TOKEN_SHELL_EDGES_COLUMN: shell_edges,
         TOKEN_DIAGNOSTIC_EDGES_COLUMN: diagnostic_edges,
         TOKEN_CROSS_DOMAIN_EDGES_COLUMN: cross_domain_edges,
+        SOURCE_IDENTITY_REGISTRY_COLUMN: list(source_identity_registry.values()),
     }
     for column in PACKED_ROW_PROVENANCE_COLUMNS:
         value = chronology.get(column) if chronology else None
@@ -1629,6 +1723,10 @@ def _materialize_packed_row(
     for column in PACKED_TOKEN_METADATA_COLUMNS:
         pad_value = int(PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES.get(column, 0))
         row[column] = _pad(token_meta_acc[column], row_length, pad_value=pad_value)
+    validate_source_identity_registry(
+        row[SOURCE_IDENTITY_REGISTRY_COLUMN],
+        referenced_ids=row[TOKEN_SOURCE_IDENTITY_IDS_COLUMN][:valid_token_count],
+    )
     return row
 
 
@@ -1801,6 +1899,9 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 TOKEN_SOURCE_DOC_IDS_COLUMN: _as_int_list(
                     row.get(TOKEN_SOURCE_DOC_IDS_COLUMN)
                 ),
+                TOKEN_SOURCE_IDENTITY_IDS_COLUMN: _as_int_list(
+                    row.get(TOKEN_SOURCE_IDENTITY_IDS_COLUMN)
+                ),
                 TOKEN_CONFIDENCE_IDS_COLUMN: _as_int_list(
                     row.get(TOKEN_CONFIDENCE_IDS_COLUMN)
                 ),
@@ -1887,6 +1988,14 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                         "kind": int(edge["kind"]),
                     }
                     for edge in row.get(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, [])
+                ],
+                SOURCE_IDENTITY_REGISTRY_COLUMN: [
+                    {
+                        "source_identity_id": int(entry["source_identity_id"]),
+                        "canonical_sha256": str(entry["canonical_sha256"]),
+                        "source": str(entry["source"]),
+                    }
+                    for entry in row.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
                 ],
             }
         )

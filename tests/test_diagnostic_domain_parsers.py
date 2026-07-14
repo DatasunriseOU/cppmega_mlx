@@ -5,6 +5,7 @@ from cppmega_mlx.data.diagnostic_parsers import (
     parse_clang_diagnostic,
     parse_linker_error,
     parse_msvc_diagnostic,
+    parse_test_output,
 )
 from cppmega_mlx.data.domain_schema import DomainEdgeKind, DomainKind, DomainRoleKind
 
@@ -25,7 +26,6 @@ def test_clang_diagnostic_parser_marks_location_and_primary_edge() -> None:
         "src/main.cpp:12:7: error: no matching function for call to 'foo'\n"
         "src/main.cpp:8:3: note: candidate function not viable\n"
     )
-    roles = _roles(parsed)
     assert parsed.domain == DomainKind.COMPILER_ERROR
     assert _has_role(parsed, "src/main.cpp", DomainRoleKind.FILE)
     assert _has_role(parsed, "12", DomainRoleKind.LINE)
@@ -37,7 +37,6 @@ def test_clang_diagnostic_parser_marks_location_and_primary_edge() -> None:
 
 def test_linker_parser_marks_undefined_symbol() -> None:
     parsed = parse_linker_error("ld: error: undefined reference to `Widget::run()'\n")
-    roles = _roles(parsed)
     assert parsed.domain == DomainKind.LINKER_ERROR
     assert _has_role(parsed, "ld", DomainRoleKind.COMMAND)
     assert _has_role(parsed, "Widget", DomainRoleKind.SYMBOL)
@@ -47,7 +46,6 @@ def test_linker_parser_marks_undefined_symbol() -> None:
 
 def test_build_error_parser_marks_build_command_and_exit_code() -> None:
     parsed = parse_build_error("ninja: build stopped: subcommand failed with exit code 1\n")
-    roles = _roles(parsed)
     assert parsed.domain == DomainKind.BUILD_ERROR
     assert _has_role(parsed, "ninja", DomainRoleKind.COMMAND)
     assert _has_role(parsed, "1", DomainRoleKind.EXIT_CODE)
@@ -55,9 +53,19 @@ def test_build_error_parser_marks_build_command_and_exit_code() -> None:
 
 def test_msvc_parser_marks_primary_location() -> None:
     parsed = parse_msvc_diagnostic("src\\main.cpp(10,5): error C2065: 'x': undeclared identifier\n")
-    roles = _roles(parsed)
     assert parsed.domain == DomainKind.COMPILER_ERROR
     assert _has_role(parsed, "src\\main.cpp", DomainRoleKind.FILE)
     assert _has_role(parsed, "10", DomainRoleKind.LINE)
     assert _has_role(parsed, "5", DomainRoleKind.COLUMN)
     assert any(edge[2] == int(DomainEdgeKind.DIAG_PRIMARY_LOCATION) for edge in parsed.edges)
+
+
+def test_successful_test_output_has_structured_result_edge() -> None:
+    parsed = parse_test_output("12 passed, 0 failed, 0 errors\n")
+    assert parsed.metadata["result_status"] == "pass"
+    assert parsed.metadata["result_counts"]
+    assert any(
+        kind == int(DomainEdgeKind.TOOL_ACTION_RESULT)
+        for _, _, kind in parsed.edges
+    )
+    assert _has_role(parsed, "passed", DomainRoleKind.SEVERITY)

@@ -46,6 +46,7 @@ def _assert_parser_vectors_are_token_aligned(parsed) -> None:
     assert len(parsed.entity_ids) == expected
     assert len(parsed.scope_ids) == expected
     assert len(parsed.source_doc_ids) == expected
+    assert len(parsed.source_identity_ids) == expected
     assert len(parsed.confidence_ids) == expected
 
 
@@ -252,6 +253,33 @@ def test_index_project_discovers_shells_and_keeps_autotools_kinds_distinct(
     }
 
 
+def test_domain_discovery_fails_loud_on_large_or_unreadable_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cppmega_mlx.data.domain_ingestion import discover_project_domain_files
+    from tools.clang_indexer import index_project
+
+    build_file = tmp_path / "CMakeLists.txt"
+    build_file.write_text("x" * 500_001)
+    with pytest.raises(ValueError, match="exceeds"):
+        discover_project_domain_files(tmp_path)
+    with pytest.raises(ValueError, match="exceeds"):
+        index_project.find_build_files(str(tmp_path))
+
+    build_file.write_text("add_library(app app.cpp)\n")
+    original_read_text = Path.read_text
+
+    def _read_text(path: Path, *args, **kwargs):
+        if path == build_file:
+            raise OSError("simulated read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+    with pytest.raises(OSError, match="failed to read domain input"):
+        discover_project_domain_files(tmp_path)
+
+
 def test_shell_shebang_overrides_generic_sh_suffix_in_both_discovery_paths(
     tmp_path: Path,
 ) -> None:
@@ -288,7 +316,10 @@ def test_process_project_emits_every_discovered_domain_once_with_source_identity
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
-    monkeypatch.setattr(index_project, "_configure_libclang", lambda *_args, **_kwargs: None)
+    def _libclang_must_not_be_touched(*_args, **_kwargs):
+        raise AssertionError("domain-only repositories must not initialize libclang")
+
+    monkeypatch.setattr(index_project, "_configure_libclang", _libclang_must_not_be_touched)
     monkeypatch.setattr(index_project, "load_compile_commands", lambda *_args: None)
     monkeypatch.setattr(
         index_project,
@@ -322,6 +353,10 @@ def test_process_project_emits_every_discovered_domain_once_with_source_identity
         assert doc["domain_kind"] == int(domain)
         assert doc["domain_source_doc_ids"]
         assert min(doc["domain_source_doc_ids"]) > 0
+        assert doc["domain_source_identity_ids"]
+        assert min(doc["domain_source_identity_ids"]) > 0
+        assert doc["source_identity_registry"]
+        assert len(doc["source_identity_registry"][0]["canonical_sha256"]) == 64
 
 
 def test_shell_dialects_keep_distinct_adapters_roles_and_metadata() -> None:
@@ -494,6 +529,24 @@ def test_embedded_sql_finds_ordinary_database_strings_and_exec_sql() -> None:
     )
 
 
+def test_embedded_sql_routes_every_adjacent_cpp_string_literal() -> None:
+    from cppmega_mlx.data.domain_ingestion import extract_embedded_domain_blocks
+
+    cpp = (
+        'sqlite3_exec(db, "CREATE TABLE " /* keep */ "jobs("\n'
+        '                    "id INTEGER);", nullptr, nullptr, nullptr);\n'
+    )
+    blocks = extract_embedded_domain_blocks(cpp, host_domain=DomainKind.CPP)
+    assert [cpp[block.start : block.end] for block in blocks] == [
+        "CREATE TABLE ",
+        "jobs(",
+        "id INTEGER);",
+    ]
+    assert {block.cross_domain_edge[0] for block in blocks} == {
+        cpp.index("sqlite3_exec")
+    }
+
+
 def test_raw_sql_literal_only_links_to_the_call_argument_that_contains_it() -> None:
     from cppmega_mlx.data.domain_ingestion import extract_embedded_domain_blocks
 
@@ -600,6 +653,7 @@ def test_parser_output_preserves_provenance_and_token_alignment() -> None:
         "domain_entity_ids",
         "domain_scope_ids",
         "domain_source_doc_ids",
+        "domain_source_identity_ids",
         "domain_confidence_ids",
     ):
         assert len(enriched[key]) == len(parsed.text), key
@@ -608,6 +662,62 @@ def test_parser_output_preserves_provenance_and_token_alignment() -> None:
     ]
     assert enriched["domain_edges"] == enriched["build_edges"]
     assert enriched["build_edges"]
+
+
+def test_source_identity_is_uint64_with_full_sha256_registry_witness() -> None:
+    from cppmega_mlx.data.source_identity import (
+        source_identity,
+        validate_source_identity_registry,
+    )
+
+    long_path = "src/" + "nested/" * 80 + "unit.cpp"
+    identity = source_identity({"repo": "owner/repo", "source_path": long_path})
+    assert 0 < identity.source_identity_id < (1 << 64)
+    assert len(identity.canonical_sha256) == 64
+    assert long_path in identity.source
+    registry = validate_source_identity_registry(
+        [identity.as_dict()],
+        referenced_ids=[identity.source_identity_id],
+    )
+    assert registry[identity.source_identity_id] == identity
+
+    corrupted = identity.as_dict()
+    corrupted["canonical_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="does not match canonical source"):
+        validate_source_identity_registry([corrupted])
+
+    uppercase = identity.as_dict()
+    uppercase["canonical_sha256"] = identity.canonical_sha256.upper()
+    with pytest.raises(ValueError, match="does not match canonical source"):
+        validate_source_identity_registry([uppercase])
+
+
+def test_assembled_multifile_doc_preserves_fragment_source_identity() -> None:
+    from tools.clang_indexer.index_project import ProjectIndex, build_enriched_doc
+
+    first = "int first();"
+    second = "int second();"
+    doc = build_enriched_doc(
+        [
+            (first, 2, 0, "first", None, None, None, "src/first.cpp"),
+            (second, 2, 0, "second", None, None, None, "lib/second.cpp"),
+        ],
+        ProjectIndex(),
+        filepath="src/root.cpp",
+    )
+    second_start = len(first) + 2
+    source_doc_ids = doc["domain_source_doc_ids"]
+    identity_ids = doc["domain_source_identity_ids"]
+    assert source_doc_ids[:second_start] == [1] * second_start
+    assert source_doc_ids[second_start:] == [2] * len(second)
+    assert len(set(identity_ids[:second_start])) == 1
+    assert len(set(identity_ids[second_start:])) == 1
+    assert identity_ids[0] != identity_ids[second_start]
+    registry_sources = {
+        entry["source"] for entry in doc["source_identity_registry"]
+    }
+    assert any("src/first.cpp" in source for source in registry_sources)
+    assert any("lib/second.cpp" in source for source in registry_sources)
 
 
 def test_domain_edge_route_is_canonical_aggregate_with_specialized_mirrors() -> None:
@@ -682,20 +792,41 @@ def test_delimiter_insertion_keeps_exclusive_chunk_ends_before_closing_marker() 
 def test_packer_rejects_malformed_edges_and_assigns_source_provenance() -> None:
     pytest.importorskip("pyarrow")
     from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+        SOURCE_IDENTITY_REGISTRY_COLUMN,
         TOKEN_BUILD_EDGES_COLUMN,
         TOKEN_IDS_COLUMN,
         TOKEN_SOURCE_DOC_IDS_COLUMN,
+        TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     )
     from scripts.nanochat_data.pack_enriched_rows import (
         normalize_document_record,
         pack_documents,
     )
+    from cppmega_mlx.data.source_identity import source_identity
 
     with pytest.raises(ValueError, match="missing src/dst/kind"):
         normalize_document_record(
             {
                 TOKEN_IDS_COLUMN: [10, 11],
                 TOKEN_BUILD_EDGES_COLUMN: [{"from": 0, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)}],
+            },
+            source_doc_index=0,
+        )
+
+    first_identity = source_identity({"source_path": "first.cc"})
+    second_identity = source_identity({"source_path": "second.cc"})
+    with pytest.raises(ValueError, match="missing exact token source identities"):
+        normalize_document_record(
+            {
+                TOKEN_IDS_COLUMN: [10, 11],
+                TOKEN_SOURCE_IDENTITY_IDS_COLUMN: [
+                    first_identity.source_identity_id,
+                    0,
+                ],
+                SOURCE_IDENTITY_REGISTRY_COLUMN: [
+                    first_identity.as_dict(),
+                    second_identity.as_dict(),
+                ],
             },
             source_doc_index=0,
         )
@@ -714,5 +845,9 @@ def test_packer_rejects_malformed_edges_and_assigns_source_provenance() -> None:
     source_ids = rows[0][TOKEN_SOURCE_DOC_IDS_COLUMN]
     assert source_ids[0] == source_ids[1] > 0
     assert source_ids[2] == source_ids[3] > 0
-    assert source_ids[0] != source_ids[2]
+    assert source_ids[0] == source_ids[2] == 1
+    identity_ids = rows[0][TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    assert identity_ids[0] == identity_ids[1] > 0
+    assert identity_ids[2] == identity_ids[3] > 0
+    assert identity_ids[0] != identity_ids[2]
     assert source_ids[4] == 0

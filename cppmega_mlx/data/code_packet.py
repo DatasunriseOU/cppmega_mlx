@@ -54,6 +54,7 @@ _DOMAIN_TOKEN_FIELDS = (
     "entity_ids",
     "scope_ids",
     "source_doc_ids",
+    "source_identity_ids",
     "confidence_ids",
 )
 # Token-aligned channels that must match token_ids length exactly.
@@ -122,6 +123,7 @@ class CodePacket:
     entity_ids: mx.array | None = None
     scope_ids: mx.array | None = None
     source_doc_ids: mx.array | None = None
+    source_identity_ids: mx.array | None = None
     confidence_ids: mx.array | None = None
 
     # Graph edges (chunk-index space).

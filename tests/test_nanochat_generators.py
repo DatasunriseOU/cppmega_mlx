@@ -792,7 +792,8 @@ def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
     assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2, 3, 3]
     assert rows[0][LOSS_MASK_COLUMN] == [1, 0, 1, 0, 1, 0]
     assert rows[0][NUM_DOCS_COLUMN] == 3
-    stable_sources = rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN] == [1] * 6
+    stable_sources = rows[0][schema.TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
     assert stable_sources[0] == stable_sources[2]
     assert stable_sources[3] != stable_sources[4]
     assert all(value > 0 for value in stable_sources)
@@ -852,7 +853,8 @@ def test_pack_enriched_rows_does_not_collide_anonymous_and_typed_source_ids(
     )
 
     assert overflow == []
-    source_ids = rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN] == [1] * 4
+    source_ids = rows[0][schema.TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
     assert source_ids[:2] == [source_ids[0], source_ids[0]]
     assert source_ids[2:] == [source_ids[2], source_ids[2]]
     assert source_ids[0] > 0 and source_ids[2] > 0

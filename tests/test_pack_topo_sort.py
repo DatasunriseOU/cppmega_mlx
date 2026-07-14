@@ -32,8 +32,10 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_DEP_LEVELS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
 )
+from cppmega_mlx.data.source_identity import source_identity
 from scripts.nanochat_data.pack_enriched_rows import (
     NormalizedDoc,
     pack_documents,
@@ -74,15 +76,20 @@ def _make_doc(
 
     fill_value = source_doc_index if fill is None else fill
     token_ids = [1000 + source_doc_index * 100 + i for i in range(token_count)]
+    identity = source_identity({"source_path": f"synthetic-{source_doc_index}.cpp"})
     return NormalizedDoc(
         source_doc_index=source_doc_index,
         stable_doc_id=source_doc_index + 1,
-        stable_source_id=source_doc_index + 1,
+        stable_source_id=identity.source_identity_id,
+        source_identity_registry=(identity.as_dict(),),
         token_ids=token_ids,
         token_meta=_token_meta(
             **{
                 TOKEN_STRUCTURE_IDS_COLUMN: [fill_value] * token_count,
                 TOKEN_DEP_LEVELS_COLUMN: [dep_level] * token_count,
+                TOKEN_SOURCE_IDENTITY_IDS_COLUMN: [
+                    identity.source_identity_id
+                ] * token_count,
             }
         ),
         chunk_starts=[0],
@@ -286,12 +293,24 @@ def _reconstruct_docs_from_packed_row(row: dict[str, object]) -> list[Normalized
             )
         )
         docs.append(
+            # Golden fixtures predate CASE5 provenance, so reconstruction makes
+            # the synthetic source explicit instead of narrowing an old ID.
             NormalizedDoc(
                 source_doc_index=int(sdi),
                 stable_doc_id=int(sdi) + 1,
-                stable_source_id=int(sdi) + 1,
+                stable_source_id=(
+                    identity := source_identity(
+                        {"source_path": f"golden-{int(sdi)}.cpp"}
+                    )
+                ).source_identity_id,
+                source_identity_registry=(identity.as_dict(),),
                 token_ids=token_ids,
-                token_meta=token_meta,
+                token_meta={
+                    **token_meta,
+                    TOKEN_SOURCE_IDENTITY_IDS_COLUMN: [
+                        identity.source_identity_id
+                    ] * length,
+                },
                 chunk_starts=[0],
                 chunk_ends=[length],
                 chunk_kinds=[1],
@@ -324,6 +343,7 @@ def _load_golden_mini_docs() -> list[NormalizedDoc]:
                 source_doc_index=new_idx,
                 stable_doc_id=new_idx + 1,
                 stable_source_id=doc.stable_source_id,
+                source_identity_registry=doc.source_identity_registry,
                 token_ids=doc.token_ids,
                 token_meta=doc.token_meta,
                 chunk_starts=doc.chunk_starts,

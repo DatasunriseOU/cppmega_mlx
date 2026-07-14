@@ -11,6 +11,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega_mlx.data.domain_schema import DomainEdgeKind
+from cppmega_mlx.data.source_identity import source_identity
+from scripts.nanochat_data.pack_enriched_rows import PACKED_ROW_OUTPUT_SCHEMA
+
 
 def _load_audit_module():
     path = Path(__file__).parents[1] / "scripts" / "audit_sidecar_parquet.py"
@@ -40,6 +44,11 @@ def _write_tiny_parquet(
     token_source_doc_type=pa.uint32(),
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
+    identity = source_identity({"source_path": "fixture.cpp"})
+    capacity = len(input_ids)
+    valid_identity_ids = [identity.source_identity_id] * valid_token_count + [0] * (
+        capacity - valid_token_count
+    )
     row = {
         "input_ids": list(input_ids),
         "target_ids": list(target_ids),
@@ -47,14 +56,16 @@ def _write_tiny_parquet(
         "doc_ids": list(doc_ids),
         "valid_token_count": int(valid_token_count),
         "trained_token_count": int(trained_token_count),
+        "num_docs": 1,
         "slack_tokens": 4,
         "source_doc_ids": [1],
         "source_doc_token_lengths": [4],
-        "source_platform_ids": [7],
-        "source_repo_stable_ids": [9],
-        "source_filepath_stable_ids": [11],
+        "source_platform_ids": [[7]],
+        "source_repo_stable_ids": ["9"],
+        "source_filepath_stable_ids": ["11"],
         "source_file_local_commit_indices": [0],
         "platform_ids": [7],
+        "token_platform_ids": [0] * capacity,
         "token_structure_ids": [1, 1, 1, 1, 0, 0, 0, 0],
         "token_dep_levels": [0, 1, 1, 0, 0, 0, 0, 0],
         "token_ast_depth": [1, 2, 2, 1, 0, 0, 0, 0],
@@ -63,6 +74,15 @@ def _write_tiny_parquet(
         "token_symbol_ids": [0, 21, 0, 0, 0, 0, 0, 0],
         "token_call_targets": [0, 0, 22, 0, 0, 0, 0, 0],
         "token_type_refs": [0, 0, 0, 23, 0, 0, 0, 0],
+        "token_domain_ids": [0] * capacity,
+        "token_role_ids": [0] * capacity,
+        "token_entity_ids": [0] * capacity,
+        "token_scope_ids": [0] * capacity,
+        "token_source_doc_ids": [1] * valid_token_count + [0] * (
+            capacity - valid_token_count
+        ),
+        "token_source_identity_ids": valid_identity_ids,
+        "token_confidence_ids": [0] * capacity,
         "token_def_use": [0, 1, 2, 0, 0, 0, 0, 0],
         "token_change_mask_pre": [0, 1, 1, 0, 0, 0, 0, 0],
         "token_change_mask_post": [0, 1, 1, 0, 0, 0, 0, 0],
@@ -74,6 +94,12 @@ def _write_tiny_parquet(
         "token_chunk_dep_levels": [0, 1],
         "token_call_edges": [{"from": 0, "to": 1}],
         "token_type_edges": [{"from": 1, "to": 0}],
+        "token_domain_edges": [],
+        "token_build_edges": [],
+        "token_shell_edges": [],
+        "token_diagnostic_edges": [],
+        "token_cross_domain_edges": [],
+        "source_identity_registry": [identity.as_dict()],
         "changed_chunk_ids": [1],
         "changed_chunk_spans": [{"start": 2, "end": 4}],
     }
@@ -113,10 +139,11 @@ def _write_tiny_parquet(
             token_source_doc_ids
             + [0] * (len(row["input_ids"]) - len(token_source_doc_ids))
         )
-    for name in omit:
-        row.pop(name, None)
-    table = pa.Table.from_pylist([row])
-    if "token_source_doc_ids" in row:
+    row["num_docs"] = len(row["source_doc_token_lengths"])
+    table = pa.Table.from_pylist([row], schema=PACKED_ROW_OUTPUT_SCHEMA)
+    if omit:
+        table = table.drop(list(omit))
+    if "token_source_doc_ids" not in omit:
         index = table.schema.get_field_index("token_source_doc_ids")
         table = table.set_column(
             index,
@@ -193,6 +220,10 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     assert report["total"]["edge_count"]["token_call_edges"] == 3
     assert report["total"]["edge_count"]["token_type_edges"] == 3
     assert report["total"]["edge_count"]["token_domain_edges"] == 0
+    assert report["status"] == "passed"
+    assert report["receipt"]["successful"] is True
+    assert report["receipt"]["contract"] == "cppmega_case5_domain_routes_v1"
+    assert "AUDIT PASSED" in proc.stdout
 
 
 def test_sidecar_audit_reads_large_files_by_row_group(tmp_path, monkeypatch):
@@ -385,7 +416,9 @@ def test_sidecar_audit_rejects_domain_delimiter_without_domain_sidecars(tmp_path
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert report is not None
     assert report["total"]["bad_rows"] >= 1
-    assert any("domain delimiter tokens" in err for err in report["total"]["errors"])
+    assert any(
+        "domain delimiter pairs" in err for err in report["total"]["errors"]
+    )
 
 
 def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(tmp_path):
@@ -651,3 +684,85 @@ def test_sidecar_audit_rejects_bad_trained_token_count(tmp_path):
         "trained_token_count != sum(loss_mask)" in err
         for err in report["total"]["errors"]
     )
+
+
+def test_sidecar_audit_rejects_missing_case5_column_and_bad_edge_schema(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    code_path = code_root / "8" / "code.parquet"
+    _write_tiny_parquet(code_path)
+    table = pq.read_table(code_path).drop_columns(["token_source_identity_ids"])
+    pq.write_table(table, code_path)
+
+    commit_path = commit_root / "8" / "commit.parquet"
+    _write_tiny_parquet(commit_path)
+    commit_table = pq.read_table(commit_path)
+    bad_edges = pa.array(
+        [[{"from": 0, "to": 1, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)}]]
+    )
+    commit_table = commit_table.set_column(
+        commit_table.schema.get_field_index("token_build_edges"),
+        "token_build_edges",
+        bad_edges,
+    )
+    pq.write_table(commit_table, commit_path)
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+    assert proc.returncode == 2
+    assert report["status"] == "failed"
+    assert report["receipt"]["successful"] is False
+    assert any("missing required CASE5 columns" in err for err in report["total"]["errors"])
+    assert any("token_build_edges type" in err for err in report["total"]["errors"])
+
+
+def test_sidecar_audit_rejects_wrong_edge_family_and_mismatched_delimiters(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={
+            "token_build_edges": [
+                {"from": 0, "to": 1, "kind": int(DomainEdgeKind.SHELL_PIPE)}
+            ]
+        },
+    )
+    _write_tiny_parquet(
+        commit_root / "8" / "commit.parquet",
+        input_ids=(195, 2, 3, 240, 0, 0, 0, 0),
+        target_ids=(2, 3, 240, 0, 0, 0, 0, 0),
+        extra={
+            "token_domain_ids": [2, 2, 2, 30, 0, 0, 0, 0],
+            "token_role_ids": [1, 0, 0, 1, 0, 0, 0, 0],
+            "token_confidence_ids": [4, 0, 0, 4, 0, 0, 0, 0],
+        },
+    )
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+    assert proc.returncode == 2
+    assert report["total"]["fields"]["token_build_edges"]["bad_value_rows"] >= 1
+    assert any("domain delimiter pairs" in err for err in report["total"]["errors"])
+
+
+def test_sidecar_audit_rejects_domain_or_delimiter_role_without_markers(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={
+            "token_domain_ids": [30, 0, 0, 0, 0, 0, 0, 0],
+            "token_role_ids": [1, 0, 0, 0, 0, 0, 0, 0],
+            "token_confidence_ids": [4, 0, 0, 0, 0, 0, 0, 0],
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2
+    assert any("domain delimiter pairs" in err for err in report["total"]["errors"])

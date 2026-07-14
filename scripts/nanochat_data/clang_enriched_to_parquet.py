@@ -53,7 +53,13 @@ from cppmega_mlx.data.symbol_identity import (
 )
 from cppmega_mlx.data.source_identity import (
     normalize_positive_source_ids,
-    stable_source_identity_id,
+    normalize_row_local_doc_ids,
+    source_identity,
+    validate_source_identity_registry,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     PLATFORM_IDS_COLUMN,
@@ -80,6 +86,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     TOKEN_SIBLING_INDEX_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
@@ -123,6 +130,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TIMESTAMP_COLUMN,
     TOKEN_CHANGE_MASK_POST_COLUMN,
     TOKEN_CHANGE_MASK_PRE_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
 
 def _normalize_char_domain_edges(
@@ -183,6 +191,7 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "domain_entity_ids",
     "domain_scope_ids",
     "domain_source_doc_ids",
+    "domain_source_identity_ids",
     "domain_confidence_ids",
 )
 _STATIC_DOC_TYPES = {"code", "code_header", "build"}
@@ -473,6 +482,7 @@ _SCHEMA = pa.schema([
     pa.field("domain_entity_ids", pa.list_(pa.uint32())),
     pa.field("domain_scope_ids", pa.list_(pa.uint32())),
     pa.field("domain_source_doc_ids", pa.list_(pa.uint32())),
+    pa.field("domain_source_identity_ids", pa.list_(pa.uint64())),
     pa.field("domain_confidence_ids", pa.list_(pa.uint8())),
     pa.field("domain_edges", pa.list_(pa.struct([
         pa.field("from_char", pa.int32()),
@@ -556,6 +566,7 @@ _SCHEMA = pa.schema([
     pa.field(TOKEN_ENTITY_IDS_COLUMN, pa.list_(pa.uint32())),
     pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
     pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SOURCE_IDENTITY_IDS_COLUMN, pa.list_(pa.uint64())),
     pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
@@ -610,11 +621,23 @@ _SCHEMA = pa.schema([
         pa.field("to", pa.uint32()),
         pa.field("kind", pa.int32()),
     ]))),
-], metadata={
-    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
-        REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
-    ).encode("ascii"),
-})
+    pa.field(SOURCE_IDENTITY_REGISTRY_COLUMN, pa.list_(pa.struct([
+        pa.field("source_identity_id", pa.uint64(), nullable=False),
+        pa.field("canonical_sha256", pa.string(), nullable=False),
+        pa.field("source", pa.string(), nullable=False),
+    ]))),
+])
+_SCHEMA = _SCHEMA.with_metadata(
+    {
+        SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
+            REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+        ).encode("ascii"),
+        DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
+            DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+        ),
+        b"cppmega.case5_schema": b"case5_domain_routes_v1",
+    }
+)
 
 
 def rows_to_table(
@@ -661,6 +684,7 @@ def rows_to_table(
     domain_entity_ids_col = []
     domain_scope_ids_col = []
     domain_source_doc_ids_col = []
+    domain_source_identity_ids_col = []
     domain_confidence_ids_col = []
     domain_edges_col = []
     build_edges_col = []
@@ -715,6 +739,7 @@ def rows_to_table(
     token_entity_ids_col = []
     token_scope_ids_col = []
     token_source_doc_ids_col = []
+    token_source_identity_ids_col = []
     token_confidence_ids_col = []
     token_change_mask_pre_col = []
     token_change_mask_post_col = []
@@ -733,6 +758,7 @@ def rows_to_table(
     token_shell_edges_col = []
     token_diagnostic_edges_col = []
     token_cross_domain_edges_col = []
+    source_identity_registry_col = []
 
     for row_index, (row, tokenized) in enumerate(
         zip(rows, tokenized_rows, strict=True)
@@ -848,6 +874,9 @@ def rows_to_table(
         domain_entity_ids_col.append(row.get("domain_entity_ids", []))
         domain_scope_ids_col.append(row.get("domain_scope_ids", []))
         domain_source_doc_ids_col.append(row.get("domain_source_doc_ids", []))
+        domain_source_identity_ids_col.append(
+            row.get("domain_source_identity_ids", [])
+        )
         domain_confidence_ids_col.append(row.get("domain_confidence_ids", []))
         domain_edges_col.append(
             _normalize_char_domain_edges(row.get("domain_edges", []), family="domain")
@@ -955,6 +984,9 @@ def rows_to_table(
         token_entity_ids_col.append(tokenized.get(TOKEN_ENTITY_IDS_COLUMN, []))
         token_scope_ids_col.append(tokenized.get(TOKEN_SCOPE_IDS_COLUMN, []))
         token_source_doc_ids_col.append(tokenized.get(TOKEN_SOURCE_DOC_IDS_COLUMN, []))
+        token_source_identity_ids_col.append(
+            tokenized.get(TOKEN_SOURCE_IDENTITY_IDS_COLUMN, [])
+        )
         token_confidence_ids_col.append(tokenized.get(TOKEN_CONFIDENCE_IDS_COLUMN, []))
         token_change_mask_pre_col.append(
             tokenized.get(TOKEN_CHANGE_MASK_PRE_COLUMN, row.get(TOKEN_CHANGE_MASK_PRE_COLUMN, []))
@@ -987,6 +1019,12 @@ def rows_to_table(
         token_shell_edges_col.append(tokenized.get(TOKEN_SHELL_EDGES_COLUMN, []))
         token_diagnostic_edges_col.append(tokenized.get(TOKEN_DIAGNOSTIC_EDGES_COLUMN, []))
         token_cross_domain_edges_col.append(tokenized.get(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, []))
+        source_identity_registry_col.append(
+            tokenized.get(
+                SOURCE_IDENTITY_REGISTRY_COLUMN,
+                row.get(SOURCE_IDENTITY_REGISTRY_COLUMN, []),
+            )
+        )
 
     return pa.table(
         {
@@ -1080,6 +1118,10 @@ def rows_to_table(
             "domain_source_doc_ids": pa.array(
                 domain_source_doc_ids_col,
                 type=_SCHEMA.field("domain_source_doc_ids").type,
+            ),
+            "domain_source_identity_ids": pa.array(
+                domain_source_identity_ids_col,
+                type=_SCHEMA.field("domain_source_identity_ids").type,
             ),
             "domain_confidence_ids": pa.array(
                 domain_confidence_ids_col,
@@ -1243,6 +1285,10 @@ def rows_to_table(
                 token_source_doc_ids_col,
                 type=_SCHEMA.field(TOKEN_SOURCE_DOC_IDS_COLUMN).type,
             ),
+            TOKEN_SOURCE_IDENTITY_IDS_COLUMN: pa.array(
+                token_source_identity_ids_col,
+                type=_SCHEMA.field(TOKEN_SOURCE_IDENTITY_IDS_COLUMN).type,
+            ),
             TOKEN_CONFIDENCE_IDS_COLUMN: pa.array(
                 token_confidence_ids_col,
                 type=_SCHEMA.field(TOKEN_CONFIDENCE_IDS_COLUMN).type,
@@ -1310,6 +1356,10 @@ def rows_to_table(
             TOKEN_CROSS_DOMAIN_EDGES_COLUMN: pa.array(
                 token_cross_domain_edges_col,
                 type=_SCHEMA.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN).type,
+            ),
+            SOURCE_IDENTITY_REGISTRY_COLUMN: pa.array(
+                source_identity_registry_col,
+                type=_SCHEMA.field(SOURCE_IDENTITY_REGISTRY_COLUMN).type,
             ),
         },
         schema=_SCHEMA,
@@ -1610,13 +1660,35 @@ def process_record_with_policy(
         )
 
     full_sids = [0] * header_len + filtered_structure_ids
-    source_identity_id = stable_source_identity_id(record)
+    source_identity_registry = [
+        dict(entry) for entry in record.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
+    ]
+    if source_identity_registry:
+        validated_registry = validate_source_identity_registry(source_identity_registry)
+        source_identity_id = next(iter(validated_registry))
+    else:
+        identity = source_identity(record)
+        source_identity_registry = [identity.as_dict()]
+        source_identity_id = identity.source_identity_id
     char_metadata: dict[str, list[int]] = {}
     for key in _CHAR_LEVEL_METADATA_FIELDS:
         values = record.get(key, [])
         if metadata_stale:
             remapped = _remap_optional_char_metadata(values, kept_indices, len(text))
             if key == "domain_source_doc_ids":
+                remapped = normalize_row_local_doc_ids(
+                    remapped,
+                    length=len(filtered_text),
+                    fallback_doc_id=1,
+                )
+                char_metadata[key] = [remapped[0] if remapped else 1] * header_len + remapped
+            elif key == "domain_source_identity_ids":
+                if len(source_identity_registry) > 1 and (
+                    not remapped or any(int(value) == 0 for value in remapped)
+                ):
+                    raise ValueError(
+                        "multi-source document lost exact character source identities"
+                    )
                 remapped = normalize_positive_source_ids(
                     remapped,
                     length=len(filtered_text),
@@ -1628,6 +1700,19 @@ def process_record_with_policy(
         else:
             aligned = _align_optional_char_metadata(values, len(filtered_text))
             if key == "domain_source_doc_ids":
+                aligned = normalize_row_local_doc_ids(
+                    aligned,
+                    length=len(filtered_text),
+                    fallback_doc_id=1,
+                )
+                char_metadata[key] = [aligned[0] if aligned else 1] * header_len + aligned
+            elif key == "domain_source_identity_ids":
+                if len(source_identity_registry) > 1 and (
+                    not aligned or any(int(value) == 0 for value in aligned)
+                ):
+                    raise ValueError(
+                        "multi-source document is missing exact character source identities"
+                    )
                 aligned = normalize_positive_source_ids(
                     aligned,
                     length=len(filtered_text),
@@ -1648,6 +1733,10 @@ def process_record_with_policy(
         }
         for cb in filtered_chunk_boundaries
     ]
+    validate_source_identity_registry(
+        source_identity_registry,
+        referenced_ids=char_metadata.get("domain_source_identity_ids", []),
+    )
 
     combined = {
         **{k: v for k, v in record.items()
@@ -1663,6 +1752,7 @@ def process_record_with_policy(
         # tokenized text exactly.
         "source_text": full_text,
         "source_identity_id": source_identity_id,
+        SOURCE_IDENTITY_REGISTRY_COLUMN: source_identity_registry,
         "structure_ids": full_sids,
         "chunk_boundaries": adjusted_chunks,
         "call_edges": filtered_call_edges,

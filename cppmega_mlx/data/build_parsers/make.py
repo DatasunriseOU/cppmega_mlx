@@ -23,6 +23,17 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
 
     for line_no, raw_line in enumerate(text.splitlines()):
         line_indices = doc.token_indices_on_line(line_no)
+        comment_offset = next(
+            (
+                idx
+                for idx, char in enumerate(raw_line)
+                if char == "#" and (idx == 0 or raw_line[idx - 1] != "\\")
+            ),
+            len(raw_line),
+        )
+        line_indices = [
+            idx for idx in line_indices if doc.tokens[idx].column < comment_offset
+        ]
         if not line_indices:
             continue
         stripped = raw_line.lstrip()
@@ -54,10 +65,20 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
                 next_entity += 1
             continue
 
-        colon_idx = next((i for i in line_indices if doc.tokens[i].text == ":"), None)
+        colon_idx = next(
+            (i for i in line_indices if doc.tokens[i].text in {":", "::"}),
+            None,
+        )
         if colon_idx is not None:
             targets = [i for i in line_indices if i < colon_idx]
-            prereqs = [i for i in line_indices if i > colon_idx]
+            prereqs: list[int] = []
+            for token_idx in (i for i in line_indices if i > colon_idx):
+                value = doc.tokens[token_idx].text
+                if value == ";":
+                    break
+                if value in {"|", "||", ".WAIT"}:
+                    continue
+                prereqs.append(token_idx)
             if targets:
                 current_target = targets[0]
                 doc.set_role(current_target, DomainRoleKind.TARGET, entity=next_entity)

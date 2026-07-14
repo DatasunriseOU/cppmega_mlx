@@ -19,7 +19,9 @@ from cppmega_mlx.data.domain_schema import (
 )
 from cppmega_mlx.data.source_identity import (
     normalize_positive_source_ids,
-    stable_source_identity_id,
+    normalize_row_local_doc_ids,
+    source_identity,
+    validate_source_identity_registry,
 )
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
@@ -61,12 +63,14 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SIBLING_INDEX_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
     TOKEN_CHANGE_MASK_POST_COLUMN,
     TOKEN_CHANGE_MASK_PRE_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
 
 _KIND_STR_TO_INT = {
@@ -550,6 +554,7 @@ def _insert_domain_delimiter_pair(
         TOKEN_ENTITY_IDS_COLUMN: (0, 0),
         TOKEN_SCOPE_IDS_COLUMN: (0, 0),
         TOKEN_SOURCE_DOC_IDS_COLUMN: (0, 0),
+        TOKEN_SOURCE_IDENTITY_IDS_COLUMN: (0, 0),
         TOKEN_CONFIDENCE_IDS_COLUMN: (exact_confidence, exact_confidence),
     }
     for column, marker_values in dense_defaults.items():
@@ -561,7 +566,10 @@ def _insert_domain_delimiter_pair(
                 f"{column} length {len(values)} does not match token count {token_count_before}"
             )
         start_marker, end_marker = marker_values
-        if column == TOKEN_SOURCE_DOC_IDS_COLUMN and values:
+        if column in {
+            TOKEN_SOURCE_DOC_IDS_COLUMN,
+            TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
+        } and values:
             start_source_idx = min(start_at, token_count_before - 1)
             end_source_idx = max(0, min(end_at - 1, token_count_before - 1))
             start_marker = int(values[start_source_idx])
@@ -833,14 +841,42 @@ def materialize_tokenized_enriched_batch(
             ("edit_op_per_char", "token_edit_op", EDIT_OP_PER_TOKEN_COLUMN),
             token_spans,
         )
-        token_source_doc_ids = normalize_positive_source_ids(
+        registry_entries = [
+            dict(entry) for entry in doc.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
+        ]
+        if not registry_entries:
+            resolved_identity = source_identity(doc)
+            registry_entries = [resolved_identity.as_dict()]
+        fallback_identity_id = int(registry_entries[0]["source_identity_id"])
+        token_source_doc_ids = normalize_row_local_doc_ids(
             _chars_to_tokens_structure_ids(
                 doc.get("domain_source_doc_ids", doc.get("source_doc_ids", [])),
                 "",
                 token_spans,
             ),
             length=len(token_ids),
-            fallback_source_id=stable_source_identity_id(doc),
+            fallback_doc_id=1,
+        )
+        raw_token_source_identity_ids = _chars_to_tokens_structure_ids(
+            doc.get("domain_source_identity_ids", []),
+            "",
+            token_spans,
+        )
+        if len(registry_entries) > 1 and (
+            not raw_token_source_identity_ids
+            or any(int(value) == 0 for value in raw_token_source_identity_ids)
+        ):
+            raise ValueError(
+                "multi-source document is missing exact token source identities"
+            )
+        token_source_identity_ids = normalize_positive_source_ids(
+            raw_token_source_identity_ids,
+            length=len(token_ids),
+            fallback_source_id=fallback_identity_id,
+        )
+        validate_source_identity_registry(
+            registry_entries,
+            referenced_ids=token_source_identity_ids,
         )
 
         row: dict[str, Any] = {
@@ -904,6 +940,7 @@ def materialize_tokenized_enriched_batch(
                 token_spans,
             ),
             TOKEN_SOURCE_DOC_IDS_COLUMN: token_source_doc_ids,
+            TOKEN_SOURCE_IDENTITY_IDS_COLUMN: token_source_identity_ids,
             TOKEN_CONFIDENCE_IDS_COLUMN: _chars_to_tokens_structure_ids(
                 doc.get("domain_confidence_ids", doc.get("confidence_ids", [])),
                 "",
@@ -947,6 +984,7 @@ def materialize_tokenized_enriched_batch(
                 column: token_batches[doc_index]
                 for column, token_batches in objective_token_batches.items()
             },
+            SOURCE_IDENTITY_REGISTRY_COLUMN: registry_entries,
         }
         row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
         _insert_embedded_domain_delimiters(row, doc=doc, token_spans=token_spans)

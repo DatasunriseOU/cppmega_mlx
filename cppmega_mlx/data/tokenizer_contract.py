@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
 from pathlib import Path
 
@@ -98,6 +99,14 @@ def _derive_domain_delimiter_token_ids(contract: Mapping[str, object]) -> dict[s
 DOMAIN_DELIMITER_TOKEN_IDS = _derive_domain_delimiter_token_ids(
     _read_contract(_TOKENIZER_CONTRACT_PATH)
 )
+DOMAIN_DELIMITER_CONTRACT_METADATA_KEY = "cppmega.domain_delimiter_contract_sha256"
+DOMAIN_DELIMITER_CONTRACT_SHA256 = hashlib.sha256(
+    json.dumps(
+        DOMAIN_DELIMITER_TOKEN_IDS,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 SpecialTokenMapping = Mapping[int, str] | Mapping[str, int]
 
@@ -205,6 +214,8 @@ def _is_int_key(value: object) -> bool:
 __all__ = [
     "DOMAIN_DELIMITER_TOKEN_IDS",
     "OBJECTIVE_BOUNDARY_TOKEN_IDS",
+    "DOMAIN_DELIMITER_CONTRACT_METADATA_KEY",
+    "DOMAIN_DELIMITER_CONTRACT_SHA256",
     "REQUIRED_SPECIAL_TOKEN_IDS",
     "SpecialTokenMapping",
     "TOOL_USE_SPECIAL_TOKEN_IDS",

@@ -48,6 +48,9 @@ def _load_schema_contracts():
     tokenizer = load(
         "_cppmega_audit_tokenizer_contract", data_dir / "tokenizer_contract.py"
     )
+    source_identity = load(
+        "_cppmega_audit_source_identity", data_dir / "source_identity.py"
+    )
     data_name = "cppmega_mlx.data"
     tokenizer_name = f"{data_name}.tokenizer_contract"
     missing = object()
@@ -83,7 +86,12 @@ def _load_schema_contracts():
         domain.ParseConfidence,
         domain.DOMAIN_EDGE_FAMILIES,
         domain.DOMAIN_DELIMITER_ROLES,
+        domain.TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+        domain.validate_domain_edge_kind,
         tokenizer.DOMAIN_DELIMITER_TOKEN_IDS,
+        tokenizer.DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+        tokenizer.DOMAIN_DELIMITER_CONTRACT_SHA256,
+        source_identity.validate_source_identity_registry,
     )
 
 
@@ -94,7 +102,12 @@ def _load_schema_contracts():
     ParseConfidence,
     DOMAIN_EDGE_FAMILIES,
     DOMAIN_DELIMITER_ROLES,
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    validate_domain_edge_kind,
     DOMAIN_DELIMITER_TOKEN_IDS,
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+    validate_source_identity_registry,
 ) = _load_schema_contracts()
 
 _EDGE_FAMILY_BY_FIELD = {
@@ -138,6 +151,7 @@ TOKEN_ALIGNED_FIELDS = (
     "token_entity_ids",
     "token_scope_ids",
     "token_source_doc_ids",
+    "token_source_identity_ids",
     "token_confidence_ids",
     "token_platform_ids",
     "token_structure_ids",
@@ -173,9 +187,94 @@ LIST_FIELDS = (
     "token_cross_domain_edges",
     "changed_chunk_ids",
     "changed_chunk_spans",
+    "source_identity_registry",
 )
 
 ALL_FIELDS = (*TOKEN_COLUMNS, *SOURCE_COLUMNS, *TOKEN_ALIGNED_FIELDS, *CHUNK_ALIGNED_FIELDS, *LIST_FIELDS)
+
+CASE5_REQUIRED_COLUMNS = frozenset(
+    {
+        *TOKEN_COLUMNS,
+        "valid_token_count",
+        "trained_token_count",
+        "num_docs",
+        "source_doc_token_lengths",
+        "token_domain_ids",
+        "token_role_ids",
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_source_doc_ids",
+        "token_source_identity_ids",
+        "token_confidence_ids",
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+        "token_call_edges",
+        "token_type_edges",
+        "token_domain_edges",
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+        "token_chunk_starts",
+        "token_chunk_ends",
+        "token_chunk_kinds",
+        "token_chunk_dep_levels",
+        "source_identity_registry",
+    }
+)
+
+_EDGE_PAIR_TYPE = pa.list_(
+    pa.struct(
+        [
+            pa.field("from", pa.uint16()),
+            pa.field("to", pa.uint16()),
+        ]
+    )
+)
+_EDGE_TRIPLE_TYPE = pa.list_(
+    pa.struct(
+        [
+            pa.field("from", pa.uint32()),
+            pa.field("to", pa.uint32()),
+            pa.field("kind", pa.int32()),
+        ]
+    )
+)
+_SOURCE_IDENTITY_REGISTRY_TYPE = pa.list_(
+    pa.struct(
+        [
+            pa.field("source_identity_id", pa.uint64(), nullable=False),
+            pa.field("canonical_sha256", pa.string(), nullable=False),
+            pa.field("source", pa.string(), nullable=False),
+        ]
+    )
+)
+CASE5_ARROW_TYPES = {
+    "doc_ids": pa.list_(pa.uint32()),
+    "token_source_doc_ids": pa.list_(pa.uint32()),
+    "token_source_identity_ids": pa.list_(pa.uint64()),
+    "token_symbol_ids": pa.list_(pa.uint64()),
+    "token_call_targets": pa.list_(pa.uint64()),
+    "token_type_refs": pa.list_(pa.uint64()),
+    "token_domain_ids": pa.list_(pa.uint16()),
+    "token_role_ids": pa.list_(pa.uint16()),
+    "token_entity_ids": pa.list_(pa.uint32()),
+    "token_scope_ids": pa.list_(pa.uint32()),
+    "token_confidence_ids": pa.list_(pa.uint8()),
+    "token_call_edges": _EDGE_PAIR_TYPE,
+    "token_type_edges": _EDGE_PAIR_TYPE,
+    "token_domain_edges": _EDGE_TRIPLE_TYPE,
+    "token_build_edges": _EDGE_TRIPLE_TYPE,
+    "token_shell_edges": _EDGE_TRIPLE_TYPE,
+    "token_diagnostic_edges": _EDGE_TRIPLE_TYPE,
+    "token_cross_domain_edges": _EDGE_TRIPLE_TYPE,
+    "token_chunk_starts": pa.list_(pa.uint32()),
+    "token_chunk_ends": pa.list_(pa.uint32()),
+    "token_chunk_kinds": pa.list_(pa.uint8()),
+    "token_chunk_dep_levels": pa.list_(pa.uint16()),
+    "source_identity_registry": _SOURCE_IDENTITY_REGISTRY_TYPE,
+}
 
 _DIAGNOSTIC_DOMAIN_IDS = {
     int(domain) for domain in DomainKind if int(domain) >= 40
@@ -190,6 +289,17 @@ _DIAGNOSTIC_DELIMITER_IDS = np.asarray(
     ],
     dtype=np.int64,
 )
+
+_DELIMITER_BY_TOKEN_ID: dict[int, tuple[int, bool]] = {}
+for _domain, (_start_role, _end_role) in DOMAIN_DELIMITER_ROLES.items():
+    _DELIMITER_BY_TOKEN_ID[DOMAIN_DELIMITER_TOKEN_IDS[_start_role]] = (
+        int(_domain),
+        True,
+    )
+    _DELIMITER_BY_TOKEN_ID[DOMAIN_DELIMITER_TOKEN_IDS[_end_role]] = (
+        int(_domain),
+        False,
+    )
 
 
 @dataclass
@@ -331,22 +441,56 @@ def _validate_positive_valid_token_source_ids(
     column: Any,
     valid: np.ndarray,
     row_bad: np.ndarray,
-    path: str,
+    path: str | Path,
+    field: str = "token_source_doc_ids",
+    max_value: int = (1 << 32) - 1,
 ) -> None:
     bad_rows = 0
     for row_idx, values in enumerate(column.to_pylist()):
         limit = int(valid[row_idx])
         valid_values = list(values or [])[:limit]
         if len(valid_values) != limit or any(
-            (value := _as_int(raw)) is None or value <= 0 or value > (1 << 32) - 1
+            (value := _as_int(raw)) is None or value <= 0 or value > max_value
             for raw in valid_values
         ):
             row_bad[row_idx] = True
             bad_rows += 1
     if bad_rows:
-        stats.field_stats["token_source_doc_ids"].bad_value_rows += bad_rows
+        stats.field_stats[field].bad_value_rows += bad_rows
         stats.errors.append(
-            f"{path}: {bad_rows} rows have zero/invalid source ids on valid tokens"
+            f"{path}: {bad_rows} rows have zero/invalid {field} on valid tokens"
+        )
+
+
+def _validate_source_identity_foreign_keys(
+    *,
+    stats: AuditStats,
+    identity_column: Any,
+    registry_column: Any,
+    valid: np.ndarray,
+    row_bad: np.ndarray,
+    path: str,
+) -> None:
+    bad_rows = 0
+    for row_idx, (identity_values, registry_entries) in enumerate(
+        zip(
+            identity_column.to_pylist(),
+            registry_column.to_pylist(),
+            strict=True,
+        )
+    ):
+        try:
+            validate_source_identity_registry(
+                registry_entries or [],
+                referenced_ids=(identity_values or [])[: int(valid[row_idx])],
+            )
+        except (TypeError, ValueError):
+            row_bad[row_idx] = True
+            bad_rows += 1
+    if bad_rows:
+        stats.field_stats["source_identity_registry"].bad_value_rows += bad_rows
+        stats.errors.append(
+            f"{path}: {bad_rows} rows have invalid source identity registry/FKs"
         )
 
 
@@ -694,17 +838,25 @@ def _edge_triple_stats_and_validate(
         stats.edge_count[field] = stats.edge_count.get(field, 0) + len(edges)
         limit = int(valid_lengths[idx]) if idx < len(valid_lengths) else 0
         family = _EDGE_FAMILY_BY_FIELD[field]
-        allowed_kinds = _EDGE_KIND_IDS_BY_FAMILY[family]
         source_ids = list(_iter_or_empty(source_doc_rows[idx]))
         for edge in edges:
             src, dst, kind = _flatten_edge_triple(edge)
+            valid_kind = True
+            if kind is not None:
+                try:
+                    validate_domain_edge_kind(
+                        kind,
+                        family=_EDGE_FAMILY_BY_FIELD[field],
+                    )
+                except (TypeError, ValueError):
+                    valid_kind = False
             if (
                 src is None
                 or dst is None
                 or kind is None
                 or src < 0
                 or dst < 0
-                or kind not in allowed_kinds
+                or not valid_kind
                 or src >= limit
                 or dst >= limit
                 or src >= len(source_ids)
@@ -745,8 +897,8 @@ def _validate_domain_delimiter_sidecars(
         row_bad |= rows_with_delimiter
         missing = [name for name in required if name not in names]
         stats.errors.append(
-            f"{int(np.count_nonzero(rows_with_delimiter))} rows contain domain delimiter tokens "
-            f"but missing sidecars: {missing}"
+            f"{int(np.count_nonzero(rows_with_delimiter))} rows contain domain "
+            f"delimiter tokens but missing sidecars: {missing}"
         )
         return
     if "token_role_ids" not in names:
@@ -765,6 +917,7 @@ def _validate_domain_delimiter_sidecars(
     domain_rows = table.column("token_domain_ids").to_pylist()
     role_rows = table.column("token_role_ids").to_pylist()
     confidence_rows = table.column("token_confidence_ids").to_pylist()
+    malformed_rows = 0
     for row_index, (tokens, domains, roles, confidence) in enumerate(
         zip(token_rows, domain_rows, role_rows, confidence_rows, strict=True)
     ):
@@ -782,8 +935,11 @@ def _validate_domain_delimiter_sidecars(
         ):
             marker = _DOMAIN_DELIMITER_BY_ID.get(int(token_id))
             if marker is None:
+                expected_domain = stack[-1][0] if stack else int(DomainKind.UNKNOWN)
                 if int(role_id) == int(DomainRoleKind.DELIMITER):
                     bad_fields.add("token_role_ids")
+                if int(domain_id) != expected_domain:
+                    bad_fields.add("token_domain_ids")
                 continue
             expected_domain, direction, expected_close = marker
             if int(domain_id) != expected_domain:
@@ -802,8 +958,13 @@ def _validate_domain_delimiter_sidecars(
             bad_fields.add("token_role_ids")
         if bad_fields:
             row_bad[row_index] = True
+            malformed_rows += 1
             for field in bad_fields:
                 stats.field_stats[field].bad_value_rows += 1
+    if malformed_rows:
+        stats.errors.append(
+            f"{malformed_rows} rows have malformed/mismatched domain delimiter pairs"
+        )
 
 
 def _validate_token_source_doc_ids(
@@ -915,7 +1076,7 @@ def _validate_diagnostic_rows_have_edges_or_raw(
 def _audit_table(
     *,
     path: Path,
-    table: object,
+    table: Any,
     names: set[str],
     expected_len: int | None,
     vocab_size: int | None,
@@ -1055,6 +1216,34 @@ def _audit_table(
             valid_lengths=valid,
             row_bad=row_bad,
         )
+        if "token_source_identity_ids" in names:
+            _validate_positive_valid_token_source_ids(
+                stats=stats,
+                column=table.column("token_source_identity_ids"),
+                valid=valid,
+                row_bad=row_bad,
+                path=path,
+                field="token_source_identity_ids",
+                max_value=(1 << 64) - 1,
+            )
+        if "source_identity_registry" in names:
+            _add_generic_list_stats(
+                stats,
+                "source_identity_registry",
+                table.column("source_identity_registry"),
+            )
+        if {
+            "token_source_identity_ids",
+            "source_identity_registry",
+        } <= names:
+            _validate_source_identity_foreign_keys(
+                stats=stats,
+                identity_column=table.column("token_source_identity_ids"),
+                registry_column=table.column("source_identity_registry"),
+                valid=valid,
+                row_bad=row_bad,
+                path=str(path),
+            )
 
         for name in SOURCE_COLUMNS:
             if name in names:
@@ -1208,6 +1397,30 @@ def _audit_table(
     return stats
 
 
+def _case5_schema_errors(path: Path, schema: pa.Schema) -> list[str]:
+    errors: list[str] = []
+    names = set(schema.names)
+    missing = sorted(CASE5_REQUIRED_COLUMNS - names)
+    if missing:
+        errors.append(f"{path}: missing required CASE5 columns: {missing}")
+    for name, expected_type in CASE5_ARROW_TYPES.items():
+        if name in names and schema.field(name).type != expected_type:
+            errors.append(
+                f"{path}: {name} type {schema.field(name).type} != {expected_type}"
+            )
+    metadata = schema.metadata or {}
+    actual_digest = metadata.get(
+        DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")
+    )
+    if actual_digest != DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"):
+        errors.append(
+            f"{path}: tokenizer/domain delimiter contract digest missing or mismatched"
+        )
+    if metadata.get(b"cppmega.case5_schema") != b"case5_domain_routes_v1":
+        errors.append(f"{path}: missing cppmega.case5_schema receipt metadata")
+    return errors
+
+
 def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -> dict[str, Any]:
     path = Path(path_str)
     stats = AuditStats(files=1)
@@ -1217,7 +1430,12 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
         cols = [name for name in ALL_FIELDS if name in top_level_names]
         cols += [
             name
-            for name in ("valid_token_count", "trained_token_count", "slack_tokens")
+            for name in (
+                "valid_token_count",
+                "trained_token_count",
+                "slack_tokens",
+                "num_docs",
+            )
             if name in top_level_names
         ]
     except Exception as exc:
@@ -1226,6 +1444,10 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
         ) from exc
 
     names = set(cols)
+    schema_errors = _case5_schema_errors(path, pf.schema_arrow)
+    if schema_errors:
+        stats.bad_files = 1
+        stats.errors.extend(schema_errors)
     for name in ALL_FIELDS:
         if name not in names:
             stats.field_stats[name].missing_files += 1
@@ -1254,6 +1476,9 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
                     vocab_size=vocab_size,
                 )
             )
+
+    if stats.bad_rows:
+        stats.bad_files = 1
 
     return {
         "kind": kind,
@@ -1429,6 +1654,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"audited {idx}/{len(futures)} parquet files", flush=True)
 
     report = _rollup(results)
+    has_bad = bool(report["total"]["bad_files"] or report["total"]["bad_rows"])
+    status = "overridden" if has_bad and args.allow_bad else "failed" if has_bad else "passed"
+    report["status"] = status
+    report["receipt"] = {
+        "contract": "cppmega_case5_domain_routes_v1",
+        "status": status,
+        "successful": status == "passed",
+        "tokenizer_domain_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        "files": report["total"]["files"],
+        "rows": report["total"]["rows"],
+        "valid_tokens": report["total"]["valid_tokens"],
+    }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "sidecar_parquet_audit.json").write_text(json.dumps(report, indent=2))
     _write_md(report, args.out_dir / "sidecar_parquet_audit.md")
@@ -1439,8 +1676,8 @@ def main(argv: list[str] | None = None) -> int:
         "capacity_tokens": report["total"]["capacity_tokens"],
         "bad_files": report["total"]["bad_files"],
         "bad_rows": report["total"]["bad_rows"],
+        "status": status,
     }, indent=2))
-    has_bad = bool(report["total"]["bad_files"] or report["total"]["bad_rows"])
     if has_bad and not args.allow_bad:
         # FAIL-CLOSED default: block the upload by exiting non-zero.
         print(
@@ -1451,6 +1688,10 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         return 2
+    if has_bad:
+        print("AUDIT OVERRIDDEN: receipt is not successful", flush=True)
+    else:
+        print("AUDIT PASSED: successful CASE5 receipt written", flush=True)
     return 0
 
 

@@ -113,12 +113,36 @@ def parse_test_output(text: str, *, tool: str = "test") -> ParsedDomainDocument:
         confidence=ParseConfidence.HEURISTIC if text.strip() else ParseConfidence.RAW,
     )
     doc.metadata["parser_adapter"] = "test-output"
+    doc.metadata["result_status"] = severity
 
     primary_idx: int | None = None
     for idx, token in enumerate(doc.tokens):
         if token.text.upper() in {"FAILED", "FAIL", "ERROR"}:
             doc.set_role(idx, DomainRoleKind.SEVERITY)
             primary_idx = primary_idx if primary_idx is not None else idx
+
+    result_counts: list[dict[str, int | str]] = []
+    seen_result_edges: set[tuple[int, int]] = set()
+    for pattern in (_STATUS_COUNT_RE, _STATUS_FIRST_COUNT_RE):
+        for match in pattern.finditer(text):
+            status_idx = _token_at_span(doc, *match.span("status"))
+            count_idx = _token_at_span(doc, *match.span("count"))
+            if status_idx is None or count_idx is None:
+                continue
+            doc.set_role(status_idx, DomainRoleKind.SEVERITY)
+            doc.set_role(count_idx, DomainRoleKind.MESSAGE)
+            edge = (status_idx, count_idx)
+            if edge not in seen_result_edges:
+                doc.add_edge(status_idx, count_idx, DomainEdgeKind.TOOL_ACTION_RESULT)
+                seen_result_edges.add(edge)
+            primary_idx = primary_idx if primary_idx is not None else status_idx
+            result_counts.append(
+                {
+                    "status": match.group("status").lower(),
+                    "count": int(match.group("count")),
+                }
+            )
+    doc.metadata["result_counts"] = result_counts
 
     test_name_idx: int | None = None
     for match in _TEST_NAME_RE.finditer(text):

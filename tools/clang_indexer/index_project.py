@@ -66,7 +66,7 @@ from cppmega_mlx.data.symbol_identity import (
     compute_symbol_id,
     require_project_identity,
 )
-from cppmega_mlx.data.source_identity import stable_source_identity_for_path
+from cppmega_mlx.data.source_identity import source_identity_for_path
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
@@ -276,7 +276,8 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
 # chunks may append a 7th element with scanner provenance so domain route edges
 # point to the precise conditional/redefinition/include-order macro nodes rather
 # than being re-derived from assembled text. Symbol-bearing chunks may append an
-# 8th element with canonical identity metadata. Builders accept all forms.
+# 8th element with canonical identity metadata and a 9th source-path field.
+# Builders accept all historical forms.
 PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
     str, int, int, str, str | None, str | None
 ] | tuple[
@@ -289,7 +290,26 @@ PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
     str | None,
     str | None,
     dict[str, object] | None,
+    str,
+] | tuple[
+    str,
+    int,
+    int,
+    str,
+    str | None,
+    str | None,
     dict[str, object] | None,
+    dict[str, object] | None,
+] | tuple[
+    str,
+    int,
+    int,
+    str,
+    str | None,
+    str | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
+    str,
 ]
 SymbolReference: TypeAlias = dict[str, object]
 
@@ -354,6 +374,7 @@ def _function_part(
             usr=func.usr,
             kind=func.symbol_kind,
         ),
+        func.file,
     )
 
 
@@ -374,6 +395,7 @@ def _typedef_part(td: "TypeDef") -> PartInfo:
             usr=td.usr,
             kind=td.symbol_kind,
         ),
+        td.file,
     )
 
 
@@ -393,6 +415,7 @@ def _macro_part(macro: "MacroDef") -> PartInfo:
             canonical_signature="(" + ",".join(macro.params) + ")",
             kind="MACRO_DEFINITION",
         ),
+        macro.file,
     )
 
 
@@ -414,6 +437,10 @@ def _global_symbol_part(record: dict[str, object], dep_level: int) -> PartInfo:
             kind=str(record.get("symbol_kind") or ""),
             provider=str(record.get("provider") or ""),
             include_provenance=str(record.get("include_provenance") or ""),
+        ),
+        str(
+            record.get("file")
+            or f"crosslib://{record.get('base_repo')}/{qname}"
         ),
     )
 
@@ -499,6 +526,37 @@ def _semantic_identity_records_for_arrays(
     }
     registry.require_ids(used_ids, source=source)
     return registry.records(used_ids)
+
+
+def _part_source_path(
+    part: tuple,
+    index: "ProjectIndex",
+    fallback: str,
+) -> str:
+    explicit = (
+        part[8]
+        if len(part) >= 9
+        else part[7]
+        if len(part) >= 8 and isinstance(part[7], str)
+        else None
+    )
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    metadata = _part_macro_provenance(part)
+    if metadata is not None and isinstance(metadata.get("file"), str):
+        return cast(str, metadata["file"])
+    symbol_key = _part_symbol_key(part)
+    qname = part[4] if len(part) >= 5 else None
+    if symbol_key or isinstance(qname, str):
+        function_key = index.resolve_function_key(symbol_key or qname)
+        function = index.functions.get(function_key) if function_key else None
+        if function is not None:
+            return function.file
+        type_key = index.resolve_type_key(symbol_key or qname)
+        typedef = index.typedefs.get(type_key) if type_key else None
+        if typedef is not None:
+            return typedef.file
+    return fallback
 
 
 # C++ source file extensions
@@ -2465,9 +2523,11 @@ def find_build_files(
             filepath = os.path.join(root, fname)
             try:
                 if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
-                    continue
-            except OSError:
-                continue
+                    raise ValueError(
+                        f"build/domain input exceeds {BUILD_FILE_SIZE_CAP}-byte limit: {filepath}"
+                    )
+            except OSError as exc:
+                raise OSError(f"failed to stat build/domain input {filepath}: {exc}") from exc
             files.append((filepath, build_kind))
     return files
 
@@ -2475,17 +2535,20 @@ def find_build_files(
 def _classify_shell_file(filepath: str, fname: str) -> str | None:
     if classify_build_file(fname) is not None:
         return None
+    extension_kind = SHELL_EXT_KINDS.get(os.path.splitext(fname)[1].lower())
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
             first_line = fh.readline(512).lower()
-    except OSError:
+    except OSError as exc:
+        if extension_kind is not None:
+            raise OSError(f"failed to read shell/domain input {filepath}: {exc}") from exc
         return None
     if first_line.startswith("#!"):
         words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
         for shell in ("tcsh", "csh", "zsh", "bash", "sh"):
             if shell in words:
                 return "tcsh" if shell == "csh" else shell
-    return SHELL_EXT_KINDS.get(os.path.splitext(fname)[1].lower())
+    return extension_kind
 
 
 def find_shell_files(
@@ -2505,9 +2568,11 @@ def find_shell_files(
                 continue
             try:
                 if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
-                    continue
-            except OSError:
-                continue
+                    raise ValueError(
+                        f"shell/domain input exceeds {BUILD_FILE_SIZE_CAP}-byte limit: {filepath}"
+                    )
+            except OSError as exc:
+                raise OSError(f"failed to stat shell/domain input {filepath}: {exc}") from exc
             files.append((filepath, shell_kind))
     return files
 
@@ -3738,6 +3803,8 @@ def _cpp_domain_sidecars(
     index: ProjectIndex | None = None,
     *,
     source_doc_id: int | None = None,
+    source_path: str = "assembled.cpp",
+    fragment_sources: list[tuple[int, int, str, int]] | None = None,
     macro_parts: list[dict[str, object]] | None = None,
     macro_invocations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -3757,10 +3824,7 @@ def _cpp_domain_sidecars(
     )
 
     text_len = len(text)
-    resolved_source_doc_id = source_doc_id or stable_source_identity_for_path(
-        "assembled.cpp",
-        text=text,
-    )
+    resolved_source_doc_id = int(source_doc_id or 1)
     domain = int(DomainKind.CPP)
     role_ids = [0] * text_len
     entity_ids = [0] * text_len
@@ -4121,10 +4185,31 @@ def _cpp_domain_sidecars(
     from cppmega_mlx.data.domain_ingestion import parse_domain_document
 
     lexical = parse_domain_document(
-        "source.cpp",
+        source_path,
         text,
         source_doc_id=resolved_source_doc_id,
     ).to_enriched_document()
+    if fragment_sources:
+        source_doc_ids = [0] * text_len
+        source_identity_ids = [0] * text_len
+        registry: dict[int, dict[str, int | str]] = {}
+        for start, end, fragment_path, row_local_id in fragment_sources:
+            identity = source_identity_for_path(fragment_path)
+            entry = identity.as_dict()
+            previous = registry.get(identity.source_identity_id)
+            if previous is not None and previous != entry:
+                raise ValueError(
+                    f"source identity uint64 collision for id {identity.source_identity_id}"
+                )
+            registry[identity.source_identity_id] = entry
+            for char_idx in range(max(0, start), min(end, text_len)):
+                source_doc_ids[char_idx] = int(row_local_id)
+                source_identity_ids[char_idx] = identity.source_identity_id
+        if any(value == 0 for value in source_doc_ids + source_identity_ids):
+            raise ValueError("assembled source provenance does not cover every character")
+        lexical["domain_source_doc_ids"] = source_doc_ids
+        lexical["domain_source_identity_ids"] = source_identity_ids
+        lexical["source_identity_registry"] = list(registry.values())
     lexical_domains = cast(list[int], lexical["domain_ids"])
     lexical_roles = cast(list[int], lexical["domain_role_ids"])
     lexical_entities = cast(list[int], lexical["domain_entity_ids"])
@@ -4155,7 +4240,9 @@ def _cpp_domain_sidecars(
         "domain_role_ids": role_ids,
         "domain_entity_ids": entity_ids,
         "domain_scope_ids": [0] * text_len,
-        "domain_source_doc_ids": [int(resolved_source_doc_id)] * text_len,
+        "domain_source_doc_ids": lexical["domain_source_doc_ids"],
+        "domain_source_identity_ids": lexical["domain_source_identity_ids"],
+        "source_identity_registry": lexical["source_identity_registry"],
         "domain_confidence_ids": confidence_ids,
         "domain_edges": deduped_domain_edges,
         "build_edges": [],
@@ -4299,6 +4386,8 @@ def build_enriched_doc(
         key = candidates[0].get("symbol_key")
         return key if isinstance(key, str) and key else None
 
+    fragment_sources: list[tuple[int, int, str, int]] = []
+
     for i, part in enumerate(parts_info):
         part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
         dep_source = _part_dep_source(part)
@@ -4307,6 +4396,15 @@ def build_enriched_doc(
         if offset + part_len > text_len:
             break
         chunk_ranges[i] = (offset, offset + part_len)
+        fragment_end = offset + part_len + (2 if i < len(parts_info) - 1 else 0)
+        fragment_sources.append(
+            (
+                offset,
+                fragment_end,
+                _part_source_path(part, index, filepath or "assembled.cpp"),
+                i + 1,
+            )
+        )
 
         # Fill structure_ids
         for j in range(offset, offset + part_len):
@@ -4470,10 +4568,9 @@ def build_enriched_doc(
         **_cpp_domain_sidecars(
             full_text,
             index,
-            source_doc_id=stable_source_identity_for_path(
-                filepath or "assembled.cpp",
-                text=full_text,
-            ),
+            source_doc_id=1,
+            source_path=filepath or "assembled.cpp",
+            fragment_sources=fragment_sources,
             macro_parts=macro_route_parts,
             macro_invocations=macro_invocation_routes,
         ),
@@ -4556,6 +4653,7 @@ def _build_domain_sidecars(
         resolve_domain_parser(resolved_path, text) if resolved_path is not None else None
     )
     if resolved_adapter is not None and resolved_adapter.name != "raw-output":
+        assert resolved_path is not None
         parsed = parse_domain_document(
             resolved_path,
             text,
@@ -4588,6 +4686,9 @@ def _build_domain_sidecars(
             },
         )
         parsed.set_source_doc_id(source_doc_id)
+        parsed.set_source_identity(
+            source_identity_for_path(resolved_path or parser_path or build_kind, text=text)
+        )
 
     enriched = parsed.to_enriched_document()
     enriched["domain_parse_info"].update(
@@ -4616,11 +4717,7 @@ def build_build_doc(
     make an otherwise valid C/C++ repo fail indexing.
     """
     text_len = len(text)
-    source_doc_id = stable_source_identity_for_path(
-        filepath,
-        text=text,
-        source_root=source_root,
-    )
+    source_doc_id = 1
     domain_sidecars = _build_domain_sidecars(
         text,
         build_kind,
@@ -4658,7 +4755,7 @@ def build_build_doc(
     # free by language_info_to_prefix as "// language: primary=<build_kind> ...").
     from cppmega_mlx.data.domain_schema import DomainKind
 
-    domain = DomainKind(int(domain_sidecars["domain_kind"]))
+    domain = DomainKind(int(cast(int, domain_sidecars["domain_kind"])))
     is_shell_doc = domain in {
         DomainKind.BASH,
         DomainKind.SH,
@@ -4690,7 +4787,15 @@ def build_build_doc(
     result: dict[str, object] = {
         'text': text,
         'doc_type': doc_type,
-        'source_identity_id': source_doc_id,
+        'source_identity_id': int(
+            cast(
+                int,
+                cast(
+                    list[dict[str, object]],
+                    domain_sidecars["source_identity_registry"],
+                )[0]["source_identity_id"],
+            )
+        ),
         'build_kind': build_kind,
         'filepath': filepath,
         'structure_ids': structure_ids,
@@ -6586,7 +6691,6 @@ def process_project(
         project_id,
         source=f"process_project({project_dir})",
     )
-    _configure_libclang()
 
     # Open the cross-repo base-lib symbol index (read-only) for THIS process.
     global_symbols: GlobalSymbolReader | None = None
@@ -6600,6 +6704,8 @@ def process_project(
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(cpp_files)} C/C++ source files", file=sys.stderr)
+    if cpp_files:
+        _configure_libclang()
 
     # Discover build/compilation files (ADDITIVE; emitted as 'build' docs).
     build_files = find_build_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
