@@ -1660,6 +1660,20 @@ def normalize_compiled_batch(
     graph_attention_bias = lm_batch.graph_attention_bias
     graph_edge_kind_bias = lm_batch.graph_edge_kind_bias
     if graph_routes_enabled is False:
+        provided_graph_fields = [
+            name
+            for name, value in (
+                ("graph_batch", lm_batch.graph_batch),
+                ("graph_attention_bias", graph_attention_bias),
+                ("graph_edge_kind_bias", graph_edge_kind_bias),
+            )
+            if value is not None
+        ]
+        if provided_graph_fields:
+            raise ValueError(
+                "compiled batch received graph data while graph routes are "
+                "disabled: " + ", ".join(provided_graph_fields)
+            )
         graph_attention_bias = None
         graph_edge_kind_bias = None
     elif lm_batch.graph_batch is not None:

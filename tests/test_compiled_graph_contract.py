@@ -342,19 +342,17 @@ def test_dsa_training_runs_two_optimizer_steps_without_mutating_module_tree(
     assert all("last_index_scores" not in name for name in state_keys_after)
 
 
-def test_graph_disabled_compiled_step_is_exact_token_baseline() -> None:
+def test_graph_disabled_compiled_step_rejects_graph_payload_before_trace() -> None:
     cfg = _config(graph_routes_enabled=False)
-
-    graph_loss, graph_before, graph_after, _ = _run(
-        cfg, _batch(graph=_graph((7, 1))), compile=True
+    model = DenseCppLM(cfg)
+    step = CompiledPretrainingStep(
+        model, optim.SGD(learning_rate=1e-2), compile=True
     )
-    plain_loss, plain_before, plain_after, _ = _run(cfg, _batch(), compile=True)
 
-    assert graph_loss == plain_loss
-    graph_update = _max_update(graph_before, graph_after)
-    plain_update = _max_update(plain_before, plain_after)
-    for name in graph_update:
-        np.testing.assert_array_equal(graph_update[name], plain_update[name])
+    with pytest.raises(ValueError, match="graph data.*routes are disabled"):
+        step(_batch(graph=_graph((7, 1))))
+
+    assert step._compiled_step is None
 
 
 def test_malformed_graph_endpoint_fails_before_compile_trace() -> None:
