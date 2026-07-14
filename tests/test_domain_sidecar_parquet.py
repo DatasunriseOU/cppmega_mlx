@@ -44,9 +44,15 @@ def _write_parquet(path, *, extra):
         "token_diagnostic_edges": [],
     }
     row.update(extra)
+    requested_confidence = list(row["token_confidence_ids"])
     doc = normalize_document_record(row, source_doc_index=0)
     packed, overflow = pack_documents([doc], target_length=8, strategy="sequential")
     assert overflow == []
+    # Audit fixtures deliberately preserve the requested post-packer state so
+    # the rejection test can write a producer-invalid confidence vector.
+    packed[0]["token_confidence_ids"][: len(requested_confidence)] = (
+        requested_confidence
+    )
     pq.write_table(rows_to_table(packed), path)
 
 

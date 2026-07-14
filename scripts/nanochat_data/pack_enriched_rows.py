@@ -27,6 +27,8 @@ from cppmega_v4.data.doc_id_assignment import stable_doc_signature
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_SCHEMA_SHA256,
     DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    DomainKind,
+    ParseConfidence,
     TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
     normalize_domain_edge_record,
     validate_case5_contract_metadata,
@@ -156,6 +158,9 @@ REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
 _STATIC_DOC_TYPES = {"code", "code_header", "build", "shell"}
+_DIAGNOSTIC_DOMAIN_IDS = frozenset(
+    int(domain) for domain in DomainKind if int(domain) >= 40
+)
 DEFAULT_PACK_TOKEN_WINDOW = 1024 * 1024
 
 
@@ -951,6 +956,60 @@ def _normalize_domain_graph_meta(
     )
 
 
+def _normalize_diagnostic_confidence(
+    *,
+    source_doc_index: int,
+    token_meta: dict[str, list[int]],
+    diagnostic_edges: list[dict[str, int]],
+) -> None:
+    """Make edge-free diagnostic documents explicitly uncertified.
+
+    HEURISTIC/PARTIAL confidence is only meaningful when the parser emitted a
+    structural diagnostic edge. At the packed-row publication boundary, an
+    edge-free diagnostic must therefore carry RAW confidence on its diagnostic
+    payload instead of looking structurally certified.
+    """
+
+    if diagnostic_edges:
+        return
+    domain_ids = token_meta[TOKEN_DOMAIN_IDS_COLUMN]
+    diagnostic_positions = [
+        index
+        for index, domain_id in enumerate(domain_ids)
+        if int(domain_id) in _DIAGNOSTIC_DOMAIN_IDS
+    ]
+    if not diagnostic_positions:
+        return
+
+    confidence_ids = token_meta[TOKEN_CONFIDENCE_IDS_COLUMN]
+    if not confidence_ids:
+        raise ValueError(
+            "edge-free diagnostic document is missing token_confidence_ids for "
+            f"source_doc_index={source_doc_index}"
+        )
+    if any(
+        int(confidence_ids[index]) == int(ParseConfidence.RAW)
+        for index in diagnostic_positions
+    ):
+        return
+
+    uncertified = {
+        int(ParseConfidence.HEURISTIC),
+        int(ParseConfidence.PARTIAL),
+    }
+    changed = False
+    for index in diagnostic_positions:
+        if int(confidence_ids[index]) in uncertified:
+            confidence_ids[index] = int(ParseConfidence.RAW)
+            changed = True
+    if not changed:
+        raise ValueError(
+            "edge-free diagnostic document must provide RAW or downgradeable "
+            "HEURISTIC/PARTIAL confidence for "
+            f"source_doc_index={source_doc_index}"
+        )
+
+
 def normalize_document_record(
     record: dict[str, Any],
     *,
@@ -1065,6 +1124,11 @@ def normalize_document_record(
         record,
         source_doc_index=source_doc_index,
         token_count=len(token_ids),
+    )
+    _normalize_diagnostic_confidence(
+        source_doc_index=source_doc_index,
+        token_meta=token_meta,
+        diagnostic_edges=diagnostic_edges,
     )
 
     return NormalizedDoc(

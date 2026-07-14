@@ -15,9 +15,12 @@ from cppmega_mlx.data.domain_schema import (
     DOMAIN_SCHEMA_SHA256,
     DOMAIN_SCHEMA_SHA256_METADATA_KEY,
     DomainEdgeKind,
+    DomainKind,
+    ParseConfidence,
 )
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
     TOKENIZER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
@@ -86,9 +89,8 @@ def _write_tiny_parquet(
         "token_role_ids": [0] * capacity,
         "token_entity_ids": [0] * capacity,
         "token_scope_ids": [0] * capacity,
-        "token_source_doc_ids": [1] * valid_token_count + [0] * (
-            capacity - valid_token_count
-        ),
+        "token_source_doc_ids": [1] * valid_token_count
+        + [0] * (capacity - valid_token_count),
         "token_source_identity_ids": valid_identity_ids,
         "token_confidence_ids": [0] * capacity,
         "token_def_use": [0, 1, 2, 0, 0, 0, 0, 0],
@@ -114,7 +116,8 @@ def _write_tiny_parquet(
     if extra:
         row.update(extra)
     if len(row["source_doc_ids"]) > 1 and not (
-        extra and any(name in extra for name in ("token_chunk_starts", "token_call_edges"))
+        extra
+        and any(name in extra for name in ("token_chunk_starts", "token_call_edges"))
     ):
         starts = []
         ends = []
@@ -143,9 +146,8 @@ def _write_tiny_parquet(
             )
             for _ in range(int(length))
         ]
-        row["token_source_doc_ids"] = (
-            token_source_doc_ids
-            + [0] * (len(row["input_ids"]) - len(token_source_doc_ids))
+        row["token_source_doc_ids"] = token_source_doc_ids + [0] * (
+            len(row["input_ids"]) - len(token_source_doc_ids)
         )
     row["num_docs"] = len(row["source_doc_token_lengths"])
     table = pa.Table.from_pylist([row], schema=PACKED_ROW_OUTPUT_SCHEMA)
@@ -156,7 +158,9 @@ def _write_tiny_parquet(
         table = table.set_column(
             index,
             "token_source_doc_ids",
-            pa.array([row["token_source_doc_ids"]], type=pa.list_(token_source_doc_type)),
+            pa.array(
+                [row["token_source_doc_ids"]], type=pa.list_(token_source_doc_type)
+            ),
         )
     pq.write_table(table, path)
 
@@ -232,10 +236,7 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     assert report["receipt"]["successful"] is True
     assert report["receipt"]["contract"] == "cppmega_case5_domain_routes_v1"
     assert report["receipt"]["domain_schema_sha256"] == DOMAIN_SCHEMA_SHA256
-    assert (
-        report["receipt"]["tokenizer_contract_sha256"]
-        == TOKENIZER_CONTRACT_SHA256
-    )
+    assert report["receipt"]["tokenizer_contract_sha256"] == TOKENIZER_CONTRACT_SHA256
     assert "AUDIT PASSED" in proc.stdout
 
 
@@ -325,6 +326,30 @@ def test_sidecar_audit_rejects_empty_or_reversed_chunk_span(tmp_path):
     assert proc.returncode == 2
     assert report["total"]["bad_rows"] == 1
     assert report["total"]["fields"]["token_chunk_ends"]["bad_value_rows"] >= 1
+
+
+def test_sidecar_audit_rejects_chunk_and_changed_spans_inside_padding(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={
+            "token_chunk_starts": [0, 4],
+            "token_chunk_ends": [2, 6],
+            "changed_chunk_ids": [1],
+            "changed_chunk_spans": [{"start": 4, "end": 6}],
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report["total"]["fields"]["token_chunk_starts"]["bad_value_rows"] >= 1
+    assert report["total"]["fields"]["token_chunk_ends"]["bad_value_rows"] >= 1
+    assert report["total"]["fields"]["changed_chunk_spans"]["bad_value_rows"] >= 1
 
 
 def test_sidecar_audit_rejects_allones_loss_mask_on_multidoc_row(tmp_path):
@@ -468,12 +493,12 @@ def test_sidecar_audit_rejects_domain_delimiter_without_domain_sidecars(tmp_path
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert report is not None
     assert report["total"]["bad_rows"] >= 1
-    assert any(
-        "domain delimiter pairs" in err for err in report["total"]["errors"]
-    )
+    assert any("domain delimiter pairs" in err for err in report["total"]["errors"])
 
 
-def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(tmp_path):
+def test_sidecar_audit_accepts_domain_delimiter_with_domain_sidecars_and_edges(
+    tmp_path,
+):
     code_root = tmp_path / "code"
     commit_root = tmp_path / "commits"
     pr_root = tmp_path / "pr"
@@ -515,11 +540,7 @@ def test_sidecar_audit_requires_uint32_positive_token_source_doc_ids(tmp_path):
         ("missing", {"omit": ("token_source_doc_ids",)}),
         (
             "zero",
-            {
-                "extra": {
-                    "token_source_doc_ids": [0, 0, 0, 0, 0, 0, 0, 0]
-                }
-            },
+            {"extra": {"token_source_doc_ids": [0, 0, 0, 0, 0, 0, 0, 0]}},
         ),
         ("wrong_dtype", {"token_source_doc_type": pa.int64()}),
     )
@@ -556,7 +577,29 @@ def test_sidecar_audit_rejects_zero_stable_source_id_inside_valid_prefix(tmp_pat
     assert report["total"]["fields"]["token_source_doc_ids"]["bad_value_rows"] >= 1
 
 
-def test_sidecar_audit_rejects_edge_crossing_source_document_provenance(tmp_path):
+def test_sidecar_audit_accepts_edges_across_sources_in_one_logical_document(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={
+            "token_source_doc_ids": [11, 11, 22, 22, 0, 0, 0, 0],
+            "token_domain_edges": [
+                {"from": 0, "to": 2, "kind": int(DomainEdgeKind.INCLUDE)}
+            ],
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert report["total"]["bad_rows"] == 0
+
+
+def test_sidecar_audit_rejects_edge_crossing_logical_document_boundary(tmp_path):
     code_root = tmp_path / "code"
     commit_root = tmp_path / "commits"
     pr_root = tmp_path / "pr"
@@ -568,7 +611,7 @@ def test_sidecar_audit_rejects_edge_crossing_source_document_provenance(tmp_path
         extra={
             "source_doc_ids": [11, 22],
             "source_doc_token_lengths": [2, 2],
-            "token_source_doc_ids": [11, 11, 22, 22, 0, 0, 0, 0],
+            "token_source_doc_ids": [11, 11, 11, 11, 0, 0, 0, 0],
             "token_domain_edges": [{"from": 0, "to": 2, "kind": 5}],
         },
     )
@@ -579,6 +622,66 @@ def test_sidecar_audit_rejects_edge_crossing_source_document_provenance(tmp_path
 
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert report["total"]["fields"]["token_domain_edges"]["bad_value_rows"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("second_doc_confidence", "expected_code"),
+    [
+        (ParseConfidence.HEURISTIC, 2),
+        (ParseConfidence.RAW, 0),
+    ],
+)
+def test_sidecar_audit_certifies_diagnostics_per_logical_document(
+    tmp_path, second_doc_confidence, expected_code
+):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    start = DOMAIN_DELIMITER_TOKEN_IDS["COMPILER_ERROR_START"]
+    end = DOMAIN_DELIMITER_TOKEN_IDS["COMPILER_ERROR_END"]
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        input_ids=(start, 101, end, start, 102, end, 0, 0),
+        target_ids=(101, end, start, 102, end, 0, 0, 0),
+        doc_ids=(1, 1, 1, 2, 2, 2, 2, 2),
+        loss_mask=(1, 1, 0, 1, 1, 0, 0, 0),
+        valid_token_count=6,
+        trained_token_count=4,
+        extra={
+            "source_doc_ids": [11, 22],
+            "source_doc_token_lengths": [3, 3],
+            "token_domain_ids": [int(DomainKind.COMPILER_ERROR)] * 6 + [0, 0],
+            "token_role_ids": [1, 31, 1, 1, 31, 1, 0, 0],
+            "token_confidence_ids": [
+                int(ParseConfidence.EXACT),
+                int(ParseConfidence.HEURISTIC),
+                int(ParseConfidence.EXACT),
+                int(ParseConfidence.EXACT),
+                int(second_doc_confidence),
+                int(ParseConfidence.EXACT),
+                0,
+                0,
+            ],
+            "token_diagnostic_edges": [
+                {
+                    "from": 0,
+                    "to": 1,
+                    "kind": int(DomainEdgeKind.DIAG_PRIMARY_LOCATION),
+                }
+            ],
+        },
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == expected_code, proc.stdout + proc.stderr
+    if expected_code:
+        assert any(
+            "diagnostic/error logical docs" in error
+            for error in report["total"]["errors"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -765,7 +868,9 @@ def test_sidecar_audit_rejects_missing_case5_column_and_bad_edge_schema(tmp_path
     assert proc.returncode == 2
     assert report["status"] == "failed"
     assert report["receipt"]["successful"] is False
-    assert any("missing required CASE5 columns" in err for err in report["total"]["errors"])
+    assert any(
+        "missing required CASE5 columns" in err for err in report["total"]["errors"]
+    )
     assert any("token_build_edges type" in err for err in report["total"]["errors"])
 
 

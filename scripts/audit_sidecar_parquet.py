@@ -24,10 +24,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
+import numpy as np  # noqa: E402
+import pyarrow as pa  # noqa: E402
+import pyarrow.compute as pc  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
+
 
 def _load_schema_contracts():
     """Load dependency-free data contracts without importing the MLX data package."""
@@ -196,7 +197,13 @@ LIST_FIELDS = (
     "source_identity_registry",
 )
 
-ALL_FIELDS = (*TOKEN_COLUMNS, *SOURCE_COLUMNS, *TOKEN_ALIGNED_FIELDS, *CHUNK_ALIGNED_FIELDS, *LIST_FIELDS)
+ALL_FIELDS = (
+    *TOKEN_COLUMNS,
+    *SOURCE_COLUMNS,
+    *TOKEN_ALIGNED_FIELDS,
+    *CHUNK_ALIGNED_FIELDS,
+    *LIST_FIELDS,
+)
 
 CASE5_REQUIRED_COLUMNS = frozenset(
     {
@@ -282,9 +289,7 @@ CASE5_ARROW_TYPES = {
     "source_identity_registry": _SOURCE_IDENTITY_REGISTRY_TYPE,
 }
 
-_DIAGNOSTIC_DOMAIN_IDS = {
-    int(domain) for domain in DomainKind if int(domain) >= 40
-}
+_DIAGNOSTIC_DOMAIN_IDS = {int(domain) for domain in DomainKind if int(domain) >= 40}
 
 _DIAGNOSTIC_DELIMITER_IDS = np.asarray(
     [
@@ -371,7 +376,9 @@ class AuditStats:
             "token_cross_domain_edges": 0,
         }
     )
-    field_stats: dict[str, FieldStats] = field(default_factory=lambda: {name: FieldStats() for name in ALL_FIELDS})
+    field_stats: dict[str, FieldStats] = field(
+        default_factory=lambda: {name: FieldStats() for name in ALL_FIELDS}
+    )
     errors: list[str] = field(default_factory=list)
 
     def add(self, other: "AuditStats") -> None:
@@ -398,7 +405,12 @@ class AuditStats:
             "trained_tokens": self.trained_tokens,
             "slack_tokens": self.slack_tokens,
             "pad_tokens": self.capacity_tokens - self.valid_tokens,
-            "pad_pct": round(100.0 * (self.capacity_tokens - self.valid_tokens) / self.capacity_tokens, 6)
+            "pad_pct": round(
+                100.0
+                * (self.capacity_tokens - self.valid_tokens)
+                / self.capacity_tokens,
+                6,
+            )
             if self.capacity_tokens
             else 0.0,
             "bad_rows": self.bad_rows,
@@ -724,7 +736,7 @@ def _validate_target_ids_shift(
         ends = starts + lengths
         for start, end in zip(starts[nonempty], ends[nonempty]):
             if end - start > 1:
-                expected[start:end - 1] = input_flat[start + 1:end]
+                expected[start : end - 1] = input_flat[start + 1 : end]
     mismatch = target_flat != expected
     bad_rows = _rows_with_flat_mask(lengths, mismatch)
     count = int(np.count_nonzero(bad_rows))
@@ -763,9 +775,7 @@ def _validate_trained_count_against_loss_mask(
     count = int(np.count_nonzero(mismatch))
     if count:
         row_bad |= mismatch
-        stats.errors.append(
-            f"{count} rows have trained_token_count != sum(loss_mask)"
-        )
+        stats.errors.append(f"{count} rows have trained_token_count != sum(loss_mask)")
 
 
 def _iter_or_empty(values: Any) -> Any:
@@ -782,7 +792,8 @@ def _edge_stats_and_validate(
     n_chunks: np.ndarray,
     chunk_starts: list[Any],
     chunk_ends: list[Any],
-    source_doc_rows: list[Any],
+    logical_doc_rows: list[Any],
+    valid_lengths: np.ndarray,
     row_bad: np.ndarray,
 ) -> None:
     fs = stats.field_stats[field]
@@ -796,23 +807,44 @@ def _edge_stats_and_validate(
         fs.slots_nonzero += len(edges)
         stats.edge_count[field] = stats.edge_count.get(field, 0) + len(edges)
         limit = int(n_chunks[idx]) if idx < len(n_chunks) else 0
+        valid_limit = int(valid_lengths[idx]) if idx < len(valid_lengths) else 0
         for edge in edges:
             src, dst = _flatten_edge(edge)
-            if src is None or dst is None or src < 0 or dst < 0 or src >= limit or dst >= limit:
+            if (
+                src is None
+                or dst is None
+                or src < 0
+                or dst < 0
+                or src >= limit
+                or dst >= limit
+            ):
                 row_bad[idx] = True
                 fs.bad_value_rows += 1
                 break
             starts = list(_iter_or_empty(chunk_starts[idx]))
             ends = list(_iter_or_empty(chunk_ends[idx]))
-            source_ids = list(_iter_or_empty(source_doc_rows[idx]))
+            logical_ids = list(_iter_or_empty(logical_doc_rows[idx]))
             endpoint_docs: list[int] = []
             for chunk_index in (src, dst):
-                start = _as_int(starts[chunk_index]) if chunk_index < len(starts) else None
+                start = (
+                    _as_int(starts[chunk_index]) if chunk_index < len(starts) else None
+                )
                 end = _as_int(ends[chunk_index]) if chunk_index < len(ends) else None
-                if start is None or end is None or start < 0 or end <= start or end > len(source_ids):
+                if (
+                    start is None
+                    or end is None
+                    or start < 0
+                    or end <= start
+                    or end > valid_limit
+                    or end > len(logical_ids)
+                ):
                     endpoint_docs = []
                     break
-                docs = {int(value) for value in source_ids[start:end] if _as_int(value) is not None}
+                docs = {
+                    int(value)
+                    for value in logical_ids[start:end]
+                    if _as_int(value) is not None
+                }
                 if len(docs) != 1 or next(iter(docs)) <= 0:
                     endpoint_docs = []
                     break
@@ -829,7 +861,7 @@ def _edge_triple_stats_and_validate(
     field: str,
     rows: list[Any],
     valid_lengths: np.ndarray,
-    source_doc_rows: list[Any],
+    logical_doc_rows: list[Any],
     row_bad: np.ndarray,
 ) -> None:
     fs = stats.field_stats[field]
@@ -843,8 +875,7 @@ def _edge_triple_stats_and_validate(
         fs.slots_nonzero += len(edges)
         stats.edge_count[field] = stats.edge_count.get(field, 0) + len(edges)
         limit = int(valid_lengths[idx]) if idx < len(valid_lengths) else 0
-        family = _EDGE_FAMILY_BY_FIELD[field]
-        source_ids = list(_iter_or_empty(source_doc_rows[idx]))
+        logical_ids = list(_iter_or_empty(logical_doc_rows[idx]))
         for edge in edges:
             src, dst, kind = _flatten_edge_triple(edge)
             valid_kind = True
@@ -865,13 +896,13 @@ def _edge_triple_stats_and_validate(
                 or not valid_kind
                 or src >= limit
                 or dst >= limit
-                or src >= len(source_ids)
-                or dst >= len(source_ids)
-                or _as_int(source_ids[src]) is None
-                or _as_int(source_ids[dst]) is None
-                or int(source_ids[src]) <= 0
-                or int(source_ids[dst]) <= 0
-                or int(source_ids[src]) != int(source_ids[dst])
+                or src >= len(logical_ids)
+                or dst >= len(logical_ids)
+                or _as_int(logical_ids[src]) is None
+                or _as_int(logical_ids[dst]) is None
+                or int(logical_ids[src]) <= 0
+                or int(logical_ids[dst]) <= 0
+                or int(logical_ids[src]) != int(logical_ids[dst])
             ):
                 row_bad[idx] = True
                 fs.bad_value_rows += 1
@@ -892,7 +923,9 @@ def _validate_domain_delimiter_sidecars(
         [
             any(
                 int(token_id) in _DOMAIN_DELIMITER_BY_ID
-                for token_id in list(_iter_or_empty(tokens))[: int(valid_lengths[index])]
+                for token_id in list(_iter_or_empty(tokens))[
+                    : int(valid_lengths[index])
+                ]
             )
             for index, tokens in enumerate(token_rows)
         ],
@@ -1003,14 +1036,9 @@ def _validate_token_source_doc_ids(
         capacity = int(input_lengths[row_index])
         valid = int(valid_lengths[row_index])
         values = list(_iter_or_empty(values))
-        bad = (
-            len(values) != capacity
-            or any(
-                _as_int(value) is None
-                or int(value) <= 0
-                or int(value) > (1 << 32) - 1
-                for value in values[:valid]
-            )
+        bad = len(values) != capacity or any(
+            _as_int(value) is None or int(value) <= 0 or int(value) > (1 << 32) - 1
+            for value in values[:valid]
         )
         if bad:
             row_bad[row_index] = True
@@ -1025,14 +1053,15 @@ def _validate_diagnostic_rows_have_edges_or_raw(
     names: set[str],
     input_ids_col: Any,
     input_lengths: np.ndarray,
+    valid_lengths: np.ndarray,
     row_bad: np.ndarray,
 ) -> None:
-    """Fail diagnostic/error rows without parsed edges unless marked RAW.
+    """Fail logical diagnostic documents without parsed edges unless marked RAW.
 
     Diagnostics are world observations, not comments. A structured diagnostic
-    row should carry token_diagnostic_edges. If a parser could not recover
-    edges, the row must explicitly say so by marking tokens
-    ParseConfidence.RAW; otherwise a silent parser miss would look certified.
+    document should carry token_diagnostic_edges. If a parser could not recover
+    edges, that logical document must explicitly mark its diagnostic tokens RAW;
+    an edge or RAW token from another document in the packed row cannot certify it.
     """
 
     flat_input = _flat_numpy(input_ids_col)
@@ -1043,39 +1072,82 @@ def _validate_diagnostic_rows_have_edges_or_raw(
     if "token_domain_ids" in names:
         domain_flat = _flat_numpy(table.column("token_domain_ids"))
         if len(domain_flat) == len(flat_input):
-            diagnostic_flat |= np.isin(domain_flat.astype(np.int64), list(_DIAGNOSTIC_DOMAIN_IDS))
+            diagnostic_flat |= np.isin(
+                domain_flat.astype(np.int64), list(_DIAGNOSTIC_DOMAIN_IDS)
+            )
 
-    diagnostic_rows = _rows_with_flat_mask(input_lengths, diagnostic_flat)
-    if not np.any(diagnostic_rows):
+    if "doc_ids" not in names:
         return
-
-    if "token_diagnostic_edges" in names:
-        edge_lengths = _list_lengths(table.column("token_diagnostic_edges"))
-        has_edges = edge_lengths > 0
-    else:
-        edge_lengths = np.zeros(len(input_lengths), dtype=np.int64)
-        has_edges = np.zeros(len(input_lengths), dtype=bool)
-
+    logical_doc_flat = _flat_numpy(table.column("doc_ids"))
+    if len(logical_doc_flat) != len(flat_input):
+        return
     if "token_confidence_ids" in names:
         conf_flat = _flat_numpy(table.column("token_confidence_ids"))
-        if len(conf_flat) == len(flat_input):
-            raw_rows = _rows_with_flat_mask(
-                input_lengths,
-                conf_flat.astype(np.int64) == int(ParseConfidence.RAW),
-            )
-        else:
-            raw_rows = np.zeros(len(input_lengths), dtype=bool)
     else:
-        raw_rows = np.zeros(len(input_lengths), dtype=bool)
+        conf_flat = np.asarray([], dtype=np.int64)
+    edge_rows = (
+        table.column("token_diagnostic_edges").to_pylist()
+        if "token_diagnostic_edges" in names
+        else [[] for _ in range(len(input_lengths))]
+    )
 
-    bad = diagnostic_rows & ~has_edges & ~raw_rows
-    count = int(np.count_nonzero(bad))
-    if count:
-        row_bad |= bad
-        stats.field_stats["token_diagnostic_edges"].bad_value_rows += count
+    bad_rows = 0
+    bad_docs = 0
+    offset = 0
+    for row_index, (capacity, valid, edges) in enumerate(
+        zip(input_lengths, valid_lengths, edge_rows, strict=True)
+    ):
+        capacity = int(capacity)
+        valid = int(valid)
+        row_slice = slice(offset, offset + valid)
+        row_diagnostic = diagnostic_flat[row_slice]
+        row_doc_ids = logical_doc_flat[row_slice]
+        diagnostic_docs = {
+            int(row_doc_ids[position])
+            for position in np.flatnonzero(row_diagnostic)
+            if int(row_doc_ids[position]) > 0
+        }
+        if not diagnostic_docs:
+            offset += capacity
+            continue
+
+        raw_docs: set[int] = set()
+        if len(conf_flat) == len(flat_input):
+            row_confidence = conf_flat[row_slice]
+            raw_docs = {
+                int(row_doc_ids[position])
+                for position in np.flatnonzero(
+                    row_diagnostic
+                    & (row_confidence.astype(np.int64) == int(ParseConfidence.RAW))
+                )
+                if int(row_doc_ids[position]) > 0
+            }
+
+        edge_docs: set[int] = set()
+        for edge in _iter_or_empty(edges):
+            src, dst, _kind = _flatten_edge_triple(edge)
+            if (
+                src is not None
+                and dst is not None
+                and 0 <= src < valid
+                and 0 <= dst < valid
+                and int(row_doc_ids[src]) > 0
+                and int(row_doc_ids[src]) == int(row_doc_ids[dst])
+            ):
+                edge_docs.add(int(row_doc_ids[src]))
+
+        missing = diagnostic_docs - raw_docs - edge_docs
+        if missing:
+            row_bad[row_index] = True
+            bad_rows += 1
+            bad_docs += len(missing)
+        offset += capacity
+
+    if bad_rows:
+        stats.field_stats["token_diagnostic_edges"].bad_value_rows += bad_rows
         stats.errors.append(
-            f"{count} diagnostic/error rows have no token_diagnostic_edges "
-            "and no explicit ParseConfidence.RAW"
+            f"{bad_docs} diagnostic/error logical docs across {bad_rows} rows have "
+            "no token_diagnostic_edges and no explicit ParseConfidence.RAW"
         )
 
 
@@ -1127,10 +1199,17 @@ def _audit_table(
         stats.valid_tokens += int(valid.sum())
         stats.trained_tokens += int(trained.sum())
         stats.slack_tokens += int(slack.sum())
-        bad_counts = (valid < 0) | (valid > input_lengths) | (trained < 0) | (trained > input_lengths)
+        bad_counts = (
+            (valid < 0)
+            | (valid > input_lengths)
+            | (trained < 0)
+            | (trained > input_lengths)
+        )
         if np.any(bad_counts):
             row_bad |= bad_counts
-            stats.errors.append(f"{path}: {int(np.count_nonzero(bad_counts))} rows have invalid valid/trained counts")
+            stats.errors.append(
+                f"{path}: {int(np.count_nonzero(bad_counts))} rows have invalid valid/trained counts"
+            )
 
         if vocab_size is not None:
             flat_input = _flat_numpy(input_ids)
@@ -1159,6 +1238,7 @@ def _audit_table(
             names=names,
             input_ids_col=input_ids,
             input_lengths=input_lengths,
+            valid_lengths=valid,
             row_bad=row_bad,
         )
 
@@ -1174,7 +1254,10 @@ def _audit_table(
 
         # Derive both doc_ids and loss_mask from logical source-document lengths.
         # Never trust doc_ids as the oracle for its own boundary correctness.
-        if all(name in names for name in ("loss_mask", "doc_ids", "source_doc_token_lengths")):
+        if all(
+            name in names
+            for name in ("loss_mask", "doc_ids", "source_doc_token_lengths")
+        ):
             _validate_packed_document_boundaries(
                 stats=stats,
                 loss_mask_col=table.column("loss_mask"),
@@ -1214,13 +1297,18 @@ def _audit_table(
                     row_bad=row_bad,
                 )
 
-        source_doc_rows = _validate_token_source_doc_ids(
+        _validate_token_source_doc_ids(
             stats=stats,
             table=table,
             names=names,
             input_lengths=input_lengths,
             valid_lengths=valid,
             row_bad=row_bad,
+        )
+        logical_doc_rows = (
+            table.column("doc_ids").to_pylist()
+            if "doc_ids" in names
+            else [[] for _ in range(stats.rows)]
         )
         if "token_source_identity_ids" in names:
             _validate_positive_valid_token_source_ids(
@@ -1278,7 +1366,7 @@ def _audit_table(
         if "token_chunk_starts" in names:
             starts = _flat_numpy(table.column("token_chunk_starts"))
             if len(starts):
-                bad_starts = (starts < 0) | (starts > np.repeat(input_lengths, n_chunks))
+                bad_starts = (starts < 0) | (starts >= np.repeat(valid, n_chunks))
                 _count_bad_flat_values(
                     stats=stats,
                     field="token_chunk_starts",
@@ -1290,7 +1378,7 @@ def _audit_table(
         if "token_chunk_ends" in names:
             ends = _flat_numpy(table.column("token_chunk_ends"))
             if len(ends):
-                bad_ends = (ends < 0) | (ends > np.repeat(input_lengths, n_chunks))
+                bad_ends = (ends <= 0) | (ends > np.repeat(valid, n_chunks))
                 _count_bad_flat_values(
                     stats=stats,
                     field="token_chunk_ends",
@@ -1329,7 +1417,9 @@ def _audit_table(
                 column=table.column("changed_chunk_ids"),
                 expected_lengths=None,
             )
-            for row_idx, values in enumerate(table.column("changed_chunk_ids").to_pylist()):
+            for row_idx, values in enumerate(
+                table.column("changed_chunk_ids").to_pylist()
+            ):
                 limit = int(n_chunks[row_idx]) if row_idx < len(n_chunks) else 0
                 for value in _iter_or_empty(values):
                     idx = _as_int(value)
@@ -1340,16 +1430,27 @@ def _audit_table(
 
         if "changed_chunk_spans" in names:
             span_rows = table.column("changed_chunk_spans").to_pylist()
-            _add_generic_list_stats(stats, "changed_chunk_spans", table.column("changed_chunk_spans"))
+            _add_generic_list_stats(
+                stats, "changed_chunk_spans", table.column("changed_chunk_spans")
+            )
             for row_idx, spans in enumerate(span_rows):
                 for span in _iter_or_empty(spans):
                     if isinstance(span, dict):
-                        start, end = _as_int(span.get("start")), _as_int(span.get("end"))
+                        start, end = (
+                            _as_int(span.get("start")),
+                            _as_int(span.get("end")),
+                        )
                     elif isinstance(span, (list, tuple)) and len(span) >= 2:
                         start, end = _as_int(span[0]), _as_int(span[1])
                     else:
                         start = end = None
-                    if start is None or end is None or start < 0 or end < start or end > input_lengths[row_idx]:
+                    if (
+                        start is None
+                        or end is None
+                        or start < 0
+                        or end <= start
+                        or end > valid[row_idx]
+                    ):
                         row_bad[row_idx] = True
                         stats.field_stats["changed_chunk_spans"].bad_value_rows += 1
                         break
@@ -1371,7 +1472,8 @@ def _audit_table(
                         if "token_chunk_ends" in names
                         else [[] for _ in range(stats.rows)]
                     ),
-                    source_doc_rows=source_doc_rows,
+                    logical_doc_rows=logical_doc_rows,
+                    valid_lengths=valid,
                     row_bad=row_bad,
                 )
 
@@ -1388,7 +1490,7 @@ def _audit_table(
                     field=name,
                     rows=table.column(name).to_pylist(),
                     valid_lengths=valid,
-                    source_doc_rows=source_doc_rows,
+                    logical_doc_rows=logical_doc_rows,
                     row_bad=row_bad,
                 )
 
@@ -1415,9 +1517,7 @@ def _case5_schema_errors(path: Path, schema: pa.Schema) -> list[str]:
                 f"{path}: {name} type {schema.field(name).type} != {expected_type}"
             )
     metadata = schema.metadata or {}
-    actual_digest = metadata.get(
-        DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")
-    )
+    actual_digest = metadata.get(DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"))
     if actual_digest != DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"):
         errors.append(
             f"{path}: tokenizer/domain delimiter contract digest missing or mismatched"
@@ -1431,7 +1531,9 @@ def _case5_schema_errors(path: Path, schema: pa.Schema) -> list[str]:
     return errors
 
 
-def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -> dict[str, Any]:
+def _audit_file(
+    path_str: str, kind: str, bucket: str, vocab_size: int | None
+) -> dict[str, Any]:
     path = Path(path_str)
     stats = AuditStats(files=1)
     try:
@@ -1498,7 +1600,9 @@ def _audit_file(path_str: str, kind: str, bucket: str, vocab_size: int | None) -
     }
 
 
-def _discover(root: Path, kind: str, buckets: set[str] | None) -> list[tuple[str, str, str]]:
+def _discover(
+    root: Path, kind: str, buckets: set[str] | None
+) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
     for path in sorted(root.glob("*/*.parquet")):
         bucket = path.parent.name
@@ -1529,7 +1633,13 @@ def _rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total": total.as_dict(),
         "by_kind": {k: v.as_dict() for k, v in sorted(by_kind.items())},
-        "by_bucket": {k: v.as_dict() for k, v in sorted(by_bucket.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else kv[0])},
+        "by_bucket": {
+            k: v.as_dict()
+            for k, v in sorted(
+                by_bucket.items(),
+                key=lambda kv: int(kv[0]) if kv[0].isdigit() else kv[0],
+            )
+        },
         "by_kind_bucket": {k: v.as_dict() for k, v in sorted(by_kind_bucket.items())},
         "bad_files": bad_files[:10000],
     }
@@ -1596,13 +1706,29 @@ def _write_md(report: dict[str, Any], path: Path) -> None:
             f"| {kind} | {fmt_int(stats['files'])} | {fmt_int(stats['rows'])} | "
             f"{fmt_int(stats['valid_tokens'])} | {fmt_int(stats['capacity_tokens'])} | {fmt_int(stats['bad_rows'])} |"
         )
-    lines.extend(["", "## By Kind/Bucket", "", "| split | files | rows | valid tokens | capacity tokens | pad pct | bad rows |", "|---|---:|---:|---:|---:|---:|---:|"])
+    lines.extend(
+        [
+            "",
+            "## By Kind/Bucket",
+            "",
+            "| split | files | rows | valid tokens | capacity tokens | pad pct | bad rows |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for key, stats in report["by_kind_bucket"].items():
         lines.append(
             f"| {key} | {fmt_int(stats['files'])} | {fmt_int(stats['rows'])} | "
             f"{fmt_int(stats['valid_tokens'])} | {fmt_int(stats['capacity_tokens'])} | {stats['pad_pct']} | {fmt_int(stats['bad_rows'])} |"
         )
-    lines.extend(["", "## Field Coverage And Correctness", "", "| field | rows present % | rows nonempty % | rows nonzero % | slots nonzero % | bad length rows | bad value rows | missing files |", "|---|---:|---:|---:|---:|---:|---:|---:|"])
+    lines.extend(
+        [
+            "",
+            "## Field Coverage And Correctness",
+            "",
+            "| field | rows present % | rows nonempty % | rows nonzero % | slots nonzero % | bad length rows | bad value rows | missing files |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for field_name, stats in total["fields"].items():
         lines.append(
             f"| `{field_name}` | {stats['rows_present_pct']} | {stats['rows_nonempty_pct']} | "
@@ -1620,8 +1746,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--code-root", type=Path, required=True)
     ap.add_argument("--commit-root", type=Path, required=True)
     ap.add_argument("--pr-root", type=Path, required=True)
-    ap.add_argument("--buckets", default="", help="Comma-separated buckets to include, e.g. 1024,2048")
-    ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)))
+    ap.add_argument(
+        "--buckets",
+        default="",
+        help="Comma-separated buckets to include, e.g. 1024,2048",
+    )
+    ap.add_argument(
+        "--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2))
+    )
     ap.add_argument("--vocab-size", type=int, default=65536)
     ap.add_argument("--out-dir", type=Path, default=Path("outputs/sidecar_audit"))
     ap.add_argument(
@@ -1665,7 +1797,13 @@ def main(argv: list[str] | None = None) -> int:
 
     report = _rollup(results)
     has_bad = bool(report["total"]["bad_files"] or report["total"]["bad_rows"])
-    status = "overridden" if has_bad and args.allow_bad else "failed" if has_bad else "passed"
+    status = (
+        "overridden"
+        if has_bad and args.allow_bad
+        else "failed"
+        if has_bad
+        else "passed"
+    )
     report["status"] = status
     report["receipt"] = {
         "contract": "cppmega_case5_domain_routes_v1",
@@ -1679,17 +1817,24 @@ def main(argv: list[str] | None = None) -> int:
         "valid_tokens": report["total"]["valid_tokens"],
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    (args.out_dir / "sidecar_parquet_audit.json").write_text(json.dumps(report, indent=2))
+    (args.out_dir / "sidecar_parquet_audit.json").write_text(
+        json.dumps(report, indent=2)
+    )
     _write_md(report, args.out_dir / "sidecar_parquet_audit.md")
-    print(json.dumps({
-        "out_dir": str(args.out_dir),
-        "files": report["total"]["files"],
-        "valid_tokens": report["total"]["valid_tokens"],
-        "capacity_tokens": report["total"]["capacity_tokens"],
-        "bad_files": report["total"]["bad_files"],
-        "bad_rows": report["total"]["bad_rows"],
-        "status": status,
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "out_dir": str(args.out_dir),
+                "files": report["total"]["files"],
+                "valid_tokens": report["total"]["valid_tokens"],
+                "capacity_tokens": report["total"]["capacity_tokens"],
+                "bad_files": report["total"]["bad_files"],
+                "bad_rows": report["total"]["bad_rows"],
+                "status": status,
+            },
+            indent=2,
+        )
+    )
     if has_bad and not args.allow_bad:
         # FAIL-CLOSED default: block the upload by exiting non-zero.
         print(
