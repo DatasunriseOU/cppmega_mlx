@@ -2,11 +2,11 @@
 
 A :class:`TrajectoryPacket` is a temporally-ordered sequence of
 :class:`Transition` steps.  Each transition carries a *current observation*
-(``obs``) and the *next observation* (``next_obs``) the world model must
-predict, plus the token-aligned edit-supervision channels that describe WHICH
-tokens changed (``change_mask`` from ``token_change_mask_post``,
-``edit_ops`` from ``edit_op_per_token``, ``hunk_ids`` from
-``hunk_id_per_token``).
+(``obs``), the action applied to it (``action``), and the *next observation*
+(``next_obs``) the world model must predict, plus the token-aligned
+edit-supervision channels that describe WHICH tokens changed (``change_mask``
+from ``token_change_mask_post``, ``edit_ops`` from ``edit_op_per_token``,
+``hunk_ids`` from ``hunk_id_per_token``).
 
 The trajectory is the temporal counterpart of :class:`CommitPacket`: one real
 commit transition turns into one :class:`Transition` whose ``obs`` is the
@@ -17,9 +17,9 @@ RULE #1 (fail fast / fail loud, NO fabricated labels):
 * Real commit transitions have ``reward = None`` and ``done = None`` — they are
   NEVER fabricated.  Reward / done are populated ONLY when a caller explicitly
   supplies a (clearly synthetic) label via :meth:`with_synthetic_control`.
-* ``__post_init__`` validates every token-aligned channel length against the
-  relevant observation and RAISES with WHERE + WHAT on any mismatch.  No silent
-  truncation, no padding-to-fit.
+* ``__post_init__`` requires a non-empty integer action and validates every
+  token-aligned channel length against the relevant observation.  It RAISES
+  with WHERE + WHAT on any mismatch.  No silent truncation, no padding-to-fit.
 
 Construction from the REAL ``tests/fixtures/golden_mini/commits`` fixture goes
 through :func:`load_golden_mini_transitions`, which pairs the post-edit "chain"
@@ -85,9 +85,9 @@ def _check_aligned(name: str, value: mx.array | None, ref: mx.array, *, ref_name
 
 @dataclass(frozen=True)
 class Transition:
-    """One world-model step: ``obs`` -> ``next_obs`` with edit supervision.
+    """One world-model step: ``(obs, action)`` -> ``next_obs``.
 
-    ``obs`` / ``next_obs`` are token-id vectors ``(S_obs,)`` / ``(S_next,)``.
+    ``obs`` / ``action`` / ``next_obs`` are non-empty integer token-id vectors.
     ``change_mask`` / ``edit_ops`` / ``hunk_ids`` align to ``next_obs`` (they
     describe which of the next-observation tokens were inserted/modified by the
     edit).  ``reward`` / ``done`` are ``None`` for real transitions and are only
@@ -95,6 +95,7 @@ class Transition:
     """
 
     obs: mx.array
+    action: mx.array
     next_obs: mx.array
     change_mask: mx.array | None = None
     edit_ops: mx.array | None = None
@@ -105,7 +106,7 @@ class Transition:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for name in ("obs", "next_obs"):
+        for name in ("obs", "action", "next_obs"):
             value = getattr(self, name)
             if not isinstance(value, mx.array):
                 raise TypeError(
@@ -117,6 +118,12 @@ class Transition:
                 )
             if int(value.shape[0]) < 1:
                 raise ValueError(f"Transition.{name} must be non-empty")
+            if not mx.issubdtype(value.dtype, mx.integer):
+                raise TypeError(
+                    f"Transition.{name} must contain integer token ids, got {value.dtype}"
+                )
+            if bool(mx.any(value < 0).item()):
+                raise ValueError(f"Transition.{name} token ids must be non-negative")
 
         _check_aligned("change_mask", self.change_mask, self.next_obs, ref_name="next_obs")
         _check_aligned("edit_ops", self.edit_ops, self.next_obs, ref_name="next_obs")
@@ -157,6 +164,7 @@ class Transition:
         meta["synthetic_control"] = True
         return Transition(
             obs=self.obs,
+            action=self.action,
             next_obs=self.next_obs,
             change_mask=self.change_mask,
             edit_ops=self.edit_ops,
@@ -221,15 +229,15 @@ def _pre_post_split(
     change_mask_post: np.ndarray,
     edit_ops: np.ndarray,
     hunk_ids: np.ndarray,
-) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Split one post-edit document into a (pre-context, post-region) transition.
 
     The post-change tokens (``change_mask_post == 1``) are the inserted/modified
-    region.  Everything strictly before the FIRST changed token is the pre-edit
-    *context* observation; the changed region (from the first changed token to
-    the end of the final contiguous changed span) is the *next* observation the
-    world model must predict.  This is a real, label-free transition extracted
-    directly from the commit's edit signal — nothing is fabricated.
+    region and therefore the typed edit action. Everything strictly before the
+    FIRST changed token is the pre-edit *context* observation; the changed region
+    (from the first changed token to the final changed token) is the *next*
+    observation the world model must predict. This is a real, label-free
+    transition extracted directly from the commit's edit signal.
     """
 
     changed = np.nonzero(change_mask_post.astype(np.int64))[0]
@@ -244,11 +252,13 @@ def _pre_post_split(
         )
     pre = token_ids[:first]
     post = token_ids[first : last + 1]
+    action = token_ids[changed]
     post_mask = change_mask_post[first : last + 1]
     post_ops = edit_ops[first : last + 1]
     post_hunks = hunk_ids[first : last + 1]
     return (
         mx.array(pre.astype(np.int32)),
+        mx.array(action.astype(np.int32)),
         mx.array(post.astype(np.int32)),
         mx.array(post_mask.astype(np.int32)),
         mx.array(post_ops.astype(np.int32)),
@@ -306,11 +316,12 @@ def load_golden_mini_transitions(
         if int(change_mask_post.sum()) == 0:
             # No post-edit region in this document; not a transition.
             continue
-        pre, post, post_mask, post_ops, post_hunks = _pre_post_split(
+        pre, action, post, post_mask, post_ops, post_hunks = _pre_post_split(
             token_ids, change_mask_post, edit_ops, hunk_ids
         )
         transition = Transition(
             obs=pre,
+            action=action,
             next_obs=post,
             change_mask=post_mask,
             edit_ops=post_ops,

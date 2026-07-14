@@ -1,8 +1,8 @@
 """Code-edit world model whose dynamics core IS the FPRM stable looped core.
 
 ``CodeLoopWorldModel`` predicts the *next observation* (the post-edit code
-region) of a code-edit transition from the *current observation* (the pre-edit
-context).  Its latent dynamics are driven by the SAME weight-tied
+region) of a code-edit transition from the *current observation* and the action
+applied to it.  Its latent dynamics are driven by the SAME weight-tied
 :class:`~cppmega_mlx.nn.stable_loop.StableFixedPointLoop` that backs the looped
 LM — this module does NOT reimplement the loop; it constructs one and asserts
 ``isinstance(self.dynamics, StableFixedPointLoop)``.
@@ -38,6 +38,7 @@ Regularizers:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -115,6 +116,14 @@ class CodeLoopWorldModel(nn.Module):
         self.encoder_norm = nn.RMSNorm(cfg.hidden_size)
         self.encoder_mlp = SwiGLUMLP(cfg.hidden_size, cfg.ffn_hidden_size)
 
+        # Actions use the same token vocabulary but a distinct encoder. The
+        # transition projection makes the stable loop's injected input depend on
+        # both the previous latent state and the action latent.
+        self.action_encoder_norm = nn.RMSNorm(cfg.hidden_size)
+        self.action_encoder_mlp = SwiGLUMLP(cfg.hidden_size, cfg.ffn_hidden_size)
+        self.transition_norm = nn.RMSNorm(2 * cfg.hidden_size)
+        self.transition_projection = nn.Linear(2 * cfg.hidden_size, cfg.hidden_size)
+
         # Dynamics core: THE StableFixedPointLoop over a shared RouteCore.
         self.route_core = RouteCore(loop_cfg)
         self.dynamics = StableFixedPointLoop(
@@ -146,42 +155,98 @@ class CodeLoopWorldModel(nn.Module):
     # ------------------------------------------------------------------ #
     # Encoding / dynamics
     # ------------------------------------------------------------------ #
-    def _embed_tokens(self, tokens: mx.array) -> mx.array:
+    def _embed_tokens(self, tokens: mx.array, *, where: str) -> mx.array:
+        if not isinstance(tokens, mx.array):
+            raise TypeError(f"{where} tokens must be an mx.array, got {type(tokens).__name__}")
         if tokens.ndim != 2:
-            raise ValueError(f"tokens must be (B, S), got {tuple(tokens.shape)}")
+            raise ValueError(f"{where} tokens must be (B, S), got {tuple(tokens.shape)}")
+        if int(tokens.shape[0]) < 1:
+            raise ValueError(f"{where} token batch must be non-empty")
         seq = int(tokens.shape[1])
+        if seq < 1:
+            raise ValueError(f"{where} token sequence must be non-empty")
         if seq > self.config.max_seq_length:
             raise ValueError(
-                f"sequence length {seq} exceeds max_seq_length {self.config.max_seq_length}"
+                f"{where} sequence length {seq} exceeds max_seq_length "
+                f"{self.config.max_seq_length}"
+            )
+        if not mx.issubdtype(tokens.dtype, mx.integer):
+            raise TypeError(f"{where} tokens must contain integer ids, got {tokens.dtype}")
+        min_token = int(mx.min(tokens).item())
+        max_token = int(mx.max(tokens).item())
+        if min_token < 0 or max_token >= self.config.vocab_size:
+            raise ValueError(
+                f"{where} token ids must be in [0, {self.config.vocab_size}), got "
+                f"range [{min_token}, {max_token}]"
             )
         positions = mx.arange(seq)[None, :]
         return self.token_embedding(tokens) + self.position_embedding(positions)
 
     def encode(self, tokens: mx.array) -> mx.array:
         """Encode an observation ``(B, S)`` to a latent ``(B, D)`` (mean pool)."""
-        hidden = self._embed_tokens(tokens)
+        hidden = self._embed_tokens(tokens, where="observation")
         hidden = hidden + self.encoder_mlp(self.encoder_norm(hidden))
+        return mx.mean(hidden, axis=1)
+
+    def encode_action(self, tokens: mx.array) -> mx.array:
+        """Encode action tokens ``(B, A)`` to an action latent ``(B, D)``."""
+
+        hidden = self._embed_tokens(tokens, where="action")
+        hidden = hidden + self.action_encoder_mlp(self.action_encoder_norm(hidden))
         return mx.mean(hidden, axis=1)
 
     def step_latent(
         self,
-        latent: mx.array,
+        previous_latent: mx.array,
+        action: mx.array,
         *,
         training_loops: int | None = None,
     ) -> mx.array:
-        """Roll the latent forward ONE world-model step via the looped core.
+        """Roll ``previous_latent`` forward under one typed action.
 
-        The latent ``(B, D)`` is treated as a length-1 sequence so the shared
-        route-core attention/FFN sublayers apply unchanged; the injected input to
-        the iteration mix is the same latent (autonomous dynamics).
+        The previous latent remains the stable loop's initial state ``z0``. The
+        injected input ``x`` is a learned fusion of the previous state and encoded
+        action, so action conditioning survives fixed-point iteration instead of
+        existing only in the initial state.
         """
 
-        z = latent[:, None, :]  # (B, 1, D)
+        if not isinstance(previous_latent, mx.array):
+            raise TypeError(
+                "previous_latent must be an mx.array, got "
+                f"{type(previous_latent).__name__}"
+            )
+        if (
+            previous_latent.ndim != 2
+            or int(previous_latent.shape[1]) != self.config.hidden_size
+        ):
+            raise ValueError(
+                "previous_latent must be (B, D) with "
+                f"D={self.config.hidden_size}, got {tuple(previous_latent.shape)}"
+            )
+        if int(previous_latent.shape[0]) < 1:
+            raise ValueError("previous_latent batch must be non-empty")
+        if not mx.issubdtype(previous_latent.dtype, mx.floating):
+            raise TypeError(
+                "previous_latent must contain floating-point values, got "
+                f"{previous_latent.dtype}"
+            )
+
+        action_latent = self.encode_action(action)
+        if int(action_latent.shape[0]) != int(previous_latent.shape[0]):
+            raise ValueError(
+                f"action batch {int(action_latent.shape[0])} != previous_latent batch "
+                f"{int(previous_latent.shape[0])}"
+            )
+
+        transition_features = mx.concatenate((previous_latent, action_latent), axis=-1)
+        injected = self.transition_projection(self.transition_norm(transition_features))
+        z = previous_latent[:, None, :]  # (B, 1, D)
+        x = injected[:, None, :]  # (B, 1, D)
         loops = training_loops if training_loops is not None else self.config.train_loops
         if loops < 0:
-            rolled = self.dynamics.forward(z, z, None, training_loops=None)
+            rolled = self.dynamics.forward(z, x, None, training_loops=None)
         else:
-            rolled = self.dynamics.forward(z, z, None, training_loops=loops)
+            rolled = self.dynamics.forward(z, x, None, training_loops=loops)
         return rolled[:, 0, :]  # (B, D)
 
     # ------------------------------------------------------------------ #
@@ -212,17 +277,18 @@ class CodeLoopWorldModel(nn.Module):
     def predict_next(
         self,
         obs: mx.array,
+        action: mx.array,
         length: int,
         *,
         training_loops: int | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Predict next-observation logits ``(B, L, V)`` and return the latent.
 
-        One world-model step: encode ``obs`` -> roll latent -> decode ``length``.
+        One world-model step: encode ``obs`` -> apply ``action`` -> decode.
         """
 
         latent = self.encode(obs)
-        rolled = self.step_latent(latent, training_loops=training_loops)
+        rolled = self.step_latent(latent, action, training_loops=training_loops)
         logits = self.decode(rolled, length)
         return logits, rolled
 
@@ -243,6 +309,7 @@ class CodeLoopWorldModel(nn.Module):
     def rollout(
         self,
         obs: mx.array,
+        actions: Sequence[mx.array],
         horizon: int,
         length: int,
         *,
@@ -255,17 +322,17 @@ class CodeLoopWorldModel(nn.Module):
         decoded.
         """
 
-        if horizon < 1:
-            raise ValueError(f"horizon must be >= 1, got {horizon}")
+        action_steps = self._validate_rollout_actions(actions, horizon)
         latent = self.encode(obs)
-        for _ in range(horizon):
-            latent = self.step_latent(latent, training_loops=training_loops)
+        for action in action_steps:
+            latent = self.step_latent(latent, action, training_loops=training_loops)
         logits = self.decode(latent, length)
         return logits, latent
 
     def rollout_decode_all(
         self,
         obs: mx.array,
+        actions: Sequence[mx.array],
         horizon: int,
         length: int,
         *,
@@ -278,23 +345,43 @@ class CodeLoopWorldModel(nn.Module):
         output because both decode the same terminal latent.
         """
 
-        if horizon < 1:
-            raise ValueError(f"horizon must be >= 1, got {horizon}")
+        action_steps = self._validate_rollout_actions(actions, horizon)
         latent = self.encode(obs)
         per_step: list[mx.array] = []
-        for _ in range(horizon):
-            latent = self.step_latent(latent, training_loops=training_loops)
+        for action in action_steps:
+            latent = self.step_latent(latent, action, training_loops=training_loops)
             per_step.append(self.decode(latent, length))
         return per_step
+
+    @staticmethod
+    def _validate_rollout_actions(
+        actions: Sequence[mx.array], horizon: int
+    ) -> tuple[mx.array, ...]:
+        if horizon < 1:
+            raise ValueError(f"horizon must be >= 1, got {horizon}")
+        if isinstance(actions, mx.array) or not isinstance(actions, Sequence):
+            raise TypeError("actions must be a sequence containing one (B, A) array per step")
+        action_steps = tuple(actions)
+        if len(action_steps) != horizon:
+            raise ValueError(
+                f"actions length {len(action_steps)} != rollout horizon {horizon}"
+            )
+        for index, action in enumerate(action_steps):
+            if not isinstance(action, mx.array):
+                raise TypeError(
+                    f"actions[{index}] must be an mx.array, got {type(action).__name__}"
+                )
+        return action_steps
 
     def __call__(
         self,
         obs: mx.array,
+        action: mx.array,
         length: int,
         *,
         training_loops: int | None = None,
     ) -> tuple[mx.array, mx.array]:
-        return self.predict_next(obs, length, training_loops=training_loops)
+        return self.predict_next(obs, action, length, training_loops=training_loops)
 
 
 __all__ = [

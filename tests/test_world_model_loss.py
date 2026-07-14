@@ -7,6 +7,10 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
+from cppmega_mlx.data.agent_trajectory import (
+    AgentTransition,
+    agent_transitions_to_trajectory_packet,
+)
 from cppmega_mlx.data.trajectory_packet import (
     Transition,
     TrajectoryPacket,
@@ -29,6 +33,11 @@ _GOLDEN_COMMITS = (
     / "commits"
     / "commits.parquet"
 )
+
+
+class _ByteTokenizer:
+    def encode(self, text: str) -> list[int]:
+        return [1 + (byte % 63) for byte in text.encode("utf-8")]
 
 
 def _real_trajectories() -> list[TrajectoryPacket]:
@@ -135,6 +144,7 @@ def test_reward_done_run_only_on_synthetic_labels() -> None:
     else:  # pragma: no cover - fixture always present in this repo
         base = Transition(
             obs=mx.array([1, 2, 3, 4], dtype=mx.int32),
+            action=mx.array([8, 9], dtype=mx.int32),
             next_obs=mx.array([5, 6, 7], dtype=mx.int32),
         )
         model = CodeLoopWorldModel(
@@ -159,6 +169,7 @@ def test_real_transition_in_loss_never_touches_control_heads() -> None:
     # contributes a reward/done term.
     base = Transition(
         obs=mx.array([1, 2, 3, 4], dtype=mx.int32),
+        action=mx.array([8, 9], dtype=mx.int32),
         next_obs=mx.array([5, 6, 7], dtype=mx.int32),
         change_mask=mx.array([1, 1, 0], dtype=mx.int32),
     )
@@ -172,3 +183,59 @@ def test_real_transition_in_loss_never_touches_control_heads() -> None:
     assert breakdown.done_ran_on_synthetic is False
     assert float(breakdown.reward.item()) == 0.0
     assert float(breakdown.done.item()) == 0.0
+
+
+def test_next_obs_loss_changes_with_packet_action() -> None:
+    mx.random.seed(11)
+    model = CodeLoopWorldModel(
+        CodeLoopWorldModelConfig(vocab_size=64, hidden_size=32, max_seq_length=64)
+    )
+    common = {
+        "obs": mx.array([1, 2, 3, 4], dtype=mx.int32),
+        "next_obs": mx.array([5, 6, 7], dtype=mx.int32),
+    }
+    action_a = Transition(
+        action=mx.array([8, 9], dtype=mx.int32),
+        **common,
+    )
+    action_b = Transition(
+        action=mx.array([10, 11], dtype=mx.int32),
+        **common,
+    )
+
+    loss_a = world_model_loss(model, TrajectoryPacket(transitions=(action_a,)))
+    loss_b = world_model_loss(model, TrajectoryPacket(transitions=(action_b,)))
+
+    assert not bool(mx.allclose(loss_a.next_obs, loss_b.next_obs).item())
+
+
+def test_extracted_agent_packet_runs_through_action_conditioned_loss() -> None:
+    extracted = AgentTransition(
+        session_id="session-1",
+        source="codex",
+        repo="/repo",
+        step_idx=0,
+        obs_text="inspect state",
+        action_kind="read",
+        action_payload='{"tool":"Read","path":"src/a.cpp"}',
+        result_text="int value = 1;",
+        exit_code=None,
+        is_build=False,
+        is_test=False,
+        reward=None,
+        edit_diff=None,
+    )
+    packet = agent_transitions_to_trajectory_packet([extracted], _ByteTokenizer())
+    model = CodeLoopWorldModel(
+        CodeLoopWorldModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            max_seq_length=128,
+            train_loops=2,
+        )
+    )
+
+    breakdown = world_model_loss(model, packet)
+
+    assert breakdown.num_real_transitions == 1
+    assert bool(mx.isfinite(breakdown.total).item())
