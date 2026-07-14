@@ -1049,15 +1049,7 @@ def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
         "document_id",
         "doc_id",
     )
-    if any(record.get(column) is not None for column in explicit):
-        return True
-    provenance = (
-        REPO_STABLE_ID_COLUMN,
-        FILEPATH_STABLE_ID_COLUMN,
-        COMMIT_HASH_COLUMN,
-        FILE_LOCAL_COMMIT_INDEX_COLUMN,
-    )
-    return any(record.get(column) is not None for column in provenance)
+    return any(record.get(column) is not None for column in explicit)
 
 
 def _stable_doc_id_for_record(
@@ -1375,12 +1367,16 @@ def _materialize_packed_row(
 
     token_offset = 0
     chunk_offset = 0
-    # ``doc_ids`` is a row-local attention/loss boundary channel.  It must
-    # identify every logical packed document independently, even when two
-    # documents share file-level provenance (for example two functions from the
-    # same header).  ``stable_doc_id`` remains provenance metadata; using it here
-    # collapsed those functions into one segment and trained across the boundary.
-    for row_doc_id, doc in enumerate(ordered_docs, start=1):
+    # ``doc_ids`` is row-local, but explicit fragments of the same logical
+    # source document keep one boundary id across input shards. Physical
+    # repo/file provenance alone never merges rows: producers must provide an
+    # explicit source_doc_id when a document is intentionally fragmented.
+    stable_to_row_doc_id: dict[int, int] = {}
+    for doc in ordered_docs:
+        row_doc_id = stable_to_row_doc_id.setdefault(
+            doc.stable_doc_id,
+            len(stable_to_row_doc_id) + 1,
+        )
         symbol_identity_registry.register_records(
             doc.symbol_identities,
             source=f"packed row {pack_id}:source_doc_index={doc.source_doc_index}",
@@ -1486,7 +1482,7 @@ def _materialize_packed_row(
         _loss_mask_for_packed_docs(doc_ids, target_length=valid_token_count)
     )
     slack_tokens = row_length - valid_token_count
-    pad_doc_id = max(len(ordered_docs), max(doc_ids, default=0)) if doc_ids else 0
+    pad_doc_id = max(stable_to_row_doc_id.values(), default=0)
     used_symbol_ids = {
         int(value)
         for column in (
@@ -1506,7 +1502,7 @@ def _materialize_packed_row(
         PACK_ID_COLUMN: int(pack_id),
         VALID_TOKEN_COUNT_COLUMN: int(valid_token_count),
         TRAINED_TOKEN_COUNT_COLUMN: int(trained_token_count),
-        NUM_DOCS_COLUMN: int(len(ordered_docs)),
+        NUM_DOCS_COLUMN: int(len(stable_to_row_doc_id)),
         SLACK_TOKENS_COLUMN: int(slack_tokens),
         INPUT_IDS_COLUMN: _pad(concatenated_tokens, row_length, pad_value=pad_token_id),
         TARGET_IDS_COLUMN: _target_ids_for_packed_tokens(

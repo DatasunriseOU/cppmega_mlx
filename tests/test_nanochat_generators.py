@@ -38,6 +38,8 @@ from scripts.nanochat_data import clang_enriched_to_parquet
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
+    LOSS_MASK_COLUMN,
+    NUM_DOCS_COLUMN,
     read_tokenized_documents,
     pack_documents,
 )
@@ -697,6 +699,41 @@ def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
     assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 3, 4, 9, 10]
     assert rows[0][DOC_IDS_COLUMN][0] == rows[0][DOC_IDS_COLUMN][2]
     assert rows[0][DOC_IDS_COLUMN][3] != rows[0][DOC_IDS_COLUMN][4]
+    assert rows[0][LOSS_MASK_COLUMN] == [1, 1, 1, 0, 1, 0]
+    assert rows[0][NUM_DOCS_COLUMN] == 2
+
+
+def test_pack_enriched_rows_does_not_merge_file_provenance_without_logical_id(
+    tmp_path: Path,
+) -> None:
+    shard = tmp_path / "train_00000.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[1, 2], [3, 4]],
+                "repo_stable_id": ["repo", "repo"],
+                "filepath_stable_id": ["include/shared.hpp", "include/shared.hpp"],
+            }
+        ),
+        shard,
+    )
+
+    docs = read_tokenized_documents(shard)
+    assert [(doc.source_doc_index, doc.stable_doc_id) for doc in docs] == [
+        (0, 1),
+        (1, 2),
+    ]
+    rows, overflow = pack_documents(
+        docs,
+        target_length=4,
+        pad_token_id=0,
+        strategy="sequential",
+    )
+
+    assert overflow == []
+    assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2]
+    assert rows[0][LOSS_MASK_COLUMN] == [1, 0, 1, 0]
+    assert rows[0][NUM_DOCS_COLUMN] == 2
 
 
 def test_token_budget_slices_semantic_char_metadata() -> None:
