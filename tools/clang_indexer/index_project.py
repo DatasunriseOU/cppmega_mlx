@@ -2740,6 +2740,7 @@ def _is_sane_compile_args(args: list[str]) -> bool:
 
 _SIMPLE_FALLBACK_ARGS = ["-fsyntax-only", "-Wno-everything"]
 DEFAULT_PARSE_BATCH_FILES = 25
+PARSE_SUBMIT_WINDOW_PER_WORKER = 2
 PARSE_HEARTBEAT_FILES = 25
 PARSE_HEARTBEAT_SECONDS = 30.0
 
@@ -3913,6 +3914,30 @@ def _mask_non_code(text: str) -> str:
         index += 1
 
     return "".join(masked)
+
+
+def _split_source_and_masked_lines(text: str) -> tuple[list[str], list[str]]:
+    """Split source and its mask at the exact same physical boundaries."""
+
+    masked = _mask_non_code(text)
+    if len(masked) != len(text):
+        raise RuntimeError(
+            "non-code mask changed source length: "
+            f"source={len(text)} masked={len(masked)}"
+        )
+    source_lines = text.splitlines(keepends=True)
+    code_lines: list[str] = []
+    offset = 0
+    for line in source_lines:
+        end = offset + len(line)
+        code_lines.append(masked[offset:end])
+        offset = end
+    if offset != len(text):
+        raise RuntimeError(
+            "source line split did not cover complete input: "
+            f"covered={offset} source={len(text)}"
+        )
+    return source_lines, code_lines
 
 
 def _iter_code_identifiers(text: str) -> Iterator[re.Match[str]]:
@@ -5338,8 +5363,7 @@ def _is_probable_include_guard_define(macro_text: str, name: str) -> bool:
 
 def extract_macro_blocks(text: str) -> list[tuple[int, int, str, str]]:
     """Return trainable ``#define`` logical lines, preserving continuations."""
-    lines = text.splitlines(keepends=True)
-    code_lines = _mask_non_code(text).splitlines(keepends=True)
+    lines, code_lines = _split_source_and_masked_lines(text)
     blocks: list[tuple[int, int, str, str]] = []
     offset = 0
     line_offsets: list[int] = []
@@ -5662,8 +5686,7 @@ def register_header_macros(
         except OSError as exc:
             raise RuntimeError(f"failed to read C/C++ file for macro scan: {norm_abs}") from exc
 
-        lines = file_text.splitlines(keepends=True)
-        code_lines = _mask_non_code(file_text).splitlines(keepends=True)
+        lines, code_lines = _split_source_and_masked_lines(file_text)
         stats["directive_file_reads"] += 1
         events: list[dict[str, object]] = []
         i = 0
@@ -7368,80 +7391,39 @@ def _parse_file_batch(args_tuple):
     return {"functions": func_results, "typedefs": type_results}, len(filepaths), errors
 
 
-def _iter_parse_batch_results(executor, batches):
-    """Yield parse batch results as workers finish, not in submit order."""
-    futures = [executor.submit(_parse_file_batch, batch) for batch in batches]
-    for future in as_completed(futures):
-        yield future.result()
-
-
-def _parse_single_file_worker(args_tuple):
-    """Parse one file in a fresh subprocess so a segfault is file-local."""
-    filepath, compile_db, default_args, project_dir, project_id = args_tuple
-    sys.setrecursionlimit(50000)
-    _configure_libclang()
-    clang_index = Index.create()
-    args = _resolve_file_args(filepath, compile_db, default_args)
-    functions, typedefs = parse_translation_unit(
-        filepath,
-        clang_index,
-        args,
-        project_dir,
-        project_id=project_id,
-    )
-    return {
-        "functions": [f.to_dict() for f in functions],
-        "typedefs": [t.to_dict() for t in typedefs],
-    }
-
-
-def _parse_files_isolated(
-    cpp_files: list[str],
-    compile_db: dict | None,
-    default_args: list[str],
-    project_dir: str,
-    project_id: str,
+def _iter_parse_batch_results(
+    executor,
+    batches: Iterable,
     *,
-    max_workers: int,
-) -> tuple[ProjectIndex, int, int]:
-    """Parse files via one-file subprocess tasks so crashes don't kill the whole repo."""
-    index_obj = ProjectIndex()
-    parsed = 0
-    errors = 0
-    worker_count = max(1, max_workers)
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(
-                _parse_single_file_worker,
-                (filepath, compile_db, default_args, project_dir, project_id),
-            ): filepath
-            for filepath in cpp_files
-        }
-        for future in as_completed(futures):
-            filepath = futures[future]
-            try:
-                payload = future.result(timeout=120)  # 2 min per file
-                for d in payload["functions"]:
-                    index_obj.add_function(FunctionDef.from_dict(d))
-                for td in payload["typedefs"]:
-                    index_obj.add_typedef(TypeDef.from_dict(td))
-                parsed += 1
-            except TimeoutError:
-                errors += 1
-                if errors <= 5:
-                    print(f"  TIMEOUT parsing {filepath} (>120s)", file=sys.stderr)
-            except SymbolIdentityError:
-                raise
-            except Exception as e:
-                errors += 1
-                if errors <= 5:
-                    print(f"  ERROR parsing {filepath}: {e}", file=sys.stderr)
-            if parsed % 500 == 0 and parsed > 0:
-                print(
-                    f"  Parsed {parsed}/{len(cpp_files)} files, {len(index_obj.functions)} functions",
-                    file=sys.stderr,
-                )
-    return index_obj, parsed, errors
+    max_in_flight: int,
+):
+    """Yield every batch result while retaining only a bounded future window."""
+
+    if max_in_flight <= 0:
+        raise ValueError(f"max_in_flight must be positive, got {max_in_flight}")
+    batch_iter = iter(batches)
+    pending = set()
+
+    def submit_one() -> bool:
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            return False
+        pending.add(executor.submit(_parse_file_batch, batch))
+        return True
+
+    try:
+        while len(pending) < max_in_flight and submit_one():
+            pass
+        while pending:
+            future = next(as_completed(tuple(pending)))
+            pending.remove(future)
+            yield future.result()
+            while len(pending) < max_in_flight and submit_one():
+                pass
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 def process_project(
@@ -7548,6 +7530,15 @@ def process_project(
             f"(max {DEFAULT_PARSE_BATCH_FILES}; bounded IPC payload)",
             file=sys.stderr,
         )
+        submit_window = max(
+            1,
+            effective_workers * PARSE_SUBMIT_WINDOW_PER_WORKER,
+        )
+        print(
+            f"  Parse submit window: {submit_window} batches "
+            f"({PARSE_SUBMIT_WINDOW_PER_WORKER} per worker)",
+            file=sys.stderr,
+        )
         batches = []
         for i in range(0, len(cpp_files), chunk_size):
             batch = cpp_files[i:i + chunk_size]
@@ -7557,41 +7548,30 @@ def process_project(
 
         total_parsed = 0
         total_errors = 0
-        try:
-            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                for payload, parsed_count, error_count in _iter_parse_batch_results(
-                    executor,
-                    batches,
-                ):
-                    for d in payload["functions"]:
-                        index_obj.add_function(FunctionDef.from_dict(d))
-                    for td in payload["typedefs"]:
-                        index_obj.add_typedef(TypeDef.from_dict(td))
-                    total_parsed += parsed_count
-                    total_errors += error_count
-                    check_memory_limit(memory_limit_gb, label="index_project")
-                    print(f"  Parsed {total_parsed}/{len(cpp_files)} files, "
-                          f"{len(index_obj.functions)} functions", file=sys.stderr)
+        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            for payload, parsed_count, error_count in _iter_parse_batch_results(
+                executor,
+                batches,
+                max_in_flight=submit_window,
+            ):
+                for d in payload["functions"]:
+                    index_obj.add_function(FunctionDef.from_dict(d))
+                for td in payload["typedefs"]:
+                    index_obj.add_typedef(TypeDef.from_dict(td))
+                total_parsed += parsed_count
+                total_errors += error_count
+                check_memory_limit(memory_limit_gb, label="index_project")
+                print(
+                    f"  Parsed {total_parsed}/{len(cpp_files)} files, "
+                    f"{len(index_obj.functions)} functions",
+                    file=sys.stderr,
+                )
 
-            print(f"  Parsed {total_parsed} files ({total_errors} errors), "
-                  f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
-        except SymbolIdentityError:
-            raise
-        except Exception as exc:
-            print(
-                f"  WARN: parallel parse failed ({exc}); retrying isolated per-file workers",
-                file=sys.stderr,
-            )
-            index_obj, parsed, errors = _parse_files_isolated(
-                cpp_files,
-                compile_db,
-                default_args,
-                project_dir,
-                stable_project_id,
-                max_workers=min(4, effective_workers),
-            )
-            print(f"  Parsed {parsed} files ({errors} errors), "
-                  f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
+        print(
+            f"  Parsed {total_parsed} files ({total_errors} errors), "
+            f"{len(index_obj.functions)} functions indexed",
+            file=sys.stderr,
+        )
     else:
         # Sequential for small projects
         clang_index = Index.create()

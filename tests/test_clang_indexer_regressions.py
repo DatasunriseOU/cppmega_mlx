@@ -261,6 +261,35 @@ const char *raw = R"tag(
     assert set(index.macros_by_name) == {"REAL_MACRO"}
 
 
+def test_macro_scanner_keeps_raw_and_masked_lines_aligned_across_form_feed(
+    tmp_path: Path,
+) -> None:
+    header = tmp_path / "bsd_page.h"
+    header.write_text(
+        "#define BEFORE 1\n"
+        "/* old BSD page\fbreak */\n"
+        "#define AFTER(x) ((x) + BEFORE)\n"
+        "int use_after(void) { return AFTER(1); }\n",
+        encoding="utf-8",
+    )
+
+    index = ip.ProjectIndex()
+    ip.register_header_macros(
+        index,
+        [str(header)],
+        project_dir=str(tmp_path),
+        project_id="tests/clang-indexer-regressions",
+    )
+
+    assert set(index.macros_by_name) == {"BEFORE", "AFTER"}
+    assert [
+        name
+        for _start, _end, name, _text in ip.extract_macro_blocks(
+            header.read_text(encoding="utf-8")
+        )
+    ] == ["BEFORE", "AFTER"]
+
+
 def test_macro_references_ignore_comments_and_literals() -> None:
     index = ip.ProjectIndex()
     macro = ip.MacroDef(

@@ -34,10 +34,14 @@ def test_parse_batch_size_rejects_invalid_worker_count():
         index_project.compute_parse_batch_size(100, 0)
 
 
-def test_parse_batch_results_follow_completion_order(monkeypatch):
+def test_parse_batch_results_bound_in_flight_futures_without_losing_batches(
+    monkeypatch,
+):
     import index_project
 
     submitted: list[Future] = []
+    completed: list[Future] = []
+    batches = [f"batch-{index}" for index in range(7)]
 
     class FakeExecutor:
         def submit(self, _fn, batch):
@@ -47,11 +51,36 @@ def test_parse_batch_results_follow_completion_order(monkeypatch):
             return future
 
     def fake_as_completed(futures):
-        assert list(futures) == submitted
-        return reversed(submitted)
+        snapshot = list(futures)
+        assert 0 < len(snapshot) <= 2
+        selected = snapshot[-1]
+        completed.append(selected)
+        return iter([selected])
 
     monkeypatch.setattr(index_project, "as_completed", fake_as_completed)
 
-    results = list(index_project._iter_parse_batch_results(FakeExecutor(), ["slow", "fast"]))
+    results = list(
+        index_project._iter_parse_batch_results(
+            FakeExecutor(),
+            batches,
+            max_in_flight=2,
+        )
+    )
 
-    assert results == ["fast", "slow"]
+    assert len(submitted) == len(batches)
+    assert len(completed) == len(batches)
+    assert sorted(results) == batches
+
+
+def test_parse_batch_results_reject_invalid_submit_window():
+    import pytest
+    import index_project
+
+    with pytest.raises(ValueError, match="max_in_flight must be positive"):
+        list(
+            index_project._iter_parse_batch_results(
+                object(),
+                [],
+                max_in_flight=0,
+            )
+        )
