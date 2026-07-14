@@ -15,7 +15,10 @@ from cppmega_mlx.config.model import (
     LOCAL_PROFILE_VOCAB_SIZE,
     MEGACPP_TOKENIZER_VOCAB_SIZE,
 )
-from cppmega_mlx.data.batch import LMTokenBatch
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+    LMTokenBatch,
+)
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.token_dataset import BatchCursor, TokenDatasetMetadata
@@ -1195,6 +1198,14 @@ def _load_side_channels(
 ) -> dict[str, _SideChannelStorage]:
     _reject_ambiguous_side_channel_metadata(sidecar)
     entries = _side_channel_entries(sidecar)
+    if _LOSS_MASK_SIDE_CHANNEL_KEY in entries:
+        alignment = sidecar.get("loss_mask_alignment")
+        if alignment != LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1:
+            raise ValueError(
+                "loss_mask sidecar requires loss_mask_alignment="
+                f"{LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1!r}, "
+                f"got {alignment!r}"
+            )
     if any(key in entries for key in _SYMBOL_ID_SIDE_CHANNEL_KEYS):
         version = sidecar.get("symbol_identity_schema_version")
         if version != SYMBOL_IDENTITY_SCHEMA_VERSION:

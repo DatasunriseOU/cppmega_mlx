@@ -11,6 +11,9 @@ from typing import Any
 
 import numpy as np
 
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+)
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_schema import (
@@ -697,6 +700,7 @@ def write_objective_materialization_artifact(
         "format": "shifted_lm_document_v1",
         "token_column": "input_ids",
         "loss_mask_column": "loss_mask",
+        "loss_mask_alignment": LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
         "length_column": "valid_token_count",
         "objective_column": "objective_kind",
         "document_id_column": "doc_ids",
@@ -774,6 +778,7 @@ def write_objective_materialization_artifact(
             for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
         ],
         "source_platform_sidecar": "require",
+        "loss_mask_alignment": LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
         "graph_relations": list(relations),
         "graph_pair_mask": pair_mask,
         "chunk_edge_expansion": expansion,
@@ -1266,6 +1271,18 @@ def materialize_megatron_document(
         row["doc_ids"],  # type: ignore[arg-type]
         where=f"{realized.task.value}.doc_ids",
     )
+    document_ids = row["doc_ids"]
+    assert isinstance(document_ids, list)
+    leaking_transitions = [
+        index
+        for index, keep in enumerate(materialized_mask[:-1])
+        if keep and document_ids[index] != document_ids[index + 1]
+    ]
+    if leaking_transitions:
+        raise ValueError(
+            f"{realized.task.value}: loss_mask trains cross-document transitions "
+            f"at source positions {leaking_transitions[:16]}"
+        )
     graph_edge_count = sum(
         len(row[column]) for column in _GRAPH_RELATION_COLUMNS.values()
     )

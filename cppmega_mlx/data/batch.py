@@ -15,6 +15,9 @@ from cppmega_mlx.data.graph_packet import GraphBatch
 from cppmega_mlx.data.integer_validation import validated_integer_array
 
 SideChannelDropoutPolicy = Mapping[str, float]
+LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1 = (
+    "source_token_predicts_next_v1"
+)
 
 _BATCH_VALUES_PREVALIDATED: ContextVar[bool] = ContextVar(
     "cppmega_mlx_batch_values_prevalidated",
@@ -222,7 +225,9 @@ class LMTokenBatch:
     @property
     def target_mask(self) -> mx.array:
         if self.loss_mask is not None:
-            return self._target_aligned(self.loss_mask).astype(mx.float32)
+            # loss_mask[i] gates the label produced from input token i. It is a
+            # transition sidecar, not a property of target token i + 1.
+            return self._input_aligned(self.loss_mask).astype(mx.float32)
         if self.attention_mask is not None:
             return self._target_aligned(self.attention_mask).astype(mx.float32)
         return mx.ones(self.targets.shape, dtype=mx.float32)
@@ -589,6 +594,7 @@ def synthetic_token_batch(
 
 
 __all__ = [
+    "LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1",
     "LMTokenBatch",
     "SideChannelDropoutPolicy",
     "batch_values_are_prevalidated",

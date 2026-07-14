@@ -17,6 +17,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+)
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.code_packet_builder import build_commit_packets_from_packed_row
 from cppmega_mlx.data.commit_packet import CommitPacket
@@ -1025,6 +1028,16 @@ def test_materialized_causal_document_normalizes_row_local_document_ids() -> Non
     assert np.asarray(realized.example.loss_mask).tolist() == [1, 0, 1]
     assert document.row["loss_mask"] == [1, 0, 1, 0]
 
+    leaking = replace(
+        realized,
+        example=replace(realized.example, loss_mask=_arr([1, 1, 1])),
+    )
+    with pytest.raises(ValueError, match="cross-document transitions"):
+        materialize_megatron_document(
+            leaking,
+            ObjectiveSource(code_packet=packet),
+        )
+
 
 def test_production_multi_document_objective_requires_exact_platform_bags() -> None:
     packet = _with_required_token_sidecars(
@@ -1552,6 +1565,7 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
         "format": "shifted_lm_document_v1",
         "token_column": "input_ids",
         "loss_mask_column": "loss_mask",
+        "loss_mask_alignment": LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
         "length_column": "valid_token_count",
         "objective_column": "objective_kind",
         "document_id_column": "doc_ids",
@@ -1725,6 +1739,9 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
             "format": "shifted_lm_document_v1",
             "token_column": "input_ids",
             "loss_mask_column": "loss_mask",
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
             "length_column": "valid_token_count",
             "objective_column": "objective_kind",
             "document_id_column": "doc_ids",

@@ -14,6 +14,9 @@ from cppmega_mlx.training.megatron_objectives import (
     OBJECTIVE_KIND_IDS,
     objective_route_mapping_contract,
 )
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+)
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_GRAPH_RELATION_COLUMNS,
     OBJECTIVE_ROUTE_COUNT_FIELDS,
@@ -535,6 +538,9 @@ class ObjectiveContractAccumulator:
                 "format": "shifted_lm_document_v1",
                 "token_column": "input_ids",
                 "loss_mask_column": "loss_mask",
+                "loss_mask_alignment": (
+                    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+                ),
                 "length_column": "valid_token_count",
                 "objective_column": "objective_kind",
                 "document_id_column": "doc_ids",

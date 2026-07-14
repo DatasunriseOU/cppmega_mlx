@@ -20,6 +20,9 @@ from cppmega_mlx.config.model import (
     MEGACPP_TOKENIZER_VOCAB_SIZE,
 )
 from cppmega_mlx.data.domain_schema import DOMAIN_SCHEMA_SHA256
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+)
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
     open_megatron_indexed_dataset,
@@ -829,6 +832,13 @@ def _validate_objectives(
         if materialization.get("format") != "shifted_lm_document_v1":
             raise ValueError(
                 f"objective materialization format drifted for bucket {bucket}"
+            )
+        if (
+            materialization.get("loss_mask_alignment")
+            != LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+        ):
+            raise ValueError(
+                f"objective loss-mask alignment drifted for bucket {bucket}"
             )
         graph = _require_mapping(
             contract.get("graph_auxiliary"), where=f"objective {bucket} graph"

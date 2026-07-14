@@ -16,7 +16,10 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 from numpy.typing import DTypeLike
 
-from cppmega_mlx.data.batch import LMTokenBatch
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+    LMTokenBatch,
+)
 from cppmega_mlx.data.megatron_indexed import (
     MegatronIndexedDataset,
     MegatronIndexedMultiShardDataset,
@@ -1403,6 +1406,56 @@ def test_mmididx_graph_sidecars_are_sequence_aligned_routes(tmp_path) -> None:
     )
 
 
+def test_source_transition_loss_mask_blocks_cross_document_label(tmp_path) -> None:
+    prefix = tmp_path / "source_transition_mask"
+    _write_mmididx(
+        prefix,
+        [np.array([10, 11, 20, 21], dtype=np.int32)],
+        dtype=np.int32,
+    )
+    loss_mask = np.array([1, 0, 1, 0], dtype=np.uint8)
+    document_ids = np.array([1, 1, 2, 2], dtype=np.uint32)
+    loss_mask.tofile(tmp_path / "transition_loss_mask.bin")
+    document_ids.tofile(tmp_path / "transition_doc_ids.bin")
+    manifest = {
+        "token_count": 4,
+        "document_count": 1,
+        "side_channel_paths": {
+            "loss_mask": {
+                "path": "transition_loss_mask.bin",
+                "dtype": "uint8",
+            },
+            "doc_ids": {
+                "path": "transition_doc_ids.bin",
+                "dtype": "uint32",
+            },
+        },
+    }
+    metadata_path = prefix.with_suffix(".idx.json")
+    metadata_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="loss_mask_alignment"):
+        MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+    manifest["loss_mask_alignment"] = (
+        LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+    )
+    metadata_path.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    batch = next(MegatronIndexedDataset(prefix, seq_len=4, batch_size=1).iter_batches())
+
+    np.testing.assert_array_equal(np.asarray(batch.inputs), [[10, 11, 20]])
+    np.testing.assert_array_equal(np.asarray(batch.targets), [[11, 20, 21]])
+    np.testing.assert_array_equal(np.asarray(batch.target_mask), [[1, 0, 1]])
+    cross_document = np.asarray(batch.input_document_ids) != np.asarray(
+        batch.target_document_ids
+    )
+    assert int(np.asarray(batch.target_mask)[cross_document].sum()) == 0
+    assert int(np.asarray(batch.target_mask).sum()) == int(loss_mask.sum())
+
+
 def test_compact_fixed_rows_restore_padding_and_document_graphs(tmp_path) -> None:
     prefix = tmp_path / "compact_fixed_rows"
     docs = [
@@ -1436,6 +1489,9 @@ def test_compact_fixed_rows_restore_padding_and_document_graphs(tmp_path) -> Non
             "token_count": 5,
             "source_capacity_token_count": 8,
             "document_count": 2,
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
             "side_channel_paths": {
                 "loss_mask": {"path": "loss_mask.bin", "dtype": "uint8"},
                 "doc_ids": {"path": "doc_ids.bin", "dtype": "uint16"},
@@ -1599,6 +1655,9 @@ def test_mmididx_v2_domain_routes_and_token_sidecars_round_trip(tmp_path) -> Non
         values.tofile(path)
         side_channel_paths[name] = {"path": path.name, "dtype": values.dtype.name}
     sidecar["side_channel_paths"] = side_channel_paths
+    sidecar["loss_mask_alignment"] = (
+        LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+    )
     prefix.with_suffix(".idx.json").write_text(json.dumps(sidecar), encoding="utf-8")
 
     dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)

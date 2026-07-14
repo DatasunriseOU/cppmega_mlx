@@ -334,7 +334,10 @@ def _build_bundle(
     contract = {
         "schema": "cppmega_pre_materialized_objectives_v1",
         "totals": {"samples": 1, "input_tokens": 7, "loss_tokens": 7},
-        "materialization": {"format": "shifted_lm_document_v1"},
+        "materialization": {
+            "format": "shifted_lm_document_v1",
+            "loss_mask_alignment": "source_token_predicts_next_v1",
+        },
         "graph_auxiliary": {
             "pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
@@ -360,7 +363,10 @@ def _build_bundle(
             "file_sha256": _sha256(contract_path),
         },
         "parquet_shards": [parquet_binding],
-        "converter": {"source_platform_sidecar": "require"},
+        "converter": {
+            "source_platform_sidecar": "require",
+            "loss_mask_alignment": "source_token_predicts_next_v1",
+        },
     }
     artifact["artifact_set_sha256"] = _canonical_sha256(artifact)
     artifact_path = provenance / "objective_artifact_seq8.json"
@@ -447,6 +453,7 @@ def _build_bundle(
         "vocab_size": 65536,
         "tokenizer_contract": "megacpp",
         "symbol_identity_schema_version": 3,
+        "loss_mask_alignment": "source_token_predicts_next_v1",
         "side_channel_paths": sidecar_specs,
         "graph_sidecar_schema": "cppmega_graph_routes_v2",
         "graph_sidecar_paths": graph_specs,
