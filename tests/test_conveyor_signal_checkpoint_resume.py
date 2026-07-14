@@ -45,6 +45,7 @@ REPOS = ["repoA", "repoB"]
 NRECORDS = 10            # -> 10 ranges per repo at --range-size 1
 RANGE_SLEEP = 0.8        # s per fake range: wide window to SIGTERM mid-repoA
 FIRST_REPO = "repoA"
+TEST_CODE_REVISION = "1" * 40
 
 
 def _python() -> str:
@@ -99,6 +100,7 @@ def _build(ckpt_root: Path):
         "CKPT_RANGE_EVENTS": str(paths["range_events"]),
     })
     argv = [
+        "--expected-code-revision", TEST_CODE_REVISION,
         "--streams", "both",
         "--workers", "2",
         "--repo-workers", "1",
@@ -114,6 +116,7 @@ def _build(ckpt_root: Path):
         "--dedup-checkpoint-tokens", "0",
         "--memory-limit-gb", "99",
         "--memory-budget-gb", "0",
+        "--min-free-disk-gb", "0",
         "--retain-partial-work",
     ]
     return paths, env, argv
