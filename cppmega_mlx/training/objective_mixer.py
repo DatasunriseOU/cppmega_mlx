@@ -25,10 +25,25 @@ from cppmega_mlx.data.fim import (
     UnsupportedDomainDelimiterStructureError,
 )
 from cppmega_mlx.data.graph_packet import GraphPacket
-from cppmega_mlx.data.source_identity import MAX_SOURCE_ID
+from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
+from cppmega_mlx.data.source_identity import MAX_ROW_LOCAL_DOC_ID, MAX_SOURCE_ID
 from cppmega_mlx.training.indexer_losses import total_indexer_loss
 from cppmega_mlx.training.objectives import ObjectiveExample
 from cppmega_mlx.training.task_mixer import TaskKind, TaskMixer, normalize_rates
+
+
+PACKED_COMMIT_BINDING_METADATA_KEY = "packed_constituent_binding"
+PACKED_COMMIT_BINDING_SCHEMA = "cppmega_packed_commit_constituent_v1"
+_PACKED_COMMIT_BINDING_FIELDS = {
+    "schema",
+    "constituent_index",
+    "token_start",
+    "token_end",
+    "attention_document_id",
+    "source_document_id",
+    "source_identity_id",
+    "platform_ids",
+}
 
 
 @dataclass(frozen=True)
@@ -37,6 +52,7 @@ class RealizedObjective:
     example: ObjectiveExample
     ineligible: Mapping[TaskKind, str]
     source_index: int
+    selected_packet: CodePacket | CommitPacket | None = None
 
 
 @dataclass(frozen=True)
@@ -45,10 +61,31 @@ class ObjectiveSource:
 
     code_packet: CodePacket | None = None
     commit_packet: CommitPacket | None = None
+    commit_candidates: tuple[CommitPacket, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.code_packet is None and self.commit_packet is None:
+        if (
+            self.code_packet is None
+            and self.commit_packet is None
+            and not self.commit_candidates
+        ):
             raise ValueError("ObjectiveSource requires a code or commit packet")
+        if any(
+            not isinstance(packet, CommitPacket) for packet in self.commit_candidates
+        ):
+            raise TypeError(
+                "ObjectiveSource.commit_candidates must contain CommitPacket values"
+            )
+        if self.commit_candidates:
+            if self.commit_packet is None:
+                raise ValueError(
+                    "ObjectiveSource.commit_candidates require commit_packet to name "
+                    "the canonical first candidate"
+                )
+            if self.commit_packet is not self.commit_candidates[0]:
+                raise ValueError(
+                    "ObjectiveSource.commit_packet must be the first commit candidate"
+                )
 
 
 SourceInput = CodePacket | CommitPacket | ObjectiveSource
@@ -56,6 +93,177 @@ SourceInput = CodePacket | CommitPacket | ObjectiveSource
 
 def _array_length(value: mx.array | None) -> int:
     return 0 if value is None else int(value.shape[0])
+
+
+def _packet_vector_values(packet: CodePacket, field: str) -> list[int] | None:
+    raw = getattr(packet, field)
+    if raw is None:
+        return None
+    values = np.asarray(raw)
+    token_count = int(packet.token_ids.shape[-1])
+    if values.ndim != 1 or len(values) != token_count:
+        raise ValueError(
+            f"CodePacket.{field} must have shape ({token_count},), got {values.shape}"
+        )
+    return [int(value) for value in values.tolist()]
+
+
+def validated_packed_commit_binding(
+    source: ObjectiveSource,
+    packet: CommitPacket,
+) -> dict[str, int | str | list[int]] | None:
+    """Validate and return one packed commit candidate's exact constituent binding."""
+
+    if source.commit_candidates and not any(
+        packet is candidate for candidate in source.commit_candidates
+    ):
+        raise ValueError("selected commit packet is not one of the source candidates")
+    raw_binding = packet.metadata.get(PACKED_COMMIT_BINDING_METADATA_KEY)
+    code = source.code_packet
+    if raw_binding is None:
+        if code is None:
+            return None
+        source_docs = _packet_vector_values(code, "source_doc_ids")
+        source_identities = _packet_vector_values(code, "source_identity_ids")
+        if source_docs is None or source_identities is None:
+            return None
+        constituents = set(zip(source_docs, source_identities, strict=True))
+        if len(constituents) > 1:
+            raise ValueError(
+                "multi-constituent commit candidate requires an exact packed "
+                "constituent binding"
+            )
+        return None
+    if not isinstance(raw_binding, Mapping):
+        raise ValueError("packed commit constituent binding must be a mapping")
+    if set(raw_binding) != _PACKED_COMMIT_BINDING_FIELDS:
+        raise ValueError(
+            "packed commit constituent binding fields are invalid: "
+            f"{sorted(raw_binding)}"
+        )
+    if raw_binding.get("schema") != PACKED_COMMIT_BINDING_SCHEMA:
+        raise ValueError("packed commit constituent binding schema is invalid")
+    if code is None:
+        raise ValueError("packed commit constituent binding requires a CodePacket")
+
+    integer_fields = (
+        "constituent_index",
+        "token_start",
+        "token_end",
+        "attention_document_id",
+        "source_document_id",
+        "source_identity_id",
+    )
+    integers: dict[str, int] = {}
+    for field in integer_fields:
+        value = raw_binding.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"packed commit binding {field} must be an integer")
+        integers[field] = value
+    if integers["constituent_index"] < 0:
+        raise ValueError("packed commit constituent_index must be non-negative")
+    packet_source_index = packet.metadata.get("source_index")
+    if (
+        isinstance(packet_source_index, bool)
+        or not isinstance(packet_source_index, int)
+        or packet_source_index != integers["constituent_index"]
+    ):
+        raise ValueError(
+            "packed commit binding constituent_index does not match its typed sections"
+        )
+    token_count = int(code.token_ids.shape[-1])
+    start = integers["token_start"]
+    end = integers["token_end"]
+    if not 0 <= start < end <= token_count:
+        raise ValueError(
+            f"packed commit token span [{start}, {end}) is outside 0..{token_count}"
+        )
+    attention_document_id = integers["attention_document_id"]
+    source_document_id = integers["source_document_id"]
+    source_identity_id = integers["source_identity_id"]
+    if attention_document_id <= 0:
+        raise ValueError("packed commit attention_document_id must be positive")
+    if not 0 < source_document_id <= MAX_ROW_LOCAL_DOC_ID:
+        raise ValueError("packed commit source_document_id must be positive uint32")
+    if not 0 < source_identity_id <= MAX_SOURCE_ID:
+        raise ValueError("packed commit source_identity_id must be positive uint64")
+
+    document_ids = _packet_vector_values(code, "document_ids")
+    source_doc_ids = _packet_vector_values(code, "source_doc_ids")
+    source_identity_ids = _packet_vector_values(code, "source_identity_ids")
+    if document_ids is None or source_doc_ids is None or source_identity_ids is None:
+        raise ValueError(
+            "packed commit binding requires token-aligned document_ids, "
+            "source_doc_ids, and source_identity_ids"
+        )
+    expected_positions = [
+        index
+        for index, value in enumerate(document_ids)
+        if value == attention_document_id
+    ]
+    if expected_positions != list(range(start, end)):
+        raise ValueError(
+            "packed commit token span does not exactly match its attention document"
+        )
+    if any(value != source_document_id for value in source_doc_ids[start:end]):
+        raise ValueError("packed commit token span crosses source document identities")
+    if any(value != source_identity_id for value in source_identity_ids[start:end]):
+        raise ValueError("packed commit token span crosses physical source identities")
+
+    raw_platform_ids = raw_binding.get("platform_ids")
+    if not isinstance(raw_platform_ids, list):
+        raise ValueError("packed commit platform_ids must be a list")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in raw_platform_ids
+    ):
+        raise ValueError("packed commit platform_ids must contain integers")
+    platform_ids = list(raw_platform_ids)
+    if any(not 0 < value <= np.iinfo(np.uint16).max for value in platform_ids):
+        raise ValueError("packed commit platform_ids must be positive uint16")
+    if len(platform_ids) > MAX_PLATFORM_IDS:
+        raise ValueError(
+            f"packed commit platform_ids exceed MAX_PLATFORM_IDS={MAX_PLATFORM_IDS}"
+        )
+    if not platform_ids:
+        raise ValueError("packed commit platform_ids must be non-empty")
+    raw_bags = code.metadata.get("source_platform_ids")
+    if not isinstance(raw_bags, (list, tuple)):
+        raise ValueError("packed commit binding requires source_platform_ids")
+    document_order: list[int] = []
+    for document_id in document_ids:
+        if not document_order or document_order[-1] != document_id:
+            if document_id in document_order:
+                raise ValueError("CodePacket.document_ids are not contiguous")
+            document_order.append(document_id)
+    try:
+        bag_index = document_order.index(attention_document_id)
+    except ValueError as exc:  # pragma: no cover - span validation proves membership
+        raise ValueError(
+            "packed commit attention document has no platform bag"
+        ) from exc
+    if bag_index != integers["constituent_index"]:
+        raise ValueError(
+            "packed commit constituent_index does not match its attention document"
+        )
+    if len(raw_bags) != len(document_order):
+        raise ValueError(
+            "source_platform_ids count does not match packed attention documents"
+        )
+    raw_constituent_bag = raw_bags[bag_index]
+    if not isinstance(raw_constituent_bag, (list, tuple)) or any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in raw_constituent_bag
+    ):
+        raise ValueError("packed commit source platform bag must contain integers")
+    if list(raw_constituent_bag) != platform_ids:
+        raise ValueError("packed commit platform bag does not match its constituent")
+
+    return {
+        "schema": PACKED_COMMIT_BINDING_SCHEMA,
+        **integers,
+        "platform_ids": platform_ids,
+    }
 
 
 def _transformed_document_physical_identity_reason(
@@ -329,10 +537,10 @@ class EligibilityAwareTaskMixer:
         eligible: list[TaskKind] = []
         ineligible: dict[TaskKind, str] = {}
         for task in self._tasks:
-            packet = self._packet_for_task(source, task)
-            if packet is None:
+            packets = self._packets_for_task(source, task)
+            if not packets:
                 family = (
-                    "commit_packet"
+                    "commit_packet/commit_candidates"
                     if task
                     in {
                         TaskKind.COMMIT_DIFF,
@@ -342,24 +550,63 @@ class EligibilityAwareTaskMixer:
                 )
                 ineligible[task] = f"missing ObjectiveSource.{family}"
                 continue
-            reason = _eligibility_reason(
-                task, packet, max_input_tokens=self._max_input_tokens
-            )
-            if reason is None:
+            reasons = [
+                self._packet_eligibility_reason(source, task, packet)
+                for packet in packets
+            ]
+            if any(reason is None for reason in reasons):
                 eligible.append(task)
             else:
-                ineligible[task] = reason
+                unique_reasons = tuple(dict.fromkeys(str(reason) for reason in reasons))
+                ineligible[task] = "; ".join(unique_reasons)
         return tuple(eligible), ineligible
 
     @staticmethod
-    def _packet_for_task(
+    def _packets_for_task(
         source: SourceInput, task: TaskKind
-    ) -> CodePacket | CommitPacket | None:
+    ) -> tuple[CodePacket | CommitPacket, ...]:
         if not isinstance(source, ObjectiveSource):
-            return source
+            return (source,)
         if task in {TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST}:
-            return source.commit_packet
-        return source.code_packet
+            if source.commit_candidates:
+                return source.commit_candidates
+            return () if source.commit_packet is None else (source.commit_packet,)
+        return () if source.code_packet is None else (source.code_packet,)
+
+    def _packet_eligibility_reason(
+        self,
+        source: SourceInput,
+        task: TaskKind,
+        packet: CodePacket | CommitPacket,
+    ) -> str | None:
+        if isinstance(source, ObjectiveSource) and isinstance(packet, CommitPacket):
+            try:
+                validated_packed_commit_binding(source, packet)
+            except ValueError as exc:
+                return str(exc)
+        return _eligibility_reason(
+            task,
+            packet,
+            max_input_tokens=self._max_input_tokens,
+        )
+
+    def _select_packet_for_task(
+        self,
+        source: SourceInput,
+        task: TaskKind,
+        *,
+        rng: random.Random,
+    ) -> CodePacket | CommitPacket:
+        eligible_packets = [
+            packet
+            for packet in self._packets_for_task(source, task)
+            if self._packet_eligibility_reason(source, task, packet) is None
+        ]
+        if not eligible_packets:  # pragma: no cover - guarded by assignment matching
+            raise RuntimeError(f"selected task {task.value} has no eligible packet")
+        if len(eligible_packets) == 1:
+            return eligible_packets[0]
+        return eligible_packets[rng.randrange(len(eligible_packets))]
 
     def materialize(
         self,
@@ -379,8 +626,7 @@ class EligibilityAwareTaskMixer:
             weights=[self._rates[candidate] for candidate in eligible],
             k=1,
         )[0]
-        task_packet = self._packet_for_task(packet, task)
-        assert task_packet is not None
+        task_packet = self._select_packet_for_task(packet, task, rng=rng)
         example = self._builder.build(task, task_packet, rng=rng)
         self._require_realized_kind(task, example)
         return RealizedObjective(
@@ -388,6 +634,7 @@ class EligibilityAwareTaskMixer:
             example=example,
             ineligible=ineligible,
             source_index=0,
+            selected_packet=task_packet,
         )
 
     @staticmethod
@@ -583,8 +830,11 @@ class EligibilityAwareTaskMixer:
             task = task_by_packet[source_index]
             step_index = start_step + output_index
             build_rng = self._step_rng(step_index)
-            task_packet = self._packet_for_task(packet, task)
-            assert task_packet is not None
+            task_packet = self._select_packet_for_task(
+                packet,
+                task,
+                rng=build_rng,
+            )
             example = self._builder.build(task, task_packet, rng=build_rng)
             self._require_realized_kind(task, example)
             realized.append(
@@ -593,6 +843,7 @@ class EligibilityAwareTaskMixer:
                     example=example,
                     ineligible=eligibility[source_index][1],
                     source_index=source_index,
+                    selected_packet=task_packet,
                 )
             )
         assert Counter(item.task for item in realized) == Counter(quotas)
@@ -1091,6 +1342,8 @@ __all__ = [
     "GraphAuxLossConfig",
     "ObjectiveAccounting",
     "ObjectiveSource",
+    "PACKED_COMMIT_BINDING_METADATA_KEY",
+    "PACKED_COMMIT_BINDING_SCHEMA",
     "ProductionTrainingLossBreakdown",
     "RealizedObjective",
     "combine_lm_and_aux_losses",
@@ -1099,4 +1352,5 @@ __all__ = [
     "graph_auxiliary_loss_from_targets",
     "production_training_loss",
     "production_training_loss_breakdown",
+    "validated_packed_commit_binding",
 ]

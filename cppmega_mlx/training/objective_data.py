@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
 
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.code_packet_builder import (
     build_code_packet_from_row,
     build_commit_packet_from_row,
@@ -24,6 +25,7 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_PLATFORM_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
 )
+from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     COMMIT_MSG_TOKEN_IDS_COLUMN,
     DIFF_TOKEN_IDS_COLUMN,
@@ -48,7 +50,11 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 from cppmega_mlx.data.fim import INSERTED_TOKEN_SOURCE_INDEX
 from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
-from cppmega_mlx.training.objective_mixer import ObjectiveSource
+from cppmega_mlx.training.objective_mixer import (
+    PACKED_COMMIT_BINDING_METADATA_KEY,
+    PACKED_COMMIT_BINDING_SCHEMA,
+    ObjectiveSource,
+)
 
 _CHUNK_GRAPH_FIELDS = {"call": "call_edges", "type": "type_edges"}
 _TOKEN_GRAPH_FIELDS = {
@@ -232,6 +238,138 @@ def _optional_i32(row: Mapping[str, Any], column: str) -> mx.array | None:
     return _i32(values, where=column)
 
 
+def _packed_constituent_spans(
+    document_ids: Sequence[int],
+) -> list[tuple[int, int, int]]:
+    spans: list[tuple[int, int, int]] = []
+    closed: set[int] = set()
+    start = 0
+    while start < len(document_ids):
+        document_id = int(document_ids[start])
+        if document_id <= 0:
+            raise ValueError("packed objective doc_ids must be positive")
+        if document_id in closed:
+            raise ValueError(
+                f"packed objective document ID {document_id} is non-contiguous"
+            )
+        end = start + 1
+        while end < len(document_ids) and int(document_ids[end]) == document_id:
+            end += 1
+        spans.append((document_id, start, end))
+        closed.add(document_id)
+        start = end
+    return spans
+
+
+def _bind_packed_commit_candidates(
+    packets: Sequence[CommitPacket],
+    *,
+    code_packet: CodePacket,
+    document_ids: Sequence[int],
+) -> tuple[CommitPacket, ...]:
+    if not packets:
+        return ()
+    spans = _packed_constituent_spans(document_ids)
+    source_doc_ids = (
+        None
+        if code_packet.source_doc_ids is None
+        else [int(value) for value in np.asarray(code_packet.source_doc_ids).tolist()]
+    )
+    source_identity_ids = (
+        None
+        if code_packet.source_identity_ids is None
+        else [
+            int(value) for value in np.asarray(code_packet.source_identity_ids).tolist()
+        ]
+    )
+    raw_platform_bags = code_packet.metadata.get(SOURCE_PLATFORM_IDS_COLUMN)
+    has_exact_binding = (
+        source_doc_ids is not None
+        and source_identity_ids is not None
+        and isinstance(raw_platform_bags, (list, tuple))
+    )
+    if not has_exact_binding:
+        if len(spans) > 1:
+            raise ValueError(
+                "packed multi-constituent commit candidates require token-aligned "
+                "source_doc_ids/source_identity_ids and source_platform_ids"
+            )
+        return tuple(packets)
+    assert source_doc_ids is not None
+    assert source_identity_ids is not None
+    assert isinstance(raw_platform_bags, (list, tuple))
+    token_count = len(document_ids)
+    if len(source_doc_ids) != token_count or len(source_identity_ids) != token_count:
+        raise ValueError(
+            "packed commit provenance sidecars must align to the valid token prefix"
+        )
+    if len(raw_platform_bags) != len(spans):
+        raise ValueError(
+            "source_platform_ids count must match packed constituent count: "
+            f"bags={len(raw_platform_bags)}, constituents={len(spans)}"
+        )
+
+    bound: list[CommitPacket] = []
+    for packet in packets:
+        raw_index = packet.metadata.get("source_index")
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            raise ValueError("packed CommitPacket source_index must be an integer")
+        if not 0 <= raw_index < len(spans):
+            raise ValueError(
+                f"packed commit constituent index {raw_index} is outside "
+                f"0..{len(spans) - 1}"
+            )
+        document_id, start, end = spans[raw_index]
+        source_documents = set(source_doc_ids[start:end])
+        if len(source_documents) != 1 or next(iter(source_documents)) <= 0:
+            raise ValueError(
+                f"packed commit constituent {raw_index} does not have one positive "
+                "source document identity"
+            )
+        physical_identities = set(source_identity_ids[start:end])
+        if len(physical_identities) != 1 or next(iter(physical_identities)) <= 0:
+            raise ValueError(
+                f"packed commit constituent {raw_index} does not have one positive "
+                "physical source identity"
+            )
+        raw_bag = raw_platform_bags[raw_index]
+        if not isinstance(raw_bag, (list, tuple)):
+            raise ValueError("every source_platform_ids bag must be a list")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in raw_bag
+        ):
+            raise ValueError("source_platform_ids bags must contain integers")
+        platform_ids = list(raw_bag)
+        if any(not 0 < value <= np.iinfo(np.uint16).max for value in platform_ids):
+            raise ValueError("source_platform_ids values must be positive uint16")
+        if len(platform_ids) > MAX_PLATFORM_IDS:
+            raise ValueError(
+                f"source_platform_ids bag exceeds MAX_PLATFORM_IDS={MAX_PLATFORM_IDS}"
+            )
+        if not platform_ids:
+            raise ValueError("packed commit source_platform_ids bag must be non-empty")
+        binding: dict[str, int | str | list[int]] = {
+            "schema": PACKED_COMMIT_BINDING_SCHEMA,
+            "constituent_index": raw_index,
+            "token_start": start,
+            "token_end": end,
+            "attention_document_id": document_id,
+            "source_document_id": next(iter(source_documents)),
+            "source_identity_id": next(iter(physical_identities)),
+            "platform_ids": platform_ids,
+        }
+        bound.append(
+            replace(
+                packet,
+                metadata={
+                    **packet.metadata,
+                    PACKED_COMMIT_BINDING_METADATA_KEY: binding,
+                },
+            )
+        )
+    return tuple(bound)
+
+
 def objective_source_from_tokenized_row(
     row: Mapping[str, Any],
     *,
@@ -306,15 +444,26 @@ def objective_source_from_tokenized_row(
         else []
     )
     if packed_commit_packets:
-        commit_packet = packed_commit_packets[source_index % len(packed_commit_packets)]
+        commit_candidates = _bind_packed_commit_candidates(
+            packed_commit_packets,
+            code_packet=code_packet,
+            document_ids=document_ids,
+        )
+        commit_packet = commit_candidates[0]
     elif has_any_commit_section:
+        commit_candidates = ()
         commit_packet = build_commit_packet_from_row(
             columns=commit_columns,
             row_index=0,
         )
     else:
+        commit_candidates = ()
         commit_packet = None
-    return ObjectiveSource(code_packet=code_packet, commit_packet=commit_packet)
+    return ObjectiveSource(
+        code_packet=code_packet,
+        commit_packet=commit_packet,
+        commit_candidates=commit_candidates,
+    )
 
 
 def empty_objective_routes() -> dict[str, list[Any]]:

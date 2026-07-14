@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_DELIMITER_ROLES,
     DomainKind,
@@ -19,6 +20,7 @@ from cppmega_mlx.data.domain_schema import (
     ParseConfidence,
 )
 from cppmega_mlx.data.fim import INSERTED_TOKEN_SOURCE_INDEX
+from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.source_identity import (
     MAX_ROW_LOCAL_DOC_ID,
     MAX_SOURCE_ID,
@@ -33,6 +35,7 @@ from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ObjectiveSource,
     RealizedObjective,
+    validated_packed_commit_binding,
 )
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_CHUNK_ROUTE_COLUMNS,
@@ -412,6 +415,10 @@ def _source_platform_bags_by_document(
             raise ValueError("production source_platform_ids bags must be non-empty")
         if any(not 0 < value <= np.iinfo(np.uint16).max for value in bag):
             raise ValueError("source_platform_ids values must be positive uint16")
+        if len(bag) > MAX_PLATFORM_IDS:
+            raise ValueError(
+                f"source_platform_ids bag exceeds MAX_PLATFORM_IDS={MAX_PLATFORM_IDS}"
+            )
         result[document_id] = bag
     return result
 
@@ -1090,6 +1097,18 @@ def materialize_megatron_document(
         row.update(route_remap.columns)
         route_receipt = route_remap.receipt
     elif realized.task in _COMMIT_TASKS:
+        selected_commit_packet = realized.selected_packet
+        if selected_commit_packet is None:
+            selected_commit_packet = source.commit_packet
+        if not isinstance(selected_commit_packet, CommitPacket):
+            raise ValueError(
+                f"{realized.task.value}: realized commit objective did not bind "
+                "the selected CommitPacket"
+            )
+        packed_binding = validated_packed_commit_binding(
+            source,
+            selected_commit_packet,
+        )
         commit_source_indices = example.metadata.get(SOURCE_TOKEN_INDICES_METADATA_KEY)
         if (
             not isinstance(commit_source_indices, (tuple, list))
@@ -1121,9 +1140,17 @@ def materialize_megatron_document(
         row["token_role_ids"] = roles
         row["token_confidence_ids"] = confidence
 
-        source_document_id = 0
-        source_identity_id = 0
-        if packet is not None and packet.source_doc_ids is not None:
+        source_document_id = (
+            0 if packed_binding is None else int(packed_binding["source_document_id"])
+        )
+        source_identity_id = (
+            0 if packed_binding is None else int(packed_binding["source_identity_id"])
+        )
+        if (
+            packed_binding is None
+            and packet is not None
+            and packet.source_doc_ids is not None
+        ):
             source_doc_ids = _ints(
                 packet.source_doc_ids,
                 where="CodePacket.source_doc_ids",
@@ -1139,12 +1166,16 @@ def materialize_megatron_document(
                     "one source document identity"
                 )
             source_document_id = source_doc_ids[0]
-        elif require_production_sidecars:
+        elif packed_binding is None and require_production_sidecars:
             raise ValueError(
                 f"{realized.task.value}: production commit objective requires "
                 "CodePacket.source_doc_ids"
             )
-        if packet is not None and packet.source_identity_ids is not None:
+        if (
+            packed_binding is None
+            and packet is not None
+            and packet.source_identity_ids is not None
+        ):
             source_identity_ids = _ints(
                 packet.source_identity_ids,
                 where="CodePacket.source_identity_ids",
@@ -1160,14 +1191,16 @@ def materialize_megatron_document(
                     "one physical source identity"
                 )
             source_identity_id = source_identity_ids[0]
-        elif require_production_sidecars:
+        elif packed_binding is None and require_production_sidecars:
             raise ValueError(
                 f"{realized.task.value}: production commit objective requires "
                 "CodePacket.source_identity_ids"
             )
         row["token_source_doc_ids"] = [source_document_id] * len(tokens)
         row["token_source_identity_ids"] = [source_identity_id] * len(tokens)
-        if (
+        if packed_binding is not None:
+            row["source_platform_ids"] = [list(packed_binding["platform_ids"])]
+        elif (
             packet is not None
             and packet_document_ids is not None
             and packet.source_doc_ids is not None

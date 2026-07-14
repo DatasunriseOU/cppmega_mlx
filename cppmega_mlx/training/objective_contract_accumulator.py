@@ -264,6 +264,7 @@ class ObjectiveContractAccumulator:
         }
         self._actual: Counter[str] = Counter()
         self._window_actual: Counter[str] = Counter()
+        self._window_positive_edges = 0
         self._samples = 0
         self._eligible_graph_samples = 0
         self._positive_edges = 0
@@ -332,6 +333,7 @@ class ObjectiveContractAccumulator:
         if graph_edges > 0:
             self._eligible_graph_samples += 1
             self._positive_edges += graph_edges
+            self._window_positive_edges += graph_edges
 
         if self._samples % self._quota_window_samples == 0:
             if self._window_actual != Counter(self._window_quotas):
@@ -340,7 +342,13 @@ class ObjectiveContractAccumulator:
                     f"realized={dict(self._window_actual)}, "
                     f"planned={self._window_quotas}"
                 )
+            if self._window_positive_edges < 1:
+                raise ValueError(
+                    "objective quota window has no materialized graph-positive "
+                    "causal same-document pair"
+                )
             self._window_actual.clear()
+            self._window_positive_edges = 0
 
     def _add_route_receipt(
         self,

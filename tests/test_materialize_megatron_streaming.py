@@ -175,7 +175,7 @@ def test_materialization_stream_uses_bounded_lookahead_and_carries_unused_source
 
     assert observed_sources == [0, 3, 4, 1, 2, 5]
     assert receipt == {
-        "schema": "cppmega_objective_source_selection_v1",
+        "schema": "cppmega_objective_source_selection_v2",
         "algorithm": "bounded_eligibility_bipartite_pool_v1",
         "output_samples": 6,
         "source_rows_consumed": 6,
@@ -185,6 +185,96 @@ def test_materialization_stream_uses_bounded_lookahead_and_carries_unused_source
         "max_source_pool_samples": 5,
         "max_source_pool_observed": 5,
         "required_graph_relations": [],
+        "resume": {
+            "schema": "cppmega_objective_source_resume_v1",
+            "cursor_semantics": (
+                "replay_buffered_rows_then_continue_after_last_yielded_v1"
+            ),
+            "last_yielded_cursor": {"source_index": 5},
+            "buffered_source_cursors": [],
+        },
+    }
+
+
+def test_terminal_lookahead_receipt_preserves_buffered_resume_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CursorIterator:
+        def __init__(self) -> None:
+            self._next = 0
+            self.last_cursor = None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            value = self._next
+            self._next += 1
+            self.last_cursor = {
+                "epoch": 0,
+                "row_index_in_record_batch": value,
+                "source_index": value,
+            }
+            return value
+
+    class Mixer:
+        @staticmethod
+        def materialize_window_from_pool(
+            sources,
+            *,
+            output_count: int,
+            start_step: int,
+            required_assignment=None,
+        ):
+            del required_assignment, output_count, start_step
+            if len(sources) < 5:
+                raise materializer.ObjectiveQuotaUnsatisfiedError("need lookahead")
+            return [SimpleNamespace(source_index=index) for index in (0, 3, 4)]
+
+    class Sink:
+        @staticmethod
+        def add(_document) -> None:
+            return None
+
+    monkeypatch.setattr(
+        materializer,
+        "materialize_megatron_document",
+        lambda *_args, **_kwargs: object(),
+    )
+    receipt = materializer._materialize_stream(
+        mixer=Mixer(),  # type: ignore[arg-type]
+        source_iter=CursorIterator(),  # type: ignore[arg-type]
+        accumulator=Sink(),  # type: ignore[arg-type]
+        writer=Sink(),  # type: ignore[arg-type]
+        samples=3,
+        quota_window_samples=3,
+        quota_lookahead_samples=2,
+    )
+
+    assert receipt["source_rows_consumed"] == 5
+    assert receipt["unused_buffered_sources"] == 2
+    assert receipt["resume"] == {
+        "schema": "cppmega_objective_source_resume_v1",
+        "cursor_semantics": (
+            "replay_buffered_rows_then_continue_after_last_yielded_v1"
+        ),
+        "last_yielded_cursor": {
+            "epoch": 0,
+            "row_index_in_record_batch": 4,
+            "source_index": 4,
+        },
+        "buffered_source_cursors": [
+            {
+                "epoch": 0,
+                "row_index_in_record_batch": 1,
+                "source_index": 1,
+            },
+            {
+                "epoch": 0,
+                "row_index_in_record_batch": 2,
+                "source_index": 2,
+            },
+        ],
     }
 
 

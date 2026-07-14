@@ -68,6 +68,7 @@ from cppmega_mlx.training.megatron_objectives import (
 )
 from cppmega_mlx.training.objective_contract_accumulator import (
     ObjectiveContractAccumulator,
+    count_configured_graph_positive_edges,
 )
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_ROUTE_MAPPING_SCHEMA,
@@ -81,7 +82,9 @@ from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ObjectiveQuotaUnsatisfiedError,
     ObjectiveSource,
+    RealizedObjective,
 )
+from cppmega_mlx.training.objectives import build_causal_lm
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES
 from cppmega_mlx.training.task_mixer import TaskKind
 
@@ -791,6 +794,34 @@ def _atomic_output_directory(output_dir: Path) -> Iterator[Path]:
             shutil.rmtree(partial)
 
 
+def _materialized_assignment_has_graph_positive(
+    source: ObjectiveSource,
+    task: TaskKind,
+    *,
+    graph_relations: tuple[str, ...],
+) -> bool:
+    """Apply the contract's graph-positive predicate after objective remapping."""
+
+    if task is not TaskKind.CAUSAL_LM or source.code_packet is None:
+        return False
+    packet = source.code_packet
+    realized = RealizedObjective(
+        task=task,
+        example=build_causal_lm(packet),
+        ineligible={},
+        source_index=0,
+        selected_packet=packet,
+    )
+    document = materialize_megatron_document(realized, source)
+    return (
+        count_configured_graph_positive_edges(
+            document,
+            relations=graph_relations,
+        )
+        > 0
+    )
+
+
 def _materialize_stream(
     *,
     mixer: EligibilityAwareTaskMixer,
@@ -803,27 +834,45 @@ def _materialize_stream(
     graph_relations: tuple[str, ...] = (),
 ) -> dict[str, object]:
     source_pool: list[ObjectiveSource] = []
+    source_cursor_pool: list[dict[str, int]] = []
     source_rows_consumed = 0
     max_source_pool_observed = 0
     max_source_pool_samples = quota_window_samples + quota_lookahead_samples
+    last_yielded_cursor: dict[str, int] | None = None
 
     def append_source() -> None:
-        nonlocal source_rows_consumed, max_source_pool_observed
+        nonlocal source_rows_consumed, max_source_pool_observed, last_yielded_cursor
         source_pool.append(next(source_iter))
+        raw_cursor = getattr(source_iter, "last_cursor", None)
+        cursor = (
+            {"source_index": source_rows_consumed}
+            if raw_cursor is None
+            else dict(raw_cursor)
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in cursor.values()
+        ):
+            raise ValueError(
+                "objective source cursor values must be non-negative integers"
+            )
+        if int(cursor.get("source_index", -1)) != source_rows_consumed:
+            raise ValueError(
+                "objective source iterator cursor is not aligned to yielded rows: "
+                f"cursor={cursor.get('source_index')}, "
+                f"expected={source_rows_consumed}"
+            )
+        source_cursor_pool.append(cursor)
+        last_yielded_cursor = cursor
         source_rows_consumed += 1
         max_source_pool_observed = max(max_source_pool_observed, len(source_pool))
 
     def required_graph_assignment(source: ObjectiveSource, task: TaskKind) -> bool:
-        if task is not TaskKind.CAUSAL_LM or source.code_packet is None:
-            return False
-        graph = source.code_packet.graph_packet()
-        for relation in graph_relations:
-            edge = graph.edges.get(relation)
-            if edge is None or edge.num_edges == 0:
-                continue
-            if edge.mask is None or bool(np.any(np.asarray(edge.mask) > 0)):
-                return True
-        return False
+        return _materialized_assignment_has_graph_positive(
+            source,
+            task,
+            graph_relations=graph_relations,
+        )
 
     for start_step in range(0, samples, quota_window_samples):
         while len(source_pool) < quota_window_samples:
@@ -865,14 +914,20 @@ def _materialize_stream(
             accumulator.add(document)
             writer.add(document)
             del document
-        source_pool = [
-            source
-            for source_index, source in enumerate(source_pool)
+        retained = [
+            (source, cursor)
+            for source_index, (source, cursor) in enumerate(
+                zip(source_pool, source_cursor_pool, strict=True)
+            )
             if source_index not in selected_indices
         ]
+        source_pool = [source for source, _cursor in retained]
+        source_cursor_pool = [cursor for _source, cursor in retained]
         del realized
+    if last_yielded_cursor is None:  # pragma: no cover - samples is validated positive
+        raise RuntimeError("objective materialization consumed no source rows")
     return {
-        "schema": "cppmega_objective_source_selection_v1",
+        "schema": "cppmega_objective_source_selection_v2",
         "algorithm": "bounded_eligibility_bipartite_pool_v1",
         "output_samples": int(samples),
         "source_rows_consumed": source_rows_consumed,
@@ -882,6 +937,14 @@ def _materialize_stream(
         "max_source_pool_samples": int(max_source_pool_samples),
         "max_source_pool_observed": int(max_source_pool_observed),
         "required_graph_relations": list(graph_relations),
+        "resume": {
+            "schema": "cppmega_objective_source_resume_v1",
+            "cursor_semantics": (
+                "replay_buffered_rows_then_continue_after_last_yielded_v1"
+            ),
+            "last_yielded_cursor": dict(last_yielded_cursor),
+            "buffered_source_cursors": [dict(cursor) for cursor in source_cursor_pool],
+        },
     }
 
 
@@ -1025,9 +1088,20 @@ def main() -> int:
                 graph_relations=graph_relations,
             )
         _require_source_snapshot_unchanged(source_signatures)
+        resume_state = source_selection.get("resume")
+        if not isinstance(resume_state, Mapping):
+            raise ValueError("objective source selection is missing resume state")
+        receipt_cursor = resume_state.get("last_yielded_cursor")
+        if not isinstance(receipt_cursor, Mapping):
+            raise ValueError("objective source resume state is missing its read cursor")
+        if source_iter.last_cursor != receipt_cursor:
+            raise ValueError(
+                "objective source selection receipt cursor differs from the "
+                "iterator read cursor"
+            )
         _bind_source_sampling_cursor(
             source_snapshot,
-            cursor=source_iter.last_cursor,
+            cursor=receipt_cursor,
             consumed_samples=int(source_selection["source_rows_consumed"]),
         )
         contract = accumulator.finalize()

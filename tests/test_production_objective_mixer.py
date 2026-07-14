@@ -6,6 +6,7 @@ import hashlib
 import itertools
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,14 +25,17 @@ from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    PACKED_ROWS_ALL_COLUMNS,
     NUM_DOCS_COLUMN,
     SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
     SOURCE_DIFF_TOKEN_IDS_COLUMN,
     SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
     SOURCE_POST_TOKEN_IDS_COLUMN,
     SOURCE_PRE_TOKEN_IDS_COLUMN,
+    SOURCE_PLATFORM_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
 )
+from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     COMMIT_MSG_TOKEN_IDS_COLUMN,
     DIFF_TOKEN_IDS_COLUMN,
@@ -41,6 +45,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
 )
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.training.objective_mixer import (
+    PACKED_COMMIT_BINDING_METADATA_KEY,
     EligibilityAwareTaskMixer,
     GraphAuxLossConfig,
     ObjectiveAccounting,
@@ -80,6 +85,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     read_tokenized_documents,
 )
 from scripts.materialize_megatron_objectives import (
+    _materialized_assignment_has_graph_positive,
     materialized_schema,
     padded_row,
 )
@@ -338,6 +344,144 @@ def test_packed_megatron_row_adapts_valid_prefix_and_real_objective_sections() -
     assert np.asarray(source.commit_packet.diff_token_ids).tolist() == [30, 31]
     assert source.commit_packet.change_mask_pre is None
     assert source.commit_packet.change_mask_post is None
+
+
+def test_packed_commit_candidates_bind_exact_constituent_provenance() -> None:
+    first = _physical_source("src/first.cpp")
+    second = _physical_source("src/second.cpp")
+    packed = {
+        INPUT_IDS_COLUMN: [10, 11, 20, 21],
+        VALID_TOKEN_COUNT_COLUMN: 4,
+        NUM_DOCS_COLUMN: 2,
+        "doc_ids": [1, 1, 2, 2],
+        "token_source_doc_ids": [101, 101, 202, 202],
+        "token_source_identity_ids": [
+            first.source_identity_id,
+            first.source_identity_id,
+            second.source_identity_id,
+            second.source_identity_id,
+        ],
+        "source_identity_registry": [first.as_dict(), second.as_dict()],
+        "platform_ids": [2, 3],
+        SOURCE_PLATFORM_IDS_COLUMN: [[2], [3]],
+        SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN: [[40], [50]],
+        SOURCE_PRE_TOKEN_IDS_COLUMN: [[110], [120]],
+        SOURCE_POST_TOKEN_IDS_COLUMN: [[111], [121]],
+        SOURCE_DIFF_TOKEN_IDS_COLUMN: [[60], [70]],
+        "token_chunk_starts": [],
+        "token_chunk_ends": [],
+        "token_chunk_kinds": [],
+        "token_chunk_dep_levels": [],
+        "token_call_edges": [],
+        "token_type_edges": [],
+        "token_domain_edges": [],
+        "token_build_edges": [],
+        "token_shell_edges": [],
+        "token_diagnostic_edges": [],
+        "token_cross_domain_edges": [],
+    }
+
+    source = objective_source_from_tokenized_row(packed, source_index=10_001)
+
+    assert len(source.commit_candidates) == 2
+    bindings = [
+        candidate.metadata[PACKED_COMMIT_BINDING_METADATA_KEY]
+        for candidate in source.commit_candidates
+    ]
+    assert bindings == [
+        {
+            "schema": "cppmega_packed_commit_constituent_v1",
+            "constituent_index": 0,
+            "token_start": 0,
+            "token_end": 2,
+            "attention_document_id": 1,
+            "source_document_id": 101,
+            "source_identity_id": first.source_identity_id,
+            "platform_ids": [2],
+        },
+        {
+            "schema": "cppmega_packed_commit_constituent_v1",
+            "constituent_index": 1,
+            "token_start": 2,
+            "token_end": 4,
+            "attention_document_id": 2,
+            "source_document_id": 202,
+            "source_identity_id": second.source_identity_id,
+            "platform_ids": [3],
+        },
+    ]
+
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.COMMIT_DIFF: 1.0}, seed=7
+    ).materialize(source, step_index=0)
+    assert realized.selected_packet in source.commit_candidates
+    selected = realized.selected_packet
+    assert isinstance(selected, CommitPacket)
+    binding = selected.metadata[PACKED_COMMIT_BINDING_METADATA_KEY]
+    reindexed_source = objective_source_from_tokenized_row(packed, source_index=0)
+    reindexed_realized = EligibilityAwareTaskMixer(
+        {TaskKind.COMMIT_DIFF: 1.0}, seed=7
+    ).materialize(reindexed_source, step_index=0)
+    assert isinstance(reindexed_realized.selected_packet, CommitPacket)
+    assert (
+        reindexed_realized.selected_packet.metadata[PACKED_COMMIT_BINDING_METADATA_KEY][
+            "constituent_index"
+        ]
+        == binding["constituent_index"]
+    )
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    assert set(document.row["token_source_doc_ids"]) == {binding["source_document_id"]}
+    assert set(document.row["token_source_identity_ids"]) == {
+        binding["source_identity_id"]
+    }
+    assert document.row[SOURCE_PLATFORM_IDS_COLUMN] == [binding["platform_ids"]]
+
+    tampered_binding = {
+        **source.commit_candidates[0].metadata[PACKED_COMMIT_BINDING_METADATA_KEY],
+        "source_identity_id": second.source_identity_id,
+    }
+    tampered_candidate = replace(
+        source.commit_candidates[0],
+        metadata={
+            **source.commit_candidates[0].metadata,
+            PACKED_COMMIT_BINDING_METADATA_KEY: tampered_binding,
+        },
+    )
+    tampered_source = ObjectiveSource(
+        code_packet=source.code_packet,
+        commit_packet=tampered_candidate,
+        commit_candidates=(tampered_candidate,),
+    )
+    with pytest.raises(ValueError, match="no eligible objective.*physical source"):
+        EligibilityAwareTaskMixer({TaskKind.COMMIT_DIFF: 1.0}, seed=7).materialize(
+            tampered_source, step_index=0
+        )
+
+
+def test_source_platform_ids_are_canonical_and_width_bounded() -> None:
+    assert SOURCE_PLATFORM_IDS_COLUMN in PACKED_ROWS_ALL_COLUMNS
+    packet = _with_required_token_sidecars(
+        CodePacket(
+            token_ids=_arr([10, 11]),
+            document_ids=_arr([1, 1]),
+            metadata={
+                "platform_ids": list(range(1, MAX_PLATFORM_IDS + 2)),
+                SOURCE_PLATFORM_IDS_COLUMN: [list(range(1, MAX_PLATFORM_IDS + 2))],
+            },
+        )
+    )
+    source = ObjectiveSource(code_packet=packet)
+    realized = EligibilityAwareTaskMixer({TaskKind.CAUSAL_LM: 1.0}, seed=3).materialize(
+        source, step_index=0
+    )
+
+    with pytest.raises(ValueError, match=r"MAX_PLATFORM_IDS=20"):
+        materialize_megatron_document(realized, source)
 
 
 def test_multi_document_pack_does_not_guess_ifim_constituent_binding() -> None:
@@ -625,6 +769,46 @@ def test_eligibility_aware_pool_honors_required_assignment() -> None:
     }
 
 
+def test_required_assignment_uses_post_materialization_graph_pairs() -> None:
+    def source(edge: tuple[int, int]) -> ObjectiveSource:
+        packet = _with_required_token_sidecars(
+            CodePacket(
+                token_ids=_arr([10, 11, 12, 13]),
+                document_ids=_arr([1, 1, 1, 1]),
+            )
+        )
+        values = dict(packet.__dict__)
+        values.update(
+            source_doc_ids=_arr([1, 1, 1, 1]),
+            source_identity_ids=_arr([1, 1, 1, 1]),
+            chunk_starts=_arr([0, 2]),
+            chunk_ends=_arr([2, 4]),
+            chunk_kinds=_arr([1, 1]),
+            chunk_dep_levels=_arr([0, 0]),
+            call_edges=EdgeIndex.from_pairs([edge], relation="call", num_nodes=2),
+        )
+        return ObjectiveSource(code_packet=CodePacket(**values))
+
+    raw_only_noncausal = source((0, 1))
+    causal = source((1, 0))
+
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.CAUSAL_LM: 1.0}, seed=13
+    ).materialize_window_from_pool(
+        [raw_only_noncausal, causal],
+        output_count=1,
+        required_assignment=lambda selected_source, task: (
+            _materialized_assignment_has_graph_positive(
+                selected_source,
+                task,
+                graph_relations=("call",),
+            )
+        ),
+    )
+
+    assert [item.source_index for item in realized] == [1]
+
+
 def test_production_batch_window_preserves_exact_task_quotas() -> None:
     code = CodePacket(
         **{
@@ -848,9 +1032,7 @@ def test_production_multi_document_objective_requires_exact_platform_bags() -> N
             token_ids=_arr([10, 11, 12, 13]),
             document_ids=_arr([1, 1, 2, 2]),
             source_doc_ids=_arr([1, 1, 2, 2]),
-            source_identity_ids=mx.array(
-                np.asarray([11, 11, 22, 22], dtype=np.uint64)
-            ),
+            source_identity_ids=mx.array(np.asarray([11, 11, 22, 22], dtype=np.uint64)),
             metadata={"platform_ids": [2, 3]},
         )
     )

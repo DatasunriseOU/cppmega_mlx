@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     build_pre_materialized_objective_contract,
@@ -98,3 +100,33 @@ def test_full_span_chunk_edge_counts_without_cartesian_pair_storage() -> None:
         )
         == input_length * (input_length + 1) // 2
     )
+
+
+def test_each_quota_window_requires_a_materialized_graph_positive() -> None:
+    tasks = (
+        TaskKind.CAUSAL_LM,
+        TaskKind.FIM,
+        TaskKind.AST_FIM,
+        TaskKind.IFIM,
+        TaskKind.COMMIT_DIFF,
+        TaskKind.PRE_TO_POST,
+    )
+    graph_config = GraphAuxLossConfig(
+        relations=("call",),
+        global_weight=1.0,
+        bce_weight=0.1,
+        coverage_weight=0.05,
+    )
+    accumulator = ObjectiveContractAccumulator(
+        rates={task: 1 / len(tasks) for task in tasks},
+        seed=17,
+        quota_window_samples=len(tasks),
+        graph_config=graph_config,
+        graph_weight=1.0,
+    )
+    for task in tasks:
+        accumulator.add(_document(task, graph=task is TaskKind.CAUSAL_LM))
+
+    with pytest.raises(ValueError, match="quota window.*graph-positive"):
+        for task in tasks:
+            accumulator.add(_document(task, graph=False))
