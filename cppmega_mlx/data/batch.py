@@ -564,7 +564,10 @@ def synthetic_token_batch(
     # Match the default StructureEmbedding/DenseCppLM category contract. The old
     # arbitrary cap of 32 generated corrupt IDs that only worked because the
     # embedding silently clamped them into its final bucket.
-    structure_vocab = max(2, min(vocab_size, 12))
+    # The production hybrid contract has 11 structural categories (IDs 0..10).
+    # Keep synthetic fixtures inside that contract instead of generating an
+    # out-of-range ID that only older clamping behavior happened to tolerate.
+    structure_vocab = max(2, min(vocab_size, 11))
     structure_ids = mx.array(
         rng.integers(
             0, structure_vocab, size=(batch_size, seq_length), dtype=np.int32

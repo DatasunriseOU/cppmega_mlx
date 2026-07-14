@@ -242,6 +242,7 @@ def test_dense_cpp_lm_dsa_requires_graph_routes_by_default():
         indexer_dim=8,
         indexer_local_window=2,
         indexer_num_sinks=1,
+        graph_routes_enabled=True,
         ngram_hash_enabled=False,
         structure_residual_scale=0.0,
         platform_residual_scale=0.0,
@@ -249,11 +250,17 @@ def test_dense_cpp_lm_dsa_requires_graph_routes_by_default():
     model = DenseCppLM(cfg)
     ids = mx.array(np.random.default_rng(0).integers(0, 128, (1, 16)))
     tgt = mx.array(np.random.default_rng(1).integers(0, 128, (1, 16)))
-    with pytest.raises(RuntimeError, match="requires graph route block_bias"):
+    with pytest.raises(RuntimeError, match="no typed GraphBatch or explicit block_bias"):
         model(ids, targets=tgt)
 
     bias = mx.zeros((1, 16, 16), dtype=mx.float32)
-    logits, loss = model(ids, targets=tgt, block_bias=bias)
+    edge_kind_bias = mx.zeros((1, 16, 16), dtype=mx.float32)
+    logits, loss = model(
+        ids,
+        targets=tgt,
+        block_bias=bias,
+        edge_kind_bias=edge_kind_bias,
+    )
     assert tuple(logits.shape) == (1, 16, 128)
     assert loss is not None and np.isfinite(float(loss))
 
