@@ -51,6 +51,39 @@ def _load_builder():
     return b
 
 
+def test_boost_provider_spec_keeps_boost_type_definitions() -> None:
+    b = _load_builder()
+    assert b.BASE_LIBS["boost"]["allow_system_types"] is True
+
+
+def test_boost_provider_worker_emits_boost_type_definition(tmp_path: Path) -> None:
+    pytest.importorskip("clang.cindex")
+    b = _load_builder()
+    root = tmp_path / "provider"
+    header = root / "boost" / "include" / "boost" / "route.hpp"
+    header.parent.mkdir(parents=True)
+    header.write_text(
+        "namespace boost { struct route_type { int value; }; }\n",
+        encoding="utf-8",
+    )
+
+    _functions, types = b._parse_file_worker(
+        (
+            str(header),
+            str(root),
+            b.project_identity_for_subtree("boost"),
+            "-std=c++17",
+            "c++",
+            [str(root), str(root / "boost" / "include")],
+            {
+                "allow_system_types": b.BASE_LIBS["boost"]["allow_system_types"],
+            },
+        )
+    )
+
+    assert any(row["qualified_name"] == "boost::route_type" for row in types)
+
+
 def _make_store(tmp: Path, *, reference: dict[str, object] | None = None):
     b = _load_builder()
     db = str(tmp / "gsi.sqlite")

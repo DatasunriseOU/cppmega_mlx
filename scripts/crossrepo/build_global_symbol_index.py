@@ -104,7 +104,13 @@ DEFAULT_OUTPUT = MLX_ROOT / "outputs" / "crossrepo" / "global_symbols.sqlite"
 _NON_PROVIDER_PATH_SEGMENTS = ("test", "tests", "testing", "benchmark", "benchmarks")
 BASE_LIBS: dict[str, dict] = {
     # ---- A1 (high-value, tractable) ----
-    "boost":      {"subtrees": ["boost"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["boost::"]},
+    "boost":      {"subtrees": ["boost"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["boost::"],
+                   # The normal project index intentionally treats boost:: as a
+                   # system namespace and drops its type definitions.  This is
+                   # the provider index, so keep those definitions exactly as we
+                   # do for std::; the generic zero-type guard below then makes a
+                   # broken Boost type index fail loud instead of being marked done.
+                   "allow_system_types": True},
     "abseil":     {"subtrees": ["abseil-cpp"],   "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["absl::"],
                    # Unit tests and benchmarks are useful training code but are
                    # not providers for the cross-library public API graph. Some
