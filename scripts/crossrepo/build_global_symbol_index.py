@@ -1506,7 +1506,11 @@ def populate_extraction_cache_from_source_cache(
                         f"[{lib}] incomplete source-cache subtree: {source_dir}"
                     )
                 completion = json.loads(sentinel.read_text(encoding="utf-8"))
-                if completion.get("repo") != subtree:
+                cached_repo = completion.get("repo")
+                if (
+                    not isinstance(cached_repo, str)
+                    or cached_repo.casefold() != subtree.casefold()
+                ):
                     raise RuntimeError(
                         f"[{lib}] source-cache sentinel repo mismatch at {sentinel}"
                     )

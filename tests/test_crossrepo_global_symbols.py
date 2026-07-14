@@ -294,7 +294,7 @@ def test_extraction_cache_hardlinks_complete_code_cache(tmp_path):
     wanted.write_text("namespace boost { inline int cached_symbol() { return 7; } }\n")
     (boost_root / "README.txt").write_text("not an index input\n")
     (boost_root / ".cppmega_source_cache_complete.json").write_text(json.dumps({
-        "repo": "boost",
+        "repo": "Boost",
         "source": str(tarball),
         "completed_at": "2026-07-14T00:00:00",
     }))
