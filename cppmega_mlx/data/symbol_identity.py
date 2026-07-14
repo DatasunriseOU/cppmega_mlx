@@ -9,8 +9,12 @@ can detect a collision and fail closed instead of aliasing supervision.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
+import ipaddress
 import re
+import unicodedata
+from urllib.parse import quote, unquote_to_bytes, urlsplit
 
 
 SYMBOL_IDENTITY_SCHEMA_VERSION = 3
@@ -24,27 +28,279 @@ class SymbolIdentityError(RuntimeError):
     """Raised when a symbol identity claim violates the v3 contract."""
 
 
-_PROJECT_IDENTITY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+@dataclass(frozen=True)
+class ResolvedProjectIdentity:
+    """Canonical symbol namespace plus an optional GitHub PR lookup key."""
+
+    project_identity: str
+    owner_repo: str | None
+
+
+_IDENTITY_COMPONENT_SAFE = "-._~"
+_INVALID_PERCENT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_ENCODED_PATH_SEPARATOR_RE = re.compile(r"%(?:2[fF]|5[cC])")
+_WINDOWS_LOCAL_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_REMOTE_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_SCP_REMOTE_RE = re.compile(
+    r"^(?:[^@/:\s]+@)?(?P<host>\[[^\]]+\]|[^/:\s]+):(?P<path>.+)$"
+)
+_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_GITHUB_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_GITHUB_HOSTS = frozenset({"github.com", "ssh.github.com", "www.github.com"})
+_DEFAULT_REMOTE_PORTS = {
+    "git": 9418,
+    "http": 80,
+    "https": 443,
+    "ssh": 22,
+}
+
+
+def _contains_unsafe_path_text(value: str) -> bool:
+    return any(
+        char == "\\" or char.isspace() or ord(char) < 32 or ord(char) == 127
+        for char in value
+    )
+
+
+def _decode_percent_encoded(value: str, *, source: str) -> str:
+    if _INVALID_PERCENT_ESCAPE_RE.search(value):
+        raise SymbolIdentityError(
+            f"{source}: malformed percent escape in project path {value!r}"
+        )
+    try:
+        decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SymbolIdentityError(
+            f"{source}: project path is not valid UTF-8"
+        ) from exc
+    normalized = unicodedata.normalize("NFC", decoded)
+    if normalized != decoded:
+        raise SymbolIdentityError(
+            f"{source}: project path must use canonical NFC Unicode"
+        )
+    return decoded
+
+
+def _validate_project_path(path: str, *, source: str) -> tuple[str, ...]:
+    if not path or _contains_unsafe_path_text(path):
+        raise SymbolIdentityError(
+            f"{source}: project path must be non-empty and contain no whitespace, "
+            "control characters, or backslashes"
+        )
+    parts = tuple(path.split("/"))
+    if any(not part or part in {".", ".."} for part in parts):
+        raise SymbolIdentityError(
+            f"{source}: project path contains an empty or traversal segment: {path!r}"
+        )
+    return parts
+
+
+def _decode_identity_component(component: str, *, source: str) -> str:
+    decoded = _decode_percent_encoded(component, source=source)
+    if quote(decoded, safe=_IDENTITY_COMPONENT_SAFE) != component:
+        raise SymbolIdentityError(
+            f"{source}: project identity component is not canonically encoded: "
+            f"{component!r}"
+        )
+    return decoded
 
 
 def require_project_identity(value: object, *, source: str) -> str:
-    """Validate and return the canonical ``owner/repo`` project identity."""
+    """Validate one canonical, exact-one-slash project identity.
+
+    GitHub identities retain their historical ``owner/repo`` form. Other
+    forges use ``host/percent-encoded-path`` so an arbitrary-depth remote path
+    remains lossless without adding literal slashes to the symbol namespace.
+    """
 
     if not isinstance(value, str) or value != value.strip():
         raise SymbolIdentityError(
-            f"{source}: project identity must be an exact owner/repo string, got {value!r}"
+            f"{source}: project identity must be an exact namespace/project "
+            f"string, got {value!r}"
         )
-    if not _PROJECT_IDENTITY_RE.fullmatch(value):
+    if value.count("/") != 1:
         raise SymbolIdentityError(
-            f"{source}: project identity must be stable owner/repo, got {value!r}"
+            f"{source}: project identity must contain exactly one slash, got {value!r}"
         )
-    owner, repo = value.split("/", 1)
-    if owner in {".", ".."} or repo in {".", ".."} or repo.endswith(".git"):
+    namespace, project = value.split("/", 1)
+    if not namespace or not project:
         raise SymbolIdentityError(
-            f"{source}: project identity must be canonical owner/repo without .git, "
-            f"got {value!r}"
+            f"{source}: project identity components must be non-empty, got {value!r}"
+        )
+    decoded_namespace = _decode_identity_component(
+        namespace, source=f"{source}:namespace"
+    )
+    decoded_project = _decode_identity_component(
+        project, source=f"{source}:project"
+    )
+    if (
+        decoded_namespace in {".", ".."}
+        or "/" in decoded_namespace
+        or _contains_unsafe_path_text(decoded_namespace)
+    ):
+        raise SymbolIdentityError(
+            f"{source}: project identity has an unsafe namespace: {value!r}"
+        )
+    project_parts = _validate_project_path(decoded_project, source=source)
+    if project_parts[-1].lower().endswith(".git"):
+        raise SymbolIdentityError(
+            f"{source}: project identity must be canonical without .git, got {value!r}"
         )
     return value
+
+
+def _normalize_remote_host(host: str, *, source: str) -> str:
+    raw_host = host.strip().rstrip(".")
+    if not raw_host or _contains_unsafe_path_text(raw_host) or "%" in raw_host:
+        raise SymbolIdentityError(f"{source}: remote host is unsafe or empty")
+    try:
+        ip = ipaddress.ip_address(raw_host)
+    except ValueError:
+        try:
+            normalized = raw_host.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise SymbolIdentityError(
+                f"{source}: remote host is not valid IDNA: {raw_host!r}"
+            ) from exc
+        labels = normalized.split(".")
+        if (
+            len(normalized) > 253
+            or any(not _HOST_LABEL_RE.fullmatch(label) for label in labels)
+        ):
+            raise SymbolIdentityError(
+                f"{source}: remote host is not canonical: {raw_host!r}"
+            )
+        return normalized
+    return ip.compressed.lower()
+
+
+def _split_remote(remote_url: str, *, source: str) -> tuple[str, int | None, str, str]:
+    if _WINDOWS_LOCAL_PATH_RE.match(remote_url):
+        raise SymbolIdentityError(
+            f"{source}: local filesystem path is not a network forge remote"
+        )
+    if _REMOTE_SCHEME_RE.match(remote_url):
+        parsed = urlsplit(remote_url)
+        if parsed.scheme.lower() == "file" or not parsed.netloc or not parsed.hostname:
+            raise SymbolIdentityError(
+                f"{source}: remote must identify a network forge host"
+            )
+        if parsed.query or parsed.fragment:
+            raise SymbolIdentityError(
+                f"{source}: remote query and fragment are not project identity"
+            )
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise SymbolIdentityError(f"{source}: remote port is invalid") from exc
+        return parsed.hostname, port, parsed.path, parsed.scheme.lower()
+
+    scp_match = _SCP_REMOTE_RE.fullmatch(remote_url)
+    if scp_match:
+        host = scp_match.group("host")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        raw_path = scp_match.group("path")
+        if "?" in raw_path or "#" in raw_path:
+            raise SymbolIdentityError(
+                f"{source}: remote query and fragment are not project identity"
+            )
+        return host, None, raw_path, "ssh"
+
+    if "/" in remote_url:
+        host, raw_path = remote_url.split("/", 1)
+        if "." in host and host and raw_path:
+            if "?" in raw_path or "#" in raw_path:
+                raise SymbolIdentityError(
+                    f"{source}: remote query and fragment are not project identity"
+                )
+            return host, None, raw_path, ""
+
+    raise SymbolIdentityError(
+        f"{source}: remote does not identify a canonical network forge project"
+    )
+
+
+def _normalize_remote_path(raw_path: str, *, source: str) -> tuple[str, ...]:
+    if raw_path != raw_path.strip():
+        raise SymbolIdentityError(
+            f"{source}: remote project path has surrounding whitespace"
+        )
+    path = raw_path
+    if path.startswith("/"):
+        path = path[1:]
+    if path.endswith("/"):
+        path = path[:-1]
+    if not path or path.startswith("/") or path.endswith("/"):
+        raise SymbolIdentityError(
+            f"{source}: remote project path has ambiguous repeated slashes"
+        )
+    if _ENCODED_PATH_SEPARATOR_RE.search(path):
+        raise SymbolIdentityError(
+            f"{source}: remote project path has an ambiguous encoded separator"
+        )
+    decoded = _decode_percent_encoded(path, source=source)
+    parts = list(_validate_project_path(decoded, source=source))
+    if parts[-1].lower().endswith(".git"):
+        parts[-1] = parts[-1][:-4]
+        if not parts[-1] or parts[-1] in {".", ".."}:
+            raise SymbolIdentityError(
+                f"{source}: remote project path is empty after removing .git"
+            )
+    return tuple(parts)
+
+
+def resolve_remote_project_identity(
+    remote_url: object,
+    *,
+    source: str,
+) -> ResolvedProjectIdentity:
+    """Resolve a network git remote to a collision-safe project identity.
+
+    The remote is authoritative. Local paths and malformed/ambiguous remotes
+    fail closed so callers cannot invent an identity from a clone directory.
+    """
+
+    if not isinstance(remote_url, str) or not remote_url.strip():
+        raise SymbolIdentityError(f"{source}: remote URL must be a non-empty string")
+    remote = remote_url.strip()
+    host, port, raw_path, scheme = _split_remote(remote, source=source)
+    canonical_host = _normalize_remote_host(host, source=source)
+    path_parts = _normalize_remote_path(raw_path, source=source)
+
+    if canonical_host in _GITHUB_HOSTS:
+        if len(path_parts) != 2:
+            raise SymbolIdentityError(
+                f"{source}: GitHub remote must have exactly owner/repo path segments"
+            )
+        owner, repo = path_parts
+        if (
+            not _GITHUB_COMPONENT_RE.fullmatch(owner)
+            or not _GITHUB_COMPONENT_RE.fullmatch(repo)
+        ):
+            raise SymbolIdentityError(
+                f"{source}: GitHub owner/repo contains unsupported characters"
+            )
+        owner_repo = require_project_identity(
+            f"{owner}/{repo}", source=f"{source}:GitHub"
+        )
+        return ResolvedProjectIdentity(
+            project_identity=owner_repo,
+            owner_repo=owner_repo,
+        )
+
+    authority = canonical_host
+    if port is not None and port != _DEFAULT_REMOTE_PORTS.get(scheme):
+        authority = f"{authority}:{port}"
+    project_identity = require_project_identity(
+        f"{quote(authority, safe=_IDENTITY_COMPONENT_SAFE)}/"
+        f"{quote('/'.join(path_parts), safe=_IDENTITY_COMPONENT_SAFE)}",
+        source=source,
+    )
+    return ResolvedProjectIdentity(
+        project_identity=project_identity,
+        owner_repo=None,
+    )
 
 
 def compute_symbol_id(symbol_key: str) -> int:
@@ -188,8 +444,10 @@ __all__ = [
     "SYMBOL_IDENTITY_SCHEMA_METADATA_KEY",
     "SYMBOL_IDENTITY_SCHEMA_VERSION",
     "SYMBOL_ID_MAX",
+    "ResolvedProjectIdentity",
     "SymbolIdentityError",
     "SymbolIdentityRegistry",
     "compute_symbol_id",
     "require_project_identity",
+    "resolve_remote_project_identity",
 ]

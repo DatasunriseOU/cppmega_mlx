@@ -135,13 +135,97 @@ def test_materialize_rejects_bare_project_identity_before_subprocess(
         "run_checked",
         lambda *_args, **_kwargs: pytest.fail("subprocess must not start"),
     )
-    with pytest.raises(streaming_reindex.SymbolIdentityError, match="stable owner/repo"):
+    with pytest.raises(
+        streaming_reindex.SymbolIdentityError,
+        match="exactly one slash",
+    ):
         streaming_reindex.stage_materialize(
             "cjson",
             tmp_path / "input.jsonl",
             tmp_path,
             project_id="cjson",
         )
+
+
+def test_non_github_repo_list_identity_reaches_code_indexer(
+    monkeypatch, tmp_path
+) -> None:
+    import streaming_reindex
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "bare_name": "aosp-frameworks-av",
+                        "project_identity": (
+                            "android.googlesource.com/platform%2Fframeworks%2Fav"
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        (tmp_path / "work" / "aosp-frameworks-av.enriched.jsonl").write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
+    work = tmp_path / "work"
+    work.mkdir()
+    project_identity = streaming_reindex.resolve_project_identity(
+        "aosp-frameworks-av", repo_list
+    )
+
+    output = streaming_reindex.stage_index_source(
+        "aosp-frameworks-av",
+        project_identity,
+        tmp_path / "source",
+        work,
+    )
+
+    project_id_arg = captured.index("--project-id")
+    assert captured[project_id_arg + 1] == (
+        "android.googlesource.com/platform%2Fframeworks%2Fav"
+    )
+    assert output == work / "aosp-frameworks-av.enriched.jsonl"
+
+
+def test_project_identity_map_rejects_duplicate_bare_name_collision(
+    tmp_path,
+) -> None:
+    import streaming_reindex
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "bare_name": "system-core",
+                        "project_identity": (
+                            "android.googlesource.com/platform%2Fsystem%2Fcore"
+                        ),
+                    },
+                    {
+                        "bare_name": "system-core",
+                        "project_identity": "example.com/vendor%2Fsystem%2Fcore",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(streaming_reindex.SymbolIdentityError, match="maps to both"):
+        streaming_reindex.load_project_identity_map(repo_list)
 
 
 def test_commit_range_materializes_short_repo_with_repo_list_identity(tmp_path) -> None:
@@ -213,7 +297,7 @@ def test_commit_range_materialize_rejects_unresolved_short_repo(tmp_path) -> Non
 
     with pytest.raises(
         streaming_reindex_commits.sr.SymbolIdentityError,
-        match="no canonical owner/repo identity for bare repo 's2n-tls'",
+        match="no canonical project identity for bare repo 's2n-tls'",
     ):
         streaming_reindex_commits.process_range(
             repo="s2n-tls",

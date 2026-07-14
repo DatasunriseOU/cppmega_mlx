@@ -100,12 +100,26 @@ def load_project_identity_map(repo_list: Path) -> dict[str, str]:
         if not isinstance(entry, dict):
             raise SymbolIdentityError(f"{repo_list}: repos[{index}] must be an object")
         name = entry.get("name") or entry.get("bare_name")
+        project_identity = entry.get("project_identity")
         owner_repo = entry.get("owner_repo")
         if not isinstance(name, str) or not name:
             continue
+        if project_identity is None:
+            project_identity = owner_repo
         project_id = require_project_identity(
-            owner_repo, source=f"{repo_list}:repos[{index}]"
+            project_identity,
+            source=f"{repo_list}:repos[{index}].project_identity",
         )
+        if owner_repo is not None:
+            github_project_id = require_project_identity(
+                owner_repo,
+                source=f"{repo_list}:repos[{index}].owner_repo",
+            )
+            if github_project_id != project_id:
+                raise SymbolIdentityError(
+                    f"{repo_list}: repos[{index}] has conflicting project_identity "
+                    f"{project_id!r} and owner_repo {github_project_id!r}"
+                )
         previous = identities.get(name)
         if previous is not None and previous != project_id:
             raise SymbolIdentityError(
@@ -121,14 +135,14 @@ def resolve_project_identity(repo: str, repo_list: Path | None) -> str:
         return require_project_identity(repo, source="streaming repo")
     if repo_list is None:
         raise SymbolIdentityError(
-            f"repo {repo!r} has no owner/repo identity; provide --repo-list"
+            f"repo {repo!r} has no canonical project identity; provide --repo-list"
         )
     identities = load_project_identity_map(repo_list)
     try:
         return identities[repo]
     except KeyError as exc:
         raise SymbolIdentityError(
-            f"{repo_list}: no canonical owner/repo identity for bare repo {repo!r}"
+            f"{repo_list}: no canonical project identity for bare repo {repo!r}"
         ) from exc
 
 
@@ -1449,7 +1463,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--repo-list",
         default=str(DEFAULT_REPO_LIST),
-        help="repo_list.json mapping bare extraction names to canonical owner/repo "
+        help="repo_list.json mapping bare extraction names to canonical project "
         f"identities. Default {DEFAULT_REPO_LIST}.",
     )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
@@ -1579,7 +1593,7 @@ def main(argv: list[str]) -> int:
             )
         except KeyError as exc:
             raise SymbolIdentityError(
-                f"{repo_list}: no canonical owner/repo identity for "
+                f"{repo_list}: no canonical project identity for "
                 f"bare commit source {key!r}"
             ) from exc
         commit_sources.append((key, project_id, files))
@@ -1658,7 +1672,7 @@ def main(argv: list[str]) -> int:
                         )
                     except KeyError as exc:
                         raise SymbolIdentityError(
-                            f"{repo_list}: no canonical owner/repo identity for "
+                            f"{repo_list}: no canonical project identity for "
                             f"bare repo {repo!r}"
                         ) from exc
                     info = process_one_repo(repo, repo_dir, target_lengths, work_root,
