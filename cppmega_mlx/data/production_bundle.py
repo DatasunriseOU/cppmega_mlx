@@ -40,6 +40,29 @@ _OBJECTIVE_BUCKETS_SCHEMA = "cppmega_bucketed_objective_materializations_v1"
 _OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 _OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v1"
 _OBJECTIVE_SOURCE_SCHEMA = "cppmega_objective_source_snapshot_v1"
+_LEGACY_SOURCE_SAMPLING_MODE = "deterministic_epoch_shuffle_v1"
+_BOUNDED_SOURCE_SAMPLING_MODE = (
+    "deterministic_shard_row_group_record_batch_shuffle_v2"
+)
+_BOUNDED_SOURCE_ORDERING = {
+    "permutation": "sha256_sort_key_v1",
+    "epochs": "ascending",
+    "shards": "seeded_permutation_per_epoch",
+    "row_groups": "seeded_permutation_per_shard_epoch",
+    "record_batches": "physical_order_within_row_group",
+    "rows": "seeded_permutation_within_record_batch",
+}
+_BOUNDED_SOURCE_CURSOR_FIELDS = {
+    "epoch",
+    "shard_position",
+    "shard_index",
+    "row_group_position",
+    "row_group_index",
+    "record_batch_index",
+    "row_shuffle_position",
+    "row_index_in_record_batch",
+    "source_index",
+}
 _GRAPH_SIDECAR_SCHEMA = "cppmega_graph_routes_v2"
 _CASE5_RECEIPT_KEY = "case5_domain_ingestion_receipt"
 _CASE5_SCHEMA = "case5_domain_routes_v1"
@@ -1257,35 +1280,12 @@ def _objective_source_summary(
         raise ValueError(
             f"objective source artifact-set hash drifted for bucket {bucket}"
         )
-    sampling = _require_mapping(
-        source.get("sampling"), where=f"objective source sampling for bucket {bucket}"
+    sampling = _validate_objective_source_sampling(
+        source.get("sampling"),
+        row_count=row_count,
+        file_count=len(files),
+        bucket=bucket,
     )
-    expected_sampling_fields = {
-        "mode",
-        "seed",
-        "requested_samples",
-        "full_passes",
-        "tail_rows",
-        "min_row_reuse",
-        "max_row_reuse",
-    }
-    if set(sampling) != expected_sampling_fields:
-        raise ValueError(
-            f"objective source sampling fields drifted for bucket {bucket}"
-        )
-    requested = _require_positive_int(
-        sampling.get("requested_samples"),
-        where=f"objective requested samples for bucket {bucket}",
-    )
-    full_passes, tail_rows = divmod(requested, row_count)
-    if (
-        sampling.get("mode") != "deterministic_epoch_shuffle_v1"
-        or sampling.get("full_passes") != full_passes
-        or sampling.get("tail_rows") != tail_rows
-        or sampling.get("min_row_reuse") != full_passes
-        or sampling.get("max_row_reuse") != full_passes + int(tail_rows > 0)
-    ):
-        raise ValueError(f"objective source sampling drifted for bucket {bucket}")
     return (
         {
             "schema": _OBJECTIVE_SOURCE_SCHEMA,
@@ -1296,6 +1296,113 @@ def _objective_source_summary(
         },
         source_counter,
     )
+
+
+def _validate_objective_source_sampling(
+    raw_sampling: object,
+    *,
+    row_count: int,
+    file_count: int,
+    bucket: int,
+) -> dict[str, object]:
+    sampling = _require_mapping(
+        raw_sampling, where=f"objective source sampling for bucket {bucket}"
+    )
+    common_fields = {
+        "mode",
+        "seed",
+        "requested_samples",
+        "full_passes",
+        "tail_rows",
+        "min_row_reuse",
+        "max_row_reuse",
+    }
+    mode = sampling.get("mode")
+    if mode == _LEGACY_SOURCE_SAMPLING_MODE:
+        expected_fields = common_fields
+    elif mode == _BOUNDED_SOURCE_SAMPLING_MODE:
+        expected_fields = common_fields | {
+            "record_batch_rows",
+            "ordering",
+            "cursor_semantics",
+            "final_cursor",
+        }
+    else:
+        raise ValueError(
+            f"objective source sampling mode is unsupported for bucket {bucket}: "
+            f"{mode!r}"
+        )
+    if set(sampling) != expected_fields:
+        raise ValueError(
+            f"objective source sampling fields drifted for bucket {bucket}"
+        )
+
+    seed = sampling.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f"objective source seed must be an integer for bucket {bucket}")
+    requested = _require_positive_int(
+        sampling.get("requested_samples"),
+        where=f"objective requested samples for bucket {bucket}",
+    )
+    full_passes, tail_rows = divmod(requested, row_count)
+    if (
+        sampling.get("full_passes") != full_passes
+        or sampling.get("tail_rows") != tail_rows
+        or sampling.get("min_row_reuse") != full_passes
+        or sampling.get("max_row_reuse") != full_passes + int(tail_rows > 0)
+    ):
+        raise ValueError(f"objective source sampling drifted for bucket {bucket}")
+
+    if mode == _LEGACY_SOURCE_SAMPLING_MODE:
+        return dict(sampling)
+
+    record_batch_rows = _require_positive_int(
+        sampling.get("record_batch_rows"),
+        where=f"objective source record_batch_rows for bucket {bucket}",
+    )
+    if sampling.get("ordering") != _BOUNDED_SOURCE_ORDERING:
+        raise ValueError(
+            f"objective source bounded ordering drifted for bucket {bucket}"
+        )
+    if sampling.get("cursor_semantics") != "last_yielded_row_v1":
+        raise ValueError(
+            f"objective source cursor semantics drifted for bucket {bucket}"
+        )
+    cursor = _require_mapping(
+        sampling.get("final_cursor"),
+        where=f"objective source final cursor for bucket {bucket}",
+    )
+    if set(cursor) != _BOUNDED_SOURCE_CURSOR_FIELDS:
+        raise ValueError(
+            f"objective source final cursor fields drifted for bucket {bucket}"
+        )
+    for name in _BOUNDED_SOURCE_CURSOR_FIELDS:
+        value = cursor.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"objective source final cursor {name} must be a non-negative "
+                f"integer for bucket {bucket}"
+            )
+    if cursor["source_index"] != requested - 1:
+        raise ValueError(
+            f"objective source final cursor index drifted for bucket {bucket}"
+        )
+    if cursor["epoch"] != (requested - 1) // row_count:
+        raise ValueError(
+            f"objective source final cursor epoch drifted for bucket {bucket}"
+        )
+    if cursor["shard_position"] >= file_count or cursor["shard_index"] >= file_count:
+        raise ValueError(
+            f"objective source final cursor shard drifted for bucket {bucket}"
+        )
+    if (
+        cursor["row_shuffle_position"] >= record_batch_rows
+        or cursor["row_index_in_record_batch"] >= record_batch_rows
+    ):
+        raise ValueError(
+            f"objective source final cursor row drifted for bucket {bucket}"
+        )
+    return dict(sampling)
 
 
 def _require_referenced_artifact(

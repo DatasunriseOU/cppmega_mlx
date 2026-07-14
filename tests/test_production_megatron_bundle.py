@@ -237,7 +237,9 @@ def _write_graph_sidecars(prefix: Path) -> dict[str, dict[str, object]]:
     return specs
 
 
-def _build_bundle(tmp_path: Path) -> _BundleFixture:
+def _build_bundle(
+    tmp_path: Path, *, bounded_source_sampling: bool = False
+) -> _BundleFixture:
     root = tmp_path / "bundle"
     prefix = root / _PREFIX_RELATIVE
     prefix.parent.mkdir(parents=True)
@@ -263,6 +265,42 @@ def _build_bundle(tmp_path: Path) -> _BundleFixture:
 
     source_bytes = b"src"
     source_digest = hashlib.sha256(source_bytes).hexdigest()
+    source_sampling: dict[str, object] = {
+        "mode": "deterministic_epoch_shuffle_v1",
+        "seed": 7,
+        "requested_samples": 1,
+        "full_passes": 1,
+        "tail_rows": 0,
+        "min_row_reuse": 1,
+        "max_row_reuse": 1,
+    }
+    if bounded_source_sampling:
+        source_sampling.update(
+            {
+                "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
+                "record_batch_rows": 64,
+                "ordering": {
+                    "permutation": "sha256_sort_key_v1",
+                    "epochs": "ascending",
+                    "shards": "seeded_permutation_per_epoch",
+                    "row_groups": "seeded_permutation_per_shard_epoch",
+                    "record_batches": "physical_order_within_row_group",
+                    "rows": "seeded_permutation_within_record_batch",
+                },
+                "cursor_semantics": "last_yielded_row_v1",
+                "final_cursor": {
+                    "epoch": 0,
+                    "shard_position": 0,
+                    "shard_index": 0,
+                    "row_group_position": 0,
+                    "row_group_index": 0,
+                    "record_batch_index": 0,
+                    "row_shuffle_position": 0,
+                    "row_index_in_record_batch": 0,
+                    "source_index": 0,
+                },
+            }
+        )
     source_snapshot = {
         "schema": "cppmega_objective_source_snapshot_v1",
         "sequence_length": _BUCKET,
@@ -276,15 +314,7 @@ def _build_bundle(tmp_path: Path) -> _BundleFixture:
                 "rows": 1,
             }
         ],
-        "sampling": {
-            "mode": "deterministic_epoch_shuffle_v1",
-            "seed": 7,
-            "requested_samples": 1,
-            "full_passes": 1,
-            "tail_rows": 0,
-            "min_row_reuse": 1,
-            "max_row_reuse": 1,
-        },
+        "sampling": source_sampling,
     }
     source_snapshot["artifact_set_sha256"] = _artifact_set_sha256(
         [
@@ -602,6 +632,18 @@ def test_open_production_megatron_bundle_records_validated_provenance(
     assert dataset.metadata.domain_schema_sha256 == DOMAIN_SCHEMA_SHA256
     assert tuple(batch.tokens.shape) == (1, _BUCKET)
     assert batch.document_ids is not None
+    assert batch.graph_batch is not None
+
+
+def test_open_production_megatron_bundle_accepts_bounded_source_sampling(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_bundle(tmp_path, bounded_source_sampling=True)
+
+    dataset = _open(fixture)
+    batch = next(dataset.iter_batches(loop=False))
+
+    assert tuple(batch.tokens.shape) == (1, _BUCKET)
     assert batch.graph_batch is not None
 
 

@@ -1848,9 +1848,18 @@ def _is_compact_fixed_row_shard(
 
     sequence_count = int(sequence_lengths.shape[0])
     expected_capacity = sequence_count * seq_len
-    if int(declared_capacity) != expected_capacity:
+    shifted_objective_capacity = sequence_count * (seq_len + 1)
+    capacity_is_valid = int(declared_capacity) == expected_capacity
+    if (
+        not capacity_is_valid
+        and int(declared_capacity) == shifted_objective_capacity
+        and _is_shifted_lm_objective_sidecar(sidecar, seq_len=seq_len)
+    ):
+        capacity_is_valid = True
+    if not capacity_is_valid:
         raise ValueError(
-            "source_capacity_token_count does not match sequence_count * seq_len"
+            "source_capacity_token_count does not match the declared compact-row "
+            "training contract"
         )
     if int(sidecar.get("document_count", -1)) != sequence_count:
         raise ValueError(
@@ -1866,6 +1875,25 @@ def _is_compact_fixed_row_shard(
             "compact fixed-row sequence lengths must satisfy 0 < length <= seq_len"
         )
     return True
+
+
+def _is_shifted_lm_objective_sidecar(
+    sidecar: dict[str, Any], *, seq_len: int
+) -> bool:
+    objective_contract = sidecar.get("objective_contract")
+    if not isinstance(objective_contract, dict):
+        return False
+    payload = objective_contract.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    materialization = payload.get("materialization")
+    source_snapshot = payload.get("source_snapshot")
+    return (
+        isinstance(materialization, dict)
+        and materialization.get("format") == "shifted_lm_document_v1"
+        and isinstance(source_snapshot, dict)
+        and source_snapshot.get("sequence_length") == seq_len
+    )
 
 
 def _build_windows(

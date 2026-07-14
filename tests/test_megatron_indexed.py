@@ -1487,8 +1487,41 @@ def test_compact_fixed_rows_reject_inconsistent_capacity_metadata(tmp_path) -> N
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match=r"sequence_count \* seq_len"):
+    with pytest.raises(ValueError, match="compact-row training contract"):
         MegatronIndexedDataset(prefix, seq_len=4, batch_size=1)
+
+
+def test_shifted_objective_rows_accept_target_token_source_capacity(tmp_path) -> None:
+    prefix = tmp_path / "shifted_objective_rows"
+    docs = [
+        np.array([1, 2, 3], dtype=np.int32),
+        np.array([10, 11], dtype=np.int32),
+    ]
+    _write_mmididx(prefix, docs, dtype=np.int32)
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(
+            {
+                "token_count": 5,
+                "source_capacity_token_count": 10,
+                "document_count": 2,
+                "objective_contract": {
+                    "payload": {
+                        "materialization": {"format": "shifted_lm_document_v1"},
+                        "source_snapshot": {"sequence_length": 4},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = MegatronIndexedDataset(prefix, seq_len=4, batch_size=2)
+    batch = next(dataset.iter_batches())
+
+    np.testing.assert_array_equal(
+        np.asarray(batch.tokens),
+        np.array([[1, 2, 3, 0], [10, 11, 0, 0]], dtype=np.int32),
+    )
 
 
 def test_mmididx_v2_domain_routes_and_token_sidecars_round_trip(tmp_path) -> None:
