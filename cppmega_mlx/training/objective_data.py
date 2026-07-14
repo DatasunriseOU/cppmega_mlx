@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -35,6 +36,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.fim import INSERTED_TOKEN_SOURCE_INDEX
 from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
 from cppmega_mlx.training.objective_mixer import ObjectiveSource
 
@@ -46,6 +48,36 @@ _TOKEN_GRAPH_FIELDS = {
     "diagnostic": "diagnostic_edges",
     "cross_domain": "cross_domain_edges",
 }
+OBJECTIVE_GRAPH_RELATION_COLUMNS = {
+    "call": "token_call_edges",
+    "type": "token_type_edges",
+    "domain": "token_domain_edges",
+    "build": "token_build_edges",
+    "shell": "token_shell_edges",
+    "diagnostic": "token_diagnostic_edges",
+    "cross_domain": "token_cross_domain_edges",
+}
+OBJECTIVE_CHUNK_ROUTE_COLUMNS = (
+    "token_chunk_starts",
+    "token_chunk_ends",
+    "token_chunk_kinds",
+    "token_chunk_dep_levels",
+)
+OBJECTIVE_ROUTE_COLUMNS = (
+    *OBJECTIVE_GRAPH_RELATION_COLUMNS.values(),
+    *OBJECTIVE_CHUNK_ROUTE_COLUMNS,
+)
+OBJECTIVE_ROUTE_MAPPING_SCHEMA = "cppmega_exact_source_route_remap_v1"
+OBJECTIVE_ROUTE_RECEIPT_SCHEMA = "cppmega_objective_route_receipt_v1"
+OBJECTIVE_ROUTE_RETENTION_SCHEMA = "cppmega_objective_route_retention_v1"
+OBJECTIVE_ROUTE_COUNT_FIELDS = (
+    "source_edges",
+    "retained_edges",
+    "dropped_unmapped_edges",
+    "dropped_noncausal_routes",
+    "dropped_duplicate_routes",
+    "excluded_edges",
+)
 
 OBJECTIVE_SECTION_COLUMNS = (
     IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
@@ -189,6 +221,356 @@ def objective_source_from_tokenized_row(
         else None
     )
     return ObjectiveSource(code_packet=code_packet, commit_packet=commit_packet)
+
+
+def empty_objective_routes() -> dict[str, list[Any]]:
+    """Return the complete empty route row used for explicit exclusions."""
+
+    return {column: [] for column in OBJECTIVE_ROUTE_COLUMNS}
+
+
+@dataclass(frozen=True)
+class ObjectiveRouteRemap:
+    columns: dict[str, list[Any]]
+    receipt: dict[str, object]
+
+
+def _empty_relation_counts(*, source_edges: int = 0) -> dict[str, int]:
+    counts = {field: 0 for field in OBJECTIVE_ROUTE_COUNT_FIELDS}
+    counts["source_edges"] = source_edges
+    return counts
+
+
+def _route_vector(packet: CodePacket, field: str, *, where: str) -> list[int] | None:
+    value = getattr(packet, field)
+    if value is None:
+        return None
+    array = np.asarray(value)
+    if array.ndim != 1:
+        raise ValueError(
+            f"{where}: CodePacket.{field} must be one-dimensional, got {array.shape}"
+        )
+    return [int(item) for item in array.tolist()]
+
+
+def remap_objective_routes(
+    packet: CodePacket,
+    *,
+    source_token_indices: Sequence[int],
+    where: str,
+    require_sidecars: bool = False,
+    mode: str = "source_token_remap",
+) -> ObjectiveRouteRemap:
+    """Remap chunk spans and graph endpoints through an exact token transform.
+
+    ``source_token_indices`` maps each output token to one source token, with
+    ``-1`` reserved for synthetic markers. Source chunks are split whenever a
+    transform makes their output positions or source positions discontinuous.
+    Only causal edges with two mapped endpoints are emitted.
+    """
+
+    source_tokens = np.asarray(packet.token_ids)
+    if source_tokens.ndim != 1:
+        raise ValueError(
+            f"{where}: route remapping requires one-dimensional CodePacket tokens, "
+            f"got {source_tokens.shape}"
+        )
+    source_length = int(source_tokens.shape[0])
+    source_map = [int(index) for index in source_token_indices]
+    inverse: dict[int, int] = {}
+    for output_index, source_index in enumerate(source_map):
+        if source_index == INSERTED_TOKEN_SOURCE_INDEX:
+            continue
+        if not 0 <= source_index < source_length:
+            raise ValueError(
+                f"{where}: source-token route index {source_index} at output token "
+                f"{output_index} is outside 0..{source_length - 1}"
+            )
+        if source_index in inverse:
+            raise ValueError(
+                f"{where}: source token {source_index} maps to multiple output tokens; "
+                "graph routes would be ambiguous"
+            )
+        inverse[source_index] = output_index
+
+    chunk_fields = {
+        field: _route_vector(packet, field, where=where)
+        for field in ("chunk_starts", "chunk_ends", "chunk_kinds", "chunk_dep_levels")
+    }
+    relation_fields = {
+        **_CHUNK_GRAPH_FIELDS,
+        **_TOKEN_GRAPH_FIELDS,
+    }
+    if require_sidecars:
+        missing = [
+            f"CodePacket.{field}"
+            for field, values in chunk_fields.items()
+            if values is None
+        ]
+        missing.extend(
+            f"CodePacket.{field}"
+            for field in relation_fields.values()
+            if getattr(packet, field) is None
+        )
+        if missing:
+            raise ValueError(
+                f"{where}: production route remapping is missing required sidecars: "
+                + ", ".join(missing)
+            )
+
+    present_chunk_fields = {
+        field: values for field, values in chunk_fields.items() if values is not None
+    }
+    if present_chunk_fields and len(present_chunk_fields) != len(chunk_fields):
+        missing = sorted(set(chunk_fields) - set(present_chunk_fields))
+        raise ValueError(
+            f"{where}: chunk route sidecars must be all present or all absent; "
+            f"missing {missing}"
+        )
+    if not present_chunk_fields:
+        for relation, field in _CHUNK_GRAPH_FIELDS.items():
+            edge = getattr(packet, field)
+            if edge is not None and edge.to_pairs():
+                raise ValueError(
+                    f"{where}: {relation} routes require complete chunk sidecars"
+                )
+        chunks: list[tuple[int, int, int, int, int]] = []
+        source_chunk_count = 0
+    else:
+        starts = present_chunk_fields["chunk_starts"]
+        ends = present_chunk_fields["chunk_ends"]
+        kinds = present_chunk_fields["chunk_kinds"]
+        dep_levels = present_chunk_fields["chunk_dep_levels"]
+        assert starts is not None
+        assert ends is not None
+        assert kinds is not None
+        assert dep_levels is not None
+        lengths = {len(starts), len(ends), len(kinds), len(dep_levels)}
+        if len(lengths) != 1:
+            raise ValueError(
+                f"{where}: chunk route sidecar lengths disagree: "
+                f"starts={len(starts)}, ends={len(ends)}, kinds={len(kinds)}, "
+                f"dep_levels={len(dep_levels)}"
+            )
+        source_chunk_count = len(starts)
+        previous_end = 0
+        for chunk_index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+            if not 0 <= start < end <= source_length:
+                raise ValueError(
+                    f"{where}: source chunk {chunk_index} span [{start}, {end}) is "
+                    f"outside 0..{source_length}"
+                )
+            if chunk_index and start < previous_end:
+                raise ValueError(
+                    f"{where}: source chunk {chunk_index} starts at {start} before "
+                    f"the previous chunk ends at {previous_end}"
+                )
+            previous_end = end
+
+        chunks = []
+        for chunk_index, (start, end, kind, dep_level) in enumerate(
+            zip(starts, ends, kinds, dep_levels, strict=True)
+        ):
+            mapped = sorted(
+                (inverse[source_index], source_index)
+                for source_index in range(start, end)
+                if source_index in inverse
+            )
+            if not mapped:
+                continue
+            fragment_start = mapped[0][0]
+            previous_output, previous_source = mapped[0]
+            for output_index, source_index in mapped[1:]:
+                if (
+                    output_index != previous_output + 1
+                    or source_index != previous_source + 1
+                ):
+                    chunks.append(
+                        (
+                            fragment_start,
+                            previous_output + 1,
+                            int(kind),
+                            int(dep_level),
+                            chunk_index,
+                        )
+                    )
+                    fragment_start = output_index
+                previous_output = output_index
+                previous_source = source_index
+            chunks.append(
+                (
+                    fragment_start,
+                    previous_output + 1,
+                    int(kind),
+                    int(dep_level),
+                    chunk_index,
+                )
+            )
+        chunks.sort(key=lambda chunk: (chunk[0], chunk[1], chunk[4]))
+        for previous, current in zip(chunks, chunks[1:]):
+            if (
+                current[0] < previous[1]
+            ):  # pragma: no cover - unique inverse proves this
+                raise AssertionError(f"{where}: remapped chunk fragments overlap")
+        if len(chunks) > np.iinfo(np.uint16).max + 1:
+            raise ValueError(
+                f"{where}: {len(chunks)} remapped chunks exceed uint16 graph endpoints"
+            )
+
+    result = empty_objective_routes()
+    result["token_chunk_starts"] = [chunk[0] for chunk in chunks]
+    result["token_chunk_ends"] = [chunk[1] for chunk in chunks]
+    result["token_chunk_kinds"] = [chunk[2] for chunk in chunks]
+    result["token_chunk_dep_levels"] = [chunk[3] for chunk in chunks]
+    output_chunks_by_source: dict[int, list[int]] = {
+        chunk_index: [] for chunk_index in range(source_chunk_count)
+    }
+    for output_chunk, chunk in enumerate(chunks):
+        output_chunks_by_source[chunk[4]].append(output_chunk)
+
+    output_starts = result["token_chunk_starts"]
+    relation_receipts: dict[str, dict[str, int]] = {}
+    for relation, field in _CHUNK_GRAPH_FIELDS.items():
+        edge = getattr(packet, field)
+        if edge is None:
+            relation_receipts[relation] = _empty_relation_counts()
+            continue
+        source_pairs = edge.to_pairs()
+        counts = _empty_relation_counts(source_edges=len(source_pairs))
+        remapped: set[tuple[int, int]] = set()
+        for source_chunk, destination_chunk in source_pairs:
+            if not (
+                0 <= source_chunk < source_chunk_count
+                and 0 <= destination_chunk < source_chunk_count
+            ):
+                raise ValueError(
+                    f"{where}: {relation} edge ({source_chunk}, {destination_chunk}) "
+                    f"is outside {source_chunk_count} source chunks"
+                )
+            source_outputs = output_chunks_by_source[source_chunk]
+            destination_outputs = output_chunks_by_source[destination_chunk]
+            if not source_outputs or not destination_outputs:
+                counts["dropped_unmapped_edges"] += 1
+                continue
+            for output_source in source_outputs:
+                for output_destination in destination_outputs:
+                    if (
+                        output_starts[output_destination]
+                        <= output_starts[output_source]
+                    ):
+                        route = (output_source, output_destination)
+                        if route in remapped:
+                            counts["dropped_duplicate_routes"] += 1
+                        else:
+                            remapped.add(route)
+                    else:
+                        counts["dropped_noncausal_routes"] += 1
+        result[OBJECTIVE_GRAPH_RELATION_COLUMNS[relation]] = [
+            {"from": source, "to": destination}
+            for source, destination in sorted(remapped)
+        ]
+        counts["retained_edges"] = len(remapped)
+        relation_receipts[relation] = counts
+
+    for relation, field in _TOKEN_GRAPH_FIELDS.items():
+        edge = getattr(packet, field)
+        if edge is None:
+            relation_receipts[relation] = _empty_relation_counts()
+            continue
+        source_triples = edge.to_triples()
+        counts = _empty_relation_counts(source_edges=len(source_triples))
+        remapped_triples: set[tuple[int, int, int]] = set()
+        for source_token, destination_token, kind in source_triples:
+            if not (
+                0 <= source_token < source_length
+                and 0 <= destination_token < source_length
+            ):
+                raise ValueError(
+                    f"{where}: {relation} edge ({source_token}, {destination_token}) "
+                    f"is outside {source_length} source tokens"
+                )
+            output_source = inverse.get(source_token)
+            output_destination = inverse.get(destination_token)
+            if output_source is None or output_destination is None:
+                counts["dropped_unmapped_edges"] += 1
+                continue
+            if output_destination <= output_source:
+                route = (output_source, output_destination, int(kind))
+                if route in remapped_triples:
+                    counts["dropped_duplicate_routes"] += 1
+                else:
+                    remapped_triples.add(route)
+            else:
+                counts["dropped_noncausal_routes"] += 1
+        result[OBJECTIVE_GRAPH_RELATION_COLUMNS[relation]] = [
+            {"from": source, "to": destination, "kind": kind}
+            for source, destination, kind in sorted(remapped_triples)
+        ]
+        counts["retained_edges"] = len(remapped_triples)
+        relation_receipts[relation] = counts
+    return ObjectiveRouteRemap(
+        columns=result,
+        receipt={
+            "schema": OBJECTIVE_ROUTE_RECEIPT_SCHEMA,
+            "mode": mode,
+            "source_chunks": source_chunk_count,
+            "retained_chunks": len(chunks),
+            "dropped_chunks": sum(
+                not output_chunks for output_chunks in output_chunks_by_source.values()
+            ),
+            "excluded_chunks": 0,
+            "relations": relation_receipts,
+        },
+    )
+
+
+def exclude_objective_routes(
+    packet: CodePacket | None,
+    *,
+    where: str,
+    reason: str,
+    require_sidecars: bool = False,
+) -> ObjectiveRouteRemap:
+    """Explicitly exclude routes when an objective has no exact source-token map."""
+
+    if packet is None:
+        source_chunks = 0
+        source_relations = {
+            relation: _empty_relation_counts()
+            for relation in OBJECTIVE_GRAPH_RELATION_COLUMNS
+        }
+    else:
+        identity = remap_objective_routes(
+            packet,
+            source_token_indices=range(int(packet.token_ids.shape[0])),
+            where=where,
+            require_sidecars=require_sidecars,
+            mode="identity_validation",
+        )
+        source_chunks = int(identity.receipt["source_chunks"])
+        raw_relations = identity.receipt["relations"]
+        assert isinstance(raw_relations, Mapping)
+        source_relations = {}
+        for relation in OBJECTIVE_GRAPH_RELATION_COLUMNS:
+            raw_counts = raw_relations[relation]
+            assert isinstance(raw_counts, Mapping)
+            source_edges = int(raw_counts["source_edges"])
+            counts = _empty_relation_counts(source_edges=source_edges)
+            counts["excluded_edges"] = source_edges
+            source_relations[relation] = counts
+    return ObjectiveRouteRemap(
+        columns=empty_objective_routes(),
+        receipt={
+            "schema": OBJECTIVE_ROUTE_RECEIPT_SCHEMA,
+            "mode": "excluded",
+            "reason": reason,
+            "source_chunks": source_chunks,
+            "retained_chunks": 0,
+            "dropped_chunks": 0,
+            "excluded_chunks": source_chunks,
+            "relations": source_relations,
+        },
+    )
 
 
 def token_graph_for_aligned_example(
@@ -371,12 +753,23 @@ def graph_targets_and_pair_mask(
 
 
 __all__ = [
+    "OBJECTIVE_CHUNK_ROUTE_COLUMNS",
+    "OBJECTIVE_GRAPH_RELATION_COLUMNS",
     "OBJECTIVE_SECTION_COLUMNS",
     "OBJECTIVE_SOURCE_COLUMNS",
     "OBJECTIVE_REQUIRED_SOURCE_COLUMNS",
     "OBJECTIVE_MEGATRON_REQUIRED_SOURCE_COLUMNS",
+    "OBJECTIVE_ROUTE_COLUMNS",
+    "OBJECTIVE_ROUTE_COUNT_FIELDS",
+    "OBJECTIVE_ROUTE_MAPPING_SCHEMA",
+    "OBJECTIVE_ROUTE_RECEIPT_SCHEMA",
+    "OBJECTIVE_ROUTE_RETENTION_SCHEMA",
+    "ObjectiveRouteRemap",
+    "empty_objective_routes",
+    "exclude_objective_routes",
     "graph_targets_and_pair_mask",
     "objective_source_from_tokenized_row",
+    "remap_objective_routes",
     "require_megatron_objective_source_columns",
     "require_objective_source_columns",
     "token_graph_for_aligned_example",

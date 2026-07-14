@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +33,14 @@ from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ObjectiveSource,
     RealizedObjective,
+)
+from cppmega_mlx.training.objective_data import (
+    OBJECTIVE_CHUNK_ROUTE_COLUMNS,
+    OBJECTIVE_GRAPH_RELATION_COLUMNS,
+    OBJECTIVE_ROUTE_MAPPING_SCHEMA,
+    OBJECTIVE_ROUTE_RETENTION_SCHEMA,
+    exclude_objective_routes,
+    remap_objective_routes,
 )
 from cppmega_mlx.training.objectives import SOURCE_TOKEN_INDICES_METADATA_KEY
 from cppmega_mlx.training.task_mixer import TaskKind
@@ -80,7 +85,6 @@ OBJECTIVE_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_chunk_kinds", "ragged_1d", "uint8"),
     ("token_chunk_dep_levels", "ragged_1d", "uint16"),
 )
-_KNOWN_TASKS = frozenset(task.value for task in TaskKind)
 OBJECTIVE_KIND_IDS = {
     TaskKind.CAUSAL_LM.value: 1,
     TaskKind.FIM.value: 2,
@@ -92,16 +96,6 @@ OBJECTIVE_KIND_IDS = {
     TaskKind.TYPE_RECOVERY.value: 8,
     TaskKind.CALLEE_RECOVERY.value: 9,
 }
-_REQUIRED_PRODUCTION_TASKS = frozenset(
-    {
-        TaskKind.CAUSAL_LM.value,
-        TaskKind.FIM.value,
-        TaskKind.AST_FIM.value,
-        TaskKind.IFIM.value,
-        TaskKind.COMMIT_DIFF.value,
-        TaskKind.PRE_TO_POST.value,
-    }
-)
 _ALIGNED_TASKS = frozenset(
     {
         TaskKind.CAUSAL_LM,
@@ -138,28 +132,38 @@ _TOKEN_SIDECARS = {
     "token_confidence_ids": "confidence_ids",
 }
 SOURCE_IDENTITY_REGISTRY_COLUMN = "source_identity_registry"
-_DOMAIN_GRAPH_FIELDS = {
-    "token_domain_edges": "domain_edges",
-    "token_build_edges": "build_edges",
-    "token_shell_edges": "shell_edges",
-    "token_diagnostic_edges": "diagnostic_edges",
-    "token_cross_domain_edges": "cross_domain_edges",
-}
-_GRAPH_RELATION_COLUMNS = {
-    "call": "token_call_edges",
-    "type": "token_type_edges",
-    "domain": "token_domain_edges",
-    "build": "token_build_edges",
-    "shell": "token_shell_edges",
-    "diagnostic": "token_diagnostic_edges",
-    "cross_domain": "token_cross_domain_edges",
-}
+_GRAPH_RELATION_COLUMNS = dict(OBJECTIVE_GRAPH_RELATION_COLUMNS)
 _DOMAIN_DELIMITER_BY_ID: dict[int, tuple[int, str, int]] = {}
 for _domain, (_start_role, _end_role) in DOMAIN_DELIMITER_ROLES.items():
     _start_id = int(DOMAIN_DELIMITER_TOKEN_IDS[_start_role])
     _end_id = int(DOMAIN_DELIMITER_TOKEN_IDS[_end_role])
     _DOMAIN_DELIMITER_BY_ID[_start_id] = (int(_domain), "start", _end_id)
     _DOMAIN_DELIMITER_BY_ID[_end_id] = (int(_domain), "end", _end_id)
+
+
+def objective_route_mapping_contract() -> dict[str, object]:
+    """Return the converter-visible policy for graph routes after transforms."""
+
+    return {
+        "schema": OBJECTIVE_ROUTE_MAPPING_SCHEMA,
+        "source_token_sentinel": INSERTED_TOKEN_SOURCE_INDEX,
+        "identity_objectives": [TaskKind.CAUSAL_LM.value],
+        "source_token_remap_objectives": [
+            task.value for task in TaskKind if task in _TRANSFORMED_CODE_TASKS
+        ],
+        "explicit_exclusions": {
+            TaskKind.COMMIT_DIFF.value: (
+                "independently_tokenized_commit_sections_have_no_exact_source_map"
+            ),
+            TaskKind.PRE_TO_POST.value: (
+                "independently_tokenized_commit_sections_have_no_exact_source_map"
+            ),
+        },
+        "chunk_fragmentation": "split_output_and_source_discontinuities_v1",
+        "edge_filter": "mapped_endpoints_causal_order_v1",
+        "retained_relation_columns": dict(OBJECTIVE_GRAPH_RELATION_COLUMNS),
+        "retained_chunk_columns": list(OBJECTIVE_CHUNK_ROUTE_COLUMNS),
+    }
 
 
 def _ints(value: Any, *, where: str) -> list[int]:
@@ -496,37 +500,6 @@ def _validate_domain_stack_sidecars(
         raise ValueError(f"{where}: unclosed domain delimiter stack {stack}")
 
 
-def _causal_chunk_pairs(
-    packet: CodePacket,
-    field: str,
-    starts: list[int],
-) -> list[dict[str, int]]:
-    edge = getattr(packet, field)
-    if edge is None:
-        return []
-    result: list[dict[str, int]] = []
-    for source, destination in edge.to_pairs():
-        if not (0 <= source < len(starts) and 0 <= destination < len(starts)):
-            raise ValueError(
-                f"CodePacket.{field} edge ({source}, {destination}) is outside "
-                f"{len(starts)} chunks"
-            )
-        if starts[destination] <= starts[source]:
-            result.append({"from": source, "to": destination})
-    return result
-
-
-def _causal_domain_triples(packet: CodePacket, field: str) -> list[dict[str, int]]:
-    edge = getattr(packet, field)
-    if edge is None:
-        return []
-    return [
-        {"from": source, "to": destination, "kind": kind}
-        for source, destination, kind in edge.to_triples()
-        if destination <= source
-    ]
-
-
 @dataclass(frozen=True)
 class MaterializedMegatronDocument:
     objective_kind: str
@@ -534,6 +507,7 @@ class MaterializedMegatronDocument:
     loss_mask: list[int]
     graph_edge_count: int
     row: dict[str, object]
+    route_receipt: Mapping[str, object] | None = None
 
 
 def _source_identity_registry_for_ids(
@@ -636,6 +610,16 @@ def write_objective_materialization_artifact(
         raise ValueError("objective contract graph pair mask semantics drifted")
     if expansion != "cartesian_token_spans_v1":
         raise ValueError("objective contract graph span expansion semantics drifted")
+    if graph.get("route_mapping") != objective_route_mapping_contract():
+        raise ValueError("objective contract route remapping semantics drifted")
+    route_retention = graph.get("route_retention")
+    if (
+        not isinstance(route_retention, Mapping)
+        or route_retention.get("schema") != OBJECTIVE_ROUTE_RETENTION_SCHEMA
+        or not isinstance(route_retention.get("by_objective"), Mapping)
+        or not route_retention["by_objective"]
+    ):
+        raise ValueError("objective contract route retention receipt is invalid")
     relations = graph.get("relations")
     if (
         not isinstance(relations, list)
@@ -761,6 +745,7 @@ def materialize_megatron_document(
         "objective_kind": realized.task.value,
         "doc_ids": [1] * len(tokens),
     }
+    route_receipt: Mapping[str, object] | None = None
     platform_ids: list[int] = []
     if packet is not None and packet.metadata.get("platform_ids") is not None:
         platform_ids = _ints(
@@ -778,17 +763,6 @@ def materialize_megatron_document(
                 f"{realized.task.value}: aligned materialized tokens differ from "
                 "CodePacket.token_ids"
             )
-        if require_production_sidecars:
-            missing_graph_sidecars = [
-                field
-                for field in ("call_edges", "type_edges")
-                if getattr(packet, field) is None
-            ]
-            if missing_graph_sidecars:
-                raise ValueError(
-                    "pre-materialized production graph objective is missing "
-                    "required sidecars: " + ", ".join(missing_graph_sidecars)
-                )
         row["doc_ids"] = _packet_vector(packet, "document_ids", length=len(tokens))
         for column, field in _TOKEN_SIDECARS.items():
             if column == "token_source_identity_ids" and getattr(packet, field) is None:
@@ -844,21 +818,15 @@ def materialize_megatron_document(
         row["token_change_mask_post"] = _optional_metadata_vector(
             packet, "token_change_mask_post", length=len(tokens)
         )
-        starts = _packet_vector(packet, "chunk_starts", length=len(packet.chunk_starts))  # type: ignore[arg-type]
-        row["token_chunk_starts"] = starts
-        row["token_chunk_ends"] = _ints(
-            packet.chunk_ends, where="CodePacket.chunk_ends"
+        route_remap = remap_objective_routes(
+            packet,
+            source_token_indices=range(len(tokens)),
+            where=realized.task.value,
+            require_sidecars=require_production_sidecars,
+            mode="identity",
         )
-        row["token_chunk_kinds"] = _ints(
-            packet.chunk_kinds, where="CodePacket.chunk_kinds"
-        )
-        row["token_chunk_dep_levels"] = _ints(
-            packet.chunk_dep_levels, where="CodePacket.chunk_dep_levels"
-        )
-        row["token_call_edges"] = _causal_chunk_pairs(packet, "call_edges", starts)
-        row["token_type_edges"] = _causal_chunk_pairs(packet, "type_edges", starts)
-        for column, field in _DOMAIN_GRAPH_FIELDS.items():
-            row[column] = _causal_domain_triples(packet, field)
+        row.update(route_remap.columns)
+        route_receipt = route_remap.receipt
     elif realized.task in _TRANSFORMED_CODE_TASKS:
         if packet is None:
             raise ValueError(
@@ -1001,6 +969,14 @@ def materialize_megatron_document(
                 length=source_length,
             )
             row[column] = _permute_source_vector(source_values, source_indices)
+        route_remap = remap_objective_routes(
+            packet,
+            source_token_indices=source_indices,
+            where=realized.task.value,
+            require_sidecars=require_production_sidecars,
+        )
+        row.update(route_remap.columns)
+        route_receipt = route_remap.receipt
     elif realized.task in _COMMIT_TASKS:
         commit_source_indices = example.metadata.get(SOURCE_TOKEN_INDICES_METADATA_KEY)
         if (
@@ -1091,20 +1067,16 @@ def materialize_megatron_document(
         row[SYMBOL_IDENTITIES_COLUMN] = []
         row["token_change_mask_pre"] = list(zeros)
         row["token_change_mask_post"] = list(zeros)
+        route_remap = exclude_objective_routes(
+            packet,
+            where=realized.task.value,
+            reason=("independently_tokenized_commit_sections_have_no_exact_source_map"),
+            require_sidecars=require_production_sidecars,
+        )
+        row.update(route_remap.columns)
+        route_receipt = route_remap.receipt
     else:  # pragma: no cover - TaskKind exhaustiveness guard
         raise ValueError(f"unsupported materialized objective {realized.task.value}")
-
-    if not aligned:
-        for column in (
-            "token_chunk_starts",
-            "token_chunk_ends",
-            "token_chunk_kinds",
-            "token_chunk_dep_levels",
-            "token_call_edges",
-            "token_type_edges",
-            *_DOMAIN_GRAPH_FIELDS,
-        ):
-            row[column] = []
 
     graph_edge_count = sum(
         len(row[column]) for column in _GRAPH_RELATION_COLUMNS.values()
@@ -1115,74 +1087,8 @@ def materialize_megatron_document(
         loss_mask=materialized_mask,
         graph_edge_count=graph_edge_count,
         row=row,
+        route_receipt=route_receipt,
     )
-
-
-def _fraction_string(value: Fraction) -> str:
-    return (
-        str(value.numerator)
-        if value.denominator == 1
-        else f"{value.numerator}/{value.denominator}"
-    )
-
-
-def _exact_rates(
-    rates: Mapping[TaskKind | str, float],
-) -> tuple[tuple[str, ...], dict[str, Fraction]]:
-    by_task: dict[str, Fraction] = {}
-    seen: set[str] = set()
-    for key, value in rates.items():
-        task = key.value if isinstance(key, TaskKind) else str(key)
-        if task in seen:
-            raise ValueError(f"duplicate objective rate for {task}")
-        seen.add(task)
-        if task not in _KNOWN_TASKS:
-            raise ValueError(f"unknown objective rate {task!r}")
-        numeric = float(value)
-        if not math.isfinite(numeric) or numeric < 0.0:
-            raise ValueError(
-                f"objective rate for {task} must be finite and non-negative"
-            )
-        fraction = Fraction(str(numeric))
-        if fraction > 0:
-            by_task[task] = fraction
-    raw = [
-        (task.value, by_task[task.value]) for task in TaskKind if task.value in by_task
-    ]
-    if not raw:
-        raise ValueError("objective contract rates have no positive task")
-    missing = sorted(_REQUIRED_PRODUCTION_TASKS - {task for task, _ in raw})
-    if missing:
-        raise ValueError(
-            f"objective contract is missing production objectives: {missing}"
-        )
-    if not math.isclose(
-        math.fsum(float(value) for _task, value in raw),
-        1.0,
-        rel_tol=0.0,
-        abs_tol=1e-9,
-    ):
-        raise ValueError("objective contract rates must sum to 1")
-    total = sum((value for _task, value in raw), Fraction())
-    return tuple(task for task, _value in raw), {
-        task: value / total for task, value in raw
-    }
-
-
-def _hamilton(
-    task_order: Sequence[str], rates: Mapping[str, Fraction], size: int
-) -> dict[str, int]:
-    raw = {task: rates[task] * size for task in task_order}
-    quotas = {task: math.floor(value) for task, value in raw.items()}
-    remaining = size - sum(quotas.values())
-    order = {task: index for index, task in enumerate(task_order)}
-    ranked = sorted(
-        task_order,
-        key=lambda task: (-(raw[task] - quotas[task]), order[task]),
-    )
-    for task in ranked[:remaining]:
-        quotas[task] += 1
-    return quotas
 
 
 def build_pre_materialized_objective_contract(
@@ -1196,175 +1102,21 @@ def build_pre_materialized_objective_contract(
 ) -> dict[str, object]:
     """Build the exact receipt consumed by root Megatron conversion."""
 
-    if not documents:
-        raise ValueError("cannot build objective contract for no documents")
-    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-        raise ValueError("objective contract seed must be a non-negative integer")
-    if quota_window_samples < 1 or len(documents) % quota_window_samples:
-        raise ValueError("document count must contain complete objective quota windows")
-    if not math.isfinite(graph_weight) or graph_weight <= 0.0:
-        raise ValueError("graph auxiliary global weight must be > 0")
-    if graph_weight != graph_config.global_weight:
-        raise ValueError(
-            "graph auxiliary global weight differs from GraphAuxLossConfig: "
-            f"{graph_weight} != {graph_config.global_weight}"
-        )
-    unknown_relations = sorted(
-        set(graph_config.relations) - set(_GRAPH_RELATION_COLUMNS)
+    from cppmega_mlx.training.objective_contract_accumulator import (
+        ObjectiveContractAccumulator,
     )
-    if unknown_relations:
-        raise ValueError(
-            f"unsupported Megatron graph auxiliary relations: {unknown_relations}"
-        )
-    if graph_config.bce_weight <= 0.0 or graph_config.coverage_weight <= 0.0:
-        raise ValueError(
-            "Megatron graph auxiliary contract requires positive BCE and coverage "
-            "weights"
-        )
-    task_order, exact_rates = _exact_rates(rates)
-    window_quotas = _hamilton(task_order, exact_rates, quota_window_samples)
-    windows = len(documents) // quota_window_samples
-    planned = {task: count * windows for task, count in window_quotas.items()}
-    zero_quota = [task for task, count in planned.items() if count == 0]
-    if zero_quota:
-        raise ValueError(f"configured objectives received zero quota: {zero_quota}")
-    actual = Counter(document.objective_kind for document in documents)
-    if actual != Counter(planned):
-        raise ValueError(
-            f"realized objective mix differs from deterministic quotas: "
-            f"realized={dict(actual)}, planned={planned}"
-        )
 
-    realized: dict[str, dict[str, int]] = {}
-    for task in task_order:
-        selected = [doc for doc in documents if doc.objective_kind == task]
-        realized[task] = {
-            "samples": len(selected),
-            "input_tokens": sum(len(doc.token_ids) - 1 for doc in selected),
-            "loss_tokens": sum(sum(doc.loss_mask[:-1]) for doc in selected),
-        }
-
-    def configured_edge_count(document: MaterializedMegatronDocument) -> int:
-        input_length = len(document.token_ids) - 1
-        doc_ids = document.row.get("doc_ids")
-        if not isinstance(doc_ids, list) or len(doc_ids) < input_length:
-            raise ValueError("materialized graph accounting requires aligned doc_ids")
-        pairs: set[tuple[int, int]] = set()
-        starts = document.row.get("token_chunk_starts")
-        ends = document.row.get("token_chunk_ends")
-        for relation in graph_config.relations:
-            column = _GRAPH_RELATION_COLUMNS[relation]
-            edges = document.row.get(column)
-            if not isinstance(edges, list):
-                raise ValueError(
-                    f"materialized {relation} graph column {column} must be a list"
-                )
-            if relation in {"call", "type"}:
-                if not isinstance(starts, list) or not isinstance(ends, list):
-                    raise ValueError(
-                        "chunk graph accounting requires token_chunk_starts/ends"
-                    )
-                if len(starts) != len(ends):
-                    raise ValueError("materialized chunk starts/ends length mismatch")
-                for edge in edges:
-                    source = int(edge["from"])
-                    destination = int(edge["to"])
-                    if not (
-                        0 <= source < len(starts) and 0 <= destination < len(starts)
-                    ):
-                        raise ValueError("materialized chunk edge endpoint is invalid")
-                    for query in range(
-                        int(starts[source]), min(int(ends[source]), input_length)
-                    ):
-                        for key in range(
-                            int(starts[destination]),
-                            min(int(ends[destination]), input_length),
-                        ):
-                            pairs.add((query, key))
-            else:
-                for edge in edges:
-                    pairs.add((int(edge["from"]), int(edge["to"])))
-        return sum(
-            1
-            for query, key in pairs
-            if 0 <= key <= query < input_length
-            and int(doc_ids[query]) > 0
-            and int(doc_ids[query]) == int(doc_ids[key])
-        )
-
-    graph_counts = [configured_edge_count(document) for document in documents]
-    graph_documents = [
-        document
-        for document, edge_count in zip(documents, graph_counts, strict=True)
-        if edge_count > 0
-    ]
-    positive_edges = sum(graph_counts)
-    if not graph_documents or positive_edges < 1:
-        raise ValueError(
-            "configured graph auxiliary objective has no eligible materialized samples"
-        )
-    total_input = sum(row["input_tokens"] for row in realized.values())
-    total_loss = sum(row["loss_tokens"] for row in realized.values())
-    return {
-        "schema": OBJECTIVE_CONTRACT_SCHEMA,
-        "algorithm": "hamilton_eligibility_bipartite_v1",
-        "seed": int(seed),
-        "quota_window_samples": int(quota_window_samples),
-        "task_order": list(task_order),
-        "objective_ids": {task: OBJECTIVE_KIND_IDS[task] for task in task_order},
-        "configured_rates": {
-            task: _fraction_string(exact_rates[task]) for task in task_order
-        },
-        "planned_samples": planned,
-        "realized": realized,
-        "totals": {
-            "samples": len(documents),
-            "input_tokens": total_input,
-            "loss_tokens": total_loss,
-        },
-        "typed_sources": {
-            "ifim_instruction": "ifim_instruction_token_ids",
-            "commit_message": "commit_msg_token_ids",
-            "diff": "diff_token_ids",
-            "pre": "pre_token_ids",
-            "post": "post_token_ids",
-            "missing_fields": "ineligible",
-            "rendered_text_parsing": False,
-        },
-        "graph_auxiliary": {
-            "relations": list(graph_config.relations),
-            "eligible_samples": len(graph_documents),
-            "positive_edges": positive_edges,
-            "global_weight": _fraction_string(
-                Fraction(str(graph_config.global_weight))
-            ),
-            "indexer_weight": _fraction_string(
-                Fraction(str(graph_config.indexer_weight))
-            ),
-            "layer_weight": _fraction_string(Fraction(str(graph_config.layer_weight))),
-            "layer_reduction": "sum",
-            "bce_weight": _fraction_string(Fraction(str(graph_config.bce_weight))),
-            "coverage_weight": _fraction_string(
-                Fraction(str(graph_config.coverage_weight))
-            ),
-            "topk": graph_config.topk,
-            "pos_weight": _fraction_string(Fraction(str(graph_config.pos_weight))),
-            "margin": _fraction_string(Fraction(str(graph_config.margin))),
-            "included_in_total_loss": True,
-            "runtime": "megatron_dsa_indexer_v1",
-            "pair_mask": "causal_same_document_upstream_v1",
-            "chunk_edge_expansion": "cartesian_token_spans_v1",
-        },
-        "materialization": {
-            "format": "shifted_lm_document_v1",
-            "token_column": "input_ids",
-            "loss_mask_column": "loss_mask",
-            "length_column": "valid_token_count",
-            "objective_column": "objective_kind",
-            "document_id_column": "doc_ids",
-            "source_document_id_column": "token_source_doc_ids",
-        },
-    }
+    accumulator = ObjectiveContractAccumulator(
+        rates=rates,
+        seed=seed,
+        quota_window_samples=quota_window_samples,
+        graph_config=graph_config,
+        graph_weight=graph_weight,
+    )
+    accumulator.validate_sample_count(len(documents))
+    for document in documents:
+        accumulator.add(document)
+    return accumulator.finalize()
 
 
 __all__ = [
@@ -1377,5 +1129,6 @@ __all__ = [
     "OBJECTIVE_TOKEN_SIDE_CHANNELS",
     "build_pre_materialized_objective_contract",
     "materialize_megatron_document",
+    "objective_route_mapping_contract",
     "write_objective_materialization_artifact",
 ]

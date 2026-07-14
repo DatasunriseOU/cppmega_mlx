@@ -21,10 +21,17 @@ from cppmega_mlx.data.domain_schema import (
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.symbol_identity import compute_symbol_id
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
-from cppmega_mlx.training.megatron_objectives import materialize_megatron_document
+from cppmega_mlx.training.megatron_objectives import (
+    MaterializedMegatronDocument,
+    materialize_megatron_document,
+)
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
     RealizedObjective,
+)
+from cppmega_mlx.training.objective_data import (
+    OBJECTIVE_ROUTE_COLUMNS,
+    remap_objective_routes,
 )
 from cppmega_mlx.training.objectives import build_fim
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES, TaskKind
@@ -125,6 +132,11 @@ def _dependency_row() -> tuple[dict[str, object], int]:
     row.update(
         {
             "ifim_instruction_token_ids": [1700, 1701],
+            "token_call_edges": [
+                {"from": 3, "to": 0},
+                {"from": 0, "to": 0},
+            ],
+            "token_domain_edges": [{"from": 150, "to": 10, "kind": 2}],
             "token_source_doc_ids": DEPENDENCY_SOURCE_DOC_IDS,
             "token_source_identity_ids": [physical.source_identity_id] * TOKEN_COUNT,
             "source_identity_registry": [physical.as_dict()],
@@ -307,6 +319,91 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _assert_exact_chunk_route_remap(
+    source_row: dict[str, object],
+    document: MaterializedMegatronDocument,
+    source_map: list[int],
+) -> None:
+    source_starts = list(source_row["token_chunk_starts"])
+    source_ends = list(source_row["token_chunk_ends"])
+    source_kinds = list(source_row["token_chunk_kinds"])
+    source_dep_levels = list(source_row["token_chunk_dep_levels"])
+    starts = list(document.row["token_chunk_starts"])
+    ends = list(document.row["token_chunk_ends"])
+    kinds = list(document.row["token_chunk_kinds"])
+    dep_levels = list(document.row["token_chunk_dep_levels"])
+    assert len(starts) == len(ends) == len(kinds) == len(dep_levels)
+
+    source_chunk_by_output: list[int] = []
+    covered_sources: list[int] = []
+    for start, end, kind, dep_level in zip(
+        starts, ends, kinds, dep_levels, strict=True
+    ):
+        fragment = source_map[start:end]
+        assert fragment
+        assert fragment == list(range(fragment[0], fragment[-1] + 1))
+        source_chunk = next(
+            index
+            for index, (source_start, source_end) in enumerate(
+                zip(source_starts, source_ends, strict=True)
+            )
+            if source_start <= fragment[0] < fragment[-1] + 1 <= source_end
+        )
+        assert kind == source_kinds[source_chunk]
+        assert dep_level == source_dep_levels[source_chunk]
+        source_chunk_by_output.append(source_chunk)
+        covered_sources.extend(fragment)
+
+    expected_sources = sorted(
+        source_index
+        for source_index in source_map
+        if source_index >= 0
+        and any(
+            start <= source_index < end
+            for start, end in zip(source_starts, source_ends, strict=True)
+        )
+    )
+    assert sorted(covered_sources) == expected_sources
+
+    source_pairs = {
+        (int(edge["from"]), int(edge["to"])) for edge in source_row["token_call_edges"]
+    }
+    expected_pairs = {
+        (source_output, destination_output)
+        for source_output, source_chunk in enumerate(source_chunk_by_output)
+        for destination_output, destination_chunk in enumerate(source_chunk_by_output)
+        if (source_chunk, destination_chunk) in source_pairs
+        and starts[destination_output] <= starts[source_output]
+    }
+    actual_pairs = {
+        (int(edge["from"]), int(edge["to"]))
+        for edge in document.row["token_call_edges"]
+    }
+    assert actual_pairs == expected_pairs
+
+
+def _expected_token_edges(
+    source_edges: list[dict[str, int]],
+    source_map: list[int],
+) -> list[dict[str, int]]:
+    inverse = {
+        source_index: output_index
+        for output_index, source_index in enumerate(source_map)
+        if source_index >= 0
+    }
+    expected = {
+        (inverse[int(edge["from"])], inverse[int(edge["to"])], int(edge["kind"]))
+        for edge in source_edges
+        if int(edge["from"]) in inverse
+        and int(edge["to"]) in inverse
+        and inverse[int(edge["to"])] <= inverse[int(edge["from"])]
+    }
+    return [
+        {"from": source, "to": destination, "kind": kind}
+        for source, destination, kind in sorted(expected)
+    ]
+
+
 def test_materialized_graph_arrow_types_match_case5_source_contract() -> None:
     schema = materializer.materialized_schema()
     pair = pa.struct([pa.field("from", pa.uint16()), pa.field("to", pa.uint16())])
@@ -365,6 +462,74 @@ def test_dependency_source_preserves_attention_and_constituent_provenance(
     assert document.row["token_change_mask_post"] == [0] * TOKEN_COUNT
 
 
+def test_identity_objective_retains_exact_chunk_and_graph_routes(
+    tmp_path: Path,
+) -> None:
+    row, _physical_id = _dependency_row()
+    source_path = tmp_path / "identity-routes.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=17))
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.CAUSAL_LM: 1.0}, seed=17
+    ).materialize(source, step_index=0)
+
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    source_map = list(realized.example.metadata["source_token_indices"])
+    assert source_map == list(range(TOKEN_COUNT))
+    _assert_exact_chunk_route_remap(row, document, source_map)
+    assert document.row["token_domain_edges"] == row["token_domain_edges"]
+    assert document.graph_edge_count == 3
+
+
+def test_route_remap_fails_closed_on_ambiguous_source_token_map(tmp_path: Path) -> None:
+    row, _physical_id = _dependency_row()
+    source_path = tmp_path / "ambiguous-route-map.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=17))
+    assert source.code_packet is not None
+    ambiguous = list(range(TOKEN_COUNT))
+    ambiguous[1] = 0
+
+    with pytest.raises(ValueError, match="source token 0 maps to multiple output"):
+        remap_objective_routes(
+            source.code_packet,
+            source_token_indices=ambiguous,
+            where="ambiguous-test",
+            require_sidecars=True,
+        )
+
+
+def test_route_remap_counts_individually_unmapped_endpoints(tmp_path: Path) -> None:
+    row, _physical_id = _dependency_row()
+    source_path = tmp_path / "partial-route-map.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=17))
+    assert source.code_packet is not None
+
+    remapped = remap_objective_routes(
+        source.code_packet,
+        source_token_indices=range(TOKEN_COUNT // 2),
+        where="partial-map-test",
+        require_sidecars=True,
+    )
+
+    relations = remapped.receipt["relations"]
+    assert relations["call"] == {
+        "source_edges": 2,
+        "retained_edges": 1,
+        "dropped_unmapped_edges": 1,
+        "dropped_noncausal_routes": 0,
+        "dropped_duplicate_routes": 0,
+        "excluded_edges": 0,
+    }
+    assert relations["domain"]["dropped_unmapped_edges"] == 1
+
+
 def test_dependency_source_rejects_nonempty_misaligned_change_mask(
     tmp_path: Path,
 ) -> None:
@@ -413,6 +578,14 @@ def test_transformed_dependency_objective_preserves_exact_document_identity(
     assert set(document.row["token_source_doc_ids"]) == {1, 2, 3, 4}
     assert set(document.row["token_source_identity_ids"]) == {physical_id}
     assert document.row["source_identity_registry"] == row["source_identity_registry"]
+    source_map = list(realized.example.metadata["source_token_indices"])
+    assert source_map != list(range(TOKEN_COUNT))
+    _assert_exact_chunk_route_remap(row, document, source_map)
+    assert document.row["token_domain_edges"] == _expected_token_edges(
+        row["token_domain_edges"],
+        source_map,
+    )
+    assert document.graph_edge_count > 0
 
 
 @pytest.mark.parametrize(("spm_rate", "mode"), ((0.0, "psm"), (1.0, "spm")))
@@ -612,6 +785,46 @@ def test_domain_wrapped_recovery_preserves_converter_stack(
     )
 
 
+def test_masked_span_recovery_remaps_routes_to_answer_tokens(tmp_path: Path) -> None:
+    row, _physical_id = _dependency_row()
+    row["token_call_edges"] = [{"from": 0, "to": 0}]
+    row["token_domain_edges"] = [{"from": 5, "to": 2, "kind": 2}]
+    source_path = tmp_path / "masked-span-routes.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=37))
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.SYMBOL_RECOVERY: 1.0}, seed=37
+    ).materialize(source, step_index=0)
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    source_map = list(realized.example.metadata["source_token_indices"])
+    assert realized.example.metadata["span"] == (5, 7)
+    inverse = {
+        source_index: output_index
+        for output_index, source_index in enumerate(source_map)
+        if source_index >= 0
+    }
+    assert inverse[5] > inverse[2]
+    assert document.row["token_domain_edges"] == [
+        {"from": inverse[5], "to": inverse[2], "kind": 2}
+    ]
+    _assert_exact_chunk_route_remap(row, document, source_map)
+    source_chunk_zero_fragments = [
+        (start, end)
+        for start, end in zip(
+            document.row["token_chunk_starts"],
+            document.row["token_chunk_ends"],
+            strict=True,
+        )
+        if 0 <= source_map[start] < 40
+    ]
+    assert len(source_chunk_zero_fragments) >= 2
+
+
 @pytest.mark.parametrize(
     ("task", "cpp_pairs"),
     ((TaskKind.COMMIT_DIFF, 1), (TaskKind.PRE_TO_POST, 2)),
@@ -646,6 +859,7 @@ def test_commit_objectives_emit_explicit_cpp_domain_sidecars(
     assert all(value > 0 for value in document.row["token_source_doc_ids"])
     assert all(value > 0 for value in document.row["token_source_identity_ids"])
     assert set(realized.example.metadata["source_token_indices"]) == {-1}
+    assert all(document.row[column] == [] for column in OBJECTIVE_ROUTE_COLUMNS)
     _assert_domain_stack_values(
         document.row["input_ids"],
         document.row["token_domain_ids"],
@@ -800,10 +1014,41 @@ def test_full_quota_materialization_accepts_mixed_dependency_and_commit_rows(
                 3,
                 4,
             }
+            assert table["token_chunk_starts"][row_index].as_py()
+            assert table["token_call_edges"][row_index].as_py()
 
     artifact_path = output_dir / "objective_materialization.json"
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     contract_path = output_dir / artifact["objective_contract"]["path"]
+    objective_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    route_mapping = objective_contract["graph_auxiliary"]["route_mapping"]
+    route_retention = objective_contract["graph_auxiliary"]["route_retention"]
+    assert route_mapping["schema"] == "cppmega_exact_source_route_remap_v1"
+    assert route_mapping["explicit_exclusions"] == {
+        TaskKind.COMMIT_DIFF.value: (
+            "independently_tokenized_commit_sections_have_no_exact_source_map"
+        ),
+        TaskKind.PRE_TO_POST.value: (
+            "independently_tokenized_commit_sections_have_no_exact_source_map"
+        ),
+    }
+    for task in (TaskKind.FIM, TaskKind.AST_FIM, TaskKind.IFIM):
+        retained = route_retention["by_objective"][task.value]
+        assert retained["modes"] == {"source_token_remap": retained["samples"]}
+        assert retained["retained_chunks"] > 0
+        assert retained["relations"]["call"]["retained_edges"] > 0
+    for task in (TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST):
+        excluded = route_retention["by_objective"][task.value]
+        assert excluded["modes"] == {"excluded": excluded["samples"]}
+        assert excluded["retained_chunks"] == 0
+        assert excluded["excluded_chunks"] > 0
+    assert table.schema.metadata[b"cppmega.objective_route_mapping"] == (
+        b"cppmega_exact_source_route_remap_v1"
+    )
+    converter_columns = {
+        sidecar["column"] for sidecar in artifact["converter"]["graph_sidecars"]
+    }
+    assert converter_columns == set(OBJECTIVE_ROUTE_COLUMNS)
     assert artifact["objective_contract"]["file_sha256"] == _sha256(contract_path)
     for shard in artifact["parquet_shards"]:
         assert shard["sha256"] == _sha256(output_dir / shard["path"])

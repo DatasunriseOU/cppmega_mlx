@@ -52,13 +52,16 @@ from cppmega_mlx.training.objective_mixer import (
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     OBJECTIVE_CONTRACT_SCHEMA,
+    OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_KIND_IDS,
     OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     build_pre_materialized_objective_contract,
     materialize_megatron_document,
+    objective_route_mapping_contract,
     write_objective_materialization_artifact,
 )
 from cppmega_mlx.training.objective_data import (
+    OBJECTIVE_ROUTE_RETENTION_SCHEMA,
     OBJECTIVE_SECTION_COLUMNS,
     OBJECTIVE_SOURCE_COLUMNS,
     graph_targets_and_pair_mask,
@@ -121,6 +124,17 @@ def _with_required_token_sidecars(packet: CodePacket) -> CodePacket:
         entity_ids=zeros,
         scope_ids=zeros,
         confidence_ids=_arr([1] * token_count),
+        chunk_starts=_arr([]),
+        chunk_ends=_arr([]),
+        chunk_kinds=_arr([]),
+        chunk_dep_levels=_arr([]),
+        call_edges=EdgeIndex.from_pairs([], relation="call", num_nodes=0),
+        type_edges=EdgeIndex.from_pairs([], relation="type", num_nodes=0),
+        domain_edges=DomainEdgeIndex.empty(),
+        build_edges=DomainEdgeIndex.empty(),
+        shell_edges=DomainEdgeIndex.empty(),
+        diagnostic_edges=DomainEdgeIndex.empty(),
+        cross_domain_edges=DomainEdgeIndex.empty(),
     )
     return CodePacket(**values)
 
@@ -801,6 +815,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
     loss_mask = mx.ones((1, 4), dtype=mx.float32)
     graph_targets = mx.zeros((1, 4, 4), dtype=mx.float32)
     graph_targets = graph_targets.at[0, 2, 0].add(1.0)
+    edge_kind_bias = graph_targets * mx.array(0.25, dtype=mx.float32)
     pair_mask = mx.ones((1, 4, 4), dtype=mx.float32)
     config = GraphAuxLossConfig(
         relations=("call",),
@@ -830,6 +845,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
         side_channels=structure_sidecars,
         document_ids=document_ids,
         block_bias=graph_targets,
+        edge_kind_bias=edge_kind_bias,
         graph_targets=graph_targets,
         graph_pair_mask=pair_mask,
         graph_config=config,
@@ -844,7 +860,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
             input_ids,
             document_ids=document_ids,
             block_bias=graph_targets,
-            edge_kind_bias=mx.zeros_like(graph_targets),
+            edge_kind_bias=edge_kind_bias,
             **structure_sidecars,
         ),
         graph_targets,
@@ -875,6 +891,7 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
             side_channels=structure_sidecars,
             document_ids=document_ids,
             block_bias=graph_targets,
+            edge_kind_bias=edge_kind_bias,
             graph_targets=graph_targets,
             graph_pair_mask=pair_mask,
             graph_config=config,
@@ -1134,7 +1151,17 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
     assert contract["graph_auxiliary"]["chunk_edge_expansion"] == (
         "cartesian_token_spans_v1"
     )
-    assert contract["graph_auxiliary"]["positive_edges"] == 8
+    assert contract["graph_auxiliary"]["positive_edges"] == 32
+    assert contract["graph_auxiliary"]["route_mapping"] == (
+        objective_route_mapping_contract()
+    )
+    retention = contract["graph_auxiliary"]["route_retention"]["by_objective"]
+    assert retention[TaskKind.CAUSAL_LM.value]["modes"] == {"identity": 1}
+    for task in (TaskKind.FIM, TaskKind.AST_FIM, TaskKind.IFIM):
+        assert retention[task.value]["modes"] == {"source_token_remap": 1}
+        assert retention[task.value]["relations"]["call"]["retained_edges"] > 0
+    for task in (TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST):
+        assert retention[task.value]["modes"] == {"excluded": 1}
     assert contract["materialization"] == {
         "format": "shifted_lm_document_v1",
         "token_column": "input_ids",
@@ -1321,6 +1348,11 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
             "relations": ["call", "type"],
             "pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
+            "route_mapping": objective_route_mapping_contract(),
+            "route_retention": {
+                "schema": OBJECTIVE_ROUTE_RETENTION_SCHEMA,
+                "by_objective": {"causal_lm": {"samples": 2}},
+            },
         },
     }
     first = tmp_path / "objectives_00000.parquet"
@@ -1374,6 +1406,10 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
         "causal_same_document_upstream_v1"
     )
     assert artifact["converter"]["chunk_edge_expansion"] == ("cartesian_token_spans_v1")
+    assert artifact["converter"]["graph_sidecars"] == [
+        {"column": column, "kind": kind, "dtype": dtype}
+        for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
+    ]
     artifact_set_payload = dict(artifact)
     artifact_set_sha256 = artifact_set_payload.pop("artifact_set_sha256")
     assert (

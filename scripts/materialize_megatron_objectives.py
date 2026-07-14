@@ -64,6 +64,7 @@ from cppmega_mlx.training.objective_contract_accumulator import (
     ObjectiveContractAccumulator,
 )
 from cppmega_mlx.training.objective_data import (
+    OBJECTIVE_ROUTE_MAPPING_SCHEMA,
     OBJECTIVE_SOURCE_COLUMNS,
     objective_source_from_tokenized_row,
     require_megatron_objective_source_columns,
@@ -304,6 +305,9 @@ def materialized_schema() -> pa.Schema:
             ),
             b"cppmega.case5_schema": b"case5_domain_routes_v1",
             b"cppmega.macro_routes_version": b"full_macro_concept_routes_v1",
+            b"cppmega.objective_route_mapping": OBJECTIVE_ROUTE_MAPPING_SCHEMA.encode(
+                "ascii"
+            ),
         }
     )
 

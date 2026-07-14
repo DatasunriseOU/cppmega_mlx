@@ -12,6 +12,13 @@ from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_KIND_IDS,
+    objective_route_mapping_contract,
+)
+from cppmega_mlx.training.objective_data import (
+    OBJECTIVE_GRAPH_RELATION_COLUMNS,
+    OBJECTIVE_ROUTE_COUNT_FIELDS,
+    OBJECTIVE_ROUTE_RECEIPT_SCHEMA,
+    OBJECTIVE_ROUTE_RETENTION_SCHEMA,
 )
 from cppmega_mlx.training.objective_mixer import GraphAuxLossConfig
 from cppmega_mlx.training.task_mixer import TaskKind
@@ -260,11 +267,43 @@ class ObjectiveContractAccumulator:
         self._samples = 0
         self._eligible_graph_samples = 0
         self._positive_edges = 0
+        self._route_receipt_samples = 0
+        self._missing_route_receipts = 0
+        self._route_retention = {
+            task: {
+                "samples": 0,
+                "modes": Counter(),
+                "source_chunks": 0,
+                "retained_chunks": 0,
+                "dropped_chunks": 0,
+                "excluded_chunks": 0,
+                "relations": {
+                    relation: Counter() for relation in OBJECTIVE_GRAPH_RELATION_COLUMNS
+                },
+            }
+            for task in task_order
+        }
         self._finalized = False
 
     @property
     def samples(self) -> int:
         return self._samples
+
+    def validate_sample_count(self, samples: int) -> dict[str, int]:
+        """Validate complete quota windows before reading document payloads."""
+
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+            raise ValueError("cannot build objective contract for no documents")
+        if samples % self._quota_window_samples:
+            raise ValueError(
+                "document count must contain complete objective quota windows"
+            )
+        windows = samples // self._quota_window_samples
+        planned = {task: count * windows for task, count in self._window_quotas.items()}
+        zero_quota = [task for task, count in planned.items() if count == 0]
+        if zero_quota:
+            raise ValueError(f"configured objectives received zero quota: {zero_quota}")
+        return planned
 
     def add(self, document: MaterializedMegatronDocument) -> None:
         if self._finalized:
@@ -280,6 +319,11 @@ class ObjectiveContractAccumulator:
         self._actual[task] += 1
         self._window_actual[task] += 1
         self._samples += 1
+
+        if document.route_receipt is None:
+            self._missing_route_receipts += 1
+        else:
+            self._add_route_receipt(task, document.route_receipt)
 
         graph_edges = count_configured_graph_positive_edges(
             document,
@@ -298,21 +342,115 @@ class ObjectiveContractAccumulator:
                 )
             self._window_actual.clear()
 
+    def _add_route_receipt(
+        self,
+        task: str,
+        receipt: Mapping[str, object],
+    ) -> None:
+        mode = receipt.get("mode")
+        expected_mode = (
+            "identity"
+            if task == TaskKind.CAUSAL_LM.value
+            else "excluded"
+            if task in {TaskKind.COMMIT_DIFF.value, TaskKind.PRE_TO_POST.value}
+            else "source_token_remap"
+        )
+        if receipt.get("schema") != OBJECTIVE_ROUTE_RECEIPT_SCHEMA:
+            raise ValueError(f"{task}: objective route receipt schema is invalid")
+        if mode != expected_mode:
+            raise ValueError(
+                f"{task}: objective route receipt mode {mode!r} != {expected_mode!r}"
+            )
+        expected_keys = {
+            "schema",
+            "mode",
+            "source_chunks",
+            "retained_chunks",
+            "dropped_chunks",
+            "excluded_chunks",
+            "relations",
+        }
+        if mode == "excluded":
+            expected_keys.add("reason")
+            expected_reason = objective_route_mapping_contract()["explicit_exclusions"]
+            assert isinstance(expected_reason, Mapping)
+            if receipt.get("reason") != expected_reason[task]:
+                raise ValueError(f"{task}: objective route exclusion reason is invalid")
+        if set(receipt) != expected_keys:
+            raise ValueError(
+                f"{task}: objective route receipt keys must be {sorted(expected_keys)}"
+            )
+
+        aggregate = self._route_retention[task]
+        aggregate["samples"] += 1
+        aggregate["modes"][str(mode)] += 1
+        for field in (
+            "source_chunks",
+            "retained_chunks",
+            "dropped_chunks",
+            "excluded_chunks",
+        ):
+            value = receipt.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{task}: route receipt {field} must be non-negative")
+            aggregate[field] += value
+
+        relations = receipt.get("relations")
+        if not isinstance(relations, Mapping) or set(relations) != set(
+            OBJECTIVE_GRAPH_RELATION_COLUMNS
+        ):
+            raise ValueError(f"{task}: objective route receipt relations are invalid")
+        for relation in OBJECTIVE_GRAPH_RELATION_COLUMNS:
+            counts = relations[relation]
+            if not isinstance(counts, Mapping) or set(counts) != set(
+                OBJECTIVE_ROUTE_COUNT_FIELDS
+            ):
+                raise ValueError(
+                    f"{task}: objective route receipt {relation} counts are invalid"
+                )
+            for field in OBJECTIVE_ROUTE_COUNT_FIELDS:
+                value = counts[field]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"{task}: route receipt {relation}.{field} must be non-negative"
+                    )
+                aggregate["relations"][relation][field] += value
+        self._route_receipt_samples += 1
+
+    def _route_retention_contract(self) -> dict[str, object] | None:
+        if self._route_receipt_samples and self._missing_route_receipts:
+            raise ValueError("objective route receipts are partially missing")
+        if not self._route_receipt_samples:
+            return None
+        if self._route_receipt_samples != self._samples:
+            raise ValueError("objective route receipt count differs from samples")
+        by_objective: dict[str, object] = {}
+        for task in self._task_order:
+            aggregate = self._route_retention[task]
+            by_objective[task] = {
+                "samples": aggregate["samples"],
+                "modes": dict(sorted(aggregate["modes"].items())),
+                "source_chunks": aggregate["source_chunks"],
+                "retained_chunks": aggregate["retained_chunks"],
+                "dropped_chunks": aggregate["dropped_chunks"],
+                "excluded_chunks": aggregate["excluded_chunks"],
+                "relations": {
+                    relation: {
+                        field: int(aggregate["relations"][relation][field])
+                        for field in OBJECTIVE_ROUTE_COUNT_FIELDS
+                    }
+                    for relation in OBJECTIVE_GRAPH_RELATION_COLUMNS
+                },
+            }
+        return {
+            "schema": OBJECTIVE_ROUTE_RETENTION_SCHEMA,
+            "by_objective": by_objective,
+        }
+
     def finalize(self) -> dict[str, object]:
         if self._finalized:
             raise RuntimeError("objective contract was already finalized")
-        if not self._samples:
-            raise ValueError("cannot build objective contract for no documents")
-        if self._samples % self._quota_window_samples:
-            raise ValueError(
-                "document count must contain complete objective quota windows"
-            )
-
-        windows = self._samples // self._quota_window_samples
-        planned = {task: count * windows for task, count in self._window_quotas.items()}
-        zero_quota = [task for task, count in planned.items() if count == 0]
-        if zero_quota:
-            raise ValueError(f"configured objectives received zero quota: {zero_quota}")
+        planned = self.validate_sample_count(self._samples)
         if self._actual != Counter(planned):
             raise ValueError(
                 "realized objective mix differs from deterministic quotas: "
@@ -327,6 +465,34 @@ class ObjectiveContractAccumulator:
         total_input = sum(row["input_tokens"] for row in self._realized.values())
         total_loss = sum(row["loss_tokens"] for row in self._realized.values())
         graph_config = self._graph_config
+        route_retention = self._route_retention_contract()
+        graph_auxiliary: dict[str, object] = {
+            "relations": list(graph_config.relations),
+            "eligible_samples": self._eligible_graph_samples,
+            "positive_edges": self._positive_edges,
+            "global_weight": _fraction_string(
+                Fraction(str(graph_config.global_weight))
+            ),
+            "indexer_weight": _fraction_string(
+                Fraction(str(graph_config.indexer_weight))
+            ),
+            "layer_weight": _fraction_string(Fraction(str(graph_config.layer_weight))),
+            "layer_reduction": "sum",
+            "bce_weight": _fraction_string(Fraction(str(graph_config.bce_weight))),
+            "coverage_weight": _fraction_string(
+                Fraction(str(graph_config.coverage_weight))
+            ),
+            "topk": graph_config.topk,
+            "pos_weight": _fraction_string(Fraction(str(graph_config.pos_weight))),
+            "margin": _fraction_string(Fraction(str(graph_config.margin))),
+            "included_in_total_loss": True,
+            "runtime": "megatron_dsa_indexer_v1",
+            "pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+            "route_mapping": objective_route_mapping_contract(),
+        }
+        if route_retention is not None:
+            graph_auxiliary["route_retention"] = route_retention
         contract: dict[str, object] = {
             "schema": OBJECTIVE_CONTRACT_SCHEMA,
             "algorithm": "hamilton_eligibility_bipartite_v1",
@@ -356,32 +522,7 @@ class ObjectiveContractAccumulator:
                 "missing_fields": "ineligible",
                 "rendered_text_parsing": False,
             },
-            "graph_auxiliary": {
-                "relations": list(graph_config.relations),
-                "eligible_samples": self._eligible_graph_samples,
-                "positive_edges": self._positive_edges,
-                "global_weight": _fraction_string(
-                    Fraction(str(graph_config.global_weight))
-                ),
-                "indexer_weight": _fraction_string(
-                    Fraction(str(graph_config.indexer_weight))
-                ),
-                "layer_weight": _fraction_string(
-                    Fraction(str(graph_config.layer_weight))
-                ),
-                "layer_reduction": "sum",
-                "bce_weight": _fraction_string(Fraction(str(graph_config.bce_weight))),
-                "coverage_weight": _fraction_string(
-                    Fraction(str(graph_config.coverage_weight))
-                ),
-                "topk": graph_config.topk,
-                "pos_weight": _fraction_string(Fraction(str(graph_config.pos_weight))),
-                "margin": _fraction_string(Fraction(str(graph_config.margin))),
-                "included_in_total_loss": True,
-                "runtime": "megatron_dsa_indexer_v1",
-                "pair_mask": "causal_same_document_upstream_v1",
-                "chunk_edge_expansion": "cartesian_token_spans_v1",
-            },
+            "graph_auxiliary": graph_auxiliary,
             "materialization": {
                 "format": "shifted_lm_document_v1",
                 "token_column": "input_ids",
