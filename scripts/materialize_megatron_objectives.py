@@ -121,6 +121,8 @@ SOURCE_IDENTITY_TYPE = pa.struct(
 _SourceStat = tuple[int, int, int, int, int]
 _LEGACY_SAMPLING_MODE = "deterministic_epoch_shuffle_v1"
 _BOUNDED_SAMPLING_MODE = "deterministic_shard_row_group_record_batch_shuffle_v2"
+_BOUNDED_SAMPLING_PRODUCER = "pyarrow.parquet.ParquetFile.iter_batches"
+_BOUNDED_SAMPLING_PRODUCER_VERSION = 1
 _DEFAULT_SOURCE_BATCH_ROWS = 64
 _DEFAULT_WRITE_BATCH_ROWS = 8
 _DEFAULT_MAX_BUFFER_BYTES = 256 * 1024 * 1024
@@ -173,12 +175,18 @@ def _build_source_snapshot(
     if not paths or len(paths) != len(set(paths)):
         raise ValueError("objective source shards must be non-empty and unique")
     records: list[dict[str, object]] = []
+    row_group_rows: list[list[int]] = []
     signatures: dict[Path, _SourceStat] = {}
     row_count = 0
     for path in paths:
         before = _source_stat(path)
         digest = _file_sha256(path)
-        rows = int(pq.ParquetFile(path).metadata.num_rows)
+        parquet = pq.ParquetFile(path)
+        rows = int(parquet.metadata.num_rows)
+        shard_row_groups = [
+            int(parquet.metadata.row_group(index).num_rows)
+            for index in range(parquet.metadata.num_row_groups)
+        ]
         after = _source_stat(path)
         if before != after:
             raise RuntimeError(f"objective source changed while hashing: {path}")
@@ -193,6 +201,7 @@ def _build_source_snapshot(
                 "rows": rows,
             }
         )
+        row_group_rows.append(shard_row_groups)
         row_count += rows
     full_passes, tail_rows = divmod(requested_samples, row_count)
     sampling: dict[str, object] = {
@@ -210,6 +219,11 @@ def _build_source_snapshot(
         sampling.update(
             {
                 "record_batch_rows": int(source_batch_rows),
+                "producer": {
+                    "name": _BOUNDED_SAMPLING_PRODUCER,
+                    "version": _BOUNDED_SAMPLING_PRODUCER_VERSION,
+                    "row_group_rows": row_group_rows,
+                },
                 "ordering": {
                     "permutation": "sha256_sort_key_v1",
                     "epochs": "ascending",

@@ -330,6 +330,11 @@ def test_bounded_sampling_snapshot_records_order_and_replay_cursor(tmp_path) -> 
     assert isinstance(sampling, dict)
     assert sampling["mode"] == materializer._BOUNDED_SAMPLING_MODE
     assert sampling["record_batch_rows"] == 2
+    assert sampling["producer"] == {
+        "name": "pyarrow.parquet.ParquetFile.iter_batches",
+        "version": 1,
+        "row_group_rows": [[1, 1]],
+    }
     assert sampling["ordering"] == {
         "permutation": "sha256_sort_key_v1",
         "epochs": "ascending",
