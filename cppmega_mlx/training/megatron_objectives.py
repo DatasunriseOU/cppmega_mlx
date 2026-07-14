@@ -338,6 +338,102 @@ def _permute_provenance_vector(
     return [int(value) for value in result if value is not None]
 
 
+def _contiguous_document_id_order(values: Sequence[int], *, where: str) -> list[int]:
+    if not values:
+        raise ValueError(f"{where}: doc_ids must be non-empty")
+    order: list[int] = []
+    closed: set[int] = set()
+    previous: int | None = None
+    for index, raw_value in enumerate(values):
+        value = int(raw_value)
+        if value <= 0:
+            raise ValueError(f"{where}: doc_ids[{index}] must be positive, got {value}")
+        if value != previous:
+            if value in closed:
+                raise ValueError(
+                    f"{where}: document ID {value} is reused non-contiguously"
+                )
+            if previous is not None:
+                closed.add(previous)
+            order.append(value)
+            previous = value
+    return order
+
+
+def _normalize_attention_document_ids(
+    values: Sequence[int], *, where: str
+) -> list[int]:
+    """Renumber contiguous attention segments to row-local IDs ``1..N``."""
+
+    order = _contiguous_document_id_order(values, where=where)
+    remap = {document_id: index + 1 for index, document_id in enumerate(order)}
+    normalized = [remap[int(value)] for value in values]
+    return normalized
+
+
+def _source_platform_bags_by_document(
+    packet: CodePacket,
+    document_ids: Sequence[int],
+    *,
+    required: bool,
+) -> dict[int, list[int]]:
+    order = _contiguous_document_id_order(
+        document_ids,
+        where="CodePacket.document_ids",
+    )
+    raw_bags = packet.metadata.get("source_platform_ids")
+    if raw_bags is None:
+        raw_union = packet.metadata.get("platform_ids")
+        union = [] if raw_union is None else _ints(raw_union, where="platform_ids")
+        if not union:
+            if required:
+                raise ValueError(
+                    "pre-materialized production objective requires source_platform_ids"
+                )
+            return {}
+        if len(order) != 1 and required:
+            raise ValueError(
+                "pre-materialized production multi-document objective requires "
+                "exact source_platform_ids bags"
+            )
+        raw_bags = [union for _ in order]
+    if not isinstance(raw_bags, (list, tuple)) or len(raw_bags) != len(order):
+        raise ValueError(
+            "source_platform_ids count must equal the number of source documents: "
+            f"bags={0 if not isinstance(raw_bags, (list, tuple)) else len(raw_bags)}, "
+            f"documents={len(order)}"
+        )
+    result: dict[int, list[int]] = {}
+    for document_id, raw_bag in zip(order, raw_bags, strict=True):
+        if not isinstance(raw_bag, (list, tuple)):
+            raise ValueError("every source_platform_ids bag must be a list")
+        bag = _ints(raw_bag, where=f"source_platform_ids[{document_id}]")
+        if required and not bag:
+            raise ValueError("production source_platform_ids bags must be non-empty")
+        if any(not 0 < value <= np.iinfo(np.uint16).max for value in bag):
+            raise ValueError("source_platform_ids values must be positive uint16")
+        result[document_id] = bag
+    return result
+
+
+def _platform_bags_for_output_documents(
+    document_ids: Sequence[int],
+    source_bags: Mapping[int, Sequence[int]],
+    *,
+    required: bool,
+    where: str,
+) -> list[list[int]]:
+    order = _contiguous_document_id_order(document_ids, where=where)
+    if not source_bags:
+        if required:
+            raise ValueError(f"{where}: source platform bags are missing")
+        return []
+    missing = [document_id for document_id in order if document_id not in source_bags]
+    if missing:
+        raise ValueError(f"{where}: source platform bags missing documents {missing}")
+    return [[int(value) for value in source_bags[document_id]] for document_id in order]
+
+
 def _domain_stack_defaults(
     token_ids: Sequence[int],
     *,
@@ -744,26 +840,40 @@ def materialize_megatron_document(
         "valid_token_count": len(tokens),
         "objective_kind": realized.task.value,
         "doc_ids": [1] * len(tokens),
+        "source_platform_ids": [],
     }
     route_receipt: Mapping[str, object] | None = None
-    platform_ids: list[int] = []
-    if packet is not None and packet.metadata.get("platform_ids") is not None:
-        platform_ids = _ints(
-            packet.metadata["platform_ids"], where="CodePacket.metadata['platform_ids']"
+    packet_document_ids: list[int] | None = None
+    source_platform_bags: dict[int, list[int]] = {}
+    if packet is not None:
+        packet_length = int(packet.token_ids.shape[0])
+        packet_document_ids = (
+            [1] * packet_length
+            if packet.document_ids is None
+            else _packet_vector(packet, "document_ids", length=packet_length)
         )
-    if require_production_sidecars and not platform_ids:
-        raise ValueError("pre-materialized production objective requires platform_ids")
-    row["source_platform_ids"] = [platform_ids] if platform_ids else []
+        source_platform_bags = _source_platform_bags_by_document(
+            packet,
+            packet_document_ids,
+            required=require_production_sidecars,
+        )
 
     if aligned:
         assert packet is not None
+        assert packet_document_ids is not None
         packet_tokens = _ints(packet.token_ids, where="CodePacket.token_ids")
         if packet_tokens != tokens:
             raise ValueError(
                 f"{realized.task.value}: aligned materialized tokens differ from "
                 "CodePacket.token_ids"
             )
-        row["doc_ids"] = _packet_vector(packet, "document_ids", length=len(tokens))
+        row["doc_ids"] = list(packet_document_ids)
+        row["source_platform_ids"] = _platform_bags_for_output_documents(
+            row["doc_ids"],  # type: ignore[arg-type]
+            source_platform_bags,
+            required=require_production_sidecars,
+            where=f"{realized.task.value}.doc_ids",
+        )
         for column, field in _TOKEN_SIDECARS.items():
             if column == "token_source_identity_ids" and getattr(packet, field) is None:
                 if require_production_sidecars:
@@ -834,20 +944,22 @@ def materialize_megatron_document(
                 "ObjectiveSource.code_packet"
             )
         source_length = int(packet.token_ids.shape[0])
+        assert packet_document_ids is not None
         source_indices = _validated_source_token_indices(
             metadata=example.metadata,
             packet=packet,
             transformed_tokens=tokens,
             objective_kind=realized.task.value,
         )
-        source_document_ids = (
-            [1] * source_length
-            if packet.document_ids is None
-            else _packet_vector(packet, "document_ids", length=source_length)
-        )
         row["doc_ids"] = _permute_provenance_vector(
-            source_document_ids,
+            packet_document_ids,
             source_indices,
+            where=f"{realized.task.value}.doc_ids",
+        )
+        row["source_platform_ids"] = _platform_bags_for_output_documents(
+            row["doc_ids"],  # type: ignore[arg-type]
+            source_platform_bags,
+            required=require_production_sidecars,
             where=f"{realized.task.value}.doc_ids",
         )
 
@@ -1055,6 +1167,45 @@ def materialize_megatron_document(
             )
         row["token_source_doc_ids"] = [source_document_id] * len(tokens)
         row["token_source_identity_ids"] = [source_identity_id] * len(tokens)
+        if (
+            packet is not None
+            and packet_document_ids is not None
+            and packet.source_doc_ids is not None
+        ):
+            packet_source_doc_ids = _packet_vector(
+                packet,
+                "source_doc_ids",
+                length=len(packet_document_ids),
+            )
+            attention_document_ids = {
+                packet_document_ids[index]
+                for index, value in enumerate(packet_source_doc_ids)
+                if value == source_document_id
+            }
+            if not attention_document_ids:
+                raise ValueError(
+                    f"{realized.task.value}: commit source document has no "
+                    "attention document mapping"
+                )
+            mapped_bags = [
+                source_platform_bags[document_id]
+                for document_id in sorted(attention_document_ids)
+                if document_id in source_platform_bags
+            ]
+            if len(mapped_bags) != len(attention_document_ids):
+                if require_production_sidecars:
+                    raise ValueError(
+                        f"{realized.task.value}: commit source platform mapping "
+                        "is incomplete"
+                    )
+            elif mapped_bags:
+                first_bag = mapped_bags[0]
+                if any(bag != first_bag for bag in mapped_bags[1:]):
+                    raise ValueError(
+                        f"{realized.task.value}: commit source spans attention "
+                        "documents with conflicting platform bags"
+                    )
+                row["source_platform_ids"] = [list(first_bag)]
         row[SOURCE_IDENTITY_REGISTRY_COLUMN] = (
             []
             if packet is None
@@ -1078,6 +1229,10 @@ def materialize_megatron_document(
     else:  # pragma: no cover - TaskKind exhaustiveness guard
         raise ValueError(f"unsupported materialized objective {realized.task.value}")
 
+    row["doc_ids"] = _normalize_attention_document_ids(
+        row["doc_ids"],  # type: ignore[arg-type]
+        where=f"{realized.task.value}.doc_ids",
+    )
     graph_edge_count = sum(
         len(row[column]) for column in _GRAPH_RELATION_COLUMNS.values()
     )

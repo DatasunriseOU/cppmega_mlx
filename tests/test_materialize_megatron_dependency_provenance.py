@@ -75,6 +75,7 @@ def _base_row(*, filepath: str) -> dict[str, object]:
         "commit_hash": "0123456789abcdef",
         "token_ids": [2, cpp_start, *code_tokens, cpp_end],
         "platform_ids": [2, 62],
+        "source_platform_ids": [[2, 62]],
         "token_structure_ids": [1] * TOKEN_COUNT,
         "token_dep_levels": [
             level for level in range(4) for _ in range(CONSTITUENT_TOKEN_COUNT)
@@ -153,6 +154,9 @@ def _commit_row() -> tuple[dict[str, object], int]:
             "doc_ids": [
                 value for value in range(1, TOKEN_COUNT // 2 + 1) for _ in range(2)
             ],
+            "source_platform_ids": [
+                [2, 62] for _ in range(TOKEN_COUNT // 2)
+            ],
             "token_symbol_ids": [0] * TOKEN_COUNT,
             "token_call_targets": [0] * TOKEN_COUNT,
             "token_type_refs": [0] * TOKEN_COUNT,
@@ -206,7 +210,11 @@ def _with_current_schema_external_cpp_wrapper(
 
 def _write_source_rows(path: Path, rows: list[dict[str, object]]) -> None:
     schema = pa.schema(
-        [*_SCHEMA, pa.field("doc_ids", pa.list_(pa.uint32()))],
+        [
+            *_SCHEMA,
+            pa.field("doc_ids", pa.list_(pa.uint32())),
+            pa.field("source_platform_ids", pa.list_(pa.list_(pa.uint16()))),
+        ],
         metadata=_SCHEMA.metadata,
     )
     pq.write_table(pa.Table.from_pylist(rows, schema=schema), path)

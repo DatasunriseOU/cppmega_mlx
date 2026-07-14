@@ -81,6 +81,7 @@ DOC_IDS_COLUMN = "doc_ids"
 VALID_TOKEN_COUNT_COLUMN = "valid_token_count"
 NUM_DOCS_COLUMN = "num_docs"
 SOURCE_DOC_IDS_COLUMN = "source_doc_ids"
+SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
 SOURCE_REPO_STABLE_IDS_COLUMN = "source_repo_stable_ids"
 SOURCE_FILEPATH_STABLE_IDS_COLUMN = "source_filepath_stable_ids"
 SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN = "source_file_local_commit_indices"
@@ -139,6 +140,7 @@ PACKED_ROWS_REQUIRED_COLUMNS = PACKED_ROWS_PACKER_REQUIRED_COLUMNS
 
 PACKED_ROWS_PROVENANCE_COLUMNS = (
     SOURCE_DOC_IDS_COLUMN,
+    SOURCE_PLATFORM_IDS_COLUMN,
     ROW_PLATFORM_IDS_COLUMN,
     *RAW_COMMIT_CHRONOLOGY_COLUMNS,
 )
@@ -325,8 +327,7 @@ def require_packed_row_loader_columns(
     missing = sorted(required_columns - set(column_names))
     if missing:
         raise ValueError(
-            "Packed-row parquet missing required loader columns: "
-            + ", ".join(missing)
+            "Packed-row parquet missing required loader columns: " + ", ".join(missing)
         )
 
 
@@ -373,7 +374,10 @@ def resolve_packed_row_valid_token_count(
     value = row.get(VALID_TOKEN_COUNT_COLUMN)
     if value is None:
         loss_mask = row.get(LOSS_MASK_COLUMN)
-        if not isinstance(loss_mask, (list, np.ndarray)) or len(loss_mask) != row_length:
+        if (
+            not isinstance(loss_mask, (list, np.ndarray))
+            or len(loss_mask) != row_length
+        ):
             raise ValueError(
                 f"packed row {LOSS_MASK_COLUMN} must have length T={row_length}"
             )
@@ -402,6 +406,7 @@ __all__ = [
     "VALID_TOKEN_COUNT_COLUMN",
     "NUM_DOCS_COLUMN",
     "SOURCE_DOC_IDS_COLUMN",
+    "SOURCE_PLATFORM_IDS_COLUMN",
     "SOURCE_REPO_STABLE_IDS_COLUMN",
     "SOURCE_FILEPATH_STABLE_IDS_COLUMN",
     "SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any
@@ -285,6 +285,10 @@ def _length_reason(
     return None
 
 
+class ObjectiveQuotaUnsatisfiedError(ValueError):
+    """The current bounded source pool cannot realize an objective quota window."""
+
+
 class EligibilityAwareTaskMixer:
     """Realize exact deterministic task quotas over a finite source window."""
 
@@ -420,9 +424,34 @@ class EligibilityAwareTaskMixer:
         *,
         start_step: int = 0,
     ) -> list[RealizedObjective]:
+        return self.materialize_window_from_pool(
+            packets,
+            output_count=len(packets),
+            start_step=start_step,
+        )
+
+    def materialize_window_from_pool(
+        self,
+        packets: Sequence[SourceInput],
+        *,
+        output_count: int,
+        start_step: int = 0,
+        required_assignment: Callable[[SourceInput, TaskKind], bool] | None = None,
+    ) -> list[RealizedObjective]:
+        """Select and realize one exact quota window from a bounded source pool."""
+
+        if output_count < 0:
+            raise ValueError(f"output_count must be >=0, got {output_count}")
+        if output_count > len(packets):
+            raise ValueError(
+                "objective source pool is smaller than the requested output window: "
+                f"pool={len(packets)}, output_count={output_count}"
+            )
+        if output_count == 0:
+            return []
         if not packets:
             return []
-        quotas = self.quotas(len(packets))
+        quotas = self.quotas(output_count)
         eligibility = [self._eligibility(packet) for packet in packets]
         eligible_counts = Counter(
             task for eligible, _ in eligibility for task in eligible
@@ -436,49 +465,123 @@ class EligibilityAwareTaskMixer:
                 f"{task.value} quota={quotas[task]} eligible={eligible_counts[task]}"
                 for task in impossible
             )
-            raise ValueError(f"objective quota is not satisfiable: {details}")
+            raise ObjectiveQuotaUnsatisfiedError(
+                f"objective quota is not satisfiable: {details}"
+            )
 
         rng = self._step_rng(start_step)
         packet_ties = [rng.random() for _ in packets]
-        packet_order = sorted(
-            range(len(packets)),
-            key=lambda index: (len(eligibility[index][0]), packet_ties[index], index),
-        )
         slots = [task for task in self._tasks for _ in range(quotas[task])]
-        rng.shuffle(slots)
-        slot_owner: list[int | None] = [None] * len(slots)
+        slot_ties = [rng.random() for _ in slots]
+        candidate_packets = [
+            [
+                packet_index
+                for packet_index, (eligible, _ineligible) in enumerate(eligibility)
+                if task in eligible
+            ]
+            for task in slots
+        ]
+        for candidates in candidate_packets:
+            candidates.sort(
+                key=lambda packet_index: (
+                    len(eligibility[packet_index][0]),
+                    packet_ties[packet_index],
+                    packet_index,
+                )
+            )
+        slot_order = sorted(
+            range(len(slots)),
+            key=lambda slot_index: (
+                len(candidate_packets[slot_index]),
+                slot_ties[slot_index],
+                slot_index,
+            ),
+        )
 
-        def assign(packet_index: int, seen: set[int]) -> bool:
-            eligible = set(eligibility[packet_index][0])
-            for slot_index, task in enumerate(slots):
-                if slot_index in seen or task not in eligible:
+        def match(
+            forced_assignment: tuple[int, int] | None,
+        ) -> tuple[list[int | None] | None, int | None]:
+            packet_owner: list[int | None] = [None] * len(packets)
+            locked_packet = locked_slot = None
+            if forced_assignment is not None:
+                locked_packet, locked_slot = forced_assignment
+                packet_owner[locked_packet] = locked_slot
+
+            def assign(slot_index: int, seen_packets: set[int]) -> bool:
+                for packet_index in candidate_packets[slot_index]:
+                    if packet_index == locked_packet or packet_index in seen_packets:
+                        continue
+                    seen_packets.add(packet_index)
+                    owner = packet_owner[packet_index]
+                    if owner is None or assign(owner, seen_packets):
+                        packet_owner[packet_index] = slot_index
+                        return True
+                return False
+
+            for slot_index in slot_order:
+                if slot_index == locked_slot:
                     continue
-                seen.add(slot_index)
-                owner = slot_owner[slot_index]
-                if owner is None or assign(owner, seen):
-                    slot_owner[slot_index] = packet_index
-                    return True
-            return False
+                if not assign(slot_index, set()):
+                    return None, slot_index
+            return packet_owner, None
 
-        for packet_index in packet_order:
-            if not assign(packet_index, set()):
-                quota_text = ", ".join(
-                    f"{task.value}={quota}" for task, quota in quotas.items()
+        forced_candidates: list[tuple[int, int] | None]
+        if required_assignment is None:
+            forced_candidates = [None]
+        else:
+            first_slot_by_task: dict[TaskKind, int] = {}
+            for slot_index, task in enumerate(slots):
+                first_slot_by_task.setdefault(task, slot_index)
+            forced_candidates = [
+                (packet_index, first_slot_by_task[task])
+                for packet_index, packet in enumerate(packets)
+                for task in eligibility[packet_index][0]
+                if task in first_slot_by_task and required_assignment(packet, task)
+            ]
+            forced_candidates.sort(
+                key=lambda pair: (
+                    len(candidate_packets[pair[1]]),
+                    len(eligibility[pair[0]][0]),
+                    packet_ties[pair[0]],
+                    pair[0],
+                    pair[1],
                 )
-                raise ValueError(
-                    "objective quota matching failed despite aggregate eligibility; "
-                    f"quotas: {quota_text}; source_index={packet_index}"
+            )
+            if not forced_candidates:
+                raise ObjectiveQuotaUnsatisfiedError(
+                    "objective source pool has no eligible assignment satisfying "
+                    "the required auxiliary constraint: "
+                    f"pool={len(packets)}, output_count={output_count}"
                 )
+
+        packet_owner = None
+        failed_slot = None
+        for forced_assignment in forced_candidates:
+            packet_owner, failed_slot = match(forced_assignment)
+            if packet_owner is not None:
+                break
+        if packet_owner is None:
+            quota_text = ", ".join(
+                f"{task.value}={quota}" for task, quota in quotas.items()
+            )
+            failed_task = "unknown" if failed_slot is None else slots[failed_slot].value
+            raise ObjectiveQuotaUnsatisfiedError(
+                "objective quota matching failed despite aggregate eligibility; "
+                f"quotas: {quota_text}; slot={failed_task}; "
+                f"pool={len(packets)}; output_count={output_count}; "
+                f"required_assignment={required_assignment is not None}"
+            )
 
         task_by_packet = {
             packet_index: slots[slot_index]
-            for slot_index, packet_index in enumerate(slot_owner)
-            if packet_index is not None
+            for packet_index, slot_index in enumerate(packet_owner)
+            if slot_index is not None
         }
         realized: list[RealizedObjective] = []
-        for source_index, packet in enumerate(packets):
+        for output_index, source_index in enumerate(sorted(task_by_packet)):
+            packet = packets[source_index]
             task = task_by_packet[source_index]
-            step_index = start_step + source_index
+            step_index = start_step + output_index
             build_rng = self._step_rng(step_index)
             task_packet = self._packet_for_task(packet, task)
             assert task_packet is not None

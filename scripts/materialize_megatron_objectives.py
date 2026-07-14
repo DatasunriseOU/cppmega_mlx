@@ -79,9 +79,11 @@ from cppmega_mlx.training.objective_data import (
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
     GraphAuxLossConfig,
+    ObjectiveQuotaUnsatisfiedError,
     ObjectiveSource,
 )
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES
+from cppmega_mlx.training.task_mixer import TaskKind
 
 _ARROW_DTYPES = {
     "uint8": pa.uint8(),
@@ -237,13 +239,31 @@ def _bind_source_sampling_cursor(
     source_snapshot: dict[str, object],
     *,
     cursor: Mapping[str, int] | None,
+    consumed_samples: int | None = None,
 ) -> None:
     sampling = source_snapshot.get("sampling")
     if not isinstance(sampling, dict) or sampling.get("mode") != _BOUNDED_SAMPLING_MODE:
         raise ValueError("source snapshot does not use bounded deterministic sampling")
     if cursor is None:
         raise ValueError("bounded source sampling did not yield a replay cursor")
-    requested_samples = int(sampling["requested_samples"])
+    requested_samples = (
+        int(sampling["requested_samples"])
+        if consumed_samples is None
+        else int(consumed_samples)
+    )
+    if requested_samples < 1:
+        raise ValueError("bounded source sampling must consume at least one row")
+    row_count = int(source_snapshot["row_count"])
+    full_passes, tail_rows = divmod(requested_samples, row_count)
+    sampling.update(
+        {
+            "requested_samples": requested_samples,
+            "full_passes": full_passes,
+            "tail_rows": tail_rows,
+            "min_row_reuse": full_passes,
+            "max_row_reuse": full_passes + int(tail_rows > 0),
+        }
+    )
     if int(cursor.get("source_index", -1)) != requested_samples - 1:
         raise ValueError(
             "source replay cursor does not match requested sample count: "
@@ -779,21 +799,90 @@ def _materialize_stream(
     writer: _StreamingParquetShardWriter,
     samples: int,
     quota_window_samples: int,
-) -> None:
+    quota_lookahead_samples: int,
+    graph_relations: tuple[str, ...] = (),
+) -> dict[str, object]:
+    source_pool: list[ObjectiveSource] = []
+    source_rows_consumed = 0
+    max_source_pool_observed = 0
+    max_source_pool_samples = quota_window_samples + quota_lookahead_samples
+
+    def append_source() -> None:
+        nonlocal source_rows_consumed, max_source_pool_observed
+        source_pool.append(next(source_iter))
+        source_rows_consumed += 1
+        max_source_pool_observed = max(max_source_pool_observed, len(source_pool))
+
+    def required_graph_assignment(source: ObjectiveSource, task: TaskKind) -> bool:
+        if task is not TaskKind.CAUSAL_LM or source.code_packet is None:
+            return False
+        graph = source.code_packet.graph_packet()
+        for relation in graph_relations:
+            edge = graph.edges.get(relation)
+            if edge is None or edge.num_edges == 0:
+                continue
+            if edge.mask is None or bool(np.any(np.asarray(edge.mask) > 0)):
+                return True
+        return False
+
     for start_step in range(0, samples, quota_window_samples):
-        sources = [next(source_iter) for _ in range(quota_window_samples)]
-        realized = mixer.materialize_window(sources, start_step=start_step)
+        while len(source_pool) < quota_window_samples:
+            append_source()
+        while True:
+            try:
+                realized = mixer.materialize_window_from_pool(
+                    source_pool,
+                    output_count=quota_window_samples,
+                    start_step=start_step,
+                    required_assignment=(
+                        required_graph_assignment if graph_relations else None
+                    ),
+                )
+                break
+            except ObjectiveQuotaUnsatisfiedError as error:
+                if len(source_pool) >= max_source_pool_samples:
+                    raise ObjectiveQuotaUnsatisfiedError(
+                        "objective quota remained unsatisfied at the bounded "
+                        "lookahead limit: "
+                        f"start_step={start_step}, pool={len(source_pool)}, "
+                        f"window={quota_window_samples}, "
+                        f"lookahead={quota_lookahead_samples}; {error}"
+                    ) from error
+                append_source()
+
+        selected_indices = {item.source_index for item in realized}
+        if len(selected_indices) != quota_window_samples:
+            raise RuntimeError(
+                "objective pool matching selected the wrong number of sources: "
+                f"selected={len(selected_indices)}, expected={quota_window_samples}"
+            )
         for item in realized:
             document = materialize_megatron_document(
                 item,
-                sources[item.source_index],
+                source_pool[item.source_index],
                 require_production_sidecars=True,
             )
             accumulator.add(document)
             writer.add(document)
             del document
+        source_pool = [
+            source
+            for source_index, source in enumerate(source_pool)
+            if source_index not in selected_indices
+        ]
         del realized
-        del sources
+    return {
+        "schema": "cppmega_objective_source_selection_v1",
+        "algorithm": "bounded_eligibility_bipartite_pool_v1",
+        "output_samples": int(samples),
+        "source_rows_consumed": source_rows_consumed,
+        "unused_buffered_sources": len(source_pool),
+        "quota_window_samples": int(quota_window_samples),
+        "quota_lookahead_samples": int(quota_lookahead_samples),
+        "max_source_pool_samples": int(max_source_pool_samples),
+        "max_source_pool_observed": int(max_source_pool_observed),
+        "required_graph_relations": list(graph_relations),
+    }
 
 
 def main() -> int:
@@ -803,6 +892,15 @@ def main() -> int:
     parser.add_argument("--samples", type=int, required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--quota-window-samples", type=int, default=60)
+    parser.add_argument(
+        "--quota-lookahead-samples",
+        type=int,
+        default=None,
+        help=(
+            "Maximum extra source rows retained while satisfying one exact quota "
+            "window (default: three quota windows)"
+        ),
+    )
     parser.add_argument("--shard-rows", type=int, default=1024)
     parser.add_argument(
         "--source-batch-rows",
@@ -836,13 +934,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    quota_lookahead_samples = (
+        3 * args.quota_window_samples
+        if args.quota_lookahead_samples is None
+        else args.quota_lookahead_samples
+    )
+
     if (
         args.samples < 1
         or args.quota_window_samples < 1
+        or quota_lookahead_samples < 0
         or args.samples % args.quota_window_samples
     ):
         raise ValueError(
-            "--samples must be positive and divisible by --quota-window-samples"
+            "--samples must be positive and divisible by --quota-window-samples; "
+            "--quota-lookahead-samples must be non-negative"
         )
     if (
         args.seq_len < 2
@@ -908,21 +1014,25 @@ def main() -> int:
             max_buffer_bytes=args.max_buffer_bytes,
         )
         with writer:
-            _materialize_stream(
+            source_selection = _materialize_stream(
                 mixer=mixer,
                 source_iter=source_iter,
                 accumulator=accumulator,
                 writer=writer,
                 samples=args.samples,
                 quota_window_samples=args.quota_window_samples,
+                quota_lookahead_samples=quota_lookahead_samples,
+                graph_relations=graph_relations,
             )
         _require_source_snapshot_unchanged(source_signatures)
         _bind_source_sampling_cursor(
             source_snapshot,
             cursor=source_iter.last_cursor,
+            consumed_samples=int(source_selection["source_rows_consumed"]),
         )
         contract = accumulator.finalize()
         contract["source_snapshot"] = source_snapshot
+        contract["source_selection"] = source_selection
         _bind_case5_contract_hashes(contract)
         artifact_partial_path = write_objective_materialization_artifact(
             partial_output_dir,

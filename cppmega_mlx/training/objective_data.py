@@ -21,6 +21,7 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     PACKED_ROWS_OBJECTIVE_SOURCE_COLUMNS,
     PACKED_ROWS_TOKEN_ALIGNED_COLUMNS,
     SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+    SOURCE_PLATFORM_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
@@ -96,6 +97,8 @@ OBJECTIVE_SECTION_COLUMNS = (
     DIFF_TOKEN_IDS_COLUMN,
 )
 
+OBJECTIVE_OPTIONAL_SOURCE_COLUMNS = (SOURCE_PLATFORM_IDS_COLUMN,)
+
 OBJECTIVE_REQUIRED_SOURCE_COLUMNS = (
     TOKEN_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
@@ -112,6 +115,7 @@ OBJECTIVE_SOURCE_COLUMNS = (
     *OBJECTIVE_REQUIRED_SOURCE_COLUMNS,
     *OBJECTIVE_SECTION_COLUMNS,
     PLATFORM_IDS_COLUMN,
+    SOURCE_PLATFORM_IDS_COLUMN,
     *TOKENIZED_ENRICHED_DOMAIN_TOKEN_COLUMNS,
     *TOKENIZED_ENRICHED_DOMAIN_GRAPH_COLUMNS,
     *TOKENIZED_ENRICHED_TEMPORAL_TOKEN_COLUMNS,
@@ -122,7 +126,7 @@ OBJECTIVE_SOURCE_COLUMNS = (
 OBJECTIVE_MEGATRON_REQUIRED_SOURCE_COLUMNS = tuple(
     column
     for column in OBJECTIVE_SOURCE_COLUMNS
-    if column not in OBJECTIVE_SECTION_COLUMNS
+    if column not in OBJECTIVE_SECTION_COLUMNS + OBJECTIVE_OPTIONAL_SOURCE_COLUMNS
 )
 
 
@@ -264,6 +268,7 @@ def objective_source_from_tokenized_row(
         extra_metadata={
             "source_index": int(source_index),
             "platform_ids": row.get(PLATFORM_IDS_COLUMN),
+            "source_platform_ids": row.get(SOURCE_PLATFORM_IDS_COLUMN),
             SOURCE_IDENTITY_REGISTRY_COLUMN: row.get(SOURCE_IDENTITY_REGISTRY_COLUMN),
             SYMBOL_IDENTITIES_COLUMN: row.get(SYMBOL_IDENTITIES_COLUMN),
             "token_change_mask_pre": row.get("token_change_mask_pre"),

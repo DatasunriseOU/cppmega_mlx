@@ -99,10 +99,17 @@ def test_materialization_loop_releases_each_document_instead_of_retaining_corpus
 
     class Mixer:
         @staticmethod
-        def materialize_window(sources, *, start_step: int):
+        def materialize_window_from_pool(
+            sources,
+            *,
+            output_count: int,
+            start_step: int,
+            required_assignment=None,
+        ):
+            del required_assignment
             del start_step
             return [
-                SimpleNamespace(source_index=index) for index in range(len(sources))
+                SimpleNamespace(source_index=index) for index in range(output_count)
             ]
 
     class Sink:
@@ -118,11 +125,67 @@ def test_materialization_loop_releases_each_document_instead_of_retaining_corpus
         writer=Sink(),  # type: ignore[arg-type]
         samples=12,
         quota_window_samples=3,
+        quota_lookahead_samples=0,
     )
 
     assert created == 12
     assert peak == 1
     assert live == 0
+
+
+def test_materialization_stream_uses_bounded_lookahead_and_carries_unused_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_sources: list[int] = []
+
+    class Mixer:
+        @staticmethod
+        def materialize_window_from_pool(
+            sources,
+            *,
+            output_count: int,
+            start_step: int,
+            required_assignment=None,
+        ):
+            del required_assignment
+            if start_step == 0 and len(sources) < 5:
+                raise materializer.ObjectiveQuotaUnsatisfiedError("need rare rows")
+            indices = [0, 3, 4] if start_step == 0 else list(range(output_count))
+            return [SimpleNamespace(source_index=index) for index in indices]
+
+    class Sink:
+        @staticmethod
+        def add(_document) -> None:
+            return None
+
+    def materialize(_item, source, **_kwargs):
+        observed_sources.append(source)
+        return object()
+
+    monkeypatch.setattr(materializer, "materialize_megatron_document", materialize)
+    receipt = materializer._materialize_stream(
+        mixer=Mixer(),  # type: ignore[arg-type]
+        source_iter=iter(range(6)),  # type: ignore[arg-type]
+        accumulator=Sink(),  # type: ignore[arg-type]
+        writer=Sink(),  # type: ignore[arg-type]
+        samples=6,
+        quota_window_samples=3,
+        quota_lookahead_samples=2,
+    )
+
+    assert observed_sources == [0, 3, 4, 1, 2, 5]
+    assert receipt == {
+        "schema": "cppmega_objective_source_selection_v1",
+        "algorithm": "bounded_eligibility_bipartite_pool_v1",
+        "output_samples": 6,
+        "source_rows_consumed": 6,
+        "unused_buffered_sources": 0,
+        "quota_window_samples": 3,
+        "quota_lookahead_samples": 2,
+        "max_source_pool_samples": 5,
+        "max_source_pool_observed": 5,
+        "required_graph_relations": [],
+    }
 
 
 def test_oversized_row_fails_before_padding_and_cleans_partial_directory(
@@ -198,4 +261,42 @@ def test_bounded_sampling_snapshot_records_order_and_replay_cursor(tmp_path) -> 
         "source_index": 4,
     }
     materializer._bind_source_sampling_cursor(snapshot, cursor=cursor)
+    assert sampling["final_cursor"] == cursor
+
+
+def test_bounded_sampling_cursor_rebinds_actual_lookahead_draw_count(tmp_path) -> None:
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.table({"value": [1, 2]}), source, row_group_size=1)
+    snapshot, _signatures = materializer._build_source_snapshot(
+        [str(source)],
+        sequence_length=128,
+        requested_samples=5,
+        seed=31,
+        sampling_mode=materializer._BOUNDED_SAMPLING_MODE,
+        source_batch_rows=2,
+    )
+    cursor = {
+        "epoch": 3,
+        "shard_position": 0,
+        "shard_index": 0,
+        "row_group_position": 0,
+        "row_group_index": 0,
+        "record_batch_index": 0,
+        "row_shuffle_position": 0,
+        "row_index_in_record_batch": 0,
+        "source_index": 6,
+    }
+
+    materializer._bind_source_sampling_cursor(
+        snapshot,
+        cursor=cursor,
+        consumed_samples=7,
+    )
+
+    sampling = snapshot["sampling"]
+    assert sampling["requested_samples"] == 7
+    assert sampling["full_passes"] == 3
+    assert sampling["tail_rows"] == 1
+    assert sampling["min_row_reuse"] == 3
+    assert sampling["max_row_reuse"] == 4
     assert sampling["final_cursor"] == cursor

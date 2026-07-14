@@ -561,6 +561,70 @@ def test_eligibility_aware_window_fails_when_quota_is_impossible() -> None:
         mixer.materialize_window([_code_packet(), _code_packet()])
 
 
+def test_eligibility_aware_pool_selects_a_satisfiable_source_subset() -> None:
+    code_only = ObjectiveSource(code_packet=_code_packet())
+    commit_only = ObjectiveSource(
+        commit_packet=CommitPacket(
+            pre_token_ids=_arr([10, 11]),
+            post_token_ids=_arr([20, 21]),
+            diff_token_ids=_arr([30, 31]),
+            commit_msg=_arr([40, 41]),
+        )
+    )
+    mixer = EligibilityAwareTaskMixer(
+        {
+            TaskKind.CAUSAL_LM: 1 / 3,
+            TaskKind.COMMIT_DIFF: 1 / 3,
+            TaskKind.PRE_TO_POST: 1 / 3,
+        },
+        seed=21,
+    )
+
+    realized = mixer.materialize_window_from_pool(
+        [code_only, code_only, code_only, commit_only, commit_only],
+        output_count=3,
+        start_step=60,
+    )
+
+    assert Counter(item.task for item in realized) == {
+        TaskKind.CAUSAL_LM: 1,
+        TaskKind.COMMIT_DIFF: 1,
+        TaskKind.PRE_TO_POST: 1,
+    }
+    assert len({item.source_index for item in realized}) == 3
+    assert sum(item.source_index >= 3 for item in realized) == 2
+
+
+def test_eligibility_aware_pool_honors_required_assignment() -> None:
+    plain_code = ObjectiveSource(code_packet=_code_packet())
+    required_code = ObjectiveSource(code_packet=_code_packet())
+    commit = ObjectiveSource(
+        commit_packet=CommitPacket(
+            pre_token_ids=_arr([10, 11]),
+            post_token_ids=_arr([20, 21]),
+            diff_token_ids=_arr([30, 31]),
+            commit_msg=_arr([40, 41]),
+        )
+    )
+    mixer = EligibilityAwareTaskMixer(
+        {TaskKind.CAUSAL_LM: 0.5, TaskKind.COMMIT_DIFF: 0.5},
+        seed=22,
+    )
+
+    realized = mixer.materialize_window_from_pool(
+        [plain_code, commit, required_code],
+        output_count=2,
+        required_assignment=lambda source, task: (
+            source is required_code and task is TaskKind.CAUSAL_LM
+        ),
+    )
+
+    assert {(item.source_index, item.task) for item in realized} == {
+        (1, TaskKind.COMMIT_DIFF),
+        (2, TaskKind.CAUSAL_LM),
+    }
+
+
 def test_production_batch_window_preserves_exact_task_quotas() -> None:
     code = CodePacket(
         **{
@@ -732,7 +796,7 @@ def test_graph_direct_token_relations_use_the_same_document_and_upstream_mask() 
     assert np.all(targets <= pair_mask)
 
 
-def test_materialized_causal_document_preserves_unique_document_ids() -> None:
+def test_materialized_causal_document_normalizes_row_local_document_ids() -> None:
     zeros = _arr([0, 0, 0, 0])
     packet = CodePacket(
         token_ids=_arr([10, 11, 12, 13]),
@@ -773,9 +837,36 @@ def test_materialized_causal_document_preserves_unique_document_ids() -> None:
         ObjectiveSource(code_packet=packet),
     )
 
-    assert document.row["doc_ids"] == [41, 41, 42, 42]
+    assert document.row["doc_ids"] == [1, 1, 2, 2]
     assert np.asarray(realized.example.loss_mask).tolist() == [1, 0, 1]
     assert document.row["loss_mask"] == [1, 0, 1, 0]
+
+
+def test_production_multi_document_objective_requires_exact_platform_bags() -> None:
+    packet = _with_required_token_sidecars(
+        CodePacket(
+            token_ids=_arr([10, 11, 12, 13]),
+            document_ids=_arr([1, 1, 2, 2]),
+            source_doc_ids=_arr([1, 1, 2, 2]),
+            source_identity_ids=mx.array(
+                np.asarray([11, 11, 22, 22], dtype=np.uint64)
+            ),
+            metadata={"platform_ids": [2, 3]},
+        )
+    )
+    realized = RealizedObjective(
+        task=TaskKind.CAUSAL_LM,
+        example=build_causal_lm(packet),
+        ineligible={},
+        source_index=0,
+    )
+
+    with pytest.raises(ValueError, match="exact source_platform_ids bags"):
+        materialize_megatron_document(
+            realized,
+            ObjectiveSource(code_packet=packet),
+            require_production_sidecars=True,
+        )
 
 
 def test_permuted_objective_preserves_one_stable_source_identity() -> None:
@@ -783,7 +874,7 @@ def test_permuted_objective_preserves_one_stable_source_identity() -> None:
     packet = _with_required_token_sidecars(
         CodePacket(
             token_ids=_arr([10, 11, 12, 13, 14, 15]),
-            document_ids=_arr([1, 1, 1, 1, 1, 1]),
+            document_ids=_arr([4, 4, 4, 4, 4, 4]),
             source_doc_ids=_arr([77, 77, 77, 77, 77, 77]),
             source_identity_ids=mx.array(
                 np.asarray([physical.source_identity_id] * 6, dtype=np.uint64)
@@ -828,7 +919,8 @@ def test_permuted_objective_selects_exactly_one_logical_document() -> None:
                 )
             ),
             metadata={
-                "platform_ids": [2],
+                "platform_ids": [2, 3],
+                "source_platform_ids": [[2], [3]],
                 "source_identity_registry": [first.as_dict(), second.as_dict()],
             },
         )
@@ -847,11 +939,13 @@ def test_permuted_objective_selects_exactly_one_logical_document() -> None:
     selected_span = realized.example.metadata["source_document_span"]
     selected_source = 77 if selected_span == (0, 3) else 88
     selected_physical = first if selected_span == (0, 3) else second
+    selected_platform = [2] if selected_span == (0, 3) else [3]
     assert set(document.row["token_source_doc_ids"]) == {selected_source}
     assert set(document.row["token_source_identity_ids"]) == {
         selected_physical.source_identity_id
     }
     assert document.row["source_identity_registry"] == [selected_physical.as_dict()]
+    assert document.row["source_platform_ids"] == [selected_platform]
     selected_tokens = {10, 11, 12} if selected_source == 77 else {13, 14, 15}
     assert set(document.token_ids) & {10, 11, 12, 13, 14, 15} <= selected_tokens
 
@@ -1097,6 +1191,45 @@ def test_megatron_document_materializes_real_commit_diff_not_post_tokens() -> No
     assert sum(document.loss_mask[:-1]) == int(
         np.asarray(realized.example.loss_mask).sum()
     )
+
+
+def test_commit_objective_collapses_matching_platform_bags_across_segments() -> None:
+    physical = _physical_source("src/commit.cpp")
+    packet = _with_required_token_sidecars(
+        CodePacket(
+            token_ids=_arr([10, 11, 12, 13]),
+            document_ids=_arr([1, 1, 2, 2]),
+            source_doc_ids=_arr([77, 77, 77, 77]),
+            source_identity_ids=mx.array(
+                np.asarray([physical.source_identity_id] * 4, dtype=np.uint64)
+            ),
+            metadata={
+                "platform_ids": [2],
+                "source_platform_ids": [[2], [2]],
+                "source_identity_registry": [physical.as_dict()],
+            },
+        )
+    )
+    commit = CommitPacket(
+        pre_token_ids=_arr([10, 11]),
+        post_token_ids=_arr([20, 21]),
+        diff_token_ids=_arr([30, 31]),
+        commit_msg=_arr([40, 41]),
+    )
+    source = ObjectiveSource(code_packet=packet, commit_packet=commit)
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.COMMIT_DIFF: 1.0}, seed=33
+    ).materialize(source, step_index=0)
+
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    assert set(document.row["doc_ids"]) == {1}
+    assert document.row["source_platform_ids"] == [[2]]
+    assert set(document.row["token_source_doc_ids"]) == {77}
 
 
 def test_megatron_document_rejects_non_shifted_targets() -> None:
