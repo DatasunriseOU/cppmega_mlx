@@ -118,4 +118,9 @@ sharding assigned all 912 tests to shard 1 while the other shards had no tests.
 The self-hosted workflow now passes `--fully-parallel`, retaining four shards
 that contain test cells rather than files. Playwright has a 12-minute global
 cap and each job has a 20-minute cap, leaving setup and artifact-upload
-headroom while still producing logs on a test timeout.
+headroom while still producing logs on a test timeout. Corrected run
+`29306678792` also exposed a 1.9 GB `setup-node` cache-save attempt after shard
+2 had passed; it spent 101 seconds packing the cache and then failed to reserve
+the key. GitHub's npm cache hook is disabled for these persistent runners;
+npm's host-local cache remains available to `npm ci` without a remote post-job
+upload.
