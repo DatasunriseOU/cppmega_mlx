@@ -16,11 +16,21 @@ from cppmega_mlx.data.domain_schema import (
 )
 
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
+    COMMIT_MSG_TEXT_COLUMN,
+    COMMIT_MSG_TOKEN_IDS_COLUMN,
+    DIFF_TEXT_COLUMN,
+    DIFF_TOKEN_IDS_COLUMN,
+    IFIM_INSTRUCTION_TEXT_COLUMN,
+    IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
     PLATFORM_IDS_COLUMN,
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
+    POST_TEXT_COLUMN,
+    POST_TOKEN_IDS_COLUMN,
+    PRE_TEXT_COLUMN,
+    PRE_TOKEN_IDS_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
     TOKEN_AST_NODE_TYPE_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
@@ -262,22 +272,51 @@ def _chunk_boundaries_to_token_offsets(
     del text
     if not chunk_boundaries or not token_lengths:
         return []
-    starts, _valid = _extract_token_char_starts_and_valid(token_lengths)
-    if not starts:
+    if token_lengths and isinstance(token_lengths[0], tuple):
+        spans = [
+            (int(start), int(end))
+            for start, end in cast(list[tuple[int, int]], token_lengths)
+        ]
+    else:
+        starts, valid = _extract_token_char_starts_and_valid(token_lengths)
+        lengths = cast(list[int], token_lengths)
+        spans = [
+            (start, start + max(int(length), 0)) if is_valid else (start, start)
+            for start, length, is_valid in zip(starts, lengths, valid, strict=True)
+        ]
+    if not spans:
         return []
 
     result: list[dict[str, Any]] = []
-    for cb in chunk_boundaries:
-        char_start = int(cb.get("start", 0))
-        tok_idx = bisect.bisect_right(starts, char_start) - 1
-        if tok_idx < 0:
-            tok_idx = 0
-        elif tok_idx >= len(starts):
-            tok_idx = len(starts) - 1
+    for chunk_index, cb in enumerate(chunk_boundaries):
+        if "start" not in cb or "end" not in cb:
+            raise ValueError(
+                f"chunk_boundaries[{chunk_index}] requires exact clang start/end"
+            )
+        char_start = int(cb["start"])
+        char_end = int(cb["end"])
+        if not 0 <= char_start < char_end:
+            raise ValueError(
+                f"chunk_boundaries[{chunk_index}] invalid half-open clang span "
+                f"[{char_start}, {char_end})"
+            )
+        overlapping = [
+            token_index
+            for token_index, (token_start, token_end) in enumerate(spans)
+            if token_end > token_start
+            and token_end > char_start
+            and token_start < char_end
+        ]
+        if not overlapping:
+            raise ValueError(
+                f"chunk_boundaries[{chunk_index}] clang span "
+                f"[{char_start}, {char_end}) overlaps no tokenizer span"
+            )
         result.append(
             {
-                "token_offset": int(tok_idx),
-                "end_char": cb.get("end", cb.get("start", 0)),
+                "token_offset": overlapping[0],
+                "token_end": overlapping[-1] + 1,
+                "end_char": char_end,
                 "kind": cb.get("kind", 0),
                 "name": cb.get("name", ""),
                 "dep_level": cb.get("dep_level", 0),
@@ -379,10 +418,13 @@ def _build_token_chunk_layout(
     index_map = {orig_idx: new_idx for new_idx, (orig_idx, _) in enumerate(chunk_entries)}
 
     starts = [int(chunk.get("token_offset", 0)) for _, chunk in chunk_entries]
-    ends = [
-        starts[i + 1] if i + 1 < len(starts) else int(token_count)
-        for i in range(len(starts))
-    ]
+    ends = [int(chunk["token_end"]) for _, chunk in chunk_entries]
+    for chunk_index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        if not 0 <= start < end <= token_count:
+            raise ValueError(
+                f"token chunk {chunk_index} exact span [{start}, {end}) is "
+                f"outside 0..{token_count}"
+            )
     kinds = [_kind_to_int(chunk.get("kind", 0)) for _, chunk in chunk_entries]
     dep_levels = [int(chunk.get("dep_level", 0)) for _, chunk in chunk_entries]
 
@@ -616,8 +658,33 @@ def materialize_tokenized_enriched_batch(
             "cannot materialize token-level enriched metadata offline."
         )
 
+    objective_token_batches: dict[str, list[list[int]]] = {}
+    for text_column, token_column in (
+        (IFIM_INSTRUCTION_TEXT_COLUMN, IFIM_INSTRUCTION_TOKEN_IDS_COLUMN),
+        (COMMIT_MSG_TEXT_COLUMN, COMMIT_MSG_TOKEN_IDS_COLUMN),
+        (PRE_TEXT_COLUMN, PRE_TOKEN_IDS_COLUMN),
+        (POST_TEXT_COLUMN, POST_TOKEN_IDS_COLUMN),
+        (DIFF_TEXT_COLUMN, DIFF_TOKEN_IDS_COLUMN),
+    ):
+        section_texts = [
+            value if isinstance(value, str) and value.strip() else ""
+            for doc in docs
+            for value in (doc.get(text_column),)
+        ]
+        encoded, _ = _encode_batch_with_optional_char_spans(
+            tokenizer,
+            section_texts,
+            num_threads=num_threads,
+        )
+        objective_token_batches[token_column] = [
+            [int(token_id) for token_id in token_ids] if text else []
+            for text, token_ids in zip(section_texts, encoded)
+        ]
+
     out = []
-    for doc, token_ids, token_spans in zip(docs, token_lists, token_spans_batch):
+    for doc_index, (doc, token_ids, token_spans) in enumerate(
+        zip(docs, token_lists, token_spans_batch)
+    ):
         token_ids = [int(tok) for tok in token_ids]
         token_structure_ids = _chars_to_tokens_structure_ids(
             doc.get("structure_ids", []),
@@ -750,6 +817,10 @@ def materialize_tokenized_enriched_batch(
             TOKEN_CHANGE_MASK_POST_COLUMN: token_change_mask_post,
             HUNK_ID_PER_TOKEN_COLUMN: hunk_id_per_token,
             EDIT_OP_PER_TOKEN_COLUMN: edit_op_per_token,
+            **{
+                column: token_batches[doc_index]
+                for column, token_batches in objective_token_batches.items()
+            },
         }
         row.update(cast(dict[str, list[int]], _build_token_chunk_layout(doc, tok_chunks, len(token_ids))))
         domain = _domain_kind_from_doc(doc)

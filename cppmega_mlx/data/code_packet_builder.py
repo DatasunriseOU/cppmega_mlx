@@ -40,9 +40,14 @@ from cppmega_mlx.data.parquet_dataset import (
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_MSG_TOKEN_IDS_COLUMN,
     COMMIT_HASH_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     FILEPATH_COLUMN,
+    DIFF_TOKEN_IDS_COLUMN,
+    IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+    POST_TOKEN_IDS_COLUMN,
+    PRE_TOKEN_IDS_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
     REPO_COLUMN,
     TIMESTAMP_COLUMN,
@@ -69,6 +74,12 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
+)
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
+    SOURCE_DIFF_TOKEN_IDS_COLUMN,
+    SOURCE_POST_TOKEN_IDS_COLUMN,
+    SOURCE_PRE_TOKEN_IDS_COLUMN,
 )
 
 
@@ -163,9 +174,9 @@ def _int_vector(value: Any, *, where: str) -> mx.array:
     return mx.array(arr.astype(np.int32))
 
 
-def _symbol_id_vector(value: Any, *, where: str) -> mx.array:
+def _opaque_identity_vector(value: Any, *, where: str) -> mx.array:
     if value is None:
-        raise ValueError(f"{where}: cannot build symbol ID vector from None")
+        raise ValueError(f"{where}: cannot build opaque identity vector from None")
     arr = np.asarray(value, dtype=object)
     if arr.ndim != 1:
         if arr.size == 0:
@@ -177,7 +188,7 @@ def _symbol_id_vector(value: Any, *, where: str) -> mx.array:
             )
     values = [int(item) for item in arr.tolist()]
     if any(item < 0 or item > np.iinfo(np.uint64).max for item in values):
-        raise ValueError(f"{where}: symbol IDs must fit unsigned 64-bit")
+        raise ValueError(f"{where}: opaque identities must fit unsigned 64-bit")
     return mx.array(np.asarray(values, dtype=np.uint64))
 
 
@@ -264,7 +275,7 @@ def build_code_packet_from_row(
             absent.append(column)
             continue
         vector_builder = (
-            _int_vector if column == TOKEN_DEF_USE_COLUMN else _symbol_id_vector
+            _int_vector if column == TOKEN_DEF_USE_COLUMN else _opaque_identity_vector
         )
         semantic_kwargs[field_name] = vector_builder(
             columns[column][row_index], where=f"{column}[row={row_index}]"
@@ -327,6 +338,15 @@ def build_code_packet_from_row(
     if extra_metadata:
         metadata.update(dict(extra_metadata))
 
+    instruction_ids = None
+    if IFIM_INSTRUCTION_TOKEN_IDS_COLUMN in columns:
+        raw_instruction_ids = columns[IFIM_INSTRUCTION_TOKEN_IDS_COLUMN][row_index]
+        if raw_instruction_ids:
+            instruction_ids = _int_vector(
+                raw_instruction_ids,
+                where=f"{IFIM_INSTRUCTION_TOKEN_IDS_COLUMN}[row={row_index}]",
+            )
+
     return CodePacket(
         token_ids=token_ids,
         target_ids=target_ids,
@@ -339,6 +359,7 @@ def build_code_packet_from_row(
         commit_or_ref=_str_scalar(columns[COMMIT_HASH_COLUMN][row_index])
         if COMMIT_HASH_COLUMN in columns
         else None,
+        ifim_instruction_token_ids=instruction_ids,
         structure_ids=structure_ids,
         ast_depth=ast_depth,
         sibling_index=sibling_index,
@@ -447,6 +468,21 @@ def build_commit_packet_from_row(
     absent: list[str] = []
     present: list[str] = []
 
+    typed_sections = (
+        ("pre_token_ids", PRE_TOKEN_IDS_COLUMN, pre_token_ids),
+        ("post_token_ids", POST_TOKEN_IDS_COLUMN, post_token_ids),
+        ("diff_token_ids", DIFF_TOKEN_IDS_COLUMN, diff_token_ids),
+        ("commit_msg", COMMIT_MSG_TOKEN_IDS_COLUMN, commit_msg),
+    )
+    resolved_sections: dict[str, mx.array | None] = {}
+    for field_name, column, supplied in typed_sections:
+        value = supplied
+        if value is None and column in columns:
+            raw = columns[column][row_index]
+            if raw:
+                value = _int_vector(raw, where=f"{column}[row={row_index}]")
+        resolved_sections[field_name] = value
+
     temporal_kwargs: dict[str, mx.array] = {}
     for column, field_name in _TEMPORAL_COLUMN_TO_FIELD.items():
         if column not in columns:
@@ -487,10 +523,10 @@ def build_commit_packet_from_row(
         metadata.update(dict(extra_metadata))
 
     return CommitPacket(
-        pre_token_ids=pre_token_ids,
-        post_token_ids=post_token_ids,
-        diff_token_ids=diff_token_ids,
-        commit_msg=commit_msg,
+        pre_token_ids=resolved_sections["pre_token_ids"],
+        post_token_ids=resolved_sections["post_token_ids"],
+        diff_token_ids=resolved_sections["diff_token_ids"],
+        commit_msg=resolved_sections["commit_msg"],
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
         repo=_str_scalar(columns[REPO_COLUMN][row_index]) if REPO_COLUMN in columns else None,
@@ -509,8 +545,83 @@ def build_commit_packet_from_row(
     )
 
 
+def build_commit_packets_from_packed_row(
+    columns: Mapping[str, list[Any]],
+    *,
+    row_index: int,
+) -> list[CommitPacket]:
+    """Build complete commit packets from per-source packed-row sections.
+
+    A source contributes a packet only when every real section required by the
+    commit objective family is present and non-empty. No post-state or special
+    tokens are substituted for missing diff/message data.
+    """
+
+    required = (
+        SOURCE_PRE_TOKEN_IDS_COLUMN,
+        SOURCE_POST_TOKEN_IDS_COLUMN,
+        SOURCE_DIFF_TOKEN_IDS_COLUMN,
+        SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
+    )
+    if any(column not in columns for column in required):
+        return []
+
+    per_column = {column: columns[column][row_index] for column in required}
+    counts = {column: len(values or []) for column, values in per_column.items()}
+    if len(set(counts.values())) != 1:
+        raise ValueError(
+            f"packed objective source columns have inconsistent counts at row "
+            f"{row_index}: {counts}"
+        )
+
+    packets: list[CommitPacket] = []
+    for source_index in range(next(iter(counts.values()), 0)):
+        sections = {
+            column: per_column[column][source_index] for column in required
+        }
+        if any(not values for values in sections.values()):
+            continue
+        packets.append(
+            build_commit_packet_from_row(
+                columns=columns,
+                row_index=row_index,
+                pre_token_ids=_int_vector(
+                    sections[SOURCE_PRE_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_PRE_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                post_token_ids=_int_vector(
+                    sections[SOURCE_POST_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_POST_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                diff_token_ids=_int_vector(
+                    sections[SOURCE_DIFF_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_DIFF_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                commit_msg=_int_vector(
+                    sections[SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                extra_metadata={"source_index": source_index},
+            )
+        )
+    return packets
+
+
 __all__ = [
     "build_code_packet_from_row",
     "build_code_packets",
     "build_commit_packet_from_row",
+    "build_commit_packets_from_packed_row",
 ]

@@ -14,8 +14,12 @@ Asserts, on the tiny ``golden_mini`` fixture with a tiny model profile:
 from __future__ import annotations
 
 import random
+from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from cppmega_mlx.data.code_packet import CodePacket
@@ -30,6 +34,7 @@ from scripts.train_stage1 import (
     _assert_aligned,
     build_train_step,
     load_code_packets,
+    load_commit_packets,
     smoke_config,
     run_training,
 )
@@ -61,9 +66,48 @@ def test_both_channel_on_and_channel_off_steps_occur(smoke_results: dict) -> Non
     # Side-channel-OFF family (reordered / synthesized: fim / commit).
     assert smoke_results["reordered_steps"] > 0
     assert any(obj in _REORDERED_OBJECTIVES for obj in dist), dist
-    # At least one FIM-permuted AND one commit-synthesized objective fired.
+    # This legacy fixture smoke intentionally has no typed commit/IFIM columns;
+    # production coverage lives in test_production_objective_mixer.py.
+    assert "fim" in dist, dist
     assert "ast_fim" in dist, dist
-    assert ("commit_diff" in dist) or ("pre_to_post" in dist), dist
+    assert "ifim" not in dist
+    assert "commit_diff" not in dist
+    assert dist == {"causal_lm": 112, "fim": 14, "ast_fim": 14}
+
+
+def test_commit_loader_requires_and_preserves_typed_upstream_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "typed_commits.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "pre_token_ids": [[10, 11]],
+                "post_token_ids": [[20, 21]],
+                "diff_token_ids": [[30, 31, 32]],
+                "commit_msg_token_ids": [[40, 41]],
+                "repo": ["repo"],
+                "filepath": ["src/demo.cc"],
+                "commit_hash": ["abc123"],
+            }
+        ),
+        path,
+    )
+
+    packets = load_commit_packets(path, vocab_size=VOCAB)
+
+    assert len(packets) == 1
+    assert np.asarray(packets[0].pre_token_ids).tolist() == [10, 11]
+    assert np.asarray(packets[0].post_token_ids).tolist() == [20, 21]
+    assert np.asarray(packets[0].diff_token_ids).tolist() == [30, 31, 32]
+    assert np.asarray(packets[0].commit_msg).tolist() == [40, 41]
+
+
+def test_commit_loader_rejects_legacy_rendered_wrapper_fixture() -> None:
+    with pytest.raises(ValueError, match="typed commit columns"):
+        load_commit_packets(
+            GOLDEN_MINI / "commits" / "commits.parquet", vocab_size=VOCAB
+        )
 
 
 def test_aligned_step_passes_channels_reordered_step_omits_them() -> None:

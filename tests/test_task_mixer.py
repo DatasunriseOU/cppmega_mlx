@@ -31,7 +31,7 @@ def _code_packet() -> CodePacket:
         symbol_ids=_arr([0, 0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0]),
         type_refs=_arr([0, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         call_targets=_arr([0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0]),
-        metadata={"source_text": "// Do a thing\nint f(int x);\n"},
+        ifim_instruction_token_ids=_arr([300, 301, 302]),
     )
 
 
@@ -41,7 +41,11 @@ def test_stage1_default_rates_sum_to_one() -> None:
     assert abs(sum(canonical.values()) - 1.0) < 1e-9
     # Bucket checks per spec.
     assert abs(canonical[TaskKind.CAUSAL_LM] - 0.5) < 1e-9
-    fim_bucket = canonical[TaskKind.AST_FIM] + canonical[TaskKind.IFIM]
+    fim_bucket = (
+        canonical[TaskKind.FIM]
+        + canonical[TaskKind.AST_FIM]
+        + canonical[TaskKind.IFIM]
+    )
     assert abs(fim_bucket - 0.2) < 1e-9
     commit_bucket = canonical[TaskKind.COMMIT_DIFF] + canonical[TaskKind.PRE_TO_POST]
     assert abs(commit_bucket - 0.2) < 1e-9
@@ -61,6 +65,11 @@ def test_rates_not_summing_to_one_raises() -> None:
 def test_negative_rate_raises() -> None:
     with pytest.raises(ValueError, match="negative"):
         normalize_rates({TaskKind.CAUSAL_LM: 1.2, TaskKind.AST_FIM: -0.2})
+
+
+def test_non_finite_rate_raises() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        normalize_rates({TaskKind.CAUSAL_LM: float("nan")})
 
 
 def test_unknown_task_key_raises() -> None:
@@ -100,13 +109,11 @@ def test_mix_yields_aligned_examples_and_is_deterministic() -> None:
     mixer = TaskMixer(
         {TaskKind.CAUSAL_LM: 0.4, TaskKind.AST_FIM: 0.3, TaskKind.IFIM: 0.3},
         seed=5,
-        instruction_encoder=lambda t: [300, 301, 302],
     )
     out1 = list(mixer.mix(packets))
     out2 = list(TaskMixer(
         {TaskKind.CAUSAL_LM: 0.4, TaskKind.AST_FIM: 0.3, TaskKind.IFIM: 0.3},
         seed=5,
-        instruction_encoder=lambda t: [300, 301, 302],
     ).mix(packets))
 
     assert [t for t, _ in out1] == [t for t, _ in out2]
@@ -118,10 +125,11 @@ def test_mix_yields_aligned_examples_and_is_deterministic() -> None:
         assert np.asarray(ex1.input_ids).tolist() == np.asarray(ex2.input_ids).tolist()
 
 
-def test_ifim_without_encoder_raises() -> None:
+def test_ifim_without_typed_instruction_raises() -> None:
     mixer = TaskMixer({TaskKind.IFIM: 1.0}, seed=0)
-    with pytest.raises(ValueError, match="no instruction_encoder"):
-        list(mixer.mix([_code_packet()]))
+    packet = CodePacket(token_ids=_arr(list(range(12))))
+    with pytest.raises(ValueError, match="ifim_instruction_token_ids"):
+        list(mixer.mix([packet]))
 
 
 def test_commit_task_with_code_packet_raises() -> None:

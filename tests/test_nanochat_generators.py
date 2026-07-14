@@ -697,10 +697,13 @@ def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
 
     assert overflow == []
     assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 3, 4, 9, 10]
-    assert rows[0][DOC_IDS_COLUMN][0] == rows[0][DOC_IDS_COLUMN][2]
-    assert rows[0][DOC_IDS_COLUMN][3] != rows[0][DOC_IDS_COLUMN][4]
-    assert rows[0][LOSS_MASK_COLUMN] == [1, 1, 1, 0, 1, 0]
-    assert rows[0][NUM_DOCS_COLUMN] == 2
+    assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2, 3, 3]
+    assert rows[0][LOSS_MASK_COLUMN] == [1, 0, 1, 0, 1, 0]
+    assert rows[0][NUM_DOCS_COLUMN] == 3
+    stable_sources = rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert stable_sources[0] == stable_sources[2]
+    assert stable_sources[3] != stable_sources[4]
+    assert all(value > 0 for value in stable_sources)
 
 
 def test_pack_enriched_rows_does_not_merge_file_provenance_without_logical_id(
@@ -719,10 +722,7 @@ def test_pack_enriched_rows_does_not_merge_file_provenance_without_logical_id(
     )
 
     docs = read_tokenized_documents(shard)
-    assert [(doc.source_doc_index, doc.stable_doc_id) for doc in docs] == [
-        (0, 1),
-        (1, 2),
-    ]
+    assert [doc.source_doc_index for doc in docs] == [0, 1]
     rows, overflow = pack_documents(
         docs,
         target_length=4,
@@ -734,6 +734,35 @@ def test_pack_enriched_rows_does_not_merge_file_provenance_without_logical_id(
     assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2]
     assert rows[0][LOSS_MASK_COLUMN] == [1, 0, 1, 0]
     assert rows[0][NUM_DOCS_COLUMN] == 2
+
+
+def test_pack_enriched_rows_does_not_collide_anonymous_and_typed_source_ids(
+    tmp_path: Path,
+) -> None:
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[1, 2], [3, 4]],
+                "source_doc_id": [None, "alpha"],
+            }
+        ),
+        tmp_path / "train_00000.parquet",
+    )
+
+    docs = read_tokenized_documents(tmp_path)
+    rows, overflow = pack_documents(
+        docs,
+        target_length=4,
+        pad_token_id=0,
+        strategy="sequential",
+    )
+
+    assert overflow == []
+    source_ids = rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN]
+    assert source_ids[:2] == [source_ids[0], source_ids[0]]
+    assert source_ids[2:] == [source_ids[2], source_ids[2]]
+    assert source_ids[0] > 0 and source_ids[2] > 0
+    assert source_ids[0] != source_ids[2]
 
 
 def test_token_budget_slices_semantic_char_metadata() -> None:

@@ -453,6 +453,24 @@ def test_sidecar_audit_requires_uint32_positive_token_source_doc_ids(tmp_path):
         assert report["total"]["bad_rows"] >= 1
 
 
+def test_sidecar_audit_rejects_zero_stable_source_id_inside_valid_prefix(tmp_path):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    _write_tiny_parquet(
+        code_root / "8" / "code.parquet",
+        extra={"token_source_doc_ids": [7, 0, 7, 7, 0, 0, 0, 0]},
+    )
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report is not None
+    assert report["total"]["fields"]["token_source_doc_ids"]["bad_value_rows"] >= 1
+
+
 def test_sidecar_audit_rejects_edge_crossing_source_document_provenance(tmp_path):
     code_root = tmp_path / "code"
     commit_root = tmp_path / "commits"

@@ -1,9 +1,9 @@
 """AST-aware Fill-in-the-Middle span sampling driven by clang chunk boundaries.
 
 This module sits on top of :mod:`cppmega_mlx.data.fim` — it does NOT reimplement
-the PSM/SPM/iFIM permutations.  Its only job is to *choose the middle span* from a
+the PSM/SPM permutations.  Its only job is to *choose the middle span* from a
 ``CodePacket``'s token-aligned structure side-channels, then hand that span to the
-existing ``fim.apply_fim_permutation`` / ``fim.apply_ifim_permutation`` emitters.
+existing ``fim.apply_fim_permutation`` emitter.
 
 Span selection (research-grounded AST-FIM):
 
@@ -22,23 +22,18 @@ Mix (mid-token robustness):
   * 10% of the time we emit a random-CHAR-FIM example whose middle is a random
     token span (``fim.sample_middle_span``) that may start/end mid-statement —
     this teaches robustness to arbitrary cursor positions.  The fall-back to the
-    char path is RECORDED in the returned ``AstFimResult.kind`` ("char_fim"
-    or "char_ifim" for instruction-aware examples), never silent.
-
-iFIM variant: when the document carries a leading comment / docstring we extract
-it via ``fim.extract_ifim_instruction_text`` and emit through
-``fim.apply_ifim_permutation`` using that text (tokenized by an injected encoder)
-as the ``FIM_INSTRUCTION`` span.
+    char path is RECORDED in the returned ``AstFimResult.kind`` ("char_fim"),
+    never silent.
 
 RULE #1 (fail fast / fail loud): every required field (``chunk_starts`` /
-``chunk_ends`` for AST-FIM, ``metadata['source_text']`` + an encoder for iFIM) is
-validated up-front and a missing one RAISES with WHERE + WHAT — no silent path.
+``chunk_ends``) is validated up-front and a missing one RAISES with WHERE +
+WHAT — no silent path.
 """
 
 from __future__ import annotations
 
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -51,7 +46,6 @@ from cppmega_mlx.data.fim import (
     FIMSpecialTokenInput,
     apply_fim_permutation,
     apply_ifim_permutation,
-    extract_ifim_instruction_text,
     sample_middle_span,
 )
 
@@ -69,10 +63,6 @@ class NoEligibleChunkError(ValueError):
     raises a plain ``ValueError`` and propagates (fail-loud).
     """
 
-# An encoder turns instruction text into token ids; injected so this module stays
-# tokenizer-artifact-free (mirrors fim.py's contract).
-InstructionEncoder = Callable[[str], Sequence[int]]
-
 
 @dataclass(frozen=True)
 class AstFimResult:
@@ -88,6 +78,7 @@ class AstFimResult:
     mode: FIMMode
     kind: AstFimKind
     chunk_index: int | None
+    document_span: tuple[int, int] | None = None
 
 
 def _token_count(packet: CodePacket) -> int:
@@ -101,6 +92,47 @@ def _token_count(packet: CodePacket) -> int:
 
 def _packet_token_list(packet: CodePacket) -> list[int]:
     return [int(x) for x in np.asarray(packet.token_ids).reshape(-1).tolist()]
+
+
+def logical_document_spans(packet: CodePacket) -> tuple[tuple[int, int, int], ...]:
+    """Return contiguous positive ``document_ids`` runs as ``(start,end,id)``."""
+
+    length = _token_count(packet)
+    if packet.document_ids is None:
+        return ((0, length, 1),)
+    document_ids = [
+        int(value)
+        for value in np.asarray(packet.document_ids).reshape(-1).tolist()
+    ]
+    if len(document_ids) != length:
+        raise ValueError(
+            f"document_ids length {len(document_ids)} != token length {length}"
+        )
+    if any(document_id <= 0 for document_id in document_ids):
+        raise ValueError("document_ids must be positive on every objective token")
+    spans: list[tuple[int, int, int]] = []
+    start = 0
+    for index in range(1, length + 1):
+        if index == length or document_ids[index] != document_ids[start]:
+            spans.append((start, index, document_ids[start]))
+            start = index
+    return tuple(spans)
+
+
+def _containing_document(
+    start: int,
+    end: int,
+    document_spans: Sequence[tuple[int, int, int]],
+    *,
+    chunk_index: int,
+) -> tuple[int, int, int]:
+    for document_start, document_end, document_id in document_spans:
+        if document_start <= start < end <= document_end:
+            return document_start, document_end, document_id
+    raise ValueError(
+        f"ast_fim: chunk {chunk_index} span [{start}, {end}) crosses a "
+        "document_ids boundary"
+    )
 
 
 def _chunk_arrays(packet: CodePacket) -> tuple[list[int], list[int], list[int] | None]:
@@ -128,9 +160,12 @@ def _chunk_arrays(packet: CodePacket) -> tuple[list[int], list[int], list[int] |
 
 
 def _eligible_chunks(
-    starts: Sequence[int], ends: Sequence[int], length: int
+    starts: Sequence[int],
+    ends: Sequence[int],
+    length: int,
+    document_spans: Sequence[tuple[int, int, int]],
 ) -> list[int]:
-    """Chunk indices whose [start, end) keep prefix/middle/suffix non-empty."""
+    """Chunks with non-empty prefix/suffix inside one logical document."""
 
     eligible: list[int] = []
     for idx, (start, end) in enumerate(zip(starts, ends)):
@@ -139,10 +174,51 @@ def _eligible_chunks(
                 f"ast_fim: chunk {idx} span [{start}, {end}) out of bounds for "
                 f"{length} tokens (chunk boundaries must be valid token offsets)"
             )
-        # Reference contract: 0 < start < end < length (non-empty pre/mid/suffix).
-        if 0 < start and end < length:
+        document_start, document_end, _document_id = _containing_document(
+            start, end, document_spans, chunk_index=idx
+        )
+        if document_start < start and end < document_end:
             eligible.append(idx)
     return eligible
+
+
+def _select_ast_span_in_document(
+    packet: CodePacket,
+    *,
+    rng: random.Random,
+) -> tuple[int, int, int, int, int]:
+    """Return document-relative span, chunk index, and absolute document span."""
+
+    length = _token_count(packet)
+    if length < 3:
+        raise ValueError(
+            "ast_fim requires at least 3 tokens to form prefix/middle/suffix, "
+            f"got {length}"
+        )
+    starts, ends, _kinds = _chunk_arrays(packet)
+    document_spans = logical_document_spans(packet)
+    eligible = _eligible_chunks(starts, ends, length, document_spans)
+    if not eligible:
+        raise NoEligibleChunkError(
+            "ast_fim: no clang chunk yields non-empty context inside one "
+            "logical document"
+        )
+    chunk_index = eligible[rng.randrange(len(eligible))]
+    absolute_start = starts[chunk_index]
+    absolute_end = ends[chunk_index]
+    document_start, document_end, _document_id = _containing_document(
+        absolute_start,
+        absolute_end,
+        document_spans,
+        chunk_index=chunk_index,
+    )
+    return (
+        absolute_start - document_start,
+        absolute_end - document_start,
+        chunk_index,
+        document_start,
+        document_end,
+    )
 
 
 def select_ast_span(
@@ -157,25 +233,37 @@ def select_ast_span(
     to route to the char-FIM slice).
     """
 
+    start, end, chunk_index, document_start, _document_end = (
+        _select_ast_span_in_document(packet, rng=rng)
+    )
+    return start + document_start, end + document_start, chunk_index
+
+
+def eligible_ast_chunk_indices(packet: CodePacket) -> tuple[int, ...]:
+    """Return validated interior clang chunks without drawing randomness."""
+
     length = _token_count(packet)
     if length < 3:
-        raise ValueError(
-            f"ast_fim requires at least 3 tokens to form prefix/middle/suffix, "
-            f"got {length}"
-        )
-    # Absent chunk boundaries are a MISSING REQUIRED FIELD for AST-FIM -> RAISE
-    # (this propagates; it is NOT the recorded 10% char fallback).
+        return ()
     starts, ends, _kinds = _chunk_arrays(packet)
-    eligible = _eligible_chunks(starts, ends, length)
+    return tuple(
+        _eligible_chunks(starts, ends, length, logical_document_spans(packet))
+    )
+
+
+def _char_document_span(
+    packet: CodePacket, *, rng: random.Random
+) -> tuple[int, int, int]:
+    eligible = [
+        span
+        for span in logical_document_spans(packet)
+        if span[1] - span[0] >= 3
+    ]
     if not eligible:
-        # Present-but-unusable for THIS window: caller routes to the char slice
-        # and RECORDS it (observable, not silent).
-        raise NoEligibleChunkError(
-            "ast_fim: no clang chunk yields a non-empty prefix/middle/suffix for "
-            f"this {length}-token window; route to the char-FIM slice instead"
+        raise ValueError(
+            "fim requires at least one logical document with at least 3 tokens"
         )
-    chunk_index = eligible[rng.randrange(len(eligible))]
-    return starts[chunk_index], ends[chunk_index], chunk_index
+    return eligible[rng.randrange(len(eligible))]
 
 
 def apply_ast_fim(
@@ -203,8 +291,8 @@ def apply_ast_fim(
         raise ValueError(f"spm_rate must be in [0, 1], got {spm_rate}")
     rand = rng if rng is not None else random.Random(seed)
 
-    tokens = _packet_token_list(packet)
-    length = len(tokens)
+    all_tokens = _packet_token_list(packet)
+    length = len(all_tokens)
     if length < 3:
         raise ValueError(
             f"ast_fim requires at least 3 tokens, got {length}"
@@ -213,20 +301,29 @@ def apply_ast_fim(
     use_ast = rand.random() < ast_fim_rate
     if use_ast:
         try:
-            start, end, chunk_index = select_ast_span(packet, rng=rand)
+            start, end, chunk_index, document_start, document_end = (
+                _select_ast_span_in_document(packet, rng=rand)
+            )
             kind: AstFimKind = "ast_fim"
         except NoEligibleChunkError:
             # No usable chunk for THIS window: fall to the char slice and RECORD
             # it (not a silent degraded path — the kind makes it observable).
             # A genuinely absent chunk field is a plain ValueError and propagates.
-            start, end = sample_middle_span(length, rng=rand)
+            document_start, document_end, _document_id = _char_document_span(
+                packet, rng=rand
+            )
+            start, end = sample_middle_span(document_end - document_start, rng=rand)
             chunk_index = None
             kind = "char_fim"
     else:
-        start, end = sample_middle_span(length, rng=rand)
+        document_start, document_end, _document_id = _char_document_span(
+            packet, rng=rand
+        )
+        start, end = sample_middle_span(document_end - document_start, rng=rand)
         chunk_index = None
         kind = "char_fim"
 
+    tokens = all_tokens[document_start:document_end]
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
     permuted = apply_fim_permutation(
         tokens,
@@ -240,82 +337,69 @@ def apply_ast_fim(
         mode=mode,
         kind=kind,
         chunk_index=chunk_index,
+        document_span=(document_start, document_end),
     )
 
 
 def apply_ast_ifim(
     packet: CodePacket,
     *,
-    instruction_encoder: InstructionEncoder,
+    instruction_token_ids: Sequence[int] | None = None,
     seed: int | None = None,
     rng: random.Random | None = None,
     spm_rate: float = 0.5,
     ast_fim_rate: float = DEFAULT_AST_FIM_RATE,
     special_token_ids: FIMSpecialTokenInput = None,
 ) -> AstFimResult:
-    """Emit an instruction-aware AST-FIM example using a leading comment/docstring.
+    """Emit typed instruction-aware AST-iFIM with an observable char fallback."""
 
-    The instruction text is the document's leading comment/docstring extracted by
-    ``fim.extract_ifim_instruction_text`` from ``packet.metadata['source_text']``;
-    it is tokenized by the injected ``instruction_encoder`` and emitted as the
-    ``FIM_INSTRUCTION`` span via ``fim.apply_ifim_permutation``.
-
-    RAISES if ``source_text`` is absent, if no instruction can be extracted, or if
-    the encoder yields an empty token list (fail-loud, no silent fallback to plain
-    FIM).
-    """
-
-    source_text = packet.metadata.get("source_text")
-    if source_text is None:
-        raise ValueError(
-            "ast_ifim requires CodePacket.metadata['source_text'] to extract the "
-            "leading comment/docstring instruction; it is absent"
-        )
-    if not isinstance(source_text, str):
-        raise TypeError(
-            f"ast_ifim: metadata['source_text'] must be a str, got "
-            f"{type(source_text).__name__}"
-        )
-    instruction_text = extract_ifim_instruction_text(source_text)
-    if instruction_text is None:
-        raise ValueError(
-            "ast_ifim: no leading comment/docstring instruction found in "
-            "source_text; cannot build an iFIM example"
-        )
-    instruction_ids = [int(x) for x in instruction_encoder(instruction_text)]
-    if not instruction_ids:
-        raise ValueError(
-            "ast_ifim: instruction_encoder produced no tokens for instruction "
-            f"text {instruction_text!r}"
-        )
-
+    if instruction_token_ids is None:
+        raise ValueError("ast_ifim requires typed instruction_token_ids")
+    instruction = list(instruction_token_ids)
+    if not instruction:
+        raise ValueError("ast_ifim instruction_token_ids must not be empty")
+    if any(not isinstance(token_id, int) or isinstance(token_id, bool) for token_id in instruction):
+        raise ValueError("ast_ifim instruction_token_ids must contain integer token ids")
     if rng is not None and seed is not None:
         raise ValueError("pass either seed or rng, not both")
+    if not 0.0 <= ast_fim_rate <= 1.0:
+        raise ValueError(f"ast_fim_rate must be in [0, 1], got {ast_fim_rate}")
+    if not 0.0 <= spm_rate <= 1.0:
+        raise ValueError(f"spm_rate must be in [0, 1], got {spm_rate}")
     rand = rng if rng is not None else random.Random(seed)
 
-    tokens = _packet_token_list(packet)
-    length = len(tokens)
+    all_tokens = _packet_token_list(packet)
+    length = len(all_tokens)
     if length < 3:
         raise ValueError(f"ast_ifim requires at least 3 tokens, got {length}")
 
     use_ast = rand.random() < ast_fim_rate
     if use_ast:
         try:
-            start, end, chunk_index = select_ast_span(packet, rng=rand)
+            start, end, chunk_index, document_start, document_end = (
+                _select_ast_span_in_document(packet, rng=rand)
+            )
             kind: AstFimKind = "ast_ifim"
         except NoEligibleChunkError:
-            start, end = sample_middle_span(length, rng=rand)
+            document_start, document_end, _document_id = _char_document_span(
+                packet, rng=rand
+            )
+            start, end = sample_middle_span(document_end - document_start, rng=rand)
             chunk_index = None
             kind = "char_ifim"
     else:
-        start, end = sample_middle_span(length, rng=rand)
+        document_start, document_end, _document_id = _char_document_span(
+            packet, rng=rand
+        )
+        start, end = sample_middle_span(document_end - document_start, rng=rand)
         chunk_index = None
         kind = "char_ifim"
 
+    tokens = all_tokens[document_start:document_end]
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
     permuted = apply_ifim_permutation(
         tokens,
-        instruction_token_ids=instruction_ids,
+        instruction_token_ids=instruction,
         span=(start, end),
         mode=mode,
         special_token_ids=special_token_ids,
@@ -326,6 +410,7 @@ def apply_ast_ifim(
         mode=mode,
         kind=kind,
         chunk_index=chunk_index,
+        document_span=(document_start, document_end),
     )
 
 
@@ -333,9 +418,10 @@ __all__ = [
     "DEFAULT_AST_FIM_RATE",
     "AstFimKind",
     "AstFimResult",
-    "InstructionEncoder",
     "NoEligibleChunkError",
     "apply_ast_fim",
     "apply_ast_ifim",
+    "eligible_ast_chunk_indices",
+    "logical_document_spans",
     "select_ast_span",
 ]

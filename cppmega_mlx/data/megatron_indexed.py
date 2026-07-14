@@ -162,6 +162,7 @@ _NAMED_DTYPES: dict[str, np.dtype] = {
     "uint16": np.dtype(np.uint16),
     "int32": np.dtype(np.int32),
     "uint32": np.dtype(np.uint32),
+    "uint64": np.dtype(np.uint64),
     "int64": np.dtype(np.int64),
     "uint64": np.dtype(np.uint64),
 }

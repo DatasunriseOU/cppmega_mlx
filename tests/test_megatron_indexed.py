@@ -1333,6 +1333,7 @@ def test_mmididx_full_cppmega_token_sidecars_are_grouped(tmp_path) -> None:
         np.array(semantic["type_refs"]),
         type_values.reshape(2, 4),
     )
+    assert np.array(semantic["symbol_ids"]).dtype == np.dtype(np.uint64)
     np.testing.assert_array_equal(
         np.array(semantic["def_use"]),
         np.array(batch.tokens) % 2,
@@ -1755,6 +1756,8 @@ def test_megatron_indexed_side_channel_schema_documents_aliases_and_dtypes() -> 
     assert "token_ast_depth" in ast_depth_aliases
     assert "token_symbol_ids" in schema["symbol_ids"]["aliases"]
     assert schema["symbol_ids"]["family"] == "semantic_graph"
+    assert schema["symbol_ids"]["default_dtype"] == "uint64"
+    assert schema["symbol_ids"]["target_dtype"] == "uint64"
     assert schema["change_mask_pre"]["family"] == "temporal_diff"
     assert schema["structure_ids"]["default_dtype"] == "int32"
     assert schema["structure_ids"]["target_dtype"] == "int32"

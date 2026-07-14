@@ -27,6 +27,19 @@ TOOL_USE_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "TOOL_RESULT": 19,
 }
 
+# Frozen semantic tokens already present in tokenizer.json. Objective builders
+# use these boundaries directly; no new or reassigned vocabulary IDs are allowed.
+OBJECTIVE_BOUNDARY_TOKEN_IDS: dict[str, int] = {
+    "FILE_SEP": 14,
+    "DIFF_START": 15,
+    "DIFF_END": 16,
+    "COMMENT_START": 17,
+    "COMMENT_END": 18,
+    "SYMBOL_REF": 38,
+    "TYPE_INFO": 39,
+    "OVERLOAD_SET": 44,
+}
+
 DOMAIN_DELIMITER_TOKEN_IDS: dict[str, int] = {
     "CPP_CODE_START": 191,
     "CPP_CODE_END": 192,
@@ -154,6 +167,7 @@ def _is_int_key(value: object) -> bool:
 
 __all__ = [
     "DOMAIN_DELIMITER_TOKEN_IDS",
+    "OBJECTIVE_BOUNDARY_TOKEN_IDS",
     "REQUIRED_SPECIAL_TOKEN_IDS",
     "SpecialTokenMapping",
     "TOOL_USE_SPECIAL_TOKEN_IDS",
