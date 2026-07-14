@@ -144,6 +144,8 @@ def test_preset_matrix_is_really_sharded_and_bounded() -> None:
     assert "--shard=${{ matrix.shard }}/4" in preset_job
     assert "timeout-minutes: 20" in preset_job
     assert "timeout-minutes: 40" not in preset_job
+    assert 'cache: "npm"' not in workflow
+    assert "cache-dependency-path:" not in workflow
 
 
 def test_core_self_hosted_jobs_use_the_shared_receipted_lane_runner() -> None:
