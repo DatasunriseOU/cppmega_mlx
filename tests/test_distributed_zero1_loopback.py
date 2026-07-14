@@ -154,9 +154,9 @@ def test_zero1_loopback_2proc_receipt(tmp_path: Path) -> None:
             "127.0.0.1",
             "--backend",
             "ring",
-            "--python",
-            _venv_python(),
             "--",
+            # mlx.launch executes the remainder directly on each rank.
+            _venv_python(),
             str(SCRIPT),
             "--steps",
             "10",  # 10 steps keeps the test under the 5 min default budget.
