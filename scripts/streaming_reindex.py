@@ -39,6 +39,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
 # NOT strip it there.
 SOURCE_EXTRA_EXCLUDE = ".git,.svn,node_modules,build,_build,cmake-build-debug"
 EXCLUDE_PARTS = frozenset(SOURCE_EXTRA_EXCLUDE.split(","))
+_PUBLICATION_LOCK = threading.Lock()
 
 
 def load_project_identity_map(repo_list: Path) -> dict[str, str]:
@@ -549,12 +551,31 @@ class Manifest:
     def is_done(self, key: str) -> bool:
         return key in self.done
 
+    def mark_started(self, key: str) -> None:
+        """Invalidate stale terminal state before starting a new attempt."""
+        changed = self.done.pop(key, None) is not None
+        changed = self.failed.pop(key, None) is not None or changed
+        if changed:
+            self.save()
+
+    def mark_started_prefix(self, prefix: str) -> None:
+        """Invalidate all stale range states for a logical parent item."""
+        done_keys = [key for key in self.done if key.startswith(prefix)]
+        failed_keys = [key for key in self.failed if key.startswith(prefix)]
+        for key in done_keys:
+            self.done.pop(key)
+        for key in failed_keys:
+            self.failed.pop(key)
+        if done_keys or failed_keys:
+            self.save()
+
     def mark_done(self, key: str, info: dict) -> None:
         self.done[key] = info
         self.failed.pop(key, None)
         self.save()
 
     def mark_failed(self, key: str, stage: str, detail: str) -> None:
+        self.done.pop(key, None)
         self.failed[key] = {
             "stage": stage,
             "detail": detail[:2000],
@@ -1039,18 +1060,151 @@ def stage_pack(repo: str, tok: Path, target_length: int, work: Path) -> Path:
     return packed
 
 
-def append_output(repo: str, packed: Path, target_length: int) -> dict:
-    """Place packed parquet at outputs/reindexed/<L>/<repo>.parquet.
+def _replace_publication_path(source: Path, destination: Path) -> None:
+    os.replace(source, destination)
 
-    Per-repo files are the append unit (one file per repo per length); this keeps
-    resume trivial and avoids rewriting a growing combined file. Returns row/token
-    stats read back from the written file.
-    """
-    out_dir = OUTPUT_ROOT / str(target_length)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / f"{repo}.parquet"
-    shutil.copyfile(packed, dest)
-    return _parquet_stats(dest, target_length)
+
+@contextmanager
+def _publication_lock(output_root: Path):
+    import fcntl
+
+    lock_path = output_root / ".publish.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _PUBLICATION_LOCK, lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def publish_bucket_outputs_atomically(
+    publication_key: str,
+    packed_by_length: dict[int, Path],
+    *,
+    output_root: Path,
+    filename: str,
+    prepare_staged: Callable[[Path], None] | None = None,
+    stats_reader: Callable[[Path, int], dict] | None = None,
+    remove_lengths: Sequence[int] = (),
+) -> dict[str, dict]:
+    """Failure-atomically publish one logical item across all routed buckets."""
+    if not packed_by_length:
+        raise ValueError(f"[{publication_key}] no bucket outputs to publish")
+    if Path(filename).name != filename:
+        raise ValueError(f"[{publication_key}] invalid output filename: {filename!r}")
+
+    read_stats = stats_reader or _parquet_stats
+    transaction_id = f"{os.getpid()}.{time.time_ns()}"
+    transaction_root = output_root / ".transactions" / transaction_id
+    transaction_root.mkdir(parents=True, exist_ok=False)
+    destinations: dict[int, Path] = {}
+    staged: dict[int, Path] = {}
+    stats: dict[str, dict] = {}
+
+    try:
+        publication_lengths = sorted(
+            set(packed_by_length) | {int(length) for length in remove_lengths}
+        )
+        for target_length in publication_lengths:
+            out_dir = output_root / str(target_length)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            destinations[target_length] = out_dir / filename
+        for target_length, packed in sorted(packed_by_length.items()):
+            destination = destinations[target_length]
+            staged_path = transaction_root / "staged" / str(target_length) / filename
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            staged[target_length] = staged_path
+            shutil.copyfile(packed, staged_path)
+            if prepare_staged is not None:
+                prepare_staged(staged_path)
+            stats[str(target_length)] = read_stats(staged_path, target_length)
+    except BaseException:
+        shutil.rmtree(transaction_root, ignore_errors=True)
+        raise
+
+    backups: dict[int, Path] = {}
+    published: list[int] = []
+    rollback_incomplete = False
+    try:
+        with _publication_lock(output_root):
+            try:
+                for target_length, destination in sorted(destinations.items()):
+                    if not destination.exists():
+                        continue
+                    backup = (
+                        transaction_root
+                        / "backups"
+                        / str(target_length)
+                        / filename
+                    )
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    _replace_publication_path(destination, backup)
+                    backups[target_length] = backup
+
+                for target_length, staged_path in sorted(staged.items()):
+                    destination = destinations[target_length]
+                    _replace_publication_path(staged_path, destination)
+                    published.append(target_length)
+            except BaseException as publication_error:
+                rollback_errors: list[str] = []
+                for target_length in reversed(published):
+                    destination = destinations[target_length]
+                    try:
+                        destination.unlink(missing_ok=True)
+                    except Exception as exc:
+                        rollback_errors.append(f"remove {destination}: {exc}")
+                for target_length, backup in reversed(tuple(backups.items())):
+                    try:
+                        _replace_publication_path(
+                            backup, destinations[target_length]
+                        )
+                    except Exception as exc:
+                        rollback_errors.append(
+                            f"restore {destinations[target_length]}: {exc}"
+                        )
+                if rollback_errors:
+                    rollback_incomplete = True
+                    raise RuntimeError(
+                        f"[{publication_key}] bucket publication failed and rollback "
+                        f"was incomplete; recovery files remain in {transaction_root}: "
+                        f"{'; '.join(rollback_errors)}"
+                    ) from publication_error
+                raise
+    finally:
+        if not rollback_incomplete:
+            shutil.rmtree(transaction_root)
+
+    return stats
+
+
+def publish_outputs(
+    repo: str,
+    packed_by_length: dict[int, Path],
+    target_lengths: Sequence[int] | None = None,
+) -> dict[str, dict]:
+    all_lengths = set(packed_by_length if target_lengths is None else target_lengths)
+    try:
+        return publish_bucket_outputs_atomically(
+            repo,
+            packed_by_length,
+            output_root=OUTPUT_ROOT,
+            filename=f"{repo}.parquet",
+            remove_lengths=sorted(all_lengths - set(packed_by_length)),
+        )
+    except RepoFailure:
+        raise
+    except Exception as exc:
+        raise RepoFailure(
+            repo,
+            "publish",
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def append_output(repo: str, packed: Path, target_length: int) -> dict:
+    """Publish one packed parquet through the atomic bucket publisher."""
+    return publish_outputs(repo, {target_length: packed})[str(target_length)]
 
 
 def _parquet_stats(path: Path, target_length: int) -> dict:
@@ -1147,11 +1301,11 @@ def process_one_repo(
             raise RepoFailure(repo, "route_by_fit", f"no docs routed for {repo}")
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-        per_length: dict[str, dict] = {}
         started = time.monotonic()
+        packed_by_length: dict[int, Path] = {}
         for L, route_parquet in sorted(routed.items()):
-            packed = stage_pack(repo, route_parquet, L, work)
-            per_length[str(L)] = append_output(repo, packed, L)
+            packed_by_length[L] = stage_pack(repo, route_parquet, L, work)
+        per_length = publish_outputs(repo, packed_by_length, lengths_sorted)
         timings["pack_s"] = round(time.monotonic() - started, 6)
         if promote_dedup_on_success:
             timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
@@ -1207,11 +1361,11 @@ def process_one_commit_source(
             raise RepoFailure(key, "route_by_fit", f"no docs routed for {key}")
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-        per_length: dict[str, dict] = {}
         started = time.monotonic()
+        packed_by_length: dict[int, Path] = {}
         for L, route_parquet in sorted(routed.items()):
-            packed = stage_pack(key, route_parquet, L, work)
-            per_length[str(L)] = append_output(key, packed, L)
+            packed_by_length[L] = stage_pack(key, route_parquet, L, work)
+        per_length = publish_outputs(key, packed_by_length, lengths_sorted)
         timings["pack_s"] = round(time.monotonic() - started, 6)
         timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
         promoted = True
@@ -1393,6 +1547,7 @@ def main(argv: list[str]) -> int:
             continue
         if args.max_repos is not None and processed >= args.max_repos:
             break
+        manifest.mark_started(manifest_key)
         try:
             info = process_one_commit_source(
                 key, files, target_lengths, work_root,
@@ -1448,6 +1603,7 @@ def main(argv: list[str]) -> int:
         )
         try:
             for repo, repo_dir in gen:
+                manifest.mark_started(repo)
                 try:
                     try:
                         project_id = (

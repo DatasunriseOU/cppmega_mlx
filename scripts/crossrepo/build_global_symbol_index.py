@@ -58,10 +58,11 @@ import sys
 import tarfile
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 # --------------------------------------------------------------------------- #
 # Locate the indexer module so we reuse its libclang parse helpers verbatim.
@@ -216,6 +217,7 @@ MAX_FILES_PER_LIB_DEFAULT = 60_000       # cap files indexed per base-lib
 MAX_BYTES_PER_FILE = 500_000             # mirror index_project's per-file cap
 PARSE_TIMEOUT_S = 60                      # per-file libclang timeout
 PROGRESS_EVERY = 2000
+SYMBOL_BATCH_SIZE = 5000
 
 # A2 std/libc: index ONLY symbols declared in headers (public surface). For std
 # the public headers are the libstdc++ <bits/...>/<...> includes + libc++'s; for
@@ -236,27 +238,9 @@ _INTERNAL_QNAME_SEG = re.compile(
     r"(^|::)(detail|internal|impl|_internal|__detail|__internal)(::|$)", re.IGNORECASE
 )
 _RESERVED_LEADING = re.compile(r"(^|::)(_[A-Z]|__)")  # __foo / _Foo reserved names
-_INLINE_NAMESPACE_SEGMENTS = {
-    "__1",
-    "__2",
-    "__3",
-    "__cxx11",
-}
-
-
 def normalize_inline_namespace_qname(qname: str) -> str:
-    """Canonicalize common C++ inline ABI namespaces in qualified names.
-
-    libstdc++/libc++ expose public symbols through inline implementation
-    namespaces such as ``std::__1`` or ``std::__cxx11``.  The cross-repo lookup
-    should index those under the stable public spelling so callers resolving
-    ``std::basic_string`` or ``std::vector`` do not miss them because of a
-    library-specific ABI namespace.
-    """
-    if not qname:
-        return qname
-    parts = [part for part in qname.split("::") if part not in _INLINE_NAMESPACE_SEGMENTS]
-    return "::".join(parts)
+    """Use the indexer's exact, std-only inline-namespace normalization."""
+    return ip.normalize_inline_namespace_qname(qname)
 
 
 def _is_public_header_path(rel_file: str) -> bool:
@@ -840,6 +824,74 @@ class GlobalSymbolStore:
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     # ---- write path (builder) ----
+    def _delete_orphaned_identities(self) -> None:
+        self.conn.execute(
+            "DELETE FROM symbol_identities WHERE NOT EXISTS ("
+            "SELECT 1 FROM symbols "
+            "WHERE symbols.symbol_id=symbol_identities.symbol_id "
+            "AND symbols.symbol_key=symbol_identities.symbol_key)"
+        )
+
+    def invalidate_lib(
+        self,
+        lib: str,
+        tier: str,
+        subtrees: Sequence[str],
+    ) -> None:
+        """Durably remove a stale generation before attempting a rebuild."""
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                f"[{lib}] cannot invalidate a library inside an open transaction"
+            )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("DELETE FROM symbols WHERE base_lib=?", (lib,))
+            self._delete_orphaned_identities()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO symbol_index_libs "
+                "(lib, tier, done, n_files, n_funcs, n_types, n_errors, elapsed_s, "
+                " subtrees, finished_utc) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (lib, tier, 0, 0, 0, 0, 0, 0.0, ",".join(subtrees), ""),
+            )
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    @contextmanager
+    def rebuild_lib(
+        self,
+        lib: str,
+        tier: str,
+        subtrees: Sequence[str],
+    ) -> Iterator[None]:
+        """Publish one library as one transaction, with durable invalidation.
+
+        The old completed generation is invalidated before parsing starts. A
+        crash or parse failure therefore cannot leave stale ``done=1`` state,
+        and every symbol inserted during the attempted rebuild rolls back.
+        """
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                f"[{lib}] cannot start atomic rebuild inside an open transaction"
+            )
+        self.invalidate_lib(lib, tier, subtrees)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            row = self.conn.execute(
+                "SELECT done, n_errors FROM symbol_index_libs WHERE lib=?", (lib,)
+            ).fetchone()
+            if row is None or int(row[0]) != 1 or int(row[1]) != 0:
+                raise RuntimeError(
+                    f"[{lib}] atomic rebuild ended without a clean done record"
+                )
+            self._delete_orphaned_identities()
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+
     def lib_done(self, lib: str) -> bool:
         row = self.conn.execute(
             "SELECT done FROM symbol_index_libs WHERE lib=?", (lib,)
@@ -899,6 +951,14 @@ class GlobalSymbolStore:
     def mark_lib_done(self, lib: str, tier: str, *, n_files: int, n_funcs: int,
                       n_types: int, n_errors: int, elapsed_s: float,
                       subtrees: list[str]) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError(
+                f"[{lib}] done state must be written inside an atomic rebuild"
+            )
+        if n_errors:
+            raise RuntimeError(
+                f"[{lib}] refusing to mark done after {n_errors} parse errors"
+            )
         self.conn.execute(
             "INSERT OR REPLACE INTO symbol_index_libs "
             "(lib, tier, done, n_files, n_funcs, n_types, n_errors, elapsed_s, "
@@ -906,7 +966,6 @@ class GlobalSymbolStore:
             (lib, tier, 1, n_files, n_funcs, n_types, n_errors, elapsed_s,
              ",".join(subtrees), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
         )
-        self.conn.commit()
 
     def commit(self) -> None:
         self.conn.commit()
@@ -1680,6 +1739,104 @@ def _parse_file_worker(args_tuple):
     )
 
 
+class ParseWorkerTimeout(RuntimeError):
+    """A per-file parse worker exceeded its wall-clock deadline."""
+
+
+def _abort_process_pool(executor: ProcessPoolExecutor) -> None:
+    """Stop running workers before waiting for executor shutdown."""
+    process_map = getattr(executor, "_processes", None)
+    processes = tuple(process_map.values()) if process_map else ()
+    for process in processes:
+        try:
+            if process.is_alive():
+                process.terminate()
+        except (OSError, ValueError):
+            continue
+    for process in processes:
+        try:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.0)
+        except (OSError, ValueError):
+            continue
+    executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _iter_parse_results(
+    tasks: Iterable[tuple[str, str, tuple]],
+    *,
+    workers: int,
+    timeout_s: float,
+    worker_fn: Callable[[tuple], tuple[list[dict], list[dict]]] = _parse_file_worker,
+) -> Iterator[tuple[str, str, tuple[list[dict], list[dict]]]]:
+    """Run a bounded set of parse workers with a deadline per submitted file."""
+    if timeout_s <= 0:
+        raise ValueError(f"parse worker timeout must be positive, got {timeout_s}")
+
+    executor = ProcessPoolExecutor(max_workers=max(1, workers))
+    task_iter = iter(tasks)
+    pending: dict[Future, tuple[str, str, float]] = {}
+    exhausted = False
+    aborted = False
+
+    def submit_one() -> None:
+        nonlocal exhausted
+        if exhausted:
+            return
+        try:
+            filepath, project_id, worker_args = next(task_iter)
+        except StopIteration:
+            exhausted = True
+            return
+        future = executor.submit(worker_fn, worker_args)
+        pending[future] = (filepath, project_id, time.monotonic())
+
+    try:
+        for _ in range(max(1, workers)):
+            submit_one()
+        while pending:
+            now = time.monotonic()
+            future, (filepath, _project_id, started) = min(
+                pending.items(), key=lambda item: item[1][2]
+            )
+            remaining = started + timeout_s - now
+            if remaining <= 0 and not future.done():
+                raise ParseWorkerTimeout(
+                    f"parse worker timed out after {timeout_s:g}s for {filepath}"
+                )
+            done, _ = wait(
+                pending,
+                timeout=max(0.0, remaining),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                raise ParseWorkerTimeout(
+                    f"parse worker timed out after {timeout_s:g}s for {filepath}"
+                )
+            for completed in sorted(done, key=lambda item: pending[item][0]):
+                completed_filepath, completed_project, _started = pending.pop(completed)
+                try:
+                    result = completed.result()
+                except ip.SymbolIdentityError:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"parse worker failed for {completed_filepath}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                submit_one()
+                yield completed_filepath, completed_project, result
+    except BaseException:
+        aborted = True
+        _abort_process_pool(executor)
+        raise
+    finally:
+        if not aborted:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
 @dataclass
 class LibResult:
     lib: str
@@ -1725,9 +1882,16 @@ def _discover_include_dirs(dest: Path, subtrees: list[str]) -> list[str]:
     return out
 
 
-def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStore,
-                       *, workers: int, std_arg: str) -> LibResult:
-    """Parse an ALREADY-EXTRACTED base-lib dir and store its public symbols."""
+def _index_lib_from_dir_uncommitted(
+    lib: str,
+    spec: dict,
+    dest: Path,
+    store: GlobalSymbolStore,
+    *,
+    workers: int,
+    std_arg: str,
+) -> LibResult:
+    """Parse an extracted base-lib inside the caller's SQLite transaction."""
     t0 = time.time()
     subtrees = spec["subtrees"]
     tier = spec["tier"]
@@ -1799,10 +1963,9 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
               file=sys.stderr, flush=True)
 
     batch: list[GlobalSymbolRecord] = []
-    BATCH_COMMIT = 5000
     parsed = 0
-    with ProcessPoolExecutor(max_workers=max(1, workers)) as ex:
-        futures = {}
+
+    def parse_tasks() -> Iterator[tuple[str, str, tuple]]:
         for fp in cpp_files:
             relative = os.path.relpath(fp, project_dir)
             subtree = relative.split(os.sep, 1)[0]
@@ -1811,8 +1974,9 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                     f"[{lib}] parsed file is outside configured subtrees: {relative!r}"
                 )
             project_id = project_identity_for_subtree(subtree)
-            future = ex.submit(
-                _parse_file_worker,
+            yield (
+                fp,
+                project_id,
                 (
                     fp,
                     project_dir,
@@ -1823,19 +1987,12 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                     lib_env,
                 ),
             )
-            futures[future] = (fp, project_id)
-        for fut in as_completed(futures):
-            fp, base_repo = futures[fut]
-            try:
-                func_dicts, type_dicts = fut.result(timeout=PARSE_TIMEOUT_S * 4)
-            except TimeoutError:
-                res.n_errors += 1
-                continue
-            except ip.SymbolIdentityError:
-                raise
-            except Exception:
-                res.n_errors += 1
-                continue
+
+    parse_results = _iter_parse_results(
+        parse_tasks(), workers=workers, timeout_s=PARSE_TIMEOUT_S
+    )
+    try:
+        for _fp, base_repo, (func_dicts, type_dicts) in parse_results:
             for d in func_dicts:
                 qn = normalize_inline_namespace_qname(d["qualified_name"])
                 frel = d["file"]
@@ -1915,17 +2072,17 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 ))
                 res.n_types += 1
             parsed += 1
-            if len(batch) >= BATCH_COMMIT:
+            if len(batch) >= SYMBOL_BATCH_SIZE:
                 store.insert_symbols(batch)
-                store.commit()
                 batch = []
             if parsed % PROGRESS_EVERY == 0:
                 print(f"    [{lib}] parsed {parsed}/{res.n_files} files, "
                       f"{res.n_funcs} funcs / {res.n_types} types, "
                       f"{res.n_errors} errors", file=sys.stderr, flush=True)
+    finally:
+        parse_results.close()
     if batch:
         store.insert_symbols(batch)
-        store.commit()
 
     # Fail-loud guard for the std-type path (CLAUDE.md RULE #1): when a lib is
     # configured to capture system (std::) TYPES, parsing files but extracting
@@ -1943,6 +2100,38 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
 
     res.elapsed_s = time.time() - t0
     return res
+
+
+def index_lib_from_dir(
+    lib: str,
+    spec: dict,
+    dest: Path,
+    store: GlobalSymbolStore,
+    *,
+    workers: int,
+    std_arg: str,
+) -> LibResult:
+    """Atomically replace one base-lib generation and mark it complete."""
+    with store.rebuild_lib(lib, spec["tier"], spec["subtrees"]):
+        result = _index_lib_from_dir_uncommitted(
+            lib,
+            spec,
+            dest,
+            store,
+            workers=workers,
+            std_arg=std_arg,
+        )
+        store.mark_lib_done(
+            lib,
+            spec["tier"],
+            n_files=result.n_files,
+            n_funcs=result.n_funcs,
+            n_types=result.n_types,
+            n_errors=result.n_errors,
+            elapsed_s=result.elapsed_s,
+            subtrees=result.subtrees,
+        )
+    return result
 
 
 def index_one_lib(lib: str, spec: dict, tarball: Path, store: GlobalSymbolStore,
@@ -2058,14 +2247,15 @@ def main(argv: list[str]) -> int:
         store.close()
         return 0
 
+    # Invalidate every selected generation before extraction starts. A tar/cache
+    # failure must not leave an older generation marked complete for this run.
+    for lib in todo:
+        spec = BASE_LIBS[lib]
+        store.invalidate_lib(lib, spec["tier"], spec["subtrees"])
+
     results: list[LibResult] = []
 
-    def _finish(lib: str, spec: dict, res: LibResult) -> None:
-        store.mark_lib_done(
-            lib, spec["tier"], n_files=res.n_files, n_funcs=res.n_funcs,
-            n_types=res.n_types, n_errors=res.n_errors, elapsed_s=res.elapsed_s,
-            subtrees=res.subtrees,
-        )
+    def _finish(lib: str, _spec: dict, res: LibResult) -> None:
         results.append(res)
         print(f"  DONE {lib}: files={res.n_files} funcs={res.n_funcs} "
               f"types={res.n_types} errors={res.n_errors} "

@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,12 @@ MLX_ROOT = Path(__file__).resolve().parents[1]
 for p in (MLX_ROOT / "tools" / "clang_indexer", MLX_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
+
+
+def _sleeping_parse_worker(args: tuple[float]):
+    (delay_s,) = args
+    time.sleep(delay_s)
+    return [], []
 
 
 def _load_index_project():
@@ -312,6 +319,97 @@ def test_is_public_symbol_filters():
         b.normalize_inline_namespace_qname("std::__cxx11::basic_string::size")
         == "std::basic_string::size"
     )
+    assert b.normalize_inline_namespace_qname("boost::__1::route") == (
+        "boost::__1::route"
+    )
+
+
+def test_global_symbol_rebuild_rolls_back_late_parse_failure(
+    tmp_path,
+    monkeypatch,
+):
+    b = _load_builder()
+    store = b.GlobalSymbolStore(str(tmp_path / "symbols.sqlite"))
+    with store.rebuild_lib("boost", "A1", ["boost"]):
+        store.mark_lib_done(
+            "boost",
+            "A1",
+            n_files=1,
+            n_funcs=0,
+            n_types=0,
+            n_errors=0,
+            elapsed_s=0.1,
+            subtrees=["boost"],
+        )
+    assert store.lib_done("boost")
+
+    source_root = tmp_path / "source"
+    source_file = source_root / "boost" / "route.hpp"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("namespace boost { int route(int); }\n")
+    monkeypatch.setattr(b.ip, "find_cpp_files", lambda _root: [str(source_file)])
+    monkeypatch.setattr(b, "SYMBOL_BATCH_SIZE", 1)
+
+    def late_failure(tasks, **_kwargs):
+        filepath, project_id, _worker_args = next(iter(tasks))
+        qname = "boost::route"
+        signature = "display=route(int)|type=int (int)"
+        symbol_key = b.ip.canonical_symbol_identity(
+            qname=qname,
+            kind="FUNCTION_DECL",
+            canonical_signature=signature,
+            project=project_id,
+            file="boost/route.hpp",
+        )
+        yield filepath, project_id, (
+            [
+                {
+                    "qualified_name": qname,
+                    "file": "boost/route.hpp",
+                    "line": 1,
+                    "end_line": 1,
+                    "text": "int route(int value) { return value + 1; }",
+                    "symbol_key": symbol_key,
+                    "usr": "",
+                    "canonical_signature": signature,
+                    "symbol_kind": "FUNCTION_DECL",
+                }
+            ],
+            [],
+        )
+        raise RuntimeError("late parse failure")
+
+    monkeypatch.setattr(b, "_iter_parse_results", late_failure)
+    with pytest.raises(RuntimeError, match="late parse failure"):
+        b.index_lib_from_dir(
+            "boost",
+            b.BASE_LIBS["boost"],
+            source_root,
+            store,
+            workers=1,
+            std_arg="-std=c++17",
+        )
+
+    assert not store.lib_done("boost")
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE base_lib='boost'"
+    ).fetchone()[0] == 0
+    store.close()
+
+
+def test_parse_worker_timeout_is_real_wall_clock():
+    b = _load_builder()
+    started = time.monotonic()
+    with pytest.raises(b.ParseWorkerTimeout, match="slow.cpp"):
+        list(
+            b._iter_parse_results(
+                [("slow.cpp", "owner/repo", (30.0,))],
+                workers=1,
+                timeout_s=0.2,
+                worker_fn=_sleeping_parse_worker,
+            )
+        )
+    assert time.monotonic() - started < 8.0
 
 
 def test_crosslink_budget_bounds():

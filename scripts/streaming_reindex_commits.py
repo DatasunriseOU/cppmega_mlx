@@ -460,22 +460,51 @@ def recompress_zstd_max(path: Path) -> None:
         compression_level=ZSTD_LEVEL,
     )
     try:
-        for row_group_index in range(pf.num_row_groups):
-            writer.write_table(pf.read_row_group(row_group_index))
-    finally:
-        writer.close()
-        release_arrow_unused()
+        try:
+            for row_group_index in range(pf.num_row_groups):
+                writer.write_table(pf.read_row_group(row_group_index))
+        finally:
+            writer.close()
+            release_arrow_unused()
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(path)
 
 
+def publish_range_outputs(
+    repo: str,
+    start_idx: int,
+    packed_by_length: dict[int, Path],
+    target_lengths: Sequence[int] | None = None,
+) -> dict[str, dict]:
+    rkey = range_key(repo, start_idx)
+    all_lengths = set(packed_by_length if target_lengths is None else target_lengths)
+    try:
+        return sr.publish_bucket_outputs_atomically(
+            rkey,
+            packed_by_length,
+            output_root=COMMIT_OUTPUT_ROOT,
+            filename=f"{repo}_r{start_idx}.parquet",
+            prepare_staged=recompress_zstd_max,
+            stats_reader=_parquet_stats,
+            remove_lengths=sorted(all_lengths - set(packed_by_length)),
+        )
+    except RepoFailure:
+        raise
+    except Exception as exc:
+        raise RepoFailure(
+            rkey,
+            "publish",
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
 def append_range_output(repo: str, start_idx: int, packed: Path, target_length: int) -> dict:
-    """Place packed parquet at outputs/reindexed_commits/<L>/<repo>_r<start>.parquet (zstd-max)."""
-    out_dir = COMMIT_OUTPUT_ROOT / str(target_length)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / f"{repo}_r{start_idx}.parquet"
-    shutil.copyfile(packed, dest)
-    recompress_zstd_max(dest)
-    return _parquet_stats(dest, target_length)
+    """Publish one range parquet through the atomic bucket publisher."""
+    return publish_range_outputs(repo, start_idx, {target_length: packed})[
+        str(target_length)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -561,11 +590,13 @@ def process_range(
             )
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-        per_length: dict[str, dict] = {}
         started = time.monotonic()
+        packed_by_length: dict[int, Path] = {}
         for L, route_parquet in sorted(routed.items()):
-            packed = stage_pack(rkey, route_parquet, L, rwork)
-            per_length[str(L)] = append_range_output(repo, start_idx, packed, L)
+            packed_by_length[L] = stage_pack(rkey, route_parquet, L, rwork)
+        per_length = publish_range_outputs(
+            repo, start_idx, packed_by_length, lengths_sorted
+        )
         timings["pack_s"] = round(time.monotonic() - started, 6)
         if dedup_db is not None and stage_id is not None:
             if defer_promote:
@@ -651,6 +682,10 @@ def process_one_repo(
     deleted immediately after extraction; ``_src`` is kept until all ranges
     finish (process_commits needs it), then the whole repo work dir is removed.
     """
+    with manifest_lock:
+        manifest.mark_started(f"{repo}::repo")
+        if not resume:
+            manifest.mark_started_prefix(f"{repo}::r")
     repo_work = work_root / repo
     repo_work.mkdir(parents=True, exist_ok=True)
     smallest = lengths_sorted[0]
@@ -683,6 +718,8 @@ def process_one_repo(
             if resume and manifest.is_done(rkey):
                 _log(f"SKIP (done) {rkey}")
                 continue
+            with manifest_lock:
+                manifest.mark_started(rkey)
             fut = pool.submit(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
@@ -811,7 +848,6 @@ def main(argv: list[str]) -> int:
     if not target_lengths:
         raise SystemExit("--target-lengths produced no lengths")
     lengths_sorted = tuple(target_lengths)
-    smallest = lengths_sorted[0]
     workers = max(1, int(args.workers or 1))
 
     for path in (VENV_PYTHON, EXTRACT_GIT, sr.PROCESS_COMMITS,
