@@ -580,7 +580,7 @@ function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: 
         id: addNodeName,
         type: "residual_add",
         position: { x: 0, y: 0 },
-        data: { kind: "residual_add", params: {} } as any,
+        data: { kind: "residual", params: {} } as any,
       });
       
       branchNames.forEach((name) => {
@@ -618,7 +618,7 @@ function presetSpecsToNodes(specs: BrickSpec[], canvasWidth?: number): { nodes: 
           id: addNodeName,
           type: "residual_add",
           position: { x: 0, y: 0 },
-          data: { kind: "residual_add", params: {} } as any,
+          data: { kind: "residual", params: {} } as any,
         });
         
         edges.push({
@@ -1658,7 +1658,7 @@ export function App(): JSX.Element {
             id: addNodeName,
             type: "residual_add",
             position: { x, y },
-            data: { kind: "residual_add", params: {} } as any,
+            data: { kind: "residual", params: {} } as any,
           });
           
           newEdges.push({

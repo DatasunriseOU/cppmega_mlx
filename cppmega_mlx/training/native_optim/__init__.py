@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import mlx.core as _mlx_core  # noqa: F401 - loads the matching MLX dylib first.
+
 try:
     from cppmega_mlx.training.native_optim._ext import (  # type: ignore[attr-defined]
         fused_adam8bit_step,
