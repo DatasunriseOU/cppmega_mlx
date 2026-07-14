@@ -34,41 +34,50 @@ def test_parse_batch_size_rejects_invalid_worker_count():
         index_project.compute_parse_batch_size(100, 0)
 
 
-def test_parse_batch_results_bound_in_flight_futures_without_losing_batches(
-    monkeypatch,
-):
+def test_parse_batch_results_bound_in_flight_futures_without_losing_batches():
     import index_project
 
-    submitted: list[Future] = []
-    completed: list[Future] = []
     batches = [f"batch-{index}" for index in range(7)]
 
+    class TrackingFuture(Future):
+        def __init__(self, executor):
+            super().__init__()
+            self.executor = executor
+            self.consumed = False
+
+        def result(self, timeout=None):
+            value = super().result(timeout)
+            if not self.consumed:
+                self.consumed = True
+                self.executor.outstanding -= 1
+            return value
+
     class FakeExecutor:
+        def __init__(self):
+            self.submitted = 0
+            self.outstanding = 0
+            self.max_outstanding = 0
+
         def submit(self, _fn, batch):
-            future: Future = Future()
+            future = TrackingFuture(self)
+            self.submitted += 1
+            self.outstanding += 1
+            self.max_outstanding = max(self.max_outstanding, self.outstanding)
             future.set_result(batch)
-            submitted.append(future)
             return future
 
-    def fake_as_completed(futures):
-        snapshot = list(futures)
-        assert 0 < len(snapshot) <= 2
-        selected = snapshot[-1]
-        completed.append(selected)
-        return iter([selected])
-
-    monkeypatch.setattr(index_project, "as_completed", fake_as_completed)
-
+    executor = FakeExecutor()
     results = list(
         index_project._iter_parse_batch_results(
-            FakeExecutor(),
+            executor,
             batches,
             max_in_flight=2,
         )
     )
 
-    assert len(submitted) == len(batches)
-    assert len(completed) == len(batches)
+    assert executor.submitted == len(batches)
+    assert executor.max_outstanding == 2
+    assert executor.outstanding == 0
     assert sorted(results) == batches
 
 
