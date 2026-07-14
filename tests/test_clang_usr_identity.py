@@ -124,9 +124,50 @@ def test_fallback_identity_and_symbol_ids_separate_qnames_and_overloads() -> Non
     assert all(0 < symbol_id <= 0xFFFFFFFFFFFFFFFF for symbol_id in symbol_ids)
 
 
-def _fallback_cursor(path: Path, *, storage: str = "NONE", parent_kind: str = "NAMESPACE"):
-    type_info = SimpleNamespace(spelling="int (int)", get_canonical=lambda: type_info)
-    result_info = SimpleNamespace(spelling="int", get_canonical=lambda: result_info)
+def test_strong_usr_and_signature_identity_ids_remain_stable() -> None:
+    usr_key = ip.canonical_symbol_identity(
+        qname="api::route",
+        kind="FUNCTION_DECL",
+        usr="c:@N@api@F@route#I#",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo",
+        file="one.cpp",
+        line=7,
+    )
+    signature_key = ip.canonical_symbol_identity(
+        qname="api::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        file="../sdk/route.hpp",
+        line=7,
+    )
+
+    assert usr_key == (
+        "usr:schema=v3\x1fproject=owner/repo\x1fusr=c:@N@api@F@route#I#"
+    )
+    assert ip._compute_symbol_id(usr_key) == 9970187544792576286
+    assert signature_key == (
+        "fallback:schema=v3\x1fqname=api::route\x1fkind=FUNCTION_DECL\x1f"
+        "sig=display=route(int)|type=int (int)"
+    )
+    assert ip._compute_symbol_id(signature_key) == 8106072181455702189
+
+
+def _fallback_cursor(
+    path: Path,
+    *,
+    storage: str = "NONE",
+    parent_kind: str = "NAMESPACE",
+    with_signature: bool = True,
+):
+    type_info = SimpleNamespace(
+        spelling="int (int)" if with_signature else "",
+        get_canonical=lambda: type_info,
+    )
+    result_info = SimpleNamespace(
+        spelling="int" if with_signature else "",
+        get_canonical=lambda: result_info,
+    )
     parent = SimpleNamespace(
         kind=SimpleNamespace(name=parent_kind),
         spelling="api" if parent_kind == "NAMESPACE" else "caller",
@@ -135,17 +176,23 @@ def _fallback_cursor(path: Path, *, storage: str = "NONE", parent_kind: str = "N
     return SimpleNamespace(
         kind=SimpleNamespace(name="FUNCTION_DECL"),
         spelling="route",
-        displayname="route(int)",
+        displayname="route(int)" if with_signature else "",
         semantic_parent=parent,
         lexical_parent=parent,
-        location=SimpleNamespace(file=SimpleNamespace(name=str(path)), line=7),
+        location=SimpleNamespace(
+            file=SimpleNamespace(name=str(path)),
+            line=7,
+            column=4,
+        ),
         linkage=SimpleNamespace(name="EXTERNAL"),
         storage_class=SimpleNamespace(name=storage),
         type=type_info,
         result_type=result_info,
         get_arguments=lambda: [],
         get_usr=lambda: "",
-        exception_specification_kind=SimpleNamespace(name="NONE"),
+        exception_specification_kind=(
+            SimpleNamespace(name="NONE") if with_signature else None
+        ),
     )
 
 
@@ -186,6 +233,123 @@ def test_external_no_usr_fallback_is_global_but_static_and_local_are_file_scoped
     assert len(set(static_keys)) == 2
     assert len(set(local_keys)) == 2
     assert all("file=" in key for key in static_keys + local_keys)
+
+
+def test_external_without_usr_or_signature_uses_repo_file_location_identity(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+    external_a = _fallback_cursor(
+        tmp_path / "sdk-a" / "route.hpp", with_signature=False
+    )
+    external_b = _fallback_cursor(
+        tmp_path / "sdk-b" / "route.hpp", with_signature=False
+    )
+
+    external_key_a, _, _ = ip.symbol_identity_for_cursor(
+        external_a, project_dir=str(project_dir), project="owner/repo"
+    )
+    external_key_b, _, _ = ip.symbol_identity_for_cursor(
+        external_b, project_dir=str(project_dir), project="owner/repo"
+    )
+
+    assert external_key_a != external_key_b
+
+
+def test_repo_file_location_identity_is_checkout_independent_and_normalized(
+    tmp_path: Path,
+) -> None:
+    checkout_a = tmp_path / "checkout-a" / "repo"
+    checkout_b = tmp_path / "checkout-b" / "repo"
+    cursor_a = _fallback_cursor(
+        checkout_a / "include" / "route.hpp", with_signature=False
+    )
+    cursor_b = _fallback_cursor(
+        checkout_b / "include" / "route.hpp", with_signature=False
+    )
+    cursor_other_line = _fallback_cursor(
+        checkout_b / "include" / "route.hpp", with_signature=False
+    )
+    cursor_other_line.location.line = 8
+    cursor_other_column = _fallback_cursor(
+        checkout_b / "include" / "route.hpp", with_signature=False
+    )
+    cursor_other_column.location.column = 9
+
+    key_a = ip.symbol_identity_for_cursor(
+        cursor_a, project_dir=str(checkout_a), project="owner/repo"
+    )[0]
+    key_b = ip.symbol_identity_for_cursor(
+        cursor_b, project_dir=str(checkout_b), project="owner/repo"
+    )[0]
+    key_other_line = ip.symbol_identity_for_cursor(
+        cursor_other_line,
+        project_dir=str(checkout_b),
+        project="owner/repo",
+    )[0]
+    key_other_column = ip.symbol_identity_for_cursor(
+        cursor_other_column,
+        project_dir=str(checkout_b),
+        project="owner/repo",
+    )[0]
+    windows_key = ip.symbol_identity_for_cursor(
+        _fallback_cursor(
+            Path(r"C:\checkout\repo\include\route.hpp"),
+            with_signature=False,
+        ),
+        project_dir=r"C:\checkout\repo",
+        project="owner/repo",
+    )[0]
+
+    assert key_a == key_b == windows_key
+    assert key_a != key_other_line
+    assert key_a != key_other_column
+    assert key_a.startswith("repo_file_location:")
+    assert "project=owner/repo" in key_a
+    assert "file=include/route.hpp" in key_a
+    assert "line=7" in key_a
+    assert "column=4" in key_a
+    assert str(tmp_path) not in key_a
+    assert "\\" not in key_a
+
+
+def test_usr_extraction_error_fails_loud(tmp_path: Path) -> None:
+    cursor = _fallback_cursor(tmp_path / "repo" / "route.hpp", with_signature=False)
+
+    def raise_usr_error():
+        raise RuntimeError("synthetic get_usr failure")
+
+    cursor.get_usr = raise_usr_error
+
+    with pytest.raises(ip.SymbolIdentityError, match="clang USR extraction failed"):
+        ip.symbol_identity_for_cursor(
+            cursor,
+            project_dir=str(tmp_path / "repo"),
+            project="owner/repo",
+        )
+
+
+def test_canonical_signature_extraction_error_fails_loud(tmp_path: Path) -> None:
+    cursor = _fallback_cursor(tmp_path / "repo" / "route.hpp")
+
+    def raise_canonical_error():
+        raise RuntimeError("synthetic canonical type failure")
+
+    cursor.type = SimpleNamespace(
+        spelling="int (int)",
+        get_canonical=raise_canonical_error,
+    )
+
+    with pytest.raises(
+        ip.SymbolIdentityError,
+        match="clang canonical signature extraction failed",
+    ):
+        ip.symbol_identity_for_cursor(
+            cursor,
+            project_dir=str(tmp_path / "repo"),
+            project="owner/repo",
+        )
 
 
 def test_corpus_registry_fails_closed_on_cross_project_symbol_id_collision() -> None:

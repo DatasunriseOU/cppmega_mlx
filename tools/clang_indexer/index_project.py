@@ -32,6 +32,7 @@ import glob
 import importlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -857,8 +858,8 @@ def _cursor_usr(cursor: Cursor) -> str:
         usr = str(get_usr() or "")
     except SymbolIdentityError:
         raise
-    except Exception:
-        return ""
+    except Exception as exc:
+        raise SymbolIdentityError("clang USR extraction failed") from exc
     # Clang can surface empty/placeholder USRs for unexposed/local constructs.
     if not usr or usr.startswith("<") or "invalid" in usr.lower():
         return ""
@@ -867,6 +868,17 @@ def _cursor_usr(cursor: Cursor) -> str:
 
 def _cursor_canonical_signature(cursor: Cursor) -> str:
     """Return a stable, clang-derived signature string for identity fallback."""
+    try:
+        return _cursor_canonical_signature_unchecked(cursor)
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        raise SymbolIdentityError(
+            "clang canonical signature extraction failed"
+        ) from exc
+
+
+def _cursor_canonical_signature_unchecked(cursor: Cursor) -> str:
     pieces: list[str] = []
     display = _normalize_signature_text(getattr(cursor, "displayname", "") or "")
     if display:
@@ -875,12 +887,7 @@ def _cursor_canonical_signature(cursor: Cursor) -> str:
     canonical_type = cursor_type
     get_canonical = getattr(cursor_type, "get_canonical", None)
     if callable(get_canonical):
-        try:
-            canonical_type = get_canonical()
-        except SymbolIdentityError:
-            raise
-        except Exception:
-            canonical_type = cursor_type
+        canonical_type = get_canonical()
     type_spelling = _normalize_signature_text(
         getattr(canonical_type, "spelling", "")
         or getattr(cursor_type, "spelling", "")
@@ -892,12 +899,7 @@ def _cursor_canonical_signature(cursor: Cursor) -> str:
     canonical_result = result_type
     get_canonical_result = getattr(result_type, "get_canonical", None)
     if callable(get_canonical_result):
-        try:
-            canonical_result = get_canonical_result()
-        except SymbolIdentityError:
-            raise
-        except Exception:
-            canonical_result = result_type
+        canonical_result = get_canonical_result()
     result_spelling = _normalize_signature_text(
         getattr(canonical_result, "spelling", "")
         or getattr(result_type, "spelling", "")
@@ -908,24 +910,19 @@ def _cursor_canonical_signature(cursor: Cursor) -> str:
     arg_types: list[str] = []
     get_arguments = getattr(cursor, "get_arguments", None)
     if callable(get_arguments):
-        try:
-            for arg in get_arguments():
-                arg_type = getattr(arg, "type", None)
-                canonical_arg = arg_type
-                get_canonical_arg = getattr(arg_type, "get_canonical", None)
-                if callable(get_canonical_arg):
-                    canonical_arg = get_canonical_arg()
-                arg_types.append(
-                    _normalize_signature_text(
-                        getattr(canonical_arg, "spelling", "")
-                        or getattr(arg_type, "spelling", "")
-                        or ""
-                    )
+        for arg in get_arguments():
+            arg_type = getattr(arg, "type", None)
+            canonical_arg = arg_type
+            get_canonical_arg = getattr(arg_type, "get_canonical", None)
+            if callable(get_canonical_arg):
+                canonical_arg = get_canonical_arg()
+            arg_types.append(
+                _normalize_signature_text(
+                    getattr(canonical_arg, "spelling", "")
+                    or getattr(arg_type, "spelling", "")
+                    or ""
                 )
-        except SymbolIdentityError:
-            raise
-        except Exception:
-            arg_types = []
+            )
     if arg_types:
         pieces.append("args=(" + ",".join(arg_types) + ")")
     exception_kind = getattr(cursor, "exception_specification_kind", None)
@@ -962,15 +959,17 @@ def canonical_symbol_identity(
     repo: str | None = None,
     file: str | None = None,
     line: int | None = None,
+    column: int | None = None,
     force_file_scope: bool = False,
+    repo_file_location_fallback: bool = False,
 ) -> str:
     """Canonical symbol identity.
 
     Stable clang USR wins when present and is namespaced by the owning project so
-    independent repositories cannot alias. Otherwise the fallback includes the
-    normalized qualified name, kind, canonical signature, and scoped provenance
-    so namespaces, overloads, templates, file-static/local symbols, and
-    same-qname definitions in different files do not collapse.
+    independent repositories cannot alias. A canonical signature keeps the
+    existing fallback contract. Clang cursor callers can require a typed
+    repo/file/location fallback when neither is usable, preventing qname-only
+    collisions without claiming cross-repo or cross-revision authority.
     """
     normalized_kind = _normalize_signature_text(kind or "symbol")
     normalized_signature = _normalize_signature_text(canonical_signature)
@@ -988,6 +987,37 @@ def canonical_symbol_identity(
             f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
             f"{project_scope}usr={normalized_usr}"
         )
+    if repo_file_location_fallback and not normalized_signature:
+        normalized_file = _normalize_repo_relative_identity_file(file)
+        try:
+            normalized_line = int(line or 0)
+            normalized_column = int(column or 0)
+        except (TypeError, ValueError) as exc:
+            raise SymbolIdentityError(
+                "repo_file_location identity requires an integer declaration location"
+            ) from exc
+        if not normalized_file or normalized_line <= 0:
+            raise SymbolIdentityError(
+                "repo_file_location identity requires a repo-relative file and line"
+            )
+        payload = [f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}"]
+        if owning_project:
+            payload.append(f"project={owning_project}")
+        payload.extend(
+            [
+                f"file={normalized_file}",
+                f"line={normalized_line}",
+            ]
+        )
+        if normalized_column > 0:
+            payload.append(f"column={normalized_column}")
+        payload.extend(
+            [
+                f"kind={normalized_kind}",
+                f"qname={normalized_qname}",
+            ]
+        )
+        return "repo_file_location:" + "\x1f".join(payload)
     scope = _identity_scope_key(
         project=owning_project,
         file=file,
@@ -1003,6 +1033,71 @@ def canonical_symbol_identity(
     if scope:
         payload.append(f"scope={scope}")
     return "fallback:" + "\x1f".join(payload)
+
+
+_WINDOWS_ABSOLUTE_IDENTITY_PATH_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def _normalize_identity_path(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = posixpath.normpath(str(value).replace("\\", "/"))
+    if normalized == ".":
+        return ""
+    if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(normalized):
+        normalized = normalized[0].upper() + normalized[1:]
+    return normalized.removeprefix("./")
+
+
+def _is_absolute_identity_path(value: str) -> bool:
+    return posixpath.isabs(value) or bool(
+        _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(value)
+    )
+
+
+def _normalize_repo_relative_identity_file(file: str | None) -> str:
+    normalized = _normalize_identity_path(file)
+    if normalized and _is_absolute_identity_path(normalized):
+        raise SymbolIdentityError(
+            "repo_file_location identity cannot contain an absolute path"
+        )
+    return normalized
+
+
+def _cursor_repo_relative_identity_file(
+    cursor: Cursor,
+    *,
+    project_dir: str | None,
+    fallback_file: str | None,
+) -> str:
+    location = getattr(cursor, "location", None)
+    location_file = getattr(location, "file", None)
+    location_name = getattr(location_file, "name", None)
+    candidate = _normalize_identity_path(
+        str(location_name) if location_name else fallback_file
+    )
+    project_path = _normalize_identity_path(project_dir)
+    if candidate and project_path and _is_absolute_identity_path(candidate):
+        if not _is_absolute_identity_path(project_path):
+            raise SymbolIdentityError(
+                "repo_file_location identity requires an absolute project root"
+            )
+        candidate_drive = (
+            candidate[:2]
+            if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(candidate)
+            else ""
+        )
+        project_drive = (
+            project_path[:2]
+            if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(project_path)
+            else ""
+        )
+        if candidate_drive != project_drive:
+            raise SymbolIdentityError(
+                "repo_file_location identity cannot cross filesystem roots"
+            )
+        candidate = posixpath.relpath(candidate, project_path)
+    return _normalize_repo_relative_identity_file(candidate)
 
 
 def _cursor_identity_location(
@@ -1046,11 +1141,21 @@ def symbol_identity_for_cursor(
     usr = _cursor_usr(cursor)
     signature = _cursor_canonical_signature(cursor)
     file_scope = force_file_scope
-    rel_file, is_project_local = _cursor_identity_location(
-        cursor,
-        project_dir=project_dir,
-        fallback_file=fallback_file,
-    )
+    uses_repo_file_location = not usr and not signature
+    if uses_repo_file_location:
+        rel_file = _cursor_repo_relative_identity_file(
+            cursor,
+            project_dir=project_dir,
+            fallback_file=fallback_file,
+        )
+        identity_project = project or repo
+    else:
+        rel_file, is_project_local = _cursor_identity_location(
+            cursor,
+            project_dir=project_dir,
+            fallback_file=fallback_file,
+        )
+        identity_project = (project or repo) if is_project_local else None
     loc = getattr(cursor, "location", None)
     linkage = getattr(cursor, "linkage", None)
     linkage_name = getattr(linkage, "name", "") or str(linkage or "")
@@ -1074,10 +1179,12 @@ def symbol_identity_for_cursor(
         kind=_cursor_kind_name(cursor),
         usr=usr,
         canonical_signature=signature,
-        project=(project or repo) if is_project_local else None,
+        project=identity_project,
         file=rel_file,
         line=getattr(loc, "line", None),
+        column=getattr(loc, "column", None),
         force_file_scope=file_scope,
+        repo_file_location_fallback=uses_repo_file_location,
     )
     return identity_key, usr, signature
 
