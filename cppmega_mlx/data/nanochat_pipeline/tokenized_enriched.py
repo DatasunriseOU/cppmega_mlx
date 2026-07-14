@@ -11,6 +11,7 @@ from cppmega_mlx.data.domain_schema import (
     DomainKind,
     DomainRoleKind,
     ParseConfidence,
+    canonicalize_domain_edge_fields,
     delimiter_token_ids,
     domain_edge_family,
     normalize_domain_edge_record,
@@ -426,6 +427,44 @@ def _char_position_to_token_index(
     return None
 
 
+def _char_point_to_token_index(
+    token_spans: list[tuple[int, int]],
+    char_pos: int,
+    *,
+    source_length: int,
+) -> int | None:
+    """Map a source insertion point to a deterministic nonempty token.
+
+    Point anchors use the token on their right. If no right token exists,
+    including at EOF, they use the final source token on their left. This
+    represents a valid closed-range point without changing its coordinate.
+    """
+
+    char_pos = int(char_pos)
+    source_length = int(source_length)
+    if char_pos < 0 or char_pos > source_length:
+        raise ValueError(
+            f"character point {char_pos} is outside source point bounds "
+            f"[0, {source_length}]"
+        )
+
+    nonempty: list[tuple[int, int, int]] = []
+    for idx, (start, end) in enumerate(token_spans):
+        start_i = int(start)
+        end_i = int(end)
+        if end_i <= start_i:
+            continue
+        nonempty.append((idx, start_i, end_i))
+        if start_i <= char_pos < end_i:
+            return idx
+    for idx, start_i, _end_i in nonempty:
+        if start_i >= char_pos:
+            return idx
+    if nonempty:
+        return nonempty[-1][0]
+    return None
+
+
 def _remap_char_edge_triples_to_tokens(
     raw_edges: Any,
     token_spans: list[tuple[int, int]],
@@ -446,16 +485,23 @@ def _remap_char_edge_triples_to_tokens(
     if source_length is None:
         source_length = max((int(end) for _start, end in token_spans), default=0)
     for src_char, dst_char, kind in triples:
-        src = _char_position_to_token_index(
-            token_spans,
-            src_char,
-            source_length=source_length,
-        )
-        dst = _char_position_to_token_index(
-            token_spans,
-            dst_char,
-            source_length=source_length,
-        )
+        if src_char == dst_char:
+            src = dst = _char_point_to_token_index(
+                token_spans,
+                src_char,
+                source_length=source_length,
+            )
+        else:
+            src = _char_position_to_token_index(
+                token_spans,
+                src_char,
+                source_length=source_length,
+            )
+            dst = _char_position_to_token_index(
+                token_spans,
+                dst_char,
+                source_length=source_length,
+            )
         if src is None or dst is None:
             raise ValueError(
                 f"domain edge {src_char}->{dst_char} endpoint is not contained "
@@ -850,6 +896,10 @@ def materialize_tokenized_enriched_batch(
         zip(docs, token_lists, token_spans_batch)
     ):
         token_ids = [int(tok) for tok in token_ids]
+        canonical_edge_fields = canonicalize_domain_edge_fields(
+            doc,
+            source_length=len(doc.get("text", "")),
+        )
         token_structure_ids = _chars_to_tokens_structure_ids(
             doc.get("structure_ids", []),
             "",
@@ -1003,31 +1053,31 @@ def materialize_tokenized_enriched_batch(
                 token_spans,
             ),
             TOKEN_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
-                doc.get("domain_edges", []),
+                canonical_edge_fields["domain_edges"],
                 token_spans,
-                family="aggregate",
+                family="domain",
                 source_length=len(doc.get("text", "")),
             ),
             TOKEN_BUILD_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
-                doc.get("build_edges", []),
+                canonical_edge_fields["build_edges"],
                 token_spans,
                 family="build",
                 source_length=len(doc.get("text", "")),
             ),
             TOKEN_SHELL_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
-                doc.get("shell_edges", []),
+                canonical_edge_fields["shell_edges"],
                 token_spans,
                 family="shell",
                 source_length=len(doc.get("text", "")),
             ),
             TOKEN_DIAGNOSTIC_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
-                doc.get("diagnostic_edges", []),
+                canonical_edge_fields["diagnostic_edges"],
                 token_spans,
                 family="diagnostic",
                 source_length=len(doc.get("text", "")),
             ),
             TOKEN_CROSS_DOMAIN_EDGES_COLUMN: _remap_char_edge_triples_to_tokens(
-                doc.get("cross_domain_edges", []),
+                canonical_edge_fields["cross_domain_edges"],
                 token_spans,
                 family="cross_domain",
                 source_length=len(doc.get("text", "")),

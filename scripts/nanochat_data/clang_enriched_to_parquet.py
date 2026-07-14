@@ -41,6 +41,7 @@ from cppmega_mlx.data.domain_schema import (
     DOMAIN_EDGE_FIELD_FAMILIES,
     DOMAIN_SCHEMA_SHA256,
     DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    canonicalize_domain_edge_fields,
     normalize_domain_edge_record,
     remap_embedded_domain_spans,
 )
@@ -773,6 +774,10 @@ def rows_to_table(
     for row_index, (row, tokenized) in enumerate(
         zip(rows, tokenized_rows, strict=True)
     ):
+        canonical_edge_fields = canonicalize_domain_edge_fields(
+            row,
+            source_length=len(row.get("text", "")),
+        )
         identity_version = row.get("symbol_identity_schema_version")
         if identity_version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
             raise SymbolIdentityError(
@@ -889,22 +894,28 @@ def rows_to_table(
         )
         domain_confidence_ids_col.append(row.get("domain_confidence_ids", []))
         domain_edges_col.append(
-            _normalize_char_domain_edges(row.get("domain_edges", []), family="domain")
+            _normalize_char_domain_edges(
+                canonical_edge_fields["domain_edges"], family="domain"
+            )
         )
         build_edges_col.append(
-            _normalize_char_domain_edges(row.get("build_edges", []), family="build")
+            _normalize_char_domain_edges(
+                canonical_edge_fields["build_edges"], family="build"
+            )
         )
         shell_edges_col.append(
-            _normalize_char_domain_edges(row.get("shell_edges", []), family="shell")
+            _normalize_char_domain_edges(
+                canonical_edge_fields["shell_edges"], family="shell"
+            )
         )
         diagnostic_edges_col.append(
             _normalize_char_domain_edges(
-                row.get("diagnostic_edges", []), family="diagnostic"
+                canonical_edge_fields["diagnostic_edges"], family="diagnostic"
             )
         )
         cross_domain_edges_col.append(
             _normalize_char_domain_edges(
-                row.get("cross_domain_edges", []), family="cross_domain"
+                canonical_edge_fields["cross_domain_edges"], family="cross_domain"
             )
         )
         change_mask_pre_col.append(row.get("change_mask_pre", []))
@@ -1554,20 +1565,29 @@ def _remap_char_edge_triples(
     header_len: int,
     *,
     family: str,
+    source_length: int,
 ) -> list[dict]:
     remapped = []
     for src, dst, kind in (
         normalize_domain_edge_record(edge, family=family)
         for edge in raw_edges or []
     ):
-        mapped_from = _map_exact_kept_char(
-            kept_indices,
-            src,
-        )
-        mapped_to = _map_exact_kept_char(
-            kept_indices,
-            dst,
-        )
+        if src == dst:
+            if src > source_length:
+                raise ValueError(
+                    f"character point {src} is outside source point bounds "
+                    f"[0, {source_length}]"
+                )
+            mapped_from = mapped_to = bisect_left(kept_indices, src)
+        else:
+            mapped_from = _map_exact_kept_char(
+                kept_indices,
+                src,
+            )
+            mapped_to = _map_exact_kept_char(
+                kept_indices,
+                dst,
+            )
         if mapped_from is None or mapped_to is None:
             continue
         remapped.append(
@@ -1605,6 +1625,10 @@ def process_record_with_policy(
         )
 
     text = record.get("text", "")
+    record = {
+        **record,
+        **canonicalize_domain_edge_fields(record, source_length=len(text)),
+    }
     structure_ids = record.get("structure_ids", [])
     chunk_boundaries = record.get("chunk_boundaries", [])
 
@@ -1641,6 +1665,7 @@ def process_record_with_policy(
                 kept_indices,
                 header_len,
                 family=family,
+                source_length=len(text),
             )
             for name, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
         }

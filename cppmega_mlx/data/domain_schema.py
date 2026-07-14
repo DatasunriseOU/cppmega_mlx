@@ -9,6 +9,7 @@ MLX route tests, and the Megatron sidecar converter.
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
 import hashlib
@@ -204,11 +205,14 @@ VALID_DOMAIN_EDGE_KINDS = frozenset(
     kind for kind in DomainEdgeKind if kind != DomainEdgeKind.UNKNOWN
 )
 DOMAIN_EDGE_FIELD_FAMILIES: dict[str, str] = {
-    "domain_edges": "aggregate",
+    "domain_edges": "domain",
     "build_edges": "build",
     "shell_edges": "shell",
     "diagnostic_edges": "diagnostic",
     "cross_domain_edges": "cross_domain",
+}
+DOMAIN_EDGE_FAMILY_FIELDS: dict[str, str] = {
+    family: field for field, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
 }
 TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES: dict[str, str] = {
     f"token_{field}": family
@@ -299,6 +303,78 @@ def normalize_domain_edge_record(
         raise ValueError(f"domain edge endpoints must be non-negative: {src_i}->{dst_i}")
     edge_kind = validate_domain_edge_kind(int(kind), family=family)
     return src_i, dst_i, int(edge_kind)
+
+
+def canonicalize_domain_edge_fields(
+    record: Mapping[str, Any],
+    *,
+    source_length: int | None = None,
+) -> dict[str, list[dict[str, int]]]:
+    """Return family-pure character-edge fields from one enriched record.
+
+    Older producers mirrored every typed edge into ``domain_edges`` as an
+    aggregate while also writing specialized fields. The persisted graph
+    contract has one channel per edge family, so route that legacy aggregate
+    by its validated kind and coalesce only exact mirrored occurrences while
+    preserving repeated-edge multiplicity. A typed edge placed in the wrong
+    specialized field remains a hard error.
+    """
+
+    if source_length is not None:
+        source_length = int(source_length)
+        if source_length < 0:
+            raise ValueError("domain edge source_length must be non-negative")
+
+    canonical = {field: [] for field in DOMAIN_EDGE_FIELD_FAMILIES}
+    aggregate_counts: dict[str, Counter[tuple[int, int, int]]] = {
+        field: Counter() for field in DOMAIN_EDGE_FIELD_FAMILIES
+    }
+    specialized_counts: dict[str, Counter[tuple[int, int, int]]] = {
+        field: Counter() for field in DOMAIN_EDGE_FIELD_FAMILIES
+    }
+
+    for source_field, expected_family in DOMAIN_EDGE_FIELD_FAMILIES.items():
+        validation_family = (
+            "aggregate" if source_field == "domain_edges" else expected_family
+        )
+        for edge_index, edge in enumerate(record.get(source_field, []) or []):
+            try:
+                src, dst, kind = normalize_domain_edge_record(
+                    edge,
+                    family=validation_family,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{source_field}[{edge_index}]: {exc}") from exc
+            if source_length is not None:
+                if src == dst:
+                    if src > source_length:
+                        raise ValueError(
+                            f"{source_field}[{edge_index}]: character point {src} "
+                            "is outside source point bounds "
+                            f"[0, {source_length}]"
+                        )
+                elif src >= source_length or dst >= source_length:
+                    raise ValueError(
+                        f"{source_field}[{edge_index}]: character edge endpoint "
+                        f"{src}->{dst} is outside source text bounds "
+                        f"[0, {source_length})"
+                    )
+            target_family = domain_edge_family(kind)
+            target_field = DOMAIN_EDGE_FAMILY_FIELDS[target_family]
+            triple = (src, dst, kind)
+            if source_field == "domain_edges":
+                aggregate_counts[target_field][triple] += 1
+            else:
+                specialized_counts[target_field][triple] += 1
+                if (
+                    specialized_counts[target_field][triple]
+                    <= aggregate_counts[target_field][triple]
+                ):
+                    continue
+            canonical[target_field].append(
+                {"from_char": src, "to_char": dst, "kind": kind}
+            )
+    return canonical
 
 
 def normalize_embedded_domain_spans(
@@ -501,6 +577,7 @@ __all__ = [
     "DOMAIN_SCHEMA_SHA256_METADATA_KEY",
     "DOMAIN_DELIMITER_ROLES",
     "DOMAIN_EDGE_FAMILIES",
+    "DOMAIN_EDGE_FAMILY_FIELDS",
     "DOMAIN_EDGE_FIELD_FAMILIES",
     "TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES",
     "VALID_DOMAIN_EDGE_KINDS",
@@ -508,6 +585,7 @@ __all__ = [
     "DomainKind",
     "DomainRoleKind",
     "ParseConfidence",
+    "canonicalize_domain_edge_fields",
     "domain_edge_family",
     "delimiter_token_ids",
     "normalize_domain_edge_record",

@@ -779,12 +779,25 @@ def test_assembled_multifile_doc_preserves_fragment_source_identity() -> None:
     assert any("lib/second.cpp" in source for source in registry_sources)
 
 
-def test_domain_edge_route_is_canonical_aggregate_with_specialized_mirrors() -> None:
-    assert domain_schema.DOMAIN_EDGE_FIELD_FAMILIES["domain_edges"] == "aggregate"
+def test_domain_edge_routes_are_family_pure_after_legacy_aggregate_ingestion() -> None:
+    assert domain_schema.DOMAIN_EDGE_FIELD_FAMILIES["domain_edges"] == "domain"
     assert normalize_domain_edge_record(
         {"from": 0, "to": 1, "kind": int(DomainEdgeKind.BUILD_TARGET_DEP)},
         family="aggregate",
     ) == (0, 1, int(DomainEdgeKind.BUILD_TARGET_DEP))
+    build_edge = {
+        "from_char": 0,
+        "to_char": 1,
+        "kind": int(DomainEdgeKind.BUILD_TARGET_DEP),
+    }
+    canonical = domain_schema.canonicalize_domain_edge_fields(
+        {
+            "domain_edges": [build_edge, dict(build_edge)],
+            "build_edges": [dict(build_edge), dict(build_edge)],
+        }
+    )
+    assert canonical["domain_edges"] == []
+    assert canonical["build_edges"] == [build_edge, build_edge]
 
 
 def test_malformed_domain_edges_and_unknown_domain_kind_fail_closed() -> None:
