@@ -170,10 +170,14 @@ def _build_source_snapshot(
     seed: int,
     sampling_mode: str = _LEGACY_SAMPLING_MODE,
     source_batch_rows: int | None = None,
+    source_root: Path | None = None,
 ) -> tuple[dict[str, object], dict[Path, _SourceStat]]:
     paths = sorted(Path(shard).resolve() for shard in shards)
     if not paths or len(paths) != len(set(paths)):
         raise ValueError("objective source shards must be non-empty and unique")
+    canonical_root = None if source_root is None else source_root.resolve()
+    if canonical_root is not None and not canonical_root.is_dir():
+        raise ValueError(f"objective source root is not a directory: {canonical_root}")
     records: list[dict[str, object]] = []
     row_group_rows: list[list[int]] = []
     signatures: dict[Path, _SourceStat] = {}
@@ -193,9 +197,18 @@ def _build_source_snapshot(
         if rows < 1:
             raise ValueError(f"objective source parquet is empty: {path}")
         signatures[path] = after
+        if canonical_root is None:
+            canonical_path = path.as_posix()
+        else:
+            try:
+                canonical_path = path.relative_to(canonical_root).as_posix()
+            except ValueError as exc:
+                raise ValueError(
+                    f"objective source shard is outside --source-root: {path}"
+                ) from exc
         records.append(
             {
-                "path": path.as_posix(),
+                "path": canonical_path,
                 "size_bytes": after[2],
                 "sha256": digest,
                 "rows": rows,
@@ -965,6 +978,15 @@ def _materialize_stream(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-glob", required=True)
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        required=True,
+        help=(
+            "Immutable root used to record canonical relative source paths; "
+            "production bundles require code/<bucket>/... and commits/<bucket>/..."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--samples", type=int, required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
@@ -1047,6 +1069,7 @@ def main() -> int:
         seed=args.seed,
         sampling_mode=_BOUNDED_SAMPLING_MODE,
         source_batch_rows=args.source_batch_rows,
+        source_root=args.source_root,
     )
 
     mixer = EligibilityAwareTaskMixer(

@@ -13,12 +13,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import tempfile
 from typing import Any
 
+from .domain_schema import DomainEdgeKind, VALID_DOMAIN_EDGE_KINDS
 from .symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     SYMBOL_ID_MAX,
@@ -68,6 +70,10 @@ CPP_NEWLINE_SENTINEL = "<NL>"
 PAIR_ROUTE_KEYS = {
     "call": ("graph_call_edges", "graph_call_edge_counts"),
     "type": ("graph_type_edges", "graph_type_edge_counts"),
+}
+PAIR_ROUTE_EDGE_KINDS = {
+    "call": int(DomainEdgeKind.CALL),
+    "type": int(DomainEdgeKind.TYPE),
 }
 TRIPLE_ROUTE_KEYS = {
     "domain": ("graph_domain_edges", "graph_domain_edge_counts"),
@@ -1445,7 +1451,7 @@ class PromptGraphModelInputs:
             token_count=self.token_count,
         )
 
-    def dense_attention_bias(
+    def dense_relation_attention_bias(
         self,
         *,
         relation_weights: Mapping[str, float] | None = None,
@@ -1467,6 +1473,12 @@ class PromptGraphModelInputs:
                     for relation, value in relation_weights.items()
                 }
             )
+        for relation, weight in weights.items():
+            if not math.isfinite(weight):
+                raise ValueError(
+                    f"prompt graph relation {relation!r} weight must be finite, "
+                    f"got {weight}"
+                )
 
         bias = [
             [0.0 for _ in range(self.token_count)]
@@ -1503,6 +1515,145 @@ class PromptGraphModelInputs:
         ]:
             bias[int(source_token)][int(target_token)] += 1.0
         return bias
+
+    def dense_edge_kind_attention_bias(
+        self,
+        *,
+        edge_kind_weights: Mapping[int, float] | None = None,
+        default_weight: float = 1.0,
+    ) -> list[list[float]]:
+        """Return the categorical edge-kind prior independently of relations."""
+
+        default_weight = float(default_weight)
+        if not math.isfinite(default_weight):
+            raise ValueError(
+                "prompt graph edge-kind default weight must be finite, "
+                f"got {default_weight}"
+            )
+        if default_weight == 0.0:
+            raise ValueError(
+                "prompt graph edge-kind default weight must be nonzero; "
+                "zero kind priors are reserved for explicit graph-off ablation"
+            )
+        weights: dict[int, float] = {}
+        if edge_kind_weights is not None:
+            known_kinds = {int(kind) for kind in VALID_DOMAIN_EDGE_KINDS}
+            unknown = sorted(
+                set(int(kind) for kind in edge_kind_weights) - known_kinds
+            )
+            if unknown:
+                raise ValueError(
+                    f"unknown prompt graph edge-kind weights: {unknown}"
+                )
+            weights = {
+                int(kind): float(value)
+                for kind, value in edge_kind_weights.items()
+            }
+        for kind, weight in weights.items():
+            if not math.isfinite(weight):
+                raise ValueError(
+                    f"prompt graph edge kind {kind} weight must be finite, "
+                    f"got {weight}"
+                )
+            if weight == 0.0:
+                raise ValueError(
+                    f"prompt graph edge kind {kind} weight must be nonzero; "
+                    "zero kind priors are reserved for explicit graph-off ablation"
+                )
+
+        bias = [
+            [0.0 for _ in range(self.token_count)]
+            for _ in range(self.token_count)
+        ]
+        starts = [
+            int(value)
+            for value in self.graph_routes["graph_chunk_starts"]
+        ]
+        ends = [
+            int(value)
+            for value in self.graph_routes["graph_chunk_ends"]
+        ]
+        for relation, (route_key, _count_key) in PAIR_ROUTE_KEYS.items():
+            kind = PAIR_ROUTE_EDGE_KINDS[relation]
+            weight = weights.get(kind, default_weight)
+            for source_chunk, target_chunk in self.graph_routes[route_key]:
+                for query_index in range(
+                    starts[int(source_chunk)],
+                    ends[int(source_chunk)],
+                ):
+                    for key_index in range(
+                        starts[int(target_chunk)],
+                        ends[int(target_chunk)],
+                    ):
+                        bias[query_index][key_index] += weight
+        for relation, (route_key, _count_key) in TRIPLE_ROUTE_KEYS.items():
+            for source_token, target_token, kind in self.graph_routes[
+                route_key
+            ]:
+                kind = _validate_route_kind(
+                    relation,
+                    int(kind),
+                    where=(
+                        f"{route_key} triple "
+                        f"({source_token},{target_token},{kind})"
+                    ),
+                )
+                bias[int(source_token)][int(target_token)] += weights.get(
+                    kind,
+                    default_weight,
+                )
+        return bias
+
+    def edge_kind_route_counts(self) -> dict[int, int]:
+        """Return categorical route counts before token-span expansion."""
+
+        counts: dict[int, int] = {}
+        for relation, (route_key, _count_key) in PAIR_ROUTE_KEYS.items():
+            kind = PAIR_ROUTE_EDGE_KINDS[relation]
+            counts[kind] = counts.get(kind, 0) + len(
+                self.graph_routes[route_key]
+            )
+        for relation, (route_key, _count_key) in TRIPLE_ROUTE_KEYS.items():
+            for source_token, target_token, kind in self.graph_routes[
+                route_key
+            ]:
+                kind = _validate_route_kind(
+                    relation,
+                    int(kind),
+                    where=(
+                        f"{route_key} triple "
+                        f"({source_token},{target_token},{kind})"
+                    ),
+                )
+                counts[kind] = counts.get(kind, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def dense_attention_bias(
+        self,
+        *,
+        relation_weights: Mapping[str, float] | None = None,
+        edge_kind_weights: Mapping[int, float] | None = None,
+        default_edge_kind_weight: float = 1.0,
+    ) -> list[list[float]]:
+        """Return the combined relation and categorical edge-kind prior."""
+
+        relation_bias = self.dense_relation_attention_bias(
+            relation_weights=relation_weights,
+        )
+        edge_kind_bias = self.dense_edge_kind_attention_bias(
+            edge_kind_weights=edge_kind_weights,
+            default_weight=default_edge_kind_weight,
+        )
+        return [
+            [
+                relation + kind
+                for relation, kind in zip(relation_row, kind_row)
+            ]
+            for relation_row, kind_row in zip(
+                relation_bias,
+                edge_kind_bias,
+            )
+        ]
 
 
 @dataclass(frozen=True)
@@ -2972,6 +3123,7 @@ __all__ = [
     "INDEX_SCHEMA",
     "LEGACY_INDEX_SCHEMA",
     "PAIR_ROUTE_KEYS",
+    "PAIR_ROUTE_EDGE_KINDS",
     "PromptGraphArtifact",
     "PromptGraphBuilder",
     "PromptGraphChunk",

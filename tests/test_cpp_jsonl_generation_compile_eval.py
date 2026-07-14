@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import subprocess
 import sys
@@ -253,11 +254,12 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
         prompt_source_start=0,
         prompt_graph_cache_dir=tmp_path,
     )
-    side, block_bias, window_receipt = mod.prompt_model_inputs(
+    side, relation_bias, edge_kind_bias, window_receipt = mod.prompt_model_inputs(
         context,
         total_token_count=len(context.token_ids) + 1,
         window_start=0,
         window_end=len(context.token_ids) + 1,
+        bias_dtype=mx.float32,
     )
 
     assert context.graph_artifact is not None
@@ -277,12 +279,16 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     assert "src/repo_helper.cpp" in dependency_paths
     assert set(context.side_channels) == set(mod.TOKEN_SIDECAR_NAMES)
     assert all(tuple(value.shape) == (1, len(context.token_ids) + 1) for value in side.values())
-    assert tuple(block_bias.shape) == (
+    assert tuple(relation_bias.shape) == (
         1,
         len(context.token_ids) + 1,
         len(context.token_ids) + 1,
     )
-    assert float(mx.sum(block_bias).item()) > 0.0
+    assert tuple(edge_kind_bias.shape) == tuple(relation_bias.shape)
+    assert relation_bias.dtype == mx.float32
+    assert edge_kind_bias.dtype == mx.float32
+    assert float(mx.sum(relation_bias).item()) > 0.0
+    assert float(mx.sum(edge_kind_bias).item()) > 0.0
     assert window_receipt["edge_counts"]["call"] > 0
     assert window_receipt["generated_token_policy"] == (
         "generated_continuation_chunk_with_repository_summary_v1"
@@ -291,7 +297,12 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     assert side["confidence_ids"][0, -1].item() == 1
     assert side["source_doc_ids"][0, -1].item() == 0
     assert side["structure_ids"][0, -1].item() > 0
-    assert float(mx.sum(block_bias[:, -1, :]).item()) > 0.0
+    assert float(mx.sum(relation_bias[:, -1, :]).item()) > 0.0
+    assert window_receipt["relation_bias_nonzero"] > 0
+    assert window_receipt["edge_kind_bias_nonzero"] > 0
+    assert window_receipt["edge_kind_route_count"] > 0
+    assert {"2", "3", "4"} <= set(window_receipt["edge_kind_route_counts"])
+    assert window_receipt["graph_bias_dtype"] == "float32"
 
 
 def test_repo_ifim_prompt_keeps_prefix_and_suffix_source_alignment(
@@ -413,7 +424,7 @@ def test_ifim_prompt_ids_are_threaded_unchanged_into_model():
             )
 
     model = CapturingModel()
-    _completion, prompt_tokens, generated_tokens, receipt = mod.generate_completion(
+    _completion, prompt_tokens, generated_tokens, finish_reason, receipt = mod.generate_completion(
         model,
         tokenizer,
         prompt,
@@ -430,16 +441,68 @@ def test_ifim_prompt_ids_are_threaded_unchanged_into_model():
         prompt_source_path=None,
         prompt_source_start=None,
         prompt_graph_cache_dir=None,
+        graph_bias_dtype=mx.float32,
     )
 
     assert prompt_tokens == len(expected_ids)
     assert generated_tokens == 1
+    assert finish_reason == "length"
     assert len(model.calls) == 1
     input_ids, kwargs = model.calls[0]
     assert input_ids.tolist() == [expected_ids]
     assert kwargs["block_bias"] is None
     assert kwargs["edge_kind_bias"] is None
     assert receipt["prompt_mode"] == "ifim"
+
+
+def test_generate_completion_emits_eos_finish_reason(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+
+    class EosModel:
+        def __call__(self, input_ids, **_kwargs):
+            return (
+                mx.zeros(
+                    (1, input_ids.shape[1], tokenizer.vocab_size),
+                    dtype=mx.float32,
+                ),
+                None,
+            )
+
+    monkeypatch.setattr(
+        mod,
+        "_sample_next",
+        lambda *_args, **_kwargs: tokenizer.eos_token_id,
+    )
+    completion, _prompt_tokens, generated_tokens, finish_reason, _receipt = (
+        mod.generate_completion(
+            EosModel(),
+            tokenizer,
+            "int answer() {\n",
+            seq_len=64,
+            max_new_tokens=8,
+            temperature=0.0,
+            top_k=None,
+            top_p=None,
+            prompt_graph_mode="off",
+            prompt_sidecars="zero",
+            prepend_code_start=False,
+            project_index=None,
+            prompt_document_id=None,
+            prompt_source_path=None,
+            prompt_source_start=None,
+            prompt_graph_cache_dir=None,
+            graph_bias_dtype=mx.float32,
+        )
+    )
+
+    assert completion == ""
+    assert generated_tokens == 0
+    assert finish_reason == "eos"
 
 
 def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path):
@@ -463,7 +526,7 @@ def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path)
             return logits, None
 
     model = CapturingModel()
-    _completion, prompt_tokens, generated_tokens, receipt = mod.generate_completion(
+    _completion, prompt_tokens, generated_tokens, finish_reason, receipt = mod.generate_completion(
         model,
         tokenizer,
         _case3_prompt(),
@@ -480,15 +543,20 @@ def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path)
         prompt_source_path=source.source_path,
         prompt_source_start=0,
         prompt_graph_cache_dir=tmp_path,
+        graph_bias_dtype=mx.float32,
     )
 
     assert prompt_tokens > 0
     assert generated_tokens == 1
+    assert finish_reason == "length"
     assert receipt["edge_counts"]["call"] > 0
     assert len(model.calls) == 1
     input_ids, kwargs = model.calls[0]
     assert tuple(input_ids.shape) == (1, prompt_tokens)
     assert float(mx.sum(kwargs["block_bias"]).item()) > 0.0
+    assert float(mx.sum(kwargs["edge_kind_bias"]).item()) > 0.0
+    assert kwargs["block_bias"].dtype == mx.float32
+    assert kwargs["edge_kind_bias"].dtype == mx.float32
     assert int(mx.sum(kwargs["structure_ids"]).item()) > 0
     assert tuple(kwargs["document_ids"].shape) == tuple(input_ids.shape)
     assert int(mx.min(kwargs["document_ids"]).item()) == 1
@@ -539,11 +607,13 @@ def test_generate_completion_keeps_graph_sensitive_after_token_one(tmp_path: Pat
         prompt_source_path=source.source_path,
         prompt_source_start=0,
         prompt_graph_cache_dir=tmp_path / "graph-cache",
+        graph_bias_dtype=mx.float32,
     )
 
     assert len(model.calls) == 3
     for _input_ids, kwargs in model.calls[1:]:
         assert float(mx.sum(kwargs["block_bias"][:, -1, :]).item()) > 0.0
+        assert float(mx.sum(kwargs["edge_kind_bias"]).item()) > 0.0
         assert int(kwargs["structure_ids"][0, -1].item()) > 0
 
 
@@ -557,9 +627,12 @@ def test_generation_e2e_output_is_distinct_from_gold_fixture(tmp_path: Path):
     class OneStepModel:
         def __init__(self):
             self.graph_bias_presence = []
+            self.graph_kind_bias_presence = []
+            self.config = SimpleNamespace(graph_routes_enabled=True)
 
         def __call__(self, input_ids, **kwargs):
             self.graph_bias_presence.append(kwargs["block_bias"] is not None)
+            self.graph_kind_bias_presence.append(kwargs["edge_kind_bias"] is not None)
             return (
                 mx.zeros(
                     (1, input_ids.shape[1], tokenizer.vocab_size),
@@ -588,10 +661,21 @@ def test_generation_e2e_output_is_distinct_from_gold_fixture(tmp_path: Path):
         prompt_graph_cache_dir=tmp_path / "graph-cache",
         prompt_index_cache_dir=tmp_path / "index-cache",
         indexer_root=ROOT,
+        num_samples=1,
+        base_seed=31,
+        graph_bias_dtype=mx.float32,
     )
 
-    assert model.graph_bias_presence == [True, False]
+    assert model.graph_bias_presence == [True, True]
+    assert model.graph_kind_bias_presence == [True, True]
     assert [row["prompt_graph_mode"] for row in rows] == ["repo", "off"]
+    assert [row["sample_index"] for row in rows] == [0, 0]
+    assert [row["seed"] for row in rows] == [31, 31]
+    assert all(row["finish_reason"] == "length" for row in rows)
+    assert all(row["length_truncated"] is True for row in rows)
+    assert rows[1]["prompt_graph_receipt"]["graph_bias_ablation"] == (
+        "explicit_prompt_graph_mode_off"
+    )
     assert all(row["completion_source"] == "model_generation" for row in rows)
     written = [json.loads(line) for line in completions.read_text().splitlines()]
     assert all(row["completion_source"] == "model_generation" for row in written)
@@ -668,6 +752,7 @@ def test_generate_completion_refuses_to_discard_repository_graph_window(
             prompt_source_path=source.source_path,
             prompt_source_start=0,
             prompt_graph_cache_dir=tmp_path,
+            graph_bias_dtype=mx.float32,
         )
 
 
@@ -842,7 +927,7 @@ def test_fim_generated_middle_is_composed_between_prefix_and_suffix(
     cases.write_text(json.dumps(case) + "\n", encoding="utf-8")
 
     def fake_generate(*_args, **_kwargs):
-        return "return 42;\n", 9, 2, {"prompt_mode": "fim"}
+        return "return 42;\n", 9, 2, "eos", {"prompt_mode": "fim"}
 
     monkeypatch.setattr(mod, "generate_completion", fake_generate)
     rows = mod.write_completions(
@@ -862,6 +947,9 @@ def test_fim_generated_middle_is_composed_between_prefix_and_suffix(
         cases_dir=tmp_path,
         prompt_graph_cache_dir=None,
         prompt_index_cache_dir=None,
+        num_samples=1,
+        base_seed=7,
+        graph_bias_dtype=mx.float32,
     )
     spec = importlib.util.spec_from_file_location(
         "cpp_generation_compile_eval_for_fim_test",
@@ -876,6 +964,10 @@ def test_fim_generated_middle_is_composed_between_prefix_and_suffix(
 
     assert rows[0]["completion"] == "return 42;\n"
     assert rows[0]["prompt_mode"] == "fim"
+    assert rows[0]["sample_index"] == 0
+    assert rows[0]["seed"] == 7
+    assert rows[0]["finish_reason"] == "eos"
+    assert rows[0]["length_truncated"] is False
     assert compile_gate.compose_source(loaded_case, loaded_completion) == (
         case["source_prefix"] + "return 42;\n" + case["source_suffix"]
     )
@@ -890,7 +982,7 @@ def test_gold_fixture_is_explicit_and_repository_gate_links_all_sources(
     assert gold_row["completion_source"] == "gold_fixture"
 
     report = tmp_path / "report.json"
-    mod.run_compile_gate(
+    compile_report = mod.run_compile_gate(
         cases=CASE3_FIXTURE / "cases.jsonl",
         completions=gold,
         report=report,
@@ -906,6 +998,16 @@ def test_gold_fixture_is_explicit_and_repository_gate_links_all_sources(
         "src/repo_helper.cpp",
         "src/repo_caller.cpp",
     ]
+    assert compile_report == payload
+    receipt = payload["compile_gate_receipt"]
+    assert receipt["script"]["path"] == str(CASE3_COMPILE_GATE.resolve())
+    assert receipt["script"]["git_commit"]
+    assert receipt["script"]["sha256"] == hashlib.sha256(
+        CASE3_COMPILE_GATE.read_bytes()
+    ).hexdigest()
+    assert receipt["inputs"]["cases"]["sha256"] == hashlib.sha256(
+        (CASE3_FIXTURE / "cases.jsonl").read_bytes()
+    ).hexdigest()
 
 
 def test_script_help_bootstraps_repo_root_from_sibling_cwd():
@@ -957,6 +1059,17 @@ def test_checkpoint_model_config_loads_safetensors_sidecar(tmp_path: Path):
     }
 
 
+def test_graph_bias_dtype_comes_from_loaded_model_weights() -> None:
+    mod = _load_module()
+    model = SimpleNamespace(
+        token_embedding=SimpleNamespace(
+            weight=mx.zeros((2, 2), dtype=mx.bfloat16)
+        )
+    )
+
+    assert mod.model_graph_bias_dtype(model) == mx.bfloat16
+
+
 def test_compile_gate_env_prepends_tool_dirs(tmp_path: Path):
     mod = _load_module()
     clang_format = tmp_path / "clang-format"
@@ -966,3 +1079,97 @@ def test_compile_gate_env_prepends_tool_dirs(tmp_path: Path):
     env = mod.compile_gate_env({"PATH": ""}, path_dirs=(tmp_path,))
 
     assert env["PATH"].split(":")[0] == str(tmp_path)
+
+
+def test_standard_pass_at_k_estimator_and_unavailable_k() -> None:
+    mod = _load_module()
+
+    assert mod.estimate_pass_at_k(10, 0, 1) == 0.0
+    assert mod.estimate_pass_at_k(10, 10, 10) == 1.0
+    assert mod.estimate_pass_at_k(10, 1, 5) == pytest.approx(0.5)
+    assert mod.estimate_pass_at_k(4, 1, 5) is None
+
+
+def test_compile_gate_evaluates_candidate_identity_and_reports_pass_at_k(
+    tmp_path: Path,
+) -> None:
+    mod = _load_module()
+    cases = tmp_path / "cases.jsonl"
+    completions = tmp_path / "completions.jsonl"
+    report = tmp_path / "compile_report.json"
+    cases.write_text(
+        '{"task_id":"candidate","language":"cpp",'
+        '"prompt":"return zero",'
+        '"source_prefix":"int candidate() {\\n",'
+        '"source_suffix":"}\\nint main() { return candidate(); }\\n"}\n',
+        encoding="utf-8",
+    )
+    completions.write_text(
+        "\n".join(
+            (
+                json.dumps(
+                    {
+                        "task_id": "candidate",
+                        "sample_index": 0,
+                        "seed": 100,
+                        "completion": "return 0;",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "task_id": "candidate",
+                        "sample_index": 1,
+                        "seed": 101,
+                        "completion": "return does_not_exist;",
+                    }
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = mod.run_compile_gate(
+        cases=cases,
+        completions=completions,
+        report=report,
+        script=CASE3_COMPILE_GATE,
+        keep_workdir=False,
+        fail_on_fail=False,
+    )
+
+    assert payload["summary"]["total"] == 2
+    assert payload["summary"]["passed"] == 1
+    assert payload["summary"]["pass@1"] == pytest.approx(0.5)
+    assert payload["summary"]["pass@5"] is None
+    assert payload["summary"]["pass@10"] is None
+    assert payload["summary"]["pass_at_k"] == {
+        "1": pytest.approx(0.5),
+        "5": None,
+        "10": None,
+    }
+    assert {
+        (row["task_id"], row["sample_index"], row["seed"])
+        for row in payload["results"]
+    } == {("candidate", 0, 100), ("candidate", 1, 101)}
+
+
+def test_cli_defaults_to_ten_candidates_for_standard_pass_at_k() -> None:
+    mod = _load_module()
+    args = mod.parse_args(["--checkpoint", "unused.safetensors"])
+
+    assert args.num_samples == 10
+    assert args.seed == 0
+    assert args.temperature == pytest.approx(0.8)
+
+    with pytest.raises(ValueError, match="temperature > 0"):
+        mod.parse_args(
+            [
+                "--checkpoint",
+                "unused.safetensors",
+                "--num-samples",
+                "10",
+                "--temperature",
+                "0",
+            ]
+        )

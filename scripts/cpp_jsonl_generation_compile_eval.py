@@ -13,11 +13,14 @@ checkpoints must be converted before this script can evaluate them locally.
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -48,6 +51,7 @@ from cppmega_mlx.inference.side_channels import (  # noqa: E402
     get_builtin_code_metadata_adapter,
 )
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig  # noqa: E402
+from cppmega_mlx.nn.domain_graph_routes import DEFAULT_EDGE_WEIGHTS  # noqa: E402
 from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer  # noqa: E402
 from cppmega_mlx.training.checkpoint import load_checkpoint  # noqa: E402
 
@@ -101,6 +105,9 @@ DEFAULT_COMPILE_PATH_DIRS = (
     Path("/usr/sbin"),
     Path("/sbin"),
 )
+STANDARD_PASS_AT_K = (1, 5, 10)
+COMPILE_GATE_RECEIPT_SCHEMA = "cppmega_mlx_compile_gate_receipt_v1"
+COMPILE_REPORT_SCHEMA = "cppmega_mlx_candidate_compile_report_v1"
 
 
 class GenerationPromptContext:
@@ -753,7 +760,13 @@ def prompt_model_inputs(
     total_token_count: int,
     window_start: int,
     window_end: int,
-) -> tuple[dict[str, mx.array], mx.array | None, dict[str, Any]]:
+    bias_dtype: mx.Dtype,
+) -> tuple[
+    dict[str, mx.array],
+    mx.array | None,
+    mx.array | None,
+    dict[str, Any],
+]:
     if context.graph_artifact is not None:
         graph_inputs = context.graph_artifact.model_inputs(
             total_token_count=total_token_count,
@@ -767,11 +780,42 @@ def prompt_model_inputs(
             )
             for name in SIDE_CHANNEL_NAMES
         }
-        block_bias = mx.array(
-            [graph_inputs.dense_attention_bias()],
-            dtype=mx.float32,
+        relation_values = graph_inputs.dense_relation_attention_bias()
+        edge_kind_values = graph_inputs.dense_edge_kind_attention_bias(
+            edge_kind_weights=DEFAULT_EDGE_WEIGHTS,
         )
-        return side, block_bias, dict(graph_inputs.receipt)
+        relation_nonzero = sum(
+            value != 0.0 for row in relation_values for value in row
+        )
+        edge_kind_nonzero = sum(
+            value != 0.0 for row in edge_kind_values for value in row
+        )
+        edge_kind_route_counts = graph_inputs.edge_kind_route_counts()
+        if relation_nonzero <= 0:
+            raise ValueError(
+                "repository prompt graph produced an all-zero relation prior"
+            )
+        if edge_kind_nonzero <= 0:
+            raise ValueError(
+                "repository prompt graph produced an all-zero edge-kind prior; "
+                "zero kind priors are allowed only in explicit graph-off ablation"
+            )
+        relation_bias = mx.array([relation_values], dtype=bias_dtype)
+        edge_kind_bias = mx.array([edge_kind_values], dtype=bias_dtype)
+        receipt = dict(graph_inputs.receipt)
+        receipt.update(
+            {
+                "relation_bias_nonzero": relation_nonzero,
+                "edge_kind_bias_nonzero": edge_kind_nonzero,
+                "edge_kind_route_count": sum(edge_kind_route_counts.values()),
+                "edge_kind_route_counts": {
+                    str(kind): count
+                    for kind, count in edge_kind_route_counts.items()
+                },
+                "graph_bias_dtype": _dtype_name(bias_dtype),
+            }
+        )
+        return side, relation_bias, edge_kind_bias, receipt
 
     if total_token_count < len(context.token_ids):
         raise ValueError(
@@ -827,7 +871,11 @@ def prompt_model_inputs(
         "generated_token_policy": generated_policy,
         "generated_token_count": generated,
     }
-    return side, None, receipt
+    return side, None, None, receipt
+
+
+def _dtype_name(dtype: mx.Dtype) -> str:
+    return str(dtype).rsplit(".", maxsplit=1)[-1]
 
 
 class BodyDecodeConstraints:
@@ -1134,6 +1182,21 @@ def build_model(args: argparse.Namespace) -> DenseCppLM:
     return model
 
 
+def model_graph_bias_dtype(model: DenseCppLM) -> mx.Dtype:
+    token_embedding = getattr(model, "token_embedding", None)
+    weight = getattr(token_embedding, "weight", None)
+    if not isinstance(weight, mx.array):
+        raise TypeError(
+            "generation model token_embedding.weight must be an MLX array"
+        )
+    if weight.dtype not in {mx.float16, mx.bfloat16, mx.float32}:
+        raise ValueError(
+            "generation model requires a floating graph-bias dtype, got "
+            f"{weight.dtype}"
+        )
+    return weight.dtype
+
+
 def _sample_next(
     logits: mx.array,
     *,
@@ -1173,7 +1236,8 @@ def generate_completion(
     prompt_source_path: str | None,
     prompt_source_start: int | None,
     prompt_graph_cache_dir: Path | None,
-) -> tuple[str, int, int, dict[str, Any]]:
+    graph_bias_dtype: mx.Dtype,
+) -> tuple[str, int, int, str, dict[str, Any]]:
     prompt_context = build_prompt_context(
         tokenizer,
         prompt,
@@ -1206,15 +1270,22 @@ def generate_completion(
     generated: list[int] = []
     last_window_receipt: dict[str, Any] | None = None
     constraints = BodyDecodeConstraints(tokenizer, prompt_len=len(prompt_ids))
+    finish_reason = "length"
     for _ in range(max_new_tokens):
         window_start = max(0, len(token_context) - seq_len)
         window = token_context[window_start:]
         input_ids = mx.array([window], dtype=mx.int32)
-        side, block_bias, last_window_receipt = prompt_model_inputs(
+        (
+            side,
+            block_bias,
+            edge_kind_bias,
+            last_window_receipt,
+        ) = prompt_model_inputs(
             prompt_context,
             total_token_count=len(token_context),
             window_start=window_start,
             window_end=len(token_context),
+            bias_dtype=graph_bias_dtype,
         )
         graph_routes_enabled = bool(
             getattr(
@@ -1224,12 +1295,37 @@ def generate_completion(
             )
         )
         if graph_routes_enabled and block_bias is None:
+            if prompt_graph_mode != "off":
+                raise RuntimeError(
+                    "graph routes are enabled but the repository prompt graph "
+                    "did not produce typed fixed biases"
+                )
             block_bias = mx.zeros(
-                (1, len(window), len(window)), dtype=mx.float32
+                (1, len(window), len(window)), dtype=graph_bias_dtype
             )
-        edge_kind_bias = (
-            None if block_bias is None else mx.zeros_like(block_bias)
-        )
+            edge_kind_bias = mx.zeros_like(block_bias)
+            last_window_receipt.update(
+                {
+                    "graph_bias_ablation": "explicit_prompt_graph_mode_off",
+                    "relation_bias_nonzero": 0,
+                    "edge_kind_bias_nonzero": 0,
+                    "edge_kind_route_count": 0,
+                    "edge_kind_route_counts": {},
+                    "graph_bias_dtype": _dtype_name(graph_bias_dtype),
+                }
+            )
+        elif graph_routes_enabled and edge_kind_bias is None:
+            raise RuntimeError(
+                "graph routes are enabled but graph_edge_kind_bias is absent; "
+                "refusing to fabricate a zero categorical prior"
+            )
+        elif not graph_routes_enabled and (
+            block_bias is not None or edge_kind_bias is not None
+        ):
+            raise RuntimeError(
+                "repository graph biases were produced for a model with graph "
+                "routes disabled"
+            )
         logits, _loss = model(
             input_ids,
             block_bias=block_bias,
@@ -1250,6 +1346,7 @@ def generate_completion(
         )
         mx.eval(logits)
         if next_id in {tokenizer.eos_token_id, tokenizer.code_end_id}:
+            finish_reason = "eos"
             break
         generated.append(next_id)
         token_context.append(next_id)
@@ -1263,10 +1360,21 @@ def generate_completion(
     ]
     if last_window_receipt is not None:
         receipt["last_decode_window"] = last_window_receipt
+        for key in (
+            "graph_bias_ablation",
+            "relation_bias_nonzero",
+            "edge_kind_bias_nonzero",
+            "edge_kind_route_count",
+            "edge_kind_route_counts",
+            "graph_bias_dtype",
+        ):
+            if key in last_window_receipt:
+                receipt[key] = last_window_receipt[key]
     return (
         trim_body_completion(tokenizer.decode(generated)),
         len(prompt_ids),
         len(generated),
+        finish_reason,
         receipt,
     )
 
@@ -1290,7 +1398,19 @@ def write_completions(
     prompt_graph_cache_dir: Path | None,
     prompt_index_cache_dir: Path | None,
     indexer_root: Path | None = None,
+    num_samples: int = 1,
+    base_seed: int = 0,
+    graph_bias_dtype: mx.Dtype = mx.float32,
 ) -> list[dict[str, Any]]:
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+    if base_seed < 0:
+        raise ValueError(f"base_seed must be non-negative, got {base_seed}")
+    if num_samples > 1 and temperature <= 0.0:
+        raise ValueError(
+            "multiple pass@k candidates require temperature > 0; refusing "
+            "duplicate greedy samples"
+        )
     completions_path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     with completions_path.open("w", encoding="utf-8") as fh:
@@ -1307,39 +1427,61 @@ def write_completions(
                 prompt_index_cache_dir=prompt_index_cache_dir,
                 indexer_root=indexer_root,
             )
-            completion, prompt_tokens, generated_tokens, side_provenance = generate_completion(
-                model,
-                tokenizer,
-                case_prompt,
-                seq_len=seq_len,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                prompt_graph_mode=case_graph_mode,
-                prompt_sidecars=prompt_sidecars,
-                prepend_code_start=prepend_code_start,
-                project_index=(None if resolved is None else resolved.project_index),
-                prompt_document_id=(None if resolved is None else resolved.document_id),
-                prompt_source_path=(None if resolved is None else resolved.source_path),
-                prompt_source_start=(None if resolved is None else resolved.source_start),
-                prompt_graph_cache_dir=prompt_graph_cache_dir,
-            )
-            row = {
-                "task_id": case["task_id"],
-                "completion": completion,
-                "completion_source": "model_generation",
-                "prompt_tokens": prompt_tokens,
-                "generated_tokens": generated_tokens,
-                "prompt_mode": case_prompt.mode,
-                "prompt_graph_mode": case_graph_mode,
-                "prompt_graph_receipt": side_provenance,
-                "prompt_graph_index_receipt": (
-                    None if resolved is None else resolved.index_receipt
-                ),
-            }
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-            rows.append(row)
+            for sample_index in range(num_samples):
+                seed = base_seed + sample_index
+                mx.random.seed(seed)
+                (
+                    completion,
+                    prompt_tokens,
+                    generated_tokens,
+                    finish_reason,
+                    side_provenance,
+                ) = generate_completion(
+                    model,
+                    tokenizer,
+                    case_prompt,
+                    seq_len=seq_len,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    prompt_graph_mode=case_graph_mode,
+                    prompt_sidecars=prompt_sidecars,
+                    prepend_code_start=prepend_code_start,
+                    project_index=(
+                        None if resolved is None else resolved.project_index
+                    ),
+                    prompt_document_id=(
+                        None if resolved is None else resolved.document_id
+                    ),
+                    prompt_source_path=(
+                        None if resolved is None else resolved.source_path
+                    ),
+                    prompt_source_start=(
+                        None if resolved is None else resolved.source_start
+                    ),
+                    prompt_graph_cache_dir=prompt_graph_cache_dir,
+                    graph_bias_dtype=graph_bias_dtype,
+                )
+                row = {
+                    "task_id": case["task_id"],
+                    "sample_index": sample_index,
+                    "seed": seed,
+                    "completion": completion,
+                    "completion_source": "model_generation",
+                    "prompt_tokens": prompt_tokens,
+                    "generated_tokens": generated_tokens,
+                    "finish_reason": finish_reason,
+                    "length_truncated": finish_reason == "length",
+                    "prompt_mode": case_prompt.mode,
+                    "prompt_graph_mode": case_graph_mode,
+                    "prompt_graph_receipt": side_provenance,
+                    "prompt_graph_index_receipt": (
+                        None if resolved is None else resolved.index_receipt
+                    ),
+                }
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                rows.append(row)
     return rows
 
 
@@ -1368,6 +1510,211 @@ def compile_gate_env(
     return env
 
 
+def _file_receipt(path: Path) -> dict[str, str]:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"receipt input not found: {resolved}")
+    return {
+        "path": str(resolved),
+        "sha256": sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+def _git_output(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}"
+        )
+    return proc.stdout.strip()
+
+
+def build_compile_gate_receipt(
+    *,
+    script: Path,
+    cases: Path,
+    completions: Path,
+) -> dict[str, Any]:
+    script_receipt = _file_receipt(script)
+    script_path = Path(script_receipt["path"])
+    git_root_text = _git_output(script_path.parent, "rev-parse", "--show-toplevel")
+    git_root = Path(git_root_text).resolve()
+    try:
+        relative_script = script_path.relative_to(git_root).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"compile gate script {script_path} is outside git root {git_root}"
+        ) from exc
+    git_commit = _git_output(git_root, "rev-parse", "HEAD")
+    last_commit = _git_output(
+        git_root,
+        "log",
+        "-1",
+        "--format=%H",
+        "--",
+        relative_script,
+    )
+    if not last_commit:
+        raise ValueError(
+            f"compile gate script is not bound to a git commit: {script_path}"
+        )
+    worktree_status = _git_output(
+        git_root,
+        "status",
+        "--short",
+        "--untracked-files=all",
+        "--",
+        relative_script,
+    )
+    branch = _git_output(git_root, "branch", "--show-current")
+    return {
+        "schema": COMPILE_GATE_RECEIPT_SCHEMA,
+        "script": {
+            **script_receipt,
+            "git_root": str(git_root),
+            "git_relative_path": relative_script,
+            "git_commit": git_commit,
+            "git_last_commit": last_commit,
+            "git_branch": branch or None,
+            "git_worktree_status": worktree_status or "clean",
+        },
+        "inputs": {
+            "cases": _file_receipt(cases),
+            "completions": _file_receipt(completions),
+        },
+        "python": str(Path(sys.executable).resolve()),
+    }
+
+
+def estimate_pass_at_k(
+    num_samples: int,
+    num_correct: int,
+    k: int,
+) -> float | None:
+    """Return the standard unbiased pass@k estimator for one task."""
+
+    if isinstance(num_samples, bool) or num_samples < 0:
+        raise ValueError(f"num_samples must be non-negative, got {num_samples}")
+    if (
+        isinstance(num_correct, bool)
+        or num_correct < 0
+        or num_correct > num_samples
+    ):
+        raise ValueError(
+            f"num_correct must be in [0,{num_samples}], got {num_correct}"
+        )
+    if isinstance(k, bool) or k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+    if num_samples < k:
+        return None
+    return 1.0 - (
+        math.comb(num_samples - num_correct, k)
+        / math.comb(num_samples, k)
+    )
+
+
+def _candidate_groups(
+    cases: Path,
+    completions: Path,
+) -> tuple[tuple[str, ...], dict[int, dict[str, dict[str, Any]]]]:
+    task_ids = tuple(sorted(row["task_id"] for row in load_cases(cases)))
+    expected_tasks = set(task_ids)
+    groups: dict[int, dict[str, dict[str, Any]]] = {}
+    seen_candidates: set[tuple[str, int, int]] = set()
+    for raw_row in iter_jsonl(completions):
+        row = dict(raw_row)
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("completion candidate needs non-empty task_id")
+        has_sample_index = "sample_index" in row
+        has_seed = "seed" in row
+        if has_sample_index != has_seed:
+            raise ValueError(
+                f"candidate {task_id!r} must carry both sample_index and seed"
+            )
+        if not has_sample_index:
+            row["sample_index"] = 0
+            row["seed"] = 0
+        sample_index = row["sample_index"]
+        seed = row["seed"]
+        if (
+            isinstance(sample_index, bool)
+            or not isinstance(sample_index, int)
+            or sample_index < 0
+        ):
+            raise ValueError(
+                f"candidate {task_id!r} sample_index must be non-negative int"
+            )
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError(
+                f"candidate {task_id!r} seed must be non-negative int"
+            )
+        identity = (task_id, sample_index, seed)
+        if identity in seen_candidates:
+            raise ValueError(f"duplicate completion candidate {identity!r}")
+        seen_candidates.add(identity)
+        sample_group = groups.setdefault(sample_index, {})
+        if task_id in sample_group:
+            raise ValueError(
+                f"duplicate task/sample completion for {task_id!r}/{sample_index}"
+            )
+        sample_group[task_id] = row
+
+    if not groups:
+        raise ValueError(f"no completion candidates in {completions}")
+    sample_indices = sorted(groups)
+    if sample_indices != list(range(len(sample_indices))):
+        raise ValueError(
+            "candidate sample_index values must be contiguous from zero, got "
+            f"{sample_indices}"
+        )
+    for sample_index, sample_group in groups.items():
+        actual_tasks = set(sample_group)
+        if actual_tasks != expected_tasks:
+            missing = sorted(expected_tasks - actual_tasks)
+            extra = sorted(actual_tasks - expected_tasks)
+            raise ValueError(
+                f"candidate sample {sample_index} task matrix mismatch: "
+                f"missing={missing}, extra={extra}"
+            )
+    return task_ids, groups
+
+
+def _pass_at_k_summary(
+    results: list[dict[str, Any]],
+    task_ids: tuple[str, ...],
+) -> dict[str, float | None]:
+    outcomes = {task_id: [] for task_id in task_ids}
+    for result in results:
+        task_id = result.get("task_id")
+        if task_id not in outcomes:
+            raise ValueError(f"compile gate returned unknown task_id {task_id!r}")
+        passed = result.get("passed")
+        if not isinstance(passed, bool):
+            raise ValueError(
+                f"compile gate result {task_id!r} has non-boolean passed"
+            )
+        outcomes[task_id].append(passed)
+
+    metrics: dict[str, float | None] = {}
+    for k in STANDARD_PASS_AT_K:
+        estimates = [
+            estimate_pass_at_k(len(values), sum(values), k)
+            for values in outcomes.values()
+        ]
+        metrics[f"pass@{k}"] = (
+            None
+            if any(value is None for value in estimates)
+            else sum(float(value) for value in estimates) / len(estimates)
+        )
+    return metrics
+
+
 def run_compile_gate(
     *,
     cases: Path,
@@ -1375,24 +1722,135 @@ def run_compile_gate(
     report: Path,
     script: Path,
     keep_workdir: bool,
-) -> None:
-    if not script.is_file():
-        raise FileNotFoundError(f"compile gate script not found: {script}")
-    cmd = [
-        sys.executable,
-        str(script),
-        "--cases",
-        str(cases),
-        "--completions",
-        str(completions),
-        "--out",
-        str(report),
-        "--json",
-        "--fail-on-fail",
-    ]
-    if keep_workdir:
-        cmd.append("--keep-workdir")
-    subprocess.run(cmd, check=True, env=compile_gate_env())
+    fail_on_fail: bool = True,
+    expected_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    gate_receipt = build_compile_gate_receipt(
+        script=script,
+        cases=cases,
+        completions=completions,
+    )
+    if expected_receipt is not None and gate_receipt != expected_receipt:
+        raise RuntimeError(
+            "compile gate path/commit/hash changed after receipt binding"
+        )
+    task_ids, groups = _candidate_groups(cases, completions)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    all_results: list[dict[str, Any]] = []
+    sample_summaries: list[dict[str, Any]] = []
+    gate_env = compile_gate_env()
+    with tempfile.TemporaryDirectory(
+        prefix="cppmega_mlx_compile_candidates_",
+        dir=report.parent,
+    ) as temp_dir:
+        temp_root = Path(temp_dir)
+        for sample_index in sorted(groups):
+            sample_completions = temp_root / f"sample_{sample_index:04d}.jsonl"
+            sample_report = temp_root / f"sample_{sample_index:04d}.json"
+            with sample_completions.open("w", encoding="utf-8") as fh:
+                for task_id in task_ids:
+                    fh.write(
+                        json.dumps(
+                            groups[sample_index][task_id],
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            cmd = [
+                sys.executable,
+                str(Path(script).resolve()),
+                "--cases",
+                str(Path(cases).resolve()),
+                "--completions",
+                str(sample_completions),
+                "--out",
+                str(sample_report),
+            ]
+            if keep_workdir:
+                cmd.append("--keep-workdir")
+            subprocess.run(cmd, check=True, env=gate_env)
+            sample_payload = json.loads(sample_report.read_text(encoding="utf-8"))
+            summary = sample_payload.get("summary")
+            results = sample_payload.get("results")
+            if not isinstance(summary, dict) or not isinstance(results, list):
+                raise ValueError(
+                    f"compile gate sample {sample_index} emitted invalid report"
+                )
+            sample_summaries.append(
+                {"sample_index": sample_index, **summary}
+            )
+            by_task = groups[sample_index]
+            for raw_result in results:
+                if not isinstance(raw_result, dict):
+                    raise ValueError(
+                        f"compile gate sample {sample_index} result is not an object"
+                    )
+                task_id = raw_result.get("task_id")
+                candidate = by_task.get(task_id)
+                if candidate is None:
+                    raise ValueError(
+                        f"compile gate sample {sample_index} returned unknown "
+                        f"task_id {task_id!r}"
+                    )
+                all_results.append(
+                    {
+                        **raw_result,
+                        "sample_index": sample_index,
+                        "seed": candidate["seed"],
+                    }
+                )
+
+    first_summary = sample_summaries[0]
+    total = len(all_results)
+    passed = sum(bool(result["passed"]) for result in all_results)
+    pass_at_k = _pass_at_k_summary(all_results, task_ids)
+    summary: dict[str, Any] = {
+        "total": total,
+        "passed": passed,
+        "compiled": sum(
+            bool(result.get("compile_ok")) for result in all_results
+        ),
+        "ran": sum(bool(result.get("run_ok")) for result in all_results),
+        "clang_format_ok": sum(
+            result.get("clang_format") is None
+            or bool(result["clang_format"].get("ok"))
+            for result in all_results
+        ),
+        "pass_rate": passed / total if total else 0.0,
+        "tasks": len(task_ids),
+        "samples_per_task": len(groups),
+        "candidate_identity": ["task_id", "sample_index", "seed"],
+        "pass_at_k": {
+            str(k): pass_at_k[f"pass@{k}"] for k in STANDARD_PASS_AT_K
+        },
+        **pass_at_k,
+    }
+    for key in ("cpp_compiler", "c_compiler", "clang_format", "jobs"):
+        if key in first_summary:
+            summary[key] = first_summary[key]
+    if "repository_cases" in first_summary:
+        summary["repository_cases"] = first_summary["repository_cases"]
+        summary["repository_candidate_evaluations"] = sum(
+            int(item.get("repository_cases", 0))
+            for item in sample_summaries
+        )
+    payload = {
+        "schema": COMPILE_REPORT_SCHEMA,
+        "compile_gate_receipt": gate_receipt,
+        "summary": summary,
+        "sample_summaries": sample_summaries,
+        "results": all_results,
+    }
+    report.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if fail_on_fail and passed != total:
+        raise subprocess.CalledProcessError(
+            1,
+            [str(Path(script).resolve()), "<candidate-matrix>"],
+        )
+    return payload
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1441,7 +1899,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--prompt-sidecars", choices=("zero", "clang"), default="zero")
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--max-new-tokens", type=int, default=128)
-    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument(
+        "--num-samples",
+        "--samples-per-task",
+        dest="num_samples",
+        type=int,
+        default=10,
+        help="Candidates per task; 10 enables standard pass@1/5/10.",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Base MLX sampling seed; candidate i uses seed+i.",
+    )
+    ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--prepend-code-start", action="store_true")
@@ -1468,6 +1940,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--seq-len must be positive")
     if args.max_new_tokens < 0:
         raise ValueError("--max-new-tokens must be non-negative")
+    if args.num_samples <= 0:
+        raise ValueError("--num-samples must be positive")
+    if args.seed < 0:
+        raise ValueError("--seed must be non-negative")
+    if args.num_samples > 1 and args.temperature <= 0.0:
+        raise ValueError(
+            "--num-samples > 1 requires --temperature > 0 for pass@k"
+        )
     if args.top_k is not None and args.top_k < 0:
         raise ValueError("--top-k must be non-negative")
     if args.top_p is not None and not (0.0 < args.top_p <= 1.0):
@@ -1539,6 +2019,13 @@ def main() -> None:
 
     tokenizer = load_cppmega_tokenizer(args.tokenizer)
     model = build_model(args)
+    model_dtype = model_graph_bias_dtype(model)
+    if args.bf16 and model_dtype != mx.bfloat16:
+        raise RuntimeError(
+            "--bf16 requested but loaded model token embeddings have dtype "
+            f"{model_dtype}"
+        )
+    graph_bias_dtype = mx.float32
 
     completions = out_dir / "completions.jsonl"
     report = out_dir / "compile_report.json"
@@ -1560,11 +2047,17 @@ def main() -> None:
         prompt_graph_cache_dir=prompt_graph_cache_dir,
         prompt_index_cache_dir=prompt_index_cache_dir,
         indexer_root=args.clang_indexer_root,
+        num_samples=args.num_samples,
+        base_seed=args.seed,
+        graph_bias_dtype=graph_bias_dtype,
     )
     summary = {
         "cases": len(cases),
         "completions": len(rows),
-        "checkpoint": str(args.checkpoint),
+        "candidate_identity": ["task_id", "sample_index", "seed"],
+        "num_samples": args.num_samples,
+        "seed": args.seed,
+        "checkpoint": str(args.checkpoint.resolve()),
         "prompt_mode": args.prompt_mode,
         "seq_len": args.seq_len,
         "max_new_tokens": args.max_new_tokens,
@@ -1586,18 +2079,50 @@ def main() -> None:
             else str(prompt_index_cache_dir)
         ),
         "prompt_sidecars": args.prompt_sidecars,
+        "graph_bias_dtype": _dtype_name(graph_bias_dtype),
+        "attention_mask_bias_dtype": _dtype_name(model_dtype),
+        "finish_reason_counts": {
+            reason: sum(row["finish_reason"] == reason for row in rows)
+            for reason in ("eos", "length")
+        },
+        "length_truncated": sum(row["length_truncated"] for row in rows),
     }
-    (out_dir / "generation_summary.json").write_text(
+    summary_path = out_dir / "generation_summary.json"
+    if args.skip_compile_gate:
+        summary["compile_gate"] = {"skipped": True}
+    else:
+        summary["compile_gate_receipt"] = build_compile_gate_receipt(
+            script=args.compile_gate_script,
+            cases=args.cases,
+            completions=completions,
+        )
+    summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     if not args.skip_compile_gate:
-        run_compile_gate(
-            cases=args.cases,
-            completions=completions,
-            report=report,
-            script=args.compile_gate_script,
-            keep_workdir=args.keep_workdir,
+        try:
+            compile_payload = run_compile_gate(
+                cases=args.cases,
+                completions=completions,
+                report=report,
+                script=args.compile_gate_script,
+                keep_workdir=args.keep_workdir,
+                expected_receipt=summary["compile_gate_receipt"],
+            )
+        except subprocess.CalledProcessError:
+            if report.is_file():
+                compile_payload = json.loads(report.read_text(encoding="utf-8"))
+                summary["compile_gate_summary"] = compile_payload["summary"]
+                summary_path.write_text(
+                    json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            raise
+        summary["compile_gate_summary"] = compile_payload["summary"]
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 

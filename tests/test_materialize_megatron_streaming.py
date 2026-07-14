@@ -359,6 +359,43 @@ def test_bounded_sampling_snapshot_records_order_and_replay_cursor(tmp_path) -> 
     assert sampling["final_cursor"] == cursor
 
 
+def test_source_snapshot_binds_paths_relative_to_explicit_root(tmp_path) -> None:
+    source_root = tmp_path / "snapshot"
+    source = source_root / "code" / "1024" / "source.parquet"
+    source.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [1, 2]}), source, row_group_size=1)
+
+    snapshot, _signatures = materializer._build_source_snapshot(
+        [str(source)],
+        sequence_length=1024,
+        requested_samples=1,
+        seed=31,
+        sampling_mode=materializer._BOUNDED_SAMPLING_MODE,
+        source_batch_rows=2,
+        source_root=source_root,
+    )
+
+    assert snapshot["files"][0]["path"] == "code/1024/source.parquet"
+
+
+def test_source_snapshot_rejects_shard_outside_explicit_root(tmp_path) -> None:
+    source = tmp_path / "source.parquet"
+    source_root = tmp_path / "other"
+    source_root.mkdir()
+    pq.write_table(pa.table({"value": [1]}), source)
+
+    with pytest.raises(ValueError, match="outside --source-root"):
+        materializer._build_source_snapshot(
+            [str(source)],
+            sequence_length=1024,
+            requested_samples=1,
+            seed=31,
+            sampling_mode=materializer._BOUNDED_SAMPLING_MODE,
+            source_batch_rows=2,
+            source_root=source_root,
+        )
+
+
 def test_bounded_sampling_cursor_rebinds_actual_lookahead_draw_count(tmp_path) -> None:
     source = tmp_path / "source.parquet"
     pq.write_table(pa.table({"value": [1, 2]}), source, row_group_size=1)

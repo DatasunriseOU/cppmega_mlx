@@ -201,10 +201,20 @@ def test_window_remaps_routes_and_extends_generated_graph_state(tmp_path: Path) 
     assert model_inputs.graph_routes["graph_generated_query_edges"]
     assert all(value > 0 for value in model_inputs.side_channels["structure_ids"][-generated:])
     assert model_inputs.side_channels["confidence_ids"][-generated:] == [1] * generated
+    relation_bias = model_inputs.dense_relation_attention_bias()
+    edge_kind_bias = model_inputs.dense_edge_kind_attention_bias()
     bias = model_inputs.dense_attention_bias()
     assert len(bias) == model_inputs.token_count
     assert all(len(row) == model_inputs.token_count for row in bias)
+    assert sum(sum(row) for row in relation_bias) > 0.0
+    assert sum(sum(row) for row in edge_kind_bias) > 0.0
     assert sum(sum(row) for row in bias) > 0.0
+    assert bias == [
+        [relation + kind for relation, kind in zip(relation_row, kind_row)]
+        for relation_row, kind_row in zip(relation_bias, edge_kind_bias)
+    ]
+    with pytest.raises(ValueError, match="nonzero.*graph-off ablation"):
+        model_inputs.dense_edge_kind_attention_bias(default_weight=0.0)
 
 
 def test_index_and_builder_fail_closed_on_invalid_or_empty_graph(tmp_path: Path) -> None:

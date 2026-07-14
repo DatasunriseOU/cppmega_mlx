@@ -18,6 +18,7 @@ from cppmega_mlx.nn.attention import (
     SPARSE_MLA_FP8_PRODUCER_OWNER,
     SPARSE_MLA_FP8_PRODUCER_STAGE,
     SparseMLAFp8Prepared,
+    _merge_dense_attention_bias,
     causal_sparse_indices,
     causal_sdpa_mask,
     sparse_indices_from_attention_mask,
@@ -115,6 +116,42 @@ def test_causal_sdpa_mask_supports_cached_decode_offsets() -> None:
             dtype=np.bool_,
         ),
     )
+
+
+def test_dense_graph_bias_keeps_native_bf16_mask_dtype() -> None:
+    relation_and_kind_bias = mx.ones((1, 4, 4), dtype=mx.float32)
+
+    merged = _merge_dense_attention_bias(
+        "causal",
+        relation_and_kind_bias,
+        batch_size=1,
+        num_heads=2,
+        query_length=4,
+        key_length=4,
+        target_dtype=mx.bfloat16,
+    )
+    assert isinstance(merged, mx.array)
+    mx.eval(merged)
+
+    assert merged.dtype == mx.bfloat16
+    assert float(merged[0, 0, 0, 0].item()) == 1.0
+    assert float(merged[0, 0, 0, 1].item()) == float("-inf")
+
+
+def test_bf16_attention_executes_with_native_graph_bias() -> None:
+    attention = CausalSelfAttention(
+        AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")
+    )
+    attention.set_dtype(mx.bfloat16)
+    hidden = _rand((1, 4, 16), seed=71).astype(mx.bfloat16)
+    graph_bias = mx.zeros((1, 4, 4), dtype=mx.float32)
+    graph_bias[0, 3, 0] = mx.array(1.0, dtype=mx.float32)
+
+    output = attention(hidden, attention_bias=graph_bias)
+    mx.eval(output)
+
+    assert output.dtype == mx.bfloat16
+    assert output.shape == hidden.shape
 
 
 def test_causal_sparse_indices_match_causal_topk_window() -> None:

@@ -394,6 +394,7 @@ def _merge_dense_attention_bias(
     num_heads: int,
     query_length: int,
     key_length: int,
+    target_dtype: mx.Dtype | None = None,
 ) -> mx.array | Literal["causal"] | None:
     if attention_bias is None:
         return mask
@@ -448,20 +449,22 @@ def _merge_dense_attention_bias(
         if mask != "causal":
             raise ValueError(f"unsupported attention mask sentinel {mask!r}")
         mask = causal_sdpa_mask(query_length, key_length=key_length)
+    output_dtype = bias.dtype if target_dtype is None else target_dtype
+    bias = bias.astype(output_dtype)
     if mask is None:
-        return bias.astype(mx.float32)
+        return bias
     if not isinstance(mask, mx.array):
         raise TypeError(f"mask must be an mlx.core.array, got {type(mask).__name__}")
     mask_value = mask
     if mask.dtype == mx.bool_:
         mask_value = mx.where(
             mask,
-            mx.zeros(mask.shape, dtype=mx.float32),
-            mx.full(mask.shape, -mx.inf, dtype=mx.float32),
+            mx.zeros(mask.shape, dtype=output_dtype),
+            mx.full(mask.shape, -mx.inf, dtype=output_dtype),
         )
     else:
-        mask_value = mask_value.astype(mx.float32)
-    return mask_value + bias.astype(mx.float32)
+        mask_value = mask_value.astype(output_dtype)
+    return mask_value + bias
 
 
 def sparse_mla_fp8_route_enabled(path: KernelPath) -> bool:
@@ -1158,6 +1161,7 @@ class CausalSelfAttention(nn.Module):
             num_heads=self.config.num_q_heads,
             query_length=int(hidden_states.shape[1]),
             key_length=int(key_length),
+            target_dtype=hidden_states.dtype,
         )
         sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
         from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
