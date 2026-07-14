@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import inspect
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import mlx.core as mx
 import pytest
@@ -21,7 +22,31 @@ from cppmega_mlx.training.stage1_production import (
     stage1_production_batch_receipt,
     stage1_production_config,
 )
+
 ROOT = Path(__file__).resolve().parents[1]
+_TRAINER_MODULES = (
+    "scripts.train_stage1",
+    "scripts.train_eval_stage1",
+    "scripts.train_realshard",
+)
+_BUNDLE_ROOT = Path("/tmp/cppmega-stage1-production-bundle")
+_BUNDLE_ID = "cppmega-stage1-bundle-0123456789abcdef"
+_RESTORE_RECEIPT = _BUNDLE_ROOT / "restore_receipt.json"
+_BUNDLE_PROVENANCE_CLI = {
+    "--production-graph-domain-data": str(_BUNDLE_ROOT),
+    "--production-bucket": "4096",
+    "--production-expected-bundle-id": _BUNDLE_ID,
+    "--production-restore-receipt": str(_RESTORE_RECEIPT),
+}
+
+
+def _bundle_cli_args(*, missing: str | None = None) -> list[str]:
+    return [
+        item
+        for flag, value in _BUNDLE_PROVENANCE_CLI.items()
+        if flag != missing
+        for item in (flag, value)
+    ]
 
 
 def _production_batch(
@@ -224,11 +249,196 @@ def test_stage1_production_cli_does_not_offer_mla() -> None:
         )
 
 
-def test_named_stage1_trainers_route_explicit_recipe_through_canonical_runner() -> None:
-    for script in ("train_stage1.py", "train_eval_stage1.py", "train_realshard.py"):
-        source = (ROOT / "scripts" / script).read_text(encoding="utf-8")
-        assert "add_stage1_production_arguments" in source
-        assert "run_stage1_graph_domain_production" in source
+@pytest.mark.parametrize(
+    ("module_name", "trainer_args", "expected_call"),
+    [
+        (
+            "scripts.train_stage1",
+            ["--steps", "9", "--seed", "17", "--lr", "0.0007"],
+            {
+                "data_path": _BUNDLE_ROOT,
+                "bucket": 4096,
+                "expected_bundle_id": _BUNDLE_ID,
+                "restore_receipt": _RESTORE_RECEIPT,
+                "steps": 9,
+                "batch_size": 4,
+                "seq_len": 4096,
+                "hidden_size": 1280,
+                "depth": 24,
+                "ffn_hidden_size": 3456,
+                "learning_rate": 0.0007,
+                "seed": 17,
+                "attention_mode": "dsa",
+            },
+        ),
+        (
+            "scripts.train_eval_stage1",
+            [
+                "--steps",
+                "9",
+                "--batch",
+                "3",
+                "--seq-len",
+                "4096",
+                "--hidden",
+                "160",
+                "--depth",
+                "3",
+                "--ffn",
+                "480",
+                "--lr",
+                "0.0007",
+                "--seed",
+                "17",
+                "--no-compile",
+                "--bf16",
+            ],
+            {
+                "data_path": _BUNDLE_ROOT,
+                "bucket": 4096,
+                "expected_bundle_id": _BUNDLE_ID,
+                "restore_receipt": _RESTORE_RECEIPT,
+                "steps": 9,
+                "batch_size": 3,
+                "seq_len": 4096,
+                "hidden_size": 160,
+                "depth": 3,
+                "ffn_hidden_size": 480,
+                "learning_rate": 0.0007,
+                "seed": 17,
+                "attention_mode": "dsa",
+                "compile": False,
+                "bf16": True,
+            },
+        ),
+        (
+            "scripts.train_realshard",
+            [
+                "--steps",
+                "9",
+                "--batch",
+                "3",
+                "--seq-len",
+                "4096",
+                "--hidden",
+                "160",
+                "--depth",
+                "3",
+                "--seed",
+                "17",
+                "--bf16",
+            ],
+            {
+                "data_path": _BUNDLE_ROOT,
+                "bucket": 4096,
+                "expected_bundle_id": _BUNDLE_ID,
+                "restore_receipt": _RESTORE_RECEIPT,
+                "steps": 9,
+                "batch_size": 3,
+                "seq_len": 4096,
+                "hidden_size": 160,
+                "depth": 3,
+                "ffn_hidden_size": 3456,
+                "learning_rate": 3e-4,
+                "seed": 17,
+                "attention_mode": "dsa",
+                "bf16": True,
+            },
+        ),
+    ],
+)
+def test_named_stage1_trainers_pass_exact_bundle_provenance_to_runner(
+    module_name: str,
+    trainer_args: list[str],
+    expected_call: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module(module_name)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module,
+        "run_stage1_graph_domain_production",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            module_name,
+            *_bundle_cli_args(),
+            "--production-attention-mode",
+            "dsa",
+            *trainer_args,
+        ],
+    )
+
+    module.main()
+
+    assert calls == [expected_call]
+
+
+@pytest.mark.parametrize("module_name", _TRAINER_MODULES)
+@pytest.mark.parametrize("missing_flag", tuple(_BUNDLE_PROVENANCE_CLI))
+def test_named_stage1_trainers_reject_incomplete_bundle_mode(
+    module_name: str,
+    missing_flag: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = importlib.import_module(module_name)
+
+    def unexpected_runner_call(**_kwargs: object) -> None:
+        pytest.fail("incomplete production bundle arguments reached the runner")
+
+    monkeypatch.setattr(
+        module,
+        "run_stage1_graph_domain_production",
+        unexpected_runner_call,
+    )
+    monkeypatch.setattr(
+        sys, "argv", [module_name, *_bundle_cli_args(missing=missing_flag)]
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main()
+
+    assert error.value.code == 2
+    assert missing_flag in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("module_name", _TRAINER_MODULES)
+def test_named_stage1_trainers_reject_legacy_data_only_bundle_mode(
+    module_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = importlib.import_module(module_name)
+
+    def unexpected_runner_call(**_kwargs: object) -> None:
+        pytest.fail("legacy production bundle arguments reached the runner")
+
+    monkeypatch.setattr(
+        module,
+        "run_stage1_graph_domain_production",
+        unexpected_runner_call,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [module_name, "--production-graph-domain-data", str(_BUNDLE_ROOT)],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main()
+
+    stderr = capsys.readouterr().err
+    assert error.value.code == 2
+    for missing_flag in (
+        "--production-bucket",
+        "--production-expected-bundle-id",
+        "--production-restore-receipt",
+    ):
+        assert missing_flag in stderr
 
 
 def test_stage1_runner_requires_and_uses_only_production_bundle_ingress() -> None:

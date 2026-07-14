@@ -613,10 +613,47 @@ def main() -> int:
         help="optional dir with a real clang_semantic_4k_v10 shard (one *.parquet)",
     )
     add_stage1_production_arguments(parser)
+    parser.add_argument(
+        "--production-bucket",
+        type=int,
+        default=None,
+        help="immutable bundle sequence-length bucket",
+    )
+    parser.add_argument(
+        "--production-expected-bundle-id",
+        default=None,
+        help="exact immutable bundle ID expected by the restore receipt",
+    )
+    parser.add_argument(
+        "--production-restore-receipt",
+        type=Path,
+        default=None,
+        help="retained bundle-root restore_receipt.json",
+    )
     args = parser.parse_args()
-    if args.production_graph_domain_data is not None:
+    production_bundle_args = {
+        "--production-graph-domain-data": args.production_graph_domain_data,
+        "--production-bucket": args.production_bucket,
+        "--production-expected-bundle-id": args.production_expected_bundle_id,
+        "--production-restore-receipt": args.production_restore_receipt,
+    }
+    production_mode = any(
+        value is not None for value in production_bundle_args.values()
+    )
+    missing_bundle_args = [
+        flag for flag, value in production_bundle_args.items() if value is None
+    ]
+    if production_mode and missing_bundle_args:
+        parser.error(
+            "production bundle mode requires explicit CLI provenance for all bundle "
+            f"arguments; missing {', '.join(missing_bundle_args)}"
+        )
+    if production_mode:
         run_stage1_graph_domain_production(
             data_path=args.production_graph_domain_data,
+            bucket=args.production_bucket,
+            expected_bundle_id=args.production_expected_bundle_id,
+            restore_receipt=args.production_restore_receipt,
             steps=args.steps,
             batch_size=4,
             seq_len=4096,
