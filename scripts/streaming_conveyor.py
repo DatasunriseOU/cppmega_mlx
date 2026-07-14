@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -123,6 +124,37 @@ DEFAULT_RANGE_TARGET_BYTES = 32 * 1024 * 1024
 DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
 DEFAULT_MIN_FREE_DISK_GB = 50.0
 
+CODE_REVISION_SCHEMA_VERSION = 1
+CODE_REVISION_DRIFT_MARKER = "CPPMEGA_CODE_REVISION_DRIFT"
+CODE_REVISION_DRIFT_EXIT_CODE = 86
+CODE_REVISION_MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
+CODE_REVISION_MAX_STATUS_BYTES = 4 * 1024 * 1024
+CODE_REVISION_MAX_UNTRACKED_FILES = 4096
+CODE_REVISION_MAX_UNTRACKED_FILE_BYTES = 8 * 1024 * 1024
+CODE_REVISION_MAX_UNTRACKED_TOTAL_BYTES = 32 * 1024 * 1024
+
+# Git pathspecs are deliberately limited to executable source and configuration.
+# Corpus data, generated parquet, caches, node_modules, and outputs are never
+# traversed or hashed by the revision guard.
+CODE_REVISION_PATHS = (
+    ":(top)cppmega_mlx",
+    ":(top)cppmega_v4",
+    ":(top)scripts",
+    ":(top)tools",
+    ":(top)configs",
+    ":(top,glob)*.py",
+    ":(top,glob)*.pyi",
+    ":(top,glob)*.toml",
+    ":(top,glob)*.yaml",
+    ":(top,glob)*.yml",
+    ":(top,glob)requirements*.txt",
+    ":(top)uv.lock",
+    ":(top)setup.cfg",
+    ":(top)setup.py",
+    ":(top)Makefile",
+    ":(top)CMakeLists.txt",
+)
+
 # Stable, repo-keyed cache for the EXPENSIVE git-history extraction output. This
 # deliberately lives OUTSIDE the randomized per-run work_root so the commit
 # records (e.g. php-src's ~6h / 10GB jsonl) survive a kill/restart with the SAME
@@ -133,6 +165,472 @@ DEFAULT_MIN_FREE_DISK_GB = 50.0
 EXTRACT_CACHE_ROOT = CONVEYOR_ROOT / "extract_cache"
 
 _PRINT_LOCK = threading.Lock()
+
+
+class CodeRevisionError(RuntimeError):
+    """The production code revision cannot be captured or enforced."""
+
+
+class CodeRevisionMismatchError(CodeRevisionError):
+    """The requested/resumed revision does not match the live checkout."""
+
+
+class CodeRevisionDriftError(CodeRevisionError):
+    """The checkout changed after the conveyor captured its revision."""
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _bounded_git_output(
+    repo_root: Path,
+    args: Sequence[str],
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Run one deterministic Git query with bounded captured stdout."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
+    )
+    command = [
+        "git",
+        "-c",
+        "color.ui=false",
+        "-C",
+        str(repo_root),
+        *args,
+    ]
+    with tempfile.TemporaryFile() as stdout_fh:
+        proc = subprocess.run(
+            command,
+            stdout=stdout_fh,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        size = stdout_fh.tell()
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace")[-2000:]
+            raise CodeRevisionError(
+                f"git revision query failed ({proc.returncode}): "
+                f"{' '.join(args)}: {stderr}"
+            )
+        if size > max_bytes:
+            raise CodeRevisionError(
+                f"git revision query exceeded {max_bytes} bytes "
+                f"({size} bytes): {' '.join(args)}"
+            )
+        stdout_fh.seek(0)
+        return stdout_fh.read()
+
+
+def _hash_untracked_source_files(repo_root: Path, paths_blob: bytes) -> str:
+    """Hash bounded untracked source files, never corpus/output trees."""
+    raw_paths = sorted(path for path in paths_blob.split(b"\0") if path)
+    if len(raw_paths) > CODE_REVISION_MAX_UNTRACKED_FILES:
+        raise CodeRevisionError(
+            "relevant untracked source count exceeds revision guard bound: "
+            f"{len(raw_paths)} > {CODE_REVISION_MAX_UNTRACKED_FILES}"
+        )
+
+    total_bytes = 0
+    digest = hashlib.sha256()
+    for raw_path in raw_paths:
+        relative = Path(os.fsdecode(raw_path))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise CodeRevisionError(f"unsafe untracked Git path: {relative}")
+        path = repo_root / relative
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError as exc:
+            raise CodeRevisionError(
+                f"untracked source changed while fingerprinting: {relative}"
+            ) from exc
+
+        digest.update(raw_path)
+        digest.update(b"\0")
+        digest.update(f"{file_stat.st_mode & 0o7777:o}".encode("ascii"))
+        digest.update(b"\0")
+        if path.is_symlink():
+            payload = os.fsencode(os.readlink(path))
+            if len(payload) > CODE_REVISION_MAX_UNTRACKED_FILE_BYTES:
+                raise CodeRevisionError(
+                    f"untracked symlink target exceeds revision guard bound: {relative}"
+                )
+            total_bytes += len(payload)
+            digest.update(b"symlink\0")
+            digest.update(payload)
+        elif path.is_file():
+            if file_stat.st_size > CODE_REVISION_MAX_UNTRACKED_FILE_BYTES:
+                raise CodeRevisionError(
+                    "untracked source exceeds per-file revision guard bound: "
+                    f"{relative} ({file_stat.st_size} bytes)"
+                )
+            total_bytes += file_stat.st_size
+            if total_bytes > CODE_REVISION_MAX_UNTRACKED_TOTAL_BYTES:
+                raise CodeRevisionError(
+                    "untracked sources exceed total revision guard bound: "
+                    f"{total_bytes} bytes"
+                )
+            digest.update(b"file\0")
+            with path.open("rb") as fh:
+                while chunk := fh.read(1024 * 1024):
+                    digest.update(chunk)
+        else:
+            raise CodeRevisionError(
+                f"unsupported untracked source file type: {relative}"
+            )
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
+    """Capture HEAD plus a bounded source/config-only dirty-tree identity."""
+    repo_root = repo_root.resolve()
+    head_before = _bounded_git_output(
+        repo_root,
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        max_bytes=256,
+    ).decode("ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", head_before) is None:
+        raise CodeRevisionError(f"git returned a non-exact HEAD: {head_before!r}")
+
+    path_args = ("--", *CODE_REVISION_PATHS)
+    status = _bounded_git_output(
+        repo_root,
+        (
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            *path_args,
+        ),
+        max_bytes=CODE_REVISION_MAX_STATUS_BYTES,
+    )
+    index_diff = _bounded_git_output(
+        repo_root,
+        (
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "HEAD",
+            *path_args,
+        ),
+        max_bytes=CODE_REVISION_MAX_GIT_OUTPUT_BYTES,
+    )
+    worktree_diff = _bounded_git_output(
+        repo_root,
+        (
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            *path_args,
+        ),
+        max_bytes=CODE_REVISION_MAX_GIT_OUTPUT_BYTES,
+    )
+    untracked_paths = _bounded_git_output(
+        repo_root,
+        ("ls-files", "--others", "--exclude-standard", "-z", *path_args),
+        max_bytes=CODE_REVISION_MAX_STATUS_BYTES,
+    )
+    untracked_sha256 = _hash_untracked_source_files(repo_root, untracked_paths)
+    head_after = _bounded_git_output(
+        repo_root,
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        max_bytes=256,
+    ).decode("ascii").strip()
+    if head_after != head_before:
+        raise CodeRevisionError(
+            "HEAD changed while the conveyor captured its code revision: "
+            f"{head_before} -> {head_after}"
+        )
+
+    components = {
+        "status_sha256": _sha256_bytes(status),
+        "index_diff_sha256": _sha256_bytes(index_diff),
+        "worktree_diff_sha256": _sha256_bytes(worktree_diff),
+        "untracked_sources_sha256": untracked_sha256,
+    }
+    dirty_fingerprint = _sha256_bytes(
+        json.dumps(components, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    relevant_scope_sha256 = _sha256_bytes(
+        b"\0".join(path.encode("utf-8") for path in CODE_REVISION_PATHS)
+    )
+    return {
+        "schema_version": CODE_REVISION_SCHEMA_VERSION,
+        "git_commit": head_before,
+        "dirty": bool(status),
+        "dirty_fingerprint": dirty_fingerprint,
+        "index_dirty": bool(index_diff),
+        "worktree_dirty": bool(worktree_diff),
+        "untracked_source_dirty": bool(untracked_paths),
+        "relevant_scope_sha256": relevant_scope_sha256,
+        "relevant_pathspecs": list(CODE_REVISION_PATHS),
+        "bounds": {
+            "max_git_output_bytes": CODE_REVISION_MAX_GIT_OUTPUT_BYTES,
+            "max_status_bytes": CODE_REVISION_MAX_STATUS_BYTES,
+            "max_untracked_files": CODE_REVISION_MAX_UNTRACKED_FILES,
+            "max_untracked_file_bytes": CODE_REVISION_MAX_UNTRACKED_FILE_BYTES,
+            "max_untracked_total_bytes": CODE_REVISION_MAX_UNTRACKED_TOTAL_BYTES,
+        },
+        **components,
+    }
+
+
+def _code_revision_identity(receipt: dict) -> tuple:
+    required = (
+        "schema_version",
+        "git_commit",
+        "dirty",
+        "dirty_fingerprint",
+        "relevant_scope_sha256",
+    )
+    missing = [key for key in required if key not in receipt]
+    if missing:
+        raise CodeRevisionMismatchError(
+            "manifest code revision receipt is missing: " + ", ".join(missing)
+        )
+    return tuple(receipt[key] for key in required)
+
+
+def _dirty_component_names(snapshot: dict) -> list[str]:
+    return [
+        name
+        for name, key in (
+            ("index", "index_dirty"),
+            ("worktree", "worktree_dirty"),
+            ("untracked source", "untracked_source_dirty"),
+        )
+        if snapshot.get(key)
+    ]
+
+
+class CodeRevisionGuard:
+    """Fail-closed production pin for every conveyor stage submission."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        snapshot: dict,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self.repo_root = repo_root.resolve()
+        self.snapshot = json.loads(json.dumps(snapshot))
+        self.stop_event = stop_event
+        self._verify_lock = threading.Lock()
+
+    @classmethod
+    def for_production(
+        cls,
+        expected_code_revision: str | None,
+        *,
+        repo_root: Path = MLX_ROOT,
+        stop_event: threading.Event | None = None,
+    ) -> "CodeRevisionGuard":
+        if expected_code_revision is None:
+            raise CodeRevisionMismatchError(
+                "--expected-code-revision is required for production conveyor runs"
+            )
+        expected = expected_code_revision.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
+            raise CodeRevisionMismatchError(
+                "--expected-code-revision must be an exact 40-character Git commit"
+            )
+        snapshot = capture_code_revision(repo_root)
+        if snapshot["git_commit"] != expected:
+            raise CodeRevisionMismatchError(
+                "expected code revision does not match HEAD: "
+                f"expected={expected} actual={snapshot['git_commit']}"
+            )
+        if snapshot["dirty"]:
+            dirty_parts = ", ".join(_dirty_component_names(snapshot)) or "unknown"
+            raise CodeRevisionMismatchError(
+                "production conveyor requires a clean executable source/config "
+                f"worktree; dirty components: {dirty_parts}; "
+                f"fingerprint={snapshot['dirty_fingerprint']}"
+            )
+        return cls(repo_root, snapshot, stop_event=stop_event)
+
+    @property
+    def git_commit(self) -> str:
+        return str(self.snapshot["git_commit"])
+
+    @property
+    def receipt(self) -> dict:
+        return {
+            **json.loads(json.dumps(self.snapshot)),
+            "repo_root": str(self.repo_root),
+            "clean_worktree_required": True,
+            "expected_code_revision": self.git_commit,
+            "child_python_preflight": "sitecustomize",
+        }
+
+    def verify(self, submission: str) -> None:
+        """Verify the pinned clean state immediately before one submission."""
+        try:
+            with self._verify_lock:
+                head = _bounded_git_output(
+                    self.repo_root,
+                    ("rev-parse", "--verify", "HEAD^{commit}"),
+                    max_bytes=256,
+                ).decode("ascii").strip()
+                status = _bounded_git_output(
+                    self.repo_root,
+                    (
+                        "status",
+                        "--porcelain=v2",
+                        "-z",
+                        "--untracked-files=all",
+                        "--ignore-submodules=none",
+                        "--",
+                        *CODE_REVISION_PATHS,
+                    ),
+                    max_bytes=CODE_REVISION_MAX_STATUS_BYTES,
+                )
+        except CodeRevisionError as exc:
+            self._raise_drift(submission, f"verification failed: {exc}")
+        if head == self.git_commit and not status:
+            return
+
+        details = [f"HEAD {self.git_commit} -> {head}"] if head != self.git_commit else []
+        if status:
+            try:
+                current = capture_code_revision(self.repo_root)
+                details.extend(_dirty_component_names(current))
+                details.append(f"fingerprint={current['dirty_fingerprint']}")
+            except CodeRevisionError as exc:
+                details.append(f"dirty-state capture failed: {exc}")
+        self._raise_drift(submission, "; ".join(details) or "unknown revision drift")
+
+    def _raise_drift(self, submission: str, detail: str) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+        raise CodeRevisionDriftError(
+            f"{CODE_REVISION_DRIFT_MARKER}: code revision drift before "
+            f"{submission}: {detail}"
+        )
+
+
+def _write_atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+def install_code_revision_child_guard(
+    guard: CodeRevisionGuard,
+    conveyor_root: Path,
+) -> Path:
+    """Install an immutable child-start check and prepend it to PYTHONPATH."""
+    shadow = guard.repo_root / "sitecustomize.py"
+    if shadow.exists():
+        raise CodeRevisionError(
+            f"repository sitecustomize.py would shadow revision guard: {shadow}"
+        )
+    guard_dir = (
+        conveyor_root
+        / "code_revision_guard"
+        / f"{guard.git_commit}-{guard.snapshot['dirty_fingerprint'][:16]}"
+    )
+    sitecustomize_path = guard_dir / "sitecustomize.py"
+    source = f'''# Generated by streaming_conveyor.py; do not edit during a run.
+import hashlib
+import os
+import subprocess
+import sys
+
+_EXPECTED = {guard.git_commit!r}
+_REPO_ROOT = {str(guard.repo_root)!r}
+_PATHS = {CODE_REVISION_PATHS!r}
+_MARKER = {CODE_REVISION_DRIFT_MARKER!r}
+_EXIT_CODE = {CODE_REVISION_DRIFT_EXIT_CODE}
+_MAX_STATUS = {CODE_REVISION_MAX_STATUS_BYTES}
+
+
+def _fail(detail):
+    sys.stderr.write(f"{{_MARKER}}: {{detail}}\\n")
+    sys.stderr.flush()
+    os._exit(_EXIT_CODE)
+
+
+def _git(args, limit):
+    env = dict(os.environ)
+    env.update({{"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C", "LANG": "C"}})
+    proc = subprocess.run(
+        ["git", "-c", "color.ui=false", "-C", _REPO_ROOT, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    if proc.returncode != 0:
+        _fail("git preflight failed: " + proc.stderr.decode("utf-8", "replace")[-1000:])
+    if len(proc.stdout) > limit:
+        _fail(f"git preflight output exceeded {{limit}} bytes")
+    return proc.stdout
+
+
+_head = _git(("rev-parse", "--verify", "HEAD^{{commit}}"), 256).decode("ascii").strip()
+_status = _git(
+    (
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+        "--",
+        *_PATHS,
+    ),
+    _MAX_STATUS,
+)
+if _head != _EXPECTED:
+    _fail(f"HEAD drift: expected={{_EXPECTED}} actual={{_head}}")
+if _status:
+    _fail(
+        "tracked/index/untracked source drift: status_sha256="
+        + hashlib.sha256(_status).hexdigest()
+    )
+'''
+    _write_atomic_text(sitecustomize_path, source)
+    launch_receipt = {
+        "schema_version": 1,
+        "code_revision": guard.receipt,
+        "sitecustomize": str(sitecustomize_path),
+        "sitecustomize_sha256": _sha256_bytes(source.encode("utf-8")),
+        "drift_marker": CODE_REVISION_DRIFT_MARKER,
+        "drift_exit_code": CODE_REVISION_DRIFT_EXIT_CODE,
+    }
+    _write_atomic_text(
+        guard_dir / "launch_receipt.json",
+        json.dumps(launch_receipt, indent=2, sort_keys=True) + "\n",
+    )
+    existing = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (
+        str(guard_dir)
+        if not existing
+        else os.pathsep.join((str(guard_dir), existing))
+    )
+    return sitecustomize_path
+
+
+def _raise_if_revision_subprocess_failure(exc: RepoFailure) -> None:
+    if CODE_REVISION_DRIFT_MARKER in exc.detail:
+        raise CodeRevisionDriftError(exc.detail) from exc
 
 
 def configure_output_roots(
@@ -221,14 +719,26 @@ def _log(msg: str) -> None:
 class BackgroundRecompressor:
     """Track deferred parquet recompress jobs and surface failures at shutdown."""
 
-    def __init__(self, max_workers: int) -> None:
+    def __init__(
+        self,
+        max_workers: int,
+        revision_guard: CodeRevisionGuard | None = None,
+    ) -> None:
         self._pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
         self._lock = threading.Lock()
         self._futures: list[tuple[Path, Future]] = []
         self._handled: set[int] = set()
+        self._revision_guard = revision_guard
+
+    def _recompress(self, path: Path) -> None:
+        if self._revision_guard is not None:
+            self._revision_guard.verify(f"background recompress {path}")
+        src.recompress_zstd_max(path)
 
     def submit(self, path: Path) -> Future:
-        fut = self._pool.submit(src.recompress_zstd_max, path)
+        if self._revision_guard is not None:
+            self._revision_guard.verify(f"submit background recompress {path}")
+        fut = self._pool.submit(self._recompress, path)
         with self._lock:
             self._futures.append((path, fut))
         return fut
@@ -530,6 +1040,8 @@ def ensure_commit_records(
     work_parent: Path,
     manifest: Manifest,
     resume: bool,
+    *,
+    revision_guard: CodeRevisionGuard | None = None,
 ) -> tuple[Path, int, str]:
     """Return (records_jsonl, n_records), running extract_git_history ONLY if needed.
 
@@ -592,6 +1104,8 @@ def ensure_commit_records(
         cache_status = "fresh"
 
     # (c) Fresh extract into the stable cache. FAIL LOUD on empty git log / output.
+    if revision_guard is not None:
+        revision_guard.verify(f"git commit-list stage for {repo}")
     commit_list = get_commit_list(repo_dir)
     if not commit_list:
         raise RepoNoCommitRecords(
@@ -600,6 +1114,8 @@ def ensure_commit_records(
             detail="no --no-merges --diff-filter=M commits",
         )
     cache_dir.mkdir(parents=True, exist_ok=True)
+    if revision_guard is not None:
+        revision_guard.verify(f"extract_git_history stage for {repo}")
     records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
     n = _count_jsonl_lines(records_jsonl)
     if n == 0:
@@ -920,30 +1436,58 @@ class ConcurrentManifest(Manifest):
     full-file ``save()`` is disabled so the clobber cannot be reintroduced.
     """
 
-    def __init__(self, path: Path, done: dict | None = None, failed: dict | None = None):
+    def __init__(
+        self,
+        path: Path,
+        done: dict | None = None,
+        failed: dict | None = None,
+        code_revision: dict | None = None,
+    ):
         # Bypass the dataclass __init__ so we can attach lock state.
         self.path = path
         self.done = dict(done or {})
         self.failed = dict(failed or {})
+        self.code_revision = (
+            json.loads(json.dumps(code_revision)) if code_revision is not None else None
+        )
         self._lock_path = Path(str(path) + ".lock")
         self._thread_lock = threading.Lock()
 
     @classmethod
     def load(cls, path: Path) -> "ConcurrentManifest":
-        base = Manifest.load(path)
-        return cls(path=path, done=base.done, failed=base.failed)
+        if not path.exists():
+            return cls(path=path)
+        blob = json.loads(path.read_text())
+        return cls(
+            path=path,
+            done=blob.get("done", {}),
+            failed=blob.get("failed", {}),
+            code_revision=blob.get("code_revision"),
+        )
 
-    def _read_disk(self) -> tuple[dict, dict]:
+    def _read_disk(self) -> dict:
         if self.path.exists():
             blob = json.loads(self.path.read_text())
-            return blob.get("done", {}), blob.get("failed", {})
-        return {}, {}
+            return {
+                "done": blob.get("done", {}),
+                "failed": blob.get("failed", {}),
+                "code_revision": blob.get("code_revision"),
+            }
+        return {"done": {}, "failed": {}, "code_revision": None}
 
     def _atomic_replace(self, done: dict, failed: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+        code_revision = getattr(
+            self,
+            "_pending_code_revision",
+            self.code_revision,
+        )
+        payload = {"done": done, "failed": failed}
+        if code_revision is not None:
+            payload["code_revision"] = code_revision
         tmp.write_text(
-            json.dumps({"done": done, "failed": failed}, indent=2, sort_keys=True)
+            json.dumps(payload, indent=2, sort_keys=True)
         )
         tmp.replace(self.path)  # atomic on POSIX
 
@@ -956,11 +1500,16 @@ class ConcurrentManifest(Manifest):
             fh = self._lock_path.open("a+", encoding="utf-8")
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                done, failed = self._read_disk()
-                apply_change(done, failed)
-                self._atomic_replace(done, failed)
-                self.done = done
-                self.failed = failed
+                state = self._read_disk()
+                apply_change(state)
+                self._pending_code_revision = state["code_revision"]
+                try:
+                    self._atomic_replace(state["done"], state["failed"])
+                finally:
+                    del self._pending_code_revision
+                self.done = state["done"]
+                self.failed = state["failed"]
+                self.code_revision = state["code_revision"]
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
                 fh.close()
@@ -968,7 +1517,9 @@ class ConcurrentManifest(Manifest):
     def mark_done(self, key: str, info: dict) -> None:
         resolved_failures = _resolved_failure_keys_for_success(key)
 
-        def apply(done: dict, failed: dict) -> None:
+        def apply(state: dict) -> None:
+            done = state["done"]
+            failed = state["failed"]
             done[key] = info
             for failure_key in resolved_failures:
                 failed.pop(failure_key, None)
@@ -978,7 +1529,9 @@ class ConcurrentManifest(Manifest):
     def mark_started(self, key: str) -> None:
         """Invalidate stale terminal state before a real retry starts."""
 
-        def apply(done: dict, failed: dict) -> None:
+        def apply(state: dict) -> None:
+            done = state["done"]
+            failed = state["failed"]
             done.pop(key, None)
             failed.pop(key, None)
 
@@ -987,7 +1540,9 @@ class ConcurrentManifest(Manifest):
     def mark_started_prefix(self, prefix: str) -> None:
         """Invalidate every stale range state for one logical parent."""
 
-        def apply(done: dict, failed: dict) -> None:
+        def apply(state: dict) -> None:
+            done = state["done"]
+            failed = state["failed"]
             for key in tuple(done):
                 if key.startswith(prefix):
                     done.pop(key)
@@ -1004,9 +1559,36 @@ class ConcurrentManifest(Manifest):
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
-        def apply(done: dict, failed: dict) -> None:
+        def apply(state: dict) -> None:
+            done = state["done"]
+            failed = state["failed"]
             done.pop(key, None)
             failed[key] = rec
+
+        self._merge_under_lock(apply)
+
+    def bind_code_revision(self, receipt: dict) -> None:
+        """Atomically bind resume state to one exact code identity."""
+        requested_identity = _code_revision_identity(receipt)
+
+        def apply(state: dict) -> None:
+            existing = state["code_revision"]
+            if existing is None:
+                if state["done"] or state["failed"]:
+                    raise CodeRevisionMismatchError(
+                        "existing conveyor manifest has work receipts but no code "
+                        "revision; use a new conveyor/output root"
+                    )
+                state["code_revision"] = json.loads(json.dumps(receipt))
+                return
+            if _code_revision_identity(existing) != requested_identity:
+                raise CodeRevisionMismatchError(
+                    "conveyor manifest code revision mismatch: "
+                    f"manifest={existing.get('git_commit')}:"
+                    f"{existing.get('dirty_fingerprint')} requested="
+                    f"{receipt.get('git_commit')}:{receipt.get('dirty_fingerprint')}; "
+                    "resume requires the same revision or a new conveyor/output root"
+                )
 
         self._merge_under_lock(apply)
 
@@ -1521,6 +2103,7 @@ def run_code_half(
     index_timeout_s: int | None = None,
     index_stall_timeout_s: int | None = None,
     recompressor: BackgroundRecompressor | None = None,
+    revision_guard: CodeRevisionGuard | None = None,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -1535,6 +2118,8 @@ def run_code_half(
     promoted = False
     try:
         try:
+            if revision_guard is not None:
+                revision_guard.verify(f"code pipeline stage for {repo}")
             info = sr.process_one_repo(
                 repo, repo_dir, lengths_code, work_root, dedup_db, dedup_near,
                 global_symbol_index, memory_limit_gb, parse_workers, index_timeout_s,
@@ -1543,6 +2128,7 @@ def run_code_half(
                 promote_dedup_on_success=False,
             )
         except RepoFailure as exc:
+            _raise_if_revision_subprocess_failure(exc)
             skip_reason = code_skip_reason(exc)
             if skip_reason is not None:
                 return {
@@ -1568,6 +2154,8 @@ def run_code_half(
                 dest = sr.OUTPUT_ROOT / str(L) / f"{repo}.parquet"
                 if dest.exists():
                     if recompressor is None:
+                        if revision_guard is not None:
+                            revision_guard.verify(f"recompress stage for {repo}:{L}")
                         src.recompress_zstd_max(dest)
                     else:
                         jobs.append((dest, recompressor.submit(dest)))
@@ -1719,6 +2307,7 @@ def run_code_half_adaptive(
     *,
     runner: CodeRunner | None = None,
     recompressor: BackgroundRecompressor | None = None,
+    revision_guard: CodeRevisionGuard | None = None,
 ) -> dict:
     """Run the code half, retrying index_project peaks/stalls with one parser.
 
@@ -1728,23 +2317,32 @@ def run_code_half_adaptive(
     while removing avoidable IPC/parser concurrency pressure.
     """
     active_runner = run_code_half if runner is None else runner
-    try:
-        return active_runner(
+    def invoke(active_parse_workers: int, active_dedup_near: bool) -> dict:
+        if revision_guard is not None:
+            revision_guard.verify(f"submit code pipeline for {repo}")
+        args = (
             repo,
             project_id,
             repo_dir,
             lengths_code,
             work_root,
             dedup_db,
-            dedup_near,
+            active_dedup_near,
             global_symbol_index,
             memory_limit_gb,
-            parse_workers,
+            active_parse_workers,
             index_timeout_s,
             index_stall_timeout_s,
             recompressor,
         )
+        if active_runner is run_code_half:
+            return active_runner(*args, revision_guard=revision_guard)
+        return active_runner(*args)
+
+    try:
+        return invoke(parse_workers, dedup_near)
     except RepoFailure as exc:
+        _raise_if_revision_subprocess_failure(exc)
         if parse_workers <= 1 or not is_retryable_index_project_failure(exc):
             raise
         _log(
@@ -1752,21 +2350,7 @@ def run_code_half_adaptive(
             f"parse_workers={parse_workers}; retrying parse_workers=1 with "
             "global exact/chunk dedup and near-dedup disabled"
         )
-        return active_runner(
-            repo,
-            project_id,
-            repo_dir,
-            lengths_code,
-            work_root,
-            dedup_db,
-            False,
-            global_symbol_index,
-            memory_limit_gb,
-            1,
-            index_timeout_s,
-            index_stall_timeout_s,
-            recompressor,
-        )
+        return invoke(1, False)
 
 
 RangeRunner = Callable[
@@ -1831,6 +2415,7 @@ def process_range_adaptive(
     analysis_cache_entries: int = 128,
     min_range_size: int = DEFAULT_MIN_RETRY_RANGE_SIZE,
     runner: RangeRunner | None = None,
+    revision_guard: CodeRevisionGuard | None = None,
 ) -> dict[str, list[tuple[int, int, dict]] | list[tuple[int, int, RepoFailure]]]:
     """Run a commit range, recursively splitting only peak-OOM failures.
 
@@ -1846,6 +2431,10 @@ def process_range_adaptive(
     active_runner = process_range if runner is None else runner
 
     try:
+        if revision_guard is not None:
+            revision_guard.verify(
+                f"commit range stage for {repo}[{start}:{end}]"
+            )
         info = active_runner(
             repo,
             repo_dir,
@@ -1863,6 +2452,7 @@ def process_range_adaptive(
         )
         return {"done": [(start, end, info)], "failed": []}
     except RepoFailure as exc:
+        _raise_if_revision_subprocess_failure(exc)
         if (end - start) <= min_range_size or not is_splitworthy_range_failure(exc):
             return {"done": [], "failed": [(start, end, exc)]}
         mid = start + ((end - start) // 2)
@@ -1886,6 +2476,7 @@ def process_range_adaptive(
             analysis_cache_entries=analysis_cache_entries,
             min_range_size=min_range_size,
             runner=active_runner,
+            revision_guard=revision_guard,
         )
         right = process_range_adaptive(
             repo,
@@ -1903,6 +2494,7 @@ def process_range_adaptive(
             analysis_cache_entries=analysis_cache_entries,
             min_range_size=min_range_size,
             runner=active_runner,
+            revision_guard=revision_guard,
         )
         return {
             "done": [*left["done"], *right["done"]],
@@ -1981,7 +2573,10 @@ def handle_repo_future_result(
     """Consume one repo future and persist any escaped failure immediately."""
     try:
         result = future.result()
+    except CodeRevisionDriftError:
+        raise
     except RepoFailure as exc:
+        _raise_if_revision_subprocess_failure(exc)
         _log(f"FAIL {repo}::repo: {exc}")
         with manifest_lock:
             manifest.mark_failed(f"{repo}::repo", exc.stage, exc.detail)
@@ -1999,6 +2594,21 @@ def handle_repo_future_result(
         int(result.get("commits_done", 0)),
         int(result.get("commits_failed", 0)),
     )
+
+
+def guard_source_submissions(source, revision_guard: CodeRevisionGuard):
+    """Verify immediately before advancing a source iterator that may spawn."""
+    iterator = iter(source)
+    try:
+        while True:
+            revision_guard.verify("source stream submission")
+            try:
+                yield next(iterator)
+            except StopIteration:
+                return
+    finally:
+        if hasattr(iterator, "close"):
+            iterator.close()
 
 
 def stream_source_with_repo_future_drain(
@@ -2076,6 +2686,7 @@ def run_commits_half(
     dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
     range_runner_override: RangeRunner | None = None,
     commit_records_override: CommitRecordsProvider | None = None,
+    revision_guard: CodeRevisionGuard | None = None,
 ) -> tuple[int, int, bool]:
     """Extract commit records once (checkpointed), fan ranges to the pool.
 
@@ -2120,13 +2731,23 @@ def run_commits_half(
 
     # Reuse a cached/adopted extract when available; never re-run the ~6h extract
     # for a repo whose commit extraction already completed (sentinel or manifest).
-    records_provider = (
-        ensure_commit_records if commit_records_override is None else commit_records_override
-    )
     try:
-        records_jsonl, n_records, extract_cache_status = records_provider(
-            repo, repo_dir, work_root, work_parent, manifest, resume,
-        )
+        if commit_records_override is None:
+            records_jsonl, n_records, extract_cache_status = ensure_commit_records(
+                repo,
+                repo_dir,
+                work_root,
+                work_parent,
+                manifest,
+                resume,
+                revision_guard=revision_guard,
+            )
+        else:
+            if revision_guard is not None:
+                revision_guard.verify(f"commit records provider for {repo}")
+            records_jsonl, n_records, extract_cache_status = commit_records_override(
+                repo, repo_dir, work_root, work_parent, manifest, resume,
+            )
     except RepoNoCommitRecords as exc:
         raise RepoFailure(
             repo,
@@ -2426,6 +3047,10 @@ def run_commits_half(
                 )
                 return None
         try:
+            if revision_guard is not None:
+                revision_guard.verify(
+                    f"submit commit range for {repo}[{sub_start}:{sub_end}]"
+                )
             with manifest_lock:
                 manifest.mark_started(rkey)
             if progress is not None:
@@ -2444,6 +3069,7 @@ def run_commits_half(
                 memory_limit_gb,
                 analysis_cache_entries=analysis_cache_entries,
                 runner=range_runner,
+                revision_guard=revision_guard,
             )
         except Exception:
             if reservation is not None:
@@ -2460,10 +3086,13 @@ def run_commits_half(
         start, end = item
         try:
             adaptive_result = fut.result()
+        except CodeRevisionDriftError:
+            raise
         except CancelledError:
             # Never started -> leave un-marked so resume re-runs this range.
             return
         except RepoFailure as exc:
+            _raise_if_revision_subprocess_failure(exc)
             mark_failed_range(start, end, exc)
             return
         except SymbolIdentityError:
@@ -2563,6 +3192,7 @@ def process_one_repo(
     analysis_cache_entries: int = 128,
     dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
     retain_partial_work: bool = False,
+    revision_guard: CodeRevisionGuard | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -2675,6 +3305,7 @@ def process_one_repo(
                             code_index_timeout_s,
                             code_index_stall_timeout_s,
                             recompressor=code_recompressor,
+                            revision_guard=revision_guard,
                         )
                         if cinfo.get("skipped"):
                             with manifest_lock:
@@ -2720,7 +3351,10 @@ def process_one_repo(
                                 f"DONE {ck}: buckets={sorted(cinfo['lengths'].keys())} "
                                 f"(cum_all={cumulative['valid']})"
                             )
+                except CodeRevisionDriftError:
+                    raise
                 except RepoFailure as exc:
+                    _raise_if_revision_subprocess_failure(exc)
                     _log(f"FAIL {ck}: {exc}")
                     with manifest_lock:
                         manifest.mark_failed(ck, exc.stage, exc.detail)
@@ -2752,10 +3386,14 @@ def process_one_repo(
                     analysis_cache_entries,
                     range_target_bytes=range_target_bytes,
                     dedup_promote_batch_size=dedup_promote_batch_size,
+                    revision_guard=revision_guard,
                 )
                 result["commits_done"] = done
                 result["commits_failed"] = failed
+            except CodeRevisionDriftError:
+                raise
             except RepoFailure as exc:
+                _raise_if_revision_subprocess_failure(exc)
                 _log(f"FAIL {repo}::commits: {exc}")
                 all_ranges_done = False
                 with manifest_lock:
@@ -2854,6 +3492,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--token-budget", type=int, default=None,
                    help="Stop after cumulative valid tokens (code + all commit "
                         "buckets) reaches this.")
+    p.add_argument(
+        "--expected-code-revision",
+        default=None,
+        help="Required exact 40-character Git commit for a production run. "
+             "The executable source/config worktree must also be clean.",
+    )
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--keep-temp", action="store_true")
     p.add_argument("--retain-partial-work", action="store_true",
@@ -2995,6 +3639,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     configure_runtime_paths_from_args(args)
+    try:
+        revision_guard = CodeRevisionGuard.for_production(
+            args.expected_code_revision,
+            repo_root=MLX_ROOT,
+            stop_event=STOP_EVENT,
+        )
+    except CodeRevisionError as exc:
+        raise SystemExit(str(exc)) from exc
     lengths_code = tuple(sorted(
         int(x) for x in args.target_lengths_code.split(",") if x.strip()))
     lengths_commits = tuple(sorted(
@@ -3164,11 +3816,22 @@ def main(argv: list[str]) -> int:
     # CONVEYOR_MANIFEST; ConcurrentManifest merges + flocks every write so they
     # cannot clobber each other's resume/accounting keys (H4 fix).
     manifest = ConcurrentManifest.load(CONVEYOR_MANIFEST)
+    try:
+        manifest.bind_code_revision(revision_guard.receipt)
+        child_guard_path = install_code_revision_child_guard(
+            revision_guard,
+            CONVEYOR_ROOT,
+        )
+    except CodeRevisionError as exc:
+        raise SystemExit(str(exc)) from exc
     manifest_lock = threading.Lock()
     resume = not args.no_resume
     progress = ProgressWriter(Path(args.progress_jsonl) if args.progress_jsonl else None)
     code_recompressor = (
-        BackgroundRecompressor(args.code_recompress_workers)
+        BackgroundRecompressor(
+            args.code_recompress_workers,
+            revision_guard=revision_guard,
+        )
         if args.background_code_recompress and args.streams in {"both", "code"}
         else None
     )
@@ -3187,6 +3850,8 @@ def main(argv: list[str]) -> int:
     )
     progress.emit(
         "run_started",
+        code_revision=revision_guard.receipt,
+        code_revision_child_guard=str(child_guard_path),
         streams=args.streams,
         workers=workers,
         repo_workers=repo_workers,
@@ -3294,6 +3959,7 @@ def main(argv: list[str]) -> int:
 
     if args.source_cache_populate_only:
         try:
+            revision_guard.verify("source cache population stage")
             report = populate_code_source_cache(
                 work_root,
                 source_cache_dir,
@@ -3372,6 +4038,7 @@ def main(argv: list[str]) -> int:
                 on_no_git=mark_no_git_repo,
             )
         )
+        gen = guard_source_submissions(gen, revision_guard)
 
         if repo_pool is None:
             for repo, repo_dir in gen:
@@ -3382,6 +4049,7 @@ def main(argv: list[str]) -> int:
                         gen.close()
                     break
                 claim_repo_once(repo)
+                revision_guard.verify(f"submit repo worker for {repo}")
                 res = process_one_repo(
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
                     args.range_target_bytes,
@@ -3401,6 +4069,7 @@ def main(argv: list[str]) -> int:
                     analysis_cache_entries=args.analysis_cache_entries,
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     retain_partial_work=args.retain_partial_work,
+                    revision_guard=revision_guard,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -3486,6 +4155,7 @@ def main(argv: list[str]) -> int:
                     if hasattr(gen, "close"):
                         gen.close()
                     break
+                revision_guard.verify(f"submit repo worker for {repo}")
                 fut = repo_pool.submit(
                     process_one_repo,
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
@@ -3506,6 +4176,7 @@ def main(argv: list[str]) -> int:
                     analysis_cache_entries=args.analysis_cache_entries,
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     retain_partial_work=args.retain_partial_work,
+                    revision_guard=revision_guard,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
@@ -3583,6 +4254,7 @@ def main(argv: list[str]) -> int:
         "dedup_db": str(dedup_db) if dedup_db else None,
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
+        "code_revision": revision_guard.receipt,
         "extract_cache_metrics": progress.extract_cache_metrics(),
         "interrupted": interrupted,
     }
