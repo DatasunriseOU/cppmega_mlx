@@ -49,6 +49,7 @@ repos AND across the two streams.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -81,6 +82,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 import streaming_reindex as sr  # noqa: E402
 import streaming_reindex_commits as src  # noqa: E402
+from nanochat_data import extract_git_history as extract_history  # noqa: E402
 
 SymbolIdentityError = sr.SymbolIdentityError
 
@@ -155,14 +157,14 @@ CODE_REVISION_PATHS = (
     ":(top)CMakeLists.txt",
 )
 
-# Stable, repo-keyed cache for the EXPENSIVE git-history extraction output. This
-# deliberately lives OUTSIDE the randomized per-run work_root so the commit
-# records (e.g. php-src's ~6h / 10GB jsonl) survive a kill/restart with the SAME
-# args -- the new run gets a fresh random work_root, so a per-run jsonl would be
-# orphaned and re-extracted from scratch. The cache holds <repo>_commits.jsonl
-# plus a <repo>_commits.jsonl.done sentinel (line/size/mtime), and is only
-# deleted once EVERY unit of the repo (code + all ranges) is marked done.
+# Run-local, repo-keyed cache for the EXPENSIVE git-history extraction output.
+# An explicit --extract-cache-root changes ownership to EXTERNAL: the same
+# extractor checkpoint/publication can then be reused across independent
+# conveyor roots and is never deleted by conveyor cleanup.
 EXTRACT_CACHE_ROOT = CONVEYOR_ROOT / "extract_cache"
+EXTRACT_CACHE_MODE_RUN_LOCAL = "run_local"
+EXTRACT_CACHE_MODE_EXTERNAL = "external"
+EXTRACT_CACHE_MODE = EXTRACT_CACHE_MODE_RUN_LOCAL
 
 _PRINT_LOCK = threading.Lock()
 
@@ -638,6 +640,7 @@ def configure_output_roots(
     code_output_root: str | os.PathLike[str] | None = None,
     commit_output_root: str | os.PathLike[str] | None = None,
     conveyor_root: str | os.PathLike[str] | None = None,
+    extract_cache_root: str | os.PathLike[str] | None = None,
 ) -> None:
     """Rebase all runtime output roots used by the conveyor.
 
@@ -654,6 +657,7 @@ def configure_output_roots(
     global DEFAULT_WORK_PARENT
     global DEFAULT_RESERVATION_FILE
     global EXTRACT_CACHE_ROOT
+    global EXTRACT_CACHE_MODE
 
     if code_output_root is not None:
         sr.OUTPUT_ROOT = Path(code_output_root)
@@ -669,6 +673,10 @@ def configure_output_roots(
         DEFAULT_WORK_PARENT = CONVEYOR_ROOT / "tmp"
         DEFAULT_RESERVATION_FILE = CONVEYOR_ROOT / "_reservations.json"
         EXTRACT_CACHE_ROOT = CONVEYOR_ROOT / "extract_cache"
+        EXTRACT_CACHE_MODE = EXTRACT_CACHE_MODE_RUN_LOCAL
+    if extract_cache_root is not None:
+        EXTRACT_CACHE_ROOT = Path(extract_cache_root).expanduser().resolve()
+        EXTRACT_CACHE_MODE = EXTRACT_CACHE_MODE_EXTERNAL
 
 
 def configure_runtime_paths_from_args(args: argparse.Namespace) -> None:
@@ -682,6 +690,7 @@ def configure_runtime_paths_from_args(args: argparse.Namespace) -> None:
         code_output_root=args.code_output_root,
         commit_output_root=args.commit_output_root,
         conveyor_root=args.conveyor_root,
+        extract_cache_root=args.extract_cache_root,
     )
 
     if Path(args.progress_jsonl) == old_defaults["progress_jsonl"]:
@@ -922,12 +931,53 @@ def validate_memory_plan(
 
 # --------------------------------------------------------------------------- #
 # Extract checkpoint: never re-run the (~6h) extract_git_history for a repo whose
-# commit extraction already completed. The records jsonl is written to a STABLE
-# repo-keyed cache (EXTRACT_CACHE_ROOT/<repo>/) guarded by a .done sentinel.
+# commit extraction already completed. Run-local entries keep the legacy .done
+# sentinel; external entries use the extractor's source-bound publication state.
 # --------------------------------------------------------------------------- #
 def extract_cache_dir(repo: str) -> Path:
-    """Stable, repo-keyed dir holding <repo>_commits.jsonl[+.done]."""
+    """Repo-keyed directory holding commit JSONL plus validation metadata."""
     return EXTRACT_CACHE_ROOT / repo
+
+
+def extract_cache_config_receipt() -> dict:
+    """Serializable cache ownership recorded in run and repository receipts."""
+    return {
+        "root": str(EXTRACT_CACHE_ROOT.resolve()),
+        "mode": EXTRACT_CACHE_MODE,
+    }
+
+
+def extract_cache_is_external() -> bool:
+    return EXTRACT_CACHE_MODE == EXTRACT_CACHE_MODE_EXTERNAL
+
+
+def extract_cache_access_receipt(status: str) -> dict:
+    reused = status in {
+        "hit",
+        "checkpoint_resume",
+        "adopt",
+        "back_compat",
+        "orphan_adopt",
+    }
+    return {
+        **extract_cache_config_receipt(),
+        "status": status,
+        "hit": status == "hit",
+        "reused": reused,
+    }
+
+
+@contextmanager
+def extract_cache_repo_lock(repo: str):
+    """Serialize validation/publication of one external entry across processes."""
+    path = extract_cache_dir(repo) / ".conveyor-cache.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield path
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _extract_sentinel_path(jsonl: Path) -> Path:
@@ -1004,6 +1054,259 @@ def _read_valid_sentinel(jsonl: Path) -> int | None:
     return int(lc) if lc is not None else None
 
 
+def _external_cache_state(repo: str, jsonl: Path) -> str:
+    """Classify metadata state without accepting a JSONL by name or stat alone."""
+    checkpoint_root = _extract_transaction_checkpoint_path(jsonl)
+    publication_path = checkpoint_root / "publication.json"
+    if publication_path.exists():
+        try:
+            publication = json.loads(publication_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RepoFailure(
+                repo,
+                "extract_cache_validate",
+                f"invalid external extraction publication {publication_path}: "
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
+        if not isinstance(publication, dict):
+            raise RepoFailure(
+                repo,
+                "extract_cache_validate",
+                f"external extraction publication must be an object: "
+                f"{publication_path}",
+            )
+        publication_status = publication.get("status")
+        if publication_status == "corrupt":
+            raise RepoFailure(
+                repo,
+                "extract_cache_validate",
+                f"external extraction publication is marked corrupt: "
+                f"{publication_path}: {publication.get('corruption', '<no detail>')}",
+            )
+        if publication_status not in {"done", "failed_partial"}:
+            raise RepoFailure(
+                repo,
+                "extract_cache_validate",
+                f"invalid external extraction publication status in "
+                f"{publication_path}: {publication_status!r}",
+            )
+        return "published" if publication_status == "done" else "checkpoint"
+
+    checkpoint_dbs = (
+        list(checkpoint_root.glob("repo-*/checkpoint.sqlite3"))
+        if checkpoint_root.is_dir()
+        else []
+    )
+    if checkpoint_dbs:
+        return "checkpoint"
+
+    unvalidated = [
+        path
+        for path in (jsonl, _extract_sentinel_path(jsonl))
+        if path.exists()
+    ]
+    if unvalidated:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            "external cache contains output without extractor checkpoint/publication "
+            "metadata; refusing filename-only reuse or automatic replacement: "
+            + ", ".join(str(path) for path in unvalidated),
+        )
+    if checkpoint_root.exists() and not checkpoint_root.is_dir():
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external extraction checkpoint root is not a directory: "
+            f"{checkpoint_root}",
+        )
+    return "miss"
+
+
+def _read_completed_external_publication(repo: str, jsonl: Path) -> int:
+    """Read count/path/size from the publication validated by the extractor."""
+    publication_path = (
+        _extract_transaction_checkpoint_path(jsonl) / "publication.json"
+    )
+    try:
+        publication = json.loads(publication_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"missing or invalid completed external extraction publication "
+            f"{publication_path}: {type(exc).__name__}: {exc}",
+        ) from exc
+    if not isinstance(publication, dict):
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external extraction publication must be an object: {publication_path}",
+        )
+    output = publication.get("output")
+    if publication.get("status") != "done" or not isinstance(output, dict):
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external extraction did not publish a completed receipt: "
+            f"{publication_path}",
+        )
+    try:
+        line_count = int(output["line_count"])
+        size_bytes = int(output["size_bytes"])
+        output_path = Path(str(publication["output_path"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"incomplete external extraction publication {publication_path}: {exc}",
+        ) from exc
+    if line_count <= 0 or size_bytes <= 0:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"invalid external extraction counts in {publication_path}: {output}",
+        )
+    if output_path.resolve() != jsonl.resolve():
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external extraction publication path mismatch: metadata={output_path} "
+            f"requested={jsonl}",
+        )
+    try:
+        actual_size = jsonl.stat().st_size
+    except OSError as exc:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"cannot stat published external extraction {jsonl}: {exc}",
+        ) from exc
+    if actual_size != size_bytes:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external extraction size changed after validation: {jsonl}: "
+            f"metadata={size_bytes} actual={actual_size}",
+        )
+    return line_count
+
+
+def _validate_completed_external_cache(
+    repo: str,
+    repo_dir: Path,
+    jsonl: Path,
+) -> int:
+    """Validate a hit with extract_git_history's exact source/job contract."""
+    policy = os.environ.get("CPPMEGA_EXTRACT_BAD_UNIT_POLICY", "fail")
+    max_bad_units_raw = os.environ.get("CPPMEGA_EXTRACT_MAX_BAD_UNITS", "0")
+    try:
+        max_bad_units = int(max_bad_units_raw)
+    except ValueError as exc:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            "CPPMEGA_EXTRACT_MAX_BAD_UNITS must be an integer, got "
+            f"{max_bad_units_raw!r}",
+        ) from exc
+    if (
+        policy not in {"fail", "quarantine"}
+        or (policy == "fail" and max_bad_units != 0)
+        or (policy == "quarantine" and max_bad_units <= 0)
+    ):
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"invalid extraction failure contract: policy={policy!r} "
+            f"max_bad_units={max_bad_units}",
+        )
+    try:
+        source = extract_history._repo_source_context(
+            str(repo_dir),
+            max_commits=0,
+            repo_name=repo_dir.name,
+            notes="auto",
+        )
+        job_fingerprint = extract_history._job_fingerprint(
+            [source],
+            checkpoint_commits=extract_history.DEFAULT_CHECKPOINT_COMMITS,
+            bad_unit_policy=policy,
+            max_bad_units=max_bad_units,
+        )
+        completed = extract_history._completed_publication(
+            output_path=jsonl,
+            checkpoint_root=_extract_transaction_checkpoint_path(jsonl),
+            job_fingerprint=job_fingerprint,
+        )
+    except Exception as exc:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external cache source/publication validation failed for {jsonl}: "
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+    if completed is None:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"external cache publication is not complete: {jsonl}",
+        )
+    n_records = int(completed["output"]["line_count"])
+    if n_records <= 0:
+        raise RepoFailure(
+            repo,
+            "extract_cache_validate",
+            f"completed external cache has no records: {jsonl}",
+        )
+    return n_records
+
+
+def _ensure_external_commit_records(
+    repo: str,
+    repo_dir: Path,
+    *,
+    revision_guard: CodeRevisionGuard | None,
+) -> tuple[Path, int, str]:
+    """Validate/reuse or atomically publish one externally owned cache entry."""
+    cache_dir = extract_cache_dir(repo)
+    cache_jsonl = cache_dir / f"{repo}_commits.jsonl"
+    with extract_cache_repo_lock(repo):
+        state = _external_cache_state(repo, cache_jsonl)
+        if revision_guard is not None:
+            revision_guard.verify(f"external extract cache stage for {repo}")
+        if state == "published":
+            n_records = _validate_completed_external_cache(
+                repo,
+                repo_dir,
+                cache_jsonl,
+            )
+            _log(
+                f"EXTRACT-CACHE HIT {repo}: source/publication validated "
+                f"{n_records} records at {cache_jsonl}"
+            )
+            return cache_jsonl, n_records, "hit"
+        if state == "miss":
+            _log(
+                f"EXTRACT-CACHE MISS {repo}: no published/checkpointed entry at "
+                f"{cache_jsonl}; extracting explicitly"
+            )
+        records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
+        if records_jsonl.resolve() != cache_jsonl.resolve():
+            raise RepoFailure(
+                repo,
+                "extract_cache_validate",
+                f"extractor returned unexpected external cache path: "
+                f"{records_jsonl} != {cache_jsonl}",
+            )
+        n_records = _read_completed_external_publication(repo, cache_jsonl)
+        status = "checkpoint_resume" if state == "checkpoint" else "fresh"
+        _log(
+            f"EXTRACT-CACHE {status.upper()} {repo}: validated "
+            f"{n_records} records at {cache_jsonl}"
+        )
+        return cache_jsonl, n_records, status
+
+
 def _discover_existing_jsonl(repo: str, work_root: Path, work_parent: Path) -> Path | None:
     """Locate a pre-existing <repo>_commits.jsonl from this or a prior run.
 
@@ -1055,6 +1358,13 @@ def ensure_commit_records(
           stamp the sentinel on success.
     RAISES (RULE #1) on empty git log / empty extract; never returns a partial set.
     """
+    if EXTRACT_CACHE_MODE == EXTRACT_CACHE_MODE_EXTERNAL:
+        return _ensure_external_commit_records(
+            repo,
+            repo_dir,
+            revision_guard=revision_guard,
+        )
+
     cache_dir = extract_cache_dir(repo)
     cache_jsonl = cache_dir / f"{repo}_commits.jsonl"
     repo_has_range_done = any(k.startswith(f"{repo}::r") for k in manifest.done)
@@ -1253,6 +1563,12 @@ def mark_commit_stream_complete(
         "n_records": n_records,
         "range_count": len(complete_ranges),
     }
+    cache_receipt = plan.get("extract_cache")
+    if (
+        isinstance(cache_receipt, dict)
+        and cache_receipt.get("mode") == EXTRACT_CACHE_MODE_EXTERNAL
+    ):
+        info["extract_cache"] = dict(cache_receipt)
     if manifest_lock is None:
         manifest.mark_done(f"{repo}::commits", info)
     else:
@@ -1642,9 +1958,22 @@ class ProgressWriter:
                 self.extract_cache_status_counts[status] = (
                     self.extract_cache_status_counts.get(status, 0) + 1
                 )
-                if status == "hit":
+                cache_hit = bool(payload.get("hit", status == "hit"))
+                cache_reused = bool(
+                    payload.get(
+                        "reused",
+                        status in {
+                            "hit",
+                            "checkpoint_resume",
+                            "adopt",
+                            "back_compat",
+                            "orphan_adopt",
+                        },
+                    )
+                )
+                if cache_hit:
                     self.extract_cache_hits += 1
-                if status in {"hit", "adopt", "back_compat", "orphan_adopt"}:
+                if cache_reused:
                     self.extract_cache_reused += 1
                 payload = {
                     **payload,
@@ -2754,12 +3083,13 @@ def run_commits_half(
             "extract_git_history",
             f"no commit records ({exc.reason}): {exc.detail}",
         ) from exc
+    extract_cache_receipt = extract_cache_access_receipt(extract_cache_status)
     if progress is not None:
         progress.emit(
             "extract_cache",
             stream="commits",
             repo=repo,
-            status=extract_cache_status,
+            **extract_cache_receipt,
             n_records=n_records,
             records_jsonl=str(records_jsonl),
         )
@@ -2775,6 +3105,7 @@ def run_commits_half(
                 "repo": repo,
                 "n_records": int(n_records),
                 "records_size_bytes": int(records_stat.st_size),
+                "extract_cache": extract_cache_receipt,
             },
         )
 
@@ -2926,6 +3257,7 @@ def run_commits_half(
         nonlocal done
         drkey = range_key(repo, done_start)
         rinfo["extract_cache_status"] = extract_cache_status
+        rinfo["extract_cache"] = extract_cache_receipt
         with manifest_lock:
             manifest.mark_done(drkey, rinfo)
         done += 1
@@ -2948,6 +3280,7 @@ def run_commits_half(
                 lengths=rinfo.get("lengths", {}),
                 stage_timings_s=rinfo.get("stage_timings_s", {}),
                 extract_cache_status=extract_cache_status,
+                extract_cache=extract_cache_receipt,
                 cumulative_valid_tokens=cumulative_valid,
             )
         if checkpoint is not None:
@@ -3061,6 +3394,7 @@ def run_commits_half(
                     unit=rkey,
                     range=[sub_start, sub_end],
                     extract_cache_status=extract_cache_status,
+                    extract_cache=extract_cache_receipt,
                 )
             fut = pool.submit(
                 process_range_adaptive, repo, repo_dir, records_jsonl,
@@ -3199,8 +3533,9 @@ def process_one_repo(
     The repo was extracted ONCE (incl .git) by the .git-preserving stream into
     ``repo_dir`` (== work_root/<repo>/_src). The CODE half runs first (it does
     NOT touch .git); then the COMMITS half consumes + deletes .git. The repo work
-    dir (and the stable extract cache) are removed at the end. Fully-done repos
-    are always cleaned. Interrupted / failed / partial repos are also cleaned by
+    dir (and a run-local extract cache) are removed at the end. An explicitly
+    configured external extract cache is never removed. Fully-done repos are
+    always cleaned. Interrupted / failed / partial repos are also cleaned by
     default so the conveyor cannot fill the disk with raw source clones; use
     --retain-partial-work for the older zero-rework resume mode. RULE #1: a
     failure in one half is recorded; the other half still runs.
@@ -3410,7 +3745,16 @@ def process_one_repo(
             pass
         elif fully_done:
             remove_tree(repo_work, reason=f"{repo} fully done work")
-            remove_tree(extract_cache_dir(repo), reason=f"{repo} fully done extract cache")
+            if extract_cache_is_external():
+                _log(
+                    f"RETAIN external extract cache for completed {repo}: "
+                    f"{extract_cache_dir(repo)}"
+                )
+            else:
+                remove_tree(
+                    extract_cache_dir(repo),
+                    reason=f"{repo} fully done extract cache",
+                )
         elif retain_partial_work:
             _log(f"RETAIN temp for {repo}: not all units marked done "
                  f"(interrupted/failed/partial); kept {repo_work} + extract cache "
@@ -3421,7 +3765,12 @@ def process_one_repo(
                  f"{extract_cache_dir(repo)} kept for checkpoint resume")
         else:
             remove_tree(repo_work, reason=f"{repo} partial work")
-            if has_resumable_extract_checkpoint(repo):
+            if extract_cache_is_external():
+                _log(
+                    f"RETAIN external extract cache for failed/partial {repo}: "
+                    f"{extract_cache_dir(repo)}"
+                )
+            elif has_resumable_extract_checkpoint(repo):
                 _log(
                     f"RETAIN extract checkpoint for failed/partial {repo}: "
                     f"{extract_cache_dir(repo)} kept; committed extraction chunks "
@@ -3526,6 +3875,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--conveyor-root", default=str(CONVEYOR_ROOT),
                    help="Root for conveyor manifest, locks, extract cache, "
                         f"progress and tmp defaults. Default {CONVEYOR_ROOT}.")
+    p.add_argument(
+        "--extract-cache-root",
+        default=None,
+        help="Shared persistent root for per-repository commit extraction "
+             "checkpoints and published JSONL. When omitted, the cache remains "
+             "run-local at <conveyor-root>/extract_cache and keeps the existing "
+             "cleanup behavior. An explicit root is externally owned, validated "
+             "through extract_git_history publication metadata, and never deleted "
+             "by this conveyor.",
+    )
     p.add_argument("--only-repo", action="append", default=[],
                    help="Restrict the conveyor to these repo names (repeatable). "
                         "Other repos are DRAINED from the .git-preserving stream "
@@ -3766,6 +4125,10 @@ def main(argv: list[str]) -> int:
     # Pre-create output trees for BOTH streams.
     CONVEYOR_ROOT.mkdir(parents=True, exist_ok=True)
     EXTRACT_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    _log(
+        "Extract cache: "
+        f"mode={EXTRACT_CACHE_MODE} root={EXTRACT_CACHE_ROOT.resolve()}"
+    )
     sr.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     for L in lengths_code:
         (sr.OUTPUT_ROOT / str(L)).mkdir(parents=True, exist_ok=True)
@@ -3863,6 +4226,7 @@ def main(argv: list[str]) -> int:
         target_lengths_code=list(lengths_code),
         target_lengths_commits=list(lengths_commits),
         manifest=str(CONVEYOR_MANIFEST),
+        extract_cache=extract_cache_config_receipt(),
         retain_partial_work=args.retain_partial_work,
         keep_temp=args.keep_temp,
         min_free_disk_gb=args.min_free_disk_gb,
@@ -3981,6 +4345,7 @@ def main(argv: list[str]) -> int:
                 "source_cache_populate_only": True,
                 "source_cache_report": report,
                 "manifest": str(CONVEYOR_MANIFEST),
+                "extract_cache": extract_cache_config_receipt(),
                 "interrupted": STOP_EVENT.is_set(),
             }
             progress.emit("run_finished", **summary)
@@ -4255,6 +4620,7 @@ def main(argv: list[str]) -> int:
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
         "code_revision": revision_guard.receipt,
+        "extract_cache": extract_cache_config_receipt(),
         "extract_cache_metrics": progress.extract_cache_metrics(),
         "interrupted": interrupted,
     }
