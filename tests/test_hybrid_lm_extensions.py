@@ -402,10 +402,14 @@ def test_path_c_parameter_gradient_aliases_use_direct_and_profile_names():
     assert aliases["layers.11.norm.weight_grad"] == (
         "layer_10_m_residual_norm_weight_grad",
         "local_gb10_quarter_brick_10_M_residual_norm_weight_grad",
+        "layer_11_r_entry_rmsnorm_weight_grad",
+        "local_gb10_quarter_brick_11_R_entry_rmsnorm_weight_grad",
     )
     assert aliases["layers.12.norm.weight_grad"] == (
         "layer_11_r_residual_norm_weight_grad",
         "local_gb10_quarter_brick_11_R_residual_norm_weight_grad",
+        "layer_12_a_entry_rmsnorm_weight_grad",
+        "local_gb10_quarter_brick_12_A_entry_rmsnorm_weight_grad",
     )
     assert aliases["layers.11.block.state_weight_grad"] == (
         "layer_11_r_m2rnn_state_weight_grad",
