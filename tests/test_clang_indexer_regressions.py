@@ -37,6 +37,39 @@ def test_unknown_libclang_cursor_kind_is_opaque_not_fatal() -> None:
     assert ip._bucket_clang_cursor_kind(ip._cursor_kind(cursor)) == 255
 
 
+def test_document_symbol_registry_keeps_boundary_only_symbol_claims() -> None:
+    index = ip.ProjectIndex()
+    function = ip.FunctionDef(
+        name="declaration_only",
+        qualified_name="api::declaration_only",
+        file="include/api.hpp",
+        line=7,
+        text="int declaration_only();",
+        callees=[],
+        symbol_key="v3|project=tests/clang-indexer-regressions|file=include/api.hpp|line=7|kind=FUNCTION_DECL|signature=int declaration_only()",
+        canonical_signature="int declaration_only()",
+        symbol_kind="FUNCTION_DECL",
+        is_definition=False,
+    )
+    index.add_function(function)
+
+    records = ip._document_symbol_identities(
+        [ip._function_part(function)],
+        index,
+        [],
+        [],
+        [],
+        source="boundary-only regression",
+    )
+
+    assert records == [
+        {
+            "symbol_id": function.symbol_id,
+            "symbol_key": function.symbol_key,
+        }
+    ]
+
+
 def test_semantic_metadata_uses_name_tokens_and_template_type_edges(
     tmp_path: Path,
 ) -> None:

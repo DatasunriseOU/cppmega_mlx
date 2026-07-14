@@ -467,6 +467,7 @@ def _document_symbol_identities(
     """Return complete, collision-checked ID/key claims used by one document."""
 
     registry = SymbolIdentityRegistry()
+    part_symbol_ids: set[int] = set()
     for part_index, part in enumerate(parts_info):
         metadata = _part_symbol_metadata(part)
         if metadata is None:
@@ -482,8 +483,9 @@ def _document_symbol_identities(
             symbol_id=int(symbol_id),
             source=f"{source}:part[{part_index}]",
         )
+        part_symbol_ids.add(int(symbol_id))
 
-    used_ids = {
+    used_ids = part_symbol_ids | {
         int(symbol_id)
         for sequence in symbol_id_sequences
         for symbol_id in sequence
