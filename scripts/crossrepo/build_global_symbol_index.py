@@ -542,34 +542,55 @@ class GlobalSymbolStore:
                     f"{self.path}:{symbol_uid}: identity schema v{identity_version} "
                     f"cannot be promoted to v{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
                 )
-            if not symbol_key or not symbol_kind or (not usr and not canonical_signature):
+            has_location_identity = bool(symbol_key) and ip.is_repo_file_location_identity(
+                str(symbol_key)
+            )
+            if (
+                not symbol_key
+                or not symbol_kind
+                or (not usr and not canonical_signature and not has_location_identity)
+            ):
                 raise ip.SymbolIdentityError(
                     f"{self.path}:{symbol_uid}: canonical identity cannot be "
-                    "reconstructed; require symbol_key, symbol_kind, and USR or signature"
+                    "reconstructed; require symbol_key, symbol_kind, and USR, "
+                    "signature, or explicit repository location"
                 )
             if str(canonical_signature).startswith("legacy-kind="):
                 raise ip.SymbolIdentityError(
                     f"{self.path}:{symbol_uid}: synthetic legacy signature cannot "
                     "establish canonical clang identity; rebuild the index"
                 )
-            identity_kwargs = {
-                "qname": str(qname),
-                "kind": str(symbol_kind),
-                "usr": str(usr or ""),
-                "canonical_signature": str(canonical_signature or ""),
-                "project": project_id,
-                "file": str(file),
-                "line": int(line),
-            }
-            expected_keys = {
-                ip.canonical_symbol_identity(**identity_kwargs),
-                ip.canonical_symbol_identity(**identity_kwargs, force_file_scope=True),
-            }
-            if str(symbol_key) not in expected_keys:
-                raise ip.SymbolIdentityError(
-                    f"{self.path}:{symbol_uid}: stored canonical key does not match "
-                    "its identity fields; rebuild the index"
+            if has_location_identity:
+                ip.validate_repo_file_location_identity_claim(
+                    str(symbol_key),
+                    project=project_id,
+                    file=str(file),
+                    line=int(line),
+                    kind=str(symbol_kind),
+                    qname=str(qname),
+                    source=f"{self.path}:{symbol_uid}",
                 )
+            else:
+                identity_kwargs = {
+                    "qname": str(qname),
+                    "kind": str(symbol_kind),
+                    "usr": str(usr or ""),
+                    "canonical_signature": str(canonical_signature or ""),
+                    "project": project_id,
+                    "file": str(file),
+                    "line": int(line),
+                }
+                expected_keys = {
+                    ip.canonical_symbol_identity(**identity_kwargs),
+                    ip.canonical_symbol_identity(
+                        **identity_kwargs, force_file_scope=True
+                    ),
+                }
+                if str(symbol_key) not in expected_keys:
+                    raise ip.SymbolIdentityError(
+                        f"{self.path}:{symbol_uid}: stored canonical key does not match "
+                        "its identity fields; rebuild the index"
+                    )
             expected_hex = self._symbol_id_hex(ip._compute_symbol_id(str(symbol_key)))
             if str(symbol_id_hex) != expected_hex:
                 raise ip.SymbolIdentityError(
@@ -676,7 +697,8 @@ class GlobalSymbolStore:
             self.conn.execute(
                 "SELECT COUNT(*) FROM symbols "
                 "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id='' "
-                "OR symbol_kind='' OR (usr='' AND canonical_signature='') "
+                "OR symbol_kind='' OR (usr='' AND canonical_signature='' "
+                "AND symbol_key NOT LIKE 'repo_file_location:%') "
                 "OR canonical_signature LIKE 'legacy-kind=%text-sha1=%' "
                 "OR provider='' OR include_provenance=''",
                 (ip.SYMBOL_IDENTITY_SCHEMA_VERSION,),
@@ -687,6 +709,20 @@ class GlobalSymbolStore:
                 f"{self.path}: incompatible symbol identity rows: "
                 f"count={incompatible_rows}, expected_version="
                 f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            )
+        for row in self.conn.execute(
+            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, symbol_kind "
+            "FROM symbols WHERE usr='' AND canonical_signature=''"
+        ):
+            symbol_uid, symbol_key, qname, project_id, file, line, symbol_kind = row
+            ip.validate_repo_file_location_identity_claim(
+                str(symbol_key),
+                project=str(project_id),
+                file=str(file),
+                line=int(line),
+                kind=str(symbol_kind),
+                qname=str(qname),
+                source=f"{self.path}:{symbol_uid}",
             )
         for (project_id,) in self.conn.execute(
             "SELECT DISTINCT base_repo FROM symbols"
@@ -780,29 +816,49 @@ class GlobalSymbolStore:
                 raise ip.SymbolIdentityError(
                     f"{project_id}:{record.file}:{record.line}: missing canonical identity"
                 )
-            if not record.usr and not record.canonical_signature:
+            has_location_identity = ip.is_repo_file_location_identity(
+                record.symbol_key
+            )
+            if (
+                not record.usr
+                and not record.canonical_signature
+                and not has_location_identity
+            ):
                 raise ip.SymbolIdentityError(
                     f"{project_id}:{record.file}:{record.line}: identity requires USR "
-                    "or canonical signature"
+                    "canonical signature, or explicit repository location"
                 )
-            identity_kwargs = {
-                "qname": record.qname,
-                "kind": record.symbol_kind,
-                "usr": record.usr,
-                "canonical_signature": record.canonical_signature,
-                "project": project_id,
-                "file": record.file,
-                "line": record.line,
-            }
-            expected_keys = {
-                ip.canonical_symbol_identity(**identity_kwargs),
-                ip.canonical_symbol_identity(**identity_kwargs, force_file_scope=True),
-            }
-            if record.symbol_key not in expected_keys:
-                raise ip.SymbolIdentityError(
-                    f"{project_id}:{record.file}:{record.line}: canonical key does not "
-                    "match the record identity fields"
+            if has_location_identity:
+                ip.validate_repo_file_location_identity_claim(
+                    record.symbol_key,
+                    project=project_id,
+                    file=record.file,
+                    line=record.line,
+                    kind=record.symbol_kind,
+                    qname=record.qname,
+                    source=f"{project_id}:{record.file}:{record.line}",
                 )
+            else:
+                identity_kwargs = {
+                    "qname": record.qname,
+                    "kind": record.symbol_kind,
+                    "usr": record.usr,
+                    "canonical_signature": record.canonical_signature,
+                    "project": project_id,
+                    "file": record.file,
+                    "line": record.line,
+                }
+                expected_keys = {
+                    ip.canonical_symbol_identity(**identity_kwargs),
+                    ip.canonical_symbol_identity(
+                        **identity_kwargs, force_file_scope=True
+                    ),
+                }
+                if record.symbol_key not in expected_keys:
+                    raise ip.SymbolIdentityError(
+                        f"{project_id}:{record.file}:{record.line}: canonical key does "
+                        "not match the record identity fields"
+                    )
             if not record.provider or not record.include_provenance:
                 raise ip.SymbolIdentityError(
                     f"{project_id}:{record.file}:{record.line}: provider and include "

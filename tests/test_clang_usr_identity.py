@@ -159,6 +159,7 @@ def _fallback_cursor(
     storage: str = "NONE",
     parent_kind: str = "NAMESPACE",
     with_signature: bool = True,
+    exception_name: str | None = "NONE",
 ):
     type_info = SimpleNamespace(
         spelling="int (int)" if with_signature else "",
@@ -191,7 +192,9 @@ def _fallback_cursor(
         get_arguments=lambda: [],
         get_usr=lambda: "",
         exception_specification_kind=(
-            SimpleNamespace(name="NONE") if with_signature else None
+            None
+            if exception_name is None
+            else SimpleNamespace(name=exception_name)
         ),
     )
 
@@ -235,7 +238,7 @@ def test_external_no_usr_fallback_is_global_but_static_and_local_are_file_scoped
     assert all("file=" in key for key in static_keys + local_keys)
 
 
-def test_external_without_usr_or_signature_uses_repo_file_location_identity(
+def test_unknown_external_without_usr_or_signature_fails_closed(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "repo"
@@ -247,14 +250,64 @@ def test_external_without_usr_or_signature_uses_repo_file_location_identity(
         tmp_path / "sdk-b" / "route.hpp", with_signature=False
     )
 
-    external_key_a, _, _ = ip.symbol_identity_for_cursor(
-        external_a, project_dir=str(project_dir), project="owner/repo"
+    for cursor in (external_a, external_b):
+        with pytest.raises(ip.SymbolIdentityError, match="stable provider identity"):
+            ip.symbol_identity_for_cursor(
+                cursor, project_dir=str(project_dir), project="owner/repo"
+            )
+
+
+def test_provider_location_identity_is_checkout_independent(tmp_path: Path) -> None:
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+    left = _fallback_cursor(
+        tmp_path / "sdk-a" / "libcxx" / "include" / "vector",
+        with_signature=False,
     )
-    external_key_b, _, _ = ip.symbol_identity_for_cursor(
-        external_b, project_dir=str(project_dir), project="owner/repo"
+    right = _fallback_cursor(
+        tmp_path / "sdk-b" / "libcxx" / "include" / "vector",
+        with_signature=False,
     )
 
-    assert external_key_a != external_key_b
+    left_key, _, _ = ip.symbol_identity_for_cursor(
+        left, project_dir=str(project_dir), project="owner/repo"
+    )
+    right_key, _, _ = ip.symbol_identity_for_cursor(
+        right, project_dir=str(project_dir), project="owner/repo"
+    )
+
+    assert left_key == right_key
+    assert "project=llvm/llvm-project" in left_key
+    assert "file=@provider/libc++/vector" in left_key
+
+    reference = ip.symbol_reference_for_cursor(
+        left,
+        project_dir=str(project_dir),
+        project_id="owner/repo",
+    )
+    assert reference["project"] == "llvm/llvm-project"
+    assert reference["file"] == "@provider/libc++/vector"
+    assert reference["provider"] == "libc++"
+    assert reference["include_provenance"] == "vector"
+
+
+def test_exception_only_signature_uses_location_fallback(tmp_path: Path) -> None:
+    project_dir = tmp_path / "repo"
+    cursor = _fallback_cursor(
+        project_dir / "include" / "route.hpp",
+        with_signature=False,
+        exception_name="UNPARSED",
+    )
+
+    key, _usr, signature = ip.symbol_identity_for_cursor(
+        cursor,
+        project_dir=str(project_dir),
+        project="owner/repo",
+    )
+
+    assert signature == ""
+    assert key.startswith("repo_file_location:")
+    assert "file=include/route.hpp" in key
 
 
 def test_repo_file_location_identity_is_checkout_independent_and_normalized(
@@ -312,6 +365,16 @@ def test_repo_file_location_identity_is_checkout_independent_and_normalized(
     assert "column=4" in key_a
     assert str(tmp_path) not in key_a
     assert "\\" not in key_a
+
+    windows_casefolded = ip.symbol_identity_for_cursor(
+        _fallback_cursor(
+            Path(r"c:\\CHECKOUT\\REPO\\INCLUDE\\ROUTE.hpp"),
+            with_signature=False,
+        ),
+        project_dir=r"C:\\checkout\\repo",
+        project="owner/repo",
+    )[0]
+    assert windows_casefolded == windows_key
 
 
 def test_usr_extraction_error_fails_loud(tmp_path: Path) -> None:

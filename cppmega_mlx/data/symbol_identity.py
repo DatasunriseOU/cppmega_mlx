@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import ipaddress
+import posixpath
 import re
 import unicodedata
 from urllib.parse import quote, unquote_to_bytes, urlsplit
@@ -22,6 +23,7 @@ SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
 SYMBOL_IDENTITIES_COLUMN = "symbol_identities"
 SYMBOL_ID_MAX = (1 << 64) - 1
 _SYMBOL_ID_HASH_DOMAIN = b"cppmega.symbol-id.v3\0"
+REPO_FILE_LOCATION_IDENTITY_PREFIX = "repo_file_location:"
 
 
 class SymbolIdentityError(RuntimeError):
@@ -34,6 +36,18 @@ class ResolvedProjectIdentity:
 
     project_identity: str
     owner_repo: str | None
+
+
+@dataclass(frozen=True)
+class RepoFileLocationIdentity:
+    """Validated fields carried by an explicit repository-location identity."""
+
+    project: str
+    file: str
+    line: int
+    column: int
+    kind: str
+    qname: str
 
 
 _IDENTITY_COMPONENT_SAFE = "-._~"
@@ -147,6 +161,115 @@ def require_project_identity(value: object, *, source: str) -> str:
             f"{source}: project identity must be canonical without .git, got {value!r}"
         )
     return value
+
+
+def parse_repo_file_location_identity(
+    value: object,
+    *,
+    source: str = "symbol identity",
+) -> RepoFileLocationIdentity:
+    """Parse and validate the explicit no-USR/no-signature identity form.
+
+    This identity is deliberately distinct from a signature fallback. It is
+    valid only when project, repository-relative file and declaration location
+    are all explicit, so downstream stores can accept it without pretending a
+    qname or an exception sentinel is a semantic signature.
+    """
+
+    if not isinstance(value, str) or not value.startswith(
+        REPO_FILE_LOCATION_IDENTITY_PREFIX
+    ):
+        raise SymbolIdentityError(
+            f"{source}: expected {REPO_FILE_LOCATION_IDENTITY_PREFIX!r} identity"
+        )
+    payload = value.removeprefix(REPO_FILE_LOCATION_IDENTITY_PREFIX)
+    parts = payload.split("\x1f")
+    if len(parts) not in {6, 7}:
+        raise SymbolIdentityError(
+            f"{source}: repo_file_location identity has {len(parts)} fields; "
+            "expected 6 or 7"
+        )
+    expected_keys = ["schema", "project", "file", "line"]
+    if len(parts) == 7:
+        expected_keys.append("column")
+    expected_keys.extend(("kind", "qname"))
+    fields: dict[str, str] = {}
+    for part, expected_key in zip(parts, expected_keys, strict=True):
+        key, separator, field_value = part.partition("=")
+        if separator != "=" or key != expected_key or not field_value:
+            raise SymbolIdentityError(
+                f"{source}: repo_file_location identity requires ordered non-empty "
+                f"field {expected_key!r}"
+            )
+        if any(ord(char) < 32 or ord(char) == 127 for char in field_value):
+            raise SymbolIdentityError(
+                f"{source}: repo_file_location field {expected_key!r} contains "
+                "control characters"
+            )
+        fields[key] = field_value
+
+    expected_schema = f"v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+    if fields["schema"] != expected_schema:
+        raise SymbolIdentityError(
+            f"{source}: repo_file_location identity schema must be {expected_schema}"
+        )
+    project = require_project_identity(
+        fields["project"], source=f"{source}:repo_file_location project"
+    )
+    file = fields["file"]
+    normalized_file = posixpath.normpath(file)
+    if (
+        file != normalized_file
+        or file.startswith("/")
+        or _WINDOWS_LOCAL_PATH_RE.match(file)
+        or "\\" in file
+        or any(part in {"", ".", ".."} for part in file.split("/"))
+    ):
+        raise SymbolIdentityError(
+            f"{source}: repo_file_location file must be canonical and "
+            f"repository-relative, got {file!r}"
+        )
+
+    def parse_positive_int(field: str, *, required: bool) -> int:
+        raw = fields.get(field, "")
+        if not raw:
+            return 0
+        if not raw.isascii() or not raw.isdecimal():
+            raise SymbolIdentityError(
+                f"{source}: repo_file_location {field} must be a decimal integer"
+            )
+        parsed = int(raw)
+        if str(parsed) != raw or parsed < (1 if required else 0):
+            qualifier = "positive" if required else "non-negative"
+            raise SymbolIdentityError(
+                f"{source}: repo_file_location {field} must be canonical {qualifier} "
+                "decimal"
+            )
+        return parsed
+
+    return RepoFileLocationIdentity(
+        project=project,
+        file=file,
+        line=parse_positive_int("line", required=True),
+        column=parse_positive_int("column", required=True),
+        kind=fields["kind"],
+        qname=fields["qname"],
+    )
+
+
+def is_repo_file_location_identity(value: object) -> bool:
+    """Return whether ``value`` is a valid explicit location identity.
+
+    A malformed value using the reserved prefix raises instead of being treated
+    as an unrelated key, preserving fail-closed validation at storage boundaries.
+    """
+
+    if not isinstance(value, str) or not value.startswith(
+        REPO_FILE_LOCATION_IDENTITY_PREFIX
+    ):
+        return False
+    parse_repo_file_location_identity(value)
+    return True
 
 
 def _normalize_remote_host(host: str, *, source: str) -> str:
@@ -440,14 +563,18 @@ class SymbolIdentityRegistry:
 
 
 __all__ = [
+    "REPO_FILE_LOCATION_IDENTITY_PREFIX",
     "SYMBOL_IDENTITIES_COLUMN",
     "SYMBOL_IDENTITY_SCHEMA_METADATA_KEY",
     "SYMBOL_IDENTITY_SCHEMA_VERSION",
     "SYMBOL_ID_MAX",
     "ResolvedProjectIdentity",
+    "RepoFileLocationIdentity",
     "SymbolIdentityError",
     "SymbolIdentityRegistry",
     "compute_symbol_id",
+    "is_repo_file_location_identity",
+    "parse_repo_file_location_identity",
     "require_project_identity",
     "resolve_remote_project_identity",
 ]

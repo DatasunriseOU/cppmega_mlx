@@ -30,6 +30,7 @@ from .prompt_graph import (
 from .symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     compute_symbol_id,
+    is_repo_file_location_identity,
 )
 
 
@@ -151,7 +152,9 @@ def _identity_for_cursor(
             reference.get("canonical_signature")
         )
         symbol_key = str(reference.get("symbol_key") or "")
-        if not signature or not symbol_key:
+        if not symbol_key:
+            return None
+        if not signature and not is_repo_file_location_identity(symbol_key):
             return None
         version = int(
             reference.get("symbol_identity_schema_version") or 0
@@ -849,7 +852,11 @@ class ClangPromptProjectIndexProducer:
             if symbol["kind"] in {"function", "type", "variable"}
         ]
         if any(
-            not symbol["symbol_key"] or not symbol["canonical_signature"]
+            not symbol["symbol_key"]
+            or (
+                not symbol["canonical_signature"]
+                and not is_repo_file_location_identity(symbol["symbol_key"])
+            )
             for symbol in definitions
         ):
             raise ValueError(

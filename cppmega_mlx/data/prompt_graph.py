@@ -25,6 +25,7 @@ from .symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     SYMBOL_ID_MAX,
     compute_symbol_id,
+    is_repo_file_location_identity,
 )
 
 
@@ -807,6 +808,7 @@ class PromptProjectIndex:
                 not legacy_adapter
                 and symbol.kind in {"function", "type", "variable"}
                 and not symbol.canonical_signature
+                and not is_repo_file_location_identity(symbol.symbol_key)
             ):
                 raise ValueError(
                     f"symbol {symbol.identity}: v3 definitions require a "

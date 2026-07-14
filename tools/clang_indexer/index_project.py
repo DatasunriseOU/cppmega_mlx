@@ -65,6 +65,8 @@ from cppmega_mlx.data.symbol_identity import (
     SymbolIdentityError,
     SymbolIdentityRegistry,
     compute_symbol_id,
+    is_repo_file_location_identity,
+    parse_repo_file_location_identity,
     require_project_identity,
 )
 from cppmega_mlx.data.source_identity import source_identity, source_identity_for_path
@@ -785,6 +787,12 @@ _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("msvc-stl", ("/stl/inc/", "/microsoft visual studio/")),
     ("boost", ("/boost/",)),
 )
+_PROVIDER_PROJECT_IDENTITIES = {
+    "libc++": "llvm/llvm-project",
+    "libstdc++": "gcc-mirror/gcc",
+    "msvc-stl": "microsoft/STL",
+    "boost": "boostorg/boost",
+}
 
 
 def symbol_provider_provenance(file_path: str | None) -> tuple[str, str]:
@@ -792,7 +800,17 @@ def symbol_provider_provenance(file_path: str | None) -> tuple[str, str]:
 
     if not file_path:
         return "", ""
-    normalized = "/" + str(file_path).replace("\\", "/").strip("/")
+    raw_path = str(file_path).replace("\\", "/").strip("/")
+    if raw_path.startswith("@provider/"):
+        parts = raw_path.split("/", 2)
+        if (
+            len(parts) == 3
+            and parts[1] in _PROVIDER_PROJECT_IDENTITIES
+            and parts[2]
+        ):
+            return parts[1], parts[2]
+        return "", ""
+    normalized = "/" + raw_path
     lowered = normalized.lower()
     for provider, markers in _PROVIDER_PATH_MARKERS:
         for marker in markers:
@@ -927,7 +945,7 @@ def _cursor_canonical_signature_unchecked(cursor: Cursor) -> str:
         pieces.append("args=(" + ",".join(arg_types) + ")")
     exception_kind = getattr(cursor, "exception_specification_kind", None)
     exception_name = getattr(exception_kind, "name", "") or str(exception_kind or "")
-    if exception_name:
+    if pieces and exception_name:
         pieces.append(f"exception={exception_name.rsplit('.', 1)[-1]}")
     return "|".join(pieces)
 
@@ -996,6 +1014,10 @@ def canonical_symbol_identity(
             raise SymbolIdentityError(
                 "repo_file_location identity requires an integer declaration location"
             ) from exc
+        if not owning_project:
+            raise SymbolIdentityError(
+                "repo_file_location identity requires a canonical project"
+            )
         if not normalized_file or normalized_line <= 0:
             raise SymbolIdentityError(
                 "repo_file_location identity requires a repo-relative file and line"
@@ -1017,7 +1039,11 @@ def canonical_symbol_identity(
                 f"qname={normalized_qname}",
             ]
         )
-        return "repo_file_location:" + "\x1f".join(payload)
+        identity_key = "repo_file_location:" + "\x1f".join(payload)
+        parse_repo_file_location_identity(
+            identity_key, source="canonical_symbol_identity"
+        )
+        return identity_key
     scope = _identity_scope_key(
         project=owning_project,
         file=file,
@@ -1045,7 +1071,7 @@ def _normalize_identity_path(value: str | None) -> str:
     if normalized == ".":
         return ""
     if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(normalized):
-        normalized = normalized[0].upper() + normalized[1:]
+        normalized = normalized.casefold()
     return normalized.removeprefix("./")
 
 
@@ -1061,15 +1087,56 @@ def _normalize_repo_relative_identity_file(file: str | None) -> str:
         raise SymbolIdentityError(
             "repo_file_location identity cannot contain an absolute path"
         )
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise SymbolIdentityError(
+            "repo_file_location identity requires a canonical repo-relative file"
+        )
     return normalized
 
 
-def _cursor_repo_relative_identity_file(
+def validate_repo_file_location_identity_claim(
+    symbol_key: str,
+    *,
+    project: str,
+    file: str,
+    line: int,
+    kind: str,
+    qname: str,
+    source: str,
+) -> None:
+    """Require an explicit location key to agree with its serialized record."""
+
+    identity = parse_repo_file_location_identity(symbol_key, source=source)
+    expected = {
+        "project": require_project_identity(project, source=f"{source}:project"),
+        "file": _normalize_repo_relative_identity_file(file),
+        "line": int(line),
+        "kind": _normalize_signature_text(kind),
+        "qname": normalize_qualified_name(qname),
+    }
+    actual = {
+        "project": identity.project,
+        "file": identity.file,
+        "line": identity.line,
+        "kind": identity.kind,
+        "qname": identity.qname,
+    }
+    if actual != expected:
+        raise SymbolIdentityError(
+            f"{source}: repo_file_location key does not match serialized fields: "
+            f"expected={expected!r} actual={actual!r}"
+        )
+
+
+def _cursor_repo_file_location_identity(
     cursor: Cursor,
     *,
     project_dir: str | None,
+    project: str | None,
     fallback_file: str | None,
-) -> str:
+) -> tuple[str, str]:
+    """Return a stable file/project pair for explicit location identity."""
+
     location = getattr(cursor, "location", None)
     location_file = getattr(location, "file", None)
     location_name = getattr(location_file, "name", None)
@@ -1077,27 +1144,36 @@ def _cursor_repo_relative_identity_file(
         str(location_name) if location_name else fallback_file
     )
     project_path = _normalize_identity_path(project_dir)
-    if candidate and project_path and _is_absolute_identity_path(candidate):
-        if not _is_absolute_identity_path(project_path):
-            raise SymbolIdentityError(
-                "repo_file_location identity requires an absolute project root"
-            )
-        candidate_drive = (
-            candidate[:2]
-            if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(candidate)
-            else ""
+    if not _is_absolute_identity_path(candidate):
+        return _normalize_repo_relative_identity_file(candidate), str(project or "")
+
+    relative_file = ""
+    if project_path and _is_absolute_identity_path(project_path):
+        candidate_is_windows = bool(
+            _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(candidate)
         )
-        project_drive = (
-            project_path[:2]
-            if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(project_path)
-            else ""
+        project_is_windows = bool(
+            _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(project_path)
         )
-        if candidate_drive != project_drive:
-            raise SymbolIdentityError(
-                "repo_file_location identity cannot cross filesystem roots"
-            )
-        candidate = posixpath.relpath(candidate, project_path)
-    return _normalize_repo_relative_identity_file(candidate)
+        same_root_kind = candidate_is_windows == project_is_windows
+        same_drive = (
+            not candidate_is_windows or candidate[:2] == project_path[:2]
+        )
+        if same_root_kind and same_drive:
+            relative_file = posixpath.relpath(candidate, project_path)
+            if relative_file == ".." or relative_file.startswith("../"):
+                relative_file = ""
+    if relative_file:
+        return _normalize_repo_relative_identity_file(relative_file), str(project or "")
+
+    provider, include_provenance = symbol_provider_provenance(candidate)
+    provider_project = _PROVIDER_PROJECT_IDENTITIES.get(provider, "")
+    if provider_project and include_provenance:
+        return f"@provider/{provider}/{include_provenance}", provider_project
+    raise SymbolIdentityError(
+        "external declaration without USR or canonical signature requires a "
+        f"stable provider identity, got path={candidate!r}"
+    )
 
 
 def _cursor_identity_location(
@@ -1143,12 +1219,12 @@ def symbol_identity_for_cursor(
     file_scope = force_file_scope
     uses_repo_file_location = not usr and not signature
     if uses_repo_file_location:
-        rel_file = _cursor_repo_relative_identity_file(
+        rel_file, identity_project = _cursor_repo_file_location_identity(
             cursor,
             project_dir=project_dir,
+            project=project or repo,
             fallback_file=fallback_file,
         )
-        identity_project = project or repo
     else:
         rel_file, is_project_local = _cursor_identity_location(
             cursor,
@@ -1204,12 +1280,22 @@ def symbol_reference_for_cursor(
         fallback_file=fallback_file,
         force_file_scope=force_file_scope,
     )
-    relative_file, is_project_local = _cursor_identity_location(
-        cursor,
-        project_dir=project_dir,
-        fallback_file=fallback_file,
-    )
     location = getattr(cursor, "location", None)
+    if is_repo_file_location_identity(key):
+        location_identity = parse_repo_file_location_identity(
+            key, source="symbol_reference_for_cursor"
+        )
+        relative_file = location_identity.file
+        reference_project = location_identity.project
+        reference_line = location_identity.line
+    else:
+        relative_file, is_project_local = _cursor_identity_location(
+            cursor,
+            project_dir=project_dir,
+            fallback_file=fallback_file,
+        )
+        reference_project = project_id if is_project_local else ""
+        reference_line = int(getattr(location, "line", 0) or 0)
     provider, include_provenance = symbol_provider_provenance(relative_file)
     return {
         "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
@@ -1219,9 +1305,9 @@ def symbol_reference_for_cursor(
         "usr": usr,
         "canonical_signature": signature,
         "symbol_kind": _cursor_kind_name(cursor),
-        "project": project_id if is_project_local else "",
+        "project": reference_project,
         "file": relative_file,
-        "line": int(getattr(location, "line", 0) or 0),
+        "line": reference_line,
         "provider": provider,
         "include_provenance": include_provenance,
     }
@@ -3077,7 +3163,8 @@ class GlobalSymbolReader:
             self._conn.execute(
                 "SELECT COUNT(*) FROM symbols "
                 "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id='' "
-                "OR symbol_kind='' OR (usr='' AND canonical_signature='') "
+                "OR symbol_kind='' OR (usr='' AND canonical_signature='' "
+                "AND symbol_key NOT LIKE 'repo_file_location:%') "
                 "OR canonical_signature LIKE 'legacy-kind=%text-sha1=%' "
                 "OR provider='' OR include_provenance=''",
                 (SYMBOL_IDENTITY_SCHEMA_VERSION,),
@@ -3088,6 +3175,20 @@ class GlobalSymbolReader:
                 f"--global-symbol-index has incompatible symbol identity rows: {path}; "
                 f"count={incompatible_rows}, expected_version="
                 f"{SYMBOL_IDENTITY_SCHEMA_VERSION}. Migrate or rebuild the index."
+            )
+        for row in self._conn.execute(
+            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, symbol_kind "
+            "FROM symbols WHERE usr='' AND canonical_signature=''"
+        ):
+            symbol_uid, symbol_key, qname, project_id, file, line, symbol_kind = row
+            validate_repo_file_location_identity_claim(
+                str(symbol_key),
+                project=str(project_id),
+                file=str(file),
+                line=int(line),
+                kind=str(symbol_kind),
+                qname=str(qname),
+                source=f"global symbol index {path}:{symbol_uid}",
             )
         for (project_id,) in self._conn.execute(
             "SELECT DISTINCT base_repo FROM symbols"

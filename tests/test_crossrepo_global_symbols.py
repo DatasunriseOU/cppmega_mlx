@@ -143,6 +143,51 @@ def test_store_reader_roundtrip(tmp_path):
     reader.close()
 
 
+def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> None:
+    b = _load_builder()
+    db = str(tmp_path / "location.sqlite")
+    store = b.GlobalSymbolStore(db)
+    symbol_key = b.ip.canonical_symbol_identity(
+        qname="boost::route",
+        kind="FUNCTION_DECL",
+        project="boostorg/boost",
+        file="boost/route.hpp",
+        line=7,
+        column=4,
+        repo_file_location_fallback=True,
+    )
+    store.insert_symbols(
+        [
+            b.GlobalSymbolRecord(
+                qname="boost::route",
+                base_lib="boost",
+                base_repo="boostorg/boost",
+                kind=2,
+                sym_type="func",
+                file="boost/route.hpp",
+                line=7,
+                end_line=9,
+                is_public=1,
+                token_est=8,
+                body_len=32,
+                text="void route() { /* location fallback */ }",
+                symbol_key=symbol_key,
+                symbol_kind="FUNCTION_DECL",
+                provider="boost",
+                include_provenance="boost/route.hpp",
+            )
+        ]
+    )
+    store.commit()
+    store.close()
+
+    reader = b.ip.GlobalSymbolReader(db)
+    record = reader.lookup("boost::route")
+    assert record is not None
+    assert record["symbol_key"] == symbol_key
+    reader.close()
+
+
 def test_store_reader_normalizes_std_inline_namespace(tmp_path):
     ip = _load_index_project()
     b = _load_builder()

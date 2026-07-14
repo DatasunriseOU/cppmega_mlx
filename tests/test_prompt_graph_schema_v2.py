@@ -37,6 +37,14 @@ def _symbol_key(usr: str) -> str:
     )
 
 
+def _location_symbol_key() -> str:
+    return (
+        f"repo_file_location:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+        f"project={PROJECT_ID}\x1ffile=src/first.cpp\x1fline=1\x1fcolumn=5\x1f"
+        "kind=FUNCTION_DECL\x1fqname=first"
+    )
+
+
 def _v3_payload() -> dict[str, object]:
     first = "int first() { return 1; }\n"
     second = "int second() { return first(); }\n"
@@ -161,6 +169,21 @@ def _v3_payload() -> dict[str, object]:
             "hashes": {"repository_sha256": "0" * 64},
         },
     }
+
+
+def test_prompt_graph_accepts_explicit_location_fallback_identity() -> None:
+    payload = _v3_payload()
+    location_key = _location_symbol_key()
+    symbol = payload["symbols"][0]
+    symbol["symbol_id"] = compute_symbol_id(location_key)
+    symbol["semantic_identity"] = location_key
+    symbol["symbol_key"] = location_key
+    symbol["usr"] = ""
+    symbol["canonical_signature"] = ""
+
+    index = PromptProjectIndex.from_dict(payload)
+
+    assert index.symbols[0].symbol_key == location_key
 
 
 def test_v3_index_validates_spans_per_document_and_cross_document_edges() -> None:
