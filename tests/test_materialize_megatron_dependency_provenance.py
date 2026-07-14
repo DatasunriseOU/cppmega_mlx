@@ -219,6 +219,26 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_materialized_graph_arrow_types_match_case5_source_contract() -> None:
+    schema = materializer.materialized_schema()
+    pair = pa.struct([pa.field("from", pa.uint16()), pa.field("to", pa.uint16())])
+    triple = pa.struct([
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
+        pa.field("kind", pa.int32()),
+    ])
+    assert schema.field("token_call_edges").type == pa.list_(pair)
+    assert schema.field("token_type_edges").type == pa.list_(pair)
+    for column in (
+        "token_domain_edges",
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+    ):
+        assert schema.field(column).type == pa.list_(triple)
+
+
 def test_dependency_source_preserves_attention_and_constituent_provenance(
     tmp_path: Path,
 ) -> None:

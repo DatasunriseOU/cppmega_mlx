@@ -75,11 +75,11 @@ _ARROW_DTYPES = {
 TOKEN_SIDECAR_TYPES = {
     column: _ARROW_DTYPES[dtype] for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
 }
-PAIR_TYPE = pa.struct([pa.field("from", pa.int32()), pa.field("to", pa.int32())])
+PAIR_TYPE = pa.struct([pa.field("from", pa.uint16()), pa.field("to", pa.uint16())])
 TRIPLE_TYPE = pa.struct(
     [
-        pa.field("from", pa.int32()),
-        pa.field("to", pa.int32()),
+        pa.field("from", pa.uint32()),
+        pa.field("to", pa.uint32()),
         pa.field("kind", pa.int32()),
     ]
 )
