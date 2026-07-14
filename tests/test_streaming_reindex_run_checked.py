@@ -5,6 +5,8 @@ import sys
 import tarfile
 import subprocess
 
+import pytest
+
 
 def test_run_checked_times_out_fail_loud(tmp_path) -> None:
     import streaming_reindex
@@ -92,6 +94,52 @@ def test_parse_ps_time_seconds_variants() -> None:
     assert streaming_reindex._parse_ps_time_seconds("01:02.50") == 62.5
     assert streaming_reindex._parse_ps_time_seconds("03:01:02.50") == 10862.5
     assert streaming_reindex._parse_ps_time_seconds("2-03:01:02.50") == 183662.5
+
+
+def test_materialize_uses_canonical_project_identity(monkeypatch, tmp_path) -> None:
+    import streaming_reindex
+
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        output = tmp_path / "cjson.tok.parquet"
+        output.write_bytes(b"parquet-placeholder")
+
+    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
+    enriched = tmp_path / "cjson.enriched.jsonl"
+    enriched.write_text("{}\n", encoding="utf-8")
+
+    output = streaming_reindex.stage_materialize(
+        "cjson",
+        "DaveGamble/cJSON",
+        enriched,
+        tmp_path,
+    )
+
+    default_repo = captured.index("--default-repo")
+    assert captured[default_repo + 1] == "DaveGamble/cJSON"
+    assert output == tmp_path / "cjson.tok.parquet"
+
+
+def test_materialize_rejects_bare_project_identity_before_subprocess(
+    monkeypatch, tmp_path
+) -> None:
+    import streaming_reindex
+
+    monkeypatch.setattr(
+        streaming_reindex,
+        "run_checked",
+        lambda *_args, **_kwargs: pytest.fail("subprocess must not start"),
+    )
+    with pytest.raises(streaming_reindex.SymbolIdentityError, match="stable owner/repo"):
+        streaming_reindex.stage_materialize(
+            "cjson",
+            "cjson",
+            tmp_path / "input.jsonl",
+            tmp_path,
+        )
 
 
 def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:

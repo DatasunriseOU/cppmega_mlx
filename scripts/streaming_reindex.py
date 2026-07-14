@@ -1007,11 +1007,15 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
 
 def stage_materialize(
     repo: str,
+    project_id: str,
     enriched: Path,
     work: Path,
     memory_limit_gb: float = 10.0,
 ) -> Path:
     """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file)."""
+    project_id = require_project_identity(
+        project_id, source=f"stage_materialize({repo})"
+    )
     tok = work / f"{repo}.tok.parquet"
     run_checked(
         repo,
@@ -1025,7 +1029,7 @@ def stage_materialize(
             "--overflow-policy", "drop",
             "--size", _budget_size_label(TOKENIZE_BUDGET),
             "--memory-limit-gb", str(memory_limit_gb),
-            "--default-repo", repo,
+            "--default-repo", project_id,
         ],
         log_path=work / f"{repo}.materialize.log",
     )
@@ -1290,7 +1294,7 @@ def process_one_repo(
             ) from exc
         timings["index_project_s"] = round(time.monotonic() - started, 6)
         started = time.monotonic()
-        tok = stage_materialize(repo, enriched, work, memory_limit_gb)
+        tok = stage_materialize(repo, project_id, enriched, work, memory_limit_gb)
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
