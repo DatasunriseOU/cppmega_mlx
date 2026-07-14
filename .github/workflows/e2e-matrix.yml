@@ -10,6 +10,7 @@ on:
       - "tests/fixtures/build_e2e_matrix.py"
       - "tests/fixtures/tokenizers/**"
       - "tests/fixtures/parquet/**"
+      - "scripts/install_self_hosted_e2e_python.sh"
       - ".github/workflows/e2e-matrix.yml"
   pull_request:
     branches: [main]
@@ -17,6 +18,8 @@ on:
       - "cppmega_v4/**"
       - "vbgui/**"
       - "tests/fixtures/build_e2e_matrix.py"
+      - "scripts/install_self_hosted_e2e_python.sh"
+      - ".github/workflows/e2e-matrix.yml"
   schedule:
     # Nightly full run — includes the mini-train matrix on macOS.
     - cron: "0 4 * * *"
@@ -25,6 +28,10 @@ on:
 concurrency:
   group: e2e-matrix-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CPPMEGA_MLX_LM_CHECKOUT: /Volumes/external/sources/mlx-lm
+  CPPMEGA_MLX_LM_COMMIT: 8618587943181787d33bac4468d3088e80202b3f
 
 jobs:
   # On every push/PR: smoke matrix (912 cells). The backend imports MLX, so
@@ -62,15 +69,7 @@ jobs:
           echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
           echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
       - name: Python deps
-        run: |
-          "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
-            -e ".[gui,parquet,widget]"
-          "$VBGUI_E2E_PYTHON" - <<'PY'
-          from cppmega_mlx.training.native_optim import status
-          native_status = status()
-          if not native_status.get("available", False):
-              raise RuntimeError(native_status.get("reason", "native optimizer extension unavailable"))
-          PY
+        run: scripts/install_self_hosted_e2e_python.sh
       - name: Generate fixtures
         run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
@@ -134,15 +133,7 @@ jobs:
           port_offset=8
           echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
           echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
-      - run: |
-          "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
-            -e ".[gui,parquet,widget]"
-          "$VBGUI_E2E_PYTHON" - <<'PY'
-          from cppmega_mlx.training.native_optim import status
-          native_status = status()
-          if not native_status.get("available", False):
-              raise RuntimeError(native_status.get("reason", "native optimizer extension unavailable"))
-          PY
+      - run: scripts/install_self_hosted_e2e_python.sh
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
@@ -201,15 +192,7 @@ jobs:
           port_offset=9
           echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
           echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
-      - run: |
-          "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
-            -e ".[gui,parquet,widget]"
-          "$VBGUI_E2E_PYTHON" - <<'PY'
-          from cppmega_mlx.training.native_optim import status
-          native_status = status()
-          if not native_status.get("available", False):
-              raise RuntimeError(native_status.get("reason", "native optimizer extension unavailable"))
-          PY
+      - run: scripts/install_self_hosted_e2e_python.sh
       - run: |
           "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui

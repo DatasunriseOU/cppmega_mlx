@@ -88,10 +88,27 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     assert workflow.count('echo "PYTHONPATH=" >> "$GITHUB_ENV"') == 3
     assert workflow.count('echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"') == 3
     assert "--no-build-isolation" not in workflow
-    assert workflow.count('-e ".[gui,parquet,widget]"') == 3
+    assert workflow.count("run: scripts/install_self_hosted_e2e_python.sh") == 3
     assert workflow.count('echo "VBGUI_E2E_PYTHON=$job_venv/bin/python"') == 3
     assert workflow.count('rm -rf "$VBGUI_E2E_VENV"') == 3
-    assert workflow.count("native optimizer extension unavailable") == 3
+
+    installer = (
+        REPO_ROOT / "scripts" / "install_self_hosted_e2e_python.sh"
+    ).read_text(encoding="utf-8")
+    assert '-e "$CPPMEGA_MLX_LM_CHECKOUT"' in installer
+    assert '-e "$repo_root[gui,parquet,widget]"' in installer
+    assert 'rev-parse HEAD' in installer
+    assert 'diff --cached --quiet' in installer
+    assert "native optimizer extension unavailable" in installer
+    for module in (
+        "bailing_hybrid",
+        "deepseek_v4",
+        "gemma4_assistant",
+        "mistral4",
+        "nemotron_h",
+        "turbo_cache",
+    ):
+        assert module in installer
 
 
 def test_macos_e2e_jobs_use_run_scoped_ports() -> None:
