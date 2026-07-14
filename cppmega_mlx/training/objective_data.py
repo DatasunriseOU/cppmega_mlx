@@ -296,7 +296,7 @@ def objective_source_from_tokenized_row(
         if name not in TOKENIZED_ENRICHED_TEMPORAL_TOKEN_COLUMNS
     }
     packed_commit_packets = (
-        build_commit_packets_from_packed_row(columns, row_index=0)
+        build_commit_packets_from_packed_row(commit_columns, row_index=0)
         if any(column in row for column in PACKED_ROWS_OBJECTIVE_SOURCE_COLUMNS)
         else []
     )

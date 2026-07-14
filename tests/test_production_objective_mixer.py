@@ -306,6 +306,10 @@ def test_packed_megatron_row_adapts_valid_prefix_and_real_objective_sections() -
         "token_call_targets": [0, 0, 0, 0, 0, 0],
         "token_type_refs": [0, 0, 0, 0, 0, 0],
         "token_def_use": [0, 0, 0, 0, 0, 0],
+        "token_change_mask_pre": [0, 1, 0, 0, 0, 0],
+        "token_change_mask_post": [0, 0, 1, 0, 0, 0],
+        "hunk_id_per_token": [0, 1, 1, 0, -1, -1],
+        "edit_op_per_token": [0, 2, 1, 0, 0, 0],
         "token_chunk_starts": [0],
         "token_chunk_ends": [4],
         "token_chunk_kinds": [3],
@@ -332,6 +336,8 @@ def test_packed_megatron_row_adapts_valid_prefix_and_real_objective_sections() -
     ]
     assert np.asarray(source.commit_packet.commit_msg).tolist() == [40, 41]
     assert np.asarray(source.commit_packet.diff_token_ids).tolist() == [30, 31]
+    assert source.commit_packet.change_mask_pre is None
+    assert source.commit_packet.change_mask_post is None
 
 
 def test_multi_document_pack_does_not_guess_ifim_constituent_binding() -> None:
