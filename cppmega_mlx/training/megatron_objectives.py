@@ -158,13 +158,15 @@ def _packet_vector(packet: CodePacket, field: str, *, length: int) -> list[int]:
     return values
 
 
-def _metadata_vector(packet: CodePacket, field: str, *, length: int) -> list[int]:
+def _optional_metadata_vector(
+    packet: CodePacket, field: str, *, length: int
+) -> list[int]:
     value = packet.metadata.get(field)
     if value is None:
-        raise ValueError(
-            f"pre-materialized aligned objective requires typed metadata {field}"
-        )
+        return [0] * length
     values = _ints(value, where=f"CodePacket.metadata[{field!r}]")
+    if not values:
+        return [0] * length
     if len(values) != length:
         raise ValueError(
             f"typed metadata {field} length {len(values)} != materialized "
@@ -651,10 +653,10 @@ def materialize_megatron_document(
             required=require_production_sidecars,
         )
         row[SYMBOL_IDENTITIES_COLUMN] = _symbol_identity_records(packet)
-        row["token_change_mask_pre"] = _metadata_vector(
+        row["token_change_mask_pre"] = _optional_metadata_vector(
             packet, "token_change_mask_pre", length=len(tokens)
         )
-        row["token_change_mask_post"] = _metadata_vector(
+        row["token_change_mask_post"] = _optional_metadata_vector(
             packet, "token_change_mask_post", length=len(tokens)
         )
         starts = _packet_vector(packet, "chunk_starts", length=len(packet.chunk_starts))  # type: ignore[arg-type]

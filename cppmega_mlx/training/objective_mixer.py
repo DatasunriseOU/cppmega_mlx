@@ -21,6 +21,7 @@ from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.fim import FIMSpecialTokenInput
 from cppmega_mlx.data.graph_packet import GraphPacket
+from cppmega_mlx.data.source_identity import MAX_SOURCE_ID
 from cppmega_mlx.training.indexer_losses import total_indexer_loss
 from cppmega_mlx.training.objectives import ObjectiveExample
 from cppmega_mlx.training.task_mixer import TaskKind, TaskMixer, normalize_rates
@@ -53,6 +54,66 @@ def _array_length(value: mx.array | None) -> int:
     return 0 if value is None else int(value.shape[0])
 
 
+def _transformed_document_physical_identity_reason(
+    packet: CodePacket,
+    document_spans: Sequence[tuple[int, int, int]],
+) -> str | None:
+    """Reject FIM candidates whose selected logical document is multi-physical."""
+
+    if packet.source_identity_ids is None:
+        return None
+    source_identity_ids = np.asarray(packet.source_identity_ids)
+    token_count = int(packet.token_ids.shape[-1])
+    if source_identity_ids.ndim != 1 or len(source_identity_ids) != token_count:
+        return (
+            "requires one token-aligned physical source identity per code token; "
+            f"got shape {source_identity_ids.shape} for {token_count} tokens"
+        )
+    identities = [int(value) for value in source_identity_ids.tolist()]
+    for start, end, _document_id in document_spans:
+        if end - start < 3:
+            continue
+        selected = identities[start:end]
+        if any(not 0 < identity <= MAX_SOURCE_ID for identity in selected):
+            return (
+                f"logical document [{start}, {end}) requires positive uint64 "
+                "physical source identities"
+            )
+        unique = set(selected)
+        if len(unique) != 1:
+            return (
+                f"logical document [{start}, {end}) spans {len(unique)} physical "
+                "source identities; transformed objective requires exactly one"
+            )
+    return None
+
+
+def _transformed_packet_physical_identity_reason(packet: CodePacket) -> str | None:
+    """Reject whole-packet permutations that cannot retain one physical source."""
+
+    if packet.source_identity_ids is None:
+        return None
+    source_identity_ids = np.asarray(packet.source_identity_ids)
+    token_count = int(packet.token_ids.shape[-1])
+    if source_identity_ids.ndim != 1 or len(source_identity_ids) != token_count:
+        return (
+            "requires one token-aligned physical source identity per code token; "
+            f"got shape {source_identity_ids.shape} for {token_count} tokens"
+        )
+    identities = [int(value) for value in source_identity_ids.tolist()]
+    if any(not 0 < identity <= MAX_SOURCE_ID for identity in identities):
+        return (
+            "transformed objective requires positive uint64 physical source identities"
+        )
+    unique = set(identities)
+    if len(unique) != 1:
+        return (
+            f"whole code packet spans {len(unique)} physical source identities; "
+            "transformed objective requires exactly one"
+        )
+    return None
+
+
 def _eligibility_reason(
     task: TaskKind,
     packet: CodePacket | CommitPacket,
@@ -71,10 +132,8 @@ def _eligibility_reason(
         if not isinstance(packet, CodePacket):
             return "requires CodePacket"
         token_count = int(packet.token_ids.shape[-1])
-        document_lengths = [
-            end - start
-            for start, end, _document_id in logical_document_spans(packet)
-        ]
+        document_spans = logical_document_spans(packet)
+        document_lengths = [end - start for start, end, _document_id in document_spans]
         if task is TaskKind.CAUSAL_LM:
             reason = (
                 None
@@ -89,6 +148,12 @@ def _eligibility_reason(
         if not eligible_document_lengths:
             return "requires a logical document with at least 3 tokens"
         selected_token_count = max(eligible_document_lengths)
+        if task in {TaskKind.FIM, TaskKind.AST_FIM, TaskKind.IFIM}:
+            physical_reason = _transformed_document_physical_identity_reason(
+                packet, document_spans
+            )
+            if physical_reason is not None:
+                return physical_reason
         if task is TaskKind.FIM:
             return _length_reason(None, selected_token_count + 3, max_input_tokens)
         if task is TaskKind.AST_FIM:
@@ -121,6 +186,9 @@ def _eligibility_reason(
                 selected_token_count + instruction_count + 4,
                 max_input_tokens,
             )
+        physical_reason = _transformed_packet_physical_identity_reason(packet)
+        if physical_reason is not None:
+            return physical_reason
         field_name = {
             TaskKind.SYMBOL_RECOVERY: "symbol_ids",
             TaskKind.TYPE_RECOVERY: "type_refs",
@@ -144,9 +212,9 @@ def _eligibility_reason(
     missing = [name for name in required if _array_length(getattr(packet, name)) == 0]
     reason = None if not missing else "missing or empty " + ", ".join(missing)
     if task is TaskKind.COMMIT_DIFF:
-        estimated_input = _array_length(packet.commit_msg) + _array_length(
-            packet.diff_token_ids
-        ) + 4
+        estimated_input = (
+            _array_length(packet.commit_msg) + _array_length(packet.diff_token_ids) + 4
+        )
     else:
         estimated_input = (
             _array_length(packet.commit_msg)
@@ -274,9 +342,7 @@ class EligibilityAwareTaskMixer:
         )
 
     @staticmethod
-    def _require_realized_kind(
-        task: TaskKind, example: ObjectiveExample
-    ) -> None:
+    def _require_realized_kind(task: TaskKind, example: ObjectiveExample) -> None:
         if example.objective != task.value:
             raise RuntimeError(
                 f"selected {task.value} but builder realized {example.objective}; "
@@ -674,9 +740,7 @@ def production_training_loss(
     if not math.isfinite(float(graph_weight)) or graph_weight <= 0.0:
         raise ValueError("graph auxiliary global weight must be finite and positive")
     if graph_config is None or graph_targets is None or graph_pair_mask is None:
-        raise ValueError(
-            "production graph objective requires config/targets/pair_mask"
-        )
+        raise ValueError("production graph objective requires config/targets/pair_mask")
     if graph_weight != graph_config.global_weight:
         raise ValueError(
             "graph auxiliary global weight differs from GraphAuxLossConfig: "
@@ -713,9 +777,7 @@ def production_training_loss(
         "node_type_ids",
     }
     missing_structure_channels = sorted(
-        name
-        for name in required_structure_channels
-        if side_channels.get(name) is None
+        name for name in required_structure_channels if side_channels.get(name) is None
     )
     if missing_structure_channels:
         raise ValueError(
