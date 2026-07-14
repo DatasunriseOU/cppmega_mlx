@@ -904,6 +904,64 @@ def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monk
     assert not cache_dir.exists()
 
 
+def test_process_one_repo_records_unresolved_project_identity_without_aborting_pool(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "unmapped archive"
+    work_root = tmp_path / "work"
+    repo_dir = work_root / repo / "_src"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "main.cpp").write_text("int value = 1;\n", encoding="utf-8")
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+    called = False
+
+    def fail_if_code_runs(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("code stage must not run without canonical identity")
+
+    monkeypatch.setattr(streaming_conveyor, "run_code_half_adaptive", fail_if_code_runs)
+    monkeypatch.setattr(
+        streaming_conveyor.sr,
+        "resolve_project_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            streaming_conveyor.SymbolIdentityError("no canonical owner/repo identity")
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = streaming_conveyor.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(),
+            range_size=500,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=streaming_conveyor.threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=False,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=tmp_path / "repo_list.json",
+            streams="code",
+        )
+
+    assert not called
+    assert result["code"] == "failed"
+    assert manifest.failed[f"{repo}::code"]["stage"] == "project_identity"
+
+
 def test_discover_existing_jsonl_never_adopts_unvalidated_stable_cache(
     tmp_path,
     monkeypatch,

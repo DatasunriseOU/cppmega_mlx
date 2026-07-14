@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from cppmega_mlx.training.stage1_production import (
     STAGE1_GRAPH_DOMAIN_RECIPE,
     add_stage1_production_arguments,
     build_stage1_production_model,
+    run_stage1_graph_domain_production,
     stage1_production_batch_receipt,
     stage1_production_config,
 )
@@ -227,6 +229,17 @@ def test_named_stage1_trainers_route_explicit_recipe_through_canonical_runner() 
         source = (ROOT / "scripts" / script).read_text(encoding="utf-8")
         assert "add_stage1_production_arguments" in source
         assert "run_stage1_graph_domain_production" in source
+
+
+def test_stage1_runner_requires_and_uses_only_production_bundle_ingress() -> None:
+    signature = inspect.signature(run_stage1_graph_domain_production)
+    for name in ("bucket", "expected_bundle_id", "restore_receipt"):
+        assert signature.parameters[name].default is inspect.Parameter.empty
+
+    source = inspect.getsource(run_stage1_graph_domain_production)
+    assert source.count("open_production_megatron_bundle(") == 1
+    assert "open_megatron_indexed_dataset" not in source
+    assert "provenance_receipt()" in source
 
 
 def test_named_stage1_trainers_import_in_fresh_subprocess() -> None:

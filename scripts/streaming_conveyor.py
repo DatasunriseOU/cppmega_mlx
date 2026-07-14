@@ -2544,9 +2544,13 @@ def process_one_repo(
                                 index_timeout_s=code_index_timeout_s,
                                 index_stall_timeout_s=code_index_stall_timeout_s,
                             )
+                        try:
+                            project_identity = sr.resolve_project_identity(repo, repo_list)
+                        except SymbolIdentityError as exc:
+                            raise RepoFailure(repo, "project_identity", str(exc)) from exc
                         cinfo = run_code_half_adaptive(
                             repo,
-                            sr.resolve_project_identity(repo, repo_list),
+                            project_identity,
                             repo_dir, lengths_code, work_root,
                             code_dedup_db, code_dedup_near,
                             global_symbol_index, code_limit, code_parse_workers,

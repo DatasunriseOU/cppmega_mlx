@@ -2869,10 +2869,21 @@ CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
 GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 4
 
 
+class AmbiguousGlobalSymbolError(SymbolIdentityError):
+    """Raised when authoritative global-symbol fields do not select one provider."""
+
+
 class CrossLinkBudget:
     """Per-document bound on cross-lib pulls (count + token budget)."""
 
-    __slots__ = ["max_deps", "token_budget", "used_deps", "used_tokens"]
+    __slots__ = [
+        "max_deps",
+        "token_budget",
+        "used_deps",
+        "used_tokens",
+        "ambiguous_lookups",
+        "ambiguity_examples",
+    ]
 
     def __init__(self, max_deps: int = CROSSLINK_MAX_DEPS_PER_DOC,
                  token_budget: int = CROSSLINK_TOKEN_BUDGET_PER_DOC):
@@ -2880,6 +2891,8 @@ class CrossLinkBudget:
         self.token_budget = token_budget
         self.used_deps = 0
         self.used_tokens = 0
+        self.ambiguous_lookups = 0
+        self.ambiguity_examples: list[str] = []
 
     def has_room(self) -> bool:
         return self.used_deps < self.max_deps and self.used_tokens < self.token_budget
@@ -2891,6 +2904,11 @@ class CrossLinkBudget:
     def spend(self, tok: int) -> None:
         self.used_deps += 1
         self.used_tokens += tok
+
+    def note_ambiguity(self, qname: str) -> None:
+        self.ambiguous_lookups += 1
+        if qname and qname not in self.ambiguity_examples and len(self.ambiguity_examples) < 8:
+            self.ambiguity_examples.append(qname)
 
 
 class GlobalSymbolReader:
@@ -3085,7 +3103,7 @@ class GlobalSymbolReader:
                 f"{row['base_repo']}:{row['file']}:{row['line']}"
                 for row in candidates[:8]
             ]
-            raise SymbolIdentityError(
+            raise AmbiguousGlobalSymbolError(
                 "ambiguous global symbol lookup: "
                 f"qname={qname!r} usr={usr or ''!r} provider={provider or ''!r} "
                 f"include={include_provenance or ''!r} candidates={preview}"
@@ -3130,37 +3148,43 @@ def collect_transitive_deps(
         # selected base-lib symbol) is simply a no-op, never a fallback.
         if not crosslink_budget.has_room():
             return
-        if isinstance(reference, dict):
-            qname = str(reference.get("qname") or "")
-            reference_project = (
-                None
-                if is_crosslinkable_baselib(qname)
-                else str(reference.get("project") or "") or None
-            )
-            hit = global_symbols.lookup(
-                qname,
-                symbol_key=(
-                    str(reference.get("symbol_key") or "") or None
+        try:
+            if isinstance(reference, dict):
+                qname = str(reference.get("qname") or "")
+                reference_project = (
+                    None
+                    if is_crosslinkable_baselib(qname)
+                    else str(reference.get("project") or "") or None
+                )
+                hit = global_symbols.lookup(
+                    qname,
+                    symbol_key=(
+                        str(reference.get("symbol_key") or "") or None
+                        if reference_project
+                        else None
+                    ),
+                    usr=str(reference.get("usr") or "") or None,
+                    canonical_signature=(
+                        str(reference.get("canonical_signature") or "") or None
+                    ),
+                    symbol_kind=str(reference.get("symbol_kind") or "") or None,
+                    project=reference_project,
+                    file=(str(reference.get("file") or "") or None)
                     if reference_project
-                    else None
-                ),
-                usr=str(reference.get("usr") or "") or None,
-                canonical_signature=(
-                    str(reference.get("canonical_signature") or "") or None
-                ),
-                symbol_kind=str(reference.get("symbol_kind") or "") or None,
-                project=reference_project,
-                file=(str(reference.get("file") or "") or None)
-                if reference_project
-                else None,
-                provider=str(reference.get("provider") or "") or None,
-                include_provenance=(
-                    str(reference.get("include_provenance") or "") or None
-                ),
-            )
-        else:
-            qname = reference
-            hit = global_symbols.lookup(qname)
+                    else None,
+                    provider=str(reference.get("provider") or "") or None,
+                    include_provenance=(
+                        str(reference.get("include_provenance") or "") or None
+                    ),
+                )
+            else:
+                qname = reference
+                hit = global_symbols.lookup(qname)
+        except AmbiguousGlobalSymbolError:
+            # Cross-repo enrichment is optional context. Never guess a provider:
+            # leave the route unresolved and emit an aggregate audit receipt.
+            crosslink_budget.note_ambiguity(qname)
+            return
         if hit is None:
             return
         target_key = hit.get("symbol_key")
@@ -6891,6 +6915,8 @@ def build_training_documents(
     HARD per-doc bounds (CrossLinkBudget). Behavior is unchanged when None.
     """
     crosslink_total = 0
+    crosslink_ambiguous_total = 0
+    crosslink_ambiguity_examples: set[str] = set()
     documents: list[str | dict[str, object]] = []
 
     def _record_doc(doc: str | dict[str, object]) -> None:
@@ -7019,6 +7045,11 @@ def build_training_documents(
                 crosslink_visited=crosslink_visited,
                 crosslink_budget=crosslink_budget,
             )
+            if crosslink_budget is not None:
+                crosslink_ambiguous_total += crosslink_budget.ambiguous_lookups
+                for example in crosslink_budget.ambiguity_examples:
+                    if len(crosslink_ambiguity_examples) < 8:
+                        crosslink_ambiguity_examples.add(example)
 
             # Sort by dep_level (leaves/most foundational first). Claims are applied
             # after the candidate document passes the tiny-doc filter so a small
@@ -7252,7 +7283,9 @@ def build_training_documents(
         print(
             f"  Cross-lib base-lib pulls: {crosslink_total} (depth-1, "
             f"cap {CROSSLINK_MAX_DEPS_PER_DOC}/doc, "
-            f"{CROSSLINK_TOKEN_BUDGET_PER_DOC} tok/doc, tagged crosslib:<repo>)",
+            f"{CROSSLINK_TOKEN_BUDGET_PER_DOC} tok/doc, tagged crosslib:<repo>); "
+            f"ambiguous_unresolved={crosslink_ambiguous_total} "
+            f"examples={sorted(crosslink_ambiguity_examples)}",
             file=sys.stderr,
         )
     return documents

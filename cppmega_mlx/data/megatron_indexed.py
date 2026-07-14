@@ -40,6 +40,10 @@ _SEMANTIC_SIDE_CHANNEL_KEYS = (
     "def_use",
 )
 _SYMBOL_ID_SIDE_CHANNEL_KEYS = ("symbol_ids", "call_targets", "type_refs")
+_UINT64_ID_SIDE_CHANNEL_KEYS = (
+    *_SYMBOL_ID_SIDE_CHANNEL_KEYS,
+    "source_identity_ids",
+)
 _TEMPORAL_SIDE_CHANNEL_KEYS = (
     "change_mask_pre",
     "change_mask_post",
@@ -52,6 +56,7 @@ _DOMAIN_SIDE_CHANNEL_KEYS = (
     "entity_ids",
     "scope_ids",
     "source_doc_ids",
+    "source_identity_ids",
     "confidence_ids",
 )
 _SIDE_CHANNEL_KEYS = (
@@ -96,6 +101,7 @@ _SIDE_CHANNEL_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "entity_ids": ("token_entity_ids",),
     "scope_ids": ("token_scope_ids",),
     "source_doc_ids": ("token_source_doc_ids",),
+    "source_identity_ids": ("token_source_identity_ids",),
     "confidence_ids": ("token_confidence_ids",),
 }
 _DOCUMENT_ID_KEYS = ("document_ids", "doc_ids", "packing_document_ids")
@@ -164,7 +170,6 @@ _NAMED_DTYPES: dict[str, np.dtype] = {
     "uint32": np.dtype(np.uint32),
     "uint64": np.dtype(np.uint64),
     "int64": np.dtype(np.int64),
-    "uint64": np.dtype(np.uint64),
 }
 
 _SIDE_CHANNEL_NAMED_DTYPES: dict[str, np.dtype] = {
@@ -838,12 +843,13 @@ def open_megatron_indexed_dataset(
     resume_batch: int = 0,
     metadata: TokenDatasetMetadata | None = None,
 ) -> MegatronIndexedDataset | MegatronIndexedMultiShardDataset:
-    """Open standalone local Megatron-indexed shards for CLI/training code.
+    """Open standalone, explicitly non-production Megatron-indexed shards.
 
-    This is the explicit fail-closed ingress for macOS/MLX paths that already
-    have Megatron .bin/.idx token shards.  It intentionally depends only on
-    the local reader, NumPy, and MLX; it does not import Megatron or Torch
-    runtime modules.
+    This bare-prefix API performs structural reader checks but deliberately has
+    no immutable-bundle or restore-receipt provenance contract. Production
+    Stage-1 callers must use ``open_production_megatron_bundle`` instead. It
+    intentionally depends only on the local reader, NumPy, and MLX; it does not
+    import Megatron or Torch runtime modules.
     """
 
     path = Path(path)
@@ -1591,11 +1597,10 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
         if dtype != np.dtype(np.float32):
             raise ValueError("attention_mask side-channel dtype must be float32")
         return dtype
-    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
         if dtype != np.dtype(np.uint64):
             raise ValueError(
-                f"{key} side-channel dtype must be uint64 for v"
-                f"{SYMBOL_IDENTITY_SCHEMA_VERSION} symbol identities, got {dtype.name}"
+                f"{key} identity side-channel dtype must be uint64, got {dtype.name}"
             )
         return dtype
     if dtype.kind not in {"i", "u"}:
@@ -1608,7 +1613,7 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
 def _default_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
-    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
         return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
@@ -1616,7 +1621,7 @@ def _default_side_channel_dtype(key: str) -> np.dtype:
 def _target_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
-    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
         return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
@@ -1624,7 +1629,7 @@ def _target_side_channel_dtype(key: str) -> np.dtype:
 def _allowed_side_channel_dtype_names(key: str) -> list[str]:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return ["float32"]
-    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
         return ["uint64"]
     return [
         name
@@ -1652,7 +1657,7 @@ def _side_channel_family(key: str) -> str:
 def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return values.astype(np.float32, copy=False)
-    if key in _SYMBOL_ID_SIDE_CHANNEL_KEYS:
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
         if values.dtype.kind not in {"i", "u"}:
             raise ValueError(f"{key} side-channel IDs must use an integer dtype")
         if values.dtype.kind == "i" and np.any(values < 0):

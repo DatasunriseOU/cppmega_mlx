@@ -15,7 +15,10 @@ import numpy as np
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import GraphBatch
-from cppmega_mlx.data.megatron_indexed import open_megatron_indexed_dataset
+from cppmega_mlx.data.production_bundle import (
+    ProductionMegatronDatasetMetadata,
+    open_production_megatron_bundle,
+)
 from cppmega_mlx.models.dense_cpp_lm import (
     DenseCppLM,
     DenseCppLMConfig,
@@ -219,8 +222,8 @@ def add_stage1_production_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help=(
-            "Megatron-indexed token prefix/directory with required graph and "
-            "domain sidecars; activates the fail-closed production recipe"
+            "restored immutable Megatron bundle root with required graph/domain "
+            "sidecars; activates the fail-closed production recipe"
         ),
     )
     parser.add_argument(
@@ -233,6 +236,9 @@ def add_stage1_production_arguments(parser: argparse.ArgumentParser) -> None:
 def run_stage1_graph_domain_production(
     *,
     data_path: Path,
+    bucket: int,
+    expected_bundle_id: str,
+    restore_receipt: Path,
     steps: int,
     batch_size: int,
     seq_len: int,
@@ -244,21 +250,26 @@ def run_stage1_graph_domain_production(
     attention_mode: ProductionAttentionMode = "gqa",
     compile: bool = True,
     bf16: bool = False,
+    bundle_hash_jobs: int = 4,
 ) -> dict[str, Any]:
-    """Run the canonical compiled Stage-1 recipe on sidecar-rich indexed data."""
+    """Run Stage-1 only after immutable bundle and restore validation."""
 
     if steps < 1:
         raise ValueError("production Stage-1 steps must be positive")
-    startup_dataset = open_megatron_indexed_dataset(
+    dataset = open_production_megatron_bundle(
         data_path,
+        bucket,
+        expected_bundle_id,
+        restore_receipt=restore_receipt,
         seq_len=seq_len,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         seed=seed,
-        loop=False,
+        loop=True,
+        hash_jobs=bundle_hash_jobs,
     )
     try:
-        first_batch = next(startup_dataset.iter_batches(loop=False))
+        first_batch = next(dataset.iter_batches(loop=False))
     except StopIteration as error:
         raise ValueError(
             "production Stage-1 dataset has no complete deterministic startup batch"
@@ -267,7 +278,7 @@ def run_stage1_graph_domain_production(
     model = build_stage1_production_model(
         attention_mode=attention_mode,
         dtype=dtype,
-        vocab_size=startup_dataset.metadata.vocab_size,
+        vocab_size=dataset.metadata.vocab_size,
         hidden_size=hidden_size,
         depth=depth,
         ffn_hidden_size=ffn_hidden_size,
@@ -276,17 +287,13 @@ def run_stage1_graph_domain_production(
         num_kv_heads=4,
         head_dim=64,
     )
-    startup = stage1_production_batch_receipt(first_batch, config=model.config)
+    if not isinstance(dataset.metadata, ProductionMegatronDatasetMetadata):
+        raise RuntimeError("production Stage-1 dataset lost immutable provenance metadata")
+    startup = {
+        **stage1_production_batch_receipt(first_batch, config=model.config),
+        **dataset.metadata.provenance_receipt(),
+    }
     print("[stage1-production-startup] " + json.dumps(startup, sort_keys=True), flush=True)
-
-    dataset = open_megatron_indexed_dataset(
-        data_path,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        shuffle=True,
-        seed=seed,
-        loop=True,
-    )
 
     optimizer = optim.AdamW(
         learning_rate=learning_rate,

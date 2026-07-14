@@ -910,6 +910,55 @@ def test_global_reader_returns_candidates_and_never_selects_ambiguous_qname(
         reader.close()
 
 
+def test_crosslink_enrichment_records_ambiguity_without_guessing_provider() -> None:
+    class AmbiguousReader:
+        def lookup(self, _qname: str, **_kwargs):
+            raise ip.AmbiguousGlobalSymbolError("two authoritative providers")
+
+    reference_key = ip.canonical_symbol_identity(
+        qname="EVP_PKEY_CTX_free",
+        kind="FUNCTION_DECL",
+        usr="c:@F@EVP_PKEY_CTX_free",
+        canonical_signature="void (EVP_PKEY_CTX *)",
+    )
+    caller = ip.FunctionDef(
+        name="release",
+        qualified_name="app::release",
+        file="release.cpp",
+        line=1,
+        text="void release() { EVP_PKEY_CTX_free(nullptr); }",
+        callees=["EVP_PKEY_CTX_free"],
+        callee_refs=[
+            {
+                "symbol_key": reference_key,
+                "qname": "EVP_PKEY_CTX_free",
+                "usr": "c:@F@EVP_PKEY_CTX_free",
+                "canonical_signature": "void (EVP_PKEY_CTX *)",
+                "symbol_kind": "FUNCTION_DECL",
+                "project": "",
+                "file": "/usr/include/openssl/evp.h",
+            }
+        ],
+    )
+    project = ip.ProjectIndex()
+    project.add_function(caller)
+    visited: dict[str, dict[str, object]] = {}
+    budget = ip.CrossLinkBudget()
+
+    deps = ip.collect_transitive_deps(
+        caller.symbol_key,
+        project,
+        global_symbols=AmbiguousReader(),
+        crosslink_visited=visited,
+        crosslink_budget=budget,
+    )
+
+    assert deps == []
+    assert visited == {}
+    assert budget.ambiguous_lookups == 1
+    assert budget.ambiguity_examples == ["EVP_PKEY_CTX_free"]
+
+
 def test_std_lookup_requires_authoritative_provider_provenance(tmp_path: Path) -> None:
     db = tmp_path / "symbols.sqlite"
     usr = "c:@N@std@FT@move>#t0.0#&&t0.0#"
