@@ -417,6 +417,21 @@ def _extract_sentinel_path(jsonl: Path) -> Path:
     return Path(str(jsonl) + ".done")
 
 
+def _extract_transaction_checkpoint_path(jsonl: Path) -> Path:
+    return Path(str(jsonl) + ".extract-checkpoint")
+
+
+def has_resumable_extract_checkpoint(repo: str) -> bool:
+    """True when the extractor has durable range state worth retaining."""
+    jsonl = extract_cache_dir(repo) / f"{repo}_commits.jsonl"
+    root = _extract_transaction_checkpoint_path(jsonl)
+    if not root.is_dir():
+        return False
+    if (root / "publication.json").is_file():
+        return True
+    return any(root.glob("repo-*/checkpoint.sqlite3"))
+
+
 def _count_jsonl_lines(path: Path) -> int:
     n = 0
     with path.open("rb") as fh:
@@ -475,17 +490,20 @@ def _read_valid_sentinel(jsonl: Path) -> int | None:
 def _discover_existing_jsonl(repo: str, work_root: Path, work_parent: Path) -> Path | None:
     """Locate a pre-existing <repo>_commits.jsonl from this or a prior run.
 
-    Deterministic search order: stable cache, the current work_root, then any
-    prior randomized conveyor work dir under work_parent / DEFAULT_WORK_PARENT
-    (back-compat: php-src was extracted by older code into a now-orphaned random
-    work_root). Returns the first existing non-empty path, else None. Safe under
-    the per-stream RunLock, which guarantees no OTHER live conveyor owns these
-    dirs while we adopt from them.
+    Deterministic search order: the current work_root, then prior randomized
+    conveyor work dirs under work_parent / DEFAULT_WORK_PARENT (back-compat:
+    php-src was extracted by older code into a now-orphaned random work_root).
+    The stable cache is handled only by its validated sentinel and is never
+    adopted through this legacy path. Returns the first existing non-empty path,
+    else None. Safe under the per-stream RunLock, which guarantees no OTHER live
+    conveyor owns these dirs while we adopt from them.
     """
-    candidates: list[Path] = [
-        extract_cache_dir(repo) / f"{repo}_commits.jsonl",
-        work_root / repo / f"{repo}_commits.jsonl",
-    ]
+    # The stable cache candidate is intentionally absent. It is authoritative
+    # only through _read_valid_sentinel(); adopting the same cache file after a
+    # missing/mismatched sentinel would turn a truncated or corrupt extract into
+    # a freshly stamped "done" corpus. Legacy work roots remain eligible because
+    # they are outside the stable cache and predate its sentinel protocol.
+    candidates: list[Path] = [work_root / repo / f"{repo}_commits.jsonl"]
     parents = {p for p in (work_parent, DEFAULT_WORK_PARENT) if p is not None}
     for parent in parents:
         if parent.exists():
@@ -510,11 +528,10 @@ def ensure_commit_records(
 
     Resolution order (all writing/reading the STABLE EXTRACT_CACHE_ROOT/<repo>):
       (a) HIT: a valid .done sentinel matches the cached jsonl -> reuse instantly.
-      (b) ADOPT/BACK-COMPAT: a jsonl is discoverable from this/a prior run (or the
-          manifest already has a <repo>::r<...> range unit, proving the prior
-          extract finished) -> adopt it into the cache, count lines, stamp the
-          sentinel retroactively, reuse. This is what preserves php-src's ~6h on
-          the upcoming restart.
+      (b) BACK-COMPAT: a jsonl is discoverable from this/a prior run AND the
+          manifest already has a <repo>::r<...> range unit proving the prior
+          extract finished -> adopt it into the cache, count lines, stamp the
+          sentinel retroactively, reuse. Unproven JSONL is never marked done.
       (c) FRESH: nothing reusable -> run extract_git_history into the cache and
           stamp the sentinel on success.
     RAISES (RULE #1) on empty git log / empty extract; never returns a partial set.
@@ -533,6 +550,12 @@ def ensure_commit_records(
 
         # (b) Adopt an existing jsonl (stable cache miss but a prior extract exists).
         existing = _discover_existing_jsonl(repo, work_root, work_parent)
+        if existing is not None and not repo_has_range_done:
+            _log(
+                f"EXTRACT-CKPT UNPROVEN {repo}: ignoring {existing}; no completed "
+                "range receipt proves this legacy JSONL reached EOF"
+            )
+            existing = None
         if existing is not None:
             cache_dir.mkdir(parents=True, exist_ok=True)
             if existing.resolve() != cache_jsonl.resolve():
@@ -543,7 +566,7 @@ def ensure_commit_records(
                 raise RepoFailure(repo, "extract_git_history",
                                   f"adopted commit jsonl is empty: {cache_jsonl}")
             _write_extract_sentinel(cache_jsonl, n)
-            tag = "BACK-COMPAT" if repo_has_range_done else "ADOPT"
+            tag = "BACK-COMPAT"
             _log(f"EXTRACT-CKPT {tag} {repo}: adopted {existing} -> {cache_jsonl} "
                  f"({n} records); stamped sentinel; skip ~extract_git_history")
             return cache_jsonl, n, tag.lower().replace("-", "_")
@@ -2598,9 +2621,22 @@ def process_one_repo(
                  f"{extract_cache_dir(repo)} kept for checkpoint resume")
         else:
             remove_tree(repo_work, reason=f"{repo} partial work")
-            remove_tree(extract_cache_dir(repo), reason=f"{repo} partial extract cache")
-            _log(f"CLEANUP partial for {repo}: unfinished units remain unmarked; "
-                 "resume will re-extract/re-run only unfinished work from manifest")
+            if has_resumable_extract_checkpoint(repo):
+                _log(
+                    f"RETAIN extract checkpoint for failed/partial {repo}: "
+                    f"{extract_cache_dir(repo)} kept; committed extraction chunks "
+                    "will resume without reprocessing"
+                )
+            else:
+                remove_tree(
+                    extract_cache_dir(repo),
+                    reason=f"{repo} partial extract cache",
+                )
+                _log(
+                    f"CLEANUP partial for {repo}: unfinished units remain "
+                    "unmarked and no extraction checkpoint exists; resume will "
+                    "re-extract/re-run only unfinished work from manifest"
+                )
 
 
 # --------------------------------------------------------------------------- #

@@ -904,6 +904,143 @@ def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monk
     assert not cache_dir.exists()
 
 
+def test_discover_existing_jsonl_never_adopts_unvalidated_stable_cache(
+    tmp_path,
+    monkeypatch,
+):
+    import streaming_conveyor
+
+    repo = "repo"
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    cache_dir.mkdir(parents=True)
+    unvalidated = cache_dir / f"{repo}_commits.jsonl"
+    unvalidated.write_text('{"partial": true}\n', encoding="utf-8")
+    work_root = tmp_path / "work"
+    work_parent = tmp_path / "work_parent"
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+    monkeypatch.setattr(streaming_conveyor, "DEFAULT_WORK_PARENT", work_parent)
+
+    assert (
+        streaming_conveyor._discover_existing_jsonl(
+            repo,
+            work_root,
+            work_parent,
+        )
+        is None
+    )
+
+
+def test_ensure_commit_records_reextracts_unproven_legacy_jsonl(
+    tmp_path,
+    monkeypatch,
+):
+    import streaming_conveyor
+
+    repo = "repo"
+    cache_root = tmp_path / "extract_cache"
+    work_root = tmp_path / "work"
+    work_parent = tmp_path / "work_parent"
+    legacy = work_root / repo / f"{repo}_commits.jsonl"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text('{"partial": true}\n', encoding="utf-8")
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+    monkeypatch.setattr(streaming_conveyor, "DEFAULT_WORK_PARENT", work_parent)
+    monkeypatch.setattr(streaming_conveyor, "get_commit_list", lambda _repo_dir: ["c1"])
+    calls = []
+
+    def fresh_extract(name, _repo_dir, cache_dir):
+        calls.append(name)
+        output = cache_dir / f"{name}_commits.jsonl"
+        output.write_text('{"fresh": true}\n', encoding="utf-8")
+        return output
+
+    monkeypatch.setattr(streaming_conveyor, "stage_extract_commits", fresh_extract)
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    output, count, status = streaming_conveyor.ensure_commit_records(
+        repo,
+        tmp_path / "repo_src",
+        work_root,
+        work_parent,
+        manifest,
+        resume=True,
+    )
+
+    assert calls == [repo]
+    assert output.read_text(encoding="utf-8") == '{"fresh": true}\n'
+    assert legacy.read_text(encoding="utf-8") == '{"partial": true}\n'
+    assert (count, status) == (1, "fresh")
+    assert streaming_conveyor._read_valid_sentinel(output) == 1
+
+
+def test_process_one_repo_retains_transactional_extract_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "repo"
+    work_root = tmp_path / "work"
+    repo_work = work_root / repo
+    repo_dir = repo_work / "_src"
+    repo_dir.mkdir(parents=True)
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    checkpoint_db = (
+        cache_dir
+        / f"{repo}_commits.jsonl.extract-checkpoint"
+        / "repo-0000-deadbeef"
+        / "checkpoint.sqlite3"
+    )
+    checkpoint_db.parent.mkdir(parents=True)
+    checkpoint_db.write_bytes(b"durable checkpoint")
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+
+    monkeypatch.setattr(
+        streaming_conveyor,
+        "run_code_half_adaptive",
+        lambda *_args, **_kwargs: {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=32, target_length=1024)},
+        },
+    )
+    monkeypatch.setattr(
+        streaming_conveyor,
+        "run_commits_half",
+        lambda *_args, **_kwargs: (0, 0, False),
+    )
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        streaming_conveyor.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(1024,),
+            range_size=500,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=streaming_conveyor.threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=False,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=_repo_identity_map(tmp_path),
+            streams="both",
+        )
+
+    assert not repo_work.exists()
+    assert checkpoint_db.read_bytes() == b"durable checkpoint"
+
+
 def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
     tmp_path,
     monkeypatch,
