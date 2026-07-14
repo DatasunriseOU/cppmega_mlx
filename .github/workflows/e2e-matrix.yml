@@ -40,7 +40,11 @@ jobs:
     name: Preset matrix (smoke, self-hosted macOS)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
-    timeout-minutes: 25
+    # Shard 1 contains the slowest generated preset cells and takes ~21 minutes
+    # after setup on the shared Mac Studio. Keep the timeout above measured test
+    # time so the self-hosted runner reports an actual verdict instead of a
+    # scheduler cancellation.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
