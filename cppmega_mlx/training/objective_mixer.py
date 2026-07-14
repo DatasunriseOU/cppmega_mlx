@@ -598,6 +598,30 @@ class GraphAuxLossConfig:
             raise ValueError("graph auxiliary margin must be non-negative")
 
 
+@dataclass(frozen=True)
+class GraphAuxLossBreakdown:
+    """Differentiable graph-loss terms after all configured weights."""
+
+    total: mx.array
+    edge_bce: mx.array
+    ranking: mx.array
+    layer_count: int
+
+
+@dataclass(frozen=True)
+class ProductionTrainingLossBreakdown:
+    """Array-valued LM + graph objective metrics from one decoder forward."""
+
+    total: mx.array
+    lm_ce: mx.array
+    graph_total: mx.array
+    graph_edge_bce: mx.array
+    graph_ranking: mx.array
+    graph_positive_pairs: mx.array
+    ntokens: mx.array
+    graph_layer_count: int
+
+
 def _graph_targets(
     graph: GraphPacket,
     *,
@@ -706,6 +730,22 @@ def graph_auxiliary_loss_from_targets(
 ) -> mx.array:
     """Differentiable graph loss for fixed-shape production batches."""
 
+    return graph_auxiliary_loss_breakdown_from_targets(
+        indexer_scores,
+        edge_targets,
+        pair_mask,
+        config,
+    ).total
+
+
+def graph_auxiliary_loss_breakdown_from_targets(
+    indexer_scores: Sequence[mx.array],
+    edge_targets: mx.array,
+    pair_mask: mx.array,
+    config: GraphAuxLossConfig,
+) -> GraphAuxLossBreakdown:
+    """Return weighted BCE/ranking terms without detaching their MLX graph."""
+
     if not indexer_scores:
         raise ValueError(
             "graph auxiliary loss configured but indexer scores are absent"
@@ -715,14 +755,15 @@ def graph_auxiliary_loss_from_targets(
             "graph auxiliary targets/pair_mask must share (B,Q,K) shape; got "
             f"targets={tuple(edge_targets.shape)} mask={tuple(pair_mask.shape)}"
         )
-    losses: list[mx.array] = []
+    edge_bce_losses: list[mx.array] = []
+    ranking_losses: list[mx.array] = []
     for layer_index, scores in enumerate(indexer_scores):
         if scores.shape != edge_targets.shape:
             raise ValueError(
                 f"graph indexer layer {layer_index} shape {tuple(scores.shape)} "
                 f"!= targets {tuple(edge_targets.shape)}"
             )
-        loss, _ = total_indexer_loss(
+        _loss, components = total_indexer_loss(
             scores,
             edge_targets=edge_targets,
             edge_pair_mask=pair_mask,
@@ -733,12 +774,20 @@ def graph_auxiliary_loss_from_targets(
             pos_weight=config.pos_weight,
             margin=config.margin,
         )
-        losses.append(loss)
-    return (
-        mx.sum(mx.stack(losses))
-        * config.global_weight
-        * config.indexer_weight
-        * config.layer_weight
+        edge_bce_losses.append(components["bce"])
+        ranking_losses.append(components["coverage"])
+    scale = (
+        float(config.global_weight)
+        * float(config.indexer_weight)
+        * float(config.layer_weight)
+    )
+    edge_bce = mx.sum(mx.stack(edge_bce_losses)) * scale
+    ranking = mx.sum(mx.stack(ranking_losses)) * scale
+    return GraphAuxLossBreakdown(
+        total=edge_bce + ranking,
+        edge_bce=edge_bce,
+        ranking=ranking,
+        layer_count=len(indexer_scores),
     )
 
 
@@ -775,12 +824,47 @@ def production_training_loss(
     side_channels: Mapping[str, mx.array],
     document_ids: mx.array | None,
     block_bias: mx.array | None,
+    edge_kind_bias: mx.array | None = None,
     graph_targets: mx.array | None,
     graph_pair_mask: mx.array | None,
     graph_config: GraphAuxLossConfig | None,
     graph_weight: float,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Compute the differentiated LM + configured graph auxiliary objective."""
+
+    breakdown = production_training_loss_breakdown(
+        model,
+        input_ids,
+        targets,
+        loss_mask,
+        side_channels=side_channels,
+        document_ids=document_ids,
+        block_bias=block_bias,
+        edge_kind_bias=edge_kind_bias,
+        graph_targets=graph_targets,
+        graph_pair_mask=graph_pair_mask,
+        graph_config=graph_config,
+        graph_weight=graph_weight,
+    )
+    return breakdown.total, breakdown.lm_ce, breakdown.graph_total
+
+
+def production_training_loss_breakdown(
+    model: Any,
+    input_ids: mx.array,
+    targets: mx.array,
+    loss_mask: mx.array,
+    *,
+    side_channels: Mapping[str, mx.array],
+    document_ids: mx.array | None,
+    block_bias: mx.array | None,
+    edge_kind_bias: mx.array | None,
+    graph_targets: mx.array | None,
+    graph_pair_mask: mx.array | None,
+    graph_config: GraphAuxLossConfig | None,
+    graph_weight: float,
+) -> ProductionTrainingLossBreakdown:
+    """Compose CE and graph terms from one hidden/indexer decoder invocation."""
 
     if not math.isfinite(float(graph_weight)) or graph_weight <= 0.0:
         raise ValueError("graph auxiliary global weight must be finite and positive")
@@ -829,41 +913,87 @@ def production_training_loss(
             "production graph objective is missing required structure sidecars: "
             + ", ".join(missing_structure_channels)
         )
-    edge_kind_bias = mx.zeros_like(block_bias)
-    _, lm_loss = model(
+    if edge_kind_bias is None:
+        raise ValueError(
+            "production graph objective requires an explicit graph edge-kind prior"
+        )
+    if tuple(edge_kind_bias.shape) != tuple(block_bias.shape):
+        raise ValueError(
+            "production graph edge-kind prior must match relation prior shape "
+            f"{tuple(block_bias.shape)}, got {tuple(edge_kind_bias.shape)}"
+        )
+    decoder_forward = getattr(model, "decoder_hidden_states", None)
+    if not callable(decoder_forward):
+        raise TypeError(
+            "production graph objective requires model.decoder_hidden_states"
+        )
+    decoder_result = decoder_forward(
         input_ids,
-        targets=targets,
-        loss_mask=loss_mask,
         document_ids=document_ids,
         block_bias=block_bias,
         edge_kind_bias=edge_kind_bias,
+        return_indexer_scores=True,
         **side_channels,
     )
-    if lm_loss is None:  # pragma: no cover - targets make this unreachable
-        raise RuntimeError("model returned no LM loss despite supplied targets")
-    graph_loss = graph_auxiliary_loss_from_targets(
-        model.indexer_scores(
-            input_ids,
-            document_ids=document_ids,
-            block_bias=block_bias,
-            edge_kind_bias=edge_kind_bias,
-            **side_channels,
-        ),
+    if not isinstance(decoder_result, tuple) or len(decoder_result) != 2:
+        raise RuntimeError(
+            "production graph decoder did not return hidden states and indexer scores"
+        )
+    hidden_states, indexer_scores = decoder_result
+    if not isinstance(hidden_states, mx.array) or not isinstance(indexer_scores, tuple):
+        raise RuntimeError(
+            "production graph decoder returned an invalid hidden/indexer contract"
+        )
+
+    if bool(getattr(model_config, "chunked_ce", False)):
+        chunked_cross_entropy = getattr(model, "_chunked_cross_entropy", None)
+        if not callable(chunked_cross_entropy):
+            raise TypeError("chunked CE requires model._chunked_cross_entropy")
+        lm_loss = chunked_cross_entropy(
+            hidden_states,
+            targets,
+            loss_mask,
+            int(getattr(model_config, "ce_chunk_size")),
+        )
+    else:
+        lm_head = getattr(model, "lm_head", None)
+        cross_entropy = getattr(model, "_cross_entropy", None)
+        if not callable(lm_head) or not callable(cross_entropy):
+            raise TypeError("production graph objective requires LM head/CE helpers")
+        logits = lm_head(hidden_states)
+        lm_loss = cross_entropy(logits, targets, loss_mask)
+
+    graph_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+        indexer_scores,
         graph_targets,
         graph_pair_mask,
         graph_config,
     )
-    return lm_loss + graph_loss, lm_loss, graph_loss
+    ntokens = mx.sum(loss_mask.astype(mx.float32))
+    return ProductionTrainingLossBreakdown(
+        total=lm_loss + graph_breakdown.total,
+        lm_ce=lm_loss,
+        graph_total=graph_breakdown.total,
+        graph_edge_bce=graph_breakdown.edge_bce,
+        graph_ranking=graph_breakdown.ranking,
+        graph_positive_pairs=mx.sum(graph_targets.astype(mx.float32)),
+        ntokens=ntokens,
+        graph_layer_count=graph_breakdown.layer_count,
+    )
 
 
 __all__ = [
     "EligibilityAwareTaskMixer",
+    "GraphAuxLossBreakdown",
     "GraphAuxLossConfig",
     "ObjectiveAccounting",
     "ObjectiveSource",
+    "ProductionTrainingLossBreakdown",
     "RealizedObjective",
     "combine_lm_and_aux_losses",
     "compute_graph_auxiliary_loss",
+    "graph_auxiliary_loss_breakdown_from_targets",
     "graph_auxiliary_loss_from_targets",
     "production_training_loss",
+    "production_training_loss_breakdown",
 ]

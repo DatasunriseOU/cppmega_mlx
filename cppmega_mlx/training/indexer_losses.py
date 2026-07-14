@@ -31,6 +31,8 @@ from collections.abc import Sequence
 import mlx.core as mx
 import numpy as np
 
+from cppmega_mlx.data.batch import batch_values_are_prevalidated
+
 _EPS = 1e-9
 _NEG_INF = -1e9
 
@@ -135,7 +137,9 @@ def indexer_edge_bce_loss(
     logits = indexer_scores.astype(mx.float32)
     valid = (logits > (_NEG_INF / 2.0)).astype(mx.float32)
     targets = edge_targets.astype(mx.float32)
-    if bool(mx.any((targets != 0) & (targets != 1)).item()):
+    if not batch_values_are_prevalidated() and bool(
+        mx.any((targets != 0) & (targets != 1)).item()
+    ):
         raise ValueError("indexer_edge_bce_loss: edge_targets must contain only 0/1")
     if pair_mask is not None:
         if tuple(pair_mask.shape) != (B, Tq, Sblk):
@@ -144,9 +148,13 @@ def indexer_edge_bce_loss(
                 f"match indexer_scores ({B},{Tq},{Sblk})"
             )
         mask = pair_mask.astype(mx.float32)
-        if bool(mx.any((mask != 0) & (mask != 1)).item()):
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((mask != 0) & (mask != 1)).item()
+        ):
             raise ValueError("indexer_edge_bce_loss: pair_mask must contain only 0/1")
-        if bool(mx.any((targets > 0) & (mask <= 0)).item()):
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((targets > 0) & (mask <= 0)).item()
+        ):
             raise ValueError(
                 "indexer_edge_bce_loss: positive edge outside pair_mask"
             )
@@ -195,7 +203,9 @@ def indexer_coverage_hinge_loss(
         raise ValueError(f"indexer_coverage_hinge_loss: topk must be >=1, got {topk}")
     logits = indexer_scores.astype(mx.float32)
     targets = edge_targets.astype(mx.float32)
-    if bool(mx.any((targets != 0) & (targets != 1)).item()):
+    if not batch_values_are_prevalidated() and bool(
+        mx.any((targets != 0) & (targets != 1)).item()
+    ):
         raise ValueError(
             "indexer_coverage_hinge_loss: edge_targets must contain only 0/1"
         )
@@ -207,11 +217,15 @@ def indexer_coverage_hinge_loss(
                 f"({B},{Tq},{Sblk})"
             )
         mask = pair_mask.astype(mx.float32)
-        if bool(mx.any((mask != 0) & (mask != 1)).item()):
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((mask != 0) & (mask != 1)).item()
+        ):
             raise ValueError(
                 "indexer_coverage_hinge_loss: pair_mask must contain only 0/1"
             )
-        if bool(mx.any((targets > 0) & (mask <= 0)).item()):
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((targets > 0) & (mask <= 0)).item()
+        ):
             raise ValueError(
                 "indexer_coverage_hinge_loss: positive edge outside pair_mask"
             )

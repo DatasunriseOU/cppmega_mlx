@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,6 +30,11 @@ from cppmega_mlx.training.compiled import (
     CompiledPretrainingStep,
     normalize_compiled_batch,
 )
+from cppmega_mlx.training.objective_mixer import (
+    GraphAuxLossConfig,
+    ProductionTrainingLossBreakdown,
+    production_training_loss_breakdown,
+)
 
 
 STAGE1_GRAPH_DOMAIN_RECIPE = "stage1_graph_domain_v1"
@@ -35,6 +42,214 @@ PRODUCTION_GRAPH_BETA = 1.0
 PRODUCTION_DOMAIN_RESIDUAL_SCALE = 1.0
 PRODUCTION_DOMAIN_FIELDS = ("domain_ids", "role_ids", "confidence_ids")
 ProductionAttentionMode = Literal["gqa", "dsa"]
+STAGE1_PRODUCTION_GRAPH_RELATIONS = (
+    "call",
+    "type",
+    "domain",
+    "build",
+    "shell",
+    "diagnostic",
+    "cross_domain",
+)
+STAGE1_PRODUCTION_GRAPH_LOSS = GraphAuxLossConfig(
+    relations=STAGE1_PRODUCTION_GRAPH_RELATIONS,
+    topk=256,
+    global_weight=1.0,
+    indexer_weight=0.001,
+    layer_weight=1.0,
+    bce_weight=0.10,
+    coverage_weight=0.05,
+    pos_weight=1.0,
+    margin=1.0,
+)
+
+
+@dataclass(frozen=True)
+class _Stage1ObjectiveBatch:
+    input_ids: mx.array
+    targets: mx.array
+    loss_mask: mx.array
+    document_ids: mx.array
+    relation_bias: mx.array
+    edge_kind_bias: mx.array
+    graph_targets: mx.array
+    graph_pair_mask: mx.array
+    side_channels: Mapping[str, mx.array]
+
+
+@dataclass(frozen=True)
+class Stage1ProductionObjective:
+    """Canonical differentiated CE + graph objective for production Stage-1."""
+
+    graph_config: GraphAuxLossConfig = STAGE1_PRODUCTION_GRAPH_LOSS
+
+    def __post_init__(self) -> None:
+        if tuple(self.graph_config.relations) != STAGE1_PRODUCTION_GRAPH_RELATIONS:
+            raise ValueError(
+                "production Stage-1 graph supervision must cover every route "
+                f"sidecar {STAGE1_PRODUCTION_GRAPH_RELATIONS}, got "
+                f"{tuple(self.graph_config.relations)}"
+            )
+
+    def validate_batch(
+        self,
+        batch: LMTokenBatch | Mapping[str, Any] | mx.array,
+    ) -> None:
+        values = _stage1_objective_batch(batch)
+        finite_relation = mx.all(mx.isfinite(values.relation_bias))
+        finite_edge_kind = mx.all(mx.isfinite(values.edge_kind_bias))
+        positive_pairs = mx.sum(values.graph_targets)
+        targets_outside_mask = mx.any(
+            (values.graph_targets > 0) & (values.graph_pair_mask <= 0)
+        )
+        loss_tokens = mx.sum(values.loss_mask.astype(mx.float32))
+        mx.eval(
+            finite_relation,
+            finite_edge_kind,
+            positive_pairs,
+            targets_outside_mask,
+            loss_tokens,
+        )
+        if not bool(finite_relation.item()):
+            raise ValueError("production graph relation prior must be finite")
+        if not bool(finite_edge_kind.item()):
+            raise ValueError("production graph edge-kind prior must be finite")
+        if float(positive_pairs.item()) <= 0.0:
+            raise ValueError(
+                "production Stage-1 graph objective requires nonzero graph targets"
+            )
+        if bool(targets_outside_mask.item()):
+            raise ValueError(
+                "production Stage-1 graph target crosses a causal/document boundary"
+            )
+        if float(loss_tokens.item()) <= 0.0:
+            raise ValueError("production Stage-1 batch has no LM loss tokens")
+
+    def loss_breakdown(
+        self,
+        model: DenseCppLM,
+        batch: LMTokenBatch | Mapping[str, Any] | mx.array,
+    ) -> ProductionTrainingLossBreakdown:
+        values = _stage1_objective_batch(batch)
+        if model.config.attention_mode != "dsa":
+            raise ValueError(
+                "production Stage-1 combined objective requires attention_mode='dsa'"
+            )
+        if model.config.attention_sparse_topk != self.graph_config.topk:
+            raise ValueError(
+                "production Stage-1 graph ranking topk differs from model DSA topk: "
+                f"{self.graph_config.topk} != {model.config.attention_sparse_topk}"
+            )
+        return production_training_loss_breakdown(
+            model,
+            values.input_ids,
+            values.targets,
+            values.loss_mask,
+            side_channels=values.side_channels,
+            document_ids=values.document_ids,
+            block_bias=values.relation_bias,
+            edge_kind_bias=values.edge_kind_bias,
+            graph_targets=values.graph_targets,
+            graph_pair_mask=values.graph_pair_mask,
+            graph_config=self.graph_config,
+            graph_weight=self.graph_config.global_weight,
+        )
+
+    def __call__(
+        self,
+        model: DenseCppLM,
+        batch: LMTokenBatch | Mapping[str, Any] | mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        breakdown = self.loss_breakdown(model, batch)
+        return breakdown.total, breakdown.ntokens
+
+    def receipt(self) -> dict[str, Any]:
+        config = self.graph_config
+        return {
+            "formula": "lm_ce + graph_edge_bce + graph_ranking",
+            "relations": list(config.relations),
+            "topk": config.topk,
+            "global_weight": config.global_weight,
+            "indexer_weight": config.indexer_weight,
+            "layer_weight": config.layer_weight,
+            "edge_bce_weight": config.bce_weight,
+            "ranking_weight": config.coverage_weight,
+            "positive_weight": config.pos_weight,
+            "ranking_margin": config.margin,
+            "single_decoder_forward": True,
+        }
+
+
+def _stage1_objective_batch(
+    batch: LMTokenBatch | Mapping[str, Any] | mx.array,
+) -> _Stage1ObjectiveBatch:
+    normalized = normalize_compiled_batch(batch, graph_routes_enabled=True)
+    lm_batch = ensure_lm_batch(normalized)
+    model_kwargs = lm_batch.model_kwargs()
+    relation_bias = model_kwargs.pop("block_bias", None)
+    edge_kind_bias = model_kwargs.pop("edge_kind_bias", None)
+    document_ids = lm_batch.input_document_ids
+    if not isinstance(relation_bias, mx.array):
+        raise ValueError(
+            "production Stage-1 objective requires a graph relation prior from "
+            "ProductionMegatronDataset graph sidecars"
+        )
+    if not isinstance(edge_kind_bias, mx.array):
+        raise ValueError(
+            "production Stage-1 objective requires a graph edge-kind prior from "
+            "ProductionMegatronDataset graph sidecars"
+        )
+    if not isinstance(document_ids, mx.array):
+        raise ValueError("production Stage-1 objective requires document_ids")
+
+    input_ids = lm_batch.inputs
+    expected_graph_shape = (
+        int(input_ids.shape[0]),
+        int(input_ids.shape[1]),
+        int(input_ids.shape[1]),
+    )
+    for name, value in (
+        ("graph relation prior", relation_bias),
+        ("graph edge-kind prior", edge_kind_bias),
+    ):
+        if tuple(value.shape) != expected_graph_shape:
+            raise ValueError(
+                f"production Stage-1 {name} must have shape {expected_graph_shape}, "
+                f"got {tuple(value.shape)}"
+            )
+
+    sequence_length = int(input_ids.shape[1])
+    positions = mx.arange(sequence_length, dtype=mx.int32)
+    causal = positions[:, None] >= positions[None, :]
+    same_document = document_ids[:, :, None] == document_ids[:, None, :]
+    pair_mask = causal[None, :, :] & same_document
+    if lm_batch.attention_mask is not None:
+        token_mask = lm_batch.attention_mask
+        if tuple(token_mask.shape) == tuple(lm_batch.tokens.shape):
+            token_mask = token_mask[:, :sequence_length]
+        elif tuple(token_mask.shape) != tuple(input_ids.shape):
+            raise ValueError(
+                "production Stage-1 attention_mask cannot align to model inputs: "
+                f"{tuple(token_mask.shape)} vs {tuple(input_ids.shape)}"
+            )
+        active = token_mask > 0
+        pair_mask = pair_mask & active[:, :, None] & active[:, None, :]
+
+    return _Stage1ObjectiveBatch(
+        input_ids=input_ids,
+        targets=lm_batch.targets,
+        loss_mask=lm_batch.target_mask,
+        document_ids=document_ids,
+        relation_bias=relation_bias,
+        edge_kind_bias=edge_kind_bias,
+        graph_targets=(relation_bias != 0).astype(mx.float32),
+        graph_pair_mask=pair_mask.astype(mx.float32),
+        side_channels={
+            name: value
+            for name, value in model_kwargs.items()
+            if isinstance(value, mx.array)
+        },
+    )
 
 
 def stage1_production_config(
@@ -229,7 +444,7 @@ def add_stage1_production_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--production-attention-mode",
         choices=("gqa", "dsa"),
-        default="gqa",
+        default="dsa",
     )
 
 
@@ -247,15 +462,22 @@ def run_stage1_graph_domain_production(
     ffn_hidden_size: int,
     learning_rate: float,
     seed: int,
-    attention_mode: ProductionAttentionMode = "gqa",
+    attention_mode: ProductionAttentionMode = "dsa",
     compile: bool = True,
     bf16: bool = False,
     bundle_hash_jobs: int = 4,
+    graph_loss_config: GraphAuxLossConfig = STAGE1_PRODUCTION_GRAPH_LOSS,
 ) -> dict[str, Any]:
     """Run Stage-1 only after immutable bundle and restore validation."""
 
     if steps < 1:
         raise ValueError("production Stage-1 steps must be positive")
+    if attention_mode != "dsa":
+        raise ValueError(
+            "production Stage-1 combined CE + graph objective requires "
+            "attention_mode='dsa'"
+        )
+    objective = Stage1ProductionObjective(graph_loss_config)
     dataset = open_production_megatron_bundle(
         data_path,
         bucket,
@@ -286,12 +508,14 @@ def run_stage1_graph_domain_production(
         num_query_heads=20,
         num_kv_heads=4,
         head_dim=64,
+        attention_sparse_topk=graph_loss_config.topk,
     )
     if not isinstance(dataset.metadata, ProductionMegatronDatasetMetadata):
         raise RuntimeError("production Stage-1 dataset lost immutable provenance metadata")
     startup = {
         **stage1_production_batch_receipt(first_batch, config=model.config),
         **dataset.metadata.provenance_receipt(),
+        "loss_objective": objective.receipt(),
     }
     print("[stage1-production-startup] " + json.dumps(startup, sort_keys=True), flush=True)
 
@@ -300,7 +524,12 @@ def run_stage1_graph_domain_production(
         weight_decay=0.1,
         betas=(0.9, 0.95),
     )
-    stepper = CompiledPretrainingStep(model, optimizer, compile=compile)
+    stepper = CompiledPretrainingStep(
+        model,
+        optimizer,
+        loss_fn=objective,
+        compile=compile,
+    )
     batch_iter = dataset.iter_batches(loop=True)
     observed_edges = 0
     observed_edge_kind_edges = 0
@@ -499,6 +728,9 @@ __all__ = [
     "PRODUCTION_DOMAIN_RESIDUAL_SCALE",
     "PRODUCTION_GRAPH_BETA",
     "STAGE1_GRAPH_DOMAIN_RECIPE",
+    "STAGE1_PRODUCTION_GRAPH_LOSS",
+    "STAGE1_PRODUCTION_GRAPH_RELATIONS",
+    "Stage1ProductionObjective",
     "add_stage1_production_arguments",
     "build_stage1_production_model",
     "run_stage1_graph_domain_production",

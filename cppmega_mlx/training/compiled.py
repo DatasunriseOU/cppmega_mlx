@@ -1802,6 +1802,10 @@ class CompiledPretrainingStep:
             graph_routes_enabled=graph_routes_enabled,
         )
         batch_is_prevalidated = False
+        loss_validator = getattr(self.loss_fn, "validate_batch", None)
+        if callable(loss_validator):
+            loss_validator(batch_dict)
+            batch_is_prevalidated = True
         validator = getattr(self.model, "validate_training_batch", None)
         if validator is None and self.compile:
             validator = getattr(self.model, "validate_compiled_batch", None)
