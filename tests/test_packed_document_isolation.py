@@ -1,5 +1,6 @@
 """Focused regressions for packed-document isolation in the MLX runtime."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
@@ -53,6 +55,24 @@ def test_objective_batch_preserves_document_ids_and_masks_boundary_target() -> N
 
     assert np.asarray(batch.document_ids).tolist() == [[41, 41, 73, 73, 0, 0]]
     assert np.asarray(batch.loss_mask).tolist() == [[1.0, 0.0, 1.0, 1.0, 0.0, 0.0]]
+    assert tuple(batch.edge_kind_bias.shape) == tuple(batch.block_bias.shape)
+
+
+def test_objective_batch_preserves_typed_edge_kind_bias() -> None:
+    packet = _aligned_packet(document_ids=_array([1, 1, 1, 1, 1]))
+    packet = replace(
+        packet,
+        domain_edges=DomainEdgeIndex.from_triples([(2, 0, 60)]),
+    )
+    example = build_causal_lm(packet)
+
+    batch = _materialize_batch(
+        TaskKind.CAUSAL_LM,
+        [(example, ObjectiveSource(code_packet=packet))],
+        seq_len=6,
+    )
+
+    assert int(mx.sum(batch.edge_kind_bias != 0).item()) == 1
 
 
 def test_aligned_objective_batch_rejects_missing_document_ids() -> None:

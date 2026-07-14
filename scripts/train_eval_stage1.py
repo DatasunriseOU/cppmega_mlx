@@ -51,6 +51,7 @@ from mlx.utils import tree_flatten
 
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_SOURCE_COLUMNS,
     graph_targets_and_pair_mask,
@@ -166,6 +167,7 @@ class ObjectiveBatch:
     document_ids: mx.array
     side_channels: dict[str, mx.array]
     block_bias: mx.array
+    edge_kind_bias: mx.array
     graph_targets: mx.array
     graph_pair_mask: mx.array
     graph_samples: int
@@ -246,6 +248,8 @@ def _materialize_batch(
     batch_size = len(entries)
     graph_targets = np.zeros((batch_size, seq_len, seq_len), dtype=np.float32)
     graph_pair_mask = np.zeros_like(graph_targets)
+    relation_bias = np.zeros_like(graph_targets)
+    edge_kind_bias = np.zeros_like(graph_targets)
     graph_samples = 0
     if task in _ALIGNED_TASKS:
         for batch_index, (example, source) in enumerate(entries):
@@ -257,6 +261,25 @@ def _materialize_batch(
                 input_length=input_length,
                 relations=graph_relations,
             )
+            aligned_graph = packet.graph_batch().input_aligned(
+                source_sequence_length=int(packet.token_ids.shape[0]),
+                input_sequence_length=input_length,
+            )
+            row_relation_bias, row_edge_kind_bias = build_token_graph_biases(
+                aligned_graph,
+                batch_size=1,
+                seq_length=input_length,
+                document_ids=document_ids[
+                    batch_index : batch_index + 1, :input_length
+                ],
+            )
+            mx.eval(row_relation_bias, row_edge_kind_bias)
+            relation_bias[
+                batch_index, :input_length, :input_length
+            ] = np.asarray(row_relation_bias[0], dtype=np.float32)
+            edge_kind_bias[
+                batch_index, :input_length, :input_length
+            ] = np.asarray(row_edge_kind_bias[0], dtype=np.float32)
             causal_edges = int(dense_targets.sum(dtype=np.float64))
             if causal_edges == 0:
                 continue
@@ -277,7 +300,8 @@ def _materialize_batch(
         loss_mask=loss_mask,
         document_ids=document_ids,
         side_channels=side_channels,
-        block_bias=targets_array,
+        block_bias=mx.array(relation_bias),
+        edge_kind_bias=mx.array(edge_kind_bias),
         graph_targets=targets_array,
         graph_pair_mask=mx.array(graph_pair_mask),
         graph_samples=graph_samples,
@@ -767,6 +791,7 @@ def main() -> None:
         document_ids,
         side,
         block_bias,
+        edge_kind_bias,
         graph_targets,
         graph_pair_mask,
     ):
@@ -778,6 +803,7 @@ def main() -> None:
             side_channels=side,
             document_ids=document_ids,
             block_bias=block_bias if graph_aux_enabled else None,
+            edge_kind_bias=edge_kind_bias if graph_aux_enabled else None,
             graph_targets=graph_targets if graph_aux_enabled else None,
             graph_pair_mask=graph_pair_mask if graph_aux_enabled else None,
             graph_config=graph_config if graph_aux_enabled else None,
@@ -787,7 +813,7 @@ def main() -> None:
     aligned_loss_and_grad = nn.value_and_grad(
         model,
         lambda input_ids, targets, loss_mask, document_ids, side_vals, block_bias,
-        graph_targets, graph_pair_mask: _objective_loss(
+        edge_kind_bias, graph_targets, graph_pair_mask: _objective_loss(
             model,
             input_ids,
             targets,
@@ -798,14 +824,15 @@ def main() -> None:
                 for index, (_src, dst) in enumerate(CHANNELS)
             },
             block_bias,
+            edge_kind_bias,
             graph_targets,
             graph_pair_mask,
         ),
     )
 
     def _reordered_lm_loss(
-        model, input_ids, targets, loss_mask, document_ids, block_bias, graph_targets,
-        graph_pair_mask,
+        model, input_ids, targets, loss_mask, document_ids, block_bias,
+        edge_kind_bias, graph_targets, graph_pair_mask,
     ):
         del graph_targets, graph_pair_mask
         _, lm_loss = model(
@@ -814,7 +841,7 @@ def main() -> None:
             loss_mask=loss_mask,
             document_ids=document_ids,
             block_bias=block_bias,
-            edge_kind_bias=mx.zeros_like(block_bias),
+            edge_kind_bias=edge_kind_bias,
         )
         if lm_loss is None:
             raise RuntimeError("model returned no LM loss despite supplied targets")
@@ -822,14 +849,15 @@ def main() -> None:
 
     reordered_loss_and_grad = nn.value_and_grad(
         model,
-        lambda input_ids, targets, loss_mask, document_ids, block_bias, graph_targets,
-        graph_pair_mask: _reordered_lm_loss(
+        lambda input_ids, targets, loss_mask, document_ids, block_bias,
+        edge_kind_bias, graph_targets, graph_pair_mask: _reordered_lm_loss(
             model,
             input_ids,
             targets,
             loss_mask,
             document_ids,
             block_bias,
+            edge_kind_bias,
             graph_targets,
             graph_pair_mask,
         ),
@@ -855,6 +883,7 @@ def main() -> None:
         document_ids,
         side_vals,
         block_bias,
+        edge_kind_bias,
         graph_targets,
         graph_pair_mask,
     ):
@@ -865,6 +894,7 @@ def main() -> None:
             document_ids,
             side_vals,
             block_bias,
+            edge_kind_bias,
             graph_targets,
             graph_pair_mask,
         )
@@ -876,6 +906,7 @@ def main() -> None:
         loss_mask,
         document_ids,
         block_bias,
+        edge_kind_bias,
         graph_targets,
         graph_pair_mask,
     ):
@@ -885,6 +916,7 @@ def main() -> None:
             loss_mask,
             document_ids,
             block_bias,
+            edge_kind_bias,
             graph_targets,
             graph_pair_mask,
         )
@@ -937,6 +969,7 @@ def main() -> None:
                 objective_batch.document_ids,
                 side_vals,
                 objective_batch.block_bias,
+                objective_batch.edge_kind_bias,
                 objective_batch.graph_targets,
                 objective_batch.graph_pair_mask,
             )
@@ -947,6 +980,7 @@ def main() -> None:
                 objective_batch.loss_mask,
                 objective_batch.document_ids,
                 objective_batch.block_bias,
+                objective_batch.edge_kind_bias,
                 objective_batch.graph_targets,
                 objective_batch.graph_pair_mask,
             )
