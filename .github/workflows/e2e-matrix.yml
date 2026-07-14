@@ -40,11 +40,9 @@ jobs:
     name: Preset matrix (smoke, self-hosted macOS)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
-    # Shard 1 contains the slowest generated preset cells and takes ~21 minutes
-    # after setup on the shared Mac Studio. Keep the timeout above measured test
-    # time so the self-hosted runner reports an actual verdict instead of a
-    # scheduler cancellation.
-    timeout-minutes: 40
+    # The matrix is one spec file. --fully-parallel is required or Playwright
+    # assigns all 912 cells to shard 1 and leaves the other shards empty.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +93,8 @@ jobs:
         run: |
           npx playwright test --config=e2e/playwright.config.ts \
             e2e/scenarios/02_preset_matrix.spec.ts \
+            --fully-parallel \
+            --global-timeout=720000 \
             --shard=${{ matrix.shard }}/4
       - name: Upload artefacts
         if: always()

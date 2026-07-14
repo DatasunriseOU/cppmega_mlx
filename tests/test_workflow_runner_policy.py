@@ -7,9 +7,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOSTED_RUNNER = re.compile(
-    r"^\s*runs-on:\s*.*(?:ubuntu|macos|windows)-latest\s*$",
-    re.MULTILINE,
+    r"\b(?:ubuntu|macos|windows)-(?:latest|[0-9]+(?:\.[0-9]+)?)\b",
+    re.IGNORECASE,
 )
+RUNS_ON = re.compile(r"(?m)^\s*runs-on:\s*(?P<labels>.+?)\s*$")
 JOB_BLOCK = re.compile(
     r"(?ms)^  (?P<name>[A-Za-z0-9_-]+):\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)"
 )
@@ -22,7 +23,7 @@ NON_PR_ONLY_GUARD = (
     "github.event_name == 'workflow_dispatch'"
 )
 ACTION_USE = re.compile(
-    r"uses:\s*['\"]?(?P<action>actions/[A-Za-z0-9_.-]+)"
+    r"uses:\s*['\"]?(?P<action>(?!\./)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
     r"@(?P<ref>[^\s'\"#]+)"
 )
 
@@ -30,8 +31,14 @@ ACTION_USE = re.compile(
 def test_workflows_do_not_use_github_hosted_runners() -> None:
     violations = []
     for workflow in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
-        if HOSTED_RUNNER.search(workflow.read_text(encoding="utf-8")):
-            violations.append(workflow.relative_to(REPO_ROOT).as_posix())
+        text = workflow.read_text(encoding="utf-8")
+        if HOSTED_RUNNER.search(text):
+            violations.append(f"{workflow.relative_to(REPO_ROOT).as_posix()}:hosted")
+        violations.extend(
+            f"{workflow.relative_to(REPO_ROOT).as_posix()}:{match.group('labels')}"
+            for match in RUNS_ON.finditer(text)
+            if "self-hosted" not in match.group("labels")
+        )
 
     assert not violations, f"GitHub-hosted runners are forbidden: {violations}"
 
@@ -60,14 +67,12 @@ def test_pull_requests_cannot_execute_on_persistent_self_hosted_runners() -> Non
     )
 
 
-def test_persistent_pr_ci_actions_are_pinned_to_commits() -> None:
+def test_all_self_hosted_workflow_actions_are_pinned_to_commits() -> None:
     violations = []
-    for name in ("ci-self-hosted.yml", "e2e-matrix.yml"):
-        workflow = (
-            REPO_ROOT / ".github" / "workflows" / name
-        ).read_text(encoding="utf-8")
+    for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        workflow = path.read_text(encoding="utf-8")
         violations.extend(
-            f"{name}:{match.group('action')}@{match.group('ref')}"
+            f"{path.name}:{match.group('action')}@{match.group('ref')}"
             for match in ACTION_USE.finditer(workflow)
             if re.fullmatch(r"[0-9a-f]{40}", match.group("ref")) is None
         )
@@ -120,6 +125,38 @@ def test_macos_e2e_jobs_use_run_scoped_ports() -> None:
     assert workflow.count("GITHUB_RUN_ID % 1000") == 3
     assert workflow.count('echo "VBGUI_E2E_BACKEND_PORT=') == 3
     assert workflow.count('echo "VBGUI_E2E_FRONTEND_PORT=') == 3
+
+
+def test_preset_matrix_is_really_sharded_and_bounded() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "e2e-matrix.yml").read_text(
+        encoding="utf-8"
+    )
+    jobs = workflow.partition("\njobs:\n")[2]
+    preset_job = next(
+        match.group("body")
+        for match in JOB_BLOCK.finditer(jobs)
+        if match.group("name") == "preset-matrix"
+    )
+
+    assert "shard: [1, 2, 3, 4]" in preset_job
+    assert "--fully-parallel" in preset_job
+    assert "--global-timeout=720000" in preset_job
+    assert "--shard=${{ matrix.shard }}/4" in preset_job
+    assert "timeout-minutes: 20" in preset_job
+    assert "timeout-minutes: 40" not in preset_job
+
+
+def test_core_self_hosted_jobs_use_the_shared_receipted_lane_runner() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml"
+    ).read_text(encoding="utf-8")
+
+    assert workflow.count("scripts/run_self_hosted_ci.py lane") == 2
+    assert "--lane macos-mlx" in workflow
+    assert "--lane linux-portable" in workflow
+    assert "--bootstrap-portable" in workflow
+    assert workflow.count("if-no-files-found: error") == 2
+    assert workflow.count("retention-days: 14") == 2
 
 
 def test_build_backend_declares_mlx_imported_by_setup_py() -> None:
