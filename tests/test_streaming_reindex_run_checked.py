@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import json
+import subprocess
 import sys
 import tarfile
-import subprocess
 
+import pyarrow.parquet as pq
 import pytest
 
 
@@ -113,9 +115,9 @@ def test_materialize_uses_canonical_project_identity(monkeypatch, tmp_path) -> N
 
     output = streaming_reindex.stage_materialize(
         "cjson",
-        "DaveGamble/cJSON",
         enriched,
         tmp_path,
+        project_id="DaveGamble/cJSON",
     )
 
     default_repo = captured.index("--default-repo")
@@ -136,10 +138,96 @@ def test_materialize_rejects_bare_project_identity_before_subprocess(
     with pytest.raises(streaming_reindex.SymbolIdentityError, match="stable owner/repo"):
         streaming_reindex.stage_materialize(
             "cjson",
-            "cjson",
             tmp_path / "input.jsonl",
             tmp_path,
+            project_id="cjson",
         )
+
+
+def test_commit_range_materializes_short_repo_with_repo_list_identity(tmp_path) -> None:
+    from scripts import streaming_reindex_commits
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "name": "s2n-tls",
+                        "owner_repo": "aws/s2n-tls",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    text = "int tls_init() { return 0; }"
+    enriched = tmp_path / "s2n-tls.enriched.jsonl"
+    enriched.write_text(
+        json.dumps(
+            {
+                "symbol_identity_schema_version": 3,
+                "symbol_identities": [],
+                "text": text,
+                "filepath": "tls/init.c",
+                "doc_type": "code",
+                "structure_ids": [3] * len(text),
+                "chunk_boundaries": [
+                    {
+                        "start": 0,
+                        "end": len(text),
+                        "kind": 3,
+                        "dep_level": 0,
+                    }
+                ],
+                "call_edges": [],
+                "type_edges": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    project_id = streaming_reindex_commits.sr.resolve_project_identity(
+        "s2n-tls", repo_list
+    )
+    output = streaming_reindex_commits.stage_materialize_commit_range(
+        "s2n-tls",
+        0,
+        enriched,
+        tmp_path,
+        project_id=project_id,
+    )
+
+    assert output == tmp_path / "s2n-tls::r0.tok.parquet"
+    assert pq.read_table(output, columns=["repo"]).column("repo").to_pylist() == [
+        "aws/s2n-tls"
+    ]
+
+
+def test_commit_range_materialize_rejects_unresolved_short_repo(tmp_path) -> None:
+    from scripts import streaming_reindex_commits
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(json.dumps({"repos": []}), encoding="utf-8")
+
+    with pytest.raises(
+        streaming_reindex_commits.sr.SymbolIdentityError,
+        match="no canonical owner/repo identity for bare repo 's2n-tls'",
+    ):
+        streaming_reindex_commits.process_range(
+            repo="s2n-tls",
+            repo_dir=tmp_path / "repo",
+            records_jsonl=tmp_path / "records.jsonl",
+            start_idx=0,
+            end_idx=1,
+            lengths_sorted=(1024,),
+            repo_work=tmp_path / "work",
+            repo_list=repo_list,
+        )
+
+    assert not (tmp_path / "work").exists()
+    assert not (tmp_path / "s2n-tls::r0.tok.parquet").exists()
 
 
 def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:

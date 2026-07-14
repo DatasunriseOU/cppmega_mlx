@@ -1007,30 +1007,39 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
 
 def stage_materialize(
     repo: str,
-    project_id: str,
     enriched: Path,
     work: Path,
     memory_limit_gb: float = 10.0,
+    *,
+    project_id: str | None = None,
 ) -> Path:
-    """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file)."""
-    project_id = require_project_identity(
-        project_id, source=f"stage_materialize({repo})"
-    )
+    """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file).
+
+    ``project_id`` is keyword-only so adding canonical identity cannot shift the
+    long-standing ``(repo, enriched, work, memory_limit_gb)`` stage ABI. Sources
+    that omit it must carry canonical repo identity in every input row; the
+    materializer validates that contract fail-closed.
+    """
     tok = work / f"{repo}.tok.parquet"
+    cmd = [
+        VENV_PYTHON, MATERIALIZER,
+        "--input-file", enriched,
+        "--output-file", tok,
+        "--tokenizer-path", TOKENIZER_PATH,
+        "--materialize-tokenized-enriched",
+        "--overflow-policy", "drop",
+        "--size", _budget_size_label(TOKENIZE_BUDGET),
+        "--memory-limit-gb", str(memory_limit_gb),
+    ]
+    if project_id is not None:
+        project_id = require_project_identity(
+            project_id, source=f"stage_materialize({repo})"
+        )
+        cmd += ["--default-repo", project_id]
     run_checked(
         repo,
         "materialize",
-        [
-            VENV_PYTHON, MATERIALIZER,
-            "--input-file", enriched,
-            "--output-file", tok,
-            "--tokenizer-path", TOKENIZER_PATH,
-            "--materialize-tokenized-enriched",
-            "--overflow-policy", "drop",
-            "--size", _budget_size_label(TOKENIZE_BUDGET),
-            "--memory-limit-gb", str(memory_limit_gb),
-            "--default-repo", project_id,
-        ],
+        cmd,
         log_path=work / f"{repo}.materialize.log",
     )
     if not tok.exists() or tok.stat().st_size == 0:
@@ -1294,7 +1303,13 @@ def process_one_repo(
             ) from exc
         timings["index_project_s"] = round(time.monotonic() - started, 6)
         started = time.monotonic()
-        tok = stage_materialize(repo, project_id, enriched, work, memory_limit_gb)
+        tok = stage_materialize(
+            repo=repo,
+            enriched=enriched,
+            work=work,
+            memory_limit_gb=memory_limit_gb,
+            project_id=project_id,
+        )
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -1333,8 +1348,13 @@ def process_one_commit_source(
     dedup_near: bool = True,
     memory_limit_gb: float = 10.0,
     analysis_cache_entries: int = 128,
+    *,
+    project_id: str,
 ) -> dict:
     work = work_root / key
+    project_id = require_project_identity(
+        project_id, source=f"process_one_commit_source({key})"
+    )
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
     stage_id = commit_stage_id(key) if dedup_db is not None else None
@@ -1354,7 +1374,13 @@ def process_one_commit_source(
         if enriched is None:
             return {"source": "commits", "lengths": {}, "stage_timings_s": timings}
         started = time.monotonic()
-        tok = stage_materialize(key, enriched, work, memory_limit_gb)
+        tok = stage_materialize(
+            repo=key,
+            enriched=enriched,
+            work=work,
+            memory_limit_gb=memory_limit_gb,
+            project_id=project_id,
+        )
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -1533,18 +1559,32 @@ def main(argv: list[str]) -> int:
     run_report: dict[str, dict] = {}
 
     # ----- commit sources first (independent of tarball extraction) -----
-    commit_sources: list[tuple[str, list[Path]]] = []
+    commit_sources: list[tuple[str, str, list[Path]]] = []
     for spec in args.commit_source:
         if "=" not in spec:
             raise SystemExit(f"--commit-source must be key=path,...; got: {spec}")
         key, paths = spec.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--commit-source key must not be empty: {spec}")
         files = [Path(p) for p in paths.split(",") if p.strip()]
         for f in files:
             if not f.exists():
                 raise SystemExit(f"commit source file missing: {f}")
-        commit_sources.append((key.strip(), files))
+        try:
+            project_id = (
+                require_project_identity(key, source="streaming commit source")
+                if "/" in key
+                else project_id_map[key]
+            )
+        except KeyError as exc:
+            raise SymbolIdentityError(
+                f"{repo_list}: no canonical owner/repo identity for "
+                f"bare commit source {key!r}"
+            ) from exc
+        commit_sources.append((key, project_id, files))
 
-    for key, files in commit_sources:
+    for key, project_id, files in commit_sources:
         manifest_key = f"commits:{key}"
         if resume and manifest.is_done(manifest_key):
             print(f"SKIP (done) {manifest_key}", file=sys.stderr)
@@ -1559,6 +1599,7 @@ def main(argv: list[str]) -> int:
                 Path(args.commit_repo_dir) if args.commit_repo_dir else None,
                 dedup_db, dedup_near, args.memory_limit_gb,
                 args.analysis_cache_entries,
+                project_id=project_id,
             )
             manifest.mark_done(manifest_key, info)
             run_report[manifest_key] = info

@@ -143,6 +143,25 @@ def range_key(repo: str, start_idx: int) -> str:
     return f"{repo}::r{start_idx}"
 
 
+def stage_materialize_commit_range(
+    repo: str,
+    start_idx: int,
+    enriched: Path,
+    work: Path,
+    *,
+    project_id: str,
+    memory_limit_gb: float = 10.0,
+) -> Path:
+    """Materialize one range under the repo's canonical owner/repo identity."""
+    return stage_materialize(
+        repo=range_key(repo, start_idx),
+        enriched=enriched,
+        work=work,
+        memory_limit_gb=memory_limit_gb,
+        project_id=project_id,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Sequential .git-preserving producer (one repo at a time, bounded disk).
 # --------------------------------------------------------------------------- #
@@ -528,6 +547,7 @@ def process_range(
     deferred_stage_dir: Path | None = None,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
+    project_id = sr.resolve_project_identity(repo, repo_list)
     rkey = range_key(repo, start_idx)
     rwork = repo_work / f"r{start_idx}"
     rwork.mkdir(parents=True, exist_ok=True)
@@ -572,7 +592,14 @@ def process_range(
             info["stage_timings_s"] = timings
             return info
         started = time.monotonic()
-        tok = stage_materialize(rkey, enriched, rwork, memory_limit_gb)
+        tok = stage_materialize_commit_range(
+            repo,
+            start_idx,
+            enriched,
+            rwork,
+            project_id=project_id,
+            memory_limit_gb=memory_limit_gb,
+        )
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -830,9 +857,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "rendered PR discussion is attached as "
                         "record['pr_discussion'] (HEAD of the commit doc). Miss "
                         "= Tier-1 git-only (no fail).")
-    p.add_argument("--repo-list", default=None,
+    p.add_argument("--repo-list", default=str(sr.DEFAULT_REPO_LIST),
                    help="Path to outputs/pr_ingest/repo_list.json (bare-name -> "
-                        "owner/repo map) for resolving the PR-store key.")
+                        "owner/repo map) for canonical materialization identity "
+                        f"and the PR-store key. Default {sr.DEFAULT_REPO_LIST}.")
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to process_commits/"
                         "materializer (default 10.0).")
@@ -880,6 +908,8 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"--pr-store does not exist: {pr_store}")
     if repo_list is not None and not repo_list.exists():
         raise SystemExit(f"--repo-list does not exist: {repo_list}")
+    if repo_list is not None:
+        sr.load_project_identity_map(repo_list)
     if pr_store is not None:
         _log(f"PR-store: live lookup into record['pr_discussion'] from {pr_store} "
              f"(repo_list={repo_list})")
