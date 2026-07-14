@@ -253,3 +253,24 @@ def test_both_lane_manifests_run_the_orchestration_regressions() -> None:
     assert "tests/test_self_hosted_ci.py" in ci.LINUX_TESTS
     assert "tests/test_workflow_runner_policy.py" in ci.MACOS_TESTS
     assert "tests/test_workflow_runner_policy.py" in ci.LINUX_TESTS
+
+
+def test_lane_manifests_cover_current_case5_and_training_regressions() -> None:
+    for test_path in (
+        "tests/test_case5_domain_ingestion.py",
+        "tests/test_convert_megatron_dense500m_torchdist_to_mlx.py",
+        "tests/test_materialize_megatron_dependency_provenance.py",
+        "tests/test_production_objective_mixer.py",
+        "tests/test_stage1_combined_graph_objective.py",
+    ):
+        assert test_path in ci.MACOS_TESTS
+
+    for test_path in (
+        "tests/test_domain_sidecar_parquet.py",
+        "tests/test_packer_edge_remap.py",
+        "tests/test_streaming_conveyor_revision.py",
+        "tests/test_streaming_reindex_run_checked.py",
+        "tests/test_tokenizer_contract.py",
+    ):
+        assert test_path in ci.MACOS_TESTS
+        assert test_path in ci.LINUX_TESTS
