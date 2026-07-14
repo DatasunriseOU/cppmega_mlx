@@ -15,7 +15,11 @@ from typing import Any
 import numpy as np
 
 from cppmega_mlx.data.code_packet import CodePacket
-from cppmega_mlx.data.source_identity import validate_source_identity_registry
+from cppmega_mlx.data.source_identity import (
+    MAX_ROW_LOCAL_DOC_ID,
+    MAX_SOURCE_ID,
+    validate_source_identity_registry,
+)
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SymbolIdentityRegistry,
@@ -209,12 +213,21 @@ class MaterializedMegatronDocument:
     row: dict[str, object]
 
 
-def _transformed_source_identity(
+def _transformed_source_document_id(
     source: ObjectiveSource,
     *,
     source_document_span: object,
+    objective_kind: str,
+    transformed_tokens: Sequence[int],
     required: bool,
 ) -> int:
+    """Return one honest row-local constituent ID for transformed output.
+
+    A selected span from one constituent retains that uint32 ID. A span assembled
+    from several constituents receives a deterministic derived ID; stable physical
+    provenance is validated and retained separately as uint64.
+    """
+
     packet = source.code_packet
     if packet is not None and packet.source_doc_ids is not None:
         source_ids = _ints(packet.source_doc_ids, where="CodePacket.source_doc_ids")
@@ -228,16 +241,41 @@ def _transformed_source_identity(
             if not 0 <= start < end <= len(source_ids):
                 raise ValueError(
                     f"objective source_document_span [{start}, {end}) is outside "
-                    f"{len(source_ids)} source identity tokens"
+                    f"{len(source_ids)} source document provenance tokens"
                 )
             source_ids = source_ids[start:end]
-        unique = {source_id for source_id in source_ids if source_id > 0}
-        if len(unique) == 1 and all(source_id > 0 for source_id in source_ids):
+        if any(not 0 < source_id <= MAX_ROW_LOCAL_DOC_ID for source_id in source_ids):
+            raise ValueError(
+                "pre-materialized transformed objective requires positive uint32 "
+                "CodePacket.source_doc_ids"
+            )
+        unique = set(source_ids)
+        if len(unique) == 1:
             return next(iter(unique))
+        if unique:
+            payload = {
+                "schema": "cppmega_transformed_source_document_v1",
+                "objective": objective_kind,
+                "source_document_span": source_document_span,
+                "source_doc_ids": source_ids,
+                "transformed_token_ids": [int(value) for value in transformed_tokens],
+            }
+            digest = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("ascii")
+            ).digest()
+            derived = int.from_bytes(digest[:4], "big") or 1
+            while derived in unique:
+                derived = derived % MAX_ROW_LOCAL_DOC_ID + 1
+            return derived
     if required:
         raise ValueError(
-            "pre-materialized transformed objective requires exactly one positive "
-            "stable source in CodePacket.source_doc_ids"
+            "pre-materialized transformed objective requires positive uint32 "
+            "source provenance in CodePacket.source_doc_ids"
         )
     if packet is not None:
         fingerprint = {
@@ -332,8 +370,13 @@ def _transformed_physical_source_identity(
                     f"{len(source_ids)} physical source identity tokens"
                 )
             source_ids = source_ids[start:end]
-        unique = {source_id for source_id in source_ids if source_id > 0}
-        if len(unique) == 1 and all(source_id > 0 for source_id in source_ids):
+        if any(not 0 < source_id <= MAX_SOURCE_ID for source_id in source_ids):
+            raise ValueError(
+                "pre-materialized transformed objective requires positive uint64 "
+                "CodePacket.source_identity_ids"
+            )
+        unique = set(source_ids)
+        if len(unique) == 1:
             identity_id = next(iter(unique))
             return identity_id, _source_identity_registry_for_ids(
                 packet,
@@ -631,9 +674,11 @@ def materialize_megatron_document(
             row[column] = _causal_domain_triples(packet, field)
     else:
         zeros = [0] * len(tokens)
-        source_identity = _transformed_source_identity(
+        source_document_id = _transformed_source_document_id(
             source,
             source_document_span=example.metadata.get("source_document_span"),
+            objective_kind=realized.task.value,
+            transformed_tokens=tokens,
             required=require_production_sidecars,
         )
         physical_identity, physical_registry = _transformed_physical_source_identity(
@@ -644,7 +689,7 @@ def materialize_megatron_document(
         row["doc_ids"] = [1] * len(tokens)
         for column in _TOKEN_SIDECARS:
             row[column] = list(zeros)
-        row["token_source_doc_ids"] = [source_identity] * len(tokens)
+        row["token_source_doc_ids"] = [source_document_id] * len(tokens)
         row["token_source_identity_ids"] = [physical_identity] * len(tokens)
         row[SOURCE_IDENTITY_REGISTRY_COLUMN] = physical_registry
         row[SYMBOL_IDENTITIES_COLUMN] = []

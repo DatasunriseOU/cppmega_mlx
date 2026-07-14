@@ -10,16 +10,17 @@ validated again by the root Megatron converter before indexed data is emitted.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import glob
-import hashlib
 import json
 import random
 from pathlib import Path
 
+import mlx.core as mx
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from cppmega_v4.data.doc_id_assignment import stable_doc_signature
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_SCHEMA_SHA256,
     DOMAIN_SCHEMA_SHA256_METADATA_KEY,
@@ -29,6 +30,12 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     SOURCE_IDENTITY_REGISTRY_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
+)
+from cppmega_mlx.data.source_identity import (
+    MAX_ROW_LOCAL_DOC_ID,
+    MAX_SOURCE_ID,
+    validate_source_identity_registry,
 )
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
@@ -173,8 +180,6 @@ def padded_row(
 def _iter_sources(shards: list[str], *, seed: int):
     rng = random.Random(seed)
     source_index = 0
-    signature_to_id: dict[str, int] = {}
-    id_to_signature: dict[int, str] = {}
     identity_columns = (
         "source_doc_id",
         "source_document_id",
@@ -213,58 +218,79 @@ def _iter_sources(shards: list[str], *, seed: int):
             rng.shuffle(row_order)
             for row_index in row_order:
                 row = {name: values[row_index] for name, values in columns.items()}
-                signature = stable_doc_signature(row)
-                stable_source_id = signature_to_id.get(signature)
-                if stable_source_id is None:
-                    stable_source_id = deterministic_source_id(signature)
-                    collision = id_to_signature.get(stable_source_id)
-                    if collision is not None and collision != signature:
-                        raise ValueError(
-                            "stable source identity hash collision: "
-                            f"id={stable_source_id} signatures={collision!r}, "
-                            f"{signature!r}"
-                        )
-                    signature_to_id[signature] = stable_source_id
-                    id_to_signature[stable_source_id] = signature
                 token_count = len(row[TOKEN_IDS_COLUMN])
-                raw_source_ids = [
+                source_doc_ids = [
                     int(value) for value in row[TOKEN_SOURCE_DOC_IDS_COLUMN]
                 ]
-                if len(raw_source_ids) != token_count:
+                if len(source_doc_ids) != token_count:
                     raise ValueError(
                         f"{TOKEN_SOURCE_DOC_IDS_COLUMN} length "
-                        f"{len(raw_source_ids)} != token count {token_count}"
+                        f"{len(source_doc_ids)} != token count {token_count}"
                     )
-                if any(value < 0 for value in raw_source_ids) or (
-                    any(value == 0 for value in raw_source_ids)
-                    and not all(value == 0 for value in raw_source_ids)
+                if any(
+                    not 0 < value <= MAX_ROW_LOCAL_DOC_ID for value in source_doc_ids
                 ):
                     raise ValueError(
-                        f"{TOKEN_SOURCE_DOC_IDS_COLUMN} mixes positive and "
-                        "non-positive IDs"
+                        f"{TOKEN_SOURCE_DOC_IDS_COLUMN} must contain positive "
+                        "uint32 row-local constituent IDs"
                     )
-                positive_source_ids = {value for value in raw_source_ids if value > 0}
-                if len(positive_source_ids) > 1:
+
+                source_identity_ids = [
+                    int(value) for value in row[TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+                ]
+                if len(source_identity_ids) != token_count:
                     raise ValueError(
-                        "objective source row contains multiple logical source IDs; "
-                        "materialize per-document rows before objective mixing"
+                        f"{TOKEN_SOURCE_IDENTITY_IDS_COLUMN} length "
+                        f"{len(source_identity_ids)} != token count {token_count}"
                     )
-                row[TOKEN_SOURCE_DOC_IDS_COLUMN] = [stable_source_id] * token_count
-                yield objective_source_from_tokenized_row(
+                if any(not 0 < value <= MAX_SOURCE_ID for value in source_identity_ids):
+                    raise ValueError(
+                        f"{TOKEN_SOURCE_IDENTITY_IDS_COLUMN} must contain positive "
+                        "uint64 physical source IDs"
+                    )
+                registry = row[SOURCE_IDENTITY_REGISTRY_COLUMN]
+                if not isinstance(registry, list):
+                    raise ValueError(
+                        f"{SOURCE_IDENTITY_REGISTRY_COLUMN} must be a list of records"
+                    )
+                validate_source_identity_registry(
+                    registry,
+                    referenced_ids=source_identity_ids,
+                )
+
+                raw_document_ids = row.get("doc_ids")
+                document_ids = (
+                    [1] * token_count
+                    if raw_document_ids is None
+                    else [int(value) for value in raw_document_ids]
+                )
+                if len(document_ids) != token_count or any(
+                    not 0 < value <= MAX_ROW_LOCAL_DOC_ID for value in document_ids
+                ):
+                    raise ValueError(
+                        "doc_ids must contain one positive uint32 attention segment "
+                        "ID per token"
+                    )
+
+                source = objective_source_from_tokenized_row(
                     row, source_index=source_index
                 )
+                if source.code_packet is None:  # pragma: no cover - typed row invariant
+                    raise ValueError(
+                        "objective source row did not produce a CodePacket"
+                    )
+                code_packet = replace(
+                    source.code_packet,
+                    document_ids=mx.array(np.asarray(document_ids, dtype=np.uint32)),
+                    source_doc_ids=mx.array(
+                        np.asarray(source_doc_ids, dtype=np.uint32)
+                    ),
+                    source_identity_ids=mx.array(
+                        np.asarray(source_identity_ids, dtype=np.uint64)
+                    ),
+                )
+                yield replace(source, code_packet=code_packet)
                 source_index += 1
-
-
-def deterministic_source_id(signature: str) -> int:
-    """Map one stable source signature to a non-zero uint32 identity."""
-
-    if not isinstance(signature, str) or not signature:
-        raise ValueError("stable source signature must be a non-empty string")
-    identity = int.from_bytes(
-        hashlib.sha256(signature.encode("utf-8")).digest()[:4], "big"
-    )
-    return identity or 1
 
 
 def _bind_case5_contract_hashes(receipt: dict[str, object]) -> None:

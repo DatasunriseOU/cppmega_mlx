@@ -73,7 +73,6 @@ from scripts.nanochat_data.pack_enriched_rows import (
     read_tokenized_documents,
 )
 from scripts.materialize_megatron_objectives import (
-    deterministic_source_id,
     materialized_schema,
     padded_row,
 )
@@ -1307,7 +1306,7 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
     assert json.loads((tmp_path / "objective_contract.json").read_text()) == contract
 
 
-def test_objective_order_and_source_ids_ignore_mapping_encounter_order() -> None:
+def test_objective_order_ignores_mapping_encounter_order() -> None:
     forward = {
         TaskKind.CAUSAL_LM: 0.5,
         TaskKind.FIM: 0.3,
@@ -1330,16 +1329,6 @@ def test_objective_order_and_source_ids_ignore_mapping_encounter_order() -> None
         "type_recovery": 8,
         "callee_recovery": 9,
     }
-    source_signatures = ("repo-a\0path\0commit", "repo-b\0path\0commit")
-    forward_ids = {
-        signature: deterministic_source_id(signature) for signature in source_signatures
-    }
-    reverse_ids = {
-        signature: deterministic_source_id(signature)
-        for signature in reversed(source_signatures)
-    }
-    assert forward_ids == reverse_ids
-    assert len(set(forward_ids.values())) == len(source_signatures)
 
 
 def test_anonymous_tokenized_source_ids_ignore_encounter_order(tmp_path: Path) -> None:
