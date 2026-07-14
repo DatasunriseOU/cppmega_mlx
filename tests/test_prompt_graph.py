@@ -38,7 +38,7 @@ def _index(tmp_path: Path) -> PromptProjectIndex:
     return ClangPromptProjectIndexProducer(
         cache_dir=tmp_path / "index-cache",
         indexer_root=ROOT,
-    ).build(FIXTURE, project_id="case3_prompt_repo").index
+    ).build(FIXTURE, project_id="tests/case3-prompt-repo").index
 
 
 def _context(index: PromptProjectIndex) -> PromptGraphContext:

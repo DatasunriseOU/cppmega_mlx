@@ -26,9 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import mlx.core as mx
+import mlx.core as mx  # noqa: E402
 
-from cppmega_mlx.data.prompt_graph import (
+from cppmega_mlx.data.prompt_graph import (  # noqa: E402
     PromptGraphArtifact,
     PromptGraphBuilder,
     PromptGraphContext,
@@ -36,16 +36,17 @@ from cppmega_mlx.data.prompt_graph import (
     GENERATED_TOKEN_SIDECAR_DEFAULTS,
     TOKEN_SIDECAR_DEFAULTS,
     TOKEN_SIDECAR_NAMES,
+    require_prompt_graph_project_id,
 )
-from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
-from cppmega_mlx.inference.sampling import sample_next_token
-from cppmega_mlx.inference.side_channels import (
+from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer  # noqa: E402
+from cppmega_mlx.inference.sampling import sample_next_token  # noqa: E402
+from cppmega_mlx.inference.side_channels import (  # noqa: E402
     InferenceSideChannelBuilder,
     get_builtin_code_metadata_adapter,
 )
-from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
-from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
-from cppmega_mlx.training.checkpoint import load_checkpoint
+from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig  # noqa: E402
+from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer  # noqa: E402
+from cppmega_mlx.training.checkpoint import load_checkpoint  # noqa: E402
 
 PromptMode = Literal["source-prefix", "docstring"]
 PromptSidecars = Literal["zero", "clang"]
@@ -60,8 +61,14 @@ MODEL_SIDE_CHANNEL_NAMES = (
     "ast_depth_ids",
     "sibling_index_ids",
     "node_type_ids",
+    "domain_ids",
+    "role_ids",
+    "confidence_ids",
 )
 SIDE_CHANNEL_NAMES = TOKEN_SIDECAR_NAMES
+OPAQUE_ID_SIDE_CHANNEL_NAMES = frozenset(
+    {"symbol_ids", "call_targets", "type_refs"}
+)
 DEFAULT_COMPILE_PATH_DIRS = (
     Path("/opt/homebrew/opt/llvm/bin"),
     Path("/opt/homebrew/bin"),
@@ -269,11 +276,9 @@ def resolve_case_prompt_graph(
                 f"case {task_id!r}: automatic prompt graph index build requires "
                 "a deterministic prompt_index_cache_dir"
             )
-        raw_project_id = case.get("prompt_graph_project_id")
-        project_id = (
-            raw_project_id
-            if isinstance(raw_project_id, str) and raw_project_id
-            else repository_root.name
+        project_id = require_prompt_graph_project_id(
+            case.get("prompt_graph_project_id"),
+            where=f"case {task_id!r} prompt_graph_project_id",
         )
         built = ClangPromptProjectIndexProducer(
             cache_dir=prompt_index_cache_dir,
@@ -324,9 +329,24 @@ def default_side_channels(seq_len: int) -> dict[str, mx.array]:
     if seq_len <= 0:
         raise ValueError(f"seq_len must be positive, got {seq_len}")
     return {
-        name: mx.zeros((1, seq_len), dtype=mx.int32)
+        name: mx.zeros(
+            (1, seq_len),
+            dtype=(
+                mx.uint64
+                if name in OPAQUE_ID_SIDE_CHANNEL_NAMES
+                else mx.int32
+            ),
+        )
         for name in SIDE_CHANNEL_NAMES
     }
+
+
+def _side_channel_dtype(name: str):
+    return (
+        mx.uint64
+        if name in OPAQUE_ID_SIDE_CHANNEL_NAMES
+        else mx.int32
+    )
 
 
 def _row_to_ints(array: mx.array) -> list[int]:
@@ -470,7 +490,10 @@ def prompt_model_inputs(
             window_end=window_end,
         )
         side = {
-            name: mx.array([graph_inputs.side_channels[name]], dtype=mx.int32)
+            name: mx.array(
+                [graph_inputs.side_channels[name]],
+                dtype=_side_channel_dtype(name),
+            )
             for name in SIDE_CHANNEL_NAMES
         }
         block_bias = mx.array(
@@ -521,7 +544,7 @@ def prompt_model_inputs(
                     window_start:window_end
                 ]
             ],
-            dtype=mx.int32,
+            dtype=_side_channel_dtype(name),
         )
         for name in SIDE_CHANNEL_NAMES
     }
@@ -802,6 +825,13 @@ def build_model_config(
                 args.prompt_graph_mode == "repo",
             )
         ),
+        graph_routes_enabled=bool(
+            getattr(
+                args,
+                "graph_routes_enabled",
+                args.prompt_graph_mode == "repo",
+            )
+        ),
         ngram_hash_enabled=not args.disable_ngram,
         ngram_hash_heads=int(_cfg_value(checkpoint_config, "ngram_hash_heads", args.ngram_hash_heads)),
         ngram_hash_table_size=int(_cfg_value(checkpoint_config, "ngram_hash_table_size", args.ngram_hash_table_size)),
@@ -910,9 +940,28 @@ def generate_completion(
             window_start=window_start,
             window_end=len(token_context),
         )
+        graph_routes_enabled = bool(
+            getattr(
+                getattr(model, "config", None),
+                "graph_routes_enabled",
+                block_bias is not None,
+            )
+        )
+        if graph_routes_enabled and block_bias is None:
+            block_bias = mx.zeros(
+                (1, len(window), len(window)), dtype=mx.float32
+            )
+        edge_kind_bias = (
+            None if block_bias is None else mx.zeros_like(block_bias)
+        )
         logits, _loss = model(
             input_ids,
             block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            # The assembled repository prompt is one intentional inference
+            # document. Source-document identity remains in source_doc_ids;
+            # packed-document IDs must not split cross-file graph context.
+            document_ids=mx.ones_like(input_ids),
             **{name: side[name] for name in MODEL_SIDE_CHANNEL_NAMES},
         )
         next_id = _sample_next(
@@ -931,6 +980,11 @@ def generate_completion(
     receipt = dict(prompt_context.receipt)
     receipt["aligned_side_channels"] = list(SIDE_CHANNEL_NAMES)
     receipt["model_consumed_side_channels"] = list(MODEL_SIDE_CHANNEL_NAMES)
+    receipt["model_consumed_runtime_channels"] = [
+        "document_ids",
+        "graph_attention_bias",
+        "graph_edge_kind_bias",
+    ]
     if last_window_receipt is not None:
         receipt["last_decode_window"] = last_window_receipt
     return (
@@ -1156,6 +1210,7 @@ def main() -> None:
     ]
     has_graph_cases = any(mode == "repo" for mode in case_graph_modes)
     args.require_graph_routes = batch_requires_graph_routes(case_graph_modes)
+    args.graph_routes_enabled = has_graph_cases
     if has_graph_cases and args.prompt_sidecars != "zero":
         raise ValueError(
             "repository prompt graph cases cannot be combined with "

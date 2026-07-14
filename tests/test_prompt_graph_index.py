@@ -36,7 +36,7 @@ def test_real_clang_producer_builds_fixture_index_and_prompt_graph(tmp_path: Pat
     result = ClangPromptProjectIndexProducer(
         cache_dir=tmp_path / "index-cache",
         indexer_root=ROOT,
-    ).build(FIXTURE, project_id="case3_prompt_repo")
+    ).build(FIXTURE, project_id="tests/case3-prompt-repo")
     index = result.index
     case = _case()
     source = index.document_for_path("src/math_prompt.cpp")
@@ -95,7 +95,7 @@ def test_real_producer_preserves_overloads_and_cross_document_calls(tmp_path: Pa
     index = ClangPromptProjectIndexProducer(
         cache_dir=tmp_path / "index-cache",
         indexer_root=ROOT,
-    ).build(FIXTURE, project_id="case3_prompt_repo").index
+    ).build(FIXTURE, project_id="tests/case3-prompt-repo").index
     overloads = [
         symbol
         for symbol in index.symbols
@@ -177,8 +177,8 @@ def test_index_cache_key_tracks_repository_and_indexer_freshness(tmp_path: Path)
         indexer_root=ROOT,
     )
 
-    first = producer.build(repo, project_id="case3-cache")
-    second = producer.build(repo, project_id="case3-cache")
+    first = producer.build(repo, project_id="tests/case3-cache")
+    second = producer.build(repo, project_id="tests/case3-cache")
     assert second.cache_hit is True
     assert second.path == first.path
     assert second.receipt["cache_key"] == first.receipt["cache_key"]
@@ -194,7 +194,7 @@ def test_index_cache_key_tracks_repository_and_indexer_freshness(tmp_path: Path)
 
     with pytest.raises(ValueError, match="repository freshness"):
         first.index.verify_repository(repo)
-    changed = producer.build(repo, project_id="case3-cache")
+    changed = producer.build(repo, project_id="tests/case3-cache")
     assert changed.cache_hit is False
     assert changed.path != first.path
     assert changed.receipt["hashes"]["repository_sha256"] != first.receipt["hashes"][
@@ -239,9 +239,9 @@ def test_index_cache_key_tracks_resolved_compile_arguments(tmp_path: Path) -> No
         indexer_root=ROOT,
     )
     write_commands("-DCASE3_CACHE_VERSION=1")
-    first = producer.build(repo, project_id="case3-compile-args")
+    first = producer.build(repo, project_id="tests/case3-compile-args")
     write_commands("-DCASE3_CACHE_VERSION=2")
-    second = producer.build(repo, project_id="case3-compile-args")
+    second = producer.build(repo, project_id="tests/case3-compile-args")
 
     assert first.path != second.path
     assert first.receipt["hashes"]["compile_args_sha256"] != second.receipt[
@@ -269,7 +269,7 @@ def test_strict_producer_rejects_clang_parse_errors(tmp_path: Path) -> None:
             cache_dir=tmp_path / "index-cache",
             indexer_root=ROOT,
             strict_diagnostics=True,
-        ).build(repo, project_id="case3-strict-error")
+        ).build(repo, project_id="tests/case3-strict-error")
 
 
 def test_corrupt_producer_cache_fails_closed(tmp_path: Path) -> None:
@@ -277,8 +277,8 @@ def test_corrupt_producer_cache_fails_closed(tmp_path: Path) -> None:
         cache_dir=tmp_path / "index-cache",
         indexer_root=ROOT,
     )
-    result = producer.build(FIXTURE, project_id="case3-corrupt")
+    result = producer.build(FIXTURE, project_id="tests/case3-corrupt")
     result.path.write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="cached prompt project index"):
-        producer.build(FIXTURE, project_id="case3-corrupt")
+        producer.build(FIXTURE, project_id="tests/case3-corrupt")

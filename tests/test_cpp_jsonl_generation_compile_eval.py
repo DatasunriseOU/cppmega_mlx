@@ -45,9 +45,14 @@ def test_default_side_channels_are_token_aligned_zero_arrays():
     mod = _load_module()
     side = mod.default_side_channels(7)
     assert set(side) == set(mod.SIDE_CHANNEL_NAMES)
-    for tensor in side.values():
+    for name, tensor in side.items():
         assert tuple(tensor.shape) == (1, 7)
-        assert tensor.dtype == mx.int32
+        expected_dtype = (
+            mx.uint64
+            if name in mod.OPAQUE_ID_SIDE_CHANNEL_NAMES
+            else mx.int32
+        )
+        assert tensor.dtype == expected_dtype
         assert int(mx.sum(tensor).item()) == 0
 
 
@@ -70,7 +75,7 @@ def _build_case3_index(tmp_path: Path):
     return ClangPromptProjectIndexProducer(
         cache_dir=tmp_path / "project-index-cache",
         indexer_root=ROOT,
-    ).build(CASE3_FIXTURE, project_id="case3_prompt_repo").index
+    ).build(CASE3_FIXTURE, project_id="tests/case3-prompt-repo").index
 
 
 def test_build_prompt_context_zero_sidecars_align_with_prepend():
@@ -123,7 +128,9 @@ def test_build_model_config_requires_graph_routes_only_in_repo_mode():
         SimpleNamespace(**base, prompt_graph_mode="off"), {}
     )
     assert graph_cfg.require_graph_routes is True
+    assert graph_cfg.graph_routes_enabled is True
     assert off_cfg.require_graph_routes is False
+    assert off_cfg.graph_routes_enabled is False
 
 
 def test_shipped_default_cases_exercise_mixed_per_case_graph_contract():
@@ -174,6 +181,9 @@ def test_build_prompt_context_repo_mode_consumes_project_index(tmp_path: Path):
     assert context.receipt["edge_counts"]["type"] > 0
     assert context.receipt["edge_counts"]["def_use"] > 0
     assert context.receipt["edge_counts"]["domain"] > 0
+    assert side["symbol_ids"].dtype == mx.uint64
+    assert side["call_targets"].dtype == mx.uint64
+    assert side["type_refs"].dtype == mx.uint64
     dependency_paths = {
         row["source_path"]
         for row in context.receipt["provenance"]["context_segments"]
@@ -248,6 +258,12 @@ def test_generate_completion_threads_repository_graph_into_model(tmp_path: Path)
     assert tuple(input_ids.shape) == (1, prompt_tokens)
     assert float(mx.sum(kwargs["block_bias"]).item()) > 0.0
     assert int(mx.sum(kwargs["structure_ids"]).item()) > 0
+    assert tuple(kwargs["document_ids"].shape) == tuple(input_ids.shape)
+    assert int(mx.min(kwargs["document_ids"]).item()) == 1
+    assert kwargs["edge_kind_bias"] is not None
+    assert tuple(kwargs["domain_ids"].shape) == tuple(input_ids.shape)
+    assert tuple(kwargs["role_ids"].shape) == tuple(input_ids.shape)
+    assert tuple(kwargs["confidence_ids"].shape) == tuple(input_ids.shape)
     assert receipt["edge_counts"]["type"] > 0
     assert receipt["edge_counts"]["def_use"] > 0
     assert receipt["edge_counts"]["domain"] > 0
@@ -369,6 +385,23 @@ def test_resolve_case_prompt_graph_builds_real_index_when_path_absent(
     assert resolved.project_index.document_for_path("src/math_prompt.cpp").id == (
         resolved.document_id
     )
+
+
+def test_resolve_case_prompt_graph_requires_stable_project_identity(
+    tmp_path: Path,
+):
+    mod = _load_module()
+    case = json.loads((CASE3_FIXTURE / "cases.jsonl").read_text().splitlines()[0])
+    case.pop("prompt_graph_project_id")
+
+    with pytest.raises(ValueError, match="prompt_graph_project_id.*owner/repo"):
+        mod.resolve_case_prompt_graph(
+            case,
+            cases_dir=CASE3_FIXTURE,
+            mode="repo",
+            prompt_index_cache_dir=tmp_path / "index-cache",
+            indexer_root=ROOT,
+        )
 
 
 def test_generate_completion_refuses_to_discard_repository_graph_window(
