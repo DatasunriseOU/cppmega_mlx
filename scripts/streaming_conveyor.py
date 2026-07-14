@@ -877,6 +877,26 @@ def manifest_covers_commit_span(repo: str, manifest: Manifest, n_records: int) -
     return False
 
 
+def _resolved_failure_keys_for_success(key: str) -> tuple[str, ...]:
+    """Return stale failure keys resolved by one terminal unit success.
+
+    ``<repo>::repo`` is the outer worker's fallback key when a failure escapes
+    before it can be recorded against the concrete code/range unit. A later
+    terminal success for that repo makes the fallback receipt stale. Commit-plan
+    publication is metadata rather than terminal work, so it cannot resolve the
+    fallback. Sibling ranges and aggregate commit failures remain authoritative.
+    """
+    repo, separator, unit = key.rpartition("::")
+    if not separator:
+        return (key,)
+    terminal_unit = unit in {"code", "commits", "no_git"} or (
+        re.fullmatch(r"r\d+", unit) is not None
+    )
+    if terminal_unit:
+        return key, f"{repo}::repo"
+    return (key,)
+
+
 class ConcurrentManifest(Manifest):
     """Cross-process-safe conveyor resume manifest (fixes the H4 clobber).
 
@@ -893,8 +913,8 @@ class ConcurrentManifest(Manifest):
 
     This subclass makes every manifest mutation atomic ACROSS processes: under an
     exclusive ``flock`` on a sibling ``.lock`` file it RE-READS the on-disk
-    manifest, MERGES only the one changed key into it, then atomically replaces
-    the file. The in-memory dicts are refreshed to the merged on-disk state so
+    manifest, applies one logical mutation to it, then atomically replaces the
+    file. The in-memory dicts are refreshed to the merged on-disk state so
     in-process resume checks (``is_done``) also observe the other process's
     committed keys. ONE clear write path; any error RAISES (RULE #1). A blind
     full-file ``save()`` is disabled so the clobber cannot be reintroduced.
@@ -946,9 +966,12 @@ class ConcurrentManifest(Manifest):
                 fh.close()
 
     def mark_done(self, key: str, info: dict) -> None:
+        resolved_failures = _resolved_failure_keys_for_success(key)
+
         def apply(done: dict, failed: dict) -> None:
             done[key] = info
-            failed.pop(key, None)
+            for failure_key in resolved_failures:
+                failed.pop(failure_key, None)
 
         self._merge_under_lock(apply)
 
@@ -1949,6 +1972,77 @@ def run_bounded_future_queue(
     return submitted
 
 
+def handle_repo_future_result(
+    future: Future,
+    repo: str,
+    manifest: Manifest,
+    manifest_lock: threading.Lock,
+) -> tuple[int, int, int, int]:
+    """Consume one repo future and persist any escaped failure immediately."""
+    try:
+        result = future.result()
+    except RepoFailure as exc:
+        _log(f"FAIL {repo}::repo: {exc}")
+        with manifest_lock:
+            manifest.mark_failed(f"{repo}::repo", exc.stage, exc.detail)
+        return 1, 0, 0, 1
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:  # surface unexpected worker failures loudly
+        _log(f"FAIL {repo}::repo: unexpected {type(exc).__name__}: {exc}")
+        with manifest_lock:
+            manifest.mark_failed(f"{repo}::repo", "unexpected", str(exc))
+        return 1, 0, 0, 1
+    return (
+        1,
+        1 if isinstance(result.get("code"), dict) else 0,
+        int(result.get("commits_done", 0)),
+        int(result.get("commits_failed", 0)),
+    )
+
+
+def stream_source_with_repo_future_drain(
+    source,
+    inflight: dict[Future, str],
+    handle_repo_done: Callable[[Future, str], None],
+    *,
+    poll_interval_s: float = 0.25,
+):
+    """Yield source items while observing repo futures during blocking extraction.
+
+    Only ``next(source)`` runs in the producer thread. The caller remains in this
+    polling loop, so a long tar extraction cannot hide a completed repo failure.
+    """
+    if poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be positive")
+    iterator = iter(source)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as source_pool:
+            while True:
+                source_future = source_pool.submit(next, iterator)
+                while True:
+                    watched = (source_future, *tuple(inflight))
+                    completed, _pending = wait(
+                        watched,
+                        timeout=poll_interval_s,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        if future is source_future:
+                            continue
+                        repo = inflight.pop(future)
+                        handle_repo_done(future, repo)
+                    if source_future.done():
+                        break
+                try:
+                    yield source_future.result()
+                except StopIteration:
+                    return
+    finally:
+        if hasattr(iterator, "close"):
+            iterator.close()
+
+
 # --------------------------------------------------------------------------- #
 # COMMITS half: orchestrate the commit range pipeline (no reimplementation).
 # extract_git_history once -> delete .git -> fan ranges to the pool via the
@@ -2250,47 +2344,71 @@ def run_commits_half(
         deferred_promotions.clear()
         stages: list[tuple[str, Path | None]] = []
         stage_paths: list[Path] = []
-        for done_items, _reservation in batch:
-            for _done_start, _done_end, rinfo in done_items:
-                stage = rinfo.get("dedup_stage")
-                if not stage:
-                    continue
-                stage_id = stage["stage_id"]
-                stage_db = Path(stage["stage_db"])
-                stages.append((stage_id, stage_db))
-                stage_paths.append(stage_db)
-        metrics = sr.promote_dedup_stages(dedup_db, stages)
-        stage_count = max(1, int(metrics.get("promote_batch_size") or len(stages) or 1))
-        per_wait = float(metrics.get("promote_wait_s", 0.0)) / stage_count
-        per_duration = float(metrics.get("promote_duration_s", 0.0)) / stage_count
         try:
-            for done_items, reservation in batch:
-                try:
-                    for done_start, done_end, rinfo in done_items:
-                        stage = rinfo.pop("dedup_stage", None)
-                        if stage:
-                            timings = dict(rinfo.get("stage_timings_s", {}))
-                            timings["promote_wait_s"] = round(per_wait, 6)
-                            timings["promote_duration_s"] = round(per_duration, 6)
-                            timings["promote_batch_size"] = stage_count
-                            timings["promote_batch_wait_s"] = metrics.get(
-                                "promote_wait_s", 0.0
-                            )
-                            timings["promote_batch_duration_s"] = metrics.get(
-                                "promote_duration_s", 0.0
-                            )
-                            timings["promote_deferred"] = 0.0
-                            rinfo["stage_timings_s"] = timings
-                            rinfo["dedup_stage_promoted"] = {
-                                "stage_id": stage["stage_id"],
-                            }
-                        mark_done_range(done_start, done_end, rinfo)
-                finally:
+            # Batch promotion is the commit barrier: publish no range receipt
+            # unless every staged dedup transaction promotes successfully.
+            try:
+                for done_items, _reservation in batch:
+                    for _done_start, _done_end, rinfo in done_items:
+                        stage = rinfo.get("dedup_stage")
+                        if not stage:
+                            continue
+                        stage_id = stage["stage_id"]
+                        stage_db = Path(stage["stage_db"])
+                        stages.append((stage_id, stage_db))
+                        stage_paths.append(stage_db)
+                metrics = sr.promote_dedup_stages(dedup_db, stages)
+            except Exception as exc:
+                failure = (
+                    exc
+                    if isinstance(exc, RepoFailure)
+                    else RepoFailure(
+                        repo,
+                        "dedup_promote",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                for done_items, _reservation in batch:
+                    for failed_start, failed_end, _rinfo in done_items:
+                        mark_failed_range(failed_start, failed_end, failure)
+                if isinstance(exc, SymbolIdentityError):
+                    raise
+                return
+
+            stage_count = max(
+                1,
+                int(metrics.get("promote_batch_size") or len(stages) or 1),
+            )
+            per_wait = float(metrics.get("promote_wait_s", 0.0)) / stage_count
+            per_duration = float(metrics.get("promote_duration_s", 0.0)) / stage_count
+            for done_items, _reservation in batch:
+                for done_start, done_end, rinfo in done_items:
+                    stage = rinfo.pop("dedup_stage", None)
+                    if stage:
+                        timings = dict(rinfo.get("stage_timings_s", {}))
+                        timings["promote_wait_s"] = round(per_wait, 6)
+                        timings["promote_duration_s"] = round(per_duration, 6)
+                        timings["promote_batch_size"] = stage_count
+                        timings["promote_batch_wait_s"] = metrics.get(
+                            "promote_wait_s", 0.0
+                        )
+                        timings["promote_batch_duration_s"] = metrics.get(
+                            "promote_duration_s", 0.0
+                        )
+                        timings["promote_deferred"] = 0.0
+                        rinfo["stage_timings_s"] = timings
+                        rinfo["dedup_stage_promoted"] = {
+                            "stage_id": stage["stage_id"],
+                        }
+                    mark_done_range(done_start, done_end, rinfo)
+        finally:
+            try:
+                for _done_items, reservation in batch:
                     if reservation is not None:
                         reservation.release()
-        finally:
-            for stage_db in stage_paths:
-                unlink_sqlite_family(stage_db)
+            finally:
+                for stage_db in stage_paths:
+                    unlink_sqlite_family(stage_db)
 
     def submit_commit_range(item: tuple[int, int]):
         sub_start, sub_end = item
@@ -3217,29 +3335,6 @@ def main(argv: list[str]) -> int:
     range_pool = ThreadPoolExecutor(max_workers=workers)
     repo_pool = ThreadPoolExecutor(max_workers=repo_workers) if repo_workers > 1 else None
 
-    def _handle_repo_result(fut, repo: str) -> tuple[int, int, int, int]:
-        """Return increments: processed_repos, code_done, ranges_done, ranges_failed."""
-        try:
-            res = fut.result()
-        except RepoFailure as exc:
-            _log(f"FAIL {repo}::repo: {exc}")
-            with manifest_lock:
-                manifest.mark_failed(f"{repo}::repo", exc.stage, exc.detail)
-            return 1, 0, 0, 1
-        except SymbolIdentityError:
-            raise
-        except Exception as exc:  # surface unexpected worker failures loudly
-            _log(f"FAIL {repo}::repo: unexpected {type(exc).__name__}: {exc}")
-            with manifest_lock:
-                manifest.mark_failed(f"{repo}::repo", "unexpected", str(exc))
-            return 1, 0, 0, 1
-        return (
-            1,
-            1 if isinstance(res.get("code"), dict) else 0,
-            int(res.get("commits_done", 0)),
-            int(res.get("commits_failed", 0)),
-        )
-
     def claim_repo_once(repo: str) -> None:
         if repo in submitted_repo_names:
             raise RepoFailure(
@@ -3328,8 +3423,20 @@ def main(argv: list[str]) -> int:
             submitted_repos = 0
             stop_submitting = False
 
-            def drain_one_or_more(block: bool = True) -> None:
+            def account_repo_result(fut: Future, repo: str) -> None:
                 nonlocal processed_repos, code_done, ranges_done, ranges_failed
+                pr, cd, rd, rf = handle_repo_future_result(
+                    fut,
+                    repo,
+                    manifest,
+                    manifest_lock,
+                )
+                processed_repos += pr
+                code_done += cd
+                ranges_done += rd
+                ranges_failed += rf
+
+            def drain_one_or_more(block: bool = True) -> None:
                 if not inflight:
                     return
                 timeout = None if block else 0
@@ -3340,12 +3447,13 @@ def main(argv: list[str]) -> int:
                 )
                 for fut in done:
                     repo = inflight.pop(fut)
-                    pr, cd, rd, rf = _handle_repo_result(fut, repo)
-                    processed_repos += pr
-                    code_done += cd
-                    ranges_done += rd
-                    ranges_failed += rf
+                    account_repo_result(fut, repo)
 
+            gen = stream_source_with_repo_future_drain(
+                gen,
+                inflight,
+                account_repo_result,
+            )
             for repo, repo_dir in gen:
                 # Signal-driven stop: stop submitting NEW repos; already-inflight
                 # repos drain (and self-cancel their queued ranges) in the loop
