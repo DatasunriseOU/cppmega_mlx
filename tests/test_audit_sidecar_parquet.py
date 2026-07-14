@@ -11,8 +11,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from cppmega_mlx.data.domain_schema import DomainEdgeKind
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    DomainEdgeKind,
+)
 from cppmega_mlx.data.source_identity import source_identity
+from cppmega_mlx.data.tokenizer_contract import (
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
 from scripts.nanochat_data.pack_enriched_rows import PACKED_ROW_OUTPUT_SCHEMA
 
 
@@ -223,7 +231,51 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     assert report["status"] == "passed"
     assert report["receipt"]["successful"] is True
     assert report["receipt"]["contract"] == "cppmega_case5_domain_routes_v1"
+    assert report["receipt"]["domain_schema_sha256"] == DOMAIN_SCHEMA_SHA256
+    assert (
+        report["receipt"]["tokenizer_contract_sha256"]
+        == TOKENIZER_CONTRACT_SHA256
+    )
     assert "AUDIT PASSED" in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "replacement"),
+    [
+        (DOMAIN_SCHEMA_SHA256_METADATA_KEY, None),
+        (TOKENIZER_CONTRACT_SHA256_METADATA_KEY, b"0" * 64),
+    ],
+)
+def test_sidecar_audit_rejects_missing_or_stale_contract_hashes(
+    tmp_path,
+    metadata_key,
+    replacement,
+):
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    pr_root = tmp_path / "pr"
+    code_path = code_root / "8" / "code.parquet"
+    _write_tiny_parquet(code_path)
+    table = pq.read_table(code_path)
+    metadata = dict(table.schema.metadata or {})
+    encoded_key = metadata_key.encode("utf-8")
+    if replacement is None:
+        metadata.pop(encoded_key)
+    else:
+        metadata[encoded_key] = replacement
+    pq.write_table(table.replace_schema_metadata(metadata), code_path)
+    _write_tiny_parquet(commit_root / "8" / "commit.parquet")
+    _write_tiny_parquet(pr_root / "8" / "pr.parquet")
+
+    proc, report = _run_audit(tmp_path, code_root, commit_root, pr_root)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert report["status"] == "failed"
+    assert report["receipt"]["successful"] is False
+    assert any(
+        "missing or stale frozen CASE5 contract hashes" in error
+        for error in report["total"]["errors"]
+    )
 
 
 def test_sidecar_audit_reads_large_files_by_row_group(tmp_path, monkeypatch):

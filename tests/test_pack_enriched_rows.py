@@ -7,10 +7,16 @@ import pytest
 
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset
 from cppmega_mlx.data.code_packet_builder import build_code_packets
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+)
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
 from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
@@ -80,6 +86,22 @@ from scripts.nanochat_data.pack_enriched_rows import (
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
+
+
+def _input_schema_metadata(*, symbol_identity: bool = True) -> dict[bytes, bytes]:
+    metadata = {
+        DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): DOMAIN_SCHEMA_SHA256.encode(
+            "ascii"
+        ),
+        TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+            "utf-8"
+        ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
+    }
+    if symbol_identity:
+        metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] = str(
+            packer.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+        ).encode("ascii")
+    return metadata
 
 
 def _doc(
@@ -171,11 +193,7 @@ def _write_input_parquet(path: Path, records: list[dict[str, object]]) -> None:
                 )
             ),
         ),
-    ).replace_schema_metadata({
-        packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
-            packer.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
-        ).encode("ascii")
-    })
+    ).replace_schema_metadata(_input_schema_metadata())
     pq.write_table(table, path)
 
 
@@ -649,6 +667,12 @@ def test_pack_parquet_dataset_marks_macro_route_schema_version(tmp_path: Path) -
     assert metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] == (
         DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
     )
+    assert metadata[DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")] == (
+        DOMAIN_SCHEMA_SHA256.encode("ascii")
+    )
+    assert metadata[TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")] == (
+        TOKENIZER_CONTRACT_SHA256.encode("ascii")
+    )
 
 
 def test_packer_rejects_cross_project_symbol_id_collision_across_shards(
@@ -688,9 +712,7 @@ def test_packer_rejects_cross_project_symbol_id_collision_across_shards(
             pa.field("token_def_use", pa.list_(pa.uint8())),
             pa.field("symbol_identities", identity_type),
         ],
-        metadata={
-            packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): b"3"
-        },
+        metadata=_input_schema_metadata(),
     )
     for shard_index, key in enumerate((first_key, second_key)):
         pq.write_table(
@@ -719,9 +741,41 @@ def test_packer_rejects_cross_project_symbol_id_collision_across_shards(
 def test_pack_parquet_dataset_rejects_stale_symbol_identity_schema(tmp_path: Path) -> None:
     input_path = tmp_path / "stale.parquet"
     output_path = tmp_path / "packed.parquet"
-    pq.write_table(pa.Table.from_pylist([_doc([1, 2, 3])]), input_path)
+    table = pa.Table.from_pylist([_doc([1, 2, 3])]).replace_schema_metadata(
+        _input_schema_metadata(symbol_identity=False)
+    )
+    pq.write_table(table, input_path)
 
     with pytest.raises(RuntimeError, match="regenerate.*clang USR"):
+        pack_parquet_dataset(input_path, output_path, target_length=8)
+    assert not output_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "replacement"),
+    [
+        (DOMAIN_SCHEMA_SHA256_METADATA_KEY, None),
+        (TOKENIZER_CONTRACT_SHA256_METADATA_KEY, b"0" * 64),
+    ],
+)
+def test_pack_parquet_dataset_rejects_missing_or_stale_contract_hashes(
+    tmp_path: Path,
+    metadata_key: str,
+    replacement: bytes | None,
+) -> None:
+    input_path = tmp_path / "stale_contract.parquet"
+    output_path = tmp_path / "packed.parquet"
+    _write_input_parquet(input_path, [_doc([1, 2, 3])])
+    table = pq.read_table(input_path)
+    metadata = dict(table.schema.metadata or {})
+    encoded_key = metadata_key.encode("utf-8")
+    if replacement is None:
+        metadata.pop(encoded_key)
+    else:
+        metadata[encoded_key] = replacement
+    pq.write_table(table.replace_schema_metadata(metadata), input_path)
+
+    with pytest.raises(ValueError, match="missing or stale frozen CASE5"):
         pack_parquet_dataset(input_path, output_path, target_length=8)
     assert not output_path.exists()
 

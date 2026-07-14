@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,6 +10,9 @@ from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_TOKEN_IDS,
     OBJECTIVE_BOUNDARY_TOKEN_IDS,
     REQUIRED_SPECIAL_TOKEN_IDS,
+    TOKENIZER_CONTRACT_PATH,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
     TOOL_USE_SPECIAL_TOKEN_IDS,
     validate_checked_out_tokenizer_contract,
     validate_required_special_token_ids,
@@ -45,6 +49,16 @@ def test_tool_use_token_ids_match_vendored_artifact_contract() -> None:
         "QUERY_TOOL": 11,
         "TOOL_RESULT": 19,
     }
+
+
+def test_tokenizer_contract_sha256_covers_exact_frozen_json_bytes() -> None:
+    assert TOKENIZER_CONTRACT_PATH == _TOKENIZER_CONTRACT_PATH
+    assert TOKENIZER_CONTRACT_SHA256 == hashlib.sha256(
+        TOKENIZER_CONTRACT_PATH.read_bytes()
+    ).hexdigest()
+    assert TOKENIZER_CONTRACT_SHA256_METADATA_KEY == (
+        "cppmega.tokenizer_contract_sha256"
+    )
 
 
 def test_objective_boundary_ids_are_existing_frozen_tokens() -> None:

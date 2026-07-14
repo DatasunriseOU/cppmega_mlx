@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_EDGE_FAMILIES,
     DOMAIN_DELIMITER_ROLES,
+    DOMAIN_SCHEMA_PATH,
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
     DomainKind,
-    validate_domain_edge_kind,
     delimiter_token_ids,
+    validate_case5_contract_metadata,
     validate_domain_delimiter_contract,
+    validate_domain_edge_kind,
 )
-from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
 
 
 def test_domain_delimiter_contract_is_complete() -> None:
@@ -33,6 +43,36 @@ def test_domain_delimiter_contract_is_complete() -> None:
     assert DomainKind.SQL in DOMAIN_DELIMITER_ROLES
     assert DomainKind.LINKER_DIAGNOSTIC in DOMAIN_DELIMITER_ROLES
     assert DomainKind.SANITIZER_OUTPUT in DOMAIN_DELIMITER_ROLES
+
+
+def test_domain_schema_sha256_covers_exact_frozen_json_bytes() -> None:
+    assert DOMAIN_SCHEMA_SHA256 == hashlib.sha256(
+        DOMAIN_SCHEMA_PATH.read_bytes()
+    ).hexdigest()
+    assert DOMAIN_SCHEMA_SHA256_METADATA_KEY == "cppmega.domain_schema_sha256"
+
+
+def test_case5_contract_metadata_rejects_missing_and_stale_hashes() -> None:
+    valid = {
+        DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): DOMAIN_SCHEMA_SHA256.encode(
+            "ascii"
+        ),
+        TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+            "utf-8"
+        ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
+    }
+    validate_case5_contract_metadata(valid, where="fixture.parquet")
+
+    for key in tuple(valid):
+        missing = dict(valid)
+        missing.pop(key)
+        with pytest.raises(ValueError, match="missing or stale frozen CASE5"):
+            validate_case5_contract_metadata(missing, where="fixture.parquet")
+
+        stale = dict(valid)
+        stale[key] = b"0" * 64
+        with pytest.raises(ValueError, match="missing or stale frozen CASE5"):
+            validate_case5_contract_metadata(stale, where="fixture.parquet")
 
 
 def test_delimiter_token_ids_use_reserved_contract() -> None:

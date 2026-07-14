@@ -44,16 +44,22 @@ OBJECTIVE_BOUNDARY_TOKEN_IDS: dict[str, int] = {
 }
 
 _TOKENIZER_DIR = Path(__file__).resolve().parents[1] / "tokenizer"
-_TOKENIZER_CONTRACT_PATH = _TOKENIZER_DIR / "tokenizer_contract_v1.json"
+TOKENIZER_CONTRACT_PATH = _TOKENIZER_DIR / "tokenizer_contract_v1.json"
 
 
-def _read_contract(path: Path) -> dict:
+def _read_contract_bytes(path: Path) -> tuple[dict, bytes]:
     try:
-        contract = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+        contract = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot load tokenizer contract {path}: {exc}") from exc
     if not isinstance(contract, dict):
         raise ValueError(f"tokenizer contract {path} must be an object")
+    return contract, raw
+
+
+def _read_contract(path: Path) -> dict:
+    contract, _raw = _read_contract_bytes(path)
     return contract
 
 
@@ -96,9 +102,12 @@ def _derive_domain_delimiter_token_ids(contract: Mapping[str, object]) -> dict[s
     return result
 
 
-DOMAIN_DELIMITER_TOKEN_IDS = _derive_domain_delimiter_token_ids(
-    _read_contract(_TOKENIZER_CONTRACT_PATH)
+TOKENIZER_CONTRACT, _TOKENIZER_CONTRACT_BYTES = _read_contract_bytes(
+    TOKENIZER_CONTRACT_PATH
 )
+TOKENIZER_CONTRACT_SHA256 = hashlib.sha256(_TOKENIZER_CONTRACT_BYTES).hexdigest()
+TOKENIZER_CONTRACT_SHA256_METADATA_KEY = "cppmega.tokenizer_contract_sha256"
+DOMAIN_DELIMITER_TOKEN_IDS = _derive_domain_delimiter_token_ids(TOKENIZER_CONTRACT)
 DOMAIN_DELIMITER_CONTRACT_METADATA_KEY = "cppmega.domain_delimiter_contract_sha256"
 DOMAIN_DELIMITER_CONTRACT_SHA256 = hashlib.sha256(
     json.dumps(
@@ -218,6 +227,10 @@ __all__ = [
     "DOMAIN_DELIMITER_CONTRACT_SHA256",
     "REQUIRED_SPECIAL_TOKEN_IDS",
     "SpecialTokenMapping",
+    "TOKENIZER_CONTRACT",
+    "TOKENIZER_CONTRACT_PATH",
+    "TOKENIZER_CONTRACT_SHA256",
+    "TOKENIZER_CONTRACT_SHA256_METADATA_KEY",
     "TOOL_USE_SPECIAL_TOKEN_IDS",
     "validate_checked_out_tokenizer_contract",
     "validate_required_special_token_ids",

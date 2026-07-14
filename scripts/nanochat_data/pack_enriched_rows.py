@@ -25,8 +25,11 @@ import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_v4.data.doc_id_assignment import stable_doc_signature
 from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
     TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
     normalize_domain_edge_record,
+    validate_case5_contract_metadata,
 )
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
@@ -132,6 +135,8 @@ from cppmega_mlx.data.source_identity import (
 from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
 from scripts.nanochat_data.atomic_publish import atomic_output_file
 
@@ -344,6 +349,12 @@ def _packed_row_schema_with_metadata() -> pa.Schema:
     ).encode("ascii")
     metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] = (
         DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+    )
+    metadata[DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")] = (
+        DOMAIN_SCHEMA_SHA256.encode("ascii")
+    )
+    metadata[TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")] = (
+        TOKENIZER_CONTRACT_SHA256.encode("ascii")
     )
     metadata[b"cppmega.case5_schema"] = b"case5_domain_routes_v1"
     return PACKED_ROW_SCHEMA.with_metadata(metadata)
@@ -1118,6 +1129,7 @@ def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
         parquet_file = pq.ParquetFile(path)
         schema = parquet_file.schema_arrow
         metadata = schema.metadata or {}
+        validate_case5_contract_metadata(metadata, where=path)
         raw_version = metadata.get(key)
         try:
             version = int(raw_version) if raw_version is not None else None

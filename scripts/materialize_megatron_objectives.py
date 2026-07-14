@@ -20,9 +20,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cppmega_v4.data.doc_id_assignment import stable_doc_signature
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    validate_case5_contract_metadata,
+)
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_IDS_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
@@ -86,7 +95,16 @@ def materialized_schema() -> pa.Schema:
         pa.field("token_chunk_kinds", pa.list_(pa.uint16()), nullable=False),
         pa.field("token_chunk_dep_levels", pa.list_(pa.uint16()), nullable=False),
     ]
-    return pa.schema(fields)
+    return pa.schema(fields).with_metadata(
+        {
+            DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): (
+                DOMAIN_SCHEMA_SHA256.encode("ascii")
+            ),
+            TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8"): (
+                TOKENIZER_CONTRACT_SHA256.encode("ascii")
+            ),
+        }
+    )
 
 
 def _pad(values: object, capacity: int, *, fill: int) -> list[int]:
@@ -135,6 +153,10 @@ def _iter_sources(shards: list[str], *, seed: int):
         rng.shuffle(shard_order)
         for shard_index in shard_order:
             parquet = pq.ParquetFile(shards[shard_index])
+            validate_case5_contract_metadata(
+                parquet.schema_arrow.metadata,
+                where=shards[shard_index],
+            )
             available = tuple(parquet.schema_arrow.names)
             require_megatron_objective_source_columns(available)
             selected = [
@@ -207,6 +229,22 @@ def deterministic_source_id(signature: str) -> int:
         hashlib.sha256(signature.encode("utf-8")).digest()[:4], "big"
     )
     return identity or 1
+
+
+def _bind_case5_contract_hashes(receipt: dict[str, object]) -> None:
+    """Bind a generated receipt to the exact frozen CASE5 contract bytes."""
+
+    expected = {
+        "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
+        "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
+    }
+    for key, digest in expected.items():
+        actual = receipt.get(key)
+        if actual is not None and actual != digest:
+            raise ValueError(
+                f"objective receipt has stale {key}: {actual!r}, expected {digest!r}"
+            )
+        receipt[key] = digest
 
 
 def main() -> int:
@@ -284,6 +322,7 @@ def main() -> int:
         graph_config=graph_config,
         graph_weight=args.graph_aux_weight,
     )
+    _bind_case5_contract_hashes(contract)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     capacity = args.seq_len + 1
@@ -312,6 +351,8 @@ def main() -> int:
                 "loss_tokens": contract["totals"]["loss_tokens"],  # type: ignore[index]
                 "contract": str(contract_path),
                 "artifact": str(artifact_path),
+                "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
+                "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
             },
             sort_keys=True,
         )

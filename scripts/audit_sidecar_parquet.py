@@ -86,11 +86,14 @@ def _load_schema_contracts():
         domain.ParseConfidence,
         domain.DOMAIN_EDGE_FAMILIES,
         domain.DOMAIN_DELIMITER_ROLES,
+        domain.DOMAIN_SCHEMA_SHA256,
         domain.TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+        domain.validate_case5_contract_metadata,
         domain.validate_domain_edge_kind,
         tokenizer.DOMAIN_DELIMITER_TOKEN_IDS,
         tokenizer.DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
         tokenizer.DOMAIN_DELIMITER_CONTRACT_SHA256,
+        tokenizer.TOKENIZER_CONTRACT_SHA256,
         source_identity.validate_source_identity_registry,
     )
 
@@ -102,11 +105,14 @@ def _load_schema_contracts():
     ParseConfidence,
     DOMAIN_EDGE_FAMILIES,
     DOMAIN_DELIMITER_ROLES,
+    DOMAIN_SCHEMA_SHA256,
     TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    validate_case5_contract_metadata,
     validate_domain_edge_kind,
     DOMAIN_DELIMITER_TOKEN_IDS,
     DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
     validate_source_identity_registry,
 ) = _load_schema_contracts()
 
@@ -1416,6 +1422,10 @@ def _case5_schema_errors(path: Path, schema: pa.Schema) -> list[str]:
         errors.append(
             f"{path}: tokenizer/domain delimiter contract digest missing or mismatched"
         )
+    try:
+        validate_case5_contract_metadata(metadata, where=path)
+    except ValueError as exc:
+        errors.append(str(exc))
     if metadata.get(b"cppmega.case5_schema") != b"case5_domain_routes_v1":
         errors.append(f"{path}: missing cppmega.case5_schema receipt metadata")
     return errors
@@ -1662,6 +1672,8 @@ def main(argv: list[str] | None = None) -> int:
         "status": status,
         "successful": status == "passed",
         "tokenizer_domain_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
+        "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
         "files": report["total"]["files"],
         "rows": report["total"]["rows"],
         "valid_tokens": report["total"]["valid_tokens"],

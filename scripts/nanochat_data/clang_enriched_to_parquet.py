@@ -39,6 +39,8 @@ import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_EDGE_FIELD_FAMILIES,
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
     normalize_domain_edge_record,
     remap_embedded_domain_spans,
 )
@@ -60,6 +62,8 @@ from cppmega_mlx.data.source_identity import (
 from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     PLATFORM_IDS_COLUMN,
@@ -634,6 +638,12 @@ _SCHEMA = _SCHEMA.with_metadata(
         ).encode("ascii"),
         DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
             DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+        ),
+        DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): (
+            DOMAIN_SCHEMA_SHA256.encode("ascii")
+        ),
+        TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8"): (
+            TOKENIZER_CONTRACT_SHA256.encode("ascii")
         ),
         b"cppmega.case5_schema": b"case5_domain_routes_v1",
     }

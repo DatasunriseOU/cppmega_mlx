@@ -17,6 +17,14 @@ from cppmega_mlx.data.symbol_identity import (
     SymbolIdentityError,
     compute_symbol_id,
 )
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
 from scripts.nanochat_data import materialize_tokenized_enriched_parquet as materializer
 from scripts.nanochat_data import migrate_clang_commits_v1_to_v12 as migration
 from scripts.nanochat_data import pack_enriched_rows as packer
@@ -34,6 +42,12 @@ _IDENTITY_METADATA = {
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
         SYMBOL_IDENTITY_SCHEMA_VERSION
     ).encode("ascii"),
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): DOMAIN_SCHEMA_SHA256.encode(
+        "ascii"
+    ),
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+        "utf-8"
+    ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
     b"cppmega.test.metadata": b"preserve-me",
 }
 

@@ -163,6 +163,15 @@ def test_clang_enriched_parquet_schema_preserves_token_semantic_columns() -> Non
         "chunk_boundaries"
     ).type.value_type
     assert boundary_type.field("symbol_id").type == pa.uint64()
+    metadata = clang_enriched_to_parquet._SCHEMA.metadata or {}
+    assert metadata[
+        clang_enriched_to_parquet.DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")
+    ] == clang_enriched_to_parquet.DOMAIN_SCHEMA_SHA256.encode("ascii")
+    assert metadata[
+        clang_enriched_to_parquet.TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+            "utf-8"
+        )
+    ] == clang_enriched_to_parquet.TOKENIZER_CONTRACT_SHA256.encode("ascii")
 
 
 def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:

@@ -11,11 +11,16 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
 
 
 class DomainKind(IntEnum):
@@ -134,9 +139,46 @@ class ParseConfidence(IntEnum):
 
 
 DOMAIN_SCHEMA_PATH = Path(__file__).with_name("domain_schema_v1.json")
-DOMAIN_SCHEMA = json.loads(DOMAIN_SCHEMA_PATH.read_text(encoding="utf-8"))
+try:
+    _DOMAIN_SCHEMA_BYTES = DOMAIN_SCHEMA_PATH.read_bytes()
+    DOMAIN_SCHEMA = json.loads(_DOMAIN_SCHEMA_BYTES.decode("utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    raise RuntimeError(
+        f"cannot load frozen domain schema {DOMAIN_SCHEMA_PATH}: {exc}"
+    ) from exc
+if not isinstance(DOMAIN_SCHEMA, dict):
+    raise RuntimeError(
+        f"frozen domain schema {DOMAIN_SCHEMA_PATH} must be an object"
+    )
+DOMAIN_SCHEMA_SHA256 = hashlib.sha256(_DOMAIN_SCHEMA_BYTES).hexdigest()
+DOMAIN_SCHEMA_SHA256_METADATA_KEY = "cppmega.domain_schema_sha256"
 if DOMAIN_SCHEMA.get("schema") != "cppmega_domain_sidecars_v1":
     raise RuntimeError(f"unsupported frozen domain schema: {DOMAIN_SCHEMA_PATH}")
+
+
+def validate_case5_contract_metadata(
+    metadata: Mapping[bytes, bytes] | None,
+    *,
+    where: str | Path,
+) -> None:
+    """Require exact full-content hashes for both frozen CASE5 contracts."""
+
+    actual_metadata = metadata or {}
+    expected = {
+        DOMAIN_SCHEMA_SHA256_METADATA_KEY: DOMAIN_SCHEMA_SHA256,
+        TOKENIZER_CONTRACT_SHA256_METADATA_KEY: TOKENIZER_CONTRACT_SHA256,
+    }
+    mismatches: list[str] = []
+    for key, digest in expected.items():
+        actual = actual_metadata.get(key.encode("utf-8"))
+        wanted = digest.encode("ascii")
+        if actual != wanted:
+            mismatches.append(f"{key}={actual!r}, expected {wanted!r}")
+    if mismatches:
+        raise ValueError(
+            f"{where}: missing or stale frozen CASE5 contract hashes: "
+            + "; ".join(mismatches)
+        )
 
 
 def _enum_contract(enum_type: type[IntEnum], field: str) -> dict[str, int]:
@@ -455,6 +497,8 @@ def validate_domain_delimiter_contract() -> None:
 __all__ = [
     "DOMAIN_SCHEMA",
     "DOMAIN_SCHEMA_PATH",
+    "DOMAIN_SCHEMA_SHA256",
+    "DOMAIN_SCHEMA_SHA256_METADATA_KEY",
     "DOMAIN_DELIMITER_ROLES",
     "DOMAIN_EDGE_FAMILIES",
     "DOMAIN_EDGE_FIELD_FAMILIES",
@@ -470,6 +514,7 @@ __all__ = [
     "normalize_embedded_domain_spans",
     "remap_embedded_domain_spans",
     "slice_embedded_domain_spans",
+    "validate_case5_contract_metadata",
     "validate_domain_delimiter_contract",
     "validate_domain_edge_kind",
 ]
