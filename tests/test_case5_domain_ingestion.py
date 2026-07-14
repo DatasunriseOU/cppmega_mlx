@@ -280,6 +280,28 @@ def test_domain_discovery_fails_loud_on_large_or_unreadable_inputs(
         discover_project_domain_files(tmp_path)
 
 
+def test_non_utf8_domain_input_is_explicitly_excluded_without_lossy_decode(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cppmega_mlx.data.domain_ingestion import discover_project_domain_files
+    from tools.clang_indexer import index_project
+
+    script = tmp_path / "invalid.sh"
+    script.write_bytes(b"#!/bin/sh\nprintf '\xff'\n")
+
+    with pytest.warns(RuntimeWarning, match="skipping non-UTF-8 domain input"):
+        assert discover_project_domain_files(tmp_path) == []
+
+    assert index_project.emit_build_documents(
+        [(str(script), "sh")],
+        default_build_info=None,
+    ) == []
+    captured = capsys.readouterr()
+    assert "SKIP domain_non_utf8" in captured.err
+    assert "skipped_non_utf8=1" in captured.err
+
+
 def test_shell_shebang_overrides_generic_sh_suffix_in_both_discovery_paths(
     tmp_path: Path,
 ) -> None:

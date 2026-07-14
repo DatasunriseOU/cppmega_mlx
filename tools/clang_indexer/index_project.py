@@ -6742,10 +6742,11 @@ def emit_build_documents(
     SAME shared DedupStore tables (token-id exact + near) so build docs dedup
     against each other globally and resumably.
 
-    FAIL LOUD (RULE #1): a discovered build file that cannot be read/decoded or
-    a non-empty build file that tokenizes empty RAISES. Truly empty/whitespace
-    build files are counted and skipped explicitly; they carry no useful text
-    and should not fail the whole C/C++ repo.
+    FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
+    that tokenizes empty RAISES. Non-UTF-8 text inputs are not replacement-decoded:
+    they are explicitly counted and logged as skipped because their bytes cannot
+    satisfy the tokenizer/source-identity text contract. Truly empty/whitespace
+    files are likewise counted and skipped.
     """
     docs: list[dict] = []
     if not build_files:
@@ -6768,10 +6769,21 @@ def emit_build_documents(
 
     dropped = 0
     skipped_empty = 0
+    skipped_non_utf8 = 0
     for filepath, build_kind in sorted(build_files):
-        # FAIL LOUD on unreadable build files -- do not paper over a broken file.
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
+        # Unreadable files remain fatal. Invalid UTF-8 is a data exclusion, not a
+        # lossy decode: record it explicitly and never train replacement glyphs.
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="strict") as fh:
+                text = fh.read()
+        except UnicodeError as exc:
+            skipped_non_utf8 += 1
+            print(
+                "  SKIP domain_non_utf8 "
+                f"kind={build_kind} path={filepath!r} error={exc}",
+                file=sys.stderr,
+            )
+            continue
         if not text or not text.strip():
             skipped_empty += 1
             continue
@@ -6831,7 +6843,8 @@ def emit_build_documents(
 
     print(
         f"  Build docs: emitted={len(docs)} dropped_dup={dropped} "
-        f"skipped_empty={skipped_empty} (whole-doc tokenized-hash dedup)",
+        f"skipped_empty={skipped_empty} skipped_non_utf8={skipped_non_utf8} "
+        "(whole-doc tokenized-hash dedup)",
         file=sys.stderr,
     )
     return docs

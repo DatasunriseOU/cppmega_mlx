@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import re
 from typing import Callable, Mapping, Sequence, cast
+import warnings
 
 from cppmega_mlx.data.build_parsers import (
     parse_autoconf,
@@ -581,7 +582,15 @@ def discover_project_domain_files(
                 encoding="utf-8",
                 errors="strict" if known_candidate else "replace",
             )
-        except (OSError, UnicodeError) as exc:
+        except UnicodeError as exc:
+            if known_candidate:
+                warnings.warn(
+                    f"skipping non-UTF-8 domain input {path}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            continue
+        except OSError as exc:
             if known_candidate:
                 raise OSError(f"failed to read domain input {path}: {exc}") from exc
             continue
