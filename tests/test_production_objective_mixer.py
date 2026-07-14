@@ -24,11 +24,13 @@ from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    NUM_DOCS_COLUMN,
     SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
     SOURCE_DIFF_TOKEN_IDS_COLUMN,
     SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
     SOURCE_POST_TOKEN_IDS_COLUMN,
     SOURCE_PRE_TOKEN_IDS_COLUMN,
+    VALID_TOKEN_COUNT_COLUMN,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     COMMIT_MSG_TOKEN_IDS_COLUMN,
@@ -65,6 +67,7 @@ from cppmega_mlx.training.objective_data import (
     OBJECTIVE_SECTION_COLUMNS,
     OBJECTIVE_SOURCE_COLUMNS,
     graph_targets_and_pair_mask,
+    normalize_megatron_objective_source_row,
     objective_source_from_tokenized_row,
     require_megatron_objective_source_columns,
     require_objective_source_columns,
@@ -280,6 +283,68 @@ def test_megatron_source_schema_does_not_require_every_task_section() -> None:
     )
 
     require_megatron_objective_source_columns(columns)
+
+    packed_columns = tuple(column for column in columns if column != "token_ids") + (
+        INPUT_IDS_COLUMN,
+        VALID_TOKEN_COUNT_COLUMN,
+    )
+    require_megatron_objective_source_columns(packed_columns)
+
+
+def test_packed_megatron_row_adapts_valid_prefix_and_real_objective_sections() -> None:
+    packed = {
+        INPUT_IDS_COLUMN: [1, 2, 3, 4, 0, 0],
+        VALID_TOKEN_COUNT_COLUMN: 4,
+        NUM_DOCS_COLUMN: 1,
+        "doc_ids": [1, 1, 1, 1, 0, 0],
+        "token_structure_ids": [1, 1, 1, 1, 0, 0],
+        "token_dep_levels": [0, 0, 0, 0, 0, 0],
+        "token_ast_depth": [0, 1, 1, 0, 0, 0],
+        "token_sibling_index": [0, 0, 1, 0, 0, 0],
+        "token_ast_node_type": [1, 2, 2, 1, 0, 0],
+        "token_symbol_ids": [0, 0, 0, 0, 0, 0],
+        "token_call_targets": [0, 0, 0, 0, 0, 0],
+        "token_type_refs": [0, 0, 0, 0, 0, 0],
+        "token_def_use": [0, 0, 0, 0, 0, 0],
+        "token_chunk_starts": [0],
+        "token_chunk_ends": [4],
+        "token_chunk_kinds": [3],
+        "token_chunk_dep_levels": [0],
+        "token_call_edges": [],
+        "token_type_edges": [],
+        SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: [[50, 51]],
+        SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN: [[40, 41]],
+        SOURCE_PRE_TOKEN_IDS_COLUMN: [[10, 11]],
+        SOURCE_POST_TOKEN_IDS_COLUMN: [[20, 21]],
+        SOURCE_DIFF_TOKEN_IDS_COLUMN: [[30, 31]],
+    }
+
+    normalized = normalize_megatron_objective_source_row(packed, source_index=7)
+    assert normalized["token_ids"] == [1, 2, 3, 4]
+    assert normalized["doc_ids"] == [1, 1, 1, 1]
+    assert normalized[IFIM_INSTRUCTION_TOKEN_IDS_COLUMN] == [50, 51]
+
+    source = objective_source_from_tokenized_row(packed, source_index=7)
+    assert np.asarray(source.code_packet.token_ids).tolist() == [1, 2, 3, 4]
+    assert np.asarray(source.code_packet.ifim_instruction_token_ids).tolist() == [
+        50,
+        51,
+    ]
+    assert np.asarray(source.commit_packet.commit_msg).tolist() == [40, 41]
+    assert np.asarray(source.commit_packet.diff_token_ids).tolist() == [30, 31]
+
+
+def test_multi_document_pack_does_not_guess_ifim_constituent_binding() -> None:
+    packed = {
+        INPUT_IDS_COLUMN: [1, 2, 3, 4, 0, 0],
+        VALID_TOKEN_COUNT_COLUMN: 4,
+        NUM_DOCS_COLUMN: 2,
+        "doc_ids": [1, 1, 2, 2, 0, 0],
+        SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: [[50], [51]],
+    }
+
+    normalized = normalize_megatron_objective_source_row(packed, source_index=0)
+    assert IFIM_INSTRUCTION_TOKEN_IDS_COLUMN not in normalized
 
 
 def test_commit_section_schema_round_trips_through_packer(tmp_path) -> None:

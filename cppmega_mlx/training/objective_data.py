@@ -13,6 +13,15 @@ from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.code_packet_builder import (
     build_code_packet_from_row,
     build_commit_packet_from_row,
+    build_commit_packets_from_packed_row,
+)
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    INPUT_IDS_COLUMN,
+    NUM_DOCS_COLUMN,
+    PACKED_ROWS_OBJECTIVE_SOURCE_COLUMNS,
+    PACKED_ROWS_TOKEN_ALIGNED_COLUMNS,
+    SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+    VALID_TOKEN_COUNT_COLUMN,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     COMMIT_MSG_TOKEN_IDS_COLUMN,
@@ -127,12 +136,82 @@ def require_objective_source_columns(columns: Sequence[str]) -> None:
 
 
 def require_megatron_objective_source_columns(columns: Sequence[str]) -> None:
-    missing = sorted(set(OBJECTIVE_MEGATRON_REQUIRED_SOURCE_COLUMNS) - set(columns))
+    available = set(columns)
+    required = set(OBJECTIVE_MEGATRON_REQUIRED_SOURCE_COLUMNS)
+    if TOKEN_IDS_COLUMN not in available:
+        if {INPUT_IDS_COLUMN, VALID_TOKEN_COUNT_COLUMN} <= available:
+            required.remove(TOKEN_IDS_COLUMN)
+        else:
+            required.add(TOKEN_IDS_COLUMN)
+    missing = sorted(required - available)
     if missing:
         raise ValueError(
             "Megatron objective materialization is missing required typed "
             "columns: " + ", ".join(missing)
         )
+
+
+def normalize_megatron_objective_source_row(
+    row: Mapping[str, Any],
+    *,
+    source_index: int,
+) -> dict[str, Any]:
+    """Adapt one fixed-length packed row to the typed objective-row contract."""
+
+    normalized = dict(row)
+    if TOKEN_IDS_COLUMN in normalized:
+        return normalized
+    if INPUT_IDS_COLUMN not in normalized or VALID_TOKEN_COUNT_COLUMN not in normalized:
+        raise ValueError(
+            "Megatron objective source requires token_ids or packed "
+            "input_ids + valid_token_count"
+        )
+
+    packed_tokens = list(normalized[INPUT_IDS_COLUMN] or [])
+    raw_valid = normalized[VALID_TOKEN_COUNT_COLUMN]
+    if isinstance(raw_valid, bool):
+        raise ValueError("valid_token_count must be an integer, not bool")
+    valid = int(raw_valid)
+    if not 0 < valid <= len(packed_tokens):
+        raise ValueError(
+            f"valid_token_count {valid} is outside packed input length "
+            f"{len(packed_tokens)}"
+        )
+
+    for column in PACKED_ROWS_TOKEN_ALIGNED_COLUMNS:
+        if column not in normalized:
+            continue
+        values = normalized[column]
+        if values is None:
+            raise ValueError(f"packed token-aligned column {column} is null")
+        vector = list(values)
+        if len(vector) != len(packed_tokens):
+            raise ValueError(
+                f"packed token-aligned column {column} length {len(vector)} != "
+                f"input_ids length {len(packed_tokens)}"
+            )
+        normalized[column] = vector[:valid]
+    normalized[TOKEN_IDS_COLUMN] = packed_tokens[:valid]
+
+    packed_instructions = normalized.get(SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN)
+    if packed_instructions is not None:
+        instructions = list(packed_instructions)
+        raw_num_docs = normalized.get(NUM_DOCS_COLUMN, len(instructions))
+        if isinstance(raw_num_docs, bool):
+            raise ValueError("num_docs must be an integer, not bool")
+        num_docs = int(raw_num_docs)
+        if num_docs != len(instructions):
+            raise ValueError(
+                f"{SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN} count "
+                f"{len(instructions)} != num_docs {num_docs}"
+            )
+        # A packet-wide instruction cannot be bound to one constituent without
+        # changing the CodePacket ABI. Preserve IFIM only when that binding is
+        # exact; multi-document packs remain eligible for the other objectives.
+        if num_docs == 1 and instructions[0]:
+            normalized[IFIM_INSTRUCTION_TOKEN_IDS_COLUMN] = list(instructions[0])
+
+    return normalized
 
 
 def _i32(values: Any, *, where: str) -> mx.array:
@@ -156,6 +235,7 @@ def objective_source_from_tokenized_row(
 ) -> ObjectiveSource:
     """Build code and, when complete, commit views from one typed source row."""
 
+    row = normalize_megatron_objective_source_row(row, source_index=source_index)
     columns = {str(name): [value] for name, value in row.items()}
     token_ids = _i32(row.get(TOKEN_IDS_COLUMN), where=TOKEN_IDS_COLUMN)
     raw_document_ids = row.get("doc_ids")
@@ -215,11 +295,20 @@ def objective_source_from_tokenized_row(
         for name, values in columns.items()
         if name not in TOKENIZED_ENRICHED_TEMPORAL_TOKEN_COLUMNS
     }
-    commit_packet = (
-        build_commit_packet_from_row(columns=commit_columns, row_index=0)
-        if has_any_commit_section
-        else None
+    packed_commit_packets = (
+        build_commit_packets_from_packed_row(columns, row_index=0)
+        if any(column in row for column in PACKED_ROWS_OBJECTIVE_SOURCE_COLUMNS)
+        else []
     )
+    if packed_commit_packets:
+        commit_packet = packed_commit_packets[source_index % len(packed_commit_packets)]
+    elif has_any_commit_section:
+        commit_packet = build_commit_packet_from_row(
+            columns=commit_columns,
+            row_index=0,
+        )
+    else:
+        commit_packet = None
     return ObjectiveSource(code_packet=code_packet, commit_packet=commit_packet)
 
 
@@ -768,6 +857,7 @@ __all__ = [
     "empty_objective_routes",
     "exclude_objective_routes",
     "graph_targets_and_pair_mask",
+    "normalize_megatron_objective_source_row",
     "objective_source_from_tokenized_row",
     "remap_objective_routes",
     "require_megatron_objective_source_columns",

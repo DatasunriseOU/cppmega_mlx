@@ -38,6 +38,12 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SOURCE_DOC_IDS_COLUMN,
     TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
 )
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    INPUT_IDS_COLUMN,
+    NUM_DOCS_COLUMN,
+    PACKED_ROWS_OBJECTIVE_SOURCE_COLUMNS,
+    VALID_TOKEN_COUNT_COLUMN,
+)
 from cppmega_mlx.data.source_identity import (
     MAX_ROW_LOCAL_DOC_ID,
     MAX_SOURCE_ID,
@@ -66,6 +72,7 @@ from cppmega_mlx.training.objective_contract_accumulator import (
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_ROUTE_MAPPING_SCHEMA,
     OBJECTIVE_SOURCE_COLUMNS,
+    normalize_megatron_objective_source_row,
     objective_source_from_tokenized_row,
     require_megatron_objective_source_columns,
 )
@@ -392,6 +399,16 @@ def _iter_parquet_source_rows(
             selected = [
                 column for column in OBJECTIVE_SOURCE_COLUMNS if column in available
             ]
+            selected.extend(
+                column
+                for column in (
+                    INPUT_IDS_COLUMN,
+                    VALID_TOKEN_COUNT_COLUMN,
+                    NUM_DOCS_COLUMN,
+                    *PACKED_ROWS_OBJECTIVE_SOURCE_COLUMNS,
+                )
+                if column in available and column not in selected
+            )
             if "doc_ids" in available:
                 selected.append("doc_ids")
             selected.extend(
@@ -462,6 +479,10 @@ class _ObjectiveSourceIterator(Iterator[ObjectiveSource]):
 
     def __next__(self) -> ObjectiveSource:
         row, raw_cursor = next(self._rows)
+        row = normalize_megatron_objective_source_row(
+            row,
+            source_index=self._source_index,
+        )
         token_count = len(row[TOKEN_IDS_COLUMN])  # type: ignore[arg-type]
         source_doc_ids = [
             int(value)
