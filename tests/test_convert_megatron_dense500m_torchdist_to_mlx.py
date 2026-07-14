@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import io
 import json
+import pickle
 import subprocess
 import sys
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
@@ -26,12 +31,8 @@ def _load_module():
     return module
 
 
-class _FakeDType:
-    pass
-
-
 class _FakeProperties:
-    dtype = _FakeDType()
+    dtype = "torch.float32"
 
 
 class _FakeTensorMeta:
@@ -51,6 +52,44 @@ class _FakeMetadata:
 class _FakeTarget:
     def __init__(self, shape: tuple[int, ...]):
         self.shape = shape
+
+
+@dataclass(frozen=True)
+class _FixtureMetadataIndex:
+    fqn: str
+    offset: tuple[int, ...]
+    index: int
+
+
+@dataclass
+class _FixtureStorageInfo:
+    relative_path: str
+    offset: int
+    length: int
+
+
+@dataclass
+class _FixtureChunk:
+    offsets: tuple[int, ...]
+    sizes: tuple[int, ...]
+
+
+@dataclass
+class _FixtureProperties:
+    dtype: str
+
+
+@dataclass
+class _FixtureTensorMetadata:
+    size: tuple[int, ...]
+    properties: _FixtureProperties
+    chunks: list[_FixtureChunk]
+
+
+@dataclass
+class _FixtureDcpMetadata:
+    state_dict_metadata: dict[str, _FixtureTensorMetadata]
+    storage_data: dict[_FixtureMetadataIndex, _FixtureStorageInfo]
 
 
 def _toy_contract(mod, cfg, *, source_keys: set[str] | None = None):
@@ -122,6 +161,156 @@ def _toy_contract(mod, cfg, *, source_keys: set[str] | None = None):
             target_shape = (len(item.source_rows), *shape[1:])
         targets[item.target_key] = _FakeTarget(target_shape)
     return source_sizes, targets
+
+
+def _fixture_source_state(mod, cfg) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(5005)
+    state: dict[str, np.ndarray] = {}
+
+    def weight(shape: tuple[int, ...], *, scale: float = 0.08) -> np.ndarray:
+        return rng.normal(0.0, scale, shape).astype(np.float32)
+
+    state["embedding.word_embeddings.weight"] = weight(
+        (cfg.vocab_size, cfg.hidden_size)
+    )
+    tables = 2 * cfg.ngram_hash_heads
+    table_sizes = np.arange(
+        cfg.ngram_hash_table_size,
+        cfg.ngram_hash_table_size + tables,
+        dtype=np.int64,
+    )
+    offsets = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(table_sizes[:-1])))
+    ngram = "embedding.cppmega_ngram_hash."
+    state[ngram + "table_offsets"] = offsets
+    state[ngram + "table_sizes_t"] = table_sizes
+    state[ngram + "hash_mults"] = np.array([[3, 5, 7], [11, 13, 17]], dtype=np.int64)
+    state[ngram + "hash_bias"] = np.array([19, 23], dtype=np.int64)
+    state[ngram + "order_for_table"] = np.array([2, 3], dtype=np.int64)
+    state[ngram + "order_mask"] = np.array([[1, 1], [1, 1], [0, 1]], dtype=np.int64)
+    state[ngram + "unified_table.weight"] = weight(
+        (int(table_sizes.sum()), cfg.ngram_hash_embed_dim)
+    )
+    state[ngram + "out_proj.weight"] = weight(
+        (cfg.hidden_size, tables * cfg.ngram_hash_embed_dim)
+    )
+    structure = "embedding.cppmega_structure."
+    state[structure + "component_scales"] = np.array([0.5, 0.5], dtype=np.float32)
+    state[structure + "stacked_emb.weight"] = weight(
+        (
+            cfg.structure_num_categories + cfg.structure_max_dep_level,
+            cfg.structure_bottleneck_dim,
+        )
+    )
+    state[structure + "up_proj.weight"] = weight(
+        (cfg.hidden_size, cfg.structure_bottleneck_dim)
+    )
+    for block in range(cfg.depth):
+        attn = f"decoder.layers.{2 * block}.self_attention."
+        state[attn + "linear_qkv.layer_norm_weight"] = np.ones(
+            (cfg.hidden_size,), dtype=np.float32
+        )
+        state[attn + "linear_qkv.weight"] = weight((cfg.qkv_dim, cfg.hidden_size))
+        state[attn + "linear_proj.weight"] = weight((cfg.hidden_size, cfg.q_proj_dim))
+        mlp = f"decoder.layers.{2 * block + 1}.mlp."
+        state[mlp + "linear_fc1.layer_norm_weight"] = np.ones(
+            (cfg.hidden_size,), dtype=np.float32
+        )
+        state[mlp + "linear_fc1.weight"] = weight(
+            (2 * cfg.ffn_hidden_size, cfg.hidden_size)
+        )
+        state[mlp + "linear_fc2.weight"] = weight(
+            (cfg.hidden_size, cfg.ffn_hidden_size)
+        )
+    state["decoder.final_norm.weight"] = np.ones((cfg.hidden_size,), dtype=np.float32)
+    assert {item.source_key for item in mod.build_key_plan(cfg)} == set(state)
+    return state
+
+
+def _torch_tensor_payload(array: np.ndarray) -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("archive/data.pkl", b"fixture")
+        archive.writestr("archive/data/0", array.tobytes(order="C"))
+        archive.writestr("archive/version", b"3\n")
+    return stream.getvalue()
+
+
+def _write_torch_dist_fixture(mod, cfg, iter_dir: Path) -> dict[str, np.ndarray]:
+    iter_dir.mkdir(parents=True)
+    source = _fixture_source_state(mod, cfg)
+    source["optimizer.state.exp_avg.decoder.final_norm.weight"] = np.zeros(
+        (cfg.hidden_size,), dtype=np.float32
+    )
+    metadata_entries: dict[str, _FixtureTensorMetadata] = {}
+    storage: dict[_FixtureMetadataIndex, _FixtureStorageInfo] = {}
+    shard = bytearray()
+    for index, (key, array) in enumerate(sorted(source.items())):
+        payload = _torch_tensor_payload(array)
+        offset = len(shard)
+        shard.extend(payload)
+        dtype = "torch.int64" if array.dtype == np.int64 else "torch.float32"
+        metadata_entries[key] = _FixtureTensorMetadata(
+            size=tuple(array.shape),
+            properties=_FixtureProperties(dtype=dtype),
+            chunks=[
+                _FixtureChunk(
+                    offsets=(0,) * array.ndim,
+                    sizes=tuple(array.shape),
+                )
+            ],
+        )
+        storage[_FixtureMetadataIndex(key, (0,) * array.ndim, index)] = (
+            _FixtureStorageInfo("__0_0.distcp", offset, len(payload))
+        )
+    (iter_dir / "__0_0.distcp").write_bytes(shard)
+    (iter_dir / ".metadata").write_bytes(
+        pickle.dumps(_FixtureDcpMetadata(metadata_entries, storage), protocol=4)
+    )
+    args = argparse.Namespace(
+        num_layers=cfg.depth * 2,
+        hidden_size=cfg.hidden_size,
+        ffn_hidden_size=cfg.ffn_hidden_size,
+        num_attention_heads=cfg.num_query_heads,
+        num_query_groups=cfg.num_kv_heads,
+        kv_channels=cfg.head_dim,
+        padded_vocab_size=cfg.vocab_size,
+        group_query_attention=True,
+        hybrid_layer_pattern="*-" * cfg.depth,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-5,
+        swiglu=True,
+        add_bias_linear=False,
+        add_qkv_bias=False,
+        position_embedding_type="rope",
+        rotary_base=10_000,
+        rotary_percent=1.0,
+        rotary_interleaved=False,
+        untie_embeddings_and_output_weights=False,
+        multi_latent_attention=False,
+        num_experts=None,
+        mtp_num_layers=None,
+        seq_length=cfg.max_seq_length,
+        max_position_embeddings=cfg.max_seq_length,
+    )
+    with zipfile.ZipFile(iter_dir / "common.pt", "w") as archive:
+        archive.writestr(
+            "common/data.pkl",
+            pickle.dumps({"args": args, "iteration": 7}, protocol=2),
+        )
+        archive.writestr("common/version", b"3\n")
+    (iter_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "sharded_backend": "torch_dist",
+                "sharded_backend_version": 1,
+                "common_backend": "torch",
+                "common_backend_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source.pop("optimizer.state.exp_avg.decoder.final_norm.weight")
+    return source
 
 
 def test_key_plan_folds_megatron_af_layers_into_dense_blocks():
@@ -468,86 +657,54 @@ def test_converter_rejects_output_without_safetensors_suffix(tmp_path: Path) -> 
         mod.conversion_output_paths(tmp_path / "dense500m.bin")
 
 
-def test_convert_checkpoint_publishes_only_after_reloaded_parity(
+def test_convert_torch_dist_fixture_runs_raw_dcp_to_mlx_logit_parity(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
     mod = _load_module()
-    cfg = mod.Dense500MConversionConfig()
-    metadata = object()
-    target = {"fixture.weight": mx.array([[1.0, 2.0]], dtype=mx.float32)}
-    source_model = object()
-    parity_inputs = {
-        "input_ids": object(),
-        "graph_attention_bias": object(),
-        "graph_edge_kind_bias": object(),
-        "domain_ids": object(),
-        "role_ids": object(),
-        "confidence_ids": object(),
-        "document_ids": object(),
-    }
+    cfg = mod.Dense500MConversionConfig(
+        vocab_size=32,
+        hidden_size=8,
+        depth=1,
+        ffn_hidden_size=12,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=2,
+        max_seq_length=6,
+        ngram_hash_heads=1,
+        ngram_hash_table_size=7,
+        ngram_hash_embed_dim=3,
+        structure_num_categories=5,
+        structure_max_dep_level=6,
+        structure_bottleneck_dim=4,
+    )
     checkpoint = tmp_path / "iter_0000001"
-    checkpoint.mkdir()
+    _write_torch_dist_fixture(mod, cfg, checkpoint)
     output = tmp_path / "converted" / "weights.safetensors"
-    observed: dict[str, object] = {}
-
-    monkeypatch.setattr(mod, "_import_runtime", lambda: (mx, None, None, None))
-    monkeypatch.setattr(mod, "resolve_checkpoint_iter", lambda _path: checkpoint)
-    monkeypatch.setattr(mod, "read_dcp_metadata", lambda _path: metadata)
-    monkeypatch.setattr(mod, "_metadata_tensor_specs", lambda _metadata: {})
-    monkeypatch.setattr(mod, "_target_arrays", lambda *_args, **_kwargs: dict(target))
-    monkeypatch.setattr(
-        mod,
-        "validate_plan_against_metadata",
-        lambda *_args, **_kwargs: {"mapped_tensors": 1},
-    )
-    monkeypatch.setattr(
-        mod, "load_required_source_tensors", lambda *_args, **_kwargs: {}
-    )
-    monkeypatch.setattr(
-        mod,
-        "apply_mapping",
-        lambda arrays, *_args, **_kwargs: arrays,
-    )
-    monkeypatch.setattr(
-        mod,
-        "_mapped_source_reference_model",
-        lambda *_args, **_kwargs: source_model,
-    )
-    monkeypatch.setattr(mod, "_fixed_parity_inputs", lambda _cfg: parity_inputs)
-    monkeypatch.setattr(
-        mod,
-        "_make_target_model",
-        lambda *_args, **_kwargs: (object(), object()),
-    )
-
-    def verify_emitted(**kwargs):
-        staged = Path(kwargs["weights_path"])
-        assert staged.is_file()
-        np.testing.assert_array_equal(
-            np.asarray(mx.load(str(staged))["fixture.weight"]),
-            np.array([[1.0, 2.0]], dtype=np.float32),
-        )
-        assert kwargs["target_model_factory"]() is not None
-        observed["weights_path"] = staged
-        return {"max_abs_logit_error": 0.0}
-
-    monkeypatch.setattr(
-        mod,
-        "verify_emitted_safetensors_logit_parity",
-        verify_emitted,
-    )
 
     manifest = mod.convert_checkpoint(checkpoint, output, cfg=cfg, bf16=False)
 
-    assert observed["weights_path"] != output
     assert output.is_file()
-    assert not output.with_suffix(".json").exists()
     model_json = output.parent / "model.json"
     assert model_json.is_file()
     payload = json.loads(model_json.read_text(encoding="utf-8"))
     assert payload == manifest
+    assert payload["schema"] == "cppmega_megatron_dense500m_to_mlx_v4"
+    assert payload["source_contract"]["route_pattern"] == "*-"
+    assert payload["source_contract"]["tied_embeddings"] is True
+    assert payload["validation"]["optimizer_exclusion"]["tensor_count"] == 1
+    assert payload["validation"]["unsupported_tensors"] == []
+    assert {item["path"] for item in payload["source_artifacts"]} == {
+        ".metadata",
+        "__0_0.distcp",
+        "common.pt",
+        "metadata.json",
+    }
+    assert all(len(item["sha256"]) == 64 for item in payload["source_artifacts"])
+    assert payload["logit_parity"]["source_reference"] == (
+        "raw_dcp_numpy_megatron_af_gqa_v1"
+    )
     assert payload["logit_parity"]["reloaded_safetensors"] == str(output.resolve())
+    assert payload["logit_parity"]["max_abs_logit_error"] <= 3e-4
 
 
 def _parity_model() -> DenseCppLM:
@@ -773,65 +930,6 @@ def test_emitted_safetensors_match_independent_grouped_gqa_source(
     assert receipt["document_boundaries"] == 1
     assert receipt["reloaded_safetensors"] == str(emitted.resolve())
     assert receipt["max_abs_logit_error"] <= 2e-5
-
-
-def test_dense_mapped_source_matches_reloaded_emitted_weights(
-    tmp_path: Path,
-) -> None:
-    mod = _load_module()
-    cfg = mod.Dense500MConversionConfig(
-        vocab_size=64,
-        hidden_size=16,
-        depth=1,
-        ffn_hidden_size=32,
-        num_query_heads=4,
-        num_kv_heads=2,
-        head_dim=4,
-        max_seq_length=8,
-        ngram_hash_heads=1,
-        ngram_hash_table_size=31,
-        ngram_hash_embed_dim=4,
-        structure_bottleneck_dim=8,
-        domain_num_domains=8,
-        domain_num_roles=8,
-        domain_num_confidences=4,
-        domain_bottleneck_dim=4,
-    )
-    mx.random.seed(141)
-    arrays = mod._target_arrays(cfg, bf16=False, domain_tensors_present=True)
-    arrays["domain_embedding.stacked_emb.weight"] = mx.random.normal(
-        arrays["domain_embedding.stacked_emb.weight"].shape
-    )
-    arrays["domain_embedding.up_proj.weight"] = mx.random.normal(
-        arrays["domain_embedding.up_proj.weight"].shape
-    )
-    source_model = mod._mapped_source_reference_model(
-        cfg,
-        arrays,
-        bf16=False,
-        domain_tensors_present=True,
-    )
-    emitted = tmp_path / "dense.safetensors"
-    mx.save_safetensors(str(emitted), arrays, metadata={"format": "mlx"})
-
-    def target_model_factory():
-        return mod._make_target_model(
-            cfg,
-            bf16=False,
-            domain_tensors_present=True,
-        )[1]
-
-    receipt = mod.verify_emitted_safetensors_logit_parity(
-        source_forward=mod._source_forward(source_model),
-        target_model_factory=target_model_factory,
-        weights_path=emitted,
-        **mod._fixed_parity_inputs(cfg),
-    )
-
-    assert receipt["relation_prior_nonzero"] == 2
-    assert receipt["edge_kind_prior_nonzero"] == 2
-    assert receipt["document_boundaries"] == 1
-    assert receipt["max_abs_logit_error"] <= 1e-6
 
 
 def test_sidecar_parity_seam_detects_dropped_graph_route() -> None:
