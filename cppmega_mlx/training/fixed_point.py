@@ -84,7 +84,7 @@ def truncated_bptt_step(
     window: int = 4,
     num_windows: int = 1,
 ) -> dict[str, object]:
-    """Run one truncated-BPTT + deep-supervision OPTIMISER step.
+    """Run an online truncated-BPTT + deep-supervision update schedule.
 
     Strategy (matches the paper's truncated-BPTT-with-deep-supervision recipe):
     for each of ``num_windows`` windows we
@@ -107,8 +107,10 @@ def truncated_bptt_step(
     upstream modules (embedding/prelude) — passing a precomputed tensor would
     detach those modules from the gradient graph.
 
-    Returns a dict with the summed loss across windows and the per-window loss
-    list. The total loss is the deep-supervision signal.
+    This is an online schedule: each window contributes exactly one optimizer
+    update, and the pre-update window endpoint is detached and carried into the
+    next window. The endpoint is not recomputed after the update. Returns the
+    summed observed loss, exact optimizer/loop counts, and final carried state.
     """
     if window <= 0:
         raise ValueError(f"window must be positive, got {window}")
@@ -137,35 +139,40 @@ def truncated_bptt_step(
 
     z = z0() if callable(z0) else z0
 
-    def window_loss(_unused: dict, state: mx.array) -> mx.array:
+    def window_loss(state: mx.array) -> tuple[mx.array, mx.array]:
         # value_and_grad differentiates the parameters captured by its first
         # arg. ``state`` is a detached constant; ``x`` (when a builder) is
         # rebuilt here so its upstream parameters are inside the graph too.
         x_now = current_x()
         z_out = loop.forward(state, x_now, ctx, training_loops=window)
         logits = head(z_out)
-        return loss_fn(logits, targets)
+        return loss_fn(logits, targets), z_out
 
     loss_and_grad = nn.value_and_grad(params_module, window_loss)
 
     total = 0.0
     for _ in range(num_windows):
         z = mx.stop_gradient(z)
-        loss_val, grads = loss_and_grad(params_module.trainable_parameters(), z)
+        (loss_val, z_next), grads = loss_and_grad(z)
         optimizer.update(params_module, grads)
-        mx.eval(params_module.parameters(), optimizer.state, loss_val)
+        mx.eval(params_module.parameters(), optimizer.state, loss_val, z_next)
         loss_float = float(loss_val.item())
         window_losses.append(loss_float)
         total += loss_float
-        # Advance the carried state with the freshly updated parameters and
-        # detach for the next window.
-        z = loop.forward(z, current_x(), ctx, training_loops=window)
+        z = z_next
+
+    final_state = mx.stop_gradient(z)
 
     return {
         "loss": total,
         "window_losses": window_losses,
         "num_windows": num_windows,
         "window": window,
+        "bptt_horizon": window,
+        "optimizer_updates": num_windows,
+        "loop_iterations": window * num_windows,
+        "final_state": final_state,
+        "schedule": "online_per_window",
     }
 
 
@@ -189,6 +196,8 @@ def fpopt_step(
     f_tilde = loop.residual_map(z, x, ctx)
     residual = float(loop.relative_residual(z, f_tilde).item())
     z_next = eta * f_tilde + (1.0 - eta) * z
+    if not bool(mx.all(mx.isfinite(z_next)).item()):
+        raise FloatingPointError("fpopt_step.updated_state contains non-finite values")
     return z_next, residual
 
 

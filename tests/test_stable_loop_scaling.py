@@ -23,9 +23,32 @@ class _ToyCore:
         ]
 
 
-def _make_loop(d_model=8, n_sublayers=4, a1=0.75, a2=0.25, seed=0):
+class _NoScalingLoop(StableFixedPointLoop):
+    def _loop_step_with_scales(self, z, x, ctx, scales):
+        del scales
+        for sublayer, norm in zip(self.core.sublayers, self.core.norms):
+            z = z + sublayer(norm, z, ctx)
+        return z + x
+
+
+class _BigB1Loop(StableFixedPointLoop):
+    def _f_theta_with_scales(self, z, ctx, scales):
+        a1, _a2, _b1, _b2 = scales
+        for sublayer, norm in zip(self.core.sublayers, self.core.norms):
+            z = a1 * z + 100.0 * sublayer(norm, z, ctx)
+        return z
+
+
+def _make_loop(
+    d_model=8,
+    n_sublayers=4,
+    a1=0.75,
+    a2=0.25,
+    seed=0,
+    loop_cls=StableFixedPointLoop,
+):
     core = _ToyCore(d_model, n_sublayers, seed=seed)
-    return StableFixedPointLoop(
+    return loop_cls(
         core,
         d_model=d_model,
         n_sublayers=n_sublayers,
@@ -34,10 +57,10 @@ def _make_loop(d_model=8, n_sublayers=4, a1=0.75, a2=0.25, seed=0):
     )
 
 
-def _expected_b1_b2(a1: float, a2: float, two_l: int, eps: float):
-    a1_pow = a1 ** two_l
+def _expected_b1_b2(a1: float, a2: float, two_l: int):
+    a1_pow = a1**two_l
     b2 = 1.0 - a2 * a1_pow
-    b1 = b2 * (1.0 - a1) / ((1.0 - a1_pow) + eps)
+    b1 = b2 * (1.0 - a1) / (1.0 - a1_pow)
     return b1, b2
 
 
@@ -51,20 +74,54 @@ def test_scales_match_coupling_formula(a1, a2, n_sublayers):
     assert got_a1 == pytest.approx(a1, abs=1e-5)
     assert got_a2 == pytest.approx(a2, abs=1e-5)
 
-    exp_b1, exp_b2 = _expected_b1_b2(a1, a2, n_sublayers, loop.eps)
+    exp_b1, exp_b2 = _expected_b1_b2(a1, a2, n_sublayers)
     assert got_b2 == pytest.approx(exp_b2, rel=1e-5, abs=1e-6)
     assert got_b1 == pytest.approx(exp_b1, rel=1e-5, abs=1e-6)
 
 
 def test_gate_constraints_enforced():
-    # Even with extreme requested values inside (0,1) the sigmoid keeps a in
-    # [0,1) and the derived b2 stays finite and positive.
+    # Requested values round-trip through the margin-scaled sigmoid.
     loop = _make_loop(a1=0.99, a2=0.99, n_sublayers=4)
     a1, a2, b1, b2 = (float(v.item()) for v in loop.scales())
-    assert 0.0 <= a1 < 1.0
-    assert 0.0 <= a2 < 1.0
+    assert 0.0 < a1 < 1.0
+    assert 0.0 < a2 < 1.0
     assert b2 > 0.0
     assert b1 >= 0.0
+
+
+def test_extreme_logits_keep_gates_strictly_inside_margin():
+    loop = _make_loop()
+    loop.logit_a1 = mx.array(1e30, dtype=mx.float32)
+    loop.logit_a2 = mx.array(-1e30, dtype=mx.float32)
+
+    a1, a2 = (float(v.item()) for v in loop.gates())
+
+    assert 0.0 < a2 <= loop.gate_margin
+    assert 1.0 - loop.gate_margin <= a1 < 1.0
+
+
+def test_nonfinite_gate_parameters_raise():
+    loop = _make_loop()
+    loop.logit_a1 = mx.array(float("inf"), dtype=mx.float32)
+    with pytest.raises(FloatingPointError, match="logit_a1"):
+        loop.gates()
+
+    loop = _make_loop()
+    loop.logit_a2 = mx.array(float("nan"), dtype=mx.float32)
+    with pytest.raises(FloatingPointError, match="logit_a2"):
+        loop.gates()
+
+
+@pytest.mark.parametrize("gate_margin", [0.0, 1e-8, 0.5, float("nan")])
+def test_invalid_gate_margin_raises(gate_margin):
+    core = _ToyCore(8, 4, seed=0)
+    with pytest.raises(ValueError, match="gate_margin"):
+        StableFixedPointLoop(
+            core,
+            d_model=8,
+            n_sublayers=4,
+            gate_margin=gate_margin,
+        )
 
 
 @pytest.mark.parametrize("init", [0.0, 1.0, -0.1, 1.5])
@@ -115,15 +172,9 @@ def test_activation_inf_norm_bounded_across_T(T):
     )
 
 
-def _run_norm_curve(f_theta_override, iteration_mix_override, *, seed=7):
-    """Drive a loop whose residual scaling is overridden, returning T->||z||."""
-    import types
-
-    loop = _make_loop(d_model=8, n_sublayers=4, seed=seed)
-    if f_theta_override is not None:
-        loop.f_theta = types.MethodType(f_theta_override, loop)
-    if iteration_mix_override is not None:
-        loop.iteration_mix = types.MethodType(iteration_mix_override, loop)
+def _run_norm_curve(loop_cls, *, seed=7):
+    """Drive an explicit scaling ablation, returning T->||z||."""
+    loop = _make_loop(d_model=8, n_sublayers=4, seed=seed, loop_cls=loop_cls)
     mx.random.seed(123)
     x = mx.random.normal((2, 5, 8))
     x_norm = float(mx.max(mx.abs(x)).item())
@@ -142,15 +193,7 @@ def test_bounded_norm_test_is_real_no_scaling_blows_up():
     and exceeds the tight bound the real test asserts.
     """
 
-    def f_theta_noscale(self, z, x, ctx):
-        for sub, norm in zip(self.core.sublayers, self.core.norms):
-            z = z + sub(norm, z, ctx)  # a1=1, b1=1: no residual scaling
-        return z
-
-    def iter_mix_noscale(self, z_block, x):
-        return z_block + x  # a2=1, b2=1
-
-    x_norm, norms = _run_norm_curve(f_theta_noscale, iter_mix_noscale)
+    x_norm, norms = _run_norm_curve(_NoScalingLoop)
     bound = _BOUNDED_NORM_RATIO * x_norm + 2.0
     # Grows with T and busts the bound at large T.
     assert norms[32] > norms[1], norms
@@ -167,13 +210,7 @@ def test_bounded_norm_test_is_real_wrong_b1_busts_tight_bound():
     which the tight bound rejects. Only the derived b1 keeps it near input.
     """
 
-    def f_theta_bigb1(self, z, x, ctx):
-        a1, _ = self.gates()
-        for sub, norm in zip(self.core.sublayers, self.core.norms):
-            z = a1 * z + 100.0 * sub(norm, z, ctx)  # b1=100, not derived
-        return z
-
-    x_norm, norms = _run_norm_curve(f_theta_bigb1, None)
+    x_norm, norms = _run_norm_curve(_BigB1Loop)
     bound = _BOUNDED_NORM_RATIO * x_norm + 2.0
     # Converges in T (a1<1 still contracts) ...
     assert abs(norms[32] - norms[16]) < 1.0, norms
