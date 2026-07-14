@@ -224,7 +224,6 @@ def test_stage1_production_dsa_builds_graph_indexer_not_dense_alias() -> None:
         num_query_heads=4,
         num_kv_heads=2,
         head_dim=8,
-        attention_sparse_topk=4,
         ngram_hash_enabled=False,
     )
 

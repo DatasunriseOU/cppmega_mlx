@@ -25,6 +25,12 @@ from cppmega_mlx.data.code_packet_builder import build_commit_packets_from_packe
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    stage1_graph_config_kwargs,
+    stage1_graph_recipe_binding,
+    stage1_graph_recipe_payload,
+)
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
@@ -97,6 +103,10 @@ from scripts.train_eval_stage1 import _objective_batches
 
 def _arr(values: list[int]) -> mx.array:
     return mx.array(np.asarray(values, dtype=np.int32))
+
+
+def _stage1_graph_config() -> GraphAuxLossConfig:
+    return GraphAuxLossConfig(**stage1_graph_config_kwargs())
 
 
 def _physical_source(name: str):
@@ -1507,12 +1517,7 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
         rates=mixer.rates,
         seed=37,
         quota_window_samples=6,
-        graph_config=GraphAuxLossConfig(
-            relations=("call", "type"),
-            topk=8,
-            bce_weight=0.10,
-            coverage_weight=0.05,
-        ),
+        graph_config=_stage1_graph_config(),
         graph_weight=1.0,
     )
 
@@ -1613,16 +1618,13 @@ def test_pre_materialized_contract_counts_the_configured_graph_relation() -> Non
         rates=rates,
         seed=41,
         quota_window_samples=6,
-        graph_config=GraphAuxLossConfig(
-            relations=("domain",),
-            topk=2,
-            bce_weight=0.1,
-            coverage_weight=0.05,
-        ),
+        graph_config=_stage1_graph_config(),
         graph_weight=1.0,
     )
 
-    assert contract["graph_auxiliary"]["relations"] == ["domain"]
+    assert contract["graph_auxiliary"]["relations"] == list(
+        STAGE1_GRAPH_RELATIONS
+    )
     assert contract["graph_auxiliary"]["eligible_samples"] == 1
     assert contract["graph_auxiliary"]["positive_edges"] == 1
 
@@ -1647,6 +1649,14 @@ def test_pre_materialized_contract_rejects_zero_quota_objective() -> None:
                     [{"from": 0, "to": 0}] if task is TaskKind.CAUSAL_LM else []
                 ),
                 "token_type_edges": [],
+                "token_domain_edges": [],
+                "token_build_edges": [],
+                "token_shell_edges": [],
+                "token_diagnostic_edges": [],
+                "token_cross_domain_edges": [],
+                "doc_ids": [1, 1],
+                "token_chunk_starts": [0],
+                "token_chunk_ends": [2],
             },
         )
         for task in tasks[:-1]
@@ -1658,12 +1668,7 @@ def test_pre_materialized_contract_rejects_zero_quota_objective() -> None:
             rates={task: 1 / 6 for task in tasks},
             seed=43,
             quota_window_samples=5,
-            graph_config=GraphAuxLossConfig(
-                relations=("call",),
-                topk=2,
-                bce_weight=0.1,
-                coverage_weight=0.05,
-            ),
+            graph_config=_stage1_graph_config(),
             graph_weight=1.0,
         )
 
@@ -1748,9 +1753,8 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
             "source_document_id_column": "token_source_doc_ids",
         },
         "graph_auxiliary": {
-            "relations": ["call", "type"],
-            "pair_mask": "causal_same_document_upstream_v1",
-            "chunk_edge_expansion": "cartesian_token_spans_v1",
+            **stage1_graph_recipe_payload(),
+            "recipe": stage1_graph_recipe_binding(),
             "route_mapping": objective_route_mapping_contract(),
             "route_retention": {
                 "schema": OBJECTIVE_ROUTE_RETENTION_SCHEMA,

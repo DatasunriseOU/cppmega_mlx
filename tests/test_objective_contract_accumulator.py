@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from cppmega_mlx.data.graph_recipe import stage1_graph_config_kwargs
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     build_pre_materialized_objective_contract,
@@ -15,6 +16,10 @@ from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
 )
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES, TaskKind
+
+
+def _stage1_graph_config() -> GraphAuxLossConfig:
+    return GraphAuxLossConfig(**stage1_graph_config_kwargs())
 
 
 def _document(
@@ -35,6 +40,11 @@ def _document(
             "token_chunk_ends": [2, 3],
             "token_call_edges": [{"from": 1, "to": 0}] if graph else [],
             "token_type_edges": [],
+            "token_domain_edges": [],
+            "token_build_edges": [],
+            "token_shell_edges": [],
+            "token_diagnostic_edges": [],
+            "token_cross_domain_edges": [],
         },
     )
 
@@ -47,14 +57,7 @@ def test_incremental_contract_exactly_matches_reference_builder() -> None:
         for task in TaskKind
         for index in range(quotas[task])
     ]
-    graph_config = GraphAuxLossConfig(
-        relations=("call", "type"),
-        global_weight=1.0,
-        indexer_weight=0.001,
-        layer_weight=1.0,
-        bce_weight=0.10,
-        coverage_weight=0.05,
-    )
+    graph_config = _stage1_graph_config()
 
     reference = build_pre_materialized_objective_contract(
         documents,
@@ -111,12 +114,7 @@ def test_each_quota_window_requires_a_materialized_graph_positive() -> None:
         TaskKind.COMMIT_DIFF,
         TaskKind.PRE_TO_POST,
     )
-    graph_config = GraphAuxLossConfig(
-        relations=("call",),
-        global_weight=1.0,
-        bce_weight=0.1,
-        coverage_weight=0.05,
-    )
+    graph_config = _stage1_graph_config()
     accumulator = ObjectiveContractAccumulator(
         rates={task: 1 / len(tasks) for task in tasks},
         seed=17,

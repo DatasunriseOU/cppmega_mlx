@@ -40,6 +40,7 @@ from cppmega_mlx.training.objective_mixer import (
     RealizedObjective,
     validated_packed_commit_binding,
 )
+from cppmega_mlx.data.graph_recipe import validate_stage1_graph_contract
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_CHUNK_ROUTE_COLUMNS,
     OBJECTIVE_GRAPH_RELATION_COLUMNS,
@@ -711,6 +712,7 @@ def write_objective_materialization_artifact(
     graph = payload.get("graph_auxiliary")
     if not isinstance(graph, Mapping):
         raise ValueError("objective contract graph_auxiliary must be an object")
+    validate_stage1_graph_contract(graph)
     pair_mask = graph.get("pair_mask")
     expansion = graph.get("chunk_edge_expansion")
     if pair_mask != "causal_same_document_upstream_v1":

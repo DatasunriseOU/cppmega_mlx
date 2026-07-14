@@ -32,6 +32,7 @@ from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
 )
+from cppmega_mlx.data.graph_recipe import validate_stage1_graph_contract
 
 
 _BUNDLE_SCHEMA = "cppmega_megatron_bundle_v1"
@@ -843,6 +844,7 @@ def _validate_objectives(
         graph = _require_mapping(
             contract.get("graph_auxiliary"), where=f"objective {bucket} graph"
         )
+        validate_stage1_graph_contract(graph)
         if (
             graph.get("pair_mask") != "causal_same_document_upstream_v1"
             or graph.get("chunk_edge_expansion") != "cartesian_token_spans_v1"

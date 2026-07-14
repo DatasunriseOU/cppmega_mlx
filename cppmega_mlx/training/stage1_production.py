@@ -30,6 +30,13 @@ from cppmega_mlx.training.compiled import (
     CompiledPretrainingStep,
     normalize_compiled_batch,
 )
+from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_TOPK,
+    stage1_graph_config_kwargs,
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_config,
+)
 from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ProductionTrainingLossBreakdown,
@@ -42,25 +49,9 @@ PRODUCTION_GRAPH_BETA = 1.0
 PRODUCTION_DOMAIN_RESIDUAL_SCALE = 1.0
 PRODUCTION_DOMAIN_FIELDS = ("domain_ids", "role_ids", "confidence_ids")
 ProductionAttentionMode = Literal["gqa", "dsa"]
-STAGE1_PRODUCTION_GRAPH_RELATIONS = (
-    "call",
-    "type",
-    "domain",
-    "build",
-    "shell",
-    "diagnostic",
-    "cross_domain",
-)
+STAGE1_PRODUCTION_GRAPH_RELATIONS = STAGE1_GRAPH_RELATIONS
 STAGE1_PRODUCTION_GRAPH_LOSS = GraphAuxLossConfig(
-    relations=STAGE1_PRODUCTION_GRAPH_RELATIONS,
-    topk=256,
-    global_weight=1.0,
-    indexer_weight=0.001,
-    layer_weight=1.0,
-    bce_weight=0.10,
-    coverage_weight=0.05,
-    pos_weight=1.0,
-    margin=1.0,
+    **stage1_graph_config_kwargs(),
 )
 
 
@@ -84,12 +75,7 @@ class Stage1ProductionObjective:
     graph_config: GraphAuxLossConfig = STAGE1_PRODUCTION_GRAPH_LOSS
 
     def __post_init__(self) -> None:
-        if tuple(self.graph_config.relations) != STAGE1_PRODUCTION_GRAPH_RELATIONS:
-            raise ValueError(
-                "production Stage-1 graph supervision must cover every route "
-                f"sidecar {STAGE1_PRODUCTION_GRAPH_RELATIONS}, got "
-                f"{tuple(self.graph_config.relations)}"
-            )
+        validate_stage1_graph_config(self.graph_config)
 
     def validate_batch(
         self,
@@ -166,6 +152,7 @@ class Stage1ProductionObjective:
     def receipt(self) -> dict[str, Any]:
         config = self.graph_config
         return {
+            "recipe": stage1_graph_recipe_binding(),
             "formula": "lm_ce + graph_edge_bce + graph_ranking",
             "relations": list(config.relations),
             "topk": config.topk,
@@ -270,6 +257,7 @@ def stage1_production_config(
         "graph_attention_bias_beta": PRODUCTION_GRAPH_BETA,
         "domain_residual_scale": PRODUCTION_DOMAIN_RESIDUAL_SCALE,
         "require_domain_routes": True,
+        "attention_sparse_topk": STAGE1_GRAPH_TOPK,
     }
     conflicts = {
         key: value

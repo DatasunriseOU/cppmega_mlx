@@ -11,26 +11,10 @@ from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM
 from cppmega_mlx.training.compiled import CompiledPretrainingStep
-from cppmega_mlx.training.objective_mixer import GraphAuxLossConfig
 from cppmega_mlx.training.stage1_production import (
-    STAGE1_PRODUCTION_GRAPH_RELATIONS,
     Stage1ProductionObjective,
     stage1_production_config,
 )
-
-
-def _graph_loss_config() -> GraphAuxLossConfig:
-    return GraphAuxLossConfig(
-        relations=STAGE1_PRODUCTION_GRAPH_RELATIONS,
-        topk=1,
-        global_weight=0.5,
-        indexer_weight=0.25,
-        layer_weight=0.5,
-        bce_weight=0.75,
-        coverage_weight=0.25,
-        pos_weight=2.0,
-        margin=0.5,
-    )
 
 
 def _model_config():
@@ -44,7 +28,6 @@ def _model_config():
         num_query_heads=4,
         num_kv_heads=2,
         head_dim=8,
-        attention_sparse_topk=1,
         indexer_heads=2,
         indexer_dim=4,
         indexer_local_window=0,
@@ -124,7 +107,7 @@ def _gradient_l1(gradients: object, *name_fragments: str) -> float:
 
 
 def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None:
-    objective = Stage1ProductionObjective(_graph_loss_config())
+    objective = Stage1ProductionObjective()
     batch = _production_batch(with_edge=True)
     model = _CountingDenseCppLM()
 
@@ -156,14 +139,14 @@ def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None
 
 
 def test_stage1_combined_loss_rejects_a_no_edge_production_batch() -> None:
-    objective = Stage1ProductionObjective(_graph_loss_config())
+    objective = Stage1ProductionObjective()
 
     with pytest.raises(ValueError, match="nonzero graph targets"):
         objective.validate_batch(_production_batch(with_edge=False))
 
 
 def test_stage1_combined_loss_reaches_model_and_graph_indexer_parameters() -> None:
-    objective = Stage1ProductionObjective(_graph_loss_config())
+    objective = Stage1ProductionObjective()
     batch = _production_batch(with_edge=True)
     model = DenseCppLM(_model_config())
     objective.validate_batch(batch)

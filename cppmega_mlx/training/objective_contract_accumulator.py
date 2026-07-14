@@ -23,6 +23,10 @@ from cppmega_mlx.training.objective_data import (
     OBJECTIVE_ROUTE_RECEIPT_SCHEMA,
     OBJECTIVE_ROUTE_RETENTION_SCHEMA,
 )
+from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_config,
+)
 from cppmega_mlx.training.objective_mixer import GraphAuxLossConfig
 from cppmega_mlx.training.task_mixer import TaskKind
 
@@ -241,6 +245,7 @@ class ObjectiveContractAccumulator:
                 "graph auxiliary global weight differs from GraphAuxLossConfig: "
                 f"{graph_weight} != {graph_config.global_weight}"
             )
+        validate_stage1_graph_config(graph_config)
         unknown_relations = sorted(
             set(graph_config.relations) - set(_GRAPH_RELATION_COLUMNS)
         )
@@ -478,6 +483,7 @@ class ObjectiveContractAccumulator:
         graph_config = self._graph_config
         route_retention = self._route_retention_contract()
         graph_auxiliary: dict[str, object] = {
+            "recipe": stage1_graph_recipe_binding(),
             "relations": list(graph_config.relations),
             "eligible_samples": self._eligible_graph_samples,
             "positive_edges": self._positive_edges,

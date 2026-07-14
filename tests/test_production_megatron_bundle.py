@@ -12,6 +12,10 @@ import pytest
 
 import cppmega_mlx.data.production_bundle as production_bundle
 from cppmega_mlx.data.domain_schema import DOMAIN_SCHEMA_SHA256
+from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_binding,
+    stage1_graph_recipe_payload,
+)
 from cppmega_mlx.data.production_bundle import (
     ProductionMegatronDatasetMetadata,
     open_production_megatron_bundle,
@@ -339,8 +343,8 @@ def _build_bundle(
             "loss_mask_alignment": "source_token_predicts_next_v1",
         },
         "graph_auxiliary": {
-            "pair_mask": "causal_same_document_upstream_v1",
-            "chunk_edge_expansion": "cartesian_token_spans_v1",
+            **stage1_graph_recipe_payload(),
+            "recipe": stage1_graph_recipe_binding(),
         },
         "source_snapshot": source_snapshot,
     }

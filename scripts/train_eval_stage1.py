@@ -65,6 +65,10 @@ from cppmega_mlx.training.objective_mixer import (
     ObjectiveSource,
     production_training_loss,
 )
+from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    stage1_graph_config_kwargs,
+)
 from cppmega_mlx.training.objectives import ObjectiveExample
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES, TaskKind
 from cppmega_mlx.runtime.code_verifier import CodeVerifier
@@ -545,15 +549,26 @@ def main() -> None:
         default=0,
         help="objective sample window (0 = 60 * batch; quotas must divide batch)",
     )
-    ap.add_argument("--graph-aux-weight", type=float, default=1.0)
-    ap.add_argument("--graph-indexer-weight", type=float, default=0.001)
-    ap.add_argument("--graph-layer-weight", type=float, default=1.0)
-    ap.add_argument("--graph-bce-weight", type=float, default=0.10)
-    ap.add_argument("--graph-coverage-weight", type=float, default=0.05)
-    ap.add_argument("--graph-topk", type=int, default=32)
+    graph_recipe = stage1_graph_config_kwargs()
+    ap.add_argument(
+        "--graph-aux-weight", type=float, default=graph_recipe["global_weight"]
+    )
+    ap.add_argument(
+        "--graph-indexer-weight", type=float, default=graph_recipe["indexer_weight"]
+    )
+    ap.add_argument(
+        "--graph-layer-weight", type=float, default=graph_recipe["layer_weight"]
+    )
+    ap.add_argument(
+        "--graph-bce-weight", type=float, default=graph_recipe["bce_weight"]
+    )
+    ap.add_argument(
+        "--graph-coverage-weight", type=float, default=graph_recipe["coverage_weight"]
+    )
+    ap.add_argument("--graph-topk", type=int, default=graph_recipe["topk"])
     ap.add_argument(
         "--graph-relations",
-        default="call,type",
+        default=",".join(STAGE1_GRAPH_RELATIONS),
         help="Comma-separated code-graph relations supervised by the indexer",
     )
     # Activation-memory controls (opt-in; default path numerically unchanged).
