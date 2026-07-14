@@ -176,6 +176,22 @@ def _fully_eligible_commit_row(*, filepath: str) -> dict[str, object]:
     return row
 
 
+def _with_current_schema_external_cpp_wrapper(
+    row: dict[str, object],
+) -> dict[str, object]:
+    """Model sidecars created before an outer CPP wrapper was attached."""
+
+    result = dict(row)
+    domain_ids = list(result["token_domain_ids"])
+    confidence_ids = list(result["token_confidence_ids"])
+    for token_index in range(2, 101):
+        domain_ids[token_index] = int(DomainKind.UNKNOWN)
+        confidence_ids[token_index] = int(ParseConfidence.ABSENT)
+    result["token_domain_ids"] = domain_ids
+    result["token_confidence_ids"] = confidence_ids
+    return result
+
+
 def _write_source_rows(path: Path, rows: list[dict[str, object]]) -> None:
     schema = pa.schema(
         [*_SCHEMA, pa.field("doc_ids", pa.list_(pa.uint32()))],
@@ -487,6 +503,75 @@ def test_domain_wrapped_fim_modes_preserve_exact_sidecars(
     )
 
 
+def test_external_cpp_wrapper_ifim_rebinds_domains_from_output_stack(
+    tmp_path: Path,
+) -> None:
+    row = _with_current_schema_external_cpp_wrapper(
+        _fully_eligible_commit_row(filepath="src/external-wrapper.cpp")
+    )
+    source_path = tmp_path / "external-wrapper-ifim.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=20260714))
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.IFIM: 1.0},
+        seed=20260714,
+        spm_rate=1.0,
+    ).materialize(source, step_index=0)
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+
+    source_map = list(realized.example.metadata["source_token_indices"])
+    rebound_output_index = source_map.index(2)
+    assert realized.example.metadata["fim_mode"] == "spm"
+    assert row["token_domain_ids"][2] == int(DomainKind.UNKNOWN)
+    assert document.row["token_domain_ids"][rebound_output_index] == int(DomainKind.CPP)
+    assert (
+        document.row["token_role_ids"][rebound_output_index] == row["token_role_ids"][2]
+    )
+    assert (
+        document.row["token_confidence_ids"][rebound_output_index]
+        == row["token_confidence_ids"][2]
+    )
+    assert document.token_ids[:2] == [2, DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]]
+    assert document.token_ids[-2:] == [
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+        3,
+    ]
+    _assert_domain_stack_values(
+        document.row["input_ids"],
+        document.row["token_domain_ids"],
+        document.row["token_role_ids"],
+        document.row["token_confidence_ids"],
+    )
+
+
+def test_external_cpp_wrapper_rejects_non_unknown_domain_conflict(
+    tmp_path: Path,
+) -> None:
+    row = _with_current_schema_external_cpp_wrapper(
+        _fully_eligible_commit_row(filepath="src/conflicting-wrapper.cpp")
+    )
+    row["token_domain_ids"][2] = int(DomainKind.CMAKE)
+    source_path = tmp_path / "conflicting-wrapper.parquet"
+    _write_source_rows(source_path, [row])
+    source = next(materializer._iter_sources([str(source_path)], seed=20260714))
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.IFIM: 1.0},
+        seed=20260714,
+        spm_rate=1.0,
+    ).materialize(source, step_index=0)
+
+    with pytest.raises(ValueError, match="incompatible with active output domain"):
+        materialize_megatron_document(
+            realized,
+            source,
+            require_production_sidecars=True,
+        )
+
+
 @pytest.mark.parametrize(
     "task",
     (
@@ -731,6 +816,76 @@ def test_full_quota_materialization_accepts_mixed_dependency_and_commit_rows(
         ensure_ascii=True,
     ).encode("ascii")
     assert artifact_set_sha256 == hashlib.sha256(canonical).hexdigest()
+
+
+def test_current_schema_external_wrapper_mix_materializes_full_quota_via_cli(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "current-schema-input"
+    input_dir.mkdir()
+    code_rows: list[dict[str, object]] = []
+    for index in range(3):
+        row = _fully_eligible_commit_row(filepath=f"src/code-{index}.cpp")
+        row.update(
+            {
+                "ifim_instruction_token_ids": [],
+                "commit_msg_token_ids": [],
+                "pre_token_ids": [],
+                "post_token_ids": [],
+                "diff_token_ids": [],
+            }
+        )
+        code_rows.append(_with_current_schema_external_cpp_wrapper(row))
+    commit_rows = [
+        _with_current_schema_external_cpp_wrapper(
+            _fully_eligible_commit_row(filepath=f"src/commit-{index}.cpp")
+        )
+        for index in range(2)
+    ]
+    _write_source_rows(input_dir / "code_temporal_probe.parquet", code_rows)
+    _write_source_rows(input_dir / "commits.parquet", commit_rows)
+    output_dir = tmp_path / "objectives-bound"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.materialize_megatron_objectives",
+            "--data-glob",
+            str(input_dir / "*.parquet"),
+            "--output-dir",
+            str(output_dir),
+            "--samples",
+            "60",
+            "--seq-len",
+            "1024",
+            "--quota-window-samples",
+            "60",
+            "--shard-rows",
+            "15",
+            "--seed",
+            "20260714",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout)["documents"] == 60
+    shard_paths = sorted(output_dir.glob("objectives_*.parquet"))
+    assert len(shard_paths) == 4
+    table = pa.concat_tables([pq.read_table(path) for path in shard_paths])
+    assert table.num_rows == 60
+    for row_index in range(table.num_rows):
+        _assert_converter_equivalent_domain_stack(table, row_index)
+    expected_quotas = EligibilityAwareTaskMixer(
+        STAGE1_DEFAULT_RATES,
+        seed=20260714,
+    ).quotas(60)
+    assert Counter(table["objective_kind"].to_pylist()) == Counter(
+        {task.value: count for task, count in expected_quotas.items()}
+    )
 
 
 def test_actual_case3_multi_physical_mix_materializes_full_quota_via_cli(

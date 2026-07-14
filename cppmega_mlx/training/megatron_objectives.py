@@ -367,6 +367,86 @@ def _domain_stack_defaults(
     return domains, roles, confidence
 
 
+def _bind_domain_stack_sidecars(
+    token_ids: Sequence[int],
+    source_indices: Sequence[int],
+    source_domain_ids: Sequence[int] | None,
+    source_role_ids: Sequence[int] | None,
+    source_confidence_ids: Sequence[int] | None,
+    *,
+    where: str,
+) -> tuple[list[int], list[int], list[int]]:
+    """Bind output domains to delimiters while retaining mapped annotations.
+
+    UNKNOWN source domains inherit the active output wrapper. Any non-zero
+    source domain must already agree with that wrapper.
+    """
+
+    if len(token_ids) != len(source_indices):
+        raise ValueError(f"{where}: source-token map must be token aligned")
+    domains, roles, confidence = _domain_stack_defaults(token_ids, where=where)
+    source_vectors = (
+        ("domain_ids", source_domain_ids),
+        ("role_ids", source_role_ids),
+        ("confidence_ids", source_confidence_ids),
+    )
+    for output_index, source_index in enumerate(source_indices):
+        if source_index == INSERTED_TOKEN_SOURCE_INDEX:
+            continue
+        if source_index < 0:
+            raise ValueError(
+                f"{where}: invalid source-token map index {source_index} at "
+                f"output token {output_index}"
+            )
+        for field, values in source_vectors:
+            if values is not None and not 0 <= source_index < len(values):
+                raise ValueError(
+                    f"{where}: source {field} index {source_index} at output token "
+                    f"{output_index} is outside {len(values)} values"
+                )
+        marker = _DOMAIN_DELIMITER_BY_ID.get(int(token_ids[output_index]))
+        if marker is not None:
+            expected_domain, _direction, _expected_close = marker
+            if (
+                source_domain_ids is not None
+                and int(source_domain_ids[source_index]) != expected_domain
+            ):
+                raise ValueError(
+                    f"{where}: source delimiter {token_ids[output_index]} requires "
+                    f"domain {expected_domain}, got "
+                    f"{source_domain_ids[source_index]}"
+                )
+            if source_role_ids is not None and int(
+                source_role_ids[source_index]
+            ) != int(DomainRoleKind.DELIMITER):
+                raise ValueError(
+                    f"{where}: source delimiter {token_ids[output_index]} requires "
+                    "DELIMITER role"
+                )
+            if source_confidence_ids is not None and int(
+                source_confidence_ids[source_index]
+            ) != int(ParseConfidence.EXACT):
+                raise ValueError(
+                    f"{where}: source delimiter {token_ids[output_index]} requires "
+                    "EXACT confidence"
+                )
+            continue
+        if source_domain_ids is not None:
+            source_domain = int(source_domain_ids[source_index])
+            expected_domain = domains[output_index]
+            if source_domain not in {int(DomainKind.UNKNOWN), expected_domain}:
+                raise ValueError(
+                    f"{where}: source token {source_index} has domain "
+                    f"{source_domain}, incompatible with active output domain "
+                    f"{expected_domain}"
+                )
+        if source_role_ids is not None:
+            roles[output_index] = int(source_role_ids[source_index])
+        if source_confidence_ids is not None:
+            confidence[output_index] = int(source_confidence_ids[source_index])
+    return domains, roles, confidence
+
+
 def _validate_domain_stack_sidecars(
     token_ids: Sequence[int],
     domain_ids: Sequence[int],
@@ -720,6 +800,17 @@ def materialize_megatron_document(
                 row[column] = [0] * len(tokens)
             else:
                 row[column] = _packet_vector(packet, field, length=len(tokens))
+        domains, roles, confidence = _bind_domain_stack_sidecars(
+            tokens,
+            list(range(len(tokens))),
+            row["token_domain_ids"],
+            row["token_role_ids"],
+            row["token_confidence_ids"],
+            where=realized.task.value,
+        )
+        row["token_domain_ids"] = domains
+        row["token_role_ids"] = roles
+        row["token_confidence_ids"] = confidence
         _validate_domain_stack_sidecars(
             tokens,
             row["token_domain_ids"],
@@ -810,26 +901,32 @@ def materialize_megatron_document(
             )
             row[column] = _permute_source_vector(source_values, source_indices)
 
-        domains, roles, confidence = _domain_stack_defaults(
+        source_domains = _source_vector(
+            packet,
+            "domain_ids",
+            source_length=source_length,
+            required=require_production_sidecars,
+        )
+        source_roles = _source_vector(
+            packet,
+            "role_ids",
+            source_length=source_length,
+            required=require_production_sidecars,
+        )
+        source_confidence = _source_vector(
+            packet,
+            "confidence_ids",
+            source_length=source_length,
+            required=require_production_sidecars,
+        )
+        domains, roles, confidence = _bind_domain_stack_sidecars(
             tokens,
+            source_indices,
+            source_domains,
+            source_roles,
+            source_confidence,
             where=realized.task.value,
         )
-        for target, field in (
-            (domains, "domain_ids"),
-            (roles, "role_ids"),
-            (confidence, "confidence_ids"),
-        ):
-            source_values = _source_vector(
-                packet,
-                field,
-                source_length=source_length,
-                required=require_production_sidecars,
-            )
-            if source_values is None:
-                continue
-            for output_index, source_index in enumerate(source_indices):
-                if source_index != INSERTED_TOKEN_SOURCE_INDEX:
-                    target[output_index] = source_values[source_index]
         _validate_domain_stack_sidecars(
             tokens,
             domains,
