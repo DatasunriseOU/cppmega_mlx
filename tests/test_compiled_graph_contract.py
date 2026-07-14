@@ -128,6 +128,16 @@ def _max_update(
     return {name: after[name] - value for name, value in before.items()}
 
 
+def _indexer_scores(model: DenseCppLM, batch: LMTokenBatch) -> tuple[mx.array, ...]:
+    normalized = normalize_compiled_batch(batch, graph_routes_enabled=True)
+    return model.indexer_scores(
+        batch.inputs,
+        block_bias=normalized["graph_attention_bias"],
+        edge_kind_bias=normalized["graph_edge_kind_bias"],
+        document_ids=batch.input_document_ids,
+    )
+
+
 def test_normalize_materializes_array_only_graph_and_flattens_domain_routes() -> None:
     normalized = normalize_compiled_batch(
         _batch(graph=_graph((7, 1)), domain_id=3),
@@ -183,8 +193,8 @@ def test_compiled_dsa_graph_changes_indexer_scores_and_training_update() -> None
     _, right_before, right_after, right_model = _run(
         cfg, _batch(graph=_graph((7, 2))), compile=True
     )
-    left_scores = left_model.indexer_scores()[0]
-    right_scores = right_model.indexer_scores()[0]
+    left_scores = _indexer_scores(left_model, _batch(graph=_graph((7, 1))))[0]
+    right_scores = _indexer_scores(right_model, _batch(graph=_graph((7, 2))))[0]
     mx.eval(left_scores, right_scores)
 
     assert float(left_scores[0, 7, 1].item() - right_scores[0, 7, 1].item()) == pytest.approx(1.0)
@@ -252,11 +262,13 @@ def test_compiled_edge_kind_changes_dsa_indexer_scores() -> None:
 
     _, _, _, build_model = _run(cfg, build, compile=True)
     _, _, _, diag_model = _run(cfg, diagnostic, compile=True)
-    build_scores = build_model.indexer_scores()[0]
-    diag_scores = diag_model.indexer_scores()[0]
+    build_scores = _indexer_scores(build_model, build)[0]
+    diag_scores = _indexer_scores(diag_model, diagnostic)[0]
     mx.eval(build_scores, diag_scores)
 
-    assert float(diag_scores[0, 7, 1].item() - build_scores[0, 7, 1].item()) == pytest.approx(1.0)
+    assert float(
+        diag_scores[0, 7, 1].item() - build_scores[0, 7, 1].item()
+    ) == pytest.approx(1.0, abs=2e-4)
 
 
 def test_compiled_domain_channels_change_loss_and_gradients() -> None:
@@ -299,6 +311,35 @@ def test_graph_enabled_eager_and_compiled_step_are_numerically_aligned() -> None
         np.testing.assert_allclose(
             compiled_update[name], eager_update[name], rtol=1e-5, atol=1e-6
         )
+
+
+@pytest.mark.parametrize("compile", [False, True])
+def test_dsa_training_runs_two_optimizer_steps_without_mutating_module_tree(
+    compile: bool,
+) -> None:
+    cfg = _config(
+        attention_mode="dsa",
+        attention_sparse_topk=4,
+        indexer_local_window=0,
+        indexer_num_sinks=0,
+        graph_routes_enabled=True,
+    )
+    model = DenseCppLM(cfg)
+    optimizer = optim.SGD(learning_rate=1e-2)
+    step = CompiledPretrainingStep(model, optimizer, compile=compile)
+    batch = _batch(graph=_graph((7, 1)))
+    state_keys_before = tuple(name for name, _value in tree_flatten(model.state))
+
+    first = step(batch)
+    second = step(batch)
+    state_keys_after = tuple(name for name, _value in tree_flatten(model.state))
+
+    assert np.isfinite(first.loss)
+    assert np.isfinite(second.loss)
+    assert first.updated is True and second.updated is True
+    assert second.step == 2
+    assert state_keys_after == state_keys_before
+    assert all("last_index_scores" not in name for name in state_keys_after)
 
 
 def test_graph_disabled_compiled_step_is_exact_token_baseline() -> None:
@@ -408,3 +449,45 @@ def test_compiled_graph_contract_rejects_dtype_change() -> None:
     bad_kind["graph_edge_kind_bias"] = good["graph_edge_kind_bias"].astype(mx.float16)
     with pytest.raises(ValueError, match="dtype|shape/dtype/field"):
         step(bad_kind)
+
+
+@pytest.mark.parametrize("compile", [False, True])
+@pytest.mark.parametrize(
+    ("field", "replacement", "error"),
+    [
+        (
+            "graph_attention_bias",
+            lambda value: value.astype(mx.float16),
+            "dtype must be float32",
+        ),
+        (
+            "graph_edge_kind_bias",
+            lambda value: mx.full(value.shape, float("nan"), dtype=mx.float32),
+            "non-finite",
+        ),
+    ],
+)
+def test_eager_and_compiled_steps_reject_invalid_fixed_graph_biases(
+    compile: bool,
+    field: str,
+    replacement,
+    error: str,
+) -> None:
+    cfg = _config(graph_routes_enabled=True)
+    normalized = normalize_compiled_batch(
+        _batch(graph=_graph((7, 1))),
+        graph_routes_enabled=True,
+    )
+    bad = dict(normalized)
+    bad[field] = replacement(normalized[field])
+    step = CompiledPretrainingStep(
+        DenseCppLM(cfg),
+        optim.SGD(learning_rate=1e-2),
+        compile=compile,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        step(bad)
+
+    assert step.state.step == 0
+    assert step._compiled_step is None

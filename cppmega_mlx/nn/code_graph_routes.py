@@ -47,6 +47,7 @@ import numpy as np
 
 from cppmega_mlx.data.graph_packet import GraphBatch, GraphPacket
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
+from cppmega_mlx.data.integer_validation import validated_integer_array
 from cppmega_mlx.nn.domain_graph_routes import DEFAULT_EDGE_WEIGHTS
 
 # Relations we know how to route. ``call`` is always primary (callsite->callee);
@@ -677,7 +678,11 @@ def _validate_graph_document_boundaries(
             "build_token_graph_biases: document_ids must be shaped "
             f"({batch_size},{seq_length}), got {tuple(document_ids.shape)}"
         )
-    docs = np.asarray(document_ids, dtype=np.int64)
+    docs = validated_integer_array(
+        document_ids,
+        where="build_token_graph_biases document_ids",
+        allow_integral_float=False,
+    )
     if np.any(docs < 0):
         raise ValueError("build_token_graph_biases: document_ids must be non-negative")
     for batch_row in range(batch_size):

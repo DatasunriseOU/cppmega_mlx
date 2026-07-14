@@ -45,16 +45,21 @@ production_recipe:
       - document_ids
       - token_chunk_starts
       - token_chunk_ends
+      - token_chunk_kinds
+      - token_chunk_dep_levels
+      - token_call_edges
+      - token_type_edges
       - token_domain_edges
       - token_build_edges
       - token_shell_edges
       - token_diagnostic_edges
       - token_cross_domain_edges
+      - graph_sidecar_schema
       - graph_sidecar_paths
   startup_validation:
     require_nonzero_graph_edges: true
     require_nonzero_graph_prior: true
-    require_nonzero_edge_kind_prior: true
+    require_valid_edge_kind_ids: true
     require_nonzero_domain_tokens: true
     require_nonzero_document_boundaries: true
     require_live_domain_residual_after_update: true

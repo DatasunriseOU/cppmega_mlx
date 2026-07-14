@@ -10,8 +10,11 @@ from typing import Any, Literal
 
 import mlx.core as mx
 import mlx.optimizers as optim
+import numpy as np
 
 from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
+from cppmega_mlx.data.domain_schema import DomainEdgeKind
+from cppmega_mlx.data.graph_packet import GraphBatch
 from cppmega_mlx.data.megatron_indexed import open_megatron_indexed_dataset
 from cppmega_mlx.models.dense_cpp_lm import (
     DenseCppLM,
@@ -140,15 +143,9 @@ def stage1_production_batch_receipt(
     )
     if graph_edges <= 0:
         raise ValueError("production Stage-1 requires nonzero graph edges")
-    edge_kind_edges = sum(
-        int(values.shape[0])
-        for row in lm_batch.graph_batch.edge_kinds
-        for values in row.values()
+    edge_kind_edges, edge_kind_ids = _validate_edge_kind_categories(
+        lm_batch.graph_batch
     )
-    if edge_kind_edges <= 0:
-        raise ValueError(
-            "production Stage-1 requires edge-kind sidecars for graph triples"
-        )
 
     normalized = normalize_compiled_batch(
         lm_batch,
@@ -186,10 +183,6 @@ def stage1_production_batch_receipt(
     domain_tokens_nonzero = int(domain_tokens_array.item())
     if graph_prior_nonzero <= 0:
         raise ValueError("production Stage-1 requires a nonzero graph prior")
-    if edge_kind_prior_nonzero <= 0:
-        raise ValueError(
-            "production Stage-1 requires a nonzero categorical edge-kind prior"
-        )
     if domain_tokens_nonzero <= 0:
         raise ValueError("production Stage-1 requires nonzero domain tokens")
 
@@ -198,6 +191,7 @@ def stage1_production_batch_receipt(
         "attention_mode": config.attention_mode,
         "graph_edges": graph_edges,
         "edge_kind_edges": edge_kind_edges,
+        "edge_kind_ids": edge_kind_ids,
         "graph_relations": sorted(
             {
                 relation
@@ -255,20 +249,25 @@ def run_stage1_graph_domain_production(
 
     if steps < 1:
         raise ValueError("production Stage-1 steps must be positive")
-    dataset = open_megatron_indexed_dataset(
+    startup_dataset = open_megatron_indexed_dataset(
         data_path,
         seq_len=seq_len,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         seed=seed,
-        loop=True,
+        loop=False,
     )
-    first_batch = next(dataset.iter_batches(loop=True))
+    try:
+        first_batch = next(startup_dataset.iter_batches(loop=False))
+    except StopIteration as error:
+        raise ValueError(
+            "production Stage-1 dataset has no complete deterministic startup batch"
+        ) from error
     dtype = mx.bfloat16 if bf16 else None
     model = build_stage1_production_model(
         attention_mode=attention_mode,
         dtype=dtype,
-        vocab_size=dataset.metadata.vocab_size,
+        vocab_size=startup_dataset.metadata.vocab_size,
         hidden_size=hidden_size,
         depth=depth,
         ffn_hidden_size=ffn_hidden_size,
@@ -279,6 +278,15 @@ def run_stage1_graph_domain_production(
     )
     startup = stage1_production_batch_receipt(first_batch, config=model.config)
     print("[stage1-production-startup] " + json.dumps(startup, sort_keys=True), flush=True)
+
+    dataset = open_megatron_indexed_dataset(
+        data_path,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        shuffle=True,
+        seed=seed,
+        loop=True,
+    )
 
     optimizer = optim.AdamW(
         learning_rate=learning_rate,
@@ -310,7 +318,6 @@ def run_stage1_graph_domain_production(
         observed_edges <= 0
         or observed_edge_kind_edges <= 0
         or observed_graph_prior_nonzero <= 0
-        or observed_edge_kind_prior_nonzero <= 0
         or observed_domain_tokens <= 0
         or observed_document_boundaries <= 0
         or last_domain_residual_l1 <= 0.0
@@ -349,6 +356,33 @@ def _validate_stage1_production_config(config: DenseCppLMConfig) -> None:
         )
 
 
+def _validate_edge_kind_categories(
+    graph_batch: GraphBatch,
+) -> tuple[int, list[int]]:
+    if not graph_batch.edge_kinds:
+        raise ValueError(
+            "production Stage-1 requires edge-kind sidecars for graph triples"
+        )
+    known = {int(kind) for kind in DomainEdgeKind}
+    observed: set[int] = set()
+    edge_count = 0
+    for row in graph_batch.edge_kinds:
+        for values in row.values():
+            raw = np.asarray(values)
+            edge_count += int(raw.size)
+            observed.update(int(value) for value in raw.tolist())
+    if edge_count <= 0:
+        raise ValueError(
+            "production Stage-1 requires edge-kind sidecars for graph triples"
+        )
+    unknown = sorted(observed - known)
+    if unknown:
+        raise ValueError(
+            f"production Stage-1 edge-kind sidecars contain unsupported IDs {unknown}"
+        )
+    return edge_count, sorted(observed)
+
+
 def _validate_domain_arrays(
     arrays: dict[str, mx.array],
     *,
@@ -385,10 +419,8 @@ def _batch_route_counts(batch: LMTokenBatch) -> dict[str, int]:
         for graph in lm_batch.graph_batch.graphs
         for edge in graph.edges.values()
     )
-    edge_kind_edges = sum(
-        int(values.shape[0])
-        for row in lm_batch.graph_batch.edge_kinds
-        for values in row.values()
+    edge_kind_edges, _edge_kind_ids = _validate_edge_kind_categories(
+        lm_batch.graph_batch
     )
     normalized = normalize_compiled_batch(lm_batch, graph_routes_enabled=True)
     relation_bias = normalized["graph_attention_bias"]
@@ -423,11 +455,14 @@ def _document_boundary_count(batch: LMTokenBatch) -> int:
     if not isinstance(document_ids, mx.array):
         raise ValueError("production Stage-1 requires document_ids sidecars")
     if document_ids.dtype not in (
+        mx.int8,
         mx.int16,
         mx.int32,
         mx.int64,
+        mx.uint8,
         mx.uint16,
         mx.uint32,
+        mx.uint64,
     ):
         raise ValueError("production document_ids sidecar must be integer")
     invalid = mx.any(document_ids < 0)

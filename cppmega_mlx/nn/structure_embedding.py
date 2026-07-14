@@ -7,6 +7,7 @@ import mlx.nn as nn
 import numpy as np
 
 from cppmega_mlx.data.batch import batch_values_are_prevalidated
+from cppmega_mlx.data.integer_validation import validated_integer_array
 
 
 class StructureEmbedding(nn.Module):
@@ -166,13 +167,14 @@ class StructureEmbedding(nn.Module):
             tensor = inputs[name]
             if tensor is None:
                 continue
-            ids = tensor.astype(mx.int64)
             max_id = int(self._comp_clamp_max[index].item())
-            invalid = mx.any((ids < 0) | (ids > max_id))
-            mx.eval(invalid)
-            if bool(invalid.item()):
-                values = np.asarray(ids)
-                bad = values[(values < 0) | (values > max_id)][:8].tolist()
+            values = validated_integer_array(
+                tensor,
+                where=f"[cppmega-structure] {name}_ids",
+            )
+            invalid = (values < 0) | (values > max_id)
+            if np.any(invalid):
+                bad = values[invalid][:8].tolist()
                 raise ValueError(
                     f"[cppmega-structure] {name}_ids out of range [0,{max_id}]: "
                     f"offending values {bad}; refusing to clamp"

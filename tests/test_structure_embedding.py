@@ -98,6 +98,47 @@ def test_structure_embedding_validates_matching_shapes_for_present_components():
         module(structure_ids=structure_ids, dep_levels=dep_levels)
 
 
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (0.5, "fractional"),
+        (float("nan"), "finite"),
+        (float("inf"), "finite"),
+    ],
+)
+def test_structure_embedding_rejects_invalid_integer_channels_before_cast(
+    value: float,
+    error: str,
+) -> None:
+    module = CppMegaStructureEmbedding(
+        hidden_size=8,
+        active_components="structure",
+        num_categories=4,
+        bottleneck_dim=2,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        module(
+            structure_ids=mx.array([[value]], dtype=mx.float32),
+            dep_levels=None,
+        )
+
+
+def test_structure_embedding_rejects_uint64_overflow_before_cast() -> None:
+    module = CppMegaStructureEmbedding(
+        hidden_size=8,
+        active_components="structure",
+        num_categories=4,
+        bottleneck_dim=2,
+    )
+
+    with pytest.raises(ValueError, match="out of range"):
+        module(
+            structure_ids=mx.array([[2**64 - 1]], dtype=mx.uint64),
+            dep_levels=None,
+        )
+
+
 def test_structure_embedding_returns_scalar_zero_when_no_active_inputs_are_present():
     module = CppMegaStructureEmbedding(hidden_size=16, active_components="core", bottleneck_dim=4)
 

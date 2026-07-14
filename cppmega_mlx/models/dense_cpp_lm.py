@@ -30,18 +30,25 @@ WHAT.  There is no silent fallback path.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from cppmega_mlx.data.batch import batch_values_are_prevalidated, ensure_lm_batch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.graph_packet import GraphBatch
+from cppmega_mlx.data.integer_validation import validated_integer_array
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
-from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
+from cppmega_mlx.nn.attention import (
+    AttentionConfig,
+    CausalSelfAttention,
+    apply_rotary_emb,
+    rotary_inv_freq,
+)
 from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.nn.domain_embedding import CppMegaDomainEmbedding
 from cppmega_mlx.nn.moe import FeedForwardExpert
@@ -256,7 +263,9 @@ class GraphIndexedAttention(nn.Module):
     (per-head ReLU dot + learned graph-prior bias ``beta * S_blk``), selects the
     top-k (+ local window + sinks), and runs dense MLA over the gathered KV via
     :func:`graph_indexed_attention_reference`. The indexer scores are exposed for
-    the indexer losses (KL warm-up / BCE / coverage / contrastive).
+    the indexer losses (KL warm-up / BCE / coverage / contrastive) as an
+    explicit return value. Forward execution never writes activation tensors
+    into the module tree.
     """
 
     def __init__(self, config: DenseCppLMConfig):
@@ -282,8 +291,38 @@ class GraphIndexedAttention(nn.Module):
         self.index_beta = mx.full(
             (1,), config.graph_attention_bias_beta, dtype=mx.float32
         )
-        # Last computed indexer scores (B, S, Skv) for the loss; not a param.
-        self.last_index_scores: mx.array | None = None
+        self.rope_inv_freq = rotary_inv_freq(acfg) if acfg.use_rope else None
+
+    def _rotary_tables(self, seq_len: int) -> tuple[mx.array, mx.array]:
+        if self.rope_inv_freq is None:
+            raise ValueError("DSA RoPE tables requested when rope=False")
+        positions = mx.arange(seq_len, dtype=mx.float32)
+        freqs = mx.outer(positions, self.rope_inv_freq)
+        return mx.cos(freqs)[None, None, :, :], mx.sin(freqs)[None, None, :, :]
+
+    def _project_q_kv(
+        self,
+        hidden_states: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        batch, seq, _ = hidden_states.shape
+        acfg = self.config
+        q = self.q_proj(hidden_states).reshape(
+            batch, seq, acfg.num_q_heads, acfg.q_head_dim
+        )
+        kv = self.kv_proj(hidden_states).reshape(
+            batch, seq, acfg.kv_heads, acfg.q_head_dim
+        )
+        if self.rope_inv_freq is not None:
+            cos, sin = self._rotary_tables(seq)
+            q = mx.transpose(
+                apply_rotary_emb(mx.transpose(q, (0, 2, 1, 3)), cos, sin),
+                (0, 2, 1, 3),
+            )
+            kv = mx.transpose(
+                apply_rotary_emb(mx.transpose(kv, (0, 2, 1, 3)), cos, sin),
+                (0, 2, 1, 3),
+            )
+        return q, kv
 
     def __call__(
         self,
@@ -291,7 +330,7 @@ class GraphIndexedAttention(nn.Module):
         mask: mx.array | Literal["causal"] | None,
         *,
         block_bias: mx.array | None = None,
-    ) -> mx.array:
+    ) -> tuple[mx.array, mx.array]:
         cfg = self._dense_config
         acfg = self.config
         batch, seq, _ = hidden_states.shape
@@ -300,12 +339,7 @@ class GraphIndexedAttention(nn.Module):
                 "DenseCppLM attention_mode='dsa' requires graph route block_bias; "
                 "set require_graph_routes=False only for explicit ablation tests"
             )
-        q = self.q_proj(hidden_states).reshape(
-            batch, seq, acfg.num_q_heads, acfg.q_head_dim
-        )
-        kv = self.kv_proj(hidden_states).reshape(
-            batch, seq, acfg.kv_heads, acfg.q_head_dim
-        )
+        q, kv = self._project_q_kv(hidden_states)
         hi, di = cfg.indexer_heads, cfg.indexer_dim
         q_index = self.index_q_proj(hidden_states).reshape(batch, seq, hi, di)
         k_index = self.index_k_proj(hidden_states).reshape(batch, seq, hi, di)
@@ -325,9 +359,8 @@ class GraphIndexedAttention(nn.Module):
             causal=True,
             return_scores=True,
         )
-        self.last_index_scores = scores
         out = out.reshape(batch, seq, acfg.q_proj_dim)
-        return self.out_proj(out)
+        return self.out_proj(out), scores
 
 
 class DenseCppBlock(nn.Module):
@@ -365,7 +398,7 @@ class DenseCppBlock(nn.Module):
         hidden_states: mx.array,
         mask: mx.array | Literal["causal"] | None,
         block_bias: mx.array | None,
-    ) -> mx.array:
+    ) -> tuple[mx.array, mx.array | None]:
         """The actual block math: norm->attn->residual, norm->FFN->residual.
 
         Kept as a separate method so it can be wrapped by ``mx.checkpoint``
@@ -373,16 +406,36 @@ class DenseCppBlock(nn.Module):
         """
 
         if self.is_dsa:
-            attn_out = self.attention(
+            attn_out, index_scores = self.attention(
                 self.attn_norm(hidden_states), mask, block_bias=block_bias
             )
         else:
             attn_out = self.attention(
                 self.attn_norm(hidden_states), mask, attention_bias=block_bias
             )
+            index_scores = None
         hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
-        return hidden_states
+        return hidden_states, index_scores
+
+    def forward_with_indexer_scores(
+        self,
+        hidden_states: mx.array,
+        mask: mx.array | Literal["causal"] | None,
+        *,
+        block_bias: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array | None]:
+        """Return block output and the DSA score tensor without state mutation."""
+
+        if not self.config.grad_checkpoint:
+            return self._compute(hidden_states, mask, block_bias)
+        params = self.trainable_parameters()
+
+        def _inner(p, h):
+            self.update(p)
+            return self._compute(h, mask, block_bias)
+
+        return mx.checkpoint(_inner)(params, hidden_states)
 
     def __call__(
         self,
@@ -391,22 +444,12 @@ class DenseCppBlock(nn.Module):
         *,
         block_bias: mx.array | None = None,
     ) -> mx.array:
-        if not self.config.grad_checkpoint:
-            return self._compute(hidden_states, mask, block_bias)
-        # Gradient checkpointing. ``mx.checkpoint`` only tracks gradients w.r.t.
-        # the EXPLICIT inputs of the wrapped function, so the block's trainable
-        # parameters MUST be passed through as an argument (params captured by
-        # closure would silently get zero/constant grads). We pass the live
-        # parameter tree in, re-bind it with ``self.update`` inside, then run the
-        # same ``_compute``. Activations are recomputed in backward; the loss and
-        # parameter grads are identical to the non-checkpointed path.
-        params = self.trainable_parameters()
-
-        def _inner(p, h):
-            self.update(p)
-            return self._compute(h, mask, block_bias)
-
-        return mx.checkpoint(_inner)(params, hidden_states)
+        hidden, _index_scores = self.forward_with_indexer_scores(
+            hidden_states,
+            mask,
+            block_bias=block_bias,
+        )
+        return hidden
 
 
 class DenseCppLM(nn.Module):
@@ -581,7 +624,12 @@ class DenseCppLM(nn.Module):
         apply_final_norm: bool = True,
         block_bias: mx.array | None = None,
         edge_kind_bias: mx.array | None = None,
-    ) -> mx.array:
+        return_indexer_scores: bool = False,
+    ) -> mx.array | tuple[mx.array, tuple[mx.array, ...]]:
+        if return_indexer_scores and self.config.attention_mode != "dsa":
+            raise ValueError(
+                "return_indexer_scores=True requires attention_mode='dsa'"
+            )
         batch_size, seq_length = int(input_ids.shape[0]), int(input_ids.shape[1])
         document_ids = _validate_dense_document_ids(
             document_ids,
@@ -619,13 +667,25 @@ class DenseCppLM(nn.Module):
             )
         )
         is_dsa = self.config.attention_mode == "dsa"
+        indexer_scores: list[mx.array] = []
         for layer in self.layers:
             if is_dsa:
-                hidden = layer(hidden, mask, block_bias=block_bias)
+                hidden, scores = layer.forward_with_indexer_scores(
+                    hidden,
+                    mask,
+                    block_bias=block_bias,
+                )
+                if scores is None:
+                    raise RuntimeError(
+                        "DenseCppLM DSA layer did not return indexer scores"
+                    )
+                indexer_scores.append(scores)
             else:
                 hidden = layer(hidden, mask, block_bias=block_bias)
         if apply_final_norm:
-            return self.norm(hidden)
+            hidden = self.norm(hidden)
+        if return_indexer_scores:
+            return hidden, tuple(indexer_scores)
         return hidden
 
     def _resolve_graph_bias(
@@ -637,6 +697,21 @@ class DenseCppLM(nn.Module):
         edge_kind_bias: mx.array | None,
         document_ids: mx.array | None,
     ) -> mx.array | None:
+        expected_shape = (
+            int(input_ids.shape[0]),
+            int(input_ids.shape[1]),
+            int(input_ids.shape[1]),
+        )
+        _validate_fixed_graph_bias(
+            "graph_attention_bias",
+            block_bias,
+            expected_shape=expected_shape,
+        )
+        _validate_fixed_graph_bias(
+            "graph_edge_kind_bias",
+            edge_kind_bias,
+            expected_shape=expected_shape,
+        )
         if not self.config.graph_routes_enabled:
             if block_bias is None:
                 return edge_kind_bias
@@ -679,32 +754,35 @@ class DenseCppLM(nn.Module):
                 bias = bias * mx.array(beta, dtype=bias.dtype)
         return bias
 
-    def indexer_scores(self) -> list[mx.array]:
-        """Return the per-layer indexer score matrices from the last DSA forward.
+    def indexer_scores(
+        self,
+        input_ids: mx.array,
+        *,
+        graph_batch: GraphBatch | None = None,
+        block_bias: mx.array | None = None,
+        edge_kind_bias: mx.array | None = None,
+        **side_channels: mx.array | None,
+    ) -> tuple[mx.array, ...]:
+        """Compute and explicitly return per-layer DSA indexer scores."""
 
-        Only meaningful when ``attention_mode='dsa'``; each entry is the
-        ``(B, S, Skv)`` lightning-indexer score used for the indexer losses.
-        Raises (RULE #1) when the model is not in DSA mode or has not run.
-        """
-
-        if self.config.attention_mode != "dsa":
-            raise ValueError(
-                "indexer_scores() is only available when attention_mode='dsa'"
-            )
-        scores: list[mx.array] = []
-        for layer in self.layers:
-            attn = layer.attention
-            if getattr(attn, "last_index_scores", None) is None:
-                raise RuntimeError(
-                    "indexer_scores(): no scores recorded; run a DSA forward first"
-                )
-            scores.append(attn.last_index_scores)
+        result = self.decoder_hidden_states(
+            input_ids,
+            graph_batch=graph_batch,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            apply_final_norm=False,
+            return_indexer_scores=True,
+            **side_channels,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("DenseCppLM failed to return DSA indexer scores")
+        _hidden, scores = result
         return scores
 
-    def validate_compiled_batch(
+    def validate_training_batch(
         self, batch: dict[str, mx.array | None]
     ) -> None:
-        """Validate array values before ``mx.compile`` traces the train step."""
+        """Validate host-visible batch values before eager or compiled steps."""
 
         lm_batch = ensure_lm_batch(batch)
         expected_bias_shape = (
@@ -725,19 +803,11 @@ class DenseCppLM(nn.Module):
             ("graph_attention_bias", relation_bias),
             ("graph_edge_kind_bias", kind_bias),
         ):
-            if bias is None:
-                continue
-            if tuple(bias.shape) != expected_bias_shape:
-                raise ValueError(
-                    f"{name} shape must be {expected_bias_shape}, got "
-                    f"{tuple(bias.shape)}"
-                )
-            if bias.dtype != mx.float32:
-                raise ValueError(f"{name} dtype must be float32, got {bias.dtype}")
-            finite = mx.all(mx.isfinite(bias))
-            mx.eval(finite)
-            if not bool(finite.item()):
-                raise ValueError(f"{name} contains non-finite values")
+            _validate_fixed_graph_bias(
+                name,
+                bias,
+                expected_shape=expected_bias_shape,
+            )
 
         document_ids = lm_batch.input_document_ids
         if document_ids is not None:
@@ -763,6 +833,15 @@ class DenseCppLM(nn.Module):
                         "document boundary"
                     )
 
+        self.structure_embedding.validate_inputs(
+            structure_ids=lm_batch.structure_ids,
+            dep_levels=lm_batch.dep_levels,
+            ast_depth_ids=lm_batch.ast_depth_ids,
+            sibling_index_ids=lm_batch.sibling_index_ids,
+            node_type_ids=lm_batch.node_type_ids,
+        )
+        self.platform_embedding.validate_input_ids(lm_batch.platform_ids)
+
         if self.config.domain_residual_scale:
             if self.domain_embedding is None:
                 raise RuntimeError(
@@ -775,6 +854,13 @@ class DenseCppLM(nn.Module):
                 expected_shape=tuple(int(x) for x in lm_batch.tokens.shape),
                 require_all=self.config.require_domain_routes,
             )
+
+    def validate_compiled_batch(
+        self, batch: dict[str, mx.array | None]
+    ) -> None:
+        """Backward-compatible alias for the unified training validator."""
+
+        self.validate_training_batch(batch)
 
     def logits(
         self,
@@ -1038,6 +1124,30 @@ class DenseCppLM(nn.Module):
 # ---------------------------------------------------------------------- #
 # Helpers
 # ---------------------------------------------------------------------- #
+def _validate_fixed_graph_bias(
+    name: str,
+    bias: mx.array | None,
+    *,
+    expected_shape: tuple[int, int, int],
+) -> None:
+    if bias is None:
+        return
+    if not isinstance(bias, mx.array):
+        raise TypeError(f"{name} must be an mx.array, got {type(bias).__name__}")
+    if tuple(bias.shape) != expected_shape:
+        raise ValueError(
+            f"{name} must be shaped {expected_shape}, got {tuple(bias.shape)}"
+        )
+    if bias.dtype != mx.float32:
+        raise ValueError(f"{name} dtype must be float32, got {bias.dtype}")
+    if batch_values_are_prevalidated():
+        return
+    finite = mx.all(mx.isfinite(bias))
+    mx.eval(finite)
+    if not bool(finite.item()):
+        raise ValueError(f"{name} contains non-finite values")
+
+
 def _scaled(residual: mx.array, scale: float, like: mx.array) -> mx.array:
     if scale == 1.0:
         return residual
@@ -1093,11 +1203,14 @@ def _validate_dense_document_ids(
             f"document_ids dtype must be integer, got {document_ids.dtype}"
         )
     if not batch_values_are_prevalidated():
-        negative = mx.any(document_ids.astype(mx.int32) < 0)
-        mx.eval(negative)
-        if bool(negative.item()):
+        values = validated_integer_array(
+            document_ids,
+            where="document_ids",
+            allow_integral_float=False,
+        )
+        if np.any(values < 0):
             raise ValueError("document_ids must be non-negative")
-    return document_ids.astype(mx.int32)
+    return document_ids
 
 
 def _check_platform_ids(

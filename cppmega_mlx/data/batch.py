@@ -12,6 +12,7 @@ import mlx.core as mx
 import numpy as np
 
 from cppmega_mlx.data.graph_packet import GraphBatch
+from cppmega_mlx.data.integer_validation import validated_integer_array
 
 SideChannelDropoutPolicy = Mapping[str, float]
 
@@ -115,6 +116,8 @@ class LMTokenBatch:
                     f"targets shape {self.targets.shape}, got {self.loss_mask.shape}"
                 )
         if self.document_ids is not None:
+            if not isinstance(self.document_ids, mx.array):
+                raise TypeError("document_ids must be an mlx array")
             if self.document_ids.ndim != 2:
                 raise ValueError(
                     f"document_ids must be shaped (B, S), got {self.document_ids.shape}"
@@ -125,10 +128,10 @@ class LMTokenBatch:
                     f"{self.tokens.shape}, got {self.document_ids.shape}"
                 )
             if not batch_values_are_prevalidated():
-                has_negative_doc = mx.any(self.document_ids.astype(mx.int32) < 0)
-                mx.eval(has_negative_doc)
-                if bool(has_negative_doc.item()):
-                    raise ValueError("document_ids must be non-negative")
+                _validate_document_id_values(
+                    self.document_ids,
+                    where="document_ids",
+                )
         if self.platform_ids is not None:
             if self.platform_ids.ndim not in (2, 3):
                 raise ValueError(
@@ -228,13 +231,13 @@ class LMTokenBatch:
     def input_document_ids(self) -> mx.array | None:
         if self.document_ids is None:
             return None
-        return self._input_aligned(self.document_ids).astype(mx.int32)
+        return self._input_aligned(self.document_ids)
 
     @property
     def target_document_ids(self) -> mx.array | None:
         if self.document_ids is None:
             return None
-        return self._target_aligned(self.document_ids).astype(mx.int32)
+        return self._target_aligned(self.document_ids)
 
     def structure_fields(self) -> dict[str, mx.array | None]:
         return {
@@ -473,11 +476,24 @@ def _document_ids_from_mapping(batch: Mapping[str, Any]) -> Any | None:
     alias = present[0]
     value = batch[alias]
     if not batch_values_are_prevalidated():
-        has_negative_doc = mx.any(value.astype(mx.int32) < 0)
-        mx.eval(has_negative_doc)
-        if bool(has_negative_doc.item()):
-            raise ValueError(f"{alias} must be non-negative")
+        _validate_document_id_values(value, where=alias)
     return value
+
+
+def _validate_document_id_values(value: Any, *, where: str) -> None:
+    if not isinstance(value, mx.array):
+        raise TypeError(f"{where} must be an mlx array")
+    try:
+        validated_integer_array(
+            value,
+            where=where,
+            min_value=0,
+            allow_integral_float=False,
+        )
+    except ValueError as error:
+        if "values must be >= 0" in str(error):
+            raise ValueError(f"{where} must be non-negative") from error
+        raise
 
 
 def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTokenBatch:

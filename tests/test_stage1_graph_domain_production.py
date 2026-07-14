@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import subprocess
+import sys
 
 import mlx.core as mx
 import pytest
@@ -27,6 +29,7 @@ def _production_batch(
     domain_id: int = 3,
     include_edge_kinds: bool = True,
     include_document_ids: bool = True,
+    edge_kind: DomainEdgeKind | int = DomainEdgeKind.DIAG_PRIMARY_LOCATION,
 ) -> LMTokenBatch:
     tokens = mx.array([[2, 3, 5, 7, 11, 13, 17, 19]], dtype=mx.int32)
     graph = None
@@ -47,7 +50,7 @@ def _production_batch(
             edge_kinds=(
                 {
                     "domain": mx.array(
-                        [int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)],
+                        [int(edge_kind)],
                         dtype=mx.int32,
                     )
                 }
@@ -117,6 +120,7 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
     assert receipt["edge_kind_edges"] == 1
+    assert receipt["edge_kind_ids"] == [int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)]
     assert receipt["edge_kind_prior_nonzero"] == 1
     assert receipt["domain_tokens_nonzero"] == 8
     assert receipt["document_boundaries"] == 1
@@ -129,6 +133,29 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
     ]
 
 
+def test_stage1_production_accepts_valid_categories_with_zero_kind_delta() -> None:
+    cfg = stage1_production_config(
+        vocab_size=64,
+        hidden_size=32,
+        depth=1,
+        ffn_hidden_size=64,
+        max_seq_length=8,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        ngram_hash_enabled=False,
+    )
+
+    receipt = stage1_production_batch_receipt(
+        _production_batch(edge_kind=DomainEdgeKind.BUILD_TARGET_DEP),
+        config=cfg,
+    )
+
+    assert receipt["edge_kind_ids"] == [int(DomainEdgeKind.BUILD_TARGET_DEP)]
+    assert receipt["edge_kind_edges"] == 1
+    assert receipt["edge_kind_prior_nonzero"] == 0
+
+
 @pytest.mark.parametrize(
     ("batch", "error"),
     [
@@ -136,6 +163,7 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
         (_production_batch(include_domain=False), "domain sidecars"),
         (_production_batch(domain_id=0), "nonzero domain tokens"),
         (_production_batch(include_edge_kinds=False), "edge-kind sidecars"),
+        (_production_batch(edge_kind=999), "unsupported IDs"),
         (_production_batch(include_document_ids=False), "document_ids"),
     ],
 )
@@ -201,6 +229,26 @@ def test_named_stage1_trainers_route_explicit_recipe_through_canonical_runner() 
         assert "run_stage1_graph_domain_production" in source
 
 
+def test_named_stage1_trainers_import_in_fresh_subprocess() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import scripts.train_stage1; "
+                "import scripts.train_eval_stage1; "
+                "import scripts.train_realshard"
+            ),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_stage1_yaml_declares_fail_closed_graph_domain_recipe() -> None:
     text = (
         ROOT / "configs" / "stage1_cpp_foundation_dense500m.yaml"
@@ -213,5 +261,16 @@ def test_stage1_yaml_declares_fail_closed_graph_domain_recipe() -> None:
     assert "required_sidecars:" in text
     assert "schema: cppmega_graph_routes_v2" in text
     assert "token_domain_edges" in text
+    for required_key in (
+        "token_chunk_kinds",
+        "token_chunk_dep_levels",
+        "token_call_edges",
+        "token_type_edges",
+        "graph_sidecar_schema",
+        "graph_sidecar_paths",
+    ):
+        assert required_key in text
     assert "document_ids" in text
     assert "require_nonzero_document_boundaries: true" in text
+    assert "require_valid_edge_kind_ids: true" in text
+    assert "require_nonzero_edge_kind_prior" not in text

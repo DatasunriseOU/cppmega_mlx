@@ -49,6 +49,7 @@ class Dense500MConversionConfig:
     domain_num_roles: int = 128
     domain_num_confidences: int = 8
     domain_bottleneck_dim: int = 32
+    attention_mode: Literal["gqa", "dsa"] = "gqa"
 
     @property
     def q_proj_dim(self) -> int:
@@ -85,6 +86,15 @@ DOMAIN_SOURCE_TO_TARGET: dict[str, str] = {
 # a reason. The allowlist is intentionally empty for this narrow checkpoint
 # family: every model tensor is either mapped or conversion fails.
 UNMAPPED_SOURCE_TENSOR_ALLOWLIST: dict[str, str] = {}
+
+
+def _require_supported_attention_mode(cfg: Dense500MConversionConfig) -> None:
+    if cfg.attention_mode != "gqa":
+        raise NotImplementedError(
+            "Dense500M checkpoint conversion supports attention_mode='gqa' only; "
+            "DSA indexer projections and graph-bias parameters do not have an "
+            "implemented Megatron-to-MLX mapping"
+        )
 
 
 def qkv_source_rows(
@@ -207,6 +217,7 @@ def build_key_plan(
     *,
     source_keys: set[str] | None = None,
 ) -> list[KeyPlan]:
+    _require_supported_attention_mode(cfg)
     plan = [
         KeyPlan("embedding.word_embeddings.weight", "token_embedding.weight"),
         KeyPlan("embedding.word_embeddings.weight", "lm_head.weight"),
@@ -312,6 +323,7 @@ def _make_target_model(
     bf16: bool,
     domain_tensors_present: bool = False,
 ):
+    _require_supported_attention_mode(cfg)
     mx, _tree_flatten, DenseCppLM, DenseCppLMConfig = _import_runtime()
     dtype = mx.bfloat16 if bf16 else None
     model_cfg = DenseCppLMConfig(
@@ -323,7 +335,7 @@ def _make_target_model(
         num_query_heads=cfg.num_query_heads,
         num_kv_heads=cfg.num_kv_heads,
         head_dim=cfg.head_dim,
-        attention_mode="gqa",
+        attention_mode=cfg.attention_mode,
         structure_components=cfg.structure_components,
         structure_num_categories=cfg.structure_num_categories,
         structure_max_dep_level=cfg.structure_max_dep_level,
@@ -757,6 +769,7 @@ def convert_checkpoint(
     bf16: bool = True,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    _require_supported_attention_mode(cfg)
     mx, _tree_flatten, _DenseCppLM, _DenseCppLMConfig = _import_runtime()
     iter_dir = resolve_checkpoint_iter(checkpoint)
     metadata = read_dcp_metadata(iter_dir)
@@ -807,6 +820,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--seq-len", type=int, default=1024)
+    ap.add_argument(
+        "--attention-mode",
+        choices=("gqa", "dsa"),
+        default="gqa",
+        help="DSA is accepted for explicit fail-closed rejection only",
+    )
     ap.add_argument("--fp32", action="store_true", help="write fp32 instead of bf16")
     ap.add_argument("--dry-run", action="store_true")
     return ap.parse_args()
@@ -814,7 +833,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cfg = Dense500MConversionConfig(max_seq_length=args.seq_len)
+    cfg = Dense500MConversionConfig(
+        max_seq_length=args.seq_len,
+        attention_mode=args.attention_mode,
+    )
     manifest = convert_checkpoint(
         args.checkpoint,
         args.output,

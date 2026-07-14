@@ -1788,23 +1788,25 @@ class CompiledPretrainingStep:
             graph_routes_enabled=graph_routes_enabled,
         )
         batch_is_prevalidated = False
-        if self.compile:
+        validator = getattr(self.model, "validate_training_batch", None)
+        if validator is None and self.compile:
             validator = getattr(self.model, "validate_compiled_batch", None)
-            if callable(validator):
-                validator(batch_dict)
-                batch_is_prevalidated = True
+        if callable(validator):
+            validator(batch_dict)
+            batch_is_prevalidated = True
+        if self.compile:
             self._check_compiled_batch_signature(batch_dict)
         pending_microbatches = self._pending_microbatches + 1
         do_update = pending_microbatches == self.grad_accum_steps
 
         start = time.perf_counter()
-        if self.compile:
-            validation_context = (
-                prevalidated_batch_values()
-                if batch_is_prevalidated
-                else nullcontext()
-            )
-            with validation_context:
+        validation_context = (
+            prevalidated_batch_values()
+            if batch_is_prevalidated
+            else nullcontext()
+        )
+        with validation_context:
+            if self.compile:
                 if self._compiled_step is None:
                     self._compiled_step = self._build_compiled_step()
                 loss, ntokens, self._grad_accum = self._compiled_step(
@@ -1812,12 +1814,12 @@ class CompiledPretrainingStep:
                     self._grad_accum,
                     do_update,
                 )
-        else:
-            loss, ntokens, self._grad_accum = self._eager_step(
-                batch_dict,
-                self._grad_accum,
-                do_update,
-            )
+            else:
+                loss, ntokens, self._grad_accum = self._eager_step(
+                    batch_dict,
+                    self._grad_accum,
+                    do_update,
+                )
         mx.eval(
             self.model.state,
             self.optimizer.state,

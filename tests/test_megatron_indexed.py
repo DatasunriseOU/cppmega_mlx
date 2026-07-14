@@ -265,6 +265,25 @@ def _write_structured_multishard_fixture(
     return prefixes
 
 
+def _attach_graph_sidecars(prefix: Path) -> None:
+    payload = json.loads(prefix.with_suffix(".idx.json").read_text(encoding="utf-8"))
+    payload.update(
+        _write_graph_sidecars(
+            prefix,
+            call_edges=[np.array([[0, 1]], dtype=np.int32)],
+            type_edges=[np.zeros((0, 2), dtype=np.int32)],
+            chunk_starts=[np.array([0, 4], dtype=np.uint32)],
+            chunk_ends=[np.array([4, 8], dtype=np.uint32)],
+            chunk_kinds=[np.array([1, 2], dtype=np.uint16)],
+            chunk_dep_levels=[np.array([0, 1], dtype=np.uint16)],
+        )
+    )
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
 def _run_train_hybrid_tiny(
     *args: str,
     timeout_seconds: int,
@@ -757,6 +776,56 @@ def test_megatron_multishard_schema_mismatch_fails_closed(tmp_path) -> None:
         open_megatron_indexed_dataset(tmp_path, seq_len=4, batch_size=2)
 
 
+@pytest.mark.parametrize(
+    "mismatch",
+    ["presence", "schema", "keys", "dtypes", "coordinate_spaces"],
+)
+def test_megatron_multishard_graph_schema_mismatch_fails_at_construction(
+    tmp_path,
+    mismatch: str,
+) -> None:
+    prefixes = _write_structured_multishard_fixture(
+        tmp_path,
+        shard_docs=[
+            [np.arange(8, dtype=np.int32)],
+            [np.arange(100, 108, dtype=np.int32)],
+        ],
+    )
+    _attach_graph_sidecars(prefixes[0])
+    if mismatch != "presence":
+        _attach_graph_sidecars(prefixes[1])
+        second_sidecar = prefixes[1].with_suffix(".idx.json")
+        payload = json.loads(second_sidecar.read_text(encoding="utf-8"))
+        graph_paths = payload["graph_sidecar_paths"]
+        if mismatch == "schema":
+            payload["graph_sidecar_schema"] = "cppmega_graph_routes_v2"
+            for key, entry in graph_paths.items():
+                entry["coordinate_space"] = (
+                    "chunk_index"
+                    if key
+                    in {
+                        "token_call_edges",
+                        "token_type_edges",
+                        "token_chunk_kinds",
+                        "token_chunk_dep_levels",
+                    }
+                    else "token_index"
+                )
+        elif mismatch == "keys":
+            graph_paths.pop("token_type_edges")
+        elif mismatch == "dtypes":
+            graph_paths["token_chunk_kinds"]["dtype"] = "int16"
+        elif mismatch == "coordinate_spaces":
+            graph_paths["token_call_edges"]["coordinate_space"] = "chunk_index"
+        second_sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="graph sidecar presence/schema/keys/dtypes/coordinate spaces",
+    ):
+        open_megatron_indexed_dataset(tmp_path, seq_len=8, batch_size=1)
+
+
 def test_train_script_accepts_multishard_megatron_directory(tmp_path) -> None:
     _write_structured_multishard_fixture(
         tmp_path,
@@ -1058,6 +1127,38 @@ def test_mmididx_document_ids_are_sliced_to_lm_batch(tmp_path, sidecar) -> None:
         np.array([[0, 0, 0], [1, 1, 1]], dtype=np.int32),
     )
     assert "document_ids" not in batch.model_kwargs()
+
+
+def test_mmididx_uint64_document_ids_preserve_wide_boundaries(tmp_path) -> None:
+    prefix = tmp_path / "wide_document_ids"
+    _write_mmididx(prefix, [np.arange(4, dtype=np.int32)], dtype=np.int32)
+    doc_ids = np.array([2**31, 2**31, 2**32, 0], dtype=np.uint64)
+    doc_ids.tofile(tmp_path / "wide_doc_ids.bin")
+    prefix.with_suffix(".idx.json").write_text(
+        json.dumps(
+            {
+                "doc_ids": {
+                    "path": "wide_doc_ids.bin",
+                    "dtype": "uint64",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    batch = next(
+        MegatronIndexedDataset(prefix, seq_len=4, batch_size=1).iter_batches()
+    )
+
+    assert batch.document_ids is not None
+    assert batch.document_ids.dtype == mx.uint64
+    np.testing.assert_array_equal(np.asarray(batch.document_ids), doc_ids[None, :])
+    assert batch.input_document_ids is not None
+    assert batch.input_document_ids.dtype == mx.uint64
+    np.testing.assert_array_equal(
+        np.asarray(batch.input_document_ids),
+        doc_ids[None, :-1],
+    )
 
 
 def test_mmididx_top_level_side_channel_entry_is_supported(tmp_path) -> None:

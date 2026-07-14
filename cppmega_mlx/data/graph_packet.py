@@ -18,32 +18,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
+
+from cppmega_mlx.data.integer_validation import (
+    as_int32_array,
+    validated_integer_array,
+)
 
 
 def _as_int_vector(value: Any, *, where: str) -> mx.array:
     """Coerce ``value`` to a 1-D int32 mx.array, raising with WHERE on failure."""
 
-    if isinstance(value, mx.array):
-        arr = value
-    elif isinstance(value, np.ndarray):
-        arr = mx.array(value)
-    elif isinstance(value, (list, tuple)):
-        arr = mx.array(np.asarray(value, dtype=np.int32)) if len(value) else mx.array(
-            np.zeros((0,), dtype=np.int32)
-        )
-    else:
-        raise TypeError(
-            f"EdgeIndex {where}: expected mx.array/np.ndarray/list, got {type(value).__name__}"
-        )
+    arr = as_int32_array(value, where=f"EdgeIndex {where}")
     if arr.ndim != 1:
         raise ValueError(
             f"EdgeIndex {where}: expected a 1-D vector, got shape {tuple(arr.shape)}"
         )
-    return arr.astype(mx.int32)
+    return arr
 
 
 @dataclass(frozen=True)
@@ -103,14 +97,16 @@ class EdgeIndex:
     ) -> "EdgeIndex":
         """Build an EdgeIndex from an ``(E, 2)`` list/array of ``(src, dst)`` pairs."""
 
-        if isinstance(pairs, mx.array):
-            arr = np.asarray(cast(mx.array, pairs).astype(mx.int32))
-        elif isinstance(pairs, np.ndarray):
-            arr = pairs
+        if isinstance(pairs, mx.array | np.ndarray):
+            raw = pairs
         else:
-            arr = np.asarray(list(pairs), dtype=np.int32) if len(pairs) else np.zeros(
-                (0, 2), dtype=np.int32
-            )
+            raw = list(pairs)
+        arr = validated_integer_array(
+            raw,
+            where=f"EdgeIndex.from_pairs[{relation}]",
+            min_value=int(np.iinfo(np.int32).min),
+            max_value=int(np.iinfo(np.int32).max),
+        )
         if arr.size == 0:
             arr = arr.reshape(0, 2)
         if arr.ndim != 2 or arr.shape[1] != 2:
@@ -141,7 +137,12 @@ class EdgeIndex:
         row has been selected.
         """
 
-        vals = np.asarray(values if not isinstance(values, mx.array) else np.asarray(values))
+        vals = validated_integer_array(
+            values,
+            where=f"EdgeIndex.from_padded[{relation}] values",
+            min_value=int(np.iinfo(np.int32).min),
+            max_value=int(np.iinfo(np.int32).max),
+        )
         if vals.ndim != 2 or vals.shape[1] != 2:
             raise ValueError(
                 f"EdgeIndex.from_padded[{relation}]: expected (E, 2) values, got "
@@ -151,7 +152,12 @@ class EdgeIndex:
         if mask is None:
             mask_arr = None
         else:
-            mask_arr = np.asarray(mask if not isinstance(mask, mx.array) else np.asarray(mask))
+            mask_arr = validated_integer_array(
+                mask,
+                where=f"EdgeIndex.from_padded[{relation}] mask",
+                min_value=int(np.iinfo(np.int32).min),
+                max_value=int(np.iinfo(np.int32).max),
+            )
             if mask_arr.shape != (vals.shape[0],):
                 raise ValueError(
                     f"EdgeIndex.from_padded[{relation}]: mask shape "

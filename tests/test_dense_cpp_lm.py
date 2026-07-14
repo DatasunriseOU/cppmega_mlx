@@ -345,7 +345,11 @@ def test_dense_graph_routes_and_attention_do_not_cross_documents(
         atol=1e-6,
     )
     if attention_mode == "dsa":
-        scores = model.indexer_scores()[0]
+        scores = model.indexer_scores(
+            right,
+            graph_batch=graph,
+            document_ids=document_ids,
+        )[0]
         mx.eval(scores)
         assert np.all(np.asarray(scores)[0, 4:, :4] < -1e8)
 
@@ -705,12 +709,10 @@ def test_dsa_graph_batch_changes_indexer_scores_with_production_beta():
     graph = _single_token_chunk_graph(8, [[7, 1]])
     empty = _single_token_chunk_graph(8, [])
 
-    model(tokens, graph_batch=graph)
-    graph_scores = model.indexer_scores()[0]
+    graph_scores = model.indexer_scores(tokens, graph_batch=graph)[0]
     mx.eval(graph_scores)
     graph_scores_np = np.asarray(graph_scores).copy()
-    model(tokens, graph_batch=empty)
-    empty_scores = model.indexer_scores()[0]
+    empty_scores = model.indexer_scores(tokens, graph_batch=empty)[0]
     mx.eval(empty_scores)
 
     assert graph_scores_np[0, 7, 1] - np.asarray(empty_scores)[0, 7, 1] == pytest.approx(1.0)

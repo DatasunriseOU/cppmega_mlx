@@ -303,6 +303,22 @@ class CodePacket:
             num_nodes = int(self.chunk_starts.shape[0])
         return GraphPacket(edges=edges, num_nodes=num_nodes)
 
+    def graph_edge_kinds(self) -> dict[str, mx.array]:
+        """Return domain edge kinds in the exact corresponding edge order."""
+
+        edge_kinds: dict[str, mx.array] = {}
+        for relation, field_name in (
+            ("domain", "domain_edges"),
+            ("build", "build_edges"),
+            ("shell", "shell_edges"),
+            ("diagnostic", "diagnostic_edges"),
+            ("cross_domain", "cross_domain_edges"),
+        ):
+            edge = getattr(self, field_name)
+            if edge is not None:
+                edge_kinds[relation] = edge.kind
+        return edge_kinds
+
     def graph_batch(self) -> GraphBatch:
         """Return this packet's routes and chunk layout as a typed graph batch."""
 
@@ -333,6 +349,7 @@ class CodePacket:
         empty = mx.zeros((0,), dtype=mx.int32)
         starts = self.chunk_starts if self.chunk_starts is not None else empty
         ends = self.chunk_ends if self.chunk_ends is not None else empty
+        edge_kinds = self.graph_edge_kinds()
         return GraphBatch(
             graphs=(self.graph_packet(),),
             chunk_starts=(starts,),
@@ -343,6 +360,7 @@ class CodePacket:
             chunk_dep_levels=()
             if self.chunk_dep_levels is None
             else (self.chunk_dep_levels,),
+            edge_kinds=(edge_kinds,) if edge_kinds else (),
         )
 
 

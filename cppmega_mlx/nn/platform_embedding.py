@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from cppmega_mlx.data.batch import batch_values_are_prevalidated
+from cppmega_mlx.data.integer_validation import validated_integer_array
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
 
 
@@ -43,9 +45,9 @@ class PlatformEmbedding(nn.Module):
             return mx.array(0.0, dtype=dtype)
         self._validate_shape(platform_ids)
 
-        ids = platform_ids.astype(mx.int64)
         if not batch_values_are_prevalidated():
-            self._validate_range(ids)
+            self._validate_range(platform_ids)
+        ids = platform_ids.astype(mx.int64)
         embeddings = self.embedding(ids)
         mask = (ids != 0)[..., None].astype(embeddings.dtype)
         if ids.ndim == 2:
@@ -62,7 +64,7 @@ class PlatformEmbedding(nn.Module):
         if platform_ids is None:
             return
         self._validate_shape(platform_ids)
-        self._validate_range(platform_ids.astype(mx.int64))
+        self._validate_range(platform_ids)
 
     def _validate_shape(self, platform_ids: mx.array) -> None:
         if platform_ids.ndim not in (2, 3):
@@ -76,12 +78,10 @@ class PlatformEmbedding(nn.Module):
             )
 
     def _validate_range(self, ids: mx.array) -> None:
-        has_negative = mx.any(ids < 0)
-        too_large = mx.any(ids >= self.vocab_size)
-        mx.eval(has_negative, too_large)
-        if bool(has_negative.item()):
+        values = validated_integer_array(ids, where="platform_ids")
+        if np.any(values < 0):
             raise ValueError("platform_ids must be non-negative")
-        if bool(too_large.item()):
+        if np.any(values >= self.vocab_size):
             raise ValueError(
                 f"platform_ids must be less than vocab_size={self.vocab_size}"
             )

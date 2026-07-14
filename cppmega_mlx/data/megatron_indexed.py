@@ -16,6 +16,7 @@ from cppmega_mlx.config.model import (
     MEGACPP_TOKENIZER_VOCAB_SIZE,
 )
 from cppmega_mlx.data.batch import LMTokenBatch
+from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.token_dataset import BatchCursor, TokenDatasetMetadata
 from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
@@ -143,6 +144,7 @@ _GRAPH_RELATION_BY_KEY = {
     "token_diagnostic_edges": "diagnostic",
     "token_cross_domain_edges": "cross_domain",
 }
+_KNOWN_GRAPH_EDGE_KIND_IDS = frozenset(int(kind) for kind in DomainEdgeKind)
 
 _INDEX_DTYPES: dict[int, np.dtype] = {
     1: np.dtype(np.uint8),
@@ -334,6 +336,11 @@ class MegatronIndexedDataset:
             prefix=resolved.prefix,
             metadata_path=resolved.metadata_path,
             sequence_count=int(sequence_lengths.shape[0]),
+        )
+        self._graph_sidecar_schema = (
+            str(sidecar["graph_sidecar_schema"])
+            if self._graph_sidecars
+            else None
         )
         self.index_metadata = MegatronIndexedMetadata(
             bin_path=self.bin_path,
@@ -556,7 +563,10 @@ class MegatronIndexedDataset:
         if "hunk_ids" in side_channels:
             side_channels["hunk_ids"].fill(-1)
         document_ids = (
-            np.zeros((sample_idx.shape[0], self.seq_len), dtype=np.int32)
+            np.zeros(
+                (sample_idx.shape[0], self.seq_len),
+                dtype=self._document_ids.dtype,
+            )
             if self._document_ids is not None
             else None
         )
@@ -1009,6 +1019,11 @@ class _MultiShardSchema:
     side_channel_dtypes: tuple[tuple[str, str], ...]
     document_ids_present: bool
     document_ids_dtype: str | None
+    graph_sidecars_present: bool
+    graph_sidecar_schema: str | None
+    graph_sidecar_keys: tuple[str, ...]
+    graph_sidecar_dtypes: tuple[tuple[str, str], ...]
+    graph_sidecar_coordinate_spaces: tuple[tuple[str, str | None], ...]
 
 
 def _find_multishard_prefixes(path: Path) -> tuple[Path, ...]:
@@ -1037,7 +1052,9 @@ def _validate_multishard_schema(
         if schema != reference:
             raise ValueError(
                 "Megatron multi-shard schema mismatch: token dtype, side-channel "
-                "keys/dtypes, and document-id sidecars must match across shards"
+                "keys/dtypes, document-id sidecars, and graph sidecar "
+                "presence/schema/keys/dtypes/coordinate spaces must match "
+                "across shards"
             )
     return reference
 
@@ -1049,6 +1066,9 @@ def _single_shard_schema(shard: MegatronIndexedDataset) -> _MultiShardSchema:
     side_channel_dtypes = tuple(
         (key, shard._side_channels[key].dtype.name) for key in side_channel_keys
     )
+    graph_sidecar_keys = tuple(
+        key for key in _GRAPH_SIDECAR_KEYS if key in shard._graph_sidecars
+    )
     return _MultiShardSchema(
         token_dtype=shard.index_metadata.dtype,
         side_channel_keys=side_channel_keys,
@@ -1056,6 +1076,17 @@ def _single_shard_schema(shard: MegatronIndexedDataset) -> _MultiShardSchema:
         document_ids_present=shard._document_ids is not None,
         document_ids_dtype=(
             None if shard._document_ids is None else shard._document_ids.dtype.name
+        ),
+        graph_sidecars_present=bool(graph_sidecar_keys),
+        graph_sidecar_schema=shard._graph_sidecar_schema,
+        graph_sidecar_keys=graph_sidecar_keys,
+        graph_sidecar_dtypes=tuple(
+            (key, shard._graph_sidecars[key].dtype.name)
+            for key in graph_sidecar_keys
+        ),
+        graph_sidecar_coordinate_spaces=tuple(
+            (key, shard._graph_sidecars[key].coordinate_space)
+            for key in graph_sidecar_keys
         ),
     )
 
@@ -1364,6 +1395,16 @@ def _parse_graph_sidecar_entry(
         if expected_values == 0
         else np.memmap(data_path, mode="r", dtype=dtype)
     )
+    if key in _GRAPH_TRIPLE_EDGE_KEYS and expected_values:
+        kinds = np.asarray(data).reshape(-1, 3)[:, 2]
+        unknown = sorted(
+            set(int(value) for value in np.unique(kinds))
+            - _KNOWN_GRAPH_EDGE_KIND_IDS
+        )
+        if unknown:
+            raise ValueError(
+                f"{key} graph sidecar contains unsupported edge kind ids {unknown}"
+            )
     return _GraphSidecarStorage(
         key=key,
         kind=kind,
@@ -1630,9 +1671,7 @@ def _to_document_id_values(values: np.ndarray) -> np.ndarray:
         raise ValueError("document_ids must use an integer dtype")
     if np.any(values < 0):
         raise ValueError("document_ids must be non-negative")
-    if np.any(values > np.iinfo(np.int32).max):
-        raise ValueError("document_ids exceed int32 range")
-    return values.astype(np.int32, copy=False)
+    return values
 
 
 def _declares_side_channel(value: Any) -> bool:

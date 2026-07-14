@@ -8,6 +8,7 @@ import pytest
 
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
 
 
@@ -39,6 +40,24 @@ def test_edge_index_from_padded_with_mask() -> None:
 def test_edge_index_src_dst_mismatch_raises() -> None:
     with pytest.raises(ValueError, match="src/dst length mismatch"):
         EdgeIndex(src=_ids([0, 1]), dst=_ids([0]), relation="call")
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (mx.array([0.5], dtype=mx.float32), "fractional"),
+        (mx.array([float("nan")], dtype=mx.float32), "finite"),
+        (mx.array([float("inf")], dtype=mx.float32), "finite"),
+        (mx.array([2**31], dtype=mx.int64), "2147483647"),
+        (mx.array([2**64 - 1], dtype=mx.uint64), "2147483647"),
+    ],
+)
+def test_edge_index_rejects_invalid_integer_values_before_cast(
+    value: mx.array,
+    error: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=error):
+        EdgeIndex(src=value, dst=mx.zeros((1,), dtype=mx.int32), relation="call")
 
 
 def test_graph_packet_block_aggregate() -> None:
@@ -108,6 +127,35 @@ def test_code_packet_full_population_and_validation() -> None:
     gp = packet.graph_packet()
     assert set(gp.relations) == {"call", "type"}
     assert gp.edge("call").to_pairs() == [(0, 1)]
+
+
+def test_code_packet_preserves_domain_edge_kind_order_through_input_alignment() -> None:
+    packet = CodePacket(
+        token_ids=_ids([1, 2, 3, 4]),
+        domain_edges=DomainEdgeIndex.from_triples(
+            [
+                (0, 1, 60),
+                (2, 3, 20),
+                (3, 0, 21),
+            ]
+        ),
+    )
+
+    graph_batch = packet.graph_batch()
+    np.testing.assert_array_equal(
+        np.asarray(graph_batch.edge_kinds[0]["domain"]),
+        np.array([60, 20, 21], dtype=np.int32),
+    )
+    aligned = graph_batch.input_aligned(
+        source_sequence_length=4,
+        input_sequence_length=3,
+    )
+
+    assert aligned.graphs[0].edge("domain").to_pairs() == [(0, 1)]
+    np.testing.assert_array_equal(
+        np.asarray(aligned.edge_kinds[0]["domain"]),
+        np.array([60], dtype=np.int32),
+    )
 
 
 def test_code_packet_misaligned_channel_raises() -> None:

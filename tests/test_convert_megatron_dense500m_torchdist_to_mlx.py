@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 import pytest
 
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
@@ -151,6 +151,30 @@ def test_key_plan_folds_megatron_af_layers_into_dense_blocks():
         "decoder.layers.3.mlp.linear_fc1.layer_norm_weight",
         "layers.1.ffn_norm.weight",
     ) in plan
+
+
+def test_converter_rejects_unsupported_dsa_checkpoint_mapping() -> None:
+    mod = _load_module()
+    cfg = mod.Dense500MConversionConfig(attention_mode="dsa")
+
+    with pytest.raises(NotImplementedError, match="DSA indexer projections"):
+        mod.build_key_plan(cfg)
+
+
+def test_converter_module_imports_in_fresh_subprocess() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import scripts.convert_megatron_dense500m_torchdist_to_mlx",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_key_plan_splits_gqa_qkv_and_swiglu_fc1_rows():
