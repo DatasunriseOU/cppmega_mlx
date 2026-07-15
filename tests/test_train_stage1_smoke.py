@@ -22,11 +22,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.fim import FIMSpecialTokenIds
+from cppmega_mlx.data.ast_fim import domain_preserving_document_spans
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM
 from cppmega_mlx.training.objectives import build_causal_lm
-from cppmega_mlx.training.task_mixer import TaskKind
 from scripts.train_stage1 import (
     _ALIGNED_OBJECTIVES,
     _REORDERED_OBJECTIVES,
@@ -101,6 +100,38 @@ def test_commit_loader_requires_and_preserves_typed_upstream_fields(
     assert np.asarray(packets[0].post_token_ids).tolist() == [20, 21]
     assert np.asarray(packets[0].diff_token_ids).tolist() == [30, 31, 32]
     assert np.asarray(packets[0].commit_msg).tolist() == [40, 41]
+
+
+def test_code_loader_preserves_packed_document_ids_for_domain_fim(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "packed_code.parquet"
+    token_ids = [2, 191, 41, 192, 2, 191, 42, 192]
+    row = {
+        "input_ids": [token_ids],
+        "target_ids": [token_ids],
+        "loss_mask": [[1] * len(token_ids)],
+        "doc_ids": [[1, 1, 1, 1, 2, 2, 2, 2]],
+        "valid_token_count": [len(token_ids)],
+        "token_structure_ids": [[0] * len(token_ids)],
+        "token_dep_levels": [[0] * len(token_ids)],
+        "token_ast_depth": [[0] * len(token_ids)],
+        "token_sibling_index": [[0] * len(token_ids)],
+        "token_ast_node_type": [[0] * len(token_ids)],
+        "token_symbol_ids": [[0] * len(token_ids)],
+        "token_call_targets": [[0] * len(token_ids)],
+        "token_type_refs": [[0] * len(token_ids)],
+        "token_def_use": [[0] * len(token_ids)],
+        "token_chunk_starts": [[1, 5]],
+        "token_chunk_ends": [[3, 7]],
+        "token_chunk_kinds": [[1, 1]],
+        "token_chunk_dep_levels": [[0, 0]],
+    }
+    pq.write_table(pa.table(row), path)
+
+    packet = load_code_packets([path], vocab_size=VOCAB)[0]
+    assert np.asarray(packet.document_ids).tolist() == [1, 1, 1, 1, 2, 2, 2, 2]
+    assert len(domain_preserving_document_spans(packet)) == 2
 
 
 def test_commit_loader_rejects_legacy_rendered_wrapper_fixture() -> None:

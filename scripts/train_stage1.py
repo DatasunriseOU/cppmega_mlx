@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# ruff: noqa: E402
 """Stage-1 end-to-end multi-objective training smoke for the dense C++ LM.
 
 This script ties the whole Stage-1 pipeline together on a tiny, fast profile:
@@ -152,7 +153,21 @@ def load_code_packets(
                     "token_symbol_ids",
                     "token_call_targets",
                     "token_type_refs",
+                    "token_source_identity_ids",
                 }:
+                    return _u64(vals)
+                return _i32(vals)
+
+            def optional_chan(name: str) -> mx.array | None:
+                if row.get(name) is None:
+                    return None
+                vals = _col(row[name])[:vtc]
+                if len(vals) != vtc:
+                    raise ValueError(
+                        f"{path.name}[row={row_index}].{name}: length {len(vals)} "
+                        f"!= valid_token_count {vtc}"
+                    )
+                if name == "token_source_identity_ids":
                     return _u64(vals)
                 return _i32(vals)
 
@@ -165,6 +180,9 @@ def load_code_packets(
                 token_ids=_i32(tokens),
                 target_ids=chan("target_ids"),
                 loss_mask=chan("loss_mask"),
+                document_ids=optional_chan("doc_ids")
+                if row.get("doc_ids") is not None
+                else optional_chan("document_ids"),
                 structure_ids=chan("token_structure_ids"),
                 dep_levels=chan("token_dep_levels"),
                 ast_depth=chan("token_ast_depth"),
@@ -173,6 +191,13 @@ def load_code_packets(
                 symbol_ids=chan("token_symbol_ids"),
                 call_targets=chan("token_call_targets"),
                 type_refs=chan("token_type_refs"),
+                domain_ids=optional_chan("token_domain_ids"),
+                role_ids=optional_chan("token_role_ids"),
+                entity_ids=optional_chan("token_entity_ids"),
+                scope_ids=optional_chan("token_scope_ids"),
+                source_doc_ids=optional_chan("token_source_doc_ids"),
+                source_identity_ids=optional_chan("token_source_identity_ids"),
+                confidence_ids=optional_chan("token_confidence_ids"),
                 repo=str(row.get("repo")) if row.get("repo") is not None else None,
                 filepath=str(row.get("filepath"))
                 if row.get("filepath") is not None
