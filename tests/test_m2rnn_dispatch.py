@@ -3,9 +3,8 @@
 These tests verify that :class:`cppmega_mlx.nn.m2rnn.M2RNNMixer` honors the
 :class:`cppmega_mlx.runtime.kernel_policy.KernelPath` selection and records
 the actual kernel used into the dispatch log. AUTO may use the pure-MLX
-fallback when the retired direct-MSL Path B surface is unavailable, while
-explicit PATH_B records the reference-backed baseline and explicit PATH_C
-exercises the TileLang route.
+reference when Metal is unavailable, while explicit PATH_B records the owned
+Metal kernel and explicit PATH_C exercises the TileLang route.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from cppmega_mlx.nn.m2rnn import (
     M2RNNConfig,
     M2RNNMixer,
     M2RNNMixerState,
-    PATH_B_REFERENCE_BASELINE_KERNEL,
 )
 from cppmega_mlx.runtime.kernel_policy import (
     KernelPath,
@@ -89,7 +87,7 @@ def test_reference_policy_forces_pure_mlx(monkeypatch: pytest.MonkeyPatch) -> No
     assert matches[-1]["kernel_used"] == "reference_pure_mlx"
 
 
-def test_path_b_policy_uses_reference_baseline_after_direct_msl_retirement() -> None:
+def test_path_b_policy_uses_owned_fail_closed_metal_kernel() -> None:
     previous = os.environ.get("CPPMEGA_KERNEL_PATH")
     try:
         os.environ["CPPMEGA_KERNEL_PATH"] = "path_b"
@@ -103,7 +101,7 @@ def test_path_b_policy_uses_reference_baseline_after_direct_msl_retirement() -> 
             os.environ["CPPMEGA_KERNEL_PATH"] = previous
     matches = [e for e in get_dispatch_log() if e["op_name"] == "m2rnn"]
     assert matches[-1]["path"] == "path_b"
-    assert matches[-1]["kernel_used"] == PATH_B_REFERENCE_BASELINE_KERNEL
+    assert matches[-1]["kernel_used"] == "metal_kernel_fwd_v1"
 
 
 def test_path_c_dispatches_grouped_heads_without_path_b_fallback(
