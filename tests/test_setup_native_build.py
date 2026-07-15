@@ -25,6 +25,20 @@ def test_native_build_dependencies_are_declared() -> None:
     assert "websockets>=12" in pyproject["project"]["optional-dependencies"]["gui"]
 
 
+def test_mlx_cmake_probe_ignores_workspace_pythonpath() -> None:
+    from setup import _mlx_probe_environment
+
+    probe_env = _mlx_probe_environment(
+        {
+            "PYTHONPATH": "/workspace/mlx/python:/workspace/tilelang",
+            "PATH": "/usr/bin",
+        }
+    )
+
+    assert "PYTHONPATH" not in probe_env
+    assert probe_env["PATH"] == "/usr/bin"
+
+
 def test_native_build_pins_cmake_to_invoking_python(monkeypatch) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     monkeypatch.syspath_prepend(str(repo_root))

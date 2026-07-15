@@ -22,6 +22,7 @@ from cppmega_mlx.training._quantize_8bit import (
     QUANT_BIAS,
     QUANT_RANGE,
     QUANT_SCHEME_DYNAMIC,
+    QUANT_SCHEME_MXFP4,
     QUANT_SCHEME_SYMMETRIC,
     QUANT_SCHEMES,
     create_dynamic_map,
@@ -875,7 +876,12 @@ def test_quant_schemes_constants_pinned() -> None:
 
     assert QUANT_SCHEME_SYMMETRIC == "symmetric_int8_v1"
     assert QUANT_SCHEME_DYNAMIC == "dynamic_int8_v1"
-    assert set(QUANT_SCHEMES) == {QUANT_SCHEME_SYMMETRIC, QUANT_SCHEME_DYNAMIC}
+    assert QUANT_SCHEME_MXFP4 == "mxfp4_e2m1_v1"
+    assert set(QUANT_SCHEMES) == {
+        QUANT_SCHEME_SYMMETRIC,
+        QUANT_SCHEME_DYNAMIC,
+        QUANT_SCHEME_MXFP4,
+    }
     assert ADAM8BIT_QUANT_SCHEMES == QUANT_SCHEMES
 
 

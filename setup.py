@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from setuptools import setup
@@ -9,12 +10,19 @@ import nanobind
 from mlx import extension
 
 
+def _mlx_probe_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    probe_env = dict(environ)
+    probe_env.pop("PYTHONPATH", None)
+    return probe_env
+
+
 def _target_mlx_cmake_root() -> Path:
     probe = subprocess.run(
         [sys.executable, "-m", "mlx", "--cmake-dir"],
         check=False,
         capture_output=True,
         text=True,
+        env=_mlx_probe_environment(os.environ),
     )
     if probe.returncode == 0 and probe.stdout.strip():
         runtime_root = Path(probe.stdout.strip()).resolve()

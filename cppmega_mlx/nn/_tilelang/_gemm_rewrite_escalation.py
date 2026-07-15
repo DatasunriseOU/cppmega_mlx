@@ -47,7 +47,6 @@ z3 ``unknown``).
 
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import subprocess
@@ -924,6 +923,12 @@ def escalate_obligation(
             tile_k=obligation.tile_k,
             k_steps=obligation.k_steps,
         )
+        # A concrete counterexample is already a definitive refutation.  Do
+        # not ask the optional secondary backend to re-prove a known failure:
+        # that would turn a useful witness into an unrelated "backend missing"
+        # result and hide the actual production defect.
+        if primary.counter_witness is not None:
+            return primary
         if primary.proved:
             return primary
         # z3-concrete could not decide -> SECONDARY egglog cross-check.
