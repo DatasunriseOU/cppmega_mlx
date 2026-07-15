@@ -1554,6 +1554,7 @@ def test_mamba3_fp8_train_production_schedule_spec_is_explicit_and_abi_complete(
     assert spec.buffer_extent == LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH
     assert spec.brick_ops == spec.op_signature
     assert set(spec.brick_schedule_families) == {
+        "lane_sequential_reverse_scan",
         "loop_descriptor_dataflow",
     }
     assert "mamba3_mimo:descriptor_codegen_ready" in (

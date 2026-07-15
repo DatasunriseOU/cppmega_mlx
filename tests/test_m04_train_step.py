@@ -60,8 +60,7 @@ DEFAULT_FUSION_COMPILE_RECEIPT = ROOT / "reports" / "path_c_fusion_compile_recei
 PRODUCTION_FUSION_COMPILE_RECEIPT = (
     ROOT / "reports" / "path_c_fusion_production_smoke_receipt.json"
 )
-LOCAL_MLX_PYTHON = Path("/Volumes/external/sources/mlx/python")
-LOCAL_MLX_LIB = LOCAL_MLX_PYTHON / "mlx" / "lib"
+LOCAL_MLX_SOURCE_ENV = "CPPMEGA_MLX_SOURCE_ROOT"
 BASELINE_RECEIPT = ROOT / "bench" / "baselines" / "m04_train_step.json"
 GB10_SAMPLE = (
     ROOT
@@ -81,6 +80,23 @@ REAL_PARQUET_COLUMNS = (
     "token_sibling_index",
     "token_ast_node_type",
 )
+
+
+def _subprocess_python_abi_tag() -> str:
+    interpreter = PYTHON if PYTHON.exists() else Path(sys.executable)
+    probe = "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')"
+    result = subprocess.run(
+        [str(interpreter), "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip().isdigit():
+        raise RuntimeError(
+            f"failed to inspect child Python ABI via {interpreter}: "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout.strip()
 
 
 def _write_m04_token_parquet(
@@ -512,6 +528,7 @@ def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(tmp_path: Path) 
     (source_root / "3rdparty" / "tvm" / "python").mkdir(parents=True)
     (build_root / "lib").mkdir(parents=True)
     (build_root / "tvm").mkdir(parents=True)
+    (build_root / "lib" / "libtilelang.so").touch()
 
     with temporary_env(
         {
@@ -527,6 +544,36 @@ def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(tmp_path: Path) 
         assert str(build_root / "lib") in os.environ["DYLD_LIBRARY_PATH"].split(
             os.pathsep
         )
+
+
+def test_tilelang_dev_env_rejects_stub_only_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "tl_apache_tvm_swap"
+    build_root = source_root / "build"
+    (source_root / "tilelang").mkdir(parents=True)
+    (build_root / "lib").mkdir(parents=True)
+    (build_root / "tvm").mkdir(parents=True)
+    (build_root / "lib" / "libcudart_stub.so").touch()
+    monkeypatch.setattr(
+        m04_train_step,
+        "_tilelang_dev_roots",
+        lambda: (source_root,),
+    )
+
+    with temporary_env(
+        {
+            "TILELANG_DEV_BUILD_ROOT": str(source_root),
+            "TVM_LIBRARY_PATH": None,
+            "DYLD_LIBRARY_PATH": None,
+        }
+    ):
+        m04_train_step.ensure_tilelang_dev_env_for_path_c()
+
+        assert os.environ["TILELANG_DEV_BUILD_ROOT"] == str(source_root)
+        assert "TVM_LIBRARY_PATH" not in os.environ
+        assert "DYLD_LIBRARY_PATH" not in os.environ
 
 
 def test_m04_import_preserves_recipes_package_exports() -> None:
@@ -606,17 +653,28 @@ def test_non_path_c_keeps_mlx_cache_default(tmp_path: Path) -> None:
 
 def run_script(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    pythonpath = [str(ROOT)]
-    if LOCAL_MLX_PYTHON.exists():
-        pythonpath.insert(0, str(LOCAL_MLX_PYTHON))
-    if env.get("PYTHONPATH"):
-        pythonpath.append(env["PYTHONPATH"])
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
-    if LOCAL_MLX_LIB.exists():
-        dyld_path = [str(LOCAL_MLX_LIB)]
-        if env.get("DYLD_LIBRARY_PATH"):
-            dyld_path.append(env["DYLD_LIBRARY_PATH"])
-        env["DYLD_LIBRARY_PATH"] = os.pathsep.join(dyld_path)
+    # Keep the child hermetic. An interactive shell may export a source-checkout
+    # MLX runtime whose dylib ABI does not match the pinned wheel in this venv.
+    # A source fork is opt-in and must match the exact test interpreter ABI.
+    env["PYTHONPATH"] = str(ROOT)
+    env.pop("DYLD_LIBRARY_PATH", None)
+    source_root_value = env.get(LOCAL_MLX_SOURCE_ENV)
+    if source_root_value:
+        source_root = Path(source_root_value).expanduser().resolve()
+        python_root = source_root / "python"
+        if (source_root / "mlx").is_dir():
+            python_root = source_root
+        abi_tag = _subprocess_python_abi_tag()
+        extension_name = f"core.cpython-{abi_tag}-darwin.so"
+        extension = python_root / "mlx" / extension_name
+        lib_root = python_root / "mlx" / "lib"
+        if not extension.is_file() or not (lib_root / "libmlx.dylib").is_file():
+            raise RuntimeError(
+                f"{LOCAL_MLX_SOURCE_ENV}={source_root} has no MLX runtime ABI "
+                f"for child Python ABI {abi_tag}"
+            )
+        env["PYTHONPATH"] = os.pathsep.join([str(python_root), str(ROOT)])
+        env["DYLD_LIBRARY_PATH"] = str(lib_root)
     result = subprocess.run(
         [str(PYTHON if PYTHON.exists() else sys.executable), str(SCRIPT), *args],
         cwd=ROOT,
@@ -678,6 +736,19 @@ def tiny_args(output: Path, *, steps: int = 1) -> list[str]:
         str(output),
         "--json",
     ]
+
+
+def test_run_script_rejects_explicit_mlx_source_with_wrong_child_abi(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "mlx-source"
+    lib_root = source_root / "python" / "mlx" / "lib"
+    lib_root.mkdir(parents=True)
+    (lib_root / "libmlx.dylib").touch()
+
+    with temporary_env({LOCAL_MLX_SOURCE_ENV: str(source_root)}):
+        with pytest.raises(RuntimeError, match="has no MLX runtime ABI"):
+            run_script(*tiny_args(tmp_path / "receipt.json"))
 
 
 def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
@@ -1912,7 +1983,10 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     )
     assert set(
         route["path_c_fusion"]["production_schedule"]["brick_schedule_families"]
-    ) == {"loop_descriptor_dataflow"}
+    ) == {
+        "lane_sequential_reverse_scan",
+        "loop_descriptor_dataflow",
+    }
     assert "mamba3_mimo:descriptor_codegen_ready" in (
         route["path_c_fusion"]["production_schedule"]["brick_descriptor_statuses"]
     )
@@ -2426,6 +2500,18 @@ def _model_route_direct_chain_mx_buffers(
     return buffers
 
 
+def _model_route_direct_chain_token_batch(
+    model: Any,
+    buffers: Mapping[str, mx.array],
+) -> dict[str, mx.array]:
+    seq_len = int(
+        buffers["local_gb10_quarter_brick_11_R_hidden_after"].shape[1]
+    )
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+    return {"tokens": tokens}
+
+
 def _model_route_direct_chain_artifacts(
     model: Any | None = None,
     *,
@@ -2883,7 +2969,7 @@ def test_path_c_direct_chain_runtime_value_and_grad_uses_loss_cotangent_bridge(
 
     (loss, ntokens), grads = runtime.value_and_grad(
         model,
-        {},
+        _model_route_direct_chain_token_batch(model, buffers),
         forbidden_loss_and_grad,
     )
     flat = dict(tree_flatten(grads))
@@ -2963,6 +3049,13 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
 
     artifacts = tuple(_artifact_for_segment(segment) for segment in chain.segments)
 
+    def _collapsed_segment_events(values: Sequence[str]) -> list[str]:
+        return [
+            value
+            for index, value in enumerate(values)
+            if index == 0 or values[index - 1] != value
+        ]
+
     class _ForwardBoundaryBridge(_ContractedLossCotangentBridge):
         def __call__(
             self,
@@ -2973,11 +3066,13 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
             required_loss_cotangent_buffers: Sequence[str],
             chain: Any,
         ) -> dict[str, Any]:
-            assert events == [
+            collapsed_forward_events = _collapsed_segment_events(events)
+            assert collapsed_forward_events == [
                 "segment:0:forward",
                 "segment:1:forward",
                 "segment:2:forward",
                 "segment:3:forward",
+                "segment:4:forward",
             ]
             events.append("loss_cotangent_bridge")
             return super().__call__(
@@ -3006,23 +3101,33 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
     def forbidden_loss_and_grad(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("Path C direct runtime must not delegate to eager")
 
-    runtime.value_and_grad(model, {}, forbidden_loss_and_grad)
+    runtime.value_and_grad(
+        model,
+        _model_route_direct_chain_token_batch(model, buffers),
+        forbidden_loss_and_grad,
+    )
 
-    # Metal forward fusion cap -> 4 forward segments (0-3) execute, then the loss
-    # cotangent bridge fires at the forward/backward boundary, then the 5 backward
-    # segments (4-8) run. The bridge boundary is unchanged; only the forward
-    # segment count grew (the 4-op forward mega-kernel is split into 4 segments).
-    assert events == [
+    # Metal forward fusion cap plus row-chunk isolation produces 5 forward
+    # segments. The backward cap produces 7 backward segments. Launcher-chunk
+    # segments may invoke their artifact repeatedly, but segment order and the
+    # single cotangent bridge boundary remain exact.
+    assert events.count("loss_cotangent_bridge") == 1
+    bridge_index = events.index("loss_cotangent_bridge")
+    assert _collapsed_segment_events(events[:bridge_index]) == [
         "segment:0:forward",
         "segment:1:forward",
         "segment:2:forward",
         "segment:3:forward",
-        "loss_cotangent_bridge",
-        "segment:4:backward",
+        "segment:4:forward",
+    ]
+    assert _collapsed_segment_events(events[bridge_index + 1 :]) == [
         "segment:5:backward",
         "segment:6:backward",
         "segment:7:backward",
         "segment:8:backward",
+        "segment:9:backward",
+        "segment:10:backward",
+        "segment:11:backward",
     ]
 
 
