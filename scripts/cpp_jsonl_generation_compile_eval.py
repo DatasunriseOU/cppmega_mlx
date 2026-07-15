@@ -3,8 +3,7 @@
 
 This is the MLX-side counterpart of the Nebius/H200 Megatron generation wrapper:
 it consumes the same ``cpp_docstring_compile_cases.jsonl`` shape, writes
-``completions.jsonl``, then optionally invokes the shared compile/run gate from
-``../cppmega/scripts/cpp_generation_compile_eval.py``.
+``completions.jsonl``, then invokes this repository's compile/run gate.
 
 Only native MLX DenseCppLM checkpoints are supported here. Megatron ``torch_dist``
 checkpoints must be converted before this script can evaluate them locally.
@@ -81,7 +80,7 @@ FIM_INSTRUCTION_TOKEN = "<FIM_INSTRUCTION>"
 
 DEFAULT_TOKENIZER = REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
 DEFAULT_CASES = REPO_ROOT / "evals" / "cpp_generation_cases.jsonl"
-DEFAULT_COMPILE_GATE = REPO_ROOT.parent / "cppmega" / "scripts" / "cpp_generation_compile_eval.py"
+DEFAULT_COMPILE_GATE = REPO_ROOT / "scripts" / "cpp_generation_compile_eval.py"
 MODEL_SIDE_CHANNEL_NAMES = (
     "structure_ids",
     "dep_levels",

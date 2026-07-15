@@ -15,12 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "cpp_jsonl_generation_compile_eval.py"
 CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
-CASE3_COMPILE_GATE = (
-    ROOT.parent
-    / "cppmega_case3_prompt"
-    / "scripts"
-    / "cpp_generation_compile_eval.py"
-)
+CASE3_COMPILE_GATE = ROOT / "scripts" / "cpp_generation_compile_eval.py"
 
 
 def _load_module():
@@ -29,6 +24,13 @@ def _load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_default_compile_gate_is_repo_local() -> None:
+    mod = _load_module()
+
+    assert mod.DEFAULT_COMPILE_GATE == CASE3_COMPILE_GATE
+    assert CASE3_COMPILE_GATE.is_file()
 
 
 def test_prompt_text_modes_use_comment_instruction_and_source_spans():
