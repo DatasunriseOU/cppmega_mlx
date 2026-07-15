@@ -1119,6 +1119,24 @@ def discover_project_domain_files(
                         continue
                     raise
                 adapter = resolve_domain_parser(path, text)
+        except ValueError as exc:
+            # Signature-based candidates are opportunistic.  Repository trees
+            # commonly contain generated/binary ``.txt`` and log artifacts;
+            # malformed bytes in those files must not abort discovery of the
+            # rest of the project.  Explicit domain paths and extensionless
+            # files that resolved to a typed adapter remain fail-closed.
+            message = str(exc)
+            if (
+                signature_candidate
+                and not explicit_candidate
+                and not ambiguous_extensionless
+                and (
+                    message.startswith("binary domain input contains NUL byte")
+                    or message.startswith("invalid UTF-8 domain input")
+                )
+            ):
+                continue
+            raise
         except OSError as exc:
             if explicit_candidate or not ambiguous_extensionless:
                 raise OSError(f"failed to read domain input {path}: {exc}") from exc

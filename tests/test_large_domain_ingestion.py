@@ -473,3 +473,33 @@ def test_large_domain_policy_skips_untyped_and_rejects_malformed_text(
     monkeypatch.setattr(Path, "open", fail_open)
     with pytest.raises(OSError, match="failed to read domain input.*simulated"):
         discover_project_domain_files(unreadable_root)
+
+
+def test_domain_discovery_skips_binary_generic_text_candidates(
+    tmp_path: Path,
+) -> None:
+    generic = tmp_path / "compiler-output.txt"
+    generic.write_bytes(b"error: invalid candidate\0binary payload")
+
+    assert discover_project_domain_files(tmp_path) == []
+
+
+def test_domain_discovery_skips_non_utf8_generic_text_candidates(
+    tmp_path: Path,
+) -> None:
+    generic = tmp_path / "compiler-output.txt"
+    generic.write_bytes(b"error: invalid candidate\xff")
+
+    assert discover_project_domain_files(tmp_path) == []
+
+
+@pytest.mark.parametrize("name", ["module.py", "script.ksh"])
+def test_domain_discovery_rejects_non_utf8_explicit_domain_files(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    explicit = tmp_path / name
+    explicit.write_bytes(b"explicit domain\xff")
+
+    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+        discover_project_domain_files(tmp_path)
