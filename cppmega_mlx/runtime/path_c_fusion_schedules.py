@@ -2564,11 +2564,11 @@ def build_path_c_descriptor_prim_func(
     )
 
     import tilelang.language as T
-    float_to_fp8_e4m3fn_bits = lambda value: _path_c_float_to_fp8_e4m3fn_bits(
-        T,
-        value,
-    )
-    fp8_e4m3fn_to_float = lambda bits: _path_c_fp8_e4m3fn_to_float(T, bits)
+    def float_to_fp8_e4m3fn_bits(value: Any) -> Any:
+        return _path_c_float_to_fp8_e4m3fn_bits(T, value)
+
+    def fp8_e4m3fn_to_float(bits: Any) -> Any:
+        return _path_c_fp8_e4m3fn_to_float(T, bits)
 
     filename = f"<path_c_descriptor_schedule:{entry_name}>"
     linecache.cache[filename] = (
@@ -4576,6 +4576,27 @@ def _force_spill_shared_scratch_name(scratch_name: str) -> bool:
     )
 
 
+def _cross_row_persistent_shared_scratch_name(scratch_name: str) -> bool:
+    """Return True for row-loop carries that shared-slot reuse can corrupt."""
+
+    # The reverse Mamba3 descriptor owns its full reverse scan under ``row == 0``;
+    # its ``*_bwd_*`` scratch is not carried between independent launcher rows.
+    # Treating that scratch as a cross-row carry needlessly consumes the last
+    # direct Metal ABI slot and makes the otherwise legal single-op backward
+    # segment unplannable.  Forward row-phased state is the affected surface.
+    name = str(scratch_name)
+    if "_bwd_" in name:
+        return False
+    return name.endswith(
+        (
+            "_mamba3_angle_cumsum",
+            "_mamba3_conv_history",
+            "_m2rnn_h_state",
+            "_m2rnn_conv_history",
+        )
+    )
+
+
 def _coalesced_scratch_parameter_count(
     candidates: Sequence[Mapping[str, Any]],
 ) -> int:
@@ -4661,10 +4682,13 @@ def _spill_large_shared_scratch_to_abi(
         scratch_name = match.group("name")
         force_scratch_abi = (
             scratch_name in force_spill_names
-            or _is_row_phased_bwd_scratch_abi_buffer(scratch_name)
+            or _cross_row_persistent_shared_scratch_name(scratch_name)
             or (
                 force_builtin_spill_names
-                and _force_spill_shared_scratch_name(scratch_name)
+                and (
+                    _is_row_phased_bwd_scratch_abi_buffer(scratch_name)
+                    or _force_spill_shared_scratch_name(scratch_name)
+                )
             )
         )
         if (
@@ -7084,8 +7108,6 @@ def _append_row_phased_mamba3_body(
     a_offset = dt_offset + heads
     trap_offset = a_offset + heads
     angle_offset = trap_offset + heads
-    conv_b_offset = inner_dim
-    conv_c_offset = inner_dim + bc_dim
     rot_dim = min(state_dim, 2 * rope_angles)
     checkpoint_interval = MAMBA3_BWD_REPLAY_CHECKPOINT_INTERVAL
     state_extent = heads * head_dim * state_dim
@@ -9036,7 +9058,7 @@ def _append_attention_projection_prepare_from_vector(
     )
     body.append(
         f"{indent}    {prepared}[0] = "
-        f"({projected}[0] * T.cos({rope_phase}[0])) + "
+        f"({projected}[0] * T.cos({rope_phase}[0])) - "
         f"({paired_projected}[0] * T.sin({rope_phase}[0]))"
     )
     body.append(f"{indent}else:")
@@ -9056,7 +9078,7 @@ def _append_attention_projection_prepare_from_vector(
     )
     body.append(
         f"{indent}    {prepared}[0] = "
-        f"({projected}[0] * T.cos({rope_phase}[0])) - "
+        f"({projected}[0] * T.cos({rope_phase}[0])) + "
         f"({paired_projected}[0] * T.sin({rope_phase}[0]))"
     )
 
@@ -9862,15 +9884,6 @@ def _append_row_phased_sparse_mla_fp8_apply_bwd_body(
     )
     body.append(f"{indent * 6}{score_accum}[0] = 0.0")
     body.append(f"{indent * 6}for {dot_dim} in T.serial(0, {head_dim}):")
-    q_dot_ref = _row_phased_attention_value_ref(
-        q_fp8_input,
-        access_by_buffer,
-        shape_env,
-        row_expr="row",
-        head_expr=q_head,
-        dim_expr=dot_dim,
-        q_side=True,
-    )
     kv_dot_ref = _row_phased_attention_selected_kv_value_ref(
         kv_fp8_input,
         access_by_buffer,
@@ -10333,12 +10346,12 @@ def _append_row_phased_attention_qkv_projection_bwd_body(
     )
     body.append(
         f"{indent * 4}{proj_grad0}[0] = "
-        f"({q_grad0}[0] * T.cos({rope_phase}[0])) - "
+        f"({q_grad0}[0] * T.cos({rope_phase}[0])) + "
         f"({q_grad1}[0] * T.sin({rope_phase}[0]))"
     )
     body.append(
         f"{indent * 4}{proj_grad1}[0] = "
-        f"({q_grad0}[0] * T.sin({rope_phase}[0])) + "
+        f"(-{q_grad0}[0] * T.sin({rope_phase}[0])) + "
         f"({q_grad1}[0] * T.cos({rope_phase}[0]))"
     )
     if q_bias_grad is not None:
@@ -10357,9 +10370,9 @@ def _append_row_phased_attention_qkv_projection_bwd_body(
     if rope_grad is not None:
         body.append(
             f"{indent * 4}{rope_grad_scratch}[0] = "
-            f"({q_grad0}[0] * ((-{q_proj0}[0] * T.sin({rope_phase}[0])) + "
+            f"({q_grad0}[0] * ((-{q_proj0}[0] * T.sin({rope_phase}[0])) - "
             f"({q_proj1}[0] * T.cos({rope_phase}[0])))) + "
-            f"({q_grad1}[0] * ((-{q_proj1}[0] * T.sin({rope_phase}[0])) - "
+            f"({q_grad1}[0] * ((-{q_proj1}[0] * T.sin({rope_phase}[0])) + "
             f"({q_proj0}[0] * T.cos({rope_phase}[0]))))"
         )
         rope_ref = _indexed_buffer_ref(rope_grad, access_by_buffer, rope_d)
@@ -10478,12 +10491,12 @@ def _append_row_phased_attention_qkv_projection_bwd_body(
     )
     body.append(
         f"{indent * 4}{proj_grad0}[0] = "
-        f"({kv_grad0}[0] * T.cos({rope_phase}[0])) - "
+        f"({kv_grad0}[0] * T.cos({rope_phase}[0])) + "
         f"({kv_grad1}[0] * T.sin({rope_phase}[0]))"
     )
     body.append(
         f"{indent * 4}{proj_grad1}[0] = "
-        f"({kv_grad0}[0] * T.sin({rope_phase}[0])) + "
+        f"(-{kv_grad0}[0] * T.sin({rope_phase}[0])) + "
         f"({kv_grad1}[0] * T.cos({rope_phase}[0]))"
     )
     if kv_bias_grad is not None:
@@ -10502,9 +10515,9 @@ def _append_row_phased_attention_qkv_projection_bwd_body(
     if rope_grad is not None:
         body.append(
             f"{indent * 4}{rope_grad_scratch}[0] = "
-            f"({kv_grad0}[0] * ((-{kv_proj0}[0] * T.sin({rope_phase}[0])) + "
+            f"({kv_grad0}[0] * ((-{kv_proj0}[0] * T.sin({rope_phase}[0])) - "
             f"({kv_proj1}[0] * T.cos({rope_phase}[0])))) + "
-            f"({kv_grad1}[0] * ((-{kv_proj1}[0] * T.sin({rope_phase}[0])) - "
+            f"({kv_grad1}[0] * ((-{kv_proj1}[0] * T.sin({rope_phase}[0])) + "
             f"({kv_proj0}[0] * T.cos({rope_phase}[0]))))"
         )
         rope_ref = _indexed_buffer_ref(rope_grad, access_by_buffer, rope_d)
@@ -10589,7 +10602,6 @@ def _append_row_phased_m2rnn_bwd_body(
     src_hist = _scratch_name(node, "src_hist")
     hidden_loop = _scratch_name(node, "hidden_loop")
     proj_dim = _scratch_name(node, "proj_dim")
-    hidden_dim = _scratch_name(node, "hidden_dim")
     conv_ch = _scratch_name(node, "conv_ch")
     kernel_pos = _scratch_name(node, "kernel_pos")
     state_idx = _scratch_name(node, "state_idx")
@@ -10600,7 +10612,6 @@ def _append_row_phased_m2rnn_bwd_body(
     vv = _scratch_name(node, "vv")
     vv_inner = _scratch_name(node, "vv_inner")
     out_dim = _scratch_name(node, "out_dim")
-    partial = _scratch_name(node, "partial")
     hidden_size = int(shape_env.hidden_size)
     sequence_length = int(shape_env.sequence_length)
     in_proj_dim = int(shape_env.m2rnn_in_proj_dim)
