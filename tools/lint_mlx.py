@@ -123,6 +123,7 @@ class _MlxLintVisitor(ast.NodeVisitor):
         self._model_backend_intrinsic_findings: set[tuple[int, str]] = set()
         self._public_partial_output_findings: set[tuple[int, str]] = set()
         self._private_output_surface_calls: set[int] = set()
+        self._private_kernel_partial_outputs: dict[str, set[str]] = {}
         self._uses_autodiff = False
         self._uses_custom_function = False
         self._defines_custom_gradient = False
@@ -335,7 +336,9 @@ class _MlxLintVisitor(ast.NodeVisitor):
             and self._is_current_function_public()
             and node.value is not None
         ):
-            for token in _public_return_partial_tokens(node.value):
+            tokens = _public_return_partial_tokens(node.value)
+            tokens.update(self._private_kernel_partial_tokens_returned(node.value))
+            for token in tokens:
                 self._add_public_partial_output_finding(node.lineno, token)
         self.generic_visit(node)
 
@@ -609,6 +612,30 @@ class _MlxLintVisitor(ast.NodeVisitor):
         target_names = {name for target in targets for name in _target_names(target)}
         if target_names and all(name.startswith("_") for name in target_names):
             self._private_output_surface_calls.add(id(value))
+            partial_outputs = _partial_output_tokens(value)
+            for name in target_names:
+                self._private_kernel_partial_outputs[name] = partial_outputs
+
+    def _private_kernel_partial_tokens_returned(self, node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return set(self._private_kernel_partial_outputs.get(node.id, ()))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return set(self._private_kernel_partial_outputs.get(node.func.id, ()))
+        if isinstance(node, ast.Subscript):
+            return self._private_kernel_partial_tokens_returned(node.value)
+        if isinstance(node, ast.Tuple | ast.List | ast.Set):
+            return {
+                token
+                for item in node.elts
+                for token in self._private_kernel_partial_tokens_returned(item)
+            }
+        if isinstance(node, ast.Dict):
+            return {
+                token
+                for value in node.values
+                for token in self._private_kernel_partial_tokens_returned(value)
+            }
+        return set()
 
     def _check_public_partial_assignment(
         self,

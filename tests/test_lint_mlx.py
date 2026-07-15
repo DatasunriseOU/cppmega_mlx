@@ -447,6 +447,44 @@ def test_lint_allows_private_kernel_partial_outputs_for_internal_reduction(
     assert result.stderr == ""
 
 
+def test_lint_blocks_private_kernel_partial_output_exposed_by_public_api(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cppmega_mlx" / "nn" / "_tilelang" / "private_leak.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                "import mlx.core as mx",
+                "",
+                "_private_kernel = mx.fast.metal_kernel(",
+                "    name='private_partial',",
+                "    input_names=['x'],",
+                "    output_names=['dB_partial'],",
+                "    source='uint elem = thread_position_in_grid.x;'",
+                ")",
+                "",
+                "def public_bwd(x):",
+                "    return _private_kernel(",
+                "        inputs=[x],",
+                "        output_shapes=[x.shape],",
+                "        output_dtypes=[x.dtype],",
+                "        grid=(x.size, 1, 1),",
+                "        threadgroup=(1, 1, 1),",
+                "    )[0]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_lint("--select", "MLX009", source)
+
+    assert result.returncode == 1
+    assert f"{source}:11: MLX009" in result.stdout
+    assert "dB_partial" in result.stdout
+    assert result.stderr == ""
+
+
 def test_lint_blocks_native_tvm_ffi_bridge_parent_imports(
     tmp_path: Path,
 ) -> None:
