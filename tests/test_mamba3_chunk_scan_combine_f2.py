@@ -169,19 +169,17 @@ def _eager_precompute(C, Bmat, x, A, dt, h0, chunk_size):
     cb = torch.einsum("bclgn,bcsgn->bcgls", Cc, Bc)  # (b,c,g,l,s)
 
     # per-chunk entry states ``prev_states`` (the inter-chunk carry F1 produces).
-    # states[c] = sum_l exp(dA_cs[c,-1]-dA_cs[c,l]) * dt[l] * (B[l] outer x[l]); then
+    # states[c] = sum_l exp(dA_cs[c,-1]-dA_cs[c,l]) * (B[l] outer x[l]); then
     # propagated across chunks with chunk-boundary decay, seeded by h0.
     h = nheads // ngroups
     Bexp = rearrange(Bf, "b (c s) g n -> b c s g n", c=nchunks)
     Bexp = Bexp.repeat_interleave(h, dim=3)  # (b,c,s,nheads,n)
     xexp = rearrange(xf, "b (c s) hh p -> b c s hh p", c=nchunks)  # (b,c,s,nheads,p)
-    dtc = rearrange(dtf, "b (c s) hh -> b hh c s", c=nchunks)  # (b,nheads,c,s)
     decay_states = torch.exp(dA_cumsum[:, :, :, -1:] - dA_cumsum)  # (b,nheads,c,s)
-    # states[b,c,hh,p,n] = sum_s decay_states * dt * x outer B
+    # Production Path C uses inp = x*B; dt contributes only to the decay.
     states = torch.einsum(
-        "bhcs,bhcs,bcshp,bcshn->bchpn",
+        "bhcs,bcshp,bcshn->bchpn",
         decay_states,
-        dtc,
         xexp,
         Bexp,
     )  # (b,c,nheads,p,n)
@@ -227,24 +225,23 @@ def _serial_forward(cb, x, dt, dA_cumsum, C, prev_states, D, chunk_size):
     Cf = repeat(C.float(), "b l g n -> b l (g h) n", h=h)  # (b,l,nheads,n)
     cbf = repeat(cb.float(), "b c g l s -> b c (g h) l s", h=h)  # (b,c,nheads,l,s)
     xf = rearrange(x.float(), "b (c s) hh p -> b c s hh p", c=nchunks)
-    dtf = dt.float()  # (b,nheads,c,s)
     dac = dA_cumsum.float()  # (b,nheads,c,l)
     psf = prev_states.float()  # (b,c,nheads,p,n)
     Cc = rearrange(Cf, "b (c l) hh n -> b c l hh n", c=nchunks)
 
     out = torch.zeros(batch, nchunks, chunk_size, nheads, headdim, device=x.device)
     for c in range(nchunks):
-        for l in range(chunk_size):
-            # intra-chunk causal: sum_{s<=l} cb[l,s]*exp(dA[l]-dA[s])*dt[s]*x[s]
+        for row in range(chunk_size):
+            # intra-chunk causal: sum_{s<=row} cb[row,s]*exp(dA[row]-dA[s])*x[s]
             acc = torch.zeros(batch, nheads, headdim, device=x.device)
-            for s in range(l + 1):
-                decay = torch.exp(dac[:, :, c, l] - dac[:, :, c, s])  # (b,nheads)
-                coef = cbf[:, c, :, l, s] * decay * dtf[:, :, c, s]  # (b,nheads)
+            for s in range(row + 1):
+                decay = torch.exp(dac[:, :, c, row] - dac[:, :, c, s])  # (b,nheads)
+                coef = cbf[:, c, :, row, s] * decay  # (b,nheads)
                 acc = acc + coef[:, :, None] * xf[:, c, s]  # (b,nheads,p)
-            # inter-chunk: (C[l] . prev_state) * exp(dA[l])
-            yoff = torch.einsum("bhn,bhpn->bhp", Cc[:, c, l], psf[:, c])
-            yoff = yoff * torch.exp(dac[:, :, c, l])[:, :, None]
-            out[:, c, l] = acc + yoff
+            # inter-chunk: (C[row] . prev_state) * exp(dA[row])
+            yoff = torch.einsum("bhn,bhpn->bhp", Cc[:, c, row], psf[:, c])
+            yoff = yoff * torch.exp(dac[:, :, c, row])[:, :, None]
+            out[:, c, row] = acc + yoff
 
     out = rearrange(out, "b c l hh p -> b (c l) hh p")
     Dskip = rearrange(D.float(), "hh -> hh 1")

@@ -189,8 +189,6 @@ def chunk_scan_fwd_metal_prim(
             dA_cs_k_shared = T.alloc_shared((block_K), dtype)
             dA_cs_k_local = T.alloc_fragment((block_K), accum_dtype)
             dA_cs_m_local = T.alloc_fragment((block_M), accum_dtype)
-            dt_shared = T.alloc_shared((block_K), dtype)
-            dt_local = T.alloc_fragment((block_K), accum_dtype)
             x_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared.dyn")
             dA_cs_m_shared = T.alloc_shared((block_M), dtype)
             scale_m_local = T.alloc_fragment((block_M), accum_dtype)
@@ -279,14 +277,8 @@ def chunk_scan_fwd_metal_prim(
                     cb_local[i, j] = cb_local[i, j] * T.exp2(
                         dA_cs_m_local[i] * p - dA_cs_k_local[j] * p
                     )
-                T.copy(
-                    dt[batch_idx, bz, chunk_idx, k * block_K : (k + 1) * block_K],
-                    dt_shared,
-                    disable_tma=True,
-                )
-                T.copy(dt_shared, dt_local)
-                for i, j in T.Parallel(block_M, block_K):
-                    cb_local[i, j] *= dt_local[j]
+                # Production SSD uses inp = x * B. ``dt`` remains in the frozen
+                # F2 ABI, but affects this kernel only through ``dA_cumsum``.
                 for i, j in T.Parallel(block_M, block_K):
                     cb_local[i, j] = T.if_then_else(
                         m_idx * block_M + i >= k * block_K + j, cb_local[i, j], 0
@@ -437,8 +429,6 @@ def chunk_scan_fwd_cuda_prim(
             dA_cs_k_shared = T.alloc_shared((block_K), dtype)
             dA_cs_k_local = T.alloc_fragment((block_K), accum_dtype)
             dA_cs_m_local = T.alloc_fragment((block_M), accum_dtype)
-            dt_shared = T.alloc_shared((block_K), dtype)
-            dt_local = T.alloc_fragment((block_K), accum_dtype)
             x_shared = T.alloc_shared((block_K, block_N), dtype)
             dA_cs_m_shared = T.alloc_shared((block_M), dtype)
             scale_m_local = T.alloc_fragment((block_M), accum_dtype)
@@ -524,14 +514,8 @@ def chunk_scan_fwd_cuda_prim(
                     cb_local[i, j] = cb_local[i, j] * T.exp2(
                         dA_cs_m_local[i] * p - dA_cs_k_local[j] * p
                     )
-                T.copy(
-                    dt[batch_idx, bz, chunk_idx, k * block_K : (k + 1) * block_K],
-                    dt_shared,
-                    disable_tma=True,
-                )
-                T.copy(dt_shared, dt_local)
-                for i, j in T.Parallel(block_M, block_K):
-                    cb_local[i, j] *= dt_local[j]
+                # Production SSD uses inp = x * B. ``dt`` remains in the frozen
+                # F2 ABI, but affects this kernel only through ``dA_cumsum``.
                 for i, j in T.Parallel(block_M, block_K):
                     cb_local[i, j] = T.if_then_else(
                         m_idx * block_M + i >= k * block_K + j, cb_local[i, j], 0
