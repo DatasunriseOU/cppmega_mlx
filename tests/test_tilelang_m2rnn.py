@@ -86,6 +86,43 @@ def test_m2rnn_path_b_keeps_direct_msl_surface() -> None:
     assert hasattr(mod, "_BWD_KERNEL_SOURCE")
 
 
+def test_m2rnn_path_b_uses_owned_fail_closed_dispatch_wrapper() -> None:
+    mod = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn")
+    source = mod.__loader__.get_source(mod.__name__)
+    assert source is not None
+    assert "_msl_transform.dispatch(" not in source
+    assert "_m2rnn_fwd_pure_mlx" not in source
+    assert "_m2rnn_bwd_pure_mlx" not in source
+    assert callable(getattr(mod, "_dispatch_m2rnn_metal_kernel", None))
+
+
+def test_m2rnn_owned_dispatch_wrapper_preserves_launch_failure() -> None:
+    mod = importlib.import_module("cppmega_mlx.nn._tilelang.m2rnn")
+    dispatch = getattr(mod, "_dispatch_m2rnn_metal_kernel", None)
+    assert callable(dispatch)
+
+    class FailingKernel:
+        def __call__(self, **_kwargs: object) -> list[mx.array]:
+            raise ValueError("synthetic kernel launch failure")
+
+    x = mx.zeros((1,), dtype=mx.float32)
+    with pytest.raises(
+        RuntimeError,
+        match="M2RNN forward Metal dispatch failed.*synthetic kernel launch failure",
+    ) as exc_info:
+        dispatch(
+            FailingKernel(),
+            operation="forward",
+            inputs=[x],
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
+            grid=(1, 1, 1),
+            threadgroup=(1, 1, 1),
+            template=[],
+        )
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
 # ---------------------------------------------------------------------------
 # Forward parity
 # ---------------------------------------------------------------------------
