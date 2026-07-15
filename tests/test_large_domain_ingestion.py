@@ -503,3 +503,23 @@ def test_domain_discovery_rejects_non_utf8_explicit_domain_files(
 
     with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
         discover_project_domain_files(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["module.py", "script.ksh", "Makefile"])
+def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    explicit = tmp_path / name
+    explicit.write_bytes(b"explicit domain\xff")
+    rejected: list[tuple[Path, str]] = []
+
+    discovered = discover_project_domain_files(
+        tmp_path,
+        invalid_input_handler=lambda path, exc: rejected.append((path, str(exc))),
+    )
+
+    assert discovered == []
+    assert len(rejected) == 1
+    assert rejected[0][0] == explicit
+    assert rejected[0][1].startswith("invalid UTF-8 domain input")

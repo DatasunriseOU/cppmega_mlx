@@ -923,6 +923,7 @@ def stage_index_source(
         "--tokenizer-path", TOKENIZER_PATH,
         "--memory-limit-gb", str(memory_limit_gb),
         "--parse-workers", str(max(1, int(parse_workers))),
+        "--skip-invalid-domain-inputs",
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
