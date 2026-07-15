@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
     DOMAIN_DELIMITER_TOKEN_IDS,
     TOKENIZER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
@@ -43,7 +45,9 @@ class DomainKind(IntEnum):
     ZSH = 21
     SH = 22
     TCSH = 23
+    KSH = 24
     SQL = 30
+    PYTHON = 31
     COMPILER_DIAGNOSTIC = 40
     BUILD_DIAGNOSTIC = 41
     COMPILER_ERROR = 42
@@ -153,6 +157,20 @@ if not isinstance(DOMAIN_SCHEMA, dict):
     )
 DOMAIN_SCHEMA_SHA256 = hashlib.sha256(_DOMAIN_SCHEMA_BYTES).hexdigest()
 DOMAIN_SCHEMA_SHA256_METADATA_KEY = "cppmega.domain_schema_sha256"
+PREVIOUS_CASE5_V1_CONTRACT_HASH_TRIPLES = frozenset(
+    {
+        (
+            "9c3517b5a3fda01c4f55d55bc0d12dff4af3edb3db6321bda6c22489061b4fdd",
+            "c3bb669015c48e2049e3b82ccb8c98c6eceae0644f7da0b5b8600c573d7087a5",
+            "1f2e35d7917409fc03704d32c2d55d0fb3e29f1bd9e60acca775a392cf2f53e6",
+        ),
+        (
+            "9c3517b5a3fda01c4f55d55bc0d12dff4af3edb3db6321bda6c22489061b4fdd",
+            "80e73699e26d2c19fe4477cf8194886e52c7a5e114023df27e55d6a69b62c198",
+            "1f2e35d7917409fc03704d32c2d55d0fb3e29f1bd9e60acca775a392cf2f53e6",
+        ),
+    }
+)
 if DOMAIN_SCHEMA.get("schema") != "cppmega_domain_sidecars_v1":
     raise RuntimeError(f"unsupported frozen domain schema: {DOMAIN_SCHEMA_PATH}")
 
@@ -162,23 +180,37 @@ def validate_case5_contract_metadata(
     *,
     where: str | Path,
 ) -> None:
-    """Require exact full-content hashes for both frozen CASE5 contracts."""
+    """Require one exact domain/tokenizer/delimiter CASE5 hash triple."""
 
     actual_metadata = metadata or {}
-    expected = {
-        DOMAIN_SCHEMA_SHA256_METADATA_KEY: DOMAIN_SCHEMA_SHA256,
-        TOKENIZER_CONTRACT_SHA256_METADATA_KEY: TOKENIZER_CONTRACT_SHA256,
+    actual_triple = (
+        actual_metadata.get(DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")),
+        actual_metadata.get(TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")),
+        actual_metadata.get(DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")),
+    )
+    accepted_triples = {
+        (
+            DOMAIN_SCHEMA_SHA256.encode("ascii"),
+            TOKENIZER_CONTRACT_SHA256.encode("ascii"),
+            DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
+        ),
+        *(
+            (
+                domain_hash.encode("ascii"),
+                tokenizer_hash.encode("ascii"),
+                delimiter_hash.encode("ascii"),
+            )
+            for domain_hash, tokenizer_hash, delimiter_hash in (
+                PREVIOUS_CASE5_V1_CONTRACT_HASH_TRIPLES
+            )
+        ),
     }
-    mismatches: list[str] = []
-    for key, digest in expected.items():
-        actual = actual_metadata.get(key.encode("utf-8"))
-        wanted = digest.encode("ascii")
-        if actual != wanted:
-            mismatches.append(f"{key}={actual!r}, expected {wanted!r}")
-    if mismatches:
+    if actual_triple not in accepted_triples:
         raise ValueError(
             f"{where}: missing or stale frozen CASE5 contract hashes: "
-            + "; ".join(mismatches)
+            f"{DOMAIN_SCHEMA_SHA256_METADATA_KEY}={actual_triple[0]!r}; "
+            f"{TOKENIZER_CONTRACT_SHA256_METADATA_KEY}={actual_triple[1]!r}; "
+            f"{DOMAIN_DELIMITER_CONTRACT_METADATA_KEY}={actual_triple[2]!r}"
         )
 
 
@@ -613,6 +645,7 @@ __all__ = [
     "DomainKind",
     "DomainRoleKind",
     "ParseConfidence",
+    "PREVIOUS_CASE5_V1_CONTRACT_HASH_TRIPLES",
     "canonicalize_domain_edge_fields",
     "domain_edge_family",
     "delimiter_token_ids",

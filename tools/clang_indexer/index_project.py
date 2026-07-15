@@ -690,6 +690,7 @@ BUILD_EXT_KINDS: dict[str, str] = {
 BUILD_FILE_SIZE_CAP = 500_000
 SHELL_EXT_KINDS: dict[str, str] = {
     ".bash": "bash",
+    ".ksh": "ksh",
     ".sh": "sh",
     ".zsh": "zsh",
     ".csh": "tcsh",
@@ -2846,7 +2847,7 @@ def _classify_shell_file(filepath: str, fname: str) -> str | None:
         return None
     if first_line.startswith("#!"):
         words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
-        for shell in ("tcsh", "csh", "zsh", "bash", "sh"):
+        for shell in ("tcsh", "csh", "zsh", "bash", "ksh", "sh"):
             if shell in words:
                 return "tcsh" if shell == "csh" else shell
     return extension_kind
@@ -5280,6 +5281,8 @@ def _build_domain_sidecars(
         "sh": "script.sh",
         "zsh": "script.zsh",
         "tcsh": "script.tcsh",
+        "ksh": "script.ksh",
+        "python": "module.py",
     }
     parser_path = parser_path_by_kind.get(kind)
     resolved_path = filepath or parser_path
@@ -5436,11 +5439,15 @@ def build_build_doc(
         DomainKind.SH,
         DomainKind.ZSH,
         DomainKind.TCSH,
+        DomainKind.KSH,
     }
+    is_python_doc = domain == DomainKind.PYTHON
     is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
     doc_type = (
         "shell"
         if is_shell_doc
+        else "code"
+        if is_python_doc
         else "diagnostic"
         if is_diagnostic_doc
         else "sql"
@@ -5453,9 +5460,19 @@ def build_build_doc(
         "primary_dialect": None,
         "embedded_languages": [],
         "signals": [
-            f"shell_file:{build_kind}" if is_shell_doc else f"build_file:{build_kind}"
+            f"shell_file:{build_kind}"
+            if is_shell_doc
+            else f"code_file:{build_kind}"
+            if is_python_doc
+            else f"build_file:{build_kind}"
         ],
-        "detector_sources": ["shell_file" if is_shell_doc else "build_file"],
+        "detector_sources": [
+            "shell_file"
+            if is_shell_doc
+            else "code_file"
+            if is_python_doc
+            else "build_file"
+        ],
         "confidence": "high",
     }
 
@@ -7074,6 +7091,8 @@ def emit_build_documents(
                 "sh",
                 "zsh",
                 "tcsh",
+                "ksh",
+                "python",
                 "sql",
                 "compiler_diagnostic",
                 "linker_diagnostic",

@@ -47,7 +47,13 @@ from cppmega_mlx.data.diagnostic_parsers import (
     parse_sanitizer_output,
     parse_test_output,
 )
-from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+from cppmega_mlx.data.shell_parsers import (
+    parse_bash,
+    parse_ksh,
+    parse_sh,
+    parse_tcsh,
+    parse_zsh,
+)
 from cppmega_mlx.data.trajectory_packet import TrajectoryPacket, Transition
 
 # --------------------------------------------------------------------------- #
@@ -152,11 +158,13 @@ def parse_shell_action_domain(
                 kind = "tcsh"
             elif "bash" in first:
                 kind = "bash"
+            elif "ksh" in first:
+                kind = "ksh"
             else:
                 kind = "sh"
         else:
             head = stripped.split(maxsplit=1)[0] if stripped else ""
-            kind = head if head in {"bash", "zsh", "tcsh", "sh"} else "sh"
+            kind = head if head in {"bash", "ksh", "zsh", "tcsh", "sh"} else "sh"
 
     if kind == "bash":
         return parse_bash(command)
@@ -164,6 +172,8 @@ def parse_shell_action_domain(
         return parse_zsh(command)
     if kind == "tcsh":
         return parse_tcsh(command)
+    if kind == "ksh":
+        return parse_ksh(command)
     return parse_sh(command)
 
 

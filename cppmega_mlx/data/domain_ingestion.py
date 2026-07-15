@@ -32,7 +32,14 @@ from cppmega_mlx.data.domain_schema import (
     DomainRoleKind,
     ParseConfidence,
 )
-from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+from cppmega_mlx.data.python_parsers import parse_python
+from cppmega_mlx.data.shell_parsers import (
+    parse_bash,
+    parse_ksh,
+    parse_sh,
+    parse_tcsh,
+    parse_zsh,
+)
 from cppmega_mlx.data.source_identity import (
     MAX_ROW_LOCAL_DOC_ID,
     MAX_SOURCE_ID,
@@ -143,7 +150,9 @@ _LARGE_DOMAIN_KINDS = frozenset(
         DomainKind.ZSH,
         DomainKind.SH,
         DomainKind.TCSH,
+        DomainKind.KSH,
         DomainKind.SQL,
+        DomainKind.PYTHON,
         DomainKind.COMPILER_DIAGNOSTIC,
         DomainKind.BUILD_DIAGNOSTIC,
         DomainKind.COMPILER_ERROR,
@@ -190,7 +199,9 @@ _EXPLICIT_DOMAIN_SUFFIXES = frozenset(
         ".zsh",
         ".tcsh",
         ".csh",
+        ".ksh",
         ".sql",
+        ".py",
         ".m4",
         ".vcxproj",
         ".sln",
@@ -669,6 +680,7 @@ _ADAPTERS = {
     "sh": DomainParserAdapter("posix-sh", DomainKind.SH, parse_sh),
     "zsh": DomainParserAdapter("zsh", DomainKind.ZSH, parse_zsh),
     "tcsh": DomainParserAdapter("tcsh", DomainKind.TCSH, parse_tcsh),
+    "ksh": DomainParserAdapter("ksh", DomainKind.KSH, parse_ksh),
     "compiler": DomainParserAdapter(
         "clang-diagnostic",
         DomainKind.COMPILER_DIAGNOSTIC,
@@ -689,18 +701,25 @@ _ADAPTERS = {
         "sanitizer-output", DomainKind.SANITIZER_OUTPUT, parse_sanitizer_output
     ),
     "sql": DomainParserAdapter("sql-lexical", DomainKind.SQL, parse_sql_lexical),
+    "python": DomainParserAdapter(
+        "python-ast-tokenize",
+        DomainKind.PYTHON,
+        parse_python,
+    ),
     "raw": DomainParserAdapter("raw-output", DomainKind.TOOL_OUTPUT, _parse_raw_output),
 }
 
 
-def _shell_kind_from_shebang(text: str) -> str | None:
+def _script_kind_from_shebang(text: str) -> str | None:
     first_line = text.lstrip().splitlines()[0] if text.strip() else ""
     if not first_line.startswith("#!"):
         return None
     words = re.findall(r"[A-Za-z0-9_+.-]+", first_line.lower())
-    for kind in ("tcsh", "csh", "zsh", "bash", "sh"):
+    for kind in ("tcsh", "csh", "zsh", "bash", "ksh", "sh"):
         if kind in words:
             return "tcsh" if kind == "csh" else kind
+    if any(word.startswith("python") for word in words):
+        return "python"
     return None
 
 
@@ -727,7 +746,7 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
     if name in {"Makefile.am", "Makefile.in"}:
         return _ADAPTERS["automake"]
 
-    shebang_kind = _shell_kind_from_shebang(text)
+    shebang_kind = _script_kind_from_shebang(text)
     if shebang_kind is not None:
         return _ADAPTERS[shebang_kind]
 
@@ -749,8 +768,12 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["zsh"]
     if suffix in {".tcsh", ".csh"}:
         return _ADAPTERS["tcsh"]
+    if suffix == ".ksh":
+        return _ADAPTERS["ksh"]
     if suffix == ".sql":
         return _ADAPTERS["sql"]
+    if suffix == ".py":
+        return _ADAPTERS["python"]
 
     # Known but currently raw build formats are still path-typed inputs. Do not
     # reinterpret their contents as diagnostics before the indexer's build-kind
@@ -1122,6 +1145,7 @@ __all__ = [
     "iter_domain_file_chunks",
     "parse_cpp_lexical",
     "parse_domain_document",
+    "parse_python",
     "parse_sql_lexical",
     "resolve_domain_parser",
 ]

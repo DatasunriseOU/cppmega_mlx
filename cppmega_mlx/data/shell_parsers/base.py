@@ -17,6 +17,7 @@ _SHELL_KEYWORDS = {
 }
 _BASH_KEYWORDS = {"declare", "local", "mapfile", "readarray", "select", "shopt"}
 _ZSH_KEYWORDS = {"autoload", "emulate", "setopt", "unsetopt", "zmodload"}
+_KSH_KEYWORDS = {"compound", "function", "integer", "nameref", "typeset"}
 _TCSH_KEYWORDS = {"setenv", "unsetenv", "alias", "foreach", "endif", "switch", "endsw"}
 _REDIR_OUT = {">", ">>", "2>", "&>"}
 _REDIR_IN = {"<"}
@@ -94,7 +95,7 @@ def _has_unbalanced_shell_syntax(text: str, shell_kind: str) -> bool:
             "while": "done",
             "until": "done",
         }
-        if shell_kind in {"bash", "zsh"}:
+        if shell_kind in {"bash", "zsh", "ksh"}:
             openers["select"] = "done"
         closers = {"fi", "esac", "done"}
 
@@ -163,6 +164,12 @@ def parse_shell(
             command_expected = False
             idx += 1
             continue
+        if shell_kind == "ksh" and value in _KSH_KEYWORDS:
+            doc.set_role(idx, DomainRoleKind.KEYWORD, entity=next_entity)
+            next_entity += 1
+            command_expected = False
+            idx += 1
+            continue
         if value == "|":
             doc.set_role(idx, DomainRoleKind.PIPE)
             if previous_command is not None:
@@ -206,7 +213,15 @@ def parse_shell(
             doc.set_role(idx, DomainRoleKind.VARIABLE)
             idx += 1
             continue
-        dialect_keywords = _SHELL_KEYWORDS | (_BASH_KEYWORDS if shell_kind == "bash" else set())
+        dialect_keywords = _SHELL_KEYWORDS | (
+            _BASH_KEYWORDS
+            if shell_kind == "bash"
+            else _ZSH_KEYWORDS
+            if shell_kind == "zsh"
+            else _KSH_KEYWORDS
+            if shell_kind == "ksh"
+            else set()
+        )
         if value in dialect_keywords:
             doc.set_role(idx, DomainRoleKind.KEYWORD)
             command_expected = True

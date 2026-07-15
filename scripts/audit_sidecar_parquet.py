@@ -1517,11 +1517,6 @@ def _case5_schema_errors(path: Path, schema: pa.Schema) -> list[str]:
                 f"{path}: {name} type {schema.field(name).type} != {expected_type}"
             )
     metadata = schema.metadata or {}
-    actual_digest = metadata.get(DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"))
-    if actual_digest != DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"):
-        errors.append(
-            f"{path}: tokenizer/domain delimiter contract digest missing or mismatched"
-        )
     try:
         validate_case5_contract_metadata(metadata, where=path)
     except ValueError as exc:

@@ -20,6 +20,7 @@ from cppmega_mlx.data.domain_schema import (
 )
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
     DOMAIN_DELIMITER_TOKEN_IDS,
     TOKENIZER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
@@ -245,6 +246,7 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     [
         (DOMAIN_SCHEMA_SHA256_METADATA_KEY, None),
         (TOKENIZER_CONTRACT_SHA256_METADATA_KEY, b"0" * 64),
+        (DOMAIN_DELIMITER_CONTRACT_METADATA_KEY, b"0" * 64),
     ],
 )
 def test_sidecar_audit_rejects_missing_or_stale_contract_hashes(
@@ -277,6 +279,36 @@ def test_sidecar_audit_rejects_missing_or_stale_contract_hashes(
         "missing or stale frozen CASE5 contract hashes" in error
         for error in report["total"]["errors"]
     )
+
+
+@pytest.mark.parametrize(
+    "tokenizer_hash",
+    [
+        b"c3bb669015c48e2049e3b82ccb8c98c6eceae0644f7da0b5b8600c573d7087a5",
+        b"80e73699e26d2c19fe4477cf8194886e52c7a5e114023df27e55d6a69b62c198",
+    ],
+)
+def test_sidecar_audit_accepts_previous_case5_metadata_triples(
+    tokenizer_hash: bytes,
+) -> None:
+    audit = _load_audit_module()
+    metadata = dict(PACKED_ROW_OUTPUT_SCHEMA.metadata or {})
+    metadata[DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")] = (
+        b"9c3517b5a3fda01c4f55d55bc0d12dff4af3edb3db6321bda6c22489061b4fdd"
+    )
+    metadata[TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")] = (
+        tokenizer_hash
+    )
+    metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] = (
+        b"1f2e35d7917409fc03704d32c2d55d0fb3e29f1bd9e60acca775a392cf2f53e6"
+    )
+
+    errors = audit._case5_schema_errors(
+        Path("previous-case5.parquet"),
+        PACKED_ROW_OUTPUT_SCHEMA.with_metadata(metadata),
+    )
+
+    assert errors == []
 
 
 def test_sidecar_audit_reads_large_files_by_row_group(tmp_path, monkeypatch):

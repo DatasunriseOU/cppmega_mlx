@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from cppmega_mlx.data.domain_schema import DomainEdgeKind, DomainKind, DomainRoleKind
-from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+from cppmega_mlx.data.shell_parsers import (
+    parse_bash,
+    parse_ksh,
+    parse_sh,
+    parse_tcsh,
+    parse_zsh,
+)
 
 
 def _roles(parsed):
@@ -30,6 +36,7 @@ def test_shell_dialects_are_not_collapsed_to_bash() -> None:
     assert parse_sh("echo ok\n").domain == DomainKind.SH
     assert parse_zsh("echo ok\n").domain == DomainKind.ZSH
     assert parse_tcsh("echo ok\n").domain == DomainKind.TCSH
+    assert parse_ksh("print ok\n").domain == DomainKind.KSH
 
 
 def test_shell_parser_resets_command_and_redirect_state_on_newline() -> None:

@@ -35,7 +35,7 @@ _TOKENIZER_CONTRACT_PATH = (
     _REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer_contract_v1.json"
 )
 _TOKENIZER_JSON_PATH = _REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
-_CASE5_SEMANTIC_DELIMITER_IDS = set(range(237, 245))
+_CASE5_SEMANTIC_DELIMITER_IDS = set(range(237, 249))
 _CPP_TOKENIZER_V2_DIR = Path("/Volumes/external/sources/cppmega/data/tokenizer_v2")
 
 _REQUIRED_DOMAIN_PAIR_IDS = {
@@ -66,6 +66,8 @@ _REQUIRED_DOMAIN_PAIR_IDS = {
     "SQL": (239, 240),
     "LINKER_DIAGNOSTIC": (241, 242),
     "SANITIZER_OUTPUT": (243, 244),
+    "KSH": (245, 246),
+    "PYTHON": (247, 248),
 }
 
 
@@ -230,6 +232,28 @@ def test_domain_delimiter_role_ids_are_reserved_contract_pairs() -> None:
     }
     for role, token_id in tokenizer_contract.DOMAIN_DELIMITER_TOKEN_IDS.items():
         assert added_tokens[token_id] == f"<RESERVED_{token_id}>", role
+
+
+def test_ksh_and_python_roles_keep_literal_reserved_vocab_entries() -> None:
+    assert {
+        role: RESERVED_ROLE_TOKEN_IDS[role]
+        for role in ("KSH_START", "KSH_END", "PYTHON_START", "PYTHON_END")
+    } == {
+        "KSH_START": 245,
+        "KSH_END": 246,
+        "PYTHON_START": 247,
+        "PYTHON_END": 248,
+    }
+
+    tokenizer = json.loads(_TOKENIZER_JSON_PATH.read_text())
+    vocab = tokenizer["model"]["vocab"]
+    added_tokens = {
+        int(item["id"]): item["content"] for item in tokenizer["added_tokens"]
+    }
+    for token_id in range(245, 249):
+        literal = f"<RESERVED_{token_id}>"
+        assert vocab[literal] == token_id
+        assert added_tokens[token_id] == literal
 
 
 def test_file_separator_has_one_canonical_role_and_id() -> None:

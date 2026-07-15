@@ -28,7 +28,13 @@ from cppmega_mlx.data.domain_schema import (
     validate_domain_delimiter_contract,
 )
 from cppmega_mlx.data.nanochat_pipeline import tokenized_enriched
-from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+from cppmega_mlx.data.shell_parsers import (
+    parse_bash,
+    parse_ksh,
+    parse_sh,
+    parse_tcsh,
+    parse_zsh,
+)
 from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 
 
@@ -67,11 +73,13 @@ def test_case5_reserved_delimiter_contract_covers_all_ingested_domains() -> None
         DomainKind.SH,
         DomainKind.ZSH,
         DomainKind.TCSH,
+        DomainKind.KSH,
         DomainKind.BUILD_DIAGNOSTIC,
         DomainKind.LINKER_DIAGNOSTIC,
         DomainKind.TEST_OUTPUT,
         DomainKind.SANITIZER_OUTPUT,
         DomainKind.SQL,
+        DomainKind.PYTHON,
     )
     for domain in required:
         assert domain in DOMAIN_DELIMITER_ROLES
@@ -103,6 +111,7 @@ def test_case5_reserved_delimiter_contract_covers_all_ingested_domains() -> None
         ("scripts/run.sh", "name=value; export name\n", DomainKind.SH, "posix-sh"),
         ("scripts/run.zsh", "autoload -Uz compinit\n", DomainKind.ZSH, "zsh"),
         ("scripts/run.tcsh", "setenv CXX clang++\n", DomainKind.TCSH, "tcsh"),
+        ("scripts/run.ksh", "typeset name=value\n", DomainKind.KSH, "ksh"),
         (
             "compile.log",
             "src/main.cpp:3:2: warning: unused variable 'x'\n",
@@ -118,6 +127,7 @@ def test_case5_reserved_delimiter_contract_covers_all_ingested_domains() -> None
             "sanitizer-output",
         ),
         ("schema.sql", "CREATE TABLE users(id INTEGER);\n", DomainKind.SQL, "sql-lexical"),
+        ("module.py", "def answer():\n    return 42\n", DomainKind.PYTHON, "python-ast-tokenize"),
     ],
 )
 def test_typed_parser_adapter_registry_covers_case5_domains(
@@ -196,6 +206,8 @@ def test_project_domain_discovery_finds_build_shell_and_configure_files(tmp_path
         "scripts/bootstrap.sh": "#!/bin/sh\necho boot\n",
         "scripts/env.zsh": "#!/bin/zsh\nprint -r -- $path\n",
         "scripts/setup.tcsh": "#!/bin/tcsh\nsetenv CXX clang++\n",
+        "scripts/setup.ksh": "#!/bin/ksh\ntypeset CXX=clang++\n",
+        "module.py": "def answer():\n    return 42\n",
         "scripts/release": "#!/usr/bin/env bash\nset -euo pipefail\n",
     }
     for rel, text in files.items():
@@ -216,6 +228,8 @@ def test_project_domain_discovery_finds_build_shell_and_configure_files(tmp_path
     assert by_path["scripts/bootstrap.sh"] == DomainKind.SH
     assert by_path["scripts/env.zsh"] == DomainKind.ZSH
     assert by_path["scripts/setup.tcsh"] == DomainKind.TCSH
+    assert by_path["scripts/setup.ksh"] == DomainKind.KSH
+    assert by_path["module.py"] == DomainKind.PYTHON
     assert by_path["scripts/release"] == DomainKind.BASH
 
 
@@ -232,6 +246,7 @@ def test_index_project_discovers_shells_and_keeps_autotools_kinds_distinct(
         "scripts/release": "#!/usr/bin/env bash\nset -euo pipefail\n",
         "scripts/env.zsh": "#!/bin/zsh\nprint -r -- $path\n",
         "scripts/setup.tcsh": "#!/bin/tcsh\nsetenv CXX clang++\n",
+        "scripts/setup.ksh": "#!/bin/ksh\ntypeset CXX=clang++\n",
     }
     for rel, text in files.items():
         path = tmp_path / rel
@@ -251,6 +266,7 @@ def test_index_project_discovers_shells_and_keeps_autotools_kinds_distinct(
         "scripts/env.zsh": "zsh",
         "scripts/release": "bash",
         "scripts/setup.tcsh": "tcsh",
+        "scripts/setup.ksh": "ksh",
     }
 
 
@@ -369,6 +385,7 @@ def test_process_project_emits_every_discovered_domain_once_with_source_identity
         "link.log": "ld: undefined reference to `missing_symbol'\n",
         "sanitizer.log": "ERROR: AddressSanitizer: heap-use-after-free\n",
         "test-results.log": "12 passed, 0 failed, 0 errors\n",
+        "module.py": "def answer():\n    return 42\n",
     }
     for relative, text in files.items():
         path = tmp_path / relative
@@ -406,6 +423,7 @@ def test_process_project_emits_every_discovered_domain_once_with_source_identity
         "link.log": DomainKind.LINKER_ERROR,
         "sanitizer.log": DomainKind.SANITIZER_OUTPUT,
         "test-results.log": DomainKind.TEST_OUTPUT,
+        "module.py": DomainKind.PYTHON,
     }
     for relative, domain in expected_domains.items():
         doc = docs_by_path[relative]
@@ -424,21 +442,25 @@ def test_shell_dialects_keep_distinct_adapters_roles_and_metadata() -> None:
         "sh": parse_sh("name=value; export name\n"),
         "zsh": parse_zsh("autoload -Uz compinit\nprint -r -- $path\n"),
         "tcsh": parse_tcsh("setenv CXX clang++\necho $CXX\n"),
+        "ksh": parse_ksh("typeset CXX=clang++\nprint $CXX\n"),
     }
 
     assert parsed["bash"].domain == DomainKind.BASH
     assert parsed["sh"].domain == DomainKind.SH
     assert parsed["zsh"].domain == DomainKind.ZSH
     assert parsed["tcsh"].domain == DomainKind.TCSH
+    assert parsed["ksh"].domain == DomainKind.KSH
     assert {doc.metadata["parser_adapter"] for doc in parsed.values()} == {
         "bash",
         "posix-sh",
         "zsh",
         "tcsh",
+        "ksh",
     }
     assert "autoload" in _role_tokens(parsed["zsh"], DomainRoleKind.KEYWORD)
     assert "setenv" in _role_tokens(parsed["tcsh"], DomainRoleKind.KEYWORD)
     assert "CXX" in _role_tokens(parsed["tcsh"], DomainRoleKind.ENVIRONMENT)
+    assert "typeset" in _role_tokens(parsed["ksh"], DomainRoleKind.KEYWORD)
     assert "declare" in _role_tokens(parsed["bash"], DomainRoleKind.KEYWORD)
     assert "export" in _role_tokens(parsed["sh"], DomainRoleKind.KEYWORD)
 
