@@ -43,8 +43,7 @@ on non-zero exit or empty/missing output we RAISE with WHERE + WHAT. There are
 no silent fallbacks: a stage that cannot run aborts the whole build.
 
 Usage:
-    /Volumes/external/sources/cppmega.mlx/.venv/bin/python \
-        /Volumes/external/sources/cppmega.mlx/scripts/data/make_golden_mini.py
+    python scripts/data/make_golden_mini.py
 """
 
 from __future__ import annotations
@@ -58,14 +57,13 @@ import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Fixed, canonical paths (absolute — this script is location-pinned).
+# Repository-local canonical paths.
 # ---------------------------------------------------------------------------
-PY = "/Volumes/external/sources/cppmega.mlx/.venv/bin/python"
-CPPMEGA_MLX_ROOT = Path("/Volumes/external/sources/cppmega.mlx")
-NANOCHAT_ROOT = Path("/Volumes/external/sources/nanochat")
+PY = sys.executable
+CPPMEGA_MLX_ROOT = Path(__file__).resolve().parents[2]
 
-INDEX_PROJECT = NANOCHAT_ROOT / "tools" / "clang_indexer" / "index_project.py"
-PROCESS_COMMITS = NANOCHAT_ROOT / "tools" / "clang_indexer" / "process_commits.py"
+INDEX_PROJECT = CPPMEGA_MLX_ROOT / "tools" / "clang_indexer" / "index_project.py"
+PROCESS_COMMITS = CPPMEGA_MLX_ROOT / "tools" / "clang_indexer" / "process_commits.py"
 CLANG_ENRICHED_TO_PARQUET = (
     CPPMEGA_MLX_ROOT / "scripts" / "nanochat_data" / "clang_enriched_to_parquet.py"
 )
@@ -373,13 +371,8 @@ def _run(
 ) -> None:
     """Run a pipeline stage as a subprocess; RAISE loudly on failure.
 
-    `pythonpath` must be EXACTLY the one repo root the stage's imports resolve
-    against. The cppmega and nanochat repos BOTH ship top-level `scripts/` and
-    `tools/` packages, so mixing both roots on PYTHONPATH makes
-    `scripts.nanochat_data` / `tools.clang_indexer` resolve to the wrong repo.
-    We therefore pin a single root per stage:
-      * nanochat stages (index_project / process_commits) -> NANOCHAT_ROOT
-      * cppmega stages (parquet / pack)                    -> CPPMEGA_MLX_ROOT
+    `pythonpath` must be exactly this repository root so every stage resolves
+    the independently shipped `scripts`, `tools`, and `cppmega_mlx` packages.
     """
     print(f"[make_golden_mini] STAGE {stage}: {' '.join(cmd)}", file=sys.stderr)
     env = dict(os.environ)
@@ -494,9 +487,10 @@ def _merge_code_provenance(
 def _merge_commit_provenance(enriched_jsonl: Path) -> None:
     """Stamp real repo/filepath/commit_hash/parent_hashes into commit JSONL.
 
-    The commit processor renders a header ``Repository: <repo>`` / ``File:
-    <filepath>`` into each document's text from the source record, but drops the
-    structured provenance fields from its emitted dict. We map each enriched
+    The commit processor renders a header ``@repo <repo>`` / ``File:
+    <filepath>`` into each document's text from the source record; older
+    snapshots used ``Repository: <repo>``. It drops the structured provenance
+    fields from its emitted dict. We map each enriched
     document back to its originating COMMIT_RECORDS entry by (repo, filepath)
     parsed out of that header, then re-attach the REAL commit_hash + a synthetic
     parent chain (the genesis commit's single parent). RAISE if any document
@@ -518,7 +512,9 @@ def _merge_commit_provenance(enriched_jsonl: Path) -> None:
         repo = filepath = None
         for line in text.splitlines():
             s = line.strip().lstrip("*").strip()
-            if s.startswith("Repository:"):
+            if s.startswith("@repo"):
+                repo = s[len("@repo"):].strip()
+            elif s.startswith("Repository:"):
                 repo = s[len("Repository:"):].strip()
             elif s.startswith("File:"):
                 filepath = s[len("File:"):].strip()
@@ -585,7 +581,7 @@ def build_code_fixture(work: Path) -> dict[str, dict]:
                 "--parse-workers",
                 "1",
             ],
-            pythonpath=NANOCHAT_ROOT,
+            pythonpath=CPPMEGA_MLX_ROOT,
         )
         if not enriched_jsonl.exists() or enriched_jsonl.stat().st_size == 0:
             raise RuntimeError(
@@ -717,7 +713,7 @@ def build_commits_fixture(work: Path) -> dict:
             "--tokenizer-path",
             str(TOKENIZER_JSON),
         ],
-        pythonpath=NANOCHAT_ROOT,
+        pythonpath=CPPMEGA_MLX_ROOT,
     )
     if not enriched_commits.exists() or enriched_commits.stat().st_size == 0:
         raise RuntimeError(
