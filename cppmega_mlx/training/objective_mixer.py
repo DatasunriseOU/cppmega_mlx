@@ -15,8 +15,10 @@ import numpy as np
 
 from cppmega_mlx.data.ast_fim import (
     domain_preserving_document_spans,
+    has_safe_physical_middle,
     eligible_ast_chunk_indices,
     logical_document_spans,
+    span_has_single_physical_source,
 )
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
@@ -28,7 +30,10 @@ from cppmega_mlx.data.graph_packet import GraphPacket
 from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.source_identity import MAX_ROW_LOCAL_DOC_ID, MAX_SOURCE_ID
 from cppmega_mlx.training.indexer_losses import total_indexer_loss
-from cppmega_mlx.training.objectives import ObjectiveExample
+from cppmega_mlx.training.objectives import (
+    ObjectiveExample,
+    ifim_instruction_ids_by_document,
+)
 from cppmega_mlx.training.task_mixer import TaskKind, TaskMixer, normalize_rates
 
 
@@ -268,9 +273,14 @@ def validated_packed_commit_binding(
 
 def _transformed_document_physical_identity_reason(
     packet: CodePacket,
-    document_spans: Sequence[tuple[int, int, int]],
+    document_spans,
 ) -> str | None:
-    """Reject FIM candidates whose selected logical document is multi-physical."""
+    """Validate provenance and require one source-local middle candidate.
+
+    A packed code document may intentionally contain cross-file context.  The
+    unsafe condition is a FIM middle that crosses physical sources, not a
+    context packet that contains more than one source identity.
+    """
 
     if packet.source_identity_ids is None:
         return None
@@ -281,49 +291,18 @@ def _transformed_document_physical_identity_reason(
             "requires one token-aligned physical source identity per code token; "
             f"got shape {source_identity_ids.shape} for {token_count} tokens"
         )
-    identities = [int(value) for value in source_identity_ids.tolist()]
-    for start, end, _document_id in document_spans:
-        if end - start < 3:
+    for region in document_spans:
+        if region.content_end - region.content_start < 3:
             continue
-        selected = identities[start:end]
-        if any(not 0 < identity <= MAX_SOURCE_ID for identity in selected):
-            return (
-                f"logical document [{start}, {end}) requires positive uint64 "
-                "physical source identities"
-            )
-        unique = set(selected)
-        if len(unique) != 1:
-            return (
-                f"logical document [{start}, {end}) spans {len(unique)} physical "
-                "source identities; transformed objective requires exactly one"
-            )
-    return None
-
-
-def _transformed_packet_physical_identity_reason(packet: CodePacket) -> str | None:
-    """Reject whole-packet permutations that cannot retain one physical source."""
-
-    if packet.source_identity_ids is None:
-        return None
-    source_identity_ids = np.asarray(packet.source_identity_ids)
-    token_count = int(packet.token_ids.shape[-1])
-    if source_identity_ids.ndim != 1 or len(source_identity_ids) != token_count:
-        return (
-            "requires one token-aligned physical source identity per code token; "
-            f"got shape {source_identity_ids.shape} for {token_count} tokens"
-        )
-    identities = [int(value) for value in source_identity_ids.tolist()]
-    if any(not 0 < identity <= MAX_SOURCE_ID for identity in identities):
-        return (
-            "transformed objective requires positive uint64 physical source identities"
-        )
-    unique = set(identities)
-    if len(unique) != 1:
-        return (
-            f"whole code packet spans {len(unique)} physical source identities; "
-            "transformed objective requires exactly one"
-        )
-    return None
+        try:
+            if has_safe_physical_middle(packet, region):
+                return None
+        except ValueError as exc:
+            return str(exc)
+    return (
+        "no logical document has a physical source run with non-empty "
+        "prefix/middle/suffix context"
+    )
 
 
 def _eligibility_reason(
@@ -372,14 +351,7 @@ def _eligibility_reason(
             )
             physical_reason = _transformed_document_physical_identity_reason(
                 packet,
-                [
-                    (
-                        region.document_start,
-                        region.document_end,
-                        region.document_id,
-                    )
-                    for region in eligible_regions
-                ],
+                eligible_regions,
             )
             if physical_reason is not None:
                 return physical_reason
@@ -404,20 +376,36 @@ def _eligibility_reason(
                 reason = None
             return _length_reason(reason, selected_token_count + 3, max_input_tokens)
         if task is TaskKind.IFIM:
-            instruction_count = _array_length(packet.ifim_instruction_token_ids)
+            try:
+                instruction_bindings = ifim_instruction_ids_by_document(packet)
+            except ValueError as exc:
+                return str(exc)
+            eligible_instruction_regions = [
+                region
+                for region in eligible_regions
+                if region.document_id in instruction_bindings
+                and has_safe_physical_middle(packet, region)
+            ]
+            instruction_count = max(
+                (
+                    len(instruction_bindings[region.document_id])
+                    for region in eligible_instruction_regions
+                ),
+                default=0,
+            )
             reason = (
                 None
-                if instruction_count > 0
-                else "missing or empty ifim_instruction_token_ids"
+                if eligible_instruction_regions and instruction_count > 0
+                else (
+                    "missing or empty source_ifim_instruction_token_ids "
+                    "per-document IFIM instruction binding"
+                )
             )
             return _length_reason(
                 reason,
                 selected_token_count + instruction_count + 4,
                 max_input_tokens,
             )
-        physical_reason = _transformed_packet_physical_identity_reason(packet)
-        if physical_reason is not None:
-            return physical_reason
         field_name = {
             TaskKind.SYMBOL_RECOVERY: "symbol_ids",
             TaskKind.TYPE_RECOVERY: "type_refs",
@@ -437,7 +425,14 @@ def _eligibility_reason(
             while end < len(markers) and markers[end] == markers[index]:
                 end += 1
             for region in transform_regions:
-                if region.content_start <= index < end <= region.content_end:
+                if (
+                    region.content_start <= index < end <= region.content_end
+                    and span_has_single_physical_source(
+                        packet,
+                        start=index,
+                        end=end,
+                    )
+                ):
                     candidate_regions.append(
                         (region.document_start, region.document_end)
                     )

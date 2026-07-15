@@ -280,12 +280,10 @@ def load_commit_packets(
         )
     rows = table.to_pylist()
 
-    def toks(row, idx, column: str) -> np.ndarray:
+    def toks(row, idx, column: str) -> np.ndarray | None:
         t = np.asarray(row[column], dtype=np.int64)
-        if t.size < 2:
-            raise ValueError(
-                f"{commits_path.name}[row={idx}].{column} too short ({t.size})"
-            )
+        if t.size == 0:
+            return None
         if t.min() < 0 or t.max() >= vocab_size:
             raise ValueError(
                 f"{commits_path.name}[row={idx}].{column}: token id out of range "
@@ -299,12 +297,16 @@ def load_commit_packets(
         post = toks(row, row_index, "post_token_ids")
         diff = toks(row, row_index, "diff_token_ids")
         message = toks(row, row_index, "commit_msg_token_ids")
+        if all(section is None for section in (pre, post, diff, message)):
+            # Keep the loader fail-closed: an entirely empty typed row carries
+            # no objective input and must not become a synthetic packet.
+            continue
         packets.append(
             CommitPacket(
-                pre_token_ids=_i32(pre),
-                post_token_ids=_i32(post),
-                diff_token_ids=_i32(diff),
-                commit_msg=_i32(message),
+                pre_token_ids=None if pre is None else _i32(pre),
+                post_token_ids=None if post is None else _i32(post),
+                diff_token_ids=None if diff is None else _i32(diff),
+                commit_msg=None if message is None else _i32(message),
                 repo=str(row.get("repo"))
                 if row.get("repo") is not None
                 else None,
@@ -318,7 +320,10 @@ def load_commit_packets(
             )
         )
     if not packets:
-        raise ValueError(f"no commit packets paired from {commits_path!r}")
+        raise ValueError(
+            f"no non-empty typed commit rows loaded from {commits_path!r}; "
+            "at least one of pre/post/diff/commit_msg is required"
+        )
     return packets
 
 

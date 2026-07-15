@@ -29,6 +29,7 @@ RAISES with WHERE + WHAT.  No silent fallback, no fabricated channels.
 from __future__ import annotations
 
 import random
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -40,6 +41,9 @@ from cppmega_mlx.data.ast_fim import (
     AstFimResult,
     apply_ast_fim,
     domain_preserving_document_spans,
+    has_safe_physical_middle,
+    sample_physical_middle_span,
+    span_has_single_physical_source,
     logical_document_spans,
 )
 from cppmega_mlx.data.code_packet import CodePacket
@@ -50,15 +54,74 @@ from cppmega_mlx.data.fim import (
     FIMSpecialTokenInput,
     INSERTED_TOKEN_SOURCE_INDEX,
     apply_domain_preserving_fim_permutation,
-    sample_middle_span,
 )
 from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_TOKEN_IDS,
     OBJECTIVE_BOUNDARY_TOKEN_IDS,
 )
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+)
 
 RecoveryKind = Literal["symbol", "type", "callee"]
 SOURCE_TOKEN_INDICES_METADATA_KEY = "source_token_indices"
+
+
+def ifim_instruction_ids_by_document(packet: CodePacket) -> dict[int, list[int]]:
+    """Return exact logical-document IFIM bindings without broadcasting."""
+
+    document_spans = logical_document_spans(packet)
+    if packet.ifim_instruction_token_ids is not None:
+        instruction = _token_list(
+            packet.ifim_instruction_token_ids,
+            where="ifim: CodePacket.ifim_instruction_token_ids",
+        )
+        if not instruction:
+            return {}
+        if len(document_spans) != 1:
+            raise ValueError(
+                "packet-wide ifim_instruction_token_ids is ambiguous for a "
+                "multi-document CodePacket"
+            )
+        return {document_spans[0][2]: instruction}
+
+    raw = packet.metadata.get(SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN)
+    if raw is None:
+        return {}
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError(
+            f"{SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN} must be a sequence"
+        )
+    if len(raw) != len(document_spans):
+        raise ValueError(
+            f"{SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN} count {len(raw)} != "
+            f"logical document count {len(document_spans)}"
+        )
+    bindings: dict[int, list[int]] = {}
+    for (_start, _end, document_id), raw_instruction in zip(
+        document_spans,
+        raw,
+        strict=True,
+    ):
+        if not isinstance(raw_instruction, Sequence) or isinstance(
+            raw_instruction, (str, bytes)
+        ):
+            raise ValueError(
+                f"{SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN}[{document_id}] "
+                "must be a token sequence"
+            )
+        instruction = list(raw_instruction)
+        if any(
+            not isinstance(token_id, int) or isinstance(token_id, bool)
+            for token_id in instruction
+        ):
+            raise ValueError(
+                f"{SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN}[{document_id}] "
+                "must contain integer token ids"
+            )
+        if instruction:
+            bindings[document_id] = instruction
+    return bindings
 
 
 @dataclass(frozen=True)
@@ -277,6 +340,7 @@ def _random_fim_result(
     packet: CodePacket,
     *,
     instruction_token_ids: list[int] | None,
+    instruction_ids_by_document: Mapping[int, Sequence[int]] | None = None,
     seed: int | None,
     rng: random.Random | None,
     spm_rate: float,
@@ -288,31 +352,43 @@ def _random_fim_result(
         raise ValueError(f"spm_rate must be in [0, 1], got {spm_rate}")
     rand = rng if rng is not None else random.Random(seed)
     all_tokens = _token_list(packet.token_ids, where="fim: CodePacket.token_ids")
+    if instruction_token_ids is not None and instruction_ids_by_document is not None:
+        raise ValueError("pass packet-wide or per-document IFIM instruction, not both")
     eligible_documents = [
         region
         for region in domain_preserving_document_spans(packet)
-        if region.content_end - region.content_start >= 3
+        if (
+            region.content_end - region.content_start >= 3
+            and has_safe_physical_middle(packet, region)
+            and (
+                instruction_ids_by_document is None
+                or region.document_id in instruction_ids_by_document
+            )
+        )
     ]
     if not eligible_documents:
         raise ValueError(
             "fim requires at least one logical document with at least 3 tokens"
         )
     region = eligible_documents[rand.randrange(len(eligible_documents))]
+    bound_instruction = instruction_token_ids
+    if instruction_ids_by_document is not None:
+        bound_instruction = list(instruction_ids_by_document[region.document_id])
     document_start = region.document_start
     document_end = region.document_end
     tokens = all_tokens[document_start:document_end]
-    span = sample_middle_span(region.content_end - region.content_start, rng=rand)
+    span = sample_physical_middle_span(packet, region, rng=rand)
     mode: FIMMode = "spm" if rand.random() < spm_rate else "psm"
     permuted = apply_domain_preserving_fim_permutation(
         tokens,
         source_start=document_start,
-        instruction_token_ids=instruction_token_ids,
+        instruction_token_ids=bound_instruction,
         span=span,
         mode=mode,
         special_token_ids=special_token_ids,
         where=f"fim logical document [{document_start}, {document_end})",
     )
-    kind = "fim" if instruction_token_ids is None else "ifim"
+    kind = "fim" if bound_instruction is None else "ifim"
     return AstFimResult(
         token_ids=permuted.token_ids,
         span=span,
@@ -357,17 +433,16 @@ def build_ifim(
 ) -> ObjectiveExample:
     """Instruction-aware token-span FIM from typed upstream instruction IDs."""
 
-    instruction_ids = _token_list(
-        packet.ifim_instruction_token_ids,
-        where="ifim: CodePacket.ifim_instruction_token_ids",
-    )
-    if not instruction_ids:
+    instruction_bindings = ifim_instruction_ids_by_document(packet)
+    if not instruction_bindings:
         raise ValueError(
-            "ifim: CodePacket.ifim_instruction_token_ids must not be empty"
+            "ifim requires ifim_instruction_token_ids typed and bound to one "
+            "logical document"
         )
     result = _random_fim_result(
         packet,
-        instruction_token_ids=instruction_ids,
+        instruction_token_ids=None,
+        instruction_ids_by_document=instruction_bindings,
         seed=seed,
         rng=rng,
         spm_rate=spm_rate,
@@ -571,7 +646,10 @@ def build_recovery(
         (start, end, marker_id, region)
         for start, end, marker_id in _recovery_runs(marker)
         for region in regions
-        if region.content_start <= start < end <= region.content_end
+        if (
+            region.content_start <= start < end <= region.content_end
+            and span_has_single_physical_source(packet, start=start, end=end)
+        )
     ]
     if not candidates:
         raise ValueError(
@@ -666,4 +744,5 @@ __all__ = [
     "build_ifim",
     "build_pre_to_post",
     "build_recovery",
+    "ifim_instruction_ids_by_document",
 ]

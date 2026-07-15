@@ -407,6 +407,9 @@ def objective_source_from_tokenized_row(
             "source_index": int(source_index),
             "platform_ids": row.get(PLATFORM_IDS_COLUMN),
             "source_platform_ids": row.get(SOURCE_PLATFORM_IDS_COLUMN),
+            SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: row.get(
+                SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN
+            ),
             SOURCE_IDENTITY_REGISTRY_COLUMN: row.get(SOURCE_IDENTITY_REGISTRY_COLUMN),
             SYMBOL_IDENTITIES_COLUMN: row.get(SYMBOL_IDENTITIES_COLUMN),
             "token_change_mask_pre": row.get("token_change_mask_pre"),

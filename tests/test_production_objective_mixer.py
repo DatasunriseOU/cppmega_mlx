@@ -32,7 +32,10 @@ from cppmega_mlx.data.graph_recipe import (
     stage1_graph_recipe_payload,
 )
 from cppmega_mlx.data.source_identity import source_identity
-from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
+    REQUIRED_SPECIAL_TOKEN_IDS,
+)
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     PACKED_ROWS_ALL_COLUMNS,
     NUM_DOCS_COLUMN,
@@ -508,6 +511,26 @@ def test_multi_document_pack_does_not_guess_ifim_constituent_binding() -> None:
 
     normalized = normalize_megatron_objective_source_row(packed, source_index=0)
     assert IFIM_INSTRUCTION_TOKEN_IDS_COLUMN not in normalized
+
+    packet = CodePacket(
+        token_ids=_arr([10, 11, 12, 13, 20, 21, 22, 23]),
+        document_ids=_arr([1, 1, 1, 1, 2, 2, 2, 2]),
+        metadata={SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: [[50], [51]]},
+    )
+    realized = EligibilityAwareTaskMixer({TaskKind.IFIM: 1.0}, seed=7).materialize(
+        ObjectiveSource(code_packet=packet),
+        step_index=0,
+    )
+    selected_span = realized.example.metadata["source_document_span"]
+    expected_instruction = 50 if selected_span == (0, 4) else 51
+    sequence = [
+        int(realized.example.input_ids[0]),
+        *[int(value) for value in np.asarray(realized.example.target_ids).tolist()],
+    ]
+    assert sequence[:2] == [
+        REQUIRED_SPECIAL_TOKEN_IDS["FIM_INSTRUCTION"],
+        expected_instruction,
+    ]
 
 
 def test_commit_section_schema_round_trips_through_packer(tmp_path) -> None:
@@ -1153,6 +1176,129 @@ def test_permuted_objective_selects_exactly_one_logical_document() -> None:
     assert document.row["source_platform_ids"] == [selected_platform]
     selected_tokens = {10, 11, 12} if selected_source == 77 else {13, 14, 15}
     assert set(document.token_ids) & {10, 11, 12, 13, 14, 15} <= selected_tokens
+
+
+def test_transformed_objective_allows_mixed_context_when_middle_is_one_physical_source() -> None:
+    first = _physical_source("src/first.cpp")
+    second = _physical_source("src/second.cpp")
+    start = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]
+    end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
+    tokens = [2, start, 10, 11, 12, 13, 20, 21, 22, 23, end, 3]
+    token_count = len(tokens)
+    zeros = _arr([0] * token_count)
+    packet = CodePacket(
+        token_ids=_arr(tokens),
+        document_ids=_arr([1] * token_count),
+        structure_ids=_arr([1] * token_count),
+        dep_levels=zeros,
+        ast_depth=zeros,
+        sibling_index=zeros,
+        ast_node_type=_arr([1] * token_count),
+        symbol_ids=zeros,
+        call_targets=zeros,
+        type_refs=zeros,
+        def_use=zeros,
+        domain_ids=_arr([0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]),
+        role_ids=_arr([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]),
+        entity_ids=zeros,
+        scope_ids=zeros,
+        confidence_ids=_arr([0, 4, 1, 1, 1, 1, 1, 1, 1, 1, 4, 0]),
+        source_doc_ids=_arr([1] * 6 + [2] * 4 + [2, 2]),
+        source_identity_ids=mx.array(
+            np.asarray(
+                [first.source_identity_id] * 6
+                + [second.source_identity_id] * 4
+                + [second.source_identity_id] * 2,
+                dtype=np.uint64,
+            )
+        ),
+        chunk_starts=_arr([2, 4, 6]),
+        chunk_ends=_arr([4, 6, 8]),
+        chunk_kinds=_arr([1, 1, 1]),
+        chunk_dep_levels=zeros[:3],
+        call_edges=EdgeIndex.from_pairs([], relation="call", num_nodes=3),
+        type_edges=EdgeIndex.from_pairs([], relation="type", num_nodes=3),
+        domain_edges=DomainEdgeIndex.empty(),
+        build_edges=DomainEdgeIndex.empty(),
+        shell_edges=DomainEdgeIndex.empty(),
+        diagnostic_edges=DomainEdgeIndex.empty(),
+        cross_domain_edges=DomainEdgeIndex.empty(),
+        metadata={
+            "platform_ids": [2],
+            "source_platform_ids": [[2]],
+            "source_identity_registry": [first.as_dict(), second.as_dict()],
+        },
+    )
+    source = ObjectiveSource(code_packet=packet)
+
+    realized = EligibilityAwareTaskMixer({TaskKind.FIM: 1.0}, seed=53).materialize(
+        source, step_index=0
+    )
+    assert realized.task is TaskKind.FIM
+    assert realized.example.metadata["source_document_span"] == (0, token_count)
+
+    span = realized.example.metadata["span"]
+    region_start = 2
+    middle_start = region_start + int(span[0])
+    middle_end = region_start + int(span[1])
+    middle_ids = np.asarray(packet.source_identity_ids)[middle_start:middle_end]
+    assert len(set(int(value) for value in middle_ids)) == 1
+
+    document = materialize_megatron_document(
+        realized,
+        source,
+        require_production_sidecars=True,
+    )
+    assert set(document.row["token_source_identity_ids"]) == {
+        first.source_identity_id,
+        second.source_identity_id,
+    }
+
+
+def test_transformed_objective_rejects_context_without_safe_physical_middle() -> None:
+    first = _physical_source("src/first.cpp")
+    second = _physical_source("src/second.cpp")
+    start = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]
+    end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
+    tokens = [2, start, 10, 20, 11, 21, 12, 22, end, 3]
+    token_count = len(tokens)
+    zeros = _arr([0] * token_count)
+    packet = CodePacket(
+        token_ids=_arr(tokens),
+        document_ids=_arr([1] * token_count),
+        source_doc_ids=_arr([1, 2, 1, 2, 1, 2, 1, 2, 1, 2]),
+        source_identity_ids=mx.array(
+            np.asarray(
+                [
+                    first.source_identity_id,
+                    first.source_identity_id,
+                    second.source_identity_id,
+                    first.source_identity_id,
+                    second.source_identity_id,
+                    first.source_identity_id,
+                    second.source_identity_id,
+                    first.source_identity_id,
+                    second.source_identity_id,
+                    second.source_identity_id,
+                ],
+                dtype=np.uint64,
+            )
+        ),
+        chunk_starts=_arr([2, 3, 4, 5, 6]),
+        chunk_ends=_arr([3, 4, 5, 6, 7]),
+        chunk_kinds=_arr([1, 1, 1, 1, 1]),
+        chunk_dep_levels=_arr([0, 0, 0, 0, 0]),
+        metadata={
+            "platform_ids": [2],
+            "source_platform_ids": [[2]],
+            "source_identity_registry": [first.as_dict(), second.as_dict()],
+        },
+    )
+
+    with pytest.raises(ValueError, match="no eligible objective.*physical source"):
+        EligibilityAwareTaskMixer({TaskKind.FIM: 1.0}, seed=53).materialize(
+            ObjectiveSource(code_packet=packet), step_index=0
+        )
 
 
 def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:

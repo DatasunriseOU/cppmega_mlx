@@ -22,7 +22,10 @@ from cppmega_mlx.data.domain_schema import (
     DomainRoleKind,
     ParseConfidence,
 )
-from cppmega_mlx.data.fim import INSERTED_TOKEN_SOURCE_INDEX
+from cppmega_mlx.data.fim import (
+    INSERTED_TOKEN_SOURCE_INDEX,
+    domain_preserving_fim_region,
+)
 from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.source_identity import (
     MAX_ROW_LOCAL_DOC_ID,
@@ -641,6 +644,83 @@ def _source_identity_registry_for_ids(
     return [validated[identity_id].as_dict() for identity_id in referenced]
 
 
+def _validate_transformed_middle_provenance(
+    packet: CodePacket,
+    *,
+    metadata: Mapping[str, object],
+    objective_kind: str,
+) -> None:
+    """Require the supervised transformed middle to stay source-local.
+
+    Cross-file context is valid for code objectives and is retained in the
+    output sidecars.  The answer span itself must remain within one exact
+    ``(source_doc_id, source_identity_id)`` run; otherwise a transformed
+    objective would supervise a synthetic cross-file fragment.
+    """
+
+    if packet.source_doc_ids is None or packet.source_identity_ids is None:
+        return
+
+    source_length = int(packet.token_ids.shape[0])
+    source_doc_ids = _packet_vector(packet, "source_doc_ids", length=source_length)
+    source_identity_ids = _packet_vector(
+        packet,
+        "source_identity_ids",
+        length=source_length,
+    )
+    raw_document_span = metadata.get("source_document_span")
+    if not isinstance(raw_document_span, (tuple, list)) or len(raw_document_span) != 2:
+        raise ValueError(
+            f"{objective_kind}: source_document_span must be a pair for provenance"
+        )
+    document_start, document_end = (int(value) for value in raw_document_span)
+    if not 0 <= document_start < document_end <= source_length:
+        raise ValueError(
+            f"{objective_kind}: source_document_span [{document_start}, "
+            f"{document_end}) is outside 0..{source_length}"
+        )
+
+    raw_span = metadata.get("span")
+    if not isinstance(raw_span, (tuple, list)) or len(raw_span) != 2:
+        raise ValueError(f"{objective_kind}: span must be a pair for provenance")
+    span_start, span_end = (int(value) for value in raw_span)
+    if objective_kind in {
+        TaskKind.FIM.value,
+        TaskKind.AST_FIM.value,
+        TaskKind.IFIM.value,
+    }:
+        source_tokens = _ints(packet.token_ids, where="CodePacket.token_ids")
+        region = domain_preserving_fim_region(
+            source_tokens[document_start:document_end],
+            where=f"{objective_kind} provenance document",
+        )
+        absolute_start = document_start + region.content_start + span_start
+        absolute_end = document_start + region.content_start + span_end
+    else:
+        absolute_start = span_start
+        absolute_end = span_end
+    if not document_start <= absolute_start < absolute_end <= document_end:
+        raise ValueError(
+            f"{objective_kind}: supervised middle [{absolute_start}, "
+            f"{absolute_end}) is outside source document [{document_start}, "
+            f"{document_end})"
+        )
+    source_pairs = {
+        (source_doc_ids[index], source_identity_ids[index])
+        for index in range(absolute_start, absolute_end)
+    }
+    if any(doc_id <= 0 or identity_id <= 0 for doc_id, identity_id in source_pairs):
+        raise ValueError(
+            f"{objective_kind}: supervised middle requires positive source "
+            "document and physical identity sidecars"
+        )
+    if len(source_pairs) != 1:
+        raise ValueError(
+            f"{objective_kind}: supervised middle crosses physical source "
+            f"identities ({len(source_pairs)} provenance pairs)"
+        )
+
+
 def _symbol_identity_records(packet: CodePacket) -> list[dict[str, object]]:
     raw_records = packet.metadata.get(SYMBOL_IDENTITIES_COLUMN, [])
     registry = SymbolIdentityRegistry()
@@ -965,6 +1045,11 @@ def materialize_megatron_document(
             transformed_tokens=tokens,
             objective_kind=realized.task.value,
         )
+        _validate_transformed_middle_provenance(
+            packet,
+            metadata=example.metadata,
+            objective_kind=realized.task.value,
+        )
         row["doc_ids"] = _permute_provenance_vector(
             packet_document_ids,
             source_indices,
@@ -1076,11 +1161,6 @@ def materialize_megatron_document(
                 raise ValueError(
                     f"{realized.task.value}: transformed "
                     "token_source_identity_ids must remain positive uint64 values"
-                )
-            if len(set(row["token_source_identity_ids"])) != 1:
-                raise ValueError(
-                    f"{realized.task.value}: transformed objective requires "
-                    "exactly one positive physical source identity"
                 )
         row[SOURCE_IDENTITY_REGISTRY_COLUMN] = _source_identity_registry_for_ids(
             packet,

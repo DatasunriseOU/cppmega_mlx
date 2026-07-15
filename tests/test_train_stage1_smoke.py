@@ -134,11 +134,43 @@ def test_code_loader_preserves_packed_document_ids_for_domain_fim(
     assert len(domain_preserving_document_spans(packet)) == 2
 
 
-def test_commit_loader_rejects_legacy_rendered_wrapper_fixture() -> None:
-    with pytest.raises(ValueError, match="typed commit columns"):
-        load_commit_packets(
-            GOLDEN_MINI / "commits" / "commits.parquet", vocab_size=VOCAB
-        )
+def test_commit_loader_accepts_typed_golden_fixture() -> None:
+    packets = load_commit_packets(
+        GOLDEN_MINI / "commits" / "commits.parquet", vocab_size=VOCAB
+    )
+    # ``--format both`` emits two full pre/post rows and two valid diff-only
+    # rows.  The loader preserves both shapes; objective eligibility decides
+    # which task can consume each packet.
+    assert len(packets) == 4
+    assert all(packet.commit_msg is not None for packet in packets)
+    assert all(int(packet.commit_msg.shape[0]) >= 2 for packet in packets)
+    assert sum(packet.post_token_ids is None for packet in packets) == 2
+
+
+def test_commit_loader_preserves_partial_sections_without_synthesizing_them(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "partial_commits.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "pre_token_ids": [[10, 11], []],
+                "post_token_ids": [[], []],
+                "diff_token_ids": [[30, 31], [32]],
+                "commit_msg_token_ids": [[40], []],
+            }
+        ),
+        path,
+    )
+
+    packets = load_commit_packets(path, vocab_size=VOCAB)
+
+    assert len(packets) == 2
+    assert packets[0].post_token_ids is None
+    assert np.asarray(packets[0].commit_msg).tolist() == [40]
+    assert packets[1].pre_token_ids is None
+    assert packets[1].commit_msg is None
+    assert np.asarray(packets[1].diff_token_ids).tolist() == [32]
 
 
 def test_aligned_step_passes_channels_reordered_step_omits_them() -> None:

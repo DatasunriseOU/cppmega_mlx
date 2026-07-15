@@ -99,6 +99,151 @@ class DomainPreservingDocumentSpan:
     content_end: int
 
 
+def _provenance_values(
+    packet: CodePacket,
+    *,
+    start: int,
+    end: int,
+) -> tuple[list[int] | None, list[int] | None]:
+    """Return validated source-document and physical-source vectors for a span."""
+
+    token_count = _token_count(packet)
+    if not 0 <= start < end <= token_count:
+        raise ValueError(
+            f"physical source span [{start}, {end}) is outside 0..{token_count}"
+        )
+
+    def read(field: str) -> list[int] | None:
+        value = getattr(packet, field)
+        if value is None:
+            return None
+        array = np.asarray(value).reshape(-1)
+        if len(array) != token_count:
+            raise ValueError(
+                f"CodePacket.{field} length {len(array)} != token length {token_count}"
+            )
+        values = [int(item) for item in array.tolist()]
+        selected = values[start:end]
+        if any(item <= 0 for item in selected):
+            raise ValueError(
+                f"CodePacket.{field} must be positive on physical span "
+                f"[{start}, {end})"
+            )
+        return values
+
+    return read("source_doc_ids"), read("source_identity_ids")
+
+
+def physical_source_runs(
+    packet: CodePacket,
+    *,
+    start: int,
+    end: int,
+) -> tuple[tuple[int, int], ...]:
+    """Return contiguous provenance runs inside ``[start, end)``.
+
+    A run changes when either the row-local source document or the physical
+    source identity changes.  If provenance sidecars are absent, the whole
+    interval is one run; production materialization separately requires those
+    sidecars.  This lets legacy unit fixtures keep their old behavior while
+    modern packed rows retain cross-file context safely.
+    """
+
+    source_doc_ids, source_identity_ids = _provenance_values(
+        packet,
+        start=start,
+        end=end,
+    )
+    if source_doc_ids is None and source_identity_ids is None:
+        return ((start, end),)
+
+    runs: list[tuple[int, int]] = []
+    run_start = start
+
+    def key(index: int) -> tuple[int | None, int | None]:
+        return (
+            None if source_doc_ids is None else source_doc_ids[index],
+            None if source_identity_ids is None else source_identity_ids[index],
+        )
+
+    previous = key(start)
+    for index in range(start + 1, end):
+        current = key(index)
+        if current != previous:
+            runs.append((run_start, index))
+            run_start = index
+            previous = current
+    runs.append((run_start, end))
+    return tuple(runs)
+
+
+def span_has_single_physical_source(
+    packet: CodePacket,
+    *,
+    start: int,
+    end: int,
+) -> bool:
+    """Whether a token span stays within one exact source provenance run."""
+
+    return len(physical_source_runs(packet, start=start, end=end)) == 1
+
+
+def has_safe_physical_middle(
+    packet: CodePacket,
+    region: DomainPreservingDocumentSpan,
+) -> bool:
+    """Whether a domain region contains a source-local FIM middle candidate."""
+
+    for run_start, run_end in physical_source_runs(
+        packet,
+        start=region.content_start,
+        end=region.content_end,
+    ):
+        min_start = max(run_start, region.content_start + 1)
+        max_start = min(run_end - 2, region.content_end - 2)
+        if min_start <= max_start:
+            return True
+    return False
+
+
+def sample_physical_middle_span(
+    packet: CodePacket,
+    region: DomainPreservingDocumentSpan,
+    *,
+    rng: random.Random,
+) -> tuple[int, int]:
+    """Sample a non-empty FIM middle wholly within one provenance run.
+
+    The returned offsets are relative to ``region.content_start``, matching the
+    existing ``apply_domain_preserving_fim_permutation`` contract.
+    """
+
+    candidates: list[tuple[int, int, int, int]] = []
+    for run_start, run_end in physical_source_runs(
+        packet,
+        start=region.content_start,
+        end=region.content_end,
+    ):
+        min_start = max(run_start, region.content_start + 1)
+        max_start = min(run_end - 2, region.content_end - 2)
+        max_end = min(run_end, region.content_end - 1)
+        if min_start <= max_start and min_start + 1 <= max_end:
+            candidates.append((min_start, max_start, min_start + 1, max_end))
+    if not candidates:
+        raise NoEligibleChunkError(
+            "fim: no physical source run yields non-empty prefix/middle/suffix"
+        )
+    if len(candidates) == 1:
+        min_start, max_start, _min_end, max_end = candidates[0]
+    else:
+        min_start, max_start, _min_end, max_end = candidates[
+            rng.randrange(len(candidates))
+        ]
+    start = rng.randint(min_start, max_start)
+    end = rng.randint(start + 1, max_end)
+    return start - region.content_start, end - region.content_start
+
+
 def _token_count(packet: CodePacket) -> int:
     if packet.token_ids.ndim != 1:
         raise ValueError(
@@ -201,6 +346,7 @@ def _chunk_arrays(packet: CodePacket) -> tuple[list[int], list[int], list[int] |
 
 
 def _eligible_chunks(
+    packet: CodePacket,
     starts: Sequence[int],
     ends: Sequence[int],
     length: int,
@@ -233,7 +379,8 @@ def _eligible_chunks(
             == (document_start, document_end, document_id)
         )
         if region.content_start < start and end < region.content_end:
-            eligible.append(idx)
+            if span_has_single_physical_source(packet, start=start, end=end):
+                eligible.append(idx)
     return eligible
 
 
@@ -252,7 +399,7 @@ def _select_ast_span_in_document(
         )
     starts, ends, _kinds = _chunk_arrays(packet)
     document_regions = domain_preserving_document_spans(packet)
-    eligible = _eligible_chunks(starts, ends, length, document_regions)
+    eligible = _eligible_chunks(packet, starts, ends, length, document_regions)
     if not eligible:
         raise NoEligibleChunkError(
             "ast_fim: no clang chunk yields non-empty context inside one "
@@ -302,7 +449,13 @@ def eligible_ast_chunk_indices(packet: CodePacket) -> tuple[int, ...]:
         return ()
     starts, ends, _kinds = _chunk_arrays(packet)
     return tuple(
-        _eligible_chunks(starts, ends, length, domain_preserving_document_spans(packet))
+        _eligible_chunks(
+            packet,
+            starts,
+            ends,
+            length,
+            domain_preserving_document_spans(packet),
+        )
     )
 
 
@@ -312,7 +465,10 @@ def _char_document_span(
     eligible = [
         region
         for region in domain_preserving_document_spans(packet)
-        if region.content_end - region.content_start >= 3
+        if (
+            region.content_end - region.content_start >= 3
+            and has_safe_physical_middle(packet, region)
+        )
     ]
     if not eligible:
         raise ValueError(
@@ -365,20 +521,14 @@ def apply_ast_fim(
             region = _char_document_span(packet, rng=rand)
             document_start = region.document_start
             document_end = region.document_end
-            start, end = sample_middle_span(
-                region.content_end - region.content_start,
-                rng=rand,
-            )
+            start, end = sample_physical_middle_span(packet, region, rng=rand)
             chunk_index = None
             kind = "char_fim"
     else:
         region = _char_document_span(packet, rng=rand)
         document_start = region.document_start
         document_end = region.document_end
-        start, end = sample_middle_span(
-            region.content_end - region.content_start,
-            rng=rand,
-        )
+        start, end = sample_physical_middle_span(packet, region, rng=rand)
         chunk_index = None
         kind = "char_fim"
 
@@ -451,20 +601,14 @@ def apply_ast_ifim(
             region = _char_document_span(packet, rng=rand)
             document_start = region.document_start
             document_end = region.document_end
-            start, end = sample_middle_span(
-                region.content_end - region.content_start,
-                rng=rand,
-            )
+            start, end = sample_physical_middle_span(packet, region, rng=rand)
             chunk_index = None
             kind = "char_ifim"
     else:
         region = _char_document_span(packet, rng=rand)
         document_start = region.document_start
         document_end = region.document_end
-        start, end = sample_middle_span(
-            region.content_end - region.content_start,
-            rng=rand,
-        )
+        start, end = sample_physical_middle_span(packet, region, rng=rand)
         chunk_index = None
         kind = "char_ifim"
 
@@ -500,6 +644,10 @@ __all__ = [
     "apply_ast_ifim",
     "domain_preserving_document_spans",
     "eligible_ast_chunk_indices",
+    "has_safe_physical_middle",
     "logical_document_spans",
+    "physical_source_runs",
+    "sample_physical_middle_span",
+    "span_has_single_physical_source",
     "select_ast_span",
 ]

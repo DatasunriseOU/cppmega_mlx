@@ -20,20 +20,21 @@ from cppmega_mlx.data.domain_schema import (
 )
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.symbol_identity import compute_symbol_id
-from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
+    REQUIRED_SPECIAL_TOKEN_IDS,
+)
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     materialize_megatron_document,
 )
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
-    RealizedObjective,
 )
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_ROUTE_COLUMNS,
     remap_objective_routes,
 )
-from cppmega_mlx.training.objectives import build_fim
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES, TaskKind
 from scripts import materialize_megatron_objectives as materializer
 from scripts.nanochat_data.clang_enriched_to_parquet import _SCHEMA
@@ -876,7 +877,7 @@ def test_commit_objectives_emit_explicit_cpp_domain_sidecars(
     )
 
 
-def test_transformed_dependency_objective_rejects_multiple_physical_sources(
+def test_transformed_dependency_objective_accepts_mixed_context_with_source_local_middle(
     tmp_path: Path,
 ) -> None:
     row, _physical_id = _dependency_row()
@@ -891,41 +892,42 @@ def test_transformed_dependency_objective_rejects_multiple_physical_sources(
     source = next(materializer._iter_sources([str(source_path)], seed=29))
 
     for task in (TaskKind.FIM, TaskKind.AST_FIM, TaskKind.IFIM):
-        with pytest.raises(
-            ValueError,
-            match="no eligible objective.*spans 2 physical source identities",
-        ):
-            EligibilityAwareTaskMixer({task: 1.0}, seed=29).materialize(
-                source, step_index=0
-            )
+        realized = EligibilityAwareTaskMixer({task: 1.0}, seed=29).materialize(
+            source, step_index=0
+        )
+        document = materialize_megatron_document(
+            realized,
+            source,
+            require_production_sidecars=True,
+        )
+        assert set(document.row["token_source_identity_ids"]) == {
+            first_registry[0]["source_identity_id"],
+            second.source_identity_id,
+        }
+        assert {
+            entry["source_identity_id"]: entry
+            for entry in document.row["source_identity_registry"]
+        } == {
+            entry["source_identity_id"]: entry
+            for entry in row["source_identity_registry"]
+        }
     for task in (
         TaskKind.SYMBOL_RECOVERY,
         TaskKind.TYPE_RECOVERY,
         TaskKind.CALLEE_RECOVERY,
     ):
-        with pytest.raises(
-            ValueError,
-            match="no eligible objective.*whole code packet spans 2 physical",
-        ):
-            EligibilityAwareTaskMixer({task: 1.0}, seed=29).materialize(
-                source, step_index=0
-            )
-
-    assert source.code_packet is not None
-    realized = RealizedObjective(
-        task=TaskKind.FIM,
-        example=build_fim(source.code_packet, seed=29),
-        ineligible={},
-        source_index=0,
-    )
-
-    with pytest.raises(ValueError, match="exactly one positive physical source"):
-        materialize_megatron_document(
+        realized = EligibilityAwareTaskMixer({task: 1.0}, seed=29).materialize(
+            source, step_index=0
+        )
+        document = materialize_megatron_document(
             realized,
             source,
             require_production_sidecars=True,
         )
-
+        assert set(document.row["token_source_identity_ids"]) == {
+            first_registry[0]["source_identity_id"],
+            second.source_identity_id,
+        }
 
 def test_full_quota_materialization_accepts_mixed_dependency_and_commit_rows(
     tmp_path: Path,
@@ -1213,20 +1215,45 @@ def test_actual_case3_multi_physical_mix_materializes_full_quota_via_cli(
         {task.value: count for task, count in expected_quotas.items()}
     )
 
-    multi_causal_rows = []
+    multi_context_rows = []
     for row_index, kind in enumerate(kinds):
         identities = set(_valid_values(table, "token_source_identity_ids", row_index))
         if identities == multi_physical_ids:
-            assert kind == TaskKind.CAUSAL_LM.value
-            multi_causal_rows.append(row_index)
-    assert multi_causal_rows
-    for row_index in multi_causal_rows:
-        assert (
-            _valid_values(table, "token_source_doc_ids", row_index)
-            == code_rows[0]["token_source_doc_ids"]
-        )
-        assert not any(_valid_values(table, "token_change_mask_pre", row_index))
-        assert not any(_valid_values(table, "token_change_mask_post", row_index))
+            multi_context_rows.append(row_index)
+            if kind == TaskKind.CAUSAL_LM.value:
+                assert (
+                    _valid_values(table, "token_source_doc_ids", row_index)
+                    == code_rows[0]["token_source_doc_ids"]
+                )
+                assert not any(_valid_values(table, "token_change_mask_pre", row_index))
+                assert not any(_valid_values(table, "token_change_mask_post", row_index))
+                continue
+            tokens = _valid_values(table, "input_ids", row_index)
+            middle_positions = [
+                index
+                for index, token in enumerate(tokens)
+                if int(token) == REQUIRED_SPECIAL_TOKEN_IDS["FIM_MIDDLE"]
+            ]
+            assert len(middle_positions) == 1
+            answer_end = next(
+                index
+                for index in range(middle_positions[0] + 1, len(tokens))
+                if tokens[index]
+                in {
+                    REQUIRED_SPECIAL_TOKEN_IDS["EOT"],
+                    *(
+                        token_id
+                        for role, token_id in DOMAIN_DELIMITER_TOKEN_IDS.items()
+                        if role.endswith("_END")
+                    ),
+                }
+            )
+            answer_ids = _valid_values(table, "token_source_identity_ids", row_index)[
+                middle_positions[0] + 1 : answer_end
+            ]
+            assert answer_ids
+            assert len(set(answer_ids)) == 1
+    assert multi_context_rows
 
     artifact = json.loads(
         (output_dir / "objective_materialization.json").read_text(encoding="utf-8")
