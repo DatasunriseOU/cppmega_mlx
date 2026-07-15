@@ -958,13 +958,17 @@ def extract_cache_access_receipt(status: str) -> dict:
         "adopt",
         "back_compat",
         "orphan_adopt",
+        "hit_legacy_identity_override",
     }
-    return {
+    receipt = {
         **extract_cache_config_receipt(),
         "status": status,
         "hit": status == "hit",
         "reused": reused,
     }
+    if status == "hit_legacy_identity_override":
+        receipt["legacy_identity_override"] = True
+    return receipt
 
 
 @contextmanager
@@ -1196,8 +1200,9 @@ def _validate_completed_external_cache(
     repo: str,
     repo_dir: Path,
     jsonl: Path,
+    project_id: str,
 ) -> int:
-    """Validate a hit with extract_git_history's exact source/job contract."""
+    """Validate a hit with the canonical or explicitly legacy source contract."""
     policy = os.environ.get("CPPMEGA_EXTRACT_BAD_UNIT_POLICY", "fail")
     max_bad_units_raw = os.environ.get("CPPMEGA_EXTRACT_MAX_BAD_UNITS", "0")
     try:
@@ -1221,23 +1226,57 @@ def _validate_completed_external_cache(
             f"max_bad_units={max_bad_units}",
         )
     try:
-        source = extract_history._repo_source_context(
+        canonical_source = extract_history._repo_source_context(
             str(repo_dir),
             max_commits=0,
-            repo_name=repo_dir.name,
+            repo_name=project_id,
             notes="auto",
         )
-        job_fingerprint = extract_history._job_fingerprint(
-            [source],
+        canonical_fingerprint = extract_history._job_fingerprint(
+            [canonical_source],
             checkpoint_commits=extract_history.DEFAULT_CHECKPOINT_COMMITS,
             bad_unit_policy=policy,
             max_bad_units=max_bad_units,
         )
-        completed = extract_history._completed_publication(
-            output_path=jsonl,
-            checkpoint_root=_extract_transaction_checkpoint_path(jsonl),
-            job_fingerprint=job_fingerprint,
-        )
+        checkpoint_root = _extract_transaction_checkpoint_path(jsonl)
+        publication_state = extract_history._load_publication_state(checkpoint_root)
+        if publication_state is None:
+            completed = None
+        elif publication_state.get("job_fingerprint") == canonical_fingerprint:
+            completed = extract_history._completed_publication(
+                output_path=jsonl,
+                checkpoint_root=checkpoint_root,
+                job_fingerprint=canonical_fingerprint,
+            )
+        else:
+            # A published cache made before --repo-name existed is still usable,
+            # but only under an explicit legacy-identity receipt.  Do not accept
+            # an arbitrary mismatched checkpoint: the legacy fingerprint is
+            # computed from the real staged directory name and must match too.
+            legacy_source = extract_history._repo_source_context(
+                str(repo_dir),
+                max_commits=0,
+                repo_name=repo_dir.name,
+                notes="auto",
+            )
+            legacy_fingerprint = extract_history._job_fingerprint(
+                [legacy_source],
+                checkpoint_commits=extract_history.DEFAULT_CHECKPOINT_COMMITS,
+                bad_unit_policy=policy,
+                max_bad_units=max_bad_units,
+            )
+            if publication_state.get("job_fingerprint") != legacy_fingerprint:
+                completed = extract_history._completed_publication(
+                    output_path=jsonl,
+                    checkpoint_root=checkpoint_root,
+                    job_fingerprint=canonical_fingerprint,
+                )
+            else:
+                completed = extract_history._completed_publication(
+                    output_path=jsonl,
+                    checkpoint_root=checkpoint_root,
+                    job_fingerprint=legacy_fingerprint,
+                )
     except Exception as exc:
         raise RepoFailure(
             repo,
@@ -1261,15 +1300,96 @@ def _validate_completed_external_cache(
     return n_records
 
 
+def _cache_first_record_needs_identity_override(
+    jsonl: Path,
+    *,
+    project_id: str,
+) -> bool:
+    """Inspect one record so a legacy cache hit is visible in the receipt."""
+    try:
+        with jsonl.open("r", encoding="utf-8", errors="replace") as handle:
+            line = next((raw for raw in handle if raw.strip()), "")
+        record = json.loads(line)
+    except (OSError, StopIteration, json.JSONDecodeError) as exc:
+        raise RepoFailure(
+            jsonl.parent.name,
+            "extract_cache_validate",
+            f"cannot inspect first cached commit identity in {jsonl}: "
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+    if not isinstance(record, dict):
+        raise RepoFailure(
+            jsonl.parent.name,
+            "extract_cache_validate",
+            f"first cached commit record is not an object: {jsonl}",
+        )
+    raw_repo = record.get("repo")
+    if isinstance(raw_repo, str) and "/" in raw_repo:
+        parsed = sr.require_project_identity(
+            raw_repo,
+            source=f"cached commit record {jsonl}",
+        )
+        if parsed != project_id:
+            raise RepoFailure(
+                jsonl.parent.name,
+                "project_identity",
+                f"cached commit project identity {parsed!r} conflicts with "
+                f"resolved {project_id!r}",
+            )
+    filepath = record.get("filepath")
+    expected_repo_id = extract_history.stable_repo_id(project_id)
+    expected_filepath_id = (
+        extract_history.stable_filepath_id(project_id, filepath)
+        if isinstance(filepath, str) and filepath
+        else None
+    )
+    return (
+        raw_repo != project_id
+        or record.get("repo_stable_id") != expected_repo_id
+        or record.get("filepath_stable_id") != expected_filepath_id
+    )
+
+
+def _resolve_commit_project_id(
+    repo: str,
+    repo_dir: Path,
+    project_id: str | None,
+) -> str | None:
+    """Resolve the identity required by extraction and commit processing.
+
+    The conveyor normally supplies the value from repo_list.json.  The remote
+    lookup is retained for direct driver/test use only when it is authoritative;
+    a synthetic staged checkout with no remote returns ``None`` here and the
+    real extractor then fails with an explicit project-id requirement rather
+    than being relabeled from its directory name.
+    """
+    if project_id is not None:
+        return sr.require_project_identity(
+            project_id,
+            source=f"commit conveyor project identity for {repo}",
+        )
+    if "/" in repo:
+        return sr.require_project_identity(repo, source=f"commit repo {repo}")
+    remote_identity = extract_history.resolve_owner_repo(str(repo_dir))
+    if remote_identity is not None:
+        return sr.require_project_identity(
+            remote_identity,
+            source=f"git remote project identity for {repo}",
+        )
+    return None
+
+
 def _ensure_external_commit_records(
     repo: str,
     repo_dir: Path,
     *,
     revision_guard: CodeRevisionGuard | None,
+    project_id: str | None = None,
 ) -> tuple[Path, int, str]:
     """Validate/reuse or atomically publish one externally owned cache entry."""
     cache_dir = extract_cache_dir(repo)
     cache_jsonl = cache_dir / f"{repo}_commits.jsonl"
+    canonical_project_id = _resolve_commit_project_id(repo, repo_dir, project_id)
     with extract_cache_repo_lock(repo):
         state = _external_cache_state(repo, cache_jsonl)
         if revision_guard is not None:
@@ -1279,18 +1399,39 @@ def _ensure_external_commit_records(
                 repo,
                 repo_dir,
                 cache_jsonl,
+                canonical_project_id or repo_dir.name,
+            )
+            legacy_identity = (
+                canonical_project_id is not None
+                and _cache_first_record_needs_identity_override(
+                    cache_jsonl,
+                    project_id=canonical_project_id,
+                )
             )
             _log(
                 f"EXTRACT-CACHE HIT {repo}: source/publication validated "
                 f"{n_records} records at {cache_jsonl}"
+                + (" (legacy identity override recorded)" if legacy_identity else "")
             )
-            return cache_jsonl, n_records, "hit"
+            return (
+                cache_jsonl,
+                n_records,
+                "hit_legacy_identity_override" if legacy_identity else "hit",
+            )
         if state == "miss":
             _log(
                 f"EXTRACT-CACHE MISS {repo}: no published/checkpointed entry at "
                 f"{cache_jsonl}; extracting explicitly"
             )
-        records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
+        if canonical_project_id is None:
+            records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
+        else:
+            records_jsonl = stage_extract_commits(
+                repo,
+                repo_dir,
+                cache_dir,
+                project_id=canonical_project_id,
+            )
         if records_jsonl.resolve() != cache_jsonl.resolve():
             raise RepoFailure(
                 repo,
@@ -1345,6 +1486,7 @@ def ensure_commit_records(
     resume: bool,
     *,
     revision_guard: CodeRevisionGuard | None = None,
+    project_id: str | None = None,
 ) -> tuple[Path, int, str]:
     """Return (records_jsonl, n_records), running extract_git_history ONLY if needed.
 
@@ -1363,7 +1505,10 @@ def ensure_commit_records(
             repo,
             repo_dir,
             revision_guard=revision_guard,
+            project_id=project_id,
         )
+
+    canonical_project_id = _resolve_commit_project_id(repo, repo_dir, project_id)
 
     cache_dir = extract_cache_dir(repo)
     cache_jsonl = cache_dir / f"{repo}_commits.jsonl"
@@ -1373,9 +1518,21 @@ def ensure_commit_records(
         # (a) Cheap stat-validated cache hit.
         lc = _read_valid_sentinel(cache_jsonl)
         if lc is not None:
+            legacy_identity = (
+                canonical_project_id is not None
+                and _cache_first_record_needs_identity_override(
+                    cache_jsonl,
+                    project_id=canonical_project_id,
+                )
+            )
             _log(f"EXTRACT-CKPT HIT {repo}: reuse {cache_jsonl} ({lc} records); "
-                 f"skip ~extract_git_history")
-            return cache_jsonl, lc, "hit"
+                 f"skip ~extract_git_history"
+                 + (" (legacy identity override recorded)" if legacy_identity else ""))
+            return (
+                cache_jsonl,
+                lc,
+                "hit_legacy_identity_override" if legacy_identity else "hit",
+            )
 
         # (b) Adopt an existing jsonl (stable cache miss but a prior extract exists).
         existing = _discover_existing_jsonl(repo, work_root, work_parent)
@@ -1398,7 +1555,20 @@ def ensure_commit_records(
             tag = "BACK-COMPAT"
             _log(f"EXTRACT-CKPT {tag} {repo}: adopted {existing} -> {cache_jsonl} "
                  f"({n} records); stamped sentinel; skip ~extract_git_history")
-            return cache_jsonl, n, tag.lower().replace("-", "_")
+            legacy_identity = (
+                canonical_project_id is not None
+                and _cache_first_record_needs_identity_override(
+                    cache_jsonl,
+                    project_id=canonical_project_id,
+                )
+            )
+            return (
+                cache_jsonl,
+                n,
+                "hit_legacy_identity_override"
+                if legacy_identity
+                else tag.lower().replace("-", "_"),
+            )
 
         cache_status = "fresh"
         if repo_has_range_done:
@@ -1426,7 +1596,15 @@ def ensure_commit_records(
     cache_dir.mkdir(parents=True, exist_ok=True)
     if revision_guard is not None:
         revision_guard.verify(f"extract_git_history stage for {repo}")
-    records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
+    if canonical_project_id is None:
+        records_jsonl = stage_extract_commits(repo, repo_dir, cache_dir)
+    else:
+        records_jsonl = stage_extract_commits(
+            repo,
+            repo_dir,
+            cache_dir,
+            project_id=canonical_project_id,
+        )
     n = _count_jsonl_lines(records_jsonl)
     if n == 0:
         raise RepoNoCommitRecords(
@@ -3016,6 +3194,7 @@ def run_commits_half(
     range_runner_override: RangeRunner | None = None,
     commit_records_override: CommitRecordsProvider | None = None,
     revision_guard: CodeRevisionGuard | None = None,
+    project_id: str | None = None,
 ) -> tuple[int, int, bool]:
     """Extract commit records once (checkpointed), fan ranges to the pool.
 
@@ -3033,6 +3212,24 @@ def run_commits_half(
     """
     lengths_sorted = tuple(sorted(int(x) for x in lengths_commits))
     smallest = lengths_sorted[0]
+    canonical_project_id: str | None = None
+    if project_id is not None:
+        canonical_project_id = _resolve_commit_project_id(
+            repo,
+            repo_dir,
+            project_id,
+        )
+    elif commit_records_override is None:
+        mapped_project_id = (
+            sr.resolve_project_identity(repo, repo_list)
+            if repo_list is not None
+            else None
+        )
+        canonical_project_id = _resolve_commit_project_id(
+            repo,
+            repo_dir,
+            mapped_project_id,
+        )
 
     if not resume:
         with manifest_lock:
@@ -3070,6 +3267,7 @@ def run_commits_half(
                 manifest,
                 resume,
                 revision_guard=revision_guard,
+                project_id=canonical_project_id,
             )
         else:
             if revision_guard is not None:

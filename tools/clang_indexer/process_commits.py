@@ -2394,6 +2394,70 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _stable_repo_id(repo_name: str) -> str:
+    return hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_filepath_id(repo_name: str, filepath: str) -> str:
+    return hashlib.sha1(
+        f"{repo_name}\0{filepath}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def normalize_record_project_identity(
+    record: dict,
+    *,
+    project_id: str,
+) -> bool:
+    """Normalize one cached record to the explicit canonical project identity.
+
+    Extract caches created before the staged-checkout identity fix may contain
+    ``repo="_src"`` (or another bare directory name).  Those values are safe
+    to replace only when the record does not already contain a different valid
+    canonical project identity.  Stable IDs are always recomputed from the
+    resulting ``owner/repo`` and relative filepath, so a legacy cache cannot
+    carry stale provenance into PR lookup or parquet.
+
+    Returns True when any identity field was repaired.  A conflicting valid
+    project identity raises instead of being silently rewritten.
+    """
+    canonical_project = require_project_identity(
+        project_id,
+        source="process_commits --project-id",
+    )
+    raw_repo = record.get("repo")
+    if isinstance(raw_repo, str) and "/" in raw_repo:
+        parsed_repo = require_project_identity(
+            raw_repo,
+            source=f"commit record {record.get('commit_hash') or '<unknown>'}:repo",
+        )
+        if parsed_repo != canonical_project:
+            raise SymbolIdentityError(
+                f"commit record {record.get('commit_hash') or '<unknown>'}: "
+                f"record project identity {parsed_repo!r} conflicts with "
+                f"--project-id {canonical_project!r}"
+            )
+
+    filepath = record.get("filepath")
+    if not isinstance(filepath, str) or not filepath:
+        raise SymbolIdentityError(
+            f"commit record {record.get('commit_hash') or '<unknown>'}: "
+            f"cannot recompute filepath identity without a non-empty filepath, "
+            f"got {filepath!r}"
+        )
+    expected_repo_id = _stable_repo_id(canonical_project)
+    expected_filepath_id = _stable_filepath_id(canonical_project, filepath)
+    changed = (
+        record.get("repo") != canonical_project
+        or record.get("repo_stable_id") != expected_repo_id
+        or record.get("filepath_stable_id") != expected_filepath_id
+    )
+    record["repo"] = canonical_project
+    record["repo_stable_id"] = expected_repo_id
+    record["filepath_stable_id"] = expected_filepath_id
+    return changed
+
+
 # OUR CppMegaTokenizer (with <SPACE>/<NL> whitespace canonicalization) used ONLY
 # for the dedup hash, so the commit-doc hash is sha1(canonical token_ids). This
 # is distinct from the plain `tokenizers.Tokenizer` above used for token COUNTS.
@@ -2613,6 +2677,7 @@ def process_jsonl_file(
     dedup_near: bool = True,
     pr_lookup: "PRDiscussionLookup | None" = None,
     analysis_cache_entries: int = 128,
+    project_id: str | None = None,
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output.
 
@@ -2633,7 +2698,13 @@ def process_jsonl_file(
         'analysis_cache_hits': 0,
         'analysis_cache_misses': 0,
         'analysis_cache_evictions': 0,
+        'legacy_identity_overrides': 0,
     }
+    canonical_project_id = (
+        require_project_identity(project_id, source="process_commits --project-id")
+        if project_id is not None
+        else None
+    )
     seen_hashes: set[str] = set()
     analysis_cache = (
         AnalysisCache(max_entries=analysis_cache_entries)
@@ -2654,6 +2725,13 @@ def process_jsonl_file(
                 continue
 
             stats['records_read'] += 1
+
+            if canonical_project_id is not None:
+                if normalize_record_project_identity(
+                    record,
+                    project_id=canonical_project_id,
+                ):
+                    stats['legacy_identity_overrides'] += 1
 
             # Tier-2 PR-store lookup glue: set record['pr_discussion'] from the
             # live store (by pr_number then merge/commit SHA) BEFORE the doc is
@@ -2767,6 +2845,14 @@ def main() -> int:
         help='Parent directory containing repos named by each record["repo"]',
     )
     parser.add_argument(
+        '--project-id', default=None,
+        help=(
+            'Explicit canonical owner/repo identity for every input record. '
+            'Required by the conveyor so staged _src paths cannot leak into '
+            'PR lookup or output provenance.'
+        ),
+    )
+    parser.add_argument(
         '--memory-limit-gb', type=float, default=10.0,
         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).',
     )
@@ -2832,6 +2918,15 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if args.project_id is not None:
+        try:
+            args.project_id = require_project_identity(
+                args.project_id,
+                source="process_commits --project-id",
+            )
+        except SymbolIdentityError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     start_memory_guard(args.memory_limit_gb, label="process_commits")
 
     print("Clang commit processor starting", file=sys.stderr)
@@ -2845,6 +2940,8 @@ def main() -> int:
         print(f"  repo_root: {args.repo_root}", file=sys.stderr)
     if args.repo_dir:
         print(f"  repo_dir: {args.repo_dir}", file=sys.stderr)
+    if args.project_id:
+        print(f"  project_id: {args.project_id}", file=sys.stderr)
 
     # Configure libclang
     try:
@@ -2926,6 +3023,7 @@ def main() -> int:
         'analysis_cache_hits': 0,
         'analysis_cache_misses': 0,
         'analysis_cache_evictions': 0,
+        'legacy_identity_overrides': 0,
     }
 
     try:
@@ -2956,6 +3054,7 @@ def main() -> int:
                                 dedup_near=dedup_near,
                                 pr_lookup=pr_lookup,
                                 analysis_cache_entries=args.analysis_cache_entries,
+                                project_id=args.project_id,
                             )
 
                             for k in total_stats:
@@ -2986,6 +3085,13 @@ def main() -> int:
 
     elapsed = time.time() - t0
     print(f"\nTotal: {total_stats}", file=sys.stderr)
+    if args.project_id:
+        print(
+            "  identity normalization: "
+            f"project_id={args.project_id} "
+            f"legacy_identity_overrides={total_stats['legacy_identity_overrides']}",
+            file=sys.stderr,
+        )
     print(f"Time: {elapsed:.1f}s", file=sys.stderr)
     if total_stats['records_read'] > 0:
         rate = total_stats['records_read'] / elapsed

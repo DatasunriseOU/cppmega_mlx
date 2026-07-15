@@ -131,6 +131,64 @@ def test_external_cache_reuses_completed_publication_across_run_roots(
     }
 
 
+def test_external_cache_reuses_legacy_directory_identity_with_explicit_receipt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import streaming_conveyor
+
+    repo = _make_git_repo(tmp_path / "source")
+    _git(repo, "remote", "remove", "origin")
+    cache_root = tmp_path / "shared-extract-cache"
+    output = cache_root / repo.name / f"{repo.name}_commits.jsonl"
+    output.parent.mkdir(parents=True)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(streaming_conveyor.EXTRACT_GIT),
+            "--repo",
+            str(repo),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    first_record = json.loads(output.read_text().splitlines()[0])
+    assert first_record["repo"] == repo.name
+
+    _set_external_cache(monkeypatch, streaming_conveyor, cache_root)
+    monkeypatch.setattr(
+        streaming_conveyor,
+        "stage_extract_commits",
+        lambda *_args, **_kwargs: pytest.fail("legacy publication must be reused"),
+    )
+
+    reused, count, status = streaming_conveyor.ensure_commit_records(
+        repo.name,
+        repo,
+        tmp_path / "work",
+        tmp_path / "work-parent",
+        streaming_conveyor.Manifest(tmp_path / "manifest.json"),
+        resume=True,
+        project_id="tests/cache-repo",
+    )
+
+    assert reused == output
+    assert count > 0
+    assert status == "hit_legacy_identity_override"
+    assert streaming_conveyor.extract_cache_access_receipt(status) == {
+        "root": str(cache_root.resolve()),
+        "mode": "external",
+        "status": "hit_legacy_identity_override",
+        "hit": False,
+        "reused": True,
+        "legacy_identity_override": True,
+    }
+
+
 def test_external_cache_rejects_stale_head_without_reextracting(
     tmp_path: Path,
     monkeypatch,

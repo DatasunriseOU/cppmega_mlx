@@ -626,3 +626,42 @@ def test_cli_publishes_then_reuses_validated_output_without_chunk_replay(tmp_pat
     )
     assert "no commit ranges reprocessed" in second.stdout
     assert output.read_bytes() == original
+
+
+def test_cli_repo_name_overrides_staged_src_directory_identity(tmp_path):
+    import extract_git_history as egh
+
+    repo = tmp_path / "_src"
+    _build_linear_history(repo, edits=2)
+    output = tmp_path / "commits.jsonl"
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--repo",
+        str(repo),
+        "--repo-name",
+        "blender/blender",
+        "--output",
+        str(output),
+        "--notes",
+        "off",
+        "--checkpoint-commits",
+        "2",
+    ]
+
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert completed.returncode == 0, (
+        f"stdout=\n{completed.stdout}\nstderr=\n{completed.stderr}"
+    )
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert records
+    assert {record["repo"] for record in records} == {"blender/blender"}
+    assert {record["repo_stable_id"] for record in records} == {
+        egh.stable_repo_id("blender/blender")
+    }
+    assert all(
+        record["filepath_stable_id"]
+        == egh.stable_filepath_id("blender/blender", record["filepath"])
+        for record in records
+    )

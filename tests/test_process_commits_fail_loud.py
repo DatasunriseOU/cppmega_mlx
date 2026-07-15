@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import sqlite3
 import sys
@@ -27,6 +29,7 @@ def _stats(*, parse_errors: int) -> dict[str, int]:
         "analysis_cache_hits": 0,
         "analysis_cache_misses": 0,
         "analysis_cache_evictions": 0,
+        "legacy_identity_overrides": 0,
     }
 
 
@@ -120,6 +123,89 @@ def test_process_commits_rejects_missing_input_before_clang_init(tmp_path, monke
 
     assert process_commits.main() == 1
     assert not output.exists()
+
+
+def test_process_jsonl_overrides_legacy_identity_before_pr_lookup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "records.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "repo": "_src",
+                "repo_stable_id": "stale-repo-id",
+                "filepath": "source/blender/editors/object/object.cc",
+                "filepath_stable_id": "stale-file-id",
+                "commit_hash": "abc123",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    expected_repo = "blender/blender"
+    expected_repo_id = hashlib.sha1(expected_repo.encode("utf-8")).hexdigest()[:16]
+    expected_file_id = hashlib.sha1(
+        f"{expected_repo}\0source/blender/editors/object/object.cc".encode("utf-8")
+    ).hexdigest()[:16]
+
+    class RecordingLookup:
+        def attach(self, record: dict) -> bool:
+            assert record["repo"] == expected_repo
+            assert record["repo_stable_id"] == expected_repo_id
+            assert record["filepath_stable_id"] == expected_file_id
+            return False
+
+    monkeypatch.setattr(process_commits, "process_record", lambda *_a, **_k: [])
+
+    stats = process_commits.process_jsonl_file(
+        str(source),
+        io.StringIO(),
+        object(),
+        str(tmp_path / "work"),
+        4096,
+        500000,
+        "both",
+        5,
+        10.0,
+        pr_lookup=RecordingLookup(),
+        project_id="blender/blender",
+        analysis_cache_entries=0,
+    )
+
+    assert stats["legacy_identity_overrides"] == 1
+
+
+def test_process_jsonl_rejects_conflicting_canonical_project_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "records.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "repo": "other/project",
+                "filepath": "src/file.cc",
+                "commit_hash": "abc123",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(process_commits, "process_record", lambda *_a, **_k: [])
+
+    with pytest.raises(process_commits.SymbolIdentityError, match="conflicts"):
+        process_commits.process_jsonl_file(
+            str(source),
+            io.StringIO(),
+            object(),
+            str(tmp_path / "work"),
+            4096,
+            500000,
+            "both",
+            5,
+            10.0,
+            project_id="blender/blender",
+            analysis_cache_entries=0,
+        )
 
 
 def test_analyze_file_clang_surfaces_translation_unit_parse_failure(

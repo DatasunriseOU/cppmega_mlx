@@ -199,6 +199,62 @@ def test_non_github_repo_list_identity_reaches_code_indexer(
     assert output == work / "aosp-frameworks-av.enriched.jsonl"
 
 
+def test_commit_indexer_receives_canonical_project_identity(
+    monkeypatch, tmp_path
+) -> None:
+    from scripts import streaming_reindex
+
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        (tmp_path / "blender.enriched.jsonl").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
+    commit_input = tmp_path / "blender.jsonl"
+    commit_input.write_text("{}\n", encoding="utf-8")
+
+    output = streaming_reindex.stage_index_commits(
+        "blender",
+        [commit_input],
+        tmp_path,
+        tmp_path / "_src",
+        None,
+        project_id="blender/blender",
+    )
+
+    project_id_arg = captured.index("--project-id")
+    assert captured[project_id_arg + 1] == "blender/blender"
+    assert output == tmp_path / "blender.enriched.jsonl"
+
+
+def test_commit_extractor_receives_canonical_project_identity(
+    monkeypatch, tmp_path
+) -> None:
+    from scripts import streaming_reindex_commits
+
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        (tmp_path / "blender_commits.jsonl").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(streaming_reindex_commits, "run_checked", fake_run_checked)
+
+    output = streaming_reindex_commits.stage_extract_commits(
+        "blender",
+        tmp_path / "_src",
+        tmp_path,
+        project_id="blender/blender",
+    )
+
+    repo_name_arg = captured.index("--repo-name")
+    assert captured[repo_name_arg + 1] == "blender/blender"
+    assert output == tmp_path / "blender_commits.jsonl"
+
+
 def test_project_identity_map_rejects_duplicate_bare_name_collision(
     tmp_path,
 ) -> None:
