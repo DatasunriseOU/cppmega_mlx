@@ -24,6 +24,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -118,6 +123,8 @@ def _write_pr_jsonl(
             if not text:
                 continue
             payload = {
+                "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+                SYMBOL_IDENTITIES_COLUMN: [],
                 "text": text,
                 "source_text": text,
                 "repo": rec["repo"],
