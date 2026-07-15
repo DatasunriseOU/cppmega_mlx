@@ -289,3 +289,32 @@ def test_stored_map_migrates_legacy_owner_repo_and_rejects_conflict(
         match="conflicting project_identity .* and owner_repo",
     ):
         build_repo_list.load_stored_map(str(stored))
+
+
+def test_stored_map_migrates_resolvable_non_github_unresolved_remote(
+    tmp_path: Path,
+) -> None:
+    stored = tmp_path / "repo_list.json"
+    stored.write_text(
+        json.dumps(
+            {
+                "repos": [],
+                "unresolved": [
+                    {
+                        "name": "blender",
+                        "url": "https://projects.blender.org/blender/blender.git",
+                        "reason": "remote-url-not-github",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_repo_list.build([], [], str(stored), allow_unresolved=False)
+
+    assert result["unresolved"] == []
+    assert result["by_bare_name"]["blender"] == (
+        "projects.blender.org/blender%2Fblender"
+    )
+    assert result["repos"][0]["source"] == "stored_map"

@@ -259,6 +259,48 @@ def load_stored_map(path: Optional[str]) -> dict[str, dict]:
                 f"{previous.get('owner_repo')!r} vs {entry.get('owner_repo')!r}"
             )
         out.setdefault(bare_name, entry)
+
+    # Older manifests placed non-GitHub remotes in ``unresolved`` even when
+    # the URL contains a lossless forge identity. Recover those entries from
+    # the recorded URL; do not infer an identity from the bare directory name.
+    unresolved_entries = data.get("unresolved", [])
+    if not isinstance(unresolved_entries, list):
+        raise SystemExit(f"[build_repo_list] {path}: expected an unresolved list")
+    for index, raw_entry in enumerate(unresolved_entries):
+        if not isinstance(raw_entry, dict):
+            raise SystemExit(
+                f"[build_repo_list] {path}: unresolved[{index}] must be an object"
+            )
+        bare_name = raw_entry.get("bare_name") or raw_entry.get("name")
+        remote_url = raw_entry.get("remote_url") or raw_entry.get("url")
+        if not isinstance(bare_name, str) or not bare_name:
+            continue
+        if not isinstance(remote_url, str) or not remote_url:
+            continue
+        try:
+            identity = resolve_remote_project_identity(
+                remote_url,
+                source=f"{path}:unresolved[{index}].url",
+            )
+        except SymbolIdentityError:
+            continue
+        migrated = {
+            "bare_name": bare_name,
+            "project_identity": identity.project_identity,
+            "remote_url": remote_url,
+            "source": "stored_unresolved_remote",
+        }
+        if identity.owner_repo is not None:
+            migrated["owner_repo"] = identity.owner_repo
+        previous = out.get(bare_name)
+        if previous is not None:
+            if previous["project_identity"] != migrated["project_identity"]:
+                raise SystemExit(
+                    "[build_repo_list] project identity collision while migrating "
+                    f"unresolved bare name {bare_name!r}"
+                )
+            continue
+        out[bare_name] = migrated
     return out
 
 
