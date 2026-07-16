@@ -148,6 +148,21 @@ production commit.
 | `git diff --check` | PASS |
 | HTML changelog desktop/mobile | PASS: 1440px и 390px без page-level horizontal overflow |
 
+## Dependabot review: 17 июля 2026
+
+- `vbgui/package.json` и `package-lock.json`: Vite поднят до `6.4.3`, Vitest
+  и coverage до `3.2.6+`, а transitive `@babel/core`, `form-data` и `ws`
+  закреплены на `7.29.6`, `4.0.6` и `8.21.0`. `npm audit` теперь сообщает
+  `0 vulnerabilities`; закрыта critical Vitest UI server группа и связанные
+  Vite/esbuild/ws/form-data alerts.
+- `gui` extra теперь явно требует `starlette>=1.3.1` и `idna>=3.15`;
+  lock содержит Starlette `1.3.1` и idna `3.18`. `uv lock --check`,
+  `uv lock --check --no-sources` и `uv pip check` прошли.
+- Проверены `575/575` vbgui tests, `56` FastAPI/TestClient tests, typecheck,
+  production build и widget build. `npm run lint` остаётся environment gap:
+  script существует, но ESLint не объявлен в vbgui dependencies; это не было
+  замаскировано установкой незаявленного пакета.
+
 Команда полного теста:
 
 ```bash
@@ -172,3 +187,5 @@ env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
   работе и не скрывают неожиданные failures.
 - Полный repo-wide Ruff остаётся legacy debt (`411` нарушения в нетронутых
   файлах); все Python-файлы production diff проходят pinned changed-file Ruff.
+- `npm run lint` в `vbgui` пока не является зелёным gate: отсутствует
+  объявленный ESLint toolchain.

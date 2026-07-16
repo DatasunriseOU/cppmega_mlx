@@ -130,10 +130,15 @@
     </tbody>
   </table></div>
 
+  <h2>Dependabot: review 17 июля 2026</h2>
+  <p><code>vbgui/package.json</code> и lock обновлены: Vite <code>6.4.3</code>, Vitest и coverage <code>3.2.6+</code>, Babel <code>7.29.6</code>, form-data <code>4.0.6</code>, ws <code>8.21.0</code>. <code>npm audit</code> сообщает <code>0 vulnerabilities</code>; закрыта critical Vitest UI server группа и связанные Vite/esbuild/ws/form-data alerts.</p>
+  <p>В <code>gui</code> extra добавлены floors <code>starlette&gt;=1.3.1</code> и <code>idna&gt;=3.15</code>; lock содержит Starlette <code>1.3.1</code> и idna <code>3.18</code>. Прошли <code>575/575</code> vbgui tests, <code>56</code> FastAPI/TestClient tests, typecheck, production и widget builds. <code>npm run lint</code> остаётся environment gap: script есть, но ESLint не объявлен в dependencies; это не скрыто установкой незаявленного пакета.</p>
+
   <h2>Остаточные риски</h2>
   <p class="warn">CUDA kernel compile/run здесь не выполнялся: Mac не даёт H200/B200 proof. Hardware test остаётся receipt-gated для self-hosted runner.</p>
   <p>TileLang и TVM worktrees сейчас dirty; запуск без явного opt-in блокируется. Два xfail относятся к известной chained-backward parity работе.</p>
   <p>Repo-wide Ruff ещё содержит 411 legacy violations в нетронутых файлах; все Python-файлы production diff проходят pinned changed-file Ruff.</p>
+  <p><code>npm run lint</code> в <code>vbgui</code> пока не является зелёным gate: отсутствует объявленный ESLint toolchain.</p>
 
   <footer>Отчёт построен по текущему source tree и live receipts, а не по старым review notes.</footer>
 </main>
