@@ -233,6 +233,9 @@ def _write_actual_case3_code_parquet(path: Path, tmp_path: Path) -> pa.Table:
         enriched=True,
         emit_doc=docs.append,
         project_id="tests/case3-prompt-repo",
+        # ru_maxrss is lifetime-scoped for the shared pytest process; this
+        # fixture validates provenance/materialization, not the memory guard.
+        memory_limit_gb=0.0,
     )
     raw_dir = tmp_path / "actual-case3"
     raw_dir.mkdir()
@@ -256,6 +259,7 @@ def _write_actual_case3_code_parquet(path: Path, tmp_path: Path) -> pa.Table:
         max_tokens=16384,
         overflow_policy="drop",
         materialize_tokenized_enriched=True,
+        memory_limit_gb=0.0,
     )
     table = pq.read_table(raw_parquet_path)
     rows = table.to_pylist()

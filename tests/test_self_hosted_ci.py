@@ -70,6 +70,9 @@ def test_inventory_routes_required_lanes_to_registered_runner_labels() -> None:
         "untrusted-10-0-0-12",
     }
     assert hosts["mac-studio"]["address"] == "10.0.0.8"
+    assert hosts["mac-studio"]["python"] == (
+        "/Volumes/external/sources/.venvs/cppmega.mlx/bin/python"
+    )
     assert hosts["mac-studio"]["github"] == {
         "runner_name": "mac-studio-cppmega-mlx",
         "labels": ["self-hosted", "macOS", "ARM64", "cppmega-mlx-macos"],

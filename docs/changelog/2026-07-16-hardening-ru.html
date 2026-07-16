@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cppmega.mlx | Hardening 2026-07-16</title>
+  <style>
+    :root { color-scheme: light; --ink:#17212b; --muted:#5f6b76; --line:#d8dee5; --paper:#f7f9fb; --blue:#1769aa; --green:#16794b; --amber:#a85b00; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1120px; margin:0 auto; padding:42px 24px 72px; }
+    header { border-bottom:3px solid var(--ink); padding-bottom:24px; margin-bottom:28px; }
+    h1 { font-size:clamp(30px,5vw,52px); line-height:1.05; margin:0 0 12px; letter-spacing:0; }
+    h2 { margin:34px 0 12px; font-size:25px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin:22px 0 8px; font-size:19px; }
+    p { margin:9px 0; }
+    a { color:var(--blue); }
+    .meta { color:var(--muted); }
+    .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin:26px 0; }
+    .metric { background:#fff; border:1px solid var(--line); border-left:5px solid var(--green); padding:15px 16px; }
+    .metric strong { display:block; font-size:24px; line-height:1.15; }
+    .metric span { color:var(--muted); font-size:13px; }
+    .bar { height:12px; background:#e5ebf0; margin-top:7px; }
+    .bar i { display:block; height:100%; background:var(--green); }
+    table { border-collapse:collapse; width:100%; background:#fff; margin:12px 0 20px; }
+    th,td { border:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:top; }
+    th { background:#edf2f6; font-weight:700; }
+    code { background:#eaf0f5; padding:2px 5px; border-radius:3px; font-size:.92em; }
+    .ok { color:var(--green); font-weight:700; }
+    .warn { color:var(--amber); font-weight:700; }
+    .source-list { columns:2 360px; column-gap:36px; }
+    .source-list li { break-inside:avoid; margin:5px 0; }
+    footer { border-top:1px solid var(--line); margin-top:40px; padding-top:16px; color:var(--muted); font-size:13px; }
+    @media (max-width:650px) { main { padding:25px 15px 48px; } table { font-size:14px; } th,td { padding:8px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>cppmega.mlx: ABI, Path C и packaging hardening</h1>
+    <p class="meta">16 июля 2026 · ветка <code>codex/canonical-complete-20260715</code> · <a href="https://github.com/DatasunriseOU/cppmega_mlx/tree/codex/canonical-complete-20260715">исходный репозиторий</a></p>
+  </header>
+
+  <section class="summary">
+    <div class="metric"><strong class="ok">7385</strong><span>passed в полном MLX suite</span><div class="bar"><i style="width:100%"></i></div></div>
+    <div class="metric"><strong>57</strong><span>skipped hardware/optional gates</span><div class="bar"><i style="width:1%"></i></div></div>
+    <div class="metric"><strong>2</strong><span>ожидаемых xfail</span><div class="bar"><i style="width:1%"></i></div></div>
+    <div class="metric"><strong class="ok">PASS</strong><span>ABI и Path-C live receipts</span><div class="bar"><i style="width:100%"></i></div></div>
+  </section>
+
+  <h2>Что сделано</h2>
+  <h3>ABI по loaded library</h3>
+  <p>Проверка больше не делает вывод о runtime по <code>brew info</code> или только по linked keg. Она смотрит на реально загруженный dyld image, сопоставляет его с dedicated wheel или Homebrew Cellar и отдельно проверяет release <code>mlx-metal</code>.</p>
+  <table>
+    <thead><tr><th>Источник</th><th>Значение</th></tr></thead>
+    <tbody>
+      <tr><td>MLX package/module</td><td><code>0.32.0</code></td></tr>
+      <tr><td>mlx-metal</td><td><code>0.32.0</code></td></tr>
+      <tr><td>loaded libmlx</td><td><code>/Volumes/external/sources/.venvs/cppmega.mlx/lib/python3.13/site-packages/mlx/lib/libmlx.dylib</code></td></tr>
+      <tr><td>Homebrew linked keg</td><td><code>/opt/homebrew/Cellar/mlx/0.32.0</code>, informational only</td></tr>
+    </tbody>
+  </table>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/check_mlx_abi.py">scripts/check_mlx_abi.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/check_mlx_abi.sh">scripts/check_mlx_abi.sh</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/fix_mlx_abi.sh">scripts/fix_mlx_abi.sh</a></li>
+  </ul>
+
+  <h3>Fail-closed dirty TileLang/TVM contract</h3>
+  <p>Launcher загружает contract module по exact source path, очищает ambient Python/TVM/DYLD variables и записывает revisions/digests TileLang, TVM и TVM-FFI. Dirty stack запрещён по умолчанию и разрешается только явным флагом. Свежий source build использует правильный TVM root, Metal ON, CUDA/ROCm OFF и явный Cython dependency; старый неверный build сохранён отдельно как <code>build.stale-20260716</code>.</p>
+  <table>
+    <thead><tr><th>Режим</th><th>Exit</th><th>Результат</th></tr></thead>
+    <tbody>
+      <tr><td>default</td><td>1</td><td class="warn">FAIL как задумано: dirty TileLang/TVM</td></tr>
+      <tr><td><code>--allow-dirty-source-stack</code></td><td>0</td><td class="ok">PASS, receipt содержит opt-in, revisions и digests</td></tr>
+    </tbody>
+  </table>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/mlx_env_contract.py">scripts/mlx_env_contract.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/run_mlx_path_c.py">scripts/run_mlx_path_c.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/run_path_c.sh">scripts/run_path_c.sh</a></li>
+  </ul>
+
+  <h3>Model/runtime correctness</h3>
+  <ul>
+    <li>DSA Metal reductions получили явные layouts и fail-closed validation.</li>
+    <li>Mamba F1→F2 ABI закреплён на fp32 для <code>prev_states</code>; repro callers исправлены.</li>
+    <li>State tiles выбираются по threadgroup memory budget.</li>
+    <li>CCE default установлен в <code>chunk_rows=8</code>; официальный acceptance bench дал устойчивый запас более 4x.</li>
+    <li>Pure-MLX quantization CLI очищает dirty loader paths до MLX import и не подхватывает dev dylib.</li>
+    <li>TVM-FFI owner-output путь остаётся основным; graph-output bridge включается явно и использует TileLang-generated source.</li>
+  </ul>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/cppmega_mlx/nn/_tilelang/dsa_splitk_indexer_loss.py">DSA Metal layouts</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/cppmega_mlx/nn/_tilelang/mamba3_chunked_scan_core.py">Mamba state ABI</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/cppmega_mlx/training/cut_cross_entropy.py">cut cross entropy</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/quantize_for_inference.py">quantization CLI</a></li>
+  </ul>
+
+  <h3>uv.lock и CUDA/self-hosted lane</h3>
+  <p>Locked Path-C export содержит <code>apache-tvm-ffi==0.1.7</code>, <code>cython==3.2.8</code>, <code>tilelang==0.1.9</code>, <code>torch==2.13.0</code> и Linux <code>triton==3.7.1</code>. CUDA workflow проверяет именно выбранный interpreter через <code>uv pip check --python</code> и публикует environment receipt. Linux dry-run проходит на <code>manylinux_2_35</code>; <code>manylinux_2_34</code> блокируется из-за locked MLX wheel и glibc floor.</p>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/pyproject.toml">pyproject.toml</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/uv.lock">uv.lock</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/.github/workflows/cuda-lane.yml">CUDA workflow</a></li>
+  </ul>
+
+  <h2>Parquet fixtures</h2>
+  <p>16 dirty fixtures декодированы PyArrow и сравнены с HEAD. Rows, columns, Arrow schema и decoded values совпадают. Отличаются writer metadata (<code>parquet-cpp-arrow version 21.0.0</code> → <code>24.0.0</code>) и физические compressed/uncompressed sizes column chunks; это file-representation churn, не изменение данных/schema. Binary fixture churn не включается в production commit.</p>
+
+  <h2>Test harness</h2>
+  <p>Полный suite запускается с <code>PYTHONSAFEPATH=1</code>. Test fixture удаляет foreign <code>PYTHONPATH</code> и возвращает только текущий checkout для дочерних <code>python -m scripts...</code>. Parser/converter fixtures явно отключают admission threshold, потому что проверяют schema/provenance; production memory guard остаётся с default <code>10 GiB</code> и fail-closed.</p>
+
+  <h2>Проверки</h2>
+  <table>
+    <thead><tr><th>Gate</th><th>Result</th><th>Деталь</th></tr></thead>
+    <tbody>
+      <tr><td>Full pytest</td><td class="ok">PASS</td><td>7385 passed, 57 skipped, 2 xfailed, 19 warnings, 22:31</td></tr>
+      <tr><td>ABI receipt</td><td class="ok">PASS</td><td>loaded dedicated wheel dylib и mx.eval smoke</td></tr>
+      <tr><td>Path-C default/opt-in</td><td class="ok">PASS</td><td>expected exit 1 / explicit exit 0</td></tr>
+      <tr><td>Safe-path subprocess regressions</td><td class="ok">PASS</td><td>64 passed</td></tr>
+      <tr><td>Parser/provenance fixture regressions</td><td class="ok">PASS</td><td>100 passed</td></tr>
+      <tr><td>ABI/Path-C/CUDA workflow contracts</td><td class="ok">PASS</td><td>69 passed, 1 skipped</td></tr>
+      <tr><td>Parquet decoded audit</td><td class="ok">PASS</td><td>16/16 data+schema identical</td></tr>
+      <tr><td>uv lock/check</td><td class="ok">PASS</td><td>lock, no-sources lock и 95 installed packages</td></tr>
+      <tr><td>Changed-file Ruff</td><td class="ok">PASS</td><td>Ruff 0.15.22</td></tr>
+      <tr><td>compileall/bash/diff</td><td class="ok">PASS</td><td>all requested static gates</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Остаточные риски</h2>
+  <p class="warn">CUDA kernel compile/run здесь не выполнялся: Mac не даёт H200/B200 proof. Hardware test остаётся receipt-gated для self-hosted runner.</p>
+  <p>TileLang и TVM worktrees сейчас dirty; запуск без явного opt-in блокируется. Два xfail относятся к известной chained-backward parity работе.</p>
+  <p>Repo-wide Ruff ещё содержит 411 legacy violations в нетронутых файлах; все Python-файлы production diff проходят pinned changed-file Ruff.</p>
+
+  <footer>Отчёт построен по текущему source tree и live receipts, а не по старым review notes.</footer>
+</main>
+</body>
+</html>

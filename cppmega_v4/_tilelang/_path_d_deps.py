@@ -97,7 +97,13 @@ def _env_falsey(name: str) -> bool:
 
 
 def _package_root_from_spec(module_name: str, package_depth: int) -> Path | None:
-    spec = importlib.util.find_spec(module_name)
+    # ``find_spec`` raises when an optional module's parent package is absent
+    # (for example ``poc`` on a clean Mac environment). That is an ordinary
+    # unavailable-dependency result for Path D and must remain fail-closed.
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ModuleNotFoundError, ValueError):
+        return None
     if spec is None:
         return None
     if spec.origin is None or spec.origin == "namespace":

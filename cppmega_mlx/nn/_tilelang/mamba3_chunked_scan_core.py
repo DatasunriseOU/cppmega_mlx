@@ -28,7 +28,8 @@ serial launcher) is a legitimate gate, not a silent fallback.
 Calling convention for the compiled Metal kernel (verified):
   * Pass a PRE-ZEROED contiguous fp16 output buffer POSITIONALLY as the 8th arg
     (the tilelang torch-mps adapter does not allocate/return via ``out_idx``).
-  * All inputs contiguous fp16; ``dA_cumsum`` is the in-chunk cumsum of A*dt.
+  * ``prev_states`` is contiguous fp32 (the F1 producer ABI); all other inputs
+    are contiguous fp16. ``dA_cumsum`` is the in-chunk cumsum of A*dt.
   * ``torch.mps.synchronize()`` after dispatch before reading the output.
 
 The original prototype/handoff lives at
@@ -58,6 +59,9 @@ __all__ = [
     "MAMBA3_CHUNKED_FWD_BLOCK_N",
     "MAMBA3_CHUNKED_FWD_BLOCK_K",
     "MAMBA3_CHUNKED_FWD_BLOCK_DSTATE",
+    "MAMBA3_CHUNKED_FWD_METAL_THREADGROUP_MEMORY_LIMIT",
+    "chunk_scan_fwd_metal_shared_bytes",
+    "select_chunk_scan_fwd_metal_block_dstate",
     "MAMBA3_CHUNKED_FWD_THREADS",
 ]
 
@@ -71,15 +75,127 @@ __all__ = [
 MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME = "mamba3_chunk_scan_combine"
 __all__.append("MAMBA3_CHUNK_SCAN_COMBINE_OP_NAME")
 
-# Metal-validated tile config. block_N=16 keeps the GEMM N below the 32-column
-# threshold so the legacy 8x8 simdgroup path (M1-M4) is selected instead of the
-# M5-only cooperative-tensor path. More headdim tiles => more threadgroups, so
-# occupancy only improves.
+# Metal-validated logical tile config. block_N=16 keeps the GEMM N below the
+# 32-column threshold so the legacy 8x8 simdgroup path (M1-M4) is selected
+# instead of the M5-only cooperative-tensor path. ``BLOCK_DSTATE`` is the
+# maximum logical state tile; the Metal selector may split it for the device
+# threadgroup-memory limit while preserving the full state contraction.
 MAMBA3_CHUNKED_FWD_BLOCK_M = 64
 MAMBA3_CHUNKED_FWD_BLOCK_N = 16
 MAMBA3_CHUNKED_FWD_BLOCK_K = 64
 MAMBA3_CHUNKED_FWD_BLOCK_DSTATE = 128
 MAMBA3_CHUNKED_FWD_THREADS = 128
+MAMBA3_CHUNKED_FWD_METAL_THREADGROUP_MEMORY_LIMIT = 32 * 1024
+MAMBA3_CHUNKED_FWD_METAL_DSTATE_ALIGNMENT = 16
+
+
+def chunk_scan_fwd_metal_shared_bytes(
+    *,
+    block_M: int = MAMBA3_CHUNKED_FWD_BLOCK_M,
+    block_N: int = MAMBA3_CHUNKED_FWD_BLOCK_N,
+    block_K: int = MAMBA3_CHUNKED_FWD_BLOCK_K,
+    block_Dstate: int,
+) -> int:
+    """Return the conservative peak Metal threadgroup-memory estimate.
+
+    The estimate includes every live ``alloc_shared`` buffer in the scan core
+    (fp16 operands, fp32 output accumulator), excluding register fragments. The
+    Metal compiler can reuse some short-lived scratch and reported 34816 B for
+    the old dstate=128 tile; this upper bound is intentionally stricter so the
+    selector cannot choose a tile that only fits by allocator accident.
+    """
+    values = (block_M, block_N, block_K, block_Dstate)
+    if any(int(value) <= 0 for value in values):
+        raise ValueError(
+            "chunk_scan_fwd_metal_shared_bytes: tile dimensions must be positive"
+        )
+    # acc_o is fp32; all other shared allocations are fp16. Fragment/local
+    # allocations are register/private storage and do not consume threadgroup
+    # memory in the Metal pipeline-state limit.
+    fp16_bytes = (
+        block_M * block_K
+        + block_K * block_N
+        + block_K
+        + block_M
+        + block_M * block_Dstate
+        + block_N * block_Dstate
+        + block_M * block_N
+    ) * 2
+    fp32_bytes = block_M * block_N * 4
+    return int(fp16_bytes + fp32_bytes)
+
+
+def select_chunk_scan_fwd_metal_block_dstate(
+    dstate: int,
+    *,
+    requested: int | None = None,
+    block_M: int = MAMBA3_CHUNKED_FWD_BLOCK_M,
+    block_N: int = MAMBA3_CHUNKED_FWD_BLOCK_N,
+    block_K: int = MAMBA3_CHUNKED_FWD_BLOCK_K,
+    memory_limit: int = MAMBA3_CHUNKED_FWD_METAL_THREADGROUP_MEMORY_LIMIT,
+) -> int:
+    """Select one state tile shared by the Metal prim and Path-C delegation.
+
+    ``dstate`` is partitioned into whole, aligned tiles and each tile is
+    accumulated into the same output fragment. A caller-provided ``requested``
+    tile is validated against the exact same feasibility predicate; an unsafe
+    request raises instead of silently truncating state columns or falling back.
+    """
+    dstate = int(dstate)
+    memory_limit = int(memory_limit)
+    alignment = MAMBA3_CHUNKED_FWD_METAL_DSTATE_ALIGNMENT
+    if dstate <= 0:
+        raise ValueError(f"mamba3 Metal state tile: dstate must be positive, got {dstate}")
+    if memory_limit <= 0:
+        raise ValueError(
+            f"mamba3 Metal state tile: memory_limit must be positive, got {memory_limit}"
+        )
+
+    def validate(tile: int) -> int:
+        tile = int(tile)
+        if tile <= 0 or tile > dstate or dstate % tile != 0:
+            raise ValueError(
+                "mamba3 Metal state tile: requested tile must be a positive divisor "
+                f"of dstate (dstate={dstate}, tile={tile})"
+            )
+        if tile % alignment != 0:
+            raise ValueError(
+                "mamba3 Metal state tile: requested tile must be aligned to "
+                f"{alignment} (dstate={dstate}, tile={tile})"
+            )
+        shared_bytes = chunk_scan_fwd_metal_shared_bytes(
+            block_M=block_M,
+            block_N=block_N,
+            block_K=block_K,
+            block_Dstate=tile,
+        )
+        if shared_bytes > memory_limit:
+            raise ValueError(
+                "mamba3 Metal state tile: threadgroup memory estimate "
+                f"{shared_bytes} exceeds limit {memory_limit} "
+                f"(dstate={dstate}, block_Dstate={tile})"
+            )
+        return tile
+
+    if requested is not None:
+        return validate(requested)
+
+    largest_aligned = dstate - (dstate % alignment)
+    for tile in range(largest_aligned, alignment - 1, -alignment):
+        if dstate % tile != 0:
+            continue
+        shared_bytes = chunk_scan_fwd_metal_shared_bytes(
+            block_M=block_M,
+            block_N=block_N,
+            block_K=block_K,
+            block_Dstate=tile,
+        )
+        if shared_bytes <= memory_limit:
+            return tile
+    raise ValueError(
+        "mamba3 Metal state tile: no aligned divisor fits the threadgroup memory "
+        f"limit {memory_limit} for dstate={dstate}"
+    )
 
 
 def chunk_scan_fwd_grid(
@@ -123,7 +239,7 @@ def chunk_scan_fwd_metal_prim(
     block_M: int = MAMBA3_CHUNKED_FWD_BLOCK_M,
     block_N: int = MAMBA3_CHUNKED_FWD_BLOCK_N,
     block_K: int = MAMBA3_CHUNKED_FWD_BLOCK_K,
-    block_Dstate: int = MAMBA3_CHUNKED_FWD_BLOCK_DSTATE,
+    block_Dstate: int | None = None,
     threads: int = MAMBA3_CHUNKED_FWD_THREADS,
 ) -> Any:
     """Build the Metal-compatible chunk-scan forward ``@T.prim_func``.
@@ -134,13 +250,14 @@ def chunk_scan_fwd_metal_prim(
       dt         : (batch, nheads, nchunks, chunk)
       dA_cumsum  : (batch, nheads, nchunks, chunk)          = cumsum(A*dt) per chunk
       C          : (batch, seqlen, ngroups, dstate)
-      prev_states: (batch, nchunks, nheads, headdim, dstate) inter-chunk entry states
+      prev_states: (batch, nchunks, nheads, headdim, dstate) fp32 inter-chunk entry states
       D          : (nheads,)
     Output       : (batch, seqlen, nheads, headdim)
 
     Two Metal-codegen-preserving deltas vs the CUDA upstream form (both
     numerics-preserving, see the prototype docstring): C accumulator lives in
-    *shared* (element-addressable for the elementwise scale/mask) and the
+    *shared* (element-addressable for the elementwise scale/mask), with the
+    state contraction tiled by the selected ``block_Dstate``, and the
     K-reduction is a plain ``T.serial`` loop (no software pipelining, which
     trips a Metal storage-sync / cast-buffer SSA bug). ``T.gemm(cb_local,
     x_shared, acc_o)`` (A register-fragment, B shared) routes through the
@@ -159,10 +276,18 @@ def chunk_scan_fwd_metal_prim(
             f"chunk_scan_fwd_metal_prim: nheads ({nheads}) must be divisible by "
             f"ngroups ({ngroups})"
         )
+    block_Dstate = select_chunk_scan_fwd_metal_block_dstate(
+        dstate,
+        requested=block_Dstate,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+    )
 
     dtype = T.float16
     accum_dtype = T.float32
     nchunks = T.ceildiv(seqlen, chunk_size)
+    state_tiles = dstate // block_Dstate
     p = 1.44269504  # 1/ln(2): exp2(x*p) == exp(x)
 
     @T.prim_func
@@ -172,7 +297,7 @@ def chunk_scan_fwd_metal_prim(
         dt: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
         dA_cumsum: T.Tensor((batch, nheads, nchunks, chunk_size), dtype),  # type: ignore
         C: T.Tensor((batch, seqlen, ngroups, dstate), dtype),  # type: ignore
-        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), dtype),  # type: ignore
+        prev_states: T.Tensor((batch, nchunks, nheads, headdim, dstate), accum_dtype),  # type: ignore
         D: T.Tensor((nheads), dtype),  # type: ignore
         Output: T.Tensor((batch, seqlen, nheads, headdim), dtype),  # type: ignore
     ):
@@ -183,7 +308,6 @@ def chunk_scan_fwd_metal_prim(
             threads=threads,
         ) as (bz, bx, by):
             acc_o = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared")
-            acc_o_shared = T.alloc_shared((block_M, block_N), dtype)
             cb_shared = T.alloc_shared((block_M, block_K), dtype)
             cb_local = T.alloc_fragment((block_M, block_K), dtype)
             dA_cs_k_shared = T.alloc_shared((block_K), dtype)
@@ -224,30 +348,36 @@ def chunk_scan_fwd_metal_prim(
 
             for i in T.Parallel(block_M):
                 scale_m_local[i] = T.exp2(dA_cs_m_local[i] * p)
-            T.copy(
-                C[
-                    batch_idx,
-                    chunk_idx * chunk_size
-                    + m_idx * block_M : chunk_idx * chunk_size
-                    + (m_idx + 1) * block_M,
-                    bz // (nheads // ngroups),
-                    0:block_Dstate,
-                ],
-                C_shared,
-                disable_tma=True,
-            )
-            T.copy(
-                prev_states[
-                    batch_idx,
-                    chunk_idx,
-                    bz,
-                    n_idx * block_N : (n_idx + 1) * block_N,
-                    0:block_Dstate,
-                ],
-                prev_state_shared,
-                disable_tma=True,
-            )
-            T.gemm(C_shared, prev_state_shared, acc_o, transpose_B=True)
+            # Tile the state contraction so dstate=128 does not require the
+            # overflowing 128-column C/prev_state pair in threadgroup memory.
+            # Every state column is covered exactly once and accumulates into the
+            # same fp32 output tile; no truncation or alternate kernel path.
+            for state_tile in T.serial(state_tiles):
+                state_offset = state_tile * block_Dstate
+                T.copy(
+                    C[
+                        batch_idx,
+                        chunk_idx * chunk_size
+                        + m_idx * block_M : chunk_idx * chunk_size
+                        + (m_idx + 1) * block_M,
+                        bz // (nheads // ngroups),
+                        state_offset : state_offset + block_Dstate,
+                    ],
+                    C_shared,
+                    disable_tma=True,
+                )
+                T.copy(
+                    prev_states[
+                        batch_idx,
+                        chunk_idx,
+                        bz,
+                        n_idx * block_N : (n_idx + 1) * block_N,
+                        state_offset : state_offset + block_Dstate,
+                    ],
+                    prev_state_shared,
+                    disable_tma=True,
+                )
+                T.gemm(C_shared, prev_state_shared, acc_o, transpose_B=True)
             for i, j in T.Parallel(block_M, block_N):
                 acc_o[i, j] *= scale_m_local[i]
 
@@ -316,9 +446,8 @@ def chunk_scan_fwd_metal_prim(
             for i, j in T.Parallel(block_M, block_N):
                 acc_o[i, j] += x_residual_local[i, j] * D_local[0]
 
-            T.copy(acc_o, acc_o_shared)
             T.copy(
-                acc_o_shared,
+                acc_o,
                 Output[
                     batch_idx,
                     chunk_idx * chunk_size

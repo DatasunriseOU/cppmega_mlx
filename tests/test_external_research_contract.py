@@ -67,7 +67,17 @@ def _collected_test_files() -> list[str]:
             seen.add(path)
             collected.append(path)
     assert collected, result.stdout
-    return collected
+
+    # A module-level pytest.importorskip (for example the CUDA-only Triton
+    # bridge on macOS) removes the file from --collect-only output even
+    # though it is still part of the repository's test surface. Collection
+    # must succeed; the filesystem is authoritative for the complete file
+    # inventory and keeps the docs check platform-independent.
+    test_files = sorted(
+        path.relative_to(ROOT).as_posix() for path in (ROOT / "tests").glob("test_*.py")
+    )
+    assert set(collected) <= set(test_files)
+    return test_files
 
 
 def test_external_framework_decisions_keep_mlx_native_contract() -> None:

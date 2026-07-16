@@ -7,14 +7,15 @@ on a small preset (default llama3_8b @ H=128) and emits:
     { preset, hidden, compile_mode, num_steps,
       first_step_ms, warm_step_ms_mean, warm_step_ms_min,
       peak_memory_mb, losses,
-      compile_engaged, compile_status, compile_error,
+      compile_engaged, compile_status, compile_error, compile_call_count,
+      compile_trace_count,
       first_vs_warm_ratio }
 
-Acceptance: compile_engaged=true (mx.compile actually wrapped the
-value-and-grad closure), AND first_vs_warm_ratio > 1.0 — i.e. the
-first step (compile + run) is measurably slower than the steady-state
-warm steps (compiled fast-path). On a 6-step run the warm-step mean
-is taken over steps 1..N-1.
+Acceptance: compile_engaged=true (the compiled closure was traced),
+compile_call_count == num_steps, compile_trace_count >= 1, and timing
+telemetry is positive. The first-vs-warm ratio is informational only:
+MLX/Metal scheduling noise makes a fixed ratio unsuitable as a
+correctness gate.
 
 Usage:
     python -m scripts.bench_whole_model_compile \\
@@ -94,6 +95,8 @@ def _bench(preset: str, hidden: int, num_steps: int,
     compile_engaged = bool(sa.get("compile_engaged", False))
     compile_status = str(sa.get("compile_status", "off"))
     compile_error = sa.get("compile_error")
+    compile_call_count = int(sa.get("compile_call_count", 0))
+    compile_trace_count = int(sa.get("compile_trace_count", 0))
     # Fall-back if the runner didn't surface per-step timing for some
     # reason (older versions): use elapsed/N as a coarse estimate.
     if first_step_ms is None:
@@ -122,6 +125,8 @@ def _bench(preset: str, hidden: int, num_steps: int,
         "compile_engaged": compile_engaged,
         "compile_status": compile_status,
         "compile_error": compile_error,
+        "compile_call_count": compile_call_count,
+        "compile_trace_count": compile_trace_count,
         "losses": [round(float(x), 4) for x in losses],
         "total_elapsed_s": round(elapsed, 4),
     }

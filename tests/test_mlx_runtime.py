@@ -91,6 +91,87 @@ kernel void vector_add(
 
 
 @pytest.mark.skipif(not _HAS_MLX, reason="mlx not importable on this host")
+def test_wrap_runs_tvm_codegen_bfloat16_body_with_mlx_native_buffers() -> None:
+    """TVM bf16 load/store helpers must match MLX's rebuilt buffer ABI."""
+    import mlx.core as mx
+    import numpy as np
+
+    from cppmega_mlx.nn._tilelang._mlx_runtime import wrap_tilelang_metal_kernel
+
+    src = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct tvm_bfloat16 {
+  ushort bits;
+  tvm_bfloat16() = default;
+  tvm_bfloat16(float value) {
+    uint raw = as_type<uint>(value);
+    bits = ushort(raw >> 16);
+  }
+  operator float() const {
+    return as_type<float>(uint(bits) << 16);
+  }
+};
+static inline float __tvm_bfloat16_to_float(
+    device const tvm_bfloat16& value) {
+  return as_type<float>(uint(value.bits) << 16);
+}
+
+kernel void tvm_bf16_copy(
+    device tvm_bfloat16* A [[buffer(0)]],
+    device tvm_bfloat16* B [[buffer(1)]]) {
+  uint id = thread_position_in_grid.x;
+  if (id < 8) {
+    tvm_bfloat16 condval;
+    if (id < 8) {
+      condval = A[id];
+    } else {
+      condval = 0.000000e+00h;
+    }
+    B[id] = tvm_bfloat16(__tvm_bfloat16_to_float(condval));
+  }
+}
+"""
+
+    adapter = wrap_tilelang_metal_kernel(
+        src,
+        input_count=1,
+        output_count=1,
+        allow_mx_fast_metal_kernel=True,
+    )
+    assert "tvm_bfloat16" not in adapter.body
+    assert "bfloat16_t" in adapter.body
+    assert "float(condval)" in adapter.body
+    assert "bfloat16_t(0.000000e+00f)" in adapter.body
+
+    values = mx.array(np.linspace(-1.0, 1.0, 8, dtype=np.float32)).astype(
+        mx.bfloat16
+    )
+    outputs = adapter(
+        inputs=[values],
+        output_shapes=[(8,)],
+        output_dtypes=[mx.bfloat16],
+        grid=(8, 1, 1),
+        threadgroup=(8, 1, 1),
+    )
+    mx.eval(*outputs)
+    np.testing.assert_array_equal(
+        np.array(outputs[0].astype(mx.float32), copy=False),
+        np.array(values.astype(mx.float32), copy=False),
+    )
+
+
+def test_tvm_bfloat16_body_rewrite_does_not_touch_non_tvm_bfloat16_code() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        _rewrite_tvm_bfloat16_graph_body,
+    )
+
+    source = "float x = 0.000000e+00h; // keep this source unchanged"
+    assert _rewrite_tvm_bfloat16_graph_body(source) == source
+
+
+@pytest.mark.skipif(not _HAS_MLX, reason="mlx not importable on this host")
 def test_wrap_multi_output_kernel() -> None:
     """A kernel with two outputs (sum and diff) renames + runs."""
     import mlx.core as mx
@@ -589,4 +670,3 @@ kernel void dummy(
             output_buffer_names=["A"],
             allow_mx_fast_metal_kernel=True,
         )
-

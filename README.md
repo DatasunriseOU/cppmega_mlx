@@ -222,7 +222,8 @@ matrix at
 2. dsa_splitk budget gate — tiled Q-cache for `AH≥8` production shapes
 3. ATEN_DISPATCH `_scaled_dot_product_flash_attention_for_cpu` wiring (FA TileLang kernel exists at `_kernels/flash_attention.py`)
 4. reduce_prod `vectorize_loop.cc` / `storage_rewrite.cc` mul-kind handling
-5. `scripts/check_mlx_abi.sh` to catch venv-vs-brew dylib mismatch (host venv `mlx.core.so` was built against older `libmlx.dylib` — silent test skips)
+5. `scripts/check_mlx_abi.sh` to catch `mlx`/`mlx-metal` drift before kernel
+   tests (run it against the isolated env; the checkout `.venv` is shared)
 
 NVFP4 on MLX research is committed at
 [`tilelang/docs/research/nvfp4_mlx_metal.md`](https://github.com/DatasunriseOU/tilelang/blob/main/docs/research/nvfp4_mlx_metal.md):

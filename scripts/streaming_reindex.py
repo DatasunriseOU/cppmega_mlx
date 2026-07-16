@@ -31,6 +31,7 @@ Source: /Users/dave/sources/parquet/data-cpp_all/data-cpp_all.tar.zst
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -45,15 +46,28 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
+from types import ModuleType
 
 _MODULE_ROOT = Path(__file__).resolve().parents[1]
 if str(_MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(_MODULE_ROOT))
 
-from cppmega_mlx.data.symbol_identity import (  # noqa: E402
-    SymbolIdentityError,
-    require_project_identity,
-)
+
+def _load_local_symbol_identity() -> ModuleType:
+    module_path = _MODULE_ROOT / "cppmega_mlx" / "data" / "symbol_identity.py"
+    module = importlib.import_module("cppmega_mlx.data.symbol_identity")
+    loaded_path = Path(getattr(module, "__file__", "")).resolve()
+    if loaded_path != module_path.resolve():
+        raise ImportError(
+            "cppmega_mlx.data.symbol_identity resolved outside this checkout: "
+            f"loaded={loaded_path} expected={module_path}"
+        )
+    return module
+
+
+_symbol_identity = _load_local_symbol_identity()
+SymbolIdentityError = _symbol_identity.SymbolIdentityError
+require_project_identity = _symbol_identity.require_project_identity
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).

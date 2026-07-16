@@ -314,12 +314,12 @@ def test_chained_metal_f0f1f2_matches_serial_forward(
        prev_states, final_state)
     torch.mps.synchronize()
 
-    # ---- F2: scan+combine ---- (consumes F0+F1 handoff; prev_states->fp16) ----
+    # ---- F2: scan+combine ---- (consumes F0+F1 handoff; prev_states is fp32) ----
     k2 = build_chunk_scan_combine_metal(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
     dt_k = rearrange(dt, "b (c s) hh -> b hh c s", c=nchunks).contiguous()
     out = torch.zeros(batch, seqlen, nheads, headdim, device=dev, dtype=torch.float16)
     k2(cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
-       C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+       C.contiguous(), prev_states.contiguous(), D.contiguous(), out)
     torch.mps.synchronize()
 
     # ---- SERIAL ground truth (full per-timestep recurrence, seeded by h0) ----
@@ -652,7 +652,7 @@ def test_region_flip_on_full_scale_region_parity(monkeypatch, capsys):
     out = torch.zeros(b, S, H, P, device=dev, dtype=torch.float16)
     kernels["mamba3_chunk_scan_combine"](
         cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
-        C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+        C.contiguous(), prev_states.contiguous(), D.contiguous(), out)
     torch.mps.synchronize()
 
     out_serial, hlast_serial = _serial_full_forward(

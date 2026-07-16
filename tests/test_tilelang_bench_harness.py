@@ -9,7 +9,6 @@ import warnings
 
 import pytest
 from importlib import import_module
-from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -75,6 +74,73 @@ def _load_receipt(name: str) -> dict[str, Any]:
 
 def _finite_positive_float(value: object) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
+
+
+def test_fp8_default_roots_prefer_existing_sibling_tilelang_checkout() -> None:
+    sibling_tilelang = REPO_ROOT.parent / "tilelang"
+    if not sibling_tilelang.is_dir():
+        pytest.skip(f"sibling TileLang checkout is not available at {sibling_tilelang}")
+
+    assert fp8_bench._default_tilelang_root() == sibling_tilelang
+    assert fp8_bench._default_tvm_root(sibling_tilelang) == (
+        sibling_tilelang / "3rdparty" / "tvm"
+    )
+
+
+def test_fp8_stale_runtime_purge_removes_mixed_tilelang_runtime_group(
+    tmp_path: Path,
+) -> None:
+    tilelang_root = tmp_path / "tilelang"
+    tvm_root = tilelang_root / "3rdparty" / "tvm"
+    (tvm_root / "python").mkdir(parents=True)
+    (tvm_root / "3rdparty" / "tvm-ffi" / "python").mkdir(parents=True)
+
+    stale_tilelang = tmp_path / "stale" / "tilelang" / "__init__.py"
+    stale_tilelang.parent.mkdir(parents=True)
+    stale_tilelang.write_text("", encoding="utf-8")
+    active_tvm = tvm_root / "python" / "tvm" / "__init__.py"
+    active_tvm.parent.mkdir(parents=True)
+    active_tvm.write_text("", encoding="utf-8")
+    active_tvm_ffi = tvm_root / "3rdparty" / "tvm-ffi" / "python" / "tvm_ffi" / "__init__.py"
+    active_tvm_ffi.parent.mkdir(parents=True)
+    active_tvm_ffi.write_text("", encoding="utf-8")
+
+    import types
+
+    modules = {
+        "tilelang": types.ModuleType("tilelang"),
+        "tilelang.language": types.ModuleType("tilelang.language"),
+        "tvm": types.ModuleType("tvm"),
+        "tvm_ffi": types.ModuleType("tvm_ffi"),
+    }
+    modules["tilelang"].__file__ = str(stale_tilelang)
+    modules["tilelang.language"].__file__ = str(stale_tilelang)
+    modules["tvm"].__file__ = str(active_tvm)
+    modules["tvm_ffi"].__file__ = str(active_tvm_ffi)
+    runtime_prefixes = ("tilelang", "tvm", "tvm_ffi")
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in runtime_prefixes
+        )
+    }
+
+    try:
+        sys.modules.update(modules)
+
+        fp8_bench._purge_stale_imported_modules(tilelang_root, tvm_root)
+
+        assert not any(name in sys.modules for name in modules)
+    finally:
+        for name in list(sys.modules):
+            if any(
+                name == prefix or name.startswith(f"{prefix}.")
+                for prefix in runtime_prefixes
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_modules)
 
 
 class _FakeMxArray:
@@ -144,23 +210,21 @@ def test_tilelang_imports_resolve_to_local_tree_and_pinned_ffi() -> None:
     tilelang = import_module("tilelang")
     tvm = import_module("tvm")
     tvm_ffi = import_module("tvm_ffi")
+    tvm_ffi_core = import_module("tvm_ffi.core")
     assert isinstance(tilelang.__file__, str)
     assert isinstance(tvm.__file__, str)
     assert isinstance(tvm_ffi.__file__, str)
+    assert isinstance(tvm_ffi_core.__file__, str)
 
     tilelang_path = Path(tilelang.__file__).resolve()
     tvm_path = Path(tvm.__file__).resolve()
     tvm_ffi_path = Path(tvm_ffi.__file__).resolve()
+    tvm_ffi_core_path = Path(tvm_ffi_core.__file__).resolve()
 
     assert tilelang_path.is_relative_to(tilelang_root)
     assert tvm_path.is_relative_to(tilelang_root / "3rdparty" / "tvm" / "python")
     assert tvm_ffi_path.is_relative_to(local_tvm_ffi_root / "python")
-
-    ffi_dist = importlib_metadata.distribution("apache-tvm-ffi")
-    direct_url = ffi_dist.read_text("direct_url.json")
-    assert direct_url is not None
-    direct_url_payload = json.loads(direct_url)
-    assert Path(direct_url_payload["url"].removeprefix("file://")).resolve() == local_tvm_ffi_root
+    assert tvm_ffi_core_path.is_relative_to(local_tvm_ffi_root / "build")
 
 
 def test_topk_strict_requires_path_c_after_path_b_retirement() -> None:

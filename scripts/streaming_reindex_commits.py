@@ -49,6 +49,7 @@ Output root is SEPARATE from the code stream: outputs/reindexed_commits/.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -62,13 +63,47 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Sequence
 
-# Reuse the proven machinery from the code driver.  Tests import this module as
-# ``scripts.streaming_reindex_commits`` while production launches it as a file;
-# support both without relying on ambient sys.path order.
-try:
-    from scripts import streaming_reindex as sr
-except ImportError:  # pragma: no cover - exercised by file-mode execution.
-    import streaming_reindex as sr
+def _load_local_streaming_reindex():
+    """Load the sibling code driver without trusting a foreign ``scripts`` package.
+
+    Cross-repo audit tests import this file as a top-level module while another
+    checkout already owns the ``scripts`` namespace. Importing
+    ``scripts.streaming_reindex`` in that state can bind the CUDA repository's
+    unrelated module and silently change every path constant. Bind by this
+    file's real sibling path instead; package-mode imports keep the ordinary
+    relative module identity.
+    """
+
+    if __package__:
+        from . import streaming_reindex
+
+        return streaming_reindex
+
+    module_path = Path(__file__).resolve().with_name("streaming_reindex.py")
+    module_name = "_cppmega_mlx_streaming_reindex"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        existing_path = Path(getattr(existing, "__file__", "")).resolve()
+        if existing_path != module_path:
+            raise ImportError(
+                f"{module_name} already resolves to {existing_path}, expected {module_path}"
+            )
+        return existing
+
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load local streaming reindex module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+sr = _load_local_streaming_reindex()
 
 MLX_ROOT = sr.MLX_ROOT
 VENV_PYTHON = sr.VENV_PYTHON

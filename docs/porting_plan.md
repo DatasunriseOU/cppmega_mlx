@@ -193,6 +193,7 @@ The current collected test files are:
 - tests/test_build_repo_list.py
 - tests/test_case5_domain_ingestion.py
 - tests/test_case5_v4_domain_materialization_regressions.py
+- tests/test_case5_v7_parser_token_span_regressions.py
 - tests/test_check_environment_script.py
 - tests/test_checkpoint.py
 - tests/test_checkpoint_subprocess_resume.py
@@ -213,7 +214,9 @@ The current collected test files are:
 - tests/test_cppmega_parity_anchors.py
 - tests/test_crossrepo_global_symbols.py
 - tests/test_crossrepo_std_namespace_index.py
+- tests/test_cuda_environment_script.py
 - tests/test_cuda_kernel_bridge.py
+- tests/test_cuda_lane_hardware.py
 - tests/test_cut_cross_entropy.py
 - tests/test_cute_bridge.py
 - tests/test_cute_to_tilelang_bridge.py
@@ -281,6 +284,7 @@ The current collected test files are:
 - tests/test_inference_speculative_decode.py
 - tests/test_inference_tool_use_template.py
 - tests/test_kernel_policy.py
+- tests/test_ksh_python_domain_parsers.py
 - tests/test_large_domain_ingestion.py
 - tests/test_lint_mlx.py
 - tests/test_long_context_forward.py
@@ -307,10 +311,12 @@ The current collected test files are:
 - tests/test_megatron_indexed.py
 - tests/test_megatron_ingress_stress_script.py
 - tests/test_memory_audit.py
+- tests/test_memory_guard.py
 - tests/test_memory_runtime.py
 - tests/test_metal_ops.py
 - tests/test_mhc.py
 - tests/test_mhc_integration.py
+- tests/test_mlx_abi_script.py
 - tests/test_mlx_lm_adapter.py
 - tests/test_mlx_runtime.py
 - tests/test_model_factory.py
@@ -340,6 +346,7 @@ The current collected test files are:
 - tests/test_path_c_autosplit_metal_parity.py
 - tests/test_path_c_backward_fusion_search.py
 - tests/test_path_c_device_caps.py
+- tests/test_path_c_environment_launcher.py
 - tests/test_path_c_fused_plus_eager_runtime.py
 - tests/test_path_c_fused_suffix_custom_function.py
 - tests/test_path_c_fusion_compile_receipt_script.py
@@ -374,6 +381,7 @@ The current collected test files are:
 - tests/test_render_sidecar_example_domain_debug.py
 - tests/test_repair_packed_document_boundaries.py
 - tests/test_report_training_steps.py
+- tests/test_repository_local_data_tools.py
 - tests/test_runtime_exports.py
 - tests/test_seed_runtime.py
 - tests/test_self_hosted_ci.py

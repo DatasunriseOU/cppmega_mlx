@@ -10,6 +10,7 @@ from cppmega_mlx.data.code_packet_builder import build_code_packets
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_SCHEMA_SHA256,
     DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    validate_case5_contract_metadata,
 )
 from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.data.tokenizer_contract import (
@@ -96,12 +97,19 @@ def _input_schema_metadata(*, symbol_identity: bool = True) -> dict[bytes, bytes
         TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
             "utf-8"
         ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
+        DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode(
+            "utf-8"
+        ): DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
     }
     if symbol_identity:
         metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] = str(
             packer.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
         ).encode("ascii")
     return metadata
+
+
+def test_input_schema_fixture_carries_the_full_case5_contract() -> None:
+    validate_case5_contract_metadata(_input_schema_metadata(), where="test fixture")
 
 
 def _doc(
@@ -756,6 +764,7 @@ def test_pack_parquet_dataset_rejects_stale_symbol_identity_schema(tmp_path: Pat
     [
         (DOMAIN_SCHEMA_SHA256_METADATA_KEY, None),
         (TOKENIZER_CONTRACT_SHA256_METADATA_KEY, b"0" * 64),
+        (DOMAIN_DELIMITER_CONTRACT_METADATA_KEY, None),
     ],
 )
 def test_pack_parquet_dataset_rejects_missing_or_stale_contract_hashes(

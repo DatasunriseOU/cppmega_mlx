@@ -3,8 +3,8 @@ mx.compile when sharding.compile_mode='whole_model' — not just a
 metadata echo.
 
 Direct (no-subprocess) gate that loads the pipeline, runs N steps,
-and asserts extras.sharding_applied.compile_engaged==True plus a
-measurable first-vs-warm gap.
+and asserts extras.sharding_applied.compile_engaged==True plus
+deterministic wrapper-call and Python-trace counts for the compiled step.
 """
 
 from __future__ import annotations
@@ -62,16 +62,11 @@ def test_item52_whole_model_compile_engagement_proven_by_extras():
     assert sa["compile_engaged"] is True
     assert sa["compile_status"] == "engaged"
     assert sa["compile_error"] is None
+    assert sa["compile_call_count"] == 6
+    assert sa["compile_trace_count"] >= 1
     per_step = sa["per_step_ms"]
     assert len(per_step) == 6
-    first = float(per_step[0])
-    warm_mean = sum(per_step[1:]) / 5.0
-    # mx.compile takes the build cost on the first step. We assert
-    # first is >=2x slower than the warm mean — empirically the gap
-    # is 10-200x on Metal but we keep the bound conservative so the
-    # test is robust to bench noise on tiny shapes.
-    assert first / max(1e-9, warm_mean) >= 2.0, (
-        f"first={first}ms warm_mean={warm_mean}ms per_step={per_step}")
+    assert all(float(step_ms) > 0.0 for step_ms in per_step)
 
 
 def test_item52_off_mode_records_no_compile_engagement():
@@ -80,6 +75,8 @@ def test_item52_off_mode_records_no_compile_engagement():
     sa = extras["sharding_applied"]
     assert sa["compile_engaged"] is False
     assert sa["compile_status"] == "off"
+    assert sa["compile_call_count"] == 0
+    assert sa["compile_trace_count"] == 0
 
 
 def test_item52_regional_mode_records_regional_status():
@@ -90,3 +87,5 @@ def test_item52_regional_mode_records_regional_status():
     sa = extras["sharding_applied"]
     assert sa["compile_engaged"] is False
     assert sa["compile_status"] == "regional"
+    assert sa["compile_call_count"] == 0
+    assert sa["compile_trace_count"] == 0

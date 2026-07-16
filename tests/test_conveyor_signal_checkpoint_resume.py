@@ -39,7 +39,6 @@ import pytest
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = MLX_ROOT / "tests" / "conveyor_ckpt_harness.py"
-VENV_PY = MLX_ROOT / ".venv" / "bin" / "python"
 
 REPOS = ["repoA", "repoB"]
 NRECORDS = 10            # -> 10 ranges per repo at --range-size 1
@@ -49,7 +48,7 @@ TEST_CODE_REVISION = "1" * 40
 
 
 def _python() -> str:
-    return str(VENV_PY) if VENV_PY.exists() else sys.executable
+    return sys.executable
 
 
 def _read_manifest(path: Path) -> dict:

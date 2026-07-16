@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEFAULT_ENV_ROOT="$(cd "$REPO_ROOT/.." && pwd)/.venvs/cppmega.mlx"
+ENV_ROOT="${CPPMEGA_MLX_ENV_ROOT:-$DEFAULT_ENV_ROOT}"
+PYTHON_BIN="${CPPMEGA_MLX_PYTHON:-$ENV_ROOT/bin/python}"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "FAIL: dedicated cppmega.mlx Python is unavailable: $PYTHON_BIN" >&2
+  exit 2
+fi
+
+exec env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+  -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
+  -u TVM_HOME -u TVM_ROOT -u TVM_LIBRARY_PATH -u TVM_IMPORT_PYTHON_PATH \
+  -u TVM_FFI_INCLUDE_PATH -u TVM_FFI_DLPACK_INCLUDE_PATH \
+  -u TL_APACHE_TVM_SOURCE_HOME -u TL_APACHE_TVM_SWAP_HOME \
+  -u TL_EXTERNAL_TVM_HOME -u TL_TILELANG_SITE -u TL_TILELANG_VENVS \
+  -u TL_TVM_IMPORT_PYTHON_PATH -u DYLD_LIBRARY_PATH \
+  PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+  CPPMEGA_MLX_ENV_ROOT="$ENV_ROOT" CPPMEGA_MLX_PYTHON="$PYTHON_BIN" \
+  "$PYTHON_BIN" "$REPO_ROOT/scripts/run_mlx_path_c.py" "$@"

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import threading as _threading
 import time
 from functools import partial
 import traceback
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping
 
 import mlx.core as mx
+import numpy as np
 
 from cppmega_v4.buildspec import (
     LossKind,
@@ -1191,6 +1193,7 @@ def stage_train(ctx: StageContext) -> StageResult:
         # run cached in _RUN_CACHE. If hit, restore opt.state so the
         # second Train's losses[0] picks up where the first left off.
         opt_state_carried = False
+        opt_state_restore_warning: str | None = None
         run_id = str(opts.get("run_id") or id(opt))
         continue_from = opts.get("continue_from_run_id")
         if continue_from:
@@ -1201,8 +1204,11 @@ def stage_train(ctx: StageContext) -> StageResult:
                 try:
                     opt.state = cached_state
                     opt_state_carried = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise RuntimeError(
+                        "optimizer state continuation could not be restored for "
+                        f"run {continue_from!r}: {type(exc).__name__}: {exc}"
+                    ) from exc
         # V4-9: when hybrid, count params routed to each bucket so e2e can
         # prove the split predicate actually saw 2D vs 1D/3D parameters.
         muon_group_size: int | None = None
@@ -1806,10 +1812,9 @@ def stage_train(ctx: StageContext) -> StageResult:
         # closure captures model.state + optimizer.state + mx.random.state
         # so MLX can fuse the forward+backward graph once on the first
         # invocation; subsequent fixed-shape invocations re-use the
-        # compiled artifact. We record whether compile actually engaged
-        # (status), and per-step wall-clock so a downstream bench/test
-        # can prove the warm step << first step (i.e. compilation
-        # produced a measurable speed-up, not a no-op).
+        # compiled artifact. We record wrapper calls plus the number of
+        # Python-body traces performed by mx.compile. Per-step wall-clock is
+        # retained as performance telemetry, not as a correctness oracle.
         _compile_mode_train = "off"
         if ws_sharding is not None:
             _compile_mode_train = str(getattr(
@@ -1817,6 +1822,8 @@ def stage_train(ctx: StageContext) -> StageResult:
         _compile_engaged = False
         _compile_status = "off"
         _compile_error: str | None = None
+        _compile_call_count = 0
+        _compile_trace_count = 0
         _compiled_step_value_and_grad = None
         if _compile_mode_train == "whole_model":
             try:
@@ -1824,15 +1831,23 @@ def stage_train(ctx: StageContext) -> StageResult:
                     all_modules.state, opt.state, mx.random.state,
                 ]
 
-                @partial(mx.compile, inputs=_captured_state,
-                         outputs=_captured_state)
-                def _compiled_step_value_and_grad(_emb, _targets):
+                def _compiled_step_body(_emb, _targets):
+                    # MLX executes this body while tracing a new compiled
+                    # graph, then reuses the graph on subsequent fixed-shape
+                    # calls. This is a deterministic trace receipt; timing
+                    # remains performance telemetry only.
+                    nonlocal _compile_trace_count
+                    _compile_trace_count += 1
                     _loss, _grads = loss_and_grad(
                         all_modules, _emb, _targets)
                     return _loss, _grads
 
-                _compile_engaged = True
-                _compile_status = "engaged"
+                _compiled_step_value_and_grad = partial(
+                    mx.compile,
+                    inputs=_captured_state,
+                    outputs=_captured_state,
+                )(_compiled_step_body)
+                _compile_status = "configured"
             except Exception as _ce:  # pragma: no cover
                 _compile_error = (
                     f"{type(_ce).__name__}: {_ce}")
@@ -1843,8 +1858,10 @@ def stage_train(ctx: StageContext) -> StageResult:
             # maybe_compile_region inside the brick layer (see
             # cppmega_mlx.training.compiled.REGIONAL_COMPILE_TARGETS).
             _compile_status = "regional"
-        # Per-step wall-clock so first-step (compile + run) vs warm
-        # steps (compiled fast-path) can be compared.
+        # Per-step wall-clock is telemetry only. MLX/Metal scheduling and
+        # tiny-shape noise make a fixed timing ratio unsuitable as a
+        # correctness oracle; compile invocation count below is the
+        # deterministic engagement signal.
         _per_step_ms: list[float] = []
         for step in range(n_steps):
             print(f"[debug_step] loop step={step} of {n_steps}", flush=True)
@@ -1885,6 +1902,7 @@ def stage_train(ctx: StageContext) -> StageResult:
             current_step_stats.clear()
             _step_t0 = time.perf_counter()
             if _compiled_step_value_and_grad is not None:
+                _compile_call_count += 1
                 loss, grads = _compiled_step_value_and_grad(emb, targets)
             else:
                 loss, grads = loss_and_grad(all_modules, emb, targets)
@@ -2126,15 +2144,16 @@ def stage_train(ctx: StageContext) -> StageResult:
                     step_expert_load = None
 
                 # Phase 1: progress telemetry & MTP logits injection
-                dataset_progress = None
-                if "pre_fetcher" in dir() and pre_fetcher is not None:
+                pre_fetcher = locals().get("pre_fetcher")
+                if pre_fetcher is not None:
                     dataset_progress = pre_fetcher.get_status()
                 else:
-                    # Fallback default progress details
                     dataset_progress = {
-                        "progress_percent": int(min(100.0, ((step + 1) / n_steps) * 100)),
+                        "progress_percent": int(
+                            min(100.0, ((step + 1) / n_steps) * 100)
+                        ),
                         "token_offset": int((step + 1) * batch * seq),
-                        "download_speed": "48.2 MB/s"
+                        "download_speed": None,
                     }
 
                 mtp_logits = None
@@ -2363,10 +2382,11 @@ def stage_train(ctx: StageContext) -> StageResult:
         # G10 / V7-I03: cache opt.state for future warm-start lookups
         # via the locked helper so a concurrent reader can't observe a
         # partial dict mid-eviction.
+        opt_state_cache_warning: str | None = None
         try:
             _run_cache_set(run_id, opt.state, cap=8)
-        except Exception:
-            pass
+        except Exception as exc:
+            opt_state_cache_warning = f"{type(exc).__name__}: {exc}"
 
         after_flat = dict(nn.utils.tree_flatten(all_modules.parameters()))
         delta = 0.0
@@ -2474,15 +2494,21 @@ def stage_train(ctx: StageContext) -> StageResult:
                        "detail": f"losses={losses}, ratio="
                                  f"{losses[-1] / losses[0]:.2f}"},
             )
+        if _compile_mode_train == "whole_model":
+            if _compile_trace_count > 0:
+                _compile_engaged = True
+                _compile_status = "engaged"
+            elif _compile_call_count > 0:
+                _compile_status = "no_trace"
         # V7-I01: enrich sharding_applied with the actual compile
-        # outcome + per-step wall-clock so downstream tests/benches
-        # can prove mx.compile engaged and produced a measurable
-        # first-vs-warm speed-up.
+        # outcome, deterministic invocation count, and timing telemetry.
         if sharding_applied is None:
             sharding_applied = {}
         sharding_applied["compile_engaged"] = bool(_compile_engaged)
         sharding_applied["compile_status"] = str(_compile_status)
         sharding_applied["compile_error"] = _compile_error
+        sharding_applied["compile_call_count"] = int(_compile_call_count)
+        sharding_applied["compile_trace_count"] = int(_compile_trace_count)
         # Per-step timing block (always populated even when compile=off)
         if _per_step_ms:
             _first_ms = float(_per_step_ms[0])
@@ -2614,6 +2640,8 @@ def stage_train(ctx: StageContext) -> StageResult:
                     if loss_scaler is not None else []),
                 "moe": moe_extras,
                 "opt_state_carried": opt_state_carried,
+                "opt_state_cache_warning": opt_state_cache_warning,
+                "opt_state_restore_warning": opt_state_restore_warning,
                 "run_id": run_id,
                 "checkpoint": {
                     "saved_path": checkpoint_saved,
@@ -2841,25 +2869,133 @@ def _validate_parquet_stream_tokenizer_fingerprints(
 # partially-populated opt.state. The lock is held only during the
 # get/set/eviction operations — never across the train step itself
 # (which would serialise actual training).
-import threading as _threading
 _RUN_CACHE: dict[str, Any] = {}
 _RUN_CACHE_LOCK = _threading.Lock()
+try:
+    _RUN_CACHE_MAX_BYTES = int(
+        os.environ.get("CPPMEGA_RUN_CACHE_MAX_BYTES", 512 * 1024**2)
+    )
+except (TypeError, ValueError) as exc:  # pragma: no cover - import contract
+    raise RuntimeError("CPPMEGA_RUN_CACHE_MAX_BYTES must be an integer") from exc
+if _RUN_CACHE_MAX_BYTES <= 0:  # pragma: no cover - import contract
+    raise RuntimeError("CPPMEGA_RUN_CACHE_MAX_BYTES must be positive")
+
+
+@dataclass(frozen=True)
+class _RunCacheArraySnapshot:
+    """Host-owned array payload safe to restore on another MLX thread."""
+
+    value: np.ndarray
+
+
+def _run_cache_value_nbytes(value: Any) -> int:
+    """Return tensor bytes without materializing MLX arrays on the host."""
+    if isinstance(value, mx.array):
+        return int(value.nbytes)
+    if isinstance(value, _RunCacheArraySnapshot):
+        return int(value.value.nbytes)
+    if isinstance(value, dict):
+        return sum(_run_cache_value_nbytes(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_run_cache_value_nbytes(child) for child in value)
+    return 0
+
+
+def _run_cache_snapshot(value: Any) -> Any:
+    """Detach MLX arrays before publishing state to the cross-thread cache."""
+    arrays: list[mx.array] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, mx.array):
+            arrays.append(node)
+            return
+        if isinstance(node, dict):
+            for child in node.values():
+                collect(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                collect(child)
+
+    collect(value)
+    if arrays:
+        mx.eval(*arrays)
+        mx.synchronize()
+
+    def materialize(node: Any) -> Any:
+        if isinstance(node, mx.array):
+            return _RunCacheArraySnapshot(np.array(node, copy=True))
+        if isinstance(node, dict):
+            return {key: materialize(child) for key, child in node.items()}
+        if isinstance(node, list):
+            return [materialize(child) for child in node]
+        if isinstance(node, tuple):
+            return tuple(materialize(child) for child in node)
+        return node
+
+    return materialize(value)
+
+
+def _run_cache_restore(value: Any) -> Any:
+    """Recreate cached arrays on the calling thread's current MLX stream."""
+    if isinstance(value, _RunCacheArraySnapshot):
+        return mx.array(value.value)
+    if isinstance(value, dict):
+        return {key: _run_cache_restore(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_run_cache_restore(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_run_cache_restore(child) for child in value)
+    return value
 
 
 def _run_cache_get(key: str) -> Any | None:
     """V7-I03: thread-safe read of _RUN_CACHE."""
     with _RUN_CACHE_LOCK:
-        return _RUN_CACHE.get(key)
+        cached = _RUN_CACHE.get(key)
+    return _run_cache_restore(cached) if cached is not None else None
 
 
 def _run_cache_set(key: str, value: Any, *, cap: int = 32) -> None:
     """V7-I03: thread-safe write with LRU-style eviction."""
+    # MLX stream identifiers are thread-local. Publishing a live GPU array
+    # here lets a concurrent warm-start reader reference a stream that does
+    # not exist in its thread, so publish a synchronized host snapshot.
+    source_bytes = _run_cache_value_nbytes(value)
+    if source_bytes > _RUN_CACHE_MAX_BYTES:
+        raise MemoryError(
+            "run cache state exceeds byte budget: "
+            f"bytes={source_bytes} max_bytes={_RUN_CACHE_MAX_BYTES}"
+        )
+    snapshot = _run_cache_snapshot(value)
+    snapshot_bytes = _run_cache_value_nbytes(snapshot)
     with _RUN_CACHE_LOCK:
-        _RUN_CACHE[key] = value
-        # Drop oldest entries past cap (insertion order in py3.7+).
-        while len(_RUN_CACHE) > cap:
-            oldest = next(iter(_RUN_CACHE))
-            _RUN_CACHE.pop(oldest, None)
+        existing = _RUN_CACHE.get(key)
+        projected_bytes = sum(
+            _run_cache_value_nbytes(entry) for entry in _RUN_CACHE.values()
+        ) - (_run_cache_value_nbytes(existing) if existing is not None else 0)
+        projected_bytes += snapshot_bytes
+        projected_entries = len(_RUN_CACHE) - (1 if existing is not None else 0)
+        victims: list[str] = []
+        for candidate in _RUN_CACHE:
+            if candidate == key:
+                continue
+            if (
+                projected_entries + 1 <= cap
+                and projected_bytes <= _RUN_CACHE_MAX_BYTES
+            ):
+                break
+            victims.append(candidate)
+            projected_entries -= 1
+            projected_bytes -= _run_cache_value_nbytes(_RUN_CACHE[candidate])
+        if projected_entries + 1 > cap or projected_bytes > _RUN_CACHE_MAX_BYTES:
+            raise MemoryError(
+                "run cache state cannot fit byte/entry budget: "
+                f"bytes={snapshot_bytes} max_bytes={_RUN_CACHE_MAX_BYTES} "
+                f"entries={cap}"
+            )
+        for victim in victims:
+            _RUN_CACHE.pop(victim, None)
+        _RUN_CACHE[key] = snapshot
 
 
 def _run_cache_contains(key: str) -> bool:

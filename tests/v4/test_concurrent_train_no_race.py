@@ -14,12 +14,13 @@ operations are no longer GIL-atomic for compound operations.
 from __future__ import annotations
 
 import threading
-import time
 
 import pytest
+import mlx.core as mx
 
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
+import cppmega_v4.runner.stages as stages
 from cppmega_v4.runner.stages import (
     _RUN_CACHE, _RUN_CACHE_LOCK,
     _run_cache_contains, _run_cache_get, _run_cache_set,
@@ -119,8 +120,10 @@ def test_v7_i03_concurrent_train_warm_start_completes_both(tmp_path):
 
     t1 = threading.Thread(target=_worker, args=(0,))
     t2 = threading.Thread(target=_worker, args=(1,))
-    t1.start(); t2.start()
-    t1.join(timeout=30.0); t2.join(timeout=30.0)
+    t1.start()
+    t2.start()
+    t1.join(timeout=30.0)
+    t2.join(timeout=30.0)
     assert not errors, errors
     assert len(results) == 2
     for r in results:
@@ -142,3 +145,61 @@ def test_v7_i03_cache_eviction_does_not_strand_concurrent_readers():
     assert surviving <= 4
     # Stale key returns None, not KeyError.
     assert _run_cache_get("k0") is None
+
+
+def test_v7_i03_gpu_state_is_recreated_on_reader_thread() -> None:
+    """Cached MLX arrays must not retain the publisher thread's GPU stream."""
+    import mlx.core as mx
+
+    value = {"state": mx.arange(4, dtype=mx.float32)}
+    mx.eval(value["state"])
+    _run_cache_set("gpu-state", value)
+
+    errors: list[BaseException] = []
+
+    def _read() -> None:
+        try:
+            restored = _run_cache_get("gpu-state")
+            assert restored is not None
+            mx.eval(restored["state"])
+            assert restored["state"].tolist() == [0, 1, 2, 3]
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_read) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+    assert not errors, errors
+
+
+def test_v7_i03_oversized_state_is_rejected_before_host_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stages, "_RUN_CACHE_MAX_BYTES", 8)
+    monkeypatch.setattr(
+        stages,
+        "_run_cache_snapshot",
+        lambda _value: (_ for _ in ()).throw(
+            AssertionError("oversized state must not be materialized")
+        ),
+    )
+
+    with pytest.raises(MemoryError, match="run cache state"):
+        _run_cache_set("oversized", {"state": mx.arange(4, dtype=mx.float32)})
+    assert not _run_cache_contains("oversized")
+
+
+def test_v7_i03_stage_surfaces_cache_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stages, "_RUN_CACHE_MAX_BYTES", 1)
+
+    result = _train({"num_steps": 1, "run_id": "too-large"})
+
+    assert result["status"] == "ok", result["error"]
+    warning = result["extras"].get("opt_state_cache_warning")
+    assert isinstance(warning, str)
+    assert "run cache state" in warning
+    assert not _run_cache_contains("too-large")

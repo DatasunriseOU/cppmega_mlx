@@ -142,8 +142,8 @@ def _eager_precompute(C, Bmat, x, A, dt, h0, chunk_size):
     and ``prev_states`` (per-chunk entry states) from base ``(C,B,x,A,dt,h0)``,
     following the canonical SSD precompute (``scratch/mamba3_chunked_forward_proto``
     algebra). This stands in for the not-yet-built F0/F1 segments (Stage 1 scope).
-    All math in fp32 (the production accumulation dtype); returned as fp16 to match
-    the F2 kernel ABI.
+    All math in fp32 (the production accumulation dtype); ``prev_states`` stays
+    fp32 to match the F1 producer and F2 kernel ABI.
     """
     import torch
     from einops import rearrange
@@ -202,7 +202,7 @@ def _eager_precompute(C, Bmat, x, A, dt, h0, chunk_size):
     return (
         cb.half().contiguous(),
         dA_cumsum.half().contiguous(),
-        prev_states.half().contiguous(),
+        prev_states.contiguous(),
     )
 
 

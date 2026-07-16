@@ -58,22 +58,36 @@ Output schema (repo_list.json):
 """
 
 import argparse
+import importlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from types import ModuleType
 
 MLX_ROOT = Path(__file__).resolve().parents[2]
 if str(MLX_ROOT) not in sys.path:
     sys.path.insert(0, str(MLX_ROOT))
 
-from cppmega_mlx.data.symbol_identity import (  # noqa: E402
-    SymbolIdentityError,
-    require_project_identity,
-    resolve_remote_project_identity,
-)
+
+def _load_local_symbol_identity() -> ModuleType:
+    module_path = MLX_ROOT / "cppmega_mlx" / "data" / "symbol_identity.py"
+    module = importlib.import_module("cppmega_mlx.data.symbol_identity")
+    loaded_path = Path(getattr(module, "__file__", "")).resolve()
+    if loaded_path != module_path.resolve():
+        raise ImportError(
+            "cppmega_mlx.data.symbol_identity resolved outside this checkout: "
+            f"loaded={loaded_path} expected={module_path}"
+        )
+    return module
+
+
+_symbol_identity = _load_local_symbol_identity()
+SymbolIdentityError = _symbol_identity.SymbolIdentityError
+require_project_identity = _symbol_identity.require_project_identity
+resolve_remote_project_identity = _symbol_identity.resolve_remote_project_identity
 
 
 REPO_LIST_SCHEMA_VERSION = 2

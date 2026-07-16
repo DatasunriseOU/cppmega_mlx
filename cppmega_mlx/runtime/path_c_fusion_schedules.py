@@ -46,6 +46,7 @@ from cppmega_mlx.runtime.path_c_fusion import (
 __all__ = [
     "MAMBA3_CHUNKED_FWD_SCAN_CHUNK_SIZE",
     "mamba3_chunked_forward_scan_grid",
+    "mamba3_chunked_forward_scan_block_dstate",
     "MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_ID",
     "MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_NAME",
     "MAMBA3_FP8_TRAIN_FUSION_SCHEDULE_STATUS",
@@ -6789,6 +6790,20 @@ def _mamba3_chunked_forward_scan_feasibility(
             heads, groups,
         )
     try:
+        mamba3_chunked_forward_scan_block_dstate(
+            state_dim=state_dim,
+            target=_path_c_default_target(),
+        )
+    except ValueError as exc:
+        return (
+            False,
+            0,
+            None,
+            "mamba3_chunked_forward state tile is infeasible",
+            state_dim,
+            str(exc),
+        )
+    try:
         total, grid = chunk_scan_fwd_grid(
             batch, sequence_length, chunk_size, groups, heads, head_dim, state_dim
         )
@@ -6800,6 +6815,32 @@ def _mamba3_chunked_forward_scan_feasibility(
             "chunk_scan_fwd_grid contract",
         )
     return (True, total, grid, "", None, None)
+
+
+def mamba3_chunked_forward_scan_block_dstate(
+    *,
+    state_dim: int,
+    target: Any = None,
+) -> int:
+    """Return the state tile shared by feasibility, delegation, and the prim.
+
+    Metal uses the scan-core's threadgroup-memory-aware selector. CUDA keeps the
+    exact state extent because its prim requires one tile covering all state
+    columns. This is a selector contract, not a fallback: an unsupported shape or
+    unsafe explicit tile raises at the call site that requested it.
+    """
+    target_name = _path_c_default_target() if target is None else str(target).lower()
+    if target_name.startswith("metal"):
+        from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
+            select_chunk_scan_fwd_metal_block_dstate,
+        )
+
+        return select_chunk_scan_fwd_metal_block_dstate(int(state_dim))
+    if int(state_dim) <= 0:
+        raise ValueError(
+            f"mamba3 chunked forward state tile: state_dim must be positive, got {state_dim}"
+        )
+    return int(state_dim)
 
 
 def mamba3_chunked_forward_scan_grid(
@@ -6987,14 +7028,17 @@ def _mamba3_chunked_grid_delegation_prim(
     # on a CUDA host).
     grid_target = "cuda" if _path_c_default_target() == "cuda" else None
     builder_kwargs: dict[str, Any] = {"target": grid_target}
-    # The scan+combine F2/B2 cores carry a GEMM ``block_Dstate`` tile that slices
-    # the state axis ``[..., 0:block_Dstate]``. The validated CUDA path tiles it
-    # to the actual ``dstate`` (production dstate=64): the builder default of 128
-    # would over-slice a dstate<128 tensor. The precompute/recur cores have no
-    # such tile and do not accept the kwarg. RULE #1: pass the exact, validated
-    # tile only where the prim consumes it (no silent over-slice).
+    # The scan+combine F2 core carries a GEMM ``block_Dstate`` tile that slices
+    # the state axis. Use the same target-aware selector as feasibility: Metal
+    # may split dstate=128 into 64-column contractions to fit its 32768 B pool;
+    # CUDA keeps the exact state extent. The precompute/recur cores have no such
+    # tile and do not accept the kwarg. RULE #1: pass the validated tile only
+    # where the prim consumes it (no silent over-slice).
     if op_name == "mamba3_chunk_scan_combine":
-        builder_kwargs["block_Dstate"] = dstate
+        builder_kwargs["block_Dstate"] = mamba3_chunked_forward_scan_block_dstate(
+            state_dim=dstate,
+            target=grid_target or "metal",
+        )
     return builder(
         batch, seqlen, chunk, ngroups, nheads, headdim, dstate, **builder_kwargs
     )

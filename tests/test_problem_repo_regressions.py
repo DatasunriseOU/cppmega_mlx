@@ -17,6 +17,18 @@ def _load_index_project_or_skip():
     return index_project
 
 
+def _process_project(index_project, *args, **kwargs):
+    """Keep parser fixtures independent from the long-lived pytest RSS.
+
+    These tests validate document/provenance semantics. The dedicated memory
+    guard is covered separately; disabling its admission threshold here avoids
+    a previous Metal test's allocator footprint changing parser assertions.
+    """
+
+    kwargs.setdefault("memory_limit_gb", 0.0)
+    return index_project.process_project(*args, **kwargs)
+
+
 def test_build_context_ignores_build_directory_named_like_bazel_file(tmp_path: Path) -> None:
     from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
 
@@ -136,7 +148,7 @@ def test_header_only_class_template_emits_standalone_header_doc(tmp_path: Path) 
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -352,7 +364,7 @@ def test_header_function_template_emits_trainable_cpp_doc(tmp_path: Path) -> Non
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -399,7 +411,7 @@ def test_header_cxx20_concept_and_inline_variable_template_emit_docs(tmp_path: P
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -453,7 +465,7 @@ def test_macro_only_header_emits_macro_doc_and_cpp_delimiters(tmp_path: Path) ->
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -511,7 +523,7 @@ def test_function_doc_pulls_used_macro_and_routes_invocation_to_definition(tmp_p
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -557,7 +569,7 @@ def test_conditional_macro_route_preserves_condition_stack(tmp_path: Path) -> No
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -609,7 +621,7 @@ def test_macro_redefinition_window_routes_to_latest_visible_definition(tmp_path:
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -673,7 +685,7 @@ def test_pulled_dependency_macro_invocation_keeps_source_redefinition_window(
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -751,7 +763,7 @@ def test_macro_include_order_routes_across_local_headers(tmp_path: Path) -> None
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -815,7 +827,7 @@ def test_macro_body_dependency_is_pulled_and_expansion_routes_to_included_macro(
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -871,7 +883,7 @@ def test_macro_condition_dependency_cycle_does_not_recurse_forever(tmp_path: Pat
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -912,7 +924,7 @@ def test_function_like_macro_condition_does_not_emit_python_syntax_warning(
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -952,7 +964,7 @@ def test_macro_elif_branch_can_become_active_after_false_if(tmp_path: Path) -> N
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1000,7 +1012,7 @@ def test_macro_else_branch_routes_to_branch_directive(tmp_path: Path) -> None:
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1079,7 +1091,7 @@ def test_macro_if_not_defined_condition_is_respected(tmp_path: Path) -> None:
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1120,7 +1132,7 @@ def test_include_guard_defines_affect_repeated_local_include_scan(tmp_path: Path
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1166,7 +1178,7 @@ def test_source_include_order_uses_only_headers_visible_to_source(tmp_path: Path
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1217,7 +1229,7 @@ def test_source_include_order_redefinition_window_routes_each_use_by_source_line
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1295,7 +1307,7 @@ def test_macro_include_resolution_uses_compile_include_dirs(tmp_path: Path) -> N
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1327,7 +1339,7 @@ def test_standalone_header_macros_survive_chunk_claims_when_used_as_deps(tmp_pat
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1373,7 +1385,7 @@ def test_header_template_extensions_emit_template_and_macro_docs(
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1458,7 +1470,7 @@ def test_header_template_docs_survive_tokenized_route_and_pack_e2e(tmp_path: Pat
     )
 
     docs: list[dict] = []
-    index_project.process_project(
+    _process_project(index_project,
         str(tmp_path),
         max_tokens=16384,
         parse_workers=1,
@@ -1507,7 +1519,8 @@ def test_header_template_docs_survive_tokenized_route_and_pack_e2e(tmp_path: Pat
         max_tokens=65536,
         overflow_policy="drop",
         materialize_tokenized_enriched=True,
-            default_repo="tests/header-e2e",
+        default_repo="tests/header-e2e",
+        memory_limit_gb=0.0,
     )
 
     route_dir = tmp_path / "routes"

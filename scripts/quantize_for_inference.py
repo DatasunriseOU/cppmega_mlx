@@ -9,22 +9,59 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 from pathlib import Path
 from typing import Any, cast
 
-import mlx.core as mx
-import mlx.nn as nn
-import numpy as np
-from mlx.utils import tree_flatten
 
-from cppmega_mlx.inference.quantization import (
+def _sanitize_pure_mlx_environment() -> None:
+    """Prevent a dirty TileLang/TVM stack from changing the MLX ABI."""
+
+    blocked_names = {
+        "CPATH",
+        "CPLUS_INCLUDE_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "LD_LIBRARY_PATH",
+        "LIBRARY_PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONUSERBASE",
+        "TVM_FFI_DLPACK_INCLUDE_PATH",
+        "TVM_FFI_INCLUDE_PATH",
+        "TVM_HOME",
+        "TVM_IMPORT_PYTHON_PATH",
+        "TVM_LIBRARY_PATH",
+        "TVM_LIBRARY_PATH_SELECTED",
+        "TVM_ROOT",
+        "TVM_SOURCE_DIR",
+        "TILELANG_DEV_BUILD_ROOT",
+        "TILELANG_DISABLE_CACHE",
+        "TILELANG_ROOT",
+        "VIRTUAL_ENV",
+    }
+    blocked_prefixes = ("TL_", "TILELANG", "TVM_", "CPPMEGA_TILELANG_")
+    for name in tuple(os.environ):
+        if name in blocked_names or name.startswith(blocked_prefixes):
+            os.environ.pop(name, None)
+    os.environ["PYTHONNOUSERSITE"] = "1"
+
+
+_sanitize_pure_mlx_environment()
+
+import mlx.core as mx  # noqa: E402
+import mlx.nn as nn  # noqa: E402
+import numpy as np  # noqa: E402
+from mlx.utils import tree_flatten  # noqa: E402
+
+from cppmega_mlx.inference.quantization import (  # noqa: E402
     InferenceQuantizationConfig,
     make_quantized_kv_cache,
     quantize_module_for_inference,
     validate_kv_head_dim,
 )
-from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
+from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "bench" / "baselines" / "quantize_for_inference_smoke.json"

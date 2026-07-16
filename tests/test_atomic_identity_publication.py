@@ -22,6 +22,8 @@ from cppmega_mlx.data.domain_schema import (
     DOMAIN_SCHEMA_SHA256_METADATA_KEY,
 )
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
@@ -48,6 +50,9 @@ _IDENTITY_METADATA = {
     TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
         "utf-8"
     ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode(
+        "utf-8"
+    ): DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
     b"cppmega.test.metadata": b"preserve-me",
 }
 

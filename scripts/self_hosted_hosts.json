@@ -13,7 +13,7 @@
       ],
       "lane": "macos-mlx",
       "required": true,
-      "python": "/Volumes/external/sources/cppmega.mlx/.venv/bin/python",
+      "python": "/Volumes/external/sources/.venvs/cppmega.mlx/bin/python",
       "timeout_seconds": 1500,
       "github": {
         "runner_name": "mac-studio-cppmega-mlx",

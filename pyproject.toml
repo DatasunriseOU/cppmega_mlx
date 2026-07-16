@@ -9,11 +9,11 @@ description = "MLX-native local training port of cppmega model semantics"
 requires-python = ">=3.11"
 dependencies = [
     "mlx==0.32.0",
-    "mlx-lm>=0.31",
+    "mlx-lm @ git+https://github.com/DatasunriseOU/mlx-lm.git@8618587943181787d33bac4468d3088e80202b3f",
     "numpy>=1.26",
     "safetensors>=0.7",
     "tokenizers>=0.22",
-    "z3-solver>=4.15",
+    "z3-solver>=4.15,<4.15.5",
 ]
 
 [project.optional-dependencies]
@@ -34,16 +34,34 @@ widget = [
     "traitlets>=5.0",
     "ipywidgets>=8.0",
 ]
+path-c = [
+    "apache-tvm-ffi>=0.1.2,<0.1.8; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
+    "cloudpickle>=3.1",
+    "cython>=3.0,<4",
+    "einops>=0.8",
+    "ml-dtypes>=0.5",
+    "tilelang==0.1.9; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
+    "torch>=2.7",
+]
+
+[dependency-groups]
+dev = [
+    "datasketch==1.10.0",
+    "libclang==18.1.1",
+    "nanobind>=2.4",
+    "pandas>=2.2",
+    "pyarrow>=21",
+    "pytest>=9.0.3",
+]
 
 [project.scripts]
 cppmega-run = "cppmega_v4.runner.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["cppmega_mlx*", "cppmega_v4*"]
-
 [tool.setuptools.package-data]
 "cppmega_v4.widget" = ["static/*.mjs", "static/*.css"]
-"cppmega_mlx.tokenizer" = ["tokenizer_contract_v1.json"]
+"cppmega_v4.nn._external" = ["*.json"]
+"cppmega_mlx.data" = ["*.json"]
+"cppmega_mlx.tokenizer" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -56,6 +74,7 @@ markers = [
     "distributed: distributed-training boundary checks and fail-closed parity guards",
     "slow: tests that spawn subprocesses or run extended training loops; opt-in via -m slow",
     "cuda_required: tests that need CUDA hardware and toolchain",
+    "cuda_hardware: tests that must execute on a real CUDA device",
 ]
 filterwarnings = [
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",

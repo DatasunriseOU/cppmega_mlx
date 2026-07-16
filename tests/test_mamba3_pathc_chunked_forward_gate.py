@@ -26,6 +26,7 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (
     PathCSplitInfeasible,
     _mamba3_chunked_forward_scan_feasibility,
     build_mamba3_fp8_train_acceptance_fixture_region,
+    mamba3_chunked_forward_scan_block_dstate,
     mamba3_chunked_forward_scan_grid,
     mamba3_fp8_train_fusion_schedule_template,
 )
@@ -99,6 +100,12 @@ def test_classifier_agrees_with_gate_on_production_shape():
     )
 
 
+def test_feasibility_and_delegation_share_the_metal_state_tile():
+    assert mamba3_chunked_forward_scan_block_dstate(
+        state_dim=128, target="metal"
+    ) == 64
+
+
 def test_emitted_forward_records_chunked_grid_descriptor():
     """The live emitter records the chunked-scan-core dispatch descriptor."""
     prim_func = mamba3_fp8_train_fusion_schedule_template(
@@ -114,11 +121,13 @@ def test_emitted_forward_records_chunked_grid_descriptor():
     # Descriptor must be emitted immediately before the serial scan-policy line.
     lines = src.splitlines()
     desc_idx = next(
-        i for i, l in enumerate(lines) if "mamba3_chunked_forward_scan: grid=" in l
+        i
+        for i, line in enumerate(lines)
+        if "mamba3_chunked_forward_scan: grid=" in line
     )
     scan_idx = next(
         i
-        for i, l in enumerate(lines)
-        if "mamba3_scan_policy: external_state_recurrence" in l
+        for i, line in enumerate(lines)
+        if "mamba3_scan_policy: external_state_recurrence" in line
     )
     assert desc_idx < scan_idx

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from cppmega_v4.jsonrpc.schema import VerifyParams
 from cppmega_v4.runner import Pipeline, run_pipeline
 
@@ -52,10 +50,21 @@ def test_long_run_n100_smoothed_shape_correct():
 
 def test_long_run_smoothed_curve_monotone_in_window():
     """Smoothed (window=10) loss over N=100 should be less noisy than
-    raw — variance of smoothed strictly less than variance of raw."""
+    raw — its step-to-step total variation should be lower than raw's.
+
+    Global variance is not a valid assertion here: the training curve has a
+    strong downward trend, and a causal window introduces a bounded lag at
+    the endpoints that can make variance increase slightly while still
+    removing high-frequency noise.
+    """
     extras = _run(100)
-    import statistics as st
-    raw_var = st.pvariance(extras["losses"])
-    smooth_var = st.pvariance(extras["losses_smoothed"])
-    assert smooth_var <= raw_var, \
-        f"smoothed var {smooth_var} should be <= raw var {raw_var}"
+    raw = extras["losses"]
+    smoothed = extras["losses_smoothed"]
+    raw_variation = sum(abs(right - left) for left, right in zip(raw, raw[1:]))
+    smoothed_variation = sum(
+        abs(right - left) for left, right in zip(smoothed, smoothed[1:])
+    )
+    assert smoothed_variation < raw_variation, (
+        f"smoothed variation {smoothed_variation} should be below "
+        f"raw variation {raw_variation}"
+    )

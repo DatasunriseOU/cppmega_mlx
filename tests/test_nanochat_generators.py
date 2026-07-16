@@ -290,6 +290,7 @@ def test_local_convert_backfills_static_code_repo_provenance(
         max_tokens=4096,
         overflow_policy="drop",
         default_repo="tests/demo-lib",
+        memory_limit_gb=0.0,
     )
 
     table = pq.read_table(
@@ -344,6 +345,7 @@ def test_local_convert_fails_on_static_code_without_repo_context(
             tokenizer=_CharTokenizer(),
             max_tokens=4096,
             overflow_policy="drop",
+            memory_limit_gb=0.0,
         )
 
 
@@ -590,6 +592,7 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
         overflow_policy="drop",
         materialize_tokenized_enriched=True,
         local_batch_size=1,
+        memory_limit_gb=0.0,
     )
 
     parquet_file = pq.ParquetFile(output_path)
@@ -669,6 +672,7 @@ def test_tokenizer_fingerprint_and_ids_stable_across_independent_shards(
             overflow_policy="drop",
             materialize_tokenized_enriched=True,
             local_batch_size=8,
+            memory_limit_gb=0.0,
         )
         table = pq.read_table(
             output_path,
