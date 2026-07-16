@@ -132,7 +132,7 @@ production commit.
 
 | Gate | Результат |
 |---|---|
-| Полный pytest в dedicated MLX env | `7385 passed, 57 skipped, 2 xfailed, 19 warnings` за `22:31` |
+| Полный pytest в dedicated MLX env | `7385 passed, 57 skipped, 2 xfailed, 19 warnings` за `21:47` (`1307.29s`) |
 | Safe-path subprocess regression group | `64 passed` |
 | Parser/provenance fixture groups | `100 passed` |
 | ABI/Path-C/CUDA workflow contract suite | `69 passed, 1 skipped` |
