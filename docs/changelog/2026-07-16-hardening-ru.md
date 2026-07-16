@@ -146,6 +146,7 @@ production commit.
 | Python compileall | PASS для `cppmega_mlx cppmega_v4 scripts tests` |
 | Tracked/new shell `bash -n` | PASS |
 | `git diff --check` | PASS |
+| HTML changelog desktop/mobile | PASS: 1440px и 390px без page-level horizontal overflow |
 
 Команда полного теста:
 

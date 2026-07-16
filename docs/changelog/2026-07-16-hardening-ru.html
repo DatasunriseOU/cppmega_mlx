@@ -22,16 +22,17 @@
     .metric span { color:var(--muted); font-size:13px; }
     .bar { height:12px; background:#e5ebf0; margin-top:7px; }
     .bar i { display:block; height:100%; background:var(--green); }
-    table { border-collapse:collapse; width:100%; background:#fff; margin:12px 0 20px; }
+    .table-wrap { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin:12px 0 20px; }
+    table { border-collapse:collapse; width:100%; background:#fff; margin:0; }
     th,td { border:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:top; }
     th { background:#edf2f6; font-weight:700; }
-    code { background:#eaf0f5; padding:2px 5px; border-radius:3px; font-size:.92em; }
+    code { background:#eaf0f5; padding:2px 5px; border-radius:3px; font-size:.92em; overflow-wrap:anywhere; word-break:break-word; }
     .ok { color:var(--green); font-weight:700; }
     .warn { color:var(--amber); font-weight:700; }
     .source-list { columns:2 360px; column-gap:36px; }
     .source-list li { break-inside:avoid; margin:5px 0; }
     footer { border-top:1px solid var(--line); margin-top:40px; padding-top:16px; color:var(--muted); font-size:13px; }
-    @media (max-width:650px) { main { padding:25px 15px 48px; } table { font-size:14px; } th,td { padding:8px; } }
+    @media (max-width:650px) { main { padding:25px 15px 48px; } table { min-width:560px; font-size:14px; } th,td { padding:8px; } }
   </style>
 </head>
 <body>
@@ -51,7 +52,7 @@
   <h2>Что сделано</h2>
   <h3>ABI по loaded library</h3>
   <p>Проверка больше не делает вывод о runtime по <code>brew info</code> или только по linked keg. Она смотрит на реально загруженный dyld image, сопоставляет его с dedicated wheel или Homebrew Cellar и отдельно проверяет release <code>mlx-metal</code>.</p>
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Источник</th><th>Значение</th></tr></thead>
     <tbody>
       <tr><td>MLX package/module</td><td><code>0.32.0</code></td></tr>
@@ -59,7 +60,7 @@
       <tr><td>loaded libmlx</td><td><code>/Volumes/external/sources/.venvs/cppmega.mlx/lib/python3.13/site-packages/mlx/lib/libmlx.dylib</code></td></tr>
       <tr><td>Homebrew linked keg</td><td><code>/opt/homebrew/Cellar/mlx/0.32.0</code>, informational only</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <ul class="source-list">
     <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/check_mlx_abi.py">scripts/check_mlx_abi.py</a></li>
     <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/check_mlx_abi.sh">scripts/check_mlx_abi.sh</a></li>
@@ -68,13 +69,13 @@
 
   <h3>Fail-closed dirty TileLang/TVM contract</h3>
   <p>Launcher загружает contract module по exact source path, очищает ambient Python/TVM/DYLD variables и записывает revisions/digests TileLang, TVM и TVM-FFI. Dirty stack запрещён по умолчанию и разрешается только явным флагом. Свежий source build использует правильный TVM root, Metal ON, CUDA/ROCm OFF и явный Cython dependency; старый неверный build сохранён отдельно как <code>build.stale-20260716</code>.</p>
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Режим</th><th>Exit</th><th>Результат</th></tr></thead>
     <tbody>
       <tr><td>default</td><td>1</td><td class="warn">FAIL как задумано: dirty TileLang/TVM</td></tr>
       <tr><td><code>--allow-dirty-source-stack</code></td><td>0</td><td class="ok">PASS, receipt содержит opt-in, revisions и digests</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <ul class="source-list">
     <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/mlx_env_contract.py">scripts/mlx_env_contract.py</a></li>
     <li><a href="https://github.com/DatasunriseOU/cppmega_mlx/blob/codex/canonical-complete-20260715/scripts/run_mlx_path_c.py">scripts/run_mlx_path_c.py</a></li>
@@ -112,7 +113,7 @@
   <p>Полный suite запускается с <code>PYTHONSAFEPATH=1</code>. Test fixture удаляет foreign <code>PYTHONPATH</code> и возвращает только текущий checkout для дочерних <code>python -m scripts...</code>. Parser/converter fixtures явно отключают admission threshold, потому что проверяют schema/provenance; production memory guard остаётся с default <code>10 GiB</code> и fail-closed.</p>
 
   <h2>Проверки</h2>
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Gate</th><th>Result</th><th>Деталь</th></tr></thead>
     <tbody>
       <tr><td>Full pytest</td><td class="ok">PASS</td><td>7385 passed, 57 skipped, 2 xfailed, 19 warnings, 22:31</td></tr>
@@ -125,8 +126,9 @@
       <tr><td>uv lock/check</td><td class="ok">PASS</td><td>lock, no-sources lock и 95 installed packages</td></tr>
       <tr><td>Changed-file Ruff</td><td class="ok">PASS</td><td>Ruff 0.15.22</td></tr>
       <tr><td>compileall/bash/diff</td><td class="ok">PASS</td><td>all requested static gates</td></tr>
+      <tr><td>HTML changelog desktop/mobile</td><td class="ok">PASS</td><td>1440px и 390px; без page-level horizontal overflow</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Остаточные риски</h2>
   <p class="warn">CUDA kernel compile/run здесь не выполнялся: Mac не даёт H200/B200 proof. Hardware test остаётся receipt-gated для self-hosted runner.</p>
