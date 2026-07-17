@@ -2499,6 +2499,18 @@ def code_key(repo: str) -> str:
     return f"{repo}::code"
 
 
+def claim_code_project_identity(
+    claims: dict[str, str],
+    repo: str,
+    project_identity: str,
+) -> str | None:
+    """Claim one canonical code project and return an existing alias, if any."""
+    previous = claims.get(project_identity)
+    if previous is None:
+        claims[project_identity] = repo
+    return previous
+
+
 def no_git_key(repo: str) -> str:
     """Checkpoint key proving the .git-preserving stream saw no git metadata."""
     return f"{repo}::no_git"
@@ -4122,13 +4134,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Parse workers passed to index_project for the CODE half "
                         "(default 2; avoid multiplying --repo-workers by the old "
                         "index_project default of 8 clang workers).")
-    p.add_argument("--code-index-timeout-s", type=int, default=0,
-                   help="Optional fail-loud timeout for each CODE index_project "
-                        "stage. 0 disables the timeout (default).")
-    p.add_argument("--code-index-stall-timeout-s", type=int, default=0,
-                   help="Optional fail-loud CODE index_project stall watchdog: "
-                        "kill when the index log has no size/mtime progress for "
-                        "this many seconds. 0 disables the watchdog (default).")
+    p.add_argument("--code-index-timeout-s", type=int,
+                   default=sr.DEFAULT_CODE_INDEX_TIMEOUT_S,
+                   help="Fail-loud timeout for each CODE index_project stage "
+                        f"(default {sr.DEFAULT_CODE_INDEX_TIMEOUT_S}s; 0 disables).")
+    p.add_argument("--code-index-stall-timeout-s", type=int,
+                   default=sr.DEFAULT_CODE_INDEX_STALL_TIMEOUT_S,
+                   help="Fail-loud log-heartbeat CODE index_project watchdog "
+                        f"(default {sr.DEFAULT_CODE_INDEX_STALL_TIMEOUT_S}s; 0 disables).")
     p.add_argument("--background-code-recompress", action="store_true",
                    help="Defer code parquet zstd-max recompress to a background "
                         "pool so repo processing can continue after valid parquet "
@@ -4220,7 +4233,11 @@ def main(argv: list[str]) -> int:
         raise SystemExit("--max-active-repos must be >= --repo-workers")
     parse_workers = max(1, int(args.parse_workers or 1))
     args.parse_workers = parse_workers
-    code_index_stall_timeout_s = int(args.code_index_stall_timeout_s or 0)
+    code_index_stall_timeout_s = int(
+        args.code_index_stall_timeout_s
+        if args.code_index_stall_timeout_s is not None
+        else sr.DEFAULT_CODE_INDEX_STALL_TIMEOUT_S
+    )
     source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
     source_dir_roots = [Path(p) for p in args.source_dir_root]
     if args.source_cache_only and source_cache_dir is None:
@@ -4377,6 +4394,14 @@ def main(argv: list[str]) -> int:
     # CONVEYOR_MANIFEST; ConcurrentManifest merges + flocks every write so they
     # cannot clobber each other's resume/accounting keys (H4 fix).
     manifest = ConcurrentManifest.load(CONVEYOR_MANIFEST)
+    submitted_code_project_identities: dict[str, str] = {}
+    if args.streams == "code" and repo_list is not None:
+        for key in manifest.done:
+            if not key.endswith("::code"):
+                continue
+            repo_name = key[:-len("::code")]
+            project_id = sr.resolve_project_identity(repo_name, repo_list)
+            submitted_code_project_identities.setdefault(project_id, repo_name)
     try:
         manifest.bind_code_revision(revision_guard.receipt)
         child_guard_path = install_code_revision_child_guard(
@@ -4564,7 +4589,7 @@ def main(argv: list[str]) -> int:
     range_pool = ThreadPoolExecutor(max_workers=workers)
     repo_pool = ThreadPoolExecutor(max_workers=repo_workers) if repo_workers > 1 else None
 
-    def claim_repo_once(repo: str) -> None:
+    def claim_repo_once(repo: str) -> bool:
         if repo in submitted_repo_names:
             raise RepoFailure(
                 repo,
@@ -4572,6 +4597,36 @@ def main(argv: list[str]) -> int:
                 f"repo {repo!r} was yielded/submitted twice in one conveyor run",
             )
         submitted_repo_names.add(repo)
+        if args.streams != "code" or repo_list is None:
+            return True
+        try:
+            project_id = sr.resolve_project_identity(repo, repo_list)
+        except Exception as exc:
+            raise RepoFailure(repo, "project_identity", str(exc)) from exc
+        previous = claim_code_project_identity(
+            submitted_code_project_identities,
+            repo,
+            project_id,
+        )
+        if previous is None:
+            return True
+        info = {
+            "source": "code",
+            "skipped": True,
+            "skip_reason": "duplicate_project_identity",
+            "project_identity": project_id,
+            "canonical_repo": previous,
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        with manifest_lock:
+            manifest.mark_done(code_key(repo), info)
+        progress.emit(
+            "duplicate_project_identity_skipped",
+            repo=repo,
+            stream="code",
+            **info,
+        )
+        return False
 
     def mark_no_git_repo(repo: str) -> None:
         info = {
@@ -4611,7 +4666,8 @@ def main(argv: list[str]) -> int:
                     if hasattr(gen, "close"):
                         gen.close()
                     break
-                claim_repo_once(repo)
+                if not claim_repo_once(repo):
+                    continue
                 revision_guard.verify(f"submit repo worker for {repo}")
                 res = process_one_repo(
                     repo, repo_dir, lengths_code, lengths_commits, args.range_size,
@@ -4694,7 +4750,8 @@ def main(argv: list[str]) -> int:
                     if hasattr(gen, "close"):
                         gen.close()
                     break
-                claim_repo_once(repo)
+                if not claim_repo_once(repo):
+                    continue
                 while len(inflight) >= max_active_repos:
                     drain_one_or_more(block=True)
                     # Worker threads mutate cumulative['valid'] under manifest_lock

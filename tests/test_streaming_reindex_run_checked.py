@@ -56,46 +56,40 @@ def test_run_checked_stall_watchdog_fail_loud(tmp_path) -> None:
     except streaming_reindex.RepoFailure as exc:
         assert exc.repo == "repo"
         assert exc.stage == "index_project"
-        assert "stalled after 1s without log or CPU progress" in exc.detail
+        assert "stalled after 1s without log progress" in exc.detail
     else:  # pragma: no cover
         raise AssertionError("expected run_checked to fail loud on stall")
 
     assert "started" in log_path.read_text(encoding="utf-8")
 
 
-def test_run_checked_stall_watchdog_allows_cpu_progress(tmp_path) -> None:
+def test_run_checked_stall_watchdog_stops_cpu_spin_without_log_progress(tmp_path) -> None:
     import streaming_reindex
 
     log_path = tmp_path / "cpu-progress.log"
-    streaming_reindex.run_checked(
-        "repo",
-        "index_project",
-        [
-            sys.executable,
-            "-c",
-            (
-                "import time\n"
-                "print('started', flush=True)\n"
-                "deadline = time.time() + 2.0\n"
-                "x = 0\n"
-                "while time.time() < deadline:\n"
-                "    x += 1\n"
-            ),
-        ],
-        log_path=log_path,
-        timeout=10,
-        stall_timeout=1,
-    )
+    with pytest.raises(streaming_reindex.RepoFailure) as caught:
+        streaming_reindex.run_checked(
+            "repo",
+            "index_project",
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import time\n"
+                    "print('started', flush=True)\n"
+                    "deadline = time.time() + 30.0\n"
+                    "x = 0\n"
+                    "while time.time() < deadline:\n"
+                    "    x += 1\n"
+                ),
+            ],
+            log_path=log_path,
+            timeout=10,
+            stall_timeout=1,
+        )
 
+    assert "stalled after 1s without log progress" in caught.value.detail
     assert "started" in log_path.read_text(encoding="utf-8")
-
-
-def test_parse_ps_time_seconds_variants() -> None:
-    import streaming_reindex
-
-    assert streaming_reindex._parse_ps_time_seconds("01:02.50") == 62.5
-    assert streaming_reindex._parse_ps_time_seconds("03:01:02.50") == 10862.5
-    assert streaming_reindex._parse_ps_time_seconds("2-03:01:02.50") == 183662.5
 
 
 def test_materialize_uses_canonical_project_identity(monkeypatch, tmp_path) -> None:

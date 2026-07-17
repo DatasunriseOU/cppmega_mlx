@@ -91,6 +91,8 @@ DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 # Tokenize at the model's full context so packing decides the final lengths.
 TOKENIZE_BUDGET = 65536
 DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
+DEFAULT_CODE_INDEX_TIMEOUT_S = 4 * 60 * 60
+DEFAULT_CODE_INDEX_STALL_TIMEOUT_S = 10 * 60
 
 # Directories never worth indexing (VCS / build artifacts). index_project has its
 # own excludes; we additionally avoid extracting .git to keep staging small for
@@ -382,65 +384,6 @@ def _subprocess_env() -> dict:
     return env
 
 
-def _parse_ps_time_seconds(value: str) -> float | None:
-    """Parse ps TIME values like MM:SS.cc, HH:MM:SS.cc, or DD-HH:MM:SS.cc."""
-    raw = value.strip()
-    if not raw:
-        return None
-    days = 0
-    if "-" in raw:
-        day_raw, raw = raw.split("-", 1)
-        try:
-            days = int(day_raw)
-        except ValueError:
-            return None
-    parts = raw.split(":")
-    try:
-        if len(parts) == 2:
-            hours = 0
-            minutes = int(parts[0])
-            seconds = float(parts[1])
-        elif len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        else:
-            return None
-    except ValueError:
-        return None
-    return float(days * 86400 + hours * 3600 + minutes * 60) + seconds
-
-
-def _process_group_cpu_seconds(pgid: int) -> float | None:
-    """Return cumulative CPU seconds for a process group, when ps supports it."""
-    try:
-        output = subprocess.check_output(
-            ["ps", "-axo", "pgid=,time="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    total = 0.0
-    seen = False
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) < 2:
-            continue
-        try:
-            row_pgid = int(fields[0])
-        except ValueError:
-            continue
-        if row_pgid != pgid:
-            continue
-        seconds = _parse_ps_time_seconds(fields[1])
-        if seconds is None:
-            continue
-        total += seconds
-        seen = True
-    return total if seen else None
-
-
 def run_checked(
     repo: str,
     stage: str,
@@ -494,7 +437,6 @@ def run_checked(
             deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
             last_activity = time.monotonic()
             last_signature: tuple[int, int] | None = None
-            last_cpu_seconds: float | None = None
             while proc.poll() is None:
                 now = time.monotonic()
                 if deadline is not None and now > deadline:
@@ -510,18 +452,12 @@ def run_checked(
                     if signature != last_signature:
                         last_signature = signature
                         last_activity = now
-                cpu_seconds = _process_group_cpu_seconds(proc.pid)
-                if cpu_seconds is not None and cpu_seconds != last_cpu_seconds:
-                    last_cpu_seconds = cpu_seconds
-                    last_activity = now
                 if now - last_activity > stall_timeout:
-                    terminate_process(
-                        f"no log/CPU progress for {stall_timeout}s"
-                    )
+                    terminate_process(f"no log progress for {stall_timeout}s")
                     raise RepoFailure(
                         repo,
                         stage,
-                        f"stalled after {stall_timeout}s without log or CPU progress",
+                        f"stalled after {stall_timeout}s without log progress",
                     )
                 time.sleep(1.0)
             stdout_data, _ = proc.communicate(timeout=1)
@@ -1498,13 +1434,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--parse-workers", type=int, default=2,
                    help="Parse workers passed to index_project for the code stage "
                         "(default 2; keep this low when multiple repos run).")
-    p.add_argument("--code-index-timeout-s", type=int, default=0,
-                   help="Optional fail-loud timeout for each index_project code "
-                        "stage. 0 disables the timeout (default).")
-    p.add_argument("--code-index-stall-timeout-s", type=int, default=0,
-                   help="Optional fail-loud stall watchdog for index_project: "
-                        "kill when the log file has no size/mtime progress for "
-                        "this many seconds. 0 disables the watchdog (default).")
+    p.add_argument("--code-index-timeout-s", type=int,
+                   default=DEFAULT_CODE_INDEX_TIMEOUT_S,
+                   help="Fail-loud timeout for each index_project code stage "
+                        f"(default {DEFAULT_CODE_INDEX_TIMEOUT_S}s; 0 disables).")
+    p.add_argument("--code-index-stall-timeout-s", type=int,
+                   default=DEFAULT_CODE_INDEX_STALL_TIMEOUT_S,
+                   help="Fail-loud log-heartbeat watchdog for index_project "
+                        f"(default {DEFAULT_CODE_INDEX_STALL_TIMEOUT_S}s; 0 disables).")
     p.add_argument("--source-cache-dir", default=None,
                    help="Optional repo-level source cache for code-only runs. "
                         "Complete cached repos are reused before opening the "

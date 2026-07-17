@@ -2963,8 +2963,38 @@ def _is_sane_compile_args(args: list[str]) -> bool:
 _SIMPLE_FALLBACK_ARGS = ["-fsyntax-only", "-Wno-everything"]
 DEFAULT_PARSE_BATCH_FILES = 25
 PARSE_SUBMIT_WINDOW_PER_WORKER = 2
+PARSE_MAX_BATCHES_PER_WORKER = 64
 PARSE_HEARTBEAT_FILES = 25
 PARSE_HEARTBEAT_SECONDS = 30.0
+DOCUMENT_HEARTBEAT_ITEMS = 100
+DOCUMENT_HEARTBEAT_SECONDS = 30.0
+_CPP_SOURCE_MARKER_RE = re.compile(
+    r"::\s*(?:new|delete)|\b(?:class|namespace|template|nullptr|"
+    r"static_cast|reinterpret_cast|dynamic_cast|const_cast)\b"
+)
+
+
+def _progress_heartbeat(
+    label: str,
+    completed: int,
+    total: int | None,
+    last_heartbeat: float,
+    *,
+    every_items: int = DOCUMENT_HEARTBEAT_ITEMS,
+    interval_s: float = DOCUMENT_HEARTBEAT_SECONDS,
+    force: bool = False,
+    now: float | None = None,
+) -> float:
+    """Emit a flushed stderr heartbeat for long, otherwise silent loops."""
+    current = time.monotonic() if now is None else now
+    item_due = every_items > 0 and completed > 0 and completed % every_items == 0
+    time_due = interval_s > 0 and current - last_heartbeat >= interval_s
+    done = total is not None and completed >= total
+    if not (force or item_due or time_due or done):
+        return last_heartbeat
+    progress = f"{completed}/{total}" if total is not None else str(completed)
+    print(f"  {label} heartbeat: {progress}", file=sys.stderr, flush=True)
+    return current
 
 
 def compute_parse_batch_size(
@@ -2990,6 +3020,25 @@ def compute_parse_batch_size(
     return min(max_batch_files, nominal)
 
 
+def make_parse_executor(
+    max_workers: int,
+    *,
+    max_tasks_per_child: int = PARSE_MAX_BATCHES_PER_WORKER,
+) -> ProcessPoolExecutor:
+    """Create a bounded-lifetime parser pool for libclang translation units."""
+    if max_workers <= 0:
+        raise ValueError(f"max_workers must be positive, got {max_workers}")
+    if max_tasks_per_child <= 0:
+        raise ValueError(
+            "max_tasks_per_child must be positive, got "
+            f"{max_tasks_per_child}"
+        )
+    return ProcessPoolExecutor(
+        max_workers=max_workers,
+        max_tasks_per_child=max_tasks_per_child,
+    )
+
+
 def get_default_compile_args(project_dir: str) -> list[str]:
     """Generate default compile args for projects without compile_commands.json."""
     _platform_info, args, _compile_index = detect_build_context(project_dir)
@@ -3007,10 +3056,24 @@ def get_default_compile_args(project_dir: str) -> list[str]:
     return result
 
 
+def _source_looks_like_cpp(filepath: str) -> bool:
+    """Detect legacy C++ compiler tests stored under a ``.c`` suffix."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
+            source = source_file.read(1_048_576)
+    except OSError:
+        return False
+    return _CPP_SOURCE_MARKER_RE.search(source) is not None
+
+
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
-    """Adapt compile args based on file extension — .c files need C mode, not C++,
-    and headers need an explicit header language (otherwise libclang can infer
-    the wrong mode for a standalone .h/.hpp translation unit)."""
+    """Adapt compile args while preserving C++ syntax in legacy ``.c`` files.
+
+    Most ``.c`` files must remain C. A few compiler test suites intentionally use
+    a ``.c`` suffix for C++ regression cases; forcing those files through C11 can
+    make libclang loop on otherwise bounded input. Only an explicit C++ mode or
+    a C++ project standard plus a source marker opts into C++ mode.
+    """
     ext = os.path.splitext(filepath)[1].lower()
     if ext in HEADER_EXTENSIONS:
         explicit_language: str | None = None
@@ -3049,6 +3112,31 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
         header_language = 'c-header' if is_c_header else 'c++-header'
         return ['-x', header_language] + adapted
     if ext in C_EXTENSIONS:
+        explicit_language: str | None = None
+        for arg_index, arg in enumerate(args):
+            if arg == '-x' and arg_index + 1 < len(args):
+                explicit_language = args[arg_index + 1].lower()
+            elif arg.startswith('-x') and arg != '-x':
+                explicit_language = arg[2:].lower()
+        has_cpp_standard = any(arg.startswith('-std=c++') for arg in args)
+        use_cpp_mode = explicit_language in {'c++', 'c++-cpp', 'objective-c++'}
+        if explicit_language is None and has_cpp_standard:
+            use_cpp_mode = _source_looks_like_cpp(filepath)
+        if use_cpp_mode:
+            adapted: list[str] = []
+            skip_next = False
+            for arg in args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == '-x':
+                    skip_next = True
+                    continue
+                if arg.startswith('-x') and arg != '-x':
+                    continue
+                adapted.append(arg)
+            return ['-x', 'c++'] + adapted
+
         adapted = []
         skip_next = False
         for arg in args:
@@ -6872,7 +6960,16 @@ def emit_header_documents(
         if td.file in header_rel_files and td.text:
             typedefs_by_file[td.file].append(td)
 
-    for rel in sorted(header_rel_files):
+    sorted_header_files = sorted(header_rel_files)
+    last_header_heartbeat = time.monotonic()
+    emitted_fragments = 0
+    for header_index, rel in enumerate(sorted_header_files, start=1):
+        last_header_heartbeat = _progress_heartbeat(
+            "Header document generation",
+            header_index - 1,
+            len(sorted_header_files),
+            last_header_heartbeat,
+        )
         compile_args, build_info = _compile_context_for_rel_file(
             rel,
             project_dir=project_dir,
@@ -6903,6 +7000,13 @@ def emit_header_documents(
                 part=_typedef_part(td),
             )
             emit_doc(doc if enriched else td.text)
+            emitted_fragments += 1
+            last_header_heartbeat = _progress_heartbeat(
+                "Header fragment emission",
+                emitted_fragments,
+                None,
+                last_header_heartbeat,
+            )
 
         abs_path = header_abs_by_rel.get(rel)
         if not abs_path:
@@ -6950,6 +7054,21 @@ def emit_header_documents(
                 part=_macro_part(macro),
             )
             emit_doc(doc if enriched else macro_text)
+            emitted_fragments += 1
+            last_header_heartbeat = _progress_heartbeat(
+                "Header fragment emission",
+                emitted_fragments,
+                None,
+                last_header_heartbeat,
+            )
+
+    _progress_heartbeat(
+        "Header document generation",
+        len(sorted_header_files),
+        len(sorted_header_files),
+        last_header_heartbeat,
+        force=True,
+    )
 
     return stats
 
@@ -7008,7 +7127,14 @@ def dedup_root_functions(
         index.functions.items(),
         key=lambda kv: (kv[1].file or "", kv[1].line or 0, kv[0]),
     )
-    for symbol_key, func in items:
+    last_dedup_heartbeat = time.monotonic()
+    for item_index, (symbol_key, func) in enumerate(items, start=1):
+        last_dedup_heartbeat = _progress_heartbeat(
+            "Function dedup",
+            item_index - 1,
+            len(items),
+            last_dedup_heartbeat,
+        )
         if not (func.is_definition and func.text):
             continue
         token_ids = tok.encode(func.text)
@@ -7030,6 +7156,14 @@ def dedup_root_functions(
                 continue
             seen_local.add(h)
         kept_roots += 1
+
+    _progress_heartbeat(
+        "Function dedup",
+        len(items),
+        len(items),
+        last_dedup_heartbeat,
+        force=True,
+    )
 
     if store is not None:
         store.commit()
@@ -7103,13 +7237,29 @@ def emit_build_documents(
     skipped_empty = 0
     from cppmega_mlx.data.domain_ingestion import iter_domain_file_chunks
 
-    for filepath, build_kind in sorted(build_files):
+    sorted_build_files = sorted(build_files)
+    last_build_heartbeat = time.monotonic()
+    processed_chunks = 0
+    for file_index, (filepath, build_kind) in enumerate(sorted_build_files, start=1):
+        last_build_heartbeat = _progress_heartbeat(
+            "Typed-domain document generation",
+            file_index - 1,
+            len(sorted_build_files),
+            last_build_heartbeat,
+        )
         try:
             source_chunks = iter_domain_file_chunks(
                 filepath,
                 max_chunk_bytes=BUILD_FILE_SIZE_CAP,
             )
             for source_chunk in source_chunks:
+                processed_chunks += 1
+                last_build_heartbeat = _progress_heartbeat(
+                    "Typed-domain chunk emission",
+                    processed_chunks,
+                    None,
+                    last_build_heartbeat,
+                )
                 text = source_chunk.text
                 if not text or not text.strip():
                     skipped_empty += 1
@@ -7179,6 +7329,14 @@ def emit_build_documents(
                 continue
             raise
 
+    _progress_heartbeat(
+        "Typed-domain document generation",
+        len(sorted_build_files),
+        len(sorted_build_files),
+        last_build_heartbeat,
+        force=True,
+    )
+
     if store is not None:
         store.commit()
         store.close()
@@ -7243,7 +7401,13 @@ def build_training_documents(
         else:
             documents.append(doc)
 
+    print(
+        f"  Training document generation started: {len(index.functions)} roots",
+        file=sys.stderr,
+        flush=True,
+    )
     index.compute_dep_levels()
+    print("  Dependency levels computed", file=sys.stderr, flush=True)
     stable_project_id = (
         require_project_identity(
             project_id,
@@ -7340,7 +7504,14 @@ def build_training_documents(
                 kv[0],
             ),
         )
-        for symbol_key, func in items:
+        last_document_heartbeat = time.monotonic()
+        for item_index, (symbol_key, func) in enumerate(items, start=1):
+            last_document_heartbeat = _progress_heartbeat(
+                "Training document generation",
+                item_index - 1,
+                len(items),
+                last_document_heartbeat,
+            )
             if not func.is_definition:
                 continue
             # Skip emitting a STANDALONE root doc for a deduped function. It remains
@@ -7549,6 +7720,14 @@ def build_training_documents(
                 _record_doc(out_doc)
             else:
                 _record_doc(doc)
+
+        _progress_heartbeat(
+            "Training document generation",
+            len(items),
+            len(items),
+            last_document_heartbeat,
+            force=True,
+        )
 
         if header_files:
             if stable_project_id is None:
@@ -7826,6 +8005,11 @@ def process_project(
             f"({PARSE_SUBMIT_WINDOW_PER_WORKER} per worker)",
             file=sys.stderr,
         )
+        print(
+            "  Parse worker recycle: "
+            f"{PARSE_MAX_BATCHES_PER_WORKER} batches per process",
+            file=sys.stderr,
+        )
         batches = []
         for i in range(0, len(cpp_files), chunk_size):
             batch = cpp_files[i:i + chunk_size]
@@ -7835,7 +8019,7 @@ def process_project(
 
         total_parsed = 0
         total_errors = 0
-        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        with make_parse_executor(max_workers=effective_workers) as executor:
             for payload, parsed_count, error_count in _iter_parse_batch_results(
                 executor,
                 batches,

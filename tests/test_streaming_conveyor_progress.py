@@ -25,6 +25,23 @@ def _repo_identity_map(tmp_path: Path) -> Path:
     return path
 
 
+def test_code_project_identity_claims_deduplicate_aliases() -> None:
+    import streaming_conveyor
+
+    claims: dict[str, str] = {}
+
+    assert streaming_conveyor.claim_code_project_identity(
+        claims,
+        "open-watcom",
+        "open-watcom/open-watcom-v2",
+    ) is None
+    assert streaming_conveyor.claim_code_project_identity(
+        claims,
+        "open-watcom-v2",
+        "open-watcom/open-watcom-v2",
+    ) == "open-watcom"
+
+
 def test_progress_writer_appends_jsonl(tmp_path):
     import streaming_conveyor
 
