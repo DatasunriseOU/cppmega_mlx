@@ -227,7 +227,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'gui'", specifier = ">=1.3.1" },
     { name = "tilelang", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'path-c') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'path-c')", specifier = "==0.1.9" },
     { name = "tokenizers", specifier = ">=0.22" },
-    { name = "torch", marker = "extra == 'path-c'", specifier = ">=2.7" },
+    { name = "torch", marker = "extra == 'path-c'", specifier = "==2.13.0" },
     { name = "traitlets", marker = "extra == 'widget'", specifier = ">=5.0" },
     { name = "uvicorn", marker = "extra == 'gui'", specifier = ">=0.30" },
     { name = "websockets", marker = "extra == 'gui'", specifier = ">=12" },

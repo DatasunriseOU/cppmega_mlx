@@ -43,7 +43,7 @@ path-c = [
     "einops>=0.8",
     "ml-dtypes>=0.5",
     "tilelang==0.1.9; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
-    "torch>=2.7",
+    "torch==2.13.0",
 ]
 
 [dependency-groups]
