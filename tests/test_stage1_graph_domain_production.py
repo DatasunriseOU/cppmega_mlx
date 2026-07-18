@@ -153,7 +153,8 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
     assert receipt["recipe"] == STAGE1_GRAPH_DOMAIN_RECIPE
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
-    assert receipt["graph_positive_pairs"] == 1
+    assert receipt["graph_route_positive_pairs"] == 1
+    assert receipt["graph_supervision_positive_pairs"] == 0
     assert receipt["edge_kind_edges"] == 1
     assert receipt["edge_kind_ids"] == [int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)]
     assert receipt["edge_kind_prior_nonzero"] == 1
@@ -166,6 +167,26 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
         "domain_ids",
         "role_ids",
     ]
+
+
+def test_stage1_dsa_receipt_marks_route_pairs_as_graph_supervision() -> None:
+    cfg = stage1_production_config(
+        attention_mode="dsa",
+        vocab_size=64,
+        hidden_size=32,
+        depth=1,
+        ffn_hidden_size=64,
+        max_seq_length=8,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        ngram_hash_enabled=False,
+    )
+
+    receipt = stage1_production_batch_receipt(_production_batch(), config=cfg)
+
+    assert receipt["graph_route_positive_pairs"] == 1
+    assert receipt["graph_supervision_positive_pairs"] == 1
 
 
 def test_stage1_production_receipt_and_counts_accept_graphless_batch() -> None:
@@ -187,13 +208,14 @@ def test_stage1_production_receipt_and_counts_accept_graphless_batch() -> None:
 
     assert receipt["graph_edges"] == 0
     assert receipt["graph_prior_nonzero"] == 0
-    assert receipt["graph_positive_pairs"] == 0
+    assert receipt["graph_route_positive_pairs"] == 0
+    assert receipt["graph_supervision_positive_pairs"] == 0
     assert receipt["edge_kind_edges"] == 0
     assert receipt["edge_kind_ids"] == []
     assert counts["graph_edges"] == 0
     assert counts["graph_prior_nonzero"] == 0
     assert counts["edge_kind_edges"] == 0
-    assert counts["graph_positive_pairs"] == 0
+    assert counts["graph_route_positive_pairs"] == 0
 
 
 def test_stage1_receipt_reports_zero_for_raw_noncausal_only_graph() -> None:
@@ -218,7 +240,8 @@ def test_stage1_receipt_reports_zero_for_raw_noncausal_only_graph() -> None:
 
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
-    assert receipt["graph_positive_pairs"] == 0
+    assert receipt["graph_route_positive_pairs"] == 0
+    assert receipt["graph_supervision_positive_pairs"] == 0
 
 
 def test_stage1_route_counts_reject_raw_noncausal_edges_as_graph_signal() -> None:
@@ -231,7 +254,7 @@ def test_stage1_route_counts_reject_raw_noncausal_edges_as_graph_signal() -> Non
 
     assert counts["graph_edges"] == 1
     assert counts["graph_prior_nonzero"] == 1
-    assert counts["graph_positive_pairs"] == 0
+    assert counts["graph_route_positive_pairs"] == 0
 
 
 def test_stage1_production_accepts_valid_categories_with_zero_kind_delta() -> None:
