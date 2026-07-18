@@ -4,16 +4,21 @@ import json
 import shutil
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cppmega_mlx.data import prompt_graph_index as prompt_graph_index_module
 from cppmega_mlx.data.prompt_graph import (
     PromptGraphBuilder,
     PromptGraphContext,
     PromptGraphSegment,
     PromptProjectIndex,
 )
-from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
+from cppmega_mlx.data.prompt_graph_index import (
+    ClangPromptProjectIndexProducer,
+)
+from cppmega_mlx.data.symbol_identity import compute_symbol_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -191,6 +196,102 @@ def test_real_producer_emits_integrity_bound_v3_production_index(
         "case4_symbol_reference_for_cursor_v3"
     ]
     assert max(symbol.symbol_id for symbol in result.index.symbols) > 0xFFFFFFFF
+
+
+def test_production_index_rejects_raw_identity_adapter_provenance(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-native-identity"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    payload["provenance"]["identity_adapters"] = [
+        "raw_clang_usr_signature_v3_adapter"
+    ]
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="untrusted identity adapter"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_prompt_producer_requires_native_case4_v3_identity_helper(
+    tmp_path: Path,
+) -> None:
+    class _CursorKind:
+        name = "FUNCTION_DECL"
+
+    cursor = SimpleNamespace(
+        kind=_CursorKind(),
+        spelling="route",
+        location=SimpleNamespace(
+            file=SimpleNamespace(name=str(tmp_path / "repo" / "route.cpp")),
+            line=4,
+            column=5,
+        ),
+    )
+    indexer = SimpleNamespace(get_qualified_name=lambda _cursor: "api::route")
+
+    with pytest.raises(RuntimeError, match="native CASE 4 v3"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            cursor,
+            repo_root=tmp_path / "repo",
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_prompt_producer_rejects_identity_without_provenance(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    source_file = repo_root / "route.cpp"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("int route() { return 1; }\n", encoding="utf-8")
+    symbol_key = (
+        "usr:schema=v3\x1fproject=tests/native-identity\x1f"
+        "usr=c:@F@route#"
+    )
+
+    class _CursorKind:
+        name = "FUNCTION_DECL"
+
+    cursor = SimpleNamespace(
+        kind=_CursorKind(),
+        spelling="route",
+        location=SimpleNamespace(
+            file=SimpleNamespace(name=str(source_file)),
+            line=1,
+            column=5,
+        ),
+    )
+
+    class _Indexer:
+        @staticmethod
+        def symbol_reference_for_cursor(_cursor, **_kwargs):
+            return {
+                "symbol_identity_schema_version": 3,
+                "symbol_key": symbol_key,
+                "symbol_id": compute_symbol_id(symbol_key),
+                "qname": "api::route",
+                "usr": "c:@F@route#",
+                "canonical_signature": "display=route()|type=int ()",
+                "symbol_kind": "FUNCTION_DECL",
+            }
+
+    with pytest.raises(ValueError, match="provenance"):
+        prompt_graph_index_module._identity_for_cursor(
+            _Indexer,
+            cursor,
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
 
 
 def test_cached_index_payload_checksum_rejects_tampering(tmp_path: Path) -> None:

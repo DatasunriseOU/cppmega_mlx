@@ -41,7 +41,6 @@ INDEX_PAYLOAD_HASH_KEY = "index_payload_sha256"
 TRUSTED_IDENTITY_ADAPTERS = frozenset(
     {
         "case4_symbol_reference_for_cursor_v3",
-        "raw_clang_usr_signature_v3_adapter",
     }
 )
 

@@ -136,75 +136,95 @@ def _identity_for_cursor(
     source_path: str,
 ) -> _CursorIdentity | None:
     helper = getattr(indexer, "symbol_reference_for_cursor", None)
-    if callable(helper):
-        reference = helper(
-            cursor,
-            project_dir=str(repo_root),
-            project_id=project_id,
-            fallback_file=source_path,
+    if not callable(helper):
+        raise RuntimeError(
+            "native CASE 4 v3 symbol_reference_for_cursor is required; "
+            "raw clang identity fallback is forbidden"
         )
-        if not isinstance(reference, Mapping):
-            raise TypeError(
-                "CASE 4 v3 symbol_reference_for_cursor must return a mapping"
-            )
-        usr = str(reference.get("usr") or "")
-        signature = _normalize_signature(
-            reference.get("canonical_signature")
-        )
-        symbol_key = str(reference.get("symbol_key") or "")
-        if not symbol_key:
-            return None
-        if not signature and not is_repo_file_location_identity(symbol_key):
-            return None
-        version = int(
-            reference.get("symbol_identity_schema_version") or 0
-        )
-        if version != SYMBOL_IDENTITY_SCHEMA_VERSION:
-            raise ValueError(
-                "CASE 4 symbol identity schema mismatch: "
-                f"expected={SYMBOL_IDENTITY_SCHEMA_VERSION} actual={version}"
-            )
-        claimed_symbol_id = reference.get("symbol_id")
-        if isinstance(claimed_symbol_id, bool) or not isinstance(
-            claimed_symbol_id, int
-        ):
-            raise ValueError(
-                "CASE 4 v3 symbol reference requires an integer symbol_id"
-            )
-        expected_symbol_id = compute_symbol_id(symbol_key)
-        if claimed_symbol_id != expected_symbol_id:
-            raise ValueError(
-                "CASE 4 symbol ID does not match canonical key: "
-                f"claimed={claimed_symbol_id} expected={expected_symbol_id}"
-            )
-        return _CursorIdentity(
-            semantic_identity=symbol_key,
-            symbol_key=symbol_key,
-            symbol_id=claimed_symbol_id,
-            usr=usr,
-            canonical_signature=signature,
-            qname=str(reference.get("qname") or ""),
-            symbol_kind=str(reference.get("symbol_kind") or "symbol"),
-            adapter="case4_symbol_reference_for_cursor_v3",
-        )
-
-    usr = _cursor_usr(cursor)
-    signature = _cursor_signature(cursor)
-    if not usr or not signature:
-        return None
-    symbol_key = (
-        f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
-        f"project={project_id}\x1fusr={usr}"
+    reference = helper(
+        cursor,
+        project_dir=str(repo_root),
+        project_id=project_id,
+        fallback_file=source_path,
     )
+    if not isinstance(reference, Mapping):
+        raise TypeError(
+            "CASE 4 v3 symbol_reference_for_cursor must return a mapping"
+        )
+    provenance_fields = ("project", "file", "line")
+    if any(field not in reference for field in provenance_fields):
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance is incomplete; "
+            "project, file, and line are required"
+        )
+    if not isinstance(reference.get("project"), str):
+        raise ValueError("CASE 4 v3 symbol reference provenance project is invalid")
+    if not isinstance(reference.get("file"), str) or not reference.get("file"):
+        raise ValueError("CASE 4 v3 symbol reference provenance file is invalid")
+    line = reference.get("line")
+    if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+        raise ValueError("CASE 4 v3 symbol reference provenance line is invalid")
+
+    location = getattr(cursor, "location", None)
+    location_file = getattr(location, "file", None)
+    location_name = getattr(location_file, "name", None)
+    if location_name:
+        try:
+            relative_file = Path(str(location_name)).resolve().relative_to(
+                repo_root.resolve()
+            ).as_posix()
+        except ValueError:
+            relative_file = None
+        if relative_file is not None:
+            if reference["project"] != project_id or reference["file"] != relative_file:
+                raise ValueError(
+                    "CASE 4 v3 symbol reference provenance is not bound to "
+                    "the repository project/file"
+                )
+            cursor_line = getattr(location, "line", None)
+            if isinstance(cursor_line, int) and cursor_line > 0 and line != cursor_line:
+                raise ValueError(
+                    "CASE 4 v3 symbol reference provenance line does not match cursor"
+                )
+
+    usr = str(reference.get("usr") or "")
+    signature = _normalize_signature(reference.get("canonical_signature"))
+    symbol_key = str(reference.get("symbol_key") or "")
+    if not symbol_key:
+        raise ValueError("CASE 4 v3 symbol reference requires a symbol_key")
+    if not signature and not is_repo_file_location_identity(symbol_key):
+        raise ValueError(
+            "CASE 4 v3 symbol reference requires USR/signature or explicit "
+            "repository-location identity"
+        )
+    version = int(reference.get("symbol_identity_schema_version") or 0)
+    if version != SYMBOL_IDENTITY_SCHEMA_VERSION:
+        raise ValueError(
+            "CASE 4 symbol identity schema mismatch: "
+            f"expected={SYMBOL_IDENTITY_SCHEMA_VERSION} actual={version}"
+        )
+    claimed_symbol_id = reference.get("symbol_id")
+    if isinstance(claimed_symbol_id, bool) or not isinstance(
+        claimed_symbol_id, int
+    ):
+        raise ValueError(
+            "CASE 4 v3 symbol reference requires an integer symbol_id"
+        )
+    expected_symbol_id = compute_symbol_id(symbol_key)
+    if claimed_symbol_id != expected_symbol_id:
+        raise ValueError(
+            "CASE 4 symbol ID does not match canonical key: "
+            f"claimed={claimed_symbol_id} expected={expected_symbol_id}"
+        )
     return _CursorIdentity(
         semantic_identity=symbol_key,
         symbol_key=symbol_key,
-        symbol_id=compute_symbol_id(symbol_key),
+        symbol_id=claimed_symbol_id,
         usr=usr,
         canonical_signature=signature,
-        qname=str(indexer.get_qualified_name(cursor) or ""),
-        symbol_kind=_cursor_kind_name(cursor),
-        adapter="raw_clang_usr_signature_v3_adapter",
+        qname=str(reference.get("qname") or ""),
+        symbol_kind=str(reference.get("symbol_kind") or "symbol"),
+        adapter="case4_symbol_reference_for_cursor_v3",
     )
 
 
