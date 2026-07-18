@@ -17,13 +17,13 @@ from cppmega_mlx.training.objective_mixer import (
 from cppmega_mlx.training.stage1_production import (
     Stage1ProductionObjective,
     _stage1_objective_batch,
+    stage1_production_batch_receipt,
     stage1_production_config,
 )
 
 
-def _model_config(*, attention_mode: str = "dsa"):
-    return stage1_production_config(
-        attention_mode=attention_mode,
+def _model_config(*, attention_mode: str | None = "dsa"):
+    kwargs: dict[str, object] = dict(
         vocab_size=64,
         hidden_size=32,
         depth=1,
@@ -39,6 +39,9 @@ def _model_config(*, attention_mode: str = "dsa"):
         ngram_hash_enabled=False,
         platform_residual_scale=0.0,
     )
+    if attention_mode is not None:
+        kwargs["attention_mode"] = attention_mode
+    return stage1_production_config(**kwargs)
 
 
 def _production_batch_rows(
@@ -178,7 +181,10 @@ def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None
         float((breakdown.lm_ce + breakdown.graph_total).item()),
         rel=1e-6,
     )
-    assert objective.receipt()["single_decoder_forward"] is True
+    dsa_receipt = objective.receipt(attention_mode="dsa")
+    assert dsa_receipt["single_decoder_forward"] is True
+    assert dsa_receipt["graph_auxiliary_enabled"] is True
+    assert dsa_receipt["route_only"] is False
 
 
 def test_stage1_gqa_graph_route_changes_logits_loss_and_gradients() -> None:
@@ -235,8 +241,39 @@ def test_stage1_gqa_graph_route_changes_logits_loss_and_gradients() -> None:
     graph_breakdown = objective.loss_breakdown(model, graph_batch)
     mx.eval(graph_breakdown.graph_total, graph_breakdown.graph_positive_pairs)
     assert float(graph_breakdown.graph_total.item()) == 0.0
-    assert float(graph_breakdown.graph_positive_pairs.item()) == 1.0
+    assert float(graph_breakdown.graph_positive_pairs.item()) == 0.0
     assert graph_breakdown.graph_layer_count == 0
+
+
+def test_stage1_default_gqa_receipt_separates_route_signal_from_graph_auxiliary() -> None:
+    objective = Stage1ProductionObjective()
+    batch = _production_batch(with_edge=True)
+    model = DenseCppLM(_model_config(attention_mode=None))
+
+    assert model.config.attention_mode == "gqa"
+    breakdown = objective.loss_breakdown(model, batch)
+    batch_receipt = stage1_production_batch_receipt(batch, config=model.config)
+    loss_receipt = objective.receipt(attention_mode=model.config.attention_mode)
+    mx.eval(
+        breakdown.graph_total,
+        breakdown.graph_positive_pairs,
+        breakdown.graph_edge_bce,
+        breakdown.graph_ranking,
+    )
+
+    assert float(breakdown.graph_total.item()) == 0.0
+    assert float(breakdown.graph_positive_pairs.item()) == 0.0
+    assert float(breakdown.graph_edge_bce.item()) == 0.0
+    assert float(breakdown.graph_ranking.item()) == 0.0
+    assert breakdown.graph_layer_count == 0
+    assert batch_receipt["graph_route_positive_pairs"] == 1
+    assert batch_receipt["graph_supervision_positive_pairs"] == 0
+    assert "graph_positive_pairs" not in batch_receipt
+    assert loss_receipt["name"] == "gqa_route_only_lm_ce"
+    assert loss_receipt["formula"] == "lm_ce"
+    assert loss_receipt["graph_auxiliary_enabled"] is False
+    assert loss_receipt["graph_supervision"] == "none"
+    assert loss_receipt["route_only"] is True
 
 
 def test_stage1_self_chunk_targets_are_intersected_with_causal_pair_mask() -> None:
