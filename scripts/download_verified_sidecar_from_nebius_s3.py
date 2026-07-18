@@ -29,10 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.sidecar_manifest_contract import (
+from scripts.sidecar_manifest_contract import (  # noqa: E402
     AUDIT_FILENAME,
     AUDIT_REMOTE,
-    MANIFEST_SCHEMA,
     contained_path,
     resolve_s3_env,
     validate_audit_receipt,

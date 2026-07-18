@@ -29,7 +29,7 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from scripts.sidecar_manifest_contract import AUDIT_SCHEMA, audit_contract
+from scripts.sidecar_manifest_contract import AUDIT_SCHEMA, audit_contract  # noqa: E402
 
 
 def _load_schema_contracts():

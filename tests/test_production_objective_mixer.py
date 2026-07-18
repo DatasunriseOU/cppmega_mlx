@@ -74,7 +74,6 @@ from cppmega_mlx.training.megatron_objectives import (
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_KIND_IDS,
-    OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     build_pre_materialized_objective_contract,
     materialize_megatron_document,
     objective_route_mapping_contract,
