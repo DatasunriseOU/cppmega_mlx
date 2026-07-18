@@ -43,13 +43,32 @@ function spawnLogged(cmd: string, args: string[],
   return child;
 }
 
-async function waitFor(url: string, label: string, timeoutMs: number) {
+function assertRunning(child: ChildProcess, label: string): void {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid == null) {
+    throw new Error(
+      `${label} exited before readiness ` +
+      `(code=${child.exitCode}, signal=${child.signalCode})`,
+    );
+  }
+  try {
+    process.kill(child.pid, 0);
+  } catch {
+    throw new Error(`${label} process ${child.pid} is not running`);
+  }
+}
+
+async function waitFor(url: string, label: string, timeoutMs: number,
+                       child: ChildProcess) {
   const deadline = Date.now() + timeoutMs;
   let lastErr: string = "no attempts";
   while (Date.now() < deadline) {
+    assertRunning(child, label);
     try {
       const res = await fetch(url);
-      if (res.ok) return;
+      if (res.ok) {
+        assertRunning(child, label);
+        return;
+      }
       lastErr = `HTTP ${res.status}`;
     } catch (e) {
       lastErr = String(e);
@@ -99,7 +118,7 @@ export default async function globalSetup(): Promise<void> {
   }, null, 2));
 
   await Promise.all([
-    waitFor(`${BACKEND_URL}/health`, "backend", 30_000),
-    waitFor(FRONTEND_URL, "frontend", 30_000),
+    waitFor(`${BACKEND_URL}/health`, "backend", 30_000, handles.backend),
+    waitFor(FRONTEND_URL, "frontend", 30_000, handles.frontend),
   ]);
 }

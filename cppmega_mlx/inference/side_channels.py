@@ -706,7 +706,10 @@ def _source_metadata_to_token_metadata(
     ast_depth = _source_values_at_indices(metadata.ast_depth, source_indices)
     sibling_index = _source_values_at_indices(metadata.sibling_index, source_indices)
     node_type = _source_values_at_indices(metadata.node_type, source_indices)
-    structure_ids = [value if value > 0 else 0 for value in node_type]
+    # Raw parser node kinds belong in node_type_ids and may span hundreds of
+    # values. structure_ids is the small shared structural vocabulary used by
+    # the model, so inference emits the canonical AST-covered category here.
+    structure_ids = [1 if value > 0 else 0 for value in node_type]
     return TokenMetadata(
         structure_ids=structure_ids,
         dep_levels=ast_depth,
@@ -1058,6 +1061,17 @@ def _token_aligned_array(
         raise ValueError(
             f"{name} must have one value per token: got {len(items)}, expected {token_count}"
         )
+    if name in {
+        "symbol_ids",
+        "call_targets",
+        "type_refs",
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+    }:
+        if any(item < 0 or item > (1 << 64) - 1 for item in items):
+            raise ValueError(f"{name} opaque identities must fit unsigned 64-bit")
+        return mx.array([items], dtype=mx.uint64)
     return mx.array([items], dtype=mx.int32)
 
 

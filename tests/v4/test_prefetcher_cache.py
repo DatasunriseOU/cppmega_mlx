@@ -1,6 +1,5 @@
 import os
 import shutil
-import pytest
 from cppmega_v4.data.pre_fetcher import StreamingPreFetcher
 from cppmega_v4.jsonrpc.path_explorer_methods import (
     ListDirectoryParams, list_directory,
@@ -61,8 +60,8 @@ def test_path_explorer_rpc_handlers():
     """Verifies that list_directory and analyze_source RPC methods run successfully and return expected types."""
     # Test directory listing
     list_res = list_directory(ListDirectoryParams(path="."))
-    assert len(list_res) > 0
-    assert any(x.name == "cppmega_v4" for x in list_res)
+    assert len(list_res.root) > 0
+    assert any(x.name == "cppmega_v4" for x in list_res.root)
     
     # Test file analysis
     analyze_res = analyze_source(AnalyzeSourceParams(path="pyproject.toml", content_type="text"))

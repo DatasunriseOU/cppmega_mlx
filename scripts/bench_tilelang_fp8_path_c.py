@@ -78,18 +78,22 @@ def _first_existing_path(candidates: Iterable[Path], fallback: Path) -> Path:
 
 
 def _default_tilelang_root() -> Path:
-    # Convergence 2026-05-07: collapsed to single canonical worktree
-    # (DatasunriseOU/tilelang fork, branch `main`). Old fallback candidates
-    # (`tl_pr_c`, `cppmega-mlx-tilelang-stack-c`, `tilelang_apple_head/`)
-    # removed — they pointed at stale forks now archived.
-    return Path("/private/tmp/tl_apache_tvm_swap")
+    # Keep the checked-out sibling beside cppmega.mlx as the local canonical
+    # stack. The temporary swap checkout is only a compatibility fallback for
+    # older machines where that sibling has not been provisioned.
+    sibling = REPO_ROOT.parent / "tilelang"
+    return _first_existing_path(
+        (sibling, Path("/private/tmp/tl_apache_tvm_swap")),
+        sibling,
+    )
 
 
 def _default_tvm_root(tilelang_root: Path) -> Path:
     bundled = tilelang_root / "3rdparty" / "tvm"
-    if bundled.exists():
-        return bundled
-    return Path("/private/tmp/tvm_apple_head/tvm")
+    return _first_existing_path(
+        (bundled, Path("/private/tmp/tvm_apple_head/tvm")),
+        bundled,
+    )
 
 
 # Bench JSON schema version. Bumped to 2 when we standardized on the FLAT
@@ -129,12 +133,18 @@ def _resolve_tilelang_root() -> Path:
     global _RESOLVED_TILELANG_ROOT, _RESOLVED_TVM_ROOT
     if _RESOLVED_TILELANG_ROOT is None:
         _RESOLVED_TILELANG_ROOT = Path(
-            os.environ.get("TILELANG_ROOT") or _default_tilelang_root()
+            os.environ.get("CPPMEGA_TILELANG_SOURCE_ROOT")
+            or os.environ.get("TILELANG_ROOT")
+            or _default_tilelang_root()
         )
     if _RESOLVED_TVM_ROOT is None:
-        _RESOLVED_TVM_ROOT = Path(
-            os.environ.get("TVM_ROOT") or _default_tvm_root(_RESOLVED_TILELANG_ROOT)
-        )
+        if os.environ.get("CPPMEGA_MLX_ENV_MODE") == "path-c-source":
+            _RESOLVED_TVM_ROOT = _RESOLVED_TILELANG_ROOT / "3rdparty" / "tvm"
+        else:
+            _RESOLVED_TVM_ROOT = Path(
+                os.environ.get("TVM_ROOT")
+                or _default_tvm_root(_RESOLVED_TILELANG_ROOT)
+            )
     return _RESOLVED_TILELANG_ROOT
 
 
@@ -320,13 +330,24 @@ def _purge_stale_imported_modules(tilelang_root: Path, tvm_root: Path) -> None:
         for root in _selected_import_roots(tilelang_root, tvm_root)
         if root.exists()
     ]
-    stale_prefixes: set[str] = set()
-    for name in ("tilelang", "tvm", "tvm_ffi"):
+    runtime_prefixes = ("tilelang", "tvm", "tvm_ffi")
+    stale_runtime = False
+    for name in runtime_prefixes:
         module_path = _module_file(name)
-        if module_path is not None and not _path_in_roots(module_path, allowed_roots):
-            stale_prefixes.add(name)
-    if not stale_prefixes:
+        if name in sys.modules and (
+            module_path is None or not _path_in_roots(module_path, allowed_roots)
+        ):
+            stale_runtime = True
+            break
+    if not stale_runtime:
         return
+
+    # TileLang, TVM, and TVM-FFI share process-global registries. Removing
+    # only the module that resolves outside the selected tree leaves a mixed
+    # runtime behind and can make the next import fail with duplicate global
+    # function registration. Treat the group as one unit and purge every
+    # prefix before any of it is imported again.
+    stale_prefixes = set(runtime_prefixes)
     for name in list(sys.modules):
         if any(
             name == prefix or name.startswith(f"{prefix}.") for prefix in stale_prefixes
@@ -2394,6 +2415,11 @@ def main() -> int:
             "torch": getattr(torch, "__version__", "unknown"),
         },
         "env_contract": {
+            "CPPMEGA_MLX_ENV_MODE": os.environ.get("CPPMEGA_MLX_ENV_MODE"),
+            "CPPMEGA_MLX_ENV_ROOT": os.environ.get("CPPMEGA_MLX_ENV_ROOT"),
+            "CPPMEGA_TILELANG_SOURCE_ROOT": os.environ.get(
+                "CPPMEGA_TILELANG_SOURCE_ROOT"
+            ),
             "MAKEFLAGS": os.environ.get("MAKEFLAGS"),
             "CMAKE_BUILD_PARALLEL_LEVEL": os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),

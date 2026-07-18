@@ -8,6 +8,7 @@ actually installed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from cppmega_v4.runner.cli import main
+from scripts.mlx_env_contract import build_mlx_wheel_environment
 
 
 _DIM_ENV = {"B": 1, "S": 4, "H": 64, "nh": 2, "nkv": 1, "head_dim": 32,
@@ -144,10 +146,15 @@ def test_cli_pipeline_yaml_round_trip(tmp_path: Path, capsys):
 def test_cppmega_run_executable_invokes(tmp_path: Path):
     """End-to-end: spawn the CLI module via -m and check exit code."""
     p = _write_spec(tmp_path)
+    environment = build_mlx_wheel_environment(
+        os.environ,
+        python=Path(sys.executable),
+    )
     result = subprocess.run(
         [sys.executable, "-m", "cppmega_v4.runner.cli", str(p), "--json"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=environment,
     )
     assert result.returncode == 0, result.stderr
+    assert "Loading tilelang libs" not in result.stderr
     payload = json.loads(result.stdout)
     assert payload["overall_status"] == "ok"

@@ -28,16 +28,19 @@ from cppmega_mlx.data.nanochat_pipeline.build_context import (
     find_compile_commands_file,
 )
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
+    _inherit_zero_width_source_tokens,
     materialize_tokenized_enriched_batch,
 )
 from cppmega_v4.data.doc_id_assignment import (
     assign_sharded_doc_ids,
     write_doc_id_manifest,
 )
-from scripts.nanochat_data import clang_enriched_to_parquet
+from scripts.nanochat_data import clang_enriched_to_parquet, token_budget
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
+    LOSS_MASK_COLUMN,
+    NUM_DOCS_COLUMN,
     read_tokenized_documents,
     pack_documents,
 )
@@ -105,6 +108,23 @@ def test_local_platform_vocab_matches_nanochat_source_of_truth() -> None:
     assert platform_vocab.MAX_PLATFORM_IDS == nanochat_vocab.MAX_PLATFORM_IDS
 
 
+def test_synthetic_special_token_inherits_nearest_exact_source() -> None:
+    assert _inherit_zero_width_source_tokens(
+        [0, 11, 22, 0],
+        [(0, 0), (0, 1), (1, 2), (2, 2)],
+        field="token_source_identity_ids",
+    ) == [11, 11, 22, 22]
+
+
+def test_nonempty_token_without_source_identity_fails_closed() -> None:
+    with pytest.raises(ValueError, match="nonempty token span"):
+        _inherit_zero_width_source_tokens(
+            [11, 0, 22],
+            [(0, 1), (1, 2), (2, 3)],
+            field="token_source_identity_ids",
+        )
+
+
 def test_local_tokenized_schema_keeps_full_nanochat_column_contract() -> None:
     nanochat_schema = _load_nanochat_module("nanochat/tokenized_enriched_schema.py")
 
@@ -145,11 +165,43 @@ def test_clang_enriched_parquet_schema_preserves_token_semantic_columns() -> Non
     }
 
     assert required <= set(clang_enriched_to_parquet._SCHEMA.names)
+    assert clang_enriched_to_parquet.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION == 3
+    assert "symbol_identities" in clang_enriched_to_parquet._SCHEMA.names
+    for column in (
+        "symbol_ids",
+        "call_targets",
+        "type_refs",
+        schema.TOKEN_SYMBOL_IDS_COLUMN,
+        schema.TOKEN_CALL_TARGETS_COLUMN,
+        schema.TOKEN_TYPE_REFS_COLUMN,
+    ):
+        assert clang_enriched_to_parquet._SCHEMA.field(column).type.value_type == pa.uint64()
+    boundary_type = clang_enriched_to_parquet._SCHEMA.field(
+        "chunk_boundaries"
+    ).type.value_type
+    assert boundary_type.field("symbol_id").type == pa.uint64()
+    metadata = clang_enriched_to_parquet._SCHEMA.metadata or {}
+    assert metadata[
+        clang_enriched_to_parquet.DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")
+    ] == clang_enriched_to_parquet.DOMAIN_SCHEMA_SHA256.encode("ascii")
+    assert metadata[
+        clang_enriched_to_parquet.TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+            "utf-8"
+        )
+    ] == clang_enriched_to_parquet.TOKENIZER_CONTRACT_SHA256.encode("ascii")
 
 
 def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
+    keys = [f"usr:schema=v3\x1fproject=test\x1fusr=c:@F@symbol{i}#" for i in range(3)]
+    symbol_id, call_id, type_id = [index_project._compute_symbol_id(key) for key in keys]
+    identities = [
+        {"symbol_id": value, "symbol_key": key}
+        for key, value in zip(keys, (symbol_id, call_id, type_id), strict=True)
+    ]
     rows = [
         {
+            "symbol_identity_schema_version": 3,
+            "symbol_identities": identities,
             "text": "int main() { return f(); }",
             "source_doc_id": "demo.cc@main",
             schema.DOC_TYPE_COLUMN: "code_header",
@@ -162,18 +214,18 @@ def test_clang_enriched_docs_to_table_carries_token_semantic_columns() -> None:
             "ast_depth": [0, 1, 2, 1],
             "sibling_index": [0, 0, 1, 2],
             "ast_node_type": [1, 2, 3, 4],
-            "symbol_ids": [0, 11, 11, 0],
-            "call_targets": [0, 22, 0, 0],
-            "type_refs": [0, 0, 33, 0],
+            "symbol_ids": [0, symbol_id, symbol_id, 0],
+            "call_targets": [0, call_id, 0, 0],
+            "type_refs": [0, 0, type_id, 0],
             "def_use": [0, 1, 2, 0],
         }
     ]
     tokenized_rows = [
         {
             schema.TOKEN_IDS_COLUMN: [1, 2, 3, 4],
-            schema.TOKEN_SYMBOL_IDS_COLUMN: [0, 11, 11, 0],
-            schema.TOKEN_CALL_TARGETS_COLUMN: [0, 22, 0, 0],
-            schema.TOKEN_TYPE_REFS_COLUMN: [0, 0, 33, 0],
+            schema.TOKEN_SYMBOL_IDS_COLUMN: [0, symbol_id, symbol_id, 0],
+            schema.TOKEN_CALL_TARGETS_COLUMN: [0, call_id, 0, 0],
+            schema.TOKEN_TYPE_REFS_COLUMN: [0, 0, type_id, 0],
             schema.TOKEN_DEF_USE_COLUMN: [0, 1, 2, 0],
         }
     ]
@@ -215,6 +267,8 @@ def test_local_convert_backfills_static_code_repo_provenance(
     input_path.write_text(
         json.dumps(
             {
+                "symbol_identity_schema_version": 3,
+                "symbol_identities": [],
                 "text": "int add(int a, int b) { return a + b; }",
                 "filepath": "include/math.hpp",
                 "structure_ids": [3] * 40,
@@ -235,7 +289,8 @@ def test_local_convert_backfills_static_code_repo_provenance(
         tokenizer=_CharTokenizer(),
         max_tokens=4096,
         overflow_policy="drop",
-        default_repo="demo-lib",
+        default_repo="tests/demo-lib",
+        memory_limit_gb=0.0,
     )
 
     table = pq.read_table(
@@ -247,14 +302,14 @@ def test_local_convert_backfills_static_code_repo_provenance(
             schema.FILEPATH_STABLE_ID_COLUMN,
         ],
     )
-    assert table.column(schema.REPO_COLUMN).to_pylist() == ["demo-lib"]
+    assert table.column(schema.REPO_COLUMN).to_pylist() == ["tests/demo-lib"]
     assert table.column(schema.FILEPATH_COLUMN).to_pylist() == ["include/math.hpp"]
     assert table.column(schema.REPO_STABLE_ID_COLUMN).to_pylist() == [
-        clang_enriched_to_parquet.stable_repo_id("demo-lib")
+        clang_enriched_to_parquet.stable_repo_id("tests/demo-lib")
     ]
     assert table.column(schema.FILEPATH_STABLE_ID_COLUMN).to_pylist() == [
         clang_enriched_to_parquet.stable_filepath_id(
-            "demo-lib",
+            "tests/demo-lib",
             "include/math.hpp",
         )
     ]
@@ -290,6 +345,7 @@ def test_local_convert_fails_on_static_code_without_repo_context(
             tokenizer=_CharTokenizer(),
             max_tokens=4096,
             overflow_policy="drop",
+            memory_limit_gb=0.0,
         )
 
 
@@ -332,6 +388,89 @@ def test_converter_header_alignment_preserves_char_metadata_coordinates() -> Non
         "def_use",
     ):
         assert doc[key] == [0] * header_len + record[key]
+
+
+def test_embedded_domain_spans_follow_filtering_and_header_insertion() -> None:
+    dead = "#ifdef __SYMBIAN32__\nconst char* dead = \"SELECT dead\";\n#endif\n"
+    live = 'const char* live = R"SQL(SELECT live;)SQL";\n'
+    text = dead + live
+    live_start = text.index("SELECT live")
+    live_end = live_start + len("SELECT live;")
+    record = {
+        "text": text,
+        "structure_ids": [1] * len(text),
+        "embedded_domain_spans": [
+            {
+                "start": live_start,
+                "end": live_end,
+                "domain_kind": int(DomainKind.SQL),
+            }
+        ],
+    }
+
+    docs = clang_enriched_to_parquet.process_record_with_policy(
+        record,
+        _CharTokenizer(),
+        max_tokens=10_000,
+    )
+
+    assert len(docs) == 1
+    doc = docs[0]
+    filtered, _ = clang_enriched_to_parquet.filter_dead_platforms_with_mapping(text)
+    header_len = len(doc["text"]) - len(filtered)
+    expected_start = header_len + filtered.index("SELECT live")
+    assert doc["embedded_domain_spans"] == [
+        {
+            "start": expected_start,
+            "end": expected_start + len("SELECT live;"),
+            "domain_kind": int(DomainKind.SQL),
+        }
+    ]
+
+
+def test_embedded_domain_spans_discard_deleted_regions_and_fail_on_partial_filter() -> None:
+    text = (
+        "before\n"
+        "#ifdef __SYMBIAN32__\n"
+        'const char* dead = R"SQL(SELECT dead;)SQL";\n'
+        "#endif\n"
+        "after\n"
+    )
+    dead_start = text.index("SELECT dead")
+    dead_end = dead_start + len("SELECT dead;")
+    deleted = clang_enriched_to_parquet.process_record_with_policy(
+        {
+            "text": text,
+            "structure_ids": [1] * len(text),
+            "embedded_domain_spans": [
+                {
+                    "start": dead_start,
+                    "end": dead_end,
+                    "domain_kind": int(DomainKind.SQL),
+                }
+            ],
+        },
+        _CharTokenizer(),
+        max_tokens=10_000,
+    )[0]
+    assert deleted["embedded_domain_spans"] == []
+
+    with pytest.raises(ValueError, match="cannot exactly remap embedded domain span"):
+        clang_enriched_to_parquet.process_record_with_policy(
+            {
+                "text": text,
+                "structure_ids": [1] * len(text),
+                "embedded_domain_spans": [
+                    {
+                        "start": 0,
+                        "end": len(text),
+                        "domain_kind": int(DomainKind.SQL),
+                    }
+                ],
+            },
+            _CharTokenizer(),
+            max_tokens=10_000,
+        )
 
 
 def test_dead_platform_filter_remaps_live_sidecars_and_drops_removed_edges() -> None:
@@ -418,6 +557,8 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     output_path = tmp_path / "out.parquet"
     records = [
         {
+            "symbol_identity_schema_version": 3,
+            "symbol_identities": [],
             "text": "int one() { return 1; }",
             "structure_ids": [3] * len("int one() { return 1; }"),
             "chunk_boundaries": [
@@ -427,6 +568,8 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
             "type_edges": [],
         },
         {
+            "symbol_identity_schema_version": 3,
+            "symbol_identities": [],
             "text": "int two() { return 2; }",
             "structure_ids": [3] * len("int two() { return 2; }"),
             "chunk_boundaries": [
@@ -449,6 +592,7 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
         overflow_policy="drop",
         materialize_tokenized_enriched=True,
         local_batch_size=1,
+        memory_limit_gb=0.0,
     )
 
     parquet_file = pq.ParquetFile(output_path)
@@ -469,6 +613,14 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
         for v in source_doc_ids
     ), source_doc_ids
     assert len(set(source_doc_ids)) == 2
+    token_source_doc_ids = parquet_file.read(
+        columns=["token_source_doc_ids"]
+    ).column("token_source_doc_ids").to_pylist()
+    assert all(
+        source_id > 0
+        for row in token_source_doc_ids
+        for source_id in row
+    )
     fingerprints = parquet_file.read(
         columns=["tokenizer_fingerprint"]
     ).column("tokenizer_fingerprint").to_pylist()
@@ -491,6 +643,8 @@ def test_tokenizer_fingerprint_and_ids_stable_across_independent_shards(
             "\n".join(
                 json.dumps(
                     {
+                        "symbol_identity_schema_version": 3,
+                        "symbol_identities": [],
                         "text": text,
                         "structure_ids": [3] * len(text),
                         "chunk_boundaries": [
@@ -518,6 +672,7 @@ def test_tokenizer_fingerprint_and_ids_stable_across_independent_shards(
             overflow_policy="drop",
             materialize_tokenized_enriched=True,
             local_batch_size=8,
+            memory_limit_gb=0.0,
         )
         table = pq.read_table(
             output_path,
@@ -664,8 +819,76 @@ def test_pack_enriched_rows_preserves_source_doc_id_across_input_shards(
 
     assert overflow == []
     assert rows[0][INPUT_IDS_COLUMN] == [1, 2, 3, 4, 9, 10]
-    assert rows[0][DOC_IDS_COLUMN][0] == rows[0][DOC_IDS_COLUMN][2]
-    assert rows[0][DOC_IDS_COLUMN][3] != rows[0][DOC_IDS_COLUMN][4]
+    assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2, 3, 3]
+    assert rows[0][LOSS_MASK_COLUMN] == [1, 0, 1, 0, 1, 0]
+    assert rows[0][NUM_DOCS_COLUMN] == 3
+    assert rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN] == [1] * 6
+    stable_sources = rows[0][schema.TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    assert stable_sources[0] == stable_sources[2]
+    assert stable_sources[3] != stable_sources[4]
+    assert all(value > 0 for value in stable_sources)
+    assert docs[0].stable_doc_id == docs[1].stable_doc_id
+    assert docs[1].stable_doc_id != docs[2].stable_doc_id
+
+
+def test_pack_enriched_rows_does_not_merge_file_provenance_without_logical_id(
+    tmp_path: Path,
+) -> None:
+    shard = tmp_path / "train_00000.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[1, 2], [3, 4]],
+                "repo_stable_id": ["repo", "repo"],
+                "filepath_stable_id": ["include/shared.hpp", "include/shared.hpp"],
+            }
+        ),
+        shard,
+    )
+
+    docs = read_tokenized_documents(shard)
+    assert [doc.source_doc_index for doc in docs] == [0, 1]
+    rows, overflow = pack_documents(
+        docs,
+        target_length=4,
+        pad_token_id=0,
+        strategy="sequential",
+    )
+
+    assert overflow == []
+    assert rows[0][DOC_IDS_COLUMN] == [1, 1, 2, 2]
+    assert rows[0][LOSS_MASK_COLUMN] == [1, 0, 1, 0]
+    assert rows[0][NUM_DOCS_COLUMN] == 2
+
+
+def test_pack_enriched_rows_does_not_collide_anonymous_and_typed_source_ids(
+    tmp_path: Path,
+) -> None:
+    pq.write_table(
+        pa.table(
+            {
+                "token_ids": [[1, 2], [3, 4]],
+                "source_doc_id": [None, "alpha"],
+            }
+        ),
+        tmp_path / "train_00000.parquet",
+    )
+
+    docs = read_tokenized_documents(tmp_path)
+    rows, overflow = pack_documents(
+        docs,
+        target_length=4,
+        pad_token_id=0,
+        strategy="sequential",
+    )
+
+    assert overflow == []
+    assert rows[0][schema.TOKEN_SOURCE_DOC_IDS_COLUMN] == [1] * 4
+    source_ids = rows[0][schema.TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    assert source_ids[:2] == [source_ids[0], source_ids[0]]
+    assert source_ids[2:] == [source_ids[2], source_ids[2]]
+    assert source_ids[0] > 0 and source_ids[2] > 0
+    assert source_ids[0] != source_ids[2]
 
 
 def test_token_budget_slices_semantic_char_metadata() -> None:
@@ -693,6 +916,43 @@ def test_token_budget_slices_semantic_char_metadata() -> None:
     assert pieces[1]["def_use"] == [0, 1, 2]
 
 
+def test_token_budget_clips_embedded_domain_spans_at_every_split_boundary() -> None:
+    text = "aaSELECT123bb"
+    span_start = text.index("SELECT")
+    span_end = span_start + len("SELECT123")
+    doc = {
+        "text": text,
+        "structure_ids": [1] * len(text),
+        "embedded_domain_spans": [
+            {
+                "start": span_start,
+                "end": span_end,
+                "domain_kind": int(DomainKind.SQL),
+            }
+        ],
+    }
+
+    pieces = token_budget.chunk_enriched_document(doc, 5, _CharTokenizer())
+
+    source_offset = 0
+    for piece in pieces:
+        piece_end = source_offset + len(piece["text"])
+        overlap_start = max(span_start, source_offset)
+        overlap_end = min(span_end, piece_end)
+        expected = []
+        if overlap_start < overlap_end:
+            expected = [
+                {
+                    "start": overlap_start - source_offset,
+                    "end": overlap_end - source_offset,
+                    "domain_kind": int(DomainKind.SQL),
+                }
+            ]
+        assert piece["embedded_domain_spans"] == expected
+        source_offset = piece_end
+    assert source_offset == len(text)
+
+
 def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
     source = tmp_path / "demo.cc"
     source.write_text(
@@ -708,6 +968,7 @@ def test_clang_indexer_ast_metadata_comes_from_clang(tmp_path: Path) -> None:
         clang_index,
         ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
         str(tmp_path),
+        project_id="tests/nanochat-fixture",
     )
 
     main = next(func for func in funcs if func.name == "main")
@@ -784,6 +1045,7 @@ def test_commit_clang_analysis_uses_repo_build_context_for_virtual_source(
         "src/main.cc",
         clang_index,
         str(tmp_path / "fallback"),
+        project_id="tests/nanochat-fixture",
     )
     repo_root, compile_args, build_info = BuildContextResolver(
         repo_root=str(tmp_path)
@@ -796,6 +1058,7 @@ def test_commit_clang_analysis_uses_repo_build_context_for_virtual_source(
         compile_args=compile_args,
         repo_root=repo_root,
         build_info=build_info,
+        project_id="tests/nanochat-fixture",
     )
 
     assert next(func for func in fallback.functions if func.name == "main").callees == []
@@ -905,6 +1168,7 @@ def test_commit_macro_dependency_parts_emit_precise_expansion_routes() -> None:
         1,
         "#define CPPMEGA_COMMIT_BASE(x) ((x) + 1)\n",
         params=["x"],
+        project_id="tests/nanochat-fixture",
         visible_in_file="src/demo.cc",
         visible_line=1,
         sequence=0,
@@ -915,6 +1179,7 @@ def test_commit_macro_dependency_parts_emit_precise_expansion_routes() -> None:
         2,
         "#define CPPMEGA_COMMIT_WRAP(x) CPPMEGA_COMMIT_BASE(x)\n",
         params=["x"],
+        project_id="tests/nanochat-fixture",
         visible_in_file="src/demo.cc",
         visible_line=1,
         sequence=1,
@@ -1003,7 +1268,7 @@ def test_process_record_pulls_header_macros_into_commit_docs_without_libclang(
 
     docs = process_record(
         {
-            "repo": "demo",
+            "repo": "tests/demo",
             "filepath": "src/demo.cc",
             "old_content": old_content,
             "new_content": new_content,
@@ -1104,6 +1369,7 @@ def test_process_record_reuses_identical_file_analysis_with_cache(tmp_path) -> N
         end_line=2,
     )
     record = {
+        "repo": "tests/demo",
         "old_content": source,
         "new_content": source,
         "diff": "\n".join(
@@ -1188,13 +1454,10 @@ def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
             "domain_kind": int(DomainKind.CMAKE),
             "domain_ids": [int(DomainKind.CMAKE)] * len(text),
             "domain_role_ids": role_ids,
-            "domain_edges": [
-                {
-                    "from_char": target_start,
-                    "to_char": source_start,
-                    "kind": int(DomainEdgeKind.BUILD_TARGET_SOURCE),
-                }
-            ],
+            "domain_source_doc_ids": [0] * len(text),
+            "repo_stable_id": "repo-17",
+            "filepath_stable_id": "cmake-file-23",
+            "domain_edges": [],
             "build_edges": [
                 {
                     "from_char": target_start,
@@ -1214,6 +1477,7 @@ def test_tokenized_materializer_inserts_domain_delimiters_and_routes() -> None:
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][1] == int(DomainRoleKind.DELIMITER)
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][-1] == int(DomainRoleKind.DELIMITER)
     assert row[schema.TOKEN_BUILD_EDGES_COLUMN]
+    assert min(row[schema.TOKEN_SOURCE_DOC_IDS_COLUMN]) > 0
     edge = row[schema.TOKEN_BUILD_EDGES_COLUMN][0]
     assert edge["kind"] == int(DomainEdgeKind.BUILD_TARGET_SOURCE)
     assert row[schema.TOKEN_ROLE_IDS_COLUMN][edge["from"]] == int(DomainRoleKind.TARGET)

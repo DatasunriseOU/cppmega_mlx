@@ -29,8 +29,8 @@ distributed math, **not** a multi-node throughput claim.
     -n 2 \
     --hosts 127.0.0.1 \
     --backend ring \
-    --python .venv/bin/python \
     -- \
+    .venv/bin/python \
     scripts/bench_zero1_loopback.py \
     --steps 20 \
     --out bench/baselines/zero1_loopback_2proc_m4.json

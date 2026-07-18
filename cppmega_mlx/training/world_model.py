@@ -2,10 +2,11 @@
 
 The world-model loss has four parts:
 
-  1. ``next_obs`` — masked next-observation (post-edit) cross-entropy.  This is
-     the core dynamics objective: the rolled latent must decode the real
-     post-edit token region.  Where a transition carries ``change_mask`` the
-     loss is weighted toward the inserted/modified tokens (the actual edit).
+  1. ``next_obs`` — masked next-observation (post-edit) cross-entropy conditioned
+     on the packet's required action.  This is the core dynamics objective: the
+     rolled latent must decode the real post-edit token region.  Where a
+     transition carries ``change_mask`` the loss is weighted toward the
+     inserted/modified tokens (the actual edit).
   2. ``latent_consistency`` — the rolled latent should match the latent obtained
      by re-encoding the teacher next observation (a forward-prediction
      consistency term, MSE).
@@ -98,9 +99,12 @@ def _transition_next_obs_loss(
     """Return ``(next_obs_loss, entropy, rolled_latent)`` for one transition."""
 
     obs = transition.obs[None, :]  # (1, S)
+    action = transition.action[None, :]  # (1, A)
     target = transition.next_obs[None, :]  # (1, L)
     length = int(transition.next_obs.shape[0])
-    logits, rolled = model.predict_next(obs, length, training_loops=cfg.training_loops)
+    logits, rolled = model.predict_next(
+        obs, action, length, training_loops=cfg.training_loops
+    )
 
     token_ce = nn.losses.cross_entropy(
         logits.astype(mx.float32), target, reduction="none"

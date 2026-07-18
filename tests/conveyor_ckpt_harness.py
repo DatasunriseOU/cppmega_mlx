@@ -67,8 +67,50 @@ NRECORDS = int(_env("CKPT_NRECORDS"))
 RANGE_SLEEP = float(_env("CKPT_RANGE_SLEEP"))
 EXTRACT_EVENTS = Path(_env("CKPT_EXTRACT_EVENTS"))
 RANGE_EVENTS = Path(_env("CKPT_RANGE_EVENTS"))
+TEST_CODE_REVISION = "1" * 40
 
 _APPEND_LOCK = threading.Lock()
+
+
+def _clean_test_revision_snapshot() -> dict:
+    """Return the stable clean revision identity used by this isolated harness."""
+    empty_sha = "0" * 64
+    return {
+        "schema_version": conv.CODE_REVISION_SCHEMA_VERSION,
+        "git_commit": TEST_CODE_REVISION,
+        "dirty": False,
+        "dirty_fingerprint": empty_sha,
+        "index_dirty": False,
+        "worktree_dirty": False,
+        "untracked_source_dirty": False,
+        "relevant_scope_sha256": empty_sha,
+        "relevant_pathspecs": list(conv.CODE_REVISION_PATHS),
+        "bounds": {},
+        "status_sha256": empty_sha,
+        "index_diff_sha256": empty_sha,
+        "worktree_diff_sha256": empty_sha,
+        "untracked_sources_sha256": empty_sha,
+    }
+
+
+def _fake_bounded_git_output(repo_root, args, *, max_bytes):
+    """Keep the real guard path deterministic without reading the live worktree."""
+    del repo_root, max_bytes
+    if tuple(args[:2]) == ("rev-parse", "--verify"):
+        return f"{TEST_CODE_REVISION}\n".encode("ascii")
+    if args and args[0] in {"status", "diff", "ls-files"}:
+        return b""
+    raise AssertionError(f"unexpected revision-guard git command: {args}")
+
+
+def _fake_capture_code_revision(repo_root=conv.MLX_ROOT):
+    del repo_root
+    return _clean_test_revision_snapshot()
+
+
+def _fake_project_identity(repo, repo_list):
+    del repo_list
+    return f"test/{repo}"
 
 
 def _append_event(path: Path, payload: dict) -> None:
@@ -163,10 +205,24 @@ def _lengths_info(lengths, valid):
     }
 
 
-def fake_run_code_half(repo, repo_dir, lengths_code, work_root, dedup_db,
-                       dedup_near, global_symbol_index=None, memory_limit_gb=10.0,
-                       parse_workers=2, index_timeout_s=None,
-                       index_stall_timeout_s=None, recompressor=None):
+def fake_run_code_half(
+    repo,
+    project_id,
+    repo_dir,
+    lengths_code,
+    work_root,
+    dedup_db,
+    dedup_near,
+    global_symbol_index=None,
+    memory_limit_gb=10.0,
+    parse_workers=2,
+    index_timeout_s=None,
+    index_stall_timeout_s=None,
+    recompressor=None,
+    *,
+    revision_guard=None,
+):
+    del revision_guard
     return {"source": f"{repo}::code", "lengths": _lengths_info(lengths_code, 10)}
 
 
@@ -196,6 +252,9 @@ conv.get_commit_list = fake_get_commit_list
 conv.stage_extract_commits = fake_stage_extract_commits
 conv.run_code_half = fake_run_code_half
 conv.process_range = fake_process_range
+conv.capture_code_revision = _fake_capture_code_revision
+conv._bounded_git_output = _fake_bounded_git_output
+sr.resolve_project_identity = _fake_project_identity
 
 
 if __name__ == "__main__":

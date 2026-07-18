@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
 NANOCHAT = MLX_ROOT / "scripts" / "nanochat_data"
@@ -294,3 +296,372 @@ def test_output_file_lock_rejects_second_process(tmp_path):
         assert "already held" in proc.stderr
     finally:
         lock.close()
+
+
+def _build_linear_history(repo: Path, edits: int = 7) -> list[str]:
+    """Create ``edits`` emittable modifications after one root commit."""
+    repo.mkdir()
+    _git(repo, "init")
+    source = repo / "main.cpp"
+    source.write_text("int f() { return 0; }\n", encoding="utf-8")
+    _git(repo, "add", "main.cpp")
+    _commit(repo, "initial")
+    commits = []
+    for value in range(1, edits + 1):
+        source.write_text(f"int f() {{ return {value}; }}\n", encoding="utf-8")
+        commits.append(_commit(repo, f"change value {value}"))
+    return commits
+
+
+def _open_checkpoint(
+    egh,
+    repo: Path,
+    root: Path,
+    *,
+    checkpoint_commits: int = 2,
+):
+    source = egh._repo_source_context(
+        str(repo),
+        max_commits=0,
+        repo_name=repo.name,
+        notes="off",
+    )
+    checkpoint = egh.RepoExtractionCheckpoint(
+        root,
+        source=source,
+        checkpoint_commits=checkpoint_commits,
+    )
+    return source, checkpoint
+
+
+def test_transactional_chunks_preserve_exact_output_order_and_indices(tmp_path):
+    import extract_git_history as egh
+
+    repo = tmp_path / "repo"
+    commits_oldest_first = _build_linear_history(repo, edits=7)
+
+    legacy_output = tmp_path / "legacy.jsonl"
+    with legacy_output.open("w", encoding="utf-8") as handle:
+        egh.process_repo(str(repo), handle, repo_name="repo", notes="off")
+
+    source, checkpoint = _open_checkpoint(
+        egh,
+        repo,
+        tmp_path / "checkpoint",
+        checkpoint_commits=2,
+    )
+    try:
+        stats = egh.extract_repo_to_checkpoint(
+            str(repo),
+            checkpoint,
+            memory_limit_gb=10.0,
+            bad_unit_policy="fail",
+            max_bad_units=0,
+        )
+        output = tmp_path / "transactional.jsonl"
+        publication = egh.publish_checkpoints(output, [checkpoint])
+    finally:
+        checkpoint.close()
+
+    assert output.read_bytes() == legacy_output.read_bytes()
+    assert publication["line_count"] == stats["records_written"] == 7
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["commit_hash"] for row in records] == list(
+        reversed(commits_oldest_first)
+    )
+    assert [row["commit_hash"] for row in records] == source["commits"]
+    assert [row["file_local_commit_index"] for row in records] == list(
+        reversed(range(7))
+    )
+
+
+def test_transactional_index_preserves_subject_filtered_counter_semantics(tmp_path):
+    import extract_git_history as egh
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    source_file = repo / "main.cpp"
+    source_file.write_text("int f() { return 0; }\n", encoding="utf-8")
+    _git(repo, "add", "main.cpp")
+    _commit(repo, "initial")
+    source_file.write_text("int f() { return 1; }\n", encoding="utf-8")
+    first = _commit(repo, "first emitted change")
+    source_file.write_text("int f() { return 2; }\n", encoding="utf-8")
+    filtered = _commit(repo, "clang-format source")
+    source_file.write_text("int f() { return 3; }\n", encoding="utf-8")
+    last = _commit(repo, "last emitted change")
+
+    _source, checkpoint = _open_checkpoint(
+        egh,
+        repo,
+        tmp_path / "checkpoint",
+        checkpoint_commits=2,
+    )
+    output = tmp_path / "transactional.jsonl"
+    try:
+        egh.extract_repo_to_checkpoint(
+            str(repo),
+            checkpoint,
+            memory_limit_gb=10.0,
+            bad_unit_policy="fail",
+            max_bad_units=0,
+        )
+        egh.publish_checkpoints(output, [checkpoint])
+    finally:
+        checkpoint.close()
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    index_by_commit = {
+        row["commit_hash"]: row["file_local_commit_index"] for row in records
+    }
+    assert filtered not in index_by_commit
+    assert index_by_commit[first] == 0
+    # The historical precompute counted accepted diffs before subject filtering.
+    assert index_by_commit[last] == 2
+
+
+def test_resume_skips_committed_chunks_and_records_exact_bad_path(
+    tmp_path,
+    monkeypatch,
+):
+    import extract_git_history as egh
+
+    repo = tmp_path / "repo"
+    commits_oldest_first = _build_linear_history(repo, edits=7)
+    failing_commit = commits_oldest_first[4]
+    real_get_file_diff = egh.get_file_diff
+    calls: list[str] = []
+
+    def fail_one_path(repo_path: str, commit_hash: str, filepath: str):
+        calls.append(commit_hash)
+        if commit_hash == failing_commit:
+            raise egh.UnitExtractionError(
+                repo_path=repo_path,
+                commit_hash=commit_hash,
+                filepath=filepath,
+                operation="new_blob",
+                error_type="GitCommandError",
+                detail="synthetic corrupt object",
+            )
+        return real_get_file_diff(repo_path, commit_hash, filepath)
+
+    monkeypatch.setattr(egh, "get_file_diff", fail_one_path)
+    checkpoint_root = tmp_path / "checkpoint"
+    _source, checkpoint = _open_checkpoint(
+        egh,
+        repo,
+        checkpoint_root,
+        checkpoint_commits=2,
+    )
+    with pytest.raises(RuntimeError, match="bad extraction unit rejected"):
+        egh.extract_repo_to_checkpoint(
+            str(repo),
+            checkpoint,
+            memory_limit_gb=10.0,
+            bad_unit_policy="fail",
+            max_bad_units=0,
+        )
+    committed_before_resume = checkpoint.chunk_rows()
+    checkpoint.close()
+
+    assert [(row["start_index"], row["end_index"]) for row in committed_before_resume] == [
+        (0, 2),
+        (2, 4),
+    ]
+    ledger_path = checkpoint_root / "bad_units.jsonl"
+    first_ledger = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert first_ledger[0]["repo"] == "repo"
+    assert first_ledger[0]["commit_hash"] == failing_commit
+    assert first_ledger[0]["filepath"] == "main.cpp"
+    assert first_ledger[0]["operation"] == "new_blob"
+    assert first_ledger[0]["error"] == "synthetic corrupt object"
+
+    calls.clear()
+    _source, resumed = _open_checkpoint(
+        egh,
+        repo,
+        checkpoint_root,
+        checkpoint_commits=2,
+    )
+    try:
+        stats = egh.extract_repo_to_checkpoint(
+            str(repo),
+            resumed,
+            memory_limit_gb=10.0,
+            bad_unit_policy="quarantine",
+            max_bad_units=1,
+        )
+        output = tmp_path / "resumed.jsonl"
+        egh.publish_checkpoints(output, [resumed])
+    finally:
+        resumed.close()
+
+    assert not set(commits_oldest_first[:4]).intersection(calls)
+    assert failing_commit in calls
+    assert stats["records_written"] == 6
+    resumed_records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert failing_commit not in {row["commit_hash"] for row in resumed_records}
+    final_ledger = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert len(final_ledger) == 1
+    assert final_ledger[0]["attempts"] == 2
+
+
+def test_quarantine_threshold_fails_after_recording_excess_unit(
+    tmp_path,
+    monkeypatch,
+):
+    import extract_git_history as egh
+
+    repo = tmp_path / "repo"
+    commits_oldest_first = _build_linear_history(repo, edits=4)
+    failing_commits = set(commits_oldest_first[:2])
+    real_get_file_diff = egh.get_file_diff
+
+    def fail_two_paths(repo_path: str, commit_hash: str, filepath: str):
+        if commit_hash in failing_commits:
+            raise egh.UnitExtractionError(
+                repo_path=repo_path,
+                commit_hash=commit_hash,
+                filepath=filepath,
+                operation="old_blob",
+                error_type="GitCommandError",
+                detail=f"missing object for {commit_hash}",
+            )
+        return real_get_file_diff(repo_path, commit_hash, filepath)
+
+    monkeypatch.setattr(egh, "get_file_diff", fail_two_paths)
+    _source, checkpoint = _open_checkpoint(
+        egh,
+        repo,
+        tmp_path / "checkpoint",
+        checkpoint_commits=4,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="distinct_bad_units=2"):
+            egh.extract_repo_to_checkpoint(
+                str(repo),
+                checkpoint,
+                memory_limit_gb=10.0,
+                bad_unit_policy="quarantine",
+                max_bad_units=1,
+            )
+        assert checkpoint.chunk_rows() == []
+    finally:
+        checkpoint.close()
+
+    ledger = [
+        json.loads(line)
+        for line in (tmp_path / "checkpoint" / "bad_units.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert {row["commit_hash"] for row in ledger} == failing_commits
+
+
+def test_corrupt_committed_chunk_cannot_replace_published_output(tmp_path):
+    import extract_git_history as egh
+
+    repo = tmp_path / "repo"
+    _build_linear_history(repo, edits=4)
+    _source, checkpoint = _open_checkpoint(
+        egh,
+        repo,
+        tmp_path / "checkpoint",
+        checkpoint_commits=2,
+    )
+    output = tmp_path / "published.jsonl"
+    output.write_bytes(b"previous-valid-output\n")
+    try:
+        egh.extract_repo_to_checkpoint(
+            str(repo),
+            checkpoint,
+            memory_limit_gb=10.0,
+            bad_unit_policy="fail",
+            max_bad_units=0,
+        )
+        first_chunk = checkpoint.root / checkpoint.chunk_rows()[0]["artifact_name"]
+        with first_chunk.open("ab") as handle:
+            handle.write(b"corrupt")
+
+        with pytest.raises(egh.CheckpointCorruptionError, match="changed during publication"):
+            egh.publish_checkpoints(output, [checkpoint])
+        assert checkpoint.meta("status") == "corrupt"
+    finally:
+        checkpoint.close()
+
+    assert output.read_bytes() == b"previous-valid-output\n"
+
+
+def test_cli_publishes_then_reuses_validated_output_without_chunk_replay(tmp_path):
+    repo = tmp_path / "repo"
+    _build_linear_history(repo, edits=5)
+    output = tmp_path / "commits.jsonl"
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--repo",
+        str(repo),
+        "--output",
+        str(output),
+        "--notes",
+        "off",
+        "--checkpoint-commits",
+        "2",
+    ]
+
+    first = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert first.returncode == 0, f"stdout=\n{first.stdout}\nstderr=\n{first.stderr}"
+    original = output.read_bytes()
+    assert len(original.splitlines()) == 5
+    checkpoint_root = Path(f"{output}.extract-checkpoint")
+    publication = json.loads((checkpoint_root / "publication.json").read_text())
+    assert publication["status"] == "done"
+    assert publication["output"]["line_count"] == 5
+    assert list(checkpoint_root.glob("repo-*/chunk-*.jsonl")) == []
+
+    second = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert second.returncode == 0, (
+        f"stdout=\n{second.stdout}\nstderr=\n{second.stderr}"
+    )
+    assert "no commit ranges reprocessed" in second.stdout
+    assert output.read_bytes() == original
+
+
+def test_cli_repo_name_overrides_staged_src_directory_identity(tmp_path):
+    import extract_git_history as egh
+
+    repo = tmp_path / "_src"
+    _build_linear_history(repo, edits=2)
+    output = tmp_path / "commits.jsonl"
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--repo",
+        str(repo),
+        "--repo-name",
+        "blender/blender",
+        "--output",
+        str(output),
+        "--notes",
+        "off",
+        "--checkpoint-commits",
+        "2",
+    ]
+
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert completed.returncode == 0, (
+        f"stdout=\n{completed.stdout}\nstderr=\n{completed.stderr}"
+    )
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert records
+    assert {record["repo"] for record in records} == {"blender/blender"}
+    assert {record["repo_stable_id"] for record in records} == {
+        egh.stable_repo_id("blender/blender")
+    }
+    assert all(
+        record["filepath_stable_id"]
+        == egh.stable_filepath_id("blender/blender", record["filepath"])
+        for record in records
+    )

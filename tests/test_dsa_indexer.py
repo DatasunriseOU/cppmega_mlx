@@ -25,7 +25,12 @@ from cppmega_mlx.data.code_packet_builder import (
     build_code_packet_from_row,
 )
 from cppmega_mlx.data.graph_packet import GraphPacket
-from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
+from cppmega_mlx.models.dense_cpp_lm import (
+    DenseCppLM,
+    DenseCppLMConfig,
+    GraphIndexedAttention,
+)
+from cppmega_mlx.nn.attention import apply_rotary_emb
 from cppmega_mlx.nn.code_graph_routes import (
     GraphRouteConfig,
     build_attention_bias,
@@ -216,7 +221,7 @@ def test_dense_cpp_lm_dsa_forward_exposes_indexer_scores():
     tgt = mx.array(np.random.default_rng(1).integers(0, 128, (2, 24)))
     logits, loss = model(ids, targets=tgt)
     assert tuple(logits.shape) == (2, 24, 128)
-    scores = model.indexer_scores()
+    scores = model.indexer_scores(ids)
     assert len(scores) == 2  # one per layer
     assert tuple(scores[0].shape) == (2, 24, 24)
 
@@ -237,6 +242,7 @@ def test_dense_cpp_lm_dsa_requires_graph_routes_by_default():
         indexer_dim=8,
         indexer_local_window=2,
         indexer_num_sinks=1,
+        graph_routes_enabled=True,
         ngram_hash_enabled=False,
         structure_residual_scale=0.0,
         platform_residual_scale=0.0,
@@ -244,11 +250,17 @@ def test_dense_cpp_lm_dsa_requires_graph_routes_by_default():
     model = DenseCppLM(cfg)
     ids = mx.array(np.random.default_rng(0).integers(0, 128, (1, 16)))
     tgt = mx.array(np.random.default_rng(1).integers(0, 128, (1, 16)))
-    with pytest.raises(RuntimeError, match="requires graph route block_bias"):
+    with pytest.raises(RuntimeError, match="no typed GraphBatch or explicit block_bias"):
         model(ids, targets=tgt)
 
     bias = mx.zeros((1, 16, 16), dtype=mx.float32)
-    logits, loss = model(ids, targets=tgt, block_bias=bias)
+    edge_kind_bias = mx.zeros((1, 16, 16), dtype=mx.float32)
+    logits, loss = model(
+        ids,
+        targets=tgt,
+        block_bias=bias,
+        edge_kind_bias=edge_kind_bias,
+    )
     assert tuple(logits.shape) == (1, 16, 128)
     assert loss is not None and np.isfinite(float(loss))
 
@@ -320,4 +332,49 @@ def test_gqa_default_unchanged_by_dsa_additions():
     _, loss = model(ids, targets=tgt)
     assert np.isfinite(float(loss))
     with pytest.raises(ValueError):
-        model.indexer_scores()
+        model.indexer_scores(ids)
+
+
+def test_graph_indexed_attention_applies_existing_rope_to_q_and_k() -> None:
+    cfg = DenseCppLMConfig(
+        vocab_size=32,
+        hidden_size=16,
+        depth=1,
+        ffn_hidden_size=32,
+        max_seq_length=8,
+        num_query_heads=2,
+        num_kv_heads=1,
+        head_dim=8,
+        attention_mode="dsa",
+        rope=True,
+        attention_sparse_topk=4,
+        indexer_heads=1,
+        indexer_dim=4,
+        require_graph_routes=False,
+        ngram_hash_enabled=False,
+        structure_residual_scale=0.0,
+        platform_residual_scale=0.0,
+    )
+    attention = GraphIndexedAttention(cfg)
+    hidden = mx.arange(4 * cfg.hidden_size, dtype=mx.float32).reshape(
+        1, 4, cfg.hidden_size
+    )
+
+    q, kv = attention._project_q_kv(hidden)
+    raw_q = attention.q_proj(hidden).reshape(1, 4, 2, 8)
+    raw_kv = attention.kv_proj(hidden).reshape(1, 4, 1, 8)
+    cos, sin = attention._rotary_tables(4)
+    expected_q = mx.transpose(
+        apply_rotary_emb(mx.transpose(raw_q, (0, 2, 1, 3)), cos, sin),
+        (0, 2, 1, 3),
+    )
+    expected_kv = mx.transpose(
+        apply_rotary_emb(mx.transpose(raw_kv, (0, 2, 1, 3)), cos, sin),
+        (0, 2, 1, 3),
+    )
+    mx.eval(q, kv, expected_q, expected_kv)
+
+    np.testing.assert_allclose(np.asarray(q), np.asarray(expected_q), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(kv), np.asarray(expected_kv), atol=1e-6)
+    assert not np.array_equal(np.asarray(q[:, 1:]), np.asarray(raw_q[:, 1:]))
+    assert not np.array_equal(np.asarray(kv[:, 1:]), np.asarray(raw_kv[:, 1:]))

@@ -654,6 +654,11 @@ def _direct_logical_abi_alternative_payload(
 ) -> dict[str, Any]:
     """Describe the no-pack direct logical-buffer ABI alternative."""
 
+    chained_plan = None
+    chained_construction: dict[str, Any] = {
+        "status": "not_planned",
+        "reason": "direct alternative planning did not start",
+    }
     try:
         if not getattr(target, "brick_descriptors", ()):
             return {
@@ -661,6 +666,11 @@ def _direct_logical_abi_alternative_payload(
                 "physical_abi_policy": DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
                 "reason": "selected schedule target does not expose brick descriptors",
             }
+        chained_plan, chained_construction = _direct_chain_for_selected_region(
+            model=model,
+            selected_region=selected_forward_region or region,
+            already_has_backward=selected_forward_region is None,
+        )
         direct_template = make_path_c_descriptor_schedule_template(
             target.brick_descriptors,
             entry_symbol=getattr(region, "entry_symbol", None)
@@ -692,11 +702,6 @@ def _direct_logical_abi_alternative_payload(
         metal_buffer_limit_exceeded = (
             target_name == "metal"
             and kernel_parameter_count > METAL_KERNEL_BUFFER_LIMIT
-        )
-        chained_plan, chained_construction = _direct_chain_for_selected_region(
-            model=model,
-            selected_region=selected_forward_region or region,
-            already_has_backward=selected_forward_region is None,
         )
         status = (
             "blocked_metal_buffer_limit"
@@ -748,14 +753,33 @@ def _direct_logical_abi_alternative_payload(
             else [],
         }
     except Exception as exc:  # pragma: no cover - defensive receipt metadata
+        error = f"{type(exc).__name__}: {exc}"
         return {
             "status": "unavailable",
             "physical_abi_policy": DESCRIPTOR_PHYSICAL_ABI_POLICY_DIRECT,
             "reason": str(exc),
+            "error": error,
+            "logical_tensor_binding_supported": True,
+            "no_hidden_allocation_policy": True,
+            "direct_chained_fusion_plan": _direct_chained_fusion_plan_payload(
+                chained_plan
+            ),
+            "direct_chained_fusion_construction": chained_construction,
         }
 
 
 def _direct_chained_fusion_plan_payload(chain: Any) -> dict[str, Any]:
+    if chain is None:
+        return {
+            "status": "unavailable",
+            "reason": "direct chained fusion plan was not produced",
+            "max_kernel_buffers": METAL_KERNEL_BUFFER_LIMIT,
+            "segment_count": 0,
+            "covers_full_region": False,
+            "source_region_name": "",
+            "source_node_count": 0,
+            "segments": [],
+        }
     segments = []
     for segment in getattr(chain, "segments", ()):
         plan = getattr(segment, "plan", None)

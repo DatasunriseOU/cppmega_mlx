@@ -41,7 +41,11 @@ if _SCRIPTS not in sys.path:
 # _mamba3_bwd_rows_per_kernel_launch_for_nodes.
 _GOLDEN_SEGMENTS = [
     (("entry_rmsnorm", "mamba3_mimo"), "forward", "grid_chunks", 64, 23, 8),
-    (("residual_rmsnorm", "m2rnn"), "forward", "grid_chunks", 64, 20, 8),
+    # The forward M2RNN row carry has a distinct h_next state buffer.  It is
+    # initialized, consumed by post-projection, and copied back into h_state;
+    # the old 20-parameter golden predated that carry and was under-counting the
+    # real direct-buffer ABI.
+    (("residual_rmsnorm", "m2rnn"), "forward", "grid_chunks", 64, 21, 8),
     (("residual_rmsnorm",), "forward", "grid_chunks", 64, 6, 8),
     (("attention_qkv_projection",), "forward", "launcher_chunks", 64, 9, 8),
     (("sparse_mla_fp8_apply",), "forward", "launcher_chunks", 64, 12, 8),
@@ -100,6 +104,13 @@ def test_metal_autosplit_reproduces_hand_tuned_splits():
     )
     for i, (got, want) in enumerate(zip(actual, _GOLDEN_SEGMENTS)):
         assert got == want, f"seg{i}: auto-split {got} != hand-tuned {want}"
+
+    m2rnn_seg = chain.segments[1]
+    m2rnn_source = m2rnn_seg.schedule_target.schedule_template(
+        m2rnn_seg.region
+    )._cppmega_path_c_generated_source
+    assert "m2rnn_h_next" in m2rnn_source
+    assert "m2rnn_h_state" in m2rnn_source
 
 
 def test_metal_caps_drive_the_split_decisions():

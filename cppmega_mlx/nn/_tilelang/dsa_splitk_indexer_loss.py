@@ -326,6 +326,61 @@ def _is_metal(target: str) -> bool:
     return target.startswith("metal")
 
 
+def _metal_rowwise_reduction_layouts(
+    T: Any,
+    rows: int,
+    cols: int,
+    threads: int,
+) -> tuple[Any, Any]:
+    """Return compatible scalar/reducer layouts for a Metal row reduction.
+
+    TileLang's free layout search may choose a layout for ``T.Parallel(rows,
+    cols)`` whose reducer destination is not a superset of the inferred
+    ``ReduceOp`` layout.  That is legal to recover from, but it produces a
+    ``LayoutConflictException`` attempt and can leave a later Metal GEMM
+    accumulator in scalar storage.  The DSA Metal tiles have static shapes,
+    so use a replica-major lane partition: each row owns a power-of-two group
+    of lanes, while each lane owns a contiguous register slice.
+
+    The second layout is exactly the layout that ``ReduceOp`` derives from the
+    first one for ``dim=1``. Metal must fail closed when the requested shape
+    cannot be represented: falling back to TileLang's inferred reducer is the
+    layout-conflict path this helper exists to avoid.
+    """
+
+    if rows <= 0 or cols <= 0 or threads <= 0 or rows > threads:
+        raise ValueError(
+            "Metal DSA row reduction requires positive dimensions with "
+            f"rows <= threads; rows={rows}, cols={cols}, threads={threads}"
+        )
+    max_lanes = min(cols, threads // rows)
+    lanes = 1
+    while lanes * 2 <= max_lanes:
+        lanes *= 2
+    while lanes > 1 and cols % lanes != 0:
+        lanes //= 2
+    if rows * lanes > threads or cols % lanes != 0:
+        raise ValueError(
+            "Metal DSA row reduction has no compatible replica-major layout: "
+            f"rows={rows}, cols={cols}, threads={threads}"
+        )
+
+    values_per_lane = cols // lanes
+    scalar_layout = T.Fragment(
+        (rows, cols),
+        forward_fn=lambda i, j: (
+            (j // values_per_lane) * rows + i,
+            j % values_per_lane,
+        ),
+    )
+    reducer_layout = T.Fragment(
+        (rows,),
+        forward_fn=lambda i, rep: (rep * rows + i, 0),
+        replicate=lanes,
+    )
+    return scalar_layout, reducer_layout
+
+
 # ---------------------------------------------------------------------------
 # Kernel builders
 # ---------------------------------------------------------------------------
@@ -407,14 +462,24 @@ def make_dsa_splitk_stage1_kernel(
     # blocks before). The wrapper pairs compute_index_path=False with a
     # separate, smaller stage-1-idx kernel that runs only for h=0.
     COMPUTE_INDEX = bool(compute_index_path)
+    METAL = _is_metal(target)
+    if METAL:
+        ROWWISE_LAYOUT, REDUCER_LAYOUT = _metal_rowwise_reduction_layouts(
+            T, BLOCK_SQ, BLOCK_SK, threads
+        )
+    else:
+        ROWWISE_LAYOUT, REDUCER_LAYOUT = None, None
 
-    is_cuda = isinstance(target, str) and "cuda" in target
     bytes_per_elem = 2 if in_dtype in ("float16", "bfloat16") else 4
     shmem_bytes = (
         (BLOCK_SQ * BLOCK_D * bytes_per_elem) +
         (BLOCK_D * BLOCK_SK * bytes_per_elem) +
         (BLOCK_SQ * AD * bytes_per_elem)
     )
+    if METAL:
+        # Float32 bridge between the opaque SIMDgroup GEMM accumulator and the
+        # scalar fragment used by masking / online-softmax reductions.
+        shmem_bytes += BLOCK_SQ * BLOCK_SK * 4
     # Plus m_i, d_i, m_i_prev, row_max_local, row_sum_local (each BLOCK_SQ * 4 bytes)
     shmem_bytes += (BLOCK_SQ * 4 * 5)
     if COMPUTE_INDEX:
@@ -456,8 +521,21 @@ def make_dsa_splitk_stage1_kernel(
 
 
 
-            # Online-softmax fragments live in registers.
-            scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+            # Keep the Metal GEMM accumulator opaque: scalar indexing of the
+            # same fragment prevents TileLang's Metal rewrite from promoting
+            # it to ``metal.simdgroup`` and leaves an invalid scalar MMA call.
+            # Stage the opaque accumulator through shared memory before the
+            # scalar mask / softmax fragment is touched.
+            if METAL:
+                scores_gemm = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+                scores_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), "float32")
+                scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+                row_reduce_f = T.alloc_fragment((BLOCK_SQ,), "float32")
+            else:
+                scores_f = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+                scores_gemm = T.alloc_fragment((1, 1), "float32")
+                scores_shared = T.alloc_shared((1, 1), "float32")
+                row_reduce_f = T.alloc_fragment((1,), "float32")
             row_max_local = T.alloc_shared((BLOCK_SQ,), "float32")
             row_sum_local = T.alloc_shared((BLOCK_SQ,), "float32")
             m_i = T.alloc_shared((BLOCK_SQ,), "float32")
@@ -478,6 +556,19 @@ def make_dsa_splitk_stage1_kernel(
                 d1_i = T.alloc_shared((1,), "float32")
                 m1_i_prev = T.alloc_shared((1,), "float32")
                 idx_scores_f = T.alloc_fragment((1, 1), "float32")
+
+            if METAL:
+                if COMPUTE_INDEX:
+                    T.annotate_layout({
+                        scores_f: ROWWISE_LAYOUT,
+                        row_reduce_f: REDUCER_LAYOUT,
+                        idx_scores_f: ROWWISE_LAYOUT,
+                    })
+                else:
+                    T.annotate_layout({
+                        scores_f: ROWWISE_LAYOUT,
+                        row_reduce_f: REDUCER_LAYOUT,
+                    })
 
             # Initialise the index-softmax accumulators. Wave-4 perf #3:
             # only when COMPUTE_INDEX (else the stub fragments are never
@@ -531,10 +622,14 @@ def make_dsa_splitk_stage1_kernel(
                 )
             for sk_tile in T.serial(_active_sk_tiles):
                 # Initialise the score accumulator for this tile.
-                for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                    scores_f[i, j] = T.cast(0, "float32")
+                if METAL:
+                    T.fill(scores_gemm, 0)
+                else:
+                    for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                        scores_f[i, j] = T.cast(0, "float32")
 
-                # Inner D-loop: matmul Q @ K^T, accumulating into scores_f.
+                # Inner D-loop: matmul Q @ K^T, accumulating into the target's
+                # native GEMM fragment.
                 for d_tile in T.serial((AD + BLOCK_D - 1) // BLOCK_D):
                     # Wave-2 perf #5: copy from the hoisted Q_full[BLOCK_SQ, AD]
                     # shared buffer (loaded once outside the sk_tile loop)
@@ -558,7 +653,15 @@ def make_dsa_splitk_stage1_kernel(
                             K_s[dd, j] = T.cast(0, in_dtype)
 
                     # Q[BLOCK_SQ, BLOCK_D] @ K[BLOCK_D, BLOCK_SK] += scores.
-                    T.gemm(Q_s, K_s, scores_f)
+                    if METAL:
+                        T.gemm(Q_s, K_s, scores_gemm)
+                    else:
+                        T.gemm(Q_s, K_s, scores_f)
+
+                if METAL:
+                    T.copy(scores_gemm, scores_shared)
+                    T.sync_threads()
+                    T.copy(scores_shared, scores_f)
 
                 # Apply softmax scale + causal mask.
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
@@ -578,7 +681,11 @@ def make_dsa_splitk_stage1_kernel(
                         )
 
                 # Online softmax recurrence on (m_i, d_i).
-                T.reduce_max(scores_f, row_max_local, dim=1, clear=True)
+                if METAL:
+                    T.reduce_max(scores_f, row_reduce_f, dim=1, clear=True)
+                    T.copy(row_reduce_f, row_max_local)
+                else:
+                    T.reduce_max(scores_f, row_max_local, dim=1, clear=True)
                 T.sync_threads()
                 for i in T.Parallel(BLOCK_SQ):
                     m_i_prev[i] = m_i[i]
@@ -592,7 +699,11 @@ def make_dsa_splitk_stage1_kernel(
                 for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                     scores_f[i, j] = T.exp(scores_f[i, j] - m_i[i])
 
-                T.reduce_sum(scores_f, row_sum_local, dim=1, clear=True)
+                if METAL:
+                    T.reduce_sum(scores_f, row_reduce_f, dim=1, clear=True)
+                    T.copy(row_reduce_f, row_sum_local)
+                else:
+                    T.reduce_sum(scores_f, row_sum_local, dim=1, clear=True)
                 T.sync_threads()
                 for i in T.Parallel(BLOCK_SQ):
                     d_i[i] = d_i[i] * T.exp(m_i_prev[i] - m_i[i]) + row_sum_local[i]
@@ -633,7 +744,11 @@ def make_dsa_splitk_stage1_kernel(
                                 T.cast(-3.4028234663852886e38, "float32")
                             )
 
-                    T.reduce_max(idx_scores_f, row_max_local, dim=1, clear=True)
+                    if METAL:
+                        T.reduce_max(idx_scores_f, row_reduce_f, dim=1, clear=True)
+                        T.copy(row_reduce_f, row_max_local)
+                    else:
+                        T.reduce_max(idx_scores_f, row_max_local, dim=1, clear=True)
                     T.sync_threads()
                     for i in T.Parallel(BLOCK_SQ):
                         m1_i_prev[i] = m1_i[i]
@@ -645,7 +760,11 @@ def make_dsa_splitk_stage1_kernel(
 
                     for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
                         idx_scores_f[i, j] = T.exp(idx_scores_f[i, j] - m1_i[i])
-                    T.reduce_sum(idx_scores_f, row_sum_local, dim=1, clear=True)
+                    if METAL:
+                        T.reduce_sum(idx_scores_f, row_reduce_f, dim=1, clear=True)
+                        T.copy(row_reduce_f, row_sum_local)
+                    else:
+                        T.reduce_sum(idx_scores_f, row_sum_local, dim=1, clear=True)
                     T.sync_threads()
                     for i in T.Parallel(BLOCK_SQ):
                         d1_i[i] = d1_i[i] * T.exp(m1_i_prev[i] - m1_i[i]) + row_sum_local[i]
@@ -790,6 +909,7 @@ def _can_use_q_cache_v5(
 # pick the largest power-of-two BLOCK_SQ that fits the per-target
 # budget instead of bouncing the kernel back to wave-4 wholesale.
 _Q_CACHE_TILE_BLOCK_SQ_CHOICES: tuple[int, ...] = (64, 32, 16, 8)
+_METAL_DSA_MAX_REDUCTION_BLOCK_SQ = 32
 
 
 def _can_use_q_cache_v5_tiled(
@@ -808,7 +928,18 @@ def _can_use_q_cache_v5_tiled(
     """
 
     budget = _q_cache_budget_bytes(target)
-    for block_sq in _Q_CACHE_TILE_BLOCK_SQ_CHOICES:
+    choices = _Q_CACHE_TILE_BLOCK_SQ_CHOICES
+    if target.startswith("metal"):
+        # The current Apple TileLang reducer lowering is numerically wrong for
+        # 64-row fragments even when the shared-memory budget says they fit.
+        # Keep the schedule deterministic and correct until that native
+        # lowering is fixed; CUDA retains the larger candidate set.
+        choices = tuple(
+            block_sq
+            for block_sq in choices
+            if block_sq <= _METAL_DSA_MAX_REDUCTION_BLOCK_SQ
+        )
+    for block_sq in choices:
         nbytes = _q_cache_bytes(block_sq, AH, AD, in_dtype)
         if nbytes is None:
             # Out-of-range / overflowing dimensions — skip and try next tile.
@@ -879,6 +1010,13 @@ def make_dsa_splitk_stage2_kernel(
     SCALE = float(softmax_scale)
     SPARSE = bool(sparse_loss)
     INV_AH = 1.0 / float(AH)
+    METAL = _is_metal(target)
+    if METAL:
+        ROWWISE_LAYOUT, REDUCER_LAYOUT = _metal_rowwise_reduction_layouts(
+            T, BLOCK_SQ, BLOCK_SK, threads
+        )
+    else:
+        ROWWISE_LAYOUT, REDUCER_LAYOUT = None, None
     # Wave-1b fix-round-2 (HIGH perf): the M_pre/D_pre fragments are
     # `(AH, BLOCK_SQ)` fp32 == AH*BLOCK_SQ*4 bytes each, total 8*AH*BLOCK_SQ
     # bytes per thread block. At AH=128, BLOCK_SQ=128 (CUDA worst case)
@@ -892,13 +1030,14 @@ def make_dsa_splitk_stage2_kernel(
     _MD_PRE_BYTES = 8 * AH * BLOCK_SQ
     USE_MD_PRE = _MD_PRE_BYTES <= _MD_PRE_BUDGET_BYTES
 
-    is_cuda = isinstance(target, str) and "cuda" in target
     bytes_per_elem = 2 if in_dtype in ("float16", "bfloat16") else 4
     shmem_bytes = (
         (BLOCK_SQ * BLOCK_D * bytes_per_elem) +
         (BLOCK_D * BLOCK_SK * bytes_per_elem) +
         (BLOCK_SQ * AD * bytes_per_elem)
     )
+    if METAL:
+        shmem_bytes += BLOCK_SQ * BLOCK_SK * 4
     if use_q_cache_v5:
         shmem_bytes += (AH * BLOCK_SQ * AD * bytes_per_elem)
     else:
@@ -960,11 +1099,29 @@ def make_dsa_splitk_stage2_kernel(
             else:
                 Q_all_heads = T.alloc_shared((1, 1, 1), in_dtype)
 
-            h_scores = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+            if METAL:
+                h_scores_gemm = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+                h_scores_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), "float32")
+                h_scores = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+                row_reduce_f = T.alloc_fragment((BLOCK_SQ,), "float32")
+            else:
+                h_scores = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
+                h_scores_gemm = T.alloc_fragment((1, 1), "float32")
+                h_scores_shared = T.alloc_shared((1, 1), "float32")
+                row_reduce_f = T.alloc_fragment((1,), "float32")
             softmax_attn = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             softmax_idx = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             kl_term = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), "float32")
             row_sum_local = T.alloc_shared((BLOCK_SQ,), "float32")
+
+            if METAL:
+                T.annotate_layout({
+                    h_scores: ROWWISE_LAYOUT,
+                    softmax_attn: ROWWISE_LAYOUT,
+                    softmax_idx: ROWWISE_LAYOUT,
+                    kl_term: ROWWISE_LAYOUT,
+                    row_reduce_f: REDUCER_LAYOUT,
+                })
 
             m1_local = T.alloc_shared((BLOCK_SQ,), "float32")
             d1_local = T.alloc_shared((BLOCK_SQ,), "float32")
@@ -1078,8 +1235,11 @@ def make_dsa_splitk_stage2_kernel(
                 # Per-head: recompute Q@K^T, scale, mask, exp/d_h.
                 for h in T.serial(AH):
                     # Initialise score accumulator.
-                    for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
-                        h_scores[i, j] = T.cast(0, "float32")
+                    if METAL:
+                        T.fill(h_scores_gemm, 0)
+                    else:
+                        for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                            h_scores[i, j] = T.cast(0, "float32")
 
                     # Wave-3 P1: partial Q hoist (load BLOCK_SQ x AD slab for
                     # this (sq_block, h) once per (sk_tile, h) -- inner d_tile
@@ -1115,7 +1275,15 @@ def make_dsa_splitk_stage2_kernel(
                             else:
                                 K_s[dd, j] = T.cast(0, in_dtype)
 
-                        T.gemm(Q_s, K_s, h_scores)
+                        if METAL:
+                            T.gemm(Q_s, K_s, h_scores_gemm)
+                        else:
+                            T.gemm(Q_s, K_s, h_scores)
+
+                    if METAL:
+                        T.copy(h_scores_gemm, h_scores_shared)
+                        T.sync_threads()
+                        T.copy(h_scores_shared, h_scores)
 
                     # Wave-2 perf #5: copy from the hoisted M_pre/D_pre
                     # fragments (loaded once outside the sk_tile loop) instead
@@ -1218,7 +1386,11 @@ def make_dsa_splitk_stage2_kernel(
                         T.cast(0, "float32")
                     )
 
-                T.reduce_sum(kl_term, row_sum_local, dim=1, clear=True)
+                if METAL:
+                    T.reduce_sum(kl_term, row_reduce_f, dim=1, clear=True)
+                    T.copy(row_reduce_f, row_sum_local)
+                else:
+                    T.reduce_sum(kl_term, row_sum_local, dim=1, clear=True)
                 T.sync_threads()
                 for i in T.Parallel(BLOCK_SQ):
                     loss_i[i] = loss_i[i] + row_sum_local[i]

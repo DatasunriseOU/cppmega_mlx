@@ -17,12 +17,12 @@ propagates the builder's RAISE — no silent skip / re-draw.
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Iterable, Iterator, Mapping
 from enum import Enum
 from typing import Callable
 
-from cppmega_mlx.data.ast_fim import InstructionEncoder
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.fim import FIMSpecialTokenInput
@@ -31,6 +31,7 @@ from cppmega_mlx.training.objectives import (
     build_ast_fim,
     build_causal_lm,
     build_commit_diff,
+    build_fim,
     build_ifim,
     build_pre_to_post,
     build_recovery,
@@ -43,6 +44,7 @@ class TaskKind(str, Enum):
     """The Stage-1 training objectives the mixer can draw."""
 
     CAUSAL_LM = "causal_lm"
+    FIM = "fim"
     AST_FIM = "ast_fim"
     IFIM = "ifim"
     COMMIT_DIFF = "commit_diff"
@@ -53,11 +55,12 @@ class TaskKind(str, Enum):
 
 
 # Stage-1 default mix.  The four research-grounded "buckets" are causal_lm 0.5,
-# ast_fim/ifim 0.2, commit 0.2, recovery 0.1; we split each bucket evenly across
-# its member TaskKinds so the bucket totals match the spec exactly.
+# fim/ast_fim/ifim 0.2, commit 0.2, recovery 0.1. Plain FIM and AST-FIM split
+# half of the FIM bucket while true typed IFIM keeps the other half.
 STAGE1_DEFAULT_RATES: dict[TaskKind, float] = {
     TaskKind.CAUSAL_LM: 0.5,
-    TaskKind.AST_FIM: 0.1,
+    TaskKind.FIM: 0.05,
+    TaskKind.AST_FIM: 0.05,
     TaskKind.IFIM: 0.1,
     TaskKind.COMMIT_DIFF: 0.1,
     TaskKind.PRE_TO_POST: 0.1,
@@ -74,6 +77,7 @@ STAGE_RATES: dict[str, dict[TaskKind, float]] = {
 _CODE_TASKS = frozenset(
     {
         TaskKind.CAUSAL_LM,
+        TaskKind.FIM,
         TaskKind.AST_FIM,
         TaskKind.IFIM,
         TaskKind.SYMBOL_RECOVERY,
@@ -111,9 +115,14 @@ def normalize_rates(
     canonical: dict[TaskKind, float] = {}
     for key, value in rates.items():
         task = key if isinstance(key, TaskKind) else TaskKind(key)
-        if value < 0.0:
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(
+                f"task rate for {task.value!r} must be finite: {value}"
+            )
+        if numeric < 0.0:
             raise ValueError(f"task rate for {task.value!r} is negative: {value}")
-        canonical[task] = canonical.get(task, 0.0) + float(value)
+        canonical[task] = canonical.get(task, 0.0) + numeric
 
     if not canonical:
         raise ValueError("task rate map is empty")
@@ -124,7 +133,11 @@ def normalize_rates(
             f"task rates must sum to 1.0 (within {_RATE_SUM_TOL}); got {total} "
             f"for {{ {', '.join(f'{k.value}={v}' for k, v in canonical.items())} }}"
         )
-    return canonical
+    return {
+        task: canonical[task]
+        for task in TaskKind
+        if task in canonical
+    }
 
 
 class TaskMixer:
@@ -141,7 +154,6 @@ class TaskMixer:
         *,
         seed: int,
         stage: str = "stage1",
-        instruction_encoder: InstructionEncoder | None = None,
         special_token_ids: FIMSpecialTokenInput = None,
         spm_rate: float = 0.5,
     ) -> None:
@@ -151,7 +163,6 @@ class TaskMixer:
         self._tasks = list(self._rates.keys())
         self._weights = [self._rates[t] for t in self._tasks]
         self._seed = seed
-        self._instruction_encoder = instruction_encoder
         self._special_token_ids = special_token_ids
         self._spm_rate = spm_rate
 
@@ -196,22 +207,24 @@ class TaskMixer:
 
         if task is TaskKind.CAUSAL_LM:
             return build_causal_lm(packet)
-        if task is TaskKind.AST_FIM:
-            return build_ast_fim(
+        if task is TaskKind.FIM:
+            return build_fim(
                 packet,
                 rng=rng,
                 spm_rate=self._spm_rate,
                 special_token_ids=self._special_token_ids,
             )
+        if task is TaskKind.AST_FIM:
+            return build_ast_fim(
+                packet,
+                rng=rng,
+                spm_rate=self._spm_rate,
+                ast_fim_rate=1.0,
+                special_token_ids=self._special_token_ids,
+            )
         if task is TaskKind.IFIM:
-            if self._instruction_encoder is None:
-                raise ValueError(
-                    "TaskMixer drew IFIM but no instruction_encoder was provided; "
-                    "supply one or set the IFIM rate to 0"
-                )
             return build_ifim(
                 packet,
-                instruction_encoder=self._instruction_encoder,
                 rng=rng,
                 spm_rate=self._spm_rate,
                 special_token_ids=self._special_token_ids,
@@ -221,7 +234,12 @@ class TaskMixer:
         if task is TaskKind.PRE_TO_POST:
             return build_pre_to_post(packet, special_token_ids=self._special_token_ids)
         # Recovery family.
-        return build_recovery(packet, kind=_RECOVERY_KIND[task], rng=rng)
+        return build_recovery(
+            packet,
+            kind=_RECOVERY_KIND[task],
+            rng=rng,
+            special_token_ids=self._special_token_ids,
+        )
 
     def mix(
         self,

@@ -6,12 +6,15 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
+from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.nn.code_graph_routes import (
     CodeGraphRouter,
     GraphRouteConfig,
     build_attention_bias,
     build_block_candidates,
+    build_token_attention_bias,
+    build_token_graph_biases,
 )
 
 
@@ -102,3 +105,179 @@ def test_router_and_config_mutually_exclusive():
     router = CodeGraphRouter(GraphRouteConfig(num_blocks=4, relations=("call",)))
     with pytest.raises(ValueError):
         build_attention_bias(pkt, router=router, config=GraphRouteConfig())
+
+
+def test_token_attention_bias_expands_chunks_and_routes_domain_tokens():
+    graph = GraphPacket(
+        edges={
+            "call": EdgeIndex.from_pairs([[1, 0]], relation="call", num_nodes=2),
+            "domain": EdgeIndex.from_pairs(
+                [[3, 0]], relation="domain", num_nodes=4
+            ),
+        },
+        num_nodes=2,
+    )
+    graph_batch = GraphBatch(
+        graphs=(graph,),
+        chunk_starts=(mx.array([0, 2], dtype=mx.int32),),
+        chunk_ends=(mx.array([2, 4], dtype=mx.int32),),
+    )
+
+    bias = build_token_attention_bias(
+        graph_batch,
+        batch_size=1,
+        seq_length=4,
+    )
+    mx.eval(bias)
+    actual = np.asarray(bias)[0]
+
+    expected_block = np.ones((2, 2))
+    expected_block[1, 0] = 2.0
+    np.testing.assert_array_equal(actual[2:4, 0:2], expected_block)
+    assert actual[3, 0] == 2.0
+    assert actual.sum() == 5.0
+
+
+def test_token_attention_bias_rejects_invalid_chunk_and_token_endpoints():
+    starts = (mx.array([0, 2], dtype=mx.int32),)
+    ends = (mx.array([2, 4], dtype=mx.int32),)
+    invalid_call = GraphBatch(
+        graphs=(
+            GraphPacket(
+                edges={
+                    "call": EdgeIndex.from_pairs(
+                        [[2, 0]], relation="call", num_nodes=2
+                    )
+                },
+                num_nodes=2,
+            ),
+        ),
+        chunk_starts=starts,
+        chunk_ends=ends,
+    )
+    with pytest.raises(ValueError, match="graph call edge.*out of range"):
+        build_token_attention_bias(invalid_call, batch_size=1, seq_length=4)
+
+    invalid_domain = GraphBatch(
+        graphs=(
+            GraphPacket(
+                edges={
+                    "domain": EdgeIndex.from_pairs(
+                        [[4, 0]], relation="domain", num_nodes=4
+                    )
+                },
+                num_nodes=2,
+            ),
+        ),
+        chunk_starts=starts,
+        chunk_ends=ends,
+    )
+    with pytest.raises(ValueError, match="graph domain edge.*out of range"):
+        build_token_attention_bias(invalid_domain, batch_size=1, seq_length=4)
+
+
+def test_token_graph_bias_carries_edge_kind_as_a_separate_fixed_shape_prior() -> None:
+    graph_batch = GraphBatch(
+        graphs=(
+            GraphPacket(
+                edges={
+                    "domain": EdgeIndex.from_pairs(
+                        [[3, 0]], relation="domain", num_nodes=4
+                    )
+                },
+                num_nodes=2,
+            ),
+        ),
+        chunk_starts=(mx.array([0, 2], dtype=mx.int32),),
+        chunk_ends=(mx.array([2, 4], dtype=mx.int32),),
+        edge_kinds=(
+            {
+                "domain": mx.array(
+                    [int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)], dtype=mx.int32
+                )
+            },
+        ),
+    )
+
+    relation_bias, kind_bias = build_token_graph_biases(
+        graph_batch,
+        batch_size=1,
+        seq_length=4,
+    )
+    combined = build_token_attention_bias(
+        graph_batch,
+        batch_size=1,
+        seq_length=4,
+    )
+    mx.eval(relation_bias, kind_bias, combined)
+
+    assert float(relation_bias[0, 3, 0].item()) == 1.0
+    assert float(kind_bias[0, 3, 0].item()) == 1.0
+    assert float(combined[0, 3, 0].item()) == 2.0
+
+
+def test_graph_batch_input_alignment_preserves_matching_edge_kinds() -> None:
+    graph_batch = GraphBatch(
+        graphs=(
+            GraphPacket(
+                edges={
+                    "domain": EdgeIndex.from_pairs(
+                        [[1, 0], [3, 0]], relation="domain", num_nodes=4
+                    )
+                },
+                num_nodes=2,
+            ),
+        ),
+        chunk_starts=(mx.array([0, 2], dtype=mx.int32),),
+        chunk_ends=(mx.array([2, 4], dtype=mx.int32),),
+        edge_kinds=(
+            {
+                "domain": mx.array(
+                    [
+                        int(DomainEdgeKind.BUILD_TARGET_DEP),
+                        int(DomainEdgeKind.DIAG_PRIMARY_LOCATION),
+                    ],
+                    dtype=mx.int32,
+                )
+            },
+        ),
+    )
+
+    aligned = graph_batch.input_aligned(
+        source_sequence_length=4,
+        input_sequence_length=3,
+    )
+
+    assert aligned.graphs[0].edge("domain").to_pairs() == [(1, 0)]
+    np.testing.assert_array_equal(
+        np.asarray(aligned.edge_kinds[0]["domain"]),
+        [int(DomainEdgeKind.BUILD_TARGET_DEP)],
+    )
+
+
+def test_graph_batch_rejects_kind_length_mismatch_and_unknown_kind() -> None:
+    graph = GraphPacket(
+        edges={
+            "domain": EdgeIndex.from_pairs(
+                [[3, 0]], relation="domain", num_nodes=4
+            )
+        },
+        num_nodes=2,
+    )
+    kwargs = {
+        "graphs": (graph,),
+        "chunk_starts": (mx.array([0, 2], dtype=mx.int32),),
+        "chunk_ends": (mx.array([2, 4], dtype=mx.int32),),
+    }
+    with pytest.raises(ValueError, match="edge_kinds.*edge count"):
+        GraphBatch(
+            **kwargs,
+            edge_kinds=({"domain": mx.array([], dtype=mx.int32)},),
+        )
+
+    graph_batch = GraphBatch(
+        **kwargs,
+        edge_kinds=({"domain": mx.array([999], dtype=mx.int32)},),
+    )
+    with pytest.raises(ValueError, match="unsupported edge kind"):
+        build_token_graph_biases(graph_batch, batch_size=1, seq_length=4)

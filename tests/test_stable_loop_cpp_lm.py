@@ -10,7 +10,9 @@ import pytest
 from cppmega_mlx.models.stable_loop_cpp_lm import (
     StableLoopCppLM,
     StableLoopCppLMConfig,
+    StableLoopCppLMInferenceResult,
 )
+from cppmega_mlx.nn.stable_loop import FixedPointConvergenceError
 from cppmega_mlx.training.fixed_point import truncated_bptt_step
 
 
@@ -56,6 +58,39 @@ def test_inference_fixed_point_mode_runs():
     mx.eval(logits)
     assert logits.shape == (1, 4, cfg.vocab_size)
     assert mx.isfinite(logits).all().item()
+
+
+def test_inference_api_preserves_convergence_result():
+    model = StableLoopCppLM(_tiny_config(tau=10.0, max_loops=2))
+    ids = mx.array([[1, 2, 3, 4]])
+
+    result = model(ids, training_loops=-1, return_convergence=True)
+    mx.eval(result.logits, result.state)
+
+    assert isinstance(result, StableLoopCppLMInferenceResult)
+    assert result.convergence.converged is True
+    assert result.convergence.steps == 1
+    assert result.state is result.convergence.state
+    assert result.logits.shape == (1, 4, model.config.vocab_size)
+
+
+def test_inference_api_is_strict_unless_best_effort_is_explicit():
+    mx.random.seed(17)
+    model = StableLoopCppLM(_tiny_config(tau=1e-30, max_loops=1))
+    ids = mx.array([[1, 2, 3, 4]])
+
+    with pytest.raises(FixedPointConvergenceError):
+        model(ids, training_loops=-1)
+
+    result = model(
+        ids,
+        training_loops=-1,
+        return_convergence=True,
+        best_effort=True,
+    )
+    assert isinstance(result, StableLoopCppLMInferenceResult)
+    assert result.convergence.converged is False
+    assert result.convergence.steps == 1
 
 
 def _loss_fn(logits: mx.array, targets: mx.array) -> mx.array:
@@ -156,9 +191,57 @@ def test_multiple_windows_deep_supervision_sums_losses():
 
     x = model.run_prelude(model.embed(inputs), mask)
     result = truncated_bptt_step(
-        model.loop, model, x, x, head, targets, _loss_fn, optimizer, mask,
-        window=2, num_windows=3,
+        model.loop,
+        model,
+        x,
+        x,
+        head,
+        targets,
+        _loss_fn,
+        optimizer,
+        mask,
+        window=2,
+        num_windows=3,
     )
     assert result["num_windows"] == 3
     assert len(result["window_losses"]) == 3
     assert result["loss"] == pytest.approx(sum(result["window_losses"]), rel=1e-5)
+    assert result["optimizer_updates"] == 3
+    assert result["loop_iterations"] == 6
+    assert result["bptt_horizon"] == 2
+    assert result["schedule"] == "online_per_window"
+
+
+def test_truncated_bptt_carries_each_window_endpoint_without_double_advance():
+    cfg = _tiny_config(train_loops=2)
+    model = StableLoopCppLM(cfg)
+    ids = mx.array([[1, 2, 3, 4]])
+    targets = mx.array([[2, 3, 4, 5]])
+    mask = model._causal_mask(ids.shape[1], mx.float32)
+    x = model.run_prelude(model.embed(ids), mask)
+    optimizer = optim.SGD(learning_rate=0.0)
+
+    def head(z):
+        return model.head(z, mask)
+
+    expected_state = model.loop.forward(x, x, mask, training_loops=6)
+    result = truncated_bptt_step(
+        model.loop,
+        model,
+        x,
+        x,
+        head,
+        targets,
+        _loss_fn,
+        optimizer,
+        mask,
+        window=2,
+        num_windows=3,
+    )
+    mx.eval(expected_state, result["final_state"], optimizer.state)
+
+    assert int(optimizer.state["step"].item()) == 3
+    assert result["optimizer_updates"] == 3
+    assert result["loop_iterations"] == 6
+    assert result["bptt_horizon"] == 2
+    assert mx.allclose(result["final_state"], expected_state, atol=1e-6).item()

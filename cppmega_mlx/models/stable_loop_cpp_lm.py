@@ -23,7 +23,10 @@ from dataclasses import asdict, dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from cppmega_mlx.nn.stable_loop import StableFixedPointLoop
+from cppmega_mlx.nn.stable_loop import (
+    FixedPointConvergenceResult,
+    StableFixedPointLoop,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,7 @@ class StableLoopCppLMConfig:
     # FPRM loop hyper-parameters (paper defaults).
     a1_init: float = 0.75
     a2_init: float = 0.25
+    gate_margin: float = 1e-4
     tau: float = 0.1
     max_loops: int = 32
     train_loops: int = 4
@@ -66,6 +70,18 @@ class StableLoopCppLMConfig:
 
     def to_dict(self) -> dict[str, int | float]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class StableLoopCppLMInferenceResult:
+    """LM logits paired with the fixed-point convergence evidence."""
+
+    logits: mx.array
+    convergence: FixedPointConvergenceResult
+
+    @property
+    def state(self) -> mx.array:
+        return self.convergence.state
 
 
 class SwiGLUMLP(nn.Module):
@@ -170,6 +186,7 @@ class StableLoopCppLM(nn.Module):
             n_sublayers=cfg.n_sublayers,
             a1_init=cfg.a1_init,
             a2_init=cfg.a2_init,
+            gate_margin=cfg.gate_margin,
             tau=cfg.tau,
             max_loops=cfg.max_loops,
         )
@@ -180,9 +197,7 @@ class StableLoopCppLM(nn.Module):
 
     def embed(self, input_ids: mx.array) -> mx.array:
         if input_ids.ndim != 2:
-            raise ValueError(
-                f"input_ids must be shaped (B, S), got {input_ids.shape}"
-            )
+            raise ValueError(f"input_ids must be shaped (B, S), got {input_ids.shape}")
         seq_length = input_ids.shape[1]
         if seq_length > self.config.max_seq_length:
             raise ValueError(
@@ -213,14 +228,29 @@ class StableLoopCppLM(nn.Module):
         *,
         training_loops: int | None = None,
         return_state: bool = False,
-    ) -> mx.array | tuple[mx.array, mx.array]:
+        return_convergence: bool = False,
+        best_effort: bool = False,
+    ) -> mx.array | tuple[mx.array, mx.array] | StableLoopCppLMInferenceResult:
         """Full forward returning logits ``(B, S, vocab)``.
 
         ``training_loops`` overrides the loop schedule. When ``None`` the model
         runs ``config.train_loops`` fixed iterations (fully differentiable).
         Pass ``training_loops=-1`` to request inference fixed-point + FPOPT
-        halting instead.
+        halting instead. In inference, ``return_convergence=True`` returns a
+        :class:`StableLoopCppLMInferenceResult` so convergence evidence is not
+        discarded. ``best_effort=True`` explicitly permits that result to be
+        non-converged; exhaustion raises by default.
         """
+        inference_requested = training_loops is not None and training_loops < 0
+        if return_convergence and not inference_requested:
+            raise ValueError(
+                "return_convergence requires fixed-point inference (training_loops < 0)"
+            )
+        if best_effort and not inference_requested:
+            raise ValueError(
+                "best_effort requires fixed-point inference (training_loops < 0)"
+            )
+
         seq_length = input_ids.shape[1]
         hidden = self.embed(input_ids)
         mask = self._causal_mask(seq_length, hidden.dtype)
@@ -228,13 +258,41 @@ class StableLoopCppLM(nn.Module):
 
         # x is the injected input to the iteration mix; z0 starts at x.
         x = hidden
-        if training_loops is not None and training_loops < 0:
-            z = self.loop.forward(x, x, mask, training_loops=None)
+        convergence: FixedPointConvergenceResult | None = None
+        if inference_requested:
+            loop_result = self.loop.forward(
+                x,
+                x,
+                mask,
+                training_loops=None,
+                return_convergence=True,
+                best_effort=best_effort,
+            )
+            if not isinstance(loop_result, FixedPointConvergenceResult):
+                raise TypeError(
+                    "StableLoopCppLM fixed-point inference must return "
+                    "FixedPointConvergenceResult"
+                )
+            convergence = loop_result
+            z = convergence.state
         else:
-            loops = training_loops if training_loops is not None else self.config.train_loops
+            loops = (
+                training_loops
+                if training_loops is not None
+                else self.config.train_loops
+            )
             z = self.loop.forward(x, x, mask, training_loops=loops)
 
         logits = self.head(z, mask)
+        if return_convergence:
+            if convergence is None:
+                raise RuntimeError(
+                    "StableLoopCppLM convergence result missing after inference"
+                )
+            return StableLoopCppLMInferenceResult(
+                logits=logits,
+                convergence=convergence,
+            )
         if return_state:
             return logits, z
         return logits
@@ -245,5 +303,6 @@ __all__ = [
     "RouteCore",
     "StableLoopCppLM",
     "StableLoopCppLMConfig",
+    "StableLoopCppLMInferenceResult",
     "SwiGLUMLP",
 ]

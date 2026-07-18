@@ -15,6 +15,7 @@ from typing import TypeAlias
 from typing import Literal
 
 from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_TOKEN_IDS,
     REQUIRED_SPECIAL_TOKEN_IDS,
     SpecialTokenMapping,
     validate_required_special_token_ids,
@@ -25,9 +26,45 @@ FIM_MIDDLE_ID = REQUIRED_SPECIAL_TOKEN_IDS["FIM_MIDDLE"]
 FIM_SUFFIX_ID = REQUIRED_SPECIAL_TOKEN_IDS["FIM_SUFFIX"]
 FIM_INSTRUCTION_ID = REQUIRED_SPECIAL_TOKEN_IDS["FIM_INSTRUCTION"]
 EOT_ID = REQUIRED_SPECIAL_TOKEN_IDS["EOT"]
+BOS_ID = REQUIRED_SPECIAL_TOKEN_IDS["BOS"]
+INSERTED_TOKEN_SOURCE_INDEX = -1
 
 FIMMode = Literal["psm", "spm"]
 FIMSpecialTokenInput: TypeAlias = "FIMSpecialTokenIds | SpecialTokenMapping | None"
+
+
+class UnsupportedDomainDelimiterStructureError(ValueError):
+    """A source document cannot be permuted without corrupting domain nesting."""
+
+
+@dataclass(frozen=True)
+class DomainPreservingFIMRegion:
+    """The only token interval that a FIM transform may reorder."""
+
+    content_start: int
+    content_end: int
+    outer_start: int | None
+    outer_end: int | None
+
+
+@dataclass(frozen=True)
+class FIMPermutationWithProvenance:
+    """A FIM sequence plus its exact output-token to source-token index map."""
+
+    token_ids: list[int]
+    source_token_indices: list[int]
+
+
+_DOMAIN_START_TO_END = {
+    token_id: DOMAIN_DELIMITER_TOKEN_IDS[f"{role.removesuffix('_START')}_END"]
+    for role, token_id in DOMAIN_DELIMITER_TOKEN_IDS.items()
+    if role.endswith("_START")
+}
+_DOMAIN_END_IDS = {
+    token_id
+    for role, token_id in DOMAIN_DELIMITER_TOKEN_IDS.items()
+    if role.endswith("_END")
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +112,239 @@ class FIMSpecialTokenIds:
 
 
 FIM_SPECIAL_TOKEN_IDS = FIMSpecialTokenIds()
+
+
+def domain_preserving_fim_region(
+    token_ids: Sequence[int],
+    *,
+    where: str,
+) -> DomainPreservingFIMRegion:
+    """Return the delimiter-free interval that may be permuted.
+
+    One balanced top-level domain pair is supported. Tokens outside that pair,
+    including a leading BOS or trailing EOT, remain fixed. Nested, repeated,
+    unmatched, and crossing pairs are rejected because moving their contents
+    independently would make the domain stack ambiguous.
+    """
+
+    tokens = [int(token_id) for token_id in token_ids]
+    opened: tuple[int, int, int] | None = None
+    pair: tuple[int, int] | None = None
+    for index, token_id in enumerate(tokens):
+        expected_end = _DOMAIN_START_TO_END.get(token_id)
+        if expected_end is not None:
+            if opened is not None:
+                raise UnsupportedDomainDelimiterStructureError(
+                    f"{where}: nested domain delimiters are unsupported; opener "
+                    f"{token_id} at token {index} is inside opener {opened[0]} at "
+                    f"token {opened[2]}"
+                )
+            if pair is not None:
+                raise UnsupportedDomainDelimiterStructureError(
+                    f"{where}: multiple top-level domain delimiter pairs are "
+                    "unsupported"
+                )
+            opened = (token_id, expected_end, index)
+            continue
+        if token_id not in _DOMAIN_END_IDS:
+            continue
+        if opened is None:
+            raise UnsupportedDomainDelimiterStructureError(
+                f"{where}: unmatched/crossing domain closer {token_id} at token {index}"
+            )
+        opener_id, expected_end, opener_index = opened
+        if token_id != expected_end:
+            raise UnsupportedDomainDelimiterStructureError(
+                f"{where}: crossing/mismatched domain pair opens with {opener_id} "
+                f"at token {opener_index} but closes with {token_id} at token "
+                f"{index}; expected {expected_end}"
+            )
+        pair = (opener_index, index)
+        opened = None
+
+    if opened is not None:
+        raise UnsupportedDomainDelimiterStructureError(
+            f"{where}: unclosed domain opener {opened[0]} at token {opened[2]}; "
+            f"expected closer {opened[1]}"
+        )
+    if pair is not None:
+        outer_start, outer_end = pair
+        return DomainPreservingFIMRegion(
+            content_start=outer_start + 1,
+            content_end=outer_end,
+            outer_start=outer_start,
+            outer_end=outer_end,
+        )
+
+    content_start = 1 if tokens and tokens[0] == BOS_ID else 0
+    content_end = len(tokens)
+    if content_end > content_start and tokens[-1] == EOT_ID:
+        content_end -= 1
+    return DomainPreservingFIMRegion(
+        content_start=content_start,
+        content_end=content_end,
+        outer_start=None,
+        outer_end=None,
+    )
+
+
+def fim_permutation_source_indices(
+    source_token_indices: Sequence[int],
+    *,
+    span: tuple[int, int],
+    mode: FIMMode,
+    allow_empty_context: bool = False,
+) -> list[int]:
+    """Apply the FIM permutation to source indices, using -1 for insertions."""
+
+    _validate_fim_mode(mode)
+    start, end = span
+    if allow_empty_context:
+        if not 0 <= start < end <= len(source_token_indices):
+            raise ValueError(
+                "recovery span must satisfy 0 <= start < end <= len(token_ids)"
+            )
+    else:
+        _validate_middle_span(len(source_token_indices), start, end)
+    source = [int(index) for index in source_token_indices]
+    if any(index < 0 for index in source):
+        raise ValueError(
+            "source_token_indices must contain non-negative source indices"
+        )
+    prefix = source[:start]
+    middle = source[start:end]
+    suffix = source[end:]
+    if mode == "psm":
+        return [
+            INSERTED_TOKEN_SOURCE_INDEX,
+            *prefix,
+            INSERTED_TOKEN_SOURCE_INDEX,
+            *suffix,
+            INSERTED_TOKEN_SOURCE_INDEX,
+            *middle,
+            INSERTED_TOKEN_SOURCE_INDEX,
+        ]
+    return [
+        INSERTED_TOKEN_SOURCE_INDEX,
+        INSERTED_TOKEN_SOURCE_INDEX,
+        *suffix,
+        INSERTED_TOKEN_SOURCE_INDEX,
+        *prefix,
+        *middle,
+        INSERTED_TOKEN_SOURCE_INDEX,
+    ]
+
+
+def apply_domain_preserving_fim_permutation(
+    token_ids: Sequence[int],
+    *,
+    source_start: int,
+    span: tuple[int, int],
+    mode: FIMMode,
+    instruction_token_ids: Sequence[int] | None = None,
+    special_token_ids: FIMSpecialTokenInput = None,
+    where: str = "fim",
+    allow_empty_context: bool = False,
+) -> FIMPermutationWithProvenance:
+    """Permute only a balanced domain wrapper's interior and retain provenance."""
+
+    tokens = [int(token_id) for token_id in token_ids]
+    region = domain_preserving_fim_region(tokens, where=where)
+    content = tokens[region.content_start : region.content_end]
+    source_indices = list(
+        range(
+            source_start + region.content_start,
+            source_start + region.content_end,
+        )
+    )
+    if instruction_token_ids is None:
+        if allow_empty_context:
+            _validate_fim_mode(mode)
+            start, end = span
+            if not 0 <= start < end <= len(content):
+                raise ValueError(
+                    "recovery span must satisfy 0 <= start < end <= len(token_ids)"
+                )
+            ids = _resolve_special_token_ids(special_token_ids)
+            prefix = content[:start]
+            middle = content[start:end]
+            suffix = content[end:]
+            if mode == "psm":
+                permuted = [
+                    ids.fim_prefix,
+                    *prefix,
+                    ids.fim_suffix,
+                    *suffix,
+                    ids.fim_middle,
+                    *middle,
+                    ids.eot,
+                ]
+            else:
+                permuted = [
+                    ids.fim_prefix,
+                    ids.fim_suffix,
+                    *suffix,
+                    ids.fim_middle,
+                    *prefix,
+                    *middle,
+                    ids.eot,
+                ]
+        else:
+            permuted = apply_fim_permutation(
+                content,
+                span=span,
+                mode=mode,
+                special_token_ids=special_token_ids,
+            )
+        source_map = fim_permutation_source_indices(
+            source_indices,
+            span=span,
+            mode=mode,
+            allow_empty_context=allow_empty_context,
+        )
+    else:
+        if allow_empty_context:
+            raise ValueError("iFIM does not support empty prefix/suffix context")
+        instruction = _validate_instruction_tokens(instruction_token_ids)
+        permuted = apply_ifim_permutation(
+            content,
+            instruction_token_ids=instruction,
+            span=span,
+            mode=mode,
+            special_token_ids=special_token_ids,
+        )
+        source_map = [
+            *([INSERTED_TOKEN_SOURCE_INDEX] * (len(instruction) + 1)),
+            *fim_permutation_source_indices(
+                source_indices,
+                span=span,
+                mode=mode,
+            ),
+        ]
+
+    ids = _resolve_special_token_ids(special_token_ids)
+    if not permuted or permuted[-1] != ids.eot:
+        raise AssertionError("domain-preserving FIM base permutation lost trailing EOT")
+    fixed_prefix = tokens[: region.content_start]
+    fixed_suffix = tokens[region.content_end :]
+    result_tokens = [*fixed_prefix, *permuted[:-1], *fixed_suffix]
+    result_map = [
+        *range(source_start, source_start + region.content_start),
+        *source_map[:-1],
+        *range(
+            source_start + region.content_end,
+            source_start + len(tokens),
+        ),
+    ]
+    if not result_tokens or result_tokens[-1] != ids.eot:
+        result_tokens.append(ids.eot)
+        result_map.append(INSERTED_TOKEN_SOURCE_INDEX)
+    if len(result_tokens) != len(result_map):
+        raise AssertionError("domain-preserving FIM token/provenance lengths diverged")
+    return FIMPermutationWithProvenance(
+        token_ids=result_tokens,
+        source_token_indices=result_map,
+    )
 
 
 def apply_fim_permutation(
@@ -402,18 +672,25 @@ def _clean_instruction(text: str) -> str | None:
 
 
 __all__ = [
+    "DomainPreservingFIMRegion",
     "EOT_ID",
     "FIM_INSTRUCTION_ID",
     "FIMMode",
     "FIM_MIDDLE_ID",
+    "FIMPermutationWithProvenance",
     "FIM_PREFIX_ID",
     "FIM_SPECIAL_TOKEN_IDS",
     "FIMSpecialTokenIds",
     "FIM_SUFFIX_ID",
+    "INSERTED_TOKEN_SOURCE_INDEX",
+    "UnsupportedDomainDelimiterStructureError",
+    "apply_domain_preserving_fim_permutation",
     "apply_fim_permutation",
     "apply_fim_transform",
     "apply_ifim_permutation",
     "apply_ifim_transform",
+    "domain_preserving_fim_region",
     "extract_ifim_instruction_text",
+    "fim_permutation_source_indices",
     "sample_middle_span",
 ]

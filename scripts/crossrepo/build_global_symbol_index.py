@@ -58,10 +58,11 @@ import sys
 import tarfile
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 # --------------------------------------------------------------------------- #
 # Locate the indexer module so we reuse its libclang parse helpers verbatim.
@@ -100,17 +101,41 @@ DEFAULT_OUTPUT = MLX_ROOT / "outputs" / "crossrepo" / "global_symbols.sqlite"
 # ``lang`` controls how headers (.h/.inc) are parsed: 'c++' (default for the C++
 # libs — header-only template libs like boost/eigen/fmt MUST parse as C++ or the
 # templated public API yields zero symbols) or 'c' (glib/openssl/libc are C).
+_NON_PROVIDER_PATH_SEGMENTS = ("test", "tests", "testing", "benchmark", "benchmarks")
 BASE_LIBS: dict[str, dict] = {
     # ---- A1 (high-value, tractable) ----
-    "boost":      {"subtrees": ["boost"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["boost::"]},
-    "abseil":     {"subtrees": ["abseil-cpp"],   "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["absl::"]},
-    "folly":      {"subtrees": ["folly"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["folly::"]},
-    "openssl":    {"subtrees": ["openssl"],      "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": []},
-    "boringssl":  {"subtrees": ["boringssl"],    "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": []},
-    "protobuf":   {"subtrees": ["protobuf"],     "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["google::protobuf::"]},
-    "eigen":      {"subtrees": ["eigen"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["Eigen::"]},
-    "fmt":        {"subtrees": ["fmt"],          "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["fmt::"]},
-    "glib":       {"subtrees": ["glib"],         "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": []},
+    "boost":      {"subtrees": ["boost"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["boost::"],
+                   # The normal project index intentionally treats boost:: as a
+                   # system namespace and drops its type definitions.  This is
+                   # the provider index, so keep those definitions exactly as we
+                   # do for std::; the generic zero-type guard below then makes a
+                   # broken Boost type index fail loud instead of being marked done.
+                   "allow_system_types": True},
+    "abseil":     {"subtrees": ["abseil-cpp"],   "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["absl::"],
+                   # Unit tests and benchmarks are useful training code but are
+                   # not providers for the cross-library public API graph. Some
+                   # benchmark TUs instantiate the full flags stack and can take
+                   # minutes / GiBs in libclang, so exclude them explicitly here
+                   # rather than weakening the per-file timeout.
+                   "index_exclude_suffixes": [
+                       "_test.cc", "_test.cpp", "_test.cxx",
+                       "_benchmark.cc", "_benchmark.cpp", "_benchmark.cxx",
+                   ],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "folly":      {"subtrees": ["folly"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["folly::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "openssl":    {"subtrees": ["openssl"],      "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": [],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "boringssl":  {"subtrees": ["boringssl"],    "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": [],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "protobuf":   {"subtrees": ["protobuf"],     "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["google::protobuf::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "eigen":      {"subtrees": ["eigen"],        "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["Eigen::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "fmt":        {"subtrees": ["fmt"],          "tier": "A1", "public_only": False, "lang": "c++", "namespace_prefixes": ["fmt::"],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
+    "glib":       {"subtrees": ["glib"],         "tier": "A1", "public_only": False, "lang": "c",   "namespace_prefixes": [],
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
     # ---- A2 (huge / template-heavy) — PUBLIC symbols only ----
     # std: gcc-mirror and llvm-project are FULL compiler monorepos (the entire GCC
     # / LLVM source trees). Without include_path_markers the per-lib file cap is
@@ -172,8 +197,43 @@ BASE_LIBS: dict[str, dict] = {
     # libc: C libraries have NO namespace; keep by-name public symbols (no prefix
     # filter). glibc/musl public surface lives in normal .h headers.
     "libc":       {"subtrees": ["glibc", "musl"],
-                   "tier": "A2", "public_only": True, "lang": "c", "namespace_prefixes": []},
+                   "tier": "A2", "public_only": True, "lang": "c", "namespace_prefixes": [],
+                   "index_public_headers_only": True,
+                   "index_exclude_path_segments": _NON_PROVIDER_PATH_SEGMENTS},
 }
+
+# Corpus subtree names are extraction details, not project identities. Keep the
+# authoritative owner/repository identity explicit so every worker emits the
+# same canonical symbol key regardless of its temporary extraction directory.
+PROJECT_ID_BY_SUBTREE = {
+    "boost": "boostorg/boost",
+    "abseil-cpp": "abseil/abseil-cpp",
+    "folly": "facebook/folly",
+    "openssl": "openssl/openssl",
+    "boringssl": "google/boringssl",
+    "protobuf": "protocolbuffers/protobuf",
+    "eigen": "libeigen/eigen",
+    "fmt": "fmtlib/fmt",
+    "glib": "GNOME/glib",
+    "STL": "microsoft/STL",
+    "stl": "microsoft/STL",
+    "gcc-mirror": "gcc-mirror/gcc",
+    "llvm-project": "llvm/llvm-project",
+    "glibc": "bminor/glibc",
+    "musl": "ifduyue/musl",
+}
+
+
+def project_identity_for_subtree(subtree: str) -> str:
+    try:
+        project_id = PROJECT_ID_BY_SUBTREE[subtree]
+    except KeyError as exc:
+        raise ip.SymbolIdentityError(
+            f"no canonical owner/repo identity configured for subtree {subtree!r}"
+        ) from exc
+    return ip.require_project_identity(
+        project_id, source=f"global symbol subtree {subtree}"
+    )
 
 A1_LIBS = [k for k, v in BASE_LIBS.items() if v["tier"] == "A1"]
 A2_LIBS = [k for k, v in BASE_LIBS.items() if v["tier"] == "A2"]
@@ -183,6 +243,7 @@ MAX_FILES_PER_LIB_DEFAULT = 60_000       # cap files indexed per base-lib
 MAX_BYTES_PER_FILE = 500_000             # mirror index_project's per-file cap
 PARSE_TIMEOUT_S = 60                      # per-file libclang timeout
 PROGRESS_EVERY = 2000
+SYMBOL_BATCH_SIZE = 5000
 
 # A2 std/libc: index ONLY symbols declared in headers (public surface). For std
 # the public headers are the libstdc++ <bits/...>/<...> includes + libc++'s; for
@@ -203,27 +264,9 @@ _INTERNAL_QNAME_SEG = re.compile(
     r"(^|::)(detail|internal|impl|_internal|__detail|__internal)(::|$)", re.IGNORECASE
 )
 _RESERVED_LEADING = re.compile(r"(^|::)(_[A-Z]|__)")  # __foo / _Foo reserved names
-_INLINE_NAMESPACE_SEGMENTS = {
-    "__1",
-    "__2",
-    "__3",
-    "__cxx11",
-}
-
-
 def normalize_inline_namespace_qname(qname: str) -> str:
-    """Canonicalize common C++ inline ABI namespaces in qualified names.
-
-    libstdc++/libc++ expose public symbols through inline implementation
-    namespaces such as ``std::__1`` or ``std::__cxx11``.  The cross-repo lookup
-    should index those under the stable public spelling so callers resolving
-    ``std::basic_string`` or ``std::vector`` do not miss them because of a
-    library-specific ABI namespace.
-    """
-    if not qname:
-        return qname
-    parts = [part for part in qname.split("::") if part not in _INLINE_NAMESPACE_SEGMENTS]
-    return "::".join(parts)
+    """Use the indexer's exact, std-only inline-namespace normalization."""
+    return ip.normalize_inline_namespace_qname(qname)
 
 
 def _is_public_header_path(rel_file: str) -> bool:
@@ -232,6 +275,34 @@ def _is_public_header_path(rel_file: str) -> bool:
         return True
     parts = [part for part in rel_file.replace("\\", "/").split("/") if part]
     return "include" in parts
+
+
+def _filter_non_provider_sources(
+    paths: Sequence[str], spec: Mapping[str, object]
+) -> tuple[list[str], int]:
+    suffixes = tuple(
+        str(value).lower() for value in spec.get("index_exclude_suffixes", ())
+    )
+    excluded_segments = {
+        str(value).lower()
+        for value in spec.get("index_exclude_path_segments", ())
+    }
+
+    def keep(path: str) -> bool:
+        normalized = path.replace("\\", "/")
+        if suffixes and normalized.lower().endswith(suffixes):
+            return False
+        parts = {part.lower() for part in normalized.split("/") if part}
+        if excluded_segments.intersection(parts):
+            return False
+        if spec.get("index_public_headers_only") and not _is_public_header_path(
+            normalized
+        ):
+            return False
+        return True
+
+    kept = [path for path in paths if keep(path)]
+    return kept, len(paths) - len(kept)
 
 
 def is_public_symbol(
@@ -278,6 +349,33 @@ def normalized_body_len(text: str) -> int:
 # --------------------------------------------------------------------------- #
 # SQLite global symbol store.
 # --------------------------------------------------------------------------- #
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 4
+
+
+@dataclass(frozen=True)
+class GlobalSymbolRecord:
+    qname: str
+    base_lib: str
+    base_repo: str
+    kind: int
+    sym_type: str
+    file: str
+    line: int
+    end_line: int
+    is_public: int
+    token_est: int
+    body_len: int
+    text: str
+    symbol_key: str
+    symbol_id: int | None = None
+    usr: str = ""
+    canonical_signature: str = ""
+    symbol_kind: str = ""
+    provider: str = ""
+    include_provenance: str = ""
+    identity_schema_version: int = ip.SYMBOL_IDENTITY_SCHEMA_VERSION
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS symbols (
     symbol_uid  TEXT NOT NULL PRIMARY KEY,
@@ -292,11 +390,30 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_public    INTEGER NOT NULL,
     token_est    INTEGER NOT NULL,
     body_len     INTEGER NOT NULL,
-    text         TEXT NOT NULL
+    text         TEXT NOT NULL,
+    symbol_key   TEXT NOT NULL,
+    symbol_id    TEXT NOT NULL,
+    usr          TEXT NOT NULL,
+    canonical_signature TEXT NOT NULL,
+    symbol_kind  TEXT NOT NULL,
+    identity_schema_version INTEGER NOT NULL,
+    provider      TEXT NOT NULL,
+    include_provenance TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qname);
 CREATE INDEX IF NOT EXISTS idx_symbols_qname_type ON symbols(qname, sym_type);
 CREATE INDEX IF NOT EXISTS idx_symbols_lib   ON symbols(base_lib);
+CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key);
+CREATE INDEX IF NOT EXISTS idx_symbols_usr ON symbols(usr);
+CREATE INDEX IF NOT EXISTS idx_symbols_qname_signature
+    ON symbols(qname, canonical_signature, symbol_kind);
+CREATE INDEX IF NOT EXISTS idx_symbols_provenance
+    ON symbols(qname, provider, include_provenance);
+
+CREATE TABLE IF NOT EXISTS symbol_identities (
+    symbol_id TEXT NOT NULL PRIMARY KEY,
+    symbol_key TEXT NOT NULL UNIQUE
+);
 
 CREATE TABLE IF NOT EXISTS symbol_index_libs (
     lib       TEXT PRIMARY KEY,
@@ -316,9 +433,9 @@ CREATE TABLE IF NOT EXISTS symbol_index_libs (
 class GlobalSymbolStore:
     """Resumable SQLite store for cross-repo base-lib symbol definitions.
 
-    Read path used by index_project at doc-build time is intentionally tiny:
-    ``lookup(qname)`` returns the function def (or None). The write path is used
-    only by THIS builder.
+    The read path returns all display-qname candidates and resolves one only by
+    canonical identity fields or proven uniqueness. The write path is used only
+    by this builder.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -326,15 +443,228 @@ class GlobalSymbolStore:
         if read_only:
             uri = f"file:{path}?mode=ro"
             self.conn = sqlite3.connect(uri, uri=True, timeout=30.0)
-            self._require_current_schema()
         else:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self.conn = sqlite3.connect(path, timeout=60.0)
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-            self.conn.execute("PRAGMA synchronous=NORMAL;")
-            self.conn.executescript(SCHEMA)
-            self._require_current_schema()
+        try:
+            if read_only:
+                self._require_current_schema()
+            else:
+                self.conn.execute("PRAGMA journal_mode=WAL;")
+                self.conn.execute("PRAGMA synchronous=NORMAL;")
+                self._initialize_or_migrate_schema()
+                self._require_current_schema()
+                self.conn.commit()
+        except BaseException:
+            self.conn.close()
+            raise
+
+    def _initialize_or_migrate_schema(self) -> None:
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: newer global symbol schema cannot be downgraded: "
+                f"user_version={version}, supported={GLOBAL_SYMBOL_DB_SCHEMA_VERSION}"
+            )
+        table_exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbols'"
+        ).fetchone()
+        if table_exists is None:
+            self.conn.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + SCHEMA
+                + f"\nPRAGMA user_version={GLOBAL_SYMBOL_DB_SCHEMA_VERSION};\nCOMMIT;"
+            )
+            return
+
+        cols = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(symbols)").fetchall()
+        }
+        identity_columns = {
+            "symbol_uid",
+            "qname",
+            "base_lib",
+            "base_repo",
+            "file",
+            "symbol_key",
+            "symbol_id",
+            "usr",
+            "canonical_signature",
+            "symbol_kind",
+            "identity_schema_version",
+        }
+        missing_identity = sorted(identity_columns - cols)
+        if missing_identity:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: legacy global symbol schema cannot be migrated "
+                "without canonical identity fields; "
+                f"missing_columns={missing_identity}. Rebuild the index."
+            )
+
+        has_provider = "provider" in cols
+        has_include = "include_provenance" in cols
+        select_tail = (
+            ", provider" if has_provider else ", '' AS provider"
+        ) + (
+            ", include_provenance"
+            if has_include
+            else ", '' AS include_provenance"
+        )
+        rows = self.conn.execute(
+            "SELECT symbol_uid, qname, base_lib, base_repo, file, line, symbol_key, "
+            "symbol_id, usr, canonical_signature, symbol_kind, "
+            "identity_schema_version" + select_tail + " FROM symbols"
+        ).fetchall()
+        provenance_updates: list[tuple[str, str, str]] = []
+        for row in rows:
+            (
+                symbol_uid,
+                qname,
+                base_lib,
+                base_repo,
+                file,
+                line,
+                symbol_key,
+                symbol_id_hex,
+                usr,
+                canonical_signature,
+                symbol_kind,
+                identity_version,
+                stored_provider,
+                stored_include,
+            ) = row
+            project_id = ip.require_project_identity(
+                base_repo, source=f"{self.path}:{symbol_uid}"
+            )
+            if int(identity_version) != ip.SYMBOL_IDENTITY_SCHEMA_VERSION:
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: identity schema v{identity_version} "
+                    f"cannot be promoted to v{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
+                )
+            has_location_identity = bool(symbol_key) and ip.is_repo_file_location_identity(
+                str(symbol_key)
+            )
+            if (
+                not symbol_key
+                or not symbol_kind
+                or (not usr and not canonical_signature and not has_location_identity)
+            ):
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: canonical identity cannot be "
+                    "reconstructed; require symbol_key, symbol_kind, and USR, "
+                    "signature, or explicit repository location"
+                )
+            if str(canonical_signature).startswith("legacy-kind="):
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: synthetic legacy signature cannot "
+                    "establish canonical clang identity; rebuild the index"
+                )
+            if has_location_identity:
+                ip.validate_repo_file_location_identity_claim(
+                    str(symbol_key),
+                    project=project_id,
+                    file=str(file),
+                    line=int(line),
+                    kind=str(symbol_kind),
+                    qname=str(qname),
+                    source=f"{self.path}:{symbol_uid}",
+                )
+            else:
+                identity_kwargs = {
+                    "qname": str(qname),
+                    "kind": str(symbol_kind),
+                    "usr": str(usr or ""),
+                    "canonical_signature": str(canonical_signature or ""),
+                    "project": project_id,
+                    "file": str(file),
+                    "line": int(line),
+                }
+                expected_keys = {
+                    ip.canonical_symbol_identity(**identity_kwargs),
+                    ip.canonical_symbol_identity(
+                        **identity_kwargs, force_file_scope=True
+                    ),
+                }
+                if str(symbol_key) not in expected_keys:
+                    raise ip.SymbolIdentityError(
+                        f"{self.path}:{symbol_uid}: stored canonical key does not match "
+                        "its identity fields; rebuild the index"
+                    )
+            expected_hex = self._symbol_id_hex(ip._compute_symbol_id(str(symbol_key)))
+            if str(symbol_id_hex) != expected_hex:
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: stored symbol_id {symbol_id_hex!r} "
+                    f"does not match canonical key ({expected_hex})"
+                )
+            detected_provider, detected_include = ip.symbol_provider_provenance(str(file))
+            provider = str(stored_provider or detected_provider or project_id)
+            include_provenance = str(stored_include or detected_include or file)
+            if base_lib == "std" and (not detected_provider or not detected_include):
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: std provider/include provenance "
+                    f"cannot be reconstructed from {file!r}; rebuild the index"
+                )
+            if stored_provider and detected_provider and stored_provider != detected_provider:
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: provider provenance mismatch: "
+                    f"stored={stored_provider!r} detected={detected_provider!r}"
+                )
+            if stored_include and detected_include and stored_include != detected_include:
+                raise ip.SymbolIdentityError(
+                    f"{self.path}:{symbol_uid}: include provenance mismatch: "
+                    f"stored={stored_include!r} detected={detected_include!r}"
+                )
+            provenance_updates.append((provider, include_provenance, str(symbol_uid)))
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not has_provider:
+                self.conn.execute(
+                    "ALTER TABLE symbols ADD COLUMN provider TEXT NOT NULL DEFAULT ''"
+                )
+            if not has_include:
+                self.conn.execute(
+                    "ALTER TABLE symbols ADD COLUMN include_provenance "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            self.conn.executemany(
+                "UPDATE symbols SET provider=?, include_provenance=? WHERE symbol_uid=?",
+                provenance_updates,
+            )
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS symbol_identities ("
+                "symbol_id TEXT NOT NULL PRIMARY KEY, "
+                "symbol_key TEXT NOT NULL UNIQUE)"
+            )
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS symbol_index_libs ("
+                "lib TEXT PRIMARY KEY, tier TEXT NOT NULL, "
+                "done INTEGER NOT NULL DEFAULT 0, n_files INTEGER NOT NULL DEFAULT 0, "
+                "n_funcs INTEGER NOT NULL DEFAULT 0, n_types INTEGER NOT NULL DEFAULT 0, "
+                "n_errors INTEGER NOT NULL DEFAULT 0, elapsed_s REAL NOT NULL DEFAULT 0, "
+                "subtrees TEXT NOT NULL DEFAULT '', finished_utc TEXT NOT NULL DEFAULT '')"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_usr ON symbols(usr)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_qname_signature "
+                "ON symbols(qname, canonical_signature, symbol_kind)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_provenance "
+                "ON symbols(qname, provider, include_provenance)"
+            )
+            self._rebuild_symbol_identity_registry()
+            self.conn.execute(f"PRAGMA user_version={GLOBAL_SYMBOL_DB_SCHEMA_VERSION}")
             self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def _require_current_schema(self) -> None:
         cols = {
@@ -342,52 +672,403 @@ class GlobalSymbolStore:
             for row in self.conn.execute("PRAGMA table_info(symbols)").fetchall()
         }
         if "symbol_uid" not in cols:
-            raise RuntimeError(
+            raise ip.SymbolIdentityError(
                 f"{self.path}: global symbol index uses old qname-only schema; "
                 "delete/rebuild it with scripts/crossrepo/build_global_symbol_index.py"
             )
+        required = {
+            "symbol_key",
+            "symbol_id",
+            "usr",
+            "canonical_signature",
+            "symbol_kind",
+            "identity_schema_version",
+            "provider",
+            "include_provenance",
+        }
+        missing = sorted(required - cols)
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if missing or version != GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: incompatible global symbol schema: "
+                f"user_version={version}, missing_columns={missing}"
+            )
+        incompatible_rows = int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM symbols "
+                "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id='' "
+                "OR symbol_kind='' OR (usr='' AND canonical_signature='' "
+                "AND symbol_key NOT LIKE 'repo_file_location:%') "
+                "OR canonical_signature LIKE 'legacy-kind=%text-sha1=%' "
+                "OR provider='' OR include_provenance=''",
+                (ip.SYMBOL_IDENTITY_SCHEMA_VERSION,),
+            ).fetchone()[0]
+        )
+        if incompatible_rows:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: incompatible symbol identity rows: "
+                f"count={incompatible_rows}, expected_version="
+                f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            )
+        for row in self.conn.execute(
+            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, symbol_kind "
+            "FROM symbols WHERE usr='' AND canonical_signature=''"
+        ):
+            symbol_uid, symbol_key, qname, project_id, file, line, symbol_kind = row
+            ip.validate_repo_file_location_identity_claim(
+                str(symbol_key),
+                project=str(project_id),
+                file=str(file),
+                line=int(line),
+                kind=str(symbol_kind),
+                qname=str(qname),
+                source=f"{self.path}:{symbol_uid}",
+            )
+        for (project_id,) in self.conn.execute(
+            "SELECT DISTINCT base_repo FROM symbols"
+        ):
+            ip.require_project_identity(
+                project_id, source=f"global symbol index {self.path}"
+            )
+        missing_std_provenance = self.conn.execute(
+            "SELECT symbol_uid, file FROM symbols WHERE base_lib='std' "
+            "AND (provider NOT IN ('libc++', 'libstdc++', 'msvc-stl') "
+            "OR include_provenance='') LIMIT 1"
+        ).fetchone()
+        if missing_std_provenance is not None:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: std symbol lacks authoritative provider/include "
+                f"provenance: uid={missing_std_provenance[0]} "
+                f"file={missing_std_provenance[1]!r}"
+            )
+        registry_table = self.conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='symbol_identities'"
+        ).fetchone()
+        if registry_table is None:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: global symbol schema has no corpus collision registry"
+            )
+        unregistered_rows = int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM symbols AS s "
+                "LEFT JOIN symbol_identities AS i "
+                "ON i.symbol_id=s.symbol_id AND i.symbol_key=s.symbol_key "
+                "WHERE i.symbol_id IS NULL"
+            ).fetchone()[0]
+        )
+        if unregistered_rows:
+            raise ip.SymbolIdentityError(
+                f"{self.path}: global symbol index has unregistered symbol IDs: "
+                f"count={unregistered_rows}"
+            )
 
     @staticmethod
-    def _symbol_uid(row: tuple) -> str:
-        qname, base_lib, base_repo, _kind, sym_type, file, line, end_line, *_rest = row
-        text = row[-1]
+    def _symbol_id_hex(symbol_id: int) -> str:
+        value = int(symbol_id)
+        if not 0 < value <= ip.SYMBOL_ID_MAX:
+            raise ip.SymbolIdentityError(
+                f"symbol_id is outside unsigned 64-bit range: {value}"
+            )
+        return f"{value:016x}"
+
+    def _rebuild_symbol_identity_registry(self) -> None:
+        self.conn.execute("DELETE FROM symbol_identities")
+        rows = self.conn.execute(
+            "SELECT symbol_uid, symbol_key, symbol_id FROM symbols "
+            "ORDER BY symbol_uid"
+        )
+        for symbol_uid, symbol_key, symbol_id_hex in rows:
+            expected_id = ip._compute_symbol_id(str(symbol_key))
+            expected_hex = self._symbol_id_hex(expected_id)
+            if str(symbol_id_hex) != expected_hex:
+                raise ip.SymbolIdentityError(
+                    f"{self.path}: symbol {symbol_uid} has ID {symbol_id_hex!r}, "
+                    f"expected {expected_hex} for {symbol_key!r}"
+                )
+            existing = self.conn.execute(
+                "SELECT symbol_key FROM symbol_identities WHERE symbol_id=?",
+                (expected_hex,),
+            ).fetchone()
+            if existing is not None and str(existing[0]) != str(symbol_key):
+                raise ip.SymbolIdentityError(
+                    "canonical symbol ID collision while rebuilding global index: "
+                    f"id={expected_id} first={existing[0]!r} second={symbol_key!r}"
+                )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO symbol_identities(symbol_id, symbol_key) "
+                "VALUES (?, ?)",
+                (expected_hex, str(symbol_key)),
+            )
+
+    def _validate_symbol_identity_claims(
+        self, records: Sequence[GlobalSymbolRecord]
+    ) -> list[int]:
+        staged_by_id: dict[str, str] = {}
+        staged_by_key: dict[str, str] = {}
+        symbol_ids: list[int] = []
+        for record in records:
+            project_id = ip.require_project_identity(
+                record.base_repo,
+                source=f"global symbol {record.base_repo}:{record.file}:{record.line}",
+            )
+            if not record.symbol_key or not record.symbol_kind:
+                raise ip.SymbolIdentityError(
+                    f"{project_id}:{record.file}:{record.line}: missing canonical identity"
+                )
+            has_location_identity = ip.is_repo_file_location_identity(
+                record.symbol_key
+            )
+            if (
+                not record.usr
+                and not record.canonical_signature
+                and not has_location_identity
+            ):
+                raise ip.SymbolIdentityError(
+                    f"{project_id}:{record.file}:{record.line}: identity requires USR "
+                    "canonical signature, or explicit repository location"
+                )
+            if has_location_identity:
+                ip.validate_repo_file_location_identity_claim(
+                    record.symbol_key,
+                    project=project_id,
+                    file=record.file,
+                    line=record.line,
+                    kind=record.symbol_kind,
+                    qname=record.qname,
+                    source=f"{project_id}:{record.file}:{record.line}",
+                )
+            else:
+                identity_kwargs = {
+                    "qname": record.qname,
+                    "kind": record.symbol_kind,
+                    "usr": record.usr,
+                    "canonical_signature": record.canonical_signature,
+                    "project": project_id,
+                    "file": record.file,
+                    "line": record.line,
+                }
+                expected_keys = {
+                    ip.canonical_symbol_identity(**identity_kwargs),
+                    ip.canonical_symbol_identity(
+                        **identity_kwargs, force_file_scope=True
+                    ),
+                }
+                if record.symbol_key not in expected_keys:
+                    raise ip.SymbolIdentityError(
+                        f"{project_id}:{record.file}:{record.line}: canonical key does "
+                        "not match the record identity fields"
+                    )
+            if not record.provider or not record.include_provenance:
+                raise ip.SymbolIdentityError(
+                    f"{project_id}:{record.file}:{record.line}: provider and include "
+                    "provenance are required"
+                )
+            claimed_id = (
+                ip._compute_symbol_id(record.symbol_key)
+                if record.symbol_id is None
+                else int(record.symbol_id)
+            )
+            claimed_hex = self._symbol_id_hex(claimed_id)
+            source = f"{record.base_repo}:{record.file}:{record.line}"
+
+            existing_key = staged_by_id.get(claimed_hex)
+            if existing_key is None:
+                row = self.conn.execute(
+                    "SELECT symbol_key FROM symbol_identities WHERE symbol_id=?",
+                    (claimed_hex,),
+                ).fetchone()
+                existing_key = None if row is None else str(row[0])
+            if existing_key is not None and existing_key != record.symbol_key:
+                raise ip.SymbolIdentityError(
+                    "canonical symbol ID collision in global index: "
+                    f"id={claimed_id} first={existing_key!r} "
+                    f"second={record.symbol_key!r} ({source})"
+                )
+
+            existing_id = staged_by_key.get(record.symbol_key)
+            if existing_id is None:
+                row = self.conn.execute(
+                    "SELECT symbol_id FROM symbol_identities WHERE symbol_key=?",
+                    (record.symbol_key,),
+                ).fetchone()
+                existing_id = None if row is None else str(row[0])
+            if existing_id is not None and existing_id != claimed_hex:
+                raise ip.SymbolIdentityError(
+                    f"{source}: canonical key {record.symbol_key!r} is already "
+                    f"registered as ID {int(existing_id, 16)}, not {claimed_id}"
+                )
+
+            expected_id = ip._compute_symbol_id(record.symbol_key)
+            if claimed_id != expected_id:
+                raise ip.SymbolIdentityError(
+                    f"{source}: symbol_id {claimed_id} does not match v"
+                    f"{ip.SYMBOL_IDENTITY_SCHEMA_VERSION} ID {expected_id} for "
+                    f"{record.symbol_key!r}"
+                )
+            if record.identity_schema_version != ip.SYMBOL_IDENTITY_SCHEMA_VERSION:
+                raise ip.SymbolIdentityError(
+                    f"{source}: symbol identity schema v{record.identity_schema_version} "
+                    f"is incompatible with v{ip.SYMBOL_IDENTITY_SCHEMA_VERSION}"
+                )
+            staged_by_id[claimed_hex] = record.symbol_key
+            staged_by_key[record.symbol_key] = claimed_hex
+            symbol_ids.append(claimed_id)
+        return symbol_ids
+
+    @staticmethod
+    def _symbol_uid(record: GlobalSymbolRecord) -> str:
         payload = "\x1f".join(
             str(part)
             for part in (
-                base_lib,
-                base_repo,
-                sym_type,
-                qname,
-                file,
-                line,
-                end_line,
-                hashlib.sha1(str(text).encode("utf-8")).hexdigest(),
+                record.base_lib,
+                record.base_repo,
+                record.sym_type,
+                record.symbol_key,
+                record.file,
+                record.line,
+                record.end_line,
+                hashlib.sha1(record.text.encode("utf-8")).hexdigest(),
             )
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     # ---- write path (builder) ----
+    def _delete_orphaned_identities(self) -> None:
+        self.conn.execute(
+            "DELETE FROM symbol_identities WHERE NOT EXISTS ("
+            "SELECT 1 FROM symbols "
+            "WHERE symbols.symbol_id=symbol_identities.symbol_id "
+            "AND symbols.symbol_key=symbol_identities.symbol_key)"
+        )
+
+    def invalidate_lib(
+        self,
+        lib: str,
+        tier: str,
+        subtrees: Sequence[str],
+    ) -> None:
+        """Durably remove a stale generation before attempting a rebuild."""
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                f"[{lib}] cannot invalidate a library inside an open transaction"
+            )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("DELETE FROM symbols WHERE base_lib=?", (lib,))
+            self._delete_orphaned_identities()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO symbol_index_libs "
+                "(lib, tier, done, n_files, n_funcs, n_types, n_errors, elapsed_s, "
+                " subtrees, finished_utc) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (lib, tier, 0, 0, 0, 0, 0, 0.0, ",".join(subtrees), ""),
+            )
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    @contextmanager
+    def rebuild_lib(
+        self,
+        lib: str,
+        tier: str,
+        subtrees: Sequence[str],
+    ) -> Iterator[None]:
+        """Publish one library as one transaction, with durable invalidation.
+
+        The old completed generation is invalidated before parsing starts. A
+        crash or parse failure therefore cannot leave stale ``done=1`` state,
+        and every symbol inserted during the attempted rebuild rolls back.
+        """
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                f"[{lib}] cannot start atomic rebuild inside an open transaction"
+            )
+        self.invalidate_lib(lib, tier, subtrees)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            row = self.conn.execute(
+                "SELECT done, n_errors FROM symbol_index_libs WHERE lib=?", (lib,)
+            ).fetchone()
+            if row is None or int(row[0]) != 1 or int(row[1]) != 0:
+                raise RuntimeError(
+                    f"[{lib}] atomic rebuild ended without a clean done record"
+                )
+            self._delete_orphaned_identities()
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+
     def lib_done(self, lib: str) -> bool:
         row = self.conn.execute(
             "SELECT done FROM symbol_index_libs WHERE lib=?", (lib,)
         ).fetchone()
         return bool(row and row[0])
 
-    def insert_symbols(self, rows: list[tuple]) -> None:
-        # rows: (qname, base_lib, base_repo, kind, sym_type, file, line,
-        #        end_line, is_public, token_est, body_len, text)
-        keyed_rows = [(self._symbol_uid(row), *row) for row in rows]
+    def insert_symbols(self, rows: list[GlobalSymbolRecord]) -> None:
+        if any(not isinstance(row, GlobalSymbolRecord) for row in rows):
+            raise ip.SymbolIdentityError(
+                "legacy tuple symbol rows cannot reconstruct canonical identity; "
+                "GlobalSymbolRecord is required"
+            )
+        records = list(rows)
+        symbol_ids = self._validate_symbol_identity_claims(records)
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO symbol_identities(symbol_id, symbol_key) VALUES (?, ?)",
+            [
+                (self._symbol_id_hex(symbol_id), record.symbol_key)
+                for record, symbol_id in zip(records, symbol_ids, strict=True)
+            ],
+        )
+        keyed_rows = [
+            (
+                self._symbol_uid(record),
+                record.qname,
+                record.base_lib,
+                record.base_repo,
+                record.kind,
+                record.sym_type,
+                record.file,
+                record.line,
+                record.end_line,
+                record.is_public,
+                record.token_est,
+                record.body_len,
+                record.text,
+                record.symbol_key,
+                self._symbol_id_hex(symbol_id),
+                record.usr,
+                record.canonical_signature,
+                record.symbol_kind,
+                record.identity_schema_version,
+                record.provider,
+                record.include_provenance,
+            )
+            for record, symbol_id in zip(records, symbol_ids, strict=True)
+        ]
         self.conn.executemany(
             "INSERT OR IGNORE INTO symbols "
             "(symbol_uid, qname, base_lib, base_repo, kind, sym_type, file, line, end_line, "
-            " is_public, token_est, body_len, text) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " is_public, token_est, body_len, text, symbol_key, symbol_id, usr, canonical_signature, "
+            " symbol_kind, identity_schema_version, provider, include_provenance) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             keyed_rows,
         )
 
     def mark_lib_done(self, lib: str, tier: str, *, n_files: int, n_funcs: int,
                       n_types: int, n_errors: int, elapsed_s: float,
                       subtrees: list[str]) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError(
+                f"[{lib}] done state must be written inside an atomic rebuild"
+            )
+        if n_errors:
+            raise RuntimeError(
+                f"[{lib}] refusing to mark done after {n_errors} parse errors"
+            )
         self.conn.execute(
             "INSERT OR REPLACE INTO symbol_index_libs "
             "(lib, tier, done, n_files, n_funcs, n_types, n_errors, elapsed_s, "
@@ -395,7 +1076,6 @@ class GlobalSymbolStore:
             (lib, tier, 1, n_files, n_funcs, n_types, n_errors, elapsed_s,
              ",".join(subtrees), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
         )
-        self.conn.commit()
 
     def commit(self) -> None:
         self.conn.commit()
@@ -405,21 +1085,88 @@ class GlobalSymbolStore:
         self.conn.close()
 
     # ---- read path (consulted by index_project) ----
-    def lookup(self, qname: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT qname, base_lib, base_repo, kind, sym_type, file, line, "
-            "end_line, is_public, token_est, body_len, text "
-            "FROM symbols WHERE qname=? AND sym_type='func' LIMIT 1",
+    def lookup_candidates(self, qname: str) -> list[dict[str, object]]:
+        qname = normalize_inline_namespace_qname(qname)
+        rows = self.conn.execute(
+            "SELECT symbol_uid, symbol_key, symbol_id, qname, base_lib, base_repo, kind, "
+            "sym_type, file, line, end_line, is_public, token_est, body_len, text, "
+            "usr, canonical_signature, symbol_kind, identity_schema_version, "
+            "provider, include_provenance "
+            "FROM symbols WHERE qname=? AND sym_type='func' "
+            "ORDER BY base_repo, file, line, symbol_uid",
             (qname,),
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "qname": row[0], "base_lib": row[1], "base_repo": row[2],
-            "kind": row[3], "sym_type": row[4], "file": row[5], "line": row[6],
-            "end_line": row[7], "is_public": row[8], "token_est": row[9],
-            "body_len": row[10], "text": row[11],
-        }
+        ).fetchall()
+        fields = (
+            "symbol_uid", "symbol_key", "symbol_id", "qname", "base_lib", "base_repo", "kind",
+            "sym_type", "file", "line", "end_line", "is_public", "token_est",
+            "body_len", "text", "usr", "canonical_signature", "symbol_kind",
+            "identity_schema_version", "provider", "include_provenance",
+        )
+        records = [dict(zip(fields, row, strict=True)) for row in rows]
+        for record in records:
+            record["symbol_id"] = int(str(record["symbol_id"]), 16)
+        return records
+
+    def lookup(
+        self,
+        qname: str,
+        *,
+        symbol_key: str | None = None,
+        usr: str | None = None,
+        canonical_signature: str | None = None,
+        symbol_kind: str | None = None,
+        project: str | None = None,
+        file: str | None = None,
+        provider: str | None = None,
+        include_provenance: str | None = None,
+    ) -> dict[str, object] | None:
+        candidates = self.lookup_candidates(qname)
+        if usr:
+            candidates = [row for row in candidates if row["usr"] == usr]
+        else:
+            fallback_used = False
+            if canonical_signature:
+                fallback_used = True
+                signature = ip._normalize_signature_text(canonical_signature)
+                candidates = [
+                    row
+                    for row in candidates
+                    if ip._normalize_signature_text(
+                        str(row["canonical_signature"])
+                    ) == signature
+                ]
+            if symbol_kind:
+                fallback_used = True
+                candidates = [
+                    row for row in candidates if row["symbol_kind"] == symbol_kind
+                ]
+            if not fallback_used and symbol_key:
+                candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
+        if project:
+            candidates = [row for row in candidates if row["base_repo"] == project]
+        if file:
+            candidates = [row for row in candidates if row["file"] == file]
+        if provider:
+            candidates = [row for row in candidates if row["provider"] == provider]
+        if include_provenance:
+            candidates = [
+                row
+                for row in candidates
+                if row["include_provenance"] == include_provenance
+            ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            preview = [
+                f"{row['base_repo']}:{row['file']}:{row['line']}"
+                for row in candidates[:8]
+            ]
+            raise ip.SymbolIdentityError(
+                "ambiguous global symbol lookup: "
+                f"qname={qname!r} usr={usr or ''!r} provider={provider or ''!r} "
+                f"include={include_provenance or ''!r} candidates={preview}"
+            )
+        return None
 
     def counts(self) -> dict:
         cur = self.conn.execute("SELECT base_lib, sym_type, COUNT(*) FROM symbols "
@@ -582,11 +1329,15 @@ def extract_subtrees(tarball: Path, subtrees: list[str], dest: Path,
     finally:
         try:
             proc.stdout.close()
+        except ip.SymbolIdentityError:
+            raise
         except Exception:
             pass
         proc.terminate()
         try:
             proc.wait(timeout=10)
+        except ip.SymbolIdentityError:
+            raise
         except Exception:
             proc.kill()
     return extracted
@@ -664,11 +1415,15 @@ def extract_many_subtrees(tarball: Path, lib_specs: dict[str, dict], dest_root: 
     finally:
         try:
             proc.stdout.close()
+        except ip.SymbolIdentityError:
+            raise
         except Exception:
             pass
         proc.terminate()
         try:
             proc.wait(timeout=10)
+        except ip.SymbolIdentityError:
+            raise
         except Exception:
             proc.kill()
     return counts
@@ -819,6 +1574,143 @@ def prepare_extraction_cache(
     return dirs, counts
 
 
+def populate_extraction_cache_from_source_cache(
+    tarball: Path,
+    lib_specs: dict[str, dict],
+    source_cache_root: Path,
+    cache_root: Path,
+    *,
+    max_files: int,
+    member_cap: int | None = None,
+) -> dict[str, int]:
+    """Hardlink missing per-lib caches from a complete conveyor source cache."""
+    if member_cap is not None:
+        raise ValueError(
+            "member_cap is archive-order-specific and cannot be used with "
+            "source-cache extraction"
+        )
+    if not source_cache_root.is_dir():
+        raise FileNotFoundError(f"source cache root not found: {source_cache_root}")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    populated: dict[str, int] = {}
+
+    for lib, spec in lib_specs.items():
+        hit = _extract_cache_hit(
+            tarball, spec, cache_root, lib,
+            max_files=max_files, member_cap=None,
+        )
+        if hit is not None:
+            populated[lib] = hit
+            continue
+
+        stage = cache_root / f".{lib}.building-{os.getpid()}"
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True)
+        count = 0
+        seen_source_dirs: set[tuple[int, int]] = set()
+        try:
+            for subtree in spec["subtrees"]:
+                source_dir = source_cache_root / subtree
+                sentinel = source_dir / ".cppmega_source_cache_complete.json"
+                if not source_dir.is_dir() or not sentinel.is_file():
+                    raise RuntimeError(
+                        f"[{lib}] incomplete source-cache subtree: {source_dir}"
+                    )
+                source_stat = source_dir.stat()
+                source_key = (int(source_stat.st_dev), int(source_stat.st_ino))
+                if source_key in seen_source_dirs:
+                    print(
+                        f"  [{lib}] source-cache alias skipped: {subtree}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                seen_source_dirs.add(source_key)
+                completion = json.loads(sentinel.read_text(encoding="utf-8"))
+                cached_repo = completion.get("repo")
+                if (
+                    not isinstance(cached_repo, str)
+                    or cached_repo.casefold() != subtree.casefold()
+                ):
+                    raise RuntimeError(
+                        f"[{lib}] source-cache sentinel repo mismatch at {sentinel}"
+                    )
+                cached_source = completion.get("source")
+                if not isinstance(cached_source, str) or not cached_source:
+                    raise RuntimeError(
+                        f"[{lib}] source-cache sentinel has no source at {sentinel}"
+                    )
+                try:
+                    same_tarball = Path(cached_source).samefile(tarball)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"[{lib}] source-cache tarball is unavailable: "
+                        f"{cached_source}"
+                    ) from exc
+                if not same_tarball:
+                    raise RuntimeError(
+                        f"[{lib}] source cache came from {cached_source}, not "
+                        f"{tarball}"
+                    )
+
+                for current_root, dirnames, filenames in os.walk(source_dir):
+                    dirnames.sort()
+                    filenames.sort()
+                    for filename in filenames:
+                        if count >= max_files:
+                            break
+                        source = Path(current_root) / filename
+                        if source == sentinel or not source.is_file():
+                            continue
+                        relative = source.relative_to(source_dir)
+                        member_name = f"cpp_all/{subtree}/{relative.as_posix()}"
+                        if not _member_is_wanted(
+                                member_name, ip.INDEX_EXTENSIONS,
+                                path_markers=spec.get("include_path_markers"),
+                                extensionless=bool(spec.get("index_extensionless_headers"))):
+                            continue
+                        if source.stat().st_size > MAX_BYTES_PER_FILE:
+                            continue
+                        target = stage / subtree / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        os.link(source, target)
+                        count += 1
+                    if count >= max_files:
+                        break
+                if count >= max_files:
+                    break
+
+            if count <= 0:
+                raise RuntimeError(
+                    f"[{lib}] source cache produced zero indexable files"
+                )
+            manifest = _extract_cache_signature(
+                tarball, spec, max_files=max_files, member_cap=None
+            )
+            manifest.update({
+                "lib": lib,
+                "count": count,
+                "finished_utc": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "materialized_from": str(source_cache_root.resolve()),
+                "publication": "hardlink",
+            })
+            (stage / ".gsi_extract_complete.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            final = cache_root / lib
+            shutil.rmtree(final, ignore_errors=True)
+            os.replace(stage, final)
+            populated[lib] = count
+            print(f"  [{lib}] source-cache extraction: {count} hardlinked files",
+                  file=sys.stderr, flush=True)
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+    return populated
+
+
 # --------------------------------------------------------------------------- #
 # Per-lib C++ standard-library compile environment (the std cross-link fix).
 #
@@ -856,6 +1748,8 @@ def _find_clang_resource_include() -> str | None:
                 text=True, stderr=subprocess.DEVNULL).strip()
             if rd:
                 cands.append(rd)
+        except ip.SymbolIdentityError:
+            raise
         except Exception:
             continue
     # Newest-first so a current toolchain (closest to modern libc++) wins.
@@ -885,6 +1779,8 @@ def _find_c_sysroot() -> str | None:
             stderr=subprocess.DEVNULL).strip()
         if sdk and os.path.isdir(os.path.join(sdk, "usr", "include")):
             return sdk
+    except ip.SymbolIdentityError:
+        raise
     except Exception:
         pass
     for sdk in ("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", "/"):
@@ -990,6 +1886,8 @@ def _probe_highest_cxx_std(
             try:
                 tu = probe_index.parse(probe_src, args=compile_args,
                                        options=parse_opts)
+            except ip.SymbolIdentityError:
+                raise
             except Exception as exc:  # noqa: BLE001 - per-candidate probe rejection
                 rejections.append(f"{cand} (parse raised: {type(exc).__name__})")
                 print(f"  [{lib}] cxx_std probe: {cand} REJECTED by libclang "
@@ -1027,7 +1925,18 @@ def _probe_highest_cxx_std(
 # Per-file libclang parse worker (isolated subprocess so a segfault is local).
 # --------------------------------------------------------------------------- #
 def _parse_file_worker(args_tuple):
-    filepath, project_dir, std_arg, lang, include_dirs, lib_env = args_tuple
+    (
+        filepath,
+        project_dir,
+        project_id,
+        std_arg,
+        lang,
+        include_dirs,
+        lib_env,
+    ) = args_tuple
+    project_id = ip.require_project_identity(
+        project_id, source=f"global symbol worker {filepath}"
+    )
     lib_env = lib_env or {}
     sys.setrecursionlimit(50000)
     ip._configure_libclang()
@@ -1069,11 +1978,110 @@ def _parse_file_worker(args_tuple):
     funcs, types = ip.parse_translation_unit(
         filepath, clang_index, compile_args, project_dir,
         allow_system_types=bool(lib_env.get("allow_system_types")),
+        project_id=project_id,
     )
     return (
         [f.to_dict() for f in funcs],
         [t.to_dict() for t in types],
     )
+
+
+class ParseWorkerTimeout(RuntimeError):
+    """A per-file parse worker exceeded its wall-clock deadline."""
+
+
+def _abort_process_pool(executor: ProcessPoolExecutor) -> None:
+    """Stop running workers before waiting for executor shutdown."""
+    process_map = getattr(executor, "_processes", None)
+    processes = tuple(process_map.values()) if process_map else ()
+    for process in processes:
+        try:
+            if process.is_alive():
+                process.terminate()
+        except (OSError, ValueError):
+            continue
+    for process in processes:
+        try:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.0)
+        except (OSError, ValueError):
+            continue
+    executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _iter_parse_results(
+    tasks: Iterable[tuple[str, str, tuple]],
+    *,
+    workers: int,
+    timeout_s: float,
+    worker_fn: Callable[[tuple], tuple[list[dict], list[dict]]] = _parse_file_worker,
+) -> Iterator[tuple[str, str, tuple[list[dict], list[dict]]]]:
+    """Run a bounded set of parse workers with a deadline per submitted file."""
+    if timeout_s <= 0:
+        raise ValueError(f"parse worker timeout must be positive, got {timeout_s}")
+
+    executor = ProcessPoolExecutor(max_workers=max(1, workers))
+    task_iter = iter(tasks)
+    pending: dict[Future, tuple[str, str, float]] = {}
+    exhausted = False
+    aborted = False
+
+    def submit_one() -> None:
+        nonlocal exhausted
+        if exhausted:
+            return
+        try:
+            filepath, project_id, worker_args = next(task_iter)
+        except StopIteration:
+            exhausted = True
+            return
+        future = executor.submit(worker_fn, worker_args)
+        pending[future] = (filepath, project_id, time.monotonic())
+
+    try:
+        for _ in range(max(1, workers)):
+            submit_one()
+        while pending:
+            now = time.monotonic()
+            future, (filepath, _project_id, started) = min(
+                pending.items(), key=lambda item: item[1][2]
+            )
+            remaining = started + timeout_s - now
+            if remaining <= 0 and not future.done():
+                raise ParseWorkerTimeout(
+                    f"parse worker timed out after {timeout_s:g}s for {filepath}"
+                )
+            done, _ = wait(
+                pending,
+                timeout=max(0.0, remaining),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                raise ParseWorkerTimeout(
+                    f"parse worker timed out after {timeout_s:g}s for {filepath}"
+                )
+            for completed in sorted(done, key=lambda item: pending[item][0]):
+                completed_filepath, completed_project, _started = pending.pop(completed)
+                try:
+                    result = completed.result()
+                except ip.SymbolIdentityError:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"parse worker failed for {completed_filepath}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                submit_one()
+                yield completed_filepath, completed_project, result
+    except BaseException:
+        aborted = True
+        _abort_process_pool(executor)
+        raise
+    finally:
+        if not aborted:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass
@@ -1121,9 +2129,17 @@ def _discover_include_dirs(dest: Path, subtrees: list[str]) -> list[str]:
     return out
 
 
-def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStore,
-                       *, workers: int, std_arg: str) -> LibResult:
-    """Parse an ALREADY-EXTRACTED base-lib dir and store its public symbols."""
+def _index_lib_from_dir_uncommitted(
+    lib: str,
+    spec: dict,
+    dest: Path,
+    store: GlobalSymbolStore,
+    *,
+    workers: int,
+    std_arg: str,
+    parse_timeout_s: float = PARSE_TIMEOUT_S,
+) -> LibResult:
+    """Parse an extracted base-lib inside the caller's SQLite transaction."""
     t0 = time.time()
     subtrees = spec["subtrees"]
     tier = spec["tier"]
@@ -1151,6 +2167,16 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
             if fp not in seen:
                 cpp_files.append(fp)
                 seen.add(fp)
+    cpp_files, excluded = _filter_non_provider_sources(cpp_files, spec)
+    if excluded:
+        print(
+            f"  [{lib}] configured non-provider source exclusions: {excluded} files "
+            f"(suffixes={tuple(spec.get('index_exclude_suffixes', ()))}, "
+            f"path_segments={tuple(spec.get('index_exclude_path_segments', ()))}, "
+            f"public_headers_only={bool(spec.get('index_public_headers_only'))})",
+            file=sys.stderr,
+            flush=True,
+        )
     res.n_files = len(cpp_files)
     if res.n_files == 0:
         raise RuntimeError(
@@ -1194,27 +2220,37 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
         print(f"  [{lib}] stdlib sysroot_args: {' '.join(sysroot_args)}",
               file=sys.stderr, flush=True)
 
-    batch: list[tuple] = []
-    BATCH_COMMIT = 5000
+    batch: list[GlobalSymbolRecord] = []
     parsed = 0
-    with ProcessPoolExecutor(max_workers=max(1, workers)) as ex:
-        futures = {
-            ex.submit(_parse_file_worker,
-                      (fp, project_dir, std_arg, lang, include_dirs, lib_env)): fp
-            for fp in cpp_files
-        }
-        for fut in as_completed(futures):
-            fp = futures[fut]
-            rel = os.path.relpath(fp, project_dir)
-            base_repo = rel.split(os.sep)[0] if os.sep in rel else subtrees[0]
-            try:
-                func_dicts, type_dicts = fut.result(timeout=PARSE_TIMEOUT_S * 4)
-            except TimeoutError:
-                res.n_errors += 1
-                continue
-            except Exception:
-                res.n_errors += 1
-                continue
+
+    def parse_tasks() -> Iterator[tuple[str, str, tuple]]:
+        for fp in cpp_files:
+            relative = os.path.relpath(fp, project_dir)
+            subtree = relative.split(os.sep, 1)[0]
+            if subtree not in subtrees:
+                raise ip.SymbolIdentityError(
+                    f"[{lib}] parsed file is outside configured subtrees: {relative!r}"
+                )
+            project_id = project_identity_for_subtree(subtree)
+            yield (
+                fp,
+                project_id,
+                (
+                    fp,
+                    project_dir,
+                    project_id,
+                    std_arg,
+                    lang,
+                    include_dirs,
+                    lib_env,
+                ),
+            )
+
+    parse_results = _iter_parse_results(
+        parse_tasks(), workers=workers, timeout_s=parse_timeout_s
+    )
+    try:
+        for _fp, base_repo, (func_dicts, type_dicts) in parse_results:
             for d in func_dicts:
                 qn = normalize_inline_namespace_qname(d["qualified_name"])
                 frel = d["file"]
@@ -1228,8 +2264,32 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 if blen < 12:
                     continue
                 tok = ip.estimate_tokens(body)
-                batch.append((qn, lib, base_repo, 2, "func", frel,
-                              d["line"], d.get("end_line", 0), 1, tok, blen, body))
+                provider, include_provenance = ip.symbol_provider_provenance(frel)
+                if lib == "std" and (not provider or not include_provenance):
+                    raise ip.SymbolIdentityError(
+                        f"[{lib}] cannot determine provider/include provenance for "
+                        f"{base_repo}:{frel}"
+                    )
+                batch.append(GlobalSymbolRecord(
+                    qname=qn,
+                    base_lib=lib,
+                    base_repo=base_repo,
+                    kind=2,
+                    sym_type="func",
+                    file=frel,
+                    line=d["line"],
+                    end_line=d.get("end_line", 0),
+                    is_public=1,
+                    token_est=tok,
+                    body_len=blen,
+                    text=body,
+                    symbol_key=d["symbol_key"],
+                    usr=d.get("usr", ""),
+                    canonical_signature=d.get("canonical_signature", ""),
+                    symbol_kind=d.get("symbol_kind", "FUNCTION_DECL"),
+                    provider=provider or base_repo,
+                    include_provenance=include_provenance or frel,
+                ))
                 res.n_funcs += 1
                 res.func_qnames.add(qn)
             for d in type_dicts:
@@ -1242,21 +2302,45 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
                 if blen < 8:
                     continue
                 tok = ip.estimate_tokens(body)
-                batch.append((qn, lib, base_repo, d["kind"], "type", frel,
-                              d["line"], d.get("end_line", 0), 1, tok, blen, body))
+                provider, include_provenance = ip.symbol_provider_provenance(frel)
+                if lib == "std" and (not provider or not include_provenance):
+                    raise ip.SymbolIdentityError(
+                        f"[{lib}] cannot determine provider/include provenance for "
+                        f"{base_repo}:{frel}"
+                    )
+                batch.append(GlobalSymbolRecord(
+                    qname=qn,
+                    base_lib=lib,
+                    base_repo=base_repo,
+                    kind=d["kind"],
+                    sym_type="type",
+                    file=frel,
+                    line=d["line"],
+                    end_line=d.get("end_line", 0),
+                    is_public=1,
+                    token_est=tok,
+                    body_len=blen,
+                    text=body,
+                    symbol_key=d["symbol_key"],
+                    usr=d.get("usr", ""),
+                    canonical_signature=d.get("canonical_signature", ""),
+                    symbol_kind=d.get("symbol_kind", "TYPE_DECL"),
+                    provider=provider or base_repo,
+                    include_provenance=include_provenance or frel,
+                ))
                 res.n_types += 1
             parsed += 1
-            if len(batch) >= BATCH_COMMIT:
+            if len(batch) >= SYMBOL_BATCH_SIZE:
                 store.insert_symbols(batch)
-                store.commit()
                 batch = []
             if parsed % PROGRESS_EVERY == 0:
                 print(f"    [{lib}] parsed {parsed}/{res.n_files} files, "
                       f"{res.n_funcs} funcs / {res.n_types} types, "
                       f"{res.n_errors} errors", file=sys.stderr, flush=True)
+    finally:
+        parse_results.close()
     if batch:
         store.insert_symbols(batch)
-        store.commit()
 
     # Fail-loud guard for the std-type path (CLAUDE.md RULE #1): when a lib is
     # configured to capture system (std::) TYPES, parsing files but extracting
@@ -1276,9 +2360,44 @@ def index_lib_from_dir(lib: str, spec: dict, dest: Path, store: GlobalSymbolStor
     return res
 
 
+def index_lib_from_dir(
+    lib: str,
+    spec: dict,
+    dest: Path,
+    store: GlobalSymbolStore,
+    *,
+    workers: int,
+    std_arg: str,
+    parse_timeout_s: float = PARSE_TIMEOUT_S,
+) -> LibResult:
+    """Atomically replace one base-lib generation and mark it complete."""
+    with store.rebuild_lib(lib, spec["tier"], spec["subtrees"]):
+        result = _index_lib_from_dir_uncommitted(
+            lib,
+            spec,
+            dest,
+            store,
+            workers=workers,
+            std_arg=std_arg,
+            parse_timeout_s=parse_timeout_s,
+        )
+        store.mark_lib_done(
+            lib,
+            spec["tier"],
+            n_files=result.n_files,
+            n_funcs=result.n_funcs,
+            n_types=result.n_types,
+            n_errors=result.n_errors,
+            elapsed_s=result.elapsed_s,
+            subtrees=result.subtrees,
+        )
+    return result
+
+
 def index_one_lib(lib: str, spec: dict, tarball: Path, store: GlobalSymbolStore,
                   *, workers: int, max_files: int, std_arg: str,
-                  member_cap: int | None) -> LibResult:
+                  member_cap: int | None,
+                  parse_timeout_s: float = PARSE_TIMEOUT_S) -> LibResult:
     """Extract (own tarball pass) + index ONE base-lib. Used for single-lib runs."""
     with tempfile.TemporaryDirectory(prefix=f"gsi_{lib}_") as td:
         dest = Path(td)
@@ -1298,7 +2417,8 @@ def index_one_lib(lib: str, spec: dict, tarball: Path, store: GlobalSymbolStore,
         print(f"  [{lib}] extracted {n_extracted} files; indexing...",
               file=sys.stderr, flush=True)
         return index_lib_from_dir(lib, spec, dest, store,
-                                  workers=workers, std_arg=std_arg)
+                                  workers=workers, std_arg=std_arg,
+                                  parse_timeout_s=parse_timeout_s)
 
 
 # --------------------------------------------------------------------------- #
@@ -1316,6 +2436,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "(default A1 — the tractable high-value set).")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
                    help="Parallel parse workers.")
+    p.add_argument(
+        "--parse-timeout-seconds",
+        type=float,
+        default=PARSE_TIMEOUT_S,
+        help=(
+            "Hard wall-clock deadline for one libclang source parse "
+            f"(default {PARSE_TIMEOUT_S}s). Increase explicitly for unusually "
+            "heavy template translation units; timeouts remain fail-closed."
+        ),
+    )
     p.add_argument("--max-files-per-lib", type=int, default=MAX_FILES_PER_LIB_DEFAULT,
                    help=f"Cap files indexed per base-lib (default {MAX_FILES_PER_LIB_DEFAULT}).")
     p.add_argument("--std-arg", default="-std=c++17",
@@ -1336,6 +2466,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Persistent source extraction cache. When set, the "
                         "tarball is streamed only for libs missing from the "
                         "cache; parser/indexer code still re-runs every build.")
+    p.add_argument("--source-cache-dir", default=None,
+                   help="Complete streaming-conveyor code source cache. Requires "
+                        "--extract-cache-dir and hardlinks missing parser cache "
+                        "inputs instead of re-reading the tarball.")
     p.add_argument("--libclang-path", default=None)
     p.add_argument("--report-only", action="store_true",
                    help="Print store counts/cost and exit (no indexing).")
@@ -1362,6 +2496,12 @@ def main(argv: list[str]) -> int:
     ip._configure_libclang(args.libclang_path)
     if args.extract_cache_dir and args.work_dir:
         raise SystemExit("--extract-cache-dir and --work-dir are mutually exclusive")
+    if args.source_cache_dir and not args.extract_cache_dir:
+        raise SystemExit("--source-cache-dir requires --extract-cache-dir")
+    if args.source_cache_dir and args.member_cap is not None:
+        raise SystemExit("--source-cache-dir cannot be combined with --member-cap")
+    if args.parse_timeout_seconds <= 0:
+        raise SystemExit("--parse-timeout-seconds must be positive")
 
     tarball = Path(args.tarball)
     store = GlobalSymbolStore(args.output, read_only=args.report_only)
@@ -1389,14 +2529,15 @@ def main(argv: list[str]) -> int:
         store.close()
         return 0
 
+    # Invalidate every selected generation before extraction starts. A tar/cache
+    # failure must not leave an older generation marked complete for this run.
+    for lib in todo:
+        spec = BASE_LIBS[lib]
+        store.invalidate_lib(lib, spec["tier"], spec["subtrees"])
+
     results: list[LibResult] = []
 
-    def _finish(lib: str, spec: dict, res: LibResult) -> None:
-        store.mark_lib_done(
-            lib, spec["tier"], n_files=res.n_files, n_funcs=res.n_funcs,
-            n_types=res.n_types, n_errors=res.n_errors, elapsed_s=res.elapsed_s,
-            subtrees=res.subtrees,
-        )
+    def _finish(lib: str, _spec: dict, res: LibResult) -> None:
         results.append(res)
         print(f"  DONE {lib}: files={res.n_files} funcs={res.n_funcs} "
               f"types={res.n_types} errors={res.n_errors} "
@@ -1410,6 +2551,11 @@ def main(argv: list[str]) -> int:
         print(f"\n=== extraction cache for {todo} -> {extract_root} ===",
               file=sys.stderr, flush=True)
         t_ext = time.time()
+        if args.source_cache_dir:
+            populate_extraction_cache_from_source_cache(
+                tarball, todo_specs, Path(args.source_cache_dir), extract_root,
+                max_files=args.max_files_per_lib,
+            )
         dirs, counts = prepare_extraction_cache(
             tarball, todo_specs, extract_root,
             max_files=args.max_files_per_lib, member_cap=args.member_cap,
@@ -1428,6 +2574,7 @@ def main(argv: list[str]) -> int:
             res = index_lib_from_dir(
                 lib, spec, dirs[lib], store,
                 workers=args.workers, std_arg=args.std_arg,
+                parse_timeout_s=args.parse_timeout_seconds,
             )
             _finish(lib, spec, res)
     # ONE tarball pass extracts ALL todo libs to a shared staging root (the
@@ -1459,6 +2606,7 @@ def main(argv: list[str]) -> int:
                 res = index_lib_from_dir(
                     lib, spec, extract_root / lib, store,
                     workers=args.workers, std_arg=args.std_arg,
+                    parse_timeout_s=args.parse_timeout_seconds,
                 )
                 _finish(lib, spec, res)
                 if not args.keep_extract:
@@ -1477,6 +2625,7 @@ def main(argv: list[str]) -> int:
                 lib, spec, tarball, store,
                 workers=args.workers, max_files=args.max_files_per_lib,
                 std_arg=args.std_arg, member_cap=args.member_cap,
+                parse_timeout_s=args.parse_timeout_seconds,
             )
             _finish(lib, spec, res)
 

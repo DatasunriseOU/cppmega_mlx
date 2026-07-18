@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
+import subprocess
 import sys
 import tarfile
-import subprocess
+
+import pyarrow.parquet as pq
+import pytest
 
 
 def test_run_checked_times_out_fail_loud(tmp_path) -> None:
@@ -52,46 +56,313 @@ def test_run_checked_stall_watchdog_fail_loud(tmp_path) -> None:
     except streaming_reindex.RepoFailure as exc:
         assert exc.repo == "repo"
         assert exc.stage == "index_project"
-        assert "stalled after 1s without log or CPU progress" in exc.detail
+        assert "stalled after 1s without log progress" in exc.detail
     else:  # pragma: no cover
         raise AssertionError("expected run_checked to fail loud on stall")
 
     assert "started" in log_path.read_text(encoding="utf-8")
 
 
-def test_run_checked_stall_watchdog_allows_cpu_progress(tmp_path) -> None:
+def test_run_checked_stall_watchdog_stops_cpu_spin_without_log_progress(tmp_path) -> None:
     import streaming_reindex
 
     log_path = tmp_path / "cpu-progress.log"
-    streaming_reindex.run_checked(
-        "repo",
-        "index_project",
-        [
-            sys.executable,
-            "-c",
-            (
-                "import time\n"
-                "print('started', flush=True)\n"
-                "deadline = time.time() + 2.0\n"
-                "x = 0\n"
-                "while time.time() < deadline:\n"
-                "    x += 1\n"
-            ),
-        ],
-        log_path=log_path,
-        timeout=10,
-        stall_timeout=1,
-    )
+    with pytest.raises(streaming_reindex.RepoFailure) as caught:
+        streaming_reindex.run_checked(
+            "repo",
+            "index_project",
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import time\n"
+                    "print('started', flush=True)\n"
+                    "deadline = time.time() + 30.0\n"
+                    "x = 0\n"
+                    "while time.time() < deadline:\n"
+                    "    x += 1\n"
+                ),
+            ],
+            log_path=log_path,
+            timeout=10,
+            stall_timeout=1,
+        )
 
+    assert "stalled after 1s without log progress" in caught.value.detail
     assert "started" in log_path.read_text(encoding="utf-8")
 
 
-def test_parse_ps_time_seconds_variants() -> None:
+def test_materialize_uses_canonical_project_identity(monkeypatch, tmp_path) -> None:
     import streaming_reindex
 
-    assert streaming_reindex._parse_ps_time_seconds("01:02.50") == 62.5
-    assert streaming_reindex._parse_ps_time_seconds("03:01:02.50") == 10862.5
-    assert streaming_reindex._parse_ps_time_seconds("2-03:01:02.50") == 183662.5
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        output = tmp_path / "cjson.tok.parquet"
+        output.write_bytes(b"parquet-placeholder")
+
+    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
+    enriched = tmp_path / "cjson.enriched.jsonl"
+    enriched.write_text("{}\n", encoding="utf-8")
+
+    output = streaming_reindex.stage_materialize(
+        "cjson",
+        enriched,
+        tmp_path,
+        project_id="DaveGamble/cJSON",
+    )
+
+    default_repo = captured.index("--default-repo")
+    assert captured[default_repo + 1] == "DaveGamble/cJSON"
+    assert output == tmp_path / "cjson.tok.parquet"
+
+
+def test_materialize_rejects_bare_project_identity_before_subprocess(
+    monkeypatch, tmp_path
+) -> None:
+    import streaming_reindex
+
+    monkeypatch.setattr(
+        streaming_reindex,
+        "run_checked",
+        lambda *_args, **_kwargs: pytest.fail("subprocess must not start"),
+    )
+    with pytest.raises(
+        streaming_reindex.SymbolIdentityError,
+        match="exactly one slash",
+    ):
+        streaming_reindex.stage_materialize(
+            "cjson",
+            tmp_path / "input.jsonl",
+            tmp_path,
+            project_id="cjson",
+        )
+
+
+def test_non_github_repo_list_identity_reaches_code_indexer(
+    monkeypatch, tmp_path
+) -> None:
+    import streaming_reindex
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "bare_name": "aosp-frameworks-av",
+                        "project_identity": (
+                            "android.googlesource.com/platform%2Fframeworks%2Fav"
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        (tmp_path / "work" / "aosp-frameworks-av.enriched.jsonl").write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
+    work = tmp_path / "work"
+    work.mkdir()
+    project_identity = streaming_reindex.resolve_project_identity(
+        "aosp-frameworks-av", repo_list
+    )
+
+    output = streaming_reindex.stage_index_source(
+        "aosp-frameworks-av",
+        project_identity,
+        tmp_path / "source",
+        work,
+    )
+
+    project_id_arg = captured.index("--project-id")
+    assert captured[project_id_arg + 1] == (
+        "android.googlesource.com/platform%2Fframeworks%2Fav"
+    )
+    assert "--skip-invalid-domain-inputs" in captured
+    assert output == work / "aosp-frameworks-av.enriched.jsonl"
+
+
+def test_commit_indexer_receives_canonical_project_identity(
+    monkeypatch, tmp_path
+) -> None:
+    from scripts import streaming_reindex
+
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        (tmp_path / "blender.enriched.jsonl").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
+    commit_input = tmp_path / "blender.jsonl"
+    commit_input.write_text("{}\n", encoding="utf-8")
+
+    output = streaming_reindex.stage_index_commits(
+        "blender",
+        [commit_input],
+        tmp_path,
+        tmp_path / "_src",
+        None,
+        project_id="blender/blender",
+    )
+
+    project_id_arg = captured.index("--project-id")
+    assert captured[project_id_arg + 1] == "blender/blender"
+    assert output == tmp_path / "blender.enriched.jsonl"
+
+
+def test_commit_extractor_receives_canonical_project_identity(
+    monkeypatch, tmp_path
+) -> None:
+    from scripts import streaming_reindex_commits
+
+    captured: list[str] = []
+
+    def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
+        del log_path
+        captured.extend(str(value) for value in cmd)
+        (tmp_path / "blender_commits.jsonl").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(streaming_reindex_commits, "run_checked", fake_run_checked)
+
+    output = streaming_reindex_commits.stage_extract_commits(
+        "blender",
+        tmp_path / "_src",
+        tmp_path,
+        project_id="blender/blender",
+    )
+
+    repo_name_arg = captured.index("--repo-name")
+    assert captured[repo_name_arg + 1] == "blender/blender"
+    assert output == tmp_path / "blender_commits.jsonl"
+
+
+def test_project_identity_map_rejects_duplicate_bare_name_collision(
+    tmp_path,
+) -> None:
+    import streaming_reindex
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "bare_name": "system-core",
+                        "project_identity": (
+                            "android.googlesource.com/platform%2Fsystem%2Fcore"
+                        ),
+                    },
+                    {
+                        "bare_name": "system-core",
+                        "project_identity": "example.com/vendor%2Fsystem%2Fcore",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(streaming_reindex.SymbolIdentityError, match="maps to both"):
+        streaming_reindex.load_project_identity_map(repo_list)
+
+
+def test_commit_range_materializes_short_repo_with_repo_list_identity(tmp_path) -> None:
+    from scripts import streaming_reindex_commits
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "name": "s2n-tls",
+                        "owner_repo": "aws/s2n-tls",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    text = "int tls_init() { return 0; }"
+    enriched = tmp_path / "s2n-tls.enriched.jsonl"
+    enriched.write_text(
+        json.dumps(
+            {
+                "symbol_identity_schema_version": 3,
+                "symbol_identities": [],
+                "text": text,
+                "filepath": "tls/init.c",
+                "doc_type": "code",
+                "structure_ids": [3] * len(text),
+                "chunk_boundaries": [
+                    {
+                        "start": 0,
+                        "end": len(text),
+                        "kind": 3,
+                        "dep_level": 0,
+                    }
+                ],
+                "call_edges": [],
+                "type_edges": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    project_id = streaming_reindex_commits.sr.resolve_project_identity(
+        "s2n-tls", repo_list
+    )
+    output = streaming_reindex_commits.stage_materialize_commit_range(
+        "s2n-tls",
+        0,
+        enriched,
+        tmp_path,
+        project_id=project_id,
+    )
+
+    assert output == tmp_path / "s2n-tls::r0.tok.parquet"
+    assert pq.read_table(output, columns=["repo"]).column("repo").to_pylist() == [
+        "aws/s2n-tls"
+    ]
+
+
+def test_commit_range_materialize_rejects_unresolved_short_repo(tmp_path) -> None:
+    from scripts import streaming_reindex_commits
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(json.dumps({"repos": []}), encoding="utf-8")
+
+    with pytest.raises(
+        streaming_reindex_commits.sr.SymbolIdentityError,
+        match="no canonical project identity for bare repo 's2n-tls'",
+    ):
+        streaming_reindex_commits.process_range(
+            repo="s2n-tls",
+            repo_dir=tmp_path / "repo",
+            records_jsonl=tmp_path / "records.jsonl",
+            start_idx=0,
+            end_idx=1,
+            lengths_sorted=(1024,),
+            repo_work=tmp_path / "work",
+            repo_list=repo_list,
+        )
+
+    assert not (tmp_path / "work").exists()
+    assert not (tmp_path / "s2n-tls::r0.tok.parquet").exists()
 
 
 def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:

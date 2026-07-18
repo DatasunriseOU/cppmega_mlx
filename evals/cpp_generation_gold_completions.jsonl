@@ -1,0 +1,2 @@
+{"task_id":"case3_add_one_checked","completion":"  return clamped + 1;\n","completion_source":"gold_fixture"}
+{"task_id":"standalone_abs","completion":"  return value < 0 ? -value : value;\n","completion_source":"gold_fixture"}

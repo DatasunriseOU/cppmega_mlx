@@ -12,16 +12,22 @@ find_package(
   Python 3.11
   COMPONENTS Interpreter Development.Module
   REQUIRED)
-execute_process(
-  COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  OUTPUT_VARIABLE nanobind_ROOT)
+if(NOT DEFINED nanobind_DIR)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE nanobind_ROOT
+    COMMAND_ERROR_IS_FATAL ANY)
+endif()
 find_package(nanobind CONFIG REQUIRED)
 
-execute_process(
-  COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  OUTPUT_VARIABLE MLX_ROOT)
+if(NOT DEFINED MLX_ROOT)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m mlx --cmake-dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE MLX_ROOT
+    COMMAND_ERROR_IS_FATAL ANY)
+endif()
 find_package(MLX CONFIG REQUIRED)
 
 add_library(cppmega_native_optim)

@@ -6,6 +6,19 @@ import numpy as np
 import pytest
 
 from cppmega_mlx.data.parquet_dataset import TokenParquetDataset
+from cppmega_mlx.data.code_packet_builder import build_code_packets
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    validate_case5_contract_metadata,
+)
+from cppmega_mlx.data.source_identity import source_identity
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
 from cppmega_mlx.data.nanochat_pipeline.platform_vocab import MAX_PLATFORM_IDS
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
@@ -36,9 +49,15 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_DEP_LEVELS_COLUMN,
     TOKEN_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
+    TOKEN_SYMBOL_IDS_COLUMN,
+    TOKEN_CALL_TARGETS_COLUMN,
+    TOKEN_TYPE_REFS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
 )
 from scripts.nanochat_data import pack_enriched_rows as packer
+from tools.clang_indexer import index_project as symbol_identity
 from scripts.nanochat_data.pack_enriched_rows import (
     DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
@@ -57,15 +76,40 @@ from scripts.nanochat_data.pack_enriched_rows import (
     SOURCE_REPO_STABLE_IDS_COLUMN,
     SOURCE_DOC_TYPES_COLUMN,
     TARGET_IDS_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
     normalize_document_record,
     pack_documents,
     pack_parquet_dataset,
+    rows_to_table,
 )
 
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
+
+
+def _input_schema_metadata(*, symbol_identity: bool = True) -> dict[bytes, bytes]:
+    metadata = {
+        DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): DOMAIN_SCHEMA_SHA256.encode(
+            "ascii"
+        ),
+        TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+            "utf-8"
+        ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
+        DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode(
+            "utf-8"
+        ): DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
+    }
+    if symbol_identity:
+        metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] = str(
+            packer.REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+        ).encode("ascii")
+    return metadata
+
+
+def test_input_schema_fixture_carries_the_full_case5_contract() -> None:
+    validate_case5_contract_metadata(_input_schema_metadata(), where="test fixture")
 
 
 def _doc(
@@ -117,7 +161,48 @@ def _normalize(records: list[dict[str, object]]):
 
 
 def _write_input_parquet(path: Path, records: list[dict[str, object]]) -> None:
-    pq.write_table(pa.Table.from_pylist(records), path)
+    symbol_columns = (
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+    )
+    special_columns = {*symbol_columns, "token_def_use", "symbol_identities"}
+    table = pa.Table.from_pylist(
+        [
+            {key: value for key, value in record.items() if key not in special_columns}
+            for record in records
+        ]
+    )
+    for column in symbol_columns:
+        table = table.append_column(
+            column,
+            pa.array(
+                [record.get(column, []) for record in records],
+                type=pa.list_(pa.uint64()),
+            ),
+        )
+    table = table.append_column(
+        "token_def_use",
+        pa.array(
+            [record.get("token_def_use", []) for record in records],
+            type=pa.list_(pa.uint8()),
+        ),
+    )
+    table = table.append_column(
+        "symbol_identities",
+        pa.array(
+            [record.get("symbol_identities", []) for record in records],
+            type=pa.list_(
+                pa.struct(
+                    [
+                        pa.field("symbol_id", pa.uint64()),
+                        pa.field("symbol_key", pa.string()),
+                    ]
+                )
+            ),
+        ),
+    ).replace_schema_metadata(_input_schema_metadata())
+    pq.write_table(table, path)
 
 
 def test_best_fit_strategy_matches_cppmega_largest_fitting_row_order() -> None:
@@ -219,6 +304,11 @@ def test_packed_doc_ids_do_not_collapse_same_file_documents() -> None:
     row = rows[0]
     assert row[SOURCE_DOC_INDICES_COLUMN] == [38, 41]
     assert row[DOC_IDS_COLUMN] == [1, 1, 2, 2, 2]
+    valid_source_ids = row[TOKEN_SOURCE_DOC_IDS_COLUMN][:4]
+    assert all(source_id > 0 for source_id in valid_source_ids)
+    assert len(set(valid_source_ids)) == 1
+    assert valid_source_ids[0] != 11
+    assert row[TOKEN_SOURCE_DOC_IDS_COLUMN][-1] == 0
     assert row[LOSS_MASK_COLUMN] == [1, 0, 1, 0, 0]
 
 
@@ -385,7 +475,7 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
                 token_chunk_dep_levels=[0, 2],
                 token_call_edges=[{"from": 1, "to": 0}],
                 token_type_edges=[{"from": 0, "to": 1}],
-                token_domain_edges=[{"from": 1, "to": 2, "kind": 21}],
+                token_domain_edges=[{"from": 1, "to": 2, "kind": 5}],
                 token_build_edges=[{"from": 1, "to": 2, "kind": 21}],
                 changed_chunk_ids=[1],
                 changed_chunk_spans=[{"start": 1, "end": 3}],
@@ -411,7 +501,7 @@ def test_pack_documents_carries_token_and_chunk_metadata_with_offsets() -> None:
     assert row[TOKEN_CHUNK_DEP_LEVELS_COLUMN] == [0, 2, 1]
     assert row[TOKEN_CALL_EDGES_COLUMN] == [{"from": 1, "to": 0}]
     assert row[TOKEN_TYPE_EDGES_COLUMN] == [{"from": 0, "to": 1}]
-    assert row[TOKEN_DOMAIN_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 21}]
+    assert row[TOKEN_DOMAIN_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 5}]
     assert row[TOKEN_BUILD_EDGES_COLUMN] == [{"from": 1, "to": 2, "kind": 21}]
     assert row[CHANGED_CHUNK_IDS_COLUMN] == [1, 2]
     assert row[CHANGED_CHUNK_SPANS_COLUMN] == [
@@ -581,6 +671,231 @@ def test_pack_parquet_dataset_marks_macro_route_schema_version(tmp_path: Path) -
     assert metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] == (
         PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
     )
+    assert metadata[packer.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] == b"3"
+    assert metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] == (
+        DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+    )
+    assert metadata[DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")] == (
+        DOMAIN_SCHEMA_SHA256.encode("ascii")
+    )
+    assert metadata[TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")] == (
+        TOKENIZER_CONTRACT_SHA256.encode("ascii")
+    )
+
+
+def test_packer_rejects_cross_project_symbol_id_collision_across_shards(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    first_key = symbol_identity.canonical_symbol_identity(
+        qname="left::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo-a",
+        file="route.cpp",
+    )
+    second_key = symbol_identity.canonical_symbol_identity(
+        qname="right::route",
+        kind="FUNCTION_DECL",
+        canonical_signature="display=route(int)|type=int (int)",
+        project="owner/repo-b",
+        file="route.cpp",
+    )
+    claimed_id = symbol_identity._compute_symbol_id(first_key)
+    identity_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("symbol_id", pa.uint64()),
+                pa.field("symbol_key", pa.string()),
+            ]
+        )
+    )
+    shard_schema = pa.schema(
+        [
+            pa.field(TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+            pa.field("token_symbol_ids", pa.list_(pa.uint64())),
+            pa.field("token_call_targets", pa.list_(pa.uint64())),
+            pa.field("token_type_refs", pa.list_(pa.uint64())),
+            pa.field("token_def_use", pa.list_(pa.uint8())),
+            pa.field("symbol_identities", identity_type),
+        ],
+        metadata=_input_schema_metadata(),
+    )
+    for shard_index, key in enumerate((first_key, second_key)):
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        TOKEN_IDS_COLUMN: [1],
+                        "token_symbol_ids": [claimed_id],
+                        "token_call_targets": [0],
+                        "token_type_refs": [0],
+                        "token_def_use": [0],
+                        "symbol_identities": [
+                            {"symbol_id": claimed_id, "symbol_key": key}
+                        ],
+                    }
+                ],
+                schema=shard_schema,
+            ),
+            input_dir / f"shard_{shard_index:05d}.parquet",
+        )
+
+    with pytest.raises(RuntimeError, match="symbol ID collision"):
+        packer._require_symbol_identity_schema(input_dir)
+
+
+def test_pack_parquet_dataset_rejects_stale_symbol_identity_schema(tmp_path: Path) -> None:
+    input_path = tmp_path / "stale.parquet"
+    output_path = tmp_path / "packed.parquet"
+    table = pa.Table.from_pylist([_doc([1, 2, 3])]).replace_schema_metadata(
+        _input_schema_metadata(symbol_identity=False)
+    )
+    pq.write_table(table, input_path)
+
+    with pytest.raises(RuntimeError, match="regenerate.*clang USR"):
+        pack_parquet_dataset(input_path, output_path, target_length=8)
+    assert not output_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "replacement"),
+    [
+        (DOMAIN_SCHEMA_SHA256_METADATA_KEY, None),
+        (TOKENIZER_CONTRACT_SHA256_METADATA_KEY, b"0" * 64),
+        (DOMAIN_DELIMITER_CONTRACT_METADATA_KEY, None),
+    ],
+)
+def test_pack_parquet_dataset_rejects_missing_or_stale_contract_hashes(
+    tmp_path: Path,
+    metadata_key: str,
+    replacement: bytes | None,
+) -> None:
+    input_path = tmp_path / "stale_contract.parquet"
+    output_path = tmp_path / "packed.parquet"
+    _write_input_parquet(input_path, [_doc([1, 2, 3])])
+    table = pq.read_table(input_path)
+    metadata = dict(table.schema.metadata or {})
+    encoded_key = metadata_key.encode("utf-8")
+    if replacement is None:
+        metadata.pop(encoded_key)
+    else:
+        metadata[encoded_key] = replacement
+    pq.write_table(table.replace_schema_metadata(metadata), input_path)
+
+    with pytest.raises(ValueError, match="missing or stale frozen CASE5"):
+        pack_parquet_dataset(input_path, output_path, target_length=8)
+    assert not output_path.exists()
+
+
+def test_uint64_source_and_symbol_ids_reach_training_batch_and_code_packet(
+    tmp_path: Path,
+) -> None:
+    identity = next(
+        candidate
+        for index in range(100)
+        if (
+            candidate := source_identity(
+                {"source_path": f"training-receipt-{index}.cpp"}
+            )
+        ).source_identity_id > (1 << 63)
+    )
+    high_id = identity.source_identity_id
+    symbol_key = next(
+        key
+        for index in range(100)
+        if symbol_identity._compute_symbol_id(
+            key := symbol_identity.canonical_symbol_identity(
+                qname=f"receipt::symbol_{index}",
+                kind="FUNCTION_DECL",
+                canonical_signature=f"display=symbol_{index}()|type=void ()",
+                project="fixtures/training-receipt",
+                file="receipt.cpp",
+            )
+        )
+        > (1 << 63)
+    )
+    symbol_high_id = symbol_identity._compute_symbol_id(symbol_key)
+    doc = normalize_document_record(
+        {
+            TOKEN_IDS_COLUMN: [10, 11, 12, 13],
+            TOKEN_SOURCE_IDENTITY_IDS_COLUMN: [high_id] * 4,
+            TOKEN_SYMBOL_IDS_COLUMN: [symbol_high_id, 0, 0, 0],
+            TOKEN_CALL_TARGETS_COLUMN: [0, symbol_high_id, 0, 0],
+            TOKEN_TYPE_REFS_COLUMN: [0, 0, symbol_high_id, 0],
+            "symbol_identities": [
+                {"symbol_id": symbol_high_id, "symbol_key": symbol_key}
+            ],
+            SOURCE_IDENTITY_REGISTRY_COLUMN: [identity.as_dict()],
+        },
+        source_doc_index=0,
+    )
+    rows, overflow = pack_documents([doc], target_length=4, strategy="sequential")
+    assert overflow == []
+    packed_path = tmp_path / "training_receipt.parquet"
+    table = rows_to_table(rows)
+    pq.write_table(table, packed_path)
+
+    dataset = TokenParquetDataset(
+        packed_path,
+        seq_len=4,
+        batch_size=1,
+        token_key=INPUT_IDS_COLUMN,
+    )
+    batch = next(dataset.iter_batches())
+    domain_ids = np.asarray(
+        batch.side_channels["domain_routes"][TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    )
+    semantic_ids = np.asarray(
+        batch.side_channels["semantic_graph"][TOKEN_SYMBOL_IDS_COLUMN]
+    )
+    assert domain_ids.dtype == np.uint64
+    assert semantic_ids.dtype == np.uint64
+    assert int(domain_ids[0, 0]) == high_id
+    assert int(semantic_ids[0, 0]) == symbol_high_id
+    receipt = dataset.parquet_receipt["family_side_channel_sources"]
+    assert receipt["domain_routes"][TOKEN_SOURCE_IDENTITY_IDS_COLUMN]["type"] == (
+        "list<element: uint64>"
+    )
+
+    packet = build_code_packets(batch, table)[0]
+    assert int(np.asarray(packet.source_identity_ids)[0]) == high_id
+    assert int(np.asarray(packet.symbol_ids)[0]) == symbol_high_id
+
+
+def test_pack_parquet_dataset_preserves_multi_source_identity_registry(
+    tmp_path: Path,
+) -> None:
+    identities = [
+        source_identity({"source_path": "repo/src/root.cpp"}),
+        source_identity({"source_path": "boost/include/boost/route.hpp"}),
+    ]
+    record = _doc([10, 11])
+    record[TOKEN_SOURCE_IDENTITY_IDS_COLUMN] = [
+        identity.source_identity_id for identity in identities
+    ]
+    record[SOURCE_IDENTITY_REGISTRY_COLUMN] = [
+        identity.as_dict() for identity in identities
+    ]
+    input_path = tmp_path / "multi_source.parquet"
+    output_path = tmp_path / "packed.parquet"
+    _write_input_parquet(input_path, [record])
+
+    pack_parquet_dataset(
+        input_path,
+        output_path,
+        target_length=2,
+        strategy="sequential",
+    )
+
+    row = pq.read_table(output_path).to_pylist()[0]
+    expected = {identity.source_identity_id for identity in identities}
+    assert set(row[TOKEN_SOURCE_IDENTITY_IDS_COLUMN]) == expected
+    assert {
+        int(entry["source_identity_id"])
+        for entry in row[SOURCE_IDENTITY_REGISTRY_COLUMN]
+    } == expected
 
 
 def test_pack_parquet_dataset_streams_windows_without_full_input_load(

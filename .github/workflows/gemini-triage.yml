@@ -18,7 +18,7 @@ defaults:
 
 jobs:
   triage:
-    runs-on: 'ubuntu-latest'
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     timeout-minutes: 7
     outputs:
       available_labels: '${{ steps.get_labels.outputs.available_labels }}'
@@ -59,7 +59,7 @@ jobs:
         id: 'gemini_analysis'
         if: |-
           ${{ steps.get_labels.outputs.available_labels != '' }}
-        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        uses: 'google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489' # v0
         env:
           GITHUB_TOKEN: '' # Do NOT pass any auth tokens here since this runs on untrusted inputs
           ISSUE_TITLE: '${{ github.event.issue.title }}'
@@ -100,7 +100,7 @@ jobs:
           prompt: '/gemini-triage'
 
   label:
-    runs-on: 'ubuntu-latest'
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     needs:
       - 'triage'
     if: |-

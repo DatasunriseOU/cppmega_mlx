@@ -14,15 +14,18 @@ Asserts, on the tiny ``golden_mini`` fixture with a tiny model profile:
 from __future__ import annotations
 
 import random
+from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.fim import FIMSpecialTokenIds
+from cppmega_mlx.data.ast_fim import domain_preserving_document_spans
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM
 from cppmega_mlx.training.objectives import build_causal_lm
-from cppmega_mlx.training.task_mixer import TaskKind
 from scripts.train_stage1 import (
     _ALIGNED_OBJECTIVES,
     _REORDERED_OBJECTIVES,
@@ -30,6 +33,7 @@ from scripts.train_stage1 import (
     _assert_aligned,
     build_train_step,
     load_code_packets,
+    load_commit_packets,
     smoke_config,
     run_training,
 )
@@ -61,9 +65,112 @@ def test_both_channel_on_and_channel_off_steps_occur(smoke_results: dict) -> Non
     # Side-channel-OFF family (reordered / synthesized: fim / commit).
     assert smoke_results["reordered_steps"] > 0
     assert any(obj in _REORDERED_OBJECTIVES for obj in dist), dist
-    # At least one FIM-permuted AND one commit-synthesized objective fired.
+    # This legacy fixture smoke intentionally has no typed commit/IFIM columns;
+    # production coverage lives in test_production_objective_mixer.py.
+    assert "fim" in dist, dist
     assert "ast_fim" in dist, dist
-    assert ("commit_diff" in dist) or ("pre_to_post" in dist), dist
+    assert "ifim" not in dist
+    assert "commit_diff" not in dist
+    assert dist == {"causal_lm": 112, "fim": 14, "ast_fim": 14}
+
+
+def test_commit_loader_requires_and_preserves_typed_upstream_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "typed_commits.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "pre_token_ids": [[10, 11]],
+                "post_token_ids": [[20, 21]],
+                "diff_token_ids": [[30, 31, 32]],
+                "commit_msg_token_ids": [[40, 41]],
+                "repo": ["repo"],
+                "filepath": ["src/demo.cc"],
+                "commit_hash": ["abc123"],
+            }
+        ),
+        path,
+    )
+
+    packets = load_commit_packets(path, vocab_size=VOCAB)
+
+    assert len(packets) == 1
+    assert np.asarray(packets[0].pre_token_ids).tolist() == [10, 11]
+    assert np.asarray(packets[0].post_token_ids).tolist() == [20, 21]
+    assert np.asarray(packets[0].diff_token_ids).tolist() == [30, 31, 32]
+    assert np.asarray(packets[0].commit_msg).tolist() == [40, 41]
+
+
+def test_code_loader_preserves_packed_document_ids_for_domain_fim(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "packed_code.parquet"
+    token_ids = [2, 191, 41, 192, 2, 191, 42, 192]
+    row = {
+        "input_ids": [token_ids],
+        "target_ids": [token_ids],
+        "loss_mask": [[1] * len(token_ids)],
+        "doc_ids": [[1, 1, 1, 1, 2, 2, 2, 2]],
+        "valid_token_count": [len(token_ids)],
+        "token_structure_ids": [[0] * len(token_ids)],
+        "token_dep_levels": [[0] * len(token_ids)],
+        "token_ast_depth": [[0] * len(token_ids)],
+        "token_sibling_index": [[0] * len(token_ids)],
+        "token_ast_node_type": [[0] * len(token_ids)],
+        "token_symbol_ids": [[0] * len(token_ids)],
+        "token_call_targets": [[0] * len(token_ids)],
+        "token_type_refs": [[0] * len(token_ids)],
+        "token_def_use": [[0] * len(token_ids)],
+        "token_chunk_starts": [[1, 5]],
+        "token_chunk_ends": [[3, 7]],
+        "token_chunk_kinds": [[1, 1]],
+        "token_chunk_dep_levels": [[0, 0]],
+    }
+    pq.write_table(pa.table(row), path)
+
+    packet = load_code_packets([path], vocab_size=VOCAB)[0]
+    assert np.asarray(packet.document_ids).tolist() == [1, 1, 1, 1, 2, 2, 2, 2]
+    assert len(domain_preserving_document_spans(packet)) == 2
+
+
+def test_commit_loader_accepts_typed_golden_fixture() -> None:
+    packets = load_commit_packets(
+        GOLDEN_MINI / "commits" / "commits.parquet", vocab_size=VOCAB
+    )
+    # ``--format both`` emits two full pre/post rows and two valid diff-only
+    # rows.  The loader preserves both shapes; objective eligibility decides
+    # which task can consume each packet.
+    assert len(packets) == 4
+    assert all(packet.commit_msg is not None for packet in packets)
+    assert all(int(packet.commit_msg.shape[0]) >= 2 for packet in packets)
+    assert sum(packet.post_token_ids is None for packet in packets) == 2
+
+
+def test_commit_loader_preserves_partial_sections_without_synthesizing_them(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "partial_commits.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "pre_token_ids": [[10, 11], []],
+                "post_token_ids": [[], []],
+                "diff_token_ids": [[30, 31], [32]],
+                "commit_msg_token_ids": [[40], []],
+            }
+        ),
+        path,
+    )
+
+    packets = load_commit_packets(path, vocab_size=VOCAB)
+
+    assert len(packets) == 2
+    assert packets[0].post_token_ids is None
+    assert np.asarray(packets[0].commit_msg).tolist() == [40]
+    assert packets[1].pre_token_ids is None
+    assert packets[1].commit_msg is None
+    assert np.asarray(packets[1].diff_token_ids).tolist() == [32]
 
 
 def test_aligned_step_passes_channels_reordered_step_omits_them() -> None:

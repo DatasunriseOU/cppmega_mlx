@@ -72,6 +72,35 @@ class FailingAdapter(FakeCppAdapter):
         raise ValueError("no compile database")
 
 
+class SemanticIdentityAdapter(FakeCppAdapter):
+    version = "semantic-identity-v1"
+
+    def probe(self, context: Mapping[str, Any]) -> AdapterCapabilities:
+        del context
+        return AdapterCapabilities(
+            language=self.language,
+            version=self.version,
+            families=("semantic_graph",),
+        )
+
+    def map_to_tokens(
+        self,
+        metadata: str,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        del metadata, tokenizer
+        identity = (1 << 63) + 12345
+        return TokenMetadata(
+            side_channels={
+                "semantic_graph": {
+                    "token_symbol_ids": [identity] * len(tokens),
+                }
+            },
+            provenance={"adapter": self.version},
+        )
+
+
 def _tiny_model() -> HybridTinyLM:
     return HybridTinyLM(
         HybridTinyConfig(
@@ -146,6 +175,18 @@ def test_inference_side_channel_builder_adapter_metadata_smoke() -> None:
     assert result.cache_components.adapter_language == "cpp"
     assert result.cache_components.adapter_version == "fake-clang-v1"
     assert logits.shape[:2] == result.prompt_ids.shape
+
+
+def test_inference_side_channels_preserve_opaque_uint64_identities() -> None:
+    result = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        adapter=SemanticIdentityAdapter(),
+    ).build("int x;", language="cpp")
+
+    identities = result.side_channels["semantic_graph"]["token_symbol_ids"]
+    values = np.array(identities)
+    assert values.dtype == np.dtype(np.uint64)
+    assert set(values.reshape(-1).tolist()) == {(1 << 63) + 12345}
 
 
 def test_inference_side_channel_builder_result_feeds_generation_loop() -> None:

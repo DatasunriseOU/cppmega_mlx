@@ -26,7 +26,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega_mlx.data.source_identity import source_identity
 from scripts import download_verified_sidecar_from_nebius_s3 as download
+from scripts.nanochat_data.pack_enriched_rows import PACKED_ROW_OUTPUT_SCHEMA
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,29 +37,63 @@ SHARDS = 2
 
 
 def _write_green_shard(path: Path) -> None:
-    """Write a single-row parquet shard that passes every audit value check.
-
-    The audit derives the canonical loss-target rules from the columns below
-    (see ``audit_sidecar_parquet`` value-level validators):
-      * ``target_ids == input_ids[1:] + PAD``
-      * ``loss_mask[pos] == 1`` iff next token is the same doc and within valid
-      * ``trained_token_count == sum(loss_mask > 0)``
-    """
+    """Write a complete CASE5 row that passes the real audit gate."""
     length = int(BUCKET)
-    input_ids = list(range(10, 10 + length))  # in-vocab, distinct
-    target_ids = input_ids[1:] + [0]  # next-token shift + pad
-    loss_mask = [1] * (length - 1) + [0]  # single doc; last token excluded
-    doc_ids = [7] * length  # one document spanning the whole row
-    table = pa.table(
-        {
-            "input_ids": pa.array([input_ids], pa.list_(pa.int64())),
-            "target_ids": pa.array([target_ids], pa.list_(pa.int64())),
-            "loss_mask": pa.array([loss_mask], pa.list_(pa.int64())),
-            "doc_ids": pa.array([doc_ids], pa.list_(pa.int64())),
-            "valid_token_count": pa.array([length], pa.int64()),
-            "trained_token_count": pa.array([length - 1], pa.int64()),
-        }
-    )
+    input_ids = list(range(10, 10 + length))
+    identity = source_identity({"source_path": "fixture.cpp"})
+    row = {
+        "input_ids": input_ids,
+        "target_ids": input_ids[1:] + [0],
+        "loss_mask": [1] * (length - 1) + [0],
+        "doc_ids": [1] * length,
+        "valid_token_count": length,
+        "trained_token_count": length - 1,
+        "num_docs": 1,
+        "slack_tokens": 0,
+        "source_doc_ids": [1],
+        "source_doc_token_lengths": [length],
+        "source_platform_ids": [[7]],
+        "source_repo_stable_ids": ["9"],
+        "source_filepath_stable_ids": ["11"],
+        "source_file_local_commit_indices": [0],
+        "platform_ids": [7],
+        "token_platform_ids": [0] * length,
+        "token_structure_ids": [1] * length,
+        "token_dep_levels": [0] * length,
+        "token_ast_depth": [1] * length,
+        "token_sibling_index": list(range(length)),
+        "token_ast_node_type": [3] * length,
+        "token_symbol_ids": [0] * length,
+        "token_call_targets": [0] * length,
+        "token_type_refs": [0] * length,
+        "token_domain_ids": [0] * length,
+        "token_role_ids": [0] * length,
+        "token_entity_ids": [0] * length,
+        "token_scope_ids": [0] * length,
+        "token_source_doc_ids": [1] * length,
+        "token_source_identity_ids": [identity.source_identity_id] * length,
+        "token_confidence_ids": [0] * length,
+        "token_def_use": [0] * length,
+        "token_change_mask_pre": [0] * length,
+        "token_change_mask_post": [0] * length,
+        "hunk_id_per_token": [-1] * length,
+        "edit_op_per_token": [0] * length,
+        "token_chunk_starts": [0],
+        "token_chunk_ends": [length],
+        "token_chunk_kinds": [1],
+        "token_chunk_dep_levels": [0],
+        "token_call_edges": [],
+        "token_type_edges": [],
+        "token_domain_edges": [],
+        "token_build_edges": [],
+        "token_shell_edges": [],
+        "token_diagnostic_edges": [],
+        "token_cross_domain_edges": [],
+        "source_identity_registry": [identity.as_dict()],
+        "changed_chunk_ids": [],
+        "changed_chunk_spans": [],
+    }
+    table = pa.Table.from_pylist([row], schema=PACKED_ROW_OUTPUT_SCHEMA)
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path)
 

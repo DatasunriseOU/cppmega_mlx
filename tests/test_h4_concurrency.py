@@ -24,6 +24,7 @@ and PASSES with ConcurrentManifest.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import json
 import multiprocessing
 import sys
 import threading
@@ -39,6 +40,58 @@ PR_INGEST = SCRIPTS / "pr_ingest"
 for _p in (SCRIPTS, PR_INGEST):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+
+def _unit_result(source, *, repo=None, unit_range=None):
+    result = {
+        "source": source,
+        "lengths": {
+            "1024": {
+                "rows": 1,
+                "valid_tokens": 7,
+                "capacity_tokens": 8,
+                "pad_tokens": 1,
+            }
+        },
+    }
+    if repo is not None:
+        result["repo"] = repo
+    if unit_range is not None:
+        result["range"] = list(unit_range)
+    return result
+
+
+class _ManifestTransactionProbe:
+    def __init__(
+        self,
+        conveyor,
+        manifest_path,
+        reservation_path,
+        unit,
+        preserved_failures,
+    ):
+        self.conveyor = conveyor
+        self.manifest_path = manifest_path
+        self.reservation_path = reservation_path
+        self.unit = unit
+        self.repo = unit.rpartition("::")[0]
+        self.preserved_failures = tuple(preserved_failures)
+        self.states = []
+
+    def emit(self, event, **_fields):
+        if event not in {"unit_started", "unit_done"}:
+            return
+        snapshot = self.conveyor.ConcurrentManifest.load(self.manifest_path)
+        active = json.loads(self.reservation_path.read_text())["active"]
+        self.states.append(
+            (
+                event,
+                f"{self.repo}::repo" in snapshot.failed,
+                self.unit in snapshot.done,
+                all(key in snapshot.failed for key in self.preserved_failures),
+                self.unit in active,
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +147,388 @@ def test_concurrent_manifest_save_is_disabled(tmp_path):
     m = sc.ConcurrentManifest.load(tmp_path / "_done.json")
     with pytest.raises(RuntimeError, match="clobber"):
         m.save()
+
+
+def test_concurrent_manifest_retry_invalidates_stale_terminal_state(tmp_path):
+    """A failed re-run must never leave an older done receipt resumable."""
+    import streaming_conveyor as sc
+
+    path = tmp_path / "_done.json"
+    manifest = sc.ConcurrentManifest.load(path)
+    manifest.mark_done("repo::code", {"generation": "old"})
+    manifest.mark_failed("repo::repo", "unexpected", "old wrapper failure")
+    manifest.mark_started("repo::code")
+
+    started = sc.ConcurrentManifest.load(path)
+    assert "repo::code" not in started.done
+    assert "repo::code" not in started.failed
+    assert "repo::repo" in started.failed
+
+    started.mark_failed("repo::code", "index", "new run failed")
+    failed = sc.ConcurrentManifest.load(path)
+    assert "repo::code" not in failed.done
+    assert failed.failed["repo::code"]["stage"] == "index"
+    assert "repo::repo" in failed.failed
+
+
+@pytest.mark.parametrize(
+    ("unit_key", "info"),
+    [
+        ("repo::code", {"source": "code", "rows": 1}),
+        ("repo::r0", {"source": "commits", "range": [0, 1]}),
+    ],
+)
+def test_concurrent_manifest_success_atomically_reconciles_repo_failure_alias(
+    tmp_path,
+    monkeypatch,
+    unit_key,
+    info,
+):
+    """A concrete success clears only its stale generic failure alias."""
+    import streaming_conveyor as sc
+
+    path = tmp_path / "_done.json"
+    manifest = sc.ConcurrentManifest.load(path)
+    manifest.mark_failed("repo::repo", "unexpected", "old wrapper failure")
+    manifest.mark_failed(unit_key, "pack", "old concrete failure")
+    manifest.mark_failed("repo::r99", "pack", "unrelated failed range")
+    manifest.mark_failed("repo::commits", "extract", "aggregate commit failure")
+    manifest.mark_failed("other::repo", "unexpected", "other repo failure")
+
+    writes = []
+    atomic_replace = manifest._atomic_replace
+
+    def capture_atomic_replace(done, failed):
+        writes.append((dict(done), dict(failed)))
+        atomic_replace(done, failed)
+
+    monkeypatch.setattr(manifest, "_atomic_replace", capture_atomic_replace)
+    manifest.mark_done(unit_key, info)
+
+    assert len(writes) == 1
+    written_done, written_failed = writes[0]
+    assert written_done[unit_key] == info
+    assert unit_key not in written_failed
+    assert "repo::repo" not in written_failed
+    assert "repo::r99" in written_failed
+    assert "repo::commits" in written_failed
+    assert "other::repo" in written_failed
+
+    reloaded = sc.ConcurrentManifest.load(path)
+    assert reloaded.done == written_done
+    assert reloaded.failed == written_failed
+
+
+def test_code_rerun_reconciles_alias_before_done_progress_and_reservation_release(
+    tmp_path,
+    monkeypatch,
+):
+    import streaming_conveyor as sc
+
+    sc.STOP_EVENT.clear()
+    repo = "repo"
+    unit = sc.code_key(repo)
+    manifest_path = tmp_path / "_done.json"
+    reservation_path = tmp_path / "reservations.json"
+    manifest = sc.ConcurrentManifest.load(manifest_path)
+    manifest.mark_failed(f"{repo}::repo", "unexpected", "old wrapper failure")
+    preserved_failure = f"{repo}::r99"
+    manifest.mark_failed(preserved_failure, "pack", "unrelated range failure")
+    reservations = sc.UnitReservationLedger(reservation_path)
+    progress = _ManifestTransactionProbe(
+        sc,
+        manifest_path,
+        reservation_path,
+        unit,
+        (preserved_failure,),
+    )
+
+    monkeypatch.setattr(sc.sr, "is_code_worktree_repo", lambda _repo: True)
+    monkeypatch.setattr(sc.sr, "resolve_project_identity", lambda *_args: "tests/repo")
+    monkeypatch.setattr(
+        sc,
+        "run_code_half_adaptive",
+        lambda *_args, **_kwargs: _unit_result("code"),
+    )
+    work_root = tmp_path / "work"
+    repo_dir = work_root / repo / "_src"
+    repo_dir.mkdir(parents=True)
+
+    with cf.ThreadPoolExecutor(max_workers=1) as pool:
+        result = sc.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(),
+            range_size=1,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "work_parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=True,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=None,
+            streams="code",
+            progress=progress,
+            reservations=reservations,
+        )
+
+    assert isinstance(result["code"], dict)
+    assert progress.states == [
+        ("unit_started", True, False, True, True),
+        ("unit_done", False, True, True, True),
+    ]
+    final = sc.ConcurrentManifest.load(manifest_path)
+    assert unit in final.done
+    assert f"{repo}::repo" not in final.failed
+    assert preserved_failure in final.failed
+    assert json.loads(reservation_path.read_text())["active"] == {}
+
+
+def test_range_rerun_reconciles_alias_before_done_progress_and_reservation_release(
+    tmp_path,
+):
+    import streaming_conveyor as sc
+
+    sc.STOP_EVENT.clear()
+    repo = "repo"
+    unit = sc.range_key(repo, 0)
+    manifest_path = tmp_path / "_done.json"
+    reservation_path = tmp_path / "reservations.json"
+    manifest = sc.ConcurrentManifest.load(manifest_path)
+    manifest.mark_failed(f"{repo}::repo", "unexpected", "old wrapper failure")
+    manifest.mark_failed(unit, "pack", "old concrete failure")
+    preserved_failures = (f"{repo}::r99", f"{repo}::commits")
+    manifest.mark_failed(preserved_failures[0], "pack", "unrelated range failure")
+    manifest.mark_failed(preserved_failures[1], "extract", "aggregate failure")
+    reservations = sc.UnitReservationLedger(reservation_path)
+    progress = _ManifestTransactionProbe(
+        sc,
+        manifest_path,
+        reservation_path,
+        unit,
+        preserved_failures,
+    )
+
+    records_jsonl = tmp_path / "records.jsonl"
+    records_jsonl.write_text("{}\n", encoding="utf-8")
+
+    def records_provider(*_args):
+        return records_jsonl, 1, "hit"
+
+    def successful_range_rerun(*args, **_kwargs):
+        start, end = args[3:5]
+        return _unit_result("commits", repo=repo, unit_range=(start, end))
+
+    with cf.ThreadPoolExecutor(max_workers=1) as pool:
+        done, failed, all_done = sc.run_commits_half(
+            repo=repo,
+            repo_dir=tmp_path / "repo_src",
+            repo_work=tmp_path / "repo_work",
+            work_root=tmp_path / "work",
+            work_parent=tmp_path / "work_parent",
+            lengths_commits=(1024,),
+            range_size=1,
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=None,
+            progress=progress,
+            reservations=reservations,
+            range_submit_window=1,
+            range_target_bytes=0,
+            range_runner_override=successful_range_rerun,
+            commit_records_override=records_provider,
+        )
+
+    assert (done, failed, all_done) == (1, 0, False)
+    assert progress.states == [
+        ("unit_started", True, False, True, True),
+        ("unit_done", False, True, True, True),
+    ]
+    final = sc.ConcurrentManifest.load(manifest_path)
+    assert unit in final.done
+    assert f"{repo}::repo" not in final.failed
+    assert all(key in final.failed for key in preserved_failures)
+    assert json.loads(reservation_path.read_text())["active"] == {}
+
+
+def test_deferred_promotion_failure_records_range_and_releases_reservation(
+    tmp_path,
+    monkeypatch,
+):
+    import streaming_conveyor as sc
+
+    sc.STOP_EVENT.clear()
+    repo = "s2n-tls"
+    failed_unit = sc.range_key(repo, 500)
+    manifest_path = tmp_path / "_done.json"
+    reservation_path = tmp_path / "reservations.json"
+    manifest = sc.ConcurrentManifest.load(manifest_path)
+    manifest.mark_done(
+        sc.range_key(repo, 0),
+        {"source": "commits", "range": [0, 500], "lengths": {}},
+    )
+    reservations = sc.UnitReservationLedger(reservation_path)
+    progress_path = tmp_path / "progress.jsonl"
+    records_jsonl = tmp_path / "records.jsonl"
+    records_jsonl.write_text("{}\n" * 501, encoding="utf-8")
+    stage_family = []
+
+    def records_provider(*_args):
+        return records_jsonl, 501, "hit"
+
+    def successful_range_before_promotion(*args, **kwargs):
+        start, end = args[3:5]
+        assert (start, end) == (500, 501)
+        assert kwargs["defer_promote"] is True
+        stage_db = kwargs["deferred_stage_dir"] / "s2n-r500.sqlite"
+        stage_db.parent.mkdir(parents=True, exist_ok=True)
+        stage_family.extend(
+            (stage_db, Path(f"{stage_db}-wal"), Path(f"{stage_db}-shm"))
+        )
+        for path in stage_family:
+            path.write_text("staged", encoding="utf-8")
+        result = _unit_result("commits", repo=repo, unit_range=(start, end))
+        result["dedup_stage"] = {
+            "stage_id": "commit:s2n-tls:r500:501",
+            "stage_db": str(stage_db),
+        }
+        return result
+
+    def fail_promotion(_dedup_db, stages):
+        assert stages == [
+            ("commit:s2n-tls:r500:501", stage_family[0]),
+        ]
+        active = json.loads(reservation_path.read_text())["active"]
+        assert failed_unit in active
+        raise RuntimeError("injected deferred promotion failure")
+
+    monkeypatch.setattr(sc.sr, "promote_dedup_stages", fail_promotion)
+    with cf.ThreadPoolExecutor(max_workers=1) as pool:
+        done, failed, all_done = sc.run_commits_half(
+            repo=repo,
+            repo_dir=tmp_path / "repo_src",
+            repo_work=tmp_path / "repo_work",
+            work_root=tmp_path / "work",
+            work_parent=tmp_path / "work_parent",
+            lengths_commits=(1024,),
+            range_size=500,
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            dedup_db=tmp_path / "dedup.sqlite",
+            dedup_near=False,
+            pr_store=None,
+            repo_list=None,
+            progress=sc.ProgressWriter(progress_path),
+            reservations=reservations,
+            range_submit_window=1,
+            range_target_bytes=0,
+            dedup_promote_batch_size=2,
+            range_runner_override=successful_range_before_promotion,
+            commit_records_override=records_provider,
+        )
+
+    assert (done, failed, all_done) == (0, 1, False)
+    final = sc.ConcurrentManifest.load(manifest_path)
+    assert failed_unit not in final.done
+    assert final.failed[failed_unit]["stage"] == "dedup_promote"
+    assert "injected deferred promotion failure" in final.failed[failed_unit]["detail"]
+    assert json.loads(reservation_path.read_text())["active"] == {}
+    assert stage_family and not any(path.exists() for path in stage_family)
+    unit_events = [
+        row
+        for row in map(json.loads, progress_path.read_text().splitlines())
+        if row.get("unit") == failed_unit
+    ]
+    assert [row["event"] for row in unit_events] == ["unit_started", "unit_failed"]
+
+
+def test_source_stream_observes_failed_repo_future_while_next_extract_blocks(tmp_path):
+    import streaming_conveyor as sc
+
+    manifest_path = tmp_path / "_done.json"
+    manifest = sc.ConcurrentManifest.load(manifest_path)
+    repo_future = cf.Future()
+    inflight = {repo_future: "s2n-tls"}
+    source_blocked = threading.Event()
+    failure_recorded = threading.Event()
+    accounted = []
+
+    def blocking_source():
+        source_blocked.set()
+        assert failure_recorded.wait(2), "repo failure was not drained during extraction"
+        yield "php-src", tmp_path / "php-src"
+
+    def fail_repo_after_source_blocks():
+        assert source_blocked.wait(1)
+        repo_future.set_exception(
+            sc.RepoFailure("s2n-tls", "dedup_promote", "injected repo failure")
+        )
+
+    def account_repo(future, repo):
+        accounted.append(
+            sc.handle_repo_future_result(
+                future,
+                repo,
+                manifest,
+                threading.Lock(),
+            )
+        )
+        failure_recorded.set()
+
+    failure_thread = threading.Thread(target=fail_repo_after_source_blocks)
+    failure_thread.start()
+    source = sc.stream_source_with_repo_future_drain(
+        blocking_source(),
+        inflight,
+        account_repo,
+        poll_interval_s=0.01,
+    )
+    try:
+        assert next(source) == ("php-src", tmp_path / "php-src")
+    finally:
+        source.close()
+        failure_thread.join(2)
+
+    assert not failure_thread.is_alive()
+    assert accounted == [(1, 0, 0, 1)]
+    assert inflight == {}
+    final = sc.ConcurrentManifest.load(manifest_path)
+    assert final.failed["s2n-tls::repo"]["stage"] == "dedup_promote"
+
+
+def test_concurrent_manifest_prefix_restart_preserves_other_stream(tmp_path):
+    """A commit restart clears its ranges without clobbering code receipts."""
+    import streaming_conveyor as sc
+
+    path = tmp_path / "_done.json"
+    code_writer = sc.ConcurrentManifest.load(path)
+    commit_writer = sc.ConcurrentManifest.load(path)
+    code_writer.mark_done("repo::code", {"rows": 1})
+    commit_writer.mark_done("repo::r0", {"rows": 2})
+    commit_writer.mark_failed("repo::r10", "pack", "old failure")
+
+    commit_writer.mark_started_prefix("repo::r")
+
+    reloaded = sc.ConcurrentManifest.load(path)
+    assert reloaded.is_done("repo::code")
+    assert "repo::r0" not in reloaded.done
+    assert "repo::r10" not in reloaded.failed
 
 
 def _mp_manifest_writer(manifest_path: str, keys: list[str]) -> None:

@@ -25,6 +25,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from cppmega_mlx.data.batch import (
+    batch_values_are_prevalidated,
+    ensure_lm_batch,
+)
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS, PLATFORM_VOCAB_SIZE
 from cppmega_mlx.data.packing import mlx_document_boundary_mask
 from cppmega_mlx.inference.engine import ContiguousKVCache, kv_cache_position
@@ -748,13 +752,10 @@ class HybridTinyBlock(nn.Module):
     ) -> mx.array:
         """Return this route's pre-residual contribution for regression tests.
 
-        ``doc_ids`` is the raw ``(B, S)`` int32 document boundary tensor. Only
-        the ``engram`` backend currently consumes it (to prevent n-gram
-        aggregation from crossing packed document boundaries). The
-        ``attention`` backend has its own additive-mask channel (``mask``) for
-        the same purpose, and the remaining backends (``mamba3``, ``moe``,
-        ``m2rnn``, ``concept``) do not yet support document-aware routing in
-        this repo, so they silently ignore ``doc_ids``.
+        ``doc_ids`` is the raw ``(B, S)`` int32 document boundary tensor.
+        Attention consumes the corresponding dense mask; Engram, Mamba3, and
+        M2RNN consume the IDs directly so their local/recurrent state resets at
+        every packed-document boundary.
         """
 
         self.validate_backend()
@@ -776,10 +777,10 @@ class HybridTinyBlock(nn.Module):
                 h0 = mamba3.initial_h0(x.shape[0], x.dtype)
                 h0 = self._emit_path_c_activation("mamba3_h0", h0)
                 h0 = self._emit_path_c_activation("state_in", h0)
-                delta, state = mamba3(x, h0=h0)
+                delta, state = mamba3(x, h0=h0, document_ids=doc_ids)
                 self._emit_path_c_activation("state", state)
             else:
-                delta, _ = mamba3(x)
+                delta, _ = mamba3(x, document_ids=doc_ids)
         elif self.backend == "moe":
             delta = cast(ReferenceMoE, self.block)(x).output
         elif self.backend == "m2rnn":
@@ -794,11 +795,12 @@ class HybridTinyBlock(nn.Module):
                 delta, state = m2rnn(
                     x,
                     h0=h0,
+                    document_ids=doc_ids,
                     return_state=True,
                 )
                 self._emit_path_c_activation("m2rnn_conv_state", state.conv_state)
             else:
-                delta, _ = m2rnn(x)
+                delta, _ = m2rnn(x, document_ids=doc_ids)
         elif self.backend == "engram":
             delta = cast(EngramBranch, self.block)(x, doc_ids=doc_ids)
         elif self.backend == "concept":
@@ -850,6 +852,29 @@ class HybridTinyLM(nn.Module):
 
         if dtype is not None and dtype != mx.float32:
             self.set_dtype(dtype)
+
+    def validate_compiled_batch(
+        self,
+        batch: Mapping[str, mx.array | None],
+    ) -> None:
+        """Validate transform-unsafe side-channel ranges before compilation."""
+
+        lm_batch = ensure_lm_batch(batch)
+        self.structure_embedding.validate_inputs(
+            structure_ids=lm_batch.structure_ids,
+            dep_levels=lm_batch.dep_levels,
+            ast_depth_ids=lm_batch.ast_depth_ids,
+            sibling_index_ids=lm_batch.sibling_index_ids,
+            node_type_ids=lm_batch.node_type_ids,
+        )
+        self.platform_embedding.validate_input_ids(lm_batch.platform_ids)
+        document_ids = lm_batch.input_document_ids
+        if document_ids is not None:
+            _validate_document_ids(
+                document_ids,
+                batch_size=int(lm_batch.inputs.shape[0]),
+                seq_length=int(lm_batch.inputs.shape[1]),
+            )
 
     @property
     def route_symbols(self) -> tuple[str, ...]:
@@ -2287,7 +2312,7 @@ class HybridTinyLM(nn.Module):
             for layer_index, layer in enumerate(self.layers):
                 if stop_layer_index is not None and layer_index >= stop_layer_index:
                     break
-                if layer.backend == "engram" and document_ids is not None:
+                if layer.backend in {"engram", "mamba3", "m2rnn"} and document_ids is not None:
                     fn = (
                         lambda hs, _layer=layer, _mask=mask, _doc=document_ids: _layer(
                             hs, _mask, doc_ids=_doc
@@ -2319,7 +2344,7 @@ class HybridTinyLM(nn.Module):
                         attention_layer_idx=attention_layer_idx if kv_cache is not None else None,
                     )
                     attention_layer_idx += 1
-                elif layer.backend == "engram":
+                elif layer.backend in {"engram", "mamba3", "m2rnn"}:
                     hidden_states = layer(
                         hidden_states, mask, doc_ids=document_ids
                     )
@@ -2392,10 +2417,22 @@ def _validate_document_ids(
             f"document_ids shape {document_ids.shape} must exactly match input_ids shape "
             f"({batch_size}, {seq_length})"
         )
-    has_negative = mx.any(document_ids.astype(mx.int32) < 0)
-    mx.eval(has_negative)
-    if bool(has_negative.item()):
-        raise ValueError("document_ids must be non-negative for explicit packed batches")
+    if document_ids.dtype not in (
+        mx.int8,
+        mx.int16,
+        mx.int32,
+        mx.int64,
+        mx.uint8,
+        mx.uint16,
+        mx.uint32,
+        mx.uint64,
+    ):
+        raise TypeError(f"document_ids must use an integer dtype, got {document_ids.dtype}")
+    if not batch_values_are_prevalidated():
+        has_negative = mx.any(document_ids.astype(mx.int32) < 0)
+        mx.eval(has_negative)
+        if bool(has_negative.item()):
+            raise ValueError("document_ids must be non-negative for explicit packed batches")
     return document_ids.astype(mx.int32)
 
 

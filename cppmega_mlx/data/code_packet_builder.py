@@ -29,6 +29,10 @@ from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
+from cppmega_mlx.data.domain_schema import (
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    normalize_domain_edge_record,
+)
 from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.data.parquet_dataset import (
     _TOKEN_CHUNK_METADATA_COLUMNS,
@@ -40,9 +44,14 @@ from cppmega_mlx.data.parquet_dataset import (
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_MSG_TOKEN_IDS_COLUMN,
     COMMIT_HASH_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     FILEPATH_COLUMN,
+    DIFF_TOKEN_IDS_COLUMN,
+    IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+    POST_TOKEN_IDS_COLUMN,
+    PRE_TOKEN_IDS_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
     REPO_COLUMN,
     TIMESTAMP_COLUMN,
@@ -66,9 +75,16 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SCOPE_IDS_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
+)
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
+    SOURCE_DIFF_TOKEN_IDS_COLUMN,
+    SOURCE_POST_TOKEN_IDS_COLUMN,
+    SOURCE_PRE_TOKEN_IDS_COLUMN,
 )
 
 
@@ -103,6 +119,7 @@ _DOMAIN_TOKEN_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_ENTITY_IDS_COLUMN: "entity_ids",
     TOKEN_SCOPE_IDS_COLUMN: "scope_ids",
     TOKEN_SOURCE_DOC_IDS_COLUMN: "source_doc_ids",
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN: "source_identity_ids",
     TOKEN_CONFIDENCE_IDS_COLUMN: "confidence_ids",
 }
 
@@ -113,7 +130,6 @@ _DOMAIN_EDGE_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_DIAGNOSTIC_EDGES_COLUMN: "diagnostic_edges",
     TOKEN_CROSS_DOMAIN_EDGES_COLUMN: "cross_domain_edges",
 }
-
 # Temporal token-level parquet column -> CommitPacket field name.
 _TEMPORAL_COLUMN_TO_FIELD: Mapping[str, str] = {
     TOKEN_CHANGE_MASK_PRE_COLUMN: "change_mask_pre",
@@ -163,6 +179,24 @@ def _int_vector(value: Any, *, where: str) -> mx.array:
     return mx.array(arr.astype(np.int32))
 
 
+def _uint64_vector(value: Any, *, where: str) -> mx.array:
+    if value is None:
+        raise ValueError(f"{where}: cannot build uint64 vector from None")
+    arr = np.asarray(value, dtype=object)
+    if arr.ndim != 1:
+        if arr.size == 0:
+            arr = arr.reshape(0)
+        else:
+            raise ValueError(
+                f"{where}: expected a 1-D token-aligned sequence, got shape "
+                f"{tuple(arr.shape)}"
+            )
+    values = [int(item) for item in arr.tolist()]
+    if any(item < 0 or item > np.iinfo(np.uint64).max for item in values):
+        raise ValueError(f"{where}: IDs must fit unsigned 64-bit")
+    return mx.array(np.asarray(values, dtype=np.uint64))
+
+
 def _str_scalar(value: Any) -> str | None:
     if value is None:
         return None
@@ -180,37 +214,28 @@ def _build_edge_index(
     return EdgeIndex.from_pairs(pairs, relation=relation, num_nodes=num_nodes)
 
 
-def _normalize_edge_triples(raw: Any) -> list[tuple[int, int, int]]:
+def _normalize_edge_triples(
+    raw: Any,
+    *,
+    family: str,
+) -> list[tuple[int, int, int]]:
     if raw is None:
         return []
     triples: list[tuple[int, int, int]] = []
     for edge in raw:
-        if hasattr(edge, "as_py"):
-            edge = edge.as_py()
-        if isinstance(edge, Mapping):
-            src = edge.get("from", edge.get("src"))
-            dst = edge.get("to", edge.get("dst"))
-            kind = edge.get("kind")
-        elif isinstance(edge, (list, tuple, np.ndarray)) and len(edge) >= 3:
-            src, dst, kind = edge[0], edge[1], edge[2]
-        else:
-            raise ValueError(
-                "domain edge triple must be {from,to,kind}/{src,dst,kind} or "
-                f"length-3 sequence, got {type(edge).__name__}"
-            )
-        if src is None or dst is None or kind is None:
-            raise ValueError(f"domain edge triple has missing value: {edge!r}")
-        src_i = int(src)
-        dst_i = int(dst)
-        kind_i = int(kind)
-        if src_i < 0 or dst_i < 0 or kind_i < 0:
-            raise ValueError(f"domain edge triple must be non-negative: {edge!r}")
-        triples.append((src_i, dst_i, kind_i))
+        triples.append(normalize_domain_edge_record(edge, family=family))
     return triples
 
 
-def _build_domain_edge_index(raw: Any, *, num_tokens: int) -> DomainEdgeIndex:
-    edge_index = DomainEdgeIndex.from_triples(_normalize_edge_triples(raw))
+def _build_domain_edge_index(
+    raw: Any,
+    *,
+    num_tokens: int,
+    family: str,
+) -> DomainEdgeIndex:
+    edge_index = DomainEdgeIndex.from_triples(
+        _normalize_edge_triples(raw, family=family)
+    )
     if edge_index.num_edges:
         max_endpoint = int(max(mx.max(edge_index.src).item(), mx.max(edge_index.dst).item()))
         if max_endpoint >= num_tokens:
@@ -245,7 +270,8 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        semantic_kwargs[field_name] = _int_vector(
+        vector_builder = _int_vector if column == TOKEN_DEF_USE_COLUMN else _uint64_vector
+        semantic_kwargs[field_name] = vector_builder(
             columns[column][row_index], where=f"{column}[row={row_index}]"
         )
         present.append(column)
@@ -271,9 +297,12 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        edge_kwargs[field_name] = _build_edge_index(
+        edge_index = _build_edge_index(
             columns[column][row_index], relation=relation, num_nodes=num_chunks
         )
+        if edge_index is None:
+            raise AssertionError(f"{column}: present graph column produced no edge index")
+        edge_kwargs[field_name] = edge_index
         present.append(column)
 
     domain_token_kwargs: dict[str, mx.array] = {}
@@ -281,7 +310,12 @@ def build_code_packet_from_row(
         if column not in columns:
             absent.append(column)
             continue
-        domain_token_kwargs[field_name] = _int_vector(
+        vector_builder = (
+            _uint64_vector
+            if column == TOKEN_SOURCE_IDENTITY_IDS_COLUMN
+            else _int_vector
+        )
+        domain_token_kwargs[field_name] = vector_builder(
             columns[column][row_index], where=f"{column}[row={row_index}]"
         )
         present.append(column)
@@ -295,6 +329,7 @@ def build_code_packet_from_row(
         domain_edge_kwargs[field_name] = _build_domain_edge_index(
             columns[column][row_index],
             num_tokens=num_tokens,
+            family=TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES[column],
         )
         present.append(column)
 
@@ -305,6 +340,15 @@ def build_code_packet_from_row(
     }
     if extra_metadata:
         metadata.update(dict(extra_metadata))
+
+    instruction_ids = None
+    if IFIM_INSTRUCTION_TOKEN_IDS_COLUMN in columns:
+        raw_instruction_ids = columns[IFIM_INSTRUCTION_TOKEN_IDS_COLUMN][row_index]
+        if raw_instruction_ids:
+            instruction_ids = _int_vector(
+                raw_instruction_ids,
+                where=f"{IFIM_INSTRUCTION_TOKEN_IDS_COLUMN}[row={row_index}]",
+            )
 
     return CodePacket(
         token_ids=token_ids,
@@ -318,6 +362,7 @@ def build_code_packet_from_row(
         commit_or_ref=_str_scalar(columns[COMMIT_HASH_COLUMN][row_index])
         if COMMIT_HASH_COLUMN in columns
         else None,
+        ifim_instruction_token_ids=instruction_ids,
         structure_ids=structure_ids,
         ast_depth=ast_depth,
         sibling_index=sibling_index,
@@ -426,6 +471,21 @@ def build_commit_packet_from_row(
     absent: list[str] = []
     present: list[str] = []
 
+    typed_sections = (
+        ("pre_token_ids", PRE_TOKEN_IDS_COLUMN, pre_token_ids),
+        ("post_token_ids", POST_TOKEN_IDS_COLUMN, post_token_ids),
+        ("diff_token_ids", DIFF_TOKEN_IDS_COLUMN, diff_token_ids),
+        ("commit_msg", COMMIT_MSG_TOKEN_IDS_COLUMN, commit_msg),
+    )
+    resolved_sections: dict[str, mx.array | None] = {}
+    for field_name, column, supplied in typed_sections:
+        value = supplied
+        if value is None and column in columns:
+            raw = columns[column][row_index]
+            if raw:
+                value = _int_vector(raw, where=f"{column}[row={row_index}]")
+        resolved_sections[field_name] = value
+
     temporal_kwargs: dict[str, mx.array] = {}
     for column, field_name in _TEMPORAL_COLUMN_TO_FIELD.items():
         if column not in columns:
@@ -466,10 +526,10 @@ def build_commit_packet_from_row(
         metadata.update(dict(extra_metadata))
 
     return CommitPacket(
-        pre_token_ids=pre_token_ids,
-        post_token_ids=post_token_ids,
-        diff_token_ids=diff_token_ids,
-        commit_msg=commit_msg,
+        pre_token_ids=resolved_sections["pre_token_ids"],
+        post_token_ids=resolved_sections["post_token_ids"],
+        diff_token_ids=resolved_sections["diff_token_ids"],
+        commit_msg=resolved_sections["commit_msg"],
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
         repo=_str_scalar(columns[REPO_COLUMN][row_index]) if REPO_COLUMN in columns else None,
@@ -488,8 +548,83 @@ def build_commit_packet_from_row(
     )
 
 
+def build_commit_packets_from_packed_row(
+    columns: Mapping[str, list[Any]],
+    *,
+    row_index: int,
+) -> list[CommitPacket]:
+    """Build complete commit packets from per-source packed-row sections.
+
+    A source contributes a packet only when every real section required by the
+    commit objective family is present and non-empty. No post-state or special
+    tokens are substituted for missing diff/message data.
+    """
+
+    required = (
+        SOURCE_PRE_TOKEN_IDS_COLUMN,
+        SOURCE_POST_TOKEN_IDS_COLUMN,
+        SOURCE_DIFF_TOKEN_IDS_COLUMN,
+        SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
+    )
+    if any(column not in columns for column in required):
+        return []
+
+    per_column = {column: columns[column][row_index] for column in required}
+    counts = {column: len(values or []) for column, values in per_column.items()}
+    if len(set(counts.values())) != 1:
+        raise ValueError(
+            f"packed objective source columns have inconsistent counts at row "
+            f"{row_index}: {counts}"
+        )
+
+    packets: list[CommitPacket] = []
+    for source_index in range(next(iter(counts.values()), 0)):
+        sections = {
+            column: per_column[column][source_index] for column in required
+        }
+        if any(not values for values in sections.values()):
+            continue
+        packets.append(
+            build_commit_packet_from_row(
+                columns=columns,
+                row_index=row_index,
+                pre_token_ids=_int_vector(
+                    sections[SOURCE_PRE_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_PRE_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                post_token_ids=_int_vector(
+                    sections[SOURCE_POST_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_POST_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                diff_token_ids=_int_vector(
+                    sections[SOURCE_DIFF_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_DIFF_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                commit_msg=_int_vector(
+                    sections[SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN],
+                    where=(
+                        f"{SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN}[row={row_index}]"
+                        f"[source={source_index}]"
+                    ),
+                ),
+                extra_metadata={"source_index": source_index},
+            )
+        )
+    return packets
+
+
 __all__ = [
     "build_code_packet_from_row",
     "build_code_packets",
     "build_commit_packet_from_row",
+    "build_commit_packets_from_packed_row",
 ]

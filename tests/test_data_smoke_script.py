@@ -324,7 +324,11 @@ def test_megatron_multishard_smoke_reports_side_channels(tmp_path: Path) -> None
     assert payload["dataset"]["index_metadata"]["source_format"] == "megatron-multishard"
     assert payload["dataset"]["index_metadata"]["shard_count"] == 2
     assert payload["dataset"]["token_id_range"] == [0, 107]
-    assert payload["side_channels"] == ["dep_levels", "structure_ids"]
+    assert payload["side_channels"] == [
+        "attention_mask",
+        "dep_levels",
+        "structure_ids",
+    ]
     assert payload["structure_side_channels"] == ["structure_ids", "dep_levels"]
     assert payload["structure_side_channels_present"] is True
     assert payload["distributed_megatron_parity_claim"] is False

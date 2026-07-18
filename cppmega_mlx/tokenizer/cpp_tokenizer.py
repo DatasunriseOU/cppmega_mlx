@@ -7,233 +7,40 @@ nearby nanochat tokenizer with different reserved IDs.
 
 from __future__ import annotations
 
-import json
-import re
 from collections.abc import Iterable, Sequence
+import operator
 from pathlib import Path
 from typing import Any
 
-EXPECTED_VOCAB_SIZE = 65_536
+from cppmega_mlx.data.tokenizer_contract import (
+    EXPECTED_VOCAB_SIZE,
+    SPECIAL_TOKEN_IDS,
+    validate_tokenizer_artifact_contract,
+)
+from cppmega_mlx.data.prompt_graph import (
+    CppPromptTokenizerAdapter,
+    normalize_cpp_whitespace_with_offsets as normalize_whitespace_with_offsets,
+)
+
 EXPECTED_SPECIAL_TOKENS: dict[str, int] = {
-    "<BOS>": 2,
-    "<EOS>": 3,
-    "<FIM_PREFIX>": 4,
-    "<FIM_MIDDLE>": 5,
-    "<FIM_SUFFIX>": 6,
-    "<CODE_START>": 7,
-    "<CODE_END>": 8,
-    "<THINK_START>": 9,
-    "<THINK_END>": 10,
-    "<QUERY_TOOL>": 11,
-    "<TOOL_RESULT>": 19,
-    "<FIM_INSTRUCTION>": 45,
-    "<SPACE>": 46,
-    "<NL>": 47,
+    f"<{role}>": SPECIAL_TOKEN_IDS[role]
+    for role in (
+        "BOS",
+        "EOS",
+        "FIM_PREFIX",
+        "FIM_MIDDLE",
+        "FIM_SUFFIX",
+        "CODE_START",
+        "CODE_END",
+        "THINK_START",
+        "THINK_END",
+        "QUERY_TOOL",
+        "TOOL_RESULT",
+        "FIM_INSTRUCTION",
+        "SPACE",
+        "NL",
+    )
 }
-
-
-# Whitespace normalization: collapse runs to a single sentinel token so that
-# BPE-split identifiers (e.g., "sum" -> "s","u","m") decode without spurious
-# inter-token spaces. Encode normalizes; decode replaces sentinels back.
-#
-# CRITICAL: normalization MUST be string/char/raw-string-literal aware. Spaces
-# and tabs *inside* a literal carry meaning (e.g. ``"a    b"``) and must NOT be
-# collapsed to ``<SPACE>``; doing so would change the program semantics and the
-# re-encoded ids. The scanner below tracks literal state and only collapses
-# whitespace runs that live OUTSIDE any literal. It also tracks comments so
-# natural-language apostrophes in docstrings (``can't``) are not mistaken for C++
-# char literals; whitespace inside comments is still normalized.
-_WS_RUN_RE = re.compile(r"[ \t]+")
-_NL_RUN_RE = re.compile(r"[\r\n]+")
-_NL_SENTINEL = "<NL>"
-_SPACE_SENTINEL = "<SPACE>"
-
-
-def normalize_whitespace_with_offsets(text: str) -> tuple[str, list[tuple[int, int]]]:
-    """Collapse outside-literal whitespace runs to sentinels, tracking offsets.
-
-    Returns ``(normalized_text, normalized_to_original)`` where
-    ``normalized_to_original[k]`` is the ``(start, end)`` half-open span in the
-    *original* ``text`` that the ``k``-th character of ``normalized_text`` came
-    from. Sentinel characters (the chars of ``<NL>``/``<SPACE>``) all map to the
-    span of the collapsed whitespace run; non-whitespace characters map to their
-    own single-char span. This lets callers translate per-token char offsets
-    computed on the normalized string back onto the original char-aligned
-    sidecar channels with no off-by-N shift.
-
-    Whitespace INSIDE string/char/raw-string literals is preserved verbatim
-    (identity offsets); only whitespace outside any literal is collapsed.  C++
-    comments are not literals: quotes/apostrophes inside comments are copied as
-    plain text, while comment whitespace is still collapsed to sentinels.
-    """
-    chars: list[str] = []
-    spans: list[tuple[int, int]] = []
-    n = len(text)
-    i = 0
-    # State: None=code, '"'=string, "'"=char, "raw"=raw-string,
-    # "line_comment"=// comment, "block_comment"=/* */ comment.
-    state: str | None = None
-    raw_delim = ""  # closing delimiter for the active raw string: )<d>"
-    while i < n:
-        ch = text[i]
-        if state is None:
-            if ch == "/" and i + 1 < n and text[i + 1] == "/":
-                chars.append("/")
-                spans.append((i, i + 1))
-                chars.append("/")
-                spans.append((i + 1, i + 2))
-                state = "line_comment"
-                i += 2
-                continue
-            if ch == "/" and i + 1 < n and text[i + 1] == "*":
-                chars.append("/")
-                spans.append((i, i + 1))
-                chars.append("*")
-                spans.append((i + 1, i + 2))
-                state = "block_comment"
-                i += 2
-                continue
-            # Detect raw-string prefix: R"<delim>( ... )<delim>"
-            if ch in ("R", "u", "U", "L") and _raw_string_opener_at(text, i):
-                r_pos = text.index('R', i)
-                quote = text.index('"', r_pos)
-                paren = text.index('(', quote)
-                delim = text[quote + 1 : paren]
-                # Emit the R"...( prefix verbatim with identity offsets.
-                for k in range(i, paren + 1):
-                    chars.append(text[k])
-                    spans.append((k, k + 1))
-                raw_delim = ")" + delim + '"'
-                state = "raw"
-                i = paren + 1
-                continue
-            if ch == '"' or ch == "'":
-                chars.append(ch)
-                spans.append((i, i + 1))
-                state = ch
-                i += 1
-                continue
-            if ch in "\r\n":
-                j = i + 1
-                while j < n and text[j] in "\r\n":
-                    j += 1
-                _append_sentinel(chars, spans, _NL_SENTINEL, i, j)
-                i = j
-                continue
-            if ch in " \t":
-                j = i + 1
-                while j < n and text[j] in " \t":
-                    j += 1
-                _append_sentinel(chars, spans, _SPACE_SENTINEL, i, j)
-                i = j
-                continue
-            chars.append(ch)
-            spans.append((i, i + 1))
-            i += 1
-        elif state == "line_comment":
-            if ch in "\r\n":
-                j = i + 1
-                while j < n and text[j] in "\r\n":
-                    j += 1
-                _append_sentinel(chars, spans, _NL_SENTINEL, i, j)
-                state = None
-                i = j
-                continue
-            if ch in " \t":
-                j = i + 1
-                while j < n and text[j] in " \t":
-                    j += 1
-                _append_sentinel(chars, spans, _SPACE_SENTINEL, i, j)
-                i = j
-                continue
-            chars.append(ch)
-            spans.append((i, i + 1))
-            i += 1
-        elif state == "block_comment":
-            if text.startswith("*/", i):
-                chars.append("*")
-                spans.append((i, i + 1))
-                chars.append("/")
-                spans.append((i + 1, i + 2))
-                state = None
-                i += 2
-                continue
-            if ch in "\r\n":
-                j = i + 1
-                while j < n and text[j] in "\r\n":
-                    j += 1
-                _append_sentinel(chars, spans, _NL_SENTINEL, i, j)
-                i = j
-                continue
-            if ch in " \t":
-                j = i + 1
-                while j < n and text[j] in " \t":
-                    j += 1
-                _append_sentinel(chars, spans, _SPACE_SENTINEL, i, j)
-                i = j
-                continue
-            chars.append(ch)
-            spans.append((i, i + 1))
-            i += 1
-        elif state == "raw":
-            if text.startswith(raw_delim, i):
-                for k in range(i, i + len(raw_delim)):
-                    chars.append(text[k])
-                    spans.append((k, k + 1))
-                i += len(raw_delim)
-                state = None
-                raw_delim = ""
-            else:
-                chars.append(ch)
-                spans.append((i, i + 1))
-                i += 1
-        else:  # inside '"' string or "'" char literal
-            chars.append(ch)
-            spans.append((i, i + 1))
-            if ch == "\\" and i + 1 < n:
-                # Escaped char: copy the next char verbatim too.
-                chars.append(text[i + 1])
-                spans.append((i + 1, i + 2))
-                i += 2
-                continue
-            if ch == state:
-                state = None
-            i += 1
-    return "".join(chars), spans
-
-
-def _raw_string_opener_at(text: str, i: int) -> bool:
-    """True if a C++ raw-string literal opens at/just after position ``i``.
-
-    Handles optional encoding prefixes (u8/u/U/L) before ``R"``.
-    """
-    n = len(text)
-    j = i
-    # Optional encoding prefix chars before R.
-    while j < n and text[j] in ("u", "U", "L", "8"):
-        j += 1
-    if j >= n or text[j] != "R":
-        return False
-    j += 1
-    if j >= n or text[j] != '"':
-        return False
-    j += 1
-    # delimiter chars until '('
-    while j < n and text[j] != "(" and text[j] != '"':
-        j += 1
-    return j < n and text[j] == "("
-
-
-def _append_sentinel(
-    chars: list[str],
-    spans: list[tuple[int, int]],
-    sentinel: str,
-    start: int,
-    end: int,
-) -> None:
-    for sentinel_char in sentinel:
-        chars.append(sentinel_char)
-        spans.append((start, end))
 
 
 class TokenizerContractError(ValueError):
@@ -246,6 +53,9 @@ class CppMegaTokenizer:
     def __init__(self, tokenizer: Any, *, path: Path):
         self._tokenizer = tokenizer
         self.path = path
+        self._prompt_adapter = CppPromptTokenizerAdapter(
+            tokenizer, tokenizer_path=path
+        )
         self._vocab: dict[str, int] = dict(tokenizer.get_vocab())
         self._id_to_token = {token_id: token for token, token_id in self._vocab.items()}
         self._space_token_id = EXPECTED_SPECIAL_TOKENS["<SPACE>"]
@@ -354,6 +164,21 @@ class CppMegaTokenizer:
         normalized = [self._normalize_whitespace(t) for t in texts]
         return [list(encoded.ids) for encoded in self._tokenizer.encode_batch(normalized)]
 
+    def encode_with_offsets(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
+        """Encode once and map tokenizer offsets back to the original source.
+
+        The tokenizer operates on whitespace-normalized text. Every normalized
+        character already carries its original source span, so this method keeps
+        prompt graph coordinates exactly aligned with the IDs passed to the model.
+        """
+
+        if not isinstance(text, str):
+            raise TypeError(f"text must be str, got {type(text).__name__}")
+        try:
+            return self._prompt_adapter.encode_with_offsets(text)
+        except (TypeError, ValueError) as exc:
+            raise TokenizerContractError(str(exc)) from exc
+
     def decode(self, ids: Iterable[int]) -> str:
         """Decode IDs by simple concat then replacing ``<SPACE>``/``<NL>`` sentinels.
 
@@ -363,7 +188,26 @@ class CppMegaTokenizer:
         single space or single newline (longer runs are collapsed by the
         normalizer). Matches the CUDA-side ``nanochat.cpp_tokenizer`` decode.
         """
-        parts = [self._id_to_token.get(int(i), "") for i in ids]
+        parts: list[str] = []
+        for position, raw_id in enumerate(ids):
+            if isinstance(raw_id, bool):
+                raise TokenizerContractError(
+                    f"decode id at position {position} must be an integer, got bool"
+                )
+            try:
+                token_id = operator.index(raw_id)
+            except TypeError as exc:
+                raise TokenizerContractError(
+                    f"decode id at position {position} must be an integer, "
+                    f"got {type(raw_id).__name__}"
+                ) from exc
+            token = self._id_to_token.get(token_id)
+            if token is None:
+                raise TokenizerContractError(
+                    f"decode id at position {position} is outside tokenizer vocab: "
+                    f"{token_id}"
+                )
+            parts.append(token)
         s = "".join(parts)
         return s.replace("<SPACE>", " ").replace("<NL>", "\n")
 
@@ -380,6 +224,10 @@ class CppMegaTokenizer:
         if token is None:
             return None
         if isinstance(token, int) and not isinstance(token, bool):
+            if token not in self._id_to_token:
+                raise TokenizerContractError(
+                    f"special token id {token} is outside tokenizer vocab"
+                )
             return token
         if isinstance(token, str):
             token_id = self.id_for_token(token)
@@ -403,9 +251,13 @@ def load_cppmega_tokenizer(path: str | Path) -> CppMegaTokenizer:
     """Load a tokenizer only if it satisfies the M0.1 contract."""
 
     tokenizer_path = _resolve_tokenizer_path(path)
-    payload = _load_tokenizer_json(tokenizer_path)
-    vocab = _extract_vocab(payload, tokenizer_path)
-    _validate_vocab_contract(vocab, tokenizer_path)
+    try:
+        validate_tokenizer_artifact_contract(
+            tokenizer_path,
+            require_frozen_artifact=True,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise TokenizerContractError(str(exc)) from exc
 
     try:
         from tokenizers import Tokenizer  # pyright: ignore[reportMissingImports]
@@ -424,61 +276,6 @@ def _resolve_tokenizer_path(path: str | Path) -> Path:
     if not candidate.is_file():
         raise FileNotFoundError(f"tokenizer artifact not found: {candidate}")
     return candidate
-
-
-def _load_tokenizer_json(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise TokenizerContractError(f"{path}: invalid tokenizer JSON") from exc
-    if not isinstance(payload, dict):
-        raise TokenizerContractError(f"{path}: tokenizer JSON must be an object")
-    return payload
-
-
-def _extract_vocab(payload: dict[str, Any], path: Path) -> dict[str, int]:
-    model = payload.get("model")
-    if not isinstance(model, dict):
-        raise TokenizerContractError(f"{path}: missing tokenizer model")
-    raw_vocab = model.get("vocab")
-    if not isinstance(raw_vocab, dict):
-        raise TokenizerContractError(f"{path}: missing tokenizer model vocab")
-
-    vocab: dict[str, int] = {}
-    seen_ids: set[int] = set()
-    for token, token_id in raw_vocab.items():
-        if not isinstance(token, str) or not isinstance(token_id, int):
-            raise TokenizerContractError(f"{path}: vocab entries must be str->int")
-        if token_id in seen_ids:
-            raise TokenizerContractError(f"{path}: duplicate vocab id {token_id}")
-        seen_ids.add(token_id)
-        vocab[token] = token_id
-    return vocab
-
-
-def _validate_vocab_contract(vocab: dict[str, int], path: Path) -> None:
-    if len(vocab) != EXPECTED_VOCAB_SIZE:
-        raise TokenizerContractError(
-            f"{path}: expected vocab size {EXPECTED_VOCAB_SIZE}, got {len(vocab)}"
-        )
-
-    id_to_token = {token_id: token for token, token_id in vocab.items()}
-    if len(id_to_token) != len(vocab):
-        raise TokenizerContractError(f"{path}: vocab ids must be unique")
-
-    for token, expected_id in EXPECTED_SPECIAL_TOKENS.items():
-        actual_id = vocab.get(token)
-        if actual_id != expected_id:
-            occupant = id_to_token.get(expected_id)
-            raise TokenizerContractError(
-                f"{path}: token {token!r} must use id {expected_id}, "
-                f"got {actual_id}; id {expected_id} maps to {occupant!r}"
-            )
-        actual_token = id_to_token.get(expected_id)
-        if actual_token != token:
-            raise TokenizerContractError(
-                f"{path}: id {expected_id} must map to {token!r}, got {actual_token!r}"
-            )
 
 
 __all__ = [

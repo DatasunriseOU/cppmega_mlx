@@ -1554,6 +1554,7 @@ def test_mamba3_fp8_train_production_schedule_spec_is_explicit_and_abi_complete(
     assert spec.buffer_extent == LOCAL_GB10_QUARTER_MAX_SEQ_LENGTH
     assert spec.brick_ops == spec.op_signature
     assert set(spec.brick_schedule_families) == {
+        "lane_sequential_reverse_scan",
         "loop_descriptor_dataflow",
     }
     assert "mamba3_mimo:descriptor_codegen_ready" in (
@@ -2252,6 +2253,101 @@ def test_mamba3_fp8_train_descriptor_spills_large_shared_scratch_to_abi() -> Non
     assert "mamba3_delta" in prim_func._cppmega_path_c_internal_scratch_abi_aliases
     assert _shared_alloc_bytes(generated_source) <= 32 * 1024
     assert len(tuple(prim_func.params)) <= 31
+
+
+def test_tiny_mra_spills_cross_row_carries_out_of_reusable_shared_memory() -> None:
+    """Row-carried state must survive later blocks in the same kernel launch.
+
+    TileLang may reuse dynamic shared-memory slots once their intra-iteration
+    liveness ends.  These buffers remain live across the enclosing row loop, so
+    even tiny variants must use device ABI scratch instead of ``T.alloc_shared``.
+    """
+
+    cfg = local_gb10_quarter_profile().tiny_smoke_config()
+    region = build_mamba3_fp8_train_acceptance_fixture_region(
+        include_backward=True,
+        model_config=cfg,
+    )
+    prim_func = mamba3_fp8_train_fusion_schedule_template(region)
+    generated_source = prim_func._cppmega_path_c_generated_source
+    spilled = prim_func._cppmega_path_c_spilled_shared_scratch_shapes
+
+    expected_carries = {
+        "mamba3_scan_mamba3_angle_cumsum": (4, 1),
+        "mamba3_scan_mamba3_conv_history": (2, 24),
+        "m2rnn_packed_post_m2rnn_h_state": (4, 4, 4),
+        "m2rnn_packed_post_m2rnn_conv_history": (3, 12),
+    }
+    for name, shape in expected_carries.items():
+        assert spilled[name]["shape"] == shape
+        assert spilled[name]["bytes"] < 1024
+        assert f"{name} = T.alloc_shared" not in generated_source
+
+    assert len(tuple(prim_func.params)) <= 31
+
+
+def test_tiny_mra_uses_megatron_non_interleaved_rope_signs() -> None:
+    """Generated Q/KV forward and backward must match eager Megatron RoPE."""
+
+    cfg = local_gb10_quarter_profile().tiny_smoke_config()
+    region = build_mamba3_fp8_train_acceptance_fixture_region(
+        include_backward=True,
+        model_config=cfg,
+    )
+    prim_func = mamba3_fp8_train_fusion_schedule_template(region)
+    generated_lines = prim_func._cppmega_path_c_generated_source.splitlines()
+
+    for projection in ("q", "kv"):
+        prepared = [
+            line.strip()
+            for line in generated_lines
+            if (
+                f"attention_qkv_projection_attention_{projection}_prepared[0] ="
+                in line
+            )
+        ]
+        assert prepared
+        assert len(prepared) % 2 == 0
+        for first_half, second_half in zip(
+            prepared[::2],
+            prepared[1::2],
+            strict=True,
+        ):
+            assert ")) - (" in first_half
+            assert ")) + (" in second_half
+
+        projected_grad0 = next(
+            line.strip()
+            for line in generated_lines
+            if "attention_qkv_projection_bwd_attention_projected_grad0[0] =" in line
+            and f"attention_qkv_projection_bwd_attention_{projection}_grad0[0]" in line
+        )
+        projected_grad1 = next(
+            line.strip()
+            for line in generated_lines
+            if "attention_qkv_projection_bwd_attention_projected_grad1[0] =" in line
+            and f"attention_qkv_projection_bwd_attention_{projection}_grad0[0]" in line
+        )
+        rope_grad = next(
+            line.strip()
+            for line in generated_lines
+            if "attention_qkv_projection_bwd_attention_rope_grad[0] =" in line
+            and f"attention_qkv_projection_bwd_attention_{projection}_grad0[0]" in line
+        )
+
+        assert ")) + (" in projected_grad0
+        assert (
+            f"(-attention_qkv_projection_bwd_attention_{projection}_grad0[0] * "
+            "T.sin(attention_qkv_projection_bwd_attention_rope_phase[0])) + ("
+        ) in projected_grad1
+        assert (
+            f"-attention_qkv_projection_bwd_attention_{projection}_projected0[0] * "
+            "T.sin(attention_qkv_projection_bwd_attention_rope_phase[0])) - ("
+        ) in rope_grad
+        assert (
+            f"-attention_qkv_projection_bwd_attention_{projection}_projected1[0] * "
+            "T.sin(attention_qkv_projection_bwd_attention_rope_phase[0])) + ("
+        ) in rope_grad
 
 
 def test_mamba3_fp8_train_descriptor_replays_mamba3_backward_without_full_h_steps_scratch() -> None:
@@ -3948,11 +4044,16 @@ def test_direct_fusion_chain_keeps_loss_bridge_forward_boundary_separate() -> No
                 "residual_rmsnorm_bwd",
             ),
         ),
-        (10, 11, "backward", "ok", ("m2rnn_bwd",)),
-        (11, 12, "backward", "ok", ("residual_rmsnorm_bwd",)),
-        (12, 13, "backward", "ok", ("mamba3_mimo_bwd",)),
-        (13, 14, "backward", "ok", ("entry_rmsnorm_bwd",)),
-    ]
+            (
+                10,
+                12,
+                "backward",
+                "ok",
+                ("m2rnn_bwd", "residual_rmsnorm_bwd"),
+            ),
+            (12, 13, "backward", "ok", ("mamba3_mimo_bwd",)),
+            (13, 14, "backward", "ok", ("entry_rmsnorm_bwd",)),
+        ]
     for segment in chain.segments:
         assert {
             str(getattr(node, "backward", ""))

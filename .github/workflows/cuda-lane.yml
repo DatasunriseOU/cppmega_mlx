@@ -12,18 +12,62 @@ jobs:
     runs-on: [self-hosted, cuda]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install dependencies
+      - name: Verify runner-provided CUDA environment
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          set -euo pipefail
+          : "${CPPMEGA_CUDA_PYTHON:?self-hosted CUDA runner must export CPPMEGA_CUDA_PYTHON}"
+          test -x "$CPPMEGA_CUDA_PYTHON"
+          cuda_info="$(env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+            "$CPPMEGA_CUDA_PYTHON" -c \
+            'import os,sys; print(os.path.realpath(sys.prefix)); print(os.path.realpath(sys.base_prefix))')"
+          cuda_prefix="${cuda_info%%$'\n'*}"
+          cuda_base_prefix="${cuda_info#*$'\n'}"
+          test -n "$cuda_prefix"
+          test -n "$cuda_base_prefix"
+          test "$cuda_prefix" != "$cuda_base_prefix"
+          test -f "$cuda_prefix/pyvenv.cfg"
+          python_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$CPPMEGA_CUDA_PYTHON")"
+          case "$python_abs" in
+            "$cuda_prefix/bin/"*) ;;
+            *) echo "selected CUDA Python is outside its venv prefix" >&2; exit 2 ;;
+          esac
+          workspace_real="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+          case "$cuda_prefix" in
+            "$workspace_real"|"$workspace_real"/*)
+              echo "refusing CUDA environment inside GITHUB_WORKSPACE" >&2
+              exit 2
+              ;;
+          esac
+          if git -C "$cuda_prefix" rev-parse --show-toplevel >/dev/null 2>&1; then
+            echo "refusing CUDA environment inside a Git checkout" >&2
+            exit 2
+          fi
+          uv lock --check --no-sources --project .
+          UV_PROJECT_ENVIRONMENT="$cuda_prefix" uv sync --project . --locked \
+            --no-sources --python "$CPPMEGA_CUDA_PYTHON" --group dev \
+            --extra path-c
+          "$CPPMEGA_CUDA_PYTHON" scripts/check_cuda_environment.py --json \
+            | tee "$RUNNER_TEMP/cppmega-cuda-environment.json"
+          uv pip check --python "$CPPMEGA_CUDA_PYTHON"
+
+      - name: Upload CUDA environment receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cppmega-mlx-cuda-environment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cppmega-cuda-environment.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run CUDA tests
         run: |
-          python -m pytest -m "cuda_hardware or cuda_required" -v --tb=short
+          set -euo pipefail
+          : "${CPPMEGA_CUDA_PYTHON:?self-hosted CUDA runner must export CPPMEGA_CUDA_PYTHON}"
+          selected="$RUNNER_TEMP/cppmega-cuda-selected.txt"
+          CPPMEGA_RUN_CUDA_TESTS=1 "$CPPMEGA_CUDA_PYTHON" -m pytest \
+            --collect-only -q -m "cuda_hardware or cuda_required" > "$selected"
+          grep -q '::' "$selected"
+          CPPMEGA_RUN_CUDA_TESTS=1 "$CPPMEGA_CUDA_PYTHON" -m pytest \
+            -m "cuda_hardware or cuda_required" -v --tb=short

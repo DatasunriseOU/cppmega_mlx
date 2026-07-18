@@ -466,6 +466,7 @@ def test_hybrid_tiny_lm_exposes_path_c_fusion_regions_from_route_symbols() -> No
     assert len(regions) == 1
     assert regions[0].name == "hybrid_tiny_lm_path_c_2_3"
     assert tuple(node.op_name for node in regions[0].nodes) == (
+        "entry_rmsnorm",
         "mamba3_mimo",
         "residual_rmsnorm",
         "m2rnn",

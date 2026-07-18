@@ -109,7 +109,10 @@ def _assert_bwd_direct_owner_output_lane_loops(
     if d_v < qk_dim:
         assert f"for (uint d = 0; d < {d_v}; ++d)" in msl
     assert "float dod = float(d_out[d_out_row + d]);" in msl
-    assert "sumexp <= 0.000000e+00f" in msl
+    assert (
+        "float inv_sum = (sumexp > 0.000000e+00f) ? "
+        "(1.000000e+00f / sumexp) : 0.000000e+00f;"
+    ) in msl
     assert msl.count("for (uint stride = threads / 2; stride > 0; stride >>= 1)") == 3
 
 
@@ -1219,7 +1222,10 @@ def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "int stride;" not in msl
     assert "half condval" not in msl
     assert "round_id" not in msl
-    assert "sumexp <= 0.000000e+00f" in msl
+    assert (
+        "float inv_sum = (sumexp > 0.000000e+00f) ? "
+        "(1.000000e+00f / sumexp) : 0.000000e+00f;"
+    ) in msl
     assert "return;" in msl
     assert "uint q_row_base =" in msl
     assert "uint d_out_row =" in msl
@@ -1236,7 +1242,6 @@ def test_path_c_backward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "float local_max = -INFINITY;" in msl
     assert "float local_sum = 0.0f;" in msl
     assert "float local_rs = 0.0f;" in msl
-    assert "float inv_sum = 1.0f / sumexp;" in msl
 
 
 def test_path_c_backward_topk4_msl_declares_or_rewrites_stride() -> None:
@@ -1395,7 +1400,7 @@ def test_path_c_forward_lowered_msl_uses_threadgroup_reductions() -> None:
     assert "int gid = int(blockIdx.x);" not in msl
     assert "((int)threadIdx.x)" not in msl
     assert "((int)blockIdx.x)" not in msl
-    assert "row_max == -INFINITY" in msl
+    assert "if (scores[k] == -INFINITY)" in msl
     assert "return;" in msl
     assert "kv_row_base" in msl
     assert "int stride;" not in msl

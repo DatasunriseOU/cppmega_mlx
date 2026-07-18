@@ -16,13 +16,24 @@ def parse_ninja(text: str) -> ParsedDomainDocument:
         domain=DomainKind.NINJA,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"build_kind": "ninja"},
+        metadata={"build_kind": "ninja", "parser_adapter": "ninja"},
     )
     next_entity = 1
     current_rule: int | None = None
 
     for line_no, raw_line in enumerate(text.splitlines()):
         line_indices = doc.token_indices_on_line(line_no)
+        comment_offset = next(
+            (
+                idx
+                for idx, char in enumerate(raw_line)
+                if char == "#" and (idx == 0 or raw_line[idx - 1] != "$")
+            ),
+            len(raw_line),
+        )
+        line_indices = [
+            idx for idx in line_indices if doc.tokens[idx].column < comment_offset
+        ]
         if not line_indices:
             continue
         first_text = doc.tokens[line_indices[0]].text
@@ -36,8 +47,15 @@ def parse_ninja(text: str) -> ParsedDomainDocument:
             colon_idx = next((i for i in line_indices if doc.tokens[i].text == ":"), None)
             if colon_idx is None:
                 continue
-            outputs = [i for i in line_indices if line_indices[0] < i < colon_idx]
-            tail = [i for i in line_indices if i > colon_idx]
+            outputs = [
+                i for i in line_indices
+                if line_indices[0] < i < colon_idx
+                and doc.tokens[i].text not in {"|", "||"}
+            ]
+            tail = [
+                i for i in line_indices
+                if i > colon_idx and doc.tokens[i].text not in {"|", "||"}
+            ]
             if tail:
                 rule_idx = tail[0]
                 doc.set_role(rule_idx, DomainRoleKind.RULE)

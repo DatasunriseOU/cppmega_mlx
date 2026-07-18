@@ -34,24 +34,62 @@ def test_parse_batch_size_rejects_invalid_worker_count():
         index_project.compute_parse_batch_size(100, 0)
 
 
-def test_parse_batch_results_follow_completion_order(monkeypatch):
+def test_parse_batch_results_bound_in_flight_futures_without_losing_batches():
     import index_project
 
-    submitted: list[Future] = []
+    batches = [f"batch-{index}" for index in range(7)]
+
+    class TrackingFuture(Future):
+        def __init__(self, executor):
+            super().__init__()
+            self.executor = executor
+            self.consumed = False
+
+        def result(self, timeout=None):
+            value = super().result(timeout)
+            if not self.consumed:
+                self.consumed = True
+                self.executor.outstanding -= 1
+            return value
 
     class FakeExecutor:
+        def __init__(self):
+            self.submitted = 0
+            self.outstanding = 0
+            self.max_outstanding = 0
+
         def submit(self, _fn, batch):
-            future: Future = Future()
+            future = TrackingFuture(self)
+            self.submitted += 1
+            self.outstanding += 1
+            self.max_outstanding = max(self.max_outstanding, self.outstanding)
             future.set_result(batch)
-            submitted.append(future)
             return future
 
-    def fake_as_completed(futures):
-        assert list(futures) == submitted
-        return reversed(submitted)
+    executor = FakeExecutor()
+    results = list(
+        index_project._iter_parse_batch_results(
+            executor,
+            batches,
+            max_in_flight=2,
+        )
+    )
 
-    monkeypatch.setattr(index_project, "as_completed", fake_as_completed)
+    assert executor.submitted == len(batches)
+    assert executor.max_outstanding == 2
+    assert executor.outstanding == 0
+    assert sorted(results) == batches
 
-    results = list(index_project._iter_parse_batch_results(FakeExecutor(), ["slow", "fast"]))
 
-    assert results == ["fast", "slow"]
+def test_parse_batch_results_reject_invalid_submit_window():
+    import pytest
+    import index_project
+
+    with pytest.raises(ValueError, match="max_in_flight must be positive"):
+        list(
+            index_project._iter_parse_batch_results(
+                object(),
+                [],
+                max_in_flight=0,
+            )
+        )

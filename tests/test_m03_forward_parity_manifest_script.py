@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
+import scripts.m03_forward_parity_manifest as manifest_script
 from cppmega_mlx.training.parity import (
     M03_FORWARD_PARITY_CUDA_ARTIFACT_CONTRACT,
     M03_FORWARD_PARITY_CUDA_ARTIFACT_FORMAT,
@@ -22,17 +25,36 @@ from scripts.m03_forward_parity_manifest import deterministic_input_tokens, inpu
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m03_forward_parity_manifest.py"
-PYTHON = ROOT / ".venv" / "bin" / "python"
+PYTHON = Path(sys.executable)
 
 
-def run_script(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+@contextmanager
+def _temporary_env(values: dict[str, str]) -> Iterator[None]:
+    previous = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def run_script(
+    *args: str,
+    timeout: int = 30,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(PYTHON if PYTHON.exists() else sys.executable), str(SCRIPT), *args],
+        [str(PYTHON), str(SCRIPT), *args],
         cwd=ROOT,
         text=True,
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
@@ -92,6 +114,54 @@ def test_deterministic_input_hash_is_seed_stable() -> None:
     assert not np.array_equal(first, different)
     assert input_tokens_sha256(first) == input_tokens_sha256(second)
     assert input_tokens_sha256(first) != input_tokens_sha256(different)
+
+
+def test_mlx_readiness_scope_overrides_and_restores_kernel_policy() -> None:
+    policy_env = (
+        "CPPMEGA_KERNEL_PATH",
+        "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO",
+        "CPPMEGA_KERNEL_PATH__M2RNN",
+        "CPPMEGA_KERNEL_PATH__SPARSE_MLA",
+    )
+    with _temporary_env({name: "path_c" for name in policy_env}):
+        with manifest_script._reference_kernel_path():
+            assert {name: os.environ[name] for name in policy_env} == {
+                name: "ref" for name in policy_env
+            }
+
+        assert {name: os.environ[name] for name in policy_env} == {
+            name: "path_c" for name in policy_env
+        }
+
+
+def test_blocked_manifest_keeps_readiness_on_reference_path(
+    tmp_path: Path,
+) -> None:
+    policy_values = {
+        "CPPMEGA_KERNEL_PATH",
+        "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO",
+        "CPPMEGA_KERNEL_PATH__M2RNN",
+        "CPPMEGA_KERNEL_PATH__SPARSE_MLA",
+    }
+    environment = os.environ.copy()
+    environment.update({name: "path_c" for name in policy_values})
+
+    output = tmp_path / "m03_random_init.json"
+    payload = load_json_result(
+        run_script(
+            "--no-cuda-reference-artifact",
+            "--output",
+            str(output),
+            "--json",
+            timeout=10,
+            env=environment,
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["mlx_reference"]["readiness_status"] == "pass"
+    assert payload["mlx_reference"]["kernel_path"] == "reference"
+    assert payload["mlx_reference"]["local_mlx_forward_executed"] is True
 
 
 def test_script_writes_blocked_manifest_without_cuda_artifact(tmp_path: Path) -> None:

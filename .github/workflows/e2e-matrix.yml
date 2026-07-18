@@ -10,13 +10,19 @@ on:
       - "tests/fixtures/build_e2e_matrix.py"
       - "tests/fixtures/tokenizers/**"
       - "tests/fixtures/parquet/**"
+      - "scripts/install_self_hosted_e2e_python.sh"
       - ".github/workflows/e2e-matrix.yml"
   pull_request:
     branches: [main]
     paths:
       - "cppmega_v4/**"
+      - "cppmega_mlx/**"
       - "vbgui/**"
       - "tests/fixtures/build_e2e_matrix.py"
+      - "tests/fixtures/parquet/**"
+      - "tests/fixtures/tokenizers/**"
+      - "scripts/install_self_hosted_e2e_python.sh"
+      - ".github/workflows/e2e-matrix.yml"
   schedule:
     # Nightly full run — includes the mini-train matrix on macOS.
     - cron: "0 4 * * *"
@@ -26,34 +32,50 @@ concurrency:
   group: e2e-matrix-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CPPMEGA_MLX_LM_CHECKOUT: /Volumes/external/sources/mlx-lm
+  CPPMEGA_MLX_LM_COMMIT: 8618587943181787d33bac4468d3088e80202b3f
+
 jobs:
-  # On every push/PR: smoke matrix (912 cells, ubuntu, no real MLX
-  # training — backend just verifies). Quick gate, ~10 min.
+  # On every push/PR: smoke matrix (912 cells). The backend imports MLX, so
+  # this runs on the repository's persistent Apple Silicon runner.
   preset-matrix:
-    name: Preset matrix (smoke, ubuntu)
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: Preset matrix (smoke, self-hosted macOS)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
+    # The matrix is one spec file. --fully-parallel is required or Playwright
+    # assigns all 912 cells to shard 1 and leaves the other shards empty.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
-          cache: "npm"
-          cache-dependency-path: vbgui/package-lock.json
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Python deps
+      - name: Create isolated MLX Python
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[gui,parquet,widget]"
-          pip install jsonschema pyarrow tokenizers anywidget
+          base_python=/Volumes/external/sources/.venvs/cppmega.mlx/bin/python
+          test -x "$base_python"
+          job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
+          "$base_python" -m venv "$job_venv"
+          echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=" >> "$GITHUB_ENV"
+          echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
+      - name: Allocate isolated E2E ports
+        run: |
+          port_base=$((22000 + (GITHUB_RUN_ID % 1000) * 20))
+          port_offset=${{ matrix.shard }}
+          echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
+      - name: Python deps
+        run: scripts/install_self_hosted_e2e_python.sh
       - name: Generate fixtures
-        run: python tests/fixtures/build_e2e_matrix.py
+        run: |
+          "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - name: Vbgui install + typecheck
         working-directory: vbgui
         env:
@@ -63,7 +85,7 @@ jobs:
           npm run typecheck
       - name: Playwright browsers
         working-directory: vbgui
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - name: Run preset matrix shard ${{ matrix.shard }}/4
         working-directory: vbgui
         env:
@@ -72,10 +94,12 @@ jobs:
         run: |
           npx playwright test --config=e2e/playwright.config.ts \
             e2e/scenarios/02_preset_matrix.spec.ts \
+            --fully-parallel \
+            --global-timeout=720000 \
             --shard=${{ matrix.shard }}/4
       - name: Upload artefacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: preset-matrix-shard-${{ matrix.shard }}
           path: |
@@ -83,31 +107,46 @@ jobs:
             vbgui/e2e/screenshots/
             vbgui/e2e/logs/
           retention-days: 3
+      - name: Remove isolated MLX Python
+        if: always()
+        run: rm -rf "$VBGUI_E2E_VENV"
 
   # Specialised + canvas smoke scenarios — run on every push (lightweight).
   specialised:
     name: Specialised + canvas smoke
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "22", cache: "npm",
-                cache-dependency-path: vbgui/package-lock.json }
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: "22" }
+      - name: Create isolated MLX Python
+        run: |
+          base_python=/Volumes/external/sources/.venvs/cppmega.mlx/bin/python
+          test -x "$base_python"
+          job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
+          "$base_python" -m venv "$job_venv"
+          echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=" >> "$GITHUB_ENV"
+          echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
+      - name: Allocate isolated E2E ports
+        run: |
+          port_base=$((22000 + (GITHUB_RUN_ID % 1000) * 20))
+          port_offset=8
+          echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
+      - run: scripts/install_self_hosted_e2e_python.sh
       - run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[gui,parquet,widget]"
-          pip install jsonschema pyarrow tokenizers anywidget
-      - run: python tests/fixtures/build_e2e_matrix.py
+          "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
         env: { NODE_ENV: development }
         run: |
           npm ci
           npm run typecheck
       - working-directory: vbgui
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - working-directory: vbgui
         env: { NODE_ENV: development, CI: "1" }
         run: |
@@ -118,7 +157,7 @@ jobs:
             e2e/scenarios/06_sharding_proposals.spec.ts \
             e2e/scenarios/07_gotchas.spec.ts
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: specialised-results
           path: |
@@ -126,39 +165,53 @@ jobs:
             vbgui/e2e/screenshots/
             vbgui/e2e/logs/
           retention-days: 3
+      - name: Remove isolated MLX Python
+        if: always()
+        run: rm -rf "$VBGUI_E2E_VENV"
 
   # Mini-train matrix (192 cells, real mlx) — macOS only, nightly.
   mini-train-matrix:
     name: Mini-train matrix (macOS, nightly)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "22", cache: "npm",
-                cache-dependency-path: vbgui/package-lock.json }
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: "22" }
+      - name: Create isolated MLX Python
+        run: |
+          base_python=/Volumes/external/sources/.venvs/cppmega.mlx/bin/python
+          test -x "$base_python"
+          job_venv="$(mktemp -d "$RUNNER_TEMP/cppmega-mlx-e2e-${GITHUB_RUN_ID}-${GITHUB_JOB}.XXXXXX")"
+          "$base_python" -m venv "$job_venv"
+          echo "VBGUI_E2E_PYTHON=$job_venv/bin/python" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_VENV=$job_venv" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=" >> "$GITHUB_ENV"
+          echo "PYTHONNOUSERSITE=1" >> "$GITHUB_ENV"
+      - name: Allocate isolated E2E ports
+        run: |
+          port_base=$((22000 + (GITHUB_RUN_ID % 1000) * 20))
+          port_offset=9
+          echo "VBGUI_E2E_BACKEND_PORT=$((port_base + port_offset))" >> "$GITHUB_ENV"
+          echo "VBGUI_E2E_FRONTEND_PORT=$((port_base + 10 + port_offset))" >> "$GITHUB_ENV"
+      - run: scripts/install_self_hosted_e2e_python.sh
       - run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[gui,parquet,widget]"
-          pip install jsonschema pyarrow tokenizers anywidget mlx mlx-lm
-      - run: python tests/fixtures/build_e2e_matrix.py
+          "$VBGUI_E2E_PYTHON" tests/fixtures/build_e2e_matrix.py
       - working-directory: vbgui
         env: { NODE_ENV: development }
         run: |
           npm ci
           npm run typecheck
       - working-directory: vbgui
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - working-directory: vbgui
         env: { NODE_ENV: development, CI: "1" }
         run: |
           npx playwright test --config=e2e/playwright.config.ts \
             e2e/scenarios/03_train_matrix.spec.ts
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mini-train-results
           path: |
@@ -166,19 +219,22 @@ jobs:
             vbgui/e2e/screenshots/
             vbgui/e2e/logs/
           retention-days: 7
+      - name: Remove isolated MLX Python
+        if: always()
+        run: rm -rf "$VBGUI_E2E_VENV"
 
   # Matrix report — aggregates shard artefacts into one Markdown
   # summary, posted as a build summary + uploaded as standalone artefact.
   matrix-report:
     name: Matrix report
     needs: [preset-matrix, specialised]
-    runs-on: ubuntu-latest
-    if: always()
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { path: artifacts }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with: { python-version: "3.13" }
       - name: Build matrix report
         run: |
@@ -186,7 +242,7 @@ jobs:
             --artifacts artifacts \
             --output e2e_matrix_report.md
           cat e2e_matrix_report.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e_matrix_report
           path: e2e_matrix_report.md

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 from typing import cast
 
 import pytest
 
+from cppmega_mlx.data.tokenizer_contract import (
+    RESERVED_ROLE_TOKEN_IDS,
+    SPECIAL_TOKEN_IDS,
+)
 from cppmega_mlx.tokenizer import TokenizerContractError, load_cppmega_tokenizer
 from cppmega_mlx.tokenizer.cpp_tokenizer import (
     EXPECTED_SPECIAL_TOKENS,
@@ -13,6 +18,9 @@ from cppmega_mlx.tokenizer.cpp_tokenizer import (
 )
 
 NANOCHAT_ROOT = Path("/Volumes/external/sources/nanochat")
+VENDORED_TOKENIZER_PATH = (
+    Path(__file__).resolve().parents[1] / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
+)
 
 
 def _write_tokenizer_json(path: Path, vocab: dict[str, int]) -> None:
@@ -22,14 +30,29 @@ def _write_tokenizer_json(path: Path, vocab: dict[str, int]) -> None:
         tokenizers.models.BPE(vocab=vocab, merges=[], unk_token="<UNK>")
     )
     tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    control_tokens = [
+        f"<{role}>"
+        for role, _token_id in sorted(
+            SPECIAL_TOKEN_IDS.items(), key=lambda item: item[1]
+        )
+        if f"<{role}>" in vocab
+    ]
+    control_tokens.extend(
+        f"<RESERVED_{token_id}>"
+        for token_id in sorted(set(RESERVED_ROLE_TOKEN_IDS.values()))
+        if f"<RESERVED_{token_id}>" in vocab
+    )
+    tokenizer.add_special_tokens(control_tokens)
     tokenizer.save(str(path))
 
 
 def _valid_vocab() -> dict[str, int]:
     vocab = {
-        "<PAD>": 0,
-        "<UNK>": 1,
-        **EXPECTED_SPECIAL_TOKENS,
+        **{f"<{role}>": token_id for role, token_id in SPECIAL_TOKEN_IDS.items()},
+        **{
+            f"<RESERVED_{token_id}>": token_id
+            for token_id in RESERVED_ROLE_TOKEN_IDS.values()
+        },
         "hello": 1_000,
         "world": 1_001,
     }
@@ -44,11 +67,8 @@ def _valid_vocab() -> dict[str, int]:
     return vocab
 
 
-def test_load_cppmega_tokenizer_accepts_exact_m01_contract(tmp_path: Path) -> None:
-    tokenizer_path = tmp_path / "tokenizer.json"
-    _write_tokenizer_json(tokenizer_path, _valid_vocab())
-
-    tokenizer = load_cppmega_tokenizer(tokenizer_path)
+def test_load_cppmega_tokenizer_accepts_exact_m01_contract() -> None:
+    tokenizer = load_cppmega_tokenizer(VENDORED_TOKENIZER_PATH)
 
     assert tokenizer.vocab_size == 65_536
     assert tokenizer.bos_token_id == 2
@@ -118,11 +138,21 @@ def test_whitespace_normalizer_still_preserves_string_literal_whitespace() -> No
 
 
 def test_load_cppmega_tokenizer_accepts_directory_path(tmp_path: Path) -> None:
-    _write_tokenizer_json(tmp_path / "tokenizer.json", _valid_vocab())
+    shutil.copyfile(VENDORED_TOKENIZER_PATH, tmp_path / "tokenizer.json")
 
     tokenizer = load_cppmega_tokenizer(tmp_path)
 
     assert tokenizer.path == tmp_path / "tokenizer.json"
+
+
+def test_load_cppmega_tokenizer_rejects_role_compatible_untrained_artifact(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    _write_tokenizer_json(tokenizer_path, _valid_vocab())
+
+    with pytest.raises(TokenizerContractError, match="expected 7200 added tokens"):
+        load_cppmega_tokenizer(tokenizer_path)
 
 
 def test_load_cppmega_tokenizer_rejects_wrong_vocab_size(tmp_path: Path) -> None:
@@ -146,7 +176,40 @@ def test_load_cppmega_tokenizer_rejects_wrong_reserved_id_token(
 
     with pytest.raises(
         TokenizerContractError,
-        match="<FIM_INSTRUCTION>.*must use id 45.*id 45 maps to '<RESERVED_45>'",
+        match="id 45 must map to '<FIM_INSTRUCTION>'.*'<RESERVED_45>'",
+    ):
+        load_cppmega_tokenizer(tokenizer_path)
+
+
+def test_load_cppmega_tokenizer_rejects_swapped_domain_delimiter_slots(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    vocab = _valid_vocab()
+    vocab["<RESERVED_209>"], vocab["<RESERVED_210>"] = 210, 209
+    _write_tokenizer_json(tokenizer_path, vocab)
+
+    with pytest.raises(
+        TokenizerContractError,
+        match="id 209 must map to '<RESERVED_209>'.*'<RESERVED_210>'",
+    ):
+        load_cppmega_tokenizer(tokenizer_path)
+
+
+def test_load_cppmega_tokenizer_rejects_missing_added_control_token(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    _write_tokenizer_json(tokenizer_path, _valid_vocab())
+    payload = json.loads(tokenizer_path.read_text())
+    payload["added_tokens"] = [
+        token for token in payload["added_tokens"] if token["id"] != 209
+    ]
+    tokenizer_path.write_text(json.dumps(payload))
+
+    with pytest.raises(
+        TokenizerContractError,
+        match="control token '<RESERVED_209>'.*must be present in added_tokens",
     ):
         load_cppmega_tokenizer(tokenizer_path)
 
@@ -190,13 +253,7 @@ def test_decode_parity_with_gb10_reference_receipt() -> None:
     receipt for any ID stream.
     """
 
-    tokenizer_path = (
-        Path(__file__).resolve().parents[1]
-        / "cppmega_mlx"
-        / "tokenizer"
-        / "tokenizer.json"
-    )
-    if not tokenizer_path.is_file():
+    if not VENDORED_TOKENIZER_PATH.is_file():
         pytest.skip("vendored tokenizer.json not present")
 
     receipt_path = (
@@ -209,7 +266,7 @@ def test_decode_parity_with_gb10_reference_receipt() -> None:
         pytest.skip("decode receipt fixture not present")
 
     receipt = json.loads(receipt_path.read_text())
-    tokenizer = load_cppmega_tokenizer(tokenizer_path)
+    tokenizer = load_cppmega_tokenizer(VENDORED_TOKENIZER_PATH)
     assert tokenizer.vocab_size == receipt["vocab_size"]
 
     for sample in receipt["samples"]:
@@ -228,16 +285,10 @@ def test_bpe_split_identifier_decodes_without_spurious_spaces() -> None:
     (id=46) sits between pieces.
     """
 
-    tokenizer_path = (
-        Path(__file__).resolve().parents[1]
-        / "cppmega_mlx"
-        / "tokenizer"
-        / "tokenizer.json"
-    )
-    if not tokenizer_path.is_file():
+    if not VENDORED_TOKENIZER_PATH.is_file():
         pytest.skip("vendored tokenizer.json not present")
 
-    tokenizer = load_cppmega_tokenizer(tokenizer_path)
+    tokenizer = load_cppmega_tokenizer(VENDORED_TOKENIZER_PATH)
 
     cases = [
         ("int sum = 5;", "int sum = 5;"),
@@ -256,6 +307,19 @@ def test_bpe_split_identifier_decodes_without_spurious_spaces() -> None:
         )
 
 
+def test_decode_and_optional_control_ids_fail_closed_outside_vocab() -> None:
+    tokenizer = load_cppmega_tokenizer(VENDORED_TOKENIZER_PATH)
+
+    with pytest.raises(TokenizerContractError, match="outside tokenizer vocab: 65536"):
+        tokenizer.decode([65_536])
+    with pytest.raises(TokenizerContractError, match="must be an integer, got bool"):
+        tokenizer.decode([True])
+    with pytest.raises(
+        TokenizerContractError, match="id 65536 is outside tokenizer vocab"
+    ):
+        tokenizer.encode("int x;", prepend=65_536)
+
+
 def test_line_comment_newline_survives_encode_decode_roundtrip() -> None:
     """A // comment must not absorb the following source line.
 
@@ -264,16 +328,10 @@ def test_line_comment_newline_survives_encode_decode_roundtrip() -> None:
     reconstruct the program: the next code line becomes part of the comment.
     """
 
-    tokenizer_path = (
-        Path(__file__).resolve().parents[1]
-        / "cppmega_mlx"
-        / "tokenizer"
-        / "tokenizer.json"
-    )
-    if not tokenizer_path.is_file():
+    if not VENDORED_TOKENIZER_PATH.is_file():
         pytest.skip("vendored tokenizer.json not present")
 
-    tokenizer = load_cppmega_tokenizer(tokenizer_path)
+    tokenizer = load_cppmega_tokenizer(VENDORED_TOKENIZER_PATH)
     source = (
         "int a = 0; // keep this comment\n"
         "int b = 1; // second comment\n"
@@ -287,6 +345,27 @@ def test_line_comment_newline_survives_encode_decode_roundtrip() -> None:
     assert tokens.count("<NL>") == 3
     assert tokens[tokens.index("//") + 1 :].index("<NL>") >= 1
     assert tokenizer.decode(ids) == source
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("int x; // C comment\nint y;\n", "int x; // C comment\nint y;\n"),
+        ("/// C++ doc comment\nint f();\n", "/// C++ doc comment\nint f();\n"),
+        ("// CRLF comment\r\nint value;\r\n", "// CRLF comment\nint value;\n"),
+        (
+            "/** block doc\n * line\n */\nint g();\n",
+            "/** block doc\n * line\n */\nint g();\n",
+        ),
+    ],
+)
+def test_comment_and_docstring_eol_roundtrip(source: str, expected: str) -> None:
+    tokenizer = load_cppmega_tokenizer(VENDORED_TOKENIZER_PATH)
+
+    ids = cast(list[int], tokenizer.encode(source))
+
+    assert ids.count(tokenizer.nl_token_id) == expected.count("\n")
+    assert tokenizer.decode(ids) == expected
 
 
 def test_nanochat_v3_fixed_tokens_config_matches_special_id_contract() -> None:

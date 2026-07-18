@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # ruff: noqa: E402
-"""Migrate clang_commits_4k_v1 parquet files to v12 schema.
+"""Migrate identity-complete clang commit parquet files to the v12 layout.
 
-Reads existing v1 parquet shards, adds missing v12 columns with appropriate
-null/empty defaults, and writes upgraded v12 parquet files.
+Reads existing shards, validates their canonical symbol identity channels, adds
+missing non-identity v12 columns with appropriate null/empty defaults, and
+writes upgraded v12 parquet files. Legacy shards without canonical identity are
+rejected because those identities cannot be reconstructed from numeric IDs.
 
 The v12 schema is defined in ``scripts/data/clang_enriched_to_4k_parquet.py``
 and corresponds to the unified clang semantic family that covers both static
 code and temporal commit data.
 
-This script is idempotent: re-running it on already-migrated v12 files is a
-no-op (existing columns are preserved, missing columns are added with defaults).
+This script is idempotent: re-running it on already-migrated v12 files preserves
+existing columns and metadata.
 
 Usage:
     # Migrate local directory
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -83,6 +86,17 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_TYPE_REFS_COLUMN,
     TOKEN_DEF_USE_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
+)
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityError,
+    SymbolIdentityRegistry,
+)
+from scripts.nanochat_data.atomic_publish import (
+    atomic_output_directory,
+    atomic_output_file,
 )
 
 logging.basicConfig(
@@ -148,9 +162,13 @@ V12_SCHEMA = pa.schema([
     pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
     # Semantic token columns (v12 additions)
-    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(SYMBOL_IDENTITIES_COLUMN, pa.list_(pa.struct([
+        pa.field("symbol_id", pa.uint64()),
+        pa.field("symbol_key", pa.string()),
+    ]))),
     pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
     # Temporal token columns
     pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
@@ -211,15 +229,68 @@ def _make_null_column(
     return pa.array([None] * num_rows, type=pa_type)
 
 
-def migrate_table(table: pa.Table) -> pa.Table:
-    """Add missing v12 columns to a table, preserving existing data.
+def migrate_table(
+    table: pa.Table,
+    *,
+    corpus_registry: SymbolIdentityRegistry | None = None,
+) -> pa.Table:
+    """Add non-identity v12 columns to an identity-complete table.
 
-    Returns a new table with the full v12 schema. Existing columns are
-    kept unchanged; missing columns are filled with appropriate defaults.
-    Extra columns not in v12 schema are preserved at the end.
+    Existing columns and metadata are preserved, and extra columns remain at the
+    end. Canonical identity columns are mandatory and are never synthesized.
     """
     existing_names = set(table.column_names)
     num_rows = table.num_rows
+    semantic_columns = (
+        TOKEN_SYMBOL_IDS_COLUMN,
+        TOKEN_CALL_TARGETS_COLUMN,
+        TOKEN_TYPE_REFS_COLUMN,
+    )
+    required_identity_columns = {*semantic_columns, SYMBOL_IDENTITIES_COLUMN}
+    missing_identity = sorted(required_identity_columns - existing_names)
+    if missing_identity:
+        raise SymbolIdentityError(
+            "legacy parquet cannot be promoted to v12 because canonical identity "
+            f"cannot be reconstructed; missing_columns={missing_identity}"
+        )
+    raw_version = (table.schema.metadata or {}).get(
+        SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    )
+    expected_version = str(SYMBOL_IDENTITY_SCHEMA_VERSION).encode("ascii")
+    if raw_version != expected_version:
+        raise SymbolIdentityError(
+            "legacy parquet cannot be promoted to v12 without canonical identity "
+            f"metadata; got={raw_version!r}, expected={expected_version!r}"
+        )
+    for name in semantic_columns:
+        field_type = table.schema.field(name).type
+        if not pa.types.is_list(field_type) or field_type.value_type != pa.uint64():
+            raise SymbolIdentityError(
+                f"{name} must preserve uint64 semantic identity, got {field_type}"
+            )
+    identities_type = table.schema.field(SYMBOL_IDENTITIES_COLUMN).type
+    if not pa.types.is_list(identities_type):
+        raise SymbolIdentityError(
+            f"{SYMBOL_IDENTITIES_COLUMN} must be a list, got {identities_type}"
+        )
+    registry = corpus_registry or SymbolIdentityRegistry()
+    identities = table.column(SYMBOL_IDENTITIES_COLUMN).to_pylist()
+    semantic_rows = {
+        name: table.column(name).to_pylist() for name in semantic_columns
+    }
+    for row_index, claims in enumerate(identities):
+        row_registry = SymbolIdentityRegistry()
+        normalized = row_registry.register_records(
+            claims, source=f"migration row {row_index}"
+        )
+        registry.register_records(normalized, source=f"migration row {row_index}")
+        used_ids = {
+            int(value)
+            for values in semantic_rows.values()
+            for value in (values[row_index] or [])
+            if int(value) != 0
+        }
+        row_registry.require_ids(used_ids, source=f"migration row {row_index}")
 
     # Build output columns in v12 schema order
     columns: dict[str, pa.Array] = {}
@@ -229,12 +300,8 @@ def migrate_table(table: pa.Table) -> pa.Table:
         if field.name in existing_names:
             # Keep existing column, cast if needed
             col = table.column(field.name)
-            try:
-                if col.type != field.type:
-                    col = col.cast(field.type, safe=False)
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                # If cast fails, keep the original type
-                pass
+            if col.type != field.type:
+                col = col.cast(field.type, safe=True)
             columns[field.name] = col
         else:
             # Add missing column with defaults
@@ -263,7 +330,8 @@ def migrate_table(table: pa.Table) -> pa.Table:
     # Build the output table: v12 columns first, then extras
     all_names = list(columns.keys()) + list(extra_columns.keys())
     all_arrays = list(columns.values()) + list(extra_columns.values())
-    return pa.table(dict(zip(all_names, all_arrays)))
+    migrated = pa.Table.from_arrays(all_arrays, names=all_names)
+    return migrated.replace_schema_metadata(table.schema.metadata)
 
 
 def migrate_shard(
@@ -272,6 +340,7 @@ def migrate_shard(
     *,
     dry_run: bool = False,
     row_group_size: int = 1024,
+    corpus_registry: SymbolIdentityRegistry | None = None,
 ) -> dict:
     """Migrate a single parquet shard from v1 to v12.
 
@@ -296,6 +365,8 @@ def migrate_shard(
         "dry_run": dry_run,
     }
 
+    migrated = migrate_table(table, corpus_registry=corpus_registry)
+
     if dry_run:
         log.info(
             "  [DRY RUN] %s: %d rows, %d missing columns, %d extra columns",
@@ -309,21 +380,23 @@ def migrate_shard(
     if not missing:
         log.info("  %s: already v12, no migration needed", input_path.name)
         if input_path != output_path:
-            # Copy as-is with extras preserved
-            migrated = migrate_table(table)
-            pq.write_table(migrated, str(output_path), row_group_size=row_group_size)
+            with atomic_output_file(output_path) as staged_output:
+                pq.write_table(
+                    migrated, str(staged_output), row_group_size=row_group_size
+                )
         stats["action"] = "copied" if input_path != output_path else "skipped"
         return stats
 
-    migrated = migrate_table(table)
-
-    # Write to output (may be same path for in-place migration)
-    pq.write_table(migrated, str(output_path), row_group_size=row_group_size)
-
-    # Validate written file
-    check = pq.ParquetFile(str(output_path))
-    assert check.num_row_groups > 0, f"Empty parquet: {output_path}"
-    check.read_row_group(0)
+    with atomic_output_file(output_path) as staged_output:
+        pq.write_table(migrated, str(staged_output), row_group_size=row_group_size)
+        check = pq.ParquetFile(str(staged_output))
+        if check.metadata.num_rows != table.num_rows:
+            raise RuntimeError(
+                f"row count changed during migration: {table.num_rows} -> "
+                f"{check.metadata.num_rows}"
+            )
+        if check.num_row_groups:
+            check.read_row_group(0)
 
     log.info(
         "  %s: migrated %d rows, added %d columns",
@@ -361,39 +434,40 @@ def migrate_directory(
         "Found %d parquet files in %s", len(parquet_files), input_dir
     )
 
-    if not dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def migrate_into(target_dir: Path) -> tuple[list[dict], int]:
+        all_stats: list[dict] = []
+        total_rows = 0
+        corpus_registry = SymbolIdentityRegistry()
+        for pf_path in parquet_files:
+            out_path = target_dir / pf_path.name
+            stats = migrate_shard(
+                pf_path,
+                out_path,
+                dry_run=dry_run,
+                row_group_size=row_group_size,
+                corpus_registry=corpus_registry,
+            )
+            all_stats.append(stats)
+            total_rows += stats["num_rows"]
+        return all_stats, total_rows
 
-    all_stats = []
-    total_rows = 0
-    total_missing = 0
-
-    for pf_path in parquet_files:
-        out_path = output_dir / pf_path.name
-        stats = migrate_shard(
-            pf_path,
-            out_path,
-            dry_run=dry_run,
-            row_group_size=row_group_size,
-        )
-        all_stats.append(stats)
-        total_rows += stats["num_rows"]
-        total_missing += len(stats["missing_columns"])
-
-    # Copy non-parquet files (e.g., _COMPLETE sentinel)
-    if not dry_run:
-        for item in input_dir.iterdir():
-            if item.is_file() and not item.name.endswith(".parquet"):
-                dest = output_dir / item.name
-                if item != dest:
-                    dest.write_bytes(item.read_bytes())
-
-        # Write _COMPLETE sentinel for the output directory
-        sentinel = output_dir / "_COMPLETE"
-        sentinel.write_text(
-            f"Migrated from {input_dir.name} to v12 schema.\n"
-            f"{len(parquet_files)} shards, {total_rows} total rows.\n"
-        )
+    if dry_run:
+        all_stats, total_rows = migrate_into(output_dir)
+    else:
+        with atomic_output_directory(output_dir) as staged_output:
+            all_stats, total_rows = migrate_into(staged_output)
+            for item in input_dir.iterdir():
+                if (
+                    item.is_file()
+                    and not item.name.endswith(".parquet")
+                    and item.name != "_COMPLETE"
+                ):
+                    shutil.copy2(item, staged_output / item.name)
+            (staged_output / "_COMPLETE").write_text(
+                f"Migrated from {input_dir.name} to v12 schema.\n"
+                f"{len(parquet_files)} shards, {total_rows} total rows.\n",
+                encoding="utf-8",
+            )
 
     log.info(
         "Migration %s: %d shards, %d total rows",

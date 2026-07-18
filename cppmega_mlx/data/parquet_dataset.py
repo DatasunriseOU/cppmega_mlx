@@ -63,6 +63,23 @@ _TOKEN_SEMANTIC_METADATA_COLUMNS = (
     "token_type_refs",
     "token_def_use",
 )
+_TOKEN_DOMAIN_METADATA_COLUMNS = (
+    "token_domain_ids",
+    "token_role_ids",
+    "token_entity_ids",
+    "token_scope_ids",
+    "token_source_doc_ids",
+    "token_source_identity_ids",
+    "token_confidence_ids",
+)
+_TOKEN_UINT64_METADATA_COLUMNS = frozenset(
+    (
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+        "token_source_identity_ids",
+    )
+)
 _TOKEN_TEMPORAL_METADATA_COLUMNS = (
     "token_change_mask_pre",
     "token_change_mask_post",
@@ -72,6 +89,7 @@ _TOKEN_TEMPORAL_METADATA_COLUMNS = (
 _FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "semantic_graph": _TOKEN_SEMANTIC_METADATA_COLUMNS,
     "temporal_diff": _TOKEN_TEMPORAL_METADATA_COLUMNS,
+    "domain_routes": _TOKEN_DOMAIN_METADATA_COLUMNS,
 }
 _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "semantic_graph": _TOKEN_GRAPH_METADATA_COLUMNS,
@@ -126,6 +144,7 @@ _ROW_METADATA_COLUMNS = (
 )
 _RECOGNIZED_BATCH_METADATA_COLUMNS = (
     *_TOKEN_SEMANTIC_METADATA_COLUMNS,
+    *_TOKEN_DOMAIN_METADATA_COLUMNS,
     *_TOKEN_TEMPORAL_METADATA_COLUMNS,
     *_TOKEN_CHUNK_METADATA_COLUMNS,
     *_TOKEN_GRAPH_METADATA_COLUMNS,
@@ -365,7 +384,7 @@ class TokenParquetDataset:
         }
         self._family_side_channels = {
             family: {
-                column: value.astype(np.int32, copy=False)
+                column: _family_side_channel_values(column, value)
                 for column, value in family_columns.items()
             }
             for family, family_columns in family_side_channel_columns.channels.items()
@@ -1042,12 +1061,29 @@ def _family_side_channel_windows(
             channels.setdefault(family, {})[column] = _fixed_windows_from_rows(
                 rows,
                 seq_len,
+                dtype=(
+                    np.dtype(np.uint64)
+                    if column in _TOKEN_UINT64_METADATA_COLUMNS
+                    else np.dtype(np.int32)
+                ),
             )
             sources.setdefault(family, {})[column] = {
                 "column": column,
                 "type": columns.type_label(column),
             }
     return _FamilySideChannelColumns(channels=channels, sources=sources)
+
+
+def _family_side_channel_values(column: str, values: np.ndarray) -> np.ndarray:
+    if column in _TOKEN_UINT64_METADATA_COLUMNS:
+        if values.dtype.kind not in {"i", "u"} or (
+            values.dtype.kind == "i" and np.any(values < 0)
+        ):
+            raise ValueError(
+                f"{column} opaque identities must be non-negative integers"
+            )
+        return values.astype(np.uint64, copy=False)
+    return values.astype(np.int32, copy=False)
 
 
 def _family_graph_side_channel_windows(
@@ -1657,20 +1693,32 @@ def _rows_are_token_aligned(
 
 
 def _fixed_windows_from_rows(
-    rows: Sequence[Sequence[int | float]], seq_len: int
+    rows: Sequence[Sequence[int | float]],
+    seq_len: int,
+    *,
+    dtype: np.dtype | None = None,
 ) -> np.ndarray:
+    target_dtype = None if dtype is None else np.dtype(dtype)
     if not rows:
-        return np.empty((0, seq_len), dtype=np.int32)
+        return np.empty(
+            (0, seq_len),
+            dtype=np.int32 if target_dtype is None else target_dtype,
+        )
     if all(len(row) == 1 for row in rows):
-        return _fixed_windows(np.asarray([row[0] for row in rows]), seq_len)
+        return _fixed_windows(
+            np.asarray([row[0] for row in rows], dtype=target_dtype), seq_len
+        )
 
     windows = [
-        _fixed_windows(np.asarray(row), seq_len)
+        _fixed_windows(np.asarray(row, dtype=target_dtype), seq_len)
         for row in rows
         if len(row) >= seq_len
     ]
     if not windows:
-        return np.empty((0, seq_len), dtype=np.int32)
+        return np.empty(
+            (0, seq_len),
+            dtype=np.int32 if target_dtype is None else target_dtype,
+        )
     return np.concatenate(windows, axis=0)
 
 

@@ -10,6 +10,7 @@ hosts where TileLang is available (both CUDA and Apple Metal SIMDgroup).
 from __future__ import annotations
 
 import math
+import re
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -34,6 +35,67 @@ def _pick_device() -> torch.device:
     if _HAS_MPS and tilelang_supports(torch.device("mps")):
         return torch.device("mps")
     return torch.device("cpu")
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+@pytest.mark.parametrize("stage", (1, 2))
+def test_dsa_splitk_metal_mma_destinations_are_simdgroup_matrices(stage: int):
+    """Metal MMA calls must not target scalar thread-local float arrays."""
+
+    from cppmega_mlx.nn._tilelang._msl_transform import _as_metal_target
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (
+        _metal_block_overrides,
+        make_dsa_splitk_stage1_kernel,
+        make_dsa_splitk_stage2_kernel,
+    )
+    from tilelang.engine.lower import lower
+
+    common = dict(
+        AB=1,
+        AH=2,
+        AD=32,
+        Sk=32,
+        ASq=32,
+        sparse_loss=False,
+        softmax_scale=1.0 / math.sqrt(32),
+        target="metal -thread_warp_size=32",
+        **_metal_block_overrides(stage, AH=2),
+    )
+    if stage == 1:
+        prim = make_dsa_splitk_stage1_kernel(**common)
+    else:
+        prim = make_dsa_splitk_stage2_kernel(
+            **common,
+            use_q_cache_v5=False,
+        )
+
+    artifact = lower(
+        prim,
+        target=_as_metal_target("metal -thread_warp_size=32"),
+    )
+    source = artifact.kernel_source
+    mma_destinations = set(
+        re.findall(
+            r"simdgroup_multiply_accumulate\(\s*([A-Za-z_]\w*)",
+            source,
+        )
+    )
+    scalar_thread_arrays = set(
+        re.findall(
+            r"\bthread\s+(?:float|half|bfloat|int|uint)\w*\s+([A-Za-z_]\w*)\s*\[",
+            source,
+        )
+    )
+    simdgroup_matrices = set(
+        re.findall(
+            r"\bsimdgroup_[A-Za-z0-9_]+\s+([A-Za-z_]\w*)\s*\[",
+            source,
+        )
+    )
+
+    assert mma_destinations, "expected the Metal lowering to contain SIMDgroup MMA"
+    assert not mma_destinations & scalar_thread_arrays, source
+    assert mma_destinations <= simdgroup_matrices, source
 
 
 def _torch_indexer_loss_reference(
@@ -668,6 +730,29 @@ def test_wave9_tiled_block_sq_choice_for_production_shapes():
     assert _can_use_q_cache_v5_tiled(AH=128, AD=64, in_dtype="float16", target="metal") is None
     # CUDA budget 64 KB -> AH=16 lands on BLOCK_SQ=32 (16*32*64*2 = 65536 B exact).
     assert _can_use_q_cache_v5_tiled(AH=16, AD=64, in_dtype="float16", target="cuda") == 32
+
+
+def test_metal_dsa_q_cache_caps_row_reduction_tile_at_32():
+    """Metal's current reducer lowering is numerically unsafe for 64 rows."""
+
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (
+        _can_use_q_cache_v5_tiled,
+    )
+
+    assert _can_use_q_cache_v5_tiled(
+        AH=2, AD=32, in_dtype="float16", target="metal"
+    ) == 32
+
+
+def test_metal_dsa_row_reduction_rejects_unrepresentable_layout() -> None:
+    """Unsupported Metal shapes must not fall back to inferred layouts."""
+
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (
+        _metal_rowwise_reduction_layouts,
+    )
+
+    with pytest.raises(ValueError, match="rows <= threads"):
+        _metal_rowwise_reduction_layouts(None, rows=64, cols=32, threads=32)
 
 
 def test_wave9_sparse_loss_scratch_cache():

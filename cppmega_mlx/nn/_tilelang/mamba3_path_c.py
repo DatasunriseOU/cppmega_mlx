@@ -384,7 +384,12 @@ def _z3_proves_mamba3_lane_mapping(
     h_idx = ((b * heads + h) * headdim + p) * state + n
 
     solver = z3.Solver()
-    solver.set("timeout", 50)
+    # This proof gates automatic Path C promotion and runs on a tiny fixed
+    # integer formula.  Fifty milliseconds was low enough to return UNKNOWN
+    # under a busy integration host, making the same shape nondeterministically
+    # fall back to Path B.  Keep the gate fail-closed, but give the solver a
+    # realistic bounded budget so valid production shapes are stable.
+    solver.set("timeout", 1000)
     solver.add(0 <= lane, lane < lanes)
     solver.add(0 <= t, t < seq)
     solver.add(0 <= n, n < state)

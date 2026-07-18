@@ -10,10 +10,9 @@
 #     (clang_semantic_4k_v10, clang_commits_4k_v1). They already carry token_ids
 #     + structure side-channels (POPULATED). Re-materialization is OFF the table
 #     for the corpus; the tiny tests/fixtures/golden_mini is a TEST fixture only.
-#   * DSA is a BUILT-IN capability — everything it needs lives INSIDE the model
-#     (the learned lightning indexer + KL warm-up to dense attention). It does
-#     NOT require clang-graph columns in the data and does NOT need a parquet
-#     regen. It is architecturally available from the start.
+#   * DSA is a BUILT-IN capability, but the production recipe below requires
+#     graph_routes_v2 sidecars for its fixed route/kind supervision. Missing
+#     graph/domain/document sidecars fail at startup.
 #   * FIRST TEST RUN attention = GQA (not DSA). Get structure + a fast training
 #     step working and the loss going down per plan. DSA is switched on in a
 #     later run (KL warm-up); optional clang-graph supervision (Phase 4) uses the
@@ -23,6 +22,47 @@
 #
 # Mirrors cppmega_mlx.config.model.Nam56RModelConfig; Wave-2 wires a
 # build_dense500m_config() profile from it.
+
+production_recipe:
+  name: stage1_graph_domain_v1
+  graph_routes:
+    schema: cppmega_graph_routes_v2
+    enabled: true
+    required: true
+    beta: 1.0
+    require_edge_kinds: true
+    relations: [call, type, domain, build, shell, diagnostic, cross_domain]
+  domain_routes:
+    enabled: true
+    required: true
+    residual_scale: 1.0
+  data:
+    ingress: megatron_indexed
+    required_sidecars:
+      - token_domain_ids
+      - token_role_ids
+      - token_confidence_ids
+      - document_ids
+      - token_chunk_starts
+      - token_chunk_ends
+      - token_chunk_kinds
+      - token_chunk_dep_levels
+      - token_call_edges
+      - token_type_edges
+      - token_domain_edges
+      - token_build_edges
+      - token_shell_edges
+      - token_diagnostic_edges
+      - token_cross_domain_edges
+      - graph_sidecar_schema
+      - graph_sidecar_paths
+  startup_validation:
+    require_nonzero_graph_edges: true
+    require_nonzero_graph_prior: true
+    require_valid_edge_kind_ids: true
+    require_nonzero_domain_tokens: true
+    require_nonzero_document_boundaries: true
+    require_live_domain_residual_after_update: true
 
 model:
   profile: dense500m
@@ -47,7 +87,7 @@ model:
 
   # DSA: BUILT-IN, available, OFF for the first run. Self-contained (learned
   # indexer + KL warm-up). Turn on in a later run by switching attention.mode to
-  # 'dsa'. Needs NOTHING added to the parquet.
+  # 'dsa'. The production recipe requires graph_routes_v2 sidecars.
   dsa:
     enabled: false          # first test run uses GQA
     a_layer_ranks: [2, 5, 8, 11, 14, 17, 20]

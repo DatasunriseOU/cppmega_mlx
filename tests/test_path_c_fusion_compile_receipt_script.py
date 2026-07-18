@@ -156,13 +156,11 @@ def test_compile_receipt_plans_model_derived_fused_schedule(tmp_path: Path) -> N
     ]
     direct_alternative = payload["direct_logical_abi_alternative"]
     assert direct_alternative["physical_abi_policy"] == "direct_buffers"
-    assert direct_alternative["status"] == "blocked_metal_buffer_limit"
+    assert direct_alternative["status"] == "unavailable"
+    assert "scratch parameter budget exceeded" in direct_alternative["error"]
+    assert "mamba3_conv_history" in direct_alternative["error"]
     assert direct_alternative["logical_tensor_binding_supported"] is True
     assert direct_alternative["no_hidden_allocation_policy"] is True
-    assert direct_alternative["kernel_parameter_count"] > (
-        direct_alternative["metal_buffer_limit"]
-    )
-    assert direct_alternative["metal_buffer_limit_exceeded"] is True
     chain_plan = direct_alternative["direct_chained_fusion_plan"]
     chain_construction = direct_alternative["direct_chained_fusion_construction"]
     assert chain_construction == {
@@ -405,7 +403,8 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         "path_c_float32_activation_gradient_abi_bank",
         "path_c_float32_parameter_gradient_abi_bank",
     ]
-    assert smoke["kernel_parameter_count"] == 21
+    assert smoke["kernel_parameter_count"] == 24
+    assert smoke["kernel_parameter_count"] <= 31
     assert smoke["logical_parameter_count"] > smoke["kernel_parameter_count"]
     assert smoke["total_buffer_bytes"] < smoke["max_buffer_bytes"]
     assert {entry["name"] for entry in smoke["buffer_abi"]} == {
@@ -419,6 +418,9 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         "path_c_float32_parameter_gradient_abi_bank",
         "path_c_float32_scratch_bank",
         "path_c_int32_scratch_bank",
+        "runtime_smoke_brick_1_R_m2rnn_h_state",
+        "runtime_smoke_brick_0_M_mamba3_conv_history",
+        "runtime_smoke_brick_1_R_m2rnn_conv_history",
         "runtime_smoke_brick_0_M_mamba3_b_raw",
         "runtime_smoke_brick_0_M_mamba3_c_raw",
         "runtime_smoke_brick_0_M_mamba3_b_group",
@@ -426,7 +428,6 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         "runtime_smoke_brick_0_M_mamba3_angle_cumsum",
         "runtime_smoke_brick_0_M_mamba3_b_inv_rms",
         "runtime_smoke_brick_0_M_mamba3_c_inv_rms",
-        "runtime_smoke_brick_1_R_m2rnn_h_state",
     }
     assert smoke["runtime_artifact_kind"] == "single"
     assert smoke["single_generated_artifact"] is True
@@ -436,12 +437,14 @@ def test_compile_receipt_can_execute_tiny_banked_abi_runtime_smoke(
         {"name": "path_c_row_chunk_index", "value": 0},
         {"name": "path_c_row_subchunk_index", "value": 0},
         {"name": "path_c_run_backward", "value": 1},
+        {"name": "path_c_backward_stage_index", "value": 0},
     ]
     assert captured["arg_count"] == smoke["kernel_parameter_count"]
-    assert captured["scalar_args"] == [(8, 0), (9, 7), (10, 1)]
+    assert captured["scalar_args"] == [(8, 0), (9, 7), (10, 1), (11, 0)]
     expected_buffer_shapes = [tuple(entry["shape"]) for entry in smoke["buffer_abi"]]
     expected_arg_shapes = [
         *expected_buffer_shapes[:8],
+        (),
         (),
         (),
         (),

@@ -14,6 +14,118 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 
+def _repo_identity_map(tmp_path: Path) -> Path:
+    path = tmp_path / "repo_list.json"
+    path.write_text(
+        json.dumps(
+            {"repos": [{"name": "repo", "owner_repo": "tests/repo"}]}
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_code_project_identity_claims_deduplicate_aliases() -> None:
+    import streaming_conveyor
+
+    claims: dict[str, str] = {}
+
+    assert streaming_conveyor.claim_code_project_identity(
+        claims,
+        "open-watcom",
+        "open-watcom/open-watcom-v2",
+    ) is None
+    assert streaming_conveyor.claim_code_project_identity(
+        claims,
+        "open-watcom-v2",
+        "open-watcom/open-watcom-v2",
+    ) == "open-watcom"
+
+
+def test_libclang_preflight_fails_before_staging_with_child_error(tmp_path) -> None:
+    import streaming_conveyor
+
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\necho 'clang bindings unavailable' >&2\nexit 17\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            r"libclang preflight failed: .*exit=17: "
+            r"clang bindings unavailable"
+        ),
+    ):
+        streaming_conveyor.verify_libclang_preflight(fake_python)
+
+
+def test_unmapped_code_repo_is_quarantined_without_blocking_next_submission(
+    tmp_path,
+) -> None:
+    import threading
+
+    import streaming_conveyor
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "name": "public-repo",
+                        "owner_repo": "tests/public-repo",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+    progress_path = tmp_path / "progress.jsonl"
+    progress = streaming_conveyor.ProgressWriter(progress_path)
+    claims: dict[str, str] = {}
+    lock = threading.Lock()
+
+    assert not streaming_conveyor.claim_code_repo_for_submission(
+        repo="unmapped archive",
+        repo_list=repo_list,
+        project_identity_claims=claims,
+        manifest=manifest,
+        manifest_lock=lock,
+        progress=progress,
+    )
+    assert manifest.failed["unmapped archive::code"]["stage"] == "project_identity"
+    assert claims == {}
+
+    assert streaming_conveyor.claim_code_repo_for_submission(
+        repo="public-repo",
+        repo_list=repo_list,
+        project_identity_claims=claims,
+        manifest=manifest,
+        manifest_lock=lock,
+        progress=progress,
+    )
+    assert claims == {"tests/public-repo": "public-repo"}
+
+    events = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["event"] == "unit_failed"
+    assert events[0]["repo"] == "unmapped archive"
+    assert events[0]["unit"] == "unmapped archive::code"
+    assert events[0]["stream"] == "code"
+    assert events[0]["stage"] == "project_identity"
+    assert events[0]["detail"] == (
+        f"{repo_list}: no canonical project identity for bare repo "
+        "'unmapped archive'"
+    )
+
+
 def test_progress_writer_appends_jsonl(tmp_path):
     import streaming_conveyor
 
@@ -428,6 +540,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
 
     def runner(
         repo,
+        project_id,
         repo_dir,
         lengths_code,
         work_root,
@@ -457,6 +570,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_peak_oom(tmp_path
 
     info = streaming_conveyor.run_code_half_adaptive(
         "repo",
+        "tests/repo",
         tmp_path,
         (1024,),
         tmp_path / "work",
@@ -484,6 +598,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path)
 
     def runner(
         repo,
+        project_id,
         repo_dir,
         lengths_code,
         work_root,
@@ -511,6 +626,7 @@ def test_run_code_half_adaptive_retries_single_parse_worker_on_timeout(tmp_path)
 
     info = streaming_conveyor.run_code_half_adaptive(
         "repo",
+        "tests/repo",
         tmp_path,
         (1024,),
         tmp_path / "work",
@@ -558,6 +674,7 @@ def test_run_code_half_removes_outputs_when_dedup_promote_fails(tmp_path, monkey
     try:
         streaming_conveyor.run_code_half(
             repo,
+            "tests/repo",
             tmp_path / "src",
             (1024,),
             tmp_path / "work",
@@ -608,6 +725,7 @@ def test_run_code_half_recompresses_before_dedup_promote(tmp_path, monkeypatch):
     try:
         streaming_conveyor.run_code_half(
             repo,
+            "tests/repo",
             tmp_path / "src",
             (1024,),
             tmp_path / "work",
@@ -655,6 +773,7 @@ def test_run_code_half_recompress_failure_rolls_back_before_promote(tmp_path, mo
     with pytest.raises(streaming_conveyor.RepoFailure, match="zstd failed") as exc_info:
         streaming_conveyor.run_code_half(
             repo,
+            "tests/repo",
             tmp_path / "src",
             (1024,),
             tmp_path / "work",
@@ -680,6 +799,7 @@ def test_run_code_half_skips_no_trainable_source(tmp_path, monkeypatch):
 
     info = streaming_conveyor.run_code_half(
         "repo",
+        "tests/repo",
         tmp_path / "src",
         (1024,),
         tmp_path / "work",
@@ -714,6 +834,7 @@ def test_run_code_half_skips_dedup_exhausted_and_discards_stage(
 
     info = streaming_conveyor.run_code_half(
         "repo",
+        "tests/repo",
         tmp_path / "src",
         (1024,),
         tmp_path / "work",
@@ -811,7 +932,7 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            repo_list=_repo_identity_map(tmp_path),
         )
 
     assert (done, failed, all_done) == (0, 0, True)
@@ -875,13 +996,208 @@ def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monk
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            repo_list=_repo_identity_map(tmp_path),
             streams="both",
         )
 
     assert manifest.is_done("repo::code")
     assert not repo_work.exists()
     assert not cache_dir.exists()
+
+
+def test_process_one_repo_records_unresolved_project_identity_without_aborting_pool(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "unmapped archive"
+    work_root = tmp_path / "work"
+    repo_dir = work_root / repo / "_src"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "main.cpp").write_text("int value = 1;\n", encoding="utf-8")
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+    called = False
+
+    def fail_if_code_runs(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("code stage must not run without canonical identity")
+
+    monkeypatch.setattr(streaming_conveyor, "run_code_half_adaptive", fail_if_code_runs)
+    monkeypatch.setattr(
+        streaming_conveyor.sr,
+        "resolve_project_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            streaming_conveyor.SymbolIdentityError("no canonical owner/repo identity")
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = streaming_conveyor.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(),
+            range_size=500,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=streaming_conveyor.threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=False,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=tmp_path / "repo_list.json",
+            streams="code",
+        )
+
+    assert not called
+    assert result["code"] == "failed"
+    assert manifest.failed[f"{repo}::code"]["stage"] == "project_identity"
+
+
+def test_discover_existing_jsonl_never_adopts_unvalidated_stable_cache(
+    tmp_path,
+    monkeypatch,
+):
+    import streaming_conveyor
+
+    repo = "repo"
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    cache_dir.mkdir(parents=True)
+    unvalidated = cache_dir / f"{repo}_commits.jsonl"
+    unvalidated.write_text('{"partial": true}\n', encoding="utf-8")
+    work_root = tmp_path / "work"
+    work_parent = tmp_path / "work_parent"
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+    monkeypatch.setattr(streaming_conveyor, "DEFAULT_WORK_PARENT", work_parent)
+
+    assert (
+        streaming_conveyor._discover_existing_jsonl(
+            repo,
+            work_root,
+            work_parent,
+        )
+        is None
+    )
+
+
+def test_ensure_commit_records_reextracts_unproven_legacy_jsonl(
+    tmp_path,
+    monkeypatch,
+):
+    import streaming_conveyor
+
+    repo = "repo"
+    cache_root = tmp_path / "extract_cache"
+    work_root = tmp_path / "work"
+    work_parent = tmp_path / "work_parent"
+    legacy = work_root / repo / f"{repo}_commits.jsonl"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text('{"partial": true}\n', encoding="utf-8")
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+    monkeypatch.setattr(streaming_conveyor, "DEFAULT_WORK_PARENT", work_parent)
+    monkeypatch.setattr(streaming_conveyor, "get_commit_list", lambda _repo_dir: ["c1"])
+    calls = []
+
+    def fresh_extract(name, _repo_dir, cache_dir):
+        calls.append(name)
+        output = cache_dir / f"{name}_commits.jsonl"
+        output.write_text('{"fresh": true}\n', encoding="utf-8")
+        return output
+
+    monkeypatch.setattr(streaming_conveyor, "stage_extract_commits", fresh_extract)
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    output, count, status = streaming_conveyor.ensure_commit_records(
+        repo,
+        tmp_path / "repo_src",
+        work_root,
+        work_parent,
+        manifest,
+        resume=True,
+    )
+
+    assert calls == [repo]
+    assert output.read_text(encoding="utf-8") == '{"fresh": true}\n'
+    assert legacy.read_text(encoding="utf-8") == '{"partial": true}\n'
+    assert (count, status) == (1, "fresh")
+    assert streaming_conveyor._read_valid_sentinel(output) == 1
+
+
+def test_process_one_repo_retains_transactional_extract_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import streaming_conveyor
+
+    repo = "repo"
+    work_root = tmp_path / "work"
+    repo_work = work_root / repo
+    repo_dir = repo_work / "_src"
+    repo_dir.mkdir(parents=True)
+    cache_root = tmp_path / "extract_cache"
+    cache_dir = cache_root / repo
+    checkpoint_db = (
+        cache_dir
+        / f"{repo}_commits.jsonl.extract-checkpoint"
+        / "repo-0000-deadbeef"
+        / "checkpoint.sqlite3"
+    )
+    checkpoint_db.parent.mkdir(parents=True)
+    checkpoint_db.write_bytes(b"durable checkpoint")
+    monkeypatch.setattr(streaming_conveyor, "EXTRACT_CACHE_ROOT", cache_root)
+
+    monkeypatch.setattr(
+        streaming_conveyor,
+        "run_code_half_adaptive",
+        lambda *_args, **_kwargs: {
+            "source": "code",
+            "lengths": {"1024": _stat(rows=1, valid=32, target_length=1024)},
+        },
+    )
+    monkeypatch.setattr(
+        streaming_conveyor,
+        "run_commits_half",
+        lambda *_args, **_kwargs: (0, 0, False),
+    )
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        streaming_conveyor.process_one_repo(
+            repo=repo,
+            repo_dir=repo_dir,
+            lengths_code=(1024,),
+            lengths_commits=(1024,),
+            range_size=500,
+            range_target_bytes=0,
+            work_root=work_root,
+            work_parent=tmp_path / "parent",
+            pool=pool,
+            manifest=manifest,
+            manifest_lock=streaming_conveyor.threading.Lock(),
+            resume=True,
+            cumulative={"valid": 0},
+            keep_temp=False,
+            dedup_db=None,
+            dedup_near=False,
+            pr_store=None,
+            repo_list=_repo_identity_map(tmp_path),
+            streams="both",
+        )
+
+    assert not repo_work.exists()
+    assert checkpoint_db.read_bytes() == b"durable checkpoint"
 
 
 def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
@@ -934,7 +1250,7 @@ def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            repo_list=_repo_identity_map(tmp_path),
             streams="both",
             retain_partial_work=True,
         )
@@ -996,7 +1312,7 @@ def test_process_one_repo_interrupted_keeps_extract_cache_without_temp(
                 dedup_db=None,
                 dedup_near=False,
                 pr_store=None,
-                repo_list=None,
+                repo_list=_repo_identity_map(tmp_path),
                 streams="both",
                 retain_partial_work=False,
             )
@@ -1225,6 +1541,26 @@ def test_default_conveyor_work_parent_lives_under_outputs():
     assert "outputs/conveyor/tmp" in str(streaming_conveyor.DEFAULT_WORK_PARENT)
     assert args.retain_partial_work is False
     assert args.min_free_disk_gb == streaming_conveyor.DEFAULT_MIN_FREE_DISK_GB
+
+
+def test_parent_work_root_cleanup_honors_retain_partial_work():
+    import streaming_conveyor
+
+    assert not streaming_conveyor.should_remove_owned_work_root(
+        own_work_root=True,
+        keep_temp=False,
+        retain_partial_work=True,
+    )
+    assert not streaming_conveyor.should_remove_owned_work_root(
+        own_work_root=True,
+        keep_temp=True,
+        retain_partial_work=False,
+    )
+    assert streaming_conveyor.should_remove_owned_work_root(
+        own_work_root=True,
+        keep_temp=False,
+        retain_partial_work=False,
+    )
 
 
 def test_output_root_args_rebase_runtime_paths(tmp_path):

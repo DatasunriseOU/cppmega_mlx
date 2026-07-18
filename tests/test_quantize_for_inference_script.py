@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -17,6 +18,44 @@ def run_script(*args: str) -> subprocess.CompletedProcess[str]:
         timeout=120,
         check=False,
     )
+
+
+def test_quantize_cli_ignores_dirty_tilelang_loader_environment(tmp_path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "DYLD_LIBRARY_PATH": "/Volumes/external/sources/tilelang/build/lib",
+            "TVM_LIBRARY_PATH": "/Volumes/external/sources/tilelang/build/lib",
+            "TILELANG_DEV_BUILD_ROOT": "/Volumes/external/sources/tilelang/build",
+            # Keep the repository importable for ``python -m`` while still
+            # placing a dirty TileLang path in front of the loader contract.
+            "PYTHONPATH": os.pathsep.join(
+                (str(REPO), "/Volumes/external/sources/tilelang")
+            ),
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.quantize_for_inference",
+            "--json",
+            "--out",
+            str(tmp_path / "clean.json"),
+            "--preset",
+            "smoke_attention",
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["hardware"]["mlx_version"] == "0.32.0"
 
 
 def test_quantize_for_inference_writes_manifest_and_forward_check(tmp_path):

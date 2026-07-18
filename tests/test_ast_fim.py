@@ -27,7 +27,12 @@ def _arr(values: list[int]) -> mx.array:
     return mx.array(np.asarray(values, dtype=np.int32))
 
 
-def _packet(tokens: list[int], chunks: list[tuple[int, int]], *, source_text=None) -> CodePacket:
+def _packet(
+    tokens: list[int],
+    chunks: list[tuple[int, int]],
+    *,
+    document_ids: list[int] | None = None,
+) -> CodePacket:
     starts = [c[0] for c in chunks]
     ends = [c[1] for c in chunks]
     return CodePacket(
@@ -36,7 +41,7 @@ def _packet(tokens: list[int], chunks: list[tuple[int, int]], *, source_text=Non
         chunk_ends=_arr(ends),
         chunk_kinds=_arr([1] * len(chunks)),
         chunk_dep_levels=_arr([0] * len(chunks)),
-        metadata={} if source_text is None else {"source_text": source_text},
+        document_ids=_arr(document_ids) if document_ids is not None else None,
     )
 
 
@@ -97,58 +102,99 @@ def test_ast_fim_deterministic_for_fixed_seed() -> None:
     assert a.span == b.span and a.kind == b.kind and a.mode == b.mode
 
 
+def test_ast_fim_is_confined_to_one_logical_document() -> None:
+    tokens = [100 + index for index in range(12)]
+    packet = _packet(
+        tokens,
+        [(1, 3), (8, 10)],
+        document_ids=[1] * 6 + [2] * 6,
+    )
+
+    result = apply_ast_fim(
+        packet,
+        seed=4,
+        spm_rate=0.0,
+        ast_fim_rate=1.0,
+    )
+
+    assert result.document_span is not None
+    assert result.document_span in {(0, 6), (6, 12)}
+    source_tokens = [token for token in result.token_ids if token in tokens]
+    start, end = result.document_span
+    assert sorted(source_tokens) == sorted(tokens[start:end])
+
+
+def test_ast_fim_rejects_a_clang_chunk_crossing_documents() -> None:
+    packet = _packet(
+        list(range(12)),
+        [(4, 8)],
+        document_ids=[1] * 6 + [2] * 6,
+    )
+
+    with pytest.raises(ValueError, match="crosses a document_ids boundary"):
+        apply_ast_fim(packet, seed=0, ast_fim_rate=1.0)
+
+
 def test_ast_fim_requires_chunk_boundaries() -> None:
     packet = CodePacket(token_ids=_arr(list(range(6))))
     with pytest.raises(ValueError, match="chunk_starts and"):
         apply_ast_fim(packet, seed=0, ast_fim_rate=1.0)
 
 
-def test_ast_ifim_uses_leading_comment_as_instruction() -> None:
-    src = "// Compute the running total of values\nint sum(int *v, int n);\n"
-    packet = _packet(list(range(10)), [(3, 6)], source_text=src)
-
-    def encoder(text: str) -> list[int]:
-        # Deterministic toy encoder: byte values, kept short.
-        return [ord(c) % 50 + 100 for c in text[:8]]
-
-    result = apply_ast_ifim(
-        packet, instruction_encoder=encoder, seed=1, spm_rate=0.0, ast_fim_rate=1.0
-    )
-    assert result.token_ids[0] == FIM_INSTRUCTION_ID
-    # FIM markers still present after the instruction block.
-    assert FIM_PREFIX_ID in result.token_ids
-    assert FIM_SUFFIX_ID in result.token_ids
-    assert result.token_ids[-1] == EOT_ID
-    assert result.kind == "ast_ifim"
-
-
-def test_ast_ifim_char_fallback_remains_instruction_aware() -> None:
-    packet = _packet(
-        list(range(10)),
-        [(0, 10)],
-        source_text="// Fill the function body\nint f() {\n",
-    )
+def test_ast_ifim_uses_typed_instruction_tokens_and_exact_ast_layout() -> None:
+    tokens = [100 + index for index in range(10)]
+    packet = _packet(tokens, [(0, 3), (3, 6), (6, 10)])
 
     result = apply_ast_ifim(
         packet,
-        instruction_encoder=lambda _text: [101, 102],
+        instruction_token_ids=[901, 902],
+        seed=1,
+        spm_rate=0.0,
+        ast_fim_rate=1.0,
+    )
+
+    assert result.kind == "ast_ifim"
+    assert result.span == (3, 6)
+    assert result.token_ids == [
+        FIM_INSTRUCTION_ID,
+        901,
+        902,
+        FIM_PREFIX_ID,
+        *tokens[:3],
+        FIM_SUFFIX_ID,
+        *tokens[6:],
+        FIM_MIDDLE_ID,
+        *tokens[3:6],
+        EOT_ID,
+    ]
+
+
+def test_ast_ifim_character_fallback_keeps_instruction_layout() -> None:
+    packet = _packet(list(range(10)), [(0, 10)])
+
+    result = apply_ast_ifim(
+        packet,
+        instruction_token_ids=[901, 902],
         seed=1,
         spm_rate=0.0,
         ast_fim_rate=1.0,
     )
 
     assert result.kind == "char_ifim"
-    assert result.token_ids[0] == FIM_INSTRUCTION_ID
+    assert result.chunk_index is None
+    assert result.token_ids[:3] == [FIM_INSTRUCTION_ID, 901, 902]
+    assert result.token_ids[-1] == EOT_ID
 
 
-def test_ast_ifim_missing_source_text_raises() -> None:
-    packet = _packet(list(range(10)), [(3, 6)])  # no source_text
+@pytest.mark.parametrize("instruction_token_ids", [None, []])
+def test_ast_ifim_rejects_missing_or_empty_typed_instruction_tokens(
+    instruction_token_ids: list[int] | None,
+) -> None:
+    packet = _packet(list(range(10)), [(3, 6)])
 
-    with pytest.raises(ValueError, match="source_text"):
-        apply_ast_ifim(packet, instruction_encoder=lambda t: [1, 2], seed=0)
-
-
-def test_ast_ifim_no_instruction_found_raises() -> None:
-    packet = _packet(list(range(10)), [(3, 6)], source_text="x")
-    with pytest.raises(ValueError, match="no leading comment"):
-        apply_ast_ifim(packet, instruction_encoder=lambda t: [1, 2], seed=0)
+    with pytest.raises(ValueError, match="instruction_token_ids"):
+        apply_ast_ifim(
+            packet,
+            instruction_token_ids=instruction_token_ids,
+            seed=0,
+        )

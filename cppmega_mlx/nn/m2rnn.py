@@ -255,6 +255,7 @@ def m2rnn_scan(
     xf: mx.array,
     *,
     h0: mx.array | None = None,
+    reset_mask: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Sequential MLX reference scan matching the Megatron PyTorch M2RNN seam.
 
@@ -267,6 +268,10 @@ def m2rnn_scan(
     q, k, v, W, xf = broadcast_m2rnn_heads(q, k, v, W, xf)
     batch, seq, heads, k_dim = q.shape
     v_dim = v.shape[-1]
+    if reset_mask is not None and tuple(reset_mask.shape) != (batch, seq):
+        raise ValueError(
+            f"reset_mask must have shape {(batch, seq)}, got {reset_mask.shape}"
+        )
 
     h = _initial_m2rnn_state(
         h0,
@@ -284,6 +289,12 @@ def m2rnn_scan(
     W_expanded = mx.expand_dims(W, 0)
     outputs: list[mx.array] = []
     for s in range(seq):
+        if reset_mask is not None:
+            h = mx.where(
+                reset_mask[:, s, None, None, None],
+                mx.zeros_like(h),
+                h,
+            )
         f = xf_5d[:, s]
         h_new = mx.tanh(mx.matmul(h, W_expanded) + x_all[:, s])
         h = f * h + (1.0 - f) * h_new
@@ -305,6 +316,7 @@ def _dispatch_m2rnn_scan(
     *,
     h0: mx.array | None,
     chunk_size: int,
+    reset_mask: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Route the M2RNN scan according to :class:`KernelPath`.
 
@@ -326,6 +338,24 @@ def _dispatch_m2rnn_scan(
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
     path = selected_path("m2rnn")
+
+    if reset_mask is not None:
+        if path in (KernelPath.PATH_B, KernelPath.PATH_C):
+            raise RuntimeError(
+                "m2rnn: packed document resets are unsupported by the explicit "
+                f"{path.value} backend; use reference or auto"
+            )
+        record_dispatch("m2rnn", path, "reference_packed_document_resets")
+        return chunked_m2rnn_scan(
+            q,
+            k,
+            v,
+            W,
+            xf,
+            h0=h0,
+            chunk_size=chunk_size,
+            reset_mask=reset_mask,
+        )
 
     if path is KernelPath.PATH_C:
         from cppmega_mlx.nn._tilelang.m2rnn_path_c import (
@@ -408,6 +438,7 @@ def chunked_m2rnn_scan(
     *,
     h0: mx.array | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    reset_mask: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Chunk wrapper for API parity with the CUDA/Triton design.
 
@@ -421,6 +452,10 @@ def chunked_m2rnn_scan(
     q, k, v, W, xf = broadcast_m2rnn_heads(q, k, v, W, xf)
     batch, seq, heads, k_dim = q.shape
     v_dim = v.shape[-1]
+    if reset_mask is not None and tuple(reset_mask.shape) != (batch, seq):
+        raise ValueError(
+            f"reset_mask must have shape {(batch, seq)}, got {reset_mask.shape}"
+        )
 
     h = _initial_m2rnn_state(
         h0,
@@ -445,6 +480,13 @@ def chunked_m2rnn_scan(
         f_chunk = xf_5d[:, start:end]
         q_chunk = q[:, start:end]
         for t in range(end - start):
+            absolute_step = start + t
+            if reset_mask is not None:
+                h = mx.where(
+                    reset_mask[:, absolute_step, None, None, None],
+                    mx.zeros_like(h),
+                    h,
+                )
             f = f_chunk[:, t]
             h_new = mx.tanh(mx.matmul(h, W_expanded) + x_chunk[:, t])
             h = f * h + (1.0 - f) * h_new
@@ -563,6 +605,7 @@ class M2RNNMixer(nn.Module):
         *,
         h0: mx.array | None = None,
         mixer_state: M2RNNMixerState | None = None,
+        document_ids: mx.array | None = None,
         chunk_size: int | None = None,
         return_state: Literal[False] = False,
     ) -> tuple[mx.array, mx.array]: ...
@@ -574,6 +617,7 @@ class M2RNNMixer(nn.Module):
         *,
         h0: mx.array | None = None,
         mixer_state: M2RNNMixerState | None = None,
+        document_ids: mx.array | None = None,
         chunk_size: int | None = None,
         return_state: Literal[True],
     ) -> tuple[mx.array, M2RNNMixerState]: ...
@@ -584,6 +628,7 @@ class M2RNNMixer(nn.Module):
         *,
         h0: mx.array | None = None,
         mixer_state: M2RNNMixerState | None = None,
+        document_ids: mx.array | None = None,
         chunk_size: int | None = None,
         return_state: bool = False,
     ) -> tuple[mx.array, mx.array] | tuple[mx.array, M2RNNMixerState]:
@@ -596,6 +641,31 @@ class M2RNNMixer(nn.Module):
         from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 
         path = selected_path("m2rnn")
+        batch, seq, _ = hidden_states.shape
+        reset_mask: mx.array | None = None
+        if document_ids is not None:
+            if document_ids.ndim != 2 or tuple(document_ids.shape) != (batch, seq):
+                raise ValueError(
+                    f"document_ids must have shape {(batch, seq)}, got "
+                    f"{document_ids.shape}"
+                )
+            if h0 is not None or mixer_state is not None or return_state:
+                raise ValueError(
+                    "packed document_ids cannot be combined with M2RNN "
+                    "continuation state"
+                )
+            if path in (KernelPath.PATH_B, KernelPath.PATH_C):
+                raise RuntimeError(
+                    "m2rnn: packed document resets are unsupported by the "
+                    f"explicit {path.value} backend; use reference or auto"
+                )
+            reset_mask = mx.concatenate(
+                [
+                    mx.ones((batch, 1), dtype=mx.bool_),
+                    document_ids[:, 1:] != document_ids[:, :-1],
+                ],
+                axis=1,
+            )
         if path is KernelPath.PATH_C:
             if h0 is None and mixer_state is None:
                 raise RuntimeError(
@@ -607,7 +677,6 @@ class M2RNNMixer(nn.Module):
         conv_end = self.conv_dim
         f_end = conv_end + self.f_dim
 
-        batch, seq, _ = hidden_states.shape
         projected_conv = projected[:, :, :conv_end]
         conv_prefix: mx.array | None = None
         scan_h0 = h0
@@ -640,6 +709,7 @@ class M2RNNMixer(nn.Module):
                 conv_source,
                 self.conv_weight.astype(projected.dtype),
                 self.conv_bias.astype(projected.dtype),
+                document_ids=document_ids,
             )
         if conv_prefix is not None and conv_prefix.shape[1] > 0:
             conv_input = conv_input[:, conv_prefix.shape[1] :, :]
@@ -800,6 +870,7 @@ class M2RNNMixer(nn.Module):
                 xf,
                 h0=scan_h0,
                 chunk_size=cfg.chunk_size if chunk_size is None else chunk_size,
+                reset_mask=reset_mask,
             )
             g = projected[:, :, f_end:].reshape(batch, seq, cfg.num_g_heads, cfg.v_head_dim)
             if self.D is not None:

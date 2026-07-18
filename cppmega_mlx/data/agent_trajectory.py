@@ -32,18 +32,29 @@ import json
 import re
 import shlex
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+import mlx.core as mx
 
 from cppmega_mlx.data.build_parsers.base import ParsedDomainDocument
 from cppmega_mlx.data.diagnostic_parsers import (
     parse_build_error,
     parse_clang_diagnostic,
     parse_linker_error,
+    parse_sanitizer_output,
+    parse_test_output,
 )
-from cppmega_mlx.data.shell_parsers import parse_bash, parse_sh, parse_tcsh, parse_zsh
+from cppmega_mlx.data.shell_parsers import (
+    parse_bash,
+    parse_ksh,
+    parse_sh,
+    parse_tcsh,
+    parse_zsh,
+)
+from cppmega_mlx.data.trajectory_packet import TrajectoryPacket, Transition
 
 # --------------------------------------------------------------------------- #
 # Action-kind classification
@@ -147,11 +158,13 @@ def parse_shell_action_domain(
                 kind = "tcsh"
             elif "bash" in first:
                 kind = "bash"
+            elif "ksh" in first:
+                kind = "ksh"
             else:
                 kind = "sh"
         else:
             head = stripped.split(maxsplit=1)[0] if stripped else ""
-            kind = head if head in {"bash", "zsh", "tcsh", "sh"} else "sh"
+            kind = head if head in {"bash", "ksh", "zsh", "tcsh", "sh"} else "sh"
 
     if kind == "bash":
         return parse_bash(command)
@@ -159,6 +172,8 @@ def parse_shell_action_domain(
         return parse_zsh(command)
     if kind == "tcsh":
         return parse_tcsh(command)
+    if kind == "ksh":
+        return parse_ksh(command)
     return parse_sh(command)
 
 
@@ -168,9 +183,28 @@ def parse_result_diagnostic_domain(result_text: str) -> ParsedDomainDocument | N
     if not result_text.strip():
         return None
     lower = result_text.lower()
+    if any(
+        marker.lower() in lower
+        for marker in (
+            "AddressSanitizer",
+            "LeakSanitizer",
+            "MemorySanitizer",
+            "ThreadSanitizer",
+            "UndefinedBehaviorSanitizer",
+        )
+    ):
+        return parse_sanitizer_output(result_text)
+    if re.search(r"(?m)^(FAILED|PASSED)\s+\S+::", result_text) or (
+        "assertionerror" in lower and "test" in lower
+    ):
+        return parse_test_output(result_text)
     if "undefined reference" in lower or "unresolved external symbol" in lower:
         return parse_linker_error(result_text)
-    if re.search(r"^[^\n:]+:\d+:\d+:\s+(fatal error|error|warning|note):", result_text, re.MULTILINE):
+    if re.search(
+        r"^[^\n:]+:\d+:(?:\d+:)?\s*(fatal error|error|warning|note):",
+        result_text,
+        re.MULTILINE,
+    ):
         return parse_clang_diagnostic(result_text)
     if "cmake error" in lower or "ninja:" in lower or "build stopped" in lower:
         return parse_build_error(result_text)
@@ -206,6 +240,33 @@ class AgentTransition:
             raise ValueError(
                 f"AgentTransition.source must be 'claude' or 'codex', got {self.source!r}"
             )
+        if not isinstance(self.action_kind, str) or not self.action_kind.strip():
+            raise ValueError("AgentTransition.action_kind must be a non-empty string")
+        if not isinstance(self.action_payload, str) or not self.action_payload.strip():
+            raise ValueError("AgentTransition.action_payload must be non-empty JSON")
+        try:
+            payload = json.loads(self.action_payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"AgentTransition.action_payload is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "AgentTransition.action_payload must encode a JSON object, got "
+                f"{type(payload).__name__}"
+            )
+        tool = payload.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise ValueError(
+                "AgentTransition.action_payload must contain a non-empty 'tool' field"
+            )
+        if tool in {"Bash", "exec_command"}:
+            command = payload.get("command" if tool == "Bash" else "cmd")
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError(
+                    f"AgentTransition.action_payload for {tool} must contain a "
+                    "non-empty command"
+                )
         if self.reward is not None and not isinstance(self.reward, (int, float)):
             raise TypeError(
                 f"AgentTransition.reward must be a number or None, got "
@@ -219,6 +280,16 @@ class AgentTransition:
                 f"reward={self.reward} but is neither build nor test -- non-build/"
                 f"non-test steps must have reward=None (no fabricated reward)."
             )
+
+    def action_document(self) -> str:
+        """Return a canonical typed action document for tokenization."""
+
+        payload = json.loads(self.action_payload)
+        return json.dumps(
+            {"kind": self.action_kind, "payload": payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -236,6 +307,113 @@ class AgentTransition:
             "reward": self.reward,
             "edit_diff": self.edit_diff,
         }
+
+
+class TextTokenEncoder(Protocol):
+    """Tokenizer boundary required by the agent-to-world-model adapter."""
+
+    def encode(self, text: str) -> Sequence[int]: ...
+
+
+def _encode_required_text(
+    tokenizer: TextTokenEncoder,
+    text: str,
+    *,
+    where: str,
+) -> mx.array:
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"{where}: text must be non-empty")
+    token_ids = tokenizer.encode(text)
+    if isinstance(token_ids, mx.array):
+        encoded = token_ids
+    else:
+        encoded = mx.array(token_ids)
+    if encoded.ndim != 1:
+        raise ValueError(
+            f"{where}: tokenizer must return a 1-D token vector, got {tuple(encoded.shape)}"
+        )
+    if int(encoded.shape[0]) < 1:
+        raise ValueError(f"{where}: tokenizer returned no tokens")
+    if not mx.issubdtype(encoded.dtype, mx.integer):
+        raise TypeError(
+            f"{where}: tokenizer must return integer token ids, got {encoded.dtype}"
+        )
+    return encoded
+
+
+def agent_transitions_to_trajectory_packet(
+    transitions: Sequence[AgentTransition],
+    tokenizer: TextTokenEncoder,
+) -> TrajectoryPacket:
+    """Convert one ordered agent session to the world-model packet contract.
+
+    Tokenization is an explicit caller-owned boundary. Missing observations,
+    actions, results, non-contiguous steps, and mixed sessions all raise instead
+    of producing a partially conditioned training packet.
+    """
+
+    records = list(transitions)
+    if not records:
+        raise ValueError("agent trajectory must contain at least one transition")
+    first = records[0]
+    expected_step = first.step_idx
+    packet_steps: list[Transition] = []
+    repos: set[str] = set()
+
+    for index, record in enumerate(records):
+        if not isinstance(record, AgentTransition):
+            raise TypeError(
+                f"agent trajectory transition {index} must be AgentTransition, got "
+                f"{type(record).__name__}"
+            )
+        if record.session_id != first.session_id or record.source != first.source:
+            raise ValueError(
+                f"agent trajectory transition {index} belongs to "
+                f"{record.source}/{record.session_id}, expected "
+                f"{first.source}/{first.session_id}"
+            )
+        if record.step_idx != expected_step:
+            raise ValueError(
+                f"agent trajectory transition {index} has step_idx={record.step_idx}, "
+                f"expected contiguous step_idx={expected_step}"
+            )
+        expected_step += 1
+        if record.repo is not None:
+            repos.add(record.repo)
+
+        where = f"agent session {record.session_id} step {record.step_idx}"
+        packet_steps.append(
+            Transition(
+                obs=_encode_required_text(
+                    tokenizer, record.obs_text, where=f"{where} observation"
+                ),
+                action=_encode_required_text(
+                    tokenizer, record.action_document(), where=f"{where} action"
+                ),
+                next_obs=_encode_required_text(
+                    tokenizer, record.result_text, where=f"{where} result"
+                ),
+                metadata={
+                    "source": record.source,
+                    "session_id": record.session_id,
+                    "step_idx": record.step_idx,
+                    "action_kind": record.action_kind,
+                    "exit_code": record.exit_code,
+                    "verified_reward": record.reward,
+                },
+            )
+        )
+
+    return TrajectoryPacket(
+        transitions=tuple(packet_steps),
+        repo=next(iter(repos)) if len(repos) == 1 else None,
+        metadata={
+            "source": f"agent/{first.source}",
+            "session_id": first.session_id,
+            "step_start": first.step_idx,
+            "step_end": records[-1].step_idx,
+        },
+    )
 
 
 PARQUET_COLUMNS = (
@@ -263,6 +441,16 @@ def _truncate(text: str, limit: int = _MAX_TEXT) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def _serialize_action_payload(payload: dict[str, Any], *, where: str) -> str:
+    encoded = json.dumps(payload, default=str)
+    if len(encoded) > _MAX_TEXT:
+        raise ValueError(
+            f"{where}: action payload length {len(encoded)} exceeds {_MAX_TEXT}; "
+            "refusing to truncate a training action"
+        )
+    return encoded
 
 
 def _reward_from_exit(exit_code: int | None) -> float | None:
@@ -439,7 +627,20 @@ def walk_claude(
             if bt != "tool_use":
                 continue
             tool_name = block.get("name", "")
-            tinput = block.get("input", {}) or {}
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError(
+                    f"Claude session {session_id} step {step}: tool_use is missing a name"
+                )
+            raw_input = block.get("input", {})
+            if raw_input is None:
+                tinput: dict[str, Any] = {}
+            elif isinstance(raw_input, dict):
+                tinput = raw_input
+            else:
+                raise TypeError(
+                    f"Claude session {session_id} step {step} ({tool_name}): "
+                    f"input must be an object, got {type(raw_input).__name__}"
+                )
             tid = block.get("id")
             command = tinput.get("command") if tool_name == "Bash" else None
             action_kind = classify_action(tool_name, command)
@@ -471,7 +672,7 @@ def walk_claude(
             if pending_reasoning.strip():
                 obs += f"\n[reasoning] {pending_reasoning.strip()}"
 
-            payload = {"tool": tool_name, **{k: tinput[k] for k in tinput}}
+            payload = {**tinput, "tool": tool_name}
             yield AgentTransition(
                 session_id=session_id,
                 source="claude",
@@ -479,7 +680,10 @@ def walk_claude(
                 step_idx=step,
                 obs_text=_truncate(obs),
                 action_kind=action_kind,
-                action_payload=json.dumps(payload, default=str)[:_MAX_TEXT],
+                action_payload=_serialize_action_payload(
+                    payload,
+                    where=f"Claude session {session_id} step {step} ({tool_name})",
+                ),
                 result_text=_truncate(result_text),
                 exit_code=exit_code,
                 is_build=is_build,
@@ -569,9 +773,22 @@ def walk_codex(
         raw_args = p.get("arguments", "{}")
         try:
             args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-        except json.JSONDecodeError:
-            args = {}
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Codex session {session_id} call {p.get('call_id')}: "
+                f"invalid exec_command arguments: {exc}"
+            ) from exc
+        if not isinstance(args, dict):
+            raise TypeError(
+                f"Codex session {session_id} call {p.get('call_id')}: "
+                f"exec_command arguments must be an object, got {type(args).__name__}"
+            )
         cmd = args.get("cmd", "")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise ValueError(
+                f"Codex session {session_id} call {p.get('call_id')}: "
+                "exec_command action is missing a non-empty cmd"
+            )
         workdir = args.get("workdir", repo)
         cid = p.get("call_id")
         output_text = output_by_call.get(cid, "")
@@ -594,7 +811,10 @@ def walk_codex(
             step_idx=step,
             obs_text=_truncate(obs),
             action_kind=action_kind,
-            action_payload=json.dumps(payload, default=str)[:_MAX_TEXT],
+            action_payload=_serialize_action_payload(
+                payload,
+                where=f"Codex session {session_id} step {step} (exec_command)",
+            ),
             result_text=_truncate(output_text),
             exit_code=exit_code,
             is_build=is_build,
@@ -854,6 +1074,8 @@ __all__ = [
     "ExtractionStats",
     "PARQUET_COLUMNS",
     "SessionRef",
+    "TextTokenEncoder",
+    "agent_transitions_to_trajectory_packet",
     "classify_action",
     "classify_cpp",
     "enumerate_local_sessions",

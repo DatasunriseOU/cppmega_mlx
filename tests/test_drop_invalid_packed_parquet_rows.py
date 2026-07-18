@@ -8,6 +8,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from cppmega_mlx.data.source_identity import source_identity
+from scripts.nanochat_data.pack_enriched_rows import PACKED_ROW_OUTPUT_SCHEMA
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = "scripts/drop_invalid_packed_parquet_rows.py"
 
@@ -24,35 +27,47 @@ def _loss_mask_for_doc_ids(doc_ids: list[int], *, valid: int, length: int) -> li
 
 def _row(length: int, *, valid: int | None = None) -> dict:
     valid = length if valid is None else valid
-    doc_ids = [7] * valid + [0] * (length - valid)
+    identity = source_identity({"source_path": "fixture.cpp"})
+    doc_ids = [1] * length
     loss_mask = _loss_mask_for_doc_ids(doc_ids, valid=valid, length=length)
     return {
+        "pack_id": 1,
         "input_ids": [1] * valid + [0] * (length - valid),
         "target_ids": [1] * max(valid - 1, 0) + [0] * (length - max(valid - 1, 0)),
         "loss_mask": loss_mask,
         "doc_ids": doc_ids,
         "valid_token_count": valid,
         "trained_token_count": sum(loss_mask),
+        "num_docs": 1,
         "slack_tokens": length - valid,
         "source_doc_ids": [1],
         "source_doc_token_lengths": [valid],
-        "source_platform_ids": [7],
-        "source_repo_stable_ids": [9],
-        "source_filepath_stable_ids": [11],
+        "source_platform_ids": [[7]],
+        "source_repo_stable_ids": ["9"],
+        "source_filepath_stable_ids": ["11"],
         "source_file_local_commit_indices": [0],
         "platform_ids": [7],
+        "token_platform_ids": [0] * length,
         "token_structure_ids": [1] * valid + [0] * (length - valid),
         "token_dep_levels": [0] * length,
         "token_ast_depth": [0] * length,
         "token_sibling_index": [0] * length,
         "token_ast_node_type": [0] * length,
+        "token_domain_ids": [0] * length,
+        "token_role_ids": [0] * length,
+        "token_entity_ids": [0] * length,
+        "token_scope_ids": [0] * length,
+        "token_source_doc_ids": [1] * valid + [0] * (length - valid),
+        "token_source_identity_ids": [identity.source_identity_id] * valid
+        + [0] * (length - valid),
+        "token_confidence_ids": [0] * length,
         "token_symbol_ids": [0] * length,
         "token_call_targets": [0] * length,
         "token_type_refs": [0] * length,
         "token_def_use": [0] * length,
         "token_change_mask_pre": [0] * length,
         "token_change_mask_post": [0] * length,
-        "hunk_id_per_token": [-1] * valid + [0] * (length - valid),
+        "hunk_id_per_token": [-1] * length,
         "edit_op_per_token": [0] * length,
         "token_chunk_starts": [0],
         "token_chunk_ends": [valid],
@@ -60,8 +75,14 @@ def _row(length: int, *, valid: int | None = None) -> dict:
         "token_chunk_dep_levels": [0],
         "token_call_edges": [],
         "token_type_edges": [],
+        "token_domain_edges": [],
+        "token_build_edges": [],
+        "token_shell_edges": [],
+        "token_diagnostic_edges": [],
+        "token_cross_domain_edges": [],
         "changed_chunk_ids": [],
         "changed_chunk_spans": [],
+        "source_identity_registry": [identity.as_dict()],
     }
 
 
@@ -93,7 +114,8 @@ def test_broken_input_file_fails_loud_by_default(tmp_path):
             [
                 _multidoc_row(8, doc_lengths=(3, 5)),    # valid (kept)
                 _multidoc_row(11, doc_lengths=(4, 7)),   # over-bucket (would drop)
-            ]
+            ],
+            schema=PACKED_ROW_OUTPUT_SCHEMA,
         ),
         bucket_dir / "good.parquet",
     )
@@ -141,7 +163,8 @@ def test_continue_on_error_records_failure_but_still_exits_nonzero(tmp_path):
             [
                 _multidoc_row(8, doc_lengths=(3, 5)),    # valid (kept)
                 _multidoc_row(11, doc_lengths=(4, 7)),   # over-bucket (dropped)
-            ]
+            ],
+            schema=PACKED_ROW_OUTPUT_SCHEMA,
         ),
         good,
     )
@@ -182,7 +205,13 @@ def test_drop_invalid_rows_removes_over_bucket_rows_and_audit_passes(tmp_path):
     root = tmp_path / "commits"
     path = root / "8" / "sample.parquet"
     path.parent.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pylist([_row(8, valid=5), _row(11, valid=11)]), path)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [_row(8, valid=5), _row(11, valid=11)],
+            schema=PACKED_ROW_OUTPUT_SCHEMA,
+        ),
+        path,
+    )
 
     report = tmp_path / "drop_report.json"
     subprocess.run(
@@ -232,7 +261,10 @@ def test_drop_invalid_rows_dry_run_fails_when_rows_would_be_dropped(tmp_path):
     root = tmp_path / "code"
     path = root / "8" / "sample.parquet"
     path.parent.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pylist([_row(9, valid=9)]), path)
+    pq.write_table(
+        pa.Table.from_pylist([_row(9, valid=9)], schema=PACKED_ROW_OUTPUT_SCHEMA),
+        path,
+    )
 
     result = subprocess.run(
         [

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, SupportsInt
@@ -23,6 +24,15 @@ import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_v4.data.doc_id_assignment import stable_doc_signature
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    DomainKind,
+    ParseConfidence,
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    normalize_domain_edge_record,
+    validate_case5_contract_metadata,
+)
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
@@ -32,6 +42,7 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     NUM_DOCS_COLUMN,
     PACKED_ROWS_CHUNK_METADATA_COLUMNS,
     PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES,
+    PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN,
     PACKED_ROWS_TOKEN_METADATA_COLUMNS,
     PACK_ID_COLUMN,
     ROW_PLATFORM_IDS_COLUMN,
@@ -40,6 +51,11 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_FILE_LOCAL_COMMIT_INDICES_COLUMN,
     SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
     SOURCE_HEADER_FRAGMENT_KINDS_COLUMN,
+    SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+    SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN,
+    SOURCE_PRE_TOKEN_IDS_COLUMN,
+    SOURCE_POST_TOKEN_IDS_COLUMN,
+    SOURCE_DIFF_TOKEN_IDS_COLUMN,
     SOURCE_PR_DISCUSSION_CHARS_COLUMN,
     SOURCE_PR_DISCUSSION_LINES_COLUMN,
     SOURCE_PR_NUMBERS_COLUMN,
@@ -99,12 +115,32 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_SIBLING_INDEX_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKEN_TYPE_REFS_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
 from cppmega_mlx.data.packing import PackingStrategy
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityError,
+    SymbolIdentityRegistry,
+)
+from cppmega_mlx.data.source_identity import (
+    source_identity,
+    validate_source_identity_registry,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 TRAINED_TOKEN_COUNT_COLUMN = "trained_token_count"
 SLACK_TOKENS_COLUMN = "slack_tokens"
@@ -118,9 +154,13 @@ SOURCE_DOC_ID_COLUMN = "source_doc_id"
 DOC_DEP_EDGES_COLUMN = "doc_dep_edges"
 PACKED_ROW_MACRO_ROUTES_METADATA_KEY = "cppmega.macro_routes_version"
 PACKED_ROW_MACRO_ROUTES_VERSION = "full_macro_concept_routes_v1"
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 
 PACKED_TOKEN_METADATA_COLUMNS = PACKED_ROWS_TOKEN_METADATA_COLUMNS
-_STATIC_DOC_TYPES = {"code", "code_header", "build"}
+_STATIC_DOC_TYPES = {"code", "code_header", "build", "shell"}
+_DIAGNOSTIC_DOMAIN_IDS = frozenset(
+    int(domain) for domain in DomainKind if int(domain) >= 40
+)
 DEFAULT_PACK_TOKEN_WINDOW = 1024 * 1024
 
 
@@ -203,6 +243,14 @@ EDGE_TRIPLE_STRUCT = pa.struct(
     ]
 )
 
+SOURCE_IDENTITY_STRUCT = pa.struct(
+    [
+        pa.field("source_identity_id", pa.uint64(), nullable=False),
+        pa.field("canonical_sha256", pa.string(), nullable=False),
+        pa.field("source", pa.string(), nullable=False),
+    ]
+)
+
 PACKED_ROW_SCHEMA = pa.schema(
     [
         pa.field(PACK_ID_COLUMN, pa.int64()),
@@ -226,7 +274,19 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_PR_DISCUSSION_LINES_COLUMN, pa.list_(pa.int32())),
         pa.field(SOURCE_DOC_TYPES_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, pa.list_(pa.string())),
+        pa.field(
+            SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
+            pa.list_(pa.list_(pa.uint32())),
+        ),
+        pa.field(SOURCE_COMMIT_MSG_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
+        pa.field(SOURCE_PRE_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
+        pa.field(SOURCE_POST_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
+        pa.field(SOURCE_DIFF_TOKEN_IDS_COLUMN, pa.list_(pa.list_(pa.uint32()))),
         pa.field(ROW_PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
+        pa.field(SYMBOL_IDENTITIES_COLUMN, pa.list_(pa.struct([
+            pa.field("symbol_id", pa.uint64()),
+            pa.field("symbol_key", pa.string()),
+        ]))),
         pa.field(REPO_COLUMN, pa.string()),
         pa.field(FILEPATH_COLUMN, pa.string()),
         pa.field(COMMIT_HASH_COLUMN, pa.string()),
@@ -256,10 +316,11 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_ENTITY_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SOURCE_IDENTITY_IDS_COLUMN, pa.list_(pa.uint64())),
         pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
-        pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-        pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-        pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+        pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+        pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+        pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
         pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
         pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
@@ -278,6 +339,7 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, pa.list_(EDGE_TRIPLE_STRUCT)),
         pa.field(CHANGED_CHUNK_IDS_COLUMN, pa.list_(pa.uint32())),
         pa.field(CHANGED_CHUNK_SPANS_COLUMN, pa.list_(CHANGED_CHUNK_SPAN_STRUCT)),
+        pa.field(SOURCE_IDENTITY_REGISTRY_COLUMN, pa.list_(SOURCE_IDENTITY_STRUCT)),
     ]
 )
 
@@ -287,6 +349,19 @@ def _packed_row_schema_with_metadata() -> pa.Schema:
     metadata[PACKED_ROW_MACRO_ROUTES_METADATA_KEY.encode("utf-8")] = (
         PACKED_ROW_MACRO_ROUTES_VERSION.encode("utf-8")
     )
+    metadata[SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")] = str(
+        REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+    ).encode("ascii")
+    metadata[DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")] = (
+        DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+    )
+    metadata[DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")] = (
+        DOMAIN_SCHEMA_SHA256.encode("ascii")
+    )
+    metadata[TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")] = (
+        TOKENIZER_CONTRACT_SHA256.encode("ascii")
+    )
+    metadata[b"cppmega.case5_schema"] = b"case5_domain_routes_v1"
     return PACKED_ROW_SCHEMA.with_metadata(metadata)
 
 
@@ -299,6 +374,8 @@ class NormalizedDoc:
 
     source_doc_index: int
     stable_doc_id: int
+    stable_source_id: int
+    source_identity_registry: tuple[dict[str, int | str], ...]
     token_ids: list[int]
     token_meta: dict[str, list[int]]
     chunk_starts: list[int]
@@ -311,6 +388,8 @@ class NormalizedDoc:
     changed_chunk_ids: list[int]
     changed_chunk_spans: list[tuple[int, int]]
     chronology: dict[str, Any]
+    symbol_identities: list[dict[str, object]] = field(default_factory=list)
+    objective_token_ids: dict[str, list[int]] = field(default_factory=dict)
     # Explicit doc-level dependency edges: source_doc_index values this document
     # depends on (a dependency must be packed BEFORE this document in the row).
     # Empty when only dep_level ordering applies.
@@ -372,8 +451,18 @@ class NormalizedDoc:
                 {"start": int(start), "end": int(end)}
                 for start, end in self.changed_chunk_spans
             ],
+            SYMBOL_IDENTITIES_COLUMN: [dict(item) for item in self.symbol_identities],
+            SOURCE_IDENTITY_REGISTRY_COLUMN: [
+                dict(entry) for entry in self.source_identity_registry
+            ],
         }
         record.update(self.chronology)
+        record.update(
+            {
+                token_column: list(values)
+                for token_column, values in self.objective_token_ids.items()
+            }
+        )
         for column, values in self.token_meta.items():
             record[column] = list(values)
         return record
@@ -591,17 +680,14 @@ def _normalize_edge_list(value: Any) -> list[dict[str, int]]:
     return edges
 
 
-def _normalize_edge_triples(value: Any) -> list[dict[str, int]]:
+def _normalize_edge_triples(
+    value: Any,
+    *,
+    family: str,
+) -> list[dict[str, int]]:
     edges: list[dict[str, int]] = []
     for item in value or []:
-        if isinstance(item, dict):
-            src = int(item.get("from", item.get("src", 0)))
-            dst = int(item.get("to", item.get("dst", 0)))
-            kind = int(item.get("kind", 0))
-        else:
-            src = int(item[0])
-            dst = int(item[1])
-            kind = int(item[2])
+        src, dst, kind = normalize_domain_edge_record(item, family=family)
         edges.append({"from": src, "to": dst, "kind": kind})
     return edges
 
@@ -847,7 +933,13 @@ def _normalize_domain_graph_meta(
         TOKEN_DIAGNOSTIC_EDGES_COLUMN,
         TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
     )
-    normalized = tuple(_normalize_edge_triples(record.get(column)) for column in columns)
+    normalized = tuple(
+        _normalize_edge_triples(
+            record.get(column),
+            family=TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES[column],
+        )
+        for column in columns
+    )
     for column, edges in zip(columns, normalized):
         _validate_token_edge_triples(
             source_doc_index=source_doc_index,
@@ -855,7 +947,67 @@ def _normalize_domain_graph_meta(
             column=column,
             edges=edges,
         )
-    return normalized
+    return (
+        normalized[0],
+        normalized[1],
+        normalized[2],
+        normalized[3],
+        normalized[4],
+    )
+
+
+def _normalize_diagnostic_confidence(
+    *,
+    source_doc_index: int,
+    token_meta: dict[str, list[int]],
+    diagnostic_edges: list[dict[str, int]],
+) -> None:
+    """Make edge-free diagnostic documents explicitly uncertified.
+
+    HEURISTIC/PARTIAL confidence is only meaningful when the parser emitted a
+    structural diagnostic edge. At the packed-row publication boundary, an
+    edge-free diagnostic must therefore carry RAW confidence on its diagnostic
+    payload instead of looking structurally certified.
+    """
+
+    if diagnostic_edges:
+        return
+    domain_ids = token_meta[TOKEN_DOMAIN_IDS_COLUMN]
+    diagnostic_positions = [
+        index
+        for index, domain_id in enumerate(domain_ids)
+        if int(domain_id) in _DIAGNOSTIC_DOMAIN_IDS
+    ]
+    if not diagnostic_positions:
+        return
+
+    confidence_ids = token_meta[TOKEN_CONFIDENCE_IDS_COLUMN]
+    if not confidence_ids:
+        raise ValueError(
+            "edge-free diagnostic document is missing token_confidence_ids for "
+            f"source_doc_index={source_doc_index}"
+        )
+    if any(
+        int(confidence_ids[index]) == int(ParseConfidence.RAW)
+        for index in diagnostic_positions
+    ):
+        return
+
+    uncertified = {
+        int(ParseConfidence.HEURISTIC),
+        int(ParseConfidence.PARTIAL),
+    }
+    changed = False
+    for index in diagnostic_positions:
+        if int(confidence_ids[index]) in uncertified:
+            confidence_ids[index] = int(ParseConfidence.RAW)
+            changed = True
+    if not changed:
+        raise ValueError(
+            "edge-free diagnostic document must provide RAW or downgradeable "
+            "HEURISTIC/PARTIAL confidence for "
+            f"source_doc_index={source_doc_index}"
+        )
 
 
 def normalize_document_record(
@@ -863,6 +1015,7 @@ def normalize_document_record(
     *,
     source_doc_index: int,
     stable_doc_id: int | None = None,
+    identity_registry: SymbolIdentityRegistry | None = None,
 ) -> NormalizedDoc:
     """Validate and normalize one input parquet record."""
 
@@ -877,6 +1030,76 @@ def normalize_document_record(
         token_count=len(token_ids),
         source_doc_index=source_doc_index,
     )
+    row_registry = SymbolIdentityRegistry()
+    normalized_identities = row_registry.register_records(
+        record.get(SYMBOL_IDENTITIES_COLUMN, []),
+        source=f"source_doc_index={source_doc_index}",
+    )
+    used_symbol_ids = {
+        int(value)
+        for column in (
+            TOKEN_SYMBOL_IDS_COLUMN,
+            TOKEN_CALL_TARGETS_COLUMN,
+            TOKEN_TYPE_REFS_COLUMN,
+        )
+        for value in token_meta[column]
+        if int(value) != 0
+    }
+    row_registry.require_ids(
+        used_symbol_ids,
+        source=f"source_doc_index={source_doc_index}",
+    )
+    if identity_registry is not None:
+        identity_registry.register_records(
+            normalized_identities,
+            source=f"source_doc_index={source_doc_index}",
+        )
+
+    raw_registry = [
+        dict(entry) for entry in record.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
+    ]
+    if raw_registry:
+        registry = validate_source_identity_registry(raw_registry)
+        stable_source_id = next(iter(registry))
+    else:
+        identity = source_identity(record)
+        raw_registry = [identity.as_dict()]
+        stable_source_id = identity.source_identity_id
+
+    source_doc_values = token_meta[TOKEN_SOURCE_DOC_IDS_COLUMN]
+    token_meta[TOKEN_SOURCE_DOC_IDS_COLUMN] = [
+        int(value) if int(value) > 0 else 1
+        for value in (source_doc_values or [1] * len(token_ids))
+    ]
+    source_identity_values = token_meta[TOKEN_SOURCE_IDENTITY_IDS_COLUMN]
+    if len(raw_registry) > 1 and (
+        not source_identity_values
+        or any(int(value) == 0 for value in source_identity_values)
+    ):
+        raise ValueError(
+            "multi-source document is missing exact token source identities"
+        )
+    token_meta[TOKEN_SOURCE_IDENTITY_IDS_COLUMN] = [
+        int(value) if int(value) > 0 else stable_source_id
+        for value in (source_identity_values or [stable_source_id] * len(token_ids))
+    ]
+    validate_source_identity_registry(
+        raw_registry,
+        referenced_ids=token_meta[TOKEN_SOURCE_IDENTITY_IDS_COLUMN],
+    )
+    for column in (
+        TOKEN_SYMBOL_IDS_COLUMN,
+        TOKEN_CALL_TARGETS_COLUMN,
+        TOKEN_TYPE_REFS_COLUMN,
+        TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
+    ):
+        if any(not 0 <= int(value) < (1 << 64) for value in token_meta[column]):
+            raise ValueError(f"{column} must contain uint64 values")
+    if any(
+        not 0 <= int(value) < (1 << 32)
+        for value in token_meta[TOKEN_SOURCE_DOC_IDS_COLUMN]
+    ):
+        raise ValueError(f"{TOKEN_SOURCE_DOC_IDS_COLUMN} must contain uint32 values")
     (
         chunk_starts,
         chunk_ends,
@@ -902,10 +1125,17 @@ def normalize_document_record(
         source_doc_index=source_doc_index,
         token_count=len(token_ids),
     )
+    _normalize_diagnostic_confidence(
+        source_doc_index=source_doc_index,
+        token_meta=token_meta,
+        diagnostic_edges=diagnostic_edges,
+    )
 
     return NormalizedDoc(
         source_doc_index=int(source_doc_index),
         stable_doc_id=int(source_doc_index + 1 if stable_doc_id is None else stable_doc_id),
+        stable_source_id=stable_source_id,
+        source_identity_registry=tuple(raw_registry),
         token_ids=token_ids,
         token_meta=token_meta,
         chunk_starts=chunk_starts,
@@ -923,6 +1153,11 @@ def normalize_document_record(
         changed_chunk_ids=changed_chunk_ids,
         changed_chunk_spans=changed_chunk_spans,
         chronology=_normalize_chronology(record),
+        symbol_identities=row_registry.records(used_symbol_ids),
+        objective_token_ids={
+            token_column: _as_int_list(record.get(token_column))
+            for token_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.values()
+        },
         doc_dep_edges=tuple(
             int(dep) for dep in (record.get(DOC_DEP_EDGES_COLUMN) or [])
         ),
@@ -943,6 +1178,67 @@ def _list_input_files(input_path: str | os.PathLike[str]) -> list[Path]:
     raise FileNotFoundError(f"Input path does not exist: {path}")
 
 
+def _require_symbol_identity_schema(input_path: str | os.PathLike[str]) -> None:
+    key = SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    corpus_registry = SymbolIdentityRegistry()
+    identity_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("symbol_id", pa.uint64()),
+                pa.field("symbol_key", pa.string()),
+            ]
+        )
+    )
+    for path in _list_input_files(input_path):
+        parquet_file = pq.ParquetFile(path)
+        schema = parquet_file.schema_arrow
+        metadata = schema.metadata or {}
+        validate_case5_contract_metadata(metadata, where=path)
+        raw_version = metadata.get(key)
+        try:
+            version = int(raw_version) if raw_version is not None else None
+        except (TypeError, ValueError):
+            version = None
+        if version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise SymbolIdentityError(
+                f"{path}: missing or stale symbol identity metadata {raw_version!r}; "
+                "regenerate tokenized parquet with clang USR/signature identities "
+                f"before packing (required v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION})"
+            )
+        if SYMBOL_IDENTITIES_COLUMN not in schema.names:
+            raise SymbolIdentityError(
+                f"{path}: missing {SYMBOL_IDENTITIES_COLUMN!r} collision registry"
+            )
+        if schema.field(SYMBOL_IDENTITIES_COLUMN).type != identity_type:
+            raise SymbolIdentityError(
+                f"{path}: {SYMBOL_IDENTITIES_COLUMN} must be {identity_type}, got "
+                f"{schema.field(SYMBOL_IDENTITIES_COLUMN).type}"
+            )
+        for column in (
+            TOKEN_SYMBOL_IDS_COLUMN,
+            TOKEN_CALL_TARGETS_COLUMN,
+            TOKEN_TYPE_REFS_COLUMN,
+        ):
+            if column not in schema.names:
+                continue
+            field_type = schema.field(column).type
+            if not pa.types.is_list(field_type) or field_type.value_type != pa.uint64():
+                raise SymbolIdentityError(
+                    f"{path}: {column} must use uint64 symbol IDs, got "
+                    f"{field_type}"
+                )
+        row_offset = 0
+        for batch in parquet_file.iter_batches(columns=[SYMBOL_IDENTITIES_COLUMN]):
+            for local_index, records in enumerate(
+                batch.column(0).to_pylist()
+            ):
+                corpus_registry.register_records(
+                    records,
+                    source=f"{path}:row={row_offset + local_index}",
+                )
+            row_offset += batch.num_rows
+
+
 def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
     explicit = (
         SOURCE_DOC_ID_COLUMN,
@@ -950,15 +1246,7 @@ def _has_stable_doc_signature(record: dict[str, Any]) -> bool:
         "document_id",
         "doc_id",
     )
-    if any(record.get(column) is not None for column in explicit):
-        return True
-    provenance = (
-        REPO_STABLE_ID_COLUMN,
-        FILEPATH_STABLE_ID_COLUMN,
-        COMMIT_HASH_COLUMN,
-        FILE_LOCAL_COMMIT_INDEX_COLUMN,
-    )
-    return any(record.get(column) is not None for column in provenance)
+    return any(record.get(column) is not None for column in explicit)
 
 
 def _stable_doc_id_for_record(
@@ -967,12 +1255,26 @@ def _stable_doc_id_for_record(
     source_doc_index: int,
     signature_to_id: dict[str, int],
 ) -> int:
-    if not _has_stable_doc_signature(record):
-        return int(source_doc_index + 1)
+    del source_doc_index
     signature = stable_doc_signature(record)
     doc_id = signature_to_id.get(signature)
     if doc_id is None:
-        doc_id = len(signature_to_id) + 1
+        doc_id = int.from_bytes(
+            hashlib.sha256(signature.encode("utf-8")).digest()[:4], "big"
+        ) or 1
+        collision = next(
+            (
+                existing_signature
+                for existing_signature, existing_id in signature_to_id.items()
+                if existing_id == doc_id and existing_signature != signature
+            ),
+            None,
+        )
+        if collision is not None:
+            raise ValueError(
+                "stable document identity hash collision: "
+                f"id={doc_id} signatures={collision!r}, {signature!r}"
+            )
         signature_to_id[signature] = doc_id
     return int(doc_id)
 
@@ -1015,6 +1317,8 @@ def _selected_input_columns(available: set[str]) -> list[str]:
         column
         for column in (
             TOKEN_IDS_COLUMN,
+            SYMBOL_IDENTITIES_COLUMN,
+            SOURCE_IDENTITY_REGISTRY_COLUMN,
             SOURCE_DOC_ID_COLUMN,
             "source_document_id",
             "document_id",
@@ -1028,6 +1332,7 @@ def _selected_input_columns(available: set[str]) -> list[str]:
             HEADER_FRAGMENT_KIND_COLUMN,
             *PACKED_TOKEN_METADATA_COLUMNS,
             *PACKED_CHUNK_METADATA_COLUMNS,
+            *PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.values(),
         )
         if column in available
     ]
@@ -1045,6 +1350,7 @@ def iter_tokenized_documents(
     source_doc_index = int(start_source_doc_index)
     if signature_to_id is None:
         signature_to_id = {}
+    identity_registry = SymbolIdentityRegistry()
     for path in _list_input_files(input_path):
         parquet_file = pq.ParquetFile(path)
         available = set(parquet_file.schema_arrow.names)
@@ -1065,6 +1371,7 @@ def iter_tokenized_documents(
                         source_doc_index=source_doc_index,
                         signature_to_id=signature_to_id,
                     ),
+                    identity_registry=identity_registry,
                 )
                 yield doc
                 source_doc_index += 1
@@ -1251,7 +1558,12 @@ def _materialize_packed_row(
     source_pr_discussion_lines: list[int] = []
     source_doc_types: list[str | None] = []
     source_header_fragment_kinds: list[str | None] = []
+    objective_source_ids: dict[str, list[list[int]]] = {
+        source_column: []
+        for source_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN
+    }
     chronology = _shared_chronology_for_docs(ordered_docs)
+    symbol_identity_registry = SymbolIdentityRegistry()
 
     token_meta_acc: dict[str, list[int]] = {
         column: [] for column in PACKED_TOKEN_METADATA_COLUMNS
@@ -1269,15 +1581,18 @@ def _materialize_packed_row(
     cross_domain_edges: list[dict[str, int]] = []
     changed_chunk_ids: list[int] = []
     changed_chunk_spans: list[dict[str, int]] = []
+    source_identity_registry: dict[int, dict[str, int | str]] = {}
 
     token_offset = 0
     chunk_offset = 0
-    # ``doc_ids`` is a row-local attention/loss boundary channel.  It must
-    # identify every logical packed document independently, even when two
-    # documents share file-level provenance (for example two functions from the
-    # same header).  ``stable_doc_id`` remains provenance metadata; using it here
-    # collapsed those functions into one segment and trained across the boundary.
+    # doc_ids is a row-local attention/loss segmentation channel. Every input
+    # document gets a distinct segment even when multiple fragments share one
+    # stable source identity; token_source_doc_ids preserves that provenance.
     for row_doc_id, doc in enumerate(ordered_docs, start=1):
+        symbol_identity_registry.register_records(
+            doc.symbol_identities,
+            source=f"packed row {pack_id}:source_doc_index={doc.source_doc_index}",
+        )
         concatenated_tokens.extend(doc.token_ids)
         doc_ids.extend([row_doc_id] * doc.token_count)
         source_doc_indices.append(doc.source_doc_index)
@@ -1302,10 +1617,33 @@ def _materialize_packed_row(
         source_header_fragment_kinds.append(
             doc.chronology.get(HEADER_FRAGMENT_KIND_COLUMN)
         )
+        for source_column, token_column in (
+            PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.items()
+        ):
+            objective_source_ids[source_column].append(
+                list(doc.objective_token_ids.get(token_column, []))
+            )
+        for entry in doc.source_identity_registry:
+            identity_id = int(entry["source_identity_id"])
+            normalized_entry = dict(entry)
+            previous = source_identity_registry.get(identity_id)
+            if previous is not None and previous != normalized_entry:
+                raise ValueError(f"source identity uint64 collision for id {identity_id}")
+            source_identity_registry[identity_id] = normalized_entry
 
         for column in PACKED_TOKEN_METADATA_COLUMNS:
             values = doc.token_meta[column]
-            if values:
+            if column == TOKEN_SOURCE_DOC_IDS_COLUMN:
+                token_meta_acc[column].extend(
+                    int(value) if int(value) > 0 else 1
+                    for value in (values or [0] * doc.token_count)
+                )
+            elif column == TOKEN_SOURCE_IDENTITY_IDS_COLUMN:
+                token_meta_acc[column].extend(
+                    int(value) if int(value) > 0 else doc.stable_source_id
+                    for value in (values or [0] * doc.token_count)
+                )
+            elif values:
                 token_meta_acc[column].extend(values)
             else:
                 fill = PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES.get(column, 0)
@@ -1379,7 +1717,21 @@ def _materialize_packed_row(
         _loss_mask_for_packed_docs(doc_ids, target_length=valid_token_count)
     )
     slack_tokens = row_length - valid_token_count
-    pad_doc_id = max(len(ordered_docs), max(doc_ids, default=0)) if doc_ids else 0
+    pad_doc_id = len(ordered_docs)
+    used_symbol_ids = {
+        int(value)
+        for column in (
+            TOKEN_SYMBOL_IDS_COLUMN,
+            TOKEN_CALL_TARGETS_COLUMN,
+            TOKEN_TYPE_REFS_COLUMN,
+        )
+        for value in token_meta_acc[column]
+        if int(value) != 0
+    }
+    symbol_identity_registry.require_ids(
+        used_symbol_ids,
+        source=f"packed row {pack_id}",
+    )
 
     row: dict[str, Any] = {
         PACK_ID_COLUMN: int(pack_id),
@@ -1410,7 +1762,9 @@ def _materialize_packed_row(
         SOURCE_PR_DISCUSSION_LINES_COLUMN: source_pr_discussion_lines,
         SOURCE_DOC_TYPES_COLUMN: source_doc_types,
         SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: source_header_fragment_kinds,
+        **objective_source_ids,
         ROW_PLATFORM_IDS_COLUMN: _merged_platform_ids_for_docs(ordered_docs),
+        SYMBOL_IDENTITIES_COLUMN: symbol_identity_registry.records(used_symbol_ids),
         HAS_PR_DISCUSSION_COLUMN: any(source_has_pr_discussions),
         PR_DISCUSSION_CHARS_COLUMN: sum(source_pr_discussion_chars),
         PR_DISCUSSION_LINES_COLUMN: sum(source_pr_discussion_lines),
@@ -1427,6 +1781,7 @@ def _materialize_packed_row(
         TOKEN_SHELL_EDGES_COLUMN: shell_edges,
         TOKEN_DIAGNOSTIC_EDGES_COLUMN: diagnostic_edges,
         TOKEN_CROSS_DOMAIN_EDGES_COLUMN: cross_domain_edges,
+        SOURCE_IDENTITY_REGISTRY_COLUMN: list(source_identity_registry.values()),
     }
     for column in PACKED_ROW_PROVENANCE_COLUMNS:
         value = chronology.get(column) if chronology else None
@@ -1445,6 +1800,10 @@ def _materialize_packed_row(
     for column in PACKED_TOKEN_METADATA_COLUMNS:
         pad_value = int(PACKED_ROWS_DENSE_FALLBACK_FILL_VALUES.get(column, 0))
         row[column] = _pad(token_meta_acc[column], row_length, pad_value=pad_value)
+    validate_source_identity_registry(
+        row[SOURCE_IDENTITY_REGISTRY_COLUMN],
+        referenced_ids=row[TOKEN_SOURCE_IDENTITY_IDS_COLUMN][:valid_token_count],
+    )
     return row
 
 
@@ -1539,7 +1898,21 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                     None if item is None else str(item)
                     for item in row.get(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, [])
                 ],
+                **{
+                    source_column: [
+                        _as_int_list(item)
+                        for item in row.get(source_column, [])
+                    ]
+                    for source_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN
+                },
                 ROW_PLATFORM_IDS_COLUMN: _as_int_list(row.get(ROW_PLATFORM_IDS_COLUMN)),
+                SYMBOL_IDENTITIES_COLUMN: [
+                    {
+                        "symbol_id": int(item["symbol_id"]),
+                        "symbol_key": str(item["symbol_key"]),
+                    }
+                    for item in row.get(SYMBOL_IDENTITIES_COLUMN, [])
+                ],
                 REPO_COLUMN: row.get(REPO_COLUMN),
                 FILEPATH_COLUMN: row.get(FILEPATH_COLUMN),
                 COMMIT_HASH_COLUMN: row.get(COMMIT_HASH_COLUMN),
@@ -1602,6 +1975,9 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 TOKEN_SCOPE_IDS_COLUMN: _as_int_list(row.get(TOKEN_SCOPE_IDS_COLUMN)),
                 TOKEN_SOURCE_DOC_IDS_COLUMN: _as_int_list(
                     row.get(TOKEN_SOURCE_DOC_IDS_COLUMN)
+                ),
+                TOKEN_SOURCE_IDENTITY_IDS_COLUMN: _as_int_list(
+                    row.get(TOKEN_SOURCE_IDENTITY_IDS_COLUMN)
                 ),
                 TOKEN_CONFIDENCE_IDS_COLUMN: _as_int_list(
                     row.get(TOKEN_CONFIDENCE_IDS_COLUMN)
@@ -1690,6 +2066,14 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                     }
                     for edge in row.get(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, [])
                 ],
+                SOURCE_IDENTITY_REGISTRY_COLUMN: [
+                    {
+                        "source_identity_id": int(entry["source_identity_id"]),
+                        "canonical_sha256": str(entry["canonical_sha256"]),
+                        "source": str(entry["source"]),
+                    }
+                    for entry in row.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
+                ],
             }
         )
     return pa.Table.from_pylist(normalized_rows, schema=PACKED_ROW_OUTPUT_SCHEMA)
@@ -1746,7 +2130,7 @@ def write_overflow_records(
     pq.write_table(table, path)
 
 
-def pack_parquet_dataset(
+def _pack_parquet_dataset_to_paths(
     input_path: str | os.PathLike[str],
     output_path: str | os.PathLike[str],
     *,
@@ -1767,6 +2151,7 @@ def pack_parquet_dataset(
     if input_batch_size <= 0:
         raise ValueError("input_batch_size must be > 0")
 
+    _require_symbol_identity_schema(input_path)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1830,6 +2215,40 @@ def pack_parquet_dataset(
         "packed_rows": packed_rows_count,
         "overflow_docs": len(overflow),
     }
+
+
+def pack_parquet_dataset(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    target_length: int,
+    pad_token_id: int = 0,
+    strategy: PackingStrategy = "best_fit",
+    overflow_output: str | os.PathLike[str] | None = None,
+    row_group_size: int = 128,
+    pack_token_window: int = DEFAULT_PACK_TOKEN_WINDOW,
+    input_batch_size: int = 1024,
+) -> dict[str, int]:
+    """Stage every artifact and publish the primary packed parquet last."""
+
+    with ExitStack() as stack:
+        staged_output = stack.enter_context(atomic_output_file(output_path))
+        staged_overflow = None
+        if overflow_output is not None:
+            staged_overflow = stack.enter_context(
+                atomic_output_file(overflow_output)
+            )
+        return _pack_parquet_dataset_to_paths(
+            input_path,
+            staged_output,
+            target_length=target_length,
+            pad_token_id=pad_token_id,
+            strategy=strategy,
+            overflow_output=staged_overflow,
+            row_group_size=row_group_size,
+            pack_token_window=pack_token_window,
+            input_batch_size=input_batch_size,
+        )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1920,6 +2339,8 @@ __all__ = [
     "NUM_DOCS_COLUMN",
     "PACKED_ROW_MACRO_ROUTES_METADATA_KEY",
     "PACKED_ROW_MACRO_ROUTES_VERSION",
+    "REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION",
+    "SYMBOL_IDENTITY_SCHEMA_METADATA_KEY",
     "PACK_ID_COLUMN",
     "SOURCE_DOC_INDICES_COLUMN",
     "TARGET_IDS_COLUMN",

@@ -1,0 +1,16 @@
+include README.md
+include pyproject.toml
+include setup.py
+include cppmega_mlx/tokenizer/tokenizer_contract_v1.json
+include cppmega_mlx/tokenizer/tokenizer.json
+include cppmega_mlx/data/domain_schema_v1.json
+include cppmega_v4/nn/_external/VENDORED_MANIFEST.json
+global-exclude *.so *.dylib *.metallib
+recursive-include cppmega_mlx/training/native_optim \
+    CMakeLists.txt \
+    bindings.cpp \
+    fused_8bit.cpp \
+    fused_8bit.h \
+    fused_8bit.metal
+recursive-include cppmega_v4/widget/static *.css *.mjs
+global-exclude *.so *.dylib *.metallib

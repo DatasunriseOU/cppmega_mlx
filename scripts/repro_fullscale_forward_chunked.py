@@ -174,7 +174,7 @@ def main() -> int:
     out = torch.zeros(b, S, H, P, device=dev, dtype=torch.float16)
     kernels["mamba3_chunk_scan_combine"](
         cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
-        C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+        C.contiguous(), prev_states.contiguous(), D.contiguous(), out)
     torch.mps.synchronize()
     wall_on = time.perf_counter() - t_on
 

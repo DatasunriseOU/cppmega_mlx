@@ -42,6 +42,8 @@ _EXPORT_MODULES = {
     "MegatronIndexedMultiShardMetadata": "cppmega_mlx.data.megatron_indexed",
     "megatron_indexed_side_channel_schema": "cppmega_mlx.data.megatron_indexed",
     "open_megatron_indexed_dataset": "cppmega_mlx.data.megatron_indexed",
+    "ProductionMegatronDatasetMetadata": "cppmega_mlx.data.production_bundle",
+    "open_production_megatron_bundle": "cppmega_mlx.data.production_bundle",
     "OversizedSamplePolicy": "cppmega_mlx.data.packing",
     "PackedSequences": "cppmega_mlx.data.packing",
     "PackingStrategy": "cppmega_mlx.data.packing",
