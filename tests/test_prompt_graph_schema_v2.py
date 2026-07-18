@@ -27,6 +27,16 @@ class _CharacterOffsetTokenizer:
         ]
 
 
+class _BoundaryMergingTokenizer:
+    name_or_path = "case3-v3-boundary-merging-tokenizer"
+
+    def encode_with_offsets(self, text: str):
+        boundary = "// synthetic boundary\n"
+        first = "int first() { return 1; }\n"
+        split = len(boundary) + len(first)
+        return [1, 2], [(0, split), (split, len(text))]
+
+
 PROJECT_ID = "tests/prompt-graph"
 
 
@@ -342,6 +352,32 @@ def test_repository_context_includes_referenced_cross_file_definition() -> None:
     assert context.segments[-1].role == "target"
     assert artifact.edge_counts["call"] == 1
     assert artifact.graph_routes["graph_call_edges"]
+
+
+def test_builder_rejects_token_spanning_unmapped_and_source_text() -> None:
+    index = PromptProjectIndex.from_dict(_v3_payload())
+    first, second = index.documents
+    context = PromptGraphContext(
+        segments=(
+            PromptGraphSegment("// synthetic boundary\n", role="boundary"),
+            PromptGraphSegment(
+                first.source,
+                document_id=first.id,
+                source_path=first.source_path,
+                source_start=0,
+            ),
+            PromptGraphSegment("\n", role="separator"),
+            PromptGraphSegment(
+                second.source,
+                document_id=second.id,
+                source_path=second.source_path,
+                source_start=0,
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="mapped and unmapped"):
+        PromptGraphBuilder(_BoundaryMergingTokenizer()).build(index, context)
 
 
 def test_from_prompt_default_remains_unmapped_and_usable() -> None:

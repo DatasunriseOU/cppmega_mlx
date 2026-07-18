@@ -10,8 +10,8 @@ the audit, no mocked object storage. They prove the fail-closed gate added to
     RAISES -- this is the gap the finding called out;
   * a non-green receipt, a manifest/receipt token divergence, and a manifest
     that is required to carry ``verified_valid_tokens`` but lacks it all RAISE;
-  * the ``--use-default-manifest`` path (no uploaded token total) is still
-    proven via the green receipt + per-bucket shard-count reconciliation.
+  * the planning-only default manifest is rejected by the real verification
+  path; only a schema-bound v3 inventory can certify a download.
 """
 
 from __future__ import annotations
@@ -29,32 +29,64 @@ import pytest
 from cppmega_mlx.data.source_identity import source_identity
 from scripts import download_verified_sidecar_from_nebius_s3 as download
 from scripts.nanochat_data.pack_enriched_rows import PACKED_ROW_OUTPUT_SCHEMA
+from scripts import upload_verified_sidecar_to_nebius_s3 as upload
+from scripts.sidecar_manifest_contract import (
+    AUDIT_FILENAME,
+    AUDIT_REMOTE,
+    AUDIT_SCHEMA,
+    GRAPH_CONTRACT,
+    MANIFEST_SCHEMA,
+    OBJECTIVE_CONTRACT,
+    build_semantic_audit_binding,
+    finalize_manifest,
+    inventory_directory,
+    inventory_sha256,
+    selection_policy,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BUCKET = "4"  # rows are this long; tiny so the real audit stays fast
+CODE_BUCKETS = ("1024", "2048", "4096", "8192")
+COMMIT_BUCKETS = ("1024", "2048", "4096", "8192", "16384")
 SHARDS = 2
+PROFILE_SELECTIONS = tuple(
+    [(f"parquet/code/{bucket}", f"reindexed/code/{bucket}") for bucket in CODE_BUCKETS]
+    + [
+        (f"parquet/commits/{bucket}", f"reindexed_commits/{bucket}")
+        for bucket in COMMIT_BUCKETS
+    ]
+    + [(AUDIT_REMOTE, "audit")]
+)
 
 
-def _write_green_shard(path: Path) -> None:
+def _write_green_shard(
+    path: Path,
+    *,
+    length: int,
+    source_id: int,
+    valid_tokens: int | None = None,
+) -> None:
     """Write a complete CASE5 row that passes the real audit gate."""
-    length = int(BUCKET)
-    input_ids = list(range(10, 10 + length))
-    identity = source_identity({"source_path": "fixture.cpp"})
+    valid_tokens = length if valid_tokens is None else valid_tokens
+    if not 0 < valid_tokens <= length:
+        raise ValueError("valid_tokens must be within the shard capacity")
+    input_ids = [1 + (index % 4) for index in range(valid_tokens)]
+    input_ids.extend([0] * (length - valid_tokens))
+    identity = source_identity({"source_path": f"fixture-{source_id}.cpp"})
     row = {
         "input_ids": input_ids,
-        "target_ids": input_ids[1:] + [0],
-        "loss_mask": [1] * (length - 1) + [0],
+        "target_ids": input_ids[1:valid_tokens] + [0] * (length - valid_tokens + 1),
+        "loss_mask": [1] * (valid_tokens - 1) + [0] * (length - valid_tokens + 1),
         "doc_ids": [1] * length,
-        "valid_token_count": length,
-        "trained_token_count": length - 1,
+        "valid_token_count": valid_tokens,
+        "trained_token_count": valid_tokens - 1,
         "num_docs": 1,
-        "slack_tokens": 0,
-        "source_doc_ids": [1],
-        "source_doc_token_lengths": [length],
+        "slack_tokens": length - valid_tokens,
+        "source_doc_ids": [source_id],
+        "source_doc_token_lengths": [valid_tokens],
         "source_platform_ids": [[7]],
         "source_repo_stable_ids": ["9"],
-        "source_filepath_stable_ids": ["11"],
+        "source_filepath_stable_ids": [str(source_id)],
         "source_file_local_commit_indices": [0],
         "platform_ids": [7],
         "token_platform_ids": [0] * length,
@@ -70,8 +102,10 @@ def _write_green_shard(path: Path) -> None:
         "token_role_ids": [0] * length,
         "token_entity_ids": [0] * length,
         "token_scope_ids": [0] * length,
-        "token_source_doc_ids": [1] * length,
-        "token_source_identity_ids": [identity.source_identity_id] * length,
+        "token_source_doc_ids": [source_id] * valid_tokens
+        + [0] * (length - valid_tokens),
+        "token_source_identity_ids": [identity.source_identity_id] * valid_tokens
+        + [0] * (length - valid_tokens),
         "token_confidence_ids": [0] * length,
         "token_def_use": [0] * length,
         "token_change_mask_pre": [0] * length,
@@ -79,7 +113,7 @@ def _write_green_shard(path: Path) -> None:
         "hunk_id_per_token": [-1] * length,
         "edit_op_per_token": [0] * length,
         "token_chunk_starts": [0],
-        "token_chunk_ends": [length],
+        "token_chunk_ends": [valid_tokens],
         "token_chunk_kinds": [1],
         "token_chunk_dep_levels": [0],
         "token_call_edges": [],
@@ -94,16 +128,26 @@ def _write_green_shard(path: Path) -> None:
         "changed_chunk_spans": [],
     }
     table = pa.Table.from_pylist([row], schema=PACKED_ROW_OUTPUT_SCHEMA)
+    assert "source_doc_token_lengths" in table.column_names
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path)
 
 
 def _build_verified_tree(dest: Path) -> int:
     """Lay out a downloaded set + a REAL green audit receipt; return valid_tokens."""
-    code_bucket = dest / "reindexed" / "code" / BUCKET
-    for idx in range(SHARDS):
-        _write_green_shard(code_bucket / f"shard{idx}.parquet")
-    (dest / "reindexed_commits").mkdir(parents=True, exist_ok=True)
+    source_id = 7
+    for remote, local_relative in PROFILE_SELECTIONS:
+        if not remote.startswith("parquet/"):
+            continue
+        kind, bucket = remote.split("/")[1:]
+        shard_count = SHARDS if kind == "code" and bucket == "1024" else 1
+        for index in range(shard_count):
+            _write_green_shard(
+                dest / local_relative / f"shard{index}.parquet",
+                length=int(bucket),
+                source_id=source_id,
+            )
+            source_id += 1
     (dest / "reindexed_pr").mkdir(parents=True, exist_ok=True)
 
     out_dir = dest / "audit"
@@ -117,7 +161,7 @@ def _build_verified_tree(dest: Path) -> int:
         "--pr-root",
         str(dest / "reindexed_pr"),
         "--buckets",
-        BUCKET,
+        ",".join((*CODE_BUCKETS, *COMMIT_BUCKETS)),
         "--out-dir",
         str(out_dir),
         "--vocab-size",
@@ -131,7 +175,7 @@ def _build_verified_tree(dest: Path) -> int:
     report = json.loads((out_dir / "sidecar_parquet_audit.json").read_text())
     assert report["total"]["bad_files"] == 0
     assert report["total"]["bad_rows"] == 0
-    assert report["by_kind_bucket"][f"code/{BUCKET}"]["files"] == SHARDS
+    assert report["by_kind_bucket"]["code/1024"]["files"] == SHARDS
     return int(report["total"]["valid_tokens"])
 
 
@@ -149,15 +193,63 @@ def _fresh(pristine: tuple[Path, int], where: Path) -> tuple[Path, int]:
     return dest, tokens
 
 
-def _manifest(tokens: int, *, include_token_total: bool = True) -> dict:
-    selections = [
-        {"remote": "parquet/code/4", "local": "reindexed/code/4"},
-        {"remote": download.RECEIPT_REMOTE, "local": "audit"},
-    ]
-    manifest: dict = {"selections": selections}
+def _manifest(
+    dest: Path, tokens: int, *, include_token_total: bool = True
+) -> dict:
+    selections: list[dict[str, object]] = []
+    for remote, local_relative in PROFILE_SELECTIONS:
+        local = dest / local_relative
+        inventory = inventory_directory(local, remote=remote)
+        selections.append(
+            {"remote": remote, "local": local_relative, **inventory}
+        )
+    audit_selection = next(
+        selection for selection in selections if selection["remote"] == AUDIT_REMOTE
+    )
+    audit_record = next(
+        record
+        for record in audit_selection["files"]
+        if record["path"] == AUDIT_FILENAME
+    )
+    payload: dict[str, object] = {
+        "schema": MANIFEST_SCHEMA,
+        "bucket": "bucket",
+        "prefix": "prefix/run-1",
+        "endpoint_url": "https://storage.example",
+        "profile": "code_commits_integrated_pr",
+        "standalone_pr_included": False,
+        "selections": selections,
+        "inventory_sha256": inventory_sha256(selections),
+        "selection_policy": selection_policy(
+            [str(selection["remote"]) for selection in selections],
+            include_standalone_pr=False,
+        ),
+        "audit_receipt": {
+            "schema": AUDIT_SCHEMA,
+            "status": "verified",
+            "remote": AUDIT_REMOTE,
+            "path": AUDIT_FILENAME,
+            "sha256": audit_record["sha256"],
+        },
+        "semantic_audit": build_semantic_audit_binding(
+            selections=selections,
+            audited_files=upload._audit_selected_parquet_files(
+                [
+                    {
+                        **selection,
+                        "local": str(dest / str(selection["local"])),
+                    }
+                    for selection in selections
+                ]
+            ),
+            source_receipt_sha256=str(audit_record["sha256"]),
+        ),
+        "graph_contract": GRAPH_CONTRACT,
+        "objective_contract": OBJECTIVE_CONTRACT,
+    }
     if include_token_total:
-        manifest["verified_valid_tokens"] = tokens
-    return manifest
+        payload["verified_valid_tokens"] = tokens
+    return finalize_manifest(payload)
 
 
 def test_verify_passes_on_complete_green_set(
@@ -165,40 +257,41 @@ def test_verify_passes_on_complete_green_set(
 ) -> None:
     dest, tokens = _fresh(pristine, tmp_path)
     result = download._verify_downloaded_set(
-        dest=dest, manifest=_manifest(tokens), require_token_total=True
+        dest=dest, manifest=_manifest(dest, tokens), require_token_total=True
     )
     assert result["bad_files"] == 0
     assert result["bad_rows"] == 0
     assert result["verified_valid_tokens"] == tokens
-    assert result["buckets_verified"] == 1
+    assert result["buckets_verified"] == 9
 
 
 def test_verify_raises_on_missing_shard_set(
     pristine: tuple[Path, int], tmp_path: Path
 ) -> None:
     dest, tokens = _fresh(pristine, tmp_path)
+    manifest = _manifest(dest, tokens)
     # Drop a shard to simulate an incomplete remote prefix that `aws s3 sync`
     # would otherwise treat as a successful (return-0) download.
-    shards = sorted((dest / "reindexed" / "code" / BUCKET).glob("*.parquet"))
+    shards = sorted((dest / "reindexed" / "code" / "1024").glob("*.parquet"))
     shards[0].unlink()
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(ValueError, match="inventory mismatch"):
         download._verify_downloaded_set(
-            dest=dest, manifest=_manifest(tokens), require_token_total=True
+            dest=dest, manifest=manifest, require_token_total=True
         )
-    assert "does not match the audit receipt" in str(exc.value)
 
 
 def test_verify_raises_on_token_total_divergence(
     pristine: tuple[Path, int], tmp_path: Path
 ) -> None:
     dest, tokens = _fresh(pristine, tmp_path)
-    manifest = _manifest(tokens)
+    manifest = _manifest(dest, tokens)
     manifest["verified_valid_tokens"] = tokens + 1
-    with pytest.raises(SystemExit) as exc:
+    manifest = finalize_manifest(manifest)
+    with pytest.raises(ValueError) as exc:
         download._verify_downloaded_set(
             dest=dest, manifest=manifest, require_token_total=True
         )
-    assert "verified_valid_tokens" in str(exc.value)
+    assert "semantic audit total" in str(exc.value)
 
 
 def test_verify_raises_on_nongreen_receipt(
@@ -207,48 +300,76 @@ def test_verify_raises_on_nongreen_receipt(
     dest, tokens = _fresh(pristine, tmp_path)
     receipt_path = dest / "audit" / "sidecar_parquet_audit.json"
     report = json.loads(receipt_path.read_text())
-    report["by_kind_bucket"][f"code/{BUCKET}"]["bad_rows"] = 1
+    report["by_kind_bucket"]["code/1024"]["bad_rows"] = 1
     receipt_path.write_text(json.dumps(report))
-    with pytest.raises(SystemExit) as exc:
+    manifest = _manifest(dest, tokens)
+    with pytest.raises(ValueError) as exc:
         download._verify_downloaded_set(
-            dest=dest, manifest=_manifest(tokens), require_token_total=True
+            dest=dest, manifest=manifest, require_token_total=True
         )
-    assert f"code/{BUCKET}" in str(exc.value)
+    assert "code/1024" in str(exc.value)
+
+
+def test_verify_rejects_receipt_bucket_drift_with_same_total(
+    pristine: tuple[Path, int], tmp_path: Path
+) -> None:
+    dest, tokens = _fresh(pristine, tmp_path)
+    receipt_path = dest / "audit" / "sidecar_parquet_audit.json"
+    report = json.loads(receipt_path.read_text())
+    report["by_kind_bucket"]["code/1024"]["valid_tokens"] -= 1
+    report["by_kind_bucket"]["code/2048"]["valid_tokens"] += 1
+    receipt_path.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="code/1024.*valid_tokens"):
+        download._verify_downloaded_set(
+            dest=dest,
+            manifest=_manifest(dest, tokens),
+            require_token_total=True,
+        )
 
 
 def test_verify_raises_when_token_total_required_but_absent(
     pristine: tuple[Path, int], tmp_path: Path
 ) -> None:
     dest, tokens = _fresh(pristine, tmp_path)
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(ValueError, match="verified_valid_tokens must be positive"):
         download._verify_downloaded_set(
             dest=dest,
-            manifest=_manifest(tokens, include_token_total=False),
+            manifest=_manifest(dest, tokens, include_token_total=False),
             require_token_total=True,
         )
-    assert "missing verified_valid_tokens" in str(exc.value)
 
 
-def test_verify_default_manifest_still_proves_set(
+def test_verify_rejects_planning_manifest_and_still_checks_v3_inventory(
     pristine: tuple[Path, int], tmp_path: Path
 ) -> None:
-    # --use-default-manifest (require_token_total=False): there is no uploaded
-    # token total, but the set is NOT silently trusted -- it is still proven via
-    # the green receipt and per-bucket shard-count reconciliation.
     dest, tokens = _fresh(pristine, tmp_path)
+    with pytest.raises(ValueError, match="unsupported sidecar manifest schema"):
+        download._verify_downloaded_set(
+            dest=dest,
+            manifest=download._default_manifest(
+                "bucket", "prefix", "https://storage.example"
+            ),
+            require_token_total=False,
+        )
+
+    manifest = _manifest(dest, tokens)
     result = download._verify_downloaded_set(
         dest=dest,
-        manifest=_manifest(tokens, include_token_total=False),
+        manifest=manifest,
         require_token_total=False,
     )
-    assert result["buckets_verified"] == 1
+    assert result["buckets_verified"] == 9
 
-    # ...and it still catches a missing-shards SET without any token total.
+    # The compatibility argument cannot bypass exact inventory verification.
     dest2, _ = _fresh(pristine, tmp_path / "second")
-    next(iter((dest2 / "reindexed" / "code" / BUCKET).glob("*.parquet"))).unlink()
-    with pytest.raises(SystemExit):
+    manifest2 = _manifest(dest2, tokens)
+    next(
+        iter((dest2 / "reindexed" / "code" / "1024").glob("*.parquet"))
+    ).unlink()
+    with pytest.raises(ValueError, match="inventory mismatch"):
         download._verify_downloaded_set(
             dest=dest2,
-            manifest=_manifest(tokens, include_token_total=False),
+            manifest=manifest2,
             require_token_total=False,
         )

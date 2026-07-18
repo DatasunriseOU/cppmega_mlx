@@ -32,7 +32,10 @@ from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
 )
-from cppmega_mlx.data.graph_recipe import validate_stage1_graph_contract
+from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_contract,
+)
 
 
 _BUNDLE_SCHEMA = "cppmega_megatron_bundle_v1"
@@ -42,7 +45,8 @@ _EXPECTED_VOCAB_SIZE = 65536
 _TRAINING_CONTRACT = "objective_materialized"
 _OBJECTIVE_BUCKETS_SCHEMA = "cppmega_bucketed_objective_materializations_v1"
 _OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
-_OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v1"
+_OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v2"
+_LEGACY_OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v1"
 _OBJECTIVE_SOURCE_SCHEMA = "cppmega_objective_source_snapshot_v1"
 _LEGACY_SOURCE_SAMPLING_MODE = "deterministic_epoch_shuffle_v1"
 _BOUNDED_SOURCE_SAMPLING_MODE = (
@@ -784,6 +788,11 @@ def _validate_objectives(
         )
         if set(descriptor) != _OBJECTIVE_DESCRIPTOR_FIELDS:
             raise ValueError(f"objective descriptor fields drifted for bucket {bucket}")
+        if descriptor.get("artifact_schema") == _LEGACY_OBJECTIVE_ARTIFACT_SCHEMA:
+            raise ValueError(
+                f"objective artifact schema for bucket {bucket} is legacy; migration "
+                "required: regenerate the objective artifact and bundle"
+            )
         if descriptor.get("artifact_schema") != _OBJECTIVE_ARTIFACT_SCHEMA:
             raise ValueError(f"objective artifact schema drifted for bucket {bucket}")
         if descriptor.get("contract_schema") != _OBJECTIVE_CONTRACT_SCHEMA:
@@ -882,10 +891,7 @@ def _validate_objectives(
             ),
             where=f"objective {bucket} artifact",
         )
-        if artifact.get("schema") != _OBJECTIVE_ARTIFACT_SCHEMA:
-            raise ValueError(
-                f"objective artifact payload schema drifted for bucket {bucket}"
-            )
+        _validate_objective_artifact_shape(artifact, bucket=bucket)
         artifact_payload = dict(artifact)
         artifact_digest = artifact_payload.pop("artifact_set_sha256", None)
         if artifact_digest != descriptor[
@@ -913,6 +919,41 @@ def _validate_objectives(
             descriptor=descriptor,
         )
     return validated
+
+
+def _validate_objective_artifact_shape(
+    artifact: Mapping[str, object], *, bucket: int
+) -> None:
+    """Validate the versioned artifact envelope before hash-bound consumption."""
+
+    if artifact.get("schema") == _LEGACY_OBJECTIVE_ARTIFACT_SCHEMA:
+        raise ValueError(
+            f"objective artifact payload for bucket {bucket} is legacy; migration "
+            "required: regenerate the objective artifact and bundle"
+        )
+    if artifact.get("schema") != _OBJECTIVE_ARTIFACT_SCHEMA:
+        raise ValueError(
+            f"objective artifact payload schema drifted for bucket {bucket}"
+        )
+    expected_fields = {
+        "schema",
+        "graph_recipe",
+        "documents",
+        "objective_contract",
+        "parquet_shards",
+        "converter",
+        "artifact_set_sha256",
+    }
+    if set(artifact) != expected_fields:
+        raise ValueError(
+            f"objective artifact fields drifted for bucket {bucket}: "
+            f"{sorted(artifact)}"
+        )
+    if artifact.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise ValueError(
+            f"objective artifact graph recipe drifted for bucket {bucket}; "
+            "regenerate the objective artifact and bundle"
+        )
 
 
 def _validate_bucket_prefixes(

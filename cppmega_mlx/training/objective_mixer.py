@@ -679,8 +679,23 @@ class EligibilityAwareTaskMixer:
         output_count: int,
         start_step: int = 0,
         required_assignment: Callable[[SourceInput, TaskKind], bool] | None = None,
+        required_realized_assignment: Callable[
+            [SourceInput, RealizedObjective], bool
+        ]
+        | None = None,
+        candidate_assignment: Callable[[SourceInput, TaskKind], bool] | None = None,
     ) -> list[RealizedObjective]:
         """Select and realize one exact quota window from a bounded source pool."""
+
+        if required_assignment is not None and required_realized_assignment is not None:
+            raise ValueError(
+                "required_assignment and required_realized_assignment are mutually "
+                "exclusive"
+            )
+        if candidate_assignment is not None and required_realized_assignment is None:
+            raise ValueError(
+                "candidate_assignment requires required_realized_assignment"
+            )
 
         if output_count < 0:
             raise ValueError(f"output_count must be >=0, got {output_count}")
@@ -767,20 +782,26 @@ class EligibilityAwareTaskMixer:
                     return None, slot_index
             return packet_owner, None
 
-        forced_candidates: list[tuple[int, int] | None]
-        if required_assignment is None:
-            forced_candidates = [None]
-        else:
-            first_slot_by_task: dict[TaskKind, int] = {}
-            for slot_index, task in enumerate(slots):
-                first_slot_by_task.setdefault(task, slot_index)
-            forced_candidates = [
-                (packet_index, first_slot_by_task[task])
-                for packet_index, packet in enumerate(packets)
-                for task in eligibility[packet_index][0]
-                if task in first_slot_by_task and required_assignment(packet, task)
-            ]
-            forced_candidates.sort(
+        slot_indices_by_task: dict[TaskKind, list[int]] = {}
+        for slot_index, task in enumerate(slots):
+            slot_indices_by_task.setdefault(task, []).append(slot_index)
+
+        def forced_candidate_pairs(
+            predicate: Callable[[SourceInput, TaskKind], bool],
+        ) -> list[tuple[int, int]]:
+            # Enumerate forced candidate edges, not complete assignments.  Each edge
+            # gets at most one augmenting-path matching attempt below, keeping
+            # the search polynomial in the bounded source/slot graph.
+            pairs: list[tuple[int, int]] = []
+            for packet_index, packet in enumerate(packets):
+                for task in eligibility[packet_index][0]:
+                    task_slots = slot_indices_by_task.get(task)
+                    if task_slots is None or not predicate(packet, task):
+                        continue
+                    pairs.extend(
+                        (packet_index, slot_index) for slot_index in task_slots
+                    )
+            pairs.sort(
                 key=lambda pair: (
                     len(candidate_packets[pair[1]]),
                     len(eligibility[pair[0]][0]),
@@ -789,6 +810,23 @@ class EligibilityAwareTaskMixer:
                     pair[1],
                 )
             )
+            return pairs
+
+        forced_candidates: list[tuple[int, int] | None]
+        if required_realized_assignment is not None:
+            forced_candidates = [None]
+            forced_candidates.extend(
+                forced_candidate_pairs(
+                    lambda packet, task: (
+                        candidate_assignment is None
+                        or candidate_assignment(packet, task)
+                    )
+                )
+            )
+        elif required_assignment is None:
+            forced_candidates = [None]
+        else:
+            forced_candidates = forced_candidate_pairs(required_assignment)
             if not forced_candidates:
                 raise ObjectiveQuotaUnsatisfiedError(
                     "objective source pool has no eligible assignment satisfying "
@@ -796,53 +834,73 @@ class EligibilityAwareTaskMixer:
                     f"pool={len(packets)}, output_count={output_count}"
                 )
 
-        packet_owner = None
+        def realize(packet_owner: Sequence[int | None]) -> list[RealizedObjective]:
+            task_by_packet = {
+                packet_index: slots[slot_index]
+                for packet_index, slot_index in enumerate(packet_owner)
+                if slot_index is not None
+            }
+            realized: list[RealizedObjective] = []
+            for output_index, source_index in enumerate(sorted(task_by_packet)):
+                packet = packets[source_index]
+                task = task_by_packet[source_index]
+                step_index = start_step + output_index
+                build_rng = self._step_rng(step_index)
+                task_packet = self._select_packet_for_task(
+                    packet,
+                    task,
+                    rng=build_rng,
+                )
+                example = self._builder.build(task, task_packet, rng=build_rng)
+                self._require_realized_kind(task, example)
+                realized.append(
+                    RealizedObjective(
+                        task=task,
+                        example=example,
+                        ineligible=eligibility[source_index][1],
+                        source_index=source_index,
+                        selected_packet=task_packet,
+                    )
+                )
+            assert Counter(item.task for item in realized) == Counter(quotas)
+            return realized
+
         failed_slot = None
+        matched_assignment = False
+        attempted_assignments: set[tuple[int | None, ...]] = set()
         for forced_assignment in forced_candidates:
             packet_owner, failed_slot = match(forced_assignment)
-            if packet_owner is not None:
-                break
-        if packet_owner is None:
-            quota_text = ", ".join(
-                f"{task.value}={quota}" for task, quota in quotas.items()
-            )
-            failed_task = "unknown" if failed_slot is None else slots[failed_slot].value
-            raise ObjectiveQuotaUnsatisfiedError(
-                "objective quota matching failed despite aggregate eligibility; "
-                f"quotas: {quota_text}; slot={failed_task}; "
-                f"pool={len(packets)}; output_count={output_count}; "
-                f"required_assignment={required_assignment is not None}"
-            )
+            if packet_owner is None:
+                continue
+            signature = tuple(packet_owner)
+            if signature in attempted_assignments:
+                continue
+            attempted_assignments.add(signature)
+            matched_assignment = True
+            realized = realize(packet_owner)
+            if required_realized_assignment is None or any(
+                required_realized_assignment(packets[item.source_index], item)
+                for item in realized
+            ):
+                return realized
 
-        task_by_packet = {
-            packet_index: slots[slot_index]
-            for packet_index, slot_index in enumerate(packet_owner)
-            if slot_index is not None
-        }
-        realized: list[RealizedObjective] = []
-        for output_index, source_index in enumerate(sorted(task_by_packet)):
-            packet = packets[source_index]
-            task = task_by_packet[source_index]
-            step_index = start_step + output_index
-            build_rng = self._step_rng(step_index)
-            task_packet = self._select_packet_for_task(
-                packet,
-                task,
-                rng=build_rng,
+        if required_realized_assignment is not None and matched_assignment:
+            raise ObjectiveQuotaUnsatisfiedError(
+                "objective quota matching produced no realized assignment "
+                "satisfying the required auxiliary constraint: "
+                f"pool={len(packets)}, output_count={output_count}"
             )
-            example = self._builder.build(task, task_packet, rng=build_rng)
-            self._require_realized_kind(task, example)
-            realized.append(
-                RealizedObjective(
-                    task=task,
-                    example=example,
-                    ineligible=eligibility[source_index][1],
-                    source_index=source_index,
-                    selected_packet=task_packet,
-                )
-            )
-        assert Counter(item.task for item in realized) == Counter(quotas)
-        return realized
+        quota_text = ", ".join(
+            f"{task.value}={quota}" for task, quota in quotas.items()
+        )
+        failed_task = "unknown" if failed_slot is None else slots[failed_slot].value
+        raise ObjectiveQuotaUnsatisfiedError(
+            "objective quota matching failed despite aggregate eligibility; "
+            f"quotas: {quota_text}; slot={failed_task}; "
+            f"pool={len(packets)}; output_count={output_count}; "
+            f"required_assignment={required_assignment is not None}; "
+            f"required_realized_assignment={required_realized_assignment is not None}"
+        )
 
 
 @dataclass
@@ -922,6 +980,7 @@ class GraphAuxLossConfig:
     coverage_weight: float = 1.0
     pos_weight: float = 1.0
     margin: float = 1.0
+    bias_beta: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.relations or any(
@@ -945,6 +1004,8 @@ class GraphAuxLossConfig:
                 raise ValueError(f"graph auxiliary {name} must be positive")
         if not math.isfinite(float(self.margin)) or self.margin < 0.0:
             raise ValueError("graph auxiliary margin must be non-negative")
+        if not math.isfinite(float(self.bias_beta)) or self.bias_beta <= 0.0:
+            raise ValueError("graph auxiliary bias_beta must be positive")
 
 
 @dataclass(frozen=True)
@@ -1213,16 +1274,43 @@ def production_training_loss_breakdown(
     graph_config: GraphAuxLossConfig | None,
     graph_weight: float,
 ) -> ProductionTrainingLossBreakdown:
-    """Compose CE and graph terms from one hidden/indexer decoder invocation."""
+    """Compose route-conditioned CE and optional DSA indexer supervision.
 
-    if not math.isfinite(float(graph_weight)) or graph_weight <= 0.0:
-        raise ValueError("graph auxiliary global weight must be finite and positive")
-    if graph_config is None or graph_targets is None or graph_pair_mask is None:
-        raise ValueError("production graph objective requires config/targets/pair_mask")
-    if graph_weight != graph_config.global_weight:
+    Dense GQA and DSA share one route-conditioned decoder invocation.  GQA uses
+    the additive dense graph prior while retaining the full causal key set; DSA
+    may additionally request the debiased neural-indexer auxiliary loss.  A
+    caller that supplies only route tensors gets a route-conditioned LM loss;
+    a partial or mode-incompatible indexer objective raises instead of being
+    silently discarded.
+    """
+
+    if not math.isfinite(float(graph_weight)) or graph_weight < 0.0:
+        raise ValueError("graph auxiliary global weight must be finite and non-negative")
+    model_config = getattr(model, "config", None)
+    aux_values = (graph_config, graph_targets, graph_pair_mask)
+    graph_aux_requested = any(value is not None for value in aux_values)
+    if graph_aux_requested and any(value is None for value in aux_values):
         raise ValueError(
-            "graph auxiliary global weight differs from GraphAuxLossConfig: "
-            f"{graph_weight} != {graph_config.global_weight}"
+            "production graph objective requires config/targets/pair_mask together"
+        )
+    if graph_aux_requested:
+        assert graph_config is not None
+        assert graph_targets is not None
+        assert graph_pair_mask is not None
+        if graph_weight <= 0.0:
+            raise ValueError(
+                "graph auxiliary global weight must be finite and positive when "
+                "indexer supervision is configured"
+            )
+        if graph_weight != graph_config.global_weight:
+            raise ValueError(
+                "graph auxiliary global weight differs from GraphAuxLossConfig: "
+                f"{graph_weight} != {graph_config.global_weight}"
+            )
+    elif graph_weight != 0.0:
+        raise ValueError(
+            "graph auxiliary global weight must be zero when indexer supervision "
+            "is not configured"
         )
     if block_bias is None:
         raise ValueError("production graph objective requires graph route block_bias")
@@ -1233,15 +1321,21 @@ def production_training_loss_breakdown(
             "production graph objective document_ids must match input_ids shape "
             f"{tuple(input_ids.shape)}, got {tuple(document_ids.shape)}"
         )
-    model_config = getattr(model, "config", None)
     if (
         model_config is None
-        or getattr(model_config, "attention_mode", None) != "dsa"
+        or getattr(model_config, "attention_mode", None) not in {"gqa", "dsa"}
         or getattr(model_config, "require_graph_routes", None) is not True
         or getattr(model_config, "graph_routes_enabled", None) is not True
     ):
         raise ValueError(
-            "production graph objective requires active fail-closed DSA graph routes"
+            "production graph objective requires active fail-closed DSA graph routes "
+            "or active dense GQA graph routes"
+        )
+    attention_mode = str(getattr(model_config, "attention_mode"))
+    if attention_mode == "gqa" and graph_aux_requested:
+        raise ValueError(
+            "production indexer supervision requires attention_mode='dsa'; "
+            "dense GQA uses additive graph bias while retaining all eligible tokens"
         )
     if float(getattr(model_config, "structure_residual_scale", 0.0)) <= 0.0:
         raise ValueError(
@@ -1271,28 +1365,71 @@ def production_training_loss_breakdown(
             "production graph edge-kind prior must match relation prior shape "
             f"{tuple(block_bias.shape)}, got {tuple(edge_kind_bias.shape)}"
         )
+    if graph_aux_requested:
+        assert graph_config is not None
+        model_beta = getattr(model_config, "graph_attention_bias_beta", None)
+        if model_beta is None or float(model_beta) != float(graph_config.bias_beta):
+            raise ValueError(
+                "production graph bias_beta differs between objective recipe and "
+                f"model config: {graph_config.bias_beta} != {model_beta}"
+            )
     decoder_forward = getattr(model, "decoder_hidden_states", None)
     if not callable(decoder_forward):
         raise TypeError(
             "production graph objective requires model.decoder_hidden_states"
         )
-    decoder_result = decoder_forward(
-        input_ids,
-        document_ids=document_ids,
-        block_bias=block_bias,
-        edge_kind_bias=edge_kind_bias,
-        return_indexer_scores=True,
-        **side_channels,
-    )
-    if not isinstance(decoder_result, tuple) or len(decoder_result) != 2:
-        raise RuntimeError(
-            "production graph decoder did not return hidden states and indexer scores"
+    if attention_mode == "dsa":
+        decoder_result = decoder_forward(
+            input_ids,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            return_indexer_scores=True,
+            **side_channels,
         )
-    hidden_states, indexer_scores = decoder_result
-    if not isinstance(hidden_states, mx.array) or not isinstance(indexer_scores, tuple):
-        raise RuntimeError(
-            "production graph decoder returned an invalid hidden/indexer contract"
+        if not isinstance(decoder_result, tuple) or len(decoder_result) != 2:
+            raise RuntimeError(
+                "production graph decoder did not return hidden states and indexer scores"
+            )
+        hidden_states, indexer_scores = decoder_result
+        if not isinstance(hidden_states, mx.array) or not isinstance(indexer_scores, tuple):
+            raise RuntimeError(
+                "production graph decoder returned an invalid hidden/indexer contract"
+            )
+        if graph_aux_requested:
+            graph_supervision_scores = getattr(model, "graph_supervision_scores", None)
+            if not callable(graph_supervision_scores):
+                raise TypeError(
+                    "production graph objective requires model.graph_supervision_scores"
+                )
+            learned_indexer_scores = graph_supervision_scores(
+                indexer_scores,
+                input_ids=input_ids,
+                document_ids=document_ids,
+                block_bias=block_bias,
+                edge_kind_bias=edge_kind_bias,
+            )
+            if not isinstance(learned_indexer_scores, tuple):
+                raise RuntimeError(
+                    "production graph supervision returned an invalid score contract"
+                )
+        else:
+            learned_indexer_scores = ()
+    elif attention_mode == "gqa":
+        hidden_states = decoder_forward(
+            input_ids,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            **side_channels,
         )
+        if not isinstance(hidden_states, mx.array):
+            raise RuntimeError(
+                "production GQA decoder returned an invalid hidden-state contract"
+            )
+        learned_indexer_scores = ()
+    else:  # pragma: no cover - config validation should make this unreachable
+        raise ValueError(f"unsupported production graph attention mode {attention_mode!r}")
 
     if bool(getattr(model_config, "chunked_ce", False)):
         chunked_cross_entropy = getattr(model, "_chunked_cross_entropy", None)
@@ -1312,12 +1449,26 @@ def production_training_loss_breakdown(
         logits = lm_head(hidden_states)
         lm_loss = cross_entropy(logits, targets, loss_mask)
 
-    graph_breakdown = graph_auxiliary_loss_breakdown_from_targets(
-        indexer_scores,
-        graph_targets,
-        graph_pair_mask,
-        graph_config,
-    )
+    if graph_aux_requested:
+        assert graph_config is not None
+        assert graph_targets is not None
+        assert graph_pair_mask is not None
+        graph_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+            learned_indexer_scores,
+            graph_targets,
+            graph_pair_mask,
+            graph_config,
+        )
+        graph_positive_pairs = mx.sum(graph_targets.astype(mx.float32))
+    else:
+        zero = lm_loss * mx.array(0.0, dtype=lm_loss.dtype)
+        graph_breakdown = GraphAuxLossBreakdown(
+            total=zero,
+            edge_bce=zero,
+            ranking=zero,
+            layer_count=0,
+        )
+        graph_positive_pairs = mx.array(0.0, dtype=mx.float32)
     ntokens = mx.sum(loss_mask.astype(mx.float32))
     return ProductionTrainingLossBreakdown(
         total=lm_loss + graph_breakdown.total,
@@ -1325,7 +1476,7 @@ def production_training_loss_breakdown(
         graph_total=graph_breakdown.total,
         graph_edge_bce=graph_breakdown.edge_bce,
         graph_ranking=graph_breakdown.ranking,
-        graph_positive_pairs=mx.sum(graph_targets.astype(mx.float32)),
+        graph_positive_pairs=graph_positive_pairs,
         ntokens=ntokens,
         graph_layer_count=graph_breakdown.layer_count,
     )

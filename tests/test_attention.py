@@ -138,6 +138,28 @@ def test_dense_graph_bias_keeps_native_bf16_mask_dtype() -> None:
     assert float(merged[0, 0, 0, 1].item()) == float("-inf")
 
 
+def test_dense_graph_bias_is_additive_without_pruning_eligible_gqa_keys() -> None:
+    graph_bias = mx.zeros((1, 4, 4), dtype=mx.float32)
+    graph_bias[0, 3, 0] = mx.array(2.5, dtype=mx.float32)
+
+    merged = _merge_dense_attention_bias(
+        "causal",
+        graph_bias,
+        batch_size=1,
+        num_heads=2,
+        query_length=4,
+        key_length=4,
+        target_dtype=mx.float32,
+    )
+    assert isinstance(merged, mx.array)
+    mx.eval(merged)
+
+    row = np.asarray(merged[0, 0, 3])
+    assert np.isfinite(row).all()
+    np.testing.assert_array_equal(row, np.array([2.5, 0.0, 0.0, 0.0]))
+    assert float(merged[0, 0, 1, 2].item()) == float("-inf")
+
+
 def test_bf16_attention_executes_with_native_graph_bias() -> None:
     attention = CausalSelfAttention(
         AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")

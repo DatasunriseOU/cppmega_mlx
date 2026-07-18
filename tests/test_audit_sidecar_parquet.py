@@ -233,7 +233,10 @@ def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     assert report["total"]["edge_count"]["token_call_edges"] == 3
     assert report["total"]["edge_count"]["token_type_edges"] == 3
     assert report["total"]["edge_count"]["token_domain_edges"] == 0
-    assert report["status"] == "passed"
+    assert report["status"] == "verified"
+    # The nested receipt preserves the existing CASE5 diagnostic status while
+    # the top-level v2 envelope uses the canonical manifest status vocabulary.
+    assert report["receipt"]["status"] == "passed"
     assert report["receipt"]["successful"] is True
     assert report["receipt"]["contract"] == "cppmega_case5_domain_routes_v1"
     assert report["receipt"]["domain_schema_sha256"] == DOMAIN_SCHEMA_SHA256

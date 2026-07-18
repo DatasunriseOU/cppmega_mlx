@@ -16,12 +16,38 @@ standard S3 client environment only for the subprocess.
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Iterable
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.sidecar_manifest_contract import (
+    AUDIT_FILENAME,
+    AUDIT_REMOTE,
+    AUDIT_SCHEMA,
+    GRAPH_CONTRACT,
+    MANIFEST_SCHEMA,
+    OBJECTIVE_CONTRACT,
+    build_semantic_audit_binding,
+    contained_path,
+    finalize_manifest,
+    inventory_directory,
+    inventory_sha256,
+    resolve_s3_env,
+    selection_policy,
+    sha256_file,
+    validate_audit_receipt,
+    validate_semantic_audit_receipt_binding,
+    write_json_atomic,
+)
 
 
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
@@ -76,17 +102,7 @@ def _load_env_file(path: Path) -> None:
 
 
 def _s3_env() -> dict[str, str]:
-    env = os.environ.copy()
-    access_key = env.get("NEBIUS_S3_ACCESS_KEY_ID") or env.get("AWS_ACCESS_KEY_ID")
-    secret_key = env.get("NEBIUS_S3_SECRET_ACCESS_KEY") or env.get("AWS_SECRET_ACCESS_KEY")
-    if not access_key or not secret_key:
-        raise SystemExit(
-            "missing Nebius S3 credentials: export NEBIUS_S3_ACCESS_KEY_ID "
-            "and NEBIUS_S3_SECRET_ACCESS_KEY for Nebius Object Storage."
-        )
-    env["AWS_ACCESS_KEY_ID"] = access_key
-    env["AWS_SECRET_ACCESS_KEY"] = secret_key
-    return env
+    return resolve_s3_env(os.environ)
 
 
 def _selection_items(
@@ -148,6 +164,10 @@ def _load_verified_token_total(
     merged: dict[str, dict] = {}
     for path in audit_receipts:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("schema") != AUDIT_SCHEMA or data.get("status") != "verified":
+            raise SystemExit(
+                f"audit receipt is not a schema-bound verified receipt: {path}"
+            )
         by_kind_bucket = data.get("by_kind_bucket")
         if not isinstance(by_kind_bucket, dict):
             raise SystemExit(f"audit receipt missing by_kind_bucket map: {path}")
@@ -185,7 +205,7 @@ def _existing_sources(selections: tuple[tuple[str, Path], ...]) -> list[tuple[st
     missing: list[str] = []
     out: list[tuple[str, Path]] = []
     for remote, local in selections:
-        if not local.exists():
+        if local.is_symlink() or not local.is_dir():
             missing.append(str(local))
         else:
             out.append((remote, local))
@@ -235,8 +255,10 @@ def _upload_manifest(
     manifest_path: Path,
     dry_run: bool,
     env: dict[str, str] | None,
-) -> None:
+) -> dict[str, object]:
     target = f"s3://{bucket}/{prefix.rstrip('/')}/manifest.json"
+    digest = sha256_file(manifest_path)
+    size = manifest_path.stat().st_size
     _run(
         [
             "aws",
@@ -246,12 +268,143 @@ def _upload_manifest(
             target,
             "--endpoint-url",
             endpoint_url,
+            "--metadata",
+            f"sha256={digest}",
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            base64.b64encode(bytes.fromhex(digest)).decode("ascii"),
             "--only-show-errors",
             "--no-progress",
         ],
         dry_run=dry_run,
         env=env,
     )
+    if dry_run:
+        return {"status": "dry_run", "size": size, "sha256": digest}
+    result = subprocess.run(
+        [
+            "aws",
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            f"{prefix.rstrip('/')}/manifest.json",
+            "--endpoint-url",
+            endpoint_url,
+            "--checksum-mode",
+            "ENABLED",
+            "--output",
+            "json",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"manifest HEAD failed after upload: {result.stderr.strip()}")
+    head = json.loads(result.stdout)
+    metadata = {
+        str(key).lower(): value for key, value in (head.get("Metadata") or {}).items()
+    }
+    expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    if (
+        int(head.get("ContentLength", -1)) != size
+        or metadata.get("sha256") != digest
+        or head.get("ChecksumSHA256") != expected_checksum
+        or head.get("ChecksumType") != "FULL_OBJECT"
+    ):
+        raise RuntimeError("uploaded manifest lacks exact full-object SHA-256 verification")
+    return {
+        "status": "verified",
+        "size": size,
+        "sha256": digest,
+        "checksum_sha256": head["ChecksumSHA256"],
+    }
+
+
+def _audit_selected_parquet_files(
+    inventory: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Run the existing semantic parquet auditor over the exact inventory."""
+
+    try:
+        from scripts.audit_sidecar_parquet import _audit_file
+    except Exception as exc:
+        raise SystemExit(
+            f"cannot load semantic parquet auditor for manifest publication: {exc}"
+        ) from exc
+
+    audited: list[dict[str, object]] = []
+    for selection in inventory:
+        remote = str(selection["remote"])
+        if not remote.startswith("parquet/"):
+            continue
+        kind, bucket = remote.removeprefix("parquet/").split("/", 1)
+        local_root = Path(str(selection["local"]))
+        files = selection.get("files")
+        if not isinstance(files, list):
+            raise SystemExit(f"manifest inventory lacks file records for {remote}")
+        for record in files:
+            if not isinstance(record, dict):
+                raise SystemExit(f"manifest inventory file record is invalid for {remote}")
+            relative = str(record["path"])
+            parquet_path = contained_path(
+                local_root,
+                relative,
+                where=f"semantic audit file for {remote}",
+            )
+            try:
+                result = _audit_file(str(parquet_path), kind, bucket, 65536)
+            except Exception as exc:
+                raise SystemExit(
+                    f"semantic parquet audit failed for {remote}/{relative}: {exc}"
+                ) from exc
+            stats = result.get("stats")
+            if not isinstance(stats, dict):
+                raise SystemExit(
+                    f"semantic parquet audit returned no stats for {remote}/{relative}"
+                )
+            if (
+                int(stats.get("files", -1)) != 1
+                or int(stats.get("bad_files", -1))
+                or int(stats.get("bad_rows", -1))
+            ):
+                raise SystemExit(
+                    f"semantic parquet audit is not green for {remote}/{relative}: "
+                    f"files={stats.get('files')} bad_files={stats.get('bad_files')} "
+                    f"bad_rows={stats.get('bad_rows')}"
+                )
+            audited.append(
+                {
+                    "remote": remote,
+                    "path": relative,
+                    "size": record["size"],
+                    "sha256": record["sha256"],
+                    "stats": stats,
+                }
+            )
+    if not audited:
+        raise SystemExit("semantic parquet audit selected no files")
+    return audited
+
+
+def _assert_inventory_stable(inventory: list[dict[str, object]]) -> None:
+    """Reject source changes between inventory hashing and publication."""
+
+    for selection in inventory:
+        current = inventory_directory(
+            Path(str(selection["local"])),
+            remote=str(selection["remote"]),
+        )
+        for field in ("files", "file_count", "byte_count", "artifact_set_sha256"):
+            if current[field] != selection[field]:
+                raise SystemExit(
+                    f"selection inventory changed during semantic audit: "
+                    f"{selection['remote']} ({field})"
+                )
 
 
 def _write_manifest(
@@ -264,8 +417,65 @@ def _write_manifest(
     selections: tuple[tuple[str, Path], ...],
     audit_receipts: tuple[Path, ...],
     include_standalone_pr: bool,
-) -> None:
+) -> dict[str, object]:
+    selected_keys = _selected_bucket_keys(selections)
+    if len(audit_receipts) != 1:
+        raise SystemExit("exactly one final audit receipt is required")
+    audit_path = audit_receipts[0]
+    audit_payload = validate_audit_receipt(
+        json.loads(audit_path.read_text(encoding="utf-8")),
+        selected_keys=selected_keys,
+    )
+    inventory: list[dict[str, object]] = []
+    for remote, local in selections:
+        record = inventory_directory(local, remote=remote)
+        inventory.append(
+            {
+                "remote": remote,
+                "local": local.as_posix(),
+                **record,
+            }
+        )
+        key = remote.removeprefix("parquet/") if remote.startswith("parquet/") else None
+        if key is not None:
+            expected_files = int(audit_payload["by_kind_bucket"][key]["files"])
+            if int(record["file_count"]) != expected_files:
+                raise SystemExit(
+                    f"inventory file count for {remote}={record['file_count']} "
+                    f"differs from audit receipt={expected_files}"
+                )
+    audit_selection = next(
+        selection for selection in inventory if selection["remote"] == AUDIT_REMOTE
+    )
+    audit_file = next(
+        record
+        for record in audit_selection["files"]
+        if record["path"] == AUDIT_FILENAME
+    )
+    if audit_file["sha256"] != sha256_file(audit_path):
+        raise SystemExit("audit receipt inventory SHA-256 drifted during manifest build")
+    audited_files = _audit_selected_parquet_files(inventory)
+    _assert_inventory_stable(inventory)
+    semantic_audit = build_semantic_audit_binding(
+        selections=inventory,
+        audited_files=audited_files,
+        source_receipt_sha256=str(audit_file["sha256"]),
+    )
+    try:
+        validate_semantic_audit_receipt_binding(
+            semantic_audit,
+            audit_payload,
+            selected_keys=selected_keys,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if int(semantic_audit["verified_valid_tokens"]) != token_total:
+        raise SystemExit(
+            "fresh semantic audit valid-token total differs from selected "
+            "audit receipt total"
+        )
     payload = {
+        "schema": MANIFEST_SCHEMA,
         "bucket": bucket,
         "prefix": prefix,
         "endpoint_url": endpoint_url,
@@ -276,20 +486,26 @@ def _write_manifest(
             else "code_commits_integrated_pr"
         ),
         "standalone_pr_included": include_standalone_pr,
-        "selections": [
-            {"remote": remote, "local": str(local)}
-            for remote, local in selections
-        ],
-        "audit_receipts": [str(path) for path in audit_receipts],
-        "excluded": [],
+        "selections": inventory,
+        "inventory_sha256": inventory_sha256(inventory),
+        "selection_policy": selection_policy(
+            [remote for remote, _local in selections],
+            include_standalone_pr=include_standalone_pr,
+        ),
+        "audit_receipt": {
+            "schema": AUDIT_SCHEMA,
+            "status": "verified",
+            "remote": AUDIT_REMOTE,
+            "path": AUDIT_FILENAME,
+            "sha256": audit_file["sha256"],
+        },
+        "semantic_audit": semantic_audit,
+        "graph_contract": GRAPH_CONTRACT,
+        "objective_contract": OBJECTIVE_CONTRACT,
     }
-    if not include_standalone_pr:
-        payload["excluded"].append(
-            "outputs/reindexed_pr/* (standalone PR diagnostics; PR text is "
-            "integrated into commit docstrings)"
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    manifest = finalize_manifest(payload)
+    write_json_atomic(path, manifest)
+    return manifest
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -319,63 +535,104 @@ def main(argv: Iterable[str] | None = None) -> int:
         ),
     )
     args = ap.parse_args(argv)
-    if args.include_standalone_pr and args.code_commits_only:
-        raise SystemExit("--include-standalone-pr conflicts with --code-commits-only")
-    _load_env_file(args.env_file)
-
-    selections = _selection_items(include_standalone_pr=args.include_standalone_pr)
-    audit_receipts = _audit_receipts()
-    token_total = _load_verified_token_total(audit_receipts, selections)
-    sources = _existing_sources(selections)
-    _write_manifest(
-        args.manifest,
-        bucket=args.bucket,
-        prefix=args.prefix,
-        endpoint_url=args.endpoint_url,
-        token_total=token_total,
-        selections=selections,
-        audit_receipts=audit_receipts,
-        include_standalone_pr=args.include_standalone_pr,
-    )
-    print(
-        json.dumps(
-            {
-                "verified_valid_tokens": token_total,
-                "sources": len(sources),
-                "manifest": str(args.manifest),
-                "dry_run": args.dry_run,
-            },
-            indent=2,
-        )
-    )
-
-    s3_env = None if args.dry_run else _s3_env()
-
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = [
-            pool.submit(
-                _sync_one,
-                endpoint_url=args.endpoint_url,
-                bucket=args.bucket,
-                prefix=args.prefix,
-                remote=remote,
-                local=local,
-                dry_run=args.dry_run,
-                env=s3_env,
+    receipt_path = args.manifest.with_name("sidecar_upload_receipt.json")
+    receipt = {
+        "schema": "cppmega_sidecar_upload_receipt_v1",
+        "status": "starting",
+        "bucket": args.bucket,
+        "prefix": args.prefix.rstrip("/"),
+        "endpoint_url": args.endpoint_url,
+        "manifest": str(args.manifest),
+        "data_object_verification": {
+            "status": "pending",
+            "completion_gate": "schema_bound_download_receipt",
+        },
+    }
+    write_json_atomic(receipt_path, receipt)
+    try:
+        if args.jobs <= 0:
+            raise ValueError("jobs must be positive")
+        if args.include_standalone_pr and args.code_commits_only:
+            raise SystemExit(
+                "--include-standalone-pr conflicts with --code-commits-only"
             )
-            for remote, local in sources
-        ]
-        for future in as_completed(futures):
-            print(f"synced {future.result()}", flush=True)
+        _load_env_file(args.env_file)
 
-    _upload_manifest(
-        endpoint_url=args.endpoint_url,
-        bucket=args.bucket,
-        prefix=args.prefix,
-        manifest_path=args.manifest,
-        dry_run=args.dry_run,
-        env=s3_env,
-    )
+        selections = _selection_items(
+            include_standalone_pr=args.include_standalone_pr
+        )
+        audit_receipts = _audit_receipts()
+        token_total = _load_verified_token_total(audit_receipts, selections)
+        sources = _existing_sources(selections)
+        manifest = _write_manifest(
+            args.manifest,
+            bucket=args.bucket,
+            prefix=args.prefix,
+            endpoint_url=args.endpoint_url,
+            token_total=token_total,
+            selections=selections,
+            audit_receipts=audit_receipts,
+            include_standalone_pr=args.include_standalone_pr,
+        )
+        receipt.update(
+            {
+                "status": "dry_run" if args.dry_run else "prepared",
+                "manifest_payload_sha256": manifest["manifest_payload_sha256"],
+                "inventory_sha256": manifest["inventory_sha256"],
+                "data_object_verification": {
+                    "status": "manifest_bound",
+                    "completion_gate": "schema_bound_download_receipt",
+                },
+            }
+        )
+        write_json_atomic(receipt_path, receipt)
+        print(
+            json.dumps(
+                {
+                    "verified_valid_tokens": token_total,
+                    "sources": len(sources),
+                    "manifest": str(args.manifest),
+                    "dry_run": args.dry_run,
+                },
+                indent=2,
+            )
+        )
+
+        s3_env = None if args.dry_run else _s3_env()
+
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futures = [
+                pool.submit(
+                    _sync_one,
+                    endpoint_url=args.endpoint_url,
+                    bucket=args.bucket,
+                    prefix=args.prefix,
+                    remote=remote,
+                    local=local,
+                    dry_run=args.dry_run,
+                    env=s3_env,
+                )
+                for remote, local in sources
+            ]
+            for future in as_completed(futures):
+                print(f"synced {future.result()}", flush=True)
+
+        manifest_verification = _upload_manifest(
+            endpoint_url=args.endpoint_url,
+            bucket=args.bucket,
+            prefix=args.prefix,
+            manifest_path=args.manifest,
+            dry_run=args.dry_run,
+            env=s3_env,
+        )
+    except (Exception, SystemExit) as error:
+        receipt["status"] = "failed"
+        receipt["error"] = f"{type(error).__name__}: {error}"
+        write_json_atomic(receipt_path, receipt)
+        raise
+    receipt["status"] = "manifest_verified" if not args.dry_run else "dry_run"
+    receipt["manifest_verification"] = manifest_verification
+    write_json_atomic(receipt_path, receipt)
     return 0
 
 

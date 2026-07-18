@@ -68,6 +68,7 @@ from cppmega_mlx.training.objective_mixer import (
     production_training_loss,
     RealizedObjective,
 )
+from cppmega_mlx.training.objective_schedule import CanonicalObjectivePlanner
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     OBJECTIVE_CONTRACT_SCHEMA,
@@ -360,6 +361,40 @@ def test_packed_megatron_row_adapts_valid_prefix_and_real_objective_sections() -
     assert np.asarray(source.commit_packet.diff_token_ids).tolist() == [30, 31]
     assert source.commit_packet.change_mask_pre is None
     assert source.commit_packet.change_mask_post is None
+
+
+def test_packed_row_rejects_non_integral_counts() -> None:
+    with pytest.raises(ValueError, match="valid_token_count.*integer"):
+        normalize_megatron_objective_source_row(
+            {
+                INPUT_IDS_COLUMN: [1, 2, 3, 4],
+                VALID_TOKEN_COUNT_COLUMN: 3.5,
+            },
+            source_index=0,
+        )
+
+    with pytest.raises(ValueError, match="num_docs.*integer"):
+        normalize_megatron_objective_source_row(
+            {
+                INPUT_IDS_COLUMN: [1, 2, 3, 4],
+                VALID_TOKEN_COUNT_COLUMN: 4,
+                NUM_DOCS_COLUMN: 1.5,
+                SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: [[50]],
+            },
+            source_index=0,
+        )
+
+
+def test_packed_and_typed_token_columns_cannot_be_ambiguous() -> None:
+    with pytest.raises(ValueError, match="both token_ids and packed"):
+        normalize_megatron_objective_source_row(
+            {
+                "token_ids": [1, 2],
+                INPUT_IDS_COLUMN: [3, 4],
+                VALID_TOKEN_COUNT_COLUMN: 2,
+            },
+            source_index=0,
+        )
 
 
 def test_packed_commit_candidates_bind_exact_constituent_provenance() -> None:
@@ -879,6 +914,7 @@ def test_production_batch_window_preserves_exact_task_quotas() -> None:
         seq_len=32,
         quota_window_samples=10,
         seed=23,
+        require_route_sidecars=False,
     )
 
     window = [next(batches) for _ in range(5)]
@@ -1262,7 +1298,6 @@ def test_transformed_objective_rejects_context_without_safe_physical_middle() ->
     end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
     tokens = [2, start, 10, 20, 11, 21, 12, 22, end, 3]
     token_count = len(tokens)
-    zeros = _arr([0] * token_count)
     packet = CodePacket(
         token_ids=_arr(tokens),
         document_ids=_arr([1] * token_count),
@@ -1371,13 +1406,20 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
 
     assert float(graph_loss.item()) > 0.0
     assert abs(float(total.item()) - float((lm_loss + graph_loss).item())) < 1e-6
+    final_indexer_scores = model.indexer_scores(
+        input_ids,
+        document_ids=document_ids,
+        block_bias=graph_targets,
+        edge_kind_bias=edge_kind_bias,
+        **structure_sidecars,
+    )
     unweighted_graph_loss = graph_auxiliary_loss_from_targets(
-        model.indexer_scores(
-            input_ids,
+        model.graph_supervision_scores(
+            final_indexer_scores,
+            input_ids=input_ids,
             document_ids=document_ids,
             block_bias=graph_targets,
             edge_kind_bias=edge_kind_bias,
-            **structure_sidecars,
         ),
         graph_targets,
         pair_mask,
@@ -1455,7 +1497,7 @@ def test_production_loss_rejects_non_finite_graph_weight_before_forward() -> Non
         "message",
     ),
     (
-        ("gqa", True, True, 1.0, "active fail-closed DSA graph routes"),
+        ("gqa", True, True, 1.0, "indexer supervision requires attention_mode='dsa'"),
         ("dsa", False, True, 1.0, "active fail-closed DSA graph routes"),
         ("dsa", True, False, 1.0, "active fail-closed DSA graph routes"),
         ("dsa", True, True, 0.0, "active structure residual routing"),
@@ -1695,6 +1737,11 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
     assert contract["graph_auxiliary"]["indexer_weight"] == "1/1000"
     assert contract["graph_auxiliary"]["layer_weight"] == "1"
     assert contract["graph_auxiliary"]["layer_reduction"] == "sum"
+    assert contract["graph_auxiliary"]["bias_beta"] == "1"
+    assert contract["graph_auxiliary"]["score_formula"] == (
+        "i_neural_plus_beta_s_graph_v1"
+    )
+    assert contract["graph_auxiliary"]["score_stage"] == "before_topk"
     assert contract["graph_auxiliary"]["pair_mask"] == (
         "causal_same_document_upstream_v1"
     )
@@ -1883,9 +1930,31 @@ def test_materialized_document_serializes_with_production_arrow_schema() -> None
 def test_canonical_objective_artifact_binds_contract_shards_and_converter(
     tmp_path: Path,
 ) -> None:
+    code = CodePacket(
+        **{
+            **_code_packet().__dict__,
+            "call_edges": EdgeIndex.from_pairs(
+                [(1, 0)], relation="call", num_nodes=3
+            ),
+            "type_edges": EdgeIndex.from_pairs([], relation="type", num_nodes=3),
+        }
+    )
+    planner = CanonicalObjectivePlanner(
+        mixer=EligibilityAwareTaskMixer({TaskKind.CAUSAL_LM: 1.0}, seed=17),
+        source_iter=iter(
+            [ObjectiveSource(code_packet=code), ObjectiveSource(code_packet=code)]
+        ),
+        quota_window_samples=2,
+        quota_lookahead_samples=0,
+        graph_relations=STAGE1_GRAPH_RELATIONS,
+        require_route_sidecars=False,
+    )
+    planner.plan_window(start_step=0)
     contract = {
         "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "quota_window_samples": 2,
         "totals": {"samples": 2},
+        "source_selection": planner.source_selection_receipt(output_samples=2),
         "materialization": {
             "format": "shifted_lm_document_v1",
             "token_column": "input_ids",
@@ -1926,7 +1995,8 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
-    assert artifact["schema"] == OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA
+    assert artifact["schema"] == "cppmega_objective_materialization_artifact_v2"
+    assert artifact["graph_recipe"] == stage1_graph_recipe_binding()
     assert artifact["documents"] == 2
     assert artifact["objective_contract"]["path"] == "objective_contract.json"
     assert (

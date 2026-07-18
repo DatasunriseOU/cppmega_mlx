@@ -17,13 +17,13 @@ from cppmega_mlx.training.objective_mixer import (
 from cppmega_mlx.training.stage1_production import (
     Stage1ProductionObjective,
     _stage1_objective_batch,
+    stage1_production_batch_receipt,
     stage1_production_config,
 )
 
 
-def _model_config():
-    return stage1_production_config(
-        attention_mode="dsa",
+def _model_config(*, attention_mode: str | None = "dsa"):
+    kwargs: dict[str, object] = dict(
         vocab_size=64,
         hidden_size=32,
         depth=1,
@@ -39,6 +39,9 @@ def _model_config():
         ngram_hash_enabled=False,
         platform_residual_scale=0.0,
     )
+    if attention_mode is not None:
+        kwargs["attention_mode"] = attention_mode
+    return stage1_production_config(**kwargs)
 
 
 def _production_batch_rows(
@@ -139,6 +142,16 @@ def _gradient_l1(gradients: object, *name_fragments: str) -> float:
     return sum(float(value.item()) for value in values)
 
 
+def _gradient_array(gradients: object, name_fragment: str) -> mx.array:
+    arrays = [
+        value
+        for name, value in tree_flatten(gradients)
+        if isinstance(value, mx.array) and name_fragment in name
+    ]
+    assert len(arrays) == 1, (name_fragment, len(arrays))
+    return arrays[0]
+
+
 def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None:
     objective = Stage1ProductionObjective()
     batch = _production_batch(with_edge=True)
@@ -168,7 +181,99 @@ def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None
         float((breakdown.lm_ce + breakdown.graph_total).item()),
         rel=1e-6,
     )
-    assert objective.receipt()["single_decoder_forward"] is True
+    dsa_receipt = objective.receipt(attention_mode="dsa")
+    assert dsa_receipt["single_decoder_forward"] is True
+    assert dsa_receipt["graph_auxiliary_enabled"] is True
+    assert dsa_receipt["route_only"] is False
+
+
+def test_stage1_gqa_graph_route_changes_logits_loss_and_gradients() -> None:
+    objective = Stage1ProductionObjective()
+    graph_batch = _production_batch(with_edge=True)
+    empty_batch = _production_batch(with_edge=False)
+    mx.random.seed(211)
+    model = DenseCppLM(_model_config(attention_mode="gqa"))
+    graph_values = _stage1_objective_batch(graph_batch)
+    empty_values = _stage1_objective_batch(empty_batch)
+
+    graph_logits = model.logits(
+        graph_values.input_ids,
+        document_ids=graph_values.document_ids,
+        block_bias=graph_values.relation_bias,
+        edge_kind_bias=graph_values.edge_kind_bias,
+        **graph_values.side_channels,
+    )
+    empty_logits = model.logits(
+        empty_values.input_ids,
+        document_ids=empty_values.document_ids,
+        block_bias=empty_values.relation_bias,
+        edge_kind_bias=empty_values.edge_kind_bias,
+        **empty_values.side_channels,
+    )
+    graph_loss_and_grad = nn.value_and_grad(
+        model,
+        lambda: objective.loss_breakdown(model, graph_batch).total,
+    )
+    empty_loss_and_grad = nn.value_and_grad(
+        model,
+        lambda: objective.loss_breakdown(model, empty_batch).total,
+    )
+    graph_loss, graph_gradients = graph_loss_and_grad()
+    empty_loss, empty_gradients = empty_loss_and_grad()
+    graph_q_grad = _gradient_array(
+        graph_gradients, "layers.0.attention.q_proj.weight"
+    )
+    empty_q_grad = _gradient_array(
+        empty_gradients, "layers.0.attention.q_proj.weight"
+    )
+    mx.eval(
+        graph_logits,
+        empty_logits,
+        graph_loss,
+        empty_loss,
+        graph_q_grad,
+        empty_q_grad,
+    )
+
+    assert float(mx.sum(mx.abs(graph_logits - empty_logits)).item()) > 1e-5
+    assert abs(float(graph_loss.item()) - float(empty_loss.item())) > 1e-6
+    assert float(mx.sum(mx.abs(graph_q_grad - empty_q_grad)).item()) > 1e-6
+    graph_breakdown = objective.loss_breakdown(model, graph_batch)
+    mx.eval(graph_breakdown.graph_total, graph_breakdown.graph_positive_pairs)
+    assert float(graph_breakdown.graph_total.item()) == 0.0
+    assert float(graph_breakdown.graph_positive_pairs.item()) == 0.0
+    assert graph_breakdown.graph_layer_count == 0
+
+
+def test_stage1_default_gqa_receipt_separates_route_signal_from_graph_auxiliary() -> None:
+    objective = Stage1ProductionObjective()
+    batch = _production_batch(with_edge=True)
+    model = DenseCppLM(_model_config(attention_mode=None))
+
+    assert model.config.attention_mode == "gqa"
+    breakdown = objective.loss_breakdown(model, batch)
+    batch_receipt = stage1_production_batch_receipt(batch, config=model.config)
+    loss_receipt = objective.receipt(attention_mode=model.config.attention_mode)
+    mx.eval(
+        breakdown.graph_total,
+        breakdown.graph_positive_pairs,
+        breakdown.graph_edge_bce,
+        breakdown.graph_ranking,
+    )
+
+    assert float(breakdown.graph_total.item()) == 0.0
+    assert float(breakdown.graph_positive_pairs.item()) == 0.0
+    assert float(breakdown.graph_edge_bce.item()) == 0.0
+    assert float(breakdown.graph_ranking.item()) == 0.0
+    assert breakdown.graph_layer_count == 0
+    assert batch_receipt["graph_route_positive_pairs"] == 1
+    assert batch_receipt["graph_supervision_positive_pairs"] == 0
+    assert "graph_positive_pairs" not in batch_receipt
+    assert loss_receipt["name"] == "gqa_route_only_lm_ce"
+    assert loss_receipt["formula"] == "lm_ce"
+    assert loss_receipt["graph_auxiliary_enabled"] is False
+    assert loss_receipt["graph_supervision"] == "none"
+    assert loss_receipt["route_only"] is True
 
 
 def test_stage1_self_chunk_targets_are_intersected_with_causal_pair_mask() -> None:
@@ -317,3 +422,107 @@ def test_stage1_combined_loss_reaches_model_and_graph_indexer_parameters() -> No
     assert metrics.updated is True
     assert metrics.ntokens == 5
     assert metrics.loss > 0.0
+
+
+def test_stage1_graph_loss_trains_neural_indexer_not_fixed_route_beta() -> None:
+    objective = Stage1ProductionObjective()
+    batch = _production_batch(with_edge=True)
+    model = DenseCppLM(_model_config())
+    objective.validate_batch(batch)
+
+    loss_and_grad = nn.value_and_grad(
+        model,
+        lambda: objective.loss_breakdown(model, batch).graph_total,
+    )
+    graph_loss, gradients = loss_and_grad()
+    mx.eval(graph_loss, gradients)
+
+    assert float(graph_loss.item()) > 0.0
+    assert _gradient_l1(
+        gradients,
+        "index_q_proj",
+        "index_k_proj",
+        "index_head_weights",
+    ) > 0.0
+    # ``index_beta`` is a fixed checkpoint-visible route coefficient. It is
+    # deliberately absent from MLX's trainable gradient tree so AdamW cannot
+    # move it through weight decay; older implementations exposed a zero
+    # gradient entry instead.
+    beta_gradients = [
+        value
+        for name, value in tree_flatten(gradients)
+        if isinstance(value, mx.array) and "index_beta" in name
+    ]
+    assert not beta_gradients
+
+
+def test_stage1_graph_loss_excludes_fixed_relation_and_kind_priors() -> None:
+    objective = Stage1ProductionObjective()
+    batch = _production_batch(with_edge=True)
+    model = DenseCppLM(_model_config())
+    attention = model.layers[0].attention
+    attention.index_q_proj.weight = mx.zeros_like(attention.index_q_proj.weight)
+    attention.index_k_proj.weight = mx.zeros_like(attention.index_k_proj.weight)
+    attention.index_beta = mx.array([4.0], dtype=mx.float32)
+    values = _stage1_objective_batch(batch)
+
+    decoder_result = model.decoder_hidden_states(
+        values.input_ids,
+        document_ids=values.document_ids,
+        block_bias=values.relation_bias,
+        edge_kind_bias=values.edge_kind_bias,
+        return_indexer_scores=True,
+        **values.side_channels,
+    )
+    assert isinstance(decoder_result, tuple)
+    _hidden_states, final_scores = decoder_result
+    learned_scores = model.graph_supervision_scores(
+        final_scores,
+        input_ids=values.input_ids,
+        document_ids=values.document_ids,
+        block_bias=values.relation_bias,
+        edge_kind_bias=values.edge_kind_bias,
+    )
+    raw_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+        final_scores,
+        values.graph_targets,
+        values.graph_pair_mask,
+        objective.graph_config,
+    )
+    learned_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+        learned_scores,
+        values.graph_targets,
+        values.graph_pair_mask,
+        objective.graph_config,
+    )
+    production_breakdown = objective.loss_breakdown(model, batch)
+    mx.eval(
+        final_scores,
+        learned_scores,
+        raw_breakdown.total,
+        learned_breakdown.total,
+        production_breakdown.graph_total,
+    )
+
+    eligible = values.graph_targets > 0
+    route_bias = values.relation_bias + values.edge_kind_bias
+    expected_delta = mx.where(eligible, 4.0 * route_bias, mx.zeros_like(route_bias))
+    observed_delta = mx.where(
+        eligible,
+        final_scores[0] - learned_scores[0],
+        mx.zeros_like(route_bias),
+    )
+    mx.eval(expected_delta, observed_delta)
+
+    assert float(mx.sum(mx.abs(observed_delta - expected_delta)).item()) == pytest.approx(
+        0.0,
+        abs=1e-6,
+    )
+    assert float(raw_breakdown.total.item()) != pytest.approx(
+        float(learned_breakdown.total.item()),
+        abs=1e-6,
+    )
+    assert float(production_breakdown.graph_total.item()) == pytest.approx(
+        float(learned_breakdown.total.item()),
+        rel=1e-6,
+    )

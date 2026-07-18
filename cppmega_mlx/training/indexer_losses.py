@@ -32,6 +32,10 @@ import mlx.core as mx
 import numpy as np
 
 from cppmega_mlx.data.batch import batch_values_are_prevalidated
+from cppmega_mlx.nn.code_graph_routes import (
+    apply_graph_route_prior,
+    remove_graph_route_prior,
+)
 
 _EPS = 1e-9
 _NEG_INF = -1e9
@@ -275,52 +279,20 @@ def apply_graph_indexer_bias(
         beta: scalar learnable/fixed graph-prior weight.
     """
 
-    B, Tq, Sblk = _check_block_scores(
-        indexer_scores, where="apply_graph_indexer_bias"
-    )
-    if graph_bias.ndim == 2:
-        if tuple(graph_bias.shape) != (Tq, Sblk):
-            raise ValueError(
-                "apply_graph_indexer_bias: 2-D graph_bias must be "
-                f"({Tq},{Sblk}), got {tuple(graph_bias.shape)}"
-            )
-        bias = mx.broadcast_to(graph_bias[None, :, :], (B, Tq, Sblk))
-    elif graph_bias.ndim == 3:
-        gB, gTq, gSblk = (int(x) for x in graph_bias.shape)
-        if (gTq, gSblk) != (Tq, Sblk):
-            raise ValueError(
-                "apply_graph_indexer_bias: graph_bias trailing shape must be "
-                f"({Tq},{Sblk}), got {tuple(graph_bias.shape)}"
-            )
-        if gB == B:
-            bias = graph_bias
-        elif gB == 1:
-            bias = mx.broadcast_to(graph_bias, (B, Tq, Sblk))
-        else:
-            raise ValueError(
-                "apply_graph_indexer_bias: graph_bias batch must be 1 or "
-                f"{B}, got {gB}"
-            )
-    else:
-        raise ValueError(
-            "apply_graph_indexer_bias: graph_bias must be 2-D or 3-D, got "
-            f"{tuple(graph_bias.shape)}"
-        )
+    _check_block_scores(indexer_scores, where="apply_graph_indexer_bias")
+    return apply_graph_route_prior(indexer_scores, graph_bias, beta=beta)
 
-    beta_arr = (
-        beta
-        if isinstance(beta, mx.array)
-        else mx.array(float(beta), dtype=mx.float32)
-    )
-    if beta_arr.ndim != 0:
-        raise ValueError(
-            "apply_graph_indexer_bias: beta must be a scalar, got "
-            f"{tuple(beta_arr.shape)}"
-        )
-    logits = indexer_scores.astype(mx.float32)
-    valid = logits > (_NEG_INF / 2.0)
-    biased = logits + beta_arr.astype(mx.float32) * bias.astype(mx.float32)
-    return mx.where(valid, biased, mx.array(_NEG_INF, dtype=mx.float32))
+
+def remove_graph_indexer_bias(
+    final_scores: mx.array,
+    graph_bias: mx.array,
+    *,
+    beta: mx.array | float = 1.0,
+) -> mx.array:
+    """Return neural indexer logits by removing the fixed graph route prior."""
+
+    _check_block_scores(final_scores, where="remove_graph_indexer_bias")
+    return remove_graph_route_prior(final_scores, graph_bias, beta=beta)
 
 
 def select_graph_biased_topk(
@@ -531,6 +503,7 @@ __all__ = [
     "indexer_edge_bce_loss",
     "indexer_coverage_hinge_loss",
     "apply_graph_indexer_bias",
+    "remove_graph_indexer_bias",
     "select_graph_biased_topk",
     "recall_at_k",
     "dense_attn_topk_overlap",

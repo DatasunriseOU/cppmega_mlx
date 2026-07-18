@@ -16,11 +16,31 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 from typing import Iterable
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.sidecar_manifest_contract import (
+    AUDIT_FILENAME,
+    AUDIT_REMOTE,
+    MANIFEST_SCHEMA,
+    contained_path,
+    resolve_s3_env,
+    validate_audit_receipt,
+    validate_manifest,
+    validate_semantic_audit_receipt_binding,
+    verify_inventory,
+    write_json_atomic,
+)
 
 
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
@@ -28,8 +48,8 @@ DEFAULT_PREFIX = "cppmega-sidecar/code-commits-integrated-pr-20260627"
 
 # The audit receipt is downloaded as one of the selections; this is the remote
 # subprefix and the JSON filename the producer (audit_sidecar_parquet.py) writes.
-RECEIPT_REMOTE = "audits/sidecar_audit_all_final_poststop_valid"
-RECEIPT_FILENAME = "sidecar_parquet_audit.json"
+RECEIPT_REMOTE = AUDIT_REMOTE
+RECEIPT_FILENAME = AUDIT_FILENAME
 PARQUET_REMOTE_PREFIX = "parquet/"
 
 
@@ -48,17 +68,7 @@ def _load_env_file(path: Path) -> None:
 
 
 def _s3_env() -> dict[str, str]:
-    env = os.environ.copy()
-    access_key = env.get("NEBIUS_S3_ACCESS_KEY_ID") or env.get("AWS_ACCESS_KEY_ID")
-    secret_key = env.get("NEBIUS_S3_SECRET_ACCESS_KEY") or env.get("AWS_SECRET_ACCESS_KEY")
-    if not access_key or not secret_key:
-        raise SystemExit(
-            "missing Nebius S3 credentials: export NEBIUS_S3_ACCESS_KEY_ID "
-            "and NEBIUS_S3_SECRET_ACCESS_KEY for Nebius Object Storage."
-        )
-    env["AWS_ACCESS_KEY_ID"] = access_key
-    env["AWS_SECRET_ACCESS_KEY"] = secret_key
-    return env
+    return resolve_s3_env(os.environ)
 
 
 def _run(cmd: list[str], *, dry_run: bool, env: dict[str, str] | None = None) -> None:
@@ -196,7 +206,9 @@ def _receipt_path_for(dest: Path, manifest: dict) -> Path:
     """Locate the downloaded audit receipt from the manifest selections, or RAISE."""
     for item in manifest["selections"]:
         if item["remote"].strip("/") == RECEIPT_REMOTE:
-            return dest / item["local"] / RECEIPT_FILENAME
+            return contained_path(
+                dest, item["local"], where="audit receipt local selection"
+            ) / RECEIPT_FILENAME
     raise SystemExit(
         "manifest selections do not include the audit receipt "
         f"({RECEIPT_REMOTE!r}); the downloaded set cannot be verified."
@@ -209,107 +221,49 @@ def _verify_downloaded_set(
     manifest: dict,
     require_token_total: bool,
 ) -> dict:
-    """Fail-closed consume-side gate over the freshly downloaded set.
+    """Verify the exact manifest-bound file inventory and audit accounting."""
 
-    ``aws s3 sync`` ETag-checks individual objects, so a single truncated file is
-    already caught, but a *missing-shards SET* (an absent or partial remote
-    prefix) syncs "successfully" and would otherwise be trusted as the verified
-    set. This proves the consume side by RAISING (``SystemExit``) unless ALL of
-    the following hold:
-
-      * every selected parquet bucket is present in the audit receipt and green;
-      * the manifest's ``verified_valid_tokens`` matches the selected buckets'
-        receipt total (when a real downloaded manifest is in use -- not the
-        built-in default);
-      * every downloaded parquet bucket has exactly the shard count the receipt
-        certified for that ``kind/bucket`` -- this is what catches a
-        missing-shards SET that the per-object ETag check cannot see.
-
-    The receipt may cover diagnostic standalone PR buckets that this manifest
-    intentionally does not select. Those unselected buckets do not participate
-    in the consume-side training gate.
-    """
-    receipt_path = _receipt_path_for(dest, manifest)
-    if not receipt_path.exists():
-        raise SystemExit(
-            f"audit receipt missing after download: {receipt_path}. "
-            "Refusing to trust an unverified set."
-        )
-    report = json.loads(receipt_path.read_text(encoding="utf-8"))
-    by_kind_bucket = report["by_kind_bucket"]
-    receipt_valid_tokens = 0
-    selected_bad_files = 0
-    selected_bad_rows = 0
-    nongreen: list[str] = []
-    manifest_token_total = manifest.get("verified_valid_tokens")
-    if require_token_total and manifest_token_total is None:
-        raise SystemExit(
-            "downloaded manifest is missing verified_valid_tokens; cannot "
-            f"reconcile the downloaded set against the audit receipt {receipt_path}."
-        )
-
-    mismatches: list[str] = []
-    checked = 0
-    for item in manifest["selections"]:
-        remote = item["remote"].strip("/")
-        if not remote.startswith(PARQUET_REMOTE_PREFIX):
-            continue
-        key = remote[len(PARQUET_REMOTE_PREFIX):]  # e.g. "parquet/code/1024" -> "code/1024"
-        local_dir = dest / item["local"]
-        downloaded = len(list(local_dir.glob("*.parquet")))
-        if key not in by_kind_bucket:
-            mismatches.append(
-                f"{remote}: downloaded {downloaded} shard(s) but the receipt has "
-                f"no entry for {key!r}"
-            )
-            continue
-        entry = by_kind_bucket[key]
-        bad_files = int(entry["bad_files"])
-        bad_rows = int(entry["bad_rows"])
-        if bad_files or bad_rows:
-            nongreen.append(f"{key} bad_files={bad_files} bad_rows={bad_rows}")
-        selected_bad_files += bad_files
-        selected_bad_rows += bad_rows
-        receipt_valid_tokens += int(entry["valid_tokens"])
-        expected = int(by_kind_bucket[key]["files"])
-        if downloaded != expected:
-            mismatches.append(
-                f"{remote}: downloaded {downloaded} shard(s) into {local_dir} but "
-                f"the receipt certified {expected}"
-            )
-        checked += 1
-    if mismatches:
-        raise SystemExit(
-            f"downloaded set does not match the audit receipt ({receipt_path}):\n"
-            + "\n".join(mismatches)
-        )
-    if checked == 0:
-        raise SystemExit(
-            "no parquet bucket selections were verified against the receipt "
-            f"{receipt_path}; refusing to certify an empty set."
-        )
-    if nongreen:
-        raise SystemExit(
-            "selected audit receipt buckets are not green: "
-            + "; ".join(nongreen)
-        )
+    validated = validate_manifest(manifest)
+    inventory = verify_inventory(dest, validated)
+    receipt_path = _receipt_path_for(dest, validated)
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise SystemExit(f"audit receipt missing after download: {receipt_path}")
+    selected_keys = [
+        str(item["remote"])[len(PARQUET_REMOTE_PREFIX):]
+        for item in validated["selections"]
+        if str(item["remote"]).startswith(PARQUET_REMOTE_PREFIX)
+    ]
+    report = validate_audit_receipt(
+        json.loads(receipt_path.read_text(encoding="utf-8")),
+        selected_keys=selected_keys,
+    )
+    audit_binding = validated["audit_receipt"]
     if (
-        manifest_token_total is not None
-        and int(manifest_token_total) != receipt_valid_tokens
+        not isinstance(audit_binding, dict)
+        or hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        != audit_binding["sha256"]
     ):
+        raise SystemExit("downloaded audit receipt SHA-256 does not match manifest")
+    validate_semantic_audit_receipt_binding(
+        validated["semantic_audit"],
+        report,
+        selected_keys=selected_keys,
+    )
+    receipt_valid_tokens = sum(
+        int(report["by_kind_bucket"][key]["valid_tokens"]) for key in selected_keys
+    )
+    if require_token_total and int(validated["verified_valid_tokens"]) != receipt_valid_tokens:
         raise SystemExit(
-            "manifest verified_valid_tokens "
-            f"({int(manifest_token_total)}) != selected receipt valid_tokens "
-            f"({receipt_valid_tokens}); manifest/receipt pair is inconsistent. "
-            f"Receipt={receipt_path}."
+            "manifest verified_valid_tokens does not match selected audit receipt total"
         )
-
     return {
+        "status": "verified",
         "receipt": str(receipt_path),
         "verified_valid_tokens": receipt_valid_tokens,
-        "buckets_verified": checked,
-        "bad_files": selected_bad_files,
-        "bad_rows": selected_bad_rows,
+        "buckets_verified": len(selected_keys),
+        "bad_files": 0,
+        "bad_rows": 0,
+        "inventory": inventory,
     }
 
 
@@ -325,7 +279,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument(
         "--use-default-manifest",
         action="store_true",
-        help="Do not download manifest first; use the built-in verified selection.",
+        help=(
+            "Planning-only: skip the manifest copy and print the built-in "
+            "training selection. Real downloads require a remote manifest."
+        ),
     )
     ap.add_argument(
         "--include-standalone-pr",
@@ -345,70 +302,137 @@ def main(argv: Iterable[str] | None = None) -> int:
         ),
     )
     args = ap.parse_args(argv)
+    if args.jobs <= 0:
+        raise ValueError("jobs must be positive")
     if args.include_standalone_pr and args.code_commits_only:
         raise SystemExit("--include-standalone-pr conflicts with --code-commits-only")
-    _load_env_file(args.env_file)
 
-    s3_env = None if args.dry_run else _s3_env()
-    args.dest.mkdir(parents=True, exist_ok=True)
-
-    if args.use_default_manifest:
-        manifest = _default_manifest(
-            args.bucket,
-            args.prefix,
-            args.endpoint_url,
-            include_standalone_pr=args.include_standalone_pr,
-            code_commits_only=args.code_commits_only,
-        )
-    else:
-        manifest_path = _cp_manifest(
-            endpoint_url=args.endpoint_url,
-            bucket=args.bucket,
-            prefix=args.prefix,
-            dest=args.dest,
-            dry_run=args.dry_run,
-            env=s3_env,
-        )
-        manifest = (
-            _default_manifest(
+    if args.dry_run:
+        if args.use_default_manifest:
+            manifest = _default_manifest(
                 args.bucket,
                 args.prefix,
                 args.endpoint_url,
                 include_standalone_pr=args.include_standalone_pr,
                 code_commits_only=args.code_commits_only,
             )
-            if args.dry_run
-            else json.loads(manifest_path.read_text(encoding="utf-8"))
-        )
-
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = []
-        for item in manifest["selections"]:
-            remote = item["remote"]
-            local = args.dest / item["local"]
-            futures.append(
-                pool.submit(
-                    _sync_one,
-                    endpoint_url=args.endpoint_url,
-                    bucket=args.bucket,
-                    prefix=args.prefix,
-                    remote=remote,
-                    local=local,
-                    dry_run=args.dry_run,
-                    env=s3_env,
-                )
+        else:
+            # Planning mode must be safe to run on a laptop with no S3
+            # credentials.  Print the manifest fetch that the leader will run,
+            # then use the deterministic profile only to enumerate sync URIs.
+            _cp_manifest(
+                endpoint_url=args.endpoint_url,
+                bucket=args.bucket,
+                prefix=args.prefix,
+                dest=args.dest,
+                dry_run=True,
+                env=None,
             )
-        for future in as_completed(futures):
-            print(f"downloaded {future.result()}", flush=True)
+            manifest = _default_manifest(
+                args.bucket,
+                args.prefix,
+                args.endpoint_url,
+                include_standalone_pr=args.include_standalone_pr,
+                code_commits_only=args.code_commits_only,
+            )
+        for item in manifest["selections"]:
+            _sync_one(
+                endpoint_url=args.endpoint_url,
+                bucket=args.bucket,
+                prefix=args.prefix,
+                remote=item["remote"],
+                local=contained_path(
+                    args.dest,
+                    item["local"],
+                    where="planning manifest local selection",
+                ),
+                dry_run=True,
+                env=None,
+            )
+        return 0
 
-    if not args.dry_run:
-        verification = _verify_downloaded_set(
-            dest=args.dest,
-            manifest=manifest,
-            require_token_total=not args.use_default_manifest,
+    _load_env_file(args.env_file)
+    if args.use_default_manifest:
+        # A built-in profile has no inventory or audit binding and therefore can
+        # never certify a real restore.
+        raise SystemExit(
+            "--use-default-manifest is planning-only; real downloads require "
+            "a schema-bound remote manifest"
         )
-        print(json.dumps({"verified": verification}, indent=2), flush=True)
-    return 0
+    else:
+        if args.dest.exists():
+            raise SystemExit(
+                f"refusing stale download destination; remove or move it first: {args.dest}"
+            )
+        s3_env = _s3_env()
+        stage_parent = args.dest.parent.resolve()
+        stage_parent.mkdir(parents=True, exist_ok=True)
+        stage = stage_parent / f".{args.dest.name}.download-{os.getpid()}"
+        if stage.exists() or stage.is_symlink():
+            raise SystemExit(f"refusing stale download staging directory: {stage}")
+        stage.mkdir()
+        try:
+            manifest_path = _cp_manifest(
+                endpoint_url=args.endpoint_url,
+                bucket=args.bucket,
+                prefix=args.prefix,
+                dest=stage,
+                dry_run=False,
+                env=s3_env,
+            )
+            manifest = validate_manifest(
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+                expected_bucket=args.bucket,
+                expected_prefix=args.prefix.rstrip("/"),
+                expected_endpoint_url=args.endpoint_url,
+            )
+            with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                futures = []
+                for item in manifest["selections"]:
+                    remote = str(item["remote"])
+                    local = contained_path(
+                        stage, item["local"], where="manifest local selection"
+                    )
+                    futures.append(
+                        pool.submit(
+                            _sync_one,
+                            endpoint_url=args.endpoint_url,
+                            bucket=args.bucket,
+                            prefix=args.prefix,
+                            remote=remote,
+                            local=local,
+                            dry_run=False,
+                            env=s3_env,
+                        )
+                    )
+                for future in as_completed(futures):
+                    print(f"downloaded {future.result()}", flush=True)
+            verification = _verify_downloaded_set(
+                dest=stage,
+                manifest=manifest,
+                require_token_total=True,
+            )
+            receipt = {
+                "schema": "cppmega_sidecar_download_receipt_v1",
+                "status": "verified",
+                "bucket": args.bucket,
+                "prefix": args.prefix.rstrip("/"),
+                "endpoint_url": args.endpoint_url,
+                "manifest_payload_sha256": manifest["manifest_payload_sha256"],
+                "inventory_sha256": manifest["inventory_sha256"],
+                "verification": verification,
+            }
+            write_json_atomic(stage / "download_receipt.json", receipt)
+            os.replace(stage, args.dest)
+            print(json.dumps({"verified": verification, "destination": str(args.dest)}, indent=2))
+            return 0
+        except Exception:
+            if stage.is_symlink() or (stage.exists() and not stage.is_dir()):
+                raise
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+    raise AssertionError("unreachable download planning branch")
 
 
 if __name__ == "__main__":

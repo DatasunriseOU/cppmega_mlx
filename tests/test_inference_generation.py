@@ -21,6 +21,11 @@ from cppmega_mlx.inference import (
     next_token_logits,
     stream_generate_tokens,
 )
+from cppmega_mlx.inference.generation import (
+    _model_kwargs_for_generated_step,
+    _model_kwargs_for_prefix,
+    _model_kwargs_for_slice,
+)
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 
 
@@ -385,6 +390,103 @@ def test_generate_tokens_threads_enriched_prompt_model_kwargs() -> None:
             kwargs["platform_ids"],
             np.array([[2, 64, 0]], dtype=np.int32),
         )
+
+
+def test_generation_aligns_square_graph_biases_across_prefix_and_slices() -> None:
+    graph_bias = mx.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=mx.float32)
+
+    prefix = _model_kwargs_for_prefix(
+        {"block_bias": graph_bias},
+        mx.zeros((1, 3), dtype=mx.int32),
+    )["block_bias"]
+    np.testing.assert_array_equal(
+        _as_numpy(prefix),
+        np.array(
+            [[[1.0, 2.0, 0.0], [3.0, 4.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=np.float32,
+        ),
+    )
+
+    sliced = _model_kwargs_for_slice(
+        {"block_bias": graph_bias},
+        start=1,
+        tokens=mx.zeros((1, 2), dtype=mx.int32),
+    )["block_bias"]
+    np.testing.assert_array_equal(
+        _as_numpy(sliced),
+        np.array([[[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]]], dtype=np.float32),
+    )
+
+    generated = _model_kwargs_for_generated_step(
+        {"block_bias": graph_bias},
+        mx.zeros((1, 1), dtype=mx.int32),
+        start=2,
+        key_length=3,
+    )["block_bias"]
+    assert generated.shape == (1, 1, 3)
+    assert float(mx.sum(mx.abs(generated)).item()) == 0.0
+
+
+def test_generate_tokens_freezes_domain_prompt_sidecars_and_graph_constants() -> None:
+    model = _KwargRecordingScriptedLogitsModel([[4], [5]])
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+    prompt_sidecars = {
+        "domain_ids": mx.array([[24, 24]], dtype=mx.int32),
+        "role_ids": mx.array([[1, 6]], dtype=mx.int32),
+        "entity_ids": mx.array([[7, 8]], dtype=mx.int32),
+        "scope_ids": mx.array([[3, 4]], dtype=mx.int32),
+        "source_doc_ids": mx.array([[11, 11]], dtype=mx.int32),
+        "source_identity_ids": mx.array([[101, 101]], dtype=mx.uint64),
+        "confidence_ids": mx.array([[4, 2]], dtype=mx.int32),
+        "token_shell_edges": mx.array([[[0, 1, 40]]], dtype=mx.int32),
+    }
+
+    generated = generate_tokens(
+        model,
+        prompt,
+        max_new_tokens=2,
+        temperature=0.0,
+        model_kwargs=prompt_sidecars,
+    )
+
+    np.testing.assert_array_equal(
+        _as_numpy(generated),
+        np.array([[1, 2, 4, 5]], dtype=np.int32),
+    )
+    assert [kwargs["domain_ids"].shape for kwargs in model.seen_model_kwargs] == [
+        (1, 2),
+        (1, 3),
+    ]
+    for name in (
+        "domain_ids",
+        "role_ids",
+        "entity_ids",
+        "scope_ids",
+        "source_doc_ids",
+        "source_identity_ids",
+        "confidence_ids",
+    ):
+        np.testing.assert_array_equal(
+            model.seen_model_kwargs[0][name],
+            np.array(prompt_sidecars[name]),
+        )
+        expected = np.concatenate(
+            [
+                np.array(prompt_sidecars[name]),
+                np.zeros((1, 1), dtype=np.array(prompt_sidecars[name]).dtype),
+            ],
+            axis=1,
+        )
+        np.testing.assert_array_equal(model.seen_model_kwargs[1][name], expected)
+
+    np.testing.assert_array_equal(
+        model.seen_model_kwargs[0]["token_shell_edges"],
+        np.array([[[0, 1, 40]]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        model.seen_model_kwargs[1]["token_shell_edges"],
+        np.array([[[0, 1, 40]]], dtype=np.int32),
+    )
 
 
 def test_generate_tokens_stops_on_eos_only_when_all_rows_emit_eos() -> None:

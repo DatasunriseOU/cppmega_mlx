@@ -51,6 +51,7 @@ def test_objective_batch_preserves_document_ids_and_masks_boundary_target() -> N
         TaskKind.CAUSAL_LM,
         [(example, ObjectiveSource(code_packet=packet))],
         seq_len=6,
+        require_route_sidecars=False,
     )
 
     assert np.asarray(batch.document_ids).tolist() == [[41, 41, 73, 73, 0, 0]]
@@ -70,6 +71,7 @@ def test_objective_batch_preserves_typed_edge_kind_bias() -> None:
         TaskKind.CAUSAL_LM,
         [(example, ObjectiveSource(code_packet=packet))],
         seq_len=6,
+        require_route_sidecars=False,
     )
 
     assert int(mx.sum(batch.edge_kind_bias != 0).item()) == 1
@@ -84,6 +86,7 @@ def test_aligned_objective_batch_rejects_missing_document_ids() -> None:
             TaskKind.CAUSAL_LM,
             [(example, ObjectiveSource(code_packet=packet))],
             seq_len=6,
+            require_route_sidecars=False,
         )
 
 

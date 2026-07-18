@@ -1,12 +1,31 @@
 from __future__ import annotations
 
+from contextlib import chdir
 import json
 from pathlib import Path
 
 import pytest
 
+from tests.test_verified_sidecar_download_verification import (
+    _write_green_shard as _write_case5_shard,
+)
 from scripts import download_verified_sidecar_from_nebius_s3 as download
 from scripts import upload_verified_sidecar_to_nebius_s3 as upload
+from scripts.sidecar_manifest_contract import (
+    AUDIT_FILENAME,
+    AUDIT_REMOTE,
+    AUDIT_SCHEMA,
+    GRAPH_CONTRACT,
+    MANIFEST_SCHEMA,
+    OBJECTIVE_CONTRACT,
+    audit_contract,
+    build_semantic_audit_binding,
+    finalize_manifest,
+    inventory_directory,
+    inventory_sha256,
+    selection_policy,
+    validate_manifest,
+)
 
 
 def _remotes_from_upload(
@@ -90,6 +109,21 @@ _BUCKET_VALID_TOKENS = {
 }
 
 
+def _write_green_shard(
+    path: Path,
+    *,
+    bucket: int,
+    valid_tokens: int,
+    source_id: int,
+) -> None:
+    _write_case5_shard(
+        path,
+        length=bucket,
+        source_id=source_id,
+        valid_tokens=valid_tokens,
+    )
+
+
 def _build_receipt(
     path: Path,
     *,
@@ -112,11 +146,14 @@ def _build_receipt(
         bf, br = bad.get(key, (0, 0))
         by_kind_bucket[key] = {
             "valid_tokens": tokens,
-            "files": 0,
+            "files": 1,
             "bad_files": bf,
             "bad_rows": br,
         }
     payload = {
+        "schema": AUDIT_SCHEMA,
+        "status": "verified",
+        "contract": audit_contract(),
         "total": {
             "valid_tokens": sum(valid_tokens.values()),
             "bad_files": 0,
@@ -126,6 +163,113 @@ def _build_receipt(
     }
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     return path
+
+
+def _download_fixture(
+    tmp_path: Path,
+    *,
+    include_standalone_pr: bool = False,
+    bad: dict[str, tuple[int, int]] | None = None,
+) -> tuple[dict, Path]:
+    """Build a complete v3 manifest and matching local inventory."""
+
+    manifest_plan = download._default_manifest(
+        "bucket",
+        "prefix",
+        "https://storage.eu-north1.nebius.cloud",
+        include_standalone_pr=include_standalone_pr,
+    )
+    selected_keys = [
+        item["remote"][len("parquet/"):]
+        for item in manifest_plan["selections"]
+        if item["remote"].startswith("parquet/")
+    ]
+    receipt_source = tmp_path / "receipt-source" / AUDIT_FILENAME
+    receipt_source.parent.mkdir(parents=True)
+    _build_receipt(receipt_source, valid_tokens=_BUCKET_VALID_TOKENS, bad=bad)
+
+    root = tmp_path / "dl"
+    selections: list[dict[str, object]] = []
+    for index, item in enumerate(manifest_plan["selections"], 1):
+        remote = str(item["remote"])
+        local_relative = str(item["local"])
+        local = root / local_relative
+        local.mkdir(parents=True)
+        if remote == AUDIT_REMOTE:
+            (local / AUDIT_FILENAME).write_bytes(receipt_source.read_bytes())
+        else:
+            bucket = int(remote.rsplit("/", 1)[1])
+            key = remote.removeprefix("parquet/")
+            _write_green_shard(
+                local / f"part-{index:03d}.parquet",
+                bucket=bucket,
+                valid_tokens=_BUCKET_VALID_TOKENS[key],
+                source_id=index,
+            )
+        inventory = inventory_directory(local, remote=remote)
+        selections.append({"remote": remote, "local": local_relative, **inventory})
+
+    audit_selection = next(item for item in selections if item["remote"] == AUDIT_REMOTE)
+    audit_record = next(
+        record for record in audit_selection["files"] if record["path"] == AUDIT_FILENAME
+    )
+    token_total = sum(_BUCKET_VALID_TOKENS[key] for key in selected_keys)
+    payload = {
+        "schema": MANIFEST_SCHEMA,
+        "bucket": "bucket",
+        "prefix": "prefix",
+        "endpoint_url": "https://storage.eu-north1.nebius.cloud",
+        "verified_valid_tokens": token_total,
+        "profile": (
+            "code_commits_plus_standalone_pr"
+            if include_standalone_pr
+            else "code_commits_integrated_pr"
+        ),
+        "standalone_pr_included": include_standalone_pr,
+        "selections": selections,
+        "inventory_sha256": inventory_sha256(selections),
+        "selection_policy": selection_policy(
+            [str(item["remote"]) for item in selections],
+            include_standalone_pr=include_standalone_pr,
+        ),
+        "audit_receipt": {
+            "schema": AUDIT_SCHEMA,
+            "status": "verified",
+            "remote": AUDIT_REMOTE,
+            "path": AUDIT_FILENAME,
+            "sha256": audit_record["sha256"],
+        },
+        "semantic_audit": build_semantic_audit_binding(
+            selections=selections,
+            audited_files=upload._audit_selected_parquet_files(
+                [
+                    {
+                        **item,
+                        "local": str(root / str(item["local"])),
+                    }
+                    for item in selections
+                ]
+            ),
+            source_receipt_sha256=str(audit_record["sha256"]),
+        ),
+        "graph_contract": GRAPH_CONTRACT,
+        "objective_contract": OBJECTIVE_CONTRACT,
+    }
+    return finalize_manifest(payload), root
+
+
+def _populate_upload_sources(selections: tuple[tuple[str, Path], ...]) -> None:
+    for index, (remote, local) in enumerate(selections, 1):
+        local.mkdir(parents=True, exist_ok=True)
+        if remote.startswith("parquet/"):
+            key = remote.removeprefix("parquet/")
+            bucket = int(remote.rsplit("/", 1)[1])
+            _write_green_shard(
+                local / f"part-{index:03d}.parquet",
+                bucket=bucket,
+                valid_tokens=_BUCKET_VALID_TOKENS[key],
+                source_id=index,
+            )
 
 
 def test_token_total_is_profile_aware_subset(tmp_path: Path) -> None:
@@ -350,8 +494,7 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
     monkeypatch.chdir(tmp_path)
     # Every selected source dir must exist or _existing_sources RAISEs; this
     # also creates the audit dir that holds the receipt.
-    for _remote, local in upload.ALL_VALID_SELECTIONS:
-        local.mkdir(parents=True, exist_ok=True)
+    _populate_upload_sources(upload.ALL_VALID_SELECTIONS)
     # Real temp receipt at the relative path the script reads (_audit_receipts),
     # covering every selected parquet bucket and green.
     _build_receipt(upload._audit_receipts()[0], valid_tokens=_BUCKET_VALID_TOKENS)
@@ -382,6 +525,12 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
     assert "s3://mybucket/myprefix/manifest.json" in out
 
     written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validate_manifest(
+        written,
+        expected_bucket="mybucket",
+        expected_prefix="myprefix",
+        expected_endpoint_url="https://storage.eu-north1.nebius.cloud",
+    )
     assert written["bucket"] == "mybucket"
     assert written["prefix"] == "myprefix"
     assert written["profile"] == "code_commits_integrated_pr"
@@ -390,15 +539,17 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
         v for k, v in _BUCKET_VALID_TOKENS.items() if not k.startswith("pr/")
     )
     assert {s["remote"] for s in written["selections"]} == _remotes_from_upload()
-    assert any("outputs/reindexed_pr" in item for item in written["excluded"])
+    assert any(
+        item["remote"].startswith("parquet/pr/")
+        for item in written["selection_policy"]["excluded"]
+    )
 
 
 def test_upload_main_dry_run_does_not_gate_default_on_standalone_pr_bucket(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    for _remote, local in upload.ALL_VALID_SELECTIONS:
-        local.mkdir(parents=True, exist_ok=True)
+    _populate_upload_sources(upload.ALL_VALID_SELECTIONS)
     _build_receipt(
         upload._audit_receipts()[0],
         valid_tokens=_BUCKET_VALID_TOKENS,
@@ -423,8 +574,9 @@ def test_upload_main_dry_run_raises_on_non_green_explicit_standalone_pr_bucket(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    for _remote, local in upload.CODE_COMMIT_SELECTIONS + upload.STANDALONE_PR_SELECTIONS:
-        local.mkdir(parents=True, exist_ok=True)
+    _populate_upload_sources(
+        upload.CODE_COMMIT_SELECTIONS + upload.STANDALONE_PR_SELECTIONS
+    )
     _build_receipt(
         upload._audit_receipts()[0],
         valid_tokens=_BUCKET_VALID_TOKENS,
@@ -445,6 +597,36 @@ def test_upload_main_dry_run_raises_on_non_green_explicit_standalone_pr_bucket(
             ]
         )
     assert "pr/8192" in str(exc.value)
+
+
+def test_upload_main_records_failed_receipt_before_local_preflight(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    receipt_path = tmp_path / "sidecar_upload_receipt.json"
+    with chdir(tmp_path):
+        upload._audit_receipts()[0].parent.mkdir(parents=True, exist_ok=True)
+        _build_receipt(
+            upload._audit_receipts()[0], valid_tokens=_BUCKET_VALID_TOKENS
+        )
+
+        with pytest.raises(SystemExit, match="missing verified upload inputs"):
+            upload.main(
+                [
+                    "--bucket",
+                    "mybucket",
+                    "--dry-run",
+                    "--manifest",
+                    str(manifest_path),
+                    "--env-file",
+                    str(tmp_path / "nonexistent.env"),
+                ]
+            )
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert "missing verified upload inputs" in receipt["error"]
+    assert not manifest_path.exists()
 
 
 def test_download_main_dry_run_default_manifest_prints_source_uris(
@@ -470,6 +652,7 @@ def test_download_main_dry_run_default_manifest_prints_source_uris(
     out = capsys.readouterr().out
     assert "aws s3 sync" in out
     assert "s3://mybucket/myprefix/parquet/code/1024/" in out
+    assert str(dest / "outputs/reindexed/1024") in out
     assert "parquet/pr/" not in out
     assert "s3://mybucket/myprefix/audits/sidecar_audit_all_final_poststop_valid/" in out
 
@@ -477,25 +660,16 @@ def test_download_main_dry_run_default_manifest_prints_source_uris(
 def test_download_verify_scopes_token_total_and_green_gate_to_selected_buckets(
     tmp_path: Path,
 ) -> None:
-    receipt_dir = tmp_path / "dl" / "outputs" / "sidecar_audit_all_final_poststop_valid"
-    receipt_dir.mkdir(parents=True)
-    _build_receipt(
-        receipt_dir / "sidecar_parquet_audit.json",
-        valid_tokens=_BUCKET_VALID_TOKENS,
+    manifest, root = _download_fixture(
+        tmp_path,
         bad={"pr/8192": (1, 0)},
     )
     code_commits_sum = sum(
         v for k, v in _BUCKET_VALID_TOKENS.items() if not k.startswith("pr/")
     )
-    manifest = download._default_manifest(
-        "bucket",
-        "prefix",
-        "https://storage.eu-north1.nebius.cloud",
-    )
-    manifest["verified_valid_tokens"] = code_commits_sum
 
     result = download._verify_downloaded_set(
-        dest=tmp_path / "dl",
+        dest=root,
         manifest=manifest,
         require_token_total=True,
     )
@@ -508,24 +682,15 @@ def test_download_verify_scopes_token_total_and_green_gate_to_selected_buckets(
 def test_download_verify_rejects_non_green_explicit_standalone_pr_bucket(
     tmp_path: Path,
 ) -> None:
-    receipt_dir = tmp_path / "dl" / "outputs" / "sidecar_audit_all_final_poststop_valid"
-    receipt_dir.mkdir(parents=True)
-    _build_receipt(
-        receipt_dir / "sidecar_parquet_audit.json",
-        valid_tokens=_BUCKET_VALID_TOKENS,
+    manifest, root = _download_fixture(
+        tmp_path,
+        include_standalone_pr=True,
         bad={"pr/8192": (1, 0)},
     )
-    manifest = download._default_manifest(
-        "bucket",
-        "prefix",
-        "https://storage.eu-north1.nebius.cloud",
-        include_standalone_pr=True,
-    )
-    manifest["verified_valid_tokens"] = sum(_BUCKET_VALID_TOKENS.values())
 
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(ValueError) as exc:
         download._verify_downloaded_set(
-            dest=tmp_path / "dl",
+            dest=root,
             manifest=manifest,
             require_token_total=True,
         )

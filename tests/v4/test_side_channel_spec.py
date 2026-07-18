@@ -33,7 +33,7 @@ def test_side_channel_spec_defaults_are_language_neutral():
     )
     assert spec.families["syntax"].language_scope == ("any",)
     assert spec.inference.source == "auto"
-    assert spec.inference.fail_policy == "drop_family"
+    assert spec.inference.fail_policy == "error"
 
 
 def test_side_channel_spec_json_round_trip_is_deterministic():

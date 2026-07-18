@@ -158,6 +158,22 @@ def test_normalize_materializes_array_only_graph_and_flattens_domain_routes() ->
         assert tuple(normalized[key].shape) == (1, 8)
 
 
+def test_normalize_rejects_raw_graph_sidecars_without_typed_graph_batch() -> None:
+    tokens = mx.array([[3, 5, 7, 11, 13, 17, 19, 23]], dtype=mx.int32)
+    raw_graph = {
+        "semantic_graph": {
+            "token_call_edges": mx.array([[[0, 1]]], dtype=mx.int32),
+            "token_call_edges_mask": mx.array([[1]], dtype=mx.int32),
+        }
+    }
+
+    with pytest.raises(ValueError, match="metadata-only.*GraphBatch"):
+        normalize_compiled_batch(
+            LMTokenBatch(tokens=tokens, side_channels=raw_graph),
+            graph_routes_enabled=True,
+        )
+
+
 def test_compiled_gqa_graph_changes_loss_and_parameter_gradients() -> None:
     cfg = _config(graph_routes_enabled=True, graph_attention_bias_beta=25.0)
 

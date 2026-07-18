@@ -26,6 +26,7 @@ from .symbol_identity import (
     SYMBOL_ID_MAX,
     compute_symbol_id,
     is_repo_file_location_identity,
+    parse_repo_file_location_identity,
 )
 
 
@@ -34,6 +35,17 @@ LEGACY_INDEX_SCHEMA = "cppmega_prompt_graph_index_v1"
 ARTIFACT_SCHEMA = "cppmega_prompt_graph_artifact_v3"
 WINDOW_SCHEMA = "cppmega_prompt_graph_window_v3"
 BUILDER_VERSION = "3"
+PRODUCTION_INDEX_PRODUCER = "ClangPromptProjectIndexProducer"
+PRODUCTION_INDEX_VERSION = "3"
+PRODUCTION_IDENTITY_PROVENANCE_CONTRACT = (
+    "case4_symbol_reference_v3_repo_binding_v1"
+)
+INDEX_PAYLOAD_HASH_KEY = "index_payload_sha256"
+TRUSTED_IDENTITY_ADAPTERS = frozenset(
+    {
+        "case4_symbol_reference_for_cursor_v3",
+    }
+)
 
 TOKEN_SIDECAR_NAMES = (
     "structure_ids",
@@ -502,6 +514,13 @@ class PromptGraphSymbol:
     canonical_signature: str = ""
     qname: str = ""
     chunk_identity: str = ""
+    identity_project: str = ""
+    identity_file: str = ""
+    identity_line: int = 0
+    identity_column: int = 0
+    identity_kind: str = ""
+    identity_provider: str = ""
+    identity_include_provenance: str = ""
 
     @classmethod
     def from_dict(cls, row: Mapping[str, Any]) -> "PromptGraphSymbol":
@@ -530,6 +549,19 @@ class PromptGraphSymbol:
             canonical_signature=str(row.get("canonical_signature") or ""),
             qname=str(row.get("qname") or ""),
             chunk_identity=str(row.get("chunk_identity") or ""),
+            identity_project=str(row.get("identity_project") or ""),
+            identity_file=str(row.get("identity_file") or ""),
+            identity_line=_require_int(
+                row.get("identity_line", 0), where="symbol.identity_line"
+            ),
+            identity_column=_require_int(
+                row.get("identity_column", 0), where="symbol.identity_column"
+            ),
+            identity_kind=str(row.get("identity_kind") or ""),
+            identity_provider=str(row.get("identity_provider") or ""),
+            identity_include_provenance=str(
+                row.get("identity_include_provenance") or ""
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -548,6 +580,13 @@ class PromptGraphSymbol:
             "start": self.start,
             "end": self.end,
             "chunk_identity": self.chunk_identity,
+            "identity_project": self.identity_project,
+            "identity_file": self.identity_file,
+            "identity_line": self.identity_line,
+            "identity_column": self.identity_column,
+            "identity_kind": self.identity_kind,
+            "identity_provider": self.identity_provider,
+            "identity_include_provenance": self.identity_include_provenance,
         }
 
 
@@ -1005,6 +1044,493 @@ class PromptProjectIndex:
     @property
     def index_sha256(self) -> str:
         return _sha_json(self.to_dict())
+
+    def _integrity_payload(self) -> dict[str, Any]:
+        payload = self.to_dict()
+        provenance = dict(payload.get("provenance") or {})
+        provenance.pop(INDEX_PAYLOAD_HASH_KEY, None)
+        payload["provenance"] = provenance
+        return payload
+
+    @property
+    def payload_sha256(self) -> str:
+        return _sha_json(self._integrity_payload())
+
+    def with_integrity(self) -> "PromptProjectIndex":
+        payload = self._integrity_payload()
+        provenance = dict(payload["provenance"])
+        provenance[INDEX_PAYLOAD_HASH_KEY] = _sha_json(payload)
+        payload["provenance"] = provenance
+        return PromptProjectIndex.from_dict(payload)
+
+    def verify_integrity(self) -> None:
+        expected = self.provenance.get(INDEX_PAYLOAD_HASH_KEY)
+        if not _is_sha256(expected):
+            raise ValueError(
+                "prompt graph index is missing a valid "
+                f"{INDEX_PAYLOAD_HASH_KEY}"
+            )
+        actual = self.payload_sha256
+        if expected != actual:
+            raise ValueError(
+                "prompt graph index payload integrity mismatch: "
+                f"expected={expected} actual={actual}"
+            )
+
+    def validate_production_repository_index(
+        self,
+        *,
+        expected_project_id: str | None = None,
+        expected_indexer_root: str | Path | None = None,
+    ) -> None:
+        """Validate the trusted v3 producer receipt used by repository inference."""
+
+        self.validate()
+        provenance = dict(self.provenance)
+        if provenance.get("producer") != PRODUCTION_INDEX_PRODUCER:
+            raise ValueError(
+                "production repository index requires producer "
+                f"{PRODUCTION_INDEX_PRODUCER!r}"
+            )
+        if str(provenance.get("producer_version")) != PRODUCTION_INDEX_VERSION:
+            raise ValueError(
+                "production repository index has unsupported producer_version "
+                f"{provenance.get('producer_version')!r}"
+            )
+        if provenance.get("schema") != INDEX_SCHEMA:
+            raise ValueError("production repository index schema provenance mismatch")
+        if provenance.get("identity_provenance_contract") != (
+            PRODUCTION_IDENTITY_PROVENANCE_CONTRACT
+        ):
+            raise ValueError(
+                "production repository index identity provenance contract mismatch"
+            )
+        if provenance.get("project_id") != self.project_id:
+            raise ValueError("production repository index project identity mismatch")
+        if expected_project_id is not None:
+            expected_project_id = require_prompt_graph_project_id(
+                expected_project_id,
+                where="expected prompt graph project_id",
+            )
+            if self.project_id != expected_project_id:
+                raise ValueError(
+                    "production repository index project identity mismatch: "
+                    f"expected={expected_project_id!r} actual={self.project_id!r}"
+                )
+        if provenance.get("strict_diagnostics") is not True:
+            raise ValueError(
+                "production repository index must be built with strict diagnostics"
+            )
+        if int(provenance.get("symbol_identity_schema_version") or 0) != (
+            SYMBOL_IDENTITY_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "production repository index symbol identity schema mismatch"
+            )
+        self.verify_integrity()
+
+        hashes = provenance.get("hashes")
+        if not isinstance(hashes, Mapping):
+            raise ValueError("production repository index hashes are missing")
+        required_hashes = {
+            "repository_sha256",
+            "dependency_closure_sha256",
+            "compile_args_sha256",
+            "indexer_sha256",
+            "libclang_version_sha256",
+        }
+        if any(
+            not _is_sha256(hashes.get(name)) for name in required_hashes
+        ):
+            raise ValueError(
+                "production repository index hashes are incomplete or invalid"
+            )
+
+        def validate_manifest(value: Any, *, name: str) -> dict[str, str]:
+            if not isinstance(value, Mapping) or not value:
+                raise ValueError(
+                    f"production repository index {name} is missing"
+                )
+            manifest: dict[str, str] = {}
+            for raw_path, digest in value.items():
+                if not isinstance(raw_path, str):
+                    raise ValueError(
+                        f"production repository index {name} has a non-string path"
+                    )
+                path = _validate_relative_source_path(
+                    raw_path,
+                    where=f"production repository index {name}",
+                )
+                if not _is_sha256(digest):
+                    raise ValueError(
+                        f"production repository index {name} has an invalid digest"
+                    )
+                manifest[path] = digest
+            return manifest
+
+        repository_manifest = validate_manifest(
+            provenance.get("repository_manifest"),
+            name="repository_manifest",
+        )
+        dependency_manifest = validate_manifest(
+            provenance.get("dependency_manifest"),
+            name="dependency_manifest",
+        )
+        if not set(dependency_manifest) <= set(repository_manifest):
+            raise ValueError(
+                "production repository index dependency_manifest escapes "
+                "repository_manifest"
+            )
+        if any(
+            repository_manifest[path] != digest
+            for path, digest in dependency_manifest.items()
+        ):
+            raise ValueError(
+                "production repository index dependency_manifest does not match "
+                "repository_manifest"
+            )
+        if _sha_json(repository_manifest) != hashes["repository_sha256"]:
+            raise ValueError(
+                "production repository index repository manifest hash mismatch"
+            )
+        if _sha_json(dependency_manifest) != hashes["dependency_closure_sha256"]:
+            raise ValueError(
+                "production repository index dependency manifest hash mismatch"
+            )
+        for document in self.documents:
+            digest = repository_manifest.get(document.source_path)
+            if digest is None:
+                raise ValueError(
+                    "production repository index documents are absent from "
+                    "repository_manifest"
+                )
+            if sha256(document.source.encode("utf-8")).hexdigest() != digest:
+                raise ValueError(
+                    "production repository index document source hash mismatch"
+                )
+
+        toolchain = provenance.get("toolchain")
+        if not isinstance(toolchain, Mapping):
+            raise ValueError(
+                "production repository index toolchain provenance is missing"
+            )
+        libclang_version = toolchain.get("libclang_version")
+        if not isinstance(libclang_version, str) or not libclang_version.strip():
+            raise ValueError(
+                "production repository index toolchain libclang_version is missing"
+            )
+        libclang_path = toolchain.get("libclang_path")
+        if libclang_path is not None and (
+            not isinstance(libclang_path, str) or not libclang_path
+        ):
+            raise ValueError(
+                "production repository index toolchain libclang_path is invalid"
+            )
+        compile_args_by_file = toolchain.get("compile_args_by_file")
+        if not isinstance(compile_args_by_file, Mapping) or not compile_args_by_file:
+            raise ValueError(
+                "production repository index compile arguments are missing"
+            )
+        for raw_path, args in compile_args_by_file.items():
+            if not isinstance(raw_path, str):
+                raise ValueError(
+                    "production repository index compile arguments have a "
+                    "non-string path"
+                )
+            _validate_relative_source_path(
+                raw_path,
+                where="production repository index compile arguments",
+            )
+            if not isinstance(args, Sequence) or isinstance(args, (str, bytes)):
+                raise ValueError(
+                    "production repository index compile arguments must be sequences"
+                )
+            if any(not isinstance(arg, str) for arg in args):
+                raise ValueError(
+                    "production repository index compile arguments must be strings"
+                )
+        if not set(document.source_path for document in self.documents) <= set(
+            compile_args_by_file
+        ):
+            raise ValueError(
+                "production repository index documents are absent from "
+                "compile_args_by_file"
+            )
+        if _sha_json(compile_args_by_file) != hashes["compile_args_sha256"]:
+            raise ValueError(
+                "production repository index compile arguments hash mismatch"
+            )
+        if sha256(libclang_version.encode("utf-8")).hexdigest() != hashes[
+            "libclang_version_sha256"
+        ]:
+            raise ValueError(
+                "production repository index libclang version hash mismatch"
+            )
+
+        raw_indexer_path = provenance.get("indexer_path")
+        if not isinstance(raw_indexer_path, str) or not raw_indexer_path:
+            raise ValueError(
+                "production repository index indexer_path is missing"
+            )
+        indexer_path = Path(raw_indexer_path)
+        if not indexer_path.is_absolute():
+            raise ValueError(
+                "production repository index indexer_path must be absolute"
+            )
+        resolved_indexer_path = indexer_path.resolve()
+        if expected_indexer_root is not None:
+            expected_indexer = (
+                Path(expected_indexer_root).resolve()
+                / "tools"
+                / "clang_indexer"
+                / "index_project.py"
+            ).resolve()
+            if resolved_indexer_path != expected_indexer:
+                raise ValueError(
+                    "production repository index same-checkout indexer "
+                    f"provenance mismatch: expected={expected_indexer} "
+                    f"actual={resolved_indexer_path}"
+                )
+        if not resolved_indexer_path.is_file():
+            raise FileNotFoundError(
+                "production repository index indexer_path not found: "
+                f"{resolved_indexer_path}"
+            )
+        if _sha_file(resolved_indexer_path) != hashes["indexer_sha256"]:
+            raise ValueError(
+                "production repository index indexer hash mismatch"
+            )
+
+        adapters = provenance.get("identity_adapters")
+        if not isinstance(adapters, Sequence) or isinstance(adapters, (str, bytes)):
+            raise ValueError(
+                "production repository index identity adapters are missing"
+            )
+        adapter_names = {str(adapter) for adapter in adapters}
+        if adapter_names != TRUSTED_IDENTITY_ADAPTERS:
+            raise ValueError(
+                "production repository index uses an untrusted identity adapter"
+            )
+
+        expected_counts = {
+            "document_count": len(self.documents),
+            "symbol_count": len(self.symbols),
+            "chunk_count": len(self.chunks),
+        }
+        for name, expected in expected_counts.items():
+            value = provenance.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+                raise ValueError(
+                    f"production repository index {name} does not match payload"
+                )
+        declared_edge_counts = provenance.get("edge_counts")
+        actual_edge_counts = {
+            relation: sum(1 for edge in self.edges if edge.relation == relation)
+            for relation in RELATION_NAMES
+        }
+        if not isinstance(declared_edge_counts, Mapping) or any(
+            declared_edge_counts.get(relation) != count
+            for relation, count in actual_edge_counts.items()
+        ):
+            raise ValueError(
+                "production repository index edge_counts do not match payload"
+            )
+
+        chunks_by_identity = {chunk.identity: chunk for chunk in self.chunks}
+        symbols_by_identity = {symbol.identity: symbol for symbol in self.symbols}
+        documents_by_id = {document.id: document for document in self.documents}
+        semantic_contracts: dict[
+            str, tuple[str, str, str, str, str, str, int, int, str, str, str]
+        ] = {}
+        definition_kinds = {"function", "type", "variable"}
+
+        for symbol in self.symbols:
+            if (
+                symbol.identity_project != self.project_id
+                or not symbol.identity_file
+                or symbol.identity_file not in repository_manifest
+                or symbol.identity_line <= 0
+                or symbol.identity_column <= 0
+                or not symbol.identity_kind
+            ):
+                raise ValueError(
+                    "production repository index symbol identity provenance "
+                    f"is incomplete or not repository-bound for {symbol.identity!r}"
+                )
+            _validate_relative_source_path(
+                symbol.identity_file,
+                where=(
+                    "production repository index symbol identity provenance file"
+                ),
+            )
+            contract = (
+                symbol.symbol_key,
+                symbol.usr,
+                symbol.canonical_signature,
+                symbol.qname,
+                symbol.identity_project,
+                symbol.identity_file,
+                symbol.identity_line,
+                symbol.identity_column,
+                symbol.identity_kind,
+                symbol.identity_provider,
+                symbol.identity_include_provenance,
+            )
+            previous = semantic_contracts.setdefault(
+                symbol.semantic_identity,
+                contract,
+            )
+            if previous != contract:
+                raise ValueError(
+                    "production repository index semantic identity contract "
+                    "mismatch (identity provenance) for "
+                    f"{symbol.semantic_identity!r}"
+                )
+
+            if symbol.usr:
+                expected_prefix = (
+                    f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+                    f"project={self.project_id}\x1fusr="
+                )
+                if not symbol.symbol_key.startswith(expected_prefix) or (
+                    symbol.symbol_key.removeprefix(expected_prefix) != symbol.usr
+                ):
+                    raise ValueError(
+                        "production repository index USR/project identity "
+                        f"mismatch for {symbol.identity!r}"
+                    )
+            elif symbol.canonical_signature:
+                parts = symbol.symbol_key.split("\x1f")
+                fields = {
+                    key: value
+                    for key, separator, value in (
+                        part.partition("=") for part in parts[1:]
+                    )
+                    if separator == "="
+                }
+                scope = fields.get("scope", "")
+                if (
+                    parts[0] != f"fallback:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+                    or not (
+                        scope == f"project={self.project_id}"
+                        or scope.startswith(f"project={self.project_id}|")
+                    )
+                    or fields.get("sig") != " ".join(symbol.canonical_signature.split())
+                ):
+                    raise ValueError(
+                        "production repository index signature/project identity "
+                        f"mismatch for {symbol.identity!r}"
+                    )
+            else:
+                if not is_repo_file_location_identity(symbol.symbol_key):
+                    raise ValueError(
+                        "production repository index symbol without USR or "
+                        f"signature has no explicit location identity: {symbol.identity!r}"
+                    )
+                location_identity = parse_repo_file_location_identity(
+                    symbol.symbol_key,
+                    source=f"production repository index {symbol.identity}",
+                )
+                if (
+                    location_identity.project != self.project_id
+                    or location_identity.project != symbol.identity_project
+                    or location_identity.file != symbol.identity_file
+                    or location_identity.file != symbol.source_path
+                    or location_identity.line != symbol.identity_line
+                    or location_identity.column != symbol.identity_column
+                    or location_identity.kind != symbol.identity_kind
+                    or location_identity.qname != symbol.qname
+                ):
+                    raise ValueError(
+                        "production repository index location/project identity "
+                        f"mismatch for {symbol.identity!r}"
+                    )
+
+            if symbol.chunk_identity:
+                chunk = chunks_by_identity.get(symbol.chunk_identity)
+                if chunk is None:
+                    raise ValueError(
+                        f"production repository index symbol {symbol.identity!r} "
+                        f"references unknown chunk {symbol.chunk_identity!r}"
+                    )
+                if (
+                    chunk.document_id != symbol.document_id
+                    or chunk.source_path != symbol.source_path
+                    or symbol.start < chunk.start
+                    or symbol.end > chunk.end
+                ):
+                    raise ValueError(
+                        "production repository index symbol chunk ownership "
+                        f"mismatch for {symbol.identity!r}"
+                    )
+
+        definitions_by_semantic: dict[str, list[PromptGraphSymbol]] = {}
+        for symbol in self.symbols:
+            if symbol.kind in definition_kinds:
+                definitions_by_semantic.setdefault(
+                    symbol.semantic_identity, []
+                ).append(symbol)
+                document = documents_by_id[symbol.document_id]
+                line_start = document.source.rfind("\n", 0, symbol.start) + 1
+                expected_line = document.source.count("\n", 0, symbol.start) + 1
+                expected_column = (
+                    len(document.source[line_start : symbol.start].encode("utf-8"))
+                    + 1
+                )
+                if (
+                    symbol.identity_file != symbol.source_path
+                    or symbol.identity_line != expected_line
+                    or symbol.identity_column != expected_column
+                ):
+                    raise ValueError(
+                        "production repository index definition identity "
+                        f"provenance does not match source for {symbol.identity!r}"
+                    )
+
+        for semantic_identity, symbols in definitions_by_semantic.items():
+            definition_contract = (
+                symbols[0].identity_project,
+                symbols[0].identity_file,
+                symbols[0].identity_line,
+                symbols[0].identity_column,
+                symbols[0].identity_kind,
+                symbols[0].identity_provider,
+                symbols[0].identity_include_provenance,
+            )
+            if any(
+                (
+                    symbol.identity_project,
+                    symbol.identity_file,
+                    symbol.identity_line,
+                    symbol.identity_column,
+                    symbol.identity_kind,
+                    symbol.identity_provider,
+                    symbol.identity_include_provenance,
+                )
+                != definition_contract
+                for symbol in symbols[1:]
+            ):
+                raise ValueError(
+                    "production repository index definition identity provenance "
+                    f"mismatch for {semantic_identity!r}"
+                )
+
+        for edge in self.edges:
+            if edge.relation not in {"call", "type", "def_use", "domain"}:
+                continue
+            source = symbols_by_identity[edge.source]
+            target = symbols_by_identity[edge.target]
+            if source.semantic_identity != target.semantic_identity:
+                raise ValueError(
+                    "production repository index edge changes semantic identity: "
+                    f"{edge.relation} {edge.source!r}->{edge.target!r}"
+                )
+            if target.kind not in definition_kinds or not target.chunk_identity:
+                raise ValueError(
+                    "production repository index graph edge target is not a "
+                    "definition-owned target: "
+                    f"{edge.target!r}"
+                )
 
 
 def _upgrade_legacy_single_document_index(
@@ -2190,6 +2716,7 @@ class PromptGraphBuilder:
                 "PromptGraphBuilder: prompt/source position map "
                 "length mismatch"
             )
+        _validate_token_source_alignment(token_spans, prompt_to_source)
         _validate_prompt_source_bounds(
             project_index,
             prompt_to_source,
@@ -2598,6 +3125,21 @@ def _token_source_sets(
         }
         for start, end in token_spans
     ]
+
+
+def _validate_token_source_alignment(
+    token_spans: Sequence[tuple[int, int]],
+    prompt_to_source: Sequence[tuple[int, int] | None],
+) -> None:
+    """Reject tokenizer pieces that mix synthetic and source-mapped text."""
+    for token_index, (start, end) in enumerate(token_spans):
+        references = prompt_to_source[start:end]
+        mapped = [reference for reference in references if reference is not None]
+        if mapped and len(mapped) != len(references):
+            raise ValueError(
+                "prompt graph token sidecar alignment crosses mapped and "
+                f"unmapped text at token {token_index}: [{start},{end})"
+            )
 
 
 def _empty_side_channels(

@@ -31,7 +31,10 @@ from cppmega_mlx.training.compiled import (
     normalize_compiled_batch,
 )
 from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_BIAS_BETA,
     STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_SCORE_FORMULA,
+    STAGE1_GRAPH_SCORE_STAGE,
     STAGE1_GRAPH_TOPK,
     stage1_graph_config_kwargs,
     stage1_graph_recipe_binding,
@@ -45,7 +48,9 @@ from cppmega_mlx.training.objective_mixer import (
 
 
 STAGE1_GRAPH_DOMAIN_RECIPE = "stage1_graph_domain_v1"
-PRODUCTION_GRAPH_BETA = 1.0
+STAGE1_GQA_ROUTE_OBJECTIVE = "gqa_route_only_lm_ce"
+STAGE1_DSA_GRAPH_OBJECTIVE = "lm_ce_plus_dsa_indexer_graph_auxiliary"
+PRODUCTION_GRAPH_BETA = float(STAGE1_GRAPH_BIAS_BETA)
 PRODUCTION_DOMAIN_RESIDUAL_SCALE = 1.0
 PRODUCTION_DOMAIN_FIELDS = ("domain_ids", "role_ids", "confidence_ids")
 ProductionAttentionMode = Literal["gqa", "dsa"]
@@ -70,7 +75,7 @@ class _Stage1ObjectiveBatch:
 
 @dataclass(frozen=True)
 class Stage1ProductionObjective:
-    """Canonical differentiated CE + graph objective for production Stage-1."""
+    """Canonical Stage-1 CE objective with optional DSA graph supervision."""
 
     graph_config: GraphAuxLossConfig = STAGE1_PRODUCTION_GRAPH_LOSS
 
@@ -111,14 +116,35 @@ class Stage1ProductionObjective:
         batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     ) -> ProductionTrainingLossBreakdown:
         values = _stage1_objective_batch(batch)
-        if model.config.attention_mode != "dsa":
-            raise ValueError(
-                "production Stage-1 combined objective requires attention_mode='dsa'"
-            )
-        if model.config.attention_sparse_topk != self.graph_config.topk:
+        if (
+            model.config.attention_mode == "dsa"
+            and model.config.attention_sparse_topk != self.graph_config.topk
+        ):
             raise ValueError(
                 "production Stage-1 graph ranking topk differs from model DSA topk: "
                 f"{self.graph_config.topk} != {model.config.attention_sparse_topk}"
+            )
+        if model.config.attention_mode == "gqa":
+            # Dense GQA has no learned indexer score tensor. Graph routes still
+            # condition the full-causal decoder, while DSA-only graph metrics
+            # remain zero instead of re-labelling route eligibility as loss.
+            return production_training_loss_breakdown(
+                model,
+                values.input_ids,
+                values.targets,
+                values.loss_mask,
+                side_channels=values.side_channels,
+                document_ids=values.document_ids,
+                block_bias=values.relation_bias,
+                edge_kind_bias=values.edge_kind_bias,
+                graph_targets=None,
+                graph_pair_mask=None,
+                graph_config=None,
+                graph_weight=0.0,
+            )
+        if model.config.attention_mode != "dsa":
+            raise ValueError(
+                "production Stage-1 supports only attention_mode='gqa' or 'dsa'"
             )
         return production_training_loss_breakdown(
             model,
@@ -143,11 +169,39 @@ class Stage1ProductionObjective:
         breakdown = self.loss_breakdown(model, batch)
         return breakdown.total, breakdown.ntokens
 
-    def receipt(self) -> dict[str, Any]:
+    def receipt(
+        self,
+        *,
+        attention_mode: ProductionAttentionMode,
+    ) -> dict[str, Any]:
+        if attention_mode == "gqa":
+            return {
+                "name": STAGE1_GQA_ROUTE_OBJECTIVE,
+                "attention_mode": attention_mode,
+                "formula": "lm_ce",
+                "graph_route": "dense_additive_bias_full_causal",
+                "graph_supervision": "none",
+                "graph_auxiliary_enabled": False,
+                "route_only": True,
+                "single_decoder_forward": True,
+            }
+        if attention_mode != "dsa":
+            raise ValueError(
+                "production Stage-1 receipt requires attention_mode='gqa' or 'dsa'"
+            )
         config = self.graph_config
         return {
+            "name": STAGE1_DSA_GRAPH_OBJECTIVE,
+            "attention_mode": attention_mode,
             "recipe": stage1_graph_recipe_binding(),
+            "bias_beta": STAGE1_GRAPH_BIAS_BETA,
+            "score_formula": STAGE1_GRAPH_SCORE_FORMULA,
+            "score_stage": STAGE1_GRAPH_SCORE_STAGE,
             "formula": "lm_ce + graph_edge_bce + graph_ranking",
+            "graph_route": "dsa_sparse_indexer",
+            "graph_supervision": "dsa_indexer",
+            "graph_auxiliary_enabled": True,
+            "route_only": False,
             "relations": list(config.relations),
             "topk": config.topk,
             "global_weight": config.global_weight,
@@ -331,7 +385,7 @@ def stage1_production_batch_receipt(
     *,
     config: DenseCppLMConfig,
 ) -> dict[str, Any]:
-    """Validate one startup batch and return its graph/domain signal receipt."""
+    """Validate one startup batch and receipt route vs. active loss signals."""
 
     _validate_stage1_production_config(config)
     lm_batch = ensure_lm_batch(batch)
@@ -363,7 +417,7 @@ def stage1_production_batch_receipt(
     graph_prior_nonzero_array = mx.sum(graph_bias != 0)
     edge_kind_prior_nonzero_array = mx.sum(edge_kind_bias != 0)
     objective_values = _stage1_objective_batch(lm_batch)
-    graph_positive_pairs_array = mx.sum(objective_values.graph_targets)
+    graph_route_positive_pairs_array = mx.sum(objective_values.graph_targets)
 
     domain_arrays: dict[str, mx.array] = {}
     for name in PRODUCTION_DOMAIN_FIELDS:
@@ -380,18 +434,22 @@ def stage1_production_batch_receipt(
     mx.eval(
         graph_prior_nonzero_array,
         edge_kind_prior_nonzero_array,
-        graph_positive_pairs_array,
+        graph_route_positive_pairs_array,
         domain_tokens_array,
     )
     graph_prior_nonzero = int(graph_prior_nonzero_array.item())
     edge_kind_prior_nonzero = int(edge_kind_prior_nonzero_array.item())
-    graph_positive_pairs = int(graph_positive_pairs_array.item())
+    graph_route_positive_pairs = int(graph_route_positive_pairs_array.item())
     domain_tokens_nonzero = int(domain_tokens_array.item())
     if domain_tokens_nonzero <= 0:
         raise ValueError("production Stage-1 requires nonzero domain tokens")
 
     return {
         "recipe": STAGE1_GRAPH_DOMAIN_RECIPE,
+        "graph_recipe": stage1_graph_recipe_binding(),
+        "bias_beta": STAGE1_GRAPH_BIAS_BETA,
+        "score_formula": STAGE1_GRAPH_SCORE_FORMULA,
+        "score_stage": STAGE1_GRAPH_SCORE_STAGE,
         "attention_mode": config.attention_mode,
         "graph_edges": graph_edges,
         "edge_kind_edges": edge_kind_edges,
@@ -404,7 +462,10 @@ def stage1_production_batch_receipt(
             }
         ),
         "graph_prior_nonzero": graph_prior_nonzero,
-        "graph_positive_pairs": graph_positive_pairs,
+        "graph_route_positive_pairs": graph_route_positive_pairs,
+        "graph_supervision_positive_pairs": (
+            graph_route_positive_pairs if config.attention_mode == "dsa" else 0
+        ),
         "edge_kind_prior_nonzero": edge_kind_prior_nonzero,
         "graph_attention_bias_beta": config.graph_attention_bias_beta,
         "domain_sidecars": sorted(domain_arrays),
@@ -459,11 +520,6 @@ def run_stage1_graph_domain_production(
 
     if steps < 1:
         raise ValueError("production Stage-1 steps must be positive")
-    if attention_mode != "dsa":
-        raise ValueError(
-            "production Stage-1 combined CE + graph objective requires "
-            "attention_mode='dsa'"
-        )
     objective = Stage1ProductionObjective(graph_loss_config)
     dataset = open_production_megatron_bundle(
         data_path,
@@ -502,7 +558,9 @@ def run_stage1_graph_domain_production(
     startup = {
         **stage1_production_batch_receipt(first_batch, config=model.config),
         **dataset.metadata.provenance_receipt(),
-        "loss_objective": objective.receipt(),
+        "loss_objective": objective.receipt(
+            attention_mode=model.config.attention_mode
+        ),
     }
     print("[stage1-production-startup] " + json.dumps(startup, sort_keys=True), flush=True)
 
@@ -519,7 +577,7 @@ def run_stage1_graph_domain_production(
     )
     batch_iter = dataset.iter_batches(loop=True)
     observed_edges = 0
-    observed_graph_positive_pairs = 0
+    observed_graph_route_positive_pairs = 0
     observed_edge_kind_edges = 0
     observed_graph_prior_nonzero = 0
     observed_edge_kind_prior_nonzero = 0
@@ -531,7 +589,9 @@ def run_stage1_graph_domain_production(
         current = next(batch_iter)
         counts = _batch_route_counts(current)
         observed_edges += counts["graph_edges"]
-        observed_graph_positive_pairs += counts["graph_positive_pairs"]
+        observed_graph_route_positive_pairs += counts[
+            "graph_route_positive_pairs"
+        ]
         observed_edge_kind_edges += counts["edge_kind_edges"]
         observed_graph_prior_nonzero += counts["graph_prior_nonzero"]
         observed_edge_kind_prior_nonzero += counts["edge_kind_prior_nonzero"]
@@ -541,7 +601,7 @@ def run_stage1_graph_domain_production(
         last_domain_residual_l1 = _domain_residual_l1(model, current)
     if (
         observed_edges <= 0
-        or observed_graph_positive_pairs <= 0
+        or observed_graph_route_positive_pairs <= 0
         or observed_edge_kind_edges <= 0
         or observed_graph_prior_nonzero <= 0
         or observed_domain_tokens <= 0
@@ -557,7 +617,12 @@ def run_stage1_graph_domain_production(
         "steps": steps,
         "compiled": compile,
         "observed_graph_edges": observed_edges,
-        "observed_graph_positive_pairs": observed_graph_positive_pairs,
+        "observed_graph_route_positive_pairs": observed_graph_route_positive_pairs,
+        "observed_graph_supervision_positive_pairs": (
+            observed_graph_route_positive_pairs
+            if model.config.attention_mode == "dsa"
+            else 0
+        ),
         "observed_edge_kind_edges": observed_edge_kind_edges,
         "observed_graph_prior_nonzero": observed_graph_prior_nonzero,
         "observed_edge_kind_prior_nonzero": observed_edge_kind_prior_nonzero,
@@ -572,14 +637,16 @@ def run_stage1_graph_domain_production(
 
 def _validate_stage1_production_config(config: DenseCppLMConfig) -> None:
     if (
-        not config.graph_routes_enabled
+        config.attention_mode not in ("gqa", "dsa")
+        or not config.graph_routes_enabled
         or not config.require_graph_routes
         or config.graph_attention_bias_beta != PRODUCTION_GRAPH_BETA
         or config.domain_residual_scale != PRODUCTION_DOMAIN_RESIDUAL_SCALE
         or not config.require_domain_routes
     ):
         raise ValueError(
-            "batch receipt requires the canonical Stage-1 graph/domain config"
+            "batch receipt requires the canonical Stage-1 graph/domain config "
+            "with attention_mode='gqa' or 'dsa'"
         )
 
 
@@ -674,13 +741,13 @@ def _batch_route_counts(batch: LMTokenBatch) -> dict[str, int]:
     relation_count = mx.sum(relation_bias != 0)
     kind_count = mx.sum(kind_bias != 0)
     objective_values = _stage1_objective_batch(lm_batch)
-    graph_positive_pairs = mx.sum(objective_values.graph_targets)
-    mx.eval(count, relation_count, kind_count, graph_positive_pairs)
+    graph_route_positive_pairs = mx.sum(objective_values.graph_targets)
+    mx.eval(count, relation_count, kind_count, graph_route_positive_pairs)
     return {
         "graph_edges": graph_edges,
         "edge_kind_edges": edge_kind_edges,
         "graph_prior_nonzero": int(relation_count.item()),
-        "graph_positive_pairs": int(graph_positive_pairs.item()),
+        "graph_route_positive_pairs": int(graph_route_positive_pairs.item()),
         "edge_kind_prior_nonzero": int(kind_count.item()),
         "domain_tokens_nonzero": int(count.item()),
         "document_boundaries": _document_boundary_count(lm_batch),
@@ -728,7 +795,9 @@ def _domain_residual_l1(model: DenseCppLM, batch: LMTokenBatch) -> float:
 __all__ = [
     "PRODUCTION_DOMAIN_RESIDUAL_SCALE",
     "PRODUCTION_GRAPH_BETA",
+    "STAGE1_DSA_GRAPH_OBJECTIVE",
     "STAGE1_GRAPH_DOMAIN_RECIPE",
+    "STAGE1_GQA_ROUTE_OBJECTIVE",
     "STAGE1_PRODUCTION_GRAPH_LOSS",
     "STAGE1_PRODUCTION_GRAPH_RELATIONS",
     "Stage1ProductionObjective",

@@ -13,7 +13,10 @@ import pytest
 from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
-from cppmega_mlx.data.graph_recipe import STAGE1_GRAPH_RELATIONS
+from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    stage1_graph_recipe_binding,
+)
 from cppmega_mlx.models.dense_cpp_lm import GraphIndexedAttention
 from cppmega_mlx.training.stage1_production import (
     STAGE1_GRAPH_DOMAIN_RECIPE,
@@ -151,9 +154,14 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
     receipt = stage1_production_batch_receipt(_production_batch(), config=cfg)
 
     assert receipt["recipe"] == STAGE1_GRAPH_DOMAIN_RECIPE
+    assert receipt["graph_recipe"] == stage1_graph_recipe_binding()
+    assert receipt["bias_beta"] == "1"
+    assert receipt["score_formula"] == "i_neural_plus_beta_s_graph_v1"
+    assert receipt["score_stage"] == "before_topk"
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
-    assert receipt["graph_positive_pairs"] == 1
+    assert receipt["graph_route_positive_pairs"] == 1
+    assert receipt["graph_supervision_positive_pairs"] == 0
     assert receipt["edge_kind_edges"] == 1
     assert receipt["edge_kind_ids"] == [int(DomainEdgeKind.DIAG_PRIMARY_LOCATION)]
     assert receipt["edge_kind_prior_nonzero"] == 1
@@ -166,6 +174,26 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
         "domain_ids",
         "role_ids",
     ]
+
+
+def test_stage1_dsa_receipt_marks_route_pairs_as_graph_supervision() -> None:
+    cfg = stage1_production_config(
+        attention_mode="dsa",
+        vocab_size=64,
+        hidden_size=32,
+        depth=1,
+        ffn_hidden_size=64,
+        max_seq_length=8,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=8,
+        ngram_hash_enabled=False,
+    )
+
+    receipt = stage1_production_batch_receipt(_production_batch(), config=cfg)
+
+    assert receipt["graph_route_positive_pairs"] == 1
+    assert receipt["graph_supervision_positive_pairs"] == 1
 
 
 def test_stage1_production_receipt_and_counts_accept_graphless_batch() -> None:
@@ -187,13 +215,14 @@ def test_stage1_production_receipt_and_counts_accept_graphless_batch() -> None:
 
     assert receipt["graph_edges"] == 0
     assert receipt["graph_prior_nonzero"] == 0
-    assert receipt["graph_positive_pairs"] == 0
+    assert receipt["graph_route_positive_pairs"] == 0
+    assert receipt["graph_supervision_positive_pairs"] == 0
     assert receipt["edge_kind_edges"] == 0
     assert receipt["edge_kind_ids"] == []
     assert counts["graph_edges"] == 0
     assert counts["graph_prior_nonzero"] == 0
     assert counts["edge_kind_edges"] == 0
-    assert counts["graph_positive_pairs"] == 0
+    assert counts["graph_route_positive_pairs"] == 0
 
 
 def test_stage1_receipt_reports_zero_for_raw_noncausal_only_graph() -> None:
@@ -218,7 +247,8 @@ def test_stage1_receipt_reports_zero_for_raw_noncausal_only_graph() -> None:
 
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
-    assert receipt["graph_positive_pairs"] == 0
+    assert receipt["graph_route_positive_pairs"] == 0
+    assert receipt["graph_supervision_positive_pairs"] == 0
 
 
 def test_stage1_route_counts_reject_raw_noncausal_edges_as_graph_signal() -> None:
@@ -231,7 +261,7 @@ def test_stage1_route_counts_reject_raw_noncausal_edges_as_graph_signal() -> Non
 
     assert counts["graph_edges"] == 1
     assert counts["graph_prior_nonzero"] == 1
-    assert counts["graph_positive_pairs"] == 0
+    assert counts["graph_route_positive_pairs"] == 0
 
 
 def test_stage1_production_accepts_valid_categories_with_zero_kind_delta() -> None:
@@ -535,16 +565,17 @@ def test_stage1_runner_requires_and_uses_only_production_bundle_ingress() -> Non
     assert "provenance_receipt()" in source
 
 
-def test_generic_stage1_runner_threads_explicit_edge_kind_bias() -> None:
+def test_generic_stage1_runner_uses_one_typed_graph_objective_path() -> None:
     module_source = inspect.getsource(
         importlib.import_module("scripts.train_eval_stage1")
     )
 
-    assert "edge_kind_bias=mx.array(edge_kind_bias)" in module_source
-    assert "edge_kind_bias=edge_kind_bias if graph_aux_enabled else None" in (
-        module_source
-    )
-    assert "edge_kind_bias=mx.zeros_like(block_bias)" not in module_source
+    assert "graph_batch_from_objective_routes(" in module_source
+    assert "edge_kind_bias=edge_kind_bias," in module_source
+    assert "objective_loss_and_grad = nn.value_and_grad(" in module_source
+    assert "_reordered_lm_loss" not in module_source
+    assert "np.zeros((batch_size, seq_len, seq_len)" not in module_source
+    assert "np.asarray(row_relation_bias" not in module_source
 
 
 def test_named_stage1_trainers_import_in_fresh_subprocess() -> None:

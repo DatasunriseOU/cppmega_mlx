@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import shutil
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cppmega_mlx.data import prompt_graph_index as prompt_graph_index_module
 from cppmega_mlx.data.prompt_graph import (
     PromptGraphBuilder,
     PromptGraphContext,
     PromptGraphSegment,
+    PromptProjectIndex,
 )
-from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
+from cppmega_mlx.data.prompt_graph_index import (
+    ClangPromptProjectIndexProducer,
+)
+from cppmega_mlx.data.symbol_identity import compute_symbol_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -167,6 +174,404 @@ def test_real_producer_preserves_overloads_and_cross_document_calls(tmp_path: Pa
         helper.id,
         caller.id,
     }
+
+
+def test_real_producer_emits_integrity_bound_v3_production_index(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-production"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+
+    result.index.validate_production_repository_index(
+        expected_project_id=project_id,
+        expected_indexer_root=ROOT,
+    )
+    assert result.receipt["strict_diagnostics"] is True
+    assert result.receipt["index_payload_sha256"] == result.index.payload_sha256
+    assert result.receipt["symbol_identity_schema_version"] == 3
+    assert result.receipt["identity_adapters"] == [
+        "case4_symbol_reference_for_cursor_v3"
+    ]
+    assert max(symbol.symbol_id for symbol in result.index.symbols) > 0xFFFFFFFF
+
+
+def test_production_index_rejects_raw_identity_adapter_provenance(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-native-identity"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    payload["provenance"]["identity_adapters"] = [
+        "raw_clang_usr_signature_v3_adapter"
+    ]
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="untrusted identity adapter"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_prompt_producer_requires_native_case4_v3_identity_helper(
+    tmp_path: Path,
+) -> None:
+    class _CursorKind:
+        name = "FUNCTION_DECL"
+
+    cursor = SimpleNamespace(
+        kind=_CursorKind(),
+        spelling="route",
+        location=SimpleNamespace(
+            file=SimpleNamespace(name=str(tmp_path / "repo" / "route.cpp")),
+            line=4,
+            column=5,
+        ),
+    )
+    indexer = SimpleNamespace(get_qualified_name=lambda _cursor: "api::route")
+
+    with pytest.raises(RuntimeError, match="native CASE 4 v3"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            cursor,
+            repo_root=tmp_path / "repo",
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_prompt_producer_rejects_identity_without_provenance(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    source_file = repo_root / "route.cpp"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("int route() { return 1; }\n", encoding="utf-8")
+    symbol_key = (
+        "usr:schema=v3\x1fproject=tests/native-identity\x1f"
+        "usr=c:@F@route#"
+    )
+
+    class _CursorKind:
+        name = "FUNCTION_DECL"
+
+    cursor = SimpleNamespace(
+        kind=_CursorKind(),
+        spelling="route",
+        location=SimpleNamespace(
+            file=SimpleNamespace(name=str(source_file)),
+            line=1,
+            column=5,
+        ),
+    )
+
+    class _Indexer:
+        @staticmethod
+        def symbol_reference_for_cursor(_cursor, **_kwargs):
+            return {
+                "symbol_identity_schema_version": 3,
+                "symbol_key": symbol_key,
+                "symbol_id": compute_symbol_id(symbol_key),
+                "qname": "api::route",
+                "usr": "c:@F@route#",
+                "canonical_signature": "display=route()|type=int ()",
+                "symbol_kind": "FUNCTION_DECL",
+            }
+
+    with pytest.raises(ValueError, match="provenance"):
+        prompt_graph_index_module._identity_for_cursor(
+            _Indexer,
+            cursor,
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def _native_identity_reference(
+    *,
+    project: str,
+    file: str,
+    line: int = 1,
+    column: int = 5,
+) -> dict[str, object]:
+    symbol_key = f"usr:schema=v3\x1fproject={project}\x1fusr=c:@F@route#"
+    return {
+        "symbol_identity_schema_version": 3,
+        "symbol_key": symbol_key,
+        "symbol_id": compute_symbol_id(symbol_key),
+        "qname": "api::route",
+        "usr": "c:@F@route#",
+        "canonical_signature": "display=route()|type=int ()",
+        "symbol_kind": "FUNCTION_DECL",
+        "project": project,
+        "file": file,
+        "line": line,
+        "column": column,
+        "provider": "clang",
+        "include_provenance": "direct",
+    }
+
+
+def _identity_cursor(*, file: Path | None, line: int = 1, column: int = 5):
+    class _CursorKind:
+        name = "FUNCTION_DECL"
+
+    return SimpleNamespace(
+        kind=_CursorKind(),
+        spelling="route",
+        location=SimpleNamespace(
+            file=None if file is None else SimpleNamespace(name=str(file)),
+            line=line,
+            column=column,
+        ),
+    )
+
+
+def test_prompt_identity_rejects_foreign_project_without_cursor_file(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reference = _native_identity_reference(
+        project="other/project",
+        file="route.cpp",
+    )
+    indexer = SimpleNamespace(
+        symbol_reference_for_cursor=lambda _cursor, **_kwargs: reference
+    )
+
+    with pytest.raises(ValueError, match="repository project"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            _identity_cursor(file=None),
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_prompt_identity_rejects_missing_cursor_file(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reference = _native_identity_reference(
+        project="tests/native-identity",
+        file="route.cpp",
+    )
+    indexer = SimpleNamespace(
+        symbol_reference_for_cursor=lambda _cursor, **_kwargs: reference
+    )
+
+    with pytest.raises(ValueError, match="cursor file is missing"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            _identity_cursor(file=None),
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_prompt_identity_rejects_out_of_repository_cursor_file(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside = tmp_path / "outside" / "route.cpp"
+    outside.parent.mkdir()
+    outside.write_text("int route();\n", encoding="utf-8")
+    reference = _native_identity_reference(
+        project="tests/native-identity",
+        file="route.cpp",
+    )
+    indexer = SimpleNamespace(
+        symbol_reference_for_cursor=lambda _cursor, **_kwargs: reference
+    )
+
+    with pytest.raises(ValueError, match="outside repository root"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            _identity_cursor(file=outside),
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_production_index_rejects_identity_provenance_tampering(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-identity-provenance"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    definition = next(
+        row for row in payload["symbols"] if row["kind"] == "function"
+    )
+    definition["identity_file"] = (
+        "include/repo_api.hpp"
+        if definition["identity_file"] != "include/repo_api.hpp"
+        else "src/math_prompt.cpp"
+    )
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="identity provenance"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_cached_index_payload_checksum_rejects_tampering(tmp_path: Path) -> None:
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    result = producer.build(FIXTURE, project_id="tests/case3-payload-integrity")
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    payload["symbols"][0]["qname"] += "_tampered"
+    result.path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="payload integrity mismatch"):
+        producer.build(FIXTURE, project_id="tests/case3-payload-integrity")
+
+
+def test_production_index_rejects_non_checkout_indexer_provenance(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-indexer-provenance"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    wrong_indexer = ROOT / "cppmega_mlx" / "data" / "prompt_graph.py"
+    payload["provenance"]["indexer_path"] = str(wrong_indexer)
+    payload["provenance"]["hashes"]["indexer_sha256"] = sha256(
+        wrong_indexer.read_bytes()
+    ).hexdigest()
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="same-checkout indexer"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_production_index_rejects_usr_signature_contract_tampering(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-semantic-contract"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    definition = next(
+        row
+        for row in payload["symbols"]
+        if row["kind"] == "function"
+        and row["qname"] == "case3_repo::repository_helper"
+        and "args=(int)" in row["canonical_signature"]
+    )
+    occurrence = next(
+        row
+        for row in payload["symbols"]
+        if row["identity"] != definition["identity"]
+        and row["semantic_identity"] == definition["semantic_identity"]
+    )
+    occurrence["canonical_signature"] += "|tampered=true"
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="semantic identity contract"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_tampered_cached_overload_edge_fails_closed(tmp_path: Path) -> None:
+    project_id = "tests/case3-cache-integrity"
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    result = producer.build(FIXTURE, project_id=project_id)
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    helper_definitions = [
+        row
+        for row in payload["symbols"]
+        if row["kind"] == "function"
+        and row["qname"] == "case3_repo::repository_helper"
+    ]
+    int_definition = next(
+        row for row in helper_definitions if "args=(int)" in row["canonical_signature"]
+    )
+    double_definition = next(
+        row
+        for row in helper_definitions
+        if "args=(double)" in row["canonical_signature"]
+    )
+    edge = next(
+        row
+        for row in payload["edges"]
+        if row["relation"] == "call" and row["target"] == int_definition["identity"]
+    )
+    edge["target"] = double_definition["identity"]
+    tampered_index = PromptProjectIndex.from_dict(payload).with_integrity()
+    result.path.write_text(
+        json.dumps(tampered_index.to_dict()) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="edge changes semantic identity"):
+        producer.build(FIXTURE, project_id=project_id)
+
+
+def test_cached_graph_edge_target_must_be_definition_owned(tmp_path: Path) -> None:
+    project_id = "tests/case3-definition-target"
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    result = producer.build(FIXTURE, project_id=project_id)
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    definition = next(
+        row
+        for row in payload["symbols"]
+        if row["kind"] == "function"
+        and row["qname"] == "case3_repo::repository_helper"
+        and "args=(int)" in row["canonical_signature"]
+    )
+    occurrence = next(
+        row
+        for row in payload["symbols"]
+        if row["semantic_identity"] == definition["semantic_identity"]
+        and row["kind"] in {"callsite", "use"}
+    )
+    edge = next(
+        row
+        for row in payload["edges"]
+        if row["relation"] == "call" and row["target"] == definition["identity"]
+    )
+    edge["target"] = occurrence["identity"]
+    tampered_index = PromptProjectIndex.from_dict(payload).with_integrity()
+    result.path.write_text(
+        json.dumps(tampered_index.to_dict()) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="definition-owned target"):
+        producer.build(FIXTURE, project_id=project_id)
 
 
 def test_index_cache_key_tracks_repository_and_indexer_freshness(tmp_path: Path) -> None:

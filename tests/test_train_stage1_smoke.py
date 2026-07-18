@@ -24,13 +24,14 @@ import pytest
 
 from cppmega_mlx.data.fim import FIMSpecialTokenIds
 from cppmega_mlx.data.ast_fim import domain_preserving_document_spans
-from cppmega_mlx.models.dense_cpp_lm import DenseCppLM
+from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.training.objectives import build_causal_lm
 from scripts.train_stage1 import (
     _ALIGNED_OBJECTIVES,
     _REORDERED_OBJECTIVES,
     GOLDEN_MINI,
     _assert_aligned,
+    _loss_for_step,
     build_train_step,
     load_code_packets,
     load_commit_packets,
@@ -179,6 +180,13 @@ def test_aligned_step_passes_channels_reordered_step_omits_them() -> None:
     )
     packet = packets[0]
 
+    # The packed row carries domain routes and graph edges; the loader must
+    # preserve both typed contracts instead of leaving them in opaque metadata.
+    assert packet.domain_ids is not None
+    assert packet.role_ids is not None
+    assert packet.confidence_ids is not None
+    assert packet.graph_batch().graphs[0].relations
+
     # Aligned objective (causal_lm) -> channels ARE passed and length-matched.
     example = build_causal_lm(packet)
     aligned = build_train_step("causal_lm", example, packet)
@@ -188,6 +196,10 @@ def test_aligned_step_passes_channels_reordered_step_omits_them() -> None:
         if name == "platform_ids":
             continue  # document-level (1, K), not token-aligned
         assert int(chan.shape[1]) == s, (name, chan.shape, s)
+    assert {"domain_ids", "role_ids", "confidence_ids"} <= set(
+        aligned.side_channels
+    )
+    assert aligned.graph_batch is not None
 
     # The aligned step runs through the real model with channels ON.
     model = DenseCppLM(smoke_config(VOCAB))
@@ -198,6 +210,33 @@ def test_aligned_step_passes_channels_reordered_step_omits_them() -> None:
         **aligned.side_channels,
     )
     assert mx.isfinite(loss).item()
+
+
+def test_aligned_step_graph_routes_reach_graph_enabled_model() -> None:
+    packet = load_code_packets(
+        sorted((GOLDEN_MINI / "code").glob("*.parquet")), vocab_size=VOCAB
+    )[0]
+    step = build_train_step("causal_lm", build_causal_lm(packet), packet)
+    model = DenseCppLM(
+        DenseCppLMConfig(
+            vocab_size=VOCAB,
+            hidden_size=16,
+            depth=1,
+            ffn_hidden_size=32,
+            max_seq_length=4096,
+            num_query_heads=2,
+            num_kv_heads=1,
+            head_dim=8,
+            graph_routes_enabled=True,
+            graph_attention_bias_beta=10.0,
+            ngram_hash_enabled=False,
+            domain_residual_scale=1.0,
+        )
+    )
+
+    loss = _loss_for_step(model, step, channels_on=True)
+    mx.eval(loss)
+    assert np.isfinite(float(loss.item()))
 
 
 def test_misaligned_channel_pass_raises() -> None:
@@ -243,3 +282,9 @@ def test_build_train_step_disables_channels_for_reordered_objective() -> None:
     step = build_train_step("ast_fim", example, packet)
     assert step.objective == "ast_fim"
     assert step.side_channels == {}, "reordered objective must disable side-channels"
+    assert step.graph_batch is None
+    assert step.metadata_only["reason"] == (
+        "objective_changes_token_order_or_synthesizes_tokens"
+    )
+    assert "domain_ids" in step.metadata_only["source_fields"]
+    assert "type_edges" in step.metadata_only["source_fields"]

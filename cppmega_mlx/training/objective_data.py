@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from numbers import Integral
 from typing import Any
 
 import mlx.core as mx
@@ -47,7 +48,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKENIZED_ENRICHED_TEMPORAL_TOKEN_COLUMNS,
     SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.fim import INSERTED_TOKEN_SOURCE_INDEX
 from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITIES_COLUMN
 from cppmega_mlx.training.objective_mixer import (
@@ -170,6 +171,14 @@ def normalize_megatron_objective_source_row(
 
     normalized = dict(row)
     if TOKEN_IDS_COLUMN in normalized:
+        if (
+            INPUT_IDS_COLUMN in normalized
+            or VALID_TOKEN_COUNT_COLUMN in normalized
+        ):
+            raise ValueError(
+                "objective source cannot contain both token_ids and packed "
+                "input_ids/valid_token_count columns"
+            )
         return normalized
     if INPUT_IDS_COLUMN not in normalized or VALID_TOKEN_COUNT_COLUMN not in normalized:
         raise ValueError(
@@ -179,8 +188,11 @@ def normalize_megatron_objective_source_row(
 
     packed_tokens = list(normalized[INPUT_IDS_COLUMN] or [])
     raw_valid = normalized[VALID_TOKEN_COUNT_COLUMN]
-    if isinstance(raw_valid, bool):
-        raise ValueError("valid_token_count must be an integer, not bool")
+    if isinstance(raw_valid, bool) or not isinstance(raw_valid, Integral):
+        raise ValueError(
+            "valid_token_count must be an integer, not "
+            f"{type(raw_valid).__name__}"
+        )
     valid = int(raw_valid)
     if not 0 < valid <= len(packed_tokens):
         raise ValueError(
@@ -207,8 +219,14 @@ def normalize_megatron_objective_source_row(
     if packed_instructions is not None:
         instructions = list(packed_instructions)
         raw_num_docs = normalized.get(NUM_DOCS_COLUMN, len(instructions))
-        if isinstance(raw_num_docs, bool):
-            raise ValueError("num_docs must be an integer, not bool")
+        if (
+            isinstance(raw_num_docs, bool)
+            or not isinstance(raw_num_docs, Integral)
+        ):
+            raise ValueError(
+                "num_docs must be an integer, not "
+                f"{type(raw_num_docs).__name__}"
+            )
         num_docs = int(raw_num_docs)
         if num_docs != len(instructions):
             raise ValueError(
@@ -479,6 +497,138 @@ def empty_objective_routes() -> dict[str, list[Any]]:
 class ObjectiveRouteRemap:
     columns: dict[str, list[Any]]
     receipt: dict[str, object]
+
+
+def graph_batch_from_objective_routes(
+    route_columns: Mapping[str, Any],
+    *,
+    input_length: int,
+    where: str,
+) -> GraphBatch:
+    """Build one typed graph batch from exact objective-route columns.
+
+    The route columns are already in output-token/chunk coordinates, so this
+    adapter only validates and wraps them.  It never creates a dense ``S x S``
+    staging array; dense bias construction remains an explicit model input
+    decision for the attention implementation.
+    """
+
+    if not isinstance(route_columns, Mapping):
+        raise TypeError(
+            f"{where}: objective route columns must be a mapping, got "
+            f"{type(route_columns).__name__}"
+        )
+    if input_length <= 0:
+        raise ValueError(f"{where}: input_length must be positive, got {input_length}")
+
+    chunk_values: dict[str, list[int]] = {}
+    for field in OBJECTIVE_CHUNK_ROUTE_COLUMNS:
+        raw = route_columns.get(field)
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            raise ValueError(f"{where}: {field} must be a sequence")
+        values: list[int] = []
+        for index, value in enumerate(raw):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"{where}: {field}[{index}] must be an integer, got {value!r}"
+                )
+            values.append(int(value))
+        chunk_values[field] = values
+    chunk_count = len(chunk_values["token_chunk_starts"])
+    if any(len(values) != chunk_count for values in chunk_values.values()):
+        raise ValueError(
+            f"{where}: remapped chunk route columns must have equal lengths: "
+            + ", ".join(f"{name}={len(values)}" for name, values in chunk_values.items())
+        )
+    previous_end = 0
+    for chunk_index, (start, end) in enumerate(
+        zip(
+            chunk_values["token_chunk_starts"],
+            chunk_values["token_chunk_ends"],
+            strict=True,
+        )
+    ):
+        if not 0 <= start < end <= input_length:
+            raise ValueError(
+                f"{where}: remapped chunk {chunk_index} span [{start}, {end}) "
+                f"is outside objective input length {input_length}"
+            )
+        if chunk_index and start < previous_end:
+            raise ValueError(
+                f"{where}: remapped chunk {chunk_index} starts at {start} before "
+                f"the previous chunk ends at {previous_end}"
+            )
+        previous_end = end
+
+    edges: dict[str, EdgeIndex] = {}
+    edge_kinds: dict[str, mx.array] = {}
+    for relation, column in OBJECTIVE_GRAPH_RELATION_COLUMNS.items():
+        raw_edges = route_columns.get(column)
+        if not isinstance(raw_edges, Sequence) or isinstance(raw_edges, (str, bytes)):
+            raise ValueError(f"{where}: {column} must be a sequence")
+        pairs: list[tuple[int, int]] = []
+        kinds: list[int] = []
+        bound = chunk_count if relation in _CHUNK_GRAPH_FIELDS else input_length
+        for edge_index, raw_edge in enumerate(raw_edges):
+            if not isinstance(raw_edge, Mapping):
+                raise ValueError(
+                    f"{where}: {column}[{edge_index}] must be a mapping"
+                )
+            required = {"from", "to"}
+            if relation in _TOKEN_GRAPH_FIELDS:
+                required.add("kind")
+            if set(raw_edge) != required:
+                raise ValueError(
+                    f"{where}: {column}[{edge_index}] fields must be "
+                    f"{sorted(required)}, got {sorted(raw_edge)}"
+                )
+            source = raw_edge["from"]
+            destination = raw_edge["to"]
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                for value in (source, destination)
+            ):
+                raise ValueError(
+                    f"{where}: {column}[{edge_index}] endpoints must be integers"
+                )
+            source_int = int(source)
+            destination_int = int(destination)
+            if not (
+                0 <= source_int < bound and 0 <= destination_int < bound
+            ):
+                coordinate = "chunks" if relation in _CHUNK_GRAPH_FIELDS else "tokens"
+                raise ValueError(
+                    f"{where}: {relation} edge ({source_int}, {destination_int}) "
+                    f"is outside {bound} {coordinate}"
+                )
+            pairs.append((source_int, destination_int))
+            if relation in _TOKEN_GRAPH_FIELDS:
+                kind = raw_edge["kind"]
+                if isinstance(kind, bool) or not isinstance(kind, (int, np.integer)):
+                    raise ValueError(
+                        f"{where}: {column}[{edge_index}].kind must be an integer"
+                    )
+                kinds.append(int(kind))
+        edges[relation] = EdgeIndex.from_pairs(
+            pairs,
+            relation=relation,
+            num_nodes=bound,
+        )
+        if relation in _TOKEN_GRAPH_FIELDS:
+            edge_kinds[relation] = mx.array(kinds, dtype=mx.int32)
+
+    graph = GraphPacket(edges=edges, num_nodes=chunk_count)
+    return GraphBatch(
+        graphs=(graph,),
+        chunk_starts=(mx.array(chunk_values["token_chunk_starts"], dtype=mx.int32),),
+        chunk_ends=(mx.array(chunk_values["token_chunk_ends"], dtype=mx.int32),),
+        chunk_kinds=(mx.array(chunk_values["token_chunk_kinds"], dtype=mx.int32),),
+        chunk_dep_levels=(
+            mx.array(chunk_values["token_chunk_dep_levels"], dtype=mx.int32),
+        ),
+        edge_kinds=(edge_kinds,),
+    )
 
 
 def _empty_relation_counts(*, source_edges: int = 0) -> dict[str, int]:
@@ -1013,6 +1163,7 @@ __all__ = [
     "ObjectiveRouteRemap",
     "empty_objective_routes",
     "exclude_objective_routes",
+    "graph_batch_from_objective_routes",
     "graph_targets_and_pair_mask",
     "normalize_megatron_objective_source_row",
     "objective_source_from_tokenized_row",

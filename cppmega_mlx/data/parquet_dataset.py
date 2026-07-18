@@ -19,6 +19,11 @@ import mlx.core as mx
 import numpy as np
 
 from cppmega_mlx.data.batch import LMTokenBatch
+from cppmega_mlx.data.domain_schema import (
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    normalize_domain_edge_record,
+)
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.platform_context import MAX_PLATFORM_IDS
 from cppmega_mlx.data.token_dataset import (
     BatchCursor,
@@ -56,6 +61,11 @@ _TOKEN_CHUNK_METADATA_COLUMNS = (
 _TOKEN_GRAPH_METADATA_COLUMNS = (
     "token_call_edges",
     "token_type_edges",
+)
+_TOKEN_DOMAIN_GRAPH_METADATA_COLUMNS = tuple(TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES)
+_GRAPH_BATCH_METADATA_COLUMNS = (
+    *_TOKEN_GRAPH_METADATA_COLUMNS,
+    *_TOKEN_DOMAIN_GRAPH_METADATA_COLUMNS,
 )
 _TOKEN_SEMANTIC_METADATA_COLUMNS = (
     "token_symbol_ids",
@@ -104,6 +114,14 @@ _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS_FLAT = tuple(
     for columns in _FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS.values()
     for column in columns
 )
+_GRAPH_COLUMN_TO_RELATION: Mapping[str, tuple[str, str]] = {
+    "token_call_edges": ("call", "chunk_index"),
+    "token_type_edges": ("type", "chunk_index"),
+    **{
+        column: (family, "token_index")
+        for column, family in TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES.items()
+    },
+}
 _SOURCE_PLATFORM_IDS_COLUMN = "source_platform_ids"
 _VALID_TOKEN_COUNT_COLUMN = "valid_token_count"
 _ROW_METADATA_COLUMNS = (
@@ -147,7 +165,7 @@ _RECOGNIZED_BATCH_METADATA_COLUMNS = (
     *_TOKEN_DOMAIN_METADATA_COLUMNS,
     *_TOKEN_TEMPORAL_METADATA_COLUMNS,
     *_TOKEN_CHUNK_METADATA_COLUMNS,
-    *_TOKEN_GRAPH_METADATA_COLUMNS,
+    *_GRAPH_BATCH_METADATA_COLUMNS,
     *_ROW_METADATA_COLUMNS,
 )
 _MODEL_INPUT_PARQUET_COLUMNS = frozenset(
@@ -178,6 +196,7 @@ _TOKEN_CONTENT_PARQUET_COLUMNS = frozenset(
 _TOKEN_LEVEL_METADATA_COLUMNS = frozenset(
     (
         *_TOKEN_SEMANTIC_METADATA_COLUMNS,
+        *_TOKEN_DOMAIN_METADATA_COLUMNS,
         *_TOKEN_TEMPORAL_METADATA_COLUMNS,
         "doc_ids",
         "document_ids",
@@ -229,6 +248,23 @@ class _ModelMetadataColumns:
 
 
 @dataclass(frozen=True)
+class _GraphWindow:
+    """Plain graph route data for one fixed token window.
+
+    Keep this representation host-side until a batch is requested.  The graph
+    itself is small, while retaining one MLX ``GraphBatch`` per dataset sample
+    would unnecessarily pin device arrays for the whole shard.
+    """
+
+    edges: Mapping[str, tuple[tuple[int, int], ...]]
+    edge_kinds: Mapping[str, tuple[int, ...]]
+    chunk_starts: tuple[int, ...]
+    chunk_ends: tuple[int, ...]
+    chunk_kinds: tuple[int, ...] | None
+    chunk_dep_levels: tuple[int, ...] | None
+
+
+@dataclass(frozen=True)
 class _WindowSpec:
     row_index: int | None
     token_start: int
@@ -240,7 +276,10 @@ class TokenParquetDataset:
 
     token_key accepts either one integer token per row or a list-like token
     sequence per row.  text_key accepts source text and requires a tokenizer
-    object with encode or a callable str -> Sequence[int].
+    object with encode or a callable str -> Sequence[int]. Domain columns retain
+    their persisted ``token_*`` names in metadata side-channel families while
+    ``LMTokenBatch`` resolves model-facing canonical names. Graph edge columns
+    are additionally materialized as typed per-window ``GraphBatch`` routes.
     """
 
     def __init__(
@@ -341,6 +380,11 @@ class TokenParquetDataset:
             token_rows,
             seq_len,
         )
+        graph_windows, graph_batch_sources = _graph_batch_windows(
+            columns,
+            token_rows,
+            seq_len=seq_len,
+        )
         family_side_channel_columns = _merge_family_side_channel_columns(
             family_token_side_channel_columns,
             family_graph_side_channel_columns,
@@ -361,6 +405,11 @@ class TokenParquetDataset:
 
         if not len(token_windows):
             raise ValueError("parquet data does not contain a full fixed-shape sample")
+        if graph_windows and len(graph_windows) != len(token_windows):
+            raise ValueError(
+                "parquet graph window count must match token windows: "
+                f"{len(graph_windows)} != {len(token_windows)}"
+            )
         for key, value in side_channels.items():
             if value.shape != token_windows.shape:
                 raise ValueError(
@@ -389,6 +438,7 @@ class TokenParquetDataset:
             }
             for family, family_columns in family_side_channel_columns.channels.items()
         }
+        self._graph_windows = graph_windows
         self._model_metadata_channels = {
             key: value.astype(np.int32, copy=False)
             for key, value in model_metadata_columns.channels.items()
@@ -407,6 +457,7 @@ class TokenParquetDataset:
             side_channel_sources=side_channel_columns.sources,
             skipped_side_channels=side_channel_columns.skipped,
             family_side_channel_sources=family_side_channel_columns.sources,
+            graph_batch_sources=graph_batch_sources,
             model_metadata_sources=model_metadata_columns.sources,
             batch_metadata_columns=batch_metadata_columns,
         )
@@ -524,9 +575,78 @@ class TokenParquetDataset:
             document_ids=None
             if self._document_ids is None
             else mx.array(self._document_ids[sample_idx]),
+            graph_batch=self._make_graph_batch(sample_idx),
             side_channels=family_side_channels or None,
             metadata=self._make_batch_metadata(sample_idx),
             **kwargs,
+        )
+
+    def _make_graph_batch(self, sample_idx: np.ndarray) -> GraphBatch | None:
+        if not self._graph_windows:
+            return None
+
+        selected = [self._graph_windows[int(index)] for index in sample_idx]
+        graphs: list[GraphPacket] = []
+        chunk_starts: list[mx.array] = []
+        chunk_ends: list[mx.array] = []
+        chunk_kinds: list[mx.array] = []
+        chunk_dep_levels: list[mx.array] = []
+        edge_kinds: list[dict[str, mx.array]] = []
+
+        include_chunk_kinds = selected[0].chunk_kinds is not None
+        include_chunk_dep_levels = selected[0].chunk_dep_levels is not None
+        if any(
+            (window.chunk_kinds is not None) != include_chunk_kinds
+            or (window.chunk_dep_levels is not None) != include_chunk_dep_levels
+            for window in selected
+        ):
+            raise ValueError(
+                "parquet graph windows changed chunk metadata presence within a batch"
+            )
+
+        for window in selected:
+            num_chunks = len(window.chunk_starts)
+            graph_edges: dict[str, EdgeIndex] = {}
+            for relation, pairs in window.edges.items():
+                graph_edges[relation] = EdgeIndex.from_pairs(
+                    pairs,
+                    relation=relation,
+                    num_nodes=(
+                        num_chunks
+                        if relation in {"call", "type"}
+                        else self.seq_len
+                    ),
+                )
+            graphs.append(GraphPacket(edges=graph_edges, num_nodes=num_chunks))
+            chunk_starts.append(
+                mx.array(window.chunk_starts, dtype=mx.int32)
+            )
+            chunk_ends.append(mx.array(window.chunk_ends, dtype=mx.int32))
+            if include_chunk_kinds:
+                assert window.chunk_kinds is not None
+                chunk_kinds.append(mx.array(window.chunk_kinds, dtype=mx.int32))
+            if include_chunk_dep_levels:
+                assert window.chunk_dep_levels is not None
+                chunk_dep_levels.append(
+                    mx.array(window.chunk_dep_levels, dtype=mx.int32)
+                )
+            edge_kinds.append(
+                {
+                    relation: mx.array(kinds, dtype=mx.int32)
+                    for relation, kinds in window.edge_kinds.items()
+                }
+            )
+
+        has_edge_kinds = any(edge_kinds_row for edge_kinds_row in edge_kinds)
+        return GraphBatch(
+            graphs=tuple(graphs),
+            chunk_starts=tuple(chunk_starts),
+            chunk_ends=tuple(chunk_ends),
+            chunk_kinds=tuple(chunk_kinds) if include_chunk_kinds else (),
+            chunk_dep_levels=(
+                tuple(chunk_dep_levels) if include_chunk_dep_levels else ()
+            ),
+            edge_kinds=tuple(edge_kinds) if has_edge_kinds else (),
         )
 
     def _make_batch_metadata(self, sample_idx: np.ndarray) -> Mapping[str, Any] | None:
@@ -809,6 +929,7 @@ def _candidate_parquet_columns(
     candidates.extend(_FAMILY_TOKEN_SIDE_CHANNEL_COLUMNS_FLAT)
     candidates.extend(_TOKEN_CHUNK_METADATA_COLUMNS)
     candidates.extend(_FAMILY_GRAPH_SIDE_CHANNEL_COLUMNS_FLAT)
+    candidates.extend(_TOKEN_DOMAIN_GRAPH_METADATA_COLUMNS)
     candidates.append(_SOURCE_PLATFORM_IDS_COLUMN)
     candidates.append(_VALID_TOKEN_COUNT_COLUMN)
     for aliases in _SIDE_CHANNEL_COLUMN_ALIASES.values():
@@ -1084,6 +1205,197 @@ def _family_side_channel_values(column: str, values: np.ndarray) -> np.ndarray:
             )
         return values.astype(np.uint64, copy=False)
     return values.astype(np.int32, copy=False)
+
+
+def _graph_batch_windows(
+    columns: ParquetColumns,
+    token_rows: list[list[int]],
+    *,
+    seq_len: int,
+) -> tuple[tuple[_GraphWindow, ...], Mapping[str, Mapping[str, str | None]]]:
+    """Build host-side typed graph routes for every fixed token window.
+
+    Call/type edges use the packed row's chunk coordinate space and are remapped
+    through ``_add_chunk_metadata_window``.  Domain graph edges use token
+    coordinates and are sliced into the current window with their edge kinds
+    retained for ``code_graph_routes``.  Raw padded edge arrays remain available
+    in ``side_channels`` for existing Path C consumers; this typed view is the
+    model-facing route contract.
+    """
+
+    present_columns = tuple(
+        column for column in _GRAPH_BATCH_METADATA_COLUMNS if column in columns.values
+    )
+    if not present_columns:
+        return (), {}
+
+    pair_columns = tuple(
+        column for column in _TOKEN_GRAPH_METADATA_COLUMNS if column in columns.values
+    )
+    domain_columns = tuple(
+        column
+        for column in _TOKEN_DOMAIN_GRAPH_METADATA_COLUMNS
+        if column in columns.values
+    )
+    if pair_columns and (
+        "token_chunk_starts" not in columns.values
+        or "token_chunk_ends" not in columns.values
+    ):
+        joined = ", ".join(pair_columns)
+        raise ValueError(
+            f"{joined} graph columns require token_chunk_starts and "
+            "token_chunk_ends for GraphBatch construction"
+        )
+
+    specs = _fixed_window_specs_from_rows(token_rows, seq_len)
+    graph_sources = {
+        column: {
+            "column": column,
+            "type": columns.type_label(column),
+            "relation": _GRAPH_COLUMN_TO_RELATION[column][0],
+            "coordinate_space": _GRAPH_COLUMN_TO_RELATION[column][1],
+        }
+        for column in present_columns
+    }
+    windows: list[_GraphWindow] = []
+    for spec_index, spec in enumerate(specs):
+        if spec.row_index is None:
+            raise ValueError(
+                "graph columns cannot be aligned to a scalar token stream; "
+                f"window {spec_index} has no source row"
+            )
+
+        row_index = spec.row_index
+        graph_edges: dict[str, tuple[tuple[int, int], ...]] = {}
+        graph_edge_kinds: dict[str, tuple[int, ...]] = {}
+        starts: tuple[int, ...] = ()
+        ends: tuple[int, ...] = ()
+        chunk_kinds: tuple[int, ...] | None = None
+        chunk_dep_levels: tuple[int, ...] | None = None
+
+        if pair_columns:
+            chunk_window: dict[str, Any] = {}
+            _add_chunk_metadata_window(
+                chunk_window,
+                columns,
+                row_index=row_index,
+                token_start=spec.token_start,
+                token_end=spec.token_end,
+                metadata_columns=(
+                    "token_chunk_starts",
+                    "token_chunk_ends",
+                    "token_chunk_kinds",
+                    "token_chunk_dep_levels",
+                    *pair_columns,
+                ),
+            )
+            starts = tuple(
+                _coerce_token_row(
+                    chunk_window.get("token_chunk_starts", []),
+                    label="token_chunk_starts GraphBatch metadata",
+                )
+            )
+            ends = tuple(
+                _coerce_token_row(
+                    chunk_window.get("token_chunk_ends", []),
+                    label="token_chunk_ends GraphBatch metadata",
+                )
+            )
+            if "token_chunk_kinds" in columns.values:
+                chunk_kinds = tuple(
+                    _coerce_token_row(
+                        chunk_window.get("token_chunk_kinds", []),
+                        label="token_chunk_kinds GraphBatch metadata",
+                    )
+                )
+            if "token_chunk_dep_levels" in columns.values:
+                chunk_dep_levels = tuple(
+                    _coerce_token_row(
+                        chunk_window.get("token_chunk_dep_levels", []),
+                        label="token_chunk_dep_levels GraphBatch metadata",
+                    )
+                )
+            if len(starts) != len(ends):
+                raise ValueError(
+                    "GraphBatch chunk starts/ends must have matching lengths"
+                )
+
+            source_chunk_count = len(
+                _coerce_token_row(
+                    columns.require("token_chunk_starts")[row_index],
+                    label="token_chunk_starts source metadata",
+                )
+            )
+            for column in pair_columns:
+                relation = _GRAPH_COLUMN_TO_RELATION[column][0]
+                source_pairs = _normalize_edge_pairs(
+                    columns.require(column)[row_index]
+                )
+                for source, target in source_pairs:
+                    if not (
+                        0 <= source < source_chunk_count
+                        and 0 <= target < source_chunk_count
+                    ):
+                        raise ValueError(
+                            f"{column} edge ({source},{target}) is outside "
+                            f"chunk range 0..{source_chunk_count - 1}"
+                        )
+                graph_edges[relation] = tuple(
+                    _normalize_edge_pairs(chunk_window.get(column, []))
+                )
+
+        token_row_length = len(token_rows[row_index])
+        for column in domain_columns:
+            family = TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES[column]
+            relation = _GRAPH_COLUMN_TO_RELATION[column][0]
+            retained: list[tuple[int, int]] = []
+            retained_kinds: list[int] = []
+            for edge in _decode_domain_edge_list(columns.require(column)[row_index]):
+                source, target, kind = normalize_domain_edge_record(
+                    edge,
+                    family=family,
+                )
+                if not (
+                    source < token_row_length and target < token_row_length
+                ):
+                    raise ValueError(
+                        f"{column} edge ({source},{target}) is outside token "
+                        f"range 0..{token_row_length - 1}"
+                    )
+                if not (
+                    spec.token_start <= source < spec.token_end
+                    and spec.token_start <= target < spec.token_end
+                ):
+                    continue
+                retained.append(
+                    (source - spec.token_start, target - spec.token_start)
+                )
+                retained_kinds.append(kind)
+            graph_edges[relation] = tuple(retained)
+            graph_edge_kinds[relation] = tuple(retained_kinds)
+
+        windows.append(
+            _GraphWindow(
+                edges=graph_edges,
+                edge_kinds=graph_edge_kinds,
+                chunk_starts=starts,
+                chunk_ends=ends,
+                chunk_kinds=chunk_kinds,
+                chunk_dep_levels=chunk_dep_levels,
+            )
+        )
+    return tuple(windows), graph_sources
+
+
+def _decode_domain_edge_list(value: Any) -> list[Any]:
+    decoded = _decode_json_like(value)
+    if decoded is None:
+        return []
+    if isinstance(decoded, np.ndarray):
+        decoded = decoded.tolist()
+    if not isinstance(decoded, (list, tuple)):
+        raise ValueError("domain graph edge column must contain a sequence")
+    return list(decoded)
 
 
 def _family_graph_side_channel_windows(
@@ -1379,7 +1691,11 @@ def _batch_metadata_windows(
             token_end=spec.token_end,
             metadata_columns=resolved_columns,
         )
-        handled = set(_TOKEN_CHUNK_METADATA_COLUMNS) | set(_TOKEN_GRAPH_METADATA_COLUMNS)
+        handled = (
+            set(_TOKEN_CHUNK_METADATA_COLUMNS)
+            | set(_TOKEN_GRAPH_METADATA_COLUMNS)
+            | set(_TOKEN_DOMAIN_GRAPH_METADATA_COLUMNS)
+        )
         for column in resolved_columns:
             if column in handled:
                 continue
@@ -1388,6 +1704,25 @@ def _batch_metadata_windows(
                 window[column] = _metadata_sequence(value)[spec.token_start : spec.token_end]
             else:
                 window[column] = _metadata_value(value)
+        for column in _TOKEN_DOMAIN_GRAPH_METADATA_COLUMNS:
+            if column not in resolved_columns or column not in columns.values:
+                continue
+            family = TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES[column]
+            window[column] = [
+                {
+                    "from": source - spec.token_start,
+                    "to": target - spec.token_start,
+                    "kind": kind,
+                }
+                for edge in _decode_domain_edge_list(
+                    columns.require(column)[spec.row_index]
+                )
+                for source, target, kind in (
+                    normalize_domain_edge_record(edge, family=family),
+                )
+                if spec.token_start <= source < spec.token_end
+                and spec.token_start <= target < spec.token_end
+            ]
         windows.append(window)
     return tuple(windows)
 
@@ -1616,6 +1951,7 @@ def _parquet_receipt(
         str,
         Mapping[str, Mapping[str, str | None]],
     ],
+    graph_batch_sources: Mapping[str, Mapping[str, str | None]],
     model_metadata_sources: Mapping[str, Mapping[str, str | None]],
     batch_metadata_columns: Sequence[str],
 ) -> dict[str, Any]:
@@ -1659,6 +1995,11 @@ def _parquet_receipt(
                 for column, source in sorted(columns.items())
             }
             for family, columns in sorted(family_side_channel_sources.items())
+        }
+    if graph_batch_sources:
+        receipt["graph_batch_sources"] = {
+            column: dict(source)
+            for column, source in sorted(graph_batch_sources.items())
         }
     training_sources = {
         "target_tokens": target_source,

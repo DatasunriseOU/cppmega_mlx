@@ -358,7 +358,8 @@ def _build_bundle(
         "sha256": hashlib.sha256(b"p").hexdigest(),
     }
     artifact: dict[str, Any] = {
-        "schema": "cppmega_objective_materialization_artifact_v1",
+        "schema": "cppmega_objective_materialization_artifact_v2",
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": 1,
         "objective_contract": {
             "path": "objective_contract.json",
@@ -434,7 +435,7 @@ def _build_bundle(
 
     objective_descriptor = {
         "artifact_path": artifact_path.relative_to(root).as_posix(),
-        "artifact_schema": "cppmega_objective_materialization_artifact_v1",
+        "artifact_schema": "cppmega_objective_materialization_artifact_v2",
         "artifact_set_sha256": artifact["artifact_set_sha256"],
         "artifact_file_sha256": _sha256(artifact_path),
         "contract_path": contract_path.relative_to(root).as_posix(),
@@ -650,6 +651,14 @@ def test_open_production_megatron_bundle_records_validated_provenance(
     assert tuple(batch.tokens.shape) == (1, _BUCKET)
     assert batch.document_ids is not None
     assert batch.graph_batch is not None
+
+
+def test_legacy_objective_artifact_shape_requires_regeneration() -> None:
+    with pytest.raises(ValueError, match="legacy.*migration required.*regenerate"):
+        production_bundle._validate_objective_artifact_shape(
+            {"schema": "cppmega_objective_materialization_artifact_v1"},
+            bucket=_BUCKET,
+        )
 
 
 def test_open_production_megatron_bundle_accepts_bounded_source_sampling(

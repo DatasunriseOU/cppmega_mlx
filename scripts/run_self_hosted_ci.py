@@ -37,24 +37,38 @@ PORTABLE_DEPENDENCIES = (
 MACOS_TESTS = (
     "tests/test_ast_fim.py",
     "tests/test_audit_sidecar_parquet.py",
+    "tests/test_atomic_identity_publication.py",
     "tests/test_case5_domain_ingestion.py",
+    "tests/test_case6_sidecar_manifest_contract.py",
+    "tests/test_clang_usr_identity.py",
     "tests/test_convert_megatron_dense500m_torchdist_to_mlx.py",
     "tests/test_cpp_jsonl_generation_compile_eval.py",
     "tests/test_data_package_imports.py",
     "tests/test_domain_graph_routes.py",
     "tests/test_domain_sidecar_parquet.py",
     "tests/test_eval_domain_routed_codegen.py",
+    "tests/test_graph_recipe.py",
     "tests/test_inference_generation.py",
+    "tests/test_inference_repository_prompt_graph.py",
     "tests/test_materialize_megatron_dependency_provenance.py",
     "tests/test_megatron_indexed.py",
+    "tests/test_objective_schedule.py",
     "tests/test_pack_enriched_rows.py",
     "tests/test_packer_edge_remap.py",
     "tests/test_production_objective_mixer.py",
+    "tests/test_production_megatron_bundle.py",
+    "tests/test_prompt_graph.py",
+    "tests/test_prompt_graph_index.py",
     "tests/test_stage1_combined_graph_objective.py",
+    "tests/test_stage1_graph_domain_production.py",
+    "tests/test_train_eval_graph_routes.py",
     "tests/test_streaming_conveyor_progress.py",
     "tests/test_streaming_conveyor_revision.py",
     "tests/test_streaming_reindex_run_checked.py",
     "tests/test_tokenizer_contract.py",
+    "tests/test_train_stage1_smoke.py",
+    "tests/test_verified_sidecar_download_verification.py",
+    "tests/test_verified_sidecar_manifest_selection.py",
     "tests/test_process_commits_fail_loud.py",
     "tests/test_repair_packed_document_boundaries.py",
     "tests/test_self_hosted_ci.py",
@@ -62,13 +76,17 @@ MACOS_TESTS = (
 )
 LINUX_TESTS = (
     "tests/test_audit_sidecar_parquet.py",
+    "tests/test_case6_sidecar_manifest_contract.py",
     "tests/test_data_package_imports.py",
     "tests/test_domain_sidecar_parquet.py",
     "tests/test_packer_edge_remap.py",
+    "tests/test_production_megatron_bundle.py",
     "tests/test_streaming_conveyor_progress.py",
     "tests/test_streaming_conveyor_revision.py",
     "tests/test_streaming_reindex_run_checked.py",
     "tests/test_tokenizer_contract.py",
+    "tests/test_verified_sidecar_download_verification.py",
+    "tests/test_verified_sidecar_manifest_selection.py",
     "tests/test_process_commits_fail_loud.py",
     "tests/test_repair_packed_document_boundaries.py",
     "tests/test_self_hosted_ci.py",
@@ -313,6 +331,77 @@ def _source_check_command(repo_root: Path) -> tuple[str, ...]:
     return ("git", "diff", "--check")
 
 
+def _source_bound_environment(
+    repo_root: Path,
+    *,
+    base_environment: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Run lane subprocesses against this checkout, never an editable sibling."""
+
+    environment = dict(os.environ if base_environment is None else base_environment)
+    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        environment.pop(key, None)
+    environment.update(
+        {
+            "CPPMEGA_SOURCE_ROOT": str(repo_root),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+            "PYTHONPATH": str(repo_root),
+        }
+    )
+    return environment
+
+
+def _source_import_probe_command(
+    python: str,
+    repo_root: Path,
+) -> tuple[str, ...]:
+    """Return a child-process probe for actual project import provenance."""
+
+    probe = r'''
+import importlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+project_modules = ("cppmega_mlx", "scripts")
+
+def inside_root(value: Path) -> bool:
+    try:
+        value.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+if root not in {Path(entry or ".").resolve() for entry in sys.path}:
+    raise SystemExit(f"reviewed root is absent from sys.path: {root}")
+
+resolved = {}
+for name in project_modules:
+    module = importlib.import_module(name)
+    candidates = []
+    origin = getattr(module, "__file__", None)
+    if origin and origin not in {"built-in", "frozen"}:
+        candidates.append(Path(origin).resolve())
+    candidates.extend(
+        Path(entry).resolve()
+        for entry in getattr(module, "__path__", ())
+    )
+    if not candidates:
+        raise SystemExit(f"project module has no source location: {name}")
+    foreign = [str(value) for value in candidates if not inside_root(value)]
+    if foreign:
+        raise SystemExit(
+            f"{name} resolved outside reviewed root {root}: {foreign}"
+        )
+    resolved[name] = [str(value) for value in candidates]
+
+print(json.dumps({"root": str(root), "imports": resolved}, sort_keys=True))
+'''.strip()
+    return (python, "-c", probe, str(repo_root))
+
+
 def run_lane(args: argparse.Namespace) -> int:
     spec = LANES[args.lane]
     repo_root = Path(args.repo_root).resolve()
@@ -337,6 +426,7 @@ def run_lane(args: argparse.Namespace) -> int:
             raise SelfHostedCIError(f"repository root is unavailable: {repo_root}")
         _validate_lane_platform(spec)
         effective_python = _resolve_executable(args.python)
+        lane_environment = _source_bound_environment(repo_root)
         if args.bootstrap_portable and not spec.portable:
             raise SelfHostedCIError("--bootstrap-portable is valid only for linux-portable")
 
@@ -354,6 +444,7 @@ def run_lane(args: argparse.Namespace) -> int:
             cwd=repo_root,
             log_path=receipt_dir / "python-preflight.log",
             timeout_seconds=remaining(30),
+            env=lane_environment,
         )
         steps.append(preflight)
         if preflight["exit_code"] != 0:
@@ -374,6 +465,7 @@ def run_lane(args: argparse.Namespace) -> int:
                 cwd=repo_root,
                 log_path=receipt_dir / "create-portable-venv.log",
                 timeout_seconds=remaining(120),
+                env=lane_environment,
             )
             steps.append(create_venv)
             if create_venv["exit_code"] != 0:
@@ -393,11 +485,25 @@ def run_lane(args: argparse.Namespace) -> int:
                 cwd=repo_root,
                 log_path=receipt_dir / "install-portable-dependencies.log",
                 timeout_seconds=remaining(300),
+                env=lane_environment,
             )
             steps.append(install)
             if install["exit_code"] != 0:
                 status = install["status"]
                 return 124 if install["timed_out"] else 1
+
+        source_probe = run_step(
+            name="source-import-provenance",
+            command=_source_import_probe_command(effective_python, repo_root),
+            cwd=repo_root,
+            log_path=receipt_dir / "source-import-provenance.log",
+            timeout_seconds=remaining(30),
+            env=lane_environment,
+        )
+        steps.append(source_probe)
+        if source_probe["exit_code"] != 0:
+            status = source_probe["status"]
+            return 124 if source_probe["timed_out"] else 1
 
         pytest_command = [effective_python, "-m", "pytest", "-q"]
         if spec.portable:
@@ -409,6 +515,7 @@ def run_lane(args: argparse.Namespace) -> int:
             cwd=repo_root,
             log_path=receipt_dir / "pytest.log",
             timeout_seconds=remaining(spec.pytest_timeout_seconds),
+            env=lane_environment,
         )
         steps.append(pytest_step)
         if pytest_step["exit_code"] != 0:
@@ -429,6 +536,7 @@ def run_lane(args: argparse.Namespace) -> int:
                 cwd=repo_root,
                 log_path=receipt_dir / "compile-portable-sources.log",
                 timeout_seconds=remaining(120),
+                env=lane_environment,
             )
             steps.append(compile_step)
             if compile_step["exit_code"] != 0:
@@ -441,6 +549,7 @@ def run_lane(args: argparse.Namespace) -> int:
             cwd=repo_root,
             log_path=receipt_dir / "source-whitespace-check.log",
             timeout_seconds=remaining(60),
+            env=lane_environment,
         )
         steps.append(source_check)
         if source_check["exit_code"] != 0:

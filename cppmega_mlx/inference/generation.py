@@ -8,6 +8,7 @@ from typing import Any, Literal, cast
 
 import mlx.core as mx
 
+from cppmega_mlx.data.graph_packet import GraphBatch
 from cppmega_mlx.inference.engine import (
     ContiguousKVCache,
     ContiguousKVCacheConfig,
@@ -21,6 +22,7 @@ from cppmega_mlx.inference.sampling import sample_next_token
 from cppmega_mlx.inference.speculative_decode import speculative_acceptance
 
 GenerationFinishReason = Literal["eos", "length"]
+ModelKwargs = Mapping[str, Any]
 
 _ZERO_GENERATED_MODEL_KWARGS = frozenset(
     {
@@ -29,11 +31,38 @@ _ZERO_GENERATED_MODEL_KWARGS = frozenset(
         "ast_depth_ids",
         "sibling_index_ids",
         "node_type_ids",
+        # Generated tokens have no source-domain provenance until a new
+        # document-sidecar record is materialized.
+        "domain_ids",
+        "role_ids",
+        "entity_ids",
+        "scope_ids",
+        "source_doc_ids",
+        "source_identity_ids",
+        "confidence_ids",
     }
 )
 _REPEAT_GENERATED_MODEL_KWARGS = frozenset({"document_ids", "platform_ids"})
+_GRAPH_BIAS_MODEL_KWARGS = frozenset({"block_bias", "edge_kind_bias"})
+_NON_SEQUENCE_ALIGNED_MODEL_KWARGS = frozenset(
+    {
+        "domain_edges",
+        "build_edges",
+        "shell_edges",
+        "diagnostic_edges",
+        "cross_domain_edges",
+        "token_domain_edges",
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+        "graph_batch",
+    }
+)
 _SEQUENCE_ALIGNED_MODEL_KWARGS = (
-    _ZERO_GENERATED_MODEL_KWARGS | _REPEAT_GENERATED_MODEL_KWARGS
+    _ZERO_GENERATED_MODEL_KWARGS
+    | _REPEAT_GENERATED_MODEL_KWARGS
+    | _GRAPH_BIAS_MODEL_KWARGS
 )
 _PROMPT_CACHE_UNSAFE_ROUTE_ROLES = frozenset({"mamba3", "m2rnn", "engram"})
 
@@ -89,7 +118,7 @@ def generate_tokens(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
-    model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -156,8 +185,8 @@ def generate_tokens_speculative(
     *,
     max_new_tokens: int,
     draft_window: int = 4,
-    model_kwargs: Mapping[str, mx.array] | None = None,
-    draft_model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
+    draft_model_kwargs: ModelKwargs | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     rng_key: Any | None = None,
@@ -258,7 +287,7 @@ def generate_tokens_mtp_self_speculative(
     *,
     max_new_tokens: int,
     draft_window: int | None = None,
-    model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     rng_key: Any | None = None,
@@ -355,7 +384,7 @@ def generate_tokens_with_kv_cache(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
-    model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
     cache: ContiguousKVCache | None = None,
     cache_config: ContiguousKVCacheConfig | None = None,
     num_layers: int | None = None,
@@ -448,7 +477,12 @@ def generate_tokens_with_kv_cache(
             model(
                 next_token,
                 kv_cache=kv_cache,
-                **_model_kwargs_for_generated_step(model_kwargs, next_token),
+                **_model_kwargs_for_generated_step(
+                    model_kwargs,
+                    next_token,
+                    start=int(tokens.shape[1]) - 1,
+                    key_length=int(tokens.shape[1]),
+                ),
             ),
             next_token,
         )
@@ -460,7 +494,7 @@ def build_prompt_cache(
     model: Any,
     prompt_ids: mx.array,
     *,
-    model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
     cache: ContiguousKVCache | None = None,
     cache_config: ContiguousKVCacheConfig | None = None,
     num_layers: int | None = None,
@@ -521,7 +555,7 @@ def generate_tokens_with_prompt_cache(
     *,
     prompt_cache: PromptCacheEntry,
     max_new_tokens: int,
-    model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -601,7 +635,12 @@ def generate_tokens_with_prompt_cache(
             model(
                 next_token,
                 kv_cache=kv_cache,
-                **_model_kwargs_for_generated_step(model_kwargs, next_token),
+                **_model_kwargs_for_generated_step(
+                    model_kwargs,
+                    next_token,
+                    start=int(tokens.shape[1]) - 1,
+                    key_length=int(tokens.shape[1]),
+                ),
             ),
             next_token,
         )
@@ -614,7 +653,7 @@ def stream_generate_tokens(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
-    model_kwargs: Mapping[str, mx.array] | None = None,
+    model_kwargs: ModelKwargs | None = None,
     eos_token_id: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -789,11 +828,21 @@ def _standard_generation_logits(model_output: Any, tokens: mx.array) -> mx.array
 
 
 def _model_kwargs_for_prefix(
-    model_kwargs: Mapping[str, mx.array] | None,
+    model_kwargs: ModelKwargs | None,
     tokens: mx.array,
-) -> dict[str, mx.array]:
+) -> dict[str, Any]:
     if not model_kwargs:
         return {}
+    batch_size, sequence_length = _batch_sequence(tokens)
+    repository_window = _repository_graph_model_kwargs_for_window(
+        model_kwargs,
+        batch_size=batch_size,
+        total_token_count=sequence_length,
+        window_start=0,
+        window_end=sequence_length,
+    )
+    if repository_window is not None:
+        return repository_window
     return {
         name: _align_model_kwarg_for_prefix(name, value, tokens)
         for name, value in model_kwargs.items()
@@ -801,17 +850,46 @@ def _model_kwargs_for_prefix(
 
 
 def _model_kwargs_for_slice(
-    model_kwargs: Mapping[str, mx.array] | None,
+    model_kwargs: ModelKwargs | None,
     *,
     start: int,
     tokens: mx.array,
-) -> dict[str, mx.array]:
+) -> dict[str, Any]:
     if not model_kwargs:
         return {}
     batch_size, sequence_length = _batch_sequence(tokens)
-    out: dict[str, mx.array] = {}
+    repository_window = _repository_graph_model_kwargs_for_window(
+        model_kwargs,
+        batch_size=batch_size,
+        total_token_count=start + sequence_length,
+        window_start=start,
+        window_end=start + sequence_length,
+    )
+    if repository_window is not None:
+        return repository_window
+    out: dict[str, Any] = {}
     for name, value in model_kwargs.items():
         _validate_model_kwarg_tensor(name, value)
+        if name == "graph_batch":
+            if start != 0:
+                raise ValueError(
+                    "static graph_batch cannot align an offset cache slice"
+                )
+            out[name] = _static_graph_batch_for_prefix(
+                value,
+                sequence_length=sequence_length,
+            )
+            continue
+        if name in _GRAPH_BIAS_MODEL_KWARGS:
+            out[name] = _graph_bias_for_window(
+                name,
+                value,
+                batch_size=batch_size,
+                query_start=start,
+                query_length=sequence_length,
+                key_length=start + sequence_length,
+            )
+            continue
         if not _sequence_aligned_model_kwarg(name, value, batch_size):
             out[name] = value
             continue
@@ -835,15 +913,58 @@ def _model_kwargs_for_slice(
 
 
 def _model_kwargs_for_generated_step(
-    model_kwargs: Mapping[str, mx.array] | None,
+    model_kwargs: ModelKwargs | None,
     tokens: mx.array,
-) -> dict[str, mx.array]:
+    *,
+    start: int | None = None,
+    key_length: int | None = None,
+) -> dict[str, Any]:
     if not model_kwargs:
         return {}
     batch_size, sequence_length = _batch_sequence(tokens)
-    out: dict[str, mx.array] = {}
+    if "graph_batch" in model_kwargs and callable(
+        getattr(model_kwargs["graph_batch"], "prompt_graph_window", None)
+    ):
+        if start is None or key_length is None:
+            raise ValueError(
+                "repository graph generated-step alignment requires absolute "
+                "query start and key length"
+            )
+        repository_window = _repository_graph_model_kwargs_for_window(
+            model_kwargs,
+            batch_size=batch_size,
+            total_token_count=key_length,
+            window_start=start,
+            window_end=key_length,
+        )
+        if repository_window is None:
+            raise RuntimeError(
+                "repository graph batch did not produce a generation window"
+            )
+        return repository_window
+    out: dict[str, Any] = {}
     for name, value in model_kwargs.items():
         _validate_model_kwarg_tensor(name, value)
+        if name == "graph_batch":
+            raise ValueError(
+                "static graph_batch generated-step alignment requires a "
+                "PromptGraphArtifact-backed graph batch"
+            )
+        if name in _GRAPH_BIAS_MODEL_KWARGS:
+            if start is None or key_length is None:
+                raise ValueError(
+                    "graph bias generated-step alignment requires absolute "
+                    "query start and key length"
+                )
+            out[name] = _graph_bias_for_window(
+                name,
+                value,
+                batch_size=batch_size,
+                query_start=start,
+                query_length=sequence_length,
+                key_length=key_length,
+            )
+            continue
         if _sequence_aligned_model_kwarg(name, value, batch_size):
             out[name] = _generated_model_kwarg_tail(
                 name,
@@ -858,11 +979,22 @@ def _model_kwargs_for_generated_step(
 
 def _align_model_kwarg_for_prefix(
     name: str,
-    value: mx.array,
+    value: Any,
     tokens: mx.array,
-) -> mx.array:
+) -> Any:
     _validate_model_kwarg_tensor(name, value)
     batch_size, sequence_length = _batch_sequence(tokens)
+    if name == "graph_batch":
+        return _static_graph_batch_for_prefix(value, sequence_length=sequence_length)
+    if name in _GRAPH_BIAS_MODEL_KWARGS:
+        return _graph_bias_for_window(
+            name,
+            value,
+            batch_size=batch_size,
+            query_start=0,
+            query_length=sequence_length,
+            key_length=sequence_length,
+        )
     if not _sequence_aligned_model_kwarg(name, value, batch_size):
         return value
 
@@ -880,9 +1012,203 @@ def _align_model_kwarg_for_prefix(
     return mx.concatenate([value, tail], axis=1)
 
 
-def _validate_model_kwarg_tensor(name: str, value: mx.array) -> None:
+def _validate_model_kwarg_tensor(name: str, value: Any) -> None:
+    if name == "graph_batch":
+        if not isinstance(value, GraphBatch):
+            raise TypeError(
+                "model_kwargs['graph_batch'] must be a GraphBatch, got "
+                f"{type(value).__name__}"
+            )
+        return
     if not isinstance(value, mx.array):
         raise TypeError(f"model_kwargs[{name!r}] must be an mlx.core.array")
+
+
+def _repository_graph_model_kwargs_for_window(
+    model_kwargs: ModelKwargs,
+    *,
+    batch_size: int,
+    total_token_count: int,
+    window_start: int,
+    window_end: int,
+) -> dict[str, Any] | None:
+    graph_batch = model_kwargs.get("graph_batch")
+    window_builder = getattr(graph_batch, "prompt_graph_window", None)
+    if window_builder is None:
+        return None
+    if not isinstance(graph_batch, GraphBatch) or not callable(window_builder):
+        raise TypeError(
+            "repository graph_batch must be a GraphBatch with prompt_graph_window"
+        )
+    if batch_size != 1:
+        raise ValueError(
+            "repository prompt graph generation currently requires batch=1"
+        )
+
+    window_graph, graph_inputs = window_builder(
+        total_token_count=total_token_count,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    if not isinstance(window_graph, GraphBatch):
+        raise TypeError("prompt_graph_window must return a GraphBatch")
+    side_channels = getattr(graph_inputs, "side_channels", None)
+    token_count = getattr(graph_inputs, "token_count", None)
+    if not isinstance(side_channels, Mapping) or int(token_count) != (
+        window_end - window_start
+    ):
+        raise ValueError(
+            "prompt_graph_window returned malformed token-aligned side channels"
+        )
+
+    out: dict[str, Any] = {}
+    for name, value in model_kwargs.items():
+        if name == "graph_batch":
+            out[name] = window_graph
+            continue
+        if name in _GRAPH_BIAS_MODEL_KWARGS:
+            raise ValueError(
+                "repository graph_batch cannot be combined with fixed graph biases"
+            )
+        _validate_model_kwarg_tensor(name, value)
+        if name in side_channels:
+            out[name] = mx.array([side_channels[name]], dtype=value.dtype)
+            continue
+        out[name] = _model_kwarg_for_absolute_window(
+            name,
+            value,
+            batch_size=batch_size,
+            window_start=window_start,
+            window_end=window_end,
+        )
+    return out
+
+
+def _model_kwarg_for_absolute_window(
+    name: str,
+    value: mx.array,
+    *,
+    batch_size: int,
+    window_start: int,
+    window_end: int,
+) -> mx.array:
+    if not _sequence_aligned_model_kwarg(name, value, batch_size):
+        return value
+    source_length = int(value.shape[1])
+    if source_length >= window_end:
+        return value[:, window_start:window_end, ...]
+
+    available = max(0, source_length - window_start)
+    chunks: list[mx.array] = []
+    if available > 0:
+        chunks.append(value[:, window_start:, ...])
+    chunks.append(
+        _generated_model_kwarg_tail(
+            name,
+            value,
+            batch_size=batch_size,
+            sequence_length=(window_end - window_start) - available,
+        )
+    )
+    return mx.concatenate(chunks, axis=1) if len(chunks) > 1 else chunks[0]
+
+
+def _static_graph_batch_for_prefix(
+    graph_batch: GraphBatch,
+    *,
+    sequence_length: int,
+) -> GraphBatch:
+    source_length = max(
+        (
+            int(mx.max(chunk_ends).item())
+            for chunk_ends in graph_batch.chunk_ends
+            if int(chunk_ends.shape[0]) > 0
+        ),
+        default=0,
+    )
+    if source_length <= 0:
+        raise ValueError("graph_batch has no source token spans")
+    if sequence_length > source_length:
+        raise ValueError(
+            "static graph_batch cannot extend beyond its source sequence; "
+            "use a PromptGraphArtifact-backed repository graph batch"
+        )
+    return graph_batch.input_aligned(
+        source_sequence_length=source_length,
+        input_sequence_length=sequence_length,
+    )
+
+
+def _graph_bias_for_window(
+    name: str,
+    value: mx.array,
+    *,
+    batch_size: int,
+    query_start: int,
+    query_length: int,
+    key_length: int,
+) -> mx.array:
+    """Align a square prompt graph bias to a query/key attention window."""
+
+    if len(value.shape) != 3 or int(value.shape[1]) != int(value.shape[2]):
+        raise ValueError(
+            f"model_kwargs[{name!r}] must have shape (B,S,S), got "
+            f"{tuple(value.shape)}"
+        )
+    if int(value.shape[0]) not in (1, batch_size):
+        raise ValueError(
+            f"model_kwargs[{name!r}] batch dimension must be 1 or "
+            f"{batch_size}, got {value.shape[0]}"
+        )
+    if query_start < 0:
+        raise ValueError("graph bias query_start must be non-negative")
+    if query_length <= 0 or key_length <= 0:
+        raise ValueError(
+            "graph bias query and key lengths must be positive, got "
+            f"{query_length}/{key_length}"
+        )
+    if key_length < query_start + query_length:
+        raise ValueError(
+            "graph bias key length must cover the query window, got "
+            f"key_length={key_length} query_end={query_start + query_length}"
+        )
+
+    source_length = int(value.shape[1])
+    source_query_end = min(source_length, query_start + query_length)
+    source_key_end = min(source_length, key_length)
+    if query_start < source_query_end and source_key_end > 0:
+        window = value[:, query_start:source_query_end, :source_key_end]
+    else:
+        window = value[:, :0, :0]
+    return _pad_graph_bias(
+        window,
+        query_length=query_length,
+        key_length=key_length,
+    )
+
+
+def _pad_graph_bias(
+    value: mx.array,
+    *,
+    query_length: int,
+    key_length: int,
+) -> mx.array:
+    current_query = int(value.shape[1])
+    current_key = int(value.shape[2])
+    if current_query > query_length or current_key > key_length:
+        value = value[:, :query_length, :key_length]
+        current_query = int(value.shape[1])
+        current_key = int(value.shape[2])
+    if current_query == query_length and current_key == key_length:
+        return value
+    return mx.pad(
+        value,
+        [
+            (0, 0),
+            (0, query_length - current_query),
+            (0, key_length - current_key),
+        ],
+    )
 
 
 def _sequence_aligned_model_kwarg(
@@ -890,6 +1216,8 @@ def _sequence_aligned_model_kwarg(
     value: mx.array,
     batch_size: int,
 ) -> bool:
+    if name in _NON_SEQUENCE_ALIGNED_MODEL_KWARGS:
+        return False
     shape = value.shape
     if not shape or int(shape[0]) != batch_size:
         return False
@@ -954,7 +1282,7 @@ def _propose_speculative_draft_window(
     tokens: mx.array,
     *,
     draft_window: int,
-    model_kwargs: Mapping[str, mx.array] | None,
+    model_kwargs: ModelKwargs | None,
     eos_token_id: int | None,
     temperature: float,
     rng_key: Any | None,
@@ -1037,7 +1365,7 @@ def _propose_mtp_self_speculative_window(
     tokens: mx.array,
     *,
     draft_window: int,
-    model_kwargs: Mapping[str, mx.array] | None,
+    model_kwargs: ModelKwargs | None,
     eos_token_id: int | None,
     temperature: float,
     rng_key: Any | None,
@@ -1171,7 +1499,7 @@ def _stream_generate_tokens_with_kv_cache(
     prompt_ids: mx.array,
     *,
     max_new_tokens: int,
-    model_kwargs: Mapping[str, mx.array] | None,
+    model_kwargs: ModelKwargs | None,
     eos_token_id: int | None,
     temperature: float,
     top_k: int | None,
@@ -1247,7 +1575,12 @@ def _stream_generate_tokens_with_kv_cache(
             model(
                 next_token,
                 kv_cache=kv_cache,
-                **_model_kwargs_for_generated_step(model_kwargs, next_token),
+                **_model_kwargs_for_generated_step(
+                    model_kwargs,
+                    next_token,
+                    start=int(tokens.shape[1]) - 1,
+                    key_length=int(tokens.shape[1]),
+                ),
             ),
             next_token,
         )

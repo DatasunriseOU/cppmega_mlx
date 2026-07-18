@@ -43,7 +43,10 @@ from cppmega_mlx.training.objective_mixer import (
     RealizedObjective,
     validated_packed_commit_binding,
 )
-from cppmega_mlx.data.graph_recipe import validate_stage1_graph_contract
+from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_contract,
+)
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_CHUNK_ROUTE_COLUMNS,
     OBJECTIVE_GRAPH_RELATION_COLUMNS,
@@ -57,7 +60,7 @@ from cppmega_mlx.training.task_mixer import TaskKind
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
-    "cppmega_objective_materialization_artifact_v1"
+    "cppmega_objective_materialization_artifact_v2"
 )
 OBJECTIVE_MATERIALIZATION_ARTIFACT_NAME = "objective_materialization.json"
 OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
@@ -816,6 +819,28 @@ def write_objective_materialization_artifact(
         or not all(isinstance(relation, str) and relation for relation in relations)
     ):
         raise ValueError("objective contract graph relations must be non-empty strings")
+    source_selection = payload.get("source_selection")
+    if not isinstance(source_selection, Mapping):
+        raise ValueError("objective contract source_selection receipt is required")
+    from cppmega_mlx.training.objective_schedule import (
+        canonical_window_quotas,
+        validate_objective_source_selection_receipt,
+    )
+
+    configured_rates = payload.get("configured_rates")
+    expected_window_quotas = None
+    if isinstance(configured_rates, Mapping):
+        expected_window_quotas = canonical_window_quotas(
+            configured_rates,
+            int(payload["quota_window_samples"]),
+        )
+    validate_objective_source_selection_receipt(
+        source_selection,
+        output_samples=int(documents),
+        quota_window_samples=int(payload["quota_window_samples"]),
+        graph_relations=relations,
+        expected_window_quotas=expected_window_quotas,
+    )
 
     resolved_shards = sorted(Path(path).resolve() for path in parquet_paths)
     if not resolved_shards or len(set(resolved_shards)) != len(resolved_shards):
@@ -867,6 +892,7 @@ def write_objective_materialization_artifact(
     }
     artifact = {
         "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": documents,
         "objective_contract": {
             "path": contract_path.name,

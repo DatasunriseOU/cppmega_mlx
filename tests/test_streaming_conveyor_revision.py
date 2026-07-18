@@ -25,6 +25,10 @@ def source_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "scripts" / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repo / "tools" / "clang_indexer").mkdir(parents=True)
+    (repo / "tools" / "clang_indexer" / "index_project.py").write_text(
+        "INDEXER = 1\n", encoding="utf-8"
+    )
     (repo / ".gitignore").write_text("outputs/\n", encoding="utf-8")
     _git(repo, "init", "-q")
     _git(repo, "config", "user.name", "Revision Test")
@@ -104,6 +108,39 @@ def test_manifest_rejects_unpinned_legacy_resume(
 
     with pytest.raises(sc.CodeRevisionMismatchError, match="new conveyor/output root"):
         manifest.bind_code_revision(sc.capture_code_revision(source_repo))
+
+
+def test_code_revision_receipt_contains_clang_indexer_dependency_binding(
+    source_repo: Path,
+) -> None:
+    receipt = sc.capture_code_revision(source_repo)
+
+    provenance = receipt["indexer_provenance"]
+    assert provenance["schema"] == "cppmega_indexer_dependency_binding_v1"
+    assert provenance["path"] == "tools/clang_indexer/index_project.py"
+    assert len(provenance["source_sha256"]) == 64
+    assert len(provenance["dependency_closure_sha256"]) == 64
+    assert provenance["dependency_manifest"] == {
+        "tools/clang_indexer/index_project.py": provenance["source_sha256"]
+    }
+    assert receipt["indexer_dependency_closure_sha256"] == (
+        provenance["dependency_closure_sha256"]
+    )
+
+
+def test_production_revision_rejects_missing_clang_indexer(
+    source_repo: Path, tmp_path: Path
+) -> None:
+    indexer = source_repo / "tools" / "clang_indexer" / "index_project.py"
+    indexer.unlink()
+    _git(source_repo, "add", "-u")
+    _git(source_repo, "commit", "-q", "-m", "remove indexer")
+
+    with pytest.raises(sc.CodeRevisionMismatchError, match="clang indexer"):
+        sc.CodeRevisionGuard.for_production(
+            _git(source_repo, "rev-parse", "HEAD"),
+            repo_root=source_repo,
+        )
 
 
 def test_child_python_preflight_rejects_late_edit(
