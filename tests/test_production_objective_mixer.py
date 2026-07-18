@@ -913,6 +913,7 @@ def test_production_batch_window_preserves_exact_task_quotas() -> None:
         seq_len=32,
         quota_window_samples=10,
         seed=23,
+        require_route_sidecars=False,
     )
 
     window = [next(batches) for _ in range(5)]

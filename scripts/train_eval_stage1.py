@@ -39,6 +39,7 @@ import math
 import random
 import tempfile
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,11 +52,15 @@ from mlx.utils import tree_flatten
 
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.data.code_packet import CodePacket
+from cppmega_mlx.data.graph_packet import GraphBatch
 from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.training.objective_data import (
+    OBJECTIVE_GRAPH_RELATION_COLUMNS,
     OBJECTIVE_SOURCE_COLUMNS,
-    graph_targets_and_pair_mask,
+    exclude_objective_routes,
+    graph_batch_from_objective_routes,
     objective_source_from_tokenized_row,
+    remap_objective_routes,
     require_objective_source_columns,
 )
 from cppmega_mlx.training.objective_mixer import (
@@ -69,7 +74,10 @@ from cppmega_mlx.data.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     stage1_graph_config_kwargs,
 )
-from cppmega_mlx.training.objectives import ObjectiveExample
+from cppmega_mlx.training.objectives import (
+    SOURCE_TOKEN_INDICES_METADATA_KEY,
+    ObjectiveExample,
+)
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES, TaskKind
 from cppmega_mlx.runtime.code_verifier import CodeVerifier
 from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
@@ -103,6 +111,21 @@ _ALIGNED_TASKS = frozenset(
     {
         TaskKind.CAUSAL_LM,
     }
+)
+_TRANSFORMED_CODE_TASKS = frozenset(
+    {
+        TaskKind.FIM,
+        TaskKind.AST_FIM,
+        TaskKind.IFIM,
+        TaskKind.SYMBOL_RECOVERY,
+        TaskKind.TYPE_RECOVERY,
+        TaskKind.CALLEE_RECOVERY,
+    }
+)
+_COMMIT_TASKS = frozenset({TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST})
+_CHUNK_GRAPH_RELATIONS = frozenset({"call", "type"})
+_COMMIT_GRAPH_EXCLUSION_REASON = (
+    "independently_tokenized_commit_sections_have_no_exact_source_map"
 )
 
 _LOG_FH = None
@@ -189,6 +212,8 @@ class ObjectiveBatch:
     graph_pair_mask: mx.array
     graph_samples: int
     graph_edges: int
+    graph_route_receipts: tuple[dict[str, object], ...]
+    graph_route_exclusion_reason: str | None
 
     @property
     def aligned(self) -> bool:
@@ -203,7 +228,252 @@ def _pad(values: mx.array, length: int, *, fill: int = 0) -> list[int]:
 
 
 def _code_packet(source: ObjectiveSource, task: TaskKind) -> CodePacket | None:
-    return None if task not in _ALIGNED_TASKS else source.code_packet
+    return None if task in _COMMIT_TASKS else source.code_packet
+
+
+def _objective_source_indices(
+    task: TaskKind,
+    example: ObjectiveExample,
+) -> list[int]:
+    raw = example.metadata.get(SOURCE_TOKEN_INDICES_METADATA_KEY)
+    input_length = int(example.input_ids.shape[0])
+    if not isinstance(raw, (tuple, list)) or len(raw) != input_length + 1:
+        raise ValueError(
+            f"{task.value}: exact source-token map must have length "
+            f"{input_length + 1}, got {0 if not isinstance(raw, (tuple, list)) else len(raw)}"
+        )
+    source_indices: list[int] = []
+    for output_index, raw_index in enumerate(raw[:input_length]):
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            raise ValueError(
+                f"{task.value}: source-token map index {output_index} must be an integer"
+            )
+        source_indices.append(int(raw_index))
+    return source_indices
+
+
+def _packet_vector(
+    packet: CodePacket,
+    field: str,
+    *,
+    where: str,
+) -> list[int]:
+    raw = getattr(packet, field)
+    if raw is None:
+        raise ValueError(f"{where}: required CodePacket.{field} is absent")
+    values = np.asarray(raw)
+    source_length = int(packet.token_ids.shape[0])
+    if values.ndim != 1 or int(values.shape[0]) != source_length:
+        raise ValueError(
+            f"{where}: CodePacket.{field} must have shape ({source_length},), "
+            f"got {tuple(values.shape)}"
+        )
+    return [int(value) for value in values.tolist()]
+
+
+def _mapped_structure_vector(
+    packet: CodePacket,
+    field: str,
+    source_indices: list[int],
+    *,
+    where: str,
+) -> list[int]:
+    source_values = _packet_vector(packet, field, where=where)
+    result: list[int] = []
+    for output_index, source_index in enumerate(source_indices):
+        if source_index < 0:
+            result.append(0)
+            continue
+        if source_index >= len(source_values):
+            raise ValueError(
+                f"{where}: source-token map index {source_index} at output token "
+                f"{output_index} is outside {len(source_values)} values"
+            )
+        result.append(source_values[source_index])
+    return result
+
+
+def _mapped_document_ids(
+    packet: CodePacket,
+    source_indices: list[int],
+    *,
+    where: str,
+) -> list[int]:
+    source_length = int(packet.token_ids.shape[0])
+    if packet.document_ids is None:
+        raise ValueError(f"{where}: required aligned channel document_ids is absent")
+    source_values = _packet_vector(packet, "document_ids", where=where)
+    output: list[int | None] = []
+    for output_index, source_index in enumerate(source_indices):
+        if source_index < 0:
+            output.append(None)
+            continue
+        if source_index >= source_length:
+            raise ValueError(
+                f"{where}: source-token map index {source_index} at output token "
+                f"{output_index} is outside {source_length} tokens"
+            )
+        document_id = source_values[source_index]
+        if document_id <= 0:
+            raise ValueError(
+                f"{where}: CodePacket.document_ids[{source_index}] must be positive"
+            )
+        output.append(document_id)
+    mapped_positions = [index for index, value in enumerate(output) if value is not None]
+    if not mapped_positions:
+        raise ValueError(f"{where}: source-token map contains no original tokens")
+    previous: list[int | None] = [None] * len(output)
+    following: list[int | None] = [None] * len(output)
+    last: int | None = None
+    for index, value in enumerate(output):
+        if value is not None:
+            last = index
+        previous[index] = last
+    last = None
+    for index in range(len(output) - 1, -1, -1):
+        if output[index] is not None:
+            last = index
+        following[index] = last
+    for index, value in enumerate(output):
+        if value is not None:
+            continue
+        left = previous[index]
+        right = following[index]
+        source_position = (
+            left
+            if right is None or (left is not None and index - left <= right - index)
+            else right
+        )
+        if source_position is None:  # pragma: no cover - mapped_positions proves this
+            raise AssertionError(f"{where}: cannot bind inserted-token document ID")
+        output[index] = output[source_position]
+    return [int(value) for value in output if value is not None]
+
+
+def _merge_graph_batches(rows: list[GraphBatch]) -> GraphBatch:
+    if not rows:
+        raise ValueError("objective graph batch requires at least one row")
+    if any(row.batch_size != 1 for row in rows):
+        raise ValueError("objective route adapter must produce one graph row at a time")
+    return GraphBatch(
+        graphs=tuple(row.graphs[0] for row in rows),
+        chunk_starts=tuple(row.chunk_starts[0] for row in rows),
+        chunk_ends=tuple(row.chunk_ends[0] for row in rows),
+        chunk_kinds=tuple(row.chunk_kinds[0] for row in rows),
+        chunk_dep_levels=tuple(row.chunk_dep_levels[0] for row in rows),
+        edge_kinds=tuple(row.edge_kinds[0] for row in rows),
+    )
+
+
+def _graph_target_row_mx(
+    graph_batch: GraphBatch,
+    row: int,
+    *,
+    seq_len: int,
+    graph_relations: tuple[str, ...],
+) -> mx.array:
+    graph = graph_batch.graphs[row]
+    starts = graph_batch.chunk_starts[row].astype(mx.int32)
+    ends = graph_batch.chunk_ends[row].astype(mx.int32)
+    chunk_count = int(starts.shape[0])
+    positions = mx.arange(seq_len, dtype=mx.int32)
+    membership = (
+        (positions[:, None] >= starts[None, :])
+        & (positions[:, None] < ends[None, :])
+    ).astype(mx.float32)
+    targets = mx.zeros((seq_len, seq_len), dtype=mx.float32)
+    for relation in graph_relations:
+        edge = graph.edge(relation)
+        if edge is None:
+            raise ValueError(
+                f"objective graph targets require relation {relation!r}; "
+                f"graph row {row} has {graph.relations}"
+            )
+        source = edge.src
+        destination = edge.dst
+        if edge.mask is not None:
+            active = edge.mask > 0
+            source = source[active]
+            destination = destination[active]
+        if int(source.shape[0]) == 0:
+            continue
+        bound = chunk_count if relation in _CHUNK_GRAPH_RELATIONS else seq_len
+        invalid = mx.any(
+            (source < 0)
+            | (destination < 0)
+            | (source >= bound)
+            | (destination >= bound)
+        )
+        mx.eval(invalid)
+        if bool(invalid.item()):
+            source_values = np.asarray(source)
+            destination_values = np.asarray(destination)
+            bad = (
+                (source_values < 0)
+                | (destination_values < 0)
+                | (source_values >= bound)
+                | (destination_values >= bound)
+            )
+            first = int(np.flatnonzero(bad)[0])
+            coordinate = "chunks" if relation in _CHUNK_GRAPH_RELATIONS else "tokens"
+            raise ValueError(
+                f"objective graph {relation} edge "
+                f"({int(source_values[first])}, {int(destination_values[first])}) "
+                f"is outside {bound} {coordinate}"
+            )
+        if relation in _CHUNK_GRAPH_RELATIONS:
+            adjacency = mx.zeros((chunk_count, chunk_count), dtype=mx.float32)
+            adjacency = adjacency.at[source, destination].add(
+                mx.ones(source.shape, dtype=mx.float32)
+            )
+            targets = targets + membership @ adjacency @ membership.T
+        else:
+            targets = targets.at[source, destination].add(
+                mx.ones(source.shape, dtype=mx.float32)
+            )
+    return (targets > 0).astype(mx.float32)
+
+
+def _graph_targets_and_pair_mask_mx(
+    graph_batch: GraphBatch,
+    *,
+    seq_len: int,
+    input_lengths: list[int],
+    document_ids: mx.array,
+    graph_relations: tuple[str, ...],
+) -> tuple[mx.array, mx.array, mx.array]:
+    targets = mx.stack(
+        [
+            _graph_target_row_mx(
+                graph_batch,
+                row,
+                seq_len=seq_len,
+                graph_relations=graph_relations,
+            )
+            for row in range(graph_batch.batch_size)
+        ],
+        axis=0,
+    )
+    positions = mx.arange(seq_len, dtype=mx.int32)
+    causal = positions[:, None] >= positions[None, :]
+    valid_tokens = positions[None, :] < mx.array(
+        input_lengths, dtype=mx.int32
+    )[:, None]
+    same_document = document_ids[:, :, None] == document_ids[:, None, :]
+    pair_mask = (
+        causal[None, :, :]
+        & valid_tokens[:, :, None]
+        & valid_tokens[:, None, :]
+        & same_document
+    )
+    targets = (targets > 0) & pair_mask
+    eligible_rows = mx.any(targets, axis=(1, 2))
+    pair_mask = pair_mask & eligible_rows[:, None, None]
+    return (
+        targets.astype(mx.float32),
+        pair_mask.astype(mx.float32),
+        eligible_rows,
+    )
 
 
 def _materialize_batch(
@@ -212,7 +482,18 @@ def _materialize_batch(
     *,
     seq_len: int,
     graph_relations: tuple[str, ...] = ("call", "type"),
+    require_route_sidecars: bool = True,
 ) -> ObjectiveBatch:
+    if not entries:
+        raise ValueError(f"{task.value}: objective batch entries must be non-empty")
+    unsupported_relations = sorted(
+        set(graph_relations) - set(OBJECTIVE_GRAPH_RELATION_COLUMNS)
+    )
+    if not graph_relations or unsupported_relations:
+        raise ValueError(
+            f"{task.value}: graph_relations must be a non-empty supported tuple; "
+            f"unsupported={unsupported_relations}"
+        )
     examples = tuple(example for example, _source in entries)
     input_ids = mx.array(
         [_pad(example.input_ids, seq_len) for example in examples], dtype=mx.int32
@@ -223,92 +504,103 @@ def _materialize_batch(
     loss_mask = mx.array(
         [_pad(example.loss_mask, seq_len) for example in examples], dtype=mx.float32
     )
+    packet_fields = {
+        "structure_ids": "structure_ids",
+        "dep_levels": "dep_levels",
+        "ast_depth_ids": "ast_depth",
+        "sibling_index_ids": "sibling_index",
+        "node_type_ids": "ast_node_type",
+    }
     document_rows: list[list[int]] = []
-    for example, source in entries:
+    side_rows: dict[str, list[list[int]]] = {
+        model_name: [] for model_name in packet_fields
+    }
+    graph_rows: list[GraphBatch] = []
+    route_receipts: list[dict[str, object]] = []
+    exclusion_reasons: set[str] = set()
+    input_lengths: list[int] = []
+    for row_index, (example, source) in enumerate(entries):
         input_length = int(example.input_ids.shape[0])
-        if task in _ALIGNED_TASKS:
-            packet = _code_packet(source, task)
-            assert packet is not None
-            if packet.document_ids is None:
-                raise ValueError(
-                    f"{task.value}: required aligned channel document_ids is absent"
-                )
-            document_rows.append(
-                _pad(packet.document_ids[:input_length], seq_len)
-            )
-        else:
+        input_lengths.append(input_length)
+        source_indices = _objective_source_indices(task, example)
+        packet = _code_packet(source, task)
+        if task in _COMMIT_TASKS:
             document_rows.append([1] * input_length + [0] * (seq_len - input_length))
-    document_ids = mx.array(document_rows, dtype=mx.int32)
-
-    side_channels: dict[str, mx.array] = {}
-    if task in _ALIGNED_TASKS:
-        packet_fields = {
-            "structure_ids": "structure_ids",
-            "dep_levels": "dep_levels",
-            "ast_depth_ids": "ast_depth",
-            "sibling_index_ids": "sibling_index",
-            "node_type_ids": "ast_node_type",
-        }
-        for model_name, packet_name in packet_fields.items():
-            rows: list[list[int]] = []
-            for example, source in entries:
-                packet = _code_packet(source, task)
-                assert packet is not None
-                values = getattr(packet, packet_name)
-                if values is None:
-                    raise ValueError(
-                        f"{task.value}: required aligned channel {packet_name} is absent"
-                    )
-                rows.append(_pad(values[: int(example.input_ids.shape[0])], seq_len))
-            side_channels[model_name] = mx.array(rows, dtype=mx.int32)
-
-    batch_size = len(entries)
-    graph_targets = np.zeros((batch_size, seq_len, seq_len), dtype=np.float32)
-    graph_pair_mask = np.zeros_like(graph_targets)
-    relation_bias = np.zeros_like(graph_targets)
-    edge_kind_bias = np.zeros_like(graph_targets)
-    graph_samples = 0
-    if task in _ALIGNED_TASKS:
-        for batch_index, (example, source) in enumerate(entries):
-            packet = _code_packet(source, task)
-            assert packet is not None
-            input_length = int(example.input_ids.shape[0])
-            dense_targets, dense_pair_mask = graph_targets_and_pair_mask(
+            for model_name in packet_fields:
+                side_rows[model_name].append([0] * seq_len)
+            route_remap = exclude_objective_routes(
+                source.code_packet,
+                where=f"{task.value}[{row_index}]",
+                reason=_COMMIT_GRAPH_EXCLUSION_REASON,
+                require_sidecars=require_route_sidecars,
+            )
+            exclusion_reasons.add(_COMMIT_GRAPH_EXCLUSION_REASON)
+        elif task in _ALIGNED_TASKS or task in _TRANSFORMED_CODE_TASKS:
+            if packet is None:
+                raise ValueError(
+                    f"{task.value}: code objective requires ObjectiveSource.code_packet"
+                )
+            mapped_documents = _mapped_document_ids(
                 packet,
+                source_indices,
+                where=f"{task.value}[{row_index}]",
+            )
+            document_rows.append(
+                mapped_documents + [0] * (seq_len - input_length)
+            )
+            for model_name, packet_name in packet_fields.items():
+                mapped = _mapped_structure_vector(
+                    packet,
+                    packet_name,
+                    source_indices,
+                    where=f"{task.value}[{row_index}]",
+                )
+                side_rows[model_name].append(mapped + [0] * (seq_len - input_length))
+            route_remap = remap_objective_routes(
+                packet,
+                source_token_indices=source_indices,
+                where=f"{task.value}[{row_index}]",
+                require_sidecars=require_route_sidecars,
+                mode=("identity" if task in _ALIGNED_TASKS else "source_token_remap"),
+            )
+        else:  # pragma: no cover - TaskKind exhaustiveness guard
+            raise ValueError(f"unsupported objective task {task.value}")
+        graph_rows.append(
+            graph_batch_from_objective_routes(
+                route_remap.columns,
                 input_length=input_length,
-                relations=graph_relations,
+                where=f"{task.value}[{row_index}]",
             )
-            aligned_graph = packet.graph_batch().input_aligned(
-                source_sequence_length=int(packet.token_ids.shape[0]),
-                input_sequence_length=input_length,
-            )
-            row_relation_bias, row_edge_kind_bias = build_token_graph_biases(
-                aligned_graph,
-                batch_size=1,
-                seq_length=input_length,
-                document_ids=document_ids[
-                    batch_index : batch_index + 1, :input_length
-                ],
-            )
-            mx.eval(row_relation_bias, row_edge_kind_bias)
-            relation_bias[
-                batch_index, :input_length, :input_length
-            ] = np.asarray(row_relation_bias[0], dtype=np.float32)
-            edge_kind_bias[
-                batch_index, :input_length, :input_length
-            ] = np.asarray(row_edge_kind_bias[0], dtype=np.float32)
-            causal_edges = int(dense_targets.sum(dtype=np.float64))
-            if causal_edges == 0:
-                continue
-            graph_targets[
-                batch_index, :input_length, :input_length
-            ] = dense_targets
-            graph_pair_mask[
-                batch_index, :input_length, :input_length
-            ] = dense_pair_mask
-            graph_samples += 1
+        )
+        route_receipts.append(dict(route_remap.receipt))
 
-    targets_array = mx.array(graph_targets)
+    if len(exclusion_reasons) > 1:  # pragma: no cover - task-homogeneous batches
+        raise ValueError(
+            f"{task.value}: objective batch has conflicting graph exclusions "
+            f"{sorted(exclusion_reasons)}"
+        )
+    document_ids = mx.array(document_rows, dtype=mx.int32)
+    side_channels = {
+        model_name: mx.array(rows, dtype=mx.int32)
+        for model_name, rows in side_rows.items()
+    }
+    graph_batch = _merge_graph_batches(graph_rows)
+    relation_bias, edge_kind_bias = build_token_graph_biases(
+        graph_batch,
+        batch_size=len(entries),
+        seq_length=seq_len,
+        document_ids=document_ids,
+    )
+    graph_targets, graph_pair_mask, eligible_rows = _graph_targets_and_pair_mask_mx(
+        graph_batch,
+        seq_len=seq_len,
+        input_lengths=input_lengths,
+        document_ids=document_ids,
+        graph_relations=graph_relations,
+    )
+    graph_edges_array = mx.sum(graph_targets)
+    graph_samples_array = mx.sum(eligible_rows.astype(mx.int32))
+    mx.eval(graph_edges_array, graph_samples_array)
     return ObjectiveBatch(
         task=task,
         examples=examples,
@@ -317,12 +609,16 @@ def _materialize_batch(
         loss_mask=loss_mask,
         document_ids=document_ids,
         side_channels=side_channels,
-        block_bias=mx.array(relation_bias),
-        edge_kind_bias=mx.array(edge_kind_bias),
-        graph_targets=targets_array,
-        graph_pair_mask=mx.array(graph_pair_mask),
-        graph_samples=graph_samples,
-        graph_edges=int(graph_targets.sum(dtype=np.float64)),
+        block_bias=relation_bias,
+        edge_kind_bias=edge_kind_bias,
+        graph_targets=graph_targets,
+        graph_pair_mask=graph_pair_mask,
+        graph_samples=int(graph_samples_array.item()),
+        graph_edges=int(graph_edges_array.item()),
+        graph_route_receipts=tuple(route_receipts),
+        graph_route_exclusion_reason=(
+            None if not exclusion_reasons else next(iter(exclusion_reasons))
+        ),
     )
 
 
@@ -335,6 +631,7 @@ def _objective_batches(
     quota_window_samples: int,
     seed: int,
     graph_relations: tuple[str, ...] = ("call", "type"),
+    require_route_sidecars: bool = True,
 ):
     quotas = mixer.quotas(quota_window_samples)
     if any(quota % batch_size for quota in quotas.values()):
@@ -363,6 +660,7 @@ def _objective_batches(
                         entries[offset : offset + batch_size],
                         seq_len=seq_len,
                         graph_relations=graph_relations,
+                        require_route_sidecars=require_route_sidecars,
                     )
                 )
         rng.shuffle(batches)
@@ -818,15 +1116,15 @@ def main() -> None:
             loss_mask,
             side_channels=side,
             document_ids=document_ids,
-            block_bias=block_bias if graph_aux_enabled else None,
-            edge_kind_bias=edge_kind_bias if graph_aux_enabled else None,
-            graph_targets=graph_targets if graph_aux_enabled else None,
-            graph_pair_mask=graph_pair_mask if graph_aux_enabled else None,
-            graph_config=graph_config if graph_aux_enabled else None,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            graph_targets=graph_targets,
+            graph_pair_mask=graph_pair_mask,
+            graph_config=graph_config,
             graph_weight=args.graph_aux_weight,
         )
 
-    aligned_loss_and_grad = nn.value_and_grad(
+    objective_loss_and_grad = nn.value_and_grad(
         model,
         lambda input_ids, targets, loss_mask, document_ids, side_vals, block_bias,
         edge_kind_bias, graph_targets, graph_pair_mask: _objective_loss(
@@ -839,39 +1137,6 @@ def main() -> None:
                 dst: side_vals[index]
                 for index, (_src, dst) in enumerate(CHANNELS)
             },
-            block_bias,
-            edge_kind_bias,
-            graph_targets,
-            graph_pair_mask,
-        ),
-    )
-
-    def _reordered_lm_loss(
-        model, input_ids, targets, loss_mask, document_ids, block_bias,
-        edge_kind_bias, graph_targets, graph_pair_mask,
-    ):
-        del graph_targets, graph_pair_mask
-        _, lm_loss = model(
-            input_ids,
-            targets=targets,
-            loss_mask=loss_mask,
-            document_ids=document_ids,
-            block_bias=block_bias,
-            edge_kind_bias=edge_kind_bias,
-        )
-        if lm_loss is None:
-            raise RuntimeError("model returned no LM loss despite supplied targets")
-        return lm_loss, lm_loss, mx.array(0.0, dtype=mx.float32)
-
-    reordered_loss_and_grad = nn.value_and_grad(
-        model,
-        lambda input_ids, targets, loss_mask, document_ids, block_bias,
-        edge_kind_bias, graph_targets, graph_pair_mask: _reordered_lm_loss(
-            model,
-            input_ids,
-            targets,
-            loss_mask,
-            document_ids,
             block_bias,
             edge_kind_bias,
             graph_targets,
@@ -892,7 +1157,7 @@ def main() -> None:
         opt.update(model, grads)
         return total_loss, lm_loss, graph_loss, gnorm
 
-    def _step_aligned(
+    def _step(
         input_ids,
         targets,
         loss_mask,
@@ -903,7 +1168,7 @@ def main() -> None:
         graph_targets,
         graph_pair_mask,
     ):
-        losses, grads = aligned_loss_and_grad(
+        losses, grads = objective_loss_and_grad(
             input_ids,
             targets,
             loss_mask,
@@ -916,34 +1181,10 @@ def main() -> None:
         )
         return _finish_step(losses, grads)
 
-    def _step_reordered(
-        input_ids,
-        targets,
-        loss_mask,
-        document_ids,
-        block_bias,
-        edge_kind_bias,
-        graph_targets,
-        graph_pair_mask,
-    ):
-        losses, grads = reordered_loss_and_grad(
-            input_ids,
-            targets,
-            loss_mask,
-            document_ids,
-            block_bias,
-            edge_kind_bias,
-            graph_targets,
-            graph_pair_mask,
-        )
-        return _finish_step(losses, grads)
-
     if args.no_compile:
-        aligned_step_fn = _step_aligned
-        reordered_step_fn = _step_reordered
+        step_fn = _step
     else:
-        aligned_step_fn = mx.compile(_step_aligned, inputs=state, outputs=state)
-        reordered_step_fn = mx.compile(_step_reordered, inputs=state, outputs=state)
+        step_fn = mx.compile(_step, inputs=state, outputs=state)
 
     val_rows = _load_val_rows(val_shard, args.seq_len, args.val_rows)
     log(f"[data] loaded {len(val_rows)} held-out val rows")
@@ -957,6 +1198,7 @@ def main() -> None:
         quota_window_samples=quota_window_samples,
         seed=args.seed,
         graph_relations=graph_config.relations,
+        require_route_sidecars=True,
     )
     accounting = ObjectiveAccounting(mixer.rates)
     lm_accounting = ObjectiveAccounting(mixer.rates)
@@ -964,6 +1206,7 @@ def main() -> None:
     graph_aux_edges = 0
     graph_aux_batches = 0
     graph_aux_loss_sum = 0.0
+    graph_route_exclusions: Counter[str] = Counter()
 
     mx.reset_peak_memory()
     t0 = time.time()
@@ -974,32 +1217,20 @@ def main() -> None:
         # LR is updated outside the compiled step (it changes every step); MLX
         # picks up the new optimizer scalar via the captured state.
         opt.learning_rate = lr_at(step)
-        if objective_batch.aligned:
-            side_vals = tuple(
-                objective_batch.side_channels[dst] for _src, dst in CHANNELS
-            )
-            loss, lm_loss, graph_loss, gnorm = aligned_step_fn(
-                objective_batch.input_ids,
-                objective_batch.targets,
-                objective_batch.loss_mask,
-                objective_batch.document_ids,
-                side_vals,
-                objective_batch.block_bias,
-                objective_batch.edge_kind_bias,
-                objective_batch.graph_targets,
-                objective_batch.graph_pair_mask,
-            )
-        else:
-            loss, lm_loss, graph_loss, gnorm = reordered_step_fn(
-                objective_batch.input_ids,
-                objective_batch.targets,
-                objective_batch.loss_mask,
-                objective_batch.document_ids,
-                objective_batch.block_bias,
-                objective_batch.edge_kind_bias,
-                objective_batch.graph_targets,
-                objective_batch.graph_pair_mask,
-            )
+        side_vals = tuple(
+            objective_batch.side_channels[dst] for _src, dst in CHANNELS
+        )
+        loss, lm_loss, graph_loss, gnorm = step_fn(
+            objective_batch.input_ids,
+            objective_batch.targets,
+            objective_batch.loss_mask,
+            objective_batch.document_ids,
+            side_vals,
+            objective_batch.block_bias,
+            objective_batch.edge_kind_bias,
+            objective_batch.graph_targets,
+            objective_batch.graph_pair_mask,
+        )
         # Single eval boundary per step: forces the compiled graph + optimizer
         # update to execute and lets MLX free transient activation buffers.
         mx.eval(state, loss, lm_loss, graph_loss, gnorm)
@@ -1017,6 +1248,10 @@ def main() -> None:
         graph_aux_edges += objective_batch.graph_edges
         graph_aux_batches += 1
         graph_aux_loss_sum += last_graph_loss
+        if objective_batch.graph_route_exclusion_reason is not None:
+            graph_route_exclusions[objective_batch.graph_route_exclusion_reason] += len(
+                objective_batch.examples
+            )
         # Memory at 4x4096 is ~29GB of 128GB (not tight), so by default we do
         # NOT flush the freed-but-pooled buffer cache every step: keeping the
         # pool warm avoids re-allocation churn and measured +6%% steps/s with an
@@ -1084,6 +1319,7 @@ def main() -> None:
         "positive_edges": graph_aux_edges,
         "raw_loss_sum": graph_aux_loss_sum,
         "raw_mean_loss": graph_aux_loss_sum / graph_aux_batches,
+        "route_exclusions": dict(graph_route_exclusions),
     }
     log(
         "[objectives] total_loss_accounting="

@@ -535,16 +535,17 @@ def test_stage1_runner_requires_and_uses_only_production_bundle_ingress() -> Non
     assert "provenance_receipt()" in source
 
 
-def test_generic_stage1_runner_threads_explicit_edge_kind_bias() -> None:
+def test_generic_stage1_runner_uses_one_typed_graph_objective_path() -> None:
     module_source = inspect.getsource(
         importlib.import_module("scripts.train_eval_stage1")
     )
 
-    assert "edge_kind_bias=mx.array(edge_kind_bias)" in module_source
-    assert "edge_kind_bias=edge_kind_bias if graph_aux_enabled else None" in (
-        module_source
-    )
-    assert "edge_kind_bias=mx.zeros_like(block_bias)" not in module_source
+    assert "graph_batch_from_objective_routes(" in module_source
+    assert "edge_kind_bias=edge_kind_bias," in module_source
+    assert "objective_loss_and_grad = nn.value_and_grad(" in module_source
+    assert "_reordered_lm_loss" not in module_source
+    assert "np.zeros((batch_size, seq_len, seq_len)" not in module_source
+    assert "np.asarray(row_relation_bias" not in module_source
 
 
 def test_named_stage1_trainers_import_in_fresh_subprocess() -> None:
