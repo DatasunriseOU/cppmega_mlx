@@ -819,6 +819,28 @@ def write_objective_materialization_artifact(
         or not all(isinstance(relation, str) and relation for relation in relations)
     ):
         raise ValueError("objective contract graph relations must be non-empty strings")
+    source_selection = payload.get("source_selection")
+    if not isinstance(source_selection, Mapping):
+        raise ValueError("objective contract source_selection receipt is required")
+    from cppmega_mlx.training.objective_schedule import (
+        canonical_window_quotas,
+        validate_objective_source_selection_receipt,
+    )
+
+    configured_rates = payload.get("configured_rates")
+    expected_window_quotas = None
+    if isinstance(configured_rates, Mapping):
+        expected_window_quotas = canonical_window_quotas(
+            configured_rates,
+            int(payload["quota_window_samples"]),
+        )
+    validate_objective_source_selection_receipt(
+        source_selection,
+        output_samples=int(documents),
+        quota_window_samples=int(payload["quota_window_samples"]),
+        graph_relations=relations,
+        expected_window_quotas=expected_window_quotas,
+    )
 
     resolved_shards = sorted(Path(path).resolve() for path in parquet_paths)
     if not resolved_shards or len(set(resolved_shards)) != len(resolved_shards):

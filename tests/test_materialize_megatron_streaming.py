@@ -174,25 +174,34 @@ def test_materialization_stream_uses_bounded_lookahead_and_carries_unused_source
     )
 
     assert observed_sources == [0, 3, 4, 1, 2, 5]
-    assert receipt == {
-        "schema": "cppmega_objective_source_selection_v2",
-        "algorithm": "bounded_eligibility_bipartite_pool_v1",
-        "output_samples": 6,
-        "source_rows_consumed": 6,
-        "unused_buffered_sources": 0,
-        "quota_window_samples": 3,
-        "quota_lookahead_samples": 2,
-        "max_source_pool_samples": 5,
-        "max_source_pool_observed": 5,
-        "required_graph_relations": [],
-        "resume": {
-            "schema": "cppmega_objective_source_resume_v1",
-            "cursor_semantics": (
-                "replay_buffered_rows_then_continue_after_last_yielded_v1"
-            ),
-            "last_yielded_cursor": {"source_index": 5},
-            "buffered_source_cursors": [],
-        },
+    assert receipt["schema"] == "cppmega_objective_source_selection_v3"
+    assert receipt["algorithm"] == (
+        "bounded_eligibility_bipartite_graph_capability_v1"
+    )
+    assert receipt["output_samples"] == 6
+    assert receipt["source_rows_consumed"] == 6
+    assert receipt["unused_buffered_sources"] == 0
+    assert receipt["quota_window_samples"] == 3
+    assert receipt["quota_lookahead_samples"] == 2
+    assert receipt["max_source_pool_samples"] == 5
+    assert receipt["max_source_pool_observed"] == 5
+    assert receipt["required_graph_relations"] == []
+    assert [window["selected_source_indices"] for window in receipt["windows"]] == [
+        [0, 3, 4],
+        [1, 2, 5],
+    ]
+    assert receipt["schedule"] == {
+        "schema": "cppmega_objective_schedule_v1",
+        "algorithm": "bounded_eligibility_bipartite_graph_capability_v1",
+        "windows_sha256": receipt["windows_sha256"],
+    }
+    assert receipt["resume"] == {
+        "schema": "cppmega_objective_source_resume_v1",
+        "cursor_semantics": (
+            "replay_buffered_rows_then_continue_after_last_yielded_v1"
+        ),
+        "last_yielded_cursor": {"source_index": 5},
+        "buffered_source_cursors": [],
     }
 
 

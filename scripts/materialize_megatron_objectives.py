@@ -68,7 +68,6 @@ from cppmega_mlx.training.megatron_objectives import (
 )
 from cppmega_mlx.training.objective_contract_accumulator import (
     ObjectiveContractAccumulator,
-    count_configured_graph_positive_edges,
 )
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_ROUTE_MAPPING_SCHEMA,
@@ -80,15 +79,18 @@ from cppmega_mlx.training.objective_data import (
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
     GraphAuxLossConfig,
-    ObjectiveQuotaUnsatisfiedError,
+    ObjectiveQuotaUnsatisfiedError,  # noqa: F401 - retained for test/API compatibility
     ObjectiveSource,
-    RealizedObjective,
+)
+from cppmega_mlx.training.objective_schedule import (
+    CanonicalObjectivePlanner,
+    assess_graph_positive_capability,
+    validate_graph_receipt_against_document,
 )
 from cppmega_mlx.data.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     stage1_graph_config_kwargs,
 )
-from cppmega_mlx.training.objectives import build_causal_lm
 from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES
 from cppmega_mlx.training.task_mixer import TaskKind
 
@@ -831,26 +833,17 @@ def _materialized_assignment_has_graph_positive(
     *,
     graph_relations: tuple[str, ...],
 ) -> bool:
-    """Apply the contract's graph-positive predicate after objective remapping."""
+    """Apply the graph-positive predicate to the task's realized route map."""
 
-    if task is not TaskKind.CAUSAL_LM or source.code_packet is None:
-        return False
-    packet = source.code_packet
-    realized = RealizedObjective(
-        task=task,
-        example=build_causal_lm(packet),
-        ineligible={},
-        source_index=0,
-        selected_packet=packet,
+    mixer = EligibilityAwareTaskMixer({task: 1.0}, seed=0)
+    realized = mixer.materialize(source, step_index=0)
+    receipt = assess_graph_positive_capability(
+        realized,
+        source,
+        graph_relations=graph_relations,
+        require_route_sidecars=False,
     )
-    document = materialize_megatron_document(realized, source)
-    return (
-        count_configured_graph_positive_edges(
-            document,
-            relations=graph_relations,
-        )
-        > 0
-    )
+    return bool(receipt["eligible"])
 
 
 def _materialize_stream(
@@ -863,120 +856,34 @@ def _materialize_stream(
     quota_window_samples: int,
     quota_lookahead_samples: int,
     graph_relations: tuple[str, ...] = (),
+    require_route_sidecars: bool = True,
 ) -> dict[str, object]:
-    source_pool: list[ObjectiveSource] = []
-    source_cursor_pool: list[dict[str, int]] = []
-    source_rows_consumed = 0
-    max_source_pool_observed = 0
-    max_source_pool_samples = quota_window_samples + quota_lookahead_samples
-    last_yielded_cursor: dict[str, int] | None = None
-
-    def append_source() -> None:
-        nonlocal source_rows_consumed, max_source_pool_observed, last_yielded_cursor
-        source_pool.append(next(source_iter))
-        raw_cursor = getattr(source_iter, "last_cursor", None)
-        cursor = (
-            {"source_index": source_rows_consumed}
-            if raw_cursor is None
-            else dict(raw_cursor)
-        )
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in cursor.values()
-        ):
-            raise ValueError(
-                "objective source cursor values must be non-negative integers"
-            )
-        if int(cursor.get("source_index", -1)) != source_rows_consumed:
-            raise ValueError(
-                "objective source iterator cursor is not aligned to yielded rows: "
-                f"cursor={cursor.get('source_index')}, "
-                f"expected={source_rows_consumed}"
-            )
-        source_cursor_pool.append(cursor)
-        last_yielded_cursor = cursor
-        source_rows_consumed += 1
-        max_source_pool_observed = max(max_source_pool_observed, len(source_pool))
-
-    def required_graph_assignment(source: ObjectiveSource, task: TaskKind) -> bool:
-        return _materialized_assignment_has_graph_positive(
-            source,
-            task,
-            graph_relations=graph_relations,
-        )
-
+    planner = CanonicalObjectivePlanner(
+        mixer=mixer,
+        source_iter=source_iter,
+        quota_window_samples=quota_window_samples,
+        quota_lookahead_samples=quota_lookahead_samples,
+        graph_relations=graph_relations,
+        require_route_sidecars=require_route_sidecars,
+    )
     for start_step in range(0, samples, quota_window_samples):
-        while len(source_pool) < quota_window_samples:
-            append_source()
-        while True:
-            try:
-                realized = mixer.materialize_window_from_pool(
-                    source_pool,
-                    output_count=quota_window_samples,
-                    start_step=start_step,
-                    required_assignment=(
-                        required_graph_assignment if graph_relations else None
-                    ),
-                )
-                break
-            except ObjectiveQuotaUnsatisfiedError as error:
-                if len(source_pool) >= max_source_pool_samples:
-                    raise ObjectiveQuotaUnsatisfiedError(
-                        "objective quota remained unsatisfied at the bounded "
-                        "lookahead limit: "
-                        f"start_step={start_step}, pool={len(source_pool)}, "
-                        f"window={quota_window_samples}, "
-                        f"lookahead={quota_lookahead_samples}; {error}"
-                    ) from error
-                append_source()
-
-        selected_indices = {item.source_index for item in realized}
-        if len(selected_indices) != quota_window_samples:
-            raise RuntimeError(
-                "objective pool matching selected the wrong number of sources: "
-                f"selected={len(selected_indices)}, expected={quota_window_samples}"
-            )
-        for item in realized:
+        window = planner.plan_window(start_step=start_step)
+        for assignment in window.assignments:
             document = materialize_megatron_document(
-                item,
-                source_pool[item.source_index],
-                require_production_sidecars=True,
+                assignment.realized,
+                assignment.source,
+                require_production_sidecars=require_route_sidecars,
             )
+            if assignment.graph_eligibility is not None:
+                validate_graph_receipt_against_document(
+                    assignment.graph_eligibility,
+                    document,
+                    graph_relations=graph_relations,
+                )
             accumulator.add(document)
             writer.add(document)
             del document
-        retained = [
-            (source, cursor)
-            for source_index, (source, cursor) in enumerate(
-                zip(source_pool, source_cursor_pool, strict=True)
-            )
-            if source_index not in selected_indices
-        ]
-        source_pool = [source for source, _cursor in retained]
-        source_cursor_pool = [cursor for _source, cursor in retained]
-        del realized
-    if last_yielded_cursor is None:  # pragma: no cover - samples is validated positive
-        raise RuntimeError("objective materialization consumed no source rows")
-    return {
-        "schema": "cppmega_objective_source_selection_v2",
-        "algorithm": "bounded_eligibility_bipartite_pool_v1",
-        "output_samples": int(samples),
-        "source_rows_consumed": source_rows_consumed,
-        "unused_buffered_sources": len(source_pool),
-        "quota_window_samples": int(quota_window_samples),
-        "quota_lookahead_samples": int(quota_lookahead_samples),
-        "max_source_pool_samples": int(max_source_pool_samples),
-        "max_source_pool_observed": int(max_source_pool_observed),
-        "required_graph_relations": list(graph_relations),
-        "resume": {
-            "schema": "cppmega_objective_source_resume_v1",
-            "cursor_semantics": (
-                "replay_buffered_rows_then_continue_after_last_yielded_v1"
-            ),
-            "last_yielded_cursor": dict(last_yielded_cursor),
-            "buffered_source_cursors": [dict(cursor) for cursor in source_cursor_pool],
-        },
-    }
+    return planner.source_selection_receipt(output_samples=samples)
 
 
 def main() -> int:

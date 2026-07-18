@@ -70,6 +70,12 @@ from cppmega_mlx.training.objective_mixer import (
     ObjectiveSource,
     production_training_loss,
 )
+from cppmega_mlx.training.objective_schedule import (
+    CanonicalObjectivePlanner,
+    OBJECTIVE_SCHEDULE_ALGORITHM,
+    OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
+    canonical_schedule_receipt_sha256,
+)
 from cppmega_mlx.data.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     stage1_graph_config_kwargs,
@@ -214,6 +220,7 @@ class ObjectiveBatch:
     graph_edges: int
     graph_route_receipts: tuple[dict[str, object], ...]
     graph_route_exclusion_reason: str | None
+    schedule_window_receipt: dict[str, object] | None = None
 
     @property
     def aligned(self) -> bool:
@@ -483,6 +490,7 @@ def _materialize_batch(
     seq_len: int,
     graph_relations: tuple[str, ...] = ("call", "type"),
     require_route_sidecars: bool = True,
+    schedule_window_receipt: dict[str, object] | None = None,
 ) -> ObjectiveBatch:
     if not entries:
         raise ValueError(f"{task.value}: objective batch entries must be non-empty")
@@ -619,6 +627,7 @@ def _materialize_batch(
         graph_route_exclusion_reason=(
             None if not exclusion_reasons else next(iter(exclusion_reasons))
         ),
+        schedule_window_receipt=schedule_window_receipt,
     )
 
 
@@ -629,10 +638,16 @@ def _objective_batches(
     batch_size: int,
     seq_len: int,
     quota_window_samples: int,
+    quota_lookahead_samples: int | None = None,
     seed: int,
     graph_relations: tuple[str, ...] = ("call", "type"),
     require_route_sidecars: bool = True,
+    schedule_receipts: list[dict[str, object]] | None = None,
 ):
+    if quota_lookahead_samples is None:
+        quota_lookahead_samples = 3 * quota_window_samples
+    if quota_lookahead_samples < 0:
+        raise ValueError("quota_lookahead_samples must be non-negative")
     quotas = mixer.quotas(quota_window_samples)
     if any(quota % batch_size for quota in quotas.values()):
         raise ValueError(
@@ -640,16 +655,26 @@ def _objective_batches(
             + ", ".join(f"{task.value}={quota}" for task, quota in quotas.items())
         )
     rng = random.Random(seed)
+    planner = CanonicalObjectivePlanner(
+        mixer=mixer,
+        source_iter=source_iter,
+        quota_window_samples=quota_window_samples,
+        quota_lookahead_samples=quota_lookahead_samples,
+        graph_relations=graph_relations,
+        require_route_sidecars=require_route_sidecars,
+    )
     start_step = 0
     while True:
-        sources = [next(source_iter) for _ in range(quota_window_samples)]
-        realized = mixer.materialize_window(sources, start_step=start_step)
+        window = planner.plan_window(start_step=start_step)
+        if schedule_receipts is not None:
+            schedule_receipts.append(dict(window.receipt))
         grouped: dict[TaskKind, list[tuple[ObjectiveExample, ObjectiveSource]]] = {
             task: [] for task in quotas
         }
-        for item in realized:
+        for assignment in window.assignments:
+            item = assignment.realized
             grouped[item.task].append(
-                (item.example, sources[item.source_index])
+                (item.example, assignment.source)
             )
         batches: list[ObjectiveBatch] = []
         for task, entries in grouped.items():
@@ -661,6 +686,7 @@ def _objective_batches(
                         seq_len=seq_len,
                         graph_relations=graph_relations,
                         require_route_sidecars=require_route_sidecars,
+                        schedule_window_receipt=window.receipt,
                     )
                 )
         rng.shuffle(batches)
@@ -860,6 +886,15 @@ def main() -> None:
         default=0,
         help="objective sample window (0 = 60 * batch; quotas must divide batch)",
     )
+    ap.add_argument(
+        "--quota-lookahead-samples",
+        type=int,
+        default=None,
+        help=(
+            "maximum extra source rows retained while satisfying one exact "
+            "objective quota window (default: three quota windows)"
+        ),
+    )
     graph_recipe = stage1_graph_config_kwargs()
     ap.add_argument(
         "--graph-aux-weight", type=float, default=graph_recipe["global_weight"]
@@ -1001,6 +1036,13 @@ def main() -> None:
     if args.quota_window_samples < 0:
         raise ValueError("--quota-window-samples must be non-negative")
     quota_window_samples = args.quota_window_samples or (60 * args.batch)
+    quota_lookahead_samples = (
+        3 * quota_window_samples
+        if args.quota_lookahead_samples is None
+        else args.quota_lookahead_samples
+    )
+    if quota_lookahead_samples < 0:
+        raise ValueError("--quota-lookahead-samples must be non-negative")
     if quota_window_samples % args.batch:
         raise ValueError("quota window samples must be divisible by batch size")
     steps_per_quota_window = quota_window_samples // args.batch
@@ -1190,15 +1232,18 @@ def main() -> None:
     log(f"[data] loaded {len(val_rows)} held-out val rows")
 
     source_iter = _iter_sources(train_shards, args.seed)
+    schedule_receipts: list[dict[str, object]] = []
     batch_iter = _objective_batches(
         source_iter,
         mixer,
         batch_size=args.batch,
         seq_len=args.seq_len,
         quota_window_samples=quota_window_samples,
+        quota_lookahead_samples=quota_lookahead_samples,
         seed=args.seed,
         graph_relations=graph_config.relations,
         require_route_sidecars=True,
+        schedule_receipts=schedule_receipts,
     )
     accounting = ObjectiveAccounting(mixer.rates)
     lm_accounting = ObjectiveAccounting(mixer.rates)
@@ -1321,6 +1366,14 @@ def main() -> None:
         "raw_mean_loss": graph_aux_loss_sum / graph_aux_batches,
         "route_exclusions": dict(graph_route_exclusions),
     }
+    schedule_report = {
+        "schema": OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
+        "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
+        "windows": len(schedule_receipts),
+        "windows_sha256": canonical_schedule_receipt_sha256(schedule_receipts),
+        "quota_window_samples": quota_window_samples,
+        "quota_lookahead_samples": quota_lookahead_samples,
+    }
     log(
         "[objectives] total_loss_accounting="
         f"{json.dumps(objective_report, sort_keys=True)}"
@@ -1330,6 +1383,9 @@ def main() -> None:
         f"{json.dumps(lm_objective_report, sort_keys=True)}"
     )
     log(f"[objectives] graph_accounting={json.dumps(graph_report, sort_keys=True)}")
+    log(
+        f"[objectives] schedule_receipt={json.dumps(schedule_report, sort_keys=True)}"
+    )
 
     final_cp = save_ckpt(model, opt, args.steps)
     log(f"[DONE] steps={args.steps} final_ckpt={final_cp} peak_gb={_peak_gb():.2f}")
