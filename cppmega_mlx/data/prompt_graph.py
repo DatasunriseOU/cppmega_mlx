@@ -37,6 +37,9 @@ WINDOW_SCHEMA = "cppmega_prompt_graph_window_v3"
 BUILDER_VERSION = "3"
 PRODUCTION_INDEX_PRODUCER = "ClangPromptProjectIndexProducer"
 PRODUCTION_INDEX_VERSION = "3"
+PRODUCTION_IDENTITY_PROVENANCE_CONTRACT = (
+    "case4_symbol_reference_v3_repo_binding_v1"
+)
 INDEX_PAYLOAD_HASH_KEY = "index_payload_sha256"
 TRUSTED_IDENTITY_ADAPTERS = frozenset(
     {
@@ -511,6 +514,13 @@ class PromptGraphSymbol:
     canonical_signature: str = ""
     qname: str = ""
     chunk_identity: str = ""
+    identity_project: str = ""
+    identity_file: str = ""
+    identity_line: int = 0
+    identity_column: int = 0
+    identity_kind: str = ""
+    identity_provider: str = ""
+    identity_include_provenance: str = ""
 
     @classmethod
     def from_dict(cls, row: Mapping[str, Any]) -> "PromptGraphSymbol":
@@ -539,6 +549,19 @@ class PromptGraphSymbol:
             canonical_signature=str(row.get("canonical_signature") or ""),
             qname=str(row.get("qname") or ""),
             chunk_identity=str(row.get("chunk_identity") or ""),
+            identity_project=str(row.get("identity_project") or ""),
+            identity_file=str(row.get("identity_file") or ""),
+            identity_line=_require_int(
+                row.get("identity_line", 0), where="symbol.identity_line"
+            ),
+            identity_column=_require_int(
+                row.get("identity_column", 0), where="symbol.identity_column"
+            ),
+            identity_kind=str(row.get("identity_kind") or ""),
+            identity_provider=str(row.get("identity_provider") or ""),
+            identity_include_provenance=str(
+                row.get("identity_include_provenance") or ""
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -557,6 +580,13 @@ class PromptGraphSymbol:
             "start": self.start,
             "end": self.end,
             "chunk_identity": self.chunk_identity,
+            "identity_project": self.identity_project,
+            "identity_file": self.identity_file,
+            "identity_line": self.identity_line,
+            "identity_column": self.identity_column,
+            "identity_kind": self.identity_kind,
+            "identity_provider": self.identity_provider,
+            "identity_include_provenance": self.identity_include_provenance,
         }
 
 
@@ -1069,6 +1099,12 @@ class PromptProjectIndex:
             )
         if provenance.get("schema") != INDEX_SCHEMA:
             raise ValueError("production repository index schema provenance mismatch")
+        if provenance.get("identity_provenance_contract") != (
+            PRODUCTION_IDENTITY_PROVENANCE_CONTRACT
+        ):
+            raise ValueError(
+                "production repository index identity provenance contract mismatch"
+            )
         if provenance.get("project_id") != self.project_id:
             raise ValueError("production repository index project identity mismatch")
         if expected_project_id is not None:
@@ -1271,7 +1307,7 @@ class PromptProjectIndex:
                 "production repository index identity adapters are missing"
             )
         adapter_names = {str(adapter) for adapter in adapters}
-        if len(adapter_names) != 1 or not adapter_names <= TRUSTED_IDENTITY_ADAPTERS:
+        if adapter_names != TRUSTED_IDENTITY_ADAPTERS:
             raise ValueError(
                 "production repository index uses an untrusted identity adapter"
             )
@@ -1302,14 +1338,43 @@ class PromptProjectIndex:
 
         chunks_by_identity = {chunk.identity: chunk for chunk in self.chunks}
         symbols_by_identity = {symbol.identity: symbol for symbol in self.symbols}
-        semantic_contracts: dict[str, tuple[str, str, str, str]] = {}
+        documents_by_id = {document.id: document for document in self.documents}
+        semantic_contracts: dict[
+            str, tuple[str, str, str, str, str, str, int, int, str, str, str]
+        ] = {}
+        definition_kinds = {"function", "type", "variable"}
 
         for symbol in self.symbols:
+            if (
+                symbol.identity_project != self.project_id
+                or not symbol.identity_file
+                or symbol.identity_file not in repository_manifest
+                or symbol.identity_line <= 0
+                or symbol.identity_column <= 0
+                or not symbol.identity_kind
+            ):
+                raise ValueError(
+                    "production repository index symbol identity provenance "
+                    f"is incomplete or not repository-bound for {symbol.identity!r}"
+                )
+            _validate_relative_source_path(
+                symbol.identity_file,
+                where=(
+                    "production repository index symbol identity provenance file"
+                ),
+            )
             contract = (
                 symbol.symbol_key,
                 symbol.usr,
                 symbol.canonical_signature,
                 symbol.qname,
+                symbol.identity_project,
+                symbol.identity_file,
+                symbol.identity_line,
+                symbol.identity_column,
+                symbol.identity_kind,
+                symbol.identity_provider,
+                symbol.identity_include_provenance,
             )
             previous = semantic_contracts.setdefault(
                 symbol.semantic_identity,
@@ -1318,7 +1383,8 @@ class PromptProjectIndex:
             if previous != contract:
                 raise ValueError(
                     "production repository index semantic identity contract "
-                    f"mismatch for {symbol.semantic_identity!r}"
+                    "mismatch (identity provenance) for "
+                    f"{symbol.semantic_identity!r}"
                 )
 
             if symbol.usr:
@@ -1367,7 +1433,13 @@ class PromptProjectIndex:
                 )
                 if (
                     location_identity.project != self.project_id
+                    or location_identity.project != symbol.identity_project
+                    or location_identity.file != symbol.identity_file
                     or location_identity.file != symbol.source_path
+                    or location_identity.line != symbol.identity_line
+                    or location_identity.column != symbol.identity_column
+                    or location_identity.kind != symbol.identity_kind
+                    or location_identity.qname != symbol.qname
                 ):
                     raise ValueError(
                         "production repository index location/project identity "
@@ -1392,7 +1464,57 @@ class PromptProjectIndex:
                         f"mismatch for {symbol.identity!r}"
                     )
 
-        definition_kinds = {"function", "type", "variable"}
+        definitions_by_semantic: dict[str, list[PromptGraphSymbol]] = {}
+        for symbol in self.symbols:
+            if symbol.kind in definition_kinds:
+                definitions_by_semantic.setdefault(
+                    symbol.semantic_identity, []
+                ).append(symbol)
+                document = documents_by_id[symbol.document_id]
+                line_start = document.source.rfind("\n", 0, symbol.start) + 1
+                expected_line = document.source.count("\n", 0, symbol.start) + 1
+                expected_column = (
+                    len(document.source[line_start : symbol.start].encode("utf-8"))
+                    + 1
+                )
+                if (
+                    symbol.identity_file != symbol.source_path
+                    or symbol.identity_line != expected_line
+                    or symbol.identity_column != expected_column
+                ):
+                    raise ValueError(
+                        "production repository index definition identity "
+                        f"provenance does not match source for {symbol.identity!r}"
+                    )
+
+        for semantic_identity, symbols in definitions_by_semantic.items():
+            definition_contract = (
+                symbols[0].identity_project,
+                symbols[0].identity_file,
+                symbols[0].identity_line,
+                symbols[0].identity_column,
+                symbols[0].identity_kind,
+                symbols[0].identity_provider,
+                symbols[0].identity_include_provenance,
+            )
+            if any(
+                (
+                    symbol.identity_project,
+                    symbol.identity_file,
+                    symbol.identity_line,
+                    symbol.identity_column,
+                    symbol.identity_kind,
+                    symbol.identity_provider,
+                    symbol.identity_include_provenance,
+                )
+                != definition_contract
+                for symbol in symbols[1:]
+            ):
+                raise ValueError(
+                    "production repository index definition identity provenance "
+                    f"mismatch for {semantic_identity!r}"
+                )
+
         for edge in self.edges:
             if edge.relation not in {"call", "type", "def_use", "domain"}:
                 continue

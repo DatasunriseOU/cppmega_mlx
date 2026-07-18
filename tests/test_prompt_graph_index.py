@@ -294,6 +294,32 @@ def test_prompt_producer_rejects_identity_without_provenance(
         )
 
 
+def test_production_index_rejects_identity_provenance_tampering(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-identity-provenance"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    definition = next(
+        row for row in payload["symbols"] if row["kind"] == "function"
+    )
+    definition["identity_file"] = (
+        "include/repo_api.hpp"
+        if definition["identity_file"] != "include/repo_api.hpp"
+        else "src/math_prompt.cpp"
+    )
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="identity provenance"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
 def test_cached_index_payload_checksum_rejects_tampering(tmp_path: Path) -> None:
     producer = ClangPromptProjectIndexProducer(
         cache_dir=tmp_path / "index-cache",

@@ -17,6 +17,14 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
 
+from cppmega_mlx.data.prompt_graph import (
+    PromptGraphArtifact,
+    PromptGraphBuilder,
+    PromptGraphContext,
+    PromptProjectIndex,
+)
+from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
+from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
 from cppmega_mlx.data.platform_context import (
     PlatformContext,
     encode_platform_context,
@@ -451,6 +459,8 @@ class InferenceSideChannelCacheComponents:
     adapter_language: str | None
     adapter_version: str | None
     platform_context: str
+    prompt_graph_cache_key: str | None = None
+    prompt_graph_project_id: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -460,6 +470,8 @@ class InferenceSideChannelCacheComponents:
                 "adapter_language": self.adapter_language,
                 "adapter_version": self.adapter_version,
                 "platform_context": self.platform_context,
+                "prompt_graph_cache_key": self.prompt_graph_cache_key,
+                "prompt_graph_project_id": self.prompt_graph_project_id,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -480,6 +492,10 @@ class InferenceSideChannelResult:
     platform_context: PlatformContext
     rendered_platform_context: str
     cache_components: InferenceSideChannelCacheComponents
+    graph_artifact: PromptGraphArtifact | None = None
+    project_index: PromptProjectIndex | None = None
+    repository_root: Path | None = None
+    index_path: Path | None = None
 
     @property
     def cache_key(self) -> str:
@@ -646,6 +662,185 @@ class InferenceSideChannelBuilder:
             platform_context=ctx,
             rendered_platform_context=rendered_context,
             cache_components=cache_components,
+        )
+
+    def build_repository(
+        self,
+        text: str,
+        *,
+        repository_root: str | Path,
+        project_id: str,
+        source_path: str,
+        source_start: int,
+        indexer_root: str | Path,
+        graph_cache_dir: str | Path,
+        index_cache_dir: str | Path | None = None,
+        index_path: str | Path | None = None,
+        libclang_path: str | Path | None = None,
+        platform_context: PlatformContext | Mapping[str, Any] | str | None = None,
+    ) -> InferenceSideChannelResult:
+        """Build inference inputs from a validated repository prompt graph.
+
+        Repository mode has one producer/loader path. An explicit index must
+        carry the trusted clang receipt; otherwise the same checkout's clang
+        producer builds it into the supplied deterministic cache.
+        """
+
+        if not isinstance(text, str) or not text:
+            raise ValueError("repository inference prompt text must be non-empty")
+        root = Path(repository_root).resolve()
+        if not root.is_dir():
+            raise NotADirectoryError(
+                f"repository inference root is not a directory: {root}"
+            )
+        indexer = Path(indexer_root).resolve()
+        if not indexer.is_dir():
+            raise NotADirectoryError(
+                f"repository inference indexer root is not a directory: {indexer}"
+            )
+        if (
+            isinstance(source_start, bool)
+            or not isinstance(source_start, int)
+            or source_start < 0
+        ):
+            raise ValueError(
+                "repository inference source_start must be a non-negative integer"
+            )
+
+        loaded_path: Path
+        cache_hit = False
+        if index_path is not None:
+            loaded_path = Path(index_path).resolve()
+            if not loaded_path.is_file():
+                raise FileNotFoundError(
+                    f"repository inference index not found: {loaded_path}"
+                )
+            project_index = PromptProjectIndex.from_json_path(loaded_path)
+            project_index.validate_production_repository_index(
+                expected_project_id=project_id,
+                expected_indexer_root=indexer,
+            )
+            project_index.verify_repository(root)
+            index_source = "loaded"
+        else:
+            if index_cache_dir is None:
+                raise ValueError(
+                    "repository inference index building requires index_cache_dir"
+                )
+            built = ClangPromptProjectIndexProducer(
+                cache_dir=index_cache_dir,
+                indexer_root=indexer,
+                libclang_path=libclang_path,
+                strict_diagnostics=True,
+            ).build(root, project_id=project_id)
+            project_index = built.index
+            loaded_path = built.path.resolve()
+            cache_hit = bool(built.cache_hit)
+            index_source = "built"
+            project_index.validate_production_repository_index(
+                expected_project_id=project_id,
+                expected_indexer_root=indexer,
+            )
+            project_index.verify_repository(root)
+
+        document = project_index.document_for_path(source_path)
+        source_end = source_start + len(text)
+        if document.source[source_start:source_end] != text:
+            raise ValueError(
+                "repository inference prompt does not match the bound project "
+                f"document span {document.source_path!r}"
+            )
+        context = PromptGraphContext.from_repository_prompt(
+            project_index,
+            text,
+            document_id=document.id,
+            source_path=document.source_path,
+            source_start=source_start,
+            language="cpp",
+        )
+        artifact = PromptGraphBuilder(
+            self.tokenizer,
+            cache_dir=graph_cache_dir,
+        ).build(project_index, context)
+        _validate_repository_artifact_binding(artifact, project_index)
+
+        token_count = artifact.token_count
+        arrays = {
+            name: _token_aligned_array(
+                name,
+                values,
+                token_count=token_count,
+            )
+            for name, values in artifact.side_channels.items()
+        }
+        side_channels = _repository_side_channels(arrays)
+        model_kwargs = {
+            name: arrays[name]
+            for name in (
+                "structure_ids",
+                "dep_levels",
+                "ast_depth_ids",
+                "sibling_index_ids",
+                "node_type_ids",
+            )
+        }
+        document_ids = arrays["source_doc_ids"]
+        model_kwargs["document_ids"] = document_ids
+
+        ctx = parse_platform_context(platform_context)
+        rendered_context = render_platform_context(ctx)
+        platform_ids = _platform_ids_for_context(ctx)
+        if platform_ids is not None:
+            model_kwargs["platform_ids"] = platform_ids
+            side_channels["platform"] = {"platform_ids": platform_ids}
+
+        graph_cache_key = str(artifact.receipt["cache_key"])
+        index_receipt = project_index.provenance
+        provenance = {
+            "prompt_graph_mode": "repository",
+            "prompt_graph_producer": str(index_receipt["producer"]),
+            "prompt_graph_producer_version": str(
+                index_receipt["producer_version"]
+            ),
+            "prompt_graph_project_id": project_index.project_id,
+            "prompt_graph_identity_schema": (
+                f"v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            ),
+            "prompt_graph_identity_adapters": ",".join(
+                str(value)
+                for value in index_receipt["identity_adapters"]
+            ),
+            "prompt_graph_identity_provenance_contract": str(
+                index_receipt["identity_provenance_contract"]
+            ),
+            "prompt_graph_index_source": index_source,
+            "prompt_graph_index_cache_hit": str(cache_hit).lower(),
+            "prompt_graph_index_path": str(loaded_path),
+            "prompt_graph_index_sha256": project_index.index_sha256,
+            "prompt_graph_artifact_cache_key": graph_cache_key,
+            "prompt_graph_repository_root": str(root),
+        }
+        cache_components = _cache_components(
+            text=context.text,
+            tokenizer_id=self.tokenizer_id,
+            adapter=None,
+            platform_context=rendered_context,
+            prompt_graph_cache_key=graph_cache_key,
+            prompt_graph_project_id=project_index.project_id,
+        )
+        prompt_ids = mx.array([artifact.token_ids], dtype=mx.int32)
+        return InferenceSideChannelResult(
+            prompt_ids=prompt_ids,
+            model_kwargs=model_kwargs,
+            side_channels=side_channels,
+            provenance=provenance,
+            platform_context=ctx,
+            rendered_platform_context=rendered_context,
+            cache_components=cache_components,
+            graph_artifact=artifact,
+            project_index=project_index,
+            repository_root=root,
+            index_path=loaded_path,
         )
 
 
@@ -1003,6 +1198,8 @@ def _cache_components(
     tokenizer_id: str,
     adapter: CodeMetadataAdapter | None,
     platform_context: str,
+    prompt_graph_cache_key: str | None = None,
+    prompt_graph_project_id: str | None = None,
 ) -> InferenceSideChannelCacheComponents:
     return InferenceSideChannelCacheComponents(
         content_sha256=sha256(text.encode("utf-8")).hexdigest(),
@@ -1010,7 +1207,77 @@ def _cache_components(
         adapter_language=getattr(adapter, "language", None),
         adapter_version=getattr(adapter, "version", None),
         platform_context=platform_context,
+        prompt_graph_cache_key=prompt_graph_cache_key,
+        prompt_graph_project_id=prompt_graph_project_id,
     )
+
+
+def _validate_repository_artifact_binding(
+    artifact: PromptGraphArtifact,
+    project_index: PromptProjectIndex,
+) -> None:
+    if artifact.receipt.get("project_id") != project_index.project_id:
+        raise ValueError(
+            "repository prompt graph artifact project identity does not match "
+            "the production index"
+        )
+    provenance = artifact.receipt.get("provenance")
+    if not isinstance(provenance, Mapping) or provenance.get(
+        "index_schema"
+    ) != project_index.schema:
+        raise ValueError(
+            "repository prompt graph artifact index schema does not match "
+            "the production index"
+        )
+    if artifact.receipt.get("symbol_identity_schema_version") != (
+        SYMBOL_IDENTITY_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "repository prompt graph artifact requires canonical symbol identity v3"
+        )
+    hashes = artifact.receipt.get("hashes")
+    if not isinstance(hashes, Mapping):
+        raise ValueError(
+            "repository prompt graph artifact identity hashes are missing"
+        )
+    if hashes.get("index_sha256") != project_index.index_sha256:
+        raise ValueError(
+            "repository prompt graph artifact is not bound to the loaded index"
+        )
+    if hashes.get("source_sha256") != project_index.source_sha256:
+        raise ValueError(
+            "repository prompt graph artifact is not bound to repository source"
+        )
+
+
+def _repository_side_channels(
+    arrays: Mapping[str, mx.array],
+) -> dict[str, dict[str, mx.array]]:
+    return {
+        "structure": {
+            "token_structure_ids": arrays["structure_ids"],
+            "token_dep_levels": arrays["dep_levels"],
+        },
+        "syntax": {
+            "token_ast_depth": arrays["ast_depth_ids"],
+            "token_sibling_index": arrays["sibling_index_ids"],
+            "token_ast_node_type": arrays["node_type_ids"],
+        },
+        "semantic_graph": {
+            "token_symbol_ids": arrays["symbol_ids"],
+            "token_call_targets": arrays["call_targets"],
+            "token_type_refs": arrays["type_refs"],
+            "token_def_use": arrays["def_use"],
+        },
+        "domain_routes": {
+            "token_domain_ids": arrays["domain_ids"],
+            "token_role_ids": arrays["role_ids"],
+            "token_entity_ids": arrays["entity_ids"],
+            "token_scope_ids": arrays["scope_ids"],
+            "token_source_doc_ids": arrays["source_doc_ids"],
+            "token_confidence_ids": arrays["confidence_ids"],
+        },
+    }
 
 
 def _platform_ids_for_context(ctx: PlatformContext) -> mx.array | None:

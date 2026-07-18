@@ -24,6 +24,7 @@ from typing import Any
 from .prompt_graph import (
     INDEX_SCHEMA,
     PromptProjectIndex,
+    PRODUCTION_IDENTITY_PROVENANCE_CONTRACT,
     repository_snapshot,
     require_prompt_graph_project_id,
 )
@@ -54,6 +55,12 @@ class _CursorIdentity:
     canonical_signature: str
     qname: str
     symbol_kind: str
+    identity_project: str
+    identity_file: str
+    identity_line: int
+    identity_column: int
+    identity_provider: str
+    identity_include_provenance: str
     adapter: str
 
 
@@ -78,49 +85,6 @@ def _normalize_signature(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
-def _cursor_usr(cursor: Any) -> str:
-    getter = getattr(cursor, "get_usr", None)
-    if not callable(getter):
-        return ""
-    try:
-        value = str(getter() or "")
-    except Exception:
-        return ""
-    if not value or value.startswith("<") or "invalid" in value.lower():
-        return ""
-    return value
-
-
-def _cursor_signature(cursor: Any) -> str:
-    pieces: list[str] = []
-    display = _normalize_signature(getattr(cursor, "displayname", ""))
-    if display:
-        pieces.append(f"display={display}")
-    cursor_type = getattr(cursor, "type", None)
-    type_spelling = _normalize_signature(getattr(cursor_type, "spelling", ""))
-    if type_spelling:
-        pieces.append(f"type={type_spelling}")
-    result_type = getattr(cursor, "result_type", None)
-    result_spelling = _normalize_signature(
-        getattr(result_type, "spelling", "")
-    )
-    if result_spelling:
-        pieces.append(f"result={result_spelling}")
-    argument_types: list[str] = []
-    getter = getattr(cursor, "get_arguments", None)
-    if callable(getter):
-        try:
-            argument_types = [
-                _normalize_signature(getattr(argument.type, "spelling", ""))
-                for argument in getter()
-            ]
-        except Exception:
-            argument_types = []
-    if argument_types:
-        pieces.append("args=(" + ",".join(argument_types) + ")")
-    return "|".join(pieces)
-
-
 def _cursor_kind_name(cursor: Any) -> str:
     kind = getattr(cursor, "kind", None)
     name = getattr(kind, "name", None)
@@ -134,7 +98,7 @@ def _identity_for_cursor(
     repo_root: Path,
     project_id: str,
     source_path: str,
-) -> _CursorIdentity | None:
+) -> _CursorIdentity:
     helper = getattr(indexer, "symbol_reference_for_cursor", None)
     if not callable(helper):
         raise RuntimeError(
@@ -151,7 +115,14 @@ def _identity_for_cursor(
         raise TypeError(
             "CASE 4 v3 symbol_reference_for_cursor must return a mapping"
         )
-    provenance_fields = ("project", "file", "line")
+    provenance_fields = (
+        "project",
+        "file",
+        "line",
+        "column",
+        "provider",
+        "include_provenance",
+    )
     if any(field not in reference for field in provenance_fields):
         raise ValueError(
             "CASE 4 v3 symbol reference provenance is incomplete; "
@@ -164,6 +135,19 @@ def _identity_for_cursor(
     line = reference.get("line")
     if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
         raise ValueError("CASE 4 v3 symbol reference provenance line is invalid")
+    column = reference.get("column")
+    if isinstance(column, bool) or not isinstance(column, int) or column <= 0:
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance column is invalid"
+        )
+    if not isinstance(reference.get("provider"), str):
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance provider is invalid"
+        )
+    if not isinstance(reference.get("include_provenance"), str):
+        raise ValueError(
+            "CASE 4 v3 symbol reference include provenance is invalid"
+        )
 
     location = getattr(cursor, "location", None)
     location_file = getattr(location, "file", None)
@@ -185,6 +169,16 @@ def _identity_for_cursor(
             if isinstance(cursor_line, int) and cursor_line > 0 and line != cursor_line:
                 raise ValueError(
                     "CASE 4 v3 symbol reference provenance line does not match cursor"
+                )
+            cursor_column = getattr(location, "column", None)
+            if (
+                isinstance(cursor_column, int)
+                and cursor_column > 0
+                and column != cursor_column
+            ):
+                raise ValueError(
+                    "CASE 4 v3 symbol reference provenance column does not "
+                    "match cursor"
                 )
 
     usr = str(reference.get("usr") or "")
@@ -224,6 +218,12 @@ def _identity_for_cursor(
         canonical_signature=signature,
         qname=str(reference.get("qname") or ""),
         symbol_kind=str(reference.get("symbol_kind") or "symbol"),
+        identity_project=str(reference["project"]),
+        identity_file=str(reference["file"]),
+        identity_line=line,
+        identity_column=column,
+        identity_provider=str(reference["provider"]),
+        identity_include_provenance=str(reference["include_provenance"]),
         adapter="case4_symbol_reference_for_cursor_v3",
     )
 
@@ -508,6 +508,9 @@ class ClangPromptProjectIndexProducer:
                 "producer": "ClangPromptProjectIndexProducer",
                 "producer_version": PRODUCER_VERSION,
                 "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+                "identity_provenance_contract": (
+                    PRODUCTION_IDENTITY_PROVENANCE_CONTRACT
+                ),
                 "project_id": project_id,
                 "strict_diagnostics": self.strict_diagnostics,
                 "hashes": fingerprint_hashes,
@@ -688,6 +691,15 @@ class ClangPromptProjectIndexProducer:
                                 "usr": identity.usr,
                                 "canonical_signature": identity.canonical_signature,
                                 "qname": identity.qname,
+                                "identity_project": identity.identity_project,
+                                "identity_file": identity.identity_file,
+                                "identity_line": identity.identity_line,
+                                "identity_column": identity.identity_column,
+                                "identity_kind": identity.symbol_kind,
+                                "identity_provider": identity.identity_provider,
+                                "identity_include_provenance": (
+                                    identity.identity_include_provenance
+                                ),
                                 "target_semantic_identity": None,
                                 "relation": None,
                             }
@@ -751,6 +763,15 @@ class ClangPromptProjectIndexProducer:
                         "usr": target.usr,
                         "canonical_signature": target.canonical_signature,
                         "qname": target.qname,
+                        "identity_project": target.identity_project,
+                        "identity_file": target.identity_file,
+                        "identity_line": target.identity_line,
+                        "identity_column": target.identity_column,
+                        "identity_kind": target.symbol_kind,
+                        "identity_provider": target.identity_provider,
+                        "identity_include_provenance": (
+                            target.identity_include_provenance
+                        ),
                         "target_semantic_identity": target.semantic_identity,
                         "relation": relation,
                     }
@@ -767,6 +788,47 @@ class ClangPromptProjectIndexProducer:
                 row["semantic_identity"],
             ),
         )
+        definition_provenance: dict[
+            str, tuple[str, str, int, int, str, str, str]
+        ] = {}
+        for row in ordered_symbols:
+            if row["relation"] is not None:
+                continue
+            contract = (
+                row["identity_project"],
+                row["identity_file"],
+                row["identity_line"],
+                row["identity_column"],
+                row["identity_kind"],
+                row["identity_provider"],
+                row["identity_include_provenance"],
+            )
+            previous = definition_provenance.setdefault(
+                row["semantic_identity"], contract
+            )
+            if previous != contract:
+                raise ValueError(
+                    "clang prompt graph producer found conflicting definition "
+                    "provenance for semantic identity "
+                    f"{row['semantic_identity']!r}"
+                )
+        provenance_fields = (
+            "identity_project",
+            "identity_file",
+            "identity_line",
+            "identity_column",
+            "identity_kind",
+            "identity_provider",
+            "identity_include_provenance",
+        )
+        for row in ordered_symbols:
+            if row["relation"] is None:
+                continue
+            contract = definition_provenance.get(row["semantic_identity"])
+            if contract is None:
+                continue
+            for field, value in zip(provenance_fields, contract, strict=True):
+                row[field] = value
         definitions_by_semantic: dict[str, list[dict[str, Any]]] = {}
         symbols: list[dict[str, Any]] = []
         for node_id, row in enumerate(ordered_symbols, start=1):
@@ -784,6 +846,15 @@ class ClangPromptProjectIndexProducer:
                 "usr": row["usr"],
                 "canonical_signature": row["canonical_signature"],
                 "qname": row["qname"],
+                "identity_project": row["identity_project"],
+                "identity_file": row["identity_file"],
+                "identity_line": row["identity_line"],
+                "identity_column": row["identity_column"],
+                "identity_kind": row["identity_kind"],
+                "identity_provider": row["identity_provider"],
+                "identity_include_provenance": row[
+                    "identity_include_provenance"
+                ],
                 "kind": row["kind"],
                 "document_id": row["document_id"],
                 "source_path": row["source_path"],
@@ -899,6 +970,9 @@ class ClangPromptProjectIndexProducer:
             "cache_key": cache_key,
             "strict_diagnostics": self.strict_diagnostics,
             "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+            "identity_provenance_contract": (
+                PRODUCTION_IDENTITY_PROVENANCE_CONTRACT
+            ),
             "identity_adapters": sorted(identity_adapters),
             "hashes": dict(fingerprint_hashes),
             "toolchain": {
@@ -1006,6 +1080,7 @@ class ClangPromptProjectIndexProducer:
 
 __all__ = [
     "ClangPromptProjectIndexProducer",
+    "PRODUCTION_IDENTITY_PROVENANCE_CONTRACT",
     "PRODUCER_VERSION",
     "PromptProjectIndexBuildResult",
     "SYMBOL_IDENTITY_SCHEMA_VERSION",
