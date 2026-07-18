@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+
+from cppmega_mlx.data.prompt_graph import PromptProjectIndex
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -719,6 +722,57 @@ def test_resolve_case_prompt_graph_requires_stable_project_identity(
             mode="repo",
             prompt_index_cache_dir=tmp_path / "index-cache",
             indexer_root=ROOT,
+        )
+
+
+def test_resolve_case_prompt_graph_rejects_synthetic_repository_index(
+    tmp_path: Path,
+):
+    mod = _load_module()
+    repo = tmp_path / "repo"
+    shutil.copytree(CASE3_FIXTURE, repo)
+    real_index = _build_case3_index(tmp_path)
+    payload = real_index.to_dict()
+    payload["provenance"]["producer"] = "test-fixture"
+    index_path = tmp_path / "static-index.json"
+    index_path.write_text(json.dumps(payload), encoding="utf-8")
+    case = json.loads((CASE3_FIXTURE / "cases.jsonl").read_text().splitlines()[0])
+    case["prompt_graph_repo"] = "repo"
+    case["prompt_graph_index"] = "static-index.json"
+
+    with pytest.raises(ValueError, match="production repository index"):
+        mod.resolve_case_prompt_graph(
+            case,
+            cases_dir=tmp_path,
+            mode="repo",
+            prompt_index_cache_dir=tmp_path / "index-cache",
+            indexer_root=ROOT,
+        )
+
+
+def test_build_prompt_context_rejects_nonproduction_project_index(tmp_path: Path):
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    tokenizer = load_cppmega_tokenizer(mod.DEFAULT_TOKENIZER)
+    real_index = _build_case3_index(tmp_path)
+    payload = real_index.to_dict()
+    payload["provenance"]["producer"] = "test-fixture"
+    project_index = PromptProjectIndex.from_dict(payload)
+    source = project_index.document_for_path("src/math_prompt.cpp")
+
+    with pytest.raises(ValueError, match="production repository index"):
+        mod.build_prompt_context(
+            tokenizer,
+            _case3_prompt(),
+            prompt_graph_mode="repo",
+            prompt_sidecars="zero",
+            prepend_code_start=False,
+            project_index=project_index,
+            prompt_document_id=source.id,
+            prompt_source_path=source.source_path,
+            prompt_source_start=0,
+            prompt_graph_cache_dir=tmp_path / "graph-cache",
         )
 
 

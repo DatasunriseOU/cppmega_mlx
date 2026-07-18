@@ -340,6 +340,15 @@ def resolve_case_prompt_graph(
     task_id = str(case.get("task_id") or "<unknown>")
     raw_index = case.get("prompt_graph_index")
     raw_repo = case.get("prompt_graph_repo")
+    raw_project_id = case.get("prompt_graph_project_id")
+    expected_project_id = (
+        None
+        if raw_project_id is None
+        else require_prompt_graph_project_id(
+            raw_project_id,
+            where=f"case {task_id!r} prompt_graph_project_id",
+        )
+    )
     if raw_repo is None:
         if isinstance(raw_index, str) and raw_index:
             repository_root = _resolve_contained_path(
@@ -370,6 +379,10 @@ def resolve_case_prompt_graph(
                 f"case {task_id!r}: prompt graph index not found: {index_path}"
             )
         project_index = PromptProjectIndex.from_json_path(index_path)
+        project_index.validate_production_repository_index(
+            expected_project_id=expected_project_id,
+            expected_indexer_root=indexer_root or REPO_ROOT,
+        )
         project_index.verify_repository(repository_root)
         index_receipt = dict(project_index.provenance)
     else:
@@ -378,15 +391,15 @@ def resolve_case_prompt_graph(
                 f"case {task_id!r}: automatic prompt graph index build requires "
                 "a deterministic prompt_index_cache_dir"
             )
-        project_id = require_prompt_graph_project_id(
-            case.get("prompt_graph_project_id"),
-            where=f"case {task_id!r} prompt_graph_project_id",
-        )
+        if expected_project_id is None:
+            raise ValueError(
+                f"case {task_id!r} prompt_graph_project_id must be stable owner/repo"
+            )
         built = ClangPromptProjectIndexProducer(
             cache_dir=prompt_index_cache_dir,
             indexer_root=indexer_root,
             strict_diagnostics=True,
-        ).build(repository_root, project_id=project_id)
+        ).build(repository_root, project_id=expected_project_id)
         project_index = built.index
         index_path = built.path
         index_receipt = dict(built.receipt)
@@ -658,6 +671,9 @@ def build_prompt_context(
             raise ValueError(
                 "prompt graph mode repo requires a PromptProjectIndex"
             )
+        project_index.validate_production_repository_index(
+            expected_indexer_root=REPO_ROOT,
+        )
         if prompt_source_start is None:
             raise ValueError(
                 "prompt graph mode repo requires prompt_source_start"

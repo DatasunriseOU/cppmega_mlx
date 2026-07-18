@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from cppmega_mlx.data.prompt_graph import (
     PromptGraphBuilder,
     PromptGraphContext,
     PromptGraphSegment,
+    PromptProjectIndex,
 )
 from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
 
@@ -167,6 +169,172 @@ def test_real_producer_preserves_overloads_and_cross_document_calls(tmp_path: Pa
         helper.id,
         caller.id,
     }
+
+
+def test_real_producer_emits_integrity_bound_v3_production_index(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-production"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+
+    result.index.validate_production_repository_index(
+        expected_project_id=project_id,
+        expected_indexer_root=ROOT,
+    )
+    assert result.receipt["strict_diagnostics"] is True
+    assert result.receipt["index_payload_sha256"] == result.index.payload_sha256
+    assert result.receipt["symbol_identity_schema_version"] == 3
+    assert result.receipt["identity_adapters"] == [
+        "case4_symbol_reference_for_cursor_v3"
+    ]
+    assert max(symbol.symbol_id for symbol in result.index.symbols) > 0xFFFFFFFF
+
+
+def test_cached_index_payload_checksum_rejects_tampering(tmp_path: Path) -> None:
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    result = producer.build(FIXTURE, project_id="tests/case3-payload-integrity")
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    payload["symbols"][0]["qname"] += "_tampered"
+    result.path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="payload integrity mismatch"):
+        producer.build(FIXTURE, project_id="tests/case3-payload-integrity")
+
+
+def test_production_index_rejects_non_checkout_indexer_provenance(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-indexer-provenance"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    wrong_indexer = ROOT / "cppmega_mlx" / "data" / "prompt_graph.py"
+    payload["provenance"]["indexer_path"] = str(wrong_indexer)
+    payload["provenance"]["hashes"]["indexer_sha256"] = sha256(
+        wrong_indexer.read_bytes()
+    ).hexdigest()
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="same-checkout indexer"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_production_index_rejects_usr_signature_contract_tampering(
+    tmp_path: Path,
+) -> None:
+    project_id = "tests/case3-semantic-contract"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+    payload = result.index.to_dict()
+    definition = next(
+        row
+        for row in payload["symbols"]
+        if row["kind"] == "function"
+        and row["qname"] == "case3_repo::repository_helper"
+        and "args=(int)" in row["canonical_signature"]
+    )
+    occurrence = next(
+        row
+        for row in payload["symbols"]
+        if row["identity"] != definition["identity"]
+        and row["semantic_identity"] == definition["semantic_identity"]
+    )
+    occurrence["canonical_signature"] += "|tampered=true"
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="semantic identity contract"):
+        tampered.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=ROOT,
+        )
+
+
+def test_tampered_cached_overload_edge_fails_closed(tmp_path: Path) -> None:
+    project_id = "tests/case3-cache-integrity"
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    result = producer.build(FIXTURE, project_id=project_id)
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    helper_definitions = [
+        row
+        for row in payload["symbols"]
+        if row["kind"] == "function"
+        and row["qname"] == "case3_repo::repository_helper"
+    ]
+    int_definition = next(
+        row for row in helper_definitions if "args=(int)" in row["canonical_signature"]
+    )
+    double_definition = next(
+        row
+        for row in helper_definitions
+        if "args=(double)" in row["canonical_signature"]
+    )
+    edge = next(
+        row
+        for row in payload["edges"]
+        if row["relation"] == "call" and row["target"] == int_definition["identity"]
+    )
+    edge["target"] = double_definition["identity"]
+    tampered_index = PromptProjectIndex.from_dict(payload).with_integrity()
+    result.path.write_text(
+        json.dumps(tampered_index.to_dict()) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="edge changes semantic identity"):
+        producer.build(FIXTURE, project_id=project_id)
+
+
+def test_cached_graph_edge_target_must_be_definition_owned(tmp_path: Path) -> None:
+    project_id = "tests/case3-definition-target"
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    )
+    result = producer.build(FIXTURE, project_id=project_id)
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    definition = next(
+        row
+        for row in payload["symbols"]
+        if row["kind"] == "function"
+        and row["qname"] == "case3_repo::repository_helper"
+        and "args=(int)" in row["canonical_signature"]
+    )
+    occurrence = next(
+        row
+        for row in payload["symbols"]
+        if row["semantic_identity"] == definition["semantic_identity"]
+        and row["kind"] in {"callsite", "use"}
+    )
+    edge = next(
+        row
+        for row in payload["edges"]
+        if row["relation"] == "call" and row["target"] == definition["identity"]
+    )
+    edge["target"] = occurrence["identity"]
+    tampered_index = PromptProjectIndex.from_dict(payload).with_integrity()
+    result.path.write_text(
+        json.dumps(tampered_index.to_dict()) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="definition-owned target"):
+        producer.build(FIXTURE, project_id=project_id)
 
 
 def test_index_cache_key_tracks_repository_and_indexer_freshness(tmp_path: Path) -> None:

@@ -418,7 +418,7 @@ class ClangPromptProjectIndexProducer:
         cache_dir: str | Path,
         indexer_root: str | Path | None = None,
         libclang_path: str | Path | None = None,
-        strict_diagnostics: bool = False,
+        strict_diagnostics: bool = True,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         if indexer_root is None:
@@ -502,6 +502,8 @@ class ClangPromptProjectIndexProducer:
                 root=root,
                 cache_key=cache_key,
                 expected_hashes=fingerprint_hashes,
+                project_id=project_id,
+                expected_indexer_root=self.indexer_root,
                 libclang_version=libclang_version,
                 resolved_libclang=resolved_libclang,
             )
@@ -520,6 +522,11 @@ class ClangPromptProjectIndexProducer:
             indexer_path=indexer_path,
             libclang_version=libclang_version,
             resolved_libclang=resolved_libclang,
+        )
+        index = index.with_integrity()
+        index.validate_production_repository_index(
+            expected_project_id=project_id,
+            expected_indexer_root=self.indexer_root,
         )
         self._write_cached(path, index)
         return PromptProjectIndexBuildResult(
@@ -934,11 +941,17 @@ class ClangPromptProjectIndexProducer:
         root: Path,
         cache_key: str,
         expected_hashes: Mapping[str, str],
+        project_id: str,
+        expected_indexer_root: Path,
         libclang_version: str,
         resolved_libclang: str | None,
     ) -> PromptProjectIndexBuildResult:
         try:
             index = PromptProjectIndex.from_json_path(path)
+            index.validate_production_repository_index(
+                expected_project_id=project_id,
+                expected_indexer_root=expected_indexer_root,
+            )
             receipt = index.provenance
             if receipt.get("producer") != "ClangPromptProjectIndexProducer":
                 raise ValueError("producer mismatch")
