@@ -107,7 +107,7 @@ def test_domain_eval_freezes_structured_ksh_prompt_sidecars(tmp_path: Path) -> N
     )
 
     report = mod.evaluate([prompt], {}, compile=False)
-    assert report["rows"][0]["prompt_sidecar_receipt"] == {
+    assert report["rows"][0]["static_prompt_sidecar_receipt"] == {
         "token_count": 10,
         "columns": sorted(prompt.prompt_sidecars),
         "edge_counts": {
@@ -535,18 +535,44 @@ def test_build_structure_oracle_rejects_unstructured_text() -> None:
     assert result["status"] == "build_structure_failed"
 
 
-def test_sidecar_structure_oracle_uses_frozen_graph_contract() -> None:
+def test_sidecar_structure_oracle_separates_static_prompt_and_completion_checks() -> None:
     mod = _load_eval_module()
     row = _case5_ksh_eval_row()
     path = Path("evals/domain_routed_prompts.jsonl")
     prompt = mod.load_prompts(path)[-1]
+    completion = mod.load_completions(
+        Path("evals/domain_routed_gold_completions.jsonl")
+    )[prompt.id]
 
-    result = mod.sidecar_structure_oracle(prompt, "The route is valid.")
+    result = mod.sidecar_structure_oracle(prompt, completion)
 
     assert result["status"] == "sidecar_structure_passed"
-    assert result["required_domains"] == ["KSH", "BUILD_ERROR"]
-    assert result["cross_domain_edges"] == 1
+    assert result["evidence_source"] == "completion_derived"
+    assert result["static_prompt_check"]["status"] == (
+        "static_prompt_sidecars_passed"
+    )
+    assert result["static_prompt_check"]["cross_domain_edges"] == 1
+    assert result["generated_completion_check"]["status"] == (
+        "generated_completion_structure_passed"
+    )
+    assert result["generated_completion_check"]["generated_cross_domain_edge"][
+        "kind"
+    ] == "EMBEDDED_DOMAIN"
     assert row["id"] == prompt.id
+
+
+def test_sidecar_structure_oracle_rejects_garbage_completion() -> None:
+    mod = _load_eval_module()
+    prompt = mod.load_prompts(Path("evals/domain_routed_prompts.jsonl"))[-1]
+
+    result = mod.sidecar_structure_oracle(prompt, "garbage")
+
+    assert result["status"] == "sidecar_structure_failed"
+    assert result["static_prompt_check"]["status"] == (
+        "static_prompt_sidecars_passed"
+    )
+    assert "typed domain blocks" in result["reason"]
+    assert "generated_completion_check" not in result
 
 
 def test_sidecar_structure_oracle_fails_without_frozen_sidecars() -> None:
@@ -691,6 +717,25 @@ def test_cross_domain_oracle_rejects_missing_diagnostic_block() -> None:
     assert "missing required typed domains" in result["reason"]
 
 
+def test_cross_domain_oracle_rejects_valid_blocks_without_generated_relation() -> None:
+    mod = _load_eval_module()
+    prompt = _extended_prompts(mod)[3]
+
+    result = mod.cross_domain_structure_oracle(
+        prompt,
+        (
+            "<KSH_START>print input.txt | tee out.txt\n<KSH_END>"
+            "<BUILD_ERROR_START>"
+            "ninja: build stopped: subcommand failed with exit code 1\n"
+            "<BUILD_ERROR_END>"
+        ),
+    )
+
+    assert result["status"] == "cross_domain_structure_failed"
+    assert "generated cross-domain relation" in result["reason"]
+    assert "generated_cross_domain_edge" not in result
+
+
 def test_extended_domain_eval_cli_rebuilds_prompt_graphs(tmp_path: Path) -> None:
     script = Path(__file__).resolve().parents[1] / "scripts" / "eval_domain_routed_codegen.py"
     report_path = tmp_path / "extended-report.json"
@@ -713,6 +758,6 @@ def test_extended_domain_eval_cli_rebuilds_prompt_graphs(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["prompt_graphs_validated"] == 4
+    assert report["static_prompt_graphs_validated"] == 4
     assert report["oracle_passed"] == 4
     assert report["passed"] is True

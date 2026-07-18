@@ -159,6 +159,22 @@ _DIAGNOSTIC_DOMAINS = frozenset(
 )
 _DOMAIN_MARKER_RE = re.compile(r"<([A-Z][A-Z0-9_]*?)_(START|END)>")
 _OUTPUT_DOMAIN_MARKER_RE = _DOMAIN_MARKER_RE
+_GENERATED_CROSS_DOMAIN_EDGE_RE = re.compile(
+    r"<GENERATED_CROSS_DOMAIN_EDGE>\s*(?P<payload>\{.*?\})\s*"
+    r"</GENERATED_CROSS_DOMAIN_EDGE>",
+    re.DOTALL,
+)
+_GENERATED_CROSS_DOMAIN_EDGE_MARKER_RE = re.compile(
+    r"</?GENERATED_CROSS_DOMAIN_EDGE(?:\s|>)"
+)
+
+
+class _GeneratedCompletionParseError(ValueError):
+    """The completion cannot be parsed as the typed output contract."""
+
+
+class _GeneratedCompletionStructureError(ValueError):
+    """The parsed completion violates its declared structural contract."""
 
 
 def _prompt_domain_id(name: str, *, context: str) -> int:
@@ -533,6 +549,165 @@ def _normalized_oracle_spec(
     }
 
 
+def _nonnegative_int(value: Any, *, field: str, context: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{context}: {field} must be a non-negative integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context}: {field} must be a non-negative integer"
+        ) from exc
+    if normalized < 0:
+        raise ValueError(f"{context}: {field} must be non-negative")
+    return normalized
+
+
+def _normalized_generated_relation(
+    raw: Mapping[str, Any],
+    *,
+    required_domains: Sequence[str],
+    context: str,
+    infer_blocks: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{context}: generated relation must be an object")
+    required = {
+        "from_domain",
+        "to_domain",
+        "from_role",
+        "to_role",
+        "kind",
+    }
+    missing = sorted(field for field in required if field not in raw)
+    if missing:
+        raise ValueError(f"{context}: generated relation is missing {missing}")
+    from_domain = _canonical_prompt_domain(
+        raw["from_domain"],
+        context=context,
+    )
+    to_domain = _canonical_prompt_domain(
+        raw["to_domain"],
+        context=context,
+    )
+    if from_domain == to_domain:
+        raise ValueError(f"{context}: generated relation domains must differ")
+    declared_domains = set(required_domains)
+    if from_domain not in declared_domains or to_domain not in declared_domains:
+        raise ValueError(
+            f"{context}: generated relation domains must be declared in required_domains"
+        )
+    from_role = _oracle_role(raw["from_role"], context=context)
+    to_role = _oracle_role(raw["to_role"], context=context)
+    edge_kind = _oracle_edge_kind(raw["kind"], context=context)
+    if domain_edge_family(edge_kind) != "cross_domain":
+        raise ValueError(
+            f"{context}: generated relation kind {edge_kind.name} must belong to cross_domain"
+        )
+    from_block = raw.get("from_block")
+    to_block = raw.get("to_block")
+    if infer_blocks and (from_block is None or to_block is None):
+        try:
+            from_block = tuple(required_domains).index(from_domain)
+            to_block = tuple(required_domains).index(to_domain)
+        except ValueError as exc:
+            raise ValueError(
+                f"{context}: generated relation domains have no declared block"
+            ) from exc
+    if from_block is None or to_block is None:
+        raise ValueError(
+            f"{context}: generated relation requires from_block and to_block"
+        )
+    normalized_from_block = _nonnegative_int(
+        from_block,
+        field="from_block",
+        context=context,
+    )
+    normalized_to_block = _nonnegative_int(
+        to_block,
+        field="to_block",
+        context=context,
+    )
+    if normalized_from_block == normalized_to_block:
+        raise ValueError(f"{context}: generated relation blocks must differ")
+    return {
+        "from_block": normalized_from_block,
+        "to_block": normalized_to_block,
+        "from_domain": from_domain,
+        "to_domain": to_domain,
+        "from_role": from_role.name,
+        "to_role": to_role.name,
+        "from_occurrence": _nonnegative_int(
+            raw.get("from_occurrence", 0),
+            field="from_occurrence",
+            context=context,
+        ),
+        "to_occurrence": _nonnegative_int(
+            raw.get("to_occurrence", 0),
+            field="to_occurrence",
+            context=context,
+        ),
+        "kind": edge_kind.name,
+    }
+
+
+def _normalized_generated_contract(
+    spec: Mapping[str, Any],
+    required_domains: Sequence[str],
+    *,
+    context: str,
+    require_relation: bool,
+) -> dict[str, Any]:
+    raw_parts = spec.get("parts")
+    if not isinstance(raw_parts, Sequence) or isinstance(raw_parts, (str, bytes)):
+        raise ValueError(f"{context}: generated output parts must be a sequence")
+    if len(raw_parts) != len(required_domains):
+        raise ValueError(
+            f"{context}: generated output parts length {len(raw_parts)} != "
+            f"required_domains length {len(required_domains)}"
+        )
+    parts: list[dict[str, Any]] = []
+    for index, raw_part in enumerate(raw_parts):
+        if not isinstance(raw_part, Mapping):
+            raise ValueError(f"{context}: generated output part {index} must be an object")
+        domain = _canonical_prompt_domain(
+            raw_part.get("domain", required_domains[index]),
+            context=f"{context} part {index}",
+        )
+        expected_domain = _canonical_prompt_domain(
+            required_domains[index],
+            context=f"{context} part {index}",
+        )
+        if domain != expected_domain:
+            raise ValueError(
+                f"{context}: generated output part {index} declares {domain}, "
+                f"expected {expected_domain}"
+            )
+        normalized = _normalized_oracle_spec(
+            raw_part,
+            context=f"{context} part {index}",
+        )
+        normalized["domain"] = domain
+        parts.append(normalized)
+
+    raw_edge = spec.get("cross_domain_edge")
+    if require_relation and not isinstance(raw_edge, Mapping):
+        raise ValueError(
+            f"{context}: generated output requires cross_domain_edge contract"
+        )
+    expected_edge = (
+        None
+        if raw_edge is None
+        else _normalized_generated_relation(
+            raw_edge,
+            required_domains=required_domains,
+            context=f"{context} cross_domain_edge",
+            infer_blocks=True,
+        )
+    )
+    return {"parts": tuple(parts), "cross_domain_edge": expected_edge}
+
+
 PASS_STATUS = "compile_passed"
 PASS_STATUSES = frozenset(
     {
@@ -667,49 +842,13 @@ class DomainEvalPrompt:
         if self.oracle_kind == ORACLE_CROSS_DOMAIN_STRUCTURE:
             if len(domains) < 2:
                 return "cross_domain_structure oracle requires at least two domains"
-            raw_edge = self.oracle_spec.get("cross_domain_edge")
-            if not isinstance(raw_edge, Mapping):
-                return "cross_domain_structure oracle requires cross_domain_edge"
             try:
-                from_domain = _canonical_prompt_domain(
-                    raw_edge.get("from_domain"),
+                _normalized_generated_contract(
+                    self.oracle_spec,
+                    self.required_domains,
                     context=f"prompt {self.id!r} cross-domain oracle",
+                    require_relation=True,
                 )
-                to_domain = _canonical_prompt_domain(
-                    raw_edge.get("to_domain"),
-                    context=f"prompt {self.id!r} cross-domain oracle",
-                )
-                if from_domain == to_domain:
-                    return "cross_domain_edge endpoints must name distinct domains"
-                if from_domain not in self.required_domains or to_domain not in self.required_domains:
-                    return "cross_domain_edge domains must be declared in required_domains"
-                edge_kind = _oracle_edge_kind(
-                    raw_edge.get("kind", int(DomainEdgeKind.EMBEDDED_DOMAIN)),
-                    context=f"prompt {self.id!r} cross-domain oracle",
-                )
-                if domain_edge_family(edge_kind) != "cross_domain":
-                    return "cross_domain_edge kind must belong to cross_domain"
-                _oracle_role(
-                    raw_edge.get("from_role"),
-                    context=f"prompt {self.id!r} cross-domain oracle",
-                )
-                _oracle_role(
-                    raw_edge.get("to_role"),
-                    context=f"prompt {self.id!r} cross-domain oracle",
-                )
-                raw_parts = self.oracle_spec.get("parts", ())
-                if not isinstance(raw_parts, Sequence) or isinstance(
-                    raw_parts,
-                    (str, bytes),
-                ):
-                    return "cross_domain oracle parts must be a sequence"
-                for index, part in enumerate(raw_parts):
-                    if not isinstance(part, Mapping):
-                        return f"cross_domain oracle part {index} must be an object"
-                    _normalized_oracle_spec(
-                        part,
-                        context=f"prompt {self.id!r} cross-domain part {index}",
-                    )
             except ValueError as exc:
                 return str(exc)
             return None
@@ -723,6 +862,15 @@ class DomainEvalPrompt:
                 "sidecar_structure oracle requires a diagnostic domain or "
                 "cross-domain sidecar"
             )
+        try:
+            _normalized_generated_contract(
+                self.oracle_spec,
+                self.required_domains,
+                context=f"prompt {self.id!r} sidecar oracle",
+                require_relation=len(domains) > 1,
+            )
+        except ValueError as exc:
+            return str(exc)
         return None
 
     def executable_oracle_error(self) -> str | None:
@@ -734,6 +882,9 @@ class DomainEvalPrompt:
 
     def sidecar_receipt(self) -> dict[str, Any]:
         return _prompt_sidecar_receipt(self.prompt_token_ids, self.prompt_sidecars)
+
+    def static_prompt_sidecar_receipt(self) -> dict[str, Any]:
+        return self.sidecar_receipt()
 
     @classmethod
     def from_row(
@@ -1047,10 +1198,17 @@ def _output_domain_blocks(
     """Extract sequential typed output blocks and reject malformed nesting."""
 
     matches = list(_OUTPUT_DOMAIN_MARKER_RE.finditer(text))
+    if not matches:
+        raise ValueError(f"{context}: completion contains no typed domain blocks")
     blocks: list[tuple[str, str]] = []
     open_domain: str | None = None
     body_start = 0
+    cursor = 0
     for match in matches:
+        if open_domain is None and text[cursor : match.start()].strip():
+            raise ValueError(
+                f"{context}: completion contains untyped text outside domain blocks"
+            )
         domain = _canonical_prompt_domain(match.group(1), context=context)
         marker_kind = match.group(2)
         if marker_kind == "START":
@@ -1060,6 +1218,7 @@ def _output_domain_blocks(
                 )
             open_domain = domain
             body_start = match.end()
+            cursor = match.end()
             continue
         if open_domain != domain:
             raise ValueError(
@@ -1067,11 +1226,48 @@ def _output_domain_blocks(
             )
         blocks.append((domain, text[body_start : match.start()]))
         open_domain = None
+        cursor = match.end()
     if open_domain is not None:
         raise ValueError(f"{context}: unclosed output domain {open_domain!r}")
+    if text[cursor:].strip():
+        raise ValueError(
+            f"{context}: completion contains untyped text outside domain blocks"
+        )
     if not blocks:
         raise ValueError(f"{context}: completion contains no typed domain blocks")
     return blocks
+
+
+def _extract_generated_relations(
+    text: str,
+    *,
+    required_domains: Sequence[str],
+    context: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    relations: list[dict[str, Any]] = []
+    for match in _GENERATED_CROSS_DOMAIN_EDGE_RE.finditer(text):
+        try:
+            payload = json.loads(match.group("payload"))
+        except json.JSONDecodeError as exc:
+            raise _GeneratedCompletionParseError(
+                f"{context}: generated cross-domain relation is not valid JSON: {exc}"
+            ) from exc
+        try:
+            relations.append(
+                _normalized_generated_relation(
+                    payload,
+                    required_domains=required_domains,
+                    context=f"{context} generated relation {len(relations)}",
+                )
+            )
+        except ValueError as exc:
+            raise _GeneratedCompletionStructureError(str(exc)) from exc
+    stripped = _GENERATED_CROSS_DOMAIN_EDGE_RE.sub("\n", text)
+    if _GENERATED_CROSS_DOMAIN_EDGE_MARKER_RE.search(stripped):
+        raise _GeneratedCompletionParseError(
+            f"{context}: malformed generated cross-domain relation marker"
+        )
+    return stripped, relations
 
 
 def _output_parser_for_domain(
@@ -1082,6 +1278,201 @@ def _output_parser_for_domain(
     if domain in _BUILD_ORACLE_SPECS:
         return _BUILD_ORACLE_SPECS[domain], frozenset({domain})
     return _DIAGNOSTIC_ORACLE_SPECS.get(domain)
+
+
+def _parse_generated_completion(
+    prompt: DomainEvalPrompt,
+    completion: str,
+    *,
+    context: str,
+    require_relation: bool,
+) -> dict[str, Any]:
+    """Validate typed blocks and relations emitted by the completion itself."""
+
+    try:
+        contract = _normalized_generated_contract(
+            prompt.oracle_spec,
+            prompt.required_domains,
+            context=f"prompt {prompt.id!r} generated completion",
+            require_relation=require_relation,
+        )
+    except ValueError as exc:
+        raise _GeneratedCompletionStructureError(str(exc)) from exc
+
+    stripped, relations = _extract_generated_relations(
+        completion,
+        required_domains=prompt.required_domains,
+        context=context,
+    )
+    try:
+        blocks = _output_domain_blocks(stripped, context=context)
+    except ValueError as exc:
+        raise _GeneratedCompletionParseError(str(exc)) from exc
+    expected_domains = [part["domain"] for part in contract["parts"]]
+    actual_domains = [domain for domain, _body in blocks]
+    missing_domains = [
+        domain for domain in expected_domains if domain not in actual_domains
+    ]
+    if missing_domains:
+        raise _GeneratedCompletionStructureError(
+            f"{context}: completion is missing required typed domains "
+            f"{missing_domains}"
+        )
+    if len(blocks) != len(contract["parts"]):
+        raise _GeneratedCompletionStructureError(
+            f"{context}: completion emitted {len(blocks)} typed domain blocks, "
+            f"expected {len(contract['parts'])}"
+        )
+
+    parsed_blocks: list[tuple[str, Any]] = []
+    block_receipts: list[dict[str, Any]] = []
+    for index, (domain_name, body) in enumerate(blocks):
+        part_spec = contract["parts"][index]
+        expected_domain = part_spec["domain"]
+        if domain_name != expected_domain:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: block {index} declares {domain_name}, "
+                f"expected {expected_domain}"
+            )
+        domain = _prompt_domain_kinds(
+            (domain_name,),
+            context=f"{context} block {index}",
+        )[0]
+        parser_spec = _output_parser_for_domain(domain)
+        if parser_spec is None:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: no typed output parser for domain {domain.name}"
+            )
+        parser, allowed_domains = parser_spec
+        try:
+            parsed = parser(body)
+            parsed.validate()
+        except (IndexError, TypeError, ValueError) as exc:
+            raise _GeneratedCompletionParseError(
+                f"{context} block {index} {domain.name.lower()} parser failed: {exc}"
+            ) from exc
+        try:
+            contract_error = _parsed_oracle_error(
+                parsed,
+                part_spec,
+                allowed_domains=allowed_domains,
+                context=f"{context} block {index}",
+            )
+        except ValueError as exc:
+            raise _GeneratedCompletionStructureError(str(exc)) from exc
+        if contract_error is not None:
+            raise _GeneratedCompletionStructureError(contract_error)
+        if domain in _SHELL_ORACLE_SPECS:
+            shell_prompt = DomainEvalPrompt(
+                id=f"{prompt.id}:generated-block:{index}",
+                task_type="generated_domain_block",
+                prompt=body,
+                required_domains=(domain.name,),
+                expected_sidecars=(),
+                oracle_kind=ORACLE_SHELL_SYNTAX,
+                oracle_spec=part_spec,
+            )
+            shell_result = shell_syntax_oracle(shell_prompt, body)
+            if shell_result["status"] != "shell_syntax_passed":
+                raise _GeneratedCompletionStructureError(
+                    f"{context} block {index} failed its executable syntax oracle: "
+                    f"{shell_result.get('reason', shell_result['status'])}"
+                )
+        parsed_blocks.append((domain_name, parsed))
+        block_receipts.append(_typed_output_receipt(parsed))
+
+    generated_edge: dict[str, Any] | None = None
+    expected_edge = contract["cross_domain_edge"]
+    if require_relation:
+        if not relations:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: completion emitted no generated cross-domain relation"
+            )
+        if len(relations) != 1:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: completion emitted {len(relations)} generated "
+                "cross-domain relations; expected exactly one"
+            )
+        actual_edge = relations[0]
+        if expected_edge is None:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: prompt has no expected cross-domain relation contract"
+            )
+        mismatches = {
+            key: {"expected": expected_edge[key], "actual": actual_edge[key]}
+            for key in expected_edge
+            if expected_edge[key] != actual_edge[key]
+        }
+        if mismatches:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: generated cross-domain relation does not match the "
+                f"prompt contract: {mismatches}"
+            )
+        from_block = actual_edge["from_block"]
+        to_block = actual_edge["to_block"]
+        if from_block >= len(parsed_blocks) or to_block >= len(parsed_blocks):
+            raise _GeneratedCompletionStructureError(
+                f"{context}: generated relation block endpoint is outside completion blocks"
+            )
+        if parsed_blocks[from_block][0] != actual_edge["from_domain"]:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: generated relation from_domain does not match its block"
+            )
+        if parsed_blocks[to_block][0] != actual_edge["to_domain"]:
+            raise _GeneratedCompletionStructureError(
+                f"{context}: generated relation to_domain does not match its block"
+            )
+        from_role = _oracle_role(
+            actual_edge["from_role"],
+            context=f"{context} generated relation",
+        )
+        to_role = _oracle_role(
+            actual_edge["to_role"],
+            context=f"{context} generated relation",
+        )
+
+        def resolve_role(block_index: int, role: DomainRoleKind, occurrence: int) -> int:
+            candidates = [
+                token_index
+                for token_index, role_id in enumerate(
+                    parsed_blocks[block_index][1].role_ids
+                )
+                if int(role_id) == int(role)
+            ]
+            if occurrence >= len(candidates):
+                raise _GeneratedCompletionStructureError(
+                    f"{context}: generated relation {role.name} occurrence "
+                    f"{occurrence} is absent from block {block_index}"
+                )
+            return candidates[occurrence]
+
+        generated_edge = dict(actual_edge)
+        generated_edge["from_token"] = resolve_role(
+            from_block,
+            from_role,
+            actual_edge["from_occurrence"],
+        )
+        generated_edge["to_token"] = resolve_role(
+            to_block,
+            to_role,
+            actual_edge["to_occurrence"],
+        )
+    elif relations:
+        raise _GeneratedCompletionStructureError(
+            f"{context}: completion emitted a cross-domain relation without a "
+            "relation contract"
+        )
+
+    result: dict[str, Any] = {
+        "status": "generated_completion_structure_passed",
+        "evidence_source": "completion",
+        "relation_contract": "generated_cross_domain_edge_marker_v1",
+        "block_count": len(parsed_blocks),
+        "blocks": block_receipts,
+    }
+    if generated_edge is not None:
+        result["generated_cross_domain_edge"] = generated_edge
+    return result
 
 
 def _failure(status: str, reason: str, **extra: Any) -> dict[str, Any]:
@@ -1404,158 +1795,23 @@ def cross_domain_structure_oracle(
     if oracle_error is not None:
         return _failure("missing_cross_domain_oracle", oracle_error)
     try:
-        blocks = _output_domain_blocks(
+        generated = _parse_generated_completion(
+            prompt,
             completion,
             context=f"prompt {prompt.id!r} cross-domain completion",
+            require_relation=True,
         )
-    except ValueError as exc:
+    except _GeneratedCompletionParseError as exc:
         return _failure("cross_domain_parse_failed", str(exc))
-
-    required_domains = {
-        _prompt_domain_id(name, context=f"prompt {prompt.id!r}")
-        for name in prompt.required_domains
-    }
-    actual_domains = {
-        _prompt_domain_id(name, context=f"prompt {prompt.id!r}")
-        for name, _body in blocks
-    }
-    missing_domains = sorted(required_domains - actual_domains)
-    if missing_domains:
-        return _failure(
-            "cross_domain_structure_failed",
-            "completion is missing required typed domains "
-            f"{[DomainKind(value).name for value in missing_domains]}",
-        )
-
-    parsed_blocks: list[tuple[str, Any]] = []
-    block_receipts: list[dict[str, Any]] = []
-    part_specs = prompt.oracle_spec.get("parts", ())
-    if not isinstance(part_specs, Sequence) or isinstance(part_specs, (str, bytes)):
-        return _failure(
-            "missing_cross_domain_oracle",
-            "cross_domain oracle parts must be a sequence",
-        )
-    for index, (domain_name, body) in enumerate(blocks):
-        domain = _prompt_domain_kinds(
-            (domain_name,),
-            context=f"prompt {prompt.id!r} block {index}",
-        )[0]
-        parser_spec = _output_parser_for_domain(domain)
-        if parser_spec is None:
-            return _failure(
-                "missing_cross_domain_oracle",
-                f"no typed output parser for domain {domain.name}",
-            )
-        parser, allowed_domains = parser_spec
-        try:
-            parsed = parser(body)
-            parsed.validate()
-        except (IndexError, TypeError, ValueError) as exc:
-            return _failure(
-                "cross_domain_parse_failed",
-                f"block {index} {domain.name.lower()} parser failed: {exc}",
-                block_index=index,
-                domain=domain.name,
-            )
-        if index < len(part_specs) and isinstance(part_specs[index], Mapping):
-            block_spec = part_specs[index]
-        else:
-            block_spec = {}
-        try:
-            contract_error = _parsed_oracle_error(
-                parsed,
-                block_spec,
-                allowed_domains=allowed_domains,
-                context=f"prompt {prompt.id!r} cross-domain block {index}",
-            )
-        except ValueError as exc:
-            return _failure("missing_cross_domain_oracle", str(exc))
-        if contract_error is not None:
-            return _failure(
-                "cross_domain_structure_failed",
-                contract_error,
-                block_index=index,
-                domain=domain.name,
-            )
-        if domain in _SHELL_ORACLE_SPECS:
-            shell_prompt = DomainEvalPrompt(
-                id=f"{prompt.id}:block:{index}",
-                task_type="cross_domain_shell_block",
-                prompt=body,
-                required_domains=(domain.name,),
-                expected_sidecars=(),
-                oracle_kind=ORACLE_SHELL_SYNTAX,
-                oracle_spec=block_spec,
-            )
-            shell_result = shell_syntax_oracle(shell_prompt, body)
-            if shell_result["status"] != "shell_syntax_passed":
-                return _failure(
-                    "cross_domain_structure_failed",
-                    "typed shell block failed its executable syntax oracle: "
-                    f"{shell_result.get('reason', shell_result['status'])}",
-                    block_index=index,
-                    domain=domain.name,
-                )
-        parsed_blocks.append((domain_name, parsed))
-        block_receipts.append(_typed_output_receipt(parsed))
-
-    edge_spec = prompt.oracle_spec["cross_domain_edge"]
-    from_domain = _canonical_prompt_domain(
-        edge_spec.get("from_domain"),
-        context=f"prompt {prompt.id!r} cross-domain oracle",
-    )
-    to_domain = _canonical_prompt_domain(
-        edge_spec.get("to_domain"),
-        context=f"prompt {prompt.id!r} cross-domain oracle",
-    )
-    from_role = _oracle_role(
-        edge_spec.get("from_role"),
-        context=f"prompt {prompt.id!r} cross-domain oracle",
-    )
-    to_role = _oracle_role(
-        edge_spec.get("to_role"),
-        context=f"prompt {prompt.id!r} cross-domain oracle",
-    )
-    edge_kind = _oracle_edge_kind(
-        edge_spec.get("kind", int(DomainEdgeKind.EMBEDDED_DOMAIN)),
-        context=f"prompt {prompt.id!r} cross-domain oracle",
-    )
-    if domain_edge_family(edge_kind) != "cross_domain":
-        return _failure(
-            "cross_domain_structure_failed",
-            f"cross-domain oracle edge kind {edge_kind.name} is not cross_domain",
-        )
-    from_candidates = [
-        index
-        for name, parsed in parsed_blocks
-        if name == from_domain
-        for index, role in enumerate(parsed.role_ids)
-        if int(role) == int(from_role)
-    ]
-    to_candidates = [
-        index
-        for name, parsed in parsed_blocks
-        if name == to_domain
-        for index, role in enumerate(parsed.role_ids)
-        if int(role) == int(to_role)
-    ]
-    if not from_candidates or not to_candidates:
-        return _failure(
-            "cross_domain_structure_failed",
-            "cross-domain oracle anchors are absent: "
-            f"from={from_domain}:{from_role.name}, to={to_domain}:{to_role.name}",
-        )
+    except _GeneratedCompletionStructureError as exc:
+        return _failure("cross_domain_structure_failed", str(exc))
     return {
         "status": "cross_domain_structure_passed",
-        "block_count": len(parsed_blocks),
-        "blocks": block_receipts,
-        "cross_domain_edge": {
-            "from_domain": from_domain,
-            "to_domain": to_domain,
-            "from_role": from_role.name,
-            "to_role": to_role.name,
-            "kind": edge_kind.name,
-        },
+        "evidence_source": "completion_derived",
+        "generated_completion_check": generated,
+        "block_count": generated["block_count"],
+        "blocks": generated["blocks"],
+        "generated_cross_domain_edge": generated["generated_cross_domain_edge"],
     }
 
 
@@ -1598,19 +1854,10 @@ def build_prompt_graph_for_prompt(
     return graph
 
 
-def sidecar_structure_oracle(
-    prompt: DomainEvalPrompt,
-    completion: str,
-) -> dict[str, Any]:
-    del completion
-    if prompt.oracle_kind != ORACLE_SIDECAR_STRUCTURE:
-        return _failure(
-            "missing_sidecar_oracle",
-            f"oracle_kind {prompt.oracle_kind!r} is not sidecar_structure",
-        )
+def _static_prompt_sidecar_check(prompt: DomainEvalPrompt) -> dict[str, Any]:
     if not prompt.prompt_token_ids or not prompt.prompt_sidecars:
         return _failure(
-            "missing_sidecar_oracle",
+            "static_prompt_sidecars_failed",
             "sidecar_structure oracle requires frozen prompt_token_ids and prompt_sidecars",
         )
     try:
@@ -1638,7 +1885,7 @@ def sidecar_structure_oracle(
             context=f"prompt {prompt.id!r}",
         )
     except ValueError as exc:
-        return _failure("sidecar_structure_failed", str(exc))
+        return _failure("static_prompt_sidecars_failed", str(exc))
 
     domain_ids = [int(value) for value in prompt.prompt_sidecars["token_domain_ids"]]
     required_domain_ids = set(
@@ -1652,13 +1899,13 @@ def sidecar_structure_oracle(
         for domain_id in required_domain_ids
     ) and not diagnostic_edges:
         return _failure(
-            "sidecar_structure_failed",
+            "static_prompt_sidecars_failed",
             "diagnostic required domain has no token_diagnostic_edges",
         )
     if len(required_domain_ids) > 1:
         if not cross_edges:
             return _failure(
-                "sidecar_structure_failed",
+                "static_prompt_sidecars_failed",
                 "multiple required domains need token_cross_domain_edges",
             )
         if not any(
@@ -1666,19 +1913,60 @@ def sidecar_structure_oracle(
             for edge in cross_edges
         ):
             return _failure(
-                "sidecar_structure_failed",
+                "static_prompt_sidecars_failed",
                 "token_cross_domain_edges must connect distinct domain ids",
             )
-    receipt = prompt.sidecar_receipt()
+    receipt = prompt.static_prompt_sidecar_receipt()
     return {
-        "status": "sidecar_structure_passed",
+        "status": "static_prompt_sidecars_passed",
         "required_domains": list(prompt.required_domains),
         "cross_domain_edges": len(cross_edges),
         "diagnostic_edges": len(diagnostic_edges),
         "prompt_graph_schema": frozen_graph.schema,
         "prompt_graph_artifact_sha256": frozen_graph.receipt["artifact_sha256"],
         "prompt_graph_part_ranges": [list(item) for item in frozen_graph.part_ranges],
-        "prompt_sidecar_receipt": receipt,
+        "static_prompt_sidecar_receipt": receipt,
+    }
+
+
+def sidecar_structure_oracle(
+    prompt: DomainEvalPrompt,
+    completion: str,
+) -> dict[str, Any]:
+    if prompt.oracle_kind != ORACLE_SIDECAR_STRUCTURE:
+        return _failure(
+            "missing_sidecar_oracle",
+            f"oracle_kind {prompt.oracle_kind!r} is not sidecar_structure",
+        )
+    oracle_error = prompt.oracle_contract_error()
+    if oracle_error is not None:
+        return _failure("missing_sidecar_oracle", oracle_error)
+    static_check = _static_prompt_sidecar_check(prompt)
+    if static_check["status"] != "static_prompt_sidecars_passed":
+        return _failure(
+            "sidecar_structure_failed",
+            "static prompt sidecar check failed: "
+            f"{static_check.get('reason', static_check['status'])}",
+            static_prompt_check=static_check,
+        )
+    try:
+        generated = _parse_generated_completion(
+            prompt,
+            completion,
+            context=f"prompt {prompt.id!r} sidecar completion",
+            require_relation=len(prompt.required_domains) > 1,
+        )
+    except (_GeneratedCompletionParseError, _GeneratedCompletionStructureError) as exc:
+        return _failure(
+            "sidecar_structure_failed",
+            str(exc),
+            static_prompt_check=static_check,
+        )
+    return {
+        "status": "sidecar_structure_passed",
+        "evidence_source": "completion_derived",
+        "static_prompt_check": static_check,
+        "generated_completion_check": generated,
     }
 
 
@@ -1731,7 +2019,7 @@ def evaluate(
             "oracle_kind": prompt.oracle_kind,
             "required_domains": list(prompt.required_domains),
             "expected_sidecars": list(prompt.expected_sidecars),
-            "prompt_sidecar_receipt": prompt.sidecar_receipt(),
+            "static_prompt_sidecar_receipt": prompt.static_prompt_sidecar_receipt(),
             "has_completion": has_completion,
         }
         if not has_completion:
@@ -1762,6 +2050,9 @@ def evaluate(
         "prompts": len(prompts),
         "completion_rows": len(completions),
         "oracle_passed": sum(status_counts[status] for status in PASS_STATUSES),
+        "completion_derived_oracle_passed": sum(
+            status_counts[status] for status in PASS_STATUSES
+        ),
         "failed": failed,
         "passed": failed == 0,
         "status_counts": dict(sorted(status_counts.items())),
@@ -1786,16 +2077,16 @@ def main() -> int:
     args = parser.parse_args()
 
     prompts = load_prompts(args.prompts)
-    prompt_graphs_validated = 0
+    static_prompt_graphs_validated = 0
     if any(prompt.prompt_graph_spec for prompt in prompts):
         tokenizer = load_cppmega_tokenizer(args.tokenizer)
         for prompt in prompts:
             if prompt.prompt_graph_spec:
                 build_prompt_graph_for_prompt(prompt, tokenizer)
-                prompt_graphs_validated += 1
+                static_prompt_graphs_validated += 1
     completions = load_completions(args.completions)
     report = evaluate(prompts, completions, compile=not args.no_compile)
-    report["prompt_graphs_validated"] = prompt_graphs_validated
+    report["static_prompt_graphs_validated"] = static_prompt_graphs_validated
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(
@@ -1806,10 +2097,11 @@ def main() -> int:
                     "prompts",
                     "completion_rows",
                     "oracle_passed",
+                    "completion_derived_oracle_passed",
                     "compile_passed",
                     "failed",
                     "passed",
-                    "prompt_graphs_validated",
+                    "static_prompt_graphs_validated",
                     "status_counts",
                 )
             },

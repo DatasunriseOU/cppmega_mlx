@@ -2,4 +2,4 @@
 {"id":"fim_compile_fix_missing_header","completion":"#include <vector>\n"}
 {"id":"cmake_link_library_fix","completion":"find_package(Threads REQUIRED)\ntarget_link_libraries(app PRIVATE Threads::Threads)\n"}
 {"id":"shell_build_command","completion":"cmake --build build -j8\n"}
-{"id":"ksh_build_sidecar_route","completion":"The command sends input through tee while preserving the build diagnostic route."}
+{"id":"ksh_build_sidecar_route","completion":"<KSH_START>print input.txt | tee out.txt\n<KSH_END><BUILD_ERROR_START>ninja: build stopped: subcommand failed with exit code 1\n<BUILD_ERROR_END><GENERATED_CROSS_DOMAIN_EDGE>{\"from_block\":0,\"to_block\":1,\"from_domain\":\"KSH\",\"to_domain\":\"BUILD_ERROR\",\"from_role\":\"COMMAND\",\"to_role\":\"COMMAND\",\"from_occurrence\":0,\"to_occurrence\":0,\"kind\":\"EMBEDDED_DOMAIN\"}</GENERATED_CROSS_DOMAIN_EDGE>"}
