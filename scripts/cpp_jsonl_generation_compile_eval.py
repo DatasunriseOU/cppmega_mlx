@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -1233,6 +1233,157 @@ def _sample_next(
     return int(sampled[0, 0].item())
 
 
+def identity_completion(text: str) -> str:
+    """Preserve non-C++ typed-domain output for the local domain evaluator."""
+
+    return text
+
+
+def generate_completion_from_context(
+    model: DenseCppLM,
+    tokenizer: Any,
+    prompt_context: GenerationPromptContext,
+    *,
+    seq_len: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+    prompt_graph_mode: PromptGraphMode,
+    graph_bias_dtype: mx.Dtype,
+    completion_normalizer: Callable[[str], str] = trim_body_completion,
+    logits_processors: Sequence[Any] | None = None,
+) -> tuple[str, int, int, str, dict[str, Any]]:
+    if not callable(completion_normalizer):
+        raise TypeError("completion_normalizer must be callable")
+    prompt_ids = list(prompt_context.token_ids)
+    if not prompt_ids:
+        raise ValueError("prompt tokenized to zero tokens")
+    if len(prompt_ids) >= seq_len:
+        raise ValueError(
+            f"prompt has {len(prompt_ids)} tokens but seq_len={seq_len}; "
+            "refusing to truncate prompt graph coordinates"
+        )
+    if (
+        prompt_context.graph_artifact is not None
+        and len(prompt_ids) + max_new_tokens > seq_len
+    ):
+        raise ValueError(
+            "prompt plus max_new_tokens exceeds seq_len; refusing to discard "
+            "indexed repository graph tokens during decode"
+        )
+    token_context = list(prompt_ids)
+    generated: list[int] = []
+    last_window_receipt: dict[str, Any] | None = None
+    finish_reason = "length"
+    for _ in range(max_new_tokens):
+        window_start = max(0, len(token_context) - seq_len)
+        window = token_context[window_start:]
+        input_ids = mx.array([window], dtype=mx.int32)
+        (
+            side,
+            block_bias,
+            edge_kind_bias,
+            last_window_receipt,
+        ) = prompt_model_inputs(
+            prompt_context,
+            total_token_count=len(token_context),
+            window_start=window_start,
+            window_end=len(token_context),
+            bias_dtype=graph_bias_dtype,
+        )
+        graph_routes_enabled = bool(
+            getattr(
+                getattr(model, "config", None),
+                "graph_routes_enabled",
+                block_bias is not None,
+            )
+        )
+        if graph_routes_enabled and block_bias is None:
+            if prompt_graph_mode != "off":
+                raise RuntimeError(
+                    "graph routes are enabled but the prompt graph "
+                    "did not produce typed fixed biases"
+                )
+            block_bias = mx.zeros(
+                (1, len(window), len(window)), dtype=graph_bias_dtype
+            )
+            edge_kind_bias = mx.zeros_like(block_bias)
+            last_window_receipt.update(
+                {
+                    "graph_bias_ablation": "explicit_prompt_graph_mode_off",
+                    "relation_bias_nonzero": 0,
+                    "edge_kind_bias_nonzero": 0,
+                    "edge_kind_route_count": 0,
+                    "edge_kind_route_counts": {},
+                    "graph_bias_dtype": _dtype_name(graph_bias_dtype),
+                }
+            )
+        elif graph_routes_enabled and edge_kind_bias is None:
+            raise RuntimeError(
+                "graph routes are enabled but graph_edge_kind_bias is absent; "
+                "refusing to fabricate a zero categorical prior"
+            )
+        elif not graph_routes_enabled and (
+            block_bias is not None or edge_kind_bias is not None
+        ):
+            raise RuntimeError(
+                "prompt graph biases were produced for a model with graph "
+                "routes disabled"
+            )
+        logits, _loss = model(
+            input_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            # The assembled typed prompt is one intentional inference document.
+            # Source provenance remains in sidecars; packed document IDs must
+            # not split cross-file or cross-domain graph context.
+            document_ids=mx.ones_like(input_ids),
+            **{name: side[name] for name in MODEL_SIDE_CHANNEL_NAMES},
+        )
+        next_id = _sample_next(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            tokens=input_ids,
+            logits_processors=logits_processors,
+        )
+        mx.eval(logits)
+        if next_id in {tokenizer.eos_token_id, tokenizer.code_end_id}:
+            finish_reason = "eos"
+            break
+        generated.append(next_id)
+        token_context.append(next_id)
+    receipt = dict(prompt_context.receipt)
+    receipt["aligned_side_channels"] = list(SIDE_CHANNEL_NAMES)
+    receipt["model_consumed_side_channels"] = list(MODEL_SIDE_CHANNEL_NAMES)
+    receipt["model_consumed_runtime_channels"] = [
+        "document_ids",
+        "graph_attention_bias",
+        "graph_edge_kind_bias",
+    ]
+    if last_window_receipt is not None:
+        receipt["last_decode_window"] = last_window_receipt
+        for key in (
+            "graph_bias_ablation",
+            "relation_bias_nonzero",
+            "edge_kind_bias_nonzero",
+            "edge_kind_route_count",
+            "edge_kind_route_counts",
+            "graph_bias_dtype",
+        ):
+            if key in last_window_receipt:
+                receipt[key] = last_window_receipt[key]
+    return (
+        completion_normalizer(tokenizer.decode(generated)),
+        len(prompt_ids),
+        len(generated),
+        finish_reason,
+        receipt,
+    )
+
+
 def generate_completion(
     model: DenseCppLM,
     tokenizer: Any,
@@ -1265,132 +1416,21 @@ def generate_completion(
         prompt_source_start=prompt_source_start,
         prompt_graph_cache_dir=prompt_graph_cache_dir,
     )
-    prompt_ids = list(prompt_context.token_ids)
-    if not prompt_ids:
-        raise ValueError("prompt tokenized to zero tokens")
-    if len(prompt_ids) >= seq_len:
-        raise ValueError(
-            f"prompt has {len(prompt_ids)} tokens but seq_len={seq_len}; "
-            "refusing to truncate prompt graph coordinates"
-        )
-    if (
-        prompt_context.graph_artifact is not None
-        and len(prompt_ids) + max_new_tokens > seq_len
-    ):
-        raise ValueError(
-            "prompt plus max_new_tokens exceeds seq_len; refusing to discard "
-            "indexed repository graph tokens during decode"
-        )
-    token_context = list(prompt_ids)
-    generated: list[int] = []
-    last_window_receipt: dict[str, Any] | None = None
-    constraints = BodyDecodeConstraints(tokenizer, prompt_len=len(prompt_ids))
-    finish_reason = "length"
-    for _ in range(max_new_tokens):
-        window_start = max(0, len(token_context) - seq_len)
-        window = token_context[window_start:]
-        input_ids = mx.array([window], dtype=mx.int32)
-        (
-            side,
-            block_bias,
-            edge_kind_bias,
-            last_window_receipt,
-        ) = prompt_model_inputs(
-            prompt_context,
-            total_token_count=len(token_context),
-            window_start=window_start,
-            window_end=len(token_context),
-            bias_dtype=graph_bias_dtype,
-        )
-        graph_routes_enabled = bool(
-            getattr(
-                getattr(model, "config", None),
-                "graph_routes_enabled",
-                block_bias is not None,
-            )
-        )
-        if graph_routes_enabled and block_bias is None:
-            if prompt_graph_mode != "off":
-                raise RuntimeError(
-                    "graph routes are enabled but the repository prompt graph "
-                    "did not produce typed fixed biases"
-                )
-            block_bias = mx.zeros(
-                (1, len(window), len(window)), dtype=graph_bias_dtype
-            )
-            edge_kind_bias = mx.zeros_like(block_bias)
-            last_window_receipt.update(
-                {
-                    "graph_bias_ablation": "explicit_prompt_graph_mode_off",
-                    "relation_bias_nonzero": 0,
-                    "edge_kind_bias_nonzero": 0,
-                    "edge_kind_route_count": 0,
-                    "edge_kind_route_counts": {},
-                    "graph_bias_dtype": _dtype_name(graph_bias_dtype),
-                }
-            )
-        elif graph_routes_enabled and edge_kind_bias is None:
-            raise RuntimeError(
-                "graph routes are enabled but graph_edge_kind_bias is absent; "
-                "refusing to fabricate a zero categorical prior"
-            )
-        elif not graph_routes_enabled and (
-            block_bias is not None or edge_kind_bias is not None
-        ):
-            raise RuntimeError(
-                "repository graph biases were produced for a model with graph "
-                "routes disabled"
-            )
-        logits, _loss = model(
-            input_ids,
-            block_bias=block_bias,
-            edge_kind_bias=edge_kind_bias,
-            # The assembled repository prompt is one intentional inference
-            # document. Source-document identity remains in source_doc_ids;
-            # packed-document IDs must not split cross-file graph context.
-            document_ids=mx.ones_like(input_ids),
-            **{name: side[name] for name in MODEL_SIDE_CHANNEL_NAMES},
-        )
-        next_id = _sample_next(
-            logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            tokens=input_ids,
-            logits_processors=[constraints],
-        )
-        mx.eval(logits)
-        if next_id in {tokenizer.eos_token_id, tokenizer.code_end_id}:
-            finish_reason = "eos"
-            break
-        generated.append(next_id)
-        token_context.append(next_id)
-    receipt = dict(prompt_context.receipt)
-    receipt["aligned_side_channels"] = list(SIDE_CHANNEL_NAMES)
-    receipt["model_consumed_side_channels"] = list(MODEL_SIDE_CHANNEL_NAMES)
-    receipt["model_consumed_runtime_channels"] = [
-        "document_ids",
-        "graph_attention_bias",
-        "graph_edge_kind_bias",
-    ]
-    if last_window_receipt is not None:
-        receipt["last_decode_window"] = last_window_receipt
-        for key in (
-            "graph_bias_ablation",
-            "relation_bias_nonzero",
-            "edge_kind_bias_nonzero",
-            "edge_kind_route_count",
-            "edge_kind_route_counts",
-            "graph_bias_dtype",
-        ):
-            if key in last_window_receipt:
-                receipt[key] = last_window_receipt[key]
-    return (
-        trim_body_completion(tokenizer.decode(generated)),
-        len(prompt_ids),
-        len(generated),
-        finish_reason,
-        receipt,
+    return generate_completion_from_context(
+        model,
+        tokenizer,
+        prompt_context,
+        seq_len=seq_len,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        prompt_graph_mode=prompt_graph_mode,
+        graph_bias_dtype=graph_bias_dtype,
+        completion_normalizer=trim_body_completion,
+        logits_processors=[
+            BodyDecodeConstraints(tokenizer, prompt_len=len(prompt_context.token_ids))
+        ],
     )
 
 

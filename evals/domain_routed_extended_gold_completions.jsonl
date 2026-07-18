@@ -1,0 +1,4 @@
+{"id":"typed_shell_pipeline","completion":"CXX=clang++ cat input.txt | grep foo > out.txt\n"}
+{"id":"typed_compiler_diagnostic","completion":"src/main.cpp:12:7: error: no matching function for call to 'foo'\nsrc/main.cpp:8:3: note: candidate function not viable\n"}
+{"id":"typed_cmake_build","completion":"add_executable(app main.cpp util.cc)\ntarget_link_libraries(app PRIVATE ssl crypto)\n"}
+{"id":"typed_cross_domain_route","completion":"<KSH_START>print input.txt | tee out.txt\n<KSH_END><BUILD_ERROR_START>ninja: build stopped: subcommand failed with exit code 1\n<BUILD_ERROR_END>"}

@@ -622,6 +622,80 @@ def test_generate_completion_keeps_graph_sensitive_after_token_one(tmp_path: Pat
         assert int(kwargs["structure_ids"][0, -1].item()) > 0
 
 
+def test_generate_completion_from_frozen_domain_context_passes_typed_sidecars():
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_module()
+    domain_eval_spec = importlib.util.spec_from_file_location(
+        "domain_eval_for_generation_context_test",
+        ROOT / "scripts" / "eval_domain_routed_codegen.py",
+    )
+    assert domain_eval_spec is not None and domain_eval_spec.loader is not None
+    domain_eval = importlib.util.module_from_spec(domain_eval_spec)
+    sys.modules[domain_eval_spec.name] = domain_eval
+    domain_eval_spec.loader.exec_module(domain_eval)
+    prompt = domain_eval.load_prompts(
+        ROOT / "evals" / "domain_routed_extended_prompts.jsonl"
+    )[-1]
+    tokenizer = load_cppmega_tokenizer(ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json")
+    graph = domain_eval.build_prompt_graph_for_prompt(prompt, tokenizer)
+
+    class CapturingModel:
+        config = SimpleNamespace(graph_routes_enabled=True)
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append((input_ids, kwargs))
+            return (
+                mx.zeros(
+                    (1, input_ids.shape[1], tokenizer.vocab_size),
+                    dtype=mx.float32,
+                ),
+                None,
+            )
+
+    model = CapturingModel()
+    context = mod.GenerationPromptContext(
+        token_ids=list(graph.token_ids),
+        side_channels={name: list(values) for name, values in graph.side_channels.items()},
+        receipt=dict(graph.receipt),
+        graph_artifact=graph,
+    )
+    completion, prompt_tokens, generated_tokens, finish_reason, receipt = (
+        mod.generate_completion_from_context(
+            model,
+            tokenizer,
+            context,
+            seq_len=256,
+            max_new_tokens=1,
+            temperature=0.0,
+            top_k=None,
+            top_p=None,
+            prompt_graph_mode="repo",
+            graph_bias_dtype=mx.float32,
+            completion_normalizer=mod.identity_completion,
+        )
+    )
+
+    assert prompt_tokens == len(graph.token_ids)
+    assert generated_tokens == 1
+    assert finish_reason == "length"
+    assert completion
+    assert len(model.calls) == 1
+    input_ids, kwargs = model.calls[0]
+    assert tuple(input_ids.shape) == (1, prompt_tokens)
+    assert kwargs["domain_ids"].tolist() == [graph.side_channels["domain_ids"]]
+    assert kwargs["role_ids"].tolist() == [graph.side_channels["role_ids"]]
+    assert kwargs["confidence_ids"].tolist() == [
+        graph.side_channels["confidence_ids"]
+    ]
+    assert float(mx.sum(kwargs["block_bias"]).item()) > 0.0
+    assert float(mx.sum(kwargs["edge_kind_bias"]).item()) > 0.0
+    assert receipt["edge_kind_route_counts"]["100"] == 1
+
+
 def test_generation_e2e_output_is_distinct_from_gold_fixture(tmp_path: Path):
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 

@@ -597,3 +597,122 @@ def test_domain_eval_full_shipped_jsonl_is_green_with_gold_completions() -> None
     assert report["completion_rows"] == 5
     assert report["passed"] is True
     assert report["failed"] == 0
+
+
+def _extended_prompts(mod):
+    return mod.load_prompts(Path("evals/domain_routed_extended_prompts.jsonl"))
+
+
+def test_extended_domain_eval_fixture_uses_four_typed_output_oracles() -> None:
+    mod = _load_eval_module()
+    prompts = _extended_prompts(mod)
+    completions = mod.load_completions(
+        Path("evals/domain_routed_extended_gold_completions.jsonl")
+    )
+
+    report = mod.evaluate(prompts, completions)
+
+    assert report["passed"] is True
+    assert report["status_counts"] == {
+        "build_structure_passed": 1,
+        "cross_domain_structure_passed": 1,
+        "diagnostic_structure_passed": 1,
+        "shell_syntax_passed": 1,
+    }
+
+
+def test_extended_prompt_graphs_rebuild_exact_frozen_sidecars() -> None:
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_eval_module()
+    tokenizer = load_cppmega_tokenizer(
+        Path("cppmega_mlx/tokenizer/tokenizer.json")
+    )
+
+    graphs = [
+        mod.build_prompt_graph_for_prompt(prompt, tokenizer)
+        for prompt in _extended_prompts(mod)
+    ]
+
+    assert [graph.receipt["edge_counts"] for graph in graphs] == [
+        {"domain": 0, "build": 0, "shell": 3, "diagnostic": 0, "cross_domain": 0},
+        {"domain": 0, "build": 0, "shell": 0, "diagnostic": 3, "cross_domain": 0},
+        {"domain": 0, "build": 6, "shell": 0, "diagnostic": 0, "cross_domain": 0},
+        {"domain": 0, "build": 0, "shell": 3, "diagnostic": 2, "cross_domain": 1},
+    ]
+
+
+def test_shell_oracle_rejects_valid_but_semantically_wrong_command() -> None:
+    mod = _load_eval_module()
+    prompt = _extended_prompts(mod)[0]
+
+    result = mod.shell_syntax_oracle(prompt, "echo ok\n")
+
+    assert result["status"] == "shell_structure_failed"
+    assert "required tokens are absent" in result["reason"]
+
+
+def test_diagnostic_oracle_rejects_output_without_required_note_edge() -> None:
+    mod = _load_eval_module()
+    prompt = _extended_prompts(mod)[1]
+
+    result = mod.diagnostic_structure_oracle(
+        prompt,
+        "src/main.cpp:12:7: error: no matching function for call to 'foo' note\n",
+    )
+
+    assert result["status"] == "diagnostic_structure_failed"
+    assert "DIAG_NOTE" in result["reason"]
+
+
+def test_build_oracle_rejects_structured_but_wrong_target() -> None:
+    mod = _load_eval_module()
+    prompt = _extended_prompts(mod)[2]
+
+    result = mod.build_structure_oracle(
+        prompt,
+        "add_executable(other other.cpp)\n",
+    )
+
+    assert result["status"] == "build_structure_failed"
+    assert "required tokens are absent" in result["reason"]
+
+
+def test_cross_domain_oracle_rejects_missing_diagnostic_block() -> None:
+    mod = _load_eval_module()
+    prompt = _extended_prompts(mod)[3]
+
+    result = mod.cross_domain_structure_oracle(
+        prompt,
+        "<KSH_START>print input.txt | tee out.txt\n<KSH_END>",
+    )
+
+    assert result["status"] == "cross_domain_structure_failed"
+    assert "missing required typed domains" in result["reason"]
+
+
+def test_extended_domain_eval_cli_rebuilds_prompt_graphs(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "eval_domain_routed_codegen.py"
+    report_path = tmp_path / "extended-report.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--prompts",
+            "evals/domain_routed_extended_prompts.jsonl",
+            "--completions",
+            "evals/domain_routed_extended_gold_completions.jsonl",
+            "--out",
+            str(report_path),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["prompt_graphs_validated"] == 4
+    assert report["oracle_passed"] == 4
+    assert report["passed"] is True
