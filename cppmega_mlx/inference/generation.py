@@ -29,9 +29,32 @@ _ZERO_GENERATED_MODEL_KWARGS = frozenset(
         "ast_depth_ids",
         "sibling_index_ids",
         "node_type_ids",
+        # Generated tokens have no source-domain provenance until a new
+        # document-sidecar record is materialized.
+        "domain_ids",
+        "role_ids",
+        "entity_ids",
+        "scope_ids",
+        "source_doc_ids",
+        "source_identity_ids",
+        "confidence_ids",
     }
 )
 _REPEAT_GENERATED_MODEL_KWARGS = frozenset({"document_ids", "platform_ids"})
+_NON_SEQUENCE_ALIGNED_MODEL_KWARGS = frozenset(
+    {
+        "domain_edges",
+        "build_edges",
+        "shell_edges",
+        "diagnostic_edges",
+        "cross_domain_edges",
+        "token_domain_edges",
+        "token_build_edges",
+        "token_shell_edges",
+        "token_diagnostic_edges",
+        "token_cross_domain_edges",
+    }
+)
 _SEQUENCE_ALIGNED_MODEL_KWARGS = (
     _ZERO_GENERATED_MODEL_KWARGS | _REPEAT_GENERATED_MODEL_KWARGS
 )
@@ -890,6 +913,8 @@ def _sequence_aligned_model_kwarg(
     value: mx.array,
     batch_size: int,
 ) -> bool:
+    if name in _NON_SEQUENCE_ALIGNED_MODEL_KWARGS:
+        return False
     shape = value.shape
     if not shape or int(shape[0]) != batch_size:
         return False

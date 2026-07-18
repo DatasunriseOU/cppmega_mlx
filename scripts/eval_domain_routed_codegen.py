@@ -10,13 +10,243 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 from typing import Any
+
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_EDGE_FIELD_FAMILIES,
+    DomainKind,
+    DomainRoleKind,
+    ParseConfidence,
+    delimiter_token_ids,
+    domain_edge_family,
+)
+
+_PROMPT_TOKEN_SIDECARS = (
+    "token_domain_ids",
+    "token_role_ids",
+    "token_entity_ids",
+    "token_scope_ids",
+    "token_source_doc_ids",
+    "token_source_identity_ids",
+    "token_confidence_ids",
+)
+_PROMPT_EDGE_SIDECARS = tuple(
+    f"token_{field}" for field in DOMAIN_EDGE_FIELD_FAMILIES
+)
+_PROMPT_EDGE_FAMILIES = {
+    f"token_{field}": family
+    for field, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
+}
+_DOMAIN_NAME_ALIASES = {"CPP_CODE": "CPP"}
+
+
+def _prompt_domain_id(name: str, *, context: str) -> int:
+    canonical = _DOMAIN_NAME_ALIASES.get(name.upper(), name.upper())
+    try:
+        return int(DomainKind[canonical])
+    except KeyError as exc:
+        raise ValueError(f"{context}: unknown required domain {name!r}") from exc
+
+
+def _prompt_delimiter_domains() -> dict[int, int]:
+    result: dict[int, int] = {}
+    for domain in DomainKind:
+        if domain == DomainKind.UNKNOWN:
+            continue
+        try:
+            start, end = delimiter_token_ids(domain)
+        except KeyError:
+            continue
+        result[int(start)] = int(domain)
+        result[int(end)] = int(domain)
+    return result
+
+
+_PROMPT_DELIMITER_DOMAINS = _prompt_delimiter_domains()
+
+
+def _prompt_start_delimiter_ids() -> frozenset[int]:
+    result: set[int] = set()
+    for domain in DomainKind:
+        if domain == DomainKind.UNKNOWN:
+            continue
+        try:
+            start, _end = delimiter_token_ids(domain)
+        except KeyError:
+            continue
+        result.add(int(start))
+    return frozenset(result)
+
+
+_PROMPT_START_DELIMITER_IDS = _prompt_start_delimiter_ids()
+
+
+def _normalize_prompt_edge(
+    edge: Any,
+    *,
+    column: str,
+    token_count: int,
+    context: str,
+) -> dict[str, int]:
+    if not isinstance(edge, Mapping):
+        raise ValueError(f"{context}: {column} entries must be objects")
+    src = edge.get("from", edge.get("src"))
+    dst = edge.get("to", edge.get("dst"))
+    if src is None or dst is None or edge.get("kind") is None:
+        raise ValueError(f"{context}: {column} entries require from/to/kind")
+    try:
+        normalized = {"from": int(src), "to": int(dst), "kind": int(edge["kind"])}
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context}: {column} edge values must be integers") from exc
+    if not (
+        0 <= normalized["from"] < token_count
+        and 0 <= normalized["to"] < token_count
+    ):
+        raise ValueError(f"{context}: {column} edge endpoint is outside prompt tokens")
+    try:
+        actual_family = domain_edge_family(normalized["kind"])
+    except ValueError as exc:
+        raise ValueError(f"{context}: {column}: {exc}") from exc
+    expected_family = _PROMPT_EDGE_FAMILIES[column]
+    if actual_family != expected_family:
+        raise ValueError(
+            f"{context}: {column} edge kind {normalized['kind']} belongs to "
+            f"{actual_family}, not {expected_family}"
+        )
+    return normalized
+
+
+def validate_prompt_sidecars(
+    token_ids: Sequence[Any],
+    sidecars: Mapping[str, Sequence[Any]],
+    required_domains: Sequence[str],
+    expected_sidecars: Sequence[str],
+    *,
+    context: str = "prompt",
+) -> None:
+    """Validate a frozen prompt token/sidecar snapshot without model execution."""
+    token_values = [int(value) for value in token_ids]
+    if not token_values:
+        raise ValueError(f"{context}: prompt_token_ids must be non-empty")
+    missing = [name for name in expected_sidecars if name not in sidecars]
+    if missing:
+        raise ValueError(f"{context}: expected sidecars are missing {missing}")
+    missing_token = [name for name in _PROMPT_TOKEN_SIDECARS if name not in sidecars]
+    if missing_token:
+        raise ValueError(
+            f"{context}: structured prompt sidecars require all token-aligned "
+            f"columns; missing={missing_token}"
+        )
+
+    token_count = len(token_values)
+    vectors: dict[str, list[int]] = {}
+    for column in _PROMPT_TOKEN_SIDECARS:
+        try:
+            vector = [int(value) for value in sidecars[column]]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{context}: {column} must be an integer sequence") from exc
+        if len(vector) != token_count:
+            raise ValueError(
+                f"{context}: {column} length {len(vector)} != token_ids length {token_count}"
+            )
+        vectors[column] = vector
+
+    for value in vectors["token_domain_ids"]:
+        try:
+            DomainKind(value)
+        except ValueError as exc:
+            raise ValueError(f"{context}: unknown token_domain_ids value {value}") from exc
+    for value in vectors["token_role_ids"]:
+        try:
+            DomainRoleKind(value)
+        except ValueError as exc:
+            raise ValueError(f"{context}: unknown token_role_ids value {value}") from exc
+    for value in vectors["token_confidence_ids"]:
+        try:
+            ParseConfidence(value)
+        except ValueError as exc:
+            raise ValueError(f"{context}: unknown token_confidence_ids value {value}") from exc
+    for column in ("token_entity_ids", "token_scope_ids", "token_source_doc_ids"):
+        if any(value < 0 for value in vectors[column]):
+            raise ValueError(f"{context}: {column} values must be non-negative")
+    if any(value <= 0 for value in vectors["token_source_doc_ids"]):
+        raise ValueError(f"{context}: token_source_doc_ids values must be positive")
+    if any(value <= 0 for value in vectors["token_source_identity_ids"]):
+        raise ValueError(f"{context}: token_source_identity_ids values must be positive")
+
+    for column in _PROMPT_EDGE_SIDECARS:
+        raw_edges = sidecars.get(column, ())
+        if not isinstance(raw_edges, Sequence) or isinstance(raw_edges, (str, bytes)):
+            raise ValueError(f"{context}: {column} must be an edge sequence")
+        for edge in raw_edges:
+            _normalize_prompt_edge(
+                edge,
+                column=column,
+                token_count=token_count,
+                context=context,
+            )
+
+    represented_domains = set(vectors["token_domain_ids"])
+    for name in required_domains:
+        domain_id = _prompt_domain_id(str(name), context=context)
+        if domain_id not in represented_domains:
+            raise ValueError(
+                f"{context}: required domain {name!r} is absent from token_domain_ids"
+            )
+
+    stack: list[int] = []
+    for index, token_id in enumerate(token_values):
+        domain_id = vectors["token_domain_ids"][index]
+        role_id = vectors["token_role_ids"][index]
+        confidence_id = vectors["token_confidence_ids"][index]
+        delimiter_domain = _PROMPT_DELIMITER_DOMAINS.get(token_id)
+        if delimiter_domain is not None:
+            if domain_id != delimiter_domain:
+                raise ValueError(
+                    f"{context}: delimiter token {token_id} has domain id {domain_id}, "
+                    f"expected {delimiter_domain}"
+                )
+            if role_id != int(DomainRoleKind.DELIMITER):
+                raise ValueError(f"{context}: delimiter token {token_id} must have role DELIMITER")
+            if confidence_id != int(ParseConfidence.EXACT):
+                raise ValueError(f"{context}: delimiter token {token_id} must have EXACT confidence")
+            if token_id in _PROMPT_START_DELIMITER_IDS:
+                stack.append(delimiter_domain)
+            elif not stack or stack.pop() != delimiter_domain:
+                raise ValueError(f"{context}: unmatched domain end delimiter {token_id}")
+            continue
+        if role_id == int(DomainRoleKind.DELIMITER):
+            raise ValueError(f"{context}: non-delimiter token {token_id} has DELIMITER role")
+        active_domain = stack[-1] if stack else int(DomainKind.UNKNOWN)
+        if domain_id != active_domain:
+            raise ValueError(
+                f"{context}: token {index} domain id {domain_id} does not match "
+                f"active domain {active_domain}"
+            )
+    if stack:
+        raise ValueError(f"{context}: unclosed domain delimiters {stack}")
+
+
+def _prompt_sidecar_receipt(
+    token_ids: Sequence[int],
+    sidecars: Mapping[str, Sequence[Any]],
+) -> dict[str, Any]:
+    return {
+        "token_count": len(token_ids),
+        "columns": sorted(sidecars),
+        "edge_counts": {
+            column: len(sidecars.get(column, ()))
+            for column in _PROMPT_EDGE_SIDECARS
+            if column in sidecars
+        },
+    }
 
 
 PASS_STATUS = "compile_passed"
@@ -44,6 +274,8 @@ class DomainEvalPrompt:
     compile_prefix: str = ""
     compile_suffix: str = ""
     run_binary: bool = False
+    prompt_token_ids: tuple[int, ...] = ()
+    prompt_sidecars: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
 
     def executable_oracle_error(self) -> str | None:
         if not (self.compile_prefix.strip() or self.compile_suffix.strip()):
@@ -51,6 +283,9 @@ class DomainEvalPrompt:
         if not self.run_binary:
             return "run_binary must be true so compiled output is executed"
         return None
+
+    def sidecar_receipt(self) -> dict[str, Any]:
+        return _prompt_sidecar_receipt(self.prompt_token_ids, self.prompt_sidecars)
 
     @classmethod
     def from_row(
@@ -68,6 +303,50 @@ class DomainEvalPrompt:
         required_domains = tuple(str(x) for x in row["required_domains"])
         if not required_domains:
             raise ValueError(f"{path}:{line_no}: required_domains must be non-empty")
+        raw_token_ids = row.get("prompt_token_ids")
+        raw_sidecars = row.get("prompt_sidecars")
+        if (raw_token_ids is None) != (raw_sidecars is None):
+            raise ValueError(
+                f"{path}:{line_no}: prompt_token_ids and prompt_sidecars must be "
+                "provided together"
+            )
+        prompt_token_ids: tuple[int, ...] = ()
+        prompt_sidecars: dict[str, tuple[Any, ...]] = {}
+        if raw_token_ids is not None:
+            if not isinstance(raw_token_ids, Sequence) or isinstance(
+                raw_token_ids, (str, bytes)
+            ):
+                raise ValueError(
+                    f"{path}:{line_no}: prompt_token_ids must be an integer sequence"
+                )
+            if not isinstance(raw_sidecars, Mapping):
+                raise ValueError(f"{path}:{line_no}: prompt_sidecars must be an object")
+            prompt_token_ids = tuple(int(value) for value in raw_token_ids)
+            for column, values in raw_sidecars.items():
+                if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                    raise ValueError(
+                        f"{path}:{line_no}: prompt sidecar {column!r} must be a sequence"
+                    )
+                column_name = str(column)
+                if column_name in _PROMPT_EDGE_SIDECARS:
+                    prompt_sidecars[column_name] = tuple(
+                        _normalize_prompt_edge(
+                            edge,
+                            column=column_name,
+                            token_count=len(prompt_token_ids),
+                            context=f"{path}:{line_no}",
+                        )
+                        for edge in values
+                    )
+                else:
+                    prompt_sidecars[column_name] = tuple(values)
+            validate_prompt_sidecars(
+                prompt_token_ids,
+                prompt_sidecars,
+                required_domains,
+                tuple(str(x) for x in row.get("expected_sidecars", ())),
+                context=f"{path}:{line_no}",
+            )
         prompt = cls(
             id=str(row["id"]),
             task_type=str(row["task_type"]),
@@ -77,6 +356,8 @@ class DomainEvalPrompt:
             compile_prefix=str(row.get("compile_prefix", "")),
             compile_suffix=str(row.get("compile_suffix", "")),
             run_binary=bool(row.get("run_binary", False)),
+            prompt_token_ids=prompt_token_ids,
+            prompt_sidecars=prompt_sidecars,
         )
         oracle_error = prompt.executable_oracle_error()
         if oracle_error is not None:
@@ -234,6 +515,7 @@ def evaluate(
             "task_type": prompt.task_type,
             "required_domains": list(prompt.required_domains),
             "expected_sidecars": list(prompt.expected_sidecars),
+            "prompt_sidecar_receipt": prompt.sidecar_receipt(),
             "has_completion": has_completion,
         }
         if not has_completion:

@@ -58,6 +58,78 @@ def test_domain_eval_prompt_loader_requires_domains(tmp_path):
     assert prompts[0].expected_sidecars == ("token_domain_ids",)
 
 
+def _case5_ksh_eval_row() -> dict:
+    for line in Path("evals/domain_routed_prompts.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines():
+        row = json.loads(line)
+        if row["id"] == "ksh_build_sidecar_route":
+            return row
+    raise AssertionError("missing ksh_build_sidecar_route eval fixture")
+
+
+def test_domain_eval_freezes_structured_ksh_prompt_sidecars(tmp_path: Path) -> None:
+    mod = _load_eval_module()
+    row = _case5_ksh_eval_row()
+    row["compile_suffix"] = "\nint main(){return 0;}\n"
+    row["run_binary"] = True
+    path = tmp_path / "ksh-prompts.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    prompt = mod.load_prompts(path)[0]
+
+    assert prompt.prompt_token_ids == (2, 245, 501, 502, 246, 215, 601, 602, 216, 3)
+    assert prompt.prompt_sidecars["token_domain_ids"] == (
+        0,
+        24,
+        24,
+        24,
+        24,
+        43,
+        43,
+        43,
+        43,
+        0,
+    )
+    assert prompt.prompt_sidecars["token_shell_edges"] == (
+        {"from": 2, "to": 3, "kind": 40},
+    )
+    assert prompt.prompt_sidecars["token_diagnostic_edges"] == (
+        {"from": 6, "to": 7, "kind": 64},
+    )
+    assert prompt.prompt_sidecars["token_cross_domain_edges"] == (
+        {"from": 3, "to": 6, "kind": 100},
+    )
+
+    report = mod.evaluate([prompt], {}, compile=False)
+    assert report["rows"][0]["prompt_sidecar_receipt"] == {
+        "token_count": 10,
+        "columns": sorted(prompt.prompt_sidecars),
+        "edge_counts": {
+            "token_domain_edges": 0,
+            "token_build_edges": 0,
+            "token_shell_edges": 1,
+            "token_diagnostic_edges": 1,
+            "token_cross_domain_edges": 1,
+        },
+    }
+
+
+def test_domain_eval_rejects_misaligned_prompt_sidecar_edges(tmp_path: Path) -> None:
+    mod = _load_eval_module()
+    row = _case5_ksh_eval_row()
+    row["compile_suffix"] = "\nint main(){return 0;}\n"
+    row["run_binary"] = True
+    row["prompt_sidecars"]["token_shell_edges"][0]["to"] = len(
+        row["prompt_token_ids"]
+    )
+    path = tmp_path / "bad-ksh-prompts.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside prompt tokens"):
+        mod.load_prompts(path)
+
+
 def test_domain_eval_rejects_shipped_prompt_without_executable_oracle():
     mod = _load_eval_module()
     path = Path("evals/domain_routed_prompts.jsonl")

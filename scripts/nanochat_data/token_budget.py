@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_EDGE_FIELD_FAMILIES,
+    canonicalize_domain_edge_fields,
     normalize_domain_edge_record,
     slice_embedded_domain_spans,
 )
@@ -245,9 +246,10 @@ def _slice_doc_char_range(
                 )
         return remapped
 
+    canonical_edges = canonicalize_domain_edge_fields(doc, source_length=len(text))
     for edge_field, family in DOMAIN_EDGE_FIELD_FAMILIES.items():
         sliced[edge_field] = _remap_char_edge_triples(
-            doc.get(edge_field, []),
+            canonical_edges[edge_field],
             family=family,
         )
     return sliced
