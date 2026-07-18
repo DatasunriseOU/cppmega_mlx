@@ -141,7 +141,7 @@ class InferenceEnrichmentSpec:
     """How inference attempts to derive side channels from input context."""
 
     source: InferenceEnrichmentSource | str = InferenceEnrichmentSource.AUTO
-    fail_policy: InferenceFailPolicy | str = InferenceFailPolicy.DROP_FAMILY
+    fail_policy: InferenceFailPolicy | str = InferenceFailPolicy.ERROR
     timeout_ms: int = 500
     cache_enabled: bool = True
 

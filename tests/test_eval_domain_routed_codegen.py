@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from collections import Counter
 import json
 from pathlib import Path
 import shutil
@@ -23,6 +24,24 @@ def _load_eval_module():
     )
     spec = importlib.util.spec_from_file_location(
         "eval_domain_routed_codegen", module_path
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_generation_module():
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "cpp_jsonl_generation_compile_eval.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "cpp_jsonl_generation_compile_eval_for_domain_tests",
+        module_path,
     )
     assert spec is not None
     assert spec.loader is not None
@@ -73,6 +92,50 @@ def _case5_ksh_eval_row() -> dict:
         if row["id"] == "ksh_build_sidecar_route":
             return row
     raise AssertionError("missing ksh_build_sidecar_route eval fixture")
+
+
+def _gold_completion_texts(path: Path) -> dict[str, str]:
+    """Read gold text only for direct oracle calibration, never for evaluate()."""
+
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert all(row.get("completion_source") == "gold_fixture" for row in rows)
+    return {str(row["id"]): str(row["completion"]) for row in rows}
+
+
+def _published_completion(mod, prompt, completion: str):
+    generated_token_count = max(1, len(completion.encode("utf-8")))
+    generation_receipt = {
+        "schema": mod.DOMAIN_GENERATION_RECEIPT_SCHEMA,
+        "generated_token_count": generated_token_count,
+        "finish_reason": "length",
+        "edge_family_route_counts": mod._prompt_edge_counts(prompt),
+    }
+    row = mod.publish_model_completion(
+        prompt,
+        completion,
+        model_id="test-dense-cpp-lm",
+        generation_receipt=generation_receipt,
+    )
+    return mod.DomainModelCompletion.from_row(row)
+
+
+def _published_row(mod, prompt, completion: str) -> dict:
+    generated_token_count = max(1, len(completion.encode("utf-8")))
+    return mod.publish_model_completion(
+        prompt,
+        completion,
+        model_id="test-dense-cpp-lm",
+        generation_receipt={
+            "schema": mod.DOMAIN_GENERATION_RECEIPT_SCHEMA,
+            "generated_token_count": generated_token_count,
+            "finish_reason": "length",
+            "edge_family_route_counts": mod._prompt_edge_counts(prompt),
+        },
+    )
 
 
 def test_domain_eval_freezes_structured_ksh_prompt_sidecars(tmp_path: Path) -> None:
@@ -294,7 +357,9 @@ def test_domain_eval_marks_no_compile_as_failure():
     )
 
     report = mod.evaluate(
-        [prompt], {"add": "int add(int a,int b){return a+b;}"}, compile=False
+        [prompt],
+        {"add": _published_completion(mod, prompt, "int add(int a,int b){return a+b;}")},
+        compile=False,
     )
 
     assert report["rows"][0]["status"] == "not_compiled"
@@ -313,7 +378,10 @@ def test_domain_eval_marks_missing_compile_oracle_as_failure():
         oracle_kind="cpp_compile_run",
     )
 
-    report = mod.evaluate([prompt], {"unchecked": "int f(){return 0;}"})
+    report = mod.evaluate(
+        [prompt],
+        {"unchecked": _published_completion(mod, prompt, "int f(){return 0;}")},
+    )
 
     assert report["rows"][0]["status"] == "missing_compile_oracle"
     assert report["failed"] == 1
@@ -334,7 +402,13 @@ def test_domain_eval_marks_compiler_unavailable_as_failure():
     )
     report = mod.evaluate(
         [prompt],
-        {"add": "int add(int a,int b){return a+b;"},
+        {
+            "add": _published_completion(
+                mod,
+                prompt,
+                "int add(int a,int b){return a+b;",
+            )
+        },
         tool_overrides={"cpp": None},
     )
 
@@ -357,7 +431,13 @@ def test_domain_eval_counts_compile_failure() -> None:
     )
     report = mod.evaluate(
         [prompt],
-        {"add": "int add(int a,int b){return ;"},
+        {
+            "add": _published_completion(
+                mod,
+                prompt,
+                "int add(int a,int b){return ;",
+            )
+        },
     )
 
     assert report["status_counts"] == {"compile_failed": 1}
@@ -368,6 +448,7 @@ def test_domain_eval_counts_compile_failure() -> None:
 def test_domain_eval_cli_exits_nonzero_for_not_compiled(
     tmp_path: Path,
 ) -> None:
+    mod = _load_eval_module()
     prompts = tmp_path / "prompts.jsonl"
     completions = tmp_path / "completions.jsonl"
     report_path = tmp_path / "report.json"
@@ -387,8 +468,24 @@ def test_domain_eval_cli_exits_nonzero_for_not_compiled(
         + "\n",
         encoding="utf-8",
     )
+    prompt_for_completion = mod.DomainEvalPrompt(
+        id="add",
+        task_type="cpp_docstring_to_code",
+        prompt="// add\n",
+        required_domains=("CPP",),
+        expected_sidecars=("token_domain_ids", "token_role_ids"),
+        oracle_kind="cpp_compile_run",
+        compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
+        run_binary=True,
+    )
     completions.write_text(
-        json.dumps({"id": "add", "completion": "int add(int a,int b){return a+b;}"})
+        json.dumps(
+            _published_row(
+                mod,
+                prompt_for_completion,
+                "int add(int a,int b){return a+b;}",
+            )
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -540,7 +637,7 @@ def test_sidecar_structure_oracle_separates_static_prompt_and_completion_checks(
     row = _case5_ksh_eval_row()
     path = Path("evals/domain_routed_prompts.jsonl")
     prompt = mod.load_prompts(path)[-1]
-    completion = mod.load_completions(
+    completion = _gold_completion_texts(
         Path("evals/domain_routed_gold_completions.jsonl")
     )[prompt.id]
 
@@ -592,58 +689,217 @@ def test_sidecar_structure_oracle_fails_without_frozen_sidecars() -> None:
     assert result["failed_closed"] is True
 
 
-def test_evaluate_dispatches_shell_build_and_sidecar_oracles() -> None:
+def test_gold_calibration_dispatches_shell_build_and_sidecar_oracles() -> None:
     mod = _load_eval_module()
     prompts = mod.load_prompts(Path("evals/domain_routed_prompts.jsonl"))[2:]
-    completions = mod.load_completions(
+    texts = _gold_completion_texts(
         Path("evals/domain_routed_gold_completions.jsonl")
     )
 
-    report = mod.evaluate(prompts, completions)
+    results = [
+        mod.run_prompt_oracle(prompt, texts[prompt.id]) for prompt in prompts
+    ]
 
-    assert [row["status"] for row in report["rows"]] == [
+    assert [result["status"] for result in results] == [
         "build_structure_passed",
         "shell_syntax_passed",
         "sidecar_structure_passed",
     ]
-    assert report["oracle_passed"] == 3
-    assert report["compile_passed"] == 0
 
 
-def test_domain_eval_full_shipped_jsonl_is_green_with_gold_completions() -> None:
+def test_domain_eval_rejects_gold_completions_as_model_inputs() -> None:
     mod = _load_eval_module()
-    prompts = mod.load_prompts(Path("evals/domain_routed_prompts.jsonl"))
-    completions = mod.load_completions(
-        Path("evals/domain_routed_gold_completions.jsonl")
-    )
+    with pytest.raises(ValueError, match="gold fixtures are not eval inputs"):
+        mod.load_completions(Path("evals/domain_routed_gold_completions.jsonl"))
 
-    report = mod.evaluate(prompts, completions)
 
-    assert report["prompts"] == 5
-    assert report["completion_rows"] == 5
-    assert report["passed"] is True
-    assert report["failed"] == 0
+def test_domain_eval_rejects_unpublished_completion_text() -> None:
+    mod = _load_eval_module()
+    prompt = mod.load_prompts(Path("evals/domain_routed_prompts.jsonl"))[0]
+
+    report = mod.evaluate([prompt], {prompt.id: "unpublished model text"})
+
+    assert report["rows"][0]["status"] == "completion_contract_failed"
+    assert report["rows"][0]["failed_closed"] is True
 
 
 def _extended_prompts(mod):
     return mod.load_prompts(Path("evals/domain_routed_extended_prompts.jsonl"))
 
 
-def test_extended_domain_eval_fixture_uses_four_typed_output_oracles() -> None:
+@pytest.mark.parametrize(
+    ("prompt_id", "column", "family"),
+    [
+        ("typed_shell_pipeline", "token_shell_edges", "shell"),
+        (
+            "typed_compiler_diagnostic",
+            "token_diagnostic_edges",
+            "diagnostic",
+        ),
+        (
+            "typed_cross_domain_route",
+            "token_cross_domain_edges",
+            "cross_domain",
+        ),
+    ],
+)
+def test_frozen_eval_rejects_each_empty_required_edge_family(
+    tmp_path: Path,
+    prompt_id: str,
+    column: str,
+    family: str,
+) -> None:
+    mod = _load_eval_module()
+    rows = [
+        json.loads(line)
+        for line in Path("evals/domain_routed_extended_prompts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    row = next(item for item in rows if item["id"] == prompt_id)
+    row["prompt_sidecars"][column] = []
+    path = tmp_path / f"empty-{family}.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"required frozen edge families are empty.*{family}",
+    ):
+        mod.load_prompts(path)
+
+
+def test_extended_gold_fixture_calibrates_four_typed_output_oracles() -> None:
     mod = _load_eval_module()
     prompts = _extended_prompts(mod)
-    completions = mod.load_completions(
+    texts = _gold_completion_texts(
         Path("evals/domain_routed_extended_gold_completions.jsonl")
     )
+    statuses = Counter(
+        mod.run_prompt_oracle(prompt, texts[prompt.id])["status"]
+        for prompt in prompts
+    )
 
-    report = mod.evaluate(prompts, completions)
-
-    assert report["passed"] is True
-    assert report["status_counts"] == {
+    assert dict(statuses) == {
         "build_structure_passed": 1,
         "cross_domain_structure_passed": 1,
         "diagnostic_structure_passed": 1,
         "shell_syntax_passed": 1,
+    }
+
+
+def test_model_completion_receipt_binds_frozen_edge_counts() -> None:
+    mod = _load_eval_module()
+    prompt = _extended_prompts(mod)[3]
+    row = mod.publish_model_completion(
+        prompt,
+        "model emitted this completion",
+        model_id="test-dense-cpp-lm",
+        generation_receipt={
+            "schema": mod.DOMAIN_GENERATION_RECEIPT_SCHEMA,
+            "generated_token_count": 1,
+            "finish_reason": "length",
+            "edge_family_route_counts": mod._prompt_edge_counts(prompt),
+        },
+    )
+    row["publisher_receipt"]["edge_counts"]["cross_domain"] = 0
+    published = mod.DomainModelCompletion.from_row(row)
+
+    report = mod.evaluate([prompt], {prompt.id: published})
+
+    assert report["rows"][0]["status"] == "completion_contract_failed"
+    assert report["rows"][0]["failed_closed"] is True
+    assert "edge counts" in report["rows"][0]["reason"]
+
+
+def test_domain_eval_consumes_a_real_dense_cpp_lm_completion() -> None:
+    import mlx.core as mx
+
+    from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
+    from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
+
+    mod = _load_eval_module()
+    generation = _load_generation_module()
+    prompt = _extended_prompts(mod)[3]
+    tokenizer = load_cppmega_tokenizer(
+        Path("cppmega_mlx/tokenizer/tokenizer.json")
+    )
+    graph = mod.build_prompt_graph_for_prompt(prompt, tokenizer)
+    mx.random.seed(91)
+    model = DenseCppLM(
+        DenseCppLMConfig(
+            vocab_size=tokenizer.vocab_size,
+            hidden_size=16,
+            depth=1,
+            ffn_hidden_size=32,
+            max_seq_length=128,
+            num_query_heads=2,
+            num_kv_heads=1,
+            head_dim=8,
+            ngram_hash_enabled=False,
+            graph_routes_enabled=True,
+            require_graph_routes=True,
+            graph_attention_bias_beta=10.0,
+        )
+    )
+    context = generation.GenerationPromptContext(
+        token_ids=list(graph.token_ids),
+        side_channels={
+            name: list(values) for name, values in graph.side_channels.items()
+        },
+        receipt=dict(graph.receipt),
+        graph_artifact=graph,
+    )
+    (
+        completion,
+        _prompt_tokens,
+        generated_tokens,
+        finish_reason,
+        generation_receipt,
+    ) = generation.generate_completion_from_context(
+        model,
+        tokenizer,
+        context,
+        seq_len=128,
+        max_new_tokens=2,
+        temperature=0.0,
+        top_k=None,
+        top_p=1.0,
+        prompt_graph_mode="repo",
+        graph_bias_dtype=mx.float32,
+        completion_normalizer=generation.identity_completion,
+    )
+
+    assert completion
+    assert completion != _gold_completion_texts(
+        Path("evals/domain_routed_extended_gold_completions.jsonl")
+    )[prompt.id]
+    assert generated_tokens > 0
+    assert generation_receipt["edge_kind_route_counts"]
+    assert {
+        family: generation_receipt["edge_family_route_counts"][family]
+        for family in ("shell", "diagnostic", "cross_domain")
+    } == {
+        "shell": 3,
+        "diagnostic": 2,
+        "cross_domain": 1,
+    }
+    published = mod.DomainModelCompletion.from_row(
+        mod.publish_model_completion(
+            prompt,
+            completion,
+            model_id="tiny-dense-cpp-lm",
+            generation_receipt=generation_receipt,
+            generated_token_count=generated_tokens,
+            finish_reason=finish_reason,
+        )
+    )
+    report = mod.evaluate([prompt], {prompt.id: published})
+
+    assert report["rows"][0]["completion_source"] == "model_generation"
+    assert report["rows"][0]["completion_chars"] == len(completion)
+    assert report["rows"][0]["status"] in {
+        "cross_domain_parse_failed",
+        "cross_domain_structure_failed",
     }
 
 
@@ -736,9 +992,34 @@ def test_cross_domain_oracle_rejects_valid_blocks_without_generated_relation() -
     assert "generated_cross_domain_edge" not in result
 
 
-def test_extended_domain_eval_cli_rebuilds_prompt_graphs(tmp_path: Path) -> None:
+def test_extended_domain_eval_cli_rebuilds_graphs_before_scoring_model_output(
+    tmp_path: Path,
+) -> None:
+    mod = _load_eval_module()
     script = Path(__file__).resolve().parents[1] / "scripts" / "eval_domain_routed_codegen.py"
     report_path = tmp_path / "extended-report.json"
+    completions_path = tmp_path / "model-completions.jsonl"
+    prompts = _extended_prompts(mod)
+    completions_path.write_text(
+        "\n".join(
+            json.dumps(
+                mod.publish_model_completion(
+                    prompt,
+                    "model output",
+                    model_id="test-dense-cpp-lm",
+                    generation_receipt={
+                        "schema": mod.DOMAIN_GENERATION_RECEIPT_SCHEMA,
+                        "generated_token_count": 1,
+                        "finish_reason": "length",
+                        "edge_family_route_counts": mod._prompt_edge_counts(prompt),
+                    },
+                )
+            )
+            for prompt in prompts
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     result = subprocess.run(
         [
@@ -747,7 +1028,7 @@ def test_extended_domain_eval_cli_rebuilds_prompt_graphs(tmp_path: Path) -> None
             "--prompts",
             "evals/domain_routed_extended_prompts.jsonl",
             "--completions",
-            "evals/domain_routed_extended_gold_completions.jsonl",
+            str(completions_path),
             "--out",
             str(report_path),
         ],
@@ -756,8 +1037,13 @@ def test_extended_domain_eval_cli_rebuilds_prompt_graphs(tmp_path: Path) -> None
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2, result.stderr
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["static_prompt_graphs_validated"] == 4
-    assert report["oracle_passed"] == 4
-    assert report["passed"] is True
+    assert report["oracle_passed"] == 0
+    assert report["completion_derived_oracle_passed"] == 0
+    assert all(
+        row["completion_source"] == "model_generation"
+        for row in report["rows"]
+    )
+    assert report["passed"] is False

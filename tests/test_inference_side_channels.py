@@ -72,6 +72,19 @@ class FailingAdapter(FakeCppAdapter):
         raise ValueError("no compile database")
 
 
+class EmptyAdapter(FakeCppAdapter):
+    version = "empty-v1"
+
+    def map_to_tokens(
+        self,
+        metadata: str,
+        tokens: Sequence[int],
+        tokenizer: Any,
+    ) -> TokenMetadata:
+        del metadata, tokens, tokenizer
+        return TokenMetadata()
+
+
 class SemanticIdentityAdapter(FakeCppAdapter):
     version = "semantic-identity-v1"
 
@@ -117,8 +130,44 @@ def _tiny_model() -> HybridTinyLM:
     )
 
 
-def test_inference_side_channel_builder_text_only_prompt() -> None:
-    builder = InferenceSideChannelBuilder(TinyTokenizer())
+def test_inference_side_channel_builder_fails_closed_without_adapter() -> None:
+    with pytest.raises(RuntimeError, match="adapter_missing"):
+        InferenceSideChannelBuilder(TinyTokenizer()).build("int x;")
+
+
+def test_inference_side_channel_builder_defaults_to_error_on_adapter_failure() -> None:
+    with pytest.raises(RuntimeError, match="adapter_error:ValueError"):
+        InferenceSideChannelBuilder(
+            TinyTokenizer(),
+            adapter=FailingAdapter(),
+        ).build("int x;", language="cpp")
+
+
+def test_inference_side_channel_builder_rejects_empty_adapter_metadata() -> None:
+    with pytest.raises(RuntimeError, match="adapter_empty_metadata"):
+        InferenceSideChannelBuilder(
+            TinyTokenizer(),
+            adapter=EmptyAdapter(),
+        ).build("int x;", language="cpp")
+
+    dropped = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        adapter=EmptyAdapter(),
+        fail_policy="drop_family",
+    ).build("int x;", language="cpp")
+    assert dropped.side_channels == {}
+    assert dropped.model_kwargs == {}
+    assert dropped.provenance["inference_failure_reason"] == (
+        "adapter_empty_metadata"
+    )
+    assert dropped.provenance["inference_degraded"] == "true"
+
+
+def test_inference_side_channel_builder_text_only_prompt_is_explicit() -> None:
+    builder = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        fail_policy="text_only",
+    )
 
     result = builder.build("int x;")
 
@@ -127,10 +176,19 @@ def test_inference_side_channel_builder_text_only_prompt() -> None:
     assert result.side_channels == {}
     assert result.cache_components.content_sha256 == sha256(b"int x;").hexdigest()
     assert result.cache_components.tokenizer_id == "tiny-tokenizer"
+    assert result.provenance == {
+        "fallback": "text_only",
+        "inference_fail_policy": "text_only",
+        "inference_enrichment_status": "explicit_text_only",
+        "inference_degraded": "true",
+    }
 
 
 def test_inference_side_channel_builder_platform_context_smoke() -> None:
-    builder = InferenceSideChannelBuilder(TinyTokenizer())
+    builder = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        fail_policy="drop_family",
+    )
 
     result = builder.build(
         "int x;",
@@ -149,6 +207,9 @@ def test_inference_side_channel_builder_platform_context_smoke() -> None:
     assert int(np.count_nonzero(np.array(platform_ids))) > 0
     assert "os=macos" in result.rendered_platform_context
     assert result.side_channels["platform"]["platform_ids"] is platform_ids
+    assert result.provenance["fallback"] == "drop_family"
+    assert result.provenance["inference_failure_reason"] == "adapter_missing"
+    assert result.provenance["inference_degraded"] == "true"
     assert logits.shape[:2] == result.prompt_ids.shape
 
 
@@ -172,6 +233,9 @@ def test_inference_side_channel_builder_adapter_metadata_smoke() -> None:
     assert result.model_kwargs["structure_ids"].shape == result.prompt_ids.shape
     assert result.side_channels["syntax"]["ast_depth_ids"].shape == result.prompt_ids.shape
     assert result.provenance["adapter"] == "fake-clang-v1"
+    assert result.provenance["inference_fail_policy"] == "error"
+    assert result.provenance["inference_enrichment_status"] == "enriched"
+    assert result.provenance["inference_degraded"] == "false"
     assert result.cache_components.adapter_language == "cpp"
     assert result.cache_components.adapter_version == "fake-clang-v1"
     assert logits.shape[:2] == result.prompt_ids.shape
@@ -222,16 +286,40 @@ def test_inference_side_channel_builder_fallback_policies_are_explicit() -> None
     ).build("int x;", platform_context=platform_context, language="cpp")
 
     assert dropped.provenance["adapter"].startswith("dropped:adapter_error")
+    assert dropped.provenance["fallback"] == "drop_family"
+    assert dropped.provenance["inference_fail_policy"] == "drop_family"
+    assert dropped.provenance["inference_enrichment_status"] == (
+        "degraded_drop_family"
+    )
+    assert dropped.provenance["inference_degraded"] == "true"
+    assert dropped.provenance["inference_failure_reason"] == (
+        "adapter_error:ValueError"
+    )
     assert "platform_ids" in dropped.model_kwargs
     assert text_only.model_kwargs == {}
     assert text_only.side_channels == {}
-    assert text_only.provenance == {"fallback": "text_only"}
+    assert text_only.provenance == {
+        "fallback": "text_only",
+        "inference_fail_policy": "text_only",
+        "inference_enrichment_status": "explicit_text_only",
+        "inference_degraded": "true",
+    }
     with pytest.raises(RuntimeError, match="adapter_error"):
         InferenceSideChannelBuilder(
             TinyTokenizer(),
             adapter=FailingAdapter(),
             fail_policy="error",
         ).build("int x;", platform_context=platform_context, language="cpp")
+
+
+def test_inference_side_channel_builder_rejects_empty_policy_override() -> None:
+    builder = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        adapter=FakeCppAdapter(),
+    )
+
+    with pytest.raises(ValueError, match="fail_policy"):
+        builder.build("int x;", language="cpp", fail_policy="")  # type: ignore[arg-type]
 
 
 def test_inference_side_channel_builder_cache_key_uses_required_components() -> None:
@@ -288,10 +376,18 @@ def test_unknown_language_adapter_fails_explicitly() -> None:
     assert caps.available is False
     assert caps.reason == "adapter_unknown_language"
 
-    dropped = builder.build("const x = 1;", language="zig")
+    with pytest.raises(RuntimeError, match="adapter_unavailable"):
+        builder.build("const x = 1;", language="zig")
+
+    dropped = InferenceSideChannelBuilder(
+        TinyTokenizer(),
+        fail_policy="drop_family",
+    ).build("const x = 1;", language="zig")
     assert dropped.model_kwargs == {}
     assert dropped.side_channels == {}
     assert dropped.provenance["adapter"].startswith("dropped:adapter_unavailable")
+    assert dropped.provenance["fallback"] == "drop_family"
+    assert dropped.provenance["inference_degraded"] == "true"
 
     with pytest.raises(RuntimeError, match="adapter_unavailable"):
         InferenceSideChannelBuilder(
@@ -311,10 +407,10 @@ def _assert_builtin_language_adapter_conforms(
     assert caps.language == language
     assert caps.families == ("syntax", "structure")
     if not caps.available:
-        result = InferenceSideChannelBuilder(TinyTokenizer()).build(
-            source,
-            language=language,
-        )
+        result = InferenceSideChannelBuilder(
+            TinyTokenizer(),
+            fail_policy="drop_family",
+        ).build(source, language=language)
         assert result.provenance["adapter"].startswith("dropped:adapter_unavailable")
         return
 
@@ -376,7 +472,10 @@ def test_builtin_cpp_adapter_conforms_or_reports_unavailable() -> None:
     assert caps.language == "cpp"
     assert caps.families == ("syntax", "structure")
     if not caps.available:
-        result = InferenceSideChannelBuilder(TinyTokenizer()).build(
+        result = InferenceSideChannelBuilder(
+            TinyTokenizer(),
+            fail_policy="drop_family",
+        ).build(
             "int main() { return 0; }\n",
             language="cpp",
         )

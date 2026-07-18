@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -8,6 +10,7 @@ import pytest
 
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
@@ -17,6 +20,7 @@ from cppmega_mlx.training.objective_schedule import (
     CanonicalObjectivePlanner,
     GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
     assess_graph_positive_capability,
+    source_has_graph_candidate,
 )
 from cppmega_mlx.training.task_mixer import TaskKind
 from scripts import materialize_megatron_objectives as materializer
@@ -128,6 +132,90 @@ def test_materializer_and_runner_share_canonical_bounded_schedule_receipt() -> N
     )
     assert graph_assignment["task"] == TaskKind.CAUSAL_LM.value
     assert graph_assignment["graph_eligibility"]["eligible"] is True
+
+
+@pytest.mark.parametrize(
+    ("seed", "source_kinds", "graph_source_index", "graph_edge", "selected"),
+    (
+        (
+            6,
+            ("commit", "both", "code", "both", "code", "both", "commit", "commit"),
+            3,
+            (4, 1),
+            [0, 2, 3, 4, 6, 7],
+        ),
+        (
+            71,
+            ("both", "commit", "code", "commit", "code", "code", "both", "commit"),
+            0,
+            (6, 2),
+            [0, 1, 2, 3, 5, 7],
+        ),
+    ),
+)
+def test_repeated_quota_slots_preserve_graph_positive_assignment(
+    seed: int,
+    source_kinds: tuple[str, ...],
+    graph_source_index: int,
+    graph_edge: tuple[int, int],
+    selected: list[int],
+) -> None:
+    commit = CommitPacket(
+        pre_token_ids=_arr([10, 11]),
+        post_token_ids=_arr([20, 21]),
+        diff_token_ids=_arr([30, 31]),
+        commit_msg=_arr([40, 41]),
+    )
+    sources: list[ObjectiveSource] = []
+    for source_index, kind in enumerate(source_kinds):
+        code = _code_packet()
+        if source_index == graph_source_index:
+            code = replace(
+                code,
+                domain_edges=DomainEdgeIndex.from_triples(
+                    [(graph_edge[0], graph_edge[1], 60)]
+                ),
+            )
+        if kind == "commit":
+            sources.append(ObjectiveSource(commit_packet=commit))
+        elif kind == "code":
+            sources.append(ObjectiveSource(code_packet=code))
+        else:
+            sources.append(ObjectiveSource(code_packet=code, commit_packet=commit))
+
+    def graph_positive(source: ObjectiveSource, item) -> bool:
+        receipt = assess_graph_positive_capability(
+            item,
+            source,
+            graph_relations=("domain",),
+            require_route_sidecars=False,
+        )
+        return bool(receipt["eligible"])
+
+    realized = EligibilityAwareTaskMixer(
+        {TaskKind.FIM: 0.5, TaskKind.COMMIT_DIFF: 0.5},
+        seed=seed,
+    ).materialize_window_from_pool(
+        sources,
+        output_count=6,
+        required_realized_assignment=graph_positive,
+        candidate_assignment=lambda source, task: source_has_graph_candidate(
+            source,
+            task,
+            graph_relations=("domain",),
+        ),
+    )
+
+    assert [item.source_index for item in realized] == selected
+    assert Counter(item.task for item in realized) == {
+        TaskKind.FIM: 3,
+        TaskKind.COMMIT_DIFF: 3,
+    }
+    assert [
+        item.source_index
+        for item in realized
+        if graph_positive(sources[item.source_index], item)
+    ] == [graph_source_index]
 
 
 def test_graph_capability_receipts_use_realized_fim_ifim_routes_and_commit_exclusion() -> None:

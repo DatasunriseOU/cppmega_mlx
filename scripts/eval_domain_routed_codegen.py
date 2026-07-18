@@ -12,6 +12,7 @@ import argparse
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -35,6 +36,7 @@ from cppmega_mlx.data.diagnostic_parsers import (
     parse_test_output,
 )
 from cppmega_mlx.data.domain_prompt_graph import (
+    DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES,
     EVAL_EDGE_SIDECARS,
     EVAL_TOKEN_SIDECARS,
     build_domain_prompt_graph,
@@ -61,6 +63,10 @@ from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TOKENIZER = REPO_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
+DOMAIN_MODEL_COMPLETION_SCHEMA = "cppmega_domain_model_completion_v1"
+DOMAIN_MODEL_COMPLETION_SOURCE = "model_generation"
+DOMAIN_GENERATION_RECEIPT_SCHEMA = "cppmega_mlx_generation_receipt_v1"
+_MODEL_FINISH_REASONS = frozenset({"eos", "length"})
 
 _PROMPT_TOKEN_SIDECARS = (
     "token_domain_ids",
@@ -250,6 +256,29 @@ def _required_prompt_sidecars(
     return frozenset(required)
 
 
+def _required_prompt_edge_families(
+    required_domains: Sequence[str],
+    *,
+    context: str,
+) -> tuple[str, ...]:
+    """Return route families that a frozen prompt must publish non-empty."""
+
+    required_sidecars = _required_prompt_sidecars(
+        required_domains,
+        context=context,
+    )
+    required_families = {
+        _PROMPT_EDGE_FAMILIES[column]
+        for column in required_sidecars
+        if column in _PROMPT_EDGE_FAMILIES
+    }
+    return tuple(
+        family
+        for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+        if family in required_families
+    )
+
+
 def _validate_expected_sidecars(
     required_domains: Sequence[str],
     expected_sidecars: Sequence[str],
@@ -405,6 +434,23 @@ def validate_prompt_sidecars(
                 token_count=token_count,
                 context=context,
             )
+
+    required_families = _required_prompt_edge_families(
+        required_domains,
+        context=context,
+    )
+    edge_columns_by_family = {
+        family: column for column, family in _PROMPT_EDGE_FAMILIES.items()
+    }
+    empty_required = {
+        family: len(sidecars.get(edge_columns_by_family[family], ()))
+        for family in required_families
+        if not sidecars.get(edge_columns_by_family[family], ())
+    }
+    if empty_required:
+        raise ValueError(
+            f"{context}: required frozen edge families are empty {empty_required}"
+        )
 
     represented_domains = set(vectors["token_domain_ids"])
     for name in required_domains:
@@ -722,6 +768,7 @@ PASS_STATUSES = frozenset(
 FAIL_STATUSES = frozenset(
     {
         "missing_completion",
+        "completion_contract_failed",
         "not_compiled",
         "missing_compile_oracle",
         "missing_shell_oracle",
@@ -886,6 +933,37 @@ class DomainEvalPrompt:
     def static_prompt_sidecar_receipt(self) -> dict[str, Any]:
         return self.sidecar_receipt()
 
+    def required_edge_families(self) -> tuple[str, ...]:
+        return _required_prompt_edge_families(
+            self.required_domains,
+            context=f"prompt {self.id!r}",
+        )
+
+    def prompt_contract_payload(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "prompt": self.prompt,
+            "required_domains": list(self.required_domains),
+            "expected_sidecars": list(self.expected_sidecars),
+            "required_edge_families": list(self.required_edge_families()),
+            "prompt_token_ids": list(self.prompt_token_ids),
+            "prompt_sidecars": {
+                str(column): list(values)
+                for column, values in sorted(self.prompt_sidecars.items())
+            },
+            "prompt_graph": dict(self.prompt_graph_spec),
+        }
+
+    def prompt_contract_sha256(self) -> str:
+        return sha256(
+            json.dumps(
+                self.prompt_contract_payload(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
     @classmethod
     def from_row(
         cls, row: dict[str, Any], *, path: Path, line_no: int
@@ -967,6 +1045,27 @@ class DomainEvalPrompt:
                 )
             except ValueError as exc:
                 raise ValueError(str(exc)) from exc
+            raw_required_families = prompt_graph_spec.get(
+                "required_edge_families"
+            )
+            if not isinstance(raw_required_families, Sequence) or isinstance(
+                raw_required_families,
+                (str, bytes),
+            ):
+                raise ValueError(
+                    f"{path}:{line_no}: prompt_graph.required_edge_families "
+                    "must be a sequence"
+                )
+            declared_families = tuple(str(value) for value in raw_required_families)
+            expected_families = _required_prompt_edge_families(
+                required_domains,
+                context=f"{path}:{line_no}",
+            )
+            if declared_families != expected_families:
+                raise ValueError(
+                    f"{path}:{line_no}: prompt_graph.required_edge_families "
+                    f"{declared_families} != expected {expected_families}"
+                )
         if raw_token_ids is not None:
             if not isinstance(raw_token_ids, Sequence) or isinstance(
                 raw_token_ids, (str, bytes)
@@ -1045,26 +1144,296 @@ def load_prompts(path: Path) -> list[DomainEvalPrompt]:
     return prompts
 
 
-def load_completions(path: Path | None) -> dict[str, str]:
+def _is_sha256(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _prompt_edge_counts(prompt: DomainEvalPrompt) -> dict[str, int]:
+    edge_columns_by_family = {
+        family: column for column, family in _PROMPT_EDGE_FAMILIES.items()
+    }
+    return {
+        family: len(prompt.prompt_sidecars.get(edge_columns_by_family[family], ()))
+        for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+    }
+
+
+@dataclass(frozen=True)
+class DomainModelCompletion:
+    """One completion published by an actual model-generation run."""
+
+    id: str
+    completion: str
+    receipt: Mapping[str, Any]
+
+    @classmethod
+    def from_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        context: str = "completion",
+    ) -> "DomainModelCompletion":
+        if not isinstance(row, Mapping):
+            raise ValueError(f"{context}: completion row must be an object")
+        completion_id = row.get("id")
+        if not isinstance(completion_id, str) or not completion_id:
+            raise ValueError(f"{context}: completion row needs non-empty id")
+        completion = row.get("completion")
+        if not isinstance(completion, str) or not completion.strip():
+            raise ValueError(f"{context}: completion must be non-empty text")
+        if row.get("completion_source") != DOMAIN_MODEL_COMPLETION_SOURCE:
+            raise ValueError(
+                f"{context}: completion_source must be "
+                f"{DOMAIN_MODEL_COMPLETION_SOURCE!r}; gold fixtures are not eval inputs"
+            )
+        raw_receipt = row.get("publisher_receipt")
+        if not isinstance(raw_receipt, Mapping):
+            raise ValueError(
+                f"{context}: model-generated completion needs publisher_receipt"
+            )
+        receipt = dict(raw_receipt)
+        if receipt.get("schema") != DOMAIN_MODEL_COMPLETION_SCHEMA:
+            raise ValueError(
+                f"{context}: unsupported publisher receipt schema "
+                f"{receipt.get('schema')!r}"
+            )
+        if receipt.get("completion_source") != DOMAIN_MODEL_COMPLETION_SOURCE:
+            raise ValueError(
+                f"{context}: publisher receipt completion_source mismatch"
+            )
+        if receipt.get("prompt_id") != completion_id:
+            raise ValueError(f"{context}: publisher receipt prompt_id mismatch")
+        if not isinstance(receipt.get("model_id"), str) or not receipt["model_id"]:
+            raise ValueError(f"{context}: publisher receipt model_id is required")
+        generated_token_count = receipt.get("generated_token_count")
+        if isinstance(generated_token_count, bool):
+            raise ValueError(
+                f"{context}: publisher receipt generated_token_count must be positive"
+            )
+        try:
+            generated_token_count = int(generated_token_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{context}: publisher receipt generated_token_count must be positive"
+            ) from exc
+        if generated_token_count <= 0:
+            raise ValueError(
+                f"{context}: publisher receipt generated_token_count must be positive"
+            )
+        if receipt.get("finish_reason") not in _MODEL_FINISH_REASONS:
+            raise ValueError(
+                f"{context}: publisher receipt finish_reason must be one of "
+                f"{sorted(_MODEL_FINISH_REASONS)}"
+            )
+        completion_sha256 = sha256(completion.encode("utf-8")).hexdigest()
+        if receipt.get("completion_sha256") != completion_sha256:
+            raise ValueError(f"{context}: publisher receipt completion hash mismatch")
+        if not _is_sha256(receipt.get("prompt_contract_sha256")):
+            raise ValueError(
+                f"{context}: publisher receipt prompt_contract_sha256 is required"
+            )
+        generation_receipt = receipt.get("generation_receipt")
+        if not isinstance(generation_receipt, Mapping):
+            raise ValueError(
+                f"{context}: publisher receipt needs generation_receipt"
+            )
+        if generation_receipt.get("schema") != DOMAIN_GENERATION_RECEIPT_SCHEMA:
+            raise ValueError(
+                f"{context}: unsupported generation receipt schema "
+                f"{generation_receipt.get('schema')!r}"
+            )
+        generation_receipt_hash = sha256(
+            json.dumps(
+                generation_receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if receipt.get("generation_receipt_sha256") != generation_receipt_hash:
+            raise ValueError(
+                f"{context}: publisher generation receipt hash mismatch"
+            )
+        if generation_receipt.get("generated_token_count") != generated_token_count:
+            raise ValueError(
+                f"{context}: publisher and generation token counts mismatch"
+            )
+        if generation_receipt.get("finish_reason") != receipt.get("finish_reason"):
+            raise ValueError(
+                f"{context}: publisher and generation finish reasons mismatch"
+            )
+        return cls(
+            id=completion_id,
+            completion=completion,
+            receipt=receipt,
+        )
+
+    def validate_for_prompt(self, prompt: DomainEvalPrompt) -> None:
+        if self.id != prompt.id:
+            raise ValueError(
+                f"completion {self.id!r} is bound to prompt {prompt.id!r}"
+            )
+        expected_contract_hash = prompt.prompt_contract_sha256()
+        if self.receipt.get("prompt_contract_sha256") != expected_contract_hash:
+            raise ValueError(
+                f"prompt {prompt.id!r}: model completion was published for a "
+                "different frozen prompt contract"
+            )
+        expected_families = list(prompt.required_edge_families())
+        if self.receipt.get("required_edge_families") != expected_families:
+            raise ValueError(
+                f"prompt {prompt.id!r}: model completion edge-family contract "
+                "does not match the frozen prompt"
+            )
+        expected_counts = _prompt_edge_counts(prompt)
+        if self.receipt.get("edge_counts") != expected_counts:
+            raise ValueError(
+                f"prompt {prompt.id!r}: model completion edge counts do not "
+                "match the frozen prompt"
+            )
+        generation_counts = self.receipt["generation_receipt"].get(
+            "edge_family_route_counts"
+        )
+        if prompt.required_edge_families():
+            if not isinstance(generation_counts, Mapping):
+                raise ValueError(
+                    f"prompt {prompt.id!r}: generation receipt has no per-family "
+                    "route counts"
+                )
+            normalized_generation_counts = {
+                family: int(generation_counts.get(family, -1))
+                for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+            }
+            if normalized_generation_counts != expected_counts:
+                raise ValueError(
+                    f"prompt {prompt.id!r}: generation receipt edge-family "
+                    "counts do not match the frozen prompt"
+                )
+
+
+def publish_model_completion(
+    prompt: DomainEvalPrompt,
+    completion: str,
+    *,
+    model_id: str,
+    generation_receipt: Mapping[str, Any],
+    generated_token_count: int | None = None,
+    finish_reason: str | None = None,
+) -> dict[str, Any]:
+    """Create the only completion row accepted by the domain evaluator."""
+
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("model_id must be non-empty")
+    if not isinstance(completion, str) or not completion.strip():
+        raise ValueError("completion must be non-empty")
+    if not isinstance(generation_receipt, Mapping):
+        raise ValueError("generation_receipt must be an object")
+    if generation_receipt.get("schema") != DOMAIN_GENERATION_RECEIPT_SCHEMA:
+        raise ValueError(
+            "generation_receipt has unsupported schema "
+            f"{generation_receipt.get('schema')!r}"
+        )
+    receipt_generated_count = generation_receipt.get("generated_token_count")
+    receipt_finish_reason = generation_receipt.get("finish_reason")
+    if generated_token_count is None:
+        generated_token_count = receipt_generated_count
+    if finish_reason is None:
+        finish_reason = receipt_finish_reason
+    if isinstance(receipt_generated_count, bool):
+        raise ValueError("generation receipt token count must be positive")
+    try:
+        receipt_generated_count = int(receipt_generated_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("generation receipt token count must be positive") from exc
+    if isinstance(generated_token_count, bool):
+        raise ValueError("generated_token_count must be positive")
+    try:
+        generated_token_count = int(generated_token_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("generated_token_count must be positive") from exc
+    if generated_token_count <= 0 or receipt_generated_count <= 0:
+        raise ValueError("generated_token_count must be positive")
+    if finish_reason not in _MODEL_FINISH_REASONS:
+        raise ValueError(f"unsupported finish_reason {finish_reason!r}")
+    if receipt_generated_count != generated_token_count:
+        raise ValueError("generation receipt token count does not match publisher row")
+    if receipt_finish_reason != finish_reason:
+        raise ValueError("generation receipt finish reason does not match publisher row")
+    required_families = prompt.required_edge_families()
+    if required_families:
+        generation_counts = generation_receipt.get("edge_family_route_counts")
+        if not isinstance(generation_counts, Mapping):
+            raise ValueError(
+                "generation receipt must carry per-family route counts"
+            )
+        expected_counts = _prompt_edge_counts(prompt)
+        actual_counts = {
+            family: int(generation_counts.get(family, -1))
+            for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+        }
+        if actual_counts != expected_counts:
+            raise ValueError(
+                "generation receipt edge-family counts do not match the prompt"
+            )
+    normalized_generation_receipt = dict(generation_receipt)
+    generation_receipt_sha256 = sha256(
+        json.dumps(
+            normalized_generation_receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt = {
+        "schema": DOMAIN_MODEL_COMPLETION_SCHEMA,
+        "completion_source": DOMAIN_MODEL_COMPLETION_SOURCE,
+        "prompt_id": prompt.id,
+        "model_id": model_id,
+        "generated_token_count": generated_token_count,
+        "finish_reason": finish_reason,
+        "completion_sha256": sha256(completion.encode("utf-8")).hexdigest(),
+        "prompt_contract_sha256": prompt.prompt_contract_sha256(),
+        "required_edge_families": list(prompt.required_edge_families()),
+        "edge_counts": _prompt_edge_counts(prompt),
+        "generation_receipt": normalized_generation_receipt,
+        "generation_receipt_sha256": generation_receipt_sha256,
+    }
+    row = {
+        "id": prompt.id,
+        "completion": completion,
+        "completion_source": DOMAIN_MODEL_COMPLETION_SOURCE,
+        "publisher_receipt": receipt,
+    }
+    DomainModelCompletion.from_row(row, context=f"prompt {prompt.id!r}")
+    return row
+
+
+def load_completions(path: Path | None) -> dict[str, DomainModelCompletion]:
     if path is None:
         return {}
-    completions: dict[str, str] = {}
+    completions: dict[str, DomainModelCompletion] = {}
     with path.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
-            if "id" not in row or "completion" not in row:
-                raise ValueError(
-                    f"{path}:{line_no}: completion rows need id and completion"
-                )
-            completion_id = str(row["id"])
+            completion = DomainModelCompletion.from_row(
+                row,
+                context=f"{path}:{line_no}",
+            )
+            completion_id = completion.id
             if completion_id in completions:
                 raise ValueError(
                     f"{path}:{line_no}: duplicate completion id {completion_id!r}"
                 )
-            completions[completion_id] = str(row["completion"])
+            completions[completion_id] = completion
     return completions
 
 
@@ -1836,6 +2205,22 @@ def build_prompt_graph_for_prompt(
         prompt.prompt_graph_spec,
         context=f"prompt {prompt.id!r} prompt_graph",
     )
+    expected_families = prompt.required_edge_families()
+    if graph.required_edge_families != expected_families:
+        raise ValueError(
+            f"prompt {prompt.id!r}: prompt graph required edge families "
+            f"{graph.required_edge_families} != expected {expected_families}"
+        )
+    empty_required = {
+        family: graph.edge_counts[family]
+        for family in expected_families
+        if graph.edge_counts[family] <= 0
+    }
+    if empty_required:
+        raise ValueError(
+            f"prompt {prompt.id!r}: prompt graph published empty required "
+            f"edge families {empty_required}"
+        )
     if not prompt.prompt_token_ids or not prompt.prompt_sidecars:
         raise ValueError(
             f"prompt {prompt.id!r}: production prompt graph requires frozen token sidecars"
@@ -1882,46 +2267,41 @@ def _static_prompt_sidecar_check(prompt: DomainEvalPrompt) -> dict[str, Any]:
             part_ranges=prompt.prompt_graph_spec.get("part_ranges")
             if prompt.prompt_graph_spec
             else None,
+            required_edge_families=prompt.required_edge_families(),
             context=f"prompt {prompt.id!r}",
         )
     except ValueError as exc:
         return _failure("static_prompt_sidecars_failed", str(exc))
 
-    domain_ids = [int(value) for value in prompt.prompt_sidecars["token_domain_ids"]]
-    required_domain_ids = set(
-        _prompt_domain_id(name, context=f"prompt {prompt.id!r}")
-        for name in prompt.required_domains
-    )
-    diagnostic_edges = prompt.prompt_sidecars.get("token_diagnostic_edges", ())
-    cross_edges = prompt.prompt_sidecars.get("token_cross_domain_edges", ())
-    if any(
-        DomainKind(int(domain_id)) in _DIAGNOSTIC_DOMAINS
-        for domain_id in required_domain_ids
-    ) and not diagnostic_edges:
+    required_families = prompt.required_edge_families()
+    edge_columns_by_family = {
+        family: column for column, family in _PROMPT_EDGE_FAMILIES.items()
+    }
+    edge_counts = {
+        family: len(
+            prompt.prompt_sidecars.get(edge_columns_by_family[family], ())
+        )
+        for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+    }
+    empty_required = {
+        family: edge_counts[family]
+        for family in required_families
+        if edge_counts[family] <= 0
+    }
+    if empty_required:
         return _failure(
             "static_prompt_sidecars_failed",
-            "diagnostic required domain has no token_diagnostic_edges",
+            f"required frozen edge families are empty {empty_required}",
         )
-    if len(required_domain_ids) > 1:
-        if not cross_edges:
-            return _failure(
-                "static_prompt_sidecars_failed",
-                "multiple required domains need token_cross_domain_edges",
-            )
-        if not any(
-            domain_ids[int(edge["from"])] != domain_ids[int(edge["to"])]
-            for edge in cross_edges
-        ):
-            return _failure(
-                "static_prompt_sidecars_failed",
-                "token_cross_domain_edges must connect distinct domain ids",
-            )
     receipt = prompt.static_prompt_sidecar_receipt()
     return {
         "status": "static_prompt_sidecars_passed",
         "required_domains": list(prompt.required_domains),
-        "cross_domain_edges": len(cross_edges),
-        "diagnostic_edges": len(diagnostic_edges),
+        "required_edge_families": list(required_families),
+        "edge_counts": edge_counts,
+        "cross_domain_edges": edge_counts["cross_domain"],
+        "diagnostic_edges": edge_counts["diagnostic"],
+        "shell_edges": edge_counts["shell"],
         "prompt_graph_schema": frozen_graph.schema,
         "prompt_graph_artifact_sha256": frozen_graph.receipt["artifact_sha256"],
         "prompt_graph_part_ranges": [list(item) for item in frozen_graph.part_ranges],
@@ -2004,15 +2384,18 @@ def run_prompt_oracle(
 
 def evaluate(
     prompts: list[DomainEvalPrompt],
-    completions: dict[str, str],
+    completions: Mapping[str, DomainModelCompletion],
     *,
     compile: bool = True,
     tool_overrides: ToolOverrides | None = None,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for prompt in prompts:
-        completion = completions.get(prompt.id)
-        has_completion = completion is not None and bool(completion.strip())
+        published = completions.get(prompt.id)
+        has_completion = (
+            isinstance(published, DomainModelCompletion)
+            and bool(published.completion.strip())
+        )
         row: dict[str, Any] = {
             "id": prompt.id,
             "task_type": prompt.task_type,
@@ -2023,20 +2406,41 @@ def evaluate(
             "has_completion": has_completion,
         }
         if not has_completion:
-            row["status"] = "missing_completion"
+            row["status"] = (
+                "missing_completion"
+                if published is None
+                else "completion_contract_failed"
+            )
+            if published is not None:
+                row["reason"] = (
+                    "completion input must be a validated model-generated "
+                    "publisher row"
+                )
+                row["failed_closed"] = True
         else:
-            assert completion is not None
-            row["completion_chars"] = len(completion)
-            if compile:
+            assert isinstance(published, DomainModelCompletion)
+            try:
+                published.validate_for_prompt(prompt)
+            except ValueError as exc:
                 row.update(
-                    run_prompt_oracle(
-                        prompt,
-                        completion,
-                        tool_overrides=tool_overrides,
+                    _failure(
+                        "completion_contract_failed",
+                        str(exc),
                     )
                 )
             else:
-                row["status"] = "not_compiled"
+                row["completion_chars"] = len(published.completion)
+                row["completion_source"] = DOMAIN_MODEL_COMPLETION_SOURCE
+                if compile:
+                    row.update(
+                        run_prompt_oracle(
+                            prompt,
+                            published.completion,
+                            tool_overrides=tool_overrides,
+                        )
+                    )
+                else:
+                    row["status"] = "not_compiled"
         rows.append(row)
     status_counts = Counter(str(row.get("status")) for row in rows)
     known_statuses = PASS_STATUSES | FAIL_STATUSES
@@ -2051,7 +2455,10 @@ def evaluate(
         "completion_rows": len(completions),
         "oracle_passed": sum(status_counts[status] for status in PASS_STATUSES),
         "completion_derived_oracle_passed": sum(
-            status_counts[status] for status in PASS_STATUSES
+            1
+            for row in rows
+            if row.get("completion_source") == DOMAIN_MODEL_COMPLETION_SOURCE
+            and row.get("status") in PASS_STATUSES
         ),
         "failed": failed,
         "passed": failed == 0,

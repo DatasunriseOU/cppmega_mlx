@@ -84,12 +84,23 @@ def _clean_test_revision_snapshot() -> dict:
         "worktree_dirty": False,
         "untracked_source_dirty": False,
         "relevant_scope_sha256": empty_sha,
+        "source_tree_sha256": empty_sha,
+        "indexer_dependency_closure_sha256": empty_sha,
         "relevant_pathspecs": list(conv.CODE_REVISION_PATHS),
         "bounds": {},
         "status_sha256": empty_sha,
         "index_diff_sha256": empty_sha,
         "worktree_diff_sha256": empty_sha,
         "untracked_sources_sha256": empty_sha,
+        "indexer_provenance": {
+            "schema": "cppmega_indexer_dependency_binding_v1",
+            "path": "tools/clang_indexer/index_project.py",
+            "source_sha256": empty_sha,
+            "dependency_closure_sha256": empty_sha,
+            "dependency_manifest": {
+                "tools/clang_indexer/index_project.py": empty_sha,
+            },
+        },
     }
 
 
@@ -98,7 +109,7 @@ def _fake_bounded_git_output(repo_root, args, *, max_bytes):
     del repo_root, max_bytes
     if tuple(args[:2]) == ("rev-parse", "--verify"):
         return f"{TEST_CODE_REVISION}\n".encode("ascii")
-    if args and args[0] in {"status", "diff", "ls-files"}:
+    if args and args[0] in {"status", "diff", "ls-files", "ls-tree"}:
         return b""
     raise AssertionError(f"unexpected revision-guard git command: {args}")
 

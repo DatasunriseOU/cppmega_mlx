@@ -91,7 +91,8 @@ SideChannelSpec(
     },
     inference=InferenceEnrichmentSpec(
         source="auto",  # none | prompt_only | parse_if_possible | project_index
-        fail_policy="drop_family",  # drop_family | text_only | error
+        fail_policy="error",  # error by default
+        # drop_family/text_only are explicit opt-ins
         timeout_ms=500,
     ),
 )
@@ -192,7 +193,9 @@ Initial adapters:
 - Go: `go/packages` or `gopls` adapter later.
 - Python: `ast` plus optional type/index provider later.
 
-Fallback must be explicit:
+Fallback must be explicit. The inference builder defaults to fail-closed
+`error`; a caller that intentionally runs a graphless/general-purpose model
+must select one of the degraded policies and retain its receipt:
 
 - `drop_family`: omit unavailable family and record provenance.
 - `text_only`: run the model without all side channels.

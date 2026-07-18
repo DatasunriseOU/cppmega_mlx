@@ -20,7 +20,6 @@ from cppmega_mlx.data.domain_schema import (
     DomainKind,
     DomainRoleKind,
     ParseConfidence,
-    delimiter_token_ids,
     domain_edge_family,
     validate_domain_edge_kind,
 )
@@ -54,6 +53,13 @@ EVAL_EDGE_SIDECARS = (
     schema.TOKEN_DIAGNOSTIC_EDGES_COLUMN,
     schema.TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
 )
+DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES = (
+    "domain",
+    "build",
+    "shell",
+    "diagnostic",
+    "cross_domain",
+)
 _EDGE_COLUMN_FAMILIES = {
     schema.TOKEN_DOMAIN_EDGES_COLUMN: "domain",
     schema.TOKEN_BUILD_EDGES_COLUMN: "build",
@@ -82,6 +88,36 @@ def _stable_json(value: Any) -> str:
 
 def _sha_json(value: Any) -> str:
     return sha256(_stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _normalize_required_edge_families(
+    values: Sequence[Any] | None,
+    *,
+    context: str,
+) -> tuple[str, ...]:
+    """Normalize the edge families a frozen publisher promises to retain."""
+
+    raw = () if values is None else values
+    if isinstance(raw, (str, bytes)):
+        raise ValueError(f"{context}: required_edge_families must be a sequence")
+    try:
+        names = tuple(str(value) for value in raw)
+    except TypeError as exc:
+        raise ValueError(
+            f"{context}: required_edge_families must be a sequence"
+        ) from exc
+    if len(set(names)) != len(names):
+        raise ValueError(f"{context}: required_edge_families must not contain duplicates")
+    unknown = set(names) - set(DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES)
+    if unknown:
+        raise ValueError(
+            f"{context}: unknown required edge families {sorted(unknown)}"
+        )
+    return tuple(
+        family
+        for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+        if family in names
+    )
 
 
 def _domain_marker_name(domain: DomainKind) -> str:
@@ -179,6 +215,7 @@ class DomainPromptGraphWindow:
     edge_sidecars: Mapping[str, list[dict[str, int]]]
     receipt: Mapping[str, Any]
     token_count: int
+    required_edge_families: tuple[str, ...] = ()
 
     def dense_relation_attention_bias(
         self,
@@ -259,6 +296,7 @@ class DomainPromptGraph:
     side_channels: Mapping[str, list[int]]
     part_ranges: tuple[tuple[int, int], ...]
     receipt: Mapping[str, Any]
+    required_edge_families: tuple[str, ...] = ()
     schema: str = DOMAIN_PROMPT_GRAPH_SCHEMA
 
     def validate(self) -> None:
@@ -327,6 +365,42 @@ class DomainPromptGraph:
                 raise ValueError(
                     f"domain prompt graph part range [{start},{end}) is invalid"
                 )
+        normalized_required = _normalize_required_edge_families(
+            self.required_edge_families,
+            context="domain prompt graph",
+        )
+        receipt_required = _normalize_required_edge_families(
+            self.receipt.get("required_edge_families", ()),
+            context="domain prompt graph receipt",
+        )
+        if receipt_required != normalized_required:
+            raise ValueError(
+                "domain prompt graph receipt required_edge_families mismatch: "
+                f"actual={normalized_required} receipt={receipt_required}"
+            )
+        actual_edge_counts = self.edge_counts
+        receipt_edge_counts = self.receipt.get("edge_counts")
+        if not isinstance(receipt_edge_counts, Mapping):
+            raise ValueError("domain prompt graph receipt edge_counts must be an object")
+        normalized_receipt_counts = {
+            family: int(receipt_edge_counts.get(family, -1))
+            for family in DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES
+        }
+        if normalized_receipt_counts != actual_edge_counts:
+            raise ValueError(
+                "domain prompt graph receipt edge_counts mismatch: "
+                f"actual={actual_edge_counts} receipt={normalized_receipt_counts}"
+            )
+        missing_required = {
+            family: actual_edge_counts[family]
+            for family in normalized_required
+            if actual_edge_counts[family] <= 0
+        }
+        if missing_required:
+            raise ValueError(
+                "domain prompt graph required edge families are empty: "
+                f"{missing_required}"
+            )
         if self.receipt.get("schema") != DOMAIN_PROMPT_GRAPH_SCHEMA:
             raise ValueError("domain prompt graph receipt schema mismatch")
         if int(self.receipt.get("token_count", -1)) != token_count:
@@ -414,16 +488,28 @@ class DomainPromptGraph:
             "total_token_count": total_token_count,
             "token_count": window_end - window_start,
             "generated_token_count": generated_count,
+            "required_edge_families": list(self.required_edge_families),
             "edge_counts": {
                 _EDGE_COLUMN_FAMILIES[column]: len(visible_edges[column])
                 for column in EVAL_EDGE_SIDECARS
             },
         }
+        missing_required = {
+            family: receipt["edge_counts"][family]
+            for family in self.required_edge_families
+            if receipt["edge_counts"][family] <= 0
+        }
+        if missing_required:
+            raise ValueError(
+                "domain prompt graph generation window dropped required edge "
+                f"families: {missing_required}"
+            )
         return DomainPromptGraphWindow(
             side_channels=side_channels,
             edge_sidecars=visible_edges,
             receipt=receipt,
             token_count=window_end - window_start,
+            required_edge_families=self.required_edge_families,
         )
 
 
@@ -552,6 +638,10 @@ def build_domain_prompt_graph(
         )
     if not parts:
         raise ValueError(f"{context}: prompt graph needs at least one part")
+    required_edge_families = _normalize_required_edge_families(
+        spec.get("required_edge_families", ()),
+        context=context,
+    )
 
     merged_token_ids: list[int] = []
     merged_sidecars: dict[str, list[Any]] = {
@@ -659,6 +749,7 @@ def build_domain_prompt_graph(
         },
         "part_ranges": [list(item) for item in part_ranges],
         "rendered_prompt": "".join(part.rendered_text() for part in parts),
+        "required_edge_families": list(required_edge_families),
     }
     receipt = {
         "schema": DOMAIN_PROMPT_GRAPH_SCHEMA,
@@ -667,6 +758,7 @@ def build_domain_prompt_graph(
         "part_domains": [
             None if part.domain is None else part.domain.name for part in parts
         ],
+        "required_edge_families": list(required_edge_families),
         "edge_counts": {
             _EDGE_COLUMN_FAMILIES[column]: len(eval_sidecars[column])
             for column in EVAL_EDGE_SIDECARS
@@ -682,6 +774,7 @@ def build_domain_prompt_graph(
         side_channels=side_channels,
         part_ranges=tuple(part_ranges),
         receipt=receipt,
+        required_edge_families=required_edge_families,
     )
     graph.validate()
     return graph
@@ -692,6 +785,7 @@ def domain_prompt_graph_from_frozen(
     sidecars: Mapping[str, Sequence[Any]],
     *,
     part_ranges: Sequence[Sequence[int]] | None = None,
+    required_edge_families: Sequence[Any] | None = None,
     context: str = "frozen domain prompt graph",
 ) -> DomainPromptGraph:
     normalized_sidecars: dict[str, tuple[Any, ...]] = {}
@@ -717,6 +811,10 @@ def domain_prompt_graph_from_frozen(
         if part_ranges is None
         else tuple((int(row[0]), int(row[1])) for row in part_ranges)
     )
+    normalized_required = _normalize_required_edge_families(
+        required_edge_families,
+        context=context,
+    )
     side_channels = {name: [0] * token_count for name in TOKEN_SIDECAR_NAMES}
     for name, column in _MODEL_SIDECAR_COLUMNS.items():
         side_channels[name] = [
@@ -729,12 +827,14 @@ def domain_prompt_graph_from_frozen(
             for column, values in sorted(normalized_sidecars.items())
         },
         "part_ranges": [list(item) for item in ranges],
+        "required_edge_families": list(normalized_required),
     }
     receipt = {
         "schema": DOMAIN_PROMPT_GRAPH_SCHEMA,
         "token_count": token_count,
         "part_count": len(ranges),
         "part_domains": [],
+        "required_edge_families": list(normalized_required),
         "edge_counts": {
             _EDGE_COLUMN_FAMILIES[column]: len(normalized_sidecars[column])
             for column in EVAL_EDGE_SIDECARS
@@ -748,6 +848,7 @@ def domain_prompt_graph_from_frozen(
         side_channels=side_channels,
         part_ranges=ranges,
         receipt=receipt,
+        required_edge_families=normalized_required,
     )
     graph.validate()
     return graph
@@ -759,6 +860,7 @@ __all__ = [
     "DomainPromptGraph",
     "DomainPromptGraphWindow",
     "DomainPromptPart",
+    "DOMAIN_PROMPT_GRAPH_EDGE_FAMILIES",
     "EVAL_EDGE_SIDECARS",
     "EVAL_TOKEN_SIDECARS",
     "build_domain_prompt_graph",

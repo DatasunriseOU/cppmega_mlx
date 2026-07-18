@@ -33,6 +33,7 @@ def _route_spec() -> dict:
                 "text": "ninja: build stopped: subcommand failed with exit code 1\n",
             },
         ],
+        "required_edge_families": ["shell", "diagnostic", "cross_domain"],
         "cross_domain_edges": [
             {
                 "from_part": 0,
@@ -57,6 +58,11 @@ def test_domain_prompt_graph_builds_typed_sidecars_and_cross_route() -> None:
         "diagnostic": 2,
         "cross_domain": 1,
     }
+    assert graph.required_edge_families == (
+        "shell",
+        "diagnostic",
+        "cross_domain",
+    )
     assert graph.eval_sidecars["token_cross_domain_edges"] == (
         {"from": 2, "to": 21, "kind": 100},
     )
@@ -95,8 +101,74 @@ def test_domain_prompt_graph_frozen_round_trip_preserves_edge_families() -> None
         graph.token_ids,
         graph.eval_sidecars,
         part_ranges=graph.part_ranges,
+        required_edge_families=graph.required_edge_families,
     )
 
     assert frozen.token_ids == graph.token_ids
     assert frozen.eval_sidecars == graph.eval_sidecars
     assert frozen.part_ranges == graph.part_ranges
+    assert frozen.required_edge_families == graph.required_edge_families
+
+
+@pytest.mark.parametrize(
+    "family",
+    ["shell", "diagnostic", "cross_domain"],
+)
+def test_frozen_generation_requires_each_edge_family_to_be_non_empty(family: str) -> None:
+    graph = build_domain_prompt_graph(_tokenizer(), _route_spec())
+    sidecars = {
+        column: list(values) for column, values in graph.eval_sidecars.items()
+    }
+    column = {
+        "shell": "token_shell_edges",
+        "diagnostic": "token_diagnostic_edges",
+        "cross_domain": "token_cross_domain_edges",
+    }[family]
+    sidecars[column] = []
+
+    with pytest.raises(ValueError, match="required edge families are empty"):
+        domain_prompt_graph_from_frozen(
+            graph.token_ids,
+            sidecars,
+            part_ranges=graph.part_ranges,
+            required_edge_families=(family,),
+        )
+
+
+@pytest.mark.parametrize(
+    "family",
+    ["shell", "diagnostic", "cross_domain"],
+)
+def test_frozen_generation_window_receipt_keeps_each_edge_family(family: str) -> None:
+    graph = build_domain_prompt_graph(_tokenizer(), _route_spec())
+
+    window = graph.model_inputs(
+        total_token_count=len(graph.token_ids) + 1,
+        window_start=0,
+        window_end=len(graph.token_ids),
+    )
+
+    assert window.receipt["required_edge_families"] == [
+        "shell",
+        "diagnostic",
+        "cross_domain",
+    ]
+    assert window.receipt["edge_counts"][family] > 0
+    assert window.edge_sidecars[
+        {
+            "shell": "token_shell_edges",
+            "diagnostic": "token_diagnostic_edges",
+            "cross_domain": "token_cross_domain_edges",
+        }[family]
+    ]
+
+
+def test_frozen_generation_fails_when_a_required_route_leaves_the_window() -> None:
+    graph = build_domain_prompt_graph(_tokenizer(), _route_spec())
+
+    with pytest.raises(ValueError, match="dropped required edge families"):
+        graph.model_inputs(
+            total_token_count=len(graph.token_ids) + 1,
+            window_start=4,
+            window_end=len(graph.token_ids),
+        )

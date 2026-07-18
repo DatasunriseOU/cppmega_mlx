@@ -21,6 +21,11 @@ from cppmega_mlx.inference import (
     next_token_logits,
     stream_generate_tokens,
 )
+from cppmega_mlx.inference.generation import (
+    _model_kwargs_for_generated_step,
+    _model_kwargs_for_prefix,
+    _model_kwargs_for_slice,
+)
 from cppmega_mlx.models.hybrid_lm import HybridTinyConfig, HybridTinyLM
 
 
@@ -385,6 +390,41 @@ def test_generate_tokens_threads_enriched_prompt_model_kwargs() -> None:
             kwargs["platform_ids"],
             np.array([[2, 64, 0]], dtype=np.int32),
         )
+
+
+def test_generation_aligns_square_graph_biases_across_prefix_and_slices() -> None:
+    graph_bias = mx.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=mx.float32)
+
+    prefix = _model_kwargs_for_prefix(
+        {"block_bias": graph_bias},
+        mx.zeros((1, 3), dtype=mx.int32),
+    )["block_bias"]
+    np.testing.assert_array_equal(
+        _as_numpy(prefix),
+        np.array(
+            [[[1.0, 2.0, 0.0], [3.0, 4.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=np.float32,
+        ),
+    )
+
+    sliced = _model_kwargs_for_slice(
+        {"block_bias": graph_bias},
+        start=1,
+        tokens=mx.zeros((1, 2), dtype=mx.int32),
+    )["block_bias"]
+    np.testing.assert_array_equal(
+        _as_numpy(sliced),
+        np.array([[[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]]], dtype=np.float32),
+    )
+
+    generated = _model_kwargs_for_generated_step(
+        {"block_bias": graph_bias},
+        mx.zeros((1, 1), dtype=mx.int32),
+        start=2,
+        key_length=3,
+    )["block_bias"]
+    assert generated.shape == (1, 1, 3)
+    assert float(mx.sum(mx.abs(generated)).item()) == 0.0
 
 
 def test_generate_tokens_freezes_domain_prompt_sidecars_and_graph_constants() -> None:

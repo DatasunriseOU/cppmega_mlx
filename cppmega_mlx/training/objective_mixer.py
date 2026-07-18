@@ -692,6 +692,10 @@ class EligibilityAwareTaskMixer:
                 "required_assignment and required_realized_assignment are mutually "
                 "exclusive"
             )
+        if candidate_assignment is not None and required_realized_assignment is None:
+            raise ValueError(
+                "candidate_assignment requires required_realized_assignment"
+            )
 
         if output_count < 0:
             raise ValueError(f"output_count must be >=0, got {output_count}")
@@ -778,19 +782,25 @@ class EligibilityAwareTaskMixer:
                     return None, slot_index
             return packet_owner, None
 
-        first_slot_by_task: dict[TaskKind, int] = {}
+        slot_indices_by_task: dict[TaskKind, list[int]] = {}
         for slot_index, task in enumerate(slots):
-            first_slot_by_task.setdefault(task, slot_index)
+            slot_indices_by_task.setdefault(task, []).append(slot_index)
 
         def forced_candidate_pairs(
             predicate: Callable[[SourceInput, TaskKind], bool],
         ) -> list[tuple[int, int]]:
-            pairs = [
-                (packet_index, first_slot_by_task[task])
-                for packet_index, packet in enumerate(packets)
-                for task in eligibility[packet_index][0]
-                if task in first_slot_by_task and predicate(packet, task)
-            ]
+            # Enumerate forced candidate edges, not complete assignments.  Each edge
+            # gets at most one augmenting-path matching attempt below, keeping
+            # the search polynomial in the bounded source/slot graph.
+            pairs: list[tuple[int, int]] = []
+            for packet_index, packet in enumerate(packets):
+                for task in eligibility[packet_index][0]:
+                    task_slots = slot_indices_by_task.get(task)
+                    if task_slots is None or not predicate(packet, task):
+                        continue
+                    pairs.extend(
+                        (packet_index, slot_index) for slot_index in task_slots
+                    )
             pairs.sort(
                 key=lambda pair: (
                     len(candidate_packets[pair[1]]),

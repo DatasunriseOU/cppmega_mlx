@@ -47,11 +47,25 @@ _SIDE_CHANNEL_FAMILY_FIELDS: Mapping[str, tuple[str, ...]] = {
     "syntax": ("ast_depth_ids", "sibling_index_ids", "node_type_ids"),
     "structure": ("structure_ids", "dep_levels"),
 }
+_DOMAIN_ROUTE_FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "domain_ids": ("token_domain_ids",),
+    "role_ids": ("token_role_ids",),
+    "entity_ids": ("token_entity_ids",),
+    "scope_ids": ("token_scope_ids",),
+    "source_doc_ids": ("token_source_doc_ids",),
+    "source_identity_ids": ("token_source_identity_ids",),
+    "confidence_ids": ("token_confidence_ids",),
+}
 
 
 @dataclass(frozen=True)
 class LMTokenBatch:
-    """A dense next-token LM batch plus optional cppmega structure side-channels."""
+    """A dense next-token LM batch plus optional cppmega structure side-channels.
+
+    Persisted ``token_*`` domain aliases are accepted in the domain side-channel
+    family, but only canonical ``domain_ids``/``role_ids``/``confidence_ids``
+    names are exposed to model kwargs.
+    """
 
     tokens: mx.array
     target_tokens: mx.array | None = None
@@ -156,24 +170,13 @@ class LMTokenBatch:
                 mx.eval(has_negative)
                 if bool(has_negative.item()):
                     raise ValueError("platform_ids must be non-negative")
-        for name, value in self.domain_route_fields().items():
+        if self.side_channels is not None:
+            _validate_side_channel_map(self.side_channels)
+        resolved_domain_routes = self.resolved_domain_route_fields()
+        for name, value in resolved_domain_routes.items():
             if value is not None and value.shape != self.tokens.shape:
                 raise ValueError(
                     f"{name} must match tokens shape {self.tokens.shape}, got {value.shape}"
-                )
-        nested_domain_routes = (
-            None if self.side_channels is None else self.side_channels.get("domain_routes")
-        )
-        if nested_domain_routes is not None:
-            duplicated = sorted(
-                name
-                for name, value in self.domain_route_fields().items()
-                if value is not None and nested_domain_routes.get(name) is not None
-            )
-            if duplicated:
-                raise ValueError(
-                    "domain routes cannot be provided both directly and through "
-                    f"side_channels.domain_routes: {duplicated}"
                 )
         if self.graph_batch is not None:
             if not isinstance(self.graph_batch, GraphBatch):
@@ -205,8 +208,6 @@ class LMTokenBatch:
                         f"{name} must be shaped for model inputs as {expected}, "
                         f"got {tuple(value.shape)}"
                     )
-        if self.side_channels is not None:
-            _validate_side_channel_map(self.side_channels)
         if self.metadata is not None and not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a mapping when provided")
 
@@ -260,6 +261,25 @@ class LMTokenBatch:
             "confidence_ids": self.confidence_ids,
         }
 
+    def resolved_domain_route_fields(self) -> dict[str, mx.array | None]:
+        """Return canonical model-facing domain routes without alias ambiguity."""
+
+        nested = _canonical_domain_route_channels(
+            None
+            if self.side_channels is None
+            else self.side_channels.get("domain_routes")
+        )
+        resolved: dict[str, mx.array | None] = {}
+        for field_name, direct in self.domain_route_fields().items():
+            nested_value = nested.get(field_name)
+            if direct is not None and nested_value is not None:
+                raise ValueError(
+                    "domain routes cannot be provided both directly and through "
+                    f"side_channels.domain_routes: {field_name}"
+                )
+            resolved[field_name] = direct if direct is not None else nested_value
+        return resolved
+
     def model_kwargs(self) -> dict[str, Any]:
         kwargs = {
             name: self._input_aligned(value)
@@ -281,15 +301,7 @@ class LMTokenBatch:
             kwargs["block_bias"] = self.graph_attention_bias
         if self.graph_edge_kind_bias is not None:
             kwargs["edge_kind_bias"] = self.graph_edge_kind_bias
-        direct_domain_routes = self.domain_route_fields()
-        if self.side_channels is not None:
-            domain_routes = self.side_channels.get("domain_routes")
-            if domain_routes is not None:
-                for field_name in ("domain_ids", "role_ids", "confidence_ids"):
-                    value = domain_routes.get(field_name)
-                    if value is not None:
-                        kwargs[field_name] = self._input_aligned(value)
-        for field_name, value in direct_domain_routes.items():
+        for field_name, value in self.resolved_domain_route_fields().items():
             if value is not None:
                 kwargs[field_name] = self._input_aligned(value)
         return kwargs
@@ -308,7 +320,24 @@ class LMTokenBatch:
                     out[family][field_name] = value
         if self.side_channels is not None:
             for family, columns in self.side_channels.items():
-                out.setdefault(family, {}).update(dict(columns))
+                if family == "domain_routes":
+                    canonical = _canonical_domain_route_channels(columns)
+                    out.setdefault(family, {}).update(canonical)
+                    alias_names = {
+                        alias
+                        for aliases in _DOMAIN_ROUTE_FIELD_ALIASES.values()
+                        for alias in aliases
+                    }
+                    out[family].update(
+                        {
+                            name: value
+                            for name, value in columns.items()
+                            if name not in alias_names
+                            and name not in _DOMAIN_ROUTE_FIELD_ALIASES
+                        }
+                    )
+                else:
+                    out.setdefault(family, {}).update(dict(columns))
         return {family: columns for family, columns in out.items() if columns}
 
     def with_side_channel_dropout(
@@ -428,6 +457,33 @@ class LMTokenBatch:
 
 
 _DOCUMENT_ID_ALIASES = ("document_ids", "doc_ids", "packing_document_ids")
+
+
+def _canonical_domain_route_channels(
+    channels: Mapping[str, mx.array] | None,
+) -> dict[str, mx.array]:
+    if channels is None:
+        return {}
+    canonical: dict[str, mx.array] = {}
+    for field_name, aliases in _DOMAIN_ROUTE_FIELD_ALIASES.items():
+        present = [
+            name
+            for name in (field_name, *aliases)
+            if name in channels and channels[name] is not None
+        ]
+        if len(present) > 1:
+            raise ValueError(
+                "domain route declared more than once via canonical/alias keys: "
+                f"{present}"
+            )
+        if present:
+            value = channels[present[0]]
+            if not isinstance(value, mx.array):
+                raise ValueError(
+                    f"domain route {present[0]!r} must be an mlx array"
+                )
+            canonical[field_name] = value
+    return canonical
 
 
 def _validate_side_channel_map(

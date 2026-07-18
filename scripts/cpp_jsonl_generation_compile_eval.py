@@ -827,6 +827,12 @@ def prompt_model_inputs(
                     str(kind): count
                     for kind, count in edge_kind_route_counts.items()
                 },
+                "edge_family_route_counts": {
+                    str(family): int(count)
+                    for family, count in graph_inputs.receipt[
+                        "edge_counts"
+                    ].items()
+                },
                 "graph_bias_dtype": _dtype_name(bias_dtype),
             }
         )
@@ -1356,6 +1362,9 @@ def generate_completion_from_context(
         generated.append(next_id)
         token_context.append(next_id)
     receipt = dict(prompt_context.receipt)
+    receipt["schema"] = "cppmega_mlx_generation_receipt_v1"
+    receipt["generated_token_count"] = len(generated)
+    receipt["finish_reason"] = finish_reason
     receipt["aligned_side_channels"] = list(SIDE_CHANNEL_NAMES)
     receipt["model_consumed_side_channels"] = list(MODEL_SIDE_CHANNEL_NAMES)
     receipt["model_consumed_runtime_channels"] = [
@@ -1371,6 +1380,7 @@ def generate_completion_from_context(
             "edge_kind_bias_nonzero",
             "edge_kind_route_count",
             "edge_kind_route_counts",
+            "edge_family_route_counts",
             "graph_bias_dtype",
         ):
             if key in last_window_receipt:

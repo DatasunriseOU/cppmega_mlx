@@ -253,7 +253,7 @@ class InferenceEnrichmentSpecPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: InferenceEnrichmentSourcePayload = "auto"
-    fail_policy: InferenceFailPolicyPayload = "drop_family"
+    fail_policy: InferenceFailPolicyPayload = "error"
     timeout_ms: int = Field(default=500, ge=0)
     cache_enabled: bool = True
 

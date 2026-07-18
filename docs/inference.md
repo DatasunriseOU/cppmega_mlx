@@ -30,8 +30,16 @@ sequence-aligned `model_kwargs`, so side-channel tensors can be passed for the
 prompt and zero-filled or repeated for generated positions according to the
 generation helper rules.
 
-Use this path when a model route is stateful, when the caller does not know KV
-cache shape, or when text-only behavior is required as a baseline.
+Repository prompt-graph results include a typed `GraphBatch` backed by the
+validated `PromptGraphArtifact`. Full-prefix and slice generation rebuild the
+current graph window through `PromptGraphArtifact.model_inputs`, preserving
+chunk/token coordinates without staging dense prompt-sized bias matrices.
+Callers that provide explicit square `block_bias` and `edge_kind_bias` tensors
+still receive validated prefix and cache-window alignment.
+
+Use this path when a model route is stateful or when the caller does not know
+KV cache shape. Text-only behavior is an explicit baseline configuration; it
+is never selected automatically after side-channel enrichment fails.
 
 ## Contiguous KV
 
@@ -156,8 +164,32 @@ consumers are configured.
 
 Inference enrichment from prompt text, platform context, parser adapters, or
 project indexes is handled by `cppmega_mlx.inference.side_channels`. Missing
-families must fail according to the configured fallback policy rather than
-being silently fabricated.
+families fail closed by default: `InferenceSideChannelBuilder` uses
+`fail_policy="error"`, and a missing adapter is an error. The graph-routed C++
+model path must use `build_repository(...)`, which supplies the validated typed
+`GraphBatch` and domain sidecars.
+
+Graphless/general-purpose use is available only through explicit configuration:
+
+```python
+text_only = InferenceSideChannelBuilder(
+    tokenizer,
+    fail_policy="text_only",
+).build(prompt)
+
+best_effort = InferenceSideChannelBuilder(
+    tokenizer,
+    adapter=adapter,
+    fail_policy="drop_family",
+).build(prompt, language="python")
+```
+
+Both opt-in paths are visible in `InferenceSideChannelResult.provenance`.
+Receipts record `inference_fail_policy`, `inference_enrichment_status`, and
+`inference_degraded`; degraded adapter results additionally record
+`inference_failure_reason` and `fallback`. Successful enriched results record
+`inference_degraded=false`. Invalid or empty policy overrides are rejected
+instead of falling back to the builder default.
 
 ## Non-Claims
 

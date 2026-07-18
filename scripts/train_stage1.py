@@ -21,13 +21,13 @@ CRITICAL SIDE-CHANNEL ALIGNMENT RULE (enforced, fail-loud):
 
   * ``causal_lm`` and the ``*_recovery`` objectives keep the ORIGINAL token order.
     Their ``input_ids`` are exactly ``packet.token_ids[:-1]``, so the CodePacket's
-    token-aligned structure/platform side-channels (sliced to the SAME prefix and
-    order) are still valid and ARE passed into :class:`DenseCppLM`.
+    token-aligned structure/domain side-channels and typed graph routes (sliced to
+    the SAME prefix and order) remain valid for :class:`DenseCppLM`.
   * ``fim`` / ``ast_fim`` / ``ifim`` / ``commit_diff`` / ``pre_to_post``
     REORDER (FIM permutation) or SYNTHESIZE (commit splice) the token stream, so
-    the original token-aligned channels no longer line up. For those steps the
-    model is run with side-channels DISABLED (``structure_residual_scale=0`` /
-    ``platform_residual_scale=0`` and NO channels passed). We NEVER pass a
+    the original token-aligned channels and graph routes no longer line up. For
+    those steps the model is run with side-channels DISABLED and the unavailable
+    source fields are retained as explicit metadata-only provenance. We NEVER pass a
     misaligned channel; whenever channels ARE passed we assert their length
     matches ``input_ids`` and RAISE on any mismatch.
 
@@ -41,9 +41,9 @@ import argparse
 import math
 import sys
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,7 +58,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
+from cppmega_mlx.data.domain_packet import DomainEdgeIndex
+from cppmega_mlx.data.domain_schema import (
+    TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
+    normalize_domain_edge_record,
+)
 from cppmega_mlx.data.fim import FIMSpecialTokenIds
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch
+from cppmega_mlx.data.parquet_dataset import _normalize_edge_pairs
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.training.objectives import ObjectiveExample
 from cppmega_mlx.training.objective_mixer import (
@@ -94,6 +101,15 @@ _REORDERED_OBJECTIVES = frozenset(
 )
 
 _SPECIAL = FIMSpecialTokenIds()
+
+_PACKET_GRAPH_COLUMNS: Mapping[str, tuple[str, str]] = {
+    "token_call_edges": ("call_edges", "call"),
+    "token_type_edges": ("type_edges", "type"),
+}
+_PACKET_DOMAIN_GRAPH_COLUMNS: Mapping[str, tuple[str, str]] = {
+    column: (f"{family}_edges", family)
+    for column, family in TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES.items()
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -175,6 +191,21 @@ def load_code_packets(
             # AST-FIM span selector. Kept whole (chunk axis), only valid chunks
             # (chunk end within the trimmed prefix) are retained.
             chunk_kwargs = _chunk_channels(row, vtc, path.name, row_index)
+            graph_kwargs, graph_receipt = _graph_channels(
+                row,
+                valid_token_count=vtc,
+                source=path.name,
+                row_index=row_index,
+                chunk_kwargs=chunk_kwargs,
+            )
+
+            packet_metadata: dict[str, Any] = {
+                "platform_ids": _platform_ids(row, vocab_safe=True),
+                "source": path.name,
+                "row_index": row_index,
+            }
+            if graph_receipt:
+                packet_metadata["graph_routes"] = graph_receipt
 
             packet = CodePacket(
                 token_ids=_i32(tokens),
@@ -202,12 +233,9 @@ def load_code_packets(
                 filepath=str(row.get("filepath"))
                 if row.get("filepath") is not None
                 else None,
-                metadata={
-                    "platform_ids": _platform_ids(row, vocab_safe=True),
-                    "source": path.name,
-                    "row_index": row_index,
-                },
+                metadata=packet_metadata,
                 **chunk_kwargs,
+                **graph_kwargs,
             )
             packets.append(packet)
     if not packets:
@@ -245,6 +273,108 @@ def _chunk_channels(row, vtc: int, source: str, row_index: int) -> dict[str, mx.
         "chunk_kinds": _i32(kinds[idx]),
         "chunk_dep_levels": _i32(deps[idx]),
     }
+
+
+def _graph_channels(
+    row: Mapping[str, Any],
+    *,
+    valid_token_count: int,
+    source: str,
+    row_index: int,
+    chunk_kwargs: Mapping[str, mx.array],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build typed graph fields from one packed row without losing route provenance."""
+
+    graph_kwargs: dict[str, object] = {}
+    receipt: dict[str, object] = {}
+
+    source_starts = np.asarray(row.get("token_chunk_starts", []), dtype=np.int64)
+    source_ends = np.asarray(row.get("token_chunk_ends", []), dtype=np.int64)
+    if source_starts.shape != source_ends.shape:
+        raise ValueError(
+            f"{source}[row={row_index}]: graph chunk starts/ends shape mismatch "
+            f"{source_starts.shape} != {source_ends.shape}"
+        )
+    kept_chunks = {
+        int(chunk_index): output_index
+        for output_index, chunk_index in enumerate(
+            int(index)
+            for index in range(len(source_starts))
+            if int(source_ends[index]) <= valid_token_count
+            and int(source_starts[index]) < int(source_ends[index])
+        )
+    }
+
+    for column, (field_name, relation) in _PACKET_GRAPH_COLUMNS.items():
+        if column not in row or row[column] is None:
+            continue
+        raw_pairs = _normalize_edge_pairs(row[column])
+        retained: list[tuple[int, int]] = []
+        excluded = 0
+        for source_chunk, target_chunk in raw_pairs:
+            if not (
+                0 <= source_chunk < len(source_starts)
+                and 0 <= target_chunk < len(source_starts)
+            ):
+                raise ValueError(
+                    f"{source}[row={row_index}].{column}: edge "
+                    f"({source_chunk},{target_chunk}) is outside chunk range"
+                )
+            if source_chunk not in kept_chunks or target_chunk not in kept_chunks:
+                excluded += 1
+                continue
+            retained.append(
+                (kept_chunks[source_chunk], kept_chunks[target_chunk])
+            )
+        if raw_pairs and not chunk_kwargs:
+            raise ValueError(
+                f"{source}[row={row_index}].{column}: non-empty graph edges "
+                "require usable token_chunk_starts/token_chunk_ends"
+            )
+        graph_kwargs[field_name] = EdgeIndex.from_pairs(
+            retained,
+            relation=relation,
+            num_nodes=len(kept_chunks),
+        )
+        receipt[column] = {
+            "source_edges": len(raw_pairs),
+            "retained_edges": len(retained),
+            "excluded_edges": excluded,
+            "coordinate_space": "chunk_index",
+        }
+
+    source_token_count = len(np.asarray(row.get("input_ids", [])))
+    for column, (field_name, family) in _PACKET_DOMAIN_GRAPH_COLUMNS.items():
+        if column not in row or row[column] is None:
+            continue
+        triples: list[tuple[int, int, int]] = []
+        excluded = 0
+        for edge in row[column] or []:
+            source_token, target_token, kind = normalize_domain_edge_record(
+                edge,
+                family=family,
+            )
+            if not (
+                source_token < source_token_count
+                and target_token < source_token_count
+            ):
+                raise ValueError(
+                    f"{source}[row={row_index}].{column}: edge "
+                    f"({source_token},{target_token}) is outside token range"
+                )
+            if source_token >= valid_token_count or target_token >= valid_token_count:
+                excluded += 1
+                continue
+            triples.append((source_token, target_token, kind))
+        graph_kwargs[field_name] = DomainEdgeIndex.from_triples(triples)
+        receipt[column] = {
+            "source_edges": len(row[column] or []),
+            "retained_edges": len(triples),
+            "excluded_edges": excluded,
+            "coordinate_space": "token_index",
+        }
+
+    return graph_kwargs, receipt
 
 
 def _platform_ids(row, *, vocab_safe: bool) -> mx.array | None:
@@ -339,6 +469,8 @@ class TrainStep:
     target_ids: mx.array  # (1, S)
     loss_mask: mx.array  # (1, S)
     side_channels: dict[str, mx.array]  # aligned channels, or {} when disabled
+    graph_batch: GraphBatch | None = None
+    metadata_only: Mapping[str, object] = field(default_factory=dict)
 
 
 def _assert_aligned(name: str, channel: mx.array, seq_len: int) -> mx.array:
@@ -368,9 +500,10 @@ def build_train_step(
 ) -> TrainStep:
     """Materialize a TrainStep, applying the side-channel alignment rule.
 
-    For ALIGNED objectives we slice the CodePacket's token-aligned channels to the
-    example's input length and pass them (asserting alignment). For REORDERED /
-    SYNTHESIZED objectives we pass NO channels (side-channels disabled).
+    For ALIGNED objectives we slice the CodePacket's token-aligned channels and
+    graph routes to the example's input length and pass them (asserting alignment).
+    For REORDERED / SYNTHESIZED objectives we pass NO channels and retain the
+    source route names as explicit metadata-only provenance.
     """
 
     seq_len = int(example.input_ids.shape[0])
@@ -399,17 +532,108 @@ def build_train_step(
                     "absent; cannot pass an aligned structure channel"
                 )
             channels[model_kw] = _assert_aligned(model_kw, source, seq_len)
+        domain_sources = {
+            name: getattr(packet, name)
+            for name in ("domain_ids", "role_ids", "confidence_ids")
+        }
+        for model_kw, source in domain_sources.items():
+            if source is not None:
+                channels[model_kw] = _assert_aligned(model_kw, source, seq_len)
         platform = packet.metadata.get("platform_ids") if packet.metadata else None
         if platform is not None:
             channels["platform_ids"] = platform  # (1, K) document-level
-        return TrainStep(objective, input_ids, target_ids, loss_mask, channels)
+        graph_batch = _aligned_packet_graph_batch(packet, input_length=seq_len)
+        metadata_only = _metadata_only_packet_fields(packet)
+        return TrainStep(
+            objective,
+            input_ids,
+            target_ids,
+            loss_mask,
+            channels,
+            graph_batch=graph_batch,
+            metadata_only=metadata_only,
+        )
 
     if objective in _REORDERED_OBJECTIVES:
         # Side-channels DISABLED: pass nothing. The model is also driven with the
         # residual scales zeroed for this step (see run_training).
-        return TrainStep(objective, input_ids, target_ids, loss_mask, {})
+        return TrainStep(
+            objective,
+            input_ids,
+            target_ids,
+            loss_mask,
+            {},
+            metadata_only={
+                "reason": "objective_changes_token_order_or_synthesizes_tokens",
+                "source_fields": _present_packet_route_fields(packet),
+            },
+        )
 
     raise ValueError(f"unknown objective {objective!r}: cannot classify alignment")
+
+
+def _aligned_packet_graph_batch(
+    packet: CodePacket,
+    *,
+    input_length: int,
+) -> GraphBatch | None:
+    has_routes = any(
+        getattr(packet, field_name) is not None
+        for field_name in (
+            "call_edges",
+            "type_edges",
+            "domain_edges",
+            "build_edges",
+            "shell_edges",
+            "diagnostic_edges",
+            "cross_domain_edges",
+        )
+    )
+    if not has_routes:
+        return None
+    graph_batch = packet.graph_batch()
+    if not graph_batch.graphs[0].relations:
+        return None
+    return graph_batch.input_aligned(
+        source_sequence_length=packet.token_axis_len,
+        input_sequence_length=input_length,
+    )
+
+
+def _present_packet_route_fields(packet: CodePacket) -> tuple[str, ...]:
+    return tuple(
+        name
+        for name in packet.present_fields()
+        if name.endswith("_edges")
+        or name
+        in {
+            "domain_ids",
+            "role_ids",
+            "entity_ids",
+            "scope_ids",
+            "source_doc_ids",
+            "source_identity_ids",
+            "confidence_ids",
+        }
+    )
+
+
+def _metadata_only_packet_fields(packet: CodePacket) -> Mapping[str, object]:
+    fields = tuple(
+        name
+        for name in (
+            "symbol_ids",
+            "call_targets",
+            "type_refs",
+            "def_use",
+            "entity_ids",
+            "scope_ids",
+            "source_doc_ids",
+            "source_identity_ids",
+        )
+        if getattr(packet, name) is not None
+    )
+    return {"source_fields": fields} if fields else {}
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +653,11 @@ def smoke_config(vocab_size: int) -> DenseCppLMConfig:
         head_dim=32,
         attention_mode="gqa",
         ngram_hash_table_size=50_000,
+        # The golden packed rows carry stable domain/role/confidence sidecars;
+        # keep this branch live in the smoke so the loader-to-model contract is
+        # exercised. Graph routing remains an explicit production-only path
+        # because mixed FIM steps need a source-coordinate remap.
+        domain_residual_scale=1.0,
     )
 
 
@@ -442,12 +671,29 @@ def _loss_for_step(
     misaligned side-channel into the stream.
     """
 
+    if (
+        getattr(model.config, "require_graph_routes", False)
+        and getattr(model.config, "graph_routes_enabled", False)
+        and step.graph_batch is None
+    ):
+        raise ValueError(
+            "train_stage1 production graph objective requires graph sidecars; "
+            f"objective={step.objective!r} has no aligned GraphBatch"
+        )
+
     if channels_on:
+        model_kwargs = dict(step.side_channels)
+        # A legacy mixed-objective smoke keeps graph routing disabled because
+        # FIM/synthesized examples have no exact source-coordinate remap.  The
+        # typed graph remains on TrainStep for graph-enabled callers; passing it
+        # here is conditional on the model's explicit graph-route contract.
+        if step.graph_batch is not None and model.config.graph_routes_enabled:
+            model_kwargs["graph_batch"] = step.graph_batch
         _, loss = model(
             step.input_ids,
             targets=step.target_ids,
             loss_mask=step.loss_mask,
-            **step.side_channels,
+            **model_kwargs,
         )
         return loss
 
@@ -455,12 +701,14 @@ def _loss_for_step(
     saved = (
         cfg.structure_residual_scale,
         cfg.platform_residual_scale,
+        cfg.domain_residual_scale,
         cfg.ngram_residual_scale,
     )
     object.__setattr__(model, "config", replace(
         cfg,
         structure_residual_scale=0.0,
         platform_residual_scale=0.0,
+        domain_residual_scale=0.0,
         ngram_residual_scale=0.0,
     ))
     try:
@@ -474,7 +722,8 @@ def _loss_for_step(
             cfg,
             structure_residual_scale=saved[0],
             platform_residual_scale=saved[1],
-            ngram_residual_scale=saved[2],
+            domain_residual_scale=saved[2],
+            ngram_residual_scale=saved[3],
         ))
     return loss
 
@@ -490,27 +739,29 @@ def materialize_steps(
 
     if not code_packets:
         raise ValueError("materialize_steps requires at least one CodePacket")
-    sources = [
-        ObjectiveSource(
-            code_packet=code_packets[index % len(code_packets)],
-            commit_packet=(
-                commit_packets[index % len(commit_packets)]
-                if commit_packets
-                else None
-            ),
-        )
+    # Keep independently tokenized commit sections in commit-only source views.
+    # Combining them with a multi-constituent packed code row would require an
+    # exact constituent binding and incorrectly make both repair tasks ineligible.
+    sources: list[ObjectiveSource] = [
+        ObjectiveSource(code_packet=code_packets[index % len(code_packets)])
         for index in range(num_steps)
     ]
-    realized = mixer.materialize_window(sources)
+    if commit_packets:
+        sources.extend(
+            ObjectiveSource(commit_packet=commit_packets[index % len(commit_packets)])
+            for index in range(num_steps)
+        )
+    realized = mixer.materialize_window_from_pool(
+        sources,
+        output_count=num_steps,
+    )
     steps: list[TrainStep] = []
     for item in realized:
-        source = sources[item.source_index]
-        packet = (
-            source.commit_packet
-            if item.task in (TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST)
-            else source.code_packet
-        )
-        assert packet is not None
+        packet = item.selected_packet
+        if packet is None:  # pragma: no cover - mixer guarantees selected packets
+            raise RuntimeError(
+                f"{item.task.value}: realized objective lost its selected packet"
+            )
         steps.append(build_train_step(item.example.objective, item.example, packet))
     return steps
 

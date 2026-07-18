@@ -17,11 +17,18 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
 
+from cppmega_mlx.data.domain_schema import DomainEdgeKind
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.prompt_graph import (
+    GENERATED_QUERY_ROUTE_KEY,
+    PAIR_ROUTE_EDGE_KINDS,
+    PAIR_ROUTE_KEYS,
+    PromptGraphModelInputs,
     PromptGraphArtifact,
     PromptGraphBuilder,
     PromptGraphContext,
     PromptProjectIndex,
+    TRIPLE_ROUTE_KEYS,
 )
 from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer
 from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
@@ -486,7 +493,7 @@ class InferenceSideChannelResult:
     """Prompt IDs plus model kwargs and provenance produced by the builder."""
 
     prompt_ids: mx.array
-    model_kwargs: Mapping[str, mx.array]
+    model_kwargs: Mapping[str, Any]
     side_channels: Mapping[str, Mapping[str, mx.array]]
     provenance: Mapping[str, str]
     platform_context: PlatformContext
@@ -502,8 +509,60 @@ class InferenceSideChannelResult:
         return self.cache_components.digest()
 
 
+class _RepositoryPromptGraphBatch(GraphBatch):
+    """Typed graph routes that retain the artifact for generation windows.
+
+    ``DenseCppLM`` consumes the base ``GraphBatch`` contract directly. The
+    artifact reference is only used by the eager generation helpers to
+    materialize a new window when the prefix grows or a cache path selects a
+    suffix; it never becomes a model kwarg of its own.
+    """
+
+    def __init__(
+        self,
+        artifact: PromptGraphArtifact,
+        graph_inputs: PromptGraphModelInputs,
+    ) -> None:
+        base = _prompt_graph_model_inputs_to_graph_batch(graph_inputs)
+        super().__init__(
+            graphs=base.graphs,
+            chunk_starts=base.chunk_starts,
+            chunk_ends=base.chunk_ends,
+            chunk_kinds=base.chunk_kinds,
+            chunk_dep_levels=base.chunk_dep_levels,
+            edge_kinds=base.edge_kinds,
+        )
+        object.__setattr__(self, "_prompt_graph_artifact", artifact)
+
+    def prompt_graph_window(
+        self,
+        *,
+        total_token_count: int,
+        window_start: int,
+        window_end: int,
+    ) -> tuple["_RepositoryPromptGraphBatch", PromptGraphModelInputs]:
+        if window_start > 0:
+            total_token_count = max(
+                int(total_token_count),
+                self._prompt_graph_artifact.token_count,
+            )
+        inputs = self._prompt_graph_artifact.model_inputs(
+            total_token_count=total_token_count,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        return _RepositoryPromptGraphBatch(self._prompt_graph_artifact, inputs), inputs
+
+
 class InferenceSideChannelBuilder:
-    """Build side-channel tensors for a single inference prompt."""
+    """Build side-channel tensors for a single inference prompt.
+
+    Generic inference is strict by default. A missing or failing adapter is
+    an error for the graph-routed model family; callers that intentionally run
+    a graphless/general-purpose model must opt into ``text_only`` or
+    ``drop_family`` explicitly and the result receipt records that choice.
+    Repository graph inference is provided by :meth:`build_repository`.
+    """
 
     def __init__(
         self,
@@ -511,7 +570,7 @@ class InferenceSideChannelBuilder:
         *,
         tokenizer_id: str | None = None,
         adapter: CodeMetadataAdapter | None = None,
-        fail_policy: InferenceFailPolicy = "drop_family",
+        fail_policy: InferenceFailPolicy = "error",
     ) -> None:
         if fail_policy not in {"drop_family", "text_only", "error"}:
             raise ValueError("fail_policy must be drop_family, text_only, or error")
@@ -531,7 +590,9 @@ class InferenceSideChannelBuilder:
     ) -> InferenceSideChannelResult:
         if not isinstance(text, str):
             raise TypeError("text must be a string")
-        policy: InferenceFailPolicy = fail_policy or self.fail_policy
+        policy: InferenceFailPolicy = (
+            self.fail_policy if fail_policy is None else fail_policy
+        )
         if policy not in {"drop_family", "text_only", "error"}:
             raise ValueError("fail_policy must be drop_family, text_only, or error")
 
@@ -550,11 +611,18 @@ class InferenceSideChannelBuilder:
         )
 
         if policy == "text_only":
+            provenance: dict[str, str] = {"fallback": "text_only"}
+            _set_inference_receipt(
+                provenance,
+                policy=policy,
+                status="explicit_text_only",
+                degraded=True,
+            )
             return InferenceSideChannelResult(
                 prompt_ids=prompt_ids,
                 model_kwargs={},
                 side_channels={},
-                provenance={"fallback": "text_only"},
+                provenance=provenance,
                 platform_context=ctx,
                 rendered_platform_context=rendered_context,
                 cache_components=cache_components,
@@ -570,6 +638,13 @@ class InferenceSideChannelBuilder:
             provenance["platform"] = "platform_context"
 
         if active_adapter is None:
+            _handle_adapter_failure(
+                policy,
+                "adapter_missing",
+                provenance=provenance,
+                model_kwargs=model_kwargs,
+                side_channels=side_channels,
+            )
             return InferenceSideChannelResult(
                 prompt_ids=prompt_ids,
                 model_kwargs=model_kwargs,
@@ -622,6 +697,7 @@ class InferenceSideChannelBuilder:
                 cache_components=cache_components,
             )
 
+        adapter_empty_metadata = False
         try:
             metadata = active_adapter.extract(
                 text,
@@ -645,10 +721,28 @@ class InferenceSideChannelBuilder:
                 "adapter",
                 f"{active_adapter.language}:{active_adapter.version}",
             )
+            if not any(family != "platform" for family in side_channels):
+                adapter_empty_metadata = True
+            else:
+                _set_inference_receipt(
+                    provenance,
+                    policy=policy,
+                    status="enriched",
+                    degraded=False,
+                )
         except Exception as exc:
             _handle_adapter_failure(
                 policy,
                 f"adapter_error:{type(exc).__name__}",
+                provenance=provenance,
+                model_kwargs=model_kwargs,
+                side_channels=side_channels,
+            )
+
+        if adapter_empty_metadata:
+            _handle_adapter_failure(
+                policy,
+                "adapter_empty_metadata",
                 provenance=provenance,
                 model_kwargs=model_kwargs,
                 side_channels=side_channels,
@@ -774,6 +868,12 @@ class InferenceSideChannelBuilder:
             for name, values in artifact.side_channels.items()
         }
         side_channels = _repository_side_channels(arrays)
+        graph_inputs = artifact.model_inputs(
+            total_token_count=token_count,
+            window_start=0,
+            window_end=token_count,
+        )
+        graph_batch = _RepositoryPromptGraphBatch(artifact, graph_inputs)
         model_kwargs = {
             name: arrays[name]
             for name in (
@@ -782,9 +882,16 @@ class InferenceSideChannelBuilder:
                 "ast_depth_ids",
                 "sibling_index_ids",
                 "node_type_ids",
+                "domain_ids",
+                "role_ids",
+                "confidence_ids",
             )
         }
-        document_ids = arrays["source_doc_ids"]
+        model_kwargs["graph_batch"] = graph_batch
+        # Repository prompts intentionally assemble dependency documents into
+        # one attention context. Keep source_doc_ids as provenance, but do not
+        # turn cross-file graph routes into an invalid document-boundary edge.
+        document_ids = mx.ones_like(arrays["source_doc_ids"])
         model_kwargs["document_ids"] = document_ids
 
         ctx = parse_platform_context(platform_context)
@@ -819,6 +926,13 @@ class InferenceSideChannelBuilder:
             "prompt_graph_index_sha256": project_index.index_sha256,
             "prompt_graph_artifact_cache_key": graph_cache_key,
             "prompt_graph_repository_root": str(root),
+            "prompt_graph_model_route_inputs": "graph_batch",
+            "prompt_graph_relation_route_count": str(
+                sum(edge.num_edges for edge in graph_batch.graphs[0].edges.values())
+            ),
+            "prompt_graph_edge_kind_route_count": str(
+                sum(graph_inputs.edge_kind_route_counts().values())
+            ),
         }
         cache_components = _cache_components(
             text=context.text,
@@ -1280,6 +1394,84 @@ def _repository_side_channels(
     }
 
 
+def _prompt_graph_model_inputs_to_graph_batch(
+    graph_inputs: PromptGraphModelInputs,
+) -> GraphBatch:
+    """Convert one artifact window into the model's typed route contract.
+
+    Pair routes stay chunk-indexed. Token routes retain their categorical edge
+    kinds. Generated-query edges have no categorical kind in the artifact, so
+    they use ``UNKNOWN``; its default weight is neutral and the route remains
+    visible without fabricating a stronger edge prior.
+    """
+
+    routes = graph_inputs.graph_routes
+    chunk_starts = mx.array(
+        [int(value) for value in routes["graph_chunk_starts"]],
+        dtype=mx.int32,
+    )
+    chunk_ends = mx.array(
+        [int(value) for value in routes["graph_chunk_ends"]],
+        dtype=mx.int32,
+    )
+    chunk_kinds = mx.array(
+        [int(value) for value in routes["graph_chunk_kinds"]],
+        dtype=mx.int32,
+    )
+    chunk_dep_levels = mx.array(
+        [int(value) for value in routes["graph_chunk_dep_levels"]],
+        dtype=mx.int32,
+    )
+    chunk_count = int(chunk_starts.shape[0])
+    token_count = int(graph_inputs.token_count)
+    edges: dict[str, EdgeIndex] = {}
+    edge_kinds: dict[str, mx.array] = {}
+
+    for relation, (route_key, _count_key) in PAIR_ROUTE_KEYS.items():
+        edges[relation] = EdgeIndex.from_pairs(
+            routes[route_key],
+            relation=relation,
+            num_nodes=chunk_count,
+        )
+        edge_kinds[relation] = mx.full(
+            (len(routes[route_key]),),
+            int(PAIR_ROUTE_EDGE_KINDS[relation]),
+            dtype=mx.int32,
+        )
+
+    for relation, (route_key, _count_key) in TRIPLE_ROUTE_KEYS.items():
+        rows = [list(row) for row in routes[route_key]]
+        if relation == "domain":
+            rows.extend(
+                [int(source), int(target), int(DomainEdgeKind.UNKNOWN)]
+                for source, target in routes[GENERATED_QUERY_ROUTE_KEY]
+            )
+        edges[relation] = EdgeIndex.from_pairs(
+            [[int(row[0]), int(row[1])] for row in rows],
+            relation=relation,
+            num_nodes=token_count,
+        )
+        edge_kinds[relation] = mx.array(
+            [int(row[2]) for row in rows],
+            dtype=mx.int32,
+        )
+
+    if not any(edge.num_edges for edge in edges.values()):
+        raise ValueError(
+            "repository prompt graph produced no graph route edges; refusing "
+            "a text-only repository model input"
+        )
+
+    return GraphBatch(
+        graphs=(GraphPacket(edges=edges, num_nodes=chunk_count),),
+        chunk_starts=(chunk_starts,),
+        chunk_ends=(chunk_ends,),
+        chunk_kinds=(chunk_kinds,),
+        chunk_dep_levels=(chunk_dep_levels,),
+        edge_kinds=(edge_kinds,),
+    )
+
+
 def _platform_ids_for_context(ctx: PlatformContext) -> mx.array | None:
     if not encode_platform_context(ctx):
         return None
@@ -1351,14 +1543,55 @@ def _handle_adapter_failure(
     side_channels: dict[str, dict[str, mx.array]],
 ) -> None:
     if policy == "error":
-        raise RuntimeError(reason)
+        raise RuntimeError(
+            "inference side-channel enrichment failed closed: "
+            f"{reason}"
+        )
     if policy == "text_only":
         model_kwargs.clear()
         side_channels.clear()
         provenance.clear()
         provenance["fallback"] = "text_only"
+        _set_inference_receipt(
+            provenance,
+            policy=policy,
+            status="explicit_text_only",
+            degraded=True,
+            reason=reason,
+        )
         return
+    _set_inference_receipt(
+        provenance,
+        policy=policy,
+        status="degraded_drop_family",
+        degraded=True,
+        reason=reason,
+    )
+    provenance["fallback"] = "drop_family"
     provenance["adapter"] = f"dropped:{reason}"
+
+
+def _set_inference_receipt(
+    provenance: dict[str, str],
+    *,
+    policy: InferenceFailPolicy,
+    status: str,
+    degraded: bool,
+    reason: str | None = None,
+) -> None:
+    """Record the selected policy and any intentional degradation.
+
+    ``provenance`` is passed through generation/eval receipts, so fallback
+    behavior must be machine-visible rather than inferred from missing keys.
+    """
+
+    provenance["inference_fail_policy"] = policy
+    provenance["inference_enrichment_status"] = status
+    provenance["inference_degraded"] = "true" if degraded else "false"
+    if reason is None:
+        provenance.pop("inference_failure_reason", None)
+    else:
+        provenance["inference_failure_reason"] = reason
 
 
 __all__ = [

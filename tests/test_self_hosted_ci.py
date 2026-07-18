@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import sys
 import time
@@ -258,6 +259,74 @@ def test_both_lane_manifests_run_the_orchestration_regressions() -> None:
     assert "tests/test_workflow_runner_policy.py" in ci.LINUX_TESTS
 
 
+def test_source_bound_environment_resolves_the_reviewed_checkout(
+    tmp_path: Path,
+) -> None:
+    foreign_root = tmp_path / "foreign-editable-checkout"
+    foreign_package = foreign_root / "cppmega_mlx"
+    foreign_package.mkdir(parents=True)
+    (foreign_package / "__init__.py").write_text(
+        "__file_marker__ = 'foreign'\n", encoding="utf-8"
+    )
+    polluted = dict(os.environ)
+    polluted["PYTHONPATH"] = str(foreign_root)
+    environment = ci._source_bound_environment(
+        REPO_ROOT,
+        base_environment=polluted,
+    )
+    log_path = tmp_path / "source-binding.log"
+    result = ci.run_step(
+        name="source-binding",
+        command=(
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import cppmega_mlx; "
+                "print(Path(cppmega_mlx.__file__).resolve())"
+            ),
+        ),
+        cwd=REPO_ROOT,
+        log_path=log_path,
+        timeout_seconds=30,
+        env=environment,
+    )
+    assert result["exit_code"] == 0
+    resolved = Path(log_path.read_text(encoding="utf-8").strip())
+    assert resolved.resolve().is_relative_to(REPO_ROOT)
+    assert environment["PYTHONPATH"] == str(REPO_ROOT)
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTHONSAFEPATH"] == "1"
+    assert "PYTHONHOME" not in environment
+    assert "VIRTUAL_ENV" not in environment
+
+
+def test_source_import_probe_rejects_a_foreign_namespace_path(
+    tmp_path: Path,
+) -> None:
+    foreign_root = tmp_path / "foreign-editable-checkout"
+    foreign_package = foreign_root / "cppmega_mlx"
+    foreign_package.mkdir(parents=True)
+    (foreign_package / "__init__.py").write_text(
+        "__file_marker__ = 'foreign'\n", encoding="utf-8"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(foreign_root), str(REPO_ROOT))
+    )
+    log_path = tmp_path / "foreign-probe.log"
+    result = ci.run_step(
+        name="foreign-source-binding",
+        command=ci._source_import_probe_command(sys.executable, REPO_ROOT),
+        cwd=tmp_path,
+        log_path=log_path,
+        timeout_seconds=30,
+        env=environment,
+    )
+
+    assert result["exit_code"] != 0
+    assert "outside reviewed root" in log_path.read_text(encoding="utf-8")
+
+
 def test_lane_manifests_cover_current_case5_and_training_regressions() -> None:
     for test_path in (
         "tests/test_case5_domain_ingestion.py",
@@ -265,6 +334,7 @@ def test_lane_manifests_cover_current_case5_and_training_regressions() -> None:
         "tests/test_materialize_megatron_dependency_provenance.py",
         "tests/test_production_objective_mixer.py",
         "tests/test_stage1_combined_graph_objective.py",
+        "tests/test_train_eval_graph_routes.py",
     ):
         assert test_path in ci.MACOS_TESTS
 
@@ -292,3 +362,14 @@ def test_macos_lane_covers_case1_to_case5_graph_identity_contracts() -> None:
         "tests/test_train_stage1_smoke.py",
     ):
         assert test_path in ci.MACOS_TESTS
+
+
+def test_both_lanes_cover_case6_sidecar_restore_contracts() -> None:
+    for test_path in (
+        "tests/test_case6_sidecar_manifest_contract.py",
+        "tests/test_production_megatron_bundle.py",
+        "tests/test_verified_sidecar_download_verification.py",
+        "tests/test_verified_sidecar_manifest_selection.py",
+    ):
+        assert test_path in ci.MACOS_TESTS
+        assert test_path in ci.LINUX_TESTS

@@ -126,7 +126,7 @@ DEFAULT_RANGE_TARGET_BYTES = 32 * 1024 * 1024
 DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
 DEFAULT_MIN_FREE_DISK_GB = 50.0
 
-CODE_REVISION_SCHEMA_VERSION = 1
+CODE_REVISION_SCHEMA_VERSION = 2
 CODE_REVISION_DRIFT_MARKER = "CPPMEGA_CODE_REVISION_DRIFT"
 CODE_REVISION_DRIFT_EXIT_CODE = 86
 CODE_REVISION_MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -331,6 +331,37 @@ def _hash_untracked_source_files(repo_root: Path, paths_blob: bytes) -> str:
     return digest.hexdigest()
 
 
+def _capture_indexer_provenance(repo_root: Path) -> dict[str, object] | None:
+    """Capture the exact clang-indexer source and imported local closure.
+
+    Small unit-test repositories do not contain the production indexer and are
+    allowed to omit this receipt.  A production guard rejects that omission;
+    this keeps the generic revision helper useful without weakening the real
+    conveyor contract.
+    """
+
+    indexer_path = repo_root / "tools" / "clang_indexer" / "index_project.py"
+    if not indexer_path.is_file() or indexer_path.is_symlink():
+        return None
+    try:
+        from cppmega_mlx.data.prompt_graph_provenance import indexer_dependency_hash
+    except ImportError as exc:
+        raise CodeRevisionError(
+            "cannot import the authoritative clang indexer provenance helper"
+        ) from exc
+    dependency_manifest, dependency_sha256 = indexer_dependency_hash(
+        indexer_path,
+        repo_root,
+    )
+    return {
+        "schema": "cppmega_indexer_dependency_binding_v1",
+        "path": "tools/clang_indexer/index_project.py",
+        "source_sha256": _sha256_bytes(indexer_path.read_bytes()),
+        "dependency_closure_sha256": dependency_sha256,
+        "dependency_manifest": dict(sorted(dependency_manifest.items())),
+    }
+
+
 def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
     """Capture HEAD plus a bounded source/config-only dirty-tree identity."""
     repo_root = repo_root.resolve()
@@ -386,6 +417,17 @@ def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
         ("ls-files", "--others", "--exclude-standard", "-z", *path_args),
         max_bytes=CODE_REVISION_MAX_STATUS_BYTES,
     )
+    tracked_source_tree = _bounded_git_output(
+        repo_root,
+        (
+            "ls-files",
+            "--cached",
+            "--stage",
+            "-z",
+            *path_args,
+        ),
+        max_bytes=CODE_REVISION_MAX_GIT_OUTPUT_BYTES,
+    )
     untracked_sha256 = _hash_untracked_source_files(repo_root, untracked_paths)
     head_after = _bounded_git_output(
         repo_root,
@@ -397,12 +439,19 @@ def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
             "HEAD changed while the conveyor captured its code revision: "
             f"{head_before} -> {head_after}"
         )
+    indexer_provenance = _capture_indexer_provenance(repo_root)
 
     components = {
         "status_sha256": _sha256_bytes(status),
         "index_diff_sha256": _sha256_bytes(index_diff),
         "worktree_diff_sha256": _sha256_bytes(worktree_diff),
         "untracked_sources_sha256": untracked_sha256,
+        "source_tree_sha256": _sha256_bytes(tracked_source_tree),
+        "indexer_dependency_closure_sha256": (
+            None
+            if indexer_provenance is None
+            else indexer_provenance["dependency_closure_sha256"]
+        ),
     }
     dirty_fingerprint = _sha256_bytes(
         json.dumps(components, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -427,6 +476,7 @@ def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
             "max_untracked_file_bytes": CODE_REVISION_MAX_UNTRACKED_FILE_BYTES,
             "max_untracked_total_bytes": CODE_REVISION_MAX_UNTRACKED_TOTAL_BYTES,
         },
+        "indexer_provenance": indexer_provenance,
         **components,
     }
 
@@ -438,6 +488,8 @@ def _code_revision_identity(receipt: dict) -> tuple:
         "dirty",
         "dirty_fingerprint",
         "relevant_scope_sha256",
+        "source_tree_sha256",
+        "indexer_dependency_closure_sha256",
     )
     missing = [key for key in required if key not in receipt]
     if missing:
@@ -496,6 +548,11 @@ class CodeRevisionGuard:
             raise CodeRevisionMismatchError(
                 "expected code revision does not match HEAD: "
                 f"expected={expected} actual={snapshot['git_commit']}"
+            )
+        if snapshot.get("indexer_provenance") is None:
+            raise CodeRevisionMismatchError(
+                "production conveyor requires the authoritative clang indexer "
+                "dependency provenance under tools/clang_indexer"
             )
         if snapshot["dirty"]:
             dirty_parts = ", ".join(_dirty_component_names(snapshot)) or "unknown"

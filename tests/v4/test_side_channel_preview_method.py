@@ -77,4 +77,9 @@ def test_side_channel_preview_source_none_is_text_only() -> None:
     assert resp.result is not None
     assert resp.result["model_kwargs"] == {}
     assert resp.result["side_channels"] == {}
-    assert resp.result["provenance"] == {"fallback": "text_only"}
+    assert resp.result["provenance"] == {
+        "fallback": "text_only",
+        "inference_fail_policy": "text_only",
+        "inference_enrichment_status": "explicit_text_only",
+        "inference_degraded": "true",
+    }

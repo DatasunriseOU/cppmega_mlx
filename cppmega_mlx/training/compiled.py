@@ -1637,28 +1637,31 @@ def normalize_compiled_batch(
     None for absent fields so callers do not alternate between different
     dict key sets when switching among plain token batches, packed-row
     training batches, and structured batches.
+
+    Raw Parquet graph tensors are metadata/Path C sidecars, not a substitute for
+    the typed GraphBatch required to derive compiled graph biases.
     """
 
     lm_batch = ensure_lm_batch(batch)
     batch_dict = lm_batch.as_dict()
-    nested_domain = (
-        None
-        if lm_batch.side_channels is None
-        else lm_batch.side_channels.get("domain_routes")
-    )
-    if nested_domain is not None:
-        for key in ("domain_ids", "role_ids", "confidence_ids"):
-            direct = batch_dict.get(key)
-            nested = nested_domain.get(key)
-            if direct is not None and nested is not None:
-                raise ValueError(
-                    f"compiled batch received duplicate direct/nested {key}"
-                )
-            if nested is not None:
-                batch_dict[key] = nested
+    for key, value in lm_batch.resolved_domain_route_fields().items():
+        if value is not None:
+            batch_dict[key] = value
 
     graph_attention_bias = lm_batch.graph_attention_bias
     graph_edge_kind_bias = lm_batch.graph_edge_kind_bias
+    raw_graph_fields = _raw_graph_side_channel_fields(lm_batch)
+    if (
+        graph_routes_enabled is True
+        and lm_batch.graph_batch is None
+        and graph_attention_bias is None
+        and graph_edge_kind_bias is None
+        and raw_graph_fields
+    ):
+        raise ValueError(
+            "compiled graph route sidecars are metadata-only without a typed "
+            f"GraphBatch: {raw_graph_fields}"
+        )
     if graph_routes_enabled is False:
         provided_graph_fields = [
             name
@@ -1690,6 +1693,28 @@ def normalize_compiled_batch(
     batch_dict["graph_attention_bias"] = graph_attention_bias
     batch_dict["graph_edge_kind_bias"] = graph_edge_kind_bias
     return {key: batch_dict.get(key) for key in STABLE_BATCH_KEYS}
+
+
+def _raw_graph_side_channel_fields(batch: LMTokenBatch) -> tuple[str, ...]:
+    """List raw graph tensors that cannot substitute for a typed GraphBatch."""
+
+    semantic_graph = (
+        {} if batch.side_channels is None else batch.side_channels.get("semantic_graph", {})
+    )
+    if not isinstance(semantic_graph, Mapping):
+        return ()
+    return tuple(
+        sorted(
+            name
+            for name in (
+                "token_call_edges",
+                "token_call_edges_mask",
+                "token_type_edges",
+                "token_type_edges_mask",
+            )
+            if semantic_graph.get(name) is not None
+        )
+    )
 
 
 @dataclass

@@ -24,18 +24,30 @@ from typing import Any
 from .prompt_graph import (
     INDEX_SCHEMA,
     PromptProjectIndex,
-    PRODUCTION_IDENTITY_PROVENANCE_CONTRACT,
     repository_snapshot,
     require_prompt_graph_project_id,
 )
+from .prompt_graph_provenance import (
+    INDEX_INTEGRITY_VERSION,
+    INDEXER_DEPENDENCY_HASH_KEY,
+    INDEXER_DEPENDENCY_MANIFEST_KEY,
+    INDEXER_DEPENDENCY_POLICY,
+    PRODUCTION_IDENTITY_PROVENANCE_CONTRACT,
+    indexer_dependency_hash,
+    validate_shared_provenance,
+)
 from .symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
+    canonical_external_provider_file,
+    canonical_external_usr_identity,
     compute_symbol_id,
+    external_provider_project,
     is_repo_file_location_identity,
 )
 
 
 PRODUCER_VERSION = "3"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -79,6 +91,32 @@ def _sha_json(value: Any) -> str:
 
 def _sha_file(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
+
+
+def _prompt_graph_cache_key(
+    *,
+    project_id: str,
+    strict_diagnostics: bool,
+    fingerprint_hashes: Mapping[str, str],
+    libclang_version: str,
+    libclang_path: str | None,
+) -> str:
+    return _sha_json(
+        {
+            "schema": INDEX_SCHEMA,
+            "producer": "ClangPromptProjectIndexProducer",
+            "producer_version": PRODUCER_VERSION,
+            "index_integrity_version": INDEX_INTEGRITY_VERSION,
+            "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+            "identity_provenance_contract": PRODUCTION_IDENTITY_PROVENANCE_CONTRACT,
+            "project_id": project_id,
+            "strict_diagnostics": strict_diagnostics,
+            "indexer_dependency_policy": INDEXER_DEPENDENCY_POLICY,
+            "hashes": dict(fingerprint_hashes),
+            "libclang_version": libclang_version,
+            "libclang_path": libclang_path,
+        }
+    )
 
 
 def _normalize_signature(value: object) -> str:
@@ -131,14 +169,20 @@ def _identity_for_cursor(
     reference_project = reference.get("project")
     if not isinstance(reference_project, str):
         raise ValueError("CASE 4 v3 symbol reference provenance project is invalid")
-    if reference_project != project_id:
+    reference_provider = reference.get("provider")
+    reference_include = reference.get("include_provenance")
+    if not isinstance(reference_provider, str):
         raise ValueError(
-            "CASE 4 v3 symbol reference provenance project does not match "
-            "the repository project"
+            "CASE 4 v3 symbol reference provenance provider is invalid"
+        )
+    if not isinstance(reference_include, str):
+        raise ValueError(
+            "CASE 4 v3 symbol reference include provenance is invalid"
         )
     reference_file = reference.get("file")
     if not isinstance(reference_file, str) or not reference_file:
         raise ValueError("CASE 4 v3 symbol reference provenance file is invalid")
+    external_provider = reference_project != project_id
     line = reference.get("line")
     if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
         raise ValueError("CASE 4 v3 symbol reference provenance line is invalid")
@@ -147,35 +191,68 @@ def _identity_for_cursor(
         raise ValueError(
             "CASE 4 v3 symbol reference provenance column is invalid"
         )
-    if not isinstance(reference.get("provider"), str):
-        raise ValueError(
-            "CASE 4 v3 symbol reference provenance provider is invalid"
-        )
-    if not isinstance(reference.get("include_provenance"), str):
-        raise ValueError(
-            "CASE 4 v3 symbol reference include provenance is invalid"
-        )
+    if external_provider:
+        try:
+            expected_project = external_provider_project(
+                reference_provider,
+                source="CASE 4 v3 external provider reference",
+            )
+            expected_file = canonical_external_provider_file(
+                reference_provider,
+                reference_include,
+                source="CASE 4 v3 external provider reference",
+            )
+        except Exception as exc:
+            raise ValueError(
+                "CASE 4 v3 symbol reference provenance project does not match "
+                "the repository project or a trusted external provider"
+            ) from exc
+        if reference_project != expected_project or reference_file != expected_file:
+            raise ValueError(
+                "CASE 4 v3 external provider reference provenance is inconsistent"
+            )
 
     location = getattr(cursor, "location", None)
     location_file = getattr(location, "file", None)
     location_name = getattr(location_file, "name", None)
     if not isinstance(location_name, (str, os.PathLike)) or not str(location_name):
         raise ValueError("CASE 4 v3 cursor file is missing")
-    try:
-        resolved_root = repo_root.resolve()
-        resolved_file = Path(location_name).resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("CASE 4 v3 cursor file could not be resolved") from exc
-    try:
-        relative_file = resolved_file.relative_to(resolved_root).as_posix()
-    except ValueError as exc:
+    location_text = str(location_name)
+    provider_resolver = getattr(indexer, "symbol_provider_provenance", None)
+    if external_provider and location_text.startswith("@provider/"):
+        if not callable(provider_resolver):
+            raise ValueError("CASE 4 v3 external provider path resolver is missing")
+        actual_provider, actual_include = provider_resolver(location_text)
+    else:
+        try:
+            resolved_root = repo_root.resolve()
+            resolved_file = Path(location_name).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("CASE 4 v3 cursor file could not be resolved") from exc
+        try:
+            relative_file = resolved_file.relative_to(resolved_root).as_posix()
+        except ValueError:
+            if not external_provider:
+                raise ValueError("CASE 4 v3 cursor file is outside repository root")
+            if not callable(provider_resolver):
+                raise ValueError("CASE 4 v3 external provider path resolver is missing")
+            actual_provider, actual_include = provider_resolver(location_text)
+        else:
+            if external_provider:
+                raise ValueError(
+                    "CASE 4 v3 external provider cursor resolves inside the repository"
+                )
+            if reference_file != relative_file:
+                raise ValueError(
+                    "CASE 4 v3 symbol reference provenance file does not match "
+                    "the cursor's repository file"
+                )
+    if external_provider and (
+        actual_provider != reference_provider
+        or actual_include != reference_include
+    ):
         raise ValueError(
-            "CASE 4 v3 cursor file is outside repository root"
-        ) from exc
-    if reference_file != relative_file:
-        raise ValueError(
-            "CASE 4 v3 symbol reference provenance file does not match "
-            "the cursor's repository file"
+            "CASE 4 v3 external provider cursor provenance does not match its path"
         )
 
     cursor_line = getattr(location, "line", None)
@@ -211,6 +288,24 @@ def _identity_for_cursor(
             "CASE 4 v3 symbol reference requires USR/signature or explicit "
             "repository-location identity"
         )
+    if external_provider and usr:
+        try:
+            expected_symbol_key = canonical_external_usr_identity(
+                usr=usr,
+                canonical_signature=signature,
+                provider=reference_provider,
+                include_provenance=reference_include,
+                project=reference_project,
+                source="CASE 4 v3 external provider reference",
+            )
+        except Exception as exc:
+            raise ValueError(
+                "CASE 4 v3 external provider symbol key is invalid"
+            ) from exc
+        if symbol_key != expected_symbol_key:
+            raise ValueError(
+                "CASE 4 v3 external provider symbol key is inconsistent"
+            )
     version = int(reference.get("symbol_identity_schema_version") or 0)
     if version != SYMBOL_IDENTITY_SCHEMA_VERSION:
         raise ValueError(
@@ -249,23 +344,53 @@ def _identity_for_cursor(
 
 
 def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
+    indexer_root = indexer_root.expanduser().resolve()
+    if indexer_root != _REPOSITORY_ROOT:
+        raise ValueError(
+            "cppmega_mlx prompt-graph indexer must come from the same checkout as "
+            "the imported cppmega_mlx package; "
+            f"package_root={_REPOSITORY_ROOT}, indexer_root={indexer_root}. "
+            "Cross-checkout cppmega/cppmega.mlx indexer mixing is unsupported."
+        )
     path = indexer_root / "tools" / "clang_indexer" / "index_project.py"
     if not path.is_file():
         raise FileNotFoundError(f"clang indexer module not found: {path}")
     module_name = "_cppmega_prompt_graph_clang_indexer_" + _sha_file(path)[:12]
     existing = sys.modules.get(module_name)
     if existing is not None:
+        existing_file = getattr(existing, "__file__", None)
+        existing_spec = getattr(existing, "__spec__", None)
+        existing_origin = getattr(existing_spec, "origin", None)
+        origins = (existing_file, existing_origin)
+        if any(
+            not isinstance(origin, (str, os.PathLike))
+            or Path(origin).expanduser().resolve(strict=False) != path
+            for origin in origins
+        ):
+            raise ValueError(
+                "cached clang indexer provenance does not match the requested "
+                f"module: requested={path}, file={existing_file!r}, "
+                f"spec_origin={existing_origin!r}"
+            )
         return existing, path
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load clang indexer module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    indexer_root_text = str(indexer_root)
+    original_sys_path = sys.path
+    original_entries = list(original_sys_path)
+    sys.path = [entry for entry in sys.path if entry != indexer_root_text]
+    sys.path.insert(0, indexer_root_text)
     try:
         spec.loader.exec_module(module)
     except Exception:
         sys.modules.pop(module_name, None)
         raise
+    finally:
+        original_sys_path[:] = original_entries
+        sys.path = original_sys_path
     return module, path
 
 
@@ -513,30 +638,25 @@ class ClangPromptProjectIndexProducer:
             for path in files
         }
         indexer_sha256 = _sha_file(indexer_path)
+        indexer_dependency_manifest, indexer_dependency_sha256 = (
+            indexer_dependency_hash(indexer_path, self.indexer_root)
+        )
         fingerprint_hashes = {
             "repository_sha256": repository_sha256,
             "dependency_closure_sha256": _sha_json(dependency_manifest),
             "compile_args_sha256": _sha_json(compile_args_by_file),
             "indexer_sha256": indexer_sha256,
+            INDEXER_DEPENDENCY_HASH_KEY: indexer_dependency_sha256,
             "libclang_version_sha256": sha256(
                 libclang_version.encode("utf-8")
             ).hexdigest(),
         }
-        cache_key = _sha_json(
-            {
-                "schema": INDEX_SCHEMA,
-                "producer": "ClangPromptProjectIndexProducer",
-                "producer_version": PRODUCER_VERSION,
-                "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
-                "identity_provenance_contract": (
-                    PRODUCTION_IDENTITY_PROVENANCE_CONTRACT
-                ),
-                "project_id": project_id,
-                "strict_diagnostics": self.strict_diagnostics,
-                "hashes": fingerprint_hashes,
-                "libclang_version": libclang_version,
-                "libclang_path": resolved_libclang,
-            }
+        cache_key = _prompt_graph_cache_key(
+            project_id=project_id,
+            strict_diagnostics=self.strict_diagnostics,
+            fingerprint_hashes=fingerprint_hashes,
+            libclang_version=libclang_version,
+            libclang_path=resolved_libclang,
         )
         path = self.cache_dir / f"{cache_key}.json"
         if path.exists():
@@ -562,6 +682,7 @@ class ClangPromptProjectIndexProducer:
             fingerprint_hashes=fingerprint_hashes,
             repository_manifest=repository_manifest,
             dependency_manifest=dependency_manifest,
+            indexer_dependency_manifest=indexer_dependency_manifest,
             indexer_path=indexer_path,
             libclang_version=libclang_version,
             resolved_libclang=resolved_libclang,
@@ -569,6 +690,10 @@ class ClangPromptProjectIndexProducer:
         index = index.with_integrity()
         index.validate_production_repository_index(
             expected_project_id=project_id,
+            expected_indexer_root=self.indexer_root,
+        )
+        validate_shared_provenance(
+            index,
             expected_indexer_root=self.indexer_root,
         )
         self._write_cached(path, index)
@@ -592,6 +717,7 @@ class ClangPromptProjectIndexProducer:
         fingerprint_hashes: Mapping[str, str],
         repository_manifest: Mapping[str, str],
         dependency_manifest: Mapping[str, str],
+        indexer_dependency_manifest: Mapping[str, str],
         indexer_path: Path,
         libclang_version: str,
         resolved_libclang: str | None,
@@ -611,6 +737,7 @@ class ClangPromptProjectIndexProducer:
 
         raw_symbols: list[dict[str, Any]] = []
         chunk_candidates: list[dict[str, Any]] = []
+        external_references: dict[tuple[Any, ...], dict[str, Any]] = {}
         diagnostics: dict[str, list[str]] = {}
         identity_adapters: set[str] = set()
         function_kinds = set(indexer.FUNCTION_KINDS)
@@ -770,6 +897,36 @@ class ClangPromptProjectIndexProducer:
                     byte_to_char=byte_to_char,
                     fallback_name=str(getattr(referenced, "spelling", "") or ""),
                 )
+                if target.identity_project != project_id:
+                    external_reference = {
+                        "relation": relation,
+                        "document_id": int(document["id"]),
+                        "source_path": relative,
+                        "start": start,
+                        "end": end,
+                        "symbol_key": target.symbol_key,
+                        "symbol_id": target.symbol_id,
+                        "usr": target.usr,
+                        "canonical_signature": target.canonical_signature,
+                        "qname": target.qname,
+                        "symbol_kind": target.symbol_kind,
+                        "project": target.identity_project,
+                        "file": target.identity_file,
+                        "line": target.identity_line,
+                        "column": target.identity_column,
+                        "provider": target.identity_provider,
+                        "include_provenance": target.identity_include_provenance,
+                    }
+                    external_key = (
+                        relation,
+                        int(document["id"]),
+                        relative,
+                        start,
+                        end,
+                        target.symbol_key,
+                    )
+                    external_references.setdefault(external_key, external_reference)
+                    continue
                 raw_symbols.append(
                     {
                         "kind": f"{relation}site" if relation != "def_use" else "use",
@@ -959,7 +1116,9 @@ class ClangPromptProjectIndexProducer:
                 "cross_domain",
             )
         }
-        if not symbols or not chunks or sum(edge_counts.values()) == 0:
+        if not symbols or not chunks or (
+            sum(edge_counts.values()) == 0 and not external_references
+        ):
             raise ValueError(
                 "clang prompt graph producer emitted unavailable graph data: "
                 f"symbols={len(symbols)} chunks={len(chunks)} edges={sum(edge_counts.values())}"
@@ -985,6 +1144,7 @@ class ClangPromptProjectIndexProducer:
         provenance = {
             "producer": "ClangPromptProjectIndexProducer",
             "producer_version": PRODUCER_VERSION,
+            "index_integrity_version": INDEX_INTEGRITY_VERSION,
             "schema": INDEX_SCHEMA,
             "project_id": project_id,
             "cache_key": cache_key,
@@ -1007,6 +1167,22 @@ class ClangPromptProjectIndexProducer:
             "dependency_closure_policy": "all_indexed_repository_sources_v1",
             "dependency_manifest": dict(sorted(dependency_manifest.items())),
             "indexer_path": str(indexer_path),
+            "indexer_dependency_policy": INDEXER_DEPENDENCY_POLICY,
+            INDEXER_DEPENDENCY_MANIFEST_KEY: dict(
+                sorted(indexer_dependency_manifest.items())
+            ),
+            "indexer_checkout_root": str(self.indexer_root),
+            "external_references": sorted(
+                external_references.values(),
+                key=lambda row: (
+                    row["document_id"],
+                    row["start"],
+                    row["end"],
+                    row["relation"],
+                    row["symbol_key"],
+                ),
+            ),
+            "external_reference_count": len(external_references),
             "document_count": len(documents),
             "symbol_count": len(symbols),
             "chunk_count": len(chunks),
@@ -1066,6 +1242,10 @@ class ClangPromptProjectIndexProducer:
                 expected_project_id=project_id,
                 expected_indexer_root=expected_indexer_root,
             )
+            validate_shared_provenance(
+                index,
+                expected_indexer_root=expected_indexer_root,
+            )
             receipt = index.provenance
             if receipt.get("producer") != "ClangPromptProjectIndexProducer":
                 raise ValueError("producer mismatch")
@@ -1100,6 +1280,7 @@ class ClangPromptProjectIndexProducer:
 
 __all__ = [
     "ClangPromptProjectIndexProducer",
+    "INDEX_INTEGRITY_VERSION",
     "PRODUCTION_IDENTITY_PROVENANCE_CONTRACT",
     "PRODUCER_VERSION",
     "PromptProjectIndexBuildResult",
