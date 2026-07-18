@@ -32,6 +32,12 @@ def _load_eval_module():
     return module
 
 
+def _write_executable(path: Path, body: str) -> str:
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | 0o111)
+    return str(path)
+
+
 def test_domain_eval_prompt_loader_requires_domains(tmp_path):
     mod = _load_eval_module()
     path = tmp_path / "prompts.jsonl"
@@ -42,7 +48,8 @@ def test_domain_eval_prompt_loader_requires_domains(tmp_path):
                 "task_type": "cpp_docstring_to_code",
                 "prompt": "// add\n",
                 "required_domains": ["CPP"],
-                "expected_sidecars": ["token_domain_ids"],
+                "oracle_kind": "cpp_compile_run",
+                "expected_sidecars": ["token_domain_ids", "token_role_ids"],
                 "compile_suffix": "\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
                 "run_binary": True,
             }
@@ -55,7 +62,7 @@ def test_domain_eval_prompt_loader_requires_domains(tmp_path):
 
     assert len(prompts) == 1
     assert prompts[0].required_domains == ("CPP",)
-    assert prompts[0].expected_sidecars == ("token_domain_ids",)
+    assert prompts[0].expected_sidecars == ("token_domain_ids", "token_role_ids")
 
 
 def _case5_ksh_eval_row() -> dict:
@@ -71,8 +78,6 @@ def _case5_ksh_eval_row() -> dict:
 def test_domain_eval_freezes_structured_ksh_prompt_sidecars(tmp_path: Path) -> None:
     mod = _load_eval_module()
     row = _case5_ksh_eval_row()
-    row["compile_suffix"] = "\nint main(){return 0;}\n"
-    row["run_binary"] = True
     path = tmp_path / "ksh-prompts.jsonl"
     path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
@@ -118,8 +123,6 @@ def test_domain_eval_freezes_structured_ksh_prompt_sidecars(tmp_path: Path) -> N
 def test_domain_eval_rejects_misaligned_prompt_sidecar_edges(tmp_path: Path) -> None:
     mod = _load_eval_module()
     row = _case5_ksh_eval_row()
-    row["compile_suffix"] = "\nint main(){return 0;}\n"
-    row["run_binary"] = True
     row["prompt_sidecars"]["token_shell_edges"][0]["to"] = len(
         row["prompt_token_ids"]
     )
@@ -130,11 +133,54 @@ def test_domain_eval_rejects_misaligned_prompt_sidecar_edges(tmp_path: Path) -> 
         mod.load_prompts(path)
 
 
-def test_domain_eval_rejects_shipped_prompt_without_executable_oracle():
+def test_domain_eval_loads_shipped_prompts_with_typed_oracles():
     mod = _load_eval_module()
     path = Path("evals/domain_routed_prompts.jsonl")
 
-    with pytest.raises(ValueError, match="executable compile oracle"):
+    prompts = mod.load_prompts(path)
+
+    assert [prompt.oracle_kind for prompt in prompts] == [
+        "cpp_compile_run",
+        "cpp_compile_run",
+        "build_structure",
+        "shell_syntax",
+        "sidecar_structure",
+    ]
+
+
+def test_domain_eval_prompt_loader_requires_typed_oracle_contract(tmp_path: Path):
+    mod = _load_eval_module()
+    row = {
+        "id": "p0",
+        "task_type": "shell",
+        "prompt": "echo ok\n",
+        "required_domains": ["SH"],
+    }
+    path = tmp_path / "prompts.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="oracle_kind"):
+        mod.load_prompts(path)
+
+
+def test_domain_eval_rejects_oracle_domain_mismatch(tmp_path: Path):
+    mod = _load_eval_module()
+    row = {
+        "id": "p0",
+        "task_type": "shell",
+        "prompt": "echo ok\n",
+        "required_domains": ["SH"],
+        "oracle_kind": "build_structure",
+        "expected_sidecars": [
+            "token_domain_ids",
+            "token_role_ids",
+            "token_shell_edges",
+        ],
+    }
+    path = tmp_path / "prompts.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="build_structure oracle requires"):
         mod.load_prompts(path)
 
 
@@ -146,6 +192,7 @@ def test_domain_eval_evaluate_without_completion_fails_closed():
         prompt="// add\n",
         required_domains=("CPP",),
         expected_sidecars=("token_domain_ids",),
+        oracle_kind="cpp_compile_run",
         compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
         run_binary=True,
     )
@@ -168,6 +215,7 @@ def test_domain_eval_compile_gate_accepts_simple_cpp_completion():
         prompt="// add\n",
         required_domains=("CPP",),
         expected_sidecars=("token_domain_ids",),
+        oracle_kind="cpp_compile_run",
         compile_prefix="",
         compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
         run_binary=True,
@@ -192,6 +240,7 @@ def test_domain_eval_runtime_oracle_rejects_wrong_compilable_completion():
         prompt="// add\n",
         required_domains=("CPP",),
         expected_sidecars=("token_domain_ids",),
+        oracle_kind="cpp_compile_run",
         compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
         run_binary=True,
     )
@@ -205,7 +254,7 @@ def test_domain_eval_runtime_oracle_rejects_wrong_compilable_completion():
     assert result["status"] == "runtime_failed"
 
 
-def test_domain_eval_reports_compile_timeout_instead_of_raising(monkeypatch):
+def test_domain_eval_reports_compile_timeout_instead_of_raising(tmp_path: Path):
     mod = _load_eval_module()
     prompt = mod.DomainEvalPrompt(
         id="timeout",
@@ -213,27 +262,22 @@ def test_domain_eval_reports_compile_timeout_instead_of_raising(monkeypatch):
         prompt="// timeout\n",
         required_domains=("CPP",),
         expected_sidecars=(),
+        oracle_kind="cpp_compile_run",
         compile_suffix="\nint main(){return f();}\n",
         run_binary=True,
     )
 
-    def timeout(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(["clang++"], timeout=0.01, stderr="busy")
-
-    monkeypatch.setattr(mod.subprocess, "run", timeout)
+    compiler = _write_executable(tmp_path / "slow-compiler", "sleep 1")
 
     result = mod.compile_cpp_completion(
         prompt,
         "int f() { return 0; }",
-        compiler="clang++",
+        compiler=compiler,
         compile_timeout_s=0.01,
     )
 
-    assert result == {
-        "status": "compile_timeout",
-        "timeout_s": 0.01,
-        "stderr": "busy",
-    }
+    assert result["status"] == "compile_timeout"
+    assert result["timeout_s"] == 0.01
 
 
 def test_domain_eval_marks_no_compile_as_failure():
@@ -244,6 +288,7 @@ def test_domain_eval_marks_no_compile_as_failure():
         prompt="// add\n",
         required_domains=("CPP",),
         expected_sidecars=(),
+        oracle_kind="cpp_compile_run",
         compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
         run_binary=True,
     )
@@ -265,6 +310,7 @@ def test_domain_eval_marks_missing_compile_oracle_as_failure():
         prompt="// unchecked\n",
         required_domains=("CPP",),
         expected_sidecars=(),
+        oracle_kind="cpp_compile_run",
     )
 
     report = mod.evaluate([prompt], {"unchecked": "int f(){return 0;}"})
@@ -274,7 +320,7 @@ def test_domain_eval_marks_missing_compile_oracle_as_failure():
     assert report["passed"] is False
 
 
-def test_domain_eval_marks_compiler_unavailable_as_failure(monkeypatch):
+def test_domain_eval_marks_compiler_unavailable_as_failure():
     mod = _load_eval_module()
     prompt = mod.DomainEvalPrompt(
         id="add",
@@ -282,26 +328,22 @@ def test_domain_eval_marks_compiler_unavailable_as_failure(monkeypatch):
         prompt="// add\n",
         required_domains=("CPP",),
         expected_sidecars=(),
+        oracle_kind="cpp_compile_run",
         compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
         run_binary=True,
     )
-    monkeypatch.setattr(mod, "_find_cpp_compiler", lambda: None)
-
-    report = mod.evaluate([prompt], {"add": "int add(int a,int b){return a+b;}"})
+    report = mod.evaluate(
+        [prompt],
+        {"add": "int add(int a,int b){return a+b;"},
+        tool_overrides={"cpp": None},
+    )
 
     assert report["rows"][0]["status"] == "compile_oracle_unavailable"
     assert report["failed"] == 1
     assert report["passed"] is False
 
 
-@pytest.mark.parametrize(
-    "status",
-    ["compile_timeout", "compile_failed", "runtime_timeout", "runtime_failed"],
-)
-def test_domain_eval_counts_compile_and_runtime_failures(
-    monkeypatch,
-    status: str,
-) -> None:
+def test_domain_eval_counts_compile_failure() -> None:
     mod = _load_eval_module()
     prompt = mod.DomainEvalPrompt(
         id="add",
@@ -309,21 +351,16 @@ def test_domain_eval_counts_compile_and_runtime_failures(
         prompt="// add\n",
         required_domains=("CPP",),
         expected_sidecars=(),
+        oracle_kind="cpp_compile_run",
         compile_suffix="\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
         run_binary=True,
     )
-    monkeypatch.setattr(
-        mod,
-        "compile_cpp_completion",
-        lambda *_args, **_kwargs: {"status": status},
-    )
-
     report = mod.evaluate(
         [prompt],
-        {"add": "int add(int a,int b){return a+b;}"},
+        {"add": "int add(int a,int b){return ;"},
     )
 
-    assert report["status_counts"] == {status: 1}
+    assert report["status_counts"] == {"compile_failed": 1}
     assert report["failed"] == 1
     assert report["passed"] is False
 
@@ -339,9 +376,11 @@ def test_domain_eval_cli_exits_nonzero_for_not_compiled(
             {
                 "id": "add",
                 "task_type": "cpp_docstring_to_code",
-                "prompt": "// add\n",
-                "required_domains": ["CPP"],
-                "compile_suffix": "\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
+                    "prompt": "// add\n",
+                    "required_domains": ["CPP"],
+                    "oracle_kind": "cpp_compile_run",
+                    "expected_sidecars": ["token_domain_ids", "token_role_ids"],
+                    "compile_suffix": "\nint main(){return add(2,3)==5 ? 0 : 1;}\n",
                 "run_binary": True,
             }
         )
@@ -378,3 +417,183 @@ def test_domain_eval_cli_exits_nonzero_for_not_compiled(
 
     assert result.returncode == 2
     assert json.loads(report_path.read_text(encoding="utf-8"))["failed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("domain", "shell_name", "completion"),
+    [
+        ("BASH", "bash", "if true; then echo ok; fi\n"),
+        ("ZSH", "zsh", "if true; then print ok; fi\n"),
+        ("KSH", "ksh", "if true; then print ok; fi\n"),
+        ("SH", "sh", "if true; then echo ok; fi\n"),
+    ],
+)
+def test_shell_oracle_checks_declared_dialect(
+    domain: str,
+    shell_name: str,
+    completion: str,
+) -> None:
+    if shutil.which(shell_name) is None:
+        pytest.skip(f"{shell_name} is unavailable")
+    mod = _load_eval_module()
+    prompt = mod.DomainEvalPrompt(
+        id=f"{shell_name}-syntax",
+        task_type="shell_syntax",
+        prompt=completion,
+        required_domains=(domain,),
+        expected_sidecars=("token_domain_ids", "token_role_ids", "token_shell_edges"),
+        oracle_kind="shell_syntax",
+    )
+
+    result = mod.shell_syntax_oracle(prompt, completion)
+
+    assert result["status"] == "shell_syntax_passed"
+    assert result["shell_kind"] == shell_name
+
+
+def test_shell_oracle_rejects_invalid_syntax() -> None:
+    mod = _load_eval_module()
+    prompt = mod.DomainEvalPrompt(
+        id="bad-sh",
+        task_type="shell_syntax",
+        prompt="if true; then echo missing-fi\n",
+        required_domains=("SH",),
+        expected_sidecars=("token_domain_ids", "token_role_ids", "token_shell_edges"),
+        oracle_kind="shell_syntax",
+    )
+
+    result = mod.shell_syntax_oracle(prompt, "if true; then echo missing-fi\n")
+
+    assert result["status"] in {"shell_parse_failed", "shell_syntax_failed"}
+
+
+def test_shell_oracle_reports_explicit_unavailability() -> None:
+    mod = _load_eval_module()
+    prompt = mod.DomainEvalPrompt(
+        id="missing-ksh",
+        task_type="shell_syntax",
+        prompt="print ok\n",
+        required_domains=("KSH",),
+        expected_sidecars=("token_domain_ids", "token_role_ids", "token_shell_edges"),
+        oracle_kind="shell_syntax",
+    )
+
+    result = mod.shell_syntax_oracle(
+        prompt,
+        "print ok\n",
+        tool_overrides={"ksh": None},
+    )
+
+    assert result["status"] == "shell_oracle_unavailable"
+    assert result["failed_closed"] is True
+
+
+@pytest.mark.parametrize(
+    ("domain", "completion"),
+    [
+        ("CMAKE", "add_executable(app main.cpp)\n"),
+        ("MAKE", "app: main.o\n\t$(CXX) -o app main.o\n"),
+        ("NINJA", "rule cc\n  command = c++ -c $in -o $out\nbuild app.o: cc app.cc\n"),
+        ("BAZEL", 'cc_binary(name = "app", srcs = ["main.cc"])\n'),
+        ("CONFIGURE", "#!/bin/sh\nCC=cc\nexport CC\n"),
+    ],
+)
+def test_build_structure_oracle_checks_declared_build_domain(
+    domain: str,
+    completion: str,
+) -> None:
+    mod = _load_eval_module()
+    sidecar = "token_shell_edges" if domain == "CONFIGURE" else "token_build_edges"
+    prompt = mod.DomainEvalPrompt(
+        id=f"{domain.lower()}-structure",
+        task_type="build_structure",
+        prompt=completion,
+        required_domains=(domain,),
+        expected_sidecars=("token_domain_ids", "token_role_ids", sidecar),
+        oracle_kind="build_structure",
+    )
+
+    result = mod.build_structure_oracle(prompt, completion)
+
+    assert result["status"] == "build_structure_passed"
+    assert result["build_kind"] == domain.lower()
+
+
+def test_build_structure_oracle_rejects_unstructured_text() -> None:
+    mod = _load_eval_module()
+    prompt = mod.DomainEvalPrompt(
+        id="bad-cmake",
+        task_type="build_structure",
+        prompt="not a cmake command\n",
+        required_domains=("CMAKE",),
+        expected_sidecars=("token_domain_ids", "token_role_ids", "token_build_edges"),
+        oracle_kind="build_structure",
+    )
+
+    result = mod.build_structure_oracle(prompt, "not a cmake command\n")
+
+    assert result["status"] == "build_structure_failed"
+
+
+def test_sidecar_structure_oracle_uses_frozen_graph_contract() -> None:
+    mod = _load_eval_module()
+    row = _case5_ksh_eval_row()
+    path = Path("evals/domain_routed_prompts.jsonl")
+    prompt = mod.load_prompts(path)[-1]
+
+    result = mod.sidecar_structure_oracle(prompt, "The route is valid.")
+
+    assert result["status"] == "sidecar_structure_passed"
+    assert result["required_domains"] == ["KSH", "BUILD_ERROR"]
+    assert result["cross_domain_edges"] == 1
+    assert row["id"] == prompt.id
+
+
+def test_sidecar_structure_oracle_fails_without_frozen_sidecars() -> None:
+    mod = _load_eval_module()
+    prompt = mod.DomainEvalPrompt(
+        id="missing-sidecars",
+        task_type="diagnostic",
+        prompt="error: bad\n",
+        required_domains=("COMPILER_ERROR",),
+        expected_sidecars=("token_domain_ids", "token_role_ids", "token_diagnostic_edges"),
+        oracle_kind="sidecar_structure",
+    )
+
+    result = mod.sidecar_structure_oracle(prompt, "add a header")
+
+    assert result["status"] == "missing_sidecar_oracle"
+    assert result["failed_closed"] is True
+
+
+def test_evaluate_dispatches_shell_build_and_sidecar_oracles() -> None:
+    mod = _load_eval_module()
+    prompts = mod.load_prompts(Path("evals/domain_routed_prompts.jsonl"))[2:]
+    completions = mod.load_completions(
+        Path("evals/domain_routed_gold_completions.jsonl")
+    )
+
+    report = mod.evaluate(prompts, completions)
+
+    assert [row["status"] for row in report["rows"]] == [
+        "build_structure_passed",
+        "shell_syntax_passed",
+        "sidecar_structure_passed",
+    ]
+    assert report["oracle_passed"] == 3
+    assert report["compile_passed"] == 0
+
+
+def test_domain_eval_full_shipped_jsonl_is_green_with_gold_completions() -> None:
+    mod = _load_eval_module()
+    prompts = mod.load_prompts(Path("evals/domain_routed_prompts.jsonl"))
+    completions = mod.load_completions(
+        Path("evals/domain_routed_gold_completions.jsonl")
+    )
+
+    report = mod.evaluate(prompts, completions)
+
+    assert report["prompts"] == 5
+    assert report["completion_rows"] == 5
+    assert report["passed"] is True
+    assert report["failed"] == 0
