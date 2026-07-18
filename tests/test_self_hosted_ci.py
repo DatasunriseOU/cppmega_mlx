@@ -277,3 +277,18 @@ def test_lane_manifests_cover_current_case5_and_training_regressions() -> None:
     ):
         assert test_path in ci.MACOS_TESTS
         assert test_path in ci.LINUX_TESTS
+
+
+def test_macos_lane_covers_case1_to_case5_graph_identity_contracts() -> None:
+    for test_path in (
+        "tests/test_atomic_identity_publication.py",
+        "tests/test_clang_usr_identity.py",
+        "tests/test_graph_recipe.py",
+        "tests/test_inference_repository_prompt_graph.py",
+        "tests/test_objective_schedule.py",
+        "tests/test_prompt_graph.py",
+        "tests/test_prompt_graph_index.py",
+        "tests/test_stage1_graph_domain_production.py",
+        "tests/test_train_stage1_smoke.py",
+    ):
+        assert test_path in ci.MACOS_TESTS
