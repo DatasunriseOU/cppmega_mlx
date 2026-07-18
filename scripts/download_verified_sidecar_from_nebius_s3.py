@@ -37,6 +37,7 @@ from scripts.sidecar_manifest_contract import (
     resolve_s3_env,
     validate_audit_receipt,
     validate_manifest,
+    validate_semantic_audit_receipt_binding,
     verify_inventory,
     write_json_atomic,
 )
@@ -227,13 +228,14 @@ def _verify_downloaded_set(
     receipt_path = _receipt_path_for(dest, validated)
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise SystemExit(f"audit receipt missing after download: {receipt_path}")
+    selected_keys = [
+        str(item["remote"])[len(PARQUET_REMOTE_PREFIX):]
+        for item in validated["selections"]
+        if str(item["remote"]).startswith(PARQUET_REMOTE_PREFIX)
+    ]
     report = validate_audit_receipt(
         json.loads(receipt_path.read_text(encoding="utf-8")),
-        selected_keys=[
-            str(item["remote"])[len(PARQUET_REMOTE_PREFIX):]
-            for item in validated["selections"]
-            if str(item["remote"]).startswith(PARQUET_REMOTE_PREFIX)
-        ],
+        selected_keys=selected_keys,
     )
     audit_binding = validated["audit_receipt"]
     if (
@@ -242,11 +244,11 @@ def _verify_downloaded_set(
         != audit_binding["sha256"]
     ):
         raise SystemExit("downloaded audit receipt SHA-256 does not match manifest")
-    selected_keys = [
-        str(item["remote"])[len(PARQUET_REMOTE_PREFIX):]
-        for item in validated["selections"]
-        if str(item["remote"]).startswith(PARQUET_REMOTE_PREFIX)
-    ]
+    validate_semantic_audit_receipt_binding(
+        validated["semantic_audit"],
+        report,
+        selected_keys=selected_keys,
+    )
     receipt_valid_tokens = sum(
         int(report["by_kind_bucket"][key]["valid_tokens"]) for key in selected_keys
     )

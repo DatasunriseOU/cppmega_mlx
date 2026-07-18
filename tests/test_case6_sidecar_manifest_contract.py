@@ -6,14 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_verified_sidecar_download_verification import _write_green_shard
+from scripts import download_verified_sidecar_from_nebius_s3 as download
+from scripts import upload_verified_sidecar_to_nebius_s3 as upload
 from scripts.check_environment import readiness_failures
 from scripts.sidecar_manifest_contract import (
     AUDIT_FILENAME,
     AUDIT_REMOTE,
     AUDIT_SCHEMA,
     GRAPH_CONTRACT,
+    MANIFEST_SCHEMA,
     OBJECTIVE_CONTRACT,
     audit_contract,
+    build_semantic_audit_binding,
     finalize_manifest,
     inventory_directory,
     inventory_sha256,
@@ -40,12 +45,17 @@ def _green_manifest(tmp_path: Path) -> tuple[dict, Path]:
     for index, remote in enumerate(PARQUET_REMOTES, 1):
         local = tmp_path / "source" / remote.replace("/", "_")
         local.mkdir(parents=True)
-        (local / f"shard-{index:03d}.parquet").write_bytes(f"shard-{index}".encode())
+        bucket = int(remote.rsplit("/", 1)[1])
+        _write_green_shard(
+            local / f"shard-{index:03d}.parquet",
+            length=bucket,
+            source_id=index,
+        )
         inventory = inventory_directory(local, remote=remote)
         selections.append({"remote": remote, "local": local.relative_to(tmp_path).as_posix(), **inventory})
         by_kind_bucket[remote.removeprefix("parquet/")] = {
             "files": 1,
-            "valid_tokens": 10,
+            "valid_tokens": bucket,
             "bad_files": 0,
             "bad_rows": 0,
         }
@@ -71,11 +81,13 @@ def _green_manifest(tmp_path: Path) -> tuple[dict, Path]:
         record for record in audit_inventory["files"] if record["path"] == AUDIT_FILENAME
     )
     payload = {
-        "schema": "cppmega_verified_sidecar_manifest_v2",
+        "schema": MANIFEST_SCHEMA,
         "bucket": "bucket",
         "prefix": "prefix/run-1",
         "endpoint_url": "https://storage.example",
-        "verified_valid_tokens": len(PARQUET_REMOTES) * 10,
+        "verified_valid_tokens": sum(
+            int(item["valid_tokens"]) for item in by_kind_bucket.values()
+        ),
         "profile": "code_commits_integrated_pr",
         "standalone_pr_included": False,
         "selections": selections,
@@ -91,6 +103,19 @@ def _green_manifest(tmp_path: Path) -> tuple[dict, Path]:
             "path": AUDIT_FILENAME,
             "sha256": audit_record["sha256"],
         },
+        "semantic_audit": build_semantic_audit_binding(
+            selections=selections,
+            audited_files=upload._audit_selected_parquet_files(
+                [
+                    {
+                        **item,
+                        "local": str(tmp_path / str(item["local"])),
+                    }
+                    for item in selections
+                ]
+            ),
+            source_receipt_sha256=str(audit_record["sha256"]),
+        ),
         "graph_contract": GRAPH_CONTRACT,
         "objective_contract": OBJECTIVE_CONTRACT,
     }
@@ -109,6 +134,18 @@ def test_manifest_binds_inventory_and_explicit_bucket_exclusions(tmp_path: Path)
 
     assert verification["status"] == "verified"
     assert verification["files"] == len(PARQUET_REMOTES) + 1
+    semantic = validated["semantic_audit"]
+    assert semantic["file_count"] == len(PARQUET_REMOTES)
+    assert semantic["contract"] == audit_contract()
+    assert {
+        (item["remote"], item["path"], item["size"], item["sha256"])
+        for item in semantic["files"]
+    } == {
+        (selection["remote"], item["path"], item["size"], item["sha256"])
+        for selection in validated["selections"]
+        if str(selection["remote"]).startswith("parquet/")
+        for item in selection["files"]
+    }
     excluded = validated["selection_policy"]["excluded"]
     assert {item["remote"] for item in excluded} >= {
         "parquet/code/16384",
@@ -181,6 +218,51 @@ def test_manifest_profile_and_audit_inventory_binding_are_exact(tmp_path: Path) 
     wrong_audit = finalize_manifest(wrong_audit)
     with pytest.raises(ValueError, match="inventory binding"):
         validate_manifest(wrong_audit)
+
+
+def test_upload_rejects_same_count_parquet_replacement_against_stale_audit(
+    tmp_path: Path,
+) -> None:
+    manifest, root = _green_manifest(tmp_path)
+    selections = tuple(
+        (str(item["remote"]), root / str(item["local"]))
+        for item in manifest["selections"]
+    )
+    audit_path = root / next(
+        str(item["local"])
+        for item in manifest["selections"]
+        if item["remote"] == AUDIT_REMOTE
+    ) / AUDIT_FILENAME
+    parquet_root = root / str(manifest["selections"][0]["local"])
+    replacement = next(parquet_root.glob("*.parquet"))
+    replacement.write_bytes(b"same-count but not parquet")
+
+    with pytest.raises((SystemExit, ValueError), match="semantic|audit|parquet"):
+        upload._write_manifest(
+            tmp_path / "manifest.json",
+            bucket="bucket",
+            prefix="prefix/run-1",
+            endpoint_url="https://storage.example",
+            token_total=int(manifest["verified_valid_tokens"]),
+            selections=selections,
+            audit_receipts=(audit_path,),
+            include_standalone_pr=False,
+        )
+
+
+def test_downloader_rejects_manifest_without_exact_semantic_audit_binding(
+    tmp_path: Path,
+) -> None:
+    manifest, root = _green_manifest(tmp_path)
+    manifest.pop("semantic_audit")
+    manifest = finalize_manifest(manifest)
+
+    with pytest.raises(ValueError, match="semantic"):
+        download._verify_downloaded_set(
+            dest=root,
+            manifest=manifest,
+            require_token_total=True,
+        )
 
 
 def test_nebius_credentials_are_atomic() -> None:

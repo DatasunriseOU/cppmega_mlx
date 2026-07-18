@@ -36,6 +36,8 @@ from scripts.sidecar_manifest_contract import (
     GRAPH_CONTRACT,
     MANIFEST_SCHEMA,
     OBJECTIVE_CONTRACT,
+    build_semantic_audit_binding,
+    contained_path,
     finalize_manifest,
     inventory_directory,
     inventory_sha256,
@@ -43,6 +45,7 @@ from scripts.sidecar_manifest_contract import (
     selection_policy,
     sha256_file,
     validate_audit_receipt,
+    validate_semantic_audit_receipt_binding,
     write_json_atomic,
 )
 
@@ -322,6 +325,88 @@ def _upload_manifest(
     }
 
 
+def _audit_selected_parquet_files(
+    inventory: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Run the existing semantic parquet auditor over the exact inventory."""
+
+    try:
+        from scripts.audit_sidecar_parquet import _audit_file
+    except Exception as exc:
+        raise SystemExit(
+            f"cannot load semantic parquet auditor for manifest publication: {exc}"
+        ) from exc
+
+    audited: list[dict[str, object]] = []
+    for selection in inventory:
+        remote = str(selection["remote"])
+        if not remote.startswith("parquet/"):
+            continue
+        kind, bucket = remote.removeprefix("parquet/").split("/", 1)
+        local_root = Path(str(selection["local"]))
+        files = selection.get("files")
+        if not isinstance(files, list):
+            raise SystemExit(f"manifest inventory lacks file records for {remote}")
+        for record in files:
+            if not isinstance(record, dict):
+                raise SystemExit(f"manifest inventory file record is invalid for {remote}")
+            relative = str(record["path"])
+            parquet_path = contained_path(
+                local_root,
+                relative,
+                where=f"semantic audit file for {remote}",
+            )
+            try:
+                result = _audit_file(str(parquet_path), kind, bucket, 65536)
+            except Exception as exc:
+                raise SystemExit(
+                    f"semantic parquet audit failed for {remote}/{relative}: {exc}"
+                ) from exc
+            stats = result.get("stats")
+            if not isinstance(stats, dict):
+                raise SystemExit(
+                    f"semantic parquet audit returned no stats for {remote}/{relative}"
+                )
+            if (
+                int(stats.get("files", -1)) != 1
+                or int(stats.get("bad_files", -1))
+                or int(stats.get("bad_rows", -1))
+            ):
+                raise SystemExit(
+                    f"semantic parquet audit is not green for {remote}/{relative}: "
+                    f"files={stats.get('files')} bad_files={stats.get('bad_files')} "
+                    f"bad_rows={stats.get('bad_rows')}"
+                )
+            audited.append(
+                {
+                    "remote": remote,
+                    "path": relative,
+                    "size": record["size"],
+                    "sha256": record["sha256"],
+                    "stats": stats,
+                }
+            )
+    if not audited:
+        raise SystemExit("semantic parquet audit selected no files")
+    return audited
+
+
+def _assert_inventory_stable(inventory: list[dict[str, object]]) -> None:
+    """Reject source changes between inventory hashing and publication."""
+
+    for selection in inventory:
+        current = inventory_directory(
+            Path(str(selection["local"])),
+            remote=str(selection["remote"]),
+        )
+        for field in ("files", "file_count", "byte_count", "artifact_set_sha256"):
+            if current[field] != selection[field]:
+                raise SystemExit(
+                    f"selection inventory changed during semantic audit: "
+                    f"{selection['remote']} ({field})"
+                )
+
+
 def _write_manifest(
     path: Path,
     *,
@@ -369,6 +454,26 @@ def _write_manifest(
     )
     if audit_file["sha256"] != sha256_file(audit_path):
         raise SystemExit("audit receipt inventory SHA-256 drifted during manifest build")
+    audited_files = _audit_selected_parquet_files(inventory)
+    _assert_inventory_stable(inventory)
+    semantic_audit = build_semantic_audit_binding(
+        selections=inventory,
+        audited_files=audited_files,
+        source_receipt_sha256=str(audit_file["sha256"]),
+    )
+    try:
+        validate_semantic_audit_receipt_binding(
+            semantic_audit,
+            audit_payload,
+            selected_keys=selected_keys,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if int(semantic_audit["verified_valid_tokens"]) != token_total:
+        raise SystemExit(
+            "fresh semantic audit valid-token total differs from selected "
+            "audit receipt total"
+        )
     payload = {
         "schema": MANIFEST_SCHEMA,
         "bucket": bucket,
@@ -394,6 +499,7 @@ def _write_manifest(
             "path": AUDIT_FILENAME,
             "sha256": audit_file["sha256"],
         },
+        "semantic_audit": semantic_audit,
         "graph_contract": GRAPH_CONTRACT,
         "objective_contract": OBJECTIVE_CONTRACT,
     }

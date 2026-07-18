@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_verified_sidecar_download_verification import (
+    _write_green_shard as _write_case5_shard,
+)
 from scripts import download_verified_sidecar_from_nebius_s3 as download
 from scripts import upload_verified_sidecar_to_nebius_s3 as upload
 from scripts.sidecar_manifest_contract import (
@@ -13,12 +16,15 @@ from scripts.sidecar_manifest_contract import (
     AUDIT_REMOTE,
     AUDIT_SCHEMA,
     GRAPH_CONTRACT,
+    MANIFEST_SCHEMA,
     OBJECTIVE_CONTRACT,
     audit_contract,
+    build_semantic_audit_binding,
     finalize_manifest,
     inventory_directory,
     inventory_sha256,
     selection_policy,
+    validate_manifest,
 )
 
 
@@ -103,6 +109,21 @@ _BUCKET_VALID_TOKENS = {
 }
 
 
+def _write_green_shard(
+    path: Path,
+    *,
+    bucket: int,
+    valid_tokens: int,
+    source_id: int,
+) -> None:
+    _write_case5_shard(
+        path,
+        length=bucket,
+        source_id=source_id,
+        valid_tokens=valid_tokens,
+    )
+
+
 def _build_receipt(
     path: Path,
     *,
@@ -150,7 +171,7 @@ def _download_fixture(
     include_standalone_pr: bool = False,
     bad: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[dict, Path]:
-    """Build a complete v2 manifest and matching local inventory."""
+    """Build a complete v3 manifest and matching local inventory."""
 
     manifest_plan = download._default_manifest(
         "bucket",
@@ -177,8 +198,13 @@ def _download_fixture(
         if remote == AUDIT_REMOTE:
             (local / AUDIT_FILENAME).write_bytes(receipt_source.read_bytes())
         else:
-            (local / f"part-{index:03d}.parquet").write_bytes(
-                f"fixture-{remote}".encode()
+            bucket = int(remote.rsplit("/", 1)[1])
+            key = remote.removeprefix("parquet/")
+            _write_green_shard(
+                local / f"part-{index:03d}.parquet",
+                bucket=bucket,
+                valid_tokens=_BUCKET_VALID_TOKENS[key],
+                source_id=index,
             )
         inventory = inventory_directory(local, remote=remote)
         selections.append({"remote": remote, "local": local_relative, **inventory})
@@ -189,7 +215,7 @@ def _download_fixture(
     )
     token_total = sum(_BUCKET_VALID_TOKENS[key] for key in selected_keys)
     payload = {
-        "schema": "cppmega_verified_sidecar_manifest_v2",
+        "schema": MANIFEST_SCHEMA,
         "bucket": "bucket",
         "prefix": "prefix",
         "endpoint_url": "https://storage.eu-north1.nebius.cloud",
@@ -213,6 +239,19 @@ def _download_fixture(
             "path": AUDIT_FILENAME,
             "sha256": audit_record["sha256"],
         },
+        "semantic_audit": build_semantic_audit_binding(
+            selections=selections,
+            audited_files=upload._audit_selected_parquet_files(
+                [
+                    {
+                        **item,
+                        "local": str(root / str(item["local"])),
+                    }
+                    for item in selections
+                ]
+            ),
+            source_receipt_sha256=str(audit_record["sha256"]),
+        ),
         "graph_contract": GRAPH_CONTRACT,
         "objective_contract": OBJECTIVE_CONTRACT,
     }
@@ -223,8 +262,13 @@ def _populate_upload_sources(selections: tuple[tuple[str, Path], ...]) -> None:
     for index, (remote, local) in enumerate(selections, 1):
         local.mkdir(parents=True, exist_ok=True)
         if remote.startswith("parquet/"):
-            (local / f"part-{index:03d}.parquet").write_bytes(
-                f"fixture-{remote}".encode()
+            key = remote.removeprefix("parquet/")
+            bucket = int(remote.rsplit("/", 1)[1])
+            _write_green_shard(
+                local / f"part-{index:03d}.parquet",
+                bucket=bucket,
+                valid_tokens=_BUCKET_VALID_TOKENS[key],
+                source_id=index,
             )
 
 
@@ -481,6 +525,12 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
     assert "s3://mybucket/myprefix/manifest.json" in out
 
     written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validate_manifest(
+        written,
+        expected_bucket="mybucket",
+        expected_prefix="myprefix",
+        expected_endpoint_url="https://storage.eu-north1.nebius.cloud",
+    )
     assert written["bucket"] == "mybucket"
     assert written["prefix"] == "myprefix"
     assert written["profile"] == "code_commits_integrated_pr"

@@ -11,8 +11,9 @@ import re
 from typing import Any
 
 
-MANIFEST_SCHEMA = "cppmega_verified_sidecar_manifest_v2"
+MANIFEST_SCHEMA = "cppmega_verified_sidecar_manifest_v3"
 AUDIT_SCHEMA = "cppmega_sidecar_audit_v2"
+SEMANTIC_AUDIT_SCHEMA = "cppmega_sidecar_semantic_audit_binding_v1"
 AUDIT_REMOTE = "audits/sidecar_audit_all_final_poststop_valid"
 AUDIT_FILENAME = "sidecar_parquet_audit.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -328,6 +329,326 @@ def _validate_selection(selection: object) -> dict[str, object]:
     }
 
 
+_SEMANTIC_SUMMARY_FIELDS = (
+    "rows",
+    "capacity_tokens",
+    "valid_tokens",
+    "trained_tokens",
+    "slack_tokens",
+    "bad_files",
+    "bad_rows",
+)
+
+
+def _parquet_inventory_records(
+    selections: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for selection in selections:
+        remote = safe_relative_path(selection.get("remote"), where="selection remote")
+        if not remote.startswith("parquet/"):
+            continue
+        if selection_key(remote) is None:
+            raise ValueError(f"semantic audit selection is not a parquet bucket: {remote}")
+        files = selection.get("files")
+        if not isinstance(files, list):
+            raise ValueError(f"semantic audit selection lacks inventory: {remote}")
+        for raw_record in files:
+            if not isinstance(raw_record, Mapping):
+                raise ValueError(f"semantic audit file record is not an object: {remote}")
+            path = safe_relative_path(raw_record.get("path"), where="inventory file path")
+            size = raw_record.get("size")
+            sha256 = raw_record.get("sha256")
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+                or not isinstance(sha256, str)
+                or SHA256_RE.fullmatch(sha256) is None
+            ):
+                raise ValueError(f"invalid semantic audit file identity: {remote}/{path}")
+            records.append(
+                {
+                    "remote": remote,
+                    "path": path,
+                    "size": size,
+                    "sha256": sha256,
+                }
+            )
+    return sorted(records, key=lambda item: (str(item["remote"]), str(item["path"])))
+
+
+def _semantic_identity_records(
+    records: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "remote": str(record["remote"]),
+            "path": str(record["path"]),
+            "size": int(record["size"]),
+            "sha256": str(record["sha256"]),
+        }
+        for record in sorted(
+            records,
+            key=lambda item: (str(item["remote"]), str(item["path"])),
+        )
+    ]
+
+
+def _semantic_summary(records: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    summary = {field: 0 for field in _SEMANTIC_SUMMARY_FIELDS}
+    summary["files"] = len(records)
+    for record in records:
+        for field in _SEMANTIC_SUMMARY_FIELDS:
+            value = record.get(field)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"semantic audit summary field {field} is invalid for "
+                    f"{record.get('remote')}/{record.get('path')}"
+                )
+            summary[field] += value
+    return summary
+
+
+def _validate_semantic_file_record(
+    raw_record: object,
+) -> dict[str, object]:
+    if not isinstance(raw_record, Mapping):
+        raise ValueError("semantic audit file record must be an object")
+    remote = safe_relative_path(raw_record.get("remote"), where="semantic audit remote")
+    if not remote.startswith("parquet/") or selection_key(remote) is None:
+        raise ValueError(f"semantic audit remote is not a parquet bucket: {remote!r}")
+    path = safe_relative_path(raw_record.get("path"), where="semantic audit file path")
+    size = raw_record.get("size")
+    sha256 = raw_record.get("sha256")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(sha256, str)
+        or SHA256_RE.fullmatch(sha256) is None
+    ):
+        raise ValueError(f"semantic audit file identity is invalid: {remote}/{path}")
+    normalized: dict[str, object] = {
+        "remote": remote,
+        "path": path,
+        "size": size,
+        "sha256": sha256,
+    }
+    for field in _SEMANTIC_SUMMARY_FIELDS:
+        value = raw_record.get(field)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise ValueError(f"semantic audit {field} is invalid: {remote}/{path}")
+        normalized[field] = value
+    stats_sha256 = raw_record.get("stats_sha256")
+    if not isinstance(stats_sha256, str) or SHA256_RE.fullmatch(stats_sha256) is None:
+        raise ValueError(f"semantic audit stats SHA-256 is invalid: {remote}/{path}")
+    normalized["stats_sha256"] = stats_sha256
+    if int(normalized["bad_files"]) or int(normalized["bad_rows"]):
+        raise ValueError(f"semantic audit file is not green: {remote}/{path}")
+    return normalized
+
+
+def build_semantic_audit_binding(
+    *,
+    selections: Sequence[Mapping[str, object]],
+    audited_files: Sequence[Mapping[str, object]],
+    source_receipt_sha256: str,
+) -> dict[str, object]:
+    """Build the manifest binding produced by the exact parquet audit pass.
+
+    ``audited_files`` is intentionally supplied by the uploader, which owns
+    the local parquet paths and invokes the existing semantic auditor.  This
+    module only canonicalizes the result and applies the consumer-side
+    contract, keeping download verification dependency-light.
+    """
+
+    if not isinstance(source_receipt_sha256, str) or SHA256_RE.fullmatch(
+        source_receipt_sha256
+    ) is None:
+        raise ValueError("semantic audit source receipt SHA-256 is invalid")
+    expected = _parquet_inventory_records(selections)
+    expected_keys = {(str(item["remote"]), str(item["path"])) for item in expected}
+    supplied: dict[tuple[str, str], dict[str, object]] = {}
+    for raw in audited_files:
+        if not isinstance(raw, Mapping):
+            raise ValueError("semantic audit result must be an object")
+        remote = safe_relative_path(raw.get("remote"), where="semantic audit remote")
+        path = safe_relative_path(raw.get("path"), where="semantic audit file path")
+        key = (remote, path)
+        if key in supplied:
+            raise ValueError(f"duplicate semantic audit result: {remote}/{path}")
+        stats = raw.get("stats")
+        if not isinstance(stats, Mapping):
+            raise ValueError(f"semantic audit result lacks stats: {remote}/{path}")
+        if key not in expected_keys:
+            raise ValueError(f"semantic audit result is not selected: {remote}/{path}")
+        supplied[key] = {
+            "remote": remote,
+            "path": path,
+            "size": raw.get("size"),
+            "sha256": raw.get("sha256"),
+            **{
+                field: stats.get(field)
+                for field in _SEMANTIC_SUMMARY_FIELDS
+            },
+            "stats_sha256": canonical_sha256(dict(stats)),
+        }
+    if set(supplied) != expected_keys:
+        missing = sorted(expected_keys - set(supplied))
+        extra = sorted(set(supplied) - expected_keys)
+        raise ValueError(
+            f"semantic audit result set mismatch: missing={missing[:5]} extra={extra[:5]}"
+        )
+
+    binding_files = [
+        _validate_semantic_file_record(supplied[key])
+        for key in sorted(supplied)
+    ]
+    by_kind_bucket: dict[str, dict[str, int]] = {}
+    for remote in sorted({str(item["remote"]) for item in binding_files}):
+        key = remote.removeprefix("parquet/")
+        by_kind_bucket[key] = _semantic_summary(
+            [item for item in binding_files if item["remote"] == remote]
+        )
+    contract = audit_contract()
+    binding = {
+        "schema": SEMANTIC_AUDIT_SCHEMA,
+        "status": "verified",
+        "audit_schema": AUDIT_SCHEMA,
+        "semantic_schema": contract["schema"],
+        "contract": contract,
+        "contract_sha256": canonical_sha256(contract),
+        "source_receipt_sha256": source_receipt_sha256,
+        "files": binding_files,
+        "file_count": len(binding_files),
+        "byte_count": sum(int(item["size"]) for item in binding_files),
+        "artifact_set_sha256": canonical_sha256(
+            _semantic_identity_records(binding_files)
+        ),
+        "by_kind_bucket": by_kind_bucket,
+        "verified_valid_tokens": sum(
+            int(item["valid_tokens"]) for item in binding_files
+        ),
+    }
+    return validate_semantic_audit_binding(
+        binding,
+        selections=selections,
+        expected_receipt_sha256=source_receipt_sha256,
+        expected_token_total=int(binding["verified_valid_tokens"]),
+    )
+
+
+def validate_semantic_audit_binding(
+    value: object,
+    *,
+    selections: Sequence[Mapping[str, object]],
+    expected_receipt_sha256: str,
+    expected_token_total: int | None = None,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("manifest semantic audit binding is missing")
+    if value.get("schema") != SEMANTIC_AUDIT_SCHEMA:
+        raise ValueError("unsupported semantic audit binding schema")
+    if value.get("status") != "verified" or value.get("audit_schema") != AUDIT_SCHEMA:
+        raise ValueError("semantic audit binding is not verified")
+    contract = audit_contract()
+    if value.get("semantic_schema") != contract["schema"]:
+        raise ValueError("semantic audit schema/version mismatch")
+    if value.get("contract") != contract:
+        raise ValueError("semantic audit contract does not match this checkout")
+    contract_sha256 = value.get("contract_sha256")
+    if contract_sha256 != canonical_sha256(contract):
+        raise ValueError("semantic audit contract SHA-256 mismatch")
+    if value.get("source_receipt_sha256") != expected_receipt_sha256:
+        raise ValueError("semantic audit source receipt binding mismatch")
+
+    raw_files = value.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError("semantic audit binding has no per-file records")
+    files = [_validate_semantic_file_record(item) for item in raw_files]
+    keys = [(str(item["remote"]), str(item["path"])) for item in files]
+    if len(keys) != len(set(keys)):
+        raise ValueError("semantic audit binding contains duplicate files")
+    if keys != sorted(keys):
+        raise ValueError("semantic audit file records are not canonical")
+
+    expected_files = _parquet_inventory_records(selections)
+    if _semantic_identity_records(files) != _semantic_identity_records(expected_files):
+        raise ValueError("semantic audit file binding does not match manifest inventory")
+    if int(value.get("file_count", -1)) != len(files):
+        raise ValueError("semantic audit file_count mismatch")
+    if int(value.get("byte_count", -1)) != sum(int(item["size"]) for item in files):
+        raise ValueError("semantic audit byte_count mismatch")
+    if value.get("artifact_set_sha256") != canonical_sha256(
+        _semantic_identity_records(files)
+    ):
+        raise ValueError("semantic audit artifact-set SHA-256 mismatch")
+
+    expected_by_kind_bucket: dict[str, dict[str, int]] = {}
+    for remote in sorted({str(item["remote"]) for item in files}):
+        expected_by_kind_bucket[remote.removeprefix("parquet/")] = _semantic_summary(
+            [item for item in files if item["remote"] == remote]
+        )
+    if value.get("by_kind_bucket") != expected_by_kind_bucket:
+        raise ValueError("semantic audit bucket accounting mismatch")
+    verified_valid_tokens = sum(int(item["valid_tokens"]) for item in files)
+    if int(value.get("verified_valid_tokens", -1)) != verified_valid_tokens:
+        raise ValueError("semantic audit valid-token total mismatch")
+    if expected_token_total is not None and verified_valid_tokens != expected_token_total:
+        raise ValueError("semantic audit total does not match manifest token total")
+
+    normalized = dict(value)
+    normalized["files"] = files
+    normalized["by_kind_bucket"] = expected_by_kind_bucket
+    return normalized
+
+
+def validate_semantic_audit_receipt_binding(
+    semantic_binding: Mapping[str, object],
+    receipt: Mapping[str, object],
+    *,
+    selected_keys: Sequence[str],
+) -> None:
+    """Reconcile manifest semantic results with the downloaded audit receipt."""
+
+    semantic_buckets = semantic_binding.get("by_kind_bucket")
+    receipt_buckets = receipt.get("by_kind_bucket")
+    if not isinstance(semantic_buckets, Mapping) or not isinstance(
+        receipt_buckets, Mapping
+    ):
+        raise ValueError("semantic audit receipt binding lacks bucket accounting")
+    for key in selected_keys:
+        semantic = semantic_buckets.get(key)
+        actual = receipt_buckets.get(key)
+        if not isinstance(semantic, Mapping) or not isinstance(actual, Mapping):
+            raise ValueError(f"semantic audit receipt binding misses bucket: {key}")
+        for field in (
+            "files",
+            "rows",
+            "capacity_tokens",
+            "valid_tokens",
+            "trained_tokens",
+            "slack_tokens",
+            "bad_files",
+            "bad_rows",
+        ):
+            if field not in actual:
+                continue
+            if int(semantic.get(field, -1)) != int(actual.get(field, -1)):
+                raise ValueError(
+                    f"semantic audit receipt mismatch for {key}: {field}"
+                )
+
+
 def validate_manifest(
     value: object,
     *,
@@ -412,7 +733,14 @@ def validate_manifest(
     unsigned.pop("manifest_payload_sha256", None)
     if expected_payload_sha != canonical_sha256(unsigned):
         raise ValueError("manifest payload SHA-256 mismatch")
+    semantic_audit = validate_semantic_audit_binding(
+        manifest.get("semantic_audit"),
+        selections=selections,
+        expected_receipt_sha256=audit_sha,
+        expected_token_total=token_total,
+    )
     manifest["selections"] = selections
+    manifest["semantic_audit"] = semantic_audit
     return manifest
 
 
@@ -503,12 +831,14 @@ __all__ = [
     "AUDIT_FILENAME",
     "AUDIT_REMOTE",
     "AUDIT_SCHEMA",
+    "SEMANTIC_AUDIT_SCHEMA",
     "AUDIT_GRAPH_FIELDS",
     "GRAPH_CONTRACT",
     "MANIFEST_SCHEMA",
     "OBJECTIVE_CONTRACT",
     "canonical_sha256",
     "audit_contract",
+    "build_semantic_audit_binding",
     "contained_path",
     "finalize_manifest",
     "inventory_directory",
@@ -520,6 +850,8 @@ __all__ = [
     "sha256_file",
     "validate_audit_receipt",
     "validate_manifest",
+    "validate_semantic_audit_binding",
+    "validate_semantic_audit_receipt_binding",
     "verify_inventory",
     "write_json_atomic",
 ]

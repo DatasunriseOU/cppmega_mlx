@@ -11,7 +11,7 @@ the audit, no mocked object storage. They prove the fail-closed gate added to
   * a non-green receipt, a manifest/receipt token divergence, and a manifest
     that is required to carry ``verified_valid_tokens`` but lacks it all RAISE;
   * the planning-only default manifest is rejected by the real verification
-    path; only a schema-bound v2 inventory can certify a download.
+  path; only a schema-bound v3 inventory can certify a download.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import pytest
 from cppmega_mlx.data.source_identity import source_identity
 from scripts import download_verified_sidecar_from_nebius_s3 as download
 from scripts.nanochat_data.pack_enriched_rows import PACKED_ROW_OUTPUT_SCHEMA
+from scripts import upload_verified_sidecar_to_nebius_s3 as upload
 from scripts.sidecar_manifest_contract import (
     AUDIT_FILENAME,
     AUDIT_REMOTE,
@@ -36,6 +37,7 @@ from scripts.sidecar_manifest_contract import (
     GRAPH_CONTRACT,
     MANIFEST_SCHEMA,
     OBJECTIVE_CONTRACT,
+    build_semantic_audit_binding,
     finalize_manifest,
     inventory_directory,
     inventory_sha256,
@@ -57,21 +59,31 @@ PROFILE_SELECTIONS = tuple(
 )
 
 
-def _write_green_shard(path: Path, *, length: int, source_id: int) -> None:
+def _write_green_shard(
+    path: Path,
+    *,
+    length: int,
+    source_id: int,
+    valid_tokens: int | None = None,
+) -> None:
     """Write a complete CASE5 row that passes the real audit gate."""
-    input_ids = [1 + (index % 4) for index in range(length)]
+    valid_tokens = length if valid_tokens is None else valid_tokens
+    if not 0 < valid_tokens <= length:
+        raise ValueError("valid_tokens must be within the shard capacity")
+    input_ids = [1 + (index % 4) for index in range(valid_tokens)]
+    input_ids.extend([0] * (length - valid_tokens))
     identity = source_identity({"source_path": f"fixture-{source_id}.cpp"})
     row = {
         "input_ids": input_ids,
-        "target_ids": input_ids[1:] + [0],
-        "loss_mask": [1] * (length - 1) + [0],
+        "target_ids": input_ids[1:valid_tokens] + [0] * (length - valid_tokens + 1),
+        "loss_mask": [1] * (valid_tokens - 1) + [0] * (length - valid_tokens + 1),
         "doc_ids": [1] * length,
-        "valid_token_count": length,
-        "trained_token_count": length - 1,
+        "valid_token_count": valid_tokens,
+        "trained_token_count": valid_tokens - 1,
         "num_docs": 1,
-        "slack_tokens": 0,
+        "slack_tokens": length - valid_tokens,
         "source_doc_ids": [source_id],
-        "source_doc_token_lengths": [length],
+        "source_doc_token_lengths": [valid_tokens],
         "source_platform_ids": [[7]],
         "source_repo_stable_ids": ["9"],
         "source_filepath_stable_ids": [str(source_id)],
@@ -90,8 +102,10 @@ def _write_green_shard(path: Path, *, length: int, source_id: int) -> None:
         "token_role_ids": [0] * length,
         "token_entity_ids": [0] * length,
         "token_scope_ids": [0] * length,
-        "token_source_doc_ids": [source_id] * length,
-        "token_source_identity_ids": [identity.source_identity_id] * length,
+        "token_source_doc_ids": [source_id] * valid_tokens
+        + [0] * (length - valid_tokens),
+        "token_source_identity_ids": [identity.source_identity_id] * valid_tokens
+        + [0] * (length - valid_tokens),
         "token_confidence_ids": [0] * length,
         "token_def_use": [0] * length,
         "token_change_mask_pre": [0] * length,
@@ -99,7 +113,7 @@ def _write_green_shard(path: Path, *, length: int, source_id: int) -> None:
         "hunk_id_per_token": [-1] * length,
         "edit_op_per_token": [0] * length,
         "token_chunk_starts": [0],
-        "token_chunk_ends": [length],
+        "token_chunk_ends": [valid_tokens],
         "token_chunk_kinds": [1],
         "token_chunk_dep_levels": [0],
         "token_call_edges": [],
@@ -217,6 +231,19 @@ def _manifest(
             "path": AUDIT_FILENAME,
             "sha256": audit_record["sha256"],
         },
+        "semantic_audit": build_semantic_audit_binding(
+            selections=selections,
+            audited_files=upload._audit_selected_parquet_files(
+                [
+                    {
+                        **selection,
+                        "local": str(dest / str(selection["local"])),
+                    }
+                    for selection in selections
+                ]
+            ),
+            source_receipt_sha256=str(audit_record["sha256"]),
+        ),
         "graph_contract": GRAPH_CONTRACT,
         "objective_contract": OBJECTIVE_CONTRACT,
     }
@@ -260,11 +287,11 @@ def test_verify_raises_on_token_total_divergence(
     manifest = _manifest(dest, tokens)
     manifest["verified_valid_tokens"] = tokens + 1
     manifest = finalize_manifest(manifest)
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(ValueError) as exc:
         download._verify_downloaded_set(
             dest=dest, manifest=manifest, require_token_total=True
         )
-    assert "verified_valid_tokens" in str(exc.value)
+    assert "semantic audit total" in str(exc.value)
 
 
 def test_verify_raises_on_nongreen_receipt(
@@ -283,6 +310,24 @@ def test_verify_raises_on_nongreen_receipt(
     assert "code/1024" in str(exc.value)
 
 
+def test_verify_rejects_receipt_bucket_drift_with_same_total(
+    pristine: tuple[Path, int], tmp_path: Path
+) -> None:
+    dest, tokens = _fresh(pristine, tmp_path)
+    receipt_path = dest / "audit" / "sidecar_parquet_audit.json"
+    report = json.loads(receipt_path.read_text())
+    report["by_kind_bucket"]["code/1024"]["valid_tokens"] -= 1
+    report["by_kind_bucket"]["code/2048"]["valid_tokens"] += 1
+    receipt_path.write_text(json.dumps(report))
+
+    with pytest.raises(ValueError, match="code/1024.*valid_tokens"):
+        download._verify_downloaded_set(
+            dest=dest,
+            manifest=_manifest(dest, tokens),
+            require_token_total=True,
+        )
+
+
 def test_verify_raises_when_token_total_required_but_absent(
     pristine: tuple[Path, int], tmp_path: Path
 ) -> None:
@@ -295,7 +340,7 @@ def test_verify_raises_when_token_total_required_but_absent(
         )
 
 
-def test_verify_rejects_planning_manifest_and_still_checks_v2_inventory(
+def test_verify_rejects_planning_manifest_and_still_checks_v3_inventory(
     pristine: tuple[Path, int], tmp_path: Path
 ) -> None:
     dest, tokens = _fresh(pristine, tmp_path)
