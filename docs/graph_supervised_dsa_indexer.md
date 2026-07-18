@@ -31,25 +31,37 @@ top-k selection, not as an after-the-fact annotation.
 
 ## Training Objective
 
-The indexer is trained with both neural and compiler-grade teachers:
+The routed score is used for inference-time top-k only. Graph supervision must
+train the neural score after removing the fixed route prior:
+
+```text
+I_neural = I_final - beta * S_graph
+```
+
+The indexer objective is therefore:
 
 ```text
 L_indexer =
-    KL(dense_attention_blocks || softmax(I_final))
-  + lambda_bce * BCE(I_final, graph_edge_targets)
-  + lambda_cov * coverage_hinge(I_final, graph_edge_targets, topk)
+    KL(dense_attention_blocks || softmax(I_neural))
+  + lambda_bce * BCE(I_neural, graph_edge_targets)
+  + lambda_cov * coverage_hinge(I_neural, graph_edge_targets, topk)
   + lambda_ctr * block_contrastive(...)
 ```
 
 `graph_edge_targets` is built from the same graph candidates that produce
-`S_graph`.  This keeps the training target aligned with the inference-time
-selection rule.
+`S_graph`, but the fixed prior itself is not rewarded by the auxiliary loss.
+This prevents the shortcut where increasing `beta` lowers graph loss without
+improving the neural indexer. `DenseCppLM` keeps `beta` checkpoint-visible but
+frozen so optimizer weight decay cannot move a coefficient that receives no
+useful differentiable training signal.
 
 ## Implemented MLX Surfaces
 
 - `cppmega_mlx.nn.code_graph_routes`
   - `GraphRouteConfig`
   - `CodeGraphRouter`
+  - `apply_graph_route_prior`
+  - `remove_graph_route_prior`
   - `build_attention_bias`
   - `build_block_candidates`
 - `cppmega_mlx.nn.sparse_mla`
@@ -58,6 +70,7 @@ selection rule.
   - `graph_indexed_attention_reference`
 - `cppmega_mlx.training.indexer_losses`
   - `apply_graph_indexer_bias`
+  - `remove_graph_indexer_bias`
   - `select_graph_biased_topk`
   - `total_indexer_loss`
   - `recall_at_k`

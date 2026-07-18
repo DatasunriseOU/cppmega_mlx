@@ -49,7 +49,10 @@ from cppmega_mlx.nn.attention import (
     apply_rotary_emb,
     rotary_inv_freq,
 )
-from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
+from cppmega_mlx.nn.code_graph_routes import (
+    build_token_graph_biases,
+    remove_graph_route_prior,
+)
 from cppmega_mlx.nn.domain_embedding import CppMegaDomainEmbedding
 from cppmega_mlx.nn.moe import FeedForwardExpert
 from cppmega_mlx.nn.ngram_hash import NgramHashEmbedding
@@ -274,8 +277,8 @@ class GraphIndexedAttention(nn.Module):
 
     Reuses the same q/k/v projections as :class:`CausalSelfAttention` but, instead
     of dense SDPA, scores each (query, key) pair with a cheap lightning indexer
-    (per-head ReLU dot + learned graph-prior bias ``beta * S_blk``), selects the
-    top-k (+ local window + sinks), and runs dense MLA over the gathered KV via
+    (per-head ReLU dot + fixed graph-prior coefficient ``beta * S_blk``), selects
+    the top-k (+ local window + sinks), and runs dense MLA over the gathered KV via
     :func:`graph_indexed_attention_reference`. The indexer scores are exposed for
     the indexer losses (KL warm-up / BCE / coverage / contrastive) as an
     explicit return value. Forward execution never writes activation tensors
@@ -299,12 +302,14 @@ class GraphIndexedAttention(nn.Module):
         self.index_q_proj = nn.Linear(d_model, hi * di, bias=False)
         self.index_k_proj = nn.Linear(d_model, hi * di, bias=False)
         self.index_head_weights = mx.ones((hi,), dtype=mx.float32)
-        # Keep the checkpoint-visible scalar while matching the production
-        # CPPMEGA_DSA_GRAPH_BIAS_BETA default (1.0). Beta=0 remains an explicit
-        # config/checkpoint ablation.
+        # Keep the checkpoint-visible route coefficient while matching the
+        # production CPPMEGA_DSA_GRAPH_BIAS_BETA default (1.0). It is fixed:
+        # graph supervision removes this prior and discrete top-k cannot train
+        # it, so leaving it in AdamW would only move it through weight decay.
         self.index_beta = mx.full(
             (1,), config.graph_attention_bias_beta, dtype=mx.float32
         )
+        self.freeze(recurse=False, keys="index_beta", strict=True)
         self.rope_inv_freq = rotary_inv_freq(acfg) if acfg.use_rope else None
 
     def _rotary_tables(self, seq_len: int) -> tuple[mx.array, mx.array]:
@@ -384,16 +389,11 @@ class GraphIndexedAttention(nn.Module):
     ) -> mx.array:
         """Remove the fixed route prior while preserving invalid score entries."""
 
-        if tuple(final_scores.shape) != tuple(route_bias.shape):
-            raise ValueError(
-                "graph supervision route bias must match final indexer scores: "
-                f"{tuple(route_bias.shape)} != {tuple(final_scores.shape)}"
-            )
-        scores = final_scores.astype(mx.float32)
-        bias = route_bias.astype(mx.float32)
-        valid = scores > mx.array(-5.0e8, dtype=mx.float32)
-        neural_scores = scores - self.index_beta[0].astype(mx.float32) * bias
-        return mx.where(valid, neural_scores, scores)
+        return remove_graph_route_prior(
+            final_scores,
+            route_bias,
+            beta=self.index_beta[0],
+        )
 
 
 class DenseCppBlock(nn.Module):
@@ -834,11 +834,18 @@ class DenseCppLM(nn.Module):
         indexer_scores: tuple[mx.array, ...],
         *,
         input_ids: mx.array,
-        document_ids: mx.array,
-        block_bias: mx.array,
-        edge_kind_bias: mx.array,
+        document_ids: mx.array | None = None,
+        graph_batch: GraphBatch | None = None,
+        block_bias: mx.array | None = None,
+        edge_kind_bias: mx.array | None = None,
     ) -> tuple[mx.array, ...]:
-        """Return learned DSA logits with the fixed graph route prior removed."""
+        """Return neural DSA logits with the fixed graph route prior removed.
+
+        The route source must match the forward pass: provide a typed
+        ``graph_batch`` or the precomputed relation and edge-kind biases, never
+        both. This keeps graph-supervised losses from training on ``beta*S_graph``
+        a second time.
+        """
 
         if self.config.attention_mode != "dsa":
             raise ValueError("graph supervision scores require attention_mode='dsa'")
@@ -849,7 +856,7 @@ class DenseCppLM(nn.Module):
             )
         route_bias = self._resolve_graph_bias(
             input_ids,
-            graph_batch=None,
+            graph_batch=graph_batch,
             block_bias=block_bias,
             edge_kind_bias=edge_kind_bias,
             document_ids=document_ids,

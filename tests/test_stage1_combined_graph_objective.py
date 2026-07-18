@@ -444,7 +444,16 @@ def test_stage1_graph_loss_trains_neural_indexer_not_fixed_route_beta() -> None:
         "index_k_proj",
         "index_head_weights",
     ) > 0.0
-    assert _gradient_l1(gradients, "index_beta") == pytest.approx(0.0, abs=1e-8)
+    # ``index_beta`` is a fixed checkpoint-visible route coefficient. It is
+    # deliberately absent from MLX's trainable gradient tree so AdamW cannot
+    # move it through weight decay; older implementations exposed a zero
+    # gradient entry instead.
+    beta_gradients = [
+        value
+        for name, value in tree_flatten(gradients)
+        if isinstance(value, mx.array) and "index_beta" in name
+    ]
+    assert not beta_gradients
 
 
 def test_stage1_graph_loss_excludes_fixed_relation_and_kind_priors() -> None:

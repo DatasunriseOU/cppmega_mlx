@@ -71,6 +71,97 @@ _DEFAULT_TOKEN_RELATION_WEIGHTS: Mapping[str, float] = {
 }
 _NORMALIZE_MODES = ("binary", "count")
 _KNOWN_EDGE_KIND_IDS = frozenset(int(kind) for kind in DomainEdgeKind)
+_MASKED_SCORE_THRESHOLD = -5.0e8
+
+
+def _broadcast_route_bias(
+    scores: mx.array,
+    graph_bias: mx.array,
+    *,
+    where: str,
+) -> mx.array:
+    if scores.ndim != 3:
+        raise ValueError(
+            f"{where}: scores must be shaped (B,Tq,S), got {tuple(scores.shape)}"
+        )
+    batch, queries, keys = (int(value) for value in scores.shape)
+    if graph_bias.ndim == 2:
+        if tuple(graph_bias.shape) != (queries, keys):
+            raise ValueError(
+                f"{where}: 2-D graph_bias must be ({queries},{keys}), got "
+                f"{tuple(graph_bias.shape)}"
+            )
+        return mx.broadcast_to(graph_bias[None, :, :], (batch, queries, keys))
+    if graph_bias.ndim != 3:
+        raise ValueError(
+            f"{where}: graph_bias must be 2-D or 3-D, got "
+            f"{tuple(graph_bias.shape)}"
+        )
+    bias_batch, bias_queries, bias_keys = (
+        int(value) for value in graph_bias.shape
+    )
+    if (bias_queries, bias_keys) != (queries, keys):
+        raise ValueError(
+            f"{where}: graph_bias trailing shape must be ({queries},{keys}), got "
+            f"{tuple(graph_bias.shape)}"
+        )
+    if bias_batch == batch:
+        return graph_bias
+    if bias_batch == 1:
+        return mx.broadcast_to(graph_bias, (batch, queries, keys))
+    raise ValueError(
+        f"{where}: graph_bias batch must be 1 or {batch}, got {bias_batch}"
+    )
+
+
+def _route_beta(beta: mx.array | float, *, where: str) -> mx.array:
+    beta_array = (
+        beta
+        if isinstance(beta, mx.array)
+        else mx.array(float(beta), dtype=mx.float32)
+    )
+    if beta_array.ndim != 0:
+        raise ValueError(
+            f"{where}: beta must be a scalar, got {tuple(beta_array.shape)}"
+        )
+    return beta_array.astype(mx.float32)
+
+
+def apply_graph_route_prior(
+    neural_scores: mx.array,
+    graph_bias: mx.array,
+    *,
+    beta: mx.array | float = 1.0,
+) -> mx.array:
+    """Return ``I_neural + beta * S_graph`` without reviving masked pairs."""
+
+    where = "apply_graph_route_prior"
+    bias = _broadcast_route_bias(neural_scores, graph_bias, where=where)
+    scores = neural_scores.astype(mx.float32)
+    valid = scores > mx.array(_MASKED_SCORE_THRESHOLD, dtype=mx.float32)
+    final_scores = scores + _route_beta(beta, where=where) * bias.astype(mx.float32)
+    return mx.where(valid, final_scores, scores)
+
+
+def remove_graph_route_prior(
+    final_scores: mx.array,
+    graph_bias: mx.array,
+    *,
+    beta: mx.array | float = 1.0,
+) -> mx.array:
+    """Recover neural indexer scores from ``I_neural + beta * S_graph``.
+
+    Graph-supervised losses must consume this neural component. Training on the
+    final routed score would reward the fixed graph prior itself and would apply
+    ``beta * S_graph`` twice when the loss path also adds the prior.
+    """
+
+    where = "remove_graph_route_prior"
+    bias = _broadcast_route_bias(final_scores, graph_bias, where=where)
+    scores = final_scores.astype(mx.float32)
+    valid = scores > mx.array(_MASKED_SCORE_THRESHOLD, dtype=mx.float32)
+    neural_scores = scores - _route_beta(beta, where=where) * bias.astype(mx.float32)
+    return mx.where(valid, neural_scores, scores)
 
 
 def _resolve_num_nodes(packet: GraphPacket, relation: str) -> int:
@@ -733,8 +824,10 @@ def _validate_graph_document_boundaries(
 __all__ = [
     "GraphRouteConfig",
     "CodeGraphRouter",
+    "apply_graph_route_prior",
     "build_attention_bias",
     "build_block_candidates",
     "build_token_attention_bias",
     "build_token_graph_biases",
+    "remove_graph_route_prior",
 ]
