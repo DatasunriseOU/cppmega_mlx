@@ -24,10 +24,13 @@ TRAINING_BUCKETS: dict[str, tuple[int, ...]] = {
     "pr": (1024, 2048, 4096, 8192, 16384),
 }
 OBJECTIVE_CONTRACT = {
-    "schema": "cppmega_mlx_runtime_objectives_v1",
-    "status": "runtime_materialized",
+    "schema": "cppmega_mlx_objective_source_v2",
+    "status": "source_for_pre_materialization",
     "materialized_in_parquet": False,
-    "runtime": "cppmega_mlx.training.task_mixer.TaskMixer",
+    "materializer": "scripts.materialize_megatron_objectives",
+    "planner": "cppmega_mlx.training.objective_schedule.CanonicalObjectivePlanner",
+    "mixer": "cppmega_mlx.training.objective_mixer.EligibilityAwareTaskMixer",
+    "artifact_schema": "cppmega_objective_materialization_artifact_v2",
     "stage": "stage1",
     "rates": {
         "causal_lm": "1/2",

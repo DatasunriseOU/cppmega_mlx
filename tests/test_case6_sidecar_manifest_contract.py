@@ -116,6 +116,19 @@ def test_manifest_binds_inventory_and_explicit_bucket_exclusions(tmp_path: Path)
     }
 
 
+def test_objective_manifest_is_explicitly_a_source_for_v2_materialization() -> None:
+    assert OBJECTIVE_CONTRACT["schema"] == "cppmega_mlx_objective_source_v2"
+    assert OBJECTIVE_CONTRACT["status"] == "source_for_pre_materialization"
+    assert OBJECTIVE_CONTRACT["materialized_in_parquet"] is False
+    assert OBJECTIVE_CONTRACT["materializer"] == (
+        "scripts.materialize_megatron_objectives"
+    )
+    assert OBJECTIVE_CONTRACT["artifact_schema"] == (
+        "cppmega_objective_materialization_artifact_v2"
+    )
+    assert "TaskMixer" not in str(OBJECTIVE_CONTRACT.get("runtime", ""))
+
+
 def test_manifest_rejects_payload_tampering(tmp_path: Path) -> None:
     manifest, _root = _green_manifest(tmp_path)
     tampered = copy.deepcopy(manifest)
