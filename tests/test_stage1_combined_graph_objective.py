@@ -317,3 +317,98 @@ def test_stage1_combined_loss_reaches_model_and_graph_indexer_parameters() -> No
     assert metrics.updated is True
     assert metrics.ntokens == 5
     assert metrics.loss > 0.0
+
+
+def test_stage1_graph_loss_trains_neural_indexer_not_fixed_route_beta() -> None:
+    objective = Stage1ProductionObjective()
+    batch = _production_batch(with_edge=True)
+    model = DenseCppLM(_model_config())
+    objective.validate_batch(batch)
+
+    loss_and_grad = nn.value_and_grad(
+        model,
+        lambda: objective.loss_breakdown(model, batch).graph_total,
+    )
+    graph_loss, gradients = loss_and_grad()
+    mx.eval(graph_loss, gradients)
+
+    assert float(graph_loss.item()) > 0.0
+    assert _gradient_l1(
+        gradients,
+        "index_q_proj",
+        "index_k_proj",
+        "index_head_weights",
+    ) > 0.0
+    assert _gradient_l1(gradients, "index_beta") == pytest.approx(0.0, abs=1e-8)
+
+
+def test_stage1_graph_loss_excludes_fixed_relation_and_kind_priors() -> None:
+    objective = Stage1ProductionObjective()
+    batch = _production_batch(with_edge=True)
+    model = DenseCppLM(_model_config())
+    attention = model.layers[0].attention
+    attention.index_q_proj.weight = mx.zeros_like(attention.index_q_proj.weight)
+    attention.index_k_proj.weight = mx.zeros_like(attention.index_k_proj.weight)
+    attention.index_beta = mx.array([4.0], dtype=mx.float32)
+    values = _stage1_objective_batch(batch)
+
+    decoder_result = model.decoder_hidden_states(
+        values.input_ids,
+        document_ids=values.document_ids,
+        block_bias=values.relation_bias,
+        edge_kind_bias=values.edge_kind_bias,
+        return_indexer_scores=True,
+        **values.side_channels,
+    )
+    assert isinstance(decoder_result, tuple)
+    _hidden_states, final_scores = decoder_result
+    learned_scores = model.graph_supervision_scores(
+        final_scores,
+        input_ids=values.input_ids,
+        document_ids=values.document_ids,
+        block_bias=values.relation_bias,
+        edge_kind_bias=values.edge_kind_bias,
+    )
+    raw_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+        final_scores,
+        values.graph_targets,
+        values.graph_pair_mask,
+        objective.graph_config,
+    )
+    learned_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+        learned_scores,
+        values.graph_targets,
+        values.graph_pair_mask,
+        objective.graph_config,
+    )
+    production_breakdown = objective.loss_breakdown(model, batch)
+    mx.eval(
+        final_scores,
+        learned_scores,
+        raw_breakdown.total,
+        learned_breakdown.total,
+        production_breakdown.graph_total,
+    )
+
+    eligible = values.graph_targets > 0
+    route_bias = values.relation_bias + values.edge_kind_bias
+    expected_delta = mx.where(eligible, 4.0 * route_bias, mx.zeros_like(route_bias))
+    observed_delta = mx.where(
+        eligible,
+        final_scores[0] - learned_scores[0],
+        mx.zeros_like(route_bias),
+    )
+    mx.eval(expected_delta, observed_delta)
+
+    assert float(mx.sum(mx.abs(observed_delta - expected_delta)).item()) == pytest.approx(
+        0.0,
+        abs=1e-6,
+    )
+    assert float(raw_breakdown.total.item()) != pytest.approx(
+        float(learned_breakdown.total.item()),
+        abs=1e-6,
+    )
+    assert float(production_breakdown.graph_total.item()) == pytest.approx(
+        float(learned_breakdown.total.item()),
+        rel=1e-6,
+    )

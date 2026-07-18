@@ -376,6 +376,25 @@ class GraphIndexedAttention(nn.Module):
         out = out.reshape(batch, seq, acfg.q_proj_dim)
         return self.out_proj(out), scores
 
+    def graph_supervision_scores(
+        self,
+        final_scores: mx.array,
+        *,
+        route_bias: mx.array,
+    ) -> mx.array:
+        """Remove the fixed route prior while preserving invalid score entries."""
+
+        if tuple(final_scores.shape) != tuple(route_bias.shape):
+            raise ValueError(
+                "graph supervision route bias must match final indexer scores: "
+                f"{tuple(route_bias.shape)} != {tuple(final_scores.shape)}"
+            )
+        scores = final_scores.astype(mx.float32)
+        bias = route_bias.astype(mx.float32)
+        valid = scores > mx.array(-5.0e8, dtype=mx.float32)
+        neural_scores = scores - self.index_beta[0].astype(mx.float32) * bias
+        return mx.where(valid, neural_scores, scores)
+
 
 class DenseCppBlock(nn.Module):
     """One pre-norm residual block: RMSNorm -> attention -> +residual,
@@ -809,6 +828,41 @@ class DenseCppLM(nn.Module):
             raise RuntimeError("DenseCppLM failed to return DSA indexer scores")
         _hidden, scores = result
         return scores
+
+    def graph_supervision_scores(
+        self,
+        indexer_scores: tuple[mx.array, ...],
+        *,
+        input_ids: mx.array,
+        document_ids: mx.array,
+        block_bias: mx.array,
+        edge_kind_bias: mx.array,
+    ) -> tuple[mx.array, ...]:
+        """Return learned DSA logits with the fixed graph route prior removed."""
+
+        if self.config.attention_mode != "dsa":
+            raise ValueError("graph supervision scores require attention_mode='dsa'")
+        if len(indexer_scores) != len(self.layers):
+            raise ValueError(
+                "graph supervision score layers must match model depth: "
+                f"{len(indexer_scores)} != {len(self.layers)}"
+            )
+        route_bias = self._resolve_graph_bias(
+            input_ids,
+            graph_batch=None,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            document_ids=document_ids,
+        )
+        if route_bias is None:
+            raise RuntimeError("graph supervision requires an active route bias")
+        return tuple(
+            layer.attention.graph_supervision_scores(
+                scores,
+                route_bias=route_bias,
+            )
+            for layer, scores in zip(self.layers, indexer_scores, strict=True)
+        )
 
     def validate_training_batch(
         self, batch: dict[str, mx.array | None]

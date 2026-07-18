@@ -1371,13 +1371,20 @@ def test_real_dsa_forward_and_backward_include_graph_auxiliary_loss() -> None:
 
     assert float(graph_loss.item()) > 0.0
     assert abs(float(total.item()) - float((lm_loss + graph_loss).item())) < 1e-6
+    final_indexer_scores = model.indexer_scores(
+        input_ids,
+        document_ids=document_ids,
+        block_bias=graph_targets,
+        edge_kind_bias=edge_kind_bias,
+        **structure_sidecars,
+    )
     unweighted_graph_loss = graph_auxiliary_loss_from_targets(
-        model.indexer_scores(
-            input_ids,
+        model.graph_supervision_scores(
+            final_indexer_scores,
+            input_ids=input_ids,
             document_ids=document_ids,
             block_bias=graph_targets,
             edge_kind_bias=edge_kind_bias,
-            **structure_sidecars,
         ),
         graph_targets,
         pair_mask,

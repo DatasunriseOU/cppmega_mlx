@@ -1293,6 +1293,22 @@ def production_training_loss_breakdown(
         raise RuntimeError(
             "production graph decoder returned an invalid hidden/indexer contract"
         )
+    graph_supervision_scores = getattr(model, "graph_supervision_scores", None)
+    if not callable(graph_supervision_scores):
+        raise TypeError(
+            "production graph objective requires model.graph_supervision_scores"
+        )
+    learned_indexer_scores = graph_supervision_scores(
+        indexer_scores,
+        input_ids=input_ids,
+        document_ids=document_ids,
+        block_bias=block_bias,
+        edge_kind_bias=edge_kind_bias,
+    )
+    if not isinstance(learned_indexer_scores, tuple):
+        raise RuntimeError(
+            "production graph supervision returned an invalid score contract"
+        )
 
     if bool(getattr(model_config, "chunked_ce", False)):
         chunked_cross_entropy = getattr(model, "_chunked_cross_entropy", None)
@@ -1313,7 +1329,7 @@ def production_training_loss_breakdown(
         lm_loss = cross_entropy(logits, targets, loss_mask)
 
     graph_breakdown = graph_auxiliary_loss_breakdown_from_targets(
-        indexer_scores,
+        learned_indexer_scores,
         graph_targets,
         graph_pair_mask,
         graph_config,
