@@ -25,8 +25,14 @@ defaults:
 jobs:
   debugger:
     if: |-
-      ${{ fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false) }}
-    runs-on: 'ubuntu-latest'
+      ${{
+        fromJSON(vars.GEMINI_DEBUG || vars.ACTIONS_STEP_DEBUG || false) &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      }}
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     permissions:
       contents: 'read'
     steps:
@@ -58,7 +64,7 @@ jobs:
         startsWith(github.event.comment.body || github.event.review.body || github.event.issue.body, '@gemini-cli') &&
         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || github.event.review.author_association || github.event.issue.author_association)
       )
-    runs-on: 'ubuntu-latest'
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     permissions:
       contents: 'read'
       issues: 'write'
@@ -189,8 +195,16 @@ jobs:
       - 'invoke'
       - 'plan-execute'
     if: |-
-      ${{ always() && !cancelled() && (failure() || needs.dispatch.outputs.command == 'fallthrough') }}
-    runs-on: 'ubuntu-latest'
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) &&
+        (failure() || needs.dispatch.outputs.command == 'fallthrough')
+      }}
+    runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     permissions:
       contents: 'read'
       issues: 'write'

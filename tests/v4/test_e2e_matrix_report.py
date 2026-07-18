@@ -47,7 +47,7 @@ def test_workflow_uploads_artifacts():
 
 def test_workflow_runs_mini_train_only_on_macos_nightly():
     text = WORKFLOW.read_text()
-    assert "macos-latest" in text
+    assert "runs-on: [self-hosted, macOS, ARM64, cppmega-mlx-macos]" in text
     assert "github.event_name == 'schedule'" in text
 
 

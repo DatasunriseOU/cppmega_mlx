@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "repository": "DatasunriseOU/cppmega_mlx",
+  "verified_at": "2026-07-14T04:00:00Z",
+  "hosts": [
+    {
+      "id": "mac-studio",
+      "address": "10.0.0.8",
+      "transport": "local",
+      "system": "darwin",
+      "machines": [
+        "arm64"
+      ],
+      "lane": "macos-mlx",
+      "required": true,
+      "python": "/Volumes/external/sources/cppmega.mlx/.venv/bin/python",
+      "timeout_seconds": 1500,
+      "github": {
+        "runner_name": "mac-studio-cppmega-mlx",
+        "labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "cppmega-mlx-macos"
+        ]
+      }
+    },
+    {
+      "id": "legion-linux",
+      "address": "10.0.0.16",
+      "transport": "ssh",
+      "ssh_target": "davidgor@10.0.0.16",
+      "ssh_port": 22,
+      "system": "linux",
+      "machines": [
+        "x86_64",
+        "amd64"
+      ],
+      "lane": "linux-portable",
+      "required": true,
+      "python": "python3",
+      "timeout_seconds": 900,
+      "github": {
+        "runner_name": "davidgor-Legion-R9000P-ARX8-cppmega-mlx",
+        "labels": [
+          "self-hosted",
+          "Linux",
+          "X64",
+          "cppmega-mlx"
+        ]
+      }
+    },
+    {
+      "id": "windows-10-0-0-11",
+      "address": "10.0.0.11",
+      "transport": "ssh",
+      "ssh_target": "dave@10.0.0.11",
+      "ssh_port": 22,
+      "system": "windows",
+      "machines": [
+        "amd64",
+        "x86_64"
+      ],
+      "lane": null,
+      "required": false,
+      "python": "python",
+      "reason": "Windows is outside the macOS MLX and portable Linux matrix; no cppmega_mlx runner is registered there.",
+      "github": null
+    },
+    {
+      "id": "untrusted-10-0-0-12",
+      "address": "10.0.0.12",
+      "transport": "ssh",
+      "ssh_target": "dave@10.0.0.12",
+      "ssh_port": 22,
+      "system": "linux",
+      "machines": [
+        "x86_64",
+        "aarch64"
+      ],
+      "lane": null,
+      "required": false,
+      "python": "python3",
+      "reason": "The observed SSH host key does not match the saved key; dispatch remains disabled until an operator verifies the replacement host out of band.",
+      "github": null
+    }
+  ]
+}
