@@ -417,7 +417,7 @@ def collect_environment(
     metal = collect_metal_report()
     device_info = mlx.get("device_info") if isinstance(mlx, dict) else {}
     device_info_map = device_info if isinstance(device_info, dict) else {}
-    return {
+    report: dict[str, JsonValue] = {
         "schema_version": 1,
         "kind": "cppmega_mlx_environment_report",
         "read_only": True,
@@ -442,6 +442,33 @@ def collect_environment(
         "thermal": collect_thermal_report(),
         "file_descriptors": file_descriptor_limits(),
     }
+    failures = readiness_failures(report)
+    report["readiness"] = {
+        "status": "ready" if not failures else "blocked",
+        "failures": failures,
+    }
+    return report
+
+
+def readiness_failures(report: Mapping[str, JsonValue]) -> list[str]:
+    failures: list[str] = []
+    if nested(report, "macos", "is_macos") is not True:
+        failures.append("platform is not macOS")
+    if nested(report, "mlx", "installed") is not True:
+        failures.append("MLX is not installed")
+    if nested(report, "mlx", "import_error") not in (None, ""):
+        failures.append(f"MLX import failed: {nested(report, 'mlx', 'import_error')}")
+    if not nested(report, "mlx", "default_device"):
+        failures.append("MLX default device is unavailable")
+    if nested(report, "metal", "module_present") is not True:
+        failures.append("mlx.core.metal is unavailable")
+    if nested(report, "metal", "available") is not True:
+        failures.append("Metal backend is not available")
+    if nested(report, "file_descriptors", "meets_recommended_min") is not True:
+        failures.append(
+            f"file descriptor soft limit is below {FD_RECOMMENDED_MIN}"
+        )
+    return failures
 
 
 def render_text(report: Mapping[str, JsonValue]) -> str:
@@ -490,6 +517,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=5.0,
         help="Timeout for the optional system_profiler GPU probe.",
     )
+    parser.add_argument(
+        "--require-ready",
+        action="store_true",
+        help="Exit nonzero unless the MLX/Metal runtime readiness contract passes.",
+    )
     return parser.parse_args(argv)
 
 
@@ -503,6 +535,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(render_text(report))
+    if args.require_ready and nested(report, "readiness", "status") != "ready":
+        return 2
     return 0
 
 

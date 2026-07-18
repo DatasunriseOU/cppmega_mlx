@@ -29,6 +29,8 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
+from scripts.sidecar_manifest_contract import AUDIT_SCHEMA, audit_contract
+
 
 def _load_schema_contracts():
     """Load dependency-free data contracts without importing the MLX data package."""
@@ -1792,18 +1794,20 @@ def main(argv: list[str] | None = None) -> int:
 
     report = _rollup(results)
     has_bad = bool(report["total"]["bad_files"] or report["total"]["bad_rows"])
-    status = (
+    case5_status = (
         "overridden"
         if has_bad and args.allow_bad
         else "failed"
         if has_bad
         else "passed"
     )
-    report["status"] = status
+    report["status"] = "failed" if has_bad else "verified"
+    report["schema"] = AUDIT_SCHEMA
+    report["contract"] = audit_contract()
     report["receipt"] = {
         "contract": "cppmega_case5_domain_routes_v1",
-        "status": status,
-        "successful": status == "passed",
+        "status": case5_status,
+        "successful": case5_status == "passed",
         "tokenizer_domain_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
         "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
         "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
@@ -1825,7 +1829,7 @@ def main(argv: list[str] | None = None) -> int:
                 "capacity_tokens": report["total"]["capacity_tokens"],
                 "bad_files": report["total"]["bad_files"],
                 "bad_rows": report["total"]["bad_rows"],
-                "status": status,
+                "status": case5_status,
             },
             indent=2,
         )
