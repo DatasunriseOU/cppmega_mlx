@@ -1213,16 +1213,42 @@ def production_training_loss_breakdown(
     graph_config: GraphAuxLossConfig | None,
     graph_weight: float,
 ) -> ProductionTrainingLossBreakdown:
-    """Compose CE and graph terms from one hidden/indexer decoder invocation."""
+    """Compose route-conditioned CE and optional DSA indexer supervision.
 
-    if not math.isfinite(float(graph_weight)) or graph_weight <= 0.0:
-        raise ValueError("graph auxiliary global weight must be finite and positive")
-    if graph_config is None or graph_targets is None or graph_pair_mask is None:
-        raise ValueError("production graph objective requires config/targets/pair_mask")
-    if graph_weight != graph_config.global_weight:
+    Dense GQA and DSA share one route-conditioned decoder invocation.  GQA uses
+    the additive dense graph prior while retaining the full causal key set; DSA
+    may additionally request the debiased neural-indexer auxiliary loss.  A
+    caller that supplies only route tensors gets a route-conditioned LM loss;
+    a partial or mode-incompatible indexer objective raises instead of being
+    silently discarded.
+    """
+
+    if not math.isfinite(float(graph_weight)) or graph_weight < 0.0:
+        raise ValueError("graph auxiliary global weight must be finite and non-negative")
+    aux_values = (graph_config, graph_targets, graph_pair_mask)
+    graph_aux_requested = any(value is not None for value in aux_values)
+    if graph_aux_requested and any(value is None for value in aux_values):
         raise ValueError(
-            "graph auxiliary global weight differs from GraphAuxLossConfig: "
-            f"{graph_weight} != {graph_config.global_weight}"
+            "production graph objective requires config/targets/pair_mask together"
+        )
+    if graph_aux_requested:
+        assert graph_config is not None
+        assert graph_targets is not None
+        assert graph_pair_mask is not None
+        if graph_weight <= 0.0:
+            raise ValueError(
+                "graph auxiliary global weight must be finite and positive when "
+                "indexer supervision is configured"
+            )
+        if graph_weight != graph_config.global_weight:
+            raise ValueError(
+                "graph auxiliary global weight differs from GraphAuxLossConfig: "
+                f"{graph_weight} != {graph_config.global_weight}"
+            )
+    elif graph_weight != 0.0:
+        raise ValueError(
+            "graph auxiliary global weight must be zero when indexer supervision "
+            "is not configured"
         )
     if block_bias is None:
         raise ValueError("production graph objective requires graph route block_bias")
@@ -1236,12 +1262,19 @@ def production_training_loss_breakdown(
     model_config = getattr(model, "config", None)
     if (
         model_config is None
-        or getattr(model_config, "attention_mode", None) != "dsa"
+        or getattr(model_config, "attention_mode", None) not in {"gqa", "dsa"}
         or getattr(model_config, "require_graph_routes", None) is not True
         or getattr(model_config, "graph_routes_enabled", None) is not True
     ):
         raise ValueError(
-            "production graph objective requires active fail-closed DSA graph routes"
+            "production graph objective requires active fail-closed DSA graph routes "
+            "or active dense GQA graph routes"
+        )
+    attention_mode = str(getattr(model_config, "attention_mode"))
+    if attention_mode == "gqa" and graph_aux_requested:
+        raise ValueError(
+            "production indexer supervision requires attention_mode='dsa'; "
+            "dense GQA uses additive graph bias while retaining all eligible tokens"
         )
     if float(getattr(model_config, "structure_residual_scale", 0.0)) <= 0.0:
         raise ValueError(
@@ -1276,39 +1309,58 @@ def production_training_loss_breakdown(
         raise TypeError(
             "production graph objective requires model.decoder_hidden_states"
         )
-    decoder_result = decoder_forward(
-        input_ids,
-        document_ids=document_ids,
-        block_bias=block_bias,
-        edge_kind_bias=edge_kind_bias,
-        return_indexer_scores=True,
-        **side_channels,
-    )
-    if not isinstance(decoder_result, tuple) or len(decoder_result) != 2:
-        raise RuntimeError(
-            "production graph decoder did not return hidden states and indexer scores"
+    if attention_mode == "dsa":
+        decoder_result = decoder_forward(
+            input_ids,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            return_indexer_scores=True,
+            **side_channels,
         )
-    hidden_states, indexer_scores = decoder_result
-    if not isinstance(hidden_states, mx.array) or not isinstance(indexer_scores, tuple):
-        raise RuntimeError(
-            "production graph decoder returned an invalid hidden/indexer contract"
+        if not isinstance(decoder_result, tuple) or len(decoder_result) != 2:
+            raise RuntimeError(
+                "production graph decoder did not return hidden states and indexer scores"
+            )
+        hidden_states, indexer_scores = decoder_result
+        if not isinstance(hidden_states, mx.array) or not isinstance(indexer_scores, tuple):
+            raise RuntimeError(
+                "production graph decoder returned an invalid hidden/indexer contract"
+            )
+        if graph_aux_requested:
+            graph_supervision_scores = getattr(model, "graph_supervision_scores", None)
+            if not callable(graph_supervision_scores):
+                raise TypeError(
+                    "production graph objective requires model.graph_supervision_scores"
+                )
+            learned_indexer_scores = graph_supervision_scores(
+                indexer_scores,
+                input_ids=input_ids,
+                document_ids=document_ids,
+                block_bias=block_bias,
+                edge_kind_bias=edge_kind_bias,
+            )
+            if not isinstance(learned_indexer_scores, tuple):
+                raise RuntimeError(
+                    "production graph supervision returned an invalid score contract"
+                )
+        else:
+            learned_indexer_scores = ()
+    elif attention_mode == "gqa":
+        hidden_states = decoder_forward(
+            input_ids,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            **side_channels,
         )
-    graph_supervision_scores = getattr(model, "graph_supervision_scores", None)
-    if not callable(graph_supervision_scores):
-        raise TypeError(
-            "production graph objective requires model.graph_supervision_scores"
-        )
-    learned_indexer_scores = graph_supervision_scores(
-        indexer_scores,
-        input_ids=input_ids,
-        document_ids=document_ids,
-        block_bias=block_bias,
-        edge_kind_bias=edge_kind_bias,
-    )
-    if not isinstance(learned_indexer_scores, tuple):
-        raise RuntimeError(
-            "production graph supervision returned an invalid score contract"
-        )
+        if not isinstance(hidden_states, mx.array):
+            raise RuntimeError(
+                "production GQA decoder returned an invalid hidden-state contract"
+            )
+        learned_indexer_scores = ()
+    else:  # pragma: no cover - config validation should make this unreachable
+        raise ValueError(f"unsupported production graph attention mode {attention_mode!r}")
 
     if bool(getattr(model_config, "chunked_ce", False)):
         chunked_cross_entropy = getattr(model, "_chunked_cross_entropy", None)
@@ -1328,12 +1380,26 @@ def production_training_loss_breakdown(
         logits = lm_head(hidden_states)
         lm_loss = cross_entropy(logits, targets, loss_mask)
 
-    graph_breakdown = graph_auxiliary_loss_breakdown_from_targets(
-        learned_indexer_scores,
-        graph_targets,
-        graph_pair_mask,
-        graph_config,
-    )
+    if graph_aux_requested:
+        assert graph_config is not None
+        assert graph_targets is not None
+        assert graph_pair_mask is not None
+        graph_breakdown = graph_auxiliary_loss_breakdown_from_targets(
+            learned_indexer_scores,
+            graph_targets,
+            graph_pair_mask,
+            graph_config,
+        )
+        graph_positive_pairs = mx.sum(graph_targets.astype(mx.float32))
+    else:
+        zero = lm_loss * mx.array(0.0, dtype=lm_loss.dtype)
+        graph_breakdown = GraphAuxLossBreakdown(
+            total=zero,
+            edge_bce=zero,
+            ranking=zero,
+            layer_count=0,
+        )
+        graph_positive_pairs = mx.array(0.0, dtype=mx.float32)
     ntokens = mx.sum(loss_mask.astype(mx.float32))
     return ProductionTrainingLossBreakdown(
         total=lm_loss + graph_breakdown.total,
@@ -1341,7 +1407,7 @@ def production_training_loss_breakdown(
         graph_total=graph_breakdown.total,
         graph_edge_bce=graph_breakdown.edge_bce,
         graph_ranking=graph_breakdown.ranking,
-        graph_positive_pairs=mx.sum(graph_targets.astype(mx.float32)),
+        graph_positive_pairs=graph_positive_pairs,
         ntokens=ntokens,
         graph_layer_count=graph_breakdown.layer_count,
     )

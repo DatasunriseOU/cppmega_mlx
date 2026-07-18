@@ -21,9 +21,9 @@ from cppmega_mlx.training.stage1_production import (
 )
 
 
-def _model_config():
+def _model_config(*, attention_mode: str = "dsa"):
     return stage1_production_config(
-        attention_mode="dsa",
+        attention_mode=attention_mode,
         vocab_size=64,
         hidden_size=32,
         depth=1,
@@ -139,6 +139,16 @@ def _gradient_l1(gradients: object, *name_fragments: str) -> float:
     return sum(float(value.item()) for value in values)
 
 
+def _gradient_array(gradients: object, name_fragment: str) -> mx.array:
+    arrays = [
+        value
+        for name, value in tree_flatten(gradients)
+        if isinstance(value, mx.array) and name_fragment in name
+    ]
+    assert len(arrays) == 1, (name_fragment, len(arrays))
+    return arrays[0]
+
+
 def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None:
     objective = Stage1ProductionObjective()
     batch = _production_batch(with_edge=True)
@@ -169,6 +179,64 @@ def test_stage1_combined_loss_uses_one_forward_and_exact_decomposition() -> None
         rel=1e-6,
     )
     assert objective.receipt()["single_decoder_forward"] is True
+
+
+def test_stage1_gqa_graph_route_changes_logits_loss_and_gradients() -> None:
+    objective = Stage1ProductionObjective()
+    graph_batch = _production_batch(with_edge=True)
+    empty_batch = _production_batch(with_edge=False)
+    mx.random.seed(211)
+    model = DenseCppLM(_model_config(attention_mode="gqa"))
+    graph_values = _stage1_objective_batch(graph_batch)
+    empty_values = _stage1_objective_batch(empty_batch)
+
+    graph_logits = model.logits(
+        graph_values.input_ids,
+        document_ids=graph_values.document_ids,
+        block_bias=graph_values.relation_bias,
+        edge_kind_bias=graph_values.edge_kind_bias,
+        **graph_values.side_channels,
+    )
+    empty_logits = model.logits(
+        empty_values.input_ids,
+        document_ids=empty_values.document_ids,
+        block_bias=empty_values.relation_bias,
+        edge_kind_bias=empty_values.edge_kind_bias,
+        **empty_values.side_channels,
+    )
+    graph_loss_and_grad = nn.value_and_grad(
+        model,
+        lambda: objective.loss_breakdown(model, graph_batch).total,
+    )
+    empty_loss_and_grad = nn.value_and_grad(
+        model,
+        lambda: objective.loss_breakdown(model, empty_batch).total,
+    )
+    graph_loss, graph_gradients = graph_loss_and_grad()
+    empty_loss, empty_gradients = empty_loss_and_grad()
+    graph_q_grad = _gradient_array(
+        graph_gradients, "layers.0.attention.q_proj.weight"
+    )
+    empty_q_grad = _gradient_array(
+        empty_gradients, "layers.0.attention.q_proj.weight"
+    )
+    mx.eval(
+        graph_logits,
+        empty_logits,
+        graph_loss,
+        empty_loss,
+        graph_q_grad,
+        empty_q_grad,
+    )
+
+    assert float(mx.sum(mx.abs(graph_logits - empty_logits)).item()) > 1e-5
+    assert abs(float(graph_loss.item()) - float(empty_loss.item())) > 1e-6
+    assert float(mx.sum(mx.abs(graph_q_grad - empty_q_grad)).item()) > 1e-6
+    graph_breakdown = objective.loss_breakdown(model, graph_batch)
+    mx.eval(graph_breakdown.graph_total, graph_breakdown.graph_positive_pairs)
+    assert float(graph_breakdown.graph_total.item()) == 0.0
+    assert float(graph_breakdown.graph_positive_pairs.item()) == 1.0
+    assert graph_breakdown.graph_layer_count == 0
 
 
 def test_stage1_self_chunk_targets_are_intersected_with_causal_pair_mask() -> None:

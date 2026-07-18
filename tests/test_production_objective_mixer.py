@@ -1496,7 +1496,7 @@ def test_production_loss_rejects_non_finite_graph_weight_before_forward() -> Non
         "message",
     ),
     (
-        ("gqa", True, True, 1.0, "active fail-closed DSA graph routes"),
+        ("gqa", True, True, 1.0, "indexer supervision requires attention_mode='dsa'"),
         ("dsa", False, True, 1.0, "active fail-closed DSA graph routes"),
         ("dsa", True, False, 1.0, "active fail-closed DSA graph routes"),
         ("dsa", True, True, 0.0, "active structure residual routing"),

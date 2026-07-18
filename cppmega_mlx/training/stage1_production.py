@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -111,14 +111,41 @@ class Stage1ProductionObjective:
         batch: LMTokenBatch | Mapping[str, Any] | mx.array,
     ) -> ProductionTrainingLossBreakdown:
         values = _stage1_objective_batch(batch)
-        if model.config.attention_mode != "dsa":
-            raise ValueError(
-                "production Stage-1 combined objective requires attention_mode='dsa'"
-            )
-        if model.config.attention_sparse_topk != self.graph_config.topk:
+        if (
+            model.config.attention_mode == "dsa"
+            and model.config.attention_sparse_topk != self.graph_config.topk
+        ):
             raise ValueError(
                 "production Stage-1 graph ranking topk differs from model DSA topk: "
                 f"{self.graph_config.topk} != {model.config.attention_sparse_topk}"
+            )
+        if model.config.attention_mode == "gqa":
+            # Dense GQA has no learned indexer to supervise.  Keep the graph
+            # route packet in the decoder path and make the absence of an
+            # indexer auxiliary term explicit rather than silently dropping it.
+            breakdown = production_training_loss_breakdown(
+                model,
+                values.input_ids,
+                values.targets,
+                values.loss_mask,
+                side_channels=values.side_channels,
+                document_ids=values.document_ids,
+                block_bias=values.relation_bias,
+                edge_kind_bias=values.edge_kind_bias,
+                graph_targets=None,
+                graph_pair_mask=None,
+                graph_config=None,
+                graph_weight=0.0,
+            )
+            return replace(
+                breakdown,
+                graph_positive_pairs=mx.sum(
+                    values.graph_targets.astype(mx.float32)
+                ),
+            )
+        if model.config.attention_mode != "dsa":
+            raise ValueError(
+                "production Stage-1 supports only attention_mode='gqa' or 'dsa'"
             )
         return production_training_loss_breakdown(
             model,
@@ -459,11 +486,6 @@ def run_stage1_graph_domain_production(
 
     if steps < 1:
         raise ValueError("production Stage-1 steps must be positive")
-    if attention_mode != "dsa":
-        raise ValueError(
-            "production Stage-1 combined CE + graph objective requires "
-            "attention_mode='dsa'"
-        )
     objective = Stage1ProductionObjective(graph_loss_config)
     dataset = open_production_megatron_bundle(
         data_path,
