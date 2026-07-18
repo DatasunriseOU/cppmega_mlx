@@ -294,6 +294,116 @@ def test_prompt_producer_rejects_identity_without_provenance(
         )
 
 
+def _native_identity_reference(
+    *,
+    project: str,
+    file: str,
+    line: int = 1,
+    column: int = 5,
+) -> dict[str, object]:
+    symbol_key = f"usr:schema=v3\x1fproject={project}\x1fusr=c:@F@route#"
+    return {
+        "symbol_identity_schema_version": 3,
+        "symbol_key": symbol_key,
+        "symbol_id": compute_symbol_id(symbol_key),
+        "qname": "api::route",
+        "usr": "c:@F@route#",
+        "canonical_signature": "display=route()|type=int ()",
+        "symbol_kind": "FUNCTION_DECL",
+        "project": project,
+        "file": file,
+        "line": line,
+        "column": column,
+        "provider": "clang",
+        "include_provenance": "direct",
+    }
+
+
+def _identity_cursor(*, file: Path | None, line: int = 1, column: int = 5):
+    class _CursorKind:
+        name = "FUNCTION_DECL"
+
+    return SimpleNamespace(
+        kind=_CursorKind(),
+        spelling="route",
+        location=SimpleNamespace(
+            file=None if file is None else SimpleNamespace(name=str(file)),
+            line=line,
+            column=column,
+        ),
+    )
+
+
+def test_prompt_identity_rejects_foreign_project_without_cursor_file(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reference = _native_identity_reference(
+        project="other/project",
+        file="route.cpp",
+    )
+    indexer = SimpleNamespace(
+        symbol_reference_for_cursor=lambda _cursor, **_kwargs: reference
+    )
+
+    with pytest.raises(ValueError, match="repository project"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            _identity_cursor(file=None),
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_prompt_identity_rejects_missing_cursor_file(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reference = _native_identity_reference(
+        project="tests/native-identity",
+        file="route.cpp",
+    )
+    indexer = SimpleNamespace(
+        symbol_reference_for_cursor=lambda _cursor, **_kwargs: reference
+    )
+
+    with pytest.raises(ValueError, match="cursor file is missing"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            _identity_cursor(file=None),
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
+def test_prompt_identity_rejects_out_of_repository_cursor_file(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside = tmp_path / "outside" / "route.cpp"
+    outside.parent.mkdir()
+    outside.write_text("int route();\n", encoding="utf-8")
+    reference = _native_identity_reference(
+        project="tests/native-identity",
+        file="route.cpp",
+    )
+    indexer = SimpleNamespace(
+        symbol_reference_for_cursor=lambda _cursor, **_kwargs: reference
+    )
+
+    with pytest.raises(ValueError, match="outside repository root"):
+        prompt_graph_index_module._identity_for_cursor(
+            indexer,
+            _identity_cursor(file=outside),
+            repo_root=repo_root,
+            project_id="tests/native-identity",
+            source_path="route.cpp",
+        )
+
+
 def test_production_index_rejects_identity_provenance_tampering(
     tmp_path: Path,
 ) -> None:

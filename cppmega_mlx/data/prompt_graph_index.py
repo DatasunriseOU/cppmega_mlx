@@ -128,9 +128,16 @@ def _identity_for_cursor(
             "CASE 4 v3 symbol reference provenance is incomplete; "
             "project, file, and line are required"
         )
-    if not isinstance(reference.get("project"), str):
+    reference_project = reference.get("project")
+    if not isinstance(reference_project, str):
         raise ValueError("CASE 4 v3 symbol reference provenance project is invalid")
-    if not isinstance(reference.get("file"), str) or not reference.get("file"):
+    if reference_project != project_id:
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance project does not match "
+            "the repository project"
+        )
+    reference_file = reference.get("file")
+    if not isinstance(reference_file, str) or not reference_file:
         raise ValueError("CASE 4 v3 symbol reference provenance file is invalid")
     line = reference.get("line")
     if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
@@ -152,34 +159,47 @@ def _identity_for_cursor(
     location = getattr(cursor, "location", None)
     location_file = getattr(location, "file", None)
     location_name = getattr(location_file, "name", None)
-    if location_name:
-        try:
-            relative_file = Path(str(location_name)).resolve().relative_to(
-                repo_root.resolve()
-            ).as_posix()
-        except ValueError:
-            relative_file = None
-        if relative_file is not None:
-            if reference["project"] != project_id or reference["file"] != relative_file:
-                raise ValueError(
-                    "CASE 4 v3 symbol reference provenance is not bound to "
-                    "the repository project/file"
-                )
-            cursor_line = getattr(location, "line", None)
-            if isinstance(cursor_line, int) and cursor_line > 0 and line != cursor_line:
-                raise ValueError(
-                    "CASE 4 v3 symbol reference provenance line does not match cursor"
-                )
-            cursor_column = getattr(location, "column", None)
-            if (
-                isinstance(cursor_column, int)
-                and cursor_column > 0
-                and column != cursor_column
-            ):
-                raise ValueError(
-                    "CASE 4 v3 symbol reference provenance column does not "
-                    "match cursor"
-                )
+    if not isinstance(location_name, (str, os.PathLike)) or not str(location_name):
+        raise ValueError("CASE 4 v3 cursor file is missing")
+    try:
+        resolved_root = repo_root.resolve()
+        resolved_file = Path(location_name).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("CASE 4 v3 cursor file could not be resolved") from exc
+    try:
+        relative_file = resolved_file.relative_to(resolved_root).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            "CASE 4 v3 cursor file is outside repository root"
+        ) from exc
+    if reference_file != relative_file:
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance file does not match "
+            "the cursor's repository file"
+        )
+
+    cursor_line = getattr(location, "line", None)
+    if (
+        isinstance(cursor_line, bool)
+        or not isinstance(cursor_line, int)
+        or cursor_line <= 0
+    ):
+        raise ValueError("CASE 4 v3 cursor line is invalid")
+    if line != cursor_line:
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance line does not match cursor"
+        )
+    cursor_column = getattr(location, "column", None)
+    if (
+        isinstance(cursor_column, bool)
+        or not isinstance(cursor_column, int)
+        or cursor_column <= 0
+    ):
+        raise ValueError("CASE 4 v3 cursor column is invalid")
+    if column != cursor_column:
+        raise ValueError(
+            "CASE 4 v3 symbol reference provenance column does not match cursor"
+        )
 
     usr = str(reference.get("usr") or "")
     signature = _normalize_signature(reference.get("canonical_signature"))
@@ -218,8 +238,8 @@ def _identity_for_cursor(
         canonical_signature=signature,
         qname=str(reference.get("qname") or ""),
         symbol_kind=str(reference.get("symbol_kind") or "symbol"),
-        identity_project=str(reference["project"]),
-        identity_file=str(reference["file"]),
+        identity_project=reference_project,
+        identity_file=reference_file,
         identity_line=line,
         identity_column=column,
         identity_provider=str(reference["provider"]),
