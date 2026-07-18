@@ -679,8 +679,19 @@ class EligibilityAwareTaskMixer:
         output_count: int,
         start_step: int = 0,
         required_assignment: Callable[[SourceInput, TaskKind], bool] | None = None,
+        required_realized_assignment: Callable[
+            [SourceInput, RealizedObjective], bool
+        ]
+        | None = None,
+        candidate_assignment: Callable[[SourceInput, TaskKind], bool] | None = None,
     ) -> list[RealizedObjective]:
         """Select and realize one exact quota window from a bounded source pool."""
+
+        if required_assignment is not None and required_realized_assignment is not None:
+            raise ValueError(
+                "required_assignment and required_realized_assignment are mutually "
+                "exclusive"
+            )
 
         if output_count < 0:
             raise ValueError(f"output_count must be >=0, got {output_count}")
@@ -767,20 +778,20 @@ class EligibilityAwareTaskMixer:
                     return None, slot_index
             return packet_owner, None
 
-        forced_candidates: list[tuple[int, int] | None]
-        if required_assignment is None:
-            forced_candidates = [None]
-        else:
-            first_slot_by_task: dict[TaskKind, int] = {}
-            for slot_index, task in enumerate(slots):
-                first_slot_by_task.setdefault(task, slot_index)
-            forced_candidates = [
+        first_slot_by_task: dict[TaskKind, int] = {}
+        for slot_index, task in enumerate(slots):
+            first_slot_by_task.setdefault(task, slot_index)
+
+        def forced_candidate_pairs(
+            predicate: Callable[[SourceInput, TaskKind], bool],
+        ) -> list[tuple[int, int]]:
+            pairs = [
                 (packet_index, first_slot_by_task[task])
                 for packet_index, packet in enumerate(packets)
                 for task in eligibility[packet_index][0]
-                if task in first_slot_by_task and required_assignment(packet, task)
+                if task in first_slot_by_task and predicate(packet, task)
             ]
-            forced_candidates.sort(
+            pairs.sort(
                 key=lambda pair: (
                     len(candidate_packets[pair[1]]),
                     len(eligibility[pair[0]][0]),
@@ -789,6 +800,23 @@ class EligibilityAwareTaskMixer:
                     pair[1],
                 )
             )
+            return pairs
+
+        forced_candidates: list[tuple[int, int] | None]
+        if required_realized_assignment is not None:
+            forced_candidates = [None]
+            forced_candidates.extend(
+                forced_candidate_pairs(
+                    lambda packet, task: (
+                        candidate_assignment is None
+                        or candidate_assignment(packet, task)
+                    )
+                )
+            )
+        elif required_assignment is None:
+            forced_candidates = [None]
+        else:
+            forced_candidates = forced_candidate_pairs(required_assignment)
             if not forced_candidates:
                 raise ObjectiveQuotaUnsatisfiedError(
                     "objective source pool has no eligible assignment satisfying "
@@ -796,53 +824,73 @@ class EligibilityAwareTaskMixer:
                     f"pool={len(packets)}, output_count={output_count}"
                 )
 
-        packet_owner = None
+        def realize(packet_owner: Sequence[int | None]) -> list[RealizedObjective]:
+            task_by_packet = {
+                packet_index: slots[slot_index]
+                for packet_index, slot_index in enumerate(packet_owner)
+                if slot_index is not None
+            }
+            realized: list[RealizedObjective] = []
+            for output_index, source_index in enumerate(sorted(task_by_packet)):
+                packet = packets[source_index]
+                task = task_by_packet[source_index]
+                step_index = start_step + output_index
+                build_rng = self._step_rng(step_index)
+                task_packet = self._select_packet_for_task(
+                    packet,
+                    task,
+                    rng=build_rng,
+                )
+                example = self._builder.build(task, task_packet, rng=build_rng)
+                self._require_realized_kind(task, example)
+                realized.append(
+                    RealizedObjective(
+                        task=task,
+                        example=example,
+                        ineligible=eligibility[source_index][1],
+                        source_index=source_index,
+                        selected_packet=task_packet,
+                    )
+                )
+            assert Counter(item.task for item in realized) == Counter(quotas)
+            return realized
+
         failed_slot = None
+        matched_assignment = False
+        attempted_assignments: set[tuple[int | None, ...]] = set()
         for forced_assignment in forced_candidates:
             packet_owner, failed_slot = match(forced_assignment)
-            if packet_owner is not None:
-                break
-        if packet_owner is None:
-            quota_text = ", ".join(
-                f"{task.value}={quota}" for task, quota in quotas.items()
-            )
-            failed_task = "unknown" if failed_slot is None else slots[failed_slot].value
-            raise ObjectiveQuotaUnsatisfiedError(
-                "objective quota matching failed despite aggregate eligibility; "
-                f"quotas: {quota_text}; slot={failed_task}; "
-                f"pool={len(packets)}; output_count={output_count}; "
-                f"required_assignment={required_assignment is not None}"
-            )
+            if packet_owner is None:
+                continue
+            signature = tuple(packet_owner)
+            if signature in attempted_assignments:
+                continue
+            attempted_assignments.add(signature)
+            matched_assignment = True
+            realized = realize(packet_owner)
+            if required_realized_assignment is None or any(
+                required_realized_assignment(packets[item.source_index], item)
+                for item in realized
+            ):
+                return realized
 
-        task_by_packet = {
-            packet_index: slots[slot_index]
-            for packet_index, slot_index in enumerate(packet_owner)
-            if slot_index is not None
-        }
-        realized: list[RealizedObjective] = []
-        for output_index, source_index in enumerate(sorted(task_by_packet)):
-            packet = packets[source_index]
-            task = task_by_packet[source_index]
-            step_index = start_step + output_index
-            build_rng = self._step_rng(step_index)
-            task_packet = self._select_packet_for_task(
-                packet,
-                task,
-                rng=build_rng,
+        if required_realized_assignment is not None and matched_assignment:
+            raise ObjectiveQuotaUnsatisfiedError(
+                "objective quota matching produced no realized assignment "
+                "satisfying the required auxiliary constraint: "
+                f"pool={len(packets)}, output_count={output_count}"
             )
-            example = self._builder.build(task, task_packet, rng=build_rng)
-            self._require_realized_kind(task, example)
-            realized.append(
-                RealizedObjective(
-                    task=task,
-                    example=example,
-                    ineligible=eligibility[source_index][1],
-                    source_index=source_index,
-                    selected_packet=task_packet,
-                )
-            )
-        assert Counter(item.task for item in realized) == Counter(quotas)
-        return realized
+        quota_text = ", ".join(
+            f"{task.value}={quota}" for task, quota in quotas.items()
+        )
+        failed_task = "unknown" if failed_slot is None else slots[failed_slot].value
+        raise ObjectiveQuotaUnsatisfiedError(
+            "objective quota matching failed despite aggregate eligibility; "
+            f"quotas: {quota_text}; slot={failed_task}; "
+            f"pool={len(packets)}; output_count={output_count}; "
+            f"required_assignment={required_assignment is not None}; "
+            f"required_realized_assignment={required_realized_assignment is not None}"
+        )
 
 
 @dataclass

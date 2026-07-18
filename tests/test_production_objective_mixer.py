@@ -68,6 +68,7 @@ from cppmega_mlx.training.objective_mixer import (
     production_training_loss,
     RealizedObjective,
 )
+from cppmega_mlx.training.objective_schedule import CanonicalObjectivePlanner
 from cppmega_mlx.training.megatron_objectives import (
     MaterializedMegatronDocument,
     OBJECTIVE_CONTRACT_SCHEMA,
@@ -1297,7 +1298,6 @@ def test_transformed_objective_rejects_context_without_safe_physical_middle() ->
     end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
     tokens = [2, start, 10, 20, 11, 21, 12, 22, end, 3]
     token_count = len(tokens)
-    zeros = _arr([0] * token_count)
     packet = CodePacket(
         token_ids=_arr(tokens),
         document_ids=_arr([1] * token_count),
@@ -1925,9 +1925,31 @@ def test_materialized_document_serializes_with_production_arrow_schema() -> None
 def test_canonical_objective_artifact_binds_contract_shards_and_converter(
     tmp_path: Path,
 ) -> None:
+    code = CodePacket(
+        **{
+            **_code_packet().__dict__,
+            "call_edges": EdgeIndex.from_pairs(
+                [(1, 0)], relation="call", num_nodes=3
+            ),
+            "type_edges": EdgeIndex.from_pairs([], relation="type", num_nodes=3),
+        }
+    )
+    planner = CanonicalObjectivePlanner(
+        mixer=EligibilityAwareTaskMixer({TaskKind.CAUSAL_LM: 1.0}, seed=17),
+        source_iter=iter(
+            [ObjectiveSource(code_packet=code), ObjectiveSource(code_packet=code)]
+        ),
+        quota_window_samples=2,
+        quota_lookahead_samples=0,
+        graph_relations=STAGE1_GRAPH_RELATIONS,
+        require_route_sidecars=False,
+    )
+    planner.plan_window(start_step=0)
     contract = {
         "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "quota_window_samples": 2,
         "totals": {"samples": 2},
+        "source_selection": planner.source_selection_receipt(output_samples=2),
         "materialization": {
             "format": "shifted_lm_document_v1",
             "token_column": "input_ids",
