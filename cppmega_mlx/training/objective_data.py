@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from numbers import Integral
 from typing import Any
 
 import mlx.core as mx
@@ -170,6 +171,14 @@ def normalize_megatron_objective_source_row(
 
     normalized = dict(row)
     if TOKEN_IDS_COLUMN in normalized:
+        if (
+            INPUT_IDS_COLUMN in normalized
+            or VALID_TOKEN_COUNT_COLUMN in normalized
+        ):
+            raise ValueError(
+                "objective source cannot contain both token_ids and packed "
+                "input_ids/valid_token_count columns"
+            )
         return normalized
     if INPUT_IDS_COLUMN not in normalized or VALID_TOKEN_COUNT_COLUMN not in normalized:
         raise ValueError(
@@ -179,8 +188,11 @@ def normalize_megatron_objective_source_row(
 
     packed_tokens = list(normalized[INPUT_IDS_COLUMN] or [])
     raw_valid = normalized[VALID_TOKEN_COUNT_COLUMN]
-    if isinstance(raw_valid, bool):
-        raise ValueError("valid_token_count must be an integer, not bool")
+    if isinstance(raw_valid, bool) or not isinstance(raw_valid, Integral):
+        raise ValueError(
+            "valid_token_count must be an integer, not "
+            f"{type(raw_valid).__name__}"
+        )
     valid = int(raw_valid)
     if not 0 < valid <= len(packed_tokens):
         raise ValueError(
@@ -207,8 +219,14 @@ def normalize_megatron_objective_source_row(
     if packed_instructions is not None:
         instructions = list(packed_instructions)
         raw_num_docs = normalized.get(NUM_DOCS_COLUMN, len(instructions))
-        if isinstance(raw_num_docs, bool):
-            raise ValueError("num_docs must be an integer, not bool")
+        if (
+            isinstance(raw_num_docs, bool)
+            or not isinstance(raw_num_docs, Integral)
+        ):
+            raise ValueError(
+                "num_docs must be an integer, not "
+                f"{type(raw_num_docs).__name__}"
+            )
         num_docs = int(raw_num_docs)
         if num_docs != len(instructions):
             raise ValueError(

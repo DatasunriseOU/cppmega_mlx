@@ -83,6 +83,20 @@ and fail closed on alias conflicts. LMTokenBatch exposes document_ids as a
 first-class field, and NPZ, Parquet, and Megatron indexed ingress preserve
 token-aligned document IDs when the shard provides exactly one supported alias.
 
+## Production Objective Rows
+
+Megatron objective materialization accepts either typed `token_ids` rows or
+fixed-length packed `input_ids` rows with an integral `valid_token_count`; the
+two representations cannot appear together. Every packed token-aligned sidecar
+is length-checked and trimmed to the valid prefix. Single-document IFIM and
+multi-document commit sections retain exact constituent bindings; ambiguous
+provenance fails closed rather than selecting a candidate by position.
+Objective loss masks are source-transition aligned: `loss_mask[i]` gates the
+label predicted from source token `i`, and must be zero at document boundaries
+and at the final valid token. The production mixer uses bounded lookahead to
+realize exact task quotas when sparse objective eligibility requires additional
+source rows.
+
 ## Optional PyTorch DataLoader Bridge
 
 cppmega_mlx.data.dataloader_bridge provides an explicit, optional PyTorch

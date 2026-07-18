@@ -362,6 +362,40 @@ def test_packed_megatron_row_adapts_valid_prefix_and_real_objective_sections() -
     assert source.commit_packet.change_mask_post is None
 
 
+def test_packed_row_rejects_non_integral_counts() -> None:
+    with pytest.raises(ValueError, match="valid_token_count.*integer"):
+        normalize_megatron_objective_source_row(
+            {
+                INPUT_IDS_COLUMN: [1, 2, 3, 4],
+                VALID_TOKEN_COUNT_COLUMN: 3.5,
+            },
+            source_index=0,
+        )
+
+    with pytest.raises(ValueError, match="num_docs.*integer"):
+        normalize_megatron_objective_source_row(
+            {
+                INPUT_IDS_COLUMN: [1, 2, 3, 4],
+                VALID_TOKEN_COUNT_COLUMN: 4,
+                NUM_DOCS_COLUMN: 1.5,
+                SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: [[50]],
+            },
+            source_index=0,
+        )
+
+
+def test_packed_and_typed_token_columns_cannot_be_ambiguous() -> None:
+    with pytest.raises(ValueError, match="both token_ids and packed"):
+        normalize_megatron_objective_source_row(
+            {
+                "token_ids": [1, 2],
+                INPUT_IDS_COLUMN: [3, 4],
+                VALID_TOKEN_COUNT_COLUMN: 2,
+            },
+            source_index=0,
+        )
+
+
 def test_packed_commit_candidates_bind_exact_constituent_provenance() -> None:
     first = _physical_source("src/first.cpp")
     second = _physical_source("src/second.cpp")
