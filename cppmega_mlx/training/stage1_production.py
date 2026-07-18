@@ -31,7 +31,10 @@ from cppmega_mlx.training.compiled import (
     normalize_compiled_batch,
 )
 from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_BIAS_BETA,
     STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_SCORE_FORMULA,
+    STAGE1_GRAPH_SCORE_STAGE,
     STAGE1_GRAPH_TOPK,
     stage1_graph_config_kwargs,
     stage1_graph_recipe_binding,
@@ -47,7 +50,7 @@ from cppmega_mlx.training.objective_mixer import (
 STAGE1_GRAPH_DOMAIN_RECIPE = "stage1_graph_domain_v1"
 STAGE1_GQA_ROUTE_OBJECTIVE = "gqa_route_only_lm_ce"
 STAGE1_DSA_GRAPH_OBJECTIVE = "lm_ce_plus_dsa_indexer_graph_auxiliary"
-PRODUCTION_GRAPH_BETA = 1.0
+PRODUCTION_GRAPH_BETA = float(STAGE1_GRAPH_BIAS_BETA)
 PRODUCTION_DOMAIN_RESIDUAL_SCALE = 1.0
 PRODUCTION_DOMAIN_FIELDS = ("domain_ids", "role_ids", "confidence_ids")
 ProductionAttentionMode = Literal["gqa", "dsa"]
@@ -191,6 +194,9 @@ class Stage1ProductionObjective:
             "name": STAGE1_DSA_GRAPH_OBJECTIVE,
             "attention_mode": attention_mode,
             "recipe": stage1_graph_recipe_binding(),
+            "bias_beta": STAGE1_GRAPH_BIAS_BETA,
+            "score_formula": STAGE1_GRAPH_SCORE_FORMULA,
+            "score_stage": STAGE1_GRAPH_SCORE_STAGE,
             "formula": "lm_ce + graph_edge_bce + graph_ranking",
             "graph_route": "dsa_sparse_indexer",
             "graph_supervision": "dsa_indexer",
@@ -440,6 +446,10 @@ def stage1_production_batch_receipt(
 
     return {
         "recipe": STAGE1_GRAPH_DOMAIN_RECIPE,
+        "graph_recipe": stage1_graph_recipe_binding(),
+        "bias_beta": STAGE1_GRAPH_BIAS_BETA,
+        "score_formula": STAGE1_GRAPH_SCORE_FORMULA,
+        "score_stage": STAGE1_GRAPH_SCORE_STAGE,
         "attention_mode": config.attention_mode,
         "graph_edges": graph_edges,
         "edge_kind_edges": edge_kind_edges,

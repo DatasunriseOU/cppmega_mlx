@@ -24,6 +24,7 @@ from cppmega_mlx.training.objective_data import (
     OBJECTIVE_ROUTE_RETENTION_SCHEMA,
 )
 from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_payload,
     stage1_graph_recipe_binding,
     validate_stage1_graph_config,
 )
@@ -480,32 +481,18 @@ class ObjectiveContractAccumulator:
 
         total_input = sum(row["input_tokens"] for row in self._realized.values())
         total_loss = sum(row["loss_tokens"] for row in self._realized.values())
-        graph_config = self._graph_config
         route_retention = self._route_retention_contract()
+        recipe_fields = {
+            field: value
+            for field, value in stage1_graph_recipe_payload().items()
+            if field != "schema"
+        }
         graph_auxiliary: dict[str, object] = {
+            **recipe_fields,
             "recipe": stage1_graph_recipe_binding(),
-            "relations": list(graph_config.relations),
             "eligible_samples": self._eligible_graph_samples,
             "positive_edges": self._positive_edges,
-            "global_weight": _fraction_string(
-                Fraction(str(graph_config.global_weight))
-            ),
-            "indexer_weight": _fraction_string(
-                Fraction(str(graph_config.indexer_weight))
-            ),
-            "layer_weight": _fraction_string(Fraction(str(graph_config.layer_weight))),
-            "layer_reduction": "sum",
-            "bce_weight": _fraction_string(Fraction(str(graph_config.bce_weight))),
-            "coverage_weight": _fraction_string(
-                Fraction(str(graph_config.coverage_weight))
-            ),
-            "topk": graph_config.topk,
-            "pos_weight": _fraction_string(Fraction(str(graph_config.pos_weight))),
-            "margin": _fraction_string(Fraction(str(graph_config.margin))),
             "included_in_total_loss": True,
-            "runtime": "megatron_dsa_indexer_v1",
-            "pair_mask": "causal_same_document_upstream_v1",
-            "chunk_edge_expansion": "cartesian_token_spans_v1",
             "route_mapping": objective_route_mapping_contract(),
         }
         if route_retention is not None:

@@ -1100,6 +1100,7 @@ def main() -> int:
     graph_config = GraphAuxLossConfig(
         relations=graph_relations,
         topk=args.graph_topk,
+        bias_beta=graph_recipe["bias_beta"],
         global_weight=args.graph_aux_weight,
         indexer_weight=args.graph_indexer_weight,
         layer_weight=args.graph_layer_weight,

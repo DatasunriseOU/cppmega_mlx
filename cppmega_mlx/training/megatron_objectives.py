@@ -43,7 +43,10 @@ from cppmega_mlx.training.objective_mixer import (
     RealizedObjective,
     validated_packed_commit_binding,
 )
-from cppmega_mlx.data.graph_recipe import validate_stage1_graph_contract
+from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_contract,
+)
 from cppmega_mlx.training.objective_data import (
     OBJECTIVE_CHUNK_ROUTE_COLUMNS,
     OBJECTIVE_GRAPH_RELATION_COLUMNS,
@@ -57,7 +60,7 @@ from cppmega_mlx.training.task_mixer import TaskKind
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
-    "cppmega_objective_materialization_artifact_v1"
+    "cppmega_objective_materialization_artifact_v2"
 )
 OBJECTIVE_MATERIALIZATION_ARTIFACT_NAME = "objective_materialization.json"
 OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
@@ -867,6 +870,7 @@ def write_objective_materialization_artifact(
     }
     artifact = {
         "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": documents,
         "objective_contract": {
             "path": contract_path.name,
