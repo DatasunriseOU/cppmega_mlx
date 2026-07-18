@@ -167,6 +167,12 @@ EXTRACT_CACHE_MODE_EXTERNAL = "external"
 EXTRACT_CACHE_MODE = EXTRACT_CACHE_MODE_RUN_LOCAL
 
 _PRINT_LOCK = threading.Lock()
+_LIBCLANG_PREFLIGHT_CODE = """
+import clang.cindex as cindex
+
+cindex.Index.create()
+print(cindex.__file__)
+"""
 
 
 class CodeRevisionError(RuntimeError):
@@ -179,6 +185,39 @@ class CodeRevisionMismatchError(CodeRevisionError):
 
 class CodeRevisionDriftError(CodeRevisionError):
     """The checkout changed after the conveyor captured its revision."""
+
+
+def verify_libclang_preflight(python: Path = VENV_PYTHON) -> str:
+    """Prove the stage interpreter can load and initialize libclang."""
+
+    try:
+        completed = subprocess.run(
+            [str(python), "-c", _LIBCLANG_PREFLIGHT_CODE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(
+            f"libclang preflight timed out after 30s: python={python}"
+        ) from exc
+    except OSError as exc:
+        raise SystemExit(
+            f"libclang preflight could not start: python={python}: {exc}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise SystemExit(
+            "libclang preflight failed: "
+            f"python={python} exit={completed.returncode}: {detail}"
+        )
+    binding_path = completed.stdout.strip()
+    if not binding_path:
+        raise SystemExit(
+            f"libclang preflight returned no binding path: python={python}"
+        )
+    return binding_path
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -2511,6 +2550,67 @@ def claim_code_project_identity(
     return previous
 
 
+def claim_code_repo_for_submission(
+    *,
+    repo: str,
+    repo_list: Path,
+    project_identity_claims: dict[str, str],
+    manifest: Manifest,
+    manifest_lock: threading.Lock,
+    progress: ProgressWriter,
+) -> bool:
+    """Claim a code repo without letting one unresolved identity stop the run.
+
+    Missing canonical identity is a fail-closed, repo-local data rejection: no
+    indexing subprocess may run, but unrelated repositories must continue.
+    Corrupt repo-list files and other unexpected failures still propagate.
+    """
+
+    try:
+        project_id = sr.resolve_project_identity(repo, repo_list)
+    except SymbolIdentityError as exc:
+        detail = str(exc)
+        unit = code_key(repo)
+        with manifest_lock:
+            manifest.mark_failed(unit, "project_identity", detail)
+        progress.emit(
+            "unit_failed",
+            stream="code",
+            repo=repo,
+            unit=unit,
+            stage="project_identity",
+            detail=detail[:2000],
+        )
+        _log(f"QUARANTINE {unit}: unresolved project identity: {detail}")
+        return False
+
+    previous = claim_code_project_identity(
+        project_identity_claims,
+        repo,
+        project_id,
+    )
+    if previous is None:
+        return True
+
+    info = {
+        "source": "code",
+        "skipped": True,
+        "skip_reason": "duplicate_project_identity",
+        "project_identity": project_id,
+        "canonical_repo": previous,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with manifest_lock:
+        manifest.mark_done(code_key(repo), info)
+    progress.emit(
+        "duplicate_project_identity_skipped",
+        repo=repo,
+        stream="code",
+        **info,
+    )
+    return False
+
+
 def no_git_key(repo: str) -> str:
     """Checkpoint key proving the .git-preserving stream saw no git metadata."""
     return f"{repo}::no_git"
@@ -4336,6 +4436,12 @@ def main(argv: list[str]) -> int:
     for path in required_paths:
         if not Path(path).exists():
             raise SystemExit(f"required path missing: {path}")
+    if not args.source_cache_populate_only:
+        libclang_binding = verify_libclang_preflight(VENV_PYTHON)
+        _log(
+            "libclang preflight: OK "
+            f"python={VENV_PYTHON} binding={libclang_binding}"
+        )
 
     # Pre-create output trees for BOTH streams.
     CONVEYOR_ROOT.mkdir(parents=True, exist_ok=True)
@@ -4599,34 +4705,14 @@ def main(argv: list[str]) -> int:
         submitted_repo_names.add(repo)
         if args.streams != "code" or repo_list is None:
             return True
-        try:
-            project_id = sr.resolve_project_identity(repo, repo_list)
-        except Exception as exc:
-            raise RepoFailure(repo, "project_identity", str(exc)) from exc
-        previous = claim_code_project_identity(
-            submitted_code_project_identities,
-            repo,
-            project_id,
-        )
-        if previous is None:
-            return True
-        info = {
-            "source": "code",
-            "skipped": True,
-            "skip_reason": "duplicate_project_identity",
-            "project_identity": project_id,
-            "canonical_repo": previous,
-            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        with manifest_lock:
-            manifest.mark_done(code_key(repo), info)
-        progress.emit(
-            "duplicate_project_identity_skipped",
+        return claim_code_repo_for_submission(
             repo=repo,
-            stream="code",
-            **info,
+            repo_list=repo_list,
+            project_identity_claims=submitted_code_project_identities,
+            manifest=manifest,
+            manifest_lock=manifest_lock,
+            progress=progress,
         )
-        return False
 
     def mark_no_git_repo(repo: str) -> None:
         info = {

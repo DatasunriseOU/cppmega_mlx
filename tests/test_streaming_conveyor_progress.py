@@ -42,6 +42,90 @@ def test_code_project_identity_claims_deduplicate_aliases() -> None:
     ) == "open-watcom"
 
 
+def test_libclang_preflight_fails_before_staging_with_child_error(tmp_path) -> None:
+    import streaming_conveyor
+
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\necho 'clang bindings unavailable' >&2\nexit 17\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            r"libclang preflight failed: .*exit=17: "
+            r"clang bindings unavailable"
+        ),
+    ):
+        streaming_conveyor.verify_libclang_preflight(fake_python)
+
+
+def test_unmapped_code_repo_is_quarantined_without_blocking_next_submission(
+    tmp_path,
+) -> None:
+    import threading
+
+    import streaming_conveyor
+
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "name": "public-repo",
+                        "owner_repo": "tests/public-repo",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = streaming_conveyor.Manifest(tmp_path / "_done.json")
+    progress_path = tmp_path / "progress.jsonl"
+    progress = streaming_conveyor.ProgressWriter(progress_path)
+    claims: dict[str, str] = {}
+    lock = threading.Lock()
+
+    assert not streaming_conveyor.claim_code_repo_for_submission(
+        repo="unmapped archive",
+        repo_list=repo_list,
+        project_identity_claims=claims,
+        manifest=manifest,
+        manifest_lock=lock,
+        progress=progress,
+    )
+    assert manifest.failed["unmapped archive::code"]["stage"] == "project_identity"
+    assert claims == {}
+
+    assert streaming_conveyor.claim_code_repo_for_submission(
+        repo="public-repo",
+        repo_list=repo_list,
+        project_identity_claims=claims,
+        manifest=manifest,
+        manifest_lock=lock,
+        progress=progress,
+    )
+    assert claims == {"tests/public-repo": "public-repo"}
+
+    events = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["event"] == "unit_failed"
+    assert events[0]["repo"] == "unmapped archive"
+    assert events[0]["unit"] == "unmapped archive::code"
+    assert events[0]["stream"] == "code"
+    assert events[0]["stage"] == "project_identity"
+    assert events[0]["detail"] == (
+        f"{repo_list}: no canonical project identity for bare repo "
+        "'unmapped archive'"
+    )
+
+
 def test_progress_writer_appends_jsonl(tmp_path):
     import streaming_conveyor
 
