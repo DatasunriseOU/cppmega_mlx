@@ -13,7 +13,10 @@ import pytest
 from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
-from cppmega_mlx.data.graph_recipe import STAGE1_GRAPH_RELATIONS
+from cppmega_mlx.data.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    stage1_graph_recipe_binding,
+)
 from cppmega_mlx.models.dense_cpp_lm import GraphIndexedAttention
 from cppmega_mlx.training.stage1_production import (
     STAGE1_GRAPH_DOMAIN_RECIPE,
@@ -151,6 +154,10 @@ def test_stage1_production_receipt_proves_nonzero_graph_and_domain_signal() -> N
     receipt = stage1_production_batch_receipt(_production_batch(), config=cfg)
 
     assert receipt["recipe"] == STAGE1_GRAPH_DOMAIN_RECIPE
+    assert receipt["graph_recipe"] == stage1_graph_recipe_binding()
+    assert receipt["bias_beta"] == "1"
+    assert receipt["score_formula"] == "i_neural_plus_beta_s_graph_v1"
+    assert receipt["score_stage"] == "before_topk"
     assert receipt["graph_edges"] == 1
     assert receipt["graph_prior_nonzero"] == 1
     assert receipt["graph_positive_pairs"] == 1

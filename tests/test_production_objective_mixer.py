@@ -1737,6 +1737,11 @@ def test_pre_materialized_contract_matches_exact_realized_schedule() -> None:
     assert contract["graph_auxiliary"]["indexer_weight"] == "1/1000"
     assert contract["graph_auxiliary"]["layer_weight"] == "1"
     assert contract["graph_auxiliary"]["layer_reduction"] == "sum"
+    assert contract["graph_auxiliary"]["bias_beta"] == "1"
+    assert contract["graph_auxiliary"]["score_formula"] == (
+        "i_neural_plus_beta_s_graph_v1"
+    )
+    assert contract["graph_auxiliary"]["score_stage"] == "before_topk"
     assert contract["graph_auxiliary"]["pair_mask"] == (
         "causal_same_document_upstream_v1"
     )
@@ -1968,7 +1973,8 @@ def test_canonical_objective_artifact_binds_contract_shards_and_converter(
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
-    assert artifact["schema"] == OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA
+    assert artifact["schema"] == "cppmega_objective_materialization_artifact_v2"
+    assert artifact["graph_recipe"] == stage1_graph_recipe_binding()
     assert artifact["documents"] == 2
     assert artifact["objective_contract"]["path"] == "objective_contract.json"
     assert (

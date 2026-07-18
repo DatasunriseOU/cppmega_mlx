@@ -922,6 +922,7 @@ class GraphAuxLossConfig:
     coverage_weight: float = 1.0
     pos_weight: float = 1.0
     margin: float = 1.0
+    bias_beta: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.relations or any(
@@ -945,6 +946,8 @@ class GraphAuxLossConfig:
                 raise ValueError(f"graph auxiliary {name} must be positive")
         if not math.isfinite(float(self.margin)) or self.margin < 0.0:
             raise ValueError("graph auxiliary margin must be non-negative")
+        if not math.isfinite(float(self.bias_beta)) or self.bias_beta <= 0.0:
+            raise ValueError("graph auxiliary bias_beta must be positive")
 
 
 @dataclass(frozen=True)
@@ -1225,6 +1228,7 @@ def production_training_loss_breakdown(
 
     if not math.isfinite(float(graph_weight)) or graph_weight < 0.0:
         raise ValueError("graph auxiliary global weight must be finite and non-negative")
+    model_config = getattr(model, "config", None)
     aux_values = (graph_config, graph_targets, graph_pair_mask)
     graph_aux_requested = any(value is not None for value in aux_values)
     if graph_aux_requested and any(value is None for value in aux_values):
@@ -1259,7 +1263,6 @@ def production_training_loss_breakdown(
             "production graph objective document_ids must match input_ids shape "
             f"{tuple(input_ids.shape)}, got {tuple(document_ids.shape)}"
         )
-    model_config = getattr(model, "config", None)
     if (
         model_config is None
         or getattr(model_config, "attention_mode", None) not in {"gqa", "dsa"}
@@ -1304,6 +1307,14 @@ def production_training_loss_breakdown(
             "production graph edge-kind prior must match relation prior shape "
             f"{tuple(block_bias.shape)}, got {tuple(edge_kind_bias.shape)}"
         )
+    if graph_aux_requested:
+        assert graph_config is not None
+        model_beta = getattr(model_config, "graph_attention_bias_beta", None)
+        if model_beta is None or float(model_beta) != float(graph_config.bias_beta):
+            raise ValueError(
+                "production graph bias_beta differs between objective recipe and "
+                f"model config: {graph_config.bias_beta} != {model_beta}"
+            )
     decoder_forward = getattr(model, "decoder_hidden_states", None)
     if not callable(decoder_forward):
         raise TypeError(
